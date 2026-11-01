@@ -1635,6 +1635,26 @@ pub struct Cli {
     #[arg(long, value_name = "HEADER")]
     pub mtls_header: Option<String>,
 
+    /// Header the reverse proxy forwards the caller's subject in (ADR-3541
+    /// decision 3): who, within the tenant, the verified client certificate
+    /// belongs to. Read on the `--mtls-listener` chain only, under the trust
+    /// rule of `--mtls-header`: the proxy sets it from the verified
+    /// certificate and strips any client-supplied copy. Query audit records
+    /// name the value verbatim as `query.principal.subject` with
+    /// `query.principal.subject_source` `mtls`. It grants no capability. A
+    /// header that is missing, empty, longer than 255 bytes, or holding a byte
+    /// outside printable non-space ASCII leaves the subject absent, still
+    /// authenticates the request, and adds one to
+    /// `ravel_auth_subject_dropped_total{source="mtls",reason=...}`. A space is
+    /// outside that bound, so an RFC 4514 subject DN such as `CN=Alice
+    /// Smith,O=Example Corp` is dropped as `charset`: the proxy must forward a
+    /// value without a space, such as an email or URI SAN, or a single CN
+    /// component that has none. Unset (the default), no subject is read.
+    /// Setting it empty, without `--mtls-enabled`, or to the tenant header
+    /// (`--mtls-header` or its default) fails startup.
+    #[arg(long, value_name = "HEADER")]
+    pub mtls_subject_header: Option<String>,
+
     /// Dedicated listener address the mTLS resolver is installed on
     /// (ADR-0050 section 1). Required when `--mtls-enabled` is set: the
     /// resolver is never added to the public HTTP or gRPC/Flight listener
@@ -6385,6 +6405,9 @@ pub struct AuthResolverSettings {
     pub oidc: Option<OidcSettings>,
     /// The trusted client-cert header, `Some` only when `--mtls-enabled`.
     pub mtls_header: Option<String>,
+    /// `--mtls-subject-header`, the proxy-forwarded subject header the mTLS
+    /// resolver reads (ADR-3541 decision 3). `Some` only when `mtls_header` is.
+    pub mtls_subject_header: Option<String>,
 }
 
 /// The resolved ADR-0071 distributed read fan-out settings,
@@ -7306,7 +7329,30 @@ impl Cli {
             None
         };
 
-        Ok(AuthResolverSettings { oidc, mtls_header })
+        let mtls_subject_header = match (&self.mtls_subject_header, &mtls_header) {
+            (None, _) => None,
+            (Some(subject), _) if subject.is_empty() => {
+                anyhow::bail!("--mtls-subject-header must be non-empty")
+            }
+            (Some(_), None) => {
+                anyhow::bail!("--mtls-subject-header was set but --mtls-enabled was not")
+            }
+            // HTTP header names are case-insensitive, so `X-Foo` and `x-foo`
+            // are one header.
+            (Some(subject), Some(tenant)) if subject.eq_ignore_ascii_case(tenant) => {
+                anyhow::bail!(
+                    "--mtls-subject-header '{subject}' is the tenant header (--mtls-header): \
+                     one header cannot name both the tenant and the subject"
+                )
+            }
+            (Some(subject), Some(_)) => Some(subject.clone()),
+        };
+
+        Ok(AuthResolverSettings {
+            oidc,
+            mtls_header,
+            mtls_subject_header,
+        })
     }
 
     /// Parse `--store-probe-interval` into a duration (ADR-0050 section 7,
@@ -20977,6 +21023,82 @@ mod tests {
             .parse_auth_resolvers()
             .expect("--oidc-subject-claim with OIDC parses");
         assert_eq!(cli(&oidc).oidc_subject_claim, None, "no default");
+    }
+
+    /// `--mtls-subject-header` is refused empty, without `--mtls-enabled`, and
+    /// when it names the tenant header (explicit or the default, in any case),
+    /// and otherwise reaches `AuthResolverSettings`. Flip to watch it fail:
+    /// delete the `(Some(_), None)` arm or the `eq_ignore_ascii_case` arm of
+    /// the `mtls_subject_header` match in `parse_auth_resolvers`.
+    #[test]
+    fn the_mtls_subject_header_is_refused_without_mtls_or_when_it_equals_the_tenant_header() {
+        const SUBJECT: &str = "x-ravel-client-cert-subject";
+        let refused = |args: &[&str], want: &str| {
+            let err = cli(args)
+                .parse_auth_resolvers()
+                .expect_err("the shape refuses startup");
+            assert!(err.to_string().contains(want), "{args:?}: {err}");
+        };
+
+        refused(
+            &["--mtls-enabled", "--mtls-subject-header", ""],
+            "--mtls-subject-header must be non-empty",
+        );
+        refused(
+            &["--mtls-subject-header", SUBJECT],
+            "--mtls-subject-header was set but --mtls-enabled was not",
+        );
+        for args in [
+            &[
+                "--mtls-enabled",
+                "--mtls-subject-header",
+                "x-ravel-client-cert-cn",
+            ][..],
+            &[
+                "--mtls-enabled",
+                "--mtls-subject-header",
+                "X-Ravel-Client-Cert-CN",
+            ][..],
+            &[
+                "--mtls-enabled",
+                "--mtls-header",
+                "x-cert-id",
+                "--mtls-subject-header",
+                "x-cert-id",
+            ][..],
+        ] {
+            refused(args, "is the tenant header (--mtls-header)");
+        }
+
+        let settings = cli(&["--mtls-enabled", "--mtls-subject-header", SUBJECT])
+            .parse_auth_resolvers()
+            .expect("a distinct subject header with --mtls-enabled parses");
+        assert_eq!(
+            settings.mtls_header.as_deref(),
+            Some(ravel_tenant_resolve::MtlsResolver::DEFAULT_HEADER)
+        );
+        assert_eq!(settings.mtls_subject_header.as_deref(), Some(SUBJECT));
+
+        // A subject header equal to the default is accepted once
+        // `--mtls-header` names a different tenant header.
+        let settings = cli(&[
+            "--mtls-enabled",
+            "--mtls-header",
+            "x-cert-id",
+            "--mtls-subject-header",
+            "x-ravel-client-cert-cn",
+        ])
+        .parse_auth_resolvers()
+        .expect("the subject header differs from the tenant header");
+        assert_eq!(
+            settings.mtls_subject_header.as_deref(),
+            Some("x-ravel-client-cert-cn")
+        );
+
+        let settings = cli(&["--mtls-enabled"])
+            .parse_auth_resolvers()
+            .expect("--mtls-enabled alone parses");
+        assert_eq!(settings.mtls_subject_header, None, "no default");
     }
 
     #[test]

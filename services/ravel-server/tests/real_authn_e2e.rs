@@ -200,6 +200,7 @@ fn mtls_bundle() -> (Arc<dyn TenantResolver>, Arc<dyn TenantResolver>) {
         AuthResolverSettings {
             oidc: None,
             mtls_header: Some(MTLS_HEADER.to_string()),
+            mtls_subject_header: None,
         },
     )
     .expect("resolver builds");
@@ -227,6 +228,7 @@ fn bearer_only_resolver() -> Arc<dyn TenantResolver> {
         AuthResolverSettings {
             oidc: None,
             mtls_header: None,
+            mtls_subject_header: None,
         },
     )
     .expect("resolver builds")

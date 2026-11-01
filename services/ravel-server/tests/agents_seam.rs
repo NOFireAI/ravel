@@ -284,6 +284,7 @@ fn agents_worker_token_suffix_resolves_only_the_worker_capability() {
         AuthResolverSettings {
             oidc: None,
             mtls_header: None,
+            mtls_subject_header: None,
         },
         OidcCapabilityClaims::default(),
     )

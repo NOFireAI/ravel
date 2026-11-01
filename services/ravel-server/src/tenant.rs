@@ -49,7 +49,7 @@ pub struct ResolverBundle {
     /// dedicated `--mtls-listener` chain only; it must never be merged into
     /// `resolver`, which backs every public listener.
     pub mtls_resolver: Option<Arc<dyn TenantResolver>>,
-    /// The counters the OIDC resolver records a dropped subject in, the same
+    /// The counters the OIDC and mTLS resolvers record a dropped subject in, the same
     /// [`subject_drop_counters`] handle `/metrics` renders as
     /// `ravel_auth_subject_dropped_total`.
     pub subject_drops: Arc<SubjectDropCounters>,
@@ -188,15 +188,22 @@ pub fn build_auth_resolver_with_principals(
     let mut resolvers: Vec<Arc<dyn TenantResolver>> =
         vec![Arc::new(StaticBearerTokenResolver::with_principals(tokens))];
 
-    let mtls_resolver: Option<Arc<dyn TenantResolver>> = auth
-        .mtls_header
-        .map(|header| Arc::new(MtlsResolver::new(header)) as Arc<dyn TenantResolver>);
+    if auth.mtls_header.is_none() && auth.mtls_subject_header.is_some() {
+        anyhow::bail!("--mtls-subject-header was set but --mtls-enabled was not");
+    }
+    let subject_drops = subject_drop_counters();
+    let mtls_resolver: Option<Arc<dyn TenantResolver>> = auth.mtls_header.map(|header| {
+        let mut mtls = MtlsResolver::new(header);
+        if let Some(subject_header) = auth.mtls_subject_header {
+            mtls = mtls.with_subject_header(subject_header, subject_drops.clone());
+        }
+        Arc::new(mtls) as Arc<dyn TenantResolver>
+    });
 
     if dev_header {
         resolvers.push(Arc::new(DevHeaderTenantResolver::default()));
     }
 
-    let subject_drops = subject_drop_counters();
     let mut oidc_refresh = None;
     if let Some(oidc) = auth.oidc {
         let cache = Arc::new(
@@ -462,6 +469,7 @@ mod tests {
             AuthResolverSettings {
                 oidc: Some(oidc_settings()),
                 mtls_header: None,
+                mtls_subject_header: None,
             },
             OidcCapabilityClaims {
                 ddl: Some("ravel_ddl".to_string()),
@@ -548,6 +556,7 @@ lVNfCuKwwBrIas5yannzOq4NUHTqcDRTLWg1ZyMnLrUgZ/WHc4/TGBXG\n\
             AuthResolverSettings {
                 oidc: Some(oidc_settings()),
                 mtls_header: None,
+                mtls_subject_header: None,
             },
             OidcCapabilityClaims {
                 subject: Some("email".to_string()),
@@ -605,6 +614,107 @@ lVNfCuKwwBrIas5yannzOq4NUHTqcDRTLWg1ZyMnLrUgZ/WHc4/TGBXG\n\
             .expect("a non-string subject claim still authenticates");
         assert_eq!(principal.subject, None);
         assert_eq!(not_string(&bundle.subject_drops), before + 1);
+    }
+
+    /// `--mtls-subject-header` reaches the mTLS resolver the bundle returns,
+    /// records its drops on the counters `/metrics` renders under `mtls`, and
+    /// never reaches the public chain. Flip to watch it fail: delete the
+    /// `with_subject_header` call in `build_auth_resolver_with_principals`.
+    #[test]
+    fn the_mtls_subject_header_reaches_only_the_built_mtls_resolver() {
+        use axum::http::{HeaderMap, HeaderValue};
+        use ravel_tenant_resolve::{SubjectDropReason, SubjectSource};
+
+        let mut principals = HashMap::new();
+        principals.insert(
+            "pub".to_string(),
+            Principal::tenant_only(TenantId::new("acme")),
+        );
+        let bundle = build_auth_resolver_with_principals(
+            principals,
+            false,
+            AuthResolverSettings {
+                oidc: None,
+                mtls_header: Some(MtlsResolver::DEFAULT_HEADER.to_string()),
+                mtls_subject_header: Some("x-ravel-client-cert-subject".to_string()),
+            },
+            OidcCapabilityClaims::default(),
+        )
+        .expect("an mTLS subject header with mTLS configured builds");
+        assert!(Arc::ptr_eq(&bundle.subject_drops, &subject_drop_counters()));
+        let mtls = bundle.mtls_resolver.expect("mTLS is configured");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            MtlsResolver::DEFAULT_HEADER,
+            HeaderValue::from_static("acme"),
+        );
+        headers.insert(
+            "x-ravel-client-cert-subject",
+            HeaderValue::from_static("CN=alice,O=Acme"),
+        );
+        let subject = mtls
+            .resolve_principal(&headers)
+            .expect("the mTLS headers resolve")
+            .subject
+            .expect("the subject header sets the subject");
+        assert_eq!(subject.value(), "CN=alice,O=Acme");
+        assert_eq!(subject.source(), SubjectSource::Mtls);
+
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer pub"),
+        );
+        assert_eq!(
+            bundle
+                .resolver
+                .resolve_principal(&headers)
+                .expect("the public token resolves"),
+            Principal::tenant_only(TenantId::new("acme")),
+            "the public chain reads no subject header"
+        );
+
+        let charset = |drops: &SubjectDropCounters| {
+            drops
+                .snapshot()
+                .into_iter()
+                .find(|(source, reason, _)| {
+                    *source == SubjectSource::Mtls && *reason == SubjectDropReason::Charset
+                })
+                .map(|(_, _, count)| count)
+                .expect("the pair is in the snapshot")
+        };
+        let before = charset(&bundle.subject_drops);
+        headers.insert(
+            "x-ravel-client-cert-subject",
+            HeaderValue::from_static("CN=Alice Smith,O=Example Corp"),
+        );
+        let principal = mtls
+            .resolve_principal(&headers)
+            .expect("a DN with a space still authenticates");
+        assert_eq!(principal.subject, None);
+        assert_eq!(charset(&bundle.subject_drops), before + 1);
+    }
+
+    #[test]
+    fn an_mtls_subject_header_without_mtls_refuses_to_build() {
+        let err = build_auth_resolver_with_principals(
+            HashMap::new(),
+            false,
+            AuthResolverSettings {
+                oidc: None,
+                mtls_header: None,
+                mtls_subject_header: Some("x-ravel-client-cert-subject".to_string()),
+            },
+            OidcCapabilityClaims::default(),
+        )
+        .err()
+        .expect("a subject header with no mTLS resolver must fail");
+        assert!(
+            err.to_string()
+                .contains("--mtls-subject-header was set but --mtls-enabled was not"),
+            "{err}"
+        );
     }
 
     #[test]
