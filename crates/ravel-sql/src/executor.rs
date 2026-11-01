@@ -706,14 +706,13 @@ pub struct SqlRequest {
     /// server's configured ceilings (ADR-1374 decision 3, prerequisite 1).
     /// `None` runs under the server config unchanged.
     ///
-    /// Which knob binds depends on the table. Only the `samples` (metrics)
-    /// provider reads the effective `max_bytes_scanned` and
-    /// `max_store_requests` at scan time; the `logs`, `spans`, `alerts`, and
-    /// `audit` providers do not. For those four tables only `max_segments` is
-    /// lowered today, through the catalog resolve every table shares. A bytes
-    /// or request ceiling set for one of them is clamped and then never
-    /// consulted. That is a pre-existing gap in those providers, tracked as
-    /// issue #1409, not a property of the budgets themselves.
+    /// Every signal table's scan (`samples`, `logs`, `spans`, `alerts` and
+    /// `audit`) checks the effective `max_bytes_scanned` and
+    /// `max_store_requests` against the statement total, summed over every
+    /// table the statement reads, each time one of its segment reads
+    /// completes, and refuses with the same typed errors as the server
+    /// ceiling once the total passes either. [`SignalStats::budgets`] reports
+    /// the limits each table's scan checked.
     pub budgets: Option<RequestBudgets>,
 }
 
