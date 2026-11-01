@@ -13,7 +13,8 @@ use ravel_segment::{
     ExpectedIdentity, Footer, FooterOutcome, HistogramValue, ReaderLimits, RunEntry,
     SampleProvenance, SeriesEntry, SeriesEntryV4, ValPageKind, ValueKind, check_identity,
     decode_catalog_matching_v4, decode_catalog_v4, decode_catalog_v5, decode_catalog_v5_chunked,
-    decode_run_histogram_pages, decode_run_pages_soa, open_from_suffix, plan_ranges_v4,
+    decode_catalog_v5_chunked_matching, decode_run_histogram_pages, decode_run_pages_soa,
+    open_from_suffix, plan_ranges_v4,
 };
 use ravel_types::accounting::{AccessIntent, AccountedOp, QueryAccounting};
 
@@ -228,9 +229,11 @@ fn section_range(footer: &Footer, kind: u32) -> Option<(u64, u64)> {
 }
 
 /// If every matcher is a non-empty positive equality (`label = "value"`),
-/// returns the `(name, value)` pairs for the dictionary-ordinal catalog decode
-/// ([`decode_catalog_matching_v4`]); otherwise `None`, and the caller keeps the
-/// materialize-then-filter path (issue #1076).
+/// returns the `(name, value)` pairs for the dictionary-ordinal catalog decodes
+/// ([`decode_catalog_matching_v4`] on the SERIES_META path,
+/// [`decode_catalog_v5_chunked_matching`] on the sparse catalog-probe path);
+/// otherwise `None`, and the caller keeps the materialize-then-filter path
+/// (issues #1076, #3511).
 ///
 /// Excluded shapes, each of which must materialize:
 /// - A regex or negated matcher (`=~`, `!~`, `!=`). The ordinal decoder only
@@ -244,7 +247,7 @@ fn section_range(footer: &Footer, kind: u32) -> Option<(u64, u64)> {
 ///   label. Falling back keeps the two paths identical.
 ///
 /// A non-empty value simply absent from the dictionary needs no special case:
-/// `decode_catalog_matching_v4` cannot resolve it and returns zero series,
+/// both ordinal decoders fail to resolve it and return zero series,
 /// which is exactly what an equality on a value no series carries must yield.
 /// An empty matcher set also returns `None`: it matches every series, so there
 /// is nothing to prune and the ordinal path would materialize all of them
@@ -1029,9 +1032,10 @@ pub struct SegmentFetcher {
     /// Count of catalog label sets materialized during `decode_selected`
     /// (issue #1076). The materializing path builds one `LabelSet` per
     /// candidate series before `matches_series` filters, so it adds the whole
-    /// decoded series count; the dictionary-ordinal path
-    /// (`decode_catalog_matching_v4`) builds one only for a series that already
-    /// matched, so it adds just the selected count. This is the counter that
+    /// decoded series count; the dictionary-ordinal paths
+    /// (`decode_catalog_matching_v4`, `decode_catalog_v5_chunked_matching`)
+    /// build one only for a series that already matched, so they add just the
+    /// selected count. This is the counter that
     /// makes the ordinal path's saving observable: same fetched bytes, fewer
     /// materializations. Shared across clones (an `Arc`), never reset, read the
     /// same way as [`suffix_fallbacks`](Self::suffix_fallbacks).
@@ -1903,8 +1907,10 @@ impl SegmentFetcher {
     ///   object qualifies for the sparse catalog-probe path, fetch
     ///   just its four catalog sections (LABEL_DICT, SERIES_IDS, SERIES_IDX, and
     ///   SERIES_META_CHUNKS, contiguous at the object front) and decode via
-    ///   [`decode_catalog_v5_chunked`], skipping the TS/VAL/HIST page bytes the
-    ///   whole-object GET would pull in.
+    ///   [`decode_catalog_v5_chunked_matching`] when every matcher is a
+    ///   non-empty positive equality, else [`decode_catalog_v5_chunked`],
+    ///   skipping the TS/VAL/HIST page bytes the whole-object GET would pull
+    ///   in.
     ///   [`Self::sparse_probe_qualifies`] gives the crossover.
     /// - **Otherwise** (a non-qualifying sparse object) fall back to the
     ///   whole-object decode, unchanged.
@@ -2016,11 +2022,14 @@ impl SegmentFetcher {
                         suffix_etag,
                         regions,
                         &sparse,
+                        matchers,
                         accounting,
                     )
                     .await?
                     .into_parts();
                 self.record_materialized(entries.len());
+                // The pruned decode already holds only the matching series;
+                // the filter keeps the result correct whichever decode ran.
                 DecodedCatalog {
                     entries: filter_matching(entries, matchers),
                     reservation,
@@ -2156,9 +2165,17 @@ impl SegmentFetcher {
     /// Fetches the four sparse catalog sections named by `ranges` in one GET
     /// (bridging the gaps between them, and skipping what `regions` already
     /// holds, so none when it holds them all) and decodes the chunked catalog
-    /// from them, without the page sections. Each section is crc-verified by
-    /// [`decode_catalog_v5_chunked`], so a mis-ranged or corrupt fetch is a
-    /// typed error, never wrong data.
+    /// from them, without the page sections. Each section the decode reads is
+    /// crc-verified, so a mis-ranged or corrupt fetch is a typed error, never
+    /// wrong data.
+    ///
+    /// When [`ordinal_equals`] accepts `matchers` the decode is
+    /// [`decode_catalog_v5_chunked_matching`], which returns only the series
+    /// holding every pair, and returns none without decompressing a chunk
+    /// when a name or value is absent from LABEL_DICT. Otherwise (a regex or
+    /// negated matcher, an empty-value equality, no matchers) it is
+    /// [`decode_catalog_v5_chunked`], which returns every series. The caller
+    /// filters the result by `matchers` either way.
     #[allow(clippy::too_many_arguments)]
     async fn decode_sparse_catalog(
         &self,
@@ -2168,6 +2185,7 @@ impl SegmentFetcher {
         suffix_etag: &Etag,
         regions: &mut FetchedRegions,
         ranges: &SparseCatalogRanges,
+        matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
     ) -> Result<DecodedCatalog, FetchError> {
         let key = seg_ref.data_object_key.as_str();
@@ -2215,15 +2233,17 @@ impl SegmentFetcher {
         let limits = self.limits;
         let (decoded, reservation) = match &self.read_gate {
             None => (
-                decode_catalog_v5_chunked(footer, &dict, &ids, &idx, &chunks, limits),
+                decode_chunked_catalog(footer, &dict, &ids, &idx, &chunks, matchers, limits),
                 reservation,
             ),
             Some(gate) => {
                 let size = JobSize::Bytes(reservation.size());
                 let footer = footer.clone();
+                let matchers = matchers.to_vec();
                 gate.run(ReadSite::SegmentSparseCatalog, size, move || {
-                    let decoded =
-                        decode_catalog_v5_chunked(&footer, &dict, &ids, &idx, &chunks, limits);
+                    let decoded = decode_chunked_catalog(
+                        &footer, &dict, &ids, &idx, &chunks, &matchers, limits,
+                    );
                     (decoded, reservation)
                 })
                 .await
@@ -3520,6 +3540,27 @@ fn decode_series_meta_catalog(
             let materialized = entries.len();
             (filter_matching(entries, matchers), materialized)
         })
+    }
+}
+
+/// The sparse branch's chunked catalog decode: the pruned
+/// [`decode_catalog_v5_chunked_matching`] when every matcher is a non-empty
+/// positive equality, otherwise the unpruned [`decode_catalog_v5_chunked`].
+/// Unfiltered either way; the caller runs `filter_matching`.
+fn decode_chunked_catalog(
+    footer: &Footer,
+    dict: &[u8],
+    ids: &[u8],
+    idx: &[u8],
+    chunks: &[u8],
+    matchers: &[LabelMatcher],
+    limits: ReaderLimits,
+) -> Result<Vec<SeriesEntryV4>, ravel_segment::SegmentError> {
+    match ordinal_equals(matchers) {
+        Some(equals) => {
+            decode_catalog_v5_chunked_matching(footer, dict, ids, idx, chunks, &equals, limits)
+        }
+        None => decode_catalog_v5_chunked(footer, dict, ids, idx, chunks, limits),
     }
 }
 
@@ -5343,6 +5384,65 @@ mod tests {
         );
     }
 
+    /// On the sparse catalog-probe path an all-positive-equality selector
+    /// takes `decode_catalog_v5_chunked_matching` (issue #3511), and a regex
+    /// selector keeps the unpruned `decode_catalog_v5_chunked`. Asserted on
+    /// `label_sets_materialized`: the pruned decode builds a label set only for
+    /// the matched series (1), the unpruned one for every series (4096), and an
+    /// equality on a value absent from LABEL_DICT builds none. The equality and
+    /// the same-series regex return identical series and samples.
+    ///
+    /// FLIP: call `decode_catalog_v5_chunked` unconditionally in
+    /// `decode_chunked_catalog` and the equality fetcher's count reads 4096,
+    /// not 1.
+    #[tokio::test]
+    async fn sparse_probe_prunes_positive_equality_and_keeps_regex_unpruned() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        let key = seg_ref.data_object_key.clone();
+        let eq = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
+        let re = [LabelMatcher::regex("__name__", "sparse_metric_2000").expect("regex")];
+        let absent = [LabelMatcher::equal("__name__", "sparse_metric_absent")];
+
+        let mut results = Vec::new();
+        for matchers in [&eq[..], &re[..], &absent[..]] {
+            let (fetcher, _metrics) = metered_fetcher(&key, bytes.clone()).await;
+            let fetcher = fetcher.with_whole_object_threshold(0);
+            let accounting = QueryAccounting::new();
+            let (footer, total, _etag, _regions) = fetcher
+                .open_segment(tenant_hash, &seg_ref, &accounting)
+                .await
+                .expect("open segment");
+            assert!(
+                fetcher
+                    .sparse_probe_qualifies(&footer, total, matchers)
+                    .is_some(),
+                "{matchers:?} takes the sparse catalog-probe path"
+            );
+            let (soa, _stats) = fetcher
+                .fetch_soa(tenant_hash, &seg_ref, matchers)
+                .await
+                .expect("fetch_soa");
+            results.push((soa, fetcher.label_sets_materialized()));
+        }
+        let [(soa_eq, mat_eq), (soa_re, mat_re), (soa_absent, mat_absent)] =
+            <[_; 3]>::try_from(results).expect("three runs");
+
+        assert_eq!(mat_eq, 1, "the pruned decode materializes the match only");
+        assert_eq!(mat_re, 4096, "the regex keeps the unpruned decode");
+        assert_eq!(mat_absent, 0, "an absent value materializes nothing");
+
+        assert_eq!(soa_eq.len(), 1);
+        assert_eq!(soa_eq[0].labels, labels("sparse_metric_2000"));
+        assert_eq!(soa_re.len(), 1);
+        assert_eq!(soa_eq[0].series_id, soa_re[0].series_id);
+        assert_eq!(soa_eq[0].labels, soa_re[0].labels);
+        assert_eq!(soa_eq[0].timestamps, soa_re[0].timestamps);
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&soa_eq[0].values), bits(&soa_re[0].values));
+        assert_eq!(soa_eq[0].timestamps.len(), 32);
+        assert!(soa_absent.is_empty(), "an absent value selects no series");
+    }
+
     /// Every GET the RSEG fetcher issues is timed under the phase its
     /// `PhaseAccounting` charges (issue #2976): the footer read under plan, the
     /// sparse catalog probe under probe, the page reads under scan, and none
@@ -5496,6 +5596,7 @@ mod tests {
                 &etag,
                 &mut regions,
                 &sparse,
+                &[],
                 &accounting,
             )
             .await

@@ -904,12 +904,117 @@ pub fn decode_catalog_v5(
 /// wrong data. The reconstructed run page ranges stay absolute-in-object (they
 /// carry the TS/VAL/HIST section bases from `footer`), so a caller can fetch
 /// those pages afterward exactly as on the whole-object path.
+///
+/// This entry materializes every series. A caller whose selector is all
+/// positive equality uses [`decode_catalog_v5_chunked_matching`] instead.
 pub fn decode_catalog_v5_chunked(
     footer: &Footer,
     label_dict_stored: &[u8],
     series_ids_stored: &[u8],
     series_idx_stored: &[u8],
     meta_chunks_stored: &[u8],
+    limits: ReaderLimits,
+) -> Result<Vec<SeriesEntryV4>, SegmentError> {
+    decode_chunked(
+        footer,
+        label_dict_stored,
+        series_ids_stored,
+        series_idx_stored,
+        meta_chunks_stored,
+        None,
+        limits,
+    )
+}
+
+/// [`decode_catalog_v5_chunked`] restricted to the series whose label set
+/// contains every `(name, value)` pair in `equals`: the result is exactly the
+/// unpruned decode's entries filtered to those series, in the same order.
+///
+/// Each name and value is resolved to its LABEL_DICT ordinal first, after
+/// only LABEL_DICT has been crc-verified and indexed. If any of them is not
+/// in the dictionary no series can match, and this returns an empty `Vec`
+/// without reading SERIES_IDS, SERIES_IDX or SERIES_META_CHUNKS, so no chunk
+/// frame is decompressed. Otherwise every section is verified and every chunk
+/// decoded as in the unpruned decode, and each series is compared by ordinal;
+/// only a matching series gets its label strings, `LabelSet` and run vectors
+/// built. A non-matching series still has its label ordinals resolved and its
+/// runs checked, so a malformed section yields the same typed error the
+/// unpruned decode returns.
+///
+/// The pairs are literal containment: `("a", "")` requires a label `a` with
+/// the empty value, not PromQL's "absent or empty". An empty `equals` matches
+/// every series.
+pub fn decode_catalog_v5_chunked_matching(
+    footer: &Footer,
+    label_dict_stored: &[u8],
+    series_ids_stored: &[u8],
+    series_idx_stored: &[u8],
+    meta_chunks_stored: &[u8],
+    equals: &[(&str, &str)],
+    limits: ReaderLimits,
+) -> Result<Vec<SeriesEntryV4>, SegmentError> {
+    decode_chunked(
+        footer,
+        label_dict_stored,
+        series_ids_stored,
+        series_idx_stored,
+        meta_chunks_stored,
+        Some(equals),
+        limits,
+    )
+}
+
+/// The LABEL_DICT ordinal of every name and value in `equals`, or `None` when
+/// any of them is not in the dictionary. Ordinal 0 is checked directly; the
+/// rest are binary-searched when ordinals `1..` are byte-sorted, which is what
+/// the writer emits. docs/segment-format.md does not make that order a
+/// contract, so an unsorted dictionary is scanned linearly instead.
+fn resolve_equals(
+    dict_bytes: &[u8],
+    dict_index: &[(usize, usize)],
+    equals: &[(&str, &str)],
+) -> Option<Vec<(u64, u64)>> {
+    let entry = |i: usize| -> &[u8] {
+        dict_index
+            .get(i)
+            .and_then(|&(start, len)| dict_bytes.get(start..start + len))
+            .unwrap_or_default()
+    };
+    let n = dict_index.len();
+    let sorted = (1..n.saturating_sub(1)).all(|i| entry(i) < entry(i + 1));
+    let find = |needle: &str| -> Option<u64> {
+        let needle = needle.as_bytes();
+        if n > 0 && entry(0) == needle {
+            return Some(0);
+        }
+        if sorted {
+            let (mut lo, mut hi) = (1usize, n);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                match entry(mid).cmp(needle) {
+                    std::cmp::Ordering::Less => lo = mid + 1,
+                    std::cmp::Ordering::Greater => hi = mid,
+                    std::cmp::Ordering::Equal => return Some(mid as u64),
+                }
+            }
+            None
+        } else {
+            (1..n).find(|&i| entry(i) == needle).map(|i| i as u64)
+        }
+    };
+    equals
+        .iter()
+        .map(|(name, value)| Some((find(name)?, find(value)?)))
+        .collect()
+}
+
+fn decode_chunked(
+    footer: &Footer,
+    label_dict_stored: &[u8],
+    series_ids_stored: &[u8],
+    series_idx_stored: &[u8],
+    meta_chunks_stored: &[u8],
+    equals: Option<&[(&str, &str)]>,
     limits: ReaderLimits,
 ) -> Result<Vec<SeriesEntryV4>, SegmentError> {
     let label_dict_section = find_section(footer, section_kind::LABEL_DICT)
@@ -922,8 +1027,23 @@ pub fn decode_catalog_v5_chunked(
         .ok_or(SegmentError::SparseSectionsIncomplete)?;
 
     let dict_bytes = decode_section_bytes(label_dict_section, label_dict_stored, limits)?;
+    // The matching decode resolves its pairs on LABEL_DICT alone, so a value
+    // the dictionary lacks returns before any other section is read.
+    let mut early_index = None;
+    let mut wanted: Option<Vec<(u64, u64)>> = None;
+    if let Some(equals) = equals {
+        let dict_index = index_label_dict(&dict_bytes)?;
+        let Some(ords) = resolve_equals(&dict_bytes, &dict_index, equals) else {
+            return Ok(Vec::new());
+        };
+        wanted = Some(ords);
+        early_index = Some(dict_index);
+    }
     let ids_bytes = decode_section_bytes(series_ids_section, series_ids_stored, limits)?;
-    let dict_index = index_label_dict(&dict_bytes)?;
+    let dict_index = match early_index {
+        Some(index) => index,
+        None => index_label_dict(&dict_bytes)?,
+    };
     let series_ids = parse_series_ids_v2(&ids_bytes)?;
     let idx_bytes = decode_section_bytes(idx_section, series_idx_stored, limits)?;
     let chunk_bytes = decode_section_bytes(chunks_section, meta_chunks_stored, limits)?;
@@ -952,8 +1072,28 @@ pub fn decode_catalog_v5_chunked(
         .map(|s| s.len)
         .unwrap_or(0);
 
+    // Per schema, the position of each wanted name in its name list, or
+    // `None` when the schema lacks one of them and no series using it can
+    // match.
+    let schema_positions: Option<Vec<Option<Vec<usize>>>> = wanted.as_ref().map(|wanted| {
+        schemas
+            .iter()
+            .map(|schema| {
+                wanted
+                    .iter()
+                    .map(|(name_ord, _)| schema.name_ords.iter().position(|n| n == name_ord))
+                    .collect()
+            })
+            .collect()
+    });
+
     let mut resolver = DictResolver::new(&dict_bytes, &dict_index);
-    let mut entries: Vec<SeriesEntryV4> = Vec::with_capacity(series_ids.len());
+    let mut entries: Vec<SeriesEntryV4> = Vec::with_capacity(if wanted.is_some() {
+        0
+    } else {
+        series_ids.len()
+    });
+    let mut abs = 0usize;
     // The chunk directory's first_index/n dense-chain (0, K, 2K, ...) is
     // already validated structurally by `parse_series_idx`, so this loop
     // does not re-check it.
@@ -993,12 +1133,13 @@ pub fn decode_catalog_v5_chunked(
         };
         run_total_sum = sum;
 
-        // Materialize each series in the frame.
+        // Materialize each selected series in the frame. Every series, selected
+        // or not, runs the same checks, so pruning changes no error.
         let mut voff = 0usize;
         let mut roff = 0usize;
         for i in 0..frame.n {
-            let abs = entries.len();
-            let Some(schema) = schemas.get(frame.schema_ref[i] as usize) else {
+            let schema_idx = frame.schema_ref[i] as usize;
+            let Some(schema) = schemas.get(schema_idx) else {
                 return Err(SegmentError::SchemaRefOutOfRange(u64::from(
                     frame.schema_ref[i],
                 )));
@@ -1008,32 +1149,50 @@ pub fn decode_catalog_v5_chunked(
                 return Err(SegmentError::BadBlockLen);
             };
             voff += name_count;
-            let mut label_pairs = Vec::with_capacity(name_count);
-            for (&name_ord, &val_ord) in schema.name_ords.iter().zip(vals) {
-                label_pairs.push(Label {
-                    name: resolver.get(name_ord)?.to_string(),
-                    value: resolver.get(val_ord)?.to_string(),
-                });
-            }
-            let label_set = LabelSet::new(label_pairs)?;
+            let keep = match (&schema_positions, &wanted) {
+                (Some(positions), Some(wanted)) => {
+                    positions[schema_idx].as_ref().is_some_and(|positions| {
+                        positions
+                            .iter()
+                            .zip(wanted)
+                            .all(|(&j, &(_, val_ord))| vals[j] == val_ord)
+                    })
+                }
+                _ => true,
+            };
+            let label_set = if keep {
+                let mut label_pairs = Vec::with_capacity(name_count);
+                for (&name_ord, &val_ord) in schema.name_ords.iter().zip(vals) {
+                    label_pairs.push(Label {
+                        name: resolver.get(name_ord)?.to_string(),
+                        value: resolver.get(val_ord)?.to_string(),
+                    });
+                }
+                Some(LabelSet::new(label_pairs)?)
+            } else {
+                for (&name_ord, &val_ord) in schema.name_ords.iter().zip(vals) {
+                    resolver.get(name_ord)?;
+                    resolver.get(val_ord)?;
+                }
+                None
+            };
 
             let rc = frame.run_count[i] as usize;
-            let runs: Vec<RunEntry> = frame.runs[roff..roff + rc].to_vec();
+            let run_slice = &frame.runs[roff..roff + rc];
             // Per-sample provenance for this series' runs (ADR-0092 decision 1).
             // Empty when the frame carried no extension, else the run slice
             // parallel to `runs`, exactly as the whole-section decode produces.
-            let per_sample_provenance: Vec<Option<Vec<SampleProvenance>>> =
-                if frame.provenance.is_empty() {
-                    Vec::new()
-                } else {
-                    frame.provenance[roff..roff + rc].to_vec()
-                };
+            let prov_slice: &[Option<Vec<SampleProvenance>>] = if frame.provenance.is_empty() {
+                &[]
+            } else {
+                &frame.provenance[roff..roff + rc]
+            };
             roff += rc;
 
             let mut sample_count: u32 = 0;
             let mut min_ts_ns = i64::MAX;
             let mut max_ts_ns = i64::MIN;
-            for r in &runs {
+            for r in run_slice {
                 let Some(sum) = sample_count.checked_add(r.sample_count) else {
                     return Err(SegmentError::FieldOverflow);
                 };
@@ -1044,6 +1203,12 @@ pub fn decode_catalog_v5_chunked(
             let Some(&series_id) = series_ids.get(abs) else {
                 return Err(SegmentError::SectionOutOfBounds);
             };
+            abs += 1;
+            let Some(label_set) = label_set else {
+                continue;
+            };
+            let runs: Vec<RunEntry> = run_slice.to_vec();
+            let per_sample_provenance = prov_slice.to_vec();
             entries.push(SeriesEntryV4 {
                 entry: SeriesEntry {
                     series_id: SeriesId(series_id),
@@ -1071,7 +1236,7 @@ pub fn decode_catalog_v5_chunked(
             run_total: u64::from(run_total),
         });
     }
-    if entries.len() != series_ids.len() {
+    if abs != series_ids.len() {
         return Err(SegmentError::BadChunkFrame);
     }
     Ok(entries)
@@ -1727,4 +1892,50 @@ fn push_raw(object: &mut Vec<u8>, sections: &mut Vec<Section>, kind: u32, bytes:
 fn align_to_8(object: &mut Vec<u8>) {
     let pad = (8 - (object.len() % 8)) % 8;
     object.extend(std::iter::repeat_n(0u8, pad));
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod resolve_equals_tests {
+    use super::resolve_equals;
+    use crate::reader::index_label_dict;
+    use crate::varint::write_uvarint;
+
+    fn dict(entries: &[&str]) -> Vec<u8> {
+        let mut out = (entries.len() as u32).to_le_bytes().to_vec();
+        for e in entries {
+            write_uvarint(&mut out, e.len() as u64);
+            out.extend_from_slice(e.as_bytes());
+        }
+        out
+    }
+
+    fn resolve(entries: &[&str], equals: &[(&str, &str)]) -> Option<Vec<(u64, u64)>> {
+        let bytes = dict(entries);
+        let index = index_label_dict(&bytes).expect("valid dictionary");
+        resolve_equals(&bytes, &index, equals)
+    }
+
+    /// The writer's byte-sorted dictionary resolves by binary search, and a
+    /// dictionary whose ordinals past 0 are not sorted (allowed by
+    /// docs/segment-format.md) resolves to the same strings' ordinals.
+    #[test]
+    fn resolves_sorted_and_unsorted_dictionaries() {
+        let sorted = ["__name__", "a", "b", "job", "m", "v0"];
+        assert_eq!(
+            resolve(&sorted, &[("__name__", "m"), ("job", "v0"), ("a", "b")]),
+            Some(vec![(0, 4), (3, 5), (1, 2)])
+        );
+        let unsorted = ["__name__", "v0", "m", "job", "b", "a"];
+        assert_eq!(
+            resolve(&unsorted, &[("__name__", "m"), ("job", "v0"), ("a", "b")]),
+            Some(vec![(0, 2), (3, 1), (5, 4)])
+        );
+        for entries in [&sorted, &unsorted] {
+            assert_eq!(resolve(entries, &[("job", "absent")]), None);
+            assert_eq!(resolve(entries, &[("absent", "v0")]), None);
+            assert_eq!(resolve(entries, &[("a", "b"), ("job", "absent")]), None);
+            assert_eq!(resolve(entries, &[]), Some(Vec::new()));
+        }
+    }
 }
