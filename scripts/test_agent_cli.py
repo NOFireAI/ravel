@@ -3,9 +3,11 @@
 import importlib.machinery
 import importlib.util
 import json
+import os
 import pathlib
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 _PATH = pathlib.Path(__file__).resolve().parent.parent / "bin" / "agent-cli"
@@ -63,12 +65,17 @@ class Findings(unittest.TestCase):
                          [(1, "should_fix", True), (4, "nit", False)])
         self.assertEqual(rows[0]["summary"], "the thing is wrong.")
 
-    def test_a_finding_carried_forward_to_a_new_head_is_not_counted_at_that_head(self):
+    def test_a_finding_re_anchored_to_head_is_still_open_at_head(self):
+        # GitHub moves commit_id to the new head when the commented line did
+        # not change, which means the finding was not fixed by the push.
         moved = [{"id": 7, "user": BOT, "commit_id": "H", "original_commit_id": "OLD",
-                  "path": "a.rs", "line": 1, "body": "should_fix: from the last round"}]
-        self.assertEqual(cli.classify_findings(moved, "H"), [])
-        self.assertEqual([r["commit"] for r in cli.classify_findings(moved, "H", all_commits=True)],
-                         ["OLD"])
+                  "path": "a.rs", "line": 1, "body": "should_fix: from the last round"},
+                 {"id": 8, "user": BOT, "commit_id": "OLD", "original_commit_id": "OLD",
+                  "path": "a.rs", "line": 2, "body": "should_fix: line changed since"}]
+        self.assertEqual([(r["id"], r["commit"]) for r in cli.classify_findings(moved, "H")],
+                         [(7, "OLD")])
+        self.assertEqual([r["id"] for r in cli.classify_findings(moved, "H", all_commits=True)],
+                         [7, 8])
 
     def test_all_commits_includes_older_findings(self):
         rows = cli.classify_findings(self.comments(), "H", all_commits=True)
@@ -187,12 +194,37 @@ class AdrSections(unittest.TestCase):
         self.assertEqual([(h["line"], h["level"], h["amendment"]) for h in heads],
                          [(1, 1, False), (3, 2, False), (8, 3, False), (10, 2, True)])
 
+    def test_status_needs_a_colon_and_a_bare_status_word_is_not_a_crash(self):
+        self.assertEqual(cli.adr_status("# A\n\n- Status: Accepted\n"), "Accepted")
+        self.assertEqual(cli.adr_status("# A\n\nstatus pending owner sign-off\n"), "")
+
+
     def test_a_section_runs_to_the_next_heading_of_its_level(self):
         hit, body = cli.section_text(self.TEXT, "decision")
         self.assertEqual(hit["line"], 3)
         self.assertTrue(body.startswith("## Decision"))
         self.assertIn("### Sub", body)
         self.assertNotIn("Amendment", body)
+
+
+class FleetConfig(unittest.TestCase):
+    def test_cp_env_accepts_the_export_form_like_the_orchestrator(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "cp.env"
+            p.write_text('export FLEET_PUBLIC_URL="https://cp.example/"\n  export FLEET_ENQUEUE_TOKEN=t\n')
+            keep = {k: os.environ.pop(k, None) for k in ("FLEET_CP_URL", "FLEET_PUBLIC_URL",
+                                                          "FLEET_ENQUEUE_TOKEN")}
+            os.environ["RAVEL_FLEET_CP_ENV"] = str(p)
+            try:
+                self.assertEqual(cli.cp_config(), ("https://cp.example", "t"))
+            finally:
+                os.environ.pop("RAVEL_FLEET_CP_ENV", None)
+                for k, v in keep.items():
+                    if v is not None:
+                        os.environ[k] = v
+
+    def test_expired_is_terminal(self):
+        self.assertIn("expired", cli.TERMINAL_TASK)
 
 
 class Parser(unittest.TestCase):
