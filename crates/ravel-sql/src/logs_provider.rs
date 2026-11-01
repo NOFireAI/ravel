@@ -4858,6 +4858,144 @@ mod tests {
         assert_eq!(run.gets(), [1, 1, 0]);
     }
 
+    /// An in-process worker: runs the unbudgeted logs worker fragment over the
+    /// slice its ticket pins, against the shared counting store.
+    #[cfg(feature = "flight-sql")]
+    #[derive(Debug)]
+    struct BudgetWorker {
+        store: Arc<KeyCountingStore>,
+    }
+
+    #[cfg(feature = "flight-sql")]
+    impl fmt::Debug for KeyCountingStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("KeyCountingStore")
+        }
+    }
+
+    #[cfg(feature = "flight-sql")]
+    impl WorkerSliceClient for BudgetWorker {
+        fn fetch_slice(
+            &self,
+            _location: &str,
+            ticket: &crate::flight_ticket::FlightTicket,
+            _limit: Option<usize>,
+            _context: &Arc<datafusion::execution::TaskContext>,
+        ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
+            let snapshot = ticket
+                .snapshot()
+                .map_err(|e| datafusion::error::DataFusionError::Internal(e.to_string()))?;
+            let backend: Arc<dyn ObjectStoreBackend> = self.store.clone();
+            let plan = LogsTableProvider::new(
+                snapshot,
+                TenantHash([7u8; 16]),
+                LogSegmentFetcher::new(backend),
+                PhaseAccounting::new(),
+            )
+            .worker_fragment(1)?;
+            datafusion::physical_plan::execute_stream(
+                plan,
+                Arc::new(datafusion::execution::TaskContext::default()),
+            )
+        }
+    }
+
+    /// Fan the three-object fixture out to one in-process worker slice and
+    /// collect the coordinator plan under `engine`'s budgets. Returns the row
+    /// count or the typed error, the logs lane's folded bytes, and the store.
+    #[cfg(feature = "flight-sql")]
+    async fn run_distributed(
+        engine: &ravel_query::EngineConfig,
+    ) -> (Result<usize, SqlError>, u64, Arc<KeyCountingStore>) {
+        use crate::distributed::WorkerSlice;
+        use crate::executor::TargetSignal;
+        use crate::flight_ticket::{FlightTicket, SegmentPin};
+        use crate::statement_accounting::StatementAccounting;
+
+        let (store, snapshot) = budget_fixture().await;
+        let ticket = FlightTicket {
+            tenant: TenantHash([7u8; 16]),
+            statement: String::new(),
+            segments: snapshot
+                .segments
+                .iter()
+                .map(SegmentPin::from_segment_ref)
+                .collect(),
+            min_commit_tokens: Vec::new(),
+            now_ns: 0,
+            deadline_ns: 1_000_000_000,
+            slice_index: 0,
+            slice_count: 1,
+            pending_erasure: Vec::new(),
+            declared_columns: Vec::new(),
+            parquet_tables: Vec::new(),
+            budgets: None,
+            signal_groups: Vec::new(),
+        };
+        let endpoints = vec![WorkerSlice {
+            location: "grpc://budget-worker-0".to_string(),
+            ticket,
+        }];
+        let statement = StatementAccounting::new();
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            LogSegmentFetcher::new(backend),
+            statement.lane(TargetSignal::Logs).clone(),
+        )
+        .with_scan_budget(statement.scan_budget(TargetSignal::Logs, engine))
+        .with_distributed_scan(
+            endpoints,
+            Arc::new(BudgetWorker {
+                store: store.clone(),
+            }),
+        );
+        let ctx = datafusion::prelude::SessionContext::new();
+        let plan = provider
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("plan");
+        let outcome = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .map(|batches| batches.iter().map(RecordBatch::num_rows).sum())
+            .map_err(|e| crate::executor::take_sql_error(e).expect("a SqlError"));
+        let folded = statement.pooled_snapshot().total_s3_bytes();
+        (outcome, folded, store)
+    }
+
+    /// The fan-out folds each worker batch into the logs lane and checks the
+    /// statement's effective byte budget, not `Unlimited`. The unbudgeted run
+    /// folds `total` bytes; a budget one byte under it refuses typed when the
+    /// last batch lands, and a budget of exactly `total` returns every row.
+    ///
+    /// FLIP: passing `ravel_query::ByteLimit::Unlimited` instead of
+    /// `self.scan_budget.max_bytes_scanned()` to `distributed_logs_plan` in
+    /// `LogsTableProvider::scan` returns all 12 rows under the lowered budget.
+    #[cfg(feature = "flight-sql")]
+    #[tokio::test]
+    async fn lowered_byte_budget_refuses_a_distributed_logs_scan() {
+        let (rows, total, store) = run_distributed(&ravel_query::EngineConfig::default()).await;
+        assert_eq!(rows.expect("unbudgeted run"), 12);
+        assert!(total > 0, "the fan-out folds worker bytes");
+        assert_eq!(
+            [0, 1, 2].map(|i| store.gets_of(&format!("budget/seg-{i}"))),
+            [1, 1, 1]
+        );
+
+        let (refused, folded, _) = run_distributed(&bytes_budget(total - 1)).await;
+        match refused {
+            Err(SqlError::TooManyBytesScanned { scanned, max }) => {
+                assert_eq!((scanned, max), (total, total - 1));
+            }
+            other => panic!("expected TooManyBytesScanned at {total} of {}, got {other:?}", total - 1),
+        }
+        assert_eq!(folded, total);
+
+        let (fits, _, _) = run_distributed(&bytes_budget(total)).await;
+        assert_eq!(fits.expect("a budget of exactly the folded total"), 12);
+    }
+
     /// Which statistics carriers a generated segment has for [`CODE`].
     #[derive(Clone, Copy, Debug)]
     enum Carriers {
