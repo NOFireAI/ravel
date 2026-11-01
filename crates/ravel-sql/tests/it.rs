@@ -144,6 +144,8 @@ mod parallel_final_default;
 mod parquet_ddl;
 #[path = "parquet_tables.rs"]
 mod parquet_tables;
+#[path = "peak_asked_bytes.rs"]
+mod peak_asked_bytes;
 #[path = "pipeline.rs"]
 mod pipeline;
 #[path = "pushdown_memory.rs"]
