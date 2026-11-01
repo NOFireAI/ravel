@@ -988,22 +988,27 @@ def nudge_table():
 def transcript_dirs():
     """This repository's Claude Code transcript directories on this machine.
 
-    A session's directory is named after the directory it started in, and
-    sessions here start in the primary checkout or in one of its worktrees,
-    whose paths extend the primary's (store, store-wt-3565), so the primary's
-    slug is a prefix of every one of them."""
+    A session's directory is named after the directory it started in. Sessions
+    here start in the primary checkout or in a worktree whose path is the
+    primary's plus a dash suffix (store, store-wt-3565), and a worktree is
+    often removed once its work merges, so the match is by name, not by the
+    live worktree list: the primary's slug exactly, or the slug followed by a
+    dash. A sibling checkout named with that same dash prefix is counted too."""
     common = Path(run(["git", "rev-parse", "--git-common-dir"], check=True)[1].strip()).resolve()
     slug = str(common.parent).replace("/", "-")
     projects = Path.home() / ".claude" / "projects"
-    return sorted(p for p in projects.glob(slug + "*") if p.is_dir())
+    return sorted(p for p in projects.glob(slug + "*")
+                  if p.is_dir() and (p.name == slug or p.name.startswith(slug + "-")))
 
 
-# Command position only: the start of the command or of a statement after
-# ; & | or (, or after a timeout/env/nohup prefix. A bare space is not a
-# command position, so a mention inside a quoted string does not count.
+# Command position only: the start of a line (indented or not) or of a
+# statement after ; & | ( then or do, then any VAR=value assignments and an
+# optional timeout, nohup or env prefix. A bare space is not a command
+# position, so a mention inside a quoted string does not count.
 AGENT_CLI_CALL = re.compile(
-    r"(?:^|[;&|(]\s*|\b(?:timeout\s+\d+[smh]?|nohup|env(?:\s+\w+=\S*)*)\s+)"
-    r"(?:\S*/)?agent-cli\s+(?:--json\s+)?([a-z-]+)")
+    r"(?:^|[;&|(]|\b(?:then|do)\b)[ \t]*(?:\w+=\S*\s+)*"
+    r"(?:(?:timeout\s+\d+[smh]?|nohup|env(?:\s+\w+=\S*)*)\s+)?"
+    r"(?:\S*/)?agent-cli\s+(?:--json\s+)?([a-z-]+)", re.MULTILINE)
 
 
 def subcommand_names():
@@ -1039,12 +1044,13 @@ def count_usage(paths, since, table, known):
                     continue
                 cmd = (part.get("input") or {}).get("command") or ""
                 counted = True
-                m = AGENT_CLI_CALL.search(cmd)
-                if m and m.group(1) in known:
-                    totals["agent_cli"] += 1
-                    sub = totals["agent_cli_by_subcommand"]
-                    sub[m.group(1)] = sub.get(m.group(1), 0) + 1
-                    continue
+                # Every call counts on both sides, and a command that runs
+                # agent-cli and a raw lookup contributes to both.
+                for m in AGENT_CLI_CALL.finditer(cmd):
+                    if m.group(1) in known:
+                        totals["agent_cli"] += 1
+                        sub = totals["agent_cli_by_subcommand"]
+                        sub[m.group(1)] = sub.get(m.group(1), 0) + 1
                 # Every pattern that matches counts: one Bash call can run
                 # several raw lookups, and each is a call agent-cli would replace.
                 for rx, sub_name in compiled:
@@ -1477,7 +1483,8 @@ def build_parser():
              "adoption figure; the per-subcommand rows say which lookups still go raw.")
     sp.add_argument("--since", default="2026-11-01", help="ISO date or timestamp; records before it are skipped")
     sp.add_argument("--dir", help="one transcript directory (default: every directory under ~/.claude/projects "
-                                  "named for the primary checkout or one of its worktrees)")
+                                  "named for the primary checkout path, or for that path plus a dash suffix, "
+                                  "which is how its worktrees are named)")
 
     sp = add("wt", cmd_wt, "worktrees: ls [--dirty] | new NAME [--ref R] [--branch B] | rm PATH [--force]",
              "new creates <primary>-wt-NAME from a fresh origin/main (detached unless --branch). "
