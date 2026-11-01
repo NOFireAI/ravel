@@ -30,6 +30,8 @@ use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
 use ravel_sql::{
     FlightTicket, MSG_UNSATISFIABLE, MinCommitToken, SqlError, TargetSignal, TicketKey,
 };
+use ravel_query::{QueryAdmissionController, QueryConcurrencyLimit};
+use ravel_types::accounting::NoopQueryCostRecorder;
 use ravel_types::{CommitToken, Signal, TenantHash, TenantId};
 use tonic::Code;
 use util::flight_harness::{Harness, MIN_COMMIT_TOKEN_KEY, statement_ticket};
@@ -57,8 +59,26 @@ fn sample_specs() -> Vec<SegSpec> {
 /// A harness over `store` whose tenant `acme` holds [`sample_specs`] and one
 /// logs object at 100, 150, 200 and 400.
 async fn harness_over(store: Arc<dyn ObjectStoreBackend>) -> (Harness, TenantId) {
+    harness_admitting(
+        store,
+        QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+    )
+    .await
+}
+
+/// [`harness_over`], admitting queries through `admission`.
+async fn harness_admitting(
+    store: Arc<dyn ObjectStoreBackend>,
+    admission: Arc<QueryAdmissionController>,
+) -> (Harness, TenantId) {
     let tenant = tenant_id("acme");
-    let harness = Harness::build(store, &[(&tenant, &sample_specs())]).await;
+    let harness = Harness::build_with_admission(
+        store,
+        &[(&tenant, &sample_specs())],
+        Arc::new(NoopQueryCostRecorder),
+        admission,
+    )
+    .await;
     util::publish_logs(harness.store.as_ref(), &tenant, 0, &[100, 150, 200, 400]).await;
     (harness, tenant)
 }
@@ -91,14 +111,16 @@ fn decode(ticket: &Ticket, key: &TicketKey) -> FlightTicket {
     FlightTicket::decode(&statement_ticket(ticket).statement_handle, key).expect("ticket decodes")
 }
 
-/// Writes a real `.dreq` for `signal` erasing `key=value`, picked up by the
-/// next resolve of that signal.
+/// Writes a real `.dreq` for `signal` erasing `key=value` over the event-time
+/// `window` (zero bounds are unset), picked up by the next resolve of that
+/// signal.
 async fn put_dreq(
     store: &dyn ObjectStoreBackend,
     tenant: TenantHash,
     sig: Signal,
     key: &str,
     value: &str,
+    (window_start_ns, window_end_ns): (i64, i64),
 ) {
     let request_id = Uuid::new_v4();
     let request = ErasureRequest {
@@ -111,8 +133,8 @@ async fn put_dreq(
             key: key.to_string(),
             value: value.to_string(),
         }],
-        window_start_ns: 0,
-        window_end_ns: 0,
+        window_start_ns,
+        window_end_ns,
         reason: String::new(),
     };
     let object_key = keys::erasure_request_key(&tenant, sig, request_id).expect("dreq key");
@@ -247,10 +269,54 @@ async fn v10_groups_that_differ_from_the_statement_are_refused_before_any_store_
     );
 }
 
-/// Each group carries the erasure its own resolve saw pending: a `.dreq`
-/// erasing `mem` removes the joined row at 150, and the same honestly
-/// resolved ticket with the samples group's erasure cleared, re-signed under
-/// the real key, brings it back.
+/// The group mismatch is refused before `DoGet` asks for an admission
+/// permit: with the only permit held elsewhere, the forged ticket still reads
+/// INVALID_ARGUMENT rather than RESOURCE_EXHAUSTED, and the held permit is
+/// the only one in flight. FLIP: a `DoGet` that admits before it checks the
+/// groups answers RESOURCE_EXHAUSTED.
+#[tokio::test]
+async fn a_v10_group_mismatch_is_refused_before_an_admission_permit() {
+    let counting = CountingStore::new(Arc::new(MemoryStore::new()));
+    let admission = QueryAdmissionController::shared(QueryConcurrencyLimit::Bounded(1));
+    let (harness, _) = harness_admitting(
+        Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>,
+        Arc::clone(&admission),
+    )
+    .await;
+
+    let ticket = harness
+        .get_flight_info("acme", JOIN)
+        .await
+        .expect("flight info");
+    let key = harness.service.ticket_key();
+    let mut forged = decode(&ticket, key);
+    forged.signal_groups[1].signal = TargetSignal::Spans;
+    let handle = forged.encode(key).expect("re-encode");
+
+    let held = admission.try_admit().expect("the only permit");
+    assert_eq!(admission.in_flight(), 1);
+    let before = counting.total_ops();
+    let err = harness
+        .do_get("acme", &wrap(handle))
+        .await
+        .expect_err("groups samples,spans cannot answer samples JOIN logs");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    assert_eq!(admission.in_flight(), 1, "no second permit was taken");
+    assert_eq!(
+        counting.total_ops(),
+        before,
+        "refused before any store request"
+    );
+    drop(held);
+}
+
+/// Each group carries the erasure its own resolve saw pending: a samples
+/// `.dreq` erasing `mem` removes the joined row at 150, a logs `.dreq`
+/// erasing `service.name=web` over `[200, 201)` removes the joined row at
+/// 200, and the same honestly resolved ticket with one group's erasure
+/// cleared, re-signed under the real key, brings back exactly that group's
+/// row. FLIP: a redemption that gives every lane the first group's erasure
+/// keeps the logs row at 200 in the honest read.
 #[tokio::test]
 async fn each_signal_group_carries_its_own_pending_erasure() {
     let store = Arc::new(MemoryStore::new());
@@ -261,6 +327,16 @@ async fn each_signal_group_carries_its_own_pending_erasure() {
         Signal::Metrics,
         "__name__",
         "mem",
+        (0, 0),
+    )
+    .await;
+    put_dreq(
+        store.as_ref(),
+        tenant.hash(),
+        Signal::Logs,
+        "service.name",
+        "web",
+        (200, 201),
     )
     .await;
 
@@ -269,19 +345,22 @@ async fn each_signal_group_carries_its_own_pending_erasure() {
         .await
         .expect("flight info");
     let key = harness.service.ticket_key();
-    let mut cleared = decode(&ticket, key);
-    assert_eq!(cleared.signal_groups[0].pending_erasure.len(), 1);
-    assert!(cleared.signal_groups[1].pending_erasure.is_empty());
+    let honest_groups = decode(&ticket, key);
+    assert_eq!(honest_groups.signal_groups[0].pending_erasure.len(), 1);
+    assert_eq!(honest_groups.signal_groups[1].pending_erasure.len(), 1);
 
     let honest = harness.do_get("acme", &ticket).await.expect("do get");
-    assert_eq!(first_column(&honest), vec![100, 200]);
+    assert_eq!(first_column(&honest), vec![100]);
 
-    cleared.signal_groups[0].pending_erasure.clear();
-    let leaked = harness
-        .do_get("acme", &wrap(cleared.encode(key).expect("re-encode")))
-        .await
-        .expect("do get with cleared erasure");
-    assert_eq!(first_column(&leaked), vec![100, 150, 200]);
+    for (group, expected) in [(0, vec![100, 150]), (1, vec![100, 200])] {
+        let mut cleared = honest_groups.clone();
+        cleared.signal_groups[group].pending_erasure.clear();
+        let leaked = harness
+            .do_get("acme", &wrap(cleared.encode(key).expect("re-encode")))
+            .await
+            .expect("do get with cleared erasure");
+        assert_eq!(first_column(&leaked), expected, "group {group} cleared");
+    }
 }
 
 /// A two-signal statement returns the same rows over Flight SQL as over

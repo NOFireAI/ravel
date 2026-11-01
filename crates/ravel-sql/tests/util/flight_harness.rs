@@ -153,6 +153,25 @@ impl Harness {
         tenants: &[(&TenantId, &[SegSpec])],
         recorder: Arc<dyn QueryCostRecorder>,
     ) -> Self {
+        Harness::build_with_admission(
+            store,
+            tenants,
+            recorder,
+            ravel_query::QueryAdmissionController::shared(
+                ravel_query::QueryConcurrencyLimit::Unlimited,
+            ),
+        )
+        .await
+    }
+
+    /// Like [`Harness::build_with_recorder`], but admitting queries through
+    /// `admission`, so a test can hold its permits.
+    pub async fn build_with_admission(
+        store: Arc<dyn ObjectStoreBackend>,
+        tenants: &[(&TenantId, &[SegSpec])],
+        recorder: Arc<dyn QueryCostRecorder>,
+        admission: Arc<ravel_query::QueryAdmissionController>,
+    ) -> Self {
         let fixture =
             Fixture::build(Arc::clone(&store), tenants, SqlConfig::default(), 1 << 30).await;
         let executor = Arc::new(SqlExecutor::new(
@@ -182,9 +201,7 @@ impl Harness {
                 ..FlightSqlConfig::default()
             },
             recorder,
-            ravel_query::QueryAdmissionController::shared(
-                ravel_query::QueryConcurrencyLimit::Unlimited,
-            ),
+            admission,
         );
         Harness {
             service,
