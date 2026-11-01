@@ -11,11 +11,11 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly twenty-five label keys:
+//! renders exactly twenty-six label keys:
 //! `tenant_hash`, `signal`, `mode`, `op`, `error_kind`, `workload_class`,
 //! `level`, `reason`, `shard`, `cache`, `tier`, `intent`, `kind`, `outcome`,
 //! `allocator`, `stat`, `component`, `class`, `carrier`, `gate`, `site`,
-//! `worker`, `family`, `variant`, and `phase` (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
+//! `worker`, `family`, `variant`, `phase`, and `source` (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
 //! admission-rejection family and reused by ADR-0059 section 2 for the scrub
 //! seal-divergence family, `shard` added by ADR-1692 decision 2 as the ninth
 //! key for the per-shard ingest-skew family, `cache` to split the read-cache
@@ -38,13 +38,15 @@
 //! ADR-1746 for the format-floor families, `variant` added by ADR-2993
 //! decision 3 for the IPCrypt values counter, and `phase` added
 //! by issue #2374 for the SQL DDL store-cost families and rendered in every
-//! build since issue #3533 for the logs phase histograms). The keys come from
-//! forty-four `Label` variants, forty-seven in a `sql` build (`DdlKind`,
-//! `DdlOutcome` and `DdlPhase`) and forty-eight in a `flight-sql` build,
+//! build since issue #3533 for the logs phase histograms, and `source` added
+//! by ADR-3541 decision 3 for the subject-drop counter). The keys come from
+//! forty-six `Label` variants, forty-nine in a `sql` build (`DdlKind`,
+//! `DdlOutcome` and `DdlPhase`) and fifty in a `flight-sql` build,
 //! which enables `sql`, because some variants share a
 //! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason`,
 //! `AlertRetentionSkipReason`, `SupersededHeldReason`,
-//! `CapabilityRejectReason`, `WorkerRecordRejectReason` and, in a
+//! `CapabilityRejectReason`, `WorkerRecordRejectReason`,
+//! `AuthSubjectDropReason` and, in a
 //! `flight-sql` build,
 //! `SliceRejectReason` all render `reason`,
 //! `Level` (log/tracing
@@ -460,6 +462,17 @@ pub enum Label {
     /// label spelling and shares it between the two registries. Shares the
     /// `reason` key with the other reason variants.
     WorkerRecordRejectReason(ravel_fleet::record_auth::RecordReject),
+    /// Which source dropped a subject on a
+    /// `ravel_auth_subject_dropped_total` sample (ADR-3541 decision 3):
+    /// `static_token`, `oidc` or `mtls`. A closed enum owned by
+    /// `ravel_tenant_resolve`, which also owns the spelling.
+    AuthSubjectSource(ravel_tenant_resolve::SubjectSource),
+    /// Why a source dropped a subject on a
+    /// `ravel_auth_subject_dropped_total` sample: `missing`, `not_string`,
+    /// `empty`, `too_long` or `charset`. A closed enum owned by
+    /// `ravel_tenant_resolve`. Shares the `reason` key with the other reason
+    /// variants.
+    AuthSubjectDropReason(ravel_tenant_resolve::SubjectDropReason),
     /// Which publication phase a `ravel_agents_store_*` sample counts:
     /// `resolve`, `build`, `store` or `publish`. A closed enum owned by
     /// `ravel_agents_store`; present only in an `agents` build. Shares the
@@ -753,6 +766,8 @@ impl Label {
             Label::IpcryptVariant(_) => "variant",
             Label::IpcryptOutcome(_) => "outcome",
             Label::WorkerRecordRejectReason(_) => "reason",
+            Label::AuthSubjectSource(_) => "source",
+            Label::AuthSubjectDropReason(_) => "reason",
             #[cfg(feature = "agents")]
             Label::AgentsStorePhase(_) => "phase",
             #[cfg(feature = "agents")]
@@ -818,6 +833,8 @@ impl Label {
             Label::IpcryptVariant(variant) => ipcrypt_variant_name(*variant).to_string(),
             Label::IpcryptOutcome(outcome) => ipcrypt_outcome_name(*outcome).to_string(),
             Label::WorkerRecordRejectReason(reason) => reason.reason().to_string(),
+            Label::AuthSubjectSource(source) => source.as_str().to_string(),
+            Label::AuthSubjectDropReason(reason) => reason.as_str().to_string(),
             #[cfg(feature = "agents")]
             Label::AgentsStorePhase(phase) => agents_store_phase_name(*phase).to_string(),
             #[cfg(feature = "agents")]
@@ -5215,6 +5232,41 @@ pub struct DurableAuthCountersSnapshot {
 /// [`render_catalog_family`] and [`render_store_probe_family`] above. Rendered
 /// only when a `DurableAuthState` exists, so a process with no keyed deployment
 /// omits the whole family rather than exporting three permanent zeros.
+const AUTH_SUBJECT_DROPPED: &str = "ravel_auth_subject_dropped_total";
+
+/// `ravel_auth_subject_dropped_total{mode,source,reason}`: one sample per
+/// (source, reason) pair in `snapshot`, zeros included, so the family is
+/// present before the first drop
+/// (`auth_subject_dropped_family_renders_each_source_and_reason_once`).
+fn render_auth_subject_family(
+    out: &mut String,
+    mode: Mode,
+    snapshot: &[(
+        ravel_tenant_resolve::SubjectSource,
+        ravel_tenant_resolve::SubjectDropReason,
+        u64,
+    )],
+) {
+    write_header(
+        out,
+        AUTH_SUBJECT_DROPPED,
+        "Authenticated requests whose subject was left absent, by source and reason: the configured claim was missing, not a string, or outside the subject bound. The request still authenticated (ADR-3541 decision 3).",
+        "counter",
+    );
+    for &(source, reason, count) in snapshot {
+        write_sample(
+            out,
+            AUTH_SUBJECT_DROPPED,
+            &[
+                Label::Mode(mode),
+                Label::AuthSubjectSource(source),
+                Label::AuthSubjectDropReason(reason),
+            ],
+            count,
+        );
+    }
+}
+
 fn render_durable_auth_family(
     out: &mut String,
     mode: Mode,
@@ -9375,6 +9427,15 @@ pub fn render(
     if let Some(snapshot) = durable_auth {
         render_durable_auth_family(&mut out, mode, snapshot);
     }
+    // Every mode but `Maintain` serves a route behind the tenant resolver,
+    // whose counters are process-global like `crate::drain_overrun_total`.
+    if !matches!(mode, Mode::Maintain) {
+        render_auth_subject_family(
+            &mut out,
+            mode,
+            &crate::tenant::subject_drop_counters().snapshot(),
+        );
+    }
     if let Some(metrics) = audit_pipeline_metrics {
         render_audit_family(&mut out, mode, metrics);
     }
@@ -10514,6 +10575,8 @@ mod tests {
             Label::IpcryptVariant(ravel_ipcrypt::policy::Variant::Deterministic),
             Label::IpcryptOutcome(ravel_ipcrypt::render::RenderOutcome::Encrypted),
             Label::WorkerRecordRejectReason(ravel_fleet::query_workers::RecordReject::MissingMac),
+            Label::AuthSubjectSource(ravel_tenant_resolve::SubjectSource::Oidc),
+            Label::AuthSubjectDropReason(ravel_tenant_resolve::SubjectDropReason::Missing),
             Label::FlushPhase(FlushPhase::Total),
             Label::StrictAckPhase(StrictAckPhase::Request),
         ];
@@ -10574,6 +10637,8 @@ mod tests {
                 Label::IpcryptVariant(_) => "variant",
                 Label::IpcryptOutcome(_) => "outcome",
                 Label::WorkerRecordRejectReason(_) => "reason",
+                Label::AuthSubjectSource(_) => "source",
+                Label::AuthSubjectDropReason(_) => "reason",
                 #[cfg(feature = "agents")]
                 Label::AgentsStorePhase(_) => "phase",
                 #[cfg(feature = "agents")]
@@ -10671,6 +10736,11 @@ mod tests {
                 // WorkerRecordRejectReason (ADR-1918 decision 4) reuses
                 // the `reason` key.
                 "reason",
+                // AuthSubjectSource (ADR-3541 decision 3) is the
+                // twenty-sixth key, for the subject-drop counter only.
+                "source",
+                // AuthSubjectDropReason reuses the `reason` key.
+                "reason",
                 // FlushPhase (issue #3533) puts the `phase` key in the default
                 // build, for the logs flush-phase histogram.
                 "phase",
@@ -10685,18 +10755,19 @@ mod tests {
              family), #532's `outcome`, #1170's `allocator`/`stat`, ADR-1170 decision 4's \
              `component`, ADR-0071's `class` (issue #1722), ADR-0873 decision 2's `carrier`, \
              ADR-1702 decision 11's `gate`/`site`/`worker`, ADR-1746's `family`, ADR-2993's \
-             `variant`, issue #3533's `phase`, and issue #1686's `level` reuse by `ScrubLevel`"
+             `variant`, issue #3533's `phase`, ADR-3541's `source`, and issue #1686's `level` \
+             reuse by `ScrubLevel`"
         );
         assert_eq!(
             one_of_each.len(),
-            44,
-            "exactly 44 label variants every build has, 25 distinct keys (sql adds DdlKind, \
+            46,
+            "exactly 46 label variants every build has, 26 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
             keys.iter().collect::<HashSet<_>>().len(),
-            25,
-            "exactly 25 distinct keys"
+            26,
+            "exactly 26 distinct keys"
         );
     }
 

@@ -925,6 +925,91 @@ async fn metrics_render_cpu_gate_and_runtime_families_once() {
     }
 }
 
+/// `ravel_auth_subject_dropped_total` (ADR-3541 decision 3) renders one HELP
+/// line, one TYPE line and one sample per (source, reason) pair in every mode
+/// that serves routes behind the auth resolver, zeros included, and carries a
+/// recorded drop as its exact count. The first scrape runs before any drop,
+/// so the family is present from start. Maintain serves no such route and
+/// renders no family. Nothing else in this binary records a subject drop, so
+/// every figure is exact. Flip to watch it fail: render the family only once
+/// a count is nonzero in `render_auth_subject_family`, or drop the
+/// `Label::AuthSubjectDropReason` label from its sample.
+#[tokio::test]
+async fn auth_subject_dropped_family_renders_each_source_and_reason_once() {
+    use ravel_tenant_resolve::{SubjectDropReason, SubjectSource};
+
+    let running = start_test_server(Mode::All, u64::MAX, false).await;
+    assert_auth_subject_family(&scrape(&running).await, "all", 0);
+    running.shutdown().await.expect("graceful shutdown");
+
+    for _ in 0..3 {
+        ravel_server::tenant::subject_drop_counters()
+            .record(SubjectSource::Mtls, SubjectDropReason::TooLong);
+    }
+    for (mode, mode_label) in [
+        (Mode::All, "all"),
+        (Mode::Gateway, "gateway"),
+        (Mode::Query, "query"),
+    ] {
+        let running = start_test_server(mode, u64::MAX, false).await;
+        assert_auth_subject_family(&scrape(&running).await, mode_label, 3);
+        running.shutdown().await.expect("graceful shutdown");
+    }
+
+    let running = start_test_server(Mode::Maintain, u64::MAX, false).await;
+    let body = scrape(&running).await;
+    assert!(
+        !body.contains(AUTH_SUBJECT_DROPPED),
+        "maintain renders no family:\n{body}"
+    );
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+const AUTH_SUBJECT_DROPPED: &str = "ravel_auth_subject_dropped_total";
+
+/// Asserts `body` holds the subject-drop family's HELP and TYPE lines once
+/// and exactly one sample per (source, reason) pair, each 0 except
+/// `(mtls, too_long)`, which is `mtls_too_long`.
+fn assert_auth_subject_family(body: &str, mode_label: &str, mtls_too_long: u64) {
+    let family = AUTH_SUBJECT_DROPPED;
+    assert_eq!(
+        body.matches(&format!("# HELP {family} ")).count(),
+        1,
+        "mode {mode_label}: one HELP line:\n{body}"
+    );
+    assert_eq!(
+        body.matches(&format!("# TYPE {family} counter\n")).count(),
+        1,
+        "mode {mode_label}: one TYPE line:\n{body}"
+    );
+    let mut expected = 0;
+    for source in ["static_token", "oidc", "mtls"] {
+        for reason in ["missing", "not_string", "empty", "too_long", "charset"] {
+            let count = if (source, reason) == ("mtls", "too_long") {
+                mtls_too_long
+            } else {
+                0
+            };
+            let line = format!(
+                "{family}{{mode=\"{mode_label}\",source=\"{source}\",reason=\"{reason}\"}} {count}"
+            );
+            assert_eq!(
+                body.lines().filter(|rendered| *rendered == line).count(),
+                1,
+                "mode {mode_label}: {line:?} must render exactly once:\n{body}"
+            );
+            expected += 1;
+        }
+    }
+    assert_eq!(
+        body.lines()
+            .filter(|line| line.starts_with(&format!("{family}{{")))
+            .count(),
+        expected,
+        "mode {mode_label}: one sample per pair and no others"
+    );
+}
+
 /// Scrapes `/metrics` once and returns the body.
 async fn scrape(running: &ravel_server::Running) -> String {
     reqwest::Client::new()

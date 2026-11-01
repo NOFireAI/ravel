@@ -5,9 +5,12 @@
 //!
 //! The kernel also appends an audit event to the effect's turn's event
 //! stream, but that event names no caller (issue #3408). This one names the
-//! caller as far as a [`Principal`] can: its tenant and the capabilities it
-//! holds. A principal carries no subject or token name, so two admins of one
-//! tenant are not told apart here either.
+//! caller as far as a [`Principal`] can: its tenant, the capabilities it
+//! holds, and its subject with the subject's source when the caller's token
+//! or claim carries one (ADR-3541;
+//! `reconcile_and_destroy_records_name_each_admins_configured_subject_and_a_token_without_one_writes_no_subject_attr`
+//! in `tests/agents_effects_e2e.rs`). Two admins of one tenant whose tokens
+//! carry no subject are still not told apart here.
 //!
 //! The record is submitted before the reconcile or destroy changes HEAD, not
 //! after. In
@@ -78,6 +81,34 @@ fn capabilities(principal: &Principal) -> String {
     .join(",")
 }
 
+/// The attributes that name `principal`: its tenant, its capabilities and,
+/// only when it carries a subject, the subject and its source. A principal
+/// with no subject writes neither key, rather than an empty value
+/// (`the_events_omit_the_subject_attrs_when_the_principal_has_none`).
+fn principal_attrs(principal: &Principal) -> Vec<(String, AttrValue)> {
+    let mut attrs = vec![
+        (
+            "agents.principal.tenant".to_string(),
+            AttrValue::Str(principal.tenant.as_str().into()),
+        ),
+        (
+            "agents.principal.capabilities".to_string(),
+            AttrValue::Str(capabilities(principal)),
+        ),
+    ];
+    if let Some(subject) = &principal.subject {
+        attrs.push((
+            "agents.principal.subject".to_string(),
+            AttrValue::Str(subject.value().into()),
+        ));
+        attrs.push((
+            "agents.principal.subject_source".to_string(),
+            AttrValue::Str(subject.source().as_str().into()),
+        ));
+    }
+    attrs
+}
+
 /// One agents audit event recording that `principal` reconciled `attempt` of
 /// the effect `effect` (its handle) with `action`.
 pub fn agents_reconcile_audit_event(
@@ -89,20 +120,15 @@ pub fn agents_reconcile_audit_event(
     action: ReconcileAction,
 ) -> AuditEvent {
     let (stream_id, stream_attrs) = agents_stream();
-    let attrs = vec![
+    let mut attrs = vec![
         (
             "kind".to_string(),
             AttrValue::Str(KIND_AGENTS_RECONCILE.into()),
         ),
         ("agents.tenant".to_string(), AttrValue::Str(tenant.to_hex())),
-        (
-            "agents.principal.tenant".to_string(),
-            AttrValue::Str(principal.tenant.as_str().into()),
-        ),
-        (
-            "agents.principal.capabilities".to_string(),
-            AttrValue::Str(capabilities(principal)),
-        ),
+    ];
+    attrs.extend(principal_attrs(principal));
+    attrs.extend([
         ("agents.effect".to_string(), AttrValue::Str(effect.into())),
         (
             "agents.attempt".to_string(),
@@ -112,7 +138,7 @@ pub fn agents_reconcile_audit_event(
             "agents.decision".to_string(),
             AttrValue::Str(action.as_str().into()),
         ),
-    ];
+    ]);
     AuditEvent {
         tenant: *tenant,
         now_ns,
@@ -140,20 +166,15 @@ pub fn agents_destroy_audit_event(
     abandoned: &AbandonedCounts,
 ) -> AuditEvent {
     let (stream_id, stream_attrs) = agents_stream();
-    let attrs = vec![
+    let mut attrs = vec![
         (
             "kind".to_string(),
             AttrValue::Str(KIND_AGENTS_DESTROY.into()),
         ),
         ("agents.tenant".to_string(), AttrValue::Str(tenant.to_hex())),
-        (
-            "agents.principal.tenant".to_string(),
-            AttrValue::Str(principal.tenant.as_str().into()),
-        ),
-        (
-            "agents.principal.capabilities".to_string(),
-            AttrValue::Str(capabilities(principal)),
-        ),
+    ];
+    attrs.extend(principal_attrs(principal));
+    attrs.extend([
         (
             "agents.agent_id".to_string(),
             AttrValue::Str(agent_id.into()),
@@ -182,7 +203,7 @@ pub fn agents_destroy_audit_event(
             "agents.abandoned.timers_scheduled".to_string(),
             AttrValue::Str(abandoned.timers_scheduled.to_string()),
         ),
-    ];
+    ]);
     AuditEvent {
         tenant: *tenant,
         now_ns,
@@ -209,15 +230,72 @@ fn agents_stream() -> (LogStreamId, Vec<u8>) {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use ravel_tenant_resolve::{Subject, SubjectSource};
     use ravel_types::TenantId;
 
+    /// An `agents_admin` of `tenant` whose static token carries the subject
+    /// `alice`.
+    fn admin_with_subject(tenant: &TenantId) -> Principal {
+        Principal {
+            agents_admin: true,
+            subject: Some(
+                Subject::new(SubjectSource::StaticToken, "alice").expect("a valid subject"),
+            ),
+            ..Principal::tenant_only(tenant.clone())
+        }
+    }
+
+    fn keys(event: &AuditEvent) -> Vec<&str> {
+        event.attrs.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    /// Flip to watch it fail: push the two subject keys with an empty value
+    /// when `principal.subject` is `None` in `principal_attrs`.
     #[test]
-    fn the_event_names_tenant_effect_attempt_decision_and_caller() {
+    fn the_events_omit_the_subject_attrs_when_the_principal_has_none() {
         let tenant = TenantId::new("acme");
         let principal = Principal {
             agents_admin: true,
             ..Principal::tenant_only(tenant.clone())
         };
+        let reconcile = agents_reconcile_audit_event(
+            &tenant.hash(),
+            7,
+            &principal,
+            "effect-handle",
+            2,
+            ReconcileAction::Retry,
+        );
+        let destroy = agents_destroy_audit_event(
+            &tenant.hash(),
+            7,
+            &principal,
+            "agent-hex",
+            2,
+            &AbandonedCounts::default(),
+        );
+        for event in [&reconcile, &destroy] {
+            let keys = keys(event);
+            assert!(
+                !keys.contains(&"agents.principal.subject"),
+                "{}: {keys:?}",
+                event.body
+            );
+            assert!(
+                !keys.contains(&"agents.principal.subject_source"),
+                "{}: {keys:?}",
+                event.body
+            );
+            assert_eq!(keys[3], "agents.principal.capabilities", "{keys:?}");
+        }
+        assert_eq!(reconcile.attrs.len(), 7);
+        assert_eq!(destroy.attrs.len(), 11);
+    }
+
+    #[test]
+    fn the_event_names_tenant_effect_attempt_decision_and_caller() {
+        let tenant = TenantId::new("acme");
+        let principal = admin_with_subject(&tenant);
         let event = agents_reconcile_audit_event(
             &tenant.hash(),
             7,
@@ -255,6 +333,23 @@ mod tests {
         );
         assert_eq!(attr("agents.attempt"), AttrValue::Str("2".into()));
         assert_eq!(attr("agents.decision"), AttrValue::Str("retry".into()));
+        assert_eq!(
+            attr("agents.principal.subject"),
+            AttrValue::Str("alice".into())
+        );
+        assert_eq!(
+            attr("agents.principal.subject_source"),
+            AttrValue::Str("static_token".into())
+        );
+        assert_eq!(
+            keys(&event)[3..6],
+            [
+                "agents.principal.capabilities",
+                "agents.principal.subject",
+                "agents.principal.subject_source"
+            ]
+        );
+        assert_eq!(event.attrs.len(), 9);
     }
 
     /// Builds the event from the counts read off a HEAD, then grows that
@@ -267,10 +362,7 @@ mod tests {
         use ravel_agents_core::identity::Hash256;
 
         let tenant = TenantId::new("acme");
-        let principal = Principal {
-            agents_admin: true,
-            ..Principal::tenant_only(tenant.clone())
-        };
+        let principal = admin_with_subject(&tenant);
         let entry = |accept_seq: u64| InboxEntry {
             accept_seq,
             handler: "place".to_string(),
@@ -310,7 +402,23 @@ mod tests {
                 .map(|(_, v)| v.clone())
                 .expect("attr present")
         };
-        assert_eq!(event.attrs.len(), 11);
+        assert_eq!(event.attrs.len(), 13);
+        assert_eq!(
+            keys(&event)[3..6],
+            [
+                "agents.principal.capabilities",
+                "agents.principal.subject",
+                "agents.principal.subject_source"
+            ]
+        );
+        assert_eq!(
+            attr("agents.principal.subject"),
+            AttrValue::Str("alice".into())
+        );
+        assert_eq!(
+            attr("agents.principal.subject_source"),
+            AttrValue::Str("static_token".into())
+        );
         assert_eq!(event.tenant, tenant.hash());
         assert_eq!(event.now_ns, 7);
         assert_eq!(event.severity_text, "INFO");

@@ -9,7 +9,7 @@ use ravel_query::http::{
     DevHeaderTenantResolver, MtlsResolver, OidcJwksCache, OidcResolver, StaticBearerTokenResolver,
     TenantResolver,
 };
-use ravel_tenant_resolve::Principal;
+use ravel_tenant_resolve::{Principal, SubjectDropCounters};
 use ravel_types::TenantId;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -49,6 +49,19 @@ pub struct ResolverBundle {
     /// dedicated `--mtls-listener` chain only; it must never be merged into
     /// `resolver`, which backs every public listener.
     pub mtls_resolver: Option<Arc<dyn TenantResolver>>,
+    /// The counters the OIDC resolver records a dropped subject in, the same
+    /// [`subject_drop_counters`] handle `/metrics` renders as
+    /// `ravel_auth_subject_dropped_total`.
+    pub subject_drops: Arc<SubjectDropCounters>,
+}
+
+/// The process's subject-drop counters (ADR-3541 decision 3). One set per
+/// process, as there is one resolver chain per process, so `/metrics` reads
+/// them without a handle threaded through the server configuration.
+pub fn subject_drop_counters() -> Arc<SubjectDropCounters> {
+    static COUNTERS: std::sync::LazyLock<Arc<SubjectDropCounters>> =
+        std::sync::LazyLock::new(|| Arc::new(SubjectDropCounters::default()));
+    Arc::clone(&COUNTERS)
 }
 
 /// Inputs for the JWKS refresh task: the cache the request-path `OidcResolver`
@@ -118,8 +131,9 @@ pub fn build_auth_resolver(
     )
 }
 
-/// The boolean OIDC claims that grant a capability, each `None` (never granted
-/// via OIDC) by default.
+/// The OIDC claims the resolver reads beyond the tenant: the boolean ones
+/// that grant a capability and the subject claim, each `None` (never read
+/// from OIDC) by default.
 #[derive(Debug, Clone, Default)]
 pub struct OidcCapabilityClaims {
     /// `--oidc-ddl-claim` (ADR-2040 decision 4).
@@ -132,6 +146,9 @@ pub struct OidcCapabilityClaims {
     pub agents_worker: Option<String>,
     /// `--oidc-agents-admin-claim` (ADR-3331 decision 9).
     pub agents_admin: Option<String>,
+    /// `--oidc-subject-claim` (ADR-3541 decision 3): the string claim read as
+    /// the principal's subject, not a capability grant.
+    pub subject: Option<String>,
 }
 
 /// Same as [`build_auth_resolver`], but the static bearer map carries a
@@ -158,6 +175,7 @@ pub fn build_auth_resolver_with_principals(
             (&claims.agents, "--oidc-agents-claim"),
             (&claims.agents_worker, "--oidc-agents-worker-claim"),
             (&claims.agents_admin, "--oidc-agents-admin-claim"),
+            (&claims.subject, "--oidc-subject-claim"),
         ] {
             if claim.is_some() {
                 anyhow::bail!(
@@ -178,6 +196,7 @@ pub fn build_auth_resolver_with_principals(
         resolvers.push(Arc::new(DevHeaderTenantResolver::default()));
     }
 
+    let subject_drops = subject_drop_counters();
     let mut oidc_refresh = None;
     if let Some(oidc) = auth.oidc {
         let cache = Arc::new(
@@ -204,6 +223,9 @@ pub fn build_auth_resolver_with_principals(
         if let Some(agents_admin_claim) = claims.agents_admin {
             oidc_resolver = oidc_resolver.with_agents_admin_claim(agents_admin_claim);
         }
+        if let Some(subject_claim) = claims.subject {
+            oidc_resolver = oidc_resolver.with_subject_claim(subject_claim, subject_drops.clone());
+        }
         resolvers.push(Arc::new(oidc_resolver));
         oidc_refresh = Some(OidcRefreshParams {
             cache,
@@ -217,6 +239,7 @@ pub fn build_auth_resolver_with_principals(
         resolver,
         oidc_refresh,
         mtls_resolver,
+        subject_drops,
     })
 }
 
@@ -446,10 +469,142 @@ mod tests {
                 agents: Some("ravel_agents".to_string()),
                 agents_worker: Some("ravel_agents_worker".to_string()),
                 agents_admin: Some("ravel_agents_admin".to_string()),
+                subject: Some("sub".to_string()),
             },
         )
         .expect("capability claims with OIDC configured build");
         assert!(bundle.oidc_refresh.is_some());
+    }
+
+    /// Flip to watch it fail: delete the `--oidc-subject-claim` entry from
+    /// the no-OIDC check in `build_auth_resolver_with_principals`.
+    #[test]
+    fn oidc_subject_claim_without_oidc_refuses_startup() {
+        let err = build_auth_resolver_with_principals(
+            HashMap::new(),
+            false,
+            AuthResolverSettings::default(),
+            OidcCapabilityClaims {
+                subject: Some("email".to_string()),
+                ..OidcCapabilityClaims::default()
+            },
+        )
+        .err()
+        .expect("a subject claim with no OIDC must fail");
+        assert!(
+            err.to_string()
+                .contains("--oidc-subject-claim was set but OIDC is not enabled"),
+            "{err}"
+        );
+    }
+
+    // A P-256 keypair used only by these tests (the same one
+    // tests/real_authn_e2e.rs signs with).
+    const EC_PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgwdzs5ZXprZ+FrmVM\n\
+2x3N9ehoXMhkWfOx7M0217LOtmehRANCAASPG9SIk2E3UTJC4nxm1l6y6yzX8N38\n\
+lVNfCuKwwBrIas5yannzOq4NUHTqcDRTLWg1ZyMnLrUgZ/WHc4/TGBXG\n\
+-----END PRIVATE KEY-----\n";
+    const EC_X: &str = "jxvUiJNhN1EyQuJ8ZtZesuss1_Dd_JVTXwrisMAayGo";
+    const EC_Y: &str = "znJqefM6rg1QdOpwNFMtaDVnIycutSBn9Ydzj9MYFcY";
+    const KID: &str = "tenant-rs-test-key";
+
+    /// `Authorization: Bearer` with a token signed for [`oidc_settings`]'s
+    /// issuer and audience, for tenant `acme`, carrying `email`.
+    fn bearer_with_email(email: serde_json::Value) -> axum::http::HeaderMap {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, get_current_timestamp};
+        let claims = serde_json::json!({
+            "iss": "https://issuer.example",
+            "aud": "ravel",
+            "exp": get_current_timestamp() + 600,
+            "tenant": "acme",
+            "email": email,
+        });
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(KID.to_string());
+        let key = EncodingKey::from_ec_pem(EC_PRIV_PEM.as_bytes()).expect("valid EC PEM");
+        let token = encode(&header, &claims, &key).expect("token encodes");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("header value"),
+        );
+        headers
+    }
+
+    /// The configured claim reaches the built `OidcResolver`: a signed token
+    /// carrying it as a string resolves a principal with that subject, source
+    /// `oidc` and no capability, and one carrying a number resolves with no subject and
+    /// one more `(oidc, not_string)` drop on the counters the bundle returns,
+    /// which are the ones `/metrics` renders. Flip to watch it fail: delete
+    /// the `with_subject_claim` call in `build_auth_resolver_with_principals`.
+    #[tokio::test]
+    async fn the_oidc_subject_claim_reaches_the_built_resolver() {
+        use ravel_tenant_resolve::{SubjectDropReason, SubjectSource};
+
+        let bundle = build_auth_resolver_with_principals(
+            HashMap::new(),
+            false,
+            AuthResolverSettings {
+                oidc: Some(oidc_settings()),
+                mtls_header: None,
+            },
+            OidcCapabilityClaims {
+                subject: Some("email".to_string()),
+                ..OidcCapabilityClaims::default()
+            },
+        )
+        .expect("a subject claim with OIDC configured builds");
+        assert!(Arc::ptr_eq(&bundle.subject_drops, &subject_drop_counters()));
+        let jwks: jsonwebtoken::jwk::JwkSet = serde_json::from_value(serde_json::json!({
+            "keys": [{
+                "kty": "EC", "crv": "P-256", "kid": KID, "alg": "ES256",
+                "x": EC_X, "y": EC_Y,
+            }]
+        }))
+        .expect("valid JWKS");
+        bundle
+            .oidc_refresh
+            .as_ref()
+            .expect("OIDC is configured")
+            .cache
+            .install_jwks(&jwks)
+            .expect("keys install");
+
+        let principal = bundle
+            .resolver
+            .resolve_principal(&bearer_with_email(serde_json::json!("alice@example.com")))
+            .expect("a signed token resolves");
+        assert_eq!(principal.tenant, TenantId::new("acme"));
+        assert!(
+            !(principal.ddl
+                || principal.ipcrypt
+                || principal.agents
+                || principal.agents_worker
+                || principal.agents_admin),
+            "a subject grants no capability"
+        );
+        let subject = principal.subject.expect("the claim sets the subject");
+        assert_eq!(subject.value(), "alice@example.com");
+        assert_eq!(subject.source(), SubjectSource::Oidc);
+
+        let not_string = |drops: &ravel_tenant_resolve::SubjectDropCounters| {
+            drops
+                .snapshot()
+                .into_iter()
+                .find(|(source, reason, _)| {
+                    *source == SubjectSource::Oidc && *reason == SubjectDropReason::NotString
+                })
+                .map(|(_, _, count)| count)
+                .expect("the pair is in the snapshot")
+        };
+        let before = not_string(&bundle.subject_drops);
+        let principal = bundle
+            .resolver
+            .resolve_principal(&bearer_with_email(serde_json::json!(7)))
+            .expect("a non-string subject claim still authenticates");
+        assert_eq!(principal.subject, None);
+        assert_eq!(not_string(&bundle.subject_drops), before + 1);
     }
 
     #[test]

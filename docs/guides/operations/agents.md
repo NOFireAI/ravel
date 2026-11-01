@@ -371,8 +371,12 @@ process that answered it. If that process restarts, or the owner's next step
 reaches another process, the effect reads in doubt again; reconcile it again
 (`manual_latches_in_doubt_after_a_coordinator_restart_and_is_never_redispatched`).
 A takeover by a new worker on the same process keeps the hand-over
-(`a_reconcile_retry_is_handed_to_the_owner_after_a_takeover`). Two admins of
-one tenant are not told apart in the audit record.
+(`a_reconcile_retry_is_handed_to_the_owner_after_a_takeover`). The record
+names `agents.principal.subject` and `agents.principal.subject_source` when
+the caller's token or claim carries a subject (a `subject=LABEL` entry on the
+admin's `--tenant-token` pair, or the claim `--oidc-subject-claim` names);
+two admins whose tokens carry none are not told apart
+(`reconcile_and_destroy_records_name_each_admins_configured_subject_and_a_token_without_one_writes_no_subject_attr`).
 
 After a 500 `outcome_unknown` from reconcile. The server could not tell
 whether its own write took effect, so it hands the attempt to nobody.
@@ -517,9 +521,10 @@ agent id, the incarnation, the `abandoned` counts as read before the write
 and `agents.abandoned.timers_scheduled`), and the caller under
 `agents.principal.tenant` and `agents.principal.capabilities`
 (`the_destroy_event_names_tenant_agent_incarnation_counts_and_caller`).
-The `agents_destroy` record names the caller's tenant and capabilities. A
-principal carries no subject, so two admins of one tenant are not told
-apart, as for reconcile. In `required` mode a failed audit write refuses
+The `agents_destroy` record names the caller's tenant and capabilities. The
+record names `agents.principal.subject` and `agents.principal.subject_source`
+when the caller's token or claim carries a subject; two admins whose tokens
+carry none are not told apart, as for reconcile. In `required` mode a failed audit write refuses
 the destroy with 503 `store_unavailable` and the agent stays active
 (`a_destroy_whose_audit_record_is_refused_leaves_the_agent_active`); in
 `best-effort` mode the destroy goes ahead without its record. Without

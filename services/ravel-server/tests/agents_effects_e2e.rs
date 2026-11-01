@@ -29,7 +29,7 @@ use ravel_object_store::{
 };
 use ravel_server::config::AgentsConfig;
 use ravel_server::{FoldTaskConfig, Mode, QueryBudgets, ServerConfig};
-use ravel_tenant_resolve::{Principal, StaticBearerTokenResolver};
+use ravel_tenant_resolve::{Principal, StaticBearerTokenResolver, Subject, SubjectSource};
 use ravel_types::{Signal, TenantId};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -38,6 +38,9 @@ const CLIENT: &str = "client-token";
 const WORKER: &str = "worker-token";
 const ADMIN: &str = "admin-token";
 const PLAIN: &str = "plain-token";
+/// Two more `agents_admin` tokens, each configured with a subject label.
+const ADMIN_ALICE: &str = "admin-token-a";
+const ADMIN_BOB: &str = "admin-token-b";
 
 const LEASE_MS: u64 = 300;
 const GRACE_MS: u64 = 100;
@@ -57,15 +60,19 @@ fn agents_config() -> AgentsConfig {
     }
 }
 
-/// A client, a worker, an admin and a capability-less token, all for
-/// tenant `acme`. The admin holds `agents_admin` only.
+/// A client, a worker, three admins and a capability-less token, all for
+/// tenant `acme`. Each admin holds `agents_admin` only; `ADMIN` carries no
+/// subject, `ADMIN_ALICE` and `ADMIN_BOB` carry the subject a
+/// `subject=LABEL` token entry configures.
 fn principals() -> Arc<dyn ravel_query::http::TenantResolver> {
     let mut tokens = HashMap::new();
-    for (token, agents, agents_worker, agents_admin) in [
-        (CLIENT, true, false, false),
-        (WORKER, false, true, false),
-        (ADMIN, false, false, true),
-        (PLAIN, false, false, false),
+    for (token, agents, agents_worker, agents_admin, subject) in [
+        (CLIENT, true, false, false, None),
+        (WORKER, false, true, false, None),
+        (ADMIN, false, false, true, None),
+        (ADMIN_ALICE, false, false, true, Some("alice")),
+        (ADMIN_BOB, false, false, true, Some("bob@example.com")),
+        (PLAIN, false, false, false, None),
     ] {
         tokens.insert(
             token.to_string(),
@@ -73,6 +80,9 @@ fn principals() -> Arc<dyn ravel_query::http::TenantResolver> {
                 agents,
                 agents_worker,
                 agents_admin,
+                subject: subject.map(|label| {
+                    Subject::new(SubjectSource::StaticToken, label).expect("valid label")
+                }),
                 ..Principal::tenant_only(TenantId::new(TENANT))
             },
         );
@@ -193,6 +203,25 @@ impl Api {
             .await
             .expect("request completes");
         read(response).await
+    }
+
+    /// [`Api::ok`], also sending a client-chosen subject in
+    /// `x-ravel-subject` and in the dev mTLS header, neither of which this
+    /// server reads.
+    async fn ok_claiming_mallory(&self, token: &str, path: &str, body: &Value) -> Value {
+        let response = self
+            .http
+            .post(format!("{}/api/v1/agents/{path}", self.base))
+            .bearer_auth(token)
+            .header("x-ravel-subject", "mallory")
+            .header("x-ravel-client-cert-cn", "mallory")
+            .json(body)
+            .send()
+            .await
+            .expect("request completes");
+        let (status, body) = read(response).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        body
     }
 
     async fn get(&self, token: &str, path_and_query: &str) -> (StatusCode, Value) {
@@ -720,6 +749,128 @@ async fn manual_blocks_until_reconciled_and_audits_the_decision_once() {
         Some(attempt.to_string().as_str())
     );
     assert_eq!(attr(row, "agents.decision"), Some("record_result"));
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// Drive the agent keyed `key` until its one `manual` effect is in doubt:
+/// A is authorized attempt 1 and dies, and B's replay is refused. Answers
+/// the effect id.
+async fn effect_in_doubt(api: &Api, key: &str) -> String {
+    let (_operation, assigned_a) = begin_on(api, key).await;
+    let (status, a_step) = step(api, &assigned_a, "manual").await;
+    assert_eq!(status, StatusCode::OK, "{a_step}");
+    assert_eq!(a_step["attempt"], json!(1));
+    let effect = a_step["effect"].as_str().expect("effect").to_string();
+    let assigned_b = take_over(api, &assigned_a).await;
+    let (status, refused) = step(api, &assigned_b, "manual").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["code"], json!("effect_in_doubt"));
+    effect
+}
+
+fn has_attr(row: &LogRecord, key: &str) -> bool {
+    row.attrs.iter().any(|(k, _)| k == key)
+}
+
+/// ADR-3541: the reconcile and destroy records name the subject the admin's
+/// token entry configures, with source `static_token`, and a token with no
+/// subject writes neither attribute. Every call also sends `mallory` as
+/// `x-ravel-subject` and as the dev mTLS header; no record carries it. No
+/// response names a subject.
+///
+/// Flip to watch it fail: set the principal's subject from the
+/// `x-ravel-subject` request header in the reconcile route, and `mallory`
+/// lands in a record; or have `principal_attrs` in `agents/audit.rs` push
+/// both keys with an empty string when the subject is `None`, and the
+/// subject-less record carries them.
+#[tokio::test]
+async fn reconcile_and_destroy_records_name_each_admins_configured_subject_and_a_token_without_one_writes_no_subject_attr()
+ {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_server(store.clone()).await;
+    let api = Api::public(&running);
+    let reconcile = |effect: &str| {
+        json!({
+            "effect": effect,
+            "attempt": 1,
+            "decision": "record_result",
+            "result": {"cents": 1500},
+        })
+    };
+    let mut answers = Vec::new();
+
+    let key = "o-subject-1";
+    let effect_1 = effect_in_doubt(&api, key).await;
+    let reconciled = api
+        .ok_claiming_mallory(ADMIN_ALICE, "reconcile", &reconcile(&effect_1))
+        .await;
+    assert_eq!(reconciled["status"], json!("completed"), "{reconciled}");
+    answers.push(reconciled);
+    let destroyed = api
+        .ok_claiming_mallory(ADMIN_BOB, "destroy", &destroy_body(key, None))
+        .await;
+    assert_eq!(destroyed["destroyed"], json!(true), "{destroyed}");
+    answers.push(destroyed);
+
+    let effect_2 = effect_in_doubt(&api, "o-subject-2").await;
+    let reconciled = api
+        .ok_claiming_mallory(ADMIN, "reconcile", &reconcile(&effect_2))
+        .await;
+    assert_eq!(reconciled["status"], json!("completed"), "{reconciled}");
+    answers.push(reconciled);
+
+    for answer in &answers {
+        let text = answer.to_string();
+        for name in ["alice", "bob@example.com", "mallory"] {
+            assert!(!text.contains(name), "{name} in a response: {text}");
+        }
+    }
+
+    let reconciles = reconcile_audit_records(store.as_ref()).await;
+    assert_eq!(reconciles.len(), 2, "{reconciles:?}");
+    let by_effect = |effect: &str| {
+        reconciles
+            .iter()
+            .find(|row| attr(row, "agents.effect") == Some(effect))
+            .expect("one reconcile record per effect")
+    };
+    let alices = by_effect(&effect_1);
+    assert_eq!(attr(alices, "agents.principal.subject"), Some("alice"));
+    assert_eq!(
+        attr(alices, "agents.principal.subject_source"),
+        Some("static_token")
+    );
+    let subjectless = by_effect(&effect_2);
+    assert_eq!(
+        attr(subjectless, "agents.principal.capabilities"),
+        Some("agents_admin")
+    );
+    assert!(
+        !has_attr(subjectless, "agents.principal.subject"),
+        "{subjectless:?}"
+    );
+    assert!(
+        !has_attr(subjectless, "agents.principal.subject_source"),
+        "{subjectless:?}"
+    );
+
+    let destroys = audit_records(store.as_ref(), "agents_destroy").await;
+    assert_eq!(destroys.len(), 1, "{destroys:?}");
+    assert_eq!(
+        attr(&destroys[0], "agents.principal.subject"),
+        Some("bob@example.com")
+    );
+    assert_eq!(
+        attr(&destroys[0], "agents.principal.subject_source"),
+        Some("static_token")
+    );
+
+    for row in reconciles.iter().chain(&destroys) {
+        assert!(
+            !format!("{:?}", row.attrs).contains("mallory"),
+            "a client-sent subject reached a record: {row:?}"
+        );
+    }
     running.shutdown().await.expect("clean shutdown");
 }
 
