@@ -720,3 +720,81 @@ async fn an_uncached_selective_scan_validates_only_surviving_cells() {
         "the surviving p cells only"
     );
 }
+
+/// ADR-3326, LIKE-deferred amendment, decision 4, on a fixture that fits: a
+/// `LIKE` scan defers the dictionary column `d`, decodes it validated on its
+/// miss and admits it whole (24 misses and 24 admissions: `ts`, `stream_ref`
+/// and `d` of 8 blocks, no refusal). A later scan of `d` without the arm is
+/// served `d` from that entry, 8 hits on `d`, and reads exactly the rows of a
+/// cold scan with no cache.
+///
+/// Seen failing against leaving the deferred columns out of the validate set
+/// (`d` is offered raw: `unvalidated_refusals` is 8 on the first scan where 0
+/// is expected), and against that plus removing `offer`'s refusal (the raw
+/// dictionary is admitted and the later scan reads every `d` as NULL, so its
+/// rows differ).
+#[tokio::test]
+async fn a_column_cached_by_a_contains_scan_serves_a_later_scan_exactly() {
+    let t = tenant();
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    let mut objects = Vec::new();
+    for seq in 1..=OBJECTS {
+        objects.push(publish_object(store.as_ref(), &t, seq).await);
+    }
+    let d_id = column_id(&objects, "d", FieldType::Str);
+    let like = "SELECT ts, d FROM logs WHERE d LIKE '%u%' ORDER BY ts";
+    let later = "SELECT ts, d FROM logs WHERE n > 0 ORDER BY ts";
+    let cold = |sql: &'static str| {
+        let store = Arc::clone(&store);
+        let t = t.clone();
+        async move {
+            let out = executor(&store, None)
+                .execute(t.hash(), &request(sql))
+                .await
+                .expect("uncached statement executes");
+            pretty_format_batches(out.output.batches())
+                .expect("format")
+                .to_string()
+        }
+    };
+    let (like_rows, later_rows) = (cold(like).await, cold(later).await);
+
+    let cache = Arc::new(DecodedColumnCache::new(
+        1 << 30,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    let cached = striped(&store, Some(Arc::clone(&cache)));
+    let first = cached
+        .execute(t.hash(), &request(like))
+        .await
+        .expect("LIKE statement executes");
+    let got = pretty_format_batches(first.output.batches())
+        .expect("format")
+        .to_string();
+    assert_eq!(got, like_rows);
+    let s = first
+        .stats
+        .decoded_cache
+        .expect("decodedCache stats with a cache")
+        .counters;
+    assert!(s.deferred_served);
+    assert_eq!(s.unvalidated_refusals, 0, "d was decoded validated");
+    assert_eq!((s.hits, s.misses, s.admissions), (0, 24, 24));
+
+    let second = cached
+        .execute(t.hash(), &request(later))
+        .await
+        .expect("later statement executes");
+    let got = pretty_format_batches(second.output.batches())
+        .expect("format")
+        .to_string();
+    assert_eq!(got, later_rows, "served d reads exactly as a cold scan");
+    let s = second
+        .stats
+        .decoded_cache
+        .expect("decodedCache stats with a cache")
+        .counters;
+    assert_eq!((s.hits, s.misses, s.unvalidated_refusals), (24, 8, 0));
+    assert_eq!(cache.column_hits(d_id), BLOCKS, "d served once per block");
+}
