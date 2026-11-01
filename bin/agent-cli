@@ -41,7 +41,7 @@ BOT = "claude-fleet"
 # Every prefix the review bot and the review skill write. Anything else is
 # reported as "unclassified", which counts as actionable, never as chatter.
 SEVERITIES = ("blocking", "blocker", "major", "should_fix", "minor", "nit")
-TERMINAL_TASK = {"done", "failed", "canceled", "cancelled", "dead", "error"}
+TERMINAL_TASK = {"done", "failed", "canceled", "cancelled", "expired", "dead", "error"}
 
 
 class CliError(Exception):
@@ -218,7 +218,9 @@ def classify_findings(comments, head, all_commits=False):
         # GitHub moves commit_id forward to a newer head when the commented
         # line is unchanged; original_commit_id is the commit the review saw.
         made_on = c.get("original_commit_id") or c.get("commit_id")
-        if not all_commits and made_on != head:
+        # A comment re-anchored to head sits on a line no push changed, so the
+        # finding is still open at head and counts there too.
+        if not all_commits and head not in (made_on, c.get("commit_id")):
             continue
         rows.append({
             "id": c.get("id"),
@@ -414,10 +416,14 @@ def cmd_pr_wait(a):
     deadline = time.monotonic() + a.timeout
     while True:
         s = pr_state(a.number)
-        settled = s["ci"]["pending"] == 0 and (a.ci_only or s["review_at_head"] is not None)
-        if settled or s["state"] != "OPEN" or time.monotonic() >= deadline:
+        ci = s["ci"]
+        # An empty rollup is no verdict: right after a push no check exists yet.
+        reported = ci["pass"] + ci["fail"] + ci["skip"] > 0
+        settled = reported and ci["pending"] == 0 and (a.ci_only or s["review_at_head"] is not None)
+        left = deadline - time.monotonic()
+        if settled or s["state"] != "OPEN" or left <= 0:
             break
-        time.sleep(a.interval)
+        time.sleep(max(1, min(a.interval, left)))
     o = Out(a.json)
     o.data = dict(s, settled=settled)
     o.text(("settled " if settled else "waiting ") + pr_line(s))
@@ -426,7 +432,7 @@ def cmd_pr_wait(a):
 
 
 LANDED_Q = ("query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n)"
-            "{state mergeCommit{oid} mergeQueueEntry{state position}}}}")
+            "{state mergeStateStatus mergeCommit{oid} mergeQueueEntry{state position}}}}")
 
 
 def landed_once(n):
@@ -434,7 +440,8 @@ def landed_once(n):
     d = gh_json(["api", "graphql", "-f", f"query={LANDED_Q}", "-F", f"o={owner}", "-F", f"r={name}",
                  "-F", f"n={n}"])
     pr = d["data"]["repository"]["pullRequest"]
-    return {"state": pr["state"], "merge_commit": (pr.get("mergeCommit") or {}).get("oid"),
+    return {"state": pr["state"], "merge_state": pr.get("mergeStateStatus"),
+            "merge_commit": (pr.get("mergeCommit") or {}).get("oid"),
             "queue": (pr.get("mergeQueueEntry") or {}).get("state"),
             "position": (pr.get("mergeQueueEntry") or {}).get("position")}
 
@@ -442,28 +449,38 @@ def landed_once(n):
 def cmd_pr_landed(a):
     deadline = time.monotonic() + a.wait
     misses = 0
+    seen_queue = False
     reason = "once"
     while True:
         s = landed_once(a.number)
         if s["state"] == "MERGED":
             reason = "merged"
             break
-        misses = misses + 1 if not s["queue"] else 0
-        if a.wait and misses >= 2:
-            reason = "not_queued"
+        if s["state"] == "CLOSED":
+            reason = "closed"
             break
-        if not a.wait or time.monotonic() >= deadline:
+        seen_queue = seen_queue or bool(s["queue"])
+        misses = misses + 1 if not s["queue"] else 0
+        # The entry appears only once GitHub has recomputed mergeability (a
+        # BEHIND PR takes a minute or more), so an entry never seen is not an
+        # ejection; one that was seen and is gone for two reads is.
+        if a.wait and seen_queue and misses >= 2:
+            reason = "ejected"
+            break
+        left = deadline - time.monotonic()
+        if not a.wait or left <= 0:
             reason = "deadline" if a.wait else "once"
             break
-        time.sleep(a.interval)
+        time.sleep(max(1, min(a.interval, left)))
     s["reason"] = reason
     o = Out(a.json)
     o.data = s
-    o.text(f"pr {a.number} {s['state']} queue={s['queue'] or 'none'}"
+    o.text(f"pr {a.number} {s['state']} merge={s['merge_state'] or '-'} queue={s['queue'] or 'none'}"
            f"{' pos=' + str(s['position']) if s['position'] is not None else ''}"
-           f"{' merged=' + s['merge_commit'][:9] if s['merge_commit'] else ''}")
+           f"{' merged=' + s['merge_commit'][:9] if s['merge_commit'] else ''}"
+           f"{'' if reason in ('once', 'merged') else ' reason=' + reason}")
     o.emit()
-    return {"merged": 0, "not_queued": 1, "deadline": 75, "once": 0}[reason]
+    return {"merged": 0, "closed": 1, "ejected": 1, "deadline": 75, "once": 0}[reason]
 
 
 def cmd_merge_line(a):
@@ -474,6 +491,10 @@ def cmd_merge_line(a):
     env = {"ALLOW_STALE_SHAPE_SITES": "1"} if a.allow_stale_shape_sites else None
     rc, out, err = run(args, env=env)
     lines = out.splitlines()
+    if rc != 0 and not lines:
+        # The script printed nothing, so it never got to a verdict (gh auth,
+        # network): could not answer, which is not the same as no merge line.
+        raise CliError(f"pr-review-status.sh rc={rc} with no output: {last_line(err)}")
     merge = next((l.strip()[2:].strip() if l.strip().startswith("->") else l.strip()
                   for l in lines if "gh pr merge" in l), "")
     # Keep every line after the status line except the merge line itself: the
@@ -635,6 +656,9 @@ def cp_config():
             if "=" not in line or line.lstrip().startswith("#"):
                 continue
             k, v = line.split("=", 1)
+            # The same grammar epic-orchestrator.sh reads: KEY=value, with or
+            # without a leading export.
+            k = re.sub(r"^\s*export\s+", "", k)
             v = v.strip().strip('"').strip("'")
             if k.strip() in ("FLEET_CP_URL", "FLEET_PUBLIC_URL") and not url:
                 url = v
@@ -872,7 +896,13 @@ def cmd_dispatch(a):
     if blocking and not a.allow_lint:
         raise CliError(f"spec has {len(blocking)} character(s) the dispatch service refuses (first: line "
                        f"{blocking[0]['line']} {blocking[0]['kind']}); run agent-cli spec-lint {a.spec}, "
-                       f"or pass --allow-lint if you checked them", 1)
+                       f"or pass --allow-lint if you checked them", 2)
+    # The orchestrator record below dies with 66 on an epic with no state file,
+    # and then the ledger line epic-status.sh parses is never written. init is
+    # idempotent, so run it before anything is dispatched.
+    rc, out, err = run(["scripts/epic-orchestrator.sh", "init", str(a.epic)])
+    if rc != 0:
+        raise CliError(f"epic-orchestrator.sh init {a.epic} rc={rc}: {last_line(err or out)}")
     ref_sha = fresh_main()
     env = {}
     if a.ref:
@@ -889,7 +919,11 @@ def cmd_dispatch(a):
     rc, out, err = run(["scripts/fleet-dispatch-intent.sh", "intent", str(a.epic), str(a.ticket), ref_sha],
                        env=env)
     if rc != 0:
-        raise CliError(f"intent refused rc={rc}: {last_line(err or out)}", rc)
+        # Nothing was dispatched. Keep the script's own refusal codes (64
+        # usage, 65 duplicate, 66 files in flight, 69 could not ask) and map
+        # anything else to 2: 1 here would read as "dispatched, not recorded".
+        raise CliError(f"intent refused rc={rc}: {last_line(err or out)}",
+                       rc if rc in (64, 65, 66, 69) else 2)
     nonce = last_line(out)
     arguments = {"spec": spec, "ref": ref_sha, "model": a.model, "expects_ref": not a.read_only}
     if a.effort:
@@ -1121,6 +1155,12 @@ def cmd_main(a):
 HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
 
 
+def adr_status(text):
+    """The value of a 'Status:' line in the ADR header, or '' when none."""
+    return next((l.split(":", 1)[1].strip() for l in text.splitlines()[:12]
+                 if l.lstrip("- ").lower().startswith("status") and ":" in l), "")
+
+
 def adr_headings(text):
     rows, fence = [], None
     for i, line in enumerate(text.splitlines(), 1):
@@ -1166,8 +1206,7 @@ def cmd_adr(a):
     if not path:
         raise CliError(f"no ADR {num} on {ref}", 1)
     _, text, _ = run(["git", "show", f"{ref}:{path}"], check=True)
-    status = next((l.split(":", 1)[1].strip() for l in text.splitlines()[:12]
-                   if l.lstrip("- ").lower().startswith("status")), "")
+    status = adr_status(text)
     heads = adr_headings(text)
     o.data = {"path": path, "ref": ref, "status": status, "lines": len(text.splitlines()),
               "headings": heads}
@@ -1240,16 +1279,19 @@ def build_parser():
     sp.add_argument("--ci-only", action="store_true", help="do not wait for a review at head")
 
     sp = add("pr-landed", cmd_pr_landed, "merge-queue state, merge commit; --wait polls until merged",
-             "One GraphQL read of state, mergeCommit and mergeQueueEntry. With --wait S, polls until "
-             "MERGED (exit 0), two consecutive reads with no queue entry and not merged (exit 1, "
-             "ejected or never queued), or the budget ends (exit 75).")
+             "One GraphQL read of state, mergeStateStatus, mergeCommit and mergeQueueEntry. With "
+             "--wait S, polls until MERGED (exit 0), CLOSED unmerged (exit 1), a queue entry that "
+             "was seen and is gone for two reads (exit 1, ejected), or the budget ends (exit 75; "
+             "an entry never seen is not an ejection, since a BEHIND PR is queued only after "
+             "GitHub recomputes mergeability).")
     sp.add_argument("number", type=int)
     sp.add_argument("--wait", type=int, default=0)
     sp.add_argument("--interval", type=int, default=60)
 
     sp = add("merge-line", cmd_merge_line, "the pinned merge command from scripts/pr-review-status.sh, or why there is none",
              "Runs scripts/pr-review-status.sh and prints only its merge line (with ALLOW_LITERAL_SHA=1 "
-             "already on it) or the notes that withheld it. Exit 1 when there is no line. Pass "
+             "already on it) or the notes that withheld it. Exit 1 when there is no line, 2 when "
+             "the script produced no verdict at all. Pass "
              "--confirm-addressed only after every inline comment is fixed or answered.")
     sp.add_argument("number", type=int)
     sp.add_argument("--confirm-addressed", action="store_true")
