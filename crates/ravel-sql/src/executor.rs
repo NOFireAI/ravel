@@ -5657,7 +5657,7 @@ fn execution_error(err: DataFusionError, pool: &Arc<dyn MemoryPool>) -> SqlError
 ///
 /// Returns the original error unchanged when there is no ravel error inside,
 /// so no detail is lost on the way to the log.
-fn take_sql_error(err: DataFusionError) -> Result<SqlError, DataFusionError> {
+pub(crate) fn take_sql_error(err: DataFusionError) -> Result<SqlError, DataFusionError> {
     match err {
         DataFusionError::External(boxed) => match boxed.downcast::<SqlError>() {
             Ok(sql) => Ok(*sql),

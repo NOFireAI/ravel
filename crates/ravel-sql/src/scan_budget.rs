@@ -143,6 +143,227 @@ impl ScanBudget {
     }
 }
 
+/// Fixtures the per-table budget tests share.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) mod test_support {
+    use std::collections::HashMap;
+
+    use bytes::Bytes;
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::ExecutionPlan;
+    use futures::StreamExt;
+    use ravel_catalog::{SegmentLevel, SegmentRef};
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{LogRecord, RlogConfig, RlogWriter};
+    use ravel_object_store::{
+        Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta,
+        ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
+    };
+    use ravel_types::accounting::AccountedOp;
+
+    use super::*;
+    use crate::executor::TargetSignal;
+
+    /// The tenant every fixture object is written for and read as.
+    pub(crate) const TENANT: [u8; 16] = [7u8; 16];
+
+    /// A pass-through backend that counts GETs per key.
+    pub(crate) struct KeyGets {
+        inner: Arc<dyn ObjectStoreBackend>,
+        gets: Mutex<HashMap<String, u64>>,
+    }
+
+    impl KeyGets {
+        pub(crate) fn wrap(inner: Arc<dyn ObjectStoreBackend>) -> Arc<Self> {
+            Arc::new(KeyGets {
+                inner,
+                gets: Mutex::new(HashMap::new()),
+            })
+        }
+
+        /// GETs of each key in `segments`, in order.
+        pub(crate) fn of(&self, segments: &[SegmentRef]) -> Vec<u64> {
+            let gets = self.gets.lock().expect("gets lock");
+            segments
+                .iter()
+                .map(|s| gets.get(&s.data_object_key).copied().unwrap_or(0))
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for KeyGets {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            *self
+                .gets
+                .lock()
+                .expect("gets lock")
+                .entry(key.to_string())
+                .or_insert(0) += 1;
+            self.inner.get(key, range).await
+        }
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                multipart: false,
+                ..self.inner.capabilities()
+            }
+        }
+    }
+
+    pub(crate) fn bytes_budget(max: u64) -> EngineConfig {
+        EngineConfig {
+            max_bytes_scanned: ByteLimit::Bounded(max),
+            ..EngineConfig::default()
+        }
+    }
+
+    pub(crate) fn requests_budget(max: u64) -> EngineConfig {
+        EngineConfig {
+            max_s3_requests: RequestLimit::Bounded(max),
+            ..EngineConfig::default()
+        }
+    }
+
+    /// A fresh statement with `bytes` and `requests` already charged to the
+    /// samples lane, standing for another table the same statement read.
+    pub(crate) fn statement_with(bytes: u64, requests: u64) -> StatementAccounting {
+        let statement = StatementAccounting::new();
+        let samples = statement.lane(TargetSignal::Metrics).scan();
+        for _ in 0..requests {
+            samples.record_s3_request(AccountedOp::Get);
+        }
+        samples.add_s3_bytes(AccountedOp::Get, bytes);
+        statement
+    }
+
+    /// `(bytes, requests)` the whole statement has charged.
+    pub(crate) fn total(statement: &StatementAccounting) -> (u64, u64) {
+        let total = statement.pooled_snapshot();
+        (total.total_s3_bytes(), total.total_s3_requests())
+    }
+
+    /// Write `records` as one RLOG object at `key`, a block per record, and
+    /// return its L0 `SegmentRef`.
+    pub(crate) async fn write_rlog(
+        store: &dyn ObjectStoreBackend,
+        key: &str,
+        records: &[LogRecord],
+    ) -> SegmentRef {
+        let mut writer = RlogWriter::new(
+            RlogConfig {
+                block_target_records: 1,
+                ..RlogConfig::default()
+            },
+            ObjectIdentity {
+                tenant_hash: TENANT,
+                shard: 0,
+                writer_id: [2u8; 16],
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        for record in records {
+            writer.push(record.clone()).expect("push");
+        }
+        let bytes = writer.finish().expect("finish");
+        let object_size = bytes.len() as u64;
+        store
+            .put(key, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        SegmentRef {
+            data_object_key: key.to_string(),
+            object_size,
+            min_event_ts_ns: records.iter().map(|r| r.ts_ns).min().expect("records"),
+            max_event_ts_ns: records.iter().map(|r| r.ts_ns).max().expect("records"),
+            ingest_hour_bucket: 0,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: [0u8; 32],
+            writer_id: uuid::Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    /// What one budgeted single-partition scan did.
+    #[derive(Debug)]
+    pub(crate) struct BudgetRun {
+        /// Rows delivered before the first error.
+        pub(crate) rows: usize,
+        pub(crate) error: Option<SqlError>,
+        /// GETs of each fixture object, in snapshot order.
+        pub(crate) gets: Vec<u64>,
+        /// `(bytes, requests)` the statement charged.
+        pub(crate) total: (u64, u64),
+    }
+
+    /// Drain `plan` and collect what it did against `store` and `statement`.
+    pub(crate) async fn budget_run(
+        plan: &dyn ExecutionPlan,
+        store: &KeyGets,
+        segments: &[SegmentRef],
+        statement: &StatementAccounting,
+    ) -> BudgetRun {
+        let (rows, error) = drain(plan).await;
+        BudgetRun {
+            rows,
+            error,
+            gets: store.of(segments),
+            total: total(statement),
+        }
+    }
+
+    /// Rows partition 0 of `plan` delivered before its first error, and that
+    /// error.
+    pub(crate) async fn drain(plan: &dyn ExecutionPlan) -> (usize, Option<SqlError>) {
+        let mut stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        let mut rows = 0;
+        while let Some(next) = stream.next().await {
+            match next {
+                Ok(batch) => rows += batch.num_rows(),
+                Err(e) => {
+                    let sql = crate::executor::take_sql_error(e).expect("a SqlError");
+                    return (rows, Some(sql));
+                }
+            }
+        }
+        (rows, None)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {

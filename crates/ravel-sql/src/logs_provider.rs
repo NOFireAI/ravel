@@ -542,6 +542,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::SqlError;
     use crate::config::SqlConfig;
     use crate::memory::TenantMemoryAccountant;
     use crate::session::{SessionTable, build_session};
@@ -4647,6 +4648,214 @@ mod tests {
             "the scan's EXPLAIN ANALYZE metrics must report the two skipped \
              segments: {scan_line}"
         );
+    }
+
+    // Issue #1409: the logs scan checks the statement's byte and request
+    // budgets after every store read.
+
+    /// Three single-record-per-block RLOG objects, `budget/seg-{0,1,2}`, the
+    /// counting store they sit in, and the snapshot over them.
+    async fn budget_fixture() -> (Arc<KeyCountingStore>, Snapshot) {
+        let memory = MemoryStore::new();
+        let mut segments = Vec::new();
+        for i in 0..3i64 {
+            let records: Vec<LogRecord> = (0..4)
+                .map(|k| record(&[], &[], i * 10 + k, &format!("seg{i} row{k}")))
+                .collect();
+            segments.push(
+                write_object_with(
+                    &memory,
+                    &format!("budget/seg-{i}"),
+                    &records,
+                    one_record_per_block(),
+                    &[],
+                )
+                .await,
+            );
+        }
+        let store = KeyCountingStore::new(Arc::new(memory));
+        let snapshot = Snapshot {
+            segments,
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        (store, snapshot)
+    }
+
+    /// What one budgeted single-partition logs scan did.
+    struct BudgetRun {
+        /// Rows delivered before the first error.
+        rows: usize,
+        error: Option<SqlError>,
+        statement: crate::statement_accounting::StatementAccounting,
+        store: Arc<KeyCountingStore>,
+    }
+
+    impl BudgetRun {
+        fn gets(&self) -> [u64; 3] {
+            [0, 1, 2].map(|i| self.store.gets_of(&format!("budget/seg-{i}")))
+        }
+
+        fn total(&self) -> (u64, u64) {
+            let total = self.statement.pooled_snapshot();
+            (total.total_s3_bytes(), total.total_s3_requests())
+        }
+    }
+
+    /// Scan the three-object fixture over one partition, so plan reads, opens
+    /// and block fetches run one after another, under `engine`'s budgets.
+    /// `preload` is charged to the spans lane first, standing for another
+    /// table of the same statement.
+    async fn run_budgeted(engine: &ravel_query::EngineConfig, preload: (u64, u64)) -> BudgetRun {
+        use crate::executor::TargetSignal;
+        use crate::statement_accounting::StatementAccounting;
+        use ravel_types::accounting::AccountedOp;
+
+        let (store, snapshot) = budget_fixture().await;
+        let statement = StatementAccounting::new();
+        let spans = statement.lane(TargetSignal::Spans).scan();
+        for _ in 0..preload.1 {
+            spans.record_s3_request(AccountedOp::Get);
+        }
+        spans.add_s3_bytes(AccountedOp::Get, preload.0);
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            LogSegmentFetcher::new(backend),
+            statement.lane(TargetSignal::Logs).clone(),
+        )
+        .with_scan_budget(statement.scan_budget(TargetSignal::Logs, engine));
+        let plan = provider.plan(1).expect("plan");
+        let ctx = Arc::new(datafusion::execution::TaskContext::default());
+        let mut stream = plan.execute(0, ctx).expect("execute");
+        let mut rows = 0;
+        let mut error = None;
+        while let Some(next) = futures::StreamExt::next(&mut stream).await {
+            match next {
+                Ok(batch) => rows += batch.num_rows(),
+                Err(e) => {
+                    error = Some(crate::executor::take_sql_error(e).expect("a SqlError"));
+                    break;
+                }
+            }
+        }
+        BudgetRun {
+            rows,
+            error,
+            statement,
+            store,
+        }
+    }
+
+    fn bytes_budget(max: u64) -> ravel_query::EngineConfig {
+        ravel_query::EngineConfig {
+            max_bytes_scanned: ravel_query::ByteLimit::Bounded(max),
+            ..ravel_query::EngineConfig::default()
+        }
+    }
+
+    fn requests_budget(max: u64) -> ravel_query::EngineConfig {
+        ravel_query::EngineConfig {
+            max_s3_requests: ravel_query::RequestLimit::Bounded(max),
+            ..ravel_query::EngineConfig::default()
+        }
+    }
+
+    /// The fixture's three objects are 872, 900 and 898 bytes, each read in
+    /// one whole-object GET. Under a 1000-byte budget the scan reads `seg-0`
+    /// (872), delivers its four rows, reads `seg-1` (1772 in total) and
+    /// refuses at that figure before decoding it or fetching `seg-2`. With
+    /// the budget equal to 1772 the second read is still inside it, and the
+    /// third (2670) trips.
+    ///
+    /// FLIP: removing `ctx.budget.check()?` from `open_segment_whole`
+    /// (logs_scan/scan.rs) returns all 12 rows with no error. Checking once
+    /// per segment after its rows are delivered (at `LogScanState::NextSegment`)
+    /// instead refuses with 8 rows delivered. Comparing with `>=` instead of
+    /// `>` refuses the 1772-byte budget at 1772.
+    #[tokio::test]
+    async fn lowered_byte_budget_fails_typed_on_logs_scan() {
+        let free = run_budgeted(&ravel_query::EngineConfig::default(), (0, 0)).await;
+        assert!(free.error.is_none(), "{:?}", free.error);
+        assert_eq!(free.rows, 12);
+        assert_eq!(free.gets(), [1, 1, 1]);
+        assert_eq!(free.total(), (2670, 3));
+
+        let run = run_budgeted(&bytes_budget(1000), (0, 0)).await;
+        let Some(SqlError::TooManyBytesScanned {
+            scanned: 1772,
+            max: 1000,
+        }) = run.error
+        else {
+            panic!("expected TooManyBytesScanned at 1772 of 1000, got {:?}", run.error);
+        };
+        assert_eq!(run.rows, 4, "only seg-0 is decoded");
+        assert_eq!(run.gets(), [1, 1, 0], "seg-2 is never fetched");
+        assert_eq!(run.total(), (1772, 2));
+
+        let edge = run_budgeted(&bytes_budget(1772), (0, 0)).await;
+        let Some(SqlError::TooManyBytesScanned {
+            scanned: 2670,
+            max: 1772,
+        }) = edge.error
+        else {
+            panic!("expected TooManyBytesScanned at 2670 of 1772, got {:?}", edge.error);
+        };
+        assert_eq!(edge.rows, 8);
+        assert_eq!(edge.gets(), [1, 1, 1]);
+    }
+
+    /// One GET per object: a one-request budget admits `seg-0` and refuses
+    /// at the second GET, before `seg-1` is decoded or `seg-2` fetched.
+    ///
+    /// FLIP: removing `ctx.budget.check()?` from `open_segment_whole` returns
+    /// all 12 rows with no error.
+    #[tokio::test]
+    async fn lowered_request_budget_fails_typed_on_logs_scan() {
+        let run = run_budgeted(&requests_budget(1), (0, 0)).await;
+        let Some(SqlError::RequestBudgetExceeded {
+            requests: 2,
+            max: 1,
+            table: None,
+            ..
+        }) = run.error
+        else {
+            panic!("expected RequestBudgetExceeded at 2 of 1, got {:?}", run.error);
+        };
+        assert_eq!(run.rows, 4);
+        assert_eq!(run.gets(), [1, 1, 0]);
+        assert_eq!(run.total(), (1772, 2));
+
+        let fits = run_budgeted(&requests_budget(3), (0, 0)).await;
+        assert!(fits.error.is_none(), "{:?}", fits.error);
+        assert_eq!(fits.rows, 12);
+    }
+
+    /// The check reads the statement total. 1500 bytes and one request
+    /// already charged to the spans lane fit a 3000-byte budget, and so do
+    /// the logs scan's 2670 alone, but their sum passes it once `seg-1` is
+    /// read: 1500 + 1772 = 3272.
+    ///
+    /// FLIP: building the budget over the logs lane alone
+    /// (`StatementAccounting::One(lane.clone())` in
+    /// `StatementAccounting::scan_budget`) returns all 12 rows with no error.
+    #[tokio::test]
+    async fn the_logs_scan_charges_the_statement_total() {
+        let alone = run_budgeted(&bytes_budget(3000), (0, 0)).await;
+        assert!(alone.error.is_none(), "{:?}", alone.error);
+        assert_eq!(alone.total(), (2670, 3));
+
+        let run = run_budgeted(&bytes_budget(3000), (1500, 1)).await;
+        let Some(SqlError::TooManyBytesScanned {
+            scanned: 3272,
+            max: 3000,
+        }) = run.error
+        else {
+            panic!("expected TooManyBytesScanned at 3272 of 3000, got {:?}", run.error);
+        };
+        assert_eq!(run.rows, 4);
+        assert_eq!(run.gets(), [1, 1, 0]);
     }
 
     /// Which statistics carriers a generated segment has for [`CODE`].
