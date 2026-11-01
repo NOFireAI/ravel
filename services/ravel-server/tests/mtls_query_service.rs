@@ -36,6 +36,11 @@ fn bearer(token: &str) -> HeaderMap {
 /// over a disjoint token set, so a credential that works on one is invalid on
 /// the other.
 async fn start_test_server() -> ravel_server::Running {
+    start_test_server_over(Arc::new(MemoryStore::new())).await
+}
+
+/// [`start_test_server`] over a store the caller keeps a handle to.
+async fn start_test_server_over(store: Arc<MemoryStore>) -> ravel_server::Running {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
@@ -44,7 +49,6 @@ async fn start_test_server() -> ravel_server::Running {
     mtls_tokens.insert(MTLS_TOKEN.to_string(), TenantId::new(MTLS_TENANT));
     let mtls_resolver = ravel_server::tenant::build_resolver(mtls_tokens, false);
 
-    let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline: Default::default(),
@@ -157,6 +161,86 @@ async fn mtls_router_service_authenticates_with_the_mtls_resolver() {
         .authenticate(&bearer(MTLS_TOKEN))
         .expect_err("the mTLS credential is not a public-listener identity");
     assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// `describe_data` answers on both listeners' query services as `start` builds
+/// them, and reads families through the metadata cache `/api/v1/metadata`
+/// serves from rather than one of its own: the HTTP route fills the cache with
+/// the first record, the record is then replaced in the store, and both
+/// services still page the cached families inside the refresh horizon. FLIP:
+/// hand either `with_describe` a fresh `MetadataCache` over the same store and
+/// that service reads the replacement's `family_new`. FLIP: drop either
+/// construction site's `with_describe` and that call is refused as
+/// `Unsupported`.
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn describe_data_is_served_on_both_listeners_from_the_routes_metadata_cache() {
+    use ravel_catalog::{MetricKind, MetricMetadataEntry, write_metrics_meta};
+    use ravel_server::service::describe::DescribeDataRequest;
+
+    const NOW_NS: i64 = 1_700_000_000_000_000_000;
+    let entry = |name: &str| MetricMetadataEntry {
+        family_name: name.to_string(),
+        kind: MetricKind::Counter,
+        help: format!("{name} help"),
+        unit: String::new(),
+        updated_unix_ns: NOW_NS,
+    };
+
+    let store = Arc::new(MemoryStore::new());
+    let tenant_hash = TenantId::new(TENANT).hash();
+    let first = write_metrics_meta(store.as_ref(), &tenant_hash, &[entry("family_old")], None)
+        .await
+        .expect("write the first record");
+    let running = start_test_server_over(Arc::clone(&store)).await;
+
+    let metadata: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{}/api/v1/metadata", running.http_addr))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .expect("metadata request")
+        .json()
+        .await
+        .expect("metadata json");
+    assert!(
+        metadata["data"]["family_old"].is_array(),
+        "the route filled the cache with the first record: {metadata}"
+    );
+
+    write_metrics_meta(
+        store.as_ref(),
+        &tenant_hash,
+        &[entry("family_new")],
+        Some(first),
+    )
+    .await
+    .expect("replace the record");
+
+    let request = DescribeDataRequest {
+        signal: "metrics".to_string(),
+        offset: 0,
+        limit: None,
+        now_ns: NOW_NS,
+        deadline: std::time::Duration::from_secs(30),
+    };
+    for (listener, service) in [
+        ("public", running.query_service.as_ref()),
+        ("mtls", running.mtls_query_service.as_ref()),
+    ] {
+        let data = service
+            .expect("a query-serving mode builds both services")
+            .describe_data(tenant_hash, &request)
+            .await
+            .unwrap_or_else(|err| panic!("{listener}: {err:?}"));
+        let names: Vec<_> = data.families.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["family_old"], "{listener}");
+        assert_eq!(data.families_total, 1, "{listener}");
+        assert_eq!(data.families[0].help, "family_old help", "{listener}");
+        assert_eq!(data.ingest_watermark_hour, None, "{listener}");
+    }
 
     running.shutdown().await.expect("clean shutdown");
 }
