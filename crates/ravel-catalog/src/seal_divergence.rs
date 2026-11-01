@@ -139,6 +139,15 @@ pub enum SealDivergenceError {
         expected: String,
         actual: String,
     },
+    /// The catalog's memory budget refused the part's declared decoded size
+    /// (ADR-1170, catalog decode charge amendment): a transient refusal under
+    /// memory pressure, not a defect of the part. Nothing was compared.
+    #[error("part {key} decode refused by the memory budget: {source}")]
+    MemoryExhausted {
+        key: String,
+        #[source]
+        source: ravel_memory::MemoryExhausted,
+    },
     #[error("part {key} has a malformed writer_id entry")]
     PartWriterId { key: String },
     #[error("failed to build shard prefix: {source}")]
@@ -213,12 +222,14 @@ fn head_key(tenant: &TenantHash, signal: Signal) -> String {
 /// read/decode failure of the objects the comparison needs -- including a
 /// non-`NotFound` HEAD GET failure (issue #1976) -- never the presence of a
 /// divergence, or [`SealDivergenceError::PartTenantMismatch`] for a part whose
-/// header names another tenant.
+/// header names another tenant, or [`SealDivergenceError::MemoryExhausted`]
+/// for a part decode the catalog's memory budget refused.
 ///
-/// Every read goes through `store`. `catalog` supplies only the
-/// isolation-breach counter a foreign part is counted on, so a caller can
-/// read through a different store than the catalog's own (the scrub reads
-/// through the background store class).
+/// Every read goes through `store`. `catalog` supplies the isolation-breach
+/// counter a foreign part is counted on and the memory budget each part
+/// decode is charged to, so a caller can read through a different store than
+/// the catalog's own (the scrub reads through the background store class).
+/// The parts' charges are held until the comparison returns.
 pub async fn verify_seal_divergence(
     store: &dyn ObjectStoreBackend,
     catalog: &Catalog,
@@ -267,6 +278,7 @@ pub async fn verify_seal_divergence(
     let SnapshotEntries {
         level0: snapshot_entries,
         entry_count: snapshot_entry_count,
+        reservations: _reservations,
         ..
     } = read_snapshot_entries(store, catalog, tenant_hash, &head).await?;
 
@@ -383,12 +395,16 @@ struct SnapshotEntries {
     entry_count: usize,
     /// Part GETs that returned an object.
     parts_read: usize,
+    /// Every decoded part's charge on the catalog's memory budget, held for
+    /// as long as these entries are.
+    reservations: Vec<ravel_memory::Reservation>,
 }
 
 /// GET and decode every part `head` references. A part that cannot be fetched
 /// or decoded is an error, never an empty part, and so is a part whose header
 /// names a tenant other than `tenant`, counted on `catalog` before its
-/// entries are decoded.
+/// entries are decoded, and a part whose decode `catalog`'s memory budget
+/// refuses. Each part's charge stays reserved while the next part is read.
 async fn read_snapshot_entries(
     store: &dyn ObjectStoreBackend,
     catalog: &Catalog,
@@ -400,6 +416,7 @@ async fn read_snapshot_entries(
         level1_records: HashSet::new(),
         entry_count: 0,
         parts_read: 0,
+        reservations: Vec::with_capacity(head.parts.len()),
     };
     for part_ref in &head.parts {
         let got = store
@@ -410,21 +427,29 @@ async fn read_snapshot_entries(
                 source,
             })?;
         entries.parts_read += 1;
-        let decoded = catalog
-            .decode_tenant_part(tenant, &got.data)
-            .map_err(|err| match err {
-                TenantPartError::Corrupt(source) => SealDivergenceError::PartCorrupt {
-                    key: part_ref.key.clone(),
-                    source,
-                },
-                TenantPartError::ForeignTenant { expected, actual } => {
-                    SealDivergenceError::PartTenantMismatch {
+        let (decoded, reservation) =
+            catalog
+                .decode_tenant_part(tenant, &got.data)
+                .map_err(|err| match err {
+                    TenantPartError::Corrupt(source) => SealDivergenceError::PartCorrupt {
                         key: part_ref.key.clone(),
-                        expected,
-                        actual,
+                        source,
+                    },
+                    TenantPartError::ForeignTenant { expected, actual } => {
+                        SealDivergenceError::PartTenantMismatch {
+                            key: part_ref.key.clone(),
+                            expected,
+                            actual,
+                        }
                     }
-                }
-            })?;
+                    TenantPartError::MemoryExhausted(source) => {
+                        SealDivergenceError::MemoryExhausted {
+                            key: part_ref.key.clone(),
+                            source,
+                        }
+                    }
+                })?;
+        entries.reservations.push(reservation);
         for entry in decoded.entries {
             entries.entry_count += 1;
             if entry.level != 0 {
@@ -559,7 +584,9 @@ pub struct SnapshotCoverage {
 /// its compaction and rewrite records fetched, never the tenant's whole commit
 /// history. A HEAD or part that cannot be fetched or decoded is an `Err`, and
 /// so is a part naming another tenant, counted on `catalog` as in
-/// [`verify_seal_divergence`]; an absent HEAD covers nothing.
+/// [`verify_seal_divergence`], and a part decode `catalog`'s memory budget
+/// refuses; an absent HEAD covers nothing. The parts' charges are held until
+/// this returns.
 pub async fn snapshot_coverage(
     store: &dyn ObjectStoreBackend,
     catalog: &Catalog,
@@ -1756,5 +1783,250 @@ mod tests {
         .expect_err("a foreign part is a breach, not coverage");
         assert_part_tenant_mismatch(&err, &part_key, tenant);
         assert_eq!(catalog.isolation_breaches(), 1, "coverage counts it once");
+    }
+
+    /// [`test_catalog`] charging its decodes to `budget`.
+    fn budgeted_catalog(budget: &Arc<ravel_memory::MemoryBudget>) -> crate::Catalog {
+        test_catalog().with_memory_budget(budget.clone())
+    }
+
+    /// Assert `err` is the budget refusal of the part at `part_key`, with the
+    /// figures the refused reservation carried.
+    fn assert_part_memory_exhausted(
+        err: &SealDivergenceError,
+        part_key: &str,
+        requested: u64,
+        reserved: u64,
+        limit: u64,
+    ) {
+        match err {
+            SealDivergenceError::MemoryExhausted { key, source } => {
+                assert_eq!(key, part_key);
+                assert_eq!(source.requested, requested, "the declared length");
+                assert_eq!(source.reserved, reserved);
+                assert_eq!(source.limit, limit);
+            }
+            other => panic!("expected MemoryExhausted, got {other:?}"),
+        }
+    }
+
+    /// ADR-1170, catalog decode charge amendment: both readers of
+    /// `read_snapshot_entries` charge a part's declared
+    /// `entries_uncompressed_len` to the catalog's budget before decoding it,
+    /// and a refusal is a typed `MemoryExhausted` naming the part, never a
+    /// degrade, a different error, or a decode. The refused reservation
+    /// charges nothing.
+    ///
+    /// FLIP: delete the `reserve_decoded` call in
+    /// `Catalog::decode_tenant_part` and both calls succeed, so `expect_err`
+    /// panics. FLIP: reserve the stored part length (`bytes.len()`) instead of
+    /// the declared one and `requested` differs (`part_declared_len` asserts
+    /// the two lengths differ). FLIP: map the refusal to `Ok(None)` in
+    /// `verify_seal_divergence` and `expect_err` panics.
+    #[tokio::test]
+    async fn a_refused_part_decode_fails_verify_and_coverage_with_the_declared_charge() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "refused-decode";
+        let tenant_hash = TenantId::new(tenant).hash();
+        let now = 600_000 * NS_PER_HOUR;
+        let rec = publish_segment(store.as_ref(), tenant, 1, now - SEALED_AGE_NS).await;
+        fold(store.clone(), tenant, now).await;
+        let part_key = first_part_key(store.as_ref(), tenant).await;
+        let declared = crate::fold::tests::part_declared_len(store.as_ref(), &part_key).await;
+
+        // One byte of pressure leaves one byte too little for the part.
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared));
+        let _pressure = budget.reserve(1).expect("one byte fits");
+        let catalog = budgeted_catalog(&budget);
+
+        let err = verify_seal_divergence(store.as_ref(), &catalog, &tenant_hash, Signal::Metrics)
+            .await
+            .expect_err("a refused decode is an error, not a report");
+        assert_part_memory_exhausted(&err, &part_key, declared, 1, declared);
+        assert_eq!(budget.reserved(), 1, "the refusal charges nothing");
+
+        let err = snapshot_coverage(
+            store.as_ref(),
+            &catalog,
+            &tenant_hash,
+            Signal::Metrics,
+            &[identity(&rec)],
+        )
+        .await
+        .expect_err("a refused decode is an error, not coverage");
+        assert_part_memory_exhausted(&err, &part_key, declared, 1, declared);
+        assert_eq!(budget.reserved(), 1, "the refusal charges nothing");
+        assert_eq!(catalog.isolation_breaches(), 0, "a refusal is no breach");
+    }
+
+    /// Fold `tenant` over one sealed commit in each of two hours under a cap
+    /// of one entry per part, so the HEAD lists two parts. Returns both part
+    /// keys in HEAD order.
+    async fn fold_two_parts(store: &Arc<MemoryStore>, tenant: &str, now: i64) -> [String; 2] {
+        publish_segment(store.as_ref(), tenant, 1, now - SEALED_AGE_NS - NS_PER_HOUR).await;
+        publish_segment(store.as_ref(), tenant, 2, now - SEALED_AGE_NS).await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        crate::Catalog::new(
+            backend,
+            crate::CatalogConfig {
+                shard_count: 1,
+                snapshot_part_max_entries: 1,
+                ..crate::CatalogConfig::default()
+            },
+        )
+        .expect("catalog")
+        .with_provisioning_enforcement()
+        .fold(
+            &TenantId::new(tenant).hash(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now,
+            &[],
+            None,
+        )
+        .await
+        .expect("fold");
+        let key = head_key(&TenantId::new(tenant).hash(), Signal::Metrics);
+        let got = store.get(&key, GetRange::Full).await.expect("HEAD");
+        let head = decode_head(&got.data).expect("decodes");
+        assert_eq!(head.parts.len(), 2, "one part per hour under a cap of 1");
+        [head.parts[0].key.clone(), head.parts[1].key.clone()]
+    }
+
+    /// A decoded part's charge is held while its entries are resident: with
+    /// room for both parts but one byte, the second part is refused with the
+    /// first still charged, and with room for both the call succeeds and
+    /// releases both charges when it returns.
+    ///
+    /// FLIP: drop the reservation right after the decode in
+    /// `read_snapshot_entries` (`let (decoded, _) = ...` instead of pushing it
+    /// onto `reservations`) and the second part fits, so `expect_err` panics.
+    /// FLIP: delete the `reserve_decoded` call and both parts decode
+    /// unreserved, so `expect_err` panics.
+    #[tokio::test]
+    async fn every_part_charge_is_held_while_the_entries_are_resident() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "two-parts";
+        let tenant_hash = TenantId::new(tenant).hash();
+        let now = 600_000 * NS_PER_HOUR;
+        let [first_key, second_key] = fold_two_parts(&store, tenant, now).await;
+        let first = crate::fold::tests::part_declared_len(store.as_ref(), &first_key).await;
+        let second = crate::fold::tests::part_declared_len(store.as_ref(), &second_key).await;
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(first + second - 1));
+        let catalog = budgeted_catalog(&budget);
+        let err = verify_seal_divergence(store.as_ref(), &catalog, &tenant_hash, Signal::Metrics)
+            .await
+            .expect_err("the second part does not fit beside the first");
+        assert_part_memory_exhausted(&err, &second_key, second, first, first + second - 1);
+        let err = snapshot_coverage(store.as_ref(), &catalog, &tenant_hash, Signal::Metrics, &[])
+            .await
+            .expect_err("the second part does not fit beside the first");
+        assert_part_memory_exhausted(&err, &second_key, second, first, first + second - 1);
+        assert_eq!(budget.reserved(), 0, "the first part's charge is released");
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(first + second));
+        let catalog = budgeted_catalog(&budget);
+        verify_seal_divergence(store.as_ref(), &catalog, &tenant_hash, Signal::Metrics)
+            .await
+            .expect("both parts fit")
+            .expect("HEAD present");
+        snapshot_coverage(store.as_ref(), &catalog, &tenant_hash, Signal::Metrics, &[])
+            .await
+            .expect("both parts fit");
+        assert_eq!(budget.reserved(), 0, "both charges end with the call");
+    }
+
+    /// The charge goes through `Catalog::reserve_decoded`, so a budget held by
+    /// the catalog's own decoded-part cache is reclaimed for the part decode:
+    /// one eviction, then the decode fits.
+    ///
+    /// FLIP: reserve on the bare budget (`self.memory_budget.reserve(..)`) in
+    /// `Catalog::decode_tenant_part` and the cached part keeps the budget
+    /// full, so verify fails with `MemoryExhausted` and `expect` panics.
+    /// FLIP: charge a different catalog's budget than the one passed in and
+    /// nothing is evicted, so the eviction count reads 0.
+    #[tokio::test]
+    async fn a_part_decode_evicts_the_resolve_cache_to_fit() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "evicts-cache";
+        let tenant_hash = TenantId::new(tenant).hash();
+        let now = 600_000 * NS_PER_HOUR;
+        let rec = publish_segment(store.as_ref(), tenant, 1, now - SEALED_AGE_NS).await;
+        fold(store.clone(), tenant, now).await;
+        let part_key = first_part_key(store.as_ref(), tenant).await;
+        let declared = crate::fold::tests::part_declared_len(store.as_ref(), &part_key).await;
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared));
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let catalog = crate::Catalog::new(
+            backend,
+            crate::CatalogConfig {
+                shard_count: 1,
+                ..crate::CatalogConfig::default()
+            },
+        )
+        .expect("catalog")
+        .with_memory_budget(budget.clone());
+        let hour = i64::from(rec.ingest_hour_bucket);
+        let range = ravel_types::TimeRange {
+            start_ns: hour * NS_PER_HOUR,
+            end_ns: (hour + 1) * NS_PER_HOUR - 1,
+        };
+        drop(
+            catalog
+                .resolve(&tenant_hash, Signal::Metrics, range, &[], now)
+                .await
+                .expect("resolve within the budget"),
+        );
+        assert_eq!(budget.reserved(), declared, "the cache holds the part");
+
+        verify_seal_divergence(store.as_ref(), &catalog, &tenant_hash, Signal::Metrics)
+            .await
+            .expect("the cached part is evicted to make room")
+            .expect("HEAD present");
+        assert_eq!(catalog.decoded_cache_memory_evictions(), 1);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the cache entry and the charge are gone"
+        );
+    }
+
+    /// A foreign part is reported as the breach it is even under a budget
+    /// that refuses every decode: the tenant check runs before the charge.
+    ///
+    /// FLIP: move the `tenant_hash` comparison after `reserve_decoded` in
+    /// `Catalog::decode_tenant_part` and both calls fail with
+    /// `MemoryExhausted`, so `assert_part_tenant_mismatch` panics and
+    /// `isolation_breaches()` reads 0. FLIP: drop the `record_isolation_breach`
+    /// call and `isolation_breaches()` reads 0.
+    #[tokio::test]
+    async fn a_foreign_part_is_a_breach_under_an_empty_budget() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "foreign-empty-budget";
+        let tenant_hash = TenantId::new(tenant).hash();
+        let (rec, part_key) = fold_with_foreign_part(&store, tenant).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(0));
+
+        let catalog = budgeted_catalog(&budget);
+        let err = verify_seal_divergence(store.as_ref(), &catalog, &tenant_hash, Signal::Metrics)
+            .await
+            .expect_err("a foreign part is a breach");
+        assert_part_tenant_mismatch(&err, &part_key, tenant);
+        assert_eq!(catalog.isolation_breaches(), 1);
+
+        let catalog = budgeted_catalog(&budget);
+        let err = snapshot_coverage(
+            store.as_ref(),
+            &catalog,
+            &tenant_hash,
+            Signal::Metrics,
+            &[identity(&rec)],
+        )
+        .await
+        .expect_err("a foreign part is a breach");
+        assert_part_tenant_mismatch(&err, &part_key, tenant);
+        assert_eq!(catalog.isolation_breaches(), 1);
     }
 }
