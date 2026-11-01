@@ -985,14 +985,26 @@ and passes through bit-exactly.
      of per candidate, which dominates at low selectivity. A non-empty
      equality value that is absent from the dictionary resolves to nothing and
      yields zero series, the correct result, with no materialization.
+   - Ordinal equality path, sparse objects. When an at-or-above-threshold
+     object takes the catalog-probe path (below) with the same matcher shape,
+     the fetcher decodes through `decode_catalog_v5_chunked_matching`. It
+     resolves every equality name and value against
+     LABEL_DICT first; when any of them is absent it returns zero series
+     without reading SERIES_IDS, SERIES_IDX or SERIES_META_CHUNKS, so no
+     chunk frame is decompressed. Otherwise it decodes every chunk and
+     compares each series by ordinal, building label strings, a LabelSet
+     and run vectors only for a series holding every pair. A non-matching
+     series still has its ordinals resolved and its runs checked, so a
+     corrupt section returns the same typed error as the unpruned decode.
+     The fetcher still filters the result with `matches_series`.
    - Materializing path. Every other case decodes the catalog and filters with
      `matches_series`, which reads each label's value as a string, costing one
      materialization per candidate series. This path takes: any set containing
      a regex or negated matcher; an empty-value equality (`l=""`, which means
      "absent or empty", a series shape the dictionary has no ordinal for); and
-     every at-or-above-threshold (sparse) object, which carries no whole
-     SERIES_META for the ordinal decoder and reads its catalog through the
-     chunked or whole-object path.
+     every at-or-above-threshold (sparse) object that does not qualify for
+     the catalog-probe path, which reads its catalog through the
+     whole-object path.
 3. Page level: v1 has one page pair per series; nothing further to prune.
 
 ## Segment catalog fetch: whole-object vs sparse catalog-probe
@@ -1011,11 +1023,16 @@ shape (docs/segment-format.md, ADR-0026):
   sit contiguously at the object front, ahead of the TS/VAL/HIST page
   sections. When the object qualifies for the **catalog-probe path**, the
   fetcher range-GETs only that catalog prefix (coalesced into as few GETs as
-  the layout allows) and decodes via `decode_catalog_v5_chunked`, skipping
-  the page bytes a whole-object GET would move. The matched series' pages are
+  the layout allows) and decodes via `decode_catalog_v5_chunked_matching`
+  when every matcher is a non-empty positive equality, else via
+  `decode_catalog_v5_chunked`, skipping the page bytes a whole-object GET
+  would move. The matched series' pages are
   fetched selectively afterward, exactly as the below-threshold path already
-  does. Each catalog section's crc32c is re-verified on the fetched bytes, so
-  a mis-ranged or corrupt fetch is a typed error, never wrong data.
+  does. Each catalog section the decode reads has its crc32c re-verified on
+  the fetched bytes, so a mis-ranged or corrupt fetch is a typed error, never
+  wrong data. The matching decode reads only LABEL_DICT when an equality
+  name or value is absent from it; the other three sections are fetched but
+  neither verified nor decoded in that case.
 - **Otherwise** (a sparse object that does not qualify) the fetcher keeps the
   unchanged whole-object GET and `decode_catalog_v5`.
 
