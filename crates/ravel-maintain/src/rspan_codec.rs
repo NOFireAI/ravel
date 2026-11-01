@@ -382,6 +382,13 @@ impl RecordCounts {
 /// [`PartBuilder::push`]) counts distinct traces correctly without a set. A
 /// record `keep` rejects is released here, so the erasure rewrite's peak memory
 /// is bounded by its survivors' part, not by everything it read.
+///
+/// A second cut runs at the same trace boundary (issue #2985): a part closes
+/// before the next trace would take any of its KEY_IDX buckets past
+/// [`PART_KEY_IDX_BUCKET_CAP`] entries (see [`admit_trace`]). Trace ids are
+/// caller-chosen and the bucket mix is invertible, so a sender can aim every
+/// trace at one bucket; without the cut such a bucket fails the writer and
+/// the bucket's inputs could never be compacted.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn merge(
     store: &dyn ObjectStoreBackend,
@@ -391,6 +398,32 @@ pub(crate) async fn merge(
     input_set_hash: &[u8; 32],
     dry_run: bool,
     keep: &mut (dyn FnMut(&SpanRecord) -> Result<bool> + Send),
+) -> Result<SpanMergeOutput> {
+    merge_with_key_idx_cap(
+        store,
+        config,
+        bucket,
+        catalogs,
+        input_set_hash,
+        dry_run,
+        keep,
+        PART_KEY_IDX_BUCKET_CAP,
+    )
+    .await
+}
+
+/// [`merge`] with the per-bucket KEY_IDX cap as a parameter, so a test can
+/// reach the cut with a few traces instead of 2^20 spans in one bucket.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn merge_with_key_idx_cap(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    catalogs: &[SpanInputCatalog],
+    input_set_hash: &[u8; 32],
+    dry_run: bool,
+    keep: &mut (dyn FnMut(&SpanRecord) -> Result<bool> + Send),
+    key_idx_cap: u64,
 ) -> Result<SpanMergeOutput> {
     let ledger = config.request_ledger.as_ref();
     // No whole-object fetch: the per-input ranged readers are already in the
@@ -427,9 +460,19 @@ pub(crate) async fn merge(
         .try_collect()
         .await?;
 
-    let mut parts = Vec::new();
-    let mut part_index: u32 = 0;
+    let mut out = PartSink {
+        store,
+        bucket,
+        config,
+        input_set_hash,
+        dry_run,
+        ledger,
+        tracker,
+        parts: Vec::new(),
+        part_index: 0,
+    };
     let mut current: Option<PartBuilder> = None;
+    let mut pending = PendingTrace::default();
     let mut current_trace: Option<[u8; 16]> = None;
     let mut counts = RecordCounts::default();
 
@@ -455,10 +498,10 @@ pub(crate) async fn merge(
 
         counts.add_input()?;
 
-        // The trace-boundary flush runs on every `trace_id` transition in the
-        // merged stream, independent of `keep`: a part is closed before the
-        // first record of a new trace so a trace never straddles two parts.
-        // Only surviving records open or push into a part.
+        // The trace-boundary work runs on every `trace_id` transition in the
+        // merged stream, independent of `keep`: the trace just completed is
+        // admitted whole into a part, so a trace never straddles two parts.
+        // Only surviving records join the pending trace.
         //
         // This transition is the only place the split target is consulted, so
         // the part's heap is whatever the traces it already holds weigh: past
@@ -475,34 +518,12 @@ pub(crate) async fn merge(
                 crate::claim_guard::Checkpoint::MergeLoop,
             )
             .await?;
+            admit_trace(&mut out, &mut current, &mut pending, &identity, key_idx_cap).await?;
             if let Some(part) = &current {
-                let over_cap =
+                let over_target =
                     part.estimate >= config.l1_part_memory_target_bytes && !part.is_empty();
-                if over_cap && let Some(builder) = current.take() {
-                    let built = builder
-                        .finish(
-                            store,
-                            bucket,
-                            config,
-                            input_set_hash,
-                            part_index,
-                            dry_run,
-                            ledger,
-                        )
-                        .await?;
-                    // Cancellation checkpoint 4: a part boundary, after the
-                    // part PUT returned.
-                    crate::claim_guard::checkpoint(
-                        config,
-                        store,
-                        crate::claim_guard::Checkpoint::PartBoundary,
-                    )
-                    .await?;
-                    parts.push(built);
-                    part_index += 1;
-                    if let Some(t) = tracker {
-                        t.set_writer_bytes(0);
-                    }
+                if over_target && let Some(builder) = current.take() {
+                    out.close(builder).await?;
                 }
             }
             current_trace = Some(trace_id);
@@ -510,40 +531,142 @@ pub(crate) async fn merge(
 
         if keep(&rec)? {
             counts.add_output()?;
-            let part = current.get_or_insert_with(|| PartBuilder::new(&identity));
-            part.push(rec, tracker);
+            pending.push(rec)?;
+            if let Some(t) = tracker {
+                let part_estimate = current.as_ref().map_or(0, |p| p.estimate);
+                t.set_writer_bytes(part_estimate.saturating_add(pending.estimate));
+            }
         }
         cursors[bi].refill(store, tracker, ledger).await?;
     }
 
+    admit_trace(&mut out, &mut current, &mut pending, &identity, key_idx_cap).await?;
     if let Some(part) = current
         && !part.is_empty()
     {
-        let built = part
-            .finish(
-                store,
-                bucket,
-                config,
-                input_set_hash,
-                part_index,
-                dry_run,
-                ledger,
-            )
-            .await?;
-        // Cancellation checkpoint 4 for the tail part.
-        crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::PartBoundary)
-            .await?;
-        parts.push(built);
-        if let Some(t) = tracker {
-            t.set_writer_bytes(0);
-        }
+        out.close(part).await?;
     }
 
     Ok(SpanMergeOutput {
-        parts,
+        parts: out.parts,
         input_record_count: counts.input,
         output_record_count: counts.output,
     })
+}
+
+/// The most KEY_IDX entries the merge lets one bucket of an L1 part reach: the
+/// cap the RSPAN writer refuses past. A test lowers it through
+/// [`merge_with_key_idx_cap`] to reach the cut without 2^20 spans.
+pub(crate) const PART_KEY_IDX_BUCKET_CAP: u64 = ravel_rspan::KEY_IDX_BUCKET_MAX_ENTRIES as u64;
+
+/// Admits the completed pending trace whole into a part (issue #2985).
+///
+/// The trace's charge is its surviving span count, billed to the KEY_IDX
+/// bucket its `trace_id` lands in. A bucket entry is a distinct
+/// `(key8, block)` pair and every pair has at least one row behind it, so the
+/// summed charges bound the bucket's entries from above whatever blocks the
+/// writer later cuts. When the part is non-empty and the charge would take
+/// that bucket past `cap`, the part is closed first and the trace opens the
+/// next one, so the writer's overflow refusal is never reached. A trace whose
+/// charge alone passes `cap` gets a fresh part rather than an error: its own
+/// entries are one per block it occupies, about its span count over
+/// `block_target_records`, far below the cap.
+async fn admit_trace(
+    out: &mut PartSink<'_>,
+    current: &mut Option<PartBuilder>,
+    pending: &mut PendingTrace,
+    identity: &ObjectIdentity,
+    cap: u64,
+) -> Result<()> {
+    let Some(bucket) = pending.bucket else {
+        return Ok(());
+    };
+    let charge = pending.records.len() as u64;
+    if let Some(part) = current.as_ref() {
+        let over_cap = part.bucket_load(bucket)?.saturating_add(charge) > cap;
+        if over_cap
+            && !part.is_empty()
+            && let Some(builder) = current.take()
+        {
+            out.close(builder).await?;
+        }
+    }
+    let part = current.get_or_insert_with(|| PartBuilder::new(identity));
+    part.charge_bucket(bucket, charge)?;
+    for rec in std::mem::take(&mut pending.records) {
+        part.push(rec);
+    }
+    *pending = PendingTrace::default();
+    if let Some(t) = out.tracker {
+        t.set_writer_bytes(part.estimate);
+    }
+    Ok(())
+}
+
+/// Where [`merge`] closes its parts: everything a part's encode and PUT need,
+/// the parts built so far, and the next part's index.
+struct PartSink<'a> {
+    store: &'a dyn ObjectStoreBackend,
+    bucket: &'a Bucket,
+    config: &'a CompactorConfig,
+    input_set_hash: &'a [u8; 32],
+    dry_run: bool,
+    ledger: Option<&'a RequestLedger>,
+    tracker: Option<&'a MergeMemoryTracker>,
+    parts: Vec<BuiltPart>,
+    part_index: u32,
+}
+
+impl PartSink<'_> {
+    /// Encodes and PUTs `builder` as the next part, then passes cancellation
+    /// checkpoint 4 (a part boundary, after the part PUT returned).
+    async fn close(&mut self, builder: PartBuilder) -> Result<()> {
+        let built = builder
+            .finish(
+                self.store,
+                self.bucket,
+                self.config,
+                self.input_set_hash,
+                self.part_index,
+                self.dry_run,
+                self.ledger,
+            )
+            .await?;
+        crate::claim_guard::checkpoint(
+            self.config,
+            self.store,
+            crate::claim_guard::Checkpoint::PartBoundary,
+        )
+        .await?;
+        self.parts.push(built);
+        self.part_index += 1;
+        if let Some(t) = self.tracker {
+            t.set_writer_bytes(0);
+        }
+        Ok(())
+    }
+}
+
+/// The surviving records of the trace the merge is reading, held until the
+/// next `trace_id` transition shows the trace is complete and its KEY_IDX
+/// charge is known. `bucket` is the trace's KEY_IDX bucket once a record has
+/// survived, `None` while the trace is empty.
+#[derive(Default)]
+struct PendingTrace {
+    records: Vec<SpanRecord>,
+    estimate: u64,
+    bucket: Option<u32>,
+}
+
+impl PendingTrace {
+    fn push(&mut self, rec: SpanRecord) -> Result<()> {
+        if self.bucket.is_none() {
+            self.bucket = Some(ravel_rspan::trace_key_idx_bucket(&rec.trace_id)?);
+        }
+        self.estimate = self.estimate.saturating_add(estimate_record(&rec));
+        self.records.push(rec);
+        Ok(())
+    }
 }
 
 /// Open one input's cursor over its whole block sequence and load its first
@@ -571,12 +694,17 @@ async fn open_cursor<'a>(
 /// [`MergeMemoryTracker`]'s writer term. Between two such boundaries the
 /// estimate grows unchecked, which is why the target is a split point rather
 /// than a bound on this part's heap.
+///
+/// `bucket_loads` is the part's per-KEY_IDX-bucket charge ([`admit_trace`]),
+/// indexed by [`ravel_rspan::trace_key_idx_bucket`], the writer's own bucket
+/// function. It lives on the part, so every new part starts at zero.
 struct PartBuilder {
     writer: RspanWriter,
     estimate: u64,
     count: usize,
     trace_count: u64,
     last_trace: Option<[u8; 16]>,
+    bucket_loads: Vec<u64>,
 }
 
 impl PartBuilder {
@@ -587,6 +715,7 @@ impl PartBuilder {
             count: 0,
             trace_count: 0,
             last_trace: None,
+            bucket_loads: vec![0; ravel_rspan::TRACE_KEY_IDX_BUCKETS],
         }
     }
 
@@ -594,12 +723,28 @@ impl PartBuilder {
         self.count == 0
     }
 
+    fn bucket_load(&self, bucket: u32) -> Result<u64> {
+        self.bucket_loads
+            .get(bucket as usize)
+            .copied()
+            .ok_or_else(|| bucket_out_of_range(bucket))
+    }
+
+    fn charge_bucket(&mut self, bucket: u32, charge: u64) -> Result<()> {
+        let load = self
+            .bucket_loads
+            .get_mut(bucket as usize)
+            .ok_or_else(|| bucket_out_of_range(bucket))?;
+        *load = load.saturating_add(charge);
+        Ok(())
+    }
+
     /// Push one merged record into the part's writer, updating the running
     /// estimate and the distinct-trace count. Since the merge feeds records in
     /// `(trace_id, start_ts_ns)` order, all of one trace's records arrive
     /// contiguously, so a transition on `last_trace` counts distinct traces
     /// exactly.
-    fn push(&mut self, r: SpanRecord, tracker: Option<&MergeMemoryTracker>) {
+    fn push(&mut self, r: SpanRecord) {
         if self.last_trace != Some(r.trace_id) {
             self.trace_count += 1;
             self.last_trace = Some(r.trace_id);
@@ -607,9 +752,6 @@ impl PartBuilder {
         self.estimate = self.estimate.saturating_add(estimate_record(&r));
         self.count += 1;
         self.writer.push(r);
-        if let Some(t) = tracker {
-            t.set_writer_bytes(self.estimate);
-        }
     }
 
     /// Encode and PUT the part through the shared writer pipeline. See
@@ -639,6 +781,13 @@ impl PartBuilder {
         )
         .await
     }
+}
+
+fn bucket_out_of_range(bucket: u32) -> MaintainError {
+    MaintainError::Invariant(format!(
+        "KEY_IDX bucket {bucket} outside {} buckets",
+        ravel_rspan::TRACE_KEY_IDX_BUCKETS
+    ))
 }
 
 /// One input's cursor over its whole block sequence, yielding records in
