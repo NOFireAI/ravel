@@ -128,25 +128,29 @@ pub struct ChunkLocation {
 // SERIES_IDX decode
 // ===========================================================================
 
+/// `len` bytes at `*pos`, advancing past them. The error is built only on the
+/// error path (let-else, not `ok_or`): this runs once per SERIES_IDX entry.
+fn take_fixed<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8], SegmentError> {
+    let Some(s) = pos.checked_add(len).and_then(|end| bytes.get(*pos..end)) else {
+        return Err(SegmentError::Truncated);
+    };
+    *pos += len;
+    Ok(s)
+}
+
 fn take_u32(bytes: &[u8], pos: &mut usize) -> Result<u32, SegmentError> {
-    let end = pos.checked_add(4).ok_or(SegmentError::Truncated)?;
-    let s = bytes.get(*pos..end).ok_or(SegmentError::Truncated)?;
-    *pos = end;
+    let s = take_fixed(bytes, pos, 4)?;
     Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
 fn take_u64(bytes: &[u8], pos: &mut usize) -> Result<u64, SegmentError> {
-    let end = pos.checked_add(8).ok_or(SegmentError::Truncated)?;
-    let s = bytes.get(*pos..end).ok_or(SegmentError::Truncated)?;
-    *pos = end;
+    let s = take_fixed(bytes, pos, 8)?;
     let arr: [u8; 8] = s.try_into().map_err(|_| SegmentError::Truncated)?;
     Ok(u64::from_le_bytes(arr))
 }
 
 fn take_id(bytes: &[u8], pos: &mut usize) -> Result<[u8; 16], SegmentError> {
-    let end = pos.checked_add(16).ok_or(SegmentError::Truncated)?;
-    let s = bytes.get(*pos..end).ok_or(SegmentError::Truncated)?;
-    *pos = end;
+    let s = take_fixed(bytes, pos, 16)?;
     s.try_into().map_err(|_| SegmentError::Truncated)
 }
 
@@ -484,12 +488,12 @@ fn reconstruct_from_base(
     let mut out = Vec::with_capacity(gaps.len());
     let mut end = base;
     for (&gap, &len) in gaps.iter().zip(lens) {
-        let offset = end
+        let Some((offset, new_end)) = end
             .checked_add(gap)
-            .ok_or(SegmentError::SectionOutOfBounds)?;
-        let new_end = offset
-            .checked_add(len)
-            .ok_or(SegmentError::SectionOutOfBounds)?;
+            .and_then(|offset| Some((offset, offset.checked_add(len)?)))
+        else {
+            return Err(SegmentError::SectionOutOfBounds);
+        };
         if new_end > section_len {
             return Err(SegmentError::SectionOutOfBounds);
         }
@@ -576,9 +580,10 @@ fn decode_chunk_frame(
         if rc == 0 {
             return Err(SegmentError::ZeroRunCount);
         }
-        rc_sum = rc_sum
-            .checked_add(u64::from(rc))
-            .ok_or(SegmentError::FieldOverflow)?;
+        let Some(sum) = rc_sum.checked_add(u64::from(rc)) else {
+            return Err(SegmentError::FieldOverflow);
+        };
+        rc_sum = sum;
     }
     if rc_sum != frame_run_total as u64 {
         return Err(SegmentError::RunCountSumMismatch {
@@ -708,9 +713,10 @@ fn parse_chunk_provenance(
             0 => {}
             1 => {
                 any_present = true;
-                prov_sample_total = prov_sample_total
-                    .checked_add(sc)
-                    .ok_or(SegmentError::FieldOverflow)?;
+                let Some(total) = prov_sample_total.checked_add(sc) else {
+                    return Err(SegmentError::FieldOverflow);
+                };
+                prov_sample_total = total;
             }
             _ => {
                 return Err(SegmentError::InvalidProvenancePresence(
@@ -957,12 +963,12 @@ pub fn decode_catalog_v5_chunked(
             usize::try_from(chunk.frame_offset).map_err(|_| SegmentError::SectionOutOfBounds)?;
         let stored_len = usize::try_from(chunk.frame_stored_len)
             .map_err(|_| SegmentError::SectionOutOfBounds)?;
-        let end = start
+        let Some(stored) = start
             .checked_add(stored_len)
-            .ok_or(SegmentError::SectionOutOfBounds)?;
-        let stored = chunk_bytes
-            .get(start..end)
-            .ok_or(SegmentError::SectionOutOfBounds)?;
+            .and_then(|end| chunk_bytes.get(start..end))
+        else {
+            return Err(SegmentError::SectionOutOfBounds);
+        };
         if crc32c::crc32c(stored) != chunk.frame_crc32c {
             return Err(SegmentError::ChunkCrcMismatch);
         }
@@ -980,23 +986,27 @@ pub fn decode_catalog_v5_chunked(
         if frame.n != chunk.n as usize {
             return Err(SegmentError::BadChunkFrame);
         }
-        run_total_sum = run_total_sum
-            .checked_add(frame.run_count.iter().map(|&c| u64::from(c)).sum::<u64>())
-            .ok_or(SegmentError::FieldOverflow)?;
+        let Some(sum) =
+            run_total_sum.checked_add(frame.run_count.iter().map(|&c| u64::from(c)).sum::<u64>())
+        else {
+            return Err(SegmentError::FieldOverflow);
+        };
+        run_total_sum = sum;
 
         // Materialize each series in the frame.
         let mut voff = 0usize;
         let mut roff = 0usize;
         for i in 0..frame.n {
             let abs = entries.len();
-            let schema = schemas.get(frame.schema_ref[i] as usize).ok_or(
-                SegmentError::SchemaRefOutOfRange(u64::from(frame.schema_ref[i])),
-            )?;
+            let Some(schema) = schemas.get(frame.schema_ref[i] as usize) else {
+                return Err(SegmentError::SchemaRefOutOfRange(u64::from(
+                    frame.schema_ref[i],
+                )));
+            };
             let name_count = schema.name_ords.len();
-            let vals = frame
-                .value_ord
-                .get(voff..voff + name_count)
-                .ok_or(SegmentError::BadBlockLen)?;
+            let Some(vals) = frame.value_ord.get(voff..voff + name_count) else {
+                return Err(SegmentError::BadBlockLen);
+            };
             voff += name_count;
             let mut label_pairs = Vec::with_capacity(name_count);
             for (&name_ord, &val_ord) in schema.name_ords.iter().zip(vals) {
@@ -1024,15 +1034,16 @@ pub fn decode_catalog_v5_chunked(
             let mut min_ts_ns = i64::MAX;
             let mut max_ts_ns = i64::MIN;
             for r in &runs {
-                sample_count = sample_count
-                    .checked_add(r.sample_count)
-                    .ok_or(SegmentError::FieldOverflow)?;
+                let Some(sum) = sample_count.checked_add(r.sample_count) else {
+                    return Err(SegmentError::FieldOverflow);
+                };
+                sample_count = sum;
                 min_ts_ns = min_ts_ns.min(r.min_ts_ns);
                 max_ts_ns = max_ts_ns.max(r.max_ts_ns);
             }
-            let series_id = *series_ids
-                .get(abs)
-                .ok_or(SegmentError::SectionOutOfBounds)?;
+            let Some(&series_id) = series_ids.get(abs) else {
+                return Err(SegmentError::SectionOutOfBounds);
+            };
             entries.push(SeriesEntryV4 {
                 entry: SeriesEntry {
                     series_id: SeriesId(series_id),
@@ -1281,9 +1292,12 @@ fn parse_v4_meta_columns(
                 0 => {}
                 1 => {
                     any_present = true;
-                    acc = acc
+                    let Some(sum) = acc
                         .checked_add(usize::try_from(sc).map_err(|_| SegmentError::FieldOverflow)?)
-                        .ok_or(SegmentError::FieldOverflow)?;
+                    else {
+                        return Err(SegmentError::FieldOverflow);
+                    };
+                    acc = sum;
                 }
                 _ => {
                     return Err(SegmentError::InvalidProvenancePresence(
@@ -1491,7 +1505,7 @@ fn build_series_idx(
         let off = 4 + i * 16;
         let id: [u8; 16] = series_ids_stored
             .get(off..off + 16)
-            .ok_or(write_err(SegmentError::SectionOutOfBounds))?
+            .ok_or_else(|| write_err(SegmentError::SectionOutOfBounds))?
             .try_into()
             .map_err(|_| write_err(SegmentError::SectionOutOfBounds))?;
         let next = (i + stride as usize).min(count_usize);
@@ -1502,7 +1516,7 @@ fn build_series_idx(
         };
         let window = series_ids_stored
             .get(off..end)
-            .ok_or(write_err(SegmentError::SectionOutOfBounds))?;
+            .ok_or_else(|| write_err(SegmentError::SectionOutOfBounds))?;
         entries.push(SparseEntry {
             id,
             ids_offset: off as u64,
