@@ -57,7 +57,8 @@ unchanged. The format-change procedure does not apply.
      and `SessionTable::Audit(Arc<AuditTableProvider>)`. `build_session`
      registers exactly the one table the query targets, as it does today
      (ADR-2904 has it register every table the statement names; see the
-     ADR-2904 amendment at the end of this file). Neither table registers a scalar UDF: every predicate their pushdown
+     ADR-2904 amendment at the end of this file). Neither table registers a
+     scalar UDF: every predicate their pushdown
      extractors accept is a plain column comparison or an `attrs['k']`
      subscript, which the map-field planner already serves.
    - `crates/ravel-sql/src/executor.rs`: `TargetSignal::Alerts` and
@@ -102,7 +103,8 @@ unchanged. The format-change procedure does not apply.
      catalog metadata built from the five schema functions
      (`public_schema`, `logs_schema`, `spans_schema`, `alerts_schema`,
      `audit_schema`), independent of the per-query session, which still
-     registers exactly one table (every named table since ADR-2904). It lists only `samples` today, which
+     registers exactly one table (every named table since ADR-2904). It
+     lists only `samples` today, which
      under-reports `logs` and `spans` as well; the Flight surface should
      discover what it can query.
 

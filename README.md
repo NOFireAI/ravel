@@ -202,8 +202,8 @@ statement may join Parquet tables with the five tables above, over
 `POST /api/v1/sql` and Flight SQL, and a `min_commit_token` on it bounds
 only the five. A Parquet table reads only the file versions it was defined
 over. A caller with the `ddl` capability, which is absent by default,
-creates a table with
-`CREATE EXTERNAL TABLE ... STORED AS PARQUET LOCATION '...'` and removes it
+creates a table with `CREATE EXTERNAL TABLE ... STORED AS PARQUET LOCATION
+'...'` and removes it
 with `DROP TABLE` (see the [query guide](docs/guides/query.md)). Such a table
 is queried by name:
 

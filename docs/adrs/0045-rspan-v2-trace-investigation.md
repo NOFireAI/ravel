@@ -127,8 +127,9 @@ assumed.
 
 Add a `Spans` arm to `SessionTable` and register `SpansTableProvider` in
 `build_session`, following the one-signal-per-query rule ADR-0033
-established for logs (since replaced by ADR-2904): the target table is decided from the `FROM` clause
-before planning, and a query naming two real tables is rejected before
+established for logs (since replaced by ADR-2904): the target table is
+decided from the `FROM` clause before planning, and a query naming two
+real tables is rejected before
 any catalog listing. Extend `SpansPushdown` with the duration, status,
 and service predicates the v2 structures make prunable, under the
 existing widen-only rule (ADR-0013): pruning may only widen the read set,
