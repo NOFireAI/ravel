@@ -5307,9 +5307,16 @@ the flag.
   (`the_decoded_set_estimate_matches_heap_bytes_per_kind` in
   `crates/ravel-logseg/src/reader.rs`). A scan that leaves a sub-bound
   segment unplanned does not fit
-  (`a_scan_that_skips_sub_bound_plans_is_withheld`), and neither does one
-  the whole-segment fast path takes, since it runs no plan pass
-  (`a_contains_scan_on_the_whole_segment_fast_path_is_withheld`). In a scan
+  (`a_scan_that_skips_sub_bound_plans_is_withheld`). The whole-segment
+  fast path runs no plan pass, so it makes the same estimate and verdict
+  itself, once per scan before any partition opens a segment, from each
+  relevant segment's directories read once through the read cache and
+  charged to the plan phase (`compute_fast_path_verdict` in
+  `crates/ravel-sql/src/logs_scan/plan.rs`;
+  `a_fitting_contains_scan_on_the_whole_segment_fast_path_is_served`,
+  `an_over_cap_contains_scan_on_the_whole_segment_fast_path_is_not_served`,
+  `the_fast_path_verdict_costs_one_directory_read_per_segment_cold_and_none_hot`).
+  In a scan
   that fits, a hit serves the deferred column, and a miss the cache will
   admit is decoded validated and offered before the survivor narrowing, so
   the entry holds the whole column and only the block's copy is narrowed

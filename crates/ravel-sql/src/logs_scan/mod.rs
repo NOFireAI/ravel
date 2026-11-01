@@ -3187,7 +3187,20 @@ impl ExecutionPlan for LogsScanExec {
                         partition,
                         n,
                     );
-                    (work, None, None, true, LogScanState::NextSegment)
+                    // ADR-3326, serve-if-fits amendment: a `Contains` scan with
+                    // a decoded cache awaits the one shared verdict before its
+                    // first open; the opens themselves are unchanged.
+                    let state = match fast_path_verdict_future(
+                        Arc::clone(&self.counts),
+                        Arc::clone(&ctx),
+                        Arc::clone(&self.segments),
+                        self.target_partitions,
+                        blocks.plan_init_elapsed.clone(),
+                    ) {
+                        Some(verdict) => LogScanState::Planning(verdict),
+                        None => LogScanState::NextSegment,
+                    };
+                    (work, None, None, true, state)
                 }
                 Err(reason) => {
                     BlockMetrics::record_fast_path_rejection(&self.metrics, partition, reason);

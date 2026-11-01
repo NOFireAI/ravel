@@ -14,8 +14,9 @@ pub(super) struct PartitionCtx {
     /// The plan pass's verdict on whether this scan serves its
     /// Contains-deferred columns from the decoded cache
     /// ([`PlanCounts::serves_deferred`]), copied in when the partition leaves
-    /// `Planning` and read by every open after it. False until then, and on
-    /// the whole-segment fast path, which runs no plan pass.
+    /// `Planning` and read by every open after it. False until then. On the
+    /// whole-segment fast path the verdict comes from
+    /// [`fast_path_verdict_future`], awaited in the same `Planning` state.
     pub(super) serve_deferred: std::sync::atomic::AtomicBool,
 }
 

@@ -124,7 +124,9 @@ pub struct DecodedCacheSnapshot {
     pub unvalidated_refusals: u64,
     /// The plan-time estimate of the decoded set of the statement's scans
     /// that carry a Contains arm, summed over those scans; `None` when no
-    /// such scan ran its plan pass (ADR-3326, serve-if-fits amendment).
+    /// such scan made a verdict (ADR-3326, serve-if-fits amendment). The SQL
+    /// logs scan makes one in its plan pass, and on the whole-segment fast
+    /// path in `compute_fast_path_verdict`.
     pub deferred_set_estimate_bytes: Option<u64>,
     /// Whether a scan of the statement serves its Contains-deferred columns
     /// from the cache, its estimate being at most 0.95 of the cap.
@@ -185,7 +187,8 @@ impl DecodedCacheCounters {
 
     /// Records one scan's plan-time decoded-set estimate and whether that
     /// scan serves its Contains-deferred columns (ADR-3326, serve-if-fits
-    /// amendment). Called once per scan with a Contains arm, by its plan pass.
+    /// amendment). Called once per scan with a Contains arm, by its plan pass
+    /// or, on the whole-segment fast path, by its directory-read pass.
     pub fn record_deferred_verdict(&self, estimate_bytes: u64, served: bool) {
         Self::bump(&self.deferred_set_estimate_bytes, estimate_bytes);
         self.deferred_estimated.store(true, Ordering::Relaxed);
