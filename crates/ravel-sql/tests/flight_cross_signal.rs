@@ -27,10 +27,10 @@ use ravel_commit::{erasure, keys, signal};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
+use ravel_query::{QueryAdmissionController, QueryConcurrencyLimit};
 use ravel_sql::{
     FlightTicket, MSG_UNSATISFIABLE, MinCommitToken, SqlError, TargetSignal, TicketKey,
 };
-use ravel_query::{QueryAdmissionController, QueryConcurrencyLimit};
 use ravel_types::accounting::NoopQueryCostRecorder;
 use ravel_types::{CommitToken, Signal, TenantHash, TenantId};
 use tonic::Code;

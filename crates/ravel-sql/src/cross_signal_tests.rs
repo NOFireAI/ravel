@@ -2058,7 +2058,10 @@ async fn a_shadowed_table_name_is_cut_like_the_alias() {
             ("relation alias", cut.as_str(), cut.as_str()),
             "{entry}"
         );
-        let message = err.as_ref().map(SqlError::client_message).unwrap_or_default();
+        let message = err
+            .as_ref()
+            .map(SqlError::client_message)
+            .unwrap_or_default();
         assert!(!message.contains(&long), "{entry}: {message}");
     }
     assert_eq!(recording.requests(), Vec::<String>::new());
