@@ -413,12 +413,14 @@ mod tests {
                 segments: 3,
                 segments_pruned: 2,
                 phases: samples.snapshot(),
+                budgets: None,
             },
             SignalStats {
                 table: "logs",
                 segments: 1,
                 segments_pruned: 0,
                 phases: logs.snapshot(),
+                budgets: None,
             },
         ];
         let entries = signals_json(&signals);

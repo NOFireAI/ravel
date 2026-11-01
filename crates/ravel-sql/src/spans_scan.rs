@@ -93,6 +93,7 @@ use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 
 use crate::error::SqlError;
+use crate::scan_budget::ScanBudget;
 use crate::spans_fetcher::{SpanRow, SpanSegmentFetcher};
 use crate::spans_schema::{
     SPAN_COL_ATTRS, SPAN_COL_DURATION_NS, SPAN_COL_END_TS, SPAN_COL_EVENTS, SPAN_COL_LINKS,
@@ -248,6 +249,9 @@ pub struct SpansScanExec {
     /// funnel, mirroring `LogsScanExec`. A trace lookup's footer and section
     /// reads land on the probe phase and its block runs on the scan phase.
     accounting: PhaseAccounting,
+    /// The statement's byte and request budgets (issue #1409), checked after
+    /// each segment fetch and before its blocks are decoded.
+    budget: ScanBudget,
     /// Partition metrics (ADR-0110 decision 5): `columnar_batches`/
     /// `rowpath_batches` show which path a partition ran, and
     /// `pages_decoded`/`pages_skipped` show projection reaching decode, so
@@ -300,6 +304,8 @@ impl SpansScanExec {
         };
         let columnar_eligible = columnar_static_eligible(projection.as_deref(), &erasure);
         let properties = Arc::new(Self::compute_properties(&schema, n, projection.as_deref())?);
+        let accounting = PhaseAccounting::pooled_over(&accounting);
+        let budget = ScanBudget::unlimited(&accounting);
         Ok(SpansScanExec {
             tenant_hash,
             fetcher,
@@ -314,7 +320,8 @@ impl SpansScanExec {
             columnar_eligible,
             schema,
             properties,
-            accounting: PhaseAccounting::pooled_over(&accounting),
+            accounting,
+            budget,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -324,6 +331,13 @@ impl SpansScanExec {
     #[must_use]
     pub fn with_phase_accounting(mut self, phases: PhaseAccounting) -> Self {
         self.accounting = phases;
+        self
+    }
+
+    /// Check the statement's byte and request budgets after every segment
+    /// fetch (issue #1409). Unlimited by default.
+    pub(crate) fn with_scan_budget(mut self, budget: ScanBudget) -> Self {
+        self.budget = budget;
         self
     }
 
@@ -458,6 +472,7 @@ impl ExecutionPlan for SpansScanExec {
             self.columnar_eligible,
             self.projection.clone(),
             self.accounting.clone(),
+            self.budget.clone(),
             metrics.blocks_decoded.clone(),
             metrics.key_index.clone(),
         ));
@@ -626,6 +641,7 @@ async fn prepare_partition(
     attempt_columnar: bool,
     projection: Option<Arc<Vec<usize>>>,
     accounting: PhaseAccounting,
+    budget: ScanBudget,
     blocks_decoded: Count,
     key_index: KeyIndexCounters,
 ) -> DFResult<Prepared> {
@@ -666,6 +682,7 @@ async fn prepare_partition(
             &predicates,
             &proj,
             &accounting,
+            &budget,
             &blocks_decoded,
             &key_index,
         )
@@ -687,7 +704,7 @@ async fn prepare_partition(
 
     let mut out: Vec<SpanRow> = Vec::new();
     for seg in &segs {
-        let Some(output) = fetcher
+        let fetched = fetcher
             .fetch_accounted_in_blocks(
                 seg,
                 tenant_hash,
@@ -699,8 +716,11 @@ async fn prepare_partition(
                 &accounting,
             )
             .await
-            .map_err(SqlError::from)?
-        else {
+            .map_err(SqlError::from)?;
+        // This exit decodes inside the fetch, so the check lands before the
+        // next segment's fetch rather than before this one's decode.
+        budget.check()?;
+        let Some(output) = fetched else {
             continue;
         };
         // The same decode-side counts the columnar arm reads off each block; the
@@ -750,6 +770,7 @@ async fn prepare_columnar(
     predicates: &[BloomPredicate<'_>],
     projection: &Arc<Vec<usize>>,
     accounting: &PhaseAccounting,
+    budget: &ScanBudget,
     blocks_decoded: &Count,
     key_index: &KeyIndexCounters,
 ) -> DFResult<ColumnarAttempt> {
@@ -761,7 +782,7 @@ async fn prepare_columnar(
     let mut pages_decoded = 0usize;
     let mut pages_skipped = 0usize;
     for seg in segs {
-        let Some(mut scan) = fetcher
+        let fetched = fetcher
             .fetch_accounted_columnar_in_blocks(
                 seg,
                 tenant_hash,
@@ -774,8 +795,10 @@ async fn prepare_columnar(
                 accounting,
             )
             .await
-            .map_err(SqlError::from)?
-        else {
+            .map_err(SqlError::from)?;
+        // Every store read for this segment is done; its blocks decode below.
+        budget.check()?;
+        let Some(mut scan) = fetched else {
             continue;
         };
         pruned.segments_pruned += scan.key_index().segments_pruned;
@@ -2322,5 +2345,215 @@ mod read_gate_tests {
                 });
             },
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod budget_tests {
+    //! Issue #1409: both exits of the spans scan check the statement's byte
+    //! and request budgets after each segment's store reads.
+
+    use ravel_catalog::{SegmentLevel, SegmentRef};
+    use ravel_object_store::ObjectStoreBackend;
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_query::EngineConfig;
+    use ravel_rspan::{ObjectIdentity, RspanConfig, RspanWriter, SpanRecord, StatusCode};
+
+    use super::*;
+    use crate::executor::TargetSignal;
+    use crate::scan_budget::test_support::{
+        BudgetRun, KeyGets, TENANT, budget_run, bytes_budget, requests_budget, statement_with,
+    };
+
+    fn span(n: u8) -> SpanRecord {
+        SpanRecord {
+            trace_id: [n; 16],
+            span_id: [n; 8],
+            parent_span_id: None,
+            name: format!("op-{n}"),
+            start_ts_ns: i64::from(n),
+            end_ts_ns: i64::from(n) + 1,
+            status_code: StatusCode::Ok,
+            status_message: None,
+            attrs: vec![("service.name".to_string(), "svc".to_string())],
+        }
+    }
+
+    /// Three four-span objects, `spans/seg-{0,1,2}`, a block per span.
+    async fn fixture() -> (Arc<KeyGets>, Vec<SegmentRef>) {
+        let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut segments = Vec::new();
+        for i in 0..3u8 {
+            let mut writer = RspanWriter::new(
+                RspanConfig {
+                    block_target_records: 1,
+                    ..RspanConfig::default()
+                },
+                ObjectIdentity {
+                    tenant_hash: TENANT,
+                    shard: 0,
+                    writer_id: [2u8; 16],
+                    writer_epoch: 1,
+                    writer_seq: u64::from(i),
+                },
+            );
+            for k in 0..4u8 {
+                writer.push(span(i * 10 + k));
+            }
+            let bytes = writer.finish().expect("finish");
+            let key = format!("spans/seg-{i}");
+            let object_size = bytes.len() as u64;
+            memory
+                .put(&key, bytes::Bytes::from(bytes), PutOptions::default())
+                .await
+                .expect("put");
+            segments.push(SegmentRef {
+                data_object_key: key,
+                object_size,
+                min_event_ts_ns: i64::from(i * 10),
+                max_event_ts_ns: i64::from(i * 10 + 4),
+                ingest_hour_bucket: 0,
+                sample_count: 4,
+                series_count: 0,
+                shard: 0,
+                content_hash: [4u8; 32],
+                writer_id: uuid::Uuid::from_u128(2),
+                writer_epoch: 1,
+                writer_seq: u64::from(i),
+                created_unix_ns: 0,
+                level: SegmentLevel::L0,
+                segment_format_version: u32::from(ravel_rspan::footer::VERSION),
+                declared_column_stats: Default::default(),
+            });
+        }
+        (KeyGets::wrap(memory), segments)
+    }
+
+    /// Scan the fixture over one partition under `engine`, on the columnar
+    /// exit (`trace_id`, `start_ts`) or the row exit (every column), in a
+    /// statement that already charged `preload` (bytes, requests) to another
+    /// table. Also returns the scan's `blocks_decoded`.
+    async fn run(
+        engine: &EngineConfig,
+        preload: (u64, u64),
+        rows: bool,
+    ) -> (BudgetRun, Vec<SegmentRef>, usize) {
+        let (store, segments) = fixture().await;
+        let statement = statement_with(preload.0, preload.1);
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let projection = (!rows).then(|| {
+            vec![
+                crate::spans_schema::SPAN_COL_TRACE_ID,
+                crate::spans_schema::SPAN_COL_START_TS,
+            ]
+        });
+        let exec = SpansScanExec::new(
+            TenantHash(TENANT),
+            SpanSegmentFetcher::new(backend),
+            &segments,
+            1,
+            SpanQuery::ts_range(0, 100),
+            None,
+            None,
+            None,
+            None,
+            Arc::new(Vec::new()),
+            projection,
+            QueryAccounting::new(),
+        )
+        .expect("scan")
+        .with_phase_accounting(statement.lane(TargetSignal::Spans).clone())
+        .with_scan_budget(statement.scan_budget(TargetSignal::Spans, engine));
+        let run = budget_run(&exec, &store, &segments, &statement).await;
+        let decoded = exec
+            .metrics()
+            .expect("metrics")
+            .iter()
+            .filter(|m| m.value().name() == METRIC_BLOCKS_DECODED)
+            .map(|m| m.value().as_usize())
+            .sum();
+        (run, segments, decoded)
+    }
+
+    /// On the columnar exit a budget equal to the first object's size admits
+    /// it and refuses once the second object's reads are done, at the two
+    /// objects' bytes summed, before any of the second object's four blocks
+    /// is decoded and before the third object is fetched.
+    ///
+    /// FLIP: removing `budget.check()?` from `prepare_columnar` returns all
+    /// 12 rows. Moving it below that segment's block loop (after decode)
+    /// refuses with 8 blocks decoded, not 4. Moving it below the fetch loop
+    /// refuses with `seg-2` fetched.
+    #[tokio::test]
+    async fn lowered_byte_budget_fails_typed_on_spans_columnar_scan() {
+        let (free, segments, decoded) = run(&EngineConfig::default(), (0, 0), false).await;
+        assert!(free.error.is_none(), "{:?}", free.error);
+        assert_eq!(free.rows, 12);
+        assert_eq!(decoded, 12);
+        assert_eq!(free.gets, [1, 1, 1]);
+        let sizes: Vec<u64> = segments.iter().map(|s| s.object_size).collect();
+        assert_eq!(free.total, (sizes.iter().sum(), 3));
+
+        let (run, _, decoded) = run(&bytes_budget(sizes[0]), (0, 0), false).await;
+        let expected = sizes[0] + sizes[1];
+        match run.error {
+            Some(SqlError::TooManyBytesScanned { scanned, max })
+                if scanned == expected && max == sizes[0] => {}
+            other => panic!("expected TooManyBytesScanned at {expected}, got {other:?}"),
+        }
+        assert_eq!(decoded, 4, "only seg-0's blocks are decoded");
+        assert_eq!(run.gets, [1, 1, 0]);
+        assert_eq!(run.total, (expected, 2));
+    }
+
+    /// The row exit decodes inside its fetch, so its check lands after each
+    /// segment's fetch: the same budget refuses at the same figure with the
+    /// third object never fetched.
+    ///
+    /// FLIP: removing `budget.check()?` from the row loop of
+    /// `prepare_partition` returns all 12 rows. Moving it below the loop
+    /// refuses with `seg-2` fetched.
+    #[tokio::test]
+    async fn lowered_byte_budget_fails_typed_on_spans_row_scan() {
+        let (free, segments, _) = run(&EngineConfig::default(), (0, 0), true).await;
+        assert!(free.error.is_none(), "{:?}", free.error);
+        assert_eq!(free.rows, 12);
+        let sizes: Vec<u64> = segments.iter().map(|s| s.object_size).collect();
+
+        let (run, _, _) = run(&bytes_budget(sizes[0]), (0, 0), true).await;
+        let expected = sizes[0] + sizes[1];
+        match run.error {
+            Some(SqlError::TooManyBytesScanned { scanned, max })
+                if scanned == expected && max == sizes[0] => {}
+            other => panic!("expected TooManyBytesScanned at {expected}, got {other:?}"),
+        }
+        assert_eq!(run.gets, [1, 1, 0]);
+    }
+
+    /// A one-request budget refuses at the second GET, on either exit.
+    ///
+    /// FLIP: removing `budget.check()?` from `prepare_columnar` returns all
+    /// 12 rows on the columnar exit.
+    #[tokio::test]
+    async fn lowered_request_budget_fails_typed_on_spans_scan() {
+        for rows in [false, true] {
+            let (run, _, _) = run(&requests_budget(1), (0, 0), rows).await;
+            assert!(
+                matches!(
+                    run.error,
+                    Some(SqlError::RequestBudgetExceeded {
+                        requests: 2,
+                        max: 1,
+                        table: None,
+                        ..
+                    })
+                ),
+                "rows={rows}: {:?}",
+                run.error
+            );
+            assert_eq!(run.gets, [1, 1, 0], "rows={rows}");
+        }
     }
 }

@@ -205,10 +205,10 @@ Nothing derived from the plan may assume the plan has one table.
   refused if any lane is refused, naming the table. The statement has one
   request budget, and the pre-flight check holds the sum of the lanes'
   requirements against it.
-- Issue #1409 is unchanged: only the `samples` provider enforces the lowered
-  byte and store-request budgets at scan time. A multi-signal statement
-  inherits that gap for each non-`samples` table it names, and the docs say
-  so until #1409 lands.
+- As written, this decision left issue #1409 open: only the `samples`
+  provider enforced the lowered byte and store-request budgets at scan time.
+  Every signal table's local scan now does (see the scan budget amendment
+  below).
 
 ### 7. Cost is reported per phase, per signal
 
@@ -481,3 +481,22 @@ Four places where the decisions as written are not what the tree does:
   and `ravel_get_trace` builds a statement over `spans` alone. Whoever
   ships either SQL tool owes decision 9's `CrossSignalQuery` refusal before
   any listing, with a test.
+
+## Amendment (issue #1409): every signal table's scan enforces the statement's budgets
+
+<!-- amendment-applies: sections="6. Admission and budgets are per statement; lane checks are per signal" pointer="scan budget amendment" -->
+
+Decision 6 left a gap for each non-`samples` table a statement names. That
+gap is closed for the local scan. The `logs`, `spans`, `alerts` and `audit`
+scans carry a `ScanBudget` (`crates/ravel-sql/src/scan_budget.rs`) built from
+the effective config, so a request's lowered budgets apply. After each
+segment's fetch and before the next, the scan compares the statement total
+across every lane with `max_bytes_scanned` and `max_s3_requests`. A statement
+whose tables each fit a budget alone but whose sum does not is refused.
+
+One limit remains. A distributed fan-out folds worker bytes against the
+effective byte budget, but it compares its own lane's total, not the statement
+total. No production path installs a distributed scan on those four tables
+today; only `samples` has a production distributed caller.
+
+Refs: #1409

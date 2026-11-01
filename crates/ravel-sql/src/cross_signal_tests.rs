@@ -23,7 +23,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
     ObjectStoreBackend, PageToken, Pin, PinnedRead, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{RequestBudgets, RequestLimit};
+use ravel_query::{ByteLimit, RequestBudgets, RequestLimit};
 use ravel_rspan::{SpanRecord, StatusCode};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{CommitToken, Sample, Signal, TenantHash, TenantId, TimeRange};
@@ -1557,6 +1557,89 @@ async fn a_statement_budget_still_counts_every_lane() {
         .and_then(|count| count.parse().ok())
         .unwrap_or_else(|| panic!("an unexpected refusal: {message}"));
     assert!(issued > max, "{issued} requests against a budget of {max}");
+}
+
+/// A lowered byte budget that each table's own bytes fit under refuses the
+/// statement once the two tables together pass it: the logs scan, which runs
+/// after the samples build side, charges the statement total (issue #1409).
+///
+/// FLIP: with the check removed from the logs scan's segment open (or with
+/// the logs scan comparing only its own lane, or the server's unlimited
+/// ceiling instead of the request's), the join completes, because the samples
+/// scan finishes below `max`.
+#[tokio::test]
+async fn a_lowered_byte_budget_refuses_two_tables_that_each_fit() {
+    let (store, tenant_hash) = per_table_cost_fixture("cross-signal-byte-budget-1409").await;
+    let unbudgeted = executor_with(store.clone(), SqlConfig::default())
+        .execute(tenant_hash, &sql_request(PER_TABLE_JOIN, WINDOW))
+        .await
+        .expect("the unbudgeted join runs");
+    let samples_bytes = unbudgeted.signals[0].phases.pooled().total_s3_bytes();
+    let logs_bytes = unbudgeted.signals[1].phases.pooled().total_s3_bytes();
+    let statement_bytes = unbudgeted.accounting.total_s3_bytes();
+    assert_eq!(samples_bytes + logs_bytes, statement_bytes);
+    let max = statement_bytes - 1;
+    assert!(
+        samples_bytes < max && logs_bytes < max,
+        "each table fits alone: samples {samples_bytes}, logs {logs_bytes}, max {max}"
+    );
+
+    let mut request = sql_request(PER_TABLE_JOIN, WINDOW);
+    request.budgets = Some(RequestBudgets {
+        max_bytes_scanned: Some(ByteLimit::Bounded(max)),
+        ..Default::default()
+    });
+    let err = executor_with(store, SqlConfig::default())
+        .execute(tenant_hash, &request)
+        .await
+        .expect_err("the two tables together exceed the budget");
+    assert!(
+        matches!(err, SqlError::TooManyBytesScanned { scanned, max: m } if m == max && scanned == statement_bytes),
+        "{err:?}"
+    );
+}
+
+/// The executor's default ceilings, which every signal scan now checks, leave
+/// an unbudgeted statement's rows and cost unchanged, and so does a request
+/// budget set exactly at the statement's cost: both checks are strict.
+///
+/// FLIP: a `>=` comparison in `ScanBudget::check` refuses the exact-budget
+/// run.
+#[tokio::test]
+async fn budgets_at_the_statement_cost_leave_results_unchanged() {
+    let (store, tenant_hash) = per_table_cost_fixture("cross-signal-default-budget-1409").await;
+    let unbudgeted = executor_with(store.clone(), SqlConfig::default())
+        .execute(tenant_hash, &sql_request(PER_TABLE_JOIN, WINDOW))
+        .await
+        .expect("the unbudgeted join runs");
+    let mut request = sql_request(PER_TABLE_JOIN, WINDOW);
+    request.budgets = Some(RequestBudgets {
+        max_bytes_scanned: Some(ByteLimit::Bounded(unbudgeted.accounting.total_s3_bytes())),
+        max_store_requests: Some(RequestLimit::Bounded(
+            unbudgeted.accounting.total_s3_requests(),
+        )),
+        ..Default::default()
+    });
+    let budgeted = executor_with(store, SqlConfig::default())
+        .execute(tenant_hash, &request)
+        .await
+        .expect("a budget at the statement's cost admits it");
+    for outcome in [&unbudgeted, &budgeted] {
+        assert_eq!(
+            rows(&outcome.output, "ts", "value"),
+            vec![(100, 2.0), (200, 3.0)]
+        );
+    }
+    assert_eq!(
+        (
+            budgeted.accounting.total_s3_bytes(),
+            budgeted.accounting.total_s3_requests()
+        ),
+        (
+            unbudgeted.accounting.total_s3_bytes(),
+            unbudgeted.accounting.total_s3_requests()
+        )
+    );
 }
 
 /// `explain` reports one entry per table, measured on a handle of its own,

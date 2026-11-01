@@ -13,11 +13,14 @@
 //! the Parquet handle, which equals the total there: the statement handle
 //! holds only the pool peak.
 
+use std::sync::Arc;
+
 use ravel_logseg::decoded_cache::DecodedCacheSnapshot;
-use ravel_query::{PhaseAccounting, PhaseAccountingSnapshot};
+use ravel_query::{EngineConfig, PhaseAccounting, PhaseAccountingSnapshot};
 use ravel_types::accounting::{AccessIntent, QueryAccountingSnapshot};
 
 use crate::executor::{SIGNAL_LANE_ORDER, TargetSignal};
+use crate::scan_budget::{BudgetLedger, EnforcedBudgets, ScanBudget};
 
 /// A statement's accounting handles and the view that sums them.
 #[derive(Debug, Clone)]
@@ -28,6 +31,8 @@ pub(crate) enum StatementAccounting {
         lanes: Box<[PhaseAccounting; SIGNAL_LANE_ORDER.len()]>,
         parquet: PhaseAccounting,
         statement: PhaseAccounting,
+        /// What each signal lane's scan budget recorded, in the same order.
+        budgets: Box<[Arc<BudgetLedger>; SIGNAL_LANE_ORDER.len()]>,
     },
     /// Every lane, Parquet and the statement record into one handle: the
     /// Flight SQL and distributed entries, whose figures this view leaves as
@@ -48,6 +53,37 @@ impl StatementAccounting {
             lanes: Box::new(std::array::from_fn(|_| PhaseAccounting::new())),
             parquet: PhaseAccounting::new(),
             statement: PhaseAccounting::new(),
+            budgets: Box::default(),
+        }
+    }
+
+    /// The position of `signal`'s lane in [`SIGNAL_LANE_ORDER`]; Parquet has
+    /// none.
+    fn lane_index(signal: TargetSignal) -> Option<usize> {
+        SIGNAL_LANE_ORDER.iter().position(|lane| *lane == signal)
+    }
+
+    /// A scan budget for `signal`'s provider: `engine`'s ceilings checked
+    /// against this statement total, recorded on the lane's ledger so
+    /// [`Self::enforced_budgets`] can report them.
+    pub(crate) fn scan_budget(&self, signal: TargetSignal, engine: &EngineConfig) -> ScanBudget {
+        let ledger = match self {
+            StatementAccounting::Split { budgets, .. } => {
+                Self::lane_index(signal).map(|index| Arc::clone(&budgets[index]))
+            }
+            StatementAccounting::One(_) => None,
+        };
+        ScanBudget::new(engine, self.clone(), ledger)
+    }
+
+    /// The budgets `signal`'s scan was given and how often it checked them;
+    /// `None` when no budget was installed on that lane.
+    pub(crate) fn enforced_budgets(&self, signal: TargetSignal) -> Option<EnforcedBudgets> {
+        match self {
+            StatementAccounting::Split { budgets, .. } => {
+                Self::lane_index(signal).and_then(|index| budgets[index].report())
+            }
+            StatementAccounting::One(_) => None,
         }
     }
 
@@ -94,6 +130,7 @@ impl StatementAccounting {
                 lanes,
                 parquet,
                 statement,
+                ..
             } => lanes
                 .iter()
                 .chain([parquet, statement])
@@ -131,6 +168,7 @@ impl StatementAccounting {
                 lanes,
                 parquet,
                 statement,
+                ..
             } => lanes
                 .iter()
                 .chain([parquet, statement])
@@ -147,6 +185,7 @@ impl StatementAccounting {
                 lanes,
                 parquet,
                 statement,
+                ..
             } => lanes
                 .iter()
                 .chain([parquet, statement])

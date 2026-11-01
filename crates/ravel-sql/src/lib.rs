@@ -104,6 +104,7 @@ mod rlog_attrs;
 mod scan;
 #[cfg(test)]
 mod scan_alternation_tests;
+mod scan_budget;
 mod schema;
 mod session;
 #[cfg(test)]
@@ -232,6 +233,7 @@ pub use ravel_catalog::SegmentLevel;
 /// Same reason as the [`SegmentLevel`] re-export above.
 pub use ravel_query::erasure::ErasurePredicate;
 pub use redact::{RedactError, redact};
+pub use scan_budget::EnforcedBudgets;
 pub use schema::{internal_schema, public_schema};
 pub use session::{
     ADMITTED_SCALARS, ADMITTED_TABLE_FUNCTIONS, ADMITTED_WINDOWS, ALERTS_TABLE, AUDIT_TABLE,

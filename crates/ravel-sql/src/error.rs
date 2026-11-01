@@ -180,6 +180,17 @@ pub enum SqlError {
     )]
     TicketPinsOneSignal,
 
+    /// A request with `row_window` set reached the two-step pinned path
+    /// (`resolve_pinned`, then a `plan_pinned*` entry), whose plan carries no
+    /// row window. Refused before any store request, rather than returning
+    /// rows outside the window; the text names no server state; HTTP 400.
+    #[error(
+        "a row window cannot be applied on the pinned plan path; send the \
+         request to POST /api/v1/sql, or filter on the event-time column in \
+         the statement"
+    )]
+    RowWindowNotPinned,
+
     /// A version 10 Flight SQL ticket whose segment groups name a different
     /// set of signal tables than its statement reads. Refused at DoGet, or at
     /// a multi-lane pinned entry whose lanes do not match the statement,
@@ -607,6 +618,7 @@ impl SqlError {
             SqlError::Validation(_)
             | SqlError::CrossSignalQuery
             | SqlError::TicketPinsOneSignal
+            | SqlError::RowWindowNotPinned
             | SqlError::PinnedSignalsMismatch { .. }
             | SqlError::CommitTokenNeedsQualifier { .. }
             | SqlError::CommitTokenQualifierNotRead { .. }
@@ -682,6 +694,7 @@ impl SqlError {
             // Safe to echo: the text names only the fixed table names.
             SqlError::CrossSignalQuery
             | SqlError::TicketPinsOneSignal
+            | SqlError::RowWindowNotPinned
             | SqlError::PinnedSignalsMismatch { .. }
             | SqlError::CommitTokenNeedsQualifier { .. }
             | SqlError::CommitTokenOnParquetStatement => self.to_string(),
