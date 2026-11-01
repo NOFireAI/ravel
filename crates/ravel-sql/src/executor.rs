@@ -277,6 +277,14 @@ impl StatementTables {
     }
 }
 
+/// Whether a statement reading `signal_lanes` signal tables, and a Parquet
+/// table beside them when `beside_parquet`, names more than one table. The
+/// resolve's budget check and the plan both ask this, so a refusal names its
+/// table exactly when the plan treats the statement as several tables.
+fn reads_several_tables(signal_lanes: usize, beside_parquet: bool) -> bool {
+    signal_lanes > 1 || beside_parquet
+}
+
 /// The one-table rule of the entry points that read one snapshot: refuse a
 /// statement naming two or more signal tables, before any catalog request.
 /// ES|QL keeps it as its own rule (ADR-2887), which ADR-2904 leaves unchanged;
@@ -2936,7 +2944,7 @@ impl SqlExecutor {
         } else {
             TargetSignal::Parquet
         };
-        let several_tables = lanes.len() > 1 || (parquet.is_some() && reads_lanes);
+        let several_tables = reads_several_tables(lanes.len(), parquet.is_some() && reads_lanes);
         let parquet_tables = match (parquet, &self.parquet) {
             (Some(resolution), Some(sources)) => {
                 // One ledger per query, shared by every reader it opens, over
@@ -3621,7 +3629,9 @@ impl SqlExecutor {
             }
         }
         let lanes = tables.lanes();
-        let several = lanes.len() > 1;
+        // Past the early return above, a statement with Parquet tables also
+        // names a signal table, so it reads both.
+        let several = reads_several_tables(lanes.len(), parquet.is_some());
         let target = tables.first_lane();
         // Postings pruning by the equality `__name__` predicate pushed down
         // from the query's WHERE clause. Without this the SQL
