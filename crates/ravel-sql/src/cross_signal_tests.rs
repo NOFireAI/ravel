@@ -2033,6 +2033,37 @@ async fn a_name_shadowing_a_table_in_a_two_table_statement_is_refused_before_any
     }
 }
 
+/// A shadowed table name is the caller's own text too, so the refusal cuts
+/// `table` to 64 bytes exactly as it cuts `name`: an alias equal to a
+/// 100-byte Parquet table name echoes neither in full.
+///
+/// FLIP: a cut applied to `name` only returns the whole 100-byte `table`.
+#[tokio::test]
+async fn a_shadowed_table_name_is_cut_like_the_alias() {
+    let long = format!("hits_{}", "x".repeat(95));
+    assert_eq!(long.len(), 100);
+    let cut = format!("{}...", &long[..64]);
+    let sql = format!("SELECT count(*) FROM {long} h, logs AS {long}");
+    let recording = Arc::new(RecordingStore::new(empty_store()));
+    let executor = executor_with(recording.clone(), SqlConfig::default());
+    let refused =
+        http_entry_errors(&executor, TenantHash([7u8; 16]), &sql_request(&sql, WINDOW)).await;
+    assert_eq!(refused.len(), 4);
+    for (entry, err) in refused {
+        let Some(SqlError::ShadowedTableName { kind, name, table }) = &err else {
+            panic!("{entry} must refuse with ShadowedTableName, got {err:?}");
+        };
+        assert_eq!(
+            (*kind, name.as_str(), table.as_str()),
+            ("relation alias", cut.as_str(), cut.as_str()),
+            "{entry}"
+        );
+        let message = err.as_ref().map(SqlError::client_message).unwrap_or_default();
+        assert!(!message.contains(&long), "{entry}: {message}");
+    }
+    assert_eq!(recording.requests(), Vec::<String>::new());
+}
+
 /// The shadowing refusal reads only statements over two or more tables, and
 /// an alias equal to its own table's name is not shadowing: a one-table
 /// `samples AS logs` and a two-table `logs AS logs` both reach the catalog

@@ -465,7 +465,7 @@ fn refuse_shadowed_table_name(sql: &str, others: &BTreeSet<String>) -> Result<()
         Some(found) => Err(SqlError::ShadowedTableName {
             kind: found.kind,
             name: quoted_qualifier(&found.name),
-            table: found.table,
+            table: quoted_qualifier(&found.table),
         }),
         None => Ok(()),
     }
