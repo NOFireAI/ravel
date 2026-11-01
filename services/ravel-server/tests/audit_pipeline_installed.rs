@@ -729,11 +729,8 @@ async fn every_query_surface_names_the_callers_configured_subject() {
             let got_status = response.status().as_u16();
             bodies.push(response.text().await.expect("response body"));
             let after = subject_counts(&query_audit_records(store.as_ref(), &tenant).await);
-            let (records, named, bare) = (
-                after.0 - before.0,
-                after.1 - before.1,
-                after.2 - before.2,
-            );
+            let (records, named, bare) =
+                (after.0 - before.0, after.1 - before.1, after.2 - before.2);
             let want = if labelled {
                 (want_status, want_records, want_records, 0)
             } else {

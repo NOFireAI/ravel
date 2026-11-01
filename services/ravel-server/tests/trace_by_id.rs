@@ -837,9 +837,8 @@ mod with_mcp {
             ),
         ]);
         let mut config = server_config(true);
-        config.tenant_resolver = Arc::new(
-            ravel_tenant_resolve::StaticBearerTokenResolver::with_principals(principals),
-        );
+        config.tenant_resolver =
+            Arc::new(ravel_tenant_resolve::StaticBearerTokenResolver::with_principals(principals));
         let running = ravel_server::start(
             config,
             store.clone(),

@@ -241,9 +241,8 @@ mod tests {
 
         fn resolve_principal(&self, _headers: &HeaderMap) -> Result<Principal, AuthError> {
             let mut principal = Principal::tenant_only(self.principal.clone());
-            principal.subject = Some(
-                Subject::new(SubjectSource::StaticToken, "alice").expect("a valid subject"),
-            );
+            principal.subject =
+                Some(Subject::new(SubjectSource::StaticToken, "alice").expect("a valid subject"));
             Ok(principal)
         }
     }
