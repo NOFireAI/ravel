@@ -1247,6 +1247,21 @@ mod tests {
         }
     }
 
+    /// A subject entry, bare or with a label, in the tenant part is refused
+    /// like a capability word there. Flip to watch it fail: delete the
+    /// `word == SUBJECT_ENTRY` arm of the `CapabilityInTenant` predicate;
+    /// `acme;subject;ddl` then parses as tenant `acme;subject` with `ddl`.
+    #[test]
+    fn split_tenant_suffix_subject_entry_in_the_tenant_is_refused() {
+        for raw in ["acme;subject;ddl", "acme;subject=x;ddl"] {
+            assert_eq!(
+                split_tenant_suffix(raw),
+                Err(TenantSuffixError::CapabilityInTenant),
+                "{raw}"
+            );
+        }
+    }
+
     #[test]
     fn split_tenant_suffix_wrong_case_is_refused() {
         assert_eq!(

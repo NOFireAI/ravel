@@ -1602,6 +1602,19 @@ pub struct Cli {
     #[arg(long, value_name = "CLAIM")]
     pub oidc_agents_admin_claim: Option<String>,
 
+    /// String claim read as the caller's subject (ADR-3541 decision 3): who,
+    /// within the tenant, the token belongs to. The agents reconcile and
+    /// destroy audit records name it as `agents.principal.subject` with
+    /// `agents.principal.subject_source` `oidc`. It grants no capability. A
+    /// claim that is missing, not a JSON string, empty, longer than 255
+    /// bytes, or holding a byte outside printable non-space ASCII leaves the
+    /// subject absent, still authenticates the request, and adds one to
+    /// `ravel_auth_subject_dropped_total{source="oidc",reason=...}`. Unset
+    /// (the default), no subject is read from OIDC tokens. Setting it empty,
+    /// or without OIDC enabled, fails startup.
+    #[arg(long, value_name = "CLAIM")]
+    pub oidc_subject_claim: Option<String>,
+
     /// How often the JWKS document is refetched, in seconds (ADR-0042
     /// decision 6). Only used when OIDC is enabled. Zero is refused at
     /// startup.
@@ -6920,7 +6933,8 @@ impl Cli {
                     "invalid {ctx} ({e}), expected TENANT or TENANT;CAPABILITIES with \
                          CAPABILITIES a comma-separated list of ddl, ipcrypt, agents, \
                          agents_worker and agents_admin, which may also hold one \
-                         subject=LABEL entry"
+                         subject=LABEL entry with LABEL 1 to 64 bytes of \
+                         A-Z a-z 0-9 . _ @ + -"
                 )
             })?;
             let principal = Principal {
@@ -7221,6 +7235,9 @@ impl Cli {
         if self.oidc_ipcrypt_claim.as_deref() == Some("") {
             anyhow::bail!("--oidc-ipcrypt-claim must be non-empty");
         }
+        if self.oidc_subject_claim.as_deref() == Some("") {
+            anyhow::bail!("--oidc-subject-claim must be non-empty");
+        }
         let agents_claims = [
             (&self.oidc_agents_claim, "--oidc-agents-claim"),
             (&self.oidc_agents_worker_claim, "--oidc-agents-worker-claim"),
@@ -7256,6 +7273,12 @@ impl Cli {
             if self.oidc_ipcrypt_claim.is_some() {
                 anyhow::bail!(
                     "--oidc-ipcrypt-claim was set but OIDC is not enabled (set --oidc-issuer and \
+                     --oidc-jwks-url)"
+                );
+            }
+            if self.oidc_subject_claim.is_some() {
+                anyhow::bail!(
+                    "--oidc-subject-claim was set but OIDC is not enabled (set --oidc-issuer and \
                      --oidc-jwks-url)"
                 );
             }
@@ -20741,6 +20764,134 @@ mod tests {
         }
     }
 
+    /// A `subject=LABEL` entry reaches the principal from the flag and from
+    /// the file; an identical repeat is accepted and a different subject is a
+    /// conflict. A label with a space, a 65th byte or a second entry refuses
+    /// with the position or the file line and the accepted charset and
+    /// length, and names none of the token, tenant or label. Every pair
+    /// another test here uses still parses to no subject.
+    ///
+    /// Flip to watch it fail: interpolate `{pair}` into the
+    /// `split_tenant_suffix` error in `parse_tenant_pairs`, or widen
+    /// `split_tenant_suffix`'s label check to accept `b' '` or 65 bytes.
+    #[test]
+    fn a_tenant_token_subject_label_reaches_the_principal_and_a_bad_label_error_never_names_the_pair()
+     {
+        use ravel_tenant_resolve::{Subject, SubjectSource};
+
+        let alice = Some(Subject::new(SubjectSource::StaticToken, "alice").expect("valid"));
+        let pair = "tok=acme;agents_admin,subject=alice";
+        let from_flag = cli(&["--tenant-token", pair])
+            .parse_tenant_principals()
+            .expect("a subject entry parses");
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(file.path(), format!("{pair}\n")).expect("write token file");
+        let path = file.path().to_str().expect("utf8 path").to_string();
+        let from_file = cli(&["--tenant-token-file", &path])
+            .parse_tenant_principals()
+            .expect("a subject entry in the file parses");
+        for (what, map) in [("flag", &from_flag), ("file", &from_file)] {
+            let principal = &map["tok"];
+            assert_eq!(principal.tenant, TenantId::new("acme"), "{what}");
+            assert!(principal.agents_admin, "{what}");
+            assert_eq!(principal.subject, alice, "{what}");
+        }
+
+        let repeated = cli(&["--tenant-token", pair, "--tenant-token-file", &path])
+            .parse_tenant_principals()
+            .expect("an identical repeat is accepted");
+        assert_eq!(repeated["tok"].subject, alice);
+        let err = cli(&[
+            "--tenant-token",
+            pair,
+            "--tenant-token",
+            "tok=acme;agents_admin,subject=bob",
+        ])
+        .parse_tenant_principals()
+        .expect_err("a subject-only difference is a conflict");
+        assert!(
+            err.to_string()
+                .contains("with a different tenant, capability or subject"),
+            "{err}"
+        );
+
+        const TOKEN: &str = "TOKSECRET51d0";
+        const TENANT: &str = "TENSECRET0c8e";
+        const LABEL: &str = "LABSECRET9b7a";
+        let max = "a".repeat(64);
+        let at_max = cli(&["--tenant-token", &format!("t={TENANT};subject={max}")])
+            .parse_tenant_principals()
+            .expect("a 64-byte label parses");
+        assert_eq!(
+            at_max["t"].subject.as_ref().map(Subject::value),
+            Some(max.as_str())
+        );
+        let too_long = format!("{LABEL}{}", "x".repeat(65 - LABEL.len()));
+        assert_eq!(too_long.len(), 65);
+        for bad in [
+            format!("{TOKEN}={TENANT};subject={LABEL} x"),
+            format!("{TOKEN}={TENANT};subject={too_long}"),
+            format!("{TOKEN}={TENANT};subject={LABEL},subject={LABEL}"),
+        ] {
+            let flag_err = cli(&["--tenant-token", &bad])
+                .parse_tenant_principals()
+                .expect_err("a bad label refuses startup")
+                .to_string();
+            assert!(
+                flag_err.contains("--tenant-token (position 1)"),
+                "{flag_err}"
+            );
+            let file = tempfile::NamedTempFile::new().expect("temp token file");
+            std::fs::write(file.path(), format!("# header\n{bad}\n")).expect("write");
+            let file_path = file.path().to_str().expect("utf8 path");
+            let file_err = cli(&["--tenant-token-file", file_path])
+                .parse_tenant_principals()
+                .expect_err("a bad label in the file refuses startup")
+                .to_string();
+            assert!(
+                file_err.contains(&format!("line 2 in --tenant-token-file {file_path}")),
+                "{file_err}"
+            );
+            for msg in [&flag_err, &file_err] {
+                assert!(
+                    msg.contains(
+                        "subject=LABEL entry with LABEL 1 to 64 bytes of A-Z a-z 0-9 . _ @ + -"
+                    ),
+                    "the error names the accepted label: {msg}"
+                );
+                for secret in [TOKEN, TENANT, LABEL] {
+                    assert!(!msg.contains(secret), "the error names {secret}: {msg}");
+                }
+            }
+        }
+
+        let fixture_pairs = [
+            "dev=acme",
+            "other=beta",
+            "has=equals=gamma",
+            "dev=acme;ddl",
+            "plaintoken=gamma",
+            "filetoken=beta;ddl",
+            "f1=acme;ipcrypt",
+            "f2=acme;ddl,ipcrypt",
+            "f3=acme;ipcrypt,ddl",
+            "f4=acme;ddl",
+            "f5=acme",
+            "a=acme",
+            "a=acme;ddl",
+            "b=beta",
+        ];
+        for fixture in fixture_pairs {
+            let parsed = cli(&["--tenant-token", fixture])
+                .parse_tenant_principals()
+                .expect("an existing fixture still parses");
+            assert!(
+                parsed.values().all(|p| p.subject.is_none()),
+                "{fixture} carries no subject"
+            );
+        }
+    }
+
     /// Fold tenants, the federation mapping guard and the resolver all derive
     /// from one parse: the tenant map equals the principals' tenants, with and
     /// without `;ddl` entries.
@@ -20782,6 +20933,50 @@ mod tests {
             err.to_string().contains("--oidc-ddl-claim"),
             "error names the flag: {err}"
         );
+    }
+
+    /// `--oidc-subject-claim` is refused empty and without OIDC, like
+    /// `--oidc-ddl-claim`, and reaches no setting on its own. Flip to watch
+    /// it fail: delete the `oidc_subject_claim.is_some()` bail in the
+    /// `oidc.is_none()` block of `parse_auth_resolvers`.
+    #[test]
+    fn oidc_subject_claim_is_refused_empty_or_without_oidc() {
+        let oidc = [
+            "--oidc-issuer",
+            "https://issuer.example",
+            "--oidc-jwks-url",
+            "https://issuer.example/jwks",
+            "--oidc-audience",
+            "ravel",
+        ];
+        let mut empty = oidc.to_vec();
+        empty.extend(["--oidc-subject-claim", ""]);
+        let err = cli(&empty)
+            .parse_auth_resolvers()
+            .expect_err("an empty --oidc-subject-claim fails startup");
+        assert!(
+            err.to_string()
+                .contains("--oidc-subject-claim must be non-empty"),
+            "{err}"
+        );
+
+        let err = cli(&["--oidc-subject-claim", "sub"])
+            .parse_auth_resolvers()
+            .expect_err("--oidc-subject-claim with no OIDC fails startup");
+        assert!(
+            err.to_string()
+                .contains("--oidc-subject-claim was set but OIDC is not enabled"),
+            "{err}"
+        );
+
+        let mut set = oidc.to_vec();
+        set.extend(["--oidc-subject-claim", "sub"]);
+        let parsed = cli(&set);
+        assert_eq!(parsed.oidc_subject_claim.as_deref(), Some("sub"));
+        parsed
+            .parse_auth_resolvers()
+            .expect("--oidc-subject-claim with OIDC parses");
+        assert_eq!(cli(&oidc).oidc_subject_claim, None, "no default");
     }
 
     #[test]

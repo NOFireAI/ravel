@@ -64,6 +64,10 @@ pub struct RavelClusterSpec {
     /// taken as part of the tenant, not the token). This is pre-existing
     /// behavior in a different crate, out of this operator's scope to change;
     /// choose token values without `=` until a native token source lands.
+    ///
+    /// The rendered pair carries neither a capability suffix nor a
+    /// `subject=LABEL` entry, since a Secret key admits no `;`; issue #3580
+    /// tracks a CRD field for them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_tokens_secret_ref: Option<LocalSecretRef>,
 

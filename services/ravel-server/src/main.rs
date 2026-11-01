@@ -374,6 +374,7 @@ async fn main() -> anyhow::Result<()> {
             agents: cli.oidc_agents_claim.clone(),
             agents_worker: cli.oidc_agents_worker_claim.clone(),
             agents_admin: cli.oidc_agents_admin_claim.clone(),
+            subject: cli.oidc_subject_claim.clone(),
         },
     )?;
     // Retention windows are validated at startup against the ADR-0019 floor
