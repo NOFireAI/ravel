@@ -253,7 +253,6 @@ fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
             )
             .await
             .map_err(SqlError::from)?;
-        ctx.budget.check()?;
         if let Some(s) = scan.as_mut() {
             ctx.attach_decoded_cache(s, &seg);
         }
@@ -1560,6 +1559,9 @@ impl LogScanStream {
                     Poll::Pending => return Poll::Pending,
                 },
                 LogScanState::NextSegment => {
+                    if let Err(e) = this.ctx.budget.check() {
+                        return this.fail(e.into());
+                    }
                     let prefetch = match this.take_next_prefetch() {
                         Ok(prefetch) => prefetch,
                         Err(e) => return this.fail(e),
