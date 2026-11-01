@@ -4362,8 +4362,9 @@ ORDER BY samples.ts
   (ADR-2904 decision 6); a statement inherits that gap for every
   other signal table it names.
 - **`min_commit_token` is qualified by table (ADR-2904 decision 3).** On the
-  HTTP statement path a token is `<token>` or `<table>:<token>`, split once
-  at the first colon (`ravel_sql::MinCommitToken`). `admit_http_tokens` assigns
+  HTTP statement path and in Flight SQL's `x-ravel-min-commit-token`
+  metadata a token is `<token>` or `<table>:<token>`, split once at the first
+  colon (`ravel_sql::MinCommitToken::parse`). `admit_http_tokens` assigns
   each token to one signal lane from the statement text alone, before any
   catalog or object-store request, and every resolve attempt of the statement,
   the snapshot retry included, reuses that assignment: each lane's resolve
@@ -4376,12 +4377,14 @@ ORDER BY samples.ts
   a char boundary. Any token on a statement naming no signal table but some
   other table is `SqlError::CommitTokenOnParquetStatement`. All three are
   HTTP 400. An unsatisfiable token stays the fixed 503 that names no table.
-  Flight SQL carries only unqualified tokens, and `POST /api/v1/esql` takes no
-  `min_commit_token`; a qualified token that reaches a Flight ticket or a
-  pinned Flight resolve is `SqlError::QualifiedCommitTokenUnsupported`. So a
-  Flight SQL statement naming two or more signal tables cannot wait on a
-  commit token: with one it is refused at `GetFlightInfo` as
-  `CommitTokenNeedsQualifier` (`INVALID_ARGUMENT`), and without one it runs.
+  Flight SQL's `GetFlightInfo` admits its tokens with the same
+  `admit_http_tokens`, so each refusal is the HTTP path's error and text,
+  mapped by `status_from_sql`: the three 400s are `INVALID_ARGUMENT` and the
+  unsatisfiable token is `UNAVAILABLE`. A metadata value that does not parse
+  is `INVALID_ARGUMENT` quoting the value and the parse error. The ticket
+  keeps the tokens as an untagged list (decision 10): their qualifiers did
+  their work in `GetFlightInfo`'s resolve, and `DoGet` resolves nothing.
+  `POST /api/v1/esql` takes no `min_commit_token`.
 - **Parquet tables beside signal tables (ADR-2904 decision 11).** A statement may name Parquet tables of the caller's tenant
   beside one or more signal tables, over HTTP and Flight SQL. Its Parquet
   tables resolve first, exactly as a Parquet-only statement's do (each

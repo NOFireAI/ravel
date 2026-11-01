@@ -41,7 +41,7 @@ use ravel_sql::{
 };
 use ravel_types::accounting::NoopQueryCostRecorder;
 use ravel_types::cost_profile::StoreCostProfile;
-use ravel_types::{CommitToken, TenantHash, TenantId, TimeRange};
+use ravel_types::{TenantHash, TenantId, TimeRange};
 use tonic::metadata::MetadataMap;
 use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
@@ -80,7 +80,7 @@ impl FlightAuth for FixedAuth {
     fn min_commit_tokens(
         &self,
         _metadata: &MetadataMap,
-    ) -> Result<Vec<CommitToken>, tonic::Status> {
+    ) -> Result<Vec<ravel_sql::MinCommitToken>, tonic::Status> {
         Ok(Vec::new())
     }
 }

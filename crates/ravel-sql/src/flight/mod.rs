@@ -33,10 +33,13 @@
 //! tables is refused as `TicketPinsOneSignal`, and groups that are not the
 //! statement's signal tables as `PinnedSignalsMismatch`, both
 //! `INVALID_ARGUMENT`. Such a statement always runs on one endpoint, never
-//! the distributed slice path. Flight metadata carries a commit token with no
-//! signal qualifier, so a `min_commit_token` on such a statement is refused at
-//! `GetFlightInfo` as `CommitTokenNeedsQualifier`; the same statement without
-//! a token runs.
+//! the distributed slice path. A `min_commit_token` in Flight metadata takes
+//! the HTTP parameter's forms, `<token>` or `<table>:<token>`, and
+//! `GetFlightInfo` admits it with the HTTP path's rule (ADR-2904 decision 3):
+//! on such a statement an unqualified token is refused as
+//! `CommitTokenNeedsQualifier` and a qualified one bounds only its table's
+//! resolve. The ticket keeps the tokens as an untagged list, since `DoGet`
+//! resolves nothing.
 //!
 //! A Parquet table (ADR-2040) has no segment set, so its pin is the table's
 //! name and the version of the manifest object `GetFlightInfo` resolved. A
@@ -109,12 +112,14 @@ mod stream;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ravel_types::{CommitToken, TenantHash};
+use ravel_types::TenantHash;
 use tonic::Status;
 use tonic::metadata::MetadataMap;
 
+use crate::min_commit_token::MinCommitToken;
+
 pub use metadata::{CATALOG_NAME, SCHEMA_NAME, TABLE_TYPE};
-pub use request::{END_KEY, START_KEY, TIMEOUT_KEY};
+pub use request::{END_KEY, START_KEY, TIMEOUT_KEY, min_commit_tokens_from_metadata};
 pub use service::{DISTRIB_SLICE_CONNECT_TIMEOUT, RavelFlightSqlService};
 pub use slice::{FlightListenerRole, SliceReject, SliceRejectCounters};
 
@@ -149,8 +154,11 @@ pub trait FlightAuth: Send + Sync + 'static {
     fn tenant(&self, metadata: &MetadataMap) -> Result<TenantHash, Status>;
 
     /// The read-your-write commit tokens attached to the request, in the
-    /// order given. Zero tokens is the normal case.
-    fn min_commit_tokens(&self, metadata: &MetadataMap) -> Result<Vec<CommitToken>, Status>;
+    /// order given, each `<token>` or `<table>:<token>` as the HTTP
+    /// `min_commit_token` parameter takes them. Zero tokens is the normal
+    /// case. [`min_commit_tokens_from_metadata`] is the parse the HTTP path
+    /// uses, read from one metadata key.
+    fn min_commit_tokens(&self, metadata: &MetadataMap) -> Result<Vec<MinCommitToken>, Status>;
 }
 
 /// Default cap on how long a Flight ticket may stay valid, standing in for

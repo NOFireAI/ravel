@@ -60,7 +60,7 @@ use ravel_sql::{
     SqlExecutor, SqlRequest,
 };
 use ravel_types::accounting::NoopQueryCostRecorder;
-use ravel_types::{CommitToken, Signal, TenantHash, TenantId, TimeRange};
+use ravel_types::{Signal, TenantHash, TenantId, TimeRange};
 use tonic::Request;
 use tonic::metadata::{MetadataMap, MetadataValue};
 use uuid::Uuid;
@@ -110,7 +110,7 @@ impl FlightAuth for BenchAuth {
     fn min_commit_tokens(
         &self,
         _metadata: &MetadataMap,
-    ) -> Result<Vec<CommitToken>, tonic::Status> {
+    ) -> Result<Vec<ravel_sql::MinCommitToken>, tonic::Status> {
         Ok(Vec::new())
     }
 }

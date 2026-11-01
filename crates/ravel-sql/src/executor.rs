@@ -323,8 +323,8 @@ pub(crate) struct LaneTokens {
 }
 
 impl LaneTokens {
-    /// Every token on one lane: the plain tokens of a pinned (Flight SQL) or
-    /// ES|QL statement over at most one signal table.
+    /// Every token on one lane: the plain tokens of a lowered statement over
+    /// at most one signal table.
     pub(crate) fn one_lane(lane: TargetSignal, tokens: Vec<CommitToken>) -> Self {
         let mut out = LaneTokens::default();
         for token in tokens {
@@ -356,8 +356,8 @@ const MAX_QUOTED_QUALIFIER_BYTES: usize = 64;
 /// section's prefix, then one bucket (ADR-2707 decision 5).
 const KEY_IDX_PROBE_DEPTH: u32 = 2;
 
-/// The HTTP SQL statement path's token rule (ADR-2904 decision 3), applied
-/// from the statement text and the request alone, before any catalog request:
+/// The SQL statement token rule (ADR-2904 decision 3), applied from the
+/// statement text and the request alone, before any catalog request:
 ///
 /// - a token qualified `<table>:` bounds that table's lane, and the qualifier
 ///   must equal, exactly, the lower-case name of a signal table the statement
@@ -368,8 +368,9 @@ const KEY_IDX_PROBE_DEPTH: u32 = 2;
 /// - a statement naming no signal table but some other table (Parquet, or
 ///   unknown) takes no token at all ([`SqlError::CommitTokenOnParquetStatement`]).
 ///
-/// [`SqlExecutor::execute_accounted`] and [`SqlExecutor::explain_accounted`]
-/// call this; its result is each lane's share for every resolve attempt.
+/// [`SqlExecutor::execute_accounted`], [`SqlExecutor::explain_accounted`] and
+/// the pinned (Flight SQL) resolve call this; its result is each lane's share
+/// for every resolve attempt.
 pub(crate) fn admit_http_tokens(
     tables: &StatementTables,
     min_tokens: &[MinCommitToken],
@@ -433,20 +434,6 @@ fn quoted_qualifier(qualifier: &str) -> String {
         end -= 1;
     }
     format!("{}...", &qualifier[..end])
-}
-
-/// Plain tokens for a path that cannot carry a table qualifier: refuse a
-/// qualified one with [`SqlError::QualifiedCommitTokenUnsupported`].
-pub(crate) fn unqualified_tokens(
-    min_tokens: &[MinCommitToken],
-) -> Result<Vec<CommitToken>, SqlError> {
-    min_tokens
-        .iter()
-        .map(|min_token| match min_token.table {
-            None => Ok(min_token.token.clone()),
-            Some(_) => Err(SqlError::QualifiedCommitTokenUnsupported),
-        })
-        .collect()
 }
 
 /// Refuse a statement that names a table function or a URL-shaped table, with
@@ -648,11 +635,8 @@ pub struct SqlRequest {
     /// above the scan, so this only bounds which segments are listed.
     pub window: TimeRange,
     /// Read-your-write tokens (docs/catalog-and-mvcc.md step 4), each
-    /// optionally qualified by the table it bounds. Only the HTTP statement
-    /// entry points ([`SqlExecutor::execute_accounted`],
-    /// [`SqlExecutor::explain_accounted`]) accept a qualified token; the
-    /// pinned (Flight SQL) surface refuses one with
-    /// [`SqlError::QualifiedCommitTokenUnsupported`].
+    /// optionally qualified by the table it bounds. Every entry point taking
+    /// this request assigns them to lanes with [`admit_http_tokens`].
     pub min_tokens: Vec<MinCommitToken>,
     /// The injected clock reading that bounds the listing window. The same
     /// value is reused on the retry so both resolves see the same window.
@@ -2563,13 +2547,9 @@ impl SqlExecutor {
     /// resolves exactly as [`Self::resolve_pinned`] does and returns its one
     /// lane.
     ///
-    /// Tokens are plain, as on a Flight ticket: a qualified one is
-    /// [`SqlError::QualifiedCommitTokenUnsupported`], and any token on a
-    /// statement naming two or more signal tables is
-    /// [`SqlError::CommitTokenNeedsQualifier`], because a plain token does not
-    /// say which table it bounds, and any token on a statement naming no
-    /// signal table is [`SqlError::CommitTokenOnParquetStatement`]. Each is
-    /// refused before any store request.
+    /// Tokens are admitted by [`admit_http_tokens`], the HTTP statement path's
+    /// rule, so each refusal is the HTTP path's error and comes before any
+    /// store request.
     pub async fn resolve_pinned_lanes(
         &self,
         tenant_hash: TenantHash,
@@ -2588,18 +2568,7 @@ impl SqlExecutor {
         tables: &StatementTables,
         accounting: &QueryAccounting,
     ) -> Result<PinnedLanes, SqlError> {
-        let plain = unqualified_tokens(&req.min_tokens)?;
-        // A token bounds a signal table's catalog, and a statement naming
-        // none has nothing for it to bound, as on HTTP (`admit_http_tokens`).
-        if !plain.is_empty() && tables.signals.is_empty() && !tables.others.is_empty() {
-            return Err(SqlError::CommitTokenOnParquetStatement);
-        }
-        let tokens = if tables.signals.len() > 1 {
-            admit_http_tokens(tables, &req.min_tokens)?
-        } else {
-            // The one table the statement reads is the one plain tokens bound.
-            LaneTokens::one_lane(tables.first_lane(), plain)
-        };
+        let tokens = admit_http_tokens(tables, &req.min_tokens)?;
         // Kept on the pooled `&QueryAccounting` signature (the public Flight
         // SQL `GetFlightInfo`-side resolve, whose caller has no phase-split
         // handle to hand in): `pooled_over` shares this same handle's counters

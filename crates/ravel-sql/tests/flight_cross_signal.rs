@@ -28,14 +28,11 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
 use ravel_sql::{
-    FlightAuth, FlightClock, FlightSqlConfig, FlightTicket, RavelFlightSqlService, TargetSignal,
-    TicketKey,
+    FlightTicket, MSG_UNSATISFIABLE, MinCommitToken, SqlError, TargetSignal, TicketKey,
 };
-use ravel_types::accounting::NoopQueryCostRecorder;
 use ravel_types::{CommitToken, Signal, TenantHash, TenantId};
-use tonic::metadata::MetadataMap;
-use tonic::{Code, Status};
-use util::flight_harness::{Harness, TOKEN_KEY, TestClock, statement_ticket};
+use tonic::Code;
+use util::flight_harness::{Harness, MIN_COMMIT_TOKEN_KEY, statement_ticket};
 use util::{CountingStore, SegSpec, SeriesSpec, tenant_id};
 use uuid::Uuid;
 
@@ -316,37 +313,46 @@ async fn a_two_signal_statement_agrees_with_http() {
     assert_eq!(first_column(&flight), vec![100, 150, 200]);
 }
 
-/// Resolves the tenant like the harness's `TestAuth`, but carries one plain
-/// `min_commit_token` on every request.
-struct TokenAuth {
-    tenant: TenantHash,
-    token: CommitToken,
+/// The HTTP statement path's error for `sql` carrying `tokens`.
+async fn http_error(harness: &Harness, tenant: &TenantId, sql: &str, tokens: &[&str]) -> SqlError {
+    let mut request = util::request(sql);
+    request.min_tokens = tokens
+        .iter()
+        .map(|raw| MinCommitToken::parse(raw).expect("a token the HTTP path parses"))
+        .collect();
+    harness
+        .executor
+        .execute(tenant.hash(), &request)
+        .await
+        .expect_err("the HTTP path refuses it too")
 }
 
-impl FlightAuth for TokenAuth {
-    fn tenant(&self, metadata: &MetadataMap) -> Result<TenantHash, Status> {
-        match metadata.get(TOKEN_KEY).and_then(|v| v.to_str().ok()) {
-            Some("acme") => Ok(self.tenant),
-            _ => Err(Status::unauthenticated(
-                "invalid or missing tenant credentials",
-            )),
-        }
-    }
-
-    fn min_commit_tokens(&self, _metadata: &MetadataMap) -> Result<Vec<CommitToken>, Status> {
-        Ok(vec![self.token.clone()])
+/// The commit token [`util::publish_logs`] returns for index 1, known before
+/// that commit is published so a test can carry it while it is unsatisfiable.
+fn second_logs_commit_token() -> CommitToken {
+    CommitToken {
+        shard: 0,
+        writer_id: Uuid::from_u128(0x7001),
+        epoch: 1,
+        seq: 2,
+        ingest_hour_bucket: 0,
     }
 }
 
-/// Flight metadata carries no signal qualifier on a commit token, so a plain
-/// token on a statement naming two signal tables is refused at
-/// `GetFlightInfo` with INVALID_ARGUMENT, while the same statement with no
-/// token runs and a one-table statement with the token runs.
+/// An unqualified token on a statement naming two signal tables is refused at
+/// `GetFlightInfo` with the HTTP path's error, `CommitTokenNeedsQualifier`,
+/// whose text tells the client to qualify it as `<table>:<token>`; the same
+/// statement with no token runs, and a one-table statement takes the token
+/// unqualified or qualified with its table.
+///
+/// FLIP: admitting an unqualified token on the one lane `first_lane` names,
+/// whatever the statement's table count, mints a ticket for the join.
 #[tokio::test]
 async fn a_plain_commit_token_on_a_two_signal_statement_is_refused_at_get_flight_info() {
     let (harness, tenant) = harness_over(Arc::new(MemoryStore::new())).await;
     let extra = SegSpec::new(30, 1, 3, vec![SeriesSpec::new("cpu", vec![(400, 4.0)])]);
     let (token, _) = util::publish_segment(harness.store.as_ref(), &tenant, 99, &extra).await;
+    let plain = token.encode();
 
     let without_token = harness
         .get_flight_info("acme", JOIN)
@@ -362,37 +368,145 @@ async fn a_plain_commit_token_on_a_two_signal_statement_is_refused_at_get_flight
         vec![100, 150, 200, 400]
     );
 
-    let service = RavelFlightSqlService::new(
-        Arc::clone(&harness.executor),
-        Arc::new(TokenAuth {
-            tenant: tenant.hash(),
-            token,
-        }),
-        TestClock::at(util::NOW_NS) as Arc<dyn FlightClock>,
-        FlightSqlConfig {
-            max_deadline: std::time::Duration::from_secs(30),
-            ..FlightSqlConfig::default()
-        },
-        Arc::new(NoopQueryCostRecorder),
-        ravel_query::QueryAdmissionController::shared(
-            ravel_query::QueryConcurrencyLimit::Unlimited,
-        ),
-    );
-    let tokened = Harness { service, ..harness };
-
-    let err = tokened
-        .get_flight_info("acme", JOIN)
+    let err = harness
+        .get_flight_info_with_tokens("acme", JOIN, &[&plain])
         .await
         .expect_err("a plain token cannot say which signal it names");
     assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
-    assert!(err.message().contains("min_commit_token"), "{err:?}");
-
-    let one_table = tokened
-        .get_flight_info("acme", "SELECT ts FROM samples ORDER BY ts")
-        .await
-        .expect("a one-table statement admits the plain token");
+    let expected = SqlError::CommitTokenNeedsQualifier {
+        tables: "samples, logs".to_owned(),
+    };
+    assert_eq!(err.message(), expected.client_message());
     assert_eq!(
-        first_column(&tokened.do_get("acme", &one_table).await.expect("do get")),
-        vec![100, 150, 200, 300, 400]
+        err.message(),
+        "an unqualified min_commit_token is ambiguous on a statement that reads more than \
+         one of the samples, logs, spans, alerts and audit tables; qualify \
+         min_commit_token with one of samples, logs, as <table>:<token>"
     );
+    assert_eq!(
+        err.message(),
+        http_error(&harness, &tenant, JOIN, &[&plain])
+            .await
+            .client_message(),
+        "the HTTP path's text"
+    );
+
+    for value in [plain.clone(), format!("samples:{plain}")] {
+        let one_table = harness
+            .get_flight_info_with_tokens("acme", "SELECT ts FROM samples ORDER BY ts", &[&value])
+            .await
+            .expect("a one-table statement admits the token");
+        assert_eq!(
+            first_column(&harness.do_get("acme", &one_table).await.expect("do get")),
+            vec![100, 150, 200, 300, 400],
+            "{value}"
+        );
+    }
+}
+
+/// A `logs:`-qualified token on a two-signal Flight statement bounds the logs
+/// resolve and only that one: while its commit is unpublished `GetFlightInfo`
+/// is UNAVAILABLE with the fixed unsatisfiable-token message, once published
+/// the statement runs and reads the new log line, and the same token
+/// qualified `samples:` is still unsatisfiable because no samples commit
+/// carries it. The ticket keeps the token as an untagged list.
+///
+/// FLIP: refusing any qualified token at `GetFlightInfo`, as the Flight path
+/// did before ADR-2904 decision 3 reached it, fails the first assertion with
+/// INVALID_ARGUMENT; applying a qualified token to every signal's resolve
+/// fails the published `logs:` case with UNAVAILABLE; dropping qualified
+/// tokens mints a ticket while the commit is unpublished.
+#[tokio::test]
+async fn a_logs_qualified_token_bounds_only_the_logs_resolve_of_a_two_signal_statement() {
+    let (harness, tenant) = harness_over(Arc::new(MemoryStore::new())).await;
+    let pending = second_logs_commit_token();
+    let logs_qualified = format!("logs:{}", pending.encode());
+    let samples_qualified = format!("samples:{}", pending.encode());
+
+    let err = harness
+        .get_flight_info_with_tokens("acme", JOIN, &[&logs_qualified])
+        .await
+        .expect_err("the logs commit is not published yet");
+    assert_eq!(err.code(), Code::Unavailable, "{err:?}");
+    assert_eq!(err.message(), MSG_UNSATISFIABLE);
+
+    let (published, _) = util::publish_logs(harness.store.as_ref(), &tenant, 1, &[300]).await;
+    assert_eq!(
+        published, pending,
+        "the token names the commit just published"
+    );
+
+    let ticket = harness
+        .get_flight_info_with_tokens("acme", JOIN, &[&logs_qualified])
+        .await
+        .expect("logs:T bounds the logs resolve");
+    assert_eq!(
+        decode(&ticket, harness.service.ticket_key()).min_commit_tokens,
+        vec![pending.clone()],
+        "the ticket carries the token untagged"
+    );
+    assert_eq!(
+        first_column(&harness.do_get("acme", &ticket).await.expect("do get")),
+        vec![100, 150, 200, 300]
+    );
+
+    let err = harness
+        .get_flight_info_with_tokens("acme", JOIN, &[&samples_qualified])
+        .await
+        .expect_err("no samples commit carries T");
+    assert_eq!(err.code(), Code::Unavailable, "{err:?}");
+    assert_eq!(err.message(), MSG_UNSATISFIABLE);
+}
+
+/// A qualifier naming a table the statement does not read is refused at
+/// `GetFlightInfo` with the HTTP path's `CommitTokenQualifierNotRead`.
+///
+/// FLIP: routing an unknown qualifier to the statement's first lane instead
+/// of refusing it mints a ticket.
+#[tokio::test]
+async fn a_qualifier_the_flight_statement_does_not_read_is_refused() {
+    let (harness, tenant) = harness_over(Arc::new(MemoryStore::new())).await;
+    let spans_qualified = format!("spans:{}", second_logs_commit_token().encode());
+
+    let err = harness
+        .get_flight_info_with_tokens("acme", JOIN, &[&spans_qualified])
+        .await
+        .expect_err("the join reads no spans");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    let expected = SqlError::CommitTokenQualifierNotRead {
+        qualifier: "spans".to_owned(),
+        tables: "samples, logs".to_owned(),
+    };
+    assert_eq!(err.message(), expected.client_message());
+    assert_eq!(
+        err.message(),
+        http_error(&harness, &tenant, JOIN, &[&spans_qualified])
+            .await
+            .client_message(),
+        "the HTTP path's text"
+    );
+}
+
+/// A malformed qualified value is refused at `GetFlightInfo` with
+/// `MinCommitToken::parse`'s error, before any resolve.
+///
+/// FLIP: a parse of its own that splits at the last colon accepts
+/// `a:b:<token>` with the qualifier `a:b`, and one that skips an empty
+/// qualifier accepts `:<token>`.
+#[tokio::test]
+async fn a_malformed_qualified_flight_token_is_refused_with_the_parse_error() {
+    let (harness, _tenant) = harness_over(Arc::new(MemoryStore::new())).await;
+    let encoded = second_logs_commit_token().encode();
+    for raw in [format!(":{encoded}"), format!("a:b:{encoded}")] {
+        let parse_err = MinCommitToken::parse(&raw).expect_err("malformed");
+        let err = harness
+            .get_flight_info_with_tokens("acme", JOIN, &[&raw])
+            .await
+            .expect_err("refused");
+        assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+        assert_eq!(
+            err.message(),
+            format!("invalid {MIN_COMMIT_TOKEN_KEY}: {raw:?}: {parse_err}")
+        );
+    }
 }
