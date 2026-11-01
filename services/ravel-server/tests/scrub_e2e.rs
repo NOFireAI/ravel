@@ -566,6 +566,150 @@ async fn postings_disagreement_surfaces_on_metrics_through_the_real_scrub_task()
     );
 }
 
+/// A folded snapshot part re-encoded under another tenant's `tenant_hash`
+/// surfaces as `ravel_catalog_isolation_breach_total` on `/metrics` through the
+/// real scheduled scrub task (ADR-0050 §2): the scrub counts on the server's
+/// own catalog, the one `/metrics` renders. The fold loop is disabled, so the
+/// scrub is the only reader of the part.
+///
+/// FLIP: hand `scrub::spawn` in `ravel_server::start` a second
+/// `Catalog::new(...)` instead of the server's catalog and the counter stays
+/// at 0, so `detected` is false.
+#[tokio::test]
+async fn foreign_snapshot_part_surfaces_as_isolation_breach_through_the_real_scrub_task() {
+    let tenant = TenantId::new("scrub-breach-e2e");
+    let store = Arc::new(MemoryStore::new());
+    let now = now_ns();
+    let created = now - SEALED_AGE_NS;
+
+    publish_sealed_segment(store.as_ref(), &tenant, 1, created).await;
+    let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
+    let catalog = ravel_catalog::Catalog::new(
+        store_dyn.clone(),
+        CatalogConfig {
+            shard_count: 1,
+            ..CatalogConfig::default()
+        },
+    )
+    .expect("catalog")
+    .with_provisioning_enforcement();
+    catalog
+        .fold(
+            &tenant.hash(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now,
+            &[],
+            None,
+        )
+        .await
+        .expect("fold produces a HEAD");
+
+    let head_key = format!(
+        "t/{}/catalog/{}/HEAD",
+        tenant.hash().to_hex(),
+        Signal::Metrics.key_prefix(),
+    );
+    let head_bytes = store
+        .get(&head_key, GetRange::Full)
+        .await
+        .expect("head present after fold")
+        .data;
+    let mut head = ravel_catalog::decode_head(&head_bytes).expect("decode head");
+    let part_key = head.parts[0].key.clone();
+    let original = store
+        .get(&part_key, GetRange::Full)
+        .await
+        .expect("part present")
+        .data;
+    let decoded = ravel_catalog::decode_part(&original, &ravel_catalog::PartLimits::default())
+        .expect("the folded part decodes");
+    assert_eq!(
+        decoded.header.min_hour, 0,
+        "the fold wrote a single-range part"
+    );
+    let foreign = ravel_catalog::encode_part(
+        [0xff; 16],
+        decoded.header.signal,
+        decoded.header.shard_count,
+        decoded.header.watermark_hour,
+        &decoded.entries,
+    )
+    .expect("re-encode the part for a foreign tenant");
+    let blake3 = blake3::hash(&foreign).as_bytes().to_vec();
+    head.parts[0].blake3 = blake3.clone();
+    head.parts[0].size = foreign.len() as u64;
+    if let Some(postings) = head.postings.as_mut() {
+        postings.part_blake3[0] = blake3;
+    }
+    store
+        .put(
+            &part_key,
+            bytes::Bytes::from(foreign),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put the foreign part");
+    let rewritten = ravel_catalog::encode_head(&head).expect("re-encode head");
+    store
+        .put(
+            &head_key,
+            bytes::Bytes::from(rewritten),
+            PutOptions::default(),
+        )
+        .await
+        .expect("overwrite head");
+
+    let mut config = maintain_config(Mode::Maintain, &tenant);
+    config.fold.enabled = false;
+    let running = ravel_server::start(
+        config,
+        store_dyn.clone(),
+        store_dyn.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("maintain server starts");
+
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let prefix = "ravel_catalog_isolation_breach_total{mode=\"maintain\"} ";
+    let mut detected = false;
+    let mut last = None;
+    for _ in 0..60 {
+        let body = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("scrape /metrics")
+            .text()
+            .await
+            .expect("metrics body");
+        last = body
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .map(str::to_string);
+        if last
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|count| count > 0)
+        {
+            detected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    running.shutdown().await.expect("graceful shutdown");
+    assert!(
+        detected,
+        "the foreign part must surface as a non-zero ravel_catalog_isolation_breach_total on \
+         /metrics through the real spawned ScrubTask; last value seen: {last:?}"
+    );
+}
+
 /// The scrub metrics family is exposed only in `Mode::Maintain`, the one mode
 /// that spawns the scrubber (mirrors the maintain discovery/safety families'
 /// Maintain-only gating). A query- or gateway-mode process spawns no scrub task
