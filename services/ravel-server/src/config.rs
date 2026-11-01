@@ -21028,8 +21028,9 @@ mod tests {
     /// `--mtls-subject-header` is refused empty, without `--mtls-enabled`, and
     /// when it names the tenant header (explicit or the default, in any case),
     /// and otherwise reaches `AuthResolverSettings`. Flip to watch it fail:
-    /// delete the `(Some(_), None)` arm or the `eq_ignore_ascii_case` arm of
-    /// the `mtls_subject_header` match in `parse_auth_resolvers`.
+    /// in the `mtls_subject_header` match in `parse_auth_resolvers`, replace
+    /// the `(Some(_), None)` arm's bail with `Some(subject.clone())` (binding
+    /// `subject` in its pattern), or delete the `eq_ignore_ascii_case` arm.
     #[test]
     fn the_mtls_subject_header_is_refused_without_mtls_or_when_it_equals_the_tenant_header() {
         const SUBJECT: &str = "x-ravel-client-cert-subject";
