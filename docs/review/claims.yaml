@@ -252,14 +252,6 @@
   status: verified
   note: "The marker phrase is about a directory, but the sentence is a positive claim: create_entry_dir uses a recursive DirBuilder with mode 0o700."
 
-- id: query-engine-provider-budgets-follow-up
-  doc: docs/query-engine.md
-  quote: "is tracked as follow-up work and is not implemented yet"
-  kind: negative
-  binds: []
-  status: not-implemented
-  note: "None of logs_provider, spans_provider, alerts_provider or audit_provider consults max_bytes_scanned; the distributed RLOG slice exec carries one defaulting to Unlimited because those providers have no per-query byte budget."
-
 - id: query-engine-limitk-not-implemented
   doc: docs/query-engine.md
   quote: "They stay out of the scored surface (they are not part of the stable language), and are not implemented;"

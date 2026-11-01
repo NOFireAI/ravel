@@ -2304,25 +2304,47 @@ On the PromQL side, `QueryEngine::instant_with_budgets`,
 points that take `Option<&RequestBudgets>`; passing `None` is exactly the
 pre-existing method. On the SQL side, `SqlRequest::budgets` carries them.
 
-Enforcement on the SQL side is not yet uniform across the five tables, and a
-caller has to know which knob binds where. The effective `max_store_requests`
-ceiling IS checked for every target signal, once, immediately after
-`resolve_admitted`'s catalog resolve: a caller cannot finish a query above a
-lowered request budget on any of the five tables merely because its snapshot
+Enforcement on the SQL side is the same on all five signal tables. The
+effective `max_store_requests` ceiling is checked once, immediately after
+`resolve_admitted`'s catalog resolve, for every target signal: a caller cannot
+finish a query above a lowered request budget merely because its snapshot
 resolved empty. `max_segments` is enforced the same way, on the same shared
-resolve, via `segment_admission::admit`.
+resolve, via `segment_admission::admit`. `resolve_admitted` computes the
+effective configuration once and uses it for both.
 
-What is not yet uniform is INCREMENTAL, scan-time enforcement. Only the
-`samples` (metrics) provider re-checks the running total against
-`max_bytes_scanned` and `max_store_requests` as it fetches segments (scan.rs);
-the `logs`, `spans`, `alerts`, and `audit` providers do not. A lowered request
-budget on one of those four tables therefore only ever traps once, at resolve,
-never again as the scan itself keeps issuing GETs. The byte budget fares
-worse: `max_bytes_scanned` is not consulted at all for those four tables,
-neither at resolve nor during the scan. Enforcing the lowered byte budget,
-and the request budget's incremental scan-time re-check,
-on the `logs`, `spans`, `alerts`, and `audit` providers is tracked as
-follow-up work and is not implemented yet.
+The scans then re-check both `max_bytes_scanned` and `max_store_requests`
+incrementally (issue #1409). Each table's provider carries a `ScanBudget`
+(`crates/ravel-sql/src/scan_budget.rs`) built from the effective
+configuration, and every check compares the STATEMENT total, summed over every
+table the statement reads (ADR-2904), so a two-table statement whose tables
+each fit a lowered budget alone but not together is refused. The check runs
+after a store read completes and before the scan issues its next one or
+decodes further:
+
+- `samples`: after each partition's segment fetch, before its decode
+  (`scan.rs`, `prepare_partition`).
+- `logs`: after each plan or probe read (`logs_scan/plan.rs`), after each
+  segment open, whole or ranged (`logs_scan/scan.rs`), and after each block
+  fetch of a row-fetch source (`logs_scan/mod.rs`, `RowFetchSource`).
+- `spans`: after each columnar fetch, before its decode
+  (`spans_scan.rs`, `prepare_columnar`), and after each row-path fetch.
+- `alerts` and `audit`: after each segment fetch, before the next one
+  (`alerts_scan.rs`, `audit_scan.rs`, `prepare_partition`).
+
+A tripped check is `SqlError::TooManyBytesScanned` or
+`SqlError::RequestBudgetExceeded`, the same typed errors the server ceiling
+produces. With no lowered budget the effective configuration is the server's,
+so the checks run against the server ceilings and change no result that fits
+them. `SignalStats::budgets` (`EnforcedBudgets`) reports, per table, the two
+limits its scan checked and how many checks ran; a table that read no lane
+reports `None`.
+
+A distributed fan-out of any of these tables folds each worker batch's Arrow
+footprint into the coordinating lane's scan accounting and refuses with
+`TooManyBytesScanned` once that lane's folded total passes the effective
+`max_bytes_scanned` (`distributed.rs`, `distributed_rlog.rs`). That fold
+compares the lane's own total, not the statement total, and the executor
+installs a fan-out only on the `samples` provider.
 
 ### The agent query knobs on `SqlRequest` (ADR-1374)
 
@@ -2359,8 +2381,9 @@ not a defect: a request whose `start_ns` equals its `end_ns` lists the
 segments covering that instant and, under `row_window`, returns zero rows.
 
 The traversal that plants the filter descends into subqueries embedded in
-expressions (`Expr::ScalarSubquery`, `Expr::InSubquery`, `Expr::Exists`) as
-well as into plan children, so every signal table's `TableScan` in the statement
+expressions (`Expr::ScalarSubquery`, `Expr::InSubquery`, `Expr::Exists`,
+`Expr::SetComparison`) as well as into plan children, so every signal table's
+`TableScan` in the statement
 is filtered, including the scans of CTEs, set operations, self-joins, and a
 `WHERE` clause's own `SELECT`. Filtering only the outer scan would answer
 `SELECT ... WHERE value > (SELECT avg(value) FROM samples)` from an average
@@ -2370,12 +2393,22 @@ The optimizer then pushes the injected predicate down exactly as it pushes
 one the statement itself carried, so **pruning tightens**: the provider is
 offered a filter it would not otherwise have seen, and it may skip segments
 and blocks the bare statement would have read. That is sound rather than a
-correctness risk because every provider reports `Inexact` for the filters it
-accepts, so DataFusion re-applies the predicate above the scan; a segment
-straddling the window is still read whole and cut by row. `SqlStats::
-window_predicate` reports the applied predicate as the display of the
-expression that was actually planted, so the reported text cannot describe a
-different filter than the one that ran.
+correctness risk either way a provider answers. Every provider but a local
+`logs` scan reports `Inexact` for the filters it accepts, so DataFusion
+re-applies the predicate above the scan; a segment straddling the window is
+still read whole and cut by row. A local `logs` scan reports the injected pure
+`ts` bound `Exact` (`logs_pushdown::filter_is_exact`) and no residual runs:
+the RLOG reader re-checks every decoded row against `Predicate::TsRange`, with
+the half-open end taken as `end_ns - 1`. `row_window_applies_to_logs_ts_and_alerts_ts_ns`
+pins both answers on a segment with records either side of each edge.
+`SqlStats::window_predicate` reports the applied predicate as the display of
+the expression that was actually planted, so the reported text cannot
+describe a different filter than the one that ran.
+
+The pinned two-step entries (`resolve_pinned`, `resolve_pinned_lanes`, then a
+`plan_pinned*` call, the Flight SQL path) carry no row window, so a request
+with `row_window` set is refused there as `SqlError::RowWindowNotPinned`
+(HTTP 400) before any store request (`a_pinned_resolve_refuses_a_row_window`).
 
 `max_rows: Option<usize>` stops the stream once `max_rows + 1` rows have
 been emitted. The extra row is deliberate: it is what distinguishes "this is
@@ -5619,9 +5652,10 @@ pays. The query-audit shard keeps its own separate compaction and 90-day sweep.
 The bounds a `logs` query runs under hold here unchanged: segment admission caps
 the resolved snapshot, every emitted batch grows the query's memory reservation
 so an over-budget scan fails with `ResourcesExhausted` at the tenant's pool
-ceiling, and the request deadline bounds wall time. The bytes-scanned budget the
-RLOG and RSPAN scan loops still lack is missing here too, and these two tables
-add two more callers without changing that scope. Neither scan takes a pushed
+ceiling, and the request deadline bounds wall time. Both scans also check the
+statement's effective `max_bytes_scanned` and `max_store_requests` after each
+segment fetch, before the next (issue #1409; see "Per-request budgets
+(ADR-1374)" above). Neither scan takes a pushed
 LIMIT: `AlertsScanExec` and `AuditScanExec` implement no `fetch`, so the LIMIT
 stays a limit operator above the scan, which ends a partition only by no longer
 polling it. `SpansScanExec` is the same, and the `spans` provider forwards a
