@@ -253,15 +253,25 @@ class Usage(unittest.TestCase):
                 self.record("2026-11-02T00:00:02Z", "bin/agent-cli --json pr 2"),
                 self.record("2026-11-02T00:00:03Z", "grep -rn 'df -h' docs/"),  # neither
                 self.record("2026-11-02T00:00:04Z", "git commit -m 'use agent-cli first'"),  # a mention
+                self.record("2026-11-02T00:00:05Z", "git commit -m 'run agent-cli pr first'"),  # quoted
+                self.record("2026-11-02T00:00:06Z", "timeout 60 bin/agent-cli pr 3"),
+                self.record("2026-11-02T00:00:07Z", "gh pr view 4; df -h ."),  # two raw lookups
                 "not json",
             ]))
             (pathlib.Path(d) / "s2.jsonl").write_text(self.record("2026-11-03T00:00:00Z", "ls"))
             t = cli.count_usage(sorted(pathlib.Path(d).glob("*.jsonl")), "2026-11-01", self.TABLE,
                                 cli.subcommand_names())
         self.assertIn("usage", cli.subcommand_names())
-        self.assertEqual((t["sessions"], t["agent_cli"], t["raw"]), (2, 1, 2))
-        self.assertEqual(t["raw_by_subcommand"], {"pr": 1, "box": 1})
-        self.assertEqual(t["agent_cli_by_subcommand"], {"pr": 1})
+        self.assertEqual((t["sessions"], t["agent_cli"], t["raw"]), (2, 2, 4))
+        self.assertEqual(t["raw_by_subcommand"], {"pr": 2, "box": 2})
+        self.assertEqual(t["agent_cli_by_subcommand"], {"pr": 2})
+
+    def test_transcript_dirs_include_worktree_sessions(self):
+        dirs = cli.transcript_dirs()
+        if not dirs:
+            self.skipTest("no Claude Code transcripts for this repository on this machine")
+        root = dirs[0].name.split("-wt-")[0]
+        self.assertTrue(all(d.name.startswith(root) for d in dirs))
 
 
 class Parser(unittest.TestCase):

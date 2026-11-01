@@ -985,14 +985,25 @@ def nudge_table():
     return json.loads((root / ".claude" / "guards" / "agent-cli-nudges.json").read_text())["nudges"]
 
 
-def transcript_dir():
-    """This repository's Claude Code transcript directory on this machine."""
+def transcript_dirs():
+    """This repository's Claude Code transcript directories on this machine.
+
+    A session's directory is named after the directory it started in, and
+    sessions here start in the primary checkout or in one of its worktrees,
+    whose paths extend the primary's (store, store-wt-3565), so the primary's
+    slug is a prefix of every one of them."""
     common = Path(run(["git", "rev-parse", "--git-common-dir"], check=True)[1].strip()).resolve()
-    primary = common.parent
-    return Path.home() / ".claude" / "projects" / str(primary).replace("/", "-")
+    slug = str(common.parent).replace("/", "-")
+    projects = Path.home() / ".claude" / "projects"
+    return sorted(p for p in projects.glob(slug + "*") if p.is_dir())
 
 
-AGENT_CLI_CALL = re.compile(r"(?:^|[;&|(]\s*|\s)(?:\S*/)?agent-cli\s+(?:--json\s+)?([a-z-]+)")
+# Command position only: the start of the command or of a statement after
+# ; & | or (, or after a timeout/env/nohup prefix. A bare space is not a
+# command position, so a mention inside a quoted string does not count.
+AGENT_CLI_CALL = re.compile(
+    r"(?:^|[;&|(]\s*|\b(?:timeout\s+\d+[smh]?|nohup|env(?:\s+\w+=\S*)*)\s+)"
+    r"(?:\S*/)?agent-cli\s+(?:--json\s+)?([a-z-]+)")
 
 
 def subcommand_names():
@@ -1034,12 +1045,13 @@ def count_usage(paths, since, table, known):
                     sub = totals["agent_cli_by_subcommand"]
                     sub[m.group(1)] = sub.get(m.group(1), 0) + 1
                     continue
+                # Every pattern that matches counts: one Bash call can run
+                # several raw lookups, and each is a call agent-cli would replace.
                 for rx, sub_name in compiled:
                     if rx.search(cmd):
                         totals["raw"] += 1
                         sub = totals["raw_by_subcommand"]
                         sub[sub_name] = sub.get(sub_name, 0) + 1
-                        break
         if counted:
             totals["sessions"] += 1
     return totals
@@ -1047,13 +1059,15 @@ def count_usage(paths, since, table, known):
 
 def cmd_usage(a):
     o = Out(a.json)
-    d = Path(a.dir) if a.dir else transcript_dir()
-    if not d.is_dir():
-        raise CliError(f"no transcript directory {d}")
-    t = count_usage(sorted(d.glob("*.jsonl")), a.since, nudge_table(), subcommand_names())
+    dirs = [Path(a.dir)] if a.dir else transcript_dirs()
+    dirs = [d for d in dirs if d.is_dir()]
+    if not dirs:
+        raise CliError("no transcript directory" + (f" {a.dir}" if a.dir else " for this repository under ~/.claude/projects"))
+    paths = sorted(p for d in dirs for p in d.glob("*.jsonl"))
+    t = count_usage(paths, a.since, nudge_table(), subcommand_names())
     total = t["agent_cli"] + t["raw"]
     t["since"] = a.since
-    t["dir"] = str(d)
+    t["dirs"] = [str(d) for d in dirs]
     t["agent_cli_share"] = round(t["agent_cli"] / total, 3) if total else None
     o.data = t
     o.text(f"since={a.since} sessions={t['sessions']} agent-cli={t['agent_cli']} raw={t['raw']} "
@@ -1462,7 +1476,8 @@ def build_parser():
              ".claude/guards/agent-cli-nudges.json, the table the PreToolUse hook reads. The share is the "
              "adoption figure; the per-subcommand rows say which lookups still go raw.")
     sp.add_argument("--since", default="2026-11-01", help="ISO date or timestamp; records before it are skipped")
-    sp.add_argument("--dir", help="transcript directory (default: derived from the primary checkout path)")
+    sp.add_argument("--dir", help="one transcript directory (default: every directory under ~/.claude/projects "
+                                  "named for the primary checkout or one of its worktrees)")
 
     sp = add("wt", cmd_wt, "worktrees: ls [--dirty] | new NAME [--ref R] [--branch B] | rm PATH [--force]",
              "new creates <primary>-wt-NAME from a fresh origin/main (detached unless --branch). "
