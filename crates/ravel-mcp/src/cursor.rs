@@ -16,19 +16,57 @@
 //! commit-token watermark the page was resolved against, the pending erasure
 //! predicates in force, and the declared column set (the 2026-09-09 amendment
 //! to ADR-1374 D5, as corrected by the 2026-09-10 one). Redemption re-resolves
-//! the snapshot from those inputs deterministically, and refuses the cursor as
-//! [`CursorError::Expired`] in the two cases where that re-resolve would no
-//! longer answer with the page's own snapshot: its deadline has fallen outside
-//! the protection horizon less the grace, which is where a compaction becomes
-//! free to take the pin apart, or an erasure predicate is in force that the
-//! cursor did not pin and that reaches its signal and time range. Both live in
-//! [`Cursor::redeem`].
+//! the snapshot from those inputs deterministically, at the cursor's own
+//! `mint_ns` (the 2026-09-12 amendment, item 4, and the 2026-09-13 one, item
+//! 5), and refuses the cursor as [`CursorError::Expired`] in the three cases
+//! where that re-resolve would no longer answer with the page's own snapshot:
+//! its deadline has fallen outside the protection horizon less the grace,
+//! which is where a compaction becomes free to take the pin apart; an erasure
+//! predicate is in force that the cursor did not pin and that reaches its
+//! signal and time range; or the declared column set differs from the pinned
+//! one (the 2026-09-12 amendment, item 3).
 //!
-//! Those two are what a redemption can detect. A third case exists that it
+//! # Redemption is two stages around the caller's resolve
+//!
+//! The last two cases are facts about the redeeming resolve, so redemption is
+//! split around it. [`Cursor::redeem`] is stage one: it decodes the token,
+//! verifies its MAC, version and deadline, and binds it to the redeeming
+//! tenant, tool and argument hash. It takes no store, catalog or erasure set,
+//! so it reads nothing, and it returns a [`PendingRedemption`] carrying the
+//! resolve inputs the caller resolves with, the resolve instant included. The
+//! caller resolves, and then [`PendingRedemption::confirm`], stage two, checks
+//! what that resolve observed (its pending erasure predicates and its declared
+//! column set) against the pin and only then hands back the [`Cursor`] with
+//! its position.
+//!
+//! The erasure check is sound for the set the redeeming resolve observed, not
+//! for a set read at the mint instant. The resolve's instant bounds which
+//! ingest-hour buckets it lists; ravel-catalog lists the pending erasure
+//! requests under `del/` with no filter on that instant
+//! (`Catalog::list_pending_erasure` in `crates/ravel-catalog/src/catalog.rs`),
+//! so a resolve at `mint_ns` still reports every request pending at the
+//! redemption. A caller that filtered that set down to what was pending at
+//! `mint_ns` would hide exactly the predicates the check exists to see.
+//!
+//! Those three are what a redemption can detect. A fourth case exists that it
 //! cannot: an erasure that arrives after the mint and completes before the
 //! redemption is neither pinned nor in force. It stays empty only while a
 //! cursor's lifetime is shorter than an erasure's completion time, which
-//! [`Cursor::redeem`] states as an assumption with both quantities named.
+//! [`PendingRedemption::confirm`] states as an assumption with both quantities
+//! named.
+//!
+//! # The pinned ingest watermark and the snapshot id
+//!
+//! A cursor also pins page one's freshness watermark,
+//! [`Cursor::ingest_watermark_hour`] (the 2026-09-13 amendment, items 3 and
+//! 4), so every page of a sequence reports the value page one measured. It is
+//! a measurement carried forward, not a resolve input, and no stage of
+//! redemption compares it with anything.
+//!
+//! [`snapshot_id`] is the `visibility.snapshot_id` derivation of the same
+//! amendment's item 6: a hash over the seven resolve inputs, the resolve
+//! instant among them. A cursor pins six of them and its `mint_ns` is the
+//! seventh, so every page of one sequence derives the same id.
 //!
 //! The watermark is one of those inputs and nothing more. It is what page 2
 //! resolves against, not a test run against whatever watermark the redeeming
@@ -50,8 +88,11 @@
 //! [`CursorError::Invalid`], the same error a corrupt or tampered token
 //! produces -- never a distinct "wrong tenant" signal, which would let one
 //! tenant learn that a token it holds was minted for someone else. Redeeming
-//! code MUST call [`Cursor::redeem`] (or [`EvidenceRef::redeem`]), never
-//! [`Cursor::decode`] directly, so the tenant check happens on every call.
+//! code MUST call [`Cursor::redeem`] and then [`PendingRedemption::confirm`]
+//! (or [`EvidenceRef::redeem`]), never [`Cursor::decode`] directly, so the
+//! tenant check happens on every call. The position is reachable only through
+//! `confirm`'s result, so a caller cannot page from a cursor whose stage two
+//! it skipped.
 //!
 //! # A token is bound to the call that minted it
 //!
@@ -84,8 +125,9 @@
 //!
 //! A cursor whose pin is gone has nothing left to offer: page 2 of a
 //! paginated result means something only against page 1's snapshot, so
-//! [`Cursor::redeem`] reports [`CursorError::Expired`] for a passed deadline,
-//! a foreign nonce, or a newer erasure over its range. An evidence reference
+//! [`Cursor::redeem`] reports [`CursorError::Expired`] for a passed deadline
+//! or a foreign nonce, and [`PendingRedemption::confirm`] for a newer erasure
+//! over its range or a changed declared column set. An evidence reference
 //! is different. It names one row,
 //! and every field a fresh re-execution needs (the tenant, the tool, the
 //! argument hash, and the row digest to compare the re-read row against) is
@@ -185,12 +227,13 @@ const CURSOR_MAGIC: [u8; 4] = *b"RMC1";
 /// projection version 1 carried; version 3 added the plaintext process nonce
 /// after the version byte; version 4 drops the segment enumeration for the
 /// resolve inputs of the 2026-09-09 amendment (signal, time range, commit-token
-/// watermark, pending erasure, declared columns, keyset position). A token of
-/// any earlier version decodes as [`CursorError::Invalid`] like any other
+/// watermark, pending erasure, declared columns, keyset position); version 5
+/// adds the pinned ingest watermark hour of the 2026-09-13 amendment. A token
+/// of any earlier version decodes as [`CursorError::Invalid`] like any other
 /// unsupported version, which is correct and costs nothing: these tokens are
 /// process-local and deadline-bounded, so none survives the deploy that
 /// changes the number.
-const CURSOR_VERSION: u8 = 4;
+const CURSOR_VERSION: u8 = 5;
 const EVIDENCE_MAGIC: [u8; 4] = *b"RME1";
 /// Version 2 adds the same plaintext process nonce [`CURSOR_VERSION`] 3 does;
 /// version 3 adds the argument hash, which an unpinned redemption needs to
@@ -228,10 +271,10 @@ pub const MAX_TOKEN_BYTES: usize = 1024 * 1024;
 /// window a redemption starting now may still use.
 ///
 /// This constant is also what bounds a cursor's lifetime, and through that
-/// what keeps [`Cursor::redeem`]'s erasure check sound. Raising a
+/// what keeps [`PendingRedemption::confirm`]'s erasure check sound. Raising a
 /// deployment's protection horizon without raising this value lengthens that
-/// lifetime; [`Cursor::redeem`] states the bound the lifetime must stay
-/// under.
+/// lifetime; [`PendingRedemption::confirm`] states the bound the lifetime must
+/// stay under.
 pub const GRACE_NS: i64 = 24 * 3_600 * 1_000_000_000;
 
 /// Typed failure for both [`Cursor`] and [`EvidenceRef`]. The two decode
@@ -254,8 +297,11 @@ pub enum CursorError {
     /// The token is structurally valid and tenant-correct but its
     /// `deadline_ns` has passed, or it was minted by a process whose key no
     /// longer exists (a nonce mismatch), which puts its pinned snapshot just
-    /// as far out of reach. Only cursors report this: an evidence reference
-    /// in either state redeems as [`Redeemed::Unpinned`] instead.
+    /// as far out of reach; or, from [`PendingRedemption::confirm`], the
+    /// redeeming resolve observed a newer erasure over its scope or a
+    /// different declared column set. Only cursors report this: an evidence
+    /// reference past its deadline or from a foreign process redeems as
+    /// [`Redeemed::Unpinned`] instead.
     #[error("cursor has expired")]
     Expired,
     /// The wire token is longer than [`MAX_TOKEN_BYTES`], refused before it is
@@ -319,7 +365,7 @@ pub struct Cursor {
     /// This is a resolve input, not a validity test. It is what makes the
     /// re-resolve deterministic rather than a fresh resolution: page 2
     /// resolves against this same watermark instead of against whatever the
-    /// redeeming call observes. [`Cursor::redeem`] never compares it with
+    /// redeeming call observes. Neither stage of redemption compares it with
     /// anything, because ADR-0010 defines no ordering over commit tokens to
     /// compare it with: `seq` is monotonic only per (writer_id, epoch,
     /// shard), gaps in it carry no meaning, and `epoch` is informational
@@ -327,8 +373,18 @@ pub struct Cursor {
     /// answer to give at resolve time, not this codec's.
     pub min_commit_watermark: Vec<CommitToken>,
     pub pending_erasure: Vec<ErasurePredicate>,
+    /// The declared column set page one resolved with. Compared as a set
+    /// against the redeeming resolve's own by [`PendingRedemption::confirm`].
     pub declared_columns: Vec<DeclaredColumn>,
+    /// Page one's freshness watermark: the greatest `ingest_hour_bucket`
+    /// among the segments its resolve returned, in whole hours since the
+    /// epoch (the 2026-09-13 amendment, items 3 and 4). `None` when that
+    /// resolve returned no segment. Carried forward so every later page
+    /// reports page one's value; never compared with anything.
+    pub ingest_watermark_hour: Option<u32>,
     pub position: CursorPosition,
+    /// The instant page one resolved at, and the instant every redeeming
+    /// resolve runs at ([`PendingRedemption::resolve_at_ns`]).
     pub mint_ns: i64,
     pub deadline_ns: i64,
 }
@@ -426,6 +482,14 @@ impl Cursor {
             buf.push(declared_type_tag(column.ty));
         }
 
+        match self.ingest_watermark_hour {
+            None => buf.push(0),
+            Some(hour) => {
+                buf.push(1);
+                buf.extend_from_slice(&hour.to_le_bytes());
+            }
+        }
+
         match &self.position {
             CursorPosition::Keyset { tuple, order_by } => {
                 buf.push(0);
@@ -509,6 +573,12 @@ impl Cursor {
             declared_columns.push(DeclaredColumn::new(key, ty));
         }
 
+        let ingest_watermark_hour = match cur.read_u8()? {
+            0 => None,
+            1 => Some(u32::from_le_bytes(cur.read_array::<4>()?)),
+            _ => return Err(CursorError::Invalid),
+        };
+
         let position = match cur.read_u8()? {
             0 => {
                 let tuple = read_bytes_vec(&mut cur)?;
@@ -544,15 +614,25 @@ impl Cursor {
             min_commit_watermark,
             pending_erasure,
             declared_columns,
+            ingest_watermark_hour,
             position,
             mint_ns,
             deadline_ns,
         })
     }
 
-    /// Decode, verify the MAC, bind the token to the redeeming call, and check
-    /// the deadline against `now_ns` -- the full redemption sequence every
-    /// call site MUST use instead of [`Cursor::decode`].
+    /// Stage one of a redemption: decode, verify the MAC and version, bind the
+    /// token to the redeeming call, and check the deadline against `now_ns`.
+    /// Every call site MUST use this, then [`PendingRedemption::confirm`],
+    /// instead of [`Cursor::decode`].
+    ///
+    /// It takes no store, catalog or erasure set, so it reads nothing: the
+    /// caller resolves the snapshot after this returns, from the inputs the
+    /// [`PendingRedemption`] exposes and at its
+    /// [`resolve_at_ns`](PendingRedemption::resolve_at_ns), and passes what
+    /// that resolve observed to [`PendingRedemption::confirm`]. `now_ns` is the
+    /// redeeming call's clock and is used for the deadline check alone; it
+    /// never becomes the resolve instant.
     ///
     /// The token must have been minted for `caller_tenant`, for `tool`, and
     /// for `argument_hash`. Any of those three mismatching is
@@ -562,10 +642,11 @@ impl Cursor {
     /// another tool, or to another argument set.
     ///
     /// The deadline checked is [`effective_deadline_ns`] of the embedded one
-    /// and `protection_horizon_ns`, not the embedded one alone, and the
-    /// returned cursor carries that clamped value in `deadline_ns` so a caller
-    /// that bounds its own work by the field cannot read past the pin's
-    /// protection either.
+    /// and `protection_horizon_ns`, not the embedded one alone. The pending
+    /// redemption reports that clamped value as
+    /// [`PendingRedemption::deadline_ns`], and the cursor `confirm` returns
+    /// carries it in `deadline_ns`, so a caller that bounds its own work by
+    /// either cannot read past the pin's protection.
     ///
     /// That clamp is also the compaction check of the 2026-09-10 amendment to
     /// ADR-1374 D5, and the only one. `protection_horizon_ns` minus
@@ -575,21 +656,185 @@ impl Cursor {
     /// in this codec can observe a compaction, and a second mechanism for it
     /// would only be a second thing to keep in agreement with this one.
     ///
-    /// `erasure_in_force` is the pending erasure predicate set at redemption,
-    /// each paired with the signal it applies to. A predicate in force that
-    /// the cursor did not pin, whose signal is the cursor's own and whose
-    /// event-time window overlaps the cursor's half-open range, is the second
-    /// failure the amendment names: the page came from a snapshot that no
-    /// longer reproduces, so the cursor is [`CursorError::Expired`]. A
-    /// predicate outside that scope leaves it redeemable (see
-    /// [`Cursor::newer_erasure_intersects`]).
+    /// The erasure and declared-column checks are not here: both compare the
+    /// pin with what the redeeming resolve observed, which does not exist yet.
+    /// They are [`PendingRedemption::confirm`].
+    //
+    // Every parameter is a distinct precondition of a single redemption, and
+    // a caller that omits one has skipped a check. Grouping them into a
+    // struct would let a call site leave a field at its default.
+    #[allow(clippy::too_many_arguments)]
+    pub fn redeem(
+        token: &str,
+        key: &CursorKey,
+        caller_tenant: TenantHash,
+        tool: &str,
+        argument_hash: &[u8; 32],
+        now_ns: i64,
+        protection_horizon_ns: i64,
+    ) -> Result<PendingRedemption, CursorError> {
+        let mut cursor = Self::decode(token, key)?;
+        if cursor.tenant != caller_tenant {
+            return Err(CursorError::Invalid);
+        }
+        if cursor.tool != tool {
+            return Err(CursorError::Invalid);
+        }
+        if !ct_eq(&cursor.argument_hash, argument_hash) {
+            return Err(CursorError::Invalid);
+        }
+        cursor.deadline_ns = effective_deadline_ns(cursor.deadline_ns, protection_horizon_ns);
+        if now_ns >= cursor.deadline_ns {
+            return Err(CursorError::Expired);
+        }
+        Ok(PendingRedemption { cursor })
+    }
+
+    /// Whether an erasure predicate is in force at redemption that this
+    /// cursor did not pin and that reaches into what its page read.
     ///
-    /// That erasure check is sound only while the maximum cursor lifetime is
+    /// Scope is the cursor's signal and its half-open `[range_start_ns,
+    /// range_end_ns)`, and nothing else. A predicate's matchers are tested
+    /// against a record's labels or attributes, and this codec holds no
+    /// records, so no matcher-level analysis is possible here: two predicates
+    /// that name different services are both treated as reaching the cursor's
+    /// rows. Overrefusing that way costs a re-run of the query, where missing
+    /// a predicate would page against a snapshot ADR-0064 requires the erasure
+    /// to have already left.
+    ///
+    /// A predicate for another signal, or one whose window lies entirely
+    /// outside the cursor's range, cannot touch a row this page returned, so
+    /// it leaves the cursor redeemable. A windowless predicate (both bounds
+    /// unset, `ravel_query::erasure`'s zero-as-unset convention) erases
+    /// regardless of event time and so intersects every range.
+    ///
+    /// Predicates that were in force at mint and are not in force now are not
+    /// a mismatch either: an erasure that completed took its rows out of the
+    /// pinned snapshot before the page was built, and the pin already names it.
+    ///
+    /// An erasure that both arrived and completed between mint and redemption
+    /// is in neither set and is invisible here. What keeps that case empty is
+    /// a timing relationship this method cannot check;
+    /// [`PendingRedemption::confirm`] states it and names both quantities.
+    fn newer_erasure_intersects(&self, in_force: &[(Signal, ErasurePredicate)]) -> bool {
+        in_force.iter().any(|(signal, predicate)| {
+            *signal == self.signal
+                && !self.pending_erasure.contains(predicate)
+                && window_intersects(predicate, self.range_start_ns, self.range_end_ns)
+        })
+    }
+}
+
+/// A cursor that passed stage one of a redemption ([`Cursor::redeem`]) and
+/// waits for the caller's resolve.
+///
+/// It exposes the pinned resolve inputs and the resolve instant, and nothing
+/// a page can be served from: the position comes back only from
+/// [`PendingRedemption::confirm`], once the resolve's observations have been
+/// checked against the pin.
+///
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// use ravel_mcp::cursor::{Cursor, CursorError, CursorKey};
+/// use ravel_types::TenantHash;
+///
+/// fn page_two(token: &str, key: &CursorKey) -> Result<(), CursorError> {
+///     // Dropping the pending redemption skips stage two.
+///     Cursor::redeem(token, key, TenantHash([0; 16]), "ravel_search_logs", &[0; 32], 0, 0)?;
+///     Ok(())
+/// }
+/// # fn main() {}
+/// ```
+///
+/// The same call compiles once the pending redemption is confirmed, so the
+/// refusal above is the `#[must_use]` on this type and nothing else:
+///
+/// ```
+/// #![deny(unused_must_use)]
+/// use ravel_mcp::cursor::{Cursor, CursorError, CursorKey};
+/// use ravel_types::TenantHash;
+///
+/// fn page_two(token: &str, key: &CursorKey) -> Result<(), CursorError> {
+///     let pending =
+///         Cursor::redeem(token, key, TenantHash([0; 16]), "ravel_search_logs", &[0; 32], 0, 0)?;
+///     pending.confirm(&[], &[])?;
+///     Ok(())
+/// }
+/// # fn main() {}
+/// ```
+#[derive(Debug)]
+#[must_use = "a pending redemption has not checked erasure or declared columns; resolve, then confirm"]
+pub struct PendingRedemption {
+    cursor: Cursor,
+}
+
+impl PendingRedemption {
+    /// The pinned signal to resolve over.
+    pub fn signal(&self) -> Signal {
+        self.cursor.signal
+    }
+
+    /// Start of the pinned half-open time range, inclusive.
+    pub fn range_start_ns(&self) -> i64 {
+        self.cursor.range_start_ns
+    }
+
+    /// End of the pinned half-open time range, exclusive.
+    pub fn range_end_ns(&self) -> i64 {
+        self.cursor.range_end_ns
+    }
+
+    /// The pinned minimum commit-token watermark to resolve against.
+    pub fn min_commit_watermark(&self) -> &[CommitToken] {
+        &self.cursor.min_commit_watermark
+    }
+
+    /// The instant the redeeming resolve runs at: the cursor's own `mint_ns`,
+    /// never the redeeming call's clock (the 2026-09-12 amendment, item 4, and
+    /// the 2026-09-13 one, item 5). Resolving at a later instant would list
+    /// buckets page one never saw, so the sequence would walk a moving
+    /// snapshot under a pinned watermark.
+    pub fn resolve_at_ns(&self) -> i64 {
+        self.cursor.mint_ns
+    }
+
+    /// The deadline stage one checked, already clamped to the protection
+    /// horizon less [`GRACE_NS`].
+    pub fn deadline_ns(&self) -> i64 {
+        self.cursor.deadline_ns
+    }
+
+    /// Stage two of a redemption: compare what the redeeming resolve observed
+    /// with the pin, and hand back the cursor and its position only when
+    /// nothing moved.
+    ///
+    /// `observed_erasure` is the pending erasure predicate set that resolve
+    /// reported, each paired with the signal it applies to. A predicate that
+    /// the cursor did not pin, whose signal is the cursor's own and whose
+    /// event-time window overlaps the cursor's half-open range, means the page
+    /// came from a snapshot that no longer reproduces, so the cursor is
+    /// [`CursorError::Expired`]. A predicate outside that scope leaves it
+    /// redeemable (see `Cursor::newer_erasure_intersects`).
+    ///
+    /// `observed_declared_columns` is the declared column set that resolve
+    /// reported. Compared with the pinned set as a set of (key, type) pairs:
+    /// an added column, a removed one, or one whose type changed is
+    /// [`CursorError::Expired`] (the 2026-09-12 amendment, item 3), and the
+    /// order the two lists name their columns in does not matter.
+    ///
+    /// The set passed must be the one the redeeming resolve listed. That
+    /// resolve runs at [`resolve_at_ns`](Self::resolve_at_ns), but the
+    /// catalog lists pending erasure requests with no filter on the resolve
+    /// instant (see this module's "Redemption is two stages around the
+    /// caller's resolve" docs), so the set holds every request pending at the
+    /// redemption.
+    ///
+    /// The erasure check is sound only while the maximum cursor lifetime is
     /// shorter than the minimum time an erasure takes to complete.
-    /// `erasure_in_force` carries the predicates still pending at redemption.
+    /// `observed_erasure` carries the predicates still pending at redemption.
     /// An erasure that arrived after the cursor was minted and whose rewrite
     /// completed before it was redeemed is in neither set: the cursor did not
-    /// pin it and it is no longer in force, so nothing here can observe it,
+    /// pin it and it is no longer pending, so nothing here can observe it,
     /// and page two is served from a snapshot it changed. The two quantities
     /// are configured in different crates and nothing asserts the
     /// relationship between them:
@@ -625,74 +870,131 @@ impl Cursor {
     /// arrives per call as an absolute instant, the crate has no startup step
     /// of its own, and it holds no ravel-catalog or ravel-maintain dependency
     /// to read either configured value from.
-    ///
-    // Every parameter is a distinct precondition of a single redemption, and
-    // a caller that omits one has skipped a check. Grouping them into a
-    // struct would let a call site leave a field at its default.
-    #[allow(clippy::too_many_arguments)]
-    pub fn redeem(
-        token: &str,
-        key: &CursorKey,
-        caller_tenant: TenantHash,
-        tool: &str,
-        argument_hash: &[u8; 32],
-        erasure_in_force: &[(Signal, ErasurePredicate)],
-        now_ns: i64,
-        protection_horizon_ns: i64,
+    pub fn confirm(
+        self,
+        observed_erasure: &[(Signal, ErasurePredicate)],
+        observed_declared_columns: &[DeclaredColumn],
     ) -> Result<Cursor, CursorError> {
-        let mut cursor = Self::decode(token, key)?;
-        if cursor.tenant != caller_tenant {
-            return Err(CursorError::Invalid);
-        }
-        if cursor.tool != tool {
-            return Err(CursorError::Invalid);
-        }
-        if !ct_eq(&cursor.argument_hash, argument_hash) {
-            return Err(CursorError::Invalid);
-        }
-        cursor.deadline_ns = effective_deadline_ns(cursor.deadline_ns, protection_horizon_ns);
-        if now_ns >= cursor.deadline_ns {
+        if self.cursor.newer_erasure_intersects(observed_erasure) {
             return Err(CursorError::Expired);
         }
-        if cursor.newer_erasure_intersects(erasure_in_force) {
+        if canonical_set(self.cursor.declared_columns.iter().map(declared_column_bytes))
+            != canonical_set(observed_declared_columns.iter().map(declared_column_bytes))
+        {
             return Err(CursorError::Expired);
         }
-        Ok(cursor)
+        Ok(self.cursor)
     }
+}
 
-    /// Whether an erasure predicate is in force at redemption that this
-    /// cursor did not pin and that reaches into what its page read.
-    ///
-    /// Scope is the cursor's signal and its half-open `[range_start_ns,
-    /// range_end_ns)`, and nothing else. A predicate's matchers are tested
-    /// against a record's labels or attributes, and this codec holds no
-    /// records, so no matcher-level analysis is possible here: two predicates
-    /// that name different services are both treated as reaching the cursor's
-    /// rows. Overrefusing that way costs a re-run of the query, where missing
-    /// a predicate would page against a snapshot ADR-0064 requires the erasure
-    /// to have already left.
-    ///
-    /// A predicate for another signal, or one whose window lies entirely
-    /// outside the cursor's range, cannot touch a row this page returned, so
-    /// it leaves the cursor redeemable. A windowless predicate (both bounds
-    /// unset, `ravel_query::erasure`'s zero-as-unset convention) erases
-    /// regardless of event time and so intersects every range.
-    ///
-    /// Predicates that were in force at mint and are not in force now are not
-    /// a mismatch either: an erasure that completed took its rows out of the
-    /// pinned snapshot before the page was built, and the pin already names it.
-    ///
-    /// An erasure that both arrived and completed between mint and redemption
-    /// is in neither set and is invisible here. What keeps that case empty is
-    /// a timing relationship this method cannot check; [`Cursor::redeem`]
-    /// states it and names both quantities.
-    fn newer_erasure_intersects(&self, in_force: &[(Signal, ErasurePredicate)]) -> bool {
-        in_force.iter().any(|(signal, predicate)| {
-            *signal == self.signal
-                && !self.pending_erasure.contains(predicate)
-                && window_intersects(predicate, self.range_start_ns, self.range_end_ns)
-        })
+/// Domain-separation context for [`snapshot_id`], in BLAKE3's derive-key mode.
+const SNAPSHOT_ID_CONTEXT: &str = "ravel-mcp visibility.snapshot_id v1";
+
+/// `visibility.snapshot_id`: a BLAKE3-256 hash over the seven resolve inputs of
+/// the 2026-09-13 amendment to ADR-1374, item 6 -- the tenant hash, the signal,
+/// the half-open time range, the minimum commit-token watermark, the pending
+/// erasure predicates, the declared column set, and the resolve instant. Two
+/// resolves over the same seven derive the same id; it identifies those
+/// inputs, not the segments they resolved to.
+///
+/// Unkeyed (BLAKE3's derive-key mode under [`SNAPSHOT_ID_CONTEXT`]), so the id
+/// does not depend on the process that derived it. Every variable-length
+/// value is written behind a `u64` little-endian length, and every list
+/// behind its element count, so no two different inputs encode to the same
+/// bytes. The three lists are sets: each element is encoded on its own and
+/// the encodings are sorted and deduplicated, so the order a resolve happened
+/// to list them in does not change the id. A redemption derives its page's id
+/// from the cursor's pinned inputs with `resolve_at_ns` set to the cursor's
+/// `mint_ns`, which is what keeps one id across a page sequence.
+// The seven inputs are the amendment's own list, the time range taken as its
+// two bounds; a struct would let a call site leave one at its default.
+#[allow(clippy::too_many_arguments)]
+pub fn snapshot_id(
+    tenant: TenantHash,
+    signal: Signal,
+    range_start_ns: i64,
+    range_end_ns: i64,
+    min_commit_watermark: &[CommitToken],
+    pending_erasure: &[ErasurePredicate],
+    declared_columns: &[DeclaredColumn],
+    resolve_at_ns: i64,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(SNAPSHOT_ID_CONTEXT);
+    hasher.update(&tenant.0);
+    hasher.update(&[signal_tag(signal)]);
+    hasher.update(&range_start_ns.to_le_bytes());
+    hasher.update(&range_end_ns.to_le_bytes());
+    hash_set(
+        &mut hasher,
+        canonical_set(
+            min_commit_watermark
+                .iter()
+                .map(|token| token.encode().into_bytes()),
+        ),
+    );
+    hash_set(
+        &mut hasher,
+        canonical_set(pending_erasure.iter().map(erasure_predicate_bytes)),
+    );
+    hash_set(
+        &mut hasher,
+        canonical_set(declared_columns.iter().map(declared_column_bytes)),
+    );
+    hasher.update(&resolve_at_ns.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// Sorts and deduplicates per-element encodings, so a list compares and
+/// hashes as the set it names.
+fn canonical_set(items: impl Iterator<Item = Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut items: Vec<Vec<u8>> = items.collect();
+    items.sort();
+    items.dedup();
+    items
+}
+
+/// Feeds a canonical set to `hasher` as its element count followed by each
+/// element behind its own length.
+fn hash_set(hasher: &mut blake3::Hasher, items: Vec<Vec<u8>>) {
+    hash_u64(hasher, items.len());
+    for item in &items {
+        hash_u64(hasher, item.len());
+        hasher.update(item);
     }
+}
+
+fn hash_u64(hasher: &mut blake3::Hasher, len: usize) {
+    hasher.update(&(len as u64).to_le_bytes());
+}
+
+/// One erasure predicate as self-delimiting bytes: its matcher count, each
+/// key and value behind a `u64` length, then both window bounds.
+fn erasure_predicate_bytes(predicate: &ErasurePredicate) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u64(&mut out, predicate.matchers().len());
+    for (k, v) in predicate.matchers() {
+        push_u64(&mut out, k.len());
+        out.extend_from_slice(k.as_bytes());
+        push_u64(&mut out, v.len());
+        out.extend_from_slice(v.as_bytes());
+    }
+    out.extend_from_slice(&predicate.window_start_ns().to_le_bytes());
+    out.extend_from_slice(&predicate.window_end_ns().to_le_bytes());
+    out
+}
+
+/// One declared column as self-delimiting bytes: its key behind a `u64`
+/// length, then its type's wire tag.
+fn declared_column_bytes(column: &DeclaredColumn) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u64(&mut out, column.key.len());
+    out.extend_from_slice(column.key.as_bytes());
+    out.push(declared_type_tag(column.ty));
+    out
+}
+
+fn push_u64(out: &mut Vec<u8>, len: usize) {
+    out.extend_from_slice(&(len as u64).to_le_bytes());
 }
 
 /// Whether an erasure predicate's half-open event-time window overlaps the
@@ -1087,6 +1389,33 @@ mod tests {
         URL_SAFE_NO_PAD.decode(token).expect("decode base64")
     }
 
+    /// Both stages of a redemption, with the resolve between them observing
+    /// `erasure` and exactly the declared column set the cursor pinned, so a
+    /// test of either stage's other checks is not perturbed by this one.
+    #[allow(clippy::too_many_arguments)]
+    fn redeem_both(
+        token: &str,
+        key: &CursorKey,
+        tenant: TenantHash,
+        tool: &str,
+        argument_hash: &[u8; 32],
+        erasure: &[(Signal, ErasurePredicate)],
+        now_ns: i64,
+        protection_horizon_ns: i64,
+    ) -> Result<Cursor, CursorError> {
+        let pending = Cursor::redeem(
+            token,
+            key,
+            tenant,
+            tool,
+            argument_hash,
+            now_ns,
+            protection_horizon_ns,
+        )?;
+        let declared = pending.cursor.declared_columns.clone();
+        pending.confirm(erasure, &declared)
+    }
+
     fn sample_evidence(tenant: TenantHash) -> EvidenceRef {
         EvidenceRef {
             tenant,
@@ -1112,6 +1441,7 @@ mod tests {
                 "us-east".to_owned(),
             )])],
             declared_columns: vec![DeclaredColumn::new("http.status_code", DeclaredType::I64)],
+            ingest_watermark_hour: Some(472_222),
             position: CursorPosition::Keyset {
                 tuple: vec![1, 2, 3],
                 order_by: vec!["timestamp desc".to_owned()],
@@ -1144,7 +1474,7 @@ mod tests {
         let key = test_key();
         let token = sample_cursor(tenant_a).encode(&key).expect("encodes");
 
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &token,
             &key,
             tenant_b,
@@ -1171,7 +1501,7 @@ mod tests {
         bytes[last] ^= 0xFF;
         let tampered = URL_SAFE_NO_PAD.encode(bytes);
 
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &tampered,
             &key,
             tenant,
@@ -1213,7 +1543,7 @@ mod tests {
         bytes[at] ^= 0x20;
         let tampered = URL_SAFE_NO_PAD.encode(bytes);
 
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &tampered,
             &key,
             tenant,
@@ -1237,7 +1567,7 @@ mod tests {
         let deadline = cursor.deadline_ns;
         let token = cursor.encode(&key).expect("encodes");
 
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &token,
             &key,
             tenant,
@@ -1310,7 +1640,7 @@ mod tests {
             in_force.push((cursor.signal, predicate.clone()));
             assert_eq!(in_force.len(), 2);
 
-            let err = Cursor::redeem(
+            let err = redeem_both(
                 &token,
                 &key,
                 tenant,
@@ -1325,7 +1655,7 @@ mod tests {
         }
 
         let only_new = [(cursor.signal, newer[0].clone())];
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &token,
             &key,
             tenant,
@@ -1341,7 +1671,7 @@ mod tests {
         // The bindings still answer first: a newer erasure does not turn a
         // wrong-tenant token into `Expired`, which would tell its holder the
         // token itself was well-formed.
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &token,
             &key,
             TenantHash([0x9Cu8; 16]),
@@ -1397,7 +1727,7 @@ mod tests {
         for entry in &outside {
             let mut in_force = pinned_erasure(&cursor);
             in_force.push(entry.clone());
-            let redeemed = Cursor::redeem(
+            let redeemed = redeem_both(
                 &token,
                 &key,
                 tenant,
@@ -1427,7 +1757,7 @@ mod tests {
 
         for predicate in &just_inside {
             let in_force = [(cursor.signal, predicate.clone())];
-            let err = Cursor::redeem(
+            let err = redeem_both(
                 &token,
                 &key,
                 tenant,
@@ -1462,7 +1792,7 @@ mod tests {
         assert_eq!(in_force_sets.len(), 3);
 
         for in_force in &in_force_sets {
-            let redeemed = Cursor::redeem(
+            let redeemed = redeem_both(
                 &token,
                 &key,
                 tenant,
@@ -1499,7 +1829,7 @@ mod tests {
 
         let horizon = NOW_NS + GRACE_NS;
         assert_eq!(effective_deadline_ns(cursor.deadline_ns, horizon), NOW_NS);
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &token,
             &key,
             tenant,
@@ -1512,7 +1842,7 @@ mod tests {
         .expect_err("a pin no longer inside the protection horizon must be refused");
         assert_eq!(err, CursorError::Expired);
 
-        let redeemed = Cursor::redeem(
+        let redeemed = redeem_both(
             &token,
             &key,
             tenant,
@@ -1575,6 +1905,7 @@ mod tests {
                 DeclaredColumn::new("error", DeclaredType::Bool),
                 DeclaredColumn::new("trace_id", DeclaredType::Bytes),
             ],
+            ingest_watermark_hour: Some(472_223),
             position: CursorPosition::Keyset {
                 tuple: vec![7, 8, 9, 10],
                 order_by: vec!["timestamp desc".to_owned(), "trace_id asc".to_owned()],
@@ -1584,7 +1915,7 @@ mod tests {
         };
 
         let token = cursor.encode(&key).expect("encodes");
-        let decoded = Cursor::redeem(
+        let decoded = redeem_both(
             &token,
             &key,
             tenant,
@@ -1604,7 +1935,7 @@ mod tests {
             end: 4_500,
         };
         let token = ranged.encode(&key).expect("encodes");
-        let decoded = Cursor::redeem(
+        let decoded = redeem_both(
             &token,
             &key,
             tenant,
@@ -1638,6 +1969,46 @@ mod tests {
         assert_eq!(err, CursorError::Invalid);
     }
 
+    /// Version 5 added the pinned ingest watermark hour, so a version 4 token
+    /// lacks a field this layout reads: it is refused at the header, as
+    /// [`a_version_3_token_is_invalid`] refuses the layout before it. Reminted
+    /// under this process's key, so the refusal is the version byte's and not
+    /// the MAC's, and checked through both stages' entry point as well as
+    /// `decode`.
+    ///
+    /// FLIP: with `CURSOR_VERSION` left at 4 (the pre-change code) the token
+    /// decodes. FLIP: a version check that accepts any version up to its own
+    /// (`> version` in `open_token`) decodes it too.
+    #[test]
+    fn a_version_4_token_is_invalid() {
+        let tenant = TenantHash([0x60u8; 16]);
+        let key = test_key();
+        let token = sample_cursor(tenant).encode(&key).expect("encodes");
+        assert!(
+            Cursor::decode(&token, &key).is_ok(),
+            "the unedited token decodes, so the edit below is what refuses it"
+        );
+
+        let mut bytes = token_bytes(&token);
+        assert_eq!(bytes[CURSOR_MAGIC.len()], CURSOR_VERSION);
+        bytes[CURSOR_MAGIC.len()] = 4;
+        let stale = remint(bytes, &key);
+
+        let err = Cursor::decode(&stale, &key).expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+        let err = Cursor::redeem(
+            &stale,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+    }
+
     /// A cursor is bound to the tool that minted it: handing a
     /// `ravel_search_logs` cursor to `ravel_query_promql` is `Invalid`, the
     /// same variant (and therefore the same message) a forged token gets.
@@ -1647,7 +2018,7 @@ mod tests {
         let key = test_key();
         let token = sample_cursor(tenant).encode(&key).expect("encodes");
 
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &token,
             &key,
             tenant,
@@ -1673,7 +2044,7 @@ mod tests {
 
         let mut other = SAMPLE_ARGS;
         other[31] ^= 0x01;
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &token,
             &key,
             tenant,
@@ -1703,7 +2074,7 @@ mod tests {
         );
 
         let token = sample_cursor(tenant).encode(&minting_key).expect("encodes");
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &token,
             &redeeming_key,
             tenant,
@@ -1757,7 +2128,7 @@ mod tests {
         let key = test_key();
 
         let over = "A".repeat(MAX_TOKEN_BYTES + 1);
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &over,
             &key,
             tenant,
@@ -1778,7 +2149,7 @@ mod tests {
         assert_eq!(MAX_TOKEN_BYTES, 1024 * 1024);
 
         let at_cap = "A".repeat(MAX_TOKEN_BYTES);
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &at_cap,
             &key,
             tenant,
@@ -1814,7 +2185,7 @@ mod tests {
             let mut truncated = bytes.clone();
             truncated.truncate(cut);
             let token = URL_SAFE_NO_PAD.encode(truncated);
-            let err = Cursor::redeem(
+            let err = redeem_both(
                 &token,
                 &key,
                 tenant,
@@ -1832,7 +2203,7 @@ mod tests {
         let tag_at = extended.len() - MAC_LEN;
         extended.insert(tag_at, 0x00);
         let reminted = remint(extended, &key);
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &reminted,
             &key,
             tenant,
@@ -1850,7 +2221,8 @@ mod tests {
     /// being no newer than it: a token claiming a future layout is `Invalid`
     /// rather than parsed with the fields this build happens to know.
     /// Re-MAC'd, so the failure is the version check and not the MAC.
-    /// [`a_version_3_token_is_invalid`] covers the previous layout.
+    /// [`a_version_4_token_is_invalid`] and [`a_version_3_token_is_invalid`]
+    /// cover the earlier layouts.
     #[test]
     fn wrong_version_token_is_cursor_invalid() {
         let tenant = TenantHash([0x4Du8; 16]);
@@ -1861,7 +2233,7 @@ mod tests {
         bytes[4] = CURSOR_VERSION + 1;
         let reminted = remint(bytes, &key);
 
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &reminted,
             &key,
             tenant,
@@ -1906,7 +2278,7 @@ mod tests {
         bytes[..4].copy_from_slice(&EVIDENCE_MAGIC);
         let reminted = remint(bytes, &key);
 
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &reminted,
             &key,
             tenant,
@@ -1942,7 +2314,7 @@ mod tests {
         bytes[at] = 0xFF;
         let reminted = remint(bytes, &key);
 
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &reminted,
             &key,
             tenant,
@@ -2117,7 +2489,7 @@ mod tests {
         cursor.deadline_ns = embedded;
         let token = cursor.encode(&key).expect("encodes");
 
-        let redeemed = Cursor::redeem(
+        let redeemed = redeem_both(
             &token,
             &key,
             tenant,
@@ -2130,8 +2502,23 @@ mod tests {
         .expect("inside the clamped deadline");
         assert_eq!(redeemed.deadline_ns, clamped);
         assert_ne!(redeemed.deadline_ns, embedded);
+        let pending = Cursor::redeem(
+            &token,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            horizon,
+        )
+        .expect("inside the clamped deadline");
+        assert_eq!(
+            pending.deadline_ns(),
+            clamped,
+            "stage one already reports the clamped deadline"
+        );
 
-        let err = Cursor::redeem(
+        let err = redeem_both(
             &token,
             &key,
             tenant,
@@ -2144,7 +2531,7 @@ mod tests {
         .expect_err("the clamped deadline has passed");
         assert_eq!(err, CursorError::Expired);
 
-        let still_live = Cursor::redeem(
+        let still_live = redeem_both(
             &token,
             &key,
             tenant,
@@ -2204,5 +2591,468 @@ mod tests {
             }),
             "the horizon, not the clock, produced the unpinned outcome above"
         );
+    }
+
+    /// Stage one for a token minted with the sample tool and arguments, at
+    /// `NOW_NS` and far inside the protection horizon.
+    fn pending_for(token: &str, key: &CursorKey, tenant: TenantHash) -> PendingRedemption {
+        Cursor::redeem(
+            token,
+            key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect("stage one passes")
+    }
+
+    /// The pinned ingest watermark hour survives the round trip in all three
+    /// shapes: a real hour, hour 0 (which a zero-as-unset encoding would read
+    /// back as `None`), and `None` (an empty resolve). A byte of the hour
+    /// flipped without re-signing is `Invalid`; re-signed, the same edit
+    /// decodes as the neighbouring hour, so the MAC and nothing in the field's
+    /// own parse is what refused it.
+    ///
+    /// FLIP: an encode that never writes the field (decode always `None`)
+    /// fails the `Some` cases. FLIP: a bare `u32` with zero as unset fails the
+    /// `Some(0)` case. FLIP: skipping the MAC comparison in `open_token`, which
+    /// leaves the field outside the MAC, decodes the tampered token.
+    #[test]
+    fn the_pinned_ingest_watermark_round_trips_and_is_under_the_mac() {
+        let tenant = TenantHash([0x61u8; 16]);
+        let key = test_key();
+        for hour in [Some(472_222u32), Some(0), None] {
+            let mut cursor = sample_cursor(tenant);
+            cursor.ingest_watermark_hour = hour;
+            let token = cursor.encode(&key).expect("encodes");
+            let redeemed = redeem_both(
+                &token,
+                &key,
+                tenant,
+                SAMPLE_TOOL,
+                &SAMPLE_ARGS,
+                NO_ERASURE,
+                NOW_NS,
+                FAR_HORIZON_NS,
+            )
+            .expect("round-trips through its own codec");
+            assert_eq!(redeemed.ingest_watermark_hour, hour);
+            assert_eq!(redeemed, cursor);
+        }
+
+        let cursor = sample_cursor(tenant);
+        assert_eq!(cursor.ingest_watermark_hour, Some(472_222));
+        let token = cursor.encode(&key).expect("encodes");
+        let mut bytes = token_bytes(&token);
+        let mut needle = vec![1u8];
+        needle.extend_from_slice(&472_222u32.to_le_bytes());
+        let at = bytes
+            .windows(needle.len())
+            .position(|window| window == needle.as_slice())
+            .expect("the present tag and the pinned hour are in the payload");
+        assert!(
+            at > HEADER_LEN && at + needle.len() <= bytes.len() - MAC_LEN,
+            "must edit inside the MAC'd payload"
+        );
+        bytes[at + 1] ^= 0x01;
+
+        let tampered = URL_SAFE_NO_PAD.encode(&bytes);
+        let err = Cursor::decode(&tampered, &key).expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+
+        let reminted = remint(bytes, &key);
+        let decoded = Cursor::decode(&reminted, &key).expect("re-signed, the edit parses");
+        assert_eq!(decoded.ingest_watermark_hour, Some(472_223));
+    }
+
+    /// Stage one reads nothing, and the proof is its signature: the coercion
+    /// below names every parameter it takes (the token, the key, the three
+    /// bindings, a clock and a horizon) and fails to compile if a store, a
+    /// catalog or an erasure set is added, and this crate has no object-store
+    /// or catalog dependency to read through. Its result carries the pinned
+    /// resolve inputs, and stage two hands back the whole cursor when the
+    /// resolve observed what was pinned.
+    ///
+    /// FLIP: the pre-change single-stage `redeem`, which takes
+    /// `erasure_in_force` before any resolve, fails the coercion with E0308.
+    /// FLIP: a stage one returning the `Cursor` itself instead of the pending
+    /// wrapper fails it the same way.
+    #[test]
+    fn stage_one_takes_no_store_and_exposes_the_resolve_inputs() {
+        type StageOne = fn(
+            &str,
+            &CursorKey,
+            TenantHash,
+            &str,
+            &[u8; 32],
+            i64,
+            i64,
+        ) -> Result<PendingRedemption, CursorError>;
+        let stage_one: StageOne = Cursor::redeem;
+
+        let tenant = TenantHash([0x62u8; 16]);
+        let key = test_key();
+        let cursor = sample_cursor(tenant);
+        let token = cursor.encode(&key).expect("encodes");
+
+        let pending = stage_one(
+            &token,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect("stage one passes");
+        assert_eq!(pending.signal(), cursor.signal);
+        assert_eq!(pending.range_start_ns(), cursor.range_start_ns);
+        assert_eq!(pending.range_end_ns(), cursor.range_end_ns);
+        assert_eq!(
+            pending.min_commit_watermark(),
+            cursor.min_commit_watermark.as_slice()
+        );
+        assert_eq!(pending.deadline_ns(), cursor.deadline_ns);
+
+        let redeemed = pending
+            .confirm(&pinned_erasure(&cursor), &cursor.declared_columns)
+            .expect("nothing moved");
+        assert_eq!(redeemed, cursor);
+    }
+
+    /// Stage two's erasure check, called directly on a pending redemption:
+    /// a newer windowless predicate paired with the cursor's own signal is
+    /// `Expired`; the same predicate paired with any other signal redeems, and
+    /// so does a newer one on the cursor's signal whose window ends where the
+    /// range starts. The pinned predicate still pending redeems too.
+    ///
+    /// FLIP: a check that ignores the signal (drop `*signal == self.signal`
+    /// in `newer_erasure_intersects`) expires the other-signal entries. FLIP:
+    /// a check that ignores the window (`window_intersects` always true)
+    /// expires the out-of-range one. FLIP: a check that ignores the pin (drop
+    /// the `contains`) expires the pinned one.
+    #[test]
+    fn stage_two_expires_only_a_newer_erasure_over_the_pinned_scope() {
+        let tenant = TenantHash([0x63u8; 16]);
+        let key = test_key();
+        let cursor = sample_cursor(tenant);
+        let token = cursor.encode(&key).expect("encodes");
+        assert_eq!(cursor.signal, Signal::Logs);
+
+        let user = vec![("user.id".to_owned(), "u-42".to_owned())];
+        let newer = ErasurePredicate::windowless(user.clone());
+
+        let err = pending_for(&token, &key, tenant)
+            .confirm(
+                &[(Signal::Logs, newer.clone())],
+                &cursor.declared_columns,
+            )
+            .expect_err("a newer erasure over the pinned signal and range");
+        assert_eq!(err, CursorError::Expired);
+
+        for other in [
+            Signal::Metrics,
+            Signal::Spans,
+            Signal::Profiles,
+            Signal::Alerts,
+            Signal::Audit,
+        ] {
+            assert_ne!(other, cursor.signal);
+            let redeemed = pending_for(&token, &key, tenant)
+                .confirm(&[(other, newer.clone())], &cursor.declared_columns)
+                .expect("an erasure on another signal cannot touch this page");
+            assert_eq!(redeemed, cursor);
+        }
+
+        let before = ErasurePredicate::new(
+            user.clone(),
+            cursor.range_start_ns - 3_600_000_000_000,
+            cursor.range_start_ns,
+        );
+        let redeemed = pending_for(&token, &key, tenant)
+            .confirm(&[(cursor.signal, before)], &cursor.declared_columns)
+            .expect("an erasure wholly before the range cannot touch this page");
+        assert_eq!(redeemed, cursor);
+
+        let redeemed = pending_for(&token, &key, tenant)
+            .confirm(&pinned_erasure(&cursor), &cursor.declared_columns)
+            .expect("the pinned predicate still pending is not newer");
+        assert_eq!(redeemed, cursor);
+    }
+
+    /// A declared column set observed at redemption that differs from the
+    /// pinned one is `Expired` (the 2026-09-12 amendment, item 3): one column
+    /// added, one removed, one retyped, one renamed. The same set in another
+    /// order, and the pinned set itself, redeem.
+    ///
+    /// FLIP: comparing by count passes the retyped and renamed sets. FLIP:
+    /// comparing keys only passes the retyped set. FLIP: comparing the lists
+    /// in order (plain `Vec` equality) refuses the reordered set.
+    #[test]
+    fn a_changed_declared_column_set_is_expired() {
+        let tenant = TenantHash([0x64u8; 16]);
+        let key = test_key();
+        let status = DeclaredColumn::new("http.status_code", DeclaredType::I64);
+        let route = DeclaredColumn::new("http.route", DeclaredType::Str);
+        let mut cursor = sample_cursor(tenant);
+        cursor.declared_columns = vec![status.clone(), route.clone()];
+        let token = cursor.encode(&key).expect("encodes");
+
+        let changed = [
+            (
+                "added",
+                vec![
+                    status.clone(),
+                    route.clone(),
+                    DeclaredColumn::new("error", DeclaredType::Bool),
+                ],
+            ),
+            ("removed", vec![status.clone()]),
+            (
+                "retyped",
+                vec![
+                    DeclaredColumn::new("http.status_code", DeclaredType::Str),
+                    route.clone(),
+                ],
+            ),
+            (
+                "renamed",
+                vec![
+                    status.clone(),
+                    DeclaredColumn::new("http.method", DeclaredType::Str),
+                ],
+            ),
+        ];
+        for (what, observed) in &changed {
+            let err = pending_for(&token, &key, tenant)
+                .confirm(&pinned_erasure(&cursor), observed)
+                .expect_err(what);
+            assert_eq!(err, CursorError::Expired, "{what}");
+        }
+
+        for observed in [
+            vec![route.clone(), status.clone()],
+            vec![status.clone(), route.clone()],
+        ] {
+            let redeemed = pending_for(&token, &key, tenant)
+                .confirm(&pinned_erasure(&cursor), &observed)
+                .expect("the same set redeems in any order");
+            assert_eq!(redeemed, cursor);
+        }
+    }
+
+    /// The redeeming resolve runs at the cursor's `mint_ns`, whatever the
+    /// redeeming call's clock reads: two redemptions a second apart report
+    /// the same instant. `mint_ns` is moved off every other instant the
+    /// cursor carries (in `sample_cursor` it equals `range_end_ns`), so only
+    /// the mint instant can satisfy the assertion.
+    ///
+    /// FLIP: a `resolve_at_ns` returning stage one's `now_ns` reads `NOW_NS`.
+    /// FLIP: one returning `range_end_ns` or `deadline_ns` reads that instead.
+    #[test]
+    fn the_redeeming_resolve_runs_at_the_mint_instant() {
+        let tenant = TenantHash([0x65u8; 16]);
+        let key = test_key();
+        let mut cursor = sample_cursor(tenant);
+        cursor.mint_ns = 1_700_000_000_250_000_000;
+        let token = cursor.encode(&key).expect("encodes");
+        for other in [
+            cursor.range_start_ns,
+            cursor.range_end_ns,
+            cursor.deadline_ns,
+            NOW_NS,
+        ] {
+            assert_ne!(cursor.mint_ns, other);
+        }
+
+        for now_ns in [NOW_NS, NOW_NS + 1_000_000_000] {
+            let pending = Cursor::redeem(
+                &token,
+                &key,
+                tenant,
+                SAMPLE_TOOL,
+                &SAMPLE_ARGS,
+                now_ns,
+                FAR_HORIZON_NS,
+            )
+            .expect("stage one passes");
+            assert_eq!(pending.resolve_at_ns(), cursor.mint_ns, "now {now_ns}");
+        }
+    }
+
+    /// The seven inputs of [`snapshot_id`], held together so a test can vary
+    /// exactly one.
+    #[derive(Clone)]
+    struct SnapshotInputs {
+        tenant: TenantHash,
+        signal: Signal,
+        range_start_ns: i64,
+        range_end_ns: i64,
+        watermark: Vec<CommitToken>,
+        erasure: Vec<ErasurePredicate>,
+        declared: Vec<DeclaredColumn>,
+        resolve_at_ns: i64,
+    }
+
+    impl SnapshotInputs {
+        fn id(&self) -> [u8; 32] {
+            snapshot_id(
+                self.tenant,
+                self.signal,
+                self.range_start_ns,
+                self.range_end_ns,
+                &self.watermark,
+                &self.erasure,
+                &self.declared,
+                self.resolve_at_ns,
+            )
+        }
+    }
+
+    fn sample_snapshot_inputs() -> SnapshotInputs {
+        let cursor = sample_cursor(TenantHash([0x70u8; 16]));
+        SnapshotInputs {
+            tenant: cursor.tenant,
+            signal: cursor.signal,
+            range_start_ns: cursor.range_start_ns,
+            range_end_ns: cursor.range_end_ns,
+            watermark: cursor.min_commit_watermark,
+            erasure: cursor.pending_erasure,
+            declared: cursor.declared_columns,
+            resolve_at_ns: cursor.mint_ns,
+        }
+    }
+
+    /// Equal inputs derive equal ids, and changing any one of the seven
+    /// inputs changes the id (the time range checked at each bound).
+    ///
+    /// FLIP: a derivation that omits the tenant fails the tenant assertion,
+    /// which is two tenants sharing an id over disjoint data. FLIP: one that
+    /// omits the resolve instant fails that assertion, which is two calls a
+    /// day apart sharing an id.
+    #[test]
+    fn snapshot_id_is_deterministic_and_separates_each_input() {
+        let base = sample_snapshot_inputs();
+        assert_eq!(base.id(), base.clone().id());
+        assert_eq!(base.id(), sample_snapshot_inputs().id());
+
+        let mut tenant = base.clone();
+        tenant.tenant = TenantHash([0x71u8; 16]);
+        assert_ne!(tenant.id(), base.id(), "tenant");
+
+        let mut signal = base.clone();
+        signal.signal = Signal::Metrics;
+        assert_ne!(signal.id(), base.id(), "signal");
+
+        let mut start = base.clone();
+        start.range_start_ns += 1;
+        assert_ne!(start.id(), base.id(), "range start");
+        let mut end = base.clone();
+        end.range_end_ns += 1;
+        assert_ne!(end.id(), base.id(), "range end");
+
+        let mut watermark = base.clone();
+        watermark.watermark[0].seq += 1;
+        assert_ne!(watermark.id(), base.id(), "commit-token watermark");
+
+        let mut erasure = base.clone();
+        erasure.erasure.push(ErasurePredicate::windowless(vec![(
+            "user.id".to_owned(),
+            "u-42".to_owned(),
+        )]));
+        assert_ne!(erasure.id(), base.id(), "pending erasure");
+
+        let mut declared = base.clone();
+        declared.declared[0].ty = DeclaredType::Str;
+        assert_ne!(declared.id(), base.id(), "declared columns");
+
+        let mut resolve_at = base.clone();
+        resolve_at.resolve_at_ns += 24 * 3_600 * 1_000_000_000;
+        assert_ne!(resolve_at.id(), base.id(), "resolve instant");
+    }
+
+    /// Every variable-length value is length-prefixed: two inputs whose
+    /// values concatenate to the same bytes derive different ids. Each pair
+    /// is asserted to collide under the naive encoding first, so the pair is
+    /// a real collision and not one the length prefix is never needed for.
+    ///
+    /// FLIP: plain concatenation (drop the length writes in
+    /// `erasure_predicate_bytes` and `declared_column_bytes`) collides every
+    /// pair. FLIP: joining the matcher key and value with a NUL byte instead
+    /// of prefixing them collides the second pair.
+    #[test]
+    fn snapshot_id_length_prefixes_every_variable_length_value() {
+        let base = sample_snapshot_inputs();
+        let matcher = |k: &str, v: &str| ErasurePredicate::windowless(vec![(k.into(), v.into())]);
+
+        assert_eq!(["a\0b", "\0", "c"].concat(), ["a", "\0", "b\0c"].concat());
+        for (left, right) in [(("ab", "c"), ("a", "bc")), (("a\0b", "c"), ("a", "b\0c"))] {
+            assert_eq!(
+                [left.0, left.1].concat(),
+                [right.0, right.1].concat(),
+                "plain concatenation collides"
+            );
+            let mut a = base.clone();
+            a.erasure = vec![matcher(left.0, left.1)];
+            let mut b = base.clone();
+            b.erasure = vec![matcher(right.0, right.1)];
+            assert_ne!(a.id(), b.id(), "{left:?} against {right:?}");
+        }
+
+        let two = vec![
+            DeclaredColumn::new("a", DeclaredType::Str),
+            DeclaredColumn::new("b", DeclaredType::I64),
+        ];
+        let one = vec![DeclaredColumn::new("a\u{1}b", DeclaredType::I64)];
+        let naive = |columns: &[DeclaredColumn]| -> Vec<u8> {
+            columns
+                .iter()
+                .flat_map(|c| {
+                    let mut out = c.key.as_bytes().to_vec();
+                    out.push(declared_type_tag(c.ty));
+                    out
+                })
+                .collect()
+        };
+        assert_eq!(naive(&two), naive(&one), "plain concatenation collides");
+        let mut a = base.clone();
+        a.declared = two;
+        let mut b = base.clone();
+        b.declared = one;
+        assert_ne!(a.id(), b.id());
+    }
+
+    /// The three lists are sets: reordering one, or naming an element twice,
+    /// does not change the id, so two resolves that list the same inputs in
+    /// different orders report one snapshot.
+    ///
+    /// FLIP: hashing each list in the order given fails the reordered cases.
+    /// FLIP: sorting without deduplicating fails the duplicated one.
+    #[test]
+    fn snapshot_id_reads_each_list_as_a_set() {
+        let mut base = sample_snapshot_inputs();
+        base.watermark = vec![sample_token(0), sample_token(1)];
+        base.erasure.push(ErasurePredicate::new(
+            vec![("user.id".to_owned(), "u-42".to_owned())],
+            1,
+            2,
+        ));
+        base.declared
+            .push(DeclaredColumn::new("http.route", DeclaredType::Str));
+
+        let mut reordered = base.clone();
+        reordered.watermark.reverse();
+        reordered.erasure.reverse();
+        reordered.declared.reverse();
+        assert_ne!(reordered.watermark, base.watermark);
+        assert_ne!(reordered.erasure, base.erasure);
+        assert_ne!(reordered.declared, base.declared);
+        assert_eq!(reordered.id(), base.id());
+
+        let mut duplicated = base.clone();
+        duplicated.declared.push(base.declared[0].clone());
+        assert_eq!(duplicated.id(), base.id());
     }
 }
