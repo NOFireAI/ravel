@@ -10,7 +10,7 @@
 //! the footer and trailer. Identical input yields byte-identical output.
 
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ravel_types::logstream::{AttrValue, LogStreamId, canonical_attr_bytes};
 
@@ -18,7 +18,7 @@ use ravel_types::logstream::{AttrValue, LogStreamId, canonical_attr_bytes};
 use crate::block::PageEncodeJob;
 use crate::block::{
     BlockEncoder, BlockStrDict, BlockStrValues, BlockWriteOut, ColumnPlan, ColumnarBlockInput,
-    PageChoice, PageEncodeExecutor,
+    FastMap, FastSet, PageChoice, PageEncodeExecutor,
 };
 use crate::bloom::BloomBuilder;
 use crate::columnar_batch::ColumnarLogBatch;
@@ -661,7 +661,7 @@ impl RlogWriter {
         }
         let dynamic_columns_used = columns.len() as u32;
         let dynamic_columns_overflowed = distinct_total.saturating_sub(columns.len()) as u32;
-        let ty_of_column: HashMap<u32, FieldType> =
+        let ty_of_column: FastMap<u32, FieldType> =
             columns.iter().map(|(_, ty, id)| (*id, *ty)).collect();
 
         // Attribute names carrying at least one NumStat-eligible column
@@ -811,11 +811,11 @@ impl RlogWriter {
         let block_spans = chunk_blocks(&rows, &self.cfg);
 
         // Per-column present/blocks accounting for FIELD_DIR.
-        let mut col_present: HashMap<u32, u64> = HashMap::new();
-        let mut col_blocks: HashMap<u32, u32> = HashMap::new();
+        let mut col_present: FastMap<u32, u64> = FastMap::default();
+        let mut col_blocks: FastMap<u32, u32> = FastMap::default();
         // Per-stream block range.
-        let mut first_blk: HashMap<u32, u32> = HashMap::new();
-        let mut last_blk: HashMap<u32, u32> = HashMap::new();
+        let mut first_blk: FastMap<u32, u32> = FastMap::default();
+        let mut last_blk: FastMap<u32, u32> = FastMap::default();
 
         let mut blocks = BlocksBuilder::new(layout);
         let mut bloom_entries: Vec<Vec<u8>> = Vec::new();
@@ -1345,9 +1345,9 @@ impl RlogWriter {
         }
         let dynamic_columns_used = columns.len() as u32;
         let dynamic_columns_overflowed = distinct_total.saturating_sub(columns.len()) as u32;
-        let ty_of_column: HashMap<u32, FieldType> =
+        let ty_of_column: FastMap<u32, FieldType> =
             columns.iter().map(|(_, ty, id)| (*id, *ty)).collect();
-        let plan_of_cid: HashMap<u32, usize> = columns
+        let plan_of_cid: FastMap<u32, usize> = columns
             .iter()
             .enumerate()
             .map(|(i, (_, _, cid))| (*cid, i))
@@ -1667,10 +1667,10 @@ impl RlogWriter {
 
         // Per-column present/blocks accounting for FIELD_DIR, per-stream block
         // range, and the streamed section buffers.
-        let mut col_present: HashMap<u32, u64> = HashMap::new();
-        let mut col_blocks: HashMap<u32, u32> = HashMap::new();
-        let mut first_blk: HashMap<u32, u32> = HashMap::new();
-        let mut last_blk: HashMap<u32, u32> = HashMap::new();
+        let mut col_present: FastMap<u32, u64> = FastMap::default();
+        let mut col_blocks: FastMap<u32, u32> = FastMap::default();
+        let mut first_blk: FastMap<u32, u32> = FastMap::default();
+        let mut last_blk: FastMap<u32, u32> = FastMap::default();
         let mut blocks = BlocksBuilder::new(layout);
         let mut bloom_entries: Vec<Vec<u8>> = Vec::new();
         #[cfg(feature = "stage-timing")]
@@ -1790,7 +1790,7 @@ impl RlogWriter {
                     ty: ty_of_column[cid],
                 })
                 .collect();
-            let plan_pos: HashMap<u32, usize> = plans
+            let plan_pos: FastMap<u32, usize> = plans
                 .iter()
                 .enumerate()
                 .map(|(i, p)| (p.column_id, i))
@@ -1967,7 +1967,7 @@ impl RlogWriter {
                 {
                     continue;
                 }
-                let mut seen: HashSet<u32> = HashSet::new();
+                let mut seen: FastSet<u32> = FastSet::default();
                 for &g in block_rows {
                     if let Some(gid) = col_dict_ids[plan_idx][g]
                         && seen.insert(gid)
@@ -4372,6 +4372,7 @@ mod tests {
     use crate::reader::{RlogReader, read_section};
     use crate::record::{Predicate, stream_attrs_bytes};
     use ravel_types::logstream::{AttrValue, log_stream_id};
+    use std::collections::HashSet;
 
     /// The slot-to-column stride must admit exactly the type bytes the
     /// decoder admits: a variant added to `FieldType` without widening the

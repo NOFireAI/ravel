@@ -81,6 +81,9 @@ hyper = "1.11"
 hyper-util = { version = "0.1.20", default-features = false }
 http-body-util = { version = "0.1.4", default-features = false }
 futures = "0.3"
+# Hasher for in-memory maps keyed by values Ravel assigns (#3590). Pinned at
+# the version Cargo.lock already resolved through hashbrown.
+foldhash = "0.2"
 async-trait = "0.1"
 # HTTP client. Used by services/ravel-server (alert/webhook sinks) and, for the
 # OIDC JWKS fetch, by ravel-query (ADR-0042 decision 6). Pinned once here so the

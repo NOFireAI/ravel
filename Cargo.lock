@@ -4915,6 +4915,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "criterion",
+ "foldhash 0.2.0",
  "memchr",
  "proptest",
  "prost",
