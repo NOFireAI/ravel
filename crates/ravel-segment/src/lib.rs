@@ -40,14 +40,17 @@ pub use reader::{
 };
 /// RSEG v5 catalog (docs/segment-format.md): `decode_catalog_v5` is the
 /// whole-catalog decode over the whole object (folding to the run-major
-/// `decode_catalog_v4` grammar below the sparse threshold). The rest is the
-/// point-lookup sparse probe: parse SERIES_IDX, locate a crc-verified
+/// `decode_catalog_v4` grammar below the sparse threshold).
+/// `decode_catalog_v5_chunked` decodes the chunked catalog from its four
+/// fetched catalog sections, and `decode_catalog_v5_chunked_matching` does the
+/// same for only the series holding every given `(name, value)` pair. The
+/// rest is the point-lookup sparse probe: parse SERIES_IDX, locate a crc-verified
 /// SERIES_IDS window, then a crc-verified meta chunk, then decode that
 /// series' runs.
 pub use sparse::{
     ChunkLocation, IdWindow, SparseIdIndex, decode_catalog_v5, decode_catalog_v5_chunked,
-    decode_chunk_runs, find_index_in_window, parse_series_idx, verify_and_decompress_chunk_frame,
-    verify_id_window,
+    decode_catalog_v5_chunked_matching, decode_chunk_runs, find_index_in_window, parse_series_idx,
+    verify_and_decompress_chunk_frame, verify_id_window,
 };
 pub use writer::{
     CompactionMetaV4, HistogramSample, IngestBounds, RunInputV4, RunInputV7, RunValuePageV4,
