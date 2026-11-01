@@ -27,7 +27,11 @@ pub fn read_uvarint(bytes: &[u8], pos: &mut usize) -> Result<u64, SegmentError> 
     let mut result: u64 = 0;
     let mut shift: u32 = 0;
     for i in 0..MAX_VARINT_BYTES {
-        let byte = *bytes.get(*pos).ok_or(SegmentError::Truncated)?;
+        // let-else rather than `ok_or`: an eager `SegmentError` argument is
+        // built and dropped on every byte of this hot loop.
+        let Some(&byte) = bytes.get(*pos) else {
+            return Err(SegmentError::Truncated);
+        };
         *pos += 1;
         let low7 = u64::from(byte & 0x7f);
         if i == MAX_VARINT_BYTES - 1 {
@@ -36,7 +40,9 @@ pub fn read_uvarint(bytes: &[u8], pos: &mut usize) -> Result<u64, SegmentError> 
                 return Err(SegmentError::BadVarint);
             }
         }
-        let shifted = low7.checked_shl(shift).ok_or(SegmentError::BadVarint)?;
+        let Some(shifted) = low7.checked_shl(shift) else {
+            return Err(SegmentError::BadVarint);
+        };
         result |= shifted;
         if byte & 0x80 == 0 {
             return Ok(result);
