@@ -2473,12 +2473,12 @@ mod tests {
     /// dealt into two inputs and into three, merged twice each, gives the same
     /// part keys and trace boundaries every time.
     ///
-    /// FLIP: a cut keyed on anything outside the merged stream fails here,
-    /// which rules out charging each input's own rows or blocks (the two and
-    /// three input runs load the bucket differently) and a cut drawn from
-    /// wall-clock time or from a randomly seeded hash map's iteration order
-    /// (repeat runs differ). Before #2985 this held trivially with one part,
-    /// so the part count is asserted to show the cut ran.
+    /// FLIP: before #2985 every run was one part, so the part-count assertion
+    /// fails. Rules out a cut whose threshold or charge draws on a randomly
+    /// seeded hasher, such as a bucket-load map iterated in `RandomState`
+    /// order (repeat runs disagree), and one that reads wall-clock time
+    /// (likewise), as well as a charge taken per input object rather than per
+    /// merged trace (the two- and three-input runs disagree).
     #[tokio::test]
     async fn the_bucket_cut_is_deterministic_across_runs_and_input_layouts() {
         let (_, records) = hot_corpus(&HOT_SIZES, 3);
@@ -2500,10 +2500,10 @@ mod tests {
                 .collect();
             runs.push(shape);
         }
-        assert_eq!(runs[0].len(), 4);
         for run in &runs[1..] {
             assert_eq!(run, &runs[0]);
         }
+        assert_eq!(runs[0].len(), 4);
     }
 
     /// One trace whose charge alone passes the cap does not fail the merge: it
