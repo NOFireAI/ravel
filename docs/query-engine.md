@@ -2313,7 +2313,7 @@ resolve, via `segment_admission::admit`. `resolve_admitted` computes the
 effective configuration once and uses it for both.
 
 The scans then re-check both `max_bytes_scanned` and `max_store_requests`
-incrementally (issue #1409). Each table's provider carries a `ScanBudget`
+incrementally. Each table's provider carries a `ScanBudget`
 (`crates/ravel-sql/src/scan_budget.rs`) built from the effective
 configuration, and every check compares the STATEMENT total, summed over every
 table the statement reads (ADR-2904), so a two-table statement whose tables
@@ -5654,8 +5654,8 @@ the resolved snapshot, every emitted batch grows the query's memory reservation
 so an over-budget scan fails with `ResourcesExhausted` at the tenant's pool
 ceiling, and the request deadline bounds wall time. Both scans also check the
 statement's effective `max_bytes_scanned` and `max_store_requests` after each
-segment fetch, before the next (issue #1409; see "Per-request budgets
-(ADR-1374)" above). Neither scan takes a pushed
+segment fetch, before the next (see "Per-request budgets (ADR-1374)"
+above). Neither scan takes a pushed
 LIMIT: `AlertsScanExec` and `AuditScanExec` implement no `fetch`, so the LIMIT
 stays a limit operator above the scan, which ends a partition only by no longer
 polling it. `SpansScanExec` is the same, and the `spans` provider forwards a
