@@ -685,6 +685,17 @@ with `INVALID_ARGUMENT` at `GetFlightInfo`. ES|QL still reads one of
 the five per query. The request body, auth, window (`start`/`end`), and
 `min_commit_token` handling are otherwise the same for all five tables.
 
+In a query that reads two or more tables, an alias or CTE name may not be a
+table name: `FROM samples AS logs JOIN logs AS l`, `WITH logs AS (...)`
+beside another table, or a subquery aliased `logs` is an HTTP 400 (Flight
+SQL: `INVALID_ARGUMENT`) naming both names, before any catalog listing.
+Rename the alias. Aliasing a table by its own name, `FROM logs AS logs`, is
+allowed. A `LIKE` on `logs.<column>` in such a query behaves as it does in a
+query over `logs` alone, including `ESCAPE` and a non-string typed
+attribute column; a `LIKE` on a column of `logs` aliased under another name (`FROM
+logs AS l` ... `l.body LIKE ...`) uses the built-in operator, which accepts
+only the backslash escape and string operands.
+
 The same endpoint also serves the Parquet tables of the tenant. A query can
 join Parquet tables with each other and with any of the five, over this
 endpoint and Flight SQL. Ravel reads the Parquet manifests first, then one

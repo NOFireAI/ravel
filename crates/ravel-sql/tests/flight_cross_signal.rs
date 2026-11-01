@@ -510,3 +510,42 @@ async fn a_malformed_qualified_flight_token_is_refused_with_the_parse_error() {
         );
     }
 }
+
+/// An alias shadowing a table name in a two-table statement is refused at
+/// `GetFlightInfo` with INVALID_ARGUMENT and the HTTP path's
+/// `ShadowedTableName` text, before any store request (issue #3026).
+///
+/// FLIP: before #3026 the statement minted a ticket, with a `logs.`
+/// qualifier naming the samples relation.
+#[tokio::test]
+async fn an_alias_shadowing_a_table_is_refused_at_get_flight_info_before_any_store_request() {
+    let counting = CountingStore::new(Arc::new(MemoryStore::new()));
+    let (harness, tenant) =
+        harness_over(Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>).await;
+    let sql = "SELECT logs.ts FROM samples AS logs JOIN logs AS l ON l.ts = logs.ts";
+
+    let before = counting.total_ops();
+    let err = harness
+        .get_flight_info("acme", sql)
+        .await
+        .expect_err("samples AS logs beside logs");
+    assert_eq!(err.code(), Code::InvalidArgument, "{err:?}");
+    let expected = SqlError::ShadowedTableName {
+        kind: "relation alias",
+        name: "logs".to_owned(),
+        table: "logs".to_owned(),
+    };
+    assert_eq!(err.message(), expected.client_message());
+    assert_eq!(
+        counting.total_ops(),
+        before,
+        "refused before any store request"
+    );
+    assert_eq!(
+        err.message(),
+        http_error(&harness, &tenant, sql, &[])
+            .await
+            .client_message(),
+        "the HTTP path's text"
+    );
+}

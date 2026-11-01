@@ -254,6 +254,29 @@ pub enum SqlError {
     )]
     TooManyTables { count: usize, max: usize },
 
+    /// A statement that reads two or more tables declares a relation alias, a
+    /// derived-table alias or a CTE name equal to a table its session
+    /// registers, or to a signal table name, under the planner's identifier
+    /// rules (ADR-2904, LIKE-scope amendment, #3026). A qualifier then names a
+    /// relation that is not that table. `FROM logs AS logs` is not refused: it
+    /// still names the logs relation. Refused from the statement text before
+    /// any catalog resolve. `name` is the caller's own text, cut to 64 bytes;
+    /// HTTP 400.
+    #[error(
+        "{kind} {name:?} shadows the table {table}; in a statement that reads more \
+         than one table, an alias or CTE name may not equal a table name: rename it"
+    )]
+    ShadowedTableName {
+        /// What declared the name: `relation alias`, `derived table alias` or
+        /// `CTE name`.
+        kind: &'static str,
+        /// The declared name as written, truncated to 64 bytes on a char
+        /// boundary.
+        name: String,
+        /// The table name it shadows.
+        table: String,
+    },
+
     /// Snapshot resolution failed.
     #[error("snapshot resolution failed: {0}")]
     Catalog(#[from] CatalogError),
@@ -587,7 +610,8 @@ impl SqlError {
             | SqlError::CommitTokenNeedsQualifier { .. }
             | SqlError::CommitTokenQualifierNotRead { .. }
             | SqlError::CommitTokenOnParquetStatement
-            | SqlError::TooManyTables { .. } => ErrorClass::BadRequest,
+            | SqlError::TooManyTables { .. }
+            | SqlError::ShadowedTableName { .. } => ErrorClass::BadRequest,
             // An over-wide window refused before any LIST is a
             // resource-budget rejection, the same class as the segment/sample
             // budgets below: a well-formed request the server declines to
@@ -665,6 +689,9 @@ impl SqlError {
             SqlError::CommitTokenQualifierNotRead { .. } => self.to_string(),
             // Safe to echo: the text carries only the two counts.
             SqlError::TooManyTables { .. } => self.to_string(),
+            // Safe to echo: the caller's own name cut to 64 bytes and a table
+            // name taken from the caller's own statement.
+            SqlError::ShadowedTableName { .. } => self.to_string(),
             // Safe to echo: `WindowTooWide` carries only the estimate and the
             // limit (counts, no object key or tenant identity), and its text
             // tells the caller to narrow the window. Same
@@ -2080,6 +2107,23 @@ mod tests {
         assert_eq!(err.client_message(), err.to_string());
         assert!(err.client_message().contains("at most 16"));
         assert!(err.client_message().contains("names 17"));
+        assert_redacted(&err.client_message());
+    }
+
+    #[test]
+    fn a_shadowed_table_name_is_a_bad_request_naming_both_names() {
+        let err = SqlError::ShadowedTableName {
+            kind: "relation alias",
+            name: "logs".to_owned(),
+            table: "logs".to_owned(),
+        };
+        assert_eq!(err.class(), ErrorClass::BadRequest);
+        assert_eq!(err.client_message(), err.to_string());
+        assert!(
+            err.client_message()
+                .starts_with("relation alias \"logs\" shadows the table logs;"),
+            "{err}"
+        );
         assert_redacted(&err.client_message());
     }
 

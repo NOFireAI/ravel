@@ -4389,6 +4389,29 @@ ORDER BY samples.ts
   keeps the tokens as an untagged list (decision 10): their qualifiers did
   their work in `GetFlightInfo`'s resolve, and `DoGet` resolves nothing.
   `POST /api/v1/esql` takes no `min_commit_token`.
+- **An alias or CTE name may not shadow a table name.** A statement
+  that reads two or more tables, signal or Parquet, is
+  `SqlError::ShadowedTableName` (HTTP 400, Flight `INVALID_ARGUMENT` at
+  `GetFlightInfo`) when it declares a relation alias, derived-table alias or
+  CTE name equal to one of its other tables' names or to any of the five
+  signal table names (`SqlExecutor::statement_tables`, from the statement
+  text, before any catalog or object-store request). The message names the
+  declared name and the table. Names compare as the planner compares them:
+  `AS LOGS` shadows `logs`, `AS "LOGS"` does not. `FROM logs AS logs` is
+  admitted, since its qualifier still names the table it reads, and a
+  one-table statement is not checked.
+- **`LIKE` beside another table (ADR-2904 LIKE-scope amendment).** In a
+  session that registers `logs` beside another table, a case-sensitive
+  `LIKE` runs on the logs evaluator (`like_udf.rs`, `LikeScope::LogsColumnsOnly`)
+  when its operands reference at least one column, every one qualified
+  `logs`, and no outer reference; it then behaves exactly as in a logs-only
+  statement, a custom `ESCAPE` and a non-string typed attribute column
+  included.
+  The shadowing refusal above is what makes the `logs` qualifier name the
+  `logs` table. A scalar subquery operand's own columns are not tested, since
+  its plan is rewritten separately. Any other `LIKE`, such as one on `l.body`
+  under `FROM logs AS l`, is the engine's built-in operator, which refuses
+  an escape other than the backslash and a non-string operand.
 - **Parquet tables beside signal tables (ADR-2904 decision 11).** A statement may name Parquet tables of the caller's tenant
   beside one or more signal tables, over HTTP and Flight SQL. Its Parquet
   tables resolve first, exactly as a Parquet-only statement's do (each

@@ -179,7 +179,8 @@ use crate::statement::{
 };
 use crate::statement_accounting::StatementAccounting;
 use crate::validate::{
-    ValidationError, referenced_base_tables, unreadable_table_reference, validate_query,
+    ValidationError, referenced_base_tables, shadowing_relation_name, unreadable_table_reference,
+    validate_query,
 };
 
 /// Which of the five v1 tables (and thus which `Signal`) a query targets, or
@@ -434,6 +435,32 @@ fn quoted_qualifier(qualifier: &str) -> String {
         end -= 1;
     }
     format!("{}...", &qualifier[..end])
+}
+
+/// Refuse a statement that reads two or more tables and declares a relation
+/// alias, derived-table alias or CTE name equal to a table name (ADR-2904,
+/// LIKE-scope amendment). The reserved names are the statement's other tables
+/// plus all five signal table names: [`referenced_base_tables`] drops a CTE's
+/// name from the tables it reports, so a CTE named `logs` reads as a statement
+/// that does not name `logs` and is only caught by reserving the name itself.
+/// The LIKE rewrite in a multi-table session trusts a `logs` qualifier to name
+/// the logs relation, which this makes true.
+fn refuse_shadowed_table_name(sql: &str, others: &BTreeSet<String>) -> Result<(), SqlError> {
+    let mut reserved = others.clone();
+    reserved.extend(
+        SIGNAL_LANE_ORDER
+            .into_iter()
+            .filter_map(crate::statement::signal_table_name)
+            .map(str::to_owned),
+    );
+    match shadowing_relation_name(sql, &reserved)? {
+        Some(found) => Err(SqlError::ShadowedTableName {
+            kind: found.kind,
+            name: quoted_qualifier(&found.name),
+            table: found.table,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Refuse a statement that names a table function or a URL-shaped table, with
@@ -4724,6 +4751,9 @@ impl SqlExecutor {
                 count: tables.len(),
                 max: MAX_STATEMENT_TABLE_NAMES,
             });
+        }
+        if signals.len() + tables.len() >= 2 {
+            refuse_shadowed_table_name(sql, &tables)?;
         }
         Ok(StatementTables {
             signals,
