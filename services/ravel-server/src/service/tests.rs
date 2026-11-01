@@ -2323,7 +2323,7 @@ mod describe_data {
             .await
             .expect("head watermark")
             .expect("the fold sealed the older hours");
-        assert!(fold_watermark >= NOW_HOUR - 20 && fold_watermark < NOW_HOUR);
+        assert!((NOW_HOUR - 20..NOW_HOUR).contains(&fold_watermark));
 
         let data = h
             .service
