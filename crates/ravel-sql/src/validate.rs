@@ -89,8 +89,9 @@ use crate::complexity_guard;
 use datafusion::sql::parser::{CreateExternalTable, Statement as DFStatement};
 use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectNamePart,
-    ObjectType, Query, SetExpr, Statement, TableFactor, Value as SqlValue, Visit, Visitor,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, LockClause, LockType,
+    ObjectNamePart, ObjectType, OrderBy, Query, Select, SetExpr, Statement, TableFactor,
+    Value as SqlValue, Visit, Visitor,
 };
 use ravel_pqtable::grants::{self, GrantsError};
 use ravel_pqtable::names;
@@ -178,7 +179,8 @@ pub enum ValidationError {
     #[error("SQL parse error: {0}")]
     Parse(String),
 
-    /// The statement parsed but is not a read-only query.
+    /// The statement parsed but is not a read-only query, or a query at any
+    /// level asks for a row lock (`FOR UPDATE`, `FOR SHARE`).
     #[error(
         "{kind} is not permitted on the read-only SQL endpoint; \
          only a single SELECT query is accepted"
@@ -186,7 +188,8 @@ pub enum ValidationError {
     NotReadOnly { kind: &'static str },
 
     /// The query is a `Statement::Query` but contains a write node
-    /// (`WITH ... INSERT`, a `VALUES`-wrapped DML body, and so on).
+    /// (`WITH ... INSERT`, a `VALUES`-wrapped DML body, `SELECT ... INTO`,
+    /// and so on).
     #[error(
         "the query contains a write operation ({kind}); \
          the SQL endpoint is read-only"
@@ -1150,31 +1153,117 @@ fn ansi_statement_kind(statement: &Statement) -> &'static str {
     }
 }
 
-/// Walk the query tree for statement-bearing `SetExpr` nodes. `WITH x AS
-/// (...) INSERT ...` and friends parse as `Statement::Query`, so accepting
-/// every `Statement::Query` unchecked would let DML through the gate.
+/// Walk the query tree for statement-bearing `SetExpr` nodes, lock clauses
+/// and `SELECT INTO`, at every query level (CTE bodies, subqueries, derived
+/// tables and set-operation arms included). `WITH x AS (...) INSERT ...` and
+/// friends parse as `Statement::Query`, so accepting every
+/// `Statement::Query` unchecked would let DML through the gate.
 fn reject_writes_in_query(query: &Query) -> Result<(), ValidationError> {
-    let mut found: Option<&'static str> = None;
+    let mut found: Option<ValidationError> = None;
     let flow = query.visit(&mut WriteFinder { found: &mut found });
     if flow.is_break()
-        && let Some(kind) = found
+        && let Some(error) = found
     {
-        return Err(ValidationError::WriteInQuery { kind });
+        return Err(error);
     }
     Ok(())
 }
 
 struct WriteFinder<'a> {
-    found: &'a mut Option<&'static str>,
+    found: &'a mut Option<ValidationError>,
+}
+
+impl WriteFinder<'_> {
+    fn refuse(&mut self, error: ValidationError) -> ControlFlow<()> {
+        *self.found = Some(error);
+        ControlFlow::Break(())
+    }
 }
 
 impl Visitor for WriteFinder<'_> {
     type Break = ();
 
+    /// Every `Query` field is named so a clause a future sqlparser adds is a
+    /// compile error here rather than a clause the read-only gate never
+    /// decided on. Nested queries in any field are visited on their own.
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
-        if let Some(kind) = write_kind(&query.body) {
-            *self.found = Some(kind);
-            return ControlFlow::Break(());
+        let Query {
+            // CTE bodies are queries and are visited.
+            with: _,
+            body,
+            order_by,
+            // LIMIT / OFFSET / LIMIT BY and FETCH bound a read.
+            limit_clause: _,
+            fetch: _,
+            locks,
+            // FOR XML / FOR JSON (MSSQL), SETTINGS and FORMAT (ClickHouse)
+            // shape output or session knobs for this one query; none writes
+            // or takes a lock.
+            for_clause: _,
+            settings: _,
+            format_clause: _,
+            // Pipe operators transform the rows read; a nested query in one
+            // is visited.
+            pipe_operators: _,
+        } = query;
+        if let Some(kind) = write_kind(body) {
+            return self.refuse(ValidationError::WriteInQuery { kind });
+        }
+        if let Some(OrderBy {
+            // Sort keys and INTERPOLATE (ClickHouse gap filling) only order
+            // or fill the rows read.
+            kind: _,
+            interpolate: _,
+        }) = order_by
+        {}
+        if let Some(LockClause { lock_type, .. }) = locks.first() {
+            let kind = match lock_type {
+                LockType::Update => "FOR UPDATE",
+                LockType::Share => "FOR SHARE",
+            };
+            return self.refuse(ValidationError::NotReadOnly { kind });
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Every `Select` field is named for the same reason as in
+    /// `pre_visit_query`. `INTO` is the one that writes: it creates a table.
+    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
+        let Select {
+            into,
+            // Keyword token, optimizer hints and MySQL modifiers such as
+            // SQL_NO_CACHE carry no semantics a read could turn into a
+            // write.
+            select_token: _,
+            optimizer_hints: _,
+            select_modifiers: _,
+            // Row-shaping clauses of a read.
+            distinct: _,
+            top: _,
+            top_before_distinct: _,
+            projection: _,
+            exclude: _,
+            from: _,
+            lateral_views: _,
+            prewhere: _,
+            selection: _,
+            connect_by: _,
+            group_by: _,
+            cluster_by: _,
+            distribute_by: _,
+            sort_by: _,
+            having: _,
+            named_window: _,
+            qualify: _,
+            window_before_qualify: _,
+            value_table_mode: _,
+            // Syntax order only (`FROM t SELECT ...`).
+            flavor: _,
+        } = select;
+        if into.is_some() {
+            return self.refuse(ValidationError::WriteInQuery {
+                kind: "SELECT INTO",
+            });
         }
         ControlFlow::Continue(())
     }
@@ -1189,8 +1278,7 @@ impl Visitor for WriteFinder<'_> {
         if let TableFactor::Derived { subquery, .. } = factor
             && let Some(kind) = write_kind(&subquery.body)
         {
-            *self.found = Some(kind);
-            return ControlFlow::Break(());
+            return self.refuse(ValidationError::WriteInQuery { kind });
         }
         ControlFlow::Continue(())
     }
@@ -1381,6 +1469,109 @@ mod tests {
     fn plain_select_is_accepted() {
         validate_query("SELECT ts, value FROM samples WHERE ts > 0 ORDER BY ts LIMIT 10")
             .expect("read-only select");
+    }
+
+    /// A lock clause is refused at every query level, in every form sqlparser
+    /// parses (`OF`, `NOWAIT`, `SKIP LOCKED`), as `NotReadOnly` naming the
+    /// lock.
+    ///
+    /// FLIP: checking `locks` on the top-level `Query` only (before the
+    /// visitor runs) accepts the subquery, derived-table, CTE, set-operation
+    /// and scalar-subquery rows; dropping the lock check accepts every row.
+    #[test]
+    fn lock_clauses_are_refused_at_every_query_level() {
+        let update = ValidationError::NotReadOnly { kind: "FOR UPDATE" };
+        let share = ValidationError::NotReadOnly { kind: "FOR SHARE" };
+        for (sql, want) in [
+            ("SELECT * FROM logs FOR UPDATE", &update),
+            ("SELECT * FROM logs FOR SHARE", &share),
+            ("SELECT * FROM logs FOR UPDATE OF logs NOWAIT", &update),
+            ("SELECT * FROM logs FOR SHARE SKIP LOCKED", &share),
+            (
+                "SELECT * FROM logs WHERE ts IN (SELECT ts FROM spans FOR UPDATE)",
+                &update,
+            ),
+            ("SELECT * FROM (SELECT * FROM logs FOR SHARE) t", &share),
+            (
+                "WITH t AS (SELECT * FROM logs FOR UPDATE) SELECT * FROM t",
+                &update,
+            ),
+            (
+                "SELECT ts FROM logs UNION ALL (SELECT ts FROM spans FOR SHARE)",
+                &share,
+            ),
+            (
+                "SELECT (SELECT max(ts) FROM spans FOR UPDATE) FROM logs",
+                &update,
+            ),
+        ] {
+            assert_eq!(&reject(sql), want, "{sql}");
+        }
+    }
+
+    /// The gate reads the parsed tree, not the text: lock and `INTO` words
+    /// inside a string literal or a quoted alias are accepted.
+    ///
+    /// FLIP: refusing when the uppercased text contains `FOR UPDATE`,
+    /// `FOR SHARE` or ` INTO ` refuses every row here.
+    #[test]
+    fn lock_words_in_literals_and_aliases_are_accepted() {
+        for sql in [
+            "SELECT * FROM logs WHERE body = 'FOR UPDATE'",
+            "SELECT 'SELECT * INTO t FROM x FOR SHARE' AS q",
+            "SELECT body AS \"for update\" FROM logs",
+        ] {
+            validate_query(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    }
+
+    /// `SELECT ... INTO` creates a table, so it is a write at any level.
+    ///
+    /// FLIP: dropping the `into` check in `pre_visit_select` accepts every
+    /// row; checking the top-level `Select` only accepts the nested rows.
+    #[test]
+    fn select_into_is_refused_at_every_query_level() {
+        let want = ValidationError::WriteInQuery {
+            kind: "SELECT INTO",
+        };
+        for sql in [
+            "SELECT * INTO copy FROM logs",
+            "SELECT * FROM logs WHERE ts IN (SELECT ts INTO copy FROM spans)",
+            "WITH t AS (SELECT * INTO copy FROM logs) SELECT * FROM t",
+            "SELECT ts FROM logs UNION ALL SELECT ts INTO copy FROM spans",
+        ] {
+            assert_eq!(reject(sql), want, "{sql}");
+        }
+    }
+
+    /// The clauses the read-only gate allows (class closure in
+    /// `WriteFinder::pre_visit_query` and `pre_visit_select`) pass it. Some
+    /// are refused later by DataFusion's planner or the paged surface; this
+    /// pins that the gate itself does not refuse them.
+    ///
+    /// FLIP: refusing any `Query` or `Select` field other than `locks` and
+    /// `into` (for example every non-empty `settings` or `for_clause`)
+    /// refuses its row.
+    #[test]
+    fn read_clauses_pass_the_read_only_gate() {
+        for sql in [
+            "WITH t AS (SELECT ts FROM logs) SELECT ts FROM t",
+            "SELECT ts FROM logs ORDER BY ts DESC LIMIT 10 OFFSET 2",
+            "SELECT ts FROM logs ORDER BY ts FETCH FIRST 5 ROWS ONLY",
+            "SELECT ts FROM logs SETTINGS max_threads = 1",
+            "SELECT ts FROM logs FORMAT JSON",
+            "SELECT ts FROM logs FOR JSON PATH",
+            "SELECT ts FROM logs ORDER BY ts WITH FILL INTERPOLATE (ts AS ts + 1)",
+            "FROM logs |> WHERE ts > 0 |> SELECT ts",
+            "SELECT DISTINCT ts FROM logs WHERE ts > 0 GROUP BY ts HAVING count(*) > 1",
+            "SELECT TOP 5 ts FROM logs",
+            "SELECT * EXCLUDE (body) FROM logs",
+            "SELECT ts FROM logs QUALIFY row_number() OVER (ORDER BY ts) = 1",
+            "SELECT ts FROM logs PREWHERE ts > 0",
+            "FROM logs SELECT ts",
+        ] {
+            validate_query(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
     }
 
     #[test]
