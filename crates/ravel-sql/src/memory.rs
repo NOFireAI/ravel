@@ -3340,10 +3340,18 @@ mod tests {
         // A shrink to zero on a consumer `holds_last_release` selects is held:
         // the charged bytes stay reserved, but the asked gauge still falls.
         res.shrink(100);
-        assert_eq!(pool.held_bytes(), 100, "the charged bytes are held, not released");
+        assert_eq!(
+            pool.held_bytes(),
+            100,
+            "the charged bytes are held, not released"
+        );
         assert_eq!(accounting.snapshot().peak_intermediate_bytes, 100);
         assert_eq!(pool.asked_used.load(Ordering::Acquire), 0);
-        assert_eq!(pool.peak_asked_bytes(), 100, "the high-water mark does not fall");
+        assert_eq!(
+            pool.peak_asked_bytes(),
+            100,
+            "the high-water mark does not fall"
+        );
 
         // A plain consumer's grow charges fresh bytes (the hold belongs to the
         // other consumer) and raises both gauges, but stays under the peak.
