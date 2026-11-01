@@ -5653,7 +5653,7 @@ pub(crate) mod tests {
     /// what `Catalog::load_part_entries` reserves before decoding it. Asserts
     /// it is non-zero and within the decode ceiling, so only a budget can
     /// refuse it.
-    async fn part_declared_len(store: &MemoryStore, key: &str) -> u64 {
+    pub(crate) async fn part_declared_len(store: &MemoryStore, key: &str) -> u64 {
         let part = store
             .get(key, GetRange::Full)
             .await

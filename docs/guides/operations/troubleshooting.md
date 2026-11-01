@@ -1355,7 +1355,9 @@ Coverage is not complete, so a zero reading is not proof of isolation:
 - Every reader of a snapshot part checks its tenant hash: the query path,
   the fold, the key-index rebuild, the scrub's covering-postings load and
   seal-divergence check, `ravel-cli catalog verify` and the coverage check of
-  `ravel-cli load`. The scrub's covering-postings load does not count a
+  `ravel-cli load`. Each checks before it charges the decode to the memory
+  budget, so a budget refusal does not hide a foreign part. The scrub's
+  covering-postings load does not count a
   tenant-hash mismatch on the postings object itself: it logs it at `error`
   and skips the postings check for the tick.
 

@@ -1706,6 +1706,21 @@ tenant's fold tick with `MemoryExhausted` instead of rebuilding from the
 commit layout, and the next tick retries. The key-index rebuild loads parts
 through the same function and is charged the same way.
 
+The snapshot-part readers outside the fold and the query path are charged
+the same way (issue #3548). `Catalog::decode_tenant_part` in
+`crates/ravel-catalog/src/tenant_part.rs` reserves a part's declared
+`entries_uncompressed_len` after the part header's tenant check and before
+the decode, so a part naming another tenant is reported as an isolation
+breach whatever the budget holds. `load_covering_postings` (the scrub's
+covering-postings load) keeps each covered part's reservation in the
+`LoadedCoveringPostings` it returns, released when that value drops; the
+scrub drops it before its seal-divergence tier decodes the same parts.
+`verify_seal_divergence` (the scrub's seal-divergence tier and `ravel-cli
+catalog verify`) and `snapshot_coverage` (the load's `--fold-after-load`
+coverage check) hold every part's reservation until they return. The scrub
+charges the server's own catalog, and so the shared budget. The CLI builds
+its catalog on the default unlimited budget, where the charge never refuses.
+
 The measurement it rests on: on the ClickBench hits tenant, folded, at 10
 concurrent connections (issue #3244 comment 6423368682), the decoded part
 and postings caches peaked at 924,705 bytes, while SQL and fetch reached 0.96
@@ -1768,6 +1783,14 @@ What a refusal does, by decode kind:
   it always holds, so that tenant's fold does not advance until the budget
   is raised (ADR-1702 decision 6). The scheduled fold runs in `all` and
   `maintain` modes.
+- A scrub tick whose covering-postings load or seal-divergence check is
+  refused skips that tier for the tick as it does a transient read failure:
+  the typed `MemoryExhausted` error is logged (the covering load at error,
+  the seal-divergence check at warn), no anomaly is counted, and the next
+  tick retries. The scrub runs in `maintain` mode.
+- `ravel-cli catalog verify` and the load's coverage check return the
+  refusal as an error, which fails the command. On the CLI's unlimited
+  budget it does not occur.
 
 The host-memory gate amendment's gate sits in front of the same budget, so
 the catalog inherits it. A catalog decode the gate refuses (the
@@ -1808,3 +1831,15 @@ decoded on each query, refused by the cache and released with the query,
 while its postings object is cached.
 `a_refused_postings_decode_fails_the_tick_and_the_next_tick_retries`
 in `services/ravel-server/src/fold.rs` pins the fold tick.
+`a_refused_part_decode_fails_verify_and_coverage_with_the_declared_charge`,
+`every_part_charge_is_held_while_the_entries_are_resident`,
+`a_part_decode_evicts_the_resolve_cache_to_fit` and
+`a_foreign_part_is_a_breach_under_an_empty_budget` in
+`crates/ravel-catalog/src/seal_divergence.rs`, and
+`a_refused_part_decode_fails_loudly_with_the_declared_charge`,
+`the_covered_entries_stay_charged_until_the_value_drops` and
+`a_foreign_part_is_a_breach_under_an_empty_budget` in
+`crates/ravel-catalog/src/covering_postings.rs`, pin the readers' charges.
+`a_refused_covering_decode_skips_the_postings_tier_until_a_tick_with_room`
+and `a_refused_seal_divergence_decode_skips_the_tier_until_a_tick_with_room`
+in `services/ravel-server/src/scrub.rs` pin the scrub's skip and retry.

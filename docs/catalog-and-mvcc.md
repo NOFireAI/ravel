@@ -2351,7 +2351,12 @@ error rather than a degrade to `None`) and its seal-divergence tier, and
 verify` and `ravel-cli load` call. The server hands the scrub its own
 `Catalog`, so a foreign part the scrub reads is counted where `/metrics`
 renders it; the command-line readers count on a `Catalog` of their own and
-report the error as a failed command. A tenant_hash mismatch on the postings
+report the error as a failed command. Only after the check does each of
+these readers charge the part's declared decoded size to that `Catalog`'s
+memory budget (ADR-1170, catalog decode charge amendment), so a budget
+refusal never hides a foreign part; the refusal is
+`LoadPostingsError::MemoryExhausted` or
+`SealDivergenceError::MemoryExhausted`. A tenant_hash mismatch on the postings
 object in `load_covering_postings` (`LoadPostingsError::TenantHashMismatch`)
 is not counted.
 The counter is rendered at `/metrics` beside the

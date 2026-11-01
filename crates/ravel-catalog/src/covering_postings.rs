@@ -15,7 +15,7 @@
 //! path (GET, blake3 verify, ADR-0050 §2 tenant-hash check, decode against the
 //! covered parts' blake3, entry-count check).
 //!
-//! # Degrade-to-None, four loud exceptions
+//! # Degrade-to-None, five loud exceptions
 //!
 //! Postings are a pure pruning/verification optimization, never a correctness
 //! gate: an absent HEAD, an absent postings ref, a `NotFound` on the HEAD, a
@@ -23,13 +23,15 @@
 //! entry-count mismatch all degrade to `Ok(None)`, exactly as
 //! `load_snapshot_postings` documents. The scrubber then simply runs the
 //! structural and content tiers with no postings tier this tick and retries
-//! next tick. Four loud exceptions return a real [`LoadPostingsError`]
+//! next tick. Five loud exceptions return a real [`LoadPostingsError`]
 //! instead: a genuinely unparseable HEAD or part (a real catalog defect,
 //! matching [`crate::seal_divergence`]), a postings object whose declared
 //! `tenant_hash` names a different tenant (an isolation breach, ADR-0050 §2,
 //! never absorbed into a silent degrade), a snapshot part whose header names
 //! a different tenant (the same breach, checked before the part's entries
-//! are decoded and counted on the catalog passed in), and a GET of the HEAD,
+//! are decoded and counted on the catalog passed in), a snapshot part decode
+//! the catalog's memory budget refuses (ADR-1170, catalog decode charge
+//! amendment: memory pressure, not an absent object), and a GET of the HEAD,
 //! a part, or the postings object itself failing for any reason other than
 //! `NotFound` (issue #1964 covered the postings object; issue #1976 extends
 //! the same treatment to the HEAD and per-part GETs above it, which used to
@@ -52,8 +54,9 @@ use crate::tenant_part::TenantPartError;
 /// borrowed) because the server-side caller loads this once per (tenant,
 /// signal) per tick and must hold it alive across every shard's tick for that
 /// signal, handing each shard a borrowing `CoveringPostings` built from these
-/// fields.
-#[derive(Clone, Debug)]
+/// fields. Each covered part's decode stays charged to the loading catalog's
+/// memory budget until this value is dropped.
+#[derive(Debug)]
 pub struct LoadedCoveringPostings {
     /// The RNP1 postings object's full bytes.
     pub bytes: Vec<u8>,
@@ -63,10 +66,13 @@ pub struct LoadedCoveringPostings {
     /// Every covered part's entries, concatenated in `SnapshotHead.parts`
     /// order (the order postings ordinals index into).
     pub covered_entries: Vec<SnapshotEntry>,
+    /// The covered parts' decode charges, one per part.
+    _reservations: Vec<ravel_memory::Reservation>,
 }
 
-/// A genuinely unparseable object, an isolation breach, or a non-`NotFound`
-/// GET failure on the HEAD, a part, or the postings object itself: the only
+/// A genuinely unparseable object, an isolation breach, a part decode the
+/// memory budget refused, or a non-`NotFound` GET failure on the HEAD, a part,
+/// or the postings object itself: the only
 /// conditions [`load_covering_postings`] surfaces as an error rather than
 /// degrading to `Ok(None)`. Every other failure mode (absent HEAD or postings
 /// ref, a `NotFound` on the HEAD, a part, or the postings object, a blake3 or
@@ -113,6 +119,16 @@ pub enum LoadPostingsError {
         key: String,
         expected: String,
         actual: String,
+    },
+    /// The catalog's memory budget refused a covered part's declared decoded
+    /// size (ADR-1170, catalog decode charge amendment). Memory pressure, not
+    /// an absent object, so a hard error the scrub tick logs and retries,
+    /// never a silent `Ok(None)` degrade; nothing was decoded.
+    #[error("snapshot part {key} decode refused by the memory budget: {source}")]
+    MemoryExhausted {
+        key: String,
+        #[source]
+        source: ravel_memory::MemoryExhausted,
     },
     /// The postings object GET failed for a reason other than `NotFound`
     /// (issue #1964): most commonly a missing IAM read grant on `idx/*`,
@@ -165,11 +181,14 @@ fn head_key(tenant: &TenantHash, signal: Signal) -> String {
 /// object is present, hash-verified, tenant-bound to this tenant, decodes
 /// against the covered parts' blake3, and its entry count matches the covered
 /// entries. See the [module docs](self) for the full degrade-to-`Ok(None)`
-/// contract and the four loud [`LoadPostingsError`] exceptions.
+/// contract and the five loud [`LoadPostingsError`] exceptions.
 ///
-/// Every read goes through `store`. `catalog` supplies only the
-/// isolation-breach counter a foreign part is counted on, so the scrub can
-/// read through its background store class with the server's own catalog.
+/// Every read goes through `store`. `catalog` supplies the isolation-breach
+/// counter a foreign part is counted on and the memory budget each part
+/// decode is charged to, so the scrub can read through its background store
+/// class with the server's own catalog. On `Ok(Some(..))` the charges travel
+/// with the returned value; on every other outcome they are released before
+/// this returns.
 pub async fn load_covering_postings(
     store: &dyn ObjectStoreBackend,
     catalog: &Catalog,
@@ -213,9 +232,11 @@ pub async fn load_covering_postings(
     // tick); any other GET failure (issue #1976) is a store outage and
     // surfaces instead; a part present but genuinely unparseable is a real
     // catalog defect surfaced as an error, matching verify_seal_divergence, and
-    // so is a part whose header names another tenant.
+    // so is a part whose header names another tenant or whose decode the
+    // memory budget refuses.
     let mut part_blake3: Vec<[u8; 32]> = Vec::with_capacity(head.parts.len());
     let mut covered_entries: Vec<SnapshotEntry> = Vec::new();
+    let mut reservations: Vec<ravel_memory::Reservation> = Vec::with_capacity(head.parts.len());
     for part_ref in &head.parts {
         // validate_head already guaranteed a 32-byte part blake3; degrade
         // rather than panic if that invariant ever changes.
@@ -233,21 +254,29 @@ pub async fn load_covering_postings(
                 });
             }
         };
-        let decoded = catalog
-            .decode_tenant_part(tenant, &got.data)
-            .map_err(|err| match err {
-                TenantPartError::Corrupt(source) => LoadPostingsError::PartCorrupt {
-                    key: part_ref.key.clone(),
-                    source,
-                },
-                TenantPartError::ForeignTenant { expected, actual } => {
-                    LoadPostingsError::PartTenantHashMismatch {
+        let (decoded, reservation) =
+            catalog
+                .decode_tenant_part(tenant, &got.data)
+                .map_err(|err| match err {
+                    TenantPartError::Corrupt(source) => LoadPostingsError::PartCorrupt {
                         key: part_ref.key.clone(),
-                        expected,
-                        actual,
+                        source,
+                    },
+                    TenantPartError::ForeignTenant { expected, actual } => {
+                        LoadPostingsError::PartTenantHashMismatch {
+                            key: part_ref.key.clone(),
+                            expected,
+                            actual,
+                        }
                     }
-                }
-            })?;
+                    TenantPartError::MemoryExhausted(source) => {
+                        LoadPostingsError::MemoryExhausted {
+                            key: part_ref.key.clone(),
+                            source,
+                        }
+                    }
+                })?;
+        reservations.push(reservation);
         covered_entries.extend(decoded.entries);
     }
 
@@ -303,6 +332,7 @@ pub async fn load_covering_postings(
         bytes: data.to_vec(),
         part_blake3,
         covered_entries,
+        _reservations: reservations,
     }))
 }
 
@@ -868,6 +898,126 @@ mod tests {
                 assert_eq!(expected, tenant_id().hash().to_hex());
                 assert_eq!(actual, crate::fold::tests::foreign_tenant_hex());
             }
+            other => panic!("expected PartTenantHashMismatch, got {other:?}"),
+        }
+        assert_eq!(catalog.isolation_breaches(), 1, "counted once");
+    }
+
+    /// Fold one real segment and return the covered part's key and declared
+    /// decoded length.
+    async fn folded_part(store: &Arc<MemoryStore>) -> (String, u64) {
+        let now = 600_000 * NS_PER_HOUR;
+        publish_real_segment(store.as_ref(), 1, now - SEALED_AGE_NS, &["cpu", "mem"]).await;
+        fold(store.clone(), now).await;
+        let key = head_key(&tenant_id().hash(), Signal::Metrics);
+        let head_bytes = store.get(&key, GetRange::Full).await.expect("head").data;
+        let head = decode_head(&head_bytes).expect("decode head");
+        let part_key = head.parts.first().expect("one covered part").key.clone();
+        let declared = crate::fold::tests::part_declared_len(store.as_ref(), &part_key).await;
+        (part_key, declared)
+    }
+
+    /// ADR-1170, catalog decode charge amendment: the loader charges a covered
+    /// part's declared `entries_uncompressed_len` to the catalog's budget
+    /// before decoding it, and a refusal is the loud `MemoryExhausted` naming
+    /// the part, never `Ok(None)`: a quiet degrade would read as "no postings
+    /// to check" and skip the scrub's comparison silently.
+    ///
+    /// FLIP: delete the `reserve_decoded` call in
+    /// `Catalog::decode_tenant_part` and the load succeeds, so `expect_err`
+    /// panics. FLIP: map `TenantPartError::MemoryExhausted` to `Ok(None)` in
+    /// `load_covering_postings` and `expect_err` panics. FLIP: reserve the
+    /// stored part length instead of the declared one and `requested`
+    /// differs.
+    #[tokio::test]
+    async fn a_refused_part_decode_fails_loudly_with_the_declared_charge() {
+        let store = Arc::new(MemoryStore::new());
+        let (part_key, declared) = folded_part(&store).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared));
+        let _pressure = budget.reserve(1).expect("one byte fits");
+        let catalog = test_catalog().with_memory_budget(budget.clone());
+
+        let err = load_covering_postings(
+            store.as_ref(),
+            &catalog,
+            &tenant_id().hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect_err("a refused decode must fail loudly, never degrade");
+        match err {
+            LoadPostingsError::MemoryExhausted { key, source } => {
+                assert_eq!(key, part_key);
+                assert_eq!(source.requested, declared, "the declared length");
+                assert_eq!(source.reserved, 1);
+                assert_eq!(source.limit, declared);
+            }
+            other => panic!("expected MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(budget.reserved(), 1, "the refusal charges nothing");
+        assert_eq!(catalog.isolation_breaches(), 0, "a refusal is no breach");
+    }
+
+    /// The covered entries stay charged while the loaded value holds them,
+    /// and the charge ends when it drops.
+    ///
+    /// FLIP: drop the reservation right after the decode in
+    /// `load_covering_postings` (`let (decoded, _) = ...`) and `reserved()`
+    /// reads 0 while `loaded` is alive. FLIP: delete the `reserve_decoded`
+    /// call and the same.
+    #[tokio::test]
+    async fn the_covered_entries_stay_charged_until_the_value_drops() {
+        let store = Arc::new(MemoryStore::new());
+        let (_, declared) = folded_part(&store).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared));
+        let catalog = test_catalog().with_memory_budget(budget.clone());
+
+        let loaded = load_covering_postings(
+            store.as_ref(),
+            &catalog,
+            &tenant_id().hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect("the part fits exactly")
+        .expect("postings present");
+        assert_eq!(loaded.covered_entries.len(), 1);
+        assert_eq!(budget.reserved(), declared, "held with the entries");
+        drop(loaded);
+        assert_eq!(budget.reserved(), 0, "released on drop");
+    }
+
+    /// A foreign part is reported as the breach it is even under a budget
+    /// that refuses every decode: the tenant check runs before the charge.
+    ///
+    /// FLIP: move the `tenant_hash` comparison after `reserve_decoded` in
+    /// `Catalog::decode_tenant_part` and the load fails with
+    /// `MemoryExhausted`, so the match panics. FLIP: drop the
+    /// `record_isolation_breach` call and `isolation_breaches()` reads 0.
+    #[tokio::test]
+    async fn a_foreign_part_is_a_breach_under_an_empty_budget() {
+        let store = Arc::new(MemoryStore::new());
+        let (_, _) = folded_part(&store).await;
+        let part_key = crate::fold::tests::repoint_tenant_head_at_foreign_part(
+            store.as_ref(),
+            &tenant_id().hash(),
+            Signal::Metrics,
+            0,
+        )
+        .await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(0));
+        let catalog = test_catalog().with_memory_budget(budget);
+
+        let err = load_covering_postings(
+            store.as_ref(),
+            &catalog,
+            &tenant_id().hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect_err("a foreign part must hard-fail");
+        match err {
+            LoadPostingsError::PartTenantHashMismatch { key, .. } => assert_eq!(key, part_key),
             other => panic!("expected PartTenantHashMismatch, got {other:?}"),
         }
         assert_eq!(catalog.isolation_breaches(), 1, "counted once");
