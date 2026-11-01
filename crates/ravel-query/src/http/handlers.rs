@@ -17,7 +17,8 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, body::Body};
 
 use ravel_promql::LabelMatcher;
-use ravel_types::{METRIC_NAME_LABEL, TenantHash, TimeRange};
+use ravel_tenant_resolve::Principal;
+use ravel_types::{METRIC_NAME_LABEL, TimeRange};
 
 use crate::engine::parse_match_selector;
 use crate::http::error::ApiError;
@@ -82,8 +83,14 @@ fn success_annotated<T: serde::Serialize>(
         .into_response()
 }
 
-fn authenticate(state: &AppState, headers: &axum::http::HeaderMap) -> Result<TenantHash, ApiError> {
-    service::authenticate(state.tenant_resolver.as_ref(), headers)
+/// The caller's full principal: its tenant hash scopes the query and its
+/// subject goes on the audit record, so every audited handler resolves this
+/// rather than the tenant alone.
+fn authenticate_principal(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<Principal, ApiError> {
+    Ok(state.tenant_resolver.resolve_principal(headers)?)
 }
 
 pub async fn query(State(state): State<AppState>, req: Request<Body>) -> Response {
@@ -95,7 +102,9 @@ pub async fn query(State(state): State<AppState>, req: Request<Body>) -> Respons
 
 async fn handle_query(state: &AppState, req: Request<Body>) -> Result<Response, ApiError> {
     let headers = req.headers().clone();
-    let tenant_hash = authenticate(state, &headers)?;
+    let principal = authenticate_principal(state, &headers)?;
+    let tenant_hash = principal.tenant.hash();
+    let subject = service::audit_subject(&principal);
     let params = read_params(req).await?;
     let now = now_ns();
     let request = InstantRequest {
@@ -110,8 +119,14 @@ async fn handle_query(state: &AppState, req: Request<Body>) -> Result<Response, 
         now_ns: now,
         budgets: None,
     };
-    let outcome =
-        service::promql_instant(&state.controls(), &state.engine, tenant_hash, &request).await?;
+    let outcome = service::promql_instant(
+        &state.controls(),
+        &state.engine,
+        tenant_hash,
+        subject.as_ref(),
+        &request,
+    )
+    .await?;
     let data = with_stats(
         instant_value_to_json(outcome.value, request.time_ms)?,
         outcome.stats,
@@ -133,7 +148,9 @@ pub async fn query_range(State(state): State<AppState>, req: Request<Body>) -> R
 
 async fn handle_query_range(state: &AppState, req: Request<Body>) -> Result<Response, ApiError> {
     let headers = req.headers().clone();
-    let tenant_hash = authenticate(state, &headers)?;
+    let principal = authenticate_principal(state, &headers)?;
+    let tenant_hash = principal.tenant.hash();
+    let subject = service::audit_subject(&principal);
     let params = read_params(req).await?;
     let request = RangeRequest {
         query: params.require("query")?.to_string(),
@@ -146,8 +163,14 @@ async fn handle_query_range(state: &AppState, req: Request<Body>) -> Result<Resp
         now_ns: now_ns(),
         budgets: None,
     };
-    let outcome =
-        service::promql_range(&state.controls(), &state.engine, tenant_hash, &request).await?;
+    let outcome = service::promql_range(
+        &state.controls(),
+        &state.engine,
+        tenant_hash,
+        subject.as_ref(),
+        &request,
+    )
+    .await?;
     let data = with_stats(
         range_value_to_json(
             outcome.value,
@@ -179,10 +202,19 @@ pub async fn labels(State(state): State<AppState>, req: Request<Body>) -> Respon
 
 async fn handle_labels(state: &AppState, req: Request<Body>) -> Result<Response, ApiError> {
     let headers = req.headers().clone();
-    let tenant_hash = authenticate(state, &headers)?;
+    let principal = authenticate_principal(state, &headers)?;
+    let tenant_hash = principal.tenant.hash();
+    let subject = service::audit_subject(&principal);
     let params = read_params(req).await?;
     let request = metadata_request(state, &params)?;
-    let outcome = service::labels(&state.controls(), &state.engine, tenant_hash, &request).await?;
+    let outcome = service::labels(
+        &state.controls(),
+        &state.engine,
+        tenant_hash,
+        subject.as_ref(),
+        &request,
+    )
+    .await?;
     Ok(success_annotated(
         outcome.names,
         outcome.partial,
@@ -208,7 +240,9 @@ async fn handle_label_values(
     req: Request<Body>,
 ) -> Result<Response, ApiError> {
     let headers = req.headers().clone();
-    let tenant_hash = authenticate(state, &headers)?;
+    let principal = authenticate_principal(state, &headers)?;
+    let tenant_hash = principal.tenant.hash();
+    let subject = service::audit_subject(&principal);
     let params = read_params(req).await?;
     let request = metadata_request(state, &params)?;
     let include_log_metrics = include_log_metric_names(&name, &request.selectors)?;
@@ -216,6 +250,7 @@ async fn handle_label_values(
         &state.controls(),
         &state.engine,
         tenant_hash,
+        subject.as_ref(),
         &request,
         &name,
         include_log_metrics,
@@ -274,7 +309,9 @@ pub async fn series(State(state): State<AppState>, req: Request<Body>) -> Respon
 
 async fn handle_series(state: &AppState, req: Request<Body>) -> Result<Response, ApiError> {
     let headers = req.headers().clone();
-    let tenant_hash = authenticate(state, &headers)?;
+    let principal = authenticate_principal(state, &headers)?;
+    let tenant_hash = principal.tenant.hash();
+    let subject = service::audit_subject(&principal);
     let params = read_params(req).await?;
     if params.all("match[]").is_empty() {
         return Err(ApiError::BadData(
@@ -282,7 +319,14 @@ async fn handle_series(state: &AppState, req: Request<Body>) -> Result<Response,
         ));
     }
     let request = metadata_request(state, &params)?;
-    let outcome = service::series(&state.controls(), &state.engine, tenant_hash, &request).await?;
+    let outcome = service::series(
+        &state.controls(),
+        &state.engine,
+        tenant_hash,
+        subject.as_ref(),
+        &request,
+    )
+    .await?;
     Ok(success_annotated(
         series_to_json(outcome.series),
         outcome.partial,

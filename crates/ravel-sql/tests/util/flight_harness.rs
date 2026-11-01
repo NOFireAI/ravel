@@ -82,6 +82,13 @@ impl FlightAuth for TestAuth {
     fn min_commit_tokens(&self, metadata: &MetadataMap) -> Result<Vec<MinCommitToken>, Status> {
         ravel_sql::flight::min_commit_tokens_from_metadata(metadata, MIN_COMMIT_TOKEN_KEY)
     }
+
+    fn audit_subject(
+        &self,
+        _metadata: &MetadataMap,
+    ) -> Result<Option<ravel_sql::flight::AuditSubject>, Status> {
+        Ok(None)
+    }
 }
 
 /// A clock the test moves by hand, so ticket expiry is deterministic rather

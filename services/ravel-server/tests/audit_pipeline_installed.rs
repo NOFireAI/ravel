@@ -480,6 +480,296 @@ async fn promql_query_writes_one_query_audit_record() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
+/// One request per audited HTTP surface the server under test mounts, as
+/// `token`, each carrying spoofed `x-ravel-subject` and
+/// `x-ravel-client-cert-cn` headers. Each entry is the surface's name, the
+/// request, the status it answers, and how many `kind=query` records it
+/// writes. `ddl` says whether `token` holds the `ddl` capability: with it a
+/// DDL statement writes its `attempted` and outcome records, without it the
+/// one refusal record.
+#[cfg(feature = "sql")]
+fn subject_surface_requests(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    ddl: bool,
+) -> Vec<(&'static str, reqwest::RequestBuilder, u16, usize)> {
+    let authed = |request: reqwest::RequestBuilder| {
+        request
+            .header("authorization", format!("Bearer {token}"))
+            .header("x-ravel-subject", "mallory")
+            .header("x-ravel-client-cert-cn", "mallory")
+    };
+    let post = |path: &str, body: serde_json::Value| {
+        authed(client.post(format!("{base}{path}")))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+    };
+    let get = |path: &str, query: Vec<(&'static str, String)>| {
+        authed(client.get(format!("{base}{path}"))).query(&query)
+    };
+    let mut surfaces = vec![
+        (
+            "sql",
+            post(
+                "/api/v1/sql",
+                serde_json::json!({
+                    "query": "SELECT ts, value FROM samples ORDER BY ts",
+                    "start": 0.0,
+                    "end": NOW_S as f64,
+                }),
+            ),
+            200,
+            1,
+        ),
+        (
+            "promql instant",
+            get(
+                "/api/v1/query",
+                vec![("query", "m".to_string()), ("time", NOW_S.to_string())],
+            ),
+            200,
+            1,
+        ),
+        (
+            "promql range",
+            get(
+                "/api/v1/query_range",
+                vec![
+                    ("query", "m".to_string()),
+                    ("start", "0".to_string()),
+                    ("end", NOW_S.to_string()),
+                    ("step", "60s".to_string()),
+                ],
+            ),
+            200,
+            1,
+        ),
+        ("labels", get("/api/v1/labels", window_params()), 200, 1),
+        (
+            "label_values",
+            get("/api/v1/label/__name__/values", window_params()),
+            200,
+            1,
+        ),
+        ("series", get("/api/v1/series", window_params()), 200, 1),
+        (
+            "analytics",
+            post(
+                "/api/v1/analytics",
+                serde_json::json!({
+                    "query": "m",
+                    "start": 0.0,
+                    "end": NOW_S as f64,
+                    "step": 60.0,
+                    "op": {"type": "summary", "percentiles": [0.5]},
+                }),
+            ),
+            200,
+            1,
+        ),
+        (
+            "exemplars",
+            get(
+                "/api/v1/query_exemplars",
+                vec![
+                    ("query", "m".to_string()),
+                    ("start", "0".to_string()),
+                    ("end", NOW_S.to_string()),
+                ],
+            ),
+            200,
+            1,
+        ),
+        (
+            "traces",
+            get("/api/traces/00112233445566778899aabbccddeeff", Vec::new()),
+            200,
+            1,
+        ),
+    ];
+    surfaces.push(if ddl {
+        (
+            "ddl",
+            post(
+                "/api/v1/sql",
+                serde_json::json!({ "query": "DROP TABLE no_such_table" }),
+            ),
+            DDL_UNKNOWN_TABLE_STATUS,
+            2,
+        )
+    } else {
+        (
+            "ddl",
+            post(
+                "/api/v1/sql",
+                serde_json::json!({ "query": "DROP TABLE no_such_table" }),
+            ),
+            403,
+            1,
+        )
+    });
+    #[cfg(feature = "esql")]
+    surfaces.push((
+        "esql",
+        post(
+            "/api/v1/esql",
+            serde_json::json!({ "query": "FROM logs | LIMIT 10" }),
+        ),
+        200,
+        1,
+    ));
+    surfaces
+}
+
+/// `(records, records naming alice by static token, records with neither
+/// principal attribute)` over `rows`.
+#[cfg(feature = "sql")]
+fn subject_counts(rows: &[LogRecord]) -> (usize, usize, usize) {
+    let named = rows
+        .iter()
+        .filter(|row| {
+            attr(row, ravel_maintain::ATTR_PRINCIPAL_SUBJECT) == Some("alice")
+                && attr(row, ravel_maintain::ATTR_PRINCIPAL_SUBJECT_SOURCE) == Some("static_token")
+        })
+        .count();
+    let bare = rows
+        .iter()
+        .filter(|row| {
+            !row.attrs.iter().any(|(k, _)| {
+                k == ravel_maintain::ATTR_PRINCIPAL_SUBJECT
+                    || k == ravel_maintain::ATTR_PRINCIPAL_SUBJECT_SOURCE
+            })
+        })
+        .count();
+    (rows.len(), named, bare)
+}
+
+/// The status `DROP TABLE` of a table that does not exist answers a caller
+/// holding the `ddl` capability.
+#[cfg(feature = "sql")]
+const DDL_UNKNOWN_TABLE_STATUS: u16 = 404;
+
+/// Every audited HTTP surface writes records naming the subject the caller's
+/// configured token carries, with its source, and a token with no subject
+/// leaves both attributes off. The DDL path is covered at its refusal, its
+/// `attempted` record and its outcome record. The subject comes from the
+/// resolved principal only: a client-supplied `x-ravel-subject` or
+/// `x-ravel-client-cert-cn` header, sent with every token, changes nothing,
+/// the tenant attribution is unchanged, and no response body names the
+/// subject. Each surface is checked on the records its own request added, and
+/// every miss is reported before the test fails, so one run names every
+/// surface that dropped the subject.
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn every_query_surface_names_the_callers_configured_subject() {
+    const LABELLED: &str = "acme-labelled-token";
+    const LABELLED_NO_DDL: &str = "acme-labelled-no-ddl-token";
+    const PLAIN: &str = "acme-plain-token";
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
+
+    let tenant = TenantId::new(TENANT);
+    let alice = |ddl: bool| {
+        let mut principal = ravel_tenant_resolve::Principal::tenant_only(tenant.clone());
+        principal.ddl = ddl;
+        principal.subject = Some(
+            ravel_tenant_resolve::Subject::new(
+                ravel_tenant_resolve::SubjectSource::StaticToken,
+                "alice",
+            )
+            .expect("a valid subject"),
+        );
+        principal
+    };
+    let mut plain = ravel_tenant_resolve::Principal::tenant_only(tenant.clone());
+    plain.ddl = true;
+    let principals = HashMap::from([
+        (LABELLED.to_string(), alice(true)),
+        (LABELLED_NO_DDL.to_string(), alice(false)),
+        (PLAIN.to_string(), plain),
+    ]);
+    let mut config = server_config(
+        HashMap::new(),
+        Mode::All,
+        required(),
+        vec![tenant.hash()],
+        Default::default(),
+    );
+    config.tenant_resolver =
+        Arc::new(ravel_tenant_resolve::StaticBearerTokenResolver::with_principals(principals));
+    let running = ravel_server::start(
+        config,
+        store.clone(),
+        store.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts");
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let mut bodies = Vec::new();
+    let mut failures = Vec::new();
+    for (token, ddl, labelled) in [
+        (LABELLED, true, true),
+        (LABELLED_NO_DDL, false, true),
+        (PLAIN, true, false),
+    ] {
+        for (surface, request, want_status, want_records) in
+            subject_surface_requests(&client, &base, token, ddl)
+        {
+            // Only the DDL surface differs between the two labelled tokens.
+            if token == LABELLED_NO_DDL && surface != "ddl" {
+                continue;
+            }
+            let before = subject_counts(&query_audit_records(store.as_ref(), &tenant).await);
+            let response = request.send().await.expect("request sent");
+            let got_status = response.status().as_u16();
+            bodies.push(response.text().await.expect("response body"));
+            let after = subject_counts(&query_audit_records(store.as_ref(), &tenant).await);
+            let (records, named, bare) =
+                (after.0 - before.0, after.1 - before.1, after.2 - before.2);
+            let want = if labelled {
+                (want_status, want_records, want_records, 0)
+            } else {
+                (want_status, want_records, 0, want_records)
+            };
+            let got = (got_status, records, named, bare);
+            if got != want {
+                failures.push(format!(
+                    "{token} {surface}: (status, records, named, bare) = {got:?}, want {want:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    for body in &bodies {
+        assert!(
+            !body.contains("alice"),
+            "a response names the subject: {body}"
+        );
+    }
+
+    let records = query_audit_records(store.as_ref(), &tenant).await;
+    assert!(!records.is_empty(), "the surfaces wrote audit records");
+    for row in &records {
+        assert_eq!(
+            attr(row, "query.tenant"),
+            Some(tenant.hash().to_hex().as_str())
+        );
+        for (key, value) in &row.attrs {
+            assert!(
+                !matches!(value, AttrValue::Str(s) if s.contains("mallory")),
+                "a client header reached the record under {key}"
+            );
+        }
+    }
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
 /// `audit_mode=required`: faulting every PUT into the audit
 /// keyspace fails the query closed with 503, after usage was already
 /// recorded (T2a order) -- the query does not outlive its trail.

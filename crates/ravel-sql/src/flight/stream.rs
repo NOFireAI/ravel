@@ -61,7 +61,7 @@ use arrow_flight::error::FlightError;
 use datafusion::arrow::array::RecordBatch;
 use futures::{Stream, StreamExt};
 use ravel_catalog::Snapshot;
-use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
+use ravel_maintain::{AuditSubject, QueryAuditSink, QueryStatus, query_audit_event};
 use ravel_query::QueryPermit;
 use ravel_types::TenantHash;
 use ravel_types::accounting::{
@@ -392,12 +392,13 @@ impl Drop for RecordOnStreamEnd {
 const AUDIT_UNAVAILABLE_MSG: &str = ravel_query::http::MSG_AUDIT_UNAVAILABLE;
 
 /// The evidential-audit context one Flight statement submits at stream
-/// completion: the sink, the resolved tenant, the request timestamp, and the
-/// statement text. Held by [`AuditedStream`] until the terminal event, then
+/// completion: the sink, the resolved tenant, the caller's subject when the
+/// principal has one, the request timestamp, and the statement text. Held by [`AuditedStream`] until the terminal event, then
 /// consumed to build and submit the [`AuditEvent`](ravel_maintain::AuditEvent).
 struct AuditCtx {
     sink: Arc<dyn QueryAuditSink>,
     tenant: TenantHash,
+    subject: Option<AuditSubject>,
     now_ns: i64,
     query_text: String,
 }
@@ -416,6 +417,7 @@ impl AuditCtx {
             &self.query_text,
             "sql",
             status,
+            self.subject.as_ref(),
             0,
             0,
         )
@@ -631,6 +633,7 @@ pub(super) fn audited_stream(
     inner: DoGetStream,
     sink: Arc<dyn QueryAuditSink>,
     tenant: TenantHash,
+    subject: Option<AuditSubject>,
     now_ns: i64,
     query_text: String,
 ) -> DoGetStream {
@@ -639,6 +642,7 @@ pub(super) fn audited_stream(
         ctx: Some(AuditCtx {
             sink,
             tenant,
+            subject,
             now_ns,
             query_text,
         }),
@@ -848,7 +852,7 @@ mod tests {
             events: Arc::clone(&events),
         });
         let inner = inner_stream(vec![Ok(FlightData::default())]);
-        let stream = audited_stream(inner, sink, TENANT, 42, "SELECT 1".to_string());
+        let stream = audited_stream(inner, sink, TENANT, None, 42, "SELECT 1".to_string());
 
         let items = drain(stream).await;
         assert_eq!(items.len(), 1, "the one data item passes through");
@@ -874,7 +878,7 @@ mod tests {
             Ok(FlightData::default()),
             Err(Status::internal("boom")),
         ]);
-        let stream = audited_stream(inner, sink, TENANT, 42, "SELECT 1".to_string());
+        let stream = audited_stream(inner, sink, TENANT, None, 42, "SELECT 1".to_string());
 
         let items = drain(stream).await;
         assert_eq!(items.len(), 2);
@@ -912,7 +916,7 @@ mod tests {
             Ok(FlightData::default()),
             Err(Status::internal("boom")),
         ]);
-        let mut stream = audited_stream(inner, sink, TENANT, 42, "SELECT 1".to_string());
+        let mut stream = audited_stream(inner, sink, TENANT, None, 42, "SELECT 1".to_string());
 
         // Consume as tonic's server role does: the first batch, then the error.
         let first = stream.next().await;
@@ -958,6 +962,7 @@ mod tests {
             inner,
             Arc::new(FailingSink),
             TENANT,
+            None,
             42,
             "SELECT 1".to_string(),
         );
@@ -990,6 +995,7 @@ mod tests {
             inner,
             Arc::new(FailingSink),
             TENANT,
+            None,
             42,
             "SELECT 1".to_string(),
         );
@@ -1015,7 +1021,7 @@ mod tests {
         // A stream that yields one batch then would continue; we drop it after
         // the first item, before its terminal event.
         let inner = inner_stream(vec![Ok(FlightData::default()), Ok(FlightData::default())]);
-        let mut stream = audited_stream(inner, sink, TENANT, 42, "SELECT 1".to_string());
+        let mut stream = audited_stream(inner, sink, TENANT, None, 42, "SELECT 1".to_string());
         let first = stream.next().await;
         assert!(first.is_some_and(|i| i.is_ok()), "pulled the first batch");
         drop(stream);

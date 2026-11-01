@@ -4067,6 +4067,13 @@ impl ravel_sql::FlightAuth for TokenAuth {
             self.token.clone(),
         )])
     }
+
+    fn audit_subject(
+        &self,
+        _metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<Option<ravel_sql::flight::AuditSubject>, tonic::Status> {
+        Ok(None)
+    }
 }
 
 /// A plain commit token on a Flight statement that reads only Parquet tables

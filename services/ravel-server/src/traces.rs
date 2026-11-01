@@ -202,7 +202,9 @@ async fn run(
         budgets: None,
     };
 
-    let service = state.service();
+    let service = state
+        .service()
+        .with_audit_subject(ravel_query::http::audit_subject(&principal));
     let request = service.trace_request(&lookup)?;
     let execution = service.sql_execute_timed(tenant_hash, &request).await?;
     crate::sql::respond(&headers, execution, tenant_hash)

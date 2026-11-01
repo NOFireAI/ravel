@@ -110,7 +110,11 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceEr
         .map_err(|e| ApiError::bad_request(format!("invalid JSON request body: {e}")))?;
     let query = build_query(body, state.clock.now_ns(), state.max_deadline)?;
 
-    let execution = state.service().esql_execute(tenant_hash, &query).await?;
+    let execution = state
+        .service()
+        .with_audit_subject(ravel_query::http::audit_subject(&principal))
+        .esql_execute(tenant_hash, &query)
+        .await?;
     respond(execution, tenant_hash)
 }
 
