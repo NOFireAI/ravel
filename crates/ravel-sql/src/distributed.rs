@@ -139,7 +139,7 @@ use tonic::transport::{Channel, ClientTlsConfig};
 use crate::config::SqlConfig;
 use crate::dedup::RsegDedupExec;
 use crate::error::SqlError;
-use crate::flight_ticket::{FlightTicket, SegmentPin, SlicePushdown, TicketKey};
+use crate::flight_ticket::{FlightTicket, SegmentPin, SlicePushdown, TicketKey, TicketSurface};
 use crate::provider::RavelTableProvider;
 use crate::schema::internal_schema;
 
@@ -519,7 +519,6 @@ impl SliceTlsDialCounter {
 /// slice mint key ([`SqlTicketKeys::mint_key`] for [`TicketSurface::Slice`]).
 ///
 /// [`SqlTicketKeys::mint_key`]: crate::flight_ticket::SqlTicketKeys::mint_key
-/// [`TicketSurface::Slice`]: crate::flight_ticket::TicketSurface::Slice
 #[derive(Clone)]
 pub struct FlightWorkerSliceClient {
     /// The coordinator's slice mint key, used to sign each slice ticket the
@@ -596,7 +595,7 @@ impl WorkerSliceClient for FlightWorkerSliceClient {
         // coordinator to merge and dedup. The pushdown block rides under the
         // ticket's MAC.
         let handle = ticket
-            .encode_with_pushdown(&self.slice_key, pushdown)
+            .encode_for_surface(&self.slice_key, TicketSurface::Slice, pushdown)
             .map_err(|err| DataFusionError::Internal(err.to_string()))?;
         // Build the channel eagerly so an unparseable location or an unusable
         // TLS configuration fails here, as a typed error, rather than inside
