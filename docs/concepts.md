@@ -408,9 +408,11 @@ re-ingests the batch, and both copies are stored.
 The boundaries are per (tenant, signal). No transaction, snapshot, or
 ordering guarantee spans two tenants or two signals of one tenant. A
 correlated read across signals, such as a metric exemplar to its trace or a
-SQL statement joining `samples` and `logs`, resolves one snapshot per signal,
-with no atomicity or ordering across them. A retry of such a SQL statement
-resolves every signal again.
+SQL statement joining `samples` and `logs`, resolves one snapshot per signal
+the query reads, with no atomicity or ordering across them. A retry of such
+a statement on `POST /api/v1/sql` resolves every signal again. Over Flight
+SQL the snapshots are pinned in the ticket: a `DoGet` retry redeems the same
+ticket and replans against those snapshots, with no second catalog resolve.
 
 ## Failure and retry
 

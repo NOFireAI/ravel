@@ -107,7 +107,8 @@ The guarantee is per signal and nothing more:
   join does not strengthen it.
 - The retry contract applies to the statement. A retry resolves every
   signal again; it never mixes a first-attempt snapshot of one signal with a
-  second-attempt snapshot of another.
+  second-attempt snapshot of another. Over Flight SQL a retry resolves
+  nothing; see the #2915 amendment below.
 
 A caller that needs a lower bound on what each side has seen uses commit
 tokens (decision 3). That is the only cross-signal consistency tool, and it
@@ -182,7 +183,8 @@ Nothing derived from the plan may assume the plan has one table.
   from that scan's own columns, and keeps a prune only when it holds for
   every scan of T. A shape it cannot classify contributes no prune. This
   covers the `__name__` postings prune on `samples` and the column-statistics
-  gate on `logs`.
+  gate on `logs`. Beside a Parquet table the `samples` prune is not made;
+  see the #2915 amendment below.
 - **Supported shape, pinned by a test.** `FROM samples s JOIN logs l ON ...
   WHERE s.__name__ = 'x'` prunes the metrics snapshot by `x` and does not
   touch the logs snapshot. A filter inside one branch of a `UNION` prunes
@@ -235,7 +237,8 @@ field for this: it plans locally for every statement today and keeps doing
 so. Join operators run under the statement's one
 memory pool. `repartition_joins` stays off. A plan containing a join stays
 ineligible for spill, as it is today, so a join that exceeds the tenant's
-memory budget fails with the existing typed memory error.
+memory budget fails with the existing typed memory error. That failure is
+not guaranteed for a join; see the #2915 amendment below.
 
 ### 9. What keeps the one-table rule
 
@@ -254,7 +257,8 @@ memory budget fails with the existing typed memory error.
   The tool is not shipped yet. As designed, its cursor and envelope carry
   one `signal` and its snapshot identity hashes one signal, so when it
   ships it refuses a multi-table statement with `CrossSignalQuery` before
-  any listing.
+  any listing. Nothing in the MCP adapter makes that refusal yet; see the
+  #2915 amendment below.
 
 ### 10. Flight SQL carries one segment group per signal
 
@@ -378,7 +382,8 @@ single response that says what each side read.
 - A `min_commit_token` on a Parquet-only statement becomes a 400. It was
   accepted and ignored.
 - Paging and MCP keep the one-table rule and now hold it themselves instead
-  of inheriting it from the executor.
+  of inheriting it from the executor. Paging does; the MCP refusal is owed
+  by whoever ships the SQL tools (see the #2915 amendment below).
 - ADR-0033, ADR-0045, ADR-1101 and ADR-2040 carry amendment sections that
   point here, added with this ADR. Each says the executor still enforces the
   old rule until the code lands.
@@ -436,3 +441,43 @@ Decision 4's `LIKE` rule is applied per session shape:
   `LIKE` on a genuine `logs` column with a custom escape or a non-string
   operand was refused beside another table and accepted in a logs-only
   session (#2910). With the refusal in place they are removed.
+
+## Amendment (2026-11-01): what landed differs from decisions 2, 5, 8 and 9 (#2915)
+
+<!-- amendment-applies: sections="2. One snapshot per named signal, resolved together, with no order between them|5. Plan-derived work is attributed per table|8. Joins run on the coordinator|9. What keeps the one-table rule|Consequences" pointer="#2915 amendment" -->
+<!-- amendment-supersedes: phrase="memory budget fails with the existing typed memory error" pointer="#2915 amendment" -->
+
+Four places where the decisions as written are not what the tree does:
+
+- **A Flight SQL retry resolves nothing (decision 2).** Decision 2's "a
+  retry resolves every signal again" holds for `POST /api/v1/sql`. Over
+  Flight SQL, `GetFlightInfo` resolves the snapshots once and pins them in
+  the ticket (decision 10). `DoGet` rebuilds each table's snapshot from its
+  ticket group, and its retry of a segment that vanished before the first
+  batch replans against the same pinned snapshots with no second catalog
+  resolve (`crates/ravel-sql/src/flight/stream.rs`). Neither path pairs one
+  attempt's snapshot of a signal with another attempt's snapshot of a
+  different signal.
+- **The `samples` postings prune is lost beside a Parquet table (decision
+  5).** `pushed_down_name_filter` (`crates/ravel-sql/src/executor.rs`)
+  plans the statement in a throwaway session built from the signal lanes
+  only. A statement that also names a Parquet table does not plan there, so
+  no `__name__` key is derived and the metrics snapshot is not pruned by
+  postings. The rows are unchanged; every `samples` segment in the window
+  is read.
+- **An over-budget join is not guaranteed to fail (decision 8).** Decision
+  8 says a join over the tenant's memory budget fails with the existing
+  typed memory error. Join memory is best-effort (ADR-0013, "Amendment:
+  memory ceilings are best-effort for joins", #1370): join operators reach
+  the pool through DataFusion's infallible grow path, which is not checked
+  against the per-query or per-tenant limit. A join may run past the budget
+  rather than fail.
+- **The MCP refusal is owed, not made (decision 9 and Consequences).** The
+  MCP adapter (`services/ravel-server/src/mcp/service_impl.rs`) runs
+  `sql_execute` and `sql_explain` through the same service calls as
+  `POST /api/v1/sql`, which admit a statement over several tables. No
+  shipped tool reaches them with caller text: `ravel_query_sql` and
+  `ravel_explain_query` answer `NotShipped` (`crates/ravel-mcp/src/tools/mod.rs`),
+  and `ravel_get_trace` builds a statement over `spans` alone. Whoever
+  ships either SQL tool owes decision 9's `CrossSignalQuery` refusal before
+  any listing, with a test.

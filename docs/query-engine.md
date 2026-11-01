@@ -4323,7 +4323,7 @@ signal it names, and registers exactly those tables in the per-query
 query-local name, not a base-table reference, and does not change the target
 (`WITH logs AS (SELECT value FROM samples) SELECT count(*) FROM logs` is a
 metrics-only query). A query naming several of the five signal tables runs on
-the HTTP endpoint; the next subsection gives its terms.
+the HTTP endpoint and over Flight SQL; the next subsection gives its terms.
 
 ### Statements over several signal tables (ADR-2904)
 
@@ -4342,9 +4342,11 @@ ORDER BY samples.ts
   reading and window and all before anything is planned. Each table's rows
   come from one immutable snapshot of its signal. There is no atomicity and
   no ordering across the snapshots: a statement may see a span whose log
-  lines are not yet visible, or the reverse. A retry resolves every signal
-  again; it never pairs one attempt's snapshot of one signal with another
-  attempt's snapshot of a different one.
+  lines are not yet visible, or the reverse. On the HTTP endpoint a retry
+  resolves every signal again; it never pairs one attempt's snapshot of one
+  signal with another attempt's snapshot of a different one. Over Flight SQL
+  a `DoGet` retry redeems the same ticket and replans against the snapshots
+  it pinned, with no second resolve (next bullet).
 - **Flight SQL pins one snapshot per signal (ADR-2904 decision 10).**
   `GetFlightInfo` resolves the snapshots as above and mints a version 10
   ticket carrying one segment group per signal table, in lane order, each

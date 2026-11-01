@@ -7497,9 +7497,11 @@ pub(crate) mod tests {
         assert!(matches!(err, SqlError::CrossSignalQuery));
     }
 
-    /// ADR-0045 decision 5: the one-signal-per-query rule now spans three
-    /// tables, so a query naming any two of {samples, logs, spans} -- or all
-    /// three -- is rejected as `CrossSignalQuery`, exactly as samples+logs was.
+    /// ADR-0045 decision 5: the one-signal-per-query rule, which ADR-2904
+    /// keeps only in `refuse_cross_signal` (ES|QL and the single-snapshot
+    /// entry points), spans three tables, so a query naming any two of
+    /// {samples, logs, spans} -- or all three -- is rejected as
+    /// `CrossSignalQuery`, exactly as samples+logs was.
     #[test]
     fn target_signal_rejects_two_of_the_three_tables() {
         for sql in [
@@ -7566,8 +7568,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// ADR-1101 decision 1: the one-signal-per-query rule counts five names, so
-    /// a query naming `alerts` and `audit` -- or `samples` and `audit` -- is
+    /// ADR-1101 decision 1: the one-signal-per-query rule (kept by ADR-2904
+    /// only in `refuse_cross_signal`) counts five names, so a query
+    /// naming `alerts` and `audit` -- or `samples` and `audit` -- is
     /// `CrossSignalQuery`, exactly as samples+logs is.
     #[test]
     fn target_signal_rejects_a_query_naming_alerts_and_audit() {

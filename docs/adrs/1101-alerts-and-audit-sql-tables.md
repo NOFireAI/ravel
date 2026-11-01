@@ -55,8 +55,9 @@ unchanged. The format-change procedure does not apply.
    - `crates/ravel-sql/src/session.rs`: `ALERTS_TABLE = "alerts"`,
      `AUDIT_TABLE = "audit"`, `SessionTable::Alerts(Arc<AlertsTableProvider>)`
      and `SessionTable::Audit(Arc<AuditTableProvider>)`. `build_session`
-     registers exactly the one table the query targets, as it does today.
-     Neither table registers a scalar UDF: every predicate their pushdown
+     registers exactly the one table the query targets, as it does today
+     (ADR-2904 has it register every table the statement names; see the
+     ADR-2904 amendment at the end of this file). Neither table registers a scalar UDF: every predicate their pushdown
      extractors accept is a plain column comparison or an `attrs['k']`
      subscript, which the map-field planner already serves.
    - `crates/ravel-sql/src/executor.rs`: `TargetSignal::Alerts` and
@@ -101,7 +102,7 @@ unchanged. The format-change procedure does not apply.
      catalog metadata built from the five schema functions
      (`public_schema`, `logs_schema`, `spans_schema`, `alerts_schema`,
      `audit_schema`), independent of the per-query session, which still
-     registers exactly one table. It lists only `samples` today, which
+     registers exactly one table (every named table since ADR-2904). It lists only `samples` today, which
      under-reports `logs` and `spans` as well; the Flight surface should
      discover what it can query.
 
@@ -199,9 +200,9 @@ flowchart LR
 Target behavior once the epic's tasks land; none of it is in a shipped
 build while this ADR is Proposed.
 
-- `POST /api/v1/sql` and Flight SQL serve five tables. The one-signal-per-
-  query rule extends to five names; naming two is still a 400 before any
-  listing. ADR-2904 replaces this rule (see the ADR-2904 amendment below).
+- `POST /api/v1/sql` and Flight SQL serve five tables. The
+  one-signal-per-query rule extends to five names; naming two is still a
+  400 before any listing. ADR-2904 replaces this rule (see the ADR-2904 amendment below).
 - A tenant can read its own audit trail, including the `query.text` of
   every retained SQL statement it ran and the `hold.scope` key prefixes of
   its own legal holds. Retention differs by shard: query-audit records are
@@ -237,6 +238,7 @@ build while this ADR is Proposed.
 ## Amendment (2026-10-11, ADR-2904): `alerts` and `audit` may be named beside other tables
 
 <!-- amendment-applies: sections="Decision|Consequences" pointer="ADR-2904" -->
+<!-- amendment-supersedes: phrase="one-signal-per-query" pointer="ADR-2904" -->
 
 The Decision extended ADR-0033's one-signal-per-query rule to five names.
 ADR-2904 replaces that rule: a statement may name `alerts` or `audit`

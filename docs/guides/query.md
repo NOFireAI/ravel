@@ -672,8 +672,13 @@ ORDER BY samples.ts
 ```
 
 Such a query reads one snapshot per signal, with no ordering between them: it
-may see a span whose log lines are not visible yet, or the reverse. The join
-runs on the server that received the query. `min_commit_token` on a query
+may see a span whose log lines are not visible yet, or the reverse. An HTTP
+retry resolves every table again; a Flight SQL `DoGet` retry reads the same
+snapshots its ticket pinned. The join runs on the server that received the
+query, under the query's one memory pool, and that pool's ceiling is
+best-effort for a join: join operators grow their memory without a check
+against the limit, so a join over budget is not guaranteed to fail with the
+memory error. `min_commit_token` on a query
 that names two or more of the five must be qualified with the table it bounds,
 `samples:<token>` or `logs:<token>`, and each token waits only for its own
 table; an unqualified one is an HTTP 400 before any catalog listing (see
@@ -710,7 +715,9 @@ one of those three checks. A `min_commit_token` bounds the five only:
 qualified with a Parquet table's name it is an HTTP 400, and on a query that
 names only Parquet tables any token is a 400 over HTTP and `INVALID_ARGUMENT`
 over Flight SQL. A row window filters the rows of the five and leaves the
-Parquet rows whole.
+Parquet rows whole. Beside a Parquet table, a `samples` filter on `__name__`
+does not prune segments by metric name: the `samples` scan reads every
+segment in the window.
 
 ### `DISTINCT ON`
 

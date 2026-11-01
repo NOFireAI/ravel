@@ -232,14 +232,15 @@ partial-success message with rejected point counts and reasons.
 ## Snapshot isolation
 
 - A query resolves one snapshot (a logical set of immutable segments) per
-  signal it reads and uses each for its entire execution. Commits,
+  signal the query reads and uses each for its entire execution. Commits,
   compactions, and deletions that land mid-query do not affect them.
-- A SQL statement that reads several signals (ADR-2904) gets no atomicity
+- A SQL statement over several signal tables (ADR-2904) gets no atomicity
   and no ordering across their snapshots: it may see a span whose log lines
-  are not yet visible, or the reverse. A retry either resolves every signal
-  again or, for a Flight SQL `DoGet`, replans against every pinned snapshot
-  of the ticket; it never pairs one attempt's snapshot of a signal with another attempt's
-  snapshot of a different signal.
+  are not yet visible, or the reverse. A retry on `POST /api/v1/sql`
+  resolves every signal again. A Flight SQL `DoGet` retry redeems the same
+  ticket and replans against the snapshots it pinned, with no second catalog
+  resolve. Neither pairs one attempt's snapshot of a signal with another
+  attempt's snapshot of a different signal.
 - Compaction publishes its outputs beside its inputs. A snapshot resolved
   before the record is listed holds the inputs alone or, transiently, both
   sets, which query-time dedup collapses for metrics; a snapshot resolved

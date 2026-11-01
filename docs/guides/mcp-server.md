@@ -195,7 +195,9 @@ The snapshot that this call read:
 
 - `snapshot_id`
 - `ingest_watermark_hour`
-- `min_commit_tokens_applied`: the commit tokens that the call honored
+- `min_commit_tokens_applied`: the commit tokens that the call honored, each
+  in the wire form the caller sent; on a SQL call a token qualified by table
+  is echoed as `<table>:<token>`
 - `pinned`: whether the snapshot of this call stays held for a later paged
   call
 
