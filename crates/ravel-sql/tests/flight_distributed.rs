@@ -410,6 +410,13 @@ impl FlightAuth for FixedAuth {
     ) -> Result<Vec<ravel_sql::MinCommitToken>, Status> {
         Ok(Vec::new())
     }
+
+    fn audit_subject(
+        &self,
+        _metadata: &MetadataMap,
+    ) -> Result<Option<ravel_sql::flight::AuditSubject>, Status> {
+        Ok(None)
+    }
 }
 
 /// Build a Flight SQL service whose fetcher reads `store` by object key. The
@@ -3787,6 +3794,14 @@ impl FlightAuth for CountingAuth {
     ) -> Result<Vec<ravel_sql::MinCommitToken>, Status> {
         Ok(Vec::new())
     }
+
+    fn audit_subject(
+        &self,
+        _metadata: &MetadataMap,
+    ) -> Result<Option<ravel_sql::flight::AuditSubject>, Status> {
+        self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+        Ok(None)
+    }
 }
 
 /// Records the tenant every cost fold is attributed to. The slice fragment
@@ -4034,7 +4049,7 @@ async fn worker_do_get_carries_no_authorization_and_resolves_ticket_tenant() {
         assert_eq!(
             auth.calls(),
             0,
-            "{role:?}: FlightAuth::tenant is never called"
+            "{role:?}: neither FlightAuth::tenant nor FlightAuth::audit_subject is called"
         );
 
         // The slice executed under the ticket's tenant: its cost is folded

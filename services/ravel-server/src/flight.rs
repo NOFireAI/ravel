@@ -26,6 +26,7 @@ use std::sync::Arc;
 use arrow_flight::flight_service_server::FlightServiceServer;
 use ravel_ingest::Clock;
 use ravel_query::http::TenantResolver;
+use ravel_sql::flight::AuditSubject;
 use ravel_sql::{
     DistributedFlightConfig, FlightAuth, FlightClock, FlightListenerRole, FlightSqlConfig,
     MinCommitToken, RavelFlightSqlService, SliceRejectCounters, SqlTicketKeys,
@@ -58,6 +59,15 @@ impl FlightAuth for ResolverFlightAuth {
 
     fn min_commit_tokens(&self, metadata: &MetadataMap) -> Result<Vec<MinCommitToken>, Status> {
         flight_auth::min_commit_tokens(metadata)
+    }
+
+    fn audit_subject(&self, metadata: &MetadataMap) -> Result<Option<AuditSubject>, Status> {
+        let headers = crate::otlp_grpc::metadata_to_headers(metadata);
+        let principal = self
+            .tenant_resolver
+            .resolve_principal(&headers)
+            .map_err(|_| Status::unauthenticated("invalid or missing tenant credentials"))?;
+        Ok(ravel_query::http::audit_subject(&principal))
     }
 }
 

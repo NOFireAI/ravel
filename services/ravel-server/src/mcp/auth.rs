@@ -25,16 +25,18 @@
 //!    revision defines no such headers, so requiring them there would refuse
 //!    every conforming legacy client.
 //!
-//! The resolved tenant leaves here in the request extensions as
-//! [`AuthenticatedTenant`], which is the only way the handler can obtain one:
-//! it holds no resolver of its own, so a tool call whose request skipped this
-//! module has no tenant to run as and fails closed.
+//! The resolved principal leaves here in the request extensions as
+//! [`AuthenticatedTenant`], which is the only way the handler can obtain a
+//! tenant: it holds no resolver of its own, so a tool call whose request
+//! skipped this module has no tenant to run as and fails closed. The
+//! principal's subject, when it has one, goes on the audit record of every
+//! tool call the request makes (ADR-3541) and nowhere else.
 
 use axum::body::{Body, Bytes};
 use axum::http::header::ORIGIN;
 use axum::http::{HeaderMap, HeaderName, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
-use ravel_types::TenantHash;
+use ravel_tenant_resolve::Principal;
 use rmcp::model::ProtocolVersion;
 use serde_json::Value;
 
@@ -53,13 +55,14 @@ const MCP_NAME: HeaderName = HeaderName::from_static("mcp-name");
 pub(crate) static SUPPORTED_REVISIONS: [ProtocolVersion; 2] =
     [ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25];
 
-/// The tenant this request's credential resolved to, carried in the request
-/// extensions from this module to the tool handler.
+/// The principal this request's credential resolved to, carried in the
+/// request extensions from this module to the tool handler: its tenant scopes
+/// every tool call and its subject is written to their audit records.
 ///
-/// A newtype rather than a bare [`TenantHash`] so that nothing else in the
+/// A newtype rather than a bare [`Principal`] so that nothing else in the
 /// extensions can be mistaken for an authentication result.
-#[derive(Debug, Clone, Copy)]
-pub struct AuthenticatedTenant(pub TenantHash);
+#[derive(Debug, Clone)]
+pub struct AuthenticatedTenant(pub Principal);
 
 /// The per-deployment inputs to the checks above.
 #[derive(Debug, Clone)]
@@ -81,13 +84,15 @@ pub(crate) async fn check(
     let (mut parts, body) = request.into_parts();
 
     check_origin(auth, &parts.headers).map_err(IntoResponse::into_response)?;
-    let tenant = service.authenticate(&parts.headers).map_err(refuse)?;
+    let principal = service
+        .authenticate_principal(&parts.headers)
+        .map_err(refuse)?;
     let bytes = read_body(auth, body)
         .await
         .map_err(IntoResponse::into_response)?;
     check_standard_headers(&parts.headers, &bytes).map_err(IntoResponse::into_response)?;
 
-    parts.extensions.insert(AuthenticatedTenant(tenant));
+    parts.extensions.insert(AuthenticatedTenant(principal));
     Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 

@@ -27,6 +27,7 @@ use axum::routing::post;
 use rand::TryRng;
 use rand::rngs::SysRng;
 use ravel_ingest::Clock;
+use ravel_maintain::AuditSubject;
 use ravel_mcp::budget::{McpBudgetConfig, McpEffectiveBudgets, McpRequestBudgets};
 use ravel_mcp::catalog::{agents_tool_catalog, tool_catalog};
 use ravel_mcp::compact;
@@ -229,7 +230,7 @@ impl ServerHandler for RavelMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        let tenant_hash = tenant(&context)?;
+        let (tenant_hash, subject) = tenant(&context)?;
         let args = Value::Object(request.arguments.unwrap_or_default());
         let budgets = match requested_budgets(&args) {
             Ok(requested) => requested.clamp(&self.engine_config, &self.budget_config),
@@ -257,7 +258,9 @@ impl ServerHandler for RavelMcp {
             .meta
             .get_progress_token()
             .map(|token| ProgressReporter::new(context.peer.clone(), token));
-        let backend = ServiceBackend::new(self.service.clone(), budgets).with_progress(progress);
+        let backend =
+            ServiceBackend::new(self.service.clone().with_audit_subject(subject), budgets)
+                .with_progress(progress);
 
         let agents = match &self.agents {
             Some(router) if AGENTS_TOOLS.contains(&request.name.as_ref()) => {
@@ -421,18 +424,26 @@ fn percent_encode(value: &str, out: &mut String) {
     }
 }
 
-/// The tenant [`super::auth`] resolved, from the HTTP parts rmcp carries into
-/// the request extensions.
+/// The tenant [`super::auth`] resolved, and the subject its tool calls'
+/// audit records carry, from the HTTP parts rmcp carries into the request
+/// extensions.
 ///
 /// Absent means the request did not pass through the checks, which cannot
 /// happen on this route. It is an internal error rather than a fallback to an
 /// anonymous tenant: guessing one would serve another tenant's data.
-fn tenant(context: &RequestContext<RoleServer>) -> Result<TenantHash, McpError> {
+fn tenant(
+    context: &RequestContext<RoleServer>,
+) -> Result<(TenantHash, Option<AuditSubject>), McpError> {
     context
         .extensions
         .get::<axum::http::request::Parts>()
         .and_then(|parts| parts.extensions.get::<AuthenticatedTenant>())
-        .map(|tenant| tenant.0)
+        .map(|AuthenticatedTenant(principal)| {
+            (
+                principal.tenant.hash(),
+                ravel_query::http::audit_subject(principal),
+            )
+        })
         .ok_or_else(|| {
             McpError::internal_error("the request carries no authenticated tenant", None)
         })

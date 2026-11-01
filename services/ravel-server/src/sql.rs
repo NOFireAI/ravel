@@ -264,6 +264,7 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceEr
     };
     let execution = state
         .service()
+        .with_audit_subject(ravel_query::http::audit_subject(&principal))
         .sql_execute_timed_with(tenant_hash, capabilities, &request)
         .await?;
     respond(&headers, execution, tenant_hash)
@@ -452,6 +453,7 @@ async fn run_ddl(
     kind: ravel_sql::DdlKind,
 ) -> Result<Response, ServiceError> {
     let tenant_hash = principal.tenant.hash();
+    let subject = ravel_query::http::audit_subject(principal);
     let now_ns = state.clock.now_ns();
     let service = state.service();
     let controls = service.controls();
@@ -475,6 +477,7 @@ async fn run_ddl(
                 "sql",
                 (now_ns, now_ns),
                 QueryStatus::Error,
+                subject.as_ref(),
             )
             .await?;
         return Err(ServiceError::forbidden(
@@ -493,6 +496,7 @@ async fn run_ddl(
             "sql",
             (now_ns, now_ns),
             QueryStatus::Attempted,
+            subject.as_ref(),
         )
         .await
     {
@@ -506,6 +510,7 @@ async fn run_ddl(
     let executor = Arc::clone(&state.executor);
     let clock = Arc::clone(&state.clock);
     let task_controls = controls.clone();
+    let task_subject = subject.clone();
     let accounting = Arc::clone(&state.query_accounting);
     let sql = body.query.clone();
     let tenant_str = principal.tenant.as_str().to_string();
@@ -551,6 +556,7 @@ async fn run_ddl(
                 "sql",
                 (outcome_now_ns, outcome_now_ns),
                 status,
+                task_subject.as_ref(),
             )
             .await;
         (ddl_result, audit_result)
@@ -571,6 +577,7 @@ async fn run_ddl(
                     "sql",
                     (failed_now_ns, failed_now_ns),
                     QueryStatus::Error,
+                    subject.as_ref(),
                 )
                 .await;
             return Err(ServiceError::new(

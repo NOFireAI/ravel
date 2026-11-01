@@ -713,6 +713,7 @@ impl FlightSqlService for RavelFlightSqlService {
         // or first-batch error surfaced by `statement_stream` as a redacted
         // `Status`) is that query's final outcome, so it is audited Error and
         // awaited here, synchronously, before the error is returned.
+        let subject = self.auth.audit_subject(request.metadata())?;
         let now_ns = self.clock.now_ns();
         let query_text = decoded.statement.clone();
 
@@ -819,6 +820,7 @@ impl FlightSqlService for RavelFlightSqlService {
                 stream,
                 Arc::clone(&self.audit_sink),
                 tenant,
+                subject,
                 now_ns,
                 query_text,
             ))),
@@ -834,6 +836,7 @@ impl FlightSqlService for RavelFlightSqlService {
                     &query_text,
                     "sql",
                     QueryStatus::Error,
+                    subject.as_ref(),
                     0,
                     0,
                 );

@@ -128,8 +128,9 @@ pub use publish::{
     publish_record_with_conservation,
 };
 pub use query_audit::{
-    AuditTextPolicy, QUERY_AUDIT_SHARD, QueryStatus, QueryTextRedactor, RedactingAuditSink,
-    query_audit_event, write_query_audit,
+    ATTR_PRINCIPAL_SUBJECT, ATTR_PRINCIPAL_SUBJECT_SOURCE, AuditSubject, AuditTextPolicy,
+    QUERY_AUDIT_SHARD, QueryStatus, QueryTextRedactor, RedactingAuditSink, query_audit_event,
+    write_query_audit,
 };
 pub use ravel_fleet::worker_set::{WorkerSet, owner, owns, run_bounded, unit_key};
 pub use reachability::MarkerStats;

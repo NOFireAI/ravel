@@ -480,6 +480,152 @@ async fn promql_query_writes_one_query_audit_record() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
+/// A SQL and a PromQL instant query each write an audit record naming the
+/// subject the caller's configured token carries, with its source; a token
+/// with no subject leaves both attributes off. The subject comes from the
+/// resolved principal only: a client-supplied `x-ravel-subject` or
+/// `x-ravel-client-cert-cn` header changes nothing, the tenant attribution is
+/// unchanged, and no response body names the subject.
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn sql_and_promql_query_audit_records_name_the_callers_configured_subject() {
+    const LABELLED: &str = "acme-labelled-token";
+    const PLAIN: &str = "acme-plain-token";
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
+
+    let tenant = TenantId::new(TENANT);
+    let mut labelled = ravel_tenant_resolve::Principal::tenant_only(tenant.clone());
+    labelled.subject = Some(
+        ravel_tenant_resolve::Subject::new(
+            ravel_tenant_resolve::SubjectSource::StaticToken,
+            "alice",
+        )
+        .expect("a valid subject"),
+    );
+    let principals = HashMap::from([
+        (LABELLED.to_string(), labelled),
+        (
+            PLAIN.to_string(),
+            ravel_tenant_resolve::Principal::tenant_only(tenant.clone()),
+        ),
+    ]);
+    let mut config = server_config(
+        HashMap::new(),
+        Mode::All,
+        required(),
+        vec![tenant.hash()],
+        Default::default(),
+    );
+    config.tenant_resolver =
+        Arc::new(ravel_tenant_resolve::StaticBearerTokenResolver::with_principals(principals));
+    let running = ravel_server::start(
+        config,
+        store.clone(),
+        store.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts");
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let mut bodies = Vec::new();
+    for (token, sql, promql) in [
+        (LABELLED, "SELECT ts, value FROM samples ORDER BY ts", "m"),
+        (PLAIN, "SELECT value FROM samples ORDER BY ts", "m + 0"),
+    ] {
+        let spoof = |request: reqwest::RequestBuilder| {
+            let request = request.header("authorization", format!("Bearer {token}"));
+            if token == LABELLED {
+                request
+                    .header("x-ravel-subject", "mallory")
+                    .header("x-ravel-client-cert-cn", "mallory")
+            } else {
+                request
+            }
+        };
+        let response = spoof(client.post(format!("{base}/api/v1/sql")))
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "query": sql,
+                    "start": 0.0,
+                    "end": NOW_NS as f64 / 1_000_000_000.0,
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("sql request sent");
+        assert_eq!(response.status(), 200, "{token}: the sql query succeeds");
+        bodies.push(response.text().await.expect("sql body"));
+
+        let response = spoof(client.get(format!("{base}/api/v1/query")))
+            .query(&[("query", promql.to_string()), ("time", NOW_S.to_string())])
+            .send()
+            .await
+            .expect("query request sent");
+        assert_eq!(response.status(), 200, "{token}: the promql query succeeds");
+        bodies.push(response.text().await.expect("promql body"));
+    }
+    for body in &bodies {
+        assert!(
+            !body.contains("alice"),
+            "a response names the subject: {body}"
+        );
+    }
+
+    let records = query_audit_records(store.as_ref(), &tenant).await;
+    assert_eq!(records.len(), 4, "two queries per token, one record each");
+    let by_text = |text: &str| {
+        records
+            .iter()
+            .find(|row| attr(row, "query.text") == Some(text))
+            .unwrap_or_else(|| panic!("no audit record for {text:?}"))
+    };
+    for text in ["SELECT ts, value FROM samples ORDER BY ts", "m"] {
+        let row = by_text(text);
+        assert_eq!(
+            attr(row, ravel_maintain::ATTR_PRINCIPAL_SUBJECT),
+            Some("alice"),
+            "{text}"
+        );
+        assert_eq!(
+            attr(row, ravel_maintain::ATTR_PRINCIPAL_SUBJECT_SOURCE),
+            Some("static_token"),
+            "{text}"
+        );
+    }
+    for text in ["SELECT value FROM samples ORDER BY ts", "m + 0"] {
+        let row = by_text(text);
+        for key in [
+            ravel_maintain::ATTR_PRINCIPAL_SUBJECT,
+            ravel_maintain::ATTR_PRINCIPAL_SUBJECT_SOURCE,
+        ] {
+            assert!(
+                !row.attrs.iter().any(|(k, _)| k == key),
+                "{text}: a token without a subject leaves {key} off"
+            );
+        }
+    }
+    for row in &records {
+        assert_eq!(
+            attr(row, "query.tenant"),
+            Some(tenant.hash().to_hex().as_str())
+        );
+        for (key, value) in &row.attrs {
+            assert!(
+                !matches!(value, AttrValue::Str(s) if s.contains("mallory")),
+                "a client header reached the record under {key}"
+            );
+        }
+    }
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
 /// `audit_mode=required`: faulting every PUT into the audit
 /// keyspace fails the query closed with 503, after usage was already
 /// recorded (T2a order) -- the query does not outlive its trail.
