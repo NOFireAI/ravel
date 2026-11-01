@@ -61,8 +61,10 @@ async fn run(reserve_ahead: AggregateReserveAhead) -> SqlOutcome {
     let tenant = tenant_id("acme");
     let specs = one_sample_per_group();
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let mut config = SqlConfig::default();
-    config.aggregate_reserve_ahead = reserve_ahead;
+    let mut config = SqlConfig {
+        aggregate_reserve_ahead: reserve_ahead,
+        ..Default::default()
+    };
     // Pinned to one SQL partition: the asked gauge is a live, concurrency-
     // sensitive high-water mark (it rises and falls with every grow and
     // shrink, not just with the plan's shape), so a multi-partition plan's
