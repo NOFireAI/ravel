@@ -1835,3 +1835,661 @@ async fn sql_explain_clamps_the_deadline_and_budgets() {
         .await
         .expect("a statement over an empty store");
 }
+
+#[cfg(feature = "sql")]
+mod describe_data {
+    use bytes::Bytes;
+    use ravel_catalog::{MetricKind, MetricMetadataEntry, write_metrics_meta};
+    use ravel_object_store::{
+        Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, PageToken,
+        PutOptions, PutOutcome, StoreError,
+    };
+    use ravel_query::http::{MetadataCache, MetadataCacheConfig};
+    use ravel_sql::{DeclaredColumn, DeclaredType, KeyIndexDeclaration, StaticDeclaredColumns};
+    use ravel_types::Signal;
+
+    use super::*;
+    use crate::service::describe::{
+        DescribeColumn, DescribeDataRequest, DescribeSignal, DescribeState, EventTimeCoverage,
+        FAMILIES_METRICS_ONLY, IndexedKeys, IndexedKeysSource, MAX_FAMILIES_PER_PAGE,
+    };
+
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+    const NOW_HOUR: u32 = (NOW_NS / NS_PER_HOUR) as u32;
+
+    /// A memory store that counts catalog resolves: every resolve issues
+    /// exactly one pending-erasure listing, and nothing else lists `/del/`.
+    struct ResolveCountingStore {
+        inner: MemoryStore,
+        resolves: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for ResolveCountingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            if prefix.contains("/del/") {
+                self.resolves.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            // multipart: false to match the refusing default `put_multipart`
+            // this double inherits.
+            Capabilities {
+                multipart: false,
+                ..self.inner.capabilities()
+            }
+        }
+    }
+
+    /// A service with only the describe surface attached, over one counting
+    /// store, with every shared piece readable afterwards.
+    struct DescribeHarness {
+        service: QueryService,
+        store: Arc<dyn ObjectStoreBackend>,
+        catalog: Arc<Catalog>,
+        metadata_cache: Arc<MetadataCache>,
+        admission: Arc<QueryAdmissionController>,
+        usage: Arc<RecordingUsage>,
+        cost: Arc<RecordingCost>,
+        resolves: Arc<AtomicU64>,
+        tenant_hash: TenantHash,
+    }
+
+    fn describe_harness(
+        limit: QueryConcurrencyLimit,
+        declared_columns: StaticDeclaredColumns,
+    ) -> DescribeHarness {
+        let resolves = Arc::new(AtomicU64::new(0));
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(ResolveCountingStore {
+            inner: MemoryStore::new(),
+            resolves: Arc::clone(&resolves),
+        });
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let metadata_cache = Arc::new(MetadataCache::new(
+            Arc::clone(&store),
+            MetadataCacheConfig::default(),
+            Arc::new(ravel_cache::SystemClock),
+        ));
+
+        let mut tokens = HashMap::new();
+        tokens.insert(TOKEN.to_string(), tenant());
+        let admission = QueryAdmissionController::shared(limit);
+        let usage = Arc::new(RecordingUsage::default());
+        let cost = Arc::new(RecordingCost::default());
+        let service = QueryService::new(
+            Arc::new(StaticBearerTokenResolver::new(tokens)),
+            Arc::new(FixedClock),
+            Arc::clone(&admission),
+            Arc::clone(&cost) as Arc<dyn QueryCostRecorder>,
+            Arc::clone(&usage) as Arc<dyn QueryUsageSink>,
+            Arc::new(NoopQueryAuditSink),
+        )
+        .with_describe(DescribeState {
+            catalog: Arc::clone(&catalog),
+            metadata_cache: Arc::clone(&metadata_cache),
+            declared_columns: Arc::new(declared_columns),
+            max_deadline: Duration::from_secs(30),
+        });
+
+        DescribeHarness {
+            service,
+            store,
+            catalog,
+            metadata_cache,
+            admission,
+            usage,
+            cost,
+            resolves,
+            tenant_hash: tenant().hash(),
+        }
+    }
+
+    fn request(signal: &str) -> DescribeDataRequest {
+        DescribeDataRequest {
+            signal: signal.to_string(),
+            offset: 0,
+            limit: None,
+            now_ns: NOW_NS,
+            deadline: Duration::from_secs(30),
+        }
+    }
+
+    fn family(name: String) -> MetricMetadataEntry {
+        MetricMetadataEntry {
+            family_name: name,
+            kind: MetricKind::Gauge,
+            help: String::new(),
+            unit: String::new(),
+            updated_unix_ns: NOW_NS,
+        }
+    }
+
+    /// Publish one metrics segment for the harness tenant: one series with a
+    /// sample at each of `event_ts_ns`, flushed in ingest hour `ingest_hour`.
+    async fn publish_metrics_segment(
+        store: &dyn ObjectStoreBackend,
+        writer: u128,
+        event_ts_ns: &[i64],
+        ingest_hour: u32,
+    ) {
+        use ravel_commit::publish::RetryPolicy;
+        use ravel_commit::record::NewCommitRecord;
+        use ravel_commit::{keys, publish, record};
+        use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+        use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal};
+
+        let tenant = tenant();
+        let tenant_hash = tenant.hash();
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "up".to_string(),
+        }])
+        .expect("valid labels");
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(&tenant, "up", &labels).expect("series id"),
+            labels,
+            samples: event_ts_ns
+                .iter()
+                .map(|&ts_ns| Sample { ts_ns, value: 1.0 })
+                .collect(),
+        }];
+
+        let ingest_ts_ns = i64::from(ingest_hour) * NS_PER_HOUR;
+        let writer_id = uuid::Uuid::from_u128(writer);
+        let written = SegmentWriter::write(
+            series,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: ingest_ts_ns,
+                max_ingest_ts_ns: ingest_ts_ns,
+            },
+        )
+        .expect("write segment");
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: ingest_ts_ns,
+            max_ingest_ts_ns: ingest_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: ingest_ts_ns,
+            ingest_hour_bucket: ingest_hour,
+        })
+        .expect("valid commit record");
+
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// Two pages over 150 families written in reverse order: the first page is
+    /// exactly the 100 smallest names in byte order, the second the remaining
+    /// 50, and both report the record's total rather than their own length. A
+    /// limit above the cap is lowered to it. FLIP: report `page.len()` as
+    /// `families_total` and the second page's total reads 50, not 150. FLIP:
+    /// collect the record through a `HashMap` instead of sorting it and the
+    /// first page's names come back out of order.
+    #[tokio::test]
+    async fn family_pages_are_sorted_and_carry_the_record_total() {
+        let h = describe_harness(
+            QueryConcurrencyLimit::Unlimited,
+            StaticDeclaredColumns::empty(),
+        );
+        let entries: Vec<_> = (0..150)
+            .rev()
+            .map(|i| family(format!("family_{i:03}")))
+            .collect();
+        write_metrics_meta(h.store.as_ref(), &h.tenant_hash, &entries, None)
+            .await
+            .expect("write metrics_meta");
+        let names = |range: std::ops::Range<usize>| -> Vec<String> {
+            range.map(|i| format!("family_{i:03}")).collect()
+        };
+
+        let first = h
+            .service
+            .describe_data(h.tenant_hash, &request("metrics"))
+            .await
+            .expect("first page");
+        assert_eq!(
+            first.families.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
+            names(0..100)
+        );
+        assert_eq!(first.families_total, 150);
+        assert_eq!(first.families_absent_reason, None);
+
+        let second = h
+            .service
+            .describe_data(
+                h.tenant_hash,
+                &DescribeDataRequest {
+                    offset: 100,
+                    ..request("metrics")
+                },
+            )
+            .await
+            .expect("second page");
+        assert_eq!(
+            second.families.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
+            names(100..150)
+        );
+        assert_eq!(second.families_total, 150);
+
+        let capped = h
+            .service
+            .describe_data(
+                h.tenant_hash,
+                &DescribeDataRequest {
+                    limit: Some(500),
+                    ..request("metrics")
+                },
+            )
+            .await
+            .expect("an over-cap limit");
+        assert_eq!(capped.families.len(), MAX_FAMILIES_PER_PAGE);
+        assert_eq!(capped.families_total, 150);
+
+        let logs = h
+            .service
+            .describe_data(h.tenant_hash, &request("logs"))
+            .await
+            .expect("logs");
+        assert!(logs.families.is_empty());
+        assert_eq!(logs.families_total, 0);
+        assert_eq!(logs.families_absent_reason, Some(FAMILIES_METRICS_ONLY));
+    }
+
+    /// A logs tenant's declared columns are exactly its declarations, in the
+    /// SQL table's types, and its indexed keys are its KEY_IDX declaration;
+    /// without declarations both are empty. FLIP: return the empty list for
+    /// `declared_columns` and the first `assert_eq!` fails. FLIP: drop the
+    /// `trace_id` push in `tenant_key_index` and the indexed keys lose
+    /// `trace_id`.
+    #[tokio::test]
+    async fn logs_declared_columns_and_indexed_keys_are_the_tenant_declarations() {
+        let declared = StaticDeclaredColumns::new(vec![
+            DeclaredColumn {
+                key: "service.version".to_string(),
+                ty: DeclaredType::Str,
+            },
+            DeclaredColumn {
+                key: "http.status".to_string(),
+                ty: DeclaredType::I64,
+            },
+        ])
+        .with_key_index(KeyIndexDeclaration {
+            columns: vec!["http.status".to_string()],
+            trace_id: true,
+        });
+        let h = describe_harness(QueryConcurrencyLimit::Unlimited, declared);
+        let logs = h
+            .service
+            .describe_data(h.tenant_hash, &request("logs"))
+            .await
+            .expect("logs");
+        assert_eq!(
+            logs.declared_columns,
+            vec![
+                DescribeColumn {
+                    name: "service.version".to_string(),
+                    data_type: "Dictionary(Int32, Utf8)".to_string(),
+                    nullable: true,
+                },
+                DescribeColumn {
+                    name: "http.status".to_string(),
+                    data_type: "Int64".to_string(),
+                    nullable: true,
+                },
+            ]
+        );
+        assert_eq!(
+            logs.indexed_keys,
+            IndexedKeys {
+                keys: vec!["http.status".to_string(), "trace_id".to_string()],
+                source: IndexedKeysSource::TenantKeyIndex,
+            }
+        );
+        assert_eq!(logs.table, "logs");
+        assert_eq!(
+            logs.fixed_columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ravel_sql::logs_schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>()
+        );
+        // The declared columns are listed apart from the fixed ones, never in
+        // both.
+        assert!(
+            logs.fixed_columns
+                .iter()
+                .all(|c| c.name != "service.version" && c.name != "http.status")
+        );
+
+        // The metrics signal carries no declared columns whatever the tenant
+        // declared for logs.
+        let metrics = h
+            .service
+            .describe_data(h.tenant_hash, &request("metrics"))
+            .await
+            .expect("metrics");
+        assert!(metrics.declared_columns.is_empty());
+        assert_eq!(metrics.indexed_keys.source, IndexedKeysSource::None);
+
+        let bare = describe_harness(
+            QueryConcurrencyLimit::Unlimited,
+            StaticDeclaredColumns::empty(),
+        );
+        let logs = bare
+            .service
+            .describe_data(bare.tenant_hash, &request("logs"))
+            .await
+            .expect("logs without declarations");
+        assert!(logs.declared_columns.is_empty());
+        assert_eq!(
+            logs.indexed_keys,
+            IndexedKeys {
+                keys: Vec::new(),
+                source: IndexedKeysSource::TenantKeyIndex,
+            }
+        );
+    }
+
+    /// The ingest watermark is the greatest ingest hour over every resolved
+    /// segment, folded or not, and the coverage and row count span all of
+    /// them; the newest segment's events are backfilled, so neither the
+    /// newest event nor the fold watermark gives the same hour. An empty
+    /// resolve has no watermark. FLIP: return
+    /// `catalog.head_watermark_hour(..)` as the watermark and the first
+    /// `assert_eq!` reads the sealed hour, not `NOW_HOUR`. FLIP: take the
+    /// watermark from the first segment instead of the max and it reads
+    /// `NOW_HOUR - 30`.
+    #[tokio::test]
+    async fn the_watermark_is_the_newest_ingest_hour_not_the_fold_watermark() {
+        let h = describe_harness(
+            QueryConcurrencyLimit::Unlimited,
+            StaticDeclaredColumns::empty(),
+        );
+
+        let empty = h
+            .service
+            .describe_data(h.tenant_hash, &request("metrics"))
+            .await
+            .expect("an empty tenant");
+        assert_eq!(empty.ingest_watermark_hour, None);
+        assert_eq!(empty.coverage, None);
+        assert_eq!(empty.segments, 0);
+        assert_eq!(empty.committed_rows, 0);
+
+        let hour_ns = |hour: u32| i64::from(hour) * NS_PER_HOUR;
+        let oldest_event = hour_ns(NOW_HOUR - 50);
+        let newest_event = hour_ns(NOW_HOUR - 20) + 5;
+        publish_metrics_segment(
+            h.store.as_ref(),
+            10,
+            &[hour_ns(NOW_HOUR - 30), hour_ns(NOW_HOUR - 30) + 1],
+            NOW_HOUR - 30,
+        )
+        .await;
+        publish_metrics_segment(h.store.as_ref(), 11, &[newest_event], NOW_HOUR - 20).await;
+        publish_metrics_segment(
+            h.store.as_ref(),
+            12,
+            &[oldest_event, oldest_event + 1, oldest_event + 2],
+            NOW_HOUR,
+        )
+        .await;
+
+        h.catalog
+            .fold(
+                &h.tenant_hash,
+                Signal::Metrics,
+                uuid::Uuid::from_u128(99),
+                NOW_NS,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        let fold_watermark = h
+            .catalog
+            .head_watermark_hour(&h.tenant_hash, Signal::Metrics)
+            .await
+            .expect("head watermark")
+            .expect("the fold sealed the older hours");
+        assert!(fold_watermark >= NOW_HOUR - 20 && fold_watermark < NOW_HOUR);
+
+        let data = h
+            .service
+            .describe_data(h.tenant_hash, &request("metrics"))
+            .await
+            .expect("describe");
+        assert_eq!(data.ingest_watermark_hour, Some(NOW_HOUR));
+        assert_ne!(data.ingest_watermark_hour, Some(fold_watermark));
+        assert_eq!(
+            data.coverage,
+            Some(EventTimeCoverage {
+                min_event_ts_ns: oldest_event,
+                max_event_ts_ns: newest_event,
+            })
+        );
+        assert_eq!(data.segments, 3);
+        assert_eq!(data.committed_rows, 6);
+        assert_eq!(data.resolved_at_ns, NOW_NS);
+    }
+
+    /// One call is one admission permit and one catalog resolve: it is refused
+    /// with no resolve while the only permit is held, and with the permit free
+    /// it resolves exactly once under a one-permit ceiling. Its spend is one
+    /// usage record and one cost record, both the figure it returns. FLIP:
+    /// delete the `admit()` call and the held-permit call succeeds. FLIP:
+    /// admit a second permit around the resolve and the free-permit call is
+    /// refused. FLIP: resolve twice and `resolves` reads 2.
+    #[tokio::test]
+    async fn one_call_takes_one_permit_and_one_resolve() {
+        let h = describe_harness(
+            QueryConcurrencyLimit::Bounded(1),
+            StaticDeclaredColumns::empty(),
+        );
+        publish_metrics_segment(h.store.as_ref(), 10, &[NOW_NS - 1], NOW_HOUR).await;
+
+        let held = h.admission.try_admit().expect("the only permit");
+        let err = err_of(
+            h.service
+                .describe_data(h.tenant_hash, &request("metrics"))
+                .await,
+        );
+        assert_eq!(err.kind, ServiceErrorKind::Unavailable);
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(h.resolves.load(Ordering::SeqCst), 0);
+        assert!(h.usage.records().is_empty());
+        drop(held);
+
+        let data = h
+            .service
+            .describe_data(h.tenant_hash, &request("metrics"))
+            .await
+            .expect("the released permit admits the call");
+        assert_eq!(h.resolves.load(Ordering::SeqCst), 1);
+        assert_eq!(data.segments, 1);
+
+        let usage = h.usage.records();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].0, h.tenant_hash);
+        assert_eq!(usage[0].1, UsageStatus::Success);
+        assert_eq!(usage[0].2, data.accounting);
+        assert_eq!(h.cost.records(), vec![(h.tenant_hash, data.accounting)]);
+        // The spend is the one resolve's, and nothing else is charged.
+        assert_eq!(
+            data.accounting.total_s3_requests(),
+            SPEND_PER_RESOLVE_WITH_ONE_SEGMENT
+        );
+    }
+
+    /// A signal outside the three is a typed 400, decided before the permit:
+    /// it is refused as an argument even while the ceiling is full, and it
+    /// costs no resolve and no usage record. FLIP: fall back to `Metrics` for
+    /// an unknown name and the first call succeeds. FLIP: parse after
+    /// `admit()` and the first call reads `Unavailable`.
+    #[tokio::test]
+    async fn an_unknown_signal_is_a_typed_error() {
+        let h = describe_harness(
+            QueryConcurrencyLimit::Bounded(1),
+            StaticDeclaredColumns::empty(),
+        );
+        let held = h.admission.try_admit().expect("the only permit");
+        for signal in ["profiles", "", "Metrics", "spans"] {
+            let err = err_of(
+                h.service
+                    .describe_data(h.tenant_hash, &request(signal))
+                    .await,
+            );
+            assert_eq!(err.kind, ServiceErrorKind::InvalidArgument, "{signal:?}");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{signal:?}");
+        }
+        drop(held);
+        assert_eq!(h.resolves.load(Ordering::SeqCst), 0);
+        assert!(h.usage.records().is_empty());
+
+        for (name, signal, table) in [
+            ("metrics", DescribeSignal::Metrics, "samples"),
+            ("logs", DescribeSignal::Logs, "logs"),
+            ("traces", DescribeSignal::Traces, "spans"),
+        ] {
+            let data = h
+                .service
+                .describe_data(h.tenant_hash, &request(name))
+                .await
+                .expect(name);
+            assert_eq!(data.signal, signal);
+            assert_eq!(data.table, table);
+        }
+    }
+
+    /// A service built without the describe state refuses the call as a
+    /// surface this instance does not serve, before any permit or read.
+    /// FLIP: `expect` the state instead of refusing and the call panics.
+    #[tokio::test]
+    async fn a_service_without_describe_state_does_not_serve_it() {
+        let h = memory_harness(QueryConcurrencyLimit::Unlimited);
+        let err = err_of(
+            h.service
+                .describe_data(h.tenant_hash, &request("metrics"))
+                .await,
+        );
+        assert_eq!(err.kind, ServiceErrorKind::Unsupported);
+        assert!(h.usage.records().is_empty());
+    }
+
+    /// The families come from the metadata cache the service was handed, not
+    /// one of its own: the caller's cache records the first call's fill and
+    /// the second call's hit. FLIP: build a fresh `MetadataCache` in
+    /// `with_describe` and both counters stay at zero. The traces signal
+    /// never touches the cache.
+    #[tokio::test]
+    async fn families_are_read_through_the_shared_metadata_cache() {
+        let h = describe_harness(
+            QueryConcurrencyLimit::Unlimited,
+            StaticDeclaredColumns::empty(),
+        );
+        write_metrics_meta(
+            h.store.as_ref(),
+            &h.tenant_hash,
+            &[family("up".to_string())],
+            None,
+        )
+        .await
+        .expect("write metrics_meta");
+
+        h.service
+            .describe_data(h.tenant_hash, &request("traces"))
+            .await
+            .expect("traces");
+        assert_eq!(h.metadata_cache.counters().misses, 0);
+
+        let first = h
+            .service
+            .describe_data(h.tenant_hash, &request("metrics"))
+            .await
+            .expect("first");
+        assert_eq!(first.families_total, 1);
+        assert_eq!(h.metadata_cache.counters().misses, 1);
+        assert_eq!(h.metadata_cache.counters().hits, 0);
+
+        h.service
+            .describe_data(h.tenant_hash, &request("metrics"))
+            .await
+            .expect("second");
+        assert_eq!(h.metadata_cache.counters().misses, 1);
+        assert_eq!(h.metadata_cache.counters().hits, 1);
+
+        let traces = h
+            .service
+            .describe_data(h.tenant_hash, &request("traces"))
+            .await
+            .expect("traces");
+        assert_eq!(
+            traces.indexed_keys,
+            IndexedKeys {
+                keys: vec!["trace_id".to_string()],
+                source: IndexedKeysSource::SpanFormat,
+            }
+        );
+    }
+}
