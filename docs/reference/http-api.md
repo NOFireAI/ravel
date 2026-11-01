@@ -620,8 +620,13 @@ Before changing an effect in
 doubt the server submits one audit record with `kind` `agents_reconcile`
 to the audit pipeline, which writes it into the tenant's audit shard,
 naming the effect, attempt, decision and the caller's tenant and
-capabilities. A principal carries no subject, so two admins of one tenant
-are not told apart. Without `--audit-mode` no record is written. Only
+capabilities. The record names `agents.principal.subject` and
+`agents.principal.subject_source` when the caller's token or claim carries a
+subject (a `subject=LABEL` entry on its `--tenant-token` pair, or the claim
+`--oidc-subject-claim` names); two admins whose tokens carry none are not
+told apart. No response names the subject, and no request header sets it
+(`agents_effects_e2e::reconcile_and_destroy_records_name_each_admins_configured_subject_and_a_token_without_one_writes_no_subject_attr`).
+Without `--audit-mode` no record is written. Only
 `--audit-mode required` refuses on a failed audit write: the reconcile is
 then 503 `store_unavailable` and nothing changes
 (`agents_effects_e2e::manual_blocks_until_reconciled_and_audits_the_decision_once`).
@@ -656,9 +661,10 @@ Before the tombstone write the server submits one audit record with `kind`
 `agents_destroy` to the audit pipeline, naming the agent id, the
 incarnation and the `abandoned` counts as it read them
 (`audit::tests::the_destroy_event_names_tenant_agent_incarnation_counts_and_caller`).
-The `agents_destroy` record names the caller's tenant and capabilities. A
-principal carries no subject, so two admins of one tenant are not told
-apart, as for reconcile. The response's counts come from the HEAD the
+The `agents_destroy` record names the caller's tenant and capabilities. The
+record names `agents.principal.subject` and `agents.principal.subject_source`
+when the caller's token or claim carries a subject; two admins whose tokens
+carry none are not told apart, as for reconcile. The response's counts come from the HEAD the
 tombstone was applied to, so a write landing between the read and the
 tombstone shows in the response and not in the record. Without
 `--audit-mode` no record is written. Under `--audit-mode required` a failed

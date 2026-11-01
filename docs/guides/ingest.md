@@ -128,6 +128,24 @@ listing:
 - `--tenant-token` and `--tenant-token-file` are mutually exclusive.
   `ravel-server` refuses to start with both set.
 
+In either source the tenant may end in `;` and a comma-separated list of
+capability words (`ddl`, `ipcrypt`, `agents`, `agents_worker`,
+`agents_admin`), which may also hold one `subject=LABEL` entry naming who,
+within the tenant, holds the token:
+
+```text
+admin-token=acme;agents_admin,subject=alice
+```
+
+LABEL is 1 to 64 bytes drawn from `A-Z a-z 0-9 . _ @ + -`. A longer label, a
+byte outside that set, or a second `subject=` entry fails startup with an
+error that names the rule and the flag position or file line, never the
+token, the tenant or the label. A label is not a secret: it appears in the
+tenant's audit records, as `agents.principal.subject` with
+`agents.principal.subject_source` `static_token` on the agents reconcile and
+destroy records. A pair with no `subject=` entry parses as before, so an
+existing token file needs no change.
+
 `--dev-insecure-tenant-header` adds a second resolver, tried only if the
 bearer lookup fails. It reads the tenant name directly from an
 `x-ravel-tenant` request header, with no token. Use it only for local
