@@ -32,7 +32,7 @@ names the path and symbol, never a line number.
 | Tenant authentication: static bearer, OIDC JWT, durable `sys/auth`, mTLS proxy header | shipped | `crates/ravel-tenant-resolve/src/lib.rs::TenantResolver::resolve` |
 | SQL statement gate: one `SELECT`, no DDL, no DML, no `COPY`, no `CREATE EXTERNAL TABLE`, no `EXPLAIN`, no `SET` | shipped, structural | `crates/ravel-sql/src/validate.rs::validate`, `::reject_writes_in_query` |
 | Empty table-function registry, empty object-store registry (a Parquet session's is `SingleStoreRegistry`; see the Parquet registry amendment below), `information_schema` off | shipped | `crates/ravel-sql/src/session.rs::build_session`, `::EmptyObjectStoreRegistry` |
-| Five SQL tables, one table per statement | gated (`sql`) | `crates/ravel-sql/src/session.rs::SessionTable`, `executor.rs::SqlExecutor::target_signal` |
+| Five SQL tables; one table per statement when written, several since ADR-2904 (see the ADR-2904 amendment below) | gated (`sql`) | `crates/ravel-sql/src/session.rs::SessionTable`, `executor.rs::refuse_cross_signal` (the single-snapshot entry points that keep the one-table rule) |
 | Declared typed attribute columns, 60 s refresh horizon | shipped, CLI-declared | `services/ravel-server/src/declared_columns.rs::TenantConfigDeclaredColumns` |
 | Metric metadata (type, unit, help), one object per tenant | shipped | `crates/ravel-query/src/http/metadata_cache.rs::MetadataCache::get` |
 | Metric name postings under `__name__` equality | shipped | `crates/ravel-catalog/src/catalog.rs::resolve_fanout` |
@@ -962,3 +962,17 @@ D7 changes in two places:
 2. The writes are no longer only audit records and cost metrics: an
    accepted `ravel_agent_send` input is written by the agents store, under
    the agents store's own durability and compare-and-swap rules.
+
+## Amendment (2026-11-01, ADR-2904): a SQL statement may name several tables
+
+<!-- amendment-applies: sections="What exists" pointer="ADR-2904" -->
+
+The "What exists" table recorded the SQL surface as one table per
+statement. ADR-2904 replaces that rule: a statement on the HTTP SQL
+endpoint or over Flight SQL may name several signal tables and the
+tenant's Parquet tables, with one snapshot resolved per named signal.
+Only the entry points that read a single snapshot keep the one-table
+rule (`refuse_cross_signal` in `crates/ravel-sql/src/executor.rs`). The
+MCP adapter calls the HTTP-path executor, so `ravel_query_sql` admits a
+join; ADR-2904's #2915 amendment records that the one-table refusal
+decision 9 promised for the MCP tools is owed by whoever ships them.
