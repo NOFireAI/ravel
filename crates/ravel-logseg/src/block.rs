@@ -1833,6 +1833,31 @@ impl CachedColumn {
         }
     }
 
+    /// Whether this is a dictionary column whose entries were not validated
+    /// when it was built ([`DictValues::unvalidated`]), which
+    /// [`crate::decoded_cache::DecodedColumnCache::offer`] refuses.
+    pub(crate) fn is_unvalidated_dict(&self) -> bool {
+        matches!(self, CachedColumn::Dict(d) if !d.values.validated())
+    }
+
+    /// A per-block dictionary column over `entries`, one id per row, built
+    /// validated or not. Test constructor.
+    #[cfg(test)]
+    pub(crate) fn dict_for_test(
+        entries: &[Vec<u8>],
+        ids: &[u32],
+        validated: bool,
+    ) -> Result<Self, LogSegError> {
+        let values = if validated {
+            DictValues::from_entries(entries)?
+        } else {
+            DictValues::unvalidated(entries)?
+        };
+        let present = vec![true; ids.len()];
+        let col = DictColumn::new(Arc::new(values), &present, ids.to_vec(), false)?;
+        Ok(CachedColumn::Dict(col.parts()))
+    }
+
     /// Block rows the column covers, checked against the block's record count
     /// before a cached column is served.
     pub(crate) fn rows(&self) -> usize {
@@ -2528,6 +2553,156 @@ fn column_kind(column_id: u32, plans: &[ColumnPlan]) -> Result<ColKind, LogSegEr
             }
         }
     })
+}
+
+/// Which [`CachedColumn`] shape a [`estimate_cached_heap_bytes`] figure is
+/// for, so each shape can be held to its own error bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum EstimateKind {
+    /// I64, F64, Bool and fixed-width byte columns.
+    FixedWidth,
+    /// A plain string page.
+    Plain,
+    /// A per-block string dictionary page (tag 7).
+    BlockDict,
+    /// A row group string dictionary (tag 12 page, tag 13 ids).
+    GroupDict,
+}
+
+/// What [`CachedColumn::heap_bytes`] charges for column `column_id` of a block
+/// of `rows` rows, estimated from PAGE_DIR descriptors alone (ADR-3326,
+/// serve-if-fits amendment). `presence` is the column's presence bitmap page,
+/// `value` its value page, and `dict_page` its chunk's row group dictionary
+/// page when `value` is a tag 13 ids page.
+///
+/// - Fixed-width kinds are exact: the charge depends only on `rows`, the
+///   presence page's length, and for a fixed-width byte column the present
+///   count, which a [`Enc::FixedWidth`] page's length gives (a dictionary
+///   encoded one with a presence page is charged as if every row were
+///   present).
+/// - A plain string page is charged its length before compression for the
+///   values, which over-counts by each present cell's length varint.
+/// - A per-block dictionary page is charged its length plus the largest
+///   offset-and-validity overhead a dictionary of up to `rows / 2` entries
+///   could need beyond the bytes the page spends on lengths and ids
+///   ([`block_dict_overhead`]). A dictionary holding more distinct entries
+///   than that is charged short by under `1.5 * rows` bytes.
+/// - A row group dictionary is charged whole to each block, with an entry
+///   count bounded by the dictionary page's length and, when the block has no
+///   presence page, by the ids page's bit width. A block is charged only the
+///   share its keys reference, which no directory records, so this is an
+///   upper bound.
+///
+/// A dictionary with a non-UTF-8 entry keeps a second, text-only copy of its
+/// UTF-8 entries ([`DictValues`]), which no figure here counts.
+/// `the_decoded_set_estimate_matches_heap_bytes_per_kind` in `reader.rs` pins
+/// each kind's error.
+pub(crate) fn estimate_cached_heap_bytes(
+    column_id: u32,
+    plans: &[ColumnPlan],
+    rows: usize,
+    presence: Option<&PageDesc>,
+    value: &PageDesc,
+    dict_page: Option<&PageDesc>,
+) -> Result<(EstimateKind, u64), LogSegError> {
+    let r = rows as u64;
+    let presence_words = 8 * r.div_ceil(64);
+    Ok(match column_kind(column_id, plans)? {
+        ColKind::I64 => (
+            EstimateKind::FixedWidth,
+            (r * std::mem::size_of::<i64>() as u64)
+                .saturating_add(presence.map_or(0, |p| p.uncomp_len)),
+        ),
+        ColKind::F64 => (
+            EstimateKind::FixedWidth,
+            r * std::mem::size_of::<Option<u64>>() as u64,
+        ),
+        ColKind::Bool => (
+            EstimateKind::FixedWidth,
+            r * std::mem::size_of::<Option<bool>>() as u64,
+        ),
+        ColKind::Fixed(width) => {
+            let width = width as u64;
+            let present = match presence {
+                Some(_) if value.enc == Enc::FixedWidth && width > 0 => {
+                    value.uncomp_len / width
+                }
+                _ => r,
+            };
+            (
+                EstimateKind::FixedWidth,
+                (r * std::mem::size_of::<Option<Vec<u8>>>() as u64)
+                    .saturating_add(present.saturating_mul(width)),
+            )
+        }
+        ColKind::Str => {
+            let keys = r * std::mem::size_of::<i32>() as u64;
+            match value.enc {
+                Enc::Plain => (
+                    EstimateKind::Plain,
+                    value
+                        .uncomp_len
+                        .saturating_add(4 * (r + 1))
+                        .saturating_add(presence_words),
+                ),
+                Enc::DictIds => {
+                    let dict = dict_page.ok_or_else(|| {
+                        LogSegError::Corrupted(format!(
+                            "column {column_id} has a dictionary id page but no dictionary page"
+                        ))
+                    })?;
+                    let mut entries = dict.uncomp_len.saturating_sub(1);
+                    if presence.is_none() && r > 0 {
+                        let width = (8 * value.uncomp_len / r).min(32);
+                        entries = entries.min(1u64 << width);
+                    }
+                    (
+                        EstimateKind::GroupDict,
+                        keys.saturating_add(presence_words)
+                            .saturating_add(dict_heap_bound(dict.uncomp_len, entries)),
+                    )
+                }
+                _ => (
+                    EstimateKind::BlockDict,
+                    value
+                        .uncomp_len
+                        .saturating_add(keys)
+                        .saturating_add(presence_words)
+                        .saturating_add(block_dict_overhead(r, presence.is_none())),
+                ),
+            }
+        }
+    })
+}
+
+/// The heap of a [`DictValues`] decoded from a dictionary page of `page_len`
+/// bytes holding at most `entries` entries, all UTF-8: its entry bytes (at
+/// most the page less a count varint and one length varint per entry), `n + 1`
+/// offsets and a validity bit per entry.
+fn dict_heap_bound(page_len: u64, entries: u64) -> u64 {
+    page_len
+        .saturating_sub(1)
+        .saturating_add(3 * entries)
+        .saturating_add(4)
+        .saturating_add(8 * entries.div_ceil(64))
+}
+
+/// What a per-block dictionary over `rows` rows holds beyond its page's length
+/// and its keys, for `n = rows / 2` entries: `n + 1` offsets and a validity
+/// bit per entry, less the count varint, a length varint per entry, the width
+/// byte and the ids of at least `log2 n` bits the page spends on `present`
+/// rows (all of them without a presence page, else at least `n`). The
+/// difference grows with `n` while `log2 n` is under 22, so the figure bounds
+/// every dictionary of at most `rows / 2` entries, and falls short for a
+/// larger one by under `1.5 * rows` bytes.
+fn block_dict_overhead(rows: u64, all_present: bool) -> u64 {
+    let n = (rows / 2).max(1);
+    let log2 = u64::from(n.ilog2()).min(22);
+    let present = if all_present { rows } else { n };
+    (3 * n)
+        .saturating_sub(present * log2 / 8)
+        .saturating_add(2)
+        .saturating_add(8 * n.div_ceil(64))
 }
 
 /// The decoded bytes of a page that the column filter kept. Only ever called

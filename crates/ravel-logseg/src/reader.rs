@@ -258,6 +258,96 @@ impl SegmentDirectories {
     pub fn decoded_bytes(&self) -> u64 {
         self.decoded_bytes
     }
+
+    /// The bytes the decoded-column cache would charge to hold every column
+    /// `columns` projects over whole-object blocks `blocks`, estimated from
+    /// PAGE_DIR page lengths before compression and SKIP_IDX row counts
+    /// without reading a page (ADR-3326, serve-if-fits amendment). The SQL
+    /// logs scan's plan pass sums it over the blocks it keeps and compares the
+    /// sum with 0.95 of the cap. Per-kind error:
+    /// [`estimate_cached_heap_bytes`](crate::block::estimate_cached_heap_bytes).
+    pub fn decoded_set_estimate(
+        &self,
+        columns: &ColumnSelection,
+        blocks: &[usize],
+    ) -> Result<u64, LogSegError> {
+        Ok(self
+            .decoded_set_estimates(columns, blocks)?
+            .iter()
+            .fold(0u64, |sum, e| sum.saturating_add(e.bytes)))
+    }
+
+    /// [`Self::decoded_set_estimate`] per (block, column).
+    pub(crate) fn decoded_set_estimates(
+        &self,
+        columns: &ColumnSelection,
+        blocks: &[usize],
+    ) -> Result<Vec<ColumnEstimate>, LogSegError> {
+        let projected = columns.resolve(&self.field_dir);
+        let plans = column_plans(&self.field_dir);
+        let mut out = Vec::new();
+        for &b in blocks {
+            let rows = self
+                .skip
+                .l0
+                .get(b)
+                .ok_or_else(|| LogSegError::Corrupted("skip block index out of range".into()))?
+                .record_count as usize;
+            let block =
+                u32::try_from(b).map_err(|_| LogSegError::Corrupted("block index range".into()))?;
+            let pages = self
+                .page_dir
+                .block_pages(block)
+                .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
+            let dict_pages = self
+                .page_dir
+                .block_dict_pages(block)
+                .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
+            // A block's pages come in `column_id` order, a column's presence
+            // bitmap page before its value page.
+            let mut i = 0;
+            while let Some(first) = pages.get(i) {
+                let cid = first.desc.column_id;
+                let (presence, value) = match pages.get(i + 1) {
+                    Some(next) if next.desc.column_id == cid => {
+                        i += 2;
+                        (Some(&first.desc), &next.desc)
+                    }
+                    _ => {
+                        i += 1;
+                        (None, &first.desc)
+                    }
+                };
+                if projected.as_ref().is_some_and(|s| !s.contains(&cid)) {
+                    continue;
+                }
+                let dict = dict_pages
+                    .iter()
+                    .find(|d| d.desc.column_id == cid)
+                    .map(|d| &d.desc);
+                let (kind, bytes) = crate::block::estimate_cached_heap_bytes(
+                    cid, &plans, rows, presence, value, dict,
+                )?;
+                out.push(ColumnEstimate {
+                    block,
+                    column: cid,
+                    kind,
+                    bytes,
+                });
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// One (block, column) figure of [`SegmentDirectories::decoded_set_estimates`].
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct ColumnEstimate {
+    pub(crate) block: u32,
+    pub(crate) column: u32,
+    pub(crate) kind: crate::block::EstimateKind,
+    pub(crate) bytes: u64,
 }
 
 impl<'a> RlogReader<'a> {
@@ -1502,16 +1592,22 @@ impl BlockScan {
     /// produced for the same block.
     ///
     /// Only the columnar exit (`columnar`) reads and fills the decoded-column
-    /// cache (ADR-3326 decision 1): an eligible column (projected, not
-    /// deferred by a Contains arm) found there is seeded into the block and
-    /// its pages are neither read nor decoded; a missed one is offered to the
-    /// cache after the decode, before any survivor narrowing. Only a missed
-    /// plain `Str` attribute column the cache would admit
+    /// cache (ADR-3326 decision 1): an eligible column found there is seeded
+    /// into the block and its pages are neither read nor decoded; a missed one
+    /// is offered to the cache after the decode, before any survivor
+    /// narrowing. Every projected column is eligible when the attach's
+    /// [`serve_deferred`](DecodedCacheAttach::serve_deferred) verdict is set;
+    /// otherwise a column deferred by a Contains arm is not, and is never
+    /// looked up or offered (ADR-3326, serve-if-fits amendment). A missed
+    /// column the cache would admit
     /// ([`would_admit`](crate::decoded_cache::DecodedColumnCache::would_admit))
-    /// is UTF-8 validated at decode, since the cache keeps that validation for
-    /// every later hit (ADR-3326 decision 5); every other plain column, a
+    /// is decoded validated: a plain `Str` attribute page is UTF-8 validated
+    /// whole, since the cache keeps that validation for every later hit
+    /// (ADR-3326 decision 5), and a deferred column's dictionary is built
+    /// validated rather than unvalidated. Every other plain column, a
     /// non-interactive first touch included, is validated per cell by its
-    /// reader.
+    /// reader, and every other deferred dictionary is built unvalidated, which
+    /// `offer` refuses.
     fn decode_block<S: ByteSource + ?Sized>(
         &mut self,
         object_bytes: &S,
@@ -1547,11 +1643,13 @@ impl BlockScan {
         let mut cached: Vec<(u32, CachedColumn)> = Vec::new();
         let mut missed: Vec<u32> = Vec::new();
         if let Some(attach) = cache {
+            // The plan pass's verdict (ADR-3326, serve-if-fits amendment).
+            let serve_deferred = attach.serve_deferred;
             for p in &pages {
                 let cid = p.desc.column_id;
                 let projected = self.columns.as_ref().is_none_or(|s| s.contains(&cid));
                 if !projected
-                    || self.deferred.contains(&cid)
+                    || (!serve_deferred && self.deferred.contains(&cid))
                     || self.served.contains(&cid)
                     || missed.contains(&cid)
                 {
@@ -1583,6 +1681,14 @@ impl BlockScan {
                 .collect(),
             None => Vec::new(),
         };
+        // A deferred column is in `validate` only when the scan serves its
+        // deferred columns; it is then decoded validated, for the cache.
+        let decode_deferred: Vec<u32> = self
+            .deferred
+            .iter()
+            .copied()
+            .filter(|cid| !validate.contains(cid))
+            .collect();
         let mut decoded = decode_v4_block_with(
             |p: &PageLoc| source_extent(object_bytes, p.offset, p.desc.len, "page"),
             loc.record_count,
@@ -1590,7 +1696,7 @@ impl BlockScan {
             &pages,
             &dict_pages,
             &mut self.dicts,
-            &self.deferred,
+            &decode_deferred,
             &validate,
             &cached,
             &self.plans,
@@ -1646,6 +1752,7 @@ impl BlockScan {
             &self.deferred,
             &mut decoded,
             &self.surviving,
+            &mut self.served,
             &mut self.dict_memo,
             &mut self.stats,
         )?;
@@ -1658,12 +1765,16 @@ impl BlockScan {
 /// form gets a dictionary of its own, holding only the entries `surviving`
 /// rows reference, each validated at most once per dictionary (through the
 /// memo the contains kernel validated through), and every other row of the
-/// column reads as absent. The unvalidated dictionary it replaces stays where
-/// it was; nothing here touches the row group cache.
+/// column reads as absent. A validated dictionary, served from the decoded
+/// cache or decoded for it, is narrowed too and validates nothing. The
+/// dictionary it replaces stays where it was; nothing here touches the row
+/// group cache or a cache entry. A narrowed column leaves `served`, so the
+/// block is charged for the copy it now owns.
 fn build_survivor_values(
     deferred: &[u32],
     block: &mut DecodedBlock,
     surviving: &[usize],
+    served: &mut Vec<u32>,
     memo: &mut DictArmMemo,
     stats: &mut ScanStats,
 ) -> Result<(), LogSegError> {
@@ -1672,9 +1783,6 @@ fn build_survivor_values(
             continue;
         };
         let values = Arc::clone(d.values());
-        if values.validated() {
-            continue;
-        }
         let used = d.entries_used_by(surviving);
         let built = texts_slot(&mut memo.texts, col, &values).build(
             &values,
@@ -1682,6 +1790,7 @@ fn build_survivor_values(
             &mut stats.str_cells_validated,
         )?;
         d.restrict_to(Arc::new(built), surviving);
+        served.retain(|&c| c != col);
     }
     Ok(())
 }
@@ -1777,10 +1886,14 @@ pub(crate) fn located_block_pages(
 /// is stored, so a corrupt dictionary still fails every block of its chunk.
 ///
 /// A column a `LIKE` contains arm tests is decoded
-/// [unvalidated](DictValues::unvalidated) and kept apart, in `raw`: its
-/// dictionary is never in `entries`, so a scan without the arm sharing the
-/// cache never reads one whose entries were not all validated, and the
-/// survivor-only build ([`build_survivor_values`]) never writes into it.
+/// [unvalidated](DictValues::unvalidated) and kept apart, in `raw`, so a
+/// reader of `entries` never meets a dictionary whose entries were not all
+/// validated, and the survivor-only build ([`build_survivor_values`]) never
+/// writes into either list. The exception is a block of a scan that serves its
+/// deferred columns whose column the decoded cache would admit
+/// ([`BlockScan::decode_block`]'s `validate` list): that decode is validated
+/// and its dictionary is in `entries`. A group whose blocks differ on that
+/// holds both, each decoded once.
 #[derive(Debug, Default)]
 pub(crate) struct DictCache {
     group: Option<u32>,
@@ -6874,6 +6987,19 @@ mod tests {
                 object: [9; 32],
                 intent: AccessIntent::Interactive,
                 counters: Arc::clone(counters),
+                serve_deferred: false,
+            }
+        }
+
+        /// [`attach_to`] for a scan the plan pass judged to fit, which serves
+        /// and offers its Contains-deferred columns.
+        fn serving(
+            cache: &Arc<DecodedColumnCache>,
+            counters: &Arc<DecodedCacheCounters>,
+        ) -> DecodedCacheAttach {
+            DecodedCacheAttach {
+                serve_deferred: true,
+                ..attach_to(cache, counters)
             }
         }
 
@@ -7069,11 +7195,165 @@ mod tests {
             assert_eq!((s.hits, s.misses, s.admissions), (6, 3, 3));
         }
 
-        /// A column a `Contains` arm defers is never looked up nor offered, on
-        /// a cold run or a hot one, while the other columns of the same blocks
-        /// are served (ADR-3326 decision 1).
+        /// ADR-3326, serve-if-fits amendment: the plan-time estimate of every
+        /// (block, column) a scan would hold, summed per kind, against the
+        /// summed `heap_bytes` of the same columns decoded, which is what
+        /// `offer` charges. The fixture holds every kind the cache keeps:
+        /// integers (one partially present), f64, bool, trace and span ids
+        /// (trace ids partially present), a plain `body`, a URL-shaped `url`
+        /// stored as a per-block dictionary in seven blocks (16 distinct URLs
+        /// of about 80 bytes over 64 rows a block, none shared between
+        /// blocks) and as a plain page in the eighth, and a low-cardinality
+        /// `svc` stored as a row group dictionary.
+        ///
+        /// Seen failing against an estimate that charges each block a
+        /// group's dictionary divided over the group's blocks rather than
+        /// whole: the `GroupDict` `>=` assertion fails.
         #[test]
-        fn a_contains_deferred_column_is_never_cached() {
+        fn the_decoded_set_estimate_matches_heap_bytes_per_kind() {
+            use crate::block::EstimateKind;
+            use std::collections::HashMap;
+
+            // splitmix64's finalizer: URL text no two blocks share and zstd
+            // cannot shorten across entries.
+            fn mix(mut z: u64) -> u64 {
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                z ^ (z >> 31)
+            }
+            // Under `Estimated` a block takes a dictionary page when at most
+            // half its rows are distinct. The last block's URLs are all
+            // distinct, so it takes a plain page, which keeps `url` out of the
+            // row group dictionary decision for the group.
+            let cfg = RlogConfig {
+                block_target_records: 64,
+                page_choice: crate::block::PageChoice::Estimated,
+                ..RlogConfig::default()
+            };
+            let recs: Vec<LogRecord> = (0..512i64)
+                .map(|i| {
+                    let block = i / 64;
+                    let url = if block == 7 {
+                        block * 1000 + i % 64
+                    } else {
+                        block * 1000 + (i % 64) % 16
+                    };
+                    let mut attrs = vec![
+                        attr(
+                            "url",
+                            AttrValue::Str(format!(
+                                "https://shop{block}.example.net/item/{:016x}?ref={:016x}&b={block}",
+                                mix(url as u64),
+                                mix(!(url as u64))
+                            )),
+                        ),
+                        attr("svc", AttrValue::Str(format!("svc-{}", i % 3))),
+                        attr("f", AttrValue::F64(i as f64 / 3.0)),
+                        attr("b", AttrValue::Bool(i % 3 == 0)),
+                    ];
+                    if i % 2 == 0 {
+                        attrs.push(attr("n", AttrValue::I64(i * 7 - 50)));
+                    }
+                    let mut r = rec_attrs(
+                        0,
+                        100 + i,
+                        &format!("request number {i} served for /path/segment/{}", i * 7919),
+                        attrs,
+                    );
+                    let id = u8::try_from(i % 251).expect("small");
+                    r.trace_id = (i % 3 != 0).then_some([id; 16]);
+                    r.span_id = Some([id.wrapping_add(1); 8]);
+                    r
+                })
+                .collect();
+            let obj = build(cfg, recs);
+            let reader = RlogReader::new(&obj, &cfg).expect("open object");
+            let dirs = reader.directories();
+            let blocks: Vec<usize> = (0..dirs.skip_index().l0.len()).collect();
+            assert_eq!(blocks.len(), 8);
+            let estimates = dirs
+                .decoded_set_estimates(&ColumnSelection::all(), &blocks)
+                .expect("estimate");
+
+            let mut actual: HashMap<(u32, u32), u64> = HashMap::new();
+            let mut scan = reader
+                .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                .expect("open cursor");
+            while let Some(b) = scan.next_block_index() {
+                let b = u32::try_from(b).expect("small block index");
+                scan.next_block_columnar(&obj)
+                    .expect("columnar exit")
+                    .expect("a block");
+                let block = scan.current.as_ref().expect("a decoded block");
+                for cid in 0..FIRST_DYNAMIC_COL + 64 {
+                    if let Some(c) = block.cached_column(cid) {
+                        actual.insert((b, cid), c.heap_bytes() as u64);
+                    }
+                }
+            }
+            assert_eq!(estimates.len(), actual.len(), "one estimate per decoded column");
+
+            let url = reader
+                .field_dir()
+                .column("url", FieldType::Str)
+                .expect("url column")
+                .column_id;
+            let svc = reader
+                .field_dir()
+                .column("svc", FieldType::Str)
+                .expect("svc column")
+                .column_id;
+            let mut sums: HashMap<EstimateKind, (u64, u64)> = HashMap::new();
+            for e in &estimates {
+                let got = actual
+                    .get(&(e.block, e.column))
+                    .copied()
+                    .unwrap_or_else(|| panic!("block {} column {} decoded", e.block, e.column));
+                if e.column == url {
+                    let want = if e.block == 7 {
+                        EstimateKind::Plain
+                    } else {
+                        EstimateKind::BlockDict
+                    };
+                    assert_eq!(e.kind, want, "url in block {}", e.block);
+                }
+                if e.column == svc {
+                    assert_eq!(e.kind, EstimateKind::GroupDict, "svc in block {}", e.block);
+                }
+                let sum = sums.entry(e.kind).or_default();
+                sum.0 += e.bytes;
+                sum.1 += got;
+            }
+            for kind in [
+                EstimateKind::FixedWidth,
+                EstimateKind::Plain,
+                EstimateKind::BlockDict,
+                EstimateKind::GroupDict,
+            ] {
+                let (est, got) = sums.get(&kind).copied().unwrap_or_default();
+                assert!(got > 0, "{kind:?} is in the fixture");
+                let ratio = est as f64 / got as f64;
+                eprintln!("{kind:?}: estimate {est}, heap_bytes {got}, ratio {ratio:.4}");
+                match kind {
+                    EstimateKind::FixedWidth => assert_eq!(est, got, "{kind:?} is exact"),
+                    EstimateKind::GroupDict => {
+                        assert!(est >= got, "{kind:?}: {est} under {got}");
+                    }
+                    EstimateKind::Plain | EstimateKind::BlockDict => {
+                        assert!((0.96..=1.08).contains(&ratio), "{kind:?}: ratio {ratio}");
+                    }
+                }
+            }
+            assert_eq!(
+                dirs.decoded_set_estimate(&ColumnSelection::all(), &blocks)
+                    .expect("estimate"),
+                sums.values().map(|s| s.0).sum::<u64>()
+            );
+        }
+
+        /// Three blocks of four rows whose `k` column a `Contains` arm on
+        /// `value 1` defers and narrows to a third of its rows.
+        fn contains_fixture() -> (RlogConfig, Vec<u8>, Predicate) {
             let cfg = RlogConfig {
                 block_target_records: 4,
                 ..RlogConfig::default()
@@ -7089,15 +7369,55 @@ mod tests {
                 })
                 .collect();
             let obj = build(cfg, recs);
-            let reader = RlogReader::new(&obj, &cfg).expect("open object");
             let contains = Predicate::Contains {
                 key: "k".into(),
-                needle: "value".into(),
+                needle: "value 1".into(),
                 negated: false,
             };
+            (cfg, obj, contains)
+        }
+
+        /// Each block's cells of a `pred` scan over every column, with
+        /// `attach` attached when given.
+        fn contains_cells(
+            obj: &[u8],
+            cfg: &RlogConfig,
+            pred: &Predicate,
+            attach: Option<DecodedCacheAttach>,
+        ) -> Vec<BlockCells> {
+            let reader = RlogReader::new(obj, cfg).expect("open object");
+            let mut scan = reader
+                .scan_blocks(pred, &[], &ColumnSelection::all())
+                .expect("open cursor");
+            if let Some(a) = attach {
+                scan.attach_decoded_cache(a);
+            }
+            let mut out = Vec::new();
+            while scan
+                .next_block_columnar(obj)
+                .expect("columnar exit")
+                .is_some()
+            {
+                out.push(block_cells(&scan));
+            }
+            out
+        }
+
+        /// In a scan that does not fit the cache a column a `Contains` arm
+        /// defers is never looked up nor offered, on a cold run or a hot one,
+        /// while the other columns of the same blocks are served (ADR-3326,
+        /// serve-if-fits amendment, decision 2).
+        #[test]
+        fn a_contains_deferred_column_is_never_cached_when_the_scan_does_not_fit() {
+            let (cfg, obj, contains) = contains_fixture();
+            let lookups: u64 = columnar_cells(&obj, &cfg, None)
+                .iter()
+                .map(|b| b.len() as u64)
+                .sum();
+            let reader = RlogReader::new(&obj, &cfg).expect("open object");
             let cache = Arc::new(DecodedColumnCache::new(1 << 30, None));
             let mut deferred = Vec::new();
-            for _ in 0..3 {
+            for run in 0..3 {
                 let counters = Arc::new(DecodedCacheCounters::default());
                 let mut scan = reader
                     .scan_blocks(&contains, &[], &ColumnSelection::all())
@@ -7108,16 +7428,92 @@ mod tests {
                 while let Some(view) = scan.next_block_columnar(&obj).expect("columnar exit") {
                     assert!(!view.served_columns().contains(&deferred[0]));
                 }
+                let s = counters.snapshot();
+                // Every column but the deferred one is looked up once per
+                // block.
+                assert_eq!(s.hits + s.misses, lookups - 3, "run {run}");
+                if run == 0 {
+                    assert_eq!(s.admissions, s.misses, "run {run}");
+                } else {
+                    assert_eq!((s.misses, s.admissions), (0, 0), "run {run}");
+                }
             }
             assert_eq!(cache.column_hits(deferred[0]), 0);
             assert_eq!(cache.column_hits(COL_TS), 6, "two hot runs over 3 blocks");
-            let p = cache.process_counters();
-            assert!(p.hits > 0);
-            let block_count = 3;
-            for b in 0..block_count {
+            for b in 0..3 {
                 let key = attach_to(&cache, &Arc::default()).key(b, deferred[0]);
                 assert_eq!(cache.entry_bytes(&key), None, "never admitted");
             }
+        }
+
+        /// In a scan that fits the cache, a column a `Contains` arm defers is
+        /// decoded validated on the cold run, admitted whole before its
+        /// survivor narrowing, and served on every later run: each run reads
+        /// exactly the cells of the same scan with no cache, and the entry
+        /// equals a fresh full decode of the column bit for bit, so no narrowed
+        /// copy was admitted (ADR-3326, LIKE-deferred amendment, decisions 2
+        /// to 4). The served copy the block narrows leaves the served list, so
+        /// the scan is charged for it.
+        ///
+        /// Seen failing against leaving a narrowed served column in the
+        /// served list: the "narrowed, so charged" assertion fails on run 1.
+        #[test]
+        fn a_contains_deferred_column_is_served_whole_when_the_scan_fits() {
+            let (cfg, obj, contains) = contains_fixture();
+            let fresh = columnar_cells(&obj, &cfg, None);
+            let uncached = contains_cells(&obj, &cfg, &contains, None);
+            let reader = RlogReader::new(&obj, &cfg).expect("open object");
+            let cache = Arc::new(DecodedColumnCache::new(1 << 30, None));
+            let mut deferred = 0;
+            for run in 0..3 {
+                let counters = Arc::new(DecodedCacheCounters::default());
+                let mut scan = reader
+                    .scan_blocks(&contains, &[], &ColumnSelection::all())
+                    .expect("open cursor");
+                deferred = scan.deferred[0];
+                scan.attach_decoded_cache(serving(&cache, &counters));
+                let mut b = 0usize;
+                while let Some(view) = scan.next_block_columnar(&obj).expect("columnar exit") {
+                    let mut served = view.served_columns().to_vec();
+                    assert!(!served.contains(&deferred), "narrowed, so charged");
+                    let charge = view.resident_charge_bytes();
+                    let current = scan.current.as_ref().expect("a decoded block");
+                    let narrowed = current
+                        .cached_column(deferred)
+                        .expect("the deferred column is decoded")
+                        .heap_bytes();
+                    served.push(deferred);
+                    assert_eq!(
+                        charge,
+                        current.heap_bytes_excluding(&served) + narrowed,
+                        "run {run} block {b}: the narrowed copy is charged"
+                    );
+                    assert_eq!(block_cells(&scan), uncached[b], "run {run} block {b}");
+                    let (_, whole) = fresh[b]
+                        .iter()
+                        .find(|(c, _)| *c == deferred)
+                        .expect("the deferred column is in the fresh decode");
+                    let pinned = scan
+                        .pins
+                        .iter()
+                        .filter(|e| e.column().cells() == *whole)
+                        .count();
+                    assert_eq!(pinned, 1, "run {run} block {b}: the whole column is pinned");
+                    b += 1;
+                }
+                assert_eq!(b, 3);
+                let s = counters.snapshot();
+                let lookups: u64 = fresh.iter().map(|b| b.len() as u64).sum();
+                assert_eq!(s.hits + s.misses, lookups, "run {run}: every column");
+                assert_eq!(s.unvalidated_refusals, 0, "run {run}");
+                if run == 0 {
+                    assert_eq!(s.hits, 0);
+                    assert_eq!(s.admissions, s.misses);
+                } else {
+                    assert_eq!((s.misses, s.admissions), (0, 0), "run {run}");
+                }
+            }
+            assert_eq!(cache.column_hits(deferred), 6, "two hot runs over 3 blocks");
         }
 
         /// The deterministic corpus reaches every cached column kind, so the
