@@ -3456,11 +3456,22 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
 
 `/api/v1/sql` and the ES|QL catalog path also render
 `stats.accounting.peakAskedIntermediateBytes`, the high-water mark of the
-bytes the query's memory consumers asked the pool for; the charged
-`peakIntermediateBytes` includes the reserve-ahead factor (1.25 by default)
-for the hash aggregate consumers and the asked figure does not, so the two
-differ by up to that factor on an aggregate-heavy statement and agree on a scan.
-The PromQL, analytics and ES|QL row paths render it as 0.
+bytes the query's memory consumers' reservations held live, before any
+reserve-ahead factor. It is at most `peakIntermediateBytes`, the charged
+peak, which includes the reserve-ahead factor (1.25 by default) for the
+hash aggregate consumers; the two agree only when no reserve-ahead
+consumer and no held release took part in the query (a scan, for
+instance). A held release can put the charged figure above 1.25 times the
+asked one: a held shrink lowers the asked gauge while the bytes it freed
+stay charged, and a later grow served from that hold raises the asked
+gauge while charging nothing new. This figure covers the coordinator's
+local memory pool only: on a distributed run `peakIntermediateBytes` is
+the maximum over the coordinator's and every remote slice's merged
+accounting snapshots, while `peakAskedIntermediateBytes` is read directly
+off the coordinator's pool and never merges a remote slice's figure. The
+analytics and ES|QL row paths render it as 0 (there is no SQL memory pool
+on those paths to report a pre-factor peak); PromQL's JSON shape carries
+no such field at all, present or zero.
 
 **`/api/v1/sql`'s JSON response** carries `stats.phases` and
 `stats.io` alongside its own pre-existing `stats.accounting`/`stats.estimate`,

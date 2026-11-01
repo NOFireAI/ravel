@@ -1263,9 +1263,15 @@ impl TenantDelegatingPool {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The high-water mark, over this query, of the bytes its consumers asked
-    /// for before any reserve-ahead factor. It equals the charged peak for a
-    /// plan with no reserve-ahead consumer.
+    /// The high-water mark, over this query, of the sum of the bytes its
+    /// consumers' reservations hold live, before any reserve-ahead factor.
+    /// This is a live-demand gauge, not a cumulative charge: a held shrink
+    /// ([`Self::holds_shrink`]) takes bytes off it while the bytes it frees
+    /// stay charged, held rather than released ([`Self::hold`]); a grow
+    /// served from a hold ([`Self::grow_charged`]) adds to it while charging
+    /// nothing new. So the asked peak is at most the charged peak
+    /// (`peak_intermediate_bytes`), and equals it only for a plan with no
+    /// reserve-ahead consumer and no held release.
     pub fn peak_asked_bytes(&self) -> u64 {
         self.peak_asked_bytes.load(Ordering::Acquire)
     }
@@ -3309,10 +3315,64 @@ mod tests {
         ));
     }
 
+    /// A held shrink takes its bytes off the asked gauge even though the
+    /// charged bytes it frees stay held, and a later plain grow adds to the
+    /// asked gauge without disturbing the earlier peak.
+    ///
+    /// FLIP: drop the `asked_shrink` call from `shrink` and the gauge reads
+    /// 100, not 0, right after the held shrink.
+    #[test]
+    fn peak_asked_bytes_falls_on_a_held_shrink_while_charged_stays() {
+        let accounting = QueryAccounting::new();
+        let tenant = TenantMemoryAccountant::new(1 << 30);
+        let pool = Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            tenant,
+            CeilingBreach::new(),
+            accounting.clone(),
+        ));
+        let res = register_on(&pool, FINAL_AGGREGATE);
+
+        res.try_grow(100).expect("within every ceiling");
+        assert_eq!(pool.peak_asked_bytes(), 100);
+        assert_eq!(accounting.snapshot().peak_intermediate_bytes, 100);
+
+        // A shrink to zero on a consumer `holds_last_release` selects is held:
+        // the charged bytes stay reserved, but the asked gauge still falls.
+        res.shrink(100);
+        assert_eq!(
+            pool.held_bytes(),
+            100,
+            "the charged bytes are held, not released"
+        );
+        assert_eq!(accounting.snapshot().peak_intermediate_bytes, 100);
+        assert_eq!(pool.asked_used.load(Ordering::Acquire), 0);
+        assert_eq!(
+            pool.peak_asked_bytes(),
+            100,
+            "the high-water mark does not fall"
+        );
+
+        // A plain consumer's grow charges fresh bytes (the hold belongs to the
+        // other consumer) and raises both gauges, but stays under the peak.
+        let plain = register_on(&pool, "ExternalSorter[0]");
+        plain.try_grow(50).expect("within every ceiling");
+        assert_eq!(pool.asked_used.load(Ordering::Acquire), 50);
+        assert_eq!(pool.peak_asked_bytes(), 100);
+        assert_eq!(accounting.snapshot().peak_intermediate_bytes, 150);
+    }
+
     /// FLIP: summing the charged delta instead of the asked delta in
     /// `aggregate_try_grow` (`self.asked_grow(charged)`) reports 5,000,000
-    /// asked bytes on the default pool; dropping the `asked_shrink` call in
-    /// `shrink` leaves the peak at 5,000,000 after the shrink and smaller grow.
+    /// asked bytes on the default pool instead of 4,000,000; dropping the
+    /// `asked_shrink` call in `shrink` leaves the peak at 5,000,000 after the
+    /// shrink and smaller grow instead of leaving it unchanged at 4,000,000;
+    /// swapping the asked delta for the charged delta in `aggregate_grow`'s
+    /// own `asked_grow` call (`next.asked.saturating_sub(state.asked)` to
+    /// `charged`) pushes the default run's final peak to 5,750,000 (the
+    /// 1.25x-charged delta of the last unconditional grow, added on top of
+    /// 2,000,000 already live) instead of the exact 5,000,000 the off run
+    /// also reaches.
     #[test]
     fn peak_asked_intermediate_bytes_ignores_the_reserve_ahead_factor() {
         const STEP: usize = 1_000_000;
@@ -3332,8 +3392,11 @@ mod tests {
             res.shrink(3 * STEP);
             res.try_grow(STEP).expect("within every ceiling");
             assert_eq!(pool.peak_asked_bytes(), 4 * STEP as u64);
-            res.grow(STEP);
-            assert_eq!(pool.peak_asked_bytes(), 4 * STEP as u64);
+
+            // An unconditional grow past the earlier peak raises it to an
+            // exact new value: 2,000,000 asked live plus a 3,000,000 grow.
+            res.grow(3 * STEP);
+            assert_eq!(pool.peak_asked_bytes(), 5 * STEP as u64);
             (pool.peak_asked_bytes(), charged)
         };
         let (asked_default, charged_default) = drive(AggregateReserveAhead::DEFAULT);
@@ -3365,6 +3428,32 @@ mod tests {
         assert_eq!(pool.reserved(), 5_000_000);
     }
 
+    /// A refused `try_grow` never calls `asked_grow`: the early `?` return in
+    /// `try_grow_charged`'s caller skips it, same as the aggregate case above.
+    #[test]
+    fn peak_asked_bytes_ignores_a_refused_plain_try_grow() {
+        let accounting = QueryAccounting::new();
+        let tenant = TenantMemoryAccountant::new(1 << 30);
+        let pool = Arc::new(TenantDelegatingPool::new(
+            100,
+            tenant,
+            CeilingBreach::new(),
+            accounting,
+        ));
+        let res = register_on(&pool, "ExternalSorter[0]");
+        res.try_grow(100).expect("exactly at the query ceiling");
+        assert_eq!(pool.peak_asked_bytes(), 100);
+        assert_eq!(pool.asked_used.load(Ordering::Acquire), 100);
+
+        res.try_grow(1).expect_err("over the query ceiling");
+        assert_eq!(pool.peak_asked_bytes(), 100, "unchanged by the refusal");
+        assert_eq!(
+            pool.asked_used.load(Ordering::Acquire),
+            100,
+            "unchanged by the refusal"
+        );
+    }
+
     #[test]
     fn peak_asked_bytes_counts_a_plain_consumer_one_to_one() {
         const N: usize = 1_000_003;
@@ -3378,8 +3467,21 @@ mod tests {
         res.grow(N - 3);
         res.try_grow(3).expect("within every ceiling");
         assert_eq!(pool.peak_asked_bytes(), N as u64);
+        assert_eq!(pool.asked_used.load(Ordering::Acquire), N);
         assert_eq!(accounting.snapshot().peak_intermediate_bytes, N as u64);
-        res.shrink(N);
+
+        // A shrink below the peak, then a smaller regrow: the gauge tracks
+        // both exactly and the peak stays at the high-water mark.
+        res.shrink(3);
+        assert_eq!(pool.asked_used.load(Ordering::Acquire), N - 3);
+        assert_eq!(pool.peak_asked_bytes(), N as u64);
+
+        res.try_grow(2).expect("within every ceiling");
+        assert_eq!(pool.asked_used.load(Ordering::Acquire), N - 1);
+        assert_eq!(pool.peak_asked_bytes(), N as u64);
+
+        res.shrink(N - 1);
+        assert_eq!(pool.asked_used.load(Ordering::Acquire), 0);
         assert_eq!(pool.peak_asked_bytes(), N as u64);
     }
 }

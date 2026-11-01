@@ -408,11 +408,14 @@ async fn wide_full_table_aggregates_complete_within_a_small_memory_pool() {
     );
 }
 
-/// The `/sql` stats carry `peakAskedIntermediateBytes`, the pre-reserve-ahead
-/// high-water mark, beside the charged `peakIntermediateBytes`. The charged
-/// figure includes the 1.25 default factor for hash aggregate consumers, so
-/// the asked figure is at most the charged one and at least the charged one
-/// divided by 1.25.
+/// The `/sql` stats carry `peakAskedIntermediateBytes`, the high-water mark
+/// of what this query's memory consumers asked for, live, before a migrated
+/// hash aggregate stream's reservations are charged ahead of that ask
+/// (`AggregateReserveAhead`), beside the charged `peakIntermediateBytes`. A
+/// consumer is never charged less than it asked for, so the asked figure is
+/// at most the charged one; this fixture is too small to also pin a lower
+/// bound on the ratio honestly (`crates/ravel-sql/tests/peak_asked_bytes.rs`
+/// does that at a scale where the bound holds).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sql_stats_json_carries_peak_asked_intermediate_bytes() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -437,9 +440,5 @@ async fn sql_stats_json_carries_peak_asked_intermediate_bytes() {
     assert!(
         asked <= charged,
         "asked {asked} > charged {charged}: {value}"
-    );
-    assert!(
-        asked as f64 >= charged as f64 / 1.25,
-        "asked {asked} < charged {charged} / 1.25: {value}"
     );
 }
