@@ -79,13 +79,16 @@
 //! sort key puts `trace_id` first, a trace's records from every input are
 //! contiguous in the merged stream, so the boundary check the old per-trace
 //! loop made once per trace group becomes an inline check on each
-//! `trace_id` transition in the flat loop. Merged records feed straight into
-//! the in-progress part's [`RspanWriter`]; there is no intermediate
-//! `Vec<SpanRecord>` batch or `by_trace` map.
+//! `trace_id` transition in the flat loop. Merged records of the trace being
+//! read are held until that transition, when the whole trace moves into the
+//! in-progress part's [`RspanWriter`]: holding it is what lets the part be cut
+//! before a trace whose KEY_IDX charge would overflow a bucket (issue #2985).
+//! There is no larger intermediate batch and no `by_trace` map.
 //!
 //! Peak resident memory is then: per-input catalog metadata (KBs per input),
 //! plus at most one decoded block per input (`O(input_count * block_size)`,
-//! independent of trace size), plus the in-progress part's writer buffer.
+//! independent of trace size), plus the in-progress part's writer buffer and
+//! the trace being read.
 //!
 //! That last term is where RSPAN differs from RLOG, and it is not a bound. The
 //! split target `l1_part_memory_target_bytes` is compared against the part's
@@ -2429,7 +2432,7 @@ mod tests {
     /// at the part boundary (every trace after the first cut gets its own
     /// part), and bucket bits re-typed away from the writer's 8 (bucket 16's
     /// fillers join the hot bucket at 7 bits; the hot traces split in two at
-    /// 9). A cut checked mid-trace splits trace 3 and fails the straddle check.
+    /// 9). A cut checked mid-trace puts traces 3 and 6 in two parts each.
     #[tokio::test]
     async fn the_merge_cuts_parts_before_an_adversarial_key_idx_bucket_overflows() {
         assert_eq!(
