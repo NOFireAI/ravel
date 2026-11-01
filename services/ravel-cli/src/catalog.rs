@@ -1010,7 +1010,7 @@ pub async fn verify(
     // command keeps its own presentation: the `println!` report and the nonzero
     // exit (via `anyhow::bail!`) on a real divergence. The catalog only counts
     // a part naming another tenant, which fails the command; its default
-    // memory budget is unlimited.
+    // memory budget is unlimited, so the part decode charge never refuses.
     let catalog = ravel_catalog::Catalog::new(store.clone(), CatalogConfig::default())
         .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?;
     let report = match ravel_catalog::verify_seal_divergence(

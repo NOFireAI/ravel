@@ -642,7 +642,8 @@ pub async fn run_cycle_on_gate(
             // breach (ADR-0050 §2) on the postings object or on a covered part
             // is logged and likewise degrades to `None` for this tick, never
             // wedging the content and structural tiers that do not depend on
-            // postings; a foreign part is also counted on `catalog`.
+            // postings; a foreign part is also counted on `catalog`. So does a
+            // part decode `catalog`'s memory budget refuses, retried next tick.
             let scan_shards = scan_shards(store, tenant, signal, shard_count).await;
 
             // Ownership gate (ADR-0065 decision 2): scrub's per-shard rotation
@@ -703,6 +704,10 @@ pub async fn run_cycle_on_gate(
                 let worst = &mut worst_held[index];
                 *worst = (*worst).max(held.unwrap_or(last_held[index]));
             }
+            // The covered parts stay charged to `catalog`'s budget while
+            // `covering` lives, and the seal-divergence tier decodes the same
+            // parts again: release them first.
+            drop(covering);
             // Seal-divergence tier (ADR-0059 decision 2): once per
             // (tenant, signal) per tick, not per shard and not gated behind the
             // content-tier cursor. It is metadata-cost, matching the structural
@@ -730,7 +735,8 @@ pub async fn run_cycle_on_gate(
 /// surviving sealed commit record is the expected shape once retention deletes a
 /// folded record. An absent HEAD (nothing folded yet) is normal, not a fault. A
 /// read or decode failure is logged and skipped for this tick, never counted as
-/// an anomaly (a transient store error must not read as seal loss). A part
+/// an anomaly (a transient store error must not read as seal loss), and so is a
+/// part decode `catalog`'s memory budget refuses. A part
 /// naming another tenant is skipped the same way but logged at `error`: it is
 /// an isolation breach, already counted on `catalog`, not a transient read.
 async fn run_seal_divergence_tick(
@@ -2676,7 +2682,42 @@ mod tests {
         publish_segment(store.as_ref(), 1, &["cpu", "mem"]).await;
         let now = 500_003 * NS_PER_HOUR;
         fold(store.clone(), now).await;
+        plant_tampered_postings(store.as_ref()).await;
 
+        let metrics = ScrubMetrics::default();
+        let worker = solo_worker();
+        run_cycle(
+            store.as_ref(),
+            &test_catalog(),
+            None,
+            1,
+            1,
+            1,
+            &metrics,
+            &worker,
+            &worker.solo_live_set(),
+            None,
+            &WallClock,
+        )
+        .await;
+
+        assert_eq!(
+            metrics.postings_disagreement(Signal::Metrics),
+            1,
+            "the omitted name must surface as a postings disagreement through the real tick"
+        );
+        assert_eq!(
+            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            0,
+            "the segment data is untouched: no checksum mismatch"
+        );
+    }
+
+    /// Replace the folded `(tenant, Metrics)` postings object with a valid,
+    /// correctly-bound one omitting "mem", which the segment carries, and
+    /// re-point the HEAD's postings ref at it so the load accepts it: a
+    /// covering load that succeeds records one postings disagreement.
+    async fn plant_tampered_postings(store: &MemoryStore) {
         // Read the folded HEAD and its covered part(s)' blake3.
         let head_key = head_key_for(&tenant().hash());
         let head_bytes = store
@@ -2728,34 +2769,152 @@ mod tests {
             .put(&head_key, Bytes::from(rewritten), PutOptions::default())
             .await
             .expect("overwrite head");
+    }
 
+    /// The declared `entries_uncompressed_len` of part 0 of the folded
+    /// `(tenant, Metrics)` HEAD: what each snapshot-part reader charges.
+    async fn first_part_declared_len(store: &MemoryStore) -> u64 {
+        let head_bytes = store
+            .get(&head_key_for(&tenant().hash()), GetRange::Full)
+            .await
+            .expect("head present")
+            .data;
+        let head = ravel_catalog::decode_head(&head_bytes).expect("decode head");
+        let part = store
+            .get(&head.parts[0].key, GetRange::Full)
+            .await
+            .expect("part present")
+            .data;
+        let declared = ravel_catalog::decode_part(&part, &ravel_catalog::PartLimits::default())
+            .expect("the folded part decodes")
+            .header
+            .entries_uncompressed_len;
+        assert!(declared > 0, "the part has a body to charge");
+        declared
+    }
+
+    /// ADR-1170, catalog decode charge amendment: the covering-postings load
+    /// charges the scrub catalog's budget, and a refusal skips the postings
+    /// tier for the tick like a transient read failure (logged, nothing
+    /// counted, nothing left charged); the next tick with room runs it.
+    ///
+    /// FLIP: pass a fresh unbudgeted catalog to `load_covering_postings` in
+    /// `run_cycle_on_gate` and the first tick records the disagreement, so the
+    /// first `assert_eq!` fails. FLIP: record the refusal as a disagreement
+    /// (`metrics.record_postings_disagreement`) in the load's `Err` arm and
+    /// the first `assert_eq!` reads 1. FLIP: `std::mem::forget(covering)`
+    /// instead of dropping it and `reserved()` reads the part's declared
+    /// length after the second tick.
+    #[tokio::test]
+    async fn a_refused_covering_decode_skips_the_postings_tier_until_a_tick_with_room() {
+        let store = Arc::new(MemoryStore::new());
+        publish_segment(store.as_ref(), 1, &["cpu", "mem"]).await;
+        fold(store.clone(), 500_003 * NS_PER_HOUR).await;
+        plant_tampered_postings(store.as_ref()).await;
+        let declared = first_part_declared_len(store.as_ref()).await;
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared));
+        let pressure = budget.reserve(1).expect("one byte fits");
+        let catalog = test_catalog().with_memory_budget(budget.clone());
         let metrics = ScrubMetrics::default();
         let worker = solo_worker();
-        run_cycle(
-            store.as_ref(),
-            &test_catalog(),
-            None,
-            1,
-            1,
-            1,
-            &metrics,
-            &worker,
-            &worker.solo_live_set(),
-            None,
-            &WallClock,
-        )
-        .await;
+        let live_set = worker.solo_live_set();
+        let cycle = || {
+            run_cycle(
+                store.as_ref(),
+                &catalog,
+                None,
+                1,
+                1,
+                1,
+                &metrics,
+                &worker,
+                &live_set,
+                None,
+                &WallClock,
+            )
+        };
 
+        cycle().await;
+        assert_eq!(
+            metrics.postings_disagreement(Signal::Metrics),
+            0,
+            "the refused load skips the postings tier"
+        );
+        assert_eq!(budget.reserved(), 1, "the refusal leaves nothing charged");
+
+        drop(pressure);
+        cycle().await;
         assert_eq!(
             metrics.postings_disagreement(Signal::Metrics),
             1,
-            "the omitted name must surface as a postings disagreement through the real tick"
+            "the next tick with room runs the postings tier"
         );
+        assert_eq!(budget.reserved(), 0, "the tick releases every charge");
+        assert_eq!(catalog.isolation_breaches(), 0);
+    }
+
+    /// The seal-divergence tier charges the scrub catalog's budget too, and a
+    /// refusal skips it for the tick without counting a divergence; the next
+    /// tick with room for one part finds the missing record. One part's room
+    /// is enough only because the covering load's charge on the same part is
+    /// released before the tier runs.
+    ///
+    /// FLIP: delete `drop(covering)` in `run_cycle_on_gate` and the covering
+    /// value still holds the part's charge when the tier decodes it, so the
+    /// second tick is refused too and the last `assert_eq!` reads 0. FLIP:
+    /// pass a fresh unbudgeted catalog to `verify_seal_divergence` in
+    /// `run_seal_divergence_tick` and the first tick counts the missing record.
+    /// FLIP: count a refusal as a missing record in the tier's `Err` arm and
+    /// the first `assert_eq!` reads 1.
+    #[tokio::test]
+    async fn a_refused_seal_divergence_decode_skips_the_tier_until_a_tick_with_room() {
+        let store = Arc::new(MemoryStore::new());
+        publish_segment(store.as_ref(), 1, &["cpu", "mem"]).await;
+        fold(store.clone(), 500_003 * NS_PER_HOUR).await;
+        // Sealed but published after the fold: one missing record.
+        publish_segment(store.as_ref(), 2, &["cpu"]).await;
+        let declared = first_part_declared_len(store.as_ref()).await;
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared));
+        let pressure = budget.reserve(1).expect("one byte fits");
+        let catalog = test_catalog().with_memory_budget(budget.clone());
+        let metrics = ScrubMetrics::default();
+        let worker = solo_worker();
+        let live_set = worker.solo_live_set();
+        let cycle = || {
+            run_cycle(
+                store.as_ref(),
+                &catalog,
+                None,
+                1,
+                1,
+                1,
+                &metrics,
+                &worker,
+                &live_set,
+                None,
+                &WallClock,
+            )
+        };
+
+        cycle().await;
         assert_eq!(
-            metrics.checksum_mismatch(Signal::Metrics, ScrubLevel::L0),
+            metrics.seal_divergence_missing(Signal::Metrics),
             0,
-            "the segment data is untouched: no checksum mismatch"
+            "the refused tier counts nothing"
         );
+        assert_eq!(metrics.seal_divergence_mismatched(Signal::Metrics), 0);
+        assert_eq!(budget.reserved(), 1, "the refusal leaves nothing charged");
+
+        drop(pressure);
+        cycle().await;
+        assert_eq!(
+            metrics.seal_divergence_missing(Signal::Metrics),
+            1,
+            "the next tick with room for one part finds the missing record"
+        );
+        assert_eq!(budget.reserved(), 0, "the tick releases every charge");
     }
 
     /// Re-encode part 0 of the folded `(tenant, Metrics)` HEAD with another
