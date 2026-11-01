@@ -1654,6 +1654,18 @@ estimate and pins its error with a test.
   row on q21's estimate against its resident bytes decides: if the test
   passes and that row misses, the pull request stops.
 
+**Implementation note (2026-11-01).** The whole-segment fast path, which
+runs no plan pass and takes q21, computes the same estimate and verdict
+for a `Contains` scan with a decoded cache attached
+(`compute_fast_path_verdict`, `crates/ravel-sql/src/logs_scan/plan.rs:327`,
+awaited by every partition before its first open from
+`crates/ravel-sql/src/logs_scan/mod.rs:3193`), reading each relevant
+segment's directories once through the plan pass's cached directory read
+(`plan.rs:344`). It costs at most one directory read per relevant segment
+cold, charged to the plan phase, and no object-store request hot with the
+directories in the read cache
+(`the_fast_path_verdict_costs_one_directory_read_per_segment_cold_and_none_hot`).
+
 **When the estimate is wrong.** Answers do not depend on it, since a served
 and a decoded deferred column yield the same rows (the LIKE-deferred
 amendment, decision 2). Memory stays bounded by the cap and decision 4.

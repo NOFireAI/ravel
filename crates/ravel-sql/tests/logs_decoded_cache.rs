@@ -830,15 +830,15 @@ fn requests(phase: &ravel_types::accounting::QueryAccountingSnapshot) -> u64 {
 /// One run of [`CONTAINS_SQL`] on the whole-segment fast path: without a read
 /// cache the scan runs as many partitions as segments, so the fast path takes
 /// it. The fast path opens both objects whole in the scan phase (2 scan-phase
-/// GETs, where the planned route reuses its plan read and issues none), and
-/// its plan phase is the verdict's directory reads, one suffix probe per
-/// object, which covers the whole of an object this small.
+/// GETs, where the planned route reuses its plan read and issues none).
+/// Returns the decoded-cache counters and the plan phase's GETs, which on the
+/// fast path are the verdict's directory reads.
 async fn fast_path_run(
     cached: &SqlExecutor,
     t: &TenantId,
     expected: &str,
     run: usize,
-) -> ravel_logseg::decoded_cache::DecodedCacheSnapshot {
+) -> (ravel_logseg::decoded_cache::DecodedCacheSnapshot, u64) {
     let outcome = cached
         .execute(t.hash(), &request(CONTAINS_SQL))
         .await
@@ -853,16 +853,12 @@ async fn fast_path_run(
         OBJECTS,
         "run {run}: the fast path opens each object whole"
     );
-    assert_eq!(
-        gets(&outcome.phase_accounting.plan),
-        OBJECTS,
-        "run {run}: one directory read per object, no plan pass"
-    );
-    outcome
+    let counters = outcome
         .stats
         .decoded_cache
         .expect("decodedCache stats with a cache")
-        .counters
+        .counters;
+    (counters, gets(&outcome.phase_accounting.plan))
 }
 
 /// ADR-3326, serve-if-fits amendment, implementation note: a fitting
@@ -874,8 +870,8 @@ async fn fast_path_run(
 /// scan's on both runs.
 ///
 /// Seen failing against the previous round's fast path, which made no
-/// verdict: `deferred_set_estimate_bytes` is `None` on run 0 where the
-/// estimate is expected.
+/// verdict: the counts assertion reads `(0, 24, 24)` on run 0 where
+/// `(0, 32, 32)` is expected, since `c` is never looked up.
 #[tokio::test]
 async fn a_fitting_contains_scan_on_the_whole_segment_fast_path_is_served() {
     let t = tenant();
@@ -900,16 +896,20 @@ async fn a_fitting_contains_scan_on_the_whole_segment_fast_path_is_served() {
     ));
     let cached = executor(&store, Some(Arc::clone(&cache)));
     for run in 0..2 {
-        let s = fast_path_run(&cached, &t, &expected, run).await;
-        assert_eq!(s.deferred_set_estimate_bytes, Some(estimate), "run {run}");
-        assert!(s.deferred_served, "run {run}");
+        let (s, plan_gets) = fast_path_run(&cached, &t, &expected, run).await;
         let (hits, misses, admissions) = if run == 0 { (0, 32, 32) } else { (32, 0, 0) };
         assert_eq!(
             (s.hits, s.misses, s.admissions),
             (hits, misses, admissions),
             "run {run}"
         );
+        assert_eq!(s.deferred_set_estimate_bytes, Some(estimate), "run {run}");
+        assert!(s.deferred_served, "run {run}");
         assert_eq!(s.unvalidated_refusals, 0, "run {run}");
+        assert_eq!(
+            plan_gets, OBJECTS,
+            "run {run}: one directory read per object"
+        );
     }
     assert_eq!(
         cache.column_hits(c_id),
@@ -923,7 +923,8 @@ async fn a_fitting_contains_scan_on_the_whole_segment_fast_path_is_served() {
 /// offered. Each run looks up 24 columns (`ts`, `stream_ref` and `d` of 8
 /// blocks), the count the fast path looked up before it made a verdict:
 /// `(0, 24, 24)` cold and `(24, 0, 0)` hot, the cache ending with 24 entries
-/// and no `c`.
+/// and no `c`. Against a fast path with no verdict the counts are the same
+/// and the estimate assertion fails (`None` where the estimate is expected).
 #[tokio::test]
 async fn an_over_cap_contains_scan_on_the_whole_segment_fast_path_is_not_served() {
     let t = tenant();
@@ -948,16 +949,20 @@ async fn an_over_cap_contains_scan_on_the_whole_segment_fast_path_is_not_served(
     ));
     let cached = executor(&store, Some(Arc::clone(&cache)));
     for run in 0..2 {
-        let s = fast_path_run(&cached, &t, &expected, run).await;
-        assert_eq!(s.deferred_set_estimate_bytes, Some(estimate), "run {run}");
-        assert!(!s.deferred_served, "run {run}");
+        let (s, plan_gets) = fast_path_run(&cached, &t, &expected, run).await;
         let (hits, misses, admissions) = if run == 0 { (0, 24, 24) } else { (24, 0, 0) };
         assert_eq!(
             (s.hits, s.misses, s.admissions),
             (hits, misses, admissions),
             "run {run}"
         );
+        assert_eq!(s.deferred_set_estimate_bytes, Some(estimate), "run {run}");
+        assert!(!s.deferred_served, "run {run}");
         assert_eq!((s.evictions, s.unvalidated_refusals), (0, 0), "run {run}");
+        assert_eq!(
+            plan_gets, OBJECTS,
+            "run {run}: one directory read per object"
+        );
     }
     assert_eq!(cache.column_hits(c_id), 0, "c is never served");
     assert_eq!(cache.len(), 24, "ts, stream_ref and d of 8 blocks; no c");
@@ -1062,8 +1067,10 @@ async fn fast_path_verdict_cost(suffix_len: Option<u64>) -> Vec<VerdictCost> {
 /// issues no request the baseline does not.
 ///
 /// Seen failing against reading the directories past the read cache (a
-/// fetcher built without the read cache for the verdict's reads): the hot
-/// `plan_requests` is 8 where 0 is expected.
+/// `BlockRangeFetcher` with no cache for the verdict's reads): on the
+/// covering probe the hot run reads `plan_requests: 8, plan_cache_hits: 0,
+/// extra_requests: 8` where `0, 8, 0` is expected, and the cold run's
+/// `extra_requests` is 8 where 0 is expected.
 #[tokio::test]
 async fn the_fast_path_verdict_costs_one_directory_read_per_segment_cold_and_none_hot() {
     let n = FAST_OBJECTS;
