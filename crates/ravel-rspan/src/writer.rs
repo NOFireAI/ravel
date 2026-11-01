@@ -22,7 +22,7 @@ use crate::error::SpanSegError;
 use crate::footer::{
     COMP_NONE, COMP_ZSTD, SectionDesc, SpanFooter, kind, write_footer_and_trailer,
 };
-use crate::key_index::encode_trace_key_idx;
+use crate::key_index::{KEY_IDX_BUCKET_MAX_ENTRIES, encode_trace_key_idx_capped};
 use crate::record::{
     COL_NAME, COL_SERVICE_NAME, EVENTS_RAW_KEY, FIRST_DYNAMIC_COL, ResolvedSpanRow,
     SERVICE_NAME_KEY, SpanEvent, SpanRecord, encode_attrs, parse_events,
@@ -76,6 +76,11 @@ pub struct RspanWriter {
     cfg: RspanConfig,
     identity: ObjectIdentity,
     records: Vec<SpanRecord>,
+    /// The most distinct `(key8, block)` entries one KEY_IDX bucket may hold
+    /// before the object is refused as
+    /// [`SpanSegError::KeyIdxBucketOverflow`]: the codec's
+    /// [`KEY_IDX_BUCKET_MAX_ENTRIES`], lowered only by tests.
+    key_idx_bucket_cap: u32,
 }
 
 impl RspanWriter {
@@ -84,6 +89,7 @@ impl RspanWriter {
             cfg,
             identity,
             records: Vec::new(),
+            key_idx_bucket_cap: KEY_IDX_BUCKET_MAX_ENTRIES,
         }
     }
 
@@ -213,11 +219,14 @@ impl RspanWriter {
 
         // One (trace_id, block ordinal) pair per row; the encoder deduplicates.
         // The ordinal is the block's SKIP_IDX entry index.
-        let key_idx = encode_trace_key_idx(spans.iter().enumerate().flat_map(|(block, span)| {
-            rows[span.clone()]
-                .iter()
-                .map(move |row| (row.trace_id, block as u32))
-        }))?;
+        let key_idx = encode_trace_key_idx_capped(
+            spans.iter().enumerate().flat_map(|(block, span)| {
+                rows[span.clone()]
+                    .iter()
+                    .map(move |row| (row.trace_id, block as u32))
+            }),
+            self.key_idx_bucket_cap,
+        )?;
 
         // Physical order: BLOCKS (raw), KEY_IDX (raw), SKIP_IDX (zstd),
         // BLOOM (raw).
@@ -581,5 +590,92 @@ mod tests {
             l1, l1_rebuild,
             "finish_compacted must reproduce byte-identical whole-object bytes on rebuild"
         );
+    }
+
+    /// The writer backstop: an object whose KEY_IDX bucket would pass the cap
+    /// is refused through both `finish` and `finish_compacted` with the typed
+    /// overflow naming the bucket and its entry count, and one entry fewer
+    /// writes an object whose summary shows the bucket at the cap. The entries
+    /// are `(key8, block)` pairs, so a trace spread over blocks counts once per
+    /// block.
+    ///
+    /// FLIP: before #2985 the writer had no cap of its own, so with the cap
+    /// lowered to 4 the five-trace object was written and the `Err` match
+    /// fails. Rules out a writer that counts traces rather than entries (the
+    /// one-trace, five-block object passes it) and one that buckets with
+    /// different bits from the section (the bucket number differs).
+    #[test]
+    fn a_writer_refuses_an_object_whose_key_idx_bucket_passes_the_cap() {
+        use crate::key_index::{TRACE_ID_FIELD, trace_id_in_bucket};
+        use crate::reader::RspanReader;
+
+        let traces = |n: u64| -> Vec<SpanRecord> {
+            (0..n)
+                .map(|j| SpanRecord {
+                    trace_id: trace_id_in_bucket(17, j),
+                    ..span(0, j as u8, j as i64, j as i64 + 1)
+                })
+                .collect()
+        };
+        let writer = |cfg: RspanConfig, records: &[SpanRecord]| {
+            let mut w = RspanWriter::new(cfg, identity());
+            w.key_idx_bucket_cap = 4;
+            for r in records {
+                w.push(r.clone());
+            }
+            w
+        };
+        let is_overflow = |r: Result<Vec<u8>, SpanSegError>, want: u64| match r {
+            Err(SpanSegError::KeyIdxBucketOverflow {
+                bucket,
+                entries,
+                cap,
+            }) => bucket == 17 && entries == want && cap == 4,
+            _ => false,
+        };
+
+        let five = traces(5);
+        assert!(is_overflow(
+            writer(RspanConfig::default(), &five).finish(),
+            5
+        ));
+        assert!(is_overflow(
+            writer(RspanConfig::default(), &five).finish_compacted(1, vec![1], 0),
+            5
+        ));
+
+        let one_trace_five_blocks: Vec<SpanRecord> = (0..10)
+            .map(|s| SpanRecord {
+                trace_id: trace_id_in_bucket(17, 0),
+                ..span(0, s, i64::from(s), i64::from(s) + 1)
+            })
+            .collect();
+        let small_blocks = RspanConfig {
+            block_target_records: 2,
+            ..RspanConfig::default()
+        };
+        assert!(is_overflow(
+            writer(small_blocks, &one_trace_five_blocks).finish(),
+            5
+        ));
+
+        let bytes = writer(RspanConfig::default(), &traces(4))
+            .finish()
+            .expect("a bucket at the cap writes");
+        let cfg = RspanConfig::default();
+        let summary = RspanReader::new(&bytes, &cfg)
+            .expect("open")
+            .key_idx_summary()
+            .expect("summary");
+        assert_eq!(summary.fields[0].name, TRACE_ID_FIELD);
+        assert_eq!(summary.fields[0].bucket_entry_counts[17], 4);
+    }
+
+    /// A default writer carries the codec's cap.
+    #[test]
+    fn a_default_writer_caps_buckets_at_the_codec_limit() {
+        let w = RspanWriter::new(RspanConfig::default(), identity());
+        assert_eq!(w.key_idx_bucket_cap, KEY_IDX_BUCKET_MAX_ENTRIES);
+        assert_eq!(KEY_IDX_BUCKET_MAX_ENTRIES, 1 << 20);
     }
 }

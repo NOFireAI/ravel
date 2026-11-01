@@ -37,6 +37,13 @@ pub enum SpanSegError {
     ColumnNotRequested(u32),
     #[error("limit exceeded: {0}")]
     LimitExceeded(String),
+    /// One KEY_IDX bucket would hold more distinct `(key8, block)` entries
+    /// than the cap (`KEY_IDX_BUCKET_MAX_ENTRIES` outside tests), so the
+    /// object is refused before any section is framed. The input is valid but
+    /// too skewed for one object; the caller splits it (the span compactor
+    /// cuts its L1 parts so it never reaches this, issue #2985).
+    #[error("KEY_IDX bucket {bucket} holds {entries} entries, over the cap {cap}")]
+    KeyIdxBucketOverflow { bucket: u32, entries: u64, cap: u32 },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
