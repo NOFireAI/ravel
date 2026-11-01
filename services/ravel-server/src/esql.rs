@@ -184,7 +184,7 @@ fn respond(
             warnings.extend(sql.warnings());
             crate::sql::esql_stats_json(sql, audit_elapsed)
         }
-        EsqlRun::Row(_) => crate::query::accounting_stats_json(&accounting, &estimate),
+        EsqlRun::Row(_) => crate::query::accounting_stats_json(&accounting, 0, &estimate),
     };
 
     let mut data = outcome

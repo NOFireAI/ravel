@@ -1148,6 +1148,12 @@ pub struct TenantDelegatingPool {
     /// derived it from the plan. `None` sizes every envelope as
     /// [`AggregateProfile::Unknown`].
     aggregate_profile: Mutex<Option<AggregateProfile>>,
+    /// Bytes this query's consumers currently ask for, before any
+    /// reserve-ahead factor. Grows and shrinks by the amounts the
+    /// `MemoryPool` entry points receive, never by the charged amounts.
+    asked_used: AtomicUsize,
+    /// The high-water mark of `asked_used`.
+    peak_asked_bytes: AtomicU64,
 }
 
 impl fmt::Debug for TenantDelegatingPool {
@@ -1205,6 +1211,8 @@ impl TenantDelegatingPool {
             envelope_width: 1,
             aggregates: Mutex::new(HashMap::new()),
             aggregate_profile: Mutex::new(None),
+            asked_used: AtomicUsize::new(0),
+            peak_asked_bytes: AtomicU64::new(0),
         }
     }
 
@@ -1253,6 +1261,37 @@ impl TenantDelegatingPool {
             .aggregate_profile
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The high-water mark, over this query, of the bytes its consumers asked
+    /// for before any reserve-ahead factor. It equals the charged peak for a
+    /// plan with no reserve-ahead consumer.
+    pub fn peak_asked_bytes(&self) -> u64 {
+        self.peak_asked_bytes.load(Ordering::Acquire)
+    }
+
+    fn asked_grow(&self, asked: usize) {
+        let total = self
+            .asked_used
+            .fetch_add(asked, Ordering::AcqRel)
+            .saturating_add(asked);
+        self.peak_asked_bytes
+            .fetch_max(total as u64, Ordering::AcqRel);
+    }
+
+    fn asked_shrink(&self, asked: usize) {
+        let mut cur = self.asked_used.load(Ordering::Acquire);
+        loop {
+            match self.asked_used.compare_exchange_weak(
+                cur,
+                cur.saturating_sub(asked),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 
     /// Bytes this pool currently holds for hash aggregate consumers. They are
@@ -1374,6 +1413,7 @@ impl TenantDelegatingPool {
             }
             return Err(error);
         }
+        self.asked_grow(next.asked.saturating_sub(state.asked));
         aggregates.insert(id, next);
         Ok(())
     }
@@ -1392,12 +1432,13 @@ impl TenantDelegatingPool {
             .charge(next.asked)
             .saturating_sub(self.reserve_ahead.charge(state.asked));
         self.grow_charged(consumer, charged);
+        self.asked_grow(next.asked.saturating_sub(state.asked));
         aggregates.insert(id, next);
     }
 
     /// Record a migrated aggregate's shrink and return the charged bytes it
-    /// frees. Its first shrink ends its build, and its envelope with it.
-    fn aggregate_shrink(&self, consumer: &MemoryConsumer, shrink: usize) -> usize {
+    /// frees, and the asked bytes it takes off the asked gauge. Its first shrink ends its build, and its envelope with it.
+    fn aggregate_shrink(&self, consumer: &MemoryConsumer, shrink: usize) -> (usize, usize) {
         let id = consumer.id();
         let mut aggregates = self.aggregates_map();
         let state = aggregates.entry(id).or_default();
@@ -1406,6 +1447,7 @@ impl TenantDelegatingPool {
             .reserve_ahead
             .charge(state.asked)
             .saturating_sub(self.reserve_ahead.charge(asked));
+        let asked_released = state.asked - asked;
         state.asked = asked;
         if !state.shrunk {
             state.shrunk = true;
@@ -1414,7 +1456,7 @@ impl TenantDelegatingPool {
                 self.set_envelope_unchecked(id, 0);
             }
         }
-        released
+        (released, asked_released)
     }
 
     /// Charge `amount` bytes for `consumer` unconditionally, serving what its
@@ -1695,6 +1737,7 @@ impl MemoryPool for TenantDelegatingPool {
             self.aggregate_grow(consumer, additional);
         } else {
             self.grow_charged(consumer, additional);
+            self.asked_grow(additional);
         }
     }
 
@@ -1704,11 +1747,12 @@ impl MemoryPool for TenantDelegatingPool {
         // makes a cancelled or dropped stream return its tenant reservation to
         // zero. A held aggregate's bytes return at its `unregister` instead.
         let consumer = reservation.consumer();
-        let charged = if self.reserves_ahead(consumer) {
+        let (charged, asked) = if self.reserves_ahead(consumer) {
             self.aggregate_shrink(consumer, shrink)
         } else {
-            shrink
+            (shrink, shrink)
         };
+        self.asked_shrink(asked);
         if self.holds_shrink(reservation) {
             self.hold(consumer.id(), charged);
         } else {
@@ -1721,7 +1765,9 @@ impl MemoryPool for TenantDelegatingPool {
         if self.reserves_ahead(consumer) {
             self.aggregate_try_grow(consumer, additional)
         } else {
-            self.try_grow_charged(consumer, additional)
+            self.try_grow_charged(consumer, additional)?;
+            self.asked_grow(additional);
+            Ok(())
         }
     }
 
@@ -3261,5 +3307,79 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// FLIP: summing the charged delta instead of the asked delta in
+    /// `aggregate_try_grow` (`self.asked_grow(charged)`) reports 5,000,000
+    /// asked bytes on the default pool; dropping the `asked_shrink` call in
+    /// `shrink` leaves the peak at 5,000,000 after the shrink and smaller grow.
+    #[test]
+    fn peak_asked_intermediate_bytes_ignores_the_reserve_ahead_factor() {
+        const STEP: usize = 1_000_000;
+        let _serial = envelope_tests();
+        let drive = |reserve_ahead: AggregateReserveAhead| {
+            let budget = Arc::new(MemoryBudget::new(1 << 40));
+            let accounting = QueryAccounting::new();
+            let (_tenant, pool) = ahead_pool(&budget, 1, reserve_ahead, accounting.clone());
+            let res = register_on(&pool, "FinalHashAggregateStream[0]");
+            for _ in 0..4 {
+                res.try_grow(STEP).expect("within every ceiling");
+            }
+            let charged = accounting.snapshot().peak_intermediate_bytes;
+            assert_eq!(pool.peak_asked_bytes(), 4 * STEP as u64);
+
+            // A shrink then a smaller grow stays under the high-water mark.
+            res.shrink(3 * STEP);
+            res.try_grow(STEP).expect("within every ceiling");
+            assert_eq!(pool.peak_asked_bytes(), 4 * STEP as u64);
+            res.grow(STEP);
+            assert_eq!(pool.peak_asked_bytes(), 4 * STEP as u64);
+            (pool.peak_asked_bytes(), charged)
+        };
+        let (asked_default, charged_default) = drive(AggregateReserveAhead::DEFAULT);
+        let (asked_off, charged_off) = drive(AggregateReserveAhead::OFF);
+        assert_eq!(asked_default, asked_off);
+        assert_eq!(charged_off, 4_000_000);
+        assert_eq!(charged_default, 5_000_000);
+        assert_eq!(charged_default * 4, charged_off * 5);
+
+        // A refused try_grow adds nothing: the 5,000,000 charged bytes fill a
+        // 5,000,000 byte query ceiling, so 1,000 more asked (1,250 charged)
+        // is refused.
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let tenant = TenantMemoryAccountant::with_process_budget(1 << 40, Arc::clone(&budget));
+        let pool = Arc::new(
+            TenantDelegatingPool::new(
+                5_000_000,
+                tenant,
+                CeilingBreach::new(),
+                QueryAccounting::new(),
+            )
+            .with_aggregate_reserve_ahead(AggregateReserveAhead::DEFAULT, NonZeroUsize::MIN),
+        );
+        let res = register_on(&pool, "FinalHashAggregateStream[0]");
+        res.try_grow(4 * STEP).expect("exactly at the ceiling");
+        assert_eq!(pool.peak_asked_bytes(), 4_000_000);
+        res.try_grow(1_000).expect_err("over the query ceiling");
+        assert_eq!(pool.peak_asked_bytes(), 4_000_000);
+        assert_eq!(pool.reserved(), 5_000_000);
+    }
+
+    #[test]
+    fn peak_asked_bytes_counts_a_plain_consumer_one_to_one() {
+        const N: usize = 1_000_003;
+        let accounting = QueryAccounting::new();
+        let tenant = TenantMemoryAccountant::new(1 << 30);
+        let pool = Arc::new(
+            TenantDelegatingPool::new(1 << 30, tenant, CeilingBreach::new(), accounting.clone())
+                .with_aggregate_reserve_ahead(AggregateReserveAhead::DEFAULT, NonZeroUsize::MIN),
+        );
+        let res = register_on(&pool, "ExternalSorter[0]");
+        res.grow(N - 3);
+        res.try_grow(3).expect("within every ceiling");
+        assert_eq!(pool.peak_asked_bytes(), N as u64);
+        assert_eq!(accounting.snapshot().peak_intermediate_bytes, N as u64);
+        res.shrink(N);
+        assert_eq!(pool.peak_asked_bytes(), N as u64);
     }
 }

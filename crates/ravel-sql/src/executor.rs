@@ -156,7 +156,7 @@ use crate::ipcrypt_udf::{IpcryptDeployment, SessionPrincipal, SqlCapabilities};
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_pushdown::{extract_logs, prune_is_rewrite_neutral};
 use crate::logs_scan::ScanExecutions;
-use crate::memory::{CeilingBreach, TenantMemoryAccountant};
+use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
 use crate::min_commit_token::MinCommitToken;
 use crate::output::QueryOutput;
 use crate::parquet::{
@@ -1485,6 +1485,12 @@ pub struct SqlOutcome {
     /// attempt's discarded counters never bleed into this one: `run` builds
     /// a fresh [`QueryAccounting`] per attempt.
     pub accounting: QueryAccountingSnapshot,
+    /// The high-water mark of the bytes this query's memory consumers asked
+    /// for, before the hash aggregate reserve-ahead factor
+    /// ([`TenantDelegatingPool::peak_asked_bytes`]). Beside
+    /// `accounting.peak_intermediate_bytes`, which is charged with the factor.
+    /// Zero when the attempt failed before the stream started.
+    pub peak_asked_intermediate_bytes: u64,
     /// The same counters as [`Self::accounting`], split by [`QueryPhase`]
     /// (issue #796) rather than pooled: `accounting` is
     /// `phase_accounting.pooled()`, so the two never disagree on a total,
@@ -2488,6 +2494,7 @@ impl SqlExecutor {
                         output,
                         stats,
                         accounting,
+                        peak_asked_intermediate_bytes: caps.peak_asked_bytes,
                         phase_accounting: phase_snapshot,
                         signals: signal_stats(&lane_counts, &phase_accounting),
                         io_shape: if blocks.keyed_logs_scan {
@@ -4872,6 +4879,7 @@ impl SqlExecutor {
                         window_predicate,
                         row_cap_hit: false,
                         wall,
+                        peak_asked_bytes: 0,
                     },
                 );
             }
@@ -4908,6 +4916,7 @@ impl SqlExecutor {
                             window_predicate,
                             row_cap_hit: stream.row_cap_hit(),
                             wall,
+                            peak_asked_bytes: stream.peak_asked_bytes(),
                         },
                     );
                 }
@@ -4929,6 +4938,7 @@ impl SqlExecutor {
                 window_predicate,
                 row_cap_hit: stream.row_cap_hit(),
                 wall,
+                peak_asked_bytes: stream.peak_asked_bytes(),
             },
         )
     }
@@ -4944,6 +4954,7 @@ struct AttemptCaps {
     window_predicate: Option<String>,
     row_cap_hit: bool,
     wall: PhaseWallTiming,
+    peak_asked_bytes: u64,
 }
 
 /// A query planned against one pinned snapshot, not yet executing.
@@ -5285,6 +5296,14 @@ impl PinnedStream {
         let mut counts = BlockCounts::default();
         accumulate_block_counts(&self.plan, &mut counts);
         counts
+    }
+
+    /// The pool's pre-factor high-water mark of requested bytes, 0 when the
+    /// stream's pool is not a [`TenantDelegatingPool`].
+    fn peak_asked_bytes(&self) -> u64 {
+        self.pool
+            .downcast_ref::<TenantDelegatingPool>()
+            .map_or(0, TenantDelegatingPool::peak_asked_bytes)
     }
 
     /// This query's spill totals and their per-operator attribution
