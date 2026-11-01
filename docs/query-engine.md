@@ -1682,9 +1682,10 @@ still reference the aggregate's whole buffers. What bounds the charge there
 is the exchange's coalescer, which copies a piece of at most half a
 `batch_size` into buffers of its own. The over-count survives a larger
 piece (two partitions, or skewed keys), `preserve_order`, and unbounded
-input, which run without a coalescer; that gap is accepted. The exec is a
-one-child pass-through with its input's partitioning, ordering and
-distribution. Its stream measures the bytes each batch's rows reference,
+input, which run without a coalescer; that gap is accepted. The exec has
+one child and its input's partitioning and distribution; without the TopK
+pre-filter below it passes every row through in order and reports its
+input's ordering and statistics. Its stream measures the bytes each batch's rows reference,
 into nested columns (a List's child range, a Dictionary's keys slice plus
 each distinct value its keys point at, once, a Struct's sliced children, a
 byte-view column's referenced data), copies each batch whose charge is more
@@ -1728,7 +1729,14 @@ cut to its own top `k` rows by that ordering before it is compacted. A row
 outside its batch's top `k` cannot be in the global top `k`, so the answer is
 the same, except that at a tie on the k-th value the tied row that survives
 may differ, as SQL allows. The plan shows `topk=[...], fetch=k` on the exec,
-and its `topk_dropped_rows` metric counts the rows cut. This is pinned by
+and its `topk_dropped_rows` metric counts the rows cut. Because the exec then
+drops all but `k` rows of each batch and reorders the rows it keeps, it
+reports a cardinality that can only shrink, no maintained input order and no
+output ordering, and an inexact row count of at most `k` times its estimated
+input batches (`ceil(rows / batch_size)` plus one per extra partition), which
+`EXPLAIN` with `datafusion.explain.show_statistics` prints on its line
+(`the_topk_prefilter_reports_fewer_rows_and_no_order`,
+`explain_shows_the_prefilters_bounded_row_count`). This is pinned by
 `the_topk_prefilter_engages_only_under_a_topk_through_projections`,
 `prop_topk_prefilter_keeps_the_topk_answer` and
 `the_q34_shape_plans_the_topk_prefilter_and_answers_the_same`.

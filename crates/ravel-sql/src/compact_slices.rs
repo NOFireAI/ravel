@@ -128,6 +128,16 @@
 //! the aggregate's output after the mapping leave the exec as described
 //! above (`the_topk_prefilter_engages_only_under_a_topk_through_projections`).
 //!
+//! With the pre-filter on, the exec keeps at most `k` rows of each batch, in
+//! the TopK's order rather than its input's, and its plan properties say so:
+//! `CardinalityEffect::LowerEqual`, no maintained input order, no output
+//! ordering, and an inexact row count of at most `k` per input batch, the
+//! batches estimated from the session's `batch_size`
+//! (`prefiltered_statistics`;
+//! `the_topk_prefilter_reports_fewer_rows_and_no_order`). Without it every
+//! property is its input's
+//! (`without_the_prefilter_the_exec_reports_its_inputs_properties`).
+//!
 //! The answer is unchanged: a row outside its own batch's top `k` has `k`
 //! rows ahead of it in the same batch, and those reach the same TopK, so it
 //! cannot be in the TopK's result. When several rows tie with the `k`-th
@@ -155,6 +165,7 @@ use datafusion::arrow::datatypes::{ByteViewType, DataType, FieldRef, Schema};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::Result as DFResult;
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
@@ -202,9 +213,9 @@ impl PhysicalOptimizerRule for CompactSlices {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        rewrite(plan, false, None)
+        rewrite(plan, false, None, config.execution.batch_size.get())
     }
 
     fn name(&self) -> &str {
@@ -256,11 +267,13 @@ fn passes_batches_through(node: &Arc<dyn ExecutionPlan>) -> bool {
 /// capacity, on the input this node feeds, which is the only thing the
 /// decision at an aggregate depends on. `topk_above` is the TopK this node's
 /// output reaches through projections and fetch-less partition merges, its
-/// ordering in this node's output columns.
+/// ordering in this node's output columns. `batch_size` is the session's, the
+/// size of the slices an aggregate hands out.
 fn rewrite(
     node: Arc<dyn ExecutionPlan>,
     charged_above: bool,
     topk_above: Option<TopKPrefilter>,
+    batch_size: usize,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
     let charged_below = if charges_by_capacity(&node) {
         true
@@ -276,7 +289,7 @@ fn rewrite(
     let mut changed = false;
     for (index, child) in children.into_iter().enumerate() {
         let charged = charged_below || join_charges_child(&node, index);
-        let new_child = rewrite(Arc::clone(child), charged, topk_below.clone())?;
+        let new_child = rewrite(Arc::clone(child), charged, topk_below.clone(), batch_size)?;
         changed |= !Arc::ptr_eq(child, &new_child);
         rewritten.push(new_child);
     }
@@ -291,7 +304,11 @@ fn rewrite(
 
     if charged_above && node.is::<AggregateExec>() {
         let topk = topk_above.filter(|topk| topk.fits(&node.schema()));
-        return Ok(Arc::new(CompactSlicesExec::new(node).with_topk(topk)));
+        return Ok(Arc::new(
+            CompactSlicesExec::new(node)
+                .with_batch_size(batch_size)
+                .with_topk(topk),
+        ));
     }
     Ok(node)
 }
@@ -377,12 +394,19 @@ impl TopKPrefilter {
     }
 }
 
-/// A pass-through whose stream gives every sliced batch buffers of its own.
-/// One child, same partitioning, same ordering, same rows. See the module
+/// An exec whose stream gives every sliced batch buffers of its own. One
+/// child, same partitioning. Without the TopK pre-filter it passes every row
+/// through in order and reports its input's properties unchanged. With it,
+/// it keeps at most `k` rows of each batch, sorted by the TopK's ordering,
+/// and reports that: [`CardinalityEffect::LowerEqual`], no maintained input
+/// order and no output ordering, and an inexact row count of at most `k` per
+/// estimated input batch
+/// (`the_topk_prefilter_reports_fewer_rows_and_no_order`). See the module
 /// docs.
 pub struct CompactSlicesExec {
     input: Arc<dyn ExecutionPlan>,
     topk: Option<TopKPrefilter>,
+    batch_size: Option<usize>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -419,18 +443,30 @@ impl CompactMetrics {
 impl CompactSlicesExec {
     /// Wrap `input`. Every plan property is the input's own.
     pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
-        let properties = Arc::new(PlanProperties::new(
-            input.equivalence_properties().clone(),
-            input.output_partitioning().clone(),
-            input.pipeline_behavior(),
-            input.boundedness(),
-        ));
+        let properties = Self::properties_over(&input, false);
         CompactSlicesExec {
             input,
             topk: None,
+            batch_size: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// The input's plan properties, less its orderings when the pre-filter
+    /// reorders rows. Constants, equivalences and constraints hold on any
+    /// subset of the input's rows, so they stay.
+    fn properties_over(input: &Arc<dyn ExecutionPlan>, prefiltered: bool) -> Arc<PlanProperties> {
+        let mut equivalence = input.equivalence_properties().clone();
+        if prefiltered {
+            equivalence.clear_orderings();
+        }
+        Arc::new(PlanProperties::new(
+            equivalence,
+            input.output_partitioning().clone(),
+            input.pipeline_behavior(),
+            input.boundedness(),
+        ))
     }
 
     /// Pre-filter each batch to its own top rows for the TopK above (see the
@@ -439,6 +475,15 @@ impl CompactSlicesExec {
     pub fn with_topk(mut self, topk: Option<TopKPrefilter>) -> Self {
         let schema = self.input.schema();
         self.topk = topk.filter(|topk| topk.fits(&schema));
+        self.properties = Self::properties_over(&self.input, self.topk.is_some());
+        self
+    }
+
+    /// The rows per input batch the pre-filter's row-count estimate assumes:
+    /// the session's `batch_size`, the size of the slices an aggregate hands
+    /// out. Without it the pre-filter's row count is `Absent`.
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = Some(batch_size);
         self
     }
 
@@ -447,7 +492,7 @@ impl CompactSlicesExec {
         self.topk.as_ref()
     }
 
-    /// The plan this exec passes through.
+    /// The exec's input.
     pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
         &self.input
     }
@@ -489,7 +534,7 @@ impl ExecutionPlan for CompactSlicesExec {
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true]
+        vec![self.topk.is_none()]
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
@@ -513,9 +558,9 @@ impl ExecutionPlan for CompactSlicesExec {
                 children.len()
             )));
         }
-        Ok(Arc::new(
-            CompactSlicesExec::new(children.swap_remove(0)).with_topk(self.topk.clone()),
-        ))
+        let mut exec = CompactSlicesExec::new(children.swap_remove(0));
+        exec.batch_size = self.batch_size;
+        Ok(Arc::new(exec.with_topk(self.topk.clone())))
     }
 
     fn execute(
@@ -550,16 +595,76 @@ impl ExecutionPlan for CompactSlicesExec {
     fn statistics_from_inputs(
         &self,
         input_stats: &[Arc<Statistics>],
-        _args: &StatisticsArgs,
+        args: &StatisticsArgs,
     ) -> DFResult<Arc<Statistics>> {
-        input_stats.first().cloned().ok_or_else(|| {
+        let input = input_stats.first().ok_or_else(|| {
             DataFusionError::Internal("CompactSlicesExec: no input statistics".to_string())
-        })
+        })?;
+        let Some(topk) = &self.topk else {
+            return Ok(Arc::clone(input));
+        };
+        let partitions = match args.partition() {
+            Some(_) => 1,
+            None => self.input.output_partitioning().partition_count(),
+        };
+        Ok(Arc::new(prefiltered_statistics(
+            input,
+            topk.fetch,
+            self.batch_size,
+            partitions,
+        )))
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
-        CardinalityEffect::Equal
+        match self.topk {
+            Some(_) => CardinalityEffect::LowerEqual,
+            None => CardinalityEffect::Equal,
+        }
     }
+}
+
+/// The statistics of the pre-filter's output over `input`, which arrives in
+/// `partitions` partitions of `batch_size`-row batches. Each batch keeps at
+/// most `k` rows, and `ceil(rows / batch_size) + partitions - 1` bounds the
+/// batch count when every batch but each partition's last is full, as an
+/// aggregate's slices are; so the row count is `min(rows, k * batches)`,
+/// inexact because a smaller batch breaks that bound. Every other figure
+/// becomes inexact, and the byte sizes scale with the row count.
+fn prefiltered_statistics(
+    input: &Statistics,
+    k: usize,
+    batch_size: Option<usize>,
+    partitions: usize,
+) -> Statistics {
+    let rows_in = input.num_rows.get_value().copied();
+    let rows_out = match (rows_in, batch_size) {
+        (Some(rows), Some(batch_size)) if batch_size > 0 => {
+            let batches = rows
+                .div_ceil(batch_size)
+                .saturating_add(partitions.saturating_sub(1));
+            Some(rows.min(k.saturating_mul(batches)))
+        }
+        _ => None,
+    };
+    let scale = |bytes: Precision<usize>| match (bytes.get_value(), rows_in, rows_out) {
+        (Some(&bytes), Some(rows_in), Some(rows_out)) => Precision::Inexact(
+            (bytes as u128 * rows_out as u128)
+                .checked_div(rows_in as u128)
+                .map_or(0, |scaled| scaled as usize),
+        ),
+        _ => Precision::Absent,
+    };
+    let mut stats = input.clone().to_inexact();
+    stats.num_rows = rows_out.map_or(Precision::Absent, Precision::Inexact);
+    stats.total_byte_size = scale(stats.total_byte_size);
+    for column in &mut stats.column_statistics {
+        column.byte_size = scale(column.byte_size);
+        if let Some(rows) = rows_out {
+            column.null_count = column.null_count.min(&Precision::Inexact(rows));
+            column.distinct_count = column.distinct_count.min(&Precision::Inexact(rows));
+        }
+    }
+    stats
 }
 
 /// The bytes `batch`'s rows reference: for a slice, the slice's own share.
@@ -869,8 +974,9 @@ mod tests {
     use datafusion::arrow::buffer::{Buffer, OffsetBuffer};
     use datafusion::arrow::compute::{SortOptions, concat_batches};
     use datafusion::arrow::datatypes::{Field, Int32Type, Int64Type, Schema, SchemaRef};
-    use datafusion::common::{ScalarValue, SplitPoint};
+    use datafusion::common::{ColumnStatistics, ScalarValue, SplitPoint};
     use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
     use datafusion::functions_aggregate::count::count_udaf;
     use datafusion::logical_expr::Operator;
     use datafusion::physical_expr::RangePartitioning;
@@ -879,6 +985,7 @@ mod tests {
     use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion::physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
+    use datafusion::physical_plan::statistics::StatisticsContext;
     use datafusion::physical_plan::{collect, displayable};
     use proptest::prelude::*;
 
@@ -2159,6 +2266,216 @@ mod tests {
             Some(10),
         );
         assert_eq!(placed_topk(computed), None, "a computed sort key");
+    }
+
+    // ----- plan properties -----
+
+    /// Rows per partition and partitions of [`sorted_scan`], the `k` and the
+    /// session `batch_size` of the plan-property fixtures.
+    const PROPERTY_ROWS: usize = 250;
+    const PROPERTY_PARTITIONS: usize = 4;
+    const PROPERTY_K: usize = 10;
+    const PROPERTY_BATCH_SIZE: usize = 64;
+
+    /// [`PROPERTY_PARTITIONS`] partitions of [`batch_of`]`(PROPERTY_ROWS)`,
+    /// declared sorted on `k`, which each partition is.
+    fn sorted_scan() -> Arc<dyn ExecutionPlan> {
+        let partitions = vec![vec![batch_of(PROPERTY_ROWS)]; PROPERTY_PARTITIONS];
+        let k_asc = LexOrdering::new([PhysicalSortExpr::new(
+            col("k", &schema()).expect("k"),
+            SortOptions::default(),
+        )])
+        .expect("one sort key");
+        let source = MemorySourceConfig::try_new(&partitions, schema(), None)
+            .expect("source")
+            .try_with_sort_information(vec![k_asc])
+            .expect("sorted on k");
+        DataSourceExec::from_data_source(source)
+    }
+
+    /// `c DESC` over `count(v) AS c, k` over a per-partition aggregate on
+    /// [`sorted_scan`], through a `CoalescePartitionsExec`, the rule run at
+    /// [`PROPERTY_BATCH_SIZE`]: the q34 chain. Returns the one exec.
+    fn placed_exec(fetch: Option<usize>) -> Arc<dyn ExecutionPlan> {
+        fn find(node: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+            if node.is::<CompactSlicesExec>() {
+                return Some(Arc::clone(node));
+            }
+            node.children().into_iter().find_map(find)
+        }
+        let plan = sort_by_c(
+            Arc::new(CoalescePartitionsExec::new(project_count_as_c(single(
+                sorted_scan(),
+            )))),
+            fetch,
+        );
+        let mut config = ConfigOptions::default();
+        config.execution.batch_size =
+            datafusion::common::config::ConfigNonZeroUsize::try_new(PROPERTY_BATCH_SIZE)
+                .expect("nonzero");
+        let optimized = CompactSlices.optimize(plan, &config).expect("rule runs");
+        let text = plan_text(&optimized);
+        find(&optimized).unwrap_or_else(|| panic!("an exec:\n{text}"))
+    }
+
+    fn statistics_of(plan: &Arc<dyn ExecutionPlan>) -> Arc<Statistics> {
+        StatisticsContext::new()
+            .compute(plan.as_ref(), &StatisticsArgs::new())
+            .expect("statistics")
+    }
+
+    /// With the pre-filter on, the exec reports that it drops rows, keeps no
+    /// order, and forwards no ordering, and its row count is inexact and
+    /// bounded: 4 partitions of 250 rows, which the aggregate estimates as
+    /// `Inexact(1000)`, in 64-row batches is `ceil(1000 / 64) + 4 - 1 = 19`
+    /// batches, so at most `10 * 19 = 190` rows.
+    ///
+    /// FLIP: report `Equal`, `[true]`, the input's statistics and the input's
+    /// equivalence properties and all four observed values differ, `(false,
+    /// [true], false, Inexact(1000))`; fix `maintains_input_order` alone and
+    /// three still do, `(false, [false], false, Inexact(1000))`.
+    #[test]
+    fn the_topk_prefilter_reports_fewer_rows_and_no_order() {
+        let exec = placed_exec(Some(PROPERTY_K));
+        let compact = exec.downcast_ref::<CompactSlicesExec>().expect("an exec");
+        assert!(compact.topk().is_some(), "the pre-filter is on");
+        let input = Arc::clone(compact.input());
+        assert!(
+            input.output_ordering().is_some(),
+            "the aggregate's input order is the fixture's premise"
+        );
+        assert_eq!(
+            statistics_of(&input).num_rows,
+            Precision::Inexact(PROPERTY_PARTITIONS * PROPERTY_ROWS)
+        );
+
+        // One assertion over all four, so a failure shows every property.
+        let observed = (
+            matches!(exec.cardinality_effect(), CardinalityEffect::LowerEqual),
+            exec.maintains_input_order(),
+            exec.output_ordering().is_none(),
+            statistics_of(&exec).num_rows,
+        );
+        assert_eq!(
+            observed,
+            (true, vec![false], true, Precision::Inexact(190)),
+            "(cardinality LowerEqual, maintains input order, no ordering forwarded, row count)"
+        );
+    }
+
+    /// Without the pre-filter every property is the input's own: `Equal`,
+    /// order maintained, the input's ordering, and the input's statistics,
+    /// which over a bare scan are its exact row count.
+    #[test]
+    fn without_the_prefilter_the_exec_reports_its_inputs_properties() {
+        let exec = placed_exec(None);
+        let compact = exec.downcast_ref::<CompactSlicesExec>().expect("an exec");
+        assert!(compact.topk().is_none(), "the pre-filter is off");
+        let input = Arc::clone(compact.input());
+        assert!(matches!(
+            exec.cardinality_effect(),
+            CardinalityEffect::Equal
+        ));
+        assert_eq!(exec.maintains_input_order(), vec![true]);
+        assert!(input.output_ordering().is_some());
+        assert_eq!(exec.output_ordering(), input.output_ordering());
+        assert_eq!(statistics_of(&exec), statistics_of(&input));
+
+        let over_scan: Arc<dyn ExecutionPlan> = Arc::new(CompactSlicesExec::new(sorted_scan()));
+        assert_eq!(
+            statistics_of(&over_scan).num_rows,
+            Precision::Exact(PROPERTY_PARTITIONS * PROPERTY_ROWS)
+        );
+        assert_eq!(over_scan.output_ordering(), sorted_scan().output_ordering());
+    }
+
+    /// Every figure the dropped rows could change comes out inexact, the row
+    /// count is `min(rows, k * batches)`, and the byte sizes scale with it.
+    #[test]
+    fn prefiltered_statistics_are_inexact_and_bounded() {
+        let column = ColumnStatistics {
+            null_count: Precision::Exact(500),
+            max_value: Precision::Exact(ScalarValue::Int64(Some(999))),
+            min_value: Precision::Exact(ScalarValue::Int64(Some(0))),
+            sum_value: Precision::Exact(ScalarValue::Int64(Some(499_500))),
+            distinct_count: Precision::Exact(1000),
+            byte_size: Precision::Exact(8000),
+        };
+        let input = Statistics {
+            num_rows: Precision::Exact(1000),
+            total_byte_size: Precision::Exact(8000),
+            column_statistics: vec![column],
+        };
+        // 1000 rows in 64-row batches over 4 partitions: 19 batches, 190 rows.
+        let out = prefiltered_statistics(&input, 10, Some(64), 4);
+        assert_eq!(out.num_rows, Precision::Inexact(190));
+        assert_eq!(out.total_byte_size, Precision::Inexact(1520));
+        assert_eq!(
+            out.column_statistics,
+            vec![ColumnStatistics {
+                null_count: Precision::Inexact(190),
+                max_value: Precision::Inexact(ScalarValue::Int64(Some(999))),
+                min_value: Precision::Inexact(ScalarValue::Int64(Some(0))),
+                sum_value: Precision::Inexact(ScalarValue::Int64(Some(499_500))),
+                distinct_count: Precision::Inexact(190),
+                byte_size: Precision::Inexact(1520),
+            }]
+        );
+        // Fewer rows than k per batch: the input's count, inexact.
+        let few = prefiltered_statistics(&input, 100, Some(64), 4);
+        assert_eq!(few.num_rows, Precision::Inexact(1000));
+        // No batch size or no row count: no figure.
+        let no_batch_size = prefiltered_statistics(&input, 10, None, 4);
+        assert_eq!(no_batch_size.num_rows, Precision::Absent);
+        assert_eq!(no_batch_size.total_byte_size, Precision::Absent);
+        let unknown = Statistics::new_unknown(&schema());
+        assert_eq!(
+            prefiltered_statistics(&unknown, 10, Some(64), 4).num_rows,
+            Precision::Absent
+        );
+    }
+
+    /// `EXPLAIN` with `datafusion.explain.show_statistics` on a ClickBench
+    /// q34-shaped statement (`GROUP BY` a key, `ORDER BY count(*) DESC LIMIT
+    /// 10`) shows the exec's bounded inexact row count: 1000 rows over 4
+    /// partitions at `batch_size` 64 is `min(1000, 10 * 19) = 190`.
+    #[tokio::test]
+    async fn explain_shows_the_prefilters_bounded_row_count() {
+        let mut config = datafusion::prelude::SessionConfig::new()
+            .with_target_partitions(PROPERTY_PARTITIONS)
+            .with_batch_size(PROPERTY_BATCH_SIZE);
+        config.options_mut().explain.show_statistics = true;
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_config(config)
+            .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(CompactSlices))
+            .build();
+        let ctx = datafusion::prelude::SessionContext::new_with_state(state);
+        let table = datafusion::datasource::MemTable::try_new(
+            schema(),
+            vec![vec![batch_of(PROPERTY_PARTITIONS * PROPERTY_ROWS)]],
+        )
+        .expect("table");
+        ctx.register_table("hits", Arc::new(table))
+            .expect("register");
+        let explained = ctx
+            .sql("EXPLAIN SELECT k, count(*) AS c FROM hits GROUP BY k ORDER BY c DESC LIMIT 10")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("explain");
+        let text = datafusion::arrow::util::pretty::pretty_format_batches(&explained)
+            .expect("format")
+            .to_string();
+        let exec_line = text
+            .lines()
+            .find(|line| line.contains("CompactSlicesExec"))
+            .unwrap_or_else(|| panic!("an exec:\n{text}"));
+        assert!(
+            exec_line.contains("fetch=10, statistics=[Rows=Inexact(190),"),
+            "the exec's line:\n{text}"
+        );
     }
 
     // ----- exactness -----
