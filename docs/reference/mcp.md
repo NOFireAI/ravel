@@ -138,6 +138,9 @@ of each field.
 Integers and timestamps travel as JSON strings for every value, whatever
 its magnitude, so parse them as strings.
 
+`visibility.min_commit_tokens_applied` echoes each token in the wire form the
+caller sent: on a SQL call a token qualified by table reads `<table>:<token>`.
+
 ### The byte cap
 
 `max_response_bytes` bounds the serialized size of this whole envelope, not

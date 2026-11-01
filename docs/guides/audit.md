@@ -357,10 +357,11 @@ shard.
 
 `audit` is one of the five tables that the SQL surface serves (`samples`,
 `logs`, `spans`, `alerts`, `audit`), on `POST /api/v1/sql` and on Flight SQL.
-`POST /api/v1/sql` can join `audit` with the other four tables; Flight SQL
-rejects a query that names two of them with `invalid_argument`, before any
-listing. See
-the [query guide](query.md) for the terms of a join.
+`POST /api/v1/sql` and Flight SQL can join `audit` with the other four
+tables, each read from its own snapshot. A `min_commit_token` on such a join
+is qualified with the table it bounds (`audit:<token>`), and the join's
+memory ceiling is best-effort. See the [query guide](query.md) for the terms
+of a join.
 
 The table has no kind-specific column. Everything specific to a kind is in the
 `attrs` map.

@@ -127,7 +127,7 @@ assumed.
 
 Add a `Spans` arm to `SessionTable` and register `SpansTableProvider` in
 `build_session`, following the one-signal-per-query rule ADR-0033
-established for logs: the target table is decided from the `FROM` clause
+established for logs (since replaced by ADR-2904): the target table is decided from the `FROM` clause
 before planning, and a query naming two real tables is rejected before
 any catalog listing. Extend `SpansPushdown` with the duration, status,
 and service predicates the v2 structures make prunable, under the
@@ -213,12 +213,14 @@ runs out of memory, not whether.
   the bloom, which is sized from its own block's distinct token count.
 - The spans SQL table becomes a public surface. It inherits the same
   tenant resolution, budgets, and one-signal-per-query rule the samples
-  and logs tables already have.
+  and logs tables already have. ADR-2904 replaces that rule; see the
+  ADR-2904 amendment below.
 - Span links remain unstored. That is a named gap, not an oversight.
 
 ## Amendment (2026-10-11, ADR-2904): `spans` may be named beside other tables
 
-<!-- amendment-applies: sections="5. Register the spans table" pointer="ADR-2904" -->
+<!-- amendment-applies: sections="5. Register the spans table|Consequences" pointer="ADR-2904" -->
+<!-- amendment-supersedes: phrase="one-signal-per-query" pointer="ADR-2904" -->
 
 Decision 5 registered `spans` under the one-signal-per-query rule of
 ADR-0033. ADR-2904 replaces that rule: a statement may name `spans` together
