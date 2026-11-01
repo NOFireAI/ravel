@@ -134,6 +134,8 @@ mod memory_group_values_compensation;
 mod memory_pool_attribution;
 #[path = "merged_run_dedup_parity.rs"]
 mod merged_run_dedup_parity;
+#[path = "one_table_rule.rs"]
+mod one_table_rule;
 #[path = "page_walk.rs"]
 mod page_walk;
 #[path = "parallel_final_aggregation.rs"]

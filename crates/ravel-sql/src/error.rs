@@ -167,6 +167,18 @@ pub enum SqlError {
     )]
     CrossSignalQuery,
 
+    /// The statement names more than one base table, at most one of them a
+    /// signal table, on a surface that reads one table per statement: the
+    /// MCP SQL tools ([`crate::refuse_several_tables`]). Two signal tables
+    /// are [`SqlError::CrossSignalQuery`] instead. Refused from the statement
+    /// text before any store or catalog request. Its text echoes no table
+    /// name and no server state, so it is safe to return verbatim; HTTP 400.
+    #[error(
+        "this query surface reads one table per statement; send a statement \
+         that joins two or more tables to POST /api/v1/sql or Flight SQL"
+    )]
+    OneTablePerStatement,
+
     /// A Flight SQL ticket that pins one snapshot (version 8 or 9) carries a
     /// statement naming two or more signal tables. GetFlightInfo mints such a
     /// statement as version 10, one segment group per signal (ADR-2904
@@ -617,6 +629,7 @@ impl SqlError {
             SqlError::PlanNotAdmitted(_) => ErrorClass::Internal,
             SqlError::Validation(_)
             | SqlError::CrossSignalQuery
+            | SqlError::OneTablePerStatement
             | SqlError::TicketPinsOneSignal
             | SqlError::RowWindowNotPinned
             | SqlError::PinnedSignalsMismatch { .. }
@@ -691,8 +704,10 @@ impl SqlError {
     pub fn client_message(&self) -> String {
         match self {
             SqlError::Validation(e) => e.to_string(),
-            // Safe to echo: the text names only the fixed table names.
+            // Safe to echo: the text names only the fixed table names, or
+            // none.
             SqlError::CrossSignalQuery
+            | SqlError::OneTablePerStatement
             | SqlError::TicketPinsOneSignal
             | SqlError::RowWindowNotPinned
             | SqlError::PinnedSignalsMismatch { .. }
@@ -2044,6 +2059,29 @@ mod tests {
         );
         assert!(!err.client_message().contains("HTTP SQL endpoint"), "{err}");
         // It carries no server state to redact.
+        assert_redacted(&err.client_message());
+    }
+
+    /// The MCP tools' refusal of a second table that is not a signal table is
+    /// a 400 like `CrossSignalQuery`, returned verbatim, names where to send
+    /// the join, and echoes no table name.
+    ///
+    /// FLIP: moving `OneTablePerStatement` to the `ErrorClass::Unsupported`
+    /// arm of `class`, or to the redacting arm of `client_message`, fails the
+    /// first or second assertion.
+    #[test]
+    fn one_table_per_statement_is_a_bad_request_that_keeps_its_own_text() {
+        let err = SqlError::OneTablePerStatement;
+        assert_eq!(err.class(), ErrorClass::BadRequest);
+        assert_eq!(err.client_message(), err.to_string());
+        assert!(
+            err.client_message()
+                .contains("POST /api/v1/sql or Flight SQL"),
+            "{err}"
+        );
+        for table in ["samples", "logs", "spans", "alerts", "audit"] {
+            assert!(!err.client_message().contains(table), "{err}");
+        }
         assert_redacted(&err.client_message());
     }
 
