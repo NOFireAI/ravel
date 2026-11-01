@@ -894,23 +894,15 @@ async fn the_table_listing_requires_credentials() {
     server.stop().await;
 }
 
-/// The binary registers the real Flight SQL service on the gRPC listener.
-///
-/// A query-only process binds gRPC only because `flight-sql` is on (gRPC
-/// otherwise carries only OTLP ingest), and an unauthenticated
-/// `GetFlightInfo` answering `UNAUTHENTICATED` rather than `UNIMPLEMENTED` is
-/// what distinguishes the real service from C1a's stub.
-#[tokio::test]
-async fn the_server_registers_the_real_flight_sql_service() {
-    let tenant = TenantId::new("acme");
-    let mut tokens = HashMap::new();
-    tokens.insert("testtoken".to_string(), tenant);
-    let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
-    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-
-    let config = ServerConfig {
+/// A query-only server's config over `tenant_resolver`, writing query audits
+/// under `audit_pipeline`.
+fn query_server_config(
+    tenant_resolver: Arc<dyn ravel_tenant_resolve::TenantResolver>,
+    audit_pipeline: Option<ravel_maintain::AuditPipelineConfig>,
+) -> ServerConfig {
+    ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
-        audit_pipeline: Default::default(),
+        audit_pipeline,
         audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
@@ -970,7 +962,24 @@ async fn the_server_registers_the_real_flight_sql_service() {
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),
-    };
+    }
+}
+
+/// The binary registers the real Flight SQL service on the gRPC listener.
+///
+/// A query-only process binds gRPC only because `flight-sql` is on (gRPC
+/// otherwise carries only OTLP ingest), and an unauthenticated
+/// `GetFlightInfo` answering `UNAUTHENTICATED` rather than `UNIMPLEMENTED` is
+/// what distinguishes the real service from C1a's stub.
+#[tokio::test]
+async fn the_server_registers_the_real_flight_sql_service() {
+    let tenant = TenantId::new("acme");
+    let mut tokens = HashMap::new();
+    tokens.insert("testtoken".to_string(), tenant);
+    let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+    let config = query_server_config(tenant_resolver, Default::default());
     let running = ravel_server::start(
         config,
         store.clone(),
@@ -1141,4 +1150,299 @@ async fn distributed_flight_sql_reachable_end_to_end() {
     );
 
     server.stop().await;
+}
+
+const LABELLED_TOKEN: &str = "acme-labelled-token";
+const PLAIN_TOKEN: &str = "acme-plain-token";
+
+/// A resolver for `tenant` holding a token whose principal carries the
+/// subject `alice` and one whose principal carries none.
+fn subject_resolver(tenant: &TenantId) -> Arc<dyn ravel_tenant_resolve::TenantResolver> {
+    let mut labelled = ravel_tenant_resolve::Principal::tenant_only(tenant.clone());
+    labelled.subject = Some(
+        ravel_tenant_resolve::Subject::new(
+            ravel_tenant_resolve::SubjectSource::StaticToken,
+            "alice",
+        )
+        .expect("a valid subject"),
+    );
+    Arc::new(
+        ravel_tenant_resolve::StaticBearerTokenResolver::with_principals(HashMap::from([
+            (LABELLED_TOKEN.to_string(), labelled),
+            (
+                PLAIN_TOKEN.to_string(),
+                ravel_tenant_resolve::Principal::tenant_only(tenant.clone()),
+            ),
+        ])),
+    )
+}
+
+fn required_audit() -> Option<ravel_maintain::AuditPipelineConfig> {
+    Some(ravel_maintain::AuditPipelineConfig {
+        audit_mode: ravel_maintain::AuditMode::Required,
+        ..Default::default()
+    })
+}
+
+/// [`authed`], plus client-supplied subject headers no record may carry.
+fn spoofed<T>(message: T, token: &str) -> Request<T> {
+    let mut request = authed(message, token);
+    let metadata = request.metadata_mut();
+    metadata.insert("x-ravel-subject", "mallory".parse().expect("ascii"));
+    metadata.insert("x-ravel-client-cert-cn", "mallory".parse().expect("ascii"));
+    request
+}
+
+async fn grpc_client(
+    running: &ravel_server::Running,
+) -> FlightServiceClient<tonic::transport::Channel> {
+    let grpc_addr = running
+        .grpc_addr
+        .expect("query mode binds gRPC when flight-sql is on");
+    let channel = tonic::transport::Channel::from_shared(format!("http://{grpc_addr}"))
+        .expect("valid endpoint uri")
+        .connect()
+        .await
+        .expect("Flight client connects");
+    FlightServiceClient::new(channel)
+}
+
+/// Every `kind=query` record on `tenant`'s query-audit shard.
+async fn query_audit_records(store: &dyn ObjectStoreBackend, tenant: &TenantId) -> Vec<LogRecord> {
+    let prefix = keys::commit_shard_prefix(
+        &tenant.hash(),
+        Signal::Audit,
+        ravel_maintain::QUERY_AUDIT_SHARD,
+    )
+    .expect("audit commit prefix");
+    let cfg = RlogConfig::default();
+    let mut out = Vec::new();
+    for meta in ravel_object_store::list_all(store, &prefix)
+        .await
+        .expect("list audit commits")
+    {
+        let got = store
+            .get(&meta.key, ravel_object_store::GetRange::Full)
+            .await
+            .expect("get commit");
+        let commit = record::decode(&got.data).expect("decode commit");
+        let data_key = keys::reconstruct_data_key(&commit).expect("data key");
+        let object = store
+            .get(&data_key, ravel_object_store::GetRange::Full)
+            .await
+            .expect("get data");
+        let reader =
+            ravel_logseg::RlogReader::new(object.data.as_ref(), &cfg).expect("rlog reader");
+        let (rows, _stats) = reader
+            .scan(&ravel_logseg::Predicate::And(Vec::new()))
+            .expect("scan");
+        out.extend(
+            rows.into_iter()
+                .filter(|r| attr(r, "kind") == Some("query")),
+        );
+    }
+    out
+}
+
+/// [`query_audit_records`] once it holds `want` records. A `DoGet` records
+/// its audit as the stream ends, which can land just after the client has
+/// read the last message.
+async fn await_query_audit_records(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    want: usize,
+) -> Vec<LogRecord> {
+    for _ in 0..100 {
+        let records = query_audit_records(store, tenant).await;
+        if records.len() >= want {
+            return records;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    query_audit_records(store, tenant).await
+}
+
+fn attr<'a>(row: &'a LogRecord, key: &str) -> Option<&'a str> {
+    row.attrs
+        .iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            AttrValue::Str(s) => Some(s.as_str()),
+            _ => None,
+        })
+}
+
+/// A Flight SQL statement run through the real server writes a query-audit
+/// record naming the subject the caller's configured token carries, with its
+/// source; a token with no subject leaves both attributes off. Client-supplied
+/// `x-ravel-subject` and `x-ravel-client-cert-cn` metadata, sent with both
+/// tokens, reaches no record.
+#[tokio::test]
+async fn a_flight_sql_statement_audits_the_callers_configured_subject() {
+    const PLAIN_QUERY: &str = "SELECT value FROM samples ORDER BY ts";
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme");
+    publish_segment(store.as_ref(), &tenant, "m", &[(100, 1.0), (200, 2.5)]).await;
+    let running = ravel_server::start(
+        query_server_config(subject_resolver(&tenant), required_audit()),
+        store.clone(),
+        store.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("starts");
+    let mut client = grpc_client(&running).await;
+
+    for (token, query) in [(LABELLED_TOKEN, QUERY), (PLAIN_TOKEN, PLAIN_QUERY)] {
+        let command = CommandStatementQuery {
+            query: query.to_string(),
+            transaction_id: None,
+        };
+        let info = client
+            .get_flight_info(spoofed(descriptor(&command), token))
+            .await
+            .expect("flight info")
+            .into_inner();
+        let ticket = info
+            .endpoint
+            .first()
+            .expect("one endpoint")
+            .ticket
+            .clone()
+            .expect("a ticket");
+        let stream = client
+            .do_get(spoofed(ticket, token))
+            .await
+            .expect("do get")
+            .into_inner();
+        let (rows, _) = decode(stream).await.expect("decode");
+        assert_eq!(rows, 2, "{token}: every published sample comes back");
+    }
+
+    let records = await_query_audit_records(store.as_ref(), &tenant, 2).await;
+    assert_eq!(records.len(), 2, "one record per statement");
+    let by_text = |text: &str| {
+        records
+            .iter()
+            .find(|row| attr(row, "query.text") == Some(text))
+            .unwrap_or_else(|| panic!("no audit record for {text:?}"))
+    };
+    let labelled = by_text(QUERY);
+    assert_eq!(attr(labelled, "query.status"), Some("ok"));
+    assert_eq!(
+        attr(labelled, ravel_maintain::ATTR_PRINCIPAL_SUBJECT),
+        Some("alice")
+    );
+    assert_eq!(
+        attr(labelled, ravel_maintain::ATTR_PRINCIPAL_SUBJECT_SOURCE),
+        Some("static_token")
+    );
+    let plain = by_text(PLAIN_QUERY);
+    for key in [
+        ravel_maintain::ATTR_PRINCIPAL_SUBJECT,
+        ravel_maintain::ATTR_PRINCIPAL_SUBJECT_SOURCE,
+    ] {
+        assert!(
+            !plain.attrs.iter().any(|(k, _)| k == key),
+            "a token without a subject leaves {key} off"
+        );
+    }
+    for row in &records {
+        assert_eq!(
+            attr(row, "query.tenant"),
+            Some(tenant.hash().to_hex().as_str())
+        );
+        for (key, value) in &row.attrs {
+            assert!(
+                !matches!(value, AttrValue::Str(s) if s.contains("mallory")),
+                "client metadata reached the record under {key}"
+            );
+        }
+    }
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// A Flight SQL statement that fails before its stream starts writes its
+/// `error` record naming the caller's subject. Every segment GET reports the
+/// object missing, so `GetFlightInfo` (which reads no segment) answers and the
+/// `DoGet` fails before its first batch.
+#[tokio::test]
+async fn a_flight_sql_statement_failing_before_its_stream_audits_the_subject() {
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
+
+    let memory = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme");
+    publish_segment(memory.as_ref(), &tenant, "m", &[(100, 1.0), (200, 2.5)]).await;
+    let faulty = Arc::new(FaultStore::new(
+        Arc::clone(&memory),
+        FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+                .with_key_contains("/m/l0/")
+                .with_occurrence(Occurrence::Always),
+        ),
+    ));
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
+    let running = ravel_server::start(
+        query_server_config(subject_resolver(&tenant), required_audit()),
+        store.clone(),
+        store,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("starts");
+    let mut client = grpc_client(&running).await;
+
+    let command = CommandStatementQuery {
+        query: QUERY.to_string(),
+        transaction_id: None,
+    };
+    let info = client
+        .get_flight_info(spoofed(descriptor(&command), LABELLED_TOKEN))
+        .await
+        .expect("flight info")
+        .into_inner();
+    let ticket = info
+        .endpoint
+        .first()
+        .expect("one endpoint")
+        .ticket
+        .clone()
+        .expect("a ticket");
+    let failed = match client.do_get(spoofed(ticket, LABELLED_TOKEN)).await {
+        Err(status) => Err(status.to_string()),
+        Ok(stream) => decode(stream.into_inner())
+            .await
+            .map_err(|err| err.to_string()),
+    };
+    assert!(failed.is_err(), "the statement fails: {failed:?}");
+    assert!(
+        faulty.fault_count(Op::Get, FaultKind::NotFoundBlip) > 0,
+        "the segment fault fired"
+    );
+
+    let records = await_query_audit_records(memory.as_ref(), &tenant, 1).await;
+    assert_eq!(records.len(), 1, "one record for the failed statement");
+    let row = &records[0];
+    assert_eq!(attr(row, "query.status"), Some("error"));
+    assert_eq!(
+        attr(row, ravel_maintain::ATTR_PRINCIPAL_SUBJECT),
+        Some("alice")
+    );
+    assert_eq!(
+        attr(row, ravel_maintain::ATTR_PRINCIPAL_SUBJECT_SOURCE),
+        Some("static_token")
+    );
+    for (key, value) in &row.attrs {
+        assert!(
+            !matches!(value, AttrValue::Str(s) if s.contains("mallory")),
+            "client metadata reached the record under {key}"
+        );
+    }
+
+    running.shutdown().await.expect("graceful shutdown");
 }

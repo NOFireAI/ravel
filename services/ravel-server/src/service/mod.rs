@@ -54,7 +54,7 @@ use std::time::Duration;
 
 use axum::http::HeaderMap;
 use ravel_ingest::Clock;
-use ravel_maintain::{QueryAuditSink, QueryStatus};
+use ravel_maintain::{AuditSubject, QueryAuditSink, QueryStatus};
 use ravel_promql::Value;
 use ravel_query::http::service as core;
 use ravel_query::http::{
@@ -239,6 +239,10 @@ pub struct QueryService {
     exemplars: Option<crate::exemplars::ExemplarsState>,
     #[cfg(feature = "sql")]
     sql: Option<crate::sql::SqlState>,
+    /// The authenticated caller's subject, written to every audit record this
+    /// service submits (ADR-3541). Set per request by
+    /// [`Self::with_audit_subject`]; `None` writes no subject attributes.
+    audit_subject: Option<AuditSubject>,
 }
 
 impl QueryService {
@@ -267,6 +271,7 @@ impl QueryService {
             exemplars: None,
             #[cfg(feature = "sql")]
             sql: None,
+            audit_subject: None,
         }
     }
 
@@ -322,6 +327,26 @@ impl QueryService {
         authenticate(self.tenant_resolver.as_ref(), headers)
     }
 
+    /// [`Self::authenticate`], returning the full [`Principal`] so the caller
+    /// can hand its subject to [`Self::with_audit_subject`].
+    pub fn authenticate_principal(&self, headers: &HeaderMap) -> Result<Principal, ServiceError> {
+        authenticate_principal(self.tenant_resolver.as_ref(), headers)
+    }
+
+    /// This service, writing `subject` to the audit record of every operation
+    /// it runs. A transport calls it once per request with
+    /// `ravel_query::http::audit_subject` of the principal it authenticated.
+    pub fn with_audit_subject(mut self, subject: Option<AuditSubject>) -> Self {
+        self.audit_subject = subject;
+        self
+    }
+
+    /// The subject [`Self::with_audit_subject`] set, for a transport that
+    /// submits its own audit events through [`Self::controls`].
+    pub fn audit_subject(&self) -> Option<&AuditSubject> {
+        self.audit_subject.as_ref()
+    }
+
     /// The service clock's current reading.
     pub fn now_ns(&self) -> i64 {
         self.clock.now_ns()
@@ -347,7 +372,14 @@ impl QueryService {
         request: &InstantRequest,
     ) -> Result<InstantOutcome, ServiceError> {
         let engine = self.engine()?;
-        Ok(core::promql_instant(&self.controls, engine, tenant_hash, request).await?)
+        Ok(core::promql_instant(
+            &self.controls,
+            engine,
+            tenant_hash,
+            self.audit_subject.as_ref(),
+            request,
+        )
+        .await?)
     }
 
     /// `/api/v1/query_range`.
@@ -357,7 +389,14 @@ impl QueryService {
         request: &RangeRequest,
     ) -> Result<RangeOutcome, ServiceError> {
         let engine = self.engine()?;
-        Ok(core::promql_range(&self.controls, engine, tenant_hash, request).await?)
+        Ok(core::promql_range(
+            &self.controls,
+            engine,
+            tenant_hash,
+            self.audit_subject.as_ref(),
+            request,
+        )
+        .await?)
     }
 
     /// `/api/v1/labels`.
@@ -367,7 +406,14 @@ impl QueryService {
         request: &MetadataRequest,
     ) -> Result<LabelsOutcome, ServiceError> {
         let engine = self.engine()?;
-        Ok(core::labels(&self.controls, engine, tenant_hash, request).await?)
+        Ok(core::labels(
+            &self.controls,
+            engine,
+            tenant_hash,
+            self.audit_subject.as_ref(),
+            request,
+        )
+        .await?)
     }
 
     /// `/api/v1/label/{name}/values`.
@@ -383,6 +429,7 @@ impl QueryService {
             &self.controls,
             engine,
             tenant_hash,
+            self.audit_subject.as_ref(),
             request,
             name,
             include_log_metric_names,
@@ -397,7 +444,14 @@ impl QueryService {
         request: &MetadataRequest,
     ) -> Result<MetadataOutcome, ServiceError> {
         let engine = self.engine()?;
-        Ok(core::series(&self.controls, engine, tenant_hash, request).await?)
+        Ok(core::series(
+            &self.controls,
+            engine,
+            tenant_hash,
+            self.audit_subject.as_ref(),
+            request,
+        )
+        .await?)
     }
 
     /// `/api/v1/analytics`: the range evaluation an analytic is applied to,
@@ -464,6 +518,7 @@ impl QueryService {
                 "analytics",
                 (ms_to_ns(request.start_ms), ms_to_ns(request.end_ms)),
                 status,
+                self.audit_subject.as_ref(),
             )
             .await?;
         let (value, stats) = eval?;
@@ -528,6 +583,7 @@ impl QueryService {
                 "exemplars",
                 (request.start_ns, request.end_ns),
                 status,
+                self.audit_subject.as_ref(),
             )
             .await?;
         let (series, stats) = collected?;
@@ -638,6 +694,7 @@ impl QueryService {
                 "sql",
                 (request.window.start_ns, request.window.end_ns),
                 status,
+                self.audit_subject.as_ref(),
             )
             .await?;
         let audit_elapsed = audit_started.elapsed();
@@ -753,7 +810,15 @@ impl QueryService {
         });
         let audit_started = std::time::Instant::now();
         self.controls
-            .audit(tenant_hash, query.now_ns, text, "esql", window, status)
+            .audit(
+                tenant_hash,
+                query.now_ns,
+                text,
+                "esql",
+                window,
+                status,
+                self.audit_subject.as_ref(),
+            )
             .await?;
         let audit_elapsed = audit_started.elapsed();
         let outcome = result?;
@@ -811,6 +876,7 @@ impl QueryService {
                 "sql",
                 (request.window.start_ns, request.window.end_ns),
                 status,
+                self.audit_subject.as_ref(),
             )
             .await?;
         let report = result?;

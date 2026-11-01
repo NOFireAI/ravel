@@ -248,7 +248,9 @@ async fn handle(State(state): State<AnalyticsState>, req: Request<Body>) -> Resp
 async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, ServiceError> {
     let headers = req.headers().clone();
     // Before the service takes a permit, so an anonymous request consumes none.
-    let tenant_hash = crate::service::authenticate(state.tenant_resolver.as_ref(), &headers)?;
+    let principal =
+        crate::service::authenticate_principal(state.tenant_resolver.as_ref(), &headers)?;
+    let tenant_hash = principal.tenant.hash();
 
     let body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
         .await
@@ -290,7 +292,11 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Ser
         }
     }
 
-    let outcome = state.service().analytics(tenant_hash, &request).await?;
+    let outcome = state
+        .service()
+        .with_audit_subject(ravel_query::http::audit_subject(&principal))
+        .analytics(tenant_hash, &request)
+        .await?;
 
     let mut stats_json =
         crate::query::accounting_stats_json(&outcome.stats.accounting, &outcome.stats.estimate);

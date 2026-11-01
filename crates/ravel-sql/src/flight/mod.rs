@@ -123,6 +123,10 @@ pub use request::{END_KEY, START_KEY, TIMEOUT_KEY, min_commit_tokens_from_metada
 pub use service::{DISTRIB_SLICE_CONNECT_TIMEOUT, RavelFlightSqlService};
 pub use slice::{FlightListenerRole, SliceReject, SliceRejectCounters};
 
+/// The subject a [`FlightAuth::audit_subject`] returns, re-exported so an
+/// implementation names it without depending on ravel-maintain.
+pub use ravel_maintain::AuditSubject;
+
 /// The injected wall clock the Flight path reads.
 ///
 /// Library logic never calls `SystemTime::now()` (CLAUDE.md "Time is
@@ -159,6 +163,14 @@ pub trait FlightAuth: Send + Sync + 'static {
     /// case. [`min_commit_tokens_from_metadata`] is the parse the HTTP path
     /// uses, read from one metadata key.
     fn min_commit_tokens(&self, metadata: &MetadataMap) -> Result<Vec<MinCommitToken>, Status>;
+
+    /// The subject of the principal this request authenticates as, for the
+    /// statement's query-audit record (ADR-3541), or `None` when the
+    /// principal has none. Called once per audited statement `DoGet`, after
+    /// [`tenant`](Self::tenant) has accepted the same metadata; never on a
+    /// slice `DoGet`, which writes no audit record. The value goes on the
+    /// audit record and nowhere else.
+    fn audit_subject(&self, metadata: &MetadataMap) -> Result<Option<AuditSubject>, Status>;
 }
 
 /// Default cap on how long a Flight ticket may stay valid, standing in for

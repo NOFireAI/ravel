@@ -113,6 +113,13 @@ impl FlightAuth for BenchAuth {
     ) -> Result<Vec<ravel_sql::MinCommitToken>, tonic::Status> {
         Ok(Vec::new())
     }
+
+    fn audit_subject(
+        &self,
+        _metadata: &MetadataMap,
+    ) -> Result<Option<ravel_sql::flight::AuditSubject>, tonic::Status> {
+        Ok(None)
+    }
 }
 
 /// A clock frozen at [`NOW_NS`], matching the request `now_ns` the JSON path

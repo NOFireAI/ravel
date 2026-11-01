@@ -316,7 +316,9 @@ async fn run(state: ExemplarsState, req: Request<Body>) -> Result<Response, Serv
     let headers = req.headers().clone();
     let query_string = req.uri().query().map(str::to_owned);
     // Before the service takes a permit, so an anonymous request consumes none.
-    let tenant_hash = crate::service::authenticate(state.tenant_resolver.as_ref(), &headers)?;
+    let principal =
+        crate::service::authenticate_principal(state.tenant_resolver.as_ref(), &headers)?;
+    let tenant_hash = principal.tenant.hash();
 
     let body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
         .await
@@ -347,7 +349,11 @@ async fn run(state: ExemplarsState, req: Request<Body>) -> Result<Response, Serv
         deadline: parse_deadline(&params, state.deadline)?,
     };
 
-    let outcome = state.service().exemplars(tenant_hash, &request).await?;
+    let outcome = state
+        .service()
+        .with_audit_subject(ravel_query::http::audit_subject(&principal))
+        .exemplars(tenant_hash, &request)
+        .await?;
     Ok((
         StatusCode::OK,
         axum::Json(Envelope::success(outcome.series, outcome.stats)),

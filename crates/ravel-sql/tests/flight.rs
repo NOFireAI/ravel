@@ -1020,6 +1020,176 @@ async fn an_audit_write_failure_fails_the_flight_response_closed() {
     );
 }
 
+/// A [`ravel_sql::FlightAuth`] over a configured token map that also names
+/// each token's subject, counting every `audit_subject` call.
+struct SubjectAuth {
+    tokens:
+        std::collections::HashMap<String, (TenantHash, Option<ravel_sql::flight::AuditSubject>)>,
+    subject_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl SubjectAuth {
+    fn subject_calls(&self) -> usize {
+        self.subject_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn entry(
+        &self,
+        metadata: &MetadataMap,
+    ) -> Result<&(TenantHash, Option<ravel_sql::flight::AuditSubject>), tonic::Status> {
+        metadata
+            .get(TOKEN_KEY)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|token| self.tokens.get(token))
+            .ok_or_else(|| tonic::Status::unauthenticated("invalid or missing tenant credentials"))
+    }
+}
+
+impl ravel_sql::FlightAuth for SubjectAuth {
+    fn tenant(&self, metadata: &MetadataMap) -> Result<TenantHash, tonic::Status> {
+        self.entry(metadata).map(|(tenant, _)| *tenant)
+    }
+
+    fn min_commit_tokens(
+        &self,
+        _metadata: &MetadataMap,
+    ) -> Result<Vec<ravel_sql::MinCommitToken>, tonic::Status> {
+        Ok(Vec::new())
+    }
+
+    fn audit_subject(
+        &self,
+        metadata: &MetadataMap,
+    ) -> Result<Option<ravel_sql::flight::AuditSubject>, tonic::Status> {
+        self.subject_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.entry(metadata).map(|(_, subject)| subject.clone())
+    }
+}
+
+/// A Flight statement's audit record names the subject the caller's
+/// credential carries, with its source, and a credential without one leaves
+/// both attributes off the record. The subject is asked for once per audited
+/// statement: never by `GetFlightInfo`, and never by a slice `DoGet`, which
+/// writes no audit record.
+#[tokio::test]
+async fn a_successful_flight_statement_records_the_callers_subject() {
+    const PLAIN_QUERY: &str = "SELECT ts FROM samples ORDER BY series_id, ts";
+    let tenant = tenant_id("acme");
+    let seg_specs = specs();
+    let mut harness = Harness::memory(&[(&tenant, &seg_specs)]).await;
+    let alice = ravel_sql::flight::AuditSubject {
+        value: "alice".to_string(),
+        source: "static_token".to_string(),
+    };
+    let auth = Arc::new(SubjectAuth {
+        tokens: [
+            ("labelled".to_string(), (tenant.hash(), Some(alice))),
+            ("plain".to_string(), (tenant.hash(), None)),
+        ]
+        .into_iter()
+        .collect(),
+        subject_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let config = ravel_maintain::AuditPipelineConfig {
+        max_batch: 1,
+        max_age: Duration::from_millis(5),
+        shard: ravel_maintain::QUERY_AUDIT_SHARD,
+        audit_mode: ravel_maintain::AuditMode::Required,
+        channel_capacity: 64,
+    };
+    let sink: Arc<dyn ravel_maintain::QueryAuditSink> = Arc::new(
+        ravel_maintain::AuditPipeline::spawn(Arc::clone(&harness.store), config),
+    );
+    let service = |role: ravel_sql::FlightListenerRole| {
+        RavelFlightSqlService::new(
+            Arc::clone(&harness.executor),
+            Arc::clone(&auth) as Arc<dyn ravel_sql::FlightAuth>,
+            Arc::clone(&harness.clock) as Arc<dyn FlightClock>,
+            FlightSqlConfig {
+                max_deadline: Duration::from_secs(30),
+                ..FlightSqlConfig::default()
+            },
+            Arc::new(NoopQueryCostRecorder),
+            QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+        )
+        .with_audit_sink(Arc::clone(&sink))
+        .with_listener_role(role)
+    };
+    harness.service = service(ravel_sql::FlightListenerRole::Combined);
+
+    let labelled = harness
+        .get_flight_info("labelled", QUERY)
+        .await
+        .expect("labelled flight info");
+    let plain = harness
+        .get_flight_info("plain", PLAIN_QUERY)
+        .await
+        .expect("plain flight info");
+    assert_eq!(
+        auth.subject_calls(),
+        0,
+        "GetFlightInfo audits nothing and asks for no subject"
+    );
+    harness
+        .do_get("labelled", &labelled)
+        .await
+        .expect("labelled do get");
+    harness.do_get("plain", &plain).await.expect("plain do get");
+    assert_eq!(
+        auth.subject_calls(),
+        2,
+        "one subject lookup per audited statement"
+    );
+
+    let audit = read_query_audit(harness.store.as_ref(), &tenant.hash()).await;
+    assert_eq!(audit.len(), 2, "two executed statements, two audit records");
+    let by_text = |text: &str| {
+        audit
+            .iter()
+            .find(|row| str_attr(row, "query.text") == Some(text))
+            .unwrap_or_else(|| panic!("no audit record for {text:?}"))
+    };
+    let labelled_row = by_text(QUERY);
+    assert_eq!(
+        str_attr(labelled_row, ravel_maintain::ATTR_PRINCIPAL_SUBJECT),
+        Some("alice")
+    );
+    assert_eq!(
+        str_attr(labelled_row, ravel_maintain::ATTR_PRINCIPAL_SUBJECT_SOURCE),
+        Some("static_token")
+    );
+    let plain_row = by_text(PLAIN_QUERY);
+    for key in [
+        ravel_maintain::ATTR_PRINCIPAL_SUBJECT,
+        ravel_maintain::ATTR_PRINCIPAL_SUBJECT_SOURCE,
+    ] {
+        assert!(
+            !plain_row.attrs.iter().any(|(k, _)| k == key),
+            "a principal without a subject leaves {key} off the record"
+        );
+    }
+    for row in [labelled_row, plain_row] {
+        assert_eq!(
+            str_attr(row, "query.tenant"),
+            Some(tenant.hash().to_hex().as_str())
+        );
+    }
+
+    // A slice listener takes the slice branch for every ticket and returns
+    // before any audit, so it never asks for a subject.
+    harness.service = service(ravel_sql::FlightListenerRole::SliceOnly);
+    harness
+        .do_get("labelled", &labelled)
+        .await
+        .expect_err("a client ticket is not a slice ticket");
+    assert_eq!(
+        auth.subject_calls(),
+        2,
+        "a slice DoGet never asks for a subject"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Per-query cost recording (ADR-0044 section 4)
 // ---------------------------------------------------------------------------
