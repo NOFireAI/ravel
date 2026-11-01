@@ -8,7 +8,9 @@
 //! fetcher carries a large decoded cache, and every run's rows must equal the
 //! same statement's rows through an executor with no decoded cache (the
 //! `--decoded-cache-max-bytes 0` shape). Hot runs must hit the cache for every
-//! projected column the scan decodes whole, and never for `c`.
+//! projected column. `c` is served too when the scan's decoded set fits under
+//! 0.95 of the cap, and never when it does not (ADR-3326, serve-if-fits
+//! amendment).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -28,7 +30,8 @@ use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_by
 use ravel_memory::MemoryBudget;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{LogSegmentFetcher, SegmentFetcher};
+use ravel_cache::{Cache, CacheLimits};
+use ravel_query::{CacheFetchError, LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlRequest,
     StaticDeclaredColumns,
@@ -156,9 +159,37 @@ fn executor(
     store: &Arc<dyn ObjectStoreBackend>,
     cache: Option<Arc<DecodedColumnCache>>,
 ) -> SqlExecutor {
+    executor_with(store, cache, false)
+}
+
+/// [`executor`] whose logs fetcher also carries a read cache, so its scans
+/// stripe over the default 8 partitions. With more partitions than this
+/// fixture's 2 segments, a `LIKE`-only scan is not taken by the whole-segment
+/// fast path and plans both segments, so its plan pass makes the
+/// serve-if-fits verdict (ADR-3326). Rows do not depend on the read cache.
+fn striped(
+    store: &Arc<dyn ObjectStoreBackend>,
+    cache: Option<Arc<DecodedColumnCache>>,
+) -> SqlExecutor {
+    executor_with(store, cache, true)
+}
+
+fn executor_with(
+    store: &Arc<dyn ObjectStoreBackend>,
+    cache: Option<Arc<DecodedColumnCache>>,
+    read_cache: bool,
+) -> SqlExecutor {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(store), CatalogConfig::default()).expect("catalog"));
     let logs = LogSegmentFetcher::new(Arc::clone(store));
+    let logs = if read_cache {
+        let bytes = 64 << 20;
+        logs.with_cache(Arc::new(Cache::<CacheFetchError>::new(CacheLimits::new(
+            bytes, 16_384, bytes,
+        ))))
+    } else {
+        logs
+    };
     let logs = match cache {
         Some(cache) => logs.with_decoded_cache(cache),
         None => logs,
@@ -213,14 +244,17 @@ fn column_id(objects: &[Vec<u8>], name: &str, ty: FieldType) -> u32 {
 
 struct Statement {
     sql: &'static str,
-    /// Columns the scan decodes whole for this statement, so a hot run must
-    /// serve each of them from the cache.
+    /// Columns a hot run must serve from the cache: every projected column,
+    /// the Contains-deferred one included, since each statement's decoded set
+    /// fits the 1 GiB cache.
     served: &'static [&'static str],
     rows: usize,
     /// The intent the executor classifies it under: a statement with no
     /// filter reads as a bulk scan (ADR-3072's predicate-free rule).
     intent: AccessIntent,
 }
+
+const CONTAINS_SQL: &str = "SELECT ts, d, c FROM logs WHERE c LIKE '%x%' ORDER BY ts";
 
 const STATEMENTS: [Statement; 4] = [
     Statement {
@@ -242,18 +276,21 @@ const STATEMENTS: [Statement; 4] = [
         intent: AccessIntent::BulkScan,
     },
     Statement {
-        sql: "SELECT ts, d, c FROM logs WHERE c LIKE '%x%' ORDER BY ts",
-        served: &["ts", "d"],
+        sql: CONTAINS_SQL,
+        served: &["ts", "d", "c"],
         rows: (ROWS_PER_OBJECT / 3) * OBJECTS as usize,
         intent: AccessIntent::Interactive,
     },
 ];
 
 /// Every statement's rows, cold and on each of three hot runs, equal its rows
-/// with no decoded cache; hot runs hit for every whole-decoded projected
-/// column and never for the `Contains`-tested `c`.
+/// with no decoded cache; hot runs hit for every projected column, the
+/// `Contains`-tested `c` included, since the fixture's decoded set is far
+/// under the 1 GiB cap (ADR-3326, serve-if-fits amendment).
+/// `decoded_cache_never_serves_the_contains_column_when_the_scan_does_not_fit`
+/// is the other half.
 #[tokio::test]
-async fn decoded_cache_serves_identical_rows_and_never_caches_contains_column() {
+async fn decoded_cache_serves_identical_rows_and_the_contains_column_when_the_scan_fits() {
     let t = tenant();
     let mem = Arc::new(MemoryStore::new());
     let store: Arc<dyn ObjectStoreBackend> = mem;
@@ -273,7 +310,7 @@ async fn decoded_cache_serves_identical_rows_and_never_caches_contains_column() 
         1 << 30,
         Some(Arc::new(MemoryBudget::unlimited())),
     ));
-    let cached = executor(&store, Some(Arc::clone(&cache)));
+    let cached = striped(&store, Some(Arc::clone(&cache)));
 
     for st in &STATEMENTS {
         let base = uncached
@@ -322,6 +359,15 @@ async fn decoded_cache_serves_identical_rows_and_never_caches_contains_column() 
                 .decoded_cache
                 .expect("decodedCache stats with a cache")
                 .counters;
+            let contains = st.sql == CONTAINS_SQL;
+            assert_eq!(stats.deferred_served, contains, "{}", st.sql);
+            assert_eq!(
+                stats.deferred_set_estimate_bytes.is_some(),
+                contains,
+                "{}",
+                st.sql
+            );
+            assert_eq!(stats.unvalidated_refusals, 0, "{}", st.sql);
             if run == 0 {
                 cold_misses = stats.misses;
                 if st.intent == AccessIntent::Interactive {
@@ -357,12 +403,140 @@ async fn decoded_cache_serves_identical_rows_and_never_caches_contains_column() 
             );
         }
     }
-    assert_eq!(
-        cache.column_hits(c_id),
-        0,
-        "the Contains-tested column is never served from the cache"
+    assert!(
+        cache.column_hits(c_id) > 0,
+        "the Contains-tested column is served from the cache"
     );
     assert!(cache.resident_bytes() > 0);
+}
+
+/// Blocks the fixture holds: every one survives [`CONTAINS_SQL`]'s plan.
+const BLOCKS: u64 = OBJECTS * BLOCKS_PER_OBJECT as u64;
+
+/// What [`CONTAINS_SQL`]'s plan pass estimates the scan's decoded set at.
+async fn contains_estimate(store: &Arc<dyn ObjectStoreBackend>, t: &TenantId) -> u64 {
+    let probe = Arc::new(DecodedColumnCache::new(
+        1 << 30,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    striped(store, Some(probe))
+        .execute(t.hash(), &request(CONTAINS_SQL))
+        .await
+        .expect("statement executes")
+        .stats
+        .decoded_cache
+        .expect("decodedCache stats with a cache")
+        .counters
+        .deferred_set_estimate_bytes
+        .expect("a Contains scan reports its estimate")
+}
+
+/// ADR-3326, serve-if-fits amendment, decision 2: a scan whose decoded set is
+/// over 0.95 of the cap looks up and offers no deferred column. The cap is
+/// the scan's own estimate, so the set sits between 0.95 of the cap and the
+/// cap. Each block's `ts`, `stream_ref` and `d` are looked up: 24 misses and
+/// 24 admissions cold, 24 hits and no miss hot, and the cache ends holding
+/// those 24 entries and no `c`. The rows equal the uncached scan's.
+///
+/// Seen failing against serving every deferred column (cold: 32 misses where
+/// 24 are expected) and against comparing the estimate with the cap instead
+/// of 0.95 of it (the same 32, since the estimate equals the cap).
+#[tokio::test]
+async fn decoded_cache_never_serves_the_contains_column_when_the_scan_does_not_fit() {
+    let t = tenant();
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    let mut objects = Vec::new();
+    for seq in 1..=OBJECTS {
+        objects.push(publish_object(store.as_ref(), &t, seq).await);
+    }
+    let c_id = column_id(&objects, "c", FieldType::Str);
+    let estimate = contains_estimate(&store, &t).await;
+    let expected = executor(&store, None)
+        .execute(t.hash(), &request(CONTAINS_SQL))
+        .await
+        .expect("uncached statement executes");
+    let expected = pretty_format_batches(expected.output.batches())
+        .expect("format")
+        .to_string();
+
+    let cache = Arc::new(DecodedColumnCache::new(
+        estimate,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    let cached = striped(&store, Some(Arc::clone(&cache)));
+    for run in 0..2 {
+        let outcome = cached
+            .execute(t.hash(), &request(CONTAINS_SQL))
+            .await
+            .expect("cached statement executes");
+        let got = pretty_format_batches(outcome.output.batches())
+            .expect("format")
+            .to_string();
+        assert_eq!(got, expected, "run {run}");
+        assert_eq!(outcome.stats.blocks_scanned, BLOCKS);
+        let s = outcome
+            .stats
+            .decoded_cache
+            .expect("decodedCache stats with a cache")
+            .counters;
+        assert_eq!(s.deferred_set_estimate_bytes, Some(estimate), "run {run}");
+        assert!(!s.deferred_served, "run {run}");
+        let (hits, misses, admissions) = if run == 0 { (0, 24, 24) } else { (24, 0, 0) };
+        assert_eq!((s.hits, s.misses, s.admissions), (hits, misses, admissions), "run {run}");
+        assert_eq!((s.evictions, s.unvalidated_refusals), (0, 0), "run {run}");
+    }
+    assert_eq!(cache.column_hits(c_id), 0, "c is never served");
+    assert_eq!(cache.len(), 24, "ts, stream_ref and d of 8 blocks; no c");
+}
+
+/// ADR-3326, serve-if-fits amendment: a scan that fits serves its deferred
+/// column with identical rows. Cold, every projected column of the 8 blocks
+/// (`ts`, `stream_ref`, `d` and the deferred `c`) misses and is admitted, 32
+/// of each, `c` decoded validated so nothing is refused; hot, all 32 hit, `c`
+/// once per block.
+#[tokio::test]
+async fn a_fitting_contains_scan_serves_its_deferred_column_with_identical_rows() {
+    let t = tenant();
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    let mut objects = Vec::new();
+    for seq in 1..=OBJECTS {
+        objects.push(publish_object(store.as_ref(), &t, seq).await);
+    }
+    let c_id = column_id(&objects, "c", FieldType::Str);
+    let expected = executor(&store, None)
+        .execute(t.hash(), &request(CONTAINS_SQL))
+        .await
+        .expect("uncached statement executes");
+    let expected = pretty_format_batches(expected.output.batches())
+        .expect("format")
+        .to_string();
+    let cache = Arc::new(DecodedColumnCache::new(
+        1 << 30,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    let cached = striped(&store, Some(Arc::clone(&cache)));
+    for run in 0..2 {
+        let outcome = cached
+            .execute(t.hash(), &request(CONTAINS_SQL))
+            .await
+            .expect("cached statement executes");
+        let got = pretty_format_batches(outcome.output.batches())
+            .expect("format")
+            .to_string();
+        assert_eq!(got, expected, "run {run}");
+        let s = outcome
+            .stats
+            .decoded_cache
+            .expect("decodedCache stats with a cache")
+            .counters;
+        assert!(s.deferred_served, "run {run}");
+        let (hits, misses, admissions) = if run == 0 { (0, 32, 32) } else { (32, 0, 0) };
+        assert_eq!((s.hits, s.misses, s.admissions), (hits, misses, admissions), "run {run}");
+        assert_eq!(s.unvalidated_refusals, 0, "run {run}");
+    }
+    assert_eq!(cache.column_hits(c_id), BLOCKS, "c hit once per block on run 1");
 }
 
 /// A statement that fails while its scan is served from the cache fails with
