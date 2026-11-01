@@ -29,7 +29,7 @@ pub use metadata_cache::{
 pub use service::{
     InstantOutcome, InstantRequest, LabelValuesOutcome, LabelsOutcome, LiveUsage, MSG_CONCURRENCY,
     MetadataOutcome, MetadataRequest, NoopQueryUsageSink, QueryControls, QueryUsageSink,
-    RangeOutcome, RangeRequest, UsageGuard, UsageStatus, partial_refusal_message,
+    RangeOutcome, RangeRequest, UsageGuard, UsageStatus, audit_subject, partial_refusal_message,
 };
 pub use tenant::{
     AuthError, DevHeaderTenantResolver, MtlsResolver, OidcError, OidcJwksCache, OidcResolver,

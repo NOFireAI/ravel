@@ -57,7 +57,13 @@
 //!   (see [`AuditTextPolicy`]): the structure-preserving keyed tokenization of
 //!   ADR-0062 decision 2e by default, or verbatim under an explicit opt-in. It
 //!   is not truncated here; the SQL handler has already bounded the whole
-//!   request body before this record is written.
+//!   request body before this record is written;
+//! - `query.principal.subject` = who within the tenant made the request, as
+//!   the token or claim that authenticated it names them (ADR-3541), and
+//!   `query.principal.subject_source` = where that value came from:
+//!   `static_token`, `oidc` or `mtls`. Both are absent when the principal has
+//!   no subject: a record never carries an empty string or a placeholder in
+//!   their place, and never one without the other.
 //!
 //! The record's `ts_ns` is the request timestamp (the handler's injected
 //! clock), and its severity reflects the status: `INFO` for `ok`, `ERROR` for
@@ -100,6 +106,10 @@ const ATTR_WINDOW_START: &str = "query.window_start_ns";
 const ATTR_WINDOW_END: &str = "query.window_end_ns";
 /// `attrs` key holding the verbatim query text.
 const ATTR_TEXT: &str = "query.text";
+/// `attrs` key holding the principal's subject value, [`AuditSubject::value`].
+pub const ATTR_PRINCIPAL_SUBJECT: &str = "query.principal.subject";
+/// `attrs` key holding where the subject came from, [`AuditSubject::source`].
+pub const ATTR_PRINCIPAL_SUBJECT_SOURCE: &str = "query.principal.subject_source";
 
 /// Resource-attr `record_type` value for the shared query-audit log stream.
 const STREAM_RECORD_TYPE: &str = "query_audit";
@@ -143,6 +153,18 @@ impl QueryStatus {
             QueryStatus::Error => (17, "ERROR"),
         }
     }
+}
+
+/// The caller's subject as a query-audit record carries it (ADR-3541): the
+/// value and its source's wire name (`static_token`, `oidc`, `mtls`).
+///
+/// This crate does not depend on the tenant resolver, so the resolver's
+/// `Subject` is copied into this plain pair at the query surface;
+/// `ravel_query::http::audit_subject` is that conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditSubject {
+    pub value: String,
+    pub source: String,
 }
 
 /// Turns one surface's raw query text into the text its audit record is
@@ -292,18 +314,24 @@ fn redact_event_text(event: &mut AuditEvent, redactor: &dyn QueryTextRedactor) {
 /// the way to the pipeline by [`RedactingAuditSink`], which every surface's
 /// events pass through, so a caller here never has to decide whether the text
 /// it holds may be stored.
+///
+/// `subject` adds `query.principal.subject` and
+/// `query.principal.subject_source` when `Some`, and neither attribute when
+/// `None`.
+#[allow(clippy::too_many_arguments)]
 pub fn query_audit_event(
     tenant: &TenantHash,
     now_ns: i64,
     query_text: &str,
     language: &str,
     status: QueryStatus,
+    subject: Option<&AuditSubject>,
     window_start_ns: i64,
     window_end_ns: i64,
 ) -> AuditEvent {
     let (stream_id, stream_attrs) = query_stream();
     let (severity_num, severity_text) = status.severity();
-    let attrs = vec![
+    let mut attrs = vec![
         (ATTR_KIND.to_string(), AttrValue::Str(KIND_QUERY.into())),
         (ATTR_LANGUAGE.to_string(), AttrValue::Str(language.into())),
         (ATTR_TENANT.to_string(), AttrValue::Str(tenant.to_hex())),
@@ -321,6 +349,16 @@ pub fn query_audit_event(
         ),
         (ATTR_TEXT.to_string(), AttrValue::Str(query_text.into())),
     ];
+    if let Some(subject) = subject {
+        attrs.push((
+            ATTR_PRINCIPAL_SUBJECT.to_string(),
+            AttrValue::Str(subject.value.clone()),
+        ));
+        attrs.push((
+            ATTR_PRINCIPAL_SUBJECT_SOURCE.to_string(),
+            AttrValue::Str(subject.source.clone()),
+        ));
+    }
     let body = format!("{language} query {}", status.as_str());
     AuditEvent {
         tenant: *tenant,
@@ -360,6 +398,7 @@ pub async fn write_query_audit(
         query_text,
         language,
         status,
+        None,
         window_start_ns,
         window_end_ns,
     );
@@ -437,48 +476,134 @@ mod tests {
         out
     }
 
+    /// The attribute keys the module doc's "Every record carries:" list names,
+    /// in order: every backticked `kind` or `query.*` token on those lines.
+    fn documented_attr_keys() -> Vec<String> {
+        let source = include_str!("query_audit.rs");
+        let list: Vec<&str> = source
+            .lines()
+            .skip_while(|line| *line != "//! Every record carries:")
+            .skip(1)
+            .take_while(|line| !line.starts_with("//! The record's `ts_ns`"))
+            .collect();
+        let mut keys = Vec::new();
+        for line in list {
+            for (i, token) in line.split('`').enumerate() {
+                let is_key = token == ATTR_KIND
+                    || (token.starts_with("query.") && !token.contains(' '));
+                if i % 2 == 1 && is_key && !keys.iter().any(|k| k == token) {
+                    keys.push(token.to_string());
+                }
+            }
+        }
+        keys
+    }
+
     #[tokio::test]
     async fn query_audit_record_round_trips_with_documented_attrs() {
-        let store = MemoryStore::new();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let tenant = TenantHash([7u8; 16]);
         let now_ns = 3 * 3_600_000_000_000;
+        let pipeline = crate::audit_pipeline::AuditPipeline::spawn(
+            Arc::clone(&store),
+            crate::config::AuditPipelineConfig {
+                max_batch: 1,
+                max_age: std::time::Duration::from_millis(5),
+                shard: QUERY_AUDIT_SHARD,
+                audit_mode: crate::config::AuditMode::Required,
+                channel_capacity: 8,
+            },
+        );
+        let subject = AuditSubject {
+            value: "alice".to_string(),
+            source: "static_token".to_string(),
+        };
 
-        write_query_audit(
-            &store,
-            &tenant,
-            now_ns,
-            "SELECT value FROM samples LIMIT 1",
-            "sql",
-            QueryStatus::Ok,
-            now_ns - 3_600_000_000_000,
-            now_ns,
-        )
-        .await
-        .expect("write ok record");
+        for (text, subject) in [
+            ("SELECT value FROM samples LIMIT 1", Some(&subject)),
+            ("SELECT value FROM samples LIMIT 2", None),
+        ] {
+            pipeline
+                .submit(query_audit_event(
+                    &tenant,
+                    now_ns,
+                    text,
+                    "sql",
+                    QueryStatus::Ok,
+                    subject,
+                    now_ns - 3_600_000_000_000,
+                    now_ns,
+                ))
+                .await
+                .expect("submit");
+        }
+        pipeline.shutdown().await.expect("shutdown");
 
-        let rows = read_audit_records(&store, &tenant).await;
-        assert_eq!(rows.len(), 1, "exactly one audit record");
-        let row = &rows[0];
-        assert_eq!(row.ts_ns, now_ns);
-        assert_eq!(row.severity_text, "INFO");
-        assert_eq!(str_attr(row, "kind"), Some("query"));
-        assert_eq!(str_attr(row, "query.language"), Some("sql"));
+        let rows = read_audit_records(store.as_ref(), &tenant).await;
+        assert_eq!(rows.len(), 2, "exactly two audit records");
+        let by_text = |text: &str| {
+            rows.iter()
+                .find(|row| str_attr(row, "query.text") == Some(text))
+                .expect("record by text")
+        };
+        let labelled = by_text("SELECT value FROM samples LIMIT 1");
+        let plain = by_text("SELECT value FROM samples LIMIT 2");
+
+        for row in [labelled, plain] {
+            assert_eq!(row.ts_ns, now_ns);
+            assert_eq!(row.severity_text, "INFO");
+            assert_eq!(str_attr(row, "kind"), Some("query"));
+            assert_eq!(str_attr(row, "query.language"), Some("sql"));
+            assert_eq!(
+                str_attr(row, "query.tenant"),
+                Some(tenant.to_hex().as_str())
+            );
+            assert_eq!(str_attr(row, "query.status"), Some("ok"));
+            assert_eq!(
+                str_attr(row, "query.window_start_ns"),
+                Some((now_ns - 3_600_000_000_000).to_string().as_str())
+            );
+            assert_eq!(
+                str_attr(row, "query.window_end_ns"),
+                Some(now_ns.to_string().as_str())
+            );
+        }
+
+        assert_eq!(str_attr(labelled, "query.principal.subject"), Some("alice"));
         assert_eq!(
-            str_attr(row, "query.tenant"),
-            Some(tenant.to_hex().as_str())
+            str_attr(labelled, "query.principal.subject_source"),
+            Some("static_token")
         );
-        assert_eq!(str_attr(row, "query.status"), Some("ok"));
+        let plain_keys: Vec<&str> = plain.attrs.iter().map(|(k, _)| k.as_str()).collect();
+        for key in ["query.principal.subject", "query.principal.subject_source"] {
+            assert!(
+                !plain_keys.contains(&key),
+                "a record with no subject carries no {key} key: {plain_keys:?}"
+            );
+        }
+
+        // RLOG stores a record's attrs in key order, so compare sorted.
+        fn sorted(mut keys: Vec<&str>) -> Vec<&str> {
+            keys.sort_unstable();
+            keys
+        }
+        let documented = documented_attr_keys();
+        let documented: Vec<&str> = documented.iter().map(String::as_str).collect();
+        assert_eq!(documented.len(), 9, "the doc list names nine keys: {documented:?}");
+        let labelled_keys: Vec<&str> = labelled.attrs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
-            str_attr(row, "query.window_start_ns"),
-            Some((now_ns - 3_600_000_000_000).to_string().as_str())
+            sorted(labelled_keys),
+            sorted(documented.clone()),
+            "a record with a subject writes exactly the documented attrs"
         );
+        let documented_without_subject: Vec<&str> = documented
+            .into_iter()
+            .filter(|k| !k.starts_with("query.principal."))
+            .collect();
         assert_eq!(
-            str_attr(row, "query.window_end_ns"),
-            Some(now_ns.to_string().as_str())
-        );
-        assert_eq!(
-            str_attr(row, "query.text"),
-            Some("SELECT value FROM samples LIMIT 1")
+            sorted(plain_keys),
+            sorted(documented_without_subject),
+            "a record without a subject writes the documented attrs less both subject attrs"
         );
     }
 
@@ -561,6 +686,7 @@ mod tests {
             "SELECT value FROM samples WHERE user = 'alice'",
             "sql",
             QueryStatus::Ok,
+            None,
             0,
             42,
         );
@@ -606,6 +732,7 @@ mod tests {
             "up{job=\"api\"}",
             "promql",
             QueryStatus::Ok,
+            None,
             0,
             42,
         ))

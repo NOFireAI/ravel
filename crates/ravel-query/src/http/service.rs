@@ -36,7 +36,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
+use ravel_maintain::{AuditSubject, QueryAuditSink, QueryStatus, query_audit_event};
 use ravel_promql::{Annotations, LabelMatcher, RangeValue, Value};
 use ravel_types::accounting::{
     CostEstimate, QueryAccountingSnapshot, QueryCostRecorder, QueryWorkloadClass,
@@ -64,6 +64,17 @@ pub fn authenticate(
     headers: &axum::http::HeaderMap,
 ) -> Result<TenantHash, ApiError> {
     Ok(resolver.resolve(headers)?.hash())
+}
+
+/// The caller's subject as its query-audit records carry it (ADR-3541), or
+/// `None` when the principal has none. The value and the source's wire name
+/// are copied as they are; the subject never reaches a log line or a response
+/// from here.
+pub fn audit_subject(principal: &ravel_tenant_resolve::Principal) -> Option<AuditSubject> {
+    principal.subject.as_ref().map(|subject| AuditSubject {
+        value: subject.value().to_string(),
+        source: subject.source().as_str().to_string(),
+    })
 }
 
 /// Client message for a query the fleet-global concurrency ceiling refused.
@@ -267,6 +278,10 @@ impl QueryControls {
     /// best-effort mode the pipeline resolves the submission to `Ok`. A query
     /// rejected before execution never calls this: there is no executed read
     /// to attribute.
+    ///
+    /// `subject` is the authenticated principal's subject ([`audit_subject`]),
+    /// recorded only on the event, never in the failure log line below.
+    #[allow(clippy::too_many_arguments)]
     pub async fn audit(
         &self,
         tenant_hash: TenantHash,
@@ -275,6 +290,7 @@ impl QueryControls {
         language: &str,
         window: (i64, i64),
         status: QueryStatus,
+        subject: Option<&AuditSubject>,
     ) -> Result<(), ApiError> {
         let event = query_audit_event(
             &tenant_hash,
@@ -282,6 +298,7 @@ impl QueryControls {
             query_text,
             language,
             status,
+            subject,
             window.0,
             window.1,
         );
@@ -452,6 +469,7 @@ pub async fn promql_instant(
     controls: &QueryControls,
     engine: &QueryEngine,
     tenant_hash: TenantHash,
+    subject: Option<&AuditSubject>,
     request: &InstantRequest,
 ) -> Result<InstantOutcome, ApiError> {
     let _permit = controls.admit()?;
@@ -489,6 +507,7 @@ pub async fn promql_instant(
             "promql",
             (time_ns, time_ns),
             status,
+            subject,
         )
         .await?;
     let (value, annotations, stats) = exec?;
@@ -512,6 +531,7 @@ pub async fn promql_range(
     controls: &QueryControls,
     engine: &QueryEngine,
     tenant_hash: TenantHash,
+    subject: Option<&AuditSubject>,
     request: &RangeRequest,
 ) -> Result<RangeOutcome, ApiError> {
     let _permit = controls.admit()?;
@@ -550,6 +570,7 @@ pub async fn promql_range(
             "promql",
             (ms_to_ns(request.start_ms), ms_to_ns(request.end_ms)),
             status,
+            subject,
         )
         .await?;
     let (value, annotations, stats) = exec?;
@@ -572,9 +593,10 @@ pub async fn labels(
     controls: &QueryControls,
     engine: &QueryEngine,
     tenant_hash: TenantHash,
+    subject: Option<&AuditSubject>,
     request: &MetadataRequest,
 ) -> Result<LabelsOutcome, ApiError> {
-    let outcome = metadata(controls, engine, tenant_hash, request, "labels").await?;
+    let outcome = metadata(controls, engine, tenant_hash, subject, request, "labels").await?;
     let mut names: BTreeSet<String> = BTreeSet::new();
     for (_, labels) in &outcome.series {
         for label in labels.iter() {
@@ -598,11 +620,12 @@ pub async fn label_values(
     controls: &QueryControls,
     engine: &QueryEngine,
     tenant_hash: TenantHash,
+    subject: Option<&AuditSubject>,
     request: &MetadataRequest,
     name: &str,
     include_log_metric_names: bool,
 ) -> Result<LabelValuesOutcome, ApiError> {
-    let outcome = metadata(controls, engine, tenant_hash, request, "label_values").await?;
+    let outcome = metadata(controls, engine, tenant_hash, subject, request, "label_values").await?;
     let mut values: BTreeSet<String> = BTreeSet::new();
     for (_, labels) in &outcome.series {
         if let Some(v) = labels.get(name) {
@@ -625,9 +648,10 @@ pub async fn series(
     controls: &QueryControls,
     engine: &QueryEngine,
     tenant_hash: TenantHash,
+    subject: Option<&AuditSubject>,
     request: &MetadataRequest,
 ) -> Result<MetadataOutcome, ApiError> {
-    metadata(controls, engine, tenant_hash, request, "series").await
+    metadata(controls, engine, tenant_hash, subject, request, "series").await
 }
 
 /// The one metadata read behind `labels`, `label_values`, and `series`, under
@@ -637,6 +661,7 @@ async fn metadata(
     controls: &QueryControls,
     engine: &QueryEngine,
     tenant_hash: TenantHash,
+    subject: Option<&AuditSubject>,
     request: &MetadataRequest,
     language: &str,
 ) -> Result<MetadataOutcome, ApiError> {
@@ -661,6 +686,7 @@ async fn metadata(
             language,
             (request.window.start_ns, request.window.end_ns),
             status,
+            subject,
         )
         .await?;
     let resolved = resolved?;
@@ -888,4 +914,38 @@ pub fn usage_status_of(err: &ApiError) -> UsageStatus {
 /// no successful resolve folds this instead.
 pub fn zero_estimate() -> CostEstimate {
     CostEstimate::new(0, 0, 0, 0, 0)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use ravel_tenant_resolve::{Principal, Subject, SubjectSource};
+    use ravel_types::TenantId;
+
+    #[test]
+    fn audit_subject_copies_the_value_and_each_sources_wire_name() {
+        for (source, wire) in [
+            (SubjectSource::StaticToken, "static_token"),
+            (SubjectSource::Oidc, "oidc"),
+            (SubjectSource::Mtls, "mtls"),
+        ] {
+            let mut principal = Principal::tenant_only(TenantId::new("acme".to_string()));
+            principal.subject = Some(Subject::new(source, "alice").expect("subject"));
+            assert_eq!(
+                audit_subject(&principal),
+                Some(AuditSubject {
+                    value: "alice".to_string(),
+                    source: wire.to_string(),
+                }),
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_subject_is_none_for_a_principal_without_one() {
+        let principal = Principal::tenant_only(TenantId::new("acme".to_string()));
+        assert_eq!(audit_subject(&principal), None);
+    }
 }

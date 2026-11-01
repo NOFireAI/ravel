@@ -410,6 +410,13 @@ impl FlightAuth for FixedAuth {
     ) -> Result<Vec<ravel_sql::MinCommitToken>, Status> {
         Ok(Vec::new())
     }
+
+    fn audit_subject(
+        &self,
+        _metadata: &MetadataMap,
+    ) -> Result<Option<ravel_sql::flight::AuditSubject>, Status> {
+        Ok(None)
+    }
 }
 
 /// Build a Flight SQL service whose fetcher reads `store` by object key. The
@@ -3786,6 +3793,13 @@ impl FlightAuth for CountingAuth {
         _metadata: &MetadataMap,
     ) -> Result<Vec<ravel_sql::MinCommitToken>, Status> {
         Ok(Vec::new())
+    }
+
+    fn audit_subject(
+        &self,
+        _metadata: &MetadataMap,
+    ) -> Result<Option<ravel_sql::flight::AuditSubject>, Status> {
+        Ok(None)
     }
 }
 

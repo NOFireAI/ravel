@@ -643,6 +643,7 @@ impl FlightSqlService for RavelFlightSqlService {
         }
 
         let tenant = self.tenant(request.metadata())?;
+        let subject = self.auth.audit_subject(request.metadata())?;
 
         let decoded = self
             .ticket_keys
@@ -819,6 +820,7 @@ impl FlightSqlService for RavelFlightSqlService {
                 stream,
                 Arc::clone(&self.audit_sink),
                 tenant,
+                subject,
                 now_ns,
                 query_text,
             ))),
@@ -834,6 +836,7 @@ impl FlightSqlService for RavelFlightSqlService {
                     &query_text,
                     "sql",
                     QueryStatus::Error,
+                    subject.as_ref(),
                     0,
                     0,
                 );

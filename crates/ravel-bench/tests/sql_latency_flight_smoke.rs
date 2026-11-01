@@ -83,6 +83,13 @@ impl FlightAuth for FixedAuth {
     ) -> Result<Vec<ravel_sql::MinCommitToken>, tonic::Status> {
         Ok(Vec::new())
     }
+
+    fn audit_subject(
+        &self,
+        _metadata: &MetadataMap,
+    ) -> Result<Option<ravel_sql::flight::AuditSubject>, tonic::Status> {
+        Ok(None)
+    }
 }
 
 /// A clock frozen at the generated dataset's query clock, so ticket expiry and
