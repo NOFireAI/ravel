@@ -11096,8 +11096,8 @@ pub(crate) mod tests {
     /// FLIP (logs): `Operator::Lt => tighten_hi(out, ns)` in
     /// `logs_pushdown::apply_ts_bound`, taking `ts < 500` as `ts <= 500`,
     /// also returns the record at 500.
-    /// FLIP (alerts): `TableProviderFilterPushDown::Exact` from
-    /// `AlertsTableProvider::supports_filters_pushdown` returns all 12.
+    /// FLIP (alerts): `TargetSignal::Alerts => None` in `window_ts_column`
+    /// refuses the windowed `alerts` statement as `RowWindowUnsupported`.
     #[tokio::test]
     async fn row_window_applies_to_logs_ts_and_alerts_ts_ns() {
         let window = TimeRange {
