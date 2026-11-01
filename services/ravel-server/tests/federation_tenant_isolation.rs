@@ -65,6 +65,7 @@ fn oidc_auth() -> AuthResolverSettings {
             refresh_interval: Duration::from_secs(300),
         }),
         mtls_header: None,
+        mtls_subject_header: None,
     }
 }
 
@@ -177,6 +178,7 @@ fn mapped_remotes_start_under_every_dynamic_resolver() {
     let mtls_auth = AuthResolverSettings {
         oidc: None,
         mtls_header: Some("x-client-tenant".to_string()),
+        mtls_subject_header: None,
     };
     ravel_server::ensure_federation_tenant_mapping(
         &mapped,
@@ -261,6 +263,7 @@ fn each_dynamic_resolver_refuses_an_unmapped_remote_cluster() {
     let mtls_auth = AuthResolverSettings {
         oidc: None,
         mtls_header: Some("x-client-tenant".to_string()),
+        mtls_subject_header: None,
     };
     let mtls_err = ravel_server::ensure_federation_tenant_mapping(
         &unmapped,
