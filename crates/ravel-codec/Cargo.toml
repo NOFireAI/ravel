@@ -11,9 +11,6 @@ thiserror = { workspace = true }
 blake3 = { workspace = true }
 crc32c = { workspace = true }
 zstd = { workspace = true }
-# BloomBuilder's dedup sets. Already in Cargo.lock through hashbrown, so this
-# adds no package to the build graph.
-foldhash = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
