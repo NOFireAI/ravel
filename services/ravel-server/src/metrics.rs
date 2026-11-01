@@ -5225,13 +5225,6 @@ pub struct DurableAuthCountersSnapshot {
     pub stale_fail_closed: u64,
 }
 
-/// The durable-auth refresh-loop counter family (ADR-0066 decision 6). Every
-/// sample carries only `{mode}` (the ADR-0044 allowlist): the loop is
-/// process-wide, one cached `sys/auth` map per deployment key, with no
-/// per-tenant or per-signal breakdown to render. The same mode-only shape as
-/// [`render_catalog_family`] and [`render_store_probe_family`] above. Rendered
-/// only when a `DurableAuthState` exists, so a process with no keyed deployment
-/// omits the whole family rather than exporting three permanent zeros.
 const AUTH_SUBJECT_DROPPED: &str = "ravel_auth_subject_dropped_total";
 
 /// `ravel_auth_subject_dropped_total{mode,source,reason}`: one sample per
@@ -5267,6 +5260,13 @@ fn render_auth_subject_family(
     }
 }
 
+/// The durable-auth refresh-loop counter family (ADR-0066 decision 6). Every
+/// sample carries only `{mode}` (the ADR-0044 allowlist): the loop is
+/// process-wide, one cached `sys/auth` map per deployment key, with no
+/// per-tenant or per-signal breakdown to render. The same mode-only shape as
+/// [`render_catalog_family`] and [`render_store_probe_family`] above. Rendered
+/// only when a `DurableAuthState` exists, so a process with no keyed deployment
+/// omits the whole family rather than exporting three permanent zeros.
 fn render_durable_auth_family(
     out: &mut String,
     mode: Mode,
