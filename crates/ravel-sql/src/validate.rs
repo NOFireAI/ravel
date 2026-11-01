@@ -87,9 +87,10 @@
 
 use crate::complexity_guard;
 use datafusion::sql::parser::{CreateExternalTable, Statement as DFStatement};
+use datafusion::sql::planner::IdentNormalizer;
 use datafusion::sql::sqlparser::ast::{
-    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart, ObjectType,
-    Query, SetExpr, Statement, TableFactor, Value as SqlValue, Visit, Visitor,
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectNamePart,
+    ObjectType, Query, SetExpr, Statement, TableFactor, Value as SqlValue, Visit, Visitor,
 };
 use ravel_pqtable::grants::{self, GrantsError};
 use ravel_pqtable::names;
@@ -874,6 +875,135 @@ pub(crate) fn unreadable_table_reference(sql: &str) -> Result<Option<String>, Va
         }
     }
     Ok(found)
+}
+
+/// A name a statement declares that equals a table name, found by
+/// [`shadowing_relation_name`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShadowingName {
+    /// `relation alias`, `derived table alias` or `CTE name`.
+    pub kind: &'static str,
+    /// The declared name as the caller wrote it.
+    pub name: String,
+    /// The entry of `reserved` it equals.
+    pub table: String,
+}
+
+/// The first relation alias, derived-table alias or CTE name anywhere in `sql`
+/// whose normalized form is in `reserved`, under the planner's own identifier
+/// rule: an unquoted identifier is lowercased, a quoted one is kept as
+/// written. `reserved` holds lower-case table names.
+///
+/// An alias on a table reference that equals that table's own name
+/// (`FROM logs AS logs`, `FROM public.logs AS logs`) is not reported: the
+/// qualifier it introduces still names that table's relation.
+pub(crate) fn shadowing_relation_name(
+    sql: &str,
+    reserved: &BTreeSet<String>,
+) -> Result<Option<ShadowingName>, ValidationError> {
+    let statements = complexity_guard::parse_guarded(sql)?;
+    let mut finder = ShadowingFinder { reserved };
+    for statement in &statements {
+        if let DFStatement::Statement(inner) = statement
+            && let Statement::Query(query) = inner.as_ref()
+            && let ControlFlow::Break(found) = query.visit(&mut finder)
+        {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+/// Stops at the first name [`shadowing_relation_name`] describes.
+struct ShadowingFinder<'a> {
+    reserved: &'a BTreeSet<String>,
+}
+
+impl ShadowingFinder<'_> {
+    fn check(&self, kind: &'static str, ident: &Ident) -> ControlFlow<ShadowingName> {
+        let normalized = IdentNormalizer::default().normalize(ident.clone());
+        if self.reserved.contains(&normalized) {
+            ControlFlow::Break(ShadowingName {
+                kind,
+                name: ident.value.clone(),
+                table: normalized,
+            })
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+}
+
+impl Visitor for ShadowingFinder<'_> {
+    type Break = ShadowingName;
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<ShadowingName> {
+        if let Some(with) = &query.with {
+            for cte in &with.cte_tables {
+                self.check("CTE name", &cte.alias.name)?;
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<ShadowingName> {
+        let (kind, alias) = match factor {
+            TableFactor::Table {
+                name,
+                alias: Some(alias),
+                ..
+            } => {
+                let own = match name.0.last() {
+                    Some(ObjectNamePart::Identifier(ident)) => {
+                        Some(IdentNormalizer::default().normalize(ident.clone()))
+                    }
+                    _ => None,
+                };
+                if own == Some(IdentNormalizer::default().normalize(alias.name.clone())) {
+                    return ControlFlow::Continue(());
+                }
+                ("relation alias", alias)
+            }
+            TableFactor::Derived {
+                alias: Some(alias), ..
+            } => ("derived table alias", alias),
+            TableFactor::TableFunction {
+                alias: Some(alias), ..
+            }
+            | TableFactor::Function {
+                alias: Some(alias), ..
+            }
+            | TableFactor::UNNEST {
+                alias: Some(alias), ..
+            }
+            | TableFactor::JsonTable {
+                alias: Some(alias), ..
+            }
+            | TableFactor::OpenJsonTable {
+                alias: Some(alias), ..
+            }
+            | TableFactor::NestedJoin {
+                alias: Some(alias), ..
+            }
+            | TableFactor::Pivot {
+                alias: Some(alias), ..
+            }
+            | TableFactor::Unpivot {
+                alias: Some(alias), ..
+            }
+            | TableFactor::MatchRecognize {
+                alias: Some(alias), ..
+            }
+            | TableFactor::XmlTable {
+                alias: Some(alias), ..
+            }
+            | TableFactor::SemanticView {
+                alias: Some(alias), ..
+            } => ("relation alias", alias),
+            _ => return ControlFlow::Continue(()),
+        };
+        self.check(kind, &alias.name)
+    }
 }
 
 /// Stops at the first table factor [`unreadable_table_reference`] describes.
@@ -1788,6 +1918,67 @@ mod tests {
             !via_cte.contains("spans"),
             "a CTE named `spans` is not the real spans table: {via_cte:?}"
         );
+    }
+
+    fn shadow(sql: &str) -> Option<(&'static str, String, String)> {
+        let reserved = BTreeSet::from(["logs".to_owned(), "samples".to_owned(), "hits".to_owned()]);
+        shadowing_relation_name(sql, &reserved)
+            .expect("parses")
+            .map(|found| (found.kind, found.name, found.table))
+    }
+
+    /// Every way a statement declares a relation name is checked, at any
+    /// depth, under the planner's identifier rule; a table aliased to its own
+    /// name is not a shadow.
+    ///
+    /// FLIP: a check over `AS <name>` in the raw text misses the CTE and the
+    /// derived table aliased without `AS`; one that lowercases quoted names
+    /// refuses `"LOGS"`; one without the own-name exemption refuses
+    /// `logs AS logs`.
+    #[test]
+    fn shadowing_names_are_found_through_the_parse_tree() {
+        let found = |kind: &'static str, name: &str, table: &str| {
+            Some((kind, name.to_owned(), table.to_owned()))
+        };
+        for (sql, expected) in [
+            (
+                "SELECT 1 FROM samples AS logs JOIN logs l ON logs.ts = l.ts",
+                found("relation alias", "logs", "logs"),
+            ),
+            (
+                "SELECT 1 FROM logs l JOIN samples LOGS ON l.ts = LOGS.ts",
+                found("relation alias", "LOGS", "logs"),
+            ),
+            (
+                "WITH logs AS (SELECT ts FROM samples) SELECT 1 FROM logs",
+                found("CTE name", "logs", "logs"),
+            ),
+            (
+                "SELECT 1 FROM (SELECT ts FROM samples) logs JOIN logs l ON logs.ts = l.ts",
+                found("derived table alias", "logs", "logs"),
+            ),
+            (
+                "SELECT 1 FROM logs WHERE ts IN \
+                 (SELECT s.ts FROM (SELECT ts FROM logs) AS samples JOIN samples s ON true)",
+                found("derived table alias", "samples", "samples"),
+            ),
+            (
+                "SELECT 1 FROM hits h JOIN logs AS hits ON h.id = hits.ts",
+                found("relation alias", "hits", "hits"),
+            ),
+            (
+                "SELECT 1 FROM samples AS \"LOGS\" JOIN logs l ON true",
+                None,
+            ),
+            ("SELECT 1 FROM logs AS logs JOIN samples s ON true", None),
+            (
+                "SELECT 1 FROM public.\"logs\" AS logs JOIN samples s ON true",
+                None,
+            ),
+            ("SELECT 1 FROM logs l JOIN samples s ON true", None),
+        ] {
+            assert_eq!(shadow(sql), expected, "{sql}");
+        }
     }
 
     /// The CTE exclusion is whole-tree: a CTE declared in a subquery shadows
