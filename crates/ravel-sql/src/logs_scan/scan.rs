@@ -11,12 +11,20 @@ pub(super) struct PartitionCtx {
     /// path can route each segment as it opens it (issue #862).
     pub(super) projected_fraction: f64,
     pub(super) phase_accounting: PhaseAccounting,
+    /// The plan pass's verdict on whether this scan serves its
+    /// Contains-deferred columns from the decoded cache
+    /// ([`PlanCounts::serves_deferred`]), copied in when the partition leaves
+    /// `Planning` and read by every open after it. False until then. On the
+    /// whole-segment fast path the verdict comes from
+    /// [`fast_path_verdict_future`], awaited in the same `Planning` state.
+    pub(super) serve_deferred: std::sync::atomic::AtomicBool,
 }
 
 impl PartitionCtx {
     /// Attaches the process decoded-column cache, when the fetcher has one, to
     /// a scan this partition opened (ADR-3326). The scan's columnar exit then
-    /// reads and fills it under the statement's access intent.
+    /// reads and fills it under the statement's access intent, and serves its
+    /// Contains-deferred columns only under the plan pass's verdict.
     fn attach_decoded_cache(&self, scan: &mut LogSegmentScan, seg: &SegmentRef) {
         if let Some(cache) = self.fetcher.decoded_cache() {
             scan.attach_decoded_cache(ravel_logseg::decoded_cache::DecodedCacheAttach {
@@ -25,6 +33,9 @@ impl PartitionCtx {
                 object: seg.content_hash,
                 intent: self.phase_accounting.scan().access_intent(),
                 counters: Arc::clone(self.phase_accounting.decoded_cache()),
+                serve_deferred: self
+                    .serve_deferred
+                    .load(std::sync::atomic::Ordering::Relaxed),
             });
         }
     }
@@ -1518,6 +1529,12 @@ impl LogScanStream {
                         this.blocks
                             .planning_wait_elapsed
                             .add_elapsed(this.stream_started);
+                        // Every partition takes the one verdict the shared
+                        // plan pass made, before its first open.
+                        this.ctx.serve_deferred.store(
+                            counts.serves_deferred(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         // Partition 0 publishes every relevant segment's
                         // whole-segment prune totals, once, so striping a segment
                         // across partitions does not multiply them.

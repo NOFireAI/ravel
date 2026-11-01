@@ -3,9 +3,18 @@
 //!
 //! An entry is one column of one block as [`decode_columns`] produced it,
 //! shared by `Arc`: a hit clones handles, never data. Only a whole-block
-//! decode on the columnar scan path reads or fills it, and never with a
-//! column a Contains arm defers (its dictionary is narrowed to survivors
-//! after decode). The row path neither reads nor fills it.
+//! decode on the columnar scan path reads or fills it. The row path neither
+//! reads nor fills it.
+//!
+//! A column a Contains arm defers is looked up and offered only when its scan
+//! was planned to fit: [`DecodedCacheAttach::serve_deferred`], set from the
+//! plan pass's estimate of the scan's whole decoded set against 0.95 of the
+//! cap (ADR-3326, serve-if-fits amendment). Such a column is offered before
+//! its survivor narrowing, so an entry holds the whole column and only the
+//! block's own copy is narrowed (`build_survivor_values` in `reader.rs`). In
+//! a scan that does not fit it is never looked up or offered.
+//! [`DecodedColumnCache::offer`] refuses a dictionary whose entries were not
+//! validated, whatever the scan (`offer_refuses_an_unvalidated_dictionary`).
 //!
 //! A hit skips the whole-block CRC cross-check for that block. Per-page CRCs
 //! still cover every byte the scan reads, and a cached column was verified
@@ -32,7 +41,7 @@
 //! [`DEFAULT_SWEEP_INTERVAL_NS`]: ravel_cache::DEFAULT_SWEEP_INTERVAL_NS
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ravel_cache::{Clock, DEFAULT_MAX_ENTRY_AGE_NS, SystemClock};
@@ -93,6 +102,10 @@ pub struct DecodedCacheCounters {
     evictions: AtomicU64,
     ghost_hits: AtomicU64,
     margin_skips: AtomicU64,
+    unvalidated_refusals: AtomicU64,
+    deferred_set_estimate_bytes: AtomicU64,
+    deferred_estimated: AtomicBool,
+    deferred_served: AtomicBool,
 }
 
 /// A point-in-time copy of [`DecodedCacheCounters`].
@@ -106,6 +119,18 @@ pub struct DecodedCacheSnapshot {
     /// Admissions skipped because the reservation would have left the budget
     /// under [`admission_margin`], though its limit would have admitted it.
     pub margin_skips: u64,
+    /// Offers refused because the column was a dictionary whose entries were
+    /// not validated (ADR-3326, LIKE-deferred amendment, decision 4).
+    pub unvalidated_refusals: u64,
+    /// The plan-time estimate of the decoded set of the statement's scans
+    /// that carry a Contains arm, summed over those scans; `None` when no
+    /// such scan made a verdict (ADR-3326, serve-if-fits amendment). The SQL
+    /// logs scan makes one in its plan pass, and on the whole-segment fast
+    /// path in `compute_fast_path_verdict`.
+    pub deferred_set_estimate_bytes: Option<u64>,
+    /// Whether a scan of the statement serves its Contains-deferred columns
+    /// from the cache, its estimate being at most 0.95 of the cap.
+    pub deferred_served: bool,
 }
 
 /// The unreserved bytes an admission must leave on a budget of `limit`, and
@@ -127,6 +152,17 @@ impl DecodedCacheSnapshot {
             evictions: self.evictions.saturating_add(other.evictions),
             ghost_hits: self.ghost_hits.saturating_add(other.ghost_hits),
             margin_skips: self.margin_skips.saturating_add(other.margin_skips),
+            unvalidated_refusals: self
+                .unvalidated_refusals
+                .saturating_add(other.unvalidated_refusals),
+            deferred_set_estimate_bytes: match (
+                self.deferred_set_estimate_bytes,
+                other.deferred_set_estimate_bytes,
+            ) {
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                (a, b) => a.or(b),
+            },
+            deferred_served: self.deferred_served || other.deferred_served,
         }
     }
 }
@@ -140,6 +176,24 @@ impl DecodedCacheCounters {
             evictions: self.evictions.load(Ordering::Relaxed),
             ghost_hits: self.ghost_hits.load(Ordering::Relaxed),
             margin_skips: self.margin_skips.load(Ordering::Relaxed),
+            unvalidated_refusals: self.unvalidated_refusals.load(Ordering::Relaxed),
+            deferred_set_estimate_bytes: self
+                .deferred_estimated
+                .load(Ordering::Relaxed)
+                .then(|| self.deferred_set_estimate_bytes.load(Ordering::Relaxed)),
+            deferred_served: self.deferred_served.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Records one scan's plan-time decoded-set estimate and whether that
+    /// scan serves its Contains-deferred columns (ADR-3326, serve-if-fits
+    /// amendment). Called once per scan with a Contains arm, by its plan pass
+    /// or, on the whole-segment fast path, by its directory-read pass.
+    pub fn record_deferred_verdict(&self, estimate_bytes: u64, served: bool) {
+        Self::bump(&self.deferred_set_estimate_bytes, estimate_bytes);
+        self.deferred_estimated.store(true, Ordering::Relaxed);
+        if served {
+            self.deferred_served.store(true, Ordering::Relaxed);
         }
     }
 
@@ -449,7 +503,9 @@ impl DecodedColumnCache {
 
     /// Offers a freshly decoded column for admission under `intent`'s rule,
     /// returning the admitted entry so the caller can hold it for as long as
-    /// it uses the column.
+    /// it uses the column. A dictionary whose entries were not validated is
+    /// refused after the intent rule, so a non-interactive first touch still
+    /// records its ghost record, and counted in `unvalidated_refusals`.
     pub(crate) fn offer(
         &self,
         key: DecodedKey,
@@ -469,6 +525,13 @@ impl DecodedColumnCache {
             }
             if !inner.intent_admits(&key, intent) {
                 self.record_ghost(&mut inner, key, bytes);
+                return None;
+            }
+            // A dictionary built unvalidated marks no entry valid, so a later
+            // scan without the Contains arm would read every row as absent.
+            if col.is_unvalidated_dict() {
+                inner.process.unvalidated_refusals += 1;
+                DecodedCacheCounters::bump(&counters.unvalidated_refusals, 1);
                 return None;
             }
             self.evict_for(&mut inner, bytes, &mut evicted, counters);
@@ -621,6 +684,11 @@ pub struct DecodedCacheAttach {
     pub object: [u8; 32],
     pub intent: AccessIntent,
     pub counters: Arc<DecodedCacheCounters>,
+    /// Whether the scan's Contains-deferred columns are looked up and
+    /// offered too: true only when the plan pass estimated the scan's whole
+    /// decoded set at most 0.95 of the cap (ADR-3326, serve-if-fits
+    /// amendment). Read once per block by `BlockScan::decode_block`.
+    pub serve_deferred: bool,
 }
 
 impl DecodedCacheAttach {
@@ -685,6 +753,58 @@ mod tests {
         assert_eq!((s.hits, s.misses, s.admissions), (1, 1, 1));
         assert_eq!(cache.resident_bytes(), v.heap_bytes() as u64);
         assert_eq!(cache.column_hits(1), 1);
+    }
+
+    /// ADR-3326, LIKE-deferred amendment, decision 4: an unvalidated
+    /// dictionary offered under an intent that admits is not admitted, and the
+    /// refusal is counted; the same dictionary built validated is admitted. A
+    /// non-interactive first touch of the unvalidated one still records its
+    /// ghost record, since the intent rule runs first.
+    #[test]
+    fn offer_refuses_an_unvalidated_dictionary() {
+        let entries = vec![b"a".to_vec(), b"b".to_vec()];
+        let raw = CachedColumn::dict_for_test(&entries, &[0, 1, 1, 0], false).expect("raw");
+        let checked = CachedColumn::dict_for_test(&entries, &[0, 1, 1, 0], true).expect("valid");
+        assert!(raw.is_unvalidated_dict());
+        assert!(!checked.is_unvalidated_dict());
+
+        let cache = DecodedColumnCache::new(1 << 20, None);
+        let c = DecodedCacheCounters::default();
+        assert!(
+            cache
+                .offer(key(0, 1), &raw, AccessIntent::Interactive, &c)
+                .is_none()
+        );
+        assert!(cache.is_empty(), "no entry");
+        let s = c.snapshot();
+        assert_eq!((s.unvalidated_refusals, s.admissions), (1, 0));
+        assert_eq!(cache.process_counters().unvalidated_refusals, 1);
+
+        assert!(
+            cache
+                .offer(key(0, 1), &checked, AccessIntent::Interactive, &c)
+                .is_some()
+        );
+        assert_eq!(c.snapshot().admissions, 1);
+
+        // Bulk scan: the first touch only ghosts and is not a refusal; the
+        // second passes the intent rule and is refused for the dictionary.
+        let bulk = DecodedCacheCounters::default();
+        assert!(!cache.would_admit(&key(1, 1), AccessIntent::BulkScan));
+        assert!(
+            cache
+                .offer(key(1, 1), &raw, AccessIntent::BulkScan, &bulk)
+                .is_none()
+        );
+        assert_eq!(bulk.snapshot().unvalidated_refusals, 0);
+        assert!(cache.would_admit(&key(1, 1), AccessIntent::BulkScan));
+        assert!(
+            cache
+                .offer(key(1, 1), &raw, AccessIntent::BulkScan, &bulk)
+                .is_none()
+        );
+        assert_eq!(bulk.snapshot().unvalidated_refusals, 1);
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
