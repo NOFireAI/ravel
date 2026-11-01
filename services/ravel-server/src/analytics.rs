@@ -299,7 +299,7 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Ser
         .await?;
 
     let mut stats_json =
-        crate::query::accounting_stats_json(&outcome.stats.accounting, &outcome.stats.estimate);
+        crate::query::accounting_stats_json(&outcome.stats.accounting, 0, &outcome.stats.estimate);
     // ADR-0071: a distributed run attaches a per-slice
     // `fragments[]` beside `accounting`/`estimate`; a non-distributed run
     // collected no entries, so the field is omitted rather than an empty array.

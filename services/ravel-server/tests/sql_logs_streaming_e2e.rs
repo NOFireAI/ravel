@@ -407,3 +407,39 @@ async fn wide_full_table_aggregates_complete_within_a_small_memory_pool() {
         "peak reserved bytes {peak} must stay under the {SMALL_POOL_BYTES}-byte          pool: {value}"
     );
 }
+
+/// The `/sql` stats carry `peakAskedIntermediateBytes`, the pre-reserve-ahead
+/// high-water mark, beside the charged `peakIntermediateBytes`. The charged
+/// figure includes the 1.25 default factor for hash aggregate consumers, so
+/// the asked figure is at most the charged one and at least the charged one
+/// divided by 1.25.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sql_stats_json_carries_peak_asked_intermediate_bytes() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_wide_object(store.as_ref(), &tenant, 0, 1, 4_000).await;
+    let app = build_router(
+        store,
+        HashMap::from([("acme-token".to_string(), tenant.clone())]),
+    );
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT severity_text, COUNT(*) AS n FROM logs GROUP BY severity_text",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let charged = peak_intermediate_bytes(&value);
+    let asked = value["stats"]["accounting"]["peakAskedIntermediateBytes"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no peakAskedIntermediateBytes in {value}"));
+    assert!(asked > 0, "a GROUP BY reserves memory: {value}");
+    assert!(
+        asked <= charged,
+        "asked {asked} > charged {charged}: {value}"
+    );
+    assert!(
+        asked as f64 >= charged as f64 / 1.25,
+        "asked {asked} < charged {charged} / 1.25: {value}"
+    );
+}

@@ -30,6 +30,7 @@ use crate::ServerConfig;
 /// the response as well as from `/metrics`.
 pub fn accounting_stats_json(
     accounting: &QueryAccountingSnapshot,
+    peak_asked_intermediate_bytes: u64,
     estimate: &CostEstimate,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -49,6 +50,7 @@ pub fn accounting_stats_json(
             "seriesMatched": accounting.series_matched,
             "bytesReused": accounting.bytes_reused,
             "peakIntermediateBytes": accounting.peak_intermediate_bytes,
+            "peakAskedIntermediateBytes": peak_asked_intermediate_bytes,
         },
         "estimate": {
             "estimatedRequests": estimate.estimated_requests,

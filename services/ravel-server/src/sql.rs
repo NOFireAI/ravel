@@ -345,7 +345,11 @@ fn build_stats_json(
     audit_elapsed: Duration,
     with_signals: bool,
 ) -> serde_json::Value {
-    let mut stats = crate::query::accounting_stats_json(&outcome.accounting, &outcome.estimate);
+    let mut stats = crate::query::accounting_stats_json(
+        &outcome.accounting,
+        outcome.peak_asked_intermediate_bytes,
+        &outcome.estimate,
+    );
     if let serde_json::Value::Object(ref mut map) = stats {
         map.insert(
             "phases".to_string(),
