@@ -1914,6 +1914,23 @@ mod describe_data {
         }
     }
 
+    /// The metadata cache's clock, advanced by hand so a test can cross the
+    /// refresh horizon with no real sleep.
+    struct CacheClock(AtomicU64);
+
+    impl ravel_cache::Clock for CacheClock {
+        fn now_ns(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl CacheClock {
+        fn advance(&self, by: Duration) {
+            let by = u64::try_from(by.as_nanos()).expect("fits");
+            self.0.fetch_add(by, Ordering::SeqCst);
+        }
+    }
+
     /// A service with only the describe surface attached, over one counting
     /// store, with every shared piece readable afterwards.
     struct DescribeHarness {
@@ -1921,6 +1938,7 @@ mod describe_data {
         store: Arc<dyn ObjectStoreBackend>,
         catalog: Arc<Catalog>,
         metadata_cache: Arc<MetadataCache>,
+        cache_clock: Arc<CacheClock>,
         admission: Arc<QueryAdmissionController>,
         usage: Arc<RecordingUsage>,
         cost: Arc<RecordingCost>,
@@ -1939,10 +1957,13 @@ mod describe_data {
         });
         let catalog =
             Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let cache_clock = Arc::new(CacheClock(AtomicU64::new(
+            u64::try_from(NOW_NS).expect("non-negative"),
+        )));
         let metadata_cache = Arc::new(MetadataCache::new(
             Arc::clone(&store),
             MetadataCacheConfig::default(),
-            Arc::new(ravel_cache::SystemClock),
+            Arc::clone(&cache_clock) as Arc<dyn ravel_cache::Clock>,
         ));
 
         let mut tokens = HashMap::new();
@@ -1970,6 +1991,7 @@ mod describe_data {
             store,
             catalog,
             metadata_cache,
+            cache_clock,
             admission,
             usage,
             cost,
@@ -1981,7 +2003,7 @@ mod describe_data {
     fn request(signal: &str) -> DescribeDataRequest {
         DescribeDataRequest {
             signal: signal.to_string(),
-            offset: 0,
+            after_name: None,
             limit: None,
             now_ns: NOW_NS,
             deadline: Duration::from_secs(30),
@@ -2078,12 +2100,14 @@ mod describe_data {
     }
 
     /// Two pages over 150 families written in reverse order: the first page is
-    /// exactly the 100 smallest names in byte order, the second the remaining
-    /// 50, and both report the record's total rather than their own length. A
-    /// limit above the cap is lowered to it. FLIP: report `page.len()` as
-    /// `families_total` and the first page's total reads 100, not 150. FLIP:
-    /// collect the record through a `HashMap` instead of sorting it and the
-    /// first page's names come back out of order.
+    /// exactly the 100 smallest names in byte order, the page after
+    /// `family_099` exactly the remaining 50, and both report the record's
+    /// total rather than their own length. A limit above the cap is lowered
+    /// to it. FLIP: report `page.len()` as `families_total` and the first
+    /// page's total reads 100, not 150. FLIP: collect the record through a
+    /// `HashMap` instead of sorting it and the first page's names come back
+    /// out of order. FLIP: keep names `>=` the keyset position and the second
+    /// page starts with `family_099` again.
     #[tokio::test]
     async fn family_pages_are_sorted_and_carry_the_record_total() {
         let h = describe_harness(
@@ -2122,7 +2146,7 @@ mod describe_data {
             .describe_data(
                 h.tenant_hash,
                 &DescribeDataRequest {
-                    offset: 100,
+                    after_name: Some("family_099".to_string()),
                     ..request("metrics")
                 },
             )
@@ -2160,6 +2184,143 @@ mod describe_data {
         assert!(logs.families.is_empty());
         assert_eq!(logs.families_total, 0);
         assert_eq!(logs.families_absent_reason, Some(FAMILIES_METRICS_ONLY));
+    }
+
+    /// Replace the tenant's record with `entries`, move the cache clock past
+    /// its refresh horizon, and read the cache until its background refresh
+    /// serves exactly the new names, so the next describe call pages over
+    /// the new record.
+    async fn replace_record(
+        h: &DescribeHarness,
+        entries: &[MetricMetadataEntry],
+        expected: ravel_object_store::Version,
+    ) -> ravel_object_store::Version {
+        let version = write_metrics_meta(h.store.as_ref(), &h.tenant_hash, entries, Some(expected))
+            .await
+            .expect("replace metrics_meta");
+        h.cache_clock
+            .advance(MetadataCacheConfig::default().refresh_horizon + Duration::from_nanos(1));
+        let mut want: Vec<_> = entries.iter().map(|e| e.family_name.clone()).collect();
+        want.sort();
+        for _ in 0..1000 {
+            let record = h.metadata_cache.get(h.tenant_hash).await;
+            let mut served: Vec<_> = record.iter().map(|e| e.family_name.clone()).collect();
+            served.sort();
+            if served == want {
+                return version;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the metadata cache never served the replaced record");
+    }
+
+    /// A record that changes between pages moves neither a skip nor a repeat
+    /// into the sequence. Page one is `family_000..family_099` of 150; the
+    /// cache then refreshes over a record that gained `family_050a`, which
+    /// sorts before the keyset position, and the page after `family_099` is
+    /// still exactly `family_100..family_124` with the total at 151; it
+    /// refreshes again over a record that lost `family_010` and
+    /// `family_050a`, and the page after `family_124` is exactly
+    /// `family_125..family_149` with the total at 149. Every family present
+    /// on all three reads is returned once, and the added one never. FLIP:
+    /// page by `offset`, the count returned so far (the replaced paging), and
+    /// page two starts at `family_099`, which page one already returned.
+    /// FLIP: keep names `>=` the keyset position and page two starts with
+    /// `family_099` again.
+    #[tokio::test]
+    async fn a_record_change_between_pages_neither_skips_nor_repeats() {
+        let h = describe_harness(
+            QueryConcurrencyLimit::Unlimited,
+            StaticDeclaredColumns::empty(),
+        );
+        let name = |i: usize| format!("family_{i:03}");
+        let names = |range: std::ops::Range<usize>| -> Vec<String> { range.map(name).collect() };
+        let page_names = |data: &crate::service::describe::DescribeData| -> Vec<String> {
+            data.families.iter().map(|f| f.name.clone()).collect()
+        };
+        let mut entries: Vec<_> = (0..150).map(|i| family(name(i))).collect();
+        let v1 = write_metrics_meta(h.store.as_ref(), &h.tenant_hash, &entries, None)
+            .await
+            .expect("write metrics_meta");
+
+        let one = h
+            .service
+            .describe_data(h.tenant_hash, &request("metrics"))
+            .await
+            .expect("page one");
+        assert_eq!(page_names(&one), names(0..100));
+        assert_eq!(one.families_total, 150);
+
+        entries.push(family("family_050a".to_string()));
+        let v2 = replace_record(&h, &entries, v1).await;
+        let two = h
+            .service
+            .describe_data(
+                h.tenant_hash,
+                &DescribeDataRequest {
+                    after_name: Some("family_099".to_string()),
+                    limit: Some(25),
+                    ..request("metrics")
+                },
+            )
+            .await
+            .expect("page two");
+        assert_eq!(two.families_total, 151, "page two read the grown record");
+        assert_eq!(page_names(&two), names(100..125));
+
+        entries.retain(|e| e.family_name != "family_010" && e.family_name != "family_050a");
+        replace_record(&h, &entries, v2).await;
+        let three = h
+            .service
+            .describe_data(
+                h.tenant_hash,
+                &DescribeDataRequest {
+                    after_name: Some("family_124".to_string()),
+                    ..request("metrics")
+                },
+            )
+            .await
+            .expect("page three");
+        assert_eq!(
+            three.families_total, 149,
+            "page three read the shrunk record"
+        );
+        assert_eq!(page_names(&three), names(125..150));
+
+        let returned: Vec<String> = [one, two, three].iter().flat_map(page_names).collect();
+        let unique: std::collections::BTreeSet<&String> = returned.iter().collect();
+        assert_eq!(unique.len(), returned.len(), "no family is returned twice");
+        for present in names(0..150).iter().filter(|n| n.as_str() != "family_010") {
+            assert!(unique.contains(present), "{present} was skipped");
+        }
+        assert!(!unique.contains(&"family_050a".to_string()));
+    }
+
+    /// A zero limit is a typed 400 decided before the permit, as an unknown
+    /// signal is: refused while the only permit is held and again once it is
+    /// free, with no resolve and no usage record. FLIP: drop the `Some(0)`
+    /// arm and the held-permit call reads `Unavailable`, refused by the
+    /// ceiling instead of as an argument.
+    #[tokio::test]
+    async fn a_zero_limit_is_refused_before_the_permit() {
+        let h = describe_harness(
+            QueryConcurrencyLimit::Bounded(1),
+            StaticDeclaredColumns::empty(),
+        );
+        let zero = DescribeDataRequest {
+            limit: Some(0),
+            ..request("metrics")
+        };
+        let held = h.admission.try_admit().expect("the only permit");
+        let err = err_of(h.service.describe_data(h.tenant_hash, &zero).await);
+        assert_eq!(err.kind, ServiceErrorKind::InvalidArgument);
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        drop(held);
+
+        let err = err_of(h.service.describe_data(h.tenant_hash, &zero).await);
+        assert_eq!(err.kind, ServiceErrorKind::InvalidArgument);
+        assert_eq!(h.resolves.load(Ordering::SeqCst), 0);
+        assert!(h.usage.records().is_empty());
     }
 
     /// A logs tenant's declared columns are exactly its declarations, in the
