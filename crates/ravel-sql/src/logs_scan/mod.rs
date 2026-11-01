@@ -3162,6 +3162,7 @@ impl ExecutionPlan for LogsScanExec {
             columns: self.columns.clone(),
             projected_fraction: self.projected_fraction,
             phase_accounting: self.phase_accounting.clone(),
+            serve_deferred: std::sync::atomic::AtomicBool::new(false),
         });
 
         // #693 part 3 deliverable 1, amended by #739: a predicate-free query

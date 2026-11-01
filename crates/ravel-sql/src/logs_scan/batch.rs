@@ -4404,6 +4404,7 @@ mod tests {
                 object: [9; 32],
                 intent,
                 counters: Arc::clone(&counters),
+                serve_deferred: false,
             });
         }
         let view = scan
