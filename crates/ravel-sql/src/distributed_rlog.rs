@@ -221,9 +221,9 @@ pub struct DistributedSliceScanExec {
     /// each worker batch is folded in by `get_array_memory_size`, exactly as the
     /// metrics lane folds its worker batches.
     accounting: QueryAccounting,
-    /// The per-tenant bytes-scanned budget. `Unlimited` (the RLOG default, since
-    /// these providers carry no per-query byte budget) never trips and still
-    /// folds the bytes.
+    /// The statement's effective bytes-scanned budget (issue #1409), compared
+    /// against the folded total of `accounting`. `Unlimited` never trips and
+    /// still folds the bytes.
     max_bytes_scanned: ByteLimit,
     /// The signal's public output schema, validated against every worker batch.
     schema: SchemaRef,

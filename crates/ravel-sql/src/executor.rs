@@ -165,6 +165,7 @@ use crate::parquet::{
 };
 use crate::provider::RavelTableProvider;
 use crate::pushdown::extract;
+use crate::scan_budget::EnforcedBudgets;
 use crate::session::{
     LOGS_TABLE, REWRITE_ONLY_AGGREGATES, SAMPLES_TABLE, SessionTable, SpillDecision,
     build_session_with_tables,
@@ -705,14 +706,13 @@ pub struct SqlRequest {
     /// server's configured ceilings (ADR-1374 decision 3, prerequisite 1).
     /// `None` runs under the server config unchanged.
     ///
-    /// Which knob binds depends on the table. Only the `samples` (metrics)
-    /// provider reads the effective `max_bytes_scanned` and
-    /// `max_store_requests` at scan time; the `logs`, `spans`, `alerts`, and
-    /// `audit` providers do not. For those four tables only `max_segments` is
-    /// lowered today, through the catalog resolve every table shares. A bytes
-    /// or request ceiling set for one of them is clamped and then never
-    /// consulted. That is a pre-existing gap in those providers, tracked as
-    /// issue #1409, not a property of the budgets themselves.
+    /// Every signal table's scan (`samples`, `logs`, `spans`, `alerts` and
+    /// `audit`) checks the effective `max_bytes_scanned` and
+    /// `max_store_requests` against the statement total, summed over every
+    /// table the statement reads, each time one of its segment reads
+    /// completes, and refuses with the same typed errors as the server
+    /// ceiling once the total passes either. [`SignalStats::budgets`] reports
+    /// the limits each table's scan checked.
     pub budgets: Option<RequestBudgets>,
 }
 
@@ -1261,12 +1261,17 @@ fn lanes_covering_window(lanes: &[(TargetSignal, Snapshot)]) -> (TimeRange, i64)
 /// optimizer then pushes projections and filters down over the rewritten plan
 /// exactly as it would over a predicate the statement itself carried. Pruning
 /// therefore tightens: the injected filter is offered to the provider like any
-/// other, and the result stays sound because every provider reports `Inexact`,
-/// so DataFusion re-applies the filter above the scan and a segment straddling
-/// the window is read whole and filtered by row.
+/// other, and the result stays sound either way the provider answers. Every
+/// provider but a local `logs` scan reports `Inexact`, so DataFusion re-applies
+/// the filter above the scan and a segment straddling the window is read whole
+/// and filtered by row. A local `logs` scan reports the pure `ts` bound
+/// `Exact` ([`crate::logs_pushdown::filter_is_exact`]) and drops the residual,
+/// because the RLOG reader re-checks every decoded row against
+/// `Predicate::TsRange` with the half-open end taken as `end_ns - 1`.
 ///
 /// The traversal descends into subqueries embedded in expressions
-/// (`Expr::ScalarSubquery`, `Expr::InSubquery`, `Expr::Exists`) as well as into
+/// (`Expr::ScalarSubquery`, `Expr::InSubquery`, `Expr::Exists`,
+/// `Expr::SetComparison`) as well as into
 /// plan children, so a statement whose `WHERE` clause carries its own `SELECT`
 /// gets the window on that scan too. A plain `transform_up` walks only the plan
 /// tree, which would leave the inner scan reading the whole overlapping segment
@@ -1376,6 +1381,10 @@ pub struct SignalStats {
     pub segments_pruned: u64,
     /// This table's cost, split by phase like [`SqlOutcome::phase_accounting`].
     pub phases: PhaseAccountingSnapshot,
+    /// The byte and store-request budgets this table's scan checked the
+    /// statement total against, and how many checks it ran (issue #1409).
+    /// `None` when no scan of this table was built with a budget.
+    pub budgets: Option<EnforcedBudgets>,
 }
 
 /// Merges `view`'s statement total into `into` when dropped, so a caller
@@ -1411,6 +1420,7 @@ fn signal_stats(lanes: &[LaneCounts], view: &StatementAccounting) -> Vec<SignalS
             segments: lane.segments,
             segments_pruned: lane.segments_pruned,
             phases: view.lane(lane.signal).snapshot(),
+            budgets: view.enforced_budgets(lane.signal),
         })
         .collect()
 }
@@ -2545,6 +2555,10 @@ impl SqlExecutor {
     /// [`ParquetPlan::Resolved`]) reads each table's manifests and the grants
     /// record once for the whole `GetFlightInfo`, not once here and again at
     /// plan time.
+    ///
+    /// The pinned plan entries take no row window, so a request with
+    /// `row_window` set is [`SqlError::RowWindowNotPinned`] here, before any
+    /// store request, on this and every other pinned resolve.
     pub async fn resolve_pinned(
         &self,
         tenant_hash: TenantHash,
@@ -2603,6 +2617,11 @@ impl SqlExecutor {
         tables: &StatementTables,
         accounting: &QueryAccounting,
     ) -> Result<PinnedLanes, SqlError> {
+        // `PinnedPlanInputs` carries no row window, so the plan that follows
+        // this resolve could not apply one.
+        if req.row_window {
+            return Err(SqlError::RowWindowNotPinned);
+        }
         let tokens = admit_http_tokens(tables, &req.min_tokens)?;
         // Kept on the pooled `&QueryAccounting` signature (the public Flight
         // SQL `GetFlightInfo`-side resolve, whose caller has no phase-split
@@ -3120,7 +3139,7 @@ impl SqlExecutor {
                             config.clone(),
                             phase_accounting.lane(signal).clone(),
                         )
-                        .with_statement_accounting(phase_accounting.clone());
+                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine));
                         // Install the distributed samples scan for this query only,
                         // when the coordinator decided to fan out. `None`/feature-off
                         // leaves the provider byte-identical to the local path.
@@ -3193,7 +3212,8 @@ impl SqlExecutor {
                             .with_key_index(key_index)
                             .with_column_stats(column_stats)
                             .with_segment_timing(config.segment_timing)
-                            .with_scan_executions(Arc::clone(&self.scan_executions)),
+                            .with_scan_executions(Arc::clone(&self.scan_executions))
+                            .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine)),
                         ))
                     }
                     // The alerts and audit providers are not yet threaded onto the
@@ -3216,27 +3236,32 @@ impl SqlExecutor {
                             self.span_fetcher.clone(),
                             phase_accounting.lane(signal).scan().clone(),
                         )
-                        .with_phase_accounting(phase_accounting.lane(signal).clone()),
+                        .with_phase_accounting(phase_accounting.lane(signal).clone())
+                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine)),
                     )),
                     // The two RLOG-backed tables (ADR-1101 decision 1) read through the
                     // executor's existing `log_fetcher`: an alert and an audit record
                     // ride RLOG v1 verbatim, so they share the `logs` table's accounted,
                     // tenant-checked fetch funnel and its caches. No declared columns
                     // and no column statistics apply to either.
-                    TargetSignal::Alerts => {
-                        SessionTable::Alerts(Arc::new(AlertsTableProvider::new(
+                    TargetSignal::Alerts => SessionTable::Alerts(Arc::new(
+                        AlertsTableProvider::new(
                             snapshot,
                             tenant_hash,
                             self.log_fetcher.clone(),
                             phase_accounting.lane(signal).scan().clone(),
-                        )))
-                    }
-                    TargetSignal::Audit => SessionTable::Audit(Arc::new(AuditTableProvider::new(
-                        snapshot,
-                        tenant_hash,
-                        self.log_fetcher.clone(),
-                        phase_accounting.lane(signal).scan().clone(),
-                    ))),
+                        )
+                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine)),
+                    )),
+                    TargetSignal::Audit => SessionTable::Audit(Arc::new(
+                        AuditTableProvider::new(
+                            snapshot,
+                            tenant_hash,
+                            self.log_fetcher.clone(),
+                            phase_accounting.lane(signal).scan().clone(),
+                        )
+                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine)),
+                    )),
                     // A lane read beside Parquet tables is a signal table.
                     TargetSignal::Parquet => {
                         return Err(SqlError::Internal(
@@ -3563,6 +3588,7 @@ impl SqlExecutor {
         // (`resolve_snapshot`) paths pass through, so any tenant running a query
         // is kept out of the idle sweep.
         self.touch_tenant(tenant_hash, req.now_ns);
+        let engine_config = self.effective_config(req.budgets.as_ref()).engine;
         let tables = statement.tables()?;
         // ADR-2040: the Parquet tables a statement names resolve their
         // manifests first, so a statement that also names signal tables
@@ -3593,12 +3619,9 @@ impl SqlExecutor {
                 requests,
                 max,
                 fold_lag,
-            }) = request_budget_exceeded(
-                estimate.estimated_requests,
-                self.effective_config(req.budgets.as_ref())
-                    .engine
-                    .max_s3_requests,
-            ) {
+            }) =
+                request_budget_exceeded(estimate.estimated_requests, engine_config.max_s3_requests)
+            {
                 return Err(SqlError::RequestBudgetExceeded {
                     requests,
                     max,
@@ -3657,7 +3680,6 @@ impl SqlExecutor {
             }
             _ => None,
         };
-        let engine_config = self.effective_config(req.budgets.as_ref()).engine;
         // Every lane is admitted against the statement's one `max_segments`,
         // so each is checked here unbounded and the running sum against the
         // ceiling below.
@@ -5645,7 +5667,7 @@ fn execution_error(err: DataFusionError, pool: &Arc<dyn MemoryPool>) -> SqlError
 ///
 /// Returns the original error unchanged when there is no ravel error inside,
 /// so no detail is lost on the way to the log.
-fn take_sql_error(err: DataFusionError) -> Result<SqlError, DataFusionError> {
+pub(crate) fn take_sql_error(err: DataFusionError) -> Result<SqlError, DataFusionError> {
     match err {
         DataFusionError::External(boxed) => match boxed.downcast::<SqlError>() {
             Ok(sql) => Ok(*sql),
@@ -6958,7 +6980,7 @@ pub(crate) mod tests {
     use ravel_object_store::instrument::InstrumentedStore;
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{ObjectStoreBackend, PutOptions};
-    use ravel_query::FetchError;
+    use ravel_query::{ByteLimit, FetchError, RequestLimit};
     use ravel_rspan::{
         ObjectIdentity as SpanObjectIdentity, RspanConfig, RspanWriter, SpanRecord, StatusCode,
     };
@@ -10283,7 +10305,7 @@ pub(crate) mod tests {
                 row_count: records.len() as u64,
                 min_event_ts_ns: min,
                 max_event_ts_ns: max,
-                segment_format_version: 1,
+                segment_format_version: u32::from(ravel_rspan::footer::VERSION),
                 ingest_hour_bucket: 0,
             },
         )
@@ -10655,18 +10677,32 @@ pub(crate) mod tests {
         kept.sort_unstable();
         assert_eq!(kept.first().copied(), Some(350));
         assert_eq!(kept.last().copied(), Some(499));
+    }
 
-        // An IN subquery is the other expression-embedded shape: the inner
-        // scan's own predicate keeps ts 400..1000, and the window cuts it to
-        // 400..500.
-        let in_list = executor
+    /// The IN-subquery shape of [`row_window_reaches_scans_inside_expression_subqueries`].
+    /// The inner select shifts every value down by 100, so its windowed rows
+    /// (values 200..500) yield 100..400 and the outer windowed scan keeps
+    /// ts 200..400: 200 rows. An unwindowed inner scan yields -100..900, which
+    /// covers the whole outer window and keeps 300 rows.
+    ///
+    /// FLIP: `plan.transform_up(` in place of
+    /// `plan.transform_up_with_subqueries(` in `apply_row_window` returns 300
+    /// rows, failing the `num_rows() == 200` assertion.
+    #[tokio::test]
+    async fn row_window_reaches_scans_inside_in_subqueries() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("row-window-in-subquery-1376", 1_000, FaultPlan::empty()).await;
+        let in_list = executor_over(store)
             .execute(
                 tenant_hash,
                 &SqlRequest {
                     row_window: true,
                     ..sql_request(
-                        "SELECT ts FROM samples WHERE ts IN (SELECT ts FROM samples WHERE value >= 400)",
-                        window,
+                        "SELECT ts FROM samples WHERE value IN (SELECT value - 100 FROM samples)",
+                        TimeRange {
+                            start_ns: 200,
+                            end_ns: 500,
+                        },
                     )
                 },
             )
@@ -10674,13 +10710,13 @@ pub(crate) mod tests {
             .expect("execute the IN-subquery statement under the row window");
         assert_eq!(
             in_list.output.num_rows(),
-            100,
-            "the window bounds the inner scan too, so ts 400..500 survives"
+            200,
+            "the window bounds the inner scan too, so ts 200..400 survives"
         );
         let mut kept = ts_values(&in_list.output);
         kept.sort_unstable();
-        assert_eq!(kept.first().copied(), Some(400));
-        assert_eq!(kept.last().copied(), Some(499));
+        assert_eq!(kept.first().copied(), Some(200));
+        assert_eq!(kept.last().copied(), Some(399));
     }
 
     /// Prerequisite 3. `explain` resolves, admits, and plans; it must never
@@ -11046,5 +11082,224 @@ pub(crate) mod tests {
             7,
             "the seven audit records outside the window are excluded"
         );
+    }
+
+    /// The row window on the two RLOG tables that answer the injected filter
+    /// differently. A local `logs` scan reports the pure `ts` bound `Exact`,
+    /// so no residual runs and the reader's `Predicate::TsRange` re-check is
+    /// the only row filter; `alerts` reports it `Inexact` and DataFusion
+    /// re-applies it. One segment straddles the window, with records at
+    /// `0, 100, ..., 900` plus `199` and `499` either side of the edges: 12
+    /// rows, of which exactly `200, 300, 400, 499` are inside `[200, 500)`.
+    ///
+    /// FLIP (logs): `Operator::Lt => tighten_hi(out, ns)` in
+    /// `logs_pushdown::apply_ts_bound`, taking `ts < 500` as `ts <= 500`,
+    /// also returns the record at 500.
+    /// FLIP (alerts): `TargetSignal::Alerts => None` in `window_ts_column`
+    /// refuses the windowed `alerts` statement as `RowWindowUnsupported`.
+    #[tokio::test]
+    async fn row_window_applies_to_logs_ts_and_alerts_ts_ns() {
+        let window = TimeRange {
+            start_ns: 200,
+            end_ns: 500,
+        };
+        let mut stamps: Vec<i64> = (0..10).map(|i| i * 100).collect();
+        stamps.extend([199, 499]);
+        stamps.sort_unstable();
+
+        for (signal, table, ts_col) in [
+            (Signal::Logs, "logs", "ts"),
+            (Signal::Alerts, "alerts", "ts_ns"),
+        ] {
+            let tenant_hash = TenantId::new(format!("row-window-{table}-1409")).hash();
+            let records: Vec<LogRecord> = stamps.iter().map(|&ts| log_record(table, ts)).collect();
+            let memory = MemoryStore::new();
+            publish_log_records(&memory, tenant_hash, signal, 1, &records).await;
+            let store = wrap_fixture_store(memory);
+            let base = sql_request(&format!("SELECT {ts_col} FROM {table}"), window);
+
+            let unfiltered = executor_over(store.clone())
+                .execute(tenant_hash, &base)
+                .await
+                .unwrap_or_else(|e| panic!("execute {table} without the row window: {e}"));
+            assert_eq!(unfiltered.output.num_rows(), 12, "{table}");
+
+            let filtered = executor_over(store)
+                .execute(
+                    tenant_hash,
+                    &SqlRequest {
+                        row_window: true,
+                        ..base
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("execute {table} with the row window: {e}"));
+            assert_eq!(
+                filtered.stats.window_predicate.as_deref(),
+                Some(
+                    window_filter_expr(&TableReference::bare(table), ts_col, window)
+                        .to_string()
+                        .as_str()
+                ),
+                "{table}"
+            );
+            let mut kept = ts_column_values(&filtered.output, ts_col);
+            kept.sort_unstable();
+            assert_eq!(kept, vec![200, 300, 400, 499], "{table}");
+            assert_eq!(filtered.output.num_rows(), 4, "{table}");
+        }
+    }
+
+    /// The pinned plan entries take no row window, so a pinned resolve of a
+    /// request that sets one is refused typed, before any store request,
+    /// instead of planning rows outside the window.
+    ///
+    /// FLIP: removing the `req.row_window` refusal from
+    /// `resolve_pinned_tables` resolves the snapshot and returns `Ok`.
+    #[tokio::test]
+    async fn a_pinned_resolve_refuses_a_row_window() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("row-window-pinned-1409", 10, FaultPlan::empty()).await;
+        let executor = executor_over(store.clone());
+        let req = SqlRequest {
+            row_window: true,
+            ..sql_request(
+                "SELECT ts FROM samples",
+                TimeRange {
+                    start_ns: 2,
+                    end_ns: 5,
+                },
+            )
+        };
+        let before = store.metrics().snapshot();
+        let single = executor
+            .resolve_pinned(tenant_hash, &req, &QueryAccounting::new())
+            .await;
+        assert!(
+            matches!(single, Err(SqlError::RowWindowNotPinned)),
+            "{:?}",
+            single.err()
+        );
+        let lanes = executor
+            .resolve_pinned_lanes(tenant_hash, &req, &QueryAccounting::new())
+            .await;
+        assert!(
+            matches!(lanes, Err(SqlError::RowWindowNotPinned)),
+            "{:?}",
+            lanes.err()
+        );
+        let after = store.metrics().snapshot();
+        assert_eq!(after.get.calls, before.get.calls);
+        assert_eq!(after.list.calls, before.list.calls);
+        assert_eq!(
+            SqlError::RowWindowNotPinned.class(),
+            crate::error::ErrorClass::BadRequest
+        );
+
+        let unwindowed = executor
+            .resolve_pinned(
+                tenant_hash,
+                &SqlRequest {
+                    row_window: false,
+                    ..req
+                },
+                &QueryAccounting::new(),
+            )
+            .await;
+        assert!(unwindowed.is_ok(), "{:?}", unwindowed.err());
+    }
+
+    /// Every signal table reports the budgets its scan checked: the request's
+    /// lowered budgets when it carries some, the executor's configuration when
+    /// it does not, and one check per data object fetched.
+    ///
+    /// FLIP: a constant `budgets` field (or one read from the server config
+    /// instead of the effective one) reports the same limits for both runs
+    /// below; a table whose scan carries no budget reports `None`.
+    #[tokio::test]
+    async fn stats_report_which_budgets_each_table_enforces() {
+        let tenant = TenantId::new("stats-budgets-1409".to_string());
+        let tenant_hash = tenant.hash();
+        let memory = MemoryStore::new();
+        let samples: Vec<Sample> = (0..4)
+            .map(|i| Sample {
+                ts_ns: i * 100,
+                value: i as f64,
+            })
+            .collect();
+        publish_metric_samples(&memory, &tenant, 1, "m", samples).await;
+        let logs: Vec<LogRecord> = (0..4).map(|i| log_record("logs", i * 100)).collect();
+        publish_log_records(&memory, tenant_hash, Signal::Logs, 2, &logs).await;
+        publish_log_records(&memory, tenant_hash, Signal::Audit, 3, &logs).await;
+        publish_log_records(&memory, tenant_hash, Signal::Alerts, 4, &logs).await;
+        let spans: Vec<SpanRecord> = (0..4)
+            .map(|i| SpanRecord {
+                trace_id: [1u8; 16],
+                span_id: [u8::try_from(i).unwrap_or(u8::MAX); 8],
+                parent_span_id: None,
+                name: "op".to_string(),
+                start_ts_ns: i * 100,
+                end_ts_ns: i * 100 + 10,
+                status_code: StatusCode::Ok,
+                status_message: None,
+                attrs: vec![("service.name".to_string(), "checkout".to_string())],
+            })
+            .collect();
+        publish_spans(&memory, tenant_hash, 5, &spans).await;
+        let store = wrap_fixture_store(memory);
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: 1_000,
+        };
+        let server = EngineConfig::default();
+        let lowered = RequestBudgets {
+            max_bytes_scanned: Some(ByteLimit::Bounded(1 << 30)),
+            max_store_requests: Some(RequestLimit::Bounded(64)),
+            ..Default::default()
+        };
+
+        for (sql, tables) in [
+            ("SELECT * FROM samples", &["samples"][..]),
+            ("SELECT * FROM logs", &["logs"][..]),
+            ("SELECT * FROM spans", &["spans"][..]),
+            ("SELECT * FROM alerts", &["alerts"][..]),
+            ("SELECT * FROM audit", &["audit"][..]),
+            (
+                "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts",
+                &["samples", "logs"][..],
+            ),
+        ] {
+            for budgets in [None, Some(lowered)] {
+                let mut request = sql_request(sql, window);
+                request.budgets = budgets;
+                let outcome = executor_over(store.clone())
+                    .execute(tenant_hash, &request)
+                    .await
+                    .unwrap_or_else(|e| panic!("{sql}: {e}"));
+                let (bytes, requests) = match &budgets {
+                    None => (server.max_bytes_scanned, server.max_s3_requests),
+                    Some(_) => (ByteLimit::Bounded(1 << 30), RequestLimit::Bounded(64)),
+                };
+                let reported: Vec<(&str, Option<EnforcedBudgets>)> = outcome
+                    .signals
+                    .iter()
+                    .map(|signal| (signal.table, signal.budgets))
+                    .collect();
+                let expected: Vec<(&str, Option<EnforcedBudgets>)> = tables
+                    .iter()
+                    .map(|&table| {
+                        (
+                            table,
+                            Some(EnforcedBudgets {
+                                max_bytes_scanned: bytes,
+                                max_store_requests: requests,
+                                checks: 1,
+                            }),
+                        )
+                    })
+                    .collect();
+                assert_eq!(reported, expected, "{sql} under {budgets:?}");
+            }
+        }
     }
 }

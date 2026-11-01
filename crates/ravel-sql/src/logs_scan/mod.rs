@@ -423,6 +423,7 @@ use crate::logs_schema::{
 use crate::rlog_attrs::{
     attr_value_to_string, decode_stream_attrs, find_attr, merged_attrs, retain_unerased,
 };
+use crate::scan_budget::ScanBudget;
 use ravel_logseg::record::canonical_value_bytes;
 
 mod batch;
@@ -1304,6 +1305,9 @@ pub struct LogsScanExec {
     /// counted it ([`Alternation::reversed`]), shared with its siblings so
     /// every partition and re-execution round takes the same one.
     reversed: Arc<std::sync::OnceLock<bool>>,
+    /// The statement's byte and request budgets, checked after every plan,
+    /// open and row-fetch read completes, before its blocks are decoded.
+    budget: ScanBudget,
 }
 
 /// [`LogQuery::is_block_predicate_free`] for route selection, reading a prune
@@ -1796,6 +1800,7 @@ impl LogsScanExec {
                 .with_fetch_pushed(self.fetch)
                 .with_topk(self.topk.clone())
                 .with_scan_executions(self.scan_executions.clone())
+                .with_scan_budget(self.budget.clone())
         })
     }
 
@@ -1841,6 +1846,7 @@ impl LogsScanExec {
                 .with_fetch_pushed(self.fetch)
                 .with_topk(self.topk.clone())
                 .with_scan_executions(self.scan_executions.clone())
+                .with_scan_budget(self.budget.clone())
         })
     }
 
@@ -1898,6 +1904,13 @@ impl LogsScanExec {
         scan_executions: Option<Arc<ScanExecutions>>,
     ) -> Self {
         self.scan_executions = scan_executions;
+        self
+    }
+
+    /// Check `budget` after every read this scan issues, in place of the
+    /// unlimited budget [`Self::new`] starts with.
+    pub(crate) fn with_scan_budget(mut self, budget: ScanBudget) -> Self {
+        self.budget = budget;
         self
     }
 
@@ -2017,6 +2030,7 @@ impl LogsScanExec {
             created_at: self.created_at,
             scan_executions: self.scan_executions.clone(),
             reversed: Arc::clone(&self.reversed),
+            budget: self.budget.clone(),
         }
     }
 
@@ -2162,6 +2176,7 @@ impl LogsScanExec {
             columnar_eligible,
             stripe_blocks,
             properties,
+            budget: ScanBudget::unlimited(&phase_accounting),
             phase_accounting,
             metrics: ExecutionPlanMetricsSet::new(),
             created_at: Instant::now(),
@@ -2711,6 +2726,7 @@ impl LogsScanExec {
             full_len: self.full_schema.fields().len(),
             schema: Arc::clone(&self.schema),
             accounting: self.phase_accounting.scan().clone(),
+            budget: self.budget.clone(),
             concurrency: self.target_partitions,
         }
     }
@@ -2761,6 +2777,8 @@ pub(crate) struct RowFetchSource {
     /// rewrite restores column order, names, and nullability exactly.
     schema: SchemaRef,
     accounting: QueryAccounting,
+    /// The originating scan's budget, checked after each block fetch.
+    budget: ScanBudget,
     /// How many block fetches may be in flight at once. The scan's declared
     /// partition count, which is the query's `target_partitions`: phase 2 has
     /// at most `k` blocks to read and no partitions of its own, so it borrows
@@ -2835,6 +2853,7 @@ impl RowFetchSource {
             )
             .await
             .map_err(SqlError::from)?;
+        self.budget.check()?;
         // `None` means the catalog summary proved the segment ts-irrelevant.
         // Phase 1 read a row out of it under the same bounds, so this cannot
         // happen; say so as an error rather than silently returning no rows.
@@ -3162,6 +3181,7 @@ impl ExecutionPlan for LogsScanExec {
             columns: self.columns.clone(),
             projected_fraction: self.projected_fraction,
             phase_accounting: self.phase_accounting.clone(),
+            budget: self.budget.clone(),
         });
 
         // #693 part 3 deliverable 1, amended by #739: a predicate-free query

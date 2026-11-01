@@ -32,6 +32,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
 use ravel_query::LogSegmentFetcher;
+use ravel_query::PhaseAccounting;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -45,8 +46,7 @@ use crate::distributed::{WorkerSlice, WorkerSliceClient};
 use crate::distributed_rlog::{
     AUDIT_ORDER_COLS, DistributedRlogContext, distributed_audit_plan, sort_slice_fragment,
 };
-#[cfg(feature = "flight-sql")]
-use ravel_query::ByteLimit;
+use crate::scan_budget::ScanBudget;
 
 /// The `audit` table provider for one tenant over one pinned `Signal::Audit`
 /// snapshot.
@@ -66,6 +66,11 @@ pub struct AuditTableProvider {
     /// default, and every non-Flight build -- is the local scan path unchanged.
     #[cfg(feature = "flight-sql")]
     distributed: Option<DistributedRlogContext>,
+    /// The statement's byte and store-request budgets (issue #1409), checked
+    /// by every `AuditScanExec` this provider builds after each store read and
+    /// passed to the distributed fan-out. Unlimited by default, installed with
+    /// [`Self::with_scan_budget`].
+    scan_budget: ScanBudget,
 }
 
 impl AuditTableProvider {
@@ -80,6 +85,7 @@ impl AuditTableProvider {
         accounting: QueryAccounting,
     ) -> Self {
         let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
+        let scan_budget = ScanBudget::unlimited(&PhaseAccounting::pooled_over(&accounting));
         AuditTableProvider {
             snapshot: Arc::new(snapshot),
             tenant_hash,
@@ -89,7 +95,17 @@ impl AuditTableProvider {
             erasure,
             #[cfg(feature = "flight-sql")]
             distributed: None,
+            scan_budget,
         }
+    }
+
+    /// Install the statement's scan budget (issue #1409): every
+    /// `AuditScanExec` this provider builds refuses once the statement total
+    /// passes the effective `max_bytes_scanned` or `max_s3_requests`, and the
+    /// distributed fan-out carries the same byte ceiling.
+    pub(crate) fn with_scan_budget(mut self, scan_budget: ScanBudget) -> Self {
+        self.scan_budget = scan_budget;
+        self
     }
 
     /// Install a coordinator-side distributed scan context (ADR-0071; #326). The
@@ -182,7 +198,8 @@ impl AuditTableProvider {
             pushdown.ts_max(),
             Arc::clone(&self.erasure),
             self.accounting.clone(),
-        )?;
+        )?
+        .with_scan_budget(self.scan_budget.clone());
         Ok(Arc::new(scan))
     }
 
@@ -236,8 +253,8 @@ impl TableProvider for AuditTableProvider {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Distributed coordinator path (ADR-0071; #326): fan out to worker slices
         // instead of scanning locally, folding worker bytes into the query
-        // accounting under an `Unlimited` ceiling. See the `logs` provider for the
-        // full rationale.
+        // accounting under the statement's effective `max_bytes_scanned` (issue
+        // #1409). See the `logs` provider for the full rationale.
         #[cfg(feature = "flight-sql")]
         if let Some(dist) = &self.distributed {
             let plan = distributed_audit_plan(
@@ -246,7 +263,7 @@ impl TableProvider for AuditTableProvider {
                 Arc::clone(&self.schema),
                 _limit,
                 self.accounting.clone(),
-                ByteLimit::Unlimited,
+                self.scan_budget.max_bytes_scanned(),
             )?;
             return self.apply_projection(plan, projection);
         }
@@ -270,5 +287,125 @@ impl TableProvider for AuditTableProvider {
             }
             None => Ok(plan),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_logseg::{LogRecord, stream_attrs_bytes};
+    use ravel_object_store::ObjectStoreBackend;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_query::EngineConfig;
+
+    use super::*;
+    use crate::SqlError;
+    use crate::executor::TargetSignal;
+    use crate::scan_budget::test_support::{
+        BudgetRun, KeyGets, TENANT, budget_run, bytes_budget, requests_budget, statement_with,
+        write_rlog,
+    };
+
+    fn audit(ts: i64) -> LogRecord {
+        LogRecord {
+            stream_id: ravel_types::logstream::log_stream_id(&[], "audit", "1", &[]),
+            stream_attrs: stream_attrs_bytes(&[], "audit", "1", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 0,
+            severity_text: "INFO".into(),
+            body: format!("audit {ts}"),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        }
+    }
+
+    /// Three four-record audit objects, `audit/seg-{0,1,2}`.
+    async fn fixture() -> (Arc<KeyGets>, Vec<SegmentRef>) {
+        let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut segments = Vec::new();
+        for i in 0..3i64 {
+            let records: Vec<LogRecord> = (0..4).map(|k| audit(i * 10 + k)).collect();
+            segments.push(write_rlog(memory.as_ref(), &format!("audit/seg-{i}"), &records).await);
+        }
+        (KeyGets::wrap(memory), segments)
+    }
+
+    /// Scan the fixture over one partition under `engine`, in a statement that
+    /// already charged `preload` (bytes, requests) to another table.
+    async fn run(engine: &EngineConfig, preload: (u64, u64)) -> (BudgetRun, Vec<SegmentRef>) {
+        let (store, segments) = fixture().await;
+        let statement = statement_with(preload.0, preload.1);
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let provider = AuditTableProvider::new(
+            Snapshot {
+                segments: segments.clone(),
+                segments_pruned: 0,
+                pending_erasure: Vec::new(),
+            },
+            TenantHash(TENANT),
+            LogSegmentFetcher::new(backend),
+            statement.lane(TargetSignal::Audit).scan().clone(),
+        )
+        .with_scan_budget(statement.scan_budget(TargetSignal::Audit, engine));
+        let plan = provider.plan(1).expect("plan");
+        let run = budget_run(plan.as_ref(), &store, &segments, &statement).await;
+        (run, segments)
+    }
+
+    /// Each audit object is read in one whole-object GET. A budget equal to
+    /// the first object's size admits it and refuses at the second read, at
+    /// exactly the first two sizes summed, with the third object never
+    /// fetched.
+    ///
+    /// FLIP: removing `budget.check()?` from `audit_scan::prepare_partition`
+    /// returns all 12 rows. Moving it below the fetch loop refuses at all
+    /// three sizes summed with `seg-2` fetched. Comparing with `>=` refuses at
+    /// the first object alone.
+    #[tokio::test]
+    async fn lowered_byte_budget_fails_typed_on_audit_scan() {
+        let (free, segments) = run(&EngineConfig::default(), (0, 0)).await;
+        assert!(free.error.is_none(), "{:?}", free.error);
+        assert_eq!(free.rows, 12);
+        assert_eq!(free.gets, [1, 1, 1]);
+        let sizes: Vec<u64> = segments.iter().map(|s| s.object_size).collect();
+        assert_eq!(free.total, (sizes.iter().sum(), 3));
+
+        let (run, _) = run(&bytes_budget(sizes[0]), (0, 0)).await;
+        let expected = sizes[0] + sizes[1];
+        match run.error {
+            Some(SqlError::TooManyBytesScanned { scanned, max })
+                if scanned == expected && max == sizes[0] => {}
+            other => panic!("expected TooManyBytesScanned at {expected}, got {other:?}"),
+        }
+        assert_eq!(run.rows, 0);
+        assert_eq!(run.gets, [1, 1, 0]);
+        assert_eq!(run.total, (expected, 2));
+    }
+
+    /// A one-request budget refuses at the second GET.
+    ///
+    /// FLIP: removing `budget.check()?` from `audit_scan::prepare_partition`
+    /// returns all 12 rows.
+    #[tokio::test]
+    async fn lowered_request_budget_fails_typed_on_audit_scan() {
+        let (run, _) = run(&requests_budget(1), (0, 0)).await;
+        assert!(
+            matches!(
+                run.error,
+                Some(SqlError::RequestBudgetExceeded {
+                    requests: 2,
+                    max: 1,
+                    table: None,
+                    ..
+                })
+            ),
+            "{:?}",
+            run.error
+        );
+        assert_eq!(run.gets, [1, 1, 0]);
+        assert_eq!(run.total.1, 2);
     }
 }

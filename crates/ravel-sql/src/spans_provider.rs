@@ -31,8 +31,6 @@ use datafusion::physical_plan::ExecutionPlan;
 #[cfg(feature = "flight-sql")]
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{SegmentRef, Snapshot};
-#[cfg(feature = "flight-sql")]
-use ravel_query::ByteLimit;
 use ravel_query::PhaseAccounting;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_types::TenantHash;
@@ -46,6 +44,7 @@ use crate::distributed_rlog::{
 };
 #[cfg(feature = "flight-sql")]
 use crate::flight_ticket::SlicePushdown;
+use crate::scan_budget::ScanBudget;
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_pushdown::{SpansPushdown, extract_spans};
 use crate::spans_scan::SpansScanExec;
@@ -73,6 +72,11 @@ pub struct SpansTableProvider {
     /// carries no schema or key, exactly as the RLOG providers do.
     #[cfg(feature = "flight-sql")]
     distributed: Option<DistributedRlogContext>,
+    /// The statement's byte and store-request budgets (issue #1409), checked
+    /// by every `SpansScanExec` this provider builds after each store read and
+    /// passed to the distributed fan-out. Unlimited by default, installed with
+    /// [`Self::with_scan_budget`].
+    scan_budget: ScanBudget,
 }
 
 impl SpansTableProvider {
@@ -87,16 +91,28 @@ impl SpansTableProvider {
         accounting: QueryAccounting,
     ) -> Self {
         let erasure = Arc::new(snapshot_pending_erasure_predicates(&snapshot));
+        let accounting = PhaseAccounting::pooled_over(&accounting);
+        let scan_budget = ScanBudget::unlimited(&accounting);
         SpansTableProvider {
             snapshot: Arc::new(snapshot),
             tenant_hash,
             fetcher,
             schema: spans_schema(),
-            accounting: PhaseAccounting::pooled_over(&accounting),
+            accounting,
             erasure,
             #[cfg(feature = "flight-sql")]
             distributed: None,
+            scan_budget,
         }
+    }
+
+    /// Install the statement's scan budget (issue #1409): every
+    /// `SpansScanExec` this provider builds refuses once the statement total
+    /// passes the effective `max_bytes_scanned` or `max_s3_requests`, and the
+    /// distributed fan-out carries the same byte ceiling.
+    pub(crate) fn with_scan_budget(mut self, scan_budget: ScanBudget) -> Self {
+        self.scan_budget = scan_budget;
+        self
     }
 
     /// Record every scan's reads on `phases`, split by the phase that issued
@@ -241,7 +257,8 @@ impl SpansTableProvider {
             projection,
             QueryAccounting::new(),
         )?
-        .with_phase_accounting(self.accounting.clone());
+        .with_phase_accounting(self.accounting.clone())
+        .with_scan_budget(self.scan_budget.clone());
         Ok(Arc::new(scan))
     }
 
@@ -300,8 +317,8 @@ impl TableProvider for SpansTableProvider {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Distributed coordinator path (ADR-0071; #327, T6b): fan out to worker
         // slices instead of scanning locally, folding worker bytes into the query
-        // accounting under an `Unlimited` ceiling (no per-query byte budget on the
-        // spans provider). See the `logs` provider for the full rationale: the
+        // accounting under the statement's effective `max_bytes_scanned` (issue
+        // #1409). See the `logs` provider for the full rationale: the
         // scan's `_limit` is a fetch-stop hint across partitions with the exact
         // limit re-applied above the merge, and filters are re-applied above the
         // returned plan by DataFusion (the provider reports `Inexact`). The
@@ -315,7 +332,7 @@ impl TableProvider for SpansTableProvider {
                 Arc::clone(&self.schema),
                 _limit,
                 self.accounting.scan().clone(),
-                ByteLimit::Unlimited,
+                self.scan_budget.max_bytes_scanned(),
                 Some(SlicePushdown::spans(&extract_spans(filters))),
             )?;
             return self.apply_projection(plan, projection);

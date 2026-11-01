@@ -54,13 +54,14 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_logseg::{AttrValue, LogRecord, Predicate};
 use ravel_query::erasure::ErasurePredicate;
-use ravel_query::{LogQuery, LogSegmentFetcher};
+use ravel_query::{LogQuery, LogSegmentFetcher, PhaseAccounting};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 
 use crate::alerts_schema::{ALERT_ID_KEY, GENERATION_KEY, RULE_ID_KEY, STATE_KEY, alerts_schema};
 use crate::error::SqlError;
 use crate::rlog_attrs::{attr_value_to_string, find_attr, merged_attrs, retain_unerased_by};
+use crate::scan_budget::ScanBudget;
 
 /// Rows accumulated into one output batch before it is emitted.
 const BATCH_ROWS: usize = 8192;
@@ -87,6 +88,9 @@ pub struct AlertsScanExec {
     /// This query's accounting handle (ADR-0044), threaded into every
     /// per-partition fetch.
     accounting: QueryAccounting,
+    /// The statement's byte and request budgets (issue #1409), checked after
+    /// each segment fetch.
+    budget: ScanBudget,
 }
 
 impl AlertsScanExec {
@@ -115,6 +119,7 @@ impl AlertsScanExec {
         }
         let schema = alerts_schema();
         let properties = Arc::new(Self::compute_properties(&schema, n)?);
+        let budget = ScanBudget::unlimited(&PhaseAccounting::pooled_over(&accounting));
         Ok(AlertsScanExec {
             tenant_hash,
             fetcher,
@@ -126,7 +131,15 @@ impl AlertsScanExec {
             schema,
             properties,
             accounting,
+            budget,
         })
+    }
+
+    /// Check the statement's byte and request budgets after every segment
+    /// fetch (issue #1409). Unlimited by default.
+    pub(crate) fn with_scan_budget(mut self, budget: ScanBudget) -> Self {
+        self.budget = budget;
+        self
     }
 
     fn compute_properties(schema: &SchemaRef, n: usize) -> DFResult<PlanProperties> {
@@ -220,6 +233,7 @@ impl ExecutionPlan for AlertsScanExec {
             content,
             erasure,
             self.accounting.clone(),
+            self.budget.clone(),
         ));
         Ok(Box::pin(AlertScanStream {
             schema,
@@ -269,6 +283,7 @@ async fn prepare_partition(
     content: Arc<Vec<Predicate>>,
     erasure: Arc<Vec<ErasurePredicate>>,
     accounting: QueryAccounting,
+    budget: ScanBudget,
 ) -> DFResult<Vec<StampedRecord>> {
     let mut query = LogQuery::new(ts_min, ts_max).with_erasure((*erasure).clone());
     for c in content.iter() {
@@ -277,11 +292,13 @@ async fn prepare_partition(
 
     let mut out: Vec<StampedRecord> = Vec::new();
     for seg in &segs {
-        let Some(output) = fetcher
+        let fetched = fetcher
             .fetch_accounted_with_tenant(seg, tenant_hash, &query, &accounting)
             .await
-            .map_err(SqlError::from)?
-        else {
+            .map_err(SqlError::from)?;
+        // The fetch decodes too, so the check lands before the next fetch.
+        budget.check()?;
+        let Some(output) = fetched else {
             continue;
         };
         // Stamped here, where the record and the `SegmentRef` it was read from

@@ -11,6 +11,9 @@ pub(super) struct PartitionCtx {
     /// path can route each segment as it opens it (issue #862).
     pub(super) projected_fraction: f64,
     pub(super) phase_accounting: PhaseAccounting,
+    /// The statement's byte and request budgets, checked after each plan read
+    /// and each segment open completes, before any of its blocks is decoded.
+    pub(super) budget: ScanBudget,
 }
 
 impl PartitionCtx {
@@ -211,6 +214,7 @@ fn open_segment_subset(
             )
             .await
             .map_err(SqlError::from)?;
+        ctx.budget.check()?;
         if let Some(s) = scan.as_mut() {
             ctx.attach_decoded_cache(s, &seg);
         }
@@ -249,6 +253,7 @@ fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
             )
             .await
             .map_err(SqlError::from)?;
+        ctx.budget.check()?;
         if let Some(s) = scan.as_mut() {
             ctx.attach_decoded_cache(s, &seg);
         }
@@ -285,6 +290,7 @@ fn open_segment_ranged(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
             )
             .await
             .map_err(SqlError::from)?;
+        ctx.budget.check()?;
         if let Some(s) = scan.as_mut() {
             ctx.attach_decoded_cache(s, &seg);
         }
