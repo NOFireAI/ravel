@@ -1016,6 +1016,67 @@ fn estimated_mode_is_deterministic() {
     }
 }
 
+/// One ingest flush of the benchmark shape through the columnar path, under
+/// both page choices at the default layout and at small blocks, hashes to the
+/// blake3 digests the writer produced before its integer-keyed maps moved to
+/// foldhash (#3590), so no switched map's iteration order reaches these bytes.
+#[test]
+fn ingest_shape_object_bytes_are_pinned() {
+    let corpus = ingest_shape::ingest_records(7_500);
+    let small = RlogConfig {
+        block_target_records: 256,
+        group_target_blocks: 4,
+        ..RlogConfig::default()
+    };
+    let cases = [
+        (
+            "default/exhaustive",
+            RlogConfig::default(),
+            PageChoice::Exhaustive,
+            GOLDEN_DEFAULT_EXHAUSTIVE,
+        ),
+        (
+            "default/estimated",
+            RlogConfig::default(),
+            PageChoice::Estimated,
+            GOLDEN_DEFAULT_ESTIMATED,
+        ),
+        (
+            "small/exhaustive",
+            small,
+            PageChoice::Exhaustive,
+            GOLDEN_SMALL_EXHAUSTIVE,
+        ),
+        (
+            "small/estimated",
+            small,
+            PageChoice::Estimated,
+            GOLDEN_SMALL_ESTIMATED,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, base, choice, want) in cases {
+        let cfg = RlogConfig {
+            page_choice: choice,
+            ..base
+        };
+        let got = blake3::hash(&write_batched(cfg, &corpus, true)).to_hex();
+        if got.as_str() != want {
+            wrong.push(format!("{name}: got {got}, want {want}"));
+        }
+    }
+    assert!(wrong.is_empty(), "object digests moved: {wrong:#?}");
+}
+
+const GOLDEN_DEFAULT_EXHAUSTIVE: &str =
+    "8690e1be20e17f2de12341b0d20cb99e80ba9199fa8033f12ba55bd2ba1011e9";
+const GOLDEN_DEFAULT_ESTIMATED: &str =
+    "e0b048f9442158d5e2aeada427fa8f8f8f69d3c9a10999ef1101e6d2b21de1a3";
+const GOLDEN_SMALL_EXHAUSTIVE: &str =
+    "d6522a9dd59c65ef4ccd298003fa660fb5570badf0bec4010a0093ead5f6854f";
+const GOLDEN_SMALL_ESTIMATED: &str =
+    "bad47f6c9f89a94aa1ed9f9ffbc03dcccbcff417efa55b8d924bd3caf28e5b31";
+
 /// How one generated page column draws its values.
 #[derive(Clone, Copy, Debug)]
 enum PageKind {
