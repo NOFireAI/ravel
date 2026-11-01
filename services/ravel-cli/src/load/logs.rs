@@ -1320,6 +1320,7 @@ async fn fold_after_load_through(
     let identities: Vec<ravel_catalog::EntryIdentity> = tokens.iter().map(token_identity).collect();
     let coverage = ravel_catalog::snapshot_coverage(
         coverage_store.as_ref(),
+        &catalog,
         &tenant_id.hash(),
         Signal::Logs,
         &identities,

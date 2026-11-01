@@ -15,7 +15,7 @@
 //! path (GET, blake3 verify, ADR-0050 §2 tenant-hash check, decode against the
 //! covered parts' blake3, entry-count check).
 //!
-//! # Degrade-to-None, three loud exceptions
+//! # Degrade-to-None, four loud exceptions
 //!
 //! Postings are a pure pruning/verification optimization, never a correctness
 //! gate: an absent HEAD, an absent postings ref, a `NotFound` on the HEAD, a
@@ -23,26 +23,29 @@
 //! entry-count mismatch all degrade to `Ok(None)`, exactly as
 //! `load_snapshot_postings` documents. The scrubber then simply runs the
 //! structural and content tiers with no postings tier this tick and retries
-//! next tick. Three loud exceptions return a real [`LoadPostingsError`]
+//! next tick. Four loud exceptions return a real [`LoadPostingsError`]
 //! instead: a genuinely unparseable HEAD or part (a real catalog defect,
 //! matching [`crate::seal_divergence`]), a postings object whose declared
 //! `tenant_hash` names a different tenant (an isolation breach, ADR-0050 §2,
-//! never absorbed into a silent degrade), and a GET of the HEAD, a part, or
-//! the postings object itself failing for any reason other than `NotFound`
-//! (issue #1964 covered the postings object; issue #1976 extends the same
-//! treatment to the HEAD and per-part GETs above it, which used to degrade to
-//! `Ok(None)` on any error: an `AccessDenied` on any of the three is a
-//! missing IAM grant, not an absent object, and must disable the postings
-//! tier loudly rather than reading as "nothing there yet").
+//! never absorbed into a silent degrade), a snapshot part whose header names
+//! a different tenant (the same breach, checked before the part's entries
+//! are decoded and counted on the catalog passed in), and a GET of the HEAD,
+//! a part, or the postings object itself failing for any reason other than
+//! `NotFound` (issue #1964 covered the postings object; issue #1976 extends
+//! the same treatment to the HEAD and per-part GETs above it, which used to
+//! degrade to `Ok(None)` on any error: an `AccessDenied` on any of the three
+//! is a missing IAM grant, not an absent object, and must disable the
+//! postings tier loudly rather than reading as "nothing there yet").
 
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_proto::catalog::v1::SnapshotEntry;
 use ravel_types::{Signal, TenantHash};
 
+use crate::catalog::Catalog;
 use crate::snapshot_format::{
-    self, DEFAULT_MAX_POSTINGS_BYTES, PartLimits, PostingsLimits, SnapshotFormatError, decode_head,
-    decode_part,
+    self, DEFAULT_MAX_POSTINGS_BYTES, PostingsLimits, SnapshotFormatError, decode_head,
 };
+use crate::tenant_part::TenantPartError;
 
 /// The owned covering-postings inputs the scrubber's postings tier needs, in
 /// the shape `ravel_maintain::CoveringPostings<'a>` borrows from. Owned (not
@@ -98,6 +101,19 @@ pub enum LoadPostingsError {
         expected: String,
         actual: String,
     },
+    /// A snapshot part the HEAD references declares a `tenant_hash` naming a
+    /// different tenant in its header (ADR-0050 §2 isolation breach), already
+    /// counted on the catalog passed in. A hard error, never a silent
+    /// degrade; the part's entries were never decoded.
+    #[error(
+        "snapshot part {key} declares tenant_hash {actual}, expected {expected} \
+         (ADR-0050 §2 isolation breach)"
+    )]
+    PartTenantHashMismatch {
+        key: String,
+        expected: String,
+        actual: String,
+    },
     /// The postings object GET failed for a reason other than `NotFound`
     /// (issue #1964): most commonly a missing IAM read grant on `idx/*`,
     /// surfaced as `StoreError::AccessDenied`. This disables the whole
@@ -149,9 +165,14 @@ fn head_key(tenant: &TenantHash, signal: Signal) -> String {
 /// object is present, hash-verified, tenant-bound to this tenant, decodes
 /// against the covered parts' blake3, and its entry count matches the covered
 /// entries. See the [module docs](self) for the full degrade-to-`Ok(None)`
-/// contract and the three loud [`LoadPostingsError`] exceptions.
+/// contract and the four loud [`LoadPostingsError`] exceptions.
+///
+/// Every read goes through `store`. `catalog` supplies only the
+/// isolation-breach counter a foreign part is counted on, so the scrub can
+/// read through its background store class with the server's own catalog.
 pub async fn load_covering_postings(
     store: &dyn ObjectStoreBackend,
+    catalog: &Catalog,
     tenant: &TenantHash,
     signal: Signal,
 ) -> Result<Option<LoadedCoveringPostings>, LoadPostingsError> {
@@ -191,8 +212,8 @@ pub async fn load_covering_postings(
     // `NotFound` part GET disables the postings tier this tick (retried next
     // tick); any other GET failure (issue #1976) is a store outage and
     // surfaces instead; a part present but genuinely unparseable is a real
-    // catalog defect surfaced as an error, matching verify_seal_divergence.
-    let part_limits = PartLimits::default();
+    // catalog defect surfaced as an error, matching verify_seal_divergence, and
+    // so is a part whose header names another tenant.
     let mut part_blake3: Vec<[u8; 32]> = Vec::with_capacity(head.parts.len());
     let mut covered_entries: Vec<SnapshotEntry> = Vec::new();
     for part_ref in &head.parts {
@@ -212,12 +233,21 @@ pub async fn load_covering_postings(
                 });
             }
         };
-        let decoded = decode_part(&got.data, &part_limits).map_err(|source| {
-            LoadPostingsError::PartCorrupt {
-                key: part_ref.key.clone(),
-                source,
-            }
-        })?;
+        let decoded = catalog
+            .decode_tenant_part(tenant, &got.data)
+            .map_err(|err| match err {
+                TenantPartError::Corrupt(source) => LoadPostingsError::PartCorrupt {
+                    key: part_ref.key.clone(),
+                    source,
+                },
+                TenantPartError::ForeignTenant { expected, actual } => {
+                    LoadPostingsError::PartTenantHashMismatch {
+                        key: part_ref.key.clone(),
+                        expected,
+                        actual,
+                    }
+                }
+            })?;
         covered_entries.extend(decoded.entries);
     }
 
@@ -382,6 +412,16 @@ mod tests {
         rec
     }
 
+    /// A catalog for the loader's isolation-breach counter. Its own store is
+    /// never read: the loader reads through the store it is handed.
+    fn test_catalog() -> crate::Catalog {
+        crate::Catalog::new(
+            Arc::new(MemoryStore::new()),
+            crate::CatalogConfig::default(),
+        )
+        .expect("catalog")
+    }
+
     async fn fold(store: Arc<dyn ObjectStoreBackend>, now_ns: i64) {
         let catalog = crate::Catalog::new(
             store,
@@ -408,9 +448,14 @@ mod tests {
     #[tokio::test]
     async fn absent_head_returns_none() {
         let store = MemoryStore::new();
-        let loaded = load_covering_postings(&store, &tenant_id().hash(), Signal::Metrics)
-            .await
-            .expect("no read error");
+        let loaded = load_covering_postings(
+            &store,
+            &test_catalog(),
+            &tenant_id().hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect("no read error");
         assert!(
             loaded.is_none(),
             "no HEAD yet must be Ok(None), not an error"
@@ -425,10 +470,15 @@ mod tests {
         publish_real_segment(store.as_ref(), 1, created, &["cpu", "mem"]).await;
         fold(store.clone(), now).await;
 
-        let loaded = load_covering_postings(store.as_ref(), &tenant_id().hash(), Signal::Metrics)
-            .await
-            .expect("no read error")
-            .expect("a fold over one real segment builds a postings object");
+        let loaded = load_covering_postings(
+            store.as_ref(),
+            &test_catalog(),
+            &tenant_id().hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect("no read error")
+        .expect("a fold over one real segment builds a postings object");
         assert_eq!(loaded.covered_entries.len(), 1, "one covered entry");
         assert_eq!(loaded.part_blake3.len(), 1, "one covered part");
         assert!(!loaded.bytes.is_empty(), "the postings bytes are present");
@@ -465,11 +515,14 @@ mod tests {
         );
         let faulty = FaultStore::new(inner.clone(), plan);
 
-        let err = load_covering_postings(&faulty, &tenant_id().hash(), Signal::Metrics)
-            .await
-            .expect_err(
-                "a non-NotFound GET failure on the postings object must surface as an error",
-            );
+        let err = load_covering_postings(
+            &faulty,
+            &test_catalog(),
+            &tenant_id().hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect_err("a non-NotFound GET failure on the postings object must surface as an error");
         match err {
             LoadPostingsError::Store { key: err_key, .. } => {
                 assert_eq!(err_key, postings_key, "error names the failing key");
@@ -505,9 +558,14 @@ mod tests {
         );
         let faulty = FaultStore::new(inner.clone(), plan);
 
-        let loaded = load_covering_postings(&faulty, &tenant_id().hash(), Signal::Metrics)
-            .await
-            .expect("a NotFound on the postings object must degrade to Ok(None), never an error");
+        let loaded = load_covering_postings(
+            &faulty,
+            &test_catalog(),
+            &tenant_id().hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect("a NotFound on the postings object must degrade to Ok(None), never an error");
         assert!(loaded.is_none());
         assert!(
             faulty.fault_count(Op::Get, FaultKind::NotFoundBlip) >= 1,
@@ -538,9 +596,14 @@ mod tests {
         );
         let faulty = FaultStore::new(inner.clone(), plan);
 
-        let err = load_covering_postings(&faulty, &tenant_id().hash(), Signal::Metrics)
-            .await
-            .expect_err("a non-NotFound GET failure on the HEAD must surface as an error");
+        let err = load_covering_postings(
+            &faulty,
+            &test_catalog(),
+            &tenant_id().hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect_err("a non-NotFound GET failure on the HEAD must surface as an error");
         match err {
             LoadPostingsError::HeadStore { key: err_key, .. } => {
                 assert_eq!(err_key, key, "error names the failing key");
@@ -570,9 +633,14 @@ mod tests {
             .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(key));
         let faulty = FaultStore::new(inner.clone(), plan);
 
-        let loaded = load_covering_postings(&faulty, &tenant_id().hash(), Signal::Metrics)
-            .await
-            .expect("a NotFound on the HEAD must degrade to Ok(None), never an error");
+        let loaded = load_covering_postings(
+            &faulty,
+            &test_catalog(),
+            &tenant_id().hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect("a NotFound on the HEAD must degrade to Ok(None), never an error");
         assert!(loaded.is_none());
         assert!(
             faulty.fault_count(Op::Get, FaultKind::NotFoundBlip) >= 1,
@@ -606,9 +674,14 @@ mod tests {
         );
         let faulty = FaultStore::new(inner.clone(), plan);
 
-        let err = load_covering_postings(&faulty, &tenant_id().hash(), Signal::Metrics)
-            .await
-            .expect_err("a non-NotFound GET failure on a snapshot part must surface as an error");
+        let err = load_covering_postings(
+            &faulty,
+            &test_catalog(),
+            &tenant_id().hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect_err("a non-NotFound GET failure on a snapshot part must surface as an error");
         match err {
             LoadPostingsError::PartStore { key: err_key, .. } => {
                 assert_eq!(err_key, part_key, "error names the failing key");
@@ -641,9 +714,14 @@ mod tests {
             .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(part_key));
         let faulty = FaultStore::new(inner.clone(), plan);
 
-        let loaded = load_covering_postings(&faulty, &tenant_id().hash(), Signal::Metrics)
-            .await
-            .expect("a NotFound on a snapshot part must degrade to Ok(None), never an error");
+        let loaded = load_covering_postings(
+            &faulty,
+            &test_catalog(),
+            &tenant_id().hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect("a NotFound on a snapshot part must degrade to Ok(None), never an error");
         assert!(loaded.is_none());
         assert!(
             faulty.fault_count(Op::Get, FaultKind::NotFoundBlip) >= 1,
@@ -676,9 +754,14 @@ mod tests {
             .await
             .expect("overwrite postings object");
 
-        let loaded = load_covering_postings(store.as_ref(), &tenant_id().hash(), Signal::Metrics)
-            .await
-            .expect("a blake3 mismatch must be Ok(None), never an error");
+        let loaded = load_covering_postings(
+            store.as_ref(),
+            &test_catalog(),
+            &tenant_id().hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect("a blake3 mismatch must be Ok(None), never an error");
         assert!(loaded.is_none());
     }
 
@@ -732,9 +815,61 @@ mod tests {
             .await
             .expect("overwrite HEAD");
 
-        let err = load_covering_postings(store.as_ref(), &tenant_id().hash(), Signal::Metrics)
-            .await
-            .expect_err("a foreign tenant_hash must hard-fail, never degrade");
+        let err = load_covering_postings(
+            store.as_ref(),
+            &test_catalog(),
+            &tenant_id().hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect_err("a foreign tenant_hash must hard-fail, never degrade");
         assert!(matches!(err, LoadPostingsError::TenantHashMismatch { .. }));
+    }
+
+    /// ADR-0050 §2: a covered part whose header names another tenant is the
+    /// fourth loud exception, `PartTenantHashMismatch`, counted once on the
+    /// catalog passed in. Never `Ok(None)`: the re-pointed part no longer
+    /// matches the postings object's binding, so a loader that decoded it
+    /// anyway would degrade quietly at the postings decode instead.
+    ///
+    /// FLIP: drop the `tenant_hash` comparison in
+    /// `Catalog::decode_tenant_part` and the load returns `Ok(None)`, so
+    /// `expect_err` panics.
+    #[tokio::test]
+    async fn a_foreign_part_hard_fails_as_a_counted_breach() {
+        let store = Arc::new(MemoryStore::new());
+        let now = 600_000 * NS_PER_HOUR;
+        publish_real_segment(store.as_ref(), 1, now - SEALED_AGE_NS, &["cpu", "mem"]).await;
+        fold(store.clone(), now).await;
+        let part_key = crate::fold::tests::repoint_tenant_head_at_foreign_part(
+            store.as_ref(),
+            &tenant_id().hash(),
+            Signal::Metrics,
+            0,
+        )
+        .await;
+
+        let catalog = test_catalog();
+        let err = load_covering_postings(
+            store.as_ref(),
+            &catalog,
+            &tenant_id().hash(),
+            Signal::Metrics,
+        )
+        .await
+        .expect_err("a foreign part must hard-fail, never degrade");
+        match err {
+            LoadPostingsError::PartTenantHashMismatch {
+                key,
+                expected,
+                actual,
+            } => {
+                assert_eq!(key, part_key);
+                assert_eq!(expected, tenant_id().hash().to_hex());
+                assert_eq!(actual, crate::fold::tests::foreign_tenant_hex());
+            }
+            other => panic!("expected PartTenantHashMismatch, got {other:?}"),
+        }
+        assert_eq!(catalog.isolation_breaches(), 1, "counted once");
     }
 }
