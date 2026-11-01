@@ -4,7 +4,8 @@
 //! operation in this module.
 //!
 //! The fixed columns are the SQL table's own schema, so this crate needs the
-//! `sql` feature for them; the MCP adapter, the only caller, implies it.
+//! `sql` feature for them; the `mcp` feature, which the tool ships behind,
+//! implies it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -102,8 +103,8 @@ pub struct DescribeDataRequest {
     /// The page size; `None` and anything above [`MAX_FAMILIES_PER_PAGE`] are
     /// [`MAX_FAMILIES_PER_PAGE`].
     pub limit: Option<usize>,
-    /// The resolve instant. A later page passes the instant its first page
-    /// resolved at, so every page describes one snapshot.
+    /// The resolve instant. A later page passes the instant its cursor was
+    /// minted at (ADR-1374, 2026-09-13 amendment, item 5).
     pub now_ns: i64,
     pub deadline: Duration,
 }
@@ -138,8 +139,8 @@ pub enum IndexedKeysSource {
     /// Traces: `trace_id`, the one field the RSPAN format's KEY_IDX indexes
     /// for every tenant.
     SpanFormat,
-    /// Metrics: none. The `samples` table has no KEY_IDX; a series is found
-    /// through its label postings, which cover every label.
+    /// Metrics: none. The `samples` table has no KEY_IDX; the metric index's
+    /// postings prune segments instead (ADR-0020).
     None,
 }
 

@@ -1857,8 +1857,10 @@ mod describe_data {
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
     const NOW_HOUR: u32 = (NOW_NS / NS_PER_HOUR) as u32;
 
-    /// A memory store that counts catalog resolves: every resolve issues
-    /// exactly one pending-erasure listing, and nothing else lists `/del/`.
+    /// A memory store that counts catalog resolves: a resolve lists its
+    /// pending-erasure prefix once (ADR-0064 decision 2), one page when there
+    /// are no erasure requests as in every test here, and nothing a describe
+    /// call does besides the resolve lists `/del/`.
     struct ResolveCountingStore {
         inner: MemoryStore,
         resolves: Arc<AtomicU64>,
@@ -2079,7 +2081,7 @@ mod describe_data {
     /// exactly the 100 smallest names in byte order, the second the remaining
     /// 50, and both report the record's total rather than their own length. A
     /// limit above the cap is lowered to it. FLIP: report `page.len()` as
-    /// `families_total` and the second page's total reads 50, not 150. FLIP:
+    /// `families_total` and the first page's total reads 100, not 150. FLIP:
     /// collect the record through a `HashMap` instead of sorting it and the
     /// first page's names come back out of order.
     #[tokio::test]
@@ -2105,7 +2107,11 @@ mod describe_data {
             .await
             .expect("first page");
         assert_eq!(
-            first.families.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
+            first
+                .families
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>(),
             names(0..100)
         );
         assert_eq!(first.families_total, 150);
@@ -2123,7 +2129,11 @@ mod describe_data {
             .await
             .expect("second page");
         assert_eq!(
-            second.families.iter().map(|f| f.name.clone()).collect::<Vec<_>>(),
+            second
+                .families
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>(),
             names(100..150)
         );
         assert_eq!(second.families_total, 150);
@@ -2385,8 +2395,9 @@ mod describe_data {
     /// A signal outside the three is a typed 400, decided before the permit:
     /// it is refused as an argument even while the ceiling is full, and it
     /// costs no resolve and no usage record. FLIP: fall back to `Metrics` for
-    /// an unknown name and the first call succeeds. FLIP: parse after
-    /// `admit()` and the first call reads `Unavailable`.
+    /// an unknown name and the first call reads `Unavailable`, refused by the
+    /// held permit instead of as an argument. FLIP: parse after `admit()` and
+    /// the first call reads `Unavailable` the same way.
     #[tokio::test]
     async fn an_unknown_signal_is_a_typed_error() {
         let h = describe_harness(
