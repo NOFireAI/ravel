@@ -647,6 +647,7 @@ pub fn build_sql_state(
         max_query_bytes,
         max_tenant_bytes,
         parallel_final_aggregation,
+        false,
         query_accounting,
         query_admission,
         declared_columns,
@@ -1217,6 +1218,11 @@ fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<LeftSpillRoot> {
 /// gate off the logs and spans fetchers only, so those two scans decode
 /// inline while the `samples` scan's catalog decodes stay on the gate.
 ///
+/// `bucketed_final_aggregation` (`--sql-bucketed-final-aggregation`, ADR-3565
+/// decision 1) sets `SqlConfig::bucketed_final_aggregation` to the default
+/// `ravel_sql::BucketedFinalAggregation` when `true` and to `None` when
+/// `false`. [`build_sql_state`] passes `false`.
+///
 /// `ipcrypt` is the deployment key and audit posture the `ipcrypt_encrypt`
 /// and `ipcrypt_prefix_encrypt` SQL functions read (ADR-2993 decision 6),
 /// installed via `SqlExecutor::with_ipcrypt_deployment`. [`build_sql_state`]
@@ -1239,6 +1245,7 @@ pub fn build_sql_state_with_parquet(
     max_query_bytes: usize,
     max_tenant_bytes: usize,
     parallel_final_aggregation: bool,
+    bucketed_final_aggregation: bool,
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     query_admission: Arc<QueryAdmissionController>,
     declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
@@ -1287,6 +1294,7 @@ pub fn build_sql_state_with_parquet(
         max_query_bytes,
         max_tenant_bytes,
         parallel_final_aggregation,
+        bucketed_final_aggregation,
         query_accounting,
         query_admission,
         declared_columns,
@@ -1313,6 +1321,7 @@ fn build_sql_state_inner(
     max_query_bytes: usize,
     max_tenant_bytes: usize,
     parallel_final_aggregation: bool,
+    bucketed_final_aggregation: bool,
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     query_admission: Arc<QueryAdmissionController>,
     declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
@@ -1353,6 +1362,11 @@ fn build_sql_state_inner(
         // field is an in-process escape hatch and the tests' rule-off side,
         // not a server-level knob.
         bounded_topk_max_limit: SqlConfig::default().bounded_topk_max_limit,
+        // ADR-3565 decision 1 (issue #3608): the bucketed final aggregation,
+        // from `--sql-bucketed-final-aggregation`, at its default tuning.
+        // Off by default, which installs no rule.
+        bucketed_final_aggregation: bucketed_final_aggregation
+            .then(ravel_sql::BucketedFinalAggregation::default),
         // ADR-0954, amended by issue #2416: `with_spill_resolved` below fills
         // this from `--sql-spill`, the `RAVEL_SQL_SPILL_DIR`/
         // `RAVEL_SQL_SPILL_MAX_BYTES` pair, and `--cache-dir`, in that order;
@@ -2727,6 +2741,7 @@ mod tests {
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
             DEFAULT_MAX_TENANT_BYTES,
             false,
+            false,
             Arc::new(crate::metrics::QueryAccountingMetrics::new(
                 std::collections::HashSet::new(),
             )),
@@ -2783,6 +2798,7 @@ mod tests {
             Arc::new(GetLimiter::new(1).expect("nonzero permits")),
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
             DEFAULT_MAX_TENANT_BYTES,
+            false,
             false,
             Arc::new(crate::metrics::QueryAccountingMetrics::new(
                 std::collections::HashSet::new(),
@@ -2915,6 +2931,7 @@ mod tests {
                 Arc::new(GetLimiter::new(1).expect("nonzero permits")),
                 ravel_sql::DEFAULT_MAX_QUERY_BYTES,
                 DEFAULT_MAX_TENANT_BYTES,
+                false,
                 false,
                 Arc::new(crate::metrics::QueryAccountingMetrics::new(
                     std::collections::HashSet::new(),
@@ -3090,6 +3107,119 @@ mod tests {
         assert!(
             state.executor.config().parallel_final_aggregation,
             "default must be on (ADR-0094 amendment, issue #741)"
+        );
+    }
+
+    /// ADR-3565 decision 1 reachability: `--sql-bucketed-final-aggregation`
+    /// must reach the plan, not stop at a parsed field. Traced from the CLI
+    /// through `query_budgets()` and `build_sql_state_with_parquet`, the
+    /// builder `start` calls, to the physical plan `EXPLAIN` renders for a
+    /// two-integer-key aggregate of the q33 shape.
+    #[tokio::test]
+    async fn sql_bucketed_final_aggregation_is_reachable_from_cli() {
+        async fn plan_text(argv: &[&str]) -> String {
+            use clap::Parser;
+            let tenant = ravel_types::TenantId::new("bucketed-3608".to_string());
+
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let catalog = build_catalog(
+                store.clone(),
+                1,
+                false,
+                ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+                None,
+                None,
+                None,
+                Duration::from_secs(2),
+            )
+            .expect("catalog");
+            // Data, so the scan is fanned out and the final aggregation is
+            // `FinalPartitioned`; an empty tenant plans `SinglePartitioned`.
+            let records: Vec<_> = (1..=64)
+                .map(|ts| crate::tests::sql_log_record(ts, "row"))
+                .collect();
+            crate::tests::publish_small_log_segment(store.as_ref(), &tenant, &records).await;
+            let cli = crate::Cli::try_parse_from(argv).expect("flags parse");
+            let resolved = cli
+                .resolve_performance(crate::config::HostProfile::new(
+                    16,
+                    Some(32_212_254_720),
+                    Some(32_212_254_720),
+                    None,
+                    None,
+                    None,
+                ))
+                .expect("performance defaults resolve");
+            let budgets = cli.query_budgets(&resolved).expect("budgets resolve");
+            // Four partitions, so the final aggregation is `FinalPartitioned`.
+            let engine = EngineConfig {
+                sql_partition_count: Some(4),
+                ..EngineConfig::default()
+            };
+            let state = build_sql_state_with_parquet(
+                catalog,
+                store,
+                Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+                None,
+                engine,
+                Arc::new(GetLimiter::new(1).expect("nonzero permits")),
+                budgets.sql_max_query_bytes,
+                budgets.sql_tenant_max_bytes,
+                budgets.sql_parallel_final_aggregation,
+                budgets.sql_bucketed_final_aggregation,
+                Arc::new(crate::metrics::QueryAccountingMetrics::new(
+                    std::collections::HashSet::new(),
+                )),
+                QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+                None,
+                Arc::new(ravel_memory::MemoryBudget::unlimited()),
+                None,
+                ravel_sql::DEFAULT_MIN_GRACE_MS,
+                &SqlSpillInputs::default(),
+                crate::cpu_gates::CpuGates::new(Default::default()).read,
+                false,
+                ravel_sql::IpcryptDeployment::default(),
+                None,
+            )
+            .expect("sql state builds");
+            let request = ravel_sql::SqlRequest {
+                sql: "SELECT ts, flags, count(*), sum(severity_num), avg(severity_num) \
+                      FROM logs GROUP BY ts, flags"
+                    .to_string(),
+                window: ravel_types::TimeRange {
+                    start_ns: 0,
+                    end_ns: i64::MAX,
+                },
+                min_tokens: Vec::new(),
+                now_ns: 1_000_000,
+                deadline: Duration::from_secs(30),
+                row_window: false,
+                max_rows: None,
+                budgets: None,
+            };
+            state
+                .executor
+                .explain(tenant.hash(), &request)
+                .await
+                .expect("explain runs")
+                .plan_text
+        }
+
+        let on = plan_text(&["ravel-server", "--sql-bucketed-final-aggregation"]).await;
+        assert!(
+            on.contains("BucketedFinalAggregateExec"),
+            "the bare flag must install the rule:\n{on}"
+        );
+        let off = plan_text(&["ravel-server"]).await;
+        assert!(
+            !off.contains("BucketedFinalAggregateExec") && off.contains("FinalPartitioned"),
+            "unset must leave the stock final:\n{off}"
+        );
+        let explicit_off =
+            plan_text(&["ravel-server", "--sql-bucketed-final-aggregation=false"]).await;
+        assert!(
+            !explicit_off.contains("BucketedFinalAggregateExec"),
+            "=false must leave the stock final:\n{explicit_off}"
         );
     }
 
@@ -3714,6 +3844,7 @@ mod tests {
             Arc::new(GetLimiter::new(1).expect("nonzero permits")),
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
             DEFAULT_MAX_TENANT_BYTES,
+            false,
             false,
             Arc::new(crate::metrics::QueryAccountingMetrics::new(
                 std::collections::HashSet::new(),

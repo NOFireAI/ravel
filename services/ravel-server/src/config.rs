@@ -1828,6 +1828,26 @@ pub struct Cli {
     )]
     pub sql_parallel_final_aggregation: bool,
 
+    /// Run a qualifying final-partitioned SQL aggregation in hash buckets
+    /// (ADR-3565 decision 1, issue #3608), threaded into
+    /// `ravel_sql::SqlConfig::bucketed_final_aggregation` with the default
+    /// `ravel_sql::BucketedFinalAggregation`. Off by default. A qualifying
+    /// aggregate groups on integer or temporal keys only, in one grouping set,
+    /// with every aggregate's state fixed-width integer, temporal or decimal;
+    /// once a partition's table holds 65,536 groups it routes its rows into 64
+    /// buckets and aggregates them one at a time. The bare
+    /// `--sql-bucketed-final-aggregation` means on. Process-wide; flipping it
+    /// needs a restart. Meaningful only in a build with the `sql` feature;
+    /// inert otherwise.
+    #[arg(
+        long = "sql-bucketed-final-aggregation",
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+    )]
+    pub sql_bucketed_final_aggregation: bool,
+
     /// Decode the SQL `logs` and `spans` scans' blocks on the tokio worker
     /// polling the scan instead of on the read CPU gate, the behaviour before
     /// ADR-1702 follow-up task 8. Every read gate site the SQL logs and spans
@@ -4034,6 +4054,11 @@ pub struct QueryBudgets {
     /// `--sql-parallel-final-aggregation=false` opt-out restores the
     /// single-partition final.
     pub sql_parallel_final_aggregation: bool,
+    /// `--sql-bucketed-final-aggregation`: run a qualifying final-partitioned
+    /// aggregation in hash buckets (ADR-3565 decision 1). Reaches
+    /// `SqlConfig::bucketed_final_aggregation` as the default tuning when
+    /// `true` and as `None` when `false`. Default `false`.
+    pub sql_bucketed_final_aggregation: bool,
     /// `--sql-scan-decode-inline`: the SQL `logs` and `spans` scans decode
     /// their blocks inline rather than on the read CPU gate (issue #2795).
     /// Reaches [`crate::query::build_sql_state_with_parquet`]. Default `false`.
@@ -4128,6 +4153,7 @@ impl Default for QueryBudgets {
             sql_max_query_bytes: DEFAULT_SQL_MAX_QUERY_BYTES,
             sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
             sql_parallel_final_aggregation: true,
+            sql_bucketed_final_aggregation: false,
             sql_scan_decode_inline: false,
             sql_cache_bulk_scan_min_bytes: None,
             logs_block_range_threshold: None,
@@ -7830,6 +7856,7 @@ impl Cli {
             sql_max_query_bytes: resolved.sql_max_query_bytes,
             sql_tenant_max_bytes: resolved.sql_tenant_max_bytes,
             sql_parallel_final_aggregation: self.sql_parallel_final_aggregation,
+            sql_bucketed_final_aggregation: self.sql_bucketed_final_aggregation,
             sql_scan_decode_inline: self.sql_scan_decode_inline,
             sql_cache_bulk_scan_min_bytes: self.cache_bulk_scan_min_bytes,
             logs_block_range_threshold: self.logs_block_range_threshold,
@@ -12912,6 +12939,10 @@ mod tests {
         assert!(
             budgets.sql_parallel_final_aggregation,
             "ADR-0094 amendment (#741): exact-typed final-aggregation repartitioning defaults on"
+        );
+        assert!(
+            !budgets.sql_bucketed_final_aggregation,
+            "ADR-3565 decision 1: the bucketed final aggregation defaults off"
         );
         assert_eq!(
             budgets.logs_max_fetch_run_bytes,

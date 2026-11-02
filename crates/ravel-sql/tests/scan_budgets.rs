@@ -658,6 +658,7 @@ fn task_ctx_with_query_bytes(max_query_bytes: usize) -> Arc<TaskContext> {
         // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
         // default, since none of these fixtures plans a grouped top-k.
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
+        bucketed_final_aggregation: None,
         // ADR-0954: spill off, as on the shipped default.
         spill: None,
         // Issue #913: the per-segment timeline off, as on the shipped default.

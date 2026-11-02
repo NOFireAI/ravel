@@ -363,6 +363,36 @@ impl SpillConfig {
     }
 }
 
+/// The tuning of [`crate::BucketedFinalAggregateExec`] (ADR-3565 decision 1).
+/// The defaults are the ADR's starting points; the A/B it schedules decides
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketedFinalAggregation {
+    /// Groups a partition's single table holds before the exec routes its
+    /// state, and every later input row, into buckets. Default 65,536.
+    pub engage_groups: usize,
+    /// `2^bits` buckets per partition, chosen by the top `bits` bits of the
+    /// key hash. Default 6 (64 buckets); a value above
+    /// [`crate::BUCKETED_FINAL_AGGREGATE_MAX_BITS`] is read as that maximum.
+    pub bits: u8,
+    /// Rows per bucket chunk, per column. Each chunk is allocated and charged
+    /// at this capacity before a row is written to it, so an engaged partition
+    /// can charge one chunk per column in every bucket before any is full: 8
+    /// MiB for one `Int64` key and a count at the defaults. Default 8192; zero
+    /// is read as one.
+    pub routed_chunk_rows: usize,
+}
+
+impl Default for BucketedFinalAggregation {
+    fn default() -> Self {
+        BucketedFinalAggregation {
+            engage_groups: 65_536,
+            bits: 6,
+            routed_chunk_rows: 8192,
+        }
+    }
+}
+
 /// Per-query ravel-sql configuration: the shared engine budgets plus the
 /// SQL-only per-query memory-pool byte budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,6 +475,15 @@ pub struct SqlConfig {
     /// `count` or `sum`, which cannot be pruned exactly at all; see the
     /// `crate::bounded_topk` module docs for the counterexample.
     pub bounded_topk_max_limit: Option<usize>,
+    /// Bucketed final aggregation (ADR-3565 decision 1, issue #3608).
+    /// `Some` installs [`crate::BucketedFinalAggregateRule`], which replaces a
+    /// `FinalPartitioned` aggregate over fixed-width integer or temporal keys
+    /// with [`crate::BucketedFinalAggregateExec`]; `None`, the default,
+    /// installs no rule and leaves every plan unchanged
+    /// (`the_plan_is_unchanged_when_the_field_is_none` in
+    /// `tests/bucketed_final_aggregate.rs`). Set once at server startup, like
+    /// every other field here.
+    pub bucketed_final_aggregation: Option<BucketedFinalAggregation>,
     /// Bounded ephemeral spill scratch (ADR-0954). `None`, the default, means
     /// the disk manager stays
     /// [`Disabled`](datafusion::execution::disk_manager::DiskManagerMode::Disabled)
@@ -507,6 +546,7 @@ impl Default for SqlConfig {
             skip_partial_aggregation: true,
             late_materialization_extra_columns: Some(DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS),
             bounded_topk_max_limit: Some(DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
+            bucketed_final_aggregation: None,
             // Spill off. See the field doc: this is requirement 9 of #954 (a
             // no-spill deployment profile) and it is what makes enabling spill
             // an operator decision rather than a version upgrade.
