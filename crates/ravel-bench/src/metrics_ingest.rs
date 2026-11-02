@@ -7955,8 +7955,8 @@ mod tests {
     ///
     /// TO SEE THIS FAIL: in `readback_plan_without_sending`, observe only
     /// the points of classes `receiver.supports` (the VictoriaMetrics plans
-    /// differ), or clear the plan's `stale_probe` before returning it (both
-    /// plans differ).
+    /// differ), or clear the plan's `stale_probe` before returning it (the
+    /// Ravel plans differ).
     #[tokio::test]
     async fn a_plan_rebuilt_without_sending_equals_the_replayed_plan() {
         use crate::metrics_gen::Generator;

@@ -586,6 +586,48 @@ the write loop of a stream generated up front.
   (decision 10); false on `memory` and on any store behind a configured
   endpoint, such as the nightly lane's local s3s-fs.
 
+#### Read-back only (`--readback-only`)
+
+`--readback-only` replays nothing: it reads one system back from an
+`ingest.json` the bin wrote earlier, for instance after the catalog has been
+folded and the server restarted. It takes `--ingest-report PATH`,
+`--readback-system NAME` (`ravel`, `prometheus`, `victoriametrics` or
+`mimir`), `--workload`, `--profile`, `--anchor-ms`, that system's
+`--<system>-query-url`, `--ravel-bearer-token-env` for the `ravel` row only,
+`--readback-timeout-secs` and `--readback-settle-secs`. The step count is
+the report's `profile.run.steps`.
+
+It rebuilds the row's read-back plan by walking the same generator stream
+through the same producer rounds the replay records its plan in, dropping
+each batch instead of sending it, so the rebuilt plan equals the replay's
+field for field, for a receiver that stores every class and for
+VictoriaMetrics, which does not store native histograms
+(`metrics_ingest::tests::a_plan_rebuilt_without_sending_equals_the_replayed_plan`).
+It then reads the report's row back with `readback_over_http`, its commit
+tokens included, so every query of the `ravel` row carries
+`min_commit_token` as in the replay, and it sends no write request
+(`metricsbench_ingest_smoke::readback_only_reads_a_kept_report_back_without_writing`).
+
+It prints one JSON object: `system`, `plan_series_count` (every series the
+plan holds, of every class) and either `readback`, the same object the
+replay records on the row, or `readback_error`. It exits 0 when
+`readback.matches_expected` is true and 1 on a mismatch or a read-back
+error, which stay in the JSON
+(`metricsbench_ingest_smoke::readback_only_reads_a_kept_report_back_without_writing`).
+
+It exits 64, with no JSON and before any query, when a write endpoint flag
+is given, `--ingest-report`, `--readback-system` or `--anchor-ms` is
+missing, the system is not one of the four or its query URL is missing,
+`--ravel-bearer-token-env` is given for another system, the report has no
+row or more than one row for the system, the row recorded no successful
+ingest (it carries `row_failure`, or the system is listed under `stalled` or
+`failed_replays`), or the report's profile name, step count,
+`run.workload_digest` or `run.anchor_ms` differs from the arguments
+(`metricsbench_ingest_smoke::readback_only_refusals_exit_64`,
+`metricsbench_ingest::tests::the_readback_row_is_one_successfully_ingested_row`).
+`--ingest-report` and `--readback-system` without `--readback-only` exit 64
+too (`metricsbench_ingest::tests::readback_flags_need_readback_only`).
+
 ## Determinism
 
 One seed (`927000933`) drives everything. Every value and every injected

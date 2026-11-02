@@ -1505,7 +1505,7 @@ fn run_readback_only(extra: &[&str]) -> (Option<i32>, String, String) {
 /// TO SEE THIS FAIL: in `run_readback_only`, pass a row with
 /// `commit_tokens_by_shard` cleared to `readback_over_http` (the fence
 /// assertion fails), or rebuild the plan for `Receiver::VictoriaMetrics`
-/// (the expected histogram figures then differ from the replay's).
+/// (the read then expects 900 series, reads 1000, and exits 1).
 #[test]
 fn readback_only_reads_a_kept_report_back_without_writing() {
     let _serial = serial();
@@ -1602,10 +1602,12 @@ fn readback_only_reads_a_kept_report_back_without_writing() {
 }
 
 /// Each `--readback-only` refusal exits 64 with a message naming the
-/// problem, before any read: a write endpoint flag, a missing flag, no row
-/// or two rows for the system, a row that recorded no successful ingest
-/// (`row_failure`, or listed under `stalled`), and a profile, workload
-/// digest or anchor that differs from the report's.
+/// problem, prints no JSON and sends no write: a write endpoint flag, a
+/// missing flag, a system that is not portable or has no query URL, a
+/// bearer token for a row other than ravel, no row or two rows for the
+/// system, a row that recorded no successful ingest (`row_failure`, or
+/// listed under `stalled`), and a profile, step count, workload digest or
+/// anchor that differs from the report's.
 #[test]
 fn readback_only_refusals_exit_64() {
     let _serial = serial();
@@ -1626,6 +1628,7 @@ fn readback_only_refusals_exit_64() {
     let ingest_json = out_dir.path().join("ingest.json");
     replay_ravel_row(&url, 1, &ingest_json);
     let writes_after_replay = observer.writes();
+    observer.fences.lock().unwrap().clear();
     let report: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&ingest_json).expect("read ingest.json"))
             .expect("ingest.json is a JSON report");
@@ -1716,10 +1719,77 @@ fn readback_only_refusals_exit_64() {
             ],
             "the ingest report's workload digest is 00",
         ),
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--readback-system",
+                "ravel",
+                "--steps",
+                "3",
+            ],
+            "the ingest report's step count is 1, but the arguments give 3",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--readback-system",
+                "ravel-in-process",
+            ],
+            "--readback-system `ravel-in-process` is not a portable system",
+        ),
+        (
+            vec!["--ingest-report", &kept, "--readback-system", "prometheus"],
+            "--readback-only for prometheus needs --prometheus-query-url",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--readback-system",
+                "mimir",
+                "--mimir-query-url",
+                &url,
+                "--ravel-bearer-token-env",
+                "RAVEL_TOKEN",
+            ],
+            "--ravel-bearer-token-env applies to the ravel row only, not to mimir",
+        ),
     ];
     for (extra, message) in cases {
         let mut argv = vec!["--anchor-ms", anchor.as_str(), "--ravel-query-url", &url];
         argv.extend(extra);
+        let (code, stdout, stderr) = run_readback_only(&argv);
+        assert_eq!(code, Some(64), "{argv:?}: {stderr}");
+        assert!(stderr.contains(message), "{argv:?}: {stderr}");
+        assert!(stdout.is_empty(), "{argv:?}: {stdout}");
+    }
+
+    for (argv, message) in [
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--readback-system",
+                "ravel",
+                "--ravel-query-url",
+                &url,
+            ],
+            "--anchor-ms is required",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--anchor-ms",
+                &anchor,
+                "--ravel-query-url",
+                &url,
+            ],
+            "--readback-only needs --readback-system",
+        ),
+    ] {
         let (code, stdout, stderr) = run_readback_only(&argv);
         assert_eq!(code, Some(64), "{argv:?}: {stderr}");
         assert!(stderr.contains(message), "{argv:?}: {stderr}");
@@ -1768,4 +1838,8 @@ fn readback_only_refusals_exit_64() {
         "{stderr}"
     );
     assert_eq!(observer.writes(), writes_after_replay, "no refusal wrote");
+    assert!(
+        observer.fences.lock().unwrap().is_empty(),
+        "no refusal queried"
+    );
 }

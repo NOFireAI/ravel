@@ -41,6 +41,14 @@
 //! without) and the report is still printed
 //! (`metricsbench_ingest_smoke::a_later_hard_failure_after_a_failed_readback_keeps_the_report`).
 //!
+//! `--readback-only` replays nothing: it reads one system's row of an
+//! earlier `ingest.json` back against a plan rebuilt from the same stream,
+//! prints `system`, `plan_series_count` and `readback` or `readback_error`,
+//! and exits 0 on a match, 1 on a mismatch or read-back error, and 64 on a
+//! usage refusal
+//! (`metricsbench_ingest_smoke::readback_only_reads_a_kept_report_back_without_writing`,
+//! `metricsbench_ingest_smoke::readback_only_refusals_exit_64`).
+//!
 //! Reachable as `cargo run -p ravel-bench --bin metricsbench_ingest -- \
 //! --profile ci --store memory --steps 10 --anchor-ms 1700000010000`.
 #![allow(clippy::expect_used)]
