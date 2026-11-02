@@ -56,8 +56,14 @@ const SAMPLE_COLUMNS: [&str; 4] = ["series", "ts_ns", "value", "histogram"];
 /// millisecond.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    Instant { at_ns: i64 },
-    Range { start_ns: i64, end_ns: i64, step_ns: i64 },
+    Instant {
+        at_ns: i64,
+    },
+    Range {
+        start_ns: i64,
+        end_ns: i64,
+        step_ns: i64,
+    },
 }
 
 impl Mode {
@@ -556,7 +562,9 @@ mod tests {
             let failure = failure_of(&envelope);
             assert_eq!(failure.class, FailureClass::InvalidArgument, "{what}");
             assert!(
-                failure.message.starts_with("ravel_query_promql takes exactly one mode"),
+                failure
+                    .message
+                    .starts_with("ravel_query_promql takes exactly one mode"),
                 "{what}: {}",
                 failure.message
             );
