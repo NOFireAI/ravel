@@ -266,7 +266,7 @@ eviction removes one whose last failure is older than the idle threshold, so
 the switch holds an entry only for a tenant whose last read failed.
 Each failed read logs one ERROR line (tenant hash, signal, cause, delay to
 the next read) and counts once under
-`ravel_ingest_provisioning_read_failures_total{signal,cause}`, `cause`
+`ravel_ingest_provisioning_read_failures_total{mode,signal,cause}`, `cause`
 being `store` for a failed GET and `decode` for a record that did not decode
 or failed its checked read. The server's first-write provisioning check
 (`ProvisioningRecordWriter::ensure`) stays fail-open on a store error and
