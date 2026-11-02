@@ -16,13 +16,18 @@
 //! is the one unreachable pair; #1381's adapter is where that JSON becomes a
 //! real `AnalyticsRequest`/`ExemplarsRequest`.
 //!
-//! Every method returns the D4 envelope directly (`Result<Envelope,
+//! Every method but two returns the D4 envelope directly (`Result<Envelope,
 //! Failure>`) rather than each operation's native outcome type. Turning a
 //! native outcome into an envelope is exactly what every tool body (#1380,
 //! #1382) needs regardless of which operation answered it, so returning nine
 //! different outcome types here would only move that same conversion to a
 //! later, harder-to-name place; the port trait states the shape the tool
-//! layer actually consumes.
+//! layer actually consumes. The two exceptions are SQL's: `sql_execute`
+//! returns a [`Draft`], an envelope no cap has run on beside the inputs a D5
+//! cursor pins, because only the tool can mint that cursor and so only the
+//! tool can finish the page; and `sql_explain` returns an [`ExplainOutcome`],
+//! the estimate and schema in this crate's own types, which the explain tool
+//! renders against its D6 comparison.
 //!
 //! No method has a body: this module only names the shape #1381's adapter
 //! must implement and #1380/#1382's tool bodies must call.
@@ -30,6 +35,7 @@
 use ravel_query::http::{InstantRequest, MetadataRequest, RangeRequest};
 use ravel_types::TenantHash;
 
+use crate::draft::{Draft, ExplainOutcome};
 use crate::envelope::{AnyJson, Envelope, Failure};
 
 /// One `ravel_get_trace` lookup, validated.
@@ -106,12 +112,13 @@ pub trait QueryBackend {
         request: &AnyJson,
     ) -> Result<Envelope, Failure>;
 
-    /// Mirrors `QueryService::sql_execute`.
+    /// Mirrors `QueryService::sql_execute`, stopping before the result is
+    /// capped: the tool finishes the [`Draft`] with [`Draft::finish_page`].
     async fn sql_execute(
         &self,
         tenant_hash: TenantHash,
         request: &ravel_sql::SqlRequest,
-    ) -> Result<Envelope, Failure>;
+    ) -> Result<Draft, Failure>;
 
     /// Mirrors `QueryService::trace_request` followed by
     /// `QueryService::sql_execute`: the statement and window rule of
@@ -127,5 +134,5 @@ pub trait QueryBackend {
         &self,
         tenant_hash: TenantHash,
         request: &ravel_sql::SqlRequest,
-    ) -> Result<Envelope, Failure>;
+    ) -> Result<ExplainOutcome, Failure>;
 }
