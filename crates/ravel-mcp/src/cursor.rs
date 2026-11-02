@@ -98,10 +98,15 @@
 //! tenant learn that a token it holds was minted for someone else. Redeeming
 //! code MUST call [`Cursor::redeem`] and then [`PendingRedemption::confirm`]
 //! (or [`EvidenceRef::redeem`]), never [`Cursor::decode`] directly, so the
-//! tenant check happens on every call. On that path the position is reachable
-//! only through `confirm`'s result, since [`PendingRedemption`] has no
-//! accessor for it, so a caller that follows the rule cannot page from a
-//! cursor whose stage two it skipped.
+//! tenant check happens on every call. On that path the position is readable
+//! before `confirm` through [`PendingRedemption::position`], because a keyset
+//! page (`ravel_describe_data`) needs it to run the resolve that `confirm`
+//! then checks. Reading it serves nothing on its own: the pins a page reports
+//! and the next cursor is minted from come only from `confirm`'s result. The
+//! `#[must_use]` on [`PendingRedemption`] catches only a redemption discarded
+//! unused; one whose position was read and that is then dropped unconfirmed
+//! compiles, so a keyset tool's test must show a page served without
+//! `confirm` failing.
 //!
 //! # A token is bound to the call that minted it
 //!
@@ -815,10 +820,12 @@ impl Cursor {
 /// A cursor that passed stage one of a redemption ([`Cursor::redeem`]) and
 /// waits for the caller's resolve.
 ///
-/// It exposes the pinned resolve inputs and the resolve instant, and nothing
-/// a page can be served from: the position comes back only from
-/// [`PendingRedemption::confirm`], once the resolve's observations have been
-/// checked against the pin.
+/// It exposes the pinned resolve inputs, the resolve instant, and the
+/// position, which a keyset tool needs to choose what its resolve reads. The
+/// cursor a page is pinned to and its next cursor minted from comes back only
+/// from [`PendingRedemption::confirm`], once the resolve's observations have
+/// been checked against the pin; a page served without that call reports
+/// rows the pin no longer covers.
 ///
 /// ```compile_fail
 /// #![deny(unused_must_use)]
@@ -889,6 +896,13 @@ impl PendingRedemption {
     /// horizon less [`GRACE_NS`].
     pub fn deadline_ns(&self) -> i64 {
         self.cursor.deadline_ns
+    }
+
+    /// Where the sequence resumes, for choosing what the redeeming resolve
+    /// reads (a keyset's lower bound). Its rows are servable only after
+    /// [`PendingRedemption::confirm`] accepts that resolve's observations.
+    pub fn position(&self) -> &CursorPosition {
+        &self.cursor.position
     }
 
     /// Stage two of a redemption: compare what the redeeming resolve observed

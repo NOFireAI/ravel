@@ -14,6 +14,7 @@
 
 pub mod agents;
 pub mod capabilities;
+pub mod describe_data;
 pub mod explain_query;
 pub mod find_labels;
 pub mod get_trace;
@@ -72,6 +73,7 @@ pub enum ToolError {
 /// here fails the test rather than under-reporting the surface.
 pub const SERVED_TOOLS: &[&str] = &[
     "ravel_capabilities",
+    "ravel_describe_data",
     "ravel_find_labels",
     "ravel_explain_query",
     "ravel_get_trace",
@@ -89,7 +91,7 @@ pub async fn dispatch<B: QueryBackend>(
 ) -> Result<Envelope, ToolError> {
     match name {
         "ravel_capabilities" => Ok(capabilities::run(args, ctx)),
-        "ravel_describe_data" => Err(ToolError::NotShipped("ravel_describe_data")),
+        "ravel_describe_data" => Ok(describe_data::run(args, ctx, backend).await),
         "ravel_find_labels" => Ok(find_labels::run(args, ctx, backend).await),
         "ravel_explain_query" => Ok(explain_query::run(args, ctx, backend).await),
         "ravel_query_sql" => Err(ToolError::NotShipped("ravel_query_sql")),
@@ -214,22 +216,35 @@ mod tests {
         ) -> Result<crate::draft::ExplainOutcome, Failure> {
             Err(unreached("sql_explain"))
         }
+
+        async fn describe_data(
+            &self,
+            _tenant_hash: TenantHash,
+            _request: &crate::service::DescribeRequest,
+        ) -> Result<crate::service::DescribeOutcome, Failure> {
+            Err(unreached("describe_data"))
+        }
     }
 
-    /// A backend whose `sql_explain`, `labels` and `label_values` answer what
-    /// the test configured and record the request they were handed. Every
-    /// other method, and either of those left unconfigured, panics: a test
-    /// built on it proves the body never reached that call.
     /// One metadata call: the request, and for `label_values` the label name
     /// and the `include_log_metric_names` flag.
     pub(crate) type MetadataCall = (MetadataRequest, Option<(String, bool)>);
 
+    /// A backend whose `sql_explain`, `labels`, `label_values` and
+    /// `describe_data` answer what the test configured and record the request
+    /// they were handed. Every other method, and any of those left
+    /// unconfigured, panics: a test built on it proves the body never reached
+    /// that call. `describe` is a queue, one outcome per call, so a paging
+    /// test configures each page's answer in order.
     #[derive(Default)]
     pub(crate) struct Stub {
         pub(crate) explain: Option<crate::draft::ExplainOutcome>,
         pub(crate) listed: Option<Envelope>,
         pub(crate) explained: std::cell::RefCell<Vec<ravel_sql::SqlRequest>>,
         pub(crate) metadata: std::cell::RefCell<Vec<MetadataCall>>,
+        pub(crate) describe:
+            std::cell::RefCell<std::collections::VecDeque<crate::service::DescribeOutcome>>,
+        pub(crate) described: std::cell::RefCell<Vec<crate::service::DescribeRequest>>,
     }
 
     impl Stub {
@@ -334,6 +349,18 @@ mod tests {
             self.explained.borrow_mut().push(request.clone());
             Ok(outcome.clone())
         }
+
+        async fn describe_data(
+            &self,
+            _tenant_hash: TenantHash,
+            request: &crate::service::DescribeRequest,
+        ) -> Result<crate::service::DescribeOutcome, Failure> {
+            let Some(outcome) = self.describe.borrow_mut().pop_front() else {
+                panic!("describe_data must not be reached");
+            };
+            self.described.borrow_mut().push(request.clone());
+            Ok(outcome)
+        }
     }
 
     pub(crate) fn test_context(key: &CursorKey) -> ToolContext<'_> {
@@ -351,8 +378,8 @@ mod tests {
     /// Drive a future that is ready on its first poll, so this crate needs no
     /// async runtime to test dispatch. Every path `dispatch` takes in this
     /// build on an empty argument object is immediate: `ravel_capabilities`
-    /// reads no store, the three query bodies refuse an empty argument object
-    /// before reaching their backend, and the five refusals return before
+    /// reads no store, the four query bodies refuse an empty argument object
+    /// before reaching their backend, and the four refusals return before
     /// awaiting anything. The stub backends in this crate's tests answer
     /// without awaiting too.
     pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
@@ -367,9 +394,9 @@ mod tests {
     }
 
     /// Every name in the catalog reaches `dispatch`, and `dispatch` refuses
-    /// anything else. The counts are exact on purpose: the five bodies not in
+    /// anything else. The counts are exact on purpose: the four bodies not in
     /// this build must each answer `NotShipped` rather than a placeholder
-    /// envelope, and the four bodies this build carries must answer an
+    /// envelope, and the five bodies this build carries must answer an
     /// envelope.
     #[test]
     fn dispatch_routes_every_catalog_name_and_refuses_unknown_names() {
@@ -384,8 +411,9 @@ mod tests {
         for tool in &catalog {
             let name = tool.name.to_string();
             match block_on(dispatch(&name, serde_json::json!({}), &ctx, &NoBackend)) {
-                Ok(envelope) if name == "ravel_get_trace" => {
-                    // Served, and an empty argument object names no trace.
+                Ok(envelope) if name == "ravel_get_trace" || name == "ravel_describe_data" => {
+                    // Served, and an empty argument object names no trace
+                    // (no signal, for describe): a deserialization refusal.
                     assert_eq!(envelope.status, crate::envelope::Status::Error);
                     assert_eq!(
                         envelope.failure.map(|failure| failure.class),
@@ -421,12 +449,13 @@ mod tests {
             served,
             vec![
                 "ravel_capabilities".to_string(),
+                "ravel_describe_data".to_string(),
                 "ravel_find_labels".to_string(),
                 "ravel_explain_query".to_string(),
                 "ravel_get_trace".to_string()
             ]
         );
-        assert_eq!(not_shipped.len(), 5);
+        assert_eq!(not_shipped.len(), 4);
 
         // What `ravel_capabilities` reports is the same split, name for name:
         // `enabled` is what dispatch runs, `catalogued` is what it refuses. A

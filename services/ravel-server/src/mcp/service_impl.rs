@@ -1,10 +1,13 @@
 //! The [`QueryBackend`] port over [`QueryService`].
 //!
 //! Every method here is one call into the query service and one conversion of
-//! its outcome into a D4 envelope, except the two SQL methods: `sql_execute`
-//! stops before the caps and returns a [`Draft`] beside the snapshot's pin
-//! inputs, and `sql_explain` returns an [`ExplainOutcome`] for the explain
-//! tool to render. `labels` and `label_values` also stop before the caps,
+//! its outcome into a D4 envelope, except the two SQL methods and
+//! `describe_data`: `sql_execute` stops before the caps and returns a
+//! [`Draft`] beside the snapshot's pin inputs, `sql_explain` returns an
+//! [`ExplainOutcome`] for the explain tool to render, and `describe_data`
+//! maps the service's `DescribeData` field by field into a
+//! [`DescribeOutcome`], because only `ravel_describe_data` knows whether it
+//! is serving a first page or a cursor's later one. `labels` and `label_values` also stop before the caps,
 //! because `ravel_find_labels` filters the list and the caps run after the
 //! filter (ADR-1374 amendment 2026-09-12 item 6: the tool layer owns
 //! envelope finishing). Nothing else: the admission permit, the
@@ -35,18 +38,23 @@
 
 use std::time::Duration;
 
+use ravel_catalog::MetricKind;
 use ravel_mcp::budget::McpEffectiveBudgets;
 use ravel_mcp::draft::{Draft, EstimateComponent, ExplainColumn, ExplainOutcome, cursor_signal};
 use ravel_mcp::envelope::{AnyJson, Cell, Envelope, Failure};
-use ravel_mcp::service::{QueryBackend, TraceLookupRequest};
+use ravel_mcp::service::{
+    DescribeOutcome, DescribeRequest, DescribedColumn, DescribedCoverage, DescribedFamily,
+    QueryBackend, TraceLookupRequest,
+};
 use ravel_promql::{RangeValue, Value as PromValue};
 use ravel_query::http::{InstantRequest, MetadataRequest, RangeRequest};
 use ravel_query::{PhaseAccountingSnapshot, QueryPhase, QueryStats, RequestBudgets};
-use ravel_types::{CommitToken, TenantHash};
+use ravel_types::{CommitToken, Signal, TenantHash};
 use rmcp::model::{ProgressNotificationParam, ProgressToken};
 use rmcp::service::{Peer, RoleServer};
 use serde::Deserialize;
 
+use crate::service::describe::{DescribeColumn, DescribeDataRequest, IndexedKeysSource};
 use crate::service::{AnalyticsRequest, ExemplarsRequest, QueryService, ServiceError};
 use crate::traces::TraceLookup;
 
@@ -536,6 +544,90 @@ impl QueryBackend for ServiceBackend {
                 })
                 .collect(),
         })
+    }
+
+    async fn describe_data(
+        &self,
+        tenant_hash: TenantHash,
+        request: &DescribeRequest,
+    ) -> Result<DescribeOutcome, Failure> {
+        let signal = match request.signal {
+            Signal::Metrics => "metrics",
+            Signal::Logs => "logs",
+            Signal::Spans => "traces",
+            other => {
+                return Err(d4::invalid_argument(format!(
+                    "describe_data: signal {other:?} is not described"
+                )));
+            }
+        };
+        let data = self
+            .service
+            .describe_data(
+                tenant_hash,
+                &DescribeDataRequest {
+                    signal: signal.to_string(),
+                    after_name: request.after_name.clone(),
+                    limit: Some(request.limit),
+                    now_ns: request.now_ns,
+                    deadline: self.budgets.deadline,
+                },
+            )
+            .await
+            .map_err(failure)?;
+        let column = |column: DescribeColumn| DescribedColumn {
+            name: column.name,
+            data_type: column.data_type,
+            nullable: column.nullable,
+        };
+        Ok(DescribeOutcome {
+            table: data.table.to_string(),
+            fixed_columns: data.fixed_columns.into_iter().map(column).collect(),
+            declared_columns: data.declared_columns.into_iter().map(column).collect(),
+            declared_column_set: data.declared_column_set,
+            indexed_keys: data.indexed_keys.keys,
+            indexed_keys_source: match data.indexed_keys.source {
+                IndexedKeysSource::TenantKeyIndex => "tenant_key_index",
+                IndexedKeysSource::SpanFormat => "span_format",
+                IndexedKeysSource::None => "none",
+            }
+            .to_string(),
+            families: data
+                .families
+                .into_iter()
+                .map(|family| DescribedFamily {
+                    name: family.name,
+                    kind: metric_kind_name(family.kind).to_string(),
+                    unit: family.unit,
+                    help: family.help,
+                })
+                .collect(),
+            families_total: data.families_total,
+            more_families: data.more_families,
+            families_absent_reason: data.families_absent_reason.map(str::to_string),
+            ingest_watermark_hour: data.ingest_watermark_hour,
+            coverage: data.coverage.map(|window| DescribedCoverage {
+                min_event_ts_ns: window.min_event_ts_ns,
+                max_event_ts_ns: window.max_event_ts_ns,
+            }),
+            segments: data.segments,
+            committed_rows: data.committed_rows,
+            pending_erasure: data.pending_erasure,
+            resolved_at_ns: data.resolved_at_ns,
+            accounting: data.accounting,
+        })
+    }
+}
+
+/// Prometheus' lowercase spelling of a metric family's type, as
+/// `GET /api/v1/metadata` renders it.
+fn metric_kind_name(kind: MetricKind) -> &'static str {
+    match kind {
+        MetricKind::Counter => "counter",
+        MetricKind::Gauge => "gauge",
+        MetricKind::Histogram => "histogram",
+        MetricKind::Summary => "summary",
+        MetricKind::Unknown => "unknown",
     }
 }
 
