@@ -732,10 +732,12 @@ mod tests {
     #[test]
     fn a_refusing_mint_gives_no_cursor_and_says_why() {
         let budgets = budgets(3);
-        let refused =
-            draft(5, 8, |i| i as i128).finish_page(&budgets, &scope(), PageOrder::Total, |_, _, _| {
-                Err(CursorError::Expired.into())
-            });
+        let refused = draft(5, 8, |i| i as i128).finish_page(
+            &budgets,
+            &scope(),
+            PageOrder::Total,
+            |_, _, _| Err(CursorError::Expired.into()),
+        );
         assert_eq!(refused.status, Status::OkBounded);
         assert_eq!(refused.presentation.cursor, None);
         assert_eq!(refused.presentation.rows_omitted, 2);
@@ -985,12 +987,10 @@ mod tests {
         assert_eq!(page.presentation.rows_omitted, 2);
         assert_eq!(page.status, Status::OkPage);
 
-        let one_group = draft(5, 8, |_| 7).finish_page(
-            &budgets(4),
-            &scope(),
-            grouped,
-            |_, _, _| panic!("no complete group, nothing to mint after"),
-        );
+        let one_group =
+            draft(5, 8, |_| 7).finish_page(&budgets(4), &scope(), grouped, |_, _, _| {
+                panic!("no complete group, nothing to mint after")
+            });
         assert_eq!(one_group.status, Status::OkBounded);
         assert_eq!(one_group.presentation.cursor, None);
         assert_eq!(one_group.data.rows.len(), 4);

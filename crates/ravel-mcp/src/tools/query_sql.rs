@@ -374,7 +374,10 @@ fn same_tuple(a: &[ResumeValue], b: &[ResumeValue]) -> bool {
 }
 
 fn order_columns(plan: &PagePlan) -> Vec<String> {
-    plan.order_by.iter().map(|term| term.column.clone()).collect()
+    plan.order_by
+        .iter()
+        .map(|term| term.column.clone())
+        .collect()
 }
 
 fn rendered_order(plan: &PagePlan) -> Vec<String> {
@@ -581,7 +584,11 @@ mod tests {
 
     fn failure_class(envelope: &Envelope) -> FailureClass {
         assert_eq!(envelope.status, Status::Error, "{envelope:?}");
-        envelope.failure.as_ref().expect("an error carries one").class
+        envelope
+            .failure
+            .as_ref()
+            .expect("an error carries one")
+            .class
     }
 
     /// A three-page walk under a total order: each page runs the planned
@@ -684,14 +691,18 @@ mod tests {
     fn a_grouped_page_ends_before_an_open_group() {
         let key = key();
         let stub = Stub::default();
-        stub.sql.borrow_mut().extend([logs(&[1, 2, 2]), logs(&[2, 2])]);
+        stub.sql
+            .borrow_mut()
+            .extend([logs(&[1, 2, 2]), logs(&[2, 2])]);
 
         let one = block_on(run(args(GROUPED, None), &context(&key), &stub));
         assert_eq!(one.status, Status::OkPage, "{one:?}");
         assert_eq!(one.data.rows.len(), 1);
         assert_eq!(one.presentation.rows_omitted, 2);
         assert!(
-            one.warnings.iter().any(|w| w.contains("the order is not total")),
+            one.warnings
+                .iter()
+                .any(|w| w.contains("the order is not total")),
             "{:?}",
             one.warnings
         );
@@ -796,12 +807,9 @@ mod tests {
     fn a_capped_statement_with_no_order_is_bounded() {
         let key = key();
         let stub = Stub::default();
-        stub.sql.borrow_mut().push_back(draft_of(
-            Signal::Logs,
-            Vec::new(),
-            Vec::new(),
-            END_NS,
-        ));
+        stub.sql
+            .borrow_mut()
+            .push_back(draft_of(Signal::Logs, Vec::new(), Vec::new(), END_NS));
         stub.sql.borrow_mut()[0].envelope.data.rows = vec![vec![Cell::Int(1)]; 3];
         stub.sql.borrow_mut()[0].envelope.data.row_count = 3;
 
@@ -907,9 +915,7 @@ mod tests {
             )])],
             LATER_NS,
         );
-        stub.sql
-            .borrow_mut()
-            .extend([samples(&[1, 2, 3]), erased]);
+        stub.sql.borrow_mut().extend([samples(&[1, 2, 3]), erased]);
 
         let one = block_on(run(args(TOTAL, None), &context(&key), &stub));
         let cursor = one.presentation.cursor.expect("page one's cursor");
