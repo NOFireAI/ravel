@@ -5358,6 +5358,27 @@ oversights.
    `blocks_pruned_by_postings=0` and reads everything, which is the widen-only
    fallback, not a failure.
 
+#### Bucketed final aggregation (ADR-3565)
+
+`SqlConfig::bucketed_final_aggregation` (`--sql-bucketed-final-aggregation` on
+ravel-server, off by default) replaces a `FinalPartitioned` hash aggregate with
+`BucketedFinalAggregateExec` when every group key is an integer, date, time,
+timestamp or interval column, every aggregate's state is integer, temporal or
+`Decimal128` (never float), and the aggregate has no limit, input ordering or
+grouping sets. The rule runs after the bounded top-k rule and before the
+compact-slices rule; `SinglePartitioned` and `Final` aggregates are left alone.
+Each partition first aggregates into one table, as the stock final does. When
+the table reaches the engage threshold (65,536 groups by default) the partition
+routes the table's state and every later input row into 2^bits hash buckets (64
+by default), hashed with a seed and bit range independent of the repartition
+exchange. Once input ends it aggregates, emits and frees one bucket at a time,
+so the peak is about one bucket's table rather than the partition's. Memory is
+charged one to one to a `BucketedFinalAggregate[p]` consumer per partition, with
+no reserve-ahead factor; a refused grow fails the query with
+`ResourcesExhausted` naming that consumer, and nothing spills. `EXPLAIN ANALYZE`
+reports `engaged`, `routed_rows` and `buckets_non_empty`. Answers match the
+stock final; output row order can differ.
+
 #### The decoded column-block cache (ADR-3326)
 
 `--decoded-cache-max-bytes` (default `0`, off) sizes a process-wide cache of
