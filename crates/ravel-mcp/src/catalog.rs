@@ -396,7 +396,7 @@ pub fn tool_catalog() -> Vec<Tool> {
             "ravel_describe_data",
             "Describe data",
             "Effective schema, indexed keys, metric families, freshness \
-             watermark, coverage window, exact row counts where available",
+             watermark, coverage window, committed row count (an upper bound)",
         ),
         tool::<FindLabelsInput>(
             "ravel_find_labels",
@@ -450,7 +450,7 @@ mod tests {
     /// every client parses on every reconnect, and it should be read in a
     /// diff rather than absorbed silently anywhere under the bound. Update
     /// it in the same commit as the schema change that moves it.
-    const TOOLS_LIST_SERIALIZED_LEN: usize = 15_648;
+    const TOOLS_LIST_SERIALIZED_LEN: usize = 15_652;
 
     /// D2 bounds `tools/list` so the catalog itself never competes with a
     /// data response for the response-size budget.
@@ -753,7 +753,7 @@ mod tests {
     /// `agents` and run with both enabled answers it. Pinned for the same
     /// reason as [`TOOLS_LIST_SERIALIZED_LEN`], under the same D2 budget
     /// (ADR-3331 decision 10).
-    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 23_537;
+    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 23_541;
 
     const _: () = assert!(
         COMBINED_TOOLS_LIST_SERIALIZED_LEN < 24_576,

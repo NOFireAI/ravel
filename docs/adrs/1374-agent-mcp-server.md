@@ -165,7 +165,7 @@ amendment below.
 | Tool | Purpose | Prerequisite |
 |---|---|---|
 | `ravel_capabilities` | Protocol and server version, enabled tools, effective budget ceilings, dialect summaries, tenant hash, enabled signals. Zero store reads | none |
-| `ravel_describe_data` | Per signal: effective schema (fixed and declared columns), indexed keys, metric families with type and unit (one bounded page), freshness watermark, coverage window, exact catalog row counts where they exist | D3 explain path, `MetadataCache`, one resolve per signal |
+| `ravel_describe_data` | Per signal: effective schema (fixed and declared columns), indexed keys, metric families with type and unit (one bounded page), freshness watermark, coverage window, exact catalog row counts where they exist (retired by the committed row count amendment below: the count is an upper bound, marked approximate) | D3 explain path, `MetadataCache`, one resolve per signal |
 | `ravel_find_labels` | Metric names for a selector, label names, or label values for one label under a selector. The result says if the list is declared, observed, or exact. An unfiltered tenant-wide list is refused, and the refusal names the bounded form | label machinery through the service layer |
 | `ravel_explain_query` | Validate SQL or PromQL, resolve the snapshot, return the target table, the effective schema in `data.columns` with zero rows, the admitted segment count, the estimate against the effective budget, and the plan shape in `plan`. No scan | D3 `SqlExecutor::explain` |
 | `ravel_query_sql` | One `SELECT` over one table, with a required `time_range` applied as a row filter, `max_rows`, budgets that can only be lowered, and a keyset cursor | D3 |
@@ -1030,8 +1030,10 @@ exceed, not their sum.
 
 Shipping the explain changed its catalog description to name SQL only, and
 `ravel_find_labels` no longer declares `evidence_ref` (2026-09-13 item 2).
-`tools/list` is now 15,648 bytes with the nine tools and 23,537 bytes with
-all fifteen, against the 24,576-byte budget; both figures are pinned in
+`tools/list` was then 15,648 bytes with the nine tools and 23,537 bytes
+with all fifteen. Since the committed row count amendment below it is
+15,652 bytes with the nine tools and 23,541 bytes with all fifteen, against
+the 24,576-byte budget; both figures are pinned in
 `crates/ravel-mcp/src/catalog.rs` and
 `services/ravel-server/tests/mcp_agents_e2e.rs`.
 
@@ -1111,3 +1113,30 @@ it.
    2026-09-12 amendment, item 4, records. The `ORDER BY` and the tool name
    are constants of the minting tool, and every other field has a fixed
    size.
+
+## Amendment (2026-11-02, #3664): the committed row count amendment, `ravel_describe_data` reports its row count as an upper bound
+
+<!-- amendment-applies: sections="D2. Nine tools, three resources, two prompts" pointer="committed row count amendment" -->
+<!-- amendment-supersedes: phrase="exact catalog row counts where they exist" pointer="committed row count amendment" -->
+
+D2's `ravel_describe_data` row promises "exact catalog row counts where
+they exist". The count the tool reports, `committed_rows` on the `table`
+row, is summed from commit records. It counts rows before duplicate
+collapse and before any pending erasure, so it is an upper bound on the
+rows a reader sees, and page one still reported `accuracy.exact: true`.
+Counting the rows a reader sees needs segment reads, which the tool does
+not do, so the count stays as it is and is marked instead.
+
+1. Page one, the only page that carries the `table` row, reports
+   `accuracy.exact: false` and `accuracy.approximation` set to
+   `COMMITTED_ROWS_APPROXIMATION` in
+   `crates/ravel-mcp/src/tools/describe_data.rs`: "committed_rows is an
+   upper bound: summed from commit records, counted before duplicate
+   collapse and before pending erasure". A later page carries no `table`
+   row and reports `exact: true`.
+2. The `table` row no longer carries `committed_rows_note`. It said what
+   the approximation now says, in the envelope field D4 defines for it.
+3. The catalog description ends "committed row count (an upper bound)"
+   instead of "exact row counts where available". That moves `tools/list`
+   from 15,648 to 15,652 bytes with the nine tools and from 23,537 to
+   23,541 bytes with all fifteen, still under the 24,576-byte budget.

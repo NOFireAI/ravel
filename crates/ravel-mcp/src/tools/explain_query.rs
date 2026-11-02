@@ -843,7 +843,7 @@ mod tests {
             "<!-- amendment-applies: sections=\"D6. Budgets|Consequences\" pointer=\"Parquet explain amendment\" -->",
             "`crates/ravel-parquet/src/limits.rs`, module doc lines 14 to 24, `admit`\n   at line 171",
             "`unbounded_estimate_components` in\n   `crates/ravel-sql/src/executor.rs`",
-            "15,648 bytes with the nine tools and 23,537 bytes",
+            "15,652 bytes with the nine tools and 23,541 bytes",
         ] {
             assert!(adr.contains(needle), "ADR-1374 lacks {needle:?}");
         }
