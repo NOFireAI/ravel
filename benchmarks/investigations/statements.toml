@@ -1,0 +1,322 @@
+# Statement set for the selective-investigations harness (issue #3699,
+# ADR-3692 decision 8). Each [[statement]] names:
+#   id            stable identifier, used in calls.jsonl and results.json
+#   table         "spans" | "logs" | "spans+logs" (join) | "hits" (control)
+#   sql           the statement text, or "GET /api/traces/<trace_id>" for
+#                 the trace-by-id endpoint (not POST /api/v1/sql)
+#   states        state-matrix entries this statement runs in: any of
+#                 "unfolded", "folded_no_leaves", "folded_leaves", "mixed",
+#                 "many_parts" (T2, see run.sh step note)
+#   truth_key     dotted path into truth.json this statement's answer is
+#                 checked against (evaluate.py resolves it); "none" when
+#                 the state varies the answer and no fixed truth applies
+#   cold_only     true if this statement never runs a warm repeat
+#   supported     false for a statement the current main build cannot run
+#                 yet (recorded unsupported-on-this-build, never silently
+#                 skipped -- see README.md "Unsupported statements")
+#   acceptance    the ADR-3692 Acceptance table row number(s) this feeds
+
+[[statement]]
+id = "spans_lookup_no_range"
+table = "spans"
+sql = "GET /api/traces/{trace_id}"
+states = ["unfolded", "folded_no_leaves", "folded_leaves"]
+truth_key = "saved_trace_ids"
+cold_only = false
+supported = true
+acceptance = [1]
+
+[[statement]]
+id = "spans_lookup_1h"
+table = "spans"
+sql = "SELECT trace_id, span_id, start_ts FROM spans WHERE trace_id = '{trace_id}' AND start_ts >= {start_ns} AND start_ts < {end_ns}"
+states = ["unfolded", "folded_no_leaves", "folded_leaves"]
+truth_key = "saved_trace_ids"
+cold_only = false
+supported = true
+acceptance = [2, 3]
+
+[[statement]]
+id = "spans_lookup_narrow_5m"
+table = "spans"
+sql = "SELECT trace_id, span_id, start_ts FROM spans WHERE trace_id = '{trace_id}' AND start_ts >= {start_ns} AND start_ts < {end_ns}"
+states = ["folded_leaves"]
+truth_key = "saved_trace_ids"
+cold_only = false
+supported = true
+acceptance = [2]
+
+[[statement]]
+id = "spans_lookup_wide_24h"
+table = "spans"
+sql = "SELECT trace_id, span_id, start_ts FROM spans WHERE trace_id = '{trace_id}' AND start_ts >= {start_ns} AND start_ts < {end_ns}"
+states = ["folded_leaves"]
+truth_key = "saved_trace_ids"
+cold_only = false
+supported = true
+acceptance = [2]
+
+[[statement]]
+id = "spans_lookup_warm"
+table = "spans"
+sql = "SELECT trace_id, span_id, start_ts FROM spans WHERE trace_id = '{trace_id}'"
+states = ["folded_leaves"]
+truth_key = "saved_trace_ids"
+cold_only = false
+supported = true
+acceptance = [4]
+
+[[statement]]
+id = "logs_by_trace_id_1h"
+table = "logs"
+sql = "SELECT * FROM logs WHERE trace_id = '{trace_id}' AND ts >= {start_ns} AND ts < {end_ns}"
+states = ["unfolded", "folded_no_leaves", "folded_leaves"]
+truth_key = "saved_trace_ids"
+cold_only = false
+supported = true
+acceptance = [5, 6]
+
+[[statement]]
+id = "logs_request_id_present"
+table = "logs"
+sql = "SELECT * FROM logs WHERE request_id = '{request_id_present}'"
+states = ["unfolded", "folded_no_leaves", "folded_leaves"]
+truth_key = "request_id.present"
+cold_only = false
+supported = true
+acceptance = [5, 6]
+
+[[statement]]
+id = "logs_request_id_absent"
+table = "logs"
+sql = "SELECT * FROM logs WHERE request_id = '{request_id_absent}'"
+states = ["unfolded", "folded_no_leaves", "folded_leaves"]
+truth_key = "request_id.absent"
+cold_only = false
+supported = true
+acceptance = [5, 6]
+
+[[statement]]
+id = "spans_in_trace_id_10"
+table = "spans"
+sql = "SELECT * FROM spans WHERE trace_id IN ({trace_id_list})"
+states = ["folded_leaves"]
+truth_key = "in_lists.trace_id.10"
+cold_only = false
+supported = false
+acceptance = [11]
+
+[[statement]]
+id = "spans_in_trace_id_100"
+table = "spans"
+sql = "SELECT * FROM spans WHERE trace_id IN ({trace_id_list})"
+states = ["folded_leaves"]
+truth_key = "in_lists.trace_id.100"
+cold_only = false
+supported = false
+acceptance = [11]
+
+[[statement]]
+id = "spans_in_trace_id_1000"
+table = "spans"
+sql = "SELECT * FROM spans WHERE trace_id IN ({trace_id_list})"
+states = ["folded_leaves"]
+truth_key = "in_lists.trace_id.1000"
+cold_only = false
+supported = false
+acceptance = [11]
+
+[[statement]]
+id = "logs_in_trace_id_10"
+table = "logs"
+sql = "SELECT * FROM logs WHERE trace_id IN ({trace_id_list})"
+states = ["folded_leaves"]
+truth_key = "in_lists.trace_id.10"
+cold_only = false
+supported = false
+acceptance = [11]
+
+[[statement]]
+id = "logs_in_trace_id_100"
+table = "logs"
+sql = "SELECT * FROM logs WHERE trace_id IN ({trace_id_list})"
+states = ["folded_leaves"]
+truth_key = "in_lists.trace_id.100"
+cold_only = false
+supported = false
+acceptance = [11]
+
+[[statement]]
+id = "logs_in_trace_id_1000"
+table = "logs"
+sql = "SELECT * FROM logs WHERE trace_id IN ({trace_id_list})"
+states = ["folded_leaves"]
+truth_key = "in_lists.trace_id.1000"
+cold_only = false
+supported = false
+acceptance = [11]
+
+[[statement]]
+id = "logs_in_request_id_10"
+table = "logs"
+sql = "SELECT * FROM logs WHERE request_id IN ({request_id_list})"
+states = ["folded_leaves"]
+truth_key = "in_lists.request_id.10"
+cold_only = false
+supported = false
+acceptance = [11]
+
+[[statement]]
+id = "logs_in_request_id_100"
+table = "logs"
+sql = "SELECT * FROM logs WHERE request_id IN ({request_id_list})"
+states = ["folded_leaves"]
+truth_key = "in_lists.request_id.100"
+cold_only = false
+supported = false
+acceptance = [11]
+
+[[statement]]
+id = "logs_in_request_id_1000"
+table = "logs"
+sql = "SELECT * FROM logs WHERE request_id IN ({request_id_list})"
+states = ["folded_leaves"]
+truth_key = "in_lists.request_id.1000"
+cold_only = false
+supported = false
+acceptance = [11]
+
+[[statement]]
+id = "logs_like_tag_1blk"
+table = "logs"
+sql = "SELECT * FROM logs WHERE tag LIKE '%needle-rare-1blk%'"
+states = ["folded_leaves"]
+truth_key = "tag_needles.needle-rare-1blk"
+cold_only = false
+supported = true
+acceptance = [14]
+
+[[statement]]
+id = "logs_like_tag_0p1pct"
+table = "logs"
+sql = "SELECT * FROM logs WHERE tag LIKE '%needle-sparse-0p1pct%'"
+states = ["folded_leaves"]
+truth_key = "tag_needles.needle-sparse-0p1pct"
+cold_only = false
+supported = true
+acceptance = [14]
+
+[[statement]]
+id = "logs_like_tag_10pct"
+table = "logs"
+sql = "SELECT * FROM logs WHERE tag LIKE '%needle-common-10pct%'"
+states = ["folded_leaves"]
+truth_key = "tag_needles.needle-common-10pct"
+cold_only = false
+supported = true
+acceptance = [14]
+
+[[statement]]
+id = "logs_has_word_body_1blk"
+table = "logs"
+sql = "SELECT * FROM logs WHERE has_word(body, 'needle-rare-1blk')"
+states = ["folded_leaves"]
+truth_key = "tag_needles.needle-rare-1blk"
+cold_only = false
+supported = true
+acceptance = [14]
+
+[[statement]]
+id = "logs_has_word_body_0p1pct"
+table = "logs"
+sql = "SELECT * FROM logs WHERE has_word(body, 'needle-sparse-0p1pct')"
+states = ["folded_leaves"]
+truth_key = "tag_needles.needle-sparse-0p1pct"
+cold_only = false
+supported = true
+acceptance = [14]
+
+[[statement]]
+id = "logs_has_word_body_10pct"
+table = "logs"
+sql = "SELECT * FROM logs WHERE has_word(body, 'needle-common-10pct')"
+states = ["folded_leaves"]
+truth_key = "tag_needles.needle-common-10pct"
+cold_only = false
+supported = true
+acceptance = [14]
+
+[[statement]]
+id = "journey_a_failing_traces"
+table = "spans"
+sql = "SELECT DISTINCT trace_id FROM spans WHERE service = '{failing_service}' AND start_ts >= {hour_start_ns} AND start_ts < {hour_end_ns} AND status = 'error'"
+states = ["folded_leaves"]
+truth_key = "failing_cell"
+cold_only = false
+supported = true
+acceptance = [15]
+
+[[statement]]
+id = "journey_b_logs_by_trace_ids"
+table = "logs"
+sql = "SELECT * FROM logs WHERE trace_id IN ({failing_trace_ids})"
+states = ["folded_leaves"]
+truth_key = "failing_cell"
+cold_only = false
+supported = false
+acceptance = [15]
+
+[[statement]]
+id = "journey_c_join_1"
+table = "spans+logs"
+sql = "SELECT s.trace_id, s.span_id, l.body FROM spans s JOIN logs l ON s.trace_id = l.trace_id WHERE s.trace_id IN ({build_side})"
+states = ["folded_leaves"]
+truth_key = "journey_join.1"
+cold_only = true
+supported = true
+acceptance = [15]
+
+[[statement]]
+id = "journey_c_join_102"
+table = "spans+logs"
+sql = "SELECT s.trace_id, s.span_id, l.body FROM spans s JOIN logs l ON s.trace_id = l.trace_id WHERE s.trace_id IN ({build_side})"
+states = ["folded_leaves"]
+truth_key = "journey_join.102"
+cold_only = true
+supported = true
+acceptance = [15]
+
+[[statement]]
+id = "journey_c_join_1024"
+table = "spans+logs"
+sql = "SELECT s.trace_id, s.span_id, l.body FROM spans s JOIN logs l ON s.trace_id = l.trace_id WHERE s.trace_id IN ({build_side})"
+states = ["folded_leaves"]
+truth_key = "journey_join.1024"
+cold_only = true
+supported = true
+acceptance = [15]
+
+[[statement]]
+id = "journey_c_join_10240"
+table = "spans+logs"
+sql = "SELECT s.trace_id, s.span_id, l.body FROM spans s JOIN logs l ON s.trace_id = l.trace_id WHERE s.trace_id IN ({build_side})"
+states = ["folded_leaves"]
+truth_key = "journey_join.10240"
+cold_only = true
+supported = true
+acceptance = [15]
+
+# Nonselective control: run the ClickBench kit's own 43-statement corpus,
+# unmodified, when run.toml sets control = true. Needs the `hits` tenant
+# loaded exactly as the ClickBench kit loads it (see
+# benchmarks/clickbench/hits.mapping.toml and the runbook's load step);
+# this harness does not load `hits` itself.
+[[statement]]
+id = "control_hits_corpus"
+table = "hits"
+sql = "(see benchmarks/clickbench/hits.corpus.json, 43 statements, run unmodified)"
+states = ["folded_leaves"]
+truth_key = "none"
+cold_only = true
+supported = true
+acceptance = [16]

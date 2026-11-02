@@ -1,0 +1,138 @@
+# Band file for the selective-investigations harness (issue #3699).
+# Encodes ADR-3692 "Decision 8 / Acceptance", rows 1-17, verbatim from
+# docs/adrs/3692-selective-investigations-logs-traces.md. Every key here
+# must be present EXACTLY ONCE in a run's results.json, or evaluate.py
+# fails with "missing <name>" / "duplicate <name>" rather than silently
+# skipping the row (see evaluate.py: ONE presence-and-band check for
+# every figure it reports).
+#
+# target/miss are evaluated by evaluate.py against the named results.json
+# figure. lanes lists which lane(s) a row is judged on; a lane not listed
+# there is reported for that row but never judged (ADR-3692 8, "Lanes").
+# judged = false rows (14, 15, 17) are reported, never pass/failed.
+
+[row_01_spans_lookup_no_range_folded_leaves]
+figure = "spans_lookup_no_range.folded_leaves.p50_ms"
+target = "value <= 5"
+miss = "value > 5 for 3 consecutive runs"
+lanes = ["local"]
+judged = true
+
+[row_01_spans_lookup_no_range_folded_leaves_p99]
+figure = "spans_lookup_no_range.folded_leaves.p99_ms"
+target = "value <= 20"
+miss = "value > 20 for 3 consecutive runs"
+lanes = ["local"]
+judged = true
+
+[row_02_spans_lookup_1h_cold]
+figure = "spans_lookup_1h.folded_leaves.p99_ms"
+target = "value <= 150"
+miss = "value > 150"
+lanes = ["local"]
+judged = true
+
+[row_03_spans_lookup_1h_unfolded]
+figure = "spans_lookup_1h.unfolded.p99_ms"
+target = "value <= 400"
+miss = "value > 400"
+lanes = ["local"]
+judged = true
+
+[row_04_spans_lookup_warm]
+figure = "spans_lookup_warm.folded_leaves.p99_ms"
+target = "value <= 10"
+miss = "value > 10"
+lanes = ["local"]
+judged = true
+
+[row_05_logs_request_id_cold_folded]
+figure = "logs_request_id_present.folded_leaves.p99_ms"
+target = "value <= 150"
+miss = "value > 150"
+lanes = ["local"]
+judged = true
+
+[row_06_logs_request_id_cold_unfolded]
+figure = "logs_request_id_present.unfolded.p99_ms"
+target = "value <= 400"
+miss = "value > 400"
+lanes = ["local"]
+judged = true
+
+[row_07_fold_leaf_switch_wall_time]
+figure = "fold.leaf_switch_wall_time_increase_ratio"
+target = "value <= 1.15"
+miss = "value > 1.15"
+lanes = ["local"]
+judged = true
+
+[row_08_leaf_bytes_per_object]
+figure = "fold.leaf_bytes_fraction_of_object"
+target = "value <= 0.02"
+miss = "value > 0.02"
+lanes = ["local"]
+judged = true
+
+[row_09_month_scale_lane]
+figure = "month_scale.bounds_held"
+target = "value == True"
+miss = "value == False"
+lanes = ["hour_ranged"]
+judged = true
+
+[row_10_past_pmax_lane]
+figure = "past_pmax_scale.bounds_held_or_reported"
+target = "value == True"
+miss = "value == False"
+lanes = ["hour_ranged"]
+judged = true
+
+[row_11_in_list_growth]
+figure = "in_list.growth_class"
+target = "value == \"linear\""
+miss = "value == \"super_linear_before_100\""
+lanes = ["local"]
+judged = true
+
+[row_12_scaling_10x_100x]
+figure = "scaling.bounds_held_all_scales"
+target = "value == True"
+miss = "value == False"
+lanes = ["hour_ranged"]
+judged = true
+
+[row_13_correctness_matrix]
+figure = "correctness.pass_fraction"
+target = "value == 1.0"
+miss = "value < 1.0"
+lanes = ["local", "s3", "hour_ranged"]
+judged = true
+
+[row_14_join_baseline]
+figure = "journey_c_join.reported"
+target = "n/a"
+miss = "n/a"
+lanes = ["local"]
+judged = false
+
+[row_15_the_journey]
+figure = "journey.reported"
+target = "n/a"
+miss = "n/a"
+lanes = ["local"]
+judged = false
+
+[row_16_nonselective_control]
+figure = "control_hits.rlog_bands_held"
+target = "value == True"
+miss = "value == False"
+lanes = ["local", "s3"]
+judged = true
+
+[row_17_cost_and_breakeven]
+figure = "cost.reported"
+target = "n/a"
+miss = "n/a"
+lanes = ["local", "s3", "hour_ranged"]
+judged = false
