@@ -84,7 +84,12 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   their type and unit, the freshness watermark, the coverage window, and
   the committed row count. That count is summed from commit records, so it
   counts rows before duplicate collapse and before any pending erasure.
-  Logs and traces have no metric families, and the response says why.
+  Logs and traces have no metric families, and the response says why; so
+  does a metrics tenant with no metric metadata record. When the metric
+  metadata read fails, a metrics call fails with the retryable class
+  `unavailable` instead of answering zero families. Retries inside the
+  60-second metadata cache horizon fail the same way; the first call after
+  it starts a reread, and calls succeed once a read of the record does.
 
 ### Find labels
 

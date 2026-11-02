@@ -1533,6 +1533,117 @@ mod with_mcp {
     }
 
     /// `ravel_describe_data` through `POST /mcp` on the shipping start path,
+    /// over a metrics tenant whose metadata GET fails every time: the call is
+    /// an `unavailable` failure saying the metadata read failed, not an
+    /// `ok_page` with zero families, and the second call, which the metadata
+    /// cache serves from the failed read without a second GET, fails the
+    /// same way.
+    ///
+    /// FLIP: today's code answers both calls with `ok` and `families_total`
+    /// 0. FLIP: a check on the miss path only (the flag the miss returns, not
+    /// the cached entry) answers the second call with `ok`.
+    #[tokio::test]
+    async fn describe_data_fails_unavailable_on_a_failed_metadata_read() {
+        use ravel_object_store::fault::{FaultKind, Rule, ScriptedFault};
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Transient("injected".into()))
+                .with_key_contains("/m/meta")
+                .with_occurrence(Occurrence::Always),
+        );
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        publish_sample(fault.inner(), 1, 1).await;
+        write_families(fault.inner(), &["up".to_string()]).await;
+        let metrics = Arc::new(ravel_object_store::StoreMetrics::default());
+        let running = start_server(
+            Arc::clone(&fault) as Arc<dyn ObjectStoreBackend>,
+            metrics,
+            mcp_on(),
+        )
+        .await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+        assert_eq!(fault.fault_count(Op::Get, FaultKind::Transient), 0);
+
+        for (call_index, expected_faults) in [(1, 1), (2, 1)] {
+            let (is_error, envelope) = call(
+                &client,
+                "ravel_describe_data",
+                serde_json::json!({"signal": "metrics"}),
+            )
+            .await;
+            assert_eq!(is_error, Some(true), "call {call_index}: {envelope}");
+            assert_eq!(envelope["status"], serde_json::json!("error"), "{envelope}");
+            assert_eq!(
+                envelope["failure"]["class"],
+                serde_json::json!("unavailable"),
+                "call {call_index}: {envelope}"
+            );
+            let message = envelope["failure"]["message"]
+                .as_str()
+                .expect("the failure carries a message");
+            assert!(
+                message.contains("metadata read failed"),
+                "call {call_index}: {message:?}"
+            );
+            assert_eq!(
+                fault.fault_count(Op::Get, FaultKind::Transient),
+                expected_faults,
+                "call {call_index}: the metadata fault fired once, on the miss"
+            );
+        }
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// `ravel_describe_data` through `POST /mcp` over a metrics tenant with
+    /// no metadata record answers `ok` with no families and says why in
+    /// `warnings`.
+    ///
+    /// FLIP: treating an absent record as a failed read answers an
+    /// `unavailable` failure. FLIP: dropping the no-record reason leaves
+    /// `warnings` without the `families:` line.
+    #[tokio::test]
+    async fn describe_data_answers_an_absent_metadata_record_with_its_reason() {
+        let (store, metrics) = instrumented_memory();
+        publish_sample(store.as_ref(), 1, 1).await;
+        let running = start_server(Arc::clone(&store), metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let (is_error, page) = call(
+            &client,
+            "ravel_describe_data",
+            serde_json::json!({"signal": "metrics"}),
+        )
+        .await;
+        assert_eq!(is_error, Some(false), "{page}");
+        assert_eq!(page["status"], serde_json::json!("ok"), "{page}");
+        assert!(family_names(&page).is_empty(), "{page}");
+        assert_eq!(
+            page["data"]["rows"][0][2]["families_total"],
+            serde_json::json!(0),
+            "{page}"
+        );
+        assert!(
+            page["warnings"]
+                .as_array()
+                .expect("warnings")
+                .iter()
+                .any(|w| w.as_str() == Some("families: the tenant has no metric metadata record")),
+            "{page}"
+        );
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// `ravel_describe_data` through `POST /mcp` on the shipping start path,
     /// over a MemoryStore tenant with 250 metric families: three pages of
     /// 100, 100, and 50, each later page redeeming the cursor the one before
     /// it returned.

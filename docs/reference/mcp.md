@@ -461,7 +461,18 @@ name in byte order (`Zeta` sorts before `alpha`). The `table` row is on
 page one only. `committed_rows` is summed from commit records, so it
 counts rows before duplicate collapse and before any pending erasure.
 Logs and traces have no metric families, and give the reason in
-`families_absent_reason` and in `warnings`.
+`families_absent_reason` and in `warnings`. So does a metrics tenant with
+no metric metadata record: the reason is `the tenant has no metric metadata
+record`.
+
+A metrics call whose metric metadata read failed is not an empty page. It
+fails with class `unavailable`, which is retryable, and a message saying
+the metric metadata read failed. The server caches the outcome of that
+read per tenant for a 60-second refresh horizon, so a retry inside the
+horizon fails the same way without reading the store again. The first
+call after the horizon starts a background reread and still fails; once a
+read of the record succeeds, calls answer the families. Logs and traces
+do not read the metric metadata record and are unaffected.
 
 The order is keyset, `scope.order_by` `["kind", "name"]`: the cursor's
 position is the last served row's kind and name, and the next page
