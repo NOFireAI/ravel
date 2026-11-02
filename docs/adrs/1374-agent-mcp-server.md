@@ -633,7 +633,9 @@ gives it its own bound.
    which stays under the 256 KiB floor. A cursor over its bound is a
    server defect, not a client-visible degradation: the envelope reports
    it as an `internal` failure rather than silently paging without a
-   cursor.
+   cursor. `ravel_query_sql` narrows this for a cursor the page's own order
+   values put over the bound (the query-sql amendment at the end of this
+   file).
 3. Evidence references are unchanged: each pins one row's segment with a
    `SegmentPin`, and the pin-codec reuse of D9 stays for them.
 4. The shipped cursor codec (segment enumeration) is replaced by the
@@ -985,7 +987,8 @@ Only the entry points that read a single snapshot keep the one-table
 rule (`refuse_cross_signal` in `crates/ravel-sql/src/executor.rs`). The
 MCP adapter calls the HTTP-path executor, so `ravel_query_sql` admits a
 join; ADR-2904's #2915 amendment records that the one-table refusal
-decision 9 promised for the MCP tools is owed by whoever ships them.
+decision 9 promised for the MCP tools is owed by whoever ships them. The
+query-sql amendment below ships `ravel_query_sql` with that refusal.
 
 ## Amendment (2026-11-02): a Parquet explain names its unbounded figures and does not refuse
 
@@ -1033,9 +1036,11 @@ exceed, not their sum.
 Shipping the explain changed its catalog description to name SQL only, and
 `ravel_find_labels` no longer declares `evidence_ref` (2026-09-13 item 2).
 `tools/list` was then 15,648 bytes with the nine tools and 23,537 bytes
-with all fifteen. Since the committed row count amendment below it is
-15,652 bytes with the nine tools and 23,541 bytes with all fifteen, against
-the 24,576-byte budget; both figures are pinned in
+with all fifteen. Since the committed row count amendment below it was
+15,652 bytes with the nine tools and 23,541 bytes with all fifteen, and
+since the query-sql amendment below it is 15,733 bytes with the nine tools
+and 23,622 bytes with all fifteen, against the 24,576-byte budget; both
+figures are pinned in
 `crates/ravel-mcp/src/catalog.rs` and
 `services/ravel-server/tests/mcp_agents_e2e.rs`.
 
@@ -1104,7 +1109,8 @@ it.
    pinned predicates. Their size grows with the number of predicates the
    minting resolve reported pending and with their matchers' lengths, and
    `ravel-mcp` bounds neither. A cursor they push over its bound is still
-   the `internal` failure of the 2026-09-09 amendment, item 2.
+   the `internal` failure of the 2026-09-09 amendment, item 2, except on
+   `ravel_query_sql` (the query-sql amendment below).
 5. The token fields that grow with tenant data, with their bounds. The
    pending erasure predicates are item 4. The keyset position is a kind tag
    and one name: an indexed key is at most 128 bytes
@@ -1114,7 +1120,8 @@ it.
    watermark holds one token per shard but is empty for every tool, as the
    2026-09-12 amendment, item 4, records. The `ORDER BY` and the tool name
    are constants of the minting tool, and every other field has a fixed
-   size.
+   size. That describes `ravel_describe_data`'s position; the query-sql
+   amendment below adds `ravel_query_sql`'s, a typed tuple of row values.
 
 ## Amendment (2026-11-02, #3664): the committed row count amendment, `ravel_describe_data` reports its row count as an upper bound
 
@@ -1181,3 +1188,69 @@ too. No MCP tool serves SQL yet, so no caller saw the earlier behavior.
    draft kept the set it was built with, and only the caller's convention
    kept the two equal. `ravel_describe_data` passes the set its resolve
    observed, the one it confirmed.
+
+## Amendment (2026-11-02, #3683): the query-sql amendment, `ravel_query_sql` ships, and a page with no cursor position ends bounded
+
+<!-- amendment-applies: sections="Consequences|Amendment (2026-11-01, ADR-2904): a SQL statement may name several tables|Amendment (2026-11-02): a Parquet explain names its unbounded figures and does not refuse|Amendment (2026-11-02, #3657): the declared-set digest amendment, a cursor pins a digest of the declared column set" pointer="query-sql amendment" -->
+
+`ravel_query_sql` is served (`crates/ravel-mcp/src/tools/query_sql.rs`),
+the sixth tool body. It keeps D2, D3 and D5 as written, and records here
+the choices they leave open and the one place it departs.
+
+1. The statement is checked from its text before any backend call, in
+   this order: `ravel_sql::refuse_several_tables` (the one-table refusal
+   ADR-2904's #2915 amendment says the MCP tools owe; `invalid_argument`
+   with a `split_the_statement` next step), `ravel_sql::validate_query` (a
+   write or any other non-query statement is `unsupported`, any other
+   failure `validation`), then `ravel_sql::plan_page`. A planner refusal is
+   `invalid_argument` naming the planner's reason, with a
+   `rewrite_the_statement` next step. That includes a float `ORDER BY`
+   term (`OrderTermNotRepresentable`): the statement as written cannot be
+   paged without losing rows after a NaN, and ordering by another column
+   pages the same rows, so it is the caller's argument to change. The one
+   planner answer that is not a refusal is `NoOrdering`, a statement with
+   no `ORDER BY` over a table with no row identity. It runs as written,
+   unpaged, and a capped result is `ok_bounded` with no cursor and an
+   `add_an_order_by` next step.
+2. `time_range` is required and is applied as a half-open row filter
+   (`SqlRequest::row_window`), as the D2 row says. The executor's row cap
+   is the effective `max_rows`, so it returns the D3 `k + 1` row. Under a
+   total order the page keeps `k` rows and resumes after the last one;
+   under an order that is not total D5's equal-group rule applies, with
+   group equality compared on the typed order values, floats by bit
+   pattern.
+3. The keyset position is a typed tuple: the last kept row's value for
+   each effective `ORDER BY` term, read from the result's Arrow arrays
+   rather than from the rendered cells, encoded by
+   `crates/ravel-mcp/src/resume_tuple.rs`, beside the rendered effective
+   `ORDER BY`. The port's `QueryBackend::sql_execute` takes the order
+   column names and the draft carries each row's tuple
+   (`Draft::order_tuples`). The argument hash covers the statement, the
+   window and the effective `max_rows`; a cursor presented with another of
+   any of them, or whose position names another `ORDER BY`, does not
+   decode, or has another arity or a non-finite value, is
+   `cursor_invalid`. A later page redeems, re-plans with the position,
+   resolves at the cursor's mint instant while its audit record and
+   redemption deadline use the call's own clock (the resolve-instant
+   amendment), and confirms before it reports rows.
+4. The departure. The 2026-09-09 amendment, item 2, makes a cursor over
+   its 4 KiB bound an `internal` failure, because the fields it then
+   carried came from the server and the tenant's catalog, never from a
+   row's values. This
+   tool's position is a row's own values, and a `Str` or `Binary` order
+   column of a few KiB puts the cursor over the bound on data the caller
+   chose to order by. So on `ravel_query_sql` a cursor over the bound,
+   whatever field put it there, is not minted: the page is `ok_bounded`
+   with no cursor, a `no cursor:` warning naming the length, and a
+   `narrow_time_range` next step. Two more boundaries end the same way: a
+   last row whose order values could not be read, and an order value that
+   is NaN or infinite. The planner refuses every float term, so the second
+   is reached only through a value the backend reads under a type the
+   planner did not foresee. Every other tool keeps item 2 as written.
+5. `evidence_ref` stays in the input schema and is refused as
+   `unsupported`; this build mints no evidence reference for a SQL row.
+6. Serving the tool moves the served count from five to six and the
+   catalogued count from four to three. The `evidence_ref` field
+   description moves `tools/list` from 15,652 to 15,733 bytes with the nine
+   tools and from 23,541 to 23,622 bytes with all fifteen, under the
+   24,576-byte budget.

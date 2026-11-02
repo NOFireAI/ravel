@@ -448,6 +448,7 @@ impl QueryBackend for ServiceBackend {
         tenant_hash: TenantHash,
         request: &ravel_sql::SqlRequest,
         resolve_at_ns: i64,
+        order_columns: &[String],
     ) -> Result<Draft, Failure> {
         let outcome = self
             .service
@@ -460,6 +461,11 @@ impl QueryBackend for ServiceBackend {
             outcome.signal_tables_named,
             outcome.reads_parquet,
         );
+        let order_tuples = if order_columns.is_empty() {
+            Vec::new()
+        } else {
+            outcome.output.resume_tuples(order_columns)
+        };
         Ok(Draft::new(
             envelope,
             signal,
@@ -467,7 +473,8 @@ impl QueryBackend for ServiceBackend {
             outcome.declared_columns,
             outcome.ingest_watermark_hour,
             resolve_at_ns,
-        ))
+        )
+        .with_order_tuples(order_tuples))
     }
 
     async fn trace_lookup(
