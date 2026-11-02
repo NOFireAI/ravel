@@ -528,7 +528,8 @@ that carries only that module and no `arrow-flight` dependency. Both
 `flight-sql` and `mcp` enable `pin-codec`. A CI build check compiles
 `ravel-server` with `sql,mcp` and without `flight-sql`, so an `mcp` build
 never depends on Flight. The published image builds
-`sql,flight-sql,otap,mcp`. The operator needs no new Service port. The flag
+`sql,flight-sql,otap,agents,mcp`; `agents` arrived with ADR-3331. The operator
+needs no new Service port, and no `RavelCluster` field sets `--mcp` yet. The flag
 `--mcp` is off by default. `--mcp-allowed-origins` is required when `--mcp`
 is set on a non-loopback listener, or startup fails. The server serves
 protocol revisions `2026-07-28` and `2025-11-25`. The new external

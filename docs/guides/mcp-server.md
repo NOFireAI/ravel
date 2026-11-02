@@ -15,6 +15,11 @@ which has its own guide: [Ravel Agents](agents.md).
 > describe the surface as designed. The [MCP reference](../reference/mcp.md)
 > carries the split `ravel_capabilities` reports at runtime.
 
+The published image built from `main` compiles in the `mcp` feature, so with
+that image you only pass `--mcp`. `--mcp` is a process flag, and no
+`RavelCluster` field sets it, so query pods the operator manages do not serve
+`POST /mcp` today. See [Running Ravel on Kubernetes](kubernetes.md).
+
 ## What agents get
 
 The Model Context Protocol (MCP) surface gives an agent host four things over

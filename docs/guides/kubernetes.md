@@ -1190,6 +1190,11 @@ in the observability guide for the full metric and site list.
 The kind environment is a development tool. A real cluster differs in these
 ways:
 
+- The published image compiles in the MCP server, which would answer
+  `POST /mcp` on the query port with no new Service port, but it mounts only
+  with the `--mcp` process flag. No `RavelCluster` field sets that flag, so
+  query pods the operator manages do not serve it. See the
+  [MCP guide](mcp-server.md).
 - Point `spec.storage.s3.endpoint` at real S3 (or omit it) and supply real
   credentials in the Secret.
 - Bucket lifecycle is the platform owner's job. The operator provisions no
