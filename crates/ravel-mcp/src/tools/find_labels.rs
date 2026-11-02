@@ -164,11 +164,12 @@ fn plan(args: Value, ctx: &ToolContext<'_>) -> Result<Plan, Refusal> {
 }
 
 /// Filter, then cap: the order that keeps a page complete for its filter.
-/// The page cap is `max_response_bytes` alone: this tool advertises no
-/// `max_rows`. Rows that do not fit are counted in
-/// `presentation.rows_omitted` with `bytes_cap_hit`, and `data.row_count` is
-/// the full match count.
+/// The page cap is `max_response_bytes` alone, so `presentation.max_rows` is
+/// 0, the value a tool that applies no row cap reports. Rows that do not fit
+/// are counted in `presentation.rows_omitted` with `bytes_cap_hit`, and
+/// `data.row_count` is the full match count.
 fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Envelope {
+    envelope.presentation.max_rows = 0;
     if let Some(filter) = &plan.filter {
         envelope.data.rows.retain(
             |row| matches!(row.first(), Some(Cell::Str(text)) if text.contains(filter.as_str())),
@@ -187,7 +188,9 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Envelop
 }
 
 /// What the list is, stated once per response: which mode ran and what the
-/// list claims.
+/// list claims. The request sends `allow_partial: false`, so partial
+/// coverage is refused before this runs and every answered list is complete
+/// for its window.
 fn basis(mode: &Mode) -> String {
     let what = match mode {
         Mode::Names => "label names of the series the selector matches".to_string(),
@@ -196,10 +199,7 @@ fn basis(mode: &Mode) -> String {
         }
         Mode::Values { name, .. } => format!("values of label {name}"),
     };
-    format!(
-        "{what}, observed from data over the window, not a declared set; complete for \
-         the window unless coverage.partial is true"
-    )
+    format!("{what}, observed from data over the window, not a declared set")
 }
 
 fn api_failure(error: ApiError) -> Failure {
@@ -259,6 +259,9 @@ mod tests {
         envelope.data.row_count = values.len() as u64;
         envelope.coverage.complete = true;
         envelope.accuracy.exact = true;
+        // The server's metadata envelope arrives carrying the effective
+        // `max_rows`, 200 by default.
+        envelope.presentation.max_rows = 200;
         envelope
     }
 
@@ -359,11 +362,14 @@ mod tests {
     /// 40,000 values alternate `db_` and `api_`, the 20,000 matches overflow
     /// the 256 KiB floor, and the page is a prefix of the matches whose
     /// length plus `presentation.rows_omitted` is the match count, with
-    /// `bytes_cap_hit` set. `max_rows` is 1 and cuts nothing.
+    /// `bytes_cap_hit` set. `max_rows` is 1 and cuts nothing, and the
+    /// envelope reports `presentation.max_rows` as 0.
     ///
     /// FLIP: capping first fits a prefix of all 40,000 values, so the page
     /// is about half as long and its length plus `rows_omitted` is not
     /// 20,000; applying `max_rows` leaves one row.
+    /// FLIP: leaving the backend's `presentation.max_rows` in place reports
+    /// 200, a page bound that did not apply.
     #[test]
     fn the_filter_runs_before_the_page_cap() {
         let values: Vec<String> = (0..20_000)
@@ -390,6 +396,7 @@ mod tests {
         assert!(page.len() > 1);
         assert!(envelope.presentation.bytes_cap_hit);
         assert!(!envelope.presentation.row_cap_hit);
+        assert_eq!(envelope.presentation.max_rows, 0);
         assert_eq!(
             page.len() as u64 + envelope.presentation.rows_omitted,
             20_000
@@ -435,6 +442,8 @@ mod tests {
     /// FLIP: routing a selector-only call to `label_values`, or computing
     /// `include_log_metric_names` as false for a bare `__name__`, fails the
     /// recorded call.
+    /// FLIP: a basis that still ends with a `coverage.partial` caveat, which
+    /// no answered list can trigger, fails the warning assertion.
     #[test]
     fn the_arguments_choose_the_mode_and_the_response_names_it() {
         for (args, call_shape, basis) in [
@@ -470,7 +479,7 @@ mod tests {
             assert_eq!(metadata[0].1, call_shape, "{args}");
             assert!(
                 envelope.warnings.iter().any(|w| w.starts_with(basis)
-                    && w.ends_with("complete for the window unless coverage.partial is true")),
+                    && w.ends_with("observed from data over the window, not a declared set")),
                 "{args}: {:?}",
                 envelope.warnings
             );
