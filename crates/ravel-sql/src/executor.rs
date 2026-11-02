@@ -551,6 +551,9 @@ struct Resolved {
     unfolded_segments_resolved: u64,
     target: TargetSignal,
     parquet: Option<ParquetResolution>,
+    /// How many signal tables the statement names, before a statement naming
+    /// none is given the default `samples` lane.
+    signal_tables_named: usize,
 }
 
 /// One signal's snapshot within a [`Resolved`] statement.
@@ -1554,6 +1557,11 @@ pub struct SqlOutcome {
     /// with signal tables. A Parquet table is resolved from its manifest, not
     /// from a signal snapshot, so no cursor pin covers it.
     pub reads_parquet: bool,
+    /// How many signal tables the statement names in its text. Zero for a
+    /// statement naming none, which [`Self::signals`] still reports as the
+    /// default `samples` lane it resolved: that lane is not a table the
+    /// statement read, so no cursor pin may rest on it.
+    pub signal_tables_named: usize,
 }
 
 /// The warning a `samples` statement carries when its answer omits the
@@ -2386,6 +2394,7 @@ impl SqlExecutor {
             let estimate = resolved.estimate;
             let target = resolved.target;
             let unfolded_segments_resolved = resolved.unfolded_segments_resolved;
+            let signal_tables_named = resolved.signal_tables_named;
             let (lanes, parquet) = resolved.into_snapshots();
             // Read off this attempt's snapshots, before they are moved into
             // `attempt`, so they describe the snapshots the returned rows were
@@ -2528,6 +2537,7 @@ impl SqlExecutor {
                         pending_erasure,
                         ingest_watermark_hour,
                         reads_parquet,
+                        signal_tables_named,
                     });
                 }
                 Err(err) => match retry_decision(err.is_segment_not_found(), emitted, attempt) {
@@ -3676,6 +3686,7 @@ impl SqlExecutor {
                     unfolded_segments_resolved: 0,
                     target: TargetSignal::Parquet,
                     parquet,
+                    signal_tables_named: 0,
                 });
             }
         }
@@ -3803,6 +3814,7 @@ impl SqlExecutor {
             unfolded_segments_resolved,
             target,
             parquet,
+            signal_tables_named: tables.signals.len(),
         })
     }
 
