@@ -8,7 +8,7 @@
 
 #![allow(clippy::expect_used)]
 
-use ravel_sql::{SqlError, refuse_several_tables};
+use ravel_sql::{SqlError, refuse_several_tables, validate_query};
 
 fn refused(sql: &str) -> SqlError {
     refuse_several_tables(sql).expect_err(sql)
@@ -106,5 +106,21 @@ fn one_table_or_none_is_admitted() {
     ] {
         refuse_several_tables(sql)
             .unwrap_or_else(|err| panic!("{sql:?} names one table or none: {err:?}"));
+    }
+}
+
+/// The check answers for query statements only, so it admits these and
+/// `validate_query` is what refuses them. A tool body must call both.
+#[test]
+fn a_statement_that_is_not_a_query_is_left_to_validate_query() {
+    for sql in [
+        "INSERT INTO logs SELECT * FROM spans",
+        "EXPLAIN SELECT * FROM logs JOIN spans ON logs.trace_id = spans.trace_id",
+    ] {
+        refuse_several_tables(sql).unwrap_or_else(|err| panic!("{sql:?} is not a query: {err:?}"));
+        assert!(
+            validate_query(sql).is_err(),
+            "{sql:?} must be refused by validate_query"
+        );
     }
 }

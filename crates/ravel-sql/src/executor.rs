@@ -309,6 +309,10 @@ pub(crate) fn refuse_cross_signal(tables: &StatementTables) -> Result<(), SqlErr
 /// a subquery or a CTE body counts; a CTE name does not, and one table read
 /// twice is one table. Text that does not parse, and the shadowed-name and
 /// table-count refusals, are [`SqlExecutor::statement_tables`]'s errors.
+///
+/// This answers only for a read-only query statement and does not replace
+/// `validate_query`: a statement that is not a top-level query, such as
+/// `INSERT` or `EXPLAIN`, names no table here and is admitted.
 pub fn refuse_several_tables(sql: &str) -> Result<(), SqlError> {
     let tables = SqlExecutor::statement_tables(sql)?;
     refuse_cross_signal(&tables)?;

@@ -258,7 +258,8 @@ not guaranteed for a join; see the #2915 amendment below.
   one `signal` and its snapshot identity hashes one signal, so when it
   ships it refuses a multi-table statement with `CrossSignalQuery` before
   any listing. Nothing in the MCP adapter makes that refusal yet; see the
-  #2915 amendment below.
+  #2915 amendment below. A second table that is not a signal table refuses
+  with a different error; see the one-table check amendment below.
 
 ### 10. Flight SQL carries one segment group per signal
 
@@ -500,3 +501,22 @@ total. No production path installs a distributed scan on those four tables
 today; only `samples` has a production distributed caller.
 
 Refs: #1409
+
+## Amendment (issue #3620): the MCP one-table check has two refusals
+
+<!-- amendment-applies: sections="9. What keeps the one-table rule" pointer="one-table check amendment" -->
+
+Decision 9 names `CrossSignalQuery` as the refusal the MCP SQL tools owe. That
+error's text names only the five signal tables, so it would misdescribe a
+statement whose second table is not one of them. `ravel_sql::refuse_several_tables`,
+the check those tools will call, therefore has two refusals. Two or more signal
+tables are `CrossSignalQuery`. A signal table beside a Parquet table, or two
+Parquet tables, are `SqlError::OneTablePerStatement`. Its text echoes no table
+name and points at `POST /api/v1/sql` and Flight SQL.
+
+The check answers only for a read-only query statement, and it does not replace
+`validate_query`: it finds no tables in a statement that is not a top-level
+query, such as `INSERT` or `EXPLAIN`, and admits it, and `validate_query` then
+refuses that statement.
+
+Refs: #3620

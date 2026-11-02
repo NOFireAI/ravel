@@ -4531,7 +4531,11 @@ ORDER BY samples.ts
   and refuses a statement naming two or more signal tables with
   `SqlError::CrossSignalQuery` before any catalog listing. Paging (`page_plan`) refuses such a
   statement, and one naming a signal table beside any other table, with
-  `PagePlanError::CrossSignal`.
+  `PagePlanError::CrossSignal`. The MCP SQL tools' check,
+  `ravel_sql::refuse_several_tables`, refuses two or more signal tables with
+  `SqlError::CrossSignalQuery` and any other second table, including a second
+  Parquet table, with `SqlError::OneTablePerStatement`. No shipped MCP tool
+  calls it yet.
 
 Schema (fixed columns plus one map):
 
