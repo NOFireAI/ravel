@@ -39,7 +39,7 @@ connection: `ravel.1` held each response's body until the client acknowledged
 its head, which added a 40 ms delayed-ACK stall to every query that touched
 storage. `ravel.3` is `ravel.2` plus atomic conditional writes: `ravel.2`
 checked `If-None-Match` and `If-Match` before streaming the body and published
-the body and its checksum sidecar separately, so concurrent conditional
+the body and its two sidecars separately, so concurrent conditional
 writers could each succeed and a body could be left beside another write's
 stored checksum. Figures measured on one release are not compared with
 figures measured on another. The ClickBench entry still runs `ravel.1`.
