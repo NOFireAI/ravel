@@ -1158,6 +1158,87 @@ mod tests {
         );
     }
 
+    /// Issue #3653: while a tenant's provisioning record cannot be read, the
+    /// router reads it at most once per backoff window, refuses every write in
+    /// between without a GET, reads again once the window passes, and routes,
+    /// with the backoff entry gone, once a read succeeds. The failure counter
+    /// counts GETs, not refused writes.
+    #[tokio::test]
+    async fn failed_provisioning_read_is_retried_once_per_backoff_window() {
+        use ravel_object_store::fault::{FaultKind, Op};
+
+        const NS_PER_SEC: i64 = 1_000_000_000;
+        const K: u64 = 5;
+        let t = TenantId::new("acme").hash();
+        let key = ravel_catalog::provisioning_key(&t, ravel_types::Signal::Spans);
+        let store = crate::read_backoff::failing_then_passing_get_store(&key, 2);
+        let router = SpanIngestRouter::new(
+            IngestConfig {
+                shard_count: 4,
+                ..IngestConfig::default()
+            },
+            store.clone(),
+            Arc::new(ManualClock::new(BASE_NS)),
+            Arc::new(crate::pending_ack::PendingAckBudget::new(0)),
+        );
+        let t0 = BASE_NS + 10 * NS_PER_HOUR;
+
+        for _ in 0..K {
+            assert!(matches!(
+                router.active_set(t, t0).await,
+                Err(SpanWriteError::StaleProvisioningView)
+            ));
+        }
+        assert_eq!(store.sequence_progress(0), 1, "one GET in the first window");
+        assert!(matches!(
+            router.active_set(t, t0 + NS_PER_SEC - 1).await,
+            Err(SpanWriteError::StaleProvisioningView)
+        ));
+        assert_eq!(
+            store.sequence_progress(0),
+            1,
+            "no GET before the window ends"
+        );
+
+        let t1 = t0 + NS_PER_SEC;
+        for _ in 0..K {
+            assert!(matches!(
+                router.active_set(t, t1).await,
+                Err(SpanWriteError::StaleProvisioningView)
+            ));
+        }
+        assert_eq!(
+            store.sequence_progress(0),
+            2,
+            "one more GET after the window"
+        );
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 2);
+        assert_eq!(
+            router
+                .switch
+                .read_backoff_entry(t)
+                .expect("still backing off")
+                .retry_at_ns(),
+            t1 + 2 * NS_PER_SEC,
+            "the second consecutive failure doubles the window"
+        );
+
+        let t2 = t1 + 2 * NS_PER_SEC;
+        assert!(
+            router.active_set(t, t2).await.is_ok(),
+            "the fault has cleared and the record reads back"
+        );
+        assert_eq!(store.sequence_progress(0), 3);
+        assert_eq!(router.switch.read_backoff_entry(t), None);
+        let snapshot = router.metrics().snapshot();
+        assert_eq!(
+            snapshot.provisioning_read_failures_store, 2,
+            "one per failed GET, not per refused write"
+        );
+        assert_eq!(snapshot.provisioning_read_failures_decode, 0);
+        assert_eq!(snapshot.stale_provisioning_flushes, 2 * K + 1);
+    }
+
     /// Staleness fail-closed, with the bounded grace window:
     /// once the router's cached view for a tenant ages past `C`, the router
     /// re-reads the provisioning record before routing; if that re-read

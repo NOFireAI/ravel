@@ -1370,6 +1370,175 @@ mod tests {
         assert_eq!(decoded.sample_count, 1);
     }
 
+    async fn buffered_write(
+        router: &IngestRouter,
+        tenant: &TenantId,
+        ts_ns: i64,
+    ) -> Result<WriteReceipt, WriteError> {
+        router
+            .write(
+                tenant.clone(),
+                vec![test_point(tenant, "cpu", ts_ns, 1.0)],
+                WriteMode::Buffered,
+                Duration::from_secs(5),
+            )
+            .await
+    }
+
+    const NS_PER_SEC: i64 = 1_000_000_000;
+
+    /// Issue #3653: while a tenant's provisioning record cannot be read, the
+    /// router reads it at most once per backoff window, refuses every write in
+    /// between with `StaleProvisioningView` without a GET, reads again once the
+    /// window passes, and routes, with the backoff entry gone, once a read
+    /// succeeds. The failure counter counts GETs, not refused writes.
+    #[tokio::test]
+    async fn failed_provisioning_read_is_retried_once_per_backoff_window() {
+        use ravel_object_store::fault::{FaultKind, Op};
+
+        let tenant = TenantId::new("acme");
+        let key = ravel_catalog::provisioning_key(&tenant.hash(), Signal::Metrics);
+        let store = crate::read_backoff::failing_then_passing_get_store(&key, 2);
+        let base_hour = crate::config::MIN_PLAUSIBLE_INGEST_CLOCK_NS / NS_PER_HOUR + 10;
+        let t0 = base_hour * NS_PER_HOUR;
+        let clock = Arc::new(FrozenClock(AtomicI64::new(t0)));
+        let router = IngestRouter::new(
+            IngestConfig {
+                shard_count: 4,
+                ..IngestConfig::default()
+            },
+            store.clone(),
+            Signal::Metrics,
+            clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
+        );
+        const K: u64 = 5;
+
+        // First window: K refused writes, one GET.
+        for _ in 0..K {
+            let err = buffered_write(&router, &tenant, t0)
+                .await
+                .expect_err("an unread record refuses the write");
+            assert!(matches!(err, WriteError::StaleProvisioningView), "{err:?}");
+        }
+        assert_eq!(store.sequence_progress(0), 1, "one GET in the first window");
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
+        let entry = router
+            .switch
+            .read_backoff_entry(tenant.hash())
+            .expect("a failed read arms the backoff");
+        assert_eq!(entry.retry_at_ns(), t0 + NS_PER_SEC);
+
+        // The last nanosecond of the window still issues no GET.
+        clock.0.store(t0 + NS_PER_SEC - 1, Ordering::SeqCst);
+        buffered_write(&router, &tenant, t0)
+            .await
+            .expect_err("still inside the window");
+        assert_eq!(store.sequence_progress(0), 1);
+
+        // Past the window: exactly one more GET, which fails and doubles the
+        // window to 2 s.
+        let t1 = t0 + NS_PER_SEC;
+        clock.0.store(t1, Ordering::SeqCst);
+        for _ in 0..K {
+            let err = buffered_write(&router, &tenant, t1)
+                .await
+                .expect_err("the second read fails too");
+            assert!(matches!(err, WriteError::StaleProvisioningView), "{err:?}");
+        }
+        assert_eq!(
+            store.sequence_progress(0),
+            2,
+            "one more GET after the window"
+        );
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 2);
+        assert_eq!(
+            router
+                .switch
+                .read_backoff_entry(tenant.hash())
+                .expect("still backing off")
+                .retry_at_ns(),
+            t1 + 2 * NS_PER_SEC
+        );
+
+        // The fault has cleared; once the window passes the next write reads,
+        // routes, and the backoff entry is gone.
+        let t2 = t1 + 2 * NS_PER_SEC;
+        clock.0.store(t2, Ordering::SeqCst);
+        buffered_write(&router, &tenant, t2)
+            .await
+            .expect("the record reads back and the write routes");
+        assert_eq!(store.sequence_progress(0), 3);
+        assert_eq!(router.switch.read_backoff_entry(tenant.hash()), None);
+
+        let snapshot = router.metrics_snapshot();
+        assert_eq!(
+            snapshot.provisioning_read_failures_store, 2,
+            "one per failed GET, not per refused write"
+        );
+        assert_eq!(snapshot.provisioning_read_failures_decode, 0);
+        assert_eq!(snapshot.stale_provisioning_flushes, 2 * K + 1);
+    }
+
+    /// Issue #3653: the backoff does not take away the grace window. A tenant
+    /// with a cached view inside its grace horizon keeps routing while its
+    /// record cannot be read, with one GET per backoff window, and idle
+    /// eviction removes the backoff entry.
+    #[tokio::test]
+    async fn backoff_still_routes_inside_the_grace_window() {
+        use ravel_object_store::fault::{FaultKind, Op};
+
+        let tenant = TenantId::new("acme");
+        let key = ravel_catalog::provisioning_key(&tenant.hash(), Signal::Metrics);
+        let store = crate::read_backoff::failing_then_passing_get_store(&key, 8);
+        let base_hour = crate::config::MIN_PLAUSIBLE_INGEST_CLOCK_NS / NS_PER_HOUR + 10;
+        let t0 = base_hour * NS_PER_HOUR;
+        let clock = Arc::new(FrozenClock(AtomicI64::new(t0)));
+        let router = IngestRouter::new(
+            IngestConfig {
+                shard_count: 4,
+                ..IngestConfig::default()
+            },
+            store.clone(),
+            Signal::Metrics,
+            clock.clone(),
+            Arc::new(PendingAckBudget::new(0)),
+        );
+        router.refresh_generations(
+            tenant.hash(),
+            vec![ShardGeneration {
+                generation: 0,
+                shard_count: 4,
+                activation_hour: 0,
+                appended_unix_ns: 0,
+            }],
+            t0,
+        );
+        let stale = t0 + DEFAULT_REFRESH_INTERVAL_NS + 1;
+        clock.0.store(stale, Ordering::SeqCst);
+        const K: u64 = 4;
+        for _ in 0..K {
+            buffered_write(&router, &tenant, stale)
+                .await
+                .expect("inside the grace horizon the write routes");
+        }
+        assert_eq!(store.sequence_progress(0), 1, "one GET in the window");
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
+        let snapshot = router.metrics_snapshot();
+        assert_eq!(snapshot.grace_extended_stale_flushes, K);
+        assert_eq!(snapshot.stale_provisioning_flushes, 0);
+        assert_eq!(snapshot.provisioning_read_failures_store, 1);
+        assert!(router.switch.read_backoff_entry(tenant.hash()).is_some());
+
+        let ttl = 60 * NS_PER_SEC;
+        router.evict_idle_generation_views(stale + ttl + 1, ttl);
+        assert_eq!(
+            router.switch.read_backoff_entry(tenant.hash()),
+            None,
+            "idle eviction removes the backoff entry"
+        );
+    }
+
     /// ADR-1702 task 9: a gated encode that panics, or that the gate cancels,
     /// fails its flush with the retryable `ShardUnavailable` an encode panic
     /// gave before the gate, not the client-fault `SegmentBuild`. Nothing is

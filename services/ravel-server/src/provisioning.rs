@@ -821,4 +821,66 @@ mod tests {
         let decoded = sysproto::ProvisioningRecord::decode(record.data.as_ref()).expect("decode");
         assert_eq!(decoded.shard_count, 4);
     }
+
+    /// Issue #3653: after `ensure` fails open on a store error, requests for
+    /// the same (tenant, signal) inside the backoff window return `Ok` with no
+    /// store read; one after the window reads again, and a success clears the
+    /// backoff and fills `seen`. Another signal of the same tenant is not
+    /// backed off.
+    #[tokio::test]
+    async fn ensure_backs_off_after_a_store_error() {
+        use ravel_object_store::fault::Sequence;
+
+        const NS_PER_SEC: i64 = 1_000_000_000;
+        let th = TenantId::new("acme").hash();
+        let key = provisioning_key(&th, Signal::Metrics);
+        let mut sequence = Sequence::new(Op::Get)
+            .with_key_contains(key)
+            .then_fault(ScriptedFault::Transient("unreadable".into()))
+            .then_fault(ScriptedFault::Transient("unreadable".into()));
+        for _ in 0..8 {
+            sequence = sequence.then_passthrough();
+        }
+        let store = Arc::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_sequence(sequence),
+        ));
+        let writer = ProvisioningRecordWriter::new(store.clone(), 4);
+        let t0 = 1_000 * NS_PER_SEC;
+
+        for _ in 0..5 {
+            writer
+                .ensure(&th, Signal::Metrics, t0)
+                .await
+                .expect("a store error fails open");
+        }
+        assert_eq!(store.sequence_progress(0), 1, "one read in the window");
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
+        writer
+            .ensure(&th, Signal::Metrics, t0 + NS_PER_SEC - 1)
+            .await
+            .expect("fails open");
+        assert_eq!(store.sequence_progress(0), 1);
+
+        let t1 = t0 + NS_PER_SEC;
+        for _ in 0..5 {
+            writer
+                .ensure(&th, Signal::Metrics, t1)
+                .await
+                .expect("fails open");
+        }
+        assert_eq!(store.sequence_progress(0), 2, "one read after the window");
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 2);
+
+        let t2 = t1 + 2 * NS_PER_SEC;
+        writer
+            .ensure(&th, Signal::Metrics, t2)
+            .await
+            .expect("the record reads back");
+        assert_eq!(store.sequence_progress(0), 3);
+        assert!(writer.seen.lock().contains(&(th, Signal::Metrics)));
+        assert!(writer.read_backoff.lock().is_empty());
+        writer.ensure(&th, Signal::Metrics, t2).await.expect("seen");
+        assert_eq!(store.sequence_progress(0), 3, "a seen tenant reads nothing");
+    }
 }

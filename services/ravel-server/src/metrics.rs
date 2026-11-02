@@ -18149,6 +18149,184 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         );
     }
 
+    /// Issue #3653: the provisioning read-failure family renders on the real
+    /// `/metrics` handler, read from a real router whose provisioning GET
+    /// failed, with its HELP text, `{mode, signal, cause}` labels and one
+    /// sample per cause, next to the stale-flush family. Three writes refused
+    /// inside one backoff window are three stale flushes and one failed read.
+    #[tokio::test]
+    async fn metrics_handler_renders_provisioning_read_failures_from_a_real_router() {
+        use ravel_catalog::CatalogConfig;
+        use ravel_ingest::{
+            AdmissionLimits, IngestConfig, PendingAckBudget, SystemClock, WriteError, WriteMode,
+        };
+        use ravel_memory::MemoryBudget;
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_types::{Label as SeriesLabel, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
+
+        let tenant = ravel_types::TenantId::new("acme");
+        let key = ravel_catalog::provisioning_key(&tenant.hash(), Signal::Metrics);
+        let store = Arc::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::Transient("unreadable".into()))
+                    .with_key_contains(key),
+            ),
+        ));
+        // A clock frozen at one instant keeps all three writes in the first
+        // backoff window.
+        struct Frozen(i64);
+        impl ravel_ingest::Clock for Frozen {
+            fn now_ns(&self) -> i64 {
+                self.0
+            }
+        }
+        let now = 1_700_000_000_000_000_000;
+        let router = Arc::new(IngestRouter::new(
+            IngestConfig::default(),
+            store.clone(),
+            Signal::Metrics,
+            Arc::new(Frozen(now)),
+            Arc::new(PendingAckBudget::new(0)),
+        ));
+        let labels = LabelSet::new(vec![SeriesLabel {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "cpu".to_string(),
+        }])
+        .expect("labels");
+        let series_id = SeriesId::compute(&tenant, "cpu", &labels).expect("series id");
+        for _ in 0..3 {
+            let err = router
+                .write(
+                    tenant.clone(),
+                    vec![ravel_otlp::NormalizedPoint {
+                        series_id,
+                        labels: Arc::new(labels.clone()),
+                        sample: Sample {
+                            ts_ns: now,
+                            value: 1.0,
+                        },
+                        is_monotonic_sum: false,
+                    }],
+                    WriteMode::Buffered,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+                .expect_err("an unreadable record refuses the write");
+            assert!(matches!(err, WriteError::StaleProvisioningView), "{err:?}");
+        }
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
+        let catalog = Arc::new(
+            Catalog::new(Arc::new(MemoryStore::new()), CatalogConfig::default()).expect("catalog"),
+        );
+
+        let state = MetricsState {
+            mode: Mode::All,
+            store_metrics: Arc::new(StoreMetrics::default()),
+            ingest_router: Some(Arc::clone(&router)),
+            log_ingest_router: None,
+            span_ingest_router: None,
+            catalog,
+            tenant_discovery: None,
+            maintenance_safety: None,
+            maintenance_ownership: None,
+            merge_memory: None,
+            scrub: None,
+            cache_metrics: None,
+            cache_disk_metrics: None,
+            catalog_cache_metrics: None,
+            catalog_cache_disk_metrics: None,
+            admission: Arc::new(AdmissionController::new(
+                Arc::new(SystemClock),
+                AdmissionLimits::default(),
+            )),
+            reconcile_cycle: Arc::new(crate::admission_reconcile::ReconcileCycleMetrics::default()),
+            metrics_tenant_labels: false,
+            metrics_tenant_allowlist: Arc::new(HashSet::new()),
+            query_accounting: Arc::new(QueryAccountingMetrics::new(HashSet::new())),
+            ingest_concurrency: crate::ingest_concurrency::IngestConcurrencyController::shared(
+                crate::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
+            ),
+            ingest_buffer_budget: ravel_ingest::IngestByteBudget::shared(
+                ravel_ingest::IngestByteBudgetLimit::Unlimited,
+            ),
+            distrib: None,
+            #[cfg(feature = "flight-sql")]
+            sql_slice_rejects: None,
+            #[cfg(feature = "flight-sql")]
+            sql_slice_tls_dials: None,
+            #[cfg(feature = "agents")]
+            agents: None,
+            durable_auth: None,
+            ingest_byte_metrics: Arc::new(crate::ingest_byte_metrics::IngestByteMetrics::new()),
+            normalize_reject_metrics: Arc::new(
+                crate::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+            ),
+            metadata_cache: None,
+            cache: None,
+            cache_max_bytes: 0,
+            catalog_cache_max_bytes: 0,
+            audit_pipeline: None,
+            process_memory_budget: Arc::new(MemoryBudget::unlimited()),
+            process_memory_budget_is_fallback: false,
+            cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
+            can_fold: true,
+            fold_loop: Default::default(),
+            refold: Arc::new(crate::fold::RefoldQueue::new(1)),
+            heartbeat: crate::health_listener::Heartbeat::new(Arc::new(SystemClock)),
+            decoded_cache: None,
+        };
+
+        let response = metrics_handler(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8(bytes.to_vec()).expect("metrics body is utf8");
+
+        let help = "# HELP ravel_ingest_provisioning_read_failures_total Provisioning-record \
+                    reads issued by the ingest router that failed, by signal and cause: store \
+                    (the GET failed) or decode (the record did not decode or failed its checked \
+                    read). Counts reads, not refused writes";
+        assert_eq!(body.matches(help).count(), 1, "HELP renders once:\n{body}");
+        assert_eq!(
+            body.matches("# TYPE ravel_ingest_provisioning_read_failures_total counter\n")
+                .count(),
+            1,
+            "{body}"
+        );
+        assert_eq!(
+            body.matches(
+                "ravel_ingest_provisioning_read_failures_total{mode=\"all\",signal=\"metrics\",\
+                 cause=\"store\"} 1\n"
+            )
+            .count(),
+            1,
+            "one failed GET:\n{body}"
+        );
+        assert_eq!(
+            body.matches(
+                "ravel_ingest_provisioning_read_failures_total{mode=\"all\",signal=\"metrics\",\
+                 cause=\"decode\"} 0\n"
+            )
+            .count(),
+            1,
+            "{body}"
+        );
+        assert_eq!(
+            body.matches(
+                "ravel_ingest_stale_provisioning_flushes_total{mode=\"all\",signal=\"metrics\"} \
+                 3\n"
+            )
+            .count(),
+            1,
+            "three refused writes:\n{body}"
+        );
+    }
+
     /// A one-pair queue that has evicted exactly one pair.
     fn refold_queue_with_one_eviction() -> Arc<crate::fold::RefoldQueue> {
         let queue = crate::fold::RefoldQueue::new(1);

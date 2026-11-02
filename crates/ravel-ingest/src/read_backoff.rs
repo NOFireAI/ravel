@@ -169,6 +169,29 @@ impl ProvisioningReadFailures {
     }
 }
 
+/// A store whose GETs of `key` fail with a transient error `faults` times and
+/// then pass through. `sequence_progress(0)` counts every GET of `key`, up to
+/// `faults + 16`.
+#[cfg(test)]
+pub(crate) fn failing_then_passing_get_store(
+    key: &str,
+    faults: usize,
+) -> std::sync::Arc<ravel_object_store::fault::FaultStore<ravel_object_store::memory::MemoryStore>>
+{
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Op, ScriptedFault, Sequence};
+    let mut sequence = Sequence::new(Op::Get).with_key_contains(key);
+    for _ in 0..faults {
+        sequence = sequence.then_fault(ScriptedFault::Transient("provisioning GET".into()));
+    }
+    for _ in 0..16 {
+        sequence = sequence.then_passthrough();
+    }
+    std::sync::Arc::new(FaultStore::new(
+        ravel_object_store::memory::MemoryStore::new(),
+        FaultPlan::empty().with_sequence(sequence),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

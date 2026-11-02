@@ -2119,4 +2119,94 @@ mod tests {
         assert_eq!(sw.floor_check(replaced, family, writing), refused);
         assert_eq!(metrics.refused(family), 2);
     }
+
+    /// Issue #3653: the flush-open background re-read obeys the same read
+    /// backoff as the write path. A failed re-read arms the window; a re-read
+    /// requested inside it resolves `false` without a GET, from either path;
+    /// one requested after it reads again; and a read that succeeds clears the
+    /// entry. Each failed re-read is counted once.
+    #[tokio::test]
+    async fn background_reread_obeys_the_read_backoff() {
+        const NS_PER_SEC: i64 = 1_000_000_000;
+        let t = tenant(3);
+        let key = provisioning_key(&t, Signal::Metrics);
+        let store = crate::read_backoff::failing_then_passing_get_store(&key, 2);
+        let t0 = 10 * NS_PER_HOUR;
+        let clock = Arc::new(SetClock(std::sync::atomic::AtomicI64::new(t0)));
+        let failures = Arc::new(ProvisioningReadFailures::default());
+        let sw = Arc::new(
+            index_switch(1, DEFAULT_REFRESH_INTERVAL_NS)
+                .with_refresh_source(store.clone(), Signal::Metrics, clock.clone())
+                .with_read_failures(Arc::clone(&failures)),
+        );
+
+        assert!(!sw.reread(t).await, "the first re-read fails");
+        assert_eq!(store.sequence_progress(0), 1);
+        assert!(!sw.reread(t).await, "inside the window");
+        assert!(matches!(
+            sw.read_view(store.as_ref(), Signal::Metrics, t, t0).await,
+            ViewRead::BackedOff
+        ));
+        assert_eq!(store.sequence_progress(0), 1, "no GET inside the window");
+
+        clock
+            .0
+            .store(t0 + NS_PER_SEC, std::sync::atomic::Ordering::SeqCst);
+        assert!(!sw.reread(t).await, "the second re-read fails");
+        assert_eq!(store.sequence_progress(0), 2);
+        assert_eq!(
+            sw.read_backoff_entry(t).map(|e| e.delay_ns),
+            Some(2 * NS_PER_SEC)
+        );
+        assert_eq!(failures.store(), 2);
+
+        clock
+            .0
+            .store(t0 + 3 * NS_PER_SEC, std::sync::atomic::Ordering::SeqCst);
+        assert!(sw.reread(t).await, "the record reads back");
+        assert_eq!(store.sequence_progress(0), 3);
+        assert_eq!(sw.read_backoff_entry(t), None);
+        assert_eq!(failures.store(), 2);
+    }
+
+    /// A record whose bytes do not decode is a `Decode` failure, counted under
+    /// `decode`, and a failed GET carries its store error class.
+    #[tokio::test]
+    async fn load_error_carries_its_cause() {
+        use ravel_object_store::PutOptions;
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+        use ravel_object_store::memory::MemoryStore;
+
+        let t = tenant(5);
+        let key = provisioning_key(&t, Signal::Metrics);
+        let garbage = MemoryStore::new();
+        garbage
+            .put(&key, vec![0xff; 7].into(), PutOptions::default())
+            .await
+            .expect("put");
+        let err = load_view(&garbage, Signal::Metrics, &t, 1)
+            .await
+            .expect_err("garbage does not decode");
+        assert_eq!(err, GenerationLoadError::Decode);
+        assert_eq!(err.cause(), ProvisioningReadCause::Decode);
+
+        let timing_out = FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(Rule::new(Op::Get, ScriptedFault::Timeout)),
+        );
+        let err = load_view(&timing_out, Signal::Metrics, &t, 1)
+            .await
+            .expect_err("a timed-out GET fails");
+        assert_eq!(err, GenerationLoadError::Store(StoreErrorClass::Timeout));
+        assert_eq!(err.to_string(), "store GET failed (timeout)");
+
+        let failures = Arc::new(ProvisioningReadFailures::default());
+        let sw =
+            index_switch(1, DEFAULT_REFRESH_INTERVAL_NS).with_read_failures(Arc::clone(&failures));
+        assert!(matches!(
+            sw.read_view(&garbage, Signal::Metrics, t, 0).await,
+            ViewRead::Failed
+        ));
+        assert_eq!((failures.store(), failures.decode()), (0, 1));
+    }
 }
