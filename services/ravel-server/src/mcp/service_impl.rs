@@ -569,7 +569,8 @@ impl QueryBackend for ServiceBackend {
                     signal: signal.to_string(),
                     after_name: request.after_name.clone(),
                     limit: Some(request.limit),
-                    now_ns: request.now_ns,
+                    resolve_at_ns: request.resolve_at_ns,
+                    caller_now_ns: request.caller_now_ns,
                     deadline: self.budgets.deadline,
                 },
             )

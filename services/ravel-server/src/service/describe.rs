@@ -113,10 +113,15 @@ pub struct DescribeDataRequest {
     /// [`MAX_FAMILIES_PER_PAGE`], and `Some(0)` is refused as
     /// [`super::ServiceErrorKind::InvalidArgument`].
     pub limit: Option<usize>,
-    /// The resolve instant. A later page passes the instant its cursor was
-    /// minted at (ADR-1374, 2026-09-13 amendment, item 5). It pins the
-    /// resolve, not the family record.
-    pub now_ns: i64,
+    /// The instant the catalog resolve runs at. A later page passes the
+    /// instant its cursor was minted at (ADR-1374, 2026-09-13 amendment, item
+    /// 5). It pins the resolve, not the family record, the declared-column
+    /// cache or the audit record.
+    pub resolve_at_ns: i64,
+    /// The caller's own clock. The declared-column and key-index lookups
+    /// judge their cache's freshness against it, and the audit record is
+    /// stamped with it, on page one and on every later page alike.
+    pub caller_now_ns: i64,
     pub deadline: Duration,
 }
 
@@ -214,7 +219,8 @@ pub struct DescribeData {
     /// committed, counted before cross-segment duplicates collapse and before
     /// a pending erasure applies, so a scan can return fewer.
     pub committed_rows: u64,
-    /// The instant the snapshot was resolved at, the request's `now_ns`.
+    /// The instant the snapshot was resolved at, the request's
+    /// `resolve_at_ns`.
     pub resolved_at_ns: i64,
     /// What the call spent: the resolve's requests and bytes. The metadata
     /// record and the tenant configuration are read through process-wide
@@ -230,7 +236,7 @@ impl QueryService {
 
     /// One signal's shape and freshness for `ravel_describe_data`, under one
     /// admission permit and one catalog resolve of the whole tenant at
-    /// `request.now_ns`.
+    /// `request.resolve_at_ns`.
     ///
     /// The ingest watermark is the greatest `ingest_hour_bucket` over the
     /// segments that resolve returned, and is absent when it returned none.
@@ -279,7 +285,10 @@ impl QueryService {
             signal,
             request.after_name.as_deref(),
             limit,
-            request.now_ns,
+            Clocks {
+                resolve_at_ns: request.resolve_at_ns,
+                caller_now_ns: request.caller_now_ns,
+            },
             &accounting,
         );
         let result =
@@ -299,10 +308,10 @@ impl QueryService {
         self.controls
             .audit(
                 tenant_hash,
-                request.now_ns,
+                request.caller_now_ns,
                 &text,
                 AUDIT_LANGUAGE,
-                (0, request.now_ns),
+                (0, request.caller_now_ns),
                 status,
                 self.audit_subject.as_ref(),
             )
@@ -316,13 +325,21 @@ impl QueryService {
     }
 }
 
+/// The two instants a call runs under: a later page resolves at its cursor's
+/// mint instant while its cache lookups stay on the caller's clock.
+#[derive(Clone, Copy)]
+struct Clocks {
+    resolve_at_ns: i64,
+    caller_now_ns: i64,
+}
+
 async fn describe(
     state: &DescribeState,
     tenant_hash: TenantHash,
     signal: DescribeSignal,
     after_name: Option<&str>,
     limit: usize,
-    now_ns: i64,
+    clocks: Clocks,
     accounting: &QueryAccounting,
 ) -> Result<DescribeData, ServiceError> {
     let snapshot = state
@@ -335,7 +352,7 @@ async fn describe(
                 end_ns: i64::MAX,
             },
             &[],
-            now_ns,
+            clocks.resolve_at_ns,
             accounting,
         )
         .await
@@ -387,9 +404,12 @@ async fn describe(
         DescribeSignal::Logs => {
             let declared_set = state
                 .declared_columns
-                .declared_columns(tenant_hash, now_ns)
+                .declared_columns(tenant_hash, clocks.caller_now_ns)
                 .await;
-            let key_index = state.declared_columns.key_index(tenant_hash, now_ns).await;
+            let key_index = state
+                .declared_columns
+                .key_index(tenant_hash, clocks.caller_now_ns)
+                .await;
             let declared = ravel_sql::logs_schema_with_declared(&declared_set)
                 .fields()
                 .iter()
@@ -432,7 +452,7 @@ async fn describe(
         segments: segments.len(),
         pending_erasure,
         committed_rows,
-        resolved_at_ns: now_ns,
+        resolved_at_ns: clocks.resolve_at_ns,
         accounting: accounting.snapshot(),
     })
 }

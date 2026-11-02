@@ -54,9 +54,12 @@ pub struct DescribeRequest {
     pub after_name: Option<String>,
     /// Families per page.
     pub limit: usize,
-    /// The instant the snapshot is resolved at: the call's clock on page one,
+    /// The instant the catalog resolve runs at: the call's clock on page one,
     /// the cursor's mint instant on a later page.
-    pub now_ns: i64,
+    pub resolve_at_ns: i64,
+    /// The call's own clock, on every page: the declared-column and key-index
+    /// cache lookups and the audit record use it, never the resolve instant.
+    pub caller_now_ns: i64,
 }
 
 /// One column of a described table.
@@ -230,7 +233,8 @@ pub trait QueryBackend {
     ) -> Result<ExplainOutcome, Failure>;
 
     /// Mirrors `QueryService::describe_data`: one catalog resolve of the
-    /// whole signal at `request.now_ns` and one page of the metadata record.
+    /// whole signal at `request.resolve_at_ns` and one page of the metadata
+    /// record.
     async fn describe_data(
         &self,
         tenant_hash: TenantHash,
