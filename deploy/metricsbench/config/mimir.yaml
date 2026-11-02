@@ -239,7 +239,7 @@ limits:
   # covers the sum.
   max_fetched_chunks_per_query: 5000000
   # Mimir query engine memory budget: replaces the default 0 ("0 to
-  # disable") with 2 GiB. -help-all marks it [experimental] and says it is
+  # disable") with 4 GiB. -help-all marks it [experimental] and says it is
   # "only enforced when Mimir's query engine is in use", which is the 3.2.3
   # default. It is that engine's only per-query bound, since max_samples
   # above does not fire under it. Sized to the 8g envelope, not to the
