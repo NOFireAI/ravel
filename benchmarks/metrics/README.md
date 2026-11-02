@@ -618,11 +618,14 @@ error, which stay in the JSON
 It exits 64, with no JSON and before any query, when a write endpoint flag
 is given, `--ingest-report`, `--readback-system` or `--anchor-ms` is
 missing, the system is not one of the four or its query URL is missing,
-`--ravel-bearer-token-env` is given for another system, the report has no
-row or more than one row for the system, the row recorded no successful
-ingest (it carries `row_failure`, or the system is listed under `stalled` or
-`failed_replays`), or the report's profile name, step count,
-`run.workload_digest` or `run.anchor_ms` differs from the arguments
+`--ravel-bearer-token-env` is given for another system or names a variable
+that is unset or empty, the report has no row or more than one row for the
+system, the row recorded no successful ingest (it carries `row_failure`, or
+the system is listed under `stalled` or `failed_replays`), the `ravel` row
+has no non-empty commit token in `commit_tokens_by_shard` to pass as
+`min_commit_token`, the report's profile name, step count,
+`run.workload_digest` or `run.anchor_ms` differs from the arguments, or the
+regenerated stream's digest differs from the report's `run.stream_digest`
 (`metricsbench_ingest_smoke::readback_only_refusals_exit_64`,
 `metricsbench_ingest::tests::the_readback_row_is_one_successfully_ingested_row`).
 `--ingest-report` and `--readback-system` without `--readback-only` exit 64

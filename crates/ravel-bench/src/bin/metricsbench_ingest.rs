@@ -381,6 +381,11 @@ enum RunError {
          the rebuilt plan is not the one the replay recorded"
     )]
     RegeneratedStreamDiverged { expected: String, got: String },
+    #[error(
+        "the ingest report's ravel row has no commit token (`commit_tokens_by_shard`) to pass as \
+         min_commit_token"
+    )]
+    NoCommitToken,
 }
 
 impl RunError {
@@ -554,7 +559,9 @@ fn exit_code(err: &RunError) -> i32 {
         | RunError::DuplicateReportRow { .. }
         | RunError::RowNotIngested { .. }
         | RunError::ReportFieldMissing { .. }
-        | RunError::ReportMismatch { .. } => EXIT_USAGE,
+        | RunError::ReportMismatch { .. }
+        | RunError::RegeneratedStreamDiverged { .. }
+        | RunError::NoCommitToken => EXIT_USAGE,
         _ => 1,
     }
 }
@@ -1162,6 +1169,20 @@ fn select_readback_row(
     }
 }
 
+/// Refuses a Ravel row with no non-empty commit token, which the read-back
+/// would otherwise query without a `min_commit_token` fence.
+fn require_commit_token(row: &SystemIngestResult) -> Result<(), RunError> {
+    let fenced = row
+        .commit_tokens_by_shard
+        .as_ref()
+        .is_some_and(|by_shard| by_shard.values().any(|t| !t.trim().is_empty()));
+    if fenced {
+        Ok(())
+    } else {
+        Err(RunError::NoCommitToken)
+    }
+}
+
 /// `field` as the report records it, refused when absent or different from
 /// the argument.
 fn check_report_field<T: PartialEq + std::fmt::Display>(
@@ -1210,6 +1231,9 @@ async fn run_readback_only(args: &Args) -> Result<ReadbackOnlyOutput, RunError> 
             detail: e.to_string(),
         })?;
     let row = select_readback_row(&report, system)?;
+    if target.receiver == Receiver::Ravel {
+        require_commit_token(&row)?;
+    }
     let recorded = report
         .profile
         .as_ref()
