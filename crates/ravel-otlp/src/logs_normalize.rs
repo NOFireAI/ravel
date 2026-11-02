@@ -5,12 +5,12 @@
 //! Log stream identity is the canonical hash of the OTLP resource attributes
 //! plus the scope name, version, and attributes; per-record attributes never
 //! enter identity. Identity is computed once per `ScopeLogs` and reused by
-//! every record under it, which is also where the record's `stream_attrs`
-//! preimage comes from: both [`ravel_types::logstream::log_stream_id`] and
-//! [`ravel_logseg::stream_attrs_bytes`] are called with the same
-//! already-converted attribute vectors, so
-//! `stream_id == blake3("ravel-logstream-v1" || stream_attrs)[..16]` holds by
-//! construction rather than by two similar computations happening to agree.
+//! every record under it. [`ravel_logseg::stream_attrs_bytes`] builds the
+//! record's `stream_attrs` preimage once, and the stream id is
+//! [`ravel_types::logstream::log_stream_id_from_preimage`] over those same
+//! bytes, so `stream_id == blake3("ravel-logstream-v1" || stream_attrs)[..16]`
+//! holds by construction: the id is computed from the stored bytes rather than
+//! from a second encoding of the attributes.
 //!
 //! Rejection granularity has three levels, mirroring
 //! [`crate::normalize`]'s: request-wide (`TooManyRecords` short-circuits
@@ -60,7 +60,9 @@ use ravel_ipcrypt::tally::IpcryptTally;
 use ravel_logseg::{
     LogRowRef, MAX_ATTR_DEPTH, MAX_ATTR_ENTRIES, attr_value_fits_storage, stream_attrs_bytes,
 };
-use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
+#[cfg(test)]
+use ravel_types::logstream::log_stream_id;
+use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id_from_preimage};
 
 use crate::label_projection::{ProjectedLabelBytes, exact_capacity};
 use crate::logs_limits::{LogIngestLimits, LogRejection};
@@ -480,9 +482,10 @@ impl LogWalk<'_> {
         // Identity and its preimage are computed once per ScopeLogs, from the
         // same converted (and, where matched, encrypted) attribute vectors, and
         // reused for every record below.
-        let stream_id = log_stream_id(resource_attrs, &scope_name, &scope_version, &scope_attrs);
-        let stream_attrs: Arc<[u8]> =
-            stream_attrs_bytes(resource_attrs, &scope_name, &scope_version, &scope_attrs).into();
+        let preimage =
+            stream_attrs_bytes(resource_attrs, &scope_name, &scope_version, &scope_attrs);
+        let stream_id = log_stream_id_from_preimage(&preimage);
+        let stream_attrs: Arc<[u8]> = preimage.into();
 
         let stored_before = self.records.len();
         let projecting = self.projecting();
