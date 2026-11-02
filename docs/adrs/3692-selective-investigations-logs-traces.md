@@ -179,17 +179,26 @@ changes no stored byte.
   `entry_count` and its `watermark_hour`, beside the decoded entries it
   already holds. The refs are read from the same HEAD GET the resolve
   already issues and are charged where the decoded part is charged.
-- Every part-sourced `SegmentRef` carries its origin: the index of its
-  part in the window and its part-local entry ordinal (ADR-0849 section 1,
-  the ordinal the leaf's `entry_ordinal` names). A `Recent` or
-  `TokenResolved` segment (snapshot.rs:166) carries none and is never
-  covered.
-- The `Snapshot` a provider receives exposes `parts()`: for each part, its
-  `blake3`, `entry_count`, `key_index` refs and the segments that came
-  from it. A segment's `(part, ordinal)` is the only way a leaf match is
-  turned into a data object key; the router never reads a part object or
-  HEAD again, so a HEAD that moved after the resolve cannot change which
-  segments a leaf prunes.
+- The per-segment part origin is a sibling of `Snapshot`, not a field on
+  `SegmentRef`: `SegmentRef` and `Snapshot` are built by full field
+  literal at 248 sites in 83 files outside ravel-catalog (snapshot.rs:156
+  records this constraint, and it is why ADR-0073's origin became the
+  parallel `SegmentOrigins` vector rather than a field). Decision 1 takes
+  the same form: `SnapshotParts { parts: Vec<SnapshotPartHandle>, origin:
+  Vec<Option<SegmentPartOrigin>> }`, produced beside the `Snapshot` by
+  `Catalog::resolve_pruned_with_admission` as `SegmentOrigins` is, with
+  `origin[i]` the `(part index, part-local entry ordinal)` of
+  `segments[i]` (ADR-0849 section 1, the ordinal the leaf's
+  `entry_ordinal` names) and `None` for a `Recent` or `TokenResolved`
+  segment (snapshot.rs:166), which is never covered. A
+  `SnapshotPartHandle` holds the part's `blake3`, `entry_count`,
+  `watermark_hour` and `key_index` refs.
+- A segment's `(part, ordinal)` is the only way a leaf match is turned
+  into a data object key; the router never reads a part object or HEAD
+  again, so a HEAD that moved after the resolve cannot change which
+  segments a leaf prunes. The providers that run the router (decisions 3
+  and 4) receive `SnapshotParts` the way they receive `SegmentOrigins`
+  today, so no `ravel-sql` construction site changes shape.
 - The binding check the reader runs (docs/catalog-and-mvcc.md "Binding
   and coverage": header `part_blake3` against the resolved ref, tenant and
   signal as a breach) is unchanged; the part hash it compares against is
@@ -234,17 +243,26 @@ docs/catalog-and-mvcc.md, with these choices fixed here:
 - Per admitted part, per key: `select_key_index_slice` picks the slice;
   GET 1 is `[0, prefix_len)` of that slice, issued once per (part, slice)
   the key set touches; the directory then names the buckets the keys fall
-  in. GET 2 reads each distinct bucket when the key set touches at most
-  `B_run` = 64 distinct buckets of that leaf; above that, the router reads
-  nothing more from the leaf and marks the part `Uncovered` for this
-  statement, since a set that spreads over more than 64 buckets of a leaf
-  sized at about `4 x sqrt(body)` per bucket is reading a share of the body
-  a scan of the part's objects does not justify. `B_run` is predicted and
-  confirmed or changed by the Stage 1 amendment. A bucket the directory
-  says is empty costs no GET. Empty-bucket and distinct-bucket counts are
-  known after GET 1, so the per-part GET count admitted against `L_max` is
-  the worst case `1 + min(k, 2^bucket_bits, B_run)` before GET 1 and the
-  exact count after it; the difference is returned to the budget.
+  in. GET 2 reads each distinct non-empty bucket when the key set touches
+  at most `B_run` = 64 of them in that leaf. Above `B_run`, the router
+  sorts the touched buckets by body offset and reads them as at most
+  `B_run` ranged GETs, bridging the smallest gaps between buckets until
+  the run count fits (the `bound_runs` shape the metrics path uses);
+  bridged gap bytes are read and discarded. It takes that read only when
+  the bridged bytes are at most `entry_count x T1_BYTES` for the part,
+  with `T1_BYTES` = 4 KiB the predicted per-object cost of the tier-1 probe
+  the part's segments would otherwise pay (a footer suffix, a prefix and
+  a bucket); otherwise the part is `Uncovered` for this statement and no
+  further leaf byte is read. A leaf body is the whole part's key set
+  (about 240 MB for the T12 spans part), so tier 2 has no whole-body
+  escape of the kind decision 6 gives tier 1 over a 2 to 6 % section;
+  the bridged read is its bounded equivalent. `B_run` and `T1_BYTES` are
+  predicted and confirmed or changed by the Stage 1 amendment. A bucket
+  the directory says is empty costs no GET. Empty-bucket and
+  distinct-bucket counts are known after GET 1, so the per-part GET count
+  admitted against `L_max` is the worst case `1 + min(k, 2^bucket_bits,
+  B_run)` before GET 1 and the exact count after it; the difference is
+  returned to the budget.
 - Before a bucket frame is decoded, the router reserves its decoded bound
   through the memory handle and decodes only when the reservation holds.
   The bound is `8 x uncompressed_len + 64` bytes per frame, derived from
@@ -309,14 +327,27 @@ docs/catalog-and-mvcc.md, with these choices fixed here:
   already uses for the same footer (fold.rs:1104), chased once when the
   footer is longer. It stays in the `probe` phase, because it is the tail
   probe and not an index read; ADR-2707 decision 7 keeps `keyIndex` for
-  leaf and section reads and nothing else. SKIP_IDX is read only when no
-  block set is known from either tier, BLOOM only when the statement has
-  predicates, each by its own range from the footer. This restates
-  #3118's ask: the bytes move from 64 KiB to about 8 KiB per candidate
-  object, the request count per uncovered object stays three (footer,
-  prefix, bucket), and a tier-2-covered present object costs the footer
-  and its block runs. The ADR-2707 T12 acceptance amendment's spans bands
-  are restated below.
+  leaf and section reads and nothing else. Today the 64 KiB probe was
+  sized to cover the footer, SKIP_IDX and BLOOM in one request
+  (span_fetcher.rs:147), SKIP_IDX is read unconditionally from it
+  (:924), and the tier-1 probe runs only when SKIP_IDX left a candidate
+  (:983). With a trace key the order changes: footer, then the KEY_IDX
+  prefix and bucket, and SKIP_IDX only for an object the key is present
+  in (to intersect the key's block set with the window's blocks, as the
+  fetcher does today at :1032), BLOOM only when the statement has
+  predicates. An object the key is absent from costs three GETs (footer,
+  prefix, bucket; about 11 KB) and is dropped without reading SKIP_IDX;
+  a holder costs those three plus SKIP_IDX and its block runs, and BLOOM
+  with predicates. The cost of the reorder is on an object whose SKIP_IDX
+  would have dropped it for free (no block in the window): it now pays
+  the prefix and bucket, two small GETs, before being dropped; on the T12
+  lane SKIP_IDX kept a candidate in every probed object, and the Stage 1
+  run reports the count of objects dropped by SKIP_IDX after a present
+  key so the trade is measured. This restates #3118's ask: bytes per
+  absent candidate object move from about 66 KB to about 11 KB at the
+  same three requests, and a tier-2-covered holder costs the footer,
+  SKIP_IDX and its block runs. The ADR-2707 T12 acceptance amendment's
+  spans bands are restated below.
 - Shard routing (ADR-2707 decision 5, deferred by the spans routing
   deferral amendment, #3034) stays deferred: the lookup is exact without
   it, and with tier 2 its remaining benefit is the tier-1 probes on the
@@ -427,12 +458,16 @@ can measure it before anything is transferred.
   object (`segmentsPrunedByKeyIndex`); present names the union of block
   sets.
 - **Ticket.** The slice ticket gains version 12: the version 11 layout
-  followed by an optional key-set section (`field`, `key_type`,
-  `key_count` up to k, `key8[key_count]`). Versions 8 to 11 are byte
-  identical and pinned; a version 12 ticket carrying a spans block is
-  refused as version 11 is. A multi-table statement never produces a
-  slice ticket (ADR-2904 decisions 8 and 10), so only a single-table `IN`
-  travels.
+  followed, on a logs block, by an optional key-set section (`field`,
+  `key_type`, `key_count` up to k, `key8[key_count]`), and, on a spans
+  block, by an optional trace-id list (`trace_id_count` up to k,
+  `trace_id[trace_id_count]`, 16 bytes each) beside the single optional
+  `trace_id` the version 9 block carries (flight_ticket.rs:1957). Versions
+  8 to 11 are byte identical and pinned. Without the spans section a
+  Flight-served `trace_id IN (...)` would encode as a version 9 ticket
+  whose block carries one id and silently lose the list. A multi-table
+  statement never produces a slice ticket (ADR-2904 decisions 8 and 10),
+  so only a single-table `IN` travels.
 - Transfer (ADR-2983 decisions 1 to 7, 10) is not part of this decision.
   Its Sequencing gate 1 (#1370) stands as written; see the Plan.
 
@@ -686,21 +721,21 @@ statement. "Covering parts" is the stamped part count for the window.
 
 | check | target | miss | source |
 |---|---|---|---|
-| 1. spans lookup, no time range, folded with leaves, one covering part (the T12 tenant: 828 objects) | leaf GETs = 2; GETs for objects the leaf proves absent = 0; data GETs at most 2 + holders x (1 footer + block runs), 6 or fewer for a 10-span trace in one object; wire under 300 KB; 10 rows; `partsCovered` 1 | over 20 GETs, over 1 MB, any `probe` GET on a pruned object, or a row count other than the unfolded answer's | predicted from ADR-2707 decision 5 against T12's 2,429 GETs and 55.7 MB, #2763 comment 6276877460 |
+| 1. spans lookup, no time range, folded with leaves, one covering part (the T12 tenant: 828 objects) | leaf GETs = 2; GETs for objects the leaf proves absent = 0; data GETs at most 2 + holders x (footer + SKIP_IDX + block runs), 8 or fewer for a 10-span trace in one object; wire under 300 KB; 10 rows; `partsCovered` 1 | over 20 GETs, over 1 MB, any `probe` GET on a pruned object, or a row count other than the unfolded answer's | predicted from ADR-2707 decision 5 against T12's 2,429 GETs and 55.7 MB, #2763 comment 6276877460 |
 | 2. spans lookup, 1 h window, cold, folded with leaves | leaf GETs = 2 x covering parts (1 or 2); data GETs as row 1; wire under 300 KB; median under 1 s | over 1 s, over 1 MB | predicted; T12 measured 2.70 MB and 0.73 s, #2763 comment 6276877460 |
-| 3. spans lookup, 1 h window, cold, unfolded tail only | per candidate object at most 3 GETs (footer at most 8 KiB in `probe`, prefix and one bucket in `keyIndex`) and at most 16 KB; `probe` wire at most 8,192 B per candidate object; rows exact | over 3 GETs per object, `probe` over 16 KiB per object (the old 64 KiB read), or any `keyIndex` GET on an object whose footer names no KEY_IDX | predicted; T12 measured 65,536 B per object, #2763 comment 6276877460; restates the T12 acceptance amendment's spans rows |
+| 3. spans lookup, 1 h window, cold, unfolded tail only | per candidate object the key is absent from: 3 GETs (footer at most 8 KiB in `probe`, prefix and one bucket in `keyIndex`) and at most 16 KB, no SKIP_IDX read; per holder: those plus SKIP_IDX and its block runs; `probe` wire at most 8,192 B per absent object; the count of objects SKIP_IDX dropped after a present key is reported; rows exact | over 3 GETs on an absent object, `probe` over 16 KiB per object (the old 64 KiB read), or any `keyIndex` GET on an object whose footer names no KEY_IDX | predicted; T12 measured 65,536 B per object, #2763 comment 6276877460; restates the T12 acceptance amendment's spans rows |
 | 4. spans lookup, warm (second run), folded with leaves | 0 data GETs, 0 leaf GETs, 1 resolve GET | any data or leaf GET | predicted; T12 measured 0 data GETs, #2763 comment 6276877460 |
 | 5. q20, cold, folded with leaves (398 `hits` objects) | leaf GETs = 2 x covering parts; objects opened = holders (1); total GETs under 40; wire under 20 MB; under 1 s; 4 rows | over 100 GETs or over 100 MB | predicted; ADR-2707's band, unreachable until the leaf is read; T12 measured 1,013 GETs and 907 MB, #2763 comment 6276877460 |
 | 6. q20, cold, unfolded, post-#3117 | every object above 512 KiB probed: `keyIndex` GETs = prefix + bucket per probed object (2 x 398 minus empty buckets); objects read past the probe = holders (1); scan wire under 20 MB; 4 rows | any object above 512 KiB read whole for an absent key; over 100 GETs beyond the probe; over 100 MB | predicted from the #3117 amendment, docs/adrs/2707-exact-key-index-for-spans-and-logs.md:1229; T12 measured 81 survivors and 823 MB before the fix, #2763 comment 6276877460 |
 | 7. fold with the switch on, advancing fold over an unchanged tail plus one new hour | section GETs = 2 x new entries (plus one per entry whose footer exceeds 8 KiB) plus one GET per previous leaf; `key_index_build_passes` 1; peak fold RSS under 1.5 GB at the T12 spans corpus (20 M distinct keys, budget 8 M pairs, so 3 passes on the from-scratch build of the sealed part and the report says 3) | section GETs over 2 x tail entries (a from-scratch rebuild), passes other than `ceil(pairs / budget)`, RSS over 2 GB | predicted; the from-scratch cost is the leaf build switch amendment's `2T`, measured by T12 as 1,656 = 2 x 828 on spans and 796 = 2 x 398 on logs, #2763 comment 6276877460 |
-| 8. leaf bytes | spans at most 6 % and logs at most 2 % of part bytes, slices x 194 B of HEAD per (part, field) | over 2x either | predicted; T12 measured 4.40 % and 2.06 %, 194 B and 192 B, #2763 comment 6276877460 |
+| 8. leaf bytes | spans at most 6 % and logs at most 2.5 % of part bytes (the logs target sits above the one measurement, 2.06 %), slices x 194 B of HEAD per (part, field) | over 2x either | predicted; T12 measured 4.40 % and 2.06 %, 194 B and 192 B, #2763 comment 6276877460 |
 | 9. month-scale lane: spans lookup without a range over 744 hour-ranged parts (`--ingest-hour-stride 1`, a month) | resolve: 1 part GET per covering part; leaf GETs = 2 x 744 = 1,488; 0 tier-1 GETs on covered objects; `partsBeyondCeiling` 0; `keyIndex` decompressed bytes per part at most `8 x sqrt(body)` as ADR-2707's row states; rows exact | more than 2 leaf GETs per part, any leaf GET outside `keyIndex`, any tier-1 GET on a covered object | predicted; the ADR-2707 month-scale row, docs/adrs/2707-exact-key-index-for-spans-and-logs.md:877, unmeasured there |
 | 10. past `P_max` lane: 2,160 hour-ranged parts | leaf GETs = 2 x 1,024 = 2,048 exactly; `partsBeyondCeiling` 1,136, the 1,136 smallest parts by entry count; those parts' objects probed at tier 1 (3 GETs, under 16 KB each, in `probe` and `keyIndex`), 0 leaf GETs for them; rows exact | any leaf GET for a part beyond the ceiling, more than 2,048 leaf GETs, a beyond-ceiling object read whole for an absent key | predicted; restates the ADR-2707 `P_max` row (scan remainder) per decision 2's amendment, docs/adrs/2707-exact-key-index-for-spans-and-logs.md:878 |
-| 11. `IN` lists of 1, 10, 100 and 1,000 keys, folded with leaves, logs and spans | rows equal the union of the per-key equality answers (the oracle), every list size, both tables; per covered part leaf GETs at most `1 + min(distinct buckets, 64)`; `keysProbed` equals the list size; the 1,000-key list on a 13-bit leaf (8,192 buckets) touches at most 64 buckets or marks the part `Uncovered` with no further leaf read | any row difference; over 65 leaf GETs on one part; a 1,001-key list served by the index | predicted; k and `B_run` are decision 6's constants, confirmed or changed by the Stage 1 amendment |
+| 11. `IN` lists of 1, 10, 100 and 1,000 keys, folded with leaves, logs and spans | rows equal the union of the per-key equality answers (the oracle), every list size, both tables; per covered part leaf GETs at most `1 + min(distinct buckets, 64)`; `keysProbed` equals the list size; the 1,000-key list on a 13-bit leaf (8,192 buckets) is read as at most 64 bridged ranged GETs whose bytes are at most `entry_count x 4 KiB` for the part, else the part is `Uncovered` with no further leaf read, and the report says which | any row difference; over 65 leaf GETs on one part; leaf bytes over `entry_count x 4 KiB` on one part; a 1,001-key list served by the index | predicted; k and `B_run` are decision 6's constants, confirmed or changed by the Stage 1 amendment |
 | 12. scaling: matching rows fixed, irrelevant retained data 10x and 100x (objects and covering parts both grow) | folded with leaves: GETs grow by at most 2 per added covering part and wire by at most the added leaf prefixes and buckets; the unfolded control grows per object | GET growth proportional to objects on the folded arm | predicted from decision 2 |
 | 13. correctness matrix | exact agreement with the oracle on every statement of every state, including mixed sealed plus unsealed, concurrent compaction and an erasure in flight; the five negative controls of decision 9 each fail on their mutant | any disagreement, any control passing on its mutant | predicted; the mutants are run and quoted in the report |
 | 14. join baseline (ADR-2983 Stage 0): `spans JOIN logs ON trace_id`, build sides of 1, k/10, k and 10k traces, transfer absent | per scan: objects and blocks opened, requests and wire bytes per phase, recorded as the Stage 0 figures ADR-2983 defers; no band on this first measurement; both sides' `signals[]` entries present | a scan without its `signals[]` entry, or a figure missing | predicted; ADR-2983 Sequencing, docs/adrs/2983-predicate-transfer-across-signal-joins.md:325 |
-| 15. the journey: failing traces of one service in 1 h (about 50), their logs by `trace_id IN`, their rows | total GETs at most resolve + 2 x covering parts per table + 50 x (footer + block runs) on spans + the logs holders' block reads; under 5 s cold end to end; rows exact | over 20 s, or any whole-object read of a non-holder | predicted from decisions 2 to 6 |
+| 15. the journey: failing traces of one service in 1 h (about 50), their logs by `trace_id IN`, their rows | total GETs at most resolve + 2 x covering parts on spans for the cell's traces + `1 + min(distinct buckets, 64)` per covering part on logs for the 50-key list (about 51 on a 13-bit leaf) + 50 x (footer + SKIP_IDX + block runs) on spans + the logs holders' block reads; under 5 s cold end to end; rows exact | over 20 s, or any whole-object read of a non-holder | predicted from decisions 2 to 6 |
 | 16. nonselective control: the 43 ClickBench statements, cold, this build against the build before Wave 1 on one box, paired | no statement over 5 % slower outside the lane's noise, and no GET or byte increase on any statement without a key | over 5 % on any statement, or any added request | predicted; the ADR-3072 decision 4 contract |
 | 17. cost per successful investigation and break-even | the dollar figure per statement of decision 8, folded against unfolded, with the index's amortised maintenance and the break-even lookups per part-month, each named with its price basis and query-frequency assumption | a figure without its basis, or a break-even stated without the frequency it assumes | predicted; the formula is decision 8's |
 
