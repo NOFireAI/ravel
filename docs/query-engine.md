@@ -5507,7 +5507,8 @@ once per statement: `hits`, `misses`, `admissions`, `evictions`, `ghostHits`,
 `marginSkips`, `pressureEvictions`, `pressureFreedBytes`, `residentBytes`,
 `deferredServed`, and `deferredSetEstimateBytes`. `deferredSetEstimateBytes`
 is the plan-time decoded-set estimate, summed over the statement's scans with
-a `Contains` arm, and is present only when such a scan ran its plan pass.
+a `Contains` arm, and is present when such a scan ran its plan pass or took
+the whole-segment fast path.
 `deferredServed` is true when a scan of the statement serves its deferred
 columns, and false otherwise (`decoded_cache_json` in
 `crates/ravel-sql/src/stats_json.rs`;
