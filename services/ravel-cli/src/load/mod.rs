@@ -165,7 +165,8 @@ pub const MEASURED_PIPELINE_DEPTH: usize = 4;
 /// this does not change.)
 ///
 /// This deliberately no longer tracks [`IngestConfig::max_inflight_flushes`]'s
-/// own default (4, ADR-2708 D3): that default governs the client-facing
+/// own default (8, ADR-2708 D3 and its flush slots amendment): that default
+/// governs the client-facing
 /// serving path, whose Strict ack contract ADR-0067 froze, and the bulk loader
 /// is a different workload with a different memory owner.
 pub const DEFAULT_MAX_INFLIGHT_FLUSHES: u32 = MEASURED_PIPELINE_DEPTH as u32;
