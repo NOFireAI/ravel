@@ -9,7 +9,7 @@
 #     --ravel-source-commit SHA --bin-dir DIR --out-dir DIR
 #     [--anchor-ms N] [--passes N] [--reps N] [--keep]
 #     [--rss-band CONTAINER:MIN_BYTES:MAX_BYTES]...
-#     [--diagnostic-prometheus-max-samples N]
+#     [--diagnostic-prometheus-max-samples N] [--folded-catalog-get-max-fraction F]
 #     [--real-s3-bucket-prefix PREFIX --real-s3-region REGION]
 #
 # The Ravel image comes in one of two forms, and stamps.json says which ran
@@ -97,7 +97,12 @@
 #               <out>/readback-folded.json, /metrics scraped again into
 #               <out>/ravel-metrics-after-folded-readback.txt. Fails on a
 #               non-zero exit or a missing scrape. Stamped as readback_folded
-#               with the GET and commit-record cache deltas between the scrapes
+#               with the GET and commit-record cache deltas between the scrapes.
+#               Also fails when the GETs the fetch cache did not cause
+#               (catalog_get_delta) exceed --folded-catalog-get-max-fraction
+#               (default 0.05) times the data objects ingest flushed
+#               (data_objects_flushed, from <out>/ravel-metrics-at-query.txt),
+#               or when either figure cannot be read
 #
 # fold, restart and readback-folded also run after a failed ingest
 # verification, when memory passed and the Ravel row itself has no
@@ -498,11 +503,12 @@ elif op == "fold-stamp":
                       "entry_count": num(entries), "buckets_folded": num(buckets),
                       "ingest_end_hour": int(end_hour), "precondition": precondition}))
 elif op == "readback-folded":
-    # The bin's stdout, its exit code and the two /metrics scrapes ("" when
-    # one failed). Prints the stamp; exit 3 when stdout is not its report.
-    out_path, code, before, after = args
+    # The bin's stdout, its exit code, the two /metrics scrapes ("" when one
+    # failed), the at-query scrape and the catalog GET fraction. Prints the
+    # stamp; exit 3 when stdout is not its report.
+    out_path, code, before, after, at_query, fraction = args
     def metric(path, name, labels):
-        if not path:
+        if not path or not os.path.isfile(path):
             return None
         total, seen = 0, False
         with open(path) as f:
@@ -521,6 +527,48 @@ elif op == "readback-folded":
     stamp = {"exit_code": int(code), "matches_expected": None, "error": None, "series_query_ms": None,
              "store_get_calls_delta": delta("ravel_store_calls_total", {"op": "get"}),
              "commit_record_cache_entries_delta": delta("ravel_catalog_record_cache_entries", {"cache": "commit"})}
+    # Store GETs the fetch cache did not cause: on an unfolded read-back these
+    # are about one commit-record GET per data object (#2821).
+    fetch_misses = delta("ravel_cache_misses_total", {"cache": "fetch"})
+    gets = stamp["store_get_calls_delta"]
+    stamp["fetch_cache_misses_delta"] = fetch_misses
+    stamp["catalog_get_delta"] = None if gets is None or fetch_misses is None else gets - fetch_misses
+    # One data object per flush: shard.rs flush_tenant calls record_flush once
+    # per flush it opens (crates/ravel-ingest/src/shard.rs:2662), and
+    # record_flush bumps exactly one of these by its FlushTrigger
+    # (crates/ravel-ingest/src/metrics.rs:957-963), so the five are disjoint.
+    # Sub-counts of them (ravel_ingest_rerouted_flushes_total,
+    # ravel_ingest_grace_extended_stale_flushes_total) are not added.
+    # flushes_manual (FlushNow and the shutdown drains, metrics.rs module
+    # docs) is left out; the at-query scrape precedes the restart. These are
+    # attempt-time, so an abandoned flush counts too.
+    flushed, absent = 0, []
+    for reason in ("size", "age", "age_adaptive", "age_floor", "arrival"):
+        name = f"ravel_ingest_flushes_by_{reason}_total"
+        v = metric(at_query, name, {"signal": "metrics"})
+        if v is None:
+            absent.append(name)
+        else:
+            flushed += int(v)
+    stamp["data_objects_flushed"] = None if absent else flushed
+    stamp["folded_catalog_get_max_fraction"] = fraction
+    cat = stamp["catalog_get_delta"]
+    if cat is None:
+        missing = [n for n, v in (("ravel_store_calls_total{op=\"get\"}", gets),
+                                  ("ravel_cache_misses_total{cache=\"fetch\"}", fetch_misses)) if v is None]
+        stamp["catalog_get_verdict"] = ("could not measure: no " + " or ".join(missing)
+                                        + " delta between the folded read-back's scrapes")
+    elif absent:
+        stamp["catalog_get_verdict"] = ("could not measure: no " + ", ".join(absent)
+                                        + " with signal=\"metrics\" in ravel-metrics-at-query.txt")
+    else:
+        from fractions import Fraction
+        limit = Fraction(fraction) * flushed
+        if cat > limit:
+            stamp["catalog_get_verdict"] = (f"breach: catalog_get_delta {cat} exceeds {fraction} x "
+                                            f"data_objects_flushed {flushed}")
+        else:
+            stamp["catalog_get_verdict"] = "within"
     try:
         doc = load(out_path)
     except (OSError, ValueError) as e:
@@ -618,6 +666,7 @@ passes=""
 reps=""
 keep=0
 diag_max_samples=""
+folded_catalog_get_max_fraction="0.05"
 real_s3_prefix=""
 real_s3_region=""
 bands=()
@@ -637,7 +686,7 @@ while [ $# -gt 0 ]; do
       ;;
     --profile | --ravel-image | --ravel-image-id | --ravel-source-commit | --bin-dir | --out-dir | \
       --anchor-ms | --passes | --reps | --rss-band | --diagnostic-prometheus-max-samples | \
-      --real-s3-bucket-prefix | --real-s3-region)
+      --real-s3-bucket-prefix | --real-s3-region | --folded-catalog-get-max-fraction)
       [ $# -ge 2 ] || usage_error "$1 needs a value"
       ;;
     *)
@@ -658,6 +707,7 @@ while [ $# -gt 0 ]; do
     --diagnostic-prometheus-max-samples) diag_max_samples="$2" ;;
     --real-s3-bucket-prefix) real_s3_prefix="$2" ;;
     --real-s3-region) real_s3_region="$2" ;;
+    --folded-catalog-get-max-fraction) folded_catalog_get_max_fraction="$2" ;;
   esac
   shift 2
 done
@@ -706,6 +756,8 @@ for band in ${bands[@]+"${bands[@]}"}; do
   hi="${band##*:}"
   [ "$lo" -le "$hi" ] || usage_error "--rss-band $band has its minimum above its maximum"
 done
+[[ "$folded_catalog_get_max_fraction" =~ ^(0(\.[0-9]+)?|\.[0-9]+|1(\.0+)?)$ ]] ||
+  usage_error "--folded-catalog-get-max-fraction takes a decimal from 0 to 1, got '$folded_catalog_get_max_fraction'"
 if [ "$diagnostic" -eq 1 ] && [ "$diag_max_samples" -eq 0 ]; then
   usage_error "--diagnostic-prometheus-max-samples must be at least 1"
 fi
@@ -1207,7 +1259,7 @@ scrape_ravel_metrics() {
 
 readback_folded_step() {
   local code=0 stamp_code=0 stamp before="${out_dir}/ravel-metrics-before-folded-readback.txt"
-  local after="${out_dir}/ravel-metrics-after-folded-readback.txt" before_arg after_arg missing=""
+  local after="${out_dir}/ravel-metrics-after-folded-readback.txt" before_arg after_arg missing="" verdict
   before_arg="$before"
   scrape_ravel_metrics "$before" || { before_arg=""; missing="before"; }
   "${bin_dir}/metricsbench_ingest" --readback-only --ingest-report "${out_dir}/ingest.json" \
@@ -1217,7 +1269,8 @@ readback_folded_step() {
     >"${out_dir}/readback-folded.json" 2>"${out_dir}/readback-folded.log" || code=$?
   after_arg="$after"
   scrape_ravel_metrics "$after" || { after_arg=""; missing="${missing:+$missing and }after"; }
-  stamp="$(py readback-folded "${out_dir}/readback-folded.json" "$code" "$before_arg" "$after_arg")" || stamp_code=$?
+  stamp="$(py readback-folded "${out_dir}/readback-folded.json" "$code" "$before_arg" "$after_arg" \
+    "${out_dir}/ravel-metrics-at-query.txt" "$folded_catalog_get_max_fraction")" || stamp_code=$?
   [ -z "$stamp" ] || stamp_set readback_folded "$stamp"
   if [ "$code" -ne 0 ]; then
     show_log "${out_dir}/readback-folded.log"
@@ -1228,6 +1281,9 @@ readback_folded_step() {
   [ "$(py get "$STAMPS" readback_folded.matches_expected)" = "True" ] ||
     fail_step readback-folded "metricsbench_ingest --readback-only exited 0 without matches_expected true"
   [ -z "$missing" ] || fail_step readback-folded "the ${missing} scrape of ${RAVEL_BASE}/metrics failed"
+  verdict="$(py get "$STAMPS" readback_folded.catalog_get_verdict 2>/dev/null)" || verdict=""
+  [ "$verdict" = "within" ] ||
+    fail_step readback-folded "folded read-back catalog GETs: ${verdict:-no verdict stamped}"
   step_done readback-folded
 }
 

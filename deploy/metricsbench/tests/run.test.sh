@@ -128,7 +128,17 @@
 #                                       a Ravel row_failure and u8: a Ravel
 #                                       stall skip them, stamped why; u9: the
 #                                       diagnostic mode runs none; u10: the
-#                                       real-S3 lane folds with its overlay
+#                                       real-S3 lane folds with its overlay;
+#                                       u11: large fetch misses leave few
+#                                       catalog GETs, a pass; u12: one catalog
+#                                       GET per data object exits 70 naming
+#                                       readback-folded, u13: listed after a
+#                                       failed ingest; u14: no fetch-miss and
+#                                       u15: no flush counter exit 70 as could
+#                                       not measure; u16: --folded-catalog-get-
+#                                       max-fraction 1 passes u12's figures;
+#                                       u17-u19: a malformed or out-of-range
+#                                       fraction exits 64
 #
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
 #
@@ -312,8 +322,14 @@ case "$url" in
     printf '%s' "${STUB_S3S_BYTES:-stub-s3s-fs-${url##*-linux-}}" >"$out"
     ;;
   */metrics)
-    # Scrape k (1-based) reports k*100 store GETs and k*3 commit-record cache
-    # entries, so consecutive scrapes differ by 100 and 3. From scrape
+    # Scrape k (1-based) reports k*STUB_GETS_PER_SCRAPE (default 100) store
+    # GETs, k*STUB_FETCH_MISSES_PER_SCRAPE (default 95) fetch-cache misses and
+    # k*3 commit-record cache entries, so consecutive scrapes differ by those.
+    # Every scrape reports metrics flushes by size 40, age 100, age_adaptive
+    # 20, age_floor 30 and arrival 10 (200 disjoint), beside a logs flush
+    # count and the rerouted and grace-extended sub-counts
+    # (STUB_FLUSH_SUBCOUNT each, default 2000). STUB_NO_FETCH_MISSES and
+    # STUB_NO_FLUSH_COUNTERS drop those families. From scrape
     # STUB_METRICS_DOWN_FROM on it answers 503.
     k=$(($(cat "${STUB_STATE}.scrapes" 2>/dev/null || echo 0) + 1))
     echo "$k" >"${STUB_STATE}.scrapes"
@@ -327,7 +343,20 @@ case "$url" in
     else
       printf '# TYPE ravel_catalog_fold_last_success_timestamp_seconds gauge\nravel_catalog_fold_last_success_timestamp_seconds 1761000000\n' >"$out"
     fi
-    printf 'ravel_store_calls_total{mode="all",op="get"} %s\nravel_store_calls_total{mode="all",op="put"} 7\n' "$((k * 100))" >>"$out"
+    printf 'ravel_store_calls_total{mode="all",op="get"} %s\nravel_store_calls_total{mode="all",op="put"} 7\n' "$((k * ${STUB_GETS_PER_SCRAPE:-100}))" >>"$out"
+    if [ -z "${STUB_NO_FETCH_MISSES:-}" ]; then
+      printf 'ravel_cache_misses_total{mode="all",cache="fetch"} %s\n' "$((k * ${STUB_FETCH_MISSES_PER_SCRAPE:-95}))" >>"$out"
+    fi
+    printf 'ravel_cache_misses_total{mode="all",cache="catalog"} %s\n' "$((k * 1000))" >>"$out"
+    if [ -z "${STUB_NO_FLUSH_COUNTERS:-}" ]; then
+      for pair in size:40 age:100 age_adaptive:20 age_floor:30 arrival:10; do
+        printf 'ravel_ingest_flushes_by_%s_total{mode="all",signal="metrics"} %s\n' "${pair%%:*}" "${pair#*:}" >>"$out"
+      done
+    fi
+    printf 'ravel_ingest_flushes_by_age_total{mode="all",signal="logs"} 5000\n' >>"$out"
+    printf 'ravel_ingest_flushes_manual_total{mode="all",signal="metrics"} 0\n' >>"$out"
+    printf 'ravel_ingest_rerouted_flushes_total{mode="all",signal="metrics",reason="retired_index"} %s\n' "${STUB_FLUSH_SUBCOUNT:-2000}" >>"$out"
+    printf 'ravel_ingest_grace_extended_stale_flushes_total{mode="all",signal="metrics"} %s\n' "${STUB_FLUSH_SUBCOUNT:-2000}" >>"$out"
     printf 'ravel_catalog_record_cache_entries{mode="all",cache="commit"} %s\nravel_catalog_record_cache_entries{mode="all",cache="compaction"} 1\n' "$((k * 3))" >>"$out"
     printf 200
     ;;
@@ -1125,7 +1154,8 @@ HOUR_NOW=$(($(date -u +%s) / 3600))
 check "u: fold stamped with its report's figures" 'j("stamps.json")["ravel_catalog_fold_writers_stopped"]["entry_count"] == 420 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["buckets_folded"] == 2 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["precondition"] == "met"'
 check "u: fold stamped with sealed and watermark hours at the ingest end hour" 'abs(j("stamps.json")["ravel_catalog_fold_writers_stopped"]["seal_through_hour"] - '"${HOUR_NOW}"') <= 1 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["watermark_hour"] >= j("stamps.json")["ravel_catalog_fold_writers_stopped"]["ingest_end_hour"]'
 check "u: restart stamped" 'j("stamps.json")["ravel_restart"].startswith("restarted: docker compose restart ravel-server")'
-check "u: folded read-back stamped with exit, match, series query_ms and deltas" 'j("stamps.json")["readback_folded"] == {"exit_code": 0, "matches_expected": True, "error": None, "series_query_ms": 12, "store_get_calls_delta": 100, "commit_record_cache_entries_delta": 3}'
+check "u: folded read-back stamped with exit, match, series query_ms, deltas and the catalog GET verdict" 'j("stamps.json")["readback_folded"] == {"exit_code": 0, "matches_expected": True, "error": None, "series_query_ms": 12, "store_get_calls_delta": 100, "commit_record_cache_entries_delta": 3, "fetch_cache_misses_delta": 95, "catalog_get_delta": 5, "data_objects_flushed": 200, "folded_catalog_get_max_fraction": "0.05", "catalog_get_verdict": "within"}'
+check "u: data_objects_flushed sums the five disjoint metrics reasons only" 'j("stamps.json")["readback_folded"]["data_objects_flushed"] == 40 + 100 + 20 + 30 + 10'
 check "u: readback-folded.json is the bin's report" 'j("readback-folded.json")["system"] == "ravel"'
 
 # u1: a fold that sealed nothing.
@@ -1201,6 +1231,58 @@ expect_no_log "u9: diagnostic runs no folded read-back" "--readback-only"
 # u10: the real-S3 lane (case s) folds through the same service, with its overlay.
 LOG="${TMP}/s/calls.log"
 expect_log "u10: the real-S3 fold runs on ravel-qualify with real-s3.yml" "real-s3.yml run --rm --no-deps -T ravel-qualify --store s3 --tenant-hash-unkeyed catalog fold"
+
+# u11: many store GETs, nearly all fetch-cache misses: 2000 GETs less 1995
+# misses leaves 5 catalog GETs against 0.05 x 200 data objects, a pass.
+mapfile -t args < <(full_args "${TMP}/u11/out")
+STUB_GETS_PER_SCRAPE=2000 STUB_FETCH_MISSES_PER_SCRAPE=1995 run_case u11 "${args[@]}"
+expect_rc u11 0
+check "u11: catalog_get_delta is the GET delta less the fetch misses, within the fraction" 'j("stamps.json")["readback_folded"]["store_get_calls_delta"] == 2000 and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 5 and j("stamps.json")["readback_folded"]["data_objects_flushed"] == 200 and j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "within" and "readback-folded" in j("stamps.json")["steps_completed"]'
+
+# u12: about one catalog GET per data object (2200 less 2000 = 200 against
+# 200 objects), as an unfolded read resolves commit records: a breach.
+mapfile -t args < <(full_args "${TMP}/u12/out")
+STUB_GETS_PER_SCRAPE=2200 STUB_FETCH_MISSES_PER_SCRAPE=2000 run_case u12 "${args[@]}"
+expect_rc u12 70
+expect_err "u12: message names step readback-folded and the breach" "step readback-folded failed: folded read-back catalog GETs: breach: catalog_get_delta 200 exceeds 0.05 x data_objects_flushed 200"
+check "u12: stamps name readback-folded and keep both figures and the verdict" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 200 and j("stamps.json")["readback_folded"]["data_objects_flushed"] == 200 and j("stamps.json")["readback_folded"]["catalog_get_verdict"].startswith("breach:") and "readback-folded" not in j("stamps.json")["steps_completed"]'
+
+# u13: the same breach after a failed ingest verification: listed after ingest.
+mapfile -t args < <(full_args "${TMP}/u13/out")
+STUB_INGEST_READBACK_FAIL=ravel STUB_GETS_PER_SCRAPE=2200 STUB_FETCH_MISSES_PER_SCRAPE=2000 run_case u13 "${args[@]}"
+expect_rc u13 70
+check "u13: stamps name ingest, readback-folded failed after it with its figures" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["readback-folded"] and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 200 and j("stamps.json")["readback_folded"]["catalog_get_verdict"].startswith("breach:")'
+
+# u14: no fetch-miss counter in the scrapes: could not measure, a failure.
+mapfile -t args < <(full_args "${TMP}/u14/out")
+STUB_NO_FETCH_MISSES=1 run_case u14 "${args[@]}"
+expect_rc u14 70
+expect_err "u14: message names step readback-folded and the absent counter" 'step readback-folded failed: folded read-back catalog GETs: could not measure: no ravel_cache_misses_total{cache="fetch"} delta'
+check "u14: catalog_get_delta null, data_objects_flushed still stamped" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["catalog_get_delta"] is None and j("stamps.json")["readback_folded"]["data_objects_flushed"] == 200 and j("stamps.json")["readback_folded"]["catalog_get_verdict"].startswith("could not measure")'
+
+# u15: no metrics flush counters in the at-query scrape: could not measure.
+mapfile -t args < <(full_args "${TMP}/u15/out")
+STUB_NO_FLUSH_COUNTERS=1 run_case u15 "${args[@]}"
+expect_rc u15 70
+expect_err "u15: message names step readback-folded and the absent flush counter" "could not measure: no ravel_ingest_flushes_by_size_total"
+check "u15: data_objects_flushed null, catalog_get_delta still stamped" 'j("stamps.json")["readback_folded"]["data_objects_flushed"] is None and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 5'
+
+# u16: a looser fraction is passed through and stamped; u12's breach is
+# within 1.
+mapfile -t args < <(full_args "${TMP}/u16/out")
+STUB_GETS_PER_SCRAPE=2200 STUB_FETCH_MISSES_PER_SCRAPE=2000 run_case u16 "${args[@]}" --folded-catalog-get-max-fraction 1
+expect_rc u16 0
+check "u16: the fraction stamped as given, 200 within 1 x 200" 'j("stamps.json")["readback_folded"]["folded_catalog_get_max_fraction"] == "1" and j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "within"'
+
+# u17-u19: a malformed or out-of-range fraction is a usage error.
+for bad in u17:abc u18:1.5 u19:-0.1; do
+  name="${bad%%:*}"
+  mapfile -t args < <(full_args "${TMP}/${name}/out")
+  run_case "${name}" "${args[@]}" --folded-catalog-get-max-fraction "${bad#*:}"
+  expect_rc "${name}" 64
+  expect_err "${name}: message names the flag and the value" "--folded-catalog-get-max-fraction takes a decimal from 0 to 1, got '${bad#*:}'"
+  expect_no_log "${name}: nothing started" "compose"
+done
 
 echo
 echo "${passes} passed, ${fails} failed"

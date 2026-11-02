@@ -556,6 +556,7 @@ script, and run in CI's `doc-scripts` job.
 | `--keep` | Leave the stack up; stamps say `kept (--keep)` and no `down -v` runs (case g). |
 | `--rss-band CONTAINER:MIN:MAX` | Repeatable. The peak sampled memory of the container (matched by container name or compose service) must lie in `[MIN, MAX]` bytes; outside it, or with no samples, the run exits 75 (case d). |
 | `--diagnostic-prometheus-max-samples N` | The falsification run, below. |
+| `--folded-catalog-get-max-fraction F` | The most catalog GETs the folded read-back (step 16) may spend per data object ingest flushed, a decimal from 0 to 1; default 0.05 (case u), stamped (case u16). A malformed or out-of-range value exits 64 (cases u17 to u19). |
 | `--real-s3-bucket-prefix PREFIX`, `--real-s3-region REGION` | The real-S3 lane, below. One without the other, a prefix S3 cannot name or longer than 44 characters, a malformed region, or either with the falsification run exits 64 (cases s2 to s7). A local build is refused with exit 65 (case t). |
 
 A compose project `metricsbench` that already has containers or volumes is
@@ -701,6 +702,50 @@ verification (step 6), after which the run goes on as a diagnostic:
     u3), and so does a scrape that did not answer 200, whose delta is then
     null (case u4).
 
+    The step then checks that the read used the fold. `catalog_get_delta`
+    is `store_get_calls_delta` less `fetch_cache_misses_delta`
+    (`ravel_cache_misses_total` with `cache="fetch"`) between the same two
+    scrapes (cases u, u11), the store GETs that did not fetch data, which a
+    read on an unfolded catalog spends resolving one commit record per data
+    object. `data_objects_flushed` is the sum of
+    `ravel_ingest_flushes_by_size_total`, `_by_age_total`,
+    `_by_age_adaptive_total`, `_by_age_floor_total` and `_by_arrival_total`
+    with `signal="metrics"` in `ravel-metrics-at-query.txt`, the fold-state
+    scrape taken before the restart. Those five are disjoint: each flush
+    open bumps exactly one of them by its trigger
+    (`record_flush`, crates/ravel-ingest/src/metrics.rs:956-964, called once
+    per flush open at crates/ravel-ingest/src/shard.rs:2662), so sub-counts
+    such as `ravel_ingest_rerouted_flushes_total` and other signals'
+    samples are not added (case u). The step fails with exit 70 naming
+    readback-folded when `catalog_get_delta` exceeds
+    `--folded-catalog-get-max-fraction` (default 0.05) times
+    `data_objects_flushed` (case u12; a failure after a failed ingest is
+    listed in `failed_after_ingest`, case u13), and when either figure
+    cannot be read: a scrape without the fetch-miss counter (case u14) or an
+    at-query scrape without a flush counter (case u15). `readback_folded`
+    stamps both figures, `folded_catalog_get_max_fraction` and
+    `catalog_get_verdict` (`within`, `breach: ...` or `could not measure:
+    ...`) before the step fails, so a breach keeps its numbers (cases u12,
+    u14, u15).
+
+    The measured basis, from issue #2821 comment 6583379446 and the E8
+    run: on a real-S3 run's unfolded read-back the GET delta was 29,029
+    and the fetch-cache misses 13,780, leaving 15,249 against 15,248
+    commit records; on an s3s-fs run after a restart, 38,698 less 29,652
+    is 9,046 against a commit-record cache growth of 9,042. An unfolded
+    read sits near one catalog GET per data object, twenty times the
+    default fraction.
+
+    `commit_record_cache_entries_delta` is a residency figure, the change
+    in an eviction-bounded gauge, and after the restart its before value is
+    near zero. It is stamped as context and the check does not use it.
+
+    Of the fold step's two conditions, `seal_through_hour` being `Some(N)`
+    is close to automatic for a writers-stopped fold:
+    `fold_with_writers_stopped` sets it from the hour the clock reads
+    (services/ravel-cli/src/catalog.rs:136-137). The `watermark_hour` clause (case u2)
+    is the one that can fail on a fold that sealed too little.
+
 Steps 14 to 16 also run after a failed ingest verification when the Ravel
 row itself replayed and only its read-back failed or mismatched, which is the
 case they measure: the run still exits 70 naming ingest (case u5), and a
@@ -805,9 +850,9 @@ deploy/metricsbench/run.sh --profile history --bin-dir target/release \
 | Exit | Meaning |
 |---|---|
 | 0 | Every step passed (cases a, f, g). |
-| 64 | Usage error (cases h, p). |
+| 64 | Usage error (cases h, p, u17 to u19). |
 | 65 | A refused input, or an s3s-fs binary whose sha256 is not the pin; nothing was started (cases c, h, p, n2, n3, n4). |
-| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k, n6, r, u1, u2, u3, u4). After a failed ingest verification (a row's read-back failed or a row stalled) the run queries as a diagnostic, records the failure, and exits 70 naming step ingest, even when a later step failed too; the first later step to fail ends the run, so an `--rss-band` breach reaches `failed_after_ingest` only when every step before `memory` passed, while `memory-summary.json` records it either way (cases q, q2, q3, q4); steps 14 to 16 still run when the Ravel row replayed, and a failure there is listed in `failed_after_ingest` (cases u5, u6). |
+| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k, n6, r, u1, u2, u3, u4, u12, u14, u15). After a failed ingest verification (a row's read-back failed or a row stalled) the run queries as a diagnostic, records the failure, and exits 70 naming step ingest, even when a later step failed too; the first later step to fail ends the run, so an `--rss-band` breach reaches `failed_after_ingest` only when every step before `memory` passed, while `memory-summary.json` records it either way (cases q, q2, q3, q4); steps 14 to 16 still run when the Ravel row replayed, and a failure there is listed in `failed_after_ingest` (cases u5, u6, u13). |
 | 75 | An `--rss-band` was violated or a container was OOM-killed (cases d, e). |
 
 ## Verify the pins
