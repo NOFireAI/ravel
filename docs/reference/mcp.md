@@ -2,9 +2,9 @@
 
 > The `POST /mcp` route exists in builds compiled with the `mcp` cargo
 > feature, and is mounted when `--mcp` is passed; both are off by default.
-> Five tools are served today: `ravel_capabilities`, `ravel_describe_data`,
-> `ravel_find_labels`, `ravel_explain_query` and `ravel_get_trace`. The
-> other four are in the
+> Six tools are served today: `ravel_capabilities`, `ravel_describe_data`,
+> `ravel_find_labels`, `ravel_explain_query`, `ravel_query_sql` and
+> `ravel_get_trace`. The other three are in the
 > catalog (so `tools/list` returns them) and refuse
 > every call with a
 > `method_not_found` protocol error until their bodies land; their entries
@@ -26,7 +26,7 @@ grouping, the envelope fields, and the empty-result checklist.
 | `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, committed row count, an upper bound (summed from commit records, before duplicate collapse and pending erasure) | `signal` (`metrics`, `logs` or `traces`), an optional `cursor` | `data` (`kind`, `name`, `value` rows: `table`, `column`, `indexed_key`, `family`), `scope`, `visibility`, `coverage`, `accuracy` (`exact: false` on page one, for the row count), `presentation`, `budget` | 100 metric families per page; the schema declares no budget input, and a page is bounded by `max_response_bytes`, 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `cursor_expired`, `cursor_invalid`, `internal` |
 | `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, an optional `filter`, `time_range` (required), `deadline_ms`, `max_response_bytes`. A call carrying neither a selector nor a label name is refused, whatever its filter | `data`, `scope`, `coverage`, `presentation` | at most 2,000 segments admitted for resolution, fewer when the effective `max_segments` is lower; `max_response_bytes` 512 KiB default, 256 KiB floor. No `max_rows`: a page is bounded by bytes, and a page cut short reports through `presentation.bytes_cap_hit` and `presentation.rows_omitted` | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
 | `ravel_explain_query` | Validate a SQL statement, estimate its cost, and return the plan shape. No scan runs. SQL only: see [Explaining a statement](#explaining-a-statement) | `query`, `time_range` (required), `deadline_ms`, `max_response_bytes` | `data` (effective schema as `data.columns`, zero rows), `scope`, `visibility`, `budget` (the estimate beside `effective`), `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `deadline`, `unavailable`, `internal` |
-| `ravel_query_sql` | One `SELECT` over one table | `query`, `time_range` (required), `max_rows`, lowerable budgets, an optional `cursor`, an optional `evidence_ref` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
+| `ravel_query_sql` | One read-only `SELECT` over one table, its rows filtered to `time_range` and paged by a keyset cursor. See [Running a statement](#running-a-statement) | `query`, `time_range` (required), `max_rows`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_segments`, `max_store_requests`, an optional `cursor`. An `evidence_ref` is refused with `unsupported` | `data`, `scope` (`order_by` is the effective order, tiebreak included), `visibility`, `presentation`, `budget` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
 | `ravel_query_promql` | Instant or range PromQL evaluation | `query`, either `time_range` and `step` or `evaluation_time` (exactly one mode), partial-coverage consent, an optional `evidence_ref`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests` | `data`, `scope`, `coverage`, `accuracy`, `budget`, `evidence` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
 | `ravel_search_logs` | Typed log search compiled to SQL | indexed and typed-attribute predicates, `has_word`, severity, trace id, `time_range` (required), an optional `cursor`, an optional `evidence_ref`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
 | `ravel_get_trace` | Every span of one trace id, as rows of the `spans` table ordered by `(start_ts, span_id)` | `trace_id` (32 hexadecimal characters, either case), an optional `time_range`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests`. Without `time_range`, every span the tenant retains is read; with it, only spans that start inside it are returned | `data`, `scope`, `presentation`, `budget` | the shared budgets in the section below; past `max_rows` the result is cut, with status `ok_bounded` and `presentation.row_cap_hit` set | `unauthorized`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
@@ -80,7 +80,7 @@ size it used, `max_rows` held to 1,000, as both `presentation.max_rows` and
 | `ravel_agent_events` | One page of the agent's events in `event_seq` order, optionally one operation's | `kind`, `key`, an optional `cursor`, an optional `operation`, `deadline_ms`, `max_response_bytes`, `max_rows` | `POST /api/v1/agents/events` | `max_rows` 200, at most 1,000; a full or byte-capped page carries `presentation.cursor`, the last event it kept | `unauthorized`, `invalid_argument`, `cursor_expired` (with a `restart_from_oldest_cursor` next step), `deadline`, `unavailable`, `internal` |
 | `ravel_agent_blocked_effects` | Effects in doubt, each with the inspector's text and the two reconcile requests that unblock it | `kind`, `key`, `deadline_ms`, `max_response_bytes` | `GET /api/v1/agents/effects` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
 
-The `tools/list` result is 15,652 bytes with the nine tools and 23,541
+The `tools/list` result is 15,733 bytes with the nine tools and 23,622
 bytes with all fifteen, against a budget of 24,576 bytes. A test pins both
 figures exactly.
 
@@ -123,6 +123,52 @@ false.
   warning names each budget the explain did not check: the Parquet reader
   enforces `max_store_requests` and `max_bytes_scanned` at scan time and
   refuses the read that would cross either.
+
+### Running a statement
+
+`ravel_query_sql` checks the statement from its text, in this order, before
+it reads anything:
+
+| Statement | Answer |
+| --- | --- |
+| names two tables | `invalid_argument` from the one-table rule, with a `split_the_statement` next step |
+| not a read-only `SELECT` | `unsupported` |
+| fails SQL validation | `validation`, with the engine's text and a `next_steps` entry naming `ravel_query_promql` |
+| cannot be paged: for example its own `LIMIT`, `OFFSET`, `FETCH` or `TOP`, an `ORDER BY` term that is not a projected column or may be NULL, or a float `ORDER BY` term | `invalid_argument` naming the planner's reason, with a `rewrite_the_statement` next step |
+| no `ORDER BY`, and no projected row identity to order by (only `samples` has one: `ts` and `series_id`) | runs as written, unpaged |
+| any other `SELECT` over one table | runs, paged |
+
+A float `ORDER BY` term is refused because a NaN or infinite value has no
+cursor position: the rows after it could not be reached. Order by another
+column to page the same rows.
+
+`time_range` filters rows, not only segments: a row whose timestamp is
+outside the half-open window is not returned, even when its segment
+overlaps the window.
+
+A page holds at most `max_rows` rows. The tool appends a tiebreak to the
+statement's `ORDER BY` where the table has one (`series_id` on `samples`)
+and reports the whole order in `scope.order_by`. Under a total order the
+cursor resumes after the page's last row. Under an order that is not
+total, a warning says so, and the page ends before the last group of rows
+equal under the order; see [Page order](#page-order).
+
+A full page ends `ok_bounded` with no cursor, and a `next_steps` entry, in
+these cases:
+
+| Case | Next step |
+| --- | --- |
+| The statement has no order to page by | `add_an_order_by` |
+| No complete group of equal rows fits the page | `narrow_time_range` |
+| The last row's order values could not be read, or one is NaN or infinite | `narrow_time_range` |
+| The cursor after the last row is over its 4 KiB bound, as a long string order value makes it | `narrow_time_range` |
+
+A warning names the reason in each case. None of them is a failure.
+
+A cursor is bound to the statement, `time_range` and the effective
+`max_rows`; a call that changes any of them is refused as
+`cursor_invalid`. A later page resolves at page one's instant and audits at
+its own clock, as under [Redemption](#redemption).
 
 ### Which list `ravel_find_labels` returns
 
@@ -233,6 +279,12 @@ authentication code. It is a server defect, and the server drops the cursor.
 | --- | --- |
 | Carries no other failure | The defect is the failure, and its class is `internal`. |
 | Already failed | The original class, message, and counter stay, because they say why the call failed. `metadata_elided` and a warning that names the bound report the dropped cursor. |
+
+`ravel_query_sql` is the exception. Its cursor carries the page's own order
+values, so a long string value can put it over the bound without any server
+defect. It measures the cursor when it mints one, and a page whose cursor
+would be over the bound ends `ok_bounded` with no cursor, a warning, and a
+`narrow_time_range` next step (see [Running a statement](#running-a-statement)).
 
 ### The row cap
 
@@ -542,7 +594,9 @@ page says so in `warnings`.
 ### Evidence references
 
 Every data tool except `ravel_find_labels` accepts an optional
-`evidence_ref` input. Redeeming a reference re-executes the tool with the
+`evidence_ref` input. Of the served tools, `ravel_query_sql` and
+`ravel_get_trace` refuse one with `unsupported` in this build, and none
+emits an `evidence` block yet; this section describes the design. Redeeming a reference re-executes the tool with the
 reference's own arguments. The re-execution runs against the reference's
 pinned snapshot while the pin is valid. The server then compares the
 BLAKE3-256 digest of the canonical row bytes. The digest travels in the
@@ -566,7 +620,7 @@ failure.
 | `max_response_bytes` | 512 KiB | floor 256 KiB | yes, raised to the floor if lower |
 | `max_response_bytes` ceiling | 4 MiB | an operator may configure a lower one | no; a larger request clamps to it |
 | cursor or evidence token length | 1 MiB | fixed | no; a longer token is refused unread |
-| `presentation.cursor` in the envelope | 4 KiB | fixed | no; a cursor over its bound is dropped, as an `internal` failure on an otherwise-successful result and as a counted drop with a warning on one that already failed |
+| `presentation.cursor` in the envelope | 4 KiB | fixed | no; a cursor over its bound is dropped, as an `internal` failure on an otherwise-successful result and as a counted drop with a warning on one that already failed; `ravel_query_sql` mints none over it and ends the page `ok_bounded` |
 | metric families per `ravel_describe_data` page | 100 | fixed | no |
 | segments admitted for `ravel_find_labels` resolution | 2,000 | fixed | no |
 | tokens in a SQL statement | 1,000 | fixed | no; a statement over it is refused before it is parsed, as `validation` |

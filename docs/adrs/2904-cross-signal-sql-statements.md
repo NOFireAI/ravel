@@ -259,7 +259,8 @@ not guaranteed for a join; see the #2915 amendment below.
   ships it refuses a multi-table statement with `CrossSignalQuery` before
   any listing. Nothing in the MCP adapter makes that refusal yet; see the
   #2915 amendment below. A second table that is not a signal table refuses
-  with a different error; see the one-table check amendment below.
+  with a different error; see the one-table check amendment below. Both MCP
+  SQL tools now ship and make the refusal; see the #3683 amendment below.
 
 ### 10. Flight SQL carries one segment group per signal
 
@@ -384,7 +385,8 @@ single response that says what each side read.
   accepted and ignored.
 - Paging and MCP keep the one-table rule and now hold it themselves instead
   of inheriting it from the executor. Paging does; the MCP refusal is owed
-  by whoever ships the SQL tools (see the #2915 amendment below).
+  by whoever ships the SQL tools (see the #2915 amendment below), and both
+  SQL tools now make it (the #3683 amendment below).
 - ADR-0033, ADR-0045, ADR-1101 and ADR-2040 carry amendment sections that
   point here, added with this ADR. Each says the executor still enforces the
   old rule until the code lands.
@@ -481,7 +483,7 @@ Four places where the decisions as written are not what the tree does:
   `ravel_explain_query` answer `NotShipped` (`crates/ravel-mcp/src/tools/mod.rs`),
   and `ravel_get_trace` builds a statement over `spans` alone. Whoever
   ships either SQL tool owes decision 9's `CrossSignalQuery` refusal before
-  any listing, with a test.
+  any listing, with a test. The #3683 amendment below closes this item.
 
 ## Amendment (issue #1409): every signal table's scan enforces the statement's budgets
 
@@ -520,3 +522,21 @@ query, such as `INSERT` or `EXPLAIN`, and admits it, and `validate_query` then
 refuses that statement.
 
 Refs: #3620
+
+## Amendment (2026-11-02): the #3683 amendment, both MCP SQL tools make the one-table refusal
+
+<!-- amendment-applies: sections="9. What keeps the one-table rule|Consequences|Amendment (2026-11-01): what landed differs from decisions 2, 5, 8 and 9 (#2915)" pointer="#3683 amendment" -->
+
+The #2915 amendment's last item, that the MCP refusal of decision 9 is owed
+rather than made, is closed. `ravel_explain_query`
+(`crates/ravel-mcp/src/tools/explain_query.rs`) and `ravel_query_sql`
+(`crates/ravel-mcp/src/tools/query_sql.rs`) both call
+`ravel_sql::refuse_several_tables` on the caller's text before any backend
+call, so before any listing, and answer its refusal as `invalid_argument`.
+`ravel_query_sql` calls it first, before `validate_query` and the page
+planner, and adds a `split_the_statement` next step. Each tool has a test
+that refuses a statement over two tables with a backend that fails if it is
+reached: `a_statement_naming_two_tables_refuses_before_the_port` and
+`statement_refusals_are_answered_before_the_backend`.
+
+Refs: #3683
