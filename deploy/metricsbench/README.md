@@ -104,20 +104,23 @@ Every write and query carries `Authorization: Bearer metricsbench-token`
 (`--tenant-token metricsbench-token=metricsbench`). `/api/v1/status/buildinfo`
 answers without it.
 
-**Envelope.** The same `cpus: "2.0"` and `memory: 4g` limits as `prometheus`,
-`victoriametrics` and `mimir`. Ravel's memory split is written as flags, not
-left to the server's derivation from the container, and the server logs each
-value with `source="flag"` at startup:
+**Envelope.** The same `cpus: "2.0"` and `memory: 8g` limits as `prometheus`,
+`victoriametrics` and `mimir`. The envelope was 4g until Mimir was
+OOM-killed at 4g ingesting the `cardinality` profile; every engine's memory
+was raised together, so figures taken at 4g are not compared with figures
+taken at 8g. Ravel's memory split is written as flags, not left to the
+server's derivation from the container, and the server logs each value with
+`source="flag"` at startup:
 
 | Quantity | Bytes | How |
 |---|---|---|
-| Envelope | 4,294,967,296 | `memory: 4g` |
-| Reserve outside the budget | 1,073,741,824 | max(min(2 GiB, envelope / 4), 256 MiB baseline + 512 MiB ingest buffer) |
-| `--memory-budget-bytes` | 3,221,225,472 | envelope minus reserve |
-| `--cache-max-bytes` (fetcher cache) | 805,306,368 | 25% of the budget, the derived share for a non-loopback S3 endpoint |
-| `--catalog-cache-max-bytes` | 161,061,273 | 5% of the budget, the derived share |
-| `--column-stats-cache-max-bytes` | 64,424,509 | 2% of the budget, the derived share (ADR-1413 decision 5) |
-| Budget left for query working set | 2,190,433,322 | budget minus the three caches (1,030,792,150) |
+| Envelope | 8,589,934,592 | `memory: 8g` |
+| Reserve outside the budget | 2,147,483,648 | max(min(2 GiB, envelope / 4), 256 MiB baseline + 512 MiB ingest buffer) |
+| `--memory-budget-bytes` | 6,442,450,944 | envelope minus reserve |
+| `--cache-max-bytes` (fetcher cache) | 1,610,612,736 | 25% of the budget, the derived share for a non-loopback S3 endpoint |
+| `--catalog-cache-max-bytes` | 322,122,547 | 5% of the budget, the derived share |
+| `--column-stats-cache-max-bytes` | 128,849,018 | 2% of the budget, the derived share (ADR-1413 decision 5) |
+| Budget left for query working set | 4,380,866,643 | budget minus the three caches (2,061,584,301) |
 | `--max-ingest-buffer-bytes` | 536,870,912 | the 512 MiB default, stated; held in the reserve |
 
 **Disclosed settings** (each commented next to its flag in `ravel.yml`):
@@ -246,6 +249,7 @@ scrape grid.
 | VictoriaMetrics | `-search.maxSamplesPerQuery` | `1000000000` | `1000000000` (unchanged) | Raw samples read across all series, unlike Prometheus' peak count. Largest: `mb_full_range_avg_over_time` on cardinality, 400,000 series x 240 samples (the 30 m grid plus the 30 m window, 1 h at 15 s) = 96,000,000 | `-search.maxSamplesPerQuery int  The maximum number of raw samples a single query can process across all time series ... (default 1000000000)` |
 | VictoriaMetrics | `-search.maxQueryDuration` | `120s` | `30s` | Equal to Prometheus' `--query.timeout` | `-search.maxQueryDuration duration  The maximum duration for query execution ... (default 30s)` |
 | VictoriaMetrics | `-search.maxUniqueTimeseries` | `1000000` | derived from CPU and memory | Cardinality profile, 1,000,000 series | `When set to zero, the limit is automatically calculated based on -search.maxConcurrentRequests (inversely proportional) and memory available to the process (proportional).` |
+| VictoriaMetrics | `-search.maxSeries` | `1000000` | `30000` | The harness's cardinality read-back lists all 1,000,000 series through `/api/v1/series`; the default refuses it with a 422 | `-search.maxSeries int  The maximum number of time series, which may be returned from /api/v1/series ... (default 30000)` |
 | VictoriaMetrics | `-search.disableCache` | `true` | `false` | Historical replay; a production_cache regime re-enables it per run | `-search.disableCache  Whether to disable response caching. This may be useful when ingesting historical data.` |
 | Mimir | `limits.out_of_order_time_window` | `1h` | `0s` | Same as Prometheus | `-ingester.out-of-order-time-window duration  Non-zero value enables out-of-order support`; `0s` read from the 3.2.3 binary's `/config` |
 | Mimir | `limits.past_grace_period` | `0s` | `0s` (unchanged) | A 30 d replay is not refused for its age | `-validation.past-grace-period duration ... 0 to disable.` |
@@ -255,7 +259,7 @@ scrape grid.
 | Mimir | `compactor.cleanup_interval` | `15m` | `15m` (unchanged) | Readiness wait, not a query budget | `-compactor.cleanup-interval duration  How frequently the compactor should run blocks cleanup and maintenance, as well as update the bucket index. (default 15m0s)` |
 | Mimir | `limits.max_fetched_chunks_per_query` | `5000000` | `2000000` | Per statement, counting a shipped block twice (the querier reads the overlap from the ingester and the store-gateway). Largest read: `mb_full_range_avg_over_time` on cardinality, 96,000,000 samples / 120 = 800,000 chunks, up to 1,200,000 with one 2 h block cut per series, 2,400,000 counted twice. Largest history read: `mb_long_range_7d_avg`, 1,000 x 40,320 / 120 = 336,000. Out-of-order chunks add at most 450,000 (one in 800 of cardinality's 360,000,000 samples) | `-querier.max-fetched-chunks-per-query int  Maximum number of chunks that can be fetched in a single query ... (default 2000000)`; 120 per chunk observed (9,600 samples in 80 chunks per 2 h block of 20 series) |
 | Mimir | `querier.max_samples` | `500000000` | `50000000` | As for Prometheus (peak samples held); does not fire under the default query engine (see below) | `-querier.max-samples int  Maximum number of samples a single query can load into memory. ... (default 50000000)` |
-| Mimir | `limits.max_estimated_memory_consumption_per_query` | `2147483648` (2 GiB) | `0` (disabled) | Half the 4g envelope, which this one process shares with the ingester and the store-gateway; sized to the envelope, not the corpus (see the note below) | `-querier.max-estimated-memory-consumption-per-query uint  [experimental] ... only enforced when Mimir's query engine is in use. ... 0 to disable.` |
+| Mimir | `limits.max_estimated_memory_consumption_per_query` | `4294967296` (4 GiB) | `0` (disabled) | Half the 8g envelope, which this one process shares with the ingester and the store-gateway; sized to the envelope, not the corpus (see the note below) | `-querier.max-estimated-memory-consumption-per-query uint  [experimental] ... only enforced when Mimir's query engine is in use. ... 0 to disable.` |
 | Mimir | `querier.timeout` | `2m` | `2m` (unchanged) | Equal to Prometheus' `--query.timeout` | `-querier.timeout duration  The timeout for a query. ... (default 2m0s)` |
 | Mimir | `limits.max_total_query_length` | `31d` | `0s` (no limit) | History's 30 d span plus 1 d; `max_query_length` does not exist in 3.2.3 | `-query-frontend.max-total-query-length duration  Limit the total query time range (end - start time).` |
 | Mimir | `limits.max_partial_query_length` | `0s` | `0s` (unchanged) | No separate bound on split sub-queries | `-querier.max-partial-query-length duration  Limit the time range for partial queries at the querier level.` |
@@ -301,9 +305,9 @@ against this deployment.
 Under Mimir 3.2.3's default query engine, `querier.max_samples` did not fire:
 with it set to 100, a query over 28,801 samples returned 200. That engine's
 per-query bound is `max_estimated_memory_consumption_per_query`, frozen at
-2 GiB so an oversized query is refused with
+4 GiB so an oversized query is refused with
 `err-mimir-max-estimated-memory-consumption-per-query` (a `refused(budget)`
-outcome, matched by the signature table below) instead of exhausting the 4g
+outcome, matched by the signature table below) instead of exhausting the 8g
 envelope. Unlike the other Mimir limits it is sized to the envelope, not to
 the corpus, so a large history-profile statement may be refused on Mimir
 where Prometheus answers it. The flag is marked experimental in 3.2.3. The
@@ -374,7 +378,7 @@ the capture does not query a Ravel that is not running.
 
 Every image in `docker-compose.yml` is pinned to an immutable `@sha256:`
 digest (see below); Ravel's image is the `RAVEL_IMAGE` the run passes. Each
-comparator, Ravel included, is given identical CPU (2.0) and memory (4g)
+comparator, Ravel included, is given identical CPU (2.0) and memory (8g)
 limits so no engine wins on hardware.
 
 **The digest pins the manifest, not the platform.** These are multi-architecture
