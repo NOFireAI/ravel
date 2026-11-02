@@ -1668,7 +1668,22 @@ What you see:
   fails the ingest router's read of that record the way a corrupt generation
   history does. Writes for that tenant and signal are then refused with
   `StaleProvisioningView` (HTTP 503): at once for a tenant the router has no
-  cached view of, and once the cached view's grace window ends otherwise. A
+  cached view of, and once the cached view's grace window ends otherwise. The
+  same holds for a record the store cannot serve at all, such as one whose
+  stored checksum no longer matches its body. After a failed read the router
+  does not read that tenant's record again for 1 second, then 2, 4 and so on,
+  doubling on each consecutive failure up to 30 seconds; a successful read
+  resets it. A write inside that window is refused, or routed on the cached
+  view inside its grace window, without a store read. Each failed read logs
+  one ERROR line naming the tenant hash, the signal, the cause and the delay
+  before the next read, and counts once under
+  `ravel_ingest_provisioning_read_failures_total{signal,cause}`, where
+  `cause` is `store` (the GET failed) or `decode` (the record did not decode
+  or failed validation). That counter counts reads;
+  `ravel_ingest_stale_provisioning_flushes_total` counts the refused writes,
+  which outnumber the reads. The first-write provisioning check on every
+  ingest request treats a store error as a pass, logs a WARN, and backs off
+  the same way, so the request is answered by the router's decision. A
   `maintain` compaction or erasure rewrite of the tenant's buckets fails its
   floor read and writes nothing.
 - In a `maintain` process, a compaction or erasure rewrite reads the bucket's

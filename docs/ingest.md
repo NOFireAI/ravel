@@ -249,6 +249,27 @@ wrong-routing. A router routing through this window increments
 still failed closed), so sustained store degradation is visible as "degraded
 but available" rather than indistinguishable from an outage.
 
+#### Read backoff on a failed re-read
+
+A record that keeps failing to read (a store that serves it with a failing
+checksum, say) would otherwise be read again on every write for that tenant.
+After a failed re-read the switch records a retry time for the tenant: 1
+second after the failure, doubling on each consecutive failure up to 30
+seconds. Until then a write that finds a stale view issues no GET; it still
+tries the grace window above and otherwise fails closed with
+`StaleProvisioningView` as before. The flush-open background re-read obeys
+the same window. A successful read removes the entry, and idle-tenant
+eviction removes one whose last failure is older than the idle threshold, so
+the switch holds an entry only for a tenant whose last read failed.
+Each failed read logs one ERROR line (tenant hash, signal, cause, delay to
+the next read) and counts once under
+`ravel_ingest_provisioning_read_failures_total{signal,cause}`, `cause`
+being `store` for a failed GET and `decode` for a record that did not decode
+or failed its checked read. The server's first-write provisioning check
+(`ProvisioningRecordWriter::ensure`) stays fail-open on a store error and
+backs off per (tenant, signal) on the same schedule, so it issues no store
+read inside the window either.
+
 #### Decrease and the straggler slack window `S`
 
 On a decrease (say 8 shards down to 4), a write routed under the retiring,
