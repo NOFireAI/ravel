@@ -756,7 +756,8 @@ struct Inner<H> {
     refreshing: HashMap<TenantHash, watch::Receiver<Option<bool>>>,
     /// Tenants whose last provisioning read failed, and when the next read is
     /// allowed (issue #3653). Holds an entry only while the last read failed:
-    /// a successful read and idle eviction both remove it.
+    /// a successful read removes it, and so does idle eviction once the last
+    /// failure is older than the idle threshold.
     read_backoff: ReadBackoff<TenantHash>,
 }
 
@@ -855,8 +856,9 @@ impl<H> GenerationSwitch<H> {
     }
 
     /// Arm or double `tenant`'s read backoff after a failed read issued at
-    /// `now_ns`, count it, and log it. Called once per issued read, so the
-    /// ERROR line is bounded by the backoff window.
+    /// `now_ns`, count it, and log it. Called once per issued read: inside a
+    /// window no read is issued, so the line repeats at most once per window,
+    /// plus once for each read already in flight when the window was armed.
     fn note_read_failure(
         &self,
         inner: &mut Inner<H>,
