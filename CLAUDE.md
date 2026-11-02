@@ -415,7 +415,12 @@ connection, a pushed-but-broken main).
   GraphQL review-thread concept), so a nonzero comment count needs a
   human/session read of `gh api repos/.../pulls/<n>/comments` to judge
   whether each was already fixed or answered; the script only tells you
-  there's something to read.
+  there's something to read. A review the bot could not parse (body starting
+  `Review task finished without a structured result`) has no findings to
+  count, so it is refused with no merge line rather than called clean, and
+  `--confirm-addressed` does not clear it: read the body, re-trigger the
+  review, or re-run with `ALLOW_UNSTRUCTURED_REVIEW=1` if the body is a
+  complete review.
 - `scripts/verify-dispatch-gates.sh [--with-gates] <ref> <scratchpad-dir>`:
   the tier-1 gate check behind the `verify-dispatch` skill: an isolated
   worktree outside the repo, a cold `CARGO_TARGET_DIR`, and the full
