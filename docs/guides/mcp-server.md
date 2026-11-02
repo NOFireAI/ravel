@@ -8,10 +8,10 @@ which has its own guide: [Ravel Agents](agents.md).
 > off by default. Build `ravel-server` with `--features mcp`, then run it
 > with `--mcp` (only supported under `--mode all` or `--mode query`) to
 > mount `POST /mcp` on the query router; `--mcp-allowed-origins` is required
-> once that listener is reachable from anywhere but localhost. Six tools are
+> once that listener is reachable from anywhere but localhost. Seven tools are
 > served today: `ravel_capabilities`, `ravel_describe_data`,
-> `ravel_find_labels`, `ravel_explain_query`, `ravel_query_sql` and
-> `ravel_get_trace`. The other three are catalogued, so
+> `ravel_find_labels`, `ravel_explain_query`, `ravel_query_sql`,
+> `ravel_query_promql` and `ravel_get_trace`. The other two are catalogued, so
 > `tools/list` returns them, and a call to one refuses with a
 > `method_not_found` protocol error until its body lands; the sections below
 > describe the surface as designed. The [MCP reference](../reference/mcp.md)
@@ -154,7 +154,12 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   [reference](../reference/mcp.md#running-a-statement) lists each answer.
 - `ravel_query_promql`: an instant or a range PromQL evaluation, with
   partial-coverage consent, step alignment, and the two log pseudo-metrics
-  available the same as any other metric name.
+  available the same as any other metric name. It answers one row per
+  series, the series' timestamps and values as parallel arrays, and
+  `max_rows` counts series: a capped result is `ok_bounded` with no cursor.
+  A result that skipped part of its coverage is refused as `unavailable`
+  unless the call sets `allow_partial_coverage: true`. The
+  [reference](../reference/mcp.md#evaluating-promql) lists each answer.
 
 ### Search logs
 
@@ -324,7 +329,8 @@ ask for the bounded form of a listing, retry after a wait.
 Five tools take a required time input: `ravel_query_sql`,
 `ravel_search_logs`, `ravel_find_labels`, `ravel_analyze_timeseries`, and
 `ravel_query_promql`. There is no default window. If you omit the time
-input, the call fails with `missing_argument`. `ravel_get_trace` is the
+input, the call fails with `missing_argument`, except on
+`ravel_query_promql`, whose modes are below. `ravel_get_trace` is the
 exception: its time range is optional, and a lookup without one reads
 every span the tenant retains.
 
@@ -347,7 +353,11 @@ included, the end is not. A row at the end timestamp is outside the window.
 - Range mode takes `time_range` and `step`.
 - Instant mode takes one `evaluation_time` and no `time_range`.
 
-If you send both, or neither, the call fails with `invalid_argument`.
+If you send both, or neither, or only one of `time_range` and `step`, the
+call fails with `invalid_argument`. The steps run from the range's start
+while below its end. The engine evaluates in milliseconds, so a time or a
+step that is not a whole millisecond is refused as `invalid_argument`
+rather than rounded. The step takes a unit, such as `30s`.
 
 ## Budgets you can lower
 
@@ -441,6 +451,9 @@ Paging order differs per tool:
 - `ravel_get_trace` mints no cursor as served today: it returns the trace's
   spans in one page, ordered by `start_ts` and `span_id`, and a trace larger
   than the row cap comes back bounded (`row_cap_hit`) rather than paged.
+- `ravel_query_promql` mints no cursor: a PromQL result has no order a
+  cursor could resume. Its row cap counts series, and a result with more
+  series than `max_rows` comes back `ok_bounded`.
 - `ravel_describe_data` pages by keyset over the row kind and the name:
   columns first, then indexed keys, then metric families, each sorted by
   name in byte order, so `Zeta` comes before `alpha`. The cursor holds the
