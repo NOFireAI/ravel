@@ -8,9 +8,10 @@ which has its own guide: [Ravel Agents](agents.md).
 > off by default. Build `ravel-server` with `--features mcp`, then run it
 > with `--mcp` (only supported under `--mode all` or `--mode query`) to
 > mount `POST /mcp` on the query router; `--mcp-allowed-origins` is required
-> once that listener is reachable from anywhere but localhost. Four tools are
-> served today: `ravel_capabilities`, `ravel_find_labels`,
-> `ravel_explain_query` and `ravel_get_trace`. The other five are catalogued, so
+> once that listener is reachable from anywhere but localhost. Five tools are
+> served today: `ravel_capabilities`, `ravel_describe_data`,
+> `ravel_find_labels`, `ravel_explain_query` and `ravel_get_trace`. The
+> other four are catalogued, so
 > `tools/list` returns them, and a call to one refuses with a
 > `method_not_found` protocol error until its body lands; the sections below
 > describe the surface as designed. The [MCP reference](../reference/mcp.md)
@@ -81,7 +82,9 @@ server offers over MCP, `ravel_agent_send`, belongs to the
 - `ravel_describe_data`: for one signal, the effective schema (fixed and
   typed attribute columns), which keys are indexed, the metric families with
   their type and unit, the freshness watermark, the coverage window, and
-  exact row counts where the catalog can give them.
+  the committed row count. That count is summed from commit records, so it
+  counts rows before duplicate collapse and before any pending erasure.
+  Logs and traces have no metric families, and the response says why.
 
 ### Find labels
 
@@ -346,7 +349,10 @@ Defaults and floors:
   `cursor` input asks for the next page. The response carries
   `presentation.cursor` when more families exist. Request the next page
   with the same signal and that cursor. The cursor follows the same
-  codec, tenant binding, and lifetime as every other cursor.
+  codec, tenant binding, and lifetime as every other cursor. Its
+  `budget.actual` counts the catalog resolve only: the metric metadata
+  and tenant configuration reads are not counted, and every page says so
+  in `warnings`.
 - `ravel_find_labels`: at most 2,000 segments admitted for label
   resolution, fewer when your `max_segments` is lower. It
   takes no `max_rows`, and a page is bounded by bytes alone. A page cut
@@ -413,6 +419,15 @@ Paging order differs per tool:
 - `ravel_get_trace` mints no cursor as served today: it returns the trace's
   spans in one page, ordered by `start_ts` and `span_id`, and a trace larger
   than the row cap comes back bounded (`row_cap_hit`) rather than paged.
+- `ravel_describe_data` pages its metric families by keyset: the cursor
+  holds the last family name served, and the next page starts after it in
+  byte order, so `Zeta` comes before `alpha`. Each page reads the family
+  list afresh. A family added later whose name sorts before the cursor's
+  position is not returned by any later page, and `families_total` can
+  differ from one page to the next. Every page reports page one's
+  watermark and snapshot id. A newer pending erasure on the same signal,
+  or a change to the typed attribute columns, expires the cursor with
+  `cursor_expired`.
 
 The equal-group rule: a page never ends inside a group of equal tuples. If a
 group does not fit on the page whole, the tool drops that whole group from
