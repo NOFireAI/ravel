@@ -554,7 +554,7 @@ script, and run in CI's `doc-scripts` job.
 | `--anchor-ms N` | The replay anchor, which must be on the profile's scrape grid (exit 65 otherwise, case h). Default: the profile's window ending at least 10 minutes before the run, on the grid, stamped `anchor_source` as from the clock. Ravel drops samples older than its 45-day `--max-ingest-lag`, so a fixed old anchor fails Ravel's read-back. |
 | `--passes N`, `--reps N` | Passed to `metricsbench_query` as `--passes` and `--reps-per-pass` and stamped (case g); its own defaults (5 and 3) otherwise. |
 | `--keep` | Leave the stack up; stamps say `kept (--keep)` and no `down -v` runs (case g). |
-| `--rss-band CONTAINER:MIN:MAX` | Repeatable. The peak sampled memory of the container (matched by container name or compose service) must lie in `[MIN, MAX]` bytes; outside it, or with no samples, the run exits 75 (case d). |
+| `--rss-band CONTAINER:MIN:MAX` | Repeatable. The peak sampled memory of the container (matched by container name or compose service) must lie in `[MIN, MAX]` bytes; outside it, or with no samples, the `memory` step fails: a full run still runs steps 15 to 18 and then exits 75 (case d; step 14 lists the other exits), and the diagnostic mode exits 75 at once (case e3). |
 | `--ravel-objects-band MIN:MAX` | The band the `objects` step checks the count of Ravel's data objects (`t/<tenant>/m/l0/*.rseg` keys) against, inclusive (cases v1, v2). It counts data objects only, not commit records, probes or the whole bucket, so the same figure is comparable between s3s-fs and real S3. A value not of the form `MIN:MAX`, a minimum above the maximum (case v3), or the flag with the falsification run (case v4) exits 64. |
 | `--diagnostic-prometheus-max-samples N` | The falsification run, below. |
 | `--folded-catalog-get-max-fraction F` | The most catalog GETs the folded read-back (step 18) may spend per data object the `objects` step listed, on top of the floor below, a decimal from 0 to 1; default 0.05 (case u), stamped (case u16). A malformed or out-of-range value exits 64 (cases u17 to u19). |
@@ -600,10 +600,12 @@ verification (step 6), after which the run goes on as a diagnostic:
    `mimir-readiness` is stamped without being checked, `query` passes
    `--diagnostic-after-failed-ingest`, `validate` must refuse the report as
    a diagnostic of a failed run, and the run then exits 70 naming step
-   ingest (cases q, q2). A later step's failure, an `--rss-band` breach
-   included, is listed in `stamps.json` as `failed_after_ingest` and the
-   exit stays 70 naming ingest (case q3). That failure ends the run there,
-   so the steps after it do not run. When the failed row is the Prometheus
+   ingest (cases q, q2). A later step's failure is listed in `stamps.json`
+   as `failed_after_ingest` and the exit stays 70 naming ingest (cases q3,
+   u6). A failed step ends the run there, so the steps after it do not run,
+   except a failed `memory` step: steps 15 to 18 still run after it, and
+   `memory` is then listed in `failed_after_ingest` (case q3). When the
+   failed row is the Prometheus
    oracle's (a failed read-back, a `row_failure`, a stall or a failed
    replay), `query` refuses the diagnostic and writes no `report.json`, so
    the `validate` and `memory` steps do not run and `failed_after_ingest` is
@@ -694,8 +696,19 @@ verification (step 6), after which the run goes on as a diagnostic:
     (case q).
 14. `memory`: the sampler stops, `memory-summary.json` records peak and
     final bytes per container and `OOMKilled` from `docker inspect` (case a),
-    and every `--rss-band` is checked (case d). An OOM-killed container exits
-    75 (case e).
+    and every `--rss-band` is checked (case d). A breach (case d) or an
+    OOM-killed container (case e) fails the step, but no longer prevents
+    steps 15 to 18: the failure is listed in `stamps.json` as
+    `deferred_failures`, the run says the memory step failed and goes on,
+    and once step 18 is done it exits 75 with `failed_step` memory
+    (cases d, e). After a failed ingest verification it exits 70 naming
+    ingest instead, with `memory` in `failed_after_ingest`, whether steps
+    15 to 18 ran (case q3) or were skipped (case e4). A step among 15 to 18
+    that fails after it ends the run as it would without the memory
+    failure, so in a run whose ingest passed that exit, 70 naming the
+    step, wins over 75; `memory` stays in `deferred_failures` and the
+    message names both failures (case e2). The diagnostic mode has no
+    folded steps and exits 75 at once (case e3).
 15. `stop`: `docker compose stop ravel-server` only (case u). The fold below
     runs with `--writers-stopped`, which ADR-2677 decision 1 gives to "an
     operator whose writer has exited" and marks "UNSAFE under a live
@@ -837,9 +850,13 @@ row itself replayed and only its read-back failed or mismatched, which is the
 case they measure: the run still exits 70 naming ingest (case u5), and a
 failure among them is listed in `failed_after_ingest` (case u6). When the
 Ravel row has a `row_failure` or stalled, the four are skipped and each of
-their three stamps says `skipped:` and why (cases u7, u8). They run only once `memory`
-passed; a run that ends earlier, at `query` for a failed oracle row (case
-q4) or at an `--rss-band` breach after a failed ingest (case q3), does not
+their three stamps says `skipped:` and why (cases u7, u8). A failed `memory`
+step no longer prevents them: they run after it in the order stop, fold,
+start, readback-folded, and the run then exits 75 naming memory (cases d,
+e), or 70 naming ingest after a failed ingest verification (case q3); in a
+run whose ingest passed, a failure among the four exits 70 naming that step
+instead (case e2). A run
+that ends earlier, at `query` for a failed oracle row (case q4), does not
 reach them. The diagnostic mode runs none of them and stamps each `not
 applicable` (case u9).
 
@@ -940,8 +957,8 @@ deploy/metricsbench/run.sh --profile history --bin-dir target/release \
 | 0 | Every step passed (cases a, f, g). |
 | 64 | Usage error (cases h, p, s2 to s7, u17 to u19, u24 to u27, v3, v4). |
 | 65 | A refused input, or an s3s-fs binary whose sha256 is not the pin; nothing was started (cases c, h, p, n2, n3, n4). |
-| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k, n6, r, u1, u2, u2a, u2b, u3, u4, u12, u14, u15a, u15b, u22, v2, v6, v7). After a failed ingest verification (a row's read-back failed or a row stalled) the run queries as a diagnostic, records the failure, and exits 70 naming step ingest, even when a later step failed too; the first later step to fail ends the run, so an `--rss-band` breach reaches `failed_after_ingest` only when every step before `memory` passed, while `memory-summary.json` records it either way (cases q, q2, q3, q4); steps 15 to 18 still run when the Ravel row replayed, and a failure there is listed in `failed_after_ingest` (cases u5, u6, u13), and are skipped when it did not (cases u7, u8); a failed `objects` band check after a failed ingest is listed the same way (case v5). |
-| 75 | An `--rss-band` was violated or a container was OOM-killed (cases d, e). |
+| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, e2, i, k, n6, r, u1, u2, u2a, u2b, u3, u4, u12, u14, u15a, u15b, u22, v2, v6, v7). A step among 15 to 18 that fails after a failed `memory` step exits 70 naming that step rather than 75, with `memory` in `deferred_failures` (case e2). After a failed ingest verification (a row's read-back failed or a row stalled) the run queries as a diagnostic, records the failure, and exits 70 naming step ingest, even when a later step failed too; the first later step to fail ends the run, except `memory`, after which steps 15 to 18 still run, so an `--rss-band` breach reaches `failed_after_ingest` only when every step before `memory` passed and no step after it failed, while `memory-summary.json` records it either way (cases q, q2, q3, q4); such a run whose Ravel row has a `row_failure` lists `memory` in `failed_after_ingest` after the four are skipped (case e4); steps 15 to 18 still run when the Ravel row replayed, and a failure there is listed in `failed_after_ingest` (cases u5, u6, u13), and are skipped when it did not (cases u7, u8); a failed `objects` band check after a failed ingest is listed the same way (case v5). |
+| 75 | An `--rss-band` was violated or a container was OOM-killed, and no later step failed. In a full run steps 15 to 18 run first and `stamps.json` lists `memory` in `deferred_failures` (cases d, e); the diagnostic mode exits at once (case e3). |
 
 ## Verify the pins
 
