@@ -1055,7 +1055,7 @@ expect_no_log "t: nothing started" "docker-env up"
 # --- u: Ravel's objects -------------------------------------------------------------
 # Three data objects, three commit records, two qualify probes and four other
 # keys, two of those under m/: 12 keys, 8 under t/*/m/. A band of 3:3 holds
-# only the data count; 8:10 holds the m/ count and the total but not it.
+# only the data count; 8:12 holds the m/ count and the total but not it.
 U_LISTING="${TMP}/u-listing.json"
 cat >"${U_LISTING}" <<'JSON'
 {"Contents": [
@@ -1078,6 +1078,8 @@ U_SPLIT='j("ravel-objects.json")["data"] == {"count": 3, "bytes": 6000} and j("r
 mapfile -t args < <(full_args "${TMP}/u/out")
 STUB_LISTING="${U_LISTING}" run_case u "${args[@]}"
 expect_rc u 0
+expect_file u ravel-objects.json
+expect_file u ravel-objects-listing.json
 check "u: every kind split, total is the sum" "${U_SPLIT}"
 check "u: the same figures stamped" 'j("stamps.json")["ravel_objects"] == j("ravel-objects.json") and j("stamps.json")["ravel_objects"]["bucket"] == "ravel-metricsbench"'
 check "u: no band, stamped as not set" 'j("ravel-objects.json")["band"].startswith("not set")'
@@ -1091,10 +1093,10 @@ expect_rc "u1 band holds the data count" 0
 check "u1: band verdict ok on the data count" 'j("ravel-objects.json")["band"] == {"min": 3, "max": 3, "counts": "data", "verdict": "ok"}'
 
 mapfile -t args < <(full_args "${TMP}/u2/out")
-STUB_LISTING="${U_LISTING}" run_case u2 "${args[@]}" --ravel-objects-band 8:10
+STUB_LISTING="${U_LISTING}" run_case u2 "${args[@]}" --ravel-objects-band 8:12
 expect_rc "u2 band excludes the data count" 70
 expect_err "u2: message names step objects and the count" "step objects failed: data 3 (6000 B)"
-expect_err "u2: message says below the band" "data count 3 below --ravel-objects-band 8:10"
+expect_err "u2: message says below the band" "data count 3 below --ravel-objects-band 8:12"
 check "u2: stamps name step objects, figures still stamped" 'j("stamps.json")["failed_step"] == "objects" and j("stamps.json")["ravel_objects"]["band"]["verdict"] == "below" and j("stamps.json")["ravel_objects"]["data"]["count"] == 3'
 expect_no_log "u2: capture not run" "capture --out"
 expect_log "u2: torn down" " down -v"
@@ -1113,7 +1115,7 @@ expect_rc "u4 band in the diagnostic mode" 64
 # A failed ingest verification: the step still runs; a band it fails is
 # listed after ingest and the run ends there naming ingest.
 mapfile -t args < <(full_args "${TMP}/u5/out")
-STUB_LISTING="${U_LISTING}" STUB_INGEST_READBACK_FAIL=mimir run_case u5 "${args[@]}" --ravel-objects-band 8:10
+STUB_LISTING="${U_LISTING}" STUB_INGEST_READBACK_FAIL=mimir run_case u5 "${args[@]}" --ravel-objects-band 8:12
 expect_rc "u5 failed ingest, band excludes" 70
 check "u5: ingest named, objects failed after it" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["objects"]'
 expect_no_log "u5: capture not run" "capture --out"
