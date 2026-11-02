@@ -14,6 +14,7 @@ pub mod compact;
 pub mod cursor;
 pub mod draft;
 pub mod envelope;
+pub mod resume_tuple;
 pub mod service;
 pub mod time;
 pub mod tools;
