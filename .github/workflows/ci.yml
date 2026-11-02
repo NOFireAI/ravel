@@ -2667,8 +2667,9 @@ jobs:
         run: docker build --target operator .
 
   # Coverage is visibility, not a gate (ADR-0053 D2): it leaves the required
-  # set and no longer runs on pull_request or in the merge queue. It runs only
-  # on pushes to main, where it updates the badge and the JSON artifact. Gating
+  # set and no longer runs on pull_request or in the merge queue. It runs on
+  # pushes to main, where it updates the badge and the JSON artifact, and on a
+  # pull request only when labelled `run-coverage`. Gating
   # the whole job on the event (rather than dropping a trigger) is the clean
   # option now that `on:` carries push, pull_request, and merge_group: the
   # job-level `if` names exactly the one context it should run in.
@@ -2678,9 +2679,14 @@ jobs:
     # only runs on pushes to main; lint runs there as well, so this adds one
     # fail-fast dependency without changing when coverage is eligible.
     needs: [changes, lint]
+    # A pull request opts in with the `run-coverage` label, the way `run-k8s`
+    # works, so a change to this job can be shown green before it lands: on
+    # its own it runs only after the merge.
     if: >-
-      github.event_name == 'push' && github.ref == 'refs/heads/main'
-      && needs.changes.outputs.docs_only != 'true'
+      needs.changes.outputs.docs_only != 'true'
+      && ((github.event_name == 'push' && github.ref == 'refs/heads/main')
+          || (github.event_name == 'pull_request'
+              && contains(github.event.pull_request.labels.*.name, 'run-coverage')))
     runs-on: ubuntu-latest
     # A cold run (no rust-cache entry) takes just over 40 minutes, and a run
     # cut off by its timeout never saves the cache, so the next run starts
@@ -2721,11 +2727,17 @@ jobs:
       # consumer needs: the text summary for the step summary, and lcov for
       # Codecov. This replaces separate `cargo llvm-cov` invocations that
       # would each re-run the entire test suite (ADR-0053 D2).
+      #
+      # Built under the `ci` profile (no debug info): the instrumented
+      # workspace under `dev`'s line tables outgrew the runner's disk (#3674).
+      # Coverage mapping lives in its own sections, so dropping debug info
+      # does not change what is measured. `report` needs the same profile to
+      # find the binaries.
       - name: Measure coverage
         run: |
-          cargo llvm-cov --locked --no-report --workspace
-          cargo llvm-cov report --locked | tee -a "$GITHUB_STEP_SUMMARY"
-          cargo llvm-cov report --locked --lcov --output-path lcov.info
+          cargo llvm-cov --locked --no-report --workspace --profile ci
+          cargo llvm-cov report --locked --profile ci | tee -a "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --locked --profile ci --lcov --output-path lcov.info
       # CODECOV_TOKEN authenticates the upload; id-token: write (job
       # permissions above) is kept as a fallback path. Renders the README
       # badge and per-file/diff coverage on codecov.io; never fails the job
