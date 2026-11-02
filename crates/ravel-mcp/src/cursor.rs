@@ -405,7 +405,9 @@ impl CursorError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CursorPosition {
     Keyset {
-        /// The last tuple of the page, in the tool's own encoding.
+        /// The last tuple of the page, in the tool's own encoding;
+        /// [`crate::resume_tuple`] is the one for a `ravel_sql::ResumeValue`
+        /// tuple.
         tuple: Vec<u8>,
         /// The `ORDER BY` terms the tuple was taken under, in order.
         order_by: Vec<String>,
