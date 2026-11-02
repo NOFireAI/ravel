@@ -1742,12 +1742,21 @@ Under a TopK the exec copies less. When the nearest consumer above it is a
 sort keys as bare columns and a `CoalescePartitionsExec` with no fetch, the
 rule hands the exec the sort's ordering and `k`
 (`CompactSlicesExec::with_topk`). Each batch of more than `k` rows is then
-cut to its own top `k` rows by that ordering before it is compacted. A row
-outside its batch's top `k` cannot be in the global top `k`, so the answer is
-the same, except that at a tie on the k-th value the tied row that survives
-may differ, as SQL allows. The plan shows `topk=[...], fetch=k` on the exec,
-and its `topk_dropped_rows` metric counts the rows cut. Because the exec then
-drops all but `k` rows of each batch and reorders the rows it keeps, it
+cut to its own top `k` rows by that ordering before it is compacted, ranked
+as the full sort ranks them (floats in total order, `-0.0` below `0.0`). A
+row outside its batch's top `k` cannot be in the full sort's first `k` rows,
+so wherever the TopK returns those rows the answer is the same, except that
+at a tie on the k-th value the tied row that survives may differ, as SQL
+allows. DataFusion 55's TopK does not always return them: over a float sort
+key holding both `0.0` and `-0.0`, its dynamic filter compares with
+`-0.0 = 0.0` while its heap ranks `-0.0` below `0.0`, so it can drop a row
+that ranks ahead of its boundary only by its zero's sign, and the answer
+depends on how its input is cut into batches. That holds with or without the
+pre-filter, which on such input can change which wrong row is returned
+(`datafusions_topk_misses_the_full_sorts_first_row_over_both_zero_signs`).
+The plan shows `topk=[...], fetch=k` on the exec, and its
+`topk_dropped_rows` metric counts the rows cut. Because the exec then drops
+all but `k` rows of each batch and reorders the rows it keeps, it
 reports a cardinality that can only shrink, no maintained input order and no
 output ordering, and an inexact row count of at most `k` times its estimated
 input batches (`ceil(rows / batch_size)` plus one per extra partition), which
