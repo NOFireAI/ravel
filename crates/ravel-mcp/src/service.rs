@@ -216,11 +216,18 @@ pub trait QueryBackend {
     /// request's `now_ns` is the call's own clock on every page: the
     /// declared-column and key-index lookups, the tenant's last-touch and the
     /// audit record use it. The draft's `resolve_at_ns` is `resolve_at_ns`.
+    ///
+    /// `order_columns` names the result columns a keyset position is read
+    /// from. When it is not empty, the draft's `order_tuples` holds each
+    /// row's typed values of those columns, read from the result's arrays
+    /// with `ravel_sql::resume_value`, so a cursor never reparses a rendered
+    /// cell.
     async fn sql_execute(
         &self,
         tenant_hash: TenantHash,
         request: &ravel_sql::SqlRequest,
         resolve_at_ns: i64,
+        order_columns: &[String],
     ) -> Result<Draft, Failure>;
 
     /// Mirrors `QueryService::trace_request` followed by

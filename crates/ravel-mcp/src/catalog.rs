@@ -82,6 +82,7 @@ pub struct QuerySqlInput {
     pub max_response_bytes: Option<u64>,
     pub deadline_ms: Option<u64>,
     pub cursor: Option<String>,
+    /// Not served by this build: any value is refused as `unsupported`.
     pub evidence_ref: Option<String>,
 }
 
@@ -450,7 +451,7 @@ mod tests {
     /// every client parses on every reconnect, and it should be read in a
     /// diff rather than absorbed silently anywhere under the bound. Update
     /// it in the same commit as the schema change that moves it.
-    const TOOLS_LIST_SERIALIZED_LEN: usize = 15_652;
+    const TOOLS_LIST_SERIALIZED_LEN: usize = 15_733;
 
     /// D2 bounds `tools/list` so the catalog itself never competes with a
     /// data response for the response-size budget.
@@ -753,7 +754,7 @@ mod tests {
     /// `agents` and run with both enabled answers it. Pinned for the same
     /// reason as [`TOOLS_LIST_SERIALIZED_LEN`], under the same D2 budget
     /// (ADR-3331 decision 10).
-    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 23_541;
+    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 23_622;
 
     const _: () = assert!(
         COMBINED_TOOLS_LIST_SERIALIZED_LEN < 24_576,

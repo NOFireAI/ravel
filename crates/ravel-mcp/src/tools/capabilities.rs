@@ -253,7 +253,7 @@ mod tests {
             .clone();
         assert_eq!(rows[0][1]["revisions"], json!(["2026-07-28", "2025-11-25"]));
         // Served and catalogued are separate lists, and the exact split is
-        // what this build does today: five bodies, four declared names that
+        // what this build does today: six bodies, three declared names that
         // refuse every call.
         assert_eq!(
             rows[1][1]["enabled"],
@@ -262,6 +262,7 @@ mod tests {
                 "ravel_describe_data",
                 "ravel_find_labels",
                 "ravel_explain_query",
+                "ravel_query_sql",
                 "ravel_get_trace"
             ])
         );
@@ -270,7 +271,7 @@ mod tests {
                 .as_array()
                 .expect("catalogued tool list")
                 .len(),
-            4
+            3
         );
         assert_eq!(rows[3][1]["hash"], json!(ctx.tenant_hash.to_hex()));
         assert_eq!(rows[4][1]["enabled"], json!(["metrics", "logs", "traces"]));

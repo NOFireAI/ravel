@@ -33,13 +33,13 @@
 //! types, so no arrow or DataFusion type crosses the port.
 
 use ravel_query::erasure::ErasurePredicate;
-use ravel_sql::{DeclaredColumn, TargetSignal};
+use ravel_sql::{DeclaredColumn, ResumeValue, TargetSignal};
 use ravel_types::accounting::CostEstimate;
 use ravel_types::{CommitToken, Signal, TenantHash};
 
 use crate::budget::McpEffectiveBudgets;
 use crate::cursor::{self, Cursor, CursorError, CursorPosition};
-use crate::envelope::{CURSOR_BOUND, Envelope, Row, serialized_str_len};
+use crate::envelope::{CURSOR_BOUND, Envelope, NextStep, Row, serialized_str_len};
 
 /// Why a statement's result cannot carry a cursor. A cursor pins exactly one
 /// signal snapshot (D5), so every other shape of statement is refused here
@@ -117,6 +117,12 @@ pub struct Draft {
     pub ingest_watermark_hour: Option<u32>,
     /// The instant the snapshot was resolved at.
     pub resolve_at_ns: i64,
+    /// The typed value of each order column, row for row with `data.rows`,
+    /// read from the result's arrays: the keyset position a cursor after a
+    /// row encodes, and what [`PageOrder::Grouped`] compares. `None` for a
+    /// row whose order values could not be read. Empty unless the caller of
+    /// [`crate::service::QueryBackend::sql_execute`] named order columns.
+    pub order_tuples: Vec<Option<Vec<ResumeValue>>>,
 }
 
 impl Draft {
@@ -140,9 +146,16 @@ impl Draft {
             declared_columns,
             ingest_watermark_hour,
             resolve_at_ns,
+            order_tuples: Vec::new(),
         };
         draft.report_watermark();
         draft
+    }
+
+    /// The draft with `order_tuples`, one per row of the envelope.
+    pub fn with_order_tuples(mut self, order_tuples: Vec<Option<Vec<ResumeValue>>>) -> Draft {
+        self.order_tuples = order_tuples;
+        self
     }
 
     fn report_watermark(&mut self) {
@@ -200,16 +213,19 @@ impl Draft {
     ///
     /// The envelope is fitted with a stand-in cursor exactly [`CURSOR_BOUND`]
     /// serialized bytes long before `mint` runs, so the token, which is never
-    /// longer, cannot push it over the cap. `mint` gets the pins and the last
-    /// row the page keeps, uncut by the byte cap, to build the position from.
-    /// A token over [`CURSOR_BOUND`] is an `internal` failure, as
-    /// [`Envelope::fit`] states.
+    /// longer, cannot push it over the cap. `mint` gets the pins, the last
+    /// row the page keeps, uncut by the byte cap, and that row's entry of
+    /// [`Draft::order_tuples`], to build the position from. A token over
+    /// [`CURSOR_BOUND`] is an `internal` failure, as [`Envelope::fit`]
+    /// states; a mint that can produce one refuses it itself.
     ///
     /// No cursor is minted, and a capped result is `ok_bounded`, when the
     /// order is [`PageOrder::Partial`], when the draft has no signal, when no
     /// complete group fits a grouped page, or when `mint` refuses. Each case
     /// but the first carries a `no cursor:` warning naming the reason; the
-    /// first is what every tool without a total order already reports.
+    /// first is what every tool without a total order already reports. A
+    /// grouped page with no complete group also carries the order's
+    /// `no_complete_group` next step, and a refusing mint its own, if any.
     /// Under both caps nothing is minted and the status is `ok`.
     pub fn finish_page<M>(
         self,
@@ -219,7 +235,7 @@ impl Draft {
         mint: M,
     ) -> Envelope
     where
-        M: FnOnce(&PagePins<'_>, &Row) -> Result<String, CursorError>,
+        M: FnOnce(&PagePins<'_>, &Row, Option<&[ResumeValue]>) -> Result<String, NoCursor>,
     {
         let Draft {
             mut envelope,
@@ -228,6 +244,7 @@ impl Draft {
             declared_columns,
             ingest_watermark_hour,
             resolve_at_ns,
+            order_tuples,
         } = self;
         let pins = signal.map(|signal| PagePins {
             signal,
@@ -255,8 +272,11 @@ impl Draft {
             fitted.data.row_count = produced_rows;
             fitted.finish(has_total_order)
         };
-        let unpaged = |mut envelope: Envelope, reason: String| {
-            envelope.warnings.insert(0, format!("no cursor: {reason}"));
+        let unpaged = |mut envelope: Envelope, refusal: NoCursor| {
+            envelope
+                .warnings
+                .insert(0, format!("no cursor: {}", refusal.reason));
+            envelope.next_steps.extend(refusal.next_step);
             finish(envelope.fit(cap), false)
         };
 
@@ -270,7 +290,7 @@ impl Draft {
         }
         let pins = match pins {
             Ok(pins) => pins,
-            Err(reason) => return unpaged(envelope, reason.to_string()),
+            Err(reason) => return unpaged(envelope, NoCursor::because(reason.to_string())),
         };
 
         let mut placed = envelope.clone();
@@ -278,22 +298,32 @@ impl Draft {
         let mut fitted = placed.fit(cap);
         let fit_rows = fitted.data.rows.len();
         let mut kept = fit_rows;
-        if let PageOrder::Grouped(same_group) = order {
-            kept = complete_groups(&pristine, kept, same_group);
+        let mut no_complete_group = None;
+        if let PageOrder::Grouped {
+            same_group,
+            no_complete_group: step,
+        } = order
+        {
+            kept = complete_groups(&order_tuples, pristine.len(), kept, same_group);
             let held_back = fit_rows - kept;
             fitted.data.rows.truncate(kept);
             fitted.presentation.rows_omitted += held_back as u64;
+            no_complete_group = Some(step);
         }
         let Some(last) = kept.checked_sub(1).and_then(|index| pristine.get(index)) else {
-            let reason = if fit_rows == 0 {
-                "no row fits one page beside a cursor"
-            } else {
-                "no complete group of rows equal under the order fits one page"
+            let refusal = match no_complete_group.filter(|_| fit_rows > 0) {
+                Some(step) => NoCursor {
+                    reason: "no complete group of rows equal under the order fits one page"
+                        .to_string(),
+                    next_step: Some(step.clone()),
+                },
+                None => NoCursor::because("no row fits one page beside a cursor".to_string()),
             };
-            return unpaged(envelope, reason.to_string());
+            return unpaged(envelope, refusal);
         };
+        let last_tuple = order_tuples.get(kept - 1).and_then(Option::as_deref);
 
-        match mint(&pins, last) {
+        match mint(&pins, last, last_tuple) {
             Ok(token) => {
                 let over_bound = serialized_str_len(&token) > CURSOR_BOUND;
                 fitted.presentation.cursor = Some(token);
@@ -302,27 +332,61 @@ impl Draft {
                 }
                 finish(fitted, true)
             }
-            Err(error) => unpaged(envelope, error.to_string()),
+            Err(refusal) => unpaged(envelope, refusal),
         }
     }
 }
 
-/// How many of the first `kept` rows form complete groups: a group still
-/// open at the page's end (its next row unknown, or equal to the page's last
-/// row) is held back whole, so a cursor taken after the page's last row
-/// cannot skip the rest of it.
-fn complete_groups(rows: &[Row], kept: usize, same_group: &dyn Fn(&Row, &Row) -> bool) -> usize {
+/// Why a page that a cap stopped carries no cursor, and what the caller can
+/// do instead.
+#[derive(Debug, Clone)]
+pub struct NoCursor {
+    /// Written into the page's `no cursor:` warning.
+    pub reason: String,
+    /// Appended to the page's `next_steps`.
+    pub next_step: Option<NextStep>,
+}
+
+impl NoCursor {
+    /// A refusal with no next step.
+    pub fn because(reason: String) -> NoCursor {
+        NoCursor {
+            reason,
+            next_step: None,
+        }
+    }
+}
+
+impl From<CursorError> for NoCursor {
+    fn from(error: CursorError) -> NoCursor {
+        NoCursor::because(error.to_string())
+    }
+}
+
+/// How many of the first `kept` of `rows` rows form complete groups, judged
+/// by their `tuples`: a group still open at the page's end (its next row
+/// unknown, or equal to the page's last row) is held back whole, so a cursor
+/// taken after the page's last row cannot skip the rest of it. A row with no
+/// tuple is a group of its own.
+fn complete_groups(
+    tuples: &[Option<Vec<ResumeValue>>],
+    rows: usize,
+    kept: usize,
+    same_group: &dyn Fn(&[ResumeValue], &[ResumeValue]) -> bool,
+) -> usize {
+    let same = |a: usize, b: usize| match (tuples.get(a), tuples.get(b)) {
+        (Some(Some(a)), Some(Some(b))) => same_group(a, b),
+        _ => false,
+    };
     let Some(last) = kept.checked_sub(1) else {
         return 0;
     };
-    let closed = rows
-        .get(kept)
-        .is_some_and(|next| !same_group(&rows[last], next));
+    let closed = kept < rows && !same(last, kept);
     if closed {
         return kept;
     }
     let mut start = last;
-    while start > 0 && same_group(&rows[start - 1], &rows[last]) {
+    while start > 0 && same(start - 1, last) {
         start -= 1;
     }
     start
@@ -342,9 +406,14 @@ pub enum PageOrder<'a> {
     /// resumes exactly after it.
     Total,
     /// A cursor resumes after a whole group of rows equal under the order,
-    /// never inside one. The function says whether two rows are in the same
-    /// group.
-    Grouped(&'a dyn Fn(&Row, &Row) -> bool),
+    /// never inside one.
+    Grouped {
+        /// Whether two rows' [`Draft::order_tuples`] put them in one group.
+        same_group: &'a dyn Fn(&[ResumeValue], &[ResumeValue]) -> bool,
+        /// What a capped page on which no complete group fits tells the
+        /// caller to do.
+        no_complete_group: &'a NextStep,
+    },
 }
 
 /// The pin inputs the tool knows and the statement's outcome does not: who
@@ -524,8 +593,11 @@ mod tests {
     }
 
     /// `rows` rows of one `Int` key column and one `Str` column `width`
-    /// bytes wide, keyed `key(i)`.
+    /// bytes wide, keyed `key(i)`, each with its key as its order tuple.
     fn draft(rows: usize, width: usize, key: impl Fn(usize) -> i128) -> Draft {
+        let tuples = (0..rows)
+            .map(|i| Some(vec![ResumeValue::Int(key(i) as i64)]))
+            .collect();
         let mut envelope = Envelope::default();
         envelope.ids.query_id = "q".to_owned();
         envelope.ids.audit_ref = "a".to_owned();
@@ -554,6 +626,7 @@ mod tests {
             Some(472_223),
             NOW_NS,
         )
+        .with_order_tuples(tuples)
     }
 
     fn key_of(row: &Row) -> i128 {
@@ -565,17 +638,38 @@ mod tests {
 
     /// A mint that encodes a keyset cursor after `row`, the way a paging
     /// tool does.
-    fn token_mint(pins: &PagePins<'_>, row: &Row) -> Result<String, CursorError> {
-        pins.cursor(
-            TOOL,
-            ARGS,
-            CursorPosition::Keyset {
-                tuple: key_of(row).to_le_bytes().to_vec(),
-                order_by: vec!["k".to_owned()],
-            },
-            i64::MAX,
-        )
-        .mint(&key(), NOW_NS, HORIZON_NS)
+    fn token_mint(
+        pins: &PagePins<'_>,
+        row: &Row,
+        tuple: Option<&[ResumeValue]>,
+    ) -> Result<String, NoCursor> {
+        assert_eq!(
+            tuple,
+            Some(&[ResumeValue::Int(key_of(row) as i64)][..]),
+            "the mint gets the kept row's own order tuple"
+        );
+        Ok(pins
+            .cursor(
+                TOOL,
+                ARGS,
+                CursorPosition::Keyset {
+                    tuple: key_of(row).to_le_bytes().to_vec(),
+                    order_by: vec!["k".to_owned()],
+                },
+                i64::MAX,
+            )
+            .mint(&key(), NOW_NS, HORIZON_NS)?)
+    }
+
+    fn same_int(a: &[ResumeValue], b: &[ResumeValue]) -> bool {
+        a == b
+    }
+
+    fn narrow() -> NextStep {
+        NextStep {
+            action: "narrow_time_range".to_owned(),
+            detail: "d".to_owned(),
+        }
     }
 
     fn serialized_len(envelope: &Envelope) -> u64 {
@@ -638,10 +732,12 @@ mod tests {
     #[test]
     fn a_refusing_mint_gives_no_cursor_and_says_why() {
         let budgets = budgets(3);
-        let refused =
-            draft(5, 8, |i| i as i128).finish_page(&budgets, &scope(), PageOrder::Total, |_, _| {
-                Err(CursorError::Expired)
-            });
+        let refused = draft(5, 8, |i| i as i128).finish_page(
+            &budgets,
+            &scope(),
+            PageOrder::Total,
+            |_, _, _| Err(CursorError::Expired.into()),
+        );
         assert_eq!(refused.status, Status::OkBounded);
         assert_eq!(refused.presentation.cursor, None);
         assert_eq!(refused.presentation.rows_omitted, 2);
@@ -655,7 +751,7 @@ mod tests {
 
         let mut parquet = draft(5, 8, |i| i as i128);
         parquet.signal = Err(NoCursorSignal::Parquet);
-        let parquet = parquet.finish_page(&budgets, &scope(), PageOrder::Total, |_, _| {
+        let parquet = parquet.finish_page(&budgets, &scope(), PageOrder::Total, |_, _, _| {
             panic!("a draft with no signal must not reach the mint")
         });
         assert_eq!(parquet.status, Status::OkBounded);
@@ -670,7 +766,7 @@ mod tests {
             &budgets,
             &scope(),
             PageOrder::Partial,
-            |_, _| panic!("a partial order must not reach the mint"),
+            |_, _, _| panic!("a partial order must not reach the mint"),
         );
         assert_eq!(partial.status, Status::OkBounded);
         assert!(!partial.warnings.iter().any(|w| w.starts_with("no cursor")));
@@ -687,7 +783,7 @@ mod tests {
             &budgets(3),
             &scope(),
             PageOrder::Total,
-            |_, _| panic!("an uncapped page must not mint"),
+            |_, _, _| panic!("an uncapped page must not mint"),
         );
         assert_eq!(page.status, Status::Ok);
         assert_eq!(page.presentation.cursor, None);
@@ -841,20 +937,26 @@ mod tests {
     /// 0,0,1,1,1,2 under a 4-row cap keep the complete group 0,0 and hold
     /// back 1,1, which the next page returns whole. A group still open with
     /// no row after it to close it is held back too, and a page with no
-    /// complete group gets no cursor.
+    /// complete group gets no cursor and carries the order's next step.
     ///
     /// FLIP: a `Total` treatment mints after the second 1 and the next page,
     /// resuming after key 1, skips the third.
     /// FLIP: leaving the held-back rows out of `rows_omitted` under-reports
     /// what the caller did not get.
+    /// FLIP: dropping `no_complete_group` leaves the bounded page with no
+    /// next step.
     #[test]
     fn a_grouped_page_holds_back_its_open_trailing_group() {
         let keys = [0, 0, 1, 1, 1, 2];
-        let same = |a: &Row, b: &Row| key_of(a) == key_of(b);
+        let step = narrow();
+        let grouped = PageOrder::Grouped {
+            same_group: &same_int,
+            no_complete_group: &step,
+        };
         let page = draft(keys.len(), 8, |i| keys[i]).finish_page(
             &budgets(4),
             &scope(),
-            PageOrder::Grouped(&same),
+            grouped,
             token_mint,
         );
         assert_eq!(page.status, Status::OkPage);
@@ -877,7 +979,7 @@ mod tests {
         // page, so whether the last group is complete is unknown.
         let mut open = draft(4, 8, |i| [0, 0, 1, 1][i]);
         open.envelope.presentation.row_cap_hit = true;
-        let page = open.finish_page(&budgets(4), &scope(), PageOrder::Grouped(&same), token_mint);
+        let page = open.finish_page(&budgets(4), &scope(), grouped, token_mint);
         assert_eq!(
             page.data.rows.iter().map(key_of).collect::<Vec<_>>(),
             [0, 0]
@@ -885,16 +987,22 @@ mod tests {
         assert_eq!(page.presentation.rows_omitted, 2);
         assert_eq!(page.status, Status::OkPage);
 
-        let one_group = draft(5, 8, |_| 7).finish_page(
-            &budgets(4),
-            &scope(),
-            PageOrder::Grouped(&same),
-            |_, _| panic!("no complete group, nothing to mint after"),
-        );
+        let one_group =
+            draft(5, 8, |_| 7).finish_page(&budgets(4), &scope(), grouped, |_, _, _| {
+                panic!("no complete group, nothing to mint after")
+            });
         assert_eq!(one_group.status, Status::OkBounded);
         assert_eq!(one_group.presentation.cursor, None);
         assert_eq!(one_group.data.rows.len(), 4);
         assert_eq!(one_group.presentation.rows_omitted, 1);
+        assert_eq!(
+            one_group
+                .next_steps
+                .iter()
+                .map(|step| step.action.as_str())
+                .collect::<Vec<_>>(),
+            ["narrow_time_range"]
+        );
         assert!(
             one_group.warnings.contains(
                 &"no cursor: no complete group of rows equal under the order fits one page"
@@ -917,7 +1025,7 @@ mod tests {
         let mut wide = draft(2, 8, |i| i as i128);
         let row: Row = (0..20_000).map(|_| Cell::Int(i128::MAX)).collect();
         wide.envelope.data.rows = vec![row.clone(), row];
-        let page = wide.finish_page(&budgets(2), &scope(), PageOrder::Total, |_, _| {
+        let page = wide.finish_page(&budgets(2), &scope(), PageOrder::Total, |_, _, _| {
             panic!("no row kept, nothing to mint after")
         });
         assert_eq!(page.status, Status::OkBounded);
@@ -943,7 +1051,7 @@ mod tests {
             &budgets(2),
             &scope(),
             PageOrder::Total,
-            |_, _| Ok("t".repeat(5000)),
+            |_, _, _| Ok("t".repeat(5000)),
         );
         assert_eq!(page.status, Status::Error);
         assert_eq!(page.presentation.cursor, None);

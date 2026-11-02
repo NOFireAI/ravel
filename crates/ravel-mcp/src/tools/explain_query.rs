@@ -115,7 +115,7 @@ fn validate(sql: &str) -> Result<(), Refusal> {
 
 /// The D4 class of an engine refusal, the same mapping the server's SQL
 /// surface applies, with the engine's client-safe text.
-fn sql_failure(error: &SqlError) -> Failure {
+pub(super) fn sql_failure(error: &SqlError) -> Failure {
     let class = match error.class() {
         ErrorClass::BadRequest => FailureClass::InvalidArgument,
         ErrorClass::Unsupported => FailureClass::Unsupported,
