@@ -229,8 +229,8 @@ async fn a_stalled_tenant_leaves_a_permit_for_a_coresident_strict_write() {
     let share = permits.saturating_sub(1).max(1);
     assert_eq!(
         (permits, share),
-        (4, 3),
-        "shipped defaults: 4 permits per shard, a tenant share of N-1"
+        (8, 7),
+        "shipped defaults: 8 permits per shard, a tenant share of N-1"
     );
 
     let fault = Arc::new(FaultStore::new(MemoryStore::new(), Default::default()));

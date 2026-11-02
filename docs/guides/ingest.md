@@ -222,7 +222,7 @@ Acked buffered rows can be lost in these cases:
   is a server defect.
 
 One stalled tenant holds at most `--max-inflight-flushes-per-tenant` of its
-shard's permits (default 3 of 4), so a co-resident tenant's flush normally
+shard's permits (default 7 of 8), so a co-resident tenant's flush normally
 takes the free permit. A flush that does queue behind a stalled co-resident
 prefix reaches the store once the stall clears, unless the wait outlasts its
 hour's bound above. A co-resident stall by itself is therefore not a

@@ -109,7 +109,7 @@ Buffered mode (opt-in per request, named "buffered"):
   The same deadline also bounds the flush's wait for a write gate permit
   for its encode (case six below).
 - A stalled prefix holds at most `max_inflight_flushes_per_tenant` of its
-  shard's permits (default `max(1, N - 1)` of 4), so a co-resident tenant's
+  shard's permits (default `max(1, N - 1)` of 8), so a co-resident tenant's
   flush normally takes a free permit and does not queue behind the stall at
   all. Only stalls on several tenants of one shard at once, or a deployment
   run at `--max-inflight-flushes 1`, queue it. Loss from a stalled co-resident
