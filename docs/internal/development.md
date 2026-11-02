@@ -22,14 +22,14 @@ generated OTLP export, and queries it back by commit token
 ([scripts/demo.sh](../../scripts/demo.sh)).
 
 One capability difference to keep in mind: the published image is built with
-`--features sql,flight-sql,otap,agents`, so `POST /api/v1/sql` and Flight SQL
+`--features sql,flight-sql,otap,agents,mcp`, so `POST /api/v1/sql` and Flight SQL
 work in the compose quickstart and `--otap` is accepted there. The image adds
-`agents` after `0.28.0`, the release the compose quickstart pins. That
-release lists the Agents API in `CHANGELOG.md`, but only for source builds
-with the `agents` feature. So `--agents` is accepted in the quickstart only
-once the pin moves to a release whose `CHANGELOG.md` section says the
-published image carries Ravel Agents.
-`make demo` builds the default feature set and enables none of the four, so
+`agents` and `mcp` after `0.28.0`, the release the compose quickstart pins. That
+release lists the Agents API and the MCP server in `CHANGELOG.md`, but only for
+source builds with those features. So `--agents` and `--mcp` are accepted in the
+quickstart only once the pin moves to a release whose `CHANGELOG.md` section says
+the published image carries them.
+`make demo` builds the default feature set and enables none of the five, so
 those surfaces are
 unavailable on the from-source path. PromQL, ingest, and the rest are identical
 on both. To exercise them from source, run `ravel-server` yourself with the

@@ -126,11 +126,11 @@ The matrix describes `main`. Its "In published image" column means that the
 image built from `main` compiles the surface in. A surface that lands after
 the tag that the quickstart pins is not yet in the quickstart image. Every
 entry below that the published image compiles in is in the pinned `0.28.0`
-image, except the Agents API: `0.28.0` ships the Agents API in source builds
-with the `agents` feature, but its image is built without it. The quickstart
-image gains it only once the pin moves to a release whose `CHANGELOG.md`
-section says the published image carries Ravel Agents. After the next
-feature lands,
+image, except the Agents API and the MCP server: `0.28.0` ships both in source
+builds with the `agents` and `mcp` features, but its image is built without
+them. The quickstart image gains each only once the pin moves to a release
+whose `CHANGELOG.md` section says the published image carries it. After the
+next feature lands,
 `git log v0.28.0..main` tells you whether that is still true. `CHANGELOG.md`
 records the release that each surface first shipped in.
 
@@ -147,11 +147,12 @@ records the release that each surface first shipped in.
 | ES&vert;QL over `POST /api/v1/esql` | logs, as `FROM logs` | `esql` | no |
 | Parquet tables over both SQL surfaces | Parquet files read in place from an S3, GCS or Azure location granted to the tenant (`ravel-cli tenant parquet-grant add`, `ravel-server --parquet-profiles`); described below the matrix | `sql` | yes |
 | Agents API under `/api/v1/agents/`, with `--agents` | none: durable agent state, not a telemetry signal; client routes (`create`, `send`, `call`, `operation`, `result`, `resolve`, `cancel`, `state`, `events`) and worker routes (`worker/register`, `worker/poll`, `worker/heartbeat`, `worker/commit`, `worker/step`, `worker/effects/*`), timer, effect, and the admin `reconcile`, `sweep` and `destroy` routes; operator guide in [docs/guides/operations/agents.md](docs/guides/operations/agents.md) | `agents` | yes |
+| MCP server at `POST /mcp`, with `--mcp` | the tools `ravel_capabilities` reports as served; described in [docs/guides/mcp-server.md](docs/guides/mcp-server.md) | `mcp` | yes |
 
 <!-- END SUPPORT MATRIX -->
 
 The published `ravel-server` image is built with
-`--features sql,flight-sql,otap,agents`. No crate in the workspace declares a default
+`--features sql,flight-sql,otap,agents,mcp`. No crate in the workspace declares a default
 feature set, so a source build gets the same surfaces only when you pass the
 same `--features` list to cargo.
 
@@ -160,6 +161,8 @@ same `--features` list to cargo.
   and returns `unimplemented` for prepared statements.
 - OTAP ingest is registered only when the process starts with `--otap`
   ([docs/otap-ingest.md](docs/otap-ingest.md)).
+- `POST /mcp` mounts only when the process starts with `--mcp`, in `--mode all`
+  or `--mode query` ([the MCP guide](docs/guides/mcp-server.md)).
 - The agents routes mount only when the process starts with `--agents`, in
   `--mode all` or `--mode query`
   ([operating Ravel Agents](docs/guides/operations/agents.md)).
@@ -539,6 +542,8 @@ cargo feature (`cargo build -p ravel-server --features mcp`) and the
 runtime `--mcp` flag, both off by default: build with the feature, then pass
 `--mcp` (and `--mcp-allowed-origins`, required whenever the MCP listener is
 reachable from outside localhost) to mount `POST /mcp` on the query router.
+The published image built from `main` compiles the feature in, so with that
+image you only pass the flag.
 Two tools are served today, `ravel_capabilities` and `ravel_get_trace` (whose
 `time_range` is optional: omitted, it reads every span the tenant retains);
 the other seven are catalogued and refuse calls until their bodies land.
