@@ -104,8 +104,8 @@ fn capability_rows(ctx: &ToolContext<'_>) -> Vec<Row> {
 ///
 /// `enabled` is what [`dispatch`](super::dispatch) will actually run today;
 /// `catalogued` is present in the catalog and answers `NotShipped`. Reporting
-/// one merged list would tell a caller it may call four tools that refuse
-/// every call, which is worse than telling it nothing.
+/// one merged list would tell a caller it may call tools that refuse every
+/// call, which is worse than telling it nothing.
 fn catalog_names(served: bool) -> Vec<String> {
     tool_catalog()
         .iter()
@@ -253,7 +253,7 @@ mod tests {
             .clone();
         assert_eq!(rows[0][1]["revisions"], json!(["2026-07-28", "2025-11-25"]));
         // Served and catalogued are separate lists, and the exact split is
-        // what this build does today: six bodies, three declared names that
+        // what this build does today: seven bodies, two declared names that
         // refuse every call.
         assert_eq!(
             rows[1][1]["enabled"],
@@ -263,15 +263,13 @@ mod tests {
                 "ravel_find_labels",
                 "ravel_explain_query",
                 "ravel_query_sql",
+                "ravel_query_promql",
                 "ravel_get_trace"
             ])
         );
         assert_eq!(
-            rows[1][1]["catalogued"]
-                .as_array()
-                .expect("catalogued tool list")
-                .len(),
-            3
+            rows[1][1]["catalogued"],
+            json!(["ravel_search_logs", "ravel_analyze_timeseries"])
         );
         assert_eq!(rows[3][1]["hash"], json!(ctx.tenant_hash.to_hex()));
         assert_eq!(rows[4][1]["enabled"], json!(["metrics", "logs", "traces"]));
