@@ -23,7 +23,7 @@ grouping, the envelope fields, and the empty-result checklist.
 | Tool | Purpose | Inputs | Output blocks used | Bounds | Failure classes |
 | --- | --- | --- | --- | --- | --- |
 | `ravel_capabilities` | Protocol and server version, the query catalog's served tools (`tools.enabled`) and declared-but-unserved ones (`tools.catalogued`), effective budget ceilings, dialect summaries, tenant hash, enabled signals. The six Ravel Agents tools appear in `tools/list` only, not in either list | none | `data` | none; reads no data | `unauthorized`, `invalid_argument`, `internal` |
-| `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, committed row count (summed from commit records, before duplicate collapse and pending erasure) | `signal` (`metrics`, `logs` or `traces`), an optional `cursor` | `data` (`kind`, `name`, `value` rows: `table`, `column`, `indexed_key`, `family`), `scope`, `visibility`, `coverage`, `presentation`, `budget` | 100 metric families per page; the schema declares no budget input, and a page is bounded by `max_response_bytes`, 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `cursor_expired`, `cursor_invalid`, `internal` |
+| `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, committed row count, an upper bound (summed from commit records, before duplicate collapse and pending erasure) | `signal` (`metrics`, `logs` or `traces`), an optional `cursor` | `data` (`kind`, `name`, `value` rows: `table`, `column`, `indexed_key`, `family`), `scope`, `visibility`, `coverage`, `accuracy` (`exact: false` on page one, for the row count), `presentation`, `budget` | 100 metric families per page; the schema declares no budget input, and a page is bounded by `max_response_bytes`, 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `cursor_expired`, `cursor_invalid`, `internal` |
 | `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, an optional `filter`, `time_range` (required), `deadline_ms`, `max_response_bytes`. A call carrying neither a selector nor a label name is refused, whatever its filter | `data`, `scope`, `coverage`, `presentation` | at most 2,000 segments admitted for resolution, fewer when the effective `max_segments` is lower; `max_response_bytes` 512 KiB default, 256 KiB floor. No `max_rows`: a page is bounded by bytes, and a page cut short reports through `presentation.bytes_cap_hit` and `presentation.rows_omitted` | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
 | `ravel_explain_query` | Validate a SQL statement, estimate its cost, and return the plan shape. No scan runs. SQL only: see [Explaining a statement](#explaining-a-statement) | `query`, `time_range` (required), `deadline_ms`, `max_response_bytes` | `data` (effective schema as `data.columns`, zero rows), `scope`, `visibility`, `budget` (the estimate beside `effective`), `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `deadline`, `unavailable`, `internal` |
 | `ravel_query_sql` | One `SELECT` over one table | `query`, `time_range` (required), `max_rows`, lowerable budgets, an optional `cursor`, an optional `evidence_ref` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
@@ -80,7 +80,7 @@ size it used, `max_rows` held to 1,000, as both `presentation.max_rows` and
 | `ravel_agent_events` | One page of the agent's events in `event_seq` order, optionally one operation's | `kind`, `key`, an optional `cursor`, an optional `operation`, `deadline_ms`, `max_response_bytes`, `max_rows` | `POST /api/v1/agents/events` | `max_rows` 200, at most 1,000; a full or byte-capped page carries `presentation.cursor`, the last event it kept | `unauthorized`, `invalid_argument`, `cursor_expired` (with a `restart_from_oldest_cursor` next step), `deadline`, `unavailable`, `internal` |
 | `ravel_agent_blocked_effects` | Effects in doubt, each with the inspector's text and the two reconcile requests that unblock it | `kind`, `key`, `deadline_ms`, `max_response_bytes` | `GET /api/v1/agents/effects` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
 
-The `tools/list` result is 15,648 bytes with the nine tools and 23,537
+The `tools/list` result is 15,652 bytes with the nine tools and 23,541
 bytes with all fifteen, against a budget of 24,576 bytes. A test pins both
 figures exactly.
 
@@ -459,8 +459,13 @@ fixed column and typed attribute column, then one `indexed_key` row per
 indexed key, then up to 100 `family` rows. Within each kind, rows sort by
 name in byte order (`Zeta` sorts before `alpha`). The `table` row is on
 page one only. `committed_rows` is summed from commit records, so it
-counts rows before duplicate collapse and before any pending erasure.
-Logs and traces have no metric families, and give the reason in
+counts rows before duplicate collapse and before any pending erasure: an
+upper bound on the rows a query reads back. Counting those needs segment
+reads, which this tool does not do. Page one therefore reports
+`accuracy.exact: false` with `accuracy.approximation` set to
+`committed_rows is an upper bound: summed from commit records, counted
+before duplicate collapse and before pending erasure`. A later page
+carries no `table` row and reports `accuracy.exact: true`. Logs and traces have no metric families, and give the reason in
 `families_absent_reason` and in `warnings`. So does a metrics tenant with
 no metric metadata record: the reason is `the tenant has no metric metadata
 record`.

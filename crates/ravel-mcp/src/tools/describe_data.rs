@@ -7,7 +7,10 @@
 //! `indexed_key` row per key, then the `family` rows. Within each kind the
 //! rows are sorted by name in byte order (`Zeta` before `alpha`), the order
 //! the service sorts the family record in. The `table` row is served on page
-//! one only.
+//! one only. Its `committed_rows` is summed from commit records, before
+//! duplicate collapse and before pending erasure, so page one reports
+//! `accuracy.exact: false` with [`COMMITTED_ROWS_APPROXIMATION`]; a later
+//! page carries no `table` row and reports `exact: true`.
 //!
 //! The rows page with a D5 keyset cursor under `order_by: ["kind", "name"]`.
 //! The position is the last served row's kind, as one tag byte, followed by
@@ -71,6 +74,12 @@ const ARGUMENT_HASH_CONTEXT: &str = "ravel-mcp ravel_describe_data arguments v1"
 pub const UNCOUNTED_READS_WARNING: &str = "budget.actual counts the catalog resolve only; \
      the metric metadata record and tenant configuration reads are not counted";
 
+/// `accuracy.approximation` on page one, the page that carries the `table`
+/// row. Counting what a reader would see needs segment reads, which this
+/// tool does not do.
+pub const COMMITTED_ROWS_APPROXIMATION: &str = "committed_rows is an upper bound: summed from \
+     commit records, counted before duplicate collapse and before pending erasure";
+
 /// Run the tool. An argument the body cannot use, an unknown signal, or a
 /// cursor that does not redeem is a failure envelope that reaches no store.
 pub async fn run<B: QueryBackend>(args: Value, ctx: &ToolContext<'_>, backend: &B) -> Envelope {
@@ -111,8 +120,11 @@ async fn first_page<B: QueryBackend>(
     rows.extend(column_rows(&outcome, None));
     rows.extend(indexed_key_rows(&outcome, None));
     rows.extend(family_rows(&outcome));
+    let mut envelope = base(name, &outcome, rows, ctx);
+    envelope.accuracy.exact = false;
+    envelope.accuracy.approximation = Some(COMMITTED_ROWS_APPROXIMATION.to_string());
     let draft = Draft::new(
-        base(name, &outcome, rows, ctx),
+        envelope,
         Ok(signal),
         outcome.pending_erasure.clone(),
         outcome.declared_column_set.clone(),
@@ -403,8 +415,6 @@ fn table_row(name: &str, outcome: &DescribeOutcome) -> Row {
             "signal": name,
             "segments": outcome.segments,
             "committed_rows": outcome.committed_rows.to_string(),
-            "committed_rows_note": "summed from commit records: counted before duplicate \
-                                    collapse and before pending erasure",
             "coverage": coverage,
             "families_total": outcome.families_total,
             "families_absent_reason": outcome.families_absent_reason,
@@ -1274,5 +1284,51 @@ mod tests {
                 .iter()
                 .any(|warning| warning.starts_with("families_total: 250"))
         );
+    }
+
+    /// FLIP: a body that marked page one `exact: true`, as it did before
+    /// issue #3664, presents the upper-bound `committed_rows` as an exact
+    /// count and fails here.
+    #[test]
+    fn page_one_marks_committed_rows_as_an_upper_bound() {
+        let key = key();
+        let ctx = test_context(&key);
+        let backend = stub(vec![outcome(&names(0..3), false, ctx.now_ns)]);
+        let one = call(json!({"signal": "metrics"}), &ctx, &backend);
+        assert_eq!(one.status, Status::Ok);
+        assert_eq!(names_of(&one, RowKind::Table), vec!["samples".to_string()]);
+        assert!(!one.accuracy.exact);
+        assert_eq!(
+            one.accuracy.approximation.as_deref(),
+            Some(COMMITTED_ROWS_APPROXIMATION)
+        );
+        assert!(COMMITTED_ROWS_APPROXIMATION.starts_with("committed_rows is an upper bound"));
+        assert!(!one.accuracy.lower_bound_count);
+        let value = serde_json::to_value(&one).expect("envelope serializes");
+        assert_eq!(value["data"]["rows"][0][2]["committed_rows"], json!("10"));
+        assert_eq!(value["data"]["rows"][0][2].get("committed_rows_note"), None);
+    }
+
+    /// FLIP: a body that set `exact: false` on every page marks a
+    /// families-only later page, which carries no `table` row, approximate.
+    #[test]
+    fn a_later_families_only_page_is_exact() {
+        let key = key();
+        let ctx = test_context(&key);
+        let backend = stub(vec![
+            outcome(&names(0..100), true, ctx.now_ns),
+            outcome(&names(100..101), false, ctx.now_ns),
+        ]);
+        let one = call(json!({"signal": "metrics"}), &ctx, &backend);
+        let two = call(
+            json!({"signal": "metrics", "cursor": cursor_of(&one)}),
+            &later(&ctx),
+            &backend,
+        );
+        assert_eq!(two.status, Status::Ok);
+        assert!(names_of(&two, RowKind::Table).is_empty());
+        assert_eq!(family_names(&two), names(100..101));
+        assert!(two.accuracy.exact);
+        assert_eq!(two.accuracy.approximation, None);
     }
 }
