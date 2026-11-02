@@ -220,14 +220,16 @@ mod tests {
     /// the test configured and record the request they were handed. Every
     /// other method, and either of those left unconfigured, panics: a test
     /// built on it proves the body never reached that call.
+    /// One metadata call: the request, and for `label_values` the label name
+    /// and the `include_log_metric_names` flag.
+    pub(crate) type MetadataCall = (MetadataRequest, Option<(String, bool)>);
+
     #[derive(Default)]
     pub(crate) struct Stub {
         pub(crate) explain: Option<crate::draft::ExplainOutcome>,
         pub(crate) listed: Option<Envelope>,
         pub(crate) explained: std::cell::RefCell<Vec<ravel_sql::SqlRequest>>,
-        /// Each metadata call: the request, and for `label_values` the label
-        /// name and the `include_log_metric_names` flag.
-        pub(crate) metadata: std::cell::RefCell<Vec<(MetadataRequest, Option<(String, bool)>)>>,
+        pub(crate) metadata: std::cell::RefCell<Vec<MetadataCall>>,
     }
 
     impl Stub {
