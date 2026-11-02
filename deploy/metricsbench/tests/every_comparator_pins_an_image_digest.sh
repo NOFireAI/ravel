@@ -865,8 +865,8 @@ fi
 echo
 echo "== s3s-fs binary sha256 pin (deploy/metricsbench/run.sh) =="
 
-S3S_PIN_X86_64='S3S_FS_SHA256_X86_64="159464c7e5a3b5658c1d3fb890b0ec6db0b3bdf40812832a25886a1af2c165ce"'
-S3S_PIN_AARCH64='S3S_FS_SHA256_AARCH64="631494fbf5508e7694b4e941c2049cd89cb58feb838eb03bdbb3dc998c60772c"'
+S3S_PIN_X86_64='S3S_FS_SHA256_X86_64="99592a8a64cbb773c34aee9966537eb4d1091d9a91b70699220f1f34dd4b384e"'
+S3S_PIN_AARCH64='S3S_FS_SHA256_AARCH64="92d7bbbb29bd4c5aee00b5f1c280c1402e799ed8a28f497e5ba813f1ebc3eecc"'
 S3S_EXPECTED_PIN_COUNT=2
 
 # count_exact <file> <line>: lines of <file> equal to <line> after leading

@@ -144,9 +144,9 @@ BIN="${TMP}/bin"
 mkdir -p "${BIN}"
 REAL_UNAME="$(command -v uname)"
 
-S3S_RELEASE="s3s-fs-0.17.0-ravel.2"
-S3S_SHA_X86_64="159464c7e5a3b5658c1d3fb890b0ec6db0b3bdf40812832a25886a1af2c165ce"
-S3S_SHA_AARCH64="631494fbf5508e7694b4e941c2049cd89cb58feb838eb03bdbb3dc998c60772c"
+S3S_RELEASE="s3s-fs-0.17.0-ravel.3"
+S3S_SHA_X86_64="99592a8a64cbb773c34aee9966537eb4d1091d9a91b70699220f1f34dd4b384e"
+S3S_SHA_AARCH64="92d7bbbb29bd4c5aee00b5f1c280c1402e799ed8a28f497e5ba813f1ebc3eecc"
 
 # --- stubs -------------------------------------------------------------------
 
@@ -276,7 +276,7 @@ while [ $# -gt 0 ]; do
 done
 case "$url" in
   *imds.invalid*) exit 7 ;;
-  */releases/download/s3s-fs-0.17.0-ravel.2/s3s-fs-linux-*)
+  */releases/download/s3s-fs-0.17.0-ravel.3/s3s-fs-linux-*)
     [ -z "${STUB_S3S_CURL_EXIT:-}" ] || exit "${STUB_S3S_CURL_EXIT}"
     printf '%s' "${STUB_S3S_BYTES:-stub-s3s-fs-${url##*-linux-}}" >"$out"
     ;;
