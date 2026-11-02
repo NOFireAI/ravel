@@ -16,8 +16,8 @@
 //! outcomes carry names, a partial flag and warnings, and no basis.
 //!
 //! The port returns the list before any cap, and this body applies the
-//! filter and then the row and byte caps, so a page is complete for its
-//! filter and a truncation report means more matches exist.
+//! filter and then the byte cap, so a page is complete for its filter and a
+//! truncation report means more matches exist.
 
 use ravel_query::RequestBudgets;
 use ravel_query::http::{ApiError, MetadataRequest, include_log_metric_names};

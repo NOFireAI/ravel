@@ -8,8 +8,9 @@ which has its own guide: [Ravel Agents](agents.md).
 > off by default. Build `ravel-server` with `--features mcp`, then run it
 > with `--mcp` (only supported under `--mode all` or `--mode query`) to
 > mount `POST /mcp` on the query router; `--mcp-allowed-origins` is required
-> once that listener is reachable from anywhere but localhost. Two tools are
-> served today, `ravel_capabilities` and `ravel_get_trace`. The other seven are catalogued, so
+> once that listener is reachable from anywhere but localhost. Four tools are
+> served today: `ravel_capabilities`, `ravel_find_labels`,
+> `ravel_explain_query` and `ravel_get_trace`. The other five are catalogued, so
 > `tools/list` returns them, and a call to one refuses with a
 > `method_not_found` protocol error until its body lands; the sections below
 > describe the surface as designed. The [MCP reference](../reference/mcp.md)
@@ -75,17 +76,41 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   over the window that you asked for. The result states whether the list is
   complete for that window.
 
+  The arguments choose the list:
+
+  - `label_name` set: the values of that label, under the selector when
+    one is given. `label_name: "__name__"` lists metric names, and that list
+    includes the two log pseudo-metrics when there is no selector or the
+    selector names one of them.
+  - only `selector` set: the label names of the series the selector
+    matches.
+
+  A warning on every answer names the list that ran and repeats that it is
+  observed from data over the window.
+
   A call must carry a selector or a label name. The server refuses a call
-  that carries neither, and names the bounded form to ask for. An optional
-  `filter` does not satisfy that bound. A selector or a label name narrows
-  what the call resolves. A filter narrows only what the call returns.
+  that carries neither with `missing_argument`, and names the bounded form
+  to ask for. An optional `filter` does not satisfy that bound. A selector
+  or a label name narrows what the call resolves. A filter narrows only what
+  the call returns.
+
+  `time_range` is required. Each bound is an RFC 3339 timestamp or a decimal
+  nanosecond string, and the window is half-open.
 
 ### Check a query first
 
-- `ravel_explain_query`: validates a SQL or PromQL statement, resolves the
-  snapshot that it targets, and runs no scan. It returns the target table,
-  the effective schema, how many segments it admits, the cost estimate
-  against the effective budget, and the plan shape.
+- `ravel_explain_query`: validates a SQL statement, resolves the snapshot
+  that it targets, and runs no scan. It returns the target table, the
+  effective schema as `data.columns` with zero rows, how many segments it
+  admits, the cost estimate beside the effective budget in `budget`, and the
+  plan shape in `plan`.
+
+  It explains SQL only. A statement that fails SQL validation returns
+  `validation` with the engine's text and a next step naming
+  `ravel_query_promql`. A statement that is not a `SELECT` returns
+  `unsupported`. A statement that names two tables is refused with
+  `invalid_argument` before anything is resolved, and the message names
+  the one-table rule.
 
 ### Run a query
 
@@ -243,8 +268,9 @@ How the server shaped the result to fit the response cap:
   combined to their minimum
 - `actual`: what the call spent
 - `estimate`: for `ravel_explain_query`
-- `estimate_is_upper_envelope`: states that the estimate is an upper
-  envelope, never a prediction
+- `estimate_is_upper_envelope`: true when every component of the estimate
+  is bounded, so the estimate is an upper envelope; false when the explain
+  names a component unbounded
 
 ### `evidence`
 
@@ -304,17 +330,42 @@ Defaults and floors:
   `presentation.cursor` when more families exist. Request the next page
   with the same signal and that cursor. The cursor follows the same
   codec, tenant binding, and lifetime as every other cursor.
-- `ravel_find_labels`: 2,000 segments admitted for label resolution. It
+- `ravel_find_labels`: at most 2,000 segments admitted for label
+  resolution, fewer when your `max_segments` is lower. It
   takes no `max_rows`, and a page is bounded by bytes alone. A page cut
   short reports through `presentation.bytes_cap_hit` and
   `presentation.rows_omitted`. A page with `bytes_cap_hit` false is the
   complete match set for the window and filter that you asked for.
 
 `ravel_explain_query` compares its cost estimate to the effective budget
-before you run anything. When the estimate exceeds the budget, the call
-fails with `budget_estimate_exceeds_ceiling` and names the factor to narrow
-the query by. An estimate that the server cannot compute counts as exceeding
-the budget. The server never treats it as zero.
+before you run anything:
+
+| Estimate | Budget |
+| --- | --- |
+| `estimated_requests` | `max_store_requests` |
+| `estimated_store_bytes` | `max_bytes_scanned` |
+| admitted segments | `max_segments` |
+
+Segments from ingest hours the catalog has not folded yet are exempt from
+`max_segments` and do not count against it. When any estimate exceeds its
+budget, the call fails with `budget_estimate_exceeds_ceiling` and names the
+factor to narrow the query by: the largest ratio of estimate to budget among
+the ones that exceed.
+
+An estimate component that the server cannot bound is never treated as zero.
+The explain names it unbounded in `warnings` and sets
+`estimate_is_upper_envelope` to false.
+
+- A component with no budget, such as `estimated_decompressed_bytes` on
+  the logs table, does not refuse the call.
+- A component that has a budget refuses the call with
+  `budget_estimate_exceeds_ceiling`, except on a Parquet table.
+- On a Parquet table, `estimated_requests` and `estimated_store_bytes` are
+  both unbounded, because a cold cache and evicted ranges cost more than
+  the manifests count. The explain does not refuse. It adds a warning for
+  each budget it did not check, because the Parquet reader enforces
+  `max_store_requests` and `max_bytes_scanned` at scan time and refuses the
+  read that would cross either.
 
 ## Cursors and evidence references
 
