@@ -1037,9 +1037,11 @@ Shipping the explain changed its catalog description to name SQL only, and
 `ravel_find_labels` no longer declares `evidence_ref` (2026-09-13 item 2).
 `tools/list` was then 15,648 bytes with the nine tools and 23,537 bytes
 with all fifteen. Since the committed row count amendment below it was
-15,652 bytes with the nine tools and 23,541 bytes with all fifteen, and
-since the query-sql amendment below it is 15,733 bytes with the nine tools
-and 23,622 bytes with all fifteen, against the 24,576-byte budget; both
+15,652 bytes with the nine tools and 23,541 bytes with all fifteen. Since
+the query-sql amendment below it was 15,733 bytes with the nine tools and
+23,622 bytes with all fifteen, and since the query-promql amendment below
+it is 15,972 bytes with the nine tools and 23,861 bytes with all fifteen,
+against the 24,576-byte budget; both
 figures are pinned in
 `crates/ravel-mcp/src/catalog.rs` and
 `services/ravel-server/tests/mcp_agents_e2e.rs`.
