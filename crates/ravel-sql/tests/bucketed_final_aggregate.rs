@@ -34,7 +34,7 @@ use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
@@ -354,6 +354,16 @@ const ANSWER_SHAPES: &[(&str, &str, bool)] = &[
         "SELECT ts, count(*), min(v), max(v) FROM logs GROUP BY ts",
         true,
     ),
+    (
+        "a 16-byte Decimal128 state routed through the chunks",
+        "SELECT a, sum(CAST(v AS DECIMAL(20, 2))) FROM logs GROUP BY a",
+        true,
+    ),
+    (
+        "a Date32 key",
+        "SELECT arrow_cast(CAST(a AS INT), 'Date32') AS d, count(*), sum(v) FROM logs GROUP BY d",
+        true,
+    ),
 ];
 
 /// The bucketed plan answers every admitted shape exactly as the stock final
@@ -644,6 +654,11 @@ struct Planned {
 
 impl Planned {
     async fn new(sql: &str, config: SqlConfig) -> Self {
+        Self::with_samples(sql, config, SAMPLES).await
+    }
+
+    /// `sql` over `samples` samples, one per `ts` in `0..samples`.
+    async fn with_samples(sql: &str, config: SqlConfig, samples: i64) -> Self {
         let tenant = tenant_id("acme");
         let specs = vec![SegSpec::new(
             10,
@@ -651,7 +666,7 @@ impl Planned {
             1,
             vec![SeriesSpec::new(
                 "m",
-                (0..SAMPLES).map(|i| (i, i as f64)).collect(),
+                (0..samples).map(|i| (i, i as f64)).collect(),
             )],
         )];
         let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
@@ -1019,4 +1034,610 @@ async fn dropping_the_stream_releases_every_bucket() {
     drop(started);
     assert_eq!(planned.reserved(), 0, "bytes left reserved after the drop");
     assert_eq!(planned.held(), 0, "bytes left held after the drop");
+}
+
+// ---------------------------------------------------------------------------
+// Repeated and NULL keys routed after engagement
+// ---------------------------------------------------------------------------
+
+/// Samples in the repeated-key fixture at `partitions` partitions.
+///
+/// The scan emits 8,192-row batches that a round-robin exchange deals to the
+/// partial partitions. A partial skips only once a batch arrives after its
+/// first `SKIP_PARTIAL_AGGREGATION_PROBE_ROWS` (8,192) rows, and the hash
+/// exchange above it coalesces what reaches each final partition into
+/// batches of up to 8,192 rows. A final partition reads more than one batch
+/// only when more than 8,192 rows reach it, so the fixture is sized for that:
+/// 300,000 rows at 4 partitions, and 800,000 (98 scan batches, about three
+/// per partial) at 32.
+fn repeated_samples(partitions: usize) -> i64 {
+    if partitions >= 32 { 800_000 } else { 300_000 }
+}
+
+/// 1,000 non-NULL keys, every key on 1 row in 1,000, plus a NULL key on
+/// every seventh row. 1,001 groups in the first 8,192 rows a partial reads
+/// is a ratio above `SKIP_PARTIAL_AGGREGATION_PROBE_RATIO` (0.1), so the partial
+/// stops aggregating and passes rows through.
+const REPEATED_SQL: &str = "SELECT CASE WHEN arrow_cast(ts, 'Int64') % 7 = 0 THEN NULL \
+                            ELSE arrow_cast(ts, 'Int64') % 1000 END AS k, count(*) AS c, \
+                            sum(arrow_cast(ts, 'Int64') % 997) AS s FROM samples GROUP BY k";
+
+/// Every row of `batches`, rendered column by column, sorted.
+fn render_sorted(batches: &[RecordBatch]) -> Vec<String> {
+    let mut out = Vec::new();
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            let cells: Vec<String> = batch
+                .columns()
+                .iter()
+                .map(|column| array_value_to_string(column, row).expect("renders"))
+                .collect();
+            out.push(cells.join("|"));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `plan` with the input of its bucketed exec wrapped in a [`RecordingInput`]
+/// that counts each partition's input batches into `batches`.
+fn recording_bucketed_input(
+    plan: &Arc<dyn ExecutionPlan>,
+    batches: &Arc<Vec<AtomicUsize>>,
+) -> Arc<dyn ExecutionPlan> {
+    if plan.downcast_ref::<BucketedFinalAggregateExec>().is_some() {
+        let recorder: Arc<dyn ExecutionPlan> = Arc::new(RecordingInput {
+            input: Arc::clone(plan.children()[0]),
+            batches: Arc::clone(batches),
+            exhausted: Arc::new((0..batches.len()).map(|_| AtomicBool::new(false)).collect()),
+        });
+        return Arc::clone(plan)
+            .replace_children(
+                vec![recorder],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .expect("rewired");
+    }
+    let children: Vec<Arc<dyn ExecutionPlan>> = plan
+        .children()
+        .into_iter()
+        .map(|child| recording_bucketed_input(child, batches))
+        .collect();
+    if children.is_empty() {
+        return Arc::clone(plan);
+    }
+    Arc::clone(plan)
+        .replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+        .expect("rewired")
+}
+
+/// The first `Partial` `AggregateExec` in `plan`, in pre-order.
+fn find_partial(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    if plan
+        .downcast_ref::<AggregateExec>()
+        .is_some_and(|aggregate| *aggregate.mode() == AggregateMode::Partial)
+    {
+        return Some(Arc::clone(plan));
+    }
+    plan.children().into_iter().find_map(find_partial)
+}
+
+/// Each partition's `output_rows` on `plan`, indexed by partition.
+fn output_rows_by_partition(plan: &Arc<dyn ExecutionPlan>, partitions: usize) -> Vec<usize> {
+    let mut out = vec![0usize; partitions];
+    let metrics = plan.metrics().expect("the exec reports metrics");
+    for metric in metrics.iter() {
+        if let MetricValue::OutputRows(count) = metric.value() {
+            let partition = metric.partition().expect("per-partition output rows");
+            out[partition] += count.value();
+        }
+    }
+    out
+}
+
+/// Repeated keys and NULL keys answer exactly as the stock final does when
+/// the same key is in the table at engagement and arrives again in later
+/// routed batches. `engage_groups = 16` engages a partition once its table
+/// holds 16 of the 1,001 groups, at 32 partitions too, and the partial
+/// aggregate passes raw rows through (its `skipped_aggregation_rows` is
+/// asserted above zero), so keys keep arriving after their partition
+/// engaged. Keys, counts and sums are compared, with the field set and
+/// unset, at 1, 4 and 32 partitions.
+///
+/// The metrics show the routing really happened after engagement: every
+/// engaged partition read more than one input batch, and its `routed_rows`
+/// exceeds its groups (its `output_rows`, there being no TopK), which bounds
+/// the rows engagement itself routes, since the table it routes holds each
+/// group once.
+#[tokio::test]
+async fn repeated_and_null_keys_routed_after_engagement_answer_as_the_stock_final() {
+    let tuning = BucketedFinalAggregation {
+        engage_groups: 16,
+        bits: 6,
+        routed_chunk_rows: 64,
+    };
+    for partitions in [1usize, 4, 32] {
+        let on = Planned::with_samples(
+            REPEATED_SQL,
+            sql_config(partitions, Some(tuning), None),
+            repeated_samples(partitions),
+        )
+        .await;
+        let off = Planned::with_samples(
+            REPEATED_SQL,
+            sql_config(partitions, None, None),
+            repeated_samples(partitions),
+        )
+        .await;
+        let input_batches: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..partitions).map(|_| AtomicUsize::new(0)).collect());
+        let physical = recording_bucketed_input(&on.physical, &input_batches);
+        let on_batches = collect(Arc::clone(&physical), on.ctx.task_ctx())
+            .await
+            .expect("bucketed query runs");
+        let off_batches = collect(Arc::clone(&off.physical), off.ctx.task_ctx())
+            .await
+            .expect("stock query runs");
+        let on_rows = render_sorted(&on_batches);
+        let off_rows = render_sorted(&off_batches);
+        assert_eq!(off_rows.len(), 1_001, "1,000 keys and NULL");
+        assert!(
+            off_rows.iter().any(|row| row.starts_with('|')),
+            "no NULL key group"
+        );
+        assert_eq!(
+            on_rows, off_rows,
+            "repeated keys at {partitions} partitions answer differently"
+        );
+        if partitions == 1 {
+            continue;
+        }
+
+        let exec = find_bucketed(&physical).expect("a bucketed exec");
+        let engaged = counter_by_partition(&exec, "engaged", partitions);
+        let routed = counter_by_partition(&exec, "routed_rows", partitions);
+        let groups = output_rows_by_partition(&exec, partitions);
+        let read: Vec<usize> = input_batches
+            .iter()
+            .map(|count| count.load(Ordering::SeqCst))
+            .collect();
+        assert_eq!(groups.iter().sum::<usize>(), 1_001);
+        assert!(
+            engaged.contains(&1),
+            "no partition engaged at {partitions}: {engaged:?}"
+        );
+        for partition in 0..partitions {
+            if engaged[partition] == 1 {
+                assert!(
+                    read[partition] > 1,
+                    "partition {partition} at {partitions} read {} input batches",
+                    read[partition]
+                );
+                assert!(
+                    routed[partition] > groups[partition],
+                    "partition {partition} at {partitions} routed {} rows for {} groups: \
+                     nothing was routed after engagement",
+                    routed[partition],
+                    groups[partition],
+                );
+            }
+        }
+        let partial = find_partial(&on.physical).expect("a partial aggregate");
+        let skipped: usize = counter_by_partition(&partial, "skipped_aggregation_rows", partitions)
+            .iter()
+            .sum();
+        assert!(
+            skipped > 0,
+            "the partial aggregate never skipped at {partitions}: the final saw no raw rows"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-bucket top-k (ADR-3565 decision 4)
+// ---------------------------------------------------------------------------
+
+/// Samples in the tie fixture: enough that each final partition reads
+/// several input batches at 4 partitions (see [`repeated_samples`]).
+const TIE_SAMPLES: i64 = 300_000;
+
+/// A key over `t = 0..300,000` in 300 runs of 1,000: five keys with distinct
+/// counts 1,500, 1,200, 900, 600 and 300, twenty keys tied at 75, and 4,900
+/// keys of count 60. Every key recurs across the whole range, and 4,925
+/// groups in a partial's first 8,192 rows make it skip, so a key's rows keep
+/// reaching its final partition in later input batches, after engagement.
+/// Under `LIMIT 10` the tenth count is 75, a tie five of the twenty fill.
+const TIE_SQL: &str = "SELECT CASE WHEN t % 1000 < 5 THEN 1000 WHEN t % 1000 < 9 THEN 1001 \
+                       WHEN t % 1000 < 12 THEN 1002 WHEN t % 1000 < 14 THEN 1003 \
+                       WHEN t % 1000 = 14 THEN 1004 WHEN t % 1000 < 20 THEN 2000 + (t / 1000) % 20 \
+                       ELSE 3000 + t % 5000 END AS k, count(*) AS c \
+                       FROM (SELECT arrow_cast(ts, 'Int64') AS t FROM samples) \
+                       GROUP BY k ORDER BY c DESC LIMIT 10";
+
+/// `(key, count)` of every row of an answer rendered as `key|count`.
+fn key_counts(rows: &[String]) -> Vec<(i64, i64)> {
+    rows.iter()
+        .map(|row| {
+            let (key, count) = row.split_once('|').expect("two columns");
+            (
+                key.parse().expect("an integer key"),
+                count.parse().expect("an integer count"),
+            )
+        })
+        .collect()
+}
+
+/// The value of the metric `name` on an `EXPLAIN ANALYZE` line, with
+/// DataFusion's `K`/`M`/`B` suffix applied.
+fn metric_on_line(line: &str, name: &str) -> f64 {
+    let needle = format!(" {name}=");
+    let start = line
+        .find(&needle)
+        .or_else(|| line.find(&format!("[{name}=")))
+        .unwrap_or_else(|| panic!("{name} missing: {line}"))
+        + needle.len();
+    let rest = &line[start..];
+    let end = rest.find([',', ']']).unwrap_or(rest.len());
+    let mut parts = rest[..end].split_whitespace();
+    let number: f64 = parts.next().expect("a value").parse().expect("a number");
+    let scale = match parts.next() {
+        None => 1.0,
+        Some("K") => 1e3,
+        Some("M") => 1e6,
+        Some("B") => 1e9,
+        Some(unit) => panic!("unit {unit} on {line}"),
+    };
+    number * scale
+}
+
+/// The bucketed exec's line of `sql`'s `EXPLAIN ANALYZE` on `executor`.
+async fn analyzed_bucketed_line(executor: &SqlExecutor, sql: &str) -> String {
+    let run = pinned(executor, sql)
+        .await
+        .execute_analyzed()
+        .await
+        .expect("query runs");
+    run.plan_with_metrics
+        .lines()
+        .find(|line| line.contains("BucketedFinalAggregateExec"))
+        .unwrap_or_else(|| panic!("no bucketed exec:\n{}", run.plan_with_metrics))
+        .to_string()
+}
+
+/// The per-bucket cut is exact when the tenth count ties across buckets: at
+/// 1, 4 and 32 partitions the counts are the stock final's multiset, and
+/// every key whose count is above the tenth is the stock final's. Which five
+/// of the twenty tied keys survive may differ, as SQL allows. Both answers
+/// are also checked against the fixture's known counts, and the run proves
+/// the cut fired: `topk_rows_dropped` is above zero at 4 and 32 partitions.
+///
+/// At 4 partitions every engaged partition reads more than one input batch,
+/// so a key's state is spread over several of its bucket's chunks: a cut
+/// taken before the bucket's last chunk is merged splits that key's count
+/// and fails here.
+#[tokio::test]
+async fn per_bucket_topk_is_exact_on_ties() {
+    let expected_counts = vec![1500, 1200, 900, 600, 300, 75, 75, 75, 75, 75];
+    for partitions in [1usize, 4, 32] {
+        // About 150 groups reach each of 32 partitions: 4 buckets keep more
+        // than 10 in a bucket, so the cut has rows to drop there too.
+        let tuning = BucketedFinalAggregation {
+            engage_groups: ENGAGE_GROUPS,
+            bits: if partitions == 32 { 2 } else { 6 },
+            routed_chunk_rows: 64,
+        };
+        let on = Planned::with_samples(
+            TIE_SQL,
+            sql_config(partitions, Some(tuning), None),
+            TIE_SAMPLES,
+        )
+        .await;
+        let off =
+            Planned::with_samples(TIE_SQL, sql_config(partitions, None, None), TIE_SAMPLES).await;
+        let input_batches: Arc<Vec<AtomicUsize>> =
+            Arc::new((0..partitions).map(|_| AtomicUsize::new(0)).collect());
+        let physical = recording_bucketed_input(&on.physical, &input_batches);
+        let on_batches = collect(Arc::clone(&physical), on.ctx.task_ctx())
+            .await
+            .expect("bucketed query runs");
+        let off_batches = collect(Arc::clone(&off.physical), off.ctx.task_ctx())
+            .await
+            .expect("stock query runs");
+        let on_rows = key_counts(&render_sorted(&on_batches));
+        let off_rows = key_counts(&render_sorted(&off_batches));
+        let mut on_counts: Vec<i64> = on_rows.iter().map(|(_, count)| *count).collect();
+        let mut off_counts: Vec<i64> = off_rows.iter().map(|(_, count)| *count).collect();
+        on_counts.sort_unstable_by(|a, b| b.cmp(a));
+        off_counts.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(off_counts, expected_counts, "the stock final's counts");
+        assert_eq!(
+            on_counts, off_counts,
+            "count multiset at {partitions} partitions"
+        );
+        let above = |rows: &[(i64, i64)]| {
+            let mut keys: Vec<i64> = rows
+                .iter()
+                .filter(|(_, count)| *count > 75)
+                .map(|(key, _)| *key)
+                .collect();
+            keys.sort_unstable();
+            keys
+        };
+        assert_eq!(above(&off_rows), vec![1000, 1001, 1002, 1003, 1004]);
+        assert_eq!(
+            above(&on_rows),
+            above(&off_rows),
+            "keys above the tie at {partitions} partitions"
+        );
+        for (key, count) in &on_rows {
+            if *count == 75 {
+                assert!((2000..2020).contains(key), "{key} is not a tied key");
+            }
+        }
+        if partitions == 1 {
+            continue;
+        }
+        let exec = find_bucketed(&physical).expect("a bucketed exec");
+        let line = format!("{}", displayable(exec.as_ref()).one_line());
+        assert!(line.contains(", k=10"), "no TopK on the exec: {line}");
+        let dropped: usize = counter_by_partition(&exec, "topk_rows_dropped", partitions)
+            .iter()
+            .sum();
+        assert!(
+            dropped > 0,
+            "the cut never fired at {partitions} partitions"
+        );
+        if partitions == 4 {
+            let engaged = counter_by_partition(&exec, "engaged", partitions);
+            assert_eq!(engaged, vec![1; 4]);
+            for (partition, count) in input_batches.iter().enumerate() {
+                let read = count.load(Ordering::SeqCst);
+                assert!(read > 1, "partition {partition} read {read} input batches");
+            }
+        }
+    }
+}
+
+/// `EXPLAIN` shows the TopK the exec cuts to, and `EXPLAIN ANALYZE` the rows
+/// the cut dropped, on the q33 shape under `ORDER BY count DESC LIMIT 10`
+/// through the executor: 6,000 unique `a` reach the exec, and with at most
+/// ten per bucket in 64 buckets of 4 partitions, at most 2,560 leave it.
+#[tokio::test]
+async fn explain_analyze_reports_the_topk_and_the_rows_it_dropped() {
+    let on = executor(ROWS, sql_config(4, Some(bucketed(ENGAGE_GROUPS)), None)).await;
+    let q33 = "SELECT a, CAST(b AS INT) AS b32, count(*) AS c, sum(CAST(v AS SMALLINT)) AS s \
+               FROM logs GROUP BY a, b32 ORDER BY c DESC LIMIT 10";
+    let plan = physical_plan(&on, q33).await;
+    let line = plan
+        .lines()
+        .find(|line| line.contains("BucketedFinalAggregateExec"))
+        .unwrap_or_else(|| panic!("no bucketed exec:\n{plan}"));
+    assert!(
+        line.contains(", topk=[count(Int64(1))@2 DESC, "),
+        "no TopK on the EXPLAIN line: {line}"
+    );
+    let line = analyzed_bucketed_line(&on, q33).await;
+    assert!(line.contains(", k=10"), "{line}");
+    let dropped = metric_on_line(&line, "topk_rows_dropped");
+    let output = metric_on_line(&line, "output_rows");
+    assert!(output <= 2_560.0, "{line}");
+    assert_eq!(dropped + output, ROWS as f64, "{line}");
+}
+
+/// The q33 shape over the samples fixture: two fixed-width keys that are
+/// unique together, `count(*)`, ordered by the count under `LIMIT 10`.
+const Q33_SAMPLES_SQL: &str = "SELECT ts, CAST(value AS BIGINT) AS v, count(*) AS c \
+                               FROM samples GROUP BY ts, v ORDER BY c DESC LIMIT 10";
+
+/// With unique keys, `LIMIT 10` and 64 buckets, every partition emits at
+/// most `64 x 10` rows to the sort above, and the rows it cut account for
+/// every other group: per partition `output_rows <= 640`, and over the
+/// partitions `output_rows + topk_rows_dropped` is exactly the 64,000
+/// groups, so `topk_rows_dropped` is at least the groups minus 640 per
+/// partition.
+#[tokio::test]
+async fn per_bucket_topk_feeds_the_sort_at_most_64_times_k_rows_per_partition() {
+    const PARTITIONS: usize = 4;
+    let tuning = BucketedFinalAggregation {
+        engage_groups: ENGAGE_GROUPS,
+        bits: 6,
+        routed_chunk_rows: 256,
+    };
+    let planned = Planned::new(Q33_SAMPLES_SQL, sql_config(PARTITIONS, Some(tuning), None)).await;
+    let exec = planned.bucketed();
+    let topk = exec
+        .downcast_ref::<BucketedFinalAggregateExec>()
+        .and_then(BucketedFinalAggregateExec::topk)
+        .expect("the rule reached the TopK");
+    assert_eq!(topk.fetch(), 10);
+    let batches = collect(Arc::clone(&planned.physical), planned.ctx.task_ctx())
+        .await
+        .expect("query runs");
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 10);
+
+    let engaged = counter_by_partition(&exec, "engaged", PARTITIONS);
+    assert_eq!(engaged, vec![1; PARTITIONS], "every partition engages");
+    let output = output_rows_by_partition(&exec, PARTITIONS);
+    let dropped = counter_by_partition(&exec, "topk_rows_dropped", PARTITIONS);
+    for partition in 0..PARTITIONS {
+        assert!(
+            output[partition] <= 64 * 10,
+            "partition {partition} fed the sort {} rows: {output:?}",
+            output[partition]
+        );
+        assert!(output[partition] > 0, "partition {partition}: {output:?}");
+    }
+    let total: usize = output.iter().sum::<usize>() + dropped.iter().sum::<usize>();
+    assert_eq!(total, SAMPLES as usize, "{output:?} {dropped:?}");
+    assert!(dropped.iter().sum::<usize>() >= SAMPLES as usize - PARTITIONS * 640);
+}
+
+/// Without a fetch the sort reaches, the exec keeps no TopK and cuts
+/// nothing: a plain `ORDER BY` with no `LIMIT`, a `LIMIT` with no
+/// `ORDER BY`, and an `ORDER BY ... LIMIT` whose sort key the projection
+/// computes rather than passes as a bare column. Each exec is run directly
+/// over every partition, so a `LIMIT` above cannot stop it early: every
+/// partition engages, `topk_rows_dropped` is 0 and the rows are the 64,000
+/// groups.
+#[tokio::test]
+async fn per_bucket_topk_does_not_engage_without_a_fetch_above() {
+    const PARTITIONS: usize = 4;
+    let statements = [
+        "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY c DESC",
+        "SELECT ts, count(*) AS c FROM samples GROUP BY ts LIMIT 10",
+        "SELECT ts, count(*) + 1 AS c FROM samples GROUP BY ts ORDER BY c DESC LIMIT 10",
+    ];
+    let tuning = BucketedFinalAggregation {
+        engage_groups: ENGAGE_GROUPS,
+        bits: 6,
+        routed_chunk_rows: 256,
+    };
+    for sql in statements {
+        let planned = Planned::new(sql, sql_config(PARTITIONS, Some(tuning), None)).await;
+        let exec = planned.bucketed();
+        let line = format!("{}", displayable(exec.as_ref()).one_line());
+        assert!(
+            exec.downcast_ref::<BucketedFinalAggregateExec>()
+                .expect("bucketed")
+                .topk()
+                .is_none(),
+            "{sql}: a TopK was kept: {line}"
+        );
+        assert!(!line.contains("topk="), "{sql}: {line}");
+        let task_ctx = planned.ctx.task_ctx();
+        let runs = (0..PARTITIONS).map(|partition| {
+            let exec = Arc::clone(&exec);
+            let task_ctx = Arc::clone(&task_ctx);
+            async move {
+                let mut stream = exec.execute(partition, task_ctx).expect("executes");
+                let mut rows = 0usize;
+                while let Some(batch) = stream.next().await {
+                    rows += batch.expect("batch").num_rows();
+                }
+                rows
+            }
+        });
+        let rows: usize = futures::future::join_all(runs).await.into_iter().sum();
+        assert_eq!(rows, SAMPLES as usize, "{sql}");
+        assert_eq!(
+            counter_by_partition(&exec, "engaged", PARTITIONS),
+            vec![1; PARTITIONS],
+            "{sql}"
+        );
+        assert_eq!(
+            counter_by_partition(&exec, "topk_rows_dropped", PARTITIONS),
+            vec![0; PARTITIONS],
+            "{sql}"
+        );
+        assert_eq!(
+            output_rows_by_partition(&exec, PARTITIONS)
+                .iter()
+                .sum::<usize>(),
+            SAMPLES as usize,
+            "{sql}"
+        );
+    }
+}
+
+/// Bytes of one output row of `exec`: the widths of its columns, every one of
+/// them fixed-width.
+fn output_row_bytes(exec: &Arc<dyn ExecutionPlan>) -> usize {
+    exec.schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            field
+                .data_type()
+                .primitive_width()
+                .unwrap_or_else(|| panic!("{field} is not fixed-width"))
+        })
+        .sum()
+}
+
+/// The per-bucket cut releases a bucket's evaluated output beyond its top k
+/// before that output drains. Pinned on a state that does not depend on
+/// scheduling: both partitions at their first output batch, with their input
+/// exhausted and bucket 0 evaluated.
+///
+/// `bits = 1` gives each of 2 partitions two buckets of about 16,000 groups,
+/// above the 8,192-row `batch_size`, so without the cut bucket 0's output is
+/// still pending after its first batch. With the cut, at most 10 rows remain
+/// and the first batch hands them all out. The reserved bytes therefore fall
+/// by at least the uncut bucket 0 output: its rows, which are the cut's
+/// `topk_rows_dropped` plus the rows kept, at 24 bytes a row.
+#[tokio::test]
+async fn per_bucket_topk_releases_the_pending_bucket_output() {
+    const PARTITIONS: usize = 2;
+    let tuning = BucketedFinalAggregation {
+        engage_groups: ENGAGE_GROUPS,
+        bits: 1,
+        routed_chunk_rows: 256,
+    };
+    let first_batches = |planned: &Planned, exec: Arc<dyn ExecutionPlan>| {
+        let task_ctx = planned.ctx.task_ctx();
+        let firsts = (0..PARTITIONS).map(move |partition| {
+            let exec = Arc::clone(&exec);
+            let task_ctx = Arc::clone(&task_ctx);
+            async move {
+                let mut stream = exec.execute(partition, task_ctx).expect("executes");
+                let first = stream.next().await.expect("a first batch").expect("batch");
+                (stream, first.num_rows())
+            }
+        });
+        futures::future::join_all(firsts)
+    };
+
+    let cut = Planned::new(Q33_SAMPLES_SQL, sql_config(PARTITIONS, Some(tuning), None)).await;
+    let cut_exec = cut.bucketed();
+    let started_cut = first_batches(&cut, Arc::clone(&cut_exec)).await;
+    let reserved_cut = cut.reserved();
+    let dropped = counter_by_partition(&cut_exec, "topk_rows_dropped", PARTITIONS);
+    for (partition, (_, rows)) in started_cut.iter().enumerate() {
+        assert!(*rows <= 10, "partition {partition} emitted {rows} rows");
+        assert!(
+            dropped[partition] + rows > 8192,
+            "partition {partition}: bucket 0 holds {} groups, within one batch",
+            dropped[partition] + rows
+        );
+    }
+
+    let uncut = Planned::new(Q33_SAMPLES_SQL, sql_config(PARTITIONS, Some(tuning), None)).await;
+    let planned_exec = uncut.bucketed();
+    let exec = planned_exec
+        .downcast_ref::<BucketedFinalAggregateExec>()
+        .expect("bucketed");
+    assert!(exec.topk().is_some());
+    let uncut_exec: Arc<dyn ExecutionPlan> = Arc::new(BucketedFinalAggregateExec::new(
+        Arc::clone(exec.aggregate()),
+        exec.config(),
+    ));
+    let started_uncut = first_batches(&uncut, Arc::clone(&uncut_exec)).await;
+    let reserved_uncut = uncut.reserved();
+    for (partition, (_, rows)) in started_uncut.iter().enumerate() {
+        assert_eq!(*rows, 8192, "partition {partition}'s first uncut batch");
+    }
+    assert_eq!(
+        counter_by_partition(&uncut_exec, "topk_rows_dropped", PARTITIONS),
+        vec![0; PARTITIONS]
+    );
+
+    let bucket_0_rows: usize =
+        dropped.iter().sum::<usize>() + started_cut.iter().map(|(_, rows)| rows).sum::<usize>();
+    let row_bytes = output_row_bytes(&cut_exec);
+    assert_eq!(row_bytes, 24, "ts, v and count(*)");
+    let floor = bucket_0_rows * row_bytes;
+    eprintln!(
+        "reserved at the first batch: cut {reserved_cut}, uncut {reserved_uncut}, \
+         floor {floor} ({bucket_0_rows} bucket 0 rows)"
+    );
+    assert!(
+        reserved_uncut >= reserved_cut + floor,
+        "the cut released {} bytes, below the {floor} bytes of bucket 0's output",
+        reserved_uncut.saturating_sub(reserved_cut)
+    );
+    drop(started_cut);
+    drop(started_uncut);
 }

@@ -43,10 +43,32 @@
 //! The rule runs before `CompactSlices`, which wraps only `AggregateExec`, so
 //! a converted aggregate gets neither half of that rule: the slice compaction
 //! (redundant, every batch emitted here owns its buffers) and the TopK
-//! pre-filter (not redundant: under `ORDER BY ... LIMIT k` every group reaches
-//! the sort). The per-bucket top-k of ADR-3565 decision 4 restores the cut
-//! inside this exec; until it lands, an A/B on those shapes measures bucketing
-//! minus the pre-filter.
+//! pre-filter, which the per-bucket top-k below replaces.
+//!
+//! # Per-bucket top-k (ADR-3565 decision 4)
+//!
+//! The rule walks the plan top down with the TopK pre-filter's reach rule,
+//! [`TopKPrefilter::above`]: a `SortExec` with a fetch starts a TopK, a
+//! `ProjectionExec` passing its sort keys as bare columns maps it through, a
+//! fetch-less `CoalescePartitionsExec` forwards it, and any other node ends
+//! it. When the TopK reaches a converted aggregate and every sort key is one
+//! of its output columns, the exec keeps it (`topk=[...], k=...` on its
+//! `EXPLAIN` line), and in phase 2 cuts each bucket's evaluated output to
+//! the k rows that sort first under that ordering before emitting it,
+//! counting the rest in `topk_rows_dropped`. A partition that never engaged
+//! is emitted uncut; the TopK above handles its one table.
+//!
+//! The cut is exact for the reason the pre-filter's is: a bucket's groups are
+//! complete when it is evaluated, so a row outside its bucket's top k has k
+//! rows ahead of it that reach the same TopK and cannot be in its result. At
+//! a tie on the k-th value, which tied rows survive may differ from the stock
+//! plan, as SQL allows (`per_bucket_topk_is_exact_on_ties`). The sort above
+//! then sees at most `2^bits x k` rows per engaged partition.
+//!
+//! The cut shrinks the charged pending output of a bucket to at most k rows
+//! while it drains (`per_bucket_topk_releases_the_pending_bucket_output`).
+//! The table that output came from was charged at its full size just before,
+//! so the cut is not a bound on peak memory.
 //!
 //! # Memory
 //!
@@ -63,8 +85,10 @@
 //! # Yielding and output
 //!
 //! The stream returns `Pending` (after waking itself) after every input batch
-//! it merges or routes, and emits each bucket before it aggregates the next,
-//! so a dropped stream or a breached ceiling acts within one batch in phase 1
+//! it merges or routes, and emits each bucket before it aggregates the next.
+//! A bucket with no output (empty, or cut to nothing at `k = 0`) returns
+//! `Pending` the same way, so one poll aggregates at most one bucket, and a
+//! dropped stream or a breached ceiling acts within one batch in phase 1
 //! and one bucket in phase 2. Every output batch is a copy of at most
 //! `batch_size` rows: no operator above holds a slice that pins a whole
 //! bucket's buffers. No output is emitted before input ends.
@@ -76,13 +100,14 @@ use std::task::{Context, Poll, ready};
 
 use datafusion::arrow::array::{Array, ArrayData, ArrayRef, MutableArrayData, make_array};
 use datafusion::arrow::buffer::{BooleanBuffer, Buffer, MutableBuffer, NullBuffer};
+use datafusion::arrow::compute::{lexsort_to_indices, take_record_batch};
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::arrow::util::bit_util;
 use datafusion::common::Result as DFResult;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::hash_utils::{RandomState, create_hashes};
-use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{RecordBatchStream, TaskContext};
@@ -106,6 +131,7 @@ use datafusion::physical_plan::{
 };
 use futures::{Stream, StreamExt};
 
+use crate::compact_slices::TopKPrefilter;
 use crate::config::BucketedFinalAggregation;
 
 /// The rule's name, as it appears in DataFusion's optimizer diagnostics.
@@ -173,6 +199,43 @@ impl BucketedFinalAggregateRule {
                     })
             })
     }
+
+    /// Rewrite `node` and its subtree, children first. `topk_above` is the
+    /// TopK `node`'s output reaches, in `node`'s output columns, under
+    /// [`TopKPrefilter::above`]'s reach rule (the one `CompactSlices` uses);
+    /// a converted aggregate cuts each bucket to it.
+    fn rewrite(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        topk_above: Option<TopKPrefilter>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let topk_below = TopKPrefilter::above(&node, topk_above.as_ref());
+        let children = node.children();
+        let mut rewritten = Vec::with_capacity(children.len());
+        let mut changed = false;
+        for child in children {
+            let new_child = self.rewrite(Arc::clone(child), topk_below.clone())?;
+            changed |= !Arc::ptr_eq(child, &new_child);
+            rewritten.push(new_child);
+        }
+        let node = if changed {
+            node.replace_children(
+                rewritten,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )?
+        } else {
+            node
+        };
+        let Some(aggregate) = node.downcast_ref::<AggregateExec>() else {
+            return Ok(node);
+        };
+        if !Self::admits(aggregate) {
+            return Ok(node);
+        }
+        let exec = BucketedFinalAggregateExec::new(Arc::new(aggregate.clone()), self.config)
+            .with_topk(topk_above);
+        Ok(Arc::new(exec))
+    }
 }
 
 impl PhysicalOptimizerRule for BucketedFinalAggregateRule {
@@ -181,17 +244,7 @@ impl PhysicalOptimizerRule for BucketedFinalAggregateRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        plan.transform_up(|node| {
-            let Some(aggregate) = node.downcast_ref::<AggregateExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            if !Self::admits(aggregate) {
-                return Ok(Transformed::no(node));
-            }
-            let exec = BucketedFinalAggregateExec::new(Arc::new(aggregate.clone()), self.config);
-            Ok(Transformed::yes(Arc::new(exec) as Arc<dyn ExecutionPlan>))
-        })
-        .data()
+        self.rewrite(plan, None)
     }
 
     fn name(&self) -> &str {
@@ -241,20 +294,37 @@ fn is_bucketed_state(data_type: &DataType) -> bool {
 pub struct BucketedFinalAggregateExec {
     aggregate: Arc<AggregateExec>,
     config: BucketedFinalAggregation,
+    topk: Option<TopKPrefilter>,
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl BucketedFinalAggregateExec {
     /// Run `aggregate`, a `FinalPartitioned` aggregate that
-    /// [`BucketedFinalAggregateRule::admits`], in two phases under `config`.
-    /// A stream over an aggregate that does not qualify fails with an
-    /// internal error on its first batch rather than misreading a column.
+    /// [`BucketedFinalAggregateRule::admits`], in two phases under `config`,
+    /// with no per-bucket top-k. A stream over an aggregate that does not
+    /// qualify fails with an internal error on its first batch rather than
+    /// misreading a column.
     pub fn new(aggregate: Arc<AggregateExec>, config: BucketedFinalAggregation) -> Self {
         BucketedFinalAggregateExec {
             aggregate,
             config,
+            topk: None,
             metrics: ExecutionPlanMetricsSet::new(),
         }
+    }
+
+    /// Cut each routed bucket's output to its own top `topk.fetch()` rows
+    /// under `topk.ordering()` (see the module docs). A TopK whose sort keys
+    /// are not all bare columns of this exec's output, by index and name, is
+    /// dropped, as is `None`: every row is then emitted.
+    pub fn with_topk(mut self, topk: Option<TopKPrefilter>) -> Self {
+        self.topk = topk.filter(|topk| topk.fits(&self.aggregate.schema()));
+        self
+    }
+
+    /// The TopK each routed bucket is cut to, if any.
+    pub fn topk(&self) -> Option<&TopKPrefilter> {
+        self.topk.as_ref()
     }
 
     /// The aggregate this exec replaced, whose input, expressions and
@@ -301,7 +371,11 @@ impl DisplayAs for BucketedFinalAggregateExec {
                     self.config.engage_groups,
                     self.config.bits.min(BUCKETED_FINAL_AGGREGATE_MAX_BITS),
                     self.config.routed_chunk_rows.max(1),
-                )
+                )?;
+                if let Some(topk) = &self.topk {
+                    write!(f, ", topk=[{}], k={}", topk.ordering(), topk.fetch())?;
+                }
+                Ok(())
             }
             DisplayFormatType::TreeRender => Ok(()),
         }
@@ -354,10 +428,10 @@ impl ExecutionPlan for BucketedFinalAggregateExec {
                     .to_string(),
             ));
         };
-        Ok(Arc::new(BucketedFinalAggregateExec::new(
-            Arc::new(aggregate.clone()),
-            self.config,
-        )))
+        Ok(Arc::new(
+            BucketedFinalAggregateExec::new(Arc::new(aggregate.clone()), self.config)
+                .with_topk(self.topk.clone()),
+        ))
     }
 
     fn execute(
@@ -372,6 +446,7 @@ impl ExecutionPlan for BucketedFinalAggregateExec {
         let stream = BucketedStream::try_new(
             &self.aggregate,
             self.config,
+            self.topk.clone(),
             input,
             partition,
             &context,
@@ -413,6 +488,9 @@ struct BucketMetrics {
     /// 1 when the partition's table reached `engage_groups` and routed, else
     /// 0.
     engaged: Count,
+    /// Rows the per-bucket top-k cut from routed buckets' output; zero
+    /// without a TopK and for a partition that never engaged.
+    topk_rows_dropped: Count,
 }
 
 impl BucketMetrics {
@@ -422,6 +500,7 @@ impl BucketMetrics {
             buckets_non_empty: MetricBuilder::new(metrics).counter("buckets_non_empty", partition),
             routed_rows: MetricBuilder::new(metrics).counter("routed_rows", partition),
             engaged: MetricBuilder::new(metrics).counter("engaged", partition),
+            topk_rows_dropped: MetricBuilder::new(metrics).counter("topk_rows_dropped", partition),
         }
     }
 }
@@ -545,6 +624,9 @@ struct Router {
     hashes: Vec<u64>,
     order: Vec<u32>,
     offsets: Vec<usize>,
+    /// Each bucket's next slot in `order` while a batch is sorted, reused
+    /// across batches.
+    next: Vec<usize>,
 }
 
 impl Router {
@@ -560,6 +642,7 @@ impl Router {
             hashes: Vec::new(),
             order: Vec::new(),
             offsets: vec![0; bucket_count + 1],
+            next: Vec::with_capacity(bucket_count + 1),
         }
     }
 
@@ -575,6 +658,7 @@ impl Router {
         self.hashes.capacity() * size_of::<u64>()
             + self.order.capacity() * size_of::<u32>()
             + self.offsets.capacity() * size_of::<usize>()
+            + self.next.capacity() * size_of::<usize>()
             + self.buckets.capacity() * size_of::<Bucket>()
     }
 
@@ -644,11 +728,12 @@ impl Router {
         }
         self.order.clear();
         self.order.resize(rows, 0);
-        let mut next = self.offsets.clone();
+        self.next.clear();
+        self.next.extend_from_slice(&self.offsets);
         for index in 0..rows {
             let bucket = self.bucket_of(self.hashes[index]);
-            self.order[next[bucket]] = index as u32;
-            next[bucket] += 1;
+            self.order[self.next[bucket]] = index as u32;
+            self.next[bucket] += 1;
         }
 
         for bucket in 0..bucket_count {
@@ -738,6 +823,8 @@ struct BucketedStream {
     pending: Option<PendingOutput>,
     phase: Phase,
     config: BucketedFinalAggregation,
+    /// The TopK each routed bucket's output is cut to before it is emitted.
+    topk: Option<TopKPrefilter>,
     batch_size: usize,
     reservation: MemoryReservation,
     /// The part of the reservation charged by `size()`: tables, scratch and
@@ -750,6 +837,7 @@ impl BucketedStream {
     fn try_new(
         aggregate: &AggregateExec,
         config: BucketedFinalAggregation,
+        topk: Option<TopKPrefilter>,
         input: SendableRecordBatchStream,
         partition: usize,
         context: &Arc<TaskContext>,
@@ -808,6 +896,7 @@ impl BucketedStream {
             pending: None,
             phase: Phase::Ingest,
             config,
+            topk,
             batch_size: context.session_config().batch_size().max(1),
             reservation,
             table_bytes: 0,
@@ -913,8 +1002,9 @@ impl BucketedStream {
     }
 
     /// Evaluate the reused table into the pending output and clear it,
-    /// keeping room for `keep_groups` groups.
-    fn evaluate_table(&mut self, keep_groups: usize) -> DFResult<()> {
+    /// keeping room for `keep_groups` groups. With `cut` and a TopK set, the
+    /// pending output is only the evaluated rows' own top k.
+    fn evaluate_table(&mut self, keep_groups: usize, cut: bool) -> DFResult<()> {
         if self.group_values.is_empty() {
             return Ok(());
         }
@@ -922,14 +1012,25 @@ impl BucketedStream {
         for accumulator in &mut self.accumulators {
             columns.push(accumulator.evaluate(EmitTo::All)?);
         }
-        let batch = RecordBatch::try_new(Arc::clone(&self.schema), columns)?;
+        let mut batch = RecordBatch::try_new(Arc::clone(&self.schema), columns)?;
         self.group_values.clear_shrink(keep_groups);
-        self.pending = Some(PendingOutput { batch, offset: 0 });
+        if cut && let Some(topk) = &self.topk {
+            let evaluated = batch.num_rows();
+            batch = cut_to_topk(batch, topk)?;
+            self.metrics
+                .topk_rows_dropped
+                .add(evaluated - batch.num_rows());
+        }
+        if batch.num_rows() > 0 {
+            self.pending = Some(PendingOutput { batch, offset: 0 });
+        }
         Ok(())
     }
 
     /// Merge one bucket, release its chunks as they are merged, and evaluate
-    /// it into the pending output.
+    /// it into the pending output, cut to the TopK when one is set. The
+    /// bucket's groups are complete here: every input row was routed before
+    /// phase 2 began.
     fn aggregate_bucket(&mut self, bucket: usize) -> DFResult<()> {
         let elapsed = self.metrics.baseline.elapsed_compute().clone();
         let _timer = elapsed.timer();
@@ -944,7 +1045,7 @@ impl BucketedStream {
             self.charge_table()?;
         }
         let groups = self.group_values.len();
-        self.evaluate_table(groups)?;
+        self.evaluate_table(groups, true)?;
         self.charge_table()
     }
 
@@ -979,7 +1080,7 @@ impl BucketedStream {
                 Ok(())
             }
             None => {
-                self.evaluate_table(0)?;
+                self.evaluate_table(0, false)?;
                 self.charge_table()
             }
         }
@@ -1003,6 +1104,23 @@ impl BucketedStream {
         self.release();
         Poll::Ready(Some(Err(err)))
     }
+}
+
+/// The `topk.fetch()` rows of `batch` that sort first under `topk`'s
+/// ordering, taken into fresh buffers; `batch` itself when it has no more
+/// rows than that. Among rows tied with the k-th, which survive is
+/// unspecified.
+fn cut_to_topk(batch: RecordBatch, topk: &TopKPrefilter) -> DFResult<RecordBatch> {
+    if batch.num_rows() <= topk.fetch() {
+        return Ok(batch);
+    }
+    let columns = topk
+        .ordering()
+        .iter()
+        .map(|sort| sort.evaluate_to_sort_column(&batch))
+        .collect::<DFResult<Vec<_>>>()?;
+    let indices = lexsort_to_indices(&columns, Some(topk.fetch()))?;
+    Ok(take_record_batch(&batch, &indices)?)
 }
 
 /// `len` rows of `batch` from `offset`, copied into fresh buffers.
@@ -1074,6 +1192,13 @@ impl Stream for BucketedStream {
                     };
                     if let Err(err) = this.aggregate_bucket(next_bucket) {
                         return this.fail(err);
+                    }
+                    // A bucket with output yields by returning its first
+                    // batch; one without yields here, so one poll walks at
+                    // most one bucket however many are empty.
+                    if this.pending.is_none() {
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
                     }
                 }
                 Phase::Done => return Poll::Ready(None),
