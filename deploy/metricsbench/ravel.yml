@@ -11,7 +11,7 @@
 #
 # Ravel is one more comparator here: written through /api/v1/write (Remote
 # Write 1.0) and queried through the Prometheus HTTP API, at the same 2 CPU /
-# 4g envelope as prometheus, victoriametrics and mimir. The in-process replay
+# 8g envelope as prometheus, victoriametrics and mimir. The in-process replay
 # (crates/ravel-bench, metricsbench_ingest) is the diagnostic lane and its
 # rows say endpoint: in-process; it is not the portable row.
 #
@@ -128,31 +128,31 @@ services:
       # does not measure it.
       - "--audit-mode"
       - "off"
-      # MEMORY (disclosed): the 4g envelope is 4,294,967,296 bytes. The
+      # MEMORY (disclosed): the 8g envelope is 8,589,934,592 bytes. The
       # server reserves max(min(2 GiB, total / 4), 256 MiB baseline + the
-      # 512 MiB ingest buffer) = 1 GiB outside its budget, which leaves a
-      # 3,221,225,472-byte (3 GiB) memory budget. Written explicitly so the
+      # 512 MiB ingest buffer) = 2 GiB outside its budget, which leaves a
+      # 6,442,450,944-byte (6 GiB) memory budget. Written explicitly so the
       # cache shares below do not depend on how the container reports its
       # memory to the server's own derivation.
       - "--memory-budget-bytes"
-      - "3221225472"
-      # Fetcher cache: 25% of the budget, 805,306,368 bytes (768 MiB), the
+      - "6442450944"
+      # Fetcher cache: 25% of the budget, 1,610,612,736 bytes (1.5 GiB), the
       # value the server derives for a non-loopback S3 endpoint.
       - "--cache-max-bytes"
-      - "805306368"
-      # Catalog cache: 5% of the budget, 161,061,273 bytes (about 154 MiB),
+      - "1610612736"
+      # Catalog cache: 5% of the budget, 322,122,547 bytes (about 307 MiB),
       # the derived value.
       - "--catalog-cache-max-bytes"
-      - "161061273"
-      # Column-statistics cache: 2% of the budget, 64,424,509 bytes (about
-      # 61 MiB), the derived value (ADR-1413 decision 5). The three caches
-      # sum to 1,030,792,150 bytes, inside the 3 GiB budget as startup
-      # requires, which leaves 2,190,433,322 bytes (about 2.0 GiB) of budget
+      - "322122547"
+      # Column-statistics cache: 2% of the budget, 128,849,018 bytes (about
+      # 123 MiB), the derived value (ADR-1413 decision 5). The three caches
+      # sum to 2,061,584,301 bytes, inside the 6 GiB budget as startup
+      # requires, which leaves 4,380,866,643 bytes (about 4.1 GiB) of budget
       # for query working set.
       - "--column-stats-cache-max-bytes"
-      - "64424509"
+      - "128849018"
       # Ingest buffer: the default 536870912 (512 MiB), stated. It is the
-      # buffer the 1 GiB reserve above holds outside the budget.
+      # buffer the 2 GiB reserve above holds outside the budget.
       - "--max-ingest-buffer-bytes"
       - "536870912"
       # QUERY LIMITS (disclosed, frozen per ADR-0927 amendment 2026-10-26 F).
@@ -200,7 +200,7 @@ services:
       # count is reached. A hit is refused(budget). This flag also sizes the
       # per-query range selector-cache cap, 2 x max_samples x 16 bytes:
       # 16,000,000,000 here against 320,000,000 at the default, so the cap is
-      # inert and the 3 GiB memory budget alone bounds a range query's cached
+      # inert and the 6 GiB memory budget alone bounds a range query's cached
       # selector copies; an entry the budget cannot hold falls back to
       # uncached reads.
       - "--max-samples"
@@ -230,4 +230,4 @@ services:
           # Identical envelope to prometheus, victoriametrics and mimir in
           # docker-compose.yml.
           cpus: "2.0"
-          memory: 4g
+          memory: 8g

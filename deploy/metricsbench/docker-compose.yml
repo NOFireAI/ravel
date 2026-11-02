@@ -94,7 +94,7 @@ services:
       # statement then reads 400,000 x 240 = 96,000,000, above the default.
       # Any value above that refuses no corpus statement on this count;
       # 500000000 is also Mimir's querier.max_samples, so the two share one
-      # frozen value. The 4g envelope is the memory bound.
+      # frozen value. The 8g envelope is the memory bound.
       - "--query.max-samples=500000000"
       # Query timeout: equals the 3.13.1 default 2m, written so the effective
       # config capture shows it and a default change cannot move it silently.
@@ -128,8 +128,10 @@ services:
         limits:
           # Identical envelope across all three engines (see victoriametrics and
           # mimir): equal CPU and memory is a portable-lane fairness precondition.
+          # 8g: Mimir's single process needs more than 4g to ingest the
+          # cardinality profile, and the envelope stays equal across engines.
           cpus: "2.0"
-          memory: 4g
+          memory: 8g
 
   # --- VictoriaMetrics ---------------------------------------------------
   # Single-node VictoriaMetrics. Accepts Prometheus Remote Write 1.0 natively at
@@ -189,6 +191,10 @@ services:
       # the cardinality profile's 1,000,000 active series, the most any
       # profile holds.
       - "-search.maxUniqueTimeseries=1000000"
+      # Series per /api/v1/series call: the default 30000 refuses the
+      # harness's cardinality read-back, which lists all 1,000,000 series, with
+      # a 422. Pinned to the same 1,000,000 as -search.maxUniqueTimeseries.
+      - "-search.maxSeries=1000000"
       # Response cache: off (replaces the default false, cache on). The
       # benchmark replays historical timestamps, and the same docs section
       # recommends disabling the cache while "writing historical data with
@@ -219,7 +225,7 @@ services:
       resources:
         limits:
           cpus: "2.0"
-          memory: 4g
+          memory: 8g
 
   # --- Object storage for the object-storage-native comparator -----------
   # s3s-fs backing Mimir's S3 blocks storage (ADR-0927 amendment 2026-10-29).
@@ -362,7 +368,7 @@ services:
       resources:
         limits:
           cpus: "2.0"
-          memory: 4g
+          memory: 8g
 
 volumes:
   prometheus-data:
