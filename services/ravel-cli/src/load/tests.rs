@@ -130,16 +130,16 @@ fn default_max_inflight_flushes_matches_pipeline_depth() {
 /// `IngestConfig::max_inflight_flushes` (issue #800). That field's default
 /// governs the client-facing serving path, whose memory has no outer window
 /// capping it; the bulk loader's tracks `--pipeline-depth`. ADR-2708 D3 moved
-/// the serving default from 1 to 4, so the two now coincide by value only.
-/// This pins the serving default so that moving it again is a deliberate edit
-/// here too, and pins that a load gives its one tenant every permit rather
-/// than the serving path's N-1 share.
+/// the serving default from 1 to 4, and its flush slots amendment to 8, while
+/// the loader's stays 4. This pins the serving default so that moving it again
+/// is a deliberate edit here too, and pins that a load gives its one tenant
+/// every permit rather than the serving path's N-1 share.
 #[test]
 fn loader_flush_window_default_diverges_from_the_serving_default() {
     assert_eq!(
         IngestConfig::default().max_inflight_flushes,
-        4,
-        "the serving default is 4 (ADR-2708 D3)"
+        8,
+        "the serving default is 8 (ADR-2708 D3, flush slots amendment)"
     );
     assert_eq!(
         IngestConfig::default().max_inflight_flushes_per_tenant,
