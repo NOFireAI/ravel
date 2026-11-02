@@ -30,7 +30,7 @@ use crate::record::{
 ///
 /// Build one with [`ColumnSelection::all`] (today's behavior: decode
 /// everything) or [`ColumnSelection::fixed_only`] plus the `with_*` builders.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ColumnSelection {
     /// Decode every column in the block, ignoring every other field here.
     all: bool,

@@ -49,6 +49,10 @@ use ravel_memory::{ExhaustionCause, MemoryBudget, Reservation};
 use ravel_types::accounting::AccessIntent;
 
 use crate::block::CachedColumn;
+use crate::columns::ColumnSelection;
+
+/// The most decoded-set estimates [`DecodedColumnCache`] memoises.
+pub const ESTIMATE_MEMO_MAX_ENTRIES: usize = 65_536;
 
 /// The decoded layout entries are stored in. Bumped when the decoder's output
 /// shape for a column kind changes, so an entry of the old shape never hits.
@@ -266,6 +270,18 @@ impl PressureSnapshot {
     }
 }
 
+/// Memoised whole-segment decoded-set estimates, by projection and then by
+/// the (tenant, object) of [`DecodedCacheAttach::key`]. `len` counts the
+/// (tenant, object, projection) entries over every projection.
+#[derive(Default)]
+struct EstimateMemo {
+    by_columns: HashMap<ColumnSelection, HashMap<ObjectId, u64>>,
+    len: usize,
+}
+
+/// The (tenant, object) of [`DecodedCacheAttach::key`].
+type ObjectId = ([u8; 16], [u8; 32]);
+
 /// The process-wide decoded-column cache.
 pub struct DecodedColumnCache {
     max_bytes: u64,
@@ -273,6 +289,7 @@ pub struct DecodedColumnCache {
     budget: Option<Arc<MemoryBudget>>,
     clock: Arc<dyn Clock>,
     inner: Mutex<Inner>,
+    estimates: Mutex<EstimateMemo>,
     pressure_evictions: AtomicU64,
     pressure_freed_bytes: AtomicU64,
 }
@@ -305,6 +322,7 @@ impl DecodedColumnCache {
             budget,
             clock,
             inner: Mutex::new(Inner::default()),
+            estimates: Mutex::new(EstimateMemo::default()),
             pressure_evictions: AtomicU64::new(0),
             pressure_freed_bytes: AtomicU64::new(0),
         }
@@ -364,6 +382,67 @@ impl DecodedColumnCache {
     /// Hits served for column id `column`, over every object and tenant.
     pub fn column_hits(&self, column: u32) -> u64 {
         self.lock().column_hits.get(&column).copied().unwrap_or(0)
+    }
+
+    fn lock_estimates(&self) -> MutexGuard<'_, EstimateMemo> {
+        self.estimates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The memoised whole-segment decoded-set estimate of `object` under
+    /// `columns` (ADR-3326, serve-if-fits amendment), keyed by the tenant and
+    /// object of [`DecodedCacheAttach::key`] and the whole selection. The
+    /// estimate is a function of the immutable object and the selection
+    /// alone, so an entry never goes stale.
+    ///
+    /// The memo holds at most [`ESTIMATE_MEMO_MAX_ENTRIES`] entries, 56 bytes
+    /// of key and value each before map overhead (about 3.7 MB at the bound),
+    /// and is not charged to `max_bytes` or the memory budget.
+    pub fn memoised_estimate(
+        &self,
+        tenant: [u8; 16],
+        object: [u8; 32],
+        columns: &ColumnSelection,
+    ) -> Option<u64> {
+        self.lock_estimates()
+            .by_columns
+            .get(columns)?
+            .get(&(tenant, object))
+            .copied()
+    }
+
+    /// Memoises `bytes` as `object`'s estimate under `columns`
+    /// ([`Self::memoised_estimate`]). A new entry that would pass
+    /// [`ESTIMATE_MEMO_MAX_ENTRIES`] clears the whole memo first.
+    pub fn memoise_estimate(
+        &self,
+        tenant: [u8; 16],
+        object: [u8; 32],
+        columns: &ColumnSelection,
+        bytes: u64,
+    ) {
+        let mut memo = self.lock_estimates();
+        let present = memo
+            .by_columns
+            .get(columns)
+            .is_some_and(|m| m.contains_key(&(tenant, object)));
+        if !present {
+            if memo.len >= ESTIMATE_MEMO_MAX_ENTRIES {
+                memo.by_columns.clear();
+                memo.len = 0;
+            }
+            memo.len += 1;
+        }
+        memo.by_columns
+            .entry(columns.clone())
+            .or_default()
+            .insert((tenant, object), bytes);
+    }
+
+    /// Entries the estimate memo holds.
+    pub fn memoised_estimates(&self) -> usize {
+        self.lock_estimates().len
     }
 
     /// Drops every entry older than the age bound and returns how many it
@@ -1347,5 +1426,36 @@ mod tests {
         cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted);
         assert!(cache.is_empty());
         assert_eq!(budget.reserved(), 0);
+    }
+
+    #[test]
+    fn the_estimate_memo_keys_on_the_whole_selection_and_clears_at_its_bound() {
+        let cache = DecodedColumnCache::new(1 << 20, None);
+        let narrow = ColumnSelection::fixed_only().with_attr("d");
+        let wide = ColumnSelection::fixed_only().with_attr("d").with_attr("p");
+        cache.memoise_estimate([1; 16], [2; 32], &narrow, 10);
+        assert_eq!(cache.memoised_estimate([1; 16], [2; 32], &narrow), Some(10));
+        assert_eq!(cache.memoised_estimate([1; 16], [2; 32], &wide), None);
+        assert_eq!(cache.memoised_estimate([9; 16], [2; 32], &narrow), None);
+        assert_eq!(cache.memoised_estimate([1; 16], [9; 32], &narrow), None);
+        cache.memoise_estimate([1; 16], [2; 32], &narrow, 10);
+        assert_eq!(cache.memoised_estimates(), 1, "a re-insert adds nothing");
+
+        for i in 1..ESTIMATE_MEMO_MAX_ENTRIES {
+            let mut object = [0u8; 32];
+            object[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            cache.memoise_estimate([1; 16], object, &wide, 1);
+        }
+        assert_eq!(cache.memoised_estimates(), ESTIMATE_MEMO_MAX_ENTRIES);
+        assert_eq!(cache.memoised_estimate([1; 16], [2; 32], &narrow), Some(10));
+        cache.memoise_estimate([1; 16], [3; 32], &narrow, 7);
+        assert_eq!(
+            cache.memoised_estimates(),
+            1,
+            "the new entry cleared the memo"
+        );
+        assert_eq!(cache.memoised_estimate([1; 16], [2; 32], &narrow), None);
+        assert_eq!(cache.memoised_estimate([1; 16], [3; 32], &narrow), Some(7));
+        assert_eq!(cache.resident_bytes(), 0, "the memo charges no cache bytes");
     }
 }
