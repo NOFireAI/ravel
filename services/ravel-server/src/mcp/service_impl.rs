@@ -4,7 +4,10 @@
 //! its outcome into a D4 envelope, except the two SQL methods: `sql_execute`
 //! stops before the caps and returns a [`Draft`] beside the snapshot's pin
 //! inputs, and `sql_explain` returns an [`ExplainOutcome`] for the explain
-//! tool to render. Nothing else: the admission permit, the
+//! tool to render. `labels` and `label_values` also stop before the caps,
+//! because `ravel_find_labels` filters the list and the caps run after the
+//! filter (ADR-1374 amendment 2026-09-12 item 6: the tool layer owns
+//! envelope finishing). Nothing else: the admission permit, the
 //! deadline clamp, the cost record, the usage guard, the audit submission, the
 //! partial-coverage gate, and the error redaction all live inside the service
 //! layer, and a tool call takes exactly one permit because it makes exactly
@@ -306,7 +309,7 @@ impl QueryBackend for ServiceBackend {
         let mut envelope = self.metadata_envelope("labels", request);
         envelope.data = d4::string_list_data("label", outcome.names);
         d4::coverage(&mut envelope, outcome.partial, outcome.warnings);
-        Ok(d4::finish(envelope, &self.budgets))
+        Ok(envelope)
     }
 
     async fn label_values(
@@ -329,7 +332,7 @@ impl QueryBackend for ServiceBackend {
             .push(format!("label={name}"));
         envelope.data = d4::string_list_data("value", outcome.values);
         d4::coverage(&mut envelope, outcome.partial, outcome.warnings);
-        Ok(d4::finish(envelope, &self.budgets))
+        Ok(envelope)
     }
 
     async fn series(

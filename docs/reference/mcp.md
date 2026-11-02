@@ -2,8 +2,9 @@
 
 > The `POST /mcp` route exists in builds compiled with the `mcp` cargo
 > feature, and is mounted when `--mcp` is passed; both are off by default.
-> Two tools are served today, `ravel_capabilities` and `ravel_get_trace`. The
-> other seven are in the catalog (so `tools/list` returns them) and refuse
+> Four tools are served today: `ravel_capabilities`, `ravel_find_labels`,
+> `ravel_explain_query` and `ravel_get_trace`. The other five are in the
+> catalog (so `tools/list` returns them) and refuse
 > every call with a
 > `method_not_found` protocol error until their bodies land; their entries
 > below describe the surface as designed. `ravel_capabilities` reports the
@@ -22,8 +23,8 @@ grouping, the envelope fields, and the empty-result checklist.
 | --- | --- | --- | --- | --- | --- |
 | `ravel_capabilities` | Protocol and server version, the query catalog's served tools (`tools.enabled`) and declared-but-unserved ones (`tools.catalogued`), effective budget ceilings, dialect summaries, tenant hash, enabled signals. The six Ravel Agents tools appear in `tools/list` only, not in either list | none | `data` | none; reads no data | `unauthorized`, `invalid_argument`, `internal` |
 | `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, exact row counts where available | `signal`, an optional `cursor` | `data`, `scope`, `visibility`, `coverage`, `presentation` | 100 metric families per page | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, an optional `filter`, `time_range` (required), `deadline_ms`, `max_response_bytes`. A call carrying neither a selector nor a label name is refused, whatever its filter | `data`, `scope`, `coverage`, `presentation` | 2,000 segments admitted for resolution; `max_response_bytes` 512 KiB default, 256 KiB floor. No `max_rows`: a page is bounded by bytes, and a page cut short reports through `presentation.bytes_cap_hit` and `presentation.rows_omitted` | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
-| `ravel_explain_query` | Validate a SQL or PromQL statement, estimate its cost, and return the plan shape. No scan runs. | `query`, `time_range`, `deadline_ms`, `max_response_bytes` | `data` (effective schema as `data.columns`, zero rows), `scope`, `budget`, `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `internal` |
+| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, an optional `filter`, `time_range` (required), `deadline_ms`, `max_response_bytes`. A call carrying neither a selector nor a label name is refused, whatever its filter | `data`, `scope`, `coverage`, `presentation` | at most 2,000 segments admitted for resolution, fewer when the effective `max_segments` is lower; `max_response_bytes` 512 KiB default, 256 KiB floor. No `max_rows`: a page is bounded by bytes, and a page cut short reports through `presentation.bytes_cap_hit` and `presentation.rows_omitted` | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
+| `ravel_explain_query` | Validate a SQL statement, estimate its cost, and return the plan shape. No scan runs. SQL only: see [Explaining a statement](#explaining-a-statement) | `query`, `time_range` (required), `deadline_ms`, `max_response_bytes` | `data` (effective schema as `data.columns`, zero rows), `scope`, `visibility`, `budget` (the estimate beside `effective`), `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `deadline`, `unavailable`, `internal` |
 | `ravel_query_sql` | One `SELECT` over one table | `query`, `time_range` (required), `max_rows`, lowerable budgets, an optional `cursor`, an optional `evidence_ref` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
 | `ravel_query_promql` | Instant or range PromQL evaluation | `query`, either `time_range` and `step` or `evaluation_time` (exactly one mode), partial-coverage consent, an optional `evidence_ref`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests` | `data`, `scope`, `coverage`, `accuracy`, `budget`, `evidence` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
 | `ravel_search_logs` | Typed log search compiled to SQL | indexed and typed-attribute predicates, `has_word`, severity, trace id, `time_range` (required), an optional `cursor`, an optional `evidence_ref`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
@@ -78,9 +79,62 @@ size it used, `max_rows` held to 1,000, as both `presentation.max_rows` and
 | `ravel_agent_events` | One page of the agent's events in `event_seq` order, optionally one operation's | `kind`, `key`, an optional `cursor`, an optional `operation`, `deadline_ms`, `max_response_bytes`, `max_rows` | `POST /api/v1/agents/events` | `max_rows` 200, at most 1,000; a full or byte-capped page carries `presentation.cursor`, the last event it kept | `unauthorized`, `invalid_argument`, `cursor_expired` (with a `restart_from_oldest_cursor` next step), `deadline`, `unavailable`, `internal` |
 | `ravel_agent_blocked_effects` | Effects in doubt, each with the inspector's text and the two reconcile requests that unblock it | `kind`, `key`, `deadline_ms`, `max_response_bytes` | `GET /api/v1/agents/effects` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
 
-The `tools/list` result is 15,700 bytes with the nine tools and 23,589
+The `tools/list` result is 15,648 bytes with the nine tools and 23,537
 bytes with all fifteen, against a budget of 24,576 bytes. A test pins both
 figures exactly.
+
+### Explaining a statement
+
+`ravel_explain_query` explains SQL only, and runs no scan.
+
+| Statement | Answer |
+| --- | --- |
+| fails SQL validation | `validation`, with the engine's text and a `next_steps` entry naming `ravel_query_promql` |
+| not a `SELECT` | `unsupported` |
+| names two tables | `invalid_argument` from the one-table rule, before the explain resolves anything |
+| one `SELECT` over one table | the explain, compared against the effective budget |
+
+The comparison pairs each bounded estimate with one budget:
+
+| Estimate | Budget |
+| --- | --- |
+| `estimated_requests` | `max_store_requests` |
+| `estimated_store_bytes` | `max_bytes_scanned` |
+| admitted segments | `max_segments` |
+
+Recent-exempt segments, from ingest hours the catalog has not folded, are
+not admitted and do not count. When any estimate exceeds its budget the
+answer is `budget_estimate_exceeds_ceiling`, and its message names the
+factor to narrow by: the largest ratio of estimate to budget among the
+ones that exceed.
+
+An estimate component the server cannot bound is named in `warnings` as
+unbounded, is never read as zero, and sets `estimate_is_upper_envelope` to
+false.
+
+- With no budget to compare against (`estimated_decompressed_bytes` on
+  every table but `samples`), the call does not refuse.
+- With a budget, the call refuses with `budget_estimate_exceeds_ceiling`,
+  except on a Parquet table.
+- On a Parquet table, `estimated_requests` and `estimated_store_bytes` are
+  unbounded, because the manifests count a cold, full scan and an uncached
+  footer or an evicted range costs more. The call does not refuse. A
+  warning names each budget the explain did not check: the Parquet reader
+  enforces `max_store_requests` and `max_bytes_scanned` at scan time and
+  refuses the read that would cross either.
+
+### Which list `ravel_find_labels` returns
+
+| Arguments | List |
+| --- | --- |
+| `label_name: "__name__"`, with or without a selector | metric names. The two log pseudo-metrics are included when there is no selector or the selector names one of them |
+| any other `label_name`, with or without a selector | the values of that label |
+| `selector` only | the label names of the series the selector matches |
+| neither | refused with `missing_argument` before any read |
+
+A warning on every answer names which list ran, and says that the list is
+observed from data over the window rather than declared, complete for the
+window unless `coverage.partial` is true.
 
 ### Filtering a label list
 
@@ -98,7 +152,7 @@ match over the strings that the call is about to return.
 - A filter does not stand in for a selector or a label name. Those bound
   which data the call resolves, and a filter bounds only the output. A call
   that carries a filter and neither of the other two is still refused with
-  `invalid_argument`.
+  `missing_argument`.
 
 The page cap that follows the filter is the byte cap. This tool advertises
 no `max_rows`. `max_response_bytes` bounds a page, 512 KiB by default with a
@@ -107,7 +161,7 @@ cap is on the page.
 
 | Page | Report |
 | --- | --- |
-| The cap stopped the page short | `presentation.bytes_cap_hit` is set, `presentation.rows_omitted` counts what did not fit, and the status is `ok_bounded`, not `ok`. |
+| The cap stopped the page short | `presentation.bytes_cap_hit` is set, `presentation.rows_omitted` counts what did not fit, `data.row_count` is the full match count, and the status is `ok_bounded`, not `ok`. |
 | `bytes_cap_hit` is false | The page is the complete match set for that filter over the requested window. |
 
 ## The envelope

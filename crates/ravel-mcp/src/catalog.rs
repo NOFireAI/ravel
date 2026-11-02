@@ -42,7 +42,6 @@ pub struct FindLabelsInput {
     /// still what a caller may need to make smaller.
     pub max_response_bytes: Option<u64>,
     pub deadline_ms: Option<u64>,
-    pub evidence_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -407,8 +406,8 @@ pub fn tool_catalog() -> Vec<Tool> {
         tool::<ExplainQueryInput>(
             "ravel_explain_query",
             "Explain query",
-            "Validate a SQL or PromQL statement, estimate its cost, and \
-             return the plan shape. No scan runs.",
+            "Validate a SQL statement, estimate its cost, and return the \
+             plan shape. No scan runs.",
         ),
         tool::<QuerySqlInput>("ravel_query_sql", "Query SQL", "One SELECT over one table"),
         tool::<QueryPromqlInput>(
@@ -451,7 +450,7 @@ mod tests {
     /// every client parses on every reconnect, and it should be read in a
     /// diff rather than absorbed silently anywhere under the bound. Update
     /// it in the same commit as the schema change that moves it.
-    const TOOLS_LIST_SERIALIZED_LEN: usize = 15_700;
+    const TOOLS_LIST_SERIALIZED_LEN: usize = 15_648;
 
     /// D2 bounds `tools/list` so the catalog itself never competes with a
     /// data response for the response-size budget.
@@ -726,12 +725,35 @@ mod tests {
         assert_eq!(schema, vec![Value::String("query".to_string())]);
     }
 
+    /// `ravel_find_labels` takes no `evidence_ref`, and the schema a client
+    /// reads says so: the argument is removed from the tool, not accepted
+    /// and ignored.
+    ///
+    /// FLIP: a removal from the body alone, leaving the field on
+    /// `FindLabelsInput`, still advertises `evidence_ref` here.
+    #[test]
+    fn find_labels_schema_has_no_evidence_ref() {
+        let tool = tool_catalog()
+            .into_iter()
+            .find(|tool| tool.name == "ravel_find_labels")
+            .expect("ravel_find_labels is in the catalog");
+        let properties = tool
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("the input schema lists its properties");
+        assert!(properties.contains_key("label_name"));
+        assert!(!properties.contains_key("evidence_ref"));
+        let text = serde_json::to_string(tool.input_schema.as_ref()).expect("schema serializes");
+        assert!(!text.contains("evidence_ref"), "{text}");
+    }
+
     /// The exact serialized size of `tools/list` with the six Ravel Agents
     /// tools merged after the nine, as a server built with `mcp` and
     /// `agents` and run with both enabled answers it. Pinned for the same
     /// reason as [`TOOLS_LIST_SERIALIZED_LEN`], under the same D2 budget
     /// (ADR-3331 decision 10).
-    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 23_589;
+    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 23_537;
 
     const _: () = assert!(
         COMBINED_TOOLS_LIST_SERIALIZED_LEN < 24_576,

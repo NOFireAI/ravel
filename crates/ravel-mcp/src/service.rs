@@ -71,14 +71,16 @@ pub trait QueryBackend {
         request: &RangeRequest,
     ) -> Result<Envelope, Failure>;
 
-    /// Mirrors `QueryService::labels`.
+    /// Mirrors `QueryService::labels`. The envelope stops before the row and
+    /// byte caps: the tool filters the list and then caps it.
     async fn labels(
         &self,
         tenant_hash: TenantHash,
         request: &MetadataRequest,
     ) -> Result<Envelope, Failure>;
 
-    /// Mirrors `QueryService::label_values`.
+    /// Mirrors `QueryService::label_values`. Stops before the caps, as
+    /// [`QueryBackend::labels`] does.
     async fn label_values(
         &self,
         tenant_hash: TenantHash,
