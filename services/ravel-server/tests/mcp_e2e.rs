@@ -1260,4 +1260,175 @@ mod with_mcp {
 
         running.shutdown().await.expect("server stops");
     }
+
+    /// One `tools/call` through the real client and route, returning the
+    /// result's error flag and its envelope.
+    async fn call(
+        client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        name: &'static str,
+        arguments: serde_json::Value,
+    ) -> (Option<bool>, serde_json::Value) {
+        let serde_json::Value::Object(arguments) = arguments else {
+            panic!("tool arguments are an object");
+        };
+        let result = client
+            .call_tool(CallToolRequestParams::new(name).with_arguments(arguments))
+            .await
+            .unwrap_or_else(|err| panic!("{name} answers: {err}"));
+        let envelope = result
+            .structured_content
+            .clone()
+            .expect("the tool result carries the envelope as structured content");
+        (result.is_error, envelope)
+    }
+
+    fn sql_window() -> serde_json::Value {
+        serde_json::json!({"start_ns": "0", "end_ns": SQL_NOW_NS.to_string()})
+    }
+
+    /// `ravel_find_labels` and `ravel_explain_query` through `POST /mcp` on
+    /// the shipping start path, over a MemoryStore tenant holding two
+    /// segments of metric `m`.
+    ///
+    /// FLIP: leaving either name off `SERVED_TOOLS`, or its dispatch arm on
+    /// `NotShipped`, makes its call a protocol error and fails `call`.
+    /// FLIP: an explain that ignored the caller's lowered
+    /// `max_store_requests` answers `ok` for the quartered budget.
+    /// FLIP: passing `include_log_metric_names: false` for a bare `__name__`
+    /// drops the two log metric names from the list.
+    #[tokio::test]
+    async fn find_labels_and_explain_query_answer_through_the_route() {
+        let (store, metrics) = instrumented_memory();
+        for (writer_seq, hour) in [(1, 0), (2, 1)] {
+            publish_sample(store.as_ref(), hour, writer_seq).await;
+        }
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let (is_error, names) = call(
+            &client,
+            "ravel_find_labels",
+            serde_json::json!({"label_name": "__name__", "time_range": sql_window()}),
+        )
+        .await;
+        assert_eq!(is_error, Some(false), "{names}");
+        assert_eq!(names["status"], serde_json::json!("ok"), "{names}");
+        // A bare `__name__` includes the log metric names, as the HTTP
+        // label-values endpoint does for the same request.
+        assert_eq!(
+            names["data"]["rows"],
+            serde_json::json!([["m"], ["ravel_log_bytes"], ["ravel_log_lines"]])
+        );
+        assert!(
+            names["warnings"].as_array().expect("warnings").iter().any(|w| w
+                .as_str()
+                .is_some_and(|w| w.starts_with("metric names (the values of __name__)"))),
+            "{names}"
+        );
+
+        let (_, filtered) = call(
+            &client,
+            "ravel_find_labels",
+            serde_json::json!({
+                "label_name": "__name__",
+                "filter": "M",
+                "time_range": sql_window(),
+            }),
+        )
+        .await;
+        assert_eq!(filtered["data"]["rows"], serde_json::json!([]), "{filtered}");
+        assert_eq!(
+            filtered["scope"]["predicates_applied"],
+            serde_json::json!(["label=__name__", "filter contains \"M\" (case-sensitive)"])
+        );
+
+        let (is_error, unbounded) = call(
+            &client,
+            "ravel_find_labels",
+            serde_json::json!({"filter": "m", "time_range": sql_window()}),
+        )
+        .await;
+        assert_eq!(is_error, Some(true));
+        assert_eq!(
+            unbounded["failure"]["class"],
+            serde_json::json!("missing_argument")
+        );
+
+        let (is_error, explained) = call(
+            &client,
+            "ravel_explain_query",
+            serde_json::json!({
+                "query": "SELECT value FROM samples",
+                "time_range": sql_window(),
+            }),
+        )
+        .await;
+        assert_eq!(is_error, Some(false), "{explained}");
+        assert_eq!(explained["status"], serde_json::json!("ok"), "{explained}");
+        assert_eq!(
+            explained["data"]["columns"],
+            serde_json::json!([{"name": "value", "type": "Float64"}])
+        );
+        assert_eq!(explained["data"]["rows"], serde_json::json!([]));
+        assert!(explained["plan"].as_str().is_some_and(|plan| !plan.is_empty()));
+        assert_eq!(
+            explained["budget"]["estimate"]["segments_resolved"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            explained["budget"]["estimate_is_upper_envelope"],
+            serde_json::json!(true)
+        );
+
+        // Lowering `max_store_requests` to a quarter of the estimate the
+        // same statement just reported refuses it with that ratio. The
+        // schema does not declare the field; the adapter reads every budget
+        // knob from the raw arguments.
+        let requests = explained["budget"]["estimate"]["store_requests"]
+            .as_u64()
+            .expect("a metrics estimate bounds its requests");
+        let ceiling = requests / 4;
+        assert!(ceiling > 0, "{explained}");
+        let (is_error, over) = call(
+            &client,
+            "ravel_explain_query",
+            serde_json::json!({
+                "query": "SELECT value FROM samples",
+                "time_range": sql_window(),
+                "max_store_requests": ceiling,
+            }),
+        )
+        .await;
+        assert_eq!(is_error, Some(true), "{over}");
+        assert_eq!(
+            over["failure"]["class"],
+            serde_json::json!("budget_estimate_exceeds_ceiling")
+        );
+        assert_eq!(
+            over["budget"]["estimate"]["narrowing_factor"],
+            serde_json::json!(requests as f64 / ceiling as f64)
+        );
+
+        let (_, logs) = call(
+            &client,
+            "ravel_explain_query",
+            serde_json::json!({"query": "SELECT * FROM logs", "time_range": sql_window()}),
+        )
+        .await;
+        assert_eq!(logs["status"], serde_json::json!("ok"), "{logs}");
+        assert_eq!(
+            logs["budget"]["estimate"]["unbounded"],
+            serde_json::json!(["estimated_decompressed_bytes"])
+        );
+        assert_eq!(
+            logs["budget"]["estimate_is_upper_envelope"],
+            serde_json::json!(false)
+        );
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
 }
