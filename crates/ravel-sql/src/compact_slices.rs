@@ -342,7 +342,10 @@ impl TopKPrefilter {
     /// feeds: a `SortExec` with a fetch starts one, a `ProjectionExec` maps
     /// it onto its input, a fetch-less `CoalescePartitionsExec` forwards it,
     /// and every other node ends it.
-    fn above(node: &Arc<dyn ExecutionPlan>, topk_above: Option<&TopKPrefilter>) -> Option<Self> {
+    pub(crate) fn above(
+        node: &Arc<dyn ExecutionPlan>,
+        topk_above: Option<&TopKPrefilter>,
+    ) -> Option<Self> {
         if let Some(sort) = node.downcast_ref::<SortExec>() {
             return sort.fetch().map(|fetch| TopKPrefilter {
                 ordering: sort.expr().clone(),
@@ -388,7 +391,7 @@ impl TopKPrefilter {
 
     /// True when every sort key is a bare column of `schema`, by index and
     /// name.
-    fn fits(&self, schema: &Schema) -> bool {
+    pub(crate) fn fits(&self, schema: &Schema) -> bool {
         self.ordering.iter().all(|sort| {
             sort.expr.downcast_ref::<Column>().is_some_and(|column| {
                 schema
