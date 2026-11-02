@@ -159,6 +159,16 @@ impl ColumnSelection {
         self
     }
 
+    /// The explicitly requested fixed column ids.
+    pub(crate) fn fixed_ids(&self) -> &BTreeSet<u32> {
+        &self.fixed
+    }
+
+    /// The requested dynamic attribute names.
+    pub(crate) fn attr_names(&self) -> &BTreeSet<String> {
+        &self.attrs
+    }
+
     /// Resolve to the concrete block column ids for one object, or `None` when
     /// every column is wanted (which the block decode,
     /// [`crate::block::read_block_pages_with_dicts`], takes as "no filter").

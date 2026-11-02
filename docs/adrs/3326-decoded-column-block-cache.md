@@ -1668,8 +1668,9 @@ directories in the read cache
 
 Each segment's estimate is memoised on the decoded cache per (tenant,
 object, projection) (`DecodedColumnCache::memoised_estimate`), bounded at
-65,536 entries, cleared whole when a new entry would pass that bound, and
-not charged to the cap. A hot verdict therefore reads and decodes nothing:
+65,536 entries and 4 MiB of projection keys, cleared whole when a new entry
+would pass either bound, and not charged to the cap; a projection larger than
+4 MiB is not memoised. A hot verdict therefore reads and decodes nothing:
 no plan-phase request, read-cache hit or decompressed byte
 (`the_fast_path_verdict_reads_directories_once_per_segment_cold_and_nothing_hot`).
 Before the memo every hot q21 to q24 run spent about 150 ms in
