@@ -5174,6 +5174,46 @@ pub struct AuditPipelineMetrics {
     pub put_retries: u64,
 }
 
+/// The query-audit pipeline as `/metrics` sees it: its two counters and
+/// nothing else. The pipeline is a private field and this type implements
+/// neither `QueryAuditSink` nor `Deref`, so an embedder holding a
+/// [`MetricsState`] cannot submit a record that skips the `--audit-text`
+/// wrapper every query surface installs.
+#[derive(Clone)]
+pub struct AuditPipelineCounters(Arc<ravel_maintain::AuditPipeline>);
+
+impl AuditPipelineCounters {
+    pub fn new(pipeline: Arc<ravel_maintain::AuditPipeline>) -> Self {
+        Self(pipeline)
+    }
+
+    /// Both counters, read now (atomic loads).
+    pub fn snapshot(&self) -> AuditPipelineMetrics {
+        AuditPipelineMetrics {
+            write_failures: self.0.flush_failures(),
+            put_retries: self.0.put_retries(),
+        }
+    }
+}
+
+// Fails to compile if `AuditPipelineCounters` or `MetricsState` ever
+// implements `QueryAuditSink` or `Deref`: `Probe<_>` would then have two
+// candidate impls and could not be inferred. The field type pin keeps the
+// pipeline from coming back as the field itself.
+const _: fn() = || {
+    trait Probe<A> {
+        fn probe() {}
+    }
+    impl<T: ?Sized> Probe<()> for T {}
+    struct ViaSink;
+    impl<T: ?Sized + ravel_maintain::QueryAuditSink> Probe<ViaSink> for T {}
+    struct ViaDeref;
+    impl<T: ?Sized + std::ops::Deref> Probe<ViaDeref> for T {}
+    <AuditPipelineCounters as Probe<_>>::probe();
+    <MetricsState as Probe<_>>::probe();
+    let _: fn(&MetricsState) -> Option<&AuditPipelineCounters> = |s| s.audit_pipeline.as_ref();
+};
+
 fn render_audit_family(out: &mut String, mode: Mode, metrics: &AuditPipelineMetrics) {
     write_header(
         out,
@@ -9742,12 +9782,13 @@ pub struct MetricsState {
     /// in a request-serving mode that built one (`Mode::All`/`Mode::Query`);
     /// `None` otherwise leaves the whole family off the exposition.
     pub metadata_cache: Option<Arc<ravel_query::http::MetadataCache>>,
-    /// The process's one query-audit pipeline (ADR-0062 decision 2b), read at
-    /// scrape time for its write-failure and put-retry counters. `Some` only
-    /// in a mode that installed one (`Mode::All`/`Mode::Query`); `None`
-    /// otherwise leaves the `ravel_audit_write_failures_total` and
+    /// The write-failure and put-retry counters of the process's one
+    /// query-audit pipeline (ADR-0062 decision 2b), read at scrape time. A
+    /// counters handle, not the pipeline, so nothing here can submit a record.
+    /// `Some` only in a mode that installed one (`Mode::All`/`Mode::Query`);
+    /// `None` otherwise leaves the `ravel_audit_write_failures_total` and
     /// `ravel_audit_put_retries_total` families off the exposition.
-    pub audit_pipeline: Option<Arc<ravel_maintain::AuditPipeline>>,
+    pub audit_pipeline: Option<AuditPipelineCounters>,
     /// The ADR-1170 decisions 1/3/4 process-wide memory accountant, the SAME
     /// instance installed on the `sql`-featured `SqlExecutor` via
     /// `SqlExecutor::with_process_memory_budget` (when `sql` is compiled in
@@ -10046,14 +10087,10 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
 
     // The query-audit pipeline's failure and retry counters, read at scrape
     // time (atomic loads). `None` in a mode that installed no pipeline.
-    let audit_pipeline_metrics =
-        state
-            .audit_pipeline
-            .as_ref()
-            .map(|pipeline| AuditPipelineMetrics {
-                write_failures: pipeline.flush_failures(),
-                put_retries: pipeline.put_retries(),
-            });
+    let audit_pipeline_metrics = state
+        .audit_pipeline
+        .as_ref()
+        .map(AuditPipelineCounters::snapshot);
     // The ADR-1170 process memory budget readings (atomic loads), like every
     // other family, rather than baking a snapshot in at construction.
     let memory_budget_snapshot = MemoryBudgetSnapshot {
