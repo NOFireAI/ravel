@@ -136,9 +136,17 @@
 #                                       failed ingest; u14: no fetch-miss and
 #                                       u15: no flush counter exit 70 as could
 #                                       not measure; u16: --folded-catalog-get-
-#                                       max-fraction 1 passes u12's figures;
-#                                       u17-u19: a malformed or out-of-range
-#                                       fraction exits 64
+#                                       max-fraction 1 passes u12's figures as
+#                                       not discriminating; u17-u19: a
+#                                       malformed or out-of-range fraction
+#                                       exits 64; u20: a ci-sized run whose
+#                                       limit is above its object count passes
+#                                       as not discriminating; u21: a
+#                                       cardinality-sized run within the floor
+#                                       plus fraction passes, u22: above it
+#                                       exits 70; u23: --folded-catalog-get-
+#                                       floor 0 is stamped; u24-u27: a floor
+#                                       that is not a whole number exits 64
 #
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
 #
@@ -349,7 +357,7 @@ case "$url" in
     fi
     printf 'ravel_cache_misses_total{mode="all",cache="catalog"} %s\n' "$((k * 1000))" >>"$out"
     if [ -z "${STUB_NO_FLUSH_COUNTERS:-}" ]; then
-      for pair in size:40 age:100 age_adaptive:20 age_floor:30 arrival:10; do
+      for pair in ${STUB_FLUSH_PAIRS:-size:40 age:100 age_adaptive:20 age_floor:30 arrival:10}; do
         printf 'ravel_ingest_flushes_by_%s_total{mode="all",signal="metrics"} %s\n' "${pair%%:*}" "${pair#*:}" >>"$out"
       done
     fi
@@ -1151,10 +1159,10 @@ else
   fail "u: calls out of order in ${LOG}"
 fi
 HOUR_NOW=$(($(date -u +%s) / 3600))
-check "u: fold stamped with its report's figures" 'j("stamps.json")["ravel_catalog_fold_writers_stopped"]["entry_count"] == 420 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["buckets_folded"] == 2 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["precondition"] == "met"'
+check "u: fold stamped with its report's figures" 'j("stamps.json")["ravel_catalog_fold_writers_stopped"]["entry_count"] == 420 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["buckets_folded"] == 2 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["no_op"] is False and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["precondition"] == "met"'
 check "u: fold stamped with sealed and watermark hours at the ingest end hour" 'abs(j("stamps.json")["ravel_catalog_fold_writers_stopped"]["seal_through_hour"] - '"${HOUR_NOW}"') <= 1 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["watermark_hour"] >= j("stamps.json")["ravel_catalog_fold_writers_stopped"]["ingest_end_hour"]'
 check "u: restart stamped" 'j("stamps.json")["ravel_restart"].startswith("restarted: docker compose restart ravel-server")'
-check "u: folded read-back stamped with exit, match, series query_ms, deltas and the catalog GET verdict" 'j("stamps.json")["readback_folded"] == {"exit_code": 0, "matches_expected": True, "error": None, "series_query_ms": 12, "store_get_calls_delta": 100, "commit_record_cache_entries_delta": 3, "fetch_cache_misses_delta": 95, "catalog_get_delta": 5, "data_objects_flushed": 200, "folded_catalog_get_max_fraction": "0.05", "catalog_get_verdict": "within"}'
+check "u: folded read-back stamped with exit, match, series query_ms, deltas and the catalog GET verdict" 'j("stamps.json")["readback_folded"] == {"exit_code": 0, "matches_expected": True, "error": None, "series_query_ms": 12, "store_get_calls_delta": 100, "commit_record_cache_entries_delta": 3, "fetch_cache_misses_delta": 95, "catalog_get_delta": 5, "data_objects_flushed": 200, "folded_catalog_get_max_fraction": "0.05", "folded_catalog_get_floor": 64, "folded_catalog_get_limit": 74, "catalog_get_verdict": "within"}'
 check "u: data_objects_flushed sums the five disjoint metrics reasons only" 'j("stamps.json")["readback_folded"]["data_objects_flushed"] == 40 + 100 + 20 + 30 + 10'
 check "u: readback-folded.json is the bin's report" 'j("readback-folded.json")["system"] == "ravel"'
 
@@ -1240,11 +1248,12 @@ expect_rc u11 0
 check "u11: catalog_get_delta is the GET delta less the fetch misses, within the fraction" 'j("stamps.json")["readback_folded"]["store_get_calls_delta"] == 2000 and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 5 and j("stamps.json")["readback_folded"]["data_objects_flushed"] == 200 and j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "within" and "readback-folded" in j("stamps.json")["steps_completed"]'
 
 # u12: about one catalog GET per data object (2200 less 2000 = 200 against
-# 200 objects), as an unfolded read resolves commit records: a breach.
+# 200 objects), as an unfolded read resolves commit records: a breach of
+# 64 + 0.05 x 200 = 74.
 mapfile -t args < <(full_args "${TMP}/u12/out")
 STUB_GETS_PER_SCRAPE=2200 STUB_FETCH_MISSES_PER_SCRAPE=2000 run_case u12 "${args[@]}"
 expect_rc u12 70
-expect_err "u12: message names step readback-folded and the breach" "step readback-folded failed: folded read-back catalog GETs: breach: catalog_get_delta 200 exceeds 0.05 x data_objects_flushed 200"
+expect_err "u12: message names step readback-folded and the breach" "step readback-folded failed: folded read-back catalog GETs: breach: catalog_get_delta 200 exceeds 64 + 0.05 x data_objects_flushed 200 = 74"
 check "u12: stamps name readback-folded and keep both figures and the verdict" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 200 and j("stamps.json")["readback_folded"]["data_objects_flushed"] == 200 and j("stamps.json")["readback_folded"]["catalog_get_verdict"].startswith("breach:") and "readback-folded" not in j("stamps.json")["steps_completed"]'
 
 # u13: the same breach after a failed ingest verification: listed after ingest.
@@ -1267,12 +1276,12 @@ expect_rc u15 70
 expect_err "u15: message names step readback-folded and the absent flush counter" "could not measure: no ravel_ingest_flushes_by_size_total"
 check "u15: data_objects_flushed null, catalog_get_delta still stamped" 'j("stamps.json")["readback_folded"]["data_objects_flushed"] is None and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 5'
 
-# u16: a looser fraction is passed through and stamped; u12's breach is
-# within 1.
+# u16: a looser fraction is passed through and stamped; with u12's figures
+# its limit 64 + 1 x 200 = 264 is above the 200 objects: not discriminating.
 mapfile -t args < <(full_args "${TMP}/u16/out")
 STUB_GETS_PER_SCRAPE=2200 STUB_FETCH_MISSES_PER_SCRAPE=2000 run_case u16 "${args[@]}" --folded-catalog-get-max-fraction 1
 expect_rc u16 0
-check "u16: the fraction stamped as given, 200 within 1 x 200" 'j("stamps.json")["readback_folded"]["folded_catalog_get_max_fraction"] == "1" and j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "within"'
+check "u16: the fraction stamped as given, limit 264 not discriminating against 200 objects" 'j("stamps.json")["readback_folded"]["folded_catalog_get_max_fraction"] == "1" and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] == 264 and j("stamps.json")["readback_folded"]["catalog_get_verdict"].startswith("not discriminating: limit 264 is at or above the 200 data objects flushed")'
 
 # u17-u19: a malformed or out-of-range fraction is a usage error.
 for bad in u17:abc u18:1.5 u19:-0.1; do
@@ -1281,6 +1290,48 @@ for bad in u17:abc u18:1.5 u19:-0.1; do
   run_case "${name}" "${args[@]}" --folded-catalog-get-max-fraction "${bad#*:}"
   expect_rc "${name}" 64
   expect_err "${name}: message names the flag and the value" "--folded-catalog-get-max-fraction takes a decimal from 0 to 1, got '${bad#*:}'"
+  expect_no_log "${name}: nothing started" "compose"
+done
+
+# u20: a ci-sized run, 20 data objects. 35 catalog GETs exceed 0.05 x 20 and
+# even the 20 objects, but the limit 64 + 0.05 x 20 = 65 is above 20: not
+# discriminating, a pass.
+mapfile -t args < <(full_args "${TMP}/u20/out")
+STUB_FLUSH_PAIRS="size:4 age:10 age_adaptive:2 age_floor:3 arrival:1" STUB_GETS_PER_SCRAPE=130 \
+  run_case u20 "${args[@]}"
+expect_rc u20 0
+check "u20: the floor default 64 and the limit 65 stamped against 20 data objects" 'j("stamps.json")["readback_folded"]["folded_catalog_get_floor"] == 64 and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] == 65 and j("stamps.json")["readback_folded"]["data_objects_flushed"] == 20 and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 35'
+check "u20: verdict not discriminating, readback-folded done" 'j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "not discriminating: limit 65 is at or above the 20 data objects flushed, so a folded and an unfolded read cannot be told apart at this profile" and "readback-folded" in j("stamps.json")["steps_completed"] and j("stamps.json")["failed_step"] is None'
+
+# u21, u22: a cardinality-sized run, 15,248 data objects, limit
+# 64 + 0.05 x 15248 = 826.4: 826 catalog GETs are within, 827 a breach.
+cardinality_flushes="size:3048 age:10000 age_adaptive:1000 age_floor:1000 arrival:200"
+mapfile -t args < <(full_args "${TMP}/u21/out")
+STUB_FLUSH_PAIRS="${cardinality_flushes}" STUB_GETS_PER_SCRAPE=2826 STUB_FETCH_MISSES_PER_SCRAPE=2000 \
+  run_case u21 "${args[@]}"
+expect_rc u21 0
+check "u21: 826 catalog GETs within the limit 826.4 for 15248 data objects" 'j("stamps.json")["readback_folded"]["data_objects_flushed"] == 15248 and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 826 and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] == 826.4 and j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "within" and "readback-folded" in j("stamps.json")["steps_completed"]'
+mapfile -t args < <(full_args "${TMP}/u22/out")
+STUB_FLUSH_PAIRS="${cardinality_flushes}" STUB_GETS_PER_SCRAPE=2827 STUB_FETCH_MISSES_PER_SCRAPE=2000 \
+  run_case u22 "${args[@]}"
+expect_rc u22 70
+expect_err "u22: message names the breach with floor, fraction and limit" "step readback-folded failed: folded read-back catalog GETs: breach: catalog_get_delta 827 exceeds 64 + 0.05 x data_objects_flushed 15248 = 826.4"
+check "u22: stamps name readback-folded with the breach" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 827 and j("stamps.json")["readback_folded"]["catalog_get_verdict"].startswith("breach:")'
+
+# u23: the floor is passed through and stamped: floor 0 on case u's figures
+# gives the limit 0.05 x 200 = 10, and 5 catalog GETs are within it.
+mapfile -t args < <(full_args "${TMP}/u23/out")
+run_case u23 "${args[@]}" --folded-catalog-get-floor 0
+expect_rc u23 0
+check "u23: floor 0 and limit 10 stamped, within" 'j("stamps.json")["readback_folded"]["folded_catalog_get_floor"] == 0 and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] == 10 and j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "within"'
+
+# u24-u27: a floor that is not a whole number is a usage error.
+for bad in u24:abc u25:-1 u26:1.5 u27:; do
+  name="${bad%%:*}"
+  mapfile -t args < <(full_args "${TMP}/${name}/out")
+  run_case "${name}" "${args[@]}" --folded-catalog-get-floor "${bad#*:}"
+  expect_rc "${name}" 64
+  expect_err "${name}: message names the flag and the value" "--folded-catalog-get-floor takes a whole number, got '${bad#*:}'"
   expect_no_log "${name}: nothing started" "compose"
 done
 

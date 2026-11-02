@@ -556,7 +556,8 @@ script, and run in CI's `doc-scripts` job.
 | `--keep` | Leave the stack up; stamps say `kept (--keep)` and no `down -v` runs (case g). |
 | `--rss-band CONTAINER:MIN:MAX` | Repeatable. The peak sampled memory of the container (matched by container name or compose service) must lie in `[MIN, MAX]` bytes; outside it, or with no samples, the run exits 75 (case d). |
 | `--diagnostic-prometheus-max-samples N` | The falsification run, below. |
-| `--folded-catalog-get-max-fraction F` | The most catalog GETs the folded read-back (step 16) may spend per data object ingest flushed, a decimal from 0 to 1; default 0.05 (case u), stamped (case u16). A malformed or out-of-range value exits 64 (cases u17 to u19). |
+| `--folded-catalog-get-max-fraction F` | The most catalog GETs the folded read-back (step 16) may spend per data object ingest flushed, on top of the floor below, a decimal from 0 to 1; default 0.05 (case u), stamped (case u16). A malformed or out-of-range value exits 64 (cases u17 to u19). |
+| `--folded-catalog-get-floor N` | The fixed part of the folded read-back's catalog GET limit (step 16), a whole number; default 64, stamped (cases u, u20, u23). A value that is not a whole number exits 64 (cases u24 to u27). |
 | `--real-s3-bucket-prefix PREFIX`, `--real-s3-region REGION` | The real-S3 lane, below. One without the other, a prefix S3 cannot name or longer than 44 characters, a malformed region, or either with the falsification run exits 64 (cases s2 to s7). A local build is refused with exit 65 (case t). |
 
 A compose project `metricsbench` that already has containers or volumes is
@@ -678,10 +679,12 @@ verification (step 6), after which the run goes on as a diagnostic:
     stopped by then. Its report goes to `fold.out` (case u). The step fails
     with exit 70 naming fold unless `seal_through_hour` is `Some(N)` (case
     u1) and `watermark_hour` is at or after the ingest hour (Unix seconds
-    divided by 3600) the clock read when the ingest step returned (case u2).
+    divided by 3600) the clock read when the ingest step returned (case u2);
+    what those two clauses can and cannot catch is under step 16.
     `ravel_catalog_fold_writers_stopped` stamps `seal_through_hour`,
-    `watermark_hour`, `entry_count`, `buckets_folded`, that `ingest_end_hour`
-    and `precondition` (`met`, or why not) (cases u, u1, u2).
+    `watermark_hour`, `entry_count`, `buckets_folded`, `no_op`, that
+    `ingest_end_hour` and `precondition` (`met`, or why not) (cases u, u1,
+    u2).
 15. `restart`: `docker compose restart ravel-server` only, then Ravel's
     `/api/v1/status/buildinfo` answers 200 as in `ready` (case u);
     `ravel_restart` says it restarted.
@@ -716,17 +719,38 @@ verification (step 6), after which the run goes on as a diagnostic:
     (`record_flush`, crates/ravel-ingest/src/metrics.rs:956-964, called once
     per flush open at crates/ravel-ingest/src/shard.rs:2662), so sub-counts
     such as `ravel_ingest_rerouted_flushes_total` and other signals'
-    samples are not added (case u). The step fails with exit 70 naming
-    readback-folded when `catalog_get_delta` exceeds
+    samples are not added (case u). The limit is
+    `--folded-catalog-get-floor` (default 64) plus
     `--folded-catalog-get-max-fraction` (default 0.05) times
-    `data_objects_flushed` (case u12; a failure after a failed ingest is
-    listed in `failed_after_ingest`, case u13), and when either figure
-    cannot be read: a scrape without the fetch-miss counter (case u14) or an
-    at-query scrape without a flush counter (case u15). `readback_folded`
-    stamps both figures, `folded_catalog_get_max_fraction` and
-    `catalog_get_verdict` (`within`, `breach: ...` or `could not measure:
-    ...`) before the step fails, so a breach keeps its numbers (cases u12,
-    u14, u15).
+    `data_objects_flushed`. The floor is the part of a folded read's catalog
+    cost that does not grow with the object count: the HEAD, the snapshot
+    parts, the commit-token keys, and any GET the `--mode all` server's own
+    maintenance or fold loop issues between the two scrapes, since
+    `ravel_store_calls_total` counts the whole process. The step fails with
+    exit 70 naming readback-folded when `catalog_get_delta` exceeds the
+    limit (cases u12, u22; a failure after a failed ingest is listed in
+    `failed_after_ingest`, case u13), and when either figure cannot be
+    read: a scrape without the fetch-miss counter (case u14) or an at-query
+    scrape without a flush counter (case u15).
+
+    A limit at or above `data_objects_flushed` cannot tell a folded read
+    from an unfolded one, which costs about one catalog GET per data
+    object. Then the step neither fails nor reports `within`: the verdict
+    is `not discriminating: limit L is at or above the N data objects
+    flushed, so a folded and an unfolded read cannot be told apart at this
+    profile`, and the step passes (cases u16, u20). The ci profile the
+    nightly workflow runs lands here: its 2026-11-02 real-S3 smoke flushed
+    8 metrics data objects (`out-ci/ravel-metrics-at-query.txt` of run
+    `mb2821-r1-20261102T063901Z-aa061edd1`). The cardinality profile does
+    not: at its measured 15,248
+    data objects the limit is 64 + 0.05 x 15,248 = 826.4, far below the
+    about 15,249 an unfolded read spends (cases u21, u22).
+
+    `readback_folded` stamps both figures, `folded_catalog_get_max_fraction`,
+    `folded_catalog_get_floor`, the computed `folded_catalog_get_limit` and
+    `catalog_get_verdict` (`within`, `not discriminating: ...`, `breach:
+    ...` or `could not measure: ...`) before the step fails, so a breach
+    keeps its numbers (cases u, u12, u14, u15, u20).
 
     The measured basis, from issue #2821 comment 6583379446 and the E8
     run: on a real-S3 run's unfolded read-back the GET delta was 29,029
@@ -734,17 +758,28 @@ verification (step 6), after which the run goes on as a diagnostic:
     commit records; on an s3s-fs run after a restart, 38,698 less 29,652
     is 9,046 against a commit-record cache growth of 9,042. An unfolded
     read sits near one catalog GET per data object, twenty times the
-    default fraction.
+    default fraction, and at that object count the floor is under half a
+    percent of it.
 
     `commit_record_cache_entries_delta` is a residency figure, the change
     in an eviction-bounded gauge, and after the restart its before value is
     near zero. It is stamped as context and the check does not use it.
 
-    Of the fold step's two conditions, `seal_through_hour` being `Some(N)`
-    is close to automatic for a writers-stopped fold:
-    `fold_with_writers_stopped` sets it from the hour the clock reads
-    (services/ravel-cli/src/catalog.rs:136-137). The `watermark_hour` clause (case u2)
-    is the one that can fail on a fold that sealed too little.
+    Neither of the fold step's two conditions can fail for a
+    writers-stopped fold that succeeded. `fold_with_writers_stopped` sets
+    `seal_through_hour` to the hour the clock reads
+    (services/ravel-cli/src/catalog.rs:136-140), the fold applies that
+    ceiling whenever the margin watermark is below it
+    (crates/ravel-catalog/src/fold.rs:422-435, 1789-1792), and it moves the
+    watermark only forward (fold.rs:1911-1912). The fold runs after the
+    ingest step, so `watermark_hour` is at or after the ingest end hour by
+    construction. The two clauses (cases u1, u2) guard against a malformed,
+    truncated or stale `fold.out`, and against a CLI whose output format
+    changed, not against an under-sealed fold. The check with teeth on
+    whether the read used the fold is the catalog-GET check above. A no-op
+    fold is not a failure, since on a long profile the server's own fold
+    loop may already have sealed every hour; `no_op` and `entry_count` are
+    stamped in `ravel_catalog_fold_writers_stopped` as context (case u).
 
 Steps 14 to 16 also run after a failed ingest verification when the Ravel
 row itself replayed and only its read-back failed or mismatched, which is the
