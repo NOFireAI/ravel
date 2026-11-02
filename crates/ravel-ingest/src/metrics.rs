@@ -45,8 +45,8 @@
 //! counted.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ravel_catalog::MAX_SHARD_COUNT;
 use ravel_types::TenantHash;
@@ -339,6 +339,11 @@ pub struct IngestMetrics {
     /// the store is slow/throttled and this router is degraded-but-available
     /// rather than fleet-wide-outed.
     grace_extended_stale_flushes: AtomicU64,
+    /// Failed provisioning-record reads this router issued (issue #3653), by
+    /// cause, shared with the router's `GenerationSwitch`, which counts them.
+    /// One per failed GET, not per refused write: inside a read backoff
+    /// window a refused write issues no read.
+    provisioning_read_failures: Arc<crate::read_backoff::ProvisioningReadFailures>,
     /// Flushes that would have written under a shard index outside the scan
     /// set of the hour they pinned, or into an hour another generation owns,
     /// and handed their rows to that hour's shard set instead (ADR-1642
@@ -848,6 +853,12 @@ pub struct IngestMetricsSnapshot {
     pub exemplars_dropped_total: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
+    /// Failed provisioning-record reads whose GET failed, exported as
+    /// `ravel_ingest_provisioning_read_failures_total{cause="store"}`.
+    pub provisioning_read_failures_store: u64,
+    /// Failed provisioning-record reads whose record did not decode or failed
+    /// its checked read, exported with `cause="decode"`.
+    pub provisioning_read_failures_decode: u64,
     /// Flushes handed back instead of written outside the scan set, or into
     /// an hour another generation owns (ADR-1642 scan-set amendment), for
     /// every [`HandBackReason`].
@@ -1256,6 +1267,13 @@ impl IngestMetrics {
         self.shards_condemned.load(Ordering::Relaxed)
     }
 
+    /// The failed-provisioning-read counters, for the router's switch.
+    pub(crate) fn provisioning_read_failures(
+        &self,
+    ) -> Arc<crate::read_backoff::ProvisioningReadFailures> {
+        Arc::clone(&self.provisioning_read_failures)
+    }
+
     /// One write refused, or one buffer's stale-view episode at flush open,
     /// on a provisioning view the router cannot trust (fail closed).
     pub(crate) fn record_stale_provisioning_flush(&self) {
@@ -1366,6 +1384,8 @@ impl IngestMetrics {
             exemplars_dropped_total: self.exemplars_dropped_total.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
+            provisioning_read_failures_store: self.provisioning_read_failures.store(),
+            provisioning_read_failures_decode: self.provisioning_read_failures.decode(),
             rerouted_flushes: self.rerouted_flushes.load(Ordering::Relaxed),
             rerouted_flushes_retired_index: self
                 .rerouted_flushes_retired_index

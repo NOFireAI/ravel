@@ -11,11 +11,11 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly twenty-six label keys:
+//! renders exactly twenty-seven label keys:
 //! `tenant_hash`, `signal`, `mode`, `op`, `error_kind`, `workload_class`,
 //! `level`, `reason`, `shard`, `cache`, `tier`, `intent`, `kind`, `outcome`,
 //! `allocator`, `stat`, `component`, `class`, `carrier`, `gate`, `site`,
-//! `worker`, `family`, `variant`, `phase`, and `source` (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
+//! `worker`, `family`, `variant`, `phase`, `source`, and `cause` (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
 //! admission-rejection family and reused by ADR-0059 section 2 for the scrub
 //! seal-divergence family, `shard` added by ADR-1692 decision 2 as the ninth
 //! key for the per-shard ingest-skew family, `cache` to split the read-cache
@@ -39,9 +39,10 @@
 //! decision 3 for the IPCrypt values counter, and `phase` added
 //! by issue #2374 for the SQL DDL store-cost families and rendered in every
 //! build since issue #3533 for the logs phase histograms, and `source` added
-//! by ADR-3541 decision 3 for the subject-drop counter). The keys come from
-//! forty-six `Label` variants, forty-nine in a `sql` build (`DdlKind`,
-//! `DdlOutcome` and `DdlPhase`) and fifty in a `flight-sql` build,
+//! by ADR-3541 decision 3 for the subject-drop counter, and `cause` added by
+//! issue #3653 for the provisioning read-failure counter). The keys come from
+//! forty-seven `Label` variants, fifty in a `sql` build (`DdlKind`,
+//! `DdlOutcome` and `DdlPhase`) and fifty-one in a `flight-sql` build,
 //! which enables `sql`, because some variants share a
 //! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason`,
 //! `AlertRetentionSkipReason`, `SupersededHeldReason`,
@@ -99,7 +100,8 @@ use ravel_catalog::Catalog;
 use ravel_ingest::{
     AdmissionController, FlushPhase, HandBackReason, IngestMetricsSnapshot, IngestRouter,
     LatencyHistogramSnapshot, LogIngestMetricsSnapshot, LogIngestRouter, LogLatencySnapshot,
-    SpanIngestMetricsSnapshot, SpanIngestRouter, StrictAckPhase, TenantPutAttribution, TenantUsage,
+    ProvisioningReadCause, SpanIngestMetricsSnapshot, SpanIngestRouter, StrictAckPhase,
+    TenantPutAttribution, TenantUsage,
 };
 use ravel_maintain::ScrubLevel;
 use ravel_maintain::UnreadableReason;
@@ -501,6 +503,10 @@ pub enum Label {
     /// measures: `queued`, `request` or `shard_skew` (issue #3533). Shares the
     /// `phase` key with `FlushPhase`.
     StrictAckPhase(StrictAckPhase),
+    /// Why a provisioning-record read failed (issue #3653): `store` or
+    /// `decode`. A closed enum owned by `ravel_ingest`, which also owns the
+    /// spelling. The only variant with the `cause` key.
+    ProvisioningReadCause(ProvisioningReadCause),
 }
 
 /// The closed `phase` set of `ravel_agents_sweep_list_pages_total`.
@@ -778,6 +784,7 @@ impl Label {
             Label::AgentsBudgetCap(_) => "cap",
             Label::FlushPhase(_) => "phase",
             Label::StrictAckPhase(_) => "phase",
+            Label::ProvisioningReadCause(_) => "cause",
         }
     }
 
@@ -847,6 +854,7 @@ impl Label {
             Label::AgentsBudgetCap(cap) => cap.code().to_string(),
             Label::FlushPhase(phase) => phase.name().to_string(),
             Label::StrictAckPhase(phase) => phase.name().to_string(),
+            Label::ProvisioningReadCause(cause) => cause.label().to_string(),
         }
     }
 
@@ -1341,6 +1349,12 @@ pub struct IngestPipelineSnapshot {
     /// spans ingest snapshots all expose it, and the two form the
     /// degraded-vs-failed pair for a stale provisioning view.
     pub grace_extended_stale_flushes: u64,
+    /// Failed provisioning-record reads the router path issued (issue #3653),
+    /// whose GET failed. Carried for every signal.
+    pub provisioning_read_failures_store: u64,
+    /// Failed provisioning-record reads whose record did not decode or failed
+    /// its checked read. Carried for every signal.
+    pub provisioning_read_failures_decode: u64,
     /// The metrics-pipeline-only adaptive-delay age-trigger counter ADR-0067
     /// added. `Some` only for the metrics pipeline; the log and span ingest
     /// snapshots expose no such figure, so logs and spans render no sample
@@ -1528,6 +1542,8 @@ impl IngestPipelineSnapshot {
                 dropped_total: snapshot.exemplars_dropped_total,
             }),
             grace_extended_stale_flushes: snapshot.grace_extended_stale_flushes,
+            provisioning_read_failures_store: snapshot.provisioning_read_failures_store,
+            provisioning_read_failures_decode: snapshot.provisioning_read_failures_decode,
             adaptive_flushes: Some(AdaptiveFlushCounters {
                 flushes_by_age_adaptive: snapshot.flushes_by_age_adaptive,
             }),
@@ -1589,6 +1605,8 @@ impl IngestPipelineSnapshot {
             metadata_sink: None,
             exemplars: None,
             grace_extended_stale_flushes: snapshot.grace_extended_stale_flushes,
+            provisioning_read_failures_store: snapshot.provisioning_read_failures_store,
+            provisioning_read_failures_decode: snapshot.provisioning_read_failures_decode,
             adaptive_flushes: None,
             in_flight_flushes_total: snapshot.in_flight_flushes_total,
             flush_permit_wait_ns_total: snapshot.flush_permit_wait_ns_total,
@@ -1639,6 +1657,8 @@ impl IngestPipelineSnapshot {
             metadata_sink: None,
             exemplars: None,
             grace_extended_stale_flushes: snapshot.grace_extended_stale_flushes,
+            provisioning_read_failures_store: snapshot.provisioning_read_failures_store,
+            provisioning_read_failures_decode: snapshot.provisioning_read_failures_decode,
             adaptive_flushes: None,
             in_flight_flushes_total: snapshot.in_flight_flushes_total,
             flush_permit_wait_ns_total: snapshot.flush_permit_wait_ns_total,
@@ -2053,6 +2073,41 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             &labels(mode, pipeline.signal),
             pipeline.grace_extended_stale_flushes,
         );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_provisioning_read_failures_total",
+        "Provisioning-record reads issued by the ingest router that failed, by signal and \
+         cause: store (the GET failed) or decode (the record did not decode or failed its \
+         checked read). Counts reads, not refused writes: after a failed read the router \
+         issues no read for that tenant until its backoff window (1 s, doubling to 30 s) \
+         passes, so refused writes outnumber reads, and \
+         ravel_ingest_stale_provisioning_flushes_total counts those.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        for (cause, value) in [
+            (
+                ProvisioningReadCause::Store,
+                pipeline.provisioning_read_failures_store,
+            ),
+            (
+                ProvisioningReadCause::Decode,
+                pipeline.provisioning_read_failures_decode,
+            ),
+        ] {
+            write_sample(
+                out,
+                "ravel_ingest_provisioning_read_failures_total",
+                &[
+                    Label::Mode(mode),
+                    Label::Signal(pipeline.signal),
+                    Label::ProvisioningReadCause(cause),
+                ],
+                value,
+            );
+        }
     }
 
     write_header(
@@ -10616,6 +10671,7 @@ mod tests {
             Label::AuthSubjectDropReason(ravel_tenant_resolve::SubjectDropReason::Missing),
             Label::FlushPhase(FlushPhase::Total),
             Label::StrictAckPhase(StrictAckPhase::Request),
+            Label::ProvisioningReadCause(ProvisioningReadCause::Store),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -10686,6 +10742,7 @@ mod tests {
                 Label::AgentsBudgetCap(_) => "cap",
                 Label::FlushPhase(_) => "phase",
                 Label::StrictAckPhase(_) => "phase",
+                Label::ProvisioningReadCause(_) => "cause",
             })
             .collect();
         assert_eq!(
@@ -10783,6 +10840,9 @@ mod tests {
                 "phase",
                 // StrictAckPhase (issue #3533) reuses the `phase` key.
                 "phase",
+                // ProvisioningReadCause (issue #3653) is the twenty-seventh
+                // key, for the provisioning read-failure counter only.
+                "cause",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), ADR-1692 decision 2's `shard` \
@@ -10792,19 +10852,19 @@ mod tests {
              family), #532's `outcome`, #1170's `allocator`/`stat`, ADR-1170 decision 4's \
              `component`, ADR-0071's `class` (issue #1722), ADR-0873 decision 2's `carrier`, \
              ADR-1702 decision 11's `gate`/`site`/`worker`, ADR-1746's `family`, ADR-2993's \
-             `variant`, issue #3533's `phase`, ADR-3541's `source`, and issue #1686's `level` \
-             reuse by `ScrubLevel`"
+             `variant`, issue #3533's `phase`, ADR-3541's `source`, issue #3653's `cause`, and \
+             issue #1686's `level` reuse by `ScrubLevel`"
         );
         assert_eq!(
             one_of_each.len(),
-            46,
-            "exactly 46 label variants every build has, 26 distinct keys (sql adds DdlKind, \
+            47,
+            "exactly 47 label variants every build has, 27 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
             keys.iter().collect::<HashSet<_>>().len(),
-            26,
-            "exactly 26 distinct keys"
+            27,
+            "exactly 27 distinct keys"
         );
     }
 

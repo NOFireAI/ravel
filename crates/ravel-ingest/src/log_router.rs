@@ -27,7 +27,7 @@ use crate::deferral::DeferralCapFlag;
 use crate::format_floor::{FormatFamily, FormatFloorPolicy};
 use crate::generation::{
     DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
-    load_view,
+    ViewRead,
 };
 use crate::indexed_fields::IndexedFieldsOverlay;
 use crate::log_error::LogWriteError;
@@ -270,6 +270,7 @@ impl LogIngestRouter {
         pending_ack_budget: Arc<PendingAckBudget>,
     ) -> Self {
         let metrics = Arc::new(LogIngestMetrics::new(config.shard_count));
+        let read_failures = metrics.provisioning_read_failures();
         let backstop_ceiling = BufferBudgetCeiling::unlimited();
         let write_gate = WriteGateSlot::default();
         #[cfg(feature = "stage-timing")]
@@ -326,6 +327,7 @@ impl LogIngestRouter {
             };
             GenerationSwitch::new(config.shard_count, DEFAULT_REFRESH_INTERVAL_NS, factory)
                 .with_refresh_source(refresh_store, ravel_types::Signal::Logs, refresh_clock)
+                .with_read_failures(read_failures)
         });
 
         LogIngestRouter {
@@ -451,25 +453,31 @@ impl LogIngestRouter {
         match self.switch.route_cached(tenant, now_ns) {
             Routed::Fresh(set) => Ok(set),
             Routed::Stale => {
-                match load_view(
-                    self.store.as_ref(),
-                    ravel_types::Signal::Logs,
-                    &tenant,
-                    self.switch.default_count(),
-                )
-                .await
+                // Inside a read backoff window no GET is issued; the grace
+                // window still applies before the write is refused.
+                match self
+                    .switch
+                    .read_view(
+                        self.store.as_ref(),
+                        ravel_types::Signal::Logs,
+                        tenant,
+                        now_ns,
+                    )
+                    .await
                 {
-                    Ok(view) => Ok(self.switch.refresh_view(tenant, view, now_ns)),
-                    Err(_) => match self.switch.try_grace_extend(tenant, now_ns) {
-                        Some(set) => {
-                            self.metrics.record_grace_extended_stale_flush();
-                            Ok(set)
+                    ViewRead::Loaded(view) => Ok(self.switch.refresh_view(tenant, view, now_ns)),
+                    ViewRead::Failed | ViewRead::BackedOff => {
+                        match self.switch.try_grace_extend(tenant, now_ns) {
+                            Some(set) => {
+                                self.metrics.record_grace_extended_stale_flush();
+                                Ok(set)
+                            }
+                            None => {
+                                self.metrics.record_stale_provisioning_flush();
+                                Err(LogWriteError::StaleProvisioningView)
+                            }
                         }
-                        None => {
-                            self.metrics.record_stale_provisioning_flush();
-                            Err(LogWriteError::StaleProvisioningView)
-                        }
-                    },
+                    }
                 }
             }
         }

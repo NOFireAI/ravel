@@ -41,6 +41,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use ravel_catalog::{AbsentPolicy, ProvisioningCheck, ProvisioningError, validate_or_adopt};
+use ravel_ingest::ReadBackoff;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{Signal, TenantHash, TenantId};
 
@@ -69,7 +70,11 @@ pub fn shard_count_mismatch_count() -> u64 {
 
 /// Whether a provisioning failure must fail the touch that raised it rather
 /// than be logged-and-ignored. A `Store` error is the one fail-open case: it is
-/// transient and retry-friendly, so a store blip never blocks all ingest. A
+/// usually transient and retry-friendly, so a store blip does not fail the
+/// request at this step. It is not always transient (a store that serves the
+/// record with a failing checksum reports one on every read), which is why
+/// the ingest router, not this check, refuses the tenant's writes while the
+/// record cannot be read. A
 /// recorded `shard_count` that differs from the live default is no longer a
 /// failure at all (ADR-0082): it is tolerated and never reaches here. Every
 /// remaining variant means the tenant's true `shard_count` is unknown or
@@ -117,10 +122,16 @@ pub(crate) fn note_provisioning_failure(err: &ProvisioningError) {
 /// the metrics, logs, spans, and remote-write ingest paths, so the "seen"
 /// set is shared and one tenant's first write across any transport provisions
 /// the record once.
+///
+/// A (tenant, signal) whose last check failed open on a store error is not
+/// checked again until its read backoff window passes (issue #3653): 1 s after
+/// the first failure, doubling on each consecutive one up to 30 s, cleared by
+/// a success.
 pub struct ProvisioningRecordWriter {
     store: Arc<dyn ObjectStoreBackend>,
     shard_count: u32,
     seen: Mutex<HashSet<(TenantHash, Signal)>>,
+    read_backoff: Mutex<ReadBackoff<(TenantHash, Signal)>>,
 }
 
 impl ProvisioningRecordWriter {
@@ -129,6 +140,7 @@ impl ProvisioningRecordWriter {
             store,
             shard_count,
             seen: Mutex::new(HashSet::new()),
+            read_backoff: Mutex::new(ReadBackoff::new()),
         }
     }
 
@@ -139,17 +151,30 @@ impl ProvisioningRecordWriter {
     /// record whose true `shard_count` cannot be trusted -- increments the
     /// process-global mismatch counter and returns the typed error so the caller
     /// fails that one request; the process is never taken down for a single
-    /// dynamic tenant. Only a transient store error is logged and treated as
-    /// success for the write path (ingest continues): it is retry-friendly and
-    /// not the tenant's fault. A genuine success (created, adopted, or matched)
-    /// is cached in `seen`.
+    /// dynamic tenant. Only a store error is logged and treated as success at
+    /// this step: it is not the tenant's fault, and the ingest router, which
+    /// re-reads the record before routing, refuses the tenant's writes for as
+    /// long as it cannot read it. After a store error the (tenant, signal) is
+    /// not checked again until its read backoff window passes; inside the
+    /// window this returns `Ok` without a store call, and the WARN is logged
+    /// once per failed check. A genuine success (created, adopted, or matched)
+    /// is cached in `seen` and clears the backoff.
     pub async fn ensure(
         &self,
         tenant_hash: &TenantHash,
         signal: Signal,
         now_ns: i64,
     ) -> Result<(), ProvisioningError> {
-        if self.seen.lock().contains(&(*tenant_hash, signal)) {
+        let key = (*tenant_hash, signal);
+        if self.seen.lock().contains(&key) {
+            return Ok(());
+        }
+        if self
+            .read_backoff
+            .lock()
+            .blocked_until(&key, now_ns)
+            .is_some()
+        {
             return Ok(());
         }
         match validate_or_adopt(
@@ -163,7 +188,8 @@ impl ProvisioningRecordWriter {
         .await
         {
             Ok(_) => {
-                self.seen.lock().insert((*tenant_hash, signal));
+                self.seen.lock().insert(key);
+                self.read_backoff.lock().clear(&key);
                 Ok(())
             }
             Err(err) if is_hard_failure(&err) => {
@@ -171,10 +197,15 @@ impl ProvisioningRecordWriter {
                 Err(err)
             }
             Err(err) => {
+                let delay_ns = self.read_backoff.lock().record_failure(key, now_ns);
                 tracing::warn!(
                     %err,
+                    tenant_hash = %tenant_hash.to_hex(),
                     signal = signal.key_prefix(),
-                    "provisioning record write hit a transient store error; ingest continues"
+                    retry_in_ms = delay_ns / 1_000_000,
+                    "provisioning record check hit a store error; this request is not refused \
+                     here, but the ingest router refuses this tenant's writes for this signal \
+                     while it cannot read the record"
                 );
                 Ok(())
             }
@@ -188,7 +219,7 @@ impl ProvisioningRecordWriter {
 ///
 /// A no-op when `writer` is `None`. Returns the typed error on a hard
 /// provisioning failure (a `shard_count` mismatch or an unreadable record), so
-/// the handler fails that one request; a transient store error is logged inside
+/// the handler fails that one request; a store error is logged inside
 /// [`ProvisioningRecordWriter::ensure`] and reported as success here.
 pub async fn ensure_provisioning_record(
     writer: &Option<Arc<ProvisioningRecordWriter>>,

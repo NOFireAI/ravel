@@ -64,6 +64,7 @@ use ravel_catalog::{
     DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, active_shard_count, current_floor, provisioning_key,
     read_floors_checked, read_generations_checked, scan_count, stable_generation_for_hour,
 };
+use ravel_object_store::instrument::StoreErrorClass;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_proto::sys::v1 as sysproto;
 use ravel_types::{Signal, TenantHash};
@@ -71,6 +72,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::clock::Clock;
 use crate::format_floor::{BelowFormatFloor, FloorAdmission, FormatFamily, FormatFloorPolicy};
+use crate::read_backoff::{ProvisioningReadCause, ProvisioningReadFailures, ReadBackoff};
 
 /// Default router refresh interval `C` (ADR-0052 section 3, an open question
 /// the ADR left to the implementing task). 60 seconds: frequent enough that a
@@ -172,7 +174,49 @@ pub enum Routed<H> {
 /// corrupt/undecodable record whose true generation set is unknown. A genuine
 /// absence is not an error — it resolves to the default (generation 0) view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GenerationLoadError;
+pub enum GenerationLoadError {
+    /// The GET of the record failed, with the store error's class
+    /// (`corrupted`, `transient`, `timeout`, ...). `not_found` never appears:
+    /// an absent record is the default view, not an error.
+    Store(StoreErrorClass),
+    /// The GET returned bytes that did not decode as a provisioning record, or
+    /// whose generation or floor history failed its checked read.
+    Decode,
+}
+
+impl GenerationLoadError {
+    /// The `cause` label this failure counts under.
+    pub fn cause(self) -> ProvisioningReadCause {
+        match self {
+            GenerationLoadError::Store(_) => ProvisioningReadCause::Store,
+            GenerationLoadError::Decode => ProvisioningReadCause::Decode,
+        }
+    }
+}
+
+impl std::fmt::Display for GenerationLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GenerationLoadError::Store(class) => {
+                write!(f, "store GET failed ({})", class.name())
+            }
+            GenerationLoadError::Decode => {
+                f.write_str("record did not decode or failed its checked read")
+            }
+        }
+    }
+}
+
+/// The outcome of [`GenerationSwitch::read_view`].
+pub(crate) enum ViewRead {
+    /// The record read back; its view is not yet installed.
+    Loaded(ProvisioningView),
+    /// A read was issued and failed; the tenant's backoff window is armed.
+    Failed,
+    /// No read was issued: an earlier read failed and the tenant's backoff
+    /// window has not passed.
+    BackedOff,
+}
 
 /// What the scan-set check at flush open found (ADR-1642 scan-set amendment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -710,6 +754,10 @@ struct Inner<H> {
     /// drain waiting for a re-read joins the one in flight. The receiver
     /// reads `Some(installed)` once the read ends.
     refreshing: HashMap<TenantHash, watch::Receiver<Option<bool>>>,
+    /// Tenants whose last provisioning read failed, and when the next read is
+    /// allowed (issue #3653). Holds an entry only while the last read failed:
+    /// a successful read and idle eviction both remove it.
+    read_backoff: ReadBackoff<TenantHash>,
 }
 
 /// The generation-versioned shard-actor topology of one router (ADR-0052
@@ -732,6 +780,8 @@ pub struct GenerationSwitch<H> {
     /// What a flush below a tenant's format floor does (ADR-1746 decisions 4
     /// and 5). Set once at startup by the router's `with_format_floor_policy`.
     floor_policy: RwLock<FormatFloorPolicy>,
+    /// Failed provisioning reads by cause, shared with the router's metrics.
+    read_failures: Arc<ProvisioningReadFailures>,
 }
 
 impl<H> GenerationSwitch<H> {
@@ -751,12 +801,90 @@ impl<H> GenerationSwitch<H> {
                 sets,
                 views: HashMap::new(),
                 refreshing: HashMap::new(),
+                read_backoff: ReadBackoff::new(),
             }),
             factory: Box::new(factory),
             refresh_interval_ns,
             refresh_source: None,
             floor_policy: RwLock::new(FormatFloorPolicy::default()),
+            read_failures: Arc::new(ProvisioningReadFailures::default()),
         }
+    }
+
+    /// Count failed provisioning reads into `counters`, the router metrics'
+    /// own, rather than a private set nothing reports.
+    #[must_use]
+    pub(crate) fn with_read_failures(mut self, counters: Arc<ProvisioningReadFailures>) -> Self {
+        self.read_failures = counters;
+        self
+    }
+
+    /// Read `tenant`'s provisioning record for a write at `now_ns`, unless an
+    /// earlier read for the tenant failed and its backoff window has not
+    /// passed (issue #3653), in which case no GET is issued and the result is
+    /// [`ViewRead::BackedOff`]. A failed read arms or doubles the window,
+    /// counts once under its cause, and logs once at ERROR; a successful one
+    /// clears the window. The view is not installed: the caller does that
+    /// with [`Self::refresh_view`].
+    pub(crate) async fn read_view(
+        &self,
+        store: &dyn ObjectStoreBackend,
+        signal: Signal,
+        tenant: TenantHash,
+        now_ns: i64,
+    ) -> ViewRead {
+        let default_count = {
+            let inner = self.lock();
+            if inner.read_backoff.blocked_until(&tenant, now_ns).is_some() {
+                return ViewRead::BackedOff;
+            }
+            inner.default_count
+        };
+        let loaded = load_view(store, signal, &tenant, default_count).await;
+        let mut inner = self.lock();
+        match loaded {
+            Ok(view) => {
+                inner.read_backoff.clear(&tenant);
+                ViewRead::Loaded(view)
+            }
+            Err(err) => {
+                self.note_read_failure(&mut inner, signal, tenant, err, now_ns);
+                ViewRead::Failed
+            }
+        }
+    }
+
+    /// Arm or double `tenant`'s read backoff after a failed read issued at
+    /// `now_ns`, count it, and log it. Called once per issued read, so the
+    /// ERROR line is bounded by the backoff window.
+    fn note_read_failure(
+        &self,
+        inner: &mut Inner<H>,
+        signal: Signal,
+        tenant: TenantHash,
+        err: GenerationLoadError,
+        now_ns: i64,
+    ) {
+        let delay_ns = inner.read_backoff.record_failure(tenant, now_ns);
+        self.read_failures.record(err.cause());
+        tracing::error!(
+            tenant_hash = %tenant.to_hex(),
+            signal = ?signal,
+            cause = %err,
+            retry_in_ms = delay_ns / 1_000_000,
+            "provisioning record read failed: writes for this tenant and signal are refused \
+             (or routed on the cached view while it is inside its grace window) until the \
+             record reads back; the next read is not issued before the retry delay"
+        );
+    }
+
+    /// The read backoff entry of `tenant`, for tests.
+    #[cfg(test)]
+    pub(crate) fn read_backoff_entry(
+        &self,
+        tenant: TenantHash,
+    ) -> Option<crate::read_backoff::ReadBackoffEntry> {
+        self.lock().read_backoff.entry(&tenant)
     }
 
     /// Replace the format-floor policy every flush of this router's shards
@@ -1038,6 +1166,7 @@ impl<H> GenerationSwitch<H> {
         inner
             .views
             .retain(|_, view| now_ns.saturating_sub(view.last_touched_ns) <= ttl_ns);
+        inner.read_backoff.evict_idle(now_ns, ttl_ns);
         before - inner.views.len()
     }
 
@@ -1211,6 +1340,16 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
             if let Some(in_flight) = inner.refreshing.get(&tenant) {
                 return Some(in_flight.clone());
             }
+            if inner
+                .read_backoff
+                .blocked_until(&tenant, source.clock.now_ns())
+                .is_some()
+            {
+                // Inside the read backoff window: resolve as a failed read
+                // without issuing one.
+                let (_, backed_off) = watch::channel(Some(false));
+                return Some(backed_off);
+            }
             let (done_tx, done_rx) = watch::channel(None);
             inner.refreshing.insert(tenant, done_rx.clone());
             (inner.default_count, done_tx, done_rx)
@@ -1226,8 +1365,14 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
             if let Some(switch) = switch.upgrade() {
                 let mut inner = switch.lock();
                 inner.refreshing.remove(&tenant);
-                if let Ok(view) = loaded {
-                    install_if_newer(&mut inner.views, tenant, view, issued_ns);
+                match loaded {
+                    Ok(view) => {
+                        inner.read_backoff.clear(&tenant);
+                        install_if_newer(&mut inner.views, tenant, view, issued_ns);
+                    }
+                    Err(err) => {
+                        switch.note_read_failure(&mut inner, signal, tenant, err, issued_ns)
+                    }
                 }
             }
             done_tx.send_replace(Some(installed));
@@ -1316,13 +1461,13 @@ pub(crate) async fn load_view(
     match store.get(&key, GetRange::Full).await {
         Ok(outcome) => {
             let record = sysproto::ProvisioningRecord::decode(outcome.data.as_ref())
-                .map_err(|_| GenerationLoadError)?;
+                .map_err(|_| GenerationLoadError::Decode)?;
             let generations = read_generations_checked(&record, &key, tenant, signal)
-                .map_err(|_| GenerationLoadError)?;
+                .map_err(|_| GenerationLoadError::Decode)?;
             let format_floor = match FormatFamily::for_signal(signal) {
                 Some(family) => {
                     let floors = read_floors_checked(&record, &key, tenant, signal)
-                        .map_err(|_| GenerationLoadError)?;
+                        .map_err(|_| GenerationLoadError::Decode)?;
                     current_floor(&floors, family.as_str())
                 }
                 None => None,
@@ -1341,7 +1486,7 @@ pub(crate) async fn load_view(
             }],
             format_floor: None,
         }),
-        Err(_) => Err(GenerationLoadError),
+        Err(err) => Err(GenerationLoadError::Store(StoreErrorClass::of(&err))),
     }
 }
 
