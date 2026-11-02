@@ -1676,7 +1676,9 @@ fn window_params() -> Vec<(&'static str, String)> {
 /// which drops the event and returns success: a surface wired that way serves
 /// queries with no trail and no error. One request per surface per listener,
 /// each asserted to add exactly one record, is what makes that regression
-/// visible at any one of the nine.
+/// visible at any one of the nine. Flight SQL is reached over gRPC, not by
+/// these requests: [`flight_sql_install_site_is_the_redacted_pipeline`]
+/// covers it under `--features flight-sql`.
 #[tokio::test]
 async fn every_sink_install_site_is_the_pipeline() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -1831,6 +1833,91 @@ async fn every_sink_install_site_is_the_pipeline() {
             "the {name} query service must write exactly one query-audit record"
         );
     }
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// The Flight SQL install site of `SqlState`'s sink, which no HTTP request in
+/// [`every_sink_install_site_is_the_pipeline`] reaches: one statement over a
+/// real gRPC channel, `GetFlightInfo` then `DoGet`, and no HTTP query at all,
+/// so the record this test counts can only have come from Flight. Run under
+/// `--audit-text redacted`, the record's `query.text` must be the pinned
+/// tokenization of the statement (the same tokens the HTTP SQL redaction test
+/// pins), so a Flight sink wired to the bare pipeline, past the redacting
+/// wrapper, stores the literals verbatim and fails here.
+///
+/// FLIP: install `NoopQueryAuditSink` on the Flight service and the count
+/// reads 0; hand every surface the unwrapped pipeline and `query.text` reads
+/// the statement verbatim.
+#[cfg(feature = "flight-sql")]
+#[tokio::test]
+async fn flight_sql_install_site_is_the_redacted_pipeline() {
+    use futures::TryStreamExt;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
+    let running = start_server_text(store.clone(), redacted_text_policy()).await;
+    let grpc = running
+        .grpc_addr
+        .expect("a query-serving mode binds gRPC when flight-sql is on");
+    let tenant = TenantId::new(TENANT);
+    assert!(
+        query_audit_records(store.as_ref(), &tenant)
+            .await
+            .is_empty(),
+        "no query has run yet"
+    );
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{grpc}"))
+        .expect("valid endpoint uri")
+        .connect()
+        .await
+        .expect("Flight client connects");
+    let mut client = arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+    client.set_header("authorization", format!("Bearer {TOKEN}"));
+    client.set_header("x-ravel-start", "0");
+    client.set_header("x-ravel-end", NOW_S.to_string());
+
+    let sql = "SELECT ts, value FROM samples WHERE label(labels, '__name__') = 'm' ORDER BY ts";
+    let info = client
+        .execute(sql.to_string(), None)
+        .await
+        .expect("GetFlightInfo");
+    let ticket = info
+        .endpoint
+        .first()
+        .expect("one endpoint")
+        .ticket
+        .clone()
+        .expect("endpoint carries a ticket");
+    let batches = client
+        .do_get(ticket)
+        .await
+        .expect("DoGet")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("decode batches");
+    let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(rows, 2, "both published samples come back over Flight");
+
+    let records = query_audit_records(store.as_ref(), &tenant).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "one Flight SQL statement must write exactly one query-audit record"
+    );
+    assert_eq!(attr(&records[0], "query.language"), Some("sql"));
+    let text = attr(&records[0], "query.text").expect("the record carries a query.text");
+    assert_ne!(
+        text, sql,
+        "the stored text must not be the statement verbatim"
+    );
+    assert_eq!(
+        text,
+        "SELECT ts, value FROM samples WHERE label(labels, 'tok_0d2d088dbe1acaea') \
+         = 'tok_784cf4b979581a8d' ORDER BY ts",
+        "the stored text must be the tokenized statement"
+    );
 
     running.shutdown().await.expect("graceful shutdown");
 }
