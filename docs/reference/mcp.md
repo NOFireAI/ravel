@@ -192,6 +192,11 @@ of each field.
 Integers and timestamps travel as JSON strings for every value, whatever
 its magnitude, so parse them as strings.
 
+A time input, such as a `time_range` bound, is either an RFC 3339 timestamp
+in UTC (ending in Z or +00:00) or a decimal nanosecond epoch, both as
+strings. A timestamp with any other offset is refused as
+`invalid_argument`.
+
 `visibility.min_commit_tokens_applied` echoes each token in the wire form the
 caller sent: on a SQL call a token qualified by table reads `<table>:<token>`.
 

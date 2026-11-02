@@ -19,7 +19,8 @@ pub fn to_ns(name: &str, raw: &str) -> Result<i64, Failure> {
     }
     let unusable = || {
         invalid(format!(
-            "{name} {raw:?} is neither an RFC 3339 timestamp nor an integer nanosecond epoch"
+            "{name} {raw:?} is neither an RFC 3339 timestamp in UTC (ending in Z or \
+             +00:00) nor an integer nanosecond epoch"
         ))
     };
     let instant = humantime::parse_rfc3339(raw).map_err(|_| unusable())?;
@@ -112,6 +113,27 @@ mod tests {
                 start_ns: 0,
                 end_ns: 9
             }
+        );
+    }
+
+    /// A valid RFC 3339 timestamp with a non-UTC offset is refused, and the
+    /// message says a timestamp must be in UTC; `+00:00` is accepted.
+    ///
+    /// FLIP: the old message, "neither an RFC 3339 timestamp nor ...", calls
+    /// a valid RFC 3339 timestamp something it is not.
+    #[test]
+    fn a_non_utc_offset_is_refused_with_a_message_naming_utc() {
+        let failure =
+            to_ns("time_range.start_ns", "2026-09-12T12:00:00+02:00").expect_err("+02:00");
+        assert_eq!(failure.class, FailureClass::InvalidArgument);
+        assert_eq!(
+            failure.message,
+            "time_range.start_ns \"2026-09-12T12:00:00+02:00\" is neither an RFC 3339 \
+             timestamp in UTC (ending in Z or +00:00) nor an integer nanosecond epoch"
+        );
+        assert_eq!(
+            to_ns("t", "2026-09-12T10:00:00+00:00").expect("+00:00"),
+            1_789_207_200_000_000_000,
         );
     }
 

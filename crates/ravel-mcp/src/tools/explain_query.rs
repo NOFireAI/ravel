@@ -234,12 +234,24 @@ fn render(request: &SqlRequest, outcome: ExplainOutcome, ctx: &ToolContext<'_>) 
     let comparisons = comparisons(&outcome, ctx);
     let factor = narrowing_factor(&comparisons);
     let estimate = estimate_json(&outcome, &comparisons, factor);
+    let upper_envelope = outcome.unbounded.is_empty();
+    let unchecked: Vec<String> = comparisons
+        .iter()
+        .filter(|comparison| comparison.exceeds() && !refuses(comparison, outcome.target))
+        .map(|comparison| {
+            format!(
+                "{} is not checked by this explain: the Parquet reader enforces it at \
+                 scan time, refusing the read that would cross it",
+                comparison.ceiling
+            )
+        })
+        .collect();
     let over: Vec<&Comparison> = comparisons
         .iter()
         .filter(|comparison| refuses(comparison, outcome.target))
         .collect();
     if !over.is_empty() {
-        return over_budget(&over, factor, estimate, ctx);
+        return over_budget(&over, factor, estimate, upper_envelope, unchecked, ctx);
     }
 
     let (signal, table) = scope_names(outcome.target);
@@ -251,15 +263,7 @@ fn render(request: &SqlRequest, outcome: ExplainOutcome, ctx: &ToolContext<'_>) 
             component.field_name()
         ));
     }
-    for comparison in &comparisons {
-        if comparison.exceeds() && !refuses(comparison, outcome.target) {
-            warnings.push(format!(
-                "{} is not checked by this explain: the Parquet reader enforces it at \
-                 scan time, refusing the read that would cross it",
-                comparison.ceiling
-            ));
-        }
-    }
+    warnings.extend(unchecked);
 
     let mut envelope = Envelope::default();
     envelope.scope.signal = signal.to_string();
@@ -282,12 +286,11 @@ fn render(request: &SqlRequest, outcome: ExplainOutcome, ctx: &ToolContext<'_>) 
         outcome.segments_resolved == 0 && outcome.target != TargetSignal::Parquet;
     envelope.coverage.complete = true;
     envelope.accuracy.exact = true;
-    envelope.presentation.max_rows = ctx.budgets.max_rows;
     envelope.budget = Budget {
         effective: AnyJson(budget_ceilings(ctx)),
         actual: AnyJson(Value::Object(Map::new())),
         estimate: AnyJson(estimate),
-        estimate_is_upper_envelope: outcome.unbounded.is_empty(),
+        estimate_is_upper_envelope: upper_envelope,
     };
     envelope.warnings = warnings;
     envelope.fit(ctx.budgets.max_response_bytes).finish(false)
@@ -297,6 +300,8 @@ fn over_budget(
     over: &[&Comparison],
     factor: Option<f64>,
     estimate: Value,
+    upper_envelope: bool,
+    warnings: Vec<String>,
     ctx: &ToolContext<'_>,
 ) -> Envelope {
     let figures: Vec<String> = over
@@ -333,8 +338,9 @@ fn over_budget(
             effective: AnyJson(budget_ceilings(ctx)),
             actual: AnyJson(Value::Object(Map::new())),
             estimate: AnyJson(estimate),
-            estimate_is_upper_envelope: false,
+            estimate_is_upper_envelope: upper_envelope,
         },
+        warnings,
         next_steps: vec![step(
             "narrow_the_query",
             "shorten time_range or add predicates on indexed columns, then explain again",
@@ -462,9 +468,14 @@ mod tests {
     /// requests 200, 2x), so a factor read from one fixed dimension fails
     /// one of the two.
     ///
+    /// Every figure is bounded, so the refused estimate is still an upper
+    /// envelope.
+    ///
     /// FLIP: summing the ratios gives 5 and 7; taking the product gives 6
     /// and 10; taking the minimum gives 2 and 2; reading requests alone
     /// gives 3 and 2.
+    /// FLIP: a refusal that hardcodes `estimate_is_upper_envelope: false`
+    /// contradicts its own empty `budget.estimate.unbounded`.
     #[test]
     fn the_narrowing_factor_is_the_largest_ratio_over_its_ceiling() {
         for (requests, bytes, factor) in [(300, 2_000, 3.0), (200, 5_000, 5.0)] {
@@ -490,6 +501,8 @@ mod tests {
                 json!(factor)
             );
             assert_eq!(envelope.next_steps[0].action, "narrow_the_query");
+            assert_eq!(envelope.budget.estimate.0["unbounded"], json!([]));
+            assert!(envelope.budget.estimate_is_upper_envelope);
             let exceeded: Vec<&str> = envelope.budget.estimate.0["comparisons"]
                 .as_array()
                 .expect("comparisons")
@@ -613,10 +626,52 @@ mod tests {
         assert!(!envelope.visibility.resolved_no_segments);
     }
 
+    /// A Parquet explain refused for a second reason, admitted segments over
+    /// `max_segments`, still names both unchecked Parquet ceilings, and its
+    /// estimate is not an upper envelope.
+    ///
+    /// FLIP: returning the refusal before the unchecked-ceiling warnings are
+    /// built leaves `warnings` empty.
+    #[test]
+    fn a_parquet_refusal_still_names_its_unchecked_ceilings() {
+        let mut parquet = outcome(TargetSignal::Parquet, CostEstimate::new(0, 0, 0, 60, 0));
+        parquet.unbounded = vec![EstimateComponent::Requests, EstimateComponent::StoreBytes];
+        parquet.segments_admitted = 60;
+        let stub = Stub {
+            explain: Some(parquet),
+            ..Stub::default()
+        };
+        let envelope = explain(&stub, "SELECT name FROM sales");
+        let failure = failure_of(&envelope);
+        assert_eq!(failure.class, FailureClass::BudgetEstimateExceedsCeiling);
+        assert!(
+            failure
+                .message
+                .contains("segments_admitted 60 > max_segments 50"),
+            "{}",
+            failure.message
+        );
+        assert!(!envelope.budget.estimate_is_upper_envelope);
+        let expected: Vec<String> = ["max_bytes_scanned", "max_store_requests"]
+            .iter()
+            .map(|ceiling| {
+                format!(
+                    "{ceiling} is not checked by this explain: the Parquet reader enforces \
+                     it at scan time, refusing the read that would cross it"
+                )
+            })
+            .collect();
+        assert_eq!(envelope.warnings, expected);
+    }
+
     /// The same unbounded store-byte figure on a signal table, against a
     /// ceiling, refuses: only Parquet's scan-time enforcement exempts it.
+    /// With a component unbounded, the refused estimate is not an upper
+    /// envelope.
     ///
     /// FLIP: exempting every target refuses nothing here.
+    /// FLIP: a refusal that reports `estimate_is_upper_envelope: true`
+    /// regardless of `unbounded` fails the last assertion.
     #[test]
     fn an_unbounded_figure_against_a_ceiling_refuses_off_parquet() {
         let mut spans = outcome(TargetSignal::Spans, CostEstimate::new(1, 0, 0, 1, 0));
@@ -635,15 +690,20 @@ mod tests {
             "{}",
             failure.message
         );
+        assert!(!envelope.budget.estimate_is_upper_envelope);
     }
 
     /// A statement inside every ceiling: the schema is `data.columns` with
     /// no rows, the plan is `plan`, the estimate sits beside `effective`,
     /// and the request reached the port with `row_window` set and no
-    /// per-request budgets.
+    /// per-request budgets. No rows are returned and none are capped, so
+    /// `presentation.max_rows` is 0.
     ///
     /// FLIP: putting the plan into `data.rows` or dropping `row_window`
     /// fails the matching assertion.
+    /// FLIP: reporting the effective `max_rows` (200) as
+    /// `presentation.max_rows` advertises a row cap the explain never
+    /// applies.
     #[test]
     fn an_explain_inside_the_budget_places_schema_plan_and_estimate() {
         let stub = Stub {
@@ -659,6 +719,7 @@ mod tests {
         assert_eq!(envelope.data.columns.len(), 1);
         assert_eq!(envelope.data.columns[0].name, "ts");
         assert!(envelope.data.rows.is_empty());
+        assert_eq!(envelope.presentation.max_rows, 0);
         assert_eq!(
             envelope.plan.as_deref(),
             Some("ProjectionExec\n  RavelScan")
