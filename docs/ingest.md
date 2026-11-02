@@ -255,7 +255,10 @@ A record that keeps failing to read (a store that serves it with a failing
 checksum, say) would otherwise be read again on every write for that tenant.
 After a failed re-read the switch records a retry time for the tenant: 1
 second after the failure, doubling on each consecutive failure up to 30
-seconds. Until then a write that finds a stale view issues no GET; it still
+seconds. A failure counts as consecutive only when its read was issued at or
+after the current retry time: reads already in flight when the window was
+armed, which fail at the same moment, leave the window as it is, so a burst
+of concurrent writes failing once backs off for 1 second, not 30. Until then a write that finds a stale view issues no GET; it still
 tries the grace window above and otherwise fails closed with
 `StaleProvisioningView` as before. The flush-open background re-read obeys
 the same window. A successful read removes the entry, and idle-tenant
@@ -268,7 +271,13 @@ being `store` for a failed GET and `decode` for a record that did not decode
 or failed its checked read. The server's first-write provisioning check
 (`ProvisioningRecordWriter::ensure`) stays fail-open on a store error and
 backs off per (tenant, signal) on the same schedule, so it issues no store
-read inside the window either.
+read inside the window either. A hard failure there (a record that does not
+decode, declares an unsupported version, is misfiled, has a corrupt
+generation history, or whose configured `shard_count` would hide data) backs
+off the same way: every request inside the window fails with the same typed
+error without a store read, and
+`ravel_provisioning_shard_count_mismatch_total` counts the read, not each
+refused request.
 
 #### Decrease and the straggler slack window `S`
 
