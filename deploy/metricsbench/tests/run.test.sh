@@ -24,7 +24,9 @@
 #                                       stamped, not checked
 #   q2 a row stalls                  -> the same, exit 70 naming ingest
 #   q3 q plus an --rss-band breach   -> exit 70 naming ingest, memory listed in
-#                                       failed_after_ingest
+#                                       failed_after_ingest and
+#                                       deferred_failures, after stop, fold,
+#                                       start and readback-folded ran
 #   q4 the oracle's read-back fails, -> exit 70 naming ingest at query: query
 #      plus an --rss-band breach        refuses, no report.json, no validate;
 #                                       only query in failed_after_ingest, the
@@ -32,9 +34,19 @@
 #   r  ingest exits non-zero, every  -> exit 70 naming ingest at once, no
 #      row verified                     capture, no query
 #   c  --ravel-image without digest  -> exit 65, nothing started, no stamps
-#   d  --rss-band breach             -> exit 75, memory-summary.json records
-#                                       the band as above, torn down
-#   e  OOM-killed container          -> exit 75, memory-summary.json names it
+#   d  --rss-band breach             -> exit 75 naming memory, memory-summary.json
+#                                       records the band as above, memory in
+#                                       deferred_failures, stop, fold, start
+#                                       and readback-folded ran first, torn
+#                                       down
+#   e  OOM-killed container          -> the same, memory-summary.json names it
+#   e2 d plus a failed folded        -> exit 70 naming readback-folded, memory
+#      read-back                        in deferred_failures, the message names
+#                                       both
+#   e3 diagnostic mode plus an       -> exit 75 at once, nothing deferred
+#      --rss-band breach
+#   e4 u7 plus an --rss-band breach  -> the four skipped, then exit 70 naming
+#                                       ingest, memory in failed_after_ingest
 #   f  diagnostic mode               -> exit 0, falsification.json carries the
 #                                       HTTP status, errorType, error and
 #                                       series count; no report.json; stamps
@@ -759,9 +771,12 @@ mapfile -t args < <(full_args "${TMP}/q3/out")
 STUB_INGEST_READBACK_FAIL=victoriametrics STUB_MEM_ravel_server=2GiB run_case q3 "${args[@]}" \
   --rss-band ravel-server:0:1073741824
 expect_rc q3 70
-check "q3: stamps name ingest and list memory as failed after it" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["memory"]'
+check "q3: stamps name ingest and list memory as failed after it" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["memory"] and j("stamps.json")["deferred_failures"] == ["memory"]'
 expect_err "q3: the band is still said" "--rss-band ravel-server:0:1073741824 above"
-expect_no_log "q3: the breach ends the run before the fold" "catalog fold"
+check "q3: the breach does not stop the folded steps, memory not done" 'j("stamps.json")["steps_completed"][-5:] == ["validate","stop","fold","start","readback-folded"] and "memory" not in j("stamps.json")["steps_completed"]'
+expect_log "q3: the fold ran after the breach" "catalog fold"
+expect_log "q3: the folded read-back ran after the breach" "--readback-only"
+expect_err "q3: the exit still names ingest" "step ingest failed:"
 
 # --- q4: the oracle's read-back fails ----------------------------------------------
 # query refuses a diagnostic whose failed row is Prometheus's, so the run ends at
@@ -807,6 +822,12 @@ expect_rc d 75
 expect_err "d: message names the band" "--rss-band ravel-server:0:1073741824 above"
 check "d: summary records the band above" 'j("memory-summary.json")["bands"][0]["verdict"] == "above" and j("memory-summary.json")["bands"][0]["peak_bytes"] == 2*1024**3 and j("memory-summary.json")["verdict"] == "band_violated"'
 check "d: stamps name step memory, exit 75" 'j("stamps.json")["failed_step"] == "memory" and j("stamps.json")["exit_code"] == 75'
+check "d: memory listed in deferred_failures" 'j("stamps.json")["deferred_failures"] == ["memory"] and j("stamps.json")["failed_after_ingest"] == []'
+check "d: stop, fold, start and readback-folded ran after validate, memory not done" 'j("stamps.json")["steps_completed"][-5:] == ["validate","stop","fold","start","readback-folded"] and "memory" not in j("stamps.json")["steps_completed"]'
+check "d: the folded read-back stamped" 'j("stamps.json")["readback_folded"]["exit_code"] == 0 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["precondition"] == "met"'
+expect_file d readback-folded.json
+expect_err "d: message says the folded steps run first" "going on to the folded steps first"
+expect_err "d: closing message names memory after the folded steps" "the folded steps ran after it"
 expect_log "d: torn down" " down -v"
 
 # --- e: OOM kill -------------------------------------------------------------
@@ -815,6 +836,33 @@ STUB_OOM_SERVICE=mimir run_case e "${args[@]}"
 expect_rc e 75
 expect_err "e: message names the container" "metricsbench-mimir-1 was OOM-killed"
 check "e: summary names the OOM-killed container" 'j("memory-summary.json")["oom_killed"] == ["metricsbench-mimir-1"] and j("memory-summary.json")["containers"]["metricsbench-mimir-1"]["oom_killed"] is True and j("memory-summary.json")["verdict"] == "oom_killed"'
+check "e: stamps name step memory, memory in deferred_failures" 'j("stamps.json")["failed_step"] == "memory" and j("stamps.json")["exit_code"] == 75 and j("stamps.json")["deferred_failures"] == ["memory"]'
+check "e: stop, fold, start and readback-folded ran after the OOM kill" 'j("stamps.json")["steps_completed"][-4:] == ["stop","fold","start","readback-folded"] and "memory" not in j("stamps.json")["steps_completed"]'
+expect_log "e: the folded read-back ran" "--readback-only"
+
+# --- e2: a memory failure, then a failed folded read-back -------------------------
+mapfile -t args < <(full_args "${TMP}/e2/out")
+STUB_MEM_ravel_server=2GiB STUB_READBACK_ONLY_EXIT=1 run_case e2 "${args[@]}" --rss-band ravel-server:0:1073741824
+expect_rc e2 70
+check "e2: stamps name step readback-folded, memory in deferred_failures" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["exit_code"] == 70 and j("stamps.json")["deferred_failures"] == ["memory"]'
+expect_err "e2: message names both failures" "step readback-folded failed: metricsbench_ingest --readback-only exited 1: query series failed: 503; step memory had failed before it: "
+expect_err "e2: the band named in the same message" "step memory had failed before it: --rss-band ravel-server:0:1073741824 above"
+
+# --- e3: the diagnostic mode still ends at a memory failure at once ---------------
+run_case e3 --profile history --bin-dir "${BIN}" --out-dir "${TMP}/e3/out" --anchor-ms "${ANCHOR}" \
+  --diagnostic-prometheus-max-samples 1000 --rss-band prometheus:0:1
+expect_rc e3 75
+check "e3: stamps name step memory, nothing deferred" 'j("stamps.json")["failed_step"] == "memory" and j("stamps.json")["deferred_failures"] == [] and j("stamps.json")["steps_completed"][-1] == "falsification"'
+expect_err "e3: message names the band" "--rss-band prometheus:0:1 above"
+expect_no_log "e3: no folded step" "--readback-only"
+if grep -qF "going on to the folded steps" "${ERR}"; then fail "e3: diagnostic deferred the memory failure"; else pass "e3: diagnostic did not defer the memory failure"; fi
+
+# --- e4: a memory failure when the folded steps are skipped -----------------------
+mapfile -t args < <(full_args "${TMP}/e4/out")
+STUB_INGEST_READBACK_FAIL=victoriametrics STUB_INGEST_ROW_FAILURE=ravel STUB_MEM_ravel_server=2GiB run_case e4 "${args[@]}" \
+  --rss-band ravel-server:0:1073741824
+expect_rc e4 70
+check "e4: stamps name ingest, memory in failed_after_ingest and deferred_failures, the four skipped" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["memory"] and j("stamps.json")["deferred_failures"] == ["memory"] and not {"stop","fold","start","readback-folded"} & set(j("stamps.json")["steps_completed"]) and j("stamps.json")["readback_folded"].startswith("skipped: the ravel row has a row_failure")'
 
 # --- f: diagnostic -----------------------------------------------------------
 run_case f --profile history --bin-dir "${BIN}" --out-dir "${TMP}/f/out" --anchor-ms "${ANCHOR}" \

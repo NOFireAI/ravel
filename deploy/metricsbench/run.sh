@@ -94,7 +94,9 @@
 #   validate    metricsbench_report validate <out>/report.json
 #   memory      the sampler stopped, <out>/memory-summary.json written (peak
 #               and final bytes per container, OOMKilled from docker inspect),
-#               every --rss-band checked
+#               every --rss-band checked. In a full run a failure here is
+#               stamped in deferred_failures and the run goes on to the four
+#               steps below before it exits (see after the list)
 #   stop        docker compose stop ravel-server: the fold below runs with
 #               --writers-stopped, which ADR-2677 decision 1 makes safe only
 #               once the writer has exited. Stamped as ravel_restart
@@ -127,10 +129,16 @@
 #               the limit does not use
 #
 # stop, fold, start and readback-folded also run after a failed ingest
-# verification, when memory passed and the Ravel row itself has no
-# row_failure and did not stall; a failure there is listed in
-# failed_after_ingest. Otherwise the four are skipped and their stamps say
-# why.
+# verification, when the Ravel row itself has no row_failure and did not
+# stall; a failure there is listed in failed_after_ingest. Otherwise the four
+# are skipped and their stamps say why.
+#
+# A failed memory step (an --rss-band breach or an OOM-killed container) does
+# not stop them: it is listed in stamps.json as deferred_failures, the four run
+# as above, and the run then exits for the memory failure (75 naming memory, or
+# 70 naming ingest with memory in failed_after_ingest after a failed ingest
+# verification). A folded step that fails after it exits 70 naming that step
+# instead, as without the memory failure.
 #
 # With --diagnostic-prometheus-max-samples N the run is the falsification run
 # pre-registered on #2821 instead: steps override (a compose override in the
@@ -166,7 +174,8 @@
 #   70  a step failed; its name is in the message and in stamps.json
 #       (failed_step). After a failed ingest verification this is ingest,
 #       even when a later step failed or the memory bands were violated
-#   75  a --rss-band was violated or a container was OOM-killed
+#   75  a --rss-band was violated or a container was OOM-killed, and no
+#       later step failed
 #
 # Environment, for tests: METRICSBENCH_DOCKER (default docker),
 # METRICSBENCH_CAPTURE (default capture-effective-config.sh beside this
@@ -1112,6 +1121,7 @@ stamp_set object_store null
 stamp_set in_process_row null
 stamp_set steps_completed '[]'
 stamp_set failed_after_ingest '[]'
+stamp_set deferred_failures '[]'
 stamp_set failed_step null
 stamp_set exit_code null
 stamp_set teardown null
@@ -1128,6 +1138,10 @@ FAILED_STEP=""
 INGEST_FAILED=0
 INGEST_FAILURE=""
 CONTINUE_AFTER_FAILED_VERIFICATION=0
+# Set by memory_step --defer in a full run whose memory step failed: the
+# folded steps still run, and the run exits for the memory failure after them.
+MEMORY_FAILED=0
+MEMORY_FAILURE=""
 # The ingest hour (Unix seconds / 3600, the catalog's hour bucket) in which
 # the ingest step ended; the fold must have folded through it.
 INGEST_END_HOUR=""
@@ -1224,14 +1238,16 @@ on_exit() {
 trap on_exit EXIT
 
 fail_step() {
+  local also=""
+  [ "$MEMORY_FAILED" -eq 0 ] || also="; step memory had failed before it: ${MEMORY_FAILURE}"
   if [ "$INGEST_FAILED" -eq 1 ]; then
-    say "step $1 failed: ${*:2}"
+    say "step $1 failed: ${*:2}${also}"
     py append "$STAMPS" failed_after_ingest "$1"
     fail_after_ingest
   fi
   FAILED_STEP="$1"
   shift
-  say "step $FAILED_STEP failed: $*"
+  say "step $FAILED_STEP failed: $*${also}"
   exit "$EXIT_STEP"
 }
 
@@ -1312,12 +1328,22 @@ run_ingest() {
   step_done ingest
 }
 
+# memory_step [--defer]: with --defer a failure is listed in deferred_failures
+# and the run goes on; end_deferred_memory exits for it later.
 memory_step() {
   local code=0 verdict
   memory_summary || code=$?
   if [ "$code" -ne 0 ]; then
     verdict="$(cat "${out_dir}/memory-verdict.txt" 2>/dev/null)"
-    say "step memory failed: ${verdict//$'\n'/; }"
+    verdict="${verdict//$'\n'/; }"
+    if [ "${1:-}" = "--defer" ]; then
+      say "step memory failed: ${verdict}; going on to the folded steps first"
+      py append "$STAMPS" deferred_failures memory
+      MEMORY_FAILED=1
+      MEMORY_FAILURE="$verdict"
+      return 0
+    fi
+    say "step memory failed: ${verdict}"
     if [ "$INGEST_FAILED" -eq 1 ]; then
       py append "$STAMPS" failed_after_ingest memory
       fail_after_ingest
@@ -1326,6 +1352,19 @@ memory_step() {
     exit "$EXIT_MEMORY"
   fi
   step_done memory
+}
+
+# end_deferred_memory: after the folded steps, end a run whose memory step
+# failed the way memory_step would have.
+end_deferred_memory() {
+  [ "$MEMORY_FAILED" -eq 1 ] || return 0
+  say "step memory failed: ${MEMORY_FAILURE}; the folded steps ran after it"
+  if [ "$INGEST_FAILED" -eq 1 ]; then
+    py append "$STAMPS" failed_after_ingest memory
+    fail_after_ingest
+  fi
+  FAILED_STEP="memory"
+  exit "$EXIT_MEMORY"
 }
 
 # fold_field KEY: KEY's value in <out>/fold.out, which must carry it exactly
@@ -1770,8 +1809,9 @@ run_full() {
   fi
   step_done validate
 
-  memory_step
+  memory_step --defer
   folded_readback
+  end_deferred_memory
   [ "$INGEST_FAILED" -eq 0 ] || fail_after_ingest
 }
 
