@@ -2666,22 +2666,22 @@ jobs:
         if: steps.dockerfile-changed.outputs.build == 'true'
         run: docker build --target operator .
 
-  # Coverage is visibility, not a gate (ADR-0053 D2): it leaves the required
-  # set and no longer runs on pull_request or in the merge queue. It runs on
-  # pushes to main, where it updates the badge and the JSON artifact, and on a
-  # pull request only when labelled `run-coverage`. Gating
-  # the whole job on the event (rather than dropping a trigger) is the clean
-  # option now that `on:` carries push, pull_request, and merge_group: the
-  # job-level `if` names exactly the one context it should run in.
+  # Coverage is visibility, not a gate (ADR-0053 D2): it is not a required
+  # check and never runs in the merge queue. It runs on pushes to main, where
+  # it updates the badge and the JSON artifact, and on a pull request only
+  # when the pull request carries the `run-coverage` label (ADR-0053's
+  # run-coverage label amendment). Gating the whole job on the event, rather
+  # than dropping a trigger, keeps that choice in the job-level `if`, since
+  # `on:` carries push, pull_request, and merge_group.
   coverage:
-    # needs lint too (ADR-0053 D3: the main-push coverage lane gains needs:
-    # lint so a fmt/clippy failure kills it before it burns ~25m). It already
-    # only runs on pushes to main; lint runs there as well, so this adds one
-    # fail-fast dependency without changing when coverage is eligible.
+    # needs lint too (ADR-0053 D3) so a fmt/clippy failure kills it before it
+    # burns ~25m. lint runs on every context coverage does, under the same
+    # docs_only gate, so the dependency never skips a coverage run.
     needs: [changes, lint]
     # A pull request opts in with the `run-coverage` label, the way `run-k8s`
-    # works, so a change to this job can be shown green before it lands: on
-    # its own it runs only after the merge.
+    # works, so a change to this job can be shown green before it lands. The
+    # label must be on the pull request before the push that triggers the
+    # run: no label event starts a run, and a re-run replays the old labels.
     if: >-
       needs.changes.outputs.docs_only != 'true'
       && ((github.event_name == 'push' && github.ref == 'refs/heads/main')
@@ -2736,6 +2736,7 @@ jobs:
       # find the binaries.
       - name: Measure coverage
         run: |
+          set -o pipefail
           cargo llvm-cov --locked --no-report --workspace --profile ci
           cargo llvm-cov report --locked --profile ci | tee -a "$GITHUB_STEP_SUMMARY"
           cargo llvm-cov report --locked --profile ci --lcov --output-path lcov.info
