@@ -40,6 +40,14 @@
 //! are fixed-width integer, temporal or `Decimal128`, never float. Anything
 //! else keeps the stock plan (`every_refusal_condition_leaves_the_plan_unchanged`).
 //!
+//! The rule runs before `CompactSlices`, which wraps only `AggregateExec`, so
+//! a converted aggregate gets neither half of that rule: the slice compaction
+//! (redundant, every batch emitted here owns its buffers) and the TopK
+//! pre-filter (not redundant: under `ORDER BY ... LIMIT k` every group reaches
+//! the sort). The per-bucket top-k of ADR-3565 decision 4 restores the cut
+//! inside this exec; until it lands, an A/B on those shapes measures bucketing
+//! minus the pre-filter.
+//!
 //! # Memory
 //!
 //! One consumer per partition, named `BucketedFinalAggregate[p]`, outside
