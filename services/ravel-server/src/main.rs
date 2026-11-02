@@ -593,6 +593,7 @@ async fn main() -> anyhow::Result<()> {
         shard_count: cli.shards,
         max_inflight_flushes: flush_concurrency.max_inflight_flushes,
         max_inflight_flushes_per_tenant: cli.max_inflight_flushes_per_tenant,
+        flush_object_backstop_multiple: cli.flush_object_backstop_multiple,
         max_queued_flushes: flush_concurrency.max_queued_flushes,
         adaptive_flush_delay: cli.adaptive_flush_delay,
         max_flush_delay: flush_cadence.max_flush_delay,

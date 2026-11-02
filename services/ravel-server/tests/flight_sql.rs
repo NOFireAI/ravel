@@ -907,6 +907,7 @@ fn query_server_config(
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         max_inflight_flushes_per_tenant: None,
+        flush_object_backstop_multiple: 4,
         max_queued_flushes: 8,
         adaptive_flush_delay: false,
         max_flush_delay: std::time::Duration::from_secs(2),

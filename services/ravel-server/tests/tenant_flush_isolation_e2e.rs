@@ -97,6 +97,7 @@ async fn start_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::Runni
         query_budgets: Default::default(),
         max_inflight_flushes: ravel_ingest::IngestConfig::default().max_inflight_flushes,
         max_inflight_flushes_per_tenant: None,
+        flush_object_backstop_multiple: 4,
         max_queued_flushes: 8,
         adaptive_flush_delay: false,
         // Fast enough that each strict write's flush fires within a few

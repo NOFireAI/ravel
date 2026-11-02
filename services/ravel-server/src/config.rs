@@ -2242,8 +2242,8 @@ pub struct Cli {
     /// ordinary queue can reach `--max-queued-flushes` plus one window per
     /// tenant on the shard with nothing in flight, and every backstop
     /// crossing (a buffer past its per-(shard, tenant) memory backstop, or
-    /// one whose object estimate has reached 4x the object-size target)
-    /// spawns past it too. Under a nonzero budget this byte ceiling bounds
+    /// one whose object estimate has reached `--flush-object-backstop-multiple`
+    /// times the object-size target) spawns past it too. Under a nonzero budget this byte ceiling bounds
     /// that total; under `0` the crossings are bounded only by how long a
     /// stall lasts (the gauge itself is still tracked for `/metrics` either
     /// way).
@@ -2258,8 +2258,9 @@ pub struct Cli {
     /// the rows buffered for the next tick rather than shedding them. That
     /// cap does not bound every spawn: a tenant with no flush in flight on
     /// the shard is never refused by it, and a buffer past its per-(shard,
-    /// tenant) memory backstop, or whose object estimate has reached 4x the
-    /// object-size target, spawns past it, because refusing there would trade
+    /// tenant) memory backstop, or whose object estimate has reached
+    /// `--flush-object-backstop-multiple` times the object-size target,
+    /// spawns past it, because refusing there would trade
     /// a bounded queue of flush tasks for an unbounded buffer.
     ///
     /// So the bound on spawned flush memory per shard depends on this flag.
@@ -2346,7 +2347,8 @@ pub struct Cli {
     /// at its share is deferred and counted on
     /// `ravel_ingest_flush_trigger_deferred_total`; its buffer keeps merging
     /// until a slot frees, the memory backstop crosses, or its object
-    /// estimate reaches 4x the flush target, which fire regardless. `0` is
+    /// estimate reaches `--flush-object-backstop-multiple` times the flush
+    /// target, which fire regardless. `0` is
     /// rejected by [`Cli::validate`] (every trigger would defer), and so is a
     /// value above `--max-inflight-flushes`, which a tenant could never use.
     #[arg(
@@ -2354,6 +2356,24 @@ pub struct Cli {
         env = "RAVEL_MAX_INFLIGHT_FLUSHES_PER_TENANT"
     )]
     pub max_inflight_flushes_per_tenant: Option<usize>,
+
+    /// How many `--target-bytes` of estimated object a deferred buffer may
+    /// hold before the object backstop exempts it from the per-tenant share
+    /// (ADR-2708 D3, configurable since issue #3662,
+    /// docs/adrs/2708-due-diligence-p1-fixes.md's 2026-11-02 amendment): once
+    /// a tenant at its share's deferred buffer reaches this many multiples of
+    /// the flush target, its trigger fires regardless of the share, the same
+    /// exemption the memory backstop already gets. Matches
+    /// [`ravel_ingest::IngestConfig::flush_object_backstop_multiple`]'s own
+    /// default of 4. `0` is rejected by [`Cli::validate`]: it would fire the
+    /// backstop on every buffer regardless of size, defeating the per-tenant
+    /// share entirely.
+    #[arg(
+        long = "flush-object-backstop-multiple",
+        env = "RAVEL_FLUSH_OBJECT_BACKSTOP_MULTIPLE",
+        default_value_t = 4
+    )]
+    pub flush_object_backstop_multiple: usize,
 
     /// Per-shard bound on flush tasks spawned and not yet reaped, for all
     /// three ingest pipelines (issue #1740). ADR-1642 moved the
@@ -2386,8 +2406,9 @@ pub struct Cli {
     /// stalled windows cannot fill the queue against it, and the ordinary
     /// queue can reach this cap plus one window per tenant on the shard with
     /// nothing in flight; and a buffer that has crossed its per-(shard,
-    /// tenant) memory backstop, or whose object estimate has reached 4x the
-    /// object-size target, spawns past the cap: the backstop is the only bound
+    /// tenant) memory backstop, or whose object estimate has reached
+    /// `--flush-object-backstop-multiple` times the object-size target,
+    /// spawns past the cap: the backstop is the only bound
     /// on one buffer's resident memory, and refusing there would trade a
     /// bounded queue of flush tasks for an unbounded buffer, the worse of the
     /// two failures. Under a nonzero `--max-ingest-buffer-bytes` that byte
@@ -8731,6 +8752,14 @@ impl Cli {
                 "--max-queued-flushes '0' would refuse every age and size trigger: a shard \
                  could never spawn a flush outside a drain. Set a positive count (8 is the \
                  default)."
+            );
+        }
+
+        if self.flush_object_backstop_multiple == 0 {
+            anyhow::bail!(
+                "--flush-object-backstop-multiple '0' would fire the object backstop on every \
+                 buffer regardless of size, defeating the per-tenant share entirely. Set a \
+                 positive count (4 is the default)."
             );
         }
 
@@ -20124,6 +20153,45 @@ mod tests {
                 share.parse().ok(),
                 "flag parses into the field"
             );
+        }
+    }
+
+    #[test]
+    fn zero_flush_object_backstop_multiple_fails_validate() {
+        let err = cli(&["--flush-object-backstop-multiple", "0"])
+            .validate()
+            .expect_err("a multiple of 0 would fire the backstop on every buffer");
+        assert!(
+            err.to_string()
+                .contains("--flush-object-backstop-multiple '0'"),
+            "error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn flush_object_backstop_multiple_defaults_to_four() {
+        let parsed = cli(&[]);
+        assert_eq!(
+            parsed.flush_object_backstop_multiple, 4,
+            "default matches ravel_ingest::IngestConfig::flush_object_backstop_multiple's default"
+        );
+        parsed
+            .validate()
+            .expect("the default multiple still validates");
+    }
+
+    #[test]
+    fn flush_object_backstop_multiple_parses_and_validates() {
+        for multiple in ["1", "2", "8"] {
+            let parsed = cli(&["--flush-object-backstop-multiple", multiple]);
+            assert_eq!(
+                parsed.flush_object_backstop_multiple,
+                multiple.parse::<usize>().expect("test value parses"),
+                "flag parses into the field"
+            );
+            parsed
+                .validate()
+                .expect("a positive --flush-object-backstop-multiple is fine");
         }
     }
 

@@ -184,10 +184,13 @@ an undeferred trigger: a deferred trigger keeps merging into the same buffer
 such an object could grow with the stall's length until the buffer crosses
 its backstop. D3 therefore adds an object-size backstop: a buffer whose
 object estimate (`flush_est_bytes`) has reached 4x `target_bytes` (32 MiB at
-defaults) fires as a backstop crossing does, exempt from both the per-tenant
-share deferral and the queued-flush cap, so its object stops growing there
-and waits for a permit with its size fixed. That bounds a deferred object at
-about 4x `target_bytes` plus one batch on every signal. The 16-byte charge
+defaults; configurable since issue #3662, see the flush-object-backstop-multiple
+amendment below) fires as a backstop crossing does, exempt from both the
+per-tenant share deferral and the queued-flush cap, so its object stops
+growing there and waits for a permit with its size fixed. That bounds a
+deferred object at about 4x `target_bytes` plus one batch on every signal
+(or the configured multiple's `target_bytes`, see the same amendment). The
+16-byte charge
 itself is unchanged; charging a native-histogram point by its object
 contribution changes when such a tenant sheds and is left to #2737, which
 needs a measurement first. Charging the encode output to the budget was
@@ -366,9 +369,10 @@ stall in exactly the tenants it does not name. It needs its own design.
   backstop already does. Depth grows by one window per active tenant plus the
   backstop windows, and under a bounded budget the 512 MiB ingest byte budget
   bounds the total (D3).
-- A deferred flush's object is capped at about 4x `target_bytes` (D3), which
-  bounds the native-histogram case the 16-byte charge leaves uncounted; the
-  charge itself is #2737.
+- A deferred flush's object is capped at about 4x `target_bytes` (D3,
+  configurable since issue #3662, see the flush-object-backstop-multiple
+  amendment), which bounds the native-histogram case the 16-byte charge
+  leaves uncounted; the charge itself is #2737.
 - A held bucket (D5b) pins the scan cursor for its (tenant, signal, shard)
   until retention removes it, so every maintenance pass for that key re-walks
   the hours after it instead of resuming from the cursor. The cost is bounded
@@ -507,3 +511,22 @@ third value under which startup does not run the check and reads nothing.
 before any listener binds and can take up to `--format-window-check-timeout`
 (20 s by default), close to an operator's liveness window, so the check runs
 only when an operator asks for it. `warn` and `refuse` are unchanged.
+
+## Amendment (2026-11-02): the object backstop's multiple is configurable (#3662)
+
+<!-- amendment-applies: sections="D3. Flush permits: four per shard, a per-tenant share, and an hour-bounded deadline (#1921, C-01)|Consequences" pointer="flush-object-backstop-multiple amendment" -->
+
+D3 fixed the object-size backstop at 4x `target_bytes`, hardcoded as
+`OBJECT_BACKSTOP_TARGET_MULTIPLE` in `crates/ravel-ingest/src/config.rs`. It
+is now a configurable field, `IngestConfig::flush_object_backstop_multiple`,
+defaulting to 4 (today's behaviour is unchanged until an operator sets it)
+and refused at 0 by `IngestConfig::validate` (a multiple of 0 would fire the
+backstop on every buffer regardless of size, defeating the per-tenant share
+entirely). `ravel-server` exposes it as `--flush-object-backstop-multiple`
+(env `RAVEL_FLUSH_OBJECT_BACKSTOP_MULTIPLE`, default 4, refused at 0 by
+`Cli::validate`), threaded into all three `IngestConfig`s the server builds
+(metrics, logs, spans), the same way `--max-inflight-flushes-per-tenant`
+already is. `object_backstop_crossed` reads
+`config.target_bytes.saturating_mul(config.flush_object_backstop_multiple)`
+in place of the former hardcoded product; nothing else about D3's deferral,
+share, or deadline logic changes.
