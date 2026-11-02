@@ -24,7 +24,8 @@
 //! resolved snapshot id or watermark hour, so `visibility` reports only the
 //! commit tokens the caller required. A zero in either place would read as a
 //! measurement. A SQL [`Draft`] writes the watermark and leaves the snapshot
-//! id to [`Draft::finish_page`], which derives it from the tool's pin scope. D4 types the identity fields as strings, so the unmeasured
+//! id to [`Draft::finish_page`], which derives it from the tool's pin scope.
+//! D4 types the identity fields as strings, so the unmeasured
 //! ones cannot be left out of the JSON at all: [`super::envelope::finish`]
 //! names each of them in `warnings` instead, and an empty string there is
 //! never a value the caller has to interpret.
@@ -442,7 +443,11 @@ impl QueryBackend for ServiceBackend {
             .await
             .map_err(failure)?;
         let envelope = self.sql_envelope(request, &outcome)?;
-        let signal = cursor_signal(outcome.target, outcome.signals.len(), outcome.reads_parquet);
+        let signal = cursor_signal(
+            outcome.target,
+            outcome.signal_tables_named,
+            outcome.reads_parquet,
+        );
         Ok(Draft::new(
             envelope,
             signal,

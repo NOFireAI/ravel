@@ -53,20 +53,26 @@ pub enum NoCursorSignal {
 }
 
 /// The signal a cursor over this statement's result pins, from the outcome's
-/// target, its count of signal lanes, and whether it read a Parquet table.
+/// target, how many signal tables the statement names
+/// (`SqlOutcome::signal_tables_named`), and whether it read a Parquet table.
+///
+/// The count is of the tables the statement names, not of the lanes it
+/// resolved: a statement naming none still resolves the default `samples`
+/// lane, and a cursor pinned to that lane would pin a snapshot the
+/// statement never read.
 pub fn cursor_signal(
     target: TargetSignal,
-    signal_lanes: usize,
+    signal_tables_named: usize,
     reads_parquet: bool,
 ) -> Result<Signal, NoCursorSignal> {
     if reads_parquet {
-        return Err(if signal_lanes == 0 {
+        return Err(if signal_tables_named == 0 {
             NoCursorSignal::Parquet
         } else {
             NoCursorSignal::ParquetJoin
         });
     }
-    match signal_lanes {
+    match signal_tables_named {
         0 => return Err(NoCursorSignal::NoTable),
         1 => {}
         count => return Err(NoCursorSignal::SeveralSignals { count }),
@@ -135,7 +141,7 @@ impl Draft {
             Err(NoCursorSignal::NoTable | NoCursorSignal::Parquet)
         );
         let visibility = &mut self.envelope.visibility;
-        match self.ingest_watermark_hour {
+        match self.ingest_watermark_hour.filter(|_| measured) {
             Some(hour) => {
                 visibility.ingest_watermark_hour = hour.to_string();
                 visibility.resolved_no_segments = false;
@@ -250,18 +256,21 @@ impl Draft {
         let mut placed = envelope.clone();
         placed.presentation.cursor = Some("c".repeat(CURSOR_BOUND - 2));
         let mut fitted = placed.fit(cap);
-        let mut kept = fitted.data.rows.len();
+        let fit_rows = fitted.data.rows.len();
+        let mut kept = fit_rows;
         if let PageOrder::Grouped(same_group) = order {
             kept = complete_groups(&pristine, kept, same_group);
-            let held_back = fitted.data.rows.len() - kept;
+            let held_back = fit_rows - kept;
             fitted.data.rows.truncate(kept);
             fitted.presentation.rows_omitted += held_back as u64;
         }
         let Some(last) = kept.checked_sub(1).and_then(|index| pristine.get(index)) else {
-            return unpaged(
-                envelope,
-                "no complete group of rows equal under the order fits one page".to_string(),
-            );
+            let reason = if fit_rows == 0 {
+                "no row fits one page beside a cursor"
+            } else {
+                "no complete group of rows equal under the order fits one page"
+            };
+            return unpaged(envelope, reason.to_string());
         };
 
         match mint(&pins, last) {
@@ -816,6 +825,41 @@ mod tests {
         assert_eq!(one_group.presentation.cursor, None);
         assert_eq!(one_group.data.rows.len(), 4);
         assert_eq!(one_group.presentation.rows_omitted, 1);
+        assert!(
+            one_group.warnings.contains(
+                &"no cursor: no complete group of rows equal under the order fits one page"
+                    .to_owned()
+            ),
+            "{:?}",
+            one_group.warnings
+        );
+    }
+
+    /// A row of cells nothing can shorten, wider than the cap, is dropped by
+    /// the fit, so a `Total` page keeps no row to mint after. Its warning
+    /// says no row fits, not that no group does: a total order has no
+    /// groups.
+    ///
+    /// FLIP: one wording for both cases tells a `Total` caller its order
+    /// groups rows, which it does not.
+    #[test]
+    fn a_total_page_that_keeps_no_row_says_no_row_fits() {
+        let mut wide = draft(2, 8, |i| i as i128);
+        let row: Row = (0..20_000).map(|_| Cell::Int(i128::MAX)).collect();
+        wide.envelope.data.rows = vec![row.clone(), row];
+        let page = wide.finish_page(&budgets(2), &scope(), PageOrder::Total, |_, _| {
+            panic!("no row kept, nothing to mint after")
+        });
+        assert_eq!(page.status, Status::OkBounded);
+        assert_eq!(page.presentation.cursor, None);
+        assert!(page.data.rows.is_empty());
+        assert_eq!(page.presentation.rows_omitted, 2);
+        assert!(
+            page.warnings
+                .contains(&"no cursor: no row fits one page beside a cursor".to_owned()),
+            "{:?}",
+            page.warnings
+        );
     }
 
     /// A token over the cursor bound is the `internal` failure `fit` states,
@@ -841,33 +885,61 @@ mod tests {
 
     /// The pinned signal of each statement shape, and the watermark wording
     /// it gets: a signal statement with no segments says it resolved none, a
-    /// Parquet one says nothing because it never measured.
+    /// Parquet one or one naming no table says nothing because it never
+    /// measured. Each argument triple is the `(target, signal_tables_named,
+    /// reads_parquet)` the executor reports for the statement named beside
+    /// it; a statement naming no table has target `Metrics`, the default
+    /// lane's.
     ///
     /// FLIP: treating a Parquet join as its signal lane pins a cursor over a
     /// snapshot that does not cover the Parquet rows.
     /// FLIP: setting `resolved_no_segments` for a Parquet-only statement
     /// claims a resolve that never ran.
+    /// FLIP: reporting the default lane's watermark for a statement naming
+    /// no table claims a measurement of a table it never read.
     #[test]
     fn cursor_signal_refuses_every_shape_but_one_signal() {
+        // SELECT * FROM spans
         assert_eq!(
             cursor_signal(TargetSignal::Spans, 1, false),
             Ok(Signal::Spans)
         );
+        // SELECT * FROM a_parquet_table
         assert_eq!(
             cursor_signal(TargetSignal::Parquet, 0, true),
             Err(NoCursorSignal::Parquet)
         );
+        // SELECT * FROM logs JOIN a_parquet_table ...
         assert_eq!(
             cursor_signal(TargetSignal::Logs, 1, true),
             Err(NoCursorSignal::ParquetJoin)
         );
+        // SELECT * FROM logs JOIN spans ...
         assert_eq!(
             cursor_signal(TargetSignal::Logs, 2, false),
             Err(NoCursorSignal::SeveralSignals { count: 2 })
         );
+        // SELECT 1
         assert_eq!(
             cursor_signal(TargetSignal::Metrics, 0, false),
             Err(NoCursorSignal::NoTable)
+        );
+
+        let no_table = Draft::new(
+            Envelope::default(),
+            Err(NoCursorSignal::NoTable),
+            vec![],
+            vec![],
+            Some(472_223),
+            0,
+        );
+        assert!(!no_table.envelope.visibility.resolved_no_segments);
+        assert!(
+            no_table
+                .envelope
+                .visibility
+                .ingest_watermark_hour
+                .is_empty()
         );
 
         let empty = Draft::new(

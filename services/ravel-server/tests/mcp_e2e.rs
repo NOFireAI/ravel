@@ -242,7 +242,7 @@ mod with_mcp {
     use super::*;
 
     use ravel_mcp::budget::{McpBudgetConfig, McpEffectiveBudgets, McpRequestBudgets};
-    use ravel_mcp::draft::{Draft, EstimateComponent, PageOrder, PinScope};
+    use ravel_mcp::draft::{Draft, EstimateComponent, NoCursorSignal, PageOrder, PinScope};
     use ravel_mcp::envelope::FailureClass;
     use ravel_mcp::service::QueryBackend;
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
@@ -1113,6 +1113,97 @@ mod with_mcp {
         assert_eq!(draft.signal, Ok(ravel_types::Signal::Metrics));
         assert!(draft.envelope.visibility.ingest_watermark_hour.is_empty());
         assert!(draft.envelope.visibility.resolved_no_segments);
+
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// A statement naming no table resolves the default `samples` lane, but
+    /// that lane is not a table it read: its draft has no cursor signal, and
+    /// its page reports neither the lane's watermark nor that it resolved no
+    /// segments. The service outcome shows the lane is there to be misread:
+    /// one signal entry, and on the tenant with data, its watermark.
+    ///
+    /// FLIP: classifying from `outcome.signals.len()` gives
+    /// `Ok(Signal::Metrics)` here, and on the empty tenant sets
+    /// `resolved_no_segments`.
+    /// FLIP: filling `signal_tables_named` from `StatementTables::lanes()`
+    /// rather than the named tables reads 1 and gives the same
+    /// `Ok(Signal::Metrics)`.
+    /// FLIP: a draft that writes the default lane's watermark reports hour 3
+    /// on the tenant with data.
+    #[tokio::test]
+    async fn sql_execute_naming_no_table_has_no_cursor_signal() {
+        for hours in [&[][..], &[3][..]] {
+            let (running, backend, service) = sql_backend_over(hours).await;
+            let request = sql_request("SELECT 1 AS x");
+
+            let outcome = service
+                .sql_execute(expected_tenant(), &request)
+                .await
+                .expect("the service executes");
+            assert_eq!(outcome.signals.len(), 1, "the default lane is reported");
+            assert_eq!(outcome.signal_tables_named, 0);
+            assert_eq!(outcome.ingest_watermark_hour, hours.first().copied());
+
+            let draft = backend
+                .sql_execute(expected_tenant(), &request)
+                .await
+                .expect("the adapter executes");
+            assert_eq!(draft.signal, Err(NoCursorSignal::NoTable));
+            let page = finish_unpaged(draft);
+            assert!(!page.visibility.resolved_no_segments, "hours {hours:?}");
+            assert!(page.visibility.ingest_watermark_hour.is_empty());
+            assert!(page.visibility.snapshot_id.is_empty());
+
+            running.shutdown().await.expect("server stops");
+        }
+    }
+
+    /// A statement naming no table can still trip a cap: two constant rows
+    /// over a one-row cap. Under a total order the page is `ok_bounded` with
+    /// no cursor and a warning naming why, and the mint never runs.
+    ///
+    /// FLIP: a cursor signal taken from the default lane mints here and the
+    /// mint panics.
+    #[tokio::test]
+    async fn a_capped_statement_naming_no_table_is_ok_bounded() {
+        let (running, backend, _) = sql_backend_over(&[3]).await;
+
+        let draft = backend
+            .sql_execute(
+                expected_tenant(),
+                &sql_request("SELECT 1 AS x UNION ALL SELECT 2 AS x"),
+            )
+            .await
+            .expect("the adapter executes");
+        let mut budgets = sql_budgets();
+        budgets.max_rows = 1;
+        let scope = PinScope {
+            tenant: expected_tenant(),
+            range_start_ns: 0,
+            range_end_ns: SQL_NOW_NS,
+            min_commit_watermark: Vec::new(),
+        };
+        let page = draft.finish_page(&budgets, &scope, PageOrder::Total, |_, _| {
+            panic!("a statement naming no table must not reach the mint")
+        });
+
+        let envelope = serde_json::to_value(&page).expect("an envelope serializes");
+        assert_eq!(
+            envelope["status"],
+            serde_json::json!("ok_bounded"),
+            "{envelope}"
+        );
+        assert_eq!(page.presentation.cursor, None);
+        assert_eq!(page.data.rows.len(), 1);
+        assert_eq!(page.presentation.rows_omitted, 1);
+        assert!(page.visibility.snapshot_id.is_empty());
+        assert!(
+            page.warnings
+                .contains(&format!("no cursor: {}", NoCursorSignal::NoTable)),
+            "{:?}",
+            page.warnings
+        );
 
         running.shutdown().await.expect("server stops");
     }
