@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
-    CustomResourceDefinition, ValidationRule,
+    CustomResourceDefinition, JSONSchemaPropsOrArray, ValidationRule,
 };
 use kube::CustomResource;
 use kube::CustomResourceExt;
@@ -825,6 +825,14 @@ pub struct QuerySpec {
     /// leave it unchanged; issue #3237 tracks the logs-scan state still uncharged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_headroom_bytes: Option<u64>,
+
+    /// Serves the MCP adapter at `POST /mcp` on the query pods (ADR-1374,
+    /// issue #3648 amendment). Omit, or leave `enabled` false, to render none
+    /// of the MCP flags. Turning the block on or off, or editing it while
+    /// enabled, changes the query Deployment's arguments, so the query pods
+    /// roll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpSpec>,
 }
 
 impl Default for QuerySpec {
@@ -836,8 +844,44 @@ impl Default for QuerySpec {
             distributed_query: None,
             memory_budget_bytes: None,
             memory_headroom_bytes: None,
+            mcp: None,
         }
     }
+}
+
+/// The MCP adapter on the query tier (ADR-1374 decisions 7 and 9).
+///
+/// When `enabled`, the query container runs `--mcp` and
+/// `--mcp-allowed-origins` with `allowedOrigins` comma-joined, plus
+/// `--mcp-max-body-bytes` when `maxBodyBytes` is set. The query pods listen
+/// on `0.0.0.0`, where `ravel-server` refuses `--mcp` with an empty allowlist,
+/// so `enabled: true` requires at least one origin at admission. The flag
+/// does nothing in an image built without the `mcp` cargo feature; the image
+/// built from `main` has it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct McpSpec {
+    /// Whether the query pods serve `POST /mcp`. Defaults to false.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// `Origin` header values the MCP route accepts, each compared whole and
+    /// ignoring ASCII case, for example `https://agents.example.com`. A
+    /// request with an `Origin` not on the
+    /// list is refused with 403. A request with no `Origin` header is
+    /// accepted: non-browser MCP clients send none, so the list governs
+    /// browser clients only. At least one entry is required when `enabled`
+    /// is true. Entries may not be empty or contain a comma, because the list
+    /// renders as one comma-separated flag value. At most 64 entries of at
+    /// most 1024 characters each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_origins: Vec<String>,
+
+    /// Largest MCP request body in bytes; a larger body is refused with 413.
+    /// Unset, no flag renders and the server default (1 MiB) applies.
+    /// Minimum 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<u64>,
 }
 
 /// Distributed query for the query tier (ADR-1689 decision 4).
@@ -1269,6 +1313,7 @@ pub fn ravel_cluster_crd() -> CustomResourceDefinition {
     inject_flush_share_guard(&mut crd);
     inject_storage_auth_guards(&mut crd);
     inject_query_headroom_needs_budget(&mut crd);
+    inject_query_mcp_guards(&mut crd);
     crd
 }
 
@@ -1383,6 +1428,16 @@ fn inject_minimum_bounds(crd: &mut CustomResourceDefinition) {
             .and_then(|p| p.get_mut("memoryBudgetBytes"))
         {
             budget.minimum = Some(1.0);
+        }
+        // ravel-server refuses `--mcp-max-body-bytes 0` at startup.
+        if let Some(max_body) = spec_props
+            .get_mut("query")
+            .and_then(|q| q.properties.as_mut())
+            .and_then(|p| p.get_mut("mcp"))
+            .and_then(|m| m.properties.as_mut())
+            .and_then(|p| p.get_mut("maxBodyBytes"))
+        {
+            max_body.minimum = Some(1.0);
         }
         // ravel-server refuses a zero `--maintain-interval-secs` and a zero
         // `--fold-interval-secs` at startup, since either would run its loop
@@ -1716,6 +1771,82 @@ fn inject_query_headroom_needs_budget(crd: &mut CustomResourceDefinition) {
         query.x_kubernetes_validations = Some(rules);
     }
 }
+
+/// Message surfaced when `spec.query.mcp` is enabled with no origin.
+const QUERY_MCP_NEEDS_ORIGINS_MESSAGE: &str = "query.mcp.enabled needs at least one \
+    query.mcp.allowedOrigins entry: the query pods listen on 0.0.0.0, and ravel-server \
+    refuses to start --mcp on a non-loopback listener with an empty allowlist";
+
+/// The CEL rule refusing `enabled: true` without an origin. Both fields carry
+/// serde defaults and may be absent from the stored object, so each is
+/// `has()`-guarded.
+const QUERY_MCP_NEEDS_ORIGINS_RULE: &str = "!has(self.enabled) || !self.enabled || \
+    (has(self.allowedOrigins) && size(self.allowedOrigins) > 0)";
+
+/// Message surfaced when an `allowedOrigins` entry is empty or holds a comma.
+const QUERY_MCP_ORIGIN_SHAPE_MESSAGE: &str = "query.mcp.allowedOrigins entries must be \
+    non-empty and contain no comma: the list renders as one comma-joined \
+    --mcp-allowed-origins value, which ravel-server splits on commas";
+
+/// The CEL rule refusing an empty or comma-bearing origin entry.
+const QUERY_MCP_ORIGIN_SHAPE_RULE: &str = "!has(self.allowedOrigins) || \
+    self.allowedOrigins.all(o, size(o) > 0 && !o.contains(','))";
+
+/// Attach the two MCP rules to the `query.mcp` property, appended to any rules
+/// already there. They sit on `mcp` rather than `query`, so a cluster that
+/// omits the block has nothing to evaluate.
+fn inject_query_mcp_guards(crd: &mut CustomResourceDefinition) {
+    let rules = [
+        (
+            QUERY_MCP_NEEDS_ORIGINS_RULE,
+            QUERY_MCP_NEEDS_ORIGINS_MESSAGE,
+        ),
+        (QUERY_MCP_ORIGIN_SHAPE_RULE, QUERY_MCP_ORIGIN_SHAPE_MESSAGE),
+    ]
+    .map(|(rule, message)| ValidationRule {
+        rule: rule.to_string(),
+        message: Some(message.to_string()),
+        ..Default::default()
+    });
+    for version in &mut crd.spec.versions {
+        let Some(mcp) = version
+            .schema
+            .as_mut()
+            .and_then(|s| s.open_api_v3_schema.as_mut())
+            .and_then(|root| root.properties.as_mut())
+            .and_then(|p| p.get_mut("spec"))
+            .and_then(|spec| spec.properties.as_mut())
+            .and_then(|p| p.get_mut("query"))
+            .and_then(|query| query.properties.as_mut())
+            .and_then(|p| p.get_mut("mcp"))
+        else {
+            continue;
+        };
+        let mut existing = mcp.x_kubernetes_validations.take().unwrap_or_default();
+        existing.extend(rules.iter().cloned());
+        mcp.x_kubernetes_validations = Some(existing);
+        // The API server refuses a CRD whose rule's estimated cost exceeds
+        // its budget, and an unbounded list of unbounded strings is costed at
+        // the request size limit, so the shape rule needs both bounds.
+        if let Some(origins) = mcp
+            .properties
+            .as_mut()
+            .and_then(|p| p.get_mut("allowedOrigins"))
+        {
+            origins.max_items = Some(QUERY_MCP_MAX_ORIGINS);
+            if let Some(JSONSchemaPropsOrArray::Schema(item)) = origins.items.as_mut() {
+                item.max_length = Some(QUERY_MCP_MAX_ORIGIN_LENGTH);
+            }
+        }
+    }
+}
+
+/// Most `query.mcp.allowedOrigins` entries admitted.
+const QUERY_MCP_MAX_ORIGINS: i64 = 64;
+
+/// Longest `query.mcp.allowedOrigins` entry admitted, in characters. An
+/// origin is a scheme, a host of at most 253 characters and a port.
+const QUERY_MCP_MAX_ORIGIN_LENGTH: i64 = 1024;
 
 /// Message surfaced when `storage.s3` names no credential Secret under
 /// `auth: static`.
@@ -2887,6 +3018,159 @@ mod tests {
             "both admitted"
         );
         assert!(query_headroom_cel_admits(None, None), "neither admitted");
+    }
+
+    /// Rust mirror of [`QUERY_MCP_NEEDS_ORIGINS_RULE`], with `None` for an
+    /// absent field. No CEL evaluator runs here, so the schema test below pins
+    /// the exact expression this mirrors.
+    fn query_mcp_origins_cel_admits(enabled: Option<bool>, origins: Option<&[&str]>) -> bool {
+        enabled != Some(true) || origins.is_some_and(|o| !o.is_empty())
+    }
+
+    /// Rust mirror of [`QUERY_MCP_ORIGIN_SHAPE_RULE`].
+    fn query_mcp_origin_shape_cel_admits(origins: Option<&[&str]>) -> bool {
+        origins.is_none_or(|o| o.iter().all(|e| !e.is_empty() && !e.contains(',')))
+    }
+
+    /// The `query.mcp` schema node of a CRD rendered as JSON.
+    fn query_mcp_json(crd: &serde_json::Value) -> &serde_json::Value {
+        &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]
+            ["query"]["properties"]["mcp"]
+    }
+
+    /// Issue #3648: the two MCP rules sit on the `query.mcp` property with
+    /// their exact text and messages, not on `query`, both in
+    /// [`ravel_cluster_crd`] and in the checked-in `crd.yaml`;
+    /// `maxBodyBytes` carries minimum 1 and `allowedOrigins` the bounds the
+    /// rule cost estimate needs. The mirrors are then evaluated over the
+    /// admission cases.
+    ///
+    /// FLIP: injecting the rules on `query` instead of `query.mcp`, or
+    /// dropping the `size(...) > 0` check from either rule, fails the exact
+    /// rule assertions.
+    #[test]
+    fn query_mcp_rules_sit_on_the_mcp_property() {
+        let crd = serde_json::to_value(ravel_cluster_crd()).expect("serialize CRD");
+        let checked_in: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../deploy/k8s/operator/crd.yaml"
+        )))
+        .expect("crd.yaml is JSON");
+        let expected = serde_json::json!([
+            {
+                "rule": "!has(self.enabled) || !self.enabled || \
+                    (has(self.allowedOrigins) && size(self.allowedOrigins) > 0)",
+                "message": QUERY_MCP_NEEDS_ORIGINS_MESSAGE,
+            },
+            {
+                "rule": "!has(self.allowedOrigins) || \
+                    self.allowedOrigins.all(o, size(o) > 0 && !o.contains(','))",
+                "message": QUERY_MCP_ORIGIN_SHAPE_MESSAGE,
+            },
+        ]);
+        for (source, crd) in [("ravel_cluster_crd", &crd), ("crd.yaml", &checked_in)] {
+            let mcp = query_mcp_json(crd);
+            assert_eq!(mcp["x-kubernetes-validations"], expected, "{source}");
+            assert_eq!(
+                mcp["properties"]["maxBodyBytes"]["minimum"],
+                serde_json::json!(1.0),
+                "{source}"
+            );
+            let origins = &mcp["properties"]["allowedOrigins"];
+            assert_eq!(origins["maxItems"], serde_json::json!(64), "{source}");
+            assert_eq!(
+                origins["items"]["maxLength"],
+                serde_json::json!(1024),
+                "{source}"
+            );
+            let query_rules = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+                ["spec"]["properties"]["query"]["x-kubernetes-validations"]
+                .to_string();
+            assert!(
+                !query_rules.contains("allowedOrigins"),
+                "{source}: query carries no MCP rule"
+            );
+        }
+
+        let origins: &[&str] = &["https://a.example"];
+        let none: &[&str] = &[];
+        assert!(
+            !query_mcp_origins_cel_admits(Some(true), None),
+            "enabled, origins absent: refused"
+        );
+        assert!(
+            !query_mcp_origins_cel_admits(Some(true), Some(none)),
+            "enabled, origins empty: refused"
+        );
+        assert!(
+            query_mcp_origins_cel_admits(Some(true), Some(origins)),
+            "enabled with origins: admitted"
+        );
+        assert!(
+            query_mcp_origins_cel_admits(Some(false), None),
+            "disabled, no origins: admitted"
+        );
+        assert!(
+            query_mcp_origins_cel_admits(None, None),
+            "enabled absent: admitted"
+        );
+
+        assert!(query_mcp_origin_shape_cel_admits(None), "absent admitted");
+        assert!(
+            query_mcp_origin_shape_cel_admits(Some(&["https://a.example", "http://b:8080"])),
+            "plain origins admitted"
+        );
+        assert!(
+            !query_mcp_origin_shape_cel_admits(Some(&["https://a.example,https://b.example"])),
+            "comma refused"
+        );
+        assert!(
+            !query_mcp_origin_shape_cel_admits(Some(&["https://a.example", ""])),
+            "empty entry refused"
+        );
+    }
+
+    /// Issue #3648: `spec.query.mcp` reads from its camelCase wire form, an
+    /// omitted block stays `None` and is not serialized back, and a block
+    /// with only `enabled` defaults the rest.
+    ///
+    /// FLIP: dropping `rename_all = "camelCase"` from [`McpSpec`] leaves
+    /// `allowedOrigins` and `maxBodyBytes` unread and fails this test.
+    #[test]
+    fn query_mcp_reads_its_camel_case_wire_form() {
+        let query: QuerySpec = serde_json::from_value(serde_json::json!({
+            "mcp": {
+                "enabled": true,
+                "allowedOrigins": ["https://a.example"],
+                "maxBodyBytes": 4096,
+            },
+        }))
+        .expect("deserialize");
+        assert_eq!(
+            query.mcp,
+            Some(McpSpec {
+                enabled: true,
+                allowed_origins: vec!["https://a.example".to_string()],
+                max_body_bytes: Some(4096),
+            })
+        );
+
+        let omitted: QuerySpec =
+            serde_json::from_value(serde_json::json!({})).expect("deserialize");
+        assert_eq!(omitted, QuerySpec::default());
+        assert!(omitted.mcp.is_none());
+        let back = serde_json::to_value(&omitted).expect("serialize");
+        assert!(back.get("mcp").is_none());
+
+        let bare: McpSpec =
+            serde_json::from_value(serde_json::json!({ "enabled": true })).expect("deserialize");
+        assert_eq!(
+            bare,
+            McpSpec {
+                enabled: true,
+                ..McpSpec::default()
+            }
+        );
     }
 
     #[test]
