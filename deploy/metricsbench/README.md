@@ -30,15 +30,19 @@ exits).
 ### The object store
 
 The stack's S3 endpoint is s3s-fs, the file-system backend of the s3s project,
-at the `s3s-fs-0.17.0-ravel.2` release of the `NOFireAI/s3s` fork (ADR-0927
-amendments 2026-10-29 and 2026-11-01). It replaced RustFS, which sat at its
-one-CPU cap while ravel-server idled, so the store bounded the Ravel row.
-Figures measured on RustFS are not compared with figures measured on s3s-fs.
-`ravel.2` is `ravel.1` plus `TCP_NODELAY` on every accepted connection:
-`ravel.1` held each response's body until the client acknowledged its head,
-which added a 40 ms delayed-ACK stall to every query that touched storage.
-Figures measured on `ravel.1` are not compared with figures measured on
-`ravel.2`. The ClickBench entry still runs `ravel.1`.
+at the `s3s-fs-0.17.0-ravel.3` release of the `NOFireAI/s3s` fork (ADR-0927
+amendments 2026-10-29, 2026-11-01 and 2026-11-02). It replaced RustFS, which
+sat at its one-CPU cap while ravel-server idled, so the store bounded the
+Ravel row. Figures measured on RustFS are not compared with figures measured
+on s3s-fs. `ravel.2` is `ravel.1` plus `TCP_NODELAY` on every accepted
+connection: `ravel.1` held each response's body until the client acknowledged
+its head, which added a 40 ms delayed-ACK stall to every query that touched
+storage. `ravel.3` is `ravel.2` plus atomic conditional writes: `ravel.2`
+checked `If-None-Match` and `If-Match` before streaming the body and published
+the body and its checksum sidecar separately, so concurrent conditional
+writers could each succeed and a body could be left beside another write's
+stored checksum. Figures measured on one release are not compared with
+figures measured on another. The ClickBench entry still runs `ravel.1`.
 
 No image carries the binary. `run.sh`'s `fetch-s3s-fs` step downloads the
 release asset for the Docker engine's arch (`s3s-fs-linux-x86_64` or
@@ -58,8 +62,8 @@ pinned values:
 
 | Asset arch | sha256 |
 |---|---|
-| `x86_64` | `159464c7e5a3b5658c1d3fb890b0ec6db0b3bdf40812832a25886a1af2c165ce` |
-| `aarch64` | `631494fbf5508e7694b4e941c2049cd89cb58feb838eb03bdbb3dc998c60772c` |
+| `x86_64` | `99592a8a64cbb773c34aee9966537eb4d1091d9a91b70699220f1f34dd4b384e` |
+| `aarch64` | `92d7bbbb29bd4c5aee00b5f1c280c1402e799ed8a28f497e5ba813f1ebc3eecc` |
 
 The binary is linked against glibc and runs on the same
 `gcr.io/distroless/cc-debian12:nonroot` digest the root `Dockerfile` builds

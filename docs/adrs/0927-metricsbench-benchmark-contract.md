@@ -1001,7 +1001,8 @@ Decision: the portable stack's local object store is s3s-fs, the
 file-system backend of the s3s project. The binary is the
 `s3s-fs-0.17.0-ravel.1` release of the `NOFireAI/s3s` fork, checked against
 that release's SHA256SUMS, the same build the ClickBench entry runs (the
-portable stack now runs `ravel.2`; see the TCP_NODELAY amendment below). It keeps
+portable stack now runs `ravel.3`; see the TCP_NODELAY amendment and the
+conditional-write amendment below). It keeps
 RustFS's resource envelope, one CPU and 2 GiB, so the store implementation is
 the only thing that changes, and both Ravel and Mimir use it. The envelope
 and the binary's checksum are disclosed beside the other frozen settings.
@@ -1090,7 +1091,8 @@ store's port showed one 40.4 to 41.0 ms stall per query, each after a
 measurements.
 
 Decision: the portable stack runs `s3s-fs-0.17.0-ravel.2` of the
-`NOFireAI/s3s` fork. It is `ravel.1` plus one commit that sets `TCP_NODELAY`
+`NOFireAI/s3s` fork (now `ravel.3`; see the conditional-write amendment
+below). It is `ravel.1` plus one commit that sets `TCP_NODELAY`
 on every accepted connection, built by the fork's release workflow and
 checked against that release's SHA256SUMS. The envelope, one CPU and 2 GiB,
 does not change.
@@ -1102,3 +1104,43 @@ figures measured on `ravel.1` are not compared with figures measured on
 Comparator rows are affected too, since Mimir writes to the same store, and
 are re-measured on `ravel.2` like Ravel's. Decision 10 is unchanged: only
 the real-S3 lane produces publishable Ravel performance and cost figures.
+
+## Amendment (2026-11-02): the portable stack's s3s-fs build makes conditional writes atomic
+
+<!-- amendment-supersedes: phrase="the portable stack runs `s3s-fs-0.17.0-ravel.2`" pointer="conditional-write amendment" -->
+
+Context. On 2026-11-02 the frozen `cardinality` run on the portable stack
+ingested nothing (#2821, Box F). Within 20 s of ravel-server starting, 48
+concurrent create-if-absent writes of one tenant's provisioning record lost
+with `already_exists`, and from then on every read of that record failed
+Ravel's CRC64-NVME check. `ravel.2` checked `If-None-Match` and `If-Match`
+once, before streaming the body, and then renamed the body and its two
+sidecar files (attributes, and the internal info holding the stored
+checksums and ETag) into place one at a time. So several conditional
+writers that arrived together could each succeed, and one write's body could
+be left beside another write's stored checksum. Reads loaded the body and
+its checksum with no ordering against a writer. Issue #3652 holds the
+evidence and the code-level cause.
+
+Decision: the portable stack runs `s3s-fs-0.17.0-ravel.3` of the
+`NOFireAI/s3s` fork. It is `ravel.2` plus NOFireAI/s3s#2, three tests and
+the fix they pin:
+
+- every object maps onto one of a fixed set of locks;
+- a write stages its body and both sidecars as temporary files, checks its
+  conditions under the object's write lock, and renames all three in one
+  blocking task that holds the lock;
+- a read opens the body and loads both sidecars under the read lock.
+
+It is built by the fork's release workflow and checked against that
+release's SHA256SUMS. The envelope, one CPU and 2 GiB, does not change.
+
+Consequences. Ravel and comparator figures measured on `ravel.2` or earlier
+are not compared with figures measured on `ravel.3`; each run's provenance
+records the store release and its sha256. Every earlier s3s-fs run used a
+store where concurrent conditional writes could each succeed. The 13
+earlier `ci` runs on s3s-fs recorded at most one losing create-if-absent
+write each and no corrupted read, but no earlier run was checked for this
+race beyond that counter. The ClickBench entry still runs `ravel.1`, which
+has the same race. Decision 10 is unchanged: only the real-S3 lane produces
+publishable Ravel performance and cost figures.
