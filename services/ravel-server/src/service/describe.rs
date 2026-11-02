@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::StatusCode;
 use ravel_catalog::{Catalog, MetricKind};
 use ravel_query::QueryError;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
@@ -19,7 +20,8 @@ use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{Signal, TenantHash, TimeRange};
 
 use super::{
-    LiveCost, QueryService, ServiceError, core, finish_usage, query_span, record_span_cost,
+    ApiError, LiveCost, QueryService, ServiceError, ServiceErrorKind, core, finish_usage,
+    query_span, record_span_cost,
 };
 
 /// The most metric families one page carries, and the page size of a request
@@ -28,6 +30,15 @@ pub const MAX_FAMILIES_PER_PAGE: usize = 100;
 
 /// Why a non-metrics signal's family page is empty.
 pub const FAMILIES_METRICS_ONLY: &str = "metric families are recorded for the metrics signal only";
+
+/// Why a metrics family page is empty when the tenant has no metric metadata
+/// record.
+pub const FAMILIES_NO_RECORD: &str = "the tenant has no metric metadata record";
+
+/// The message of the failure a metrics call returns when the metric
+/// metadata read failed, rather than an empty family page.
+pub const FAMILIES_READ_FAILED: &str =
+    "the metric metadata read failed, so the metric families are unknown, not empty; retry";
 
 /// The `audit` language of a describe call.
 const AUDIT_LANGUAGE: &str = "describe_data";
@@ -203,7 +214,9 @@ pub struct DescribeData {
     /// page's. The record is not pinned between pages, so two pages of one
     /// sequence can report different totals.
     pub families_total: usize,
-    /// Why the family page is empty by construction; `None` for metrics.
+    /// Why the family page is empty by construction: the signal is not
+    /// metrics, or the tenant has no metric metadata record. `None` for a
+    /// metrics tenant whose record was read.
     pub families_absent_reason: Option<&'static str>,
     /// The greatest ingest-hour bucket among the resolved segments, in unix
     /// hours; `None` when the resolve found no segment.
@@ -247,6 +260,13 @@ impl QueryService {
     /// An unknown signal and a zero limit are refused before the permit is
     /// taken, and a process built without [`DescribeState`] refuses every call
     /// as unsupported.
+    ///
+    /// A metrics call whose metric metadata read failed is refused as
+    /// [`super::ServiceErrorKind::Unavailable`] with [`FAMILIES_READ_FAILED`],
+    /// on the call whose cache miss failed and on every call the metadata
+    /// cache serves from that failed read until a read succeeds. A missing
+    /// record is not a failure: it answers an empty page with
+    /// [`FAMILIES_NO_RECORD`].
     pub async fn describe_data(
         &self,
         tenant_hash: TenantHash,
@@ -377,6 +397,9 @@ async fn describe(
     let (families, families_total, more_families, families_absent_reason) = match signal {
         DescribeSignal::Metrics => {
             let record = state.metadata_cache.get(tenant_hash).await;
+            if record.read_failed() {
+                return Err(families_read_failed());
+            }
             let mut entries: Vec<_> = record.iter().collect();
             entries.sort_by(|a, b| a.family_name.as_bytes().cmp(b.family_name.as_bytes()));
             let mut remaining = entries.iter().filter(|entry| {
@@ -393,7 +416,8 @@ async fn describe(
                 })
                 .collect();
             let more = remaining.next().is_some();
-            (page, entries.len(), more, None)
+            let absent = record.record_absent().then_some(FAMILIES_NO_RECORD);
+            (page, entries.len(), more, absent)
         }
         DescribeSignal::Logs | DescribeSignal::Traces => {
             (Vec::new(), 0, false, Some(FAMILIES_METRICS_ONLY))
@@ -455,6 +479,21 @@ async fn describe(
         resolved_at_ns: clocks.resolve_at_ns,
         accounting: accounting.snapshot(),
     })
+}
+
+/// A metric metadata read that failed, as the retryable class rather than an
+/// empty page the caller would read as "no families". The cache does not say
+/// why the read failed, so a decode failure on a corrupt record is reported
+/// the same way as a store fault.
+fn families_read_failed() -> ServiceError {
+    ServiceError::new(
+        ServiceErrorKind::Unavailable,
+        ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error_type: "unavailable",
+            message: FAMILIES_READ_FAILED.to_string(),
+        },
+    )
 }
 
 fn fixed_columns(signal: DescribeSignal) -> Vec<DescribeColumn> {

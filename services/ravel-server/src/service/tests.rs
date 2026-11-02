@@ -1957,7 +1957,8 @@ mod describe_data {
     use super::*;
     use crate::service::describe::{
         DescribeColumn, DescribeDataRequest, DescribeSignal, DescribeState, EventTimeCoverage,
-        FAMILIES_METRICS_ONLY, IndexedKeys, IndexedKeysSource, MAX_FAMILIES_PER_PAGE,
+        FAMILIES_METRICS_ONLY, FAMILIES_NO_RECORD, FAMILIES_READ_FAILED, IndexedKeys,
+        IndexedKeysSource, MAX_FAMILIES_PER_PAGE,
     };
 
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
@@ -2061,6 +2062,37 @@ mod describe_data {
             inner: MemoryStore::new(),
             resolves: Arc::clone(&resolves),
         });
+        describe_harness_over(limit, declared_columns, store, resolves)
+    }
+
+    /// [`describe_harness`] over a [`FaultStore`] running `plan`, and the
+    /// fault store, so a test can assert its counters.
+    fn describe_harness_with_faults(
+        plan: FaultPlan,
+    ) -> (DescribeHarness, Arc<FaultStore<ResolveCountingStore>>) {
+        let resolves = Arc::new(AtomicU64::new(0));
+        let fault = Arc::new(FaultStore::new(
+            ResolveCountingStore {
+                inner: MemoryStore::new(),
+                resolves: Arc::clone(&resolves),
+            },
+            plan,
+        ));
+        let harness = describe_harness_over(
+            QueryConcurrencyLimit::Unlimited,
+            StaticDeclaredColumns::empty(),
+            Arc::clone(&fault) as Arc<dyn ObjectStoreBackend>,
+            resolves,
+        );
+        (harness, fault)
+    }
+
+    fn describe_harness_over(
+        limit: QueryConcurrencyLimit,
+        declared_columns: StaticDeclaredColumns,
+        store: Arc<dyn ObjectStoreBackend>,
+        resolves: Arc<AtomicU64>,
+    ) -> DescribeHarness {
         let catalog =
             Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
         let cache_clock = Arc::new(CacheClock(AtomicU64::new(
@@ -2401,6 +2433,132 @@ mod describe_data {
             assert!(unique.contains(present), "{present} was skipped");
         }
         assert!(!unique.contains(&"family_050a".to_string()));
+    }
+
+    /// A metrics call whose metadata GET failed is refused as `Unavailable`
+    /// with the read-failed message, not answered as zero families, and so is
+    /// the next call within the horizon, which the cache serves from the
+    /// failed read with no GET. Logs and traces, which read no families,
+    /// answer meanwhile. Once the store recovers and a refresh past the
+    /// horizon replaces the cached entry, the call answers the record's
+    /// families.
+    ///
+    /// FLIP: today's code (no `read_failed` check in `describe`) answers the
+    /// first call with an empty page and `families_total` 0. FLIP: a flag
+    /// that only the miss's snapshot carries, or that the first call clears,
+    /// answers the second call with an empty page. FLIP: a sticky failure
+    /// that ignores the refreshed snapshot refuses the call after recovery.
+    #[tokio::test]
+    async fn a_failed_metadata_read_is_unavailable_until_a_read_succeeds() {
+        use ravel_object_store::fault::Sequence;
+
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Get)
+                .with_key_contains("/m/meta")
+                .then_fault(ScriptedFault::Transient("injected".into()))
+                .then_passthrough(),
+        );
+        let (h, fault) = describe_harness_with_faults(plan);
+        let entries = vec![
+            family("beta_total".to_string()),
+            family("alpha_total".to_string()),
+        ];
+        write_metrics_meta(h.store.as_ref(), &h.tenant_hash, &entries, None)
+            .await
+            .expect("write metrics_meta");
+
+        let first = h
+            .service
+            .describe_data(h.tenant_hash, &request("metrics"))
+            .await
+            .expect_err("a failed metadata read is not an empty page");
+        assert_eq!(first.kind, ServiceErrorKind::Unavailable);
+        assert_eq!(first.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(first.message, FAMILIES_READ_FAILED);
+        assert_eq!(
+            fault.fault_count(Op::Get, FaultKind::Transient),
+            1,
+            "the injected metadata fault fired"
+        );
+
+        let second = h
+            .service
+            .describe_data(h.tenant_hash, &request("metrics"))
+            .await
+            .expect_err("the cached failed read is still a failure");
+        assert_eq!(second.kind, ServiceErrorKind::Unavailable);
+        assert_eq!(second.message, FAMILIES_READ_FAILED);
+        assert_eq!(
+            h.metadata_cache.counters().misses,
+            1,
+            "the second call was served from the cached failed read"
+        );
+
+        for signal in ["logs", "traces"] {
+            let data = h
+                .service
+                .describe_data(h.tenant_hash, &request(signal))
+                .await
+                .unwrap_or_else(|err| panic!("{signal} reads no families: {err:?}"));
+            assert_eq!(data.families_absent_reason, Some(FAMILIES_METRICS_ONLY));
+        }
+
+        h.cache_clock
+            .advance(MetadataCacheConfig::default().refresh_horizon + Duration::from_nanos(1));
+        let mut recovered = false;
+        for _ in 0..1000 {
+            if !h.metadata_cache.get(h.tenant_hash).await.read_failed() {
+                recovered = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(recovered, "the refresh never replaced the failed read");
+
+        let data = h
+            .service
+            .describe_data(h.tenant_hash, &request("metrics"))
+            .await
+            .expect("the recovered read answers");
+        assert_eq!(
+            data.families
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha_total", "beta_total"]
+        );
+        assert_eq!(data.families_total, 2);
+        assert_eq!(data.families_absent_reason, None);
+        assert_eq!(fault.fault_count(Op::Get, FaultKind::Transient), 1);
+    }
+
+    /// A metrics tenant with no metadata record answers an empty page with
+    /// the no-record reason, on the miss and on the cached hit after it.
+    ///
+    /// FLIP: treating an absent record as a failed read refuses the call as
+    /// `Unavailable`. FLIP: dropping the reason answers `None`.
+    #[tokio::test]
+    async fn an_absent_metadata_record_is_an_empty_page_with_its_reason() {
+        let h = describe_harness(
+            QueryConcurrencyLimit::Unlimited,
+            StaticDeclaredColumns::empty(),
+        );
+        for call in ["miss", "hit"] {
+            let data = h
+                .service
+                .describe_data(h.tenant_hash, &request("metrics"))
+                .await
+                .unwrap_or_else(|err| panic!("the {call} answers: {err:?}"));
+            assert!(data.families.is_empty(), "{call}");
+            assert_eq!(data.families_total, 0, "{call}");
+            assert!(!data.more_families, "{call}");
+            assert_eq!(
+                data.families_absent_reason,
+                Some(FAMILIES_NO_RECORD),
+                "{call}"
+            );
+        }
+        assert_eq!(h.metadata_cache.counters().misses, 1);
     }
 
     /// A zero limit is a typed 400 decided before the permit, as an unknown
