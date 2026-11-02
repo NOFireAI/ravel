@@ -78,9 +78,9 @@ and stays conformant.
 ## Score
 
 - Supported and covered: 61
-- Intentionally rejected: 70
+- Intentionally rejected: 73
 - Unclassified / broken: 0
-- **Conformance: 131 / 131 = 100.0%**
+- **Conformance: 134 / 134 = 100.0%**
 
 ## Conformance table
 
@@ -208,8 +208,11 @@ and stays conformant.
 | Write / DDL statement | `DELETE` | `DELETE FROM samples` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `DROP` | `DROP TABLE samples` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `EXPLAIN` | `EXPLAIN SELECT 1` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
+| Write / DDL statement | `FOR SHARE` | `SELECT * FROM samples FOR SHARE` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
+| Write / DDL statement | `FOR UPDATE` | `SELECT * FROM samples FOR UPDATE` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `INSERT` | `INSERT INTO samples VALUES (1, 2.0)` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `PREPARE` | `PREPARE p AS SELECT 1` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
+| Write / DDL statement | `SELECT ... INTO` | `SELECT * INTO t FROM samples` | Intentionally rejected | `ValidationError::WriteInQuery` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `SET` | `SET datafusion.execution.batch_size = 1` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `Transaction control` | `BEGIN TRANSACTION` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `UPDATE` | `UPDATE samples SET value = 1` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |

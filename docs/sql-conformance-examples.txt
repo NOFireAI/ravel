@@ -132,8 +132,11 @@ Write / DDL statement	CREATE VIEW	CREATE VIEW v AS SELECT 1
 Write / DDL statement	DELETE	DELETE FROM samples
 Write / DDL statement	DROP	DROP TABLE samples
 Write / DDL statement	EXPLAIN	EXPLAIN SELECT 1
+Write / DDL statement	FOR SHARE	SELECT * FROM samples FOR SHARE
+Write / DDL statement	FOR UPDATE	SELECT * FROM samples FOR UPDATE
 Write / DDL statement	INSERT	INSERT INTO samples VALUES (1, 2.0)
 Write / DDL statement	PREPARE	PREPARE p AS SELECT 1
+Write / DDL statement	SELECT ... INTO	SELECT * INTO t FROM samples
 Write / DDL statement	SET	SET datafusion.execution.batch_size = 1
 Write / DDL statement	Transaction control	BEGIN TRANSACTION
 Write / DDL statement	UPDATE	UPDATE samples SET value = 1

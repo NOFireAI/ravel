@@ -823,6 +823,21 @@ pub fn registry() -> Vec<Construct> {
             "WITH c AS (SELECT 1) INSERT INTO samples VALUES (1, 2.0)",
             E_WRITE_IN_QUERY,
         ),
+        (
+            "FOR UPDATE",
+            "SELECT * FROM samples FOR UPDATE",
+            E_NOT_READ_ONLY,
+        ),
+        (
+            "FOR SHARE",
+            "SELECT * FROM samples FOR SHARE",
+            E_NOT_READ_ONLY,
+        ),
+        (
+            "SELECT ... INTO",
+            "SELECT * INTO t FROM samples",
+            E_WRITE_IN_QUERY,
+        ),
     ];
     for (name, example, typed_error) in write_stmts {
         out.push(Construct {
