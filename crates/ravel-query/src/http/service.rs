@@ -128,8 +128,8 @@ impl QueryUsageSink for NoopQueryUsageSink {
 /// The drop path has no outcome to read counters from, so it reads them here
 /// instead: a query that fetched objects for two minutes and was then abandoned
 /// records what it actually spent, not zeros. Implemented over `ravel-sql`'s
-/// `LiveAccounting` for the SQL path and over a live `QueryAccounting` handle
-/// for the exemplars path.
+/// `LiveAccounting` for the SQL path and over `ravel-server`'s `LiveCost` for
+/// the exemplars path, each summing one handle per attempt.
 pub trait LiveUsage: Send + Sync {
     fn snapshot(&self) -> QueryAccountingSnapshot;
 }

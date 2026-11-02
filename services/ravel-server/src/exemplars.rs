@@ -503,9 +503,9 @@ async fn collect_once(
     now_ns: i64,
     live: &LiveCost,
 ) -> Result<(Vec<ExemplarSeriesJson>, QueryStatsJson), CollectError> {
-    // Each attempt installs its own fresh accounting into the live view, so a
-    // cancelled or timed-out query records what the attempt that was running
-    // had spent, and a discarded first attempt's counters do not bleed into it.
+    // Each attempt adds its own fresh accounting to the live view, so a
+    // cancelled or timed-out query records what every attempt had spent, while
+    // this attempt's stats and request budget read its own counters alone.
     let accounting = QueryAccounting::new();
     live.install(&accounting);
     let (snapshot, origins) = state
@@ -578,10 +578,12 @@ async fn collect_once(
         }
     }
 
+    let spend = accounting.snapshot();
     let stats = QueryStatsJson {
         segments_fetched: snapshot.segments.len() as u64,
         segments_pruned: snapshot.segments_pruned,
-        accounting: QueryAccountingJson::from_snapshot(&accounting.snapshot()),
+        accounting: QueryAccountingJson::from_snapshot(&spend),
+        spend,
     };
     Ok((group_by_series(collected), stats))
 }
@@ -1262,6 +1264,18 @@ pub struct QueryStatsJson {
     #[serde(rename = "segmentsPruned")]
     segments_pruned: u64,
     accounting: QueryAccountingJson,
+    /// The snapshot `accounting` renders, kept whole for the cost and usage
+    /// records a completed request folds.
+    #[serde(skip)]
+    spend: QueryAccountingSnapshot,
+}
+
+impl QueryStatsJson {
+    /// The spend of the attempt that produced this result. A discarded
+    /// earlier attempt is not in it.
+    pub(crate) fn spend(&self) -> QueryAccountingSnapshot {
+        self.spend
+    }
 }
 
 /// Actual per-request store/decode counters, the ADR-0044 cost surface. Every
