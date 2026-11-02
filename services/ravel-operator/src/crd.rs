@@ -393,7 +393,7 @@ pub struct GatewaySpec {
     /// stalled flush cannot block co-resident tenants beyond this many permits.
     /// Ingest runs only in the gateway tier (the query and maintain modes never
     /// enter the ingest path), so this is a gateway-only field.
-    /// Omit to keep `ravel-server`'s own default of 4 (ADR-2708 D3). The CRD
+    /// Omit to keep `ravel-server`'s own default of 8 (ADR-2708 D3). The CRD
     /// schema enforces a minimum of 1 at admission: `ravel-server` rejects 0
     /// as a flush deadlock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -405,7 +405,7 @@ pub struct GatewaySpec {
     /// leaves a permit for co-resident tenants whenever there is more than
     /// one. Gateway-only, like `maxInflightFlushes`. The CRD schema enforces a
     /// minimum of 1 at admission, and a CEL rule on `gateway` refuses a value
-    /// above `maxInflightFlushes` (4 when that is omitted), which
+    /// above `maxInflightFlushes` (8 when that is omitted), which
     /// `ravel-server` would otherwise reject at startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_inflight_flushes_per_tenant: Option<u32>,
@@ -1679,16 +1679,16 @@ fn inject_canonical_tenant_backend_guard(crd: &mut CustomResourceDefinition) {
 /// Message surfaced to a user whose per-tenant flush share exceeds the
 /// shard's permit count (ADR-2708 D3).
 const FLUSH_SHARE_ABOVE_PERMITS_MESSAGE: &str = "gateway.maxInflightFlushesPerTenant \
-    must not exceed gateway.maxInflightFlushes (ravel-server's default of 4 when unset); \
+    must not exceed gateway.maxInflightFlushes (ravel-server's default of 8 when unset); \
     ravel-server refuses the pair at startup";
 
 /// The CEL rule refusing a per-tenant flush share above the permit count, kept
 /// as a constant so the injected rule and the logic unit test cannot drift.
-/// The `4` is `ravel-server`'s `--max-inflight-flushes` default, which applies
+/// The `8` is `ravel-server`'s `--max-inflight-flushes` default, which applies
 /// when `maxInflightFlushes` is omitted.
 const FLUSH_SHARE_ABOVE_PERMITS_RULE: &str = "!has(self.maxInflightFlushesPerTenant) || \
     self.maxInflightFlushesPerTenant <= \
-    (has(self.maxInflightFlushes) ? self.maxInflightFlushes : 4)";
+    (has(self.maxInflightFlushes) ? self.maxInflightFlushes : 8)";
 
 /// Attach the flush-share guard to the `gateway` property, appended like the
 /// other gateway guards. `ravel-server` rejects a share above its permit count
@@ -2919,7 +2919,7 @@ mod tests {
     fn flush_share_cel_admits(permits: Option<u32>, share: Option<u32>) -> bool {
         match share {
             None => true,
-            Some(share) => share <= permits.unwrap_or(4),
+            Some(share) => share <= permits.unwrap_or(8),
         }
     }
 
@@ -2963,7 +2963,9 @@ mod tests {
         assert!(!flush_share_cel_admits(Some(2), Some(4)), "2/4 refused");
         assert!(flush_share_cel_admits(Some(4), Some(3)), "4/3 admitted");
         assert!(flush_share_cel_admits(Some(4), Some(4)), "4/4 admitted");
-        assert!(!flush_share_cel_admits(None, Some(5)), "unset/5 refused");
+        assert!(!flush_share_cel_admits(None, Some(9)), "unset/9 refused");
+        assert!(flush_share_cel_admits(None, Some(8)), "unset/8 admitted");
+        assert!(flush_share_cel_admits(None, Some(5)), "unset/5 admitted");
         assert!(flush_share_cel_admits(None, Some(3)), "unset/3 admitted");
         assert!(flush_share_cel_admits(Some(2), None), "2/unset admitted");
         assert!(flush_share_cel_admits(None, None), "unset/unset admitted");

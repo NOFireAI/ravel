@@ -525,7 +525,11 @@ backstop. Those flushes take five to ten times longer to encode, which keeps
 the tenant at its share. At a fixed 150k lines/s offered on 8 vCPU, every
 window at 4 permits (share 4) stored about 115k. At 8 (share 8), two of four
 instance windows held about 152k with no drops (#3645, comments 6574471828
-and 6575073635).
+and 6575073635). That measurement set the share to 8; the default ships 7 of
+8, one permit below it. The mechanism turns on the tenant reaching its share,
+and 7 of 8 permits is still twice the 3 of 4 a tenant had before, so the
+measurement supports the default but does not pin it; the next measured run
+uses the shipped default.
 
 What 8 does not do: two of those four windows still entered the overloaded
 state, so the share refusal and the backstop can still sustain it. The fix for

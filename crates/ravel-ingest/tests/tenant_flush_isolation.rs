@@ -875,12 +875,14 @@ async fn stalled_span_flush_does_not_stop_a_coresident_tenants_age_trigger() {
 // ---------------------------------------------------------------------------
 //
 // The tests above pin that a stalled flush does not park the actor. These pin
-// that it does not take every flush permit either: with the default four
-// permits a tenant owns a share of three, so one tenant whose PUTs are all held
-// leaves a permit for its neighbours on the same shard.
+// that it does not take every flush permit either: with four permits a tenant
+// owns a share of three, so one tenant whose PUTs are all held leaves a permit
+// for its neighbours on the same shard.
 
-/// The default permit count, and the share it resolves to (`N - 1`).
-const DEFAULT_PERMITS: u32 = 4;
+/// The permit count these tests run at, and the share the unset per-tenant
+/// flag resolves it to (`N - 1`). Set explicitly: the counts below are written
+/// against it, while the shipped default is pinned in `IngestConfig`'s tests.
+const PERMITS: u32 = 4;
 const SHARE: usize = 3;
 
 /// Past `max_flush_delay` (50 ms) on every tick.
@@ -902,7 +904,8 @@ async fn settles(mut probe: impl FnMut() -> bool) -> bool {
     probe()
 }
 
-/// One shard, the default permit count and share, and only the age trigger.
+/// One shard, [`PERMITS`] permits with the unset share, and only the age
+/// trigger.
 fn share_config(max_queued_flushes: usize) -> IngestConfig {
     let config = IngestConfig {
         shard_count: 1,
@@ -910,9 +913,9 @@ fn share_config(max_queued_flushes: usize) -> IngestConfig {
         max_flush_delay: Duration::from_millis(50),
         flush_tick: Duration::from_millis(10),
         max_queued_flushes,
+        max_inflight_flushes: PERMITS,
         ..IngestConfig::default()
     };
-    assert_eq!(config.max_inflight_flushes, DEFAULT_PERMITS);
     assert_eq!(config.max_inflight_flushes_per_tenant, None);
     config
 }
