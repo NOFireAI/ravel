@@ -1678,7 +1678,7 @@ What you see:
   view inside its grace window, without a store read. Each failed read logs
   one ERROR line naming the tenant hash, the signal, the cause and the delay
   before the next read, and counts once under
-  `ravel_ingest_provisioning_read_failures_total{signal,cause}`, where
+  `ravel_ingest_provisioning_read_failures_total{mode,signal,cause}`, where
   `cause` is `store` (the GET failed) or `decode` (the record did not decode
   or failed validation). That counter counts reads;
   `ravel_ingest_stale_provisioning_flushes_total` counts the refused writes,
