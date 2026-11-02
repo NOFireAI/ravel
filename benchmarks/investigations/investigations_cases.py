@@ -1,0 +1,3073 @@
+#!/usr/bin/env python3
+"""Cases of the selective-investigations harness (issue #3699), run by
+investigations.test.sh. No AWS, no server, no network.
+
+    investigations_cases.py [unittest args]
+    investigations_cases.py --refresh-local-smoke
+    investigations_cases.py --import-local-smoke RUN_DIR
+
+--refresh-local-smoke re-evaluates fixtures/local-smoke/ and rewrites its
+results.local.json.gz and summary.local.txt: run it after a deliberate change
+to evaluate.py, bands.toml or statements.toml, and review the diff of
+summary.local.txt before committing it.
+
+--import-local-smoke replaces fixtures/local-smoke/ with the inputs of the
+local run box/run.sh wrote to RUN_DIR (run.toml, and calls.jsonl, truth.json
+and every stamp gzipped with mtime 0), then refreshes it. Nothing in the
+fixture is written by hand.
+"""
+
+import copy
+import gzip
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+EVALUATE = os.path.join(HERE, "evaluate.py")
+GEN = os.path.join(HERE, "gen_corpus.py")
+STATEMENTS = os.path.join(HERE, "statements.toml")
+BANDS = os.path.join(HERE, "bands.toml")
+README = os.path.join(HERE, "README.md")
+ADR = os.path.join(HERE, "..", "..", "docs", "adrs", "3692-selective-investigations-logs-traces.md")
+HITS_TRUTH = os.path.join(HERE, "hits.truth.json")
+SMOKE = os.path.join(HERE, "fixtures", "local-smoke")
+BOX = os.path.join(HERE, "box")
+PY = sys.executable
+# investigations.test.sh passes the bash running it, so a run under bash 3.2
+# runs every box/ script under 3.2 too.
+BASH = os.environ.get("INV_BASH", "bash")
+HOUR_NS = 3600 * 1_000_000_000
+STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight", "compaction_done",
+          "erasure_in_flight", "many_parts_24", "many_parts_744", "many_parts_2160")
+SMOKE_STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight",
+                "erasure_in_flight", "many_parts_24")
+UNSUPPORTED = "unsupported-on-this-build"
+GUARD = "refused-by-guard"
+REFUSAL_1000 = ("server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of "
+                "1000 tokens; simplify the statement")
+
+
+def gen(out, traces=1000, hours=2, seed=7, *extra):
+    subprocess.run([PY, GEN, "--traces", str(traces), "--hours", str(hours), "--seed", str(seed),
+                    "--spans-per-trace", "10", "--logs-per-trace", "5", "--format", "jsonl",
+                    "--out", out, *extra], check=True, capture_output=True)
+    with open(os.path.join(out, "truth.json")) as f:
+        truth = json.load(f)
+    rows = {}
+    for sig in ("spans", "logs"):
+        with open(os.path.join(out, f"{sig}.jsonl")) as f:
+            rows[sig] = [json.loads(line) for line in f]
+    return truth, rows
+
+
+SMALL_CORPUS = {"traces": 1000, "hours": 2, "seed": 7, "start_hour": 498248, "tail_traces": 500, "tail_seed": 8,
+                "tail_start_hour": 498250,
+                "many_parts": {"24": {"traces": 240, "hours": 24, "seed": 31, "start_hour": 498222}}}
+# The corpus.json the committed smoke run stamped.
+SMOKE_CORPUS = {"traces": 20000, "hours": 2, "seed": 7, "start_hour": 498257, "tail_traces": 10000, "tail_seed": 8,
+                "tail_start_hour": 498259,
+                "many_parts": {"24": {"traces": 240, "hours": 24, "seed": 31, "start_hour": 498231,
+                                      "ingest_hour_start": 498232}}}
+
+
+def merged_truth(out, c=SMALL_CORPUS):
+    """truth.json as run.sh builds it from a corpus.json stamp: the base corpus,
+    the tail hour and each many_parts_N corpus, folded by inv.py merge-truth."""
+    gen(os.path.join(out, "base"), c["traces"], c["hours"], c["seed"], "--start-hour", str(c["start_hour"]))
+    gen(os.path.join(out, "tail"), c["tail_traces"], 1, c["tail_seed"], "--start-hour", str(c["tail_start_hour"]),
+        "--tail")
+    subs = ["--sub", f"tail={os.path.join(out, 'tail', 'truth.json')}"]
+    for n, mp in sorted(c["many_parts"].items()):
+        d = os.path.join(out, f"mp{n}")
+        gen(d, mp["traces"], mp["hours"], mp["seed"], "--start-hour", str(mp["start_hour"]))
+        subs += ["--sub", f"many_parts_{n}={os.path.join(d, 'truth.json')}"]
+    path = os.path.join(out, "truth.json")
+    subprocess.run([PY, os.path.join(BOX, "lib", "inv.py"), "merge-truth", "--base",
+                    os.path.join(out, "base", "truth.json"), *subs, "--out", path], check=True, capture_output=True)
+    with open(path) as f:
+        return json.load(f)
+
+
+def read_jsonl(path):
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def write_jsonl(path, lines):
+    with open(path, "w") as f:
+        for line in lines:
+            f.write(json.dumps(line, sort_keys=True) + "\n")
+
+
+def gunzip_to(src, dst):
+    with gzip.open(src, "rb") as f, open(dst, "wb") as g:
+        g.write(f.read())
+
+
+def smoke_run(dst):
+    """The committed local-smoke run's inputs, unpacked into dst."""
+    os.makedirs(os.path.join(dst, "stamps"))
+    shutil.copy(os.path.join(SMOKE, "run.toml"), dst)
+    for name in sorted(os.listdir(os.path.join(SMOKE, "stamps"))):
+        if not name.endswith(".gz"):
+            raise AssertionError(f"fixture stamp {name} is not gzipped; re-import the run")
+        gunzip_to(os.path.join(SMOKE, "stamps", name), os.path.join(dst, "stamps", name[:-3]))
+    gunzip_to(os.path.join(SMOKE, "calls.jsonl.gz"), os.path.join(dst, "calls.jsonl"))
+    gunzip_to(os.path.join(SMOKE, "truth.json.gz"), os.path.join(dst, "truth.json"))
+    return dst
+
+
+def evaluate(run, out, bands=BANDS, evaluate_py=EVALUATE):
+    """(exit code, results, summary text) of one evaluate.py run."""
+    p = subprocess.run([PY, evaluate_py, "--run", run, "--out-dir", out, "--statements", STATEMENTS,
+                        "--bands", bands, "--hits-truth", HITS_TRUTH], capture_output=True, text=True)
+    res = text = None
+    for name in os.listdir(out) if os.path.isdir(out) else []:
+        if name.startswith("results."):
+            with open(os.path.join(out, name)) as f:
+                res = json.load(f)
+        elif name.startswith("summary."):
+            with open(os.path.join(out, name)) as f:
+                text = f.read()
+    return p.returncode, res, text or p.stdout + p.stderr
+
+
+def figure(res, fid):
+    hits = [f for f in res["figures"] if f["id"] == fid]
+    assert len(hits) == 1, f"{fid} appears {len(hits)} times"
+    return hits[0]
+
+
+def load_module(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# A bands file every figure of which the local smoke run passes: one counter
+# figure per kind (statement answer, fold report, cost) and one timing figure
+# whose target no run meets, so only the lane decides its verdict.
+PASS_BANDS = """
+[[row]]
+key = "row_t1"
+adr_row = 1
+check = "case"
+target = "case"
+miss = "case"
+source = "predicted"
+requires_tenant = "inv"
+requires_states = ["folded_leaves"]
+
+[[row.figure]]
+name = "spans_1_rows_exact"
+statement = "spans_in_1"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "present_rows_exact"
+statement = "logs_request_id_present"
+state = "folded_leaves"
+metric = "cold.rows_exact"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "spans_leaves"
+statement = "fold"
+state = "folded_leaves"
+transition = "leaf_rebuild"
+metric = "fold.inv.spans.leaves_written"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "cost_figures"
+statement = "all"
+state = "folded_leaves"
+metric = "cost.figures_without_basis"
+lane = "counter"
+target_if = "v == 0"
+
+[[row.figure]]
+name = "spans_1_wall"
+statement = "spans_in_1"
+state = "folded_leaves"
+metric = "cold.wall_p50_s"
+lane = "timing"
+target_if = "v < 0"
+"""
+
+
+MATRIX_BANDS = PASS_BANDS + """
+[[row]]
+key = "row_t2"
+adr_row = 13
+check = "case"
+target = "case"
+miss = "case"
+source = "predicted"
+requires_tenant = "inv"
+
+[[row.figure]]
+name = "mixed_rows_exact"
+statement = "all"
+state = "mixed"
+metric = "matrix.state_rows_exact"
+lane = "counter"
+target_if = "v == 1"
+"""
+
+
+class Workdir(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def path(self, *parts):
+        return os.path.join(self.tmp, *parts)
+
+    def pass_bands(self, text=PASS_BANDS):
+        p = self.path("bands.toml")
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+
+# --- gen_corpus.py --------------------------------------------------------------
+
+
+class Corpus(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.truth, cls.rows = gen(os.path.join(cls._tmp.name, "s1"))
+        cls.truth10, cls.rows10 = gen(os.path.join(cls._tmp.name, "s10"), 1000, 2, 7, "--scale", "10")
+        # 25,000 log rows span four BLOCK_ROWS blocks, the fewest that give
+        # every needle tier its own block count.
+        cls.truthb, cls.rowsb = gen(os.path.join(cls._tmp.name, "b1"), 5000, 2, 7)
+        cls.truthb10, cls.rowsb10 = gen(os.path.join(cls._tmp.name, "b10"), 5000, 2, 7, "--scale", "10")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def hour(self, truth, ts):
+        return ts // HOUR_NS - truth["generator"]["start_hour"]
+
+    def roots(self, rows):
+        return {r["trace_id"]: r for r in rows["spans"] if r["parent_span_id"] is None}
+
+    def test_rows_recounted_from_the_data(self):
+        for truth, rows, traces in ((self.truth, self.rows, 1000), (self.truth10, self.rows10, 10000)):
+            self.assertEqual(len(rows["spans"]), traces * 10)
+            self.assertEqual(len(rows["logs"]), traces * 5)
+            self.assertEqual(truth["rows_written"], {"spans": traces * 10, "logs": traces * 5})
+
+    def test_scale_10_adds_exactly_nine_times_the_unplanted_rows(self):
+        self.assertEqual(self.truth["unplanted_rows"], {"spans": 0, "logs": 0, "noise_traces": 0})
+        self.assertEqual(self.truth10["unplanted_rows"], {"spans": 90000, "logs": 45000, "noise_traces": 9000})
+        base = {json.dumps(r, sort_keys=True) for r in self.rows["spans"]}
+        self.assertTrue(base <= {json.dumps(r, sort_keys=True) for r in self.rows10["spans"]})
+        for key in ("failing_cell", "needles", "in_lists", "saved_traces", "request_id"):
+            self.assertEqual(self.truth[key], self.truth10[key], key)
+
+    def test_hour_is_a_function_of_the_timestamp_and_rows_share_their_trace_hour(self):
+        for truth, rows in ((self.truth, self.rows), (self.truth10, self.rows10)):
+            roots = self.roots(rows)
+            hours = truth["generator"]["hours"]
+            for r in rows["spans"]:
+                h = self.hour(truth, r["start_ts"])
+                self.assertTrue(0 <= h < hours)
+                self.assertEqual(h, self.hour(truth, roots[r["trace_id"]]["start_ts"]))
+                self.assertEqual(self.hour(truth, r["end_ts"]), h)
+            for r in rows["logs"]:
+                self.assertEqual(self.hour(truth, r["ts"]), self.hour(truth, roots[r["trace_id"]]["start_ts"]))
+            for s in truth["saved_traces"]:
+                self.assertEqual(s["hour"], self.hour(truth, s["start_ns"]))
+
+    def test_traces_are_written_sorted_by_start(self):
+        for rows in (self.rows, self.rows10):
+            starts = [r["start_ts"] for r in rows["spans"] if r["parent_span_id"] is None]
+            self.assertEqual(starts, sorted(starts))
+
+    def test_failing_cell_is_exactly_the_planted_traces(self):
+        for truth, rows in ((self.truth, self.rows), (self.truth10, self.rows10)):
+            cell = truth["failing_cell"]
+            got = sorted(r["trace_id"] for r in rows["spans"]
+                         if r["service"] == cell["service"] and r["status_code"] == 2
+                         and cell["hour_start_ns"] <= r["start_ts"] < cell["hour_end_ns"])
+            self.assertEqual(got, cell["trace_ids"])
+            self.assertEqual(cell["count"], 50)
+            self.assertFalse(cell["capped"])
+            self.assertEqual(truth["answers"]["failing_cell.trace_ids"]["row_set"], got)
+            n = sum(1 for r in rows["logs"] if r["trace_id"] in set(got))
+            self.assertEqual(truth["answers"]["failing_cell.logs_count"]["value"], n)
+
+    def test_status_is_an_integer_otlp_code(self):
+        codes = {r["status_code"] for r in self.rows10["spans"]}
+        self.assertEqual(codes, {0, 1, 2})
+        self.assertTrue(all(type(c) is int for c in codes))
+
+    def test_request_id_answers_recount(self):
+        t, logs = self.truth, self.rows["logs"]
+        present = [r for r in logs if r["request_id"] == t["request_id"]["present"]]
+        self.assertEqual(len(present), 1)
+        self.assertEqual(t["answers"]["request_id.present"], {"rows": 1, "row_set": [present[0]["trace_id"]]})
+        self.assertFalse([r for r in logs if r["request_id"] == t["request_id"]["absent"]])
+        counts = {}
+        for r in logs:
+            counts[r["request_id"]] = counts.get(r["request_id"], 0) + 1
+        for size, ids in t["in_lists"]["request_id"].items():
+            self.assertEqual(len(ids), int(size))
+            self.assertEqual(len(set(ids)), int(size))
+            self.assertNotIn(t["request_id"]["present"], ids)
+            self.assertEqual(sum(counts.get(i, 0) for i in ids), int(size))
+            self.assertEqual(t["answers"][f"in_request_id.{size}"]["rows"], int(size))
+
+    def test_trace_id_in_lists_recount(self):
+        t = self.truth
+        for size, ids in t["in_lists"]["trace_id"].items():
+            ids = set(ids)
+            spans = sum(1 for r in self.rows["spans"] if r["trace_id"] in ids)
+            logs = sum(1 for r in self.rows["logs"] if r["trace_id"] in ids)
+            self.assertEqual(t["answers"][f"in_trace_id.{size}.spans"]["rows"], spans)
+            self.assertEqual(t["answers"][f"in_trace_id.{size}.logs"]["rows"], logs)
+            self.assertEqual(spans, int(size) * 10)
+
+    def test_needle_tiers_recount_and_are_distinguishable(self):
+        t, rows = self.truthb, self.rowsb
+        counts = {v: sum(1 for r in rows["logs"] if r["tag"] == v) for v in t["needles"]}
+        self.assertEqual(counts, t["needles"])
+        for v, n in counts.items():
+            self.assertEqual(n, sum(1 for r in rows["logs"] if r["body"].endswith(" " + v)))
+            self.assertEqual(t["answers"][f"needle.{v}"]["value"], n)
+        self.assertEqual(counts["needlerare"], 1)
+        self.assertLess(counts["needlerare"], counts["needlesparse"])
+        self.assertLess(counts["needlesparse"], counts["needlecommon"])
+
+    def test_needle_blocks_recount_within_20_percent(self):
+        # Item 7: tiers are ordered by blocks touched, and a recount over the
+        # written file in BLOCK_ROWS-row blocks agrees with truth within 20 %.
+        for truth, rows in ((self.truthb, self.rowsb), (self.truthb10, self.rowsb10)):
+            br = truth["generator"]["block_rows"]
+            self.assertEqual(br, 8192)
+            nb = dict(truth["needle_blocks"])
+            want = nb.pop("any")
+            got = len({i // br for i, r in enumerate(rows["logs"]) if r["tag"] in nb})
+            self.assertLessEqual(abs(got - want), 0.2 * want, ("any", got, want))
+            for v, want in nb.items():
+                got = len({i // br for i, r in enumerate(rows["logs"]) if r["tag"] == v})
+                self.assertLessEqual(abs(got - want), 0.2 * want, (v, got, want))
+            self.assertEqual(nb["needlerare"], 1)
+            self.assertLess(nb["needlerare"], nb["needlesparse"])
+            self.assertLess(nb["needlesparse"], nb["needlecommon"])
+            # One row per block: the planted row count equals the block count.
+            self.assertEqual(nb, truth["needles"])
+
+    def test_needle_tiers_are_one_tenth_percent_and_ten_percent_of_blocks(self):
+        spec = importlib.util.spec_from_file_location("gen_corpus", GEN)
+        g = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(g)
+        self.assertEqual(g.BLOCK_ROWS, 8192)
+        n_blocks = -(-100_000_000 // g.BLOCK_ROWS)
+        got = g.needle_block_counts(100_000_000)
+        self.assertEqual(got["needlerare"], 1)
+        self.assertEqual(got["needlesparse"], round(0.001 * n_blocks))
+        self.assertEqual(got["needlecommon"], round(0.10 * n_blocks))
+
+    def test_under_one_block_plants_no_needle(self):
+        # 5,000 log rows fill less than one block, so no needle row exists
+        # and every needle answer is 0.
+        for truth in (self.truth, self.truth10):
+            self.assertEqual(truth["needles"], {"needlecommon": 0, "needlerare": 0, "needlesparse": 0})
+            for v in truth["needles"]:
+                self.assertEqual(truth["answers"][f"needle.{v}"]["value"], 0)
+        self.assertFalse([r for r in self.rows["logs"] if r["tag"] is not None])
+
+    def test_tail_corpus_plants_its_own_request_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            truth, rows = gen(d, 200, 1, 8, "--tail")
+        self.assertTrue(truth["generator"]["tail"])
+        self.assertEqual(truth["request_id"]["present"], "req-planted-tail-0001")
+        hit = [r for r in rows["logs"] if r["request_id"] == "req-planted-tail-0001"]
+        self.assertEqual(len(hit), 1)
+        self.assertFalse(any(r["request_id"] == "req-planted-present-0001" for r in rows["logs"]))
+        self.assertEqual(truth["answers"]["request_id.present"]["row_set"], [hit[0]["trace_id"]])
+
+    def test_erasure_victim_is_read_by_no_statement(self):
+        with tempfile.TemporaryDirectory() as d:
+            truth, rows = gen(d, 3000, 4, 9)
+        v = truth["erasure_victim"]
+        self.assertIsNotNone(v)
+        row = [r for r in rows["logs"] if r["request_id"] == v["request_id"]]
+        self.assertEqual(len(row), 1)
+        self.assertEqual(row[0]["trace_id"], v["trace_id"])
+        self.assertIsNone(row[0]["tag"])
+        busy = {s["trace_id"] for s in truth["saved_traces"]} | set(truth["failing_cell"]["trace_ids"])
+        busy |= {t for ids in truth["in_lists"]["trace_id"].values() for t in ids}
+        self.assertNotIn(v["trace_id"], busy)
+        self.assertNotIn(v["request_id"], {r for ids in truth["in_lists"]["request_id"].values() for r in ids})
+        self.assertNotEqual(self.hour(truth, row[0]["ts"]), truth["failing_cell"]["hour"])
+
+    def test_saved_trace_answers_recount(self):
+        for n, s in enumerate(self.truth["saved_traces"]):
+            ids = sorted(r["span_id"] for r in self.rows["spans"] if r["trace_id"] == s["trace_id"])
+            self.assertEqual(self.truth["answers"][f"saved_trace.{n}.spans"], {"rows": 10, "row_set": ids})
+
+    def test_journey_c_build_sides_recount(self):
+        for truth, rows in ((self.truth, self.rows), (self.truth10, self.rows10)):
+            roots = self.roots(rows)
+            for k, jc in truth["journey_c"].items():
+                build = {tid for tid, r in roots.items() if jc["start_ns"] <= r["start_ts"] < jc["cut_ns"]}
+                self.assertEqual(len(build), jc["build"])
+                self.assertEqual(jc["capped"], jc["build"] < int(k))
+                n = sum(1 for r in rows["logs"] if r["trace_id"] in build)
+                self.assertEqual(truth["answers"][f"journey_c.{k}"]["value"], n)
+                self.assertEqual(truth["answers"][f"journey_c.{k}"]["capped"], jc["capped"])
+        self.assertTrue(self.truth["journey_c"]["10240"]["capped"])
+        self.assertFalse(self.truth["journey_c"]["1"]["capped"])
+
+    def test_capped_is_real(self):
+        with tempfile.TemporaryDirectory() as d:
+            truth, _ = gen(d, 60, 2, 7)
+        cell = truth["failing_cell"]
+        self.assertTrue(cell["capped"])
+        self.assertEqual(cell["count"], len(cell["trace_ids"]))
+        self.assertLess(cell["count"], 50)
+        self.assertTrue(truth["answers"]["in_trace_id.100.spans"]["capped"])
+        self.assertEqual(truth["answers"]["in_trace_id.100.spans"]["rows"], 600)
+        self.assertFalse(self.truth["answers"]["in_trace_id.1000.spans"]["capped"])
+
+    def test_seeded_and_deterministic(self):
+        with tempfile.TemporaryDirectory() as d:
+            gen(d)
+            for name in ("truth.json", "spans.jsonl", "logs.jsonl"):
+                with open(os.path.join(d, name), "rb") as a, open(os.path.join(self._tmp.name, "s1", name), "rb") as b:
+                    self.assertEqual(a.read(), b.read(), name)
+
+    def test_mappings_parse_and_name_real_columns(self):
+        for sig in ("spans", "logs"):
+            with open(os.path.join(self._tmp.name, "s1", f"{sig}.mapping.toml"), "rb") as f:
+                m = tomllib.load(f)[sig]
+            fields = set(self.rows[sig][0])
+            cols = [v for k, v in m.items() if k.endswith("_column")]
+            cols += [a["column"] for a in m.get("resource_attribute", []) + m.get("attribute", [])]
+            self.assertTrue(cols)
+            self.assertTrue(set(cols) <= fields, set(cols) - fields)
+            self.assertEqual([a["key"] for a in m["resource_attribute"]], ["service.name"])
+        with open(os.path.join(self._tmp.name, "s1", "spans.mapping.toml"), "rb") as f:
+            self.assertEqual(tomllib.load(f)["spans"]["status_code_column"], "status_code")
+
+
+# --- statements.toml and bands.toml ---------------------------------------------
+
+
+class Statements(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with open(STATEMENTS, "rb") as f:
+            cls.st = tomllib.load(f)["statement"]
+        with open(BANDS, "rb") as f:
+            cls.bands = tomllib.load(f)
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.truth = merged_truth(cls._tmp.name)
+        spec = importlib.util.spec_from_file_location("inv", os.path.join(BOX, "lib", "inv.py"))
+        cls.inv = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.inv)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_fields(self):
+        ids = [s["id"] for s in self.st]
+        self.assertEqual(len(ids), len(set(ids)))
+        for s in self.st:
+            self.assertIn(s["tenant"], ("inv", "hits"), s["id"])
+            self.assertIn(s["kind"], ("trace_get", "sql"), s["id"])
+            self.assertTrue(set(s["states"]) <= set(STATES), s["id"])
+            self.assertIn(s.get("window", "none"), ("none", "1h", "narrow", "wide"), s["id"])
+            if s["kind"] == "sql" and not s.get("corpus_id") and not s.get("control"):
+                self.assertTrue(s.get("sql"), s["id"])
+
+    def test_every_truth_key_exists(self):
+        with open(HITS_TRUTH) as f:
+            hits = json.load(f)
+        for s in self.st:
+            if s["tenant"] == "hits":
+                self.assertIn(s["truth_key"], hits, s["id"])
+                continue
+            t, prefix = self.inv.sub_truth(self.truth, s.get("truth_sub"))
+            if s.get("requires") and not t.get(s["requires"]):
+                continue
+            runs = range(len(t["saved_traces"])) if s.get("per_run") == "saved_trace" else [0]
+            for run in runs:
+                self.assertIn(prefix + s["truth_key"].replace("{run}", str(run)), self.truth["answers"], s["id"])
+
+    def test_object_ranges_reads_every_data_object(self):
+        # Item 3: the ranges stamp lists every .rseg of the tenant and signal,
+        # not commit records, provenance or the other signal's objects.
+        tenant = "a" * 32
+        keys = os.path.join(self._tmp.name, "keys.tsv")
+        with open(keys, "w") as f:
+            for size, key in ((10, f"t/{tenant}/s/l0/0000/b.rseg"), (20, f"t/{tenant}/s/l0/0001/a.rseg"),
+                              (5, f"t/{tenant}/s/c/0000/x.commit"), (3, f"t/{tenant}/s/prov"),
+                              (7, f"t/{tenant}/l/l0/0000/c.rseg"), (9, f"t/{'b' * 32}/s/l0/0000/d.rseg")):
+                f.write(f"{size}\t{key}\n")
+        seen = []
+
+        def run_cli(argv, stop_at=None):
+            seen.append(argv[-1])
+            lo = 100 if argv[-1].endswith("a.rseg") else 200
+            return [f"min_start_ts_ns: {lo}", f"max_end_ts_ns: {lo + 50}"] + (
+                [] if argv[-1].endswith("a.rseg") else ["min_trace_id: 00"])
+
+        old, self.inv.run_cli = self.inv.run_cli, run_cli
+        try:
+            got = self.inv.object_ranges(["ravel-cli"], keys, tenant, "spans")
+        finally:
+            self.inv.run_cli = old
+        self.assertEqual(got, [
+            {"key": f"t/{tenant}/s/l0/0000/b.rseg", "bytes": 10, "min_ns": 200, "max_ns": 250},
+            {"key": f"t/{tenant}/s/l0/0001/a.rseg", "bytes": 20, "min_ns": 100, "max_ns": 150},
+        ])
+        self.assertEqual(seen, [f"t/{tenant}/s/l0/0000/b.rseg", f"t/{tenant}/s/l0/0001/a.rseg"])
+
+    def test_needle_totals_null_when_unreadable(self):
+        # Item 5: a sum inv.py cannot vouch for is written null, never 0.
+        def obj(*cols, blocks=4):
+            return {"block_count": blocks, "record_count": 100,
+                    "field_dir": [{"name": "body", "present_blocks": 4, "null_count": 0}, *cols]}
+
+        tag = {"name": "tag", "present_blocks": 2, "null_count": 90}
+        rare = {"name": "needle_rare", "present_blocks": 1, "null_count": 99}
+        got = self.inv.needle_totals([obj(tag, rare), obj(tag)])
+        self.assertEqual((got["block_count"], got["tag_present_blocks"], got["needle_rare_present_blocks"],
+                          got["needle_rare_null_count"]), (8, 4, 1, 99))
+        # A column no object lists is unknown, not absent.
+        self.assertEqual((got["needle_sparse_present_blocks"], got["needle_common_present_blocks"]), (None, None))
+        got = self.inv.needle_totals([obj(tag, {"name": "needle_rare", "null_count": 99}), obj(tag, rare)])
+        self.assertEqual((got["needle_rare_present_blocks"], got["needle_rare_null_count"]), (None, 198))
+        self.assertEqual(got["tag_present_blocks"], 4)
+        for bad in ({"block_count": 4, "record_count": 100, "field_dir": []}, obj(tag, blocks=None)):
+            got = self.inv.needle_totals([obj(tag, rare), bad])
+            self.assertEqual(set(got.values()), {None}, bad)
+
+    def test_evaluator_window_matches_the_plan(self):
+        # Item 3: the evaluator's window for a candidate count is the one
+        # inv.py's plan sent.
+        ev = load_module(EVALUATE, "evaluate_window")
+        st = next(s for s in self.st if s["id"] == "spans_lookup_1h")
+        for run in range(len(self.truth["saved_traces"])):
+            start_s, end_s = self.inv.window_bounds(st, self.truth, run, 0)
+            start, end = ev.call_window_ns(st, self.truth, {"try": run})
+            self.assertEqual((round(start / 1e9, 6), round(end / 1e9, 6)), (round(start_s, 6), round(end_s, 6)))
+
+    def test_every_placeholder_fills(self):
+        for s in self.st:
+            t, _ = self.inv.sub_truth(self.truth, s.get("truth_sub"))
+            if s.get("sql") and not (s.get("requires") and not t.get(s["requires"])):
+                self.inv.fill(s["sql"], self.inv.placeholders(t, 0))
+
+    def test_erasure_victim_needs_a_corpus_with_an_unread_row(self):
+        # The small corpus's 1000-key lists name every trace, so it has no
+        # victim and logs_erasure_victim plans as not-run; the box's corpus has one.
+        self.assertIsNone(self.truth["erasure_victim"])
+        truth, _ = gen(os.path.join(self._tmp.name, "victim"), 3000, 2, 7)
+        self.assertEqual(truth["answers"]["erasure_victim.present"]["rows"], 1)
+
+    def test_real_column_names(self):
+        for s in self.st:
+            sql = s.get("sql", "")
+            self.assertIsNone(re.search(r"\bservice\s*=", sql), s["id"])
+            self.assertIsNone(re.search(r"\bstatus\s*=", sql), s["id"])
+
+    def test_three_statements_run_warm(self):
+        """docs/internal/bench-reports.md: 43 of the 46 statements are cold_only."""
+        self.assertEqual(len(self.st), 46)
+        self.assertEqual([s["id"] for s in self.st if not s.get("cold_only")],
+                         ["spans_lookup_norange", "spans_lookup_1h", "logs_trace_1h"])
+
+    def test_required_statements(self):
+        by = {s["id"]: s for s in self.st}
+        for size in ("1", "10", "100", "1000"):
+            self.assertIn("IN (", by[f"spans_in_{size}"]["sql"])
+            self.assertIn("IN (", by[f"logs_request_in_{size}"]["sql"])
+        for k in ("1", "102", "1024", "10240"):
+            self.assertEqual(by[f"journey_c_{k}"]["truth_key"], f"journey_c.{k}")
+        self.assertEqual(by["logs_trace_norange"]["window"], "none")
+        self.assertEqual(by["q20_hits"]["tenant"], "hits")
+        # Item 11: the 1000-key lists are sent; the server's refusal is the
+        # measured outcome, not a static skip.
+        for sid in ("spans_in_1000", "logs_request_in_1000", "logs_trace_in_1000"):
+            self.assertNotIn("unsupported_reason", by[sid], sid)
+
+    def test_q20_oracle_is_the_unfolded_answer(self):
+        # Item 19: q20's rows are judged against its own unfolded call; the
+        # pre-registered row count is a separate, reported figure.
+        by = {s["id"]: s for s in self.st}
+        self.assertEqual(by["q20_hits"]["oracle"], "unfolded")
+        row5 = {f["name"]: f for f in next(r for r in self.bands["row"] if r["key"] == "row_05")["figure"]}
+        self.assertEqual(row5["rows_exact"]["metric"], "cold.rows_exact")
+        self.assertEqual(row5["rows_match_unfolded"]["metric"], "cold.rows_match_state.unfolded")
+        self.assertEqual((row5["rows_predicted"]["metric"], row5["rows_predicted"]["target_if"]),
+                         ("cold.max.rows", "v == 4"))
+
+    @staticmethod
+    def guard_units(sql):
+        """complexity_guard's scan for the statements here: one unit per token
+        start, a word run or a quoted literal one token, any other character
+        one token. An X'..' literal is the X run plus the quoted literal."""
+        n = i = 0
+        while i < len(sql):
+            c = sql[i]
+            if c.isspace():
+                i += 1
+                continue
+            n += 1
+            if c == "'":
+                i = sql.index("'", i + 1) + 1
+            elif c.isalnum() or c in "_$":
+                while i < len(sql) and (sql[i].isalnum() or sql[i] in "_$"):
+                    i += 1
+            else:
+                i += 1
+        return n
+
+    def test_in_list_caps_from_the_complexity_guard(self):
+        # Item 9: an X list holds at most 330 keys (3n + 8) and a quoted list
+        # at most 496 (2n + 8) under MAX_STATEMENT_COMPLEXITY = 1,000. Kills a
+        # cap stated from 2 units per X element (495) or from 1,000 / 2.
+        with open(os.path.join(HERE, "..", "..", "crates", "ravel-sql", "src", "complexity_guard.rs")) as f:
+            guard = f.read().splitlines()
+        self.assertEqual(guard[256], "pub const MAX_STATEMENT_COMPLEXITY: usize = 1_000;")
+        self.assertIn("count > MAX_STATEMENT_COMPLEXITY", guard[380])
+        self.assertIn("scan(sql, MAX_STATEMENT_COMPLEXITY)", guard[379])
+        self.assertEqual(guard[639].strip(), "count += 1;")
+        self.assertIn("if c == '\\''", guard[673])
+        self.assertTrue(any("BackslashEscaped" in line for line in guard[673:684]))
+        by = {x["id"]: x for x in self.st}
+        caps = {}
+        for sid, elem in (("spans_in_1000", "X'{:032x}'"), ("logs_trace_in_1000", "X'{:032x}'"),
+                          ("logs_request_in_1000", "'req-{:016x}-000'")):
+            sql = by[sid]["sql"]
+            fill = lambda n: re.sub(r"\{[a-z_0-9]+\}", ", ".join(elem.format(k) for k in range(n)), sql)
+            per = 3 if elem.startswith("X") else 2
+            for n in (1, 2, 330):
+                self.assertEqual(self.guard_units(fill(n)), per * n + 8, (sid, n))
+            caps[sid] = max(n for n in range(1, 1001) if self.guard_units(fill(n)) <= 1000)
+            self.assertGreater(self.guard_units(fill(1000)), 1000, sid)
+            self.assertGreater(self.guard_units(fill(1001)), 1000, sid)
+            self.assertTrue(by[sid].get("expect_refusal_on_main"), sid)
+            self.assertTrue(by[sid.replace("1000", "1001")].get("expect_refusal_on_main"), sid)
+        self.assertEqual(caps, {"spans_in_1000": 330, "logs_trace_in_1000": 330, "logs_request_in_1000": 496})
+        for doc in (README, STATEMENTS):
+            with open(doc) as f:
+                text = " ".join(f.read().split())
+            self.assertIn("330", text, doc)
+            self.assertIn("496", text, doc)
+            self.assertIn("3n + 8", text, doc)
+            self.assertIn("2n + 8", text, doc)
+
+    def adr_band_rows(self):
+        with open(ADR) as f:
+            lines = f.read().splitlines()
+        header = "| check | target | miss | source |"
+        self.assertEqual(lines.count(header), 1)
+        head = lines.index(header)
+        self.assertEqual(lines[head + 1], "|---|---|---|---|")
+        # The table is the one under the Acceptance heading, wherever the ADR
+        # puts it: the nearest heading above it.
+        above = next(x for x in reversed(lines[:head]) if x.startswith("#"))
+        self.assertTrue(above.startswith("## Acceptance"), above)
+        rows = []
+        for line in lines[head + 2:]:
+            if not line.startswith("|"):
+                break
+            cells = [c.strip() for c in line.strip().strip("|").split(" | ")]
+            self.assertEqual(len(cells), 4, line[:60])
+            rows.append(cells)
+        return head + 1, rows
+
+    def test_band_text_is_the_adr_table_verbatim(self):
+        # Item 17: each row's check, target, miss and source text is the ADR
+        # Acceptance table's cell, the check without its "N. " number.
+        _, adr = self.adr_band_rows()
+        self.assertEqual(len(adr), 17)
+        rows = self.bands["row"]
+        for n, (r, cells) in enumerate(zip(rows, adr), 1):
+            num, _, check = cells[0].partition(". ")
+            self.assertEqual(num, str(n))
+            self.assertEqual(r["check"].strip(), check, f"{r['key']}.check")
+            for k, cell in zip(("target", "miss", "source"), cells[1:]):
+                self.assertEqual(r[k].strip(), cell, f"{r['key']}.{k}")
+
+    def test_bands_rows_1_to_17(self):
+        rows = self.bands["row"]
+        self.assertEqual([r["adr_row"] for r in rows], list(range(1, 18)))
+        self.assertEqual([r["key"] for r in rows], [f"row_{n:02d}" for n in range(1, 18)])
+        ids = {s["id"] for s in self.st} | {"fold", "all", "control", "stamp", "derived", "truth"}
+        for r in rows:
+            for k in ("check", "target", "miss", "source"):
+                self.assertTrue(r.get(k), f"{r['key']}.{k}")
+            self.assertNotEqual(r["target"].strip().lower(), "n/a", r["key"])
+            names = [f["name"] for f in r["figure"]]
+            self.assertEqual(len(names), len(set(names)), r["key"])
+            for f in r["figure"]:
+                self.assertIn(f["statement"], ids, f["name"])
+                self.assertIn(f["lane"], ("counter", "timing"), f["name"])
+                for e in ("target_if", "miss_if"):
+                    if e in f:
+                        compile(f[e], f["name"], "eval")
+        for key in ("row_05", "row_06"):
+            r = next(r for r in rows if r["key"] == key)
+            self.assertEqual(r["requires_tenant"], "hits")
+            self.assertEqual({f["statement"] for f in r["figure"]}, {"q20_hits", "stamp"})
+        timed = sorted({r["key"] for r in rows for f in r["figure"] if f["lane"] == "timing"})
+        # Rows 2, 5 and 15 time statements; row 16's slowdown is a timing
+        # figure of a control run this harness does not perform.
+        self.assertEqual(timed, ["row_02", "row_05", "row_15", "row_16"])
+        r16 = next(r for r in rows if r["key"] == "row_16")
+        self.assertEqual({f["statement"] for f in r16["figure"] if f["lane"] == "timing"}, {"control"})
+        for r in rows:
+            for f in r["figure"]:
+                if f["metric"] == "derived":
+                    self.assertTrue(f.get("expr"), f["name"])
+
+
+# --- evaluate.py ------------------------------------------------------------------
+
+
+class LocalSmoke(Workdir):
+    """The committed local-lane run, re-evaluated."""
+
+    def test_byte_identical_reevaluation(self):
+        code, _, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
+        self.assertEqual(code, 1)
+        with gzip.open(os.path.join(SMOKE, "results.local.json.gz"), "rb") as f:
+            want = f.read()
+        with open(self.path("out", "results.local.json"), "rb") as f:
+            self.assertEqual(f.read(), want)
+        for name in ("summary.local.txt",):
+            with open(os.path.join(SMOKE, name), "rb") as a, open(self.path("out", name), "rb") as b:
+                self.assertEqual(a.read(), b.read(), name)
+
+    def test_control_1001_refused_by_guard_on_main(self):
+        """bands.toml row 11: on main the complexity guard refuses the 1,000-key lists."""
+        with gzip.open(os.path.join(SMOKE, "results.local.json.gz"), "rt") as f:
+            res = json.load(f)
+        for name in ("spans_control_1001", "logs_trace_control_1001", "logs_request_control_1001"):
+            f = figure(res, f"row_11.{name}")
+            self.assertEqual((f["status"], f["verdict"]), (GUARD, GUARD), name)
+
+    def test_fixture_is_under_300_kb(self):
+        total = sum(os.path.getsize(os.path.join(d, n)) for d, _, names in os.walk(SMOKE) for n in names)
+        self.assertLess(total, 300_000)
+
+    def test_problems_are_exactly_these(self):
+        _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
+        self.assertEqual(res["verdict"], "fail")
+        self.assertEqual(res["problems"], [
+            "miss row_01.wire_bytes",
+            "miss row_02.wire_bytes",
+            "miss row_03.probe_wire_per_object",
+            "miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count",
+            "miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count",
+            "miss row_08.logs_trace_id_leaf_pct",
+            "miss row_08.logs_request_id_leaf_pct: key cardinality equals the row count",
+            "dead_counter segmentsOpened journey_c_1 folded_leaves",
+            "dead_counter segmentsOpened journey_c_10240 folded_leaves",
+        ])
+
+    def test_every_band_figure_present_exactly_once(self):
+        _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
+        with open(BANDS, "rb") as f:
+            bands = tomllib.load(f)
+        want = [f"{r['key']}.{f['name']}" for r in bands["row"] for f in r["figure"]]
+        self.assertEqual(sorted(f["id"] for f in res["figures"]), sorted(want))
+        covered = set(SMOKE_STATES) | {"fold_advance", "compaction_done"}
+        for f in res["figures"]:
+            self.assertNotIn(f["status"], ("missing", "duplicate"), f["id"])
+            if f["status"] == "not-run":
+                self.assertTrue(f["reason"], f["id"])
+                continue
+            if f["state"] in covered:
+                self.assertIn(f["status"], ("value", UNSUPPORTED, GUARD, "dead_counter"), f["id"])
+            if f["status"] in (UNSUPPORTED, GUARD):
+                self.assertTrue(f["reason"], f["id"])
+
+    def test_states_section(self):
+        # Item 15: every state is listed, run or not, with the reason it was not.
+        _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
+        got = {s["state"]: (s["status"], s.get("reason")) for s in res["states"]}
+        want = {s: ("run", None) for s in SMOKE_STATES + ("fold_advance", "compaction_done")}
+        want.update({s: ("not-run", "not in run.toml states") for s in ("many_parts_744", "many_parts_2160")})
+        self.assertEqual(got, want)
+
+    def test_in_1000_is_sent_and_refused_by_the_complexity_guard(self):
+        # Item 11: the refusal is the server's, observed live, with its text.
+        run = smoke_run(self.path("run"))
+        _, res, _ = evaluate(run, self.path("out"))
+        calls = read_jsonl(os.path.join(run, "calls.jsonl"))
+        for sid in ("spans_in_1000", "logs_trace_in_1000", "logs_request_in_1000"):
+            for state in ("unfolded", "folded_leaves"):
+                lines = [c for c in calls if (c["statement"], c["state"]) == (sid, state)]
+                self.assertEqual(len(lines), 2, (sid, state))
+                for c in lines:
+                    self.assertEqual((c["outcome"], c["http_status"], c["reason"]), (UNSUPPORTED, 400, REFUSAL_1000))
+                    self.assertIn("wall_s", c)
+        # The 1,001-key control has no 1,000-key answer to compare against.
+        for prefix in ("spans", "logs_trace", "logs_request"):
+            f = figure(res, f"row_11.{prefix}_control_1001")
+            self.assertEqual((f["status"], f["value"], f["verdict"], f["reason"]),
+                             (GUARD, None, GUARD, f"refused by the SQL complexity guard: {REFUSAL_1000}"))
+        self.assertEqual(figure(res, "row_11.spans_1000_rows_exact")["reason"], REFUSAL_1000)
+        # Item 8: the guard's refusals are counted apart from unsupported figures.
+        self.assertEqual(res["refusal_classes"], {GUARD: {"figures": 15, "calls": 24},
+                                                  UNSUPPORTED: {"figures": 23, "calls": 0}})
+        guarded = sorted(f["id"] for f in res["figures"] if f["status"] == GUARD)
+        self.assertEqual(len(guarded), 15)
+        self.assertTrue(all(i.startswith("row_11.") for i in guarded), guarded)
+
+    def test_not_requested_rows_listed_beside_the_verdict(self):
+        # Item 9: gated rows run.toml never asked for, in results and summary.
+        _, res, text = evaluate(smoke_run(self.path("run")), self.path("out"))
+        self.assertEqual(res["not_requested"], [
+            {"row": 5, "key": "row_05", "reason": "run.toml hits = false"},
+            {"row": 6, "key": "row_06", "reason": "run.toml hits = false"},
+            {"row": 9, "key": "row_09",
+             "figures": ["covering_parts", "resolve_gets", "leaf_gets", "parts_beyond_ceiling", "rows_exact"],
+             "reason": "run.toml states lacks ['many_parts_744']"},
+            {"row": 10, "key": "row_10", "reason": "run.toml states lacks ['many_parts_2160']"},
+            {"row": 12, "key": "row_12", "reason": "run.toml scales lacks [10, 100]"},
+            {"row": 16, "key": "row_16", "reason": "run.toml hits = false, baseline = false"},
+        ])
+        self.assertEqual(text.splitlines()[:3], [
+            "selective investigations, lane local: fail",
+            "not requested: row 5 (run.toml hits = false); row 6 (run.toml hits = false); row 9 figures "
+            "covering_parts, resolve_gets, leaf_gets, parts_beyond_ceiling, rows_exact (run.toml states lacks "
+            "['many_parts_744']); row 10 (run.toml "
+            "states lacks ['many_parts_2160']); row 12 (run.toml scales lacks [10, 100]); row 16 (run.toml "
+            "hits = false, baseline = false)",
+            "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 23 figure(s), "
+            "0 call(s)",
+        ])
+
+    def test_many_parts_24(self):
+        # Item 9: the smoke's many-parts state is a real 24-part catalog.
+        run = smoke_run(self.path("run"))
+        _, res, _ = evaluate(run, self.path("out"))
+        with open(os.path.join(run, "stamps", "many_parts_24.spans.catalog.json")) as f:
+            doc = json.load(f)
+        self.assertEqual((doc["tenant"], doc["part_count"], len(doc["parts"]), doc["parts_with_leaves"]),
+                         ("mp24", 24, 24, 24))
+        for name, value in (("covering_parts_24", 24), ("rows_exact_24", 1)):
+            f = figure(res, f"row_09.{name}")
+            self.assertEqual((f["value"], f["verdict"]), (value, "pass"), name)
+        self.assertLessEqual(figure(res, "row_09.resolve_gets_24")["value"], 24 + 3)
+        for name in ("covering_parts", "rows_exact"):
+            self.assertEqual(figure(res, f"row_09.{name}")["status"], "not-run")
+
+    def test_section_gets_are_a_from_scratch_rebuild(self):
+        # Item 3: the advancing fold re-reads every entry's sections, old and
+        # new, not only the tail's.
+        _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
+        for sig in ("spans", "logs"):
+            f = figure(res, f"row_07.{sig}_section_gets")
+            tail = figure(res, f"row_07.{sig}_tail_entries")["value"]
+            self.assertEqual((f["value"], f["verdict"]), (2 * tail, "miss"), sig)
+            self.assertEqual(f["reason"], "from-scratch rebuild: section GETs = 2 x entry_count")
+
+    def test_dead_counter_on_row_14(self):
+        # Item 5: segmentsOpened reads 0 on calls that issued scan GETs.
+        run = smoke_run(self.path("run"))
+        _, res, _ = evaluate(run, self.path("out"))
+        for k in ("1", "10240"):
+            f = figure(res, f"row_14.objects_opened_{k}")
+            self.assertEqual((f["status"], f["value"], f["verdict"]), ("dead_counter", 0, "dead_counter"))
+            self.assertIn(f"segmentsOpened 0 while journey_c_{k}/folded_leaves/cold try", f["reason"])
+        calls = [c for c in read_jsonl(os.path.join(run, "calls.jsonl"))
+                 if (c["statement"], c["state"], c["temp"]) == ("journey_c_1", "folded_leaves", "cold")]
+        self.assertTrue(all(sum(p["segmentsOpened"] for p in c["stats"]["phases"]) == 0 for c in calls))
+        self.assertTrue(any(p["phase"] == "scan" and p["s3GetRequests"] >= 1
+                            for c in calls for p in c["stats"]["phases"]))
+
+    def test_probe_wire_per_object_reads_the_ranges_stamp(self):
+        # The smoke stamps unfolded's per-object event ranges, the only state
+        # row 3 reads; check_probe_per_object covers the figure's arithmetic.
+        _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
+        f = figure(res, "row_03.probe_wire_per_object")
+        self.assertEqual((f["status"], f["value"], f["verdict"]), ("value", 65536.0, "miss"))
+
+    def test_probe_wire_per_object_reads_missing_without_ranges(self):
+        # Without the ranges stamp the per-object denominator is missing
+        # rather than guessed.
+        run = smoke_run(self.path("run"))
+        os.remove(os.path.join(run, "stamps", "unfolded.spans.ranges.json"))
+        _, res, _ = evaluate(run, self.path("out"))
+        f = figure(res, "row_03.probe_wire_per_object")
+        self.assertEqual((f["status"], f["value"], f["reason"]), (
+            "missing", None, "stamps/unfolded.spans.ranges.json absent: no per-object event ranges to count the "
+            "window's candidate objects"))
+
+    def test_leaf_share_is_per_field_over_the_census_bytes(self):
+        # Item 14, recomputed by hand from the stamps.
+        run = smoke_run(self.path("run"))
+        _, res, _ = evaluate(run, self.path("out"))
+        census = next(c for c in read_jsonl(os.path.join(run, "stamps", "census.jsonl"))
+                      if c["state"] == "folded_leaves")
+        for label, field in (("spans", "trace_id"), ("logs", "trace_id"), ("logs", "request_id")):
+            with open(os.path.join(run, "stamps", f"folded_leaves.{label}.catalog.json")) as f:
+                doc = json.load(f)
+            leaf = sum(lf["bytes"] for p in doc["parts"] for lf in p["leaves"] if lf["field"] == field)
+            data = census["census"]["tenants"]["inv"]["data"][label]["bytes"]
+            got = figure(res, f"row_08.{label}_{field}_leaf_pct")["value"]
+            self.assertEqual(got, round(100.0 * leaf / data, 9), (label, field))
+        self.assertEqual(figure(res, "row_08.logs_request_id_leaf_pct")["value"], 27.532655509)
+
+    def test_maintenance_per_part_month(self):
+        # Item 13: spans leaf rebuild, 8 section GET x $0.0004/1000 + 1 leaf
+        # PUT x $0.005/1000 = $8.2e-06 over 1 month, plus 219887 leaf bytes
+        # x $0.023/GB-month = $5.057401e-06, over 1 part = $1.3257401e-05,
+        # $1.3257e-05 at evaluate.py's nine decimal places.
+        _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
+        m = next(m for m in res["cost"]["maintenance"] if m["signal"] == "spans")
+        self.assertEqual((m["section_gets"], m["leaf_puts"], m["leaf_bytes"], m["parts"]), (8, 1, 219887, 1))
+        self.assertEqual(m["maintenance_per_part_month"], round(8 * 0.0004 / 1000 + 1 * 0.005 / 1000
+                                                                + 219887 / 1e9 * 0.023, 9))
+        self.assertEqual(m["maintenance_per_part_month"], 1.3257e-05)
+
+    def test_warm_served_counts_cold_calls_the_cache_served(self):
+        # Item 18: a cold call after a restart and page-cache drop can still
+        # be served from the server's own warmed cache; each is listed.
+        run = smoke_run(self.path("run"))
+        _, res, text = evaluate(run, self.path("out"))
+        want = sorted((c["statement"], c["state"], c["try"]) for c in read_jsonl(os.path.join(run, "calls.jsonl"))
+                      if c.get("temp") == "cold" and c["outcome"] == "ok"
+                      and sum(p.get("cacheServedBytes", 0) for p in c["stats"]["phases"]) > 0)
+        self.assertEqual(sorted((w["statement"], w["state"], w["try"]) for w in res["warm_served"]), want)
+        self.assertEqual(len(want), 126)
+        self.assertIn("warm_served", text)
+
+    def test_flow_stamps(self):
+        run = smoke_run(self.path("run"))
+        folds = read_jsonl(os.path.join(run, "stamps", "folds.jsonl"))
+        self.assertEqual([(f["transition"], f["tenant"], f["signal"]) for f in folds], [
+            ("folded_no_leaves", "inv", "spans"), ("folded_no_leaves", "inv", "logs"),
+            ("folded_leaves", "inv", "spans"), ("folded_leaves", "inv", "logs"),
+            ("leaf_rebuild", "inv", "spans"), ("leaf_rebuild", "inv", "logs"),
+            ("fold_advance", "inv", "spans"), ("fold_advance", "inv", "logs"),
+            ("many_parts_24", "mp24", "spans"), ("many_parts_24_leaf_rebuild", "mp24", "spans")])
+        self.assertTrue(all(f["exit"] == 0 for f in folds))
+        rebuilt = [f for f in folds if f["transition"] == "leaf_rebuild"]
+        self.assertTrue(all(f["report"]["leaves_written"] >= 1 for f in rebuilt))
+        trans = read_jsonl(os.path.join(run, "stamps", "transitions.jsonl"))
+        self.assertEqual([t["state"] for t in trans], [
+            "unfolded", "folded_no_leaves", "folded_leaves", "mixed", "fold_advance", "compaction_in_flight",
+            "compaction_done", "erasure_in_flight", "many_parts_24"])
+        mixed = next(t for t in trans if t["state"] == "mixed")
+        self.assertGreater(mixed["ingest_hour"], trans[0]["ingest_hour"])
+        compaction = read_jsonl(os.path.join(run, "stamps", "compaction.jsonl"))
+        self.assertEqual([c["signal"] for c in compaction], ["spans", "logs"])
+        self.assertTrue(all(c["exit"] == 0 and c["report"]["fields"]["compacted"] >= 1 for c in compaction))
+        for name in ("store.json", "corpus.json", "tenants.json", "needle_blocks.json"):
+            self.assertTrue(os.path.exists(os.path.join(run, "stamps", name)), name)
+        calls = read_jsonl(os.path.join(run, "calls.jsonl"))
+        restarts = read_jsonl(os.path.join(run, "stamps", "restarts.jsonl"))
+        cold = {(c["statement"], c["state"], c["try"]) for c in calls if c.get("temp") == "cold"
+                and (c["outcome"] == "ok" or (c["outcome"] == UNSUPPORTED and "http_status" in c))}
+        # One more restart than cold calls: the server restarts once before
+        # the compaction starts, stamped under the state's own name.
+        self.assertEqual(cold | {("compaction_in_flight", "compaction_in_flight", 0)},
+                         {(r["statement"], r["state"], r["try"]) for r in restarts})
+        self.assertEqual(len({r["pid"] for r in restarts}), len(restarts))
+        self.assertTrue(all(isinstance(c.get("stats"), dict) for c in calls if c["outcome"] == "ok"))
+        with open(os.path.join(run, "stamps", "host.json")) as f:
+            self.assertEqual(json.load(f)["rq_stats"], "1")
+
+    def test_needle_blocks_over_ten_written_blocks(self):
+        # Item 10: every logs object inspected; 100,000 rows in 8,192-row
+        # blocks; the rare needle sits in exactly the blocks truth predicts.
+        with open(os.path.join(smoke_run(self.path("run")), "stamps", "needle_blocks.json")) as f:
+            nb = json.load(f)
+        self.assertEqual((nb["objects_inspected"], nb["record_count"], nb["truth_block_rows"]),
+                         (nb["objects_total"], 100_000, 8192))
+        self.assertEqual(nb["block_count"], 14)
+        self.assertGreaterEqual(nb["block_count"], 10)
+        self.assertEqual(nb["needle_rare_present_blocks"], nb["truth_needle_blocks"]["needlerare"])
+        self.assertEqual(nb["needle_rare_present_blocks"], 1)
+        self.assertEqual((nb["needle_sparse_present_blocks"], nb["truth_needle_blocks"]["needlesparse"]), (2, 2))
+        self.assertEqual((nb["needle_common_present_blocks"], nb["truth_needle_blocks"]["needlecommon"]), (3, 3))
+        self.assertEqual((nb["tag_present_blocks"], nb["truth_needle_blocks"]["any"]), (4, 5))
+
+    def test_erasure_in_flight_reads_pending_and_filters_the_victim(self):
+        # Item 12: run.sh's PENDING check saw the request, and the victim's
+        # lookup returned no row under it while the unfolded state returned one.
+        run = smoke_run(self.path("run"))
+        _, res, _ = evaluate(run, self.path("out"))
+        er = read_jsonl(os.path.join(run, "stamps", "erasure.jsonl"))
+        self.assertEqual(len(er), 1)
+        victim = er[0]["victim_request_id"]
+        self.assertEqual(er[0]["status_after"]["fields"]["predicate"], f"request_id={victim}")
+        self.assertEqual(sum(line.endswith(": PENDING") for line in er[0]["status_after"]["lines"]), 1)
+        rows = {(c["state"], c["temp"], c["try"]): c["rows"] for c in read_jsonl(os.path.join(run, "calls.jsonl"))
+                if c["statement"] == "logs_erasure_victim" and c["outcome"] == "ok"}
+        self.assertEqual({k: v for k, v in rows.items() if k[0] == "erasure_in_flight"},
+                         {("erasure_in_flight", "cold", 0): 0, ("erasure_in_flight", "cold", 1): 0})
+        self.assertEqual(rows[("unfolded", "cold", 0)], 1)
+        self.assertEqual(figure(res, "row_13.erasure_in_flight_rows_exact")["value"], 1)
+
+    def test_truth_regenerates_from_the_stamped_corpus(self):
+        run = smoke_run(self.path("run"))
+        with open(os.path.join(run, "stamps", "corpus.json")) as f:
+            c = json.load(f)
+        with open(os.path.join(SMOKE, "run.toml"), "rb") as f:
+            corpus = tomllib.load(f)["corpus"]
+        self.assertEqual((c["traces"], c["hours"], c["seed"]), (corpus["traces"], corpus["hours"], corpus["seed"]))
+        self.assertEqual(c, {**SMOKE_CORPUS, "truth_sha256": c["truth_sha256"]})
+        truth = merged_truth(self.path("g"), c)
+        with gzip.open(os.path.join(SMOKE, "truth.json.gz")) as f:
+            committed = json.load(f)
+        for t in (committed, truth):
+            for doc in (t, *t["sub"].values()):
+                self.assertEqual(doc["generator"].pop("format"), "parquet" if t is committed else "jsonl")
+        self.assertEqual(truth, committed)
+
+
+class Evaluate(Workdir):
+    """evaluate.py cases on mutations of the local smoke run."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_dir = smoke_run(self.path("run"))
+        self.calls_path = os.path.join(self.run_dir, "calls.jsonl")
+        self.calls = read_jsonl(self.calls_path)
+
+    def save_calls(self):
+        write_jsonl(self.calls_path, self.calls)
+
+    def go(self, bands=None, evaluate_py=EVALUATE):
+        out = self.path("out")
+        shutil.rmtree(out, ignore_errors=True)
+        return evaluate(self.run_dir, out, bands or self.pass_bands(), evaluate_py)
+
+    def select(self, statement, state="folded_leaves", temp="cold"):
+        return [c for c in self.calls if c["statement"] == statement and c["state"] == state
+                and c.get("temp") == temp]
+
+    def test_pass(self):
+        code, res, _ = self.go()
+        self.assertEqual((code, res["verdict"], res["problems"]), (0, "pass", []))
+        self.assertEqual(figure(res, "row_t1.spans_1_rows_exact")["verdict"], "pass")
+        self.assertGreaterEqual(figure(res, "row_t1.spans_leaves")["value"], 1)
+
+    def test_timing_is_judged_on_the_s3_lane_only(self):
+        code, res, _ = self.go()
+        self.assertEqual(code, 0)
+        self.assertEqual(figure(res, "row_t1.spans_1_wall")["verdict"], "reported (timing is judged on the s3 lane only)")
+        toml = os.path.join(self.run_dir, "run.toml")
+        with open(toml) as f:
+            text = f.read()
+        with open(toml, "w") as f:
+            f.write(text.replace('lane = "local"', 'lane = "s3"'))
+        code, res, _ = self.go()
+        self.assertEqual((code, res["lane"]), (1, "s3"))
+        self.assertEqual(figure(res, "row_t1.spans_1_wall")["verdict"], "miss")
+
+    def check_missing(self, evaluate_py=EVALUATE):
+        """Failures of the missing-call case; empty when evaluate is right."""
+        self.calls = [c for c in self.calls if not (c["statement"] == "spans_in_1" and c["state"] == "folded_leaves")]
+        self.save_calls()
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = []
+        f = figure(res, "row_t1.spans_1_rows_exact")
+        if code != 1:
+            out.append(f"exit {code}")
+        if f["verdict"] != "missing":
+            out.append(f"verdict {f['verdict']}")
+        if not any(p.startswith("missing row_t1.spans_1_rows_exact") for p in res["problems"]):
+            out.append(f"problems {res['problems']}")
+        return out
+
+    def test_missing_call(self):
+        self.assertEqual(self.check_missing(), [])
+
+    def test_missing_try(self):
+        self.calls = [c for c in self.calls if not (c["statement"] == "spans_in_1" and c["state"] == "folded_leaves"
+                                                    and c.get("temp") == "cold" and c["try"] == 1)]
+        self.save_calls()
+        code, res, _ = self.go()
+        self.assertEqual(code, 1)
+        f = figure(res, "row_t1.spans_1_rows_exact")
+        self.assertEqual((f["status"], f["reason"]), ("missing", "cold tries [1] of spans_in_1 in folded_leaves"))
+
+    def test_duplicate_call(self):
+        self.calls.append(copy.deepcopy(self.select("spans_in_1")[0]))
+        self.save_calls()
+        code, res, _ = self.go()
+        self.assertEqual(code, 1)
+        self.assertEqual(figure(res, "row_t1.spans_1_rows_exact")["verdict"], "duplicate")
+        self.assertIn("duplicate call spans_in_1/folded_leaves/cold try 0", res["problems"])
+
+    def check_duplicate_stamp(self, evaluate_py=EVALUATE):
+        """Failures of the duplicated-fold-stamp case; empty when evaluate is right."""
+        path = os.path.join(self.run_dir, "stamps", "folds.jsonl")
+        folds = read_jsonl(path)
+        extra = copy.deepcopy(next(f for f in folds if f["transition"] == "leaf_rebuild" and f["signal"] == "spans"))
+        extra["report"]["leaves_written"] += 5
+        write_jsonl(path, folds + [extra])
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = []
+        f = figure(res, "row_t1.spans_leaves")
+        if code != 1:
+            out.append(f"exit {code}")
+        if f["verdict"] != "duplicate":
+            out.append(f"verdict {f['verdict']} value {f['value']}")
+        if "duplicate stamps/folds.jsonl leaf_rebuild/inv/spans" not in res["problems"]:
+            out.append(f"problems {res['problems']}")
+        return out
+
+    def test_duplicate_fold_stamp(self):
+        self.assertEqual(self.check_duplicate_stamp(), [])
+
+    def test_band_miss(self):
+        code, res, _ = self.go(self.pass_bands(PASS_BANDS.replace('target_if = "v >= 1"', 'target_if = "v >= 10000"')))
+        self.assertEqual(code, 1)
+        self.assertEqual(figure(res, "row_t1.spans_leaves")["verdict"], "miss")
+        self.assertEqual(res["problems"], ["miss row_t1.spans_leaves"])
+
+    def test_wrong_answer_zero_rows_against_one(self):
+        for c in self.select("logs_request_id_present"):
+            if c["try"] == 0:
+                c["rows"], c["values"] = 0, []
+        self.save_calls()
+        code, res, _ = self.go()
+        self.assertEqual(code, 1)
+        self.assertIn("wrong_answer logs_request_id_present/folded_leaves/cold try 0: rows 0 expected 1", res["problems"])
+        f = figure(res, "row_t1.present_rows_exact")
+        self.assertEqual((f["value"], f["verdict"]), (0, "miss"))
+
+    def test_wrong_answer_row_set(self):
+        c = self.select("logs_request_id_present")[0]
+        c["values"] = ["0" * 32]
+        self.save_calls()
+        code, res, _ = self.go()
+        self.assertEqual(code, 1)
+        self.assertIn("wrong_answer logs_request_id_present/folded_leaves/cold try 0: row set differs from the oracle",
+                      res["problems"])
+
+    def test_wrong_answer_truth_key_from_statements(self):
+        c = self.select("logs_request_id_present")[0]
+        c["truth_key"] = "request_id.absent"
+        c["rows"], c["values"] = 0, []
+        self.save_calls()
+        code, res, _ = self.go()
+        self.assertEqual(code, 1)
+        self.assertTrue(any(p.startswith("wrong_answer logs_request_id_present/folded_leaves/cold try 0: call names truth key")
+                            for p in res["problems"]), res["problems"])
+
+    def test_empty_stamps_directory(self):
+        stamps = os.path.join(self.run_dir, "stamps")
+        shutil.rmtree(stamps)
+        os.makedirs(stamps)
+        code, res, _ = self.go()
+        self.assertEqual(code, 1)
+        for name in ("build.json", "host.json", "declare.json", "store.json", "corpus.json", "tenants.json",
+                     "needle_blocks.json", "loads.jsonl", "folds.jsonl", "census.jsonl", "restarts.jsonl",
+                     "transitions.jsonl", "compaction.jsonl"):
+            self.assertIn(f"missing stamps/{name}", res["problems"])
+        self.assertEqual(figure(res, "row_t1.spans_leaves")["verdict"], "missing")
+
+    def test_no_calls(self):
+        os.remove(self.calls_path)
+        code, res, _ = self.go()
+        self.assertEqual(code, 1)
+        self.assertIn("missing calls.jsonl", res["problems"])
+        self.assertEqual(figure(res, "row_t1.spans_1_rows_exact")["verdict"], "missing")
+
+    def test_unsupported_statement_is_carried_with_its_reason(self):
+        self.calls = [c for c in self.calls if not (c["statement"] == "spans_in_1" and c["state"] == "folded_leaves")]
+        self.calls.append({"statement": "spans_in_1", "state": "folded_leaves", "temp": "cold", "try": 0,
+                           "tenant": "inv", "outcome": UNSUPPORTED, "reason": "case reason"})
+        self.save_calls()
+        code, res, _ = self.go()
+        f = figure(res, "row_t1.spans_1_rows_exact")
+        self.assertEqual((f["status"], f["reason"]), (UNSUPPORTED, "case reason"))
+        s = next(s for s in res["statements"] if s["statement"] == "spans_in_1" and s["state"] == "folded_leaves")
+        self.assertEqual((s["status"], s["reason"]), (UNSUPPORTED, "case reason"))
+        self.assertEqual(code, 0)
+
+    def test_cost_exact_with_nonzero_cpu(self):
+        for c, cpu in zip(self.select("spans_in_1"), (1.8, 3.6)):
+            c["server_cpu_s"] = cpu
+            for p in c["stats"]["phases"]:
+                p["s3GetRequests"] = 1000 if p["phase"] == "probe" else 0
+                p["s3ListRequests"] = 200 if p["phase"] == "resolve" else 0
+        self.save_calls()
+        _, res, _ = self.go()
+        s = next(s for s in res["cost"]["statements"] if (s["statement"], s["state"]) == ("spans_in_1", "folded_leaves"))
+        # 1000 GET x $0.0004/1000 + 200 LIST x $0.005/1000 + 2.7 cpu_s x $0.612/3600
+        self.assertEqual(s["dollars_per_call"], 0.001859)
+        self.assertEqual((s["mean_gets"], s["mean_list_requests"], s["mean_server_cpu_s"]), (1000, 200, 2.7))
+        self.assertEqual(s["server_cpu_s_cold_sum"], 5.4)
+        for sig in ("spans", "logs"):
+            m = next(m for m in res["cost"]["maintenance"] if m["signal"] == sig)
+            r = next(f for f in read_jsonl(os.path.join(self.run_dir, "stamps", "folds.jsonl"))
+                     if (f["transition"], f["tenant"], f["signal"]) == ("leaf_rebuild", "inv", sig))
+            with open(os.path.join(self.run_dir, "stamps", f"folded_leaves.{sig}.catalog.json")) as f:
+                doc = json.load(f)
+            leaf = sum(lf["bytes"] for p in doc["parts"] for lf in p["leaves"])
+            puts = sum(a["leaf_puts"] for a in r["report"]["attempts"])
+            want = (r["report"]["ranged_gets"] * 0.0004 / 1000 + puts * 0.005 / 1000 + leaf / 1e9 * 0.023)
+            self.assertEqual(m["maintenance_per_part_month"], round(want / doc["part_count"], 9), sig)
+        for k, b in res["cost"]["prices"].items():
+            self.assertTrue(b["source"], k)
+
+    def test_cost_figures_come_from_data(self):
+        toml = os.path.join(self.run_dir, "run.toml")
+        with open(toml) as f:
+            text = f.read()
+        with open(toml, "w") as f:
+            f.write(re.sub(r"(?m)^get_per_1000 = .*\n", "", text))
+        code, res, _ = self.go()
+        self.assertEqual(code, 1)
+        self.assertIn("missing run.toml prices.get_per_1000", res["problems"])
+
+    def check_amortise_months_required(self, evaluate_py=EVALUATE):
+        """Item 5: run.toml without cost.amortise_months is a problem, never a one-month default."""
+        toml = os.path.join(self.run_dir, "run.toml")
+        with open(toml) as f:
+            text = f.read()
+        with open(toml, "w") as f:
+            f.write(re.sub(r"(?m)^amortise_months = .*\n", "", text))
+        code, res, summary = self.go(evaluate_py=evaluate_py)
+        out = []
+        want = "missing run.toml cost.amortise_months (a whole number of months, at least 1)"
+        if want not in res["problems"]:
+            out.append(f"no '{want}' in {res['problems']}")
+        if res["cost"]["amortise_months"] is not None:
+            out.append(f"results amortise_months {res['cost']['amortise_months']}")
+        got = [m["status"] for m in res["cost"]["maintenance"]]
+        if got != ["missing", "missing"]:
+            out.append(f"maintenance statuses {got}")
+        if "leaf build amortised over missing (run.toml cost.amortise_months absent)" not in summary:
+            out.append("summary does not say amortise_months is missing")
+        return out
+
+    def test_amortise_months_required(self):
+        self.assertEqual(self.check_amortise_months_required(), [])
+
+    def check_storage_bytes_missing(self, evaluate_py=EVALUATE):
+        """Item 5: a census line without bytes is a missing storage cost, never $0."""
+        path = self.stamp_path("census.jsonl")
+        lines = read_jsonl(path)
+        for line in lines:
+            if line["state"] == "unfolded":
+                del line["census"]["bytes"]
+        with open(path, "w") as f:
+            f.writelines(json.dumps(line, sort_keys=True) + "\n" for line in lines)
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = []
+        want = "missing storage cost for unfolded: census line carries no census.bytes"
+        if want not in res["problems"]:
+            out.append(f"no '{want}' in {res['problems']}")
+        got = next(s for s in res["cost"]["storage"] if s["state"] == "unfolded")
+        if (got.get("status"), got["bytes"], got["dollars_per_month"]) != ("missing", None, None):
+            out.append(f"unfolded storage {got}")
+        return out
+
+    def test_storage_bytes_missing(self):
+        self.assertEqual(self.check_storage_bytes_missing(), [])
+
+    def check_row_6_floor(self, evaluate_py=EVALUATE):
+        """Item 4: row 6's keyIndex GETs below the census's objects over 512 KiB read miss, with the reason."""
+        mod = load_module(evaluate_py, "evaluate_row6")
+        with open(BANDS, "rb") as f:
+            bands = {"row": [r for r in tomllib.load(f)["row"] if r["key"] == "row_06"]}
+        census = {("unfolded",): {"state": "unfolded", "census": {"tenants": {
+            "hits": {"data": {"logs": {"objects": 398, "objects_over_512k": 3}}}}}}}
+        cfg = {"lane": "local", "hits": True, "tenant": "inv", "scales": [1], "baseline": False,
+               "states": ["unfolded"]}
+        out = []
+        for gets, want in ((2, "miss"), (3, "pass"), (796, "pass"), (797, "miss")):
+            def fixed(calls, cfg, statement, state, metric, candidates=None, gets=gets):
+                return ("value", gets, "") if metric == "cold.max.keyindex_gets" else ("missing", None, "not set")
+            mod.statement_figure = fixed
+            figs = mod.run_rows(bands, cfg, {"unfolded": None}, None, None, {}, census, None, {}, {})
+            got = next(f for f in figs if f["id"] == "row_06.keyindex_gets")
+            if got["verdict"] != want:
+                out.append(f"{gets} keyIndex GETs read {got['verdict']}, want {want}")
+            if gets == 2 and got["reason"] != ("fewer keyIndex GETs than objects above 512 KiB: one was read "
+                                               "without its probe"):
+                out.append(f"2 keyIndex GETs reason {got['reason']!r}")
+        return out
+
+    def test_row_6_floor(self):
+        self.assertEqual(self.check_row_6_floor(), [])
+
+    def needle_stamp(self, **fields):
+        path = self.stamp_path("needle_blocks.json")
+        with open(path) as f:
+            doc = json.load(f)
+        for k, v in fields.items():
+            if k.startswith("truth_"):
+                doc["truth_needle_blocks"][k[len("truth_"):]] = v
+            else:
+                doc[k] = v
+        with open(path, "w") as f:
+            json.dump(doc, f)
+
+    NEEDLE_IDS = [f"needle_blocks.{v}.{k}" for v in ("needlerare", "needlesparse", "needlecommon", "any")
+                  for k in ("planted", "storage")]
+
+    def check_needle_geometry(self, evaluate_py=EVALUATE):
+        """Item 7: planted and storage blocks per needle, each figure once; sparse and common inside 25 %."""
+        self.needle_stamp(needle_sparse_present_blocks=2, truth_needlecommon=4, needle_common_present_blocks=5)
+        code, res, summary = self.go(evaluate_py=evaluate_py)
+        nb = res["needle_blocks"]
+        out = []
+        ids = [f["id"] for f in nb["figures"]]
+        for i in self.NEEDLE_IDS:
+            if ids.count(i) != 1:
+                out.append(f"{i} present {ids.count(i)} time(s)")
+        if sorted(ids) != sorted(self.NEEDLE_IDS):
+            out.append(f"figure ids {ids}")
+        got = {v: (e["planted"], e["storage"], e["status"]) for v, e in nb["needles"].items()}
+        want = {"needlerare": (1, 1, "match"), "needlesparse": (2, 2, "within"), "needlecommon": (4, 5, "within"),
+                "any": (5, 4, "reported")}
+        if got != want:
+            out.append(f"needles {got}")
+        if [p for p in res["problems"] if "needle" in p]:
+            out.append(f"needle problems {res['problems']}")
+        if "  needlecommon   needle_common      4 / 5     within 25%  within" not in summary:
+            out.append("summary lacks the needlecommon line")
+        return out
+
+    def test_needle_geometry(self):
+        self.assertEqual(self.check_needle_geometry(), [])
+
+    def check_needle_partial(self, evaluate_py=EVALUATE):
+        """Item 3 (round 5): a partial needle inspection leaves the exact and
+        banded needles unjudged, and says so under incomplete with the counts
+        inspected."""
+        self.needle_stamp(objects_inspected=1, objects_total=4)
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = [] if (code, res["verdict"], res["problems"]) == (1, "incomplete", []) else [
+            f"exit {code} {res['verdict']} {res['problems']}"]
+        got = {v: e["status"] for v, e in res["needle_blocks"]["needles"].items()}
+        if got != {"needlerare": "incomplete", "needlesparse": "incomplete", "needlecommon": "incomplete",
+                   "any": "reported"}:
+            out.append(f"needles {got}")
+        want = ("needle_blocks needlerare: needle_rare counted over 1 of 4 logs objects (run.toml "
+                "needle_blocks_max_objects), 1 storage blocks against 1 planted, not judged")
+        if want not in res["incomplete"]:
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_needle_partial(self):
+        self.assertEqual(self.check_needle_partial(), [])
+
+    def check_needle_band_miss(self, evaluate_py=EVALUATE):
+        """Item 7: a common needle in 6 storage blocks against 4 planted is outside 25 %, a miss."""
+        self.needle_stamp(needle_sparse_present_blocks=2, truth_needlecommon=4, needle_common_present_blocks=6)
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        want = "miss needle_blocks needlecommon: needle_common in 6 storage blocks, 4 planted, outside 25%"
+        out = [] if want in res["problems"] else [f"no '{want}' in {res['problems']}"]
+        if res["needle_blocks"]["needles"]["needlecommon"]["status"] != "miss":
+            out.append(f"status {res['needle_blocks']['needles']['needlecommon']}")
+        return out
+
+    def test_needle_band_miss(self):
+        self.assertEqual(self.check_needle_band_miss(), [])
+
+    def check_needle_storage_null(self, evaluate_py=EVALUATE):
+        """Item 5: a null storage block count (inv.py could not sum it) is missing, never 0."""
+        self.needle_stamp(needle_sparse_present_blocks=None, needle_common_present_blocks=3)
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        want = ("missing needle_blocks needlesparse: stamps/needle_blocks.json needle_sparse_present_blocks "
+                "absent or null")
+        out = [] if want in res["problems"] else [f"no '{want}' in {res['problems']}"]
+        got = res["needle_blocks"]["needles"]["needlesparse"]
+        if (got["storage"], got["status"]) != (None, "missing"):
+            out.append(f"needlesparse {got}")
+        return out
+
+    def test_needle_storage_null(self):
+        self.assertEqual(self.check_needle_storage_null(), [])
+
+    def stamp_path(self, name):
+        return os.path.join(self.run_dir, "stamps", name)
+
+    def check_missing_catalog_stamp(self, evaluate_py=EVALUATE):
+        """Item 1: a state's catalog stamp absent is a problem, not a skip."""
+        os.remove(self.stamp_path("folded_leaves.spans.catalog.json"))
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = []
+        if code != 1:
+            out.append(f"exit {code}")
+        if "missing covering_parts.folded_leaves.spans" not in res["problems"]:
+            out.append(f"problems {res['problems']}")
+        return out
+
+    def test_missing_catalog_stamp(self):
+        self.assertEqual(self.check_missing_catalog_stamp(), [])
+
+    def check_dirty_paths_null(self, evaluate_py=EVALUATE):
+        """Round 5 item 5: a local build stamp whose git status failed (dirty_paths null) is missing."""
+        path = self.stamp_path("build.json")
+        with open(path) as f:
+            doc = json.load(f)
+        doc["lane"], doc["dirty_paths"] = "local", None
+        with open(path, "w") as f:
+            json.dump(doc, f)
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = []
+        if code != 1:
+            out.append(f"exit {code}")
+        want = "missing stamps/build.json dirty_paths: no count of the harness's uncommitted paths"
+        if want not in res["problems"]:
+            out.append(f"problems {res['problems']}")
+        return out
+
+    def test_dirty_paths_null(self):
+        self.assertEqual(self.check_dirty_paths_null(), [])
+
+    def check_absent_phases(self, evaluate_py=EVALUATE):
+        """Item 2: an ok call without stats.phases is named, and its figures are missing."""
+        c = next(c for c in self.select("spans_lookup_norange") if c["try"] == 0)
+        del c["stats"]["phases"]
+        self.save_calls()
+        code, res, _ = self.go(BANDS, evaluate_py)
+        out = []
+        if code != 1:
+            out.append(f"exit {code}")
+        if "missing stats.phases in spans_lookup_norange/folded_leaves/cold try 0" not in res["problems"]:
+            out.append(f"problems {res['problems']}")
+        return out
+
+    def test_absent_phases(self):
+        self.assertEqual(self.check_absent_phases(), [])
+
+    def test_absent_cpu_on_every_call(self):
+        n = 0
+        for c in self.calls:
+            if c["outcome"] == "ok":
+                del c["server_cpu_s"]
+                n += 1
+        self.save_calls()
+        code, res, _ = self.go()
+        self.assertEqual(code, 1)
+        lacking = [p for p in res["problems"] if p.startswith("missing server_cpu_s in ")]
+        self.assertEqual(len(lacking), n)
+        self.assertIn("missing server_cpu_s in spans_in_1/folded_leaves/cold try 0", lacking)
+        self.assertEqual(res["cost"]["statements"], [])
+        self.assertEqual(figure(res, "row_t1.spans_1_rows_exact")["verdict"], "missing")
+
+    def check_dead_counter(self, evaluate_py=EVALUATE):
+        """Item 5: segmentsOpened 0 beside scan GETs is a dead counter, not a value."""
+        code, res, _ = self.go(BANDS, evaluate_py)
+        out = []
+        f = figure(res, "row_14.objects_opened_1")
+        if (f["status"], f["verdict"]) != ("dead_counter", "dead_counter"):
+            out.append(f"row_14.objects_opened_1 {f['status']} {f['verdict']}")
+        if "dead_counter segmentsOpened journey_c_1 folded_leaves" not in res["problems"]:
+            out.append(f"problems {res['problems']}")
+        return out
+
+    def test_dead_counter(self):
+        self.assertEqual(self.check_dead_counter(), [])
+
+    def test_zero_opened_without_scan_gets_is_a_miss(self):
+        for c in self.select("journey_c_1"):
+            for p in c["stats"]["phases"]:
+                if p["phase"] == "scan":
+                    p["s3GetRequests"] = 0
+        self.save_calls()
+        _, res, _ = self.go(BANDS)
+        f = figure(res, "row_14.objects_opened_1")
+        self.assertEqual((f["status"], f["value"], f["verdict"]), ("value", 0, "miss"))
+        self.assertIn("miss row_14.objects_opened_1", res["problems"])
+        self.assertNotIn("dead_counter segmentsOpened journey_c_1 folded_leaves", res["problems"])
+
+    def write_ranges(self, inside=4, outside=2):
+        """stamps/unfolded.spans.ranges.json: inside objects overlapping every saved-trace window the cold
+        tries read, outside objects two hours before them."""
+        with open(os.path.join(self.run_dir, "truth.json")) as f:
+            saved = json.load(f)["saved_traces"]
+        starts = [saved[c["try"] % len(saved)]["start_ns"] for c in self.select("spans_lookup_1h", "unfolded")]
+        lo, hi = min(starts), max(starts)
+        objects = [{"key": f"in{i}.rseg", "bytes": 1, "min_ns": lo - 60 * 10**9, "max_ns": hi + 60 * 10**9}
+                   for i in range(inside)]
+        objects += [{"key": f"out{i}.rseg", "bytes": 1, "min_ns": lo - 3 * HOUR_NS, "max_ns": lo - 2 * HOUR_NS}
+                    for i in range(outside)]
+        with open(self.stamp_path("unfolded.spans.ranges.json"), "w") as f:
+            json.dump({"state": "unfolded", "label": "spans", "objects": objects}, f)
+
+    def check_probe_per_object(self, evaluate_py=EVALUATE):
+        """Row 3's probe band is per candidate object: the unfolded objects whose event range overlaps the
+        call's window, from the ranges stamp; not per GET, not the call's own pruning.segments, not every
+        object in the state."""
+        self.write_ranges(inside=4, outside=2)
+        for c in self.select("spans_lookup_1h", "unfolded"):
+            c["stats"].pop("perObject", None)
+            c["stats"]["pruning"]["segments"] = 9
+            for p in c["stats"]["phases"]:
+                if p["phase"] == "probe":
+                    p["s3GetRequests"], p["s3GetWireBytes"] = 8, 16388
+        self.save_calls()
+        _, res, _ = self.go(BANDS, evaluate_py)
+        f = figure(res, "row_03.probe_wire_per_object")
+        return [] if (f["value"], f["verdict"]) == (4097.0, "pass") else [f"{f['value']} {f['verdict']}"]
+
+    def check_probe_per_object_cross_check(self, evaluate_py=EVALUATE):
+        """A per-object breakdown whose entry count differs from the stamp's candidate count is a problem."""
+        self.write_ranges(inside=4, outside=2)
+        for c in self.select("spans_lookup_1h", "unfolded"):
+            c["stats"]["perObject"] = [{"probeGets": 1}] * 3
+        self.save_calls()
+        _, res, _ = self.go(BANDS, evaluate_py)
+        f = figure(res, "row_03.probe_wire_per_object")
+        want = ("missing row_03.probe_wire_per_object: spans_lookup_1h/unfolded/cold try 0 perObject has 3 "
+                "entries, the ranges stamp 4 candidate objects")
+        return [] if want in res["problems"] else [f"{f['status']} {f['reason']}"]
+
+    def test_probe_per_object_cross_check(self):
+        self.assertEqual(self.check_probe_per_object_cross_check(), [])
+
+    def test_probe_per_object(self):
+        self.assertEqual(self.check_probe_per_object(), [])
+
+    def check_miss_reason(self, evaluate_py=EVALUATE):
+        """Item 3: row 7's miss carries the from-scratch reason bands.toml gives it."""
+        _, res, _ = self.go(BANDS, evaluate_py)
+        want = "miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count"
+        return [] if want in res["problems"] else [f"problems {res['problems']}"]
+
+    def test_miss_reason(self):
+        self.assertEqual(self.check_miss_reason(), [])
+
+    def check_leaf_share(self, evaluate_py=EVALUATE):
+        """Item 14: the share is the named field's leaf bytes, not every leaf's."""
+        _, res, _ = self.go(BANDS, evaluate_py)
+        census = next(c for c in read_jsonl(self.stamp_path("census.jsonl")) if c["state"] == "folded_leaves")
+        data = census["census"]["tenants"]["inv"]["data"]["logs"]["bytes"]
+        with open(self.stamp_path("folded_leaves.logs.catalog.json")) as f:
+            doc = json.load(f)
+        out = []
+        for field in ("trace_id", "request_id"):
+            leaf = sum(lf["bytes"] for p in doc["parts"] for lf in p["leaves"] if lf["field"] == field)
+            got = figure(res, f"row_08.logs_{field}_leaf_pct")["value"]
+            if got != round(100.0 * leaf / data, 9):
+                out.append(f"{field} {got}")
+        return out
+
+    def test_leaf_share(self):
+        self.assertEqual(self.check_leaf_share(), [])
+
+    def check_part_count(self, evaluate_py=EVALUATE):
+        """Item 9: the part count is what the catalog holds, not what the load declared."""
+        path = self.stamp_path("many_parts_24.spans.catalog.json")
+        with open(path) as f:
+            doc = json.load(f)
+        doc["parts"] = doc["parts"][:-1]
+        doc["part_count"] = len(doc["parts"])
+        with open(path, "w") as f:
+            json.dump(doc, f)
+        _, res, _ = self.go(BANDS, evaluate_py)
+        f = figure(res, "row_09.covering_parts_24")
+        out = [] if (f["value"], f["verdict"]) == (23, "miss") else [f"{f['value']} {f['verdict']}"]
+        if "miss row_09.covering_parts_24" not in res["problems"]:
+            out.append(f"problems {res['problems']}")
+        return out
+
+    def test_part_count(self):
+        self.assertEqual(self.check_part_count(), [])
+
+    def check_state_absent(self, evaluate_py=EVALUATE):
+        """Item 15: a state run.toml lists and calls.jsonl lacks is missing."""
+        self.calls = [c for c in self.calls if c["state"] != "mixed"]
+        self.save_calls()
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = []
+        if code != 1:
+            out.append(f"exit {code}")
+        if "missing state mixed: no calls in calls.jsonl" not in res["problems"]:
+            out.append(f"problems {res['problems']}")
+        st = next(s for s in res["states"] if s["state"] == "mixed")
+        if st["status"] != "missing":
+            out.append(f"states {st}")
+        return out
+
+    def test_state_absent(self):
+        self.assertEqual(self.check_state_absent(), [])
+
+    def check_census_per_tenant(self, evaluate_py=EVALUATE):
+        """Item 4: census figures read their own tenant's objects."""
+        mod = load_module(evaluate_py, "evaluate_case")
+        tenants = {"inv": {"data": {"logs": {"objects": 9}}}, "hits": {"data": {"logs": {"objects": 398}}}}
+        census = {("unfolded",): {"state": "unfolded", "census": {"tenants": tenants}}}
+        cfg = {"tenant": "inv", "hits": True}
+        out = []
+        for tenant, want in (("hits", 398), ("inv", 9)):
+            got = mod.stamp_figure(None, census, cfg, "unfolded", f"census.{tenant}.logs.objects")
+            if got != ("value", want, ""):
+                out.append(f"{tenant} {got}")
+        return out
+
+    def test_census_per_tenant(self):
+        self.assertEqual(self.check_census_per_tenant(), [])
+
+    def to_s3_lane(self):
+        toml = os.path.join(self.run_dir, "run.toml")
+        with open(toml) as f:
+            text = f.read()
+        with open(toml, "w") as f:
+            f.write(text.replace('lane = "local"', 'lane = "s3"'))
+
+    def test_journey_wall_is_the_sum_of_its_steps(self):
+        # Item 16: three 2 s steps make a 6 s journey, which misses < 5 s.
+        self.to_s3_lane()
+        for sid in ("failing_cell", "journey_b", "spans_lookup_1h"):
+            for c in self.select(sid):
+                c["wall_s"] = 2.0
+        self.save_calls()
+        _, res, _ = self.go(BANDS)
+        self.assertEqual(figure(res, "row_15.lookup_wall_p50_s")["value"], 2.0)
+        f = figure(res, "row_15.journey_wall_p50_s")
+        self.assertEqual((f["value"], f["verdict"]), (6.0, "miss"))
+        self.assertIn("miss row_15.journey_wall_p50_s", res["problems"])
+
+    def test_journey_gets_over_budget(self):
+        for c in self.select("journey_b"):
+            for p in c["stats"]["phases"]:
+                if p["phase"] == "scan":
+                    p["s3GetRequests"] = 10_000
+        self.save_calls()
+        _, res, _ = self.go(BANDS)
+        budget = figure(res, "row_15.journey_gets_budget")["value"]
+        f = figure(res, "row_15.journey_total_gets")
+        self.assertGreater(f["value"], budget)
+        self.assertEqual(f["verdict"], "miss")
+        self.assertIn("miss row_15.journey_total_gets", res["problems"])
+
+    def test_unsealed_tail_wrong_answer(self):
+        # Item 17: the tail's planted row missing from the mixed state's
+        # answer is a wrong answer.
+        c = next(c for c in self.select("logs_tail_request_id", "mixed") if c["try"] == 0)
+        c["rows"], c["values"] = 0, []
+        self.save_calls()
+        code, res, _ = self.go(BANDS)
+        self.assertEqual(code, 1)
+        self.assertIn("wrong_answer logs_tail_request_id/mixed/cold try 0: rows 0 expected 1", res["problems"])
+        self.assertEqual(figure(res, "row_13.wrong_answers")["value"], 1)
+
+    # --- in-flight overlap, refusals, the 1,001-key control -----------------
+
+    def statement_tables(self):
+        with open(STATEMENTS, "rb") as f:
+            return {s["id"]: s.get("table", "spans") for s in tomllib.load(f)["statement"]}
+
+    def inflight_calls(self, sig):
+        table = self.statement_tables()
+        return [c for c in self.calls if c["state"] == "compaction_in_flight" and c.get("temp") == "inflight"
+                and c["outcome"] == "ok" and table[c["statement"]] == sig]
+
+    def set_compaction(self, windows):
+        """windows: {signal: f(calls) -> (started, ended)} over that signal's in-flight calls."""
+        path = self.stamp_path("compaction.jsonl")
+        lines = read_jsonl(path)
+        for line in lines:
+            window = windows.get(line["signal"])
+            if window:
+                line["measure"]["started_unix_s"], line["measure"]["ended_unix_s"] = window(
+                    self.inflight_calls(line["signal"]))
+        write_jsonl(path, lines)
+
+    @staticmethod
+    def covering(calls):
+        return min(c["started_unix_s"] for c in calls) - 1, max(c["started_unix_s"] + c["wall_s"] for c in calls) + 1
+
+    @staticmethod
+    def after(calls, seconds):
+        end = max(c["started_unix_s"] + c["wall_s"] for c in calls) + 1
+        return end, end + seconds
+
+    def check_overlap_full(self, evaluate_py=EVALUATE):
+        """Every in-flight try inside its compaction's window: no not_in_flight, the state's figure passes."""
+        self.set_compaction({"spans": self.covering, "logs": self.covering})
+        _, res, _ = self.go(BANDS, evaluate_py)
+        out = [p for p in res["problems"] if p.startswith("not_in_flight")]
+        f = figure(res, "row_13.compaction_in_flight_rows_exact")
+        if (f["status"], f["value"], f["verdict"]) != ("value", 1, "pass"):
+            out.append(f"figure {f['status']} {f['value']} {f['verdict']}")
+        return out
+
+    def test_overlap_full(self):
+        self.assertEqual(self.check_overlap_full(), [])
+
+    def check_overlap_partial(self, evaluate_py=EVALUATE):
+        """A logs compaction that covers only the first logs try: that group is not_in_flight."""
+        calls = sorted(self.inflight_calls("logs"), key=lambda c: c["started_unix_s"])
+        first, second = calls[0], calls[1]
+        group = [c for c in calls if c["statement"] == first["statement"]]
+        self.set_compaction({"spans": self.covering,
+                             "logs": lambda _: (first["started_unix_s"] - 10,
+                                                (first["started_unix_s"] + second["started_unix_s"]) / 2)})
+        _, res, _ = self.go(BANDS, evaluate_py)
+        want = (f"not_in_flight {first['statement']}/compaction_in_flight: 1 of {len(group)} inflight tries "
+                f"overlapped the logs compaction")
+        return [] if len(group) > 1 and want in res["problems"] else [f"problems {res['problems']}"]
+
+    def test_overlap_partial(self):
+        self.assertEqual(self.check_overlap_partial(), [])
+
+    def check_overlap_zero(self, evaluate_py=EVALUATE):
+        """A long logs compaction that started after every logs try ended: not_in_flight, not not-run."""
+        calls = self.inflight_calls("logs")
+        self.set_compaction({"spans": self.covering, "logs": lambda c: self.after(c, 100)})
+        _, res, _ = self.go(BANDS, evaluate_py)
+        out = []
+        for statement in sorted({c["statement"] for c in calls}):
+            n = sum(1 for c in calls if c["statement"] == statement)
+            want = (f"not_in_flight {statement}/compaction_in_flight: 0 of {n} inflight tries "
+                    f"overlapped the logs compaction")
+            if want not in res["problems"]:
+                out.append(f"no '{want}'")
+        return out
+
+    def test_overlap_zero(self):
+        self.assertEqual(self.check_overlap_zero(), [])
+
+    def check_overlap_too_short(self, evaluate_py=EVALUATE):
+        """Compactions shorter than one call that cover no try: not-run, so incomplete, never a problem."""
+        shortest = min(c["wall_s"] for sig in ("spans", "logs") for c in self.inflight_calls(sig))
+        self.set_compaction({"spans": lambda c: self.after(c, shortest / 2),
+                             "logs": lambda c: self.after(c, shortest / 2)})
+        code, res, _ = self.go(BANDS, evaluate_py)
+        out = [p for p in res["problems"] if p.startswith("not_in_flight") or "compaction_in_flight" in p]
+        f = figure(res, "row_13.compaction_in_flight_rows_exact")
+        if f["status"] != "not-run" or "shorter than one call" not in (f["reason"] or ""):
+            out.append(f"figure {f['status']} {f['reason']}")
+        if not any("compaction_in_flight not run: compaction ran " in r for r in res["incomplete"]):
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_overlap_too_short(self):
+        self.assertEqual(self.check_overlap_too_short(), [])
+
+    def test_compaction_done_before_the_first_call_is_not_run(self):
+        calls = {sig: self.inflight_calls(sig) for sig in ("spans", "logs")}
+        first = min(c["started_unix_s"] for v in calls.values() for c in v)
+        self.set_compaction({"spans": lambda _: (first - 10, first - 9), "logs": lambda _: (first - 10, first - 9)})
+        _, res, _ = self.go(BANDS)
+        self.assertEqual([p for p in res["problems"] if "compaction_in_flight" in p], [])
+        f = figure(res, "row_13.compaction_in_flight_rows_exact")
+        self.assertEqual((f["status"], f["reason"]), ("not-run", "every call group in compaction_in_flight not run: "
+                                                       "compaction finished in 1000 ms before the first call"))
+
+    def check_refused(self, evaluate_py=EVALUATE):
+        """A refusal of a statement not planned as a cap probe is the problem refused; a cap probe's reads
+        unsupported."""
+        for c in self.select("spans_in_100"):
+            for k in ("stats", "rows", "values", "server_cpu_s"):
+                c.pop(k, None)
+            c.update(outcome=UNSUPPORTED, http_status=400, reason=REFUSAL_1000)
+        self.save_calls()
+        code, res, _ = self.go(BANDS, evaluate_py)
+        want = f"refused spans_in_100/folded_leaves/cold try 0: HTTP 400 {REFUSAL_1000}"
+        out = [] if want in res["problems"] else [f"no '{want}'"]
+        out += [p for p in res["problems"] if p.startswith("refused spans_in_1000")]
+        return out
+
+    def test_refused(self):
+        self.assertEqual(self.check_refused(), [])
+
+    def served_1000(self, statement, keys=None, parts=1, scan=True):
+        """Turn statement's folded_leaves cold calls into ok calls copied from spans_in_100, which scanned 4
+        objects. keys None drops the keyIndex section; scan False zeros the probe and scan GETs and blocks."""
+        src = {c["try"]: c for c in self.select("spans_in_100")}
+        for i, c in enumerate(self.calls):
+            if c["statement"] == statement and c["state"] == "folded_leaves" and c.get("temp") == "cold":
+                new = copy.deepcopy(src[c["try"]])
+                new.update(statement=statement, truth_key=c.get("truth_key", new.get("truth_key")))
+                if keys is None:
+                    new["stats"].pop("keyIndex", None)
+                else:
+                    new["stats"]["keyIndex"] = dict(new["stats"].get("keyIndex") or {}, keysProbed=keys,
+                                                    partsCovered=parts)
+                if not scan:
+                    for p in new["stats"]["phases"]:
+                        if p["phase"] in ("probe", "scan"):
+                            p["s3GetRequests"] = 0
+                    new["stats"]["pruning"]["blocksScanned"] = 0
+                self.calls[i] = new
+
+    CONTROL = {
+        # mode: (1,000-key arm, 1,001-key arm, (status, value, verdict), reason fragment)
+        "guard": (None, None, (GUARD, None, GUARD), "refused by the SQL complexity guard: " + REFUSAL_1000),
+        "unsupported": (dict(), None, (UNSUPPORTED, None, UNSUPPORTED), "carries no keyIndex.keysProbed"),
+        "pass": (dict(keys=1000), None, ("value", 1, "pass"), ""),
+        "miss": (dict(keys=1000), dict(keys=1001), ("value", 0, "miss"), "was index-served"),
+        "served-with-scan": (dict(keys=1000), dict(), ("value", 1, "pass"), ""),
+        "served-with-keyindex": (dict(keys=1000), dict(keys=1001, scan=False), ("value", 0, "miss"),
+                                 "was index-served: keysProbed 1001 partsCovered 1"),
+        "served-without-scan": (dict(keys=1000), dict(scan=False), ("value", 0, "miss"),
+                                "served without a visible path"),
+        "zeros-without-scan": (dict(keys=1000), dict(keys=0, parts=0, scan=False), ("value", 0, "miss"),
+                               "served without a visible path"),
+        "zero-parts-covered": (dict(keys=1000, parts=0), None, ("value", 0, "miss"),
+                               "probed 1000 keys with partsCovered 0"),
+    }
+
+    def check_control(self, mode, evaluate_py=EVALUATE):
+        arm_1000, arm_1001, want, reason = self.CONTROL[mode]
+        if arm_1000 is not None:
+            self.served_1000("spans_in_1000", **arm_1000)
+        if arm_1001 is not None:
+            self.served_1000("spans_in_1001", **arm_1001)
+        self.save_calls()
+        _, res, _ = self.go(BANDS, evaluate_py)
+        f = figure(res, "row_11.spans_control_1001")
+        out = [] if (f["status"], f["value"], f["verdict"]) == want else [f"{f['status']} {f['value']} {f['verdict']}"]
+        if reason not in (f["reason"] or ""):
+            out.append(f"reason {f['reason']}")
+        return out
+
+    def check_control_guard(self, evaluate_py=EVALUATE):
+        """Row 11 on main: the 1,000-key list refused by the complexity guard reads refused-by-guard."""
+        return self.check_control("guard", evaluate_py)
+
+    def check_control_unsupported(self, evaluate_py=EVALUATE):
+        """A 1,000-key list served with no tier-2 figures: unsupported."""
+        return self.check_control("unsupported", evaluate_py)
+
+    def check_control_pass(self, evaluate_py=EVALUATE):
+        """1,000 keys probed and the 1,001-key list refused: the control passes."""
+        return self.check_control("pass", evaluate_py)
+
+    def check_control_miss(self, evaluate_py=EVALUATE):
+        """A 1,001-key list the index served: the control misses."""
+        return self.check_control("miss", evaluate_py)
+
+    def check_control_served_with_scan(self, evaluate_py=EVALUATE):
+        """A 1,001-key list served by a scan with no keyIndex figure: the control passes."""
+        return self.check_control("served-with-scan", evaluate_py)
+
+    def check_control_served_with_keyindex(self, evaluate_py=EVALUATE):
+        """A 1,001-key list served with keyIndex figures and no scan: the control misses."""
+        return self.check_control("served-with-keyindex", evaluate_py)
+
+    def check_control_served_without_scan(self, evaluate_py=EVALUATE):
+        """Reviewer mutation (a): a 1,001-key list served with no keyIndex figure and zero GETs: miss."""
+        return self.check_control("served-without-scan", evaluate_py)
+
+    def check_control_zeros_without_scan(self, evaluate_py=EVALUATE):
+        """Reviewer mutation (b): a 1,001-key list whose keyIndex figures are zeros, with no scan: miss."""
+        return self.check_control("zeros-without-scan", evaluate_py)
+
+    def check_control_zero_parts_covered(self, evaluate_py=EVALUATE):
+        """A 1,000-key list that probed 1,000 keys but covered no part: miss."""
+        return self.check_control("zero-parts-covered", evaluate_py)
+
+    def test_control_guard(self):
+        self.assertEqual(self.check_control_guard(), [])
+
+    def test_control_unsupported(self):
+        self.assertEqual(self.check_control_unsupported(), [])
+
+    def test_control_pass(self):
+        self.assertEqual(self.check_control_pass(), [])
+
+    def test_control_miss(self):
+        self.assertEqual(self.check_control_miss(), [])
+
+    def test_control_served_with_scan(self):
+        self.assertEqual(self.check_control_served_with_scan(), [])
+
+    def test_control_served_with_keyindex(self):
+        self.assertEqual(self.check_control_served_with_keyindex(), [])
+
+    def test_control_served_without_scan(self):
+        self.assertEqual(self.check_control_served_without_scan(), [])
+
+    def test_control_zeros_without_scan(self):
+        self.assertEqual(self.check_control_zeros_without_scan(), [])
+
+    def test_control_zero_parts_covered(self):
+        self.assertEqual(self.check_control_zero_parts_covered(), [])
+
+    # --- incomplete, truth-derived budgets, absent fields -------------------
+
+    def check_skipped_state(self, evaluate_py=EVALUATE):
+        """A state run.toml asks for that the run skipped: incomplete, not pass."""
+        self.calls = [c for c in self.calls if c["state"] != "mixed"]
+        self.save_calls()
+        write_jsonl(self.stamp_path("not_run.jsonl"), [{"state": "mixed", "reason": "case: run deadline"}])
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = [] if (code, res["verdict"], res["problems"]) == (1, "incomplete", []) else [
+            f"exit {code} {res['verdict']} {res['problems']}"]
+        if "state mixed not run: case: run deadline" not in res["incomplete"]:
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_skipped_state(self):
+        self.assertEqual(self.check_skipped_state(), [])
+
+    def check_deadline_mid_state(self, evaluate_py=EVALUATE):
+        """A deadline that stopped a state part way: its unsent calls make the run incomplete."""
+        for i, c in enumerate(self.calls):
+            if (c["statement"], c["state"], c.get("temp"), c["try"]) == ("spans_in_10", "folded_leaves", "cold", 1):
+                self.calls[i] = {k: c[k] for k in ("statement", "state", "temp", "try", "tenant")}
+                self.calls[i].update(outcome="not-run", reason="case: run deadline")
+        self.save_calls()
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = [] if (code, res["verdict"], res["problems"]) == (1, "incomplete", []) else [
+            f"exit {code} {res['verdict']} {res['problems']}"]
+        if "1 cold call(s) of spans_in_10 in folded_leaves not run: case: run deadline" not in res["incomplete"]:
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_deadline_mid_state(self):
+        self.assertEqual(self.check_deadline_mid_state(), [])
+
+    def check_not_requested(self, evaluate_py=EVALUATE):
+        """Gated rows run.toml never asked for are listed, each with the setting that leaves it out."""
+        _, res, text = self.go(BANDS, evaluate_py)
+        got = [(r["row"], r["reason"]) for r in res["not_requested"]]
+        want = [(5, "run.toml hits = false"), (6, "run.toml hits = false"),
+                (9, "run.toml states lacks ['many_parts_744']"), (10, "run.toml states lacks ['many_parts_2160']"), (12, "run.toml scales lacks [10, 100]"),
+                (16, "run.toml hits = false, baseline = false")]
+        out = [] if got == want else [f"not_requested {got}"]
+        if "not requested: row 5 (run.toml hits = false); row 6 " not in text:
+            out.append("summary carries no not-requested line")
+        return out
+
+    def test_not_requested(self):
+        self.assertEqual(self.check_not_requested(), [])
+
+    @staticmethod
+    def gated_placement(res):
+        """Each not-run figure not placed exactly once among not_requested
+        (its whole row, or the figure by name) and incomplete."""
+        rows = {r["key"] for r in res["not_requested"] if not r.get("figures")}
+        named = {f"{r['key']}.{n}" for r in res["not_requested"] for n in r.get("figures", [])}
+        out = []
+        for f in res["figures"]:
+            places = (f["id"].split(".", 1)[0] in rows) + (f["id"] in named) + sum(
+                line.startswith(f"figure {f['id']} not run: ") for line in res["incomplete"])
+            if places != (f["status"] == "not-run"):
+                out.append(f"{f['id']} ({f['status']}) placed {places} time(s)")
+        return out
+
+    def check_gated_unrequested(self, evaluate_py=EVALUATE):
+        """Item 2 (round 5): a gated figure whose state run.toml does not list
+        (row 9's many_parts_744 arm) is listed under not_requested by name."""
+        _, res, text = self.go(BANDS, evaluate_py)
+        out = self.gated_placement(res)
+        want = {"row": 9, "key": "row_09", "figures": ["covering_parts", "resolve_gets", "leaf_gets",
+                                                       "parts_beyond_ceiling", "rows_exact"],
+                "reason": "run.toml states lacks ['many_parts_744']"}
+        if want not in res["not_requested"]:
+            out.append(f"not_requested {res['not_requested']}")
+        if ("row 9 figures covering_parts, resolve_gets, leaf_gets, parts_beyond_ceiling, rows_exact "
+                "(run.toml states lacks ['many_parts_744'])") not in text:
+            out.append("summary names no row 9 figures")
+        return out
+
+    def test_gated_unrequested(self):
+        self.assertEqual(self.check_gated_unrequested(), [])
+
+    def check_gated_asked_not_run(self, evaluate_py=EVALUATE):
+        """Item 2 (round 5): a gated figure whose state run.toml asks for and
+        the run did not reach is incomplete with the reason."""
+        toml = os.path.join(self.run_dir, "run.toml")
+        with open(toml) as f:
+            text = f.read()
+        self.assertEqual(text.count('"many_parts_24"]'), 1)
+        with open(toml, "w") as f:
+            f.write(text.replace('"many_parts_24"]', '"many_parts_24", "many_parts_744"]'))
+        write_jsonl(self.stamp_path("not_run.jsonl"), [{"state": "many_parts_744", "reason": "case: run deadline"}])
+        code, res, _ = self.go(BANDS, evaluate_py)
+        out = self.gated_placement(res)
+        if any(r["key"] == "row_09" for r in res["not_requested"]):
+            out.append(f"not_requested {res['not_requested']}")
+        want = "figure row_09.covering_parts not run: many_parts_744: case: run deadline"
+        if want not in res["incomplete"]:
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_gated_asked_not_run(self):
+        self.assertEqual(self.check_gated_asked_not_run(), [])
+
+    def test_gated_measured(self):
+        # Item 2 (round 5): the 24-part arm ran, so its figures are measured
+        # and placed nowhere else.
+        _, res, _ = self.go(BANDS)
+        self.assertEqual(self.gated_placement(res), [])
+        for name in ("covering_parts_24", "resolve_gets_24", "rows_exact_24"):
+            self.assertEqual(figure(res, f"row_09.{name}")["status"], "value")
+
+    def check_refusal_classes(self, evaluate_py=EVALUATE):
+        """Guard refusals and unsupported figures are counted apart."""
+        _, res, text = self.go(BANDS, evaluate_py)
+        want = {GUARD: {"figures": 15, "calls": 24}, UNSUPPORTED: {"figures": 23, "calls": 0}}
+        out = [] if res["refusal_classes"] == want else [f"classes {res['refusal_classes']}"]
+        if "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 23" not in text:
+            out.append("summary carries no refusal-class line")
+        return out
+
+    def test_refusal_classes(self):
+        self.assertEqual(self.check_refusal_classes(), [])
+
+    def unsend(self, keep):
+        """Turn every mixed call whose (statement, temp) keep rejects into a not-run line."""
+        for i, c in enumerate(self.calls):
+            if c["state"] == "mixed" and not keep(c["statement"], c.get("temp")):
+                self.calls[i] = {k: c[k] for k in ("statement", "state", "temp", "try", "tenant")}
+                self.calls[i].update(outcome="not-run", reason="case: run deadline")
+        self.save_calls()
+
+    def check_matrix_all_not_run(self, evaluate_py=EVALUATE):
+        """Every call group of a state not run: its rows_exact figure is not-run and the run incomplete."""
+        self.unsend(lambda statement, temp: False)
+        code, res, _ = self.go(self.pass_bands(MATRIX_BANDS), evaluate_py)
+        f = figure(res, "row_t2.mixed_rows_exact")
+        out = [] if (f["status"], f["value"], f["verdict"]) == ("not-run", None, "not-run") else [
+            f"figure {f['status']} {f['value']} {f['verdict']}"]
+        if (code, res["verdict"]) != (1, "incomplete"):
+            out.append(f"exit {code} {res['verdict']} {res['problems']}")
+        if ("figure row_t2.mixed_rows_exact not run: every call group in mixed not run: case: run deadline"
+                not in res["incomplete"]):
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_matrix_all_not_run(self):
+        self.assertEqual(self.check_matrix_all_not_run(), [])
+
+    def check_matrix_some_not_run(self, evaluate_py=EVALUATE):
+        """Some call groups of a state not run: the figure passes over the groups that ran and names the rest."""
+        self.unsend(lambda statement, temp: (statement, temp) not in (("journey_b", "cold"),
+                                                                      ("spans_lookup_1h", "warm")))
+        code, res, _ = self.go(self.pass_bands(MATRIX_BANDS), evaluate_py)
+        f = figure(res, "row_t2.mixed_rows_exact")
+        out = [] if (f["status"], f["value"], f["verdict"]) == ("value", 1, "pass") else [
+            f"figure {f['status']} {f['value']} {f['verdict']}"]
+        if f["reason"] != ("over the 23 call group(s) that ran; 2 not run: journey_b/cold, "
+                           "spans_lookup_1h/warm"):
+            out.append(f"reason {f['reason']}")
+        if res["verdict"] != "incomplete":
+            out.append(f"verdict {res['verdict']} {res['problems']}")
+        return out
+
+    def test_matrix_some_not_run(self):
+        self.assertEqual(self.check_matrix_some_not_run(), [])
+
+    def check_budget_from_truth(self, evaluate_py=EVALUATE):
+        """Row 15's GET budget charges truth.json's holders times its rows per holder."""
+        path = os.path.join(self.run_dir, "truth.json")
+        with open(path) as f:
+            truth = json.load(f)
+        truth["failing_cell"]["count"] += 1
+        truth["generator"]["logs_per_trace"] += 2
+        with open(path, "w") as f:
+            json.dump(truth, f)
+        _, res, _ = self.go(BANDS, evaluate_py)
+        m = {f["id"]: f["value"] for f in res["figures"]}
+        out = []
+        if (m["row_15.truth_holders"], m["row_15.truth_rows_per_holder"]) != (
+                truth["failing_cell"]["count"], truth["generator"]["logs_per_trace"]):
+            out.append(f"holders {m['row_15.truth_holders']} rows {m['row_15.truth_rows_per_holder']}")
+        with open(BANDS, "rb") as f:
+            row = next(r for r in tomllib.load(f)["row"] if r["key"] == "row_15")
+        expr = next(f["expr"] for f in row["figure"] if f["name"] == "journey_gets_budget")
+        if m["row_15.journey_gets_budget"] != eval(expr, {"min": min}, {"m": m}):
+            out.append(f"budget {m['row_15.journey_gets_budget']}")
+        return out
+
+    def test_budget_from_truth(self):
+        self.assertEqual(self.check_budget_from_truth(), [])
+
+    def check_absent_leaf_size(self, evaluate_py=EVALUATE):
+        """A leaf the inspector printed no size for makes the share missing, never a sum that reads it as 0."""
+        path = self.stamp_path("folded_leaves.logs.catalog.json")
+        with open(path) as f:
+            doc = json.load(f)
+        leaf = next(lf for p in doc["parts"] for lf in p["leaves"] if lf["field"] == "trace_id")
+        del leaf["bytes"]
+        with open(path, "w") as f:
+            json.dump(doc, f)
+        _, res, _ = self.go(BANDS, evaluate_py)
+        f = figure(res, "row_08.logs_trace_id_leaf_pct")
+        want = ("missing", "a trace_id leaf in stamps/folded_leaves.logs.catalog.json has no size")
+        return [] if (f["status"], f["reason"]) == want else [f"{f['status']} {f['value']} {f['reason']}"]
+
+    def test_absent_leaf_size(self):
+        self.assertEqual(self.check_absent_leaf_size(), [])
+
+    def check_negative_controls(self, evaluate_py=EVALUATE):
+        """Row 13's mutant controls are not built: not-run with that reason, so the run is at best incomplete."""
+        _, res, _ = self.go(BANDS, evaluate_py)
+        f = figure(res, "row_13.negative_controls_failing_on_mutant")
+        out = [] if (f["status"], f["reason"]) == ("not-run", "mutant controls not implemented") else [
+            f"{f['status']} {f['value']} {f['reason']}"]
+        want = "figure row_13.negative_controls_failing_on_mutant not run: mutant controls not implemented"
+        if want not in res["incomplete"]:
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_negative_controls(self):
+        self.assertEqual(self.check_negative_controls(), [])
+
+    def check_maintenance_per_lookup(self, evaluate_py=EVALUATE):
+        """The folded cost with maintenance adds maintenance per part-month over lookups per part-month."""
+        _, res, _ = self.go(BANDS, evaluate_py)
+        freq = res["cost"]["lookups_per_part_month_assumed"]
+        rows = [b for b in res["cost"]["break_even"] if "maintenance_per_lookup" in b]
+        out = [] if freq == 1000 and rows else [f"freq {freq} rows {len(rows)}"]
+        for b in rows:
+            per = round(b["maintenance_per_part_month"] / freq, 9)
+            if (b["maintenance_per_lookup"], b["dollars_folded_leaves_with_maintenance"]) != (
+                    per, round(b["dollars_folded_leaves"] + per, 9)):
+                out.append(f"{b['statement']} {b['maintenance_per_lookup']} {b['dollars_folded_leaves_with_maintenance']}")
+        return out
+
+    def test_maintenance_per_lookup(self):
+        self.assertEqual(self.check_maintenance_per_lookup(), [])
+
+    def check_erasure_victim(self, evaluate_py=EVALUATE):
+        """Under a pending erasure the victim's lookup must return no row (truth_key_in), not the unfolded
+        answer."""
+        _, res, _ = self.go(BANDS, evaluate_py)
+        out = [p for p in res["problems"] if "logs_erasure_victim" in p]
+        f = figure(res, "row_13.erasure_in_flight_rows_exact")
+        if (f["status"], f["value"]) != ("value", 1):
+            out.append(f"figure {f['status']} {f['value']}")
+        return out
+
+    def test_erasure_victim(self):
+        self.assertEqual(self.check_erasure_victim(), [])
+
+    def test_erasure_victim_row_returned_is_wrong(self):
+        unfolded = {c["try"]: c for c in self.select("logs_erasure_victim", "unfolded")}
+        for c in self.select("logs_erasure_victim", "erasure_in_flight"):
+            c["rows"], c["values"] = unfolded[c["try"]]["rows"], unfolded[c["try"]]["values"]
+        self.save_calls()
+        _, res, _ = self.go(BANDS)
+        self.assertIn("wrong_answer logs_erasure_victim/erasure_in_flight/cold try 0: rows 1 expected 0",
+                      res["problems"])
+
+
+# --- wrong evaluators the cases rule out --------------------------------------------
+
+FLIPS = {
+    "missing treated as pass": (
+        '        if entry["status"] != "value":\n            entry["verdict"] = entry["status"]\n',
+        '        if entry["status"] != "value":\n'
+        '            entry["verdict"] = "pass" if entry["status"] == "missing" else entry["status"]\n',
+        "check_missing",
+    ),
+    "last of the duplicates taken": (
+        "            problems.add(\"duplicate\", f\"{name} {'/'.join(str(x) for x in k)}\")\n            out[k] = None\n",
+        "            out[k] = line\n",
+        "check_duplicate_stamp",
+    ),
+    "absent catalog stamp skipped": (
+        '                    problems.add("missing", f"covering_parts.{s}.{lab}")',
+        "                    pass",
+        "check_missing_catalog_stamp",
+    ),
+    "a local build stamp with dirty_paths null taken as clean": (
+        '        problems.add("missing", "stamps/build.json dirty_paths: no count of the harness\'s uncommitted paths")\n',
+        "        pass\n",
+        "check_dirty_paths_null",
+    ),
+    "absent field not named": (
+        '    for name in lacking:\n        problems.add("missing", f"{name} in {at}")\n',
+        '    for name in lacking[:0]:\n        problems.add("missing", f"{name} in {at}")\n',
+        "check_absent_phases",
+    ),
+    "zero segmentsOpened taken as a value": (
+        '    if name == "segments_opened" and value == 0:',
+        "    if False:",
+        "check_dead_counter",
+    ),
+    "probe wire divided by the call's own segment count": (
+        '            probed, why = candidates(c) if candidates else (None, "no ranges stamp reader")',
+        '            probed, why = m["segments"], None',
+        "check_probe_per_object",
+    ),
+    "probe wire divided per GET": (
+        '            probed, why = candidates(c) if candidates else (None, "no ranges stamp reader")',
+        '            probed, why = m["probe_gets"], None',
+        "check_probe_per_object",
+    ),
+    "every object in the state taken as a candidate": (
+        '    return sum(1 for o in objects if o["min_ns"] < end and o["max_ns"] >= start), None',
+        '    return len(objects), None',
+        "check_probe_per_object",
+    ),
+    "a per-object breakdown not cross-checked against the stamp": (
+        '            if isinstance(per_object, list) and len(per_object) != probed:',
+        '            if False:',
+        "check_probe_per_object_cross_check",
+    ),
+    "miss reason dropped": (
+        '        if miss and f.get("miss_reason"):',
+        "        if False:",
+        "check_miss_reason",
+    ),
+    "leaf share over every field": (
+        "        lb = leaf_bytes(doc, field)",
+        "        lb = leaf_bytes(doc)",
+        "check_leaf_share",
+    ),
+    "part count read from the declaration": (
+        '    v = doc.get("part_count")\n',
+        '    v = doc.get("parts_declared", 24)\n',
+        "check_part_count",
+    ),
+    "every server refusal read refused-by-guard": (
+        '                        outcome = c["outcome"] = GUARD if probe else "refused"',
+        '                        outcome = c["outcome"] = GUARD',
+        "check_refused",
+    ),
+    "only cap-probe refusals taken as refused": (
+        '                        outcome = c["outcome"] = GUARD if probe else "refused"',
+        '                        outcome = c["outcome"] = "refused" if probe else GUARD',
+        "check_refused",
+    ),
+    "a guard-refused 1,000-key list read as missing": (
+        "    if guarded:\n",
+        "    if False:\n",
+        "check_control_guard",
+    ),
+    "a 1,000-key list without tier-2 figures read as a miss": (
+        '            return UNSUPPORTED, None, f"{where(c)} carries no keyIndex.keysProbed and partsCovered',
+        '            return "value", 0, f"{where(c)} carries no keyIndex.keysProbed and partsCovered',
+        "check_control_unsupported",
+    ),
+    "1,000 keys probed read as a miss": (
+        '        if ki["keysProbed"] != 1000:',
+        '        if ki["keysProbed"] != 999:',
+        "check_control_pass",
+    ),
+    "a 1,000-key list covering no part passed": (
+        '        if not ki["partsCovered"]:',
+        "        if False:",
+        "check_control_zero_parts_covered",
+    ),
+    "an index-served 1,001-key list not seen": (
+        "        if key_index_nonzero(c):\n",
+        "        if False:\n",
+        "check_control_miss",
+    ),
+    "a 1,001-key list served with keyIndex figures and no scan passed": (
+        "        if key_index_nonzero(c):\n",
+        "        if c.get(\"_never\"):\n",
+        "check_control_served_with_keyindex",
+    ),
+    "scan GETs not counted as a visible path": (
+        '        if m["probe_gets"] == 0 and m["scan_gets"] == 0 and m["blocks_scanned"] == 0:',
+        '        if m["probe_gets"] == 0:',
+        "check_control_served_with_scan",
+    ),
+    "a 1,001-key list served with no visible path passed": (
+        '        if m["probe_gets"] == 0 and m["scan_gets"] == 0 and m["blocks_scanned"] == 0:',
+        "        if False:",
+        "check_control_served_without_scan",
+    ),
+    "keyIndex zeros read as index-served or passed": (
+        '    return isinstance(ki, dict) and bool(ki.get("keysProbed") or ki.get("partsCovered"))',
+        '    return isinstance(ki, dict)',
+        "check_control_zeros_without_scan",
+    ),
+    "a state with every call group unsent read as missing": (
+        "        if groups and len(unsent) == len(groups):\n",
+        "        if False:\n",
+        "check_matrix_all_not_run",
+    ),
+    "unsent call groups not named beside the figure": (
+        "        if unsent:\n            names = ",
+        "        if False:\n            names = ",
+        "check_matrix_some_not_run",
+    ),
+    "a hits-gated row not listed as not requested": (
+        '    if tenant == "hits" and not cfg["hits"]:\n        why.append',
+        '    if False:\n        why.append',
+        "check_not_requested",
+    ),
+    "a gated figure of an unlisted state left out of not_requested": (
+        "        out.append({\"row\": row, \"key\": key, \"figures\": names, \"reason\": why})\n",
+        "        pass\n",
+        "check_gated_unrequested",
+    ),
+    "a gated figure of an asked state left out of incomplete": (
+        '        if f["status"] == "not-run" and not f.get("not_requested"):\n',
+        '        if f["status"] == "not-run" and not f.get("gated"):\n',
+        "check_gated_asked_not_run",
+    ),
+    "a partial needle inspection left out of incomplete": (
+        '            out["incomplete"].append(entry["reason"])\n',
+        "",
+        "check_needle_partial",
+    ),
+    "guard refusals counted with unsupported figures": (
+        '                                             if c.get("outcome") == k)}',
+        '                                             if c.get("outcome") in (GUARD, UNSUPPORTED))}',
+        "check_refusal_classes",
+    ),
+    "full overlap not counted": (
+        'overlapped = sum(1 for c in lines if c["started_unix_s"] < ended and',
+        'overlapped = sum(1 for c in lines if c["started_unix_s"] > ended and',
+        "check_overlap_full",
+    ),
+    "partial overlap taken as in flight": (
+        "        if overlapped == len(lines):\n",
+        "        if overlapped:\n",
+        "check_overlap_partial",
+    ),
+    "zero overlap read as a short window": (
+        "        if ended <= first:\n",
+        "        if ended <= first or not overlapped:\n",
+        "check_overlap_zero",
+    ),
+    "a short window taken as not_in_flight": (
+        "        elif ended - started < shortest:\n",
+        "        elif False:\n",
+        "check_overlap_too_short",
+    ),
+    "an unsent state read as missing": (
+        "        if groups and len(unsent) == len(groups):\n",
+        "        if False:\n",
+        "check_overlap_too_short",
+    ),
+    "a skipped state passed over": (
+        "        if live.get(s) is not None:\n            out.append(",
+        "        if False:\n            out.append(",
+        "check_skipped_state",
+    ),
+    "unsent calls of a live state passed over": (
+        "        if lines:\n            out.append(",
+        "        if False:\n            out.append(",
+        "check_deadline_mid_state",
+    ),
+    "truth figures not read from truth.json": (
+        "    return \"value\", v, \"\"\n\n\ndef run_rows",
+        "    return \"value\", 1, \"\"\n\n\ndef run_rows",
+        "check_budget_from_truth",
+    ),
+    "an absent leaf size summed as 0": (
+        "    return sum(values) if all(isinstance(v, int) for v in values) else None",
+        "    return sum(v for v in values if isinstance(v, int))",
+        "check_absent_leaf_size",
+    ),
+    "negative controls reported as run": (
+        '            return "not-run", None, "mutant controls not implemented"',
+        '            return "value", 5, ""',
+        "check_negative_controls",
+    ),
+    "maintenance charged whole to every lookup": (
+        '                per = m["maintenance_per_part_month"] / freq',
+        '                per = m["maintenance_per_part_month"]',
+        "check_maintenance_per_lookup",
+    ),
+    "pending erasure judged against the unfolded answer": (
+        'unfolded_oracle = st is not None and state not in (st.get("truth_key_in") or {}) and (',
+        "unfolded_oracle = st is not None and (",
+        "check_erasure_victim",
+    ),
+    "state without calls passed over": (
+        '            problems.add("missing", f"state {state}: no calls in calls.jsonl")\n',
+        "            pass\n",
+        "check_state_absent",
+    ),
+    "census read from the first tenant": (
+        '        data = ((line.get("census") or {}).get("tenants") or {}).get(tenant, {}).get("data", {}).get(signal)',
+        '        data = ((line.get("census") or {}).get("tenants") or {}).get("inv", {}).get("data", {}).get(signal)',
+        "check_census_per_tenant",
+    ),
+    "amortise_months defaulted to one month": (
+        '        problems.add("missing", "run.toml cost.amortise_months (a whole number of months, at least 1)")\n'
+        '        cfg["cost"]["amortise_months"] = None\n',
+        '        cfg["cost"]["amortise_months"] = 1\n',
+        "check_amortise_months_required",
+    ),
+    "census bytes defaulted to 0": (
+        '        b = (line.get("census") or {}).get("bytes")\n',
+        '        b = (line.get("census") or {}).get("bytes", 0)\n',
+        "check_storage_bytes_missing",
+    ),
+    "a band's lower bound not applied": (
+        '            ok = evaluate_expr(f.get("target_if", "True"), entry["value"], values)\n'
+        '            miss = evaluate_expr(f.get("miss_if", "False"), entry["value"], values)\n',
+        '            ok = evaluate_expr(f.get("target_if", "True").split(" <= ", 1)[-1], entry["value"], values)\n'
+        '            miss = False\n',
+        "check_row_6_floor",
+    ),
+    "a needle outside 25 % of planted passed": (
+        "        elif abs(got - want) <= NEEDLE_BLOCK_BAND * want:\n",
+        "        elif True:\n",
+        "check_needle_band_miss",
+    ),
+    "a sparse or common needle compared exactly": (
+        "        elif band == \"exact\":\n",
+        "        elif band in (\"exact\", \"band\"):\n",
+        "check_needle_geometry",
+    ),
+    "a null storage block count read as 0": (
+        '        got = doc.get(f"{column}_present_blocks")\n',
+        '        got = doc.get(f"{column}_present_blocks") or 0\n',
+        "check_needle_storage_null",
+    ),
+    "a needle's planted count not reported": (
+        '        out["figures"].append({"id": f"needle_blocks.{value}.planted", "value": want})\n',
+        "",
+        "check_needle_geometry",
+    ),
+}
+
+
+class Flips(Workdir):
+    def test_each_wrong_evaluator_fails_its_case(self):
+        with open(EVALUATE) as f:
+            src = f.read()
+        for name, (old, new, case) in FLIPS.items():
+            with self.subTest(flip=name):
+                self.assertEqual(src.count(old), 1, f"{name}: anchor gone from evaluate.py; update the flip")
+                differs = next((i for i, (a, b) in enumerate(zip(old, new)) if a != b), min(len(old), len(new)))
+                line = src[: src.index(old) + differs].count("\n") + 1
+                flipped = self.path(f"evaluate_{case}.py")
+                with open(flipped, "w") as f:
+                    f.write(src.replace(old, new))
+                t = Evaluate(case)
+                t.setUp()
+                try:
+                    self.assertEqual(getattr(t, case)(), [], f"{name}: the real evaluator fails its own case")
+                    t.tearDown()
+                    t.setUp()
+                    failures = getattr(t, case)(flipped)
+                finally:
+                    t.tearDown()
+                self.assertTrue(failures, f"{name}: the flipped evaluator passed {case}")
+                print(f"flip '{name}' at evaluate.py:{line} fails {case}: {failures}", file=sys.stderr)
+
+
+# --- box/ ---------------------------------------------------------------------------
+
+
+def run_sh(lane, toml, out, *extra):
+    p = subprocess.run([BASH, os.path.join(BOX, "run.sh"), "--dry-run", "--lane", lane, "--run-toml", toml,
+                        "--out", out, *extra], capture_output=True, text=True)
+    return p.returncode, p.stdout + p.stderr
+
+
+class Box(Workdir):
+    def steps(self, text):
+        return [line.split(" ", 1)[1] for line in text.splitlines() if line.startswith("STEP ")]
+
+    def blocks(self, text):
+        """{step: [lines]} of a dry-run's output."""
+        out, cur = {}, None
+        for line in text.splitlines():
+            if line.startswith("STEP "):
+                cur = line.split(" ", 1)[1]
+                out[cur] = []
+            elif cur:
+                out[cur].append(line)
+        return out
+
+    LANE_STATES = {"local": ("compaction_in_flight", "erasure_in_flight", "many_parts_24"),
+                   "s3": ("compaction_in_flight", "erasure_in_flight", "many_parts_744", "many_parts_2160")}
+
+    def assert_flow(self, text, lane, hits=False):
+        states = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed") + self.LANE_STATES[lane]
+        self.assertEqual(self.steps(text), [
+            "bootstrap", "store", "host", "corpus", "declare", "load-base",
+            *(f"state:{s}" for s in states), "evaluate", "finish"])
+        b = self.blocks(text)
+        for state in states:
+            lines = b[f"state:{state}"]
+            self.assertIn("STAMP stamps/transitions.jsonl", lines, state)
+            self.assertIn("STAMP stamps/census.jsonl", lines, state)
+            self.assertIn("STAMP stamps/restarts.jsonl", lines, state)
+            if state != "compaction_in_flight":
+                self.assertIn(f"STAMP stamps/{state}.server.json", lines, state)
+        for state in states[:4]:
+            lines = b[f"state:{state}"]
+            self.assertIn("STAMP stamps/census.jsonl", lines, state)
+            self.assertIn("STAMP stamps/restarts.jsonl", lines, state)
+            j = "\n".join(lines)
+            self.assertIn("stop server, drop page cache, start server", j)
+            self.assertIn("RQ_STATS=1", j)
+            self.assertIn("plan --statements " + STATEMENTS, j)
+        folds = 3 if hits else 2
+        fl = b["state:folded_no_leaves"]
+        self.assertEqual(sum("catalog fold" in x and "--writers-stopped" in x and "--key-index-leaves" not in x
+                             for x in fl), folds)
+        lv = "\n".join(b["state:folded_leaves"])
+        self.assertEqual(lv.count("--writers-stopped --json --key-index-leaves"), folds)
+        self.assertEqual(lv.count("--rebuild-key-index --json"), folds)
+        self.assertLess(lv.index("--key-index-leaves"), lv.index("--rebuild-key-index"))
+        self.assertLess(lv.rindex("--rebuild-key-index"), lv.index("STAMP stamps/transitions.jsonl"))
+        self.assertEqual(b["state:folded_leaves"].count("STAMP stamps/folds.jsonl"), 2 * folds)
+        mx = b["state:mixed"]
+        mj = "\n".join(mx)
+        self.assertLess(mj.index("wait until the ingest hour"), mj.index("load-tail-spans"))
+        self.assertLess(mj.index("load-tail-spans"), mj.index("load-tail-logs"))
+        self.assertEqual(mx.count("STAMP stamps/transitions.jsonl"), 2)
+        self.assertLess(mj.index("RQ_STATS=1"), mj.index("fold-fold_advance-spans"))
+        self.assertIn("fold-fold_advance-logs", mj)
+        cx = b["state:compaction_in_flight"]
+        cj = "\n".join(cx)
+        self.assertLess(cj.index("wait until 310 s past the current hour start"), cj.index("compact-spans"))
+        self.assertEqual(cj.count("the compactions above run as background children, both signals at once"), 1)
+        self.assertLess(cj.index("background children"), cj.index("--state compaction_in_flight"))
+        self.assertLess(cj.index("RQ_STATS=1"), cj.index("kv-report"))
+        self.assertEqual(cx.count("STAMP stamps/compaction.jsonl"), 2)
+        self.assertEqual(cx.count("STAMP stamps/transitions.jsonl"), 2)
+        self.assertEqual(cx.count("STAMP stamps/compaction_done.server.json"), 1)
+        self.assertIn("--state compaction_done", cj)
+        for state in self.LANE_STATES[lane]:
+            if not state.startswith("many_parts_"):
+                continue
+            tenant = "mp" + state.rsplit("_", 1)[1]
+            pj = "\n".join(b[f"state:{state}"])
+            self.assertIn(f"load-{state}-spans", pj)
+            self.assertLess(pj.index(f"fold-{state}-spans"), pj.index(f"fold-{state}_leaf_rebuild-spans"))
+            self.assertIn(f"--tenant {tenant}", pj)
+            self.assertIn(f"--state {state} ", pj)
+            self.assertIn(f"--tenant {tenant} --sub {state}", pj)
+        self.assertIn("evaluate.py --run", "\n".join(b["evaluate"]))
+        return b
+
+    def test_s3_dry_run(self):
+        code, text = run_sh("s3", os.path.join(BOX, "run.example.toml"), self.path("out"))
+        self.assertEqual(code, 0, text)
+        b = self.assert_flow(text, "s3")
+        boot = "\n".join(b["bootstrap"])
+        self.assertIn("checkout -q --detach", boot)
+        self.assertIn("force-frame-pointers=yes", boot)
+        self.assertIn("-p ravel-server --features sql", boot)
+        self.assertIn("pyarrow", boot)
+        self.assertIn("store qualify", "\n".join(b["store"]))
+        self.assertIn("--index-trace-id true", "\n".join(b["declare"]))
+        self.assertIn("upload out/ (no DONE, FAILED or work/) to s3://", "\n".join(b["finish"]))
+        self.assertIn("then terminate the instance", "\n".join(b["finish"]))
+        self.assertNotIn("--tenant hits", text)
+        self.assertNotIn("NOT-RUN", text)
+        # Item 9: one part per ingest hour, N hours ending three hours before
+        # the run's first hour, so both states' parts are sealed when they run.
+        h0 = int(time.time()) // 3600
+        for n in (744, 2160):
+            pj = "\n".join(b[f"state:many_parts_{n}"])
+            m = re.findall(r"--ingest-hour-stride 1 --ingest-hour-start (\d+)", pj)
+            self.assertEqual(len(m), 1, n)
+            self.assertIn(int(m[0]) + n + 3 - h0, (0, -1), (n, m[0], h0))
+            fold = next(x for x in b[f"state:many_parts_{n}"] if f"fold-many_parts_{n}-spans" in x)
+            self.assertIn("--snapshot-part-max-entries 1", fold)
+            self.assertEqual(pj.count("--snapshot-part-max-entries 1"), 1, n)
+
+    def example_toml(self, *swaps):
+        with open(os.path.join(BOX, "run.example.toml")) as f:
+            text = f.read()
+        for old, new in swaps:
+            self.assertEqual(text.count(old), 1, old)
+            text = text.replace(old, new)
+        p = self.path("run.toml")
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    def test_s3_dry_run_with_hits(self):
+        # Item 4: the hits tenant is declared, loaded, folded, rebuilt and
+        # stamped on its own, keyed on UserID.
+        code, text = run_sh("s3", self.example_toml(("hits = false", "hits = true")), self.path("out"))
+        self.assertEqual(code, 0, text)
+        b = self.assert_flow(text, "s3", hits=True)
+        self.assertIn("--key-index UserID", "\n".join(b["declare"]))
+        self.assertIn("--batch-rows 100000 --target-bytes 1850000000", text)
+        self.assertIn("load-hits.measure.json", text)
+        lv = "\n".join(b["state:folded_leaves"])
+        self.assertIn("fold-folded_leaves-hits", lv)
+        self.assertIn("fold-leaf_rebuild-hits", lv)
+        self.assertIn("catalog fold --tenant hits --shards 8 --signal logs --rebuild-key-index --json", lv)
+        stamped = [s for s in b if "--tenant hits --signal logs --label hits" in "\n".join(b[s])]
+        self.assertTrue({"state:unfolded", "state:folded_no_leaves", "state:folded_leaves"} <= set(stamped), stamped)
+
+    def test_s3_dry_run_past_the_deadline(self):
+        # Item 20: with the deadline already passed every state is NOT-RUN
+        # with its reason, and the run still evaluates and finishes.
+        code, text = run_sh("s3", self.example_toml(("max_minutes = 540", "max_minutes = 0")), self.path("out"))
+        self.assertEqual(code, 0, text)
+        states = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed") + self.LANE_STATES["s3"]
+        lines = [x for x in text.splitlines() if x.startswith("NOT-RUN ")]
+        self.assertEqual(lines, [f"NOT-RUN {s}: deadline: run.max_minutes 0 passed (0 minutes elapsed)"
+                                 for s in states])
+        self.assertEqual(self.steps(text)[-2:], ["evaluate", "finish"])
+        self.assertNotIn("RQ_STATS=1", text)
+
+    def deadline_lines(self, text):
+        # The seconds left move with the clock; everything else is pinned.
+        return [re.sub(r", \d+ s left of", ", N s left of", x) for x in text.splitlines()
+                if x.startswith("NOT-RUN ")]
+
+    def test_s3_dry_run_skips_steps_the_deadline_cannot_hold(self):
+        # Item 6: with 20 minutes of deadline, every state whose next long
+        # step is bounded past what is left is NOT-RUN before that step starts:
+        # the 30-minute default estimate for loads, folds, leaf rebuilds and
+        # compaction, the 70-minute wait for the mixed state's hour. States
+        # with no long step run, and evaluate and finish still follow.
+        code, text = run_sh("s3", self.example_toml(("max_minutes = 540", "max_minutes = 20")), self.path("out"))
+        self.assertEqual(code, 0, text)
+        left = "N s left of run.max_minutes 20"
+        self.assertEqual(self.deadline_lines(text), [
+            f"NOT-RUN folded_no_leaves: deadline: fold needs up to 1800 s, {left}",
+            f"NOT-RUN folded_leaves: deadline: fold needs up to 1800 s, {left}",
+            f"NOT-RUN mixed: deadline: the wait for the next ingest hour needs up to 4200 s, {left}",
+            f"NOT-RUN compaction_in_flight: deadline: wait_sealed and compaction needs up to 2110 s, {left}",
+            f"NOT-RUN many_parts_744: deadline: load needs up to 1800 s, {left}",
+            f"NOT-RUN many_parts_2160: deadline: load needs up to 1800 s, {left}",
+        ])
+        b = self.blocks(text)
+        self.assertNotIn("catalog fold", "\n".join(b["state:folded_no_leaves"] + b["state:folded_leaves"]))
+        self.assertNotIn("wait until the ingest hour", text)
+        self.assertNotIn("maintain compact-tenant", text)
+        self.assertIn("needle-blocks", "\n".join(b["state:unfolded"]))
+        self.assertIn("erase submit", "\n".join(b["state:erasure_in_flight"]))
+        self.assertEqual(self.steps(text)[-2:], ["evaluate", "finish"])
+
+    def test_s3_dry_run_per_state_estimate(self):
+        # Item 6: a per-state estimate in run.toml replaces the default for
+        # that state alone; the 310 s sealed-hour wait is bounded on its own.
+        code, text = run_sh("s3", self.example_toml(
+            ("max_minutes = 540", "max_minutes = 20"),
+            ("[step_estimate_minutes]\ndefault = 30\n",
+             "[step_estimate_minutes]\ndefault = 30\nfolded_no_leaves = 5\ncompaction_in_flight = 13\n")),
+            self.path("out"))
+        self.assertEqual(code, 0, text)
+        lines = self.deadline_lines(text)
+        self.assertNotIn("folded_no_leaves", "\n".join(lines))
+        self.assertNotIn("compaction_in_flight", "\n".join(lines))
+        self.assertIn("NOT-RUN folded_leaves: deadline: fold needs up to 1800 s, N s left of run.max_minutes 20",
+                      lines)
+        self.assertIn("catalog fold", "\n".join(self.blocks(text)["state:folded_no_leaves"]))
+        self.assertIn("maintain compact-tenant", text)
+        code, text = run_sh("s3", self.example_toml(
+            ("max_minutes = 540", "max_minutes = 5"), ("states = [\"unfolded\"", "states = [\"compaction_in_flight\""),
+            ("[step_estimate_minutes]\ndefault = 30\n", "[step_estimate_minutes]\ndefault = 0\n")),
+            self.path("out"))
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.deadline_lines(text)[0], "NOT-RUN compaction_in_flight: deadline: wait_sealed and "
+                                                       "compaction needs up to 310 s, N s left of run.max_minutes 5")
+        code, text = run_sh("s3", self.example_toml(
+            ("[step_estimate_minutes]\ndefault = 30\n", "[step_estimate_minutes]\ndefault = \"half\"\n")),
+            self.path("out"))
+        self.assertEqual(code, 1, text)
+        self.assertIn("run.toml step_estimate_minutes.unfolded", text)
+
+    def compaction_deadline_lines(self, run_sh_path):
+        # 16 minutes of compaction fits 20 minutes of run, and so does the
+        # 310 s sealed-hour wait, but not the two back to back.
+        toml = self.example_toml(
+            ("max_minutes = 540", "max_minutes = 20"), ("states = [\"unfolded\"", "states = [\"compaction_in_flight\""),
+            ("[step_estimate_minutes]\ndefault = 30\n", "[step_estimate_minutes]\ndefault = 0\ncompaction_in_flight = 16\n"))
+        p = subprocess.run([BASH, run_sh_path, "--dry-run", "--lane", "s3", "--run-toml", toml, "--out",
+                            self.path("out")], capture_output=True, text=True)
+        lines = [x for x in self.deadline_lines(p.stdout + p.stderr) if x.startswith("NOT-RUN compaction_in_flight:")]
+        return p.returncode, sorted(set(lines)), p.stdout + p.stderr
+
+    def test_compaction_deadline_checks_the_sum(self):
+        # Item 4 (round 5): wait_sealed and the compaction are checked
+        # against the time left together.
+        code, lines, text = self.compaction_deadline_lines(os.path.join(BOX, "run.sh"))
+        self.assertEqual(code, 0, text)
+        self.assertEqual(lines, ["NOT-RUN compaction_in_flight: deadline: wait_sealed and compaction needs up to "
+                                 "1270 s, N s left of run.max_minutes 20"])
+        self.assertNotIn("maintain compact-tenant", text)
+        with open(os.path.join(BOX, "run.sh")) as f:
+            src = f.read()
+        old = ('  fits compaction_in_flight "wait_sealed and compaction" "$((WAIT_SEALED_MAX_S + compact_s))" '
+               '|| return 0\n')
+        self.assertEqual(src.count(old), 1)
+        inv = self.path("inv")
+        os.mkdir(inv)
+        for name in os.listdir(HERE):
+            if name != "box":
+                os.symlink(os.path.join(HERE, name), os.path.join(inv, name))
+        shutil.copytree(BOX, os.path.join(inv, "box"))
+        with open(os.path.join(inv, "box", "run.sh"), "w") as f:
+            f.write(src.replace(old, '  fits compaction_in_flight wait_sealed "$WAIT_SEALED_MAX_S" || return 0\n'
+                                     '  fits compaction_in_flight compaction "$compact_s" || return 0\n'))
+        _, lines, text = self.compaction_deadline_lines(os.path.join(inv, "box", "run.sh"))
+        self.assertEqual(lines, [])
+        self.assertIn("maintain compact-tenant", text)
+        line = src[: src.index(old)].count("\n") + 1
+        print(f"flip 'wait_sealed and compaction checked apart' at box/run.sh:{line} fails "
+              f"test_compaction_deadline_checks_the_sum: NOT-RUN lines {lines}", file=sys.stderr)
+
+    def test_deadline_check_flip_fails_its_case(self):
+        # Item 6: a run.sh whose step check never refuses starts the fold
+        # the deadline cannot hold.
+        with open(os.path.join(BOX, "run.sh")) as f:
+            src = f.read()
+        old = '  [ "$left" -lt "$3" ] || return 0\n'
+        self.assertEqual(src.count(old), 1)
+        inv = self.path("inv")
+        os.mkdir(inv)
+        for name in os.listdir(HERE):
+            if name != "box":
+                os.symlink(os.path.join(HERE, name), os.path.join(inv, name))
+        shutil.copytree(BOX, os.path.join(inv, "box"))
+        with open(os.path.join(inv, "box", "run.sh"), "w") as f:
+            f.write(src.replace(old, "  return 0\n"))
+        toml = self.example_toml(("max_minutes = 540", "max_minutes = 20"))
+        p = subprocess.run([BASH, os.path.join(inv, "box", "run.sh"), "--dry-run", "--lane", "s3", "--run-toml",
+                            toml, "--out", self.path("out")], capture_output=True, text=True)
+        lines = self.deadline_lines(p.stdout + p.stderr)
+        self.assertNotIn("NOT-RUN folded_no_leaves: deadline: fold needs up to 1800 s, N s left of "
+                         "run.max_minutes 20", lines)
+        line = src[: src.index(old)].count("\n") + 1
+        print(f"flip 'a step the deadline cannot hold started' at box/run.sh:{line} fails "
+              f"test_s3_dry_run_skips_steps_the_deadline_cannot_hold: NOT-RUN lines {lines}", file=sys.stderr)
+
+    def test_local_dry_run(self):
+        code, text = run_sh("local", os.path.join(BOX, "run.local-smoke.toml"), self.path("out"))
+        self.assertEqual(code, 0, text)
+        b = self.assert_flow(text, "local")
+        self.assertIn("--address 127.0.0.1:", "\n".join(b["store"]))
+        self.assertNotIn("--tenant hits", text)
+        self.assertNotIn("aws ", text)
+        self.assertNotIn("terminate", text)
+        self.assertNotIn("shutdown", text)
+
+    def dirty_paths_line(self, run_sh_src=None):
+        """The local dry run's dirty_paths with a git whose status fails."""
+        d = self.path("gitstub")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "git"), "w") as f:
+            f.write('#!/bin/sh\ncase " $* " in *" status "*) exit 128 ;; esac\necho 0123456789abcdef\n')
+        os.chmod(os.path.join(d, "git"), 0o755)
+        script = os.path.join(BOX, "run.sh")
+        if run_sh_src is not None:
+            script = os.path.join(BOX, "run.flipped.sh")
+            with open(script, "w") as f:
+                f.write(run_sh_src)
+        try:
+            p = subprocess.run([BASH, script, "--dry-run", "--lane", "local", "--run-toml",
+                                os.path.join(BOX, "run.local-smoke.toml"), "--out", self.path("out")],
+                               capture_output=True, text=True, env=dict(os.environ, PATH=d + os.pathsep + os.environ["PATH"]))
+        finally:
+            if run_sh_src is not None:
+                os.remove(script)
+        return [x for x in p.stdout.splitlines() if "build.json dirty_paths" in x]
+
+    def test_dirty_paths_null_when_git_status_fails(self):
+        self.assertEqual(self.dirty_paths_line(), ["DRY-RUN: build.json dirty_paths null"])
+        with open(os.path.join(BOX, "run.sh")) as f:
+            src = f.read()
+        old = "      dirty=null\n"
+        self.assertEqual(src.count(old), 1)
+        # Flipped back to a count of zero, the failed status reads as a clean tree.
+        self.assertEqual(self.dirty_paths_line(src.replace(old, "      dirty=0\n")),
+                         ["DRY-RUN: build.json dirty_paths 0"])
+
+    def test_s3_lane_refuses_off_the_box(self):
+        p = subprocess.run([BASH, os.path.join(BOX, "run.sh"), "--lane", "s3", "--run-toml",
+                            os.path.join(BOX, "run.example.toml"), "--out", self.path("out")],
+                           capture_output=True, text=True)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("runs only on a box launch.sh started", p.stderr)
+
+    def test_run_sh_failure_and_terminate_guards(self):
+        with open(os.path.join(BOX, "run.sh")) as f:
+            src = f.read()
+        self.assertIn("trap on_exit EXIT", src)
+        self.assertIn(">\"$OUT/FAILED\"", src)
+        self.assertIn('[ "$LANE" = s3 ] && [ "$DRY_RUN" = 0 ] && [ -f "$BOX_MARKER" ] || return 0', src)
+        self.assertEqual(src.count("shutdown -h now"), 1)
+        self.assertIn("--mode query", src)
+
+    def filled_toml(self):
+        with open(os.path.join(BOX, "run.example.toml")) as f:
+            text = f.read()
+        text = (text.replace("FILL-IN-COMMIT", "0123456789abcdef0123456789abcdef01234567")
+                .replace("FILL-IN-BUCKET-NAME", "case-bucket").replace("FILL-IN-EMPTY-STORE-BUCKET", "case-store"))
+        p = self.path("run.toml")
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    def stub_path(self):
+        """A PATH whose aws records any call and fails, so a dry run that runs one shows."""
+        d = self.path("stub")
+        os.makedirs(d)
+        with open(os.path.join(d, "aws"), "w") as f:
+            f.write(f"#!/bin/sh\necho \"$*\" >> {self.path('aws-called')}\nexit 1\n")
+        os.chmod(os.path.join(d, "aws"), 0o755)
+        return d + os.pathsep + os.environ["PATH"]
+
+    def test_launch_dry_run(self):
+        env = dict(os.environ, PATH=self.stub_path())
+        p = subprocess.run([BASH, os.path.join(BOX, "launch.sh"), "--dry-run", self.filled_toml()],
+                           capture_output=True, text=True, env=env, cwd=self.tmp)
+        text = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, text)
+        self.assertFalse(os.path.exists(self.path("aws-called")))
+        self.assertIn("--instance-initiated-shutdown-behavior terminate", text)
+        self.assertIn("shutdown -h +600", text)
+        self.assertIn("c6a.4xlarge", text)
+        self.assertNotIn("spot", text.lower().replace("no spot", ""))
+        user = text[text.index("DRY-RUN user-data:"): text.index("DRY-RUN end user-data")]
+        self.assertLess(user.index("shutdown -h +600"), user.index("run.sh"))
+        self.assertIn("RUN_ID", user)
+
+    def test_launch_refuses_an_unfilled_toml(self):
+        p = subprocess.run([BASH, os.path.join(BOX, "launch.sh"), "--dry-run", os.path.join(BOX, "run.example.toml")],
+                           capture_output=True, text=True, env=dict(os.environ, PATH=self.stub_path()))
+        self.assertEqual(p.returncode, 64)
+
+    @staticmethod
+    def objects_over_512k(inv_py):
+        mod = load_module(inv_py, "inv_case")
+        keys = [("t/h1/l/l0/0000/a.1.1.0000000000000000.rseg", 512 * 1024),
+                ("t/h1/l/l0/0000/b.1.1.0000000000000000.rseg", 512 * 1024 + 1),
+                ("t/h1/l/l0/0001/c.1.1.0000000000000000.rseg", 10),
+                ("t/h2/l/l0/0000/d.1.1.0000000000000000.rseg", 1 << 30)]
+        got = mod.tenant_census(keys, "h1")["data"]["logs"]
+        return [] if (got["objects"], got["objects_over_512k"]) == (3, 1) else [f"census {got}"]
+
+    def test_row_6_floor_counts_objects_over_512_kib(self):
+        # Row 6's keyIndex GET floor is the tenant's data objects strictly
+        # over 512 KiB; one at exactly 512 KiB is not probed.
+        inv = os.path.join(BOX, "lib", "inv.py")
+        self.assertEqual(self.objects_over_512k(inv), [])
+        with open(inv) as f:
+            src = f.read()
+        old = 'd["objects_over_512k"] += size > LARGE_OBJECT_BYTES'
+        self.assertEqual(src.count(old), 1)
+        flipped = self.path("inv_flipped.py")
+        with open(flipped, "w") as f:
+            f.write(src.replace(old, old.replace(" > ", " >= ")))
+        failures = self.objects_over_512k(flipped)
+        self.assertTrue(failures)
+        line = src[: src.index(old)].count("\n") + 1
+        print(f"flip 'objects at 512 KiB counted' at box/lib/inv.py:{line} fails the row 6 floor: {failures}",
+              file=sys.stderr)
+
+    # A listing of one hour: 4 L0 objects, their 4 commit records, the
+    # provenance object and one L1 part. One commit
+    # record is given a data-object size so a count over the signal prefix
+    # shows in objects_over_512k too.
+    CENSUS_KEYS = [
+        *((f"t/h1/l/l0/000{i}/w.1.{i}.000000000000000{i}.rseg", 600 * 1024 if i < 2 else 1000) for i in range(4)),
+        *((f"t/h1/l/c/000{i}/2026110300/w.1.{i}.cmt", 700 * 1024 if i == 0 else 300) for i in range(4)),
+        ("t/h1/l/prov", 33),
+        ("t/h1/l/l1/0000/2026110300/abcdabcdabcdabcd.0000.0123456701234567.rseg", 900 * 1024),
+    ]
+
+    @classmethod
+    def census_of_hits(cls, inv_py):
+        """(problems, census figures) of CENSUS_KEYS as the hits tenant, and
+        row 6's keyIndex GET verdicts at the 2 x objects ceiling and one past
+        it."""
+        inv = load_module(inv_py, "inv_census")
+        tc = inv.tenant_census(cls.CENSUS_KEYS, "h1")
+        got = tc["data"]["logs"]
+        out = []
+        want = {"objects": 5, "l0_objects": 4, "l1_objects": 1, "objects_over_512k": 3,
+                "bytes": 2 * 600 * 1024 + 2 * 1000 + 900 * 1024}
+        for k, v in want.items():
+            if got.get(k) != v:
+                out.append(f"census {k} {got.get(k)}, want {v}")
+        for cls_name, n in (("l/l0", 4), ("l/c", 4), ("l/prov", 1), ("l/l1", 1)):
+            if tc["classes"].get(cls_name, {}).get("objects") != n:
+                out.append(f"class {cls_name} {tc['classes'].get(cls_name)}, want {n} objects")
+        for key, want_cls in (("t/h1/l/l0/0000/x.rseg", "l/l0"), ("t/h1/s/c/0000/h/x.cmt", "s/c"),
+                              ("t/h1/l/prov", "l/prov"), ("t/h1/catalog/s/HEAD", "catalog/s")):
+            if inv.object_class(key) != want_cls:
+                out.append(f"object_class({key}) {inv.object_class(key)!r}, want {want_cls!r}")
+        mod = load_module(EVALUATE, "evaluate_census_row6")
+        with open(BANDS, "rb") as f:
+            bands = {"row": [r for r in tomllib.load(f)["row"] if r["key"] == "row_06"]}
+        census = {("unfolded",): {"state": "unfolded", "census": {"tenants": {"hits": tc}}}}
+        cfg = {"lane": "local", "hits": True, "tenant": "inv", "scales": [1], "baseline": False,
+               "states": ["unfolded"]}
+        for gets, verdict in ((10, "pass"), (11, "miss")):
+            def fixed(calls, cfg, statement, state, metric, candidates=None, gets=gets):
+                return ("value", gets, "") if metric == "cold.max.keyindex_gets" else ("missing", None, "not set")
+            mod.statement_figure = fixed
+            figs = mod.run_rows(bands, cfg, {"unfolded": None}, None, None, {}, census, None, {}, {})
+            fig = next(f for f in figs if f["id"] == "row_06.keyindex_gets")
+            if fig["verdict"] != verdict:
+                out.append(f"{gets} keyIndex GETs over {got.get('objects')} objects read {fig['verdict']}, "
+                           f"want {verdict}")
+        return out
+
+    def test_census_counts_data_objects_only(self):
+        # Item 1 (round 5): data objects are the .rseg keys under l0/ and l1/;
+        # commit records, provenance and compaction records are classes.
+        inv = os.path.join(BOX, "lib", "inv.py")
+        self.assertEqual(self.census_of_hits(inv), [])
+        with open(inv) as f:
+            src = f.read()
+        old = "            if is_data_key(rest):\n"
+        self.assertEqual(src.count(old), 1)
+        flipped = self.path("inv_census_flipped.py")
+        with open(flipped, "w") as f:
+            f.write(src.replace(old, "            if True:\n"))
+        failures = self.census_of_hits(flipped)
+        self.assertIn("census objects 10, want 5", failures)
+        self.assertIn("11 keyIndex GETs over 10 objects read pass, want miss", failures)
+        line = src[: src.index(old)].count("\n") + 1
+        print(f"flip 'every signal key counted as a data object' at box/lib/inv.py:{line} fails the census: "
+              f"{failures}", file=sys.stderr)
+        old = "    if head in SIGNAL_DIR and len(rest) > 1:\n"
+        self.assertEqual(src.count(old), 1)
+        with open(flipped, "w") as f:
+            f.write(src.replace(old, '    if head in ("logs", "spans", "metrics") and len(rest) > 1:\n'))
+        failures = self.census_of_hits(flipped)
+        self.assertIn("object_class(t/h1/l/l0/0000/x.rseg) 'l', want 'l/l0'", failures)
+        line = src[: src.index(old)].count("\n") + 1
+        print(f"flip 'object_class by long signal names' at box/lib/inv.py:{line} fails the census: {failures}",
+              file=sys.stderr)
+
+    def test_fetch_dry_run(self):
+        env = dict(os.environ, PATH=self.stub_path())
+        run_id = "investigations-20261103T000000Z-1-1"
+        p = subprocess.run([BASH, os.path.join(BOX, "fetch.sh"), "--dry-run", self.filled_toml(), run_id],
+                           capture_output=True, text=True, env=env, cwd=self.tmp)
+        text = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, text)
+        self.assertFalse(os.path.exists(self.path("aws-called")))
+        self.assertIn(f"s3://case-bucket/investigations/runs/{run_id}/out", text)
+        p = subprocess.run([BASH, os.path.join(BOX, "fetch.sh"), "--dry-run", self.filled_toml(), "case-run"],
+                           capture_output=True, text=True, env=env, cwd=self.tmp)
+        self.assertEqual(p.returncode, 64)
+
+    def fetch_with_aws(self, ls_exit, *flags):
+        d = self.path(f"stub-{ls_exit}")
+        os.makedirs(d)
+        with open(os.path.join(d, "aws"), "w") as f:
+            f.write(f"#!/bin/sh\ncase \"$*\" in *' s3 ls '*) echo denied >&2; exit {ls_exit} ;; esac\nexit 0\n")
+        os.chmod(os.path.join(d, "aws"), 0o755)
+        env = dict(os.environ, PATH=d + os.pathsep + os.environ["PATH"])
+        p = subprocess.run([BASH, os.path.join(BOX, "fetch.sh"), *flags, "--interval", "1", self.filled_toml(),
+                            "investigations-20261103T000000Z-1-1"], capture_output=True, text=True, env=env,
+                           cwd=self.tmp, timeout=60)
+        return p.returncode, p.stdout + p.stderr
+
+    def test_fetch_exits_69_when_a_marker_check_cannot_be_answered(self):
+        # Kills fetch.sh's has_marker `*) ... exit 69` arm: an aws error
+        # (255) read as "no marker yet" polls until the bound and exits 3.
+        code, text = self.fetch_with_aws(255, "--partial")
+        self.assertEqual(code, 69, text)
+        self.assertIn("aws exit 255", text)
+        self.assertIn("denied", text)
+        # aws's own "not there" (exit 1) is an answer: --partial downloads.
+        code, text = self.fetch_with_aws(1, "--partial")
+        self.assertEqual(code, 3, text)
+        self.assertIn("PARTIAL", text)
+
+    # Arrays box/ scripts expand bare: each is assigned non-empty before use.
+    NON_EMPTY_ARRAYS = {"CLI", "tenants", "args", "pids"}
+
+    def test_possibly_empty_arrays_are_guarded_for_bash_3_2(self):
+        # bash before 4.4 treats "${x[@]}" of an empty x as unbound under
+        # set -u; any array outside NON_EMPTY_ARRAYS must use the
+        # ${x[@]+"${x[@]}"} form.
+        bare = re.compile(r'(?<!\+)"\$\{([A-Za-z_][A-Za-z_0-9]*)\[@\]\}"')
+        found = []
+        for name in sorted(os.listdir(BOX)) + ["../investigations.test.sh"]:
+            if not name.endswith(".sh"):
+                continue
+            with open(os.path.join(BOX, name)) as f:
+                for n, line in enumerate(f, 1):
+                    for m in bare.finditer(line):
+                        if m.group(1) not in self.NON_EMPTY_ARRAYS:
+                            found.append(f"{name}:{n}: {m.group(1)}")
+        self.assertEqual(found, [])
+        self.assertTrue(bare.search('run "${CLI[@]}" x'))
+        self.assertFalse(bare.search('${flags[@]+"${flags[@]}"}'))
+
+    def test_empty_flags_dry_run_under_bash_3_2(self):
+        # Kills an unguarded "${flags[@]}" at run.sh's load-base step:
+        # run.example.toml has split_base_load = false, so flags is empty.
+        ver = subprocess.run([BASH, "-c", "echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"], capture_output=True,
+                             text=True).stdout.strip()
+        if tuple(int(x) for x in ver.split(".")) >= (4, 4):
+            self.skipTest(f"bash {ver} accepts an empty array under set -u; run under bash 3.2 to check")
+        code, text = run_sh("s3", os.path.join(BOX, "run.example.toml"), self.path("out"))
+        self.assertEqual(code, 0, text)
+        copy = self.path("inv")
+        shutil.copytree(HERE, copy, ignore=shutil.ignore_patterns("fixtures", "__pycache__"))
+        p = os.path.join(copy, "box", "run.sh")
+        with open(p) as f:
+            src = f.read()
+        guarded = 'load_signal base "$sig" "$WORK/corpus" "$TENANT" ${flags[@]+"${flags[@]}"}'
+        self.assertEqual(src.count(guarded), 1)
+        with open(p, "w") as f:
+            f.write(src.replace(guarded, 'load_signal base "$sig" "$WORK/corpus" "$TENANT" "${flags[@]}"'))
+        m = subprocess.run([BASH, p, "--dry-run", "--lane", "s3", "--run-toml", os.path.join(BOX, "run.example.toml"),
+                            "--out", self.path("out2")], capture_output=True, text=True)
+        self.assertNotEqual(m.returncode, 0, m.stdout + m.stderr)
+        self.assertIn("unbound variable", m.stderr)
+
+
+def refresh_local_smoke():
+    with tempfile.TemporaryDirectory() as d:
+        code, _, text = evaluate(smoke_run(os.path.join(d, "run")), os.path.join(d, "out"))
+        with open(os.path.join(d, "out", "results.local.json"), "rb") as f:
+            data = f.read()
+        with open(os.path.join(SMOKE, "results.local.json.gz"), "wb") as f:
+            f.write(gzip.compress(data, compresslevel=9, mtime=0))
+        shutil.copy(os.path.join(d, "out", "summary.local.txt"), SMOKE)
+    print(f"refreshed {SMOKE} (evaluate.py exit {code})")
+    return 0
+
+
+def gzip_to(src, dst):
+    with open(src, "rb") as f, open(dst, "wb") as g:
+        g.write(gzip.compress(f.read(), compresslevel=9, mtime=0))
+
+
+def import_local_smoke(run_dir):
+    with open(os.path.join(run_dir, "run.toml"), "rb") as f:
+        lane = tomllib.load(f)["run"]["lane"]
+    if lane != "local":
+        print(f"{run_dir} is a {lane} run, not the local smoke", file=sys.stderr)
+        return 64
+    if not os.path.exists(os.path.join(run_dir, "DONE")):
+        print(f"{run_dir} has no DONE marker: run.sh did not finish", file=sys.stderr)
+        return 64
+    shutil.rmtree(SMOKE, ignore_errors=True)
+    os.makedirs(os.path.join(SMOKE, "stamps"))
+    shutil.copy(os.path.join(run_dir, "run.toml"), SMOKE)
+    gzip_to(os.path.join(run_dir, "calls.jsonl"), os.path.join(SMOKE, "calls.jsonl.gz"))
+    gzip_to(os.path.join(run_dir, "truth.json"), os.path.join(SMOKE, "truth.json.gz"))
+    for name in sorted(os.listdir(os.path.join(run_dir, "stamps"))):
+        gzip_to(os.path.join(run_dir, "stamps", name), os.path.join(SMOKE, "stamps", name + ".gz"))
+    return refresh_local_smoke()
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--refresh-local-smoke"]:
+        sys.exit(refresh_local_smoke())
+    if len(sys.argv) == 3 and sys.argv[1] == "--import-local-smoke":
+        sys.exit(import_local_smoke(sys.argv[2]))
+    unittest.main()

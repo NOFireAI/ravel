@@ -1,0 +1,54 @@
+# The local lane's smoke run, whose outputs are committed under
+# fixtures/local-smoke/ (issue #3699): every state and statement of the s3
+# lane's flow against a loopback RustFS, at 20,000 traces and 2 cold runs, so
+# it finishes on one small machine while its 100,000 log rows still span more
+# than ten 8,192-row logs blocks. Its figures prove the flow, not the bands:
+# timing is judged on the s3 lane only. README.md "Local lane" gives the
+# command.
+
+[run]
+lane = "local"
+states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight",
+          "erasure_in_flight", "many_parts_24"]
+cold_runs = 2
+warm_runs = 1
+hits = false
+scales = [1]
+baseline = false
+mixed_wait_max_minutes = 70
+max_minutes = 540
+# Every logs object is inspected for the needle-block count at this scale.
+needle_blocks_max_objects = 0
+# Two L0 objects per shard and hour, so compaction_in_flight has inputs.
+split_base_load = true
+
+[corpus]
+traces = 20000
+hours = 2
+seed = 7
+spans_per_trace = 10
+logs_per_trace = 5
+
+[server]
+tenant = "inv"
+shards = 2
+memory_budget_bytes = 1000000000
+
+[many_parts]
+traces_per_hour = 10
+snapshot_part_max_entries = 1
+
+[prices]
+get_per_1000 = 0.0004
+get_per_1000_source = "AWS S3 Standard pricing, us-east-1: GET, SELECT and all other requests, $0.0004 per 1,000 requests"
+put_per_1000 = 0.005
+put_per_1000_source = "AWS S3 Standard pricing, us-east-1: PUT, COPY, POST, LIST requests, $0.005 per 1,000 requests"
+storage_gb_month = 0.023
+storage_gb_month_source = "AWS S3 Standard pricing, us-east-1: first 50 TB per month, $0.023 per GB"
+instance_per_hour = 0.612
+instance_per_hour_source = "AWS EC2 on-demand pricing, us-east-1, Linux: c6a.4xlarge $0.612 per hour"
+
+[cost]
+lookups_per_part_month = 1000
+lookups_per_part_month_source = "assumption: 1,000 selective lookups per snapshot part per month, ADR-3692 gives no frequency"
+amortise_months = 1
