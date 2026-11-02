@@ -3455,10 +3455,11 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                     store.clone(),
                     audit_config.clone(),
                 ));
-                // `/metrics` reads the pipeline's failure counter at scrape
-                // time, so it takes the pipeline itself rather than a snapshot
-                // taken here.
-                metrics_state.audit_pipeline = Some(audit_pipeline_handle.clone());
+                // `/metrics` reads the pipeline's counters at scrape time, so
+                // it takes a counters handle rather than a snapshot taken here.
+                metrics_state.audit_pipeline = Some(metrics::AuditPipelineCounters::new(
+                    audit_pipeline_handle.clone(),
+                ));
                 running_audit_pipeline = Some(audit_pipeline_handle.clone());
                 // ADR-0062 decision 2e: the `--audit-text` posture is applied
                 // here, once, by wrapping the sink every surface below
