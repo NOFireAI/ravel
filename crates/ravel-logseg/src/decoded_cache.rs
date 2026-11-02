@@ -54,6 +54,38 @@ use crate::columns::ColumnSelection;
 /// The most decoded-set estimates [`DecodedColumnCache`] memoises.
 pub const ESTIMATE_MEMO_MAX_ENTRIES: usize = 65_536;
 
+/// The most bytes the distinct selections keying [`DecodedColumnCache`]'s
+/// estimate memo may hold, as [`estimate_memo_selection_bytes`] charges them.
+pub const ESTIMATE_MEMO_MAX_SELECTION_BYTES: usize = 4 * 1024 * 1024;
+
+/// Charged per distinct selection on top of the selection itself: its outer
+/// map slot's inner map header and control byte.
+const ESTIMATE_MEMO_SELECTION_NODE_BYTES: usize = 64;
+
+/// Charged per element of a selection's `fixed` or `attrs` set on top of the
+/// element itself: its share of the B-tree node.
+const ESTIMATE_MEMO_SET_ELEMENT_BYTES: usize = 16;
+
+/// The bytes the estimate memo charges for holding `columns` as a key:
+/// [`ESTIMATE_MEMO_SELECTION_NODE_BYTES`] plus the selection's own size, 4
+/// bytes plus [`ESTIMATE_MEMO_SET_ELEMENT_BYTES`] per fixed id, and per
+/// attribute name its length plus a `String` plus
+/// [`ESTIMATE_MEMO_SET_ELEMENT_BYTES`].
+fn estimate_memo_selection_bytes(columns: &ColumnSelection) -> usize {
+    let fixed = columns
+        .fixed_ids()
+        .len()
+        .saturating_mul(std::mem::size_of::<u32>() + ESTIMATE_MEMO_SET_ELEMENT_BYTES);
+    columns.attr_names().iter().fold(
+        (std::mem::size_of::<ColumnSelection>() + ESTIMATE_MEMO_SELECTION_NODE_BYTES)
+            .saturating_add(fixed),
+        |sum, name| {
+            sum.saturating_add(name.len())
+                .saturating_add(std::mem::size_of::<String>() + ESTIMATE_MEMO_SET_ELEMENT_BYTES)
+        },
+    )
+}
+
 /// The decoded layout entries are stored in. Bumped when the decoder's output
 /// shape for a column kind changes, so an entry of the old shape never hits.
 pub const LAYOUT_TAG: u8 = 0;
@@ -272,11 +304,22 @@ impl PressureSnapshot {
 
 /// Memoised whole-segment decoded-set estimates, by projection and then by
 /// the (tenant, object) of [`DecodedCacheAttach::key`]. `len` counts the
-/// (tenant, object, projection) entries over every projection.
+/// (tenant, object, projection) entries over every projection;
+/// `selection_bytes` sums [`estimate_memo_selection_bytes`] over the keys of
+/// `by_columns`.
 #[derive(Default)]
 struct EstimateMemo {
     by_columns: HashMap<ColumnSelection, HashMap<ObjectId, u64>>,
     len: usize,
+    selection_bytes: usize,
+}
+
+impl EstimateMemo {
+    fn clear(&mut self) {
+        self.by_columns.clear();
+        self.len = 0;
+        self.selection_bytes = 0;
+    }
 }
 
 /// The (tenant, object) of [`DecodedCacheAttach::key`].
@@ -397,8 +440,11 @@ impl DecodedColumnCache {
     /// alone, so an entry never goes stale.
     ///
     /// The memo holds at most [`ESTIMATE_MEMO_MAX_ENTRIES`] entries, 56 bytes
-    /// of key and value each before map overhead (about 3.7 MB at the bound),
-    /// and is not charged to `max_bytes` or the memory budget.
+    /// of key and value each, plus at most
+    /// [`ESTIMATE_MEMO_MAX_SELECTION_BYTES`] (4 MiB) of selection keys as
+    /// [`estimate_memo_selection_bytes`] charges them: 3,670,016 + 4,194,304
+    /// = 7,864,320 bytes (7.5 MiB) at both bounds, before the entries' map
+    /// overhead. Neither is charged to `max_bytes` or the memory budget.
     pub fn memoised_estimate(
         &self,
         tenant: [u8; 16],
@@ -414,7 +460,10 @@ impl DecodedColumnCache {
 
     /// Memoises `bytes` as `object`'s estimate under `columns`
     /// ([`Self::memoised_estimate`]). A new entry that would pass
-    /// [`ESTIMATE_MEMO_MAX_ENTRIES`] clears the whole memo first.
+    /// [`ESTIMATE_MEMO_MAX_ENTRIES`], or whose selection is not yet a key and
+    /// would take the keys past [`ESTIMATE_MEMO_MAX_SELECTION_BYTES`], clears
+    /// the whole memo first. A selection charged above
+    /// [`ESTIMATE_MEMO_MAX_SELECTION_BYTES`] on its own is never memoised.
     pub fn memoise_estimate(
         &self,
         tenant: [u8; 16],
@@ -423,17 +472,34 @@ impl DecodedColumnCache {
         bytes: u64,
     ) {
         let mut memo = self.lock_estimates();
-        let present = memo
+        if let Some(slot) = memo
             .by_columns
-            .get(columns)
-            .is_some_and(|m| m.contains_key(&(tenant, object)));
-        if !present {
-            if memo.len >= ESTIMATE_MEMO_MAX_ENTRIES {
-                memo.by_columns.clear();
-                memo.len = 0;
-            }
-            memo.len += 1;
+            .get_mut(columns)
+            .and_then(|by_object| by_object.get_mut(&(tenant, object)))
+        {
+            *slot = bytes;
+            return;
         }
+        // A selection already keyed was charged, and admitted, when its first
+        // entry went in.
+        let mut charge = if memo.by_columns.contains_key(columns) {
+            None
+        } else {
+            let charge = estimate_memo_selection_bytes(columns);
+            if charge > ESTIMATE_MEMO_MAX_SELECTION_BYTES {
+                return;
+            }
+            Some(charge)
+        };
+        if memo.len >= ESTIMATE_MEMO_MAX_ENTRIES
+            || memo.selection_bytes.saturating_add(charge.unwrap_or(0))
+                > ESTIMATE_MEMO_MAX_SELECTION_BYTES
+        {
+            memo.clear();
+            charge = Some(charge.unwrap_or_else(|| estimate_memo_selection_bytes(columns)));
+        }
+        memo.selection_bytes += charge.unwrap_or(0);
+        memo.len += 1;
         memo.by_columns
             .entry(columns.clone())
             .or_default()
@@ -1457,5 +1523,84 @@ mod tests {
         assert_eq!(cache.memoised_estimate([1; 16], [2; 32], &narrow), None);
         assert_eq!(cache.memoised_estimate([1; 16], [3; 32], &narrow), Some(7));
         assert_eq!(cache.resident_bytes(), 0, "the memo charges no cache bytes");
+    }
+
+    #[test]
+    fn the_estimate_memo_charges_a_selection_its_ids_and_names() {
+        let selection = ColumnSelection::fixed_only().with_body().with_attr("abc");
+        assert_eq!(
+            estimate_memo_selection_bytes(&selection),
+            std::mem::size_of::<ColumnSelection>() + 64 + (4 + 16) + (3 + 24 + 16)
+        );
+    }
+
+    #[test]
+    fn the_estimate_memo_never_holds_a_selection_above_the_key_bound() {
+        let cache = DecodedColumnCache::new(1 << 20, None);
+        let small = ColumnSelection::fixed_only().with_attr("d");
+        cache.memoise_estimate([1; 16], [2; 32], &small, 10);
+        let huge =
+            ColumnSelection::fixed_only().with_attr("x".repeat(ESTIMATE_MEMO_MAX_SELECTION_BYTES));
+        cache.memoise_estimate([1; 16], [3; 32], &huge, 7);
+        assert_eq!(cache.memoised_estimate([1; 16], [3; 32], &huge), None);
+        assert_eq!(
+            cache.memoised_estimates(),
+            1,
+            "the huge selection added nothing"
+        );
+        assert_eq!(
+            cache.memoised_estimate([1; 16], [2; 32], &small),
+            Some(10),
+            "the huge selection cleared nothing"
+        );
+
+        let fresh = DecodedColumnCache::new(1 << 20, None);
+        fresh.memoise_estimate([1; 16], [3; 32], &huge, 7);
+        assert_eq!(fresh.memoised_estimate([1; 16], [3; 32], &huge), None);
+        assert_eq!(fresh.memoised_estimates(), 0);
+        assert_eq!(fresh.lock_estimates().selection_bytes, 0);
+    }
+
+    #[test]
+    fn the_estimate_memo_clears_when_its_selection_keys_would_pass_the_byte_bound() {
+        let cache = DecodedColumnCache::new(1 << 20, None);
+        let selection = |i: usize| ColumnSelection::fixed_only().with_attr(format!("{i:0>1000}"));
+        let charge = estimate_memo_selection_bytes(&selection(0));
+        let fit = ESTIMATE_MEMO_MAX_SELECTION_BYTES / charge;
+        assert!(
+            fit < ESTIMATE_MEMO_MAX_ENTRIES / 10,
+            "far below the entry bound"
+        );
+        for i in 0..fit {
+            cache.memoise_estimate([1; 16], [2; 32], &selection(i), i as u64);
+        }
+        assert_eq!(cache.memoised_estimates(), fit);
+        assert_eq!(cache.lock_estimates().selection_bytes, fit * charge);
+        cache.memoise_estimate([1; 16], [3; 32], &selection(0), 99);
+        assert_eq!(
+            cache.memoised_estimates(),
+            fit + 1,
+            "a known selection adds no key bytes"
+        );
+        assert_eq!(
+            cache.memoised_estimate([1; 16], [2; 32], &selection(0)),
+            Some(0)
+        );
+
+        cache.memoise_estimate([1; 16], [2; 32], &selection(fit), 5);
+        assert_eq!(
+            cache.memoised_estimates(),
+            1,
+            "the new selection cleared the memo"
+        );
+        assert_eq!(
+            cache.memoised_estimate([1; 16], [2; 32], &selection(0)),
+            None
+        );
+        assert_eq!(
+            cache.memoised_estimate([1; 16], [2; 32], &selection(fit)),
+            Some(5)
+        );
+        assert_eq!(cache.lock_estimates().selection_bytes, charge);
     }
 }
