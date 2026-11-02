@@ -788,10 +788,10 @@ tick for every co-resident tenant on the shard for the whole duration of the
 stall.
 
 That makes `max_inflight_flushes` the per-shard flush **isolation** control,
-not only a memory/latency knob. The default on `ravel-server` is **4**
-(ADR-2708 D3), and `max_inflight_flushes_per_tenant`
+not only a memory/latency knob. The default on `ravel-server` is **8**
+(ADR-2708 D3 and its flush slots amendment), and `max_inflight_flushes_per_tenant`
 (`IngestConfig::max_inflight_flushes_per_tenant`,
-`--max-inflight-flushes-per-tenant`, default `max(1, N - 1)`, so 3) caps how
+`--max-inflight-flushes-per-tenant`, default `max(1, N - 1)`, so 7) caps how
 many flushes one tenant may have spawned and not yet finished on one shard. A size or age
 trigger for a tenant already at its share is refused through the same
 deferral path as the queued-flush cap below, and a tenant with no flush in
@@ -1918,8 +1918,8 @@ waiting for their ack.
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
 | max pending strict acks (process-wide, one budget shared by the three routers) | 8,192 (`--max-pending-strict-acks`, `RAVEL_MAX_PENDING_STRICT_ACKS`: the in-flight ingest ceiling times eight, 0 = unlimited, refused above the tokio semaphore maximum) |
 | max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |
-| max_inflight_flushes (per shard, all three pipelines) | 4 on `ravel-server` and on `ravel-cli load` (`--max-inflight-flushes`, rejects 0) |
-| max_inflight_flushes_per_tenant (per shard and tenant, all three pipelines) | `max(1, N - 1)` on `ravel-server`, so 3 (`--max-inflight-flushes-per-tenant`, rejects 0 and values above `--max-inflight-flushes`); N on `ravel-cli load` |
+| max_inflight_flushes (per shard, all three pipelines) | 8 on `ravel-server`, 4 on `ravel-cli load` (`--max-inflight-flushes`, rejects 0) |
+| max_inflight_flushes_per_tenant (per shard and tenant, all three pipelines) | `max(1, N - 1)` on `ravel-server`, so 7 (`--max-inflight-flushes-per-tenant`, rejects 0 and values above `--max-inflight-flushes`); N on `ravel-cli load` |
 | max_queued_flushes (per shard, all three pipelines) | 8 (`--max-queued-flushes`, `RAVEL_MAX_QUEUED_FLUSHES`, rejects 0; a `max_inflight_flushes` above it raises the effective cap to match, with a warning; floored at 1 in `IngestConfig`; a buffer over its memory backstop spawns past the cap) |
 | adaptive_flush_delay (metrics pipeline only) | off (`--adaptive-flush-delay`) |
 | idle-tenant state TTL (process-wide) | 1 h (`--idle-tenant-state-ttl`, 0 = disabled) |

@@ -140,7 +140,8 @@ decision, not taken here.
 
 ### D3. Flush permits: four per shard, a per-tenant share, and an hour-bounded deadline (#1921, C-01)
 
-Defaults: `--max-inflight-flushes` goes from 1 to 4. A new
+Defaults: `--max-inflight-flushes` goes from 1 to 4 (raised to 8 by the flush
+slots amendment below). A new
 `--max-inflight-flushes-per-tenant` defaults to `max(1, N - 1)`. The shard
 actor keeps one FIFO semaphore and counts spawned, unreaped flushes per
 (shard, tenant). An ordinary trigger for a tenant already at its share is
@@ -507,3 +508,29 @@ third value under which startup does not run the check and reads nothing.
 before any listener binds and can take up to `--format-window-check-timeout`
 (20 s by default), close to an operator's liveness window, so the check runs
 only when an operator asks for it. `warn` and `refuse` are unchanged.
+
+## Amendment (2026-11-02): eight flush slots per shard by default (#3645)
+
+<!-- amendment-applies: sections="D3. Flush permits: four per shard, a per-tenant share, and an hour-bounded deadline (#1921, C-01)" pointer="flush slots amendment" -->
+
+Owner decision (2026-11-02): `--max-inflight-flushes` defaults to 8, up from
+D3's 4, so `--max-inflight-flushes-per-tenant` resolves to 7 when unset. The
+`--max-queued-flushes` default of 8 is unchanged and still not below the
+permit count.
+
+At 4, a single busy tenant overloads a shard on the logs ingest benchmark
+(#3645). The tenant spends most of its time at its share, so its ordinary
+size and age triggers are refused and its buffer grows to the object
+backstop. Those flushes take five to ten times longer to encode, which keeps
+the tenant at its share. At a fixed 150k lines/s offered on 8 vCPU, every
+window at 4 permits (share 4) stored about 115k. At 8 (share 8), two of four
+instance windows held about 152k with no drops (#3645, comments 6574471828
+and 6575073635).
+
+What 8 does not do: two of those four windows still entered the overloaded
+state, so the share refusal and the backstop can still sustain it. The fix for
+that is a separate change (#3662). What it costs: up to twice the concurrent
+PUTs per shard and twice the flushes in flight, each still charged to the
+ingest byte budget as D3 states. The isolation D3 buys is unchanged in kind: a
+stalled tenant leaves one of eight permits free instead of one of four.
+`ravel-cli load` keeps its own `--max-inflight-flushes` default of 4.
