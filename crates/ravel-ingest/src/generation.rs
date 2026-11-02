@@ -823,9 +823,10 @@ impl<H> GenerationSwitch<H> {
     /// Read `tenant`'s provisioning record for a write at `now_ns`, unless an
     /// earlier read for the tenant failed and its backoff window has not
     /// passed (issue #3653), in which case no GET is issued and the result is
-    /// [`ViewRead::BackedOff`]. A failed read arms or doubles the window,
-    /// counts once under its cause, and logs once at ERROR; a successful one
-    /// clears the window. The view is not installed: the caller does that
+    /// [`ViewRead::BackedOff`]. A failed read arms or doubles the window (or
+    /// leaves it unchanged when it fails inside the current window), counts
+    /// once under its cause, and logs once at ERROR; a successful one clears
+    /// the window. The view is not installed: the caller does that
     /// with [`Self::refresh_view`].
     pub(crate) async fn read_view(
         &self,
@@ -855,8 +856,8 @@ impl<H> GenerationSwitch<H> {
         }
     }
 
-    /// Arm or double `tenant`'s read backoff after a failed read issued at
-    /// `now_ns`, count it, and log it. Called once per issued read: inside a
+    /// Arm, double, or keep `tenant`'s read backoff after a failed read issued
+    /// at `now_ns`, count it, and log it. Called once per issued read: inside a
     /// window no read is issued, so the line repeats at most once per window,
     /// plus once for each read already in flight when the window was armed.
     fn note_read_failure(

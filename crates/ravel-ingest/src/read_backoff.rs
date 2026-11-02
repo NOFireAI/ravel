@@ -7,7 +7,9 @@
 //! remembers nothing either. [`ReadBackoff`] remembers the failure: after a
 //! failed read the key is not read again until its retry time, which starts
 //! [`PROVISIONING_READ_BACKOFF_INITIAL_NS`] after the failure and doubles on
-//! each consecutive failure up to [`PROVISIONING_READ_BACKOFF_MAX_NS`]. A
+//! each consecutive failure up to [`PROVISIONING_READ_BACKOFF_MAX_NS`]. Only a
+//! failure at or after the current retry time counts as consecutive: failures
+//! of reads issued before or inside the window leave it unchanged. A
 //! successful read clears the entry, so the map holds only keys whose last
 //! read failed.
 //!
@@ -67,20 +69,26 @@ impl<K: Hash + Eq> ReadBackoff<K> {
         (now_ns < retry_at).then_some(retry_at)
     }
 
-    /// Record a failed read of `key` at `now_ns` and return the new window:
+    /// Record a failed read of `key` at `now_ns` and return the delay until
+    /// the next read is allowed. A failure at or after the current retry time
+    /// (or of a key with no entry) starts a new window:
     /// [`PROVISIONING_READ_BACKOFF_INITIAL_NS`] for a first failure, double
-    /// the previous window for a consecutive one, capped at
-    /// [`PROVISIONING_READ_BACKOFF_MAX_NS`].
+    /// the previous window otherwise, capped at
+    /// [`PROVISIONING_READ_BACKOFF_MAX_NS`]. A failure before the current
+    /// retry time came from a read issued before or inside that window, so the
+    /// entry is kept and the remaining delay returned: concurrent reads that
+    /// all fail at once arm one window, not one doubling each.
     pub fn record_failure(&mut self, key: K, now_ns: i64) -> i64 {
-        let delay_ns =
-            self.entries
-                .get(&key)
-                .map_or(PROVISIONING_READ_BACKOFF_INITIAL_NS, |entry| {
-                    entry
-                        .delay_ns
-                        .saturating_mul(2)
-                        .min(PROVISIONING_READ_BACKOFF_MAX_NS)
-                });
+        let delay_ns = match self.entries.get(&key) {
+            Some(entry) if now_ns < entry.retry_at_ns() => {
+                return entry.retry_at_ns().saturating_sub(now_ns);
+            }
+            Some(entry) => entry
+                .delay_ns
+                .saturating_mul(2)
+                .min(PROVISIONING_READ_BACKOFF_MAX_NS),
+            None => PROVISIONING_READ_BACKOFF_INITIAL_NS,
+        };
         self.entries.insert(
             key,
             ReadBackoffEntry {
@@ -219,6 +227,87 @@ mod tests {
         assert!(backoff.is_empty());
         assert_eq!(backoff.blocked_until(&"k", now), None);
         assert_eq!(backoff.record_failure("k", now), 1_000_000_000);
+    }
+
+    /// Failures of reads issued before the first failure was recorded land at
+    /// the same instant; they belong to the window that failure armed and
+    /// leave it at one second.
+    #[test]
+    fn same_instant_failures_keep_a_one_second_window() {
+        let mut backoff = ReadBackoff::new();
+        let now = 5_000_i64;
+        for _ in 0..6 {
+            assert_eq!(
+                backoff.record_failure("k", now),
+                PROVISIONING_READ_BACKOFF_INITIAL_NS
+            );
+        }
+        assert_eq!(
+            backoff.entry(&"k"),
+            Some(ReadBackoffEntry {
+                failed_at_ns: now,
+                delay_ns: PROVISIONING_READ_BACKOFF_INITIAL_NS,
+            })
+        );
+        assert_eq!(
+            backoff.blocked_until(&"k", now),
+            Some(now + PROVISIONING_READ_BACKOFF_INITIAL_NS)
+        );
+    }
+
+    /// A failure recorded inside the window keeps the entry and its retry
+    /// time, and returns the remaining delay; one at or after the retry time
+    /// doubles.
+    #[test]
+    fn failure_inside_window_keeps_retry_time_and_at_retry_doubles() {
+        const SEC: i64 = 1_000_000_000;
+        let mut backoff = ReadBackoff::new();
+        let t0 = 10 * SEC;
+        backoff.record_failure("k", t0);
+        let inside = t0 + SEC / 4;
+        assert_eq!(backoff.record_failure("k", inside), SEC - SEC / 4);
+        assert_eq!(
+            backoff.entry(&"k"),
+            Some(ReadBackoffEntry {
+                failed_at_ns: t0,
+                delay_ns: SEC,
+            })
+        );
+        assert_eq!(backoff.record_failure("k", t0 + SEC - 1), 1);
+        assert_eq!(backoff.entry(&"k").map(|e| e.retry_at_ns()), Some(t0 + SEC));
+
+        let t1 = t0 + SEC;
+        assert_eq!(backoff.record_failure("k", t1), 2 * SEC);
+        assert_eq!(
+            backoff.entry(&"k"),
+            Some(ReadBackoffEntry {
+                failed_at_ns: t1,
+                delay_ns: 2 * SEC,
+            })
+        );
+        let late = t1 + 5 * SEC;
+        assert_eq!(backoff.record_failure("k", late), 4 * SEC);
+        assert_eq!(backoff.blocked_until(&"k", late), Some(late + 4 * SEC));
+    }
+
+    /// Many failures inside and at the edge of each window never take it past
+    /// the cap.
+    #[test]
+    fn cap_holds_with_failures_inside_windows() {
+        let mut backoff = ReadBackoff::new();
+        let mut now = 0_i64;
+        for _ in 0..20 {
+            let delay = backoff.record_failure("k", now);
+            for _ in 0..3 {
+                backoff.record_failure("k", now);
+            }
+            assert!(delay <= PROVISIONING_READ_BACKOFF_MAX_NS);
+            now += delay;
+        }
+        assert_eq!(
+            backoff.entry(&"k").map(|e| e.delay_ns),
+            Some(PROVISIONING_READ_BACKOFF_MAX_NS)
+        );
     }
 
     #[test]
