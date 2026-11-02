@@ -5400,6 +5400,22 @@ no reserve-ahead factor; a refused grow fails the query with
 reports `engaged`, `routed_rows` and `buckets_non_empty`. Answers match the
 stock final; output row order can differ.
 
+When `--sql-bucketed-final-aggregation` is on and a sort with a fetch sits above
+a converted final aggregate, `BucketedFinalAggregateExec` keeps that TopK and
+cuts each bucket's output to its own top k before emitting it. The sort may
+reach the aggregate through projections that pass its keys as bare columns and
+through a coalesce without a fetch. The cut is exact for the same reason as the
+CompactSlices TopK pre-filter: a bucket's groups are complete when it is
+evaluated, so any row outside its bucket's top k already has k rows ahead of it
+bound for the same TopK. With 64 buckets, the sort above therefore reads at most
+64 × k rows per engaged partition instead of every group. A partition that
+stayed below the engage threshold emits its single table uncut. `EXPLAIN` shows
+the ordering and k as `topk=[...], k=N` on the exec's line, and `EXPLAIN
+ANALYZE` reports the rows cut as `topk_rows_dropped`. When the k-th value is
+tied, which tied rows survive can differ from the stock plan, as SQL allows. The
+cut does not lower peak memory, because each bucket's table is charged in full
+before its output is cut.
+
 #### The decoded column-block cache (ADR-3326)
 
 `--decoded-cache-max-bytes` (default `0`, off) sizes a process-wide cache of
