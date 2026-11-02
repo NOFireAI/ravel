@@ -885,6 +885,49 @@ mod tests {
         assert!(two.data.rows.is_empty());
     }
 
+    /// A tenant whose declared set is 4,000 wide typed columns pages through
+    /// every column, each later page observing the set in reverse order, and
+    /// every page reports page one's snapshot id.
+    ///
+    /// FLIP: the version 5 cursor, which pinned the declared set verbatim,
+    /// mints a token over `CURSOR_BOUND` here, so page one is `internal`.
+    #[test]
+    fn a_wide_declared_column_set_pages_to_the_end() {
+        let key = key();
+        let ctx = test_context(&key);
+        let declared: Vec<DeclaredColumn> = (0..4_000)
+            .map(|index| {
+                DeclaredColumn::new(
+                    format!("attr_{index:04}_{}", "x".repeat(80)),
+                    DeclaredType::Str,
+                )
+            })
+            .collect();
+        let reversed: Vec<DeclaredColumn> = declared.iter().rev().cloned().collect();
+        let mut outcomes = vec![wide_logs(4_000, 0, declared, ctx.now_ns)];
+        outcomes.extend((0..19).map(|_| wide_logs(4_000, 0, reversed.clone(), ctx.now_ns)));
+        let backend = stub(outcomes);
+
+        let one = call(json!({"signal": "logs"}), &ctx, &backend);
+        assert_eq!(one.status, Status::OkPage, "{:?}", one.failure);
+        let pages = drain(one, &later(&ctx), &backend);
+        assert!(pages.len() >= 2, "{} pages", pages.len());
+        assert_eq!(
+            pages
+                .last()
+                .map(|page| (page.status, page.presentation.cursor.clone())),
+            Some((Status::Ok, None))
+        );
+        for page in &pages {
+            assert_eq!(page.visibility.snapshot_id, pages[0].visibility.snapshot_id);
+        }
+        let served = pages
+            .iter()
+            .map(|page| names_of(page, RowKind::Column).len())
+            .sum::<usize>();
+        assert_eq!(served, 4_001);
+    }
+
     /// FLIP: a body that redeemed without its own tool name accepts a token
     /// another tool minted; one whose argument hash ignored the signal
     /// serves a metrics cursor to a logs call.
