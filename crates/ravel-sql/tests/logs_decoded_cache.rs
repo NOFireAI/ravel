@@ -907,8 +907,9 @@ async fn a_fitting_contains_scan_on_the_whole_segment_fast_path_is_served() {
         assert!(s.deferred_served, "run {run}");
         assert_eq!(s.unvalidated_refusals, 0, "run {run}");
         assert_eq!(
-            plan_gets, OBJECTS,
-            "run {run}: one directory read per object"
+            plan_gets,
+            if run == 0 { OBJECTS } else { 0 },
+            "run {run}: one directory read per object cold, none once memoised"
         );
     }
     assert_eq!(
@@ -960,8 +961,9 @@ async fn an_over_cap_contains_scan_on_the_whole_segment_fast_path_is_not_served(
         assert!(!s.deferred_served, "run {run}");
         assert_eq!((s.evictions, s.unvalidated_refusals), (0, 0), "run {run}");
         assert_eq!(
-            plan_gets, OBJECTS,
-            "run {run}: one directory read per object"
+            plan_gets,
+            if run == 0 { OBJECTS } else { 0 },
+            "run {run}: one directory read per object cold, none once memoised"
         );
     }
     assert_eq!(cache.column_hits(c_id), 0, "c is never served");
@@ -984,6 +986,8 @@ struct VerdictCost {
     plan_requests: u64,
     /// Plan-phase read-cache hits.
     plan_cache_hits: u64,
+    /// Plan-phase decompressed bytes: the verdict's directory decodes.
+    plan_decompressed_bytes: u64,
     /// The run's requests over the baseline run's.
     extra_requests: u64,
 }
@@ -1046,6 +1050,7 @@ async fn fast_path_verdict_cost(suffix_len: Option<u64>) -> Vec<VerdictCost> {
         costs.push(VerdictCost {
             plan_requests: requests(plan),
             plan_cache_hits: plan.cache_hits,
+            plan_decompressed_bytes: plan.decompressed_bytes,
             extra_requests: requests(&got.accounting)
                 .checked_sub(requests(&base.accounting))
                 .expect("the verdict never saves a request"),
@@ -1054,56 +1059,260 @@ async fn fast_path_verdict_cost(suffix_len: Option<u64>) -> Vec<VerdictCost> {
     costs
 }
 
-/// The fast-path verdict's request cost, under the plan phase's accounting,
-/// cold and hot. With the default probe, which covers the whole of an object
-/// this small, the verdict issues one plan-phase GET per object cold, and the
-/// whole-object opens after it are served that extent by the read cache, so
-/// the run issues no more requests than the baseline. With a
-/// [`SHORT_PROBE`]-byte probe, shorter than every object, the verdict still
-/// reads each object's directories in one GET, but that extent is not the
-/// whole object, the opens cannot share it, and the run issues 8 more
-/// requests than the baseline: one directory read per object. Hot, in both
-/// shapes, the verdict's directory reads are all read-cache hits and the run
-/// issues no request the baseline does not.
+/// The fast-path verdict's cost, under the plan phase's accounting, cold and
+/// hot. With the default probe, which covers the whole of an object this
+/// small, the verdict issues one plan-phase GET per object cold and decodes
+/// each object's directories, and the whole-object opens after it are served
+/// that extent by the read cache, so the run issues no more requests than the
+/// baseline. With a [`SHORT_PROBE`]-byte probe, shorter than every object, the
+/// verdict still reads each object's directories in one GET, but that extent
+/// is not the whole object, the opens cannot share it, and the run issues 8
+/// more requests than the baseline: one directory read per object. Hot, in
+/// both shapes, every segment's estimate is memoised on the decoded cache, so
+/// the verdict issues no request, takes no read-cache hit and decompresses
+/// nothing.
 ///
-/// Seen failing against reading the directories past the read cache (a
-/// `BlockRangeFetcher` with no cache for the verdict's reads): on the
-/// covering probe the hot run reads `plan_requests: 8, plan_cache_hits: 0,
-/// extra_requests: 8` where `0, 8, 0` is expected, and the cold run's
-/// `extra_requests` is 8 where 0 is expected.
+/// Seen failing against the unmemoised verdict, which reads every segment's
+/// directories again hot: the hot run reads `plan_cache_hits: 8` and a nonzero
+/// `plan_decompressed_bytes` where `0, 0` is expected.
 #[tokio::test]
-async fn the_fast_path_verdict_costs_one_directory_read_per_segment_cold_and_none_hot() {
+async fn the_fast_path_verdict_reads_directories_once_per_segment_cold_and_nothing_hot() {
     let n = FAST_OBJECTS;
     let covering = fast_path_verdict_cost(None).await;
     let short = fast_path_verdict_cost(Some(SHORT_PROBE)).await;
+    for (shape, costs) in [("covering", &covering), ("short", &short)] {
+        assert!(
+            costs[0].plan_decompressed_bytes > 0,
+            "{shape}: the cold verdict decodes directories"
+        );
+    }
+    let hot = VerdictCost {
+        plan_requests: 0,
+        plan_cache_hits: 0,
+        plan_decompressed_bytes: 0,
+        extra_requests: 0,
+    };
     assert_eq!(
         covering,
         vec![
             VerdictCost {
                 plan_requests: n,
                 plan_cache_hits: 0,
+                plan_decompressed_bytes: covering[0].plan_decompressed_bytes,
                 extra_requests: 0,
             },
-            VerdictCost {
-                plan_requests: 0,
-                plan_cache_hits: n,
-                extra_requests: 0,
-            },
+            hot,
         ]
     );
+    let hot = VerdictCost {
+        plan_requests: 0,
+        plan_cache_hits: 0,
+        plan_decompressed_bytes: 0,
+        extra_requests: 0,
+    };
     assert_eq!(
         short,
         vec![
             VerdictCost {
                 plan_requests: n,
                 plan_cache_hits: 0,
+                plan_decompressed_bytes: short[0].plan_decompressed_bytes,
                 extra_requests: n,
             },
-            VerdictCost {
-                plan_requests: 0,
-                plan_cache_hits: n,
-                extra_requests: 0,
-            },
+            hot,
         ]
+    );
+}
+
+/// [`CONTAINS_SQL`] with `p` projected in place of `d`: a different
+/// [`ColumnSelection`](ravel_logseg::ColumnSelection) over the same segments.
+const CONTAINS_P_SQL: &str = "SELECT ts, p, c FROM logs WHERE c LIKE '%x%' ORDER BY ts";
+
+/// What one fast-path verdict reported and cost.
+#[derive(Debug, PartialEq, Eq)]
+struct Verdict {
+    estimate: u64,
+    served: bool,
+    /// Plan-phase requests plus plan-phase read-cache hits: the segments
+    /// whose directories the verdict read.
+    directory_reads: u64,
+    plan_decompressed_bytes: u64,
+}
+
+/// Runs `sql` through `exec` and returns its verdict. Asserts the rows equal
+/// the same statement's through an executor with no decoded cache.
+async fn verdict_of(
+    exec: &SqlExecutor,
+    store: &Arc<dyn ObjectStoreBackend>,
+    t: &TenantId,
+    sql: &str,
+) -> Verdict {
+    let base = executor(store, None)
+        .execute(t.hash(), &request(sql))
+        .await
+        .expect("uncached statement executes");
+    let got = exec
+        .execute(t.hash(), &request(sql))
+        .await
+        .expect("cached statement executes");
+    assert_eq!(
+        pretty_format_batches(got.output.batches())
+            .expect("format")
+            .to_string(),
+        pretty_format_batches(base.output.batches())
+            .expect("format")
+            .to_string(),
+        "{sql}"
+    );
+    let s = got
+        .stats
+        .decoded_cache
+        .expect("decodedCache stats with a cache")
+        .counters;
+    let plan = &got.phase_accounting.plan;
+    Verdict {
+        estimate: s
+            .deferred_set_estimate_bytes
+            .expect("a Contains scan reports its estimate"),
+        served: s.deferred_served,
+        directory_reads: requests(plan) + plan.cache_hits,
+        plan_decompressed_bytes: plan.decompressed_bytes,
+    }
+}
+
+fn fresh_cache() -> Arc<DecodedColumnCache> {
+    Arc::new(DecodedColumnCache::new(
+        1 << 30,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ))
+}
+
+/// A store holding objects `seqs`, each published.
+async fn fast_store(
+    t: &TenantId,
+    seqs: std::ops::RangeInclusive<u64>,
+) -> Arc<dyn ObjectStoreBackend> {
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    for seq in seqs {
+        publish_object(store.as_ref(), t, seq).await;
+    }
+    store
+}
+
+/// The memoised estimate is the estimate: the same fast-path scan run cold,
+/// reading every segment's directories, and hot, reading none, reports the
+/// same `deferredSetEstimateBytes` and the same `deferredServed`.
+#[tokio::test]
+async fn the_memoised_fast_path_estimate_equals_the_uncached_one() {
+    let t = tenant();
+    let store = fast_store(&t, 1..=FAST_OBJECTS).await;
+    let exec = executor_with(&store, Some(fresh_cache()), true, None);
+    let cold = verdict_of(&exec, &store, &t, CONTAINS_SQL).await;
+    let hot = verdict_of(&exec, &store, &t, CONTAINS_SQL).await;
+    assert_eq!(
+        cold.directory_reads, FAST_OBJECTS,
+        "cold reads every segment"
+    );
+    assert_eq!(
+        (hot.directory_reads, hot.plan_decompressed_bytes),
+        (0, 0),
+        "hot reads nothing"
+    );
+    assert_eq!(
+        (hot.estimate, hot.served),
+        (cold.estimate, cold.served),
+        "the memoised verdict is the uncached one"
+    );
+    assert!(cold.served);
+}
+
+/// The memo is keyed by projection: after a scan of [`CONTAINS_SQL`] has
+/// memoised every segment, the first scan of [`CONTAINS_P_SQL`] over the
+/// same segments reads every segment's directories again, and each reports
+/// the estimate a cache with an empty memo reports for its projection.
+///
+/// Seen failing against a memo keyed on (tenant, object) alone: the second
+/// projection's `directory_reads` is 0 where 8 is expected.
+#[tokio::test]
+async fn the_fast_path_estimate_memo_is_keyed_by_projection() {
+    let t = tenant();
+    let store = fast_store(&t, 1..=FAST_OBJECTS).await;
+    let uncached = |sql: &'static str| {
+        let store = Arc::clone(&store);
+        let t = t.clone();
+        async move {
+            let exec = executor_with(&store, Some(fresh_cache()), true, None);
+            verdict_of(&exec, &store, &t, sql).await
+        }
+    };
+    let d_alone = uncached(CONTAINS_SQL).await;
+    let p_alone = uncached(CONTAINS_P_SQL).await;
+    assert_ne!(
+        d_alone.estimate, p_alone.estimate,
+        "the two projections estimate differently"
+    );
+
+    let exec = executor_with(&store, Some(fresh_cache()), true, None);
+    let d = verdict_of(&exec, &store, &t, CONTAINS_SQL).await;
+    let p = verdict_of(&exec, &store, &t, CONTAINS_P_SQL).await;
+    assert_eq!(d.directory_reads, FAST_OBJECTS);
+    assert_eq!(
+        p.directory_reads, FAST_OBJECTS,
+        "a new projection misses the memo on every segment"
+    );
+    assert_eq!((d.estimate, d.served), (d_alone.estimate, d_alone.served));
+    assert_eq!((p.estimate, p.served), (p_alone.estimate, p_alone.served));
+}
+
+/// The memo is per segment: a segment published between two runs of the same
+/// scan is the only one whose directories the second run reads, and the
+/// second run's estimate is the first run's plus that segment's own, as a
+/// scan of a store holding only that segment reports it.
+///
+/// Seen failing against a memo of the whole scan's summed estimate, keyed on
+/// its segment set: the second run's `directory_reads` is 9 where 1 is
+/// expected.
+#[tokio::test]
+async fn a_segment_added_between_runs_is_the_only_one_the_verdict_reads() {
+    let t = tenant();
+    let added = FAST_OBJECTS + 1;
+    let store = fast_store(&t, 1..=FAST_OBJECTS).await;
+    let cache = fresh_cache();
+    let first = verdict_of(
+        &executor_with(&store, Some(Arc::clone(&cache)), true, None),
+        &store,
+        &t,
+        CONTAINS_SQL,
+    )
+    .await;
+    assert_eq!(first.directory_reads, FAST_OBJECTS);
+
+    publish_object(store.as_ref(), &t, added).await;
+    let second = verdict_of(
+        &executor_with(&store, Some(Arc::clone(&cache)), true, None),
+        &store,
+        &t,
+        CONTAINS_SQL,
+    )
+    .await;
+    assert_eq!(
+        second.directory_reads, 1,
+        "only the added segment's directories are read"
+    );
+
+    let alone = fast_store(&t, added..=added).await;
+    let added_alone = verdict_of(
+        &executor(&alone, Some(fresh_cache())),
+        &alone,
+        &t,
+        CONTAINS_SQL,
+    )
+    .await;
+    assert_eq!(added_alone.directory_reads, 1);
+    assert_eq!(
+        second.estimate,
+        first.estimate + added_alone.estimate,
+        "the second estimate is the first plus the added segment's own"
     );
 }
