@@ -1541,6 +1541,19 @@ pub struct SqlOutcome {
     /// erasure is in force, so a later page cannot return rows an erasure
     /// accepted between pages.
     pub pending_erasure: Vec<ErasurePredicate>,
+    /// The greatest `ingest_hour_bucket` among the segments the succeeding
+    /// attempt resolved, over every signal lane, in whole hours since the
+    /// epoch. `None` when that resolve returned no segment.
+    ///
+    /// The freshness watermark ADR-1374 reports in
+    /// `visibility.ingest_watermark_hour` and a cursor carries forward (the
+    /// 2026-09-13 amendment, items 3 and 4). It is read off the snapshot the
+    /// rows came from, for the same reason as [`Self::pending_erasure`].
+    pub ingest_watermark_hour: Option<u32>,
+    /// Whether the statement read a Parquet table (ADR-2040), alone or joined
+    /// with signal tables. A Parquet table is resolved from its manifest, not
+    /// from a signal snapshot, so no cursor pin covers it.
+    pub reads_parquet: bool,
 }
 
 /// The warning a `samples` statement carries when its answer omits the
@@ -2385,6 +2398,12 @@ impl SqlExecutor {
                 .iter()
                 .flat_map(|(_, snapshot)| snapshot_pending_erasure_predicates(snapshot))
                 .collect();
+            let ingest_watermark_hour = lanes
+                .iter()
+                .flat_map(|(_, snapshot)| snapshot.segments.iter())
+                .map(|seg| seg.ingest_hour_bucket)
+                .max();
+            let reads_parquet = parquet.is_some();
             let lane_refs: Vec<(TargetSignal, &Snapshot)> = lanes
                 .iter()
                 .map(|(signal, snapshot)| (*signal, snapshot))
@@ -2507,6 +2526,8 @@ impl SqlExecutor {
                         target,
                         declared_columns: declared.clone(),
                         pending_erasure,
+                        ingest_watermark_hour,
+                        reads_parquet,
                     });
                 }
                 Err(err) => match retry_decision(err.is_segment_not_found(), emitted, attempt) {

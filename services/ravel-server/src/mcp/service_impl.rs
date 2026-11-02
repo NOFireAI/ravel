@@ -1,7 +1,10 @@
 //! The [`QueryBackend`] port over [`QueryService`].
 //!
 //! Every method here is one call into the query service and one conversion of
-//! its outcome into a D4 envelope. Nothing else: the admission permit, the
+//! its outcome into a D4 envelope, except the two SQL methods: `sql_execute`
+//! stops before the caps and returns a [`Draft`] beside the snapshot's pin
+//! inputs, and `sql_explain` returns an [`ExplainOutcome`] for the explain
+//! tool to render. Nothing else: the admission permit, the
 //! deadline clamp, the cost record, the usage guard, the audit submission, the
 //! partial-coverage gate, and the error redaction all live inside the service
 //! layer, and a tool call takes exactly one permit because it makes exactly
@@ -17,10 +20,11 @@
 //! Two figures the service outcomes do not carry are absent rather than
 //! invented. The metadata operations (`labels`, `label_values`, `series`)
 //! return no accounting snapshot, so their envelopes report the ceilings they
-//! ran under and no `actual` block; and no outcome carries the resolved
-//! snapshot id or watermark hour, so `visibility` reports only the commit
-//! tokens the caller required. A zero in either place would read as a
-//! measurement. D4 types the identity fields as strings, so the unmeasured
+//! ran under and no `actual` block; and no outcome but SQL's carries the
+//! resolved snapshot id or watermark hour, so `visibility` reports only the
+//! commit tokens the caller required. A zero in either place would read as a
+//! measurement. A SQL [`Draft`] writes the watermark and leaves the snapshot
+//! id to [`Draft::finish_page`], which derives it from the tool's pin scope. D4 types the identity fields as strings, so the unmeasured
 //! ones cannot be left out of the JSON at all: [`super::envelope::finish`]
 //! names each of them in `warnings` instead, and an empty string there is
 //! never a value the caller has to interpret.
@@ -28,6 +32,7 @@
 use std::time::Duration;
 
 use ravel_mcp::budget::McpEffectiveBudgets;
+use ravel_mcp::draft::{Draft, EstimateComponent, ExplainColumn, ExplainOutcome, cursor_signal};
 use ravel_mcp::envelope::{AnyJson, Cell, Envelope, Failure};
 use ravel_mcp::service::{QueryBackend, TraceLookupRequest};
 use ravel_promql::{RangeValue, Value as PromValue};
@@ -37,7 +42,6 @@ use ravel_types::{CommitToken, TenantHash};
 use rmcp::model::{ProgressNotificationParam, ProgressToken};
 use rmcp::service::{Peer, RoleServer};
 use serde::Deserialize;
-use serde_json::json;
 
 use crate::service::{AnalyticsRequest, ExemplarsRequest, QueryService, ServiceError};
 use crate::traces::TraceLookup;
@@ -431,13 +435,22 @@ impl QueryBackend for ServiceBackend {
         &self,
         tenant_hash: TenantHash,
         request: &ravel_sql::SqlRequest,
-    ) -> Result<Envelope, Failure> {
+    ) -> Result<Draft, Failure> {
         let outcome = self
             .service
             .sql_execute(tenant_hash, request)
             .await
             .map_err(failure)?;
-        self.sql_envelope(request, outcome)
+        let envelope = self.sql_envelope(request, &outcome)?;
+        let signal = cursor_signal(outcome.target, outcome.signals.len(), outcome.reads_parquet);
+        Ok(Draft::new(
+            envelope,
+            signal,
+            outcome.pending_erasure,
+            outcome.declared_columns,
+            outcome.ingest_watermark_hour,
+            request.now_ns,
+        ))
     }
 
     async fn trace_lookup(
@@ -471,7 +484,7 @@ impl QueryBackend for ServiceBackend {
             .sql_execute(tenant_hash, &native)
             .await
             .map_err(failure)?;
-        let mut envelope = self.sql_envelope(&native, outcome)?;
+        let mut envelope = d4::finish(self.sql_envelope(&native, &outcome)?, &self.budgets);
         envelope.scope.signal = "traces".to_string();
         envelope.scope.table = "spans".to_string();
         Ok(envelope)
@@ -481,56 +494,40 @@ impl QueryBackend for ServiceBackend {
         &self,
         tenant_hash: TenantHash,
         request: &ravel_sql::SqlRequest,
-    ) -> Result<Envelope, Failure> {
+    ) -> Result<ExplainOutcome, Failure> {
         let report = self
             .service
             .sql_explain(tenant_hash, request)
             .await
             .map_err(failure)?;
-
-        let mut envelope = self.sql_base(request);
-        envelope.scope.signal = target_signal(report.target).to_string();
-        envelope.plan = Some(report.plan_text.clone());
-        if let Some(predicate) = &report.window_predicate {
-            envelope.scope.predicates_applied.push(predicate.clone());
-        }
-        envelope.data = d4::property_data(vec![
-            ("segments_resolved", json!(report.segments_resolved)),
-            ("segments_admitted", json!(report.segments_admitted)),
-            (
-                "segments_recent_exempt",
-                json!(report.segments_recent_exempt),
-            ),
-            (
-                "result_columns",
-                json!(
-                    report
-                        .schema
-                        .fields()
-                        .iter()
-                        .map(|field| json!({
-                            "name": field.name(),
-                            "type": field.data_type().to_string(),
-                        }))
-                        .collect::<Vec<_>>()
-                ),
-            ),
-        ]);
-        // An estimate with unbounded components is not an upper envelope of
-        // the whole query: the components the estimator cannot bound are
-        // named so a structural zero is not read as an estimate of zero.
-        for component in &report.unbounded_components {
-            envelope
-                .warnings
-                .push(format!("cost estimate does not bound {component}"));
-        }
-        d4::estimate_only(
-            &mut envelope,
-            &self.budgets,
-            &report.estimate,
-            report.unbounded_components.is_empty(),
-        );
-        Ok(d4::finish(envelope, &self.budgets))
+        let unbounded = report
+            .unbounded_components
+            .iter()
+            .map(|name| {
+                EstimateComponent::from_field_name(name).ok_or_else(|| {
+                    d4::internal(format!("sql explain: unknown estimate component {name}"))
+                })
+            })
+            .collect::<Result<Vec<_>, Failure>>()?;
+        Ok(ExplainOutcome {
+            target: report.target,
+            plan_text: report.plan_text,
+            window_predicate: report.window_predicate,
+            segments_resolved: report.segments_resolved as u64,
+            segments_admitted: report.segments_admitted,
+            segments_recent_exempt: report.segments_recent_exempt,
+            estimate: report.estimate,
+            unbounded,
+            columns: report
+                .schema
+                .fields()
+                .iter()
+                .map(|field| ExplainColumn {
+                    name: field.name().clone(),
+                    data_type: field.data_type().to_string(),
+                })
+                .collect(),
+        })
     }
 }
 
@@ -550,11 +547,12 @@ impl ServiceBackend {
         envelope
     }
 
-    /// The D4 envelope of an executed SQL statement.
+    /// The D4 envelope of an executed SQL statement, before any cap runs on
+    /// it.
     fn sql_envelope(
         &self,
         request: &ravel_sql::SqlRequest,
-        outcome: ravel_sql::SqlOutcome,
+        outcome: &ravel_sql::SqlOutcome,
     ) -> Result<Envelope, Failure> {
         let mut envelope = self.sql_base(request);
         // A result the JSON encoding cannot hold is the caller's choice of
@@ -584,7 +582,7 @@ impl ServiceBackend {
                 estimate_is_upper_envelope: true,
             },
         );
-        Ok(d4::finish(envelope, &self.budgets))
+        Ok(envelope)
     }
 
     /// The envelope shell of a SQL operation. The signal is not resolved
@@ -604,19 +602,6 @@ impl ServiceBackend {
             .map(ravel_sql::MinCommitToken::encode)
             .collect();
         envelope
-    }
-}
-
-/// The signal name of a SQL statement's target table, in the spelling
-/// `ravel_capabilities` reports its enabled signals with.
-fn target_signal(target: ravel_sql::TargetSignal) -> &'static str {
-    match target {
-        ravel_sql::TargetSignal::Metrics => "metrics",
-        ravel_sql::TargetSignal::Logs => "logs",
-        ravel_sql::TargetSignal::Spans => "traces",
-        ravel_sql::TargetSignal::Alerts => "alerts",
-        ravel_sql::TargetSignal::Audit => "audit",
-        ravel_sql::TargetSignal::Parquet => "parquet",
     }
 }
 
