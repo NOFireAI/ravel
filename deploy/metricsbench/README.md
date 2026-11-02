@@ -736,9 +736,16 @@ verification (step 6), after which the run goes on as a diagnostic:
     `watermark_hour`, `entry_count`, `buckets_folded`, `no_op`, that
     `ingest_end_hour` and `precondition` (`met`, or why not) (cases u, u1,
     u2).
-17. `start`: `docker compose start ravel-server` only, then Ravel's
+17. `start`: `docker compose up -d --no-deps --no-recreate ravel-server`,
+    which starts the stopped `ravel-server` container alone, then Ravel's
     `/api/v1/status/buildinfo` answers 200 as in `ready`, before the
-    read-back's first scrape (case u). A failed start exits 70 naming start
+    read-back's first scrape (case u). `docker compose start ravel-server`
+    would also start its dependencies, rerunning the one-shot
+    `createbuckets` and `ravel-qualify`; on the real-S3 lane
+    `createbuckets` refuses a bucket that holds objects and exits 1, so the
+    step failed there. `--no-recreate` keeps it the same container the run
+    measured before the fold. Case u asserts that this is the only compose
+    start or up after the fold and that no one-shot service starts again. A failed start exits 70 naming start
     (case u2b). `ravel_restart` says it stopped before the fold and started
     after it (cases u, u1, u2a, u2b).
 18. `readback-folded`: Ravel's `/metrics` into

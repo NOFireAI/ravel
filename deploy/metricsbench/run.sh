@@ -107,8 +107,11 @@
 #               watermark_hour is at or after the hour the ingest step ended
 #               in. Stamped as ravel_catalog_fold_writers_stopped. A failed
 #               fold ends the run with the server still stopped
-#   start       docker compose start ravel-server, then its readiness URL
-#               answers 200 as in ready. Stamped as ravel_restart
+#   start       docker compose up -d --no-deps --no-recreate ravel-server:
+#               the stopped container alone, since compose start would also
+#               rerun the one-shot createbuckets and ravel-qualify. Then its
+#               readiness URL answers 200 as in ready. Stamped as
+#               ravel_restart
 #   readback-folded  Ravel's /metrics scraped into
 #               <out>/ravel-metrics-before-folded-readback.txt,
 #               metricsbench_ingest --readback-only for the Ravel row into
@@ -1418,16 +1421,20 @@ stop_step() {
   step_done stop
 }
 
+# start_step: compose start also starts a service's dependencies, which reruns
+# the one-shot createbuckets (it refuses a non-empty real-S3 bucket) and
+# ravel-qualify. --no-deps starts the stopped container alone, and
+# --no-recreate keeps it the container the run measured before the fold.
 start_step() {
   local code=0 stopped="stopped: docker compose stop ravel-server before the fold"
-  compose start ravel-server >"${out_dir}/ravel-start.log" 2>&1 || code=$?
+  compose up -d --no-deps --no-recreate ravel-server >"${out_dir}/ravel-start.log" 2>&1 || code=$?
   if [ "$code" -ne 0 ]; then
     show_log "${out_dir}/ravel-start.log"
-    stamp_str ravel_restart "${stopped}; docker compose start ravel-server after it exited $code"
-    fail_step start "docker compose start ravel-server exited $code"
+    stamp_str ravel_restart "${stopped}; docker compose up -d --no-deps --no-recreate ravel-server after it exited $code"
+    fail_step start "docker compose up -d --no-deps --no-recreate ravel-server exited $code"
   fi
   wait_ready ravel "${RAVEL_BASE}/api/v1/status/buildinfo" start
-  stamp_str ravel_restart "${stopped}; started: docker compose start ravel-server after it, then ravel answered 200 on /api/v1/status/buildinfo"
+  stamp_str ravel_restart "${stopped}; started: docker compose up -d --no-deps --no-recreate ravel-server after it, then ravel answered 200 on /api/v1/status/buildinfo"
   step_done start
 }
 
