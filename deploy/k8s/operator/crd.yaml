@@ -522,6 +522,44 @@
                         },
                         "type": "object"
                       },
+                      "mcp": {
+                        "description": "Serves the MCP adapter at `POST /mcp` on the query pods (ADR-1374,\nissue #3648 amendment). Omit, or leave `enabled` false, to render none\nof the MCP flags. Turning the block on or off, or editing it while\nenabled, changes the query Deployment's arguments, so the query pods\nroll.",
+                        "nullable": true,
+                        "properties": {
+                          "allowedOrigins": {
+                            "description": "`Origin` header values the MCP route accepts, each compared whole and\nignoring ASCII case, for example `https://agents.example.com`. A\nrequest with an `Origin` not on the\nlist is refused with 403. A request with no `Origin` header is\naccepted: non-browser MCP clients send none, so the list governs\nbrowser clients only. At least one entry is required when `enabled`\nis true. Entries may not be empty or contain a comma, because the list\nrenders as one comma-separated flag value. At most 64 entries of at\nmost 1024 characters each.",
+                            "items": {
+                              "maxLength": 1024,
+                              "type": "string"
+                            },
+                            "maxItems": 64,
+                            "type": "array"
+                          },
+                          "enabled": {
+                            "default": false,
+                            "description": "Whether the query pods serve `POST /mcp`. Defaults to false.",
+                            "type": "boolean"
+                          },
+                          "maxBodyBytes": {
+                            "description": "Largest MCP request body in bytes; a larger body is refused with 413.\nUnset, no flag renders and the server default (1 MiB) applies.\nMinimum 1.",
+                            "format": "uint64",
+                            "minimum": 1.0,
+                            "nullable": true,
+                            "type": "integer"
+                          }
+                        },
+                        "type": "object",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "query.mcp.enabled needs at least one query.mcp.allowedOrigins entry: the query pods listen on 0.0.0.0, and ravel-server refuses to start --mcp on a non-loopback listener with an empty allowlist",
+                            "rule": "!has(self.enabled) || !self.enabled || (has(self.allowedOrigins) && size(self.allowedOrigins) > 0)"
+                          },
+                          {
+                            "message": "query.mcp.allowedOrigins entries must be non-empty and contain no comma: the list renders as one comma-joined --mcp-allowed-origins value, which ravel-server splits on commas",
+                            "rule": "!has(self.allowedOrigins) || self.allowedOrigins.all(o, size(o) > 0 && !o.contains(','))"
+                          }
+                        ]
+                      },
                       "memoryBudgetBytes": {
                         "description": "Pins the query pods' memory budget: renders `--memory-budget-bytes`\nwith this value on the query container only (ADR-1170, issue #3200\namendment). Unset, no flag renders and the server derives its budget\nfrom the pod's memory limit minus a reserve (a quarter of the limit\nbelow 8 GiB, 2 GiB from 8 GiB up), so raising the limit raises the\nbudget with it and adds no headroom beyond that reserve. Set,\n`resources.limits.memory` must be at least this value plus the 256 MiB\nthe server holds outside its budget in `--mode query`.\nA missing, unparseable or smaller limit is refused: the query\nDeployment is not applied (a running one is left unchanged) and the\ncluster reports `Degraded` with reason `QueryMemoryBudgetExceedsLimit`\nor `QueryMemoryLimitUnparseable`. A limit below that floor plus the\nheadroom (`memoryHeadroomBytes`) still rolls the Deployment and reports\n`Degraded` with reason `QueryMemoryHeadroomLow`. Minimum 1.",
                         "format": "uint64",

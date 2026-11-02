@@ -17,9 +17,18 @@ which has its own guide: [Ravel Agents](agents.md).
 > carries the split `ravel_capabilities` reports at runtime.
 
 The published image built from `main` compiles in the `mcp` feature, so with
-that image you only pass `--mcp`. `--mcp` is a process flag, and no
-`RavelCluster` field sets it, so query pods the operator manages do not serve
-`POST /mcp` today. See [Running Ravel on Kubernetes](kubernetes.md).
+that image you only pass `--mcp`. On Kubernetes, query pods the operator
+manages serve `POST /mcp` when the `RavelCluster` sets
+`spec.query.mcp.enabled: true` with at least one `spec.query.mcp.allowedOrigins`
+entry; the operator then renders `--mcp` and `--mcp-allowed-origins` on the
+query pods only. The query pods listen on `0.0.0.0`, so the API server refuses
+`enabled: true` without an origin, as the server would refuse to start. A
+non-browser MCP client sends no `Origin` header and is accepted, so the
+allowlist governs browser clients only. A custom `spec.image` built without
+the `mcp` feature ignores `--mcp` and mounts no route. Turning
+`spec.query.mcp` on or off, or editing it while it is enabled, changes the
+query Deployment's arguments and rolls the query pods. See
+[Serving MCP from the query pods](kubernetes.md#serving-mcp-from-the-query-pods).
 
 ## What agents get
 
