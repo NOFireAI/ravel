@@ -5371,8 +5371,13 @@ Each partition first aggregates into one table, as the stock final does. When
 the table reaches the engage threshold (65,536 groups by default) the partition
 routes the table's state and every later input row into 2^bits hash buckets (64
 by default), hashed with a seed and bit range independent of the repartition
-exchange. Once input ends it aggregates, emits and frees one bucket at a time,
-so the peak is about one bucket's table rather than the partition's. Memory is
+exchange. Once input ends it aggregates, emits and frees one bucket at a time.
+The partition's peak is therefore one bucket's table plus every routed row
+still buffered (one slot per input row, keys and state, no dedup until its
+bucket is aggregated) plus up to one chunk of slack per bucket per column; it
+is lower than the stock final's only when the routed rows are close to the
+group count, as on unique keys, not when many partial rows reach the final per
+group. Memory is
 charged one to one to a `BucketedFinalAggregate[p]` consumer per partition, with
 no reserve-ahead factor; a refused grow fails the query with
 `ResourcesExhausted` naming that consumer, and nothing spills. `EXPLAIN ANALYZE`
