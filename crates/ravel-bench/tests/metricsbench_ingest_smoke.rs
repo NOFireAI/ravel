@@ -1604,10 +1604,12 @@ fn readback_only_reads_a_kept_report_back_without_writing() {
 /// Each `--readback-only` refusal exits 64 with a message naming the
 /// problem, prints no JSON and sends no write: a write endpoint flag, a
 /// missing flag, a system that is not portable or has no query URL, a
-/// bearer token for a row other than ravel, no row or two rows for the
-/// system, a row that recorded no successful ingest (`row_failure`, or
-/// listed under `stalled`), and a profile, step count, workload digest or
-/// anchor that differs from the report's.
+/// bearer token for a row other than ravel, a bearer token variable that is
+/// unset or empty, no row or two rows for the system, a row that recorded no
+/// successful ingest (`row_failure`, or listed under `stalled`), a ravel row
+/// with no non-empty commit token, a profile, step count, workload digest or
+/// anchor that differs from the report's, and a regenerated stream whose
+/// digest differs from the report's `run.stream_digest`.
 #[test]
 fn readback_only_refusals_exit_64() {
     let _serial = serial();
@@ -1662,6 +1664,19 @@ fn readback_only_refusals_exit_64() {
     let other_digest = variant("digest.json", &|r| {
         r["profile"]["run"]["workload_digest"] = serde_json::json!("00");
     });
+    let other_stream = variant("stream.json", &|r| {
+        r["profile"]["run"]["stream_digest"] = serde_json::json!("00");
+    });
+    let no_token = variant("no_token.json", &|r| {
+        r["systems"][0]["commit_tokens_by_shard"] = serde_json::Value::Null;
+    });
+    let empty_tokens = variant("empty_tokens.json", &|r| {
+        r["systems"][0]["commit_tokens_by_shard"] = serde_json::json!({});
+    });
+    let blank_token = variant("blank_token.json", &|r| {
+        r["systems"][0]["commit_tokens_by_shard"] = serde_json::json!({"0": " "});
+    });
+    let unset_var = "METRICSBENCH_SMOKE_TOKEN_NEVER_SET";
     let anchor = on_grid_anchor().to_string();
     let other_anchor = (on_grid_anchor() + ci_interval_ms()).to_string();
     let write = format!("{url}/api/v1/write");
@@ -1756,6 +1771,49 @@ fn readback_only_refusals_exit_64() {
             ],
             "--ravel-bearer-token-env applies to the ravel row only, not to mimir",
         ),
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--readback-system",
+                "ravel",
+                "--ravel-bearer-token-env",
+                unset_var,
+            ],
+            "--ravel-bearer-token-env names `METRICSBENCH_SMOKE_TOKEN_NEVER_SET`, which is unset",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &other_stream,
+                "--readback-system",
+                "ravel",
+            ],
+            "differs from the ingest report's 00, so the rebuilt plan is not the one the replay \
+             recorded",
+        ),
+        (
+            vec!["--ingest-report", &no_token, "--readback-system", "ravel"],
+            "the ingest report's ravel row has no commit token (`commit_tokens_by_shard`)",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &empty_tokens,
+                "--readback-system",
+                "ravel",
+            ],
+            "the ingest report's ravel row has no commit token (`commit_tokens_by_shard`)",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &blank_token,
+                "--readback-system",
+                "ravel",
+            ],
+            "the ingest report's ravel row has no commit token (`commit_tokens_by_shard`)",
+        ),
     ];
     for (extra, message) in cases {
         let mut argv = vec!["--anchor-ms", anchor.as_str(), "--ravel-query-url", &url];
@@ -1813,6 +1871,34 @@ fn readback_only_refusals_exit_64() {
         )),
         "{stderr}"
     );
+
+    let empty_var = "METRICSBENCH_SMOKE_TOKEN_EMPTY";
+    let output = Command::new(env!("CARGO_BIN_EXE_metricsbench_ingest"))
+        .args([
+            "--readback-only",
+            "--profile",
+            "ci",
+            "--anchor-ms",
+            &anchor,
+            "--ingest-report",
+            &kept,
+            "--readback-system",
+            "ravel",
+            "--ravel-query-url",
+            &url,
+            "--ravel-bearer-token-env",
+            empty_var,
+        ])
+        .env(empty_var, "")
+        .output()
+        .expect("spawn metricsbench_ingest");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(64), "{stderr}");
+    assert!(
+        stderr.contains("names `METRICSBENCH_SMOKE_TOKEN_EMPTY`, which is unset, empty"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "{stderr}");
 
     let output = Command::new(env!("CARGO_BIN_EXE_metricsbench_ingest"))
         .args([
