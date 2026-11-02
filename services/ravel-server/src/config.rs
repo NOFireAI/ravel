@@ -2299,7 +2299,7 @@ pub struct Cli {
     /// stalled. This makes the knob the per-shard cross-tenant flush
     /// isolation control as much as a throughput one: one tenant may hold at
     /// most `--max-inflight-flushes-per-tenant` of the shard's permits
-    /// (ADR-2708 D3, default N-1), so at the default of 4 a tenant whose S3
+    /// (ADR-2708 D3, default N-1), so at the default of 8 a tenant whose S3
     /// key prefix is stalled leaves a permit for its co-resident tenants'
     /// flushes. At 1 there is no permit to leave: a stalled tenant holds the
     /// shard's only permit and co-resident tenants' flushes queue behind it
@@ -2324,7 +2324,7 @@ pub struct Cli {
     /// their buffers and their ADR-0069 byte charges, so the byte budget, not
     /// this bound, is what sheds when a shard backs up. Matches
     /// [`ravel_ingest::IngestConfig::max_inflight_flushes`]'s own default of
-    /// 4. `0` is rejected by
+    /// 8. `0` is rejected by
     /// [`Cli::validate`]: it would deadlock every flush, since a shard could
     /// never acquire a permit to run one. A value ABOVE `--max-queued-flushes`
     /// (default 8) is accepted and raises the effective queue cap to match,
@@ -2335,7 +2335,7 @@ pub struct Cli {
     /// refusal would crash-loop an already-admitted cluster on upgrade.
     /// Nothing lowers this flag; set `--max-queued-flushes` yourself when you
     /// want the queue deeper than the permit count.
-    #[arg(long = "max-inflight-flushes", default_value_t = 4)]
+    #[arg(long = "max-inflight-flushes", default_value_t = 8)]
     pub max_inflight_flushes: u32,
 
     /// How many of a shard's `--max-inflight-flushes` permits one tenant's
@@ -20294,7 +20294,7 @@ mod tests {
     fn max_inflight_flushes_and_adaptive_flush_delay_default() {
         let parsed = cli(&[]);
         assert_eq!(
-            parsed.max_inflight_flushes, 4,
+            parsed.max_inflight_flushes, 8,
             "default matches ravel_ingest::IngestConfig::max_inflight_flushes"
         );
         assert_eq!(

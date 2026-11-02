@@ -733,7 +733,8 @@ pub struct IngestConfig {
     /// semaphore, which a spawned flush task holds from grant through its
     /// last store call, retries included. The count bounds concurrent PUTs per
     /// shard; it does not bound encode memory, which the ingest byte budget
-    /// does (ADR-2708 D3). Default 4 (ADR-2708 D3), so a tenant held at its
+    /// does (ADR-2708 D3). Default 8 (ADR-2708's flush slots amendment), so
+    /// a tenant held at its
     /// [`Self::max_inflight_flushes_per_tenant`] share leaves a permit for a
     /// co-resident tenant. Must be at least 1: a value of 0 deadlocks every
     /// flush (`services/ravel-server`'s `Cli::validate` rejects it at the
@@ -863,7 +864,7 @@ impl Default for IngestConfig {
             put_retry_max_delay: Duration::from_secs(2),
             max_flush_lifetime: Duration::from_secs(3600),
             exemplar_cap_window_ns: ravel_types::ExemplarCap::DEFAULT_WINDOW_NS,
-            max_inflight_flushes: 4,
+            max_inflight_flushes: 8,
             max_inflight_flushes_per_tenant: None,
             // Issue #1740: eight flush windows per shard is deep enough that a
             // healthy shard never reaches it (a flush that is not stalled is
@@ -1306,10 +1307,11 @@ mod tests {
             cfg.exemplar_cap_window_ns,
             ravel_types::ExemplarCap::DEFAULT_WINDOW_NS
         );
-        // ADR-2708 D3: four permits per shard, three of them per tenant.
-        assert_eq!(cfg.max_inflight_flushes, 4);
+        // ADR-2708's flush slots amendment: eight permits per shard, seven of
+        // them per tenant.
+        assert_eq!(cfg.max_inflight_flushes, 8);
         assert_eq!(cfg.max_inflight_flushes_per_tenant, None);
-        assert_eq!(cfg.flush_share_per_tenant(), 3);
+        assert_eq!(cfg.flush_share_per_tenant(), 7);
         assert_eq!(cfg.validate(), Ok(()));
         // Issue #1740: the count bound on spawned-but-unreaped flush tasks per
         // shard, the one that still holds under an Unlimited byte budget.

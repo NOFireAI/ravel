@@ -45,8 +45,8 @@ object-store stall.
 
 The store applies `503 SlowDown` per key prefix. When the key prefix of one
 tenant is throttled, its stalled flushes hold up to
-`--max-inflight-flushes-per-tenant` of the permits on that shard (default 3 of
-4). Once stalled tenants hold every permit, the flushes of co-resident tenants
+`--max-inflight-flushes-per-tenant` of the permits on that shard (default 7 of
+8). Once stalled tenants hold every permit, the flushes of co-resident tenants
 queue behind them on every replica in the subset. A smaller or different
 subset does not change that. The shard actor
 keeps running, so the writes of those tenants are still accepted and their
