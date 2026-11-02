@@ -90,8 +90,11 @@ pub struct QuerySqlInput {
 pub struct QueryPromqlInput {
     pub query: String,
     /// Set together with `step` for a range evaluation. Exactly one of this
-    /// pair or `evaluation_time` must be present.
+    /// pair or `evaluation_time` must be present. Steps run from `start_ns`
+    /// while below `end_ns`.
     pub time_range: Option<TimeRange>,
+    /// A duration with a unit, such as `30s`. The step and every time must be
+    /// a whole millisecond.
     pub step: Option<String>,
     /// Set alone for an instant evaluation. Exactly one of this or the
     /// `time_range`/`step` pair must be present.
@@ -109,6 +112,7 @@ pub struct QueryPromqlInput {
     /// 256 KiB.
     pub max_response_bytes: Option<u64>,
     pub deadline_ms: Option<u64>,
+    /// Not served by this build: any value is refused as `unsupported`.
     pub evidence_ref: Option<String>,
 }
 
@@ -451,7 +455,7 @@ mod tests {
     /// every client parses on every reconnect, and it should be read in a
     /// diff rather than absorbed silently anywhere under the bound. Update
     /// it in the same commit as the schema change that moves it.
-    const TOOLS_LIST_SERIALIZED_LEN: usize = 15_733;
+    const TOOLS_LIST_SERIALIZED_LEN: usize = 15_972;
 
     /// D2 bounds `tools/list` so the catalog itself never competes with a
     /// data response for the response-size budget.
@@ -754,7 +758,7 @@ mod tests {
     /// `agents` and run with both enabled answers it. Pinned for the same
     /// reason as [`TOOLS_LIST_SERIALIZED_LEN`], under the same D2 budget
     /// (ADR-3331 decision 10).
-    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 23_622;
+    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 23_861;
 
     const _: () = assert!(
         COMBINED_TOOLS_LIST_SERIALIZED_LEN < 24_576,

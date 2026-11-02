@@ -1037,9 +1037,11 @@ Shipping the explain changed its catalog description to name SQL only, and
 `ravel_find_labels` no longer declares `evidence_ref` (2026-09-13 item 2).
 `tools/list` was then 15,648 bytes with the nine tools and 23,537 bytes
 with all fifteen. Since the committed row count amendment below it was
-15,652 bytes with the nine tools and 23,541 bytes with all fifteen, and
-since the query-sql amendment below it is 15,733 bytes with the nine tools
-and 23,622 bytes with all fifteen, against the 24,576-byte budget; both
+15,652 bytes with the nine tools and 23,541 bytes with all fifteen. Since
+the query-sql amendment below it was 15,733 bytes with the nine tools and
+23,622 bytes with all fifteen, and since the query-promql amendment below
+it is 15,972 bytes with the nine tools and 23,861 bytes with all fifteen,
+against the 24,576-byte budget; both
 figures are pinned in
 `crates/ravel-mcp/src/catalog.rs` and
 `services/ravel-server/tests/mcp_agents_e2e.rs`.
@@ -1254,3 +1256,55 @@ the choices they leave open and the one place it departs.
    description moves `tools/list` from 15,652 to 15,733 bytes with the nine
    tools and from 23,541 to 23,622 bytes with all fifteen, under the
    24,576-byte budget.
+
+## Amendment (2026-11-02, #3695): the query-promql amendment, `ravel_query_promql` ships, and its row cap counts series
+
+<!-- amendment-applies: sections="Amendment (2026-11-02): a Parquet explain names its unbounded figures and does not refuse" pointer="query-promql amendment" -->
+
+`ravel_query_promql` is served (`crates/ravel-mcp/src/tools/query_promql.rs`),
+the seventh tool body. It keeps D2's two modes and D4's precision rule as
+written, and records here the choices they leave open.
+
+1. The mode is checked from the arguments before any backend call.
+   `evaluation_time` together with `time_range` or `step`, none of the
+   three, `time_range` without `step`, and `step` without `time_range` are
+   each `invalid_argument`, with a next step naming the two modes.
+2. The range is half-open, as D2 says of every `time_range`. The engine's
+   range is closed, so the tool sends `end_ns` minus one millisecond as its
+   end; steps run from `start_ns` while below `end_ns`. An `end_ns` not
+   after `start_ns` is `invalid_argument`. The scope reports the instant or
+   the range as nanosecond strings and, after the query in
+   `predicates_applied`, one line for the instant or the step alignment
+   (start, step, and the last step in nanoseconds) and one for the 5 m
+   lookback, which an end-to-end test pins equal to the engine's
+   `DEFAULT_LOOKBACK_NS`.
+3. The engine evaluates in milliseconds. An `evaluation_time`, range bound
+   or step that is not a whole millisecond is `invalid_argument` naming the
+   value, not rounded: rounding would evaluate an instant the caller did
+   not name and report the one it did.
+4. `step` is a duration with a unit (`30s`, `1m`, `1h30m`). A bare number,
+   zero, or a negative step is `invalid_argument`; a bare number reads as
+   seconds to the HTTP API and is the one spelling an agent and a person
+   disagree on.
+5. Partial coverage is refused as `unavailable`, the class the HTTP route's
+   503 maps to, unless `allow_partial_coverage` is true, with a next step
+   that names the argument. The service's own refusal, which names the HTTP
+   parameter `allow_partial`, is rewritten to name this argument.
+6. A vector or matrix result is one row per series: the label set, then
+   `ts_ns` and `value` as parallel arrays (and `histogram` only when a step
+   of the series is a native histogram). `max_rows` (default 200, ceiling
+   5,000) counts series, not samples, and a capped result is `ok_bounded`
+   with no cursor: neither the D2 row nor D5 gives this tool one, and a
+   PromQL result has no order a cursor could resume. So the server's
+   `promql_instant` and `promql_range` ports stop before the caps and the
+   tool groups, caps and fits once. A scalar or string result is one
+   `value` row.
+7. `evidence_ref` stays in the input schema and is refused as
+   `unsupported`.
+8. `ravel_log_lines` and `ravel_log_bytes` are evaluated as the HTTP API
+   evaluates them; the tool adds no handling of its own, and an end-to-end
+   test counts both over a logs tenant.
+9. Serving the tool moves the served count from six to seven and the
+   catalogued count from three to two. The input descriptions move
+   `tools/list` from 15,733 to 15,972 bytes with the nine tools and from
+   23,622 to 23,861 bytes with all fifteen, under the 24,576-byte budget.
