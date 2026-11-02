@@ -1,9 +1,12 @@
 //! `--decoded-cache-max-bytes` through the server's own wiring: at 0 the SQL
 //! response carries no `stats.decodedCache`, and above 0 it carries the field
-//! exactly once per call, with every counter named.
+//! exactly once per call, with every counter named, and for a statement with
+//! a `LIKE '%...%'` arm the serve-if-fits estimate and verdict (ADR-3326).
 //!
 //! Two servers share one store holding one ingested log object and differ
-//! only in the flag.
+//! only in the flag, and in the read cache the enabled one carries: with it
+//! the logs scan stripes over more partitions than the one segment, so a
+//! `LIKE`-only scan runs the plan pass that makes the verdict.
 
 #![cfg(feature = "sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -18,6 +21,7 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
+use ravel_catalog::{DeclaredColumnType, DeclaredTypedColumn, TenantConfig, TenantLifecycleState};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_server::config::QueryBudgets;
@@ -31,7 +35,11 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const ROWS: usize = 500;
 const DECODED_CACHE: u64 = 64 * 1024 * 1024;
 const STATEMENT: &str = "SELECT count(*) AS n FROM logs WHERE severity_text = 'INFO'";
-const FIELDS: [&str; 9] = [
+/// A declared `Str` attribute every row carries, so `LIKE` on it is a pushed
+/// `Contains` arm.
+const URL: &str = "url";
+const LIKE_STATEMENT: &str = "SELECT count(*) AS n FROM logs WHERE url LIKE '%example%'";
+const FIELDS: [&str; 10] = [
     "hits",
     "misses",
     "admissions",
@@ -41,6 +49,7 @@ const FIELDS: [&str; 9] = [
     "residentBytes",
     "pressureEvictions",
     "pressureFreedBytes",
+    "deferredServed",
 ];
 
 fn tenant_hash() -> TenantHash {
@@ -65,7 +74,12 @@ async fn start(
         store.clone(),
         store,
         Arc::new(ravel_object_store::StoreMetrics::default()),
-        None,
+        (decoded_cache_max_bytes > 0).then(|| {
+            let bytes = 64 * 1024 * 1024;
+            ravel_query::ReadCache::Ram(Arc::new(ravel_cache::Cache::new(
+                ravel_cache::CacheLimits::new(bytes, 16_384, bytes),
+            )))
+        }),
     )
     .await
     .expect("server starts")
@@ -83,6 +97,16 @@ async fn ingest(client: &reqwest::Client, base: &str, base_ts_ns: i64) {
                 body: Some(AnyValue {
                     value: Some(AnyValueVariant::StringValue(format!("request {i}"))),
                 }),
+                attributes: vec![KeyValue {
+                    key: URL.to_string(),
+                    value: Some(AnyValue {
+                        value: Some(AnyValueVariant::StringValue(format!(
+                            "https://example.com/page/{}",
+                            i % 7
+                        ))),
+                    }),
+                    ..Default::default()
+                }],
                 ..Default::default()
             }
         })
@@ -118,15 +142,20 @@ async fn ingest(client: &reqwest::Client, base: &str, base_ts_ns: i64) {
     assert_eq!(response.status(), 200, "export accepted");
 }
 
-/// Run [`STATEMENT`] and return the raw response body and its `stats` object.
-async fn run(client: &reqwest::Client, base: &str, base_ts_ns: i64) -> (String, Value) {
+/// Run `statement` and return the raw response body and its `stats` object.
+async fn run(
+    client: &reqwest::Client,
+    base: &str,
+    base_ts_ns: i64,
+    statement: &str,
+) -> (String, Value) {
     let start = (base_ts_ns - NS_PER_HOUR) as f64 / 1e9;
     let end = (base_ts_ns + NS_PER_HOUR) as f64 / 1e9;
     let response = client
         .post(format!("{base}/api/v1/sql"))
         .header("authorization", format!("Bearer {TOKEN}"))
         .header("content-type", "application/json")
-        .body(serde_json::json!({ "query": STATEMENT, "start": start, "end": end }).to_string())
+        .body(serde_json::json!({ "query": statement, "start": start, "end": end }).to_string())
         .send()
         .await
         .expect("sql request sent");
@@ -141,9 +170,24 @@ async fn run(client: &reqwest::Client, base: &str, base_ts_ns: i64) -> (String, 
 /// FLIP: dropping the `decodedCache` insert in `stats_json`
 /// (`services/ravel-server/src/sql.rs`) fails the enabled half; inserting it
 /// unconditionally fails the disabled half.
+///
+/// The `LIKE` statement's object carries `deferredSetEstimateBytes` too, a
+/// positive estimate at most 0.95 of the cap, with `deferredServed` true;
+/// the filtered statement's carries `deferredServed` false and no estimate.
 #[tokio::test]
 async fn decoded_cache_stats_appear_once_when_enabled_and_never_at_zero() {
-    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let memory = Arc::new(MemoryStore::new());
+    let config = TenantConfig {
+        typed_attr_columns: Some(vec![DeclaredTypedColumn {
+            key: URL.to_string(),
+            ty: DeclaredColumnType::Str,
+        }]),
+        ..TenantConfig::new(TenantLifecycleState::Active)
+    };
+    ravel_catalog::set_tenant_config(memory.as_ref(), &tenant_hash(), &config, now_ns())
+        .await
+        .expect("tenant config");
+    let store: Arc<dyn ObjectStoreBackend> = memory;
     let client = reqwest::Client::new();
     let base_ts_ns = now_ns();
 
@@ -152,8 +196,9 @@ async fn decoded_cache_stats_appear_once_when_enabled_and_never_at_zero() {
     ingest(&client, &disabled_base, base_ts_ns).await;
     let mut off = Vec::new();
     for _ in 0..2 {
-        off.push(run(&client, &disabled_base, base_ts_ns).await);
+        off.push(run(&client, &disabled_base, base_ts_ns, STATEMENT).await);
     }
+    off.push(run(&client, &disabled_base, base_ts_ns, LIKE_STATEMENT).await);
     let off_metrics = scrape(&client, &disabled_base).await;
     disabled
         .shutdown()
@@ -164,8 +209,9 @@ async fn decoded_cache_stats_appear_once_when_enabled_and_never_at_zero() {
     let enabled_base = format!("http://{}", enabled.http_addr);
     let mut on = Vec::new();
     for _ in 0..3 {
-        on.push(run(&client, &enabled_base, base_ts_ns).await);
+        on.push(run(&client, &enabled_base, base_ts_ns, STATEMENT).await);
     }
+    let like = run(&client, &enabled_base, base_ts_ns, LIKE_STATEMENT).await;
     let on_metrics = scrape(&client, &enabled_base).await;
     enabled.shutdown().await.expect("enabled server shuts down");
 
@@ -207,12 +253,37 @@ async fn decoded_cache_stats_appear_once_when_enabled_and_never_at_zero() {
             .unwrap_or_else(|| panic!("stats.decodedCache: {stats}"));
         assert_eq!(decoded.len(), FIELDS.len(), "{stats}");
         for field in FIELDS {
+            if field == "deferredServed" {
+                assert_eq!(decoded[field], Value::Bool(false), "{stats}");
+            } else {
+                assert!(
+                    decoded[field].is_u64(),
+                    "stats.decodedCache.{field}: {stats}"
+                );
+            }
+        }
+    }
+    assert_eq!(like.0.matches("\"decodedCache\"").count(), 1, "{}", like.0);
+    let decoded = like.1["decodedCache"]
+        .as_object()
+        .unwrap_or_else(|| panic!("stats.decodedCache: {}", like.1));
+    assert_eq!(decoded.len(), FIELDS.len() + 1, "{}", like.1);
+    for field in FIELDS {
+        if field == "deferredServed" {
+            assert_eq!(decoded[field], Value::Bool(true), "{}", like.1);
+        } else {
             assert!(
                 decoded[field].is_u64(),
-                "stats.decodedCache.{field}: {stats}"
+                "stats.decodedCache.{field}: {}",
+                like.1
             );
         }
     }
+    let estimate = decoded["deferredSetEstimateBytes"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("deferredSetEstimateBytes: {}", like.1));
+    assert!(estimate > 0, "{}", like.1);
+    assert!(estimate * 20 <= DECODED_CACHE * 19, "{}", like.1);
     // The filtered statement is interactive, so the first run admits and the
     // later runs are served.
     let first = &on[0].1["decodedCache"];

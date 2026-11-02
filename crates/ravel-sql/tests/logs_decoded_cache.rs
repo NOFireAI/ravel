@@ -8,7 +8,9 @@
 //! fetcher carries a large decoded cache, and every run's rows must equal the
 //! same statement's rows through an executor with no decoded cache (the
 //! `--decoded-cache-max-bytes 0` shape). Hot runs must hit the cache for every
-//! projected column the scan decodes whole, and never for `c`.
+//! projected column. `c` is served too when the scan's decoded set fits under
+//! 0.95 of the cap, and never when it does not (ADR-3326, serve-if-fits
+//! amendment).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -16,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use datafusion::arrow::util::pretty::pretty_format_batches;
+use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -28,7 +31,7 @@ use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_by
 use ravel_memory::MemoryBudget;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{CacheFetchError, LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlRequest,
     StaticDeclaredColumns,
@@ -156,9 +159,42 @@ fn executor(
     store: &Arc<dyn ObjectStoreBackend>,
     cache: Option<Arc<DecodedColumnCache>>,
 ) -> SqlExecutor {
+    executor_with(store, cache, false, None)
+}
+
+/// [`executor`] whose logs fetcher also carries a read cache, so its scans
+/// stripe over the default 8 partitions. With more partitions than this
+/// fixture's 2 segments, a `LIKE`-only scan is not taken by the whole-segment
+/// fast path and plans both segments, so its plan pass makes the
+/// serve-if-fits verdict (ADR-3326). Rows do not depend on the read cache.
+fn striped(
+    store: &Arc<dyn ObjectStoreBackend>,
+    cache: Option<Arc<DecodedColumnCache>>,
+) -> SqlExecutor {
+    executor_with(store, cache, true, None)
+}
+
+fn executor_with(
+    store: &Arc<dyn ObjectStoreBackend>,
+    cache: Option<Arc<DecodedColumnCache>>,
+    read_cache: bool,
+    suffix_len: Option<u64>,
+) -> SqlExecutor {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(store), CatalogConfig::default()).expect("catalog"));
     let logs = LogSegmentFetcher::new(Arc::clone(store));
+    let logs = match suffix_len {
+        Some(n) => logs.with_suffix_len(n),
+        None => logs,
+    };
+    let logs = if read_cache {
+        let bytes = 64 << 20;
+        logs.with_cache(Arc::new(Cache::<CacheFetchError>::new(CacheLimits::new(
+            bytes, 16_384, bytes,
+        ))))
+    } else {
+        logs
+    };
     let logs = match cache {
         Some(cache) => logs.with_decoded_cache(cache),
         None => logs,
@@ -213,14 +249,17 @@ fn column_id(objects: &[Vec<u8>], name: &str, ty: FieldType) -> u32 {
 
 struct Statement {
     sql: &'static str,
-    /// Columns the scan decodes whole for this statement, so a hot run must
-    /// serve each of them from the cache.
+    /// Columns a hot run must serve from the cache: every projected column,
+    /// the Contains-deferred one included, since each statement's decoded set
+    /// fits the 1 GiB cache.
     served: &'static [&'static str],
     rows: usize,
     /// The intent the executor classifies it under: a statement with no
     /// filter reads as a bulk scan (ADR-3072's predicate-free rule).
     intent: AccessIntent,
 }
+
+const CONTAINS_SQL: &str = "SELECT ts, d, c FROM logs WHERE c LIKE '%x%' ORDER BY ts";
 
 const STATEMENTS: [Statement; 4] = [
     Statement {
@@ -242,18 +281,21 @@ const STATEMENTS: [Statement; 4] = [
         intent: AccessIntent::BulkScan,
     },
     Statement {
-        sql: "SELECT ts, d, c FROM logs WHERE c LIKE '%x%' ORDER BY ts",
-        served: &["ts", "d"],
+        sql: CONTAINS_SQL,
+        served: &["ts", "d", "c"],
         rows: (ROWS_PER_OBJECT / 3) * OBJECTS as usize,
         intent: AccessIntent::Interactive,
     },
 ];
 
 /// Every statement's rows, cold and on each of three hot runs, equal its rows
-/// with no decoded cache; hot runs hit for every whole-decoded projected
-/// column and never for the `Contains`-tested `c`.
+/// with no decoded cache; hot runs hit for every projected column, the
+/// `Contains`-tested `c` included, since the fixture's decoded set is far
+/// under the 1 GiB cap (ADR-3326, serve-if-fits amendment).
+/// `decoded_cache_never_serves_the_contains_column_when_the_scan_does_not_fit`
+/// is the other half.
 #[tokio::test]
-async fn decoded_cache_serves_identical_rows_and_never_caches_contains_column() {
+async fn decoded_cache_serves_identical_rows_and_the_contains_column_when_the_scan_fits() {
     let t = tenant();
     let mem = Arc::new(MemoryStore::new());
     let store: Arc<dyn ObjectStoreBackend> = mem;
@@ -273,7 +315,7 @@ async fn decoded_cache_serves_identical_rows_and_never_caches_contains_column() 
         1 << 30,
         Some(Arc::new(MemoryBudget::unlimited())),
     ));
-    let cached = executor(&store, Some(Arc::clone(&cache)));
+    let cached = striped(&store, Some(Arc::clone(&cache)));
 
     for st in &STATEMENTS {
         let base = uncached
@@ -322,6 +364,15 @@ async fn decoded_cache_serves_identical_rows_and_never_caches_contains_column() 
                 .decoded_cache
                 .expect("decodedCache stats with a cache")
                 .counters;
+            let contains = st.sql == CONTAINS_SQL;
+            assert_eq!(stats.deferred_served, contains, "{}", st.sql);
+            assert_eq!(
+                stats.deferred_set_estimate_bytes.is_some(),
+                contains,
+                "{}",
+                st.sql
+            );
+            assert_eq!(stats.unvalidated_refusals, 0, "{}", st.sql);
             if run == 0 {
                 cold_misses = stats.misses;
                 if st.intent == AccessIntent::Interactive {
@@ -357,12 +408,153 @@ async fn decoded_cache_serves_identical_rows_and_never_caches_contains_column() 
             );
         }
     }
-    assert_eq!(
-        cache.column_hits(c_id),
-        0,
-        "the Contains-tested column is never served from the cache"
+    assert!(
+        cache.column_hits(c_id) > 0,
+        "the Contains-tested column is served from the cache"
     );
     assert!(cache.resident_bytes() > 0);
+}
+
+/// Blocks the fixture holds: every one survives [`CONTAINS_SQL`]'s plan.
+const BLOCKS: u64 = OBJECTS * BLOCKS_PER_OBJECT as u64;
+
+/// What [`CONTAINS_SQL`]'s plan pass estimates the scan's decoded set at.
+async fn contains_estimate(store: &Arc<dyn ObjectStoreBackend>, t: &TenantId) -> u64 {
+    let probe = Arc::new(DecodedColumnCache::new(
+        1 << 30,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    striped(store, Some(probe))
+        .execute(t.hash(), &request(CONTAINS_SQL))
+        .await
+        .expect("statement executes")
+        .stats
+        .decoded_cache
+        .expect("decodedCache stats with a cache")
+        .counters
+        .deferred_set_estimate_bytes
+        .expect("a Contains scan reports its estimate")
+}
+
+/// ADR-3326, serve-if-fits amendment, decision 2: a scan whose decoded set is
+/// over 0.95 of the cap looks up and offers no deferred column. The cap is
+/// the scan's own estimate, so the set sits between 0.95 of the cap and the
+/// cap. Each block's `ts`, `stream_ref` and `d` are looked up: 24 misses and
+/// 24 admissions cold, 24 hits and no miss hot, and the cache ends holding
+/// those 24 entries and no `c`. The rows equal the uncached scan's.
+///
+/// Seen failing against serving every deferred column (the counts assertion:
+/// cold `(0, 32, 32)` where `(0, 24, 24)` is expected) and against comparing
+/// the estimate with the cap instead of 0.95 of it (the `deferred_served`
+/// assertion on run 0, since the estimate equals the cap).
+#[tokio::test]
+async fn decoded_cache_never_serves_the_contains_column_when_the_scan_does_not_fit() {
+    let t = tenant();
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    let mut objects = Vec::new();
+    for seq in 1..=OBJECTS {
+        objects.push(publish_object(store.as_ref(), &t, seq).await);
+    }
+    let c_id = column_id(&objects, "c", FieldType::Str);
+    let estimate = contains_estimate(&store, &t).await;
+    let expected = executor(&store, None)
+        .execute(t.hash(), &request(CONTAINS_SQL))
+        .await
+        .expect("uncached statement executes");
+    let expected = pretty_format_batches(expected.output.batches())
+        .expect("format")
+        .to_string();
+
+    let cache = Arc::new(DecodedColumnCache::new(
+        estimate,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    let cached = striped(&store, Some(Arc::clone(&cache)));
+    for run in 0..2 {
+        let outcome = cached
+            .execute(t.hash(), &request(CONTAINS_SQL))
+            .await
+            .expect("cached statement executes");
+        let got = pretty_format_batches(outcome.output.batches())
+            .expect("format")
+            .to_string();
+        assert_eq!(got, expected, "run {run}");
+        assert_eq!(outcome.stats.blocks_scanned, BLOCKS);
+        let s = outcome
+            .stats
+            .decoded_cache
+            .expect("decodedCache stats with a cache")
+            .counters;
+        assert_eq!(s.deferred_set_estimate_bytes, Some(estimate), "run {run}");
+        assert!(!s.deferred_served, "run {run}");
+        let (hits, misses, admissions) = if run == 0 { (0, 24, 24) } else { (24, 0, 0) };
+        assert_eq!(
+            (s.hits, s.misses, s.admissions),
+            (hits, misses, admissions),
+            "run {run}"
+        );
+        assert_eq!((s.evictions, s.unvalidated_refusals), (0, 0), "run {run}");
+    }
+    assert_eq!(cache.column_hits(c_id), 0, "c is never served");
+    assert_eq!(cache.len(), 24, "ts, stream_ref and d of 8 blocks; no c");
+}
+
+/// ADR-3326, serve-if-fits amendment: a scan that fits serves its deferred
+/// column with identical rows. Cold, every projected column of the 8 blocks
+/// (`ts`, `stream_ref`, `d` and the deferred `c`) misses and is admitted, 32
+/// of each, `c` decoded validated so nothing is refused; hot, all 32 hit, `c`
+/// once per block.
+#[tokio::test]
+async fn a_fitting_contains_scan_serves_its_deferred_column_with_identical_rows() {
+    let t = tenant();
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    let mut objects = Vec::new();
+    for seq in 1..=OBJECTS {
+        objects.push(publish_object(store.as_ref(), &t, seq).await);
+    }
+    let c_id = column_id(&objects, "c", FieldType::Str);
+    let expected = executor(&store, None)
+        .execute(t.hash(), &request(CONTAINS_SQL))
+        .await
+        .expect("uncached statement executes");
+    let expected = pretty_format_batches(expected.output.batches())
+        .expect("format")
+        .to_string();
+    let cache = Arc::new(DecodedColumnCache::new(
+        1 << 30,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    let cached = striped(&store, Some(Arc::clone(&cache)));
+    for run in 0..2 {
+        let outcome = cached
+            .execute(t.hash(), &request(CONTAINS_SQL))
+            .await
+            .expect("cached statement executes");
+        let got = pretty_format_batches(outcome.output.batches())
+            .expect("format")
+            .to_string();
+        assert_eq!(got, expected, "run {run}");
+        let s = outcome
+            .stats
+            .decoded_cache
+            .expect("decodedCache stats with a cache")
+            .counters;
+        assert!(s.deferred_served, "run {run}");
+        let (hits, misses, admissions) = if run == 0 { (0, 32, 32) } else { (32, 0, 0) };
+        assert_eq!(
+            (s.hits, s.misses, s.admissions),
+            (hits, misses, admissions),
+            "run {run}"
+        );
+        assert_eq!(s.unvalidated_refusals, 0, "run {run}");
+    }
+    assert_eq!(
+        cache.column_hits(c_id),
+        BLOCKS,
+        "c hit once per block on run 1"
+    );
 }
 
 /// A statement that fails while its scan is served from the cache fails with
@@ -544,5 +736,374 @@ async fn an_uncached_selective_scan_validates_only_surviving_cells() {
     assert_eq!(
         outcome.stats.str_cells_validated, 6,
         "the surviving p cells only"
+    );
+}
+
+/// ADR-3326, LIKE-deferred amendment, decision 4, on a fixture that fits: a
+/// `LIKE` scan defers the dictionary column `d`, decodes it validated on its
+/// miss and admits it whole (24 misses and 24 admissions: `ts`, `stream_ref`
+/// and `d` of 8 blocks, no refusal). A later scan of `d` without the arm is
+/// served `d` from that entry, 8 hits on `d`, and reads exactly the rows of a
+/// cold scan with no cache.
+///
+/// Seen failing against leaving the deferred columns out of the validate set
+/// (`d` is offered raw: `unvalidated_refusals` is 8 on the first scan where 0
+/// is expected), and against that plus removing `offer`'s refusal (the raw
+/// dictionary is admitted and the later scan reads every `d` as NULL, so its
+/// rows differ).
+#[tokio::test]
+async fn a_column_cached_by_a_contains_scan_serves_a_later_scan_exactly() {
+    let t = tenant();
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    let mut objects = Vec::new();
+    for seq in 1..=OBJECTS {
+        objects.push(publish_object(store.as_ref(), &t, seq).await);
+    }
+    let d_id = column_id(&objects, "d", FieldType::Str);
+    let like = "SELECT ts, d FROM logs WHERE d LIKE '%u%' ORDER BY ts";
+    let later = "SELECT ts, d FROM logs WHERE n > 0 ORDER BY ts";
+    let cold = |sql: &'static str| {
+        let store = Arc::clone(&store);
+        let t = t.clone();
+        async move {
+            let out = executor(&store, None)
+                .execute(t.hash(), &request(sql))
+                .await
+                .expect("uncached statement executes");
+            pretty_format_batches(out.output.batches())
+                .expect("format")
+                .to_string()
+        }
+    };
+    let (like_rows, later_rows) = (cold(like).await, cold(later).await);
+
+    let cache = Arc::new(DecodedColumnCache::new(
+        1 << 30,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    let cached = striped(&store, Some(Arc::clone(&cache)));
+    let first = cached
+        .execute(t.hash(), &request(like))
+        .await
+        .expect("LIKE statement executes");
+    let got = pretty_format_batches(first.output.batches())
+        .expect("format")
+        .to_string();
+    assert_eq!(got, like_rows);
+    let s = first
+        .stats
+        .decoded_cache
+        .expect("decodedCache stats with a cache")
+        .counters;
+    assert!(s.deferred_served);
+    assert_eq!(s.unvalidated_refusals, 0, "d was decoded validated");
+    assert_eq!((s.hits, s.misses, s.admissions), (0, 24, 24));
+
+    let second = cached
+        .execute(t.hash(), &request(later))
+        .await
+        .expect("later statement executes");
+    let got = pretty_format_batches(second.output.batches())
+        .expect("format")
+        .to_string();
+    assert_eq!(got, later_rows, "served d reads exactly as a cold scan");
+    let s = second
+        .stats
+        .decoded_cache
+        .expect("decodedCache stats with a cache")
+        .counters;
+    assert_eq!((s.hits, s.misses, s.unvalidated_refusals), (24, 8, 0));
+    assert_eq!(cache.column_hits(d_id), BLOCKS, "d served once per block");
+}
+
+/// GET requests in one phase of an outcome's accounting.
+fn gets(phase: &ravel_types::accounting::QueryAccountingSnapshot) -> u64 {
+    phase.s3_requests[ravel_types::accounting::AccountedOp::Get.index()]
+}
+
+/// Requests of every kind in an outcome's accounting.
+fn requests(phase: &ravel_types::accounting::QueryAccountingSnapshot) -> u64 {
+    phase.s3_requests.iter().sum()
+}
+
+/// One run of [`CONTAINS_SQL`] on the whole-segment fast path: without a read
+/// cache the scan runs as many partitions as segments, so the fast path takes
+/// it. The fast path opens both objects whole in the scan phase (2 scan-phase
+/// GETs, where the planned route reuses its plan read and issues none).
+/// Returns the decoded-cache counters and the plan phase's GETs, which on the
+/// fast path are the verdict's directory reads.
+async fn fast_path_run(
+    cached: &SqlExecutor,
+    t: &TenantId,
+    expected: &str,
+    run: usize,
+) -> (ravel_logseg::decoded_cache::DecodedCacheSnapshot, u64) {
+    let outcome = cached
+        .execute(t.hash(), &request(CONTAINS_SQL))
+        .await
+        .expect("cached statement executes");
+    let got = pretty_format_batches(outcome.output.batches())
+        .expect("format")
+        .to_string();
+    assert_eq!(got, expected, "run {run}");
+    assert_eq!(outcome.stats.blocks_scanned, BLOCKS, "run {run}");
+    assert_eq!(
+        gets(&outcome.phase_accounting.scan),
+        OBJECTS,
+        "run {run}: the fast path opens each object whole"
+    );
+    let counters = outcome
+        .stats
+        .decoded_cache
+        .expect("decodedCache stats with a cache")
+        .counters;
+    (counters, gets(&outcome.phase_accounting.plan))
+}
+
+/// ADR-3326, serve-if-fits amendment, implementation note: a fitting
+/// `Contains` scan on the whole-segment fast path is served as the planned
+/// route is. Its estimate equals the plan pass's ([`contains_estimate`]),
+/// since both cover every block. Cold, every projected column of the 8 blocks
+/// (`ts`, `stream_ref`, `d` and the deferred `c`) misses and is admitted, 32
+/// of each; hot, all 32 hit, `c` once per block. Rows equal the uncached
+/// scan's on both runs.
+///
+/// Seen failing against the previous round's fast path, which made no
+/// verdict: the counts assertion reads `(0, 24, 24)` on run 0 where
+/// `(0, 32, 32)` is expected, since `c` is never looked up.
+#[tokio::test]
+async fn a_fitting_contains_scan_on_the_whole_segment_fast_path_is_served() {
+    let t = tenant();
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    let mut objects = Vec::new();
+    for seq in 1..=OBJECTS {
+        objects.push(publish_object(store.as_ref(), &t, seq).await);
+    }
+    let c_id = column_id(&objects, "c", FieldType::Str);
+    let estimate = contains_estimate(&store, &t).await;
+    let expected = executor(&store, None)
+        .execute(t.hash(), &request(CONTAINS_SQL))
+        .await
+        .expect("uncached statement executes");
+    let expected = pretty_format_batches(expected.output.batches())
+        .expect("format")
+        .to_string();
+    let cache = Arc::new(DecodedColumnCache::new(
+        1 << 30,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    let cached = executor(&store, Some(Arc::clone(&cache)));
+    for run in 0..2 {
+        let (s, plan_gets) = fast_path_run(&cached, &t, &expected, run).await;
+        let (hits, misses, admissions) = if run == 0 { (0, 32, 32) } else { (32, 0, 0) };
+        assert_eq!(
+            (s.hits, s.misses, s.admissions),
+            (hits, misses, admissions),
+            "run {run}"
+        );
+        assert_eq!(s.deferred_set_estimate_bytes, Some(estimate), "run {run}");
+        assert!(s.deferred_served, "run {run}");
+        assert_eq!(s.unvalidated_refusals, 0, "run {run}");
+        assert_eq!(
+            plan_gets, OBJECTS,
+            "run {run}: one directory read per object"
+        );
+    }
+    assert_eq!(
+        cache.column_hits(c_id),
+        BLOCKS,
+        "c hit once per block on run 1"
+    );
+}
+
+/// The over-cap half on the fast path: with the cap at the scan's own
+/// estimate the set is over 0.95 of it, so `c` is neither looked up nor
+/// offered. Each run looks up 24 columns (`ts`, `stream_ref` and `d` of 8
+/// blocks), the count the fast path looked up before it made a verdict:
+/// `(0, 24, 24)` cold and `(24, 0, 0)` hot, the cache ending with 24 entries
+/// and no `c`. Against a fast path with no verdict the counts are the same
+/// and the estimate assertion fails (`None` where the estimate is expected).
+#[tokio::test]
+async fn an_over_cap_contains_scan_on_the_whole_segment_fast_path_is_not_served() {
+    let t = tenant();
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    let mut objects = Vec::new();
+    for seq in 1..=OBJECTS {
+        objects.push(publish_object(store.as_ref(), &t, seq).await);
+    }
+    let c_id = column_id(&objects, "c", FieldType::Str);
+    let estimate = contains_estimate(&store, &t).await;
+    let expected = executor(&store, None)
+        .execute(t.hash(), &request(CONTAINS_SQL))
+        .await
+        .expect("uncached statement executes");
+    let expected = pretty_format_batches(expected.output.batches())
+        .expect("format")
+        .to_string();
+    let cache = Arc::new(DecodedColumnCache::new(
+        estimate,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    let cached = executor(&store, Some(Arc::clone(&cache)));
+    for run in 0..2 {
+        let (s, plan_gets) = fast_path_run(&cached, &t, &expected, run).await;
+        let (hits, misses, admissions) = if run == 0 { (0, 24, 24) } else { (24, 0, 0) };
+        assert_eq!(
+            (s.hits, s.misses, s.admissions),
+            (hits, misses, admissions),
+            "run {run}"
+        );
+        assert_eq!(s.deferred_set_estimate_bytes, Some(estimate), "run {run}");
+        assert!(!s.deferred_served, "run {run}");
+        assert_eq!((s.evictions, s.unvalidated_refusals), (0, 0), "run {run}");
+        assert_eq!(
+            plan_gets, OBJECTS,
+            "run {run}: one directory read per object"
+        );
+    }
+    assert_eq!(cache.column_hits(c_id), 0, "c is never served");
+    assert_eq!(cache.len(), 24, "ts, stream_ref and d of 8 blocks; no c");
+}
+
+/// Objects in the request-count fixture: as many as the read-cache executor's
+/// 8 partitions, so its scans take the whole-segment fast path.
+const FAST_OBJECTS: u64 = 8;
+
+/// A suffix-probe length shorter than every object in the fixture.
+const SHORT_PROBE: u64 = 1024;
+
+/// What the fast-path verdict cost on one run, against the same run with no
+/// decoded cache.
+#[derive(Debug, PartialEq, Eq)]
+struct VerdictCost {
+    /// Plan-phase requests: the verdict's directory reads, since the fast
+    /// path runs no plan pass.
+    plan_requests: u64,
+    /// Plan-phase read-cache hits.
+    plan_cache_hits: u64,
+    /// The run's requests over the baseline run's.
+    extra_requests: u64,
+}
+
+/// A cold and a hot run of [`CONTAINS_SQL`] over [`FAST_OBJECTS`] objects
+/// through a read cache, so on the whole-segment fast path, each beside the
+/// same run through an executor with no decoded cache, which makes no
+/// verdict. `suffix_len` pins the fetcher's suffix probe. Asserts both runs
+/// return the same rows, the verdict serves, and the baseline issues no
+/// plan-phase request (it is on the fast path).
+async fn fast_path_verdict_cost(suffix_len: Option<u64>) -> Vec<VerdictCost> {
+    let t = tenant();
+    let mem = Arc::new(MemoryStore::new());
+    let store: Arc<dyn ObjectStoreBackend> = mem;
+    for seq in 1..=FAST_OBJECTS {
+        let bytes = publish_object(store.as_ref(), &t, seq).await;
+        assert!(
+            bytes.len() > SHORT_PROBE as usize,
+            "the short probe misses the front"
+        );
+    }
+    let baseline = executor_with(&store, None, true, suffix_len);
+    let cache = Arc::new(DecodedColumnCache::new(
+        1 << 30,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    let cached = executor_with(&store, Some(cache), true, suffix_len);
+    let mut costs = Vec::new();
+    for run in 0..2 {
+        let base = baseline
+            .execute(t.hash(), &request(CONTAINS_SQL))
+            .await
+            .expect("baseline statement executes");
+        let got = cached
+            .execute(t.hash(), &request(CONTAINS_SQL))
+            .await
+            .expect("cached statement executes");
+        assert_eq!(
+            pretty_format_batches(got.output.batches())
+                .expect("format")
+                .to_string(),
+            pretty_format_batches(base.output.batches())
+                .expect("format")
+                .to_string(),
+            "run {run}"
+        );
+        let s = got
+            .stats
+            .decoded_cache
+            .expect("decodedCache stats with a cache")
+            .counters;
+        assert!(s.deferred_served, "run {run}: the verdict ran and fits");
+        assert_eq!(
+            requests(&base.phase_accounting.plan),
+            0,
+            "run {run}: the baseline is on the fast path"
+        );
+        let plan = &got.phase_accounting.plan;
+        assert_eq!(gets(plan), requests(plan), "run {run}: only GETs");
+        costs.push(VerdictCost {
+            plan_requests: requests(plan),
+            plan_cache_hits: plan.cache_hits,
+            extra_requests: requests(&got.accounting)
+                .checked_sub(requests(&base.accounting))
+                .expect("the verdict never saves a request"),
+        });
+    }
+    costs
+}
+
+/// The fast-path verdict's request cost, under the plan phase's accounting,
+/// cold and hot. With the default probe, which covers the whole of an object
+/// this small, the verdict issues one plan-phase GET per object cold, and the
+/// whole-object opens after it are served that extent by the read cache, so
+/// the run issues no more requests than the baseline. With a
+/// [`SHORT_PROBE`]-byte probe, shorter than every object, the verdict still
+/// reads each object's directories in one GET, but that extent is not the
+/// whole object, the opens cannot share it, and the run issues 8 more
+/// requests than the baseline: one directory read per object. Hot, in both
+/// shapes, the verdict's directory reads are all read-cache hits and the run
+/// issues no request the baseline does not.
+///
+/// Seen failing against reading the directories past the read cache (a
+/// `BlockRangeFetcher` with no cache for the verdict's reads): on the
+/// covering probe the hot run reads `plan_requests: 8, plan_cache_hits: 0,
+/// extra_requests: 8` where `0, 8, 0` is expected, and the cold run's
+/// `extra_requests` is 8 where 0 is expected.
+#[tokio::test]
+async fn the_fast_path_verdict_costs_one_directory_read_per_segment_cold_and_none_hot() {
+    let n = FAST_OBJECTS;
+    let covering = fast_path_verdict_cost(None).await;
+    let short = fast_path_verdict_cost(Some(SHORT_PROBE)).await;
+    assert_eq!(
+        covering,
+        vec![
+            VerdictCost {
+                plan_requests: n,
+                plan_cache_hits: 0,
+                extra_requests: 0,
+            },
+            VerdictCost {
+                plan_requests: 0,
+                plan_cache_hits: n,
+                extra_requests: 0,
+            },
+        ]
+    );
+    assert_eq!(
+        short,
+        vec![
+            VerdictCost {
+                plan_requests: n,
+                plan_cache_hits: 0,
+                extra_requests: n,
+            },
+            VerdictCost {
+                plan_requests: 0,
+                plan_cache_hits: n,
+                extra_requests: 0,
+            },
+        ]
     );
 }

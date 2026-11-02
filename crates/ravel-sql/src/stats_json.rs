@@ -183,9 +183,11 @@ pub fn cache_json(cache: &StatementCacheStats) -> Json {
 /// `stats.decodedCache` (ADR-3326). The counters are the statement's
 /// own; `residentBytes` is the process-wide cache size when it finished, and
 /// the two pressure figures are the budget evictor's work over the statement's
-/// lifetime (see [`DecodedCacheStats`]).
+/// lifetime (see [`DecodedCacheStats`]). `deferredServed` is always present;
+/// `deferredSetEstimateBytes` only when a scan with a `Contains` arm ran its
+/// plan pass (ADR-3326, serve-if-fits amendment).
 pub fn decoded_cache_json(stats: &DecodedCacheStats) -> Json {
-    json!({
+    let mut out = json!({
         "hits": stats.counters.hits,
         "misses": stats.counters.misses,
         "admissions": stats.counters.admissions,
@@ -195,7 +197,15 @@ pub fn decoded_cache_json(stats: &DecodedCacheStats) -> Json {
         "residentBytes": stats.resident_bytes,
         "pressureEvictions": stats.pressure.evictions,
         "pressureFreedBytes": stats.pressure.freed_bytes,
-    })
+        "deferredServed": stats.counters.deferred_served,
+    });
+    if let (Some(estimate), Some(map)) = (
+        stats.counters.deferred_set_estimate_bytes,
+        out.as_object_mut(),
+    ) {
+        map.insert("deferredSetEstimateBytes".into(), json!(estimate));
+    }
+    out
 }
 
 /// An [`AccessIntent`]'s name in `stats.cache`, the same spelling as its
@@ -269,11 +279,13 @@ mod tests {
         assert_eq!(total_requests, snapshot.pooled().total_s3_requests());
     }
 
-    /// `decoded_cache_json` renders exactly the nine ADR-3326 keys, each
-    /// carrying its own distinct source figure.
+    /// `decoded_cache_json` renders exactly the eleven ADR-3326 keys for a
+    /// statement whose scan has a `Contains` arm, each carrying its own
+    /// distinct source figure, and the ten without
+    /// `deferredSetEstimateBytes` for one with no estimate.
     #[test]
     fn decoded_cache_json_names_every_field_exactly_once() {
-        let stats = DecodedCacheStats {
+        let mut stats = DecodedCacheStats {
             counters: ravel_logseg::decoded_cache::DecodedCacheSnapshot {
                 hits: 1,
                 misses: 2,
@@ -281,6 +293,9 @@ mod tests {
                 evictions: 4,
                 ghost_hits: 5,
                 margin_skips: 9,
+                unvalidated_refusals: 11,
+                deferred_set_estimate_bytes: Some(10),
+                deferred_served: true,
             },
             resident_bytes: 6,
             pressure: ravel_logseg::decoded_cache::PressureSnapshot {
@@ -288,9 +303,8 @@ mod tests {
                 freed_bytes: 8,
             },
         };
-        let rendered = decoded_cache_json(&stats);
         assert_eq!(
-            rendered,
+            decoded_cache_json(&stats),
             json!({
                 "hits": 1,
                 "misses": 2,
@@ -301,6 +315,25 @@ mod tests {
                 "residentBytes": 6,
                 "pressureEvictions": 7,
                 "pressureFreedBytes": 8,
+                "deferredServed": true,
+                "deferredSetEstimateBytes": 10,
+            })
+        );
+        stats.counters.deferred_set_estimate_bytes = None;
+        stats.counters.deferred_served = false;
+        assert_eq!(
+            decoded_cache_json(&stats),
+            json!({
+                "hits": 1,
+                "misses": 2,
+                "admissions": 3,
+                "evictions": 4,
+                "ghostHits": 5,
+                "marginSkips": 9,
+                "residentBytes": 6,
+                "pressureEvictions": 7,
+                "pressureFreedBytes": 8,
+                "deferredServed": false,
             })
         );
     }
