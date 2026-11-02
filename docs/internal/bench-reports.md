@@ -81,3 +81,24 @@ The intended corpora are the LogHub datasets from
 [logpai/loghub](https://github.com/logpai/loghub): HDFS, BGL, and Apache.
 They are not checked in. Results are posted on issue #2977, each with its
 report's `stamp`.
+
+## Selective investigations (benchmarks/investigations)
+
+Issue #3699 (ADR-3692 decision 8, T1). Not a `ravel-bench` report: a box
+flow that generates a seeded spans and logs corpus, loads it with `ravel-cli
+load`, folds it through the key-index state matrix (unfolded, folded
+without leaves, folded with leaves, mixed, compaction in flight, erasure in
+flight, and many parts over N ingest hours), and runs the statements of
+`statements.toml` cold, each cold call after a `ravel-server` restart and
+a page-cache drop (required on the S3 lane). Of the 46 statements, 43 are
+`cold_only`; the other three (`spans_lookup_norange`, `spans_lookup_1h`,
+`logs_trace_1h`) also run warm, repeated against the running server with no
+restart.
+`evaluate.py` judges every answer against the generator's oracle and every
+figure against `benchmarks/investigations/bands.toml` (ADR-3692 Acceptance
+rows 1 to 17), and prints pass, fail or incomplete; timing is judged on the
+real-S3 lane only. `benchmarks/investigations/README.md`
+covers both lanes, and `benchmarks/investigations/investigations.test.sh`,
+run by CI's `doc-scripts` job, holds the harness's cases, including a
+committed local-lane run under `fixtures/local-smoke/` that it re-evaluates
+byte for byte.
