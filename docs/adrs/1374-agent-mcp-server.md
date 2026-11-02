@@ -531,7 +531,8 @@ that carries only that module and no `arrow-flight` dependency. Both
 `ravel-server` with `sql,mcp` and without `flight-sql`, so an `mcp` build
 never depends on Flight. The published image builds
 `sql,flight-sql,otap,agents,mcp`; `agents` arrived with ADR-3331. The operator
-needs no new Service port, and no `RavelCluster` field sets `--mcp` yet. The flag
+needs no new Service port, and no `RavelCluster` field sets `--mcp` yet
+(`spec.query.mcp` now sets it; see the RavelCluster MCP amendment). The flag
 `--mcp` is off by default. `--mcp-allowed-origins` is required when `--mcp`
 is set on a non-loopback listener, or startup fails. The server serves
 protocol revisions `2026-07-28` and `2025-11-25`. The new external
@@ -1031,3 +1032,26 @@ Shipping the explain changed its catalog description to name SQL only, and
 all fifteen, against the 24,576-byte budget; both figures are pinned in
 `crates/ravel-mcp/src/catalog.rs` and
 `services/ravel-server/tests/mcp_agents_e2e.rs`.
+
+## Amendment (2026-11-02, #3648): the RavelCluster MCP amendment, `spec.query.mcp` sets `--mcp` on query pods
+
+<!-- amendment-applies: sections="D9. Packaging and rollout" pointer="RavelCluster MCP amendment" -->
+<!-- amendment-supersedes: phrase="no `RavelCluster` field sets `--mcp` yet" pointer="RavelCluster MCP amendment" -->
+
+D9 says no `RavelCluster` field sets `--mcp`. `spec.query.mcp` now does, on
+the query Deployment only, and the default stays off.
+
+1. The block carries `enabled` (default `false`), `allowedOrigins` (default
+   empty) and an optional `maxBodyBytes` (minimum 1). With `enabled: true`
+   the operator renders `--mcp`, then `--mcp-allowed-origins` with the
+   entries comma-joined, then `--mcp-max-body-bytes` when `maxBodyBytes` is
+   set. An absent block, or `enabled: false`, renders no MCP flag
+   (`desired_query_deployment` in `services/ravel-operator/src/reconcile.rs`).
+2. Two CEL rules on the `mcp` property enforce D7 at admission. The query
+   pods listen on `0.0.0.0`, where the server refuses `--mcp` with an empty
+   allowlist, so `enabled: true` needs at least one origin. An entry may not
+   be empty or contain a comma, because the server splits the flag value on
+   commas (`QUERY_MCP_NEEDS_ORIGINS_RULE` and `QUERY_MCP_ORIGIN_SHAPE_RULE`
+   in `services/ravel-operator/src/crd.rs`).
+3. A request with no `Origin` header is still accepted, as D7 ships, so the
+   allowlist governs browser clients only.

@@ -346,6 +346,10 @@ A minimal example is in
 | `spec.query.distributedQuery.sqlTicketKeySecretRef.name` | string | none | Secret with key `keys`: the SQL ticket key file. Required when `enabled`. |
 | `spec.query.memoryBudgetBytes` | integer | none | Pins the memory budget of the query pods: renders `--memory-budget-bytes` with this value on the query pods only. Needs `spec.query.resources.limits.memory` of at least the budget plus 256 MiB; otherwise the operator leaves the query Deployment unchanged and reports `Degraded`. Unset, the budget derives from the memory limit. Minimum `1`. See "Pinning the query memory budget" below. |
 | `spec.query.memoryHeadroomBytes` | integer | provisional default from the budget | Memory to leave in the limit above the budget plus 256 MiB. A smaller gap reports `Degraded` with reason `QueryMemoryHeadroomLow` and still rolls the query pods. Setting it without `memoryBudgetBytes` is refused. See "Pinning the query memory budget" below. |
+| `spec.query.mcp` | object | none | Serves the MCP server at `POST /mcp` on the query pods. Omit and nothing is rendered. See "Serving MCP from the query pods" below. |
+| `spec.query.mcp.enabled` | boolean | `false` | `true` renders `--mcp` and `--mcp-allowed-origins` on the query pods only. `false` renders no MCP flag, whatever the other fields hold. |
+| `spec.query.mcp.allowedOrigins` | list of strings | `[]` | `Origin` header values `POST /mcp` accepts, each compared whole and ignoring ASCII case, rendered comma-joined into `--mcp-allowed-origins`. At least one entry is required when `enabled` is `true`. An empty entry or one containing a comma is refused. At most 64 entries of at most 1024 characters. |
+| `spec.query.mcp.maxBodyBytes` | integer | none | Renders `--mcp-max-body-bytes` when `enabled`. Unset, the server default of 1 MiB applies. Minimum `1`. |
 | `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. `true` renders it only with `keySecretRef` set. |
 | `spec.maintain.keySecretRef.name` | string | none | Secret with key `keys`: the maintain key file, mounted and passed as `--maintain-key-file`. Required when `enabled`. See "Maintain key file" below. |
 | `spec.maintain.replicas` | integer | `1` | |
@@ -1041,6 +1045,40 @@ An edit to `memoryBudgetBytes` changes the query Deployment's arguments and
 rolls the query pods. An edit to `memoryHeadroomBytes` changes only the
 condition.
 
+### Serving MCP from the query pods
+
+`spec.query.mcp` mounts the [MCP server](mcp-server.md) at `POST /mcp` on the
+query pods' HTTP port, behind the existing query Service. No new Service port
+is needed.
+
+```yaml
+spec:
+  query:
+    mcp:
+      enabled: true
+      allowedOrigins:
+        - https://agents.example.com
+      maxBodyBytes: 2097152
+```
+
+With that block the query container runs
+`--mcp --mcp-allowed-origins https://agents.example.com --mcp-max-body-bytes 2097152`.
+The gateway, maintain, ingest-router and qualify pods get none of these flags.
+
+- The query pods listen on `0.0.0.0`, and `ravel-server` refuses to start
+  `--mcp` on a non-loopback listener with an empty allowlist. The API server
+  therefore refuses `enabled: true` without an `allowedOrigins` entry.
+- A request with no `Origin` header is accepted. Non-browser MCP clients send
+  none, so the allowlist governs browser clients only. Each request is
+  authenticated by the same tenant resolver as the HTTP query routes.
+- The image built from `main` compiles in the `mcp` cargo feature. In an
+  image built without it, such as a custom `spec.image`, `--mcp` does
+  nothing and `POST /mcp` is not mounted. The README's feature matrix says
+  which release images carry it.
+- Turning `spec.query.mcp` on or off, or editing it while it is enabled,
+  changes the query Deployment's arguments and rolls the query pods. With
+  `enabled: false`, editing the other fields changes nothing.
+
 ## Probe semantics
 
 All three modes serve two routes on the HTTP port, and the operator points a
@@ -1190,10 +1228,9 @@ in the observability guide for the full metric and site list.
 The kind environment is a development tool. A real cluster differs in these
 ways:
 
-- The published image compiles in the MCP server, which would answer
-  `POST /mcp` on the query port with no new Service port, but it mounts only
-  with the `--mcp` process flag. No `RavelCluster` field sets that flag, so
-  query pods the operator manages do not serve it. See the
+- Query pods serve `POST /mcp` only when `spec.query.mcp.enabled` is `true`,
+  which needs at least one `allowedOrigins` entry and an image built with the
+  `mcp` feature. See "Serving MCP from the query pods" above and the
   [MCP guide](mcp-server.md).
 - Point `spec.storage.s3.endpoint` at real S3 (or omit it) and supply real
   credentials in the Secret.

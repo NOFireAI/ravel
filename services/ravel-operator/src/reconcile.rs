@@ -1990,7 +1990,8 @@ pub fn query_memory_budget_check(spec: &RavelClusterSpec) -> QueryMemoryBudgetCh
 }
 
 /// The query Deployment: `--mode query`, HTTP listener, tenant tokens,
-/// `--memory-budget-bytes` when `spec.query.memoryBudgetBytes` is set, and,
+/// `--memory-budget-bytes` when `spec.query.memoryBudgetBytes` is set, the
+/// MCP flags when `spec.query.mcp` is enabled, and,
 /// under an enabled and complete `spec.query.distributedQuery`, the
 /// distributed-query flags, the fragment listener port, and the four Secret
 /// mounts. RollingUpdate strategy.
@@ -2020,6 +2021,15 @@ pub fn desired_query_deployment(
     if let Some(budget) = spec.query.memory_budget_bytes {
         args.push("--memory-budget-bytes".to_string());
         args.push(budget.to_string());
+    }
+    if let Some(mcp) = spec.query.mcp.as_ref().filter(|m| m.enabled) {
+        args.push("--mcp".to_string());
+        args.push("--mcp-allowed-origins".to_string());
+        args.push(mcp.allowed_origins.join(","));
+        if let Some(max_body) = mcp.max_body_bytes {
+            args.push("--mcp-max-body-bytes".to_string());
+            args.push(max_body.to_string());
+        }
     }
 
     let tier_override = spec.query.credentials_secret_ref.as_ref();
@@ -4648,6 +4658,7 @@ mod tests {
                 distributed_query: None,
                 memory_budget_bytes: None,
                 memory_headroom_bytes: None,
+                mcp: None,
             },
             maintain: MaintainSpec {
                 enabled: true,
@@ -11663,5 +11674,161 @@ mod tests {
         );
         let objects = desired_objects(&base_spec(), "prod", "ns", &ctx()).expect("spec renders");
         assert_eq!(objects.query_memory_budget, QueryMemoryBudgetCheck::Unset);
+    }
+
+    /// `base_spec` with `spec.query.mcp` set from its camelCase wire form, the
+    /// shape a RavelCluster manifest carries.
+    fn mcp_spec(base: RavelClusterSpec, mcp: serde_json::Value) -> RavelClusterSpec {
+        let mut value = serde_json::to_value(&base).expect("serialize spec");
+        value["query"]["mcp"] = mcp;
+        serde_json::from_value(value).expect("deserialize a spec with a query.mcp block")
+    }
+
+    /// Issue #3648: an enabled `spec.query.mcp` renders `--mcp`, then
+    /// `--mcp-allowed-origins` with the entries comma-joined into one value,
+    /// then `--mcp-max-body-bytes`, once each, at the end of the query
+    /// container's args; removing those five args gives back the render
+    /// without the block.
+    ///
+    /// FLIP: pushing `--mcp-allowed-origins` once per origin, or joining the
+    /// origins with a space, fails the exact-slice assertion.
+    #[test]
+    fn enabled_query_mcp_renders_exact_flags_on_the_query_container() {
+        let spec = mcp_spec(
+            base_spec(),
+            serde_json::json!({
+                "enabled": true,
+                "allowedOrigins": ["https://a.example", "https://b.example:8443"],
+                "maxBodyBytes": 2_097_152,
+            }),
+        );
+        let args = args_of(&desired_query_deployment(&spec, "prod", &ctx()));
+        let at = args.iter().position(|a| a == "--mcp").expect("--mcp");
+        assert_eq!(
+            args[at..],
+            [
+                "--mcp",
+                "--mcp-allowed-origins",
+                "https://a.example,https://b.example:8443",
+                "--mcp-max-body-bytes",
+                "2097152",
+            ]
+        );
+        let mut without = args.clone();
+        without.drain(at..);
+        assert_eq!(
+            without,
+            args_of(&desired_query_deployment(&base_spec(), "prod", &ctx()))
+        );
+    }
+
+    /// Issue #3648: the MCP flags render on the query container only. The
+    /// gateway, maintain, ingest-router and qualify renders of the same
+    /// enabled spec carry none.
+    ///
+    /// FLIP: pushing the MCP flags from `common_store_args` puts `--mcp` on
+    /// the gateway, maintain and qualify renders and fails this test.
+    #[test]
+    fn query_mcp_renders_on_no_other_tier() {
+        let spec = mcp_spec(
+            ravel_native_spec(3, AffinityKeySource::AuthorizationHeader),
+            serde_json::json!({
+                "enabled": true,
+                "allowedOrigins": ["https://a.example"],
+                "maxBodyBytes": 4096,
+            }),
+        );
+        assert!(
+            args_of(&desired_query_deployment(&spec, "prod", &ctx())).contains(&"--mcp".into()),
+            "the query container carries the flag, so its absence below is meaningful"
+        );
+        let rendered_elsewhere = serde_json::to_string(&serde_json::json!({
+            "gateway": desired_gateway_deployment(&spec, "prod", &ctx()),
+            "maintain": desired_maintain_deployment(&spec, "prod", &ctx())
+                .expect("maintain renders")
+                .expect("maintain enabled"),
+            "router": desired_router_deployment(&spec, "prod", "ns", &ctx())
+                .expect("router renders")
+                .expect("ravelNative renders a router Deployment"),
+            "qualify": desired_qualify_job(&spec, "prod", Some("rv-1"), None),
+        }))
+        .expect("serializes");
+        assert!(
+            !rendered_elsewhere.contains("--mcp"),
+            "only the query container carries MCP flags"
+        );
+    }
+
+    /// Issue #3648: with no `mcp` block the query Deployment is identical to
+    /// the render of a spec that never had the field, and a block with
+    /// `enabled: false` renders no MCP flag even with origins and a body cap
+    /// set. Together with the pinned hash in
+    /// `unset_memory_budget_renders_the_query_deployment_byte_identical`, this
+    /// shows existing clusters' query args are unchanged.
+    ///
+    /// FLIP: rendering whenever the block is present (dropping the `enabled`
+    /// filter) puts `--mcp` on the disabled render and fails this test.
+    #[test]
+    fn absent_or_disabled_query_mcp_renders_no_flag() {
+        let mut value = serde_json::to_value(base_spec()).expect("serialize spec");
+        assert!(
+            value["query"].get("mcp").is_none(),
+            "an absent block is not serialized"
+        );
+        value["query"]
+            .as_object_mut()
+            .expect("query object")
+            .remove("mcp");
+        let field_absent: RavelClusterSpec = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(
+            desired_query_deployment(&field_absent, "prod", &ctx()),
+            desired_query_deployment(&base_spec(), "prod", &ctx())
+        );
+
+        let disabled = mcp_spec(
+            base_spec(),
+            serde_json::json!({
+                "enabled": false,
+                "allowedOrigins": ["https://a.example"],
+                "maxBodyBytes": 4096,
+            }),
+        );
+        assert_eq!(
+            desired_query_deployment(&disabled, "prod", &ctx()),
+            desired_query_deployment(&base_spec(), "prod", &ctx())
+        );
+        let omitted_enabled = mcp_spec(
+            base_spec(),
+            serde_json::json!({ "allowedOrigins": ["https://a.example"] }),
+        );
+        assert_eq!(
+            desired_query_deployment(&omitted_enabled, "prod", &ctx()),
+            desired_query_deployment(&base_spec(), "prod", &ctx()),
+            "enabled defaults to false"
+        );
+    }
+
+    /// Issue #3648: an enabled block without `maxBodyBytes` renders no
+    /// `--mcp-max-body-bytes`, so the server keeps its own default.
+    ///
+    /// FLIP: rendering `max_body_bytes.unwrap_or_default()` puts
+    /// `--mcp-max-body-bytes 0`, which the server refuses at startup, on the
+    /// container and fails this test.
+    #[test]
+    fn query_mcp_without_max_body_bytes_renders_no_cap_flag() {
+        let spec = mcp_spec(
+            base_spec(),
+            serde_json::json!({
+                "enabled": true,
+                "allowedOrigins": ["https://a.example"],
+            }),
+        );
+        let args = args_of(&desired_query_deployment(&spec, "prod", &ctx()));
+        let at = args.iter().position(|a| a == "--mcp").expect("--mcp");
+        assert_eq!(
+            args[at..],
+            ["--mcp", "--mcp-allowed-origins", "https://a.example"]
+        );
+        assert!(!args.iter().any(|a| a == "--mcp-max-body-bytes"));
     }
 }
