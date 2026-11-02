@@ -679,6 +679,43 @@ impl QueryService {
         capabilities: ravel_sql::SqlCapabilities,
         request: &ravel_sql::SqlRequest,
     ) -> Result<SqlExecution, ServiceError> {
+        self.sql_execute_resolved_at(tenant_hash, capabilities, request, request.now_ns)
+            .await
+    }
+
+    /// [`Self::sql_execute`] with the catalog resolve at `resolve_at_ns`
+    /// rather than `request.now_ns`, for a later page of a paged SQL result,
+    /// which resolves at page one's instant
+    /// ([`ravel_sql::SqlExecutor::execute_accounted_at`]). `request.now_ns` is
+    /// the call's own clock: the declared-column and key-index lookups, the
+    /// tenant's last-touch and the audit record's timestamp use it.
+    #[cfg(feature = "sql")]
+    pub async fn sql_execute_at(
+        &self,
+        tenant_hash: TenantHash,
+        request: &ravel_sql::SqlRequest,
+        resolve_at_ns: i64,
+    ) -> Result<ravel_sql::SqlOutcome, ServiceError> {
+        self.sql_execute_resolved_at(
+            tenant_hash,
+            ravel_sql::SqlCapabilities::default(),
+            request,
+            resolve_at_ns,
+        )
+        .await
+        .map(|timed| timed.outcome)
+    }
+
+    /// The one body behind [`Self::sql_execute_timed_with`] and
+    /// [`Self::sql_execute_at`].
+    #[cfg(feature = "sql")]
+    async fn sql_execute_resolved_at(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: ravel_sql::SqlCapabilities,
+        request: &ravel_sql::SqlRequest,
+        resolve_at_ns: i64,
+    ) -> Result<SqlExecution, ServiceError> {
         let state = self
             .sql
             .as_ref()
@@ -694,7 +731,7 @@ impl QueryService {
         let span = query_span("sql_query", tenant_hash);
         let result = state
             .executor
-            .execute_accounted_with(tenant_hash, capabilities, request, &live)
+            .execute_accounted_at(tenant_hash, capabilities, request, resolve_at_ns, &live)
             .instrument(span.clone())
             .await
             .map_err(|err| ServiceError::from_sql(err, tenant_hash));
@@ -704,6 +741,8 @@ impl QueryService {
         });
 
         let audit_started = std::time::Instant::now();
+        // Stamped with the call's own clock, not `resolve_at_ns`: a later page
+        // runs now, whatever instant its snapshot was resolved at.
         self.controls
             .audit(
                 tenant_hash,

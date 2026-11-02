@@ -7,9 +7,14 @@
 //!    builds no plan.
 //! 2. Resolve one snapshot per signal table the statement names, each once per
 //!    attempt, through `catalog.resolve_pruned(&tenant_hash, signal, window,
-//!    lane_tokens, now_ns, name_filter)`, every lane at the same `now_ns` and
-//!    window, with `now_ns` threaded in from the caller's injected clock (no
-//!    `SystemTime::now()` in library logic). The signals are read off the
+//!    lane_tokens, now_ns, name_filter)`, every lane at the same resolve
+//!    instant and window, with the instant threaded in from the caller (no
+//!    `SystemTime::now()` in library logic). The resolve instant is the
+//!    request's `now_ns` on every entry point but
+//!    [`SqlExecutor::execute_accounted_at`], which takes it separately so a
+//!    later page resolves at page one's instant while the declared-column and
+//!    key-index lookups and the idle-eviction last-touch read the caller's
+//!    `now_ns`. The signals are read off the
 //!    query's own `FROM` clause ([`SqlExecutor::statement_tables`], ADR-0033,
 //!    extended to `spans` by ADR-0045 decision 5 and to `alerts`/`audit` by
 //!    ADR-1101 decision 1): `Signal::Metrics` for `samples`, `Signal::Logs`
@@ -57,8 +62,8 @@
 //! that means:
 //!
 //! - A store `NotFound` raised **before the first batch has been emitted**
-//!   re-resolves every signal the statement names with the *same* `now_ns`
-//!   and the *same* per-lane tokens, assigned once at admission and not
+//!   re-resolves every signal the statement names at the *same* resolve
+//!   instant and with the *same* per-lane tokens, assigned once at admission and not
 //!   re-derived, rebuilds the whole session (new pool, new
 //!   providers, new context), and
 //!   re-executes the query exactly once. A second `NotFound` fails
@@ -676,8 +681,14 @@ struct PlanExtras {
     /// snapshot with no request window attached.
     column_stats_window: TimeRange,
     /// The injected clock reading paired with `column_stats_window`, same
-    /// provenance rule.
+    /// provenance rule: the resolve instant, so the stats load covers the
+    /// hours the snapshot's listing covered.
     column_stats_now_ns: i64,
+    /// The instant the tenant's KEY_IDX declaration is looked up at: the
+    /// caller's clock, which the declaration's cache judges freshness against.
+    /// The pinned plan entry points have no separate caller clock and pass
+    /// `column_stats_now_ns`.
+    key_index_now_ns: i64,
     /// The Parquet tables the statement reads, when its resolve already
     /// resolved them.
     parquet: ParquetPlan,
@@ -699,8 +710,15 @@ pub struct SqlRequest {
     /// optionally qualified by the table it bounds. Every entry point taking
     /// this request assigns them to lanes with [`admit_http_tokens`].
     pub min_tokens: Vec<MinCommitToken>,
-    /// The injected clock reading that bounds the listing window. The same
-    /// value is reused on the retry so both resolves see the same window.
+    /// The caller's injected clock reading. The declared-column and key-index
+    /// lookups judge their caches' freshness against it, and the tenant's
+    /// idle-eviction last-touch is stamped with it.
+    ///
+    /// It is also the resolve instant, which bounds the listing window, on
+    /// every entry point but [`SqlExecutor::execute_accounted_at`], which
+    /// takes the resolve instant separately so a later page can resolve at
+    /// page one's instant on its own clock. The same resolve instant is
+    /// reused on the retry so both resolves see the same window.
     pub now_ns: i64,
     /// Wall deadline for the whole call, retry included.
     pub deadline: Duration,
@@ -753,6 +771,29 @@ pub(crate) struct StatementRequest {
     pub row_window: bool,
     pub max_rows: Option<usize>,
     pub budgets: Option<RequestBudgets>,
+}
+
+/// The two instants one SQL call reads. Equal on every entry point but
+/// [`SqlExecutor::execute_accounted_at`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Clocks {
+    /// The catalog resolve's instant: the listing window, the column-stats
+    /// window and the fold-lag figure, everything that must describe the
+    /// snapshot the rows come from.
+    resolve_at_ns: i64,
+    /// The caller's clock ([`SqlRequest::now_ns`]): the declared-column and
+    /// key-index lookups and the idle-eviction last-touch.
+    caller_now_ns: i64,
+}
+
+impl Clocks {
+    /// One instant for both: `req.now_ns`.
+    fn of(req: &SqlRequest) -> Clocks {
+        Clocks {
+            resolve_at_ns: req.now_ns,
+            caller_now_ns: req.now_ns,
+        }
+    }
 }
 
 /// One statement's decoded-column cache figures: the counters its scans moved
@@ -2040,8 +2081,10 @@ impl SqlExecutor {
     /// first use (ADR-0069 decision 2). Called from [`Self::resolve`], the one
     /// funnel every query's snapshot resolve passes through (HTTP SQL and
     /// Flight SQL alike), so a tenant running any query is never a candidate
-    /// for the idle sweep. `now_ns` is the request's injected clock reading;
-    /// this reads no clock itself.
+    /// for the idle sweep. [`Self::resolve`] passes the caller's injected
+    /// clock reading ([`SqlRequest::now_ns`]) and not the resolve instant, so
+    /// a later page stamps the time of its own call rather than page one's
+    /// earlier instant; this reads no clock itself.
     fn touch_tenant(&self, tenant: TenantHash, now_ns: i64) {
         let mut tenants = self.lock_tenants();
         let entry = tenants
@@ -2119,6 +2162,34 @@ impl SqlExecutor {
         req: &SqlRequest,
         live: &LiveAccounting,
     ) -> Result<SqlOutcome, SqlError> {
+        self.execute_accounted_at(tenant_hash, capabilities, req, req.now_ns, live)
+            .await
+    }
+
+    /// [`Self::execute_accounted_with`] with the catalog resolve at
+    /// `resolve_at_ns` instead of `req.now_ns`: a later page of a paged result
+    /// resolves at page one's instant, so it lists the ingest hours page one
+    /// listed.
+    ///
+    /// The resolve, its listing window, the column-stats load paired with that
+    /// window and the fold-lag figure of a request-budget refusal use
+    /// `resolve_at_ns`. The declared-column and key-index lookups, whose
+    /// caches judge freshness against the instant they are asked at, and the
+    /// tenant's idle-eviction last-touch use `req.now_ns`, the caller's clock.
+    /// `resolve_at_ns` equal to `req.now_ns` is
+    /// [`Self::execute_accounted_with`].
+    pub async fn execute_accounted_at(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        req: &SqlRequest,
+        resolve_at_ns: i64,
+        live: &LiveAccounting,
+    ) -> Result<SqlOutcome, SqlError> {
+        let clocks = Clocks {
+            resolve_at_ns,
+            caller_now_ns: req.now_ns,
+        };
         // Step 1: the security gate runs before any catalog or plan work.
         validate_query(&req.sql)?;
         let tokens = admit_http_tokens(&Statement::Sql(&req.sql).tables()?, &req.min_tokens)?;
@@ -2131,6 +2202,7 @@ impl SqlExecutor {
                 capabilities,
                 Statement::Sql(&req.sql),
                 req,
+                clocks,
                 &tokens,
                 live,
             ),
@@ -2197,6 +2269,7 @@ impl SqlExecutor {
                 SqlCapabilities::default(),
                 statement,
                 &sql_req,
+                Clocks::of(&sql_req),
                 &tokens,
                 live,
             ),
@@ -2283,7 +2356,10 @@ impl SqlExecutor {
         phase_accounting: &StatementAccounting,
     ) -> Result<ExplainReport, SqlError> {
         let statement = Statement::Sql(&req.sql);
-        let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
+        let clocks = Clocks::of(req);
+        let declared = self
+            .resolve_declared_columns(tenant_hash, clocks.caller_now_ns)
+            .await;
         // `resolve_admitted` itself checks the effective `max_s3_requests`
         // right after resolve returns, so `explain` gets that enforcement
         // for free here without ever reaching the segment-fetch loop in
@@ -2296,6 +2372,7 @@ impl SqlExecutor {
                 SqlCapabilities::default(),
                 statement,
                 req,
+                clocks,
                 tokens,
                 phase_accounting,
             )
@@ -2322,7 +2399,8 @@ impl SqlExecutor {
                     row_window: req.row_window.then_some(req.window),
                     budgets: req.budgets,
                     column_stats_window: req.window,
-                    column_stats_now_ns: req.now_ns,
+                    column_stats_now_ns: clocks.resolve_at_ns,
+                    key_index_now_ns: clocks.caller_now_ns,
                     parquet: ParquetPlan::Resolved(parquet),
                     // A deliberate narrowing: explain does not carry a
                     // principal's capabilities; no caller of it authenticates
@@ -2361,12 +2439,15 @@ impl SqlExecutor {
     /// `statement` is what runs; `req.sql` is not read here or below, and
     /// neither is `req.min_tokens`: `tokens` is each lane's share, assigned
     /// once by the caller, and every attempt resolves with that same share.
+    /// `clocks` says which instant each step reads (see [`Clocks`]).
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
         tenant_hash: TenantHash,
         capabilities: SqlCapabilities,
         statement: Statement<'_>,
         req: &SqlRequest,
+        clocks: Clocks,
         tokens: &LaneTokens,
         live: &LiveAccounting,
     ) -> Result<SqlOutcome, SqlError> {
@@ -2376,11 +2457,14 @@ impl SqlExecutor {
         // whole request (ADR-0090 decision 2), before the retry loop, so the
         // same declared schema is used across the original attempt and the one
         // retry the consistency model allows -- never re-resolved per attempt
-        // with a source that might have refreshed in between. `req.now_ns` is
-        // the request's injected clock reading, the same one that bounds the
-        // resolve window, so the declared schema and the snapshot are pinned to
-        // one instant together.
-        let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
+        // with a source that might have refreshed in between. It is asked at
+        // the caller's clock, which its cache judges freshness against, not at
+        // the resolve instant: a later page resolving at page one's instant
+        // must not read a declaration cache as fresh by that earlier instant.
+        // A paged caller compares the set it gets with the one it pinned.
+        let declared = self
+            .resolve_declared_columns(tenant_hash, clocks.caller_now_ns)
+            .await;
         let cache_mark = self.fetcher.cache_ram_metrics().map(CacheCounterMark::take);
         let pressure_mark = self
             .log_fetcher
@@ -2414,6 +2498,7 @@ impl SqlExecutor {
                     capabilities,
                     statement,
                     req,
+                    clocks,
                     tokens,
                     &phase_accounting,
                 )
@@ -2459,7 +2544,7 @@ impl SqlExecutor {
                     parquet.is_some(),
                     req.window,
                     read_shape,
-                    req.now_ns,
+                    clocks,
                     &declared,
                 )
                 .await,
@@ -2493,6 +2578,7 @@ impl SqlExecutor {
                     capabilities,
                     statement,
                     req,
+                    clocks,
                     lanes,
                     &phase_accounting,
                     &declared,
@@ -2705,6 +2791,7 @@ impl SqlExecutor {
                 SqlCapabilities::default(),
                 Statement::Sql(&req.sql),
                 req,
+                Clocks::of(req),
                 &tokens,
                 &StatementAccounting::One(PhaseAccounting::pooled_over(accounting)),
             )
@@ -2932,6 +3019,7 @@ impl SqlExecutor {
                 budgets: inputs.budgets,
                 column_stats_window: window,
                 column_stats_now_ns: now_ns,
+                key_index_now_ns: now_ns,
                 parquet: inputs.parquet,
                 // A deliberate narrowing: Flight SQL does not carry a
                 // principal's capabilities; it authenticates a tenant only.
@@ -3269,7 +3357,7 @@ impl SqlExecutor {
                         // blocks read and never the rows returned.
                         let key_index = self
                             .declared_source
-                            .key_index(tenant_hash, extras.column_stats_now_ns)
+                            .key_index(tenant_hash, extras.key_index_now_ns)
                             .await;
                         SessionTable::Logs(Arc::new(
                             LogsTableProvider::new(
@@ -3604,12 +3692,14 @@ impl SqlExecutor {
     /// (resolve itself is not free, and an estimate computed only after
     /// resolve structurally cannot bound resolve's own spend), and the segment
     /// term from the resolved snapshot's `SegmentRef`s, computed after.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve(
         &self,
         tenant_hash: TenantHash,
         capabilities: SqlCapabilities,
         statement: Statement<'_>,
         req: &SqlRequest,
+        clocks: Clocks,
         tokens: &LaneTokens,
         phase_accounting: &StatementAccounting,
     ) -> Result<Resolved, SqlError> {
@@ -3618,6 +3708,7 @@ impl SqlExecutor {
             capabilities,
             statement,
             req,
+            clocks,
             tokens,
             phase_accounting,
         )
@@ -3643,21 +3734,24 @@ impl SqlExecutor {
 
     /// [`Self::resolve`] keeping the [`SegmentAdmission`] counts, for
     /// [`Self::explain`], which reports them.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_admitted(
         &self,
         tenant_hash: TenantHash,
         capabilities: SqlCapabilities,
         statement: Statement<'_>,
         req: &SqlRequest,
+        clocks: Clocks,
         tokens: &LaneTokens,
         phase_accounting: &StatementAccounting,
     ) -> Result<Resolved, SqlError> {
         // Idle-tenant eviction last-touch (ADR-0069 decision 2): stamp this
-        // tenant's activity with the request's injected clock before resolving.
+        // tenant's activity with the caller's clock before resolving, not the
+        // resolve instant, which a later page sets earlier than the call.
         // This is the one funnel both the HTTP (`execute`/`run`) and Flight SQL
         // (`resolve_snapshot`) paths pass through, so any tenant running a query
         // is kept out of the idle sweep.
-        self.touch_tenant(tenant_hash, req.now_ns);
+        self.touch_tenant(tenant_hash, clocks.caller_now_ns);
         let engine_config = self.effective_config(req.budgets.as_ref()).engine;
         let tables = statement.tables()?;
         // ADR-2040: the Parquet tables a statement names resolve their
@@ -3761,8 +3855,8 @@ impl SqlExecutor {
         let mut resolved = Vec::with_capacity(lanes.len());
         let mut unfolded_segments_resolved = 0_u64;
         let mut sealed_total = 0_u64;
-        // Every lane resolves at the request's one `now_ns` and window, in
-        // `SIGNAL_LANE_ORDER`, before anything is planned.
+        // Every lane resolves at the request's one resolve instant and window,
+        // in `SIGNAL_LANE_ORDER`, before anything is planned.
         for lane in lanes {
             let signal = lane.signal().ok_or_else(|| {
                 SqlError::Internal("a signal-table resolve reached the Parquet target".to_string())
@@ -3777,7 +3871,7 @@ impl SqlExecutor {
             };
             let catalog_requests = self
                 .catalog
-                .estimated_catalog_requests(req.window, req.now_ns);
+                .estimated_catalog_requests(req.window, clocks.resolve_at_ns);
             let (snapshot, origins) = self
                 .catalog
                 .resolve_pruned_with_admission(
@@ -3785,7 +3879,7 @@ impl SqlExecutor {
                     signal,
                     req.window,
                     tokens.for_lane(lane),
-                    req.now_ns,
+                    clocks.resolve_at_ns,
                     lane_name_filter,
                     phase_accounting.lane(lane).resolve(),
                 )
@@ -3828,7 +3922,7 @@ impl SqlExecutor {
                 phase_accounting,
                 &snapshot,
                 &origins,
-                req.now_ns,
+                clocks.resolve_at_ns,
                 &engine_config,
                 several
                     .then(|| crate::statement::signal_table_name(lane))
@@ -4252,7 +4346,9 @@ impl SqlExecutor {
     /// statement is an exact-key lookup ([`Self::reads_key_equality`]). A
     /// statement with no SQL text (a lowered plan) never reaches the trigger.
     /// Called once per attempt, after resolve and before the first segment
-    /// read.
+    /// read. The window and snapshot tests read `clocks.resolve_at_ns`, the
+    /// instant the lanes were resolved at; the KEY_IDX lookup reads
+    /// `clocks.caller_now_ns`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn statement_access_intent(
         &self,
@@ -4263,7 +4359,7 @@ impl SqlExecutor {
         names_parquet: bool,
         window: TimeRange,
         shape: ReadShape,
-        now_ns: i64,
+        clocks: Clocks,
         declared: &[DeclaredColumn],
     ) -> AccessIntent {
         let predicate_free = self
@@ -4273,11 +4369,17 @@ impl SqlExecutor {
                 statement,
                 lanes,
                 window,
-                now_ns,
+                clocks.resolve_at_ns,
                 declared,
             )
             .await;
-        let intent = classify_access_intent(lanes, names_parquet, window, now_ns, predicate_free);
+        let intent = classify_access_intent(
+            lanes,
+            names_parquet,
+            window,
+            clocks.resolve_at_ns,
+            predicate_free,
+        );
         if intent != AccessIntent::Interactive {
             return intent;
         }
@@ -4296,7 +4398,13 @@ impl SqlExecutor {
             return intent;
         }
         if self
-            .reads_key_equality(tenant_hash, capabilities, statement, now_ns, declared)
+            .reads_key_equality(
+                tenant_hash,
+                capabilities,
+                statement,
+                clocks.caller_now_ns,
+                declared,
+            )
             .await
         {
             AccessIntent::Interactive
@@ -4877,6 +4985,7 @@ impl SqlExecutor {
         capabilities: SqlCapabilities,
         statement: Statement<'_>,
         req: &SqlRequest,
+        clocks: Clocks,
         lanes: Vec<(TargetSignal, Snapshot)>,
         phase_accounting: &StatementAccounting,
         declared: &[DeclaredColumn],
@@ -4904,7 +5013,8 @@ impl SqlExecutor {
                     row_window: req.row_window.then_some(req.window),
                     budgets: req.budgets,
                     column_stats_window: req.window,
-                    column_stats_now_ns: req.now_ns,
+                    column_stats_now_ns: clocks.resolve_at_ns,
+                    key_index_now_ns: clocks.caller_now_ns,
                     parquet: ParquetPlan::Resolved(parquet),
                     capabilities,
                 },
@@ -5634,7 +5744,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// What to do after a failed attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetryDecision {
-    /// Re-resolve with the same `now_ns` and per-lane tokens and re-execute.
+    /// Re-resolve at the same resolve instant with the same per-lane tokens
+    /// and re-execute.
     RetryOnce,
     /// Fail with [`SqlError::SnapshotInvalidated`].
     FailInvalidated,
@@ -9402,7 +9513,10 @@ pub(crate) mod tests {
                         false,
                         window,
                         ReadShape::new(window, false, None),
-                        NOW,
+                        Clocks {
+                            resolve_at_ns: NOW,
+                            caller_now_ns: NOW,
+                        },
                         &declared,
                     )
                     .await;
@@ -9422,7 +9536,10 @@ pub(crate) mod tests {
                         false,
                         window,
                         ReadShape::new(window, false, None),
-                        NOW,
+                        Clocks {
+                            resolve_at_ns: NOW,
+                            caller_now_ns: NOW,
+                        },
                         &declared,
                     )
                     .await;
@@ -9473,7 +9590,10 @@ pub(crate) mod tests {
                     false,
                     window,
                     ReadShape::new(window, false, None),
-                    SIZE_TRIGGER_NOW,
+                    Clocks {
+                        resolve_at_ns: SIZE_TRIGGER_NOW,
+                        caller_now_ns: SIZE_TRIGGER_NOW,
+                    },
                     &declared,
                 )
                 .await,
@@ -9524,7 +9644,10 @@ pub(crate) mod tests {
                     false,
                     window,
                     ReadShape::new(window, false, None),
-                    SIZE_TRIGGER_NOW,
+                    Clocks {
+                        resolve_at_ns: SIZE_TRIGGER_NOW,
+                        caller_now_ns: SIZE_TRIGGER_NOW,
+                    },
                     &declared,
                 )
                 .await,
@@ -11479,5 +11602,183 @@ pub(crate) mod tests {
                 assert_eq!(reported, expected, "{sql} under {budgets:?}");
             }
         }
+    }
+
+    /// A [`DeclaredColumnSource`] declaring nothing that records the instant
+    /// each lookup was asked at.
+    #[derive(Default)]
+    struct RecordingDeclaredColumns {
+        declared_at: std::sync::Mutex<Vec<i64>>,
+        key_index_at: std::sync::Mutex<Vec<i64>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DeclaredColumnSource for RecordingDeclaredColumns {
+        async fn declared_columns(&self, _tenant: TenantHash, now_ns: i64) -> Vec<DeclaredColumn> {
+            self.declared_at.lock().expect("declared lock").push(now_ns);
+            Vec::new()
+        }
+
+        async fn key_index(
+            &self,
+            _tenant: TenantHash,
+            now_ns: i64,
+        ) -> crate::declared::KeyIndexDeclaration {
+            self.key_index_at
+                .lock()
+                .expect("key index lock")
+                .push(now_ns);
+            crate::declared::KeyIndexDeclaration::default()
+        }
+    }
+
+    const CLOCKS_NS_PER_HOUR: i64 = 3_600_000_000_000;
+    /// The later page's own call: 10h30m.
+    const CLOCKS_CALLER_NS: i64 = 10 * CLOCKS_NS_PER_HOUR + 1_800_000_000_000;
+    /// Page one's resolve instant: 5h30m. With the default 5-minute clock
+    /// skew allowance its listing ends at ingest hour 5.
+    const CLOCKS_RESOLVE_NS: i64 = 5 * CLOCKS_NS_PER_HOUR + 1_800_000_000_000;
+    const CLOCKS_EARLY_TS: i64 = 2 * CLOCKS_NS_PER_HOUR + 5;
+    const CLOCKS_LATE_TS: i64 = 8 * CLOCKS_NS_PER_HOUR + 5;
+
+    /// One logs record in ingest hour 2 and one in ingest hour 8, an executor
+    /// over them reading `source`, and a `SELECT ts FROM logs` over
+    /// `[0, CLOCKS_CALLER_NS]` whose `now_ns` is `CLOCKS_CALLER_NS`.
+    async fn two_clock_fixture(
+        name: &str,
+        source: &Arc<RecordingDeclaredColumns>,
+    ) -> (SqlExecutor, TenantHash, SqlRequest) {
+        let tenant_hash = TenantId::new(name).hash();
+        let memory = MemoryStore::new();
+        for (seq, hour, ts) in [(1, 2, CLOCKS_EARLY_TS), (2, 8, CLOCKS_LATE_TS)] {
+            publish_log_records_in_hour(
+                &memory,
+                tenant_hash,
+                Signal::Logs,
+                seq,
+                hour,
+                &[log_record("logs", ts)],
+            )
+            .await;
+        }
+        let source: Arc<dyn DeclaredColumnSource> = source.clone();
+        let executor =
+            executor_over(wrap_fixture_store(memory)).with_declared_column_source(source);
+        let request = SqlRequest {
+            now_ns: CLOCKS_CALLER_NS,
+            ..sql_request(
+                "SELECT ts FROM logs",
+                TimeRange {
+                    start_ns: 0,
+                    end_ns: CLOCKS_CALLER_NS,
+                },
+            )
+        };
+        (executor, tenant_hash, request)
+    }
+
+    /// A later page (resolve instant before the caller's clock) resolves the
+    /// catalog at the resolve instant, so the record in ingest hour 8, past
+    /// that listing's end, is not read, while the declared-column and KEY_IDX
+    /// lookups are asked at the caller's clock.
+    ///
+    /// FLIP (resolve): `execute_accounted_at` building
+    /// `Clocks { resolve_at_ns: req.now_ns, .. }`, everything at the caller's
+    /// clock, reads both records.
+    /// FLIP (caches): `execute_accounted_at` building
+    /// `Clocks { caller_now_ns: resolve_at_ns, .. }`, everything at the
+    /// resolve instant, asks both lookups at `CLOCKS_RESOLVE_NS`.
+    #[tokio::test]
+    async fn a_later_page_resolves_at_its_instant_and_looks_up_at_the_callers_clock() {
+        let source = Arc::new(RecordingDeclaredColumns::default());
+        let (executor, tenant_hash, request) =
+            two_clock_fixture("clocks-split-3663", &source).await;
+
+        let outcome = executor
+            .execute_accounted_at(
+                tenant_hash,
+                SqlCapabilities::default(),
+                &request,
+                CLOCKS_RESOLVE_NS,
+                &LiveAccounting::new(),
+            )
+            .await
+            .expect("execute at the resolve instant");
+
+        assert_eq!(
+            ts_column_values(&outcome.output, "ts"),
+            vec![CLOCKS_EARLY_TS]
+        );
+        assert_eq!(
+            *source.declared_at.lock().expect("declared lock"),
+            vec![CLOCKS_CALLER_NS]
+        );
+        assert_eq!(
+            *source.key_index_at.lock().expect("key index lock"),
+            vec![CLOCKS_CALLER_NS]
+        );
+    }
+
+    /// A later page stamps the tenant's idle-eviction last-touch with the
+    /// caller's clock: a sweep at `caller + ttl - 1` keeps the accountant, and
+    /// one at `caller + ttl + 1` evicts it.
+    ///
+    /// FLIP: `resolve_admitted` calling
+    /// `touch_tenant(tenant_hash, clocks.resolve_at_ns)` stamps 5 hours
+    /// earlier, so the first sweep evicts.
+    #[tokio::test]
+    async fn a_later_page_stamps_the_last_touch_with_the_callers_clock() {
+        let ttl_ns = 100 * CLOCKS_NS_PER_HOUR;
+        let source = Arc::new(RecordingDeclaredColumns::default());
+        let (executor, tenant_hash, request) =
+            two_clock_fixture("clocks-touch-3663", &source).await;
+
+        executor
+            .execute_accounted_at(
+                tenant_hash,
+                SqlCapabilities::default(),
+                &request,
+                CLOCKS_RESOLVE_NS,
+                &LiveAccounting::new(),
+            )
+            .await
+            .expect("execute at the resolve instant");
+
+        assert_eq!(
+            executor.evict_idle_accountants(CLOCKS_CALLER_NS + ttl_ns - 1, ttl_ns),
+            0
+        );
+        assert_eq!(
+            executor.evict_idle_accountants(CLOCKS_CALLER_NS + ttl_ns + 1, ttl_ns),
+            1
+        );
+    }
+
+    /// The HTTP entry has one instant: it resolves at the request's `now_ns`,
+    /// so both records are read, and asks both lookups at the same `now_ns`.
+    ///
+    /// FLIP: `execute_accounted_with` passing `CLOCKS_RESOLVE_NS` (any
+    /// instant but `req.now_ns`) as the resolve instant reads one record.
+    #[tokio::test]
+    async fn the_http_entry_resolves_and_looks_up_at_one_instant() {
+        let source = Arc::new(RecordingDeclaredColumns::default());
+        let (executor, tenant_hash, request) = two_clock_fixture("clocks-http-3663", &source).await;
+
+        let outcome = executor
+            .execute(tenant_hash, &request)
+            .await
+            .expect("execute on the HTTP entry");
+
+        let mut read = ts_column_values(&outcome.output, "ts");
+        read.sort_unstable();
+        assert_eq!(read, vec![CLOCKS_EARLY_TS, CLOCKS_LATE_TS]);
+        assert_eq!(
+            *source.declared_at.lock().expect("declared lock"),
+            vec![CLOCKS_CALLER_NS]
+        );
+        assert_eq!(
+            *source.key_index_at.lock().expect("key index lock"),
+            vec![CLOCKS_CALLER_NS]
+        );
     }
 }

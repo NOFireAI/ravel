@@ -374,7 +374,8 @@ calls.
 1. It resolves the snapshot against the pinned watermark, not against a
    fresh observation. This makes the re-resolve deterministic. The resolve
    runs at the instant the cursor was minted, not at the redeeming call's
-   clock.
+   clock. The page's typed attribute column and indexed key lookups and its
+   query audit record's timestamp use the redeeming call's own clock.
 2. It re-executes the original statement against that snapshot with a keyset
    predicate.
 
