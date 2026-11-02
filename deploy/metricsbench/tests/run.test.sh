@@ -211,6 +211,20 @@ JSON
       logs)
         echo "stub compose logs"
         ;;
+      run)
+        # ravel-cli catalog fold on the ravel-qualify service: its text
+        # report, the hours in the clock's current hour bucket.
+        case " $* " in
+          *" catalog fold "*)
+            [ "${STUB_FOLD_EXIT:-0}" -eq 0 ] || exit "${STUB_FOLD_EXIT}"
+            hour=$(($(date -u +%s) / 3600))
+            printf 'store: s3\nsignal: metrics\nno_op: false\nrebuilt: false\nprevious_watermark_hour: None\n'
+            printf 'watermark_hour: Some(%s)\nseal_margin: 1h 20m\n' "$((hour - ${STUB_FOLD_WATERMARK_LAG:-0}))"
+            printf 'seal_through_hour: %s\nbuckets_folded: 2\nentry_count: 420\npart_bytes: 9000\n' \
+              "${STUB_FOLD_SEAL:-Some(${hour})}"
+            ;;
+        esac
+        ;;
     esac
     ;;
   stats)
@@ -281,11 +295,23 @@ case "$url" in
     printf '%s' "${STUB_S3S_BYTES:-stub-s3s-fs-${url##*-linux-}}" >"$out"
     ;;
   */metrics)
+    # Scrape k (1-based) reports k*100 store GETs and k*3 commit-record cache
+    # entries, so consecutive scrapes differ by 100 and 3. From scrape
+    # STUB_METRICS_DOWN_FROM on it answers 503.
+    k=$(($(cat "${STUB_STATE}.scrapes" 2>/dev/null || echo 0) + 1))
+    echo "$k" >"${STUB_STATE}.scrapes"
+    if [ -n "${STUB_METRICS_DOWN_FROM:-}" ] && [ "$k" -ge "${STUB_METRICS_DOWN_FROM}" ]; then
+      printf 'unavailable' >"$out"
+      printf 503
+      exit 0
+    fi
     if [ -n "${STUB_NO_FOLD:-}" ]; then
       printf '# no fold yet\nravel_up 1\n' >"$out"
     else
       printf '# TYPE ravel_catalog_fold_last_success_timestamp_seconds gauge\nravel_catalog_fold_last_success_timestamp_seconds 1761000000\n' >"$out"
     fi
+    printf 'ravel_store_calls_total{mode="all",op="get"} %s\nravel_store_calls_total{mode="all",op="put"} 7\n' "$((k * 100))" >>"$out"
+    printf 'ravel_catalog_record_cache_entries{mode="all",cache="commit"} %s\nravel_catalog_record_cache_entries{mode="all",cache="compaction"} 1\n' "$((k * 3))" >>"$out"
     printf 200
     ;;
   */api/v1/query)
@@ -351,6 +377,15 @@ cat >"${BIN}/metricsbench_ingest" <<'STUB'
 #!/usr/bin/env bash
 printf 'metricsbench_ingest %s\n' "$*" >>"${STUB_LOG}"
 printf 'metricsbench_ingest env token=%s\n' "${METRICSBENCH_RAVEL_TOKEN:+set}" >>"${STUB_LOG}"
+# --readback-only: one row's read-back against an existing ingest report;
+# STUB_READBACK_ONLY_EXIT 1 is a read error, as the bin reports one.
+if [ "${1:-}" = "--readback-only" ]; then
+  case "${STUB_READBACK_ONLY_EXIT:-0}" in
+    0) echo '{"system":"ravel","plan_series_count":1000,"readback":{"series_count":1000,"sample_count":120000,"matches_expected":true,"mismatches":[],"query_ms":{"series":12,"samples.0":5}}}' ;;
+    1) echo '{"system":"ravel","plan_series_count":1000,"readback_error":"query series failed: 503"}' ;;
+  esac
+  exit "${STUB_READBACK_ONLY_EXIT:-0}"
+fi
 if [ -n "${STUB_INGEST_EXIT:-}" ]; then
   echo "stub ingest: remote write refused" >&2
   exit "${STUB_INGEST_EXIT}"
@@ -364,7 +399,9 @@ for ((i = 0; i < ${#args[@]}; i++)); do
     --*-endpoint)
       sys="${args[$i]#--}"
       sys="${sys%-endpoint}"
-      if [ "${STUB_INGEST_READBACK_FAIL:-}" = "$sys" ]; then
+      if [ "${STUB_INGEST_ROW_FAILURE:-}" = "$sys" ]; then
+        rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"row_failure\":{\"band\":null,\"error\":\"skipped after an earlier failure\"}}"
+      elif [ "${STUB_INGEST_READBACK_FAIL:-}" = "$sys" ]; then
         rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback_error\":\"query samples.0 failed: 422\"}"
       else
         rows="${rows}${rows:+,}{\"system\":\"${sys}\",\"readback\":{\"series_count\":1000,\"sample_count\":120000,\"matches_expected\":true,\"mismatches\":[]}}"
@@ -523,7 +560,7 @@ for f in stamps.json ingest.json effective-config.json provenance.json report.js
   expect_file a "$f"
 done
 check "a: stamps status passed, exit 0" 'j("stamps.json")["status"] == "passed" and j("stamps.json")["exit_code"] == 0'
-check "a: every step recorded in order" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","ingest","mimir-readiness","capture","provenance","fold-state","query","validate","memory"]'
+check "a: every step recorded in order" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","ingest","mimir-readiness","capture","provenance","fold-state","query","validate","memory","fold","restart","readback-folded"]'
 check "a: published image kind stamped, no image_id" 'j("stamps.json")["ravel_image"]["kind"] == "published" and "image_id" not in j("stamps.json")["ravel_image"]'
 expect_log "a: provenance says the image is published" "--config ravel_image_kind=published"
 expect_no_log "a: provenance carries no local image id" "ravel_image_id="
@@ -582,7 +619,7 @@ expect_rc q 70
 expect_err "q: message names step ingest and the row" "step ingest failed: metricsbench_ingest exited 1: mimir: read-back failed"
 expect_err "q: message says the run went on as a diagnostic" "the run went on as a diagnostic"
 check "q: stamps name step ingest, status failed, exit 70" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["status"] == "failed" and j("stamps.json")["exit_code"] == 70'
-check "q: every later step ran, ingest and mimir-readiness not done" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","capture","provenance","fold-state","query","validate","memory"]'
+check "q: every later step ran, ingest and mimir-readiness not done" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","capture","provenance","fold-state","query","validate","memory","fold","restart","readback-folded"]'
 check "q: nothing failed after ingest" 'j("stamps.json")["failed_after_ingest"] == []'
 check "q: Mimir readiness line stamped as not matching" 'j("stamps.json")["mimir_readiness"].startswith("ingest read-back for mimir did not match")'
 expect_log "q: query run as a diagnostic" "--diagnostic-after-failed-ingest"
@@ -1017,6 +1054,125 @@ STUB_LOCAL_IMAGE_ID="${LOCAL_ID}" run_case t --profile ci --ravel-image "${LOCAL
 expect_rc t 65
 expect_err "t: a local build is refused in the real-S3 lane" "a local build is never publishable"
 expect_no_log "t: nothing started" "docker-env up"
+
+# --- u: fold, restart and the folded read-back -----------------------------------
+# u reads case a's output; a's step list above pins fold, restart and
+# readback-folded after memory, in that order.
+OUT="${TMP}/a/out"
+LOG="${TMP}/a/calls.log"
+for f in fold.out readback-folded.json ravel-metrics-before-folded-readback.txt ravel-metrics-after-folded-readback.txt; do
+  expect_file u "$f"
+done
+expect_log "u: the fold runs ravel-cli on the ravel-qualify service with the server's flags" "ravel.yml run --rm --no-deps -T ravel-qualify --store s3 --tenant-hash-unkeyed catalog fold --tenant metricsbench --shards 4 --signal metrics --writers-stopped"
+expect_log "u: only ravel-server is restarted" "ravel.yml restart ravel-server"
+expect_log "u: the folded read-back reads the Ravel row of ingest.json" "metricsbench_ingest --readback-only --ingest-report ${OUT}/ingest.json --readback-system ravel --workload "
+expect_log "u: the folded read-back uses the ingest step's workload, profile, anchor, URL and token env" "--profile ci --anchor-ms ${ANCHOR} --ravel-query-url http://127.0.0.1:4318 --ravel-bearer-token-env METRICSBENCH_RAVEL_TOKEN --readback-timeout-secs 30 --readback-settle-secs 60"
+expect_no_log "u: the ingest step passes no settle flag" "--max-ingest-secs 600 --readback-timeout-secs 30 --readback-settle-secs"
+INGEST_BIN_SRC="${HERE}/../../../crates/ravel-bench/src/bin/metricsbench_ingest.rs"
+if grep -A1 -F '#[arg(long, default_value_t = 60)]' "${INGEST_BIN_SRC}" | grep -qF 'readback_settle_secs: u64,'; then
+  pass "u: 60 s is the bin's --readback-settle-secs default the ingest step runs with"
+else
+  fail "u: readback_settle_secs does not default to 60 in ${INGEST_BIN_SRC}"
+fi
+# The order of the calls themselves: the fold, then the restart, then the scrape,
+# read-back and scrape, all after the memory summary's inspect.
+if python3 -I - "${LOG}" <<'PY'; then
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+def first(s, after=-1):
+    return next(i for i, l in enumerate(lines) if i > after and s in l)
+mem = max(i for i, l in enumerate(lines) if l.startswith("docker inspect id-"))
+fold = first("catalog fold")
+restart = first("restart ravel-server")
+before = first("/metrics", restart)
+rb = first("--readback-only")
+after = first("/metrics", rb)
+sys.exit(0 if mem < fold < restart < before < rb < after else 1)
+PY
+  pass "u: calls ran memory, fold, restart, scrape, read-back, scrape"
+else
+  fail "u: calls out of order in ${LOG}"
+fi
+HOUR_NOW=$(($(date -u +%s) / 3600))
+check "u: fold stamped with its report's figures" 'j("stamps.json")["ravel_catalog_fold_writers_stopped"]["entry_count"] == 420 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["buckets_folded"] == 2 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["precondition"] == "met"'
+check "u: fold stamped with sealed and watermark hours at the ingest end hour" 'abs(j("stamps.json")["ravel_catalog_fold_writers_stopped"]["seal_through_hour"] - '"${HOUR_NOW}"') <= 1 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["watermark_hour"] >= j("stamps.json")["ravel_catalog_fold_writers_stopped"]["ingest_end_hour"]'
+check "u: restart stamped" 'j("stamps.json")["ravel_restart"].startswith("restarted: docker compose restart ravel-server")'
+check "u: folded read-back stamped with exit, match, series query_ms and deltas" 'j("stamps.json")["readback_folded"] == {"exit_code": 0, "matches_expected": True, "error": None, "series_query_ms": 12, "store_get_calls_delta": 100, "commit_record_cache_entries_delta": 3}'
+check "u: readback-folded.json is the bin's report" 'j("readback-folded.json")["system"] == "ravel"'
+
+# u1: a fold that sealed nothing.
+mapfile -t args < <(full_args "${TMP}/u1/out")
+STUB_FOLD_SEAL=None run_case u1 "${args[@]}"
+expect_rc u1 70
+expect_err "u1: message names step fold" "step fold failed: fold sealed nothing: seal_through_hour=None"
+check "u1: stamps name step fold, fold stamped failed" 'j("stamps.json")["failed_step"] == "fold" and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["precondition"].startswith("fold sealed nothing")'
+expect_no_log "u1: no restart" "restart ravel-server"
+expect_no_log "u1: no folded read-back" "--readback-only"
+
+# u2: a fold whose watermark is before the hour ingest ended in.
+mapfile -t args < <(full_args "${TMP}/u2/out")
+STUB_FOLD_WATERMARK_LAG=2 run_case u2 "${args[@]}"
+expect_rc u2 70
+expect_err "u2: message names step fold and the watermark" "step fold failed: watermark_hour=Some("
+check "u2: stamps name step fold, watermark before the ingest end hour" 'j("stamps.json")["failed_step"] == "fold" and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["watermark_hour"] < j("stamps.json")["ravel_catalog_fold_writers_stopped"]["ingest_end_hour"]'
+expect_no_log "u2: no restart" "restart ravel-server"
+
+# u3: the folded read-back fails.
+mapfile -t args < <(full_args "${TMP}/u3/out")
+STUB_READBACK_ONLY_EXIT=1 run_case u3 "${args[@]}"
+expect_rc u3 70
+expect_err "u3: message names step readback-folded and the error" "step readback-folded failed: metricsbench_ingest --readback-only exited 1: query series failed: 503"
+check "u3: stamps name step readback-folded, exit 1 and the error stamped" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["exit_code"] == 1 and j("stamps.json")["readback_folded"]["error"] == "query series failed: 503" and "restart" in j("stamps.json")["steps_completed"]'
+expect_file u3 ravel-metrics-after-folded-readback.txt
+
+# u4: the scrape after the folded read-back fails (scrape 1 is fold-state's).
+mapfile -t args < <(full_args "${TMP}/u4/out")
+STUB_METRICS_DOWN_FROM=3 run_case u4 "${args[@]}"
+expect_rc u4 70
+expect_err "u4: message names step readback-folded and the scrape" "step readback-folded failed: the after scrape"
+check "u4: no delta without the second scrape" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["store_get_calls_delta"] is None'
+
+# u5: Ravel's own read-back failed at ingest: the three steps still run.
+mapfile -t args < <(full_args "${TMP}/u5/out")
+STUB_INGEST_READBACK_FAIL=ravel run_case u5 "${args[@]}"
+expect_rc u5 70
+check "u5: stamps name ingest, the three steps done after memory" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["steps_completed"][-4:] == ["memory","fold","restart","readback-folded"] and j("stamps.json")["failed_after_ingest"] == []'
+check "u5: the folded read-back matched" 'j("stamps.json")["readback_folded"]["matches_expected"] is True'
+expect_err "u5: message names step ingest" "step ingest failed: metricsbench_ingest exited 1: ravel: read-back failed"
+
+# u6: the same, and the folded read-back fails too: listed after ingest.
+mapfile -t args < <(full_args "${TMP}/u6/out")
+STUB_INGEST_READBACK_FAIL=ravel STUB_READBACK_ONLY_EXIT=1 run_case u6 "${args[@]}"
+expect_rc u6 70
+check "u6: stamps name ingest, readback-folded failed after it" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["readback-folded"]'
+
+# u7: the Ravel row has a row_failure: the three steps are skipped and say why.
+mapfile -t args < <(full_args "${TMP}/u7/out")
+STUB_INGEST_READBACK_FAIL=victoriametrics STUB_INGEST_ROW_FAILURE=ravel run_case u7 "${args[@]}"
+expect_rc u7 70
+check "u7: stamps name ingest, no fold, restart or readback-folded" 'j("stamps.json")["failed_step"] == "ingest" and not {"fold","restart","readback-folded"} & set(j("stamps.json")["steps_completed"]) and "memory" in j("stamps.json")["steps_completed"]'
+check "u7: each of the three stamped skipped for the row_failure" 'all(j("stamps.json")[k].startswith("skipped: the ravel row has a row_failure") for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded"))'
+expect_no_log "u7: no fold" "catalog fold"
+expect_no_log "u7: no folded read-back" "--readback-only"
+
+# u8: the Ravel row stalled: skipped the same way.
+mapfile -t args < <(full_args "${TMP}/u8/out")
+STUB_INGEST_STALL=ravel run_case u8 "${args[@]}"
+expect_rc u8 70
+check "u8: each of the three stamped skipped for the stall" 'all(j("stamps.json")[k].startswith("skipped: the ravel row stalled") for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded"))'
+expect_no_log "u8: no fold" "catalog fold"
+
+# u9: the diagnostic mode (case f) runs none of them.
+OUT="${TMP}/f/out"
+LOG="${TMP}/f/calls.log"
+check "u9: diagnostic stamps the three not applicable" 'all(j("stamps.json")[k] == "not applicable: diagnostic run starts no Ravel" for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded")) and not {"fold","restart","readback-folded"} & set(j("stamps.json")["steps_completed"])'
+expect_no_log "u9: diagnostic runs no fold" "catalog fold"
+expect_no_log "u9: diagnostic restarts nothing" "restart ravel-server"
+expect_no_log "u9: diagnostic runs no folded read-back" "--readback-only"
+
+# u10: the real-S3 lane (case s) folds through the same service, with its overlay.
+LOG="${TMP}/s/calls.log"
+expect_log "u10: the real-S3 fold runs on ravel-qualify with real-s3.yml" "real-s3.yml run --rm --no-deps -T ravel-qualify --store s3 --tenant-hash-unkeyed catalog fold"
 
 echo
 echo "${passes} passed, ${fails} failed"
