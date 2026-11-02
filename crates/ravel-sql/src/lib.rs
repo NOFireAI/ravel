@@ -101,6 +101,7 @@ mod provider;
 mod pushdown;
 pub mod redact;
 mod regexp_replace_udf;
+mod resume_value;
 mod rlog_attrs;
 mod scan;
 #[cfg(test)]
@@ -238,6 +239,7 @@ pub use ravel_catalog::SegmentLevel;
 /// Same reason as the [`SegmentLevel`] re-export above.
 pub use ravel_query::erasure::ErasurePredicate;
 pub use redact::{RedactError, redact};
+pub use resume_value::resume_value;
 pub use scan_budget::EnforcedBudgets;
 pub use schema::{internal_schema, public_schema};
 pub use session::{
