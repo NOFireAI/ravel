@@ -24,6 +24,14 @@
 //! its samples, and caps the series count at `max_rows`. A capped result is
 //! `ok_bounded`: a PromQL result has no order a cursor could resume, and the
 //! ADR gives this tool no cursor.
+//!
+//! `max_rows` cannot bound one series' samples, so two rules do. A range of
+//! more than [`MAX_RANGE_POINTS`] steps is `invalid_argument` before the
+//! backend is called. And a series whose samples do not fit the byte cap
+//! keeps a prefix of them as an object of parallel arrays of one length,
+//! with `samples_omitted` counting the rest. The cut happens before
+//! [`Envelope::fit`] runs, which would otherwise serialize the object to
+//! text and cut that.
 
 use ravel_query::RequestBudgets;
 use ravel_query::http::{InstantRequest, RangeRequest};
@@ -32,7 +40,8 @@ use serde_json::{Map, Value};
 
 use crate::catalog::QueryPromqlInput;
 use crate::envelope::{
-    Cell, Column, Data, Envelope, Failure, FailureClass, NextStep, Row, TimeRange,
+    Cell, Column, Data, Envelope, Failure, FailureClass, NextStep, Row, TimeRange, fit_cap,
+    serialized_len,
 };
 use crate::service::QueryBackend;
 
@@ -46,6 +55,19 @@ const TOOL: &str = "ravel_query_promql";
 /// figure (`ravel_promql::DEFAULT_LOOKBACK_NS`); this copy is what the scope
 /// block reports, and the server's MCP tests pin the two equal.
 pub const LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
+
+/// The most steps one range evaluation may have. The evaluator owns the
+/// figure (`ravel_promql::DEFAULT_MAX_RANGE_POINTS`) and refuses past it as
+/// `unsupported` with no next step; this crate does not depend on the
+/// evaluator, so this copy refuses first as `invalid_argument` with a next
+/// step, and the server's MCP tests pin the two equal.
+pub const MAX_RANGE_POINTS: usize = 11_000;
+
+/// Room left below the fit cap for the presentation counters `fit` and this
+/// body set after the series are measured: four `u64` counters, zero when
+/// measured and at most 20 digits each, and two flags one byte longer when
+/// set.
+const COUNTER_SLACK: usize = 128;
 
 const NS_PER_MS: i64 = 1_000_000;
 
@@ -206,6 +228,27 @@ fn range_mode(range: &TimeRange, step: &str) -> Result<Mode, Refusal> {
         ));
     }
     let step_ns = whole_ms("step", step_ns(step))?;
+    let span_ns = i128::from(end_ns) - i128::from(start_ns);
+    let steps = (span_ns - 1) / i128::from(step_ns) + 1;
+    if steps > MAX_RANGE_POINTS as i128 {
+        // The smallest whole-millisecond step that brings the range under the
+        // limit: ceil(span / limit), since the steps number ceil(span / step).
+        let limit = MAX_RANGE_POINTS as i128;
+        let min_step_ms = (span_ns / i128::from(NS_PER_MS) + limit - 1) / limit;
+        return Err((
+            invalid(format!(
+                "time_range and step evaluate {steps} steps, over the {MAX_RANGE_POINTS} a \
+                 range evaluation may have"
+            )),
+            vec![NextStep {
+                action: TOOL.to_string(),
+                detail: format!(
+                    "widen step to at least {min_step_ms}ms, or narrow time_range, so the \
+                     range evaluates at most {MAX_RANGE_POINTS} steps"
+                ),
+            }],
+        ));
+    }
     Ok(Mode::Range {
         start_ns,
         end_ns,
@@ -279,7 +322,8 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Result<
         .iter()
         .map(|column| column.name.as_str())
         .collect();
-    if names == SAMPLE_COLUMNS {
+    let grouped = names == SAMPLE_COLUMNS;
+    if grouped {
         envelope.data = series_data(std::mem::take(&mut envelope.data.rows))?;
     }
 
@@ -289,8 +333,15 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Result<
     envelope.data.rows.truncate(max_rows);
     envelope.presentation.max_rows = ctx.budgets.max_rows;
 
+    let cut = if grouped {
+        fit_series(&mut envelope, ctx.budgets.max_response_bytes, plan.mode)?
+    } else {
+        SeriesCut::default()
+    };
     let mut fitted = envelope.fit(ctx.budgets.max_response_bytes);
-    fitted.presentation.rows_omitted += row_cap_omitted;
+    fitted.presentation.rows_omitted += row_cap_omitted + cut.rows_omitted;
+    fitted.presentation.cells_truncated += cut.samples_cut;
+    fitted.presentation.bytes_cap_hit |= cut.rows_omitted > 0 || cut.samples_cut > 0;
     fitted.presentation.row_cap_hit |= row_cap_omitted > 0;
     fitted.data.row_count = produced as u64;
     Ok(fitted.finish(false))
@@ -390,6 +441,137 @@ impl Series {
         }
         map
     }
+}
+
+/// What [`fit_series`] took to bring the series under the byte cap.
+#[derive(Debug, Default)]
+struct SeriesCut {
+    /// Series dropped whole, after the one cut.
+    rows_omitted: u64,
+    /// Series kept with a prefix of their samples: zero or one.
+    samples_cut: u64,
+}
+
+/// Fit the series rows under the byte cap before [`Envelope::fit`] sees
+/// them, so a samples cell stays an object of parallel arrays: `fit` would
+/// serialize an oversized one to text and cut that. Series that fit whole
+/// are kept whole, in order. The first that does not is kept with the
+/// longest prefix of its samples that fits, every array cut to the same
+/// length and `samples_omitted` counting the samples left out; it is dropped
+/// instead when no sample of it fits and a series before it was kept. Every
+/// series after it is dropped.
+fn fit_series(
+    envelope: &mut Envelope,
+    requested_max_response_bytes: u64,
+    mode: Mode,
+) -> Result<SeriesCut, Failure> {
+    let cap = fit_cap(requested_max_response_bytes).saturating_sub(COUNTER_SLACK);
+    if serialized_len(envelope) <= cap {
+        return Ok(SeriesCut::default());
+    }
+    envelope.next_steps.push(bytes_next_step(mode));
+    let mut rows = std::mem::take(&mut envelope.data.rows).into_iter();
+    let mut used = serialized_len(envelope);
+    let mut cut = SeriesCut::default();
+    for row in rows.by_ref() {
+        let separator = usize::from(!envelope.data.rows.is_empty());
+        let room = cap.saturating_sub(used + separator);
+        let len = row_len(&row);
+        if len <= room {
+            used += separator + len;
+            envelope.data.rows.push(row);
+            continue;
+        }
+        let (prefix, kept) = samples_prefix(row, room)?;
+        if kept > 0 || envelope.data.rows.is_empty() {
+            envelope.data.rows.push(prefix);
+            cut.samples_cut = 1;
+        } else {
+            cut.rows_omitted = 1;
+        }
+        break;
+    }
+    cut.rows_omitted += rows.count() as u64;
+    if cut.rows_omitted == 0 && cut.samples_cut == 0 {
+        envelope.next_steps.pop();
+    }
+    Ok(cut)
+}
+
+fn bytes_next_step(mode: Mode) -> NextStep {
+    let detail = match mode {
+        Mode::Range { .. } => {
+            "the series did not fit max_response_bytes: widen step or narrow time_range for \
+             fewer samples per series, or narrow the query for fewer series"
+        }
+        Mode::Instant { .. } => {
+            "the series did not fit max_response_bytes: narrow the query for fewer series"
+        }
+    };
+    NextStep {
+        action: TOOL.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+fn row_len(row: &Row) -> usize {
+    serde_json::to_string(row)
+        .map(|text| text.len())
+        .unwrap_or(usize::MAX)
+}
+
+/// The series row with the longest prefix of its samples whose serialized
+/// row fits `room`, and how many samples that prefix holds. Every array is
+/// cut to the same length and `samples_omitted` counts the rest, as a
+/// string like every other D4 integer. A row's length only grows with the
+/// prefix (each sample adds a `ts_ns` string of at least 3 bytes, and the
+/// count loses at most one digit), so a binary search finds it.
+fn samples_prefix(row: Row, room: usize) -> Result<(Row, usize), Failure> {
+    let [series, samples]: [Cell; 2] = row
+        .try_into()
+        .map_err(|_| internal("a series row is not a label set and samples".to_string()))?;
+    let Cell::Map(samples) = samples else {
+        return Err(internal("a series' samples are not an object".to_string()));
+    };
+    let arrays: Vec<(String, Vec<Value>)> = samples
+        .into_iter()
+        .map(|(name, value)| match value {
+            Value::Array(items) => Ok((name, items)),
+            other => Err(internal(format!(
+                "a series' {name} is not an array: {other}"
+            ))),
+        })
+        .collect::<Result<_, _>>()?;
+    let total = arrays
+        .iter()
+        .map(|(_, items)| items.len())
+        .min()
+        .unwrap_or(0);
+    let build = |kept: usize| -> Row {
+        let mut map = Map::new();
+        for (name, items) in &arrays {
+            map.insert(
+                name.clone(),
+                Value::Array(items.iter().take(kept).cloned().collect()),
+            );
+        }
+        map.insert(
+            "samples_omitted".to_string(),
+            Value::String((total - kept).to_string()),
+        );
+        vec![series.clone(), Cell::Map(map)]
+    };
+    // The largest prefix shorter than the whole series that fits, or none.
+    let (mut fits, mut over) = (0usize, total);
+    while over - fits > 1 {
+        let mid = fits + (over - fits) / 2;
+        if row_len(&build(mid)) <= room {
+            fits = mid;
+        } else {
+            over = mid;
+        }
+    }
+    Ok((build(fits), fits))
 }
 
 /// A cell as the envelope serializes it, so a sample value follows the D4
@@ -836,6 +1018,212 @@ mod tests {
             };
             assert_eq!(samples["value"], json!([0.0, 1.0, 2.0, 3.0]));
         }
+    }
+
+    /// A range one step over [`MAX_RANGE_POINTS`] is `invalid_argument`
+    /// before the backend runs, with a next step naming the smallest step
+    /// that fits; a range of exactly the limit reaches the backend. The step
+    /// count is the half-open one, so a range one millisecond past the limit
+    /// at 1 s steps is over it.
+    ///
+    /// FLIP: refusing at `steps >= MAX_RANGE_POINTS` refuses the range at
+    /// the limit; counting `span / step` without the partial last step lets
+    /// the 1 ms-over range reach the panicking stub.
+    #[test]
+    fn a_range_over_the_step_limit_is_refused_before_the_backend() {
+        let key = key();
+        let ctx = test_context(&key);
+        let limit = MAX_RANGE_POINTS as i64;
+        let second = 1_000_000_000;
+        let stub = Stub::default();
+        for end_ns in [
+            START_NS + (limit + 1) * second,
+            START_NS + limit * second + NS_PER_MS,
+        ] {
+            let envelope = block_on(run(range_args(START_NS, end_ns, "1s"), &ctx, &stub));
+            let failure = failure_of(&envelope);
+            assert_eq!(failure.class, FailureClass::InvalidArgument);
+            assert_eq!(
+                failure.message,
+                "time_range and step evaluate 11001 steps, over the 11000 a range evaluation \
+                 may have"
+            );
+            assert_eq!(envelope.next_steps.len(), 1);
+            assert!(
+                envelope.next_steps[0]
+                    .detail
+                    .starts_with("widen step to at least 1001ms, or narrow time_range"),
+                "{:?}",
+                envelope.next_steps
+            );
+        }
+
+        let stub = answering(vec![Ok(sample_rows(&[("m", START_NS, 1.0)]))]);
+        let envelope = block_on(run(
+            range_args(START_NS, START_NS + limit * second, "1s"),
+            &ctx,
+            &stub,
+        ));
+        assert_eq!(envelope.status, Status::Ok, "{envelope:?}");
+        assert_eq!(stub.ranges.borrow().len(), 1);
+    }
+
+    /// `n` consecutive one-second samples of `name` from [`START_NS`].
+    fn long_series(
+        name: &'static str,
+        n: i64,
+        value: impl Fn(i64) -> f64,
+    ) -> Vec<(&'static str, i64, f64)> {
+        (0..n)
+            .map(|k| (name, START_NS + k * 1_000_000_000, value(k)))
+            .collect()
+    }
+
+    /// Eleven digits after the point, so each sample costs about 34 B and
+    /// 11,000 of them are well over the 256 KiB floor cap.
+    fn wide(k: i64) -> f64 {
+        k as f64 + 0.123_456_789_01
+    }
+
+    /// The samples object of `row`, its two arrays, and its omitted count.
+    fn samples_of(row: &Row) -> (&Map<String, Value>, &Vec<Value>, &Vec<Value>) {
+        let Cell::Map(samples) = &row[1] else {
+            panic!("samples is an object, not {:?}", row[1]);
+        };
+        let ts = samples["ts_ns"].as_array().expect("ts_ns is an array");
+        let values = samples["value"].as_array().expect("value is an array");
+        (samples, ts, values)
+    }
+
+    /// 11,000 one-second steps, the most a range may have.
+    fn range_at_the_step_limit() -> Value {
+        range_args(
+            START_NS,
+            START_NS + MAX_RANGE_POINTS as i64 * 1_000_000_000,
+            "1s",
+        )
+    }
+
+    /// One series whose samples are over the byte cap keeps an aligned
+    /// prefix: `samples` stays an object, `ts_ns` and `value` hold the same
+    /// first `k` samples of the series, `samples_omitted` counts the rest,
+    /// the cut is one truncated cell, the result is `ok_bounded`, and a next
+    /// step says to widen the step or narrow the range. The envelope still
+    /// fits the cap.
+    ///
+    /// FLIP: leaving the cell to `Envelope::fit` (the code before this rule)
+    /// answers a string; cutting `ts_ns` alone leaves arrays of different
+    /// lengths.
+    #[test]
+    fn a_series_over_the_byte_cap_keeps_an_aligned_prefix() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_response_bytes = 1;
+        let full = long_series("m", 11_000, wide);
+        let stub = answering(vec![Ok(sample_rows(&full))]);
+
+        let envelope = block_on(run(range_at_the_step_limit(), &ctx, &stub));
+
+        assert_eq!(
+            envelope.status,
+            Status::OkBounded,
+            "{:?}",
+            envelope.presentation
+        );
+        assert!(envelope.presentation.bytes_cap_hit);
+        assert_eq!(envelope.presentation.cells_truncated, 1);
+        assert_eq!(envelope.presentation.rows_omitted, 0);
+        assert_eq!(envelope.data.row_count, 1);
+        assert_eq!(envelope.data.rows.len(), 1);
+        let (samples, ts, values) = samples_of(&envelope.data.rows[0]);
+        let kept = ts.len();
+        assert_eq!(values.len(), kept);
+        assert!(kept > 0 && kept < full.len(), "{kept}");
+        for (k, &(_, ts_ns, value)) in full[..kept].iter().enumerate() {
+            assert_eq!(ts[k], json!(ts_ns.to_string()));
+            assert_eq!(values[k], json!(value));
+        }
+        assert_eq!(
+            samples["samples_omitted"],
+            json!((full.len() - kept).to_string())
+        );
+        assert!(
+            envelope
+                .next_steps
+                .iter()
+                .any(|step| step.detail.contains("widen step or narrow time_range")),
+            "{:?}",
+            envelope.next_steps
+        );
+        let size = serde_json::to_vec(&envelope).expect("serializes").len() as u64;
+        let cap = envelope.presentation.effective_max_response_bytes;
+        assert!(size <= cap, "{size} over {cap}");
+        // A prefix far shorter than the room (a fixed small cut) is not the
+        // longest that fits: the envelope ends within 2 KiB of the cap.
+        assert!(size + 2048 > cap, "{size} leaves more than 2 KiB of {cap}");
+    }
+
+    /// With several series and the second over the remaining room, the
+    /// first is kept whole, the second is cut to a prefix, and the third is
+    /// dropped and counted.
+    ///
+    /// FLIP: cutting the first series rather than the one that does not fit
+    /// keeps `a` alone, with fewer than 10 samples, and drops `b`.
+    #[test]
+    fn the_series_that_does_not_fit_is_cut_and_the_ones_before_stay_whole() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_response_bytes = 1;
+        let mut rows = long_series("a", 10, wide);
+        rows.extend(long_series("b", 11_000, wide));
+        rows.extend(long_series("c", 10, wide));
+        let stub = answering(vec![Ok(sample_rows(&rows))]);
+
+        let envelope = block_on(run(range_at_the_step_limit(), &ctx, &stub));
+
+        assert_eq!(envelope.status, Status::OkBounded);
+        assert_eq!(envelope.data.row_count, 3);
+        assert_eq!(envelope.data.rows.len(), 2);
+        assert_eq!(envelope.presentation.cells_truncated, 1);
+        assert_eq!(envelope.presentation.rows_omitted, 1);
+        let (a, a_ts, a_values) = samples_of(&envelope.data.rows[0]);
+        assert_eq!(envelope.data.rows[0][0], labels("a"));
+        assert_eq!((a_ts.len(), a_values.len()), (10, 10));
+        assert!(!a.contains_key("samples_omitted"), "{a:?}");
+        let (b, b_ts, b_values) = samples_of(&envelope.data.rows[1]);
+        assert_eq!(envelope.data.rows[1][0], labels("b"));
+        assert_eq!(b_ts.len(), b_values.len());
+        assert_eq!(
+            b["samples_omitted"],
+            json!((11_000 - b_ts.len()).to_string())
+        );
+    }
+
+    /// `NaN`, the infinities and `-0.0` inside a cut prefix keep the D4
+    /// precision encoding.
+    ///
+    /// FLIP: a cut that turns the string-encoded values into `null` (what
+    /// rebuilding the arrays through `json!(f64)` does) fails the match.
+    #[test]
+    fn a_cut_prefix_keeps_float_precision() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_response_bytes = 1;
+        let special = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0];
+        let full = long_series("m", 11_000, |k| {
+            special.get(k as usize).copied().unwrap_or_else(|| wide(k))
+        });
+        let stub = answering(vec![Ok(sample_rows(&full))]);
+
+        let envelope = block_on(run(range_at_the_step_limit(), &ctx, &stub));
+
+        assert_eq!(envelope.presentation.cells_truncated, 1);
+        let text = serde_json::to_string(&envelope.data).expect("data serializes");
+        assert!(
+            text.contains(r#""value":["NaN","+Inf","-Inf",-0.0,4.12345678901,"#),
+            "{}",
+            &text[..text.len().min(400)]
+        );
     }
 
     /// Without consent a partial result is refused as `unavailable`, the

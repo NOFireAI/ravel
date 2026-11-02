@@ -157,8 +157,11 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   available the same as any other metric name. It answers one row per
   series, the series' timestamps and values as parallel arrays, and
   `max_rows` counts series: a capped result is `ok_bounded` with no cursor.
-  A result that skipped part of its coverage is refused as `unavailable`
-  unless the call sets `allow_partial_coverage: true`. The
+  A range of more than 11,000 steps is refused as `invalid_argument`, and a
+  series whose samples do not fit `max_response_bytes` comes back with a
+  prefix of them, counted in `samples.samples_omitted`. A result that
+  skipped part of its coverage is refused as `unavailable` unless the call
+  sets `allow_partial_coverage: true`. The
   [reference](../reference/mcp.md#evaluating-promql) lists each answer.
 
 ### Search logs
@@ -357,7 +360,17 @@ If you send both, or neither, or only one of `time_range` and `step`, the
 call fails with `invalid_argument`. The steps run from the range's start
 while below its end. The engine evaluates in milliseconds, so a time or a
 step that is not a whole millisecond is refused as `invalid_argument`
-rather than rounded. The step takes a unit, such as `30s`.
+rather than rounded. The step takes a unit, such as `30s`. A range may have
+at most 11,000 steps, the engine's own limit; past it the call fails with
+`invalid_argument` and a next step naming the smallest step that fits.
+
+One series can hold up to 11,000 samples, which `max_rows` does not bound
+because it counts series. When the samples do not fit
+`max_response_bytes`, the series that does not fit comes back with a
+prefix of its samples, `ts_ns` and `value` of one length, and
+`samples.samples_omitted` says how many were left out. The result is
+`ok_bounded`, and its next step says to widen `step` or narrow
+`time_range`.
 
 ## Budgets you can lower
 

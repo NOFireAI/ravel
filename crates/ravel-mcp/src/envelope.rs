@@ -604,7 +604,7 @@ pub struct Envelope {
     pub next_steps: Vec<NextStep>,
 }
 
-fn serialized_len(envelope: &Envelope) -> usize {
+pub(crate) fn serialized_len(envelope: &Envelope) -> usize {
     serde_json::to_vec(envelope)
         .map(|bytes| bytes.len())
         .unwrap_or(usize::MAX)
@@ -880,6 +880,15 @@ const fn identity_warnings_allowance() -> usize {
 
 /// See [`identity_warnings_allowance`].
 const IDENTITY_WARNINGS_ALLOWANCE: usize = identity_warnings_allowance();
+
+/// The serialized size [`Envelope::fit`] packs an envelope under for a
+/// requested `max_response_bytes`: the floored cap less
+/// [`IDENTITY_WARNINGS_ALLOWANCE`]. A tool that fits its own cells before
+/// calling `fit` measures against this figure, so the two cannot disagree.
+pub(crate) fn fit_cap(requested_max_response_bytes: u64) -> usize {
+    let effective_cap = requested_max_response_bytes.max(MAX_RESPONSE_BYTES_FLOOR);
+    (effective_cap as usize).saturating_sub(IDENTITY_WARNINGS_ALLOWANCE)
+}
 
 /// Serialized size of `s` as a JSON string value, quotes and every escape
 /// sequence included. This is the number every budget in this module is
@@ -1272,7 +1281,7 @@ impl Envelope {
         let effective_cap = requested_max_response_bytes.max(MAX_RESPONSE_BYTES_FLOOR);
         self.presentation.effective_max_response_bytes = effective_cap;
         self.presentation.floor_applied = requested_max_response_bytes < MAX_RESPONSE_BYTES_FLOOR;
-        let cap = (effective_cap as usize).saturating_sub(IDENTITY_WARNINGS_ALLOWANCE);
+        let cap = fit_cap(requested_max_response_bytes);
 
         if serialized_len(&self) <= cap {
             self.presentation.bytes_cap_hit = false;

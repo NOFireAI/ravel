@@ -2618,6 +2618,106 @@ mod with_mcp {
         running.shutdown().await.expect("server stops");
     }
 
+    /// The step limit `ravel_query_promql` refuses past is the engine's.
+    ///
+    /// FLIP: a tool copy of 10,000 or 12,000 while the engine keeps 11,000
+    /// fails here.
+    #[test]
+    fn query_promql_step_limit_is_the_engines() {
+        assert_eq!(
+            ravel_mcp::tools::query_promql::MAX_RANGE_POINTS,
+            ravel_promql::DEFAULT_MAX_RANGE_POINTS
+        );
+    }
+
+    /// Through `POST /mcp` over one series of metric `m` sampled every 10 s
+    /// in [0 s, 1100 s): a range of 11,001 steps of 100 ms is
+    /// `invalid_argument` with a next step, and the engine's own limit is
+    /// never reached; a range of exactly 11,000 steps is evaluated, and its
+    /// one series, over the 256 KiB floor cap at about 34 B a sample, comes
+    /// back as an object of parallel arrays of one length, a prefix of the
+    /// series, with `samples_omitted`, one truncated cell, `ok_bounded`, and
+    /// a next step to widen the step or narrow the range.
+    ///
+    /// FLIP: dropping the tool's step check lets the engine refuse the first
+    /// call as `unsupported`, naming the HTTP route's `step_ms`, with no next
+    /// step; a tool copy of the limit above the engine's does the same.
+    /// FLIP: leaving the samples cell to `Envelope::fit` answers it as a
+    /// string, and `samples["ts_ns"]` is null.
+    #[tokio::test]
+    async fn query_promql_bounds_a_long_series_by_steps_and_bytes() {
+        let (store, metrics) = instrumented_memory();
+        let samples: Vec<(i64, f64)> = (0..110)
+            .map(|k| (k * 10 * NS_PER_SEC, k as f64 + 0.123_456_789_012_345))
+            .collect();
+        publish_samples(store.as_ref(), 0, 1, &samples).await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+        let range = |end_ms: i64| {
+            serde_json::json!({
+                "query": "m",
+                "time_range": {"start_ns": "0", "end_ns": (end_ms * 1_000_000).to_string()},
+                "step": "100ms",
+                "max_response_bytes": 1,
+            })
+        };
+
+        let (is_error, over) = call(&client, "ravel_query_promql", range(1_100_100)).await;
+        assert_eq!(is_error, Some(true), "{over}");
+        assert_eq!(
+            over["failure"]["class"],
+            serde_json::json!("invalid_argument"),
+            "{over}"
+        );
+        assert_eq!(
+            over["next_steps"][0]["detail"],
+            serde_json::json!(
+                "widen step to at least 101ms, or narrow time_range, so the range evaluates \
+                 at most 11000 steps"
+            )
+        );
+
+        let (is_error, cut) = call(&client, "ravel_query_promql", range(1_100_000)).await;
+        assert_eq!(is_error, Some(false), "{}", cut["failure"]);
+        assert_eq!(cut["status"], serde_json::json!("ok_bounded"));
+        assert_eq!(cut["presentation"]["cells_truncated"], serde_json::json!(1));
+        assert_eq!(cut["presentation"]["rows_omitted"], serde_json::json!(0));
+        let rows = cut["data"]["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 1);
+        let ts = rows[0][1]["ts_ns"].as_array().expect("ts_ns is an array");
+        let values = rows[0][1]["value"].as_array().expect("value is an array");
+        assert_eq!(ts.len(), values.len());
+        assert!(ts.len() > 1_000 && ts.len() < 11_000, "{}", ts.len());
+        for (k, (ts_ns, value)) in ts.iter().zip(values).enumerate() {
+            let step_ns = k as i64 * 100_000_000;
+            assert_eq!(ts_ns, &serde_json::json!(step_ns.to_string()));
+            let sample = samples[(step_ns / (10 * NS_PER_SEC)) as usize].1;
+            assert_eq!(value, &serde_json::json!(sample));
+        }
+        assert_eq!(
+            rows[0][1]["samples_omitted"],
+            serde_json::json!((11_000 - ts.len()).to_string())
+        );
+        let details: Vec<&str> = cut["next_steps"]
+            .as_array()
+            .expect("next steps")
+            .iter()
+            .filter_map(|step| step["detail"].as_str())
+            .collect();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("widen step or narrow time_range")),
+            "{details:?}"
+        );
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
     /// `max_rows` counts series: three series of three steps each under
     /// `max_rows: 2` answer two whole series, `ok_bounded`, one series
     /// omitted, and no cursor.
