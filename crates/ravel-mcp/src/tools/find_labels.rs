@@ -390,7 +390,10 @@ mod tests {
         assert!(page.len() > 1);
         assert!(envelope.presentation.bytes_cap_hit);
         assert!(!envelope.presentation.row_cap_hit);
-        assert_eq!(page.len() as u64 + envelope.presentation.rows_omitted, 20_000);
+        assert_eq!(
+            page.len() as u64 + envelope.presentation.rows_omitted,
+            20_000
+        );
         assert_eq!(envelope.data.row_count, 20_000);
     }
 

@@ -1323,9 +1323,13 @@ mod with_mcp {
             serde_json::json!([["m"], ["ravel_log_bytes"], ["ravel_log_lines"]])
         );
         assert!(
-            names["warnings"].as_array().expect("warnings").iter().any(|w| w
-                .as_str()
-                .is_some_and(|w| w.starts_with("metric names (the values of __name__)"))),
+            names["warnings"]
+                .as_array()
+                .expect("warnings")
+                .iter()
+                .any(|w| w
+                    .as_str()
+                    .is_some_and(|w| w.starts_with("metric names (the values of __name__)"))),
             "{names}"
         );
 
@@ -1339,7 +1343,11 @@ mod with_mcp {
             }),
         )
         .await;
-        assert_eq!(filtered["data"]["rows"], serde_json::json!([]), "{filtered}");
+        assert_eq!(
+            filtered["data"]["rows"],
+            serde_json::json!([]),
+            "{filtered}"
+        );
         assert_eq!(
             filtered["scope"]["predicates_applied"],
             serde_json::json!(["label=__name__", "filter contains \"M\" (case-sensitive)"])
@@ -1373,7 +1381,11 @@ mod with_mcp {
             serde_json::json!([{"name": "value", "type": "Float64"}])
         );
         assert_eq!(explained["data"]["rows"], serde_json::json!([]));
-        assert!(explained["plan"].as_str().is_some_and(|plan| !plan.is_empty()));
+        assert!(
+            explained["plan"]
+                .as_str()
+                .is_some_and(|plan| !plan.is_empty())
+        );
         assert_eq!(
             explained["budget"]["estimate"]["segments_resolved"],
             serde_json::json!(2)

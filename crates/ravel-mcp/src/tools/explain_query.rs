@@ -790,6 +790,9 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("| [1374](1374-agent-mcp-server.md) |"))
             .expect("the index has a row for ADR-1374");
-        assert!(row.contains("amended 2026-11-02: a Parquet explain"), "{row}");
+        assert!(
+            row.contains("amended 2026-11-02: a Parquet explain"),
+            "{row}"
+        );
     }
 }
