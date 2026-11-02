@@ -2945,7 +2945,7 @@ mod tests {
                 r.rule
                     == "!has(self.maxInflightFlushesPerTenant) || \
                         self.maxInflightFlushesPerTenant <= \
-                        (has(self.maxInflightFlushes) ? self.maxInflightFlushes : 4)"
+                        (has(self.maxInflightFlushes) ? self.maxInflightFlushes : 8)"
             })
             .expect("gateway must carry the exact flush-share rule");
         assert_eq!(
