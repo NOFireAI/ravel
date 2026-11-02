@@ -5367,6 +5367,13 @@ timestamp or interval column, every aggregate's state is integer, temporal or
 `Decimal128` (never float), and the aggregate has no limit, input ordering or
 grouping sets. The rule runs after the bounded top-k rule and before the
 compact-slices rule; `SinglePartitioned` and `Final` aggregates are left alone.
+Because the compact-slices rule wraps only `AggregateExec`, a qualifying
+aggregate under this switch forfeits both halves of that rule: the slice
+compaction, which the exec's owned output batches make redundant, and the
+TopK pre-filter, which they do not. Under `ORDER BY ... LIMIT k` every group
+therefore reaches the sort until the per-bucket top-k of ADR-3565 decision 4
+(#3609) restores the cut one layer down; an A/B on those shapes is read with
+that in mind.
 Each partition first aggregates into one table, as the stock final does. When
 the table reaches the engage threshold (65,536 groups by default) the partition
 routes the table's state and every later input row into 2^bits hash buckets (64
