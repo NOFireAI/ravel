@@ -306,7 +306,10 @@ mod tests {
     /// `encode_attrs` was changed.
     fn golden_inputs() -> Vec<(&'static str, Vec<(String, AttrValue)>)> {
         let nested = AttrValue::Map(vec![
-            ("z".into(), AttrValue::List(vec![s("x"), AttrValue::I64(-7)])),
+            (
+                "z".into(),
+                AttrValue::List(vec![s("x"), AttrValue::I64(-7)]),
+            ),
             ("a".into(), AttrValue::Bytes(vec![0, 255, 1])),
         ]);
         vec![
@@ -349,10 +352,26 @@ mod tests {
     /// input as resource attributes with scope "scope", "1.0" and no scope
     /// attributes), as printed on the base commit.
     const GOLDEN: &[(&str, &str, &str)] = &[
-        ("empty", "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213", "305e0d48bcb4f4a9f22f8cfecbba8d9f"),
-        ("flat", "91e0aa735c3be8c3d0ed77064734444d766480196e4ca3da766a530b4b92af91", "3d082f71b9354f90abcd07ed90c5a2f1"),
-        ("duplicate_keys", "5f92c98f9df2c41a88edbb65f226cbe70fd7124ae84c9e9579e50a1d4abfbc40", "ec9bb286682cd52e62a1d9ba37410c3c"),
-        ("floats_and_nested", "7ce413c8f0fe0a662e5edf4ba9c8aa513855a0ad8539a37325bf0f3723d1bd07", "9e32f30685b12d0575e0af2c53008940"),
+        (
+            "empty",
+            "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213",
+            "305e0d48bcb4f4a9f22f8cfecbba8d9f",
+        ),
+        (
+            "flat",
+            "91e0aa735c3be8c3d0ed77064734444d766480196e4ca3da766a530b4b92af91",
+            "3d082f71b9354f90abcd07ed90c5a2f1",
+        ),
+        (
+            "duplicate_keys",
+            "5f92c98f9df2c41a88edbb65f226cbe70fd7124ae84c9e9579e50a1d4abfbc40",
+            "ec9bb286682cd52e62a1d9ba37410c3c",
+        ),
+        (
+            "floats_and_nested",
+            "7ce413c8f0fe0a662e5edf4ba9c8aa513855a0ad8539a37325bf0f3723d1bd07",
+            "9e32f30685b12d0575e0af2c53008940",
+        ),
     ];
 
     #[test]

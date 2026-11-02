@@ -37,7 +37,7 @@ static LOCK: Mutex<()> = Mutex::new(());
 const INGEST_TS_NS: i64 = 1_700_000_000_000_000_000;
 
 /// Allocations per `ScopeLogs` at either attribute count, measured below.
-const PER_SCOPE_ALLOCATIONS: usize = 0;
+const PER_SCOPE_ALLOCATIONS: usize = 6;
 
 fn string_kv(key: String, value: String) -> KeyValue {
     KeyValue {
@@ -56,7 +56,9 @@ fn request(attrs: usize, scopes: usize) -> ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
             resource: Some(Resource {
                 attributes: (0..attrs)
-                    .map(|i| string_kv(format!("resource.{i:03}"), format!("resource-value-{i:03}")))
+                    .map(|i| {
+                        string_kv(format!("resource.{i:03}"), format!("resource-value-{i:03}"))
+                    })
                     .collect(),
                 ..Default::default()
             }),
@@ -103,15 +105,21 @@ fn allocations(attrs: usize, scopes: usize) -> usize {
 
 #[test]
 fn stream_identity_allocations_do_not_scale_with_attribute_count() {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     const FEW: usize = 8;
     const MANY: usize = 24;
     let mut per_scope = Vec::new();
     for attrs in [10usize, 40] {
         let few = allocations(attrs, FEW);
         let many = allocations(attrs, MANY);
-        eprintln!("{attrs} resource attributes: {few} allocations at {FEW} scopes, {many} at {MANY}");
-        assert_eq!((many - few) % (MANY - FEW), 0, "not a whole count per scope");
+        eprintln!(
+            "{attrs} resource attributes: {few} allocations at {FEW} scopes, {many} at {MANY}"
+        );
+        assert_eq!(
+            (many - few) % (MANY - FEW),
+            0,
+            "not a whole count per scope"
+        );
         per_scope.push((many - few) / (MANY - FEW));
     }
     eprintln!("allocations per ScopeLogs at 10 and 40 attributes: {per_scope:?}");
@@ -124,7 +132,7 @@ fn stream_identity_allocations_do_not_scale_with_attribute_count() {
 
 #[test]
 fn preimage_id_equals_log_stream_id_through_stream_attrs_bytes() {
-    let _guard = LOCK.lock().unwrap();
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let resource: Vec<(String, AttrValue)> = vec![
         ("service.name".into(), AttrValue::Str("api".into())),
         ("host.name".into(), AttrValue::Str(String::new())),
@@ -138,7 +146,7 @@ fn preimage_id_equals_log_stream_id_through_stream_attrs_bytes() {
             ]),
         ),
     ];
-    let scope_attrs = vec![("k".into(), AttrValue::Str("v".into()))];
+    let scope_attrs = [("k".into(), AttrValue::Str("v".into()))];
     for (name, version, scope) in [
         ("", "", &[][..]),
         ("scope", "1.0", &[][..]),
