@@ -846,6 +846,17 @@ mod with_mcp {
         writer_seq: u64,
         samples: &[(i64, f64)],
     ) {
+        publish_series(store, ingest_hour, writer_seq, &[(None, samples)]).await;
+    }
+
+    /// [`publish_samples`] with one series of metric `m` per entry, the entry
+    /// carrying label `k` set to its value when one is given.
+    async fn publish_series(
+        store: &dyn ObjectStoreBackend,
+        ingest_hour: u32,
+        writer_seq: u64,
+        entries: &[(Option<&str>, &[(i64, f64)])],
+    ) {
         use ravel_commit::publish::RetryPolicy;
         use ravel_commit::record::NewCommitRecord;
         use ravel_commit::{keys, publish, record};
@@ -855,19 +866,30 @@ mod with_mcp {
 
         let tenant = TenantId::new(TENANT);
         let tenant_hash = tenant.hash();
-        let labels = LabelSet::new(vec![Label {
-            name: "__name__".to_string(),
-            value: "m".to_string(),
-        }])
-        .expect("valid labels");
-        let series = vec![SeriesInput {
-            series_id: SeriesId::compute(&tenant, "m", &labels).expect("series id"),
-            labels,
-            samples: samples
-                .iter()
-                .map(|&(ts_ns, value)| Sample { ts_ns, value })
-                .collect(),
-        }];
+        let series = entries
+            .iter()
+            .map(|&(k, samples)| {
+                let mut labels = vec![Label {
+                    name: "__name__".to_string(),
+                    value: "m".to_string(),
+                }];
+                if let Some(k) = k {
+                    labels.push(Label {
+                        name: "k".to_string(),
+                        value: k.to_string(),
+                    });
+                }
+                let labels = LabelSet::new(labels).expect("valid labels");
+                SeriesInput {
+                    series_id: SeriesId::compute(&tenant, "m", &labels).expect("series id"),
+                    labels,
+                    samples: samples
+                        .iter()
+                        .map(|&(ts_ns, value)| Sample { ts_ns, value })
+                        .collect(),
+                }
+            })
+            .collect();
         let writer_id = uuid::Uuid::from_u128(2_000);
         let hour_start_ns = i64::from(ingest_hour) * 3_600_000_000_000;
         let written = SegmentWriter::write(
@@ -2472,6 +2494,326 @@ mod with_mcp {
         stamps.sort_unstable();
         assert_eq!(stamps, vec![t0, t1]);
 
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// The lookback `ravel_query_promql` reports in its scope is the one the
+    /// engine applies.
+    ///
+    /// FLIP: a tool constant of 60 s while the engine keeps its 5 m default
+    /// fails here, and the scope line would describe a lookback no query ran
+    /// with.
+    #[test]
+    fn query_promql_reports_the_engines_lookback() {
+        assert_eq!(
+            ravel_mcp::tools::query_promql::LOOKBACK_NS,
+            ravel_promql::DEFAULT_LOOKBACK_NS
+        );
+    }
+
+    /// `ravel_query_promql` through `POST /mcp` in both modes over one series
+    /// of metric `m` holding 1.5 at 60 s, -0.0 at 90 s and NaN at 120 s. The
+    /// instant call at 100 s answers -0.0 stamped with the evaluation time;
+    /// the range call over [60 s, 150 s) with a 30 s step answers the three
+    /// samples at their own steps, in ns strings, and reports the alignment.
+    ///
+    /// FLIP: leaving `ravel_query_promql` off `SERVED_TOOLS`, or its dispatch
+    /// arm on `NotShipped`, makes the first call a protocol error.
+    /// FLIP: handing the engine `end_ns` itself as the closed range end adds
+    /// a fourth step at 150 s carrying the NaN again.
+    /// FLIP: writing a sample value with `serde_json::json!(f64)` instead of
+    /// the cell's serializer turns the NaN into `null`.
+    /// FLIP: the port finishing its own envelope before the tool's caps adds
+    /// each identity warning twice.
+    #[tokio::test]
+    async fn query_promql_answers_both_modes_with_exact_samples() {
+        let (store, metrics) = instrumented_memory();
+        publish_samples(
+            store.as_ref(),
+            0,
+            1,
+            &[
+                (60 * NS_PER_SEC, 1.5),
+                (90 * NS_PER_SEC, -0.0),
+                (120 * NS_PER_SEC, f64::NAN),
+            ],
+        )
+        .await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let (is_error, instant) = call(
+            &client,
+            "ravel_query_promql",
+            serde_json::json!({
+                "query": "m",
+                "evaluation_time": (100 * NS_PER_SEC).to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(is_error, Some(false), "{instant}");
+        assert_eq!(instant["status"], serde_json::json!("ok"), "{instant}");
+        assert_eq!(
+            instant["data"]["rows"].to_string(),
+            r#"[[{"__name__":"m"},{"ts_ns":["100000000000"],"value":[-0.0]}]]"#
+        );
+        assert_eq!(
+            instant["scope"]["time_range"],
+            serde_json::json!({"start_ns": "100000000000", "end_ns": "100000000000"})
+        );
+        assert_eq!(
+            instant["scope"]["predicates_applied"]
+                .as_array()
+                .expect("predicates")[..2],
+            [
+                serde_json::json!("m"),
+                serde_json::json!("instant evaluation at 100000000000 ns"),
+            ]
+        );
+
+        let (is_error, range) = call(
+            &client,
+            "ravel_query_promql",
+            serde_json::json!({
+                "query": "m",
+                "time_range": {
+                    "start_ns": (60 * NS_PER_SEC).to_string(),
+                    "end_ns": (150 * NS_PER_SEC).to_string(),
+                },
+                "step": "30s",
+            }),
+        )
+        .await;
+        assert_eq!(is_error, Some(false), "{range}");
+        assert_eq!(range["status"], serde_json::json!("ok"), "{range}");
+        assert_eq!(
+            range["data"]["rows"].to_string(),
+            r#"[[{"__name__":"m"},{"ts_ns":["60000000000","90000000000","120000000000"],"value":[1.5,-0.0,"NaN"]}]]"#
+        );
+        assert_eq!(
+            range["scope"]["predicates_applied"],
+            serde_json::json!([
+                "m",
+                "steps aligned to time_range.start_ns: 60000000000 + k * 30000000000 ns, every \
+                 step before 150000000000 ns, the last at 120000000000 ns",
+                "lookback 300000000000 ns (5m): an instant selector at step t reads the latest \
+                 sample in (t - 5m, t]",
+            ])
+        );
+
+        for envelope in [&instant, &range] {
+            let warnings = envelope["warnings"].as_array().expect("warnings");
+            let distinct: std::collections::HashSet<&serde_json::Value> = warnings.iter().collect();
+            assert_eq!(distinct.len(), warnings.len(), "{envelope}");
+        }
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// `max_rows` counts series: three series of three steps each under
+    /// `max_rows: 2` answer two whole series, `ok_bounded`, one series
+    /// omitted, and no cursor.
+    ///
+    /// FLIP: capping the port's per-sample rows before grouping them into
+    /// series answers two samples of one series, `ok`.
+    #[tokio::test]
+    async fn query_promql_max_rows_caps_series_and_is_ok_bounded() {
+        let (store, metrics) = instrumented_memory();
+        let samples = [
+            (60 * NS_PER_SEC, 1.0),
+            (90 * NS_PER_SEC, 2.0),
+            (120 * NS_PER_SEC, 3.0),
+        ];
+        publish_series(
+            store.as_ref(),
+            0,
+            1,
+            &[
+                (Some("a"), &samples[..]),
+                (Some("b"), &samples[..]),
+                (Some("c"), &samples[..]),
+            ],
+        )
+        .await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let (is_error, bounded) = call(
+            &client,
+            "ravel_query_promql",
+            serde_json::json!({
+                "query": "m",
+                "time_range": {
+                    "start_ns": (60 * NS_PER_SEC).to_string(),
+                    "end_ns": (150 * NS_PER_SEC).to_string(),
+                },
+                "step": "30s",
+                "max_rows": 2,
+            }),
+        )
+        .await;
+
+        assert_eq!(is_error, Some(false), "{bounded}");
+        assert_eq!(
+            bounded["status"],
+            serde_json::json!("ok_bounded"),
+            "{bounded}"
+        );
+        let rows = bounded["data"]["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 2, "{bounded}");
+        for row in rows {
+            assert_eq!(
+                row[1],
+                serde_json::json!({
+                    "ts_ns": ["60000000000", "90000000000", "120000000000"],
+                    "value": [1.0, 2.0, 3.0],
+                }),
+                "{bounded}"
+            );
+        }
+        assert_eq!(bounded["data"]["row_count"], serde_json::json!(3));
+        assert_eq!(
+            bounded["presentation"]["rows_omitted"],
+            serde_json::json!(1)
+        );
+        assert!(bounded["presentation"]["cursor"].is_null(), "{bounded}");
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// Publish `lines` as one RLOG object of service `api` plus its
+    /// `Signal::Logs` commit record in ingest hour 0, the way log ingest does.
+    async fn publish_log_lines(store: &dyn ObjectStoreBackend, lines: &[(i64, &str)]) {
+        use ravel_commit::publish::RetryPolicy;
+        use ravel_commit::record::NewCommitRecord;
+        use ravel_commit::{keys, publish, record};
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+        use ravel_object_store::PutOptions;
+        use ravel_types::Signal;
+        use ravel_types::logstream::log_stream_id;
+
+        let tenant_hash = TenantId::new(TENANT).hash();
+        let resource = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
+        let writer_id = uuid::Uuid::from_u128(3_000);
+        let mut writer = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.into_bytes(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        for &(ts_ns, body) in lines {
+            writer
+                .push(LogRecord {
+                    stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                    stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                    ts_ns,
+                    observed_ts_ns: ts_ns,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: body.into(),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: Vec::new(),
+                })
+                .expect("push log record");
+        }
+        let bytes = writer.finish().expect("finish rlog object");
+        let min_ts = lines.iter().map(|&(ts, _)| ts).min().expect("a line");
+        let max_ts = lines.iter().map(|&(ts, _)| ts).max().expect("a line");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash: *blake3::hash(&bytes).as_bytes(),
+            sample_count: lines.len() as u64,
+            series_count: 1,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: min_ts,
+            max_ingest_ts_ns: max_ts,
+            segment_format_version: u32::from(ravel_ingest::LOG_SEGMENT_FORMAT_VERSION),
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid log commit record");
+        store
+            .put(
+                &keys::reconstruct_data_key(&rec).expect("data key"),
+                bytes::Bytes::from(bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put log data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish log commit");
+    }
+
+    /// The two log pseudo-metrics through `ravel_query_promql` over a logs
+    /// tenant: three lines of 5, 8 and 5 bytes at 10, 20 and 30 s count 3
+    /// lines and 18 bytes at 60 s.
+    ///
+    /// FLIP: dropping the rows of a query that names a log metric, the result
+    /// a path reading the metrics signal alone gives, answers `[]` for both.
+    #[tokio::test]
+    async fn query_promql_counts_log_lines_and_bytes() {
+        let (store, metrics) = instrumented_memory();
+        publish_log_lines(
+            store.as_ref(),
+            &[
+                (10 * NS_PER_SEC, "alpha"),
+                (20 * NS_PER_SEC, "beta two"),
+                (30 * NS_PER_SEC, "gamma"),
+            ],
+        )
+        .await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        for (query, total) in [
+            ("sum(count_over_time(ravel_log_lines[1h]))", 3.0),
+            ("sum(sum_over_time(ravel_log_bytes[1h]))", 18.0),
+        ] {
+            let (is_error, counted) = call(
+                &client,
+                "ravel_query_promql",
+                serde_json::json!({
+                    "query": query,
+                    "evaluation_time": (60 * NS_PER_SEC).to_string(),
+                }),
+            )
+            .await;
+            assert_eq!(is_error, Some(false), "{counted}");
+            assert_eq!(counted["status"], serde_json::json!("ok"), "{counted}");
+            assert_eq!(
+                counted["data"]["rows"],
+                serde_json::json!([[{}, {"ts_ns": ["60000000000"], "value": [total]}]]),
+                "{query}"
+            );
+        }
+
+        client.cancel().await.expect("client stops");
         running.shutdown().await.expect("server stops");
     }
 }
