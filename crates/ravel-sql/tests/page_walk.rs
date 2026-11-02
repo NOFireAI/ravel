@@ -73,9 +73,10 @@
 //! - one `value` is `0.0`, so a projected `nullif(value, 0)` is NULL for it
 //!   and a projection that shadows a NOT NULL name with a nullable expression
 //!   loses rows;
-//! - one `value` is `-0.0`, which DataFusion holds to be a DIFFERENT value
-//!   from `0.0` (it compares floats by a total order, so `-0.0 = 0` is FALSE
-//!   and `-0.0` sorts first);
+//! - one `value` is `-0.0`, which DataFusion sorts before `0.0` (its sort is
+//!   a total order) but compares EQUAL to it (`-0.0 = 0` is TRUE, since its
+//!   comparison kernels normalise a zero's sign first), while `nullif` does
+//!   not normalise, so `nullif(value, 0)` keeps the `-0.0` row;
 //! - one `value` is NaN, which no cursor can carry, so a page ending on it
 //!   mints no resume position;
 //! - `series_id` is anti-correlated with `ts` at the head of the ordering (the
@@ -180,11 +181,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, DictionaryArray, FixedSizeBinaryArray,
-    Float64Array, Int32Array, Int64Array, MapArray, MapBuilder, RecordBatch, StringArray,
-    StringBuilder, TimestampNanosecondArray, UInt8Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, DictionaryArray, FixedSizeBinaryArray, Float64Array, Int32Array, MapArray,
+    MapBuilder, RecordBatch, StringArray, StringBuilder, TimestampNanosecondArray, UInt8Array,
+    UInt32Array,
 };
-use datafusion::arrow::datatypes::{DataType, Int32Type, TimeUnit};
+use datafusion::arrow::datatypes::Int32Type;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
@@ -194,8 +195,8 @@ use datafusion::sql::sqlparser::ast::{
     Expr as SqlExpr, Ident, OrderBy, OrderByExpr, OrderByKind, OrderByOptions, Statement,
 };
 use ravel_sql::{
-    LOGS_TABLE, NotTotalOrder, PagePlan, PagePlanError, ResumePosition, ResumeValue, SAMPLES_TABLE,
-    logs_schema, plan_page, public_schema,
+    LOGS_TABLE, NotTotalOrder, PagePlan, PagePlanError, ResumePosition, SAMPLES_TABLE, logs_schema,
+    plan_page, public_schema, resume_value,
 };
 
 /// The `ts` the two tied rows share.
@@ -224,9 +225,9 @@ const TIED_HIGH_SERIES_HEX: &str = "02020202020202020202020202020202";
 /// The `value` that a projected `nullif(value, 0)` turns into NULL.
 const NULLING_VALUE: f64 = 0.0;
 
-/// A `value` distinct from [`NULLING_VALUE`] under DataFusion's total float
-/// order: `-0.0 = 0` is FALSE and `-0.0` sorts before `0.0`, so the two zero
-/// rows are two values rather than one repeated.
+/// A `value` that sorts before [`NULLING_VALUE`] under DataFusion's total
+/// float sort order and that `nullif(value, 0)` leaves alone, though
+/// `value = 0` is TRUE for it.
 const NEGATIVE_ZERO: f64 = -0.0;
 
 /// A `ts` distinct from [`TIED_TS`], on the row carrying [`NULLING_VALUE`].
@@ -589,107 +590,6 @@ fn reference_statement(sql: &str, plan: &PagePlan) -> String {
     query.to_string()
 }
 
-/// The resume value for one order-term column of one row, or `None` when that
-/// value is NULL.
-///
-/// A NULL is not a resume value ([`ResumeValue`] has no NULL variant, because
-/// every comparison against NULL is NULL), so a walk that reaches one cannot
-/// continue. That is itself a finding, and [`walk`] reports it rather than
-/// treating the walk as finished.
-fn resume_value(array: &ArrayRef, index: usize) -> Option<ResumeValue> {
-    if array.is_null(index) {
-        return None;
-    }
-    let value = match array.data_type() {
-        DataType::Timestamp(TimeUnit::Nanosecond, None) => ResumeValue::TimestampNanos(
-            array
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .expect("timestamp array")
-                .value(index),
-        ),
-        DataType::Float64 => ResumeValue::Float(
-            array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .expect("float array")
-                .value(index),
-        ),
-        DataType::Int64 => ResumeValue::Int(
-            array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("int64 array")
-                .value(index),
-        ),
-        DataType::Int32 => ResumeValue::Int(i64::from(
-            array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("int32 array")
-                .value(index),
-        )),
-        DataType::UInt64 => ResumeValue::UInt(
-            array
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .expect("uint64 array")
-                .value(index),
-        ),
-        DataType::UInt8 => ResumeValue::UInt(u64::from(
-            array
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .expect("uint8 array")
-                .value(index),
-        )),
-        DataType::UInt32 => ResumeValue::UInt(u64::from(
-            array
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .expect("uint32 array")
-                .value(index),
-        )),
-        DataType::Boolean => ResumeValue::Bool(
-            array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .expect("boolean array")
-                .value(index),
-        ),
-        DataType::Utf8 => ResumeValue::Str(
-            array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("string array")
-                .value(index)
-                .to_string(),
-        ),
-        DataType::FixedSizeBinary(_) => ResumeValue::FixedSizeBinary(
-            array
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .expect("fixed size binary array")
-                .value(index)
-                .to_vec(),
-        ),
-        DataType::Binary => ResumeValue::Binary(
-            array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .expect("binary array")
-                .value(index)
-                .to_vec(),
-        ),
-        // Reachable only from a plan that claimed a total order over a term no
-        // cursor can carry, which `plan_page` now refuses outright
-        // (`OrderTermNotRepresentable`). It stays as the harness's own last
-        // check on that refusal.
-        other => panic!("no resume value for an order term of type {other}"),
-    };
-    Some(value)
-}
-
 /// What an executed walk found.
 struct Walk {
     /// The rows each non-empty page returned, in page order. The terminating
@@ -744,17 +644,28 @@ async fn walk(ctx: &SessionContext, sql: &str) -> Walk {
             let column = batch
                 .column_by_name(&term.column)
                 .unwrap_or_else(|| panic!("page of {sql:?} does not carry {:?}", term.column));
-            match resume_value(column, offset) {
-                Some(value) => tuple.push(value),
-                None => {
-                    page_rows.push(page);
-                    return Walk {
-                        page_rows,
-                        pages,
-                        stopped_at_null: Some(term.column.clone()),
-                    };
-                }
+            // A NULL is not a resume value, so a walk that reaches one cannot
+            // continue. That is itself a finding, reported rather than treated
+            // as the walk finishing.
+            if column.is_null(offset) {
+                page_rows.push(page);
+                return Walk {
+                    page_rows,
+                    pages,
+                    stopped_at_null: Some(term.column.clone()),
+                };
             }
+            // `None` on a non-NULL cell is reachable only from a plan that
+            // claimed a total order over a term no cursor can carry, which
+            // `plan_page` refuses (`OrderTermNotRepresentable`).
+            let value = resume_value(column.as_ref(), offset).unwrap_or_else(|| {
+                panic!(
+                    "no resume value for order term {:?} of type {}",
+                    term.column,
+                    column.data_type(),
+                )
+            });
+            tuple.push(value);
         }
         page_rows.push(page);
         resume = Some(ResumePosition::new(tuple));
@@ -1279,9 +1190,9 @@ async fn the_fixture_can_expose_a_broken_keyset_predicate() {
         "rows sharing one series_id",
     );
 
-    // One, not two: DataFusion compares floats by a total order, so `-0.0 = 0`
-    // is FALSE and only the positive zero is NULLed. Measured, not assumed:
-    // `SELECT value, value = 0 FROM samples` returns false for the `-0.0` row.
+    // One, not two: `nullif` compares without normalising a zero's sign, so
+    // only the positive zero is NULLed, although `value = 0` is TRUE for both
+    // zero rows (the comparison below).
     let nulled = rows_of(
         &execute(
             &ctx,
@@ -1294,17 +1205,11 @@ async fn the_fixture_can_expose_a_broken_keyset_predicate() {
         vec![vec!["1".to_string()]],
         "rows a projected nullif(value, 0) nulls",
     );
-    let zeroes = rows_of(
-        &execute(
-            &ctx,
-            "SELECT count(*) AS n FROM samples WHERE value = 0 OR value = -0.0",
-        )
-        .await,
-    );
+    let zeroes = rows_of(&execute(&ctx, "SELECT count(*) AS n FROM samples WHERE value = 0").await);
     assert_eq!(
         zeroes,
         vec![vec!["2".to_string()]],
-        "the two zero rows are distinct values, not one repeated",
+        "rows `value = 0` holds for: both zero signs",
     );
 
     let distinct_identity = rows_of(
