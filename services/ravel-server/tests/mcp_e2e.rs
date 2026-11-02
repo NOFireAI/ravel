@@ -1609,7 +1609,10 @@ mod with_mcp {
             serde_json::json!("1")
         );
         assert_eq!(two["visibility"]["pinned"], serde_json::json!(true));
-        assert_eq!(two["visibility"]["snapshot_id"], one["visibility"]["snapshot_id"]);
+        assert_eq!(
+            two["visibility"]["snapshot_id"],
+            one["visibility"]["snapshot_id"]
+        );
 
         let (is_error, three) = call(
             &client,
@@ -1625,7 +1628,10 @@ mod with_mcp {
             three["visibility"]["ingest_watermark_hour"],
             serde_json::json!("1")
         );
-        assert_eq!(three["visibility"]["snapshot_id"], one["visibility"]["snapshot_id"]);
+        assert_eq!(
+            three["visibility"]["snapshot_id"],
+            one["visibility"]["snapshot_id"]
+        );
 
         let mut served = family_names(&one);
         served.extend(family_names(&two));

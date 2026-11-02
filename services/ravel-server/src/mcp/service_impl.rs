@@ -38,10 +38,10 @@
 
 use std::time::Duration;
 
+use ravel_catalog::MetricKind;
 use ravel_mcp::budget::McpEffectiveBudgets;
 use ravel_mcp::draft::{Draft, EstimateComponent, ExplainColumn, ExplainOutcome, cursor_signal};
 use ravel_mcp::envelope::{AnyJson, Cell, Envelope, Failure};
-use ravel_catalog::MetricKind;
 use ravel_mcp::service::{
     DescribeOutcome, DescribeRequest, DescribedColumn, DescribedCoverage, DescribedFamily,
     QueryBackend, TraceLookupRequest,

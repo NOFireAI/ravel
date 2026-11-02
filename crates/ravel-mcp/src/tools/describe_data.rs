@@ -70,9 +70,7 @@ pub async fn run<B: QueryBackend>(args: Value, ctx: &ToolContext<'_>, backend: &
     let argument_hash = argument_hash(&input.signal);
     match input.cursor {
         None => first_page(signal, &input.signal, argument_hash, ctx, backend).await,
-        Some(token) => {
-            later_page(signal, &input.signal, &token, argument_hash, ctx, backend).await
-        }
+        Some(token) => later_page(signal, &input.signal, &token, argument_hash, ctx, backend).await,
     }
 }
 
@@ -153,14 +151,11 @@ async fn later_page<B: QueryBackend>(
         .iter()
         .map(|predicate| (signal, predicate.clone()))
         .collect();
-    let confirmed = match pending.confirm(
-        ctx.now_ns,
-        &observed_erasure,
-        &outcome.declared_column_set,
-    ) {
-        Ok(confirmed) => confirmed,
-        Err(error) => return refused(error.failure(), ctx),
-    };
+    let confirmed =
+        match pending.confirm(ctx.now_ns, &observed_erasure, &outcome.declared_column_set) {
+            Ok(confirmed) => confirmed,
+            Err(error) => return refused(error.failure(), ctx),
+        };
 
     let mut envelope = base(name, &outcome, family_rows(&outcome), ctx);
     envelope.warnings.push(format!(
@@ -240,7 +235,9 @@ fn finish(
     budgets.max_rows = u32::try_from(draft.envelope.data.rows.len()).unwrap_or(u32::MAX);
     draft.finish_page(&budgets, scope, PageOrder::Total, |pins, last| {
         let position = CursorPosition::Keyset {
-            tuple: family_name(last).map(|name| name.as_bytes().to_vec()).unwrap_or_default(),
+            tuple: family_name(last)
+                .map(|name| name.as_bytes().to_vec())
+                .unwrap_or_default(),
             order_by: vec![ORDER_BY.to_string()],
         };
         pins.cursor(TOOL, argument_hash, position, i64::MAX).mint(
@@ -352,7 +349,11 @@ fn row(kind: &str, name: &str, value: Value) -> Row {
         Value::Object(map) => Cell::Map(map),
         other => Cell::Str(other.to_string()),
     };
-    vec![Cell::Str(kind.to_string()), Cell::Str(name.to_string()), value]
+    vec![
+        Cell::Str(kind.to_string()),
+        Cell::Str(name.to_string()),
+        value,
+    ]
 }
 
 fn column(name: &str, r#type: &str) -> Column {
@@ -553,16 +554,15 @@ mod tests {
         );
 
         let ctx_two = later(&ctx);
-        let two = call(json!({"signal": "metrics", "cursor": token}), &ctx_two, &backend);
+        let two = call(
+            json!({"signal": "metrics", "cursor": token}),
+            &ctx_two,
+            &backend,
+        );
         assert_eq!(two.status, Status::OkPage);
         assert!(two.visibility.pinned);
         assert_eq!(family_names(&two), names(100..200));
-        assert!(
-            two.data
-                .rows
-                .iter()
-                .all(|row| family_name(row).is_some())
-        );
+        assert!(two.data.rows.iter().all(|row| family_name(row).is_some()));
         let three = call(
             json!({"signal": "metrics", "cursor": cursor_of(&two)}),
             &ctx_two,
@@ -744,7 +744,11 @@ mod tests {
     fn the_keyset_position_is_the_last_name_byte_for_byte() {
         let key = key();
         let ctx = test_context(&key);
-        let page = vec!["Zeta".to_string(), "alpha".to_string(), "\u{e9}t\u{e9}".to_string()];
+        let page = vec![
+            "Zeta".to_string(),
+            "alpha".to_string(),
+            "\u{e9}t\u{e9}".to_string(),
+        ];
         let backend = stub(vec![
             outcome(&page, true, ctx.now_ns),
             outcome(&[], false, ctx.now_ns),
@@ -862,10 +866,7 @@ mod tests {
             &backend,
         );
         for page in [&one, &two] {
-            assert!(
-                page.warnings
-                    .contains(&UNCOUNTED_READS_WARNING.to_string())
-            );
+            assert!(page.warnings.contains(&UNCOUNTED_READS_WARNING.to_string()));
             assert_eq!(
                 page.budget.effective.0,
                 json!({
