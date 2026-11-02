@@ -84,12 +84,17 @@ fn uniform_record(i: u64, stream_attrs: &[u8]) -> LogRecord {
 /// is setup, not the flush.
 fn flush_uniform(rows: u64) -> stats_alloc::Stats {
     let stream_attrs = stream_attrs_bytes(
-        &[("service.name".to_string(), AttrValue::Str("svc".to_string()))],
+        &[(
+            "service.name".to_string(),
+            AttrValue::Str("svc".to_string()),
+        )],
         "scope",
         "1",
         &[],
     );
-    let records: Vec<LogRecord> = (0..rows).map(|i| uniform_record(i, &stream_attrs)).collect();
+    let records: Vec<LogRecord> = (0..rows)
+        .map(|i| uniform_record(i, &stream_attrs))
+        .collect();
     let batch = ColumnarLogBatch::try_from_records(&records).expect("batch");
     let mut w = RlogWriter::new(RlogConfig::default(), identity());
     w.push_columnar(batch).expect("push_columnar");
@@ -198,7 +203,10 @@ fn sparse_record(i: u64, stream_attrs: &[u8]) -> LogRecord {
 
 fn flush_sparse(rows: u64) -> stats_alloc::Stats {
     let stream_attrs = stream_attrs_bytes(
-        &[("service.name".to_string(), AttrValue::Str("svc".to_string()))],
+        &[(
+            "service.name".to_string(),
+            AttrValue::Str("svc".to_string()),
+        )],
         "scope",
         "1",
         &[],
