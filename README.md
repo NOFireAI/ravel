@@ -544,9 +544,10 @@ runtime `--mcp` flag, both off by default: build with the feature, then pass
 reachable from outside localhost) to mount `POST /mcp` on the query router.
 The published image built from `main` compiles the feature in, so with that
 image you only pass the flag.
-Two tools are served today, `ravel_capabilities` and `ravel_get_trace` (whose
-`time_range` is optional: omitted, it reads every span the tenant retains);
-the other seven are catalogued and refuse calls until their bodies land.
+Four tools are served today, `ravel_capabilities`, `ravel_find_labels`,
+`ravel_explain_query` and `ravel_get_trace` (whose `time_range` is optional:
+omitted, it reads every span the tenant retains); the other five are
+catalogued and refuse calls until their bodies land.
 
 ## Container images
 

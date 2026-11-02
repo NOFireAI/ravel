@@ -48,16 +48,8 @@ fn request(args: Value) -> Result<TraceLookupRequest, Failure> {
     let trace_id = parse_trace_id(&input.trace_id)?;
     let window = input
         .time_range
-        .map(|range| {
-            let start_ns = parse_ns("time_range.start_ns", &range.start_ns)?;
-            let end_ns = parse_ns("time_range.end_ns", &range.end_ns)?;
-            if start_ns > end_ns {
-                return Err(invalid(
-                    "time_range.start_ns must not be after time_range.end_ns".to_string(),
-                ));
-            }
-            Ok(ravel_types::TimeRange { start_ns, end_ns })
-        })
+        .as_ref()
+        .map(crate::time::window)
         .transpose()?;
     Ok(TraceLookupRequest { trace_id, window })
 }
@@ -75,11 +67,6 @@ fn parse_trace_id(raw: &str) -> Result<[u8; 16], Failure> {
         *out = (hi << 4 | lo) as u8;
     }
     Ok(id)
-}
-
-fn parse_ns(name: &str, raw: &str) -> Result<i64, Failure> {
-    raw.parse::<i64>()
-        .map_err(|_| invalid(format!("{name} {raw:?} is not an integer nanosecond epoch")))
 }
 
 fn invalid(message: String) -> Failure {
@@ -118,6 +105,27 @@ mod tests {
             Some(ravel_types::TimeRange {
                 start_ns: 7,
                 end_ns: 9
+            })
+        );
+    }
+
+    /// FLIP: a get_trace that kept its own decimal-only parser instead of
+    /// `crate::time` refuses this RFC 3339 window as `invalid_argument`.
+    #[test]
+    fn an_rfc3339_time_range_is_the_same_window_as_its_decimal_form() {
+        let request = request(json!({
+            "trace_id": "00112233445566778899aabbccddeeff",
+            "time_range": {
+                "start_ns": "2026-09-12T10:00:00Z",
+                "end_ns": "2026-09-12T10:00:00.5Z",
+            },
+        }))
+        .expect("valid arguments");
+        assert_eq!(
+            request.window,
+            Some(ravel_types::TimeRange {
+                start_ns: 1_789_207_200_000_000_000,
+                end_ns: 1_789_207_200_500_000_000,
             })
         );
     }

@@ -14,6 +14,8 @@
 
 pub mod agents;
 pub mod capabilities;
+pub mod explain_query;
+pub mod find_labels;
 pub mod get_trace;
 
 use crate::budget::McpEffectiveBudgets;
@@ -68,7 +70,12 @@ pub enum ToolError {
 /// call. `dispatch_routes_every_catalog_name_and_refuses_unknown_names` pins
 /// this list against what `dispatch` does, so adding a body without adding it
 /// here fails the test rather than under-reporting the surface.
-pub const SERVED_TOOLS: &[&str] = &["ravel_capabilities", "ravel_get_trace"];
+pub const SERVED_TOOLS: &[&str] = &[
+    "ravel_capabilities",
+    "ravel_find_labels",
+    "ravel_explain_query",
+    "ravel_get_trace",
+];
 
 /// Route one tool call to its body.
 ///
@@ -83,8 +90,8 @@ pub async fn dispatch<B: QueryBackend>(
     match name {
         "ravel_capabilities" => Ok(capabilities::run(args, ctx)),
         "ravel_describe_data" => Err(ToolError::NotShipped("ravel_describe_data")),
-        "ravel_find_labels" => Err(ToolError::NotShipped("ravel_find_labels")),
-        "ravel_explain_query" => Err(ToolError::NotShipped("ravel_explain_query")),
+        "ravel_find_labels" => Ok(find_labels::run(args, ctx, backend).await),
+        "ravel_explain_query" => Ok(explain_query::run(args, ctx, backend).await),
         "ravel_query_sql" => Err(ToolError::NotShipped("ravel_query_sql")),
         "ravel_query_promql" => Err(ToolError::NotShipped("ravel_query_promql")),
         "ravel_search_logs" => Err(ToolError::NotShipped("ravel_search_logs")),
@@ -209,6 +216,126 @@ mod tests {
         }
     }
 
+    /// A backend whose `sql_explain`, `labels` and `label_values` answer what
+    /// the test configured and record the request they were handed. Every
+    /// other method, and either of those left unconfigured, panics: a test
+    /// built on it proves the body never reached that call.
+    /// One metadata call: the request, and for `label_values` the label name
+    /// and the `include_log_metric_names` flag.
+    pub(crate) type MetadataCall = (MetadataRequest, Option<(String, bool)>);
+
+    #[derive(Default)]
+    pub(crate) struct Stub {
+        pub(crate) explain: Option<crate::draft::ExplainOutcome>,
+        pub(crate) listed: Option<Envelope>,
+        pub(crate) explained: std::cell::RefCell<Vec<ravel_sql::SqlRequest>>,
+        pub(crate) metadata: std::cell::RefCell<Vec<MetadataCall>>,
+    }
+
+    impl Stub {
+        fn listed(&self, method: &str) -> Result<Envelope, Failure> {
+            match &self.listed {
+                Some(envelope) => Ok(envelope.clone()),
+                None => panic!("{method} must not be reached"),
+            }
+        }
+    }
+
+    impl QueryBackend for Stub {
+        async fn promql_instant(
+            &self,
+            _tenant_hash: TenantHash,
+            _request: &InstantRequest,
+        ) -> Result<Envelope, Failure> {
+            panic!("promql_instant must not be reached")
+        }
+
+        async fn promql_range(
+            &self,
+            _tenant_hash: TenantHash,
+            _request: &RangeRequest,
+        ) -> Result<Envelope, Failure> {
+            panic!("promql_range must not be reached")
+        }
+
+        async fn labels(
+            &self,
+            _tenant_hash: TenantHash,
+            request: &MetadataRequest,
+        ) -> Result<Envelope, Failure> {
+            let listed = self.listed("labels");
+            self.metadata.borrow_mut().push((request.clone(), None));
+            listed
+        }
+
+        async fn label_values(
+            &self,
+            _tenant_hash: TenantHash,
+            request: &MetadataRequest,
+            name: &str,
+            include_log_metric_names: bool,
+        ) -> Result<Envelope, Failure> {
+            let listed = self.listed("label_values");
+            self.metadata.borrow_mut().push((
+                request.clone(),
+                Some((name.to_string(), include_log_metric_names)),
+            ));
+            listed
+        }
+
+        async fn series(
+            &self,
+            _tenant_hash: TenantHash,
+            _request: &MetadataRequest,
+        ) -> Result<Envelope, Failure> {
+            panic!("series must not be reached")
+        }
+
+        async fn analytics(
+            &self,
+            _tenant_hash: TenantHash,
+            _request: &AnyJson,
+        ) -> Result<Envelope, Failure> {
+            panic!("analytics must not be reached")
+        }
+
+        async fn exemplars(
+            &self,
+            _tenant_hash: TenantHash,
+            _request: &AnyJson,
+        ) -> Result<Envelope, Failure> {
+            panic!("exemplars must not be reached")
+        }
+
+        async fn sql_execute(
+            &self,
+            _tenant_hash: TenantHash,
+            _request: &ravel_sql::SqlRequest,
+        ) -> Result<crate::draft::Draft, Failure> {
+            panic!("sql_execute must not be reached")
+        }
+
+        async fn trace_lookup(
+            &self,
+            _tenant_hash: TenantHash,
+            _request: &crate::service::TraceLookupRequest,
+        ) -> Result<Envelope, Failure> {
+            panic!("trace_lookup must not be reached")
+        }
+
+        async fn sql_explain(
+            &self,
+            _tenant_hash: TenantHash,
+            request: &ravel_sql::SqlRequest,
+        ) -> Result<crate::draft::ExplainOutcome, Failure> {
+            let Some(outcome) = &self.explain else {
+                panic!("sql_explain must not be reached");
+            };
+            self.explained.borrow_mut().push(request.clone());
+            Ok(outcome.clone())
+        }
+    }
+
     pub(crate) fn test_context(key: &CursorKey) -> ToolContext<'_> {
         ToolContext {
             tenant_hash: TenantId::new("acme").hash(),
@@ -221,17 +348,14 @@ mod tests {
         }
     }
 
-    /// Every name in the catalog reaches `dispatch`, and `dispatch` refuses
-    /// anything else. The counts are exact on purpose: the seven bodies that
-    /// land in #1380 and #1382 must each answer `NotShipped` today rather than
-    /// a placeholder envelope, and the two bodies this build carries must
-    /// answer an envelope.
     /// Drive a future that is ready on its first poll, so this crate needs no
     /// async runtime to test dispatch. Every path `dispatch` takes in this
-    /// build is immediate: `ravel_capabilities` reads no store,
-    /// `ravel_get_trace` refuses an empty argument object before reaching its
-    /// backend, and the seven refusals return before awaiting anything.
-    fn block_on<F: Future>(future: F) -> F::Output {
+    /// build on an empty argument object is immediate: `ravel_capabilities`
+    /// reads no store, the three query bodies refuse an empty argument object
+    /// before reaching their backend, and the five refusals return before
+    /// awaiting anything. The stub backends in this crate's tests answer
+    /// without awaiting too.
+    pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = pin!(future);
         match future
             .as_mut()
@@ -242,6 +366,11 @@ mod tests {
         }
     }
 
+    /// Every name in the catalog reaches `dispatch`, and `dispatch` refuses
+    /// anything else. The counts are exact on purpose: the five bodies not in
+    /// this build must each answer `NotShipped` rather than a placeholder
+    /// envelope, and the four bodies this build carries must answer an
+    /// envelope.
     #[test]
     fn dispatch_routes_every_catalog_name_and_refuses_unknown_names() {
         let key = CursorKey::from_process_secret([7u8; CURSOR_KEY_LEN]);
@@ -264,6 +393,16 @@ mod tests {
                     );
                     served.push(name);
                 }
+                Ok(envelope) if name == "ravel_find_labels" || name == "ravel_explain_query" => {
+                    // Served, and an empty argument object has no time_range
+                    // (and, for explain, no query): D4's missing_argument.
+                    assert_eq!(envelope.status, crate::envelope::Status::Error);
+                    assert_eq!(
+                        envelope.failure.map(|failure| failure.class),
+                        Some(crate::envelope::FailureClass::MissingArgument)
+                    );
+                    served.push(name);
+                }
                 Ok(envelope) => {
                     assert_eq!(envelope.status, crate::envelope::Status::Ok);
                     served.push(name);
@@ -282,10 +421,12 @@ mod tests {
             served,
             vec![
                 "ravel_capabilities".to_string(),
+                "ravel_find_labels".to_string(),
+                "ravel_explain_query".to_string(),
                 "ravel_get_trace".to_string()
             ]
         );
-        assert_eq!(not_shipped.len(), 7);
+        assert_eq!(not_shipped.len(), 5);
 
         // What `ravel_capabilities` reports is the same split, name for name:
         // `enabled` is what dispatch runs, `catalogued` is what it refuses. A

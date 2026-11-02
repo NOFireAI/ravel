@@ -414,7 +414,9 @@ tenant ceiling, and the caller value. A caller can lower `deadline`,
 `ravel_explain_query` returns the estimate beside the effective budget. When
 the estimate exceeds the budget, the tool returns
 `budget_estimate_exceeds_ceiling` and the factor to narrow by. An `unknown`
-estimate component is not zero and does not pass. Retries and snapshot
+estimate component is not zero and does not pass (scoped by the 2026-09-12
+amendment, and narrowed for Parquet tables by the Parquet explain amendment
+below). Retries and snapshot
 re-resolution run inside the same deadline and their cost is added.
 Enforcement is process-local. The fleet concurrency ceiling is the only
 cross-replica control, and the envelope says so. Usage is reported as
@@ -736,7 +738,8 @@ against the 256 KiB `max_response_bytes` floor.
    reading of the rule refuses every logs explain, on the signal an agent
    most needs. The shipped adapter already reports each unbounded component
    as a warning and performs no comparison at all, so this corrects a rule
-   that has never had an implementation.
+   that has never had an implementation. The Parquet explain amendment
+   below narrows this item for Parquet tables.
 2. D2: `ravel_explain_query` is SQL-only in its first shipped phase. A
    statement that fails SQL validation returns the `validation` class with
    the engine's own text, and a `next_steps` entry naming
@@ -947,7 +950,8 @@ D2 changes in two places:
    no authority stands.
 2. The 24 KiB bound covers the combined catalog. Measured, `tools/list` is
    15,700 bytes with the nine tools and 23,589 bytes with all fifteen,
-   against the 24,576-byte budget; both figures are pinned in
+   against the 24,576-byte budget (the Parquet explain amendment below
+   restates both); both figures are pinned in
    `services/ravel-server/tests/mcp_agents_e2e.rs`.
 
 D7 changes in two places:
@@ -977,3 +981,53 @@ rule (`refuse_cross_signal` in `crates/ravel-sql/src/executor.rs`). The
 MCP adapter calls the HTTP-path executor, so `ravel_query_sql` admits a
 join; ADR-2904's #2915 amendment records that the one-table refusal
 decision 9 promised for the MCP tools is owed by whoever ships them.
+
+## Amendment (2026-11-02): a Parquet explain names its unbounded figures and does not refuse
+
+<!-- amendment-applies: sections="D6. Budgets|Consequences" pointer="Parquet explain amendment" -->
+<!-- amendment-supersedes: phrase="15,700 bytes" pointer="Parquet explain amendment" -->
+<!-- amendment-supersedes: phrase="23,589 bytes" pointer="Parquet explain amendment" -->
+
+The 2026-09-12 amendment's item 1 says an unknown estimate component that
+has a budget ceiling fails the comparison. For a Parquet table that rule
+refuses every explain, and the refusal protects nothing, so it is narrowed
+for Parquet tables.
+
+1. On a Parquet table, `estimated_requests` and `estimated_store_bytes` are
+   unbounded and both have ceilings (`max_store_requests` and
+   `max_bytes_scanned`). The estimator fills them from the manifests for a
+   cold cache and a full scan, and neither bounds the query: an uncached
+   footer or column chunk costs requests beyond the one per file it counts,
+   and a range read again after eviction costs store bytes it already
+   counted once (`unbounded_estimate_components` in
+   `crates/ravel-sql/src/executor.rs`, its doc at line 1453 and its body at
+   lines 1461 to 1481).
+2. Explain runs no scan, and the Parquet reader enforces both ceilings at
+   scan time: `ReadLimits::admit` counts each store request and the wire
+   bytes of its body against `max_s3_requests` and `max_bytes_scanned`, and
+   refuses the request that would cross either before it is issued
+   (`crates/ravel-parquet/src/limits.rs`, module doc lines 14 to 24, `admit`
+   at line 171).
+3. So `ravel_explain_query` on a Parquet table names both components
+   unbounded, reports `estimate_is_upper_envelope: false`, adds a warning
+   that the ceiling is not checked by the explain and that the reader
+   enforces it at scan time, and does not refuse. An unbounded component
+   with a ceiling on any other table still refuses with
+   `budget_estimate_exceeds_ceiling`, and an unbounded component with no
+   ceiling (`estimated_decompressed_bytes` on every table but `samples`)
+   still names it unbounded and passes.
+
+The D6 comparison the tool ships is: `estimated_requests` against
+`max_store_requests`, `estimated_store_bytes` against `max_bytes_scanned`,
+and `segments_admitted` against `max_segments`. Recent-exempt segments are
+not admitted and do not count, as the engine's own segment budget does not
+count them. When any bounded figure exceeds its ceiling, the narrowing
+factor is the largest ratio of figure to ceiling over the dimensions that
+exceed, not their sum.
+
+Shipping the explain changed its catalog description to name SQL only, and
+`ravel_find_labels` no longer declares `evidence_ref` (2026-09-13 item 2).
+`tools/list` is now 15,648 bytes with the nine tools and 23,537 bytes with
+all fifteen, against the 24,576-byte budget; both figures are pinned in
+`crates/ravel-mcp/src/catalog.rs` and
+`services/ravel-server/tests/mcp_agents_e2e.rs`.
