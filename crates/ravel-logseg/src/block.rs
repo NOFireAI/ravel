@@ -427,9 +427,13 @@ struct OwnedStrings {
 }
 
 impl OwnedStrings {
-    fn new<'a>(values: impl Iterator<Item = &'a [u8]>) -> Self {
-        let mut bytes = Vec::new();
-        let mut ends = Vec::new();
+    /// `values` must be cheap to clone (both callers pass a slice iterator),
+    /// so the total byte length is summed up front and `bytes` and `ends` are
+    /// allocated once each, instead of regrowing as the loop below copies.
+    fn new<'a>(values: impl ExactSizeIterator<Item = &'a [u8]> + Clone) -> Self {
+        let total: usize = values.clone().map(<[u8]>::len).sum();
+        let mut bytes = Vec::with_capacity(total);
+        let mut ends = Vec::with_capacity(values.len());
         for v in values {
             bytes.extend_from_slice(v);
             ends.push(bytes.len());

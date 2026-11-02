@@ -1712,11 +1712,17 @@ impl RlogWriter {
             blk_indexed_ends.clear();
             blk_stat.clear();
             blk_stat_ends.clear();
+            // Seeded from the previous row's final length, not from
+            // `b.dyn_columns.len()`: a wide sparse batch has far more declared
+            // columns than any one row has present, and sizing from the batch
+            // width would multiply columns by rows against the per-block peak
+            // this copy bounds (#682).
+            let mut prev_cols_len: usize = 0;
             for &grow in block_rows {
                 let bi = g_batch[grow] as usize;
                 let b = &batches[bi];
                 let local = grow - bases[bi];
-                let mut cols: Vec<(u32, ColumnValue)> = Vec::new();
+                let mut cols: Vec<(u32, ColumnValue)> = Vec::with_capacity(prev_cols_len);
                 stamp.begin();
                 for (ci, c) in b.dyn_columns.iter().enumerate() {
                     if !c.validity.get(local) {
@@ -1764,6 +1770,7 @@ impl RlogWriter {
                 }
                 blk_indexed_ends.push(blk_indexed.len() as u32);
                 blk_stat_ends.push(blk_stat.len() as u32);
+                prev_cols_len = cols.len();
                 blk_cols.push(cols);
             }
             if let Some(plan) = key_plan.as_mut() {
