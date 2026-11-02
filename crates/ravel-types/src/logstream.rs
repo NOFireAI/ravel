@@ -10,6 +10,8 @@
 //! requires a new domain string (`ravel-logstream-v2`), never an in-place
 //! edit.
 
+use std::ops::Range;
+
 /// An OTLP attribute value. Lists and maps nest; maps are canonicalized like
 /// the top-level attribute set (entries sorted, values type-tagged).
 #[derive(Clone, Debug, PartialEq)]
@@ -111,33 +113,73 @@ fn encode_value(out: &mut Vec<u8>, value: &AttrValue) {
 /// prefixed fields (as [`log_stream_id`] does) is an injective mapping and
 /// cannot alias two distinct logical inputs.
 fn encode_attrs(out: &mut Vec<u8>, attrs: &[(String, AttrValue)]) {
-    let mut items: Vec<(&str, Vec<u8>)> = attrs
-        .iter()
-        .map(|(k, v)| {
-            let mut encoded = Vec::new();
-            encode_value(&mut encoded, v);
-            (k.as_str(), encoded)
-        })
-        .collect();
-    items.sort_by(|a, b| {
+    // Every value goes into one scratch buffer; entries remember only their
+    // range in it, so the set costs a fixed number of allocations however
+    // many attributes it holds.
+    let mut scratch = Vec::with_capacity(estimated_encoded_len(attrs));
+    let mut entries: Vec<(&str, Range<usize>)> = Vec::with_capacity(attrs.len());
+    for (key, value) in attrs {
+        let start = scratch.len();
+        encode_value(&mut scratch, value);
+        entries.push((key.as_str(), start..scratch.len()));
+    }
+    entries.sort_by(|a, b| {
         a.0.as_bytes()
             .cmp(b.0.as_bytes())
-            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| scratch[a.1.clone()].cmp(&scratch[b.1.clone()]))
     });
-    put_uvarint(out, items.len() as u64);
-    for (key, encoded) in items {
+    put_uvarint(out, entries.len() as u64);
+    for (key, range) in entries {
         put_uvarint(out, key.len() as u64);
         out.extend_from_slice(key.as_bytes());
-        out.extend_from_slice(&encoded);
+        out.extend_from_slice(&scratch[range]);
     }
+}
+
+/// A cheap capacity hint for the encoding of `attrs`: exact for strings,
+/// a small guess for everything else. It only sizes buffers, never output.
+fn estimated_encoded_len(attrs: &[(String, AttrValue)]) -> usize {
+    attrs
+        .iter()
+        .map(|(key, value)| {
+            let value_len = match value {
+                AttrValue::Str(s) => s.len() + 2,
+                AttrValue::Bytes(b) => b.len() + 2,
+                _ => 10,
+            };
+            key.len() + 1 + value_len
+        })
+        .sum::<usize>()
+        + 5
 }
 
 /// Canonical byte encoding of an attribute set (frozen contract, ADR-0029).
 /// See [`encode_attrs`] for the grammar.
 pub fn canonical_attr_bytes(attrs: &[(String, AttrValue)]) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(estimated_encoded_len(attrs));
     encode_attrs(&mut out, attrs);
     out
+}
+
+/// The domain string of the stream identity hash (ADR-0029). Changing it is a
+/// format change.
+const LOG_STREAM_DOMAIN: &[u8] = b"ravel-logstream-v1";
+
+/// Computes the [`LogStreamId`] from the hash preimage: the first 16 bytes of
+/// `blake3("ravel-logstream-v1" || preimage)`. For the preimage
+/// `ravel_logseg::stream_attrs_bytes` builds, this equals [`log_stream_id`]
+/// for the same resource and scope.
+pub fn log_stream_id_from_preimage(preimage: &[u8]) -> LogStreamId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(LOG_STREAM_DOMAIN);
+    hasher.update(preimage);
+    stream_id_from_digest(&hasher.finalize())
+}
+
+fn stream_id_from_digest(digest: &blake3::Hash) -> LogStreamId {
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest.as_bytes()[..16]);
+    LogStreamId(out)
 }
 
 /// Computes the canonical [`LogStreamId`] from an OTLP resource+scope
@@ -156,7 +198,7 @@ pub fn log_stream_id(
     scope_attrs: &[(String, AttrValue)],
 ) -> LogStreamId {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"ravel-logstream-v1");
+    hasher.update(LOG_STREAM_DOMAIN);
     hasher.update(&canonical_attr_bytes(resource_attrs));
     let mut lenbuf = Vec::new();
     put_uvarint(&mut lenbuf, scope_name.len() as u64);
@@ -167,10 +209,7 @@ pub fn log_stream_id(
     hasher.update(&lenbuf);
     hasher.update(scope_version.as_bytes());
     hasher.update(&canonical_attr_bytes(scope_attrs));
-    let digest = hasher.finalize();
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest.as_bytes()[..16]);
-    LogStreamId(out)
+    stream_id_from_digest(&hasher.finalize())
 }
 
 #[cfg(test)]
@@ -260,6 +299,173 @@ mod tests {
             log_stream_id(&list_ab, "s", "1", &[]),
             log_stream_id(&list_ba, "s", "1", &[])
         );
+    }
+
+    /// Fixed inputs for the golden test. The pinned digests below were printed
+    /// by this exact function on the base commit (2d10ba4), before
+    /// `encode_attrs` was changed.
+    fn golden_inputs() -> Vec<(&'static str, Vec<(String, AttrValue)>)> {
+        let nested = AttrValue::Map(vec![
+            ("z".into(), AttrValue::List(vec![s("x"), AttrValue::I64(-7)])),
+            ("a".into(), AttrValue::Bytes(vec![0, 255, 1])),
+        ]);
+        vec![
+            ("empty", vec![]),
+            (
+                "flat",
+                vec![
+                    ("service.name".into(), s("api")),
+                    ("host.name".into(), s("")),
+                    ("n".into(), AttrValue::I64(i64::MIN)),
+                    ("ok".into(), AttrValue::Bool(true)),
+                ],
+            ),
+            (
+                "duplicate_keys",
+                vec![
+                    ("k".into(), s("b")),
+                    ("k".into(), s("a")),
+                    ("k".into(), AttrValue::I64(3)),
+                    ("j".into(), s("a")),
+                ],
+            ),
+            (
+                "floats_and_nested",
+                vec![
+                    ("neg_zero".into(), AttrValue::F64(-0.0)),
+                    (
+                        "nan".into(),
+                        AttrValue::F64(f64::from_bits(0x7ff8_0000_0000_0001)),
+                    ),
+                    ("m".into(), nested),
+                    ("longer".into(), s("value")),
+                    ("long".into(), s("value")),
+                ],
+            ),
+        ]
+    }
+
+    /// (name, blake3 of `canonical_attr_bytes`, `log_stream_id` bytes for the
+    /// input as resource attributes with scope "scope", "1.0" and no scope
+    /// attributes), as printed on the base commit.
+    const GOLDEN: &[(&str, &str, &str)] = &[
+        ("empty", "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213", "305e0d48bcb4f4a9f22f8cfecbba8d9f"),
+        ("flat", "91e0aa735c3be8c3d0ed77064734444d766480196e4ca3da766a530b4b92af91", "3d082f71b9354f90abcd07ed90c5a2f1"),
+        ("duplicate_keys", "5f92c98f9df2c41a88edbb65f226cbe70fd7124ae84c9e9579e50a1d4abfbc40", "ec9bb286682cd52e62a1d9ba37410c3c"),
+        ("floats_and_nested", "7ce413c8f0fe0a662e5edf4ba9c8aa513855a0ad8539a37325bf0f3723d1bd07", "9e32f30685b12d0575e0af2c53008940"),
+    ];
+
+    #[test]
+    fn golden_canonical_bytes_and_stream_ids() {
+        let inputs = golden_inputs();
+        assert_eq!(GOLDEN.len(), inputs.len());
+        for ((name, attrs), (gname, gdigest, gid)) in inputs.iter().zip(GOLDEN) {
+            assert_eq!(name, gname);
+            assert_eq!(
+                blake3::hash(&canonical_attr_bytes(attrs)).to_hex().as_str(),
+                *gdigest,
+                "{name}: canonical bytes"
+            );
+            assert_eq!(
+                log_stream_id(attrs, "scope", "1.0", &[]).to_hex(),
+                *gid,
+                "{name}: stream id"
+            );
+        }
+    }
+
+    /// Test-only copy of the encoder before the scratch-buffer change.
+    fn legacy_encode_value(out: &mut Vec<u8>, value: &AttrValue) {
+        match value {
+            AttrValue::Map(entries) => {
+                out.push(7);
+                legacy_encode_attrs(out, entries);
+            }
+            AttrValue::List(items) => {
+                out.push(6);
+                put_uvarint(out, items.len() as u64);
+                for item in items {
+                    legacy_encode_value(out, item);
+                }
+            }
+            // Scalar arms never reach encode_attrs, so the shared encoder is
+            // the same code as the old one for them.
+            other => encode_value(out, other),
+        }
+    }
+
+    fn legacy_encode_attrs(out: &mut Vec<u8>, attrs: &[(String, AttrValue)]) {
+        let mut items: Vec<(&str, Vec<u8>)> = attrs
+            .iter()
+            .map(|(k, v)| {
+                let mut encoded = Vec::new();
+                legacy_encode_value(&mut encoded, v);
+                (k.as_str(), encoded)
+            })
+            .collect();
+        items.sort_by(|a, b| {
+            a.0.as_bytes()
+                .cmp(b.0.as_bytes())
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        put_uvarint(out, items.len() as u64);
+        for (key, encoded) in items {
+            put_uvarint(out, key.len() as u64);
+            out.extend_from_slice(key.as_bytes());
+            out.extend_from_slice(&encoded);
+        }
+    }
+
+    /// Nested values to depth 3, a small key alphabet so duplicate keys with
+    /// differing values are common, empty strings, NaN payloads and -0.0.
+    fn arb_deep_value() -> impl Strategy<Value = AttrValue> {
+        let leaf = prop_oneof![
+            prop_oneof![Just(String::new()), "[a-c]{0,3}"].prop_map(AttrValue::Str),
+            any::<i64>().prop_map(AttrValue::I64),
+            prop_oneof![
+                Just(-0.0f64),
+                Just(0.0f64),
+                any::<u64>().prop_map(f64::from_bits),
+                (0u64..4).prop_map(|p| f64::from_bits(0x7ff8_0000_0000_0000 | p)),
+            ]
+            .prop_map(AttrValue::F64),
+            any::<bool>().prop_map(AttrValue::Bool),
+            proptest::collection::vec(any::<u8>(), 0..4).prop_map(AttrValue::Bytes),
+        ];
+        leaf.prop_recursive(3, 24, 4, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..4).prop_map(AttrValue::List),
+                proptest::collection::vec(("[a-c]{0,2}", inner), 0..5).prop_map(AttrValue::Map),
+            ]
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn encode_attrs_matches_the_legacy_encoder(
+            attrs in proptest::collection::vec(("[a-c]{0,2}", arb_deep_value()), 0..12),
+        ) {
+            let mut legacy = Vec::new();
+            legacy_encode_attrs(&mut legacy, &attrs);
+            prop_assert_eq!(canonical_attr_bytes(&attrs), legacy);
+        }
+
+        #[test]
+        fn preimage_id_matches_log_stream_id(
+            resource in proptest::collection::vec(("[a-c]{0,2}", arb_deep_value()), 0..6),
+            scope in proptest::collection::vec(("[a-c]{0,2}", arb_deep_value()), 0..6),
+        ) {
+            let mut preimage = canonical_attr_bytes(&resource);
+            put_uvarint(&mut preimage, 1);
+            preimage.extend_from_slice(b"n");
+            put_uvarint(&mut preimage, 2);
+            preimage.extend_from_slice(b"v1");
+            preimage.extend_from_slice(&canonical_attr_bytes(&scope));
+            prop_assert_eq!(
+                log_stream_id_from_preimage(&preimage),
+                log_stream_id(&resource, "n", "v1", &scope)
+            );
+        }
     }
 
     // A small strategy for arbitrary flat attribute sets.
