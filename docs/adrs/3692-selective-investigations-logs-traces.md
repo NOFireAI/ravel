@@ -185,9 +185,15 @@ changes no stored byte.
   records this constraint, and it is why ADR-0073's origin became the
   parallel `SegmentOrigins` vector rather than a field). Decision 1 takes
   the same form: `SnapshotParts { parts: Vec<SnapshotPartHandle>, origin:
-  Vec<Option<SegmentPartOrigin>> }`, produced beside the `Snapshot` by
-  `Catalog::resolve_pruned_with_admission` as `SegmentOrigins` is, with
-  `origin[i]` the `(part index, part-local entry ordinal)` of
+  Vec<Option<SegmentPartOrigin>> }`, returned by a new
+  `Catalog::resolve_pruned_with_parts` as a third value beside the
+  `Snapshot` and `SegmentOrigins` that `resolve_pruned_with_admission`
+  returns today. The existing method keeps its two-value signature and
+  every caller (ravel-sql's executor, ravel-server's exemplars) stays as
+  it is, the way `resolve_pruned_with_generations` was added rather than
+  widening a return (catalog.rs:2465); the providers that run the router
+  switch to the new method in T4 and T5, whose crate scope includes
+  ravel-sql. `origin[i]` is the `(part index, part-local entry ordinal)` of
   `segments[i]` (ADR-0849 section 1, the ordinal the leaf's
   `entry_ordinal` names) and `None` for a `Recent` or `TokenResolved`
   segment (snapshot.rs:166), which is never covered. A
@@ -250,9 +256,11 @@ docs/catalog-and-mvcc.md, with these choices fixed here:
   the run count fits (the `bound_runs` shape the metrics path uses);
   bridged gap bytes are read and discarded. It takes that read only when
   the bridged bytes are at most `entry_count x T1_BYTES` for the part,
-  with `T1_BYTES` = 4 KiB the predicted per-object cost of the tier-1 probe
-  the part's segments would otherwise pay (a footer suffix, a prefix and
-  a bucket); otherwise the part is `Uncovered` for this statement and no
+  with `T1_BYTES` = 11 KiB the predicted per-object cost of the tier-1
+  probe the part's segments would otherwise pay (decision 3's figure for
+  an absent object: the 8 KiB footer suffix, about 1 KB of prefix and
+  about 2 KB of bucket); otherwise the part is `Uncovered` for this
+  statement and no
   further leaf byte is read. A leaf body is the whole part's key set
   (about 240 MB for the T12 spans part), so tier 2 has no whole-body
   escape of the kind decision 6 gives tier 1 over a 2 to 6 % section;
@@ -731,7 +739,7 @@ statement. "Covering parts" is the stamped part count for the window.
 | 8. leaf bytes | spans at most 6 % and logs at most 2.5 % of part bytes (the logs target sits above the one measurement, 2.06 %), slices x 194 B of HEAD per (part, field) | over 2x either | predicted; T12 measured 4.40 % and 2.06 %, 194 B and 192 B, #2763 comment 6276877460 |
 | 9. month-scale lane: spans lookup without a range over 744 hour-ranged parts (`--ingest-hour-stride 1`, a month) | resolve: 1 part GET per covering part; leaf GETs = 2 x 744 = 1,488; 0 tier-1 GETs on covered objects; `partsBeyondCeiling` 0; `keyIndex` decompressed bytes per part at most `8 x sqrt(body)` as ADR-2707's row states; rows exact | more than 2 leaf GETs per part, any leaf GET outside `keyIndex`, any tier-1 GET on a covered object | predicted; the ADR-2707 month-scale row, docs/adrs/2707-exact-key-index-for-spans-and-logs.md:877, unmeasured there |
 | 10. past `P_max` lane: 2,160 hour-ranged parts | leaf GETs = 2 x 1,024 = 2,048 exactly; `partsBeyondCeiling` 1,136, the 1,136 smallest parts by entry count; those parts' objects probed at tier 1 (3 GETs, under 16 KB each, in `probe` and `keyIndex`), 0 leaf GETs for them; rows exact | any leaf GET for a part beyond the ceiling, more than 2,048 leaf GETs, a beyond-ceiling object read whole for an absent key | predicted; restates the ADR-2707 `P_max` row (scan remainder) per decision 2's amendment, docs/adrs/2707-exact-key-index-for-spans-and-logs.md:878 |
-| 11. `IN` lists of 1, 10, 100 and 1,000 keys, folded with leaves, logs and spans | rows equal the union of the per-key equality answers (the oracle), every list size, both tables; per covered part leaf GETs at most `1 + min(distinct buckets, 64)`; `keysProbed` equals the list size; the 1,000-key list on a 13-bit leaf (8,192 buckets) is read as at most 64 bridged ranged GETs whose bytes are at most `entry_count x 4 KiB` for the part, else the part is `Uncovered` with no further leaf read, and the report says which | any row difference; over 65 leaf GETs on one part; leaf bytes over `entry_count x 4 KiB` on one part; a 1,001-key list served by the index | predicted; k and `B_run` are decision 6's constants, confirmed or changed by the Stage 1 amendment |
+| 11. `IN` lists of 1, 10, 100 and 1,000 keys, folded with leaves, logs and spans | rows equal the union of the per-key equality answers (the oracle), every list size, both tables; per covered part leaf GETs at most `1 + min(distinct buckets, 64)`; `keysProbed` equals the list size; the 1,000-key list on a 13-bit leaf (8,192 buckets) is read as at most 64 bridged ranged GETs whose bytes are at most `entry_count x 11 KiB` for the part, else the part is `Uncovered` with no further leaf read, and the report says which | any row difference; over 65 leaf GETs on one part; leaf bytes over `entry_count x 11 KiB` on one part; a 1,001-key list served by the index | predicted; k and `B_run` are decision 6's constants, confirmed or changed by the Stage 1 amendment |
 | 12. scaling: matching rows fixed, irrelevant retained data 10x and 100x (objects and covering parts both grow) | folded with leaves: GETs grow by at most 2 per added covering part and wire by at most the added leaf prefixes and buckets; the unfolded control grows per object | GET growth proportional to objects on the folded arm | predicted from decision 2 |
 | 13. correctness matrix | exact agreement with the oracle on every statement of every state, including mixed sealed plus unsealed, concurrent compaction and an erasure in flight; the five negative controls of decision 9 each fail on their mutant | any disagreement, any control passing on its mutant | predicted; the mutants are run and quoted in the report |
 | 14. join baseline (ADR-2983 Stage 0): `spans JOIN logs ON trace_id`, build sides of 1, k/10, k and 10k traces, transfer absent | per scan: objects and blocks opened, requests and wire bytes per phase, recorded as the Stage 0 figures ADR-2983 defers; no band on this first measurement; both sides' `signals[]` entries present | a scan without its `signals[]` entry, or a figure missing | predicted; ADR-2983 Sequencing, docs/adrs/2983-predicate-transfer-across-signal-joins.md:325 |
