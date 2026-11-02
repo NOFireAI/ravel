@@ -95,13 +95,17 @@
 #   memory      the sampler stopped, <out>/memory-summary.json written (peak
 #               and final bytes per container, OOMKilled from docker inspect),
 #               every --rss-band checked
+#   stop        docker compose stop ravel-server: the fold below runs with
+#               --writers-stopped, which ADR-2677 decision 1 makes safe only
+#               once the writer has exited. Stamped as ravel_restart
 #   fold        ravel-cli catalog fold --signal metrics --writers-stopped, run
 #               through `docker compose run` on the ravel-qualify service (so
 #               it reads the same store as the server in either lane), into
 #               <out>/fold.out. Fails unless seal_through_hour is Some(N) and
 #               watermark_hour is at or after the hour the ingest step ended
-#               in. Stamped as ravel_catalog_fold_writers_stopped
-#   restart     docker compose restart ravel-server, then its readiness URL
+#               in. Stamped as ravel_catalog_fold_writers_stopped. A failed
+#               fold ends the run with the server still stopped
+#   start       docker compose start ravel-server, then its readiness URL
 #               answers 200 as in ready. Stamped as ravel_restart
 #   readback-folded  Ravel's /metrics scraped into
 #               <out>/ravel-metrics-before-folded-readback.txt,
@@ -113,16 +117,19 @@
 #               Also fails when the GETs the fetch cache did not cause
 #               (catalog_get_delta) exceed --folded-catalog-get-floor
 #               (default 64) plus --folded-catalog-get-max-fraction
-#               (default 0.05) times the data objects ingest flushed
-#               (data_objects_flushed, from <out>/ravel-metrics-at-query.txt),
+#               (default 0.05) times the data objects the objects step listed
+#               (data_objects_listed, data.count in <out>/ravel-objects.json),
 #               or when either figure cannot be read. A limit at or above
-#               data_objects_flushed cannot tell a folded read from an
-#               unfolded one; that is stamped not discriminating and passes
+#               data_objects_listed cannot tell a folded read from an
+#               unfolded one; that is stamped not discriminating and passes.
+#               The flush counters' sum in <out>/ravel-metrics-at-query.txt
+#               is stamped beside it as data_objects_flushed, a cross-check
+#               the limit does not use
 #
-# fold, restart and readback-folded also run after a failed ingest
+# stop, fold, start and readback-folded also run after a failed ingest
 # verification, when memory passed and the Ravel row itself has no
 # row_failure and did not stall; a failure there is listed in
-# failed_after_ingest. Otherwise the three are skipped and their stamps say
+# failed_after_ingest. Otherwise the four are skipped and their stamps say
 # why.
 #
 # With --diagnostic-prometheus-max-samples N the run is the falsification run
@@ -522,9 +529,10 @@ elif op == "fold-stamp":
                       "ingest_end_hour": int(end_hour), "precondition": precondition}))
 elif op == "readback-folded":
     # The bin's stdout, its exit code, the two /metrics scrapes ("" when one
-    # failed), the at-query scrape, the catalog GET fraction and floor. Prints
-    # the stamp; exit 3 when stdout is not its report.
-    out_path, code, before, after, at_query, fraction, floor = args
+    # failed), the at-query scrape, ravel-objects.json, the catalog GET
+    # fraction and floor. Prints the stamp; exit 3 when stdout is not its
+    # report.
+    out_path, code, before, after, at_query, objects_path, fraction, floor = args
     def metric(path, name, labels):
         if not path or not os.path.isfile(path):
             return None
@@ -551,6 +559,20 @@ elif op == "readback-folded":
     gets = stamp["store_get_calls_delta"]
     stamp["fetch_cache_misses_delta"] = fetch_misses
     stamp["catalog_get_delta"] = None if gets is None or fetch_misses is None else gets - fetch_misses
+    # The denominator: the .rseg data objects the objects step listed, the
+    # count the fraction was calibrated on.
+    listed, listed_error = None, None
+    try:
+        data = load(objects_path).get("data")
+        n = data.get("count") if isinstance(data, dict) else None
+        if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+            listed = n
+        else:
+            listed_error = "no data.count in ravel-objects.json"
+    except (OSError, ValueError, AttributeError) as e:
+        listed_error = f"ravel-objects.json could not be read ({type(e).__name__})"
+    stamp["data_objects_listed"] = listed
+    # A cross-check only, not the denominator.
     # One data object per flush: shard.rs flush_tenant calls record_flush once
     # per flush it opens (crates/ravel-ingest/src/shard.rs:2662), and
     # record_flush bumps exactly one of these by its FlushTrigger
@@ -558,7 +580,7 @@ elif op == "readback-folded":
     # Sub-counts of them (ravel_ingest_rerouted_flushes_total,
     # ravel_ingest_grace_extended_stale_flushes_total) are not added.
     # flushes_manual (FlushNow and the shutdown drains, metrics.rs module
-    # docs) is left out; the at-query scrape precedes the restart. These are
+    # docs) is left out; the at-query scrape precedes the stop. These are
     # attempt-time, so an abandoned flush counts too.
     flushed, absent = 0, []
     for reason in ("size", "age", "age_adaptive", "age_floor", "arrival"):
@@ -578,24 +600,23 @@ elif op == "readback-folded":
                                   ("ravel_cache_misses_total{cache=\"fetch\"}", fetch_misses)) if v is None]
         stamp["catalog_get_verdict"] = ("could not measure: no " + " or ".join(missing)
                                         + " delta between the folded read-back's scrapes")
-    elif absent:
-        stamp["catalog_get_verdict"] = ("could not measure: no " + ", ".join(absent)
-                                        + " with signal=\"metrics\" in ravel-metrics-at-query.txt")
+    elif listed is None:
+        stamp["catalog_get_verdict"] = f"could not measure: {listed_error}"
     else:
         from fractions import Fraction
         # The floor is the read's fixed catalog cost (HEAD, snapshot parts,
         # commit-token keys, the server's own background GETs in the window).
-        limit = int(floor) + Fraction(fraction) * flushed
+        limit = int(floor) + Fraction(fraction) * listed
         shown = int(limit) if limit.denominator == 1 else float(limit)
         stamp["folded_catalog_get_limit"] = shown
         # An unfolded read costs about one catalog GET per data object.
-        if limit >= flushed:
-            stamp["catalog_get_verdict"] = (f"not discriminating: limit {shown} is at or above the {flushed} "
-                                            "data objects flushed, so a folded and an unfolded read cannot "
+        if limit >= listed:
+            stamp["catalog_get_verdict"] = (f"not discriminating: limit {shown} is at or above the {listed} "
+                                            "data objects listed, so a folded and an unfolded read cannot "
                                             "be told apart at this profile")
         elif cat > limit:
             stamp["catalog_get_verdict"] = (f"breach: catalog_get_delta {cat} exceeds {floor} + {fraction} x "
-                                            f"data_objects_flushed {flushed} = {shown}")
+                                            f"data_objects_listed {listed} = {shown}")
         else:
             stamp["catalog_get_verdict"] = "within"
     try:
@@ -1344,16 +1365,31 @@ fold_step() {
   step_done fold
 }
 
-restart_step() {
+# stop_step: the --writers-stopped fold is safe only once the writer has
+# exited (ADR-2677 decision 1), so ravel-server is down for the whole fold.
+stop_step() {
   local code=0
-  compose restart ravel-server >"${out_dir}/ravel-restart.log" 2>&1 || code=$?
+  compose stop ravel-server >"${out_dir}/ravel-stop.log" 2>&1 || code=$?
   if [ "$code" -ne 0 ]; then
-    show_log "${out_dir}/ravel-restart.log"
-    fail_step restart "docker compose restart ravel-server exited $code"
+    show_log "${out_dir}/ravel-stop.log"
+    stamp_str ravel_restart "not stopped: docker compose stop ravel-server exited $code; no fold ran"
+    fail_step stop "docker compose stop ravel-server exited $code"
   fi
-  wait_ready ravel "${RAVEL_BASE}/api/v1/status/buildinfo" restart
-  stamp_str ravel_restart "restarted: docker compose restart ravel-server, then ravel answered 200 on /api/v1/status/buildinfo"
-  step_done restart
+  stamp_str ravel_restart "stopped: docker compose stop ravel-server before the fold; not started again"
+  step_done stop
+}
+
+start_step() {
+  local code=0 stopped="stopped: docker compose stop ravel-server before the fold"
+  compose start ravel-server >"${out_dir}/ravel-start.log" 2>&1 || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "${out_dir}/ravel-start.log"
+    stamp_str ravel_restart "${stopped}; docker compose start ravel-server after it exited $code"
+    fail_step start "docker compose start ravel-server exited $code"
+  fi
+  wait_ready ravel "${RAVEL_BASE}/api/v1/status/buildinfo" start
+  stamp_str ravel_restart "${stopped}; started: docker compose start ravel-server after it, then ravel answered 200 on /api/v1/status/buildinfo"
+  step_done start
 }
 
 # scrape_ravel_metrics FILE: Ravel's /metrics into FILE; non-zero unless it
@@ -1377,7 +1413,7 @@ readback_folded_step() {
   after_arg="$after"
   scrape_ravel_metrics "$after" || { after_arg=""; missing="${missing:+$missing and }after"; }
   stamp="$(py readback-folded "${out_dir}/readback-folded.json" "$code" "$before_arg" "$after_arg" \
-    "${out_dir}/ravel-metrics-at-query.txt" "$folded_catalog_get_max_fraction" \
+    "${out_dir}/ravel-metrics-at-query.txt" "${out_dir}/ravel-objects.json" "$folded_catalog_get_max_fraction" \
     "$folded_catalog_get_floor")" || stamp_code=$?
   [ -z "$stamp" ] || stamp_set readback_folded "$stamp"
   if [ "$code" -ne 0 ]; then
@@ -1395,19 +1431,22 @@ readback_folded_step() {
   step_done readback-folded
 }
 
-# folded_readback: fold, restart and readback-folded, or their stamps saying
-# why they were skipped when the Ravel row did not replay.
+# folded_readback: stop, fold, start and readback-folded, or their stamps
+# saying why they were skipped when the Ravel row did not replay. A failed
+# fold ends the run with ravel-server still stopped; teardown removes the
+# stack either way, and nothing after the fold would read it.
 folded_readback() {
   local why k
   if ! why="$(py ravel-row-state "${out_dir}/ingest.json")"; then
     for k in ravel_catalog_fold_writers_stopped ravel_restart readback_folded; do
       stamp_str "$k" "skipped: $why"
     done
-    say "steps fold, restart and readback-folded skipped: $why"
+    say "steps stop, fold, start and readback-folded skipped: $why"
     return 0
   fi
+  stop_step
   fold_step
-  restart_step
+  start_step
   readback_folded_step
 }
 

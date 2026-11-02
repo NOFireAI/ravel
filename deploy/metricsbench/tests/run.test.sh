@@ -112,17 +112,21 @@
 #                                       and the usage names the flags; s8: an
 #                                       engine arch with no s3s-fs asset passes
 #   t  real S3 with a local build    -> exit 65, nothing started
-#   u  fold, restart, folded read-back -> u (case a's output): fold.out,
-#                                       readback-folded.json and both /metrics
+#   u  stop, fold, start, folded     -> u (case a's output): fold.out,
+#      read-back                        readback-folded.json and both /metrics
 #                                       scrapes written, the three stamps, the
-#                                       calls in order memory, fold, restart,
-#                                       scrape, read-back, scrape; u1: a fold
-#                                       that sealed nothing and u2: a watermark
-#                                       before the ingest end hour exit 70
-#                                       naming fold; u3: a read-back-only exit
+#                                       calls in order memory, stop, fold,
+#                                       start, readiness, scrape, read-back,
+#                                       scrape, the fold run while ravel-server
+#                                       was stopped; u1: a fold that sealed
+#                                       nothing and u2: a watermark before the
+#                                       ingest end hour exit 70 naming fold,
+#                                       with no start; u2a: a failed stop and
+#                                       u2b: a failed start exit 70 naming
+#                                       their step; u3: a read-back-only exit
 #                                       1 and u4: a failed scrape exit 70 naming
 #                                       readback-folded; u5: Ravel's ingest
-#                                       read-back failed, the three still run,
+#                                       read-back failed, the four still run,
 #                                       exit 70 naming ingest; u6: the same with
 #                                       readback-folded listed after ingest; u7:
 #                                       a Ravel row_failure and u8: a Ravel
@@ -131,17 +135,21 @@
 #                                       real-S3 lane folds with its overlay;
 #                                       u11: large fetch misses leave few
 #                                       catalog GETs, a pass; u12: one catalog
-#                                       GET per data object exits 70 naming
-#                                       readback-folded, u13: listed after a
-#                                       failed ingest; u14: no fetch-miss and
-#                                       u15: no flush counter exit 70 as could
-#                                       not measure; u16: --folded-catalog-get-
-#                                       max-fraction 1 passes u12's figures as
+#                                       GET per listed data object exits 70
+#                                       naming readback-folded where the flush
+#                                       counters would not, u13: listed after a
+#                                       failed ingest; u14: no fetch-miss
+#                                       counter, u15a: no ravel-objects.json
+#                                       and u15b: no data.count in it exit 70
+#                                       as could not measure; u15: no flush
+#                                       counter stamps the cross-check null
+#                                       and passes; u16: --folded-catalog-get-
+#                                       max-fraction 1 passes u13's figures as
 #                                       not discriminating; u17-u19: a
 #                                       malformed or out-of-range fraction
 #                                       exits 64; u20: a ci-sized run whose
-#                                       limit is above its object count passes
-#                                       as not discriminating; u21: a
+#                                       limit is above its listed object count
+#                                       passes as not discriminating; u21: a
 #                                       cardinality-sized run within the floor
 #                                       plus fraction passes, u22: above it
 #                                       exits 70; u23: --folded-catalog-get-
@@ -207,8 +215,9 @@ S3S_SHA_AARCH64="92d7bbbb29bd4c5aee00b5f1c280c1402e799ed8a28f497e5ba813f1ebc3eec
 # --- stubs -------------------------------------------------------------------
 
 # docker: version (Server.Arch is STUB_ENGINE_ARCH, default amd64; exit 1
-# with STUB_ENGINE_DOWN), compose up/ps/config/down/logs, stats, inspect,
-# image inspect and volume ls, with the stack's up/down state in $STUB_STATE.
+# with STUB_ENGINE_DOWN), compose up/ps/config/down/logs/stop/start, stats,
+# inspect, image inspect and volume ls, with the stack's up/down state in
+# $STUB_STATE and ravel-server's stopped/running state in $STUB_STATE.ravel.
 cat >"${BIN}/docker" <<'STUB'
 #!/usr/bin/env bash
 printf 'docker %s\n' "$*" >>"${STUB_LOG}"
@@ -267,21 +276,43 @@ JSON
       logs)
         echo "stub compose logs"
         ;;
+      # stop and start: ravel-server's state for the fold to log, exit
+      # STUB_STOP_EXIT / STUB_START_EXIT. On stop, STUB_OBJECTS_DOC_AT (a
+      # ravel-objects.json path) is replaced by STUB_OBJECTS_DOC, or removed
+      # when that is empty, after the objects step wrote it.
+      stop)
+        [ "${STUB_STOP_EXIT:-0}" -eq 0 ] || exit "${STUB_STOP_EXIT}"
+        [ "$1" = ravel-server ] && echo stopped >"${STUB_STATE}.ravel"
+        if [ -n "${STUB_OBJECTS_DOC_AT:-}" ]; then
+          if [ -n "${STUB_OBJECTS_DOC:-}" ]; then
+            printf '%s\n' "${STUB_OBJECTS_DOC}" >"${STUB_OBJECTS_DOC_AT}"
+          else
+            rm -f "${STUB_OBJECTS_DOC_AT}"
+          fi
+        fi
+        ;;
+      start)
+        [ "${STUB_START_EXIT:-0}" -eq 0 ] || exit "${STUB_START_EXIT}"
+        [ "$1" = ravel-server ] && echo running >"${STUB_STATE}.ravel"
+        ;;
       run)
         case " $* " in
           *" list-objects-v2 "*)
             # The objects step's listing of Ravel's bucket: STUB_LISTING's
-            # file, else one key of every kind; exit STUB_LIST_EXIT.
+            # file, else STUB_LIST_DATA (default 300) data objects and one
+            # key of every other kind; exit STUB_LIST_EXIT.
             [ "${STUB_LIST_EXIT:-0}" -eq 0 ] || exit "${STUB_LIST_EXIT}"
             if [ -n "${STUB_LISTING:-}" ]; then
               cat "${STUB_LISTING}"
             else
-              printf '%s\n' '{"Contents": [{"Key": "t/h1/m/l0/a.rseg", "Size": 100}, {"Key": "t/h1/m/c/a", "Size": 10}, {"Key": "sys/qualify/p", "Size": 1}, {"Key": "t/h1/catalog/x", "Size": 5}]}'
+              python3 -I -c 'import json,sys; n=int(sys.argv[1]); print(json.dumps({"Contents": [{"Key": f"t/h1/m/l0/{i:06d}.rseg", "Size": 100} for i in range(n)] + [{"Key": "t/h1/m/c/a", "Size": 10}, {"Key": "sys/qualify/p", "Size": 1}, {"Key": "t/h1/catalog/x", "Size": 5}]}))' "${STUB_LIST_DATA:-300}"
             fi
             ;;
           # ravel-cli catalog fold on the ravel-qualify service: its text
-          # report, the hours in the clock's current hour bucket.
+          # report, the hours in the clock's current hour bucket. It logs
+          # ravel-server's state as it runs.
           *" catalog fold "*)
+            printf 'docker-state fold ravel-server=%s\n' "$(cat "${STUB_STATE}.ravel" 2>/dev/null || echo running)" >>"${STUB_LOG}"
             [ "${STUB_FOLD_EXIT:-0}" -eq 0 ] || exit "${STUB_FOLD_EXIT}"
             hour=$(($(date -u +%s) / 3600))
             printf 'store: s3\nsignal: metrics\nno_op: false\nrebuilt: false\nprevious_watermark_hour: None\n'
@@ -645,7 +676,7 @@ for f in stamps.json ingest.json effective-config.json provenance.json report.js
   expect_file a "$f"
 done
 check "a: stamps status passed, exit 0" 'j("stamps.json")["status"] == "passed" and j("stamps.json")["exit_code"] == 0'
-check "a: every step recorded in order" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","ingest","mimir-readiness","objects","capture","provenance","fold-state","query","validate","memory","fold","restart","readback-folded"]'
+check "a: every step recorded in order" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","ingest","mimir-readiness","objects","capture","provenance","fold-state","query","validate","memory","stop","fold","start","readback-folded"]'
 check "a: published image kind stamped, no image_id" 'j("stamps.json")["ravel_image"]["kind"] == "published" and "image_id" not in j("stamps.json")["ravel_image"]'
 expect_log "a: provenance says the image is published" "--config ravel_image_kind=published"
 expect_no_log "a: provenance carries no local image id" "ravel_image_id="
@@ -704,7 +735,7 @@ expect_rc q 70
 expect_err "q: message names step ingest and the row" "step ingest failed: metricsbench_ingest exited 1: mimir: read-back failed"
 expect_err "q: message says the run went on as a diagnostic" "the run went on as a diagnostic"
 check "q: stamps name step ingest, status failed, exit 70" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["status"] == "failed" and j("stamps.json")["exit_code"] == 70'
-check "q: every later step ran, ingest and mimir-readiness not done" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","objects","capture","provenance","fold-state","query","validate","memory","fold","restart","readback-folded"]'
+check "q: every later step ran, ingest and mimir-readiness not done" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","objects","capture","provenance","fold-state","query","validate","memory","stop","fold","start","readback-folded"]'
 check "q: nothing failed after ingest" 'j("stamps.json")["failed_after_ingest"] == []'
 check "q: Mimir readiness line stamped as not matching" 'j("stamps.json")["mimir_readiness"].startswith("ingest read-back for mimir did not match")'
 expect_log "q: query run as a diagnostic" "--diagnostic-after-failed-ingest"
@@ -1145,8 +1176,8 @@ expect_rc t 65
 expect_err "t: a local build is refused in the real-S3 lane" "a local build is never publishable"
 expect_no_log "t: nothing started" "docker-env up"
 
-# --- u: fold, restart and the folded read-back -----------------------------------
-# u reads case a's output; a's step list above pins fold, restart and
+# --- u: stop, fold, start and the folded read-back -------------------------------
+# u reads case a's output; a's step list above pins stop, fold, start and
 # readback-folded after memory, in that order.
 OUT="${TMP}/a/out"
 LOG="${TMP}/a/calls.log"
@@ -1159,11 +1190,14 @@ if grep -A1 -xF '      - "--shards"' "${HERE}/../ravel.yml" | grep -qxF '      -
 else
   fail "u: ravel.yml's ravel-server does not run --shards 4"
 fi
-if grep -qE ' restart ravel-server$' "${LOG}" && [ "$(grep -c ' restart' "${LOG}")" -eq 1 ]; then
-  pass "u: only ravel-server is restarted, once"
+if [ "$(grep -cE '^docker compose .* stop ravel-server$' "${LOG}")" -eq 1 ] &&
+  [ "$(grep -cE '^docker compose .* start ravel-server$' "${LOG}")" -eq 1 ] &&
+  [ "$(grep -cE '^docker compose .* (stop|start|restart) ' "${LOG}")" -eq 2 ]; then
+  pass "u: only ravel-server is stopped and started, once each, and nothing restarted"
 else
-  fail "u: restart calls in ${LOG}: $(grep ' restart' "${LOG}")"
+  fail "u: stop, start and restart calls in ${LOG}: $(grep -E ' (stop|start|restart) ' "${LOG}")"
 fi
+expect_log "u: the fold ran while ravel-server was stopped" "docker-state fold ravel-server=stopped"
 expect_log "u: the folded read-back reads the Ravel row of ingest.json" "metricsbench_ingest --readback-only --ingest-report ${OUT}/ingest.json --readback-system ravel --workload "
 expect_log "u: the folded read-back uses the ingest step's workload, profile, anchor, URL and token env" "--profile ci --anchor-ms ${ANCHOR} --ravel-query-url http://127.0.0.1:4318 --ravel-bearer-token-env METRICSBENCH_RAVEL_TOKEN --readback-timeout-secs 30 --readback-settle-secs 60"
 expect_no_log "u: the ingest step passes no settle flag" "--max-ingest-secs 600 --readback-timeout-secs 30 --readback-settle-secs"
@@ -1173,30 +1207,34 @@ if grep -A1 -F '#[arg(long, default_value_t = 60)]' "${INGEST_BIN_SRC}" | grep -
 else
   fail "u: readback_settle_secs does not default to 60 in ${INGEST_BIN_SRC}"
 fi
-# The order of the calls themselves: the fold, then the restart, then the scrape,
-# read-back and scrape, all after the memory summary's inspect.
+# The order of the calls themselves: the stop, the fold, the start and its
+# readiness probe, then the scrape, read-back and scrape, all after the
+# memory summary's inspect.
 if python3 -I - "${LOG}" <<'PY'; then
 import sys
 lines = open(sys.argv[1]).read().splitlines()
 def first(s, after=-1):
     return next(i for i, l in enumerate(lines) if i > after and s in l)
 mem = max(i for i, l in enumerate(lines) if l.startswith("docker inspect id-"))
+stop = first(" stop ravel-server")
 fold = first("catalog fold")
-restart = first("restart ravel-server")
-before = first("/metrics", restart)
+start = first(" start ravel-server")
+ready = first("/api/v1/status/buildinfo", start)
+before = first("/metrics", start)
 rb = first("--readback-only")
 after = first("/metrics", rb)
-sys.exit(0 if mem < fold < restart < before < rb < after else 1)
+sys.exit(0 if mem < stop < fold < start < ready < before < rb < after else 1)
 PY
-  pass "u: calls ran memory, fold, restart, scrape, read-back, scrape"
+  pass "u: calls ran memory, stop, fold, start, readiness, scrape, read-back, scrape"
 else
   fail "u: calls out of order in ${LOG}"
 fi
 HOUR_NOW=$(($(date -u +%s) / 3600))
 check "u: fold stamped with its report's figures" 'j("stamps.json")["ravel_catalog_fold_writers_stopped"]["entry_count"] == 420 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["buckets_folded"] == 2 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["no_op"] is False and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["precondition"] == "met"'
 check "u: fold stamped with sealed and watermark hours at the ingest end hour" 'abs(j("stamps.json")["ravel_catalog_fold_writers_stopped"]["seal_through_hour"] - '"${HOUR_NOW}"') <= 1 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["watermark_hour"] >= j("stamps.json")["ravel_catalog_fold_writers_stopped"]["ingest_end_hour"]'
-check "u: restart stamped" 'j("stamps.json")["ravel_restart"].startswith("restarted: docker compose restart ravel-server")'
-check "u: folded read-back stamped with exit, match, series query_ms, deltas and the catalog GET verdict" 'j("stamps.json")["readback_folded"] == {"exit_code": 0, "matches_expected": True, "error": None, "series_query_ms": 12, "store_get_calls_delta": 100, "commit_record_cache_entries_delta": 3, "fetch_cache_misses_delta": 95, "catalog_get_delta": 5, "data_objects_flushed": 200, "folded_catalog_get_max_fraction": "0.05", "folded_catalog_get_floor": 64, "folded_catalog_get_limit": 74, "catalog_get_verdict": "within"}'
+check "u: stop and start stamped" 'j("stamps.json")["ravel_restart"] == "stopped: docker compose stop ravel-server before the fold; started: docker compose start ravel-server after it, then ravel answered 200 on /api/v1/status/buildinfo"'
+check "u: folded read-back stamped with exit, match, series query_ms, deltas and the catalog GET verdict" 'j("stamps.json")["readback_folded"] == {"exit_code": 0, "matches_expected": True, "error": None, "series_query_ms": 12, "store_get_calls_delta": 100, "commit_record_cache_entries_delta": 3, "fetch_cache_misses_delta": 95, "catalog_get_delta": 5, "data_objects_listed": 300, "data_objects_flushed": 200, "folded_catalog_get_max_fraction": "0.05", "folded_catalog_get_floor": 64, "folded_catalog_get_limit": 79, "catalog_get_verdict": "within"}'
+check "u: data_objects_listed is ravel-objects.json's data count, the limit 64 + 0.05 x 300 = 79" 'j("stamps.json")["readback_folded"]["data_objects_listed"] == j("ravel-objects.json")["data"]["count"] == 300 and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] == 79'
 check "u: data_objects_flushed sums the five disjoint metrics reasons only" 'j("stamps.json")["readback_folded"]["data_objects_flushed"] == 40 + 100 + 20 + 30 + 10'
 check "u: readback-folded.json is the bin's report" 'j("readback-folded.json")["system"] == "ravel"'
 
@@ -1206,7 +1244,9 @@ STUB_FOLD_SEAL=None run_case u1 "${args[@]}"
 expect_rc u1 70
 expect_err "u1: message names step fold" "step fold failed: fold sealed nothing: seal_through_hour=None"
 check "u1: stamps name step fold, fold stamped failed" 'j("stamps.json")["failed_step"] == "fold" and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["precondition"].startswith("fold sealed nothing")'
-expect_no_log "u1: no restart" "restart ravel-server"
+check "u1: stop done, start not, the server stamped stopped and not started again" 'j("stamps.json")["steps_completed"][-2:] == ["memory","stop"] and j("stamps.json")["ravel_restart"] == "stopped: docker compose stop ravel-server before the fold; not started again"'
+expect_log "u1: the fold ran while ravel-server was stopped" "docker-state fold ravel-server=stopped"
+expect_no_log "u1: no start" "start ravel-server"
 expect_no_log "u1: no folded read-back" "--readback-only"
 
 # u2: a fold whose watermark is before the hour ingest ended in.
@@ -1215,14 +1255,30 @@ STUB_FOLD_WATERMARK_LAG=2 run_case u2 "${args[@]}"
 expect_rc u2 70
 expect_err "u2: message names step fold and the watermark" "step fold failed: watermark_hour=Some("
 check "u2: stamps name step fold, watermark before the ingest end hour" 'j("stamps.json")["failed_step"] == "fold" and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["watermark_hour"] < j("stamps.json")["ravel_catalog_fold_writers_stopped"]["ingest_end_hour"]'
-expect_no_log "u2: no restart" "restart ravel-server"
+expect_no_log "u2: no start" "start ravel-server"
+
+# u2a: docker compose stop fails: no fold, no start.
+mapfile -t args < <(full_args "${TMP}/u2a/out")
+STUB_STOP_EXIT=1 run_case u2a "${args[@]}"
+expect_rc u2a 70
+expect_err "u2a: message names step stop" "step stop failed: docker compose stop ravel-server exited 1"
+check "u2a: stamps name step stop, the failed stop stamped" 'j("stamps.json")["failed_step"] == "stop" and j("stamps.json")["ravel_restart"] == "not stopped: docker compose stop ravel-server exited 1; no fold ran" and j("stamps.json")["steps_completed"][-1] == "memory"'
+expect_no_log "u2a: no fold" "catalog fold"
+
+# u2b: docker compose start fails after the fold: no read-back.
+mapfile -t args < <(full_args "${TMP}/u2b/out")
+STUB_START_EXIT=1 run_case u2b "${args[@]}"
+expect_rc u2b 70
+expect_err "u2b: message names step start" "step start failed: docker compose start ravel-server exited 1"
+check "u2b: stamps name step start after stop and fold, the failed start stamped" 'j("stamps.json")["failed_step"] == "start" and j("stamps.json")["steps_completed"][-3:] == ["memory","stop","fold"] and j("stamps.json")["ravel_restart"] == "stopped: docker compose stop ravel-server before the fold; docker compose start ravel-server after it exited 1"'
+expect_no_log "u2b: no folded read-back" "--readback-only"
 
 # u3: the folded read-back fails.
 mapfile -t args < <(full_args "${TMP}/u3/out")
 STUB_READBACK_ONLY_EXIT=1 run_case u3 "${args[@]}"
 expect_rc u3 70
 expect_err "u3: message names step readback-folded and the error" "step readback-folded failed: metricsbench_ingest --readback-only exited 1: query series failed: 503"
-check "u3: stamps name step readback-folded, exit 1 and the error stamped" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["exit_code"] == 1 and j("stamps.json")["readback_folded"]["error"] == "query series failed: 503" and "restart" in j("stamps.json")["steps_completed"]'
+check "u3: stamps name step readback-folded, exit 1 and the error stamped" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["exit_code"] == 1 and j("stamps.json")["readback_folded"]["error"] == "query series failed: 503" and "start" in j("stamps.json")["steps_completed"]'
 expect_file u3 ravel-metrics-after-folded-readback.txt
 
 # u4: the scrape after the folded read-back fails (scrape 1 is fold-state's).
@@ -1232,11 +1288,11 @@ expect_rc u4 70
 expect_err "u4: message names step readback-folded and the scrape" "step readback-folded failed: the after scrape"
 check "u4: no delta without the second scrape" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["store_get_calls_delta"] is None'
 
-# u5: Ravel's own read-back failed at ingest: the three steps still run.
+# u5: Ravel's own read-back failed at ingest: the four steps still run.
 mapfile -t args < <(full_args "${TMP}/u5/out")
 STUB_INGEST_READBACK_FAIL=ravel run_case u5 "${args[@]}"
 expect_rc u5 70
-check "u5: stamps name ingest, the three steps done after memory" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["steps_completed"][-4:] == ["memory","fold","restart","readback-folded"] and j("stamps.json")["failed_after_ingest"] == []'
+check "u5: stamps name ingest, the four steps done after memory" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["steps_completed"][-5:] == ["memory","stop","fold","start","readback-folded"] and j("stamps.json")["failed_after_ingest"] == []'
 check "u5: the folded read-back matched" 'j("stamps.json")["readback_folded"]["matches_expected"] is True'
 expect_err "u5: message names step ingest" "step ingest failed: metricsbench_ingest exited 1: ravel: read-back failed"
 
@@ -1246,12 +1302,12 @@ STUB_INGEST_READBACK_FAIL=ravel STUB_READBACK_ONLY_EXIT=1 run_case u6 "${args[@]
 expect_rc u6 70
 check "u6: stamps name ingest, readback-folded failed after it" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["readback-folded"]'
 
-# u7: the Ravel row has a row_failure: the three steps are skipped and say why.
+# u7: the Ravel row has a row_failure: the four steps are skipped and say why.
 mapfile -t args < <(full_args "${TMP}/u7/out")
 STUB_INGEST_READBACK_FAIL=victoriametrics STUB_INGEST_ROW_FAILURE=ravel run_case u7 "${args[@]}"
 expect_rc u7 70
-check "u7: stamps name ingest, no fold, restart or readback-folded" 'j("stamps.json")["failed_step"] == "ingest" and not {"fold","restart","readback-folded"} & set(j("stamps.json")["steps_completed"]) and "memory" in j("stamps.json")["steps_completed"]'
-check "u7: each of the three stamped skipped for the row_failure" 'all(j("stamps.json")[k].startswith("skipped: the ravel row has a row_failure") for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded"))'
+check "u7: stamps name ingest, no stop, fold, start or readback-folded" 'j("stamps.json")["failed_step"] == "ingest" and not {"stop","fold","start","readback-folded"} & set(j("stamps.json")["steps_completed"]) and "memory" in j("stamps.json")["steps_completed"]'
+check "u7: each of the three stamps skipped for the row_failure" 'all(j("stamps.json")[k].startswith("skipped: the ravel row has a row_failure") for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded"))'
 expect_no_log "u7: no fold" "catalog fold"
 expect_no_log "u7: no folded read-back" "--readback-only"
 
@@ -1259,15 +1315,16 @@ expect_no_log "u7: no folded read-back" "--readback-only"
 mapfile -t args < <(full_args "${TMP}/u8/out")
 STUB_INGEST_STALL=ravel run_case u8 "${args[@]}"
 expect_rc u8 70
-check "u8: each of the three stamped skipped for the stall" 'all(j("stamps.json")[k].startswith("skipped: the ravel row stalled") for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded"))'
+check "u8: each of the three stamps skipped for the stall" 'all(j("stamps.json")[k].startswith("skipped: the ravel row stalled") for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded"))'
 expect_no_log "u8: no fold" "catalog fold"
 
 # u9: the diagnostic mode (case f) runs none of them.
 OUT="${TMP}/f/out"
 LOG="${TMP}/f/calls.log"
-check "u9: diagnostic stamps the three not applicable" 'all(j("stamps.json")[k] == "not applicable: diagnostic run starts no Ravel" for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded")) and not {"fold","restart","readback-folded"} & set(j("stamps.json")["steps_completed"])'
+check "u9: diagnostic stamps the three not applicable" 'all(j("stamps.json")[k] == "not applicable: diagnostic run starts no Ravel" for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded")) and not {"stop","fold","start","readback-folded"} & set(j("stamps.json")["steps_completed"])'
 expect_no_log "u9: diagnostic runs no fold" "catalog fold"
-expect_no_log "u9: diagnostic restarts nothing" "restart ravel-server"
+expect_no_log "u9: diagnostic stops nothing" "stop ravel-server"
+expect_no_log "u9: diagnostic starts nothing" "start ravel-server"
 expect_no_log "u9: diagnostic runs no folded read-back" "--readback-only"
 
 # u10: the real-S3 lane (case s) folds through the same service, with its overlay.
@@ -1275,22 +1332,25 @@ LOG="${TMP}/s/calls.log"
 expect_log "u10: the real-S3 fold runs on ravel-qualify with real-s3.yml" "real-s3.yml run --rm --no-deps -T ravel-qualify --store s3 --tenant-hash-unkeyed catalog fold"
 
 # u11: many store GETs, nearly all fetch-cache misses: 2000 GETs less 1995
-# misses leaves 5 catalog GETs against 0.05 x 200 data objects, a pass.
+# misses leaves 5 catalog GETs against 0.05 x 300 listed data objects, a pass.
 mapfile -t args < <(full_args "${TMP}/u11/out")
 STUB_GETS_PER_SCRAPE=2000 STUB_FETCH_MISSES_PER_SCRAPE=1995 run_case u11 "${args[@]}"
 expect_rc u11 0
-check "u11: catalog_get_delta is the GET delta less the fetch misses, within the fraction" 'j("stamps.json")["readback_folded"]["store_get_calls_delta"] == 2000 and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 5 and j("stamps.json")["readback_folded"]["data_objects_flushed"] == 200 and j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "within" and "readback-folded" in j("stamps.json")["steps_completed"]'
+check "u11: catalog_get_delta is the GET delta less the fetch misses, within the fraction" 'j("stamps.json")["readback_folded"]["store_get_calls_delta"] == 2000 and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 5 and j("stamps.json")["readback_folded"]["data_objects_listed"] == 300 and j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "within" and "readback-folded" in j("stamps.json")["steps_completed"]'
 
 # u12: about one catalog GET per data object (2200 less 2000 = 200 against
-# 200 objects), as an unfolded read resolves commit records: a breach of
-# 64 + 0.05 x 200 = 74.
+# 200 listed objects), as an unfolded read resolves commit records: a breach
+# of 64 + 0.05 x 200 = 74. The flush counters sum to 20 here, so a limit
+# taken from them (64 + 0.05 x 20 = 65, at or above 20) would pass this read
+# as not discriminating.
 mapfile -t args < <(full_args "${TMP}/u12/out")
-STUB_GETS_PER_SCRAPE=2200 STUB_FETCH_MISSES_PER_SCRAPE=2000 run_case u12 "${args[@]}"
+STUB_LIST_DATA=200 STUB_FLUSH_PAIRS="size:4 age:10 age_adaptive:2 age_floor:3 arrival:1" \
+  STUB_GETS_PER_SCRAPE=2200 STUB_FETCH_MISSES_PER_SCRAPE=2000 run_case u12 "${args[@]}"
 expect_rc u12 70
-expect_err "u12: message names step readback-folded and the breach" "step readback-folded failed: folded read-back catalog GETs: breach: catalog_get_delta 200 exceeds 64 + 0.05 x data_objects_flushed 200 = 74"
-check "u12: stamps name readback-folded and keep both figures and the verdict" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 200 and j("stamps.json")["readback_folded"]["data_objects_flushed"] == 200 and j("stamps.json")["readback_folded"]["catalog_get_verdict"].startswith("breach:") and "readback-folded" not in j("stamps.json")["steps_completed"]'
+expect_err "u12: message names step readback-folded and the breach" "step readback-folded failed: folded read-back catalog GETs: breach: catalog_get_delta 200 exceeds 64 + 0.05 x data_objects_listed 200 = 74"
+check "u12: stamps name readback-folded and keep the figures and the verdict" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 200 and j("stamps.json")["readback_folded"]["data_objects_listed"] == 200 and j("stamps.json")["readback_folded"]["data_objects_flushed"] == 20 and j("stamps.json")["readback_folded"]["catalog_get_verdict"].startswith("breach:") and "readback-folded" not in j("stamps.json")["steps_completed"]'
 
-# u13: the same breach after a failed ingest verification: listed after ingest.
+# u13: a breach after a failed ingest verification: listed after ingest.
 mapfile -t args < <(full_args "${TMP}/u13/out")
 STUB_INGEST_READBACK_FAIL=ravel STUB_GETS_PER_SCRAPE=2200 STUB_FETCH_MISSES_PER_SCRAPE=2000 run_case u13 "${args[@]}"
 expect_rc u13 70
@@ -1301,21 +1361,36 @@ mapfile -t args < <(full_args "${TMP}/u14/out")
 STUB_NO_FETCH_MISSES=1 run_case u14 "${args[@]}"
 expect_rc u14 70
 expect_err "u14: message names step readback-folded and the absent counter" 'step readback-folded failed: folded read-back catalog GETs: could not measure: no ravel_cache_misses_total{cache="fetch"} delta'
-check "u14: catalog_get_delta null, data_objects_flushed still stamped" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["catalog_get_delta"] is None and j("stamps.json")["readback_folded"]["data_objects_flushed"] == 200 and j("stamps.json")["readback_folded"]["catalog_get_verdict"].startswith("could not measure")'
+check "u14: catalog_get_delta null, both object counts still stamped" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["catalog_get_delta"] is None and j("stamps.json")["readback_folded"]["data_objects_listed"] == 300 and j("stamps.json")["readback_folded"]["data_objects_flushed"] == 200 and j("stamps.json")["readback_folded"]["catalog_get_verdict"].startswith("could not measure")'
 
-# u15: no metrics flush counters in the at-query scrape: could not measure.
+# u15: no metrics flush counters in the at-query scrape: the cross-check is
+# stamped null and the check, which does not use it, still passes.
 mapfile -t args < <(full_args "${TMP}/u15/out")
 STUB_NO_FLUSH_COUNTERS=1 run_case u15 "${args[@]}"
-expect_rc u15 70
-expect_err "u15: message names step readback-folded and the absent flush counter" "could not measure: no ravel_ingest_flushes_by_size_total"
-check "u15: data_objects_flushed null, catalog_get_delta still stamped" 'j("stamps.json")["readback_folded"]["data_objects_flushed"] is None and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 5'
+expect_rc u15 0
+check "u15: data_objects_flushed null, the verdict from the listed count" 'j("stamps.json")["readback_folded"]["data_objects_flushed"] is None and j("stamps.json")["readback_folded"]["data_objects_listed"] == 300 and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 5 and j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "within"'
 
-# u16: a looser fraction is passed through and stamped; with u12's figures
-# its limit 64 + 1 x 200 = 264 is above the 200 objects: not discriminating.
+# u15a: ravel-objects.json gone by the read-back: could not measure, a failure.
+mapfile -t args < <(full_args "${TMP}/u15a/out")
+STUB_OBJECTS_DOC_AT="${TMP}/u15a/out/ravel-objects.json" run_case u15a "${args[@]}"
+expect_rc u15a 70
+expect_err "u15a: message names step readback-folded and the unreadable listing" "step readback-folded failed: folded read-back catalog GETs: could not measure: ravel-objects.json could not be read (FileNotFoundError)"
+check "u15a: data_objects_listed null, no limit, the cross-check still stamped" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["data_objects_listed"] is None and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] is None and j("stamps.json")["readback_folded"]["data_objects_flushed"] == 200'
+
+# u15b: ravel-objects.json without data.count: could not measure, a failure.
+mapfile -t args < <(full_args "${TMP}/u15b/out")
+STUB_OBJECTS_DOC_AT="${TMP}/u15b/out/ravel-objects.json" STUB_OBJECTS_DOC='{"data": {"bytes": 1}}' \
+  run_case u15b "${args[@]}"
+expect_rc u15b 70
+expect_err "u15b: message names step readback-folded and the missing count" "step readback-folded failed: folded read-back catalog GETs: could not measure: no data.count in ravel-objects.json"
+check "u15b: data_objects_listed null" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["data_objects_listed"] is None'
+
+# u16: a looser fraction is passed through and stamped; with u13's figures
+# its limit 64 + 1 x 300 = 364 is above the 300 objects: not discriminating.
 mapfile -t args < <(full_args "${TMP}/u16/out")
 STUB_GETS_PER_SCRAPE=2200 STUB_FETCH_MISSES_PER_SCRAPE=2000 run_case u16 "${args[@]}" --folded-catalog-get-max-fraction 1
 expect_rc u16 0
-check "u16: the fraction stamped as given, limit 264 not discriminating against 200 objects" 'j("stamps.json")["readback_folded"]["folded_catalog_get_max_fraction"] == "1" and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] == 264 and j("stamps.json")["readback_folded"]["catalog_get_verdict"].startswith("not discriminating: limit 264 is at or above the 200 data objects flushed")'
+check "u16: the fraction stamped as given, limit 364 not discriminating against 300 objects" 'j("stamps.json")["readback_folded"]["folded_catalog_get_max_fraction"] == "1" and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] == 364 and j("stamps.json")["readback_folded"]["catalog_get_verdict"].startswith("not discriminating: limit 364 is at or above the 300 data objects listed")'
 
 # u17-u19: a malformed or out-of-range fraction is a usage error.
 for bad in u17:abc u18:1.5 u19:-0.1; do
@@ -1327,37 +1402,35 @@ for bad in u17:abc u18:1.5 u19:-0.1; do
   expect_no_log "${name}: nothing started" "compose"
 done
 
-# u20: a ci-sized run, 20 data objects. 35 catalog GETs exceed 0.05 x 20 and
-# even the 20 objects, but the limit 64 + 0.05 x 20 = 65 is above 20: not
-# discriminating, a pass.
+# u20: a ci-sized run, 20 listed data objects. 35 catalog GETs exceed
+# 0.05 x 20 and even the 20 objects, but the limit 64 + 0.05 x 20 = 65 is
+# above 20: not discriminating, a pass. The flush counters say 200 here, which
+# would make the limit 74 and the verdict within.
 mapfile -t args < <(full_args "${TMP}/u20/out")
-STUB_FLUSH_PAIRS="size:4 age:10 age_adaptive:2 age_floor:3 arrival:1" STUB_GETS_PER_SCRAPE=130 \
-  run_case u20 "${args[@]}"
+STUB_LIST_DATA=20 STUB_GETS_PER_SCRAPE=130 run_case u20 "${args[@]}"
 expect_rc u20 0
-check "u20: the floor default 64 and the limit 65 stamped against 20 data objects" 'j("stamps.json")["readback_folded"]["folded_catalog_get_floor"] == 64 and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] == 65 and j("stamps.json")["readback_folded"]["data_objects_flushed"] == 20 and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 35'
-check "u20: verdict not discriminating, readback-folded done" 'j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "not discriminating: limit 65 is at or above the 20 data objects flushed, so a folded and an unfolded read cannot be told apart at this profile" and "readback-folded" in j("stamps.json")["steps_completed"] and j("stamps.json")["failed_step"] is None'
+check "u20: the floor default 64 and the limit 65 stamped against 20 listed data objects" 'j("stamps.json")["readback_folded"]["folded_catalog_get_floor"] == 64 and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] == 65 and j("stamps.json")["readback_folded"]["data_objects_listed"] == 20 and j("stamps.json")["readback_folded"]["data_objects_flushed"] == 200 and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 35'
+check "u20: verdict not discriminating, readback-folded done" 'j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "not discriminating: limit 65 is at or above the 20 data objects listed, so a folded and an unfolded read cannot be told apart at this profile" and "readback-folded" in j("stamps.json")["steps_completed"] and j("stamps.json")["failed_step"] is None'
 
-# u21, u22: a cardinality-sized run, 15,248 data objects, limit
-# 64 + 0.05 x 15248 = 826.4: 826 catalog GETs are within, 827 a breach.
-cardinality_flushes="size:3048 age:10000 age_adaptive:1000 age_floor:1000 arrival:200"
+# u21, u22: a cardinality-sized run, 15,248 listed data objects, limit
+# 64 + 0.05 x 15248 = 826.4: 826 catalog GETs are within, 827 a breach. The
+# flush counters stay at 200, which would put the limit at 74.
 mapfile -t args < <(full_args "${TMP}/u21/out")
-STUB_FLUSH_PAIRS="${cardinality_flushes}" STUB_GETS_PER_SCRAPE=2826 STUB_FETCH_MISSES_PER_SCRAPE=2000 \
-  run_case u21 "${args[@]}"
+STUB_LIST_DATA=15248 STUB_GETS_PER_SCRAPE=2826 STUB_FETCH_MISSES_PER_SCRAPE=2000 run_case u21 "${args[@]}"
 expect_rc u21 0
-check "u21: 826 catalog GETs within the limit 826.4 for 15248 data objects" 'j("stamps.json")["readback_folded"]["data_objects_flushed"] == 15248 and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 826 and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] == 826.4 and j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "within" and "readback-folded" in j("stamps.json")["steps_completed"]'
+check "u21: 826 catalog GETs within the limit 826.4 for 15248 listed data objects" 'j("stamps.json")["readback_folded"]["data_objects_listed"] == 15248 and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 826 and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] == 826.4 and j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "within" and "readback-folded" in j("stamps.json")["steps_completed"]'
 mapfile -t args < <(full_args "${TMP}/u22/out")
-STUB_FLUSH_PAIRS="${cardinality_flushes}" STUB_GETS_PER_SCRAPE=2827 STUB_FETCH_MISSES_PER_SCRAPE=2000 \
-  run_case u22 "${args[@]}"
+STUB_LIST_DATA=15248 STUB_GETS_PER_SCRAPE=2827 STUB_FETCH_MISSES_PER_SCRAPE=2000 run_case u22 "${args[@]}"
 expect_rc u22 70
-expect_err "u22: message names the breach with floor, fraction and limit" "step readback-folded failed: folded read-back catalog GETs: breach: catalog_get_delta 827 exceeds 64 + 0.05 x data_objects_flushed 15248 = 826.4"
+expect_err "u22: message names the breach with floor, fraction and limit" "step readback-folded failed: folded read-back catalog GETs: breach: catalog_get_delta 827 exceeds 64 + 0.05 x data_objects_listed 15248 = 826.4"
 check "u22: stamps name readback-folded with the breach" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["catalog_get_delta"] == 827 and j("stamps.json")["readback_folded"]["catalog_get_verdict"].startswith("breach:")'
 
 # u23: the floor is passed through and stamped: floor 0 on case u's figures
-# gives the limit 0.05 x 200 = 10, and 5 catalog GETs are within it.
+# gives the limit 0.05 x 300 = 15, and 5 catalog GETs are within it.
 mapfile -t args < <(full_args "${TMP}/u23/out")
 run_case u23 "${args[@]}" --folded-catalog-get-floor 0
 expect_rc u23 0
-check "u23: floor 0 and limit 10 stamped, within" 'j("stamps.json")["readback_folded"]["folded_catalog_get_floor"] == 0 and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] == 10 and j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "within"'
+check "u23: floor 0 and limit 15 stamped, within" 'j("stamps.json")["readback_folded"]["folded_catalog_get_floor"] == 0 and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] == 15 and j("stamps.json")["readback_folded"]["catalog_get_verdict"] == "within"'
 
 # u24-u27: a floor that is not a whole number is a usage error.
 for bad in u24:abc u25:-1 u26:1.5 u27:; do
