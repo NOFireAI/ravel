@@ -54,12 +54,55 @@ pub type MetadataSnapshot = Arc<MetadataRecord>;
 /// reservation that charges them to the process memory budget (ADR-1702
 /// decision 6) for as long as any clone of the snapshot is alive. Derefs to
 /// the entries.
+///
+/// The record also says how it was read: [`MetadataRecord::read_failed`]
+/// tells an empty stand-in for a failed read apart from
+/// [`MetadataRecord::record_absent`], a read that found no record. A
+/// best-effort caller can ignore both and serve the entries.
 #[derive(Debug, Default)]
 pub struct MetadataRecord {
     entries: Vec<MetricMetadataEntry>,
+    read: ReadStatus,
     /// `None` for an empty snapshot (an absent record or a failed read),
     /// which decoded nothing.
     _reservation: Option<ravel_memory::Reservation>,
+}
+
+/// How a [`MetadataRecord`] was read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ReadStatus {
+    /// The read returned the record; the entries are its entries.
+    Present,
+    /// The read found no record; the entries are empty.
+    #[default]
+    Absent,
+    /// The read failed; the entries are an empty stand-in, not the record.
+    Failed,
+}
+
+impl MetadataRecord {
+    /// Whether this snapshot stands in for a read that failed: its entries
+    /// are empty because the read failed (the GET, the memory reservation,
+    /// or the decode), not because the
+    /// tenant has no families. The cache serves such a snapshot on the miss
+    /// that failed and on every later hit until a read succeeds and replaces
+    /// it.
+    pub fn read_failed(&self) -> bool {
+        self.read == ReadStatus::Failed
+    }
+
+    /// Whether the read behind this snapshot found no record for the tenant.
+    pub fn record_absent(&self) -> bool {
+        self.read == ReadStatus::Absent
+    }
+
+    fn empty(read: ReadStatus) -> MetadataSnapshot {
+        Arc::new(MetadataRecord {
+            entries: Vec::new(),
+            read,
+            _reservation: None,
+        })
+    }
 }
 
 impl std::ops::Deref for MetadataRecord {
@@ -265,6 +308,13 @@ impl MetadataCache {
     /// Never returns an error: a refresh failure keeps serving the stale record
     /// and is counted, and a miss whose GET fails caches an empty snapshot for
     /// the horizon rather than turning a best-effort probe into a fault.
+    ///
+    /// A caller that must not read that empty snapshot as "no families" checks
+    /// [`MetadataRecord::read_failed`]. It is set on the miss whose read
+    /// failed and on every hit served from the empty entry that miss cached,
+    /// including the past-horizon hit that starts a refresh, until a refresh
+    /// succeeds and replaces the snapshot. A failed refresh of an entry
+    /// holding a real record keeps that record, which is not flagged.
     pub async fn get(&self, tenant_hash: TenantHash) -> MetadataSnapshot {
         let now = self.shared.clock.now_ns();
 
@@ -356,14 +406,17 @@ fn charged_snapshot(
 ) -> MetadataSnapshot {
     Arc::new(MetadataRecord {
         entries,
+        read: ReadStatus::Present,
         _reservation: Some(reservation),
     })
 }
 
 /// Read a tenant's record into a snapshot. An absent record and any read error
 /// both become an empty snapshot: metadata is best-effort, so its absence or a
-/// transient store failure is not a fault to surface. A read error on the miss
-/// path is logged; the horizon then bounds how long the empty answer is served.
+/// transient store failure is not a fault to surface. The snapshot records
+/// which of the two it was, so a caller that must not serve a failed read as
+/// an empty one can tell. A read error on the miss path is logged; the horizon
+/// then bounds how long the empty answer is served.
 async fn fetch_snapshot(
     shared: &Shared,
     tenant_hash: TenantHash,
@@ -374,14 +427,14 @@ async fn fetch_snapshot(
         Ok(Some((entries, version, reservation))) => {
             (charged_snapshot(entries, reservation), Some(version))
         }
-        Ok(None) => (MetadataSnapshot::default(), None),
+        Ok(None) => (MetadataRecord::empty(ReadStatus::Absent), None),
         Err(err) => {
             tracing::warn!(
                 target: "ravel_query::metadata_cache",
                 error = %err,
                 "metric metadata read failed; serving an empty record for this horizon"
             );
-            (MetadataSnapshot::default(), None)
+            (MetadataRecord::empty(ReadStatus::Failed), None)
         }
     }
 }
@@ -389,8 +442,9 @@ async fn fetch_snapshot(
 /// Spawn the single background refresh for `tenant_hash`. The caller has already
 /// set `refreshing = true` under the lock and counted the refresh, so this is
 /// the one GET the single-flight guard admits. On success the entry's snapshot,
-/// version, and `fetched_at_ns` advance; on error the stale snapshot stays and
-/// `refresh_errors` is incremented. Either way `refreshing` clears so a later
+/// version, and `fetched_at_ns` advance; on error the stale snapshot stays,
+/// with its read status, and `refresh_errors` is incremented: an entry a
+/// failed miss cached still reads as failed. Either way `refreshing` clears so a later
 /// past-horizon request can refresh again.
 ///
 /// The read is [`read_metrics_meta_for_serve`], the same read-only reader the
@@ -420,7 +474,7 @@ fn spawn_refresh(shared: Arc<Shared>, tenant_hash: TenantHash) {
                 // The record was deleted out from under us (no role holds
                 // delete on this key today, so this is not expected, but it is
                 // representable): serve empty going forward.
-                entry.snapshot = MetadataSnapshot::default();
+                entry.snapshot = MetadataRecord::empty(ReadStatus::Absent);
                 entry.version = None;
                 entry.fetched_at_ns = now;
             }
@@ -888,10 +942,114 @@ mod tests {
         );
         assert_eq!(cache.counters().refresh_errors, 1);
 
-        // The stale record is still served after the failed refresh.
+        // The stale record is still served after the failed refresh, and it
+        // is the record, not a stand-in for a failed read.
         let again = cache.get(th).await;
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].family_name, "stable_metric");
+        assert!(
+            !again.read_failed(),
+            "a failed refresh keeps the real record"
+        );
+    }
+
+    /// The read status across a failed miss, the cached failure, a failed
+    /// refresh of it, and recovery: the miss whose GET fails returns an empty
+    /// snapshot flagged as a failed read; a hit within the horizon serves
+    /// that cached entry, still flagged, with no GET; past the horizon a
+    /// refresh that fails again leaves it flagged; the next refresh succeeds
+    /// and the snapshot is the record, unflagged. An absent record is
+    /// flagged absent and never failed.
+    ///
+    /// FLIP: flagging only the snapshot the miss returns, and caching an
+    /// unflagged one, fails "the cached failed read is still flagged".
+    /// FLIP: replacing the snapshot on a failed refresh with an unflagged
+    /// empty one fails "a failed refresh keeps the failed flag". FLIP: a flag
+    /// held on the entry and never cleared by a successful refresh fails "the
+    /// recovered read is not flagged". FLIP: building the absent snapshot as
+    /// a failed one fails "an absent record is not a failed read".
+    #[tokio::test]
+    async fn read_status_reports_a_failed_read_until_a_read_succeeds() {
+        use ravel_object_store::fault::{FaultKind, Sequence};
+
+        let inner = MemoryStore::new();
+        let th = tenant(0xF6);
+        seed(
+            &inner,
+            th,
+            &[entry("recovered_metric", MetricKind::Gauge, "help", "")],
+        )
+        .await;
+        let plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Get)
+                .with_key_contains("/m/meta")
+                .then_fault(ScriptedFault::Transient("injected miss".into()))
+                .then_fault(ScriptedFault::Transient("injected refresh".into()))
+                .then_passthrough(),
+        );
+        let fault = Arc::new(FaultStore::new(inner, plan));
+        let store = CountingStore::new(fault.clone());
+        let clock = TestClock::new(7_000);
+        let cache =
+            MetadataCache::new(store.clone(), MetadataCacheConfig::default(), clock.clone());
+
+        let miss = cache.get(th).await;
+        assert!(miss.is_empty());
+        assert!(miss.read_failed(), "the failed miss is flagged");
+        assert!(
+            !miss.record_absent(),
+            "a failed read is not an absent record"
+        );
+        assert_eq!(
+            fault.fault_count(Op::Get, FaultKind::Transient),
+            1,
+            "the injected miss fault fired"
+        );
+
+        let hit = cache.get(th).await;
+        assert!(hit.is_empty());
+        assert!(hit.read_failed(), "the cached failed read is still flagged");
+        assert_eq!(store.get_count(), 1, "the hit within the horizon is no GET");
+
+        clock.advance(Duration::from_secs(61));
+        let stale = cache.get(th).await;
+        assert!(
+            stale.read_failed(),
+            "the past-horizon hit serves the failure"
+        );
+        wait_for_refresh_errors(&cache, 1).await;
+        wait_for_refresh_to_settle(&cache, th).await;
+        assert_eq!(fault.fault_count(Op::Get, FaultKind::Transient), 2);
+        let after_failed_refresh = cache.get(th).await;
+        assert!(
+            after_failed_refresh.read_failed(),
+            "a failed refresh keeps the failed flag"
+        );
+
+        clock.advance(Duration::from_secs(61));
+        let _ = cache.get(th).await;
+        wait_for_gets(&store, 3).await;
+        wait_for_refresh_to_settle(&cache, th).await;
+        let recovered = cache.get(th).await;
+        assert!(
+            !recovered.read_failed(),
+            "the recovered read is not flagged"
+        );
+        assert!(!recovered.record_absent());
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].family_name, "recovered_metric");
+        assert_eq!(store.get_count(), 3, "one miss and two refresh GETs");
+
+        let absent_tenant = tenant(0xF7);
+        let absent = cache.get(absent_tenant).await;
+        assert!(absent.is_empty());
+        assert!(
+            !absent.read_failed(),
+            "an absent record is not a failed read"
+        );
+        assert!(absent.record_absent());
+        let absent_hit = cache.get(absent_tenant).await;
+        assert!(absent_hit.record_absent() && !absent_hit.read_failed());
     }
 
     #[tokio::test]
