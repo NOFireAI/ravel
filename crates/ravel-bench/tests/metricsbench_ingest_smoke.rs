@@ -668,16 +668,52 @@ fn stub_receiver(db: StubTsdb) -> axum::Router {
 /// [`stub_receiver`], storing native histograms only when `histograms` is
 /// set: VictoriaMetrics acknowledges them without storing them.
 fn stub_receiver_storing(db: StubTsdb, histograms: bool) -> axum::Router {
+    stub_receiver_with(db, histograms, StubObserver::default())
+}
+
+/// What a stub receiver reports to its test: the write requests it was
+/// sent, the `min_commit_token` values its queries carried, and the
+/// `x-ravel-commit-token` it answers each write with, if any.
+#[derive(Clone, Default)]
+struct StubObserver {
+    writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    fences: std::sync::Arc<Mutex<Vec<String>>>,
+    token: Option<String>,
+}
+
+impl StubObserver {
+    fn writes(&self) -> usize {
+        self.writes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn record_fences(&self, params: &[(String, String)]) {
+        self.fences.lock().unwrap().extend(
+            params
+                .iter()
+                .filter(|(name, _)| name == "min_commit_token")
+                .map(|(_, value)| value.clone()),
+        );
+    }
+}
+
+/// [`stub_receiver_storing`], reporting to `observer`.
+fn stub_receiver_with(db: StubTsdb, histograms: bool, observer: StubObserver) -> axum::Router {
     use ravel_remote_write::proto::prometheus::WriteRequest;
 
     let write_db = db.clone();
     let series_db = db.clone();
+    let write_observer = observer.clone();
+    let series_observer = observer.clone();
     axum::Router::new()
         .route(
             "/api/v1/write",
             axum::routing::post(move |body: axum::body::Bytes| {
                 let db = write_db.clone();
+                let observer = write_observer.clone();
                 async move {
+                    observer
+                        .writes
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let raw = snap::raw::Decoder::new()
                         .decompress_vec(&body)
                         .expect("snappy body");
@@ -696,7 +732,15 @@ fn stub_receiver_storing(db: StubTsdb, histograms: bool) -> axum::Router {
                             points.push((h.timestamp, StubPoint::Histogram));
                         }
                     }
-                    axum::http::StatusCode::NO_CONTENT
+                    let mut response = axum::response::Response::new(axum::body::Body::empty());
+                    *response.status_mut() = axum::http::StatusCode::NO_CONTENT;
+                    if let Some(token) = &observer.token {
+                        response.headers_mut().insert(
+                            "x-ravel-commit-token",
+                            axum::http::HeaderValue::from_str(token).expect("header value"),
+                        );
+                    }
+                    response
                 }
             }),
         )
@@ -705,6 +749,7 @@ fn stub_receiver_storing(db: StubTsdb, histograms: bool) -> axum::Router {
             axum::routing::get(
                 move |axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>| {
                     let db = series_db.clone();
+                    series_observer.record_fences(&params);
                     async move {
                         let param = |k: &str| {
                             params
@@ -744,6 +789,7 @@ fn stub_receiver_storing(db: StubTsdb, histograms: bool) -> axum::Router {
             axum::routing::get(
                 move |axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>| {
                     let db = db.clone();
+                    observer.record_fences(&params);
                     async move {
                         let param = |k: &str| {
                             params
@@ -1362,4 +1408,364 @@ fn a_later_hard_failure_after_a_failed_readback_keeps_the_report() {
     assert_eq!(mimir["readback"]["matches_expected"], true, "{mimir}");
     assert!(report.get("stalled").is_none(), "{report}");
     assert!(report.get("failed_replays").is_none(), "{report}");
+}
+
+/// Serve `app` on `runtime` and return its base URL.
+fn spawn_stub(runtime: &tokio::runtime::Runtime, app: axum::Router) -> String {
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .expect("bind stub");
+    let addr = listener.local_addr().expect("addr");
+    runtime.spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// The commit token the Ravel-like stub answers every write with.
+fn stub_commit_token() -> String {
+    ravel_types::CommitToken {
+        shard: 0,
+        writer_id: uuid::Uuid::from_u128(0x5eed),
+        epoch: 1,
+        seq: 1,
+        ingest_hour_bucket: 488_888,
+    }
+    .encode()
+}
+
+/// Replay `steps` scrapes of `ci` into the Ravel-like stub at `url` as the
+/// portable Ravel row only, writing the report to `ingest_json` as
+/// `deploy/metricsbench/run.sh` writes it.
+fn replay_ravel_row(url: &str, steps: u64, ingest_json: &std::path::Path) {
+    let stdout = std::fs::File::create(ingest_json).expect("create ingest.json");
+    let anchor = on_grid_anchor().to_string();
+    let write = format!("{url}/api/v1/write");
+    let output = Command::new(env!("CARGO_BIN_EXE_metricsbench_ingest"))
+        .args([
+            "--profile",
+            "ci",
+            "--steps",
+            &steps.to_string(),
+            "--anchor-ms",
+            &anchor,
+            "--no-in-process-row",
+            "--http-batch-size",
+            "4096",
+            "--readback-timeout-secs",
+            "10",
+            "--ravel-endpoint",
+            &write,
+            "--ravel-tenant",
+            "metricsbench",
+            "--ravel-query-url",
+            url,
+        ])
+        .stdout(stdout)
+        .output()
+        .expect("spawn metricsbench_ingest");
+    assert!(
+        output.status.success(),
+        "status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Run `--readback-only` over the `ci` profile with `extra` arguments and
+/// return its exit code, stdout and stderr.
+fn run_readback_only(extra: &[&str]) -> (Option<i32>, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_metricsbench_ingest"))
+        .args([
+            "--readback-only",
+            "--profile",
+            "ci",
+            "--readback-timeout-secs",
+            "10",
+            "--readback-settle-secs",
+            "0",
+        ])
+        .args(extra)
+        .output()
+        .expect("spawn metricsbench_ingest");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// `--readback-only` reads the portable Ravel row of a kept `ingest.json`
+/// back without sending a write: against the stub the replay wrote to it
+/// exits 0 with `readback.matches_expected` true, the same expected figures
+/// the replay's own read-back recorded, every query fenced by the row's
+/// commit token, and no write request; against a stub holding one series
+/// fewer it exits 1 with the mismatch in the JSON.
+///
+/// TO SEE THIS FAIL: in `run_readback_only`, pass a row with
+/// `commit_tokens_by_shard` cleared to `readback_over_http` (the fence
+/// assertion fails), or rebuild the plan for `Receiver::VictoriaMetrics`
+/// (the expected histogram figures then differ from the replay's).
+#[test]
+fn readback_only_reads_a_kept_report_back_without_writing() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let db = StubTsdb::default();
+    let observer = StubObserver {
+        token: Some(stub_commit_token()),
+        ..StubObserver::default()
+    };
+    let url = spawn_stub(
+        &runtime,
+        stub_receiver_with(db.clone(), true, observer.clone()),
+    );
+    let out_dir = tempfile::tempdir().expect("temp dir");
+    let ingest_json = out_dir.path().join("ingest.json");
+    replay_ravel_row(&url, 2, &ingest_json);
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ingest_json).expect("read ingest.json"))
+            .expect("ingest.json is a JSON report");
+    let replayed = &report["systems"][0];
+    assert_eq!(replayed["system"], "ravel");
+    assert_eq!(replayed["readback"]["matches_expected"], true, "{replayed}");
+    let writes_after_replay = observer.writes();
+    assert!(writes_after_replay > 0);
+    observer.fences.lock().unwrap().clear();
+
+    let report_path = ingest_json.to_str().expect("utf-8 path").to_string();
+    let anchor = on_grid_anchor().to_string();
+    let read = |query_url: &str| {
+        run_readback_only(&[
+            "--ingest-report",
+            &report_path,
+            "--readback-system",
+            "ravel",
+            "--anchor-ms",
+            &anchor,
+            "--ravel-query-url",
+            query_url,
+        ])
+    };
+
+    let (code, stdout, stderr) = read(&url);
+    assert_eq!(code, Some(0), "{stderr}");
+    let output: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+    assert_eq!(output["system"], "ravel");
+    assert!(output.get("readback_error").is_none(), "{output}");
+    let readback = &output["readback"];
+    assert_eq!(readback["matches_expected"], true, "{output}");
+    assert_eq!(readback["expected"], replayed["readback"]["expected"]);
+    let series = readback["expected"]["series_count"]
+        .as_u64()
+        .expect("series_count");
+    assert!(series > 0, "{output}");
+    assert_eq!(output["plan_series_count"], series, "{output}");
+    assert_eq!(observer.writes(), writes_after_replay, "no write was sent");
+    let fences = observer.fences.lock().unwrap().clone();
+    assert!(!fences.is_empty(), "every query carries the fence");
+    assert!(
+        fences.iter().all(|f| *f == stub_commit_token()),
+        "{fences:?}"
+    );
+
+    let mut short_db = db.lock().unwrap().clone();
+    let dropped = short_db.keys().next().cloned().expect("a stored series");
+    short_db.remove(&dropped);
+    let short_observer = StubObserver::default();
+    let short_url = spawn_stub(
+        &runtime,
+        stub_receiver_with(
+            std::sync::Arc::new(Mutex::new(short_db)),
+            true,
+            short_observer.clone(),
+        ),
+    );
+    let (code, stdout, stderr) = read(&short_url);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("does not match"), "{stderr}");
+    let output: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+    let readback = &output["readback"];
+    assert_eq!(readback["matches_expected"], false, "{output}");
+    assert_eq!(readback["series_count"], series - 1, "{output}");
+    let mismatches = readback["mismatches"].as_array().expect("mismatches");
+    assert!(
+        mismatches
+            .iter()
+            .any(|m| m.as_str().is_some_and(|m| m.contains("series_count"))),
+        "{output}"
+    );
+    assert_eq!(short_observer.writes(), 0, "no write was sent");
+}
+
+/// Each `--readback-only` refusal exits 64 with a message naming the
+/// problem, before any read: a write endpoint flag, a missing flag, no row
+/// or two rows for the system, a row that recorded no successful ingest
+/// (`row_failure`, or listed under `stalled`), and a profile, workload
+/// digest or anchor that differs from the report's.
+#[test]
+fn readback_only_refusals_exit_64() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let observer = StubObserver {
+        token: Some(stub_commit_token()),
+        ..StubObserver::default()
+    };
+    let url = spawn_stub(
+        &runtime,
+        stub_receiver_with(StubTsdb::default(), true, observer.clone()),
+    );
+    let out_dir = tempfile::tempdir().expect("temp dir");
+    let ingest_json = out_dir.path().join("ingest.json");
+    replay_ravel_row(&url, 1, &ingest_json);
+    let writes_after_replay = observer.writes();
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ingest_json).expect("read ingest.json"))
+            .expect("ingest.json is a JSON report");
+    let variant = |name: &str, edit: &dyn Fn(&mut serde_json::Value)| -> String {
+        let mut edited = report.clone();
+        edit(&mut edited);
+        let path = out_dir.path().join(name);
+        std::fs::write(&path, serde_json::to_string(&edited).expect("serialize")).expect("write");
+        path.to_str().expect("utf-8 path").to_string()
+    };
+    let kept = ingest_json.to_str().expect("utf-8 path").to_string();
+    let twice = variant("twice.json", &|r| {
+        let row = r["systems"][0].clone();
+        r["systems"].as_array_mut().expect("systems").push(row);
+    });
+    let row_failure = variant("row_failure.json", &|r| {
+        r["systems"][0]["row_failure"] = serde_json::json!({"band": 6, "error": "band 6"});
+    });
+    let stalled = variant("stalled.json", &|r| {
+        r["systems"] = serde_json::json!([]);
+        r["stalled"] = serde_json::json!([{
+            "system": "ravel",
+            "endpoint": "http://r/api/v1/write",
+            "projected_secs": 1200.0,
+            "ceiling_secs": 600,
+            "offered_points": 50,
+            "stream_points": 1000,
+            "error": "projected past the ceiling",
+        }]);
+    });
+    let other_digest = variant("digest.json", &|r| {
+        r["profile"]["run"]["workload_digest"] = serde_json::json!("00");
+    });
+    let anchor = on_grid_anchor().to_string();
+    let other_anchor = (on_grid_anchor() + ci_interval_ms()).to_string();
+    let write = format!("{url}/api/v1/write");
+
+    let cases: Vec<(Vec<&str>, &str)> = vec![
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--readback-system",
+                "ravel",
+                "--ravel-endpoint",
+                &write,
+            ],
+            "--ravel-endpoint replays into a system, and --readback-only sends no write",
+        ),
+        (
+            vec!["--readback-system", "ravel"],
+            "--readback-only needs --ingest-report",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &kept,
+                "--readback-system",
+                "mimir",
+                "--mimir-query-url",
+                &url,
+            ],
+            "the ingest report has no row for mimir",
+        ),
+        (
+            vec!["--ingest-report", &twice, "--readback-system", "ravel"],
+            "the ingest report has 2 rows for ravel",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &row_failure,
+                "--readback-system",
+                "ravel",
+            ],
+            "row recorded no successful ingest: it carries row_failure",
+        ),
+        (
+            vec!["--ingest-report", &stalled, "--readback-system", "ravel"],
+            "row recorded no successful ingest: it stalled",
+        ),
+        (
+            vec![
+                "--ingest-report",
+                &other_digest,
+                "--readback-system",
+                "ravel",
+            ],
+            "the ingest report's workload digest is 00",
+        ),
+    ];
+    for (extra, message) in cases {
+        let mut argv = vec!["--anchor-ms", anchor.as_str(), "--ravel-query-url", &url];
+        argv.extend(extra);
+        let (code, stdout, stderr) = run_readback_only(&argv);
+        assert_eq!(code, Some(64), "{argv:?}: {stderr}");
+        assert!(stderr.contains(message), "{argv:?}: {stderr}");
+        assert!(stdout.is_empty(), "{argv:?}: {stdout}");
+    }
+
+    let (code, _, stderr) = run_readback_only(&[
+        "--ingest-report",
+        &kept,
+        "--readback-system",
+        "ravel",
+        "--anchor-ms",
+        &other_anchor,
+        "--ravel-query-url",
+        &url,
+    ]);
+    assert_eq!(code, Some(64), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "the ingest report's anchor is {anchor}, but the arguments give {other_anchor}"
+        )),
+        "{stderr}"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_metricsbench_ingest"))
+        .args([
+            "--readback-only",
+            "--profile",
+            "cardinality",
+            "--anchor-ms",
+            &anchor,
+            "--ingest-report",
+            &kept,
+            "--readback-system",
+            "ravel",
+            "--ravel-query-url",
+            &url,
+        ])
+        .output()
+        .expect("spawn metricsbench_ingest");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(64), "{stderr}");
+    assert!(
+        stderr
+            .contains("the ingest report's profile name is ci, but the arguments give cardinality"),
+        "{stderr}"
+    );
+    assert_eq!(observer.writes(), writes_after_replay, "no refusal wrote");
 }
