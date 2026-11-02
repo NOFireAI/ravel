@@ -23,10 +23,17 @@ peak minus stored, over peak.
 | 16 vCPU | 283k lines/s (280k step) | 300k to 340k | 248k to 260k | 8% to 12% | #3492 comment 6589850073 |
 | 2 x 8 vCPU, one Service | 261k lines/s (280k step, 9% dropped) | 300k to 340k | 227k to 248k | 5% to 13% | #3492 comment 6589850073 |
 
-The two-replica row held 243k with no drops (240k step) and peaked at 261k
-with drops at the 280k step, because one replica saturated at 220k and the
-other never did. Its loss grows with the excess load like the others, from a
-peak set by its busier replica.
+The two-replica row is on a different basis from the other two.
+- **Clean step:** it held 243k with no drops at the 240k step. Measured from
+  there, its 300k to 340k steps stored between 7% less and 2% more, so at the
+  topology level there is no clear collapse.
+- **Peak:** it peaked at 261k at the 280k step, with drops, because one
+  replica saturated at 220k and the other never did.
+
+The collapse is per replica: the busier one was in the overloaded signature
+from 220k on (#3492 comment 6589850073). The topology-level figure
+understates it, because the idle replica's spare cores absorb part of the
+loss.
 
 The overloaded state has one signature on every topology:
 - every core is busy;
@@ -85,10 +92,29 @@ above and no clean step.
 ### D2. While saturated, refuse a growing fraction of new ingest requests at the head
 
 The detector keeps a shed fraction `p` between 0 and `--ingest-cpu-shed-max`
-(default 0.9). While saturated, `p` rises by 0.05 every 100 ms. While not
-saturated, it halves every 100 ms. Each new ingest request draws once against
-`p`: refused requests get 429 with `Retry-After: 1` on OTLP HTTP and Remote
-Write, and `RESOURCE_EXHAUSTED` on gRPC.
+(default 0.9). Each sample it moves `p` by one of three rules, with CPU use
+and deferred triggers averaged over 1 s as in D1:
+
+| CPU use | Deferred triggers | `p` |
+|---|---|---|
+| at or above the threshold | above zero (saturated) | rises by 0.05 |
+| at or above the release level (threshold minus 0.05, so 0.90 by default) | zero | holds |
+| below the release level | any | falls by 10% of itself |
+
+The middle row is what lets `p` settle. Once shedding brings the admitted
+load just under the ceiling, deferrals stop but CPU use stays near the
+ceiling: a clean step at the ceiling runs at about 91% of the node (#3492
+comment 6579509683). So `p` holds instead of collapsing back into the
+overload.
+
+The rule that lowers `p` needs CPU to fall clear of the ceiling, and it falls
+slower than it rises: from 0.5 to under 0.05 takes about 2.2 s, against
+1 s to climb from 0 to 0.5. A drop in offered load releases the shed within
+seconds, and a server sitting at its ceiling does not cycle.
+
+Each new ingest request draws once against `p`. Refused requests get 429
+with `Retry-After: 1` on OTLP HTTP and Remote Write, and
+`RESOURCE_EXHAUSTED` on gRPC.
 
 The check runs at the request head, before the body is read or decoded, and
 before the tenant is resolved: right after the in-flight permit, in the order
@@ -96,7 +122,8 @@ that permit already keeps (a shed is answered before a credential check, so
 a saturated node does no tenant resolution for a request it will refuse):
 - in `admit_ingest_request` (`services/ravel-server/src/ingest_admission.rs`),
   answered through `refuse_from_head`, which drains the body without decoding
-  it;
+  it. The in-flight permit is released before the refusal, as the
+  pending-ack shed already does, so a drain does not hold an in-flight slot;
 - in `GrpcIngestAdmissionLayer::call` at the same point for gRPC.
 
 So an unauthenticated request that arrives while shedding gets 429, not 401,
@@ -116,8 +143,12 @@ and `ravel_ingest_buffer_shed_total`. The current `p` exports as the gauge
 `ravel_ingest_cpu_shed_fraction`.
 
 A probabilistic fraction, rather than refusing everything while saturated,
-lets the admitted load settle just under the ceiling instead of oscillating
-between full refusal and overload.
+admits a steady share of the load. With the hold band above, that share
+settles just under the ceiling instead of oscillating between full refusal
+and overload.
+
+Whether it settles is a measured question, not an assumption. D4 reports `p`
+over time, and a cycle that drops back into overload fails D4's first bar.
 
 ### D3. Defaults scale with the node; one flag turns it off
 
@@ -144,7 +175,7 @@ flowchart LR
   subgraph det["saturation detector, every 100 ms (D1)"]
     U["process CPU / cores"] --> S{"saturated?\nCPU at least 0.95\nand deferred triggers above 0"}
     Q["deferred flush triggers\n(per-shard counters)"] --> S
-    S --> PF["p: +0.05 while saturated,\nhalved otherwise"]
+    S --> PF["p: +0.05 while saturated,\nheld while CPU at least 0.90,\n-10% of p below that"]
   end
   F -. defers triggers .-> Q
   PF -. sets p .-> C
@@ -165,9 +196,13 @@ detector on its defaults:
 Each run also reports, without a bar:
 - `ravel_ingest_head_refusal_undrained_total` by reason, against the CPU
   sheds;
-- the client's connection count.
+- the client's connection count;
+- `ravel_ingest_cpu_shed_fraction` over time, with the share of each window
+  spent in the overloaded signature (size-triggered flushes at the backstop,
+  deferred triggers above zero).
 
-Together they show how many refusals forced a reconnect (Consequences).
+The first two show how many refusals forced a reconnect (Consequences). The
+third shows whether `p` settled or cycled (D2).
 
 ## Rejected alternatives
 
@@ -207,10 +242,14 @@ Together they show how many refusals forced a reconnect (Consequences).
     with `Connection: close`, so an HTTP/1 exporter reconnects, and with TLS
     re-handshakes, for each one. That spends CPU on connection setup while
     the node is shedding for CPU.
-  - **Implementation and measurement.** Before raising the drain caps, the
-    implementation measures this (D4 reports the undrained count). If
-    reconnects dominate, it answers a CPU shed with `Connection: close` only
-    when the drain cap is reached, not on every undrained case.
+  - **`Connection: close` stays mandatory.** Every refusal that leaves the
+    body unread keeps the header. A reused HTTP/1.1 connection would
+    otherwise parse the unread body bytes as the next request.
+  - **The caps are the lever.** If D4's undrained count shows reconnects
+    dominate, the change is to raise the drain caps
+    (`HEAD_REFUSAL_DRAIN_MAX_CONCURRENT` and `HEAD_REFUSAL_DRAIN_MAX_BYTES`
+    in `services/ravel-server/src/ingest_admission.rs`), measured, not to
+    drop the header.
   - **gRPC is cheaper.** gRPC is refused per stream on a kept connection, so
     it pays no reconnect.
 - On a node shared with other CPU-heavy work, the process's own CPU use
