@@ -18,6 +18,7 @@ pub mod describe_data;
 pub mod explain_query;
 pub mod find_labels;
 pub mod get_trace;
+pub mod query_promql;
 pub mod query_sql;
 
 use crate::budget::McpEffectiveBudgets;
@@ -78,6 +79,7 @@ pub const SERVED_TOOLS: &[&str] = &[
     "ravel_find_labels",
     "ravel_explain_query",
     "ravel_query_sql",
+    "ravel_query_promql",
     "ravel_get_trace",
 ];
 
@@ -97,7 +99,7 @@ pub async fn dispatch<B: QueryBackend>(
         "ravel_find_labels" => Ok(find_labels::run(args, ctx, backend).await),
         "ravel_explain_query" => Ok(explain_query::run(args, ctx, backend).await),
         "ravel_query_sql" => Ok(query_sql::run(args, ctx, backend).await),
-        "ravel_query_promql" => Err(ToolError::NotShipped("ravel_query_promql")),
+        "ravel_query_promql" => Ok(query_promql::run(args, ctx, backend).await),
         "ravel_search_logs" => Err(ToolError::NotShipped("ravel_search_logs")),
         "ravel_get_trace" => Ok(get_trace::run(args, ctx, backend).await),
         "ravel_analyze_timeseries" => Err(ToolError::NotShipped("ravel_analyze_timeseries")),
@@ -243,14 +245,19 @@ mod tests {
         pub(crate) order_columns: Vec<String>,
     }
 
-    /// A backend whose `sql_explain`, `sql_execute`, `labels`, `label_values`
-    /// and `describe_data` answer what the test configured and record the
-    /// request they were handed. Every other method, and any of those left
-    /// unconfigured, panics: a test built on it proves the body never reached
-    /// that call. `describe` and `sql` are queues, one answer per call, so a
-    /// paging test configures each page's answer in order.
+    /// A backend whose `sql_explain`, `sql_execute`, `labels`, `label_values`,
+    /// `describe_data`, `promql_instant` and `promql_range` answer what the
+    /// test configured and record the request they were handed. Every other
+    /// method, and any of those left unconfigured, panics: a test built on it
+    /// proves the body never reached that call. `describe`, `sql` and
+    /// `promql` are queues, one answer per call, so a paging test configures
+    /// each page's answer in order; the two PromQL methods share `promql`.
     #[derive(Default)]
     pub(crate) struct Stub {
+        pub(crate) promql:
+            std::cell::RefCell<std::collections::VecDeque<Result<Envelope, Failure>>>,
+        pub(crate) instants: std::cell::RefCell<Vec<InstantRequest>>,
+        pub(crate) ranges: std::cell::RefCell<Vec<RangeRequest>>,
         pub(crate) explain: Option<crate::draft::ExplainOutcome>,
         pub(crate) listed: Option<Envelope>,
         pub(crate) explained: std::cell::RefCell<Vec<ravel_sql::SqlRequest>>,
@@ -275,17 +282,25 @@ mod tests {
         async fn promql_instant(
             &self,
             _tenant_hash: TenantHash,
-            _request: &InstantRequest,
+            request: &InstantRequest,
         ) -> Result<Envelope, Failure> {
-            panic!("promql_instant must not be reached")
+            let Some(answer) = self.promql.borrow_mut().pop_front() else {
+                panic!("promql_instant must not be reached");
+            };
+            self.instants.borrow_mut().push(request.clone());
+            answer
         }
 
         async fn promql_range(
             &self,
             _tenant_hash: TenantHash,
-            _request: &RangeRequest,
+            request: &RangeRequest,
         ) -> Result<Envelope, Failure> {
-            panic!("promql_range must not be reached")
+            let Some(answer) = self.promql.borrow_mut().pop_front() else {
+                panic!("promql_range must not be reached");
+            };
+            self.ranges.borrow_mut().push(request.clone());
+            answer
         }
 
         async fn labels(
@@ -403,8 +418,8 @@ mod tests {
     /// Drive a future that is ready on its first poll, so this crate needs no
     /// async runtime to test dispatch. Every path `dispatch` takes in this
     /// build on an empty argument object is immediate: `ravel_capabilities`
-    /// reads no store, the five query bodies refuse an empty argument object
-    /// before reaching their backend, and the three refusals return before
+    /// reads no store, the six query bodies refuse an empty argument object
+    /// before reaching their backend, and the two refusals return before
     /// awaiting anything. The stub backends in this crate's tests answer
     /// without awaiting too.
     pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
@@ -419,9 +434,9 @@ mod tests {
     }
 
     /// Every name in the catalog reaches `dispatch`, and `dispatch` refuses
-    /// anything else. The counts are exact on purpose: the three bodies not in
+    /// anything else. The counts are exact on purpose: the two bodies not in
     /// this build must each answer `NotShipped` rather than a placeholder
-    /// envelope, and the six bodies this build carries must answer an
+    /// envelope, and the seven bodies this build carries must answer an
     /// envelope.
     #[test]
     fn dispatch_routes_every_catalog_name_and_refuses_unknown_names() {
@@ -449,10 +464,11 @@ mod tests {
                 Ok(envelope)
                     if name == "ravel_find_labels"
                         || name == "ravel_explain_query"
-                        || name == "ravel_query_sql" =>
+                        || name == "ravel_query_sql"
+                        || name == "ravel_query_promql" =>
                 {
                     // Served, and an empty argument object has no time_range
-                    // (and, for the SQL tools, no query): D4's
+                    // (and, for the SQL and PromQL tools, no query): D4's
                     // missing_argument.
                     assert_eq!(envelope.status, crate::envelope::Status::Error);
                     assert_eq!(
@@ -483,10 +499,11 @@ mod tests {
                 "ravel_find_labels".to_string(),
                 "ravel_explain_query".to_string(),
                 "ravel_query_sql".to_string(),
+                "ravel_query_promql".to_string(),
                 "ravel_get_trace".to_string()
             ]
         );
-        assert_eq!(not_shipped.len(), 3);
+        assert_eq!(not_shipped.len(), 2);
 
         // What `ravel_capabilities` reports is the same split, name for name:
         // `enabled` is what dispatch runs, `catalogued` is what it refuses. A
