@@ -27,6 +27,7 @@ mod log_shard;
 mod metrics;
 mod metrics_meta_sink;
 mod pending_ack;
+mod read_backoff;
 mod reconcile;
 mod router;
 mod shard;
@@ -85,6 +86,10 @@ pub use metrics_meta_sink::{
     MetadataSinkConfig, catalog_metric_kind,
 };
 pub use pending_ack::{PendingAckBudget, PendingAckPermit};
+pub use read_backoff::{
+    PROVISIONING_READ_BACKOFF_INITIAL_NS, PROVISIONING_READ_BACKOFF_MAX_NS, ProvisioningReadCause,
+    ProvisioningReadFailures, ReadBackoff, ReadBackoffEntry,
+};
 pub use reconcile::{
     DEFAULT_ADMISSION_RECONCILE_INTERVAL, ReconcileCycleStats, reconcile_once, snapshot_key,
 };
