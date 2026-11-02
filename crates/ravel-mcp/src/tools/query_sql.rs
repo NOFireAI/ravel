@@ -455,3 +455,496 @@ fn step(action: &str, detail: &str) -> NextStep {
         detail: detail.to_string(),
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_query::erasure::ErasurePredicate;
+    use serde_json::json;
+
+    use super::*;
+    use crate::cursor::{CURSOR_KEY_LEN, CursorKey};
+    use crate::envelope::{Cell, Column};
+    use crate::tools::tests::{Stub, block_on, test_context};
+
+    const TOTAL: &str = "SELECT * FROM samples ORDER BY ts";
+    const GROUPED: &str = "SELECT * FROM logs ORDER BY ts";
+    const START_NS: i64 = 3_600_000_000_000;
+    const END_NS: i64 = 3 * 3_600_000_000_000;
+    /// The later pages' clock, a minute after page one's.
+    const LATER_NS: i64 = END_NS + 60_000_000_000;
+
+    fn key() -> CursorKey {
+        CursorKey::from_process_secret([0x51u8; CURSOR_KEY_LEN])
+    }
+
+    fn args(query: &str, cursor: Option<&str>) -> Value {
+        let mut args = json!({
+            "query": query,
+            "time_range": {"start_ns": START_NS.to_string(), "end_ns": END_NS.to_string()},
+        });
+        if let Some(cursor) = cursor {
+            args["cursor"] = json!(cursor);
+        }
+        args
+    }
+
+    /// The `samples` order tuple of row `i`: its `ts` and its `series_id`.
+    fn sample(i: u8) -> Vec<ResumeValue> {
+        vec![
+            ResumeValue::TimestampNanos(START_NS + i64::from(i) * 1_000),
+            ResumeValue::FixedSizeBinary(vec![i; 16]),
+        ]
+    }
+
+    /// The `logs` order tuple of a row at `ts` offset `i`.
+    fn log_at(i: u8) -> Vec<ResumeValue> {
+        vec![ResumeValue::TimestampNanos(START_NS + i64::from(i) * 1_000)]
+    }
+
+    /// What the executor answers for one page: one row per tuple, under
+    /// `signal`'s snapshot with `erasure` pending, resolved at `resolve_at_ns`.
+    fn draft_of(
+        signal: Signal,
+        tuples: Vec<Option<Vec<ResumeValue>>>,
+        erasure: Vec<ErasurePredicate>,
+        resolve_at_ns: i64,
+    ) -> Draft {
+        let mut envelope = Envelope::default();
+        envelope.ids.query_id = "q".to_owned();
+        envelope.ids.audit_ref = "a".to_owned();
+        envelope.data.columns = vec![Column {
+            name: "row".to_owned(),
+            r#type: "string".to_owned(),
+        }];
+        envelope.data.rows = tuples
+            .iter()
+            .map(|tuple| vec![Cell::Str(format!("{tuple:?}"))])
+            .collect();
+        envelope.data.row_count = tuples.len() as u64;
+        Draft::new(
+            envelope,
+            Ok(signal),
+            erasure,
+            Vec::new(),
+            Some(2),
+            resolve_at_ns,
+        )
+        .with_order_tuples(tuples)
+    }
+
+    fn samples(rows: &[u8]) -> Draft {
+        draft_of(
+            Signal::Metrics,
+            rows.iter().map(|&i| Some(sample(i))).collect(),
+            Vec::new(),
+            END_NS,
+        )
+    }
+
+    fn logs(rows: &[u8]) -> Draft {
+        draft_of(
+            Signal::Logs,
+            rows.iter().map(|&i| Some(log_at(i))).collect(),
+            Vec::new(),
+            END_NS,
+        )
+    }
+
+    /// A context at page one's clock (`END_NS`) with a two-row cap.
+    fn context(key: &CursorKey) -> ToolContext<'_> {
+        let mut ctx = test_context(key);
+        ctx.now_ns = END_NS;
+        ctx.budgets.max_rows = 2;
+        ctx
+    }
+
+    fn later(key: &CursorKey) -> ToolContext<'_> {
+        let mut ctx = context(key);
+        ctx.now_ns = LATER_NS;
+        ctx
+    }
+
+    fn statement(query: &str, resume: Option<Vec<ResumeValue>>) -> String {
+        ravel_sql::plan_page(query, resume.map(ResumePosition::new).as_ref())
+            .expect("the statement pages")
+            .statement
+    }
+
+    fn actions(envelope: &Envelope) -> Vec<&str> {
+        envelope
+            .next_steps
+            .iter()
+            .map(|step| step.action.as_str())
+            .collect()
+    }
+
+    fn failure_class(envelope: &Envelope) -> FailureClass {
+        assert_eq!(envelope.status, Status::Error, "{envelope:?}");
+        envelope.failure.as_ref().expect("an error carries one").class
+    }
+
+    /// A three-page walk under a total order: each page runs the planned
+    /// statement with the executor's cap at `max_rows` (so it returns the
+    /// k+1 row), keeps two rows and resumes after the second, and the last
+    /// page is `ok` with no cursor. Every page reports one snapshot id.
+    ///
+    /// FLIP: resuming from the k+1 row instead of the last kept row makes
+    /// page two's statement start after row 3 and skip it.
+    /// FLIP: dropping the planner's `series_id` tiebreak from the order
+    /// columns encodes a one-value tuple the second page's plan refuses.
+    #[test]
+    fn a_total_order_walks_three_pages_by_keyset() {
+        let key = key();
+        let stub = Stub::default();
+        stub.sql
+            .borrow_mut()
+            .extend([samples(&[1, 2, 3]), samples(&[3, 4, 5]), samples(&[5])]);
+
+        let one = block_on(run(args(TOTAL, None), &context(&key), &stub));
+        assert_eq!(one.status, Status::OkPage, "{one:?}");
+        assert_eq!(one.data.rows.len(), 2);
+        assert_eq!(one.scope.order_by, ["\"ts\" ASC", "\"series_id\" ASC"]);
+        let cursor = one.presentation.cursor.clone().expect("page one's cursor");
+
+        let two = block_on(run(args(TOTAL, Some(&cursor)), &later(&key), &stub));
+        assert_eq!(two.status, Status::OkPage, "{two:?}");
+        assert_eq!(two.data.rows.len(), 2);
+        let cursor = two.presentation.cursor.clone().expect("page two's cursor");
+
+        let three = block_on(run(args(TOTAL, Some(&cursor)), &later(&key), &stub));
+        assert_eq!(three.status, Status::Ok, "{three:?}");
+        assert_eq!(three.data.rows.len(), 1);
+        assert_eq!(three.presentation.cursor, None);
+
+        let executed = stub.executed.borrow();
+        let statements: Vec<&str> = executed.iter().map(|c| c.request.sql.as_str()).collect();
+        assert_eq!(
+            statements,
+            [
+                statement(TOTAL, None),
+                statement(TOTAL, Some(sample(2))),
+                statement(TOTAL, Some(sample(4))),
+            ]
+        );
+        for call in executed.iter() {
+            assert_eq!(call.order_columns, ["ts", "series_id"]);
+            assert_eq!(call.request.max_rows, Some(2));
+            assert!(call.request.row_window);
+            assert_eq!(
+                (call.request.window.start_ns, call.request.window.end_ns),
+                (START_NS, END_NS)
+            );
+        }
+        assert_eq!(one.visibility.snapshot_id, two.visibility.snapshot_id);
+        assert_eq!(one.visibility.snapshot_id, three.visibility.snapshot_id);
+        assert!(two.visibility.pinned && three.visibility.pinned);
+    }
+
+    /// A later page resolves at the instant page one minted its cursor at and
+    /// carries its own clock as the request's `now_ns`, which is what the
+    /// audit record and the deadline read.
+    ///
+    /// FLIP: resolving a later page at its own clock reads a snapshot page
+    /// one never saw (`resolve_at_ns` would be `LATER_NS`).
+    /// FLIP: sending page one's instant as `now_ns` audits the later call at
+    /// a time it did not run.
+    #[test]
+    fn a_later_page_resolves_at_the_mint_instant_and_runs_at_its_own_clock() {
+        let key = key();
+        let stub = Stub::default();
+        stub.sql
+            .borrow_mut()
+            .extend([samples(&[1, 2, 3]), samples(&[3])]);
+
+        let one = block_on(run(args(TOTAL, None), &context(&key), &stub));
+        let cursor = one.presentation.cursor.expect("page one's cursor");
+        let two = block_on(run(args(TOTAL, Some(&cursor)), &later(&key), &stub));
+        assert_eq!(two.status, Status::Ok, "{two:?}");
+
+        let executed = stub.executed.borrow();
+        assert_eq!(
+            executed
+                .iter()
+                .map(|c| (c.resolve_at_ns, c.request.now_ns))
+                .collect::<Vec<_>>(),
+            [(END_NS, END_NS), (END_NS, LATER_NS)]
+        );
+    }
+
+    /// Under an order that is not total, the k+1 row decides where the page
+    /// ends: rows 2 and 3 share a `ts`, so the group they open is held back
+    /// whole and the cursor resumes after row 1, the last complete group.
+    ///
+    /// FLIP: resuming after the page's last kept row (row 2) puts row 3,
+    /// equal to it under the order, on no page.
+    /// FLIP: comparing tuples by position only (`same_group` always false)
+    /// keeps both rows and mints after row 2.
+    #[test]
+    fn a_grouped_page_ends_before_an_open_group() {
+        let key = key();
+        let stub = Stub::default();
+        stub.sql.borrow_mut().extend([logs(&[1, 2, 2]), logs(&[2, 2])]);
+
+        let one = block_on(run(args(GROUPED, None), &context(&key), &stub));
+        assert_eq!(one.status, Status::OkPage, "{one:?}");
+        assert_eq!(one.data.rows.len(), 1);
+        assert_eq!(one.presentation.rows_omitted, 2);
+        assert!(
+            one.warnings.iter().any(|w| w.contains("the order is not total")),
+            "{:?}",
+            one.warnings
+        );
+        let cursor = one.presentation.cursor.clone().expect("page one's cursor");
+
+        let two = block_on(run(args(GROUPED, Some(&cursor)), &later(&key), &stub));
+        assert_eq!(two.status, Status::Ok, "{two:?}");
+        assert_eq!(two.data.rows.len(), 2);
+        assert_eq!(
+            stub.executed.borrow()[1].request.sql,
+            statement(GROUPED, Some(log_at(1)))
+        );
+    }
+
+    /// When the k+1 row continues the only group on the page, no complete
+    /// group fits: the page is `ok_bounded` with no cursor and says to narrow
+    /// the range.
+    ///
+    /// FLIP: minting after the open group's last kept row resumes inside the
+    /// group and loses its third row.
+    #[test]
+    fn no_complete_group_fits_is_bounded_with_no_cursor() {
+        let key = key();
+        let stub = Stub::default();
+        stub.sql.borrow_mut().push_back(logs(&[4, 4, 4]));
+
+        let page = block_on(run(args(GROUPED, None), &context(&key), &stub));
+
+        assert_eq!(page.status, Status::OkBounded, "{page:?}");
+        assert_eq!(page.presentation.cursor, None);
+        assert_eq!(actions(&page), ["narrow_time_range"]);
+    }
+
+    /// A NaN order value, a missing order tuple, and a `Str` key long enough
+    /// to put the cursor over its 4096-byte bound each end the page
+    /// `ok_bounded` with no cursor and a next step, never a failure.
+    ///
+    /// The planner refuses every float order term, so a NaN reaches this
+    /// tool only through a tuple the backend read; the boundary is held
+    /// here so that a backend type the planner did not foresee degrades to
+    /// a bounded page rather than an `internal` error.
+    ///
+    /// FLIP: propagating the encode error as a failure turns a page of good
+    /// rows into an error envelope.
+    /// FLIP: handing the over-bound token to `finish_page` makes it an
+    /// `internal` failure (`Envelope::fit` refuses a cursor over the bound).
+    #[test]
+    fn a_boundary_with_no_cursor_position_is_bounded_with_a_next_step() {
+        let long = "k".repeat(CURSOR_BOUND);
+        let cases: [(&str, Option<Vec<ResumeValue>>, &str); 3] = [
+            (
+                "nan",
+                Some(vec![
+                    ResumeValue::Float(f64::NAN),
+                    ResumeValue::FixedSizeBinary(vec![2; 16]),
+                ]),
+                "have no cursor position",
+            ),
+            ("unread", None, "could not be read"),
+            (
+                "over-bound",
+                Some(vec![
+                    ResumeValue::Str(long),
+                    ResumeValue::FixedSizeBinary(vec![2; 16]),
+                ]),
+                "-byte bound",
+            ),
+        ];
+        for (name, last, reason) in cases {
+            let key = key();
+            let stub = Stub::default();
+            stub.sql.borrow_mut().push_back(draft_of(
+                Signal::Metrics,
+                vec![Some(sample(1)), last, Some(sample(3))],
+                Vec::new(),
+                END_NS,
+            ));
+
+            let page = block_on(run(args(TOTAL, None), &context(&key), &stub));
+
+            assert_eq!(page.status, Status::OkBounded, "{name}: {page:?}");
+            assert_eq!(page.presentation.cursor, None, "{name}");
+            assert_eq!(page.data.rows.len(), 2, "{name}");
+            assert_eq!(actions(&page), ["narrow_time_range"], "{name}");
+            assert!(
+                page.warnings
+                    .first()
+                    .is_some_and(|w| w.starts_with("no cursor:") && w.contains(reason)),
+                "{name}: {:?}",
+                page.warnings
+            );
+        }
+    }
+
+    /// A statement with no `ORDER BY` over a table with no row identity runs
+    /// as written, unpaged: capped, it is `ok_bounded` with no cursor and a
+    /// next step to add an ordering.
+    ///
+    /// FLIP: treating `NoOrdering` as a refusal answers `invalid_argument`
+    /// for a statement the executor can run.
+    #[test]
+    fn a_capped_statement_with_no_order_is_bounded() {
+        let key = key();
+        let stub = Stub::default();
+        stub.sql.borrow_mut().push_back(draft_of(
+            Signal::Logs,
+            Vec::new(),
+            Vec::new(),
+            END_NS,
+        ));
+        stub.sql.borrow_mut()[0].envelope.data.rows = vec![vec![Cell::Int(1)]; 3];
+        stub.sql.borrow_mut()[0].envelope.data.row_count = 3;
+
+        let page = block_on(run(args("SELECT * FROM logs", None), &context(&key), &stub));
+
+        assert_eq!(page.status, Status::OkBounded, "{page:?}");
+        assert_eq!(page.presentation.cursor, None);
+        assert_eq!(page.data.rows.len(), 2);
+        assert_eq!(actions(&page), ["add_an_order_by"]);
+        let executed = stub.executed.borrow();
+        assert_eq!(executed[0].request.sql, "SELECT * FROM logs");
+        assert!(executed[0].order_columns.is_empty());
+    }
+
+    /// Every statement-level refusal comes back before the backend is
+    /// called: the stub has no answer queued and panics if reached.
+    ///
+    /// A float order term is `invalid_argument` rather than `unsupported`:
+    /// the planner refuses it because a NaN or infinite value has no cursor
+    /// position, so the statement as written cannot be paged without losing
+    /// rows, and the caller can page the same rows by ordering on a
+    /// representable column. That is a rewrite of the caller's argument, the
+    /// D4 meaning of `invalid_argument`.
+    ///
+    /// FLIP: dropping the `refuse_several_tables` check leaves the planner's
+    /// cross-signal refusal, with `rewrite_the_statement` in place of
+    /// `split_the_statement`.
+    /// FLIP: mapping `OrderTermNotRepresentable` through `validation_refusal`
+    /// would send a PromQL hint for a SQL statement.
+    #[test]
+    fn statement_refusals_are_answered_before_the_backend() {
+        let cases: [(&str, FailureClass, &[&str], &str); 4] = [
+            (
+                "SELECT * FROM samples JOIN logs ON samples.ts = logs.ts ORDER BY samples.ts",
+                FailureClass::InvalidArgument,
+                &["split_the_statement"],
+                "",
+            ),
+            (
+                "DELETE FROM samples",
+                FailureClass::Unsupported,
+                &[],
+                "read-only SELECT",
+            ),
+            (
+                "SELECT * FROM samples ORDER BY ts LIMIT 5",
+                FailureClass::InvalidArgument,
+                &["rewrite_the_statement"],
+                "cannot page this statement",
+            ),
+            (
+                "SELECT * FROM samples ORDER BY value",
+                FailureClass::InvalidArgument,
+                &["rewrite_the_statement"],
+                "`value`",
+            ),
+        ];
+        for (query, class, steps, message) in cases {
+            let key = key();
+            let stub = Stub::default();
+            let envelope = block_on(run(args(query, None), &context(&key), &stub));
+            assert_eq!(failure_class(&envelope), class, "{query}: {envelope:?}");
+            assert_eq!(actions(&envelope), steps, "{query}");
+            let text = &envelope.failure.as_ref().expect("failure").message;
+            assert!(text.contains(message), "{query}: {text}");
+            assert!(stub.executed.borrow().is_empty(), "{query}");
+        }
+    }
+
+    /// `evidence_ref` is not served, and a value for it is `unsupported`
+    /// before the backend.
+    ///
+    /// FLIP: ignoring the field answers rows a caller believes are scoped by
+    /// evidence they are not scoped by.
+    #[test]
+    fn an_evidence_ref_is_unsupported() {
+        let key = key();
+        let stub = Stub::default();
+        let mut call = args(TOTAL, None);
+        call["evidence_ref"] = json!("e");
+
+        let envelope = block_on(run(call, &context(&key), &stub));
+
+        assert_eq!(failure_class(&envelope), FailureClass::Unsupported);
+        assert!(stub.executed.borrow().is_empty());
+    }
+
+    /// A newer erasure observed by a later page's resolve expires the cursor
+    /// rather than serving rows the pin no longer describes.
+    ///
+    /// FLIP: skipping `confirm` serves page two from a snapshot whose
+    /// erasure set moved.
+    #[test]
+    fn a_newer_erasure_expires_the_cursor() {
+        let key = key();
+        let stub = Stub::default();
+        let erased = draft_of(
+            Signal::Metrics,
+            vec![Some(sample(3))],
+            vec![ErasurePredicate::windowless(vec![(
+                "host".to_owned(),
+                "a".to_owned(),
+            )])],
+            LATER_NS,
+        );
+        stub.sql
+            .borrow_mut()
+            .extend([samples(&[1, 2, 3]), erased]);
+
+        let one = block_on(run(args(TOTAL, None), &context(&key), &stub));
+        let cursor = one.presentation.cursor.expect("page one's cursor");
+        let two = block_on(run(args(TOTAL, Some(&cursor)), &later(&key), &stub));
+
+        assert_eq!(failure_class(&two), FailureClass::CursorExpired);
+        assert!(two.data.rows.is_empty());
+    }
+
+    /// A cursor is bound to its statement and its `time_range`: presented
+    /// with another of either it is `cursor_invalid`, before the backend.
+    ///
+    /// FLIP: leaving the window out of the argument hash resumes page one's
+    /// keyset under another range.
+    /// FLIP: leaving the statement out resumes one statement's position in
+    /// another's order.
+    #[test]
+    fn a_cursor_for_another_query_or_time_range_is_refused() {
+        let key = key();
+        let stub = Stub::default();
+        stub.sql.borrow_mut().push_back(samples(&[1, 2, 3]));
+        let one = block_on(run(args(TOTAL, None), &context(&key), &stub));
+        let cursor = one.presentation.cursor.expect("page one's cursor");
+
+        let other_query = args("SELECT * FROM samples ORDER BY ts DESC", Some(&cursor));
+        let mut other_window = args(TOTAL, Some(&cursor));
+        other_window["time_range"]["start_ns"] = json!((START_NS + 1).to_string());
+        for (name, call) in [("query", other_query), ("time_range", other_window)] {
+            let envelope = block_on(run(call, &later(&key), &stub));
+            assert_eq!(
+                failure_class(&envelope),
+                FailureClass::CursorInvalid,
+                "{name}"
+            );
+        }
+        assert_eq!(stub.executed.borrow().len(), 1);
+    }
+}
