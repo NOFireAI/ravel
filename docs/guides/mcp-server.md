@@ -83,7 +83,10 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   typed attribute columns), which keys are indexed, the metric families with
   their type and unit, the freshness watermark, the coverage window, and
   the committed row count. That count is summed from commit records, so it
-  counts rows before duplicate collapse and before any pending erasure.
+  counts rows before duplicate collapse and before any pending erasure: an
+  upper bound, not the number of rows a query reads back. Page one, which
+  carries the count, reports `accuracy.exact: false` and names the count in
+  `accuracy.approximation`; later pages report `exact: true`.
   Logs and traces have no metric families, and the response says why; so
   does a metrics tenant with no metric metadata record. When the metric
   metadata read fails, a metrics call fails with the retryable class
