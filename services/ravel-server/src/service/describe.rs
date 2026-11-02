@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use ravel_catalog::{Catalog, MetricKind};
 use ravel_query::QueryError;
+use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_query::http::{LiveUsage, MetadataCache};
 use ravel_sql::{DeclaredColumnSource, KeyIndexDeclaration};
 use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
@@ -181,9 +182,18 @@ pub struct DescribeData {
     /// for the other signals and for a tenant that declares none.
     pub declared_columns: Vec<DescribeColumn>,
     pub indexed_keys: IndexedKeys,
+    /// The declared column set as the tenant configuration states it, the
+    /// form a D5 cursor pins and compares on redemption. `declared_columns`
+    /// above is the same set rendered as schema columns.
+    pub declared_column_set: Vec<ravel_sql::DeclaredColumn>,
     /// One page of families, ordered by name in byte order. Empty for a
     /// non-metrics signal.
     pub families: Vec<DescribeFamily>,
+    /// Whether the record read for this page holds a family that sorts after
+    /// the page's last one (after the request's `after_name` when the page is
+    /// empty). Decided from the same read as the page, so a page that ends
+    /// exactly at the record's last family says `false`.
+    pub more_families: bool,
     /// Every family the record held when this call read it, not only this
     /// page's. The record is not pinned between pages, so two pages of one
     /// sequence can report different totals.
@@ -197,6 +207,8 @@ pub struct DescribeData {
     pub coverage: Option<EventTimeCoverage>,
     /// Segments the resolve returned.
     pub segments: usize,
+    /// The pending erasure predicates the resolve listed for this signal.
+    pub pending_erasure: Vec<ErasurePredicate>,
     /// The sum of the resolved segments' commit-record row counts
     /// (`sample_count`: samples, log records or spans). Exact for what was
     /// committed, counted before cross-segment duplicates collapse and before
@@ -343,17 +355,18 @@ async fn describe(
     let committed_rows = segments
         .iter()
         .fold(0u64, |rows, s| rows.saturating_add(s.sample_count));
+    let pending_erasure = snapshot_pending_erasure_predicates(&snapshot);
 
-    let (families, families_total, families_absent_reason) = match signal {
+    let (families, families_total, more_families, families_absent_reason) = match signal {
         DescribeSignal::Metrics => {
             let record = state.metadata_cache.get(tenant_hash).await;
             let mut entries: Vec<_> = record.iter().collect();
             entries.sort_by(|a, b| a.family_name.as_bytes().cmp(b.family_name.as_bytes()));
-            let page = entries
-                .iter()
-                .filter(|entry| {
-                    after_name.is_none_or(|after| entry.family_name.as_bytes() > after.as_bytes())
-                })
+            let mut remaining = entries.iter().filter(|entry| {
+                after_name.is_none_or(|after| entry.family_name.as_bytes() > after.as_bytes())
+            });
+            let page: Vec<_> = remaining
+                .by_ref()
                 .take(limit)
                 .map(|entry| DescribeFamily {
                     name: entry.family_name.clone(),
@@ -362,29 +375,31 @@ async fn describe(
                     help: entry.help.clone(),
                 })
                 .collect();
-            (page, entries.len(), None)
+            let more = remaining.next().is_some();
+            (page, entries.len(), more, None)
         }
         DescribeSignal::Logs | DescribeSignal::Traces => {
-            (Vec::new(), 0, Some(FAMILIES_METRICS_ONLY))
+            (Vec::new(), 0, false, Some(FAMILIES_METRICS_ONLY))
         }
     };
 
-    let (declared_columns, indexed_keys) = match signal {
+    let (declared_column_set, declared_columns, indexed_keys) = match signal {
         DescribeSignal::Logs => {
-            let declared = state
+            let declared_set = state
                 .declared_columns
                 .declared_columns(tenant_hash, now_ns)
                 .await;
             let key_index = state.declared_columns.key_index(tenant_hash, now_ns).await;
-            let declared = ravel_sql::logs_schema_with_declared(&declared)
+            let declared = ravel_sql::logs_schema_with_declared(&declared_set)
                 .fields()
                 .iter()
                 .skip(ravel_sql::FIRST_DECLARED_COL)
                 .map(|field| column(field.name(), field.data_type(), field.is_nullable()))
                 .collect();
-            (declared, tenant_key_index(key_index))
+            (declared_set, declared, tenant_key_index(key_index))
         }
         DescribeSignal::Traces => (
+            Vec::new(),
             Vec::new(),
             IndexedKeys {
                 keys: vec![ravel_rspan::key_index::TRACE_ID_FIELD.to_string()],
@@ -392,6 +407,7 @@ async fn describe(
             },
         ),
         DescribeSignal::Metrics => (
+            Vec::new(),
             Vec::new(),
             IndexedKeys {
                 keys: Vec::new(),
@@ -405,13 +421,16 @@ async fn describe(
         table: signal.table(),
         fixed_columns: fixed_columns(signal),
         declared_columns,
+        declared_column_set,
         indexed_keys,
         families,
+        more_families,
         families_total,
         families_absent_reason,
         ingest_watermark_hour,
         coverage,
         segments: segments.len(),
+        pending_erasure,
         committed_rows,
         resolved_at_ns: now_ns,
         accounting: accounting.snapshot(),
