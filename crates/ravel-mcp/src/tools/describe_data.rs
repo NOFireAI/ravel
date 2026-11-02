@@ -276,7 +276,7 @@ fn finish(
 ) -> Envelope {
     let mut budgets = ctx.budgets;
     budgets.max_rows = u32::try_from(draft.envelope.data.rows.len()).unwrap_or(u32::MAX);
-    draft.finish_page(&budgets, scope, PageOrder::Total, |pins, last| {
+    draft.finish_page(&budgets, scope, PageOrder::Total, |pins, last, _| {
         let (kind, name) = kind_and_name(last).ok_or(CursorError::Invalid)?;
         let position = CursorPosition::Keyset {
             tuple: Resume {
@@ -286,11 +286,11 @@ fn finish(
             .tuple(),
             order_by: ORDER_BY.map(str::to_string).to_vec(),
         };
-        pins.cursor(TOOL, argument_hash, position, i64::MAX).mint(
+        Ok(pins.cursor(TOOL, argument_hash, position, i64::MAX).mint(
             ctx.cursor_key,
             ctx.now_ns,
             ctx.protection_horizon_ns,
-        )
+        )?)
     })
 }
 

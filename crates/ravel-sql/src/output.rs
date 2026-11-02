@@ -81,6 +81,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use serde_json::{Map as JsonMap, Value as Json, json};
 
 use crate::error::SqlError;
+use crate::page_plan::ResumeValue;
 
 /// The collected result of one SQL query.
 #[derive(Debug, Clone)]
@@ -117,6 +118,30 @@ impl QueryOutput {
     /// The collected batches, for in-crate tests and the differential gate.
     pub fn batches(&self) -> &[RecordBatch] {
         &self.batches
+    }
+
+    /// The typed value of `columns`, in order, for every row in output order:
+    /// the keyset position a paging caller resumes after, read from the
+    /// arrays rather than from any rendered cell. A row is `None` when a
+    /// named column is missing from the result or any of its cells has no
+    /// [`ResumeValue`] (see [`crate::resume_value`]).
+    pub fn resume_tuples(&self, columns: &[String]) -> Vec<Option<Vec<ResumeValue>>> {
+        let indices: Option<Vec<usize>> = columns
+            .iter()
+            .map(|name| self.schema.index_of(name).ok())
+            .collect();
+        let mut tuples = Vec::with_capacity(self.num_rows());
+        for batch in &self.batches {
+            for row in 0..batch.num_rows() {
+                tuples.push(indices.as_ref().and_then(|indices| {
+                    indices
+                        .iter()
+                        .map(|&index| crate::resume_value(batch.column(index).as_ref(), row))
+                        .collect()
+                }));
+            }
+        }
+        tuples
     }
 
     /// Encode as an Arrow IPC stream (schema message followed by one record
@@ -647,6 +672,51 @@ mod tests {
         )
         .expect("batch");
         QueryOutput::new(schema, vec![batch])
+    }
+
+    /// Each row's tuple holds the named columns' typed values in the order
+    /// named, across batches; a row with a null cell, and every row when a
+    /// named column is absent, is `None`.
+    ///
+    /// FLIP: reading the columns in schema order instead of the order named
+    /// swaps the first tuple's values; flattening a null cell into the tuple
+    /// shortens it instead of giving `None`.
+    #[test]
+    fn resume_tuples_read_the_named_columns_in_order_across_batches() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let batch = |a: Vec<Option<i64>>, b: Vec<&str>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(a)) as ArrayRef,
+                    Arc::new(StringArray::from(b)) as ArrayRef,
+                ],
+            )
+            .expect("batch")
+        };
+        let out = QueryOutput::new(
+            Arc::clone(&schema),
+            vec![
+                batch(vec![Some(1), None], vec!["x", "y"]),
+                batch(vec![Some(3)], vec!["z"]),
+            ],
+        );
+        let named = ["b".to_string(), "a".to_string()];
+        assert_eq!(
+            out.resume_tuples(&named),
+            vec![
+                Some(vec![ResumeValue::Str("x".to_string()), ResumeValue::Int(1)]),
+                None,
+                Some(vec![ResumeValue::Str("z".to_string()), ResumeValue::Int(3)]),
+            ]
+        );
+        assert_eq!(
+            out.resume_tuples(&["missing".to_string()]),
+            vec![None, None, None]
+        );
     }
 
     #[test]

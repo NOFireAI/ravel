@@ -246,7 +246,7 @@ mod with_mcp {
     use ravel_mcp::draft::{Draft, EstimateComponent, NoCursorSignal, PageOrder, PinScope};
     use ravel_mcp::envelope::{FailureClass, Status};
     use ravel_mcp::service::QueryBackend;
-    use ravel_mcp::tools::{ToolContext, describe_data};
+    use ravel_mcp::tools::{ToolContext, describe_data, query_sql};
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
     use ravel_query::http::InstantRequest;
     use ravel_server::mcp::ServiceBackend;
@@ -829,6 +829,23 @@ mod with_mcp {
     /// row to project and several calls with distinct hours and sequences land
     /// several segments, each with its own row.
     async fn publish_sample(store: &dyn ObjectStoreBackend, ingest_hour: u32, writer_seq: u64) {
+        publish_samples(
+            store,
+            ingest_hour,
+            writer_seq,
+            &[(1 + i64::from(ingest_hour), 1.0)],
+        )
+        .await;
+    }
+
+    /// [`publish_sample`] with one segment holding every `(ts_ns, value)` of
+    /// `samples`, all of metric `m`'s one series.
+    async fn publish_samples(
+        store: &dyn ObjectStoreBackend,
+        ingest_hour: u32,
+        writer_seq: u64,
+        samples: &[(i64, f64)],
+    ) {
         use ravel_commit::publish::RetryPolicy;
         use ravel_commit::record::NewCommitRecord;
         use ravel_commit::{keys, publish, record};
@@ -846,10 +863,10 @@ mod with_mcp {
         let series = vec![SeriesInput {
             series_id: SeriesId::compute(&tenant, "m", &labels).expect("series id"),
             labels,
-            samples: vec![Sample {
-                ts_ns: 1 + i64::from(ingest_hour),
-                value: 1.0,
-            }],
+            samples: samples
+                .iter()
+                .map(|&(ts_ns, value)| Sample { ts_ns, value })
+                .collect(),
         }];
         let writer_id = uuid::Uuid::from_u128(2_000);
         let hour_start_ns = i64::from(ingest_hour) * 3_600_000_000_000;
@@ -904,11 +921,10 @@ mod with_mcp {
     /// A started server holding one [`publish_sample`] row from ingest hour 0,
     /// and the [`ServiceBackend`] the adapter hands `ravel_query_sql`'s body.
     ///
-    /// Driven through the backend rather than the transport because
-    /// `ravel_query_sql` is in the catalog but not served by this build: a
-    /// `tools/call` for it answers `NotShipped` before any backend is reached.
-    /// The mapping under test is the backend's own `sql_execute`, which is the
-    /// call that tool body makes.
+    /// Driven through the backend rather than the transport because the
+    /// mapping under test is the backend's own `sql_execute`, which is the
+    /// call that tool body makes; the tool itself is driven through the
+    /// transport further down.
     async fn sql_backend() -> (ravel_server::Running, ServiceBackend) {
         let (running, backend, _) = sql_backend_over(&[0]).await;
         (running, backend)
@@ -954,7 +970,7 @@ mod with_mcp {
             range_end_ns: SQL_NOW_NS,
             min_commit_watermark: Vec::new(),
         };
-        draft.finish_page(&sql_budgets(), &scope, PageOrder::Partial, |_, _| {
+        draft.finish_page(&sql_budgets(), &scope, PageOrder::Partial, |_, _, _| {
             panic!("a partial order never mints")
         })
     }
@@ -994,6 +1010,7 @@ mod with_mcp {
                     "SELECT arrow_cast({MILLIS}, 'Date64') AS d FROM samples LIMIT 1"
                 )),
                 SQL_NOW_NS,
+                &[],
             )
             .await
             .expect_err("a Date64 that is not a whole day has no JSON form");
@@ -1037,6 +1054,7 @@ mod with_mcp {
                     "SELECT arrow_cast({WHOLE_DAY_MILLIS}, 'Date64') AS d FROM samples LIMIT 1"
                 )),
                 SQL_NOW_NS,
+                &[],
             )
             .await
             .expect("a whole-day Date64 has a JSON date");
@@ -1076,7 +1094,7 @@ mod with_mcp {
             .await
             .expect("the service executes");
         let draft = backend
-            .sql_execute(expected_tenant(), &request, SQL_NOW_NS)
+            .sql_execute(expected_tenant(), &request, SQL_NOW_NS, &[])
             .await
             .expect("the adapter executes");
 
@@ -1110,7 +1128,7 @@ mod with_mcp {
             .await
             .expect("the service executes");
         let draft = backend
-            .sql_execute(expected_tenant(), &request, SQL_NOW_NS)
+            .sql_execute(expected_tenant(), &request, SQL_NOW_NS, &[])
             .await
             .expect("the adapter executes");
 
@@ -1152,7 +1170,7 @@ mod with_mcp {
             assert_eq!(outcome.ingest_watermark_hour, hours.first().copied());
 
             let draft = backend
-                .sql_execute(expected_tenant(), &request, SQL_NOW_NS)
+                .sql_execute(expected_tenant(), &request, SQL_NOW_NS, &[])
                 .await
                 .expect("the adapter executes");
             assert_eq!(draft.signal, Err(NoCursorSignal::NoTable));
@@ -1180,6 +1198,7 @@ mod with_mcp {
                 expected_tenant(),
                 &sql_request("SELECT 1 AS x UNION ALL SELECT 2 AS x"),
                 SQL_NOW_NS,
+                &[],
             )
             .await
             .expect("the adapter executes");
@@ -1191,7 +1210,7 @@ mod with_mcp {
             range_end_ns: SQL_NOW_NS,
             min_commit_watermark: Vec::new(),
         };
-        let page = draft.finish_page(&budgets, &scope, PageOrder::Total, |_, _| {
+        let page = draft.finish_page(&budgets, &scope, PageOrder::Total, |_, _, _| {
             panic!("a statement naming no table must not reach the mint")
         });
 
@@ -1979,9 +1998,10 @@ mod with_mcp {
             tenant_hash: ravel_types::TenantHash,
             request: &ravel_sql::SqlRequest,
             resolve_at_ns: i64,
+            order_columns: &[String],
         ) -> Result<Draft, ravel_mcp::envelope::Failure> {
             self.0
-                .sql_execute(tenant_hash, request, resolve_at_ns)
+                .sql_execute(tenant_hash, request, resolve_at_ns, order_columns)
                 .await
         }
 
@@ -2218,7 +2238,7 @@ mod with_mcp {
         };
 
         let draft = backend
-            .sql_execute(expected_tenant(), &request, resolve_at)
+            .sql_execute(expected_tenant(), &request, resolve_at, &[])
             .await
             .expect("the adapter executes");
 
@@ -2231,6 +2251,226 @@ mod with_mcp {
             .map(|row| row.ts_ns)
             .collect();
         assert_eq!(stamps, vec![caller]);
+
+        running.shutdown().await.expect("server stops");
+    }
+
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    /// A `samples` statement under a total order, which `ravel_query_sql`
+    /// pages by keyset.
+    const SAMPLES_BY_TS: &str = "SELECT * FROM samples ORDER BY ts";
+
+    /// The `value` cell of every row on `page`, in page order.
+    fn sql_values(page: &serde_json::Value) -> Vec<f64> {
+        let index = page["data"]["columns"]
+            .as_array()
+            .expect("columns")
+            .iter()
+            .position(|column| column["name"] == serde_json::json!("value"))
+            .expect("the page projects value");
+        page["data"]["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| {
+                let cell = &row[index];
+                cell.as_f64()
+                    .or_else(|| cell.as_str().and_then(|text| text.parse().ok()))
+                    .unwrap_or_else(|| panic!("a float value cell: {cell}"))
+            })
+            .collect()
+    }
+
+    /// `ravel_query_sql` through `POST /mcp` on the shipping start path walks
+    /// a total order three pages deep by keyset, over two segments whose rows
+    /// interleave: two rows, two rows, then the last row with no cursor, every
+    /// page under one snapshot id and the order the tool appended its
+    /// tiebreak to.
+    ///
+    /// FLIP: leaving `ravel_query_sql` off `SERVED_TOOLS`, or its dispatch
+    /// arm on `NotShipped`, makes the first call a protocol error.
+    /// FLIP: a cursor that resumed at or before the page's last row repeats
+    /// a row on the next page.
+    /// FLIP: minting a cursor on a page with no row past `max_rows` leaves
+    /// page three `ok_page` with a cursor to an empty page.
+    #[tokio::test]
+    async fn query_sql_walks_a_total_order_three_pages_by_keyset() {
+        let (store, metrics) = instrumented_memory();
+        publish_samples(store.as_ref(), 0, 1, &[(10, 1.0), (30, 3.0), (50, 5.0)]).await;
+        publish_samples(store.as_ref(), 1, 2, &[(20, 2.0), (40, 4.0)]).await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let mut cursor: Option<String> = None;
+        let mut pages = Vec::new();
+        for _ in 0..3 {
+            let mut arguments = serde_json::json!({
+                "query": SAMPLES_BY_TS,
+                "time_range": sql_window(),
+                "max_rows": 2,
+            });
+            if let Some(token) = &cursor {
+                arguments["cursor"] = serde_json::json!(token);
+            }
+            let (is_error, page) = call(&client, "ravel_query_sql", arguments).await;
+            assert_eq!(is_error, Some(false), "{page}");
+            cursor = cursor_of(&page);
+            pages.push(page);
+        }
+
+        let statuses: Vec<&serde_json::Value> = pages.iter().map(|page| &page["status"]).collect();
+        assert_eq!(
+            statuses,
+            [
+                &serde_json::json!("ok_page"),
+                &serde_json::json!("ok_page"),
+                &serde_json::json!("ok"),
+            ]
+        );
+        let values: Vec<Vec<f64>> = pages.iter().map(sql_values).collect();
+        assert_eq!(values, vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0]]);
+        assert_eq!(cursor, None, "{}", pages[2]);
+        for page in &pages {
+            assert_eq!(
+                page["scope"]["order_by"],
+                serde_json::json!(["\"ts\" ASC", "\"series_id\" ASC"]),
+                "{page}"
+            );
+            assert_eq!(
+                page["visibility"]["snapshot_id"],
+                pages[0]["visibility"]["snapshot_id"]
+            );
+        }
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// `time_range` filters rows, not only the segments the resolve lists: a
+    /// segment whose two samples straddle the window's end overlaps the
+    /// window, and contributes only the sample inside it.
+    ///
+    /// FLIP: `row_window: false` in `ravel_query_sql`'s request bounds the
+    /// listing only, and the page carries the 2.0 row, whose timestamp is past
+    /// the window's end.
+    #[tokio::test]
+    async fn query_sql_excludes_a_row_outside_time_range_from_an_overlapping_segment() {
+        let (store, metrics) = instrumented_memory();
+        publish_samples(store.as_ref(), 0, 1, &[(10, 1.0), (100, 2.0)]).await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let (is_error, page) = call(
+            &client,
+            "ravel_query_sql",
+            serde_json::json!({
+                "query": SAMPLES_BY_TS,
+                "time_range": {"start_ns": "0", "end_ns": "50"},
+            }),
+        )
+        .await;
+
+        assert_eq!(is_error, Some(false), "{page}");
+        assert_eq!(page["status"], serde_json::json!("ok"), "{page}");
+        assert_eq!(sql_values(&page), vec![1.0]);
+        assert_eq!(page["data"]["row_count"], serde_json::json!(1), "{page}");
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// A `ravel_query_sql` call context at `now_ns` with a two-row page and a
+    /// 30 h protection horizon, so a cursor outlives the two hours between
+    /// the pages of the test below.
+    fn query_sql_context(now_ns: i64, key: &ravel_mcp::cursor::CursorKey) -> ToolContext<'_> {
+        let mut budgets = sql_budgets();
+        budgets.max_rows = 2;
+        ToolContext {
+            tenant_hash: expected_tenant(),
+            now_ns,
+            deadline_ns: now_ns + 60 * NS_PER_SEC,
+            protection_horizon_ns: now_ns + 30 * NS_PER_HOUR,
+            budgets,
+            cursor_key: key,
+        }
+    }
+
+    /// A later `ravel_query_sql` page resolves at the instant its cursor was
+    /// minted and writes its audit record at the caller's clock. Page one, at
+    /// T0, two hours before the call, sees one segment of three rows; a
+    /// segment flushed in the caller's own ingest hour is not on page two,
+    /// which ends with the third row under page one's snapshot id, and the two
+    /// pages' audit records carry T0 and T1.
+    ///
+    /// FLIP: `later_page` resolving at `ctx.now_ns` reads the newer segment,
+    /// and page two carries 4.0 as well.
+    /// FLIP: stamping page two's audit record with the resolve instant writes
+    /// both records at T0.
+    #[tokio::test]
+    async fn a_later_query_sql_page_resolves_at_the_mint_instant_and_audits_at_the_callers_clock() {
+        let t1 = wall_now_ns();
+        let t0 = t1 - 2 * NS_PER_HOUR;
+        let caller_hour = u32::try_from(t1 / NS_PER_HOUR).expect("the hour fits a u32");
+        let (store, metrics) = instrumented_memory();
+        publish_samples(
+            store.as_ref(),
+            caller_hour - 3,
+            1,
+            &[(10, 1.0), (20, 2.0), (30, 3.0)],
+        )
+        .await;
+        publish_samples(store.as_ref(), caller_hour, 2, &[(40, 4.0)]).await;
+        let mut config = server_config(mcp_on());
+        config.audit_pipeline = Some(ravel_maintain::AuditPipelineConfig {
+            audit_mode: ravel_maintain::AuditMode::Required,
+            ..Default::default()
+        });
+        let (running, backend) = describe_backend(&store, metrics, config).await;
+        let key = ravel_mcp::cursor::CursorKey::from_process_secret(
+            [0x42; ravel_mcp::cursor::CURSOR_KEY_LEN],
+        );
+        let window = serde_json::json!({"start_ns": "0", "end_ns": "1000"});
+
+        let one = query_sql::run(
+            serde_json::json!({"query": SAMPLES_BY_TS, "time_range": window}),
+            &query_sql_context(t0, &key),
+            &backend,
+        )
+        .await;
+        assert_eq!(one.status, Status::OkPage, "{:?}", one.failure);
+        let two = query_sql::run(
+            serde_json::json!({
+                "query": SAMPLES_BY_TS,
+                "time_range": window,
+                "cursor": one.presentation.cursor.clone().expect("page one cursor"),
+            }),
+            &query_sql_context(t1, &key),
+            &backend,
+        )
+        .await;
+        assert_eq!(two.status, Status::Ok, "{:?}", two.failure);
+
+        let values = |page: &ravel_mcp::envelope::Envelope| {
+            sql_values(&serde_json::to_value(page).expect("the envelope serializes"))
+        };
+        assert_eq!(values(&one), vec![1.0, 2.0]);
+        assert_eq!(values(&two), vec![3.0]);
+        assert_eq!(two.visibility.snapshot_id, one.visibility.snapshot_id);
+        let mut stamps: Vec<i64> = query_audit_records(store.as_ref())
+            .await
+            .iter()
+            .filter(|row| audit_attr(row, "query.language") == Some("sql"))
+            .map(|row| row.ts_ns)
+            .collect();
+        stamps.sort_unstable();
+        assert_eq!(stamps, vec![t0, t1]);
 
         running.shutdown().await.expect("server stops");
     }
