@@ -227,7 +227,8 @@ S3S_SHA_AARCH64="92d7bbbb29bd4c5aee00b5f1c280c1402e799ed8a28f497e5ba813f1ebc3eec
 # --- stubs -------------------------------------------------------------------
 
 # docker: version (Server.Arch is STUB_ENGINE_ARCH, default amd64; exit 1
-# with STUB_ENGINE_DOWN), compose up/ps/config/down/logs/stop/start, stats,
+# with STUB_ENGINE_DOWN), compose up/ps/config/down/logs/stop/start (each up
+# and start also logged as a docker-compose-up/-start line), stats,
 # inspect, image inspect and volume ls, with the stack's up/down state in
 # $STUB_STATE and ravel-server's stopped/running state in $STUB_STATE.ravel.
 cat >"${BIN}/docker" <<'STUB'
@@ -249,6 +250,30 @@ case "$1" in
     while [ "$1" = "-f" ]; do shift 2; done
     sub="$1"
     shift
+    case "$sub" in
+      up | start)
+        printf 'docker-compose-%s %s\n' "$sub" "$*" >>"${STUB_LOG}"
+        ;;
+    esac
+    # Once ravel-server has been stopped, a start or up of it reruns its
+    # one-shot dependencies unless the up carries --no-deps, and on the
+    # real-S3 lane createbuckets refuses the bucket it already filled: the
+    # stub fails that call the way compose did there. --no-deps alone starts
+    # the stopped container, exit STUB_START_EXIT.
+    if [ "$(cat "${STUB_STATE}.ravel" 2>/dev/null)" = stopped ] &&
+      { [ "$sub" = start ] || [ "$sub" = up ]; } && [ "${!#}" = ravel-server ]; then
+      case " $* " in
+        *" --no-deps "*) ;;
+        *)
+          printf 'docker-oneshot started %s\n' createbuckets ravel-qualify >>"${STUB_LOG}"
+          echo 'service "createbuckets" didn'"'"'t complete successfully: exit 1' >&2
+          exit 1
+          ;;
+      esac
+      [ "${STUB_START_EXIT:-0}" -eq 0 ] || exit "${STUB_START_EXIT}"
+      echo running >"${STUB_STATE}.ravel"
+      exit 0
+    fi
     case "$sub" in
       up)
         [ "${STUB_UP_EXIT:-0}" -eq 0 ] || exit "${STUB_UP_EXIT}"
@@ -289,7 +314,8 @@ JSON
         echo "stub compose logs"
         ;;
       # stop and start: ravel-server's state for the fold to log, exit
-      # STUB_STOP_EXIT / STUB_START_EXIT. On stop, STUB_OBJECTS_DOC_AT (a
+      # STUB_STOP_EXIT / STUB_START_EXIT (a start of a stopped ravel-server
+      # is handled above). On stop, STUB_OBJECTS_DOC_AT (a
       # ravel-objects.json path) is replaced by STUB_OBJECTS_DOC, or removed
       # when that is empty, after the objects step wrote it.
       stop)
@@ -305,7 +331,6 @@ JSON
         ;;
       start)
         [ "${STUB_START_EXIT:-0}" -eq 0 ] || exit "${STUB_START_EXIT}"
-        [ "$1" = ravel-server ] && echo running >"${STUB_STATE}.ravel"
         ;;
       run)
         case " $* " in
@@ -1239,12 +1264,29 @@ else
   fail "u: ravel.yml's ravel-server does not run --shards 4"
 fi
 if [ "$(grep -cE '^docker compose .* stop ravel-server$' "${LOG}")" -eq 1 ] &&
-  [ "$(grep -cE '^docker compose .* start ravel-server$' "${LOG}")" -eq 1 ] &&
-  [ "$(grep -cE '^docker compose .* (stop|start|restart) ' "${LOG}")" -eq 2 ]; then
-  pass "u: only ravel-server is stopped and started, once each, and nothing restarted"
+  [ "$(grep -cE '^docker compose .* (stop|start|restart) ' "${LOG}")" -eq 1 ]; then
+  pass "u: only ravel-server is stopped, once, and nothing started or restarted by compose start/restart"
 else
   fail "u: stop, start and restart calls in ${LOG}: $(grep -E ' (stop|start|restart) ' "${LOG}")"
 fi
+# The start step: every compose start or up after the fold is exactly the
+# no-deps, no-recreate up of ravel-server, and no one-shot service ran again.
+if python3 -I - "${LOG}" <<'PY'; then
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+fold = next(i for i, l in enumerate(lines) if "catalog fold" in l)
+after = lines[fold + 1:]
+calls = [l for l in after if l.startswith(("docker-compose-up ", "docker-compose-start "))]
+oneshots = [l for l in after if l.startswith("docker-oneshot ")
+            or (l.startswith(("docker-compose-up ", "docker-compose-start "))
+                and any(s in l.split() for s in ("createbuckets", "ravel-qualify")))]
+sys.exit(0 if calls == ["docker-compose-up -d --no-deps --no-recreate ravel-server"] and not oneshots else 1)
+PY
+  pass "u: the start step ran exactly docker compose up -d --no-deps --no-recreate ravel-server"
+else
+  fail "u: compose start/up calls after the fold in ${LOG}: $(grep -E '^docker-(compose-up|compose-start|oneshot) ' "${LOG}")"
+fi
+expect_no_log "u: no one-shot service started after the fold" "docker-oneshot started"
 expect_log "u: the fold ran while ravel-server was stopped" "docker-state fold ravel-server=stopped"
 expect_log "u: the folded read-back reads the Ravel row of ingest.json" "metricsbench_ingest --readback-only --ingest-report ${OUT}/ingest.json --readback-system ravel --workload "
 expect_log "u: the folded read-back uses the ingest step's workload, profile, anchor, URL and token env" "--profile ci --anchor-ms ${ANCHOR} --ravel-query-url http://127.0.0.1:4318 --ravel-bearer-token-env METRICSBENCH_RAVEL_TOKEN --readback-timeout-secs 30 --readback-settle-secs 60"
@@ -1266,7 +1308,7 @@ def first(s, after=-1):
 mem = max(i for i, l in enumerate(lines) if l.startswith("docker inspect id-"))
 stop = first(" stop ravel-server")
 fold = first("catalog fold")
-start = first(" start ravel-server")
+start = first("docker-compose-up -d --no-deps --no-recreate ravel-server")
 ready = first("/api/v1/status/buildinfo", start)
 before = first("/metrics", start)
 rb = first("--readback-only")
@@ -1280,7 +1322,7 @@ fi
 HOUR_NOW=$(($(date -u +%s) / 3600))
 check "u: fold stamped with its report's figures" 'j("stamps.json")["ravel_catalog_fold_writers_stopped"]["entry_count"] == 420 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["buckets_folded"] == 2 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["no_op"] is False and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["precondition"] == "met"'
 check "u: fold stamped with sealed and watermark hours at the ingest end hour" 'abs(j("stamps.json")["ravel_catalog_fold_writers_stopped"]["seal_through_hour"] - '"${HOUR_NOW}"') <= 1 and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["watermark_hour"] >= j("stamps.json")["ravel_catalog_fold_writers_stopped"]["ingest_end_hour"]'
-check "u: stop and start stamped" 'j("stamps.json")["ravel_restart"] == "stopped: docker compose stop ravel-server before the fold; started: docker compose start ravel-server after it, then ravel answered 200 on /api/v1/status/buildinfo"'
+check "u: stop and start stamped" 'j("stamps.json")["ravel_restart"] == "stopped: docker compose stop ravel-server before the fold; started: docker compose up -d --no-deps --no-recreate ravel-server after it, then ravel answered 200 on /api/v1/status/buildinfo"'
 check "u: folded read-back stamped with exit, match, series query_ms, deltas and the catalog GET verdict" 'j("stamps.json")["readback_folded"] == {"exit_code": 0, "matches_expected": True, "error": None, "series_query_ms": 12, "store_get_calls_delta": 100, "commit_record_cache_entries_delta": 3, "fetch_cache_misses_delta": 95, "catalog_get_delta": 5, "data_objects_listed": 300, "data_objects_flushed": 200, "folded_catalog_get_max_fraction": "0.05", "folded_catalog_get_floor": 64, "folded_catalog_get_limit": 79, "catalog_get_verdict": "within"}'
 check "u: data_objects_listed is ravel-objects.json's data count, the limit 64 + 0.05 x 300 = 79" 'j("stamps.json")["readback_folded"]["data_objects_listed"] == j("ravel-objects.json")["data"]["count"] == 300 and j("stamps.json")["readback_folded"]["folded_catalog_get_limit"] == 79'
 check "u: data_objects_flushed sums the five disjoint metrics reasons only" 'j("stamps.json")["readback_folded"]["data_objects_flushed"] == 40 + 100 + 20 + 30 + 10'
@@ -1294,7 +1336,8 @@ expect_err "u1: message names step fold" "step fold failed: fold sealed nothing:
 check "u1: stamps name step fold, fold stamped failed" 'j("stamps.json")["failed_step"] == "fold" and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["precondition"].startswith("fold sealed nothing")'
 check "u1: stop done, start not, the server stamped stopped and not started again" 'j("stamps.json")["steps_completed"][-2:] == ["memory","stop"] and j("stamps.json")["ravel_restart"] == "stopped: docker compose stop ravel-server before the fold; not started again"'
 expect_log "u1: the fold ran while ravel-server was stopped" "docker-state fold ravel-server=stopped"
-expect_no_log "u1: no start" "start ravel-server"
+expect_no_log "u1: no start" "up -d --no-deps --no-recreate ravel-server"
+expect_no_log "u1: no compose start" "docker-compose-start "
 expect_no_log "u1: no folded read-back" "--readback-only"
 
 # u2: a fold whose watermark is before the hour ingest ended in.
@@ -1303,7 +1346,8 @@ STUB_FOLD_WATERMARK_LAG=2 run_case u2 "${args[@]}"
 expect_rc u2 70
 expect_err "u2: message names step fold and the watermark" "step fold failed: watermark_hour=Some("
 check "u2: stamps name step fold, watermark before the ingest end hour" 'j("stamps.json")["failed_step"] == "fold" and j("stamps.json")["ravel_catalog_fold_writers_stopped"]["watermark_hour"] < j("stamps.json")["ravel_catalog_fold_writers_stopped"]["ingest_end_hour"]'
-expect_no_log "u2: no start" "start ravel-server"
+expect_no_log "u2: no start" "up -d --no-deps --no-recreate ravel-server"
+expect_no_log "u2: no compose start" "docker-compose-start "
 
 # u2a: docker compose stop fails: no fold, no start.
 mapfile -t args < <(full_args "${TMP}/u2a/out")
@@ -1313,12 +1357,12 @@ expect_err "u2a: message names step stop" "step stop failed: docker compose stop
 check "u2a: stamps name step stop, the failed stop stamped" 'j("stamps.json")["failed_step"] == "stop" and j("stamps.json")["ravel_restart"] == "not stopped: docker compose stop ravel-server exited 1; no fold ran" and j("stamps.json")["steps_completed"][-1] == "memory"'
 expect_no_log "u2a: no fold" "catalog fold"
 
-# u2b: docker compose start fails after the fold: no read-back.
+# u2b: starting ravel-server fails after the fold: no read-back.
 mapfile -t args < <(full_args "${TMP}/u2b/out")
 STUB_START_EXIT=1 run_case u2b "${args[@]}"
 expect_rc u2b 70
-expect_err "u2b: message names step start" "step start failed: docker compose start ravel-server exited 1"
-check "u2b: stamps name step start after stop and fold, the failed start stamped" 'j("stamps.json")["failed_step"] == "start" and j("stamps.json")["steps_completed"][-3:] == ["memory","stop","fold"] and j("stamps.json")["ravel_restart"] == "stopped: docker compose stop ravel-server before the fold; docker compose start ravel-server after it exited 1"'
+expect_err "u2b: message names step start" "step start failed: docker compose up -d --no-deps --no-recreate ravel-server exited 1"
+check "u2b: stamps name step start after stop and fold, the failed start stamped" 'j("stamps.json")["failed_step"] == "start" and j("stamps.json")["steps_completed"][-3:] == ["memory","stop","fold"] and j("stamps.json")["ravel_restart"] == "stopped: docker compose stop ravel-server before the fold; docker compose up -d --no-deps --no-recreate ravel-server after it exited 1"'
 expect_no_log "u2b: no folded read-back" "--readback-only"
 
 # u3: the folded read-back fails.
@@ -1372,7 +1416,8 @@ LOG="${TMP}/f/calls.log"
 check "u9: diagnostic stamps the three not applicable" 'all(j("stamps.json")[k] == "not applicable: diagnostic run starts no Ravel" for k in ("ravel_catalog_fold_writers_stopped","ravel_restart","readback_folded")) and not {"stop","fold","start","readback-folded"} & set(j("stamps.json")["steps_completed"])'
 expect_no_log "u9: diagnostic runs no fold" "catalog fold"
 expect_no_log "u9: diagnostic stops nothing" "stop ravel-server"
-expect_no_log "u9: diagnostic starts nothing" "start ravel-server"
+expect_no_log "u9: diagnostic starts no ravel-server" "up -d --no-deps --no-recreate ravel-server"
+expect_no_log "u9: diagnostic runs no compose start" "docker-compose-start "
 expect_no_log "u9: diagnostic runs no folded read-back" "--readback-only"
 
 # u10: the real-S3 lane (case s) folds through the same service, with its overlay.
