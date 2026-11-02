@@ -32,8 +32,8 @@ permissions:
 # not leave the old run burning coverage/k8s minutes to completion (ADR-0053
 # D3). Keyed on the workflow plus the ref for PR and merge-queue refs, where
 # only the latest run matters. A push to main is history other things build
-# on (the coverage lane runs only there, and the publish gate needs a
-# successful run for the tagged SHA), so every main push gets its own group,
+# on (the publish gate needs a successful run for the tagged SHA, and the
+# coverage badge is updated from it), so every main push gets its own group,
 # keyed on the commit SHA: GitHub holds at most one pending run per group and
 # cancels the previous pending run whenever a new one is queued, so a shared
 # main group with `cancel-in-progress` off still lost the run of any push that
@@ -868,8 +868,8 @@ jobs:
   # these same fmt/clippy steps; they now live here alone (D3: "check and sql
   # drop their now-duplicate fmt/clippy steps").
   #
-  # The expensive lanes gate on this job (k8s-integration and the main-push
-  # coverage job carry `needs: lint`). The cheap lanes (`check`, `sql`, the
+  # The expensive lanes gate on this job (k8s-integration and the coverage
+  # job carry `needs: lint`). The cheap lanes (`check`, `sql`, the
   # other test jobs) deliberately do NOT gate on it: they keep fanning out
   # behind `changes` and run their real nextest suites in parallel with lint,
   # since that is useful work regardless of lint's outcome and D3's rejected
