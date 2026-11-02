@@ -81,3 +81,16 @@ The intended corpora are the LogHub datasets from
 [logpai/loghub](https://github.com/logpai/loghub): HDFS, BGL, and Apache.
 They are not checked in. Results are posted on issue #2977, each with its
 report's `stamp`.
+
+## Selective investigations (benchmarks/investigations)
+
+Issue #3699 (ADR-3692 decision 8, T1). Not a `ravel-bench` report: a
+standalone box flow that generates a correlated spans+logs corpus, loads it
+across a key-index state matrix (unfolded, folded without leaves, folded
+with leaves, mixed, many-parts), and runs a pre-registered statement set
+cold and warm, scoring every figure against the bands in
+`benchmarks/investigations/bands.toml` (the 17 rows of ADR-3692's
+Acceptance table). See `benchmarks/investigations/README.md` for how to
+launch a run on the local/RustFS lane or the real-S3 lane, and
+`benchmarks/investigations/kit.test.sh` (wired into CI's `doc-scripts` job)
+for the harness's own self-tests.
