@@ -112,6 +112,23 @@
 #                                       and the usage names the flags; s8: an
 #                                       engine arch with no s3s-fs asset passes
 #   t  real S3 with a local build    -> exit 65, nothing started
+#   u  fold, restart, folded read-back -> u (case a's output): fold.out,
+#                                       readback-folded.json and both /metrics
+#                                       scrapes written, the three stamps, the
+#                                       calls in order memory, fold, restart,
+#                                       scrape, read-back, scrape; u1: a fold
+#                                       that sealed nothing and u2: a watermark
+#                                       before the ingest end hour exit 70
+#                                       naming fold; u3: a read-back-only exit
+#                                       1 and u4: a failed scrape exit 70 naming
+#                                       readback-folded; u5: Ravel's ingest
+#                                       read-back failed, the three still run,
+#                                       exit 70 naming ingest; u6: the same with
+#                                       readback-folded listed after ingest; u7:
+#                                       a Ravel row_failure and u8: a Ravel
+#                                       stall skip them, stamped why; u9: the
+#                                       diagnostic mode runs none; u10: the
+#                                       real-S3 lane folds with its overlay
 #
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
 #
@@ -645,6 +662,7 @@ STUB_INGEST_READBACK_FAIL=victoriametrics STUB_MEM_ravel_server=2GiB run_case q3
 expect_rc q3 70
 check "q3: stamps name ingest and list memory as failed after it" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["memory"]'
 expect_err "q3: the band is still said" "--rss-band ravel-server:0:1073741824 above"
+expect_no_log "q3: the breach ends the run before the fold" "catalog fold"
 
 # --- q4: the oracle's read-back fails ----------------------------------------------
 # query refuses a diagnostic whose failed row is Prometheus's, so the run ends at
@@ -665,6 +683,7 @@ expect_no_log "q4: validate not run" "metricsbench_report validate"
 expect_file q4 memory-summary.json
 check "q4: the breach is recorded in memory-summary.json" 'j("memory-summary.json")["verdict"] == "band_violated" and [b["verdict"] for b in j("memory-summary.json")["bands"]] == ["above"]'
 expect_log "q4: torn down" " down -v"
+expect_no_log "q4: the run ends before the fold" "catalog fold"
 
 # --- r: ingest fails with every row verified ---------------------------------------
 mapfile -t args < <(full_args "${TMP}/r/out")
@@ -1064,7 +1083,16 @@ for f in fold.out readback-folded.json ravel-metrics-before-folded-readback.txt 
   expect_file u "$f"
 done
 expect_log "u: the fold runs ravel-cli on the ravel-qualify service with the server's flags" "ravel.yml run --rm --no-deps -T ravel-qualify --store s3 --tenant-hash-unkeyed catalog fold --tenant metricsbench --shards 4 --signal metrics --writers-stopped"
-expect_log "u: only ravel-server is restarted" "ravel.yml restart ravel-server"
+if grep -A1 -xF '      - "--shards"' "${HERE}/../ravel.yml" | grep -qxF '      - "4"'; then
+  pass "u: ravel.yml's server runs --shards 4, the count the fold names"
+else
+  fail "u: ravel.yml's ravel-server does not run --shards 4"
+fi
+if grep -qE ' restart ravel-server$' "${LOG}" && [ "$(grep -c ' restart' "${LOG}")" -eq 1 ]; then
+  pass "u: only ravel-server is restarted, once"
+else
+  fail "u: restart calls in ${LOG}: $(grep ' restart' "${LOG}")"
+fi
 expect_log "u: the folded read-back reads the Ravel row of ingest.json" "metricsbench_ingest --readback-only --ingest-report ${OUT}/ingest.json --readback-system ravel --workload "
 expect_log "u: the folded read-back uses the ingest step's workload, profile, anchor, URL and token env" "--profile ci --anchor-ms ${ANCHOR} --ravel-query-url http://127.0.0.1:4318 --ravel-bearer-token-env METRICSBENCH_RAVEL_TOKEN --readback-timeout-secs 30 --readback-settle-secs 60"
 expect_no_log "u: the ingest step passes no settle flag" "--max-ingest-secs 600 --readback-timeout-secs 30 --readback-settle-secs"
