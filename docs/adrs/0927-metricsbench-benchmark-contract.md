@@ -1102,7 +1102,8 @@ otherwise, so the two benchmarks no longer run the same s3s-fs build. Ravel
 figures measured on `ravel.1` are not compared with figures measured on
 `ravel.2`; each run's provenance records the store release and its sha256.
 Comparator rows are affected too, since Mimir writes to the same store, and
-are re-measured on `ravel.2` like Ravel's. Decision 10 is unchanged: only
+are re-measured on `ravel.2` like Ravel's (now on `ravel.3`; see the
+conditional-write amendment below). Decision 10 is unchanged: only
 the real-S3 lane produces publishable Ravel performance and cost figures.
 
 ## Amendment (2026-11-02): the portable stack's s3s-fs build makes conditional writes atomic
@@ -1123,8 +1124,8 @@ its checksum with no ordering against a writer. Issue #3652 holds the
 evidence and the code-level cause.
 
 Decision: the portable stack runs `s3s-fs-0.17.0-ravel.3` of the
-`NOFireAI/s3s` fork. It is `ravel.2` plus NOFireAI/s3s#2, three tests and
-the fix they pin:
+`NOFireAI/s3s` fork. It is `ravel.2` plus NOFireAI/s3s#2: three tests, the
+fix they pin, and three behaviour-preserving lint and doc commits. The fix:
 
 - every object maps onto one of a fixed set of locks;
 - a write stages its body and both sidecars as temporary files, checks its
@@ -1137,7 +1138,9 @@ release's SHA256SUMS. The envelope, one CPU and 2 GiB, does not change.
 
 Consequences. Ravel and comparator figures measured on `ravel.2` or earlier
 are not compared with figures measured on `ravel.3`; each run's provenance
-records the store release and its sha256. Every earlier s3s-fs run used a
+records the store release and its sha256. Comparator rows are re-measured
+on `ravel.3` like Ravel's, since Mimir writes to the same store. Every
+earlier s3s-fs run used a
 store where concurrent conditional writes could each succeed. The 13
 earlier `ci` runs on s3s-fs recorded at most one losing create-if-absent
 write each and no corrupted read, but no earlier run was checked for this
