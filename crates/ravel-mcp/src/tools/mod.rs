@@ -214,22 +214,35 @@ mod tests {
         ) -> Result<crate::draft::ExplainOutcome, Failure> {
             Err(unreached("sql_explain"))
         }
+
+        async fn describe_data(
+            &self,
+            _tenant_hash: TenantHash,
+            _request: &crate::service::DescribeRequest,
+        ) -> Result<crate::service::DescribeOutcome, Failure> {
+            Err(unreached("describe_data"))
+        }
     }
 
-    /// A backend whose `sql_explain`, `labels` and `label_values` answer what
-    /// the test configured and record the request they were handed. Every
-    /// other method, and either of those left unconfigured, panics: a test
-    /// built on it proves the body never reached that call.
     /// One metadata call: the request, and for `label_values` the label name
     /// and the `include_log_metric_names` flag.
     pub(crate) type MetadataCall = (MetadataRequest, Option<(String, bool)>);
 
+    /// A backend whose `sql_explain`, `labels`, `label_values` and
+    /// `describe_data` answer what the test configured and record the request
+    /// they were handed. Every other method, and any of those left
+    /// unconfigured, panics: a test built on it proves the body never reached
+    /// that call. `describe` is a queue, one outcome per call, so a paging
+    /// test configures each page's answer in order.
     #[derive(Default)]
     pub(crate) struct Stub {
         pub(crate) explain: Option<crate::draft::ExplainOutcome>,
         pub(crate) listed: Option<Envelope>,
         pub(crate) explained: std::cell::RefCell<Vec<ravel_sql::SqlRequest>>,
         pub(crate) metadata: std::cell::RefCell<Vec<MetadataCall>>,
+        pub(crate) describe:
+            std::cell::RefCell<std::collections::VecDeque<crate::service::DescribeOutcome>>,
+        pub(crate) described: std::cell::RefCell<Vec<crate::service::DescribeRequest>>,
     }
 
     impl Stub {
@@ -333,6 +346,18 @@ mod tests {
             };
             self.explained.borrow_mut().push(request.clone());
             Ok(outcome.clone())
+        }
+
+        async fn describe_data(
+            &self,
+            _tenant_hash: TenantHash,
+            request: &crate::service::DescribeRequest,
+        ) -> Result<crate::service::DescribeOutcome, Failure> {
+            let Some(outcome) = self.describe.borrow_mut().pop_front() else {
+                panic!("describe_data must not be reached");
+            };
+            self.described.borrow_mut().push(request.clone());
+            Ok(outcome)
         }
     }
 
