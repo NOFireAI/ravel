@@ -127,16 +127,27 @@
 //! which is the float case. A `Float64` column admits NaN and the infinities,
 //! and [`ResumeValue::Float`] refuses all three
 //! ([`PagePlanError::NonFiniteResumeValue`]), because none has a SQL literal
-//! to splice. Comparison is not the problem: DataFusion orders floats totally,
-//! so `NaN = NaN` is TRUE, `NaN` sorts after every number, `-0.0` sorts before
-//! `0.0`, and a keyset predicate does place a NaN row on a page. What it
-//! cannot do is resume FROM one. A page whose last row carries NaN mints no
-//! cursor, so under `ORDER BY value` the walk dies on the last page and under
-//! `ORDER BY value DESC` it dies on the first, and every row it had not
-//! reached appears on no page. Carrying NaN in a cursor instead of refusing
-//! the term needs a literal DataFusion parses back to the same bit pattern and
-//! a disjunct that places it where the sort does; until that exists, every
+//! to splice. A page whose last row carries NaN mints no cursor, so under
+//! `ORDER BY value` the walk dies on the last page and under `ORDER BY value
+//! DESC` it dies on the first, and every row it had not reached appears on no
+//! page. Carrying NaN in a cursor instead of refusing the term needs a literal
+//! DataFusion parses back to the same bit pattern; until that exists, every
 //! float term is refused, and `samples.value` is the one reachable case.
+//!
+//! Comparison is a problem too, at the zeros. DataFusion SORTS floats by a
+//! total order, `-0.0` before `0.0`, but its comparison operators normalise a
+//! zero's sign first, so `-0.0 = 0.0` is TRUE, `0.0 > -0.0` is FALSE and
+//! `-0.0 < 0.0` is FALSE. Written as literals, a `-0.0` boundary would skip
+//! the `0.0` rows the sort places next, and as an earlier term's equality it
+//! would take the `0.0` rows for its peers. [`keyset_predicate`] therefore
+//! compares a zero boundary as `0.0` and reads the sign through
+//! `atan2(c, -1.0)`, which is π for `0.0` and -π for `-0.0`. NaN is not
+//! normalised: `NaN = NaN` is TRUE, and a negative NaN sorts first and
+//! compares below zero while a positive one sorts last and compares above it;
+//! a NaN boundary is refused, as above. Because float terms are refused, no
+//! cursor minted from a page's own rows carries a float; a zero still reaches
+//! the predicate through a caller's resume tuple, whose variants are not
+//! checked against the term's type.
 //!
 //! # Every clause of the body is read, or discarded by name
 //!
@@ -1492,7 +1503,7 @@ enum TermProof {
 /// infinities [`ResumeValue::Float`] refuses). The two are one answer here
 /// because they have one consequence: a page ending on such a value mints no
 /// cursor, so the string carries the distinction into the refusal instead.
-enum CursorSupport {
+pub(crate) enum CursorSupport {
     /// A [`ResumeValue`] variant carries every value of the type, and the
     /// literal it renders reads back as the same value.
     Exact,
@@ -1509,7 +1520,7 @@ enum CursorSupport {
 /// `Nanosecond` with no timezone because that is what
 /// [`ResumeValue::TimestampNanos`] renders; another unit or a timezone would
 /// compare a nanosecond count against a differently scaled column.
-fn cursor_support(data_type: &DataType) -> CursorSupport {
+pub(crate) fn cursor_support(data_type: &DataType) -> CursorSupport {
     match data_type {
         DataType::Boolean
         | DataType::Int8
@@ -2084,6 +2095,9 @@ fn render_statement(
 }
 
 /// The strict lexicographic keyset predicate for `terms` at `tuple`.
+///
+/// A float zero in `tuple` is written through [`zero_sign`]; see the module
+/// docs for why `-0.0` and `0.0` cannot be compared as literals.
 fn keyset_predicate(terms: &[OrderTerm], tuple: &[ResumeValue]) -> Result<String, PagePlanError> {
     if terms.len() != tuple.len() {
         return Err(PagePlanError::ResumeArity {
@@ -2098,20 +2112,56 @@ fn keyset_predicate(terms: &[OrderTerm], tuple: &[ResumeValue]) -> Result<String
     let mut disjuncts = Vec::with_capacity(terms.len());
     for (index, term) in terms.iter().enumerate() {
         let mut conjuncts = Vec::with_capacity(index + 1);
-        for (earlier, value) in terms.iter().zip(&values).take(index) {
-            conjuncts.push(format!("{} = {}", quote_ident(&earlier.column), value));
+        for ((earlier, value), rendered) in terms.iter().zip(tuple).zip(&values).take(index) {
+            let column = quote_ident(&earlier.column);
+            conjuncts.push(match zero_sign(value) {
+                Some(negative) => same_zero(&column, negative),
+                None => format!("{column} = {rendered}"),
+            });
         }
+        let column = quote_ident(&term.column);
         let operator = if term.descending { "<" } else { ">" };
         let value = values.get(index).map_or("", String::as_str);
-        conjuncts.push(format!(
-            "{} {} {}",
-            quote_ident(&term.column),
-            operator,
-            value
-        ));
+        conjuncts.push(match tuple.get(index).and_then(zero_sign) {
+            // The other zero sorts after this one: `0.0` after `-0.0`
+            // ascending, `-0.0` after `0.0` descending.
+            Some(negative) if negative != term.descending => {
+                format!(
+                    "({column} {operator} 0.0 OR {})",
+                    same_zero(&column, !negative)
+                )
+            }
+            _ => format!("{column} {operator} {value}"),
+        });
         disjuncts.push(format!("({})", conjuncts.join(" AND ")));
     }
     Ok(format!("({})", disjuncts.join(" OR ")))
+}
+
+/// For a float zero, whether it is `-0.0`; `None` for every other value.
+///
+/// DataFusion's comparison operators normalise a zero's sign before
+/// comparing, so `"c" = -0.0` holds for a `0.0` row and `"c" > -0.0` does not,
+/// while its sort places `-0.0` before `0.0`. A zero boundary therefore
+/// compares as `0.0` and reads the sign through [`same_zero`].
+fn zero_sign(value: &ResumeValue) -> Option<bool> {
+    match value {
+        ResumeValue::Float(v) if v.classify() == std::num::FpCategory::Zero => {
+            Some(v.is_sign_negative())
+        }
+        _ => None,
+    }
+}
+
+/// The predicate holding exactly for a row whose `column` is the zero of the
+/// given sign.
+///
+/// `atan2(c, -1.0)` is π for `0.0` and -π for `-0.0` (IEEE 754 `atan2` keeps
+/// the sign of its first argument), and `atan2` is an admitted scalar, so the
+/// sign is read inside the statement rather than lost to the comparison.
+fn same_zero(column: &str, negative: bool) -> String {
+    let sign = if negative { "<" } else { ">" };
+    format!("({column} = 0.0 AND atan2({column}, -1.0) {sign} 0.0)")
 }
 
 /// The column an expression names, or `None` when it is not a column
@@ -2380,6 +2430,64 @@ mod tests {
                 expected: 2,
                 found: 1,
             },
+        );
+    }
+
+    /// A caller's tuple is not checked against the terms' types, so a float
+    /// zero reaches the keyset predicate even though no float term plans. It
+    /// is written as `0.0` with its sign read through `atan2`, in the earlier
+    /// term's equality and in the last term's comparison alike.
+    ///
+    /// FLIP: with `keyset_predicate` splicing the rendered literal for a zero
+    /// (the planner before #3682), the statement reads `"ts" > -0.0` and
+    /// `"ts" = -0.0`, and both comparisons fail.
+    #[test]
+    fn a_float_zero_in_a_callers_tuple_is_compared_with_its_sign() {
+        let series = format!("arrow_cast(decode('{SERIES_ID_HEX}', 'hex'), 'FixedSizeBinary(16)')");
+        let negative = ResumePosition::new(vec![
+            ResumeValue::Float(-0.0),
+            ResumeValue::FixedSizeBinary(SERIES_ID.to_vec()),
+        ]);
+        let ascending =
+            plan_page("SELECT * FROM samples ORDER BY ts", Some(&negative)).expect("planned");
+        assert_eq!(
+            ascending.statement,
+            format!(
+                "SELECT * FROM (SELECT * FROM samples) AS ravel_page \
+                 WHERE (((\"ts\" > 0.0 OR (\"ts\" = 0.0 AND atan2(\"ts\", -1.0) > 0.0))) \
+                 OR ((\"ts\" = 0.0 AND atan2(\"ts\", -1.0) < 0.0) \
+                 AND \"series_id\" > {series})) \
+                 ORDER BY \"ts\" ASC, \"series_id\" ASC"
+            ),
+        );
+        let descending =
+            plan_page("SELECT * FROM samples ORDER BY ts DESC", Some(&negative)).expect("planned");
+        assert_eq!(
+            descending.statement,
+            format!(
+                "SELECT * FROM (SELECT * FROM samples) AS ravel_page \
+                 WHERE ((\"ts\" < -0.0) \
+                 OR ((\"ts\" = 0.0 AND atan2(\"ts\", -1.0) < 0.0) \
+                 AND \"series_id\" > {series})) \
+                 ORDER BY \"ts\" DESC, \"series_id\" ASC"
+            ),
+        );
+
+        let positive = ResumePosition::new(vec![
+            ResumeValue::Float(0.0),
+            ResumeValue::FixedSizeBinary(SERIES_ID.to_vec()),
+        ]);
+        let descending =
+            plan_page("SELECT * FROM samples ORDER BY ts DESC", Some(&positive)).expect("planned");
+        assert_eq!(
+            descending.statement,
+            format!(
+                "SELECT * FROM (SELECT * FROM samples) AS ravel_page \
+                 WHERE (((\"ts\" < 0.0 OR (\"ts\" = 0.0 AND atan2(\"ts\", -1.0) < 0.0))) \
+                 OR ((\"ts\" = 0.0 AND atan2(\"ts\", -1.0) > 0.0) \
+                 AND \"series_id\" > {series})) \
+                 ORDER BY \"ts\" DESC, \"series_id\" ASC"
+            ),
         );
     }
 
@@ -2954,10 +3062,11 @@ mod tests {
     ///
     /// The half of the second clause where a variant EXISTS and does not cover
     /// the type. `ResumeValue::Float` carries any FINITE float, so nothing
-    /// upstream refuses `ORDER BY value`, and the comparison is not the
-    /// problem: DataFusion orders floats totally, so `NaN = NaN` is TRUE and a
-    /// keyset disjunct does place a NaN row on a page. What no caller can do
-    /// is resume FROM that row. Rendering its cursor position hits
+    /// upstream refuses `ORDER BY value`. NaN comparison is not the problem:
+    /// DataFusion compares NaN by its total order, so `NaN = NaN` is TRUE and
+    /// a keyset disjunct does place a NaN row on a page (the zeros are the
+    /// one place its comparison and its sort part, which [`keyset_predicate`]
+    /// handles). What no caller can do is resume FROM a NaN row. Rendering its cursor position hits
     /// [`PagePlanError::NonFiniteResumeValue`], so the page after it is never
     /// planned and every row the walk had not reached appears on no page.
     ///
@@ -4181,6 +4290,316 @@ mod tests {
                 }),
                 "unexpected outcome for {sql:?}"
             );
+        }
+    }
+
+    /// `(f, k)` rows holding each zero sign twice, under distinct `k`, stored
+    /// in an order none of the walks below uses. The `k = 1` rows are a
+    /// single-key fixture: `f` alone is a key over them.
+    const ZERO_SIGN_ROWS: [(f64, i64); 6] = [
+        (0.0, 2),
+        (-1.0, 1),
+        (1.0, 1),
+        (-0.0, 2),
+        (0.0, 1),
+        (-0.0, 1),
+    ];
+
+    fn zero_sign_context() -> SessionContext {
+        use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
+        use datafusion::arrow::datatypes::{Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f", DataType::Float64, false),
+            Field::new("k", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Float64Array::from(
+                    ZERO_SIGN_ROWS.iter().map(|row| row.0).collect::<Vec<f64>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    ZERO_SIGN_ROWS.iter().map(|row| row.1).collect::<Vec<i64>>(),
+                )),
+            ],
+        )
+        .expect("zero sign batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("mem table");
+        let ctx = SessionContext::new();
+        ctx.register_table("zero_signs", Arc::new(table))
+            .expect("registered");
+        ctx
+    }
+
+    /// The `(f, k)` rows `statement` returns, in order, `f` as its bits so a
+    /// comparison tells the zero signs apart.
+    async fn zero_sign_rows(ctx: &SessionContext, statement: &str) -> Vec<(u64, i64)> {
+        use datafusion::arrow::array::{Float64Array, Int64Array};
+
+        let batches = ctx
+            .sql(statement)
+            .await
+            .unwrap_or_else(|e| panic!("{statement} would not plan: {e}"))
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{statement} would not execute: {e}"));
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let f = batch
+                .column_by_name("f")
+                .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
+                .expect("an f column");
+            let k = batch
+                .column_by_name("k")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .expect("a k column");
+            for index in 0..batch.num_rows() {
+                rows.push((f.value(index).to_bits(), k.value(index)));
+            }
+        }
+        rows
+    }
+
+    fn zero_sign_position(terms: &[OrderTerm], row: (u64, i64)) -> ResumePosition {
+        ResumePosition::new(
+            terms
+                .iter()
+                .map(|term| match term.column.as_str() {
+                    "f" => ResumeValue::Float(f64::from_bits(row.0)),
+                    _ => ResumeValue::Int(row.1),
+                })
+                .collect(),
+        )
+    }
+
+    fn shown(rows: &[(u64, i64)]) -> Vec<(f64, i64)> {
+        rows.iter().map(|&(f, k)| (f64::from_bits(f), k)).collect()
+    }
+
+    /// Walks `sql` under `terms` one row per page, each page resumed at the
+    /// previous page's row, and then resumes it after every row of its full
+    /// ordering, failing unless every resumed page holds exactly the rows
+    /// after its boundary, compared bit for bit.
+    ///
+    /// The statements go through [`render_statement`], the step of
+    /// [`plan_page`] that writes the keyset predicate, because `plan_page`
+    /// refuses a float order term before it gets there.
+    async fn assert_pages_across_zero_signs(sql: &str, terms: &[OrderTerm]) {
+        let ctx = zero_sign_context();
+        let query = parse_query(sql).expect("parsed");
+        let full = zero_sign_rows(
+            &ctx,
+            &render_statement(&query, terms, None).expect("first page"),
+        )
+        .await;
+        for zero in [0.0f64, -0.0] {
+            assert!(
+                full.iter().any(|row| row.0 == zero.to_bits()),
+                "{sql} returns a {zero:?} row: {:?}",
+                shown(&full),
+            );
+        }
+
+        let mut walked: Vec<(u64, i64)> = Vec::new();
+        let mut resume: Option<ResumePosition> = None;
+        for _ in 0..=full.len() {
+            let statement = render_statement(&query, terms, resume.as_ref()).expect("page");
+            let Some(&row) = zero_sign_rows(&ctx, &statement).await.first() else {
+                break;
+            };
+            walked.push(row);
+            resume = Some(zero_sign_position(terms, row));
+        }
+        let mut wrong = Vec::new();
+        if walked != full {
+            wrong.push(format!(
+                "walked a row per page: {:?}, expected {:?}",
+                shown(&walked),
+                shown(&full),
+            ));
+        }
+
+        for (index, &boundary) in full.iter().enumerate() {
+            let position = zero_sign_position(terms, boundary);
+            let statement = render_statement(&query, terms, Some(&position)).expect("page");
+            let after = zero_sign_rows(&ctx, &statement).await;
+            let expected = full.get(index + 1..).unwrap_or_default();
+            if after != expected {
+                wrong.push(format!(
+                    "resumed after {:?}: {:?}, expected {:?}, from {statement}",
+                    position.tuple,
+                    shown(&after),
+                    shown(expected),
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{sql} under {terms:?}:\n{}",
+            wrong.join("\n"),
+        );
+    }
+
+    /// What the zero-sign predicate assumes about DataFusion, measured over
+    /// column values rather than folded literals: comparisons treat the two
+    /// zeros as one value, the sort does not, `atan2(c, -1.0)` tells them
+    /// apart, and NaN is compared by the sort's total order, not normalised.
+    ///
+    /// FLIP: with `signum(f)` in place of `atan2(f, -1.0)` in the two sign
+    /// queries, each returns no row, since `signum` returns a zero for both
+    /// zeros. The same substitution in `same_zero` fails the three zero-sign
+    /// walks below.
+    #[tokio::test]
+    async fn datafusion_compares_the_zeros_as_one_value_and_sorts_them_as_two() {
+        use datafusion::arrow::array::{Float64Array, RecordBatch, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+
+        assert!(
+            crate::session::ADMITTED_SCALARS.contains(&"atan2"),
+            "a page statement may call atan2",
+        );
+
+        let rows = [
+            ("neg_zero", -0.0f64),
+            ("zero", 0.0),
+            ("nan", f64::NAN),
+            ("neg_nan", -f64::NAN),
+            ("one", 1.0),
+        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("f", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<&str>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<f64>>(),
+                )),
+            ],
+        )
+        .expect("batch");
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "fs",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("mem table")),
+        )
+        .expect("registered");
+
+        let names = |sql: &'static str| {
+            let ctx = ctx.clone();
+            async move {
+                let batches = ctx
+                    .sql(sql)
+                    .await
+                    .expect("planned")
+                    .collect()
+                    .await
+                    .expect("executed");
+                let mut names = Vec::new();
+                for batch in &batches {
+                    let column = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("names");
+                    names.extend(column.iter().flatten().map(str::to_string));
+                }
+                names
+            }
+        };
+
+        assert_eq!(
+            names("SELECT name FROM fs ORDER BY f").await,
+            ["neg_nan", "neg_zero", "zero", "one", "nan"],
+            "the sort places -0.0 before 0.0 and each NaN at its own end",
+        );
+        assert_eq!(
+            names("SELECT name FROM fs WHERE f = -0.0 ORDER BY name").await,
+            ["neg_zero", "zero"],
+            "= compares the two zeros equal",
+        );
+        assert_eq!(
+            names("SELECT name FROM fs WHERE f > -0.0 ORDER BY name").await,
+            ["nan", "one"],
+            "> -0.0 is false for 0.0",
+        );
+        assert_eq!(
+            names("SELECT name FROM fs WHERE f < 0.0 ORDER BY name").await,
+            ["neg_nan"],
+            "< 0.0 is false for -0.0",
+        );
+        assert_eq!(
+            names("SELECT name FROM fs WHERE f = 0.0 AND atan2(f, -1.0) < 0.0").await,
+            ["neg_zero"],
+            "atan2 reads the sign of -0.0",
+        );
+        assert_eq!(
+            names("SELECT name FROM fs WHERE f = 0.0 AND atan2(f, -1.0) > 0.0").await,
+            ["zero"],
+            "atan2 reads the sign of 0.0",
+        );
+        assert_eq!(
+            names("SELECT name FROM fs WHERE f = cast('NaN' AS double)").await,
+            ["nan"],
+            "NaN = NaN is TRUE for the same NaN, and a negative NaN is another value",
+        );
+    }
+
+    /// A walk whose boundary is `-0.0` reaches the `0.0` row after it.
+    ///
+    /// DataFusion sorts `-0.0` before `0.0` but compares the two equal, so a
+    /// boundary written as `"f" > -0.0` is false for the `0.0` row that sorts
+    /// next.
+    ///
+    /// FLIP: with `keyset_predicate` comparing a zero boundary like any other
+    /// value (`"f" > -0.0`, the planner before #3682) the walk returns `-1.0,
+    /// -0.0, 1.0` and skips `0.0`.
+    #[tokio::test]
+    async fn a_walk_from_a_negative_zero_reaches_the_positive_zero() {
+        assert_pages_across_zero_signs(
+            "SELECT f, k FROM zero_signs WHERE k = 1",
+            &[OrderTerm::ascending("f")],
+        )
+        .await;
+    }
+
+    /// The descending mirror: a walk whose boundary is `0.0` reaches the
+    /// `-0.0` row after it.
+    ///
+    /// FLIP: with `keyset_predicate` writing `"f" < 0.0` for a `0.0` boundary
+    /// (the planner before #3682) the walk returns `1.0, 0.0, -1.0` and skips
+    /// `-0.0`.
+    #[tokio::test]
+    async fn a_descending_walk_from_a_positive_zero_reaches_the_negative_zero() {
+        assert_pages_across_zero_signs(
+            "SELECT f, k FROM zero_signs WHERE k = 1",
+            &[OrderTerm::descending("f")],
+        )
+        .await;
+    }
+
+    /// Under a second key, the zero sign decides the equality conjunct too: at
+    /// a `(-0.0, k)` boundary, `"f" = -0.0 AND "k" > k` holds for the `0.0`
+    /// rows as well, so a boundary can both skip rows and repeat them.
+    ///
+    /// FLIP: with `keyset_predicate` writing `"f" = <zero>` for the earlier
+    /// term and `"f" > <zero>` for the last (the planner before #3682), the
+    /// ascending walk from `(-0.0, 2)` skips `(0.0, 1)` and `(0.0, 2)`, and a
+    /// page resumed after `(0.0, 1)` repeats `(-0.0, 2)`.
+    #[tokio::test]
+    async fn a_second_key_pages_across_both_zero_signs_in_every_direction() {
+        for terms in [
+            [OrderTerm::ascending("f"), OrderTerm::ascending("k")],
+            [OrderTerm::ascending("f"), OrderTerm::descending("k")],
+            [OrderTerm::descending("f"), OrderTerm::ascending("k")],
+            [OrderTerm::descending("f"), OrderTerm::descending("k")],
+        ] {
+            assert_pages_across_zero_signs("SELECT f, k FROM zero_signs", &terms).await;
         }
     }
 }
