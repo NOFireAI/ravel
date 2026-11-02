@@ -447,10 +447,11 @@ impl QueryBackend for ServiceBackend {
         &self,
         tenant_hash: TenantHash,
         request: &ravel_sql::SqlRequest,
+        resolve_at_ns: i64,
     ) -> Result<Draft, Failure> {
         let outcome = self
             .service
-            .sql_execute(tenant_hash, request)
+            .sql_execute_at(tenant_hash, request, resolve_at_ns)
             .await
             .map_err(failure)?;
         let envelope = self.sql_envelope(request, &outcome)?;
@@ -465,7 +466,7 @@ impl QueryBackend for ServiceBackend {
             outcome.pending_erasure,
             outcome.declared_columns,
             outcome.ingest_watermark_hour,
-            request.now_ns,
+            resolve_at_ns,
         ))
     }
 

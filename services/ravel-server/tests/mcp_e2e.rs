@@ -993,6 +993,7 @@ mod with_mcp {
                 &sql_request(&format!(
                     "SELECT arrow_cast({MILLIS}, 'Date64') AS d FROM samples LIMIT 1"
                 )),
+                SQL_NOW_NS,
             )
             .await
             .expect_err("a Date64 that is not a whole day has no JSON form");
@@ -1035,6 +1036,7 @@ mod with_mcp {
                 &sql_request(&format!(
                     "SELECT arrow_cast({WHOLE_DAY_MILLIS}, 'Date64') AS d FROM samples LIMIT 1"
                 )),
+                SQL_NOW_NS,
             )
             .await
             .expect("a whole-day Date64 has a JSON date");
@@ -1061,7 +1063,9 @@ mod with_mcp {
     /// FLIP: a watermark taken as the least hour, or from the first segment
     /// in key order, reads 1 here instead of 3.
     /// FLIP: a draft whose resolve instant is the clock's and not the
-    /// request's `now_ns` breaks the `resolve_at_ns` equality.
+    /// `resolve_at_ns` the call passed breaks the `resolve_at_ns` equality;
+    /// `a_later_sql_page_is_audited_at_the_callers_clock` covers one that
+    /// takes the request's `now_ns` instead.
     #[tokio::test]
     async fn sql_execute_carries_the_outcomes_pin_inputs() {
         let (running, backend, service) = sql_backend_over(&[1, 3, 2]).await;
@@ -1072,7 +1076,7 @@ mod with_mcp {
             .await
             .expect("the service executes");
         let draft = backend
-            .sql_execute(expected_tenant(), &request)
+            .sql_execute(expected_tenant(), &request, SQL_NOW_NS)
             .await
             .expect("the adapter executes");
 
@@ -1106,7 +1110,7 @@ mod with_mcp {
             .await
             .expect("the service executes");
         let draft = backend
-            .sql_execute(expected_tenant(), &request)
+            .sql_execute(expected_tenant(), &request, SQL_NOW_NS)
             .await
             .expect("the adapter executes");
 
@@ -1148,7 +1152,7 @@ mod with_mcp {
             assert_eq!(outcome.ingest_watermark_hour, hours.first().copied());
 
             let draft = backend
-                .sql_execute(expected_tenant(), &request)
+                .sql_execute(expected_tenant(), &request, SQL_NOW_NS)
                 .await
                 .expect("the adapter executes");
             assert_eq!(draft.signal, Err(NoCursorSignal::NoTable));
@@ -1175,6 +1179,7 @@ mod with_mcp {
             .sql_execute(
                 expected_tenant(),
                 &sql_request("SELECT 1 AS x UNION ALL SELECT 2 AS x"),
+                SQL_NOW_NS,
             )
             .await
             .expect("the adapter executes");
@@ -1973,8 +1978,11 @@ mod with_mcp {
             &self,
             tenant_hash: ravel_types::TenantHash,
             request: &ravel_sql::SqlRequest,
+            resolve_at_ns: i64,
         ) -> Result<Draft, ravel_mcp::envelope::Failure> {
-            self.0.sql_execute(tenant_hash, request).await
+            self.0
+                .sql_execute(tenant_hash, request, resolve_at_ns)
+                .await
         }
 
         async fn trace_lookup(
@@ -2170,6 +2178,59 @@ mod with_mcp {
             stamps,
             vec![(t0, Some(t0.to_string())), (t1, Some(t1.to_string()))]
         );
+
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// A later SQL page, resolved two hours before the call, reads the
+    /// snapshot of its resolve instant (one of the two segments; the other
+    /// was flushed in the call's own ingest hour) and writes its audit record
+    /// at the call's clock. The draft carries the resolve instant.
+    ///
+    /// FLIP: `sql_execute_resolved_at` stamping the audit record with
+    /// `resolve_at_ns` writes it two hours early.
+    /// FLIP: `ServiceBackend::sql_execute` calling `sql_execute` (resolving
+    /// at the request's `now_ns`) reads both segments.
+    /// FLIP: `ServiceBackend::sql_execute` building the draft at
+    /// `request.now_ns` breaks the `resolve_at_ns` equality.
+    #[tokio::test]
+    async fn a_later_sql_page_is_audited_at_the_callers_clock() {
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        let caller = wall_now_ns();
+        let resolve_at = caller - 2 * NS_PER_HOUR;
+        let caller_hour = u32::try_from(caller / NS_PER_HOUR).expect("the hour fits a u32");
+        let (store, metrics) = instrumented_memory();
+        publish_sample(store.as_ref(), caller_hour - 3, 1).await;
+        publish_sample(store.as_ref(), caller_hour, 2).await;
+        let mut config = server_config(mcp_on());
+        config.audit_pipeline = Some(ravel_maintain::AuditPipelineConfig {
+            audit_mode: ravel_maintain::AuditMode::Required,
+            ..Default::default()
+        });
+        let (running, backend) = describe_backend(&store, metrics, config).await;
+        let request = ravel_sql::SqlRequest {
+            window: ravel_types::TimeRange {
+                start_ns: 0,
+                end_ns: caller,
+            },
+            now_ns: caller,
+            ..sql_request("SELECT value FROM samples")
+        };
+
+        let draft = backend
+            .sql_execute(expected_tenant(), &request, resolve_at)
+            .await
+            .expect("the adapter executes");
+
+        assert_eq!(draft.resolve_at_ns, resolve_at);
+        assert_eq!(draft.envelope.data.row_count, 1);
+        let stamps: Vec<i64> = query_audit_records(store.as_ref())
+            .await
+            .iter()
+            .filter(|row| audit_attr(row, "query.language") == Some("sql"))
+            .map(|row| row.ts_ns)
+            .collect();
+        assert_eq!(stamps, vec![caller]);
 
         running.shutdown().await.expect("server stops");
     }

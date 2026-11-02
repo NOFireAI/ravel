@@ -757,8 +757,10 @@ against the 256 KiB `max_response_bytes` floor.
 4. D5: `min_commit_watermark` is empty for every tool in this phase. No MCP
    input struct declares `min_tokens`, so read-your-write is not reachable
    from this surface. A redemption passes the cursor's own mint instant as
-   the resolve's `now_ns`. That instant bounds which ingest-hour buckets are
-   listed, not which records those buckets hold. So the pagination guarantee
+   the resolve's `now_ns` (its resolve instant only, and not the request's
+   `now_ns`; see the resolve-instant amendment below). That instant bounds
+   which ingest-hour buckets are listed, not which records those buckets
+   hold. So the pagination guarantee
    is three-part. A row is never repeated. A row may appear on a later page.
    A late-arriving row that sorts before the cursor position is silently
    omitted from every page. The third part is the one a caller must know.
@@ -1140,3 +1142,42 @@ not do, so the count stays as it is and is marked instead.
    instead of "exact row counts where available". That moves `tools/list`
    from 15,648 to 15,652 bytes with the nine tools and from 23,537 to
    23,541 bytes with all fifteen, still under the 24,576-byte budget.
+
+## Amendment (2026-11-02, #3663): the resolve-instant amendment, a later SQL page resolves at page one's instant on the call's own clock
+
+<!-- amendment-applies: sections="Consequences" pointer="resolve-instant amendment" -->
+<!-- amendment-supersedes: phrase="the resolve's `now_ns`" pointer="resolve-instant amendment" -->
+
+The 2026-09-12 amendment, item 4, has a redemption pass the cursor's mint
+instant as the resolve's `now_ns`. On the SQL path one field,
+`SqlRequest::now_ns`, fed both the catalog resolve and every other instant
+the executor reads, so a later page carrying page one's instant would also
+have run its declared-column and key-index lookups, stamped the tenant's
+last-touch and written its audit record at page one's instant.
+`ravel_describe_data` already carries the two apart
+(`DescribeRequest::resolve_at_ns` and `caller_now_ns`); the SQL path now does
+too. No MCP tool serves SQL yet, so no caller saw the earlier behavior.
+
+1. `SqlExecutor::execute_accounted_at` takes the resolve instant beside the
+   request, and `SqlRequest::now_ns` is the call's own clock. `SqlRequest`
+   gains no field. Every other entry (`execute`, `execute_accounted_with`,
+   explain, the Flight resolve, the lowered-statement path) resolves at the
+   request's `now_ns`, so its two instants are equal.
+2. The resolve instant feeds what describes the snapshot: the catalog
+   listing's end hour, the catalog request estimate, the column-statistics
+   load, the lane request budget's fold-lag figure, and the access-intent
+   classification (whole-lane read, window covering all history).
+3. The call's clock feeds what describes the call that runs now: the
+   declared-column and key-index cache lookups and their freshness horizon,
+   the tenant's idle-eviction last-touch, and the audit record's timestamp.
+   The audit record's window stays the statement's window.
+4. `QueryService::sql_execute_at` and the port's `QueryBackend::sql_execute`
+   take the resolve instant as `resolve_at_ns`, and the draft reports it as
+   its own `resolve_at_ns`. `QueryService::sql_execute`, behind
+   `/api/v1/sql`, passes the request's `now_ns` for both.
+5. `Draft::pinned_to` takes the declared column set `confirm` accepted and
+   sets it on the draft. The declared-set digest amendment, item 2, has a
+   redeemed page derive its `snapshot_id` from that set; until now the
+   draft kept the set it was built with, and only the caller's convention
+   kept the two equal. `ravel_describe_data` passes the set its resolve
+   observed, the one it confirmed.

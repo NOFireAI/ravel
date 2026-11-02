@@ -208,12 +208,19 @@ pub trait QueryBackend {
         request: &AnyJson,
     ) -> Result<Envelope, Failure>;
 
-    /// Mirrors `QueryService::sql_execute`, stopping before the result is
+    /// Mirrors `QueryService::sql_execute_at`, stopping before the result is
     /// capped: the tool finishes the [`Draft`] with [`Draft::finish_page`].
+    ///
+    /// The catalog resolve runs at `resolve_at_ns`: the call's clock on page
+    /// one, the pending redemption's resolve instant on a later page. The
+    /// request's `now_ns` is the call's own clock on every page: the
+    /// declared-column and key-index lookups, the tenant's last-touch and the
+    /// audit record use it. The draft's `resolve_at_ns` is `resolve_at_ns`.
     async fn sql_execute(
         &self,
         tenant_hash: TenantHash,
         request: &ravel_sql::SqlRequest,
+        resolve_at_ns: i64,
     ) -> Result<Draft, Failure>;
 
     /// Mirrors `QueryService::trace_request` followed by

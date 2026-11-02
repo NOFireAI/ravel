@@ -197,6 +197,7 @@ mod tests {
             &self,
             _tenant_hash: TenantHash,
             _request: &ravel_sql::SqlRequest,
+            _resolve_at_ns: i64,
         ) -> Result<crate::draft::Draft, Failure> {
             Err(unreached("sql_execute"))
         }
@@ -326,6 +327,7 @@ mod tests {
             &self,
             _tenant_hash: TenantHash,
             _request: &ravel_sql::SqlRequest,
+            _resolve_at_ns: i64,
         ) -> Result<crate::draft::Draft, Failure> {
             panic!("sql_execute must not be reached")
         }

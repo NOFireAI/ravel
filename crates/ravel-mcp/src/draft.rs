@@ -13,11 +13,21 @@
 //! 1. Page one: `sql_execute`, then [`Draft::finish_page`] with a mint that
 //!    builds the cursor from [`PagePins::cursor`] and encodes it with
 //!    [`Cursor::mint`].
-//! 2. A later page: [`Cursor::redeem`], then `sql_execute` at the pending
-//!    redemption's `resolve_at_ns` over its pinned window and tokens, then
+//! 2. A later page: [`Cursor::redeem`], then `sql_execute` over the pending
+//!    redemption's pinned window and tokens, then
 //!    [`crate::cursor::PendingRedemption::confirm`] with what that resolve
-//!    observed, then [`Draft::pinned_to`] with the confirmed cursor, then
-//!    [`Draft::finish_page`] with [`PinScope::of`] that cursor.
+//!    observed, then [`Draft::pinned_to`] with the confirmed cursor and the
+//!    declared column set `confirm` accepted, then [`Draft::finish_page`]
+//!    with [`PinScope::of`] that cursor.
+//!
+//! Each `sql_execute` call carries two instants. Its `resolve_at_ns`
+//! argument is the instant the catalog resolve runs at: the call's own clock
+//! on page one, the pending redemption's `resolve_at_ns` (page one's
+//! instant) on a later page, so every page resolves at one instant. The
+//! request's `now_ns` is the call's own clock on every page: the
+//! declared-column and key-index cache lookups, the tenant's last-touch and
+//! the audit record use it, because they describe the call that runs now
+//! rather than the snapshot it reads.
 //!
 //! [`ExplainOutcome`] is the explain operation's answer in this crate's own
 //! types, so no arrow or DataFusion type crosses the port.
@@ -160,12 +170,18 @@ impl Draft {
     /// every page of one sequence reports one snapshot id and one watermark.
     ///
     /// The cursor carries only a digest of its declared column set, so the
-    /// draft keeps its own `declared_columns`. They must be the set `confirm`
-    /// accepted for `cursor`, which hashes to the pinned digest, so they name
-    /// page one's set and derive page one's snapshot id.
-    pub fn pinned_to(mut self, cursor: &Cursor) -> Draft {
+    /// caller passes `confirmed_declared_columns`, the set `confirm` accepted
+    /// for `cursor`, and the draft takes it in place of its own. That set
+    /// hashes to the pinned digest, so it is page one's set up to order and
+    /// derives page one's snapshot id, whatever set the draft was built with.
+    pub fn pinned_to(
+        mut self,
+        cursor: &Cursor,
+        confirmed_declared_columns: Vec<DeclaredColumn>,
+    ) -> Draft {
         self.signal = Ok(cursor.signal);
         self.pending_erasure = cursor.pending_erasure.clone();
+        self.declared_columns = confirmed_declared_columns;
         self.ingest_watermark_hour = cursor.ingest_watermark_hour;
         self.resolve_at_ns = cursor.mint_ns;
         self.envelope.visibility.pinned = true;
@@ -680,18 +696,24 @@ mod tests {
     }
 
     /// Page one's `snapshot_id` is `cursor::snapshot_id` over its pins, and
-    /// page two, resolved later and observing its erasure and declared
-    /// columns in another order, reports the same id and page one's
-    /// watermark once pinned to the cursor.
+    /// page two, resolved later and observing page one's two declared columns
+    /// in the reverse order, reports the same id and page one's watermark once
+    /// pinned to the cursor. A page two observing a third column expires.
     ///
     /// FLIP: deriving page two's id from its own resolve instant (or its own
     /// watermark) instead of the cursor's changes it.
     /// FLIP: hashing anything but `cursor::snapshot_id`'s inputs fails the
     /// first equality.
+    /// FLIP: a digest or snapshot id over the declared columns in list order
+    /// rather than as a set refuses the reversed pair or changes its id.
     #[test]
     fn every_page_reports_page_ones_snapshot_id() {
         let budgets = budgets(2);
-        let first = draft(5, 8, |i| i as i128);
+        let mut first = draft(5, 8, |i| i as i128);
+        first
+            .declared_columns
+            .push(DeclaredColumn::new("a", DeclaredType::Str));
+        let page_one_set = first.declared_columns.clone();
         let expected = cursor::snapshot_id(
             scope().tenant,
             Signal::Logs,
@@ -722,13 +744,11 @@ mod tests {
         let mut second = draft(5, 8, |i| i as i128 + 2);
         second.resolve_at_ns = pending.resolve_at_ns() + 7;
         second.ingest_watermark_hour = Some(472_299);
-        second
-            .declared_columns
-            .push(DeclaredColumn::new("a", DeclaredType::Str));
-        second.declared_columns.reverse();
-        let observed = second.declared_columns.clone();
+        let mut observed = page_one_set.clone();
+        observed.push(DeclaredColumn::new("b", DeclaredType::Str));
+        observed.reverse();
         let cursor = pending
-            .confirm(NOW_NS + 2, &[], &[observed[1].clone(), observed[0].clone()])
+            .confirm(NOW_NS + 2, &[], &observed)
             .expect_err("an added declared column expires the cursor");
         assert_eq!(cursor, CursorError::Expired);
 
@@ -745,10 +765,14 @@ mod tests {
         let mut second = draft(5, 8, |i| i as i128 + 2);
         second.resolve_at_ns = pending.resolve_at_ns() + 7;
         second.ingest_watermark_hour = Some(472_299);
+        let mut observed = page_one_set.clone();
+        observed.reverse();
+        assert_ne!(observed, page_one_set, "the observed list is reordered");
+        second.declared_columns = observed.clone();
         let confirmed = pending
-            .confirm(NOW_NS + 2, &[], &second.declared_columns)
-            .expect("nothing moved");
-        let page_two = second.pinned_to(&confirmed).finish_page(
+            .confirm(NOW_NS + 2, &[], &observed)
+            .expect("a reordered declared set has not moved");
+        let page_two = second.pinned_to(&confirmed, observed).finish_page(
             &budgets,
             &PinScope::of(&confirmed),
             PageOrder::Total,
@@ -768,6 +792,48 @@ mod tests {
         assert_eq!(
             next.mint_ns, NOW_NS,
             "page three resolves at page one's instant"
+        );
+    }
+
+    /// A later-page draft built with a declared set other than the one
+    /// `confirm` accepted reports, once pinned, the snapshot id of the
+    /// confirmed set: page one's.
+    ///
+    /// FLIP: a `pinned_to` that keeps the draft's own `declared_columns`
+    /// derives the id from `user.id`, a set the cursor never pinned.
+    #[test]
+    fn pinning_reports_the_confirmed_declared_sets_snapshot_id() {
+        let budgets = budgets(2);
+        let first = draft(5, 8, |i| i as i128);
+        let page_one_set = first.declared_columns.clone();
+        let page_one = first.finish_page(&budgets, &scope(), PageOrder::Total, token_mint);
+        let token = page_one.presentation.cursor.as_deref().expect("a cursor");
+        let pending = Cursor::redeem(
+            token,
+            &key(),
+            scope().tenant,
+            TOOL,
+            &ARGS,
+            NOW_NS + 1,
+            NOW_NS + 1 + GRACE_NS + 3_600 * 1_000_000_000,
+        )
+        .expect("stage one");
+        let confirmed = pending
+            .confirm(NOW_NS + 2, &[], &page_one_set)
+            .expect("nothing moved");
+        let mut second = draft(5, 8, |i| i as i128 + 2);
+        second.declared_columns = vec![DeclaredColumn::new("user.id", DeclaredType::Str)];
+
+        let page_two = second.pinned_to(&confirmed, page_one_set).finish_page(
+            &budgets,
+            &PinScope::of(&confirmed),
+            PageOrder::Total,
+            token_mint,
+        );
+
+        assert_eq!(
+            page_two.visibility.snapshot_id,
+            page_one.visibility.snapshot_id
         );
     }
 

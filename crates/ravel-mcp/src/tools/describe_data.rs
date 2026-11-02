@@ -214,7 +214,7 @@ async fn later_page<B: QueryBackend>(
         outcome.ingest_watermark_hour,
         outcome.resolved_at_ns,
     )
-    .pinned_to(&confirmed);
+    .pinned_to(&confirmed, outcome.declared_column_set.clone());
     finish(draft, &PinScope::of(&confirmed), argument_hash, ctx)
 }
 
