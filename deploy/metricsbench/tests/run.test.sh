@@ -136,9 +136,17 @@
 #                                       failed ingest; u14: no fetch-miss and
 #                                       u15: no flush counter exit 70 as could
 #                                       not measure; u16: --folded-catalog-get-
-#                                       max-fraction 1 passes u12's figures;
-#                                       u17-u19: a malformed or out-of-range
-#                                       fraction exits 64
+#                                       max-fraction 1 passes u12's figures as
+#                                       not discriminating; u17-u19: a
+#                                       malformed or out-of-range fraction
+#                                       exits 64; u20: a ci-sized run whose
+#                                       limit is above its object count passes
+#                                       as not discriminating; u21: a
+#                                       cardinality-sized run within the floor
+#                                       plus fraction passes, u22: above it
+#                                       exits 70; u23: --folded-catalog-get-
+#                                       floor 0 is stamped; u24-u27: a floor
+#                                       that is not a whole number exits 64
 #
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
 #
