@@ -164,9 +164,10 @@ fn plan(args: Value, ctx: &ToolContext<'_>) -> Result<Plan, Refusal> {
 }
 
 /// Filter, then cap: the order that keeps a page complete for its filter.
-/// The caps mirror the server's metadata finish: rows past `max_rows` are
-/// counted in `presentation.rows_omitted` with `row_cap_hit`, the byte fit
-/// reports `bytes_cap_hit`, and `data.row_count` is the full match count.
+/// The page cap is `max_response_bytes` alone: this tool advertises no
+/// `max_rows`. Rows that do not fit are counted in
+/// `presentation.rows_omitted` with `bytes_cap_hit`, and `data.row_count` is
+/// the full match count.
 fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Envelope {
     if let Some(filter) = &plan.filter {
         envelope.data.rows.retain(
@@ -180,13 +181,7 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Envelop
     envelope.warnings.push(basis(&plan.mode));
 
     let matched = envelope.data.rows.len() as u64;
-    let max_rows = ctx.budgets.max_rows as usize;
-    let omitted = envelope.data.rows.len().saturating_sub(max_rows) as u64;
-    envelope.data.rows.truncate(max_rows);
-
     let mut fitted = envelope.fit(ctx.budgets.max_response_bytes);
-    fitted.presentation.rows_omitted += omitted;
-    fitted.presentation.row_cap_hit |= omitted > 0;
     fitted.data.row_count = matched;
     fitted.finish(false)
 }
@@ -279,10 +274,9 @@ mod tests {
             .collect()
     }
 
-    fn call(stub: &Stub, args: Value, max_rows: u32) -> Envelope {
+    fn call(stub: &Stub, args: Value) -> Envelope {
         let key = CursorKey::from_process_secret([31u8; CURSOR_KEY_LEN]);
         let mut ctx = test_context(&key);
-        ctx.budgets.max_rows = max_rows;
         block_on(run(args, &ctx, stub))
     }
 
@@ -304,7 +298,7 @@ mod tests {
     fn a_request_with_neither_selector_nor_label_name_is_refused() {
         for args in [json!({}), json!({"filter": "http"})] {
             let stub = Stub::default();
-            let envelope = call(&stub, with_window(args.clone()), 200);
+            let envelope = call(&stub, with_window(args.clone()));
             let failure = failure_of(&envelope);
             assert_eq!(failure.class, FailureClass::MissingArgument, "{args}");
             assert_eq!(envelope.next_steps.len(), 1);
@@ -330,7 +324,7 @@ mod tests {
             json!({"label_name": ""}),
         ] {
             let stub = Stub::default();
-            let envelope = call(&stub, with_window(args.clone()), 200);
+            let envelope = call(&stub, with_window(args.clone()));
             assert_eq!(
                 failure_of(&envelope).class,
                 FailureClass::InvalidArgument,
@@ -352,7 +346,6 @@ mod tests {
         let envelope = call(
             &stub,
             with_window(json!({"label_name": "service", "filter": "api"})),
-            200,
         );
         assert_eq!(envelope.status, Status::Ok, "{:?}", envelope.failure);
         assert_eq!(strings(&envelope), ["api_y"]);
@@ -362,31 +355,43 @@ mod tests {
         );
     }
 
-    /// The filter runs before the page cap: with a cap of three and four
-    /// matches spread through eight values, the page holds three matches,
-    /// and `presentation.row_cap_hit` with `rows_omitted: 1` reports the
-    /// fourth. `data.row_count` is the full match count.
+    /// The filter runs before the page cap, and the cap is the byte cap:
+    /// 40,000 values alternate `db_` and `api_`, the 20,000 matches overflow
+    /// the 256 KiB floor, and the page is a prefix of the matches whose
+    /// length plus `presentation.rows_omitted` is the match count, with
+    /// `bytes_cap_hit` set. `max_rows` is 1 and cuts nothing.
     ///
-    /// FLIP: capping first keeps `db_0`, `api_0`, `db_1` and filters that to
-    /// one row.
+    /// FLIP: capping first fits a prefix of all 40,000 values, so the page
+    /// is about half as long and its length plus `rows_omitted` is not
+    /// 20,000; applying `max_rows` leaves one row.
     #[test]
     fn the_filter_runs_before_the_page_cap() {
+        let values: Vec<String> = (0..20_000)
+            .flat_map(|i| [format!("db_{i:05}"), format!("api_{i:05}")])
+            .collect();
+        let refs: Vec<&str> = values.iter().map(String::as_str).collect();
         let stub = Stub {
-            listed: Some(listed(&[
-                "db_0", "api_0", "db_1", "api_1", "db_2", "api_2", "db_3", "api_3",
-            ])),
+            listed: Some(listed(&refs)),
             ..Stub::default()
         };
-        let envelope = call(
-            &stub,
+        let key = CursorKey::from_process_secret([31u8; CURSOR_KEY_LEN]);
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_rows = 1;
+        ctx.budgets.max_response_bytes = 0;
+        let envelope = block_on(run(
             with_window(json!({"label_name": "service", "filter": "api"})),
-            3,
-        );
+            &ctx,
+            &stub,
+        ));
         assert_eq!(envelope.status, Status::OkBounded);
-        assert_eq!(strings(&envelope), ["api_0", "api_1", "api_2"]);
-        assert!(envelope.presentation.row_cap_hit);
-        assert_eq!(envelope.presentation.rows_omitted, 1);
-        assert_eq!(envelope.data.row_count, 4);
+        let page = strings(&envelope);
+        let expected: Vec<String> = (0..page.len()).map(|i| format!("api_{i:05}")).collect();
+        assert_eq!(page, expected);
+        assert!(page.len() > 1);
+        assert!(envelope.presentation.bytes_cap_hit);
+        assert!(!envelope.presentation.row_cap_hit);
+        assert_eq!(page.len() as u64 + envelope.presentation.rows_omitted, 20_000);
+        assert_eq!(envelope.data.row_count, 20_000);
     }
 
     /// The resolution is bounded at the smaller of the effective
@@ -450,7 +455,7 @@ mod tests {
                 listed: Some(listed(&["x"])),
                 ..Stub::default()
             };
-            let envelope = call(&stub, with_window(args.clone()), 200);
+            let envelope = call(&stub, with_window(args.clone()));
             assert_eq!(
                 envelope.status,
                 Status::Ok,
