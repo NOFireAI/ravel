@@ -1,8 +1,9 @@
 //! The live accounting handle a caller hands to
 //! [`SqlExecutor::execute_accounted`] must equal the query's own final
-//! accounting on the success path, so the same figures the server records on a
-//! timeout or a dropped future (read from that handle) are the query's real
-//! cost and not an independent, drifting count.
+//! accounting on the success path when no attempt was retried, so the same
+//! figures the server records on a timeout or a dropped future (read from that
+//! handle) are the query's real cost and not an independent, drifting count. A
+//! retried attempt adds to the handle but not to the outcome.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -11,7 +12,7 @@ use crate::util;
 use ravel_sql::LiveAccounting;
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 
-/// On a successful query the live handle's snapshot equals
+/// On a successful query with no retry the live handle's snapshot equals
 /// `SqlOutcome::accounting` field-for-field: the handle the guard reads on the
 /// non-success exits is the very same counter block the success path reports.
 #[tokio::test]

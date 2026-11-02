@@ -1628,16 +1628,20 @@ impl SqlOutcome {
 /// the cost incurred so far at any instant, including on the two exits that
 /// never yield a [`SqlOutcome`]: a wall-deadline trip (the `execute` timeout
 /// wrapper drops the run future and returns [`SqlError::DeadlineExceeded`]) and
-/// the whole execute future being dropped mid-fetch (a client disconnect). On
-/// the success path the snapshot equals the returned [`SqlOutcome::accounting`].
+/// the whole execute future being dropped mid-fetch (a client disconnect).
 ///
-/// The executor re-points this at each attempt's own handle: the snapshot retry
-/// builds a fresh [`QueryAccounting`] per attempt, and installing the live view
-/// on each keeps a discarded first attempt's counters from lingering in a later
-/// read, matching how [`SqlOutcome::accounting`] reports only the successful
-/// attempt.
+/// The view is ADDITIVE, the mirror of `ravel_query::LiveQueryAccounting`: the
+/// snapshot retry builds a fresh [`StatementAccounting`] per attempt, the
+/// executor adds each one here before the attempt's first store call, and
+/// [`Self::snapshot`] sums them, because a caller that cancelled after a retry
+/// started owes what both attempts issued. Each attempt's scan budget and
+/// [`SqlOutcome::accounting`] read that attempt's own handle and never this
+/// view, so a discarded attempt counts against neither. On the success path of
+/// a statement that did not retry, the snapshot equals the returned
+/// [`SqlOutcome::accounting`]; after a retry it is that figure plus the
+/// discarded attempt's.
 #[derive(Clone, Default)]
-pub struct LiveAccounting(Arc<Mutex<StatementAccounting>>);
+pub struct LiveAccounting(Arc<Mutex<Vec<StatementAccounting>>>);
 
 impl LiveAccounting {
     /// A live view whose counters are all zero until an execution installs the
@@ -1646,28 +1650,32 @@ impl LiveAccounting {
         LiveAccounting::default()
     }
 
-    /// Snapshot the current attempt's counters, pooled across phases
-    /// (matching this type's pre-#1367 behavior: a caller of this method
-    /// never had a phase to ask for). Safe from any thread at any time,
-    /// including a `Drop` running after the execute future was dropped
-    /// mid-await: the attempt's counter block lives behind an `Arc` this view
-    /// shares, so it outlives the dropped future.
+    /// Snapshot every installed attempt's counters, each pooled across phases
+    /// and lanes (matching this type's pre-#1367 behavior: a caller of this
+    /// method never had a phase to ask for) and then summed. Safe from any
+    /// thread at any time, including a `Drop` running after the execute future
+    /// was dropped mid-await: each attempt's counter blocks live behind an
+    /// `Arc` this view shares, so they outlive the dropped future.
     pub fn snapshot(&self) -> QueryAccountingSnapshot {
-        self.lock().pooled_snapshot()
+        self.lock()
+            .iter()
+            .fold(QueryAccountingSnapshot::default(), |total, attempt| {
+                total.saturating_add(&attempt.pooled_snapshot())
+            })
     }
 
-    /// Point this view at `phase_accounting` (the attempt about to run).
-    /// Clones every lane's handle, so the two share the same atomic counter
-    /// blocks and every increment the attempt makes, in any lane, is visible
-    /// through [`Self::snapshot`].
+    /// Add `phase_accounting` (the attempt about to run) to this view. Clones
+    /// every lane's handle, so the two share the same atomic counter blocks
+    /// and every increment the attempt makes, in any lane, is visible through
+    /// [`Self::snapshot`].
     fn install(&self, phase_accounting: &StatementAccounting) {
-        *self.lock() = phase_accounting.clone();
+        self.lock().push(phase_accounting.clone());
     }
 
-    /// Lock the inner slot, recovering a poisoned guard. The slot holds one
-    /// cheap-to-clone handle and no torn state, so recovering is safe and
+    /// Lock the inner slot, recovering a poisoned guard. The slot holds
+    /// cheap-to-clone handles and no torn state, so recovering is safe and
     /// strictly better than failing every later snapshot.
-    fn lock(&self) -> std::sync::MutexGuard<'_, StatementAccounting> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<StatementAccounting>> {
         match self.0.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -2386,10 +2394,11 @@ impl SqlExecutor {
         // into the retry's.
         for attempt in 0..2u32 {
             let phase_accounting = StatementAccounting::new();
-            // Re-point the caller's live view at this attempt's handle before
-            // any store call, so a snapshot taken from a `Drop` or after a
-            // deadline trip reflects exactly this attempt's issued cost and
-            // never a discarded prior attempt's.
+            // Add this attempt's handle to the caller's live view before any
+            // store call, so a snapshot taken from a `Drop` or after a deadline
+            // trip includes this attempt's issued cost beside a discarded
+            // prior attempt's. The budget checks below read
+            // `phase_accounting` alone.
             live.install(&phase_accounting);
             // `resolve` (via `resolve_admitted`) itself checks the effective
             // `max_s3_requests` right after resolve returns, so a statement
@@ -10918,6 +10927,76 @@ pub(crate) mod tests {
     /// here, rather than becoming a larger number nobody compares.
     const EXPLAIN_RESOLVE_LISTS: u64 = 2;
     const EXPLAIN_RESOLVE_GETS: u64 = 2;
+
+    /// A snapshot invalidated under a running statement: the first attempt's
+    /// data-object GET finds the object gone, so `run` resolves again through a
+    /// fresh handle. A caller that drops the execute future during the second
+    /// attempt reads, through its live view, the spend of both attempts.
+    ///
+    /// FLIP: make `LiveAccounting::install` replace the held handle instead of
+    /// pushing one, and the view reads the held attempt's 1 request (one
+    /// listing, no get) instead of 6.
+    #[tokio::test]
+    async fn live_accounting_sums_both_attempts_of_a_retry() {
+        let (store, tenant_hash, data_key) = one_metrics_segment(
+            "live-retry-1456",
+            1_000,
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+                    .with_key_contains(".rseg")
+                    .with_occurrence(Occurrence::Nth(1)),
+            ),
+        )
+        .await;
+        assert!(
+            data_key.ends_with(".rseg"),
+            "the rule names the data object"
+        );
+        // The first attempt lists twice, so the second attempt's first
+        // listing is the statement's third.
+        let gate = store
+            .inner()
+            .hold(Op::List, None, Occurrence::Nth(EXPLAIN_RESOLVE_LISTS + 1));
+        let executor = executor_over(store.clone());
+
+        let request = sql_request(
+            "SELECT ts, value FROM samples",
+            TimeRange {
+                start_ns: 0,
+                end_ns: 2_000,
+            },
+        );
+        let live = LiveAccounting::new();
+        let mut run = Box::pin(executor.execute_accounted(tenant_hash, &request, &live));
+
+        tokio::select! {
+            _ = &mut run => panic!("the statement is held inside the second attempt's listing"),
+            () = gate.wait_until_held(1) => {}
+        }
+        assert_eq!(gate.held_count(), 1);
+        // The retry happened because the fault fired, not because of a race.
+        assert_eq!(
+            store.inner().fault_count(Op::Get, FaultKind::NotFoundBlip),
+            1
+        );
+
+        drop(run);
+
+        // The discarded attempt in full: its two listings and three gets (the
+        // catalog HEAD read, the commit-record read, and the 404'd data-object
+        // GET). Plus the held attempt's one listing, the only request it had
+        // issued when the gate held it: the replacing view reads that 1 alone.
+        let spent = live.snapshot();
+        assert_eq!(
+            spent.s3_requests(AccountedOp::List),
+            EXPLAIN_RESOLVE_LISTS + 1
+        );
+        assert_eq!(
+            spent.s3_requests(AccountedOp::Get),
+            EXPLAIN_RESOLVE_GETS + 1
+        );
+        assert_eq!(spent.total_s3_requests(), 6);
+    }
 
     /// Finding 2. `explain` never opens a data object, but it does issue the
     /// resolve's catalog reads, so it needs the same wall bound `execute` has.

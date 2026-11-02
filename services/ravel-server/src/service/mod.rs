@@ -105,17 +105,23 @@ pub fn authenticate_principal(
         .map_err(|_| ServiceError::unauthorized())
 }
 
-/// A shared, cloneable view of the [`QueryAccounting`] handle a running query
+/// A shared, cloneable view of the [`QueryAccounting`] handles a running query
 /// is spending through.
 ///
 /// The drop path of a cancelled query has no outcome to read counters from, so
 /// it reads them here instead: a query that fetched objects for two minutes and
 /// was then abandoned records what it actually spent, not zeros. The mirror of
-/// `ravel_sql::LiveAccounting` for the surfaces that do not go through
-/// `ravel-sql` (`ravel-sql` is behind the `sql` feature, and its type is not
-/// reachable from a default build).
+/// `ravel_query::LiveQueryAccounting` for the surfaces that do not go through
+/// the query engine or `ravel-sql` (`ravel-sql` is behind the `sql` feature,
+/// and its type is not reachable from a default build).
+///
+/// The view is ADDITIVE: it keeps every handle installed during the request
+/// and [`LiveUsage::snapshot`] sums them. An exemplars read that re-resolves
+/// after a snapshot invalidation spends through one handle per attempt, and a
+/// cancelled request owes both. Each attempt installs a handle it just built,
+/// exactly once, so no counter block is summed twice.
 #[derive(Clone, Default)]
-pub struct LiveCost(Arc<Mutex<QueryAccounting>>);
+pub struct LiveCost(Arc<Mutex<Vec<QueryAccounting>>>);
 
 impl LiveCost {
     /// A live view whose counters are all zero until an attempt installs its
@@ -124,17 +130,17 @@ impl LiveCost {
         LiveCost::default()
     }
 
-    /// Point this view at `accounting` (the attempt about to run). Clones the
+    /// Add `accounting` (the attempt about to run) to this view. Clones the
     /// handle, so the two share one atomic counter block and every increment
     /// the attempt makes is visible through [`LiveUsage::snapshot`].
     pub fn install(&self, accounting: &QueryAccounting) {
-        *self.lock() = accounting.clone();
+        self.lock().push(accounting.clone());
     }
 
-    /// Lock the inner slot, recovering a poisoned guard. The slot holds one
-    /// cheap-to-clone handle and no torn state, so recovering is strictly
+    /// Lock the inner slot, recovering a poisoned guard. The slot holds
+    /// cheap-to-clone handles and no torn state, so recovering is strictly
     /// better than failing every later snapshot.
-    fn lock(&self) -> std::sync::MutexGuard<'_, QueryAccounting> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<QueryAccounting>> {
         match self.0.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -144,7 +150,11 @@ impl LiveCost {
 
 impl LiveUsage for LiveCost {
     fn snapshot(&self) -> QueryAccountingSnapshot {
-        self.lock().snapshot()
+        self.lock()
+            .iter()
+            .fold(QueryAccountingSnapshot::default(), |total, accounting| {
+                total.saturating_add(&accounting.snapshot())
+            })
     }
 }
 
@@ -566,8 +576,10 @@ impl QueryService {
         let now_ns = self.clock.now_ns();
 
         // The live handle each read attempt installs its own accounting into,
-        // so a cancelled or timed-out exemplar query records the requests and
-        // bytes it issued rather than zeros.
+        // so a cancelled, timed-out or failed exemplar query records the
+        // requests and bytes every attempt issued rather than zeros. A
+        // completed one records the attempt that produced its result, as
+        // `stats` reports it, the same split PromQL and SQL make.
         let live = LiveCost::new();
         let guard = self
             .controls
@@ -577,8 +589,8 @@ impl QueryService {
             crate::exemplars::collect_within_deadline(state, tenant_hash, request, deadline, &live)
                 .await;
 
-        let status = finish_usage(guard, &collected, |_| {
-            (live.snapshot(), core::zero_estimate())
+        let status = finish_usage(guard, &collected, |(_, stats)| {
+            (stats.spend(), core::zero_estimate())
         });
 
         self.controls
@@ -595,7 +607,7 @@ impl QueryService {
         let (series, stats) = collected?;
 
         self.controls
-            .record_cost(tenant_hash, &live.snapshot(), &core::zero_estimate());
+            .record_cost(tenant_hash, &stats.spend(), &core::zero_estimate());
         Ok(ExemplarsOutcome { series, stats })
     }
 

@@ -1034,11 +1034,117 @@ async fn usage_on_cancel_sums_both_attempts_of_a_retry() {
     );
     // The same figure split by operation, so the sum above is checked against
     // its parts rather than against itself: the discarded attempt's two
-    // listings and the held attempt's one, and four gets (two commit-record
-    // reads, the 404, and the second attempt's first read).
+    // listings and the held attempt's one, and four gets (each attempt's
+    // catalog HEAD read, the discarded attempt's one commit-record read, and
+    // its 404'd segment fetch).
     assert_eq!(usage[0].2.s3_requests(AccountedOp::List), 3);
     assert_eq!(usage[0].2.s3_requests(AccountedOp::Get), 4);
     assert_eq!(h.cost.records().len(), 0);
+}
+
+/// The exemplars read retries a snapshot invalidation the same way: the first
+/// attempt resolves, its segment GET finds the object gone, and the read
+/// resolves again through a fresh handle. A cancellation during the second
+/// attempt owes both attempts' spend.
+///
+/// FLIP: make `LiveCost::install` replace the held handle instead of pushing
+/// one, and the record reads the held attempt's 2 requests (1 list, 1 get)
+/// instead of 6.
+#[tokio::test]
+async fn usage_on_cancel_sums_both_attempts_of_an_exemplars_retry() {
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+            .with_key_contains(".rseg")
+            .with_occurrence(Occurrence::Nth(1)),
+    );
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    publish_up_segment(fault_store.as_ref()).await;
+    // The first attempt resolves and then 404s on its segment read, so the
+    // second attempt's first listing is the request's third.
+    let gate: GateHandle = fault_store.hold(Op::List, None, Occurrence::Nth(LISTS_PER_RESOLVE + 1));
+    let h = harness_without_head_cache(Arc::clone(&fault_store) as Arc<dyn ObjectStoreBackend>);
+
+    let request = exemplars_request();
+    let mut query = Box::pin(h.service.exemplars(h.tenant_hash, &request));
+
+    tokio::select! {
+        _ = &mut query => panic!("the read is held inside the second attempt's store call"),
+        () = gate.wait_until_held(1) => {}
+    }
+    assert_eq!(gate.held_count(), 1);
+    // The retry happened because the fault fired, not because of a race.
+    assert_eq!(fault_store.fault_count(Op::Get, FaultKind::NotFoundBlip), 1);
+
+    drop(query);
+
+    let usage = h.usage.records();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].1, UsageStatus::Canceled);
+    // The discarded attempt's whole resolve plus what the second attempt had
+    // reached. Unlike the engine, this path records a segment GET only once
+    // it returns an object, so the 404 itself is in neither part.
+    assert_eq!(
+        usage[0].2.total_s3_requests(),
+        SPEND_PER_RESOLVE_WITH_ONE_SEGMENT + SPEND_BEFORE_FIRST_LIST
+    );
+    // Split by operation: the discarded attempt's two listings and the held
+    // attempt's one, and three gets (each attempt's catalog HEAD read and the
+    // discarded attempt's commit-record read).
+    assert_eq!(usage[0].2.s3_requests(AccountedOp::List), 3);
+    assert_eq!(usage[0].2.s3_requests(AccountedOp::Get), 3);
+    assert_eq!(h.cost.records().len(), 0);
+}
+
+/// The other side of the split: an exemplars read that retries and then
+/// completes is billed for the attempt that produced its result, the figure
+/// its `stats` report, as a completed PromQL or SQL call is.
+///
+/// FLIP: fold the completed read's usage and cost from the live view, and both
+/// records read 8 requests (the discarded attempt's 4 beside these 4).
+#[tokio::test]
+async fn completed_exemplars_retry_bills_the_attempt_that_answered() {
+    use ravel_object_store::fault::Sequence;
+
+    let plan = FaultPlan::empty()
+        .with_rule(
+            Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+                .with_key_contains(".rseg")
+                .with_occurrence(Occurrence::Nth(1)),
+        )
+        // Counts commit-record reads without changing them.
+        .with_sequence(
+            Sequence::new(Op::Get)
+                .with_key_contains(".cmt")
+                .then_passthrough()
+                .then_passthrough(),
+        );
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    publish_up_segment(fault_store.as_ref()).await;
+    let h = harness_without_head_cache(Arc::clone(&fault_store) as Arc<dyn ObjectStoreBackend>);
+
+    let outcome = h
+        .service
+        .exemplars(h.tenant_hash, &exemplars_request())
+        .await
+        .expect("the retry recovers the read");
+    assert_eq!(fault_store.fault_count(Op::Get, FaultKind::NotFoundBlip), 1);
+    // The commit record was read once, by the discarded attempt; the second
+    // resolve took it from the catalog's record cache.
+    assert_eq!(fault_store.sequence_progress(0), 1);
+
+    // The answering attempt: its two listings, its catalog HEAD read and its
+    // segment read. None of the discarded attempt's 4 requests.
+    let spend = outcome.stats.spend();
+    assert_eq!(spend.s3_requests(AccountedOp::List), LISTS_PER_RESOLVE);
+    assert_eq!(spend.s3_requests(AccountedOp::Get), 2);
+    assert_eq!(spend.total_s3_requests(), 4);
+    let usage = h.usage.records();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].1, UsageStatus::Success);
+    assert_eq!(usage[0].2, outcome.stats.spend());
+    let cost = h.cost.records();
+    assert_eq!(cost.len(), 1);
+    assert_eq!(cost[0].1, outcome.stats.spend());
 }
 
 /// The sink `build_app_state` wires. The whole PromQL route family folded its
