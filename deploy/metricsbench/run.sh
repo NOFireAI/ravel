@@ -10,6 +10,7 @@
 #     [--anchor-ms N] [--passes N] [--reps N] [--keep]
 #     [--rss-band CONTAINER:MIN_BYTES:MAX_BYTES]...
 #     [--diagnostic-prometheus-max-samples N] [--folded-catalog-get-max-fraction F]
+#     [--folded-catalog-get-floor N]
 #     [--real-s3-bucket-prefix PREFIX --real-s3-region REGION]
 #
 # The Ravel image comes in one of two forms, and stamps.json says which ran
@@ -99,10 +100,13 @@
 #               non-zero exit or a missing scrape. Stamped as readback_folded
 #               with the GET and commit-record cache deltas between the scrapes.
 #               Also fails when the GETs the fetch cache did not cause
-#               (catalog_get_delta) exceed --folded-catalog-get-max-fraction
+#               (catalog_get_delta) exceed --folded-catalog-get-floor
+#               (default 64) plus --folded-catalog-get-max-fraction
 #               (default 0.05) times the data objects ingest flushed
 #               (data_objects_flushed, from <out>/ravel-metrics-at-query.txt),
-#               or when either figure cannot be read
+#               or when either figure cannot be read. A limit at or above
+#               data_objects_flushed cannot tell a folded read from an
+#               unfolded one; that is stamped not discriminating and passes
 #
 # fold, restart and readback-folded also run after a failed ingest
 # verification, when memory passed and the Ravel row itself has no
@@ -207,7 +211,7 @@ say() {
 }
 
 usage() {
-  sed -n '7,13p' "$0" >&2
+  sed -n '7,14p' "$0" >&2
 }
 
 usage_error() {
@@ -493,7 +497,7 @@ elif op == "ravel-row-state":
             print(f"the ravel row's replay failed ({fr.get('error')})")
             sys.exit(3)
 elif op == "fold-stamp":
-    seal, watermark, entries, buckets, end_hour, precondition = args
+    seal, watermark, entries, buckets, no_op, end_hour, precondition = args
     def hour(v):
         m = re.fullmatch(r"Some\((\d+)\)", v)
         return int(m.group(1)) if m else v
@@ -501,12 +505,13 @@ elif op == "fold-stamp":
         return int(v) if re.fullmatch(r"\d+", v) else v
     print(json.dumps({"seal_through_hour": hour(seal), "watermark_hour": hour(watermark),
                       "entry_count": num(entries), "buckets_folded": num(buckets),
+                      "no_op": {"true": True, "false": False}.get(no_op, no_op or None),
                       "ingest_end_hour": int(end_hour), "precondition": precondition}))
 elif op == "readback-folded":
     # The bin's stdout, its exit code, the two /metrics scrapes ("" when one
-    # failed), the at-query scrape and the catalog GET fraction. Prints the
-    # stamp; exit 3 when stdout is not its report.
-    out_path, code, before, after, at_query, fraction = args
+    # failed), the at-query scrape, the catalog GET fraction and floor. Prints
+    # the stamp; exit 3 when stdout is not its report.
+    out_path, code, before, after, at_query, fraction, floor = args
     def metric(path, name, labels):
         if not path or not os.path.isfile(path):
             return None
@@ -552,6 +557,8 @@ elif op == "readback-folded":
             flushed += int(v)
     stamp["data_objects_flushed"] = None if absent else flushed
     stamp["folded_catalog_get_max_fraction"] = fraction
+    stamp["folded_catalog_get_floor"] = int(floor)
+    stamp["folded_catalog_get_limit"] = None
     cat = stamp["catalog_get_delta"]
     if cat is None:
         missing = [n for n, v in (("ravel_store_calls_total{op=\"get\"}", gets),
@@ -563,10 +570,19 @@ elif op == "readback-folded":
                                         + " with signal=\"metrics\" in ravel-metrics-at-query.txt")
     else:
         from fractions import Fraction
-        limit = Fraction(fraction) * flushed
-        if cat > limit:
-            stamp["catalog_get_verdict"] = (f"breach: catalog_get_delta {cat} exceeds {fraction} x "
-                                            f"data_objects_flushed {flushed}")
+        # The floor is the read's fixed catalog cost (HEAD, snapshot parts,
+        # commit-token keys, the server's own background GETs in the window).
+        limit = int(floor) + Fraction(fraction) * flushed
+        shown = int(limit) if limit.denominator == 1 else float(limit)
+        stamp["folded_catalog_get_limit"] = shown
+        # An unfolded read costs about one catalog GET per data object.
+        if limit >= flushed:
+            stamp["catalog_get_verdict"] = (f"not discriminating: limit {shown} is at or above the {flushed} "
+                                            "data objects flushed, so a folded and an unfolded read cannot "
+                                            "be told apart at this profile")
+        elif cat > limit:
+            stamp["catalog_get_verdict"] = (f"breach: catalog_get_delta {cat} exceeds {floor} + {fraction} x "
+                                            f"data_objects_flushed {flushed} = {shown}")
         else:
             stamp["catalog_get_verdict"] = "within"
     try:
@@ -667,6 +683,7 @@ reps=""
 keep=0
 diag_max_samples=""
 folded_catalog_get_max_fraction="0.05"
+folded_catalog_get_floor="64"
 real_s3_prefix=""
 real_s3_region=""
 bands=()
@@ -686,7 +703,8 @@ while [ $# -gt 0 ]; do
       ;;
     --profile | --ravel-image | --ravel-image-id | --ravel-source-commit | --bin-dir | --out-dir | \
       --anchor-ms | --passes | --reps | --rss-band | --diagnostic-prometheus-max-samples | \
-      --real-s3-bucket-prefix | --real-s3-region | --folded-catalog-get-max-fraction)
+      --real-s3-bucket-prefix | --real-s3-region | --folded-catalog-get-max-fraction | \
+      --folded-catalog-get-floor)
       [ $# -ge 2 ] || usage_error "$1 needs a value"
       ;;
     *)
@@ -708,6 +726,7 @@ while [ $# -gt 0 ]; do
     --real-s3-bucket-prefix) real_s3_prefix="$2" ;;
     --real-s3-region) real_s3_region="$2" ;;
     --folded-catalog-get-max-fraction) folded_catalog_get_max_fraction="$2" ;;
+    --folded-catalog-get-floor) folded_catalog_get_floor="$2" ;;
   esac
   shift 2
 done
@@ -758,6 +777,8 @@ for band in ${bands[@]+"${bands[@]}"}; do
 done
 [[ "$folded_catalog_get_max_fraction" =~ ^(0(\.[0-9]+)?|\.[0-9]+|1(\.0+)?)$ ]] ||
   usage_error "--folded-catalog-get-max-fraction takes a decimal from 0 to 1, got '$folded_catalog_get_max_fraction'"
+is_uint "$folded_catalog_get_floor" ||
+  usage_error "--folded-catalog-get-floor takes a whole number, got '$folded_catalog_get_floor'"
 if [ "$diagnostic" -eq 1 ] && [ "$diag_max_samples" -eq 0 ]; then
   usage_error "--diagnostic-prometheus-max-samples must be at least 1"
 fi
@@ -1211,7 +1232,7 @@ fold_field() {
 }
 
 fold_step() {
-  local code=0 seal watermark entries buckets precondition="met"
+  local code=0 seal watermark entries buckets no_op precondition="met"
   compose run --rm --no-deps -T ravel-qualify \
     --store s3 --tenant-hash-unkeyed catalog fold \
     --tenant "$RAVEL_TENANT" --shards "$RAVEL_SHARDS" --signal metrics --writers-stopped \
@@ -1224,6 +1245,7 @@ fold_step() {
   watermark="$(fold_field watermark_hour)" || fail_step fold "no single watermark_hour in fold.out"
   entries="$(fold_field entry_count)" || fail_step fold "no single entry_count in fold.out"
   buckets="$(fold_field buckets_folded)" || fail_step fold "no single buckets_folded in fold.out"
+  no_op="$(fold_field no_op)" || no_op=""
   if ! [[ "$seal" =~ ^Some\(([0-9]+)\)$ ]]; then
     precondition="fold sealed nothing: seal_through_hour=$seal"
   elif ! [[ "$watermark" =~ ^Some\(([0-9]+)\)$ ]] || [ "${BASH_REMATCH[1]}" -lt "$INGEST_END_HOUR" ]; then
@@ -1232,7 +1254,7 @@ fold_step() {
     precondition="entry_count '$entries' or buckets_folded '$buckets' is not a whole number"
   fi
   stamp_set ravel_catalog_fold_writers_stopped \
-    "$(py fold-stamp "$seal" "$watermark" "$entries" "$buckets" "$INGEST_END_HOUR" "$precondition")"
+    "$(py fold-stamp "$seal" "$watermark" "$entries" "$buckets" "$no_op" "$INGEST_END_HOUR" "$precondition")"
   [ "$precondition" = "met" ] || fail_step fold "$precondition"
   step_done fold
 }
@@ -1270,7 +1292,8 @@ readback_folded_step() {
   after_arg="$after"
   scrape_ravel_metrics "$after" || { after_arg=""; missing="${missing:+$missing and }after"; }
   stamp="$(py readback-folded "${out_dir}/readback-folded.json" "$code" "$before_arg" "$after_arg" \
-    "${out_dir}/ravel-metrics-at-query.txt" "$folded_catalog_get_max_fraction")" || stamp_code=$?
+    "${out_dir}/ravel-metrics-at-query.txt" "$folded_catalog_get_max_fraction" \
+    "$folded_catalog_get_floor")" || stamp_code=$?
   [ -z "$stamp" ] || stamp_set readback_folded "$stamp"
   if [ "$code" -ne 0 ]; then
     show_log "${out_dir}/readback-folded.log"
@@ -1282,7 +1305,7 @@ readback_folded_step() {
     fail_step readback-folded "metricsbench_ingest --readback-only exited 0 without matches_expected true"
   [ -z "$missing" ] || fail_step readback-folded "the ${missing} scrape of ${RAVEL_BASE}/metrics failed"
   verdict="$(py get "$STAMPS" readback_folded.catalog_get_verdict 2>/dev/null)" || verdict=""
-  [ "$verdict" = "within" ] ||
+  [ "$verdict" = "within" ] || [[ "$verdict" == "not discriminating:"* ]] ||
     fail_step readback-folded "folded read-back catalog GETs: ${verdict:-no verdict stamped}"
   step_done readback-folded
 }
