@@ -3292,6 +3292,7 @@ pub const COMMIT_TOKEN_HEADER: &str = "x-ravel-commit-token";
 /// valid points by the classes it carried, one probe series per class, and
 /// the replay window. Built from the points sent, not from the responses.
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct ReadbackPlan {
     receiver: Receiver,
     series: HashMap<[u8; 32], SeriesTally>,
@@ -3309,6 +3310,7 @@ pub struct ReadbackPlan {
 
 /// One series' points, by class, in a [`ReadbackPlan`].
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 struct SeriesTally {
     /// Bit per [`PayloadClass`] the series carried.
     classes: u8,
@@ -3319,6 +3321,7 @@ struct SeriesTally {
 
 /// A probe series: the first series seen of a class.
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 struct Probe {
     key: [u8; 32],
     selector: String,
@@ -3388,6 +3391,12 @@ impl ReadbackPlan {
                 self.stale_probe = Some((ts_ms, prior_scalar));
             }
         }
+    }
+
+    /// Distinct series the replay sent, of every class, the classes the
+    /// receiver does not store included.
+    pub fn series_count(&self) -> u64 {
+        self.series.len() as u64
     }
 
     fn supported_mask(&self) -> u8 {
@@ -3969,6 +3978,20 @@ impl Producer {
         self.generation += now().saturating_sub(start);
         Ok(Some(full))
     }
+}
+
+/// The plan [`replay_over_http_with_plan`] records for `receiver` over
+/// `source`, rebuilt without sending anything: the same [`Producer`] rounds
+/// pull, validate and observe every point in offered order, and each batch
+/// they fill is dropped instead of queued
+/// (`tests::a_plan_rebuilt_without_sending_equals_the_replayed_plan`).
+pub fn readback_plan_without_sending<S: SampleBatches + ?Sized>(
+    receiver: Receiver,
+    source: &mut S,
+) -> Result<ReadbackPlan, LaneError> {
+    let mut producer = Producer::new(receiver, 1, DEFAULT_HTTP_BATCH_SIZE);
+    while producer.round(source, |_| 0, || Duration::ZERO)?.is_some() {}
+    Ok(producer.plan)
 }
 
 /// The projected total ingest wall time of a row that has sent for
@@ -7921,6 +7944,72 @@ mod tests {
             .await
             .expect_err("a connection closed before the declared length is refused");
         assert!(refused.contains("/api/v1/series"), "{refused}");
+    }
+
+    /// The plan `readback_plan_without_sending` rebuilds from the ci stream
+    /// equals, field for field, the plan the replay recorded for the same
+    /// profile, steps and anchor: for Ravel, which stores every class, and
+    /// for VictoriaMetrics, which acknowledges native histograms without
+    /// storing them. The replay's plan holds a native-histogram probe and a
+    /// stale marker probe for both, so the comparison covers both.
+    ///
+    /// TO SEE THIS FAIL: in `readback_plan_without_sending`, observe only
+    /// the points of classes `receiver.supports` (the VictoriaMetrics plans
+    /// differ), or clear the plan's `stale_probe` before returning it (the
+    /// Ravel plans differ).
+    #[tokio::test]
+    async fn a_plan_rebuilt_without_sending_equals_the_replayed_plan() {
+        use crate::metrics_gen::Generator;
+
+        let workload = ci_workload();
+        let anchor_ms = 1_760_000_010_000;
+        let steps = 40;
+        for (receiver, canned) in [
+            (Receiver::Ravel, Canned::ok(Some(token(0, 1)))),
+            (Receiver::VictoriaMetrics, Canned::ok(None)),
+        ] {
+            let (addr, server) = serve(write_stub(vec![canned])).await;
+            let config = HttpReplayConfig {
+                receiver,
+                endpoint: format!("http://{addr}/api/v1/write"),
+                bearer_token: None,
+                tenant: None,
+                batch_size: 500,
+                max_retries: 0,
+                timeout_secs: 5,
+                shards: 4,
+                stall_ceiling: None,
+            };
+            let mut sent = GeneratedStream::new(
+                Generator::new(&workload, "ci", anchor_ms).expect("builds"),
+                steps,
+            );
+            let outcome = replay_over_http_with_plan(&config, &mut sent)
+                .await
+                .expect("replay");
+            server.abort();
+            assert!(
+                outcome
+                    .plan
+                    .probes
+                    .contains_key(&PayloadClass::NativeHistogram),
+                "{receiver:?}: the replay recorded native histograms"
+            );
+            assert!(
+                outcome.plan.stale_probe.is_some(),
+                "{receiver:?}: the replay recorded a stale marker probe"
+            );
+
+            let mut rebuilt_from = GeneratedStream::new(
+                Generator::new(&workload, "ci", anchor_ms).expect("builds"),
+                steps,
+            );
+            let rebuilt =
+                readback_plan_without_sending(receiver, &mut rebuilt_from).expect("rebuild");
+            assert_eq!(rebuilt.series_count(), outcome.plan.series_count());
+            assert_eq!(rebuilt.expected(), outcome.plan.expected(), "{receiver:?}");
+            assert!(rebuilt == outcome.plan, "{receiver:?}: the plans differ");
+        }
     }
 
     /// The read-back of the portable Ravel row matches a receiver that
