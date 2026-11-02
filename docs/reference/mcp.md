@@ -351,10 +351,17 @@ mints it fresh for each call and does not store it. It carries:
 - the half-open time range
 - the minimum commit-token watermark that the page was resolved against
 - which erasure predicates were pending
-- which typed attribute columns were declared
+- a 32-byte digest of the typed attribute columns that were declared
 - the position to resume from
 
 It pins a snapshot by these resolve inputs, not by enumerating segments.
+
+The typed attribute columns are pinned as a digest, not as a list, so the
+token's size does not depend on how many columns a tenant declares. The digest is
+taken over the set of (key, type) pairs: the order the columns are listed
+in and any repeats do not change it. The pending erasure predicates are
+carried whole, because redemption asks of each predicate in force whether
+the cursor pinned it, and a digest cannot answer that.
 
 ### Redemption
 
@@ -383,7 +390,7 @@ fails with `cursor_invalid`.
 ### Expiry
 
 Redemption refuses a structurally valid, correctly bound cursor with
-`cursor_expired` in two cases. In both cases the caller re-runs the query.
+`cursor_expired` in three cases. In each case the caller re-runs the query.
 
 - The effective deadline of the cursor has passed. That deadline is already
   clamped to the protection horizon minus the grace period. So this is also
@@ -394,8 +401,11 @@ Redemption refuses a structurally valid, correctly bound cursor with
   range. A windowless predicate overlaps every range. The overlap is judged
   on the signal and the range only, never on the predicate's matchers,
   because a cursor holds no records to match.
+- The typed attribute columns the redeeming resolve observed hash to a
+  different digest than the pinned one: a column was added, removed,
+  renamed or retyped. The same columns in another order do not expire it.
 
-Those are the two cases that a redemption can detect. An erasure that arrives
+Those are the three cases that a redemption can detect. An erasure that arrives
 after a cursor is minted and finishes before it is redeemed is in neither
 set, so no check sees it. That case stays empty only while a cursor cannot
 outlive an erasure:
@@ -481,9 +491,9 @@ later page of that sequence, and nothing reports it.
 `families_total` is the count in the record the page read, so it can
 differ between pages of one sequence. A later page says so in `warnings`.
 
-A logs cursor carries the typed attribute column set, and a cursor is
-bounded at 4 KiB. A tenant whose declared set does not fit gets
-`internal` on a page the byte cap cuts.
+A logs cursor carries a fixed-size digest of the typed attribute column
+set, not the set, so a tenant with thousands of typed attribute columns
+pages like any other. A changed set expires the cursor, as below.
 
 Page one's freshness watermark is pinned into that cursor. Every later
 page reports the same value in `visibility.ingest_watermark_hour` and the

@@ -370,8 +370,9 @@ commit token is a read-your-write lower bound. It is not a snapshot identity.
 A cursor is a token with a keyed MAC, minted with a process-local key in the
 `TicketKey` pattern. It carries the tenant hash, the tool, the argument hash,
 the keyset position, and the deadline. It also carries the pinned segment
-set, with the pending erasure predicates and the declared columns. The server
-stores nothing. A page
+set, with the pending erasure predicates and the declared columns. (The
+declared columns are now pinned as a fixed-size digest of the set; see the
+declared-set digest amendment below.) The server stores nothing. A page
 re-executes the statement against the pin with a keyset predicate. A cursor
 from a dead process fails with `cursor_expired`. Only the process that minted
 a cursor can redeem it. The documentation says this, and it names sticky
@@ -615,13 +616,14 @@ gives it its own bound.
 1. A cursor pins its snapshot by resolve inputs, not by segment
    enumeration: the tenant hash, the signal, the half-open time range, the
    minimum commit-token watermark the page was resolved against, the
-   pending erasure predicates in force, the declared column set, and the
-   keyset position (the last tuple of the page and the `ORDER BY` it was
-   taken under). Redemption re-resolves the snapshot against that
-   watermark deterministically. When the re-resolve cannot reproduce the
-   pinned watermark (a compaction past the protection horizon, a newer
-   erasure), redemption fails with `cursor_expired` and the caller re-runs
-   the query. A tampered or wrong-tenant token stays `cursor_invalid`. The
+   pending erasure predicates in force, the declared column set (pinned as
+   its digest since the declared-set digest amendment at the end of this
+   file), and the keyset position (the last tuple of the page and the
+   `ORDER BY` it was taken under). Redemption re-resolves the snapshot
+   against that watermark deterministically. When the re-resolve cannot
+   reproduce the pinned watermark (a compaction past the protection
+   horizon, a newer erasure), redemption fails with `cursor_expired` and
+   the caller re-runs the query. A tampered or wrong-tenant token stays `cursor_invalid`. The
    dead-process rule, the tenant binding, the tool and argument-hash
    binding, and the deadline clamp are unchanged.
 2. The cursor leaves the 4 KiB scalar allowance of D4 and gets its own
@@ -1055,3 +1057,57 @@ the query Deployment only, and the default stays off.
    in `services/ravel-operator/src/crd.rs`).
 3. A request with no `Origin` header is still accepted, as D7 ships, so the
    allowlist governs browser clients only.
+
+## Amendment (2026-11-02, #3657): the declared-set digest amendment, a cursor pins a digest of the declared column set
+
+<!-- amendment-applies: sections="D5. Consistency, cursors, and evidence references|Consequences" pointer="declared-set digest amendment" -->
+
+The 2026-09-09 amendment, item 1, pins the declared column set in the
+cursor, and the codec carried every column verbatim. A cursor grew with
+the number of declared typed attribute columns, so a wide logs tenant
+overran the 4 KiB cursor bound of that amendment's item 2. A
+`ravel_describe_data` page one over 4,000 declared columns with 90-byte
+keys minted a 507,045 B cursor, and the call failed as `internal`. At
+redemption the pinned set is only compared with the observed one for
+equality (the 2026-09-12 amendment, item 3), and every later use of the
+set reads the observed one, so the cursor now pins a fixed-size digest of
+it.
+
+1. The digest is BLAKE3-256 in derive-key mode under the context
+   `ravel-mcp cursor declared_column_set v1`. Each column encodes as its
+   key's byte length (`u64`, little-endian), the key bytes, then a one-byte
+   type tag. The encodings are sorted and deduplicated, and the hash covers
+   their count and then each encoding behind its own length. The order the
+   resolve lists the columns in, and any repeats, do not change the digest;
+   a column's key or type does. The digest is 32 bytes for any set
+   (`declared_column_set_digest` in `crates/ravel-mcp/src/cursor.rs`).
+2. `confirm` computes the digest of the declared column set the redeeming
+   resolve observed and compares it with the pinned one. A difference is
+   `cursor_expired`, as the 2026-09-12 amendment, item 3, says of a
+   differing set, and the same columns in another order redeem. The
+   `snapshot_id` derivation of the 2026-09-13 amendment, item 6, is
+   unchanged and still hashes the set itself: a redeemed page derives it
+   from the set `confirm` accepted, which hashes to the same id as the
+   minting page's set because that hash also sorts and deduplicates.
+3. `CURSOR_VERSION` moves from 5 to 6. A version-5 token fails the header
+   check as `cursor_invalid`, the class every token of another version gets.
+4. The pending erasure predicates stay in the cursor whole. `confirm` reads
+   them by membership: a newer erasure expires the cursor only when it is
+   pending at redemption, is not among the pinned predicates, and overlaps
+   the page's window. A pinned predicate that completed between mint and
+   redemption therefore still redeems, and a digest of the set would expire
+   that cursor. The next page's `snapshot_id` is also derived from the
+   pinned predicates. Their size grows with the number of predicates the
+   minting resolve reported pending and with their matchers' lengths, and
+   `ravel-mcp` bounds neither. A cursor they push over its bound is still
+   the `internal` failure of the 2026-09-09 amendment, item 2.
+5. The token fields that grow with tenant data, with their bounds. The
+   pending erasure predicates are item 4. The keyset position is a kind tag
+   and one name: an indexed key is at most 128 bytes
+   (`MAX_KEY_INDEX_COLUMN_KEY_LEN` in
+   `crates/ravel-catalog/src/tenant_config.rs`), and no length bound applies
+   to a declared column key or a metric family name. The minimum commit
+   watermark holds one token per shard but is empty for every tool, as the
+   2026-09-12 amendment, item 4, records. The `ORDER BY` and the tool name
+   are constants of the minting tool, and every other field has a fixed
+   size.

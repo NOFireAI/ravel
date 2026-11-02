@@ -14,17 +14,44 @@
 //!
 //! A cursor carries the signal, the half-open time range, the minimum
 //! commit-token watermark the page was resolved against, the pending erasure
-//! predicates in force, and the declared column set (the 2026-09-09 amendment
-//! to ADR-1374 D5, as corrected by the 2026-09-10 one). Redemption re-resolves
-//! the snapshot from those inputs deterministically, at the cursor's own
-//! `mint_ns` (the 2026-09-12 amendment, item 4, and the 2026-09-13 one, item
-//! 5), and refuses the cursor as [`CursorError::Expired`] in the three cases
-//! where that re-resolve would no longer answer with the page's own snapshot:
-//! its deadline has fallen outside the protection horizon less the grace,
-//! which is where a compaction becomes free to take the pin apart; an erasure
-//! predicate is in force that the cursor did not pin and that reaches its
-//! signal and time range; or the declared column set differs from the pinned
-//! one (the 2026-09-12 amendment, item 3).
+//! predicates in force, and a digest of the declared column set (the
+//! 2026-09-09 amendment to ADR-1374 D5, as corrected by the 2026-09-10 one;
+//! the digest is the 2026-11-02 declared-set digest amendment). Redemption
+//! re-resolves the snapshot from those inputs deterministically, at the
+//! cursor's own `mint_ns` (the 2026-09-12 amendment, item 4, and the
+//! 2026-09-13 one, item 5), and refuses the cursor as [`CursorError::Expired`]
+//! in the three cases where that re-resolve would no longer answer with the
+//! page's own snapshot: its deadline has fallen outside the protection
+//! horizon less the grace, which is where a compaction becomes free to take
+//! the pin apart; an erasure predicate is in force that the cursor did not
+//! pin and that reaches its signal and time range; or the declared column set
+//! differs from the pinned one (the 2026-09-12 amendment, item 3).
+//!
+//! # The declared column set is pinned as a digest
+//!
+//! The declared set is the one resolve input whose only use at redemption is
+//! an equality test, so a cursor carries
+//! [`declared_column_set_digest`] of it, 32 bytes, instead of the set: a
+//! BLAKE3-256 hash, in derive-key mode under its own context, of the set's
+//! canonical form (each column encoded as its length-prefixed key and its
+//! type tag, the encodings sorted and deduplicated). Two lists that name the
+//! same (key, type) pairs in any order or with repeats hash alike, and an
+//! added, removed, renamed or retyped column changes the hash (short of a
+//! BLAKE3 collision), which is the question [`PendingRedemption::confirm`]
+//! asks. A cursor's size therefore does not depend on the tenant's declared
+//! columns: pinned verbatim under version 5, a set of 4,000 keys of 90 bytes
+//! each minted a 507,079-character token, where the 4 KiB the envelope
+//! bounds `presentation.cursor` at made every page minting one `internal`.
+//!
+//! The pending erasure predicates are still carried whole. Their check is not
+//! an equality: a predicate the cursor pinned that is no longer pending
+//! leaves it redeemable, and only an observed predicate the cursor did not
+//! pin can expire it, so `confirm` has to test each observed predicate for
+//! membership in the pinned set, which a digest of the set cannot answer.
+//! The next page's [`snapshot_id`] is also derived from the pinned set
+//! itself. Their bytes grow with the number of predicates the minting
+//! resolve reported pending and with their matchers' lengths, and this crate
+//! bounds neither.
 //!
 //! The commit-token watermark is one of those inputs and nothing more. It is
 //! what page 2 resolves against, not a test run against whatever watermark the
@@ -85,10 +112,14 @@
 //!
 //! [`snapshot_id`] is the `visibility.snapshot_id` derivation of the same
 //! amendment's item 6: a hash over the seven resolve inputs, the resolve
-//! instant among them. A cursor pins six of them, and its `mint_ns` is the
-//! seventh as [`PendingRedemption::resolve_at_ns`], so a redemption that
-//! derives its id from the pinned inputs and that instant reports page one's
-//! id.
+//! instant among them. A cursor pins five of them, the digest of a sixth (the
+//! declared column set), and its `mint_ns` is the seventh as
+//! [`PendingRedemption::resolve_at_ns`]. A redemption derives its id from the
+//! five pinned inputs, the declared set its own resolve observed, and that
+//! instant. [`PendingRedemption::confirm`] accepted that observed set only if
+//! it hashes to the pinned digest, so it names the same set page one did, and
+//! [`snapshot_id`] reads the set without regard to order, so the redemption
+//! reports page one's id.
 //!
 //! # The D5 wrong-tenant rule
 //!
@@ -244,12 +275,14 @@ const CURSOR_MAGIC: [u8; 4] = *b"RMC1";
 /// after the version byte; version 4 drops the segment enumeration for the
 /// resolve inputs of the 2026-09-09 amendment (signal, time range, commit-token
 /// watermark, pending erasure, declared columns, keyset position); version 5
-/// adds the pinned ingest watermark hour of the 2026-09-13 amendment. A token
+/// adds the pinned ingest watermark hour of the 2026-09-13 amendment; version
+/// 6 replaces the declared column set with its 32-byte
+/// [`declared_column_set_digest`] (the 2026-11-02 amendment). A token
 /// of any earlier version decodes as [`CursorError::Invalid`] like any other
 /// unsupported version, which is correct and costs nothing: these tokens are
 /// process-local and deadline-bounded, so none survives the deploy that
 /// changes the number.
-const CURSOR_VERSION: u8 = 5;
+const CURSOR_VERSION: u8 = 6;
 const EVIDENCE_MAGIC: [u8; 4] = *b"RME1";
 /// Version 2 adds the same plaintext process nonce [`CURSOR_VERSION`] 3 does;
 /// version 3 adds the argument hash, which an unpinned redemption needs to
@@ -417,9 +450,10 @@ pub struct Cursor {
     /// answer to give at resolve time, not this codec's.
     pub min_commit_watermark: Vec<CommitToken>,
     pub pending_erasure: Vec<ErasurePredicate>,
-    /// The declared column set page one resolved with. Compared as a set
-    /// against the redeeming resolve's own by [`PendingRedemption::confirm`].
-    pub declared_columns: Vec<DeclaredColumn>,
+    /// [`declared_column_set_digest`] of the declared column set page one
+    /// resolved with. [`PendingRedemption::confirm`] compares it with the
+    /// digest of the redeeming resolve's own set.
+    pub declared_column_set_digest: [u8; 32],
     /// Page one's freshness watermark: the greatest `ingest_hour_bucket`
     /// among the segments its resolve returned, in whole hours since the
     /// epoch (the 2026-09-13 amendment, items 3 and 4). `None` when that
@@ -520,11 +554,7 @@ impl Cursor {
             buf.extend_from_slice(&predicate.window_end_ns().to_le_bytes());
         }
 
-        write_count(&mut buf, self.declared_columns.len())?;
-        for column in &self.declared_columns {
-            write_len_prefixed(&mut buf, column.key.as_bytes())?;
-            buf.push(declared_type_tag(column.ty));
-        }
+        buf.extend_from_slice(&self.declared_column_set_digest);
 
         match self.ingest_watermark_hour {
             None => buf.push(0),
@@ -657,13 +687,7 @@ impl Cursor {
             ));
         }
 
-        let declared_count = cur.read_u32()?;
-        let mut declared_columns = Vec::new();
-        for _ in 0..declared_count {
-            let key = read_string(&mut cur)?;
-            let ty = declared_type_from_tag(cur.read_u8()?)?;
-            declared_columns.push(DeclaredColumn::new(key, ty));
-        }
+        let declared_column_set_digest = cur.read_array::<32>()?;
 
         let ingest_watermark_hour = match cur.read_u8()? {
             0 => None,
@@ -705,7 +729,7 @@ impl Cursor {
             range_end_ns,
             min_commit_watermark,
             pending_erasure,
-            declared_columns,
+            declared_column_set_digest,
             ingest_watermark_hour,
             position,
             mint_ns,
@@ -925,8 +949,9 @@ impl PendingRedemption {
     /// redeemable (see `Cursor::newer_erasure_intersects`).
     ///
     /// `observed_declared_columns` is the declared column set that resolve
-    /// reported. Compared with the pinned set as a set of (key, type) pairs:
-    /// an added column, a removed one, or one whose type changed is
+    /// reported. Its [`declared_column_set_digest`] is compared with the
+    /// pinned digest, which compares the two as sets of (key, type) pairs: an
+    /// added column, a removed one, or one whose type changed is
     /// [`CursorError::Expired`] (the 2026-09-12 amendment, item 3), and the
     /// order the two lists name their columns in does not matter.
     ///
@@ -999,17 +1024,32 @@ impl PendingRedemption {
         if self.cursor.newer_erasure_intersects(observed_erasure) {
             return Err(CursorError::Expired);
         }
-        if canonical_set(
-            self.cursor
-                .declared_columns
-                .iter()
-                .map(declared_column_bytes),
-        ) != canonical_set(observed_declared_columns.iter().map(declared_column_bytes))
+        if declared_column_set_digest(observed_declared_columns)
+            != self.cursor.declared_column_set_digest
         {
             return Err(CursorError::Expired);
         }
         Ok(self.cursor)
     }
+}
+
+/// Domain-separation context for [`declared_column_set_digest`], in BLAKE3's
+/// derive-key mode.
+const DECLARED_COLUMN_SET_CONTEXT: &str = "ravel-mcp cursor declared_column_set v1";
+
+/// The digest a cursor pins in place of its declared column set: BLAKE3-256
+/// in derive-key mode under [`DECLARED_COLUMN_SET_CONTEXT`], over the set's
+/// element count and then each column's encoding (its key behind a `u64`
+/// length, then its type's wire tag) behind its own length, the encodings
+/// sorted and deduplicated first. The order `columns` lists them in and any
+/// repeats do not change the digest; a column's key or type does.
+pub fn declared_column_set_digest(columns: &[DeclaredColumn]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(DECLARED_COLUMN_SET_CONTEXT);
+    hash_set(
+        &mut hasher,
+        canonical_set(columns.iter().map(declared_column_bytes)),
+    );
+    *hasher.finalize().as_bytes()
 }
 
 /// Domain-separation context for [`snapshot_id`], in BLAKE3's derive-key mode.
@@ -1029,8 +1069,10 @@ const SNAPSHOT_ID_CONTEXT: &str = "ravel-mcp visibility.snapshot_id v1";
 /// or repetition never encode to the same bytes. The three lists are sets: each element is encoded on its own and
 /// the encodings are sorted and deduplicated, so the order a resolve happened
 /// to list them in does not change the id. A redemption derives its page's id
-/// from the cursor's pinned inputs with `resolve_at_ns` set to the cursor's
-/// `mint_ns`, which is what keeps one id across a page sequence.
+/// from the cursor's pinned inputs, the declared set
+/// [`PendingRedemption::confirm`] accepted in place of the pinned digest, and
+/// `resolve_at_ns` set to the cursor's `mint_ns`, which is what keeps one id
+/// across a page sequence.
 // The seven inputs are the amendment's own list, the time range taken as its
 // two bounds; a struct would let a call site leave one at its default.
 #[allow(clippy::too_many_arguments)]
@@ -1378,16 +1420,6 @@ fn declared_type_tag(ty: DeclaredType) -> u8 {
     }
 }
 
-fn declared_type_from_tag(tag: u8) -> Result<DeclaredType, CursorError> {
-    match tag {
-        1 => Ok(DeclaredType::Str),
-        2 => Ok(DeclaredType::I64),
-        3 => Ok(DeclaredType::Bool),
-        4 => Ok(DeclaredType::Bytes),
-        _ => Err(CursorError::Invalid),
-    }
-}
-
 /// Keyed BLAKE3-256 MAC, in the same construction as
 /// `ravel_sql::flight_ticket`'s ticket MAC, but under this crate's own
 /// process-local [`CursorKey`]: a cursor and a Flight ticket are separate
@@ -1523,8 +1555,8 @@ mod tests {
     }
 
     /// Both stages of a redemption, with the resolve between them observing
-    /// `erasure` and exactly the declared column set the cursor pinned, so a
-    /// test of either stage's other checks is not perturbed by this one.
+    /// `erasure` and [`sample_declared`], the set every sample cursor pins,
+    /// so a test of either stage's other checks is not perturbed by this one.
     #[allow(clippy::too_many_arguments)]
     fn redeem_both(
         token: &str,
@@ -1545,8 +1577,12 @@ mod tests {
             now_ns,
             protection_horizon_ns,
         )?;
-        let declared = pending.cursor.declared_columns.clone();
-        pending.confirm(now_ns, erasure, &declared)
+        pending.confirm(now_ns, erasure, &sample_declared())
+    }
+
+    /// The declared column set [`sample_cursor`] pins the digest of.
+    fn sample_declared() -> Vec<DeclaredColumn> {
+        vec![DeclaredColumn::new("http.status_code", DeclaredType::I64)]
     }
 
     fn sample_evidence(tenant: TenantHash) -> EvidenceRef {
@@ -1573,7 +1609,7 @@ mod tests {
                 "region".to_owned(),
                 "us-east".to_owned(),
             )])],
-            declared_columns: vec![DeclaredColumn::new("http.status_code", DeclaredType::I64)],
+            declared_column_set_digest: declared_column_set_digest(&sample_declared()),
             ingest_watermark_hour: Some(472_222),
             position: CursorPosition::Keyset {
                 tuple: vec![1, 2, 3],
@@ -1998,6 +2034,24 @@ mod tests {
     fn cursor_round_trips_every_resolve_input() {
         let tenant = TenantHash([0x5Eu8; 16]);
         let key = test_key();
+        let declared = vec![
+            DeclaredColumn::new("http.status_code", DeclaredType::I64),
+            DeclaredColumn::new("http.route", DeclaredType::Str),
+            DeclaredColumn::new("error", DeclaredType::Bool),
+            DeclaredColumn::new("trace_id", DeclaredType::Bytes),
+        ];
+        let redeem = |token: &str| {
+            Cursor::redeem(
+                token,
+                &key,
+                tenant,
+                SAMPLE_TOOL,
+                &SAMPLE_ARGS,
+                NOW_NS,
+                FAR_HORIZON_NS,
+            )?
+            .confirm(NOW_NS, NO_ERASURE, &declared)
+        };
         let cursor = Cursor {
             tenant,
             tool: SAMPLE_TOOL.to_owned(),
@@ -2032,12 +2086,7 @@ mod tests {
                     ("user.id".to_owned(), "u-42".to_owned()),
                 ]),
             ],
-            declared_columns: vec![
-                DeclaredColumn::new("http.status_code", DeclaredType::I64),
-                DeclaredColumn::new("http.route", DeclaredType::Str),
-                DeclaredColumn::new("error", DeclaredType::Bool),
-                DeclaredColumn::new("trace_id", DeclaredType::Bytes),
-            ],
+            declared_column_set_digest: declared_column_set_digest(&declared),
             ingest_watermark_hour: Some(472_223),
             position: CursorPosition::Keyset {
                 tuple: vec![7, 8, 9, 10],
@@ -2048,17 +2097,7 @@ mod tests {
         };
 
         let token = cursor.encode(&key).expect("encodes");
-        let decoded = redeem_both(
-            &token,
-            &key,
-            tenant,
-            SAMPLE_TOOL,
-            &SAMPLE_ARGS,
-            NO_ERASURE,
-            NOW_NS,
-            FAR_HORIZON_NS,
-        )
-        .expect("round-trips through its own codec");
+        let decoded = redeem(&token).expect("round-trips through its own codec");
         assert_eq!(decoded, cursor);
 
         // The other position arm, through the same codec.
@@ -2068,17 +2107,7 @@ mod tests {
             end: 4_500,
         };
         let token = ranged.encode(&key).expect("encodes");
-        let decoded = redeem_both(
-            &token,
-            &key,
-            tenant,
-            SAMPLE_TOOL,
-            &SAMPLE_ARGS,
-            NO_ERASURE,
-            NOW_NS,
-            FAR_HORIZON_NS,
-        )
-        .expect("round-trips through its own codec");
+        let decoded = redeem(&token).expect("round-trips through its own codec");
         assert_eq!(decoded, ranged);
     }
 
@@ -2125,6 +2154,46 @@ mod tests {
         let mut bytes = token_bytes(&token);
         assert_eq!(bytes[CURSOR_MAGIC.len()], CURSOR_VERSION);
         bytes[CURSOR_MAGIC.len()] = 4;
+        let stale = remint(bytes, &key);
+
+        let err = Cursor::decode(&stale, &key).expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+        let err = Cursor::redeem(
+            &stale,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+    }
+
+    /// Version 6 replaced the declared column set with its digest, so a
+    /// version 5 token carries a count and keys where this layout reads 32
+    /// digest bytes: it is refused at the header with the same `Invalid` as
+    /// [`a_version_4_token_is_invalid`], through `decode` and through stage
+    /// one. Reminted under this process's key, so the refusal is the version
+    /// byte's and not the MAC's.
+    ///
+    /// FLIP: with `CURSOR_VERSION` left at 5 (the pre-change number over the
+    /// new layout) the token decodes, and a real version 5 token would be
+    /// misread as a digest instead of refused.
+    #[test]
+    fn a_version_5_token_is_invalid() {
+        let tenant = TenantHash([0x61u8; 16]);
+        let key = test_key();
+        let token = sample_cursor(tenant).encode(&key).expect("encodes");
+        assert!(
+            Cursor::decode(&token, &key).is_ok(),
+            "the unedited token decodes, so the edit below is what refuses it"
+        );
+
+        let mut bytes = token_bytes(&token);
+        assert_eq!(bytes[CURSOR_MAGIC.len()], CURSOR_VERSION);
+        bytes[CURSOR_MAGIC.len()] = 5;
         let stale = remint(bytes, &key);
 
         let err = Cursor::decode(&stale, &key).expect_err("must be refused");
@@ -2428,10 +2497,10 @@ mod tests {
     /// A string field whose bytes are not UTF-8 is `Invalid`, not a lossy
     /// decode and not a panic. 0xFF is never a valid UTF-8 leading byte.
     ///
-    /// The field edited is a declared column key, not the tool name: a lossy
-    /// decode of the tool name would be caught a second time by the tool
-    /// binding in `redeem`, and the assertion would hold for the wrong reason.
-    /// Nothing downstream re-checks a column key.
+    /// The field edited is a keyset `order_by` entry, not the tool name: a
+    /// lossy decode of the tool name would be caught a second time by the
+    /// tool binding in `redeem`, and the assertion would hold for the wrong
+    /// reason. Nothing in redemption re-checks an `order_by` entry.
     #[test]
     fn non_utf8_string_field_is_cursor_invalid() {
         let tenant = TenantHash([0x7Eu8; 16]);
@@ -2439,11 +2508,11 @@ mod tests {
         let token = sample_cursor(tenant).encode(&key).expect("encodes");
 
         let mut bytes = token_bytes(&token);
-        let needle = b"http.status_code";
+        let needle = b"timestamp desc";
         let at = bytes
             .windows(needle.len())
             .position(|window| window == needle)
-            .expect("the declared column key is in the payload");
+            .expect("the order_by entry is in the payload");
         bytes[at] = 0xFF;
         let reminted = remint(bytes, &key);
 
@@ -2857,7 +2926,7 @@ mod tests {
         assert_eq!(pending.deadline_ns(), cursor.deadline_ns);
 
         let redeemed = pending
-            .confirm(NOW_NS, &pinned_erasure(&cursor), &cursor.declared_columns)
+            .confirm(NOW_NS, &pinned_erasure(&cursor), &sample_declared())
             .expect("nothing moved");
         assert_eq!(redeemed, cursor);
     }
@@ -2885,11 +2954,7 @@ mod tests {
         let newer = ErasurePredicate::windowless(user.clone());
 
         let err = pending_for(&token, &key, tenant)
-            .confirm(
-                NOW_NS,
-                &[(Signal::Logs, newer.clone())],
-                &cursor.declared_columns,
-            )
+            .confirm(NOW_NS, &[(Signal::Logs, newer.clone())], &sample_declared())
             .expect_err("a newer erasure over the pinned signal and range");
         assert_eq!(err, CursorError::Expired);
 
@@ -2902,7 +2967,7 @@ mod tests {
         ] {
             assert_ne!(other, cursor.signal);
             let redeemed = pending_for(&token, &key, tenant)
-                .confirm(NOW_NS, &[(other, newer.clone())], &cursor.declared_columns)
+                .confirm(NOW_NS, &[(other, newer.clone())], &sample_declared())
                 .expect("an erasure on another signal cannot touch this page");
             assert_eq!(redeemed, cursor);
         }
@@ -2913,12 +2978,12 @@ mod tests {
             cursor.range_start_ns,
         );
         let redeemed = pending_for(&token, &key, tenant)
-            .confirm(NOW_NS, &[(cursor.signal, before)], &cursor.declared_columns)
+            .confirm(NOW_NS, &[(cursor.signal, before)], &sample_declared())
             .expect("an erasure wholly before the range cannot touch this page");
         assert_eq!(redeemed, cursor);
 
         let redeemed = pending_for(&token, &key, tenant)
-            .confirm(NOW_NS, &pinned_erasure(&cursor), &cursor.declared_columns)
+            .confirm(NOW_NS, &pinned_erasure(&cursor), &sample_declared())
             .expect("the pinned predicate still pending is not newer");
         assert_eq!(redeemed, cursor);
     }
@@ -2926,11 +2991,18 @@ mod tests {
     /// A declared column set observed at redemption that differs from the
     /// pinned one is `Expired` (the 2026-09-12 amendment, item 3): one column
     /// added, one removed, one retyped, one renamed. The same set in another
-    /// order, and the pinned set itself, redeem.
+    /// order or with a column repeated, and the pinned set itself, redeem.
+    /// The cursor pins only the set's digest (the 2026-11-02 declared-set
+    /// digest amendment), so each case is decided by
+    /// [`declared_column_set_digest`].
     ///
-    /// FLIP: comparing by count passes the retyped and renamed sets. FLIP:
-    /// comparing keys only passes the retyped set. FLIP: comparing the lists
-    /// in order (plain `Vec` equality) refuses the reordered set.
+    /// FLIP: a digest over the columns in observed order (hash
+    /// `columns.iter().map(declared_column_bytes)` without `canonical_set`)
+    /// refuses the reordered set. FLIP: sorting without deduplicating refuses
+    /// the repeated one. FLIP: a digest that ignores the type
+    /// (`declared_column_bytes` without the type tag) passes the retyped set.
+    /// FLIP: a digest over the count alone passes the retyped and renamed
+    /// sets.
     #[test]
     fn a_changed_declared_column_set_is_expired() {
         let tenant = TenantHash([0x64u8; 16]);
@@ -2938,7 +3010,8 @@ mod tests {
         let status = DeclaredColumn::new("http.status_code", DeclaredType::I64);
         let route = DeclaredColumn::new("http.route", DeclaredType::Str);
         let mut cursor = sample_cursor(tenant);
-        cursor.declared_columns = vec![status.clone(), route.clone()];
+        cursor.declared_column_set_digest =
+            declared_column_set_digest(&[status.clone(), route.clone()]);
         let token = cursor.encode(&key).expect("encodes");
 
         let changed = [
@@ -2976,12 +3049,112 @@ mod tests {
         for observed in [
             vec![route.clone(), status.clone()],
             vec![status.clone(), route.clone()],
+            vec![status.clone(), route.clone(), status.clone()],
         ] {
             let redeemed = pending_for(&token, &key, tenant)
                 .confirm(NOW_NS, &pinned_erasure(&cursor), &observed)
-                .expect("the same set redeems in any order");
+                .expect("the same set redeems in any order and with repeats");
             assert_eq!(redeemed, cursor);
         }
+    }
+
+    /// A declared column set of 4,000 keys of 90 bytes each mints a token
+    /// exactly as long as [`sample_cursor`]'s one-column token, inside
+    /// [`CURSOR_BOUND`], and that token redeems against the same set observed
+    /// in reverse order and expires once one column is gone.
+    ///
+    /// FLIP: the pre-change cursor (version 5, which pinned the set verbatim)
+    /// mints a 507,079-character token for this cursor, against 450 here and
+    /// a bound of 4,096, so a describe_data page on such a tenant failed
+    /// `internal`.
+    #[test]
+    fn a_large_declared_set_fits_the_cursor_bound_and_redeems() {
+        let tenant = TenantHash([0x67u8; 16]);
+        let key = test_key();
+        let declared: Vec<DeclaredColumn> = (0..4_000)
+            .map(|i| {
+                let ty = match i % 4 {
+                    0 => DeclaredType::Str,
+                    1 => DeclaredType::I64,
+                    2 => DeclaredType::Bool,
+                    _ => DeclaredType::Bytes,
+                };
+                DeclaredColumn::new(format!("attr_{i:04}_{}", "x".repeat(80)), ty)
+            })
+            .collect();
+        assert!(declared.iter().all(|c| c.key.len() == 90));
+
+        let small = sample_cursor(tenant).encode(&key).expect("encodes");
+        let mut cursor = sample_cursor(tenant);
+        cursor.declared_column_set_digest = declared_column_set_digest(&declared);
+        let token = cursor.encode(&key).expect("encodes");
+        assert_eq!(token.len(), small.len());
+        assert!(
+            crate::envelope::serialized_str_len(&token) <= crate::envelope::CURSOR_BOUND,
+            "{} serialized bytes",
+            crate::envelope::serialized_str_len(&token)
+        );
+
+        let reversed: Vec<DeclaredColumn> = declared.iter().rev().cloned().collect();
+        let redeemed = pending_for(&token, &key, tenant)
+            .confirm(NOW_NS, &pinned_erasure(&cursor), &reversed)
+            .expect("the same set redeems");
+        assert_eq!(redeemed, cursor);
+
+        let err = pending_for(&token, &key, tenant)
+            .confirm(NOW_NS, &pinned_erasure(&cursor), &declared[1..])
+            .expect_err("one column fewer is a changed set");
+        assert_eq!(err, CursorError::Expired);
+    }
+
+    /// The pending erasure predicates stay pinned whole rather than as a
+    /// digest, because stage two asks whether each in-force predicate was
+    /// pinned, not whether the two sets are equal: an in-force set that lost
+    /// a pinned predicate (that erasure completed) redeems, in either order,
+    /// and the cursor that comes back still carries every pinned predicate,
+    /// which the next page's snapshot id is derived from. A set that gained
+    /// one in scope expires.
+    ///
+    /// FLIP: pinning a digest of the erasure set and comparing it with the
+    /// digest of the in-force predicates on the cursor's signal expires the
+    /// completed case. FLIP: a `confirm` that rebuilds `pending_erasure` from
+    /// what it observed hands back a cursor missing the completed predicate.
+    #[test]
+    fn the_pinned_erasure_set_is_read_by_membership_not_equality() {
+        let tenant = TenantHash([0x68u8; 16]);
+        let key = test_key();
+        let region = ErasurePredicate::windowless(vec![("region".into(), "us-east".into())]);
+        let user = ErasurePredicate::windowless(vec![("user.id".into(), "u-42".into())]);
+        let host = ErasurePredicate::windowless(vec![("host".into(), "h-7".into())]);
+        let mut cursor = sample_cursor(tenant);
+        cursor.pending_erasure = vec![region.clone(), user.clone()];
+        let token = cursor.encode(&key).expect("encodes");
+        let on_logs = |predicates: &[&ErasurePredicate]| -> Vec<(Signal, ErasurePredicate)> {
+            predicates
+                .iter()
+                .map(|p| (Signal::Logs, (*p).clone()))
+                .collect()
+        };
+
+        for (what, in_force) in [
+            ("region completed", on_logs(&[&user])),
+            ("both completed", on_logs(&[])),
+            ("reordered", on_logs(&[&user, &region])),
+        ] {
+            let redeemed = pending_for(&token, &key, tenant)
+                .confirm(NOW_NS, &in_force, &sample_declared())
+                .expect(what);
+            assert_eq!(redeemed.pending_erasure, cursor.pending_erasure, "{what}");
+        }
+
+        let err = pending_for(&token, &key, tenant)
+            .confirm(
+                NOW_NS,
+                &on_logs(&[&region, &user, &host]),
+                &sample_declared(),
+            )
+            .expect_err("a newer predicate in scope");
+        assert_eq!(err, CursorError::Expired);
     }
 
     /// The redeeming resolve runs at the cursor's `mint_ns`, whatever the
@@ -3061,7 +3234,7 @@ mod tests {
             range_end_ns: cursor.range_end_ns,
             watermark: cursor.min_commit_watermark,
             erasure: cursor.pending_erasure,
-            declared: cursor.declared_columns,
+            declared: sample_declared(),
             resolve_at_ns: cursor.mint_ns,
         }
     }
@@ -3115,8 +3288,11 @@ mod tests {
     }
 
     /// A redemption that derives its id from the confirmed cursor's pinned
-    /// inputs and [`PendingRedemption::resolve_at_ns`] reports the id page one
-    /// derived at its mint, whatever the redeeming clock reads.
+    /// inputs, the declared set `confirm` accepted, and
+    /// [`PendingRedemption::resolve_at_ns`] reports the id page one derived at
+    /// its mint, whatever the redeeming clock reads. The set is observed in
+    /// another order than page one listed it, which `confirm` accepts and the
+    /// id reads as the same set.
     ///
     /// FLIP: a `resolve_at_ns` returning stage one's `now_ns` derives a
     /// different id. FLIP: one returning `deadline_ns` does too. FLIP: a
@@ -3126,8 +3302,13 @@ mod tests {
     fn a_redemption_reports_page_ones_snapshot_id() {
         let tenant = TenantHash([0x66u8; 16]);
         let key = test_key();
+        let declared = vec![
+            DeclaredColumn::new("http.status_code", DeclaredType::I64),
+            DeclaredColumn::new("http.route", DeclaredType::Str),
+        ];
         let mut cursor = sample_cursor(tenant);
         cursor.mint_ns = 1_700_000_000_250_000_000;
+        cursor.declared_column_set_digest = declared_column_set_digest(&declared);
         let page_one = snapshot_id(
             cursor.tenant,
             cursor.signal,
@@ -3135,7 +3316,7 @@ mod tests {
             cursor.range_end_ns,
             &cursor.min_commit_watermark,
             &cursor.pending_erasure,
-            &cursor.declared_columns,
+            &declared,
             cursor.mint_ns,
         );
         let token = cursor.encode(&key).expect("encodes");
@@ -3143,22 +3324,21 @@ mod tests {
         let pending = pending_for(&token, &key, tenant);
         assert_ne!(NOW_NS, cursor.mint_ns);
         let resolve_at_ns = pending.resolve_at_ns();
+        let observed: Vec<DeclaredColumn> = declared.iter().rev().cloned().collect();
         let redeemed = pending
-            .confirm(NOW_NS, &pinned_erasure(&cursor), &cursor.declared_columns)
+            .confirm(NOW_NS, &pinned_erasure(&cursor), &observed)
             .expect("nothing moved");
-        let page_two = |c: &Cursor| {
-            snapshot_id(
-                c.tenant,
-                c.signal,
-                c.range_start_ns,
-                c.range_end_ns,
-                &c.min_commit_watermark,
-                &c.pending_erasure,
-                &c.declared_columns,
-                resolve_at_ns,
-            )
-        };
-        assert_eq!(page_two(&redeemed), page_one);
+        let page_two = snapshot_id(
+            redeemed.tenant,
+            redeemed.signal,
+            redeemed.range_start_ns,
+            redeemed.range_end_ns,
+            &redeemed.min_commit_watermark,
+            &redeemed.pending_erasure,
+            &observed,
+            resolve_at_ns,
+        );
+        assert_eq!(page_two, page_one);
     }
 
     /// Every variable-length value is length-prefixed: two inputs whose
@@ -3262,7 +3442,7 @@ mod tests {
         let tenant = TenantHash([0xAAu8; 16]);
         let cursor = sample_cursor(tenant);
         let token = cursor.encode(&key).expect("encodes");
-        let declared = cursor.declared_columns.clone();
+        let declared = sample_declared();
         let redeem = || {
             Cursor::redeem(
                 &token,

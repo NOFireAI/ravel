@@ -158,10 +158,14 @@ impl Draft {
     /// that the observed erasure and declared columns did not move; the
     /// watermark and the resolve instant are page one's by definition, so
     /// every page of one sequence reports one snapshot id and one watermark.
+    ///
+    /// The cursor carries only a digest of its declared column set, so the
+    /// draft keeps its own `declared_columns`. They must be the set `confirm`
+    /// accepted for `cursor`, which hashes to the pinned digest, so they name
+    /// page one's set and derive page one's snapshot id.
     pub fn pinned_to(mut self, cursor: &Cursor) -> Draft {
         self.signal = Ok(cursor.signal);
         self.pending_erasure = cursor.pending_erasure.clone();
-        self.declared_columns = cursor.declared_columns.clone();
         self.ingest_watermark_hour = cursor.ingest_watermark_hour;
         self.resolve_at_ns = cursor.mint_ns;
         self.envelope.visibility.pinned = true;
@@ -394,7 +398,7 @@ impl PagePins<'_> {
             range_end_ns: self.scope.range_end_ns,
             min_commit_watermark: self.scope.min_commit_watermark.clone(),
             pending_erasure: self.pending_erasure.to_vec(),
-            declared_columns: self.declared_columns.to_vec(),
+            declared_column_set_digest: cursor::declared_column_set_digest(self.declared_columns),
             ingest_watermark_hour: self.ingest_watermark_hour,
             position,
             mint_ns: self.resolve_at_ns,
