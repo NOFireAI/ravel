@@ -8,10 +8,10 @@ which has its own guide: [Ravel Agents](agents.md).
 > off by default. Build `ravel-server` with `--features mcp`, then run it
 > with `--mcp` (only supported under `--mode all` or `--mode query`) to
 > mount `POST /mcp` on the query router; `--mcp-allowed-origins` is required
-> once that listener is reachable from anywhere but localhost. Five tools are
+> once that listener is reachable from anywhere but localhost. Six tools are
 > served today: `ravel_capabilities`, `ravel_describe_data`,
-> `ravel_find_labels`, `ravel_explain_query` and `ravel_get_trace`. The
-> other four are catalogued, so
+> `ravel_find_labels`, `ravel_explain_query`, `ravel_query_sql` and
+> `ravel_get_trace`. The other three are catalogued, so
 > `tools/list` returns them, and a call to one refuses with a
 > `method_not_found` protocol error until its body lands; the sections below
 > describe the surface as designed. The [MCP reference](../reference/mcp.md)
@@ -142,9 +142,16 @@ server offers over MCP, `ravel_agent_send`, belongs to the
 
 ### Run a query
 
-- `ravel_query_sql`: one `SELECT` over one table, with a required
+- `ravel_query_sql`: one read-only `SELECT` over one table, with a required
   `time_range` applied as a row filter, `max_rows`, budgets you can only
-  lower, and a cursor for the next page.
+  lower, and a cursor for the next page. The statement is checked before
+  anything is read: two tables, a write, a statement-level `LIMIT`, and an
+  `ORDER BY` the tool cannot page by (a float column, a column that may be
+  NULL, one the statement does not project) are refused with a next step.
+  A statement with no `ORDER BY` over a table with no row identity runs
+  unpaged, and a full page of it is `ok_bounded` with no cursor. An
+  `evidence_ref` is refused as unsupported. The
+  [reference](../reference/mcp.md#running-a-statement) lists each answer.
 - `ravel_query_promql`: an instant or a range PromQL evaluation, with
   partial-coverage consent, step alignment, and the two log pseudo-metrics
   available the same as any other metric name.
@@ -421,10 +428,14 @@ and the protection horizon minus the grace period.
 
 Paging order differs per tool:
 
-- `ravel_query_sql` mints a cursor only when the statement's `ORDER BY`,
-  together with the tiebreak that the tool appends, orders every row
-  uniquely. When the tiebreak is not unique, the equal-group rule applies
-  as for `ravel_search_logs`, and cursor paging continues.
+- `ravel_query_sql` pages by keyset over the statement's `ORDER BY`,
+  together with the tiebreak that the tool appends where the table has a
+  row identity (`series_id` on `samples`). When that order is total, the
+  cursor resumes after the page's last row. When it is not, a warning says
+  so, the equal-group rule applies as for `ravel_search_logs`, and cursor
+  paging continues. A page whose last row has no cursor position (a NaN
+  or infinite order value, or a cursor over its 4 KiB bound) ends
+  `ok_bounded` with no cursor and a `narrow_time_range` next step.
 - `ravel_search_logs` orders by a tuple that is not always unique, because
   `logs` rows carry no row identity. The equal-group rule applies.
 - `ravel_get_trace` mints no cursor as served today: it returns the trace's
