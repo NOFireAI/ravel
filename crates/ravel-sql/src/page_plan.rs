@@ -773,6 +773,9 @@ fn parse_query(sql: &str) -> Result<Query, PagePlanError> {
 /// `SELECT ... INTO` is refused on the same reasoning one level down: it is a
 /// write, and the wrap re-emits it once per page.
 ///
+/// The `SELECT ... INTO` and lock-clause arms are reached only by a direct
+/// call: `plan_page` runs `validate_query` first, which refuses both.
+///
 /// The pipe check is keyed on a pipe being PRESENT rather than on a list of
 /// pipe kinds, so a kind a later sqlparser adds fails closed.
 fn reject_nested_unpageable_clauses(query: &Query) -> Result<(), PagePlanError> {
@@ -3012,7 +3015,8 @@ mod tests {
     /// classification did not read. `SELECT ts, series_id INTO t2 FROM samples
     /// ORDER BY ts` planned with `not_total: None` and re-emitted `INTO t2`
     /// into the derived table, so every page of the walk would have tried to
-    /// write the table again.
+    /// write the table again. `plan_page` now meets the read-only gate's own
+    /// refusal first; the walk's is checked directly.
     #[test]
     fn refuses_select_into_at_every_nesting_depth() {
         for sql in [
@@ -3020,10 +3024,17 @@ mod tests {
             "SELECT * FROM samples WHERE ts IN (SELECT ts INTO t3 FROM samples) ORDER BY ts",
             "WITH c AS (SELECT ts INTO t4 FROM samples) SELECT * FROM samples ORDER BY ts",
         ] {
-            let err = plan_page(sql, None).expect_err("refused");
+            let query = parse_query(sql).expect("parses");
             assert_eq!(
-                err,
-                PagePlanError::SelectInto,
+                reject_nested_unpageable_clauses(&query),
+                Err(PagePlanError::SelectInto),
+                "unexpected refusal for {sql:?}"
+            );
+            assert_eq!(
+                plan_page(sql, None).expect_err("refused"),
+                PagePlanError::Invalid(ValidationError::WriteInQuery {
+                    kind: "SELECT INTO"
+                }),
                 "unexpected refusal for {sql:?}"
             );
         }
@@ -3203,7 +3214,8 @@ mod tests {
             ),
         ];
         for (sql, clause) in cases {
-            let err = plan_page(sql, None).expect_err("refused");
+            let query = parse_query(sql).expect("parses");
+            let err = reject_nested_unpageable_clauses(&query).expect_err("refused");
             assert_eq!(
                 err,
                 PagePlanError::UnsupportedQueryClause { clause },
@@ -3212,6 +3224,18 @@ mod tests {
             assert_eq!(
                 err.to_string(),
                 format!("the `{clause}` clause cannot be paged")
+            );
+            // `plan_page` runs the read-only gate first, which refuses a lock
+            // clause itself.
+            let want = if clause == "FOR UPDATE/FOR SHARE" {
+                PagePlanError::Invalid(ValidationError::NotReadOnly { kind: "FOR UPDATE" })
+            } else {
+                err
+            };
+            assert_eq!(
+                plan_page(sql, None).expect_err("refused"),
+                want,
+                "unexpected refusal for {sql:?}"
             );
         }
 
