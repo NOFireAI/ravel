@@ -1308,3 +1308,23 @@ written, and records here the choices they leave open.
    catalogued count from three to two. The input descriptions move
    `tools/list` from 15,733 to 15,972 bytes with the nine tools and from
    23,622 to 23,861 bytes with all fifteen, under the 24,576-byte budget.
+10. A range of more than 11,000 steps is `invalid_argument` before the
+    backend call, with a next step naming the smallest whole-millisecond
+    step that fits, or to narrow `time_range`. 11,000 is the engine's
+    `DEFAULT_MAX_RANGE_POINTS`; past it the engine refuses as `unsupported`
+    with no next step, naming the HTTP route's `step_ms`. `ravel-mcp` does
+    not depend on the engine, so the tool holds `MAX_RANGE_POINTS`, which
+    an end-to-end test pins equal to the engine's constant, as item 2 does
+    for the lookback.
+11. A series whose samples do not fit `max_response_bytes` stays an object
+    of parallel arrays. D4 shortens an oversized cell by serializing it to
+    text and cutting the text, which would turn `samples` into a string no
+    caller can read as arrays, so this tool fits its series before D4's
+    fit runs: whole series are kept in order, the first that does not fit
+    keeps the longest prefix of its samples that does, with `ts_ns`,
+    `value` and `histogram` cut to one length and `samples_omitted` a
+    string count, and the series after it are dropped. A series none of
+    whose samples fit is dropped when an earlier one was kept.
+    `cells_truncated` counts the cut series and `rows_omitted` every series
+    dropped, the result is `ok_bounded`, and a next step says to widen
+    `step`, narrow `time_range` or narrow the query.
