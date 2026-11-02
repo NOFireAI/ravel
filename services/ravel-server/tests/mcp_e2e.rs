@@ -1456,4 +1456,250 @@ mod with_mcp {
         client.cancel().await.expect("client stops");
         running.shutdown().await.expect("server stops");
     }
+
+    /// Write the test tenant's metric metadata record with one gauge family
+    /// per name.
+    async fn write_families(store: &dyn ObjectStoreBackend, names: &[String]) {
+        let entries: Vec<_> = names
+            .iter()
+            .map(|name| ravel_catalog::MetricMetadataEntry {
+                family_name: name.clone(),
+                kind: ravel_catalog::MetricKind::Gauge,
+                help: format!("help for {name}"),
+                unit: String::new(),
+                updated_unix_ns: 1,
+            })
+            .collect();
+        ravel_catalog::write_metrics_meta(store, &expected_tenant(), &entries, None)
+            .await
+            .expect("metadata record written");
+    }
+
+    /// Write a pending (no `.done`) windowless erasure request on `signal`
+    /// for the test tenant.
+    async fn request_erasure(
+        store: &dyn ObjectStoreBackend,
+        signal: ravel_types::Signal,
+        request_id: u128,
+    ) {
+        use ravel_commit::{erasure, keys, signal as commit_signal};
+        use ravel_object_store::{PutMode, PutOptions};
+        use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
+
+        let request_id = uuid::Uuid::from_u128(request_id);
+        let request = ErasureRequest {
+            format_version: 1,
+            tenant_hash: expected_tenant().0.to_vec(),
+            signal: commit_signal::to_proto(signal) as i32,
+            request_id: request_id.to_string(),
+            created_unix_ns: 1,
+            predicate: vec![ErasurePredicateMatcher {
+                key: "user".to_string(),
+                value: "u1".to_string(),
+            }],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: String::new(),
+        };
+        let key = keys::erasure_request_key(&expected_tenant(), signal, request_id)
+            .expect("erasure request key");
+        store
+            .put(
+                &key,
+                erasure::encode_request(&request),
+                PutOptions {
+                    mode: PutMode::CreateIfAbsent,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("erasure request written");
+    }
+
+    /// The `family` rows' names, in the order the page carries them.
+    fn family_names(page: &serde_json::Value) -> Vec<String> {
+        page["data"]["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .filter(|row| row[0] == serde_json::json!("family"))
+            .map(|row| row[1].as_str().expect("a family name").to_string())
+            .collect()
+    }
+
+    fn cursor_of(page: &serde_json::Value) -> Option<String> {
+        page["presentation"]["cursor"].as_str().map(str::to_string)
+    }
+
+    /// `ravel_describe_data` through `POST /mcp` on the shipping start path,
+    /// over a MemoryStore tenant with 250 metric families: three pages of
+    /// 100, 100, and 50, each later page redeeming the cursor the one before
+    /// it returned.
+    ///
+    /// FLIP: paging by offset, or resuming at `>=` rather than `>` the last
+    /// name, repeats or skips a family and the concatenation differs from
+    /// the sorted list.
+    /// FLIP: a case-insensitive or locale-aware collation interleaves the
+    /// `Fam_` and `fam_` names, which byte order keeps apart.
+    /// FLIP: minting on a complete last page leaves a cursor on page three.
+    /// FLIP: re-measuring the watermark on a later page reports hour 7, the
+    /// segment committed between page one and page two, which a fresh page
+    /// one does report.
+    #[tokio::test]
+    async fn describe_data_pages_families_by_keyset_through_the_route() {
+        let (store, metrics) = instrumented_memory();
+        publish_sample(store.as_ref(), 1, 1).await;
+        let mut names: Vec<String> = (0..249)
+            .map(|index| {
+                if index % 2 == 0 {
+                    format!("fam_{index:03}")
+                } else {
+                    format!("Fam_{index:03}")
+                }
+            })
+            .collect();
+        names.push("\u{e9}tat_total".to_string());
+        write_families(store.as_ref(), &names).await;
+        names.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        assert_eq!(names[0], "Fam_001");
+        assert_eq!(names[123], "Fam_247");
+        assert_eq!(names[124], "fam_000");
+        assert_eq!(names[249], "\u{e9}tat_total");
+
+        let running = start_server(Arc::clone(&store), metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let (is_error, one) = call(
+            &client,
+            "ravel_describe_data",
+            serde_json::json!({"signal": "metrics"}),
+        )
+        .await;
+        assert_eq!(is_error, Some(false), "{one}");
+        assert_eq!(one["status"], serde_json::json!("ok_page"), "{one}");
+        assert_eq!(family_names(&one), names[..100]);
+        assert_eq!(one["data"]["rows"][0][0], serde_json::json!("table"));
+        assert_eq!(
+            one["data"]["rows"][0][2]["families_total"],
+            serde_json::json!(250)
+        );
+        assert_eq!(
+            one["visibility"]["ingest_watermark_hour"],
+            serde_json::json!("1")
+        );
+        assert_eq!(one["visibility"]["pinned"], serde_json::json!(false));
+
+        publish_sample(store.as_ref(), 7, 2).await;
+
+        let (is_error, two) = call(
+            &client,
+            "ravel_describe_data",
+            serde_json::json!({"signal": "metrics", "cursor": cursor_of(&one).expect("page one cursor")}),
+        )
+        .await;
+        assert_eq!(is_error, Some(false), "{two}");
+        assert_eq!(two["status"], serde_json::json!("ok_page"), "{two}");
+        assert_eq!(family_names(&two), names[100..200]);
+        assert_eq!(two["data"]["rows"].as_array().map(Vec::len), Some(100));
+        assert_eq!(
+            two["visibility"]["ingest_watermark_hour"],
+            serde_json::json!("1")
+        );
+        assert_eq!(two["visibility"]["pinned"], serde_json::json!(true));
+        assert_eq!(two["visibility"]["snapshot_id"], one["visibility"]["snapshot_id"]);
+
+        let (is_error, three) = call(
+            &client,
+            "ravel_describe_data",
+            serde_json::json!({"signal": "metrics", "cursor": cursor_of(&two).expect("page two cursor")}),
+        )
+        .await;
+        assert_eq!(is_error, Some(false), "{three}");
+        assert_eq!(three["status"], serde_json::json!("ok"), "{three}");
+        assert_eq!(family_names(&three), names[200..]);
+        assert_eq!(cursor_of(&three), None);
+        assert_eq!(
+            three["visibility"]["ingest_watermark_hour"],
+            serde_json::json!("1")
+        );
+        assert_eq!(three["visibility"]["snapshot_id"], one["visibility"]["snapshot_id"]);
+
+        let mut served = family_names(&one);
+        served.extend(family_names(&two));
+        served.extend(family_names(&three));
+        assert_eq!(served, names);
+
+        let (_, fresh) = call(
+            &client,
+            "ravel_describe_data",
+            serde_json::json!({"signal": "metrics"}),
+        )
+        .await;
+        assert_eq!(
+            fresh["visibility"]["ingest_watermark_hour"],
+            serde_json::json!("7"),
+            "{fresh}"
+        );
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// A metrics cursor through the route survives a pending erasure on
+    /// logs and is expired by one on metrics, with no rows served.
+    ///
+    /// FLIP: confirming against every signal's erasure expires the cursor
+    /// after the logs request; confirming against none, or serving the rows
+    /// before `confirm`, answers page two after the metrics request.
+    #[tokio::test]
+    async fn a_metrics_cursor_survives_a_logs_erasure_and_expires_on_a_metrics_one() {
+        let (store, metrics) = instrumented_memory();
+        publish_sample(store.as_ref(), 1, 1).await;
+        let names: Vec<String> = (0..150).map(|index| format!("m_{index:03}")).collect();
+        write_families(store.as_ref(), &names).await;
+        let running = start_server(Arc::clone(&store), metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let (_, one) = call(
+            &client,
+            "ravel_describe_data",
+            serde_json::json!({"signal": "metrics"}),
+        )
+        .await;
+        assert_eq!(one["status"], serde_json::json!("ok_page"), "{one}");
+        let cursor = cursor_of(&one).expect("page one cursor");
+
+        request_erasure(store.as_ref(), ravel_types::Signal::Logs, 0x3641).await;
+        let (is_error, two) = call(
+            &client,
+            "ravel_describe_data",
+            serde_json::json!({"signal": "metrics", "cursor": cursor}),
+        )
+        .await;
+        assert_eq!(is_error, Some(false), "{two}");
+        assert_eq!(family_names(&two), names[100..]);
+
+        request_erasure(store.as_ref(), ravel_types::Signal::Metrics, 0x3642).await;
+        let (is_error, expired) = call(
+            &client,
+            "ravel_describe_data",
+            serde_json::json!({"signal": "metrics", "cursor": cursor}),
+        )
+        .await;
+        assert_eq!(is_error, Some(true), "{expired}");
+        assert_eq!(
+            expired["failure"]["class"],
+            serde_json::json!("cursor_expired")
+        );
+        assert_eq!(expired["data"]["rows"], serde_json::json!([]));
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
 }
