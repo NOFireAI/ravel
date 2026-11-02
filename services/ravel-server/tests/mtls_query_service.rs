@@ -223,7 +223,8 @@ async fn describe_data_is_served_on_both_listeners_from_the_routes_metadata_cach
         signal: "metrics".to_string(),
         after_name: None,
         limit: None,
-        now_ns: NOW_NS,
+        resolve_at_ns: NOW_NS,
+        caller_now_ns: NOW_NS,
         deadline: std::time::Duration::from_secs(30),
     };
     for (listener, service) in [

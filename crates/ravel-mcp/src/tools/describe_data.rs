@@ -2,24 +2,38 @@
 //! committed row count, coverage window, freshness watermark, and its metric
 //! families, a page of 100 at a time.
 //!
-//! The family list pages with a D5 keyset cursor. The position is the last
-//! served family name's bytes under `order_by: ["name"]`, and a later page
-//! asks [`QueryBackend::describe_data`] for the families whose names sort
-//! after it in byte order, the order the service sorts the record in. The
-//! cursor pins the resolve inputs of page one, so a later page resolves at
-//! page one's instant and reports page one's watermark and snapshot id; the
-//! redemption is refused when a newer erasure on the signal or a changed
-//! declared column set has moved what that pin describes.
+//! Page one carries a `table` row (signal, segments, committed rows, coverage
+//! window, family total), one `column` row per fixed and declared column, one
+//! `indexed_key` row per key, then the `family` rows. Within each kind the
+//! rows are sorted by name in byte order (`Zeta` before `alpha`), the order
+//! the service sorts the family record in. The `table` row is served on page
+//! one only.
+//!
+//! The rows page with a D5 keyset cursor under `order_by: ["kind", "name"]`.
+//! The position is the last served row's kind, as one tag byte, followed by
+//! its name's bytes. A later page resumes inside that kind after that name,
+//! then serves every row of the kinds that follow it, in the order above; a
+//! position inside the families asks [`QueryBackend::describe_data`] for the
+//! families whose names sort after it. The cursor pins the resolve inputs of
+//! page one, so a later page resolves at page one's instant and reports page
+//! one's watermark and snapshot id, while its cache lookups and audit record
+//! use its own clock; the redemption is refused when a newer erasure on the
+//! signal or a changed declared column set has moved what that pin
+//! describes.
+//!
+//! A later page takes the column and indexed-key lists from its own call.
+//! The declared column set is pinned (above); the fixed columns are the
+//! serving binary's schema and the logs key index is the tenant's current
+//! declaration, and the cursor pins neither. A later page whose position
+//! names a column or key its own list no longer holds is refused as
+//! `cursor_expired` rather than resumed. A fixed column or indexed key added
+//! between pages that sorts before the position is not served by that
+//! sequence, and nothing detects it.
 //!
 //! The family list is not pinned: the metadata record is read fresh for each
 //! page. A family added that sorts after the position appears on a later
 //! page, one added that sorts before it does not, and `families_total` is the
 //! count of the read that served the page, so it can differ between pages.
-//!
-//! Page one carries a `table` row (signal, segments, committed rows, coverage
-//! window, family total), one `column` row per fixed and declared column, one
-//! `indexed_key` row per key, then the `family` rows. A later page carries
-//! `family` rows only.
 //!
 //! `budget.actual` counts the catalog resolve only. The metadata record read
 //! and the tenant configuration read are not in the service's accounting,
@@ -46,8 +60,9 @@ const TOOL: &str = "ravel_describe_data";
 /// Families per page: the service's own page bound.
 pub const FAMILIES_PER_PAGE: usize = 100;
 
-/// The keyset order the position is taken under.
-const ORDER_BY: &str = "name";
+/// The keyset order the position is taken under: the row kind in page
+/// order, then the name in byte order.
+const ORDER_BY: [&str; 2] = ["kind", "name"];
 
 /// The BLAKE3 derive-key context of the cursor's argument hash.
 const ARGUMENT_HASH_CONTEXT: &str = "ravel-mcp ravel_describe_data arguments v1";
@@ -85,15 +100,16 @@ async fn first_page<B: QueryBackend>(
         signal,
         after_name: None,
         limit: FAMILIES_PER_PAGE,
-        now_ns: ctx.now_ns,
+        resolve_at_ns: ctx.now_ns,
+        caller_now_ns: ctx.now_ns,
     };
     let outcome = match backend.describe_data(ctx.tenant_hash, &request).await {
         Ok(outcome) => outcome,
         Err(failure) => return refused(failure, ctx),
     };
     let mut rows = vec![table_row(name, &outcome)];
-    rows.extend(column_rows(&outcome));
-    rows.extend(indexed_key_rows(&outcome));
+    rows.extend(column_rows(&outcome, None));
+    rows.extend(indexed_key_rows(&outcome, None));
     rows.extend(family_rows(&outcome));
     let draft = Draft::new(
         base(name, &outcome, rows, ctx),
@@ -132,15 +148,16 @@ async fn later_page<B: QueryBackend>(
         Ok(pending) => pending,
         Err(error) => return refused(error.failure(), ctx),
     };
-    let after_name = match after_name(pending.position()) {
-        Ok(after_name) => after_name,
+    let resume = match resume_point(pending.position()) {
+        Ok(resume) => resume,
         Err(error) => return refused(error.failure(), ctx),
     };
     let request = DescribeRequest {
         signal,
-        after_name,
+        after_name: resume.after(RowKind::Family).map(str::to_string),
         limit: FAMILIES_PER_PAGE,
-        now_ns: pending.resolve_at_ns(),
+        resolve_at_ns: pending.resolve_at_ns(),
+        caller_now_ns: ctx.now_ns,
     };
     let outcome = match backend.describe_data(ctx.tenant_hash, &request).await {
         Ok(outcome) => outcome,
@@ -156,8 +173,22 @@ async fn later_page<B: QueryBackend>(
             Ok(confirmed) => confirmed,
             Err(error) => return refused(error.failure(), ctx),
         };
+    if let Err(failure) = resume.still_listed(&outcome) {
+        return refused(failure, ctx);
+    }
 
-    let mut envelope = base(name, &outcome, family_rows(&outcome), ctx);
+    let mut rows = Vec::new();
+    if resume.kind <= RowKind::Column {
+        rows.extend(column_rows(&outcome, resume.after(RowKind::Column)));
+    }
+    if resume.kind <= RowKind::IndexedKey {
+        rows.extend(indexed_key_rows(
+            &outcome,
+            resume.after(RowKind::IndexedKey),
+        ));
+    }
+    rows.extend(family_rows(&outcome));
+    let mut envelope = base(name, &outcome, rows, ctx);
     envelope.warnings.push(format!(
         "families_total: {} in the metadata record read for this page; the count \
          can differ between pages of one sequence",
@@ -195,7 +226,7 @@ fn base(name: &str, outcome: &DescribeOutcome, rows: Vec<Row>, ctx: &ToolContext
         start_ns: "0".to_string(),
         end_ns: i64::MAX.to_string(),
     });
-    envelope.scope.order_by = vec![ORDER_BY.to_string()];
+    envelope.scope.order_by = ORDER_BY.map(str::to_string).to_vec();
     envelope.coverage.complete = true;
     envelope.accuracy.exact = true;
     envelope.presentation.max_rows = FAMILIES_PER_PAGE as u32;
@@ -234,11 +265,14 @@ fn finish(
     let mut budgets = ctx.budgets;
     budgets.max_rows = u32::try_from(draft.envelope.data.rows.len()).unwrap_or(u32::MAX);
     draft.finish_page(&budgets, scope, PageOrder::Total, |pins, last| {
+        let (kind, name) = kind_and_name(last).ok_or(CursorError::Invalid)?;
         let position = CursorPosition::Keyset {
-            tuple: family_name(last)
-                .map(|name| name.as_bytes().to_vec())
-                .unwrap_or_default(),
-            order_by: vec![ORDER_BY.to_string()],
+            tuple: Resume {
+                kind,
+                name: name.to_string(),
+            }
+            .tuple(),
+            order_by: ORDER_BY.map(str::to_string).to_vec(),
         };
         pins.cursor(TOOL, argument_hash, position, i64::MAX).mint(
             ctx.cursor_key,
@@ -248,29 +282,107 @@ fn finish(
     })
 }
 
-/// The family name a row carries, when it is a `family` row. A page cut
-/// before its first family row resumes at the first family: no family name
-/// is empty, so the empty tuple names that position unambiguously.
-fn family_name(row: &Row) -> Option<&str> {
+/// The kinds of row a page carries, in page order. The discriminant is the
+/// tag byte a position tuple starts with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RowKind {
+    Table = 0,
+    Column = 1,
+    IndexedKey = 2,
+    Family = 3,
+}
+
+impl RowKind {
+    const ALL: [RowKind; 4] = [
+        RowKind::Table,
+        RowKind::Column,
+        RowKind::IndexedKey,
+        RowKind::Family,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            RowKind::Table => "table",
+            RowKind::Column => "column",
+            RowKind::IndexedKey => "indexed_key",
+            RowKind::Family => "family",
+        }
+    }
+}
+
+/// The kind and name a row carries.
+fn kind_and_name(row: &Row) -> Option<(RowKind, &str)> {
     match (row.first(), row.get(1)) {
-        (Some(Cell::Str(kind)), Some(Cell::Str(name))) if kind == "family" => Some(name),
+        (Some(Cell::Str(kind)), Some(Cell::Str(name))) => RowKind::ALL
+            .into_iter()
+            .find(|candidate| candidate.name() == kind)
+            .map(|kind| (kind, name.as_str())),
         _ => None,
     }
 }
 
-/// The keyset lower bound a cursor's position names: `None` before the
-/// first family. Anything this tool does not mint is
-/// [`CursorError::Invalid`], since the MAC already vouched for the token.
-fn after_name(position: &CursorPosition) -> Result<Option<String>, CursorError> {
+/// Where a later page resumes: after the row of `kind` named `name`.
+#[derive(Debug, PartialEq, Eq)]
+struct Resume {
+    kind: RowKind,
+    name: String,
+}
+
+impl Resume {
+    /// The position tuple: the kind's tag byte, then the name's bytes.
+    fn tuple(&self) -> Vec<u8> {
+        let mut tuple = vec![self.kind as u8];
+        tuple.extend_from_slice(self.name.as_bytes());
+        tuple
+    }
+
+    /// The name rows of `kind` must sort after, when the position is inside
+    /// that kind.
+    fn after(&self, kind: RowKind) -> Option<&str> {
+        (self.kind == kind).then_some(self.name.as_str())
+    }
+
+    /// Refuse a position inside the columns or the indexed keys whose name
+    /// the later page's own list no longer holds: that list changed since
+    /// the position was taken, so resuming would not continue page one's.
+    fn still_listed(&self, outcome: &DescribeOutcome) -> Result<(), Failure> {
+        let listed = match self.kind {
+            RowKind::Column => outcome
+                .fixed_columns
+                .iter()
+                .chain(&outcome.declared_columns)
+                .any(|column| column.name == self.name),
+            RowKind::IndexedKey => outcome.indexed_keys.contains(&self.name),
+            RowKind::Table | RowKind::Family => true,
+        };
+        if listed {
+            return Ok(());
+        }
+        Err(Failure {
+            class: FailureClass::CursorExpired,
+            message: format!(
+                "cursor has expired: the {} {:?} it resumes after is no longer listed",
+                self.kind.name(),
+                self.name
+            ),
+            counter: None,
+        })
+    }
+}
+
+/// The resumption point a cursor's position names. Anything this tool does
+/// not mint is [`CursorError::Invalid`], since the MAC already vouched for
+/// the token.
+fn resume_point(position: &CursorPosition) -> Result<Resume, CursorError> {
     match position {
-        CursorPosition::Keyset { tuple, order_by } if order_by == &[ORDER_BY] => {
-            if tuple.is_empty() {
-                Ok(None)
-            } else {
-                String::from_utf8(tuple.clone())
-                    .map(Some)
-                    .map_err(|_| CursorError::Invalid)
-            }
+        CursorPosition::Keyset { tuple, order_by } if order_by == &ORDER_BY => {
+            let (&tag, name) = tuple.split_first().ok_or(CursorError::Invalid)?;
+            let kind = RowKind::ALL
+                .into_iter()
+                .find(|kind| *kind as u8 == tag)
+                .ok_or(CursorError::Invalid)?;
+            let name = String::from_utf8(name.to_vec()).map_err(|_| CursorError::Invalid)?;
+            Ok(Resume { kind, name })
         }
         _ => Err(CursorError::Invalid),
     }
@@ -285,7 +397,7 @@ fn table_row(name: &str, outcome: &DescribeOutcome) -> Row {
         None => Value::Null,
     };
     row(
-        "table",
+        RowKind::Table.name(),
         &outcome.table,
         json!({
             "signal": name,
@@ -300,30 +412,54 @@ fn table_row(name: &str, outcome: &DescribeOutcome) -> Row {
     )
 }
 
-fn column_rows(outcome: &DescribeOutcome) -> impl Iterator<Item = Row> + '_ {
+/// The fixed and declared columns whose names sort after `after` (all of
+/// them for `None`), in byte order.
+fn column_rows(outcome: &DescribeOutcome, after: Option<&str>) -> Vec<Row> {
     let fixed = outcome.fixed_columns.iter().map(|column| (column, false));
     let declared = outcome.declared_columns.iter().map(|column| (column, true));
-    fixed.chain(declared).map(|(column, declared)| {
-        row(
-            "column",
-            &column.name,
-            json!({
-                "type": column.data_type,
-                "nullable": column.nullable,
-                "declared": declared,
-            }),
-        )
-    })
+    let mut columns: Vec<_> = fixed
+        .chain(declared)
+        .filter(|(column, _)| sorts_after(&column.name, after))
+        .collect();
+    columns.sort_by(|(a, _), (b, _)| a.name.as_bytes().cmp(b.name.as_bytes()));
+    columns
+        .into_iter()
+        .map(|(column, declared)| {
+            row(
+                RowKind::Column.name(),
+                &column.name,
+                json!({
+                    "type": column.data_type,
+                    "nullable": column.nullable,
+                    "declared": declared,
+                }),
+            )
+        })
+        .collect()
 }
 
-fn indexed_key_rows(outcome: &DescribeOutcome) -> impl Iterator<Item = Row> + '_ {
-    outcome.indexed_keys.iter().map(|key| {
-        row(
-            "indexed_key",
-            key,
-            json!({ "source": outcome.indexed_keys_source }),
-        )
-    })
+/// The indexed keys whose names sort after `after` (all of them for
+/// `None`), in byte order.
+fn indexed_key_rows(outcome: &DescribeOutcome, after: Option<&str>) -> Vec<Row> {
+    let mut keys: Vec<_> = outcome
+        .indexed_keys
+        .iter()
+        .filter(|key| sorts_after(key, after))
+        .collect();
+    keys.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    keys.into_iter()
+        .map(|key| {
+            row(
+                RowKind::IndexedKey.name(),
+                key,
+                json!({ "source": outcome.indexed_keys_source }),
+            )
+        })
+        .collect()
+}
+
+fn sorts_after(name: &str, after: Option<&str>) -> bool {
+    after.is_none_or(|after| name.as_bytes() > after.as_bytes())
 }
 
 fn family_rows(outcome: &DescribeOutcome) -> Vec<Row> {
@@ -332,7 +468,7 @@ fn family_rows(outcome: &DescribeOutcome) -> Vec<Row> {
         .iter()
         .map(|family| {
             row(
-                "family",
+                RowKind::Family.name(),
                 &family.name,
                 json!({
                     "type": family.kind,
@@ -460,13 +596,77 @@ mod tests {
         block_on(run(args, ctx, backend))
     }
 
-    fn family_names(envelope: &Envelope) -> Vec<String> {
+    fn names_of(envelope: &Envelope, kind: RowKind) -> Vec<String> {
         envelope
             .data
             .rows
             .iter()
-            .filter_map(|row| family_name(row).map(str::to_string))
+            .filter_map(kind_and_name)
+            .filter(|(row_kind, _)| *row_kind == kind)
+            .map(|(_, name)| name.to_string())
             .collect()
+    }
+
+    fn family_names(envelope: &Envelope) -> Vec<String> {
+        names_of(envelope, RowKind::Family)
+    }
+
+    fn keyset(kind: RowKind, name: &str) -> CursorPosition {
+        CursorPosition::Keyset {
+            tuple: Resume {
+                kind,
+                name: name.to_string(),
+            }
+            .tuple(),
+            order_by: vec!["kind".to_string(), "name".to_string()],
+        }
+    }
+
+    /// A logs outcome with `columns` declared columns and `keys` indexed
+    /// keys, each name padded wide enough that a few thousand of them are
+    /// over the byte cap. The names are generated out of byte order so the
+    /// page's own sort is what orders them.
+    fn wide_logs(
+        columns: usize,
+        keys: usize,
+        declared: Vec<DeclaredColumn>,
+        now_ns: i64,
+    ) -> DescribeOutcome {
+        let wide = |prefix: &str, index: usize| format!("{prefix}_{index:04}_{}", "x".repeat(80));
+        let mut logs = outcome(&[], false, now_ns);
+        logs.table = "logs".to_string();
+        logs.families_total = 0;
+        logs.families_absent_reason = Some("families are a metrics concept".to_string());
+        logs.declared_columns = (0..columns)
+            .rev()
+            .map(|index| DescribedColumn {
+                name: wide("attr", index),
+                data_type: "Utf8".to_string(),
+                nullable: true,
+            })
+            .collect();
+        logs.indexed_keys = (0..keys).rev().map(|index| wide("key", index)).collect();
+        logs.indexed_keys_source = "tenant_key_index".to_string();
+        logs.declared_column_set = declared;
+        logs
+    }
+
+    /// Every page of the sequence that starts with `one`, page one included,
+    /// against a backend holding one outcome per later call.
+    fn drain(one: Envelope, ctx: &ToolContext<'_>, backend: &Stub) -> Vec<Envelope> {
+        let mut pages = vec![one];
+        while let Some(token) = pages
+            .last()
+            .and_then(|page| page.presentation.cursor.clone())
+        {
+            assert!(pages.len() < 20, "the sequence does not end");
+            pages.push(call(
+                json!({"signal": "logs", "cursor": token}),
+                ctx,
+                backend,
+            ));
+        }
+        pages
     }
 
     fn cursor_of(envelope: &Envelope) -> String {
@@ -522,14 +722,16 @@ mod tests {
         assert_eq!(described.len(), 1);
         assert_eq!(described[0].limit, FAMILIES_PER_PAGE);
         assert_eq!(described[0].after_name, None);
-        assert_eq!(described[0].now_ns, ctx.now_ns);
+        assert_eq!(described[0].resolve_at_ns, ctx.now_ns);
+        assert_eq!(described[0].caller_now_ns, ctx.now_ns);
     }
 
     /// FLIP: a body that paged by offset, or that resolved page two at its
     /// own clock, sends page two's request with no `after_name` or with the
-    /// later `now_ns`; one that re-measured the watermark reports page two's
-    /// newer hour; one that served a cursor on the complete last page
-    /// returns a third cursor.
+    /// later `resolve_at_ns`; one that handed the mint instant on as the
+    /// caller's clock sends page one's instant as `caller_now_ns`; one that
+    /// re-measured the watermark reports page two's newer hour; one that
+    /// served a cursor on the complete last page returns a third cursor.
     #[test]
     fn a_later_page_resumes_after_the_last_name_at_the_mint_instant_with_page_one_pins() {
         let key = key();
@@ -545,13 +747,7 @@ mod tests {
         assert!(!one.visibility.pinned);
         let token = cursor_of(&one);
         let decoded = Cursor::decode(&token, &key).expect("the cursor decodes");
-        assert_eq!(
-            decoded.position,
-            CursorPosition::Keyset {
-                tuple: b"fam_099".to_vec(),
-                order_by: vec!["name".to_string()],
-            }
-        );
+        assert_eq!(decoded.position, keyset(RowKind::Family, "fam_099"));
 
         let ctx_two = later(&ctx);
         let two = call(
@@ -562,7 +758,7 @@ mod tests {
         assert_eq!(two.status, Status::OkPage);
         assert!(two.visibility.pinned);
         assert_eq!(family_names(&two), names(100..200));
-        assert!(two.data.rows.iter().all(|row| family_name(row).is_some()));
+        assert_eq!(two.data.rows.len(), 100);
         let three = call(
             json!({"signal": "metrics", "cursor": cursor_of(&two)}),
             &ctx_two,
@@ -576,12 +772,16 @@ mod tests {
         assert_eq!(
             described
                 .iter()
-                .map(|request| (request.after_name.clone(), request.now_ns))
+                .map(|request| (
+                    request.after_name.clone(),
+                    request.resolve_at_ns,
+                    request.caller_now_ns
+                ))
                 .collect::<Vec<_>>(),
             vec![
-                (None, ctx.now_ns),
-                (Some("fam_099".to_string()), ctx.now_ns),
-                (Some("fam_199".to_string()), ctx.now_ns),
+                (None, ctx.now_ns, ctx.now_ns),
+                (Some("fam_099".to_string()), ctx.now_ns, ctx_two.now_ns),
+                (Some("fam_199".to_string()), ctx.now_ns, ctx_two.now_ns),
             ]
         );
         for page in [&one, &two, &three] {
@@ -650,27 +850,15 @@ mod tests {
     fn a_changed_declared_column_set_expires_a_logs_cursor() {
         let key = key();
         let ctx = test_context(&key);
-        let logs = |declared: Vec<DeclaredColumn>| {
-            let mut logs = outcome(&[], false, ctx.now_ns);
-            logs.table = "logs".to_string();
-            logs.families_total = 0;
-            logs.families_absent_reason = Some("families are a metrics concept".to_string());
-            logs.declared_columns = (0..4000)
-                .map(|index| DescribedColumn {
-                    name: format!("attr_{index:04}_{}", "x".repeat(80)),
-                    data_type: "Utf8".to_string(),
-                    nullable: true,
-                })
-                .collect();
-            logs.declared_column_set = declared;
-            logs
-        };
         let pinned = vec![DeclaredColumn::new("service", DeclaredType::Str)];
         let changed = vec![
             DeclaredColumn::new("service", DeclaredType::Str),
             DeclaredColumn::new("region", DeclaredType::Str),
         ];
-        let backend = stub(vec![logs(pinned), logs(changed)]);
+        let backend = stub(vec![
+            wide_logs(4000, 0, pinned, ctx.now_ns),
+            wide_logs(4000, 0, changed, ctx.now_ns),
+        ]);
 
         // Four thousand wide column rows are over the byte cap, so page one
         // is cut inside its column rows and carries a cursor.
@@ -679,12 +867,10 @@ mod tests {
         assert!(one.presentation.bytes_cap_hit);
         let decoded = Cursor::decode(&cursor_of(&one), &key).expect("the cursor decodes");
         assert_eq!(decoded.signal, Signal::Logs);
+        let served = names_of(&one, RowKind::Column);
         assert_eq!(
             decoded.position,
-            CursorPosition::Keyset {
-                tuple: Vec::new(),
-                order_by: vec!["name".to_string()],
-            }
+            keyset(RowKind::Column, served.last().expect("a column row"))
         );
 
         let two = call(
@@ -739,9 +925,11 @@ mod tests {
 
     /// FLIP: a body that took the position through a lossy or re-collated
     /// form (lowercasing, a locale-aware comparison key, a lossy UTF-8
-    /// decode) sends a different `after_name` than the bytes it minted.
+    /// decode) sends a different `after_name` than the bytes it minted; one
+    /// that dropped the kind tag, or read an empty or unknown tag as a
+    /// position, accepts a tuple this tool never mints.
     #[test]
-    fn the_keyset_position_is_the_last_name_byte_for_byte() {
+    fn the_keyset_position_is_the_kind_tag_then_the_last_name_byte_for_byte() {
         let key = key();
         let ctx = test_context(&key);
         let page = vec![
@@ -755,11 +943,13 @@ mod tests {
         ]);
         let one = call(json!({"signal": "metrics"}), &ctx, &backend);
         let decoded = Cursor::decode(&cursor_of(&one), &key).expect("the cursor decodes");
+        let mut tuple = vec![3u8];
+        tuple.extend_from_slice("\u{e9}t\u{e9}".as_bytes());
         assert_eq!(
             decoded.position,
             CursorPosition::Keyset {
-                tuple: "\u{e9}t\u{e9}".as_bytes().to_vec(),
-                order_by: vec!["name".to_string()],
+                tuple,
+                order_by: vec!["kind".to_string(), "name".to_string()],
             }
         );
         let _ = call(
@@ -772,24 +962,185 @@ mod tests {
             Some("\u{e9}t\u{e9}")
         );
 
+        let kind_name = || vec!["kind".to_string(), "name".to_string()];
+        for tuple in [vec![3, 0xff, 0xfe], Vec::new(), b"\x04a".to_vec()] {
+            assert_eq!(
+                resume_point(&CursorPosition::Keyset {
+                    tuple: tuple.clone(),
+                    order_by: kind_name(),
+                }),
+                Err(CursorError::Invalid),
+                "{tuple:?}"
+            );
+        }
         assert_eq!(
-            after_name(&CursorPosition::Keyset {
-                tuple: vec![0xff, 0xfe],
+            resume_point(&CursorPosition::RowRange { start: 0, end: 100 }),
+            Err(CursorError::Invalid)
+        );
+        assert_eq!(
+            resume_point(&CursorPosition::Keyset {
+                tuple: b"\x03a".to_vec(),
                 order_by: vec!["name".to_string()],
             }),
             Err(CursorError::Invalid)
         );
+        for (tag, kind) in [
+            (0u8, RowKind::Table),
+            (1, RowKind::Column),
+            (2, RowKind::IndexedKey),
+            (3, RowKind::Family),
+        ] {
+            assert_eq!(
+                resume_point(&CursorPosition::Keyset {
+                    tuple: vec![tag, b'a'],
+                    order_by: kind_name(),
+                }),
+                Ok(Resume {
+                    kind,
+                    name: "a".to_string()
+                })
+            );
+        }
+    }
+
+    /// FLIP: a body that resumed every later page at the families serves no
+    /// column after page one's cut, so the columns come up short; one that
+    /// resumed at the first column repeats page one's on every page and the
+    /// sequence never ends; one whose position dropped the row kind mints a
+    /// tuple that does not start with the column tag.
+    #[test]
+    fn a_page_one_cut_inside_the_columns_serves_every_column_once_in_order() {
+        let key = key();
+        let ctx = test_context(&key);
+        let declared = vec![DeclaredColumn::new("service", DeclaredType::Str)];
+        let logs = || wide_logs(12_000, 3, declared.clone(), ctx.now_ns);
+        let backend = stub((0..20).map(|_| logs()).collect());
+
+        let one = call(json!({"signal": "logs"}), &ctx, &backend);
+        assert!(one.presentation.bytes_cap_hit);
+        let decoded = Cursor::decode(&cursor_of(&one), &key).expect("the cursor decodes");
+        let CursorPosition::Keyset { tuple, .. } = decoded.position else {
+            panic!("a keyset position");
+        };
+        assert_eq!(tuple[0], RowKind::Column as u8);
+
+        let pages = drain(one, &later(&ctx), &backend);
+        assert!(pages.len() >= 3, "{} pages", pages.len());
         assert_eq!(
-            after_name(&CursorPosition::RowRange { start: 0, end: 100 }),
-            Err(CursorError::Invalid)
+            pages
+                .last()
+                .map(|page| (page.status, page.presentation.cursor.clone())),
+            Some((Status::Ok, None))
+        );
+        for later_page in &pages[1..] {
+            assert!(names_of(later_page, RowKind::Table).is_empty());
+        }
+
+        let mut expected: Vec<String> = logs()
+            .fixed_columns
+            .iter()
+            .chain(&logs().declared_columns)
+            .map(|column| column.name.clone())
+            .collect();
+        expected.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let served: Vec<String> = pages
+            .iter()
+            .flat_map(|page| names_of(page, RowKind::Column))
+            .collect();
+        assert_eq!(served.len(), 12_001);
+        assert_eq!(served, expected);
+
+        let mut keys = logs().indexed_keys;
+        keys.sort();
+        let served_keys: Vec<String> = pages
+            .iter()
+            .flat_map(|page| names_of(page, RowKind::IndexedKey))
+            .collect();
+        assert_eq!(served_keys, keys);
+        for page in &pages {
+            let kinds: Vec<RowKind> = page
+                .data
+                .rows
+                .iter()
+                .filter_map(kind_and_name)
+                .map(|(kind, _)| kind)
+                .collect();
+            assert!(kinds.is_sorted(), "rows out of kind order");
+        }
+        let described = backend.described.borrow();
+        assert!(
+            described.iter().all(|request| request.after_name.is_none()),
+            "a column position reached the family keyset"
+        );
+    }
+
+    /// FLIP: a body that resumed at the families after a cut inside the
+    /// indexed keys serves no key on page two; one that resumed at the first
+    /// key repeats page one's last key; one that resumed at the columns
+    /// serves column rows on page two.
+    #[test]
+    fn a_cut_inside_the_indexed_keys_resumes_inside_them() {
+        let key = key();
+        let ctx = test_context(&key);
+        let backend = stub(
+            (0..20)
+                .map(|_| wide_logs(0, 6000, Vec::new(), ctx.now_ns))
+                .collect(),
+        );
+
+        let one = call(json!({"signal": "logs"}), &ctx, &backend);
+        let one_keys = names_of(&one, RowKind::IndexedKey);
+        let last = one_keys.last().expect("page one serves a key").clone();
+        assert_eq!(
+            Cursor::decode(&cursor_of(&one), &key)
+                .expect("the cursor decodes")
+                .position,
+            keyset(RowKind::IndexedKey, &last)
+        );
+
+        let two = call(
+            json!({"signal": "logs", "cursor": cursor_of(&one)}),
+            &later(&ctx),
+            &backend,
+        );
+        assert_eq!(two.status, Status::Ok);
+        assert!(names_of(&two, RowKind::Column).is_empty());
+        let two_keys = names_of(&two, RowKind::IndexedKey);
+        let mut all = wide_logs(0, 6000, Vec::new(), ctx.now_ns).indexed_keys;
+        all.sort();
+        let next = all.iter().position(|name| *name == last).expect("listed") + 1;
+        assert_eq!(two_keys.first(), all.get(next));
+        assert_eq!(two_keys, all[next..next + two_keys.len()]);
+    }
+
+    /// FLIP: a body that resumed by filtering names after the position
+    /// without checking the position is still listed serves page two from
+    /// a key list that changed under it, as `ok`.
+    #[test]
+    fn a_resumption_key_gone_from_the_later_list_expires_the_cursor() {
+        let key = key();
+        let ctx = test_context(&key);
+        let one_outcome = wide_logs(0, 6000, Vec::new(), ctx.now_ns);
+        let backend = stub(vec![one_outcome]);
+        let one = call(json!({"signal": "logs"}), &ctx, &backend);
+        let last = names_of(&one, RowKind::IndexedKey)
+            .last()
+            .expect("page one serves a key")
+            .clone();
+
+        let mut changed = wide_logs(0, 6000, Vec::new(), ctx.now_ns);
+        changed.indexed_keys.retain(|name| *name != last);
+        backend.describe.borrow_mut().push_back(changed);
+        let two = call(
+            json!({"signal": "logs", "cursor": cursor_of(&one)}),
+            &later(&ctx),
+            &backend,
         );
         assert_eq!(
-            after_name(&CursorPosition::Keyset {
-                tuple: b"a".to_vec(),
-                order_by: vec!["kind".to_string()],
-            }),
-            Err(CursorError::Invalid)
+            two.failure.as_ref().map(|failure| failure.class),
+            Some(FailureClass::CursorExpired)
         );
+        assert!(two.data.rows.is_empty());
     }
 
     /// FLIP: a body that dropped the service's absent reason, or that minted

@@ -243,8 +243,9 @@ mod with_mcp {
 
     use ravel_mcp::budget::{McpBudgetConfig, McpEffectiveBudgets, McpRequestBudgets};
     use ravel_mcp::draft::{Draft, EstimateComponent, NoCursorSignal, PageOrder, PinScope};
-    use ravel_mcp::envelope::FailureClass;
+    use ravel_mcp::envelope::{FailureClass, Status};
     use ravel_mcp::service::QueryBackend;
+    use ravel_mcp::tools::{ToolContext, describe_data};
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
     use ravel_query::http::InstantRequest;
     use ravel_server::mcp::ServiceBackend;
@@ -1706,6 +1707,358 @@ mod with_mcp {
         assert_eq!(expired["data"]["rows"], serde_json::json!([]));
 
         client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
+    const NS_PER_SEC: i64 = 1_000_000_000;
+
+    fn wall_now_ns() -> i64 {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is past the epoch");
+        i64::try_from(since_epoch.as_nanos()).expect("the epoch fits an i64")
+    }
+
+    /// Declare `count` string columns as the test tenant's typed attribute
+    /// columns, through the same config write the operator path makes.
+    async fn declare_columns(store: &dyn ObjectStoreBackend, count: usize) {
+        let declared = (0..count)
+            .map(|index| ravel_catalog::DeclaredTypedColumn {
+                key: format!("attr_{index:02}"),
+                ty: ravel_catalog::DeclaredColumnType::Str,
+            })
+            .collect();
+        let config = ravel_catalog::TenantConfig {
+            typed_attr_columns: Some(declared),
+            ..ravel_catalog::TenantConfig::new(ravel_catalog::TenantLifecycleState::Active)
+        };
+        ravel_catalog::set_tenant_config(store, &expected_tenant(), &config, wall_now_ns())
+            .await
+            .expect("tenant config written");
+    }
+
+    /// A `ravel_describe_data` call context at `now_ns` under the
+    /// deployment's default protection horizon, with the response byte cap
+    /// at its floor.
+    fn describe_context(now_ns: i64, key: &ravel_mcp::cursor::CursorKey) -> ToolContext<'_> {
+        let mut budgets = sql_budgets();
+        budgets.max_response_bytes = ravel_mcp::envelope::MAX_RESPONSE_BYTES_FLOOR;
+        ToolContext {
+            tenant_hash: expected_tenant(),
+            now_ns,
+            deadline_ns: now_ns + 60 * NS_PER_SEC,
+            protection_horizon_ns: now_ns
+                + ravel_maintain::GcConfigValues::maintain_defaults().protection_horizon_ns,
+            budgets,
+            cursor_key: key,
+        }
+    }
+
+    /// A started server over `store`, and the backend the describe tool body
+    /// calls.
+    async fn describe_backend(
+        store: &Arc<dyn ObjectStoreBackend>,
+        metrics: Arc<ravel_object_store::StoreMetrics>,
+        config: ServerConfig,
+    ) -> (ravel_server::Running, ServiceBackend) {
+        let running = start_with(config, Arc::clone(store), metrics).await;
+        let service = running
+            .query_service
+            .clone()
+            .expect("a query-serving mode builds one");
+        (running, ServiceBackend::new(service, sql_budgets()))
+    }
+
+    /// The `column` rows' names, in the order the page carries them.
+    fn column_names(page: &ravel_mcp::envelope::Envelope) -> Vec<String> {
+        use ravel_mcp::envelope::Cell;
+        page.data
+            .rows
+            .iter()
+            .filter_map(|row| match (row.first(), row.get(1)) {
+                (Some(Cell::Str(kind)), Some(Cell::Str(name))) if kind == "column" => {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Fixed columns [`Padded`] appends to a logs outcome.
+    const PAD_COLUMNS: usize = 2_500;
+
+    /// The real backend, with [`PAD_COLUMNS`] wide fixed columns appended to
+    /// every logs describe outcome so a logs page one is cut by the response
+    /// byte floor. Without them it never is: the cursor pins the whole
+    /// declared set and is bounded at 4 KiB, while the floor is 256 KiB.
+    /// Fixed columns are not pinned, and the request reaches the real service
+    /// unchanged, so the declared-column lookup and both clocks are the
+    /// service's own.
+    struct Padded<'a>(&'a ServiceBackend);
+
+    impl QueryBackend for Padded<'_> {
+        async fn promql_instant(
+            &self,
+            tenant_hash: ravel_types::TenantHash,
+            request: &InstantRequest,
+        ) -> Result<ravel_mcp::envelope::Envelope, ravel_mcp::envelope::Failure> {
+            self.0.promql_instant(tenant_hash, request).await
+        }
+
+        async fn promql_range(
+            &self,
+            tenant_hash: ravel_types::TenantHash,
+            request: &ravel_query::http::RangeRequest,
+        ) -> Result<ravel_mcp::envelope::Envelope, ravel_mcp::envelope::Failure> {
+            self.0.promql_range(tenant_hash, request).await
+        }
+
+        async fn labels(
+            &self,
+            tenant_hash: ravel_types::TenantHash,
+            request: &ravel_query::http::MetadataRequest,
+        ) -> Result<ravel_mcp::envelope::Envelope, ravel_mcp::envelope::Failure> {
+            self.0.labels(tenant_hash, request).await
+        }
+
+        async fn label_values(
+            &self,
+            tenant_hash: ravel_types::TenantHash,
+            request: &ravel_query::http::MetadataRequest,
+            name: &str,
+            include_log_metric_names: bool,
+        ) -> Result<ravel_mcp::envelope::Envelope, ravel_mcp::envelope::Failure> {
+            self.0
+                .label_values(tenant_hash, request, name, include_log_metric_names)
+                .await
+        }
+
+        async fn series(
+            &self,
+            tenant_hash: ravel_types::TenantHash,
+            request: &ravel_query::http::MetadataRequest,
+        ) -> Result<ravel_mcp::envelope::Envelope, ravel_mcp::envelope::Failure> {
+            self.0.series(tenant_hash, request).await
+        }
+
+        async fn analytics(
+            &self,
+            tenant_hash: ravel_types::TenantHash,
+            request: &ravel_mcp::envelope::AnyJson,
+        ) -> Result<ravel_mcp::envelope::Envelope, ravel_mcp::envelope::Failure> {
+            self.0.analytics(tenant_hash, request).await
+        }
+
+        async fn exemplars(
+            &self,
+            tenant_hash: ravel_types::TenantHash,
+            request: &ravel_mcp::envelope::AnyJson,
+        ) -> Result<ravel_mcp::envelope::Envelope, ravel_mcp::envelope::Failure> {
+            self.0.exemplars(tenant_hash, request).await
+        }
+
+        async fn sql_execute(
+            &self,
+            tenant_hash: ravel_types::TenantHash,
+            request: &ravel_sql::SqlRequest,
+        ) -> Result<Draft, ravel_mcp::envelope::Failure> {
+            self.0.sql_execute(tenant_hash, request).await
+        }
+
+        async fn trace_lookup(
+            &self,
+            tenant_hash: ravel_types::TenantHash,
+            request: &ravel_mcp::service::TraceLookupRequest,
+        ) -> Result<ravel_mcp::envelope::Envelope, ravel_mcp::envelope::Failure> {
+            self.0.trace_lookup(tenant_hash, request).await
+        }
+
+        async fn sql_explain(
+            &self,
+            tenant_hash: ravel_types::TenantHash,
+            request: &ravel_sql::SqlRequest,
+        ) -> Result<ravel_mcp::draft::ExplainOutcome, ravel_mcp::envelope::Failure> {
+            self.0.sql_explain(tenant_hash, request).await
+        }
+
+        async fn describe_data(
+            &self,
+            tenant_hash: ravel_types::TenantHash,
+            request: &ravel_mcp::service::DescribeRequest,
+        ) -> Result<ravel_mcp::service::DescribeOutcome, ravel_mcp::envelope::Failure> {
+            let mut outcome = self.0.describe_data(tenant_hash, request).await?;
+            if request.signal == ravel_types::Signal::Logs {
+                outcome.fixed_columns.extend((0..PAD_COLUMNS).map(|index| {
+                    ravel_mcp::service::DescribedColumn {
+                        name: format!("pad_{index:04}_{}", "x".repeat(100)),
+                        data_type: "Utf8".to_string(),
+                        nullable: true,
+                    }
+                }));
+            }
+            Ok(outcome)
+        }
+    }
+
+    /// A logs cursor minted at T0 and redeemed at T1, 120 s later on the
+    /// caller's clock, after a typed column was declared between the pages
+    /// through the real config write: the declared-column lookup on page two
+    /// runs at T1, past its 60 s freshness horizon, sees the new column, and
+    /// the cursor expires with no rows served.
+    ///
+    /// FLIP: handing the backdated resolve instant (T0) to the declared-column
+    /// lookup finds the entry page one stamped at T0 still fresh, keeps the
+    /// old set, and serves page two against a declaration that has moved.
+    #[tokio::test]
+    async fn a_logs_cursor_expires_on_a_column_declared_between_pages_past_the_horizon() {
+        let (store, metrics) = instrumented_memory();
+        declare_columns(store.as_ref(), 3).await;
+        let (running, service) = describe_backend(&store, metrics, server_config(mcp_on())).await;
+        let backend = Padded(&service);
+        let key = ravel_mcp::cursor::CursorKey::from_process_secret(
+            [0x41; ravel_mcp::cursor::CURSOR_KEY_LEN],
+        );
+        let t1 = wall_now_ns();
+        let t0 = t1 - 120 * NS_PER_SEC;
+
+        let one = describe_data::run(
+            serde_json::json!({"signal": "logs"}),
+            &describe_context(t0, &key),
+            &backend,
+        )
+        .await;
+        assert_eq!(one.status, Status::OkPage, "{:?}", one.failure);
+        let declared_on_page_one: Vec<String> = column_names(&one)
+            .into_iter()
+            .filter(|name| name.starts_with("attr_"))
+            .collect();
+        assert_eq!(declared_on_page_one, ["attr_00", "attr_01", "attr_02"]);
+        let cursor = one.presentation.cursor.clone().expect("page one cursor");
+
+        declare_columns(store.as_ref(), 4).await;
+
+        let two = describe_data::run(
+            serde_json::json!({"signal": "logs", "cursor": cursor}),
+            &describe_context(t1, &key),
+            &backend,
+        )
+        .await;
+        assert_eq!(two.status, Status::Error);
+        assert_eq!(
+            two.failure.as_ref().map(|failure| failure.class),
+            Some(FailureClass::CursorExpired),
+            "{:?}",
+            two.failure
+        );
+        assert!(two.data.rows.is_empty());
+
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// Every `kind=query` record on the test tenant's query-audit shard.
+    async fn query_audit_records(store: &dyn ObjectStoreBackend) -> Vec<ravel_logseg::LogRecord> {
+        use ravel_commit::{keys, record};
+        use ravel_logseg::{Predicate, RlogConfig, RlogReader};
+        use ravel_object_store::{GetRange, list_all};
+
+        let prefix = keys::commit_shard_prefix(
+            &expected_tenant(),
+            ravel_types::Signal::Audit,
+            ravel_maintain::QUERY_AUDIT_SHARD,
+        )
+        .expect("audit commit prefix");
+        let config = RlogConfig::default();
+        let mut out = Vec::new();
+        for meta in list_all(store, &prefix).await.expect("list audit commits") {
+            let commit = store
+                .get(&meta.key, GetRange::Full)
+                .await
+                .expect("get commit");
+            let commit = record::decode(&commit.data).expect("decode commit");
+            let data_key = keys::reconstruct_data_key(&commit).expect("data key");
+            let object = store
+                .get(&data_key, GetRange::Full)
+                .await
+                .expect("get data");
+            let reader = RlogReader::new(object.data.as_ref(), &config).expect("rlog reader");
+            let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+            out.extend(
+                rows.into_iter()
+                    .filter(|row| audit_attr(row, "kind") == Some("query")),
+            );
+        }
+        out
+    }
+
+    fn audit_attr<'a>(row: &'a ravel_logseg::LogRecord, key: &str) -> Option<&'a str> {
+        row.attrs
+            .iter()
+            .find(|(name, _)| name == key)
+            .and_then(|(_, value)| match value {
+                ravel_logseg::AttrValue::Str(text) => Some(text.as_str()),
+                _ => None,
+            })
+    }
+
+    /// A later metrics page redeemed at T1 writes its audit record at T1, the
+    /// caller's clock, both as the record's timestamp and as its window end,
+    /// while the cursor it redeemed was minted at T0.
+    ///
+    /// FLIP: stamping the audit record with the backdated resolve instant
+    /// writes page two at T0, and both records carry T0.
+    #[tokio::test]
+    async fn a_later_describe_page_is_audited_at_the_callers_clock() {
+        let (store, metrics) = instrumented_memory();
+        let names: Vec<String> = (0..150).map(|index| format!("m_{index:03}")).collect();
+        write_families(store.as_ref(), &names).await;
+        let mut config = server_config(mcp_on());
+        config.audit_pipeline = Some(ravel_maintain::AuditPipelineConfig {
+            audit_mode: ravel_maintain::AuditMode::Required,
+            ..Default::default()
+        });
+        let (running, backend) = describe_backend(&store, metrics, config).await;
+        let key = ravel_mcp::cursor::CursorKey::from_process_secret(
+            [0x42; ravel_mcp::cursor::CURSOR_KEY_LEN],
+        );
+        let t1 = wall_now_ns();
+        let t0 = t1 - 120 * NS_PER_SEC;
+
+        let one = describe_data::run(
+            serde_json::json!({"signal": "metrics"}),
+            &describe_context(t0, &key),
+            &backend,
+        )
+        .await;
+        assert_eq!(one.status, Status::OkPage, "{:?}", one.failure);
+        let two = describe_data::run(
+            serde_json::json!({
+                "signal": "metrics",
+                "cursor": one.presentation.cursor.clone().expect("page one cursor"),
+            }),
+            &describe_context(t1, &key),
+            &backend,
+        )
+        .await;
+        assert_eq!(two.status, Status::Ok, "{:?}", two.failure);
+        assert_eq!(two.visibility.snapshot_id, one.visibility.snapshot_id);
+
+        let mut stamps: Vec<(i64, Option<String>)> = query_audit_records(store.as_ref())
+            .await
+            .iter()
+            .filter(|row| audit_attr(row, "query.language") == Some("describe_data"))
+            .map(|row| {
+                (
+                    row.ts_ns,
+                    audit_attr(row, "query.window_end_ns").map(str::to_string),
+                )
+            })
+            .collect();
+        stamps.sort_unstable();
+        assert_eq!(
+            stamps,
+            vec![(t0, Some(t0.to_string())), (t1, Some(t1.to_string()))]
+        );
+
         running.shutdown().await.expect("server stops");
     }
 }

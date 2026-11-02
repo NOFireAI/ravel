@@ -2111,7 +2111,8 @@ mod describe_data {
             signal: signal.to_string(),
             after_name: None,
             limit: None,
-            now_ns: NOW_NS,
+            resolve_at_ns: NOW_NS,
+            caller_now_ns: NOW_NS,
             deadline: Duration::from_secs(30),
         }
     }
