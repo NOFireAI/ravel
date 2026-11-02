@@ -90,17 +90,29 @@ mod tests {
     /// empty, would answer a query the caller did not write.
     #[test]
     fn a_start_after_the_end_is_invalid_argument() {
-        let failure = window(&range("2026-09-12T10:00:01Z", "2026-09-12T10:00:00Z"))
-            .expect_err("reversed");
+        let failure =
+            window(&range("2026-09-12T10:00:01Z", "2026-09-12T10:00:00Z")).expect_err("reversed");
         assert_eq!(failure.class, FailureClass::InvalidArgument);
         assert_eq!(
             failure.message,
             "time_range.start_ns must not be after time_range.end_ns"
         );
         let empty = window(&range("7", "7")).expect("an empty window is a window");
-        assert_eq!(empty, ravel_types::TimeRange { start_ns: 7, end_ns: 7 });
+        assert_eq!(
+            empty,
+            ravel_types::TimeRange {
+                start_ns: 7,
+                end_ns: 7
+            }
+        );
         let mixed = window(&range("1970-01-01T00:00:00Z", "9")).expect("mixed spellings");
-        assert_eq!(mixed, ravel_types::TimeRange { start_ns: 0, end_ns: 9 });
+        assert_eq!(
+            mixed,
+            ravel_types::TimeRange {
+                start_ns: 0,
+                end_ns: 9
+            }
+        );
     }
 
     /// FLIP: a parser that fell back to zero, to "now", or to a lenient

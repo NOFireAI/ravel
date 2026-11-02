@@ -46,7 +46,11 @@ fn request(args: Value) -> Result<TraceLookupRequest, Failure> {
         });
     }
     let trace_id = parse_trace_id(&input.trace_id)?;
-    let window = input.time_range.as_ref().map(crate::time::window).transpose()?;
+    let window = input
+        .time_range
+        .as_ref()
+        .map(crate::time::window)
+        .transpose()?;
     Ok(TraceLookupRequest { trace_id, window })
 }
 

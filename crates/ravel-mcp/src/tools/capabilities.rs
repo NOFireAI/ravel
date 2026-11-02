@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 
 use crate::catalog::{CapabilitiesInput, tool_catalog};
 use crate::envelope::{
-    AnyJson, Budget, Cell, Column, Envelope, Failure, FailureClass, Row, Status,
+    AnyJson, Budget, Cell, Column, Envelope, Failure, FailureClass, NextStep, Row, Status,
 };
 
 use super::{SERVED_TOOLS, ToolContext};
@@ -127,7 +127,7 @@ fn row(name: &str, value: Value) -> Row {
 
 /// The effective ceilings this call resolved to, in the same spelling the
 /// envelope's `budget.effective` block uses.
-fn budget_ceilings(ctx: &ToolContext<'_>) -> Value {
+pub(super) fn budget_ceilings(ctx: &ToolContext<'_>) -> Value {
     let budgets = &ctx.budgets;
     json!({
         "max_rows": budgets.max_rows,
@@ -187,6 +187,15 @@ fn invalid_argument(message: String, ctx: &ToolContext<'_>) -> Envelope {
 /// started is also rendered here and under-reports what it read, because
 /// `ServiceError` carries no accounting.
 pub(super) fn refused(failure: Failure, ctx: &ToolContext<'_>) -> Envelope {
+    refused_with(failure, Vec::new(), ctx)
+}
+
+/// [`refused`], with the `next_steps` that say what to send instead.
+pub(super) fn refused_with(
+    failure: Failure,
+    next_steps: Vec<NextStep>,
+    ctx: &ToolContext<'_>,
+) -> Envelope {
     let envelope = Envelope {
         status: Status::Error,
         failure: Some(failure),
@@ -196,6 +205,7 @@ pub(super) fn refused(failure: Failure, ctx: &ToolContext<'_>) -> Envelope {
             estimate: AnyJson(Value::Object(Map::new())),
             estimate_is_upper_envelope: false,
         },
+        next_steps,
         ..Envelope::default()
     };
     envelope.fit(ctx.budgets.max_response_bytes).finish(false)
@@ -243,18 +253,23 @@ mod tests {
             .clone();
         assert_eq!(rows[0][1]["revisions"], json!(["2026-07-28", "2025-11-25"]));
         // Served and catalogued are separate lists, and the exact split is
-        // what this build does today: two bodies, seven declared names that
+        // what this build does today: four bodies, five declared names that
         // refuse every call.
         assert_eq!(
             rows[1][1]["enabled"],
-            json!(["ravel_capabilities", "ravel_get_trace"])
+            json!([
+                "ravel_capabilities",
+                "ravel_find_labels",
+                "ravel_explain_query",
+                "ravel_get_trace"
+            ])
         );
         assert_eq!(
             rows[1][1]["catalogued"]
                 .as_array()
                 .expect("catalogued tool list")
                 .len(),
-            7
+            5
         );
         assert_eq!(rows[3][1]["hash"], json!(ctx.tenant_hash.to_hex()));
         assert_eq!(rows[4][1]["enabled"], json!(["metrics", "logs", "traces"]));
