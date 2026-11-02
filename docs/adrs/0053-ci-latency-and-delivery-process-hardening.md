@@ -71,7 +71,8 @@ structurally instead of procedurally.
 ### D2. Correct the required-check set
 
 `coverage` leaves the required set and stops running on PRs
-entirely; it runs on pushes to main (badge and JSON artifact unchanged,
+entirely, except on request through the run-coverage label amendment
+below; it runs on pushes to main (badge and JSON artifact unchanged,
 and given a floor by the main-push coverage ratchet amendment below) and
 its double test execution collapses to one `--no-report` run followed
 by two `report` invocations. `k8s-integration` joins the required set, but
@@ -219,7 +220,9 @@ that blocks merges, and a duplicated workspace test run sitting on the
 merge critical path D2 just cut from 22-26m to 13-17m. Nothing observed
 since changes that price, and this amendment does not pay it. No
 coverage measurement returns to pull requests, the merge queue, or the
-required-check set. The PR-blocking critical path is untouched.
+required-check set (a pull request now runs it only on request, outside
+the required set: see the run-coverage label amendment below). The
+PR-blocking critical path is untouched.
 
 What the rejection did not price is the failure mode J-7 names: on
 main, the number can decay for weeks and nothing raises its hand. The
@@ -229,7 +232,8 @@ amendment makes the existing main-push visibility self-alarming.
 ### Decision
 
 The main-push `coverage` job (D2) gains a ratchet step after it renders
-`coverage.json`. No new job, no new test execution, no PR trigger.
+`coverage.json`. No new job, no new test execution, no PR trigger (the
+run-coverage label amendment below adds an opt-in one).
 
 - The job stores a full-precision baseline (workspace line-coverage
   percent plus the main SHA that produced it) as a second file in the
@@ -417,3 +421,30 @@ dependencies cold; the leg timeout is 45 minutes for that case. The cache
 key names the profile, so that entry is written; a profile change that
 kept the old key would restore the old subtree on every run and never
 save the new one.
+
+## Amendment: the run-coverage label and coverage on the ci profile
+
+<!-- amendment-applies: sections="D2. Correct the required-check set|Amendment: main-push coverage ratchet" pointer="run-coverage label amendment" -->
+
+Dated 2026-11-02. Tracked in issue #3674.
+
+The `coverage` job failed on every push to main from 2026-10-27, because
+`cargo llvm-cov --no-report --workspace` under the `dev` profile ran the
+runner out of disk: one run started with 89,520 MiB free, its cleanup freed
+19,472 MiB more, and it still fell to 37 MiB. The job now builds under the
+`ci` profile, which differs from `dev` only in carrying no debug info.
+Instrumented coverage keeps its mapping in its own object sections, so this
+changes what the job stores, not what it measures. Both `report` calls take
+the same profile.
+
+Because the job ran only after a merge, no pull request could show a change
+to it working. A pull request carrying the `run-coverage` label now runs the
+job too, the way `run-k8s` gates the kind lane. It stays out of the
+required-check set and off the PR-blocking critical path that D2 cut, and a
+pull request without the label runs it no more than before. The label has to
+be on the pull request before the push that triggers the run, since the
+workflow does not run on a label event.
+
+The first labelled run (41456540729) built cold, kept at least 54,757 MiB
+free, and finished in 54 minutes. The job's timeout rises from 60 to 75
+minutes so a cold run can finish and save its cache.
