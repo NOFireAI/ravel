@@ -1209,6 +1209,8 @@ impl Visitor for WriteFinder<'_> {
         if let Some(kind) = write_kind(body) {
             return self.refuse(ValidationError::WriteInQuery { kind });
         }
+        // Empty on purpose: the destructure exists only so a field a new
+        // sqlparser adds to `OrderBy` fails to compile until it is reviewed.
         if let Some(OrderBy {
             // Sort keys and INTERPOLATE (ClickHouse gap filling) only order
             // or fill the rows read.

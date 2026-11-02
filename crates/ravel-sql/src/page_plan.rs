@@ -773,6 +773,9 @@ fn parse_query(sql: &str) -> Result<Query, PagePlanError> {
 /// `SELECT ... INTO` is refused on the same reasoning one level down: it is a
 /// write, and the wrap re-emits it once per page.
 ///
+/// The `SELECT ... INTO` and lock-clause arms are reached only by a direct
+/// call: `plan_page` runs `validate_query` first, which refuses both.
+///
 /// The pipe check is keyed on a pipe being PRESENT rather than on a list of
 /// pipe kinds, so a kind a later sqlparser adds fails closed.
 fn reject_nested_unpageable_clauses(query: &Query) -> Result<(), PagePlanError> {
