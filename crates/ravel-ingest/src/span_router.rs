@@ -1188,6 +1188,7 @@ mod tests {
                 router.active_set(t, t0).await,
                 Err(SpanWriteError::StaleProvisioningView)
             ));
+            assert_eq!(store.sequence_progress(0), 1, "one GET in the first window");
         }
         assert_eq!(store.sequence_progress(0), 1, "one GET in the first window");
         assert!(matches!(

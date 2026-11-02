@@ -1420,8 +1420,8 @@ mod tests {
                 .await
                 .expect_err("an unread record refuses the write");
             assert!(matches!(err, WriteError::StaleProvisioningView), "{err:?}");
+            assert_eq!(store.sequence_progress(0), 1, "one GET in the first window");
         }
-        assert_eq!(store.sequence_progress(0), 1, "one GET in the first window");
         assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
         let entry = router
             .switch
@@ -1530,8 +1530,26 @@ mod tests {
         assert_eq!(snapshot.provisioning_read_failures_store, 1);
         assert!(router.switch.read_backoff_entry(tenant.hash()).is_some());
 
+        // Past the window the router reads again, and still routes on grace.
+        let next = stale + NS_PER_SEC;
+        clock.0.store(next, Ordering::SeqCst);
+        for _ in 0..K {
+            buffered_write(&router, &tenant, next)
+                .await
+                .expect("still inside the grace horizon");
+        }
+        assert_eq!(
+            store.sequence_progress(0),
+            2,
+            "one more GET after the window"
+        );
+        assert_eq!(
+            router.metrics_snapshot().grace_extended_stale_flushes,
+            2 * K
+        );
+
         let ttl = 60 * NS_PER_SEC;
-        router.evict_idle_generation_views(stale + ttl + 1, ttl);
+        router.evict_idle_generation_views(next + ttl + 1, ttl);
         assert_eq!(
             router.switch.read_backoff_entry(tenant.hash()),
             None,
