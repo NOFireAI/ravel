@@ -77,10 +77,13 @@
 //! one with no reserve-ahead factor and no held release. Every bucket chunk is
 //! charged at its allocated capacity before a row is written to it; the
 //! tables, the per-batch scratch and a bucket's pending output are charged by
-//! their `size()` after each batch. A refused grow fails the stream with the
-//! pool's `ResourcesExhausted`, prefixed with the consumer's name. Nothing
-//! spills. Every byte is released as its bucket is emitted, and all of it
-//! when the stream drops.
+//! their `size()` after each batch. One transient is not charged: under a
+//! TopK, the evaluated bucket batch and the sort's index vector are held
+//! uncharged while `cut_to_topk` runs, at most one bucket's evaluated output
+//! per partition, and only the cut result is charged as pending output. A
+//! refused grow fails the stream with the pool's `ResourcesExhausted`,
+//! prefixed with the consumer's name. Nothing spills. Every byte is released
+//! as its bucket is emitted, and all of it when the stream drops.
 //!
 //! # Yielding and output
 //!
