@@ -46,6 +46,8 @@ DataFusion 55.2 has no hook to give the final aggregate a different group table.
 
 ### 1. `BucketedFinalAggregateExec`, behind `SqlConfig::bucketed_final_aggregation` (off by default)
 
+*Amendment 1 below records what the implementation and the A/B measured against this section; read it with this one.*
+
 A physical optimizer rule replaces `AggregateExec mode=FinalPartitioned` with `BucketedFinalAggregateExec` when every condition below holds. Otherwise the plan is unchanged.
 
 Conditions:
@@ -87,6 +89,8 @@ A differential test runs every ClickBench GROUP BY shape that qualifies, plus fi
 
 ### 3. Memory
 
+*Amendment 1 below records what the implementation and the A/B measured against this section; read it with this one.*
+
 Every byte the exec retains in its buckets is charged before it is retained, to one consumer per partition named `BucketedFinalAggregate[p]`. Phase 1's stock table is the exception, and it is bounded: it is charged by `size()` after each batch, which is the #3181 undercount `AggregateReserveAhead` covers for the stock consumers (`memory.rs:48-57`) and does not cover here, and it holds at most `engage_groups` groups: 65,536 groups at 53 B of keys and state is 3.3 MiB, and with the table's load factor (0.5-0.875) and doubling slack counted as the Context does, the undercount is bounded at about 2 x 3.3 MiB, under 7 MiB per partition.
 
 The pool records charged bytes only. `peak_intermediate_bytes` is the high-water mark of the charged total, and the stock final's consumers are charged at the reserve-ahead factor while this exec's are charged at 1.0, so that figure cannot compare the two arms. PR1 adds `peakAskedIntermediateBytes` to the query stats beside it: the high-water mark of the bytes consumers asked for, before any factor, on both arms alike. That is the memory gate's figure.
@@ -109,6 +113,8 @@ Peak per partition = retained bucket input + one bucket's table and accumulators
 
 ### 4. Exact per-bucket top-k
 
+*Amendment 1 below records what the implementation and the A/B measured against this section; read it with this one.*
+
 When the exec's output reaches a `SortExec` with `fetch = k` through `ProjectionExec` nodes that pass the sort keys as bare columns and through a fetch-less `CoalescePartitionsExec`, each bucket's evaluated output is cut to its own top k before it is emitted. That is `TopKPrefilter::above`'s reach rule (`compact_slices.rs:329-345`), reused as is. Ravel plans with `repartition_sorts(false)` (`session.rs:620`), so the top-k over a 32-partition final is one global `SortExec` above a `CoalescePartitionsExec`, the shape the TopK pre-filter's reach rule is written for (`docs/query-engine.md:1722-1726`, the `tests/compact_slices.rs` q34 shape test), and that is the shape the rule matches; a `preserve_partitioning` sort is not required and never appears here.
 
 It is exact for the reason `compact_slices.rs:141-146` gives for a batch:
@@ -123,6 +129,8 @@ What this buys:
 
 ### 5. Fused routing: only after decision 1 clears its A/B
 
+*Amendment 1 below records what the implementation and the A/B measured against this section; read it with this one.*
+
 The exchange and the bucket router each move every row once. A fused exec that replaces `RepartitionExec(Hash)` and the final together would let each producer:
 - hash once for the partition and the bucket;
 - sort a chunk of rows by (partition, bucket) with one copy;
@@ -135,6 +143,8 @@ This is a separate decision. It needs its own amendment, its own pre-registratio
 What the counters say about it: the exchange holds 0.36 of q33's DRAM misses on main (0.20 of them in the `take_native` scatter, the rest in the per-partition output writes), about as much as the final's probe, and decision 1 leaves it in place. Fusion does not remove those misses; a sorted scatter still writes every row once into fresh chunks, so they move. What it removes is the router copy decision 1 adds, which the 0.36 does not contain. Its measurement needs decision 1's exec as arm A, so it is scheduled after decision 1's A/B, and only if decision 1 passes.
 
 ### 6. Delivery and bands
+
+*Amendment 1 below records what the implementation and the A/B measured against this section; read it with this one.*
 
 Each step is a separate PR. The switch is off in every one of them. Turning it on by default is its own PR, opened only after step 3 passes.
 
@@ -170,6 +180,8 @@ Two more guards:
 
 ## Consequences
 
+*Amendment 1 below records what the implementation and the A/B measured against this section; read it with this one.*
+
 - Off by default. With the switch off, no plan changes, and a test pins plan equality.
 - With it on, eligible fixed-width finals lose overlap with the scan: phase 2 starts only when input ends. That is the cost #25724 measured on its Q12.
 - Ravel carries one aggregate exec of its own until DataFusion ships an equivalent. The DataFusion surfaces it uses (`GroupValues`, `GroupsAccumulator`, `create_hashes`, the `AggregateExec` accessors) are named in a test that fails to compile if any becomes private.
@@ -192,3 +204,36 @@ flowchart TD
   A1 --> TK[SortExec TopK fetch=k]
   T1 --> TK
 ```
+
+## Amendment 1 (2026-11-02): what the implementation and the A/B measured
+
+<!-- amendment-applies: sections="1. `BucketedFinalAggregateExec`, behind `SqlConfig::bucketed_final_aggregation` (off by default)|3. Memory|4. Exact per-bucket top-k|5. Fused routing: only after decision 1 clears its A/B|6. Delivery and bands|Consequences" pointer="amendment 1" -->
+
+Status of this amendment: Accepted. Refs: #3565, #3607, #3608, #3609, #3639. The switch stays off by default.
+
+### Corrections to the decision text
+
+- **Decision 1, chunk slack.** Decision 6's band row said the slack is "under 0.1 GB over 32 x 64 buckets"; it is about 9x that. The q33 shape routes 6 columns at 52 B per row (8 + 4 B of keys; 8 + 8 + 16 + 8 B of state, the integer `avg` state being `Decimal128` plus `Int64`), so one chunk set per bucket is 8192 x 52 + 6 x 1024 = 432,128 B, 26.4 MiB per partition for 64 buckets and 0.885 GB at 32 partitions. The engage routes about 1,024 state rows per bucket, so every bucket allocates its first chunk at once and the 0.885 GB is charged up front (#3565, checkpoint review of #3608). The smallest shape, one Int64 key plus a count, charges 8 MiB per engaged partition, more than the 256 MiB default query ceiling at 32 partitions. `routed_chunk_rows` (default 8192) is revisited in #3639 before any default changes.
+- **Decision 3, the gate figure.** `peakAskedIntermediateBytes` (#3607) is the peak of the bytes live reservations hold before any reserve-ahead factor: a held shrink lowers it while the charge stays held, so it is at most the charged peak and equals it only when no reserve-ahead consumer and no held release took part. Under a TopK the evaluated bucket batch and its sort indices are held uncharged while the cut runs, at most one bucket's evaluated output per partition (#3639 charges it).
+- **Decision 4, what the cut buys.** The per-bucket cut bounds the sort's input to 2^bits x k rows per engaged partition. It does not lower whole-plan peak asked bytes: each bucket's table is charged in full before its output is cut, and buckets run one at a time (measured identical with and without the cut on the q33 shape, #3609). The per-bucket table release belongs to decision 1, not to the cut. The reach rule is `TopKPrefilter::above` as written, so a `preserve_partitioning` sort with a fetch is also cut, which is exact because each partition feeds its own TopK.
+- **Decision 1, `CompactSlices`.** A converted aggregate gets neither half of that rule: the slice compaction, redundant because the exec's output batches own their buffers, and the TopK pre-filter, which decision 4 replaces inside the exec. Between #3628 and #3640 a qualifying `ORDER BY ... LIMIT k` under the switch had no cut at all.
+- **Decision 5, wording.** Fusion does not "hash once": `GroupValues::intern` hashes with the private aggregation seed in phase 2 whatever the exchange does, so decision 1 hashes three times per row and fusion twice. Fusion takes back the router copy decision 1 adds; whether it lowers the exchange's misses (0.36 of q33's on main) or relocates them is what its own A/B would measure. It is not scheduled.
+
+### The A/B
+
+`bfab-20261102T0716Z`, c6a.4xlarge, stage `cpuab`, A = B = main 6df152450, arm B `--sql-bucketed-final-aggregation`, eight lifetimes A B B A B A A B, 1,256 timed calls, medians of the 12 timed calls per arm; pre-registration #3565 comment 6571398126, readout comment 6572771621 and its correction. Validity: every answer `success`, answers identical across arms on all 43 statements, A/A spread on the scan control 0.9%.
+
+| figure | band | miss | result | basis |
+|---|---|---|---|---|
+| q33 server CPU per call, B/A | 0.82-0.90 | > 0.94 | 1.000, MISS | #3565 comment 6572771621 |
+| q33 hot wall, B/A | 0.84-0.95 | > 0.98 | 1.004, MISS | #3565 comment 6572771621 |
+| q33 `peakAskedIntermediateBytes`, B/A | 0.45-0.75 | > 0.85 | 0.623, PASS (9.48 GB to 5.91 GB; charged 11.83 to 5.91; VmHWM 18.25 to 13.65) | #3565 comment 6572771621 |
+| q05, q09, q16, q31, q32, q36 server CPU, B/A | 0.88-1.00 each | > 1.03 | 0.825, 0.894, 0.917, 1.030, 0.999, 0.918: no miss; q05 below the band, q31 at the miss line | #3565 comment 6572771621 |
+| same six, `peakAskedIntermediateBytes` B/A | reported | none | 1.13, 1.63, 1.74, 1.89, 0.84, 3.34: the chunk slack above, visible | #3565 comment 6572771621 |
+| every refused statement, server CPU, B/A | 0.98-1.02 each | > 1.03 | no miss; q25 0.968, q38 0.974, q43 1.029 on 0.1-0.3 s statements | #3565 comment 6572771621 |
+| 43-statement hot sum, B/A | 0.96-0.99 | > 1.01 | 0.996 | #3565 comment 6572771621 |
+| answers | identical except q18, q25 ties | any other difference | identical across arms on all 43 | #3565 comment 6572771621 |
+
+### Decision
+
+On q33, the statement this ADR was written for, bucketing moves the memory and not the time: the latency saving the counters bounded at 0.14 of cycles is spent again on the router copy, the second hash and the chunk writes, within the run's resolution. The CPU wins land on the small fixed-width statements (q05, q09, q16, q36, 0.67 s of the 50 s hot sum) and cost them 1.1-3.3x in asked bytes. Per the pre-registered outcome rule (CPU miss with the memory gate in band), **the switch stays off by default**. The exec, the rule, the stat and the tests stay in the tree behind `SqlConfig::bucketed_final_aggregation` as a measured, reviewed option for an operator who wants q33's peak memory halved at equal CPU. No PR turns it on. Decision 5 is recorded as the only lever left on q33's CPU and is not scheduled. #3639 carries the follow-ups.
