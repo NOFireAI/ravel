@@ -338,7 +338,8 @@ Defaults and floors:
   `presentation.floor_applied` states so.
 - `ravel_describe_data`: 100 metric families per page. An optional
   `cursor` input asks for the next page. The response carries
-  `presentation.cursor` when more families exist. Request the next page
+  `presentation.cursor` when more families exist or when
+  `max_response_bytes` cut the page. Request the next page
   with the same signal and that cursor. The cursor follows the same
   codec, tenant binding, and lifetime as every other cursor. Its
   `budget.actual` counts the catalog resolve only: the metric metadata
@@ -410,15 +411,20 @@ Paging order differs per tool:
 - `ravel_get_trace` mints no cursor as served today: it returns the trace's
   spans in one page, ordered by `start_ts` and `span_id`, and a trace larger
   than the row cap comes back bounded (`row_cap_hit`) rather than paged.
-- `ravel_describe_data` pages its metric families by keyset: the cursor
-  holds the last family name served, and the next page starts after it in
-  byte order, so `Zeta` comes before `alpha`. Each page reads the family
-  list afresh. A family added later whose name sorts before the cursor's
-  position is not returned by any later page, and `families_total` can
-  differ from one page to the next. Every page reports page one's
-  watermark and snapshot id. A newer pending erasure on the same signal,
-  or a change to the typed attribute columns, expires the cursor with
-  `cursor_expired`.
+- `ravel_describe_data` pages by keyset over the row kind and the name:
+  columns first, then indexed keys, then metric families, each sorted by
+  name in byte order, so `Zeta` comes before `alpha`. The cursor holds the
+  last row's kind and name, and the next page starts after it, so a page
+  cut inside the columns continues with the next column. The `table` row
+  is on page one only. Each page reads its lists afresh. A row added later
+  whose name sorts before the cursor's position is not returned by any
+  later page, and `families_total` can differ from one page to the next.
+  Every page reports page one's watermark and snapshot id and resolves at
+  page one's instant. The column lookups, the audit record and the cursor
+  deadline use the time of the call itself. A newer pending erasure on the
+  same signal, a change to the typed attribute columns, or a column or key
+  at the cursor's position that is no longer listed expires the cursor
+  with `cursor_expired`.
 
 The equal-group rule: a page never ends inside a group of equal tuples. If a
 group does not fit on the page whole, the tool drops that whole group from

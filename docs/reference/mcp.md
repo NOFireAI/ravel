@@ -23,7 +23,7 @@ grouping, the envelope fields, and the empty-result checklist.
 | Tool | Purpose | Inputs | Output blocks used | Bounds | Failure classes |
 | --- | --- | --- | --- | --- | --- |
 | `ravel_capabilities` | Protocol and server version, the query catalog's served tools (`tools.enabled`) and declared-but-unserved ones (`tools.catalogued`), effective budget ceilings, dialect summaries, tenant hash, enabled signals. The six Ravel Agents tools appear in `tools/list` only, not in either list | none | `data` | none; reads no data | `unauthorized`, `invalid_argument`, `internal` |
-| `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, exact row counts where available | `signal` (`metrics`, `logs` or `traces`), an optional `cursor` | `data` (`kind`, `name`, `value` rows: `table`, `column`, `indexed_key`, `family`), `scope`, `visibility`, `coverage`, `presentation`, `budget` | 100 metric families per page; the schema declares no budget input, and a page is bounded by `max_response_bytes`, 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `cursor_expired`, `cursor_invalid`, `internal` |
+| `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, committed row count (summed from commit records, before duplicate collapse and pending erasure) | `signal` (`metrics`, `logs` or `traces`), an optional `cursor` | `data` (`kind`, `name`, `value` rows: `table`, `column`, `indexed_key`, `family`), `scope`, `visibility`, `coverage`, `presentation`, `budget` | 100 metric families per page; the schema declares no budget input, and a page is bounded by `max_response_bytes`, 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `cursor_expired`, `cursor_invalid`, `internal` |
 | `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, an optional `filter`, `time_range` (required), `deadline_ms`, `max_response_bytes`. A call carrying neither a selector nor a label name is refused, whatever its filter | `data`, `scope`, `coverage`, `presentation` | at most 2,000 segments admitted for resolution, fewer when the effective `max_segments` is lower; `max_response_bytes` 512 KiB default, 256 KiB floor. No `max_rows`: a page is bounded by bytes, and a page cut short reports through `presentation.bytes_cap_hit` and `presentation.rows_omitted` | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
 | `ravel_explain_query` | Validate a SQL statement, estimate its cost, and return the plan shape. No scan runs. SQL only: see [Explaining a statement](#explaining-a-statement) | `query`, `time_range` (required), `deadline_ms`, `max_response_bytes` | `data` (effective schema as `data.columns`, zero rows), `scope`, `visibility`, `budget` (the estimate beside `effective`), `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `deadline`, `unavailable`, `internal` |
 | `ravel_query_sql` | One `SELECT` over one table | `query`, `time_range` (required), `max_rows`, lowerable budgets, an optional `cursor`, an optional `evidence_ref` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
@@ -437,43 +437,73 @@ rows it has, up to the row cap, with status `ok_bounded` and no cursor.
 ### `ravel_describe_data` pages
 
 `ravel_describe_data` also pages with a cursor. The response carries
-`presentation.cursor` when more families exist. Request the next page
+`presentation.cursor` when a page did not hold every row: more than 100
+families, or rows that `max_response_bytes` cut. Request the next page
 with the same signal and that cursor. The cursor follows the same codec,
 tenant binding, and lifetime as every other cursor, and it is refused as
 `cursor_invalid` by any other tool and by a call naming another signal.
 
-Page one carries one `table` row (segments, committed rows, the event-time
-coverage window, `families_total`), one `column` row per fixed column and
-typed attribute column, one `indexed_key` row per indexed key, then up to 100 `family` rows.
-A later page carries `family` rows only. `committed_rows` is summed from
-commit records, so it counts rows before duplicate collapse and before any
-pending erasure. Logs and traces have no metric families: their page
-carries the other rows and no cursor, and gives the reason in
+Rows come in kind order: one `table` row (segments, committed rows, the
+event-time coverage window, `families_total`), then one `column` row per
+fixed column and typed attribute column, then one `indexed_key` row per
+indexed key, then up to 100 `family` rows. Within each kind, rows sort by
+name in byte order (`Zeta` sorts before `alpha`). The `table` row is on
+page one only. `committed_rows` is summed from commit records, so it
+counts rows before duplicate collapse and before any pending erasure.
+Logs and traces have no metric families, and give the reason in
 `families_absent_reason` and in `warnings`.
 
-The order is keyset: the cursor's position is the last served family
-name's bytes, and the next page returns the families whose names sort
-after it in byte order (`Zeta` sorts before `alpha`). It is not an offset.
-The family list itself is not pinned: each page reads the tenant's
-metric metadata record afresh. A family added after page one whose name
-sorts after the position appears on a later page; one whose name sorts
-before the position is not returned by any later page of that sequence.
-`families_total` is the count in the record the page read, so it can
-differ between pages of one sequence, and a later page says so in
-`warnings`. A page one cut by `max_response_bytes` before its first family
-row resumes at the first family, and the column rows the cut dropped are
-counted in `presentation.rows_omitted` but not served again.
+The order is keyset, `scope.order_by` `["kind", "name"]`: the cursor's
+position is the last served row's kind and name, and the next page
+resumes after it. A cut inside the `column` rows resumes at the next
+column, then serves the indexed keys and the families; a cut inside the
+`indexed_key` rows resumes at the next key, then serves the families; a
+cut inside the `family` rows resumes at the next family. It is not an
+offset.
 
-Page one's freshness watermark is pinned into that cursor, and every later
+A later page reads its column, key and family lists afresh rather than
+from page one:
+
+- The typed attribute columns are pinned. A changed set expires the
+  cursor, as below.
+- Fixed columns are the server's compiled table schema. They change only
+  with the server binary.
+- The logs indexed keys are the tenant's current declaration, and the
+  traces indexed key is `trace_id`. Neither is pinned.
+- The family list is not pinned: each page reads the tenant's metric
+  metadata record again.
+
+When the column or key that a position names is no longer listed, the
+cursor expires (`cursor_expired`) and the page serves no rows. A row added
+after page one whose name sorts after the position appears on a later
+page. One whose name sorts before the position is not returned by any
+later page of that sequence, and nothing reports it.
+`families_total` is the count in the record the page read, so it can
+differ between pages of one sequence. A later page says so in `warnings`.
+
+A logs cursor carries the typed attribute column set, and a cursor is
+bounded at 4 KiB. A tenant whose declared set does not fit gets
+`internal` on a page the byte cap cuts.
+
+Page one's freshness watermark is pinned into that cursor. Every later
 page reports the same value in `visibility.ingest_watermark_hour` and the
-same `visibility.snapshot_id`. A later page resolves at page one's
-instant. The pinned value is page one's measurement. A later page can
+same `visibility.snapshot_id`. A later page runs its catalog resolve at
+page one's instant. The pinned value is page one's measurement. A later page can
 resolve over a superset of page one's segments, because the live listing
-above the fold watermark picks up whatever has committed since. A newer
-pending erasure on the same signal, or a changed set of typed attribute
-columns, expires the cursor (`cursor_expired`) and the page serves no rows; an
-erasure on another signal does not. A resolve that found no segments
-reports no watermark and sets `visibility.resolved_no_segments`.
+above the fold watermark picks up whatever has committed since. Everything
+else on a later page runs on the call's own clock:
+
+- the typed attribute column lookup and its 60-second freshness horizon;
+- the indexed key lookup;
+- the redemption deadline;
+- the query audit record's timestamp and window end.
+
+A column declared between pages is therefore seen once that horizon has
+passed, and the page expires the cursor. A newer pending erasure on the
+same signal, or a changed set of typed attribute columns, expires the
+cursor (`cursor_expired`) and the page serves no rows. An erasure on
+another signal does not. A resolve that found no segments reports no
+watermark and sets `visibility.resolved_no_segments`.
 
 `budget.actual` counts the catalog resolve only. The metric metadata
 record read and the tenant configuration read are not counted, and every
