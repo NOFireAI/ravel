@@ -138,12 +138,28 @@
 //! property is its input's
 //! (`without_the_prefilter_the_exec_reports_its_inputs_properties`).
 //!
-//! The answer is unchanged: a row outside its own batch's top `k` has `k`
-//! rows ahead of it in the same batch, and those reach the same TopK, so it
-//! cannot be in the TopK's result. When several rows tie with the `k`-th
-//! value, which of them survive may differ from the plan without the
-//! pre-filter, as SQL allows for a `LIMIT` under a non-unique ordering
-//! (`prop_topk_prefilter_keeps_the_topk_answer`). The TopK still sees only
+//! The pre-filter ranks rows as the full sort does (`lexsort_to_indices`,
+//! floats in total order, -0.0 below 0.0), and a row outside its own
+//! batch's top `k` has `k` rows ahead of it in the same batch, which reach
+//! the same TopK, so it cannot be in the first `k` rows of the full sort.
+//! Where the TopK returns those rows, the answer is unchanged. When several
+//! rows tie with the `k`-th value, which of them survive may differ from the
+//! plan without the pre-filter, as SQL allows for a `LIMIT` under a
+//! non-unique ordering (`prop_topk_prefilter_keeps_the_topk_answer`).
+//!
+//! DataFusion 55's TopK does not always return them. Its heap ranks a float
+//! key in total order, but its dynamic filter, which it evaluates on each
+//! incoming batch against the heap's current boundary, compares with
+//! `-0.0 = 0.0`. A row that ranks ahead of the boundary only by its zero's
+//! sign is then judged on the next sort key, or dropped when there is none,
+//! so over a float sort key holding both 0.0 and -0.0 the TopK can miss a
+//! row of the full sort's first `k`, with or without the pre-filter, and
+//! which row it returns depends on how its input is cut into batches. The
+//! pre-filter changes that cut, so on such input it can change which wrong
+//! answer the TopK gives
+//! (`datafusions_topk_misses_the_full_sorts_first_row_over_both_zero_signs`).
+//! The pre-filter's own ranking is pinned per batch against the full sort
+//! (`check_typed_topk`). The TopK still sees only
 //! batches that own their buffers: a taken batch goes through the same
 //! compaction, since `take` of a byte-view or Dictionary column keeps the
 //! source buffers (`the_topk_prefilter_copies_only_k_rows_per_batch`). A
@@ -2573,12 +2589,13 @@ mod tests {
 
     /// The exactness rule over rows of any shape: the TopK's answer `with`
     /// the pre-filter, which dropped `dropped` rows, against its answer
-    /// `without` over `input`, one inner `Vec` per batch. Both answers have
-    /// the same sort-key sequence (`key_of`) always, `with` holds only input
-    /// rows and none twice (`id_of`), and the two hold the same rows when
-    /// every input row tied with the `k`-th key is in `without`. Rows tied
-    /// with the `k`-th key past the cut may be swapped for each other, as
-    /// SQL allows for a `LIMIT` under a non-unique ordering.
+    /// `without` over `input`, one inner `Vec` per batch. `with` has the
+    /// shape `assert_topk_answer_shape` checks (`id_of` names a row), both
+    /// answers have the same sort-key sequence (`key_of`), and the two hold
+    /// the same rows when every input row tied with the `k`-th key is in
+    /// `without`. Rows tied with the `k`-th key past the cut may be swapped
+    /// for each other, as SQL allows for a `LIMIT` under a non-unique
+    /// ordering.
     #[allow(clippy::too_many_arguments)]
     fn assert_same_topk_answer<R, K>(
         input: &[Vec<R>],
@@ -2593,25 +2610,13 @@ mod tests {
         R: Clone + fmt::Debug + Ord,
         K: fmt::Debug + PartialEq,
     {
-        let all: Vec<R> = input.iter().flatten().cloned().collect();
-        let expected_dropped: usize = input
-            .iter()
-            .map(|rows| rows.len().saturating_sub(fetch))
-            .sum();
-        prop_assert_eq!(dropped, expected_dropped, "the pre-filter fired");
-        prop_assert_eq!(with.len(), fetch.min(all.len()));
+        assert_topk_answer_shape(input, with, dropped, fetch, id_of)?;
         prop_assert_eq!(
             with.iter().map(&key_of).collect::<Vec<_>>(),
             without.iter().map(&key_of).collect::<Vec<_>>(),
             "the sort-key sequence"
         );
-        for row in with {
-            prop_assert!(all.contains(row), "{:?} is an input row", row);
-        }
-        let mut ids: Vec<i64> = with.iter().map(&id_of).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        prop_assert_eq!(ids.len(), with.len(), "no row twice");
+        let all: Vec<R> = input.iter().flatten().cloned().collect();
         if let Some(last) = without.last() {
             let kth = key_of(last);
             let in_input = all.iter().filter(|row| key_of(row) == kth).count();
@@ -2624,6 +2629,41 @@ mod tests {
                 prop_assert_eq!(with_sorted, without_sorted, "the same rows");
             }
         }
+        Ok(())
+    }
+
+    /// The part of the exactness rule that holds whatever the TopK above
+    /// ranks: the pre-filter dropped every row past each batch's `k`-th,
+    /// and `with` holds `k` input rows (all of them when there are fewer),
+    /// none twice.
+    fn assert_topk_answer_shape<R>(
+        input: &[Vec<R>],
+        with: &[R],
+        dropped: usize,
+        fetch: usize,
+        id_of: impl Fn(&R) -> i64,
+    ) -> Result<(), TestCaseError>
+    where
+        R: fmt::Debug + PartialEq,
+    {
+        let expected_dropped: usize = input
+            .iter()
+            .map(|rows| rows.len().saturating_sub(fetch))
+            .sum();
+        prop_assert_eq!(dropped, expected_dropped, "the pre-filter fired");
+        let rows = input.iter().map(Vec::len).sum::<usize>();
+        prop_assert_eq!(with.len(), fetch.min(rows));
+        for row in with {
+            prop_assert!(
+                input.iter().flatten().any(|r| r == row),
+                "{:?} is an input row",
+                row
+            );
+        }
+        let mut ids: Vec<i64> = with.iter().map(&id_of).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        prop_assert_eq!(ids.len(), with.len(), "no row twice");
         Ok(())
     }
 
@@ -2891,8 +2931,12 @@ mod tests {
             .collect()
     }
 
-    /// The exactness rule (`assert_same_topk_answer`) for `a` of `key_type`,
-    /// alone or followed by the Utf8 `b`, over `batches` of domain indices.
+    /// The exactness rule for `a` of `key_type`, alone or followed by the
+    /// Utf8 `b`, over `batches` of domain indices. The pre-filter alone keeps
+    /// each batch's first `k` rows of the full sort, by sort key. The TopK's
+    /// answer with it has the shape `assert_topk_answer_shape` checks and,
+    /// unless `a` holds both zero signs, the full sort's first `k` sort keys
+    /// and the answer without it (`assert_same_topk_answer`).
     fn check_typed_topk(
         key_type: KeyType,
         batches: Vec<Vec<(Option<usize>, Option<usize>)>>,
@@ -2950,9 +2994,92 @@ mod tests {
             let rows: Vec<TypedRow> = out.iter().flat_map(typed_batch_to_rows).collect();
             (rows, dropped)
         };
+        for batch in &record_batches {
+            if batch.num_rows() <= fetch {
+                continue;
+            }
+            let kept: Vec<TypedRow> = prefilter_alone(batch, &ordering, fetch)
+                .iter()
+                .flat_map(typed_batch_to_rows)
+                .collect();
+            let first: Vec<TypedRow> = full_sort(std::slice::from_ref(batch), &ordering)
+                .iter()
+                .flat_map(typed_batch_to_rows)
+                .take(fetch)
+                .collect();
+            prop_assert_eq!(
+                kept.iter().map(key_of).collect::<Vec<_>>(),
+                first.iter().map(key_of).collect::<Vec<_>>(),
+                "the pre-filter keeps its batch's first k rows of the full sort"
+            );
+        }
         let (with, dropped) = answer(true);
+        if holds_both_zero_signs(key_type, &input) {
+            return assert_topk_answer_shape(&input, &with, dropped, fetch, |row| row.2);
+        }
         let (without, _) = answer(false);
+        let sorted: Vec<TypedRow> = full_sort(&record_batches, &ordering)
+            .iter()
+            .flat_map(typed_batch_to_rows)
+            .take(fetch)
+            .collect();
+        prop_assert_eq!(
+            with.iter().map(key_of).collect::<Vec<_>>(),
+            sorted.iter().map(key_of).collect::<Vec<_>>(),
+            "the sort-key sequence of the full sort's first k rows"
+        );
         assert_same_topk_answer(&input, &with, dropped, &without, fetch, key_of, |row| row.2)
+    }
+
+    /// True when the `a` column of `input` holds both 0.0 and -0.0. Over
+    /// such input DataFusion 55's TopK is not exact, with or without the
+    /// pre-filter, so the exactness rule has no oracle there (issue #3598,
+    /// `datafusions_topk_misses_the_full_sorts_first_row_over_both_zero_signs`).
+    fn holds_both_zero_signs(key_type: KeyType, input: &[Vec<TypedRow>]) -> bool {
+        let negative_zero = match key_type {
+            KeyType::Float64 => Key::Bits((-0.0f64).to_bits()),
+            KeyType::Float32 => Key::Bits(u64::from((-0.0f32).to_bits())),
+            _ => return false,
+        };
+        let holds = |key: &Key| input.iter().flatten().any(|row| &row.0 == key);
+        holds(&Key::Bits(0)) && holds(&negative_zero)
+    }
+
+    /// `batches` (one partition) sorted whole by `ordering`, as `ORDER BY`
+    /// without a `LIMIT` sorts them.
+    fn full_sort(batches: &[RecordBatch], ordering: &LexOrdering) -> Vec<RecordBatch> {
+        let schema = batches.first().expect("a batch").schema();
+        let source =
+            MemorySourceConfig::try_new_exec(&[batches.to_vec()], schema, None).expect("source");
+        collect_blocking(Arc::new(SortExec::new(ordering.clone(), source)))
+    }
+
+    /// The exec's output over `batch` with the pre-filter on and no TopK
+    /// above it.
+    fn prefilter_alone(
+        batch: &RecordBatch,
+        ordering: &LexOrdering,
+        fetch: usize,
+    ) -> Vec<RecordBatch> {
+        let source = MemorySourceConfig::try_new_exec(&[vec![batch.clone()]], batch.schema(), None)
+            .expect("source");
+        let topk = TopKPrefilter {
+            ordering: ordering.clone(),
+            fetch,
+        };
+        collect_blocking(Arc::new(
+            CompactSlicesExec::new(source).with_topk(Some(topk)),
+        ))
+    }
+
+    fn collect_blocking(plan: Arc<dyn ExecutionPlan>) -> Vec<RecordBatch> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime
+            .block_on(collect(plan, Arc::new(TaskContext::default())))
+            .expect("collect")
     }
 
     /// Batches of up to 11 rows of domain indices, nullable, drawn from
@@ -2978,7 +3105,9 @@ mod tests {
         /// or Float32 key, alone or followed by a Utf8 key (q28 and q29 rank
         /// by `AVG(...)`, a Float64), over both NaN signs, two NaN payloads,
         /// both zeros, both infinities and nulls, in every combination of
-        /// `descending` and `nulls_first`.
+        /// `descending` and `nulls_first` (`check_typed_topk`; an input whose
+        /// `a` holds both zero signs gets the pre-filter's own rule and the
+        /// shape rule only, since the TopK is not exact over it).
         ///
         /// FLIP (a): in `prefilter_batch`, evaluate each key with
         /// `nulls_first: !sort.options.nulls_first` and the sort-key sequence
@@ -2989,7 +3118,14 @@ mod tests {
         /// and it fails, shrunk to one `a DESC NULLS LAST` key with
         /// `fetch = 1` over five NaN and two NaN with the low payload bit set
         /// (a NaN kept, the payload NaN expected). The (b) cases are the
-        /// checked-in seeds.
+        /// checked-in seeds. FLIP (c): rank -0.0 equal to 0.0 in
+        /// `prefilter_batch` (each sort column through DataFusion's
+        /// `normalize_float_zero`) and the pre-filter's own rule fails, shrunk
+        /// to `a ASC NULLS LAST, b ASC NULLS FIRST` with `fetch = 1` over one
+        /// batch (-0.0, "y"), (0.0, null), (null, null) ((0.0, null) kept,
+        /// (-0.0, "y") expected); the every-key-type property shrinks it to
+        /// one `a ASC NULLS LAST` key with `fetch = 1` over 0.0, -0.0, the
+        /// checked-in `cc d04e5caa` seed.
         #[test]
         fn prop_topk_prefilter_keeps_the_topk_answer_for_float_keys(
             key_type in prop::sample::select(vec![KeyType::Float64, KeyType::Float32]),
@@ -3000,6 +3136,188 @@ mod tests {
         ) {
             check_typed_topk(key_type, batches, two_keys, &options, fetch)?;
         }
+    }
+
+    /// DataFusion 55's TopK is not exact over a float sort key holding both
+    /// 0.0 and -0.0, in a plain DataFusion session with no Ravel rule: its
+    /// heap ranks -0.0 below 0.0, as the full sort does, but its dynamic
+    /// filter compares with `-0.0 = 0.0`, so a row that ranks ahead of the
+    /// heap's boundary only by its zero's sign is judged on the next key
+    /// and can be dropped. The answer then depends on batch order. Over
+    /// (-0.0, 'x') then (-0.0, NULL), (0.0, 'x') under `a DESC NULLS LAST, b
+    /// ASC NULLS FIRST`, `LIMIT 1` answers (-0.0, NULL), where the full
+    /// sort's first row, and the answer with the batches swapped, is
+    /// (0.0, 'x'); `ORDER BY a DESC NULLS LAST LIMIT 1` answers (-0.0, 'x').
+    /// Through the exec with the pre-filter on, the TopK answers (-0.0, 'x')
+    /// too. When this test fails, the TopK agrees with the full sort and
+    /// `holds_both_zero_signs` can go from `check_typed_topk`.
+    #[tokio::test]
+    async fn datafusions_topk_misses_the_full_sorts_first_row_over_both_zero_signs() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Float64, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let batch = |a: Vec<Option<f64>>, b: Vec<Option<&str>>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Float64Array::from(a)) as ArrayRef,
+                    Arc::new(StringArray::from(b)),
+                ],
+            )
+            .expect("batch")
+        };
+        let first = batch(vec![Some(-0.0)], vec![Some("x")]);
+        let second = batch(vec![Some(-0.0), Some(0.0)], vec![None, Some("x")]);
+        let first_row = |batches: Vec<RecordBatch>, statement: &'static str| {
+            let schema = Arc::clone(&schema);
+            async move {
+                let ctx = datafusion::prelude::SessionContext::new_with_config(
+                    datafusion::prelude::SessionConfig::new().with_target_partitions(1),
+                );
+                let table = datafusion::datasource::MemTable::try_new(schema, vec![batches])
+                    .expect("table");
+                ctx.register_table("t", Arc::new(table)).expect("register");
+                let frame = ctx.sql(statement).await.expect("plan");
+                let plan = frame
+                    .clone()
+                    .create_physical_plan()
+                    .await
+                    .expect("physical");
+                let shown = displayable(plan.as_ref()).indent(true).to_string();
+                let out = frame.collect().await.expect("collect");
+                let row = out.iter().find(|b| b.num_rows() > 0).expect("a row");
+                let a = row.column(0).as_primitive::<Float64Type>();
+                let b = row.column(1).as_string::<i32>();
+                (
+                    a.value(0).to_bits(),
+                    b.is_valid(0).then(|| b.value(0).to_string()),
+                    shown,
+                )
+            }
+        };
+        const LIMITED: &str =
+            "SELECT a, b FROM t ORDER BY a DESC NULLS LAST, b ASC NULLS FIRST LIMIT 1";
+        const FULL: &str = "SELECT a, b FROM t ORDER BY a DESC NULLS LAST, b ASC NULLS FIRST";
+        let (a, b, plan) = first_row(vec![first.clone(), second.clone()], LIMITED).await;
+        assert!(plan.contains("TopK(fetch=1)"), "a TopK:\n{plan}");
+        assert!(
+            !plan.contains("CompactSlicesExec"),
+            "no Ravel rule:\n{plan}"
+        );
+        assert_eq!((a, b), ((-0.0f64).to_bits(), None), "the TopK's answer");
+        let (a, b, plan) = first_row(vec![first.clone(), second.clone()], FULL).await;
+        assert!(!plan.contains("TopK"), "a full sort:\n{plan}");
+        assert_eq!(
+            (a, b.as_deref()),
+            (0.0f64.to_bits(), Some("x")),
+            "the full sort"
+        );
+        let (a, b, _) = first_row(vec![second.clone(), first.clone()], LIMITED).await;
+        assert_eq!(
+            (a, b.as_deref()),
+            (0.0f64.to_bits(), Some("x")),
+            "the TopK's answer with the batches swapped"
+        );
+        let (a, b, _) = first_row(
+            vec![first.clone(), second.clone()],
+            "SELECT a, b FROM t ORDER BY a DESC NULLS LAST LIMIT 1",
+        )
+        .await;
+        assert_eq!(
+            (a, b.as_deref()),
+            ((-0.0f64).to_bits(), Some("x")),
+            "the TopK's answer on `a` alone"
+        );
+
+        // With the pre-filter on, the TopK still misses the full sort's first
+        // row.
+        let ordering = LexOrdering::new([
+            PhysicalSortExpr::new(
+                col("a", &schema).expect("a"),
+                SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                },
+            ),
+            PhysicalSortExpr::new(
+                col("b", &schema).expect("b"),
+                SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            ),
+        ])
+        .expect("a sort key");
+        let source =
+            MemorySourceConfig::try_new_exec(&[vec![first, second]], Arc::clone(&schema), None)
+                .expect("source");
+        let topk = TopKPrefilter {
+            ordering: ordering.clone(),
+            fetch: 1,
+        };
+        let exec = Arc::new(CompactSlicesExec::new(source).with_topk(Some(topk)));
+        let sort = SortExec::new(ordering, Arc::clone(&exec) as Arc<dyn ExecutionPlan>)
+            .with_fetch(Some(1));
+        let out = collect(Arc::new(sort), Arc::new(TaskContext::default()))
+            .await
+            .expect("collect");
+        assert_eq!(
+            metric(&exec, "topk_dropped_rows"),
+            1,
+            "the pre-filter fired"
+        );
+        let row = out.iter().find(|b| b.num_rows() > 0).expect("a row");
+        assert_eq!(
+            (
+                row.column(0)
+                    .as_primitive::<Float64Type>()
+                    .value(0)
+                    .to_bits(),
+                row.column(1).as_string::<i32>().value(0),
+            ),
+            ((-0.0f64).to_bits(), "x"),
+            "the TopK's answer with the pre-filter"
+        );
+    }
+
+    /// Issue #3598, first recorded failure: domain index 3 is -0.0 and 13
+    /// is 0.0, under `a DESC NULLS LAST, b ASC NULLS FIRST` with `fetch = 1`.
+    /// The input holds both zero signs, where the TopK is not exact with or
+    /// without the pre-filter
+    /// (`datafusions_topk_misses_the_full_sorts_first_row_over_both_zero_signs`
+    /// runs this input through SQL), so `check_typed_topk` holds the
+    /// pre-filter to its own rule and the answer to its shape.
+    #[test]
+    fn issue_3598_float_topk_with_a_second_key_case_1() -> Result<(), TestCaseError> {
+        check_typed_topk(
+            KeyType::Float64,
+            vec![
+                vec![(Some(3), Some(0))],
+                vec![(Some(3), None), (Some(13), Some(0))],
+            ],
+            true,
+            &[(true, false), (false, true)],
+            1,
+        )
+    }
+
+    /// Issue #3598, second recorded failure: domain indices 4 and 13 are
+    /// 0.0 and 12 is -0.0, under `a ASC NULLS LAST, b ASC NULLS FIRST` with
+    /// `fetch = 2`, checked as the first case is. The proptest seed that
+    /// shrank to it in CI is the checked-in `cc cc4c7d3a` line.
+    #[test]
+    fn issue_3598_float_topk_with_a_second_key_case_2() -> Result<(), TestCaseError> {
+        check_typed_topk(
+            KeyType::Float64,
+            vec![
+                vec![(Some(4), Some(1)), (Some(13), Some(1))],
+                vec![(Some(12), Some(1)), (Some(12), None), (Some(4), None)],
+            ],
+            true,
+            &[(false, false), (false, true)],
+            2,
+        )
     }
 
     proptest! {
