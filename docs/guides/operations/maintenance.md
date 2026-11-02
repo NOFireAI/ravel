@@ -1673,7 +1673,8 @@ What you see:
   stored checksum no longer matches its body. After a failed read the router
   does not read that tenant's record again for 1 second, then 2, 4 and so on,
   doubling on each consecutive failure up to 30 seconds; a successful read
-  resets it. A write inside that window is refused, or routed on the cached
+  resets it. Failures of reads already in flight when a window was armed do
+  not extend it, so a burst of writes that all fail once waits 1 second. A write inside that window is refused, or routed on the cached
   view inside its grace window, without a store read. Each failed read logs
   one ERROR line naming the tenant hash, the signal, the cause and the delay
   before the next read, and counts once under
@@ -1684,6 +1685,10 @@ What you see:
   which outnumber the reads. The first-write provisioning check on every
   ingest request treats a store error as a pass, logs a WARN, and backs off
   the same way, so the request is answered by the router's decision. A
+  record it reads but cannot accept (undecodable, an unsupported version,
+  misfiled, a corrupt generation history) fails the request, and requests
+  inside the same backoff window fail with the same error without reading
+  the record again. A
   `maintain` compaction or erasure rewrite of the tenant's buckets fails its
   floor read and writes nothing.
 - In a `maintain` process, a compaction or erasure rewrite reads the bucket's

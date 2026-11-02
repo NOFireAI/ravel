@@ -35,7 +35,7 @@
 //! a valid history whose recorded `shard_count` differs from the live default
 //! is tolerated (ADR-0082).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -102,6 +102,55 @@ fn is_hard_failure(err: &ProvisioningError) -> bool {
     )
 }
 
+/// A copy of a hard provisioning failure, for [`ProvisioningRecordWriter`] to
+/// return again inside its read backoff window. `None` for any other variant.
+/// `ProvisioningError` is not `Clone` (its `Store` variant carries a
+/// `StoreError`), so the hard variants are rebuilt field by field.
+fn copy_hard_failure(err: &ProvisioningError) -> Option<ProvisioningError> {
+    Some(match err {
+        ProvisioningError::AdoptionWouldHideData {
+            tenant_hash,
+            signal,
+            configured,
+            observed_shard,
+        } => ProvisioningError::AdoptionWouldHideData {
+            tenant_hash: tenant_hash.clone(),
+            signal,
+            configured: *configured,
+            observed_shard: *observed_shard,
+        },
+        ProvisioningError::UnsupportedVersion { key, got, ceiling } => {
+            ProvisioningError::UnsupportedVersion {
+                key: key.clone(),
+                got: *got,
+                ceiling: *ceiling,
+            }
+        }
+        ProvisioningError::CorruptRecord {
+            key,
+            field,
+            expected,
+            actual,
+        } => ProvisioningError::CorruptRecord {
+            key: key.clone(),
+            field,
+            expected: expected.clone(),
+            actual: actual.clone(),
+        },
+        ProvisioningError::Decode { key, source } => ProvisioningError::Decode {
+            key: key.clone(),
+            source: source.clone(),
+        },
+        ProvisioningError::CorruptGenerations { key, defect } => {
+            ProvisioningError::CorruptGenerations {
+                key: key.clone(),
+                defect: *defect,
+            }
+        }
+        _ => return None,
+    })
+}
+
 /// Increment the process-global mismatch counter if `err` is a hard provisioning
 /// failure. Shared by the consumers that catch a provisioning error off the
 /// ingest hot path (the maintain per-tenant loop), so an alert keyed on the
@@ -123,15 +172,18 @@ pub(crate) fn note_provisioning_failure(err: &ProvisioningError) {
 /// set is shared and one tenant's first write across any transport provisions
 /// the record once.
 ///
-/// A (tenant, signal) whose last check failed open on a store error is not
-/// checked again until its read backoff window passes (issue #3653): 1 s after
-/// the first failure, doubling on each consecutive one up to 30 s, cleared by
-/// a success.
+/// A (tenant, signal) whose last check failed, on a store error or a hard
+/// failure, is not checked again until its read backoff window passes (issue
+/// #3653): 1 s after the first failure, doubling on each consecutive one up to
+/// 30 s, cleared by a success. Inside the window a store error's check returns
+/// `Ok` and a hard failure's returns the same typed error again.
 pub struct ProvisioningRecordWriter {
     store: Arc<dyn ObjectStoreBackend>,
     shard_count: u32,
     seen: Mutex<HashSet<(TenantHash, Signal)>>,
     read_backoff: Mutex<ReadBackoff<(TenantHash, Signal)>>,
+    /// The hard failure of each backed-off key whose last check failed hard.
+    hard_failures: Mutex<HashMap<(TenantHash, Signal), ProvisioningError>>,
 }
 
 impl ProvisioningRecordWriter {
@@ -141,6 +193,7 @@ impl ProvisioningRecordWriter {
             shard_count,
             seen: Mutex::new(HashSet::new()),
             read_backoff: Mutex::new(ReadBackoff::new()),
+            hard_failures: Mutex::new(HashMap::new()),
         }
     }
 
@@ -151,7 +204,10 @@ impl ProvisioningRecordWriter {
     /// record whose true `shard_count` cannot be trusted -- increments the
     /// process-global mismatch counter and returns the typed error so the caller
     /// fails that one request; the process is never taken down for a single
-    /// dynamic tenant. Only a store error is logged and treated as success at
+    /// dynamic tenant. The (tenant, signal) then backs off: inside the window
+    /// every request fails with the same typed error without a store call, and
+    /// the counter is not incremented again until a read fails. Only a store
+    /// error is logged and treated as success at
     /// this step: it is not the tenant's fault, and the ingest router, which
     /// re-reads the record before routing, refuses the tenant's writes for as
     /// long as it cannot read it. After a store error the (tenant, signal) is
@@ -175,7 +231,16 @@ impl ProvisioningRecordWriter {
             .blocked_until(&key, now_ns)
             .is_some()
         {
-            return Ok(());
+            // Only hard failures are remembered, and every hard failure
+            // copies, so a backed-off key with a remembered error never reads.
+            match self.hard_failures.lock().get(&key) {
+                Some(err) => {
+                    if let Some(err) = copy_hard_failure(err) {
+                        return Err(err);
+                    }
+                }
+                None => return Ok(()),
+            }
         }
         match validate_or_adopt(
             self.store.as_ref(),
@@ -190,14 +255,27 @@ impl ProvisioningRecordWriter {
             Ok(_) => {
                 self.seen.lock().insert(key);
                 self.read_backoff.lock().clear(&key);
+                self.hard_failures.lock().remove(&key);
                 Ok(())
             }
             Err(err) if is_hard_failure(&err) => {
                 SHARD_COUNT_MISMATCHES.fetch_add(1, Ordering::Relaxed);
+                self.read_backoff.lock().record_failure(key, now_ns);
+                if let Some(copy) = copy_hard_failure(&err) {
+                    self.hard_failures.lock().insert(key, copy);
+                }
                 Err(err)
             }
             Err(err) => {
-                let delay_ns = self.read_backoff.lock().record_failure(key, now_ns);
+                let delay_ns = {
+                    let mut read_backoff = self.read_backoff.lock();
+                    // A store error inside a hard failure's window came from a
+                    // concurrent read; the window keeps failing closed.
+                    if read_backoff.blocked_until(&key, now_ns).is_none() {
+                        self.hard_failures.lock().remove(&key);
+                    }
+                    read_backoff.record_failure(key, now_ns)
+                };
                 tracing::warn!(
                     %err,
                     tenant_hash = %tenant_hash.to_hex(),
@@ -880,6 +958,84 @@ mod tests {
         assert_eq!(store.sequence_progress(0), 3);
         assert!(writer.seen.lock().contains(&(th, Signal::Metrics)));
         assert!(writer.read_backoff.lock().is_empty());
+        writer.ensure(&th, Signal::Metrics, t2).await.expect("seen");
+        assert_eq!(store.sequence_progress(0), 3, "a seen tenant reads nothing");
+    }
+
+    /// Issue #3653: a present-but-corrupt record fails every request, but
+    /// requests for the same (tenant, signal) inside the backoff window fail
+    /// with the same typed error and issue no GET. One after the window reads
+    /// again, and a read that succeeds clears the remembered error.
+    #[tokio::test]
+    async fn ensure_backs_off_after_a_hard_failure() {
+        use ravel_object_store::fault::Sequence;
+
+        const NS_PER_SEC: i64 = 1_000_000_000;
+        let th = TenantId::new("acme").hash();
+        let key = provisioning_key(&th, Signal::Metrics);
+        let mut sequence = Sequence::new(Op::Get).with_key_contains(key.clone());
+        for _ in 0..16 {
+            sequence = sequence.then_passthrough();
+        }
+        let store = Arc::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_sequence(sequence),
+        ));
+        store
+            .put(
+                &key,
+                vec![0xFF, 0xFF, 0xFF, 0x07].into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed garbage record");
+        let writer = ProvisioningRecordWriter::new(store.clone(), 4);
+        let t0 = 1_000 * NS_PER_SEC;
+
+        for _ in 0..5 {
+            let err = writer
+                .ensure(&th, Signal::Metrics, t0)
+                .await
+                .expect_err("a corrupt record fails the request");
+            assert!(
+                matches!(err, ProvisioningError::Decode { .. }),
+                "got: {err}"
+            );
+        }
+        assert_eq!(store.sequence_progress(0), 1, "one GET in the window");
+        let err = writer
+            .ensure(&th, Signal::Metrics, t0 + NS_PER_SEC - 1)
+            .await
+            .expect_err("still failing inside the window");
+        assert!(
+            matches!(err, ProvisioningError::Decode { .. }),
+            "got: {err}"
+        );
+        assert_eq!(store.sequence_progress(0), 1);
+
+        let t1 = t0 + NS_PER_SEC;
+        for _ in 0..3 {
+            let err = writer
+                .ensure(&th, Signal::Metrics, t1)
+                .await
+                .expect_err("a corrupt record fails the request");
+            assert!(
+                matches!(err, ProvisioningError::Decode { .. }),
+                "got: {err}"
+            );
+        }
+        assert_eq!(store.sequence_progress(0), 2, "one GET after the window");
+
+        seed_record(store.as_ref(), &th, Signal::Metrics, 4).await;
+        let t2 = t1 + 2 * NS_PER_SEC;
+        writer
+            .ensure(&th, Signal::Metrics, t2)
+            .await
+            .expect("the repaired record reads back");
+        assert_eq!(store.sequence_progress(0), 3);
+        assert!(writer.seen.lock().contains(&(th, Signal::Metrics)));
+        assert!(writer.read_backoff.lock().is_empty());
+        assert!(writer.hard_failures.lock().is_empty());
         writer.ensure(&th, Signal::Metrics, t2).await.expect("seen");
         assert_eq!(store.sequence_progress(0), 3, "a seen tenant reads nothing");
     }
