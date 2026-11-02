@@ -112,6 +112,27 @@
 #                                       and the usage names the flags; s8: an
 #                                       engine arch with no s3s-fs asset passes
 #   t  real S3 with a local build    -> exit 65, nothing started
+#   u  Ravel's objects               -> u: a listing of every kind splits into
+#                                       data, commit, qualify and other with
+#                                       their sum as total, stamped the same,
+#                                       no band; the portable stack lists
+#                                       ravel-metricsbench through
+#                                       http://s3s:9000; the step sits
+#                                       between mimir-readiness and capture;
+#                                       u1: a band holding the data count
+#                                       passes; u2: one holding the total and
+#                                       the m/ count but not the data count
+#                                       exits 70 naming objects; u3: a
+#                                       malformed or inverted band exits 64;
+#                                       u4: a band in the diagnostic mode
+#                                       exits 64; u5: after a failed ingest
+#                                       verification a band breach is listed
+#                                       in failed_after_ingest; u6: a failed
+#                                       listing and u7: a truncated one exit
+#                                       70; u8: the real-S3 lane lists
+#                                       PREFIX-ravel with no endpoint
+#                                       override; f: the diagnostic mode runs
+#                                       no objects step
 #
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
 #
@@ -204,6 +225,16 @@ case "$1" in
         cat <<'JSON'
 {"services": {"prometheus": {"image": "prom/prometheus@sha256:aaaa", "command": ["--config.file=/etc/prometheus/prometheus.yml", "--query.max-samples=50000000", "--web.enable-remote-write-receiver"]}}}
 JSON
+        ;;
+      run)
+        # The objects step's listing of Ravel's bucket: STUB_LISTING's file,
+        # else one key of every kind; exit STUB_LIST_EXIT.
+        [ "${STUB_LIST_EXIT:-0}" -eq 0 ] || exit "${STUB_LIST_EXIT}"
+        if [ -n "${STUB_LISTING:-}" ]; then
+          cat "${STUB_LISTING}"
+        else
+          printf '%s\n' '{"Contents": [{"Key": "t/h1/m/l0/a.rseg", "Size": 100}, {"Key": "t/h1/m/c/a", "Size": 10}, {"Key": "sys/qualify/p", "Size": 1}, {"Key": "t/h1/catalog/x", "Size": 5}]}'
+        fi
         ;;
       down)
         echo down >"${STUB_STATE}"
@@ -523,7 +554,7 @@ for f in stamps.json ingest.json effective-config.json provenance.json report.js
   expect_file a "$f"
 done
 check "a: stamps status passed, exit 0" 'j("stamps.json")["status"] == "passed" and j("stamps.json")["exit_code"] == 0'
-check "a: every step recorded in order" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","ingest","mimir-readiness","capture","provenance","fold-state","query","validate","memory"]'
+check "a: every step recorded in order" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","ingest","mimir-readiness","objects","capture","provenance","fold-state","query","validate","memory"]'
 check "a: published image kind stamped, no image_id" 'j("stamps.json")["ravel_image"]["kind"] == "published" and "image_id" not in j("stamps.json")["ravel_image"]'
 expect_log "a: provenance says the image is published" "--config ravel_image_kind=published"
 expect_no_log "a: provenance carries no local image id" "ravel_image_id="
@@ -582,7 +613,7 @@ expect_rc q 70
 expect_err "q: message names step ingest and the row" "step ingest failed: metricsbench_ingest exited 1: mimir: read-back failed"
 expect_err "q: message says the run went on as a diagnostic" "the run went on as a diagnostic"
 check "q: stamps name step ingest, status failed, exit 70" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["status"] == "failed" and j("stamps.json")["exit_code"] == 70'
-check "q: every later step ran, ingest and mimir-readiness not done" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","capture","provenance","fold-state","query","validate","memory"]'
+check "q: every later step ran, ingest and mimir-readiness not done" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","objects","capture","provenance","fold-state","query","validate","memory"]'
 check "q: nothing failed after ingest" 'j("stamps.json")["failed_after_ingest"] == []'
 check "q: Mimir readiness line stamped as not matching" 'j("stamps.json")["mimir_readiness"].startswith("ingest read-back for mimir did not match")'
 expect_log "q: query run as a diagnostic" "--diagnostic-after-failed-ingest"
@@ -682,6 +713,9 @@ expect_no_log "f: no query run" "metricsbench_query"
 expect_log "f: torn down" " down -v"
 expect_no_log "f: no s3s-fs download" "s3s-fs-linux"
 check "f: stamps say the object store does not apply" 'j("stamps.json")["object_store"].startswith("not applicable")'
+check "f: no objects step, stamped not applicable" '"objects" not in j("stamps.json")["steps_completed"] and j("stamps.json")["ravel_objects"].startswith("not applicable")'
+expect_no_log "f: Ravel's bucket not listed" "list-objects-v2"
+expect_no_file f ravel-objects.json
 
 # --- f2: diagnostic on a profile the entry is not declared for ---------------
 run_case f2 --profile ci --bin-dir "${BIN}" --out-dir "${TMP}/f2/out" --anchor-ms "${ANCHOR}" \
@@ -1017,6 +1051,92 @@ STUB_LOCAL_IMAGE_ID="${LOCAL_ID}" run_case t --profile ci --ravel-image "${LOCAL
 expect_rc t 65
 expect_err "t: a local build is refused in the real-S3 lane" "a local build is never publishable"
 expect_no_log "t: nothing started" "docker-env up"
+
+# --- u: Ravel's objects -------------------------------------------------------------
+# Three data objects, three commit records, two qualify probes and four other
+# keys, two of those under m/: 12 keys, 8 under t/*/m/. A band of 3:3 holds
+# only the data count; 8:12 holds the m/ count and the total but not it.
+U_LISTING="${TMP}/u-listing.json"
+cat >"${U_LISTING}" <<'JSON'
+{"Contents": [
+  {"Key": "t/h1/m/l0/0001.rseg", "Size": 1000},
+  {"Key": "t/h1/m/l0/0002.rseg", "Size": 2000},
+  {"Key": "t/h2/m/l0/0003.rseg", "Size": 3000},
+  {"Key": "t/h1/m/c/0001", "Size": 10},
+  {"Key": "t/h1/m/c/0002", "Size": 20},
+  {"Key": "t/h2/m/c/0003", "Size": 30},
+  {"Key": "sys/qualify/run-1/probe-a", "Size": 1},
+  {"Key": "sys/qualify/run-1/probe-b", "Size": 2},
+  {"Key": "t/h1/catalog/manifest-1", "Size": 300},
+  {"Key": "t/h1/m/admission", "Size": 40},
+  {"Key": "t/h1/m/prov", "Size": 50},
+  {"Key": "sys/tenancy", "Size": 60}
+]}
+JSON
+U_SPLIT='j("ravel-objects.json")["data"] == {"count": 3, "bytes": 6000} and j("ravel-objects.json")["commit"] == {"count": 3, "bytes": 60} and j("ravel-objects.json")["qualify"] == {"count": 2, "bytes": 3} and j("ravel-objects.json")["other"] == {"count": 4, "bytes": 450} and j("ravel-objects.json")["total"] == {"count": 12, "bytes": 6513}'
+
+mapfile -t args < <(full_args "${TMP}/u/out")
+STUB_LISTING="${U_LISTING}" run_case u "${args[@]}"
+expect_rc u 0
+expect_file u ravel-objects.json
+expect_file u ravel-objects-listing.json
+check "u: every kind split, total is the sum" "${U_SPLIT}"
+check "u: the same figures stamped" 'j("stamps.json")["ravel_objects"] == j("ravel-objects.json") and j("stamps.json")["ravel_objects"]["bucket"] == "ravel-metricsbench"'
+check "u: no band, stamped as not set" 'j("ravel-objects.json")["band"].startswith("not set")'
+expect_err "u: message says no band was set" "no --ravel-objects-band set, counts stamped only"
+expect_log "u: the portable stack lists ravel-metricsbench through s3s" "run --rm --no-deps -T --entrypoint aws createbuckets --endpoint-url http://s3s:9000 s3api list-objects-v2 --output json --bucket ravel-metricsbench"
+check "u: objects runs between mimir-readiness and capture" 'j("stamps.json")["steps_completed"][7:10] == ["mimir-readiness","objects","capture"]'
+
+mapfile -t args < <(full_args "${TMP}/u1/out")
+STUB_LISTING="${U_LISTING}" run_case u1 "${args[@]}" --ravel-objects-band 3:3
+expect_rc "u1 band holds the data count" 0
+check "u1: band verdict ok on the data count" 'j("ravel-objects.json")["band"] == {"min": 3, "max": 3, "counts": "data", "verdict": "ok"}'
+
+mapfile -t args < <(full_args "${TMP}/u2/out")
+STUB_LISTING="${U_LISTING}" run_case u2 "${args[@]}" --ravel-objects-band 8:12
+expect_rc "u2 band excludes the data count" 70
+expect_err "u2: message names step objects and the count" "step objects failed: data 3 (6000 B)"
+expect_err "u2: message says below the band" "data count 3 below --ravel-objects-band 8:12"
+check "u2: stamps name step objects, figures still stamped" 'j("stamps.json")["failed_step"] == "objects" and j("stamps.json")["ravel_objects"]["band"]["verdict"] == "below" and j("stamps.json")["ravel_objects"]["data"]["count"] == 3'
+expect_no_log "u2: capture not run" "capture --out"
+expect_log "u2: torn down" " down -v"
+
+for bad in 3 a:b 3:2 -1:4 3:4:5; do
+  mapfile -t args < <(full_args "${TMP}/u3-${bad//:/_}/out")
+  run_case "u3-${bad//:/_}" "${args[@]}" --ravel-objects-band "${bad}"
+  expect_rc "u3 band '${bad}'" 64
+  expect_no_log "u3 band '${bad}': nothing started" "compose -f"
+done
+
+run_case u4 --profile history --bin-dir "${BIN}" --out-dir "${TMP}/u4/out" --anchor-ms "${ANCHOR}" \
+  --diagnostic-prometheus-max-samples 1000 --ravel-objects-band 1:2
+expect_rc "u4 band in the diagnostic mode" 64
+
+# A failed ingest verification: the step still runs; a band it fails is
+# listed after ingest and the run ends there naming ingest.
+mapfile -t args < <(full_args "${TMP}/u5/out")
+STUB_LISTING="${U_LISTING}" STUB_INGEST_READBACK_FAIL=mimir run_case u5 "${args[@]}" --ravel-objects-band 8:12
+expect_rc "u5 failed ingest, band excludes" 70
+check "u5: ingest named, objects failed after it" 'j("stamps.json")["failed_step"] == "ingest" and j("stamps.json")["failed_after_ingest"] == ["objects"]'
+expect_no_log "u5: capture not run" "capture --out"
+
+mapfile -t args < <(full_args "${TMP}/u6/out")
+STUB_LIST_EXIT=254 run_case u6 "${args[@]}"
+expect_rc "u6 listing fails" 70
+check "u6: stamps name step objects" 'j("stamps.json")["failed_step"] == "objects" and j("stamps.json")["ravel_objects"] is None'
+
+printf '%s\n' '{"Contents": [{"Key": "t/h1/m/l0/a.rseg", "Size": 1}], "NextToken": "abc"}' >"${TMP}/u7-listing.json"
+mapfile -t args < <(full_args "${TMP}/u7/out")
+STUB_LISTING="${TMP}/u7-listing.json" run_case u7 "${args[@]}"
+expect_rc "u7 truncated listing" 70
+expect_err "u7: message says truncated" "the listing is truncated"
+
+mapfile -t args < <(full_args "${TMP}/u8/out")
+STUB_LISTING="${U_LISTING}" run_case u8 "${args[@]}" --real-s3-bucket-prefix mb-run1 --real-s3-region us-east-1
+expect_rc "u8 real-S3 lane" 0
+expect_log "u8: the real-S3 lane lists PREFIX-ravel" "run --rm --no-deps -T --entrypoint aws createbuckets s3api list-objects-v2 --output json --bucket mb-run1-ravel"
+expect_no_log "u8: no endpoint override" "--endpoint-url"
+check "u8: stamped bucket mb-run1-ravel" 'j("stamps.json")["ravel_objects"]["bucket"] == "mb-run1-ravel"'
 
 echo
 echo "${passes} passed, ${fails} failed"
