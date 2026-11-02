@@ -225,6 +225,10 @@ inline_comments=$(echo "${comments_json}" | jq 'length')
 # commit and had already been fixed, so `inline_comments=2` read as "two stale
 # findings, nothing new" while an unaddressed body finding sat at the current
 # head -- the exact shape this script exists to prevent.
+# A review the bot could not parse reports no findings whatever it says, so the
+# counts above cannot tell it from a clean one.
+review_unstructured=$(echo "${reviews_json}" | jq --arg sha "${head_sha}" --arg bot "${bot}" \
+  -f "${script_dir}/lib/fleet-review-unstructured.jq")
 outside_diff=$(echo "${reviews_json}" | jq --arg sha "${head_sha}" --arg bot "${bot}" \
   -f "${script_dir}/lib/fleet-review-outside-diff.jq")
 
@@ -363,6 +367,15 @@ elif [[ "${reviews_at_head}" == "0" ]]; then # PROVE-FLIP
   if [[ "${reviews_stale}" != "0" ]]; then
     echo "     (${reviews_stale} review(s) exist at older commits; the head moved after them, so they do not cover it)"
   fi
+# --confirm-addressed does not clear this: it says findings were read, and this
+# review reported none to read. ALLOW_UNSTRUCTURED_REVIEW=1 is the way past a
+# body read by hand and found to be a complete review.
+elif [[ "${review_unstructured}" == "true" && "${ALLOW_UNSTRUCTURED_REVIEW:-}" != "1" ]]; then
+  if [[ "${task_state}" == "running" ]]; then
+    echo "  -> the last review at head finished without a structured result, and a newer review task is running; wait"
+  else
+    echo "  -> the last review at head finished without a structured result, so its zero findings mean nothing; read its body, and re-trigger with \`@claude-fleet review\` unless it is a complete review (then re-run with ALLOW_UNSTRUCTURED_REVIEW=1)"
+  fi
 # Block-only, and the `reviews_at_head_any` conjunct is what keeps it that way: the
 # branch above owns "no review at head" and prints which of the five states the
 # PR is in, so this one refuses only a review that EXISTS and carries a state
@@ -430,6 +443,9 @@ else
     echo "  -> clean (operator confirmed all ${outside_diff} outside-diff body finding(s) addressed): ${ci_phrase}, review at the current head"
   else
     echo "  -> clean: ${ci_phrase}, review at the current head with zero findings"
+  fi
+  if [[ "${review_unstructured}" == "true" ]]; then
+    echo "  -> NOTE: the review at head has no structured result; ALLOW_UNSTRUCTURED_REVIEW=1 says its body was read by hand"
   fi
   if [[ "${struct_rc}" == "1" ]]; then
     echo "  -> NOTE: the shape guard's refusal was overridden with ALLOW_STALE_SHAPE_SITES=1; these are the sites it reported:"

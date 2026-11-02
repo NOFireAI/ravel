@@ -15,6 +15,8 @@ set -uo pipefail
 
 TASK_FILTER="$(dirname "$0")/lib/fleet-review-task-state.jq"
 [[ -r "${TASK_FILTER}" ]] || { echo "missing ${TASK_FILTER}" >&2; exit 64; }
+UNSTRUCTURED_FILTER="$(dirname "$0")/lib/fleet-review-unstructured.jq"
+[[ -r "${UNSTRUCTURED_FILTER}" ]] || { echo "missing ${UNSTRUCTURED_FILTER}" >&2; exit 64; }
 OUTSIDE_FILTER="$(dirname "$0")/lib/fleet-review-outside-diff.jq"
 [[ -r "${OUTSIDE_FILTER}" ]] || { echo "missing ${OUTSIDE_FILTER}" >&2; exit 64; }
 
@@ -38,6 +40,7 @@ run_case() {
 
 check_task() { run_case "${TASK_FILTER}" "$@"; }
 check_outside() { run_case "${OUTSIDE_FILTER}" "$@"; }
+check_unstructured() { run_case "${UNSTRUCTURED_FILTER}" "$@"; }
 
 # --- lib/fleet-review-task-state.jq --------------------------------------
 #
@@ -1184,6 +1187,63 @@ check_eq "shape guard missing: warns with exit 127" \
   "$(printf '%s\n' "${struct_missing_out}" | sed -n 3p)"
 check_eq "shape guard missing: the merge line is still printed, last" \
   "${MERGE_LINE}" "$(printf '%s\n' "${struct_missing_out}" | sed -n '$p')"
+
+# --- lib/fleet-review-unstructured.jq and the refusal it drives ----------
+#
+# A review the bot could not parse has no findings list and no inline comments,
+# so every count reads zero. The negative cases come first: a filter that said
+# true for everything would refuse every clean review, and the e2e cases below
+# would not notice.
+
+UNSTRUCTURED_LINE='Review task finished without a structured result (no ```json block in final message). Raw tail follows.'
+UNSTRUCTURED_BODY_JSON="$(printf '%s\n\nLet me check one more file.' "${UNSTRUCTURED_LINE}" | jq -Rs .)"
+
+check_unstructured "no reviews at all is false" false '[]'
+check_unstructured "a structured review at the commit is false" false "$(printf '[{"user":{"login":"%s"},"commit_id":"%s","body":"Verdict: comment."}]' "${BOT}" "${SHA}")"
+check_unstructured "the marker at another commit is false" false "$(printf '[{"user":{"login":"%s"},"commit_id":"%s","body":%s}]' "${BOT}" "${OTHER}" "${UNSTRUCTURED_BODY_JSON}")"
+check_unstructured "the marker from a human is false" false "$(printf '[{"user":{"login":"pmoust"},"commit_id":"%s","body":%s}]' "${SHA}" "${UNSTRUCTURED_BODY_JSON}")"
+check_unstructured "the marker quoted inside a body is false" false "$(printf '[{"user":{"login":"%s"},"commit_id":"%s","body":"Verdict: comment. An earlier run said Review task finished without a structured result."}]' "${BOT}" "${SHA}")"
+check_unstructured "a null body is false" false "$(printf '[{"user":{"login":"%s"},"commit_id":"%s","body":null}]' "${BOT}" "${SHA}")"
+check_unstructured "a later structured review of the commit supersedes it" false "$(printf '[{"user":{"login":"%s"},"commit_id":"%s","body":%s},{"user":{"login":"%s"},"commit_id":"%s","body":"Verdict: comment."}]' "${BOT}" "${SHA}" "${UNSTRUCTURED_BODY_JSON}" "${BOT}" "${SHA}")"
+check_unstructured "the marker on the last bot review at the commit is true" true "$(printf '[{"user":{"login":"%s"},"commit_id":"%s","body":%s}]' "${BOT}" "${SHA}" "${UNSTRUCTURED_BODY_JSON}")"
+check_unstructured "a later unparsed review overrides an earlier structured one" true "$(printf '[{"user":{"login":"%s"},"commit_id":"%s","body":"Verdict: comment."},{"user":{"login":"%s"},"commit_id":"%s","body":%s}]' "${BOT}" "${SHA}" "${BOT}" "${SHA}" "${UNSTRUCTURED_BODY_JSON}")"
+
+UNSTRUCTURED_REFUSAL="  -> the last review at head finished without a structured result, so its zero findings mean nothing; read its body, and re-trigger with \`@claude-fleet review\` unless it is a complete review (then re-run with ALLOW_UNSTRUCTURED_REVIEW=1)"
+
+unstructured_out="$(e2e "${UNSTRUCTURED_BODY_JSON}")"
+check_eq "unstructured review: refused, not called clean" \
+  "${UNSTRUCTURED_REFUSAL}" "$(printf '%s\n' "${unstructured_out}" | sed -n 2p)"
+check_eq "unstructured review: no merge line" \
+  "0" "$(printf '%s\n' "${unstructured_out}" | grep -c 'gh pr merge' || true)"
+
+# --confirm-addressed says findings were read, and this review reported none.
+unstructured_confirmed_out="$(e2e "${UNSTRUCTURED_BODY_JSON}" --confirm-addressed)"
+check_eq "unstructured review: --confirm-addressed does not clear it" \
+  "${UNSTRUCTURED_REFUSAL}" "$(printf '%s\n' "${unstructured_confirmed_out}" | sed -n 2p)"
+check_eq "unstructured review: --confirm-addressed prints no merge line" \
+  "0" "$(printf '%s\n' "${unstructured_confirmed_out}" | grep -c 'gh pr merge' || true)"
+
+# The re-trigger advice is wrong once a newer task is already running.
+E2E_ISSUE_COMMENTS="$(printf '[{"user":{"login":"%s"},"body":"%s"}]' "${BOT}" "${RUNNING_HEAD}")"
+unstructured_running_out="$(e2e "${UNSTRUCTURED_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS
+check_eq "unstructured review with a newer task running: says wait" \
+  "  -> the last review at head finished without a structured result, and a newer review task is running; wait" \
+  "$(printf '%s\n' "${unstructured_running_out}" | sed -n 2p)"
+check_eq "unstructured review with a newer task running: no merge line" \
+  "0" "$(printf '%s\n' "${unstructured_running_out}" | grep -c 'gh pr merge' || true)"
+
+# A body read by hand as a complete review can pass, and the output says so.
+unstructured_override_out="$(ALLOW_UNSTRUCTURED_REVIEW=1 e2e "${UNSTRUCTURED_BODY_JSON}")"
+check_eq "unstructured review overridden: the clean verdict, the note, the merge line" \
+  "$(printf '%s\n%s\n%s' \
+    "  -> clean: CI green, review at the current head with zero findings" \
+    "  -> NOTE: the review at head has no structured result; ALLOW_UNSTRUCTURED_REVIEW=1 says its body was read by hand" \
+    "${MERGE_LINE}")" \
+  "$(printf '%s\n' "${unstructured_override_out}" | sed -n '2,$p')"
+# Catches: the note printed whenever the variable is set.
+check_eq "structured review with the override set: output unchanged" \
+  "${struct_clean_out}" "$(ALLOW_UNSTRUCTURED_REVIEW=1 e2e "${CLEAN_BODY_JSON}")"
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
