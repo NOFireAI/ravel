@@ -102,8 +102,8 @@
 # the provenance name real S3. It takes a published image only.
 #
 # The stack is always torn down with `docker compose ... down -v` (after its
-# logs, s3s-fs's among them, are saved to <out>/compose.log) unless --keep is
-# given.
+# logs, s3s-fs's among them when it ran, are saved to <out>/compose.log) unless
+# --keep is given. That removes no real-S3 bucket or object.
 #
 # Exit codes:
 #   0   every step passed
@@ -176,7 +176,7 @@ say() {
 }
 
 usage() {
-  sed -n '7,12p' "$0" >&2
+  sed -n '7,13p' "$0" >&2
 }
 
 usage_error() {
@@ -689,7 +689,7 @@ else
 fi
 
 host_arch="$(uname -m)"
-if [ "$diagnostic" -eq 0 ]; then
+if [ "$diagnostic" -eq 0 ] && [ "$real_s3" -eq 0 ]; then
   # The binary runs inside the engine's Linux containers, so the engine's arch
   # picks the asset, not the host's (macOS reports arm64 for linux/aarch64).
   engine_arch="$("$DOCKER" version --format '{{.Server.Arch}}' 2>/dev/null)" || engine_arch=""

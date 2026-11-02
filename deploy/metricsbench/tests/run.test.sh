@@ -108,7 +108,9 @@
 #                                       without the flags none of that happens;
 #                                       s2-s7: a lone flag, a prefix S3 cannot
 #                                       name or past 44 characters, a malformed
-#                                       region and the falsification run exit 64
+#                                       region and the falsification run exit 64,
+#                                       and the usage names the flags; s8: an
+#                                       engine arch with no s3s-fs asset passes
 #   t  real S3 with a local build    -> exit 65, nothing started
 #
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
@@ -963,6 +965,11 @@ expect_no_log "s: nothing downloads s3s-fs" "s3s-fs-linux"
 check "s: stamps name real S3 and every bucket" 'j("stamps.json")["store_kind"] == "s3" and j("stamps.json")["object_store"] == {"implementation": "s3", "region": "us-east-1", "credentials": "instance-role", "buckets": ["mb-run1-ravel", "mb-run1-mimir-blocks", "mb-run1-mimir-ruler", "mb-run1-mimir-alertmanager"]}'
 check "s: fetch-s3s-fs did not run" '"fetch-s3s-fs" not in j("stamps.json")["steps_completed"] and "query" in j("stamps.json")["steps_completed"]'
 
+# An engine arch with no s3s-fs asset does not matter when no asset is fetched.
+mapfile -t args < <(full_args "${TMP}/s8/out")
+STUB_ENGINE_ARCH=riscv64 run_case s8 "${args[@]}" --real-s3-bucket-prefix mb-run1 --real-s3-region us-east-1
+expect_rc s8 0
+
 # The default lane stays on s3s-fs and never reads the overlay.
 mapfile -t args < <(full_args "${TMP}/s1/out")
 run_case s1 "${args[@]}"
@@ -976,6 +983,7 @@ mapfile -t args < <(full_args "${TMP}/s2/out")
 run_case s2 "${args[@]}" --real-s3-bucket-prefix mb-run1
 expect_rc s2 64
 expect_err "s2: a prefix needs a region" "go together"
+expect_err "s2: the usage it prints names both flags" "--real-s3-bucket-prefix PREFIX --real-s3-region REGION"
 
 mapfile -t args < <(full_args "${TMP}/s3/out")
 run_case s3 "${args[@]}" --real-s3-region us-east-1
