@@ -99,8 +99,9 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   or a label name narrows what the call resolves. A filter narrows only what
   the call returns.
 
-  `time_range` is required. Each bound is an RFC 3339 timestamp or a decimal
-  nanosecond string, and the window is half-open.
+  `time_range` is required. Each bound is an RFC 3339 timestamp in UTC
+  (ending in Z or +00:00) or a decimal nanosecond string, and the window is
+  half-open.
 
 ### Check a query first
 
@@ -302,8 +303,10 @@ every span the tenant retains.
 `ravel_describe_data` reports the coverage window and the freshness
 watermark itself.
 
-Pass a time as an RFC 3339 string or as an integer count of nanoseconds,
-given as a string. A raw JSON number cannot hold a nanosecond epoch exactly.
+Pass a time as an RFC 3339 timestamp in UTC (ending in Z or +00:00) or as
+an integer count of nanoseconds, given as a string. A timestamp with any
+other offset is refused as `invalid_argument`. A raw JSON number cannot hold
+a nanosecond epoch exactly.
 For the same reason, every timestamp that the server returns is a nanosecond
 count, given as a string.
 

@@ -1296,6 +1296,9 @@ mod with_mcp {
     /// `max_store_requests` answers `ok` for the quartered budget.
     /// FLIP: passing `include_log_metric_names: false` for a bare `__name__`
     /// drops the two log metric names from the list.
+    /// FLIP: leaving the server's metadata envelope `presentation.max_rows`
+    /// (200) on the find_labels answer, or setting the effective value on
+    /// the explain answer, reports a row cap neither tool applies.
     #[tokio::test]
     async fn find_labels_and_explain_query_answer_through_the_route() {
         let (store, metrics) = instrumented_memory();
@@ -1321,6 +1324,11 @@ mod with_mcp {
         assert_eq!(
             names["data"]["rows"],
             serde_json::json!([["m"], ["ravel_log_bytes"], ["ravel_log_lines"]])
+        );
+        assert_eq!(
+            names["presentation"]["max_rows"],
+            serde_json::json!(0),
+            "{names}"
         );
         assert!(
             names["warnings"]
@@ -1381,6 +1389,11 @@ mod with_mcp {
             serde_json::json!([{"name": "value", "type": "Float64"}])
         );
         assert_eq!(explained["data"]["rows"], serde_json::json!([]));
+        assert_eq!(
+            explained["presentation"]["max_rows"],
+            serde_json::json!(0),
+            "{explained}"
+        );
         assert!(
             explained["plan"]
                 .as_str()
