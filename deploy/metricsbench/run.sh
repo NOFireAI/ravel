@@ -10,6 +10,7 @@
 #     [--anchor-ms N] [--passes N] [--reps N] [--keep]
 #     [--rss-band CONTAINER:MIN_BYTES:MAX_BYTES]...
 #     [--diagnostic-prometheus-max-samples N]
+#     [--real-s3-bucket-prefix PREFIX --real-s3-region REGION]
 #
 # The Ravel image comes in one of two forms, and stamps.json says which ran
 # (ravel_image.kind):
@@ -91,6 +92,14 @@
 # <out>/falsification.json) and memory. It writes no report.json, and
 # stamps.json says diagnostic: true. --ravel-image and --ravel-source-commit
 # are optional there, since no Ravel is started.
+#
+# With --real-s3-bucket-prefix and --real-s3-region the run is the real-S3 lane
+# (ADR-0927 decision 10): the overlay real-s3.yml moves Ravel and Mimir onto the
+# operator's <PREFIX>-ravel, <PREFIX>-mimir-blocks, <PREFIX>-mimir-ruler and
+# <PREFIX>-mimir-alertmanager buckets with the instance role's credentials.
+# fetch-s3s-fs does not run and s3s does not start; createbuckets instead fails
+# the qualify step when a bucket is missing or holds an object. stamps.json and
+# the provenance name real S3. It takes a published image only.
 #
 # The stack is always torn down with `docker compose ... down -v` (after its
 # logs, s3s-fs's among them, are saved to <out>/compose.log) unless --keep is
@@ -504,6 +513,8 @@ passes=""
 reps=""
 keep=0
 diag_max_samples=""
+real_s3_prefix=""
+real_s3_region=""
 bands=()
 
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
@@ -520,7 +531,8 @@ while [ $# -gt 0 ]; do
       exit 0
       ;;
     --profile | --ravel-image | --ravel-image-id | --ravel-source-commit | --bin-dir | --out-dir | \
-      --anchor-ms | --passes | --reps | --rss-band | --diagnostic-prometheus-max-samples)
+      --anchor-ms | --passes | --reps | --rss-band | --diagnostic-prometheus-max-samples | \
+      --real-s3-bucket-prefix | --real-s3-region)
       [ $# -ge 2 ] || usage_error "$1 needs a value"
       ;;
     *)
@@ -539,6 +551,8 @@ while [ $# -gt 0 ]; do
     --reps) reps="$2" ;;
     --rss-band) bands+=("$2") ;;
     --diagnostic-prometheus-max-samples) diag_max_samples="$2" ;;
+    --real-s3-bucket-prefix) real_s3_prefix="$2" ;;
+    --real-s3-region) real_s3_region="$2" ;;
   esac
   shift 2
 done
@@ -549,6 +563,19 @@ diagnostic=0
 [ -n "$profile" ] || usage_error "--profile is required"
 [ -n "$bin_dir" ] || usage_error "--bin-dir is required"
 [ -n "$out_dir" ] || usage_error "--out-dir is required"
+real_s3=0
+if [ -n "$real_s3_prefix" ] || [ -n "$real_s3_region" ]; then
+  real_s3=1
+  [ -n "$real_s3_prefix" ] && [ -n "$real_s3_region" ] ||
+    usage_error "--real-s3-bucket-prefix and --real-s3-region go together"
+  [ "$diagnostic" -eq 0 ] ||
+    usage_error "--diagnostic-prometheus-max-samples starts Prometheus alone, which uses no object store; it takes no --real-s3 flags"
+  # 44 leaves room for the longest suffix inside S3's 63-character bucket name.
+  [[ "$real_s3_prefix" =~ ^[a-z0-9][a-z0-9-]{0,43}$ ]] ||
+    usage_error "--real-s3-bucket-prefix takes lowercase letters, digits and hyphens, at most 44 characters, got '$real_s3_prefix'"
+  [[ "$real_s3_region" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]] ||
+    usage_error "--real-s3-region takes an AWS region name, got '$real_s3_region'"
+fi
 if [ -n "$ravel_image_id" ]; then
   [ -n "$ravel_image" ] ||
     usage_error "--ravel-image-id needs --ravel-image REF naming the local tag it identifies"
@@ -588,6 +615,8 @@ command -v python3 >/dev/null 2>&1 || {
 ravel_image_kind=""
 if [ -n "$ravel_image_id" ]; then
   ravel_image_kind="local-build"
+  [ "$real_s3" -eq 0 ] ||
+    refuse "--ravel-image-id with --real-s3-bucket-prefix: the real-S3 lane produces publishable figures, and a local build is never publishable"
   [[ "$ravel_image_id" =~ ^sha256:[0-9a-f]{64}$ ]] ||
     refuse "--ravel-image-id '$ravel_image_id' is not sha256:<64 hex>"
   [ "$profile" = "ci" ] ||
@@ -699,6 +728,10 @@ if [ "$diagnostic" -eq 1 ]; then
   compose_files=(-f "${here}/docker-compose.yml" -f "${out_dir}/prometheus-max-samples.override.yml")
 else
   compose_files=(-f "${here}/docker-compose.yml" -f "${here}/ravel.yml")
+  if [ "$real_s3" -eq 1 ]; then
+    compose_files+=(-f "${here}/real-s3.yml")
+    export METRICSBENCH_S3_BUCKET_PREFIX="$real_s3_prefix" METRICSBENCH_S3_REGION="$real_s3_region"
+  fi
 fi
 # compose interpolates ravel.yml on every command, `ps` and `down` included.
 export RAVEL_IMAGE="${ravel_image:-unset-diagnostic-run-starts-no-ravel}"
@@ -771,7 +804,11 @@ stamp_str ravel_source_commit "${ravel_source_commit:-not given: diagnostic run}
 stamp_str harness_commit "$(git_head "$bin_dir")"
 stamp_str run_script_commit "$(git_head "$here")"
 stamp_str bin_dir "$bin_dir"
-stamp_str store_kind s3s-fs
+if [ "$real_s3" -eq 1 ]; then
+  stamp_str store_kind s3
+else
+  stamp_str store_kind s3s-fs
+fi
 stamp_str instance_type "$host_instance_type"
 stamp_str host.arch "$host_arch"
 stamp_str host.kernel "$(uname -sr)"
@@ -1109,7 +1146,12 @@ run_diagnostic() {
 
 run_full() {
   local code=0 resolved line fold
-  fetch_s3s_fs
+  if [ "$real_s3" -eq 1 ]; then
+    stamp_set object_store "$(python3 -I -c 'import json,sys; print(json.dumps({"implementation":"s3","region":sys.argv[1],"credentials":"instance-role","buckets":[sys.argv[2]+"-"+b for b in ("ravel","mimir-blocks","mimir-ruler","mimir-alertmanager")]}))' \
+      "$real_s3_region" "$real_s3_prefix")"
+  else
+    fetch_s3s_fs
+  fi
 
   STACK_UP=1
   compose up -d >"${out_dir}/compose-up.log" 2>&1 || code=$?
@@ -1198,6 +1240,17 @@ run_full() {
   done < <(py capture-pins "${out_dir}/effective-config.json" 2>"${out_dir}/provenance.log")
   [ "${#pins[@]}" -eq 6 ] ||
     fail_step provenance "$(cat "${out_dir}/provenance.log")"
+  local store_args
+  if [ "$real_s3" -eq 1 ]; then
+    store_args=(--store-backend s3 --region "$real_s3_region" --endpoint n/a --bills-requests
+      --config "store_kind=s3"
+      --config "store_bucket_prefix=${real_s3_prefix}")
+  else
+    store_args=(--store-backend s3s-fs --region us-east-1 --endpoint http://s3s:9000
+      --config "store_kind=s3s-fs"
+      --config "store_release=${S3S_FS_RELEASE}"
+      --config "store_sha256=${s3s_fs_sha256}")
+  fi
   local it_env=(env -u RAVEL_INSTANCE_TYPE)
   [ "$host_instance_type" = "unknown" ] || it_env=(env "RAVEL_INSTANCE_TYPE=${host_instance_type}")
   # ravel_git_commit names the source of the image under test, not this
@@ -1205,16 +1258,13 @@ run_full() {
   code=0
   "${it_env[@]}" GITHUB_SHA="$ravel_source_commit" "${bin_dir}/metricsbench_report" provenance \
     --workload "$WORKLOAD" --corpus "$CORPUS" \
-    --store-backend s3s-fs --region us-east-1 --endpoint http://s3s:9000 \
+    "${store_args[@]}" \
     "${pins[@]}" \
     --config "ravel_image=${ravel_image}" \
     --config "ravel_image_kind=${ravel_image_kind}" \
     ${ravel_image_id:+--config "ravel_image_id=${ravel_image_id}"} \
     --config "ravel_source_commit=${ravel_source_commit}" \
     --config "harness_commit=$(py get "$STAMPS" harness_commit)" \
-    --config "store_kind=s3s-fs" \
-    --config "store_release=${S3S_FS_RELEASE}" \
-    --config "store_sha256=${s3s_fs_sha256}" \
     >"${out_dir}/provenance.json" 2>>"${out_dir}/provenance.log" || code=$?
   if [ "$code" -ne 0 ]; then
     show_log "${out_dir}/provenance.log"

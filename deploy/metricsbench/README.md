@@ -548,6 +548,7 @@ script, and run in CI's `doc-scripts` job.
 | `--keep` | Leave the stack up; stamps say `kept (--keep)` and no `down -v` runs (case g). |
 | `--rss-band CONTAINER:MIN:MAX` | Repeatable. The peak sampled memory of the container (matched by container name or compose service) must lie in `[MIN, MAX]` bytes; outside it, or with no samples, the run exits 75 (case d). |
 | `--diagnostic-prometheus-max-samples N` | The falsification run, below. |
+| `--real-s3-bucket-prefix PREFIX`, `--real-s3-region REGION` | The real-S3 lane, below. One without the other, a prefix S3 cannot name or longer than 44 characters, a malformed region, or either with the falsification run exits 64 (cases s2 to s7). A local build is refused with exit 65 (case t). |
 
 A compose project `metricsbench` that already has containers or volumes is
 refused with exit 65 before anything starts (case h), since an earlier run's
@@ -697,6 +698,36 @@ URL, cached path and whether it came from the cache or a download; `not applicab
 cases a, f, n1, n5 and n7), `steps_completed`, `failed_step`,
 `failed_after_ingest` (cases a, q and q3), `exit_code`, `status` and
 `teardown`.
+
+### The real-S3 lane
+
+ADR-0927 decision 10 says only real S3 produces publishable Ravel performance
+and cost figures, because s3s-fs charges nothing per request. The two flags
+above layer `real-s3.yml` after `ravel.yml`, which moves Ravel and Mimir onto
+real S3 and changes no other setting. Prometheus and VictoriaMetrics stay on
+local disk.
+
+Before the run, on an EC2 host:
+
+1. Create four empty buckets in the region: `<PREFIX>-ravel`,
+   `<PREFIX>-mimir-blocks`, `<PREFIX>-mimir-ruler` and
+   `<PREFIX>-mimir-alertmanager`. `run.sh` does not create them, since bucket
+   names are global and a bucket outlives the run.
+2. Give the instance role read and write access to them.
+3. Set the instance's metadata hop limit to 2. Both engines get credentials
+   from the instance metadata service through the Docker bridge, one hop past
+   the default limit.
+
+`createbuckets` then checks the buckets instead of creating them, and fails the
+`qualify` step when one is missing, unreadable or holds an object: a bucket
+keeps its data after `down -v`, so each run needs fresh ones. `s3s` does not
+start and `fetch-s3s-fs` does not run (case s).
+
+`stamps.json` says `store_kind: "s3"` and lists the buckets under
+`object_store`. The provenance says `--store-backend s3`, endpoint `n/a` and
+`backend_bills_requests: true` (case s). Without the flags none of this happens
+(case s1). The lane has no credentials to record: neither engine is given a
+key.
 
 ### The falsification run
 
