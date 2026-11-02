@@ -462,16 +462,14 @@ counters that the read spends through, and hands the same view to its usage
 guard. So a future dropped in the middle of a resolve is billed for the store
 requests that it had already issued.
 
-- On the PromQL, metadata, and analytics operations that view is additive,
-  because one request can spend through several counter blocks. The record
-  sums all of them:
-  - The metrics lane and the log lane of a query naming both signals.
-  - One block per `match[]` selector of a metadata request.
-  - One block per attempt when a snapshot is invalidated and the read
-    re-resolves.
-- The exemplars and SQL operations hold one block at a time and replace it
-  when an attempt retries. So a cancellation there is billed for the retried
-  attempt alone and not also for the discarded one.
+That view is additive, because one request can spend through several counter
+blocks. The record sums all of them:
+
+- The metrics lane and the log lane of a query naming both signals.
+- One block per `match[]` selector of a metadata request.
+- One block per attempt when a snapshot is invalidated and the read
+  re-resolves, on the PromQL, metadata, analytics, exemplars, and SQL
+  operations alike.
 
 ### Failure boundaries
 
