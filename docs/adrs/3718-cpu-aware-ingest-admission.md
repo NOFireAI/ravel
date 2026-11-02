@@ -98,8 +98,12 @@ and deferred triggers averaged over 1 s as in D1:
 | CPU use | Deferred triggers | `p` |
 |---|---|---|
 | at or above the threshold | above zero (saturated) | rises by 0.05 |
-| at or above the release level (threshold minus 0.05, so 0.90 by default) | zero | holds |
-| below the release level | any | falls by 10% of itself |
+| at or above the release level (threshold minus 0.05, so 0.90 by default) | any, while not saturated | holds |
+| below the release level | any | falls by 10% of itself, and snaps to 0 below 0.01 |
+
+The three rows partition every input: saturated, not saturated but near the
+ceiling, and clear of it. The snap to 0 means a node that has left the ceiling
+refuses nothing, rather than a vanishing fraction for ever.
 
 The middle row is what lets `p` settle. Once shedding brings the admitted
 load just under the ceiling, deferrals stop but CPU use stays near the
@@ -175,7 +179,7 @@ flowchart LR
   subgraph det["saturation detector, every 100 ms (D1)"]
     U["process CPU / cores"] --> S{"saturated?\nCPU at least 0.95\nand deferred triggers above 0"}
     Q["deferred flush triggers\n(per-shard counters)"] --> S
-    S --> PF["p: +0.05 while saturated,\nheld while CPU at least 0.90,\n-10% of p below that"]
+    S --> PF["p: +0.05 while saturated,\nelse held while CPU at least 0.90,\nelse -10% of p, 0 below 0.01"]
   end
   F -. defers triggers .-> Q
   PF -. sets p .-> C
