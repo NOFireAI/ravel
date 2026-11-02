@@ -41,6 +41,14 @@
 //! without) and the report is still printed
 //! (`metricsbench_ingest_smoke::a_later_hard_failure_after_a_failed_readback_keeps_the_report`).
 //!
+//! `--readback-only` replays nothing: it reads one system's row of an
+//! earlier `ingest.json` back against a plan rebuilt from the same stream,
+//! prints `system`, `plan_series_count` and `readback` or `readback_error`,
+//! and exits 0 on a match, 1 on a mismatch or read-back error, and 64 on a
+//! usage refusal
+//! (`metricsbench_ingest_smoke::readback_only_reads_a_kept_report_back_without_writing`,
+//! `metricsbench_ingest_smoke::readback_only_refusals_exit_64`).
+//!
 //! Reachable as `cargo run -p ravel-bench --bin metricsbench_ingest -- \
 //! --profile ci --store memory --steps 10 --anchor-ms 1700000010000`.
 #![allow(clippy::expect_used)]
@@ -55,12 +63,13 @@ use ravel_bench::metrics_gen::{GenerationReport, Generator};
 use ravel_bench::metrics_ingest::{
     AnchorError, Band6Violation, DEFAULT_HTTP_BATCH_SIZE, DEFAULT_HTTP_SHARDS, FailedReplay,
     GeneratedStream, HttpReplayConfig, IN_PROCESS_SYSTEM, LaneError, MetricsIngestReport,
-    PayloadClass, ProfileRecord, RavelReplayConfig, ReadbackConfig, Receiver,
+    PayloadClass, ProfileRecord, RavelReplayConfig, Readback, ReadbackConfig, Receiver,
     RowAccountingViolation, RowFailure, RunProvenance, STALL_GRACE, STALL_RECHECK, StallCeiling,
     StalledRow, StreamBandViolation, StreamCounts, Substrate, SystemIngestResult,
     SystemQueryResult, build_profile_record, check_anchor, check_expected_digests_agree,
     check_row_accounting, check_row_band6, check_stream_band, query_after_replay,
-    readback_over_http, replay_into_ravel, replay_over_http_with_plan, workload_digest,
+    readback_over_http, readback_plan_without_sending, replay_into_ravel,
+    replay_over_http_with_plan, workload_digest,
 };
 use ravel_bench::metrics_workload::{Profile, WorkloadFile, load_workload};
 use ravel_types::TenantId;
@@ -208,6 +217,19 @@ struct Args {
     /// reads once.
     #[arg(long, default_value_t = 60)]
     readback_settle_secs: u64,
+    /// Replay nothing: read one system back from an `ingest.json` this bin
+    /// wrote earlier, against a plan rebuilt from the same stream. Needs
+    /// `--ingest-report`, `--readback-system`, `--anchor-ms` and that
+    /// system's query URL flag, and refuses every write endpoint flag.
+    #[arg(long)]
+    readback_only: bool,
+    /// The `ingest.json` to read back from. `--readback-only` only.
+    #[arg(long)]
+    ingest_report: Option<PathBuf>,
+    /// The system row of `--ingest-report` to read back (`ravel`,
+    /// `prometheus`, `victoriametrics` or `mimir`). `--readback-only` only.
+    #[arg(long)]
+    readback_system: Option<String>,
 }
 
 /// A band violation: the run measured something outside what was pre-registered
@@ -320,6 +342,45 @@ enum RunError {
     NothingIngested { system: String },
     #[error("the post-ingest read-your-write query phase failed: {0}")]
     Query(String),
+    #[error("--{flag} needs --readback-only")]
+    ReadbackOnlyFlag { flag: &'static str },
+    #[error("--readback-only needs --{flag}")]
+    MissingReadbackFlag { flag: &'static str },
+    #[error("--{flag} replays into a system, and --readback-only sends no write")]
+    WriteEndpointWithReadbackOnly { flag: &'static str },
+    #[error(
+        "--readback-system `{name}` is not a portable system (ravel, prometheus, \
+         victoriametrics or mimir)"
+    )]
+    UnknownReadbackSystem { name: String },
+    #[error("--readback-only for {system} needs --{system}-query-url")]
+    MissingReadbackQueryUrl { system: &'static str },
+    #[error("--ravel-bearer-token-env applies to the ravel row only, not to {system}")]
+    BearerForOtherSystem { system: &'static str },
+    #[error("reading the ingest report {path}: {detail}")]
+    IngestReport { path: String, detail: String },
+    #[error("the ingest report has no row for {system}")]
+    NoReportRow { system: String },
+    #[error("the ingest report has {count} rows for {system}, so the row to read is ambiguous")]
+    DuplicateReportRow { system: String, count: usize },
+    #[error("the ingest report's {system} row recorded no successful ingest: {reason}")]
+    RowNotIngested { system: String, reason: String },
+    #[error("the ingest report carries no {field}, so it cannot be matched to the arguments")]
+    ReportFieldMissing { field: &'static str },
+    #[error(
+        "the ingest report's {field} is {report}, but the arguments give {argument}: it \
+         describes a different stream"
+    )]
+    ReportMismatch {
+        field: &'static str,
+        report: String,
+        argument: String,
+    },
+    #[error(
+        "the regenerated stream's digest {got} differs from the ingest report's {expected}, so \
+         the rebuilt plan is not the one the replay recorded"
+    )]
+    RegeneratedStreamDiverged { expected: String, got: String },
 }
 
 impl RunError {
@@ -481,7 +542,19 @@ fn exit_code(err: &RunError) -> i32 {
         | RunError::MissingQueryUrl { .. }
         | RunError::QueryUrlWithoutEndpoint { .. }
         | RunError::NoRows
-        | RunError::ZeroHttpSetting { .. } => EXIT_USAGE,
+        | RunError::ZeroHttpSetting { .. }
+        | RunError::ReadbackOnlyFlag { .. }
+        | RunError::MissingReadbackFlag { .. }
+        | RunError::WriteEndpointWithReadbackOnly { .. }
+        | RunError::UnknownReadbackSystem { .. }
+        | RunError::MissingReadbackQueryUrl { .. }
+        | RunError::BearerForOtherSystem { .. }
+        | RunError::IngestReport { .. }
+        | RunError::NoReportRow { .. }
+        | RunError::DuplicateReportRow { .. }
+        | RunError::RowNotIngested { .. }
+        | RunError::ReportFieldMissing { .. }
+        | RunError::ReportMismatch { .. } => EXIT_USAGE,
         _ => 1,
     }
 }
@@ -663,6 +736,7 @@ fn assemble(
 }
 
 async fn run(args: &Args) -> Result<MetricsIngestReport, RunFailure> {
+    refuse_readback_flags(args)?;
     let workload = load_workload(&args.workload).map_err(|e| RunError::Workload(e.to_string()))?;
     let steps = resolve_steps(args, &workload)?;
     let profile = workload.profile(&args.profile).ok_or_else(|| {
@@ -958,6 +1032,281 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunFailure> {
     }
 }
 
+/// `--ingest-report` or `--readback-system` without `--readback-only` is
+/// refused (`tests::readback_flags_need_readback_only`).
+fn refuse_readback_flags(args: &Args) -> Result<(), RunError> {
+    if args.readback_only {
+        return Ok(());
+    }
+    if args.ingest_report.is_some() {
+        return Err(RunError::ReadbackOnlyFlag {
+            flag: "ingest-report",
+        });
+    }
+    if args.readback_system.is_some() {
+        return Err(RunError::ReadbackOnlyFlag {
+            flag: "readback-system",
+        });
+    }
+    Ok(())
+}
+
+/// What `--readback-only` reads, once its flags are checked: the report
+/// path, the receiver, its query URL and bearer token.
+struct ReadbackOnlyTarget {
+    ingest_report: PathBuf,
+    receiver: Receiver,
+    query_url: String,
+    bearer_token: Option<String>,
+}
+
+/// Check the `--readback-only` flags before anything is read: no write
+/// endpoint, the report and system given, the system portable, its query URL
+/// given, and a bearer token only for the ravel row
+/// (`metricsbench_ingest_smoke::readback_only_refusals_exit_64`).
+fn resolve_readback_target(args: &Args) -> Result<ReadbackOnlyTarget, RunError> {
+    for (flag, endpoint) in [
+        ("ravel-endpoint", &args.ravel_endpoint),
+        ("prometheus-endpoint", &args.prometheus_endpoint),
+        ("victoriametrics-endpoint", &args.victoriametrics_endpoint),
+        ("mimir-endpoint", &args.mimir_endpoint),
+    ] {
+        if endpoint.is_some() {
+            return Err(RunError::WriteEndpointWithReadbackOnly { flag });
+        }
+    }
+    let ingest_report = args
+        .ingest_report
+        .clone()
+        .ok_or(RunError::MissingReadbackFlag {
+            flag: "ingest-report",
+        })?;
+    let name = args
+        .readback_system
+        .as_deref()
+        .ok_or(RunError::MissingReadbackFlag {
+            flag: "readback-system",
+        })?;
+    let (receiver, query_url) = [
+        (Receiver::Ravel, &args.ravel_query_url),
+        (Receiver::Prometheus, &args.prometheus_query_url),
+        (Receiver::VictoriaMetrics, &args.victoriametrics_query_url),
+        (Receiver::Mimir, &args.mimir_query_url),
+    ]
+    .into_iter()
+    .find(|(receiver, _)| receiver.system() == name)
+    .ok_or_else(|| RunError::UnknownReadbackSystem {
+        name: name.to_string(),
+    })?;
+    let query_url = query_url.clone().ok_or(RunError::MissingReadbackQueryUrl {
+        system: receiver.system(),
+    })?;
+    let bearer_token = match &args.ravel_bearer_token_env {
+        None => None,
+        Some(_) if receiver != Receiver::Ravel => {
+            return Err(RunError::BearerForOtherSystem {
+                system: receiver.system(),
+            });
+        }
+        Some(var) => match std::env::var(var) {
+            Ok(token) if !token.is_empty() => Some(token),
+            _ => return Err(RunError::MissingBearerToken { var: var.clone() }),
+        },
+    };
+    Ok(ReadbackOnlyTarget {
+        ingest_report,
+        receiver,
+        query_url,
+        bearer_token,
+    })
+}
+
+/// The one row of `report` that `system` names, refused when there is none
+/// or more than one, or when it recorded no successful ingest (a stall, a
+/// failed replay, or a `row_failure`)
+/// (`tests::the_readback_row_is_one_successfully_ingested_row`).
+fn select_readback_row(
+    report: &MetricsIngestReport,
+    system: &str,
+) -> Result<SystemIngestResult, RunError> {
+    let not_ingested = |reason: String| RunError::RowNotIngested {
+        system: system.to_string(),
+        reason,
+    };
+    if let Some(stalled) = report.stalled.iter().find(|s| s.system == system) {
+        return Err(not_ingested(format!("it stalled: {}", stalled.error)));
+    }
+    let rows: Vec<&SystemIngestResult> = report
+        .systems
+        .iter()
+        .filter(|r| r.system == system)
+        .collect();
+    match rows.as_slice() {
+        [] => match report.failed_replays.iter().find(|f| f.system == system) {
+            Some(failed) => Err(not_ingested(format!("its replay failed: {}", failed.error))),
+            None => Err(RunError::NoReportRow {
+                system: system.to_string(),
+            }),
+        },
+        [row] => match &row.row_failure {
+            Some(failure) => Err(not_ingested(format!(
+                "it carries row_failure: {}",
+                failure.error
+            ))),
+            None => Ok((*row).clone()),
+        },
+        _ => Err(RunError::DuplicateReportRow {
+            system: system.to_string(),
+            count: rows.len(),
+        }),
+    }
+}
+
+/// `field` as the report records it, refused when absent or different from
+/// the argument.
+fn check_report_field<T: PartialEq + std::fmt::Display>(
+    field: &'static str,
+    report: Option<&T>,
+    argument: &T,
+) -> Result<(), RunError> {
+    match report {
+        None => Err(RunError::ReportFieldMissing { field }),
+        Some(value) if value != argument => Err(RunError::ReportMismatch {
+            field,
+            report: value.to_string(),
+            argument: argument.to_string(),
+        }),
+        Some(_) => Ok(()),
+    }
+}
+
+/// What `--readback-only` prints: the system, how many series the rebuilt
+/// plan holds, and the read-back or why it failed.
+#[derive(Debug, serde::Serialize)]
+struct ReadbackOnlyOutput {
+    system: String,
+    plan_series_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    readback: Option<Readback>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    readback_error: Option<String>,
+}
+
+/// `--readback-only`: rebuild the named row's plan from the stream the
+/// report's workload digest, profile, steps and anchor name, without opening
+/// a write connection, and read the row back with its commit tokens through
+/// [`readback_over_http`], as the replay does.
+async fn run_readback_only(args: &Args) -> Result<ReadbackOnlyOutput, RunError> {
+    let target = resolve_readback_target(args)?;
+    let system = target.receiver.system();
+    let text =
+        std::fs::read_to_string(&target.ingest_report).map_err(|e| RunError::IngestReport {
+            path: target.ingest_report.display().to_string(),
+            detail: e.to_string(),
+        })?;
+    let report: MetricsIngestReport =
+        serde_json::from_str(&text).map_err(|e| RunError::IngestReport {
+            path: target.ingest_report.display().to_string(),
+            detail: e.to_string(),
+        })?;
+    let row = select_readback_row(&report, system)?;
+    let recorded = report
+        .profile
+        .as_ref()
+        .ok_or(RunError::ReportFieldMissing { field: "profile" })?;
+    check_report_field("profile name", Some(&recorded.name), &args.profile)?;
+    let steps = recorded.run.steps;
+    if let Some(flag_steps) = args.steps {
+        check_report_field("step count", Some(&steps), &flag_steps)?;
+    }
+
+    let workload = load_workload(&args.workload).map_err(|e| RunError::Workload(e.to_string()))?;
+    let profile = workload.profile(&args.profile).ok_or_else(|| {
+        RunError::Generate(format!("manifest declares no profile `{}`", args.profile))
+    })?;
+    let anchor_ms = resolve_anchor(args, profile.scrape_interval_secs, steps)?;
+    let manifest_bytes = std::fs::read(&args.workload).map_err(|e| {
+        RunError::Workload(format!(
+            "reading {} for its digest: {e}",
+            args.workload.display()
+        ))
+    })?;
+    check_report_field(
+        "workload digest",
+        recorded.run.workload_digest.as_ref(),
+        &workload_digest(&manifest_bytes),
+    )?;
+    check_report_field("anchor", recorded.run.anchor_ms.as_ref(), &anchor_ms)?;
+
+    let generator = Generator::new(&workload, &args.profile, anchor_ms)
+        .map_err(|e| RunError::Generate(e.to_string()))?;
+    let mut stream = GeneratedStream::new(generator, steps);
+    let plan = readback_plan_without_sending(target.receiver, &mut stream)
+        .map_err(|e| RunError::Generate(e.to_string()))?;
+    let (regenerated, _) = stream
+        .finish()
+        .map_err(|e| RunError::Generate(e.to_string()))?;
+    if let Some(expected) = &recorded.run.stream_digest
+        && *expected != regenerated.digest
+    {
+        return Err(RunError::RegeneratedStreamDiverged {
+            expected: expected.clone(),
+            got: regenerated.digest,
+        });
+    }
+
+    let readback_cfg = ReadbackConfig {
+        query_url: target.query_url,
+        bearer_token: target.bearer_token,
+        timeout_secs: args.readback_timeout_secs,
+        settle_secs: args.readback_settle_secs,
+    };
+    let mut output = ReadbackOnlyOutput {
+        system: system.to_string(),
+        plan_series_count: plan.series_count(),
+        readback: None,
+        readback_error: None,
+    };
+    match readback_over_http(&readback_cfg, &row, &plan).await {
+        Ok(readback) => output.readback = Some(readback),
+        Err(error) => output.readback_error = Some(error.to_string()),
+    }
+    Ok(output)
+}
+
+/// Print `--readback-only`'s output and exit: 0 when the read-back matches,
+/// 1 on a mismatch or a read-back error, each kept in the JSON, and the
+/// error's own code, with no JSON, when the read could not be set up.
+async fn readback_only_main(args: &Args) -> ! {
+    let output = match run_readback_only(args).await {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("metricsbench_ingest: {error}");
+            std::process::exit(exit_code(&error));
+        }
+    };
+    let json = serde_json::to_string_pretty(&output).expect("serialize read-back");
+    println!("{json}");
+    let failure = match (&output.readback, &output.readback_error) {
+        (Some(readback), _) if readback.matches_expected => None,
+        (Some(readback), _) => Some(format!(
+            "{}'s read-back does not match what it accepted: {}",
+            output.system,
+            readback.mismatches.join("; ")
+        )),
+        (None, error) => Some(format!(
+            "reading {} back failed: {}",
+            output.system,
+            error.as_deref().unwrap_or("no read-back")
+        )),
+    };
+    if let Some(failure) = failure {
+        eprintln!("metricsbench_ingest: {failure}");
+        std::process::exit(1);
+    }
+    std::process::exit(0)
+}
+
 /// Records a band 6 across rows failure that follows an earlier row's
 /// failure as `row_failure` on the row it names, so the report is still
 /// printed
@@ -979,6 +1328,9 @@ fn record_across_rows_failure(portable: &mut [SystemIngestResult], error: &RunEr
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    if args.readback_only {
+        readback_only_main(&args).await;
+    }
     match run(&args).await {
         Ok(report) => {
             let json = serde_json::to_string_pretty(&report).expect("serialize report");
@@ -1307,6 +1659,90 @@ mod tests {
             );
             assert_eq!(exit_code(&err), 64);
         }
+    }
+
+    /// The read-back-only flags are refused without `--readback-only`.
+    #[test]
+    fn readback_flags_need_readback_only() {
+        refuse_readback_flags(&args(&[])).expect("neither flag");
+        for (flag, name) in [
+            ("--ingest-report", "ingest-report"),
+            ("--readback-system", "readback-system"),
+        ] {
+            let err = refuse_readback_flags(&args(&[flag, "x"])).expect_err("flag alone");
+            assert!(
+                matches!(err, RunError::ReadbackOnlyFlag { flag: f } if f == name),
+                "{err}"
+            );
+            assert_eq!(exit_code(&err), 64);
+        }
+        refuse_readback_flags(&args(&["--readback-only", "--ingest-report", "x"]))
+            .expect("with --readback-only");
+    }
+
+    /// The row `--readback-only` reads is the report's one row for the
+    /// system, and only when it ingested: no row, two rows, a stalled row, a
+    /// failed replay and a `row_failure` are each refused with exit 64.
+    #[test]
+    fn the_readback_row_is_one_successfully_ingested_row() {
+        let report = MetricsIngestReport::new(vec![
+            portable_row("prometheus", "aa"),
+            portable_row("mimir", "aa"),
+        ]);
+        let row = select_readback_row(&report, "mimir").expect("one ingested row");
+        assert_eq!(row, report.systems[1]);
+
+        let refused = |report: &MetricsIngestReport, system: &str| {
+            let err = select_readback_row(report, system).expect_err("refused");
+            assert_eq!(exit_code(&err), 64, "{err}");
+            err.to_string()
+        };
+        assert_eq!(
+            refused(&report, "ravel"),
+            "the ingest report has no row for ravel"
+        );
+
+        let twice = MetricsIngestReport::new(vec![
+            portable_row("mimir", "aa"),
+            portable_row("mimir", "aa"),
+        ]);
+        assert!(refused(&twice, "mimir").contains("has 2 rows for mimir"));
+
+        let mut failed = report.clone();
+        failed.systems[1].row_failure = Some(RowFailure {
+            band: Some(6),
+            error: "band 6".to_string(),
+        });
+        let text = refused(&failed, "mimir");
+        assert!(
+            text.contains("recorded no successful ingest") && text.contains("row_failure"),
+            "{text}"
+        );
+
+        let mut stalled = report.clone();
+        stalled.stalled.push(StalledRow {
+            system: "ravel".to_string(),
+            endpoint: "http://r/api/v1/write".to_string(),
+            projected_secs: 1_200.0,
+            ceiling_secs: 600,
+            offered_points: 50,
+            stream_points: 1_000,
+            error: "stalled".to_string(),
+        });
+        let text = refused(&stalled, "ravel");
+        assert!(
+            text.contains("recorded no successful ingest") && text.contains("it stalled"),
+            "{text}"
+        );
+
+        let mut replay_failed = report.clone();
+        replay_failed.failed_replays.push(FailedReplay {
+            system: "victoriametrics".to_string(),
+            endpoint: "http://v/api/v1/write".to_string(),
+            error: "transport".to_string(),
+        });
+        let text = refused(&replay_failed, "victoriametrics");
+        assert!(text.contains("its replay failed"), "{text}");
     }
 
     /// A stalled row exits 1, the code a band violation exits with.
