@@ -555,6 +555,7 @@ script, and run in CI's `doc-scripts` job.
 | `--passes N`, `--reps N` | Passed to `metricsbench_query` as `--passes` and `--reps-per-pass` and stamped (case g); its own defaults (5 and 3) otherwise. |
 | `--keep` | Leave the stack up; stamps say `kept (--keep)` and no `down -v` runs (case g). |
 | `--rss-band CONTAINER:MIN:MAX` | Repeatable. The peak sampled memory of the container (matched by container name or compose service) must lie in `[MIN, MAX]` bytes; outside it, or with no samples, the run exits 75 (case d). |
+| `--ravel-objects-band MIN:MAX` | The band the `objects` step checks the count of Ravel's data objects (`t/<tenant>/m/l0/*.rseg` keys) against, inclusive (cases u1, u2). It counts data objects only, not commit records, probes or the whole bucket, so the same figure is comparable between s3s-fs and real S3. A value not of the form `MIN:MAX`, a minimum above the maximum (case u3), or the flag with the falsification run (case u4) exits 64. |
 | `--diagnostic-prometheus-max-samples N` | The falsification run, below. |
 | `--real-s3-bucket-prefix PREFIX`, `--real-s3-region REGION` | The real-S3 lane, below. One without the other, a prefix S3 cannot name or longer than 44 characters, a malformed region, or either with the falsification run exits 64 (cases s2 to s7). A local build is refused with exit 65 (case t). |
 
@@ -643,16 +644,40 @@ verification (step 6), after which the run goes on as a diagnostic:
 7. `mimir-readiness`: the ingest row for Mimir read back exactly what it
    accepted; the line is stamped (case a). After a failed ingest
    verification the line is stamped and the step is not checked (case q).
-8. `capture`: `capture-effective-config.sh` into `effective-config.json`,
+8. `objects`: Ravel's bucket is listed with `aws s3api list-objects-v2`,
+   run as `docker compose run --rm --no-deps -T --entrypoint aws
+   createbuckets`, so each lane lists with its own endpoint and credentials:
+   `ravel-metricsbench` through `--endpoint-url http://s3s:9000` on the
+   portable stack (case u), `<PREFIX>-ravel` with no endpoint override in
+   the real-S3 lane (case u8), where `real-s3.yml` leaves `createbuckets`
+   the instance role's credentials. No `--no-paginate` or `--max-items` is
+   passed, so the aws CLI follows every continuation token itself (its own
+   default, which the stubbed cases cannot show); a listing that still
+   carries a token fails the step with exit 70, as does a listing that
+   exits non-zero (cases u7, u6).
+   The listing is kept as `ravel-objects-listing.json`, and its keys are
+   counted, and their sizes summed, by kind into `ravel-objects.json`, the
+   same figures stamped as `ravel_objects`:
+   `data` (`t/<tenant>/m/l0/*.rseg`), `commit` (`t/<tenant>/m/c/`),
+   `qualify` (`sys/qualify/`, the store-qualify probes), `other` (the
+   catalog and bookkeeping keys) and `total`, every key once (case u). The
+   step fails when the kinds do not sum to the total; no listing can make
+   that happen, so no case drives it. With `--ravel-objects-band` the data
+   count must lie in the band; outside it the step fails with exit 70
+   naming `objects` (cases u1, u2). Without the flag the counts are stamped
+   only and the band is recorded as not set (case u). After a failed ingest
+   verification the step still runs (case q), and a band breach is listed
+   in `failed_after_ingest` (case u5).
+9. `capture`: `capture-effective-config.sh` into `effective-config.json`,
    which must exit 0; a partial capture (exit 1) fails the step with exit
    70 before any query runs (case k).
-9. `provenance`: `metricsbench_report provenance` into `provenance.json`,
-   pinning Prometheus, VictoriaMetrics and Mimir at the version and digest
-   the capture recorded (case a). Its `ravel_git_commit` is
-   `--ravel-source-commit`, not this checkout.
-10. `fold-state`: `ravel_catalog_fold_last_success_timestamp_seconds` from
+10. `provenance`: `metricsbench_report provenance` into `provenance.json`,
+    pinning Prometheus, VictoriaMetrics and Mimir at the version and digest
+    the capture recorded (case a). Its `ravel_git_commit` is
+    `--ravel-source-commit`, not this checkout.
+11. `fold-state`: `ravel_catalog_fold_last_success_timestamp_seconds` from
     Ravel's `/metrics` (case a), or `absent` (case j).
-11. `query`: `metricsbench_query` against all four engines into
+12. `query`: `metricsbench_query` against all four engines into
     `report.json`, with `--diagnostics diagnostics.json` for the per-entry
     ULP gaps against the oracle and every oracle retry (case a; the
     sidecar's fields are in benchmarks/metrics/README.md, "Portable query
@@ -661,11 +686,11 @@ verification (step 6), after which the run goes on as a diagnostic:
     `run_verdict: "failed"` and `failed_bands` (case q). When the failed row
     is the Prometheus oracle's, `metricsbench_query` refuses instead, writes
     no report, and the run ends here (case q4).
-12. `validate`: `metricsbench_report validate report.json` exits 0 (case a).
+13. `validate`: `metricsbench_report validate report.json` exits 0 (case a).
     After a failed ingest verification it must refuse the report, naming it
     a diagnostic of a failed run; a validate that accepts it fails the run
     (case q).
-13. `memory`: the sampler stops, `memory-summary.json` records peak and
+14. `memory`: the sampler stops, `memory-summary.json` records peak and
     final bytes per container and `OOMKilled` from `docker inspect` (case a),
     and every `--rss-band` is checked (case d). An OOM-killed container exits
     75 (case e).
@@ -700,7 +725,9 @@ case p), `ravel_image.resolved` (the `docker image inspect` result),
 and `anchor_source`, `started_at` and `ended_at`, `store_kind: s3s-fs`, `host.arch`,
 `instance_type` (EC2 IMDSv2, else `unknown`), `comparator_images` (each
 comparator's image block as the capture recorded it), `ravel_catalog_fold`,
-`mimir_readiness`, `in_process_row` (`present` or `skipped`, cases a, l and
+`mimir_readiness`, `ravel_objects` (the contents of `ravel-objects.json`,
+case u; `not applicable` in the diagnostic mode, case f),
+`in_process_row` (`present` or `skipped`, cases a, l and
 f), `object_store` (release, asset arch, engine arch and its source, sha256,
 URL, cached path and whether it came from the cache or a download; `not applicable` in the diagnostic mode;
 cases a, f, n1, n5 and n7), `steps_completed`, `failed_step`,
@@ -747,7 +774,7 @@ query once as an instant query at the newest sample. `falsification.json`
 records the HTTP status, `status`, `errorType`, `error` and the result's
 series count; no `report.json` is written and stamps say `diagnostic: true`
 (case f). `--ravel-image` and `--ravel-source-commit` are optional here,
-since no Ravel starts. A `--profile` the corpus does not declare
+since no Ravel starts; for the same reason the `objects` step does not run there (case f). A `--profile` the corpus does not declare
 `mb_long_range_7d_avg` for (today only `history`) is refused with exit 65
 before anything starts: elsewhere the query loads too few samples to reach
 the limit, and its success would falsify nothing (case f2). A failed ingest
@@ -762,9 +789,9 @@ deploy/metricsbench/run.sh --profile history --bin-dir target/release \
 | Exit | Meaning |
 |---|---|
 | 0 | Every step passed (cases a, f, g). |
-| 64 | Usage error (cases h, p). |
+| 64 | Usage error (cases h, p, u3, u4). |
 | 65 | A refused input, or an s3s-fs binary whose sha256 is not the pin; nothing was started (cases c, h, p, n2, n3, n4). |
-| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k, n6, r). After a failed ingest verification (a row's read-back failed or a row stalled) the run queries as a diagnostic, records the failure, and exits 70 naming step ingest, even when a later step failed too; the first later step to fail ends the run, so an `--rss-band` breach reaches `failed_after_ingest` only when every step before `memory` passed, while `memory-summary.json` records it either way (cases q, q2, q3, q4). |
+| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k, n6, r, u2). After a failed ingest verification (a row's read-back failed or a row stalled) the run queries as a diagnostic, records the failure, and exits 70 naming step ingest, even when a later step failed too; the first later step to fail ends the run, so an `--rss-band` breach reaches `failed_after_ingest` only when every step before `memory` passed, while `memory-summary.json` records it either way (cases q, q2, q3, q4). |
 | 75 | An `--rss-band` was violated or a container was OOM-killed (cases d, e). |
 
 ## Verify the pins
