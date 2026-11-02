@@ -9,6 +9,7 @@
 #     --ravel-source-commit SHA --bin-dir DIR --out-dir DIR
 #     [--anchor-ms N] [--passes N] [--reps N] [--keep]
 #     [--rss-band CONTAINER:MIN_BYTES:MAX_BYTES]...
+#     [--ravel-objects-band MIN:MAX]
 #     [--diagnostic-prometheus-max-samples N]
 #     [--real-s3-bucket-prefix PREFIX --real-s3-region REGION]
 #
@@ -72,7 +73,17 @@
 #               Any other ingest failure stops the run
 #   mimir-readiness  the ingest row for mimir read back what it accepted
 #               (after a failed ingest verification, stamped and not checked)
-#   capture     capture-effective-config.sh into <out>/effective-config.json
+#   objects     Ravel's bucket (ravel-metricsbench through http://s3s:9000, or
+#               <PREFIX>-ravel on the regional AWS endpoint in the real-S3
+#               lane) listed by aws s3api list-objects-v2 in the createbuckets
+#               service with its entrypoint overridden, every page; the keys
+#               counted and summed by kind into <out>/ravel-objects.json and
+#               stamped (ravel_objects): data (t/*/m/l0/*.rseg), commit
+#               (t/*/m/c/), qualify (sys/qualify/), other, and total. A
+#               failed or truncated listing fails the step. With
+#               --ravel-objects-band MIN:MAX the data count, and only it,
+#               must lie in [MIN, MAX]; otherwise the step fails
+#   capture    capture-effective-config.sh into <out>/effective-config.json
 #   provenance  metricsbench_report provenance into <out>/provenance.json
 #   fold-state  ravel_catalog_fold_last_success_timestamp_seconds from Ravel's
 #               /metrics, stamped
@@ -91,7 +102,9 @@
 # once as an instant query at the newest sample, into
 # <out>/falsification.json) and memory. It writes no report.json, and
 # stamps.json says diagnostic: true. --ravel-image and --ravel-source-commit
-# are optional there, since no Ravel is started.
+# are optional there, since no Ravel is started; objects does not run
+# (ravel_objects is stamped not applicable) and --ravel-objects-band is a
+# usage error.
 #
 # With --real-s3-bucket-prefix and --real-s3-region the run is the real-S3 lane
 # (ADR-0927 decision 10): the overlay real-s3.yml moves Ravel and Mimir onto the
@@ -176,7 +189,7 @@ say() {
 }
 
 usage() {
-  sed -n '7,13p' "$0" >&2
+  sed -n '7,14p' "$0" >&2
 }
 
 usage_error() {
@@ -450,6 +463,67 @@ elif op == "override":
     cmd = list(cmd)
     cmd[hits[0]] = f"--query.max-samples={n}"
     print(json.dumps({"services": {"prometheus": {"command": cmd}}}, indent=2))
+elif op == "ravel-objects":
+    # aws s3api list-objects-v2 JSON (every page merged), the output path, the
+    # bucket, the endpoint, then MIN:MAX or "". Exit 0 clean, 3 when the data
+    # count is outside the band, 4 when the listing cannot be counted.
+    listing_path, out_path, bucket, endpoint, band = args
+    try:
+        listing = load(listing_path)
+    except (OSError, ValueError) as e:
+        print(f"the listing is not JSON: {type(e).__name__}")
+        sys.exit(4)
+    if not isinstance(listing, dict):
+        print("the listing is not a list-objects-v2 document")
+        sys.exit(4)
+    if listing.get("NextToken") or listing.get("NextContinuationToken") or listing.get("IsTruncated"):
+        print("the listing is truncated: it carries a continuation token")
+        sys.exit(4)
+    rows = listing.get("Contents") or []
+    kinds = {k: {"count": 0, "bytes": 0} for k in ("data", "commit", "qualify", "other")}
+    total = {"count": 0, "bytes": 0}
+    for row in rows:
+        key, size = (row.get("Key"), row.get("Size")) if isinstance(row, dict) else (None, None)
+        if not isinstance(key, str) or not isinstance(size, int):
+            print(f"a listing row has no Key or integer Size: {row!r}")
+            sys.exit(4)
+        total["count"] += 1
+        total["bytes"] += size
+        if re.match(r"t/[^/]+/m/l0/", key) and key.endswith(".rseg"):
+            kind = "data"
+        elif re.match(r"t/[^/]+/m/c/", key):
+            kind = "commit"
+        elif key.startswith("sys/qualify/"):
+            kind = "qualify"
+        else:
+            kind = "other"
+        kinds[kind]["count"] += 1
+        kinds[kind]["bytes"] += size
+    for field in ("count", "bytes"):
+        summed = sum(k[field] for k in kinds.values())
+        if summed != total[field]:
+            print(f"the kinds' {field} sum to {summed}, the listing's total is {total[field]}")
+            sys.exit(4)
+    doc = {"bucket": bucket, "endpoint": endpoint, **kinds, "total": total}
+    verdict = None
+    if band:
+        lo, hi = (int(x) for x in band.split(":"))
+        n = kinds["data"]["count"]
+        verdict = "above" if n > hi else "below" if n < lo else "ok"
+        doc["band"] = {"min": lo, "max": hi, "counts": "data", "verdict": verdict}
+    else:
+        doc["band"] = "not set: no --ravel-objects-band given"
+    dump(out_path, doc)
+    line = (f"data {kinds['data']['count']} ({kinds['data']['bytes']} B), "
+            f"commit {kinds['commit']['count']}, qualify {kinds['qualify']['count']}, "
+            f"other {kinds['other']['count']}, total {total['count']} ({total['bytes']} B) in {bucket}")
+    if verdict is None:
+        print(line + "; no --ravel-objects-band set, counts stamped only")
+    elif verdict == "ok":
+        print(line + f"; data count inside --ravel-objects-band {band}")
+    else:
+        print(line + f"; data count {kinds['data']['count']} {verdict} --ravel-objects-band {band}")
+        sys.exit(3)
 elif op == "newest-time":
     # The newest generated sample, in seconds, as metricsbench_query evaluates
     # an instant entry: anchor_ms + (steps - 1) * scrape_interval_secs * 1000.
@@ -515,6 +589,7 @@ keep=0
 diag_max_samples=""
 real_s3_prefix=""
 real_s3_region=""
+objects_band=""
 bands=()
 
 is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
@@ -532,7 +607,7 @@ while [ $# -gt 0 ]; do
       ;;
     --profile | --ravel-image | --ravel-image-id | --ravel-source-commit | --bin-dir | --out-dir | \
       --anchor-ms | --passes | --reps | --rss-band | --diagnostic-prometheus-max-samples | \
-      --real-s3-bucket-prefix | --real-s3-region)
+      --real-s3-bucket-prefix | --real-s3-region | --ravel-objects-band)
       [ $# -ge 2 ] || usage_error "$1 needs a value"
       ;;
     *)
@@ -553,6 +628,7 @@ while [ $# -gt 0 ]; do
     --diagnostic-prometheus-max-samples) diag_max_samples="$2" ;;
     --real-s3-bucket-prefix) real_s3_prefix="$2" ;;
     --real-s3-region) real_s3_region="$2" ;;
+    --ravel-objects-band) objects_band="$2" ;;
   esac
   shift 2
 done
@@ -601,6 +677,14 @@ for band in ${bands[@]+"${bands[@]}"}; do
   hi="${band##*:}"
   [ "$lo" -le "$hi" ] || usage_error "--rss-band $band has its minimum above its maximum"
 done
+if [ -n "$objects_band" ]; then
+  [ "$diagnostic" -eq 0 ] ||
+    usage_error "--diagnostic-prometheus-max-samples starts no Ravel, so there are no Ravel objects to count; it takes no --ravel-objects-band"
+  [[ "$objects_band" =~ ^[0-9]+:[0-9]+$ ]] ||
+    usage_error "--ravel-objects-band takes MIN:MAX, got '$objects_band'"
+  [ "${objects_band%%:*}" -le "${objects_band##*:}" ] ||
+    usage_error "--ravel-objects-band $objects_band has its minimum above its maximum"
+fi
 if [ "$diagnostic" -eq 1 ] && [ "$diag_max_samples" -eq 0 ]; then
   usage_error "--diagnostic-prometheus-max-samples must be at least 1"
 fi
@@ -821,6 +905,7 @@ fi
 stamp_set comparator_images null
 stamp_set ravel_catalog_fold null
 stamp_set mimir_readiness null
+stamp_set ravel_objects null
 stamp_set object_store null
 stamp_set in_process_row null
 stamp_set steps_completed '[]'
@@ -1088,6 +1173,38 @@ fetch_s3s_fs() {
   step_done fetch-s3s-fs
 }
 
+# count_ravel_objects: list Ravel's bucket through the createbuckets service,
+# so each lane uses its own endpoint and credentials, and split the keys by
+# kind into ravel-objects.json. The aws CLI follows every continuation token
+# itself unless told not to.
+count_ravel_objects() {
+  local bucket endpoint code=0 line
+  local list_args=(s3api list-objects-v2 --output json)
+  if [ "$real_s3" -eq 1 ]; then
+    bucket="${real_s3_prefix}-ravel"
+    endpoint="regional AWS endpoint"
+  else
+    bucket="ravel-metricsbench"
+    endpoint="http://s3s:9000"
+    list_args=(--endpoint-url "$endpoint" "${list_args[@]}")
+  fi
+  compose run --rm --no-deps -T --entrypoint aws createbuckets "${list_args[@]}" --bucket "$bucket" \
+    >"${out_dir}/ravel-objects-listing.json" 2>"${out_dir}/objects.log" || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "${out_dir}/objects.log"
+    fail_step objects "listing bucket $bucket exited $code; see ${out_dir}/objects.log"
+  fi
+  code=0
+  line="$(py ravel-objects "${out_dir}/ravel-objects-listing.json" "${out_dir}/ravel-objects.json" \
+    "$bucket" "$endpoint" "$objects_band")" || code=$?
+  if [ "$code" -eq 0 ] || [ "$code" -eq 3 ]; then
+    stamp_set ravel_objects "$(cat "${out_dir}/ravel-objects.json")"
+  fi
+  [ "$code" -eq 0 ] || fail_step objects "$line"
+  say "objects: $line"
+  step_done objects
+}
+
 run_diagnostic() {
   local code=0 query at http
   compose_config="$("$DOCKER" compose -f "${here}/docker-compose.yml" config --format json 2>"${out_dir}/override.log")" ||
@@ -1113,6 +1230,7 @@ run_diagnostic() {
   stamp_str object_store "not applicable: diagnostic run starts no object store"
   stamp_str ravel_catalog_fold "not applicable: diagnostic run starts no Ravel"
   stamp_str mimir_readiness "not applicable: diagnostic run starts no Mimir"
+  stamp_str ravel_objects "not applicable: diagnostic run starts no Ravel"
 
   wait_ready prometheus "${PROM_BASE}/-/ready"
   step_done ready
@@ -1223,6 +1341,8 @@ run_full() {
     stamp_str mimir_readiness "$line"
     step_done mimir-readiness
   fi
+
+  count_ravel_objects
 
   code=0
   "$CAPTURE" --out "${out_dir}/effective-config.json" >"${out_dir}/capture.log" 2>&1 || code=$?
