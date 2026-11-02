@@ -168,7 +168,10 @@ async fn handle(State(state): State<Arc<McpRoute>>, request: Request<Body>) -> R
 /// Never derived from a configured or shared secret: two processes deriving
 /// one key would each honour cursors the other minted, and a restarted
 /// process would redeem cursors describing a snapshot it no longer has. A
-/// fresh key per process makes both cases a `cursor_invalid` refusal.
+/// fresh key per process makes both cases a `cursor_expired` refusal: the
+/// codec reads a token minted under another key as one from a process that
+/// is gone, and [`ravel_mcp::cursor::CursorError::failure`] maps that to
+/// `cursor_expired`, not `cursor_invalid`.
 static CURSOR_KEY: OnceLock<CursorKey> = OnceLock::new();
 
 fn cursor_key() -> anyhow::Result<&'static CursorKey> {
@@ -535,6 +538,7 @@ fn build_tool_context<'a>(
     let now_ns = clock.now_ns();
     ToolContext {
         tenant_hash,
+        now_ns,
         deadline_ns: now_ns.saturating_add(deadline_ns(&budgets)),
         protection_horizon_ns: now_ns.saturating_add(protection_horizon_ns),
         budgets,

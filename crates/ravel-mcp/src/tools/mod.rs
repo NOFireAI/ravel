@@ -29,6 +29,10 @@ pub struct ToolContext<'a> {
     /// The tenant the transport authenticated. Every store read a body issues
     /// is scoped to it, and a cursor minted under it is only redeemable by it.
     pub tenant_hash: TenantHash,
+    /// The wall-clock instant the call started, as a nanosecond epoch: what a
+    /// SQL body resolves at and mints its cursor at, and what a cursor's
+    /// deadline is tested against on redemption and confirmation.
+    pub now_ns: i64,
     /// Wall-clock instant the call must be finished by, as a nanosecond epoch.
     pub deadline_ns: i64,
     /// The instant, as a nanosecond epoch, through which the deployment
@@ -184,7 +188,7 @@ mod tests {
             &self,
             _tenant_hash: TenantHash,
             _request: &ravel_sql::SqlRequest,
-        ) -> Result<Envelope, Failure> {
+        ) -> Result<crate::draft::Draft, Failure> {
             Err(unreached("sql_execute"))
         }
 
@@ -200,7 +204,7 @@ mod tests {
             &self,
             _tenant_hash: TenantHash,
             _request: &ravel_sql::SqlRequest,
-        ) -> Result<Envelope, Failure> {
+        ) -> Result<crate::draft::ExplainOutcome, Failure> {
             Err(unreached("sql_explain"))
         }
     }
@@ -208,6 +212,7 @@ mod tests {
     pub(crate) fn test_context(key: &CursorKey) -> ToolContext<'_> {
         ToolContext {
             tenant_hash: TenantId::new("acme").hash(),
+            now_ns: 3 * 3_600_000_000_000,
             deadline_ns: 4 * 3_600_000_000_000,
             protection_horizon_ns: 30 * 3_600_000_000_000,
             budgets: McpRequestBudgets::default()

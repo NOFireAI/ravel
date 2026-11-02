@@ -184,6 +184,8 @@ use ravel_query::erasure::ErasurePredicate;
 use ravel_sql::{DeclaredColumn, DeclaredType};
 use ravel_types::{CommitToken, Signal, TenantHash};
 
+use crate::envelope::{Failure, FailureClass};
+
 /// Length in bytes of the trailing keyed-MAC tag.
 const MAC_LEN: usize = 32;
 
@@ -280,8 +282,8 @@ pub const MAX_TOKEN_BYTES: usize = 1024 * 1024;
 /// window a redemption starting now may still use.
 ///
 /// This constant also enters the bound on a cursor's lifetime, and through
-/// that what keeps [`PendingRedemption::confirm`]'s erasure check sound, under
-/// the minting rule [`PendingRedemption::confirm`] names. Raising a
+/// that what keeps [`PendingRedemption::confirm`]'s erasure check sound,
+/// through the clamp [`Cursor::mint`] applies. Raising a
 /// deployment's protection horizon without raising this value lengthens that
 /// lifetime; [`PendingRedemption::confirm`] states the bound the lifetime must
 /// stay under.
@@ -325,6 +327,33 @@ pub enum CursorError {
     /// decode outcomes above.
     #[error("cursor field length {len} exceeds the {max}-byte cap")]
     FieldTooLong { len: usize, max: usize },
+}
+
+impl CursorError {
+    /// The D4 failure a tool reports for this error, carrying its message.
+    ///
+    /// [`CursorError::Expired`] is `cursor_expired`, and that includes a token
+    /// minted by a process that has since restarted: its nonce is foreign, so
+    /// it decodes as expired, not invalid. [`CursorError::Invalid`] and
+    /// [`CursorError::TokenTooLong`] are `cursor_invalid`: both are a token
+    /// the caller sent that no redemption can use, and the second only names
+    /// the length the caller already knows. [`CursorError::FieldTooLong`] is
+    /// `internal`: it is only ever returned while minting, so it is this
+    /// process failing to build a token, never anything about one a caller
+    /// holds. The match is exhaustive, so a new variant must be classed here
+    /// before it compiles.
+    pub fn failure(self) -> Failure {
+        let class = match self {
+            CursorError::Expired => FailureClass::CursorExpired,
+            CursorError::Invalid | CursorError::TokenTooLong { .. } => FailureClass::CursorInvalid,
+            CursorError::FieldTooLong { .. } => FailureClass::Internal,
+        };
+        Failure {
+            class,
+            message: self.to_string(),
+            counter: None,
+        }
+    }
 }
 
 /// Where a paginated result left off.
@@ -522,6 +551,54 @@ impl Cursor {
         let tag = mac(key, &buf);
         buf.extend_from_slice(&tag);
         Ok(URL_SAFE_NO_PAD.encode(buf))
+    }
+
+    /// Mint the wire token a tool hands out: [`Cursor::encode`] after holding
+    /// `deadline_ns` to the cursor lifetime bound.
+    ///
+    /// The bound is `mint_ns + horizon - GRACE_NS`, where `horizon` is the
+    /// deployment's protection horizon as a duration. This crate never sees
+    /// that duration directly; the minting call's [`ToolContext`] carries it
+    /// as the pair `now_ns` and `protection_horizon_ns` (`now_ns + horizon`),
+    /// so the horizon is their difference and the bound is measured from this
+    /// cursor's own `mint_ns`, not from the minting call's clock.
+    ///
+    /// A `deadline_ns` past the bound is clamped to it, not refused. The bound
+    /// is the deployment's, not something the tool asked for, and a clamped
+    /// cursor is exactly as sound as one minted at the bound: stage one of a
+    /// redemption re-clamps the same way through [`effective_deadline_ns`]
+    /// and only ever shortens a deadline. Refusing would end pagination for
+    /// every tool whose requested lifetime is longer than the deployment
+    /// allows, with no gain in what a redemption can trust. A tool that has
+    /// no lifetime of its own passes `i64::MAX` and gets the bound.
+    ///
+    /// Refused with [`CursorError::Expired`] when the clamped deadline is not
+    /// after `now_ns`: such a token would be expired at its first redemption,
+    /// which happens when the horizon is no longer than [`GRACE_NS`] or the
+    /// resolve instant lies more than `horizon - GRACE_NS` in the past.
+    /// Every [`Cursor::encode`] failure passes through unchanged.
+    ///
+    /// [`ToolContext`]: crate::tools::ToolContext
+    pub fn mint(
+        &self,
+        key: &CursorKey,
+        now_ns: i64,
+        protection_horizon_ns: i64,
+    ) -> Result<String, CursorError> {
+        let horizon_ns = protection_horizon_ns.saturating_sub(now_ns);
+        let bound_ns = self
+            .mint_ns
+            .saturating_add(horizon_ns)
+            .saturating_sub(GRACE_NS);
+        let deadline_ns = self.deadline_ns.min(bound_ns);
+        if deadline_ns <= now_ns {
+            return Err(CursorError::Expired);
+        }
+        Cursor {
+            deadline_ns,
+            ..self.clone()
+        }
+        .encode(key)
     }
 
     /// Decode and MAC-verify a wire token. Does NOT check the tenant, tool, or
@@ -767,7 +844,7 @@ impl Cursor {
 /// fn page_two(token: &str, key: &CursorKey) -> Result<(), CursorError> {
 ///     let pending =
 ///         Cursor::redeem(token, key, TenantHash([0; 16]), "ravel_search_logs", &[0; 32], 0, 0)?;
-///     pending.confirm(&[], &[])?;
+///     pending.confirm(0, &[], &[])?;
 ///     Ok(())
 /// }
 /// # fn main() {}
@@ -818,6 +895,13 @@ impl PendingRedemption {
     /// with the pin, and hand back the cursor and its position only when
     /// nothing moved.
     ///
+    /// `now_ns` is the redeeming call's clock read when its resolve finished.
+    /// The deadline stage one checked is tested again against it, so a
+    /// resolve that ran past the pin's protection is [`CursorError::Expired`]
+    /// even though stage one accepted the token: the deadline is what bounds
+    /// the time the erasure check below depends on, and stage one cannot see
+    /// how long the resolve took.
+    ///
     /// `observed_erasure` is the pending erasure predicate set that resolve
     /// reported, each paired with the signal it applies to. A predicate that
     /// the cursor did not pin, whose signal is the cursor's own and whose
@@ -852,19 +936,20 @@ impl PendingRedemption {
     /// nothing asserts the relationship between them:
     ///
     /// - Maximum cursor lifetime is `protection_horizon_ns` minus
-    ///   [`GRACE_NS`], measured from the mint. Stage one enforces it only
-    ///   through [`effective_deadline_ns`], whose horizon argument is the
-    ///   redeeming call's `now + protection_horizon`; that clamp therefore
-    ///   never expires a cursor on its own, and the bound holds only when the
-    ///   minting side embeds a deadline no later than `mint_ns` plus the
-    ///   horizon less [`GRACE_NS`]. The horizon is the deployment's own
+    ///   [`GRACE_NS`], measured from the mint. [`Cursor::mint`] enforces it,
+    ///   clamping the embedded deadline to `mint_ns` plus the horizon less
+    ///   [`GRACE_NS`]. Stage one's own clamp, [`effective_deadline_ns`], cannot:
+    ///   its horizon argument is the redeeming call's `now +
+    ///   protection_horizon`, so it never expires a cursor on its own, and a
+    ///   token built with [`Cursor::encode`] directly carries whatever deadline
+    ///   its builder chose. The horizon is the deployment's own
     ///   (`CatalogConfig::protection_horizon_ns` in
     ///   `crates/ravel-catalog/src/config.rs`, default
     ///   `DEFAULT_PROTECTION_HORIZON_NS` = 25 h 05 m), set by an operator
     ///   through `ravel-cli gc-config set --protection-horizon`, which writes
     ///   durable `sys/gc`. [`GRACE_NS`] is a constant of this crate, 24 h,
-    ///   that no configuration moves. With the default horizon, and a minting
-    ///   side that follows the rule above, a cursor lives at most 1 h 05 m.
+    ///   that no configuration moves. With the default horizon, a cursor
+    ///   [`Cursor::mint`] minted lives at most 1 h 05 m.
     /// - Minimum erasure completion is the seal wait,
     ///   `erasure_seal_wait_bound_ns` in
     ///   `crates/ravel-maintain/src/erasure_rewrite.rs`: `max_ingest_lag`
@@ -873,8 +958,8 @@ impl PendingRedemption {
     ///   1 h + `clock_skew_allowance` 5 m), 4 h 05 m with defaults. A rewrite
     ///   cannot acknowledge before the bucket open at the request seals.
     ///
-    /// 1 h 05 m under 4 h 05 m is what closes the window, for a minting side
-    /// that follows that rule and a caller that resolves promptly. The operator
+    /// 1 h 05 m under 4 h 05 m is what closes the window, for a cursor minted
+    /// through [`Cursor::mint`] and a caller that resolves promptly. The operator
     /// action that opens it is raising `--protection-horizon`, because
     /// [`GRACE_NS`] cannot be raised with it. `gc-config set` accepts any
     /// horizon at or above `max_query_duration + grace +
@@ -890,9 +975,13 @@ impl PendingRedemption {
     /// to read either configured value from.
     pub fn confirm(
         self,
+        now_ns: i64,
         observed_erasure: &[(Signal, ErasurePredicate)],
         observed_declared_columns: &[DeclaredColumn],
     ) -> Result<Cursor, CursorError> {
+        if now_ns >= self.cursor.deadline_ns {
+            return Err(CursorError::Expired);
+        }
         if self.cursor.newer_erasure_intersects(observed_erasure) {
             return Err(CursorError::Expired);
         }
@@ -1211,6 +1300,14 @@ fn open_token(
 /// minted with an honest but over-long deadline (a misconfigured adapter, a
 /// horizon shortened after the mint) cannot outlive the protection its pin
 /// depends on.
+///
+/// This clamp is relative to the redeeming call's clock, so it never bounds a
+/// cursor's lifetime from its mint. [`Cursor::mint`] does that, by clamping
+/// the embedded deadline to `mint_ns + horizon - GRACE_NS` before encoding.
+/// Clamping rather than refusing there matches this function: both only ever
+/// shorten a deadline, a cursor at the bound is as sound as any shorter one,
+/// and a refusal would end pagination over a deadline the deployment, not the
+/// tool, is responsible for.
 fn effective_deadline_ns(embedded_deadline_ns: i64, protection_horizon_ns: i64) -> i64 {
     embedded_deadline_ns.min(protection_horizon_ns.saturating_sub(GRACE_NS))
 }
@@ -1435,7 +1532,7 @@ mod tests {
             protection_horizon_ns,
         )?;
         let declared = pending.cursor.declared_columns.clone();
-        pending.confirm(erasure, &declared)
+        pending.confirm(now_ns, erasure, &declared)
     }
 
     fn sample_evidence(tenant: TenantHash) -> EvidenceRef {
@@ -2746,7 +2843,7 @@ mod tests {
         assert_eq!(pending.deadline_ns(), cursor.deadline_ns);
 
         let redeemed = pending
-            .confirm(&pinned_erasure(&cursor), &cursor.declared_columns)
+            .confirm(NOW_NS, &pinned_erasure(&cursor), &cursor.declared_columns)
             .expect("nothing moved");
         assert_eq!(redeemed, cursor);
     }
@@ -2774,7 +2871,11 @@ mod tests {
         let newer = ErasurePredicate::windowless(user.clone());
 
         let err = pending_for(&token, &key, tenant)
-            .confirm(&[(Signal::Logs, newer.clone())], &cursor.declared_columns)
+            .confirm(
+                NOW_NS,
+                &[(Signal::Logs, newer.clone())],
+                &cursor.declared_columns,
+            )
             .expect_err("a newer erasure over the pinned signal and range");
         assert_eq!(err, CursorError::Expired);
 
@@ -2787,7 +2888,7 @@ mod tests {
         ] {
             assert_ne!(other, cursor.signal);
             let redeemed = pending_for(&token, &key, tenant)
-                .confirm(&[(other, newer.clone())], &cursor.declared_columns)
+                .confirm(NOW_NS, &[(other, newer.clone())], &cursor.declared_columns)
                 .expect("an erasure on another signal cannot touch this page");
             assert_eq!(redeemed, cursor);
         }
@@ -2798,12 +2899,12 @@ mod tests {
             cursor.range_start_ns,
         );
         let redeemed = pending_for(&token, &key, tenant)
-            .confirm(&[(cursor.signal, before)], &cursor.declared_columns)
+            .confirm(NOW_NS, &[(cursor.signal, before)], &cursor.declared_columns)
             .expect("an erasure wholly before the range cannot touch this page");
         assert_eq!(redeemed, cursor);
 
         let redeemed = pending_for(&token, &key, tenant)
-            .confirm(&pinned_erasure(&cursor), &cursor.declared_columns)
+            .confirm(NOW_NS, &pinned_erasure(&cursor), &cursor.declared_columns)
             .expect("the pinned predicate still pending is not newer");
         assert_eq!(redeemed, cursor);
     }
@@ -2853,7 +2954,7 @@ mod tests {
         ];
         for (what, observed) in &changed {
             let err = pending_for(&token, &key, tenant)
-                .confirm(&pinned_erasure(&cursor), observed)
+                .confirm(NOW_NS, &pinned_erasure(&cursor), observed)
                 .expect_err(what);
             assert_eq!(err, CursorError::Expired, "{what}");
         }
@@ -2863,7 +2964,7 @@ mod tests {
             vec![status.clone(), route.clone()],
         ] {
             let redeemed = pending_for(&token, &key, tenant)
-                .confirm(&pinned_erasure(&cursor), &observed)
+                .confirm(NOW_NS, &pinned_erasure(&cursor), &observed)
                 .expect("the same set redeems in any order");
             assert_eq!(redeemed, cursor);
         }
@@ -3029,7 +3130,7 @@ mod tests {
         assert_ne!(NOW_NS, cursor.mint_ns);
         let resolve_at_ns = pending.resolve_at_ns();
         let redeemed = pending
-            .confirm(&pinned_erasure(&cursor), &cursor.declared_columns)
+            .confirm(NOW_NS, &pinned_erasure(&cursor), &cursor.declared_columns)
             .expect("nothing moved");
         let page_two = |c: &Cursor| {
             snapshot_id(
@@ -3131,5 +3232,156 @@ mod tests {
         let mut duplicated = base.clone();
         duplicated.declared.push(base.declared[0].clone());
         assert_eq!(duplicated.id(), base.id());
+    }
+
+    /// Stage one accepts a token whose deadline is still ahead; a resolve
+    /// that finishes at or past that deadline is refused by stage two, and
+    /// one that finishes a nanosecond before it is not.
+    ///
+    /// FLIP: a `confirm` that ignores `now_ns` (stage two trusting stage
+    /// one's deadline check) returns the cursor on the late resolve.
+    /// FLIP: testing `now_ns > deadline_ns` instead of `>=` accepts the
+    /// resolve that lands exactly on the deadline, which stage one refuses.
+    #[test]
+    fn confirm_refuses_a_resolve_that_finished_past_the_deadline() {
+        let key = test_key();
+        let tenant = TenantHash([0xAAu8; 16]);
+        let cursor = sample_cursor(tenant);
+        let token = cursor.encode(&key).expect("encodes");
+        let declared = cursor.declared_columns.clone();
+        let redeem = || {
+            Cursor::redeem(
+                &token,
+                &key,
+                tenant,
+                SAMPLE_TOOL,
+                &SAMPLE_ARGS,
+                NOW_NS,
+                FAR_HORIZON_NS,
+            )
+            .expect("stage one accepts a token before its deadline")
+        };
+        assert!(NOW_NS < cursor.deadline_ns);
+
+        assert_eq!(
+            redeem()
+                .confirm(cursor.deadline_ns, NO_ERASURE, &declared)
+                .expect_err("a resolve finishing on the deadline is refused"),
+            CursorError::Expired
+        );
+        assert_eq!(
+            redeem()
+                .confirm(cursor.deadline_ns + 1, NO_ERASURE, &declared)
+                .expect_err("a resolve finishing past the deadline is refused"),
+            CursorError::Expired
+        );
+        assert_eq!(
+            redeem()
+                .confirm(cursor.deadline_ns - 1, NO_ERASURE, &declared)
+                .expect("a resolve finishing before the deadline confirms"),
+            cursor
+        );
+    }
+
+    /// `Cursor::mint` clamps the embedded deadline to `mint_ns` plus the
+    /// configured horizon less `GRACE_NS`, keeps a shorter one as it is, and
+    /// refuses a cursor whose clamped deadline is already behind `now_ns`.
+    /// The horizon here is 25 h 05 m measured from `now_ns`, the default, so
+    /// the bound is 1 h 05 m after the mint.
+    ///
+    /// FLIP: a `mint` that encodes `deadline_ns` unchanged decodes the
+    /// year-long deadline in the second case.
+    /// FLIP: a bound measured from `now_ns` rather than from `mint_ns`
+    /// decodes to a deadline 500 ms later than the one asserted.
+    /// FLIP: a `mint` that clamps every deadline to the bound, rather than
+    /// taking the smaller of the two, lengthens the first case's.
+    /// FLIP: a `mint` that never refuses returns a token that stage one
+    /// would refuse on its first redemption.
+    #[test]
+    fn mint_enforces_the_cursor_lifetime_bound() {
+        let key = test_key();
+        let tenant = TenantHash([0xAAu8; 16]);
+        let horizon_ns = 25 * 3_600 * 1_000_000_000 + 5 * 60 * 1_000_000_000;
+        let horizon_at = NOW_NS + horizon_ns;
+        let lifetime_ns = horizon_ns - GRACE_NS;
+        assert_eq!(lifetime_ns, 65 * 60 * 1_000_000_000);
+
+        let short = sample_cursor(tenant);
+        assert!(short.deadline_ns < short.mint_ns + lifetime_ns);
+        let token = short.mint(&key, NOW_NS, horizon_at).expect("mints");
+        assert_eq!(
+            Cursor::decode(&token, &key).expect("decodes").deadline_ns,
+            short.deadline_ns,
+            "a deadline inside the bound is kept"
+        );
+
+        let long = Cursor {
+            deadline_ns: short.mint_ns + 365 * 24 * 3_600 * 1_000_000_000,
+            ..short.clone()
+        };
+        let token = long.mint(&key, NOW_NS, horizon_at).expect("mints");
+        let decoded = Cursor::decode(&token, &key).expect("decodes");
+        assert_eq!(decoded.deadline_ns, long.mint_ns + lifetime_ns);
+        assert_eq!(
+            Cursor {
+                deadline_ns: long.deadline_ns,
+                ..decoded
+            },
+            long,
+            "only the deadline changes"
+        );
+
+        let stale = Cursor {
+            mint_ns: NOW_NS - lifetime_ns,
+            deadline_ns: i64::MAX,
+            ..short.clone()
+        };
+        assert_eq!(
+            stale.mint(&key, NOW_NS, horizon_at),
+            Err(CursorError::Expired),
+            "a bound that is already behind now is refused"
+        );
+        assert_eq!(
+            short.mint(&key, NOW_NS, NOW_NS + GRACE_NS),
+            Err(CursorError::Expired),
+            "a horizon no longer than the grace leaves no lifetime"
+        );
+    }
+
+    /// Every `CursorError` variant maps to the D4 class its doc states, and
+    /// carries its own message. The match below has no wildcard, so a new
+    /// variant fails to compile here until it is given a row.
+    ///
+    /// FLIP: mapping `Expired` to `cursor_invalid` (the adapter doc's old
+    /// claim for a restarted process's token) fails the first row.
+    /// FLIP: mapping `FieldTooLong` to `cursor_invalid` blames the caller for
+    /// a mint-time failure and fails the last row.
+    #[test]
+    fn cursor_error_failure_mapping_is_exhaustive() {
+        let all = [
+            CursorError::Expired,
+            CursorError::Invalid,
+            CursorError::TokenTooLong { len: 9, max: 8 },
+            CursorError::FieldTooLong { len: 9, max: 8 },
+        ];
+        for error in all {
+            let expected = match error {
+                CursorError::Expired => FailureClass::CursorExpired,
+                CursorError::Invalid => FailureClass::CursorInvalid,
+                CursorError::TokenTooLong { .. } => FailureClass::CursorInvalid,
+                CursorError::FieldTooLong { .. } => FailureClass::Internal,
+            };
+            let failure = error.failure();
+            assert_eq!(failure.class, expected, "{error:?}");
+            assert_eq!(failure.message, error.to_string());
+            assert_eq!(failure.counter, None);
+        }
+
+        let key = test_key();
+        let foreign = sample_cursor(TenantHash([0xAAu8; 16]))
+            .encode(&CursorKey::from_process_secret([0x22u8; CURSOR_KEY_LEN]))
+            .expect("encodes");
+        let restarted = Cursor::decode(&foreign, &key).expect_err("foreign nonce");
+        assert_eq!(restarted.failure().class, FailureClass::CursorExpired);
     }
 }

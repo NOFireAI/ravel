@@ -252,26 +252,6 @@ pub(crate) fn unencodable_sql_result(column: &str, data_type: &str, reason: &str
     }
 }
 
-/// The `budget` block of an operation that reports an estimate but no spend of
-/// its own.
-///
-/// `actual` stays empty rather than zero: an operation whose outcome type does
-/// not carry its accounting snapshot spent store requests it cannot report,
-/// and a zero there would read as a query that touched nothing.
-pub(crate) fn estimate_only(
-    envelope: &mut Envelope,
-    budgets: &McpEffectiveBudgets,
-    estimate: &CostEstimate,
-    estimate_is_upper_envelope: bool,
-) {
-    envelope.budget = Budget {
-        effective: AnyJson(ceilings(budgets)),
-        actual: AnyJson(Value::Object(Map::new())),
-        estimate: AnyJson(estimated(estimate)),
-        estimate_is_upper_envelope,
-    };
-}
-
 /// The effective ceilings, in the spelling `ravel_capabilities` reports and
 /// the D6 `budget.effective` block uses.
 fn ceilings(budgets: &McpEffectiveBudgets) -> Value {
@@ -458,20 +438,6 @@ pub(crate) fn series_data(series: Vec<(SeriesId, LabelSet)>) -> Data {
         .collect();
     Data {
         columns: vec![column("series_id", "hex_id"), column("series", "json")],
-        row_count: rows.len() as u64,
-        rows,
-    }
-}
-
-/// A `(property, value)` table, for an operation whose answer is a set of
-/// named figures rather than a result set.
-pub(crate) fn property_data(properties: Vec<(&str, Value)>) -> Data {
-    let rows: Vec<Row> = properties
-        .into_iter()
-        .map(|(name, value)| vec![Cell::Str(name.to_string()), json_cell(value)])
-        .collect();
-    Data {
-        columns: vec![column("property", "string"), column("value", "json")],
         row_count: rows.len() as u64,
         rows,
     }

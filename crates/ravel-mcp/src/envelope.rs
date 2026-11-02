@@ -102,7 +102,7 @@ const SCALAR_ALLOWANCE: usize = 4096;
 /// [`crate::cursor::MAX_TOKEN_BYTES`], which is the hostile-input cap the
 /// codec refuses to even look at a longer token past; this is what an
 /// envelope will carry.
-const CURSOR_BOUND: usize = 4096;
+pub(crate) const CURSOR_BOUND: usize = 4096;
 
 /// The per-scalar sub-bounds. Every scalar with a natural size has one, so
 /// no single field can eat the whole allowance and no cut is needed on a
@@ -888,7 +888,7 @@ const IDENTITY_WARNINGS_ALLOWANCE: usize = identity_warnings_allowance();
 /// as a backslash, a `u`, and four hex digits). That escape is spelled out
 /// here rather than written literally: a raw NUL byte in a source file makes
 /// every text tool, `grep` and `git diff` included, treat it as binary.
-fn serialized_str_len(s: &str) -> usize {
+pub(crate) fn serialized_str_len(s: &str) -> usize {
     escaped_len(s) + 2
 }
 

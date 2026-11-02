@@ -241,7 +241,8 @@ async fn feature_off_build_serves_no_mcp_route() {
 mod with_mcp {
     use super::*;
 
-    use ravel_mcp::budget::{McpBudgetConfig, McpRequestBudgets};
+    use ravel_mcp::budget::{McpBudgetConfig, McpEffectiveBudgets, McpRequestBudgets};
+    use ravel_mcp::draft::{Draft, EstimateComponent, PageOrder, PinScope};
     use ravel_mcp::envelope::FailureClass;
     use ravel_mcp::service::QueryBackend;
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
@@ -820,9 +821,12 @@ mod with_mcp {
     /// a handful of calls.
     const SQL_NOW_NS: i64 = 4 * 3_600_000_000_000;
 
-    /// Publish one sample of metric `m` at `ts_ns` 1 for the test tenant, as a
-    /// real segment plus its commit record, so `samples` has a row to project.
-    async fn publish_one_sample(store: &dyn ObjectStoreBackend) {
+    /// Publish one sample of metric `m` at `ts_ns` `1 + ingest_hour` for the
+    /// test tenant, as a real segment plus its commit record flushed in ingest
+    /// hour `ingest_hour` by writer sequence `writer_seq`, so `samples` has a
+    /// row to project and several calls with distinct hours and sequences land
+    /// several segments, each with its own row.
+    async fn publish_sample(store: &dyn ObjectStoreBackend, ingest_hour: u32, writer_seq: u64) {
         use ravel_commit::publish::RetryPolicy;
         use ravel_commit::record::NewCommitRecord;
         use ravel_commit::{keys, publish, record};
@@ -841,11 +845,12 @@ mod with_mcp {
             series_id: SeriesId::compute(&tenant, "m", &labels).expect("series id"),
             labels,
             samples: vec![Sample {
-                ts_ns: 1,
+                ts_ns: 1 + i64::from(ingest_hour),
                 value: 1.0,
             }],
         }];
         let writer_id = uuid::Uuid::from_u128(2_000);
+        let hour_start_ns = i64::from(ingest_hour) * 3_600_000_000_000;
         let written = SegmentWriter::write(
             series,
             SegmentIdentity {
@@ -853,11 +858,11 @@ mod with_mcp {
                 shard: 0,
                 writer_id: writer_id.to_string(),
                 writer_epoch: 1,
-                writer_seq: 1,
+                writer_seq,
             },
             IngestBounds {
-                min_ingest_ts_ns: 0,
-                max_ingest_ts_ns: 0,
+                min_ingest_ts_ns: hour_start_ns,
+                max_ingest_ts_ns: hour_start_ns,
             },
         )
         .expect("write segment");
@@ -867,7 +872,7 @@ mod with_mcp {
             shard: 0,
             writer_id,
             writer_epoch: 1,
-            writer_seq: 1,
+            writer_seq,
             object_size: written.bytes.len() as u64,
             content_hash: written.summary.blake3,
             sample_count: written.summary.sample_count,
@@ -877,8 +882,8 @@ mod with_mcp {
             min_ingest_ts_ns: written.summary.min_event_ts_ns,
             max_ingest_ts_ns: written.summary.max_event_ts_ns,
             segment_format_version: 1,
-            created_unix_ns: 10,
-            ingest_hour_bucket: 0,
+            created_unix_ns: hour_start_ns + 10,
+            ingest_hour_bucket: ingest_hour,
         })
         .expect("valid commit record");
         store
@@ -894,8 +899,8 @@ mod with_mcp {
             .expect("publish");
     }
 
-    /// A started server holding [`publish_one_sample`]'s row, and the
-    /// [`ServiceBackend`] the adapter hands `ravel_query_sql`'s body.
+    /// A started server holding one [`publish_sample`] row from ingest hour 0,
+    /// and the [`ServiceBackend`] the adapter hands `ravel_query_sql`'s body.
     ///
     /// Driven through the backend rather than the transport because
     /// `ravel_query_sql` is in the catalog but not served by this build: a
@@ -903,18 +908,53 @@ mod with_mcp {
     /// The mapping under test is the backend's own `sql_execute`, which is the
     /// call that tool body makes.
     async fn sql_backend() -> (ravel_server::Running, ServiceBackend) {
+        let (running, backend, _) = sql_backend_over(&[0]).await;
+        (running, backend)
+    }
+
+    /// [`sql_backend`] over one [`publish_sample`] segment per entry of
+    /// `ingest_hours`, plus the query service the backend wraps.
+    async fn sql_backend_over(
+        ingest_hours: &[u32],
+    ) -> (
+        ravel_server::Running,
+        ServiceBackend,
+        ravel_server::service::QueryService,
+    ) {
         let (store, metrics) = instrumented_memory();
-        publish_one_sample(store.as_ref()).await;
+        for (writer_seq, hour) in (1u64..).zip(ingest_hours) {
+            publish_sample(store.as_ref(), *hour, writer_seq).await;
+        }
         let running = start_server(store, metrics, mcp_on()).await;
         let service = running
             .query_service
             .clone()
             .expect("a query-serving mode builds one");
-        let budgets = McpRequestBudgets::default().clamp(
+        (
+            running,
+            ServiceBackend::new(service.clone(), sql_budgets()),
+            service,
+        )
+    }
+
+    fn sql_budgets() -> McpEffectiveBudgets {
+        McpRequestBudgets::default().clamp(
             &ravel_query::EngineConfig::default(),
             &McpBudgetConfig::default(),
-        );
-        (running, ServiceBackend::new(service, budgets))
+        )
+    }
+
+    /// Finish `draft` the way a tool without a total order does.
+    fn finish_unpaged(draft: Draft) -> ravel_mcp::envelope::Envelope {
+        let scope = PinScope {
+            tenant: expected_tenant(),
+            range_start_ns: 0,
+            range_end_ns: SQL_NOW_NS,
+            min_commit_watermark: Vec::new(),
+        };
+        draft.finish_page(&sql_budgets(), &scope, PageOrder::Partial, |_, _| {
+            panic!("a partial order never mints")
+        })
     }
 
     fn sql_request(sql: &str) -> ravel_sql::SqlRequest {
@@ -987,7 +1027,7 @@ mod with_mcp {
         const WHOLE_DAY_MILLIS: i64 = 19_675 * 86_400_000;
         let (running, backend) = sql_backend().await;
 
-        let envelope = backend
+        let draft = backend
             .sql_execute(
                 expected_tenant(),
                 &sql_request(&format!(
@@ -997,7 +1037,7 @@ mod with_mcp {
             .await
             .expect("a whole-day Date64 has a JSON date");
 
-        let envelope = serde_json::to_value(&envelope).expect("an envelope serializes");
+        let envelope = serde_json::to_value(finish_unpaged(draft)).expect("an envelope serializes");
         assert_eq!(envelope["status"], serde_json::json!("ok"), "{envelope}");
         assert_eq!(envelope["data"]["row_count"], serde_json::json!(1));
         assert_eq!(
@@ -1005,6 +1045,127 @@ mod with_mcp {
             serde_json::json!([["2023-11-14"]]),
             "{envelope}"
         );
+
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// `sql_execute` through the real adapter hands the tool the pin inputs
+    /// of the snapshot the rows came from, equal to the `SqlOutcome` the
+    /// query service returns for the same statement: the signal of its one
+    /// lane, its pending erasure, its declared columns, and as the watermark
+    /// the greatest `ingest_hour_bucket` across segments flushed in three
+    /// different hours, written into `visibility.ingest_watermark_hour`.
+    ///
+    /// FLIP: a watermark taken as the least hour, or from the first segment
+    /// in key order, reads 1 here instead of 3.
+    /// FLIP: a draft whose resolve instant is the clock's and not the
+    /// request's `now_ns` breaks the `resolve_at_ns` equality.
+    #[tokio::test]
+    async fn sql_execute_carries_the_outcomes_pin_inputs() {
+        let (running, backend, service) = sql_backend_over(&[1, 3, 2]).await;
+        let request = sql_request("SELECT value FROM samples");
+
+        let outcome = service
+            .sql_execute(expected_tenant(), &request)
+            .await
+            .expect("the service executes");
+        let draft = backend
+            .sql_execute(expected_tenant(), &request)
+            .await
+            .expect("the adapter executes");
+
+        assert_eq!(outcome.ingest_watermark_hour, Some(3));
+        assert_eq!(draft.ingest_watermark_hour, outcome.ingest_watermark_hour);
+        assert_eq!(draft.pending_erasure, outcome.pending_erasure);
+        assert_eq!(draft.declared_columns, outcome.declared_columns);
+        assert_eq!(outcome.signals.len(), 1);
+        assert_eq!(draft.signal, Ok(ravel_types::Signal::Metrics));
+        assert_eq!(draft.resolve_at_ns, SQL_NOW_NS);
+        assert_eq!(draft.envelope.visibility.ingest_watermark_hour, "3");
+        assert!(!draft.envelope.visibility.resolved_no_segments);
+        assert_eq!(draft.envelope.data.row_count, 3);
+
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// A statement over a tenant with no segments resolves none, so it has no
+    /// watermark: `None`, an empty `visibility.ingest_watermark_hour`, and
+    /// `resolved_no_segments` saying why it is empty.
+    ///
+    /// FLIP: defaulting the watermark to hour 0 reports a measurement the
+    /// resolve never made.
+    #[tokio::test]
+    async fn sql_execute_over_an_empty_resolve_has_no_watermark() {
+        let (running, backend, service) = sql_backend_over(&[]).await;
+        let request = sql_request("SELECT value FROM samples");
+
+        let outcome = service
+            .sql_execute(expected_tenant(), &request)
+            .await
+            .expect("the service executes");
+        let draft = backend
+            .sql_execute(expected_tenant(), &request)
+            .await
+            .expect("the adapter executes");
+
+        assert_eq!(outcome.ingest_watermark_hour, None);
+        assert_eq!(draft.ingest_watermark_hour, None);
+        assert_eq!(draft.signal, Ok(ravel_types::Signal::Metrics));
+        assert!(draft.envelope.visibility.ingest_watermark_hour.is_empty());
+        assert!(draft.envelope.visibility.resolved_no_segments);
+
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// `sql_explain` through the adapter carries the service report's
+    /// estimate figure for figure, its segment counts, and its schema, and
+    /// names the components the estimator cannot bound: none for a metrics
+    /// statement, `estimated_decompressed_bytes` for a logs one.
+    ///
+    /// FLIP: dropping `unbounded` (or mapping every name to one component)
+    /// fails the logs statement's list.
+    /// FLIP: a conversion that drops a figure, or fills `estimate` from the
+    /// segment count alone, fails the equalities against the report.
+    #[tokio::test]
+    async fn sql_explain_carries_exact_estimates_and_names_the_unbounded() {
+        let (running, backend, service) = sql_backend_over(&[1, 3, 2]).await;
+
+        let request = sql_request("SELECT value FROM samples");
+        let report = service
+            .sql_explain(expected_tenant(), &request)
+            .await
+            .expect("the service explains");
+        let explained = backend
+            .sql_explain(expected_tenant(), &request)
+            .await
+            .expect("the adapter explains");
+        assert_eq!(explained.estimate, report.estimate);
+        assert_eq!(explained.estimate.segments, 3);
+        assert_eq!(explained.segments_resolved, 3);
+        assert_eq!(explained.segments_resolved, report.segments_resolved as u64);
+        assert_eq!(explained.segments_admitted, report.segments_admitted);
+        assert_eq!(
+            explained.segments_recent_exempt,
+            report.segments_recent_exempt
+        );
+        assert_eq!(explained.target, ravel_sql::TargetSignal::Metrics);
+        assert_eq!(explained.plan_text, report.plan_text);
+        assert!(explained.unbounded.is_empty());
+        assert_eq!(
+            explained
+                .columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.data_type.as_str()))
+                .collect::<Vec<_>>(),
+            [("value", "Float64")]
+        );
+
+        let logs = backend
+            .sql_explain(expected_tenant(), &sql_request("SELECT * FROM logs"))
+            .await
+            .expect("the adapter explains a logs statement");
+        assert_eq!(logs.target, ravel_sql::TargetSignal::Logs);
+        assert_eq!(logs.unbounded, [EstimateComponent::DecompressedBytes]);
 
         running.shutdown().await.expect("server stops");
     }

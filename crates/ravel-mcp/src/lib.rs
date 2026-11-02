@@ -12,6 +12,7 @@ pub mod budget;
 pub mod catalog;
 pub mod compact;
 pub mod cursor;
+pub mod draft;
 pub mod envelope;
 pub mod service;
 pub mod tools;
