@@ -112,17 +112,21 @@
 #                                       and the usage names the flags; s8: an
 #                                       engine arch with no s3s-fs asset passes
 #   t  real S3 with a local build    -> exit 65, nothing started
-#   u  fold, restart, folded read-back -> u (case a's output): fold.out,
-#                                       readback-folded.json and both /metrics
+#   u  stop, fold, start, folded     -> u (case a's output): fold.out,
+#      read-back                        readback-folded.json and both /metrics
 #                                       scrapes written, the three stamps, the
-#                                       calls in order memory, fold, restart,
-#                                       scrape, read-back, scrape; u1: a fold
-#                                       that sealed nothing and u2: a watermark
-#                                       before the ingest end hour exit 70
-#                                       naming fold; u3: a read-back-only exit
+#                                       calls in order memory, stop, fold,
+#                                       start, readiness, scrape, read-back,
+#                                       scrape, the fold run while ravel-server
+#                                       was stopped; u1: a fold that sealed
+#                                       nothing and u2: a watermark before the
+#                                       ingest end hour exit 70 naming fold,
+#                                       with no start; u2a: a failed stop and
+#                                       u2b: a failed start exit 70 naming
+#                                       their step; u3: a read-back-only exit
 #                                       1 and u4: a failed scrape exit 70 naming
 #                                       readback-folded; u5: Ravel's ingest
-#                                       read-back failed, the three still run,
+#                                       read-back failed, the four still run,
 #                                       exit 70 naming ingest; u6: the same with
 #                                       readback-folded listed after ingest; u7:
 #                                       a Ravel row_failure and u8: a Ravel
@@ -131,17 +135,21 @@
 #                                       real-S3 lane folds with its overlay;
 #                                       u11: large fetch misses leave few
 #                                       catalog GETs, a pass; u12: one catalog
-#                                       GET per data object exits 70 naming
-#                                       readback-folded, u13: listed after a
-#                                       failed ingest; u14: no fetch-miss and
-#                                       u15: no flush counter exit 70 as could
-#                                       not measure; u16: --folded-catalog-get-
-#                                       max-fraction 1 passes u12's figures as
+#                                       GET per listed data object exits 70
+#                                       naming readback-folded where the flush
+#                                       counters would not, u13: listed after a
+#                                       failed ingest; u14: no fetch-miss
+#                                       counter, u15a: no ravel-objects.json
+#                                       and u15b: no data.count in it exit 70
+#                                       as could not measure; u15: no flush
+#                                       counter stamps the cross-check null
+#                                       and passes; u16: --folded-catalog-get-
+#                                       max-fraction 1 passes u13's figures as
 #                                       not discriminating; u17-u19: a
 #                                       malformed or out-of-range fraction
 #                                       exits 64; u20: a ci-sized run whose
-#                                       limit is above its object count passes
-#                                       as not discriminating; u21: a
+#                                       limit is above its listed object count
+#                                       passes as not discriminating; u21: a
 #                                       cardinality-sized run within the floor
 #                                       plus fraction passes, u22: above it
 #                                       exits 70; u23: --folded-catalog-get-
