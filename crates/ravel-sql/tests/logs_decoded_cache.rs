@@ -979,7 +979,7 @@ const SHORT_PROBE: u64 = 1024;
 
 /// What the fast-path verdict cost on one run, against the same run with no
 /// decoded cache.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct VerdictCost {
     /// Plan-phase requests: the verdict's directory reads, since the fast
     /// path runs no plan pass.
@@ -1101,15 +1101,9 @@ async fn the_fast_path_verdict_reads_directories_once_per_segment_cold_and_nothi
                 plan_decompressed_bytes: covering[0].plan_decompressed_bytes,
                 extra_requests: 0,
             },
-            hot,
+            hot.clone(),
         ]
     );
-    let hot = VerdictCost {
-        plan_requests: 0,
-        plan_cache_hits: 0,
-        plan_decompressed_bytes: 0,
-        extra_requests: 0,
-    };
     assert_eq!(
         short,
         vec![

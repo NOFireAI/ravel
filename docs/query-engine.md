@@ -5457,7 +5457,11 @@ the flag.
   `crates/ravel-sql/src/logs_scan/plan.rs`;
   `a_fitting_contains_scan_on_the_whole_segment_fast_path_is_served`,
   `an_over_cap_contains_scan_on_the_whole_segment_fast_path_is_not_served`,
-  `the_fast_path_verdict_costs_one_directory_read_per_segment_cold_and_none_hot`).
+  `the_fast_path_verdict_reads_directories_once_per_segment_cold_and_nothing_hot`).
+  Each segment's estimate is memoised on the decoded cache per tenant,
+  object and projection, so a hot verdict does no directory read
+  (`the_fast_path_verdict_reads_directories_once_per_segment_cold_and_nothing_hot`,
+  `the_fast_path_estimate_memo_is_keyed_by_projection`).
   In a scan
   that fits, a hit serves the deferred column, and a miss the cache will
   admit is decoded validated and offered before the survivor narrowing, so

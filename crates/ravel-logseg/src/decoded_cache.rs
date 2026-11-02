@@ -275,9 +275,12 @@ impl PressureSnapshot {
 /// (tenant, object, projection) entries over every projection.
 #[derive(Default)]
 struct EstimateMemo {
-    by_columns: HashMap<ColumnSelection, HashMap<([u8; 16], [u8; 32]), u64>>,
+    by_columns: HashMap<ColumnSelection, HashMap<ObjectId, u64>>,
     len: usize,
 }
+
+/// The (tenant, object) of [`DecodedCacheAttach::key`].
+type ObjectId = ([u8; 16], [u8; 32]);
 
 /// The process-wide decoded-column cache.
 pub struct DecodedColumnCache {
