@@ -904,11 +904,10 @@ mod with_mcp {
     /// A started server holding one [`publish_sample`] row from ingest hour 0,
     /// and the [`ServiceBackend`] the adapter hands `ravel_query_sql`'s body.
     ///
-    /// Driven through the backend rather than the transport because
-    /// `ravel_query_sql` is in the catalog but not served by this build: a
-    /// `tools/call` for it answers `NotShipped` before any backend is reached.
-    /// The mapping under test is the backend's own `sql_execute`, which is the
-    /// call that tool body makes.
+    /// Driven through the backend rather than the transport because the
+    /// mapping under test is the backend's own `sql_execute`, which is the
+    /// call that tool body makes; the tool itself is driven through the
+    /// transport further down.
     async fn sql_backend() -> (ravel_server::Running, ServiceBackend) {
         let (running, backend, _) = sql_backend_over(&[0]).await;
         (running, backend)
@@ -954,7 +953,7 @@ mod with_mcp {
             range_end_ns: SQL_NOW_NS,
             min_commit_watermark: Vec::new(),
         };
-        draft.finish_page(&sql_budgets(), &scope, PageOrder::Partial, |_, _| {
+        draft.finish_page(&sql_budgets(), &scope, PageOrder::Partial, |_, _, _| {
             panic!("a partial order never mints")
         })
     }
@@ -994,6 +993,7 @@ mod with_mcp {
                     "SELECT arrow_cast({MILLIS}, 'Date64') AS d FROM samples LIMIT 1"
                 )),
                 SQL_NOW_NS,
+                &[],
             )
             .await
             .expect_err("a Date64 that is not a whole day has no JSON form");
@@ -1037,6 +1037,7 @@ mod with_mcp {
                     "SELECT arrow_cast({WHOLE_DAY_MILLIS}, 'Date64') AS d FROM samples LIMIT 1"
                 )),
                 SQL_NOW_NS,
+                &[],
             )
             .await
             .expect("a whole-day Date64 has a JSON date");
@@ -1076,7 +1077,7 @@ mod with_mcp {
             .await
             .expect("the service executes");
         let draft = backend
-            .sql_execute(expected_tenant(), &request, SQL_NOW_NS)
+            .sql_execute(expected_tenant(), &request, SQL_NOW_NS, &[])
             .await
             .expect("the adapter executes");
 
@@ -1110,7 +1111,7 @@ mod with_mcp {
             .await
             .expect("the service executes");
         let draft = backend
-            .sql_execute(expected_tenant(), &request, SQL_NOW_NS)
+            .sql_execute(expected_tenant(), &request, SQL_NOW_NS, &[])
             .await
             .expect("the adapter executes");
 
@@ -1152,7 +1153,7 @@ mod with_mcp {
             assert_eq!(outcome.ingest_watermark_hour, hours.first().copied());
 
             let draft = backend
-                .sql_execute(expected_tenant(), &request, SQL_NOW_NS)
+                .sql_execute(expected_tenant(), &request, SQL_NOW_NS, &[])
                 .await
                 .expect("the adapter executes");
             assert_eq!(draft.signal, Err(NoCursorSignal::NoTable));
@@ -1180,6 +1181,7 @@ mod with_mcp {
                 expected_tenant(),
                 &sql_request("SELECT 1 AS x UNION ALL SELECT 2 AS x"),
                 SQL_NOW_NS,
+                &[],
             )
             .await
             .expect("the adapter executes");
@@ -1191,7 +1193,7 @@ mod with_mcp {
             range_end_ns: SQL_NOW_NS,
             min_commit_watermark: Vec::new(),
         };
-        let page = draft.finish_page(&budgets, &scope, PageOrder::Total, |_, _| {
+        let page = draft.finish_page(&budgets, &scope, PageOrder::Total, |_, _, _| {
             panic!("a statement naming no table must not reach the mint")
         });
 
@@ -1979,9 +1981,10 @@ mod with_mcp {
             tenant_hash: ravel_types::TenantHash,
             request: &ravel_sql::SqlRequest,
             resolve_at_ns: i64,
+            order_columns: &[String],
         ) -> Result<Draft, ravel_mcp::envelope::Failure> {
             self.0
-                .sql_execute(tenant_hash, request, resolve_at_ns)
+                .sql_execute(tenant_hash, request, resolve_at_ns, order_columns)
                 .await
         }
 
@@ -2218,7 +2221,7 @@ mod with_mcp {
         };
 
         let draft = backend
-            .sql_execute(expected_tenant(), &request, resolve_at)
+            .sql_execute(expected_tenant(), &request, resolve_at, &[])
             .await
             .expect("the adapter executes");
 
