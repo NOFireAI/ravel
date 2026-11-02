@@ -555,8 +555,10 @@ script, and run in CI's `doc-scripts` job.
 | `--passes N`, `--reps N` | Passed to `metricsbench_query` as `--passes` and `--reps-per-pass` and stamped (case g); its own defaults (5 and 3) otherwise. |
 | `--keep` | Leave the stack up; stamps say `kept (--keep)` and no `down -v` runs (case g). |
 | `--rss-band CONTAINER:MIN:MAX` | Repeatable. The peak sampled memory of the container (matched by container name or compose service) must lie in `[MIN, MAX]` bytes; outside it, or with no samples, the run exits 75 (case d). |
-| `--ravel-objects-band MIN:MAX` | The band the `objects` step checks the count of Ravel's data objects (`t/<tenant>/m/l0/*.rseg` keys) against, inclusive (cases u1, u2). It counts data objects only, not commit records, probes or the whole bucket, so the same figure is comparable between s3s-fs and real S3. A value not of the form `MIN:MAX`, a minimum above the maximum (case u3), or the flag with the falsification run (case u4) exits 64. |
+| `--ravel-objects-band MIN:MAX` | The band the `objects` step checks the count of Ravel's data objects (`t/<tenant>/m/l0/*.rseg` keys) against, inclusive (cases v1, v2). It counts data objects only, not commit records, probes or the whole bucket, so the same figure is comparable between s3s-fs and real S3. A value not of the form `MIN:MAX`, a minimum above the maximum (case v3), or the flag with the falsification run (case v4) exits 64. |
 | `--diagnostic-prometheus-max-samples N` | The falsification run, below. |
+| `--folded-catalog-get-max-fraction F` | The most catalog GETs the folded read-back (step 18) may spend per data object the `objects` step listed, on top of the floor below, a decimal from 0 to 1; default 0.05 (case u), stamped (case u16). A malformed or out-of-range value exits 64 (cases u17 to u19). |
+| `--folded-catalog-get-floor N` | The fixed part of the folded read-back's catalog GET limit (step 18), a whole number; default 64, stamped (cases u, u20, u23). A value that is not a whole number exits 64 (cases u24 to u27). |
 | `--real-s3-bucket-prefix PREFIX`, `--real-s3-region REGION` | The real-S3 lane, below. One without the other, a prefix S3 cannot name or longer than 44 characters, a malformed region, or either with the falsification run exits 64 (cases s2 to s7). A local build is refused with exit 65 (case t). |
 
 A compose project `metricsbench` that already has containers or volumes is
@@ -648,26 +650,26 @@ verification (step 6), after which the run goes on as a diagnostic:
    run as `docker compose run --rm --no-deps -T --entrypoint aws
    createbuckets`, so each lane lists with its own endpoint and credentials:
    `ravel-metricsbench` through `--endpoint-url http://s3s:9000` on the
-   portable stack (case u), `<PREFIX>-ravel` with no endpoint override in
-   the real-S3 lane (case u8), where `real-s3.yml` leaves `createbuckets`
+   portable stack (case v), `<PREFIX>-ravel` with no endpoint override in
+   the real-S3 lane (case v8), where `real-s3.yml` leaves `createbuckets`
    the instance role's credentials. No `--no-paginate` or `--max-items` is
    passed, so the aws CLI follows every continuation token itself (its own
    default, which the stubbed cases cannot show); a listing that still
    carries a token fails the step with exit 70, as does a listing that
-   exits non-zero (cases u7, u6).
+   exits non-zero (cases v7, v6).
    The listing is kept as `ravel-objects-listing.json`, and its keys are
    counted, and their sizes summed, by kind into `ravel-objects.json`, the
    same figures stamped as `ravel_objects`:
    `data` (`t/<tenant>/m/l0/*.rseg`), `commit` (`t/<tenant>/m/c/`),
    `qualify` (`sys/qualify/`, the store-qualify probes), `other` (the
-   catalog and bookkeeping keys) and `total`, every key once (case u). The
+   catalog and bookkeeping keys) and `total`, every key once (case v). The
    step fails when the kinds do not sum to the total; no listing can make
    that happen, so no case drives it. With `--ravel-objects-band` the data
    count must lie in the band; outside it the step fails with exit 70
-   naming `objects` (cases u1, u2). Without the flag the counts are stamped
-   only and the band is recorded as not set (case u). After a failed ingest
+   naming `objects` (cases v1, v2). Without the flag the counts are stamped
+   only and the band is recorded as not set (case v). After a failed ingest
    verification the step still runs (case q), and a band breach is listed
-   in `failed_after_ingest` (case u5).
+   in `failed_after_ingest` (case v5).
 9. `capture`: `capture-effective-config.sh` into `effective-config.json`,
    which must exit 0; a partial capture (exit 1) fails the step with exit
    70 before any query runs (case k).
@@ -694,6 +696,152 @@ verification (step 6), after which the run goes on as a diagnostic:
     final bytes per container and `OOMKilled` from `docker inspect` (case a),
     and every `--rss-band` is checked (case d). An OOM-killed container exits
     75 (case e).
+15. `stop`: `docker compose stop ravel-server` only (case u). The fold below
+    runs with `--writers-stopped`, which ADR-2677 decision 1 gives to "an
+    operator whose writer has exited" and marks "UNSAFE under a live
+    writer" (docs/adrs/2677-clickbench-floor-fetch-and-pruning.md:90-100):
+    a commit record landing in an hour the fold has sealed lands in a
+    bucket reconcile skips, invisible to non-token queries until a HEAD
+    rebuild. The server is Ravel's only writer here, so it stays down
+    from this step until `start`; the fold runs while it is stopped (cases
+    u, u1). A failed stop exits 70 naming stop, and no fold runs (case
+    u2a). `ravel_restart` says it stopped.
+16. `fold`: `ravel-cli --store s3 --tenant-hash-unkeyed catalog fold
+    --tenant metricsbench --shards 4 --signal metrics --writers-stopped`,
+    run as `docker compose run --rm --no-deps -T ravel-qualify ...`, so it
+    reads the store `ravel-qualify` carries in either lane: s3s-fs here,
+    the real-S3 bucket under `real-s3.yml` (cases u, u10). Every writer has
+    stopped by then: the ingest bin has exited and `ravel-server` is
+    stopped. Its report goes to `fold.out` (case u). The step fails
+    with exit 70 naming fold unless `seal_through_hour` is `Some(N)` (case
+    u1) and `watermark_hour` is at or after the ingest hour (Unix seconds
+    divided by 3600) the clock read when the ingest step returned (case u2);
+    what those two clauses can and cannot catch is under step 18. A failed
+    fold ends the run with `ravel-server` still stopped, and `start` does not
+    run (cases u1, u2); the teardown removes the stack either way.
+    `ravel_catalog_fold_writers_stopped` stamps `seal_through_hour`,
+    `watermark_hour`, `entry_count`, `buckets_folded`, `no_op`, that
+    `ingest_end_hour` and `precondition` (`met`, or why not) (cases u, u1,
+    u2).
+17. `start`: `docker compose start ravel-server` only, then Ravel's
+    `/api/v1/status/buildinfo` answers 200 as in `ready`, before the
+    read-back's first scrape (case u). A failed start exits 70 naming start
+    (case u2b). `ravel_restart` says it stopped before the fold and started
+    after it (cases u, u1, u2a, u2b).
+18. `readback-folded`: Ravel's `/metrics` into
+    `ravel-metrics-before-folded-readback.txt`, then `metricsbench_ingest
+    --readback-only --ingest-report ingest.json --readback-system ravel`
+    with the ingest step's workload, profile, anchor, query URL, token
+    variable and `--readback-timeout-secs`, and `--readback-settle-secs 60`,
+    the bin's default the ingest step runs with, into `readback-folded.json`,
+    then `/metrics` again into `ravel-metrics-after-folded-readback.txt`
+    (case u). `readback_folded`
+    stamps the bin's `exit_code`, `matches_expected`, `error`, the series
+    query's `series_query_ms` (`readback.query_ms.series`), and between the
+    two scrapes `store_get_calls_delta` (`ravel_store_calls_total` with
+    `op="get"`) and `commit_record_cache_entries_delta`
+    (`ravel_catalog_record_cache_entries` with `cache="commit"`) (case u).
+    A non-zero exit fails the step with exit 70 naming readback-folded (case
+    u3), and so does a scrape that did not answer 200, whose delta is then
+    null (case u4).
+
+    The step then checks that the read used the fold. `catalog_get_delta`
+    is `store_get_calls_delta` less `fetch_cache_misses_delta`
+    (`ravel_cache_misses_total` with `cache="fetch"`) between the same two
+    scrapes (cases u, u11), the store GETs that did not fetch data, which a
+    read on an unfolded catalog spends resolving one commit record per data
+    object. `data_objects_listed` is `data.count` in `ravel-objects.json`,
+    the `.rseg` data objects the `objects` step (step 8) listed in Ravel's
+    bucket, the count the fraction was calibrated on (cases u, u20, u21).
+    The limit is
+    `--folded-catalog-get-floor` (default 64) plus
+    `--folded-catalog-get-max-fraction` (default 0.05) times
+    `data_objects_listed`. Beside it the step stamps a cross-check the
+    limit does not use: `data_objects_flushed`, the sum of
+    `ravel_ingest_flushes_by_size_total`, `_by_age_total`,
+    `_by_age_adaptive_total`, `_by_age_floor_total` and `_by_arrival_total`
+    with `signal="metrics"` in `ravel-metrics-at-query.txt`, the fold-state
+    scrape taken before the stop. Those five are disjoint: each flush
+    open bumps exactly one of them by its trigger
+    (`record_flush`, crates/ravel-ingest/src/metrics.rs:956-964, called once
+    per flush open at crates/ravel-ingest/src/shard.rs:2662), so sub-counts
+    such as `ravel_ingest_rerouted_flushes_total` and other signals'
+    samples are not added (case u). They count flush attempts, so an
+    abandoned flush counts too; a scrape without them stamps null and does
+    not fail the step (case u15). The floor is the part of a folded read's catalog
+    cost that does not grow with the object count: the HEAD, the snapshot
+    parts, the commit-token keys, and any GET the `--mode all` server's own
+    maintenance or fold loop issues between the two scrapes, since
+    `ravel_store_calls_total` counts the whole process. The step fails with
+    exit 70 naming readback-folded when `catalog_get_delta` exceeds the
+    limit (cases u12, u22; a failure after a failed ingest is listed in
+    `failed_after_ingest`, case u13), and when either figure cannot be
+    read: a scrape without the fetch-miss counter (case u14), or a
+    `ravel-objects.json` that is gone (case u15a) or has no `data.count`
+    (case u15b).
+
+    A limit at or above `data_objects_listed` cannot tell a folded read
+    from an unfolded one, which costs about one catalog GET per data
+    object. Then the step neither fails nor reports `within`: the verdict
+    is `not discriminating: limit L is at or above the N data objects
+    listed, so a folded and an unfolded read cannot be told apart at this
+    profile`, and the step passes (cases u16, u20). The ci profile the
+    nightly workflow runs lands here: its 2026-11-02 real-S3 smoke flushed
+    8 metrics data objects (`out-ci/ravel-metrics-at-query.txt` of run
+    `mb2821-r1-20261102T063901Z-aa061edd1`), and its bucket listed the
+    same 8 `.rseg` data objects. The cardinality profile does
+    not: at its measured 15,248 listed
+    data objects the limit is 64 + 0.05 x 15,248 = 826.4, far below the
+    about 15,249 an unfolded read spends (cases u21, u22).
+
+    `readback_folded` stamps `data_objects_listed`, `data_objects_flushed`,
+    `catalog_get_delta`, `folded_catalog_get_max_fraction`,
+    `folded_catalog_get_floor`, the computed `folded_catalog_get_limit` and
+    `catalog_get_verdict` (`within`, `not discriminating: ...`, `breach:
+    ...` or `could not measure: ...`) before the step fails, so a breach
+    keeps its numbers (cases u, u12, u14, u15a, u20).
+
+    The measured basis, from issue #2821 comment 6583379446 and the E8
+    run: on a real-S3 run's unfolded read-back the GET delta was 29,029
+    and the fetch-cache misses 13,780, leaving 15,249 against 15,248
+    listed data objects, one commit record each; on an s3s-fs run after a
+    restart, 38,698 less 29,652 is 9,046 against a commit-record cache
+    growth of 9,042. An unfolded
+    read sits near one catalog GET per data object, twenty times the
+    default fraction, and at that object count the floor is under half a
+    percent of it.
+
+    `commit_record_cache_entries_delta` is a residency figure, the change
+    in an eviction-bounded gauge, and after the stop and start its before
+    value is near zero. It is stamped as context and the check does not use
+    it.
+
+    Neither of the fold step's two conditions can fail for a
+    writers-stopped fold that succeeded. `fold_with_writers_stopped` sets
+    `seal_through_hour` to the hour the clock reads
+    (services/ravel-cli/src/catalog.rs:136-140), the fold applies that
+    ceiling whenever the margin watermark is below it
+    (crates/ravel-catalog/src/fold.rs:422-435, 1789-1792), and it moves the
+    watermark only forward (fold.rs:1911-1912). The fold runs after the
+    ingest step, so `watermark_hour` is at or after the ingest end hour by
+    construction. The two clauses (cases u1, u2) guard against a malformed,
+    truncated or stale `fold.out`, and against a CLI whose output format
+    changed, not against an under-sealed fold. The check with teeth on
+    whether the read used the fold is the catalog-GET check above. A no-op
+    fold is not a failure, since on a long profile the server's own fold
+    loop may already have sealed every hour; `no_op` and `entry_count` are
+    stamped in `ravel_catalog_fold_writers_stopped` as context (case u).
+
+Steps 15 to 18 also run after a failed ingest verification when the Ravel
+row itself replayed and only its read-back failed or mismatched, which is the
+case they measure: the run still exits 70 naming ingest (case u5), and a
+failure among them is listed in `failed_after_ingest` (case u6). When the
+Ravel row has a `row_failure` or stalled, the four are skipped and each of
+their three stamps says `skipped:` and why (cases u7, u8). They run only once `memory`
+passed; a run that ends earlier, at `query` for a failed oracle row (case
+q4) or at an `--rss-band` breach after a failed ingest (case q3), does not
+reach them. The diagnostic mode runs none of them and stamps each `not
+applicable` (case u9).
 
 Whatever the outcome, the compose logs go to `compose.log` and the stack is
 torn down with `docker compose ... down -v` unless `--keep` is given (cases
@@ -725,9 +873,10 @@ case p), `ravel_image.resolved` (the `docker image inspect` result),
 and `anchor_source`, `started_at` and `ended_at`, `store_kind: s3s-fs`, `host.arch`,
 `instance_type` (EC2 IMDSv2, else `unknown`), `comparator_images` (each
 comparator's image block as the capture recorded it), `ravel_catalog_fold`,
-`mimir_readiness`, `ravel_objects` (the contents of `ravel-objects.json`,
-case u; `not applicable` in the diagnostic mode, case f),
-`in_process_row` (`present` or `skipped`, cases a, l and
+`ravel_catalog_fold_writers_stopped`, `ravel_restart` and `readback_folded`
+(steps 15 to 18; cases u, u7 and u9), `mimir_readiness`, `ravel_objects`
+(the contents of `ravel-objects.json`, case v; `not applicable` in the
+diagnostic mode, case f), `in_process_row` (`present` or `skipped`, cases a, l and
 f), `object_store` (release, asset arch, engine arch and its source, sha256,
 URL, cached path and whether it came from the cache or a download; `not applicable` in the diagnostic mode;
 cases a, f, n1, n5 and n7), `steps_completed`, `failed_step`,
@@ -789,9 +938,9 @@ deploy/metricsbench/run.sh --profile history --bin-dir target/release \
 | Exit | Meaning |
 |---|---|
 | 0 | Every step passed (cases a, f, g). |
-| 64 | Usage error (cases h, p, u3, u4). |
+| 64 | Usage error (cases h, p, s2 to s7, u17 to u19, u24 to u27, v3, v4). |
 | 65 | A refused input, or an s3s-fs binary whose sha256 is not the pin; nothing was started (cases c, h, p, n2, n3, n4). |
-| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k, n6, r, u2). After a failed ingest verification (a row's read-back failed or a row stalled) the run queries as a diagnostic, records the failure, and exits 70 naming step ingest, even when a later step failed too; the first later step to fail ends the run, so an `--rss-band` breach reaches `failed_after_ingest` only when every step before `memory` passed, while `memory-summary.json` records it either way (cases q, q2, q3, q4). |
+| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k, n6, r, u1, u2, u2a, u2b, u3, u4, u12, u14, u15a, u15b, u22, v2, v6, v7). After a failed ingest verification (a row's read-back failed or a row stalled) the run queries as a diagnostic, records the failure, and exits 70 naming step ingest, even when a later step failed too; the first later step to fail ends the run, so an `--rss-band` breach reaches `failed_after_ingest` only when every step before `memory` passed, while `memory-summary.json` records it either way (cases q, q2, q3, q4); steps 15 to 18 still run when the Ravel row replayed, and a failure there is listed in `failed_after_ingest` (cases u5, u6, u13), and are skipped when it did not (cases u7, u8); a failed `objects` band check after a failed ingest is listed the same way (case v5). |
 | 75 | An `--rss-band` was violated or a container was OOM-killed (cases d, e). |
 
 ## Verify the pins

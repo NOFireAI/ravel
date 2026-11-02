@@ -10,7 +10,8 @@
 #     [--anchor-ms N] [--passes N] [--reps N] [--keep]
 #     [--rss-band CONTAINER:MIN_BYTES:MAX_BYTES]...
 #     [--ravel-objects-band MIN:MAX]
-#     [--diagnostic-prometheus-max-samples N]
+#     [--diagnostic-prometheus-max-samples N] [--folded-catalog-get-max-fraction F]
+#     [--folded-catalog-get-floor N]
 #     [--real-s3-bucket-prefix PREFIX --real-s3-region REGION]
 #
 # The Ravel image comes in one of two forms, and stamps.json says which ran
@@ -94,6 +95,42 @@
 #   memory      the sampler stopped, <out>/memory-summary.json written (peak
 #               and final bytes per container, OOMKilled from docker inspect),
 #               every --rss-band checked
+#   stop        docker compose stop ravel-server: the fold below runs with
+#               --writers-stopped, which ADR-2677 decision 1 makes safe only
+#               once the writer has exited. Stamped as ravel_restart
+#   fold        ravel-cli catalog fold --signal metrics --writers-stopped, run
+#               through `docker compose run` on the ravel-qualify service (so
+#               it reads the same store as the server in either lane), into
+#               <out>/fold.out. Fails unless seal_through_hour is Some(N) and
+#               watermark_hour is at or after the hour the ingest step ended
+#               in. Stamped as ravel_catalog_fold_writers_stopped. A failed
+#               fold ends the run with the server still stopped
+#   start       docker compose start ravel-server, then its readiness URL
+#               answers 200 as in ready. Stamped as ravel_restart
+#   readback-folded  Ravel's /metrics scraped into
+#               <out>/ravel-metrics-before-folded-readback.txt,
+#               metricsbench_ingest --readback-only for the Ravel row into
+#               <out>/readback-folded.json, /metrics scraped again into
+#               <out>/ravel-metrics-after-folded-readback.txt. Fails on a
+#               non-zero exit or a missing scrape. Stamped as readback_folded
+#               with the GET and commit-record cache deltas between the scrapes.
+#               Also fails when the GETs the fetch cache did not cause
+#               (catalog_get_delta) exceed --folded-catalog-get-floor
+#               (default 64) plus --folded-catalog-get-max-fraction
+#               (default 0.05) times the data objects the objects step listed
+#               (data_objects_listed, data.count in <out>/ravel-objects.json),
+#               or when either figure cannot be read. A limit at or above
+#               data_objects_listed cannot tell a folded read from an
+#               unfolded one; that is stamped not discriminating and passes.
+#               The flush counters' sum in <out>/ravel-metrics-at-query.txt
+#               is stamped beside it as data_objects_flushed, a cross-check
+#               the limit does not use
+#
+# stop, fold, start and readback-folded also run after a failed ingest
+# verification, when memory passed and the Ravel row itself has no
+# row_failure and did not stall; a failure there is listed in
+# failed_after_ingest. Otherwise the four are skipped and their stamps say
+# why.
 #
 # With --diagnostic-prometheus-max-samples N the run is the falsification run
 # pre-registered on #2821 instead: steps override (a compose override in the
@@ -171,6 +208,11 @@ CORPUS="${repo_root}/benchmarks/metrics/metrics.corpus.json"
 RAVEL_TOKEN_ENV="METRICSBENCH_RAVEL_TOKEN"
 RAVEL_TOKEN_VALUE="metricsbench-token"
 RAVEL_TENANT="metricsbench"
+# ravel.yml's --shards; the fold must name the same count.
+RAVEL_SHARDS=4
+# metricsbench_ingest's --readback-settle-secs default, which the ingest step
+# runs with; the folded read-back passes it so both reads settle alike.
+READBACK_SETTLE_SECS=60
 
 PROM_BASE="http://127.0.0.1:9090"
 VM_BASE="http://127.0.0.1:8428"
@@ -189,7 +231,7 @@ say() {
 }
 
 usage() {
-  sed -n '7,14p' "$0" >&2
+  sed -n '7,15p' "$0" >&2
 }
 
 usage_error() {
@@ -450,6 +492,154 @@ elif op == "fold-gauge":
                 print(parts[1])
                 sys.exit(0)
     sys.exit(3)
+elif op == "ravel-row-state":
+    # Exit 0 when the ingest report's Ravel row replayed: present, no
+    # row_failure, not stalled, not a failed replay. Otherwise exit 3 with why.
+    try:
+        doc = load(args[0])
+    except (OSError, ValueError):
+        print("ingest.json is not readable")
+        sys.exit(3)
+    rows = [r for r in doc.get("systems") or [] if r.get("system") == "ravel"]
+    if not rows:
+        print("the ingest report has no ravel row")
+        sys.exit(3)
+    rf = rows[0].get("row_failure")
+    if rf:
+        print(f"the ravel row has a row_failure ({rf.get('error') if isinstance(rf, dict) else rf})")
+        sys.exit(3)
+    for st in doc.get("stalled") or []:
+        if st.get("system") == "ravel":
+            print(f"the ravel row stalled ({st.get('error')})")
+            sys.exit(3)
+    for fr in doc.get("failed_replays") or []:
+        if fr.get("system") == "ravel":
+            print(f"the ravel row's replay failed ({fr.get('error')})")
+            sys.exit(3)
+elif op == "fold-stamp":
+    seal, watermark, entries, buckets, no_op, end_hour, precondition = args
+    def hour(v):
+        m = re.fullmatch(r"Some\((\d+)\)", v)
+        return int(m.group(1)) if m else v
+    def num(v):
+        return int(v) if re.fullmatch(r"\d+", v) else v
+    print(json.dumps({"seal_through_hour": hour(seal), "watermark_hour": hour(watermark),
+                      "entry_count": num(entries), "buckets_folded": num(buckets),
+                      "no_op": {"true": True, "false": False}.get(no_op, no_op or None),
+                      "ingest_end_hour": int(end_hour), "precondition": precondition}))
+elif op == "readback-folded":
+    # The bin's stdout, its exit code, the two /metrics scrapes ("" when one
+    # failed), the at-query scrape, ravel-objects.json, the catalog GET
+    # fraction and floor. Prints the stamp; exit 3 when stdout is not its
+    # report.
+    out_path, code, before, after, at_query, objects_path, fraction, floor = args
+    def metric(path, name, labels):
+        if not path or not os.path.isfile(path):
+            return None
+        total, seen = 0, False
+        with open(path) as f:
+            for line in f:
+                m = re.match(r"^([A-Za-z_:][A-Za-z0-9_:]*)(\{([^}]*)\})?\s+(\S+)", line)
+                if not m or m.group(1) != name:
+                    continue
+                got = dict(re.findall(r'([A-Za-z_][A-Za-z0-9_]*)="([^"]*)"', m.group(3) or ""))
+                if all(got.get(k) == v for k, v in labels.items()):
+                    total += float(m.group(4))
+                    seen = True
+        return total if seen else None
+    def delta(name, labels):
+        a, b = metric(before, name, labels), metric(after, name, labels)
+        return None if a is None or b is None else int(b - a)
+    stamp = {"exit_code": int(code), "matches_expected": None, "error": None, "series_query_ms": None,
+             "store_get_calls_delta": delta("ravel_store_calls_total", {"op": "get"}),
+             "commit_record_cache_entries_delta": delta("ravel_catalog_record_cache_entries", {"cache": "commit"})}
+    # Store GETs the fetch cache did not cause: on an unfolded read-back these
+    # are about one commit-record GET per data object (#2821).
+    fetch_misses = delta("ravel_cache_misses_total", {"cache": "fetch"})
+    gets = stamp["store_get_calls_delta"]
+    stamp["fetch_cache_misses_delta"] = fetch_misses
+    stamp["catalog_get_delta"] = None if gets is None or fetch_misses is None else gets - fetch_misses
+    # The denominator: the .rseg data objects the objects step listed, the
+    # count the fraction was calibrated on.
+    listed, listed_error = None, None
+    try:
+        data = load(objects_path).get("data")
+        n = data.get("count") if isinstance(data, dict) else None
+        if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+            listed = n
+        else:
+            listed_error = "no data.count in ravel-objects.json"
+    except (OSError, ValueError, AttributeError) as e:
+        listed_error = f"ravel-objects.json could not be read ({type(e).__name__})"
+    stamp["data_objects_listed"] = listed
+    # A cross-check only, not the denominator.
+    # One data object per flush: shard.rs flush_tenant calls record_flush once
+    # per flush it opens (crates/ravel-ingest/src/shard.rs:2662), and
+    # record_flush bumps exactly one of these by its FlushTrigger
+    # (crates/ravel-ingest/src/metrics.rs:957-963), so the five are disjoint.
+    # Sub-counts of them (ravel_ingest_rerouted_flushes_total,
+    # ravel_ingest_grace_extended_stale_flushes_total) are not added.
+    # flushes_manual (FlushNow and the shutdown drains, metrics.rs module
+    # docs) is left out; the at-query scrape precedes the stop. These are
+    # attempt-time, so an abandoned flush counts too.
+    flushed, absent = 0, []
+    for reason in ("size", "age", "age_adaptive", "age_floor", "arrival"):
+        name = f"ravel_ingest_flushes_by_{reason}_total"
+        v = metric(at_query, name, {"signal": "metrics"})
+        if v is None:
+            absent.append(name)
+        else:
+            flushed += int(v)
+    stamp["data_objects_flushed"] = None if absent else flushed
+    stamp["folded_catalog_get_max_fraction"] = fraction
+    stamp["folded_catalog_get_floor"] = int(floor)
+    stamp["folded_catalog_get_limit"] = None
+    cat = stamp["catalog_get_delta"]
+    if cat is None:
+        missing = [n for n, v in (("ravel_store_calls_total{op=\"get\"}", gets),
+                                  ("ravel_cache_misses_total{cache=\"fetch\"}", fetch_misses)) if v is None]
+        stamp["catalog_get_verdict"] = ("could not measure: no " + " or ".join(missing)
+                                        + " delta between the folded read-back's scrapes")
+    elif listed is None:
+        stamp["catalog_get_verdict"] = f"could not measure: {listed_error}"
+    else:
+        from fractions import Fraction
+        # The floor is the read's fixed catalog cost (HEAD, snapshot parts,
+        # commit-token keys, the server's own background GETs in the window).
+        limit = int(floor) + Fraction(fraction) * listed
+        shown = int(limit) if limit.denominator == 1 else float(limit)
+        stamp["folded_catalog_get_limit"] = shown
+        # An unfolded read costs about one catalog GET per data object.
+        if limit >= listed:
+            stamp["catalog_get_verdict"] = (f"not discriminating: limit {shown} is at or above the {listed} "
+                                            "data objects listed, so a folded and an unfolded read cannot "
+                                            "be told apart at this profile")
+        elif cat > limit:
+            stamp["catalog_get_verdict"] = (f"breach: catalog_get_delta {cat} exceeds {floor} + {fraction} x "
+                                            f"data_objects_listed {listed} = {shown}")
+        else:
+            stamp["catalog_get_verdict"] = "within"
+    try:
+        doc = load(out_path)
+    except (OSError, ValueError) as e:
+        stamp["error"] = f"readback-folded.json is not JSON: {type(e).__name__}"
+        print(json.dumps(stamp))
+        sys.exit(3)
+    rb = doc.get("readback") if isinstance(doc, dict) else None
+    if isinstance(rb, dict):
+        stamp["matches_expected"] = rb.get("matches_expected")
+        if rb.get("matches_expected") is not True:
+            stamp["error"] = "; ".join(rb.get("mismatches") or []) or None
+        qms = rb.get("query_ms")
+        if isinstance(qms, dict):
+            stamp["series_query_ms"] = qms.get("series")
+    elif isinstance(doc, dict) and doc.get("readback_error"):
+        stamp["error"] = doc["readback_error"]
+    else:
+        stamp["error"] = "readback-folded.json carries neither readback nor readback_error"
+        print(json.dumps(stamp))
+        sys.exit(3)
+    print(json.dumps(stamp))
 elif op == "override":
     # docker compose config --format json on stdin; Prometheus' command with
     # --query.max-samples replaced by N, as a compose override document.
@@ -587,6 +777,8 @@ passes=""
 reps=""
 keep=0
 diag_max_samples=""
+folded_catalog_get_max_fraction="0.05"
+folded_catalog_get_floor="64"
 real_s3_prefix=""
 real_s3_region=""
 objects_band=""
@@ -607,7 +799,8 @@ while [ $# -gt 0 ]; do
       ;;
     --profile | --ravel-image | --ravel-image-id | --ravel-source-commit | --bin-dir | --out-dir | \
       --anchor-ms | --passes | --reps | --rss-band | --diagnostic-prometheus-max-samples | \
-      --real-s3-bucket-prefix | --real-s3-region | --ravel-objects-band)
+      --real-s3-bucket-prefix | --real-s3-region | --ravel-objects-band | \
+      --folded-catalog-get-max-fraction | --folded-catalog-get-floor)
       [ $# -ge 2 ] || usage_error "$1 needs a value"
       ;;
     *)
@@ -628,6 +821,8 @@ while [ $# -gt 0 ]; do
     --diagnostic-prometheus-max-samples) diag_max_samples="$2" ;;
     --real-s3-bucket-prefix) real_s3_prefix="$2" ;;
     --real-s3-region) real_s3_region="$2" ;;
+    --folded-catalog-get-max-fraction) folded_catalog_get_max_fraction="$2" ;;
+    --folded-catalog-get-floor) folded_catalog_get_floor="$2" ;;
     --ravel-objects-band) objects_band="$2" ;;
   esac
   shift 2
@@ -677,6 +872,10 @@ for band in ${bands[@]+"${bands[@]}"}; do
   hi="${band##*:}"
   [ "$lo" -le "$hi" ] || usage_error "--rss-band $band has its minimum above its maximum"
 done
+[[ "$folded_catalog_get_max_fraction" =~ ^(0(\.[0-9]+)?|\.[0-9]+|1(\.0+)?)$ ]] ||
+  usage_error "--folded-catalog-get-max-fraction takes a decimal from 0 to 1, got '$folded_catalog_get_max_fraction'"
+is_uint "$folded_catalog_get_floor" ||
+  usage_error "--folded-catalog-get-floor takes a whole number, got '$folded_catalog_get_floor'"
 if [ -n "$objects_band" ]; then
   [ "$diagnostic" -eq 0 ] ||
     usage_error "--diagnostic-prometheus-max-samples starts no Ravel, so there are no Ravel objects to count; it takes no --ravel-objects-band"
@@ -905,6 +1104,9 @@ fi
 stamp_set comparator_images null
 stamp_set ravel_catalog_fold null
 stamp_set mimir_readiness null
+stamp_set ravel_catalog_fold_writers_stopped null
+stamp_set ravel_restart null
+stamp_set readback_folded null
 stamp_set ravel_objects null
 stamp_set object_store null
 stamp_set in_process_row null
@@ -926,6 +1128,9 @@ FAILED_STEP=""
 INGEST_FAILED=0
 INGEST_FAILURE=""
 CONTINUE_AFTER_FAILED_VERIFICATION=0
+# The ingest hour (Unix seconds / 3600, the catalog's hour bucket) in which
+# the ingest step ended; the fold must have folded through it.
+INGEST_END_HOUR=""
 
 sample_once() {
   local ids ts
@@ -1059,7 +1264,7 @@ show_log() {
 # --- steps -------------------------------------------------------------------
 
 wait_ready() {
-  local name="$1" url="$2" i code
+  local name="$1" url="$2" step="${3:-ready}" i code
   for ((i = 1; i <= READY_TRIES; i++)); do
     code="$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)" || code=""
     if [ "$code" = "200" ]; then
@@ -1067,7 +1272,7 @@ wait_ready() {
     fi
     sleep "$READY_INTERVAL"
   done
-  fail_step ready "$name did not answer 200 on $url after $READY_TRIES tries ${READY_INTERVAL}s apart (last status '${code}')"
+  fail_step "$step" "$name did not answer 200 on $url after $READY_TRIES tries ${READY_INTERVAL}s apart (last status '${code}')"
 }
 
 check_one_shot() {
@@ -1121,7 +1326,128 @@ memory_step() {
     exit "$EXIT_MEMORY"
   fi
   step_done memory
-  [ "$INGEST_FAILED" -eq 0 ] || fail_after_ingest
+}
+
+# fold_field KEY: KEY's value in <out>/fold.out, which must carry it exactly
+# once.
+fold_field() {
+  local n
+  n="$(grep -c "^[[:space:]]*$1[[:space:]]*:" "${out_dir}/fold.out" 2>/dev/null)"
+  [ "$n" = 1 ] || { say "fold.out carries $1 ${n:-0} times, not once"; return 1; }
+  sed -n "s/^[[:space:]]*$1[[:space:]]*:[[:space:]]*//p" "${out_dir}/fold.out"
+}
+
+fold_step() {
+  local code=0 seal watermark entries buckets no_op precondition="met"
+  compose run --rm --no-deps -T ravel-qualify \
+    --store s3 --tenant-hash-unkeyed catalog fold \
+    --tenant "$RAVEL_TENANT" --shards "$RAVEL_SHARDS" --signal metrics --writers-stopped \
+    >"${out_dir}/fold.out" 2>&1 || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "${out_dir}/fold.out"
+    fail_step fold "ravel-cli catalog fold exited $code; see ${out_dir}/fold.out"
+  fi
+  seal="$(fold_field seal_through_hour)" || fail_step fold "no single seal_through_hour in fold.out"
+  watermark="$(fold_field watermark_hour)" || fail_step fold "no single watermark_hour in fold.out"
+  entries="$(fold_field entry_count)" || fail_step fold "no single entry_count in fold.out"
+  buckets="$(fold_field buckets_folded)" || fail_step fold "no single buckets_folded in fold.out"
+  no_op="$(fold_field no_op)" || no_op=""
+  if ! [[ "$seal" =~ ^Some\(([0-9]+)\)$ ]]; then
+    precondition="fold sealed nothing: seal_through_hour=$seal"
+  elif ! [[ "$watermark" =~ ^Some\(([0-9]+)\)$ ]] || [ "${BASH_REMATCH[1]}" -lt "$INGEST_END_HOUR" ]; then
+    precondition="watermark_hour=$watermark is before hour $INGEST_END_HOUR, in which the ingest step ended"
+  elif ! [[ "$entries" =~ ^[0-9]+$ ]] || ! [[ "$buckets" =~ ^[0-9]+$ ]]; then
+    precondition="entry_count '$entries' or buckets_folded '$buckets' is not a whole number"
+  fi
+  stamp_set ravel_catalog_fold_writers_stopped \
+    "$(py fold-stamp "$seal" "$watermark" "$entries" "$buckets" "$no_op" "$INGEST_END_HOUR" "$precondition")"
+  [ "$precondition" = "met" ] || fail_step fold "$precondition"
+  step_done fold
+}
+
+# stop_step: the --writers-stopped fold is safe only once the writer has
+# exited (ADR-2677 decision 1), so ravel-server is down for the whole fold.
+stop_step() {
+  local code=0
+  compose stop ravel-server >"${out_dir}/ravel-stop.log" 2>&1 || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "${out_dir}/ravel-stop.log"
+    stamp_str ravel_restart "not stopped: docker compose stop ravel-server exited $code; no fold ran"
+    fail_step stop "docker compose stop ravel-server exited $code"
+  fi
+  stamp_str ravel_restart "stopped: docker compose stop ravel-server before the fold; not started again"
+  step_done stop
+}
+
+start_step() {
+  local code=0 stopped="stopped: docker compose stop ravel-server before the fold"
+  compose start ravel-server >"${out_dir}/ravel-start.log" 2>&1 || code=$?
+  if [ "$code" -ne 0 ]; then
+    show_log "${out_dir}/ravel-start.log"
+    stamp_str ravel_restart "${stopped}; docker compose start ravel-server after it exited $code"
+    fail_step start "docker compose start ravel-server exited $code"
+  fi
+  wait_ready ravel "${RAVEL_BASE}/api/v1/status/buildinfo" start
+  stamp_str ravel_restart "${stopped}; started: docker compose start ravel-server after it, then ravel answered 200 on /api/v1/status/buildinfo"
+  step_done start
+}
+
+# scrape_ravel_metrics FILE: Ravel's /metrics into FILE; non-zero unless it
+# answered 200 with a body.
+scrape_ravel_metrics() {
+  local code=0 http
+  http="$(curl -sS --max-time 10 -o "$1" -w '%{http_code}' "${RAVEL_BASE}/metrics" 2>/dev/null)" || code=$?
+  [ "$code" -eq 0 ] && [ "$http" = "200" ] && [ -s "$1" ]
+}
+
+readback_folded_step() {
+  local code=0 stamp_code=0 stamp before="${out_dir}/ravel-metrics-before-folded-readback.txt"
+  local after="${out_dir}/ravel-metrics-after-folded-readback.txt" before_arg after_arg missing="" verdict
+  before_arg="$before"
+  scrape_ravel_metrics "$before" || { before_arg=""; missing="before"; }
+  "${bin_dir}/metricsbench_ingest" --readback-only --ingest-report "${out_dir}/ingest.json" \
+    --readback-system ravel --workload "$WORKLOAD" --profile "$profile" --anchor-ms "$anchor_ms" \
+    --ravel-query-url "$RAVEL_BASE" --ravel-bearer-token-env "$RAVEL_TOKEN_ENV" \
+    --readback-timeout-secs "$readback_timeout_secs" --readback-settle-secs "$READBACK_SETTLE_SECS" \
+    >"${out_dir}/readback-folded.json" 2>"${out_dir}/readback-folded.log" || code=$?
+  after_arg="$after"
+  scrape_ravel_metrics "$after" || { after_arg=""; missing="${missing:+$missing and }after"; }
+  stamp="$(py readback-folded "${out_dir}/readback-folded.json" "$code" "$before_arg" "$after_arg" \
+    "${out_dir}/ravel-metrics-at-query.txt" "${out_dir}/ravel-objects.json" "$folded_catalog_get_max_fraction" \
+    "$folded_catalog_get_floor")" || stamp_code=$?
+  [ -z "$stamp" ] || stamp_set readback_folded "$stamp"
+  if [ "$code" -ne 0 ]; then
+    show_log "${out_dir}/readback-folded.log"
+    fail_step readback-folded "metricsbench_ingest --readback-only exited $code: $(py get "$STAMPS" readback_folded.error 2>/dev/null)"
+  fi
+  [ "$stamp_code" -eq 0 ] ||
+    fail_step readback-folded "metricsbench_ingest --readback-only exited 0 without a read-back report"
+  [ "$(py get "$STAMPS" readback_folded.matches_expected)" = "True" ] ||
+    fail_step readback-folded "metricsbench_ingest --readback-only exited 0 without matches_expected true"
+  [ -z "$missing" ] || fail_step readback-folded "the ${missing} scrape of ${RAVEL_BASE}/metrics failed"
+  verdict="$(py get "$STAMPS" readback_folded.catalog_get_verdict 2>/dev/null)" || verdict=""
+  [ "$verdict" = "within" ] || [[ "$verdict" == "not discriminating:"* ]] ||
+    fail_step readback-folded "folded read-back catalog GETs: ${verdict:-no verdict stamped}"
+  step_done readback-folded
+}
+
+# folded_readback: stop, fold, start and readback-folded, or their stamps
+# saying why they were skipped when the Ravel row did not replay. A failed
+# fold ends the run with ravel-server still stopped; teardown removes the
+# stack either way, and nothing after the fold would read it.
+folded_readback() {
+  local why k
+  if ! why="$(py ravel-row-state "${out_dir}/ingest.json")"; then
+    for k in ravel_catalog_fold_writers_stopped ravel_restart readback_folded; do
+      stamp_str "$k" "skipped: $why"
+    done
+    say "steps stop, fold, start and readback-folded skipped: $why"
+    return 0
+  fi
+  stop_step
+  fold_step
+  start_step
+  readback_folded_step
 }
 
 # sha256_of FILE: the file's sha256 as 64 lowercase hex characters.
@@ -1230,6 +1556,9 @@ run_diagnostic() {
   stamp_str object_store "not applicable: diagnostic run starts no object store"
   stamp_str ravel_catalog_fold "not applicable: diagnostic run starts no Ravel"
   stamp_str mimir_readiness "not applicable: diagnostic run starts no Mimir"
+  stamp_str ravel_catalog_fold_writers_stopped "not applicable: diagnostic run starts no Ravel"
+  stamp_str ravel_restart "not applicable: diagnostic run starts no Ravel"
+  stamp_str readback_folded "not applicable: diagnostic run starts no Ravel"
   stamp_str ravel_objects "not applicable: diagnostic run starts no Ravel"
 
   wait_ready prometheus "${PROM_BASE}/-/ready"
@@ -1329,6 +1658,7 @@ run_full() {
     --prometheus-endpoint "${PROM_BASE}/api/v1/write" --prometheus-query-url "$PROM_BASE" \
     --victoriametrics-endpoint "${VM_BASE}/api/v1/write" --victoriametrics-query-url "${VM_BASE}/prometheus" \
     --mimir-endpoint "${MIMIR_BASE}/api/v1/push" --mimir-query-url "${MIMIR_BASE}/prometheus"
+  INGEST_END_HOUR=$(($(date -u +%s) / 3600))
 
   code=0
   line="$(py mimir-readiness "${out_dir}/ingest.json")" || code=$?
@@ -1441,6 +1771,8 @@ run_full() {
   step_done validate
 
   memory_step
+  folded_readback
+  [ "$INGEST_FAILED" -eq 0 ] || fail_after_ingest
 }
 
 if [ "$diagnostic" -eq 1 ]; then
