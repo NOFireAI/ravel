@@ -85,6 +85,7 @@ async fn start_server(
         },
         max_inflight_flushes: 1,
         max_inflight_flushes_per_tenant: None,
+        flush_object_backstop_multiple: 4,
         max_queued_flushes: 8,
         adaptive_flush_delay: false,
         max_flush_delay: Duration::from_secs(2),

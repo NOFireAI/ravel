@@ -894,12 +894,15 @@ under `Unlimited` only the length of the stall does. Size the steady state
 from `max_queued_flushes`, and size the overshoot from the byte ceiling rather
 than from a count of buffers.
 A second exempt crossing is the object backstop (ADR-2708 D3): a buffer whose
-object estimate (`flush_est_bytes`) has reached 4x `target_bytes` (32 MiB at
-defaults) spawns past both the share and the cap. A deferred trigger keeps
-merging into the same buffer, and the memory backstop alone does not bound
-the object a native histogram encodes (16 bytes charged a point against up to
+object estimate (`flush_est_bytes`) has reached `flush_object_backstop_multiple`
+times `target_bytes` (4x, 32 MiB at defaults; configurable via
+`--flush-object-backstop-multiple`, refused at 0) spawns past both the
+share and the cap. A deferred trigger keeps merging into the same buffer, and
+the memory backstop alone does not bound the object a native histogram
+encodes (16 bytes charged a point against up to
 `32 + 8 * (buckets + spans + custom_values)` object bytes), so this caps a
-deferred object at about 4x `target_bytes` plus one batch.
+deferred object at about `flush_object_backstop_multiple * target_bytes` plus
+one batch.
 `flushes_queued` reading above the cap while `flush_trigger_deferred` stays
 flat is this exemption, not a queue that lost its bound. Both are exported:
 `/metrics` renders them as `ravel_ingest_queued_flushes` (gauge) and

@@ -530,6 +530,12 @@ pub struct ServerConfig {
     /// three ingest pipelines (ADR-2708 D3). `None` resolves to `max(1,
     /// max_inflight_flushes - 1)`. See `--max-inflight-flushes-per-tenant`.
     pub max_inflight_flushes_per_tenant: Option<usize>,
+    /// How many `target_bytes` of object a deferred buffer may hold before
+    /// the object backstop exempts it from the per-tenant share, forwarded to
+    /// [`ravel_ingest::IngestConfig::flush_object_backstop_multiple`] on all
+    /// three ingest pipelines (ADR-2708 D3, configurable since issue #3662).
+    /// See `--flush-object-backstop-multiple`.
+    pub flush_object_backstop_multiple: usize,
     /// Per-shard bound on spawned-but-unreaped flush tasks, forwarded to
     /// [`ravel_ingest::IngestConfig::max_queued_flushes`] on all three ingest
     /// pipelines (issue #1740). A buffer over its memory backstop spawns even
@@ -2351,6 +2357,9 @@ fn ingest_config_refusal(e: &IngestConfigError) -> String {
         IngestConfigError::FlushShareAboveMaxInflightFlushes { .. } => {
             format!("{e}. --max-inflight-flushes-per-tenant must not exceed --max-inflight-flushes")
         }
+        IngestConfigError::ZeroFlushObjectBackstopMultiple => format!(
+            "{e}. Set --flush-object-backstop-multiple to a positive count (4 is the default)"
+        ),
     }
 }
 
@@ -2553,6 +2562,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 shard_count: config.shard_count,
                 max_inflight_flushes: config.max_inflight_flushes,
                 max_inflight_flushes_per_tenant: config.max_inflight_flushes_per_tenant,
+                flush_object_backstop_multiple: config.flush_object_backstop_multiple,
                 max_queued_flushes: config.max_queued_flushes as usize,
                 adaptive_flush_delay: config.adaptive_flush_delay,
                 max_flush_delay: config.max_flush_delay,
@@ -2649,6 +2659,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 shard_count: config.shard_count,
                 max_inflight_flushes: config.max_inflight_flushes,
                 max_inflight_flushes_per_tenant: config.max_inflight_flushes_per_tenant,
+                flush_object_backstop_multiple: config.flush_object_backstop_multiple,
                 max_queued_flushes: config.max_queued_flushes as usize,
                 max_flush_delay: config.max_flush_delay,
                 max_flush_delay_idle: config.max_flush_delay_idle,
@@ -2685,6 +2696,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 shard_count: config.shard_count,
                 max_inflight_flushes: config.max_inflight_flushes,
                 max_inflight_flushes_per_tenant: config.max_inflight_flushes_per_tenant,
+                flush_object_backstop_multiple: config.flush_object_backstop_multiple,
                 max_queued_flushes: config.max_queued_flushes as usize,
                 max_flush_delay: config.max_flush_delay,
                 max_flush_delay_idle: config.max_flush_delay_idle,
@@ -5879,6 +5891,7 @@ mod startup_test_support {
             shard_count: 1,
             max_inflight_flushes: 1,
             max_inflight_flushes_per_tenant: None,
+            flush_object_backstop_multiple: 4,
             max_queued_flushes: 8,
             adaptive_flush_delay: false,
             max_flush_delay: Duration::from_secs(2),

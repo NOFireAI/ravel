@@ -4514,6 +4514,125 @@ mod tests {
         let _ = h.task.await;
     }
 
+    /// Issue #3662: `flush_object_backstop_multiple` is config now, not the
+    /// hardcoded 4. A tenant held at its one-flush share (`max_inflight_flushes:
+    /// 1`) has its ordinary size trigger deferred past `target_bytes`
+    /// (`queued_flush_cap_reached`) until the deferred buffer's own object
+    /// estimate crosses `multiple * target_bytes`, the only point at which
+    /// [`object_backstop_crossed`] exempts it from the share.
+    ///
+    /// `target_bytes` is set to the size of exactly one record
+    /// ([`est_record_object_bytes`]), so each further record is one more
+    /// multiple of the target: `expected_records` is both the record count
+    /// and the multiple under test.
+    async fn object_backstop_spawns_the_deferred_buffer_at_its_configured_multiple(
+        multiple: usize,
+        expected_records: usize,
+    ) {
+        let record = norm_record(&[("service.name", "api")], "scope", 1_000, "x");
+        let record_bytes = est_record_object_bytes(&record);
+        let config = IngestConfig {
+            shard_count: 1,
+            target_bytes: record_bytes,
+            max_flush_delay: Duration::from_secs(3600),
+            max_flush_delay_idle: Duration::from_secs(3600),
+            flush_tick: Duration::from_millis(10),
+            max_inflight_flushes: 1,
+            max_queued_flushes: 8,
+            flush_object_backstop_multiple: multiple,
+            put_retry_base_delay: Duration::from_millis(1),
+            put_retry_max_delay: Duration::from_millis(5),
+            ..IngestConfig::default()
+        };
+        assert_eq!(
+            config.flush_share_per_tenant(),
+            1,
+            "max_inflight_flushes: 1 gives a share of 1"
+        );
+
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let h = Harness::spawn_with_store(config, store);
+        let tenant = TenantId::new("acme");
+        let gate = fault.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Always);
+
+        async fn send(h: &Harness, tenant: &TenantId, record: &NormalizedLogRecord) {
+            h.tx.send(LogShardMsg::Write {
+                arrival: false,
+                tenant: tenant.clone(),
+                records: vec![record.clone()].into(),
+                ack: None,
+                charge: None,
+            })
+            .await
+            .expect("send write");
+        }
+
+        // Size-triggered first flush fills the tenant's one-flush share and
+        // parks on its data-object PUT.
+        send(&h, &tenant, &record).await;
+        gate.wait_until_held(1).await;
+
+        // Every record short of the configured multiple stays deferred: the
+        // tenant is at its share and the object backstop has not crossed.
+        for _ in 0..expected_records.saturating_sub(1) {
+            send(&h, &tenant, &record).await;
+        }
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            gate.held().len(),
+            1,
+            "{} of {expected_records} records ({} of {} bytes) must stay deferred below \
+             {multiple} x target_bytes",
+            expected_records.saturating_sub(1),
+            expected_records.saturating_sub(1) * record_bytes,
+            multiple * record_bytes,
+        );
+
+        // The record that reaches multiple * target_bytes crosses the object
+        // backstop: the deferred buffer is taken for a second flush task,
+        // exempt from the share, rather than refused and re-merged again.
+        // With `max_inflight_flushes: 1` the tenant's one permit is still held
+        // by the first flush, so the second task cannot reach its own PUT
+        // until the first is released; releasing it is what proves the
+        // second task was actually spawned rather than silently re-buffered
+        // forever (the bug this test must catch).
+        send(&h, &tenant, &record).await;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        let first_ids = gate.held();
+        assert_eq!(
+            first_ids.len(),
+            1,
+            "the crossing record's flush task waits on the tenant's one permit, not on a second PUT"
+        );
+        gate.release(first_ids[0]);
+        tokio::time::timeout(Duration::from_secs(5), gate.wait_until_held(1))
+            .await
+            .expect(
+                "the deferred buffer's second flush reached its data-object PUT once the \
+                 tenant's permit freed, proving it was spawned at the configured object backstop",
+            );
+
+        for id in gate.held() {
+            gate.release(id);
+        }
+        h.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn object_backstop_multiple_one_spawns_the_deferred_buffer_at_target_bytes() {
+        object_backstop_spawns_the_deferred_buffer_at_its_configured_multiple(1, 1).await;
+    }
+
+    #[tokio::test]
+    async fn object_backstop_multiple_four_spawns_the_deferred_buffer_at_four_times_target_bytes() {
+        object_backstop_spawns_the_deferred_buffer_at_its_configured_multiple(4, 4).await;
+    }
+
     /// ADR-0069 refund on the happy path: the charge the buffer held is dropped
     /// inside the flush task at its terminal outcome, so the process-wide gauge
     /// returns to exactly the sentinel it started at (never leaking the flush's
