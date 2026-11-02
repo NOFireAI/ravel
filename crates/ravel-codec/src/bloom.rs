@@ -11,7 +11,8 @@
 //! and field-scoped (the column id is hashed in) so a `body` match never
 //! collides with an `attr.k` match.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 
 use crate::error::CodecError;
 use crate::varint::{get_uvarint, put_uvarint};
@@ -124,49 +125,43 @@ fn get_bit(bits: &[u8], bit: u64) -> bool {
 /// keys still collapses to one, matching the old distinct-triple count that
 /// sizes the filter).
 ///
+/// `insert`'s own membership check hashes the raw key exactly once too (issue
+/// #3655): `staged` buckets keys by `hasher.hash_one(key)`, a single SipHash
+/// pass over the `column_id_le || token` bytes, rather than the two a
+/// `HashSet::contains` followed by `HashSet::insert` would run over the same
+/// bytes. A `u64` bucket key can collide between two different raw keys, so
+/// each bucket is a small `Vec<Box<[u8]>>` and a new key is only pushed after
+/// a byte-equality check against every key already in its bucket; the keyed
+/// SipHash value (not a public, grindable hash) makes a bucket collision
+/// infeasible for a tenant to engineer on purpose. The outer `HashMap<u64,
+/// _>` still hashes its `u64` keys with its own `RandomState`, but that hash
+/// runs over a fixed 8 bytes regardless of token length, so it does not scale
+/// with the cost this change removes.
+///
 /// `finish` takes `self` by value and drains `staged`. `triples` is built
-/// with capacity `self.staged.len()` before the drain loop, which reserves
-/// the full bucket array up front, so `staged` and `triples` are both fully
-/// live at once: draining does not roughly halve peak memory.
+/// with capacity equal to the total boxed-key count (summed across buckets)
+/// before the drain loop, which reserves the full bucket array up front, so
+/// `staged` and `triples` are both fully live at once: draining does not
+/// roughly halve peak memory.
 ///
-/// Per-key cost at that peak, on the same basis for both tables (hashbrown
-/// adds one control byte per slot and keeps the load factor between about
-/// 0.4375 just after a resize and 0.875 just before the next one, so a
-/// slot's real cost is `(value_width + 1) / load_factor`, not the bare
-/// value width):
-/// - `staged: HashSet<Box<[u8]>>` -- each slot holds a `Box<[u8]>` fat
-///   pointer (16 bytes: data pointer + length), so the slot itself costs
-///   `(16 + 1) / 0.875` to `(16 + 1) / 0.4375`, roughly 19 to 39 bytes. That
-///   pointer addresses a separate heap allocation for the raw
-///   `column_id_le || token` bytes: up to 4 + 64 = 68 bytes of data (the
-///   64-byte token bound `insert` documents below) plus a typical ~16-byte
-///   allocator header, roughly 84 bytes. Staged cost: roughly 103 to 123
-///   bytes per distinct key.
-/// - `triples: HashSet<(u64, u64, u64)>` -- the 24-byte tuple lives inline
-///   in the slot, no separate heap allocation, so the slot costs
-///   `(24 + 1) / 0.875` to `(24 + 1) / 0.4375`, roughly 29 to 57 bytes per
-///   distinct key.
-///
-/// Both tables are live at peak (above), so the combined peak cost is their
-/// sum: roughly 132 to 180 bytes per distinct key. That is an increase over
-/// the old builder's single `staged: HashSet<(u64, u64, u64)>` (~29 to 57
-/// bytes per distinct key on the same basis), roughly 3x -- negligible in
-/// absolute terms at a per-block builder's typical scale (a few MB at
-/// ~16k distinct keys).
-///
-/// Both sets hash with std's SipHash `RandomState`: `staged` holds
-/// tenant-chosen tokens, and `triples` follows the same rule so the crate has
-/// one hasher policy (owner decision on issue #3228). The hasher does not
-/// change which keys are distinct, so it does not change the emitted bytes.
+/// Both `staged`'s keys and `triples` hash with std's SipHash `RandomState`:
+/// `staged` holds tenant-chosen tokens, and `triples` follows the same rule
+/// so the crate has one hasher policy (owner decision on issue #3228). The
+/// hasher does not change which keys are distinct, so it does not change the
+/// emitted bytes.
 pub struct BloomBuilder {
     seed: u64,
-    /// Distinct `column_id_le || token` byte strings. Queried by `&[u8]` via
-    /// `Box<[u8]>: Borrow<[u8]>`, so a duplicate insert probes without
-    /// allocating. Hashed with std's SipHash `RandomState`, not a faster
-    /// non-SipHash hasher: the keys are tenant-chosen tokens, nothing caps
-    /// how many distinct keys a block stages, and the owner declined a
-    /// hasher without HashDoS resistance for this data (issue #3228).
-    staged: HashSet<Box<[u8]>>,
+    /// Hashes the raw `column_id_le || token` bytes for `staged`'s buckets.
+    /// Std's SipHash `RandomState`, not a faster non-SipHash hasher: the
+    /// keys are tenant-chosen tokens, nothing caps how many distinct keys a
+    /// block stages, and the owner declined a hasher without HashDoS
+    /// resistance for this data (issue #3228).
+    hasher: std::collections::hash_map::RandomState,
+    /// Distinct `column_id_le || token` byte strings, bucketed by
+    /// `hasher.hash_one(key)` so a duplicate insert hashes the key once, not
+    /// twice. A bucket normally holds one key; more than one means a 64-bit
+    /// hash collision, resolved by the byte-equality check in `insert`.
+    staged: HashMap<u64, Vec<Box<[u8]>>>,
     /// Reused `column_id_le || token` buffer for the membership probe, so a
     /// duplicate insert copies bytes but allocates nothing.
     scratch: Vec<u8>,
@@ -176,7 +171,8 @@ impl BloomBuilder {
     pub fn new(seed: u64) -> Self {
         BloomBuilder {
             seed,
-            staged: HashSet::default(),
+            hasher: std::collections::hash_map::RandomState::new(),
+            staged: HashMap::new(),
             scratch: Vec::new(),
         }
     }
@@ -204,8 +200,10 @@ impl BloomBuilder {
         self.scratch.clear();
         self.scratch.extend_from_slice(&column_id.to_le_bytes());
         self.scratch.extend_from_slice(token);
-        if !self.staged.contains(self.scratch.as_slice()) {
-            self.staged.insert(self.scratch.as_slice().into());
+        let h = self.hasher.hash_one(self.scratch.as_slice());
+        let bucket = self.staged.entry(h).or_default();
+        if !bucket.iter().any(|k| k.as_ref() == self.scratch.as_slice()) {
+            bucket.push(self.scratch.as_slice().into());
         }
     }
 
@@ -236,13 +234,16 @@ impl BloomBuilder {
         // capacity reserved below covers the full table up front, so `staged`
         // and `triples` are both fully live once the loop starts -- see the
         // struct doc for the measured peak and per-key arithmetic.
-        let mut triples: HashSet<(u64, u64, u64)> = HashSet::with_capacity(self.staged.len());
-        for key in self.staged.drain() {
-            let mut col = [0u8; 4];
-            col.copy_from_slice(&key[..4]);
-            let column_id = u32::from_le_bytes(col);
-            let h = key_hash(self.seed, column_id, &key[4..]);
-            triples.insert((h.block, h.g1, h.g2));
+        let distinct_count: usize = self.staged.values().map(Vec::len).sum();
+        let mut triples: HashSet<(u64, u64, u64)> = HashSet::with_capacity(distinct_count);
+        for (_, bucket) in self.staged.drain() {
+            for key in bucket {
+                let mut col = [0u8; 4];
+                col.copy_from_slice(&key[..4]);
+                let column_id = u32::from_le_bytes(col);
+                let h = key_hash(self.seed, column_id, &key[4..]);
+                triples.insert((h.block, h.g1, h.g2));
+            }
         }
         let n = triples.len() as f64;
         let target = (n * BITS_PER_ELEM).ceil() as u64;
@@ -343,18 +344,52 @@ impl<'a> BloomView<'a> {
 }
 
 #[cfg(test)]
+impl BloomBuilder {
+    /// Test-only: stages `(column_id, token)` directly under bucket `h`,
+    /// bypassing `hasher.hash_one`, so a test can force a 64-bit bucket
+    /// collision between two different keys without needing a real SipHash
+    /// collision. Mirrors `insert`'s byte-equality check.
+    fn insert_at_hash_for_test(&mut self, h: u64, column_id: u32, token: &[u8]) {
+        let mut key = Vec::with_capacity(4 + token.len());
+        key.extend_from_slice(&column_id.to_le_bytes());
+        key.extend_from_slice(token);
+        let bucket = self.staged.entry(h).or_default();
+        if !bucket.iter().any(|k| k.as_ref() == key.as_slice()) {
+            bucket.push(key.into_boxed_slice());
+        }
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
     /// Owner decision on issue #3228: `staged` holds tenant tokens and keeps
     /// std's SipHash `RandomState`. Swapping the hasher fails to compile here.
-    fn staged_uses_siphash(_: &HashSet<Box<[u8]>, std::collections::hash_map::RandomState>) {}
+    fn staged_uses_siphash(_: &std::collections::hash_map::RandomState) {}
 
     #[test]
     fn staged_set_hasher_is_pinned_to_siphash() {
         let builder = BloomBuilder::new(0);
-        staged_uses_siphash(&builder.staged);
+        staged_uses_siphash(&builder.hasher);
+    }
+
+    /// Forces two different keys into the same 64-bit bucket (a real SipHash
+    /// collision is infeasible to engineer in a test) and checks both survive
+    /// `insert`'s byte-equality check. A builder that skipped the check --
+    /// treating a matching bucket hash as a matching key -- would silently
+    /// drop the second key, and `may_contain` for it would wrongly report
+    /// `false` (a false negative, the property the bloom must never have).
+    #[test]
+    fn bucket_collision_keeps_both_distinct_keys() {
+        let mut b = BloomBuilder::new(11);
+        b.insert_at_hash_for_test(42, 1, b"alpha");
+        b.insert_at_hash_for_test(42, 1, b"beta");
+        let bytes = b.finish();
+        let v = BloomView::parse(&bytes).expect("parse");
+        assert!(v.may_contain(1, b"alpha"));
+        assert!(v.may_contain(1, b"beta"));
     }
 
     #[test]
@@ -661,6 +696,113 @@ mod proptests {
                 "779c568c38d754bae581481bf0dc1a7be1c7e67dbe49dc42af0e90106dba0975".to_string()
             )
         );
+    }
+
+    /// Test-only copy of `BloomBuilder` exactly as it was immediately before
+    /// issue #3655: `staged: HashSet<Box<[u8]>>`, a `contains` then `insert`
+    /// on every call (two SipHash passes per new key), hashing still
+    /// deferred to `finish`. The new builder (one SipHash pass per new key)
+    /// must emit identical bytes for the same inserts.
+    struct OldBloomBuilder {
+        seed: u64,
+        staged: HashSet<Box<[u8]>>,
+        scratch: Vec<u8>,
+    }
+
+    impl OldBloomBuilder {
+        fn new(seed: u64) -> Self {
+            OldBloomBuilder {
+                seed,
+                staged: HashSet::new(),
+                scratch: Vec::new(),
+            }
+        }
+
+        fn insert(&mut self, column_id: u32, token: &[u8]) {
+            self.scratch.clear();
+            self.scratch.extend_from_slice(&column_id.to_le_bytes());
+            self.scratch.extend_from_slice(token);
+            if !self.staged.contains(self.scratch.as_slice()) {
+                self.staged.insert(self.scratch.as_slice().into());
+            }
+        }
+
+        fn finish_sized(self, size: impl FnOnce(u64) -> u64) -> Vec<u8> {
+            let mut triples: HashSet<(u64, u64, u64)> = HashSet::with_capacity(self.staged.len());
+            for key in self.staged {
+                let mut col = [0u8; 4];
+                col.copy_from_slice(&key[..4]);
+                let column_id = u32::from_le_bytes(col);
+                let h = key_hash(self.seed, column_id, &key[4..]);
+                triples.insert((h.block, h.g1, h.g2));
+            }
+            let n = triples.len() as f64;
+            let target = (n * BITS_PER_ELEM).ceil() as u64;
+            let m_bits = size(target);
+            let block_count = m_bits / BLOCK_BITS;
+            let mut bits = vec![0u8; (m_bits / 8) as usize];
+            for (block, g1, g2) in &triples {
+                let h = KeyHash {
+                    block: *block,
+                    g1: *g1,
+                    g2: *g2,
+                };
+                for bit in probe_bits(&h, K, block_count) {
+                    set_bit(&mut bits, bit);
+                }
+            }
+            let mut out = Vec::new();
+            put_uvarint(&mut out, m_bits);
+            out.push(K);
+            out.extend_from_slice(&self.seed.to_le_bytes());
+            out.extend_from_slice(&bits);
+            out
+        }
+
+        fn finish(self) -> Vec<u8> {
+            self.finish_sized(|target| target.max(BLOCK_BITS).next_power_of_two())
+        }
+
+        fn finish_exact(self) -> Vec<u8> {
+            self.finish_sized(|target| target.max(BLOCK_BITS).div_ceil(BLOCK_BITS) * BLOCK_BITS)
+        }
+    }
+
+    /// The new builder's `finish` and `finish_exact` bytes equal
+    /// `OldBloomBuilder`'s over the fixed corpus's heavy token duplication
+    /// (deliverable 2, issue #3655).
+    #[test]
+    fn bloom_identical_to_pre_3655_builder() {
+        let corpus = fixed_corpus();
+        let seed = 0x1234_5678_9abc;
+        let mut new_pow2 = BloomBuilder::new(seed);
+        let mut old_pow2 = OldBloomBuilder::new(seed);
+        let mut new_exact = BloomBuilder::new(seed);
+        let mut old_exact = OldBloomBuilder::new(seed);
+        for (col, tok) in &corpus {
+            new_pow2.insert(*col, tok);
+            old_pow2.insert(*col, tok);
+            new_exact.insert(*col, tok);
+            old_exact.insert(*col, tok);
+        }
+        assert_eq!(new_pow2.finish(), old_pow2.finish());
+        assert_eq!(new_exact.finish_exact(), old_exact.finish_exact());
+    }
+
+    proptest! {
+        /// Same identity, over random seeds, so the comparison is not pinned
+        /// to one seed value.
+        #[test]
+        fn bloom_identical_to_pre_3655_builder_any_seed(seed in any::<u64>()) {
+            let corpus = fixed_corpus();
+            let mut new_pow2 = BloomBuilder::new(seed);
+            let mut old_pow2 = OldBloomBuilder::new(seed);
+            for (col, tok) in &corpus {
+                new_pow2.insert(*col, tok);
+                old_pow2.insert(*col, tok);
+            }
+            prop_assert_eq!(new_pow2.finish(), old_pow2.finish());
+        }
     }
 
     proptest! {

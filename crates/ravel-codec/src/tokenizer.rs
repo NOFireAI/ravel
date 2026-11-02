@@ -44,6 +44,31 @@ pub fn for_each_token(text: &str, mut f: impl FnMut(&[u8])) {
     }
 }
 
+/// Calls `f` with each of [`tokens`]`(text)`'s tokens, where `text` is the
+/// UTF-8 decoding of `bytes`. Returns whether `bytes` is valid UTF-8; when it
+/// is not, `f` is never called, matching [`for_each_token`]`(s, f)` after a
+/// failed `str::from_utf8(bytes)`.
+///
+/// All-ASCII `bytes` runs the ASCII byte path directly, with no
+/// `str::from_utf8` validation pass: ASCII bytes are trivially valid UTF-8,
+/// so that scan would only re-confirm what `is_ascii` already established.
+/// Any byte at or above 0x80 validates with `str::from_utf8` and then runs
+/// the Unicode path on success, same as [`for_each_token`].
+pub fn for_each_token_bytes(bytes: &[u8], mut f: impl FnMut(&[u8])) -> bool {
+    if bytes.is_ascii() {
+        ascii_tokens(bytes, &mut f);
+        true
+    } else {
+        match std::str::from_utf8(bytes) {
+            Ok(s) => {
+                unicode_tokens(s, &mut f);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 fn ascii_tokens(text: &[u8], f: &mut impl FnMut(&[u8])) {
     let mut buf = [0u8; TOKEN_MAX_BYTES];
     let mut len = 0;
@@ -382,6 +407,40 @@ mod proptests {
             prop_assert_eq!(tokens(&text), want.clone());
             let mut got = Vec::new();
             for_each_token(&text, |t| got.push(t.to_vec()));
+            prop_assert_eq!(got, want);
+        }
+    }
+
+    /// Byte strings for [`for_each_token_bytes`]: valid UTF-8 (reusing
+    /// [`text`], which covers ASCII, the edge characters including U+0130,
+    /// and words over 64 bytes) plus arbitrary bytes, which are usually
+    /// invalid UTF-8 but occasionally valid by chance.
+    fn bytes_input() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            text().prop_map(String::into_bytes),
+            proptest::collection::vec(any::<u8>(), 0..300),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2048))]
+
+        /// [`for_each_token_bytes`] yields exactly what `str::from_utf8`
+        /// followed by [`for_each_token`] yields, and reports invalid UTF-8
+        /// exactly when `str::from_utf8` fails.
+        #[test]
+        fn for_each_token_bytes_matches_from_utf8_then_for_each_token(bytes in bytes_input()) {
+            let (want_valid, want) = match std::str::from_utf8(&bytes) {
+                Ok(s) => {
+                    let mut got = Vec::new();
+                    for_each_token(s, |t| got.push(t.to_vec()));
+                    (true, got)
+                }
+                Err(_) => (false, Vec::new()),
+            };
+            let mut got = Vec::new();
+            let got_valid = for_each_token_bytes(&bytes, |t| got.push(t.to_vec()));
+            prop_assert_eq!(got_valid, want_valid);
             prop_assert_eq!(got, want);
         }
     }

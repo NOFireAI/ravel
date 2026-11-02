@@ -44,7 +44,7 @@ use crate::rlog_bloom::encode_rlog_bloom_section;
 use crate::rlog_codec::{MAX_DICT_ENTRIES, encode_dict_ids, encode_dict_page};
 use crate::skip_index::{Level0Entry, SkipIndex};
 use crate::stream_dir::{BorrowedStreamEntry, StreamDir};
-use crate::tokenizer::for_each_token;
+use crate::tokenizer::for_each_token_bytes;
 
 /// Writer configuration and format constants (docs/log-segment-format.md).
 #[derive(Clone, Copy, Debug)]
@@ -3227,11 +3227,13 @@ fn row_estimate(row: &ResolvedRow) -> usize {
 }
 
 /// Inserts a text value's word tokens (and its exact bytes when short) into the
-/// bloom, all scoped to `column_id`.
+/// bloom, all scoped to `column_id`. Scans `bytes` once: all-ASCII input
+/// tokenizes directly off the bytes with no `str::from_utf8` validation pass
+/// (issue #3655), where before this both `from_utf8` and the tokenizer's own
+/// `is_ascii` check scanned the same bytes. Invalid UTF-8 still contributes no
+/// word tokens, exactly as before.
 fn insert_text(builder: &mut BloomBuilder, column_id: u32, bytes: &[u8]) {
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        for_each_token(s, |tok| builder.insert(column_id, tok));
-    }
+    for_each_token_bytes(bytes, |tok| builder.insert(column_id, tok));
     if bytes.len() <= EXACT_BLOOM_MAX {
         builder.insert(column_id, bytes);
     }
