@@ -1657,11 +1657,11 @@ estimate and pins its error with a test.
 **Implementation note (2026-11-01).** The whole-segment fast path, which
 runs no plan pass and takes q21, computes the same estimate and verdict
 for a `Contains` scan with a decoded cache attached
-(`compute_fast_path_verdict`, `crates/ravel-sql/src/logs_scan/plan.rs:327`,
+(`compute_fast_path_verdict`, `crates/ravel-sql/src/logs_scan/plan.rs:332`,
 awaited by every partition before its first open from
-`crates/ravel-sql/src/logs_scan/mod.rs:3193`), reading each relevant
+`crates/ravel-sql/src/logs_scan/mod.rs:3213`), reading each relevant
 segment's directories once through the plan pass's cached directory read
-(`plan.rs:344`). It costs at most one directory read per relevant segment
+(`plan.rs:356`). It costs at most one directory read per relevant segment
 cold, charged to the plan phase, and no object-store request hot with the
 directories in the read cache
 (`the_fast_path_verdict_reads_directories_once_per_segment_cold_and_nothing_hot`).
@@ -1675,8 +1675,10 @@ no plan-phase request, read-cache hit or decompressed byte
 Before the memo every hot q21 to q24 run spent about 150 ms in
 `planInitMs` re-reading and decoding every segment's directories (#3326
 comment 6571977317). The measured q22 plan-time estimate is 8,167,435,851
-bytes against the 8,000,000,000-byte cap, 2.1% over, beside the model's
-2.4 MB to about 12 MB over quoted above.
+bytes against the 8,000,000,000-byte cap, 2.1% over. That figure is the
+estimate, not the set: against the set the decision 5 table puts 2.4 MB
+over the cap it runs 2.06% high, the safe side of the error budget below,
+and q22 is over the cap on both, so it is not served.
 
 **When the estimate is wrong.** Answers do not depend on it, since a served
 and a decoded deferred column yield the same rows (the LIKE-deferred
