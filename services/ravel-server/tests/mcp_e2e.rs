@@ -849,13 +849,17 @@ mod with_mcp {
         publish_series(store, ingest_hour, writer_seq, &[(None, samples)]).await;
     }
 
+    /// One series for [`publish_series`]: its label `k`, if any, and its
+    /// `(ts_ns, value)` samples.
+    type SeriesEntry<'a> = (Option<&'a str>, &'a [(i64, f64)]);
+
     /// [`publish_samples`] with one series of metric `m` per entry, the entry
     /// carrying label `k` set to its value when one is given.
     async fn publish_series(
         store: &dyn ObjectStoreBackend,
         ingest_hour: u32,
         writer_seq: u64,
-        entries: &[(Option<&str>, &[(i64, f64)])],
+        entries: &[SeriesEntry<'_>],
     ) {
         use ravel_commit::publish::RetryPolicy;
         use ravel_commit::record::NewCommitRecord;
