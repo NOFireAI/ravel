@@ -669,6 +669,48 @@ verification (step 6), after which the run goes on as a diagnostic:
     final bytes per container and `OOMKilled` from `docker inspect` (case a),
     and every `--rss-band` is checked (case d). An OOM-killed container exits
     75 (case e).
+14. `fold`: `ravel-cli --store s3 --tenant-hash-unkeyed catalog fold
+    --tenant metricsbench --shards 4 --signal metrics --writers-stopped`,
+    run as `docker compose run --rm --no-deps -T ravel-qualify ...`, so it
+    reads the store `ravel-qualify` carries in either lane: s3s-fs here,
+    the real-S3 bucket under `real-s3.yml` (cases u, u10). Every writer has
+    stopped by then. Its report goes to `fold.out` (case u). The step fails
+    with exit 70 naming fold unless `seal_through_hour` is `Some(N)` (case
+    u1) and `watermark_hour` is at or after the ingest hour (Unix seconds
+    divided by 3600) the clock read when the ingest step returned (case u2).
+    `ravel_catalog_fold_writers_stopped` stamps `seal_through_hour`,
+    `watermark_hour`, `entry_count`, `buckets_folded`, that `ingest_end_hour`
+    and `precondition` (`met`, or why not) (cases u, u1, u2).
+15. `restart`: `docker compose restart ravel-server` only, then Ravel's
+    `/api/v1/status/buildinfo` answers 200 as in `ready` (case u);
+    `ravel_restart` says it restarted.
+16. `readback-folded`: Ravel's `/metrics` into
+    `ravel-metrics-before-folded-readback.txt`, then `metricsbench_ingest
+    --readback-only --ingest-report ingest.json --readback-system ravel`
+    with the ingest step's workload, profile, anchor, query URL, token
+    variable and `--readback-timeout-secs`, and `--readback-settle-secs 60`,
+    the bin's default the ingest step runs with, into `readback-folded.json`,
+    then `/metrics` again into `ravel-metrics-after-folded-readback.txt`
+    (case u). `readback_folded`
+    stamps the bin's `exit_code`, `matches_expected`, `error`, the series
+    query's `series_query_ms` (`readback.query_ms.series`), and between the
+    two scrapes `store_get_calls_delta` (`ravel_store_calls_total` with
+    `op="get"`) and `commit_record_cache_entries_delta`
+    (`ravel_catalog_record_cache_entries` with `cache="commit"`) (case u).
+    A non-zero exit fails the step with exit 70 naming readback-folded (case
+    u3), and so does a scrape that did not answer 200, whose delta is then
+    null (case u4).
+
+Steps 14 to 16 also run after a failed ingest verification when the Ravel
+row itself replayed and only its read-back failed or mismatched, which is the
+case they measure: the run still exits 70 naming ingest (case u5), and a
+failure among them is listed in `failed_after_ingest` (case u6). When the
+Ravel row has a `row_failure` or stalled, the three are skipped and each
+stamp says `skipped:` and why (cases u7, u8). They run only once `memory`
+passed; a run that ends earlier, at `query` for a failed oracle row (case
+q4) or at an `--rss-band` breach after a failed ingest (case q3), does not
+reach them. The diagnostic mode runs none of them and stamps each `not
+applicable` (case u9).
 
 Whatever the outcome, the compose logs go to `compose.log` and the stack is
 torn down with `docker compose ... down -v` unless `--keep` is given (cases
@@ -700,7 +742,8 @@ case p), `ravel_image.resolved` (the `docker image inspect` result),
 and `anchor_source`, `started_at` and `ended_at`, `store_kind: s3s-fs`, `host.arch`,
 `instance_type` (EC2 IMDSv2, else `unknown`), `comparator_images` (each
 comparator's image block as the capture recorded it), `ravel_catalog_fold`,
-`mimir_readiness`, `in_process_row` (`present` or `skipped`, cases a, l and
+`ravel_catalog_fold_writers_stopped`, `ravel_restart` and `readback_folded`
+(steps 14 to 16; cases u, u7 and u9), `mimir_readiness`, `in_process_row` (`present` or `skipped`, cases a, l and
 f), `object_store` (release, asset arch, engine arch and its source, sha256,
 URL, cached path and whether it came from the cache or a download; `not applicable` in the diagnostic mode;
 cases a, f, n1, n5 and n7), `steps_completed`, `failed_step`,
@@ -764,7 +807,7 @@ deploy/metricsbench/run.sh --profile history --bin-dir target/release \
 | 0 | Every step passed (cases a, f, g). |
 | 64 | Usage error (cases h, p). |
 | 65 | A refused input, or an s3s-fs binary whose sha256 is not the pin; nothing was started (cases c, h, p, n2, n3, n4). |
-| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k, n6, r). After a failed ingest verification (a row's read-back failed or a row stalled) the run queries as a diagnostic, records the failure, and exits 70 naming step ingest, even when a later step failed too; the first later step to fail ends the run, so an `--rss-band` breach reaches `failed_after_ingest` only when every step before `memory` passed, while `memory-summary.json` records it either way (cases q, q2, q3, q4). |
+| 70 | A step failed; its name is in the message and in `stamps.json` as `failed_step` (cases b, i, k, n6, r, u1, u2, u3, u4). After a failed ingest verification (a row's read-back failed or a row stalled) the run queries as a diagnostic, records the failure, and exits 70 naming step ingest, even when a later step failed too; the first later step to fail ends the run, so an `--rss-band` breach reaches `failed_after_ingest` only when every step before `memory` passed, while `memory-summary.json` records it either way (cases q, q2, q3, q4); steps 14 to 16 still run when the Ravel row replayed, and a failure there is listed in `failed_after_ingest` (cases u5, u6). |
 | 75 | An `--rss-band` was violated or a container was OOM-killed (cases d, e). |
 
 ## Verify the pins
