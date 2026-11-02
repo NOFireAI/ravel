@@ -5081,11 +5081,14 @@ name = "ravel-otlp"
 version = "0.28.0"
 dependencies = [
  "blake3",
+ "bytes",
  "criterion",
  "hex",
  "opentelemetry-proto",
  "proptest",
  "prost",
+ "prost-build",
+ "protox",
  "ravel-ipcrypt",
  "ravel-logseg",
  "ravel-rspan",

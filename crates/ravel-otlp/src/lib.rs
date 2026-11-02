@@ -16,6 +16,10 @@
 //! `ExportTraceServiceRequest` to canonical spans (ADR-0041). Spans have no
 //! stream identity at all, so resource and scope attributes are merged into
 //! each span's single `attrs` map instead of feeding an identity hash.
+//!
+//! `vendored_logs` (ADR-3492 D3b) vendors the OTLP logs protos with their hot
+//! string fields retyped as bytes, measured by this crate's decode bench;
+//! nothing above reads from it yet.
 
 pub mod label_projection;
 pub mod limits;
@@ -26,6 +30,7 @@ pub mod normalize;
 pub mod promcompat;
 pub mod traces_limits;
 pub mod traces_normalize;
+pub mod vendored_logs;
 
 pub use label_projection::{
     ProjectedLabelBytes, RESOLVED_LABEL_OVERHEAD_BYTES, project_log_resolved_label_bytes,

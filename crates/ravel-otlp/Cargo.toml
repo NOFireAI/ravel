@@ -26,8 +26,15 @@ opentelemetry-proto = { workspace = true }
 # Span events and links are stored as an opaque serialized blob in RSPAN v1
 # (ADR-0041 decision 4), which needs prost's own length-delimited encoding.
 prost = { workspace = true }
+# vendored_logs decodes its bytes-retyped fields as bytes::Bytes (ADR-3492
+# D3b); validate_utf8 inspects those Bytes directly.
+bytes = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protox = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -51,6 +58,10 @@ harness = false
 
 [[bench]]
 name = "logs_identity"
+harness = false
+
+[[bench]]
+name = "vendored_logs_decode"
 harness = false
 
 [lints]
