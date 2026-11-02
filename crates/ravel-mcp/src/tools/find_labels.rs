@@ -276,7 +276,7 @@ mod tests {
 
     fn call(stub: &Stub, args: Value) -> Envelope {
         let key = CursorKey::from_process_secret([31u8; CURSOR_KEY_LEN]);
-        let mut ctx = test_context(&key);
+        let ctx = test_context(&key);
         block_on(run(args, &ctx, stub))
     }
 

@@ -766,4 +766,30 @@ mod tests {
             request(json!({"query": "SELECT ts FROM samples"}), &ctx).expect_err("refused");
         assert_eq!(failure.class, FailureClass::MissingArgument);
     }
+
+    /// The Parquet exemption in [`refuses`] is the one ADR-1374's 2026-11-02
+    /// amendment records: the amendment, its marker, both citations it rests
+    /// on, and the index row that names it.
+    ///
+    /// FLIP: dropping the amendment, its marker or a citation, or leaving the
+    /// index row unamended, fails the matching assertion.
+    #[test]
+    fn the_parquet_exemption_is_recorded_in_adr_1374() {
+        let adr = include_str!("../../../../docs/adrs/1374-agent-mcp-server.md");
+        let index = include_str!("../../../../docs/adrs/README.md");
+        for needle in [
+            "## Amendment (2026-11-02): a Parquet explain names its unbounded figures and does not refuse",
+            "<!-- amendment-applies: sections=\"D6. Budgets|Consequences\" pointer=\"Parquet explain amendment\" -->",
+            "`crates/ravel-parquet/src/limits.rs`, module doc lines 14 to 24, `admit`\n   at line 171",
+            "`unbounded_estimate_components` in\n   `crates/ravel-sql/src/executor.rs`",
+            "15,648 bytes with the nine tools and 23,537 bytes",
+        ] {
+            assert!(adr.contains(needle), "ADR-1374 lacks {needle:?}");
+        }
+        let row = index
+            .lines()
+            .find(|line| line.starts_with("| [1374](1374-agent-mcp-server.md) |"))
+            .expect("the index has a row for ADR-1374");
+        assert!(row.contains("amended 2026-11-02: a Parquet explain"), "{row}");
+    }
 }
