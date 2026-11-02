@@ -412,13 +412,14 @@ pub(crate) fn memory_backstop_crossed(
     est_bytes >= buffer_memory_backstop_bytes(config, ceiling)
 }
 
-/// How many `target_bytes` of object a buffer may hold before
-/// [`object_backstop_crossed`] fires (ADR-2708 D3).
+/// The default of [`IngestConfig::flush_object_backstop_multiple`] (ADR-2708
+/// D3), the single source of that field's default value.
 pub(crate) const OBJECT_BACKSTOP_TARGET_MULTIPLE: usize = 4;
 
 /// Whether a buffer whose flush would write `flush_est_bytes` of object has
-/// reached [`OBJECT_BACKSTOP_TARGET_MULTIPLE`] times `target_bytes`, the object
-/// counterpart of [`memory_backstop_crossed`] (ADR-2708 D3).
+/// reached [`IngestConfig::flush_object_backstop_multiple`] times
+/// `target_bytes`, the object counterpart of [`memory_backstop_crossed`]
+/// (ADR-2708 D3).
 ///
 /// A buffer whose object estimate outruns its memory charge (a native
 /// histogram charges 16 bytes per point against far more object bytes) never
@@ -430,7 +431,7 @@ pub(crate) fn object_backstop_crossed(flush_est_bytes: usize, config: &IngestCon
     flush_est_bytes
         >= config
             .target_bytes
-            .saturating_mul(OBJECT_BACKSTOP_TARGET_MULTIPLE)
+            .saturating_mul(config.flush_object_backstop_multiple)
 }
 
 /// The deadline a flush pinned to ingest hour `ingest_hour_bucket` carries
@@ -839,6 +840,15 @@ pub struct IngestConfig {
     /// flag. This field records the default an embedder passes to
     /// [`crate::PendingAckBudget::new`].
     pub max_pending_strict_acks: u64,
+    /// How many `target_bytes` of object a buffer may hold before
+    /// [`object_backstop_crossed`] fires (ADR-2708 D3; configurable since
+    /// issue #3662, docs/adrs/2708-due-diligence-p1-fixes.md's 2026-11-02
+    /// amendment). Read by the metrics, log, and span shard actors on every
+    /// trigger check. Default [`OBJECT_BACKSTOP_TARGET_MULTIPLE`]; must be at
+    /// least 1, which [`IngestConfig::validate`] refuses otherwise (a 0 would
+    /// fire the backstop on every buffer regardless of size). `ravel-server`
+    /// threads this in from `--flush-object-backstop-multiple`.
+    pub flush_object_backstop_multiple: usize,
 }
 
 impl Default for IngestConfig {
@@ -896,6 +906,7 @@ impl Default for IngestConfig {
             rlog_chunk_order: RlogChunkOrder::DEFAULT,
             rlog_page_choice: PageChoice::Estimated,
             max_pending_strict_acks: 8_192,
+            flush_object_backstop_multiple: OBJECT_BACKSTOP_TARGET_MULTIPLE,
         }
     }
 }
@@ -931,6 +942,11 @@ pub enum IngestConfigError {
         share: usize,
         max_inflight_flushes: u32,
     },
+    /// A `flush_object_backstop_multiple` of 0, which would fire
+    /// [`object_backstop_crossed`] on every buffer regardless of size
+    /// (issue #3662).
+    #[error("flush_object_backstop_multiple must be at least 1")]
+    ZeroFlushObjectBackstopMultiple,
 }
 
 /// A level [`RlogZstdLevel::new`] refused.
@@ -983,6 +999,9 @@ impl IngestConfig {
                     max_inflight_flushes: self.max_inflight_flushes,
                 });
             }
+        }
+        if self.flush_object_backstop_multiple == 0 {
+            return Err(IngestConfigError::ZeroFlushObjectBackstopMultiple);
         }
         Ok(())
     }
@@ -1254,13 +1273,41 @@ mod tests {
     }
 
     /// ADR-2708 D3: the object backstop fires at exactly four times
-    /// `target_bytes` of object estimate.
+    /// `target_bytes` of object estimate at the default multiple.
     #[test]
     fn object_backstop_fires_at_four_targets() {
         let cfg = IngestConfig::default();
         assert_eq!(OBJECT_BACKSTOP_TARGET_MULTIPLE, 4);
+        assert_eq!(cfg.flush_object_backstop_multiple, 4);
         assert!(!object_backstop_crossed(4 * cfg.target_bytes - 1, &cfg));
         assert!(object_backstop_crossed(4 * cfg.target_bytes, &cfg));
+    }
+
+    /// Issue #3662: `flush_object_backstop_multiple` is a server flag now,
+    /// not a hardcoded 4. At a multiple of 1 the backstop fires at exactly
+    /// `target_bytes`, not one byte below.
+    #[test]
+    fn object_backstop_fires_at_one_target_with_multiple_one() {
+        let cfg = IngestConfig {
+            flush_object_backstop_multiple: 1,
+            ..IngestConfig::default()
+        };
+        assert!(!object_backstop_crossed(cfg.target_bytes - 1, &cfg));
+        assert!(object_backstop_crossed(cfg.target_bytes, &cfg));
+    }
+
+    /// Issue #3662: a `flush_object_backstop_multiple` of 0 would fire the
+    /// backstop on every buffer regardless of size, so `validate` refuses it.
+    #[test]
+    fn zero_flush_object_backstop_multiple_is_refused() {
+        let cfg = IngestConfig {
+            flush_object_backstop_multiple: 0,
+            ..IngestConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(IngestConfigError::ZeroFlushObjectBackstopMultiple)
+        );
     }
 
     /// ADR-2708 D3: the grant deadline is the lifetime from grant, clamped to
