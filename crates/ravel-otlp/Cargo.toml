@@ -49,5 +49,9 @@ memo-stats = []
 name = "normalize_alloc"
 harness = false
 
+[[bench]]
+name = "logs_identity"
+harness = false
+
 [lints]
 workspace = true
