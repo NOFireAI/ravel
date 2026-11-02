@@ -52,10 +52,13 @@ lines 225 to 226). No admission control looks at CPU today.
 
 A background task samples every 100 ms:
 
-- **CPU use:** the process's own CPU time (user plus system, from
-  `getrusage`) over wall time, divided by the core count `HostProfile`
-  already resolves through `available_parallelism`. That count follows a
-  cgroup CPU quota.
+- **CPU use:** the process's own CPU time (user plus system, fields 14 and
+  15 of `/proc/self/stat` at Linux's fixed 100 ticks per second, a plain
+  file read, as `crates/ravel-bench/src/columnar_load.rs` already does) over
+  wall time, divided by the core count `HostProfile` already resolves
+  through `available_parallelism`. That count follows a cgroup CPU quota.
+  Off Linux there is no `/proc/self/stat`, so the detector never reports
+  saturation and logs once that shedding is off.
 - **Flush backlog:** the sum over shards of `flush_trigger_deferred` (an
   existing counter, `crates/ravel-ingest/src/metrics.rs`), read as a rate
   over the last second through a new cheap accessor on the ingest routers:
