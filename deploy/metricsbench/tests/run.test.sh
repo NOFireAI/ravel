@@ -101,6 +101,16 @@
 #                                       ulimits nofile soft and hard 524288,
 #                                       read from the files' text
 #
+#   s  the real-S3 lane              -> s: exit 0; compose takes real-s3.yml with
+#                                       the prefix and region exported, no
+#                                       s3s-fs download, stamps and provenance
+#                                       name real S3 and billed requests; s1:
+#                                       without the flags none of that happens;
+#                                       s2-s7: a lone flag, a prefix S3 cannot
+#                                       name or past 44 characters, a malformed
+#                                       region and the falsification run exit 64
+#   t  real S3 with a local build    -> exit 65, nothing started
+#
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
 #
 # Run: bash deploy/metricsbench/tests/run.test.sh
@@ -164,6 +174,7 @@ case "$1" in
       up)
         [ "${STUB_UP_EXIT:-0}" -eq 0 ] || exit "${STUB_UP_EXIT}"
         printf 'docker-env up S3S_FS_BIN=%s\n' "${S3S_FS_BIN-<unset>}" >>"${STUB_LOG}"
+        printf 'docker-env up S3_PREFIX=%s S3_REGION=%s\n' "${METRICSBENCH_S3_BUCKET_PREFIX-<unset>}" "${METRICSBENCH_S3_REGION-<unset>}" >>"${STUB_LOG}"
         echo up >"${STUB_STATE}"
         if [ "$#" -gt 1 ]; then
           shift
@@ -938,6 +949,66 @@ PY
     fail "o: ${svc} in ${file} lacks ulimits nofile soft and hard 524288"
   fi
 done
+
+# --- s: the real-S3 lane --------------------------------------------------------
+mapfile -t args < <(full_args "${TMP}/s/out")
+run_case s "${args[@]}" --real-s3-bucket-prefix mb-run1 --real-s3-region us-east-1
+expect_rc s 0
+expect_log "s: compose takes the real-S3 overlay" "real-s3.yml"
+expect_log "s: compose up gets the prefix and region" "docker-env up S3_PREFIX=mb-run1 S3_REGION=us-east-1"
+expect_log "s: provenance records real S3, billing requests" "--store-backend s3 --region us-east-1 --endpoint n/a --bills-requests"
+expect_no_log "s: provenance does not name s3s-fs" "--store-backend s3s-fs"
+expect_no_log "s: provenance carries no s3s-fs release" "store_release="
+expect_no_log "s: nothing downloads s3s-fs" "s3s-fs-linux"
+check "s: stamps name real S3 and every bucket" 'j("stamps.json")["store_kind"] == "s3" and j("stamps.json")["object_store"] == {"implementation": "s3", "region": "us-east-1", "credentials": "instance-role", "buckets": ["mb-run1-ravel", "mb-run1-mimir-blocks", "mb-run1-mimir-ruler", "mb-run1-mimir-alertmanager"]}'
+check "s: fetch-s3s-fs did not run" '"fetch-s3s-fs" not in j("stamps.json")["steps_completed"] and "query" in j("stamps.json")["steps_completed"]'
+
+# The default lane stays on s3s-fs and never reads the overlay.
+mapfile -t args < <(full_args "${TMP}/s1/out")
+run_case s1 "${args[@]}"
+expect_rc s1 0
+expect_no_log "s1: no real-S3 overlay by default" "real-s3.yml"
+expect_no_log "s1: no billing flag by default" "--bills-requests"
+expect_log "s1: no bucket prefix by default" "docker-env up S3_PREFIX=<unset> S3_REGION=<unset>"
+check "s1: stamps say s3s-fs" 'j("stamps.json")["store_kind"] == "s3s-fs" and j("stamps.json")["object_store"]["implementation"] == "s3s-fs"'
+
+mapfile -t args < <(full_args "${TMP}/s2/out")
+run_case s2 "${args[@]}" --real-s3-bucket-prefix mb-run1
+expect_rc s2 64
+expect_err "s2: a prefix needs a region" "go together"
+
+mapfile -t args < <(full_args "${TMP}/s3/out")
+run_case s3 "${args[@]}" --real-s3-region us-east-1
+expect_rc s3 64
+expect_err "s3: a region needs a prefix" "go together"
+
+mapfile -t args < <(full_args "${TMP}/s4/out")
+run_case s4 "${args[@]}" --real-s3-bucket-prefix MB_Run --real-s3-region us-east-1
+expect_rc s4 64
+expect_err "s4: a prefix S3 cannot name is refused" "--real-s3-bucket-prefix takes"
+
+mapfile -t args < <(full_args "${TMP}/s5/out")
+run_case s5 "${args[@]}" --real-s3-bucket-prefix "$(printf 'a%.0s' {1..45})" --real-s3-region us-east-1
+expect_rc s5 64
+expect_err "s5: a prefix past 44 characters is refused" "at most 44 characters"
+
+mapfile -t args < <(full_args "${TMP}/s6/out")
+run_case s6 "${args[@]}" --real-s3-bucket-prefix mb-run1 --real-s3-region useast1
+expect_rc s6 64
+expect_err "s6: a malformed region is refused" "--real-s3-region takes"
+
+run_case s7 --profile history --bin-dir "${BIN}" --out-dir "${TMP}/s7/out" --diagnostic-prometheus-max-samples 100000 \
+  --real-s3-bucket-prefix mb-run1 --real-s3-region us-east-1
+expect_rc s7 64
+expect_err "s7: the falsification run takes no real-S3 flags" "takes no --real-s3 flags"
+
+# --- t: real S3 with a local build -----------------------------------------------
+STUB_LOCAL_IMAGE_ID="${LOCAL_ID}" run_case t --profile ci --ravel-image "${LOCAL_REF}" --ravel-image-id "${LOCAL_ID}" \
+  --ravel-source-commit "${COMMIT}" --bin-dir "${BIN}" --out-dir "${TMP}/t/out" --anchor-ms "${ANCHOR}" \
+  --real-s3-bucket-prefix mb-run1 --real-s3-region us-east-1
+expect_rc t 65
+expect_err "t: a local build is refused in the real-S3 lane" "a local build is never publishable"
+expect_no_log "t: nothing started" "docker-env up"
 
 echo
 echo "${passes} passed, ${fails} failed"
