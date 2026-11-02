@@ -314,12 +314,17 @@ pub(super) fn fast_path_verdict_future(
 
 /// The decoded-set estimate and [`deferred_verdict`] of a scan on the
 /// whole-segment fast path, which runs no plan pass (ADR-3326, serve-if-fits
-/// amendment, implementation note). Every relevant segment's directories are
-/// read once through
+/// amendment, implementation note). A relevant segment's estimate comes from
+/// the decoded cache's memo ([`DecodedColumnCache::memoised_estimate`]) when
+/// it holds one for the tenant, object and projection; otherwise its
+/// directories are read once through
 /// [`fetch_plan_directories`](ravel_query::BlockRangeFetcher::fetch_plan_directories), the
 /// plan pass's own directory read: its extents go through the fetcher's read
 /// cache, and its requests are charged to the plan phase. The fast path keeps
-/// every block of a relevant segment, so the estimate covers all of them.
+/// every block of a relevant segment, so the estimate covers all of them and
+/// is memoised on a miss.
+///
+/// [`DecodedColumnCache::memoised_estimate`]: ravel_logseg::decoded_cache::DecodedColumnCache::memoised_estimate
 ///
 /// The result is a [`PlanCounts`] carrying only the verdict: no segment is
 /// planned and nothing is published, so the fast path's routing and opens are
@@ -336,7 +341,14 @@ async fn compute_fast_path_verdict(
             continue;
         }
         refuse_unreadable_version(seg)?;
+        let memo = ctx.fetcher.decoded_cache();
         reads.push(async move {
+            let tenant = ctx.tenant_hash.0;
+            if let Some(bytes) =
+                memo.and_then(|m| m.memoised_estimate(tenant, seg.content_hash, &ctx.columns))
+            {
+                return Ok::<u64, SqlError>(bytes);
+            }
             let plan = ctx.phase_accounting.plan();
             let (footer, dirs, _) = ctx
                 .fetcher
@@ -357,8 +369,13 @@ async fn compute_fast_path_verdict(
                 ))
             })?;
             let all: Vec<usize> = (0..blocks).collect();
-            dirs.decoded_set_estimate(&ctx.columns, &all)
-                .map_err(corrupt)
+            let bytes = dirs
+                .decoded_set_estimate(&ctx.columns, &all)
+                .map_err(corrupt)?;
+            if let Some(m) = memo {
+                m.memoise_estimate(tenant, seg.content_hash, &ctx.columns, bytes);
+            }
+            Ok(bytes)
         });
     }
     let mut stream = futures::stream::iter(reads).buffer_unordered(concurrency.max(1));
