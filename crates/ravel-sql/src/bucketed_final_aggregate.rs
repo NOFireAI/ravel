@@ -1109,7 +1109,11 @@ impl BucketedStream {
 /// The `topk.fetch()` rows of `batch` that sort first under `topk`'s
 /// ordering, taken into fresh buffers; `batch` itself when it has no more
 /// rows than that. Among rows tied with the k-th, which survive is
-/// unspecified.
+/// unspecified. `batch` and the sort's index vector are held uncharged for
+/// the duration of this call: the bucket's table was charged in full before
+/// evaluation, and only the cut result is charged as pending output, so the
+/// asked-bytes figure under-reports the transient by at most one bucket's
+/// evaluated output per partition.
 fn cut_to_topk(batch: RecordBatch, topk: &TopKPrefilter) -> DFResult<RecordBatch> {
     if batch.num_rows() <= topk.fetch() {
         return Ok(batch);
