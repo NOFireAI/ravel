@@ -1807,7 +1807,7 @@ async fn publish_large_sql_segment(
 
 /// One log record on stream `service.name = "budget-svc"`, mirroring
 /// `tests/sql_endpoint.rs`'s `log_record` fixture builder.
-fn sql_log_record(ts: i64, body: &str) -> LogRecord {
+pub(crate) fn sql_log_record(ts: i64, body: &str) -> LogRecord {
     let resource = vec![(
         "service.name".to_string(),
         AttrValue::Str("budget-svc".to_string()),
@@ -1833,7 +1833,7 @@ fn sql_log_record(ts: i64, body: &str) -> LogRecord {
 /// by default; see `EngineConfig::logs_max_fetch_run_bytes`), so a single
 /// small record is enough to force a budgeted reservation, unlike RSEG's
 /// small-object path which needs a >512 KiB fixture.
-async fn publish_small_log_segment(
+pub(crate) async fn publish_small_log_segment(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantId,
     records: &[LogRecord],

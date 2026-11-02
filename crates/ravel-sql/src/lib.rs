@@ -54,6 +54,7 @@ mod audit_scan;
 mod audit_schema;
 mod avg;
 mod bounded_topk;
+mod bucketed_final_aggregate;
 mod clock;
 mod compact_slices;
 pub mod complexity_guard;
@@ -136,13 +137,17 @@ pub use audit_schema::{
     AUDIT_COL_ATTRS, AUDIT_COL_BODY, AUDIT_COL_SEVERITY_TEXT, AUDIT_COL_TS, audit_schema,
 };
 pub use bounded_topk::{BOUNDED_TOPK_AGGREGATE_RULE, BoundedTopKAggregate};
+pub use bucketed_final_aggregate::{
+    BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX, BUCKETED_FINAL_AGGREGATE_MAX_BITS,
+    BUCKETED_FINAL_AGGREGATE_RULE, BucketedFinalAggregateExec, BucketedFinalAggregateRule,
+};
 pub use compact_slices::{COMPACT_SLICES_RULE, CompactSlices, CompactSlicesExec, TopKPrefilter};
 pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex, structural_count};
 pub use config::{
-    CacheDirSpill, DEFAULT_BOUNDED_TOPK_MAX_LIMIT, DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS,
-    DEFAULT_MAX_QUERY_BYTES, DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES,
-    DERIVED_SPILL_MAX_BYTES_MEMORY_MULTIPLE, ENV_SPILL_DIR, ENV_SPILL_MAX_BYTES,
-    GROUP_VALUES_CEILING_COMPENSATION, GROUP_VALUES_RESIZE_TRANSIENT_FACTOR,
+    BucketedFinalAggregation, CacheDirSpill, DEFAULT_BOUNDED_TOPK_MAX_LIMIT,
+    DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS, DEFAULT_MAX_QUERY_BYTES,
+    DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES, DERIVED_SPILL_MAX_BYTES_MEMORY_MULTIPLE, ENV_SPILL_DIR,
+    ENV_SPILL_MAX_BYTES, GROUP_VALUES_CEILING_COMPENSATION, GROUP_VALUES_RESIZE_TRANSIENT_FACTOR,
     GROUP_VALUES_UNDERCOUNT_FACTOR, SQL_SPILL_SUBDIR, SpillConfig, SpillConfigError, SqlConfig,
     cache_spill_dir, compensated_group_values_ceiling, derive_spill_max_bytes, measure_free_bytes,
 };

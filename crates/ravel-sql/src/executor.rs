@@ -1485,11 +1485,12 @@ pub struct SqlOutcome {
     /// attempt's discarded counters never bleed into this one: `run` builds
     /// a fresh [`QueryAccounting`] per attempt.
     pub accounting: QueryAccountingSnapshot,
-    /// The high-water mark of the bytes this query's memory consumers asked
-    /// for, before the hash aggregate reserve-ahead factor
-    /// ([`TenantDelegatingPool::peak_asked_bytes`]). Beside
-    /// `accounting.peak_intermediate_bytes`, which is charged with the factor.
-    /// Zero when the attempt failed before the stream started.
+    /// The high-water mark of the bytes this query's memory consumers'
+    /// reservations hold live, before any reserve-ahead factor
+    /// ([`TenantDelegatingPool::peak_asked_bytes`]). It is at most
+    /// `accounting.peak_intermediate_bytes`, which is charged with the factor
+    /// and keeps held releases charged. Zero when the attempt failed before
+    /// the stream started.
     pub peak_asked_intermediate_bytes: u64,
     /// The same counters as [`Self::accounting`], split by [`QueryPhase`]
     /// (issue #796) rather than pooled: `accounting` is

@@ -146,6 +146,7 @@ use crate::attrs_per_key::AttrsPerKeyProjection;
 use crate::audit_provider::AuditTableProvider;
 use crate::avg::sequential_avg_udaf;
 use crate::bounded_topk::BoundedTopKAggregate;
+use crate::bucketed_final_aggregate::BucketedFinalAggregateRule;
 use crate::compact_slices::CompactSlices;
 use crate::config::SqlConfig;
 use crate::group_keys::DictionaryGroupKeysAsViews;
@@ -869,6 +870,14 @@ pub fn build_session_with_tables(
     if let Some(max_limit) = config.bounded_topk_max_limit {
         builder =
             builder.with_physical_optimizer_rule(Arc::new(BoundedTopKAggregate::new(max_limit)));
+    }
+    // Issue #3608 (ADR-3565 decision 1): run a qualifying `FinalPartitioned`
+    // aggregate in hash buckets. After `BoundedTopKAggregate`, which sets the
+    // limit this rule refuses on, and before `CompactSlices`, which must see
+    // the final plan. `None` does not install it at all.
+    if let Some(bucketed) = config.bucketed_final_aggregation {
+        builder = builder
+            .with_physical_optimizer_rule(Arc::new(BucketedFinalAggregateRule::new(bucketed)));
     }
     // ADR-2677 decision 6: confirm a `logs` scan's kept TopK filter only when
     // it is the filter of an ascending nulls-last `ORDER BY ts ... LIMIT k`,

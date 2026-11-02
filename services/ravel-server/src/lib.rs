@@ -3630,6 +3630,10 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 // Default-on; the `=false` opt-out leaves every SQL query
                 // single-partitioned.
                 config.query_budgets.sql_parallel_final_aggregation,
+                // ADR-3565 decision 1 (issue #3608): the bucketed final
+                // aggregation, from `--sql-bucketed-final-aggregation`. Off by
+                // default.
+                config.query_budgets.sql_bucketed_final_aggregation,
                 query_accounting.clone(),
                 query_admission.clone(),
                 Some(declared_columns),

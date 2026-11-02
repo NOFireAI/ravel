@@ -28,6 +28,8 @@ mod audit_provider;
 mod avg_distinct;
 #[path = "bounded_topk_aggregate.rs"]
 mod bounded_topk_aggregate;
+#[path = "bucketed_final_aggregate.rs"]
+mod bucketed_final_aggregate;
 #[path = "ceiling_breach.rs"]
 mod ceiling_breach;
 #[path = "compact_slices.rs"]

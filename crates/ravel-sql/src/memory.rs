@@ -1270,7 +1270,7 @@ impl TenantDelegatingPool {
     /// stay charged, held rather than released ([`Self::hold`]); a grow
     /// served from a hold ([`Self::grow_charged`]) adds to it while charging
     /// nothing new. So the asked peak is at most the charged peak
-    /// (`peak_intermediate_bytes`), and equals it only for a plan with no
+    /// (`peak_intermediate_bytes`), and equals it if the plan has no
     /// reserve-ahead consumer and no held release.
     pub fn peak_asked_bytes(&self) -> u64 {
         self.peak_asked_bytes.load(Ordering::Acquire)
@@ -1443,7 +1443,8 @@ impl TenantDelegatingPool {
     }
 
     /// Record a migrated aggregate's shrink and return the charged bytes it
-    /// frees, and the asked bytes it takes off the asked gauge. Its first shrink ends its build, and its envelope with it.
+    /// frees, and the asked bytes it takes off the asked gauge. Its first
+    /// shrink ends its build, and its envelope with it.
     fn aggregate_shrink(&self, consumer: &MemoryConsumer, shrink: usize) -> (usize, usize) {
         let id = consumer.id();
         let mut aggregates = self.aggregates_map();
