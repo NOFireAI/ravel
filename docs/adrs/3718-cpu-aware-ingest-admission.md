@@ -10,14 +10,23 @@ Logs ingest throughput on one `ravel-server` follows its cores: about 18k
 OTLP log lines/s per vCPU, about 46 to 47 us of CPU per stored line, on 8 and
 on 16 vCPU alike (#3492 comments 6579509683 and 6589850073). Below that
 ceiling every offered line is stored. Above it the server does not hold the
-ceiling. It falls into an overloaded state and stores 13% to 20% less than it
-held, and it stays there for as long as the excess load keeps arriving.
+ceiling. It falls into an overloaded state and stores less than its peak, and
+it stays there for as long as the excess load keeps arriving.
 
-| Node | Holds | Offered above the ceiling | Stored there | Source |
-|---|---|---|---|---|
-| 8 vCPU | 151k lines/s | 160k | 115k to 123k | #3492 comment 6579509683, #3645 comment 6584038929 |
-| 16 vCPU | 283k lines/s | 300k to 340k | 248k to 260k | #3492 comment 6589850073 |
-| 2 x 8 vCPU, one Service | 243k lines/s | 280k to 340k | 227k to 261k | #3492 comment 6589850073 |
+Peak stored is the highest stored rate the topology reached at any step.
+Stored above the ceiling is the range over the overloaded steps. The loss is
+peak minus stored, over peak.
+
+| Node | Peak stored | Offered above the ceiling | Stored there | Loss | Source |
+|---|---|---|---|---|---|
+| 8 vCPU | 152k lines/s (fixed 150k) | 160k (fixed) | 115k to 123k | 19% to 24% | #3645 comments 6574471828 and 6584038929 |
+| 16 vCPU | 283k lines/s (280k step) | 300k to 340k | 248k to 260k | 8% to 12% | #3492 comment 6589850073 |
+| 2 x 8 vCPU, one Service | 261k lines/s (280k step, 9% dropped) | 300k to 340k | 227k to 248k | 5% to 13% | #3492 comment 6589850073 |
+
+The two-replica row held 243k with no drops (240k step) and peaked at 261k
+with drops at the 280k step, because one replica saturated at 220k and the
+other never did. Its loss grows with the excess load like the others, from a
+peak set by its busier replica.
 
 The overloaded state has one signature on every topology:
 - every core is busy;
@@ -81,13 +90,26 @@ saturated, it halves every 100 ms. Each new ingest request draws once against
 `p`: refused requests get 429 with `Retry-After: 1` on OTLP HTTP and Remote
 Write, and `RESOURCE_EXHAUSTED` on gRPC.
 
-The check runs at the request head, before the body is read or decoded:
-- in `admit_ingest_request` right after the in-flight permit
-  (`services/ravel-server/src/ingest_admission.rs`), answered through
-  `refuse_from_head`, which drains the body without decoding it;
+The check runs at the request head, before the body is read or decoded, and
+before the tenant is resolved: right after the in-flight permit, in the order
+that permit already keeps (a shed is answered before a credential check, so
+a saturated node does no tenant resolution for a request it will refuse):
+- in `admit_ingest_request` (`services/ravel-server/src/ingest_admission.rs`),
+  answered through `refuse_from_head`, which drains the body without decoding
+  it;
 - in `GrpcIngestAdmissionLayer::call` at the same point for gRPC.
 
-A refusal costs the server a header parse and a body drain, not a decode.
+So an unauthenticated request that arrives while shedding gets 429, not 401,
+as it already does from the in-flight permit.
+
+A refusal costs the server a header parse and, when it can, a body drain. It
+never costs a decode. The drain is bounded: at most 1 MiB, 1 s, and 64
+concurrent drains per process. A refusal that finds no free drain slot, whose
+body exceeds 1 MiB or whose drain times out is answered with
+`Connection: close` and counted on `ravel_ingest_head_refusal_undrained_total`
+(`services/ravel-server/src/ingest_admission.rs`, `refuse_from_head`). See
+Consequences for what that costs at a high shed fraction.
+
 Refusals count on a new `ravel_ingest_cpu_shed_total{mode}`, beside the
 existing `ravel_ingest_concurrency_shed_total`, `ravel_ingest_pending_ack_shed_total`
 and `ravel_ingest_buffer_shed_total`. The current `p` exports as the gauge
@@ -104,18 +126,18 @@ holds on 8, 16 or more vCPU without tuning. `--ingest-cpu-shed-threshold 0`
 disables shedding, which is today's behaviour. The resolved threshold and the
 core count are logged at startup with the other derived defaults.
 
-It is on by default: a server that saturates loses 13% to 20% of its
-throughput, which no operator wants. Shedding is process-wide and does not
+It is on by default: a server that saturates loses 5% to 24% of its peak
+stored rate (Context), which no operator wants. Shedding is process-wide and does not
 pick tenants; refusals fall on tenants in proportion to their requests. Per
 tenant fairness stays with rate admission (ADR-0051).
 
 ```mermaid
 flowchart LR
   subgraph head["request head, before the body is read"]
-    P["in-flight permit\n(--max-inflight-ingest-requests)"] --> T[tenant]
-    T --> C{"CPU shed draw\n(D2: refuse with probability p)"}
+    P["in-flight permit\n(--max-inflight-ingest-requests)"] --> C{"CPU shed draw\n(D2: refuse with probability p)"}
     C -- refused --> R["429 Retry-After: 1\nravel_ingest_cpu_shed_total"]
-    C -- admitted --> A["pending strict ack\n(strict writes)"]
+    C -- admitted --> T[tenant]
+    T --> A["pending strict ack\n(strict writes)"]
   end
   A --> D["read, rate check, inflate,\nbyte budget, decode"]
   D --> B["shard buffers"] --> F["flush: write gate encode, PUT"]
@@ -139,6 +161,13 @@ detector on its defaults:
 | 8 vCPU, fixed 160k offered: stored | at least 145k, with refusals in place of the collapse | predicted |
 | 16 vCPU, fixed 320k offered: stored | at least 270k | predicted |
 | 8 vCPU, exit ramp to 150k: best 30-min and the 150k step | within 1% of the same build with `--ingest-cpu-shed-threshold 0`, and no refusals below the 150k step | predicted |
+
+Each run also reports, without a bar:
+- `ravel_ingest_head_refusal_undrained_total` by reason, against the CPU
+  sheds;
+- the client's connection count.
+
+Together they show how many refusals forced a reconnect (Consequences).
 
 ## Rejected alternatives
 
@@ -168,9 +197,22 @@ detector on its defaults:
 
 ## Consequences
 
-- Above its ceiling a server refuses the excess instead of losing 13% to 20%
-  of what it stores. Clients see 429s where they saw latency and dropped
-  lines.
+- Above its ceiling a server refuses the excess instead of losing 5% to 24%
+  of its peak stored rate. Clients see 429s where they saw latency and
+  dropped lines.
+- At a high shed fraction most refusals go through `refuse_from_head`.
+  - **Undrained refusals reconnect.** Its 64 drain slots, 1 MiB cap and 1 s
+    timeout were sized for the rare in-flight and pending-ack sheds. A
+    refusal that misses a slot, or carries a body over 1 MiB, is answered
+    with `Connection: close`, so an HTTP/1 exporter reconnects, and with TLS
+    re-handshakes, for each one. That spends CPU on connection setup while
+    the node is shedding for CPU.
+  - **Implementation and measurement.** Before raising the drain caps, the
+    implementation measures this (D4 reports the undrained count). If
+    reconnects dominate, it answers a CPU shed with `Connection: close` only
+    when the drain cap is reached, not on every undrained case.
+  - **gRPC is cheaper.** gRPC is refused per stream on a kept connection, so
+    it pays no reconnect.
 - On a node shared with other CPU-heavy work, the process's own CPU use
   under-states the node's, so shedding starts later. The threshold flag is the
   lever there.
