@@ -10,7 +10,9 @@
 //! is serving a first page or a cursor's later one. `labels` and `label_values` also stop before the caps,
 //! because `ravel_find_labels` filters the list and the caps run after the
 //! filter (ADR-1374 amendment 2026-09-12 item 6: the tool layer owns
-//! envelope finishing). Nothing else: the admission permit, the
+//! envelope finishing), and so do `promql_instant` and `promql_range`,
+//! because `ravel_query_promql` groups the per-sample rows into one row per
+//! series and caps series, not samples. Nothing else: the admission permit, the
 //! deadline clamp, the cost record, the usage guard, the audit submission, the
 //! partial-coverage gate, and the error redaction all live inside the service
 //! layer, and a tool call takes exactly one permit because it makes exactly
@@ -130,6 +132,21 @@ impl ServiceBackend {
     /// [`QueryStats`]: its spend, its per-phase split, and its coverage.
     fn stats_envelope(
         &self,
+        envelope: Envelope,
+        stats: &QueryStats,
+        partial: bool,
+        warnings: Vec<String>,
+    ) -> Envelope {
+        d4::finish(
+            self.uncapped_stats_envelope(envelope, stats, partial, warnings),
+            &self.budgets,
+        )
+    }
+
+    /// [`Self::stats_envelope`] before the caps, for a tool that reshapes
+    /// the rows before it caps them.
+    fn uncapped_stats_envelope(
+        &self,
         mut envelope: Envelope,
         stats: &QueryStats,
         partial: bool,
@@ -146,7 +163,7 @@ impl ServiceBackend {
                 estimate_is_upper_envelope: true,
             },
         );
-        d4::finish(envelope, &self.budgets)
+        envelope
     }
 
     /// One PromQL result value, as this envelope's data block. A scalar or a
@@ -270,7 +287,7 @@ impl QueryBackend for ServiceBackend {
         envelope.data = Self::value_data(outcome.value);
         let mut warnings = outcome.warnings;
         warnings.extend(outcome.infos);
-        Ok(self.stats_envelope(envelope, &outcome.stats, outcome.partial, warnings))
+        Ok(self.uncapped_stats_envelope(envelope, &outcome.stats, outcome.partial, warnings))
     }
 
     async fn promql_range(
@@ -300,7 +317,7 @@ impl QueryBackend for ServiceBackend {
         };
         let mut warnings = outcome.warnings;
         warnings.extend(outcome.infos);
-        Ok(self.stats_envelope(envelope, &outcome.stats, outcome.partial, warnings))
+        Ok(self.uncapped_stats_envelope(envelope, &outcome.stats, outcome.partial, warnings))
     }
 
     async fn labels(
