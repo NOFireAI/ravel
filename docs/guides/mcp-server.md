@@ -87,9 +87,11 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   Logs and traces have no metric families, and the response says why; so
   does a metrics tenant with no metric metadata record. When the metric
   metadata read fails, a metrics call fails with the retryable class
-  `unavailable` instead of answering zero families. Retries inside the
-  60-second metadata cache horizon fail the same way; the first call after
-  it starts a reread, and calls succeed once a read of the record does.
+  `unavailable` instead of answering zero families. Retries within 60
+  seconds of the failed read fail the same way without reading the store.
+  After that, a retry starts a background reread unless one is in flight,
+  and still fails; a failed reread lets the next retry start another.
+  Calls succeed once a read of the record does.
 
 ### Find labels
 

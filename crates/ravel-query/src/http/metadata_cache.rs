@@ -313,8 +313,11 @@ impl MetadataCache {
     /// [`MetadataRecord::read_failed`]. It is set on the miss whose read
     /// failed and on every hit served from the empty entry that miss cached,
     /// including the past-horizon hit that starts a refresh, until a refresh
-    /// succeeds and replaces the snapshot. A failed refresh of an entry
-    /// holding a real record keeps that record, which is not flagged.
+    /// or a concurrent miss's read succeeds and replaces the snapshot. A miss
+    /// that finds the tenant cached when its own read returns replaces the
+    /// entry only when the entry is a failed read and its own read returned
+    /// the record or found none. A failed refresh of an entry holding a real
+    /// record keeps that record, which is not flagged.
     pub async fn get(&self, tenant_hash: TenantHash) -> MetadataSnapshot {
         let now = self.shared.clock.now_ns();
 
@@ -347,10 +350,17 @@ impl MetadataCache {
 
         let mut inner = self.shared.lock();
         // Re-check under the lock: a concurrent miss for the same tenant may
-        // have filled it while this GET was in flight. Keep whichever is
-        // already there rather than clobber it, and never grow past the bound.
+        // have filled it while this GET was in flight. Keep the entry already
+        // there unless it stands in for a failed read and this one succeeded,
+        // and never grow past the bound.
         if let Some(entry) = inner.tenants.get_mut(&tenant_hash) {
             entry.last_access_ns = now;
+            if entry.snapshot.read_failed() && !snapshot.read_failed() {
+                entry.snapshot = Arc::clone(&snapshot);
+                entry.version = version;
+                entry.fetched_at_ns = now;
+                return snapshot;
+            }
             return Arc::clone(&entry.snapshot);
         }
         self.evict_if_full(&mut inner, tenant_hash);
@@ -588,6 +598,185 @@ mod tests {
         fn capabilities(&self) -> Capabilities {
             self.inner.capabilities()
         }
+    }
+
+    /// Wraps a store and holds the n-th GET (0-indexed, in call order) until
+    /// the test releases gate n, so two concurrent misses can be made to
+    /// complete in a chosen order with no timing.
+    struct GatedStore {
+        inner: Arc<dyn ObjectStoreBackend>,
+        entered: AtomicU64,
+        gates: Vec<tokio::sync::Semaphore>,
+    }
+
+    impl GatedStore {
+        fn new(inner: Arc<dyn ObjectStoreBackend>, gets: usize) -> Arc<Self> {
+            Arc::new(GatedStore {
+                inner,
+                entered: AtomicU64::new(0),
+                gates: (0..gets).map(|_| tokio::sync::Semaphore::new(0)).collect(),
+            })
+        }
+        fn release(&self, n: usize) {
+            self.gates[n].add_permits(1);
+        }
+        async fn wait_entered(&self, target: u64) {
+            for _ in 0..1000 {
+                if self.entered.load(Ordering::SeqCst) >= target {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!(
+                "only {} GETs entered the gate",
+                self.entered.load(Ordering::SeqCst)
+            );
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for GatedStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            let n = usize::try_from(self.entered.fetch_add(1, Ordering::SeqCst)).expect("fits");
+            let gate = self.gates.get(n).expect("a gate for every GET");
+            gate.acquire().await.expect("gate open").forget();
+            self.inner.get(key, range).await
+        }
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Two concurrent misses for one tenant whose GETs are both in flight;
+    /// the store faults its `fault_nth` matching GET. Miss A's GET is released
+    /// first and finishes its `get` (inserting its entry), then miss B's.
+    /// Returns A's snapshot, B's snapshot, the hit after both, and the fault
+    /// store so the caller can assert the fault fired.
+    async fn race_two_misses(
+        fault_nth: u64,
+    ) -> (
+        MetadataSnapshot,
+        MetadataSnapshot,
+        MetadataSnapshot,
+        Arc<FaultStore<MemoryStore>>,
+    ) {
+        let inner = MemoryStore::new();
+        let th = tenant(0xA7);
+        seed(
+            &inner,
+            th,
+            &[entry("raced_metric", MetricKind::Counter, "help", "")],
+        )
+        .await;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Transient("injected".into()))
+                .with_key_contains("/m/meta")
+                .with_occurrence(Occurrence::Nth(fault_nth)),
+        );
+        let fault = Arc::new(FaultStore::new(inner, plan));
+        let gated = GatedStore::new(fault.clone(), 2);
+        let cache = MetadataCache::new(
+            gated.clone(),
+            MetadataCacheConfig::default(),
+            TestClock::new(3_000),
+        );
+
+        let a = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.get(th).await }
+        });
+        gated.wait_entered(1).await;
+        let b = tokio::spawn({
+            let cache = cache.clone();
+            async move { cache.get(th).await }
+        });
+        gated.wait_entered(2).await;
+        assert_eq!(cache.counters().misses, 2, "both calls missed");
+
+        gated.release(0);
+        let a = a.await.expect("miss A did not panic");
+        gated.release(1);
+        let b = b.await.expect("miss B did not panic");
+        let hit = cache.get(th).await;
+        assert_eq!(
+            gated.entered.load(Ordering::SeqCst),
+            2,
+            "the hit after both misses is no GET"
+        );
+        (a, b, hit, fault)
+    }
+
+    /// A miss whose read succeeds replaces the failed read a concurrent miss
+    /// cached while its GET was in flight: it returns the record, and so does
+    /// the next hit.
+    ///
+    /// FLIP: keeping whatever entry the re-check finds, the shape before this
+    /// fix, fails "the successful miss returns its record, not the cached
+    /// failure".
+    #[tokio::test]
+    async fn successful_miss_replaces_a_concurrently_cached_failed_read() {
+        use ravel_object_store::fault::FaultKind;
+
+        let (a, b, hit, fault) = race_two_misses(1).await;
+        assert_eq!(fault.fault_count(Op::Get, FaultKind::Transient), 1);
+        assert!(a.read_failed(), "miss A's read failed");
+        assert!(
+            !b.read_failed(),
+            "the successful miss returns its record, not the cached failure"
+        );
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].family_name, "raced_metric");
+        assert!(!hit.read_failed(), "the next hit serves the record");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].family_name, "raced_metric");
+    }
+
+    /// A miss whose read fails does not replace the record a concurrent miss
+    /// cached while its GET was in flight: it returns that record, and so
+    /// does the next hit.
+    ///
+    /// FLIP: always overwriting the entry with the snapshot just fetched
+    /// fails "the failed miss returns the cached record".
+    #[tokio::test]
+    async fn failed_miss_does_not_replace_a_concurrently_cached_record() {
+        use ravel_object_store::fault::FaultKind;
+
+        let (a, b, hit, fault) = race_two_misses(2).await;
+        assert_eq!(fault.fault_count(Op::Get, FaultKind::Transient), 1);
+        assert!(!a.read_failed(), "miss A read the record");
+        assert_eq!(a.len(), 1);
+        assert!(
+            !b.read_failed(),
+            "the failed miss returns the cached record"
+        );
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].family_name, "raced_metric");
+        assert!(!hit.read_failed(), "the next hit serves the record");
+        assert_eq!(hit.len(), 1);
     }
 
     fn tenant(byte: u8) -> TenantHash {

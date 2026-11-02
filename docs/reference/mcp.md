@@ -468,10 +468,13 @@ record`.
 A metrics call whose metric metadata read failed is not an empty page. It
 fails with class `unavailable`, which is retryable, and a message saying
 the metric metadata read failed. The server caches the outcome of that
-read per tenant for a 60-second refresh horizon, so a retry inside the
-horizon fails the same way without reading the store again. The first
-call after the horizon starts a background reread and still fails; once a
-read of the record succeeds, calls answer the families. Logs and traces
+read per tenant. For 60 seconds after the call that read it, a retry
+fails the same way without reading the store again. After that the
+cached failure is stale: a call starts a background reread unless one is
+already in flight, and still fails. A failed reread leaves the entry
+stale, so the first call after each failed reread completes starts
+another; one reread is in flight at a time. Once a read of the record
+succeeds, calls answer the families. Logs and traces
 do not read the metric metadata record and are unaffected.
 
 The order is keyset, `scope.order_by` `["kind", "name"]`: the cursor's
