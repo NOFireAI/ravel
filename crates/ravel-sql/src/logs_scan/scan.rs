@@ -1142,6 +1142,15 @@ impl LogScanStream {
         }
     }
 
+    /// Whether the shared plan pass already recorded the open of the segment
+    /// at snapshot ordinal `ordinal` ([`PlanCounts::footer_opened`]), so this
+    /// partition's open of it records none (issue #3745).
+    fn plan_opened(&self, ordinal: usize) -> bool {
+        self.plan_counts
+            .as_ref()
+            .is_some_and(|counts| counts.footer_opened(ordinal))
+    }
+
     /// Whether this whole-segment fast-path open carries a block-level arm, so
     /// the open's survivor list, not the whole segment, is what a row ref
     /// indexes. It tests only that the prune or content list is non-empty:
@@ -1583,6 +1592,7 @@ impl LogScanStream {
                                 )
                             })
                         });
+                        this.plan_counts = Some(counts);
                         this.state = LogScanState::NextSegment;
                     }
                     Poll::Ready(Err(e)) => return this.fail(e),
@@ -1620,7 +1630,7 @@ impl LogScanStream {
                         this.blocks.record_fast_path_route(true);
                         this.ctx.record_open_shape(true);
                         this.ctx.record_data_object_touched();
-                        this.count_current_open = true;
+                        this.count_current_open = !this.plan_opened(ordinal);
                         match open {
                             PrefetchOpen::InFlight(fut) => {
                                 this.open_started = Some(issued);
@@ -1705,7 +1715,8 @@ impl LogScanStream {
                             // follow-up).
                             this.current_whole_object = whole_object;
                             this.current_unplanned = unplanned;
-                            this.count_current_open = !footer_counted;
+                            this.count_current_open =
+                                !(footer_counted || this.plan_opened(ordinal));
                             this.retrying = false;
                             this.block_cursor = 0;
                             this.consecutive_fallbacks = 0;

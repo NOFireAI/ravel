@@ -19,9 +19,11 @@ pub(super) struct PlanCounts {
     /// blocks from that read ([`open_segment_whole`]); its `segs` entry is
     /// `None`.
     unplanned: Vec<bool>,
-    /// Per segment, in snapshot order: the KEY_IDX probe decoded its footer
-    /// and recorded that open under the plan phase (issue #3745), so an
-    /// unplanned open of it does not record a second one.
+    /// Per segment, in snapshot order: the plan pass decoded its footer
+    /// without planning it (the KEY_IDX probe, or the fast-path verdict's
+    /// directory read) and recorded that open under the plan phase (issue
+    /// #3745), so the scan's open of it does not record a second one
+    /// ([`Self::footer_opened`]).
     probed: Vec<bool>,
     /// Relevant segments the plan phase read whole instead of counting from the
     /// skip index (#761). A segment planned from footer alone or from the skip
@@ -346,7 +348,7 @@ async fn compute_fast_path_verdict(
     cap: u64,
 ) -> DFResult<Arc<PlanCounts>> {
     let mut reads = Vec::new();
-    for seg in segments {
+    for (idx, seg) in segments.iter().enumerate() {
         if !LogSegmentFetcher::ts_range_relevant(seg, ctx.query.ts_min_ns, ctx.query.ts_max_ns) {
             continue;
         }
@@ -357,7 +359,7 @@ async fn compute_fast_path_verdict(
             if let Some(bytes) =
                 memo.and_then(|m| m.memoised_estimate(tenant, seg.content_hash, &ctx.columns))
             {
-                return Ok::<u64, SqlError>(bytes);
+                return Ok::<(usize, u64, bool), SqlError>((idx, bytes, false));
             }
             let plan = ctx.phase_accounting.plan();
             let (footer, dirs, _) = ctx
@@ -385,15 +387,25 @@ async fn compute_fast_path_verdict(
             if let Some(m) = memo {
                 m.memoise_estimate(tenant, seg.content_hash, &ctx.columns, bytes);
             }
-            Ok(bytes)
+            Ok((idx, bytes, true))
         });
     }
     let relevant = reads.len();
     let mut stream = futures::stream::iter(reads).buffer_unordered(concurrency.max(1));
     let mut summed = 0usize;
     let mut verdict = deferred_verdict(0, cap, false);
+    let mut footer_opened = vec![false; segments.len()];
     while let Some(read) = stream.next().await {
-        let bytes = read?;
+        let (idx, bytes, decoded) = read?;
+        // Recorded where the read is consumed, not inside it: a read dropped
+        // with the stream below leaves its object to the scan's open to
+        // record, so each object is recorded once either way (issue #3745).
+        if decoded {
+            ctx.phase_accounting.plan().add_segments_opened(1);
+            if let Some(flag) = footer_opened.get_mut(idx) {
+                *flag = true;
+            }
+        }
         ctx.budget.check()?;
         summed += 1;
         verdict = deferred_verdict(verdict.estimate_bytes.saturating_add(bytes), cap, false);
@@ -421,6 +433,7 @@ async fn compute_fast_path_verdict(
         false,
     );
     counts.deferred = Some(verdict);
+    counts.probed = footer_opened;
     Ok(Arc::new(counts))
 }
 
@@ -766,6 +779,13 @@ impl PlanCounts {
         self.deferred.is_some_and(|v| v.serve)
     }
 
+    /// Whether the plan pass decoded segment `seg_idx`'s footer without
+    /// planning it and recorded that open under the plan phase: the scan's
+    /// open of it records none (issue #3745).
+    pub(super) fn footer_opened(&self, seg_idx: usize) -> bool {
+        self.probed.get(seg_idx).copied().unwrap_or(false)
+    }
+
     /// The plan pass's decoded-set verdict, when it made one.
     #[cfg(test)]
     pub(super) fn deferred_verdict(&self) -> Option<DeferredVerdict> {
@@ -870,7 +890,7 @@ impl PlanCounts {
                         whole_object: None,
                         dirs: None,
                         unplanned: true,
-                        footer_counted: self.probed.get(seg_idx).copied().unwrap_or(false),
+                        footer_counted: self.footer_opened(seg_idx),
                     });
                 }
                 let unit = self.segs.get(seg_idx)?.as_ref()?;
