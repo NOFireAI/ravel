@@ -3465,6 +3465,43 @@ mod tests {
         assert_eq!(b_out.stats.blocks_after_skip, 0);
     }
 
+    /// A ranged trace lookup's footer open (the tail probe at
+    /// `ranged_trace_scan`) is charged to `stats.phases[probe].segmentsOpened`
+    /// (issue #3745); the scan built from the already-open footer never calls
+    /// `open_scan`, so `stats.phases[scan].segmentsOpened` stays 0 for the
+    /// same object.
+    ///
+    /// Fails against an implementation that increments on every GET the probe
+    /// and run reads issue (2, one per `fx.probe_of`/`fx.run` request), and
+    /// against one that charges the open to `scan()` because the scan is the
+    /// phase that ends up reading block data.
+    #[tokio::test]
+    async fn ranged_trace_segment_open_counts_once_under_probe() {
+        let mut fx = trace_fixture().await;
+        let log = Arc::new(GetLog::new(fx.memory.take().expect("memory")));
+        let fetcher = SpanSegmentFetcher::new(log.clone()).with_trace_probe_bytes(fx.probe);
+        let query = SpanQuery::trace(trace(3), i64::MIN, i64::MAX);
+        let accounting = PhaseAccounting::new();
+
+        let out = fetcher
+            .fetch_accounted_in_blocks(&fx.a, TENANT, &query, None, None, &[], None, &accounting)
+            .await
+            .expect("fetch A")
+            .expect("A is ts-relevant");
+        assert_eq!(out.records.len(), 4, "every trace-3 span");
+
+        assert_eq!(
+            accounting.probe().snapshot().segments_opened,
+            1,
+            "the tail probe opened this object's footer exactly once"
+        );
+        assert_eq!(
+            accounting.scan().snapshot().segments_opened,
+            0,
+            "the block-run read reuses the probe's footer, not a second open"
+        );
+    }
+
     /// The columnar exit takes the same ranged read and names it; a query with
     /// no `trace_id` still reads the whole object and names that.
     #[tokio::test]
