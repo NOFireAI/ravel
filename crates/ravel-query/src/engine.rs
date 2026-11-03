@@ -43,6 +43,8 @@ use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot};
 use crate::request_budgets::RequestBudgets;
 use crate::segment_admission::{self, RequestBudget};
 
+mod sample_fold;
+
 /// Which evaluation shape a prefetch is being computed for: an instant
 /// query has one lookup instant, a range query spans a step grid whose
 /// first and last instants bound every `PlanAnchor::Window` selector's own
