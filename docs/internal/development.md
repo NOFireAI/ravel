@@ -24,8 +24,8 @@ generated OTLP export, and queries it back by commit token
 One capability difference to keep in mind: the published image is built with
 `--features sql,flight-sql,otap,agents,mcp`, so `POST /api/v1/sql` and Flight SQL
 work in the compose quickstart, and `--otap`, `--agents` and `--mcp` are
-accepted there. The image first carries `agents` and `mcp` in `0.29.0`, the
-release the compose quickstart pins.
+accepted there. The image first carries `agents` and `mcp` in `0.29.0`, and
+the compose quickstart pins `0.30.0`.
 `make demo` builds the default feature set and enables none of the five, so
 those surfaces are
 unavailable on the from-source path. PromQL, ingest, and the rest are identical
