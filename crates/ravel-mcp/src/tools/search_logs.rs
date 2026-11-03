@@ -561,6 +561,8 @@ fn finish(
 ) -> Envelope {
     let order_by = rendered_order(plan);
     group_by_attribute_set(&mut draft.envelope.data, ctx.budgets.max_rows as usize);
+    draft.envelope.scope.signal = "logs".to_string();
+    draft.envelope.scope.table = "logs".to_string();
     draft.envelope.scope.order_by = order_by.clone();
     draft.envelope.scope.predicates_applied = call.conditions.clone();
     let narrow_groups = step(
@@ -1114,6 +1116,10 @@ mod tests {
             ]
         );
         assert_eq!(envelope.scope.order_by, ["\"ts\" ASC", "\"observed_ts\" ASC"]);
+        assert_eq!(
+            (envelope.scope.signal.as_str(), envelope.scope.table.as_str()),
+            ("logs", "logs")
+        );
         let executed = stub.executed.borrow();
         assert_eq!(executed[0].order_columns, ["ts", "observed_ts"]);
         assert!(executed[0].request.row_window);

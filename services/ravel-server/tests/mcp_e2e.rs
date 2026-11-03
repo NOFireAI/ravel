@@ -2796,6 +2796,31 @@ mod with_mcp {
     /// Publish `lines` as one RLOG object of service `api` plus its
     /// `Signal::Logs` commit record in ingest hour 0, the way log ingest does.
     async fn publish_log_lines(store: &dyn ObjectStoreBackend, lines: &[(i64, &str)]) {
+        let records: Vec<TestLog> = lines
+            .iter()
+            .map(|&(ts_ns, body)| TestLog {
+                ts_ns,
+                severity_num: 9,
+                body,
+                trace_id: None,
+                attrs: Vec::new(),
+            })
+            .collect();
+        publish_logs(store, &records).await;
+    }
+
+    /// One log record [`publish_logs`] writes, observed at its `ts_ns`.
+    struct TestLog<'a> {
+        ts_ns: i64,
+        severity_num: u8,
+        body: &'a str,
+        trace_id: Option<[u8; 16]>,
+        attrs: Vec<(&'a str, &'a str)>,
+    }
+
+    /// Publish `records` as one RLOG object of service `api` plus its
+    /// `Signal::Logs` commit record in ingest hour 0, the way log ingest does.
+    async fn publish_logs(store: &dyn ObjectStoreBackend, records: &[TestLog<'_>]) {
         use ravel_commit::publish::RetryPolicy;
         use ravel_commit::record::NewCommitRecord;
         use ravel_commit::{keys, publish, record};
@@ -2805,6 +2830,7 @@ mod with_mcp {
         use ravel_types::Signal;
         use ravel_types::logstream::log_stream_id;
 
+        let lines: Vec<(i64, &str)> = records.iter().map(|log| (log.ts_ns, log.body)).collect();
         let tenant_hash = TenantId::new(TENANT).hash();
         let resource = vec![("service.name".to_string(), AttrValue::Str("api".into()))];
         let writer_id = uuid::Uuid::from_u128(3_000);
@@ -2818,20 +2844,24 @@ mod with_mcp {
                 writer_seq: 1,
             },
         );
-        for &(ts_ns, body) in lines {
+        for log in records {
             writer
                 .push(LogRecord {
                     stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
                     stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
-                    ts_ns,
-                    observed_ts_ns: ts_ns,
-                    severity_num: 9,
+                    ts_ns: log.ts_ns,
+                    observed_ts_ns: log.ts_ns,
+                    severity_num: log.severity_num,
                     severity_text: "INFO".into(),
-                    body: body.into(),
-                    trace_id: None,
+                    body: log.body.into(),
+                    trace_id: log.trace_id,
                     span_id: None,
                     flags: 0,
-                    attrs: Vec::new(),
+                    attrs: log
+                        .attrs
+                        .iter()
+                        .map(|&(key, value)| (key.to_string(), AttrValue::Str(value.into())))
+                        .collect(),
                 })
                 .expect("push log record");
         }
@@ -2916,6 +2946,194 @@ mod with_mcp {
                 "{query}"
             );
         }
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
+    const TRACE_A: [u8; 16] = [0xab; 16];
+    const HOSTILE: &str = "x' OR 1=1; -- /*";
+
+    /// Four log lines 10 s apart: severities info, error, warn and fatal,
+    /// trace A on the first and last, and `attr_00` (declared) set to `web`
+    /// on all but the second, which carries [`HOSTILE`].
+    fn search_corpus() -> Vec<TestLog<'static>> {
+        vec![
+            TestLog {
+                ts_ns: 10 * NS_PER_SEC,
+                severity_num: 9,
+                body: "user login ok",
+                trace_id: Some(TRACE_A),
+                attrs: vec![("attr_00", "web"), ("region", "eu")],
+            },
+            TestLog {
+                ts_ns: 20 * NS_PER_SEC,
+                severity_num: 17,
+                body: "disk timeout on node",
+                trace_id: Some([0xcd; 16]),
+                attrs: vec![("attr_00", HOSTILE), ("region", "eu")],
+            },
+            TestLog {
+                ts_ns: 30 * NS_PER_SEC,
+                severity_num: 13,
+                body: "time drift",
+                trace_id: None,
+                attrs: vec![("attr_00", "web")],
+            },
+            TestLog {
+                ts_ns: 40 * NS_PER_SEC,
+                severity_num: 21,
+                body: "it's down; -- /* now",
+                trace_id: Some(TRACE_A),
+                attrs: vec![("attr_00", "web"), ("region", "us")],
+            },
+        ]
+    }
+
+    /// The `body` column of an envelope's rows, in page order.
+    fn bodies(envelope: &serde_json::Value) -> Vec<String> {
+        let at = envelope["data"]["columns"]
+            .as_array()
+            .expect("columns")
+            .iter()
+            .position(|column| column["name"] == "body")
+            .expect("a body column");
+        envelope["data"]["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| row[at].as_str().expect("a body string").to_string())
+            .collect()
+    }
+
+    /// `ravel_search_logs` through `POST /mcp` over a MemoryStore logs
+    /// tenant with `attr_00` declared: `has_word`, `severity`, `trace_id`
+    /// and a predicate each select exactly the rows they name, a predicate
+    /// value and a `has_word` term carrying a quote, a semicolon and comment
+    /// markers match literally, and a two-row cap walks the four rows in two
+    /// pages, every row once, in `(ts, observed_ts)` order.
+    ///
+    /// FLIP: compiling `severity` to `=` instead of `>=` drops the fatal
+    /// line; `format!` of the raw predicate value refuses the statement as
+    /// several; leaving the tool off `SERVED_TOOLS` or dispatch answers a
+    /// protocol error.
+    #[tokio::test]
+    async fn search_logs_filters_and_pages_a_logs_tenant() {
+        let (store, metrics) = instrumented_memory();
+        declare_columns(store.as_ref(), 1).await;
+        publish_logs(store.as_ref(), &search_corpus()).await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+        let window = serde_json::json!({"start_ns": "0", "end_ns": (3_600 * NS_PER_SEC).to_string()});
+        let search = |extra: serde_json::Value| {
+            let mut arguments = serde_json::json!({"time_range": window});
+            if let (Some(arguments), serde_json::Value::Object(extra)) =
+                (arguments.as_object_mut(), extra)
+            {
+                arguments.extend(extra);
+            }
+            arguments
+        };
+        let trace_a: String = TRACE_A.iter().map(|byte| format!("{byte:02X}")).collect();
+
+        let cases = [
+            ("has_word", serde_json::json!({"has_word": "timeout"}), vec!["disk timeout on node"]),
+            ("has_word token", serde_json::json!({"has_word": "time"}), vec!["time drift"]),
+            (
+                "hostile has_word",
+                serde_json::json!({"has_word": "it's down; -- /* now"}),
+                vec!["it's down; -- /* now"],
+            ),
+            (
+                "severity",
+                serde_json::json!({"severity": "error"}),
+                vec!["disk timeout on node", "it's down; -- /* now"],
+            ),
+            (
+                "trace_id",
+                serde_json::json!({"trace_id": trace_a}),
+                vec!["user login ok", "it's down; -- /* now"],
+            ),
+            (
+                "hostile predicate",
+                serde_json::json!({"predicates": [{"key": "attr_00", "op": "eq", "value": HOSTILE}]}),
+                vec!["disk timeout on node"],
+            ),
+            (
+                "ne predicate",
+                serde_json::json!({"predicates": [{"key": "attr_00", "op": "ne", "value": HOSTILE}]}),
+                vec!["user login ok", "time drift", "it's down; -- /* now"],
+            ),
+        ];
+        for (name, extra, expected) in cases {
+            let (is_error, found) = call(&client, "ravel_search_logs", search(extra)).await;
+            assert_eq!(is_error, Some(false), "{name}: {found}");
+            assert_eq!(found["status"], serde_json::json!("ok"), "{name}: {found}");
+            assert_eq!(bodies(&found), expected, "{name}");
+        }
+
+        let (_, all) = call(&client, "ravel_search_logs", search(serde_json::json!({}))).await;
+        let grouping: Vec<serde_json::Value> = all["data"]["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| serde_json::json!([row[0], row[1]]))
+            .collect();
+        // Lines one, two and four carry attr_00 and region beside the
+        // resource's service.name, line three no region. Only service.name
+        // is equal across the first group, so it alone is hoisted there; the
+        // second group's one row hoists all it has.
+        assert_eq!(
+            grouping,
+            [
+                serde_json::json!(["0", {"service.name": "api"}]),
+                serde_json::json!(["0", null]),
+                serde_json::json!(["1", {"attr_00": "web", "service.name": "api"}]),
+                serde_json::json!(["0", null]),
+            ],
+            "{all}"
+        );
+        assert_eq!(
+            all["data"]["rows"][1][10],
+            serde_json::json!({"attr_00": HOSTILE, "region": "eu"})
+        );
+        assert_eq!(all["scope"]["table"], serde_json::json!("logs"));
+
+        let (is_error, unknown) = call(
+            &client,
+            "ravel_search_logs",
+            search(serde_json::json!({"predicates": [{"key": "region", "op": "exists"}]})),
+        )
+        .await;
+        assert_eq!(is_error, Some(true), "{unknown}");
+        assert_eq!(unknown["failure"]["class"], serde_json::json!("invalid_argument"));
+        assert_eq!(
+            unknown["next_steps"][0]["action"],
+            serde_json::json!("ravel_describe_data")
+        );
+
+        let (_, one) = call(
+            &client,
+            "ravel_search_logs",
+            search(serde_json::json!({"max_rows": 2})),
+        )
+        .await;
+        assert_eq!(one["status"], serde_json::json!("ok_page"), "{one}");
+        assert_eq!(bodies(&one), ["user login ok", "disk timeout on node"]);
+        let cursor = one["presentation"]["cursor"].clone();
+        assert!(cursor.is_string(), "{one}");
+        let (_, two) = call(
+            &client,
+            "ravel_search_logs",
+            search(serde_json::json!({"max_rows": 2, "cursor": cursor})),
+        )
+        .await;
+        assert_eq!(two["status"], serde_json::json!("ok"), "{two}");
+        assert_eq!(bodies(&two), ["time drift", "it's down; -- /* now"]);
+        assert_eq!(one["visibility"]["snapshot_id"], two["visibility"]["snapshot_id"]);
 
         client.cancel().await.expect("client stops");
         running.shutdown().await.expect("server stops");
