@@ -43,6 +43,8 @@ pub struct ToolContext<'a> {
     /// deadline is tested against on redemption and confirmation.
     pub now_ns: i64,
     /// Wall-clock instant the call must be finished by, as a nanosecond epoch.
+    /// It does not bound a cursor the call mints, which outlives the call
+    /// (ADR-1374, the call-deadline amendment).
     pub deadline_ns: i64,
     /// The instant, as a nanosecond epoch, through which the deployment
     /// still protects a pinned snapshot from the sweeper. A cursor or

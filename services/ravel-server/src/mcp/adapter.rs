@@ -233,6 +233,7 @@ impl ServerHandler for RavelMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        let started = tokio::time::Instant::now();
         let (tenant_hash, subject) = tenant(&context)?;
         let args = Value::Object(request.arguments.unwrap_or_default());
         let budgets = match requested_budgets(&args) {
@@ -263,6 +264,7 @@ impl ServerHandler for RavelMcp {
             .map(|token| ProgressReporter::new(context.peer.clone(), token));
         let backend =
             ServiceBackend::new(self.service.clone().with_audit_subject(subject), budgets)
+                .with_call_start(started)
                 .with_progress(progress);
 
         let agents = match &self.agents {
