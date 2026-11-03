@@ -4,8 +4,9 @@
 //! trips) [`Distributed::fetch`] partitions it into shard-major slices,
 //! dispatches each to a worker through a [`SliceFetcher`], and returns the
 //! decoded per-slice results in the exact in-memory shapes the local fetch
-//! produces. The engine's merge layer (`merge_soa_runs`) then runs unchanged;
-//! because that merge is order-insensitive over the flat pool of decoded runs,
+//! produces. The engine folds them into the same per-series accumulator as the
+//! local path's runs, with the result `merge_soa_runs` gives; because that
+//! merge is order-insensitive over the flat pool of decoded runs,
 //! the coordinator-merged distributed result is bit-for-bit identical to the
 //! local-path result. See the acceptance test
 //! `distributed_merge_equals_local_bitwise`.
