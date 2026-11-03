@@ -7,7 +7,7 @@
 # investigations_cases.py: gen_corpus.py recounts, statements.toml and
 # bands.toml shape, evaluate.py on the committed local-lane run
 # (fixtures/local-smoke/, re-evaluated byte for byte) and on mutations of it,
-# two wrong evaluators that must fail their cases, and the box/ scripts'
+# the wrong evaluators that must each fail their case, and the box/ scripts'
 # dry runs. The scripts run, and are syntax-checked, under the bash that runs
 # this file, so `/path/to/bash-3.2 investigations.test.sh` checks them under
 # bash 3.2.

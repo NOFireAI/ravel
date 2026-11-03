@@ -3,7 +3,7 @@ selective investigations, lane local: fail
 states:
   compaction_done          run
   compaction_in_flight     run
-  erasure_in_flight        not-run  (not in run.toml states)
+  erasure_in_flight        run
   fold_advance             run
   folded_leaves            run
   folded_no_leaves         run
@@ -19,15 +19,15 @@ row_01.leaf_gets                             unsupported-                 unsupp
 row_01.absent_object_gets                    unsupported-                 unsupported-on-this-build  (stats carry no per-object breakdown)
 row_01.data_gets                             value                     5  pass
 row_01.total_gets                            value                     9  pass
-row_01.wire_bytes                            value                319459  miss
+row_01.wire_bytes                            value                464913  miss
 row_01.rows_exact                            value                     1  pass
 row_01.rows_match_unfolded                   value                     1  pass
 row_01.parts_covered                         unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.partsCovered on this build)
 row_02.covering_parts                        value                     1  pass
 row_02.leaf_gets                             unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.leafGetRequests on this build)
 row_02.data_gets                             value                     3  pass
-row_02.wire_bytes                            value                191272  pass
-row_02.wall_p50_s                            value             0.0396295  reported (timing is judged on the s3 lane only)
+row_02.wire_bytes                            value                333841  miss
+row_02.wall_p50_s                            value             0.0204685  reported (timing is judged on the s3 lane only)
 row_03.absent_object_gets                    unsupported-                 unsupported-on-this-build  (stats carry no per-object breakdown)
 row_03.probe_wire_per_object                 value               65536.0  miss
 row_03.keyindex_gets_without_kidx            unsupported-                 unsupported-on-this-build  (stats carry no per-object breakdown)
@@ -47,6 +47,7 @@ row_05.rows_exact                            not-run                      not-ru
 row_05.rows_match_unfolded                   not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
 row_05.rows_predicted                        not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
 row_06.hits_objects                          not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_06.hits_objects_over_512k                not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
 row_06.keyindex_gets                         not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
 row_06.objects_past_probe                    not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
 row_06.gets_beyond_probe                     not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
@@ -57,21 +58,21 @@ row_07.spans_mixed_entries                   value                     4  pass
 row_07.spans_tail_entries                    value                     6  pass
 row_07.spans_new_entries                     value                     2  pass
 row_07.spans_previous_leaves                 value                     1  pass
-row_07.spans_footer_len                      value                   196  pass
+row_07.spans_footer_len                      value                   199  pass
 row_07.spans_section_gets                    value                    12  miss  (from-scratch rebuild: section GETs = 2 x entry_count)
 row_07.spans_build_passes                    unsupported-                 unsupported-on-this-build  (fold report carries no key_index_build_passes on this build)
-row_07.spans_peak_rss_bytes                  value              24903680  pass
+row_07.spans_peak_rss_bytes                  value              26853376  pass
 row_07.logs_mixed_entries                    value                     4  pass
 row_07.logs_tail_entries                     value                     6  pass
 row_07.logs_new_entries                      value                     2  pass
 row_07.logs_previous_leaves                  value                     2  pass
-row_07.logs_footer_len                       value                   241  pass
+row_07.logs_footer_len                       value                   248  pass
 row_07.logs_section_gets                     value                    12  miss  (from-scratch rebuild: section GETs = 2 x entry_count)
 row_07.logs_build_passes                     unsupported-                 unsupported-on-this-build  (fold report carries no key_index_build_passes on this build)
-row_07.logs_peak_rss_bytes                   value              24903680  pass
-row_08.spans_trace_id_leaf_pct               value           4.635744684  pass
-row_08.logs_trace_id_leaf_pct                value           5.482831646  miss
-row_08.logs_request_id_leaf_pct              value          25.174788981  miss  (key cardinality equals the row count)
+row_07.logs_peak_rss_bytes                   value              44105728  pass
+row_08.spans_trace_id_leaf_pct               value            4.25350369  pass
+row_08.logs_trace_id_leaf_pct                value           5.855545639  miss
+row_08.logs_request_id_leaf_pct              value           27.52645665  miss  (key cardinality equals the row count)
 row_08.head_bytes_per_part_field             unsupported-                 unsupported-on-this-build  (fold report carries no head_bytes_per_part_field on this build)
 row_09.covering_parts                        not-run                      not-run  (many_parts_744: not in run.toml states)
 row_09.resolve_gets                          not-run                      not-run  (many_parts_744: not in run.toml states)
@@ -110,9 +111,9 @@ row_11.logs_1_keys_probed                    unsupported-                 unsupp
 row_11.logs_10_keys_probed                   unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.keysProbed on this build)
 row_11.logs_100_keys_probed                  unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.keysProbed on this build)
 row_11.logs_1000_keys_probed                 unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-row_11.spans_buckets                         value                    64  pass
+row_11.spans_buckets                         value                   256  pass
 row_11.spans_part_entries                    value                     4  pass
-row_11.logs_buckets                          value                   128  pass
+row_11.logs_buckets                          value                   512  pass
 row_11.logs_part_entries                     value                     4  pass
 row_11.spans_1000_leaf_gets_per_part         unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 row_11.spans_1000_leaf_bytes_per_part        unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
@@ -120,35 +121,37 @@ row_11.logs_trace_1000_leaf_gets_per_part    unsupported-                 unsupp
 row_11.logs_trace_1000_leaf_bytes_per_part   unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 row_11.logs_1000_leaf_gets_per_part          unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 row_11.logs_1000_leaf_bytes_per_part         unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-row_11.control_1001_not_served               value                     1  pass
+row_11.spans_control_1001                    unsupported-                 unsupported-on-this-build  (the 1,000-key list was refused: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.logs_trace_control_1001               unsupported-                 unsupported-on-this-build  (the 1,000-key list was refused: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.logs_request_control_1001             unsupported-                 unsupported-on-this-build  (the 1,000-key list was refused: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 row_12.gets_growth_10x                       not-run                      not-run  (scales [10, 100] not in run.toml scales)
 row_12.gets_growth_100x                      not-run                      not-run  (scales [10, 100] not in run.toml scales)
 row_13.wrong_answers                         value                     0  pass
 row_13.mixed_rows_exact                      value                     1  pass
 row_13.compaction_in_flight_rows_exact       value                     1  pass
 row_13.compaction_done_rows_exact            value                     1  pass
-row_13.erasure_in_flight_rows_exact          not-run                      not-run  (erasure_in_flight: not in run.toml states)
-row_13.negative_controls_failing_on_mutant   unsupported-                 unsupported-on-this-build  (the decision 9 mutants are not built or run by this harness)
+row_13.erasure_in_flight_rows_exact          value                     1  pass
+row_13.negative_controls_failing_on_mutant   not-run                      not-run  (mutant controls not implemented)
 row_14.signals_1                             value                     2  pass
 row_14.signals_102                           value                     2  pass
 row_14.signals_1024                          value                     2  pass
 row_14.signals_10240                         value                     2  pass
-row_14.gets_1                                value                     7  pass
-row_14.wire_1                                value                138067  pass
+row_14.gets_1                                value                     9  pass
+row_14.wire_1                                value               2847140  pass
 row_14.objects_opened_1                      dead_counter              0  dead_counter  (segmentsOpened 0 while journey_c_1/folded_leaves/cold try 0 issued 2 scan GETs)
-row_14.blocks_scanned_1                      value                     2  pass
-row_14.gets_10240                            value                     7  pass
-row_14.wire_10240                            value                138067  pass
+row_14.blocks_scanned_1                      value                     7  pass
+row_14.gets_10240                            value                     9  pass
+row_14.wire_10240                            value               2847140  pass
 row_14.objects_opened_10240                  dead_counter              0  dead_counter  (segmentsOpened 0 while journey_c_10240/folded_leaves/cold try 0 issued 2 scan GETs)
 row_15.cell_rows_exact                       value                     1  pass
 row_15.logs_rows_exact                       value                     1  pass
 row_15.lookup_rows_exact                     value                     1  pass
-row_15.cell_wall_p50_s                       value              0.043586  reported (timing is judged on the s3 lane only)
-row_15.logs_wall_p50_s                       value              0.044347  reported (timing is judged on the s3 lane only)
-row_15.lookup_wall_p50_s                     value             0.0396295  reported (timing is judged on the s3 lane only)
-row_15.journey_wall_p50_s                    value             0.1275625  reported (timing is judged on the s3 lane only)
+row_15.cell_wall_p50_s                       value             0.0473125  reported (timing is judged on the s3 lane only)
+row_15.logs_wall_p50_s                       value              0.060782  reported (timing is judged on the s3 lane only)
+row_15.lookup_wall_p50_s                     value             0.0204685  reported (timing is judged on the s3 lane only)
+row_15.journey_wall_p50_s                    value              0.128563  reported (timing is judged on the s3 lane only)
 row_15.cell_total_gets                       value                     6  pass
-row_15.logs_total_gets                       value                     7  pass
+row_15.logs_total_gets                       value                     9  pass
 row_15.lookup_total_gets                     value                     7  pass
 row_15.cell_resolve_gets                     value                     4  pass
 row_15.logs_resolve_gets                     value                     5  pass
@@ -156,137 +159,150 @@ row_15.lookup_resolve_gets                   value                     4  pass
 row_15.cell_traces                           value                    50  pass
 row_15.spans_covering_parts                  value                     1  pass
 row_15.logs_covering_parts                   value                     1  pass
-row_15.logs_blocks_scanned                   value                     2  pass
-row_15.journey_gets_budget                   value                   218  pass
-row_15.journey_total_gets                    value                    20  pass
+row_15.logs_blocks_scanned                   value                     7  pass
+row_15.truth_holders                         value                    50  pass
+row_15.truth_rows_per_holder                 value                     5  pass
+row_15.journey_gets_budget                   value                   466  pass
+row_15.journey_total_gets                    value                    22  pass
 row_15.logs_leaf_gets                        unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.leafGetRequests on this build)
 row_15.non_holder_whole_reads                unsupported-                 unsupported-on-this-build  (stats carry no per-object breakdown)
 row_16.max_slowdown_pct                      not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
 row_16.added_requests                        not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
 row_17.cost_figures_without_basis            value                     0  pass
-row_17.cost_statements                       value                    93  pass
+row_17.cost_statements                       value                    98  pass
 row_17.break_even_without_frequency          value                     0  pass
 
 statement                       state                temp      p50_s     p95_s  gets  wire_B   cpu_s   $/call  warm_served
-failing_cell                    compaction_done      cold     0.041531 0.0416885     6  138206   0.025 1.165e-05  0
-failing_cell                    compaction_in_flight inflight 0.035465 0.0401774     2   74406   0.015           
-failing_cell                    folded_leaves        cold     0.043586 0.0450575     6  138034   0.025 1.165e-05  0
-failing_cell                    folded_no_leaves     cold     0.040231 0.0402742     6  137845   0.025 1.165e-05  0
-failing_cell                    mixed                cold     0.0487855 0.05436865     8  138642    0.02 2.16e-05  0
-failing_cell                    unfolded             cold     0.0434875 0.04470835     9  138310    0.03 2.37e-05  0
-failing_cell_tail               mixed                cold     0.045649 0.0473608     8  138809   0.025 2.245e-05  0
-journey_b                       folded_leaves        cold     0.044347 0.0449374     7  138067   0.025 1.705e-05  2
-journey_b                       mixed                cold     0.048573 0.0519462     9  138675    0.02  3.7e-05  2
-journey_b                       unfolded             cold     0.049639 0.0544171    10  138343    0.02 3.74e-05  2
-journey_c_1                     folded_leaves        cold     0.041774 0.0433751     7  138067    0.02 1.62e-05  2
-journey_c_1                     mixed                cold     0.053901 0.0601137     9  138675   0.015 3.615e-05  2
-journey_c_1                     unfolded             cold     0.0453595 0.04597555    10  138343   0.025 3.825e-05  2
-journey_c_102                   folded_leaves        cold     0.0460155 0.04714185     7  138067   0.025 1.705e-05  2
-journey_c_102                   mixed                cold     0.049653 0.0519309     9  138675    0.02  3.7e-05  2
-journey_c_102                   unfolded             cold     0.0452535 0.04604505    10  138343   0.025 3.825e-05  2
-journey_c_1024                  folded_leaves        cold     0.043157 0.0437195     7  138067    0.02 1.62e-05  2
-journey_c_1024                  mixed                cold     0.04568 0.0469364     9  138675    0.03 3.87e-05  2
-journey_c_1024                  unfolded             cold      0.0476 0.0481553    10  138343   0.025 3.825e-05  2
-journey_c_10240                 folded_leaves        cold     0.045237 0.0455223     7  138067    0.02 1.62e-05  2
-journey_c_10240                 mixed                cold     0.049951  0.050077     9  138675    0.02  3.7e-05  2
-journey_c_10240                 unfolded             cold     0.0442405 0.04510135    10  138343   0.025 3.825e-05  2
-logs_erasure_victim             unfolded             cold     not-run (truth.json erasure_victim is null at this corpus size)
-logs_request_id_absent          folded_leaves        cold     0.032764 0.0333427     1      33   0.015 7.95e-06  2
-logs_request_id_absent          mixed                cold     0.0376705 0.03856555     3  115692   0.025 2.045e-05  2
-logs_request_id_absent          unfolded             cold     0.033827 0.0346415     1      33   0.015 1.795e-05  2
-logs_request_id_present         compaction_done      cold     0.0364445 0.03740615     3  115692   0.015 8.75e-06  2
-logs_request_id_present         compaction_in_flight inflight 0.0299885 0.03071345     1      33   0.005           
-logs_request_id_present         folded_leaves        cold     0.0317165 0.03277715     1      33   0.005 6.25e-06  2
-logs_request_id_present         mixed                cold     0.0404485 0.04418755     3  115692   0.025 2.045e-05  2
-logs_request_id_present         unfolded             cold     0.032512 0.0330727     1      33    0.01 1.71e-05  2
-logs_request_in_1               folded_leaves        cold     0.0330155 0.03362255     1      33    0.01  7.1e-06  2
-logs_request_in_1               unfolded             cold     0.0413085 0.04764135     1      33    0.02 1.88e-05  2
-logs_request_in_10              folded_leaves        cold     0.0350135 0.03683645     1      33   0.015 7.95e-06  2
-logs_request_in_10              unfolded             cold     0.034634 0.0355997     1      33   0.005 1.625e-05  2
-logs_request_in_100             folded_leaves        cold     0.0365725 0.03763225     1      33    0.01  7.1e-06  2
-logs_request_in_100             unfolded             cold     0.042689 0.0482771     1      33    0.02 1.88e-05  2
+failing_cell                    compaction_done      cold     0.0506055 0.05071305     6 2585134    0.08  2.1e-05  0
+failing_cell                    compaction_in_flight inflight 0.0752355 0.08094195     3 2583982   0.095           
+failing_cell                    folded_leaves        cold     0.0473125 0.04825075     6 2584963   0.075 2.015e-05  0
+failing_cell                    folded_no_leaves     cold     0.0471815 0.04849145     6 2584772   0.075 2.015e-05  0
+failing_cell                    mixed                cold     0.067637 0.0734465     8 2585573   0.065 2.925e-05  0
+failing_cell                    unfolded             cold     0.0496655 0.05036615     9 2585239   0.075 3.135e-05  0
+failing_cell_tail               mixed                cold     0.0649465 0.06783415     8 2585122   0.065 2.925e-05  0
+journey_b                       folded_leaves        cold     0.060782 0.0614201     9 2847140    0.08 2.72e-05  2
+journey_b                       mixed                cold     0.086996 0.0877448    11 2847750   0.085 4.885e-05  2
+journey_b                       unfolded             cold     0.0650265 0.06506205    12 2847416    0.09 5.01e-05  2
+journey_c_1                     folded_leaves        cold     0.048416 0.0488588     9 2847140    0.06 2.38e-05  2
+journey_c_1                     mixed                cold     0.0621355 0.06392695    11 2847750    0.05 4.29e-05  2
+journey_c_1                     unfolded             cold     0.054304 0.0570787    12 2847416   0.055 4.415e-05  2
+journey_c_102                   folded_leaves        cold     0.0498495 0.04988325     9 2847140    0.06 2.38e-05  2
+journey_c_102                   mixed                cold     0.067219 0.0690847    11 2847750    0.06 4.46e-05  2
+journey_c_102                   unfolded             cold     0.05291 0.0530171    12 2847416    0.06  4.5e-05  2
+journey_c_1024                  folded_leaves        cold     0.0503865 0.05046975     9 2847140    0.05 2.21e-05  2
+journey_c_1024                  mixed                cold     0.0663045 0.07284705    11 2847750    0.06 4.46e-05  2
+journey_c_1024                  unfolded             cold     0.055424  0.056729    12 2847416    0.06  4.5e-05  2
+journey_c_10240                 folded_leaves        cold     0.057331 0.0575479     9 2847140    0.07 2.55e-05  2
+journey_c_10240                 mixed                cold     0.0700275 0.07087845    11 2847750    0.08  4.8e-05  2
+journey_c_10240                 unfolded             cold     0.0675035 0.07354025    12 2847416    0.08 4.84e-05  2
+logs_erasure_victim             erasure_in_flight    cold     0.059713 0.0623779    21 1641390    0.04 2.02e-05  2
+logs_erasure_victim             unfolded             cold     0.0330445 0.03352915    13  536395   0.015 2.275e-05  2
+logs_request_id_absent          folded_leaves        cold     0.0281095 0.02875795    13  536306   0.015 1.275e-05  2
+logs_request_id_absent          mixed                cold     0.0430165 0.04346425    19  804606    0.01 2.43e-05  2
+logs_request_id_absent          unfolded             cold     0.0284665 0.02877745    13  536306   0.015 2.275e-05  2
+logs_request_id_present         compaction_done      cold     0.045999 0.0481806    20 1641137    0.02 1.64e-05  2
+logs_request_id_present         compaction_in_flight inflight 0.0203235 0.02891895     8  842045    0.01           
+logs_request_id_present         erasure_in_flight    cold     0.057784 0.0588064    21 1641280   0.045 2.105e-05  2
+logs_request_id_present         folded_leaves        cold     0.030751 0.0310867    13  536433    0.02 1.36e-05  2
+logs_request_id_present         mixed                cold     0.053238 0.0533685    20 1641137    0.02 2.64e-05  2
+logs_request_id_present         unfolded             cold     0.0315725 0.03171155    13  536433   0.015 2.275e-05  2
+logs_request_in_1               folded_leaves        cold     0.029894 0.0304898    13  536482   0.015 1.275e-05  2
+logs_request_in_1               unfolded             cold     0.030372 0.0308787    13  536482    0.02 2.36e-05  2
+logs_request_in_10              folded_leaves        cold     0.025818 0.0261744     5  524321    0.02 1.04e-05  2
+logs_request_in_10              unfolded             cold     0.026312 0.0266999     5  524321    0.03 2.21e-05  2
+logs_request_in_100             folded_leaves        cold     0.027887 0.0279266     5  524321   0.035 1.295e-05  2
+logs_request_in_100             unfolded             cold     0.0293505 0.02999445     5  524321   0.035 2.295e-05  2
 logs_request_in_1000            folded_leaves        cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 logs_request_in_1000            unfolded             cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-logs_tag_common                 folded_leaves        cold     0.0346875 0.03484005     1      33    0.01  7.1e-06  2
-logs_tag_common                 unfolded             cold     0.0389415 0.04094085     1      33    0.02 1.88e-05  2
-logs_tag_mixed_rare             mixed                cold     0.038538 0.0393957     3  115692    0.01 1.79e-05  2
-logs_tag_rare                   folded_leaves        cold     0.033983 0.0353105     1      33   0.005 6.25e-06  2
-logs_tag_rare                   unfolded             cold     0.034969 0.0357997     1      33   0.015 1.795e-05  2
-logs_tag_sparse                 folded_leaves        cold     0.034594 0.0349441     1      33   0.015 7.95e-06  2
-logs_tag_sparse                 unfolded             cold     0.034381 0.0358192     1      33    0.01 1.71e-05  2
-logs_tail_request_id            mixed                cold     0.0405055 0.04056805     3  115692    0.01 1.79e-05  2
-logs_tail_trace_norange         mixed                cold     0.0381595 0.03978085     3  115692   0.015 1.875e-05  2
-logs_trace_1h                   folded_leaves        cold     0.033592 0.0337657     1      33    0.01  7.1e-06  2
-logs_trace_1h                   folded_leaves        warm     0.031854  0.031854     1      33     0.0           
-logs_trace_1h                   folded_no_leaves     cold     0.032263 0.0323161     1      33    0.01  7.1e-06  2
-logs_trace_1h                   folded_no_leaves     warm     0.030568  0.030568     1      33     0.0           
-logs_trace_1h                   mixed                cold     0.0388155 0.03923715     3  115692   0.005 1.705e-05  2
-logs_trace_1h                   mixed                warm     0.039449  0.039449     1      33    0.01           
-logs_trace_1h                   unfolded             cold     0.033278 0.0333059     1      33    0.01 1.71e-05  2
-logs_trace_1h                   unfolded             warm     0.031978  0.031978     1      33    0.01           
-logs_trace_in_1                 folded_leaves        cold     0.0358615 0.03675475     1      33   0.015 7.95e-06  2
-logs_trace_in_1                 unfolded             cold     0.03811 0.0406588     1      33    0.02 1.88e-05  2
-logs_trace_in_10                folded_leaves        cold     0.043334  0.050147     1      33   0.015 7.95e-06  2
-logs_trace_in_10                unfolded             cold     0.03495 0.0351921     1      33   0.015 1.795e-05  2
-logs_trace_in_100               folded_leaves        cold     0.0388545 0.04139295     1      33   0.015 7.95e-06  2
-logs_trace_in_100               unfolded             cold     0.03736 0.0378496     1      33   0.025 1.965e-05  2
+logs_request_in_1001            folded_leaves        cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_request_in_1001            unfolded             cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_tag_common                 folded_leaves        cold     0.020586 0.0209622     5  524321   0.025 1.125e-05  2
+logs_tag_common                 unfolded             cold     0.0215315 0.02179565     5  524321   0.025 2.125e-05  2
+logs_tag_mixed_rare             mixed                cold     0.0415185 0.04259535     9 2635818    0.03 2.37e-05  2
+logs_tag_rare                   folded_leaves        cold     0.02041 0.0204838     5  524321   0.015 9.55e-06  2
+logs_tag_rare                   unfolded             cold     0.0209125 0.02121355     5  524321    0.01 1.87e-05  2
+logs_tag_sparse                 folded_leaves        cold     0.020443 0.0205627     5  524321   0.015 9.55e-06  2
+logs_tag_sparse                 unfolded             cold     0.0223575 0.02241735     5  524321    0.02 2.04e-05  2
+logs_tail_request_id            mixed                cold     0.048792 0.0494436    19  804805   0.025 2.685e-05  2
+logs_tail_trace_norange         mixed                cold     0.0439015 0.04519345    14 1190159   0.025 2.485e-05  2
+logs_trace_1h                   folded_leaves        cold     0.0250365 0.02733195     7  657709    0.01  9.3e-06  2
+logs_trace_1h                   folded_leaves        warm     0.009541  0.009541     1      33    0.01           
+logs_trace_1h                   folded_no_leaves     cold      0.0249  0.026628     7  657709    0.01  9.3e-06  2
+logs_trace_1h                   folded_no_leaves     warm     0.009588  0.009588     1      33     0.0           
+logs_trace_1h                   mixed                cold     0.031392 0.0316503     7  657709    0.01 1.93e-05  2
+logs_trace_1h                   mixed                warm     0.011836  0.011836     1      33    0.01           
+logs_trace_1h                   unfolded             cold     0.0257555 0.02717165     7  657709   0.015 2.015e-05  2
+logs_trace_1h                   unfolded             warm     0.010867  0.010867     1      33     0.0           
+logs_trace_in_1                 folded_leaves        cold     0.030649 0.0310684    10  857666    0.02 1.24e-05  2
+logs_trace_in_1                 unfolded             cold     0.0314435 0.03187055    10  857666    0.02 2.24e-05  2
+logs_trace_in_10                folded_leaves        cold     0.036661 0.0370552     5  524321   0.055 1.635e-05  2
+logs_trace_in_10                unfolded             cold     0.0376435 0.03772765     5  524321    0.06 2.72e-05  2
+logs_trace_in_100               folded_leaves        cold     0.0404045 0.04089185     5  524321    0.06 1.72e-05  2
+logs_trace_in_100               unfolded             cold     0.0400435 0.04015915     5  524321    0.06 2.72e-05  2
 logs_trace_in_1000              folded_leaves        cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 logs_trace_in_1000              unfolded             cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-logs_trace_norange              compaction_done      cold     0.043291   0.04861     3  115692    0.02  9.6e-06  2
-logs_trace_norange              compaction_in_flight inflight 0.031347 0.0314784     3  115692    0.01           
-logs_trace_norange              folded_leaves        cold     0.040525 0.0434545     1      33    0.01  7.1e-06  2
-logs_trace_norange              folded_no_leaves     cold     0.0341875 0.03472615     1      33   0.015 7.95e-06  2
-logs_trace_norange              mixed                cold     0.037536 0.0393576     3  115692    0.01 1.79e-05  2
-logs_trace_norange              unfolded             cold     0.037538 0.0392885     1      33    0.02 1.88e-05  2
-logs_word_common                folded_leaves        cold     0.0358855 0.03801175     1      33    0.02  8.8e-06  2
-logs_word_common                unfolded             cold     0.036429  0.036438     1      33    0.01 1.71e-05  2
-logs_word_mixed_rare            mixed                cold     0.037882 0.0379297     3  115692    0.01 1.79e-05  2
-logs_word_rare                  folded_leaves        cold     0.0339965 0.03439655     1      33    0.01  7.1e-06  2
-logs_word_rare                  unfolded             cold     0.035834 0.0363524     1      33    0.01 1.71e-05  2
-logs_word_sparse                folded_leaves        cold     0.0358305 0.03912405     1      33   0.015 7.95e-06  2
-logs_word_sparse                unfolded             cold     0.039324  0.041574     1      33   0.015 1.795e-05  2
-spans_in_1                      folded_leaves        cold     0.0387255 0.03896265     9  326942    0.01 1.03e-05  0
-spans_in_1                      unfolded             cold     0.041281 0.0418606    12  327218    0.02 2.32e-05  0
-spans_in_10                     folded_leaves        cold     0.0411095 0.04209725     8  273974    0.02 1.16e-05  0
-spans_in_10                     unfolded             cold     0.039997 0.0402418    11  274250   0.015 2.195e-05  0
-spans_in_100                    folded_leaves        cold     0.0421675 0.04224985     8  273974   0.025 1.245e-05  0
-spans_in_100                    unfolded             cold     0.043013 0.0459569    11  274250   0.025 2.365e-05  0
+logs_trace_in_1001              folded_leaves        cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_trace_in_1001              unfolded             cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_trace_norange              compaction_done      cold     0.0377285 0.03958655    17 1190932   0.025 1.545e-05  2
+logs_trace_norange              compaction_in_flight inflight 0.0444665 0.06032315    14 1166686    0.02           
+logs_trace_norange              erasure_in_flight    cold     0.0535565 0.06216995    18 1812743   0.035 1.755e-05  2
+logs_trace_norange              folded_leaves        cold     0.031806 0.0342603    12  924378   0.015 1.195e-05  2
+logs_trace_norange              folded_no_leaves     cold     0.032979 0.0346269    12  924378    0.02 1.28e-05  2
+logs_trace_norange              mixed                cold     0.0461795 0.05143685    17 1190932   0.025 2.545e-05  2
+logs_trace_norange              unfolded             cold     0.0323275 0.03405415    12  924378   0.015 2.195e-05  2
+logs_word_common                folded_leaves        cold     0.0250555 0.02522425     5  524321   0.025 1.125e-05  2
+logs_word_common                unfolded             cold     0.0280455 0.02900175     5  524321   0.025 2.125e-05  2
+logs_word_mixed_rare            mixed                cold     0.044291 0.0459407     9 2635818   0.045 2.625e-05  2
+logs_word_rare                  folded_leaves        cold     0.0233185 0.02351785     5  524321   0.025 1.125e-05  2
+logs_word_rare                  unfolded             cold     0.0247135 0.02519635     5  524321   0.015 1.955e-05  2
+logs_word_sparse                folded_leaves        cold     0.027173 0.0295706     5  524321    0.04 1.38e-05  2
+logs_word_sparse                unfolded             cold     0.026488 0.0272692     5  524321   0.025 2.125e-05  2
+spans_in_1                      folded_leaves        cold     0.0250465 0.02585695     9  464988    0.02  1.2e-05  0
+spans_in_1                      unfolded             cold     0.0270695 0.02763245    12  465264   0.025 2.405e-05  0
+spans_in_10                     folded_leaves        cold     0.0629205 0.06394245     8 5169307    0.15 3.37e-05  0
+spans_in_10                     unfolded             cold     0.06591 0.0660279    11 5169583   0.145 4.405e-05  0
+spans_in_100                    folded_leaves        cold     0.065121 0.0659958     8 5169307    0.16 3.54e-05  0
+spans_in_100                    unfolded             cold     0.066788 0.0685385    11 5169583   0.135 4.235e-05  0
 spans_in_1000                   folded_leaves        cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 spans_in_1000                   unfolded             cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-spans_lookup_1h                 folded_leaves        cold     0.0396295 0.04045975     7  191272   0.015 1.035e-05  0
-spans_lookup_1h                 folded_leaves        warm     0.028802  0.028802     1      33     0.0           
-spans_lookup_1h                 folded_no_leaves     cold     0.041674  0.041755     7  191083    0.01  9.5e-06  0
-spans_lookup_1h                 folded_no_leaves     warm     0.028615  0.028615     1      33    0.01           
-spans_lookup_1h                 many_parts_24        cold     0.0508995 0.05338125    31   27291    0.02 2.04e-05  0
-spans_lookup_1h                 many_parts_24        warm     0.033356  0.033356     1      33    0.01           
-spans_lookup_1h                 mixed                cold     0.0419495 0.04227125     9  191880    0.02  2.2e-05  0
-spans_lookup_1h                 mixed                warm     0.030595  0.030595     1      33    0.01           
-spans_lookup_1h                 unfolded             cold     0.0418555 0.04266415    10  191548    0.01 2.07e-05  0
-spans_lookup_1h                 unfolded             warm     0.029098  0.029098     1      33    0.01           
-spans_lookup_narrow             folded_leaves        cold     0.0377825 0.03868475     7  191272    0.01  9.5e-06  0
-spans_lookup_narrow             mixed                cold     0.0411205 0.04194445     9  191880    0.02  2.2e-05  0
-spans_lookup_narrow             unfolded             cold     0.0393965 0.04013045    10  191548   0.015 2.155e-05  0
-spans_lookup_norange            compaction_done      cold     0.0418225 0.04228015    11  450703   0.015 1.195e-05  0
-spans_lookup_norange            compaction_done      warm     0.033904  0.033904     1      33     0.0           
-spans_lookup_norange            compaction_in_flight inflight 0.037211 0.0429935    11  450703    0.01           
-spans_lookup_norange            folded_leaves        cold     0.044895 0.0477678     9  319459   0.025 1.285e-05  0
-spans_lookup_norange            folded_leaves        warm     0.030616  0.030616     1      33     0.0           
-spans_lookup_norange            folded_no_leaves     cold     0.0422335 0.04367485     9  319270    0.02  1.2e-05  0
-spans_lookup_norange            folded_no_leaves     warm     0.035182  0.035182     1      33    0.01           
-spans_lookup_norange            many_parts_24        cold     0.049901 0.0516344    75  171176   0.035 4.095e-05  0
-spans_lookup_norange            many_parts_24        warm     0.035442  0.035442     1      33     0.0           
-spans_lookup_norange            mixed                cold     0.0488915 0.05205725    13  451139   0.015 2.275e-05  0
-spans_lookup_norange            mixed                warm     0.032147  0.032147     1      33    0.02           
-spans_lookup_norange            unfolded             cold     0.044377 0.0464713    12  319735   0.015 2.235e-05  0
-spans_lookup_norange            unfolded             warm     0.030991  0.030991     1      33    0.01           
-spans_lookup_wide               folded_leaves        cold     0.038972 0.0397442     9  319459    0.02  1.2e-05  0
-spans_lookup_wide               mixed                cold     0.043909  0.044287    13  451139   0.025 2.445e-05  0
-spans_lookup_wide               unfolded             cold     0.0411865 0.04302475    12  319735   0.015 2.235e-05  0
-spans_sql_trace_1h              folded_leaves        cold     0.037218 0.0374205     7  191272   0.015 1.035e-05  0
-spans_sql_trace_1h              mixed                cold     0.039191 0.0398309     9  191880    0.01 2.03e-05  0
-spans_sql_trace_1h              unfolded             cold     0.0404935 0.04144975    10  191548    0.02 2.24e-05  0
-spans_tail_lookup_1h            mixed                cold     0.0431695 0.04350295    11  324857   0.015 2.195e-05  0
-spans_tail_lookup_norange       mixed                cold     0.0452365 0.04851475    13  455929    0.02 2.36e-05  0
+spans_in_1001                   folded_leaves        cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+spans_in_1001                   unfolded             cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+spans_lookup_1h                 folded_leaves        cold     0.0204685 0.02228515     7  333841    0.01  9.5e-06  0
+spans_lookup_1h                 folded_leaves        warm     0.008129  0.008129     1      33     0.0           
+spans_lookup_1h                 folded_no_leaves     cold     0.020636 0.0217268     7  333650    0.01  9.5e-06  0
+spans_lookup_1h                 folded_no_leaves     warm     0.008516  0.008516     1      33     0.0           
+spans_lookup_1h                 many_parts_24        cold     0.025196 0.0254624    29   20631    0.01 1.83e-05  0
+spans_lookup_1h                 many_parts_24        warm     0.007815  0.007815     1      33    0.01           
+spans_lookup_1h                 mixed                cold     0.029008 0.0296893     9  334451    0.01 2.03e-05  0
+spans_lookup_1h                 mixed                warm     0.013467  0.013467     1      33    0.01           
+spans_lookup_1h                 unfolded             cold     0.023738 0.0247685    10  334117   0.015 2.155e-05  0
+spans_lookup_1h                 unfolded             warm     0.010201  0.010201     1      33    0.01           
+spans_lookup_narrow             folded_leaves        cold     0.020623 0.0223321     7  333841   0.015 1.035e-05  0
+spans_lookup_narrow             mixed                cold      0.0322 0.0363103     9  334451   0.015 2.115e-05  0
+spans_lookup_narrow             unfolded             cold     0.0252725 0.02929325    10  334117   0.015 2.155e-05  0
+spans_lookup_norange            compaction_done      cold     0.0265335 0.02894775    11  596156   0.025 1.365e-05  0
+spans_lookup_norange            compaction_done      warm     0.010849  0.010849     1      33    0.01           
+spans_lookup_norange            compaction_in_flight inflight 0.082331 0.1386998    11  596156   0.025           
+spans_lookup_norange            erasure_in_flight    cold     0.0259535 0.02841995    11  596156    0.02 1.28e-05  0
+spans_lookup_norange            erasure_in_flight    warm     0.010508  0.010508     1      33     0.0           
+spans_lookup_norange            folded_leaves        cold     0.0240555 0.02600085     9  464913   0.015 1.115e-05  0
+spans_lookup_norange            folded_leaves        warm     0.010625  0.010625     1      33    0.01           
+spans_lookup_norange            folded_no_leaves     cold     0.024945 0.0267657     9  464722    0.02  1.2e-05  0
+spans_lookup_norange            folded_no_leaves     warm     0.010437  0.010437     1      33    0.01           
+spans_lookup_norange            many_parts_24        cold     0.046925 0.0472004    75  171178   0.035 4.095e-05  0
+spans_lookup_norange            many_parts_24        warm     0.010529  0.010529     1      33    0.01           
+spans_lookup_norange            mixed                cold     0.0564405 0.06054855    13  596595   0.025 2.445e-05  0
+spans_lookup_norange            mixed                warm     0.021574  0.021574     1      33    0.01           
+spans_lookup_norange            unfolded             cold     0.026345 0.0283142    12  465189    0.02 2.32e-05  0
+spans_lookup_norange            unfolded             warm     0.012013  0.012013     1      33    0.01           
+spans_lookup_wide               folded_leaves        cold     0.0222115 0.02381035     9  464913    0.01 1.03e-05  0
+spans_lookup_wide               mixed                cold     0.040578 0.0513006    13  596595    0.02 2.36e-05  0
+spans_lookup_wide               unfolded             cold     0.0240925 0.02599375    12  465189    0.02 2.32e-05  0
+spans_sql_trace_1h              folded_leaves        cold     0.019081 0.0201853     7  333841   0.015 1.035e-05  0
+spans_sql_trace_1h              mixed                cold     0.0235115 0.02478455     9  334451    0.01 2.03e-05  0
+spans_sql_trace_1h              unfolded             cold     0.0234385 0.02674285    10  334117    0.01 2.07e-05  0
+spans_tail_lookup_1h            mixed                cold     0.030645 0.0311346    11  465889    0.02 2.28e-05  0
+spans_tail_lookup_norange       mixed                cold     0.036178 0.0385684    13  596961   0.015 2.275e-05  0
 
 prices:
   get_per_1000 = 0.0004  source: AWS S3 Standard pricing, us-east-1: GET, SELECT and all other requests, $0.0004 per 1,000 requests
@@ -294,40 +310,41 @@ prices:
   storage_gb_month = 0.023  source: AWS S3 Standard pricing, us-east-1: first 50 TB per month, $0.023 per GB
   instance_per_hour = 0.612  source: AWS EC2 on-demand pricing, us-east-1, Linux: c6a.4xlarge $0.612 per hour
 query frequency assumed (once, for every break-even below): 1000 lookups per part-month (source: assumption: 1,000 selective lookups per snapshot part per month, ADR-3692 gives no frequency); leaf build amortised over 1 month(s)
-  maintenance spans: 8 section GET, 1 leaf PUT, 12712 leaf B over 1 part(s) = $8.492e-06/part-month
-  maintenance logs: 8 section GET, 2 leaf PUT, 71080 leaf B over 1 part(s) = $1.4835e-05/part-month
-  failing_cell (spans): unfolded $2.37e-05 folded $1.165e-05 saving $1.205e-05/call; break-even 0.70473029 lookups/part-month
-  journey_b (logs): unfolded $3.74e-05 folded $1.705e-05 saving $2.035e-05/call; break-even 0.728992629 lookups/part-month
-  journey_c_1 (logs): unfolded $3.825e-05 folded $1.62e-05 saving $2.205e-05/call; break-even 0.672789116 lookups/part-month
-  journey_c_102 (logs): unfolded $3.825e-05 folded $1.705e-05 saving $2.12e-05/call; break-even 0.699764151 lookups/part-month
-  journey_c_1024 (logs): unfolded $3.825e-05 folded $1.62e-05 saving $2.205e-05/call; break-even 0.672789116 lookups/part-month
-  journey_c_10240 (logs): unfolded $3.825e-05 folded $1.62e-05 saving $2.205e-05/call; break-even 0.672789116 lookups/part-month
-  logs_request_id_absent (logs): unfolded $1.795e-05 folded $7.95e-06 saving $1e-05/call; break-even 1.4835 lookups/part-month
-  logs_request_id_present (logs): unfolded $1.71e-05 folded $6.25e-06 saving $1.085e-05/call; break-even 1.367281106 lookups/part-month
-  logs_request_in_1 (logs): unfolded $1.88e-05 folded $7.1e-06 saving $1.17e-05/call; break-even 1.267948718 lookups/part-month
-  logs_request_in_10 (logs): unfolded $1.625e-05 folded $7.95e-06 saving $8.3e-06/call; break-even 1.787349398 lookups/part-month
-  logs_request_in_100 (logs): unfolded $1.88e-05 folded $7.1e-06 saving $1.17e-05/call; break-even 1.267948718 lookups/part-month
-  logs_tag_common (logs): unfolded $1.88e-05 folded $7.1e-06 saving $1.17e-05/call; break-even 1.267948718 lookups/part-month
-  logs_tag_rare (logs): unfolded $1.795e-05 folded $6.25e-06 saving $1.17e-05/call; break-even 1.267948718 lookups/part-month
-  logs_tag_sparse (logs): unfolded $1.71e-05 folded $7.95e-06 saving $9.15e-06/call; break-even 1.621311475 lookups/part-month
-  logs_trace_1h (logs): unfolded $1.71e-05 folded $7.1e-06 saving $1e-05/call; break-even 1.4835 lookups/part-month
-  logs_trace_in_1 (logs): unfolded $1.88e-05 folded $7.95e-06 saving $1.085e-05/call; break-even 1.367281106 lookups/part-month
-  logs_trace_in_10 (logs): unfolded $1.795e-05 folded $7.95e-06 saving $1e-05/call; break-even 1.4835 lookups/part-month
-  logs_trace_in_100 (logs): unfolded $1.965e-05 folded $7.95e-06 saving $1.17e-05/call; break-even 1.267948718 lookups/part-month
-  logs_trace_norange (logs): unfolded $1.88e-05 folded $7.1e-06 saving $1.17e-05/call; break-even 1.267948718 lookups/part-month
-  logs_word_common (logs): unfolded $1.71e-05 folded $8.8e-06 saving $8.3e-06/call; break-even 1.787349398 lookups/part-month
-  logs_word_rare (logs): unfolded $1.71e-05 folded $7.1e-06 saving $1e-05/call; break-even 1.4835 lookups/part-month
-  logs_word_sparse (logs): unfolded $1.795e-05 folded $7.95e-06 saving $1e-05/call; break-even 1.4835 lookups/part-month
-  spans_in_1 (spans): unfolded $2.32e-05 folded $1.03e-05 saving $1.29e-05/call; break-even 0.658294574 lookups/part-month
-  spans_in_10 (spans): unfolded $2.195e-05 folded $1.16e-05 saving $1.035e-05/call; break-even 0.820483092 lookups/part-month
-  spans_in_100 (spans): unfolded $2.365e-05 folded $1.245e-05 saving $1.12e-05/call; break-even 0.758214286 lookups/part-month
-  spans_lookup_1h (spans): unfolded $2.07e-05 folded $1.035e-05 saving $1.035e-05/call; break-even 0.820483092 lookups/part-month
-  spans_lookup_narrow (spans): unfolded $2.155e-05 folded $9.5e-06 saving $1.205e-05/call; break-even 0.70473029 lookups/part-month
-  spans_lookup_norange (spans): unfolded $2.235e-05 folded $1.285e-05 saving $9.5e-06/call; break-even 0.893894737 lookups/part-month
-  spans_lookup_wide (spans): unfolded $2.235e-05 folded $1.2e-05 saving $1.035e-05/call; break-even 0.820483092 lookups/part-month
-  spans_sql_trace_1h (spans): unfolded $2.24e-05 folded $1.035e-05 saving $1.205e-05/call; break-even 0.70473029 lookups/part-month
+  maintenance spans: 8 section GET, 1 leaf PUT, 219887 leaf B over 1 part(s) = $1.3257e-05/part-month
+  maintenance logs: 8 section GET, 2 leaf PUT, 1235076 leaf B over 1 part(s) = $4.1607e-05/part-month
+  failing_cell (spans): unfolded $3.135e-05 folded $2.015e-05 (with maintenance $2.0163e-05) saving $1.12e-05/call; break-even 1.183660714 lookups/part-month
+  journey_b (logs): unfolded $5.01e-05 folded $2.72e-05 (with maintenance $2.7242e-05) saving $2.29e-05/call; break-even 1.816899563 lookups/part-month
+  journey_c_1 (logs): unfolded $4.415e-05 folded $2.38e-05 (with maintenance $2.3842e-05) saving $2.035e-05/call; break-even 2.044570025 lookups/part-month
+  journey_c_102 (logs): unfolded $4.5e-05 folded $2.38e-05 (with maintenance $2.3842e-05) saving $2.12e-05/call; break-even 1.96259434 lookups/part-month
+  journey_c_1024 (logs): unfolded $4.5e-05 folded $2.21e-05 (with maintenance $2.2142e-05) saving $2.29e-05/call; break-even 1.816899563 lookups/part-month
+  journey_c_10240 (logs): unfolded $4.84e-05 folded $2.55e-05 (with maintenance $2.5542e-05) saving $2.29e-05/call; break-even 1.816899563 lookups/part-month
+  logs_request_id_absent (logs): unfolded $2.275e-05 folded $1.275e-05 (with maintenance $1.2792e-05) saving $1e-05/call; break-even 4.1607 lookups/part-month
+  logs_request_id_present (logs): unfolded $2.275e-05 folded $1.36e-05 (with maintenance $1.3642e-05) saving $9.15e-06/call; break-even 4.547213115 lookups/part-month
+  logs_request_in_1 (logs): unfolded $2.36e-05 folded $1.275e-05 (with maintenance $1.2792e-05) saving $1.085e-05/call; break-even 3.834746544 lookups/part-month
+  logs_request_in_10 (logs): unfolded $2.21e-05 folded $1.04e-05 (with maintenance $1.0442e-05) saving $1.17e-05/call; break-even 3.556153846 lookups/part-month
+  logs_request_in_100 (logs): unfolded $2.295e-05 folded $1.295e-05 (with maintenance $1.2992e-05) saving $1e-05/call; break-even 4.1607 lookups/part-month
+  logs_tag_common (logs): unfolded $2.125e-05 folded $1.125e-05 (with maintenance $1.1292e-05) saving $1e-05/call; break-even 4.1607 lookups/part-month
+  logs_tag_rare (logs): unfolded $1.87e-05 folded $9.55e-06 (with maintenance $9.592e-06) saving $9.15e-06/call; break-even 4.547213115 lookups/part-month
+  logs_tag_sparse (logs): unfolded $2.04e-05 folded $9.55e-06 (with maintenance $9.592e-06) saving $1.085e-05/call; break-even 3.834746544 lookups/part-month
+  logs_trace_1h (logs): unfolded $2.015e-05 folded $9.3e-06 (with maintenance $9.342e-06) saving $1.085e-05/call; break-even 3.834746544 lookups/part-month
+  logs_trace_in_1 (logs): unfolded $2.24e-05 folded $1.24e-05 (with maintenance $1.2442e-05) saving $1e-05/call; break-even 4.1607 lookups/part-month
+  logs_trace_in_10 (logs): unfolded $2.72e-05 folded $1.635e-05 (with maintenance $1.6392e-05) saving $1.085e-05/call; break-even 3.834746544 lookups/part-month
+  logs_trace_in_100 (logs): unfolded $2.72e-05 folded $1.72e-05 (with maintenance $1.7242e-05) saving $1e-05/call; break-even 4.1607 lookups/part-month
+  logs_trace_norange (logs): unfolded $2.195e-05 folded $1.195e-05 (with maintenance $1.1992e-05) saving $1e-05/call; break-even 4.1607 lookups/part-month
+  logs_word_common (logs): unfolded $2.125e-05 folded $1.125e-05 (with maintenance $1.1292e-05) saving $1e-05/call; break-even 4.1607 lookups/part-month
+  logs_word_rare (logs): unfolded $1.955e-05 folded $1.125e-05 (with maintenance $1.1292e-05) saving $8.3e-06/call; break-even 5.012891566 lookups/part-month
+  logs_word_sparse (logs): unfolded $2.125e-05 folded $1.38e-05 (with maintenance $1.3842e-05) saving $7.45e-06/call; break-even 5.584832215 lookups/part-month
+  spans_in_1 (spans): unfolded $2.405e-05 folded $1.2e-05 (with maintenance $1.2013e-05) saving $1.205e-05/call; break-even 1.100165975 lookups/part-month
+  spans_in_10 (spans): unfolded $4.405e-05 folded $3.37e-05 (with maintenance $3.3713e-05) saving $1.035e-05/call; break-even 1.280869565 lookups/part-month
+  spans_in_100 (spans): unfolded $4.235e-05 folded $3.54e-05 (with maintenance $3.5413e-05) saving $6.95e-06/call; break-even 1.907482014 lookups/part-month
+  spans_lookup_1h (spans): unfolded $2.155e-05 folded $9.5e-06 (with maintenance $9.513e-06) saving $1.205e-05/call; break-even 1.100165975 lookups/part-month
+  spans_lookup_narrow (spans): unfolded $2.155e-05 folded $1.035e-05 (with maintenance $1.0363e-05) saving $1.12e-05/call; break-even 1.183660714 lookups/part-month
+  spans_lookup_norange (spans): unfolded $2.32e-05 folded $1.115e-05 (with maintenance $1.1163e-05) saving $1.205e-05/call; break-even 1.100165975 lookups/part-month
+  spans_lookup_wide (spans): unfolded $2.32e-05 folded $1.03e-05 (with maintenance $1.0313e-05) saving $1.29e-05/call; break-even 1.027674419 lookups/part-month
+  spans_sql_trace_1h (spans): unfolded $2.07e-05 folded $1.035e-05 (with maintenance $1.0363e-05) saving $1.035e-05/call; break-even 1.280869565 lookups/part-month
 
 miss row_01.wire_bytes
+miss row_02.wire_bytes
 miss row_03.probe_wire_per_object
 miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
 miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
@@ -335,3 +352,5 @@ miss row_08.logs_trace_id_leaf_pct
 miss row_08.logs_request_id_leaf_pct: key cardinality equals the row count
 dead_counter segmentsOpened journey_c_1 folded_leaves
 dead_counter segmentsOpened journey_c_10240 folded_leaves
+
+incomplete figure row_13.negative_controls_failing_on_mutant not run: mutant controls not implemented

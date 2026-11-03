@@ -532,12 +532,27 @@ python3 benchmarks/investigations/investigations_cases.py --refresh-local-smoke
 
 `bash benchmarks/investigations/investigations.test.sh`, in CI's
 `doc-scripts` job: no AWS, no server, under two minutes. It runs `bash -n`
-over every script, generator recounts at 1,000 traces (and at scale 10,
-with the block-frequency recount), the shape of `statements.toml` and
-`bands.toml`, evaluate.py on the fixture and on mutations of it (missing,
-duplicate, miss, wrong answer, a deleted catalog stamp, absent phases and
-CPU, dead counters, the IN refusal, the unsealed tail, a state absent from
-the results, exact cost and maintenance dollars), the wrong evaluators each
-of those cases must reject, and the dry runs of `run.sh` (local, s3, s3
+over every script, generator recounts at 1,000 traces and at 5,000 (where
+the logs reach 4 blocks of 8,192 rows and the needle-block recount applies,
+also at scale 10), the shape of `statements.toml` and `bands.toml` (the IN
+list caps recomputed from the complexity guard, and every band's text
+against the ADR's Acceptance table), evaluate.py on the fixture and on
+mutations of it (missing, duplicate, miss, wrong answer, a deleted catalog
+stamp, absent phases, CPU and leaf sizes, dead counters, full, partial, zero
+and too-short compaction overlap, a refusal outside the cap probes, the
+1,001-key control's pass, miss and unsupported readings, a skipped state
+and a mid-state deadline, the unsealed tail, the pending-erasure victim, a
+state absent from the results, row 3's per-object denominator, row 15's
+budget from `truth.json`, exact cost and maintenance dollars), the wrong
+evaluators each of those cases must reject (each printed with the
+evaluate.py line it flips), and the dry runs of `run.sh` (local, s3, s3
 with hits, and past the deadline), `launch.sh` (with an `aws` stub that
-fails if called) and `fetch.sh`.
+fails if called) and `fetch.sh` (including an `aws` stub that exits 255,
+which must exit 69).
+
+The box scripts target bash 3.2 as well as 5: run
+`/path/to/bash-3.2 benchmarks/investigations/investigations.test.sh` and
+every script is syntax-checked and dry-run under that bash. bash before 4.4
+treats `"${a[@]}"` of an empty array as unbound under `set -u`, so every
+array that can be empty expands as `${a[@]+"${a[@]}"}`; a lint case
+enforces it, and under 3.2 a case shows the unguarded form failing.
