@@ -281,6 +281,56 @@ class Corpus(unittest.TestCase):
         self.assertLess(counts["needlerare"], counts["needlesparse"])
         self.assertLess(counts["needlesparse"], counts["needlecommon"])
 
+    def test_needle_blocks_recount_within_20_percent(self):
+        # Item 7: tiers are ordered by blocks touched, and a recount over the
+        # written file in BLOCK_ROWS-row blocks agrees with truth within 20 %.
+        for truth, rows in ((self.truth, self.rows), (self.truth10, self.rows10)):
+            br = truth["generator"]["block_rows"]
+            nb = truth["needle_blocks"]
+            for v, want in nb.items():
+                got = len({i // br for i, r in enumerate(rows["logs"]) if r["tag"] == v})
+                self.assertLessEqual(abs(got - want), 0.2 * want, (v, got, want))
+            self.assertEqual(nb["needlerare"], 1)
+            self.assertLess(nb["needlerare"], nb["needlesparse"])
+            self.assertLess(nb["needlesparse"], nb["needlecommon"])
+            # One row per block: the planted row count equals the block count.
+            self.assertEqual(nb, truth["needles"])
+
+    def test_needle_tiers_are_one_tenth_percent_and_ten_percent_of_blocks(self):
+        spec = importlib.util.spec_from_file_location("gen_corpus", GEN)
+        g = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(g)
+        n_blocks = -(-100_000_000 // 256)
+        got = g.needle_block_counts(100_000_000)
+        self.assertEqual(got["needlerare"], 1)
+        self.assertEqual(got["needlesparse"], round(0.001 * n_blocks))
+        self.assertEqual(got["needlecommon"], round(0.10 * n_blocks))
+
+    def test_tail_corpus_plants_its_own_request_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            truth, rows = gen(d, 200, 1, 8, "--tail")
+        self.assertTrue(truth["generator"]["tail"])
+        self.assertEqual(truth["request_id"]["present"], "req-planted-tail-0001")
+        hit = [r for r in rows["logs"] if r["request_id"] == "req-planted-tail-0001"]
+        self.assertEqual(len(hit), 1)
+        self.assertFalse(any(r["request_id"] == "req-planted-present-0001" for r in rows["logs"]))
+        self.assertEqual(truth["answers"]["request_id.present"]["row_set"], [hit[0]["trace_id"]])
+
+    def test_erasure_victim_is_read_by_no_statement(self):
+        with tempfile.TemporaryDirectory() as d:
+            truth, rows = gen(d, 3000, 4, 9)
+        v = truth["erasure_victim"]
+        self.assertIsNotNone(v)
+        row = [r for r in rows["logs"] if r["request_id"] == v["request_id"]]
+        self.assertEqual(len(row), 1)
+        self.assertEqual(row[0]["trace_id"], v["trace_id"])
+        self.assertIsNone(row[0]["tag"])
+        busy = {s["trace_id"] for s in truth["saved_traces"]} | set(truth["failing_cell"]["trace_ids"])
+        busy |= {t for ids in truth["in_lists"]["trace_id"].values() for t in ids}
+        self.assertNotIn(v["trace_id"], busy)
+        self.assertNotIn(v["request_id"], {r for ids in truth["in_lists"]["request_id"].values() for r in ids})
+        self.assertNotEqual(self.hour(truth, row[0]["ts"]), truth["failing_cell"]["hour"])
+
     def test_saved_trace_answers_recount(self):
         for n, s in enumerate(self.truth["saved_traces"]):
             ids = sorted(r["span_id"] for r in self.rows["spans"] if r["trace_id"] == s["trace_id"])

@@ -50,6 +50,7 @@ NEEDLE_SPARSE = "needlesparse"
 NEEDLE_COMMON = "needlecommon"
 REQUEST_ID_PRESENT = "req-planted-present-0001"
 REQUEST_ID_ABSENT = "req-planted-absent-0001"
+REQUEST_ID_TAIL = "req-planted-tail-0001"
 SAVED_TRACES = 40
 IN_SIZES = (1, 10, 100, 1000)
 JOURNEY_TIERS = (1, 102, 1024, 10240)
@@ -92,27 +93,35 @@ def draw_traces(rng, n, hours, start_hour, seen_ids):
     return traces
 
 
-def plan_needles(rng, n_rows):
-    """Row indices for the three needle tiers, disjoint by construction.
-
-    common: whole BLOCK_ROWS-row runs covering 10 % of the generator's blocks
-    (at least one); rare: exactly one row; sparse: 0.1 % of rows, at least
-    two, each outside the common blocks.
-    """
-    if n_rows < 4:
-        return {NEEDLE_RARE: set(), NEEDLE_SPARSE: set(), NEEDLE_COMMON: set()}
+def needle_block_counts(n_rows):
+    """Blocks each needle tier touches: rare 1, sparse 0.1 % of the
+    generator's BLOCK_ROWS-row blocks (at least 2), common 10 % (at least one
+    more than sparse), so single < sparse < common whenever the corpus has
+    that many blocks."""
     n_blocks = math.ceil(n_rows / BLOCK_ROWS)
-    n_common = max(1, round(0.10 * n_blocks))
-    if n_common >= n_blocks:
-        n_common = n_blocks - 1
-    common_blocks = rng.sample(range(n_blocks), n_common) if n_common > 0 else []
-    common = set()
-    for b in common_blocks:
-        common.update(range(b * BLOCK_ROWS, min((b + 1) * BLOCK_ROWS, n_rows)))
-    free = [r for r in range(n_rows) if r not in common]
-    n_sparse = min(max(2, round(0.001 * n_rows)), len(free) - 1)
-    picked = rng.sample(free, n_sparse + 1)
-    return {NEEDLE_RARE: {picked[0]}, NEEDLE_SPARSE: set(picked[1:]), NEEDLE_COMMON: common}
+    sparse = min(max(2, round(0.001 * n_blocks)), n_blocks)
+    common = min(max(sparse + 1, round(0.10 * n_blocks)), n_blocks)
+    return {NEEDLE_RARE: min(1, n_blocks), NEEDLE_SPARSE: sparse, NEEDLE_COMMON: common}
+
+
+def plan_needles(rng, n_rows):
+    """Row indices for the three needle tiers: one row in each of the tier's
+    blocks (needle_block_counts), drawn independently per tier, no row
+    carrying two needles."""
+    out = {NEEDLE_RARE: set(), NEEDLE_SPARSE: set(), NEEDLE_COMMON: set()}
+    if n_rows < BLOCK_ROWS:
+        return out
+    n_blocks = math.ceil(n_rows / BLOCK_ROWS)
+    used = set()
+    for value, k in needle_block_counts(n_rows).items():
+        for b in sorted(rng.sample(range(n_blocks), k)):
+            lo, hi = b * BLOCK_ROWS, min((b + 1) * BLOCK_ROWS, n_rows)
+            r = rng.randrange(lo, hi)
+            while r in used:
+                r = rng.randrange(lo, hi)
+            used.add(r)
+            out[value].add(r)
+    return out
 
 
 class Sink:
@@ -213,12 +222,12 @@ def request_id_of(tid, l):
     return f"req-{tid[:16]}-{l:03d}"
 
 
-def emit_logs(rng, tr, tid, logs_per_trace, logs_sink, row_base, needle_of, present_row):
+def emit_logs(rng, tr, tid, logs_per_trace, logs_sink, row_base, needle_of, present_row, present_id=REQUEST_ID_PRESENT):
     for l in range(logs_per_trace):
         r = row_base + l
         ts = tr.start_ns + rng.randrange(LOG_OFFSET_MAX_NS)
         dur = rng.randrange(1, 5000)
-        rid = REQUEST_ID_PRESENT if r == present_row else request_id_of(tid, l)
+        rid = present_id if r == present_row else request_id_of(tid, l)
         body = BODY_TEMPLATES[rng.randrange(len(BODY_TEMPLATES))].format(rid=rid, dur=dur, svc=SERVICES[tr.service])
         tag = needle_of.get(r)
         if tag is not None:
@@ -318,11 +327,19 @@ def main(argv):
     ap.add_argument(
         "--noise-only",
         action="store_true",
-        help="write unplanted rows only (the mixed state's extra hour); truth.json lists no planted keys",
+        help="write unplanted rows only; truth.json lists no planted keys",
+    )
+    ap.add_argument(
+        "--tail",
+        action="store_true",
+        help=f"the mixed state's extra hour: planted like the base corpus, with {REQUEST_ID_TAIL} as its present request id",
     )
     args = ap.parse_args(argv)
     if args.traces < 1 or args.hours < 1 or args.spans_per_trace < 1 or args.logs_per_trace < 1:
         ap.error("--traces, --hours, --spans-per-trace and --logs-per-trace must be positive")
+    if args.tail and args.noise_only:
+        ap.error("--tail plants keys; --noise-only plants none")
+    present_id = REQUEST_ID_TAIL if args.tail else REQUEST_ID_PRESENT
     fmt = resolve_format(args.format)
     os.makedirs(args.out, exist_ok=True)
 
@@ -378,7 +395,8 @@ def main(argv):
         if take_base:
             tr = base[bi]
             tid = emit_trace(rng, tr, args.spans_per_trace, spans_sink, saved_spans if bi in saved_set else None)
-            emit_logs(rng, tr, tid, args.logs_per_trace, logs_sink, bi * args.logs_per_trace, needle_of, present_row)
+            emit_logs(rng, tr, tid, args.logs_per_trace, logs_sink, bi * args.logs_per_trace, needle_of, present_row,
+                      present_id)
             tids.append(tid)
             bi += 1
         else:
@@ -430,6 +448,22 @@ def main(argv):
     answers["request_id.absent"] = answer(0, row_set=[])
     for value, rows in needles.items():
         answers[f"needle.{value}"] = answer(1, value=len(rows))
+    needle_blocks = {v: len({r // BLOCK_ROWS for r in rows}) for v, rows in needles.items()}
+
+    # The erasure_in_flight state's victim: one log row no statement reads, so
+    # a pending erasure leaves every answer as truth.json gives it.
+    victim = None
+    if not args.noise_only:
+        busy_traces = set(saved_idx) | set(planted)
+        busy_traces |= {i for i, t in enumerate(base) if hour_of(t.start_ns, args.start_hour) == failing_hour}
+        busy_tids = {tids[i] for i in busy_traces} | {t for ids in in_lists["trace_id"].values() for t in ids}
+        busy_rids = {r for ids in in_lists["request_id"].values() for r in ids}
+        for r in range(n_log_rows):
+            tid = tids[r // lpt]
+            rid = request_id_of(tid, r % lpt)
+            if r != present_row and r not in needle_of and tid not in busy_tids and rid not in busy_rids:
+                victim = {"request_id": rid, "trace_id": tid}
+                break
 
     # Journey C build sides: the first k root spans of the failing hour.
     hour_starts = [base[i].start_ns for i in in_hour]
@@ -458,6 +492,7 @@ def main(argv):
             "block_rows": BLOCK_ROWS,
             "format": fmt,
             "noise_only": args.noise_only,
+            "tail": args.tail,
         },
         "rows_written": {"spans": spans_sink.count, "logs": logs_sink.count},
         "unplanted_rows": {"spans": len(noise) * spt, "logs": len(noise) * lpt, "noise_traces": len(noise)},
@@ -473,7 +508,9 @@ def main(argv):
         },
         "saved_traces": saved,
         "needles": {v: len(r) for v, r in needles.items()},
-        "request_id": {"present": REQUEST_ID_PRESENT, "absent": REQUEST_ID_ABSENT},
+        "needle_blocks": needle_blocks,
+        "erasure_victim": victim,
+        "request_id": {"present": present_id, "absent": REQUEST_ID_ABSENT},
         "in_lists": in_lists,
         "journey_c": journey,
         "answers": answers,
