@@ -184,7 +184,7 @@ async fn start_ingest_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server
             write: 2,
             write_inline_floor_bytes: DEFAULT_INLINE_FLOOR_BYTES,
         },
-        cpu_shed: Default::default(),
+        ingest_hold: Default::default(),
         max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: Duration::from_secs(3600),

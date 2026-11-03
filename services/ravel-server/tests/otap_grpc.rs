@@ -103,7 +103,7 @@ async fn start_test_server() -> ravel_server::Running {
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
-        cpu_shed: Default::default(),
+        ingest_hold: Default::default(),
         max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
@@ -191,7 +191,7 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
-        cpu_shed: Default::default(),
+        ingest_hold: Default::default(),
         max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
@@ -221,6 +221,16 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
 async fn start_test_server_fault(
     store: Arc<dyn ObjectStoreBackend>,
     limit: IngestConcurrencyLimit,
+) -> ravel_server::Running {
+    start_test_server_fault_with_hold(store, limit, Default::default()).await
+}
+
+/// [`start_test_server_fault`] with the ADR-3718 ingest hold configured as
+/// `ingest_hold` (its default, max wait 0, leaves the gate off).
+async fn start_test_server_fault_with_hold(
+    store: Arc<dyn ObjectStoreBackend>,
+    limit: IngestConcurrencyLimit,
+    ingest_hold: ravel_server::config::IngestHoldConfig,
 ) -> ravel_server::Running {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
@@ -277,7 +287,7 @@ async fn start_test_server_fault(
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
-        cpu_shed: Default::default(),
+        ingest_hold,
         max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
@@ -1034,75 +1044,88 @@ async fn scrape_counter(http_base: &str, prefix: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// ADR-3718's CPU-aware shed must reach OTAP batches, not just unary OTLP
+/// ADR-3718's flush-backlog hold must reach OTAP batches, not just unary OTLP
 /// exports: `GrpcIngestAdmissionService` takes no permit for the OTAP arm (it
 /// passes the stream straight through, since each batch admits itself inside
-/// `process_batch`), so the draw at the gRPC layer never runs for it, and the
+/// `process_batch`), so the hold at the gRPC layer never runs for it, and the
 /// only place left to apply ADR-3718 is the per-batch `try_admit` site itself.
-/// With `p` pinned to 1.0, a batch on a fresh stream is shed `RESOURCE_EXHAUSTED`
-/// with the CPU-shed message, ingests nothing, and -- like the in-flight-ceiling
-/// shed above -- tears the stream down so a queued second batch never gets a
-/// status. `ravel_ingest_cpu_shed_total` counts the refusal.
+/// Forced congested with a 200 ms max wait, a batch on a fresh stream is
+/// refused `RESOURCE_EXHAUSTED` with the hold message, ingests nothing, and --
+/// like the in-flight-ceiling shed above -- tears the stream down so a queued
+/// second batch never gets a status. The refused hold counter counts it.
 ///
 /// Drives the real `ArrowMetricsService::arrow_metrics` handler over gRPC. To
 /// watch this test fail (proving the gap it closes, not just a passing
-/// wire-up), delete the `cpu_shed().draw()` block `process_batch` added right
-/// after its `try_admit` block: the shed batch would then be admitted and ack
-/// OK instead of `RESOURCE_EXHAUSTED`.
+/// wire-up), delete the `ingest_hold().hold()` block `process_batch` runs
+/// right after its `try_admit` block: the batch would then be admitted and
+/// ack OK instead of `RESOURCE_EXHAUSTED`.
 #[tokio::test]
-async fn otap_batch_is_shed_by_the_cpu_shed() {
+async fn otap_batch_is_refused_by_the_ingest_hold() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let running = start_test_server_fault(store.clone(), IngestConcurrencyLimit::Unlimited).await;
+    let running = start_test_server_fault_with_hold(
+        store.clone(),
+        IngestConcurrencyLimit::Unlimited,
+        ravel_server::config::IngestHoldConfig {
+            queued_flushes: None,
+            max_wait: std::time::Duration::from_millis(200),
+        },
+    )
+    .await;
     let grpc_addr = running.grpc_addr.expect("gateway binds gRPC");
     let http_base = format!("http://{}", running.http_addr);
 
-    running.cpu_shed.set_for_test(1.0);
+    running.ingest_hold.force_for_test(Some(true));
 
     let ts = now_ns();
-    let shed_statuses = open_stream_send(
+    let refused_statuses = open_stream_send(
         grpc_addr,
-        otap_stream_batches(&[&["cpu_shed_a"], &["cpu_shed_b"]], ts),
+        otap_stream_batches(&[&["ingest_hold_a"], &["ingest_hold_b"]], ts),
     )
     .await;
     assert_eq!(
-        shed_statuses.len(),
+        refused_statuses.len(),
         1,
-        "a CPU shed must tear the stream down: the second batch must never get a status, got {shed_statuses:?}"
+        "a hold refusal must tear the stream down: the second batch must never get a status, got {refused_statuses:?}"
     );
     assert_eq!(
-        shed_statuses[0].status_code,
+        refused_statuses[0].status_code,
         StatusCode::ResourceExhausted as i32,
-        "a CPU-shed batch must be RESOURCE_EXHAUSTED: {}",
-        shed_statuses[0].status_message
+        "a held-then-refused batch must be RESOURCE_EXHAUSTED: {}",
+        refused_statuses[0].status_message
     );
     assert_eq!(
-        shed_statuses[0].status_message, "node is CPU-saturated, shedding ingest requests",
-        "shed message must be the CPU-shed reason, not another RESOURCE_EXHAUSTED \
+        refused_statuses[0].status_message,
+        "node flush backlog stayed over its bound for the ingest hold's max wait",
+        "the message must be the hold's reason, not another RESOURCE_EXHAUSTED \
          (in-flight ceiling, byte rate, buffer budget): {:?}",
-        shed_statuses[0].status_message
+        refused_statuses[0].status_message
     );
     assert_eq!(
-        scrape_counter(&http_base, "ravel_ingest_cpu_shed_total").await,
+        scrape_counter(
+            &http_base,
+            "ravel_ingest_head_hold_total{mode=\"all\",outcome=\"refused\"}"
+        )
+        .await,
         1,
-        "the CPU-shed counter must count the batch's refusal"
+        "the refused hold counter must count the batch's refusal"
     );
 
-    // With `p` back at 0, the next export is admitted on its own merits.
-    running.cpu_shed.set_for_test(0.0);
-    let after = send_one_batch(grpc_addr, otap_gauge_batch("cpu_shed_after", ts)).await;
+    // Once the backlog clears, the next export is admitted on its own merits.
+    running.ingest_hold.force_for_test(Some(false));
+    let after = send_one_batch(grpc_addr, otap_gauge_batch("ingest_hold_after", ts)).await;
     assert_eq!(
         after.status_code,
         StatusCode::Ok as i32,
-        "once p drops back to 0, the next OTAP export must be admitted: {}",
+        "once the node is no longer congested, the next OTAP export must be admitted: {}",
         after.status_message
     );
 
-    // The shed batch ingested nothing: only the one admitted batch ("after")
-    // ever became durable.
+    // The refused batch ingested nothing: only the one admitted batch
+    // ("after") ever became durable.
     assert_eq!(
         durable_metric_object_count(store.as_ref()).await,
         1,
-        "the shed batch must write nothing durable: only the admitted batch's flush persists"
+        "the refused batch must write nothing durable: only the admitted batch's flush persists"
     );
 
     running.shutdown().await.expect("graceful shutdown");
