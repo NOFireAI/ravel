@@ -828,6 +828,7 @@ mod tests {
             specs(&["dur:i64", "dur:str"]), // conflicting types
             specs(&["body:str"]),           // fixed-column collision
             specs(&[":i64"]),               // empty key
+            specs(&["__ravel_x:str"]),      // reserved prefix
             specs(&["dur"]),                // no type
             specs(&["dur:f64"]),            // deferred type
         ] {

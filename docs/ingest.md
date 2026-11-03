@@ -88,33 +88,51 @@ it. A refusal keeps its status and message: `RESOURCE_EXHAUSTED` for a shed,
 and `UNAUTHENTICATED` with "invalid or missing tenant credentials" for bad
 credentials on gRPC.
 
-A second, CPU-aware shed draws right between the in-flight permit and the
-credential check (ADR-3718): a background detector samples the process's own
-CPU use and the ingest routers' deferred-flush-trigger rate every 100 ms, and
-while both are elevated at once (CPU at or above `--ingest-cpu-shed-threshold`,
-default 0.95 of the resolved core count, and at least one deferred trigger in
-the last second) it raises a shed fraction `p`, capped at
-`--ingest-cpu-shed-max` (default 0.9). Every admitted request then draws once
-against the published `p`; CPU use alone never trips it; see ADR-3718 D1/D2
-for the exact three-way rule that moves `p` and the hold band that lets it
-settle instead of cycling. A drawn refusal goes through the same
-`refuse_from_head` path and the same drain caps as the in-flight shed above
-(`ravel_ingest_head_refusal_undrained_total` counts it the same way), with the
-in-flight permit released first, so an unauthenticated request that arrives
-while shedding also gets 429, not 401: the draw runs before tenant resolution.
-Refusals count on `ravel_ingest_cpu_shed_total{mode}`; the current `p` exports
-as the gauge `ravel_ingest_cpu_shed_fraction`. `--ingest-cpu-shed-threshold 0`
-disables the detector entirely (today's pre-ADR-3718 behavior, no background
-task spawned).
+A head hold runs right between the in-flight permit and the credential check
+(ADR-3718, flush-backlog hold amendment). A background detector samples each
+ingest router's queued flush count and the routers' deferred flush triggers
+every 100 ms, and marks the node congested while any one router's queued count
+is above that router's bound and at least 1 trigger was deferred across all
+routers over the last full second (10 samples; a shorter window is never
+congested). Neither signal decides alone. A healthy node at a fixed 160k on
+ADR-3718's benchmark defers triggers with its queue at its cap, and a deferral
+can also be a per-tenant share refusal (ADR-2708 D3). A router's queued count
+can exceed its cap with no backlog, since a tenant with no flush in flight on
+a shard, and a buffer past its memory or object backstop, spawn past the cap.
+A router's bound is its own queued-flush cap, its shard count times
+`--max-queued-flushes` (32 at the defaults of 4 shards and 8), unless `--ingest-hold-queued-flushes` is set, which replaces
+every router's bound. Routers are not summed against one bound: the
+`ravel_ingest_queued_flushes` gauge is that sum, and a node ingesting several
+signals can carry more queued flushes than any one router's bound with no
+router over its own. A request that
+arrives while the node is not congested goes on at once. One that arrives
+while it is congested waits, keeping its in-flight permit, re-reading the flag
+every 10 ms for up to `--ingest-hold-max-wait` (default 1s, at most 20s, the
+listener-join share of the default `--shutdown-timeout`): it goes on if the
+congestion clears in time, and is refused otherwise. A refusal goes through
+the same `refuse_from_head` path and the same drain caps as the in-flight shed
+above (`ravel_ingest_head_refusal_undrained_total` counts it the same way),
+with the in-flight permit released first, and is answered 429 with
+`Retry-After: 1` (gRPC `RESOURCE_EXHAUSTED`) and the message "node flush
+backlog stayed over its bound for the ingest hold's max wait". The hold runs
+before tenant resolution, so an unauthenticated request held to the max wait
+also gets 429, not 401. Because a held request keeps its permit,
+`--max-inflight-ingest-requests` bounds how many are held at once.
+Held requests count on `ravel_ingest_head_hold_total{mode,outcome}`
+(`outcome` is `admitted` or `refused`) and their time held on the histogram
+`ravel_ingest_head_hold_seconds{mode}`; a request that is not held counts
+nothing. The gauge `ravel_ingest_head_congested{mode}` reads 1 while requests
+would be held. `--ingest-hold-max-wait 0` turns the hold off entirely, with no
+background task spawned.
 
-OTAP batches draw against the same `p` too, but not at this gRPC-layer point:
+OTAP batches are held too, but not at this gRPC-layer point:
 `GrpcIngestAdmissionService` takes no permit for the OTAP arm (see the OTAP
-paragraph below), so its own draw is skipped for every OTAP request. The draw
+paragraph below), so its own hold is skipped for every OTAP request. The hold
 instead runs once per `BatchArrowRecords`, right after that batch's own
 in-flight permit (`process_batch` in `otap_grpc.rs`), the only place left
-where ADR-3718 can reach an OTAP batch. A drawn batch is answered
-`RESOURCE_EXHAUSTED` with the same message and counts on the same
-`ravel_ingest_cpu_shed_total`, and ends the stream, like an in-flight-ceiling
+where ADR-3718 can reach an OTAP batch. A batch held to the max wait is
+answered `RESOURCE_EXHAUSTED` with the same message, counts on the same
+`ravel_ingest_head_hold_total`, and ends the stream, like an in-flight-ceiling
 shed.
 
 An HTTP/1 server that answers and closes a connection with request bytes still

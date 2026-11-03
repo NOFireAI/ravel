@@ -87,14 +87,12 @@ async fn main() -> anyhow::Result<()> {
         "CPU gate permits resolved"
     );
 
-    // ADR-3718: CPU-aware ingest admission settings, scaled by the same host
-    // profile. `threshold == 0.0` means shedding stays off, same as today.
-    let cpu_shed = cli.resolve_cpu_shed(host);
+    // ADR-3718: the flush-backlog head hold. A zero max wait turns it off.
+    let ingest_hold = cli.resolve_ingest_hold();
     tracing::info!(
-        threshold = cpu_shed.threshold,
-        max = cpu_shed.max,
-        cores = cpu_shed.cores,
-        "CPU-aware ingest admission (ADR-3718) resolved"
+        queued_flushes_override = ?ingest_hold.queued_flushes,
+        max_wait_ms = ingest_hold.max_wait.as_millis() as u64,
+        "ingest head hold (ADR-3718) resolved"
     );
 
     // OTAP (ADR-0011) is opt-in even in a build with the `otap` feature: the
@@ -531,12 +529,13 @@ async fn main() -> anyhow::Result<()> {
         "POSTINGS indexed-field defaults resolved"
     );
     // Per-tenant declared typed attribute columns for the logs SQL table
-    // (ADR-0090 decision 1). Validated here, on the same rules a durable write
-    // is held to (ravel_catalog::validate_typed_attr_columns), so an empty key,
-    // a duplicate, a conflicting type, or a collision with a fixed logs column
-    // fails startup rather than silently declaring a schema the operator did
-    // not ask for. `ravel_server::start` wraps this in the cache-aside overlay
-    // that resolves each query's declaration.
+    // (ADR-0090 decision 1). Validated here by the gate for new operator input
+    // (ravel_catalog::validate_typed_attr_columns), so an empty key, a
+    // duplicate, a conflicting type, a collision with a fixed logs column, or a
+    // key starting with the reserved `__ravel_` prefix fails startup rather
+    // than silently declaring a schema the operator did not ask for.
+    // `ravel_server::start` wraps this in the cache-aside overlay that
+    // resolves each query's declaration.
     let typed_attr_columns = ravel_server::typed_attr_config::TypedAttrColumnConfig::from_policy(
         cli.parse_typed_attr_column_policy()?,
     )
@@ -680,7 +679,7 @@ async fn main() -> anyhow::Result<()> {
         cache_dir: cli.cache_dir.clone(),
         catalog_resolve_concurrency: Some(performance.catalog_resolve_concurrency),
         cpu_gate_permits,
-        cpu_shed,
+        ingest_hold,
         ingest_concurrency_limit: cli
             .parse_ingest_concurrency_limit()
             .context("failed to parse --max-inflight-ingest-requests")?,

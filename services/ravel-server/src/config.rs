@@ -457,31 +457,34 @@ fn parse_cache_bulk_share(value: &str) -> Result<f64, String> {
     }
 }
 
-/// Parses `--ingest-cpu-shed-threshold` (ADR-3718 D2/D3): `0` disables CPU-aware
-/// shedding entirely, and any other value must be strictly above the 0.05
-/// release-level gap and at most `1.0`, since a smaller gap would make the
-/// release level negative.
-fn parse_ingest_cpu_shed_threshold(value: &str) -> Result<f64, String> {
-    let threshold: f64 = value.parse().map_err(|err| format!("{err}"))?;
-    if threshold == 0.0 {
-        return Ok(0.0);
+/// Parses `--ingest-hold-queued-flushes` (ADR-3718, flush-backlog hold
+/// amendment): a flush count of at least 1, since a bound of 0 would read any
+/// one queued flush as congestion.
+fn parse_ingest_hold_queued_flushes(value: &str) -> Result<u64, String> {
+    let bound: u64 = value.parse().map_err(|err| format!("{err}"))?;
+    if bound == 0 {
+        return Err("must be at least 1".to_string());
     }
-    if threshold > 0.05 && threshold <= 1.0 {
-        Ok(threshold)
-    } else {
-        Err("must be 0 (disabled) or strictly greater than 0.05 and at most 1".to_string())
-    }
+    Ok(bound)
 }
 
-/// Parses `--ingest-cpu-shed-max` (ADR-3718 D2): the cap on the shed fraction
-/// `p`, between 0 and 1 inclusive.
-fn parse_ingest_cpu_shed_max(value: &str) -> Result<f64, String> {
-    let cap: f64 = value.parse().map_err(|err| format!("{err}"))?;
-    if (0.0..=1.0).contains(&cap) {
-        Ok(cap)
-    } else {
-        Err("must be between 0 and 1".to_string())
+/// The longest `--ingest-hold-max-wait` accepted: the listener-join slice of
+/// the default `--shutdown-timeout` (four fifths of 25 s), so a request held
+/// when shutdown starts is answered before the listener join is abandoned.
+pub const INGEST_HOLD_MAX_WAIT_LIMIT: Duration = Duration::from_secs(20);
+
+/// Parses `--ingest-hold-max-wait` (ADR-3718, flush-backlog hold amendment):
+/// a humantime duration of at most [`INGEST_HOLD_MAX_WAIT_LIMIT`], where `0`
+/// turns the hold off.
+fn parse_ingest_hold_max_wait(value: &str) -> Result<Duration, String> {
+    let wait = humantime::parse_duration(value).map_err(|err| err.to_string())?;
+    if wait > INGEST_HOLD_MAX_WAIT_LIMIT {
+        return Err(format!(
+            "must be at most {}",
+            humantime::format_duration(INGEST_HOLD_MAX_WAIT_LIMIT)
+        ));
     }
+    Ok(wait)
 }
 
 /// Parses `--cache-bulk-scan-min-bytes`: a positive byte count. `0` would read
@@ -3097,44 +3100,38 @@ pub struct Cli {
     )]
     pub cpu_gate_write_inline_floor_bytes: u64,
 
-    /// The 1-second rolling-average process CPU fraction (of resolved cores,
-    /// ADR-3718 D3), at or above which the node counts as saturated for
-    /// ADR-3718's CPU-aware ingest admission, PROVIDED the 1-second
-    /// rolling-average rate of deferred flush triggers across every ingest
-    /// router is also above zero: CPU alone never trips shedding, since a
-    /// clean ceiling run can sit at over 90% CPU with no backlog at all. Once
-    /// saturated, the shed fraction `p` (the probability a new ingest request
-    /// is refused at the head, before tenant resolution) rises by 0.05 per
-    /// 100ms sample, capped at `--ingest-cpu-shed-max`; `p` holds while CPU
-    /// stays at or above `threshold - 0.05` even if deferrals have cleared
-    /// (closing the gap where a request would otherwise flap in and out of
-    /// shedding as deferrals momentarily hit zero); below that it decays by
-    /// 10% of itself per sample, snapping to exactly 0 under 0.01. Default
-    /// 0.95 is tuned to this scaling so it needs no manual adjustment from
-    /// 8 to 16+ vCPU hosts; `0` disables CPU-aware shedding entirely
-    /// (today's behavior, with no detector task spawned). Must be `0` or
-    /// strictly greater than 0.05 and at most 1; refused otherwise, not
-    /// clamped. The resolved threshold and core count are logged at startup
-    /// beside the other derived defaults.
+    /// Overrides every ingest router's queued-flush bound for ADR-3718's head
+    /// hold. The node counts as congested while any one router's queued
+    /// flushes (flush tasks spawned and not yet reaped, which `/metrics`
+    /// sums across routers as `ravel_ingest_queued_flushes`) exceed that
+    /// router's bound and at least 1 flush trigger was deferred across all
+    /// routers over the last full second. While congested, an admitted
+    /// ingest request waits at the head, holding its in-flight permit, for
+    /// the backlog to clear, up to `--ingest-hold-max-wait`. Unset, each
+    /// router's bound is its own queued-flush cap: its shard count times
+    /// `--max-queued-flushes` (32 at the default 4 shards and 8 queued
+    /// flushes). When set, must be at least 1.
     #[arg(
-        long = "ingest-cpu-shed-threshold",
-        value_name = "FRACTION",
-        default_value_t = 0.95,
-        value_parser = parse_ingest_cpu_shed_threshold
+        long = "ingest-hold-queued-flushes",
+        value_name = "COUNT",
+        value_parser = parse_ingest_hold_queued_flushes
     )]
-    pub ingest_cpu_shed_threshold: f64,
+    pub ingest_hold_queued_flushes: Option<u64>,
 
-    /// The cap on ADR-3718's CPU-aware ingest admission shed fraction `p`:
-    /// however long the node stays saturated, at most this fraction of
-    /// incoming ingest requests is ever refused at the head. Default 0.9.
-    /// Must be between 0 and 1 inclusive; refused otherwise.
+    /// The longest an admitted ingest request waits at the head while the
+    /// node is congested (ADR-3718's head hold), as a humantime duration
+    /// (e.g. `1s`, `500ms`). A request still congested when it runs out is
+    /// refused with 429 and `Retry-After: 1` (gRPC `RESOURCE_EXHAUSTED`).
+    /// Default 1s, at most 20s (the listener-join share of the default
+    /// `--shutdown-timeout`). `0` turns the hold off, and no detector task is
+    /// spawned.
     #[arg(
-        long = "ingest-cpu-shed-max",
-        value_name = "FRACTION",
-        default_value_t = 0.9,
-        value_parser = parse_ingest_cpu_shed_max
+        long = "ingest-hold-max-wait",
+        value_name = "DURATION",
+        default_value = "1s",
+        value_parser = parse_ingest_hold_max_wait
     )]
-    pub ingest_cpu_shed_max: f64,
+    pub ingest_hold_max_wait: Duration,
 
     /// Disables every ADR-0046 read cache in the process entirely: the query
     /// fetcher cache (`store::build_cache`) and the catalog's byte cache
@@ -4888,32 +4885,27 @@ impl Default for CpuGatePermits {
     }
 }
 
-/// The resolved ADR-3718 CPU-aware ingest admission settings, from
-/// [`Cli::resolve_cpu_shed`]. `Default` is `threshold: 0.0` (disabled), the
-/// one-core-equivalent default a test building a `ServerConfig` by hand gets,
-/// matching the stock no-shedding posture of every other admission ceiling's
-/// `Default` in this crate.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CpuShedConfig {
-    /// `--ingest-cpu-shed-threshold`: the 1-second rolling average CPU
-    /// fraction (of resolved cores) at or above which the node counts as
-    /// saturated, provided deferred flushes are also above zero (ADR-3718
-    /// D1). `0.0` disables shedding entirely.
-    pub threshold: f64,
-    /// `--ingest-cpu-shed-max`: the cap on the shed fraction `p` (ADR-3718
-    /// D2).
-    pub max: f64,
-    /// The resolved core count the CPU signal is divided by (ADR-3718 D3),
-    /// from [`HostProfile::cores`].
-    pub cores: usize,
+/// The resolved ADR-3718 head hold settings, from
+/// [`Cli::resolve_ingest_hold`]. `Default` has `max_wait: 0` (off), the
+/// posture a test building a `ServerConfig` by hand gets, matching the stock
+/// no-shedding posture of every other admission ceiling's `Default` in this
+/// crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestHoldConfig {
+    /// `--ingest-hold-queued-flushes`: when set, the queued-flush bound every
+    /// ingest router is held to in place of its own queued-flush cap (shard
+    /// count times `--max-queued-flushes`).
+    pub queued_flushes: Option<u64>,
+    /// `--ingest-hold-max-wait`: the longest a request is held while
+    /// congested. Zero turns the hold off and spawns no detector.
+    pub max_wait: Duration,
 }
 
-impl Default for CpuShedConfig {
+impl Default for IngestHoldConfig {
     fn default() -> Self {
-        CpuShedConfig {
-            threshold: 0.0,
-            max: 0.9,
-            cores: 1,
+        IngestHoldConfig {
+            queued_flushes: None,
+            max_wait: Duration::ZERO,
         }
     }
 }
@@ -7257,12 +7249,15 @@ impl Cli {
     ///
     /// This resolves the flag *syntax* and the type spelling; the declaration
     /// rules (empty key, duplicate key, the same key with two types, a
-    /// collision with one of the nine fixed logs SQL columns) are checked by
+    /// collision with one of the nine fixed logs SQL columns, a key starting
+    /// with the reserved `__ravel_` prefix) are checked by
     /// [`TypedAttrColumnConfig::from_policy`](crate::typed_attr_config::TypedAttrColumnConfig::from_policy),
-    /// which calls `ravel_catalog::validate_typed_attr_columns` -- the same
-    /// function guarding a durable write -- so the flags and the durable record
-    /// are held to identical rules. `main` calls both, so any violation fails
-    /// startup, never a silent partial parse. The same deferral of validation to
+    /// which calls `ravel_catalog::validate_typed_attr_columns`, the gate for
+    /// new operator input. A durable write applies the same rules with one
+    /// difference: it keeps a reserved key the record it replaces already
+    /// declares, so a record stored before the prefix rule can still be
+    /// rewritten. `main` calls both, so any violation fails startup, never a
+    /// silent partial parse. The same deferral of validation to
     /// `from_policy` that `parse_indexed_field_policy` uses.
     ///
     /// A key may itself contain `:` (the type is split off the right), but a
@@ -7836,15 +7831,12 @@ impl Cli {
         }
     }
 
-    /// Resolve the ADR-3718 CPU-aware ingest admission settings: both flags
-    /// verbatim (their value parsers already enforce the legal ranges), plus
-    /// `host`'s resolved core count as the CPU signal's divisor (ADR-3718
-    /// D3).
-    pub fn resolve_cpu_shed(&self, host: HostProfile) -> CpuShedConfig {
-        CpuShedConfig {
-            threshold: self.ingest_cpu_shed_threshold,
-            max: self.ingest_cpu_shed_max,
-            cores: host.cores,
+    /// Resolve the ADR-3718 head hold settings: both flags verbatim, since
+    /// their value parsers already enforce the legal ranges.
+    pub fn resolve_ingest_hold(&self) -> IngestHoldConfig {
+        IngestHoldConfig {
+            queued_flushes: self.ingest_hold_queued_flushes,
+            max_wait: self.ingest_hold_max_wait,
         }
     }
 
@@ -22884,50 +22876,79 @@ mod tests {
         }
     }
 
-    /// ADR-3718 D2/D3: `0` disables the detector, and any other value must
-    /// clear the 0.05 release-level gap and stay at or below 1.
     #[test]
-    fn ingest_cpu_shed_threshold_accepts_zero_and_the_valid_range() {
-        assert_eq!(
-            parse_ingest_cpu_shed_threshold("0").expect("0 disables"),
-            0.0
-        );
-        assert_eq!(
-            parse_ingest_cpu_shed_threshold("0.06").expect("just above the gap"),
-            0.06
-        );
-        assert_eq!(
-            parse_ingest_cpu_shed_threshold("0.95").expect("within range"),
-            0.95
-        );
-        assert_eq!(
-            parse_ingest_cpu_shed_threshold("1").expect("the inclusive upper bound"),
-            1.0
-        );
-    }
-
-    #[test]
-    fn ingest_cpu_shed_threshold_rejects_the_gap_boundary_and_out_of_range_values() {
-        for value in ["0.05", "1.01", "-0.1", "NaN"] {
-            parse_ingest_cpu_shed_threshold(value).expect_err(value);
-        }
-    }
-
-    /// ADR-3718 D2: the shed-fraction cap is a plain `[0, 1]` range, with no
-    /// release-level gap (unlike the threshold above).
-    #[test]
-    fn ingest_cpu_shed_max_accepts_the_closed_unit_range() {
-        for value in ["0", "0.05", "0.06", "0.95", "1"] {
-            let parsed =
-                parse_ingest_cpu_shed_max(value).unwrap_or_else(|err| panic!("{value}: {err}"));
-            assert_eq!(parsed, value.parse::<f64>().expect("test value parses"));
+    fn ingest_hold_queued_flushes_accepts_one_and_above() {
+        for (value, expected) in [("1", 1), ("16", 16), ("100000", 100_000)] {
+            assert_eq!(
+                parse_ingest_hold_queued_flushes(value)
+                    .unwrap_or_else(|err| panic!("{value}: {err}")),
+                expected
+            );
         }
     }
 
     #[test]
-    fn ingest_cpu_shed_max_rejects_out_of_range_and_non_numeric_values() {
-        for value in ["1.01", "-0.1", "NaN"] {
-            parse_ingest_cpu_shed_max(value).expect_err(value);
+    fn ingest_hold_queued_flushes_rejects_zero_negative_and_non_numeric_values() {
+        for value in ["0", "-1", "1.5", "sixteen", ""] {
+            parse_ingest_hold_queued_flushes(value).expect_err(value);
         }
+    }
+
+    #[test]
+    fn ingest_hold_max_wait_accepts_zero_and_humantime_durations() {
+        for (value, expected) in [
+            ("0", Duration::ZERO),
+            ("0s", Duration::ZERO),
+            ("200ms", Duration::from_millis(200)),
+            ("1s", Duration::from_secs(1)),
+            ("20s", Duration::from_secs(20)),
+        ] {
+            assert_eq!(
+                parse_ingest_hold_max_wait(value).unwrap_or_else(|err| panic!("{value}: {err}")),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn ingest_hold_max_wait_rejects_values_that_are_not_durations() {
+        for value in ["-1s", "1", "soon", "1.5.s", ""] {
+            parse_ingest_hold_max_wait(value).expect_err(value);
+        }
+    }
+
+    #[test]
+    fn ingest_hold_max_wait_refuses_values_above_twenty_seconds() {
+        for value in ["20001ms", "21s", "30s", "2m"] {
+            let err = parse_ingest_hold_max_wait(value).expect_err(value);
+            assert_eq!(err, "must be at most 20s", "{value}");
+        }
+        assert!(
+            Cli::try_parse_from(["ravel-server", "--ingest-hold-max-wait", "21s"]).is_err(),
+            "the flag refuses 21s at parse time"
+        );
+    }
+
+    #[test]
+    fn ingest_hold_flags_default_to_the_per_router_cap_and_one_second() {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(
+            cli.resolve_ingest_hold(),
+            IngestHoldConfig {
+                queued_flushes: None,
+                max_wait: Duration::from_secs(1),
+            }
+        );
+    }
+
+    #[test]
+    fn ingest_hold_queued_flushes_flag_sets_the_override() {
+        let cli = Cli::try_parse_from(["ravel-server", "--ingest-hold-queued-flushes", "16"])
+            .expect("override parses");
+        assert_eq!(cli.resolve_ingest_hold().queued_flushes, Some(16));
+        assert!(
+            Cli::try_parse_from(["ravel-server", "--ingest-hold-queued-flushes", "0"]).is_err(),
+            "an override of 0 is refused"
+        );
     }
 }

@@ -284,16 +284,51 @@ pub enum TypedAttrColumnError {
         "declared typed attribute column key {key:?} collides with a fixed logs SQL column name"
     )]
     FixedColumnCollision { key: String },
+    /// A declared key starts with [`RESERVED_COLUMN_PREFIX`].
+    #[error(
+        "declared typed attribute column key {key:?} starts with the reserved prefix \
+         {RESERVED_COLUMN_PREFIX:?}, which names Ravel's own synthetic columns"
+    )]
+    ReservedPrefix { key: String },
 }
+
+/// The prefix of the column names Ravel itself adds to a logs plan or result
+/// (`__ravel_attr[k]`, `__ravel_row_ref`, the MCP tools' `__ravel_group`). A
+/// new declared typed attribute column may not start with it. Compared
+/// case-sensitively, as those names are spelled: `__Ravel_x` is an ordinary
+/// key.
+pub const RESERVED_COLUMN_PREFIX: &str = "__ravel_";
 
 /// Validate an operator-provided typed-attribute-column declaration (ADR-0090
 /// decision 1). Rejects an empty key, a duplicate key within the declaration,
-/// the same key declared with two different types, and a key colliding with any
-/// fixed logs SQL column name. This is the operator-input gate, called before a
+/// the same key declared with two different types, a key colliding with any
+/// fixed logs SQL column name, and a key starting with
+/// [`RESERVED_COLUMN_PREFIX`]. This is the operator-input gate, called before a
 /// durable write, NOT at proto decode time (a durable record predating a rule
-/// is read, not re-validated).
+/// is read, not re-validated): a record stored before the reserved-prefix rule
+/// existed is held to [`validate_stored_typed_attr_columns`] instead, which
+/// keeps its `__ravel_` keys.
 pub fn validate_typed_attr_columns(
     columns: &[DeclaredTypedColumn],
+) -> Result<(), TypedAttrColumnError> {
+    check_typed_attr_columns(columns, |_| false)
+}
+
+/// The rules a declaration already in a durable record is held to when it is
+/// applied: every rule of [`validate_typed_attr_columns`] except the
+/// reserved-prefix rule, which binds new declarations only, so a record stored
+/// before that rule keeps resolving to the columns it declares.
+pub fn validate_stored_typed_attr_columns(
+    columns: &[DeclaredTypedColumn],
+) -> Result<(), TypedAttrColumnError> {
+    check_typed_attr_columns(columns, |_| true)
+}
+
+/// The declaration rules, with `reserved_allowed` deciding which keys
+/// starting with [`RESERVED_COLUMN_PREFIX`] pass.
+fn check_typed_attr_columns(
+    columns: &[DeclaredTypedColumn],
+    reserved_allowed: impl Fn(&str) -> bool,
 ) -> Result<(), TypedAttrColumnError> {
     let mut seen: std::collections::HashMap<&str, DeclaredColumnType> =
         std::collections::HashMap::new();
@@ -303,6 +338,11 @@ pub fn validate_typed_attr_columns(
         }
         if FIXED_LOGS_SQL_COLUMNS.contains(&col.key.as_str()) {
             return Err(TypedAttrColumnError::FixedColumnCollision {
+                key: col.key.clone(),
+            });
+        }
+        if col.key.starts_with(RESERVED_COLUMN_PREFIX) && !reserved_allowed(&col.key) {
+            return Err(TypedAttrColumnError::ReservedPrefix {
                 key: col.key.clone(),
             });
         }
@@ -1349,8 +1389,8 @@ pub fn resolve_retention_window(
 
 /// The tenant's effective declared typed attribute columns: the record's
 /// [`TenantConfig::typed_attr_columns`] override when the record is present and
-/// carries a `Some` list that passes [`validate_typed_attr_columns`] (including
-/// `Some(vec![])`, an override to no declared columns), otherwise
+/// carries a `Some` list that passes [`validate_stored_typed_attr_columns`]
+/// (including `Some(vec![])`, an override to no declared columns), otherwise
 /// `base_columns`, which is the tenant's base columns as the server resolves
 /// them (`TypedAttrColumnConfig::columns_for`: the tenant's
 /// `--typed-attr-column-tenant` override when one is set, else the
@@ -1366,7 +1406,7 @@ pub fn resolve_declared_columns<'a>(
     base_columns: &'a [DeclaredTypedColumn],
 ) -> &'a [DeclaredTypedColumn] {
     match tenant_config.and_then(|cfg| cfg.typed_attr_columns.as_deref()) {
-        Some(list) if validate_typed_attr_columns(list).is_ok() => list,
+        Some(list) if validate_stored_typed_attr_columns(list).is_ok() => list,
         _ => base_columns,
     }
 }
@@ -1827,6 +1867,24 @@ enum ReadExpectation<'a> {
     At(&'a Version),
 }
 
+/// Refuse a declared key starting with [`RESERVED_COLUMN_PREFIX`] unless the
+/// record being replaced already declares a column with that key, so a
+/// read-modify-write over a record stored before the rule still succeeds. The
+/// match is by key alone: such a write may change the stored column's type,
+/// but it cannot add a reserved name.
+fn refuse_new_reserved_keys(
+    config: &TenantConfig,
+    existing: Option<&TenantConfig>,
+) -> Result<(), TypedAttrColumnError> {
+    let Some(columns) = config.typed_attr_columns.as_deref() else {
+        return Ok(());
+    };
+    let stored = existing
+        .and_then(|cfg| cfg.typed_attr_columns.as_deref())
+        .unwrap_or_default();
+    check_typed_attr_columns(columns, |key| stored.iter().any(|col| col.key == key))
+}
+
 async fn write_config(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
@@ -1839,14 +1897,14 @@ async fn write_config(
     // Validate the operator-provided declared-column list before any durable
     // write (ADR-0090 decision 1: "any durable write" rejects an empty key, a
     // duplicate, a conflicting type, or a fixed-column collision). Decode never
-    // re-runs this; it is the write-time operator-input gate.
+    // re-runs this; it is the write-time operator-input gate. The
+    // reserved-prefix rule needs the record being replaced, so it runs below.
+    let invalid_columns = |source| TenantConfigError::InvalidTypedAttrColumns {
+        key: key.clone(),
+        source,
+    };
     if let Some(columns) = config.typed_attr_columns.as_ref() {
-        validate_typed_attr_columns(columns).map_err(|source| {
-            TenantConfigError::InvalidTypedAttrColumns {
-                key: key.clone(),
-                source,
-            }
-        })?;
+        validate_stored_typed_attr_columns(columns).map_err(invalid_columns)?;
     }
     let storage_layout_error = |source| TenantConfigError::InvalidStorageLayoutConfig {
         key: key.clone(),
@@ -1895,6 +1953,7 @@ async fn write_config(
             // persists the record, so trusting a misfiled or below-floor read
             // would durably corrupt it.
             let existing_config = decode_record(&existing, &key, tenant_hash)?;
+            refuse_new_reserved_keys(config, Some(&existing_config)).map_err(invalid_columns)?;
             config
                 .check_storage_layout_writable(Some(&existing_config))
                 .map_err(storage_layout_error)?;
@@ -1924,6 +1983,7 @@ async fn write_config(
             if let ReadExpectation::At(_) = expectation {
                 return Err(TenantConfigError::CasConflict { key });
             }
+            refuse_new_reserved_keys(config, None).map_err(invalid_columns)?;
             config
                 .check_storage_layout_writable(None)
                 .map_err(storage_layout_error)?;
@@ -2878,6 +2938,144 @@ mod tests {
                 "collision with {fixed:?} must report FixedColumnCollision"
             );
         }
+    }
+
+    /// Validation rejects a key starting with the reserved `__ravel_` prefix,
+    /// and the message names the key and the prefix.
+    #[test]
+    fn validation_rejects_reserved_prefix() {
+        for key in ["__ravel_x", "__ravel_group"] {
+            let err = validate_typed_attr_columns(&[str_col(key)])
+                .expect_err("a key with the reserved prefix must be rejected");
+            assert_eq!(
+                err,
+                TypedAttrColumnError::ReservedPrefix { key: key.into() }
+            );
+            let message = err.to_string();
+            assert!(message.contains(&format!("{key:?}")), "{message}");
+            assert!(message.contains("\"__ravel_\""), "{message}");
+        }
+    }
+
+    /// The prefix is compared case-sensitively and in full: near misses are
+    /// ordinary keys.
+    #[test]
+    fn validation_accepts_keys_that_only_resemble_the_reserved_prefix() {
+        for key in ["_ravel_x", "ravel_x", "__Ravel_x"] {
+            assert_eq!(
+                validate_typed_attr_columns(&[str_col(key)]),
+                Ok(()),
+                "{key:?} does not start with the reserved prefix"
+            );
+        }
+    }
+
+    /// A record stored before the reserved-prefix rule still decodes and its
+    /// declaration still resolves: the rule binds new declarations only.
+    #[tokio::test]
+    async fn a_stored_record_with_a_reserved_key_still_loads() {
+        let stored = vec![str_col("__ravel_x"), str_col("user.id")];
+        let record = build_record(
+            &tenant(),
+            &TenantConfig {
+                typed_attr_columns: Some(stored.clone()),
+                ..TenantConfig::new(TenantLifecycleState::Active)
+            },
+            1,
+            1,
+        );
+        let decoded = store_and_read(&record).await;
+        assert_eq!(decoded.typed_attr_columns.as_deref(), Some(&stored[..]));
+        assert!(validate_typed_attr_columns(&stored).is_err());
+        assert_eq!(validate_stored_typed_attr_columns(&stored), Ok(()));
+        let base = [str_col("base")];
+        assert_eq!(resolve_declared_columns(Some(&decoded), &base), &stored[..]);
+    }
+
+    /// `set_tenant_config` refuses a reserved key a new record would declare,
+    /// writing nothing.
+    #[tokio::test]
+    async fn set_tenant_config_refuses_a_new_reserved_key() {
+        let store = mem();
+        let cfg = TenantConfig {
+            typed_attr_columns: Some(vec![str_col("__ravel_x")]),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+        let err = set_tenant_config(store.as_ref(), &tenant(), &cfg, 1)
+            .await
+            .expect_err("a reserved key must fail the durable write");
+        assert!(
+            matches!(
+                err,
+                TenantConfigError::InvalidTypedAttrColumns {
+                    source: TypedAttrColumnError::ReservedPrefix { ref key },
+                    ..
+                } if key == "__ravel_x"
+            ),
+            "got: {err}"
+        );
+        assert!(
+            read_config(store.as_ref(), &tenant())
+                .await
+                .expect("read")
+                .is_none(),
+            "a refused declaration must not persist"
+        );
+    }
+
+    /// Over a record stored before the rule, a write carrying its reserved key
+    /// through succeeds, and one adding a second reserved key is refused.
+    #[tokio::test]
+    async fn set_tenant_config_keeps_a_stored_reserved_key_and_refuses_a_new_one() {
+        let store = mem();
+        let stored = TenantConfig {
+            typed_attr_columns: Some(vec![str_col("__ravel_x")]),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+        store
+            .put(
+                &config_key(&tenant()),
+                build_record(&tenant(), &stored, 1, 1)
+                    .encode_to_vec()
+                    .into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed a record stored before the rule");
+
+        let carried = TenantConfig {
+            retention_ns: Some(3_600_000_000_000),
+            ..stored.clone()
+        };
+        set_tenant_config(store.as_ref(), &tenant(), &carried, 2)
+            .await
+            .expect("carrying a stored reserved key through must succeed");
+
+        let added = TenantConfig {
+            typed_attr_columns: Some(vec![str_col("__ravel_x"), str_col("__ravel_y")]),
+            ..carried.clone()
+        };
+        let err = set_tenant_config(store.as_ref(), &tenant(), &added, 3)
+            .await
+            .expect_err("a reserved key the stored record lacks must be refused");
+        assert!(
+            matches!(
+                err,
+                TenantConfigError::InvalidTypedAttrColumns {
+                    source: TypedAttrColumnError::ReservedPrefix { ref key },
+                    ..
+                } if key == "__ravel_y"
+            ),
+            "got: {err}"
+        );
+        let (now, _) = read_config(store.as_ref(), &tenant())
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            now, carried,
+            "the refused write must leave the record as it was"
+        );
     }
 
     /// A durable write carrying an invalid declaration is refused before it
