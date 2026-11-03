@@ -1,0 +1,10 @@
+{
+ "extra_seed": 8,
+ "extra_start_hour": 498241,
+ "extra_traces": 500,
+ "hours": 2,
+ "seed": 7,
+ "start_hour": 498239,
+ "traces": 1000,
+ "truth_sha256": "b2b079495c8e18fd34294b63792bce9209677f0283153a57f7d720b57cbf7071"
+}

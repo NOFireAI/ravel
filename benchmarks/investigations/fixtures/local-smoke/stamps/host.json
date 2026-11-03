@@ -1,0 +1,12 @@
+{
+ "arch": "aarch64",
+ "at": "2026-11-03T01:54:56Z",
+ "disk": "/dev/nvme0n1p2  468G  106G  339G  24% /var/lib/fleet",
+ "instance_type": "local",
+ "kernel": "6.12.25+rpt-rpi-2712",
+ "lane": "local",
+ "mem_total_kb": 8257232,
+ "nproc": 4,
+ "page_cache_drop": "unavailable (not root)",
+ "rq_stats": "1"
+}
