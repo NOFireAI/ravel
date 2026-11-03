@@ -142,6 +142,7 @@ pub struct DecodedCacheCounters {
     deferred_set_estimate_bytes: AtomicU64,
     deferred_estimated: AtomicBool,
     deferred_served: AtomicBool,
+    deferred_partial: AtomicBool,
 }
 
 /// A point-in-time copy of [`DecodedCacheCounters`].
@@ -167,6 +168,10 @@ pub struct DecodedCacheSnapshot {
     /// Whether a scan of the statement serves its Contains-deferred columns
     /// from the cache, its estimate being at most 0.95 of the cap.
     pub deferred_served: bool,
+    /// Whether a scan of the statement stopped reading segment directories
+    /// once its running estimate passed 0.95 of the cap, so that
+    /// `deferred_set_estimate_bytes` is a lower bound of its decoded set.
+    pub deferred_set_estimate_partial: bool,
 }
 
 /// The unreserved bytes an admission must leave on a budget of `limit`, and
@@ -199,6 +204,8 @@ impl DecodedCacheSnapshot {
                 (a, b) => a.or(b),
             },
             deferred_served: self.deferred_served || other.deferred_served,
+            deferred_set_estimate_partial: self.deferred_set_estimate_partial
+                || other.deferred_set_estimate_partial,
         }
     }
 }
@@ -218,6 +225,7 @@ impl DecodedCacheCounters {
                 .load(Ordering::Relaxed)
                 .then(|| self.deferred_set_estimate_bytes.load(Ordering::Relaxed)),
             deferred_served: self.deferred_served.load(Ordering::Relaxed),
+            deferred_set_estimate_partial: self.deferred_partial.load(Ordering::Relaxed),
         }
     }
 
@@ -225,11 +233,16 @@ impl DecodedCacheCounters {
     /// scan serves its Contains-deferred columns (ADR-3326, serve-if-fits
     /// amendment). Called once per scan with a Contains arm, by its plan pass
     /// or, on the whole-segment fast path, by its directory-read pass.
-    pub fn record_deferred_verdict(&self, estimate_bytes: u64, served: bool) {
+    /// `partial` is whether that pass stopped before reading every segment,
+    /// making `estimate_bytes` a lower bound.
+    pub fn record_deferred_verdict(&self, estimate_bytes: u64, served: bool, partial: bool) {
         Self::bump(&self.deferred_set_estimate_bytes, estimate_bytes);
         self.deferred_estimated.store(true, Ordering::Relaxed);
         if served {
             self.deferred_served.store(true, Ordering::Relaxed);
+        }
+        if partial {
+            self.deferred_partial.store(true, Ordering::Relaxed);
         }
     }
 

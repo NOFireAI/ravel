@@ -5505,10 +5505,17 @@ the flag.
 When the cap is nonzero each SQL response's `stats` carries `decodedCache`
 once per statement: `hits`, `misses`, `admissions`, `evictions`, `ghostHits`,
 `marginSkips`, `pressureEvictions`, `pressureFreedBytes`, `residentBytes`,
-`deferredServed`, and `deferredSetEstimateBytes`. `deferredSetEstimateBytes`
-is the plan-time decoded-set estimate, summed over the statement's scans with
-a `Contains` arm, and is present when such a scan ran its plan pass or took
-the whole-segment fast path.
+`deferredServed`, `deferredSetEstimateBytes`, and `deferredSetEstimatePartial`.
+`deferredSetEstimateBytes` is the plan-time decoded-set estimate, summed over
+the statement's scans with a `Contains` arm, and is present when such a scan
+ran its plan pass or took the whole-segment fast path. On the fast path the
+estimate stops once its running sum passes 0.95 of the cap; then
+`deferredSetEstimatePartial` is `true` and `deferredSetEstimateBytes` is a
+lower bound of the decoded set. The key is absent otherwise
+(`an_over_cap_fast_path_verdict_stops_reading_once_past_the_threshold` in
+`crates/ravel-sql/tests/logs_decoded_cache.rs`). A `LIMIT` without
+`ORDER BY` changes none of this: the `LIKE` filter stays above the scan, so
+such a statement reads and reports the estimate like any other.
 `deferredServed` is true when a scan of the statement serves its deferred
 columns, and false otherwise (`decoded_cache_json` in
 `crates/ravel-sql/src/stats_json.rs`;
