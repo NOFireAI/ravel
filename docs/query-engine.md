@@ -36,21 +36,23 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
        -> selective-erasure exclusion: every series or sample matching a
           predicate the snapshot carries in `pending_erasure` is dropped
           from the decoded per-segment results (ADR-0064 decision 2)
-       -> the selector's per-segment scalar SoA runs are kept UNMERGED
-          (native-histogram runs are merged per selector here); the raw
-          scalar runs join a single query-wide pool so the one k-way merge
-          below unions across selectors AND cross-cluster federation runs
-          (ADR-0071) under one total order
-  -> all selectors' raw scalar runs (plus every remote cluster's federated
-     runs) pooled and merged once by series id: one lazy k-way merge (each
-     run already ascending by ts; emits ascending, one sample per ts, no
-     final sort). Duplicate timestamps (across segments, within one run,
-     and across clusters) resolve under the total order in
-     docs/catalog-and-mvcc.md, not by arrival order. max_series/max_samples
-     are enforced ONCE over this pooled union -- a query-wide bound, not a
-     per-selector budget: the caps guard the coordinator's peak memory for
-     the pooled fetch, so a multi-selector (or federated) query cannot hold
-     N times the cap at fetch time. Evaluating a compound range query then
+       -> as each segment's fetch completes, its scalar SoA runs are
+          folded into one query-wide per-series accumulator (native-histogram
+          runs into one per selector), so the fold unions across selectors
+          AND cross-cluster federation runs (ADR-0071) under one total order
+          without holding every segment's runs until the last arrives; what
+          the fold holds is reserved against the memory budget ("Samples
+          held by a PromQL read" below)
+  -> all selectors' scalar runs (plus every remote cluster's federated
+     runs) folded by series id, with the result one lazy k-way merge over
+     the pooled runs gives (`merge_soa_runs`: each run already ascending by
+     ts; one sample per ts, ascending). Duplicate timestamps (across
+     segments, within one run, and across clusters) resolve under the
+     total order in docs/catalog-and-mvcc.md, not by arrival order.
+     max_series/max_samples are enforced over this one fold -- a
+     query-wide bound, not a per-selector budget: max_series as each
+     series is added, max_samples once the fold is finished, so a
+     multi-selector (or federated) query cannot hold N times the cap. Evaluating a compound range query then
      keeps one owned copy of the matched pool per distinct selector key
      (matchers, channel, `offset`, `@`) for the whole query. Each copy is
      charged to the query's memory budget and to a per-query cap on the
@@ -1245,6 +1247,25 @@ map is handed to the endpoint. The endpoint's merge of several selectors'
 series (`resolve_matched_series` in `http/service.rs`) and the response it
 renders are not charged, and `max_series` does not bound that merged set.
 
+**Samples held by a PromQL read.** The local sample prefetch folds each
+object's scalar and histogram runs into one per-series accumulator as that
+object's fetch completes (`RunFold` in `engine/sample_fold.rs`), keeping on a
+duplicate `(series, timestamp)` the sample the dedup order serves, so the
+result is the one `merge_soa_runs` gives over every object at once, whatever
+order the objects complete in. Cross-selector and federation scalar runs fold
+into the same accumulator. After each object the fold reserves what it holds
+against the same budget: each series' id and labels (`retained_series_len`),
+each held sample and each distinct provenance prefix. A read whose merged
+samples do not fit is refused with the same 422 `FetchMemoryExhausted`,
+against the budget's limit, and the reservation is released when the series
+are handed to the evaluator or when the read fails. `max_series` is checked
+as each series is added and `max_samples` once the fold is finished, with the
+merge's errors. The reservation is the most the fold held after any object, so
+it does not shrink when a later object's duplicates are dropped. The
+distributed coordinator still holds every slice's runs until the last slice
+answers before they are folded, federation histogram runs are merged whole as
+before, and a series' run is held unreserved while it is folded in.
+
 **Objects a discovery read skips.** The same reads also keep the id of every
 series a decoded object held, matched or not, and charge 32 bytes per id to
 the budget (`SEEN_SERIES_LEN` in `engine.rs`). The set only saves work, so
@@ -1375,12 +1396,12 @@ Prometheus-style error, never a partial silent result.
 The series and samples caps are counts: they bound the plan's width, not
 its bytes. The bytes a query holds are bounded by the memory budget
 (ADR-1170), which fetch reservations and selector-cache entries are
-charged to. The float series of every selector are pooled and checked
-once against both caps (`merge_soa_runs` in
-`crates/ravel-query/src/engine.rs`; see the merge step under "Flow"
-above), so a multi-selector query shares one budget rather than
-granting each selector its own; histogram series are merged and checked
-per selector (`merge_histogram_soa_runs`). Over a cap the query is
+charged to. The float series of every selector are folded into one
+accumulator and checked against both caps (`ScalarFold` in
+`crates/ravel-query/src/engine/sample_fold.rs`; see the fold step under
+"Flow" above), so a multi-selector query shares one budget rather than
+granting each selector its own; histogram series are folded and checked
+per selector (`HistogramFold`). Over a cap the query is
 refused with `query matched N series, exceeding the limit of M` (or the
 samples form), answered as HTTP 422 with `errorType` `execution`. Both
 flags are process-wide and have no limits-file key: `[defaults]` and

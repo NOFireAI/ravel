@@ -553,11 +553,14 @@ struct ReservationStep {
 
 /// Splits [`fetch_reservation_steps`] for the one-segment instant query these
 /// tests run into the totals a held GET can observe, and the size of the
-/// catalog decode's reservation (ADR-1702 decision 6). The query reserves three
-/// times: the catalog-section range read, the catalog decode, then the page
-/// read. The decode reserves between GETs, so no held GET sees its own running
-/// total, and it charges decoded output rather than cache-bound bytes, so it is
-/// never marked handed off.
+/// catalog decode's reservation (ADR-1702 decision 6). The query reserves four
+/// times: the catalog-section range read, the catalog decode, the page read,
+/// then the sample fold's charge for the samples it retains (#3747). The decode
+/// reserves between GETs, so no held GET sees its own running total, and it
+/// charges decoded output rather than cache-bound bytes, so it is never marked
+/// handed off. The fold reserves once the object's fetch has returned and
+/// released its own reservations, so it holds nothing else when it reserves
+/// and no held GET observes it either.
 ///
 /// The decode figure is the decode step's own total less the range read, which
 /// is the pre-shrink charge. That is only the figure a held GET observes while
@@ -568,8 +571,8 @@ struct ReservationStep {
 fn split_decode_step(steps: &[ReservationStep]) -> (Vec<u64>, u64) {
     assert_eq!(
         steps.len(),
-        3,
-        "range read, catalog decode, page read: {steps:?}"
+        4,
+        "range read, catalog decode, page read, sample fold: {steps:?}"
     );
     let range_read = steps[0].total;
     assert_eq!(
@@ -579,6 +582,14 @@ fn split_decode_step(steps: &[ReservationStep]) -> (Vec<u64>, u64) {
     assert!(
         steps[2].held >= range_read,
         "the range read is still held when the page read reserves: {steps:?}"
+    );
+    assert_eq!(
+        steps[3].held, 0,
+        "the sample fold reserves after the fetch released its reservations: {steps:?}"
+    );
+    assert!(
+        steps[3].total > 0,
+        "the sample fold charges the samples it retains: {steps:?}"
     );
     (
         vec![range_read, steps[2].total],
