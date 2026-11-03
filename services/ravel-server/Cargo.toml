@@ -317,8 +317,12 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client-reqwest",
 ] }
 # `query` on top of the normal dependency's `json`: the test client builds
-# query strings the server binary itself never needs to.
-reqwest = { version = "0.13", features = ["json", "query"] }
+# query strings the server binary itself never needs to. `stream` lets a
+# permit-release test (tests/cpu_shed_e2e.rs) send a request body that
+# trickles in slowly, so the server-side drain is still running when a
+# concurrent request needs the ceiling slot the drain's permit is supposed
+# to have already freed.
+reqwest = { version = "0.13", features = ["json", "query", "stream"] }
 # Test-only: `channel` is not in tonic's default feature set, and the Flight
 # startup test needs a gRPC client to call the server it just started. The
 # server binary itself keeps the default (server-only) tonic.

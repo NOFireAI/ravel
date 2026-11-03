@@ -78,9 +78,31 @@ fn metrics_export_request(metric_name: &str, ts_ns: i64) -> ExportMetricsService
     }
 }
 
-/// Starts a full server with an open in-flight ceiling, so only the CPU shed
-/// draw can refuse a request here.
-async fn start_test_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::Running {
+/// A reqwest request body that trickles `payload` out over `chunks` pieces,
+/// each delayed by `delay`. Used to prove a shed request's in-flight permit
+/// is released before its body finishes draining: with the ceiling at
+/// `Bounded(1)`, a concurrent second request can only be admitted while this
+/// one's `discard_body` drain (`ingest_admission.rs`) is still running if the
+/// permit was already freed.
+fn slow_body(payload: Vec<u8>, chunks: usize, delay: Duration) -> reqwest::Body {
+    let chunk_len = payload.len().div_ceil(chunks).max(1);
+    let pieces: Vec<Vec<u8>> = payload.chunks(chunk_len).map(<[u8]>::to_vec).collect();
+    reqwest::Body::wrap_stream(futures::stream::unfold(
+        pieces.into_iter(),
+        move |mut remaining| async move {
+            let piece = remaining.next()?;
+            tokio::time::sleep(delay).await;
+            Some((Ok::<_, std::io::Error>(piece), remaining))
+        },
+    ))
+}
+
+/// Starts a full server with the given in-flight ceiling; the CPU shed is
+/// pinned separately via `running.cpu_shed.set_for_test`.
+async fn start_test_server(
+    store: Arc<dyn ObjectStoreBackend>,
+    ingest_concurrency_limit: IngestConcurrencyLimit,
+) -> ravel_server::Running {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
@@ -144,7 +166,7 @@ async fn start_test_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::
         remote_clusters: Vec::new(),
         shutdown_timeout: ravel_server::DEFAULT_SHUTDOWN_TIMEOUT,
         drain_settle_interval: Duration::ZERO,
-        ingest_concurrency_limit: IngestConcurrencyLimit::Unlimited,
+        ingest_concurrency_limit,
     };
     ravel_server::start(
         config,
@@ -155,6 +177,31 @@ async fn start_test_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::
     )
     .await
     .expect("server starts")
+}
+
+/// Scrapes `/metrics` and returns the raw text, for assertions that need to
+/// look at more than one family or at a family's `# HELP`/`# TYPE` lines.
+async fn scrape_metrics(client: &reqwest::Client, base: &str) -> String {
+    client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics scrape completes")
+        .text()
+        .await
+        .expect("metrics body is text")
+}
+
+/// True when `body` declares `name`'s `# HELP` and `# TYPE` lines: proof the
+/// family was actually rendered on this scrape. `scrape_counter` and
+/// `scrape_family_sum` both default a missing family to 0 via `unwrap_or(0)`,
+/// which reads the same as a family that was rendered and genuinely sampled
+/// 0; this is the check that tells the two apart.
+fn metric_family_registered(body: &str, name: &str) -> bool {
+    let help = format!("# HELP {name} ");
+    let kind = format!("# TYPE {name} ");
+    body.lines().any(|line| line.starts_with(&help))
+        && body.lines().any(|line| line.starts_with(&kind))
 }
 
 /// Scrapes `/metrics` and returns the value of the single sample whose line
@@ -199,9 +246,7 @@ async fn scrape_family_sum(client: &reqwest::Client, base: &str, name: &str) -> 
 }
 
 /// Acceptance case: with `p` pinned to 1.0, an authenticated OTLP metrics
-/// export is refused 429 with `Retry-After: 1`, its body is never decoded
-/// (`ravel_ingest_buffered_items_total` stays 0), the in-flight permit it took
-/// is released (a second export after this one still succeeds), and
+/// export is refused 429 with `Retry-After: 1`, and
 /// `ravel_ingest_cpu_shed_total{mode="all"}` reads 1.
 ///
 /// Distinguishing test 3 (draw after tenant resolution instead of before): a
@@ -211,16 +256,48 @@ async fn scrape_family_sum(client: &reqwest::Client, base: &str, name: &str) -> 
 /// `cpu_shed_refuses_before_tenant_resolution_unauthenticated` case below is
 /// the one that does: it sends no credential at all and asserts 429, not 401,
 /// which only holds when the draw runs first.
+///
+/// Distinguishing test 4 (refusal does not release the in-flight permit): the
+/// ceiling here is `Bounded(1)`, and the shed request's body trickles in over
+/// several hundred milliseconds (`slow_body`), so `ingest_admission.rs`'s
+/// `discard_body` drain is still running when a second, concurrent request is
+/// sent. That second request can only be admitted if the CPU-shed branch
+/// already called `permit.release()` (`ingest_admission.rs:532`) -- the
+/// bounded ceiling has no other slot to give it. A wrong implementation that
+/// forgot that call holds the slot for the whole drain, so the second
+/// request's `try_admit()` would fail the in-flight ceiling instead
+/// (`ingest_concurrency_shed_response`, a different body and counter than
+/// this case's CPU shed), and `assert_eq!(response.status(), 200, ...)` below
+/// is the line that flips from pass to fail.
 #[tokio::test]
 async fn cpu_shed_refuses_an_authenticated_http_export_and_releases_its_permit() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let running = start_test_server(store).await;
+    let running = start_test_server(store, IngestConcurrencyLimit::Bounded(1)).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
     running.cpu_shed.set_for_test(1.0);
 
-    let request = metrics_export_request("shed", now_ns());
+    let slow_payload = metrics_export_request("shed", now_ns()).encode_to_vec();
+    let slow_client = client.clone();
+    let slow_base = base.clone();
+    let slow_request = tokio::spawn(async move {
+        slow_client
+            .post(format!("{slow_base}/v1/metrics"))
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/x-protobuf")
+            .body(slow_body(slow_payload, 5, Duration::from_millis(80)))
+            .send()
+            .await
+    });
+
+    // Give the slow request time to reach the CPU-shed branch and start
+    // draining (well before its ~400ms body finishes arriving), but pin `p`
+    // back to 0.0 first so this second request is admitted on its own merits
+    // rather than shed itself.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    running.cpu_shed.set_for_test(0.0);
+    let request = metrics_export_request("admitted_while_shed_drains", now_ns());
     let response = client
         .post(format!("{base}/v1/metrics"))
         .header("authorization", format!("Bearer {TOKEN}"))
@@ -229,52 +306,39 @@ async fn cpu_shed_refuses_an_authenticated_http_export_and_releases_its_permit()
         .send()
         .await
         .expect("request completes");
-
-    assert_eq!(response.status(), 429, "p=1.0 refuses every request");
     assert_eq!(
-        response
+        response.status(),
+        200,
+        "the slow shed request's permit was already released, so the \
+         bounded ceiling still has room for this concurrent one"
+    );
+
+    let slow_response = slow_request
+        .await
+        .expect("task does not panic")
+        .expect("request completes");
+    assert_eq!(slow_response.status(), 429, "p=1.0 refuses every request");
+    assert_eq!(
+        slow_response
             .headers()
             .get("retry-after")
             .and_then(|v| v.to_str().ok()),
         Some("1"),
         "the CPU shed keeps the same Retry-After shape as the other sheds"
     );
-    let text = response.text().await.expect("body reads");
+    let text = slow_response.text().await.expect("body reads");
     assert_eq!(text, "node is CPU-saturated, shedding ingest requests");
 
     assert_eq!(
         scrape_counter(&client, &base, "ravel_ingest_cpu_shed_total").await,
         1,
-        "the new counter counts this refusal, exactly once"
+        "the new counter counts the slow request's refusal, exactly once"
     );
-    assert_eq!(
-        scrape_family_sum(&client, &base, "ravel_ingest_buffered_items_total").await,
-        0,
-        "a shed request's body is never decoded into a shard buffer"
-    );
-
-    // Distinguishing test 4 (refusal does not release the in-flight permit):
-    // a wrong implementation that forgot `permit.release()` before refusing
-    // would leave this slot held forever. The ceiling here is Unlimited, so
-    // this alone would not fail; what proves the release is that `p=0.0`
-    // admits cleanly right after, with no leaked state from the shed path
-    // (no stray extensions, no held strict-ack permit) breaking the next
-    // request.
-    running.cpu_shed.set_for_test(0.0);
-    let request = metrics_export_request("admitted_after_shed", now_ns());
-    let response = client
-        .post(format!("{base}/v1/metrics"))
-        .header("authorization", format!("Bearer {TOKEN}"))
-        .header("content-type", "application/x-protobuf")
-        .body(request.encode_to_vec())
-        .send()
-        .await
-        .expect("request completes");
-    assert_eq!(response.status(), 200, "p=0.0 admits the next request");
     assert_eq!(
         scrape_family_sum(&client, &base, "ravel_ingest_buffered_items_total").await,
         1,
-        "the admitted request's point reached a shard buffer"
+        "the shed request's body is never decoded; only the admitted \
+         request's point reached a shard buffer"
     );
 
     running.shutdown().await.expect("graceful shutdown");
@@ -295,7 +359,7 @@ async fn cpu_shed_refuses_an_authenticated_http_export_and_releases_its_permit()
 #[tokio::test]
 async fn cpu_shed_refuses_before_tenant_resolution_unauthenticated() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let running = start_test_server(store).await;
+    let running = start_test_server(store, IngestConcurrencyLimit::Unlimited).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
@@ -325,7 +389,7 @@ async fn cpu_shed_refuses_before_tenant_resolution_unauthenticated() {
 #[tokio::test]
 async fn cpu_shed_at_zero_admits_normally() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let running = start_test_server(store).await;
+    let running = start_test_server(store, IngestConcurrencyLimit::Unlimited).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
@@ -342,6 +406,24 @@ async fn cpu_shed_at_zero_admits_normally() {
         .expect("request completes");
 
     assert_eq!(response.status(), 200);
+
+    // Both ADR-3718 families must be registered on this scrape, not merely
+    // read as 0 because `scrape_counter`'s `unwrap_or(0)` papers over a
+    // family that was never emitted at all (the gap `cpu_shed_at_zero_admits_normally`
+    // used to have: a detector wired to render nothing at `p` = 0 would still
+    // pass the bare `scrape_counter` assertion below).
+    let body = scrape_metrics(&client, &base).await;
+    assert!(
+        metric_family_registered(&body, "ravel_ingest_cpu_shed_total"),
+        "ravel_ingest_cpu_shed_total must have HELP/TYPE lines even when \
+         nothing has been shed yet"
+    );
+    assert!(
+        metric_family_registered(&body, "ravel_ingest_cpu_shed_fraction"),
+        "ravel_ingest_cpu_shed_fraction must have HELP/TYPE lines even when \
+         the fraction itself is 0"
+    );
+
     assert_eq!(
         scrape_counter(&client, &base, "ravel_ingest_cpu_shed_total").await,
         0
@@ -358,7 +440,7 @@ async fn cpu_shed_refuses_a_grpc_export() {
     use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
 
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let running = start_test_server(store).await;
+    let running = start_test_server(store, IngestConcurrencyLimit::Unlimited).await;
     let grpc_addr = running.grpc_addr.expect("gateway mode binds gRPC");
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();

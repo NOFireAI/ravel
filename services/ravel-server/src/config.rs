@@ -22883,4 +22883,51 @@ mod tests {
             );
         }
     }
+
+    /// ADR-3718 D2/D3: `0` disables the detector, and any other value must
+    /// clear the 0.05 release-level gap and stay at or below 1.
+    #[test]
+    fn ingest_cpu_shed_threshold_accepts_zero_and_the_valid_range() {
+        assert_eq!(
+            parse_ingest_cpu_shed_threshold("0").expect("0 disables"),
+            0.0
+        );
+        assert_eq!(
+            parse_ingest_cpu_shed_threshold("0.06").expect("just above the gap"),
+            0.06
+        );
+        assert_eq!(
+            parse_ingest_cpu_shed_threshold("0.95").expect("within range"),
+            0.95
+        );
+        assert_eq!(
+            parse_ingest_cpu_shed_threshold("1").expect("the inclusive upper bound"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn ingest_cpu_shed_threshold_rejects_the_gap_boundary_and_out_of_range_values() {
+        for value in ["0.05", "1.01", "-0.1", "NaN"] {
+            parse_ingest_cpu_shed_threshold(value).expect_err(value);
+        }
+    }
+
+    /// ADR-3718 D2: the shed-fraction cap is a plain `[0, 1]` range, with no
+    /// release-level gap (unlike the threshold above).
+    #[test]
+    fn ingest_cpu_shed_max_accepts_the_closed_unit_range() {
+        for value in ["0", "0.05", "0.06", "0.95", "1"] {
+            let parsed =
+                parse_ingest_cpu_shed_max(value).unwrap_or_else(|err| panic!("{value}: {err}"));
+            assert_eq!(parsed, value.parse::<f64>().expect("test value parses"));
+        }
+    }
+
+    #[test]
+    fn ingest_cpu_shed_max_rejects_out_of_range_and_non_numeric_values() {
+        for value in ["1.01", "-0.1", "NaN"] {
+            parse_ingest_cpu_shed_max(value).expect_err(value);
+        }
+    }
 }
