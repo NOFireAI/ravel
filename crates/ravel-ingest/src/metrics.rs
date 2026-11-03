@@ -605,7 +605,7 @@ impl ShardSkew {
 
     /// Sum of `flush_trigger_deferred` across every shard, as one relaxed
     /// atomic load per shard rather than the full [`Self::by_shard`] snapshot
-    /// (ADR-3718 D1): the CPU-aware admission detector samples this every
+    /// (ADR-3718 D1): the head-hold backlog detector samples this every
     /// 100 ms and must not build a per-shard map to do it.
     pub(crate) fn flush_trigger_deferred_total(&self) -> u64 {
         self.shards
