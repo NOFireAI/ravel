@@ -1717,14 +1717,39 @@ fn type_label(data_type: &DataType) -> String {
 /// shapes that arrive are a non-NULL literal, a `count(...)`, parentheses and
 /// a unary sign. Everything else is unrepresentable rather than assumed, on
 /// the same fail-closed reading as [`cursor_support`]'s catch-all.
+///
+/// A sign follows DataFusion's typing of it. A minus written directly on a
+/// number literal is folded into the literal, so the signed text is what gets
+/// classified ([`negated_number_cursor_support`]). Any other minus negates its
+/// operand in that operand's type, which DataFusion admits only for a signed
+/// type, so it keeps `Int` and refuses the rest. A plus is the operand itself,
+/// admitted only for a number.
 fn expression_cursor_support(expr: &SqlExpr) -> CursorSupport {
     match expr {
         SqlExpr::Value(value) => literal_cursor_support(&value.value),
         SqlExpr::Nested(inner) => expression_cursor_support(inner),
         SqlExpr::UnaryOp {
-            op: UnaryOperator::Plus | UnaryOperator::Minus,
-            expr,
-        } => expression_cursor_support(expr),
+            op: UnaryOperator::Minus,
+            expr: operand,
+        } => match operand.as_ref() {
+            SqlExpr::Value(value) => match &value.value {
+                Value::Number(text, _) => negated_number_cursor_support(text),
+                _ => CursorSupport::Unrepresentable(format!("the expression `{expr}`")),
+            },
+            _ => match expression_cursor_support(operand) {
+                CursorSupport::Exact(ResumeKind::Int) => CursorSupport::Exact(ResumeKind::Int),
+                _ => CursorSupport::Unrepresentable(format!("the expression `{expr}`")),
+            },
+        },
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr: operand,
+        } => match expression_cursor_support(operand) {
+            CursorSupport::Exact(kind @ (ResumeKind::Int | ResumeKind::UInt)) => {
+                CursorSupport::Exact(kind)
+            }
+            _ => CursorSupport::Unrepresentable(format!("the expression `{expr}`")),
+        },
         // `count(...)` is a row count: a non-negative integer, which
         // `ResumeValue::Int` carries exactly. The name is re-checked here
         // rather than inherited from the nullability proof, so the two cannot
@@ -1746,9 +1771,10 @@ fn expression_cursor_support(expr: &SqlExpr) -> CursorSupport {
 /// does. A decimal or exponent literal is parsed to a type the dialect
 /// chooses, `Decimal128` among them, and comparing it against a rendered
 /// float is neither of this planner's decisions to make, so it is refused.
-/// An integer that fits `i64` is typed `Int64` and one that only fits `u64`
-/// is typed `UInt64`, so the two take [`ResumeKind::Int`] and
-/// [`ResumeKind::UInt`].
+/// An unsigned integer literal that fits `i64` is typed `Int64` and one that
+/// only fits `u64` is typed `UInt64`, so the two take [`ResumeKind::Int`] and
+/// [`ResumeKind::UInt`]. A negated literal is not classified here; see
+/// [`negated_number_cursor_support`].
 fn literal_cursor_support(value: &Value) -> CursorSupport {
     match value {
         Value::Number(text, _) => {
@@ -1765,6 +1791,22 @@ fn literal_cursor_support(value: &Value) -> CursorSupport {
         }
         Value::Boolean(_) => CursorSupport::Exact(ResumeKind::Bool),
         other => CursorSupport::Unrepresentable(format!("the literal {other}")),
+    }
+}
+
+/// The cursor support of `-text`, a minus written directly on a number
+/// literal.
+///
+/// DataFusion folds the sign into the literal and parses the signed text: a
+/// value that fits `i64` is typed `Int64`, and anything below `i64::MIN` is
+/// typed `Float64` (or `Decimal128` under `parse_float_as_decimal`), never
+/// `UInt64`. So `-9223372036854775808` is [`ResumeKind::Int`], although its
+/// unsigned text only fits `u64`, and `-9223372036854775809` is refused.
+fn negated_number_cursor_support(text: &str) -> CursorSupport {
+    if format!("-{text}").parse::<i64>().is_ok() {
+        CursorSupport::Exact(ResumeKind::Int)
+    } else {
+        CursorSupport::Unrepresentable(format!("the numeric literal -{text}"))
     }
 }
 
@@ -2671,16 +2713,43 @@ mod tests {
 
     /// The types DataFusion gives the expressions and literals whose kinds
     /// `expression_cursor_support` and `literal_cursor_support` prove, read
-    /// off a planned statement's schema.
+    /// off a planned statement's schema, and the planner's kind for each one
+    /// equal to [`cursor_support`] of that type.
+    ///
+    /// A sign is part of the expression: `-9223372036854775808` is `Int64`
+    /// although its unsigned text only fits `u64`, and a literal below
+    /// `i64::MIN` is `Float64`, which no resume kind carries exactly.
+    ///
+    /// FLIP: with `expression_cursor_support` stripping a sign before it
+    /// classifies the literal by its text, `min` is proven `UInt` against
+    /// DataFusion's `Int64`, and `below_min` and `neg_u64_max` are proven
+    /// `UInt` against `Float64`.
     #[tokio::test]
     async fn datafusion_types_the_proven_expressions_as_their_kinds_say() {
+        let cases = [
+            ("n", "count(*)", DataType::Int64),
+            ("signed", "9223372036854775807", DataType::Int64),
+            ("unsigned", "9223372036854775808", DataType::UInt64),
+            ("s", "'x'", DataType::Utf8),
+            ("b", "TRUE", DataType::Boolean),
+            ("neg_one", "-1", DataType::Int64),
+            ("min", "-9223372036854775808", DataType::Int64),
+            ("below_min", "-9223372036854775809", DataType::Float64),
+            ("neg_u64_max", "-18446744073709551615", DataType::Float64),
+            ("neg_nested", "-(5)", DataType::Int64),
+            ("neg_neg", "-(-5)", DataType::Int64),
+            ("plus", "+5", DataType::Int64),
+            ("plus_unsigned", "+9223372036854775808", DataType::UInt64),
+            ("neg_count", "-count(*)", DataType::Int64),
+        ];
+        let projection = cases
+            .iter()
+            .map(|(name, expr, _)| format!("{expr} AS {name}"))
+            .collect::<Vec<String>>()
+            .join(", ");
         let ctx = SessionContext::new();
         let frame = ctx
-            .sql(
-                "SELECT count(*) AS n, 9223372036854775807 AS signed, \
-                 9223372036854775808 AS unsigned, 'x' AS s, TRUE AS b \
-                 FROM (VALUES (1)) AS t(c)",
-            )
+            .sql(&format!("SELECT {projection} FROM (VALUES (1)) AS t(c)"))
             .await
             .expect("planned");
         let types: Vec<(String, DataType)> = frame
@@ -2689,25 +2758,32 @@ mod tests {
             .iter()
             .map(|field| (field.name().clone(), field.data_type().clone()))
             .collect();
-        let expected = [
-            ("n", DataType::Int64, ResumeKind::Int),
-            ("signed", DataType::Int64, ResumeKind::Int),
-            ("unsigned", DataType::UInt64, ResumeKind::UInt),
-            ("s", DataType::Utf8, ResumeKind::Str),
-            ("b", DataType::Boolean, ResumeKind::Bool),
-        ];
         assert_eq!(
             types,
-            expected
+            cases
                 .iter()
-                .map(|(name, ty, _)| ((*name).to_string(), ty.clone()))
+                .map(|(name, _, ty)| ((*name).to_string(), ty.clone()))
                 .collect::<Vec<_>>(),
         );
-        for (name, ty, kind) in expected {
-            assert!(
-                matches!(cursor_support(&ty), CursorSupport::Exact(proven) if proven == kind),
-                "{name} is proven {kind:?}",
-            );
+
+        let query = parse_query(&format!("SELECT {projection}")).expect("parsed");
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("not a select");
+        };
+        for ((name, text, ty), item) in cases.iter().zip(&select.projection) {
+            let datafusion::sql::sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = item
+            else {
+                panic!("{name} is not an aliased expression");
+            };
+            let planned = match expression_cursor_support(expr) {
+                CursorSupport::Exact(kind) => Some(kind),
+                CursorSupport::Unrepresentable(_) => None,
+            };
+            let engine = match cursor_support(ty) {
+                CursorSupport::Exact(kind) => Some(kind),
+                CursorSupport::Unrepresentable(_) => None,
+            };
+            assert_eq!(planned, engine, "{name} = {text}, typed {ty} by DataFusion");
         }
     }
 
