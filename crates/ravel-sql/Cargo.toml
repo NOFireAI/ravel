@@ -332,6 +332,10 @@ path = "tests/logs_scan_allocations.rs"
 name = "scan_batch_allocations"
 path = "tests/scan_batch_allocations.rs"
 
+[[test]]
+name = "memo_overhead_alloc_pin"
+path = "tests/memo_overhead_alloc_pin.rs"
+
 # Exact deltas on a process-wide monotonic tally, which tests in another file
 # of the same process could move.
 [[test]]

@@ -5560,8 +5560,12 @@ the flag.
   the cache are all gone
   (`str_values_releases_a_memo_arrays_charge_once_no_batch_holds_it`, both
   cases). The scan takes nothing from `strDictValuesBuilt`. `offer` charges such a column
-  `VALUES_MEMO_BYTES` (512) beyond its `heap_bytes` for the memo
-  (`the_entry_charge_includes_the_memo_constant`). Every other column, and
+  `VALUES_MEMO_BYTES` (528) beyond its `heap_bytes` for the memo
+  (`the_entry_charge_includes_the_memo_constant`). The figure is measured:
+  one memo fill leaves 392 heap bytes live for a plain `Text` column or a
+  `Text` dictionary and 520 for a `Mixed` dictionary, and the constant is
+  the largest rounded up to a multiple of 16
+  (`crates/ravel-sql/tests/memo_overhead_alloc_pin.rs`). Every other column, and
   a row group dictionary, keeps the per-scan build.
 - Known under-count: a dictionary column's entry is charged its share of the
   dictionary but can keep the whole dictionary alive. An Arrow buffer over
