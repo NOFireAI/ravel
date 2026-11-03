@@ -879,6 +879,67 @@ mod tests {
         assert!(executed[0].order_columns.is_empty());
     }
 
+    /// A statement ordered by a value computed from other rows runs as
+    /// written, unpaged: capped, it is `ok_bounded` with no cursor and a
+    /// next step saying paging needs an order on the row's own columns.
+    /// Uncapped, it is `ok` with every row.
+    ///
+    /// FLIP: sending `OrderTermFromOtherRows` to `plan_refusal` answers
+    /// `invalid_argument` with `rewrite_the_statement`, and the backend is
+    /// never called.
+    #[test]
+    fn a_statement_ordered_by_an_aggregate_runs_unpaged() {
+        let queries = [
+            "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY c, ts",
+            "SELECT series_id, sum(value) AS s FROM samples GROUP BY series_id ORDER BY s",
+            "SELECT ts, series_id, count(*) OVER () AS c FROM samples ORDER BY c, ts, series_id",
+        ];
+        for query in queries {
+            for (rows, status) in [(3, Status::OkBounded), (2, Status::Ok)] {
+                let key = key();
+                let stub = Stub::default();
+                stub.sql.borrow_mut().push_back(draft_of(
+                    Signal::Metrics,
+                    Vec::new(),
+                    Vec::new(),
+                    END_NS,
+                ));
+                stub.sql.borrow_mut()[0].envelope.data.rows = vec![vec![Cell::Int(1)]; rows];
+                stub.sql.borrow_mut()[0].envelope.data.row_count = rows as u64;
+
+                let page = block_on(run(args(query, None), &context(&key), &stub));
+
+                assert_eq!(page.status, status, "{query}: {page:?}");
+                assert_eq!(page.presentation.cursor, None, "{query}");
+                assert_eq!(page.data.rows.len(), 2, "{query}");
+                let executed = stub.executed.borrow();
+                assert_eq!(executed[0].request.sql, query);
+                assert!(executed[0].order_columns.is_empty(), "{query}");
+                if status == Status::OkBounded {
+                    assert_eq!(
+                        actions(&page),
+                        ["order_by_the_rows_own_columns"],
+                        "{query}"
+                    );
+                    let detail = &page.next_steps[0].detail;
+                    assert!(
+                        detail.contains("computed from other rows")
+                            && detail.contains("the row's own non-null columns"),
+                        "{query}: {detail}"
+                    );
+                    assert!(
+                        page.warnings.iter().any(|w| w.starts_with("no cursor:")
+                            && w.contains("a value computed from other rows")),
+                        "{query}: {:?}",
+                        page.warnings
+                    );
+                } else {
+                    assert!(actions(&page).is_empty(), "{query}");
+                }
+            }
+        }
+    }
+
     /// Every statement-level refusal comes back before the backend is
     /// called: the stub has no answer queued and panics if reached.
     ///

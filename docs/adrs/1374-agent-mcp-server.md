@@ -769,7 +769,8 @@ against the 256 KiB `max_response_bytes` floor.
    `now_ns`; see the resolve-instant amendment below). That instant bounds
    which ingest-hour buckets are listed, not which records those buckets
    hold. So the pagination guarantee
-   is three-part. A row is never repeated. A row may appear on a later page.
+   is three-part. A row is never repeated (an order term computed from
+   other rows mints no cursor so that this holds; see the other-rows order amendment below). A row may appear on a later page.
    A late-arriving row that sorts before the cursor position is silently
    omitted from every page. The third part is the one a caller must know.
 5. D2: `ravel_find_labels` states whether its list is complete for the
@@ -1222,7 +1223,7 @@ the choices they leave open and the one place it departs.
    paged without losing rows after a NaN, and ordering by another column
    pages the same rows, so it is the caller's argument to change. The one
    planner answer that is not a refusal is `NoOrdering`, a statement with
-   no `ORDER BY` over a table with no row identity. It runs as written,
+   no `ORDER BY` over a table with no row identity (the other-rows order amendment below adds a second). It runs as written,
    unpaged, and a capped result is `ok_bounded` with no cursor and an
    `add_an_order_by` next step.
 2. `time_range` is required and is applied as a half-open row filter
@@ -1544,3 +1545,59 @@ through `Draft::finish_page` (`crates/ravel-mcp/src/draft.rs`).
 2. D4's first-row guarantee is a rule of the byte cap: the byte fit never
    drops the first row and shortens its cells instead. It says nothing about
    the row cap, which item 1 governs.
+
+## Amendment (2026-11-03, #3749): the other-rows order amendment, an aggregate or window order term carries no cursor
+
+<!-- amendment-applies: sections="Consequences|Amendment (2026-11-02, #3683): the query-sql amendment, `ravel_query_sql` ships, and a page with no cursor position ends bounded" pointer="other-rows order amendment" -->
+
+The 2026-09-12 amendment, item 4, says a row is never repeated across a
+walk, and that a row arriving late is at worst omitted. Both parts assume
+that a row's position under the order is a function of that row alone. A
+cursor pins the ingest hours page one listed, not what they hold, so a row
+committed into one of those hours after page one is read by every later
+page. `ravel_query_sql` minted a cursor on a `count(...)` order term, the
+window form `count(*) OVER ()` included, and a late row changes a count:
+under `SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY c, ts`,
+page one served the `ts = 10` group with its count of 1, two `ts = 10` rows
+were then committed into page one's hour, and the rest of the walk served
+the `ts = 10` group again, now sorted after the cursor (#3749, the blocking
+finding of review #1388). This other-rows order amendment closes that.
+
+1. An `ORDER BY` term whose value is computed from rows other than its own
+   carries no cursor. `ravel_sql::plan_page` answers
+   `PagePlanError::OrderTermFromOtherRows` for it, before the per-term
+   checks of the order. The class is any call whose name is an aggregate
+   or window function the SQL session admits (`ADMITTED_AGGREGATES`,
+   `REWRITE_ONLY_AGGREGATES`, `ADMITTED_WINDOWS` in
+   `crates/ravel-sql/src/session.rs`), any call that carries `OVER`,
+   `FILTER`, `WITHIN GROUP`, a null treatment, `DISTINCT` or `ALL`, an
+   argument-list clause or parameters, whatever its name, and any subquery.
+   Each counts anywhere inside the term (`-count(*)`,
+   `nullif(count(*), 0)`), whether the term is written in the `ORDER BY` or
+   names a projected alias that defines it. `count(...)` was the only
+   function an order term could carry before this; it no longer can, and
+   no function is admitted.
+2. The statement is not refused. `ravel_query_sql` treats this outcome as
+   the query-sql amendment, item 1, treats `NoOrdering`: it runs the
+   statement as written, unpaged, and returns the rows up to `max_rows`; a
+   capped result is `ok_bounded` with no cursor, a `no cursor:` warning
+   saying the result is ordered by a value computed from other rows, and an
+   `order_by_the_rows_own_columns` next step saying that paging needs an
+   order on the row's own non-null columns. The planner names the outcome
+   and the tool maps it (`Unpaged` in
+   `crates/ravel-mcp/src/tools/query_sql.rs`); the tool does not classify
+   planner error text.
+3. A grouping column stays an order term a cursor resumes on. A late row
+   can add a group, which item 4's third part covers, but it cannot change
+   the key of a group already served.
+4. The ClickBench corpus, with each trailing row limit set aside, planned
+   22 of its 43 statements as pages before this. It now plans 1, and 27
+   answer `OrderTermFromOtherRows` and run unpaged: the other 21 that
+   planned, each ordered by a count, and 6 that were refused before for
+   an order term that was not a column or not proven non-null
+   (`the_clickbench_corpus_page_plan_outcomes_are_pinned` in
+   `crates/ravel-sql/src/page_plan.rs`).
+5. Not covered: an alias defined by an aggregate inside a derived table or
+   a CTE resolves as opaque, and such a statement is still refused as
+   `OrderTermNullabilityUnknown` (`invalid_argument`) rather than run
+   unpaged. It mints no cursor either way.
