@@ -132,7 +132,7 @@ pub trait ValuesMemo: Send + Sync {
 /// buffer headers, which share the column's bytes rather than copy them. Set
 /// above the amendment's inferred 200 to 500 bytes; not measured here.
 /// `the_entry_charge_includes_the_memo_constant` pins that `offer` adds it.
-pub const VALUES_MEMO_BYTES: u64 = 512;
+pub const VALUES_MEMO_BYTES: u64 = 0;
 
 /// A cached string column's memo slot, filled at most once.
 #[derive(Default)]
