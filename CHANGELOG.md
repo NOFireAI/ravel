@@ -6,6 +6,376 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-11-03
+
+### Fixed
+
+- **A resume position whose values do not have the order terms' types is
+  refused** (issue #1623). `plan_page` now checks every value of a resume
+  tuple against the type it proved for the order term at that position, and
+  refuses a mismatch with `PagePlanError::ResumeValueTypeMismatch`, naming the
+  position, the term and both types, instead of rendering a literal of another
+  type into the keyset predicate
+  (`a_resume_value_of_another_type_is_refused_at_any_position`). A fixed-width
+  binary value of another width is a mismatch. The MCP `ravel_query_sql` and
+  `ravel_search_logs` tools answer such a cursor as `cursor_invalid`
+  (`a_cursor_whose_tuple_has_another_type_is_invalid`).
+- **A MetricsBench memory-step failure no longer stops the folded read-back**
+  (issue #2821). After an `--rss-band` breach or an OOM-killed container,
+  `run.sh` lists `memory` in `stamps.json` as `deferred_failures`, runs stop,
+  fold, start and readback-folded, and then exits as before: 75 naming
+  memory, or 70 naming ingest after a failed ingest verification. A folded
+  step that fails after the memory failure exits 70 naming that step.
+- **The MetricsBench start step no longer reruns the one-shot services**
+  (issue #2821). After the fold, `run.sh` starts the stopped `ravel-server`
+  container with `docker compose up -d --no-deps --no-recreate ravel-server`
+  instead of `docker compose start ravel-server`, which also started its
+  dependencies: on the real-S3 lane `createbuckets` reran its empty-bucket
+  check against Ravel's bucket, which by then held the run's objects, exited
+  1, and failed the step. The `ravel_restart` stamp and
+  the step's failure message name the new command.
+- **MetricsBench's Mimir comparator can now list the cardinality profile's
+  1,000,000 series** (issue #2821). In `deploy/metricsbench/config/mimir.yaml`,
+  the gRPC message ceilings go from the 100 MiB default to 512 MiB: the
+  server pair, and every client pair on the query path between Mimir's own
+  components (six sections, listed in the README's frozen-limits table). At
+  the default, the harness read-back's `/api/v1/series` answered 500 ("grpc:
+  trying to send message larger than max (133231002 vs. 104857600)"), which
+  made both cardinality runs of 2026-11-03 diagnostic. A response under
+  100 MiB is unaffected.
+- **A declared typed attribute column whose key starts with `__ravel_` is
+  refused** (issue #3730, epic #1374). The prefix names Ravel's own
+  synthetic columns (`__ravel_attr[k]`, `__ravel_row_ref`, and the MCP
+  tools' `__ravel_group`, `__ravel_group_attrs`, `__ravel_depth` and
+  `__ravel_parent`), and before this nothing
+  stopped a declaration from taking one of those names. The check is
+  case-sensitive, so `__Ravel_x` is still an ordinary key
+  (`validation_rejects_reserved_prefix`,
+  `validation_accepts_keys_that_only_resemble_the_reserved_prefix`). It
+  applies to `ravel-cli typed-attr-column set`, to `ravel-server`'s
+  `--typed-attr-column` and `--typed-attr-column-tenant` flags, which now
+  fail startup on such a key, and to every durable tenant config write
+  (`set_tenant_config_refuses_a_new_reserved_key`). A tenant config record
+  stored before this rule still loads and its typed attribute columns are
+  still served (`a_stored_record_with_a_reserved_key_still_loads`,
+  `a_stored_reserved_prefix_key_is_still_applied`), and a durable write that
+  carries such a stored key through unchanged, such as a retention change,
+  still succeeds, while one adding a new reserved key is refused
+  (`set_tenant_config_keeps_a_stored_reserved_key_and_refuses_a_new_one`).
+  `ravel-cli typed-attr-column set` replaces the whole list, so it refuses
+  any reserved key, a stored one included.
+- **An MCP response that a row cap stopped stays inside its byte cap**
+  (issue #3733). The byte fit now measures the envelope with the row cap's
+  `rows_omitted` count and `row_cap_hit` already written, and under the
+  status `finish` gives it (`ok_bounded` whenever a cap took something), so
+  neither can add bytes after the fit. Before, a response packed to its cap
+  could end up a few bytes over it once the status changed from `ok` to
+  `ok_bounded`. When the byte cap cuts, the kept rows or the one cut cell can
+  now be a few bytes smaller than before.
+- **A PromQL read no longer holds every object's samples outside the memory
+  budget** (issue #3747). The local sample prefetch folds each object's scalar
+  and histogram runs into one per-series accumulator as the object's fetch
+  completes, with the result `merge_soa_runs` gives in any completion order
+  (`scalar_fold_equals_the_merge_in_any_completion_order`), and reserves what
+  the fold holds against the engine memory budget. A series carried by many
+  objects is held and charged once
+  (`a_sample_read_holds_one_copy_of_each_series_across_objects`), and a read
+  whose merged samples do not fit is refused with `FetchMemoryExhausted`
+  against the budget's limit instead of reaching the host-memory floor
+  (`a_sample_read_that_outgrows_the_budget_is_refused_against_it`). The
+  charge is 24 bytes per held scalar sample, plus an overhead per series and
+  per distinct provenance prefix, and shows under
+  `ravel_memory_reserved_bytes{component="fetch"}`. A native-histogram sample
+  costs substantially more, because its spans and buckets are charged too. A
+  large read now either answers or is refused earlier, with "fetch memory
+  exhausted", against the budget itself, so a deployment with a tight
+  `--memory-budget-bytes` may see more refusals on very large reads.
+  `TooManySeries` can now be raised partway through a fetch, at the series
+  that crosses the limit.
+- **The MCP compact text block escapes line separators, C1 controls and bidi
+  controls in every caller string** (issue #3750). String cells, column names,
+  the failure message, warnings and `next_steps` text now escape U+2028,
+  U+2029, the bidi controls U+202A to U+202E and U+2066 to U+2069, and the
+  marks U+200E, U+200F and U+061C as `\u{XXXX}`, beside the control
+  characters they already escaped. Map cells,
+  the `# shared` line and each row's diff are serialized as JSON, and each of
+  those characters the serializer left raw is written as JSON's own `\uXXXX`,
+  so U+007F, U+0085 and U+009B no longer reach the text raw
+  (`no_caller_path_writes_a_hostile_character_raw`) and each stays JSON that
+  parses back to the original map
+  (`json_cells_parse_back_to_the_original_map`). The `warnings:`
+  line now quotes each warning and writes its `"` as `\"`, so a warning
+  containing `; ` no longer reads as two
+  (`one_warning_containing_the_separator_is_not_read_as_two`). A
+  `next_step:` line quotes its action the same way, so an action containing
+  ` - ` is not read as a split
+  (`one_next_step_action_containing_the_separator_is_not_read_as_a_split`).
+  `structuredContent` is unchanged, but a consumer that parses the text block
+  sees the new escapes and quoting.
+- **The MCP docs no longer misstate `accuracy.lower_bound_count`** (issue
+  #3751). The reference and guide now say it is reserved and always `false`;
+  0.29.0's guide said it was `true` on a `COUNT` over `logs` or `spans`. The
+  reference also
+  says that a `budget_exceeded` names its counter in `failure.message`, with
+  `failure.counter` set only for the analyze-timeseries series cap.
+
+### Added
+
+- **`ravel_get_trace` reports the span tree** (#1382, epic #1374). Every span
+  carries `__ravel_depth`, its count of returned ancestors, and
+  `__ravel_parent`: `root`, `present`, `cycle`, or, for a parent id no
+  returned span has, `missing` when the result is complete and `not_returned`
+  when it is not, because a row or byte cap fired or coverage is partial
+  (`missing_parent_is_disclosed`,
+  `a_row_capped_result_never_says_missing`,
+  `get_trace_reports_the_span_tree_and_a_dropped_root`). The tree is labelled
+  after the byte fit over the rows that survive it, and the envelope stays
+  inside the cap
+  (`a_byte_capped_result_labels_after_the_fit_and_stays_inside_the_cap`). A
+  child that starts before its parent still resolves
+  (`a_child_that_starts_before_its_parent_is_present`), a parent loop ends
+  the walk as `cycle` with a null depth
+  (`a_parent_cycle_ends_and_is_labelled`), and a duplicated span id resolves
+  to its first row (`a_duplicated_span_id_resolves_to_its_first_row`). A
+  `missing` parent under a `time_range` adds a `widen_time_range` next step,
+  and a `not_returned` one adds `raise_max_rows`
+  (`next_steps_appear_exactly_for_an_absent_parent`). `include_logs: true` is
+  still refused as `unsupported`, and its message now names
+  `ravel_search_logs` (`include_logs_names_search_logs`).
+- **`benchmarks/mcp-eval` holds the MCP agent evaluation corpus and runner**
+  (issue #1385, epic #1374). It has 24 questions across six journeys, their
+  expected answers and evidence, the bands, and a seeded OTLP fixture.
+  `run.sh --check` validates the corpus offline, `--fixture` loads the
+  fixture into an empty tenant, and `--run baseline|full` runs every case
+  through `$MCP_EVAL_AGENT_CMD` and scores correctness, evidence, tool calls,
+  invalid queries, retries, store requests and bytes. No results are
+  recorded yet, and a run refuses an `--out` inside the repository.
+- **MetricsBench counts Ravel's objects after ingest** (issue #2821). The
+  new `objects` step of `deploy/metricsbench/run.sh` lists Ravel's bucket on
+  either lane and writes `ravel-objects.json` with the count and bytes of data
+  objects, commit records, store-qualify probes and everything else, and the
+  optional `--ravel-objects-band MIN:MAX` fails the run when the data object
+  count, and not the whole bucket, falls outside it.
+- **The MCP server serves `ravel_query_sql`** (epic #1374). It runs one
+  read-only `SELECT` over one table, with its rows filtered to the required
+  `time_range` rather than only the segments listed for it
+  (`query_sql_excludes_a_row_outside_time_range_from_an_overlapping_segment`),
+  and pages by keyset. The statement is checked before anything is read:
+  two tables are `invalid_argument` with a `split_the_statement` next step,
+  a write is `unsupported`, and a statement the page planner refuses, such
+  as one with its own `LIMIT` or a float `ORDER BY` term, is
+  `invalid_argument` naming the reason
+  (`statement_refusals_are_answered_before_the_backend`). An `ORDER BY` term
+  computed from other rows (an aggregate, a window function such as
+  `count(*) OVER ()`, or a subquery) carries no cursor, since a row committed
+  between pages could move a group past it: the statement runs as written, a
+  capped result is `ok_bounded`, and an `order_by_the_rows_own_columns` next
+  step says that paging needs an order on the row's own columns (issue
+  #3749). A full page of a
+  statement with no `ORDER BY` to page by ends `ok_bounded` with no cursor
+  (`a_capped_statement_with_no_order_is_bounded`). Under a total order
+  the cursor resumes after the page's last row
+  (`query_sql_walks_a_total_order_three_pages_by_keyset`); under an order that
+  is not total, a page ends before an open group of equal rows
+  (`a_grouped_page_ends_before_an_open_group`). A later page resolves at page
+  one's instant and audits at its own clock
+  (`a_later_query_sql_page_resolves_at_the_mint_instant_and_audits_at_the_callers_clock`).
+  A full page with no cursor position (no complete group, a boundary value
+  that has no cursor encoding, or a cursor over its 4 KiB bound) also ends
+  `ok_bounded` with
+  no cursor and a next step
+  (`no_complete_group_fits_is_bounded_with_no_cursor`,
+  `a_boundary_with_no_cursor_position_is_bounded_with_a_next_step`). A newer
+  erasure expires the cursor (`a_newer_erasure_expires_the_cursor`), and a
+  cursor sent with another statement or `time_range` is `cursor_invalid`
+  (`a_cursor_for_another_query_or_time_range_is_refused`). `max_rows` defaults to
+  200 with a ceiling of 5,000. An `evidence_ref` is refused as `unsupported`.
+- **`metricsbench_ingest --readback-only` reads one system back from a kept
+  `ingest.json` without replaying anything** (#3685). It rebuilds the row's
+  read-back plan from the same stream through the replay's own recording
+  path, reads the row back with its commit tokens, and exits 0 on a match, 1
+  on a mismatch, a read-back error or another setup failure, and 64 on a
+  refused report or flag, including a stream that drifted from the kept one.
+- **MetricsBench reads Ravel back on a folded catalog** (#3685). After the
+  memory step, `deploy/metricsbench/run.sh` stops ravel-server, folds the
+  metrics catalog with every writer stopped, starts the server again, and
+  repeats the Ravel read-back. It fails the run when the folded read-back
+  does not match, or when its catalog GETs exceed
+  `--folded-catalog-get-floor` (default 64) plus
+  `--folded-catalog-get-max-fraction` (default 0.05) of the data objects the
+  objects step listed; an unfolded read costs about one per object.
+- **The MCP server serves `ravel_query_promql`** (epic #1374). It runs an
+  instant evaluation (`evaluation_time`) or a range evaluation
+  (`time_range` with `step`) and answers one row per series, the series'
+  `ts_ns` and `value` as parallel arrays, with `NaN` and `-0.0` kept
+  (`query_promql_answers_both_modes_with_exact_samples`). The mode is checked
+  before anything is read: both modes, neither, or half of the range pair is
+  `invalid_argument` (`both_modes_or_neither_is_refused_before_the_backend`),
+  and so is a step without a unit or an empty range
+  (`a_bad_step_or_an_empty_range_is_refused_before_the_backend`). A time or
+  step that is not a whole millisecond is refused rather than rounded
+  (`sub_millisecond_inputs_are_refused_not_truncated`). The range is
+  half-open: steps run from `start_ns` while below `end_ns`, and the scope
+  reports the step alignment and the 5 m lookback. A result that skipped
+  part of its coverage is refused as `unavailable` unless the call sets
+  `allow_partial_coverage: true`
+  (`partial_coverage_is_refused_without_consent_and_returned_with_it`); a
+  partial result returned with that consent reports `accuracy.exact: false`,
+  with an approximation saying it omits the data the query could not reach
+  (issue #3751).
+  `max_rows` counts series, defaults to 200 with a ceiling of 5,000, and a
+  capped result is `ok_bounded` with no cursor
+  (`query_promql_max_rows_caps_series_and_is_ok_bounded`). A range of more
+  than 11,000 steps, the engine's own limit, is `invalid_argument` before the
+  backend call, with a next step naming the smallest step that fits
+  (`a_range_over_the_step_limit_is_refused_before_the_backend`). A series
+  whose samples do not fit `max_response_bytes` keeps a prefix of them as
+  parallel arrays of one length, with `samples_omitted` counting the rest,
+  and the result is `ok_bounded`
+  (`a_series_over_the_byte_cap_keeps_an_aligned_prefix`,
+  `query_promql_bounds_a_long_series_by_steps_and_bytes`). `ravel_log_lines`
+  and `ravel_log_bytes` work over a logs tenant
+  (`query_promql_counts_log_lines_and_bytes`). An `evidence_ref` is refused
+  as `unsupported`.
+- **`ravel-cli load` writes batches into a range of past ingest hours**
+  (issue #3700). `--ingest-hour-stride <hours> --ingest-hour-start <unix
+  hour>` writes batch i into ingest hour start + i x stride through a shifted
+  clock, so a fresh tenant can span many ingest hours for read-path
+  measurement (ADR-3692 decision 8). The hours are synthetic, so the lane is
+  for fresh measurement tenants only. It forces one fully acked batch per
+  hour (`--pipeline-depth 1`, `--read-cursors 1`, `--target-bytes 1`), and
+  refuses with exit code 2 before any write for `--signal metrics`, on a
+  tenant that already has a HEAD or commit records, when the range reaches
+  the current hour, or when the start is before 2020-01-01. Before each
+  batch it fails the load if the catalog HEAD has appeared (a fold ran
+  during the load) or if the batch's
+  event times reach past its hour plus `max_ingest_lag`; a failed strided
+  load is not resumable. The load report names the synthetic hours.
+  `ravel-cli catalog fold --snapshot-part-max-entries <n>` overrides the
+  snapshot part cap for one fold, so a small cap gives hour-ranged parts.
+- **Ingest holds at the head while the flush backlog is over a bound**
+  (ADR-3718, issues #3720 and #3756). A background detector reads each ingest
+  router's queued flush count and the routers' deferred-flush-trigger counts
+  every 100 ms. The node counts as congested while any one router's queued
+  flush count is above that router's bound and at least 1 flush trigger was
+  deferred across all routers over the last full second. Neither signal alone
+  counts: a healthy node at its queue cap defers triggers, and a node with
+  many tenants can sit above the bound with no backlog. A router's bound is its
+  shard count times `--max-queued-flushes` (32 at the defaults), unless
+  `--ingest-hold-queued-flushes` sets one bound for every router. While it is
+  congested, every OTLP and Remote Write request waits at the head, right after
+  the in-flight permit and before the tenant is resolved, for up to
+  `--ingest-hold-max-wait` (default `1s`, at most `20s`, the listener-join
+  share of the default `--shutdown-timeout`). A request whose wait ends with
+  the congestion cleared is admitted; one
+  still congested at the max wait gets 429 with `Retry-After: 1` on HTTP and
+  `RESOURCE_EXHAUSTED` on gRPC. An OTAP stream holds once per
+  `BatchArrowRecords` batch, after that batch's own in-flight permit; its
+  tenant was resolved when the stream opened, and a refused batch ends the
+  stream. Held requests are counted on `ravel_ingest_head_hold_total{mode,
+  outcome}` and timed on the histogram `ravel_ingest_head_hold_seconds{mode}`;
+  the gauge `ravel_ingest_head_congested{mode}` reads 1 while the hold is on.
+  `--ingest-hold-max-wait 0` turns the hold off and spawns no detector task.
+  On GKE at a fixed 160k log lines/s offered on 8 cores, the hold kept two
+  overloaded nodes at 141k to 150k lines/s stored, where unheld collapses
+  settled at about 112k.
+  It does not make a node that locked into overload recover (#3718 comment
+  6610502055).
+- **The MCP server serves `ravel_analyze_timeseries`** (epic #1374). It
+  runs `change_point` or `summary` over each series of a PromQL range result
+  and answers one row per series, through the same service method as
+  `POST /api/v1/analytics`, so admission and the `analytics` audit record are
+  the route's (`analyze_timeseries_summary_is_exact_and_matches_the_http_route`).
+  A change point lands where the series changes
+  (`analyze_timeseries_places_a_change_point_where_it_was_built`). Both ops
+  are reported as heuristics, `accuracy.exact: false` with the method named,
+  and every row carries the minimum point count and whether the series was
+  downsampled; `change_point` bucket-averages a series over 2,000 points and
+  `summary` never downsamples
+  (`analyze_timeseries_reports_downsampling_and_summary_never_does`). A series
+  under the minimum is a row marked `too_few_points`, not a failed call
+  (`analyze_timeseries_reports_too_few_points_per_row`). The range arguments
+  are checked by the same function as `ravel_query_promql`'s, before anything
+  is read, and both tools refuse the same inputs with the same message
+  (`both_tools_refuse_the_same_bad_ranges_before_the_backend`,
+  `analyze_timeseries_refuses_bad_ranges_before_the_store`). A result that
+  skipped part of its coverage is refused as `unavailable`, with a next step
+  to read the partial series through `ravel_query_promql`. `max_rows` counts
+  series; the scan budgets and an `evidence_ref` are refused as
+  `unsupported`.
+- **The MCP server serves `ravel_search_logs`** (epic #1374), the last of the
+  nine tools. Typed predicates (`eq`, `ne`, `in`, `exists`) on typed attribute
+  columns and an indexed `trace_id`, a `has_word` body search, a minimum
+  severity and a trace id compile to one `SELECT` over `logs`, with every
+  caller value rendered as a typed literal (text single-quoted, bytes as
+  `X'...'`)
+  (`caller_values_reach_the_statement_only_as_literals`,
+  `search_logs_filters_and_pages_a_logs_tenant`). A predicate key that is
+  neither a typed attribute column nor `trace_id` with `trace_id` indexed is
+  refused before any statement runs, an indexed key that is not a typed
+  attribute column included, with a next step naming `ravel_describe_data`
+  (`an_unknown_key_is_refused_before_the_statement_runs`,
+  `an_indexed_key_other_than_trace_id_is_refused_unless_declared`). Results
+  order and page by `(ts, observed_ts)`, and a page never ends inside a group
+  of rows equal on that pair (`a_group_straddling_the_cap_is_not_split`); a
+  group larger than the page comes back `ok_bounded` with no cursor
+  (`a_group_larger_than_max_rows_is_bounded_with_no_cursor`). Rows with the
+  same attribute key set form a group, and the attributes the whole group
+  shares are listed once in `__ravel_group_attrs`
+  (`shared_attributes_are_hoisted_once_per_group`). The tool's two columns,
+  `__ravel_group` and `__ravel_group_attrs`, cannot collide with a declared
+  attribute column named `group` or `group_attrs`
+  (`search_logs_group_columns_cannot_collide_with_a_declared_column`). An
+  `evidence_ref` is refused as `unsupported`. All nine tools are now served
+  and none is only catalogued: 0.29.0 served five, and this release adds
+  `ravel_query_sql`, `ravel_query_promql`, `ravel_analyze_timeseries` and
+  `ravel_search_logs`, and the span tree in `ravel_get_trace`, whose logs leg
+  (`include_logs`) is still deferred.
+
+### Changed
+
+- **The MCP tools reference is generated from the tool catalog.** Each tool's
+  title, description, annotations and arguments (JSON type and whether
+  required) in `docs/reference/mcp.md` now come from the catalog the server
+  advertises in `tools/list`, and a test fails when the page drifts from it.
+  The reference and the guide now state, tool by tool, how an `evidence_ref`
+  argument is handled.
+- **MetricsBench runs Ravel at fetch concurrency 32** (issue #2821).
+  `deploy/metricsbench/ravel.yml` sets `--fetch-concurrency 32` in place of
+  the derived default, `max(8, 2 x cores)`, which is 8 in the benchmark's
+  2-CPU container. It is disclosed in the README's settings list and in an
+  ADR-0927 amendment. On real S3 the cardinality read-back is bound by GETs
+  in flight. On the folded 1,000,000-series tenant, its `/api/v1/series`
+  listing took 264 to 277 s at 8, past the 120 s deadline, and 71 to 74 s at
+  32, with the same GETs and bytes. Ravel's own derivation is unchanged.
+- **Cached log string columns hand SQL their values without a copy** (issue
+  #3231). With the decoded-column cache on (it is off by default:
+  `--decoded-cache-max-bytes` defaults to 0), each cached string column keeps
+  one Arrow values array over its own buffers, built once. A scan served
+  from the cache, or the scan that admits the entry, now reuses that array
+  instead of copying
+  every cell: a plain column whose block no filter narrowed and whose rows
+  are all present also skips the per-row key loop, and a block's own
+  dictionary skips its per-scan values copy. Results are unchanged. The
+  cache's memory reservation now lasts until the last Arrow buffer over an
+  entry's bytes is gone, so the memory pressure evictor no longer counts as
+  freed an entry a query result still holds. Each cached string column that
+  can carry the array is charged 512 bytes more when admitted. A ClickBench
+  run at an 8 GB cache measured 20% more evictions and 4% more misses per
+  round, which the counters attribute to the larger charge (#3326 comment
+  6607706943). Building the array counts
+  once per cache entry in `strCellsValidated`. An offer refused because the
+  column already carries a filled reservation (admitted concurrently under
+  another key, or evicted while something outside the cache still held it)
+  is counted in the new `stats.decodedCache.filledCellRefusals`.
+- **The whole-segment fast path's serve-if-fits check stops early** (issue
+  #3642). With the decoded cache on, a `LIKE '%...%'` scan whose decoded-set
+  estimate passes 0.95 of `--decoded-cache-max-bytes` stops reading segment
+  directories at that point, since the verdict can no longer change. Its
+  `stats.decodedCache.deferredSetEstimateBytes` is then the sum read so far,
+  a lower bound, and the new `deferredSetEstimatePartial: true` says so. A
+  scan that fits reads and reports exactly as before.
+
 ## [0.29.0] - 2026-11-02
 
 ### Fixed
