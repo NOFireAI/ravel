@@ -21,9 +21,18 @@
 //! Nothing else: the admission permit, the
 //! deadline clamp, the cost record, the usage guard, the audit submission, the
 //! partial-coverage gate, and the error redaction all live inside the service
-//! layer, and a tool call takes exactly one permit because it makes exactly
-//! one of these calls (ADR-1374 decision 7). Taking a second permit here
-//! would deadlock a deployment whose ceiling is 1.
+//! layer. Each service call takes its own permit and releases it when it
+//! returns. Every tool makes one service call except `ravel_search_logs` with
+//! predicates, which reads the declared columns before its statement and so
+//! takes two permits one after the other, never two at once (ADR-1374
+//! decision 7 as amended 2026-11-03). Taking a permit here as well would
+//! deadlock a deployment whose ceiling is 1.
+//!
+//! One deadline bounds the whole tool call. [`ServiceBackend::with_call_start`]
+//! fixes it at the call's start, and each service call runs under what
+//! remains of it, so a second call gets only what the first left; a call
+//! that would start with nothing left fails as `deadline` without running or
+//! taking a permit.
 //!
 //! Nothing here spawns: the service call is awaited on the same task the tool
 //! future runs on, so cancelling that future cancels the engine call and the
@@ -87,15 +96,59 @@ pub struct ServiceBackend {
     service: QueryService,
     budgets: McpEffectiveBudgets,
     progress: Option<ProgressReporter>,
+    call_deadline: Option<tokio::time::Instant>,
 }
 
 impl ServiceBackend {
+    /// A backend whose every service call gets the whole effective deadline
+    /// from its own start. The adapter adds [`Self::with_call_start`], which
+    /// bounds a tool call's service calls together.
     pub fn new(service: QueryService, budgets: McpEffectiveBudgets) -> Self {
         ServiceBackend {
             service,
             budgets,
             progress: None,
+            call_deadline: None,
         }
+    }
+
+    /// Bound every service call this backend makes by one deadline, the
+    /// effective deadline measured from `started`, the tool call's start.
+    /// A later call gets only what an earlier one left, and a call that
+    /// would start with nothing left fails as `deadline` without running.
+    pub fn with_call_start(mut self, started: tokio::time::Instant) -> Self {
+        self.call_deadline = started.checked_add(self.budgets.deadline);
+        self
+    }
+
+    /// The deadline the next service call runs under: what remains of the
+    /// tool call's deadline, never above the effective ceiling.
+    fn remaining(&self) -> Result<Duration, Failure> {
+        let Some(at) = self.call_deadline else {
+            return Ok(self.budgets.deadline);
+        };
+        let left = at.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Err(Failure {
+                class: FailureClass::Deadline,
+                message: format!("query exceeded its deadline of {:?}", self.budgets.deadline),
+                counter: None,
+            });
+        }
+        Ok(left.min(self.budgets.deadline))
+    }
+
+    /// `request` with its deadline lowered to what the tool call has left.
+    fn bounded<T: Clone>(
+        &self,
+        request: &T,
+        deadline: impl FnOnce(&mut T) -> &mut Duration,
+    ) -> Result<T, Failure> {
+        let remaining = self.remaining()?;
+        let mut bounded = request.clone();
+        let field = deadline(&mut bounded);
+        *field = (*field).min(remaining);
+        Ok(bounded)
     }
 
     /// Report phase progress to the client that supplied a `progressToken`.
@@ -405,6 +458,7 @@ impl QueryBackend for ServiceBackend {
         tenant_hash: TenantHash,
         request: &InstantRequest,
     ) -> Result<Envelope, Failure> {
+        let request = &self.bounded(request, |request| &mut request.deadline)?;
         let outcome = self
             .service
             .promql_instant(tenant_hash, request)
@@ -428,6 +482,7 @@ impl QueryBackend for ServiceBackend {
         tenant_hash: TenantHash,
         request: &RangeRequest,
     ) -> Result<Envelope, Failure> {
+        let request = &self.bounded(request, |request| &mut request.deadline)?;
         let outcome = self
             .service
             .promql_range(tenant_hash, request)
@@ -458,6 +513,7 @@ impl QueryBackend for ServiceBackend {
         tenant_hash: TenantHash,
         request: &MetadataRequest,
     ) -> Result<Envelope, Failure> {
+        let request = &self.bounded(request, |request| &mut request.deadline)?;
         let outcome = self
             .service
             .labels(tenant_hash, request)
@@ -477,6 +533,7 @@ impl QueryBackend for ServiceBackend {
         name: &str,
         include_log_metric_names: bool,
     ) -> Result<Envelope, Failure> {
+        let request = &self.bounded(request, |request| &mut request.deadline)?;
         let outcome = self
             .service
             .label_values(tenant_hash, request, name, include_log_metric_names)
@@ -498,6 +555,7 @@ impl QueryBackend for ServiceBackend {
         tenant_hash: TenantHash,
         request: &MetadataRequest,
     ) -> Result<Envelope, Failure> {
+        let request = &self.bounded(request, |request| &mut request.deadline)?;
         let outcome = self
             .service
             .series(tenant_hash, request)
@@ -522,7 +580,7 @@ impl QueryBackend for ServiceBackend {
             end_ms: args.end_ms,
             step_ms: args.step_ms,
             min_tokens: decode_tokens(&args.min_tokens)?,
-            deadline: deadline(args.deadline_ms, self.budgets.deadline),
+            deadline: deadline(args.deadline_ms, self.remaining()?),
             allow_partial: args.allow_partial,
         };
 
@@ -580,7 +638,7 @@ impl QueryBackend for ServiceBackend {
             start_ns: args.start_ns,
             end_ns: args.end_ns,
             min_tokens: decode_tokens(&args.min_tokens)?,
-            deadline: deadline(args.deadline_ms, self.budgets.deadline),
+            deadline: deadline(args.deadline_ms, self.remaining()?),
         };
 
         let outcome = self
@@ -611,6 +669,7 @@ impl QueryBackend for ServiceBackend {
         resolve_at_ns: i64,
         order_columns: &[String],
     ) -> Result<Draft, Failure> {
+        let request = &self.bounded(request, |request| &mut request.deadline)?;
         let outcome = self
             .service
             .sql_execute_at(tenant_hash, request, resolve_at_ns)
@@ -649,7 +708,7 @@ impl QueryBackend for ServiceBackend {
             start_ns: request.window.map(|window| window.start_ns),
             end_ns: request.window.map(|window| window.end_ns),
             min_tokens: Vec::new(),
-            deadline: self.budgets.deadline,
+            deadline: self.remaining()?,
             // A window the caller named bounds the rows as well as the
             // listing, so a bounded call returns only spans that start in it.
             row_window: true,
@@ -680,6 +739,7 @@ impl QueryBackend for ServiceBackend {
         tenant_hash: TenantHash,
         request: &ravel_sql::SqlRequest,
     ) -> Result<ExplainOutcome, Failure> {
+        let request = &self.bounded(request, |request| &mut request.deadline)?;
         let report = self
             .service
             .sql_explain(tenant_hash, request)
@@ -740,7 +800,7 @@ impl QueryBackend for ServiceBackend {
                     limit: Some(request.limit),
                     resolve_at_ns: request.resolve_at_ns,
                     caller_now_ns: request.caller_now_ns,
-                    deadline: self.budgets.deadline,
+                    deadline: self.remaining()?,
                 },
             )
             .await

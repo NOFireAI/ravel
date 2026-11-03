@@ -502,6 +502,13 @@ never as statement text. `scope.predicates_applied` lists the compiled
 conditions and `scope.order_by` the order. `time_range` filters rows, as on
 `ravel_query_sql`.
 
+A call with `predicates` makes two service calls, the typed attribute
+column lookup and then the statement, one after the other and both under the
+call's one deadline, so the statement runs under what the lookup left.
+`budget.actual` counts the statement only. Every page of such a call
+carries a warning saying so; a call without `predicates` makes no lookup
+and carries no such warning.
+
 The result's first two columns are added by the tool, and the `logs`
 columns follow in table order. The two tool columns carry the `__ravel_`
 prefix of the `logs` schema's own synthetic names, so a typed
@@ -899,8 +906,10 @@ the cursor pinned it, and a digest cannot answer that.
 
 ### Redemption
 
-A cursor stays valid until the earlier of the call's remaining deadline
-and the protection horizon minus the grace period.
+A cursor stays valid until the protection horizon minus the grace period,
+measured from the instant the cursor was minted. The deadline of the call
+that minted it does not bound it: a cursor is redeemed by a later call,
+which runs under its own deadline.
 
 Redeeming a cursor does two things. The server holds nothing in between
 calls.
@@ -1120,6 +1129,13 @@ failure.
 The effective budget for a call is the smallest of the server's ceiling,
 the tenant's ceiling, and the value the caller sent. A caller can never
 raise a value past its ceiling.
+
+The deadline bounds the whole tool call and is measured from the call's
+start. A tool that makes more than one service call runs each under what
+is left of it, and a service call that would start with nothing left fails
+the call as `deadline` without running. Each service call takes its own
+admission permit and releases it before the next one starts, so a call
+never holds two.
 
 ## Protocol headers per revision
 
