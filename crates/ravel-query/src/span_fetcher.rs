@@ -3496,6 +3496,77 @@ mod tests {
         }
     }
 
+    /// A GET that fails before any byte arrives decodes no footer, so it
+    /// records no `segmentsOpened` in any phase, on the ranged trace path
+    /// (whose footer open is charged to probe) or the whole-object path
+    /// (charged to scan); the second fetch, whose GET passes through, records
+    /// the one open under that phase.
+    ///
+    /// FLIP: counting the open before the probe GET on the ranged path, or
+    /// before the whole-object GET, reads `left: 1, right: 0` on the failed
+    /// fetch's phase.
+    #[tokio::test]
+    async fn a_failed_get_records_no_segment_open() {
+        use ravel_object_store::fault::ScriptedFault;
+        use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule};
+
+        for (query, counted) in [
+            (
+                SpanQuery::trace(trace(3), i64::MIN, i64::MAX),
+                QueryPhase::Probe,
+            ),
+            (SpanQuery::ts_range(i64::MIN, i64::MAX), QueryPhase::Scan),
+        ] {
+            let mut fx = trace_fixture().await;
+            let plan = FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::Permanent("injected".into()))
+                    .with_key_contains(fx.a.data_object_key.clone())
+                    .with_occurrence(Occurrence::Nth(1)),
+            );
+            let fault = Arc::new(FaultStore::new(
+                GetLog::new(fx.memory.take().expect("memory")),
+                plan,
+            ));
+            let fetcher = SpanSegmentFetcher::new(fault.clone()).with_trace_probe_bytes(fx.probe);
+
+            let failed = PhaseAccounting::new();
+            let err = fetcher
+                .fetch_accounted_in_blocks(&fx.a, TENANT, &query, None, None, &[], None, &failed)
+                .await;
+            assert!(err.is_err(), "{query:?}: the injected GET failure surfaces");
+            assert_eq!(
+                fault.fault_count(Op::Get, FaultKind::Permanent),
+                1,
+                "{query:?}: the fault fired"
+            );
+            let phases = failed.snapshot();
+            for phase in QueryPhase::ALL {
+                assert_eq!(
+                    phases.phase(phase).segments_opened,
+                    0,
+                    "{query:?}, {}: the failed GET decoded no footer",
+                    phase.name()
+                );
+            }
+
+            let retried = PhaseAccounting::new();
+            fetcher
+                .fetch_accounted_in_blocks(&fx.a, TENANT, &query, None, None, &[], None, &retried)
+                .await
+                .expect("the second GET passes through")
+                .expect("A is ts-relevant");
+            let phases = retried.snapshot();
+            for phase in QueryPhase::ALL {
+                assert_eq!(
+                    phases.phase(phase).segments_opened,
+                    u64::from(phase == counted),
+                    "{query:?}, {}",
+                    phase.name()
+                );
+            }
+        }
+    }
+
     /// A segment the catalog ts pre-check rules out is never opened, on the
     /// ranged trace path or the whole-object path, so no phase counts it.
     ///
