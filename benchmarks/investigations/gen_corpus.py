@@ -449,6 +449,7 @@ def main(argv):
     for value, rows in needles.items():
         answers[f"needle.{value}"] = answer(1, value=len(rows))
     needle_blocks = {v: len({r // BLOCK_ROWS for r in rows}) for v, rows in needles.items()}
+    needle_blocks["any"] = len({r // BLOCK_ROWS for r in needle_of})
 
     # The erasure_in_flight state's victim: one log row no statement reads, so
     # a pending erasure leaves every answer as truth.json gives it.
@@ -463,6 +464,7 @@ def main(argv):
             rid = request_id_of(tid, r % lpt)
             if r != present_row and r not in needle_of and tid not in busy_tids and rid not in busy_rids:
                 victim = {"request_id": rid, "trace_id": tid}
+                answers["erasure_victim.present"] = answer(1, row_set=[tid])
                 break
 
     # Journey C build sides: the first k root spans of the failing hour.

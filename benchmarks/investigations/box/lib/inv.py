@@ -18,6 +18,13 @@ Subcommands:
                             and peak RSS as JSON
   census-listing            the census of an aws s3api list-objects-v2
                             listing (the s3 lane)
+  merge-truth               fold the tail and many_parts_N corpora's truth
+                            into truth.json (sub.<name>, answers <name>.*)
+  inspect-stamp             one state's inspect stamps for one tenant and
+                            signal: catalog, data object header, leaf,
+                            typed-attr-column show
+  needle-blocks             storage blocks holding a needle, from rlog
+                            inspect's field directory
   stamp                     write or append one stamp document
   get                       print one run.toml value for bash
   warmup                    wait for the server's startup cache warmup and
@@ -187,18 +194,51 @@ def cmd_s3(args):
         return
     if args.op == "census":
         keys = s3_list_all(env, args.prefix)
-        write_json(args.out, census_doc(env["bucket"], args.prefix, keys))
+        write_keys(args.keys_out, keys)
+        write_json(args.out, census_doc(env["bucket"], args.prefix, keys, load_tenants(args.tenants)))
         return
     die(f"unknown s3 op {args.op}", 64)
 
 
-def census_doc(bucket, prefix, keys):
+SIGNAL_DIR = {"s": "spans", "l": "logs", "m": "metrics"}
+
+
+def tenant_census(keys, tenant_hash):
+    """One tenant's objects: classes by layout path, each signal's data objects
+    with its largest (the object the per-state inspect stamps read), and every
+    catalog object's size (HEAD, snapshot parts, key-index leaves)."""
+    classes, data, catalog = {}, {}, {}
+    for key, size in keys:
+        parts = key.split("/")
+        if len(parts) < 4 or parts[0] != "t" or parts[1] != tenant_hash:
+            continue
+        rest = parts[2:]
+        if rest[0] == "catalog":
+            cls = "/".join(rest[:3]) if len(rest) > 3 else "/".join(rest[:2]) + "/HEAD"
+            catalog[key] = size
+        elif rest[0] in SIGNAL_DIR:
+            cls = "/".join(rest[:2])
+            d = data.setdefault(SIGNAL_DIR[rest[0]], {"objects": 0, "bytes": 0, "largest": None, "largest_bytes": -1})
+            d["objects"] += 1
+            d["bytes"] += size
+            if size > d["largest_bytes"] or (size == d["largest_bytes"] and key < d["largest"]):
+                d["largest"], d["largest_bytes"] = key, size
+        else:
+            cls = rest[0]
+        c = classes.setdefault(cls, {"objects": 0, "bytes": 0})
+        c["objects"] += 1
+        c["bytes"] += size
+    return {"hash": tenant_hash, "classes": dict(sorted(classes.items())), "data": dict(sorted(data.items())),
+            "catalog_objects": dict(sorted(catalog.items()))}
+
+
+def census_doc(bucket, prefix, keys, tenants=None):
     classes = {}
     for key, size in keys:
         c = classes.setdefault(object_class(key), {"objects": 0, "bytes": 0})
         c["objects"] += 1
         c["bytes"] += size
-    return {
+    doc = {
         "verified_at": utc_now(),
         "bucket": bucket,
         "prefix": prefix,
@@ -206,6 +246,23 @@ def census_doc(bucket, prefix, keys):
         "bytes": sum(s for _, s in keys),
         "classes": dict(sorted(classes.items())),
     }
+    if tenants:
+        doc["tenants"] = {name: tenant_census(keys, h) for name, h in sorted(tenants.items())}
+    return doc
+
+
+def load_tenants(path):
+    if not path:
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def write_keys(path, keys):
+    if path:
+        with open(path, "w") as f:
+            for key, size in keys:
+                f.write(f"{size}\t{key}\n")
 
 
 def cmd_census_listing(args):
@@ -218,7 +275,214 @@ def cmd_census_listing(args):
     except (OSError, ValueError) as e:
         die(f"census-listing: {args.listing}: {e}")
     keys = [(o["Key"], int(o["Size"])) for o in doc.get("Contents") or []]
-    write_json(args.out, census_doc(args.bucket, "", keys))
+    write_keys(args.keys_out, keys)
+    write_json(args.out, census_doc(args.bucket, "", keys, load_tenants(args.tenants)))
+
+
+# --- truth, inspect stamps -----------------------------------------------------
+
+
+def cmd_merge_truth(args):
+    """Fold the extra corpora (the mixed state's tail hour, each many_parts_N
+    tenant's corpus) into truth.json: each under sub.<name>, its answers
+    copied to the top level under <name>., and mixed.needle.* the sum of the
+    base and tail needle counts (the mixed state holds both)."""
+    with open(args.base) as f:
+        truth = json.load(f)
+    truth["sub"] = {}
+    for spec in args.sub:
+        name, sep, path = spec.partition("=")
+        if not sep or not name:
+            die(f"merge-truth: --sub wants NAME=PATH, got {spec!r}", 64)
+        with open(path) as f:
+            sub = json.load(f)
+        truth["sub"][name] = sub
+        for k, v in sub["answers"].items():
+            truth["answers"][f"{name}.{k}"] = v
+    tail = truth["sub"].get("tail")
+    if tail:
+        for k in [k for k in truth["answers"] if k.startswith("needle.")]:
+            got = truth["answers"][k]["value"] + tail["answers"][k]["value"]
+            truth["answers"]["mixed." + k] = {"rows": 1, "value": got}
+    write_json(args.out, truth)
+
+
+def cli_base(args):
+    return [args.cli_bin, "--store", "s3", "--tenant-hash-unkeyed"]
+
+
+def run_cli(cmd, stop_at=None):
+    """A ravel-cli command's stdout lines. stop_at ends the read (and the
+    child) at the first line starting with it: rspan inspect prints every
+    record after the header."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+    lines = []
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        if stop_at and line.startswith(stop_at):
+            proc.kill()
+            proc.wait()
+            return lines
+        lines.append(line)
+    err = proc.stderr.read()
+    if proc.wait() != 0:
+        die(f"{' '.join(cmd[4:])}: exit {proc.returncode}: {err.strip()[:300]}")
+    return lines
+
+
+def kv_fields(text):
+    return dict(kv.split("=", 1) for kv in text.split() if "=" in kv)
+
+
+def as_int(v):
+    return int(v) if isinstance(v, str) and v.isdigit() else v
+
+
+def parse_catalog_inspect(lines, catalog_objects):
+    """catalog inspect's text: the HEAD header, each snapshot part with its
+    entry count, and each key-index leaf the part carries with its size from
+    the census."""
+    doc = {"head": None, "parts": []}
+    part = None
+    for line in lines:
+        s = line.strip()
+        if "HEAD" in s and "absent" in s:
+            doc["head"] = None
+            doc["head_absent"] = s
+            return doc
+        if line.startswith("  part["):
+            f = kv_fields(s)
+            part = {"index": int(s[5:s.index("]")]), "range": f.get("range"), "key": f.get("key"),
+                    "bytes": as_int(f.get("size")), "entry_count": as_int(f.get("entry_count")), "leaves": []}
+            doc["parts"].append(part)
+        elif s.startswith("field=") and part is not None:
+            f = kv_fields(s)
+            part["leaves"].append({"field": f.get("field"), "entry_count": as_int(f.get("entry_count")),
+                                   "uncovered_count": as_int(f.get("uncovered_count")), "key": f.get("key"),
+                                   "bytes": catalog_objects.get(f.get("key"))})
+        elif s.startswith("key_index (field 8):") and part is not None:
+            part["key_index"] = s.split(":", 1)[1].strip()
+        elif part is None and ":" in s and not s.startswith("parts"):
+            k, _, v = s.partition(":")
+            if k in ("format_version", "watermark_hour", "folder_id", "created_unix_ns", "shard_count", "signal"):
+                if doc["head"] is None:
+                    doc["head"] = {}
+                doc["head"][k] = as_int(v.strip())
+        elif s.startswith("parts:"):
+            doc["parts_declared"] = int(s.split(":", 1)[1])
+    doc["part_count"] = len(doc["parts"])
+    doc["parts_with_leaves"] = sum(1 for p in doc["parts"] if p["leaves"])
+    doc["entries"] = sum(p["entry_count"] or 0 for p in doc["parts"])
+    return doc
+
+
+def parse_object_inspect(lines):
+    """rspan/rlog inspect's header: version, the section table, KEY_IDX and
+    its fields, the field directory, and the footer length (the bytes after
+    the last section)."""
+    doc = {"sections": [], "key_idx": None, "key_idx_fields": [], "field_dir": []}
+    where = "header"
+    for line in lines:
+        s = line.strip()
+        if not line.startswith(" "):
+            if s.startswith("key_idx:"):
+                doc["key_idx"] = {k: as_int(v) for k, v in kv_fields(s[8:]).items()}
+                where = "key_idx"
+            elif s == "sections:":
+                where = "sections"
+            elif s.startswith("field_dir"):
+                where = "field_dir"
+            elif where == "header" and ":" in s:
+                k, _, v = s.partition(":")
+                doc[k] = as_int(v.strip())
+            else:
+                where = "other"
+            continue
+        if where == "sections":
+            doc["sections"].append({k: as_int(v) for k, v in kv_fields(s).items()})
+        elif where == "key_idx" and s.startswith("field "):
+            doc["key_idx_fields"].append({k: as_int(v) for k, v in kv_fields(s).items()
+                                          if k in ("name", "key_type", "entries", "buckets", "empty_buckets")})
+        elif where == "field_dir" and s.startswith("column_id="):
+            doc["field_dir"].append({k: as_int(v) for k, v in kv_fields(s).items()})
+    ends = [sec["offset"] + sec["len"] for sec in doc["sections"] if isinstance(sec.get("offset"), int)]
+    total = doc.get("total_size")
+    doc["footer_len"] = total - max(ends) if ends and isinstance(total, int) else None
+    return doc
+
+
+def cmd_inspect_stamp(args):
+    """The per-state inspect stamps of one tenant and signal: catalog inspect,
+    rspan/rlog inspect of the census's largest data object, inspect kidx of
+    the first leaf, and typed-attr-column show, each as
+    stamps/STATE.LABEL.{catalog,object,kidx}.json and .tenant.txt."""
+    with open(args.census) as f:
+        census = json.load(f)
+    tc = (census.get("tenants") or {}).get(args.tenant)
+    if tc is None:
+        die(f"inspect-stamp: census {args.census} has no tenant {args.tenant}")
+    base = cli_base(args)
+    stem = os.path.join(args.out_dir, f"{args.state}.{args.label}")
+    meta = {"state": args.state, "tenant": args.tenant, "signal": args.signal, "label": args.label,
+            "at": utc_now()}
+    store_signal = "logs" if args.signal == "logs" else "spans"
+    lines = run_cli(base + ["catalog", "inspect", "--tenant", args.tenant, "--signal", store_signal])
+    catalog = parse_catalog_inspect(lines, tc.get("catalog_objects", {}))
+    write_json(stem + ".catalog.json", {**meta, **catalog})
+    data = (tc.get("data") or {}).get(store_signal)
+    if data and data.get("largest"):
+        tool = "rlog" if store_signal == "logs" else "rspan"
+        obj = parse_object_inspect(run_cli(base + [tool, "inspect", data["largest"]], stop_at="records ("))
+        write_json(stem + ".object.json", {**meta, "key": data["largest"], "bytes": data["largest_bytes"],
+                                           "objects": data["objects"], **obj})
+    else:
+        write_json(stem + ".object.json", {**meta, "key": None, "reason": "no data object in the census"})
+    leaf = next((lf for p in catalog["parts"] for lf in p["leaves"]), None)
+    if leaf:
+        kidx = {}
+        for line in run_cli(base + ["inspect", "kidx", leaf["key"]]):
+            k, sep, v = line.strip().partition(": ")
+            if sep:
+                kidx[k] = as_int(v)
+        write_json(stem + ".kidx.json", {**meta, "key": leaf["key"], **kidx})
+    else:
+        write_json(stem + ".kidx.json", {**meta, "key": None, "reason": "no key-index leaf in this state"})
+    show = run_cli(base + ["typed-attr-column", "show", args.tenant])
+    with open(stem + ".tenant.txt", "w") as f:
+        f.write("\n".join(show) + "\n")
+
+
+def cmd_needle_blocks(args):
+    """Storage blocks holding a needle, from rlog inspect's field directory:
+    the tag column is null on every row but a needle row, so its
+    present_blocks summed over the logs objects is the count gen_corpus
+    predicts in units of its own row order (truth needle_blocks.any)."""
+    with open(args.census) as f:
+        census = json.load(f)
+    tc = census["tenants"][args.tenant]
+    prefix = f"t/{tc['hash']}/l/"
+    keys = []
+    with open(args.keys) as f:
+        for line in f:
+            size, _, key = line.rstrip("\n").partition("\t")
+            if key.startswith(prefix) and key.endswith(".rseg"):
+                keys.append(key)
+    keys.sort()
+    picked = keys if args.max_objects <= 0 else keys[: args.max_objects]
+    tot = {"tag_present_blocks": 0, "block_count": 0, "tag_null_count": 0, "record_count": 0}
+    for key in picked:
+        obj = parse_object_inspect(run_cli(cli_base(args) + ["rlog", "inspect", key], stop_at="records ("))
+        tot["block_count"] += obj.get("block_count") or 0
+        tot["record_count"] += obj.get("record_count") or 0
+        tag = next((c for c in obj["field_dir"] if c.get("name") == "tag"), None)
+        if tag:
+            tot["tag_present_blocks"] += tag.get("present_blocks") or 0
+            tot["tag_null_count"] += tag.get("null_count") or 0
+    with open(args.truth) as f:
+        truth = json.load(f)
+    write_json(args.out, {"tenant": args.tenant, "objects_total": len(keys), "objects_inspected": len(picked),
+                          **tot, "truth_needle_blocks": truth["needle_blocks"], "truth_needles": truth["needles"],
+                          "truth_block_rows": truth["generator"]["block_rows"]})
 
 
 # --- plan ---------------------------------------------------------------------
@@ -256,11 +520,14 @@ def placeholders(truth, run):
     }
     for size, ids in truth["in_lists"]["trace_id"].items():
         p[f"in_trace_ids_x_{size}"] = ", ".join(f"X'{t}'" for t in ids)
+        p[f"in_trace_ids_s_{size}"] = ", ".join(f"'{t}'" for t in ids)
     for size, ids in truth["in_lists"]["request_id"].items():
         p[f"in_request_ids_{size}"] = ", ".join(f"'{r}'" for r in ids)
     for k, jc in truth["journey_c"].items():
         p[f"jc_start_ns_{k}"] = str(jc["start_ns"])
         p[f"jc_cut_ns_{k}"] = str(jc["cut_ns"])
+    if truth.get("erasure_victim"):
+        p["erasure_victim_rid"] = truth["erasure_victim"]["request_id"]
     return p
 
 
@@ -303,11 +570,24 @@ def window_bounds(st, truth, run, ingest_shift_ns):
     return start / 1e9, end / 1e9
 
 
+def sub_truth(truth, name):
+    """truth.json itself, or one of the corpora merge-truth folded into it
+    (sub.<name>) with its answers under the <name>. prefix."""
+    if not name:
+        return truth, ""
+    sub = (truth.get("sub") or {}).get(name)
+    if sub is None:
+        die(f"plan: truth.json has no sub.{name}", 64)
+    return sub, name + "."
+
+
 def cmd_plan(args):
     """Every call of one state, statement by statement: a statement's cold
     tries, then its warm repeats, so a warm call follows its own cold calls
     with no restart between. A state this build cannot reach
-    (--unsupported-reason) plans one unsupported line per statement."""
+    (--unsupported-reason) plans one unsupported line per statement. --temp
+    inflight plans every try as an in-flight call: no restart, no warm
+    repeat (the compaction_in_flight state)."""
     doc = load_toml(args.statements)
     truth = json.load(open(args.truth)) if args.truth else None
     hits = load_corpus(args.hits_corpus) if args.hits_corpus else {}
@@ -318,6 +598,8 @@ def cmd_plan(args):
         tenant = st.get("tenant", "inv")
         if tenant == "hits" and not args.hits:
             continue
+        if args.tenant:
+            tenant = args.tenant
         base = {"statement": st["id"], "state": args.state, "tenant": tenant, "kind": st["kind"]}
         reason = args.unsupported_reason or st.get("unsupported_reason")
         if reason:
@@ -331,16 +613,26 @@ def cmd_plan(args):
                               "path": "/api/v1/sql", "body": {"query": entry["sql"], "start": 0},
                               "truth_key": "hits.control"})
             continue
-        temps = [("cold", i) for i in range(args.runs)]
-        if not st.get("cold_only", True):
-            temps += [("warm", i) for i in range(args.warm_runs)]
+        t, prefix = sub_truth(truth, args.sub or st.get("truth_sub"))
+        if st.get("requires") and not t.get(st["requires"]):
+            lines.append({**base, "temp": "cold", "try": 0,
+                          "not_run_reason": f"truth.json {prefix}{st['requires']} is null at this corpus size"})
+            continue
+        if args.temp == "inflight":
+            temps = [("inflight", i) for i in range(args.runs)]
+        else:
+            temps = [("cold", i) for i in range(args.runs)]
+            if not st.get("cold_only", True):
+                temps += [("warm", i) for i in range(args.warm_runs)]
         for temp, i in temps:
             # A warm repeat reads the last cold call's key, so its data is
             # what that call just pulled in.
-            run = (i if temp == "cold" else args.runs - 1) if st.get("per_run") == "saved_trace" else 0
-            p = placeholders(truth, run)
-            start, end = window_bounds(st, truth, run, args.ingest_shift_ns)
-            line = {**base, "temp": temp, "try": i, "truth_key": fill(st["truth_key"], p)}
+            run = (args.runs - 1 if temp == "warm" else i) if st.get("per_run") == "saved_trace" else 0
+            p = placeholders(t, run)
+            start, end = window_bounds(st, t, run, args.ingest_shift_ns)
+            line = {**base, "temp": temp, "try": i, "truth_key": prefix + fill(st["truth_key"], p)}
+            if st.get("oracle"):
+                line["oracle"] = st["oracle"]
             if st["kind"] == "trace_get":
                 q = {}
                 if start is not None:
@@ -401,6 +693,21 @@ def answer_values(columns, rows):
     return {"values_sha256": hashlib.sha256("\n".join(vals).encode()).hexdigest()}
 
 
+def complexity_refusal(code, raw):
+    """The server's own text when it refused a statement for its size (ravel-sql
+    complexity_guard: HTTP 400 naming the statement complexity), else None."""
+    if code != 400:
+        return None
+    text = (raw or b"").decode("utf-8", "replace")
+    try:
+        doc = json.loads(text)
+        if isinstance(doc, dict) and isinstance(doc.get("error"), str):
+            text = doc["error"]
+    except ValueError:
+        pass
+    return text.strip()[:500] if "complexity" in text else None
+
+
 def unsupported_line(statement, state, temp, reason):
     return {
         "statement": statement,
@@ -423,6 +730,10 @@ def cmd_call(args):
         append_line(args.calls, unsupported_line(plan["statement"], plan["state"], plan["temp"],
                                                  plan["unsupported_reason"]))
         return
+    if plan.get("not_run_reason"):
+        append_line(args.calls, {"statement": plan["statement"], "state": plan["state"], "temp": plan["temp"],
+                                 "try": 0, "outcome": "not-run", "reason": plan["not_run_reason"]})
+        return
     auth = open(os.path.join(args.auth_dir, plan["tenant"] + ".auth")).read().strip()
     name, _, value = auth.partition(":")
     headers = {name.strip(): value.strip(), "Accept": "application/json"}
@@ -433,6 +744,7 @@ def cmd_call(args):
         data = json.dumps(plan["body"]).encode()
         headers["Content-Type"] = "application/json"
     cpu0 = proc_cpu_s(args.pid)
+    started = time.time()
     t0 = time.monotonic()
     req = urllib.request.Request(args.server.rstrip("/") + plan["path"], data=data, method=method, headers=headers)
     code = None
@@ -453,14 +765,23 @@ def cmd_call(args):
         "tenant": plan["tenant"],
         "truth_key": plan.get("truth_key"),
         "http_status": code,
+        "started_unix_s": round(started, 3),
         "wall_s": round(wall, 6),
         "server_cpu_s": round(cpu1 - cpu0, 6),
         "server_hwm_bytes": proc_hwm_bytes(args.pid),
     }
+    if plan.get("oracle"):
+        line["oracle"] = plan["oracle"]
     try:
         doc = json.loads(raw)
     except ValueError:
         doc = None
+    refusal = complexity_refusal(code, raw)
+    if refusal:
+        line["outcome"] = "unsupported-on-this-build"
+        line["reason"] = f"server refused the statement (HTTP {code}): {refusal}"
+        append_line(args.calls, line)
+        return
     if code == 200 and isinstance(doc, dict) and isinstance(doc.get("data"), dict):
         rows = doc["data"].get("rows", [])
         cols = [c.get("name") for c in doc["data"].get("columns", [])]
@@ -498,6 +819,7 @@ def cmd_measure(args):
     cmd = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else args.cmd
     if not cmd:
         die("measure: no command", 64)
+    started = time.time()
     t0 = time.monotonic()
     with open(args.stdout, "w") as out:
         proc = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT)
@@ -506,6 +828,8 @@ def cmd_measure(args):
     doc = {
         "argv0": os.path.basename(cmd[0]),
         "exit": proc.returncode,
+        "started_unix_s": round(started, 3),
+        "ended_unix_s": round(started + wall, 3),
         "wall_s": round(wall, 3),
         "cpu_s": round(ru.ru_utime + ru.ru_stime, 3),
         "peak_rss_bytes": ru.ru_maxrss * 1024,
@@ -629,6 +953,28 @@ def cmd_warmup(args):
         time.sleep(0.2)
 
 
+def cmd_kv_report(args):
+    """A text tool report as JSON: each `key: value` line (an integer value
+    as a number), a count per `outcome=X` line (maintain compact-tenant), and
+    the first 50 lines verbatim."""
+    try:
+        with open(args.log) as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        die(f"kv-report: {e}")
+    doc = {"fields": {}, "outcomes": {}, "lines": lines[:50]}
+    for line in lines:
+        k, sep, v = line.partition(":")
+        k, v = k.strip(), v.strip()
+        if sep and k and all(c.isalnum() or c in "_ " for c in k):
+            doc["fields"][k.replace(" ", "_")] = int(v) if v.isdigit() else v
+        for kv in line.split():
+            if kv.startswith("outcome="):
+                o = kv[len("outcome="):]
+                doc["outcomes"][o] = doc["outcomes"].get(o, 0) + 1
+    print(json.dumps(doc, sort_keys=True))
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd_name", required=True)
@@ -654,6 +1000,8 @@ def main():
     cl.add_argument("--listing", required=True)
     cl.add_argument("--bucket", required=True)
     cl.add_argument("--out", default="-")
+    cl.add_argument("--tenants", help="JSON {tenant: hash}: census each tenant's objects too")
+    cl.add_argument("--keys-out", help="write every key and its size, one per line")
     cl.set_defaults(fn=cmd_census_listing)
 
     s = sub.add_parser("s3")
@@ -661,7 +1009,35 @@ def main():
     s.add_argument("--timeout", type=float, default=60)
     s.add_argument("--prefix", default="")
     s.add_argument("--out", default="-")
+    s.add_argument("--tenants", help="JSON {tenant: hash}: census each tenant's objects too")
+    s.add_argument("--keys-out", help="write every key and its size, one per line")
     s.set_defaults(fn=cmd_s3)
+
+    mt = sub.add_parser("merge-truth")
+    mt.add_argument("--base", required=True)
+    mt.add_argument("--sub", action="append", default=[], help="NAME=PATH, repeatable")
+    mt.add_argument("--out", required=True)
+    mt.set_defaults(fn=cmd_merge_truth)
+
+    ins = sub.add_parser("inspect-stamp")
+    ins.add_argument("--cli-bin", required=True)
+    ins.add_argument("--census", required=True)
+    ins.add_argument("--tenant", required=True)
+    ins.add_argument("--signal", required=True, choices=["spans", "logs"])
+    ins.add_argument("--label", required=True)
+    ins.add_argument("--state", required=True)
+    ins.add_argument("--out-dir", required=True)
+    ins.set_defaults(fn=cmd_inspect_stamp)
+
+    nb = sub.add_parser("needle-blocks")
+    nb.add_argument("--cli-bin", required=True)
+    nb.add_argument("--census", required=True)
+    nb.add_argument("--keys", required=True)
+    nb.add_argument("--tenant", required=True)
+    nb.add_argument("--truth", required=True)
+    nb.add_argument("--max-objects", type=int, default=0, help="0: every logs object")
+    nb.add_argument("--out", required=True)
+    nb.set_defaults(fn=cmd_needle_blocks)
 
     p = sub.add_parser("plan")
     p.add_argument("--statements", required=True)
@@ -673,6 +1049,9 @@ def main():
     p.add_argument("--hits", action="store_true")
     p.add_argument("--hits-corpus")
     p.add_argument("--ingest-shift-ns", type=int, default=0)
+    p.add_argument("--sub", help="read placeholders and truth keys from truth.json sub.<SUB>")
+    p.add_argument("--tenant", help="run every statement against this tenant (many_parts_N)")
+    p.add_argument("--temp", choices=["cold", "inflight"], default="cold")
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_plan)
 
@@ -699,6 +1078,10 @@ def main():
     m.add_argument("--stdout", required=True)
     m.add_argument("cmd", nargs=argparse.REMAINDER)
     m.set_defaults(fn=cmd_measure)
+
+    kv = sub.add_parser("kv-report")
+    kv.add_argument("--log", required=True)
+    kv.set_defaults(fn=cmd_kv_report)
 
     args = ap.parse_args()
     args.fn(args)

@@ -8,11 +8,23 @@
 # "s3" (an EC2 box against a real S3 bucket; the only lane timing is judged
 # on) or "local" (a loopback RustFS on the machine running run.sh).
 lane = "s3"
-# The states the statement matrix runs in, in this order. many_parts needs
-# ravel-cli load --ingest-hour-stride, which this build lacks: it is listed
-# here and under [unsupported_states], and run.sh records every statement
-# planned for it as unsupported-on-this-build.
-states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed", "many_parts"]
+# The states the statement matrix runs in, in this order (README.md
+# "States"). mixed is followed by the fold_advance transition and
+# compaction_in_flight by compaction_done, each stamped. many_parts_N loads a
+# fresh spans tenant mpN over N strided ingest hours. erasure_in_flight is
+# recorded not-run when the corpus has no erasure victim.
+states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight",
+          "erasure_in_flight", "many_parts_744", "many_parts_2160"]
+# The run's own deadline, below box.max_minutes: a state that would start
+# past it is recorded not-run (reason deadline), and evaluate and the upload
+# still happen.
+max_minutes = 540
+# Logs objects rlog inspect reads for the needle-block count (0: all).
+needle_blocks_max_objects = 200
+# true: load the base corpus in two batches per signal so each shard and
+# hour holds two L0 objects (the local smoke; at s3 scale every shard and
+# hour already holds many).
+split_base_load = false
 # Cold calls per (statement, state); each one follows a server restart and a
 # page-cache drop. The warm repeat follows the last cold call without a
 # restart, once, for statements whose cold_only is false.
@@ -82,8 +94,12 @@ dataset_url = "https://datasets.clickhouse.com/hits_compatible/hits.parquet"
 dataset_sha256 = "a390f6cb782f6aaef278c72fc1dd86c4f30bc843ebab3c159e9bd4d45ddb079f"
 rows_expected = 99997497
 
-[unsupported_states]
-many_parts = "ravel-cli load has no --ingest-hour-stride on this build, so the many-parts state (one part per ingest hour across the corpus) cannot be built"
+[many_parts]
+# Each many_parts_N tenant's corpus: N hours at this many traces per hour,
+# loaded one ingest hour per batch (--ingest-hour-stride 1) and folded with
+# --snapshot-part-max-entries below, so every hour is its own part.
+traces_per_hour = 10
+snapshot_part_max_entries = 1
 
 # Every price evaluate.py multiplies by, with the source it was read from.
 # A price without a source is reported missing.
