@@ -367,7 +367,9 @@ tenant-mismatch signal.
 Each call resolves its own snapshot. Two calls share a snapshot only when the
 second call carries a cursor from the first. The cursor pin is valid until
 `min(remaining query deadline, protection_horizon - grace)`. This is the
-Flight ticket rule. The envelope reports `snapshot_id` (a hash of the pinned
+Flight ticket rule. (Corrected by the call-deadline amendment below: the
+minting call's deadline does not bound a cursor, which lives until
+`horizon - grace` from its mint.) The envelope reports `snapshot_id` (a hash of the pinned
 segment set), the watermark hour, the applied commit tokens, and `pinned`. A
 commit token is a read-your-write lower bound. It is not a snapshot identity.
 
@@ -427,7 +429,10 @@ the estimate exceeds the budget, the tool returns
 estimate component is not zero and does not pass (scoped by the 2026-09-12
 amendment, and narrowed for Parquet tables by the Parquet explain amendment
 below). Retries and snapshot
-re-resolution run inside the same deadline and their cost is added.
+re-resolution run inside the same deadline and their cost is added. (One
+deadline bounds the whole tool call, every service call it makes included;
+see the call-deadline amendment below, which also records a lookup whose
+cost is not added.)
 Enforcement is process-local. The fleet concurrency ceiling is the only
 cross-replica control, and the envelope says so. Usage is reported as
 requests and bytes by kind: wire, cache-served, decompressed. Usage is never
@@ -454,7 +459,9 @@ bundle id is not trustworthy.
   see the Ravel Agents write tools amendment below.
 - Transport: `POST /mcp` only. The server validates `Origin` against
   `--mcp-allowed-origins` and answers 403 on a mismatch. The body cap is
-  1 MiB. Each tool call takes one admission permit. The deadline is clamped.
+  1 MiB. Each tool call takes one admission permit. (A `ravel_search_logs`
+  call with predicates takes two, one after the other; see the
+  call-deadline amendment below.) The deadline is clamped.
   Header validation is per revision. For a `2026-07-28` request, the server
   requires `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name`, and answers
   400 on a mismatch with the body. For a `2025-11-25` request, the server
@@ -1672,3 +1679,66 @@ check now refuses one.
    write that adds a `__ravel_` key the stored record does not already
    declare is refused. Such a record is the only way a declared column can
    still take one of the tool columns' names.
+
+## Amendment (2026-11-03, #3753): the call-deadline amendment, one deadline per tool call, and a cursor outlives the call that minted it
+
+<!-- amendment-applies: sections="D5. Consistency, cursors, and evidence references|D6. Budgets|D7. Security" pointer="call-deadline amendment" -->
+<!-- amendment-supersedes: phrase="`min(remaining query deadline, protection_horizon - grace)`" pointer="call-deadline amendment" -->
+
+Findings S5 and S8 of review #1388. A `ravel_search_logs` call with
+predicates makes two service calls, the declared-column lookup and then the
+statement, and each ran under a whole effective deadline of its own, so the
+call could run for twice its deadline. And D5 bounds a cursor by the
+minting call's remaining deadline, which no tool implements. This
+call-deadline amendment settles both.
+
+1. D6: one deadline bounds the whole tool call. It is the effective
+   deadline (the caller's `deadline_ms` included), measured from the moment
+   the adapter receives the call. Every service call the tool makes runs
+   under what is left of it, never under more than the effective deadline,
+   and a service call that would start with nothing left fails the tool
+   call as `deadline` without running, without taking an admission permit
+   and without reaching the store. `ServiceBackend::with_call_start` in
+   `services/ravel-server/src/mcp/service_impl.rs` fixes the instant, which
+   the adapter's `call_tool` reads as its first step. Pinned by
+   `search_logs_lookup_and_statement_share_one_deadline` and
+   `a_service_call_with_no_time_left_fails_as_deadline_before_the_store` in
+   `services/ravel-server/tests/mcp_e2e.rs`, which run under a paused
+   clock with the store held by `FaultStore` gates.
+2. D6: the lookup's reads are not added to the call's cost.
+   `budget.actual` on a `ravel_search_logs` page counts the statement only,
+   and every page of a call that ran the lookup carries
+   `UNCOUNTED_LOOKUP_WARNING` (`crates/ravel-mcp/src/tools/search_logs.rs`)
+   saying so. The lookup is a catalog and metadata read with no budget of
+   its own to report against, and summing two service calls' accounting is
+   a change to the backend contract that this amendment does not make. The
+   warning is pinned by
+   `a_page_says_its_spend_leaves_out_the_declared_column_lookup` in the
+   same file.
+3. D7: a `ravel_search_logs` call with predicates takes two admission
+   permits, one for each service call, one after the other. The service
+   layer takes and releases each permit; the call never holds two at once,
+   so it cannot deadlock against itself at a concurrency ceiling of 1, and
+   both permits sit inside the one deadline of item 1. Taking one permit
+   for the whole tool call in the adapter as well would hold it while the
+   service layer asks for a second, which deadlocks at a ceiling of 1.
+   Every other tool call makes one service call and takes one permit.
+4. D5: a cursor lives until `horizon - grace` from the instant it was
+   minted, where `horizon` is the deployment's protection horizon as a
+   duration and `grace` is `GRACE_NS` (24 h). The minting call's deadline
+   does not bound it. The Flight ticket rule fits a ticket, which is
+   redeemed inside the query that issued it; a cursor is redeemed by a
+   later tool call, after the client has read the page, by which time the
+   minting call's deadline has normally run out, so the rule as written
+   would expire nearly every cursor before its first redemption. What a
+   redemption needs is that the sweeper still protects what the pin
+   resolves to, and the horizon clamp is that check (the 2026-09-10
+   amendment, item 1). Each redemption runs under its own call's deadline.
+   The implementation already did this: every tool that mints a cursor
+   passes `i64::MAX` as its requested deadline to `Cursor::mint`
+   (`crates/ravel-mcp/src/cursor.rs`), which clamps it to
+   `mint_ns + horizon - GRACE_NS`, and a redemption re-clamps against its
+   own call's horizon. Pinned by
+   `a_cursor_lives_until_the_horizon_less_grace_not_the_calls_deadline` in
+   `crates/ravel-mcp/src/tools/search_logs.rs`. Evidence references are
+   not changed by this amendment.
