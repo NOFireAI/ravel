@@ -2108,15 +2108,16 @@ shifted: the decode admission skew check and the shard-count provisioning
 record both use the real `now_ns`. Everything that reads
 `ingest_hour_bucket` then treats the hour as real:
 
-- the commit key, built by `commit_key` in
-  `crates/ravel-commit/src/keys.rs`;
+- the commit key, built by `ravel_commit::keys::commit_key` (ravel-commit,
+  `keys` module);
 - the fold, which seals and partitions by it in
-  `Catalog::fold_with_seal_through` (`crates/ravel-catalog/src/fold.rs`);
+  `Catalog::fold_with_seal_through` (ravel-catalog, `fold` module);
 - retention, which walks and seals buckets by it in
-  `retention_sweep_bucket` (`crates/ravel-maintain/src/retention.rs`)
-  through `Bucket` (`crates/ravel-maintain/src/bucket.rs`);
+  `ravel_maintain::retention::retention_sweep_bucket` (ravel-maintain,
+  `retention` module) through `ravel_maintain::bucket::Bucket`
+  (`bucket` module);
 - readers, which list it in `Catalog::resolve` through
-  `window_hour_bounds` (`crates/ravel-catalog/src/catalog.rs`).
+  `Catalog::window_hour_bounds` (ravel-catalog, `catalog` module).
 
 The lane's contract:
 
