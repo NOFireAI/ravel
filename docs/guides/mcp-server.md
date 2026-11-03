@@ -336,7 +336,8 @@ How the server shaped the result to fit the response cap:
 
 A list of references. Each is an opaque `ref` token plus a `blake3_256` of
 the canonical row bytes that it covers. Redeem a reference later to prove
-that a row has not changed. `ravel_find_labels` emits no `evidence` block.
+that a row has not changed. No tool emits an `evidence` block in this build;
+see [Evidence references](#evidence-references).
 
 ### `warnings` and `next_steps`
 
@@ -512,9 +513,17 @@ it has, up to the row cap, with status `ok_bounded` and no cursor.
 
 ### Evidence references
 
-Every data tool but `ravel_find_labels` accepts an optional `evidence_ref`
-input. Redeeming a reference re-executes the tool with the reference's own
-arguments. The server then compares the BLAKE3-256 digest of the canonical
+No tool redeems an `evidence_ref` or emits an `evidence` block in this
+build. `ravel_query_sql`, `ravel_query_promql`, `ravel_search_logs`,
+`ravel_get_trace` and `ravel_analyze_timeseries` refuse an `evidence_ref`
+with `unsupported`, and `ravel_find_labels` refuses one with
+`invalid_argument`. `ravel_capabilities`, `ravel_describe_data`,
+`ravel_explain_query` and the Ravel Agents tools do not list it in their
+input schemas, and ignore it like any other argument they do not list. The
+[reference](../reference/mcp.md#evidence-references) has the same list.
+
+The rest of this section describes the design. Redeeming a reference
+re-executes the tool with the reference's own arguments. The server then compares the BLAKE3-256 digest of the canonical
 row bytes.
 
 | Pin state | Redemption |
