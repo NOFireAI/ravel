@@ -101,8 +101,8 @@ run.max_minutes` before it starts. Each of these makes the verdict
 #### Runtime estimate
 
 From the smoke's own figures (`fixtures/local-smoke/`): a cold-call restart
-(server stop, start, `/readyz`, warmup) took 1.181 s on average over its 221
-restarts, and a call 0.034 s on average over its 244 timed calls. The s3
+(server stop, start, `/readyz`, warmup) took 0.875 s on average over its 221
+restarts, and a call 0.032 s on average over its 244 timed calls. The s3
 lane's default states plan, at 20 cold runs and 1 warm run per statement
 that is not `cold_only` (statement counts from `statements.toml`):
 
@@ -118,13 +118,13 @@ that is not `cold_only` (statement counts from `statements.toml`):
 | many_parts_744 | 2 | 40 | 2 |
 | many_parts_2160 | 2 | 40 | 2 |
 
-That is 2,299 calls and 2,201 restarts: 2,201 x 1.181 s = 2,599 s, plus
-2,299 x 0.034 s = 78 s, so 2,677 s, about 45 minutes of calls. The fixed
+That is 2,299 calls and 2,201 restarts: 2,201 x 0.875 s = 1,926 s, plus
+2,299 x 0.032 s = 74 s, so 2,000 s, about 33 minutes of calls. The fixed
 waits add at most 70 minutes for mixed (the next ingest hour;
 `run.mixed_wait_max_minutes`, which `box/run.sh` defaults to 70) and at most
 310 s, about 5 minutes, for compaction_in_flight (until 310 s into an hour;
-in the smoke they took 48 and 3 minutes). The estimate is 2,677 + 4,200 +
-310 = 7,187 s, about 120 minutes, against the 540-minute
+in the smoke they took 13 and 4 minutes). The estimate is 2,000 + 4,200 +
+310 = 6,510 s, about 109 minutes, against the 540-minute
 deadline, and it covers calls and waits only. It omits corpus generation,
 every load (the `hits` tenant's included) and every fold at 20,000,000
 traces: the smoke's figures for them (0.30 to 1.03 s per load, at most
@@ -537,8 +537,8 @@ generator planted needles in 5 of its 8,192-row blocks over 100,000 log rows
 (common 3, sparse 2, rare 1; one block holds two tiers), and `rlog inspect`
 over all 4 logs objects reports 14 blocks for 100,000 records, with the
 needle tag present in 4 of them against 5 planted and the rare needle in
-exactly 1. The smoke's stamp predates the sparse and common columns, so
-those two read `missing`. The suite pins those figures.
+exactly 1, the sparse needle in 2 against 2 planted and the common needle in
+3 against 3, both inside 25 %. The suite pins those figures.
 
 ## fixtures/local-smoke
 
@@ -547,7 +547,7 @@ cores, 8 GB, `CARGO_BUILD_JOBS=2`): 20,000 traces over 2 hours plus a
 10,000-trace tail hour, 2 cold runs, hits = false, over unfolded,
 folded_no_leaves, folded_leaves, mixed, compaction_in_flight,
 erasure_in_flight and many_parts_24, against a loopback RustFS. Its 100,000
-log rows fill 14 store blocks. It took 57 minutes, 48 of them the mixed
+log rows fill 14 store blocks. It took 23 minutes, 13 of them the mixed
 state's wait for the next ingest hour. Imported
 with `investigations_cases.py --import-local-smoke DIR`. Its `calls.jsonl`,
 `truth.json`, `results.local.json` and every stamp are gzipped, which keeps
@@ -556,11 +556,9 @@ the fixture under 300 KB; `summary.local.txt` and `run.toml` are plain.
 Its verdict is `fail`. The problem list, pinned by the suite:
 
 ```
-missing needle_blocks needlesparse: stamps/needle_blocks.json needle_sparse_present_blocks absent or null
-missing needle_blocks needlecommon: stamps/needle_blocks.json needle_common_present_blocks absent or null
 miss row_01.wire_bytes
 miss row_02.wire_bytes
-missing row_03.probe_wire_per_object: stamps/unfolded.spans.ranges.json absent: no per-object event ranges to count the window's candidate objects
+miss row_03.probe_wire_per_object
 miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
 miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
 miss row_08.logs_trace_id_leaf_pct
@@ -573,10 +571,11 @@ The only incomplete line is
 `figure row_13.negative_controls_failing_on_mutant not run: mutant controls
 not implemented`.
 
-- Row 3: the call moved 131,072 probe wire bytes in 2 probe GETs, the old
-  64 KiB read (#3118, fixed by T4, not on main). The smoke predates the
-  ranges stamp, so the figure reads `missing`: no per-object event ranges
-  to count the window's candidate objects.
+- Row 3: the call moved 131,072 probe wire bytes in 2 probe GETs over the
+  window's 2 candidate objects (from `stamps/unfolded.spans.ranges.json`),
+  65,536 per object against a 16 KiB miss: the old 64 KiB read (#3118,
+  fixed by T4, not on main). The fixture carries the ranges stamps of
+  unfolded, the only state row 3 reads and the only one the run stamps.
 - Row 7: the fold_advance rebuild issued 12 section GETs on each signal,
   2 x the 6 entries of the whole tail, against targets of 2 x 2 new + 1
   previous leaf = 5 (spans) and 2 x 2 + 2 = 6 (logs). Main rebuilds the leaf
@@ -585,14 +584,14 @@ not implemented`.
 - Row 8: the logs `request_id` leaf is 27.5 % of the logs data bytes (one
   key per row) and the logs trace id leaf 5.9 %, against 2.5 %; the spans
   trace id leaf is 4.3 %, inside 6 %.
-- Rows 1 and 2: 464,913 wire bytes for the no-range lookup and 333,841 for
+- Rows 1 and 2: 464,912 wire bytes for the no-range lookup and 333,840 for
   the 1 h lookup, against 300 KB; the run's real figures.
 - Row 11: the 1,000-key IN lists are refused by the complexity guard
   (1,001 units), so their figures and the 1,001-key controls read
   `refused-by-guard` with the server's text (15 figures over 24 calls on
   the summary's `refusal classes` line). Row 13: every in-flight try of
   compaction_in_flight's four statements overlapped its own signal's
-  compaction (the two signals compact concurrently, 1.36 s and 2.15 s), and
+  compaction (the two signals compact concurrently, 1.26 s and 1.98 s), and
   under the pending erasure the victim's lookup returned no row on
   both cold tries while `erase status` read PENDING.
 - `dead_counter`: segmentsOpened is 0 on every SQL call while scan GETs move

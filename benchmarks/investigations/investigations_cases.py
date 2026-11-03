@@ -73,10 +73,10 @@ SMALL_CORPUS = {"traces": 1000, "hours": 2, "seed": 7, "start_hour": 498248, "ta
                 "tail_start_hour": 498250,
                 "many_parts": {"24": {"traces": 240, "hours": 24, "seed": 31, "start_hour": 498222}}}
 # The corpus.json the committed smoke run stamped.
-SMOKE_CORPUS = {"traces": 20000, "hours": 2, "seed": 7, "start_hour": 498253, "tail_traces": 10000, "tail_seed": 8,
-                "tail_start_hour": 498255,
-                "many_parts": {"24": {"traces": 240, "hours": 24, "seed": 31, "start_hour": 498227,
-                                      "ingest_hour_start": 498228}}}
+SMOKE_CORPUS = {"traces": 20000, "hours": 2, "seed": 7, "start_hour": 498257, "tail_traces": 10000, "tail_seed": 8,
+                "tail_start_hour": 498259,
+                "many_parts": {"24": {"traces": 240, "hours": 24, "seed": 31, "start_hour": 498231,
+                                      "ingest_hour_start": 498232}}}
 
 
 def merged_truth(out, c=SMALL_CORPUS):
@@ -784,11 +784,9 @@ class LocalSmoke(Workdir):
         _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
         self.assertEqual(res["verdict"], "fail")
         self.assertEqual(res["problems"], [
-            "missing needle_blocks needlesparse: stamps/needle_blocks.json needle_sparse_present_blocks absent or null",
-            "missing needle_blocks needlecommon: stamps/needle_blocks.json needle_common_present_blocks absent or null",
             "miss row_01.wire_bytes",
             "miss row_02.wire_bytes",
-            "missing row_03.probe_wire_per_object: stamps/unfolded.spans.ranges.json absent: no per-object event ranges to count the window's candidate objects",
+            "miss row_03.probe_wire_per_object",
             "miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count",
             "miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count",
             "miss row_08.logs_trace_id_leaf_pct",
@@ -805,10 +803,6 @@ class LocalSmoke(Workdir):
         self.assertEqual(sorted(f["id"] for f in res["figures"]), sorted(want))
         covered = set(SMOKE_STATES) | {"fold_advance", "compaction_done"}
         for f in res["figures"]:
-            if f["id"] == "row_03.probe_wire_per_object":
-                # The smoke predates the ranges stamp the denominator reads.
-                self.assertEqual(f["status"], "missing")
-                continue
             self.assertNotIn(f["status"], ("missing", "duplicate"), f["id"])
             if f["status"] == "not-run":
                 self.assertTrue(f["reason"], f["id"])
@@ -914,11 +908,19 @@ class LocalSmoke(Workdir):
         self.assertTrue(any(p["phase"] == "scan" and p["s3GetRequests"] >= 1
                             for c in calls for p in c["stats"]["phases"]))
 
-    def test_probe_wire_per_object_reads_missing_without_ranges(self):
-        # The smoke predates the ranges stamp, so the per-object denominator
-        # is missing rather than guessed; check_probe_per_object covers the
-        # figure itself.
+    def test_probe_wire_per_object_reads_the_ranges_stamp(self):
+        # The smoke stamps unfolded's per-object event ranges, the only state
+        # row 3 reads; check_probe_per_object covers the figure's arithmetic.
         _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
+        f = figure(res, "row_03.probe_wire_per_object")
+        self.assertEqual((f["status"], f["value"], f["verdict"]), ("value", 65536.0, "miss"))
+
+    def test_probe_wire_per_object_reads_missing_without_ranges(self):
+        # Without the ranges stamp the per-object denominator is missing
+        # rather than guessed.
+        run = smoke_run(self.path("run"))
+        os.remove(os.path.join(run, "stamps", "unfolded.spans.ranges.json"))
+        _, res, _ = evaluate(run, self.path("out"))
         f = figure(res, "row_03.probe_wire_per_object")
         self.assertEqual((f["status"], f["value"], f["reason"]), (
             "missing", None, "stamps/unfolded.spans.ranges.json absent: no per-object event ranges to count the "
@@ -937,7 +939,7 @@ class LocalSmoke(Workdir):
             data = census["census"]["tenants"]["inv"]["data"][label]["bytes"]
             got = figure(res, f"row_08.{label}_{field}_leaf_pct")["value"]
             self.assertEqual(got, round(100.0 * leaf / data, 9), (label, field))
-        self.assertEqual(figure(res, "row_08.logs_request_id_leaf_pct")["value"], 27.52645665)
+        self.assertEqual(figure(res, "row_08.logs_request_id_leaf_pct")["value"], 27.532655509)
 
     def test_maintenance_per_part_month(self):
         # Item 13: spans leaf rebuild, 8 section GET x $0.0004/1000 + 1 leaf
@@ -1010,6 +1012,9 @@ class LocalSmoke(Workdir):
         self.assertGreaterEqual(nb["block_count"], 10)
         self.assertEqual(nb["needle_rare_present_blocks"], nb["truth_needle_blocks"]["needlerare"])
         self.assertEqual(nb["needle_rare_present_blocks"], 1)
+        self.assertEqual((nb["needle_sparse_present_blocks"], nb["truth_needle_blocks"]["needlesparse"]), (2, 2))
+        self.assertEqual((nb["needle_common_present_blocks"], nb["truth_needle_blocks"]["needlecommon"]), (3, 3))
+        self.assertEqual((nb["tag_present_blocks"], nb["truth_needle_blocks"]["any"]), (4, 5))
 
     def test_erasure_in_flight_reads_pending_and_filters_the_victim(self):
         # Item 12: run.sh's PENDING check saw the request, and the victim's
@@ -1053,10 +1058,6 @@ class Evaluate(Workdir):
         self.run_dir = smoke_run(self.path("run"))
         self.calls_path = os.path.join(self.run_dir, "calls.jsonl")
         self.calls = read_jsonl(self.calls_path)
-        # The smoke's stamp predates the sparse and common needle columns;
-        # these cases start from the planted counts so only their own
-        # mutation can fail them.
-        self.needle_stamp(needle_sparse_present_blocks=2, needle_common_present_blocks=3)
 
     def save_calls(self):
         write_jsonl(self.calls_path, self.calls)
