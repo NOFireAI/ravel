@@ -265,10 +265,14 @@ fn body_timeout_status() -> Status {
 }
 
 /// Most body bytes, as sent on the wire and before any inflate, that
-/// [`refuse_from_head`] reads and discards before answering. A request
-/// declaring more in its `Content-Length` is not read at all; a chunked body
-/// that passes this mid-drain is abandoned.
-pub const HEAD_REFUSAL_DRAIN_MAX_BYTES: u64 = 1024 * 1024;
+/// [`refuse_from_head`] reads and discards before answering: the 16 MiB
+/// request body limit, [`MAX_REQUEST_BODY_BYTES`], so any body an admitted
+/// request could send is drained when refused. A request declaring more in
+/// its `Content-Length` is not read at all; a chunked body that passes this
+/// mid-drain is abandoned.
+///
+/// [`MAX_REQUEST_BODY_BYTES`]: crate::ingest_decode::MAX_REQUEST_BODY_BYTES
+pub const HEAD_REFUSAL_DRAIN_MAX_BYTES: u64 = crate::ingest_decode::MAX_REQUEST_BODY_BYTES as u64;
 
 /// How long [`refuse_from_head`] waits for the rest of a refused request's
 /// body before answering without it.
@@ -285,8 +289,8 @@ pub const HEAD_REFUSAL_DRAIN_MAX_CONCURRENT: usize = 64;
 pub enum UndrainedReason {
     /// The credential on the head did not resolve to a tenant.
     Unauthenticated,
-    /// The body is larger than [`HEAD_REFUSAL_DRAIN_MAX_BYTES`], by its
-    /// `Content-Length` or as it arrived.
+    /// The body is larger than [`HEAD_REFUSAL_DRAIN_MAX_BYTES`], the request
+    /// body limit, by its `Content-Length` or as it arrived.
     OverCap,
     /// All [`HEAD_REFUSAL_DRAIN_MAX_CONCURRENT`] drain slots were taken.
     Busy,
@@ -406,8 +410,8 @@ async fn discard_body(mut body: axum::body::Body) -> Result<(), DrainStopped> {
 /// 3. `Expect: 100-continue`: answered with `Connection: close`, uncounted.
 ///    The client sends nothing until it sees `100 Continue`, which reading the
 ///    body would solicit, so there are no unread bytes to drain.
-/// 4. `Content-Length` above [`HEAD_REFUSAL_DRAIN_MAX_BYTES`], with nothing
-///    read: `over_cap`.
+/// 4. `Content-Length` above [`HEAD_REFUSAL_DRAIN_MAX_BYTES`] (the 16 MiB
+///    request body limit), with nothing read: `over_cap`.
 /// 5. No free drain slot ([`HEAD_REFUSAL_DRAIN_MAX_CONCURRENT`]): `busy`.
 /// 6. While draining, the body passes the cap (`over_cap`) or does not end
 ///    within [`HEAD_REFUSAL_DRAIN_TIMEOUT`] (`timeout`).
@@ -1930,19 +1934,71 @@ mod tests {
         assert_eq!(controller.shed_total(), 2);
     }
 
-    /// A chunked shed body is read only until it passes the 1 MiB cap: the
-    /// 17th 64 KiB frame of 32 crosses it, nothing after that is read, and the
-    /// refusal carries `Connection: close`, counted under `over_cap`.
+    /// Issue #3744: the drain cap is the request body limit, so a refused
+    /// 2 MiB body, the size the logs benchmark sends, is read to its end and
+    /// answered without `Connection: close`, with `over_cap` unmoved.
+    #[tokio::test(start_paused = true)]
+    async fn a_shed_body_of_two_mib_is_drained() {
+        use tower::ServiceExt;
+
+        assert_eq!(
+            HEAD_REFUSAL_DRAIN_MAX_BYTES,
+            crate::ingest_decode::MAX_REQUEST_BODY_BYTES as u64
+        );
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(0));
+        let response = tokio::time::timeout(
+            TEST_DEADLINE,
+            http_router(&controller).oneshot(http_upload(axum::body::Body::from(vec![
+                0u8;
+                2 * 1024
+                    * 1024
+            ]))),
+        )
+        .await
+        .expect("answered")
+        .expect("infallible router");
+
+        assert_shed(response, false).await;
+        assert_eq!(undrained_counts(&controller), [0, 0, 0, 0]);
+    }
+
+    /// A sized shed body of 17 MiB, above the 16 MiB body limit, is not read
+    /// and is answered with `Connection: close`, counted under `over_cap`.
+    #[tokio::test(start_paused = true)]
+    async fn a_shed_body_above_the_body_limit_is_over_cap() {
+        use tower::ServiceExt;
+
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(0));
+        let response = tokio::time::timeout(
+            TEST_DEADLINE,
+            http_router(&controller).oneshot(http_upload(axum::body::Body::from(vec![
+                0u8;
+                17 * 1024
+                    * 1024
+            ]))),
+        )
+        .await
+        .expect("answered")
+        .expect("infallible router");
+
+        assert_shed(response, true).await;
+        assert_eq!(undrained_counts(&controller), [0, 1, 0, 0]);
+    }
+
+    /// A chunked shed body is read only until it passes the cap: of twice the
+    /// cap in 64 KiB frames, the frame that crosses it is the last one read,
+    /// and the refusal carries `Connection: close`, counted under `over_cap`.
     #[tokio::test(start_paused = true)]
     async fn a_chunked_shed_body_past_the_cap_stops_the_drain() {
         use tower::ServiceExt;
 
+        const FRAME: u64 = 64 * 1024;
         let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(0));
         let polled = Arc::new(AtomicUsize::new(0));
         let response = tokio::time::timeout(
             TEST_DEADLINE,
             http_router(&controller).oneshot(http_upload(axum::body::Body::new(ChunkedBody {
-                chunks: 32,
+                chunks: (2 * HEAD_REFUSAL_DRAIN_MAX_BYTES / FRAME) as usize,
                 polled: polled.clone(),
             }))),
         )
@@ -1953,7 +2009,7 @@ mod tests {
         assert_shed(response, true).await;
         assert_eq!(
             polled.load(Ordering::SeqCst) as u64,
-            HEAD_REFUSAL_DRAIN_MAX_BYTES / (64 * 1024) + 1
+            HEAD_REFUSAL_DRAIN_MAX_BYTES / FRAME + 1
         );
         assert_eq!(undrained_counts(&controller), [0, 1, 0, 0]);
     }
@@ -1992,8 +2048,9 @@ mod tests {
             .clone()
             .oneshot(http_upload(axum::body::Body::from(vec![
                 0u8;
-                2 * HEAD_REFUSAL_DRAIN_MAX_BYTES
+                HEAD_REFUSAL_DRAIN_MAX_BYTES
                     as usize
+                    + 1
             ])))
             .await
             .expect("infallible router");

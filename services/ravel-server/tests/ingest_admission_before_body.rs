@@ -810,12 +810,61 @@ async fn only_an_authenticated_shed_drains_its_body() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
+/// Issue #3744: a pooled HTTP/1.1 client sending a 2 MiB body, the size the
+/// logs benchmark sends, to each HTTP ingest route has every shed refusal
+/// drained: each 429 arrives without `Connection: close`, and no reason of
+/// `ravel_ingest_head_refusal_undrained_total` moves, `over_cap` included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shed_two_mib_body_is_drained_and_keeps_its_connection() {
+    const BODY_BYTES: usize = 2 * 1024 * 1024;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_test_server(store, IngestConcurrencyLimit::Bounded(0)).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .build()
+        .expect("client builds");
+
+    let body = bytes::Bytes::from(incompressible_body(BODY_BYTES, 0x3744));
+    for route in HTTP_INGEST_ROUTES {
+        for _ in 0..4 {
+            let response = client
+                .post(format!("{base}{route}"))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/x-protobuf")
+                .body(body.clone())
+                .send()
+                .await
+                .expect("the shed refusal is read, not a transport error");
+            assert_eq!(response.status(), 429, "{route}: every request is shed");
+            assert_eq!(
+                response.headers().get("connection"),
+                None,
+                "{route}: a drained 2 MiB refusal leaves the pooled connection open"
+            );
+            response.text().await.expect("refusal body reads");
+        }
+    }
+
+    for reason in ["unauthenticated", "over_cap", "busy", "timeout"] {
+        assert_eq!(
+            undrained(&client, &base, reason).await,
+            0,
+            "every 2 MiB refusal was drained, none left undrained for {reason}"
+        );
+    }
+    running.shutdown().await.expect("graceful shutdown");
+}
+
 /// Issue #2926, case C: an authenticated shed whose `Content-Length` is
-/// above the 1 MiB drain cap is answered at once, without reading, with
-/// `Connection: close`, and counted under `over_cap`. "At once" is read off
-/// the drain counters, as in case B.
+/// above the drain cap, the 16 MiB request body limit, is answered at once,
+/// without reading, with `Connection: close`, and counted under `over_cap`.
+/// "At once" is read off the drain counters, as in case B.
 #[tokio::test]
 async fn an_authenticated_shed_over_the_cap_is_answered_without_a_drain() {
+    use ravel_server::ingest_admission::HEAD_REFUSAL_DRAIN_MAX_BYTES;
+
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let running = start_test_server(store, IngestConcurrencyLimit::Bounded(0)).await;
     let base = format!("http://{}", running.http_addr);
@@ -825,7 +874,7 @@ async fn an_authenticated_shed_over_the_cap_is_answered_without_a_drain() {
         running.http_addr,
         "/v1/metrics",
         Some(TOKEN),
-        &format!("content-length: {}", 2 * 1024 * 1024),
+        &format!("content-length: {}", HEAD_REFUSAL_DRAIN_MAX_BYTES + 1),
     );
     let shed = exchange(running.http_addr, &head, &[], Duration::from_secs(10)).await;
 
@@ -885,6 +934,8 @@ async fn a_stalled_authenticated_shed_is_answered_at_the_drain_timeout() {
 /// never also counted `over_cap`.
 #[tokio::test]
 async fn an_unauthenticated_shed_over_the_cap_counts_as_unauthenticated() {
+    use ravel_server::ingest_admission::HEAD_REFUSAL_DRAIN_MAX_BYTES;
+
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let running = start_test_server(store, IngestConcurrencyLimit::Bounded(0)).await;
     let base = format!("http://{}", running.http_addr);
@@ -894,7 +945,7 @@ async fn an_unauthenticated_shed_over_the_cap_counts_as_unauthenticated() {
         running.http_addr,
         "/api/v1/write",
         Some("not-a-token"),
-        &format!("content-length: {}", 2 * 1024 * 1024),
+        &format!("content-length: {}", HEAD_REFUSAL_DRAIN_MAX_BYTES + 1),
     );
     let shed = exchange(running.http_addr, &head, &[], Duration::from_secs(10)).await;
 

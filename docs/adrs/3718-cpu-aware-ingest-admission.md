@@ -151,6 +151,10 @@ body exceeds 1 MiB or whose drain times out is answered with
 (`services/ravel-server/src/ingest_admission.rs`, `refuse_from_head`). See
 Consequences for what that costs at a high shed fraction.
 
+Changed: the drain bound is now the 16 MiB request body limit, not 1 MiB;
+the slots and the timeout are unchanged. See the body-limit drain amendment
+below.
+
 Refusals count on a new `ravel_ingest_cpu_shed_total{mode}`, beside the
 existing `ravel_ingest_concurrency_shed_total`, `ravel_ingest_pending_ack_shed_total`
 and `ravel_ingest_buffer_shed_total`. The current `p` exports as the gauge
@@ -264,7 +268,9 @@ hold amendment below.
     refusal that misses a slot, or carries a body over 1 MiB, is answered
     with `Connection: close`, so an HTTP/1 exporter reconnects, and with TLS
     re-handshakes, for each one. That spends CPU on connection setup while
-    the node is shedding for CPU.
+    the node is shedding for CPU. (Changed by the body-limit drain
+    amendment below: the byte cap is now the 16 MiB request body limit, so
+    no body an admitted request could send is over it.)
   - **`Connection: close` stays mandatory.** Every refusal that leaves the
     body unread keeps the header. A reused HTTP/1.1 connection would
     otherwise parse the unread body bytes as the next request.
@@ -560,3 +566,29 @@ admitted, at a mean of 0.25 s, and the node cleared its bar.
   deferred. A stalled tenant whose deferrals coincide with a router over its
   bound does hold every tenant's requests while both last, since CPU is no
   longer read; no measurement here covers that case.
+
+## Amendment (2026-11-03): drain refusals up to the body limit (#3744)
+
+<!-- amendment-applies: sections="D2. While saturated, refuse a growing fraction of new ingest requests at the head|Consequences" pointer="body-limit drain amendment" -->
+
+D2 bounds a head-refusal drain at 1 MiB, and Consequences names that cap as
+the lever if undrained refusals dominate. Acceptance part 1 showed they do:
+every head refusal, about 50 per second, was answered undrained with reason
+`over_cap` (#3718 comment 6596936397). The logs benchmark sends 2,000-line
+OTLP/HTTP bodies of about 2 MiB, over the 1 MiB cap, so every refusal carried
+`Connection: close` and the client dialled again for the next request.
+
+- **The byte cap is the request body limit.** `HEAD_REFUSAL_DRAIN_MAX_BYTES`
+  is defined as `MAX_REQUEST_BODY_BYTES` (16 MiB,
+  `services/ravel-server/src/ingest_decode.rs`), so the two cannot drift. A
+  refused body of any size an admitted request may send is read and
+  discarded, and the refusal keeps its connection.
+- **Over the limit is still `over_cap`.** A `Content-Length` above 16 MiB is
+  answered at once with `Connection: close`, and a chunked body that passes
+  16 MiB mid-drain is abandoned the same way, both counted under `over_cap`.
+- **The other bounds are unchanged.** 64 drain slots per process and a 1 s
+  timeout still apply, so a drain still never runs past 1 s and at most 64
+  run at once.
+- **Every head refusal gains it.** The hold's refusal at its max wait, the
+  in-flight shed and the pending-ack shed all answer through
+  `refuse_from_head`.

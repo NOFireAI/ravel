@@ -845,8 +845,9 @@ pub(crate) mod tests {
             .header("authorization", "Bearer not-a-token")
             .body(axum::body::Body::from(vec![
                 0u8;
-                2 * HEAD_REFUSAL_DRAIN_MAX_BYTES
+                HEAD_REFUSAL_DRAIN_MAX_BYTES
                     as usize
+                    + 1
             ]))
             .expect("request builds");
 
