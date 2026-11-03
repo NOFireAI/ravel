@@ -38,14 +38,27 @@
 //! column name (the caller's own projection or alias), a failure message
 //! (the engine may echo query text back), and the text of a warning or a
 //! `next_steps` entry, wherever either one carries a value built from what
-//! the caller sent. [`Cell::Str`] and [`Cell::HexId`], every column name,
-//! the failure message, every warning, and every `next_steps` action and
-//! detail are rendered through `escape_cell`, which escapes the newline and
-//! the tab this syntax uses as structure, the backslash, and every other
-//! control character. So none of them can print something a reader takes
-//! for the server's own summary, `# shared`, or `row_count:` line.
-//! [`Cell::Map`] is rendered by `serde_json`, which escapes those
-//! characters already.
+//! the caller sent. [`Cell::Str`] and [`Cell::HexId`], every column name
+//! (in the header and in a `# shared` line), the failure message, every
+//! warning, and every `next_steps` action and detail are rendered through
+//! `escape_text`. [`Cell::Map`] cells, the `# shared` line's map and each
+//! row's diff against it are serialized by `serde_json` first and then go
+//! through the same `escape_text`, since `serde_json` itself escapes only
+//! characters below U+0020, the quote and the backslash, and leaves U+007F,
+//! U+0085, U+2028 and the bidi controls raw.
+//!
+//! `escape_text` writes the newline, carriage return and tab as `\n`,
+//! `\r` and `\t`, the backslash as `\\`, and as `\u{XXXX}` every other
+//! control character (category Cc: U+0000 to U+001F, U+007F, U+0080 to
+//! U+009F), U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR, and the bidi
+//! controls U+202A to U+202E and U+2066 to U+2069. So no caller string can
+//! break a line in the text block, add a column, or reorder what a reader
+//! sees, and none can print something a reader takes for the server's own
+//! summary, `# shared`, or `row_count:` line. `structuredContent` is not
+//! touched: it still carries the exact original strings.
+//!
+//! Warnings share one line, each quoted with its own `"` written as `\"`
+//! and separated by `; `, so one warning containing `; ` reads as one.
 //!
 //! The byte bound applies to the table alone. The summary lines (status,
 //! failure, warnings, next steps) are what a caller acts on when a result
@@ -94,21 +107,37 @@ fn failure_class_label(class: FailureClass) -> &'static str {
     }
 }
 
-/// Escapes everything this rendering uses as structure, plus every other
-/// control character.
+/// Whether `ch` is escaped as `\u{XXXX}`: a control character (Unicode
+/// category Cc, which includes U+007F DEL and the C1 range such as U+0085
+/// NEL and U+009B CSI), U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR,
+/// or a bidi embedding, override or isolate control (U+202A to U+202E,
+/// U+2066 to U+2069).
+fn needs_unicode_escape(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// Escapes everything this rendering uses as structure, plus every
+/// character a terminal or text renderer may treat as a line break or use
+/// to reorder what the reader sees.
 ///
 /// The table's syntax is the newline (row separator) and the tab (column
 /// separator), and the summary and hoist lines are recognised by their
 /// leading text at the start of a line. So a cell holding a newline could
 /// otherwise print a line a reader (or an agent parsing this text) reads as
 /// the server's own `next_step:`, `row_count:`, or `# shared` line, and one
-/// holding a tab could add a column. Row and column data is caller data:
-/// a log body is whatever was ingested.
+/// holding a tab could add a column. U+2028, U+2029 and U+0085 break lines
+/// in some renderers, and a bidi override can make a line display as
+/// something else. Row and column data is caller data: a log body is
+/// whatever was ingested.
 ///
 /// The backslash is escaped too, so the mapping is reversible: without it
 /// the two literal characters `\` `n` in ingested text would render
 /// identically to an escaped newline.
-fn escape_cell(text: &str) -> String {
+fn escape_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -116,13 +145,31 @@ fn escape_cell(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            other if other.is_control() => {
+            other if needs_unicode_escape(other) => {
                 out.push_str(&format!("\\u{{{:04x}}}", other as u32));
             }
             other => out.push(other),
         }
     }
     out
+}
+
+/// A map's JSON, passed through [`escape_text`]. `serde_json` escapes only
+/// characters below U+0020, the quote and the backslash, so U+0085, U+2028
+/// or a bidi control in a key or value would otherwise reach the text raw.
+fn escape_json_map(map: Map<String, Value>) -> String {
+    escape_text(&serde_json::to_string(&Value::Object(map)).unwrap_or_default())
+}
+
+/// The warnings line: each warning escaped, then quoted with its own `"`
+/// escaped as `\"`, so a `; ` inside one warning cannot read as the
+/// separator between two.
+fn warnings_line(warnings: &[String]) -> String {
+    let quoted: Vec<String> = warnings
+        .iter()
+        .map(|w| format!("\"{}\"", escape_text(w).replace('"', "\\\"")))
+        .collect();
+    format!("warnings: {}\n", quoted.join("; "))
 }
 
 fn cell_display(cell: &Cell) -> String {
@@ -138,9 +185,9 @@ fn cell_display(cell: &Cell) -> String {
         // A `HexId` is already restricted to `[0-9a-f]` at construction, so
         // this escape is inert today; it is here so widening that alphabet
         // cannot silently make a hex id able to forge a line.
-        Cell::HexId(id) => escape_cell(id.as_str()),
-        Cell::Str(s) => escape_cell(s),
-        Cell::Map(m) => serde_json::to_string(&Value::Object(m.clone())).unwrap_or_default(),
+        Cell::HexId(id) => escape_text(id.as_str()),
+        Cell::Str(s) => escape_text(s),
+        Cell::Map(m) => escape_json_map(m.clone()),
     }
 }
 
@@ -190,7 +237,7 @@ fn render_data_table(data: &Data, out: &mut String) {
     let header: Vec<String> = data
         .columns
         .iter()
-        .map(|c: &Column| escape_cell(c.name.as_str()))
+        .map(|c: &Column| escape_text(c.name.as_str()))
         .collect();
     out.push_str(&header.join("\t"));
     out.push('\n');
@@ -207,8 +254,8 @@ fn render_data_table(data: &Data, out: &mut String) {
         if let Some(map) = keys {
             out.push_str(&format!(
                 "# shared {}: {}\n",
-                escape_cell(&data.columns[i].name),
-                serde_json::to_string(&Value::Object(map.clone())).unwrap_or_default()
+                escape_text(&data.columns[i].name),
+                escape_json_map(map.clone())
             ));
         }
     }
@@ -225,7 +272,7 @@ fn render_data_table(data: &Data, out: &mut String) {
                             .filter(|(k, v)| shared_map.get(k.as_str()) != Some(*v))
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
-                        serde_json::to_string(&Value::Object(diff)).unwrap_or_default()
+                        escape_json_map(diff)
                     }
                     _ => cell_display(cell),
                 },
@@ -260,7 +307,7 @@ pub fn render(envelope: &Envelope) -> String {
         head.push_str(&format!(
             "failure: {} {}\n",
             failure_class_label(failure.class),
-            escape_cell(&failure.message)
+            escape_text(&failure.message)
         ));
     }
 
@@ -269,14 +316,13 @@ pub fn render(envelope: &Envelope) -> String {
 
     let mut tail = String::new();
     if !envelope.warnings.is_empty() {
-        let escaped: Vec<String> = envelope.warnings.iter().map(|w| escape_cell(w)).collect();
-        tail.push_str(&format!("warnings: {}\n", escaped.join("; ")));
+        tail.push_str(&warnings_line(&envelope.warnings));
     }
     for step in &envelope.next_steps {
         tail.push_str(&format!(
             "next_step: {} - {}\n",
-            escape_cell(&step.action),
-            escape_cell(&step.detail)
+            escape_text(&step.action),
+            escape_text(&step.detail)
         ));
     }
 
@@ -363,7 +409,7 @@ mod tests {
         assert_eq!(text.len(), MAX_TEXT_BYTES);
         assert_eq!(text.len(), 65_536);
         assert!(text.starts_with("status: ok\nn\nxxx"));
-        assert!(text.ends_with("\n...[truncated]\nwarnings: one row was shortened\n"));
+        assert!(text.ends_with("\n...[truncated]\nwarnings: \"one row was shortened\"\n"));
     }
 
     /// The cut lands on a character boundary, never mid-`char`: a table of
@@ -512,7 +558,7 @@ mod tests {
         let text = render(&envelope);
         assert_eq!(
             text,
-            concat!("status: ok\n", "warnings: w\\n# shared attrs: {}\n",)
+            concat!("status: ok\n", "warnings: \"w\\n# shared attrs: {}\"\n",)
         );
         assert_eq!(text.lines().count(), 2);
         assert!(!text.contains("\n# shared"));
@@ -571,5 +617,250 @@ mod tests {
                 "row_count: 1\n",
             )
         );
+    }
+
+    /// The characters every caller-string path must not write raw: line and
+    /// paragraph separators, C1 controls (NEL, CSI), DEL, a bidi override and
+    /// a bidi isolate, the newline and NUL.
+    const HOSTILE_CHARS: [char; 9] = [
+        '\u{2028}', '\u{2029}', '\u{85}', '\u{9b}', '\u{7f}', '\u{202e}', '\u{2066}', '\n', '\u{0}',
+    ];
+
+    fn string_column(name: &str) -> Column {
+        Column {
+            name: name.to_string(),
+            r#type: "string".to_string(),
+        }
+    }
+
+    fn map_of(pairs: &[(&str, &str)]) -> Cell {
+        Cell::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
+                .collect(),
+        )
+    }
+
+    fn rows_envelope(column: &str, rows: Vec<Cell>) -> Envelope {
+        let mut envelope = Envelope::default();
+        envelope.data.columns = vec![string_column(column)];
+        envelope.data.row_count = rows.len() as u64;
+        envelope.data.rows = rows.into_iter().map(|cell| vec![cell]).collect();
+        envelope
+    }
+
+    /// Every path that writes a caller string into the text block, each
+    /// building an envelope carrying `h` there and naming where
+    /// `structuredContent` holds it: a JSON pointer to the string, or to the
+    /// object whose key it is.
+    type CallerPath = (&'static str, fn(&str) -> Envelope, &'static str, bool);
+
+    fn caller_paths() -> Vec<CallerPath> {
+        vec![
+            (
+                "string cell",
+                |h| rows_envelope("c", vec![Cell::Str(h.to_string())]),
+                "/data/rows/0/0",
+                false,
+            ),
+            (
+                "map cell value",
+                |h| rows_envelope("attrs", vec![map_of(&[("k", h)])]),
+                "/data/rows/0/0/k",
+                false,
+            ),
+            (
+                "map cell key",
+                |h| rows_envelope("attrs", vec![map_of(&[(h, "v")])]),
+                "/data/rows/0/0",
+                true,
+            ),
+            (
+                "shared line value",
+                |h| {
+                    rows_envelope(
+                        "attrs",
+                        vec![
+                            map_of(&[("k", h), ("id", "1")]),
+                            map_of(&[("k", h), ("id", "2")]),
+                        ],
+                    )
+                },
+                "/data/rows/0/0/k",
+                false,
+            ),
+            (
+                "shared line column name",
+                |h| {
+                    rows_envelope(
+                        h,
+                        vec![
+                            map_of(&[("s", "x"), ("id", "1")]),
+                            map_of(&[("s", "x"), ("id", "2")]),
+                        ],
+                    )
+                },
+                "/data/columns/0/name",
+                false,
+            ),
+            (
+                "row diff value",
+                |h| {
+                    rows_envelope(
+                        "attrs",
+                        vec![
+                            map_of(&[("s", "x"), ("k", h)]),
+                            map_of(&[("s", "x"), ("k", "other")]),
+                        ],
+                    )
+                },
+                "/data/rows/0/0/k",
+                false,
+            ),
+            (
+                "column name",
+                |h| rows_envelope(h, vec![Cell::Str("v".to_string())]),
+                "/data/columns/0/name",
+                false,
+            ),
+            (
+                "failure message",
+                |h| Envelope {
+                    status: Status::Error,
+                    failure: Some(crate::envelope::Failure {
+                        class: FailureClass::Internal,
+                        message: h.to_string(),
+                        counter: None,
+                    }),
+                    ..Default::default()
+                },
+                "/failure/message",
+                false,
+            ),
+            (
+                "warning",
+                |h| Envelope {
+                    warnings: vec![h.to_string()],
+                    ..Default::default()
+                },
+                "/warnings/0",
+                false,
+            ),
+            (
+                "next_step action",
+                |h| Envelope {
+                    next_steps: vec![crate::envelope::NextStep {
+                        action: h.to_string(),
+                        detail: "d".to_string(),
+                    }],
+                    ..Default::default()
+                },
+                "/next_steps/0/action",
+                false,
+            ),
+            (
+                "next_step detail",
+                |h| Envelope {
+                    next_steps: vec![crate::envelope::NextStep {
+                        action: "a".to_string(),
+                        detail: h.to_string(),
+                    }],
+                    ..Default::default()
+                },
+                "/next_steps/0/detail",
+                false,
+            ),
+        ]
+    }
+
+    /// Each hostile character, sent through each caller-string path, never
+    /// appears raw in the text block and adds no line, while
+    /// `structuredContent` still carries the exact original string.
+    #[test]
+    fn no_caller_path_writes_a_hostile_character_raw() {
+        for (path, build, pointer, is_key) in caller_paths() {
+            let baseline = render(&build("a_b")).lines().count();
+            for ch in HOSTILE_CHARS {
+                let hostile = format!("a{ch}b");
+                let envelope = build(&hostile);
+                let text = render(&envelope);
+
+                if ch == '\n' {
+                    assert!(!text.contains("a\nb"), "{path}: raw newline in {text:?}");
+                } else {
+                    assert!(!text.contains(ch), "{path}: raw {ch:?} in {text:?}");
+                }
+                assert_eq!(
+                    text.lines().count(),
+                    baseline,
+                    "{path}: {ch:?} changed the line count of {text:?}"
+                );
+
+                let structured = serde_json::to_value(&envelope).expect("envelope serializes");
+                let held = structured
+                    .pointer(pointer)
+                    .unwrap_or_else(|| panic!("{path}: nothing at {pointer} in {structured}"));
+                if is_key {
+                    let object = held.as_object().expect("a map cell");
+                    assert_eq!(
+                        object.keys().collect::<Vec<_>>(),
+                        vec![&hostile],
+                        "{path}: {structured}"
+                    );
+                } else {
+                    assert_eq!(held, &Value::String(hostile.clone()), "{path}");
+                }
+            }
+        }
+    }
+
+    /// The escaped set's spelling: the newline as `\n`, every other
+    /// character in the set as `\u{XXXX}`, in a string cell and, after
+    /// `serde_json` wrote its own `\n` and `\u0000`, in a map cell.
+    #[test]
+    fn escaped_characters_use_the_cell_escape_spelling() {
+        let all: String = HOSTILE_CHARS.iter().collect();
+        assert_eq!(
+            escape_text(&all),
+            "\\u{2028}\\u{2029}\\u{0085}\\u{009b}\\u{007f}\\u{202e}\\u{2066}\\n\\u{0000}"
+        );
+        assert_eq!(
+            escape_text("\u{202a}\u{202b}\u{202c}\u{202d}\u{2067}\u{2068}\u{2069}"),
+            "\\u{202a}\\u{202b}\\u{202c}\\u{202d}\\u{2067}\\u{2068}\\u{2069}"
+        );
+        assert_eq!(
+            render(&rows_envelope("attrs", vec![map_of(&[("k", &all)])])),
+            concat!(
+                "status: ok\n",
+                "attrs\n",
+                "{\"k\":\"\\u{2028}\\u{2029}\\u{0085}\\u{009b}\\u{007f}\\u{202e}\\u{2066}",
+                "\\\\n\\\\u0000\"}\n",
+                "row_count: 1\n",
+            )
+        );
+    }
+
+    /// One warning containing `; ` renders differently from two warnings
+    /// split at that `; `, and so does one containing `"; "`, the quoted
+    /// separator itself.
+    #[test]
+    fn one_warning_containing_the_separator_is_not_read_as_two() {
+        let with = |warnings: &[&str]| {
+            render(&Envelope {
+                warnings: warnings.iter().map(|w| w.to_string()).collect(),
+                ..Default::default()
+            })
+        };
+
+        let one = with(&["a; b"]);
+        let two = with(&["a", "b"]);
+        assert_eq!(one, "status: ok\nwarnings: \"a; b\"\n");
+        assert_eq!(two, "status: ok\nwarnings: \"a\"; \"b\"\n");
+        assert_ne!(one, two);
+
+        let quoted = with(&["a\"; \"b"]);
+        assert_eq!(quoted, "status: ok\nwarnings: \"a\\\"; \\\"b\"\n");
+        assert_ne!(quoted, two);
     }
 }
