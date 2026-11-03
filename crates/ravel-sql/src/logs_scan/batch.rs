@@ -5554,9 +5554,9 @@ mod tests {
             /// [`the_memo_case_generator_reaches_every_case_the_property_names`]
             /// pins what the cases cover.
             ///
-            /// Flipped: building the plain memo over `offsets[1..]` fails
-            /// "offsets"; dropping the `all_present` precondition fails the
-            /// keys comparison on a block with absent rows.
+            /// Flipped: dropping the `all_present` precondition from
+            /// `StrCursor::plain_memo` fails "keys" on a block with absent
+            /// rows.
             #[test]
             fn memo_str_block_is_byte_identical_to_the_loop(case in memo_case()) {
                 let block = memo_block(&case);
@@ -5626,9 +5626,10 @@ mod tests {
         /// last one, releases them.
         ///
         /// Flipped: keeping the reservation in `DecodedEntry` (today's) fails
-        /// "the holder keeps the evicted entry's bytes reserved" for every
-        /// case; dropping the memo's `held_outside` term from the pressure
-        /// pass fails "the pressure pass counts nothing the holder holds".
+        /// "the holder keeps the evicted entry's bytes reserved", with the
+        /// batch and with the view cast alike; dropping the memo's
+        /// `held_outside` term from the pressure pass evicts the entry and
+        /// fails "the Str entry stays".
         #[test]
         fn an_arrow_array_is_the_last_holder_of_an_evicted_entrys_reservation() {
             for plain in [true, false] {
@@ -5707,8 +5708,9 @@ mod tests {
         /// batch nor the dictionary is held.
         ///
         /// Flipped: storing the memo's own `ArrayRef` and handing every scan a
-        /// clone of that `Arc` keeps `held` true for as long as the memo
-        /// lives, and "released once no batch of its own holds it" fails.
+        /// clone of that `Arc` fails "one Arc per scan"; with that assertion
+        /// set aside, `held` stays true for as long as the memo lives and
+        /// "released once no batch of its own holds it" fails.
         #[test]
         fn str_values_releases_a_memo_arrays_charge_once_no_batch_holds_it() {
             for plain in [true, false] {

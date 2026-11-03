@@ -1360,8 +1360,7 @@ mod tests {
     ///
     /// FLIP: move the reservation from the cell into `Slot` and the budget
     /// reads `bytes` short right after the eviction; fill a fresh cell in
-    /// `offer` instead of the column's and the second case reads 0 once the
-    /// entry drops, with the outside holder still alive.
+    /// `offer` instead of the column's and the plain case fails "one cell".
     #[test]
     fn the_reservation_is_released_by_the_last_handle_not_by_eviction() {
         // An Arrow buffer owner holds the cell and the column's buffers, never
