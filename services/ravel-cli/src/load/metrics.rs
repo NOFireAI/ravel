@@ -77,6 +77,7 @@ impl MetricsLoadReport {
             flush_mix: self.flush_mix.clone(),
             target_bytes_no_effect_warning: self.target_bytes_no_effect_warning.clone(),
             realign_gave_up: self.realign_gave_up,
+            synthetic_ingest_hours: None,
         }
     }
 }

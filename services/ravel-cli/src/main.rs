@@ -983,6 +983,43 @@ enum Command {
         /// policy with rules creates it.
         #[arg(long, value_name = "TOML")]
         ipcrypt_config: Option<std::path::PathBuf>,
+        /// Hour-ranged measurement lane (ADR-3692 decision 8): write batch i
+        /// (counting batches that carry a row) into ingest hour
+        /// `--ingest-hour-start` + i x HOURS instead of the current hour. The
+        /// hours are synthetic: the router's and shard actors' clock readings
+        /// during batch i (the flush-open stamp that sets each object's
+        /// `ingest_hour_bucket` and `created_unix_ns`, the age trigger) come
+        /// from a clock shifted into that hour, while the decode admission
+        /// (future-skew) check and tenant provisioning read the real time.
+        /// Retention, fold sealing and readers treat the hours as real ingest
+        /// hours; the load report marks them synthetic. Needs
+        /// `--ingest-hour-start`; logs and spans only. Forces
+        /// `--pipeline-depth 1`, `--read-cursors 1` and `--target-bytes 1`
+        /// (refusing another value), so each batch flushes once per shard
+        /// (pinned at the tested batch sizes), fully acked before the clock
+        /// moves on, and the hours are non-decreasing. Before anything is
+        /// written, refused (exit 2) when the start is below unix hour 438288
+        /// (2020-01-01) or not strictly before the current hour, when start +
+        /// batches x HOURS is not below the current hour (batches counted
+        /// from the Parquet footer), when the signal's catalog HEAD exists,
+        /// or when its commit prefix holds any record: use a fresh tenant.
+        /// Before each batch the load fails (exit 1), writing nothing of that
+        /// batch, when the catalog HEAD has appeared (no fold or maintain may
+        /// run against the tenant during the load), or when the batch's
+        /// latest event time is not before its hour's end plus the catalog's
+        /// default max_ingest_lag (2h). A failed strided load cannot be
+        /// resumed: drop and recreate the tenant. Not combinable with
+        /// `--fold-after-load`; fold with `catalog fold --writers-stopped`.
+        #[arg(long, value_name = "HOURS", requires = "ingest_hour_start",
+              conflicts_with = "fold_after_load",
+              value_parser = clap::value_parser!(u32).range(1..))]
+        ingest_hour_stride: Option<u32>,
+        /// The unix hour (unix seconds / 3600) batch 0 of an
+        /// `--ingest-hour-stride` load is written into. Must be strictly
+        /// before the current hour and at least 438288 (2020-01-01, the
+        /// write path's plausible-clock floor). Needs `--ingest-hour-stride`.
+        #[arg(long, value_name = "UNIX_HOUR", requires = "ingest_hour_stride")]
+        ingest_hour_start: Option<u32>,
     },
     /// Bulk-export a tenant's stored logs, metrics or spans to a Parquet file (ADR-1751).
     ///
@@ -2544,6 +2581,14 @@ enum CatalogCommand {
         #[arg(long, value_name = "DURATION",
               value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
+        /// Override the most entries one snapshot part this fold writes may
+        /// hold (default 250,000, `ravel_catalog::DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`),
+        /// for this invocation only. Parts still split at hour boundaries, so a
+        /// small cap gives hour-ranged parts. At least 1. The report names the
+        /// value used.
+        #[arg(long, value_name = "N", conflicts_with = "rebuild_key_index",
+              value_parser = clap::value_parser!(u64).range(1..))]
+        snapshot_part_max_entries: Option<u64>,
         /// Seal through the hour this fold runs in, as well as every hour the
         /// seal margin seals. Asserts that no writer will publish into the
         /// current hour or any earlier one, so a load that has finished can
@@ -3062,11 +3107,12 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     max_flush_lifetime,
                     writers_stopped,
                     key_index_leaves,
+                    snapshot_part_max_entries,
                     json,
                     tenant_kms,
                     ..
                 },
-        } => catalog::fold_with_writers_stopped(
+        } => catalog::fold_with_part_cap(
             store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
                 .await?,
             cli.store.selection(),
@@ -3076,6 +3122,10 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             max_flush_lifetime,
             writers_stopped,
             key_index_leaves,
+            snapshot_part_max_entries
+                .map(usize::try_from)
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("--snapshot-part-max-entries does not fit usize"))?,
             now_ns()?,
             json,
         )
@@ -3862,7 +3912,18 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             load_memory_bytes,
             fold_after_load,
             ipcrypt_config,
+            ingest_hour_stride,
+            ingest_hour_start,
         } => {
+            let ingest_hour_stride =
+                ingest_hour_stride
+                    .zip(ingest_hour_start)
+                    .map(
+                        |(stride_hours, start_hour)| ravel_cli::load::IngestHourStride {
+                            stride_hours,
+                            start_hour,
+                        },
+                    );
             let ipcrypt = ravel_cli::ipcrypt::IpcryptPolicy::from_flags(
                 ipcrypt_config.as_deref(),
                 cli.tenancy.tenant_hash_key_file.as_deref(),
@@ -3891,10 +3952,19 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 load_memory_bytes,
                 fold_after_load,
                 &ipcrypt,
+                ingest_hour_stride,
                 now_ns()?,
             )
             .await;
             profile.finish();
+            if let Err(err) = &result
+                && err
+                    .downcast_ref::<ravel_cli::load::IngestHourStrideRefused>()
+                    .is_some()
+            {
+                eprintln!("error: {err}");
+                std::process::exit(ravel_cli::load::INGEST_HOUR_STRIDE_REFUSED_EXIT);
+            }
             result
         }
         Command::Export {

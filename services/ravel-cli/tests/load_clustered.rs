@@ -296,6 +296,7 @@ async fn load_one(store: &Arc<dyn ObjectStoreBackend>, fx: &Fixture) -> bytes::B
         None,
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),
+        None,
         fx.now_ns,
     )
     .await
