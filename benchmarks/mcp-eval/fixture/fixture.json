@@ -1,0 +1,98 @@
+{
+  "fixture_version": 1,
+  "generator": "fixture/gen.py",
+  "seed": 1385,
+  "time_base": {
+    "anchor": "T0",
+    "rule": "T0 is the load time floored to the minute, minus 60 minutes; every fixture event lies in [T0, T0+60m), inside the server's default 2 h ingest-lag admission window",
+    "recorded_in": "<out>/anchor.json, written by run.sh --fixture"
+  },
+  "counts": {
+    "series": 16,
+    "samples": 3840,
+    "metric_families": 3,
+    "log_rows": 725,
+    "spans": 480,
+    "traces": 120,
+    "slow_traces": 20,
+    "failing_traces": 3,
+    "error_spans": 6,
+    "error_log_rows": 6,
+    "target_user_log_rows": 8,
+    "target_user_spans": 3,
+    "late_batch_rows": 4
+  },
+  "entities": {
+    "services": ["checkout", "payments", "inventory", "frontend"],
+    "absent_service": "billing",
+    "metric_families": [
+      {"name": "http_server_requests_total", "type": "counter", "unit": "", "labels": ["job", "instance", "status_class"]},
+      {"name": "http_server_duration_p99_milliseconds", "type": "gauge", "unit": "ms", "labels": ["job", "instance"]},
+      {"name": "process_resident_memory_bytes", "type": "gauge", "unit": "By", "labels": ["job", "instance"]}
+    ],
+    "incident": {
+      "service": "checkout",
+      "window": {"from": "T0+20m", "to": "T0+30m"},
+      "baseline_window": {"from": "T0+10m", "to": "T0+20m"},
+      "p99_ms_baseline": "40-44",
+      "p99_ms_incident": "900-904",
+      "checkout_5xx_per_scrape_incident": 3,
+      "checkout_5xx_per_scrape_baseline": 0,
+      "slow_trace_index_range": [40, 59],
+      "failing_trace_ids": [
+        "5eed056900000000000000000000002d",
+        "5eed0569000000000000000000000032",
+        "5eed0569000000000000000000000037"
+      ],
+      "failing_span_messages": {
+        "payments": "card processor timeout",
+        "checkout": "upstream payments failed"
+      }
+    },
+    "security": {
+      "user_id": "u-7f3a",
+      "user_key": "user.id",
+      "user_key_is_indexed": true,
+      "user_key_is_declared_column": true,
+      "session_key": "session.id",
+      "session_key_is_indexed": false,
+      "auth_session_id": "s-auth",
+      "auth_events": [
+        {"at": "T0+33m", "body": "login failed: bad password"},
+        {"at": "T0+33m10s", "body": "login failed: bad password"},
+        {"at": "T0+33m20s", "body": "login failed: bad password"},
+        {"at": "T0+34m", "body": "password reset requested"},
+        {"at": "T0+35m", "body": "login succeeded"}
+      ],
+      "user_trace_ids": [
+        "5eed056900000000000000000000000d",
+        "5eed0569000000000000000000000030",
+        "5eed0569000000000000000000000060"
+      ],
+      "uncovered_source": "metrics: samples carry no user.id label"
+    },
+    "late_batch": {
+      "service": "checkout",
+      "attribute": "eval.batch",
+      "rows": 4,
+      "body_prefix": "late batch row"
+    }
+  },
+  "server_flags": [
+    "--mcp",
+    "--mcp-allowed-origins", "http://mcp-eval.invalid",
+    "--indexed-field", "service.name",
+    "--indexed-field", "http.status_code",
+    "--indexed-field", "user.id",
+    "--typed-attr-column", "user.id:str",
+    "--retention-default", "7d"
+  ],
+  "load_sequence": [
+    "check that the tenant is empty: SELECT count(*) on samples, logs and spans must each return 0",
+    "pick T0 and write <out>/anchor.json",
+    "POST /v1/metrics with gen.py encode metrics T0 (Content-Type: application/x-protobuf)",
+    "POST /v1/logs with gen.py encode logs T0",
+    "POST /v1/traces with gen.py encode traces T0",
+    "query back every count above that has a SQL form, with min_commit_token set to the three ack tokens, and fail unless each figure is present exactly once and equal"
+  ]
+}

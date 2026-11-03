@@ -1,0 +1,17 @@
+{
+  "id": "D2",
+  "answer_facts": [
+    {"fact": "the typed failure is named", "pattern": "budget_estimate_exceeds_ceiling|budget_exceeded"},
+    {"fact": "the 1000-byte ceiling", "pattern": "1,?000\\s*(bytes|b\\b)|max_bytes_scanned"},
+    {"fact": "an estimate figure is reported", "pattern": "estimat"},
+    {"fact": "one next step to narrow", "pattern": "narrow|next step|smaller|shorter|reduce|limit"}
+  ],
+  "evidence": [
+    {"item": "the refused statement", "pattern": "select"}
+  ],
+  "expected_failure_classes": ["budget_estimate_exceeds_ceiling", "budget_exceeded"],
+  "retry_bound": 1,
+  "tools_expected": ["ravel_explain_query", "ravel_query_sql"],
+  "call_bound": 4,
+  "fixture_refs": ["counts.log_rows"]
+}

@@ -1,0 +1,17 @@
+{
+  "id": "B3",
+  "answer_facts": [
+    {"fact": "3 failed traces", "pattern": "\\b(3|three)\\b"},
+    {"fact": "failed trace 5eed...002d", "pattern": "5eed056900000000000000000000002d"},
+    {"fact": "failed trace 5eed...0032", "pattern": "5eed0569000000000000000000000032"},
+    {"fact": "failed trace 5eed...0037", "pattern": "5eed0569000000000000000000000037"},
+    {"fact": "payments span message", "pattern": "card processor timeout"},
+    {"fact": "checkout span message", "pattern": "upstream payments failed"}
+  ],
+  "evidence": [
+    {"item": "the query text or trace lookup", "pattern": "select|ravel_get_trace|trace_id"}
+  ],
+  "tools_expected": ["ravel_query_sql", "ravel_get_trace", "ravel_search_logs"],
+  "call_bound": 8,
+  "fixture_refs": ["counts.failing_traces", "entities.incident.failing_trace_ids", "entities.incident.failing_span_messages"]
+}

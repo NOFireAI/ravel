@@ -6,12 +6,15 @@ nanosecond timestamp the loader picks and records) and of SEED. Nothing reads
 the clock, the environment or a random source the seed does not drive.
 
     gen.py counts                      print the fixture's counts as JSON
+    gen.py entities                    print the named trace ids, user and
+                                       services as JSON
     gen.py encode SIGNAL ANCHOR_NS     write the OTLP request body for SIGNAL
                                        (metrics, logs or traces) to stdout
     gen.py late BATCH_NS LABEL         write the 4-row late log batch carrying
                                        eval.batch=LABEL, at BATCH_NS + 0..3 s
-                                       (a minute-aligned time the runner picks
-                                       inside the ingest-lag window), to stdout
+                                       (a time the runner picks after the
+                                       fixture hour, inside the ingest-lag
+                                       window), to stdout
 
 Standard library only: the protobuf wire encoding is written out by hand
 against the opentelemetry-proto field numbers.
@@ -200,6 +203,18 @@ def counts():
     }
 
 
+def entities():
+    """The named ids fixture.json states, derived from the model."""
+    sp = spans(0)
+    return {
+        "failing_trace_ids": sorted({s["trace_id"].hex() for s in sp if s["error"]}),
+        "user_trace_ids": sorted({s["trace_id"].hex() for s in sp
+                                  if s["attrs"].get("user.id") == TARGET_USER}),
+        "user_id": TARGET_USER,
+        "services": SERVICES,
+    }
+
+
 # --- protobuf wire encoding ------------------------------------------------
 
 
@@ -329,6 +344,9 @@ def main(argv):
     if len(argv) == 2 and argv[1] == "counts":
         print(json.dumps(counts(), sort_keys=True))
         return 0
+    if len(argv) == 2 and argv[1] == "entities":
+        print(json.dumps(entities(), sort_keys=True))
+        return 0
     if len(argv) == 4 and argv[1] == "encode":
         t0 = parse_anchor(argv[3])
         encoders = {"metrics": encode_metrics, "logs": lambda a: encode_logs_rows(logs(a)),
@@ -338,7 +356,10 @@ def main(argv):
         sys.stdout.buffer.write(encoders[argv[2]](t0))
         return 0
     if len(argv) == 4 and argv[1] == "late":
-        sys.stdout.buffer.write(encode_logs_rows(late_logs(parse_anchor(argv[2]), argv[3])))
+        batch_ns = int(argv[2])
+        if batch_ns <= 0:
+            raise SystemExit("gen.py: batch time must be a positive unix ns value")
+        sys.stdout.buffer.write(encode_logs_rows(late_logs(batch_ns, argv[3])))
         return 0
     sys.stderr.write(__doc__)
     return 64

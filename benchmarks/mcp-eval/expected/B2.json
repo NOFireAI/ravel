@@ -1,0 +1,14 @@
+{
+  "id": "B2",
+  "answer_facts": [
+    {"fact": "20 slow traces", "pattern": "\\b20\\b"},
+    {"fact": "checkout span about 900 ms", "pattern": "\\b90[0-4](\\.\\d+)?\\s*(ms|milli)|0\\.9\\d*\\s*s"},
+    {"fact": "an example slow trace id", "pattern": "5eed0569000000000000000000000(029|02a|02b|02c|02d|02e|02f|030|031|032|033|034|035|036|037|038|039|03a|03b|03c)"}
+  ],
+  "evidence": [
+    {"item": "the query text", "pattern": "select|spans"}
+  ],
+  "tools_expected": ["ravel_query_sql"],
+  "call_bound": 8,
+  "fixture_refs": ["counts.slow_traces", "entities.incident.slow_trace_index_range"]
+}

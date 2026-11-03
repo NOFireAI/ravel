@@ -1,0 +1,14 @@
+{
+  "id": "F5",
+  "answer_facts": [
+    {"fact": "zero rows", "pattern": "\\b(0|zero|no)\\b"},
+    {"fact": "classified as window outside retention", "pattern": "retention|retained|older than|before the (earliest|oldest)"}
+  ],
+  "evidence": [
+    {"item": "the earliest retained or covered time", "pattern": "coverage|earliest|oldest|retention"}
+  ],
+  "expected_empty_class": "window_outside_retention",
+  "tools_expected": ["ravel_describe_data", "ravel_search_logs"],
+  "call_bound": 4,
+  "fixture_refs": ["server_flags"]
+}

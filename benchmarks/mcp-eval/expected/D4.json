@@ -1,0 +1,17 @@
+{
+  "id": "D4",
+  "answer_facts": [
+    {"fact": "the refusal is quoted exactly", "pattern": "@first_failure_message"},
+    {"fact": "the 11,000-step limit", "pattern": "11,?000"},
+    {"fact": "a peak rate of 0.2 per second", "pattern": "\\b0\\.2\\d*\\b|\\b0\\.19\\d*\\b"}
+  ],
+  "evidence": [
+    {"item": "the PromQL query text", "pattern": "rate\\(|http_server_requests_total"},
+    {"item": "the step used", "pattern": "step"}
+  ],
+  "expected_failure_classes": ["invalid_argument"],
+  "retry_bound": 1,
+  "tools_expected": ["ravel_query_promql"],
+  "call_bound": 4,
+  "fixture_refs": ["entities.incident.checkout_5xx_per_scrape_incident"]
+}
