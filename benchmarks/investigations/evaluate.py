@@ -1391,6 +1391,10 @@ def main(argv):
         ok = [c for (_, s, _), t in calls.groups.items() if s == state for v in t.values() for c in v
               if c.get("outcome") == "ok"]
         if not ok:
+            unsent = [c for (_, s, _), t in sorted(calls.groups.items()) if s == state for v in t.values()
+                      for c in v if c.get("outcome") == "not-run"]
+            if unsent:
+                return "not-run", None, unsent[0].get("reason") or "no reason given"
             return "missing", None, f"no ok call in {state}"
         return "value", int(all(c.get("_judged") in ("correct", "reference", "unjudged") for c in ok)), ""
 

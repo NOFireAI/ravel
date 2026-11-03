@@ -1045,6 +1045,7 @@ class Evaluate(Workdir):
         # 1000 GET x $0.0004/1000 + 200 LIST x $0.005/1000 + 2.7 cpu_s x $0.612/3600
         self.assertEqual(s["dollars_per_call"], 0.001859)
         self.assertEqual((s["mean_gets"], s["mean_list_requests"], s["mean_server_cpu_s"]), (1000, 200, 2.7))
+        self.assertEqual(s["server_cpu_s_cold_sum"], 5.4)
         for sig in ("spans", "logs"):
             m = next(m for m in res["cost"]["maintenance"] if m["signal"] == sig)
             r = next(f for f in read_jsonl(os.path.join(self.run_dir, "stamps", "folds.jsonl"))
@@ -1143,11 +1144,14 @@ class Evaluate(Workdir):
         self.assertNotIn("dead_counter segmentsOpened journey_c_1 folded_leaves", res["problems"])
 
     def check_probe_per_object(self, evaluate_py=EVALUATE):
-        """Item 6: row 3's probe band is per object read, not the call's total."""
+        """Row 3's probe band is per distinct probed object (pruning.segments
+        without a per-object breakdown), not per GET and not the call's total."""
         for c in self.select("spans_lookup_1h", "unfolded"):
+            c["stats"].pop("perObject", None)
+            c["stats"]["pruning"]["segments"] = 4
             for p in c["stats"]["phases"]:
                 if p["phase"] == "probe":
-                    p["s3GetRequests"], p["s3GetWireBytes"] = 4, 16388
+                    p["s3GetRequests"], p["s3GetWireBytes"] = 8, 16388
         self.save_calls()
         _, res, _ = self.go(BANDS, evaluate_py)
         f = figure(res, "row_03.probe_wire_per_object")
@@ -1201,21 +1205,6 @@ class Evaluate(Workdir):
 
     def test_part_count(self):
         self.assertEqual(self.check_part_count(), [])
-
-    def check_in_refusal(self, evaluate_py=EVALUATE):
-        """Item 11: a 1000-key list counts as refused only when the server said so."""
-        for c in self.select("spans_in_1000"):
-            del c["http_status"]
-        self.save_calls()
-        _, res, _ = self.go(BANDS, evaluate_py)
-        f = figure(res, "row_11.control_1001_not_served")
-        out = [] if f["verdict"] == "missing" else [f"{f['value']} {f['verdict']}"]
-        if not any(p.startswith("missing row_11.control_1001_not_served") for p in res["problems"]):
-            out.append(f"problems {res['problems']}")
-        return out
-
-    def test_in_refusal(self):
-        self.assertEqual(self.check_in_refusal(), [])
 
     def check_state_absent(self, evaluate_py=EVALUATE):
         """Item 15: a state run.toml lists and calls.jsonl lacks is missing."""
@@ -1295,6 +1284,301 @@ class Evaluate(Workdir):
         self.assertIn("wrong_answer logs_tail_request_id/mixed/cold try 0: rows 0 expected 1", res["problems"])
         self.assertEqual(figure(res, "row_13.wrong_answers")["value"], 1)
 
+    # --- in-flight overlap, refusals, the 1,001-key control -----------------
+
+    def statement_tables(self):
+        with open(STATEMENTS, "rb") as f:
+            return {s["id"]: s.get("table", "spans") for s in tomllib.load(f)["statement"]}
+
+    def inflight_calls(self, sig):
+        table = self.statement_tables()
+        return [c for c in self.calls if c["state"] == "compaction_in_flight" and c.get("temp") == "inflight"
+                and c["outcome"] == "ok" and table[c["statement"]] == sig]
+
+    def set_compaction(self, windows):
+        """windows: {signal: f(calls) -> (started, ended)} over that signal's in-flight calls."""
+        path = self.stamp_path("compaction.jsonl")
+        lines = read_jsonl(path)
+        for line in lines:
+            window = windows.get(line["signal"])
+            if window:
+                line["measure"]["started_unix_s"], line["measure"]["ended_unix_s"] = window(
+                    self.inflight_calls(line["signal"]))
+        write_jsonl(path, lines)
+
+    @staticmethod
+    def covering(calls):
+        return min(c["started_unix_s"] for c in calls) - 1, max(c["started_unix_s"] + c["wall_s"] for c in calls) + 1
+
+    @staticmethod
+    def after(calls, seconds):
+        end = max(c["started_unix_s"] + c["wall_s"] for c in calls) + 1
+        return end, end + seconds
+
+    def check_overlap_full(self, evaluate_py=EVALUATE):
+        """Every in-flight try inside its compaction's window: no not_in_flight, the state's figure passes."""
+        self.set_compaction({"spans": self.covering, "logs": self.covering})
+        _, res, _ = self.go(BANDS, evaluate_py)
+        out = [p for p in res["problems"] if p.startswith("not_in_flight")]
+        f = figure(res, "row_13.compaction_in_flight_rows_exact")
+        if (f["status"], f["value"], f["verdict"]) != ("value", 1, "pass"):
+            out.append(f"figure {f['status']} {f['value']} {f['verdict']}")
+        return out
+
+    def test_overlap_full(self):
+        self.assertEqual(self.check_overlap_full(), [])
+
+    def check_overlap_partial(self, evaluate_py=EVALUATE):
+        """A logs compaction that covers only the first logs try: that group is not_in_flight."""
+        calls = sorted(self.inflight_calls("logs"), key=lambda c: c["started_unix_s"])
+        first, second = calls[0], calls[1]
+        group = [c for c in calls if c["statement"] == first["statement"]]
+        self.set_compaction({"spans": self.covering,
+                             "logs": lambda _: (first["started_unix_s"] - 10,
+                                                (first["started_unix_s"] + second["started_unix_s"]) / 2)})
+        _, res, _ = self.go(BANDS, evaluate_py)
+        want = (f"not_in_flight {first['statement']}/compaction_in_flight: 1 of {len(group)} inflight tries "
+                f"overlapped the logs compaction")
+        return [] if len(group) > 1 and want in res["problems"] else [f"problems {res['problems']}"]
+
+    def test_overlap_partial(self):
+        self.assertEqual(self.check_overlap_partial(), [])
+
+    def check_overlap_zero(self, evaluate_py=EVALUATE):
+        """A long logs compaction that started after every logs try ended: not_in_flight, not not-run."""
+        calls = self.inflight_calls("logs")
+        self.set_compaction({"spans": self.covering, "logs": lambda c: self.after(c, 100)})
+        _, res, _ = self.go(BANDS, evaluate_py)
+        out = []
+        for statement in sorted({c["statement"] for c in calls}):
+            n = sum(1 for c in calls if c["statement"] == statement)
+            want = (f"not_in_flight {statement}/compaction_in_flight: 0 of {n} inflight tries "
+                    f"overlapped the logs compaction")
+            if want not in res["problems"]:
+                out.append(f"no '{want}'")
+        return out
+
+    def test_overlap_zero(self):
+        self.assertEqual(self.check_overlap_zero(), [])
+
+    def check_overlap_too_short(self, evaluate_py=EVALUATE):
+        """Compactions shorter than one call that cover no try: not-run, so incomplete, never a problem."""
+        shortest = min(c["wall_s"] for sig in ("spans", "logs") for c in self.inflight_calls(sig))
+        self.set_compaction({"spans": lambda c: self.after(c, shortest / 2),
+                             "logs": lambda c: self.after(c, shortest / 2)})
+        code, res, _ = self.go(BANDS, evaluate_py)
+        out = [p for p in res["problems"] if p.startswith("not_in_flight") or "compaction_in_flight" in p]
+        f = figure(res, "row_13.compaction_in_flight_rows_exact")
+        if f["status"] != "not-run" or "shorter than one call" not in (f["reason"] or ""):
+            out.append(f"figure {f['status']} {f['reason']}")
+        if not any("compaction_in_flight not run: compaction ran " in r for r in res["incomplete"]):
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_overlap_too_short(self):
+        self.assertEqual(self.check_overlap_too_short(), [])
+
+    def test_compaction_done_before_the_first_call_is_not_run(self):
+        calls = {sig: self.inflight_calls(sig) for sig in ("spans", "logs")}
+        first = min(c["started_unix_s"] for v in calls.values() for c in v)
+        self.set_compaction({"spans": lambda _: (first - 10, first - 9), "logs": lambda _: (first - 10, first - 9)})
+        _, res, _ = self.go(BANDS)
+        self.assertEqual([p for p in res["problems"] if "compaction_in_flight" in p], [])
+        f = figure(res, "row_13.compaction_in_flight_rows_exact")
+        self.assertEqual((f["status"], f["reason"]), ("not-run", "compaction finished in 1000 ms before the first call"))
+
+    def check_refused(self, evaluate_py=EVALUATE):
+        """A refusal of a statement not planned as a cap probe is the problem refused; a cap probe's reads
+        unsupported."""
+        for c in self.select("spans_in_100"):
+            for k in ("stats", "rows", "values", "server_cpu_s"):
+                c.pop(k, None)
+            c.update(outcome=UNSUPPORTED, http_status=400, reason=REFUSAL_1000)
+        self.save_calls()
+        code, res, _ = self.go(BANDS, evaluate_py)
+        want = f"refused spans_in_100/folded_leaves/cold try 0: HTTP 400 {REFUSAL_1000}"
+        out = [] if want in res["problems"] else [f"no '{want}'"]
+        out += [p for p in res["problems"] if p.startswith("refused spans_in_1000")]
+        return out
+
+    def test_refused(self):
+        self.assertEqual(self.check_refused(), [])
+
+    def served_1000(self, statement, keys):
+        """Turn statement's folded_leaves cold calls into ok calls probing keys keys."""
+        src = {c["try"]: c for c in self.select("spans_in_100")}
+        for i, c in enumerate(self.calls):
+            if c["statement"] == statement and c["state"] == "folded_leaves" and c.get("temp") == "cold":
+                new = copy.deepcopy(src[c["try"]])
+                new.update(statement=statement, truth_key=c.get("truth_key", new.get("truth_key")))
+                new["stats"]["keyIndex"] = dict(new["stats"].get("keyIndex") or {}, keysProbed=keys, partsCovered=1)
+                self.calls[i] = new
+
+    def check_control(self, mode, evaluate_py=EVALUATE):
+        want = {"unsupported": (UNSUPPORTED, None, "unsupported-on-this-build"),
+                "pass": ("value", 1, "pass"), "miss": ("value", 0, "miss")}[mode]
+        if mode in ("pass", "miss"):
+            self.served_1000("spans_in_1000", 1000)
+        if mode == "miss":
+            self.served_1000("spans_in_1001", 1001)
+        self.save_calls()
+        _, res, _ = self.go(BANDS, evaluate_py)
+        f = figure(res, "row_11.spans_control_1001")
+        out = [] if (f["status"], f["value"], f["verdict"]) == want else [f"{f['status']} {f['value']} {f['verdict']}"]
+        reason = {"unsupported": "the 1,000-key list was refused: ", "miss": "was index-served", "pass": ""}[mode]
+        if reason not in (f["reason"] or ""):
+            out.append(f"reason {f['reason']}")
+        return out
+
+    def check_control_unsupported(self, evaluate_py=EVALUATE):
+        """Row 11 on main: the 1,000-key list refused by the complexity guard reads unsupported."""
+        return self.check_control("unsupported", evaluate_py)
+
+    def check_control_pass(self, evaluate_py=EVALUATE):
+        """1,000 keys probed and the 1,001-key list refused: the control passes."""
+        return self.check_control("pass", evaluate_py)
+
+    def check_control_miss(self, evaluate_py=EVALUATE):
+        """A 1,001-key list the index served: the control misses."""
+        return self.check_control("miss", evaluate_py)
+
+    def test_control_unsupported(self):
+        self.assertEqual(self.check_control_unsupported(), [])
+
+    def test_control_pass(self):
+        self.assertEqual(self.check_control_pass(), [])
+
+    def test_control_miss(self):
+        self.assertEqual(self.check_control_miss(), [])
+
+    # --- incomplete, truth-derived budgets, absent fields -------------------
+
+    def check_skipped_state(self, evaluate_py=EVALUATE):
+        """A state run.toml asks for that the run skipped: incomplete, not pass."""
+        self.calls = [c for c in self.calls if c["state"] != "mixed"]
+        self.save_calls()
+        write_jsonl(self.stamp_path("not_run.jsonl"), [{"state": "mixed", "reason": "case: run deadline"}])
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = [] if (code, res["verdict"], res["problems"]) == (1, "incomplete", []) else [
+            f"exit {code} {res['verdict']} {res['problems']}"]
+        if "state mixed not run: case: run deadline" not in res["incomplete"]:
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_skipped_state(self):
+        self.assertEqual(self.check_skipped_state(), [])
+
+    def check_deadline_mid_state(self, evaluate_py=EVALUATE):
+        """A deadline that stopped a state part way: its unsent calls make the run incomplete."""
+        for i, c in enumerate(self.calls):
+            if (c["statement"], c["state"], c.get("temp"), c["try"]) == ("spans_in_10", "folded_leaves", "cold", 1):
+                self.calls[i] = {k: c[k] for k in ("statement", "state", "temp", "try", "tenant")}
+                self.calls[i].update(outcome="not-run", reason="case: run deadline")
+        self.save_calls()
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = [] if (code, res["verdict"], res["problems"]) == (1, "incomplete", []) else [
+            f"exit {code} {res['verdict']} {res['problems']}"]
+        if "1 cold call(s) of spans_in_10 in folded_leaves not run: case: run deadline" not in res["incomplete"]:
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_deadline_mid_state(self):
+        self.assertEqual(self.check_deadline_mid_state(), [])
+
+    def check_budget_from_truth(self, evaluate_py=EVALUATE):
+        """Row 15's GET budget charges truth.json's holders times its rows per holder."""
+        path = os.path.join(self.run_dir, "truth.json")
+        with open(path) as f:
+            truth = json.load(f)
+        truth["failing_cell"]["count"] += 1
+        truth["generator"]["logs_per_trace"] += 2
+        with open(path, "w") as f:
+            json.dump(truth, f)
+        _, res, _ = self.go(BANDS, evaluate_py)
+        m = {f["id"]: f["value"] for f in res["figures"]}
+        out = []
+        if (m["row_15.truth_holders"], m["row_15.truth_rows_per_holder"]) != (
+                truth["failing_cell"]["count"], truth["generator"]["logs_per_trace"]):
+            out.append(f"holders {m['row_15.truth_holders']} rows {m['row_15.truth_rows_per_holder']}")
+        with open(BANDS, "rb") as f:
+            row = next(r for r in tomllib.load(f)["row"] if r["key"] == "row_15")
+        expr = next(f["expr"] for f in row["figure"] if f["name"] == "journey_gets_budget")
+        if m["row_15.journey_gets_budget"] != eval(expr, {"min": min}, {"m": m}):
+            out.append(f"budget {m['row_15.journey_gets_budget']}")
+        return out
+
+    def test_budget_from_truth(self):
+        self.assertEqual(self.check_budget_from_truth(), [])
+
+    def check_absent_leaf_size(self, evaluate_py=EVALUATE):
+        """A leaf the inspector printed no size for makes the share missing, never a sum that reads it as 0."""
+        path = self.stamp_path("folded_leaves.logs.catalog.json")
+        with open(path) as f:
+            doc = json.load(f)
+        leaf = next(lf for p in doc["parts"] for lf in p["leaves"] if lf["field"] == "trace_id")
+        del leaf["bytes"]
+        with open(path, "w") as f:
+            json.dump(doc, f)
+        _, res, _ = self.go(BANDS, evaluate_py)
+        f = figure(res, "row_08.logs_trace_id_leaf_pct")
+        want = ("missing", "a trace_id leaf in stamps/folded_leaves.logs.catalog.json has no size")
+        return [] if (f["status"], f["reason"]) == want else [f"{f['status']} {f['value']} {f['reason']}"]
+
+    def test_absent_leaf_size(self):
+        self.assertEqual(self.check_absent_leaf_size(), [])
+
+    def check_negative_controls(self, evaluate_py=EVALUATE):
+        """Row 13's mutant controls are not built: not-run with that reason, so the run is at best incomplete."""
+        _, res, _ = self.go(BANDS, evaluate_py)
+        f = figure(res, "row_13.negative_controls_failing_on_mutant")
+        out = [] if (f["status"], f["reason"]) == ("not-run", "mutant controls not implemented") else [
+            f"{f['status']} {f['value']} {f['reason']}"]
+        want = "figure row_13.negative_controls_failing_on_mutant not run: mutant controls not implemented"
+        if want not in res["incomplete"]:
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_negative_controls(self):
+        self.assertEqual(self.check_negative_controls(), [])
+
+    def check_maintenance_per_lookup(self, evaluate_py=EVALUATE):
+        """The folded cost with maintenance adds maintenance per part-month over lookups per part-month."""
+        _, res, _ = self.go(BANDS, evaluate_py)
+        freq = res["cost"]["lookups_per_part_month_assumed"]
+        rows = [b for b in res["cost"]["break_even"] if "maintenance_per_lookup" in b]
+        out = [] if freq == 1000 and rows else [f"freq {freq} rows {len(rows)}"]
+        for b in rows:
+            per = round(b["maintenance_per_part_month"] / freq, 9)
+            if (b["maintenance_per_lookup"], b["dollars_folded_leaves_with_maintenance"]) != (
+                    per, round(b["dollars_folded_leaves"] + per, 9)):
+                out.append(f"{b['statement']} {b['maintenance_per_lookup']} {b['dollars_folded_leaves_with_maintenance']}")
+        return out
+
+    def test_maintenance_per_lookup(self):
+        self.assertEqual(self.check_maintenance_per_lookup(), [])
+
+    def check_erasure_victim(self, evaluate_py=EVALUATE):
+        """Under a pending erasure the victim's lookup must return no row (truth_key_in), not the unfolded
+        answer."""
+        _, res, _ = self.go(BANDS, evaluate_py)
+        out = [p for p in res["problems"] if "logs_erasure_victim" in p]
+        f = figure(res, "row_13.erasure_in_flight_rows_exact")
+        if (f["status"], f["value"]) != ("value", 1):
+            out.append(f"figure {f['status']} {f['value']}")
+        return out
+
+    def test_erasure_victim(self):
+        self.assertEqual(self.check_erasure_victim(), [])
+
+    def test_erasure_victim_row_returned_is_wrong(self):
+        unfolded = {c["try"]: c for c in self.select("logs_erasure_victim", "unfolded")}
+        for c in self.select("logs_erasure_victim", "erasure_in_flight"):
+            c["rows"], c["values"] = unfolded[c["try"]]["rows"], unfolded[c["try"]]["values"]
+        self.save_calls()
+        _, res, _ = self.go(BANDS)
+        self.assertIn("wrong_answer logs_erasure_victim/erasure_in_flight/cold try 0: rows 1 expected 0",
+                      res["problems"])
+
 
 # --- wrong evaluators the cases rule out --------------------------------------------
 
@@ -1325,9 +1609,9 @@ FLIPS = {
         "    if False:",
         "check_dead_counter",
     ),
-    "probe wire not divided per object": (
-        '            v = rnd(m["probe_wire_bytes"] / m["probe_gets"])',
-        '            v = m["probe_wire_bytes"]',
+    "probe wire divided per GET": (
+        '            probed = len(per_object) if isinstance(per_object, list) else m["segments"]',
+        '            probed = len(per_object) if isinstance(per_object, list) else m["probe_gets"]',
         "check_probe_per_object",
     ),
     "miss reason dropped": (
@@ -1336,8 +1620,8 @@ FLIPS = {
         "check_miss_reason",
     ),
     "leaf share over every field": (
-        '        return "value", rnd(100.0 * leaf_bytes(doc, field) / data["bytes"]), ""',
-        '        return "value", rnd(100.0 * leaf_bytes(doc) / data["bytes"]), ""',
+        "        lb = leaf_bytes(doc, field)",
+        "        lb = leaf_bytes(doc)",
         "check_leaf_share",
     ),
     "part count read from the declaration": (
@@ -1345,11 +1629,90 @@ FLIPS = {
         '        return "value", doc.get("parts_declared", 24), ""',
         "check_part_count",
     ),
-    "any unsupported 1000-key call taken as refused": (
-        '        refused = all(c.get("outcome") == UNSUPPORTED and COMPLEXITY_REFUSAL in (c.get("reason") or "")\n'
-        '                      and "http_status" in c for c in lines)',
-        '        refused = all(c.get("outcome") == UNSUPPORTED for c in lines)',
-        "check_in_refusal",
+    "every server refusal read unsupported": (
+        '                    if outcome == UNSUPPORTED and "http_status" in c and not (',
+        '                    if False and not (',
+        "check_refused",
+    ),
+    "only cap-probe refusals taken as refused": (
+        '                    if outcome == UNSUPPORTED and "http_status" in c and not (',
+        '                    if outcome == UNSUPPORTED and "http_status" in c and (',
+        "check_refused",
+    ),
+    "a refused 1,000-key list read as missing": (
+        "    if refused:\n",
+        "    if False:\n",
+        "check_control_unsupported",
+    ),
+    "1,000 keys probed read as a miss": (
+        '        if ki["keysProbed"] != 1000:',
+        '        if ki["keysProbed"] != 999:',
+        "check_control_pass",
+    ),
+    "an index-served 1,001-key list not seen": (
+        "    if served:\n",
+        "    if False:\n",
+        "check_control_miss",
+    ),
+    "full overlap not counted": (
+        'overlapped = sum(1 for c in lines if c["started_unix_s"] < ended and',
+        'overlapped = sum(1 for c in lines if c["started_unix_s"] > ended and',
+        "check_overlap_full",
+    ),
+    "partial overlap taken as in flight": (
+        "        if overlapped == len(lines):\n",
+        "        if overlapped:\n",
+        "check_overlap_partial",
+    ),
+    "zero overlap read as a short window": (
+        "        if ended <= first:\n",
+        "        if ended <= first or not overlapped:\n",
+        "check_overlap_zero",
+    ),
+    "a short window taken as not_in_flight": (
+        "        elif ended - started < shortest:\n",
+        "        elif False:\n",
+        "check_overlap_too_short",
+    ),
+    "an unsent state read as missing": (
+        "            if unsent:\n",
+        "            if False:\n",
+        "check_overlap_too_short",
+    ),
+    "a skipped state passed over": (
+        "        if live.get(s) is not None:\n            out.append(",
+        "        if False:\n            out.append(",
+        "check_skipped_state",
+    ),
+    "unsent calls of a live state passed over": (
+        "        if lines:\n            out.append(",
+        "        if False:\n            out.append(",
+        "check_deadline_mid_state",
+    ),
+    "truth figures not read from truth.json": (
+        "    return \"value\", v, \"\"\n\n\ndef run_rows",
+        "    return \"value\", 1, \"\"\n\n\ndef run_rows",
+        "check_budget_from_truth",
+    ),
+    "an absent leaf size summed as 0": (
+        "    return sum(values) if all(isinstance(v, int) for v in values) else None",
+        "    return sum(v for v in values if isinstance(v, int))",
+        "check_absent_leaf_size",
+    ),
+    "negative controls reported as run": (
+        '            return "not-run", None, "mutant controls not implemented"',
+        '            return "value", 5, ""',
+        "check_negative_controls",
+    ),
+    "maintenance charged whole to every lookup": (
+        '                per = m["maintenance_per_part_month"] / freq',
+        '                per = m["maintenance_per_part_month"]',
+        "check_maintenance_per_lookup",
+    ),
+    "pending erasure judged against the unfolded answer": (
+        'unfolded_oracle = st is not None and state not in (st.get("truth_key_in") or {}) and (',
+        "unfolded_oracle = st is not None and (",
+        "check_erasure_victim",
     ),
     "state without calls passed over": (
         '            problems.add("missing", f"state {state}: no calls in calls.jsonl")\n',
@@ -1371,7 +1734,8 @@ class Flips(Workdir):
         for name, (old, new, case) in FLIPS.items():
             with self.subTest(flip=name):
                 self.assertEqual(src.count(old), 1, f"{name}: anchor gone from evaluate.py; update the flip")
-                line = src[: src.index(old)].count("\n") + 2
+                differs = next((i for i, (a, b) in enumerate(zip(old, new)) if a != b), min(len(old), len(new)))
+                line = src[: src.index(old) + differs].count("\n") + 1
                 flipped = self.path(f"evaluate_{case}.py")
                 with open(flipped, "w") as f:
                     f.write(src.replace(old, new))
@@ -1606,6 +1970,31 @@ class Box(Workdir):
         p = subprocess.run([BASH, os.path.join(BOX, "launch.sh"), "--dry-run", os.path.join(BOX, "run.example.toml")],
                            capture_output=True, text=True, env=dict(os.environ, PATH=self.stub_path()))
         self.assertEqual(p.returncode, 64)
+
+    @staticmethod
+    def objects_over_512k(inv_py):
+        mod = load_module(inv_py, "inv_case")
+        keys = [("t/h1/l/a", 512 * 1024), ("t/h1/l/b", 512 * 1024 + 1), ("t/h1/l/c", 10), ("t/h2/l/d", 1 << 30)]
+        got = mod.tenant_census(keys, "h1")["data"]["logs"]
+        return [] if (got["objects"], got["objects_over_512k"]) == (3, 1) else [f"census {got}"]
+
+    def test_row_6_floor_counts_objects_over_512_kib(self):
+        # Row 6's keyIndex GET floor is the tenant's data objects strictly
+        # over 512 KiB; one at exactly 512 KiB is not probed.
+        inv = os.path.join(BOX, "lib", "inv.py")
+        self.assertEqual(self.objects_over_512k(inv), [])
+        with open(inv) as f:
+            src = f.read()
+        old = 'd["objects_over_512k"] += size > LARGE_OBJECT_BYTES'
+        self.assertEqual(src.count(old), 1)
+        flipped = self.path("inv_flipped.py")
+        with open(flipped, "w") as f:
+            f.write(src.replace(old, old.replace(" > ", " >= ")))
+        failures = self.objects_over_512k(flipped)
+        self.assertTrue(failures)
+        line = src[: src.index(old)].count("\n") + 1
+        print(f"flip 'objects at 512 KiB counted' at box/lib/inv.py:{line} fails the row 6 floor: {failures}",
+              file=sys.stderr)
 
     def test_fetch_dry_run(self):
         env = dict(os.environ, PATH=self.stub_path())
