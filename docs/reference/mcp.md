@@ -16,25 +16,43 @@ grouping, the envelope fields, and the empty-result checklist.
 
 ## Tools
 
-<!-- mcp-tools:begin -->
-| Tool | Purpose | Inputs | Output blocks used | Bounds | Failure classes |
-| --- | --- | --- | --- | --- | --- |
-| `ravel_capabilities` | Protocol and server version, the query catalog's served tools (`tools.enabled`) and any it declares without serving (`tools.catalogued`, empty in this build), effective budget ceilings, dialect summaries, tenant hash, enabled signals. The six Ravel Agents tools appear in `tools/list` only, not in either list | none | `data` | none; reads no data | `unauthorized`, `invalid_argument`, `internal` |
-| `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, committed row count, an upper bound (summed from commit records, before duplicate collapse and pending erasure) | `signal` (`metrics`, `logs` or `traces`), an optional `cursor` | `data` (`kind`, `name`, `value` rows: `table`, `column`, `indexed_key`, `family`), `scope`, `visibility`, `coverage`, `accuracy` (`exact: false` on page one, for the row count), `presentation`, `budget` | 100 metric families per page; the schema declares no budget input, and a page is bounded by `max_response_bytes`, 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, an optional `filter`, `time_range` (required), `deadline_ms`, `max_response_bytes`. A call carrying neither a selector nor a label name is refused, whatever its filter | `data`, `scope`, `coverage`, `presentation` | at most 2,000 segments admitted for resolution, fewer when the effective `max_segments` is lower; `max_response_bytes` 512 KiB default, 256 KiB floor. No `max_rows`: a page is bounded by bytes, and a page cut short reports through `presentation.bytes_cap_hit` and `presentation.rows_omitted` | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
-| `ravel_explain_query` | Validate a SQL statement, estimate its cost, and return the plan shape. No scan runs. SQL only: see [Explaining a statement](#explaining-a-statement) | `query`, `time_range` (required), `deadline_ms`, `max_response_bytes` | `data` (effective schema as `data.columns`, zero rows), `scope`, `visibility`, `budget` (the estimate beside `effective`), `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `deadline`, `unavailable`, `internal` |
-| `ravel_query_sql` | One read-only `SELECT` over one table, its rows filtered to `time_range` and paged by a keyset cursor. See [Running a statement](#running-a-statement) | `query`, `time_range` (required), `max_rows`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_segments`, `max_store_requests`, an optional `cursor`. An `evidence_ref` is refused with `unsupported` | `data`, `scope` (`order_by` is the effective order, tiebreak included), `visibility`, `presentation`, `budget` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_query_promql` | Instant or range PromQL evaluation, one row per series. See [Evaluating PromQL](#evaluating-promql) | `query`, either `time_range` and `step` or `evaluation_time` (exactly one mode), `allow_partial_coverage`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests`. An `evidence_ref` is refused with `unsupported` | `data` (`series`, `samples`), `scope` (the instant or range, the step alignment, the lookback), `coverage`, `accuracy`, `budget` | `max_rows` 200 series, ceiling 5,000; past it the result is `ok_bounded` with no cursor; a range of at most 11,000 steps; `max_response_bytes` 512 KiB default, 256 KiB floor, a series over it cut to a prefix of its samples | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
-| `ravel_search_logs` | Typed log search compiled to one SQL `SELECT` over `logs`, ordered by `(ts, observed_ts)`, rows grouped by attribute key set with the shared attributes listed once per group. See [Searching logs](#searching-logs) | `predicates` (each `key`, `op` and `value`), `has_word`, `severity`, `trace_id`, `time_range` (required), `max_rows`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_segments`, `max_store_requests`, an optional `cursor`. An `evidence_ref` is refused with `unsupported` | `data` (`__ravel_group`, `__ravel_group_attrs`, then the `logs` columns), `scope` (`predicates_applied`, `order_by`), `visibility`, `presentation`, `budget` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_get_trace` | Every span of one trace id, as rows of the `spans` table ordered by `(start_ts, span_id)`, each with its depth in the span tree and whether its parent was returned. See [Span tree](#span-tree) | `trace_id` (32 hexadecimal characters, either case), an optional `time_range`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests`. Without `time_range`, every span the tenant retains is read; with it, only spans that start inside it are returned | `data` (`__ravel_depth`, `__ravel_parent`, then the `spans` columns), `scope`, `presentation`, `budget` | `max_rows` 200, ceiling 5,000; past it the result is cut, with status `ok_bounded`, `presentation.row_cap_hit` set and no cursor; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
-| `ravel_analyze_timeseries` | `change_point` or `summary` over each series of a PromQL range result, one row per series, reported as a heuristic. See [Analyzing a series](#analyzing-a-series) | `query`, `time_range`, `step` and `op` (`change_point` or `summary`), all required; `deadline_ms`, `max_response_bytes`, `max_rows`. `max_bytes_scanned`, `max_segments`, `max_store_requests` and an `evidence_ref` are refused with `unsupported` | `data`, `scope` (the range, the step alignment, the lookback), `coverage`, `accuracy` (`exact: false`, naming the heuristic), `presentation`, `budget` | `max_rows` 200 series, ceiling 5,000; past it the result is `ok_bounded` with no cursor; at most 1,000 matched series; a range of at most 11,000 steps; `max_response_bytes` 512 KiB default, 256 KiB floor; every row reports the method's minimum point count | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
-<!-- mcp-tools:end -->
+Each tool's subsection below is generated from the catalog the server
+advertises in `tools/list`: its title, description and annotations, and each
+argument with its JSON type and whether it is required. Tools appear in the
+order `tools/list` lists them. Arguments are listed required first, then
+optional, each group sorted by name; inside an object type, a field marked
+`?` is optional. Do not edit the subsections by hand: regenerate them with
 
-`ravel_capabilities` and `ravel_describe_data` return metadata only.
-Neither tool accepts `evidence_ref` or emits an `evidence` block.
-`ravel_find_labels` accepts no `evidence_ref` and emits no `evidence`
-block either: nothing defines what a label list attests to, so the tool
-mints no reference.
+```sh
+RAVEL_UPDATE_MCP_REFERENCE=1 cargo test -p ravel-mcp --test mcp_reference
+```
+
+### Query tools
+
+<!-- BEGIN GENERATED MCP TOOLS -->
+<!-- END GENERATED MCP TOOLS -->
+
+### What each query tool returns
+
+The rules an input schema cannot carry, and each tool's output blocks,
+bounds and failure classes.
+
+| Tool | Notes | Output blocks used | Bounds | Failure classes |
+| --- | --- | --- | --- | --- |
+| `ravel_capabilities` | `tools.enabled` lists the query catalog's served tools, and `tools.catalogued` any it declares without serving (empty in this build). The six Ravel Agents tools appear in `tools/list` only, not in either list | `data` | none; reads no data | `unauthorized`, `invalid_argument`, `internal` |
+| `ravel_describe_data` | `signal` is `metrics`, `logs` or `traces`. The committed row count is an upper bound, summed from commit records before duplicate collapse and pending erasure | `data` (`kind`, `name`, `value` rows: `table`, `column`, `indexed_key`, `family`), `scope`, `visibility`, `coverage`, `accuracy` (`exact: false` on page one, for the row count), `presentation`, `budget` | 100 metric families per page; the schema declares no budget input, and a page is bounded by `max_response_bytes`, 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `cursor_expired`, `cursor_invalid`, `internal` |
+| `ravel_find_labels` | A call carrying neither a `selector` nor a `label_name` is refused, whatever its `filter`. See [Which list `ravel_find_labels` returns](#which-list-ravel_find_labels-returns) | `data`, `scope`, `coverage`, `presentation` | at most 2,000 segments admitted for resolution, fewer when the effective `max_segments` is lower; `max_response_bytes` 512 KiB default, 256 KiB floor. No `max_rows`: a page is bounded by bytes, and a page cut short reports through `presentation.bytes_cap_hit` and `presentation.rows_omitted` | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
+| `ravel_explain_query` | SQL only: see [Explaining a statement](#explaining-a-statement) | `data` (effective schema as `data.columns`, zero rows), `scope`, `visibility`, `budget` (the estimate beside `effective`), `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `deadline`, `unavailable`, `internal` |
+| `ravel_query_sql` | The `SELECT` is read-only, its rows are filtered to `time_range`, and it is paged by a keyset cursor. See [Running a statement](#running-a-statement) | `data`, `scope` (`order_by` is the effective order, tiebreak included), `visibility`, `presentation`, `budget` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
+| `ravel_query_promql` | Exactly one mode: `time_range` with `step`, or `evaluation_time`. One row per series. See [Evaluating PromQL](#evaluating-promql) | `data` (`series`, `samples`), `scope` (the instant or range, the step alignment, the lookback), `coverage`, `accuracy`, `budget` | `max_rows` 200 series, ceiling 5,000; past it the result is `ok_bounded` with no cursor; a range of at most 11,000 steps; `max_response_bytes` 512 KiB default, 256 KiB floor, a series over it cut to a prefix of its samples | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
+| `ravel_search_logs` | Compiled to one SQL `SELECT` over `logs`. The shared attributes of a group are listed once per group. See [Searching logs](#searching-logs) | `data` (`__ravel_group`, `__ravel_group_attrs`, then the `logs` columns), `scope` (`predicates_applied`, `order_by`), `visibility`, `presentation`, `budget` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
+| `ravel_get_trace` | Rows of the `spans` table, each with its depth in the span tree and whether its parent was returned. With `time_range`, only spans that start inside it are returned. See [Span tree](#span-tree) | `data` (`__ravel_depth`, `__ravel_parent`, then the `spans` columns), `scope`, `presentation`, `budget` | `max_rows` 200, ceiling 5,000; past it the result is cut, with status `ok_bounded`, `presentation.row_cap_hit` set and no cursor; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
+| `ravel_analyze_timeseries` | One row per series, reported as a heuristic. `max_bytes_scanned`, `max_segments` and `max_store_requests` are refused with `unsupported`. See [Analyzing a series](#analyzing-a-series) | `data`, `scope` (the range, the step alignment, the lookback), `coverage`, `accuracy` (`exact: false`, naming the heuristic), `presentation`, `budget` | `max_rows` 200 series, ceiling 5,000; past it the result is `ok_bounded` with no cursor; at most 1,000 matched series; a range of at most 11,000 steps; `max_response_bytes` 512 KiB default, 256 KiB floor; every row reports the method's minimum point count | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
+
+`ravel_capabilities` and `ravel_describe_data` return metadata only. No tool
+emits an `evidence` block in this build, and no tool redeems an
+`evidence_ref`; see [Evidence references](#evidence-references) for what each
+tool does with one.
 
 `ravel_get_trace` runs the same lookup as `GET /api/traces/<trace_id>`
 (see [Fetching one trace by id](../guides/traces.md#fetching-one-trace-by-id)).
@@ -44,8 +62,7 @@ cost grows with retention. With it, the bounds are kept exactly. Unlike the
 HTTP route, where `start` and `end` only choose which objects are read, the
 tool also drops every span that starts outside `time_range`. `include_logs:
 true` is refused with `unsupported`; for a trace's logs, call
-`ravel_search_logs` with a `trace_id` and a `time_range`. An `evidence_ref`
-is refused with `unsupported`.
+`ravel_search_logs` with a `trace_id` and a `time_range`.
 
 #### Span tree
 
@@ -109,14 +126,21 @@ size it used, `max_rows` held to 1,000, as both `presentation.max_rows` and
 `max_rows`, so their envelopes, and every failed agents call, report
 `presentation.max_rows` as 0 and carry no `max_rows` in `budget.effective`.
 
-| Tool | Purpose | Inputs | Agents route | Bounds | Failure classes |
-| --- | --- | --- | --- | --- | --- |
-| `ravel_agent_describe` | One row: agent id, incarnation, state version, content type, state size in bytes, active turn and mailbox depth, without the state itself | `kind`, `key`, `deadline_ms`, `max_response_bytes` | `GET /api/v1/agents/state` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
-| `ravel_agent_send` | Accept one input into an agent's inbox; the only tool that writes. `readOnlyHint: false`, `idempotentHint: true` | `kind`, `key`, `handler`, `payload` (any JSON), `idempotency_key` (required; sent as the request id), `deadline_ms`, `max_response_bytes` | `POST /api/v1/agents/send` | `max_response_bytes` 512 KiB default, 256 KiB floor; one row: `operation`, `accept_seq`, `duplicate`. A repeat with the same key answers the same operation with `duplicate: true` and accepts nothing new | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` (an `outcome_unknown` answer and a `deadline` both add the `resend_with_the_same_key` next step) |
-| `ravel_agent_operation` | One operation's status, accept sequence and blocking effect | `operation`, `deadline_ms`, `max_response_bytes` | `GET /api/v1/agents/operation` | `max_response_bytes` 512 KiB default, 256 KiB floor; one row; a blocked operation's next step names the blocking effect | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
-| `ravel_agent_state` | The agent's state, active turn and mailbox | `kind`, `key`, `deadline_ms`, `max_response_bytes` | `GET /api/v1/agents/state` | `max_response_bytes` 512 KiB default, 256 KiB floor; the route bounds the state itself by `--agents-max-state-bytes` | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
-| `ravel_agent_events` | One page of the agent's events in `event_seq` order, optionally one operation's | `kind`, `key`, an optional `cursor`, an optional `operation`, `deadline_ms`, `max_response_bytes`, `max_rows` | `POST /api/v1/agents/events` | `max_rows` 200, at most 1,000; a full or byte-capped page carries `presentation.cursor`, the last event it kept | `unauthorized`, `invalid_argument`, `cursor_expired` (with a `restart_from_oldest_cursor` next step), `deadline`, `unavailable`, `internal` |
-| `ravel_agent_blocked_effects` | Effects in doubt, each with the inspector's text and the two reconcile requests that unblock it | `kind`, `key`, `deadline_ms`, `max_response_bytes` | `GET /api/v1/agents/effects` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
+The subsections below are generated from the agents catalog. They appear on
+this page whatever the build; the paragraphs above say when a server serves
+them.
+
+<!-- BEGIN GENERATED MCP AGENTS TOOLS -->
+<!-- END GENERATED MCP AGENTS TOOLS -->
+
+| Tool | Returns | Agents route | Bounds | Failure classes |
+| --- | --- | --- | --- | --- |
+| `ravel_agent_describe` | One row: agent id, incarnation, state version, content type, state size in bytes, active turn and mailbox depth, without the state itself | `GET /api/v1/agents/state` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
+| `ravel_agent_send` | Accept one input into an agent's inbox; the only tool that writes. `idempotency_key` is sent as the request id | `POST /api/v1/agents/send` | `max_response_bytes` 512 KiB default, 256 KiB floor; one row: `operation`, `accept_seq`, `duplicate`. A repeat with the same key answers the same operation with `duplicate: true` and accepts nothing new | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` (an `outcome_unknown` answer and a `deadline` both add the `resend_with_the_same_key` next step) |
+| `ravel_agent_operation` | One operation's status, accept sequence and blocking effect | `GET /api/v1/agents/operation` | `max_response_bytes` 512 KiB default, 256 KiB floor; one row; a blocked operation's next step names the blocking effect | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
+| `ravel_agent_state` | The agent's state, active turn and mailbox | `GET /api/v1/agents/state` | `max_response_bytes` 512 KiB default, 256 KiB floor; the route bounds the state itself by `--agents-max-state-bytes` | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
+| `ravel_agent_events` | One page of the agent's events in `event_seq` order, optionally one operation's | `POST /api/v1/agents/events` | `max_rows` 200, at most 1,000; a full or byte-capped page carries `presentation.cursor`, the last event it kept | `unauthorized`, `invalid_argument`, `cursor_expired` (with a `restart_from_oldest_cursor` next step), `deadline`, `unavailable`, `internal` |
+| `ravel_agent_blocked_effects` | Effects in doubt, each with the inspector's text and the two reconcile requests that unblock it | `GET /api/v1/agents/effects` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
 
 The `tools/list` result is 16,177 bytes with the nine tools and 24,066
 bytes with all fifteen, against a budget of 24,576 bytes. A test pins both
@@ -802,13 +826,17 @@ page says so in `warnings`.
 
 ### Evidence references
 
-Every data tool except `ravel_find_labels` accepts an optional
-`evidence_ref` input. Of the served tools, `ravel_query_sql`,
-`ravel_query_promql`, `ravel_search_logs`, `ravel_get_trace` and
-`ravel_analyze_timeseries` refuse one with `unsupported`
-in this build, and none
-emits an `evidence` block yet; this section describes the design. Redeeming a reference re-executes the tool with the
-reference's own arguments. The re-execution runs against the reference's
+No tool redeems an `evidence_ref` or emits an `evidence` block in this
+build. What each tool does with an `evidence_ref` argument today:
+
+| Tool | An `evidence_ref` argument |
+| --- | --- |
+| `ravel_query_sql`, `ravel_query_promql`, `ravel_search_logs`, `ravel_get_trace`, `ravel_analyze_timeseries` | Listed in the input schema, and refused with `unsupported` |
+| `ravel_find_labels` | Not in the input schema, and refused with `invalid_argument` |
+| `ravel_capabilities`, `ravel_describe_data`, `ravel_explain_query`, and the six Ravel Agents tools | Not in the input schema. Accepted and ignored, like any argument the schema does not list |
+
+The rest of this section describes the design. Redeeming a reference
+re-executes the tool with the reference's own arguments. The re-execution runs against the reference's
 pinned snapshot while the pin is valid. The server then compares the
 BLAKE3-256 digest of the canonical row bytes. The digest travels in the
 evidence entry's `blake3_256` field, named for the function that produced
