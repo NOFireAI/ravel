@@ -89,14 +89,21 @@ and `UNAUTHENTICATED` with "invalid or missing tenant credentials" for bad
 credentials on gRPC.
 
 A head hold runs right between the in-flight permit and the credential check
-(ADR-3718, flush-backlog hold amendment). A background detector samples the
-process-wide queued flush count (`ravel_ingest_queued_flushes`) and the ingest
-routers' deferred flush triggers every 100 ms, and marks the node congested
-while the queued count is above `--ingest-hold-queued-flushes` (default 16) or
-at least 10 triggers were deferred over the last full second. A request that
+(ADR-3718, flush-backlog hold amendment). A background detector samples each
+ingest router's queued flush count and the routers' deferred flush triggers
+every 100 ms, and marks the node congested while any one router's queued count
+is above that router's bound, or at least 10 triggers were deferred across all
+routers over the last full second. A router's bound is its own queued-flush
+cap, its shard count times `--max-queued-flushes` (32 at the defaults of 4
+shards and 8), unless `--ingest-hold-queued-flushes` is set, which replaces
+every router's bound. Routers are not summed against one bound: the
+`ravel_ingest_queued_flushes` gauge is that sum, and a node ingesting several
+signals can carry more queued flushes than any one router's bound with no
+router over its own. A request that
 arrives while the node is not congested goes on at once. One that arrives
 while it is congested waits, keeping its in-flight permit, re-reading the flag
-every 10 ms for up to `--ingest-hold-max-wait` (default 1s): it goes on if the
+every 10 ms for up to `--ingest-hold-max-wait` (default 1s, at most 20s, the
+listener-join share of the default `--shutdown-timeout`): it goes on if the
 congestion clears in time, and is refused otherwise. A refusal goes through
 the same `refuse_from_head` path and the same drain caps as the in-flight shed
 above (`ravel_ingest_head_refusal_undrained_total` counts it the same way),

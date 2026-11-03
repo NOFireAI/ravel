@@ -5365,12 +5365,9 @@ mod shutdown_drain_tests {
     /// holds no router clone, so `drain_router` can still join the actors.
     #[tokio::test]
     async fn ingest_hold_default_bound_is_shards_times_max_queued_flushes() {
-        let cli = <crate::config::Cli as clap::Parser>::try_parse_from([
-            "ravel-server",
-            "--shards",
-            "4",
-        ])
-        .expect("cli parses");
+        let cli =
+            <crate::config::Cli as clap::Parser>::try_parse_from(["ravel-server", "--shards", "4"])
+                .expect("cli parses");
         let max_queued_flushes = cli.resolve_flush_concurrency().max_queued_flushes;
         assert_eq!(max_queued_flushes, 8);
         assert_eq!(cli.resolve_ingest_hold().queued_flushes, None);
@@ -5381,14 +5378,14 @@ mod shutdown_drain_tests {
         };
         let store = Arc::new(ravel_object_store::memory::MemoryStore::new());
         let router = Arc::new(IngestRouter::new(
-            ingest_config.clone(),
+            ingest_config,
             store.clone(),
             Signal::Metrics,
             Arc::new(SystemClock),
             Arc::new(PendingAckBudget::new(0)),
         ));
         let log_router = Arc::new(LogIngestRouter::new(
-            ingest_config.clone(),
+            ingest_config,
             store.clone(),
             Arc::new(SystemClock),
             Arc::new(PendingAckBudget::new(0)),

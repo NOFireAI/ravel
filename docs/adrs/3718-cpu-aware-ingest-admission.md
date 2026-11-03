@@ -277,14 +277,22 @@ hold amendment below.
     it pays no reconnect.
 - On a node shared with other CPU-heavy work, the process's own CPU use
   under-states the node's, so shedding starts later. The threshold flag is the
-  lever there.
+  lever there. (Superseded by the flush-backlog hold amendment below: the
+  detector reads no CPU and the threshold flag is removed, so neither the
+  under-statement nor this lever applies.)
 - Strict acks are refused at the same head, so a strict client sees a 429
   instead of an ack that arrives late. The pending-ack budget is unchanged.
 - Under heavy deferral with spare cores (one stalled tenant on a busy
   multi-tenant node), nothing is shed, because D1 needs both signals. That
-  case stays with ADR-2708 D3's share.
+  case stays with ADR-2708 D3's share. (Superseded by the flush-backlog hold
+  amendment below: deferrals alone now mark the node congested and hold every
+  tenant's requests; see its Consequences of the change.)
 - The detector adds one background task and two atomic reads per sample. A
   shed draw is one atomic load and one random number per request.
+  (Superseded by the flush-backlog hold amendment below: there is no draw and
+  no random number; a request on a node that is not congested pays one
+  relaxed atomic load, and a sample reads each router's queued flushes and
+  deferred triggers.)
 - `docs/ingest.md` and `docs/guides/ingest-affinity.md` ("Admission
   rejections") gain the new refusal, and `docs/reference/ravel-server-flags.md`
   the two flags. The guide pointer is corrected by the OTAP batch amendment
@@ -317,7 +325,7 @@ Three changes from implementing D1 and D2 (#3720).
 
 ## Amendment (2026-11-03): hold at the head while the flush backlog is over a bound, replacing the shed fraction (#3756)
 
-<!-- amendment-applies: sections="D1. A saturation detector reads two signals the process already has|D2. While saturated, refuse a growing fraction of new ingest requests at the head|D3. Defaults scale with the node; one flag turns it off|D4. Acceptance on the benchmark|Rejected alternatives" pointer="flush-backlog hold amendment" -->
+<!-- amendment-applies: sections="D1. A saturation detector reads two signals the process already has|D2. While saturated, refuse a growing fraction of new ingest requests at the head|D3. Defaults scale with the node; one flag turns it off|D4. Acceptance on the benchmark|Rejected alternatives|Consequences" pointer="flush-backlog hold amendment" -->
 
 The shed fraction `p` of D2 missed D4's first bar, and a model of the
 benchmark explains why no rule for `p` can meet it. This amendment replaces
@@ -331,7 +339,8 @@ lines/s in two runs against the 145k bar, with `p` cycling between 0.1 and
 0.9 instead of settling (#3718 comment 6596936397).
 
 A closed-loop plant was calibrated to GKE traces of 140k offered on 8 vCPU
-(#3756). In those traces:
+(#3756). The traced node ingested logs only, on one router with `--shards 2`
+and `--max-queued-flushes 8`, so its queued-flush cap was 16. In those traces:
 - **Healthy:** 6.4 cores busy, 0 to 0.1 deferred flush triggers per second,
   6 to 14 queued flushes.
 - **Collapsed:** about 112k stored, 8.0 cores busy, about 85 deferred
@@ -354,17 +363,25 @@ The plant shows three things.
 The 100 ms background task stays, with its shutdown handling (stopped
 before the shard actors are joined). It no longer reads CPU. Each sample it
 reads:
-- the process-wide queued flush count, the sum of `flushes_queued_total`
-  over every ingest router (metrics, logs, spans), the figure `/metrics`
-  exports as `ravel_ingest_queued_flushes`;
-- the deferred flush triggers since the last sample, as before.
+- each ingest router's (metrics, logs, spans) own queued flush count, its
+  `flushes_queued_total`;
+- the deferred flush triggers since the last sample, summed over the
+  routers, as before.
 
-The node is **congested** while the queued flush count is above
-`--ingest-hold-queued-flushes`, or while at least 10 deferred triggers fell
+The node is **congested** while any one router's queued flush count is above
+that router's bound (D3 below), or while at least 10 deferred triggers fell
 in the last full 1 s window (10 samples). A window shorter than 10 samples
 never counts as congested on deferrals. The 10 per second sits between the
 healthy traces (0 to 0.1 per second) and the collapsed ones (about 85). The
 detector publishes one congested flag, which replaces `p`.
+
+The queued half is per router, not the process-wide sum `/metrics` exports
+as `ravel_ingest_queued_flushes`. Each router's queue is capped per shard by
+`--max-queued-flushes`, so a router at its own cap is the backlog the traces
+show; a sum against one fixed bound would instead read two signals each
+healthy under its own cap as congested once they add up past the bound, and
+the bound would mean something different on every node with a different
+shard count or signal mix. The deferral half stays process-wide.
 
 ### D2 replaced: the hold
 
@@ -398,11 +415,21 @@ no release carried.
 ### D3 replaced: the flags
 
 D3's threshold and cap flags are removed; no release carried them. In their place:
-- `--ingest-hold-queued-flushes`, default 16, at least 1: the queued flush
-  count above which the node is congested. 16 is above the healthy traces'
-  6 to 14 and well below the collapsed ones' 40.
-- `--ingest-hold-max-wait`, a duration, default `1s`: the longest a request
-  is held. `0` turns the gate off entirely and spawns no detector.
+- **A router's bound** defaults to its own queued-flush cap: its shard
+  count times `--max-queued-flushes` (the per-shard cap, floored at 1). On
+  the traced benchmark (logs only, `--shards 2`, `--max-queued-flushes 8`)
+  that is 16, above the healthy traces' 6 to 14 queued flushes and well
+  below the collapsed ones' 40. The collapsed figure can exceed the cap
+  because a tenant buffer over its memory backstop spawns its flush
+  whatever the queue depth. At the default `--shards 4` the bound is 32.
+- `--ingest-hold-queued-flushes`, unset by default, at least 1 when set:
+  overrides every router's bound with one count.
+- `--ingest-hold-max-wait`, a duration, default `1s`, at most `20s`: the
+  longest a request is held. `0` turns the gate off entirely and spawns no
+  detector. 20 s is the listener-join share (four fifths) of the default
+  25 s `--shutdown-timeout`, so a request held when shutdown starts is
+  answered before the listener join is abandoned. A smaller
+  `--shutdown-timeout` shrinks that budget without lowering the limit.
 
 Both are logged at startup with the other derived defaults. The gate is
 still on by default and still process-wide.
@@ -446,11 +473,11 @@ of the plant this port was taken from (#3756).
 
 | Case | Offered | Span | Bar, hold | Rust, hold | Bar, no gate | Rust, no gate | Python reference | Source |
 |---|---|---|---|---|---|---|---|---|
-| A | 160k for 80 s, 400k start burst | 20 to 80 s | stored at least 152, drops at most 3.2, collapsed 0 | stored 163.4, drops 0, collapsed 0 | collapsed above 0.5 | stored 106.7, collapsed 1.0 | hold 163.4, 0, 0; no gate 106.7, collapsed 1.0 | `services/ravel-server/src/ingest_hold.rs:735` |
-| A, bound 1,000,000 (above the 300k tip) | as A | 20 to 80 s | collapsed above 0.5 | stored 106.7, collapsed 1.0 | - | - | stored 106.7, collapsed 1.0 | `services/ravel-server/src/ingest_hold.rs:735` |
-| B | 320k for 80 s | 20 to 80 s | stored at least 155, collapsed 0 | stored 163.4, collapsed 0 | - | - | - | `services/ravel-server/src/ingest_hold.rs:751` |
-| C | 140k for 120 s, start burst | 60 to 120 s | stored at least 139, drops 0, collapsed 0 | stored 140.0, drops 0, collapsed 0 | collapsed above 0.5 | stored 105.8, collapsed 1.0 | - | `services/ravel-server/src/ingest_hold.rs:759` |
-| D | 160k, then 100k from 40 s, 70 s | 45 to 70 s | stored within 1 of 100, cores under 5.5 | stored 100.1, cores 4.9 | - | - | - | `services/ravel-server/src/ingest_hold.rs:773` |
+| A | 160k for 80 s, 400k start burst | 20 to 80 s | stored at least 152, drops at most 3.2, collapsed 0 | stored 163.4, drops 0, collapsed 0 | collapsed above 0.5 | stored 106.7, collapsed 1.0 | hold 163.4, 0, 0; no gate 106.7, collapsed 1.0 | `services/ravel-server/src/ingest_hold.rs:861` |
+| A, bound 1,000,000 (above the 300k tip) | as A | 20 to 80 s | collapsed above 0.5 | stored 106.7, collapsed 1.0 | - | - | stored 106.7, collapsed 1.0 | `services/ravel-server/src/ingest_hold.rs:861` |
+| B | 320k for 80 s | 20 to 80 s | stored at least 155.1 (0.95 x the Python reference's 163.3), collapsed 0 | stored 163.4, collapsed 0 | - | - | - | `services/ravel-server/src/ingest_hold.rs:878` |
+| C | 140k for 120 s, start burst | 60 to 120 s | stored at least 139, drops 0, collapsed 0 | stored 140.0, drops 0, collapsed 0 | collapsed above 0.5 | stored 105.8, collapsed 1.0 | - | `services/ravel-server/src/ingest_hold.rs:886` |
+| D | 160k, then 100k from 40 s, 70 s | 45 to 70 s | stored within 1 of 100, cores under 5.5 | stored 100.1, cores 4.9 | - | - | - | `services/ravel-server/src/ingest_hold.rs:900` |
 
 The bound-1,000,000 row is the distinguishing case: with the queued bound
 above the tip point the hold never engages, and the plant collapses as it

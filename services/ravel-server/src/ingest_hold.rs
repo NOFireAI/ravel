@@ -437,7 +437,10 @@ mod tests {
         let routers = [router(0, 16), router(33, 32), router(0, 16)];
         assert!(congested(&routers, None, &quiet));
         let at_cap = [router(0, 16), router(32, 32), router(0, 16)];
-        assert!(!congested(&at_cap, None, &quiet), "at the cap is not over it");
+        assert!(
+            !congested(&at_cap, None, &quiet),
+            "at the cap is not over it"
+        );
     }
 
     /// `--ingest-hold-queued-flushes` replaces every router's cap: 20 queued
@@ -469,7 +472,10 @@ mod tests {
         let handle = tokio::spawn(Detector::new(None, gate.clone()).run(
             Arc::new(SystemClock),
             move || CongestionSample {
-                routers: vec![router(0, 4), router(queued_for_task.load(Ordering::Relaxed), 16)],
+                routers: vec![
+                    router(0, 4),
+                    router(queued_for_task.load(Ordering::Relaxed), 16),
+                ],
                 deferred_total: 0,
             },
         ));
