@@ -21,7 +21,9 @@
 //! never appears, and the page reports page one's snapshot id and freshness
 //! watermark with `visibility.pinned` set. That instant bounds which hours are
 //! listed and not what they hold, so a row committed after the mint into an
-//! hour it does list can still appear, as the last test here pins.
+//! hour it does list can still appear on a later page if it sorts after the
+//! cursor position, and is silently omitted from every page if it sorts
+//! before it; the last three tests pin both.
 
 #![cfg(feature = "mcp")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -531,8 +533,9 @@ async fn a_row_committed_into_the_mint_hour_after_the_mint_may_appear_on_a_later
     running.shutdown().await.expect("server stops");
 }
 
-/// Walk `tool` from `cursor` at `now_ns` to its last page and return each
-/// page's rows as `rows` reads them.
+/// Walk `tool` from `cursor` at `now_ns` to its last page, or to the fourth
+/// page if a walk never ends, and return each page's rows as `rows` reads
+/// them.
 async fn rest_of_walk<T>(
     tool: &str,
     backend: &ServiceBackend,
@@ -543,7 +546,7 @@ async fn rest_of_walk<T>(
 ) -> Vec<Vec<T>> {
     let mut pages = Vec::new();
     let mut cursor = Some(cursor);
-    while let Some(current) = cursor {
+    while let Some(current) = cursor.filter(|_| pages.len() < 4) {
         let next = page(tool, backend, arguments, Some(&current), now_ns).await;
         pages.push(rows(&next));
         cursor = cursor_of(&next);
