@@ -456,7 +456,7 @@ pub fn tool_catalog() -> Vec<Tool> {
             "ravel_search_logs",
             "Search logs",
             "Typed log search compiled to SQL, ordered by (ts, observed_ts). \
-             Rows are grouped by attribute key set; group_attrs lists the \
+             Rows grouped by attribute key set; __ravel_group_attrs lists \
              attributes the group shares once",
         ),
         tool::<GetTraceInput>(
