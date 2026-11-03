@@ -120,9 +120,11 @@ that is not `cold_only` (statement counts from `statements.toml`):
 
 That is 2,299 calls and 2,201 restarts: 2,201 x 1.181 s = 2,599 s, plus
 2,299 x 0.034 s = 78 s, so 2,677 s, about 45 minutes of calls. The fixed
-waits add at most 60 minutes for mixed (the next ingest hour) and at most
+waits add at most 70 minutes for mixed (the next ingest hour;
+`run.mixed_wait_max_minutes`, which `box/run.sh` defaults to 70) and at most
 310 s, about 5 minutes, for compaction_in_flight (until 310 s into an hour;
-in the smoke they took 48 and 3 minutes). The estimate is about 110 minutes, against the 540-minute
+in the smoke they took 48 and 3 minutes). The estimate is 2,677 + 4,200 +
+310 = 7,187 s, about 120 minutes, against the 540-minute
 deadline, and it covers calls and waits only. It omits corpus generation,
 every load (the `hits` tenant's included) and every fold at 20,000,000
 traces: the smoke's figures for them (0.30 to 1.03 s per load, at most
@@ -178,8 +180,12 @@ With `run.hits = true` the hits tenant is loaded with T12's recipe
 (`--batch-rows 100000 --target-bytes 1850000000 --max-flush-delay 30s
 --pipeline-depth 32 --load-memory-bytes 6500000000`), and every fold, leaf
 rebuild, inspect stamp and census line covers each loaded tenant and signal,
-hits included. Its object count, 398, is a census band of its own (row 6),
-and row 6 reads 2 x the census's hits objects.
+hits included. The census's `objects` for a tenant and signal counts its data
+objects only, the `.rseg` keys under `<signal>/l0/` and `<signal>/l1/`
+(`is_data_key` in `box/lib/inv.py`); commit records, the provenance object and
+erasure markers are classes of their own. Row 6 bands the hits tenant's logs
+count in the unfolded state at exactly 398 (`row_06.hits_objects`), and caps
+its keyIndex GETs at 2 x that count.
 
 ### States
 
@@ -365,7 +371,10 @@ asked for. Each reason is listed under `incomplete` in the results and the
 summary. The rows left out that way are not silent either: each is listed
 with the setting that leaves it out (`hits = false`, `baseline = false`, a
 state or scale `run.toml` does not list) under `not_requested` in the results and on the
-summary's `not requested:` line. Otherwise it is `pass`. Exit 0 only on `pass`; `DONE` carries the
+summary's `not requested:` line. A gated figure whose row is listed for
+another reason goes there too, by name (`row 9 figures covering_parts, ...`
+when `many_parts_744` is not in `run.toml`'s states), so every gated figure is
+measured, `not_requested` or `incomplete`. Otherwise it is `pass`. Exit 0 only on `pass`; `DONE` carries the
 verdict.
 
 Every in-flight call must overlap the compaction of the signal its

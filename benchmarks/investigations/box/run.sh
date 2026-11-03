@@ -385,10 +385,18 @@ step_bootstrap() {
       ravel_cli_sha256="$(sha256 "$BIN")" ravel_server_sha256="$(sha256 "$SERVER_BIN")" \
       rustc="$([ "$DRY_RUN" = 1 ] && echo dry-run || (cd "$src" && rustc --version))"
   else
-    local sha dirty
+    local sha dirty porcelain
     sha="$(git -C "$INV_DIR" rev-parse HEAD 2>/dev/null)" || sha=unknown
-    dirty="$(git -C "$INV_DIR" status --porcelain -- . 2>/dev/null | wc -l | tr -d ' ')"
-    stamp build.json lane=local sha="$sha" dirty_paths:="${dirty:-0}" \
+    # A git status that fails is no count: null, which evaluate.py reports
+    # missing.
+    if porcelain="$(git -C "$INV_DIR" status --porcelain -- . 2>/dev/null)"; then
+      dirty=0
+      [ -z "$porcelain" ] || dirty="$(printf '%s\n' "$porcelain" | wc -l | tr -d ' ')"
+    else
+      dirty=null
+    fi
+    [ "$DRY_RUN" = 0 ] || printf 'DRY-RUN: build.json dirty_paths %s\n' "$dirty"
+    stamp build.json lane=local sha="$sha" dirty_paths:="$dirty" \
       build="prebuilt binaries from --bin-dir; README.md \"Local lane\" gives the build" \
       ravel_cli_sha256="$(sha256 "$BIN")" ravel_server_sha256="$(sha256 "$SERVER_BIN")"
   fi
@@ -788,8 +796,10 @@ wait_sealed() {
 
 state_compaction() {
   local code=0 sig
-  fits compaction_in_flight wait_sealed "$WAIT_SEALED_MAX_S" || return 0
-  fits compaction_in_flight compaction "$(estimate_s compaction_in_flight)" || return 0
+  # The sealed-hour wait and the compaction run back to back: both must fit.
+  local compact_s
+  compact_s="$(estimate_s compaction_in_flight)" || fail "run.toml step_estimate_minutes.compaction_in_flight"
+  fits compaction_in_flight "wait_sealed and compaction" "$((WAIT_SEALED_MAX_S + compact_s))" || return 0
   stop_server
   wait_sealed
   # One restart before the in-flight calls; they run against this server.

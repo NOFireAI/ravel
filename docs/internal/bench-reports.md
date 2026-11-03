@@ -90,8 +90,10 @@ load`, folds it through the key-index state matrix (unfolded, folded
 without leaves, folded with leaves, mixed, compaction in flight, erasure in
 flight, and many parts over N ingest hours), and runs the statements of
 `statements.toml` cold, each cold call after a `ravel-server` restart and
-a page-cache drop (required on the S3 lane), then warm, repeated against
-the running server with no restart.
+a page-cache drop (required on the S3 lane). Of the 46 statements, 43 are
+`cold_only`; the other three (`spans_lookup_norange`, `spans_lookup_1h`,
+`logs_trace_1h`) also run warm, repeated against the running server with no
+restart.
 `evaluate.py` judges every answer against the generator's oracle and every
 figure against `benchmarks/investigations/bands.toml` (ADR-3692 Acceptance
 rows 1 to 17), and prints pass, fail or incomplete; timing is judged on the

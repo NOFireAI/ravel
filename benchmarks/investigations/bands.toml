@@ -1071,15 +1071,17 @@ metric = "cold.max.per_part.leaf_bytes"
 lane = "counter"
 target_if = "v <= m['row_11.logs_part_entries'] * 11 * 1024"
 
-# The 1,001-key controls, one per table and key kind: 1 when every cold call
-# of the 1,000-key list probed 1,000 keys with partsCovered reported and no
-# call of its 1,001-key twin was index-served; 0 when the twin was served or
-# the 1,000-key list probed another count; unsupported-on-this-build when the
-# 1,000-key list was refused or carries no tier-2 figures. This build's SQL
-# complexity guard refuses both lists (3n + 8 units for an X list, 2n + 8 for
-# a quoted one, against MAX_STATEMENT_COMPLEXITY = 1,000,
-# crates/ravel-sql/src/complexity_guard.rs:257), so on main it reads
-# unsupported.
+# The 1,001-key controls, one per table and key kind (evaluate.py
+# control_1001). The 1,001-key twin is judged first: 0 when one of its cold
+# calls carries a nonzero keyIndex figure, or was served with no keyIndex
+# figure, no probe or scan GET and no block scanned; a refused twin call
+# passes. Then the 1,000-key list: refused-by-guard when the SQL complexity
+# guard refused it, unsupported-on-this-build when it was refused otherwise or
+# carries no keyIndex.keysProbed and partsCovered, 0 when it probed another
+# count or covered no part, else 1. This build's guard refuses both lists
+# (MAX_STATEMENT_COMPLEXITY = 1,000, crates/ravel-sql/src/complexity_guard.rs:257),
+# so on main all three read refused-by-guard (fixtures/local-smoke, pinned by
+# test_control_1001_refused_by_guard_on_main).
 [[row.figure]]
 name = "spans_control_1001"
 statement = "spans_in_1000"

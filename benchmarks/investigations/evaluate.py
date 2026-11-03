@@ -743,6 +743,10 @@ def required_stamps(run_dir, cfg, live, problems):
         names.append("needle_blocks.json")
     for name in names:
         docs[name] = load_json(os.path.join(stamps, name), problems, f"stamps/{name}")
+    build = docs.get("build.json")
+    if isinstance(build, dict) and build.get("lane") == "local" and (
+            isinstance(build.get("dirty_paths"), bool) or not isinstance(build.get("dirty_paths"), int)):
+        problems.add("missing", "stamps/build.json dirty_paths: no count of the harness's uncommitted paths")
 
     def jsonl(name, keys):
         return index_lines(load_jsonl(os.path.join(stamps, name), problems, f"stamps/{name}"),
@@ -848,7 +852,7 @@ def check_needle_blocks(doc, problems):
     partial = doc.get("objects_inspected") != doc.get("objects_total")
     out = {"block_count": doc.get("block_count"), "record_count": doc.get("record_count"),
            "objects_inspected": doc.get("objects_inspected"), "objects_total": doc.get("objects_total"),
-           "needles": {}, "figures": []}
+           "needles": {}, "figures": [], "incomplete": []}
     for value, column, band in NEEDLE_GEOMETRY:
         want = planted.get(value)
         got = doc.get(f"{column}_present_blocks")
@@ -864,8 +868,12 @@ def check_needle_blocks(doc, problems):
             entry["status"] = "reported"
         elif partial:
             # A partial inspection (needle_blocks_max_objects) can miss an
-            # object holding a needle row; that is a sample, not a mismatch.
-            entry["status"] = "partial"
+            # object holding a needle row: the band cannot be judged.
+            entry["status"] = "incomplete"
+            entry["reason"] = (f"needle_blocks {value}: {column} counted over {doc.get('objects_inspected')} of "
+                               f"{doc.get('objects_total')} logs objects (run.toml needle_blocks_max_objects), "
+                               f"{got} storage blocks against {want} planted, not judged")
+            out["incomplete"].append(entry["reason"])
         elif band == "exact":
             entry["status"] = "match" if got == want else "wrong"
             if got != want:
@@ -1071,25 +1079,50 @@ def row_not_run(row, cfg, live):
     return None
 
 
-def not_requested(bands, cfg, live):
+def unrequested(cfg, live, tenant=None, scales=(), baseline=False, states=()):
+    """The run.toml settings that leave a row or figure out: hits, scales,
+    baseline, or a state run.toml never lists. Empty when it was asked for."""
+    why = []
+    if tenant == "hits" and not cfg["hits"]:
+        why.append("hits = false")
+    scales = [s for s in scales if s not in cfg["scales"]]
+    if scales:
+        why.append(f"scales lacks {scales}")
+    if baseline and not cfg["baseline"]:
+        why.append("baseline = false")
+    states = [s for s in dict.fromkeys(states) if live.get(s) == "not in run.toml states"]
+    if states:
+        why.append(f"states lacks {states}")
+    return "run.toml " + ", ".join(why) if why else None
+
+
+def row_unrequested(row, cfg, live, fig=None):
+    states = list(row.get("requires_states", []))
+    if fig is not None:
+        states += list(fig.get("requires_states", [])) + ([fig["state"]] if fig["state"] != "all" else [])
+    return unrequested(cfg, live, row.get("requires_tenant"), row.get("requires_scales", []),
+                       row.get("requires_baseline"), states)
+
+
+def not_requested(bands, cfg, live, figures):
     """Gated rows run.toml never asked for, each with the setting that leaves
-    it out. A requested state that did not run is incomplete, not listed."""
+    it out, then the gated figures of other rows that run.toml never asked
+    for (a figure naming a state the run does not list), by row and reason.
+    A requested state that did not run is incomplete, not listed."""
     out = []
     for row in bands["row"]:
-        why = []
-        if row.get("requires_tenant") == "hits" and not cfg["hits"]:
-            why.append("hits = false")
-        scales = [s for s in row.get("requires_scales", []) if s not in cfg["scales"]]
-        if scales:
-            why.append(f"scales lacks {scales}")
-        if row.get("requires_baseline") and not cfg["baseline"]:
-            why.append("baseline = false")
-        states = [s for s in row.get("requires_states", []) if live.get(s) == "not in run.toml states"]
-        if states:
-            why.append(f"states lacks {states}")
+        why = row_unrequested(row, cfg, live)
         if why:
-            out.append({"row": row["adr_row"], "key": row["key"], "reason": "run.toml " + ", ".join(why)})
-    return out
+            out.append({"row": row["adr_row"], "key": row["key"], "reason": why})
+    listed = {r["key"] for r in out}
+    groups = {}
+    for f in figures:
+        key = f["id"].split(".", 1)[0]
+        if f.get("gated") and f.get("not_requested") and key not in listed:
+            groups.setdefault((f["row"], key, f["not_requested"]), []).append(f["id"].split(".", 1)[1])
+    for (row, key, why), names in groups.items():
+        out.append({"row": row, "key": key, "figures": names, "reason": why})
+    return sorted(out, key=lambda r: r["row"])
 
 
 def figure_not_run(fig, live):
@@ -1145,11 +1178,17 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
             if why_not:
                 status, value, why = "not-run", None, why_not
                 entry["gated"] = True
+                gap = row_unrequested(row, cfg, live, fig)
+                if gap:
+                    entry["not_requested"] = gap
             elif metric == "derived":
                 status, value, why = derived_value(fig["expr"], by_id)
-                if status == "not-run" and any(by_id.get(r, {}).get("gated")
-                                               for r in re.findall(r"m\['([^']+)'\]", fig["expr"])):
+                refs = [by_id.get(r, {}) for r in re.findall(r"m\['([^']+)'\]", fig["expr"])]
+                if status == "not-run" and any(r.get("gated") for r in refs):
                     entry["gated"] = True
+                    gap = next((r["not_requested"] for r in refs if r.get("not_requested")), None)
+                    if gap:
+                        entry["not_requested"] = gap
             elif metric.startswith(("stamp.", "leaf_share.", "census.")):
                 status, value, why = stamp_figure(stamps, census, cfg, fig["state"], metric)
             elif metric.startswith("fold."):
@@ -1384,12 +1423,13 @@ def warm_served_calls(calls):
     return out
 
 
-def incomplete_reasons(cfg, live, calls, figures):
+def incomplete_reasons(cfg, live, calls, figures, needles=None):
     """Why a run with no problem still proved less than it was asked to: a
     state run.toml asks for that did not run, a planned call that was not
     sent in a state that did, or a figure not-run for any reason other than
     its row or figure lacking a state, tenant, scale or baseline the run
-    never asked for."""
+    never asked for (a gated figure is either not_requested or listed
+    here), or a needle band a partial inspection could not judge."""
     out = []
     for s in cfg["states"]:
         if live.get(s) is not None:
@@ -1402,15 +1442,18 @@ def incomplete_reasons(cfg, live, calls, figures):
             out.append(f"{len(lines)} {temp} call(s) of {statement} in {state} not run: "
                        f"{lines[0].get('reason') or 'no reason given'}")
     for f in figures:
-        if f["status"] == "not-run" and not f.get("gated"):
+        if f["status"] == "not-run" and not f.get("not_requested"):
             out.append(f"figure {f['id']} not run: {f['reason']}")
+    out.extend((needles or {}).get("incomplete", []))
     return out
 
 
 def summary_text(res):
     out = [f"selective investigations, lane {res['lane']}: {res['verdict']}"]
     if res["not_requested"]:
-        out.append("not requested: " + "; ".join(f"row {r['row']} ({r['reason']})" for r in res["not_requested"]))
+        out.append("not requested: " + "; ".join(
+            f"row {r['row']}" + (f" figures {', '.join(r['figures'])}" if r.get("figures") else "")
+            + f" ({r['reason']})" for r in res["not_requested"]))
     k = res["refusal_classes"]
     out.append(f"refusal classes: {GUARD} {k[GUARD]['figures']} figure(s), {k[GUARD]['calls']} call(s); "
                f"{UNSUPPORTED} {k[UNSUPPORTED]['figures']} figure(s), {k[UNSUPPORTED]['calls']} call(s)")
@@ -1584,14 +1627,14 @@ def main(argv):
             states.append({"state": s, "status": "not-run", "reason": live[s]})
         else:
             states.append({"state": s, "status": coverage.get(s, "run")})
-    incomplete = incomplete_reasons(cfg, live, calls, figures)
+    incomplete = incomplete_reasons(cfg, live, calls, figures, needles)
     verdict = "fail" if problems.lines else "incomplete" if incomplete else "pass"
     res = {
         "lane": cfg["lane"],
         "verdict": verdict,
         "problems": problems.lines,
         "incomplete": incomplete,
-        "not_requested": not_requested(bands, cfg, live),
+        "not_requested": not_requested(bands, cfg, live, figures),
         "refusal_classes": {k: {"figures": sum(1 for f in figures if f["status"] == k),
                                 "calls": sum(1 for t in calls.groups.values() for v in t.values() for c in v
                                              if c.get("outcome") == k)}

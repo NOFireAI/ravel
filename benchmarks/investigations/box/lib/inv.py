@@ -158,17 +158,33 @@ def s3_list_all(env, prefix=""):
             die("list truncated without a continuation token")
 
 
+SIGNAL_DIR = {"s": "spans", "l": "logs", "m": "metrics"}
+# Data objects live under <signal>/l0/ and <signal>/l1/ with the .rseg suffix
+# for every signal (docs/catalog-and-mvcc.md "Key layout"; ravel-commit
+# keys::DATA_SUFFIX). Commit records, provenance, delete markers and the rest
+# of the signal prefix are census classes, never data objects.
+DATA_LEVELS = ("l0", "l1")
+DATA_SUFFIX = ".rseg"
+
+
+def is_data_key(rest):
+    """rest: a tenant key's path after t/<tenant_hash>/."""
+    return len(rest) > 2 and rest[0] in SIGNAL_DIR and rest[1] in DATA_LEVELS and rest[-1].endswith(DATA_SUFFIX)
+
+
 def object_class(key):
-    """The census class of a key, by its layout path (docs/catalog-and-mvcc.md)."""
+    """The census class of a key, by its layout path (docs/catalog-and-mvcc.md):
+    a signal's keys split by their level (l/l0, l/c, l/prov), the catalog by
+    signal."""
     parts = key.split("/")
     if parts[0] != "t" or len(parts) < 3:
         return parts[0]
     rest = parts[2:]
-    if not rest:
-        return "tenant"
     head = rest[0]
-    if head in ("logs", "spans", "metrics") and len(rest) > 1:
+    if head in SIGNAL_DIR and len(rest) > 1:
         return f"{head}/{rest[1]}"
+    if head == "catalog" and len(rest) > 2:
+        return f"catalog/{rest[1]}"
     return head
 
 
@@ -201,7 +217,6 @@ def cmd_s3(args):
     die(f"unknown s3 op {args.op}", 64)
 
 
-SIGNAL_DIR = {"s": "spans", "l": "logs", "m": "metrics"}
 # The logs keyed plan probes every data object past this size (#3117), so
 # row 6 expects at least one keyIndex GET for each.
 LARGE_OBJECT_BYTES = 512 * 1024
@@ -209,8 +224,10 @@ LARGE_OBJECT_BYTES = 512 * 1024
 
 def tenant_census(keys, tenant_hash):
     """One tenant's objects: classes by layout path, each signal's data objects
-    with its largest (the object the per-state inspect stamps read), and every
-    catalog object's size (HEAD, snapshot parts, key-index leaves)."""
+    (.rseg under l0/ and l1/ only) with its largest (the object the per-state
+    inspect stamps read), and every catalog object's size (HEAD, snapshot
+    parts, key-index leaves). A signal with keys but no data object reads
+    objects 0."""
     classes, data, catalog = {}, {}, {}
     for key, size in keys:
         parts = key.split("/")
@@ -222,13 +239,17 @@ def tenant_census(keys, tenant_hash):
             catalog[key] = size
         elif rest[0] in SIGNAL_DIR:
             cls = "/".join(rest[:2])
-            d = data.setdefault(SIGNAL_DIR[rest[0]], {"objects": 0, "bytes": 0, "largest": None, "largest_bytes": -1,
-                                                      "objects_over_512k": 0})
-            d["objects"] += 1
-            d["bytes"] += size
-            d["objects_over_512k"] += size > LARGE_OBJECT_BYTES
-            if size > d["largest_bytes"] or (size == d["largest_bytes"] and key < d["largest"]):
-                d["largest"], d["largest_bytes"] = key, size
+            d = data.setdefault(SIGNAL_DIR[rest[0]], {"objects": 0, "bytes": 0, "l0_objects": 0, "l1_objects": 0,
+                                                      "largest": None, "largest_bytes": -1, "objects_over_512k": 0})
+            if is_data_key(rest):
+                d["objects"] += 1
+                d["l1_objects" if rest[1] == "l1" else "l0_objects"] += 1
+                d["bytes"] += size
+                d["objects_over_512k"] += size > LARGE_OBJECT_BYTES
+                if size > d["largest_bytes"] or (size == d["largest_bytes"] and key < d["largest"]):
+                    d["largest"], d["largest_bytes"] = key, size
+            elif rest[1] in DATA_LEVELS:
+                cls += "/other"
         else:
             cls = rest[0]
         c = classes.setdefault(cls, {"objects": 0, "bytes": 0})
@@ -424,7 +445,7 @@ RANGE_FIELDS = {"spans": ("min_start_ts_ns", "max_end_ts_ns"), "logs": ("min_ts_
 
 
 def object_ranges(base, keys_path, tenant_hash, signal):
-    """Every data object (.rseg) of one tenant and signal in a census keys
+    """Every data object (is_data_key) of one tenant and signal in a census keys
     file, with its size and the event range its header gives; a field the
     header does not carry is null."""
     prefix = f"t/{tenant_hash}/{'l' if signal == 'logs' else 's'}/"
@@ -433,7 +454,7 @@ def object_ranges(base, keys_path, tenant_hash, signal):
     with open(keys_path) as f:
         keys = sorted((line.rstrip("\n").split("\t", 1) for line in f if "\t" in line), key=lambda p: p[1])
     for size, key in keys:
-        if not (key.startswith(prefix) and key.endswith(".rseg")):
+        if not (key.startswith(prefix) and is_data_key(key.split("/")[2:])):
             continue
         tool = "rlog" if signal == "logs" else "rspan"
         obj = parse_object_inspect(run_cli(base + [tool, "inspect", key], stop_at="records ("))
@@ -539,7 +560,7 @@ def cmd_needle_blocks(args):
     with open(args.keys) as f:
         for line in f:
             size, _, key = line.rstrip("\n").partition("\t")
-            if key.startswith(prefix) and key.endswith(".rseg"):
+            if key.startswith(prefix) and is_data_key(key.split("/")[2:]):
                 keys.append(key)
     keys.sort()
     picked = keys if args.max_objects <= 0 else keys[: args.max_objects]

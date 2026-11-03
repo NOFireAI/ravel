@@ -598,6 +598,12 @@ class Statements(unittest.TestCase):
             self.assertIsNone(re.search(r"\bservice\s*=", sql), s["id"])
             self.assertIsNone(re.search(r"\bstatus\s*=", sql), s["id"])
 
+    def test_three_statements_run_warm(self):
+        """docs/internal/bench-reports.md: 43 of the 46 statements are cold_only."""
+        self.assertEqual(len(self.st), 46)
+        self.assertEqual([s["id"] for s in self.st if not s.get("cold_only")],
+                         ["spans_lookup_norange", "spans_lookup_1h", "logs_trace_1h"])
+
     def test_required_statements(self):
         by = {s["id"]: s for s in self.st}
         for size in ("1", "10", "100", "1000"):
@@ -762,6 +768,14 @@ class LocalSmoke(Workdir):
             with open(os.path.join(SMOKE, name), "rb") as a, open(self.path("out", name), "rb") as b:
                 self.assertEqual(a.read(), b.read(), name)
 
+    def test_control_1001_refused_by_guard_on_main(self):
+        """bands.toml row 11: on main the complexity guard refuses the 1,000-key lists."""
+        with gzip.open(os.path.join(SMOKE, "results.local.json.gz"), "rt") as f:
+            res = json.load(f)
+        for name in ("spans_control_1001", "logs_trace_control_1001", "logs_request_control_1001"):
+            f = figure(res, f"row_11.{name}")
+            self.assertEqual((f["status"], f["verdict"]), (GUARD, GUARD), name)
+
     def test_fixture_is_under_300_kb(self):
         total = sum(os.path.getsize(os.path.join(d, n)) for d, _, names in os.walk(SMOKE) for n in names)
         self.assertLess(total, 300_000)
@@ -843,13 +857,18 @@ class LocalSmoke(Workdir):
         self.assertEqual(res["not_requested"], [
             {"row": 5, "key": "row_05", "reason": "run.toml hits = false"},
             {"row": 6, "key": "row_06", "reason": "run.toml hits = false"},
+            {"row": 9, "key": "row_09",
+             "figures": ["covering_parts", "resolve_gets", "leaf_gets", "parts_beyond_ceiling", "rows_exact"],
+             "reason": "run.toml states lacks ['many_parts_744']"},
             {"row": 10, "key": "row_10", "reason": "run.toml states lacks ['many_parts_2160']"},
             {"row": 12, "key": "row_12", "reason": "run.toml scales lacks [10, 100]"},
             {"row": 16, "key": "row_16", "reason": "run.toml hits = false, baseline = false"},
         ])
         self.assertEqual(text.splitlines()[:3], [
             "selective investigations, lane local: fail",
-            "not requested: row 5 (run.toml hits = false); row 6 (run.toml hits = false); row 10 (run.toml "
+            "not requested: row 5 (run.toml hits = false); row 6 (run.toml hits = false); row 9 figures "
+            "covering_parts, resolve_gets, leaf_gets, parts_beyond_ceiling, rows_exact (run.toml states lacks "
+            "['many_parts_744']); row 10 (run.toml "
             "states lacks ['many_parts_2160']); row 12 (run.toml scales lacks [10, 100]); row 16 (run.toml "
             "hits = false, baseline = false)",
             "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 23 figure(s), "
@@ -1342,6 +1361,27 @@ class Evaluate(Workdir):
     def test_needle_geometry(self):
         self.assertEqual(self.check_needle_geometry(), [])
 
+    def check_needle_partial(self, evaluate_py=EVALUATE):
+        """Item 3 (round 5): a partial needle inspection leaves the exact and
+        banded needles unjudged, and says so under incomplete with the counts
+        inspected."""
+        self.needle_stamp(objects_inspected=1, objects_total=4)
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = [] if (code, res["verdict"], res["problems"]) == (1, "incomplete", []) else [
+            f"exit {code} {res['verdict']} {res['problems']}"]
+        got = {v: e["status"] for v, e in res["needle_blocks"]["needles"].items()}
+        if got != {"needlerare": "incomplete", "needlesparse": "incomplete", "needlecommon": "incomplete",
+                   "any": "reported"}:
+            out.append(f"needles {got}")
+        want = ("needle_blocks needlerare: needle_rare counted over 1 of 4 logs objects (run.toml "
+                "needle_blocks_max_objects), 1 storage blocks against 1 planted, not judged")
+        if want not in res["incomplete"]:
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_needle_partial(self):
+        self.assertEqual(self.check_needle_partial(), [])
+
     def check_needle_band_miss(self, evaluate_py=EVALUATE):
         """Item 7: a common needle in 6 storage blocks against 4 planted is outside 25 %, a miss."""
         self.needle_stamp(needle_sparse_present_blocks=2, truth_needlecommon=4, needle_common_present_blocks=6)
@@ -1386,6 +1426,26 @@ class Evaluate(Workdir):
 
     def test_missing_catalog_stamp(self):
         self.assertEqual(self.check_missing_catalog_stamp(), [])
+
+    def check_dirty_paths_null(self, evaluate_py=EVALUATE):
+        """Round 5 item 5: a local build stamp whose git status failed (dirty_paths null) is missing."""
+        path = self.stamp_path("build.json")
+        with open(path) as f:
+            doc = json.load(f)
+        doc["lane"], doc["dirty_paths"] = "local", None
+        with open(path, "w") as f:
+            json.dump(doc, f)
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = []
+        if code != 1:
+            out.append(f"exit {code}")
+        want = "missing stamps/build.json dirty_paths: no count of the harness's uncommitted paths"
+        if want not in res["problems"]:
+            out.append(f"problems {res['problems']}")
+        return out
+
+    def test_dirty_paths_null(self):
+        self.assertEqual(self.check_dirty_paths_null(), [])
 
     def check_absent_phases(self, evaluate_py=EVALUATE):
         """Item 2: an ok call without stats.phases is named, and its figures are missing."""
@@ -1890,7 +1950,7 @@ class Evaluate(Workdir):
         _, res, text = self.go(BANDS, evaluate_py)
         got = [(r["row"], r["reason"]) for r in res["not_requested"]]
         want = [(5, "run.toml hits = false"), (6, "run.toml hits = false"),
-                (10, "run.toml states lacks ['many_parts_2160']"), (12, "run.toml scales lacks [10, 100]"),
+                (9, "run.toml states lacks ['many_parts_744']"), (10, "run.toml states lacks ['many_parts_2160']"), (12, "run.toml scales lacks [10, 100]"),
                 (16, "run.toml hits = false, baseline = false")]
         out = [] if got == want else [f"not_requested {got}"]
         if "not requested: row 5 (run.toml hits = false); row 6 " not in text:
@@ -1899,6 +1959,68 @@ class Evaluate(Workdir):
 
     def test_not_requested(self):
         self.assertEqual(self.check_not_requested(), [])
+
+    @staticmethod
+    def gated_placement(res):
+        """Each not-run figure not placed exactly once among not_requested
+        (its whole row, or the figure by name) and incomplete."""
+        rows = {r["key"] for r in res["not_requested"] if not r.get("figures")}
+        named = {f"{r['key']}.{n}" for r in res["not_requested"] for n in r.get("figures", [])}
+        out = []
+        for f in res["figures"]:
+            places = (f["id"].split(".", 1)[0] in rows) + (f["id"] in named) + sum(
+                line.startswith(f"figure {f['id']} not run: ") for line in res["incomplete"])
+            if places != (f["status"] == "not-run"):
+                out.append(f"{f['id']} ({f['status']}) placed {places} time(s)")
+        return out
+
+    def check_gated_unrequested(self, evaluate_py=EVALUATE):
+        """Item 2 (round 5): a gated figure whose state run.toml does not list
+        (row 9's many_parts_744 arm) is listed under not_requested by name."""
+        _, res, text = self.go(BANDS, evaluate_py)
+        out = self.gated_placement(res)
+        want = {"row": 9, "key": "row_09", "figures": ["covering_parts", "resolve_gets", "leaf_gets",
+                                                       "parts_beyond_ceiling", "rows_exact"],
+                "reason": "run.toml states lacks ['many_parts_744']"}
+        if want not in res["not_requested"]:
+            out.append(f"not_requested {res['not_requested']}")
+        if ("row 9 figures covering_parts, resolve_gets, leaf_gets, parts_beyond_ceiling, rows_exact "
+                "(run.toml states lacks ['many_parts_744'])") not in text:
+            out.append("summary names no row 9 figures")
+        return out
+
+    def test_gated_unrequested(self):
+        self.assertEqual(self.check_gated_unrequested(), [])
+
+    def check_gated_asked_not_run(self, evaluate_py=EVALUATE):
+        """Item 2 (round 5): a gated figure whose state run.toml asks for and
+        the run did not reach is incomplete with the reason."""
+        toml = os.path.join(self.run_dir, "run.toml")
+        with open(toml) as f:
+            text = f.read()
+        self.assertEqual(text.count('"many_parts_24"]'), 1)
+        with open(toml, "w") as f:
+            f.write(text.replace('"many_parts_24"]', '"many_parts_24", "many_parts_744"]'))
+        write_jsonl(self.stamp_path("not_run.jsonl"), [{"state": "many_parts_744", "reason": "case: run deadline"}])
+        code, res, _ = self.go(BANDS, evaluate_py)
+        out = self.gated_placement(res)
+        if any(r["key"] == "row_09" for r in res["not_requested"]):
+            out.append(f"not_requested {res['not_requested']}")
+        want = "figure row_09.covering_parts not run: many_parts_744: case: run deadline"
+        if want not in res["incomplete"]:
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_gated_asked_not_run(self):
+        self.assertEqual(self.check_gated_asked_not_run(), [])
+
+    def test_gated_measured(self):
+        # Item 2 (round 5): the 24-part arm ran, so its figures are measured
+        # and placed nowhere else.
+        _, res, _ = self.go(BANDS)
+        self.assertEqual(self.gated_placement(res), [])
+        for name in ("covering_parts_24", "resolve_gets_24", "rows_exact_24"):
+            self.assertEqual(figure(res, f"row_09.{name}")["status"], "value")
 
     def check_refusal_classes(self, evaluate_py=EVALUATE):
         """Guard refusals and unsupported figures are counted apart."""
@@ -2069,6 +2191,11 @@ FLIPS = {
         "                    pass",
         "check_missing_catalog_stamp",
     ),
+    "a local build stamp with dirty_paths null taken as clean": (
+        '        problems.add("missing", "stamps/build.json dirty_paths: no count of the harness\'s uncommitted paths")\n',
+        "        pass\n",
+        "check_dirty_paths_null",
+    ),
     "absent field not named": (
         '    for name in lacking:\n        problems.add("missing", f"{name} in {at}")\n',
         '    for name in lacking[:0]:\n        problems.add("missing", f"{name} in {at}")\n',
@@ -2180,9 +2307,24 @@ FLIPS = {
         "check_matrix_some_not_run",
     ),
     "a hits-gated row not listed as not requested": (
-        '        if row.get("requires_tenant") == "hits" and not cfg["hits"]:\n            why.append',
-        '        if False:\n            why.append',
+        '    if tenant == "hits" and not cfg["hits"]:\n        why.append',
+        '    if False:\n        why.append',
         "check_not_requested",
+    ),
+    "a gated figure of an unlisted state left out of not_requested": (
+        "        out.append({\"row\": row, \"key\": key, \"figures\": names, \"reason\": why})\n",
+        "        pass\n",
+        "check_gated_unrequested",
+    ),
+    "a gated figure of an asked state left out of incomplete": (
+        '        if f["status"] == "not-run" and not f.get("not_requested"):\n',
+        '        if f["status"] == "not-run" and not f.get("gated"):\n',
+        "check_gated_asked_not_run",
+    ),
+    "a partial needle inspection left out of incomplete": (
+        '            out["incomplete"].append(entry["reason"])\n',
+        "",
+        "check_needle_partial",
     ),
     "guard refusals counted with unsupported figures": (
         '                                             if c.get("outcome") == k)}',
@@ -2497,7 +2639,7 @@ class Box(Workdir):
             f"NOT-RUN folded_no_leaves: deadline: fold needs up to 1800 s, {left}",
             f"NOT-RUN folded_leaves: deadline: fold needs up to 1800 s, {left}",
             f"NOT-RUN mixed: deadline: the wait for the next ingest hour needs up to 4200 s, {left}",
-            f"NOT-RUN compaction_in_flight: deadline: compaction needs up to 1800 s, {left}",
+            f"NOT-RUN compaction_in_flight: deadline: wait_sealed and compaction needs up to 2110 s, {left}",
             f"NOT-RUN many_parts_744: deadline: load needs up to 1800 s, {left}",
             f"NOT-RUN many_parts_2160: deadline: load needs up to 1800 s, {left}",
         ])
@@ -2515,7 +2657,7 @@ class Box(Workdir):
         code, text = run_sh("s3", self.example_toml(
             ("max_minutes = 540", "max_minutes = 20"),
             ("[step_estimate_minutes]\ndefault = 30\n",
-             "[step_estimate_minutes]\ndefault = 30\nfolded_no_leaves = 5\ncompaction_in_flight = 15\n")),
+             "[step_estimate_minutes]\ndefault = 30\nfolded_no_leaves = 5\ncompaction_in_flight = 13\n")),
             self.path("out"))
         self.assertEqual(code, 0, text)
         lines = self.deadline_lines(text)
@@ -2530,13 +2672,53 @@ class Box(Workdir):
             ("[step_estimate_minutes]\ndefault = 30\n", "[step_estimate_minutes]\ndefault = 0\n")),
             self.path("out"))
         self.assertEqual(code, 0, text)
-        self.assertEqual(self.deadline_lines(text)[0], "NOT-RUN compaction_in_flight: deadline: wait_sealed needs "
-                                                       "up to 310 s, N s left of run.max_minutes 5")
+        self.assertEqual(self.deadline_lines(text)[0], "NOT-RUN compaction_in_flight: deadline: wait_sealed and "
+                                                       "compaction needs up to 310 s, N s left of run.max_minutes 5")
         code, text = run_sh("s3", self.example_toml(
             ("[step_estimate_minutes]\ndefault = 30\n", "[step_estimate_minutes]\ndefault = \"half\"\n")),
             self.path("out"))
         self.assertEqual(code, 1, text)
         self.assertIn("run.toml step_estimate_minutes.unfolded", text)
+
+    def compaction_deadline_lines(self, run_sh_path):
+        # 16 minutes of compaction fits 20 minutes of run, and so does the
+        # 310 s sealed-hour wait, but not the two back to back.
+        toml = self.example_toml(
+            ("max_minutes = 540", "max_minutes = 20"), ("states = [\"unfolded\"", "states = [\"compaction_in_flight\""),
+            ("[step_estimate_minutes]\ndefault = 30\n", "[step_estimate_minutes]\ndefault = 0\ncompaction_in_flight = 16\n"))
+        p = subprocess.run([BASH, run_sh_path, "--dry-run", "--lane", "s3", "--run-toml", toml, "--out",
+                            self.path("out")], capture_output=True, text=True)
+        lines = [x for x in self.deadline_lines(p.stdout + p.stderr) if x.startswith("NOT-RUN compaction_in_flight:")]
+        return p.returncode, sorted(set(lines)), p.stdout + p.stderr
+
+    def test_compaction_deadline_checks_the_sum(self):
+        # Item 4 (round 5): wait_sealed and the compaction are checked
+        # against the time left together.
+        code, lines, text = self.compaction_deadline_lines(os.path.join(BOX, "run.sh"))
+        self.assertEqual(code, 0, text)
+        self.assertEqual(lines, ["NOT-RUN compaction_in_flight: deadline: wait_sealed and compaction needs up to "
+                                 "1270 s, N s left of run.max_minutes 20"])
+        self.assertNotIn("maintain compact-tenant", text)
+        with open(os.path.join(BOX, "run.sh")) as f:
+            src = f.read()
+        old = ('  fits compaction_in_flight "wait_sealed and compaction" "$((WAIT_SEALED_MAX_S + compact_s))" '
+               '|| return 0\n')
+        self.assertEqual(src.count(old), 1)
+        inv = self.path("inv")
+        os.mkdir(inv)
+        for name in os.listdir(HERE):
+            if name != "box":
+                os.symlink(os.path.join(HERE, name), os.path.join(inv, name))
+        shutil.copytree(BOX, os.path.join(inv, "box"))
+        with open(os.path.join(inv, "box", "run.sh"), "w") as f:
+            f.write(src.replace(old, '  fits compaction_in_flight wait_sealed "$WAIT_SEALED_MAX_S" || return 0\n'
+                                     '  fits compaction_in_flight compaction "$compact_s" || return 0\n'))
+        _, lines, text = self.compaction_deadline_lines(os.path.join(inv, "box", "run.sh"))
+        self.assertEqual(lines, [])
+        self.assertIn("maintain compact-tenant", text)
+        line = src[: src.index(old)].count("\n") + 1
+        print(f"flip 'wait_sealed and compaction checked apart' at box/run.sh:{line} fails "
+              f"test_compaction_deadline_checks_the_sum: NOT-RUN lines {lines}", file=sys.stderr)
 
     def test_deadline_check_flip_fails_its_case(self):
         # Item 6: a run.sh whose step check never refuses starts the fold
@@ -2572,6 +2754,37 @@ class Box(Workdir):
         self.assertNotIn("aws ", text)
         self.assertNotIn("terminate", text)
         self.assertNotIn("shutdown", text)
+
+    def dirty_paths_line(self, run_sh_src=None):
+        """The local dry run's dirty_paths with a git whose status fails."""
+        d = self.path("gitstub")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "git"), "w") as f:
+            f.write('#!/bin/sh\ncase " $* " in *" status "*) exit 128 ;; esac\necho 0123456789abcdef\n')
+        os.chmod(os.path.join(d, "git"), 0o755)
+        script = os.path.join(BOX, "run.sh")
+        if run_sh_src is not None:
+            script = os.path.join(BOX, "run.flipped.sh")
+            with open(script, "w") as f:
+                f.write(run_sh_src)
+        try:
+            p = subprocess.run([BASH, script, "--dry-run", "--lane", "local", "--run-toml",
+                                os.path.join(BOX, "run.local-smoke.toml"), "--out", self.path("out")],
+                               capture_output=True, text=True, env=dict(os.environ, PATH=d + os.pathsep + os.environ["PATH"]))
+        finally:
+            if run_sh_src is not None:
+                os.remove(script)
+        return [x for x in p.stdout.splitlines() if "build.json dirty_paths" in x]
+
+    def test_dirty_paths_null_when_git_status_fails(self):
+        self.assertEqual(self.dirty_paths_line(), ["DRY-RUN: build.json dirty_paths null"])
+        with open(os.path.join(BOX, "run.sh")) as f:
+            src = f.read()
+        old = "      dirty=null\n"
+        self.assertEqual(src.count(old), 1)
+        # Flipped back to a count of zero, the failed status reads as a clean tree.
+        self.assertEqual(self.dirty_paths_line(src.replace(old, "      dirty=0\n")),
+                         ["DRY-RUN: build.json dirty_paths 0"])
 
     def test_s3_lane_refuses_off_the_box(self):
         p = subprocess.run([BASH, os.path.join(BOX, "run.sh"), "--lane", "s3", "--run-toml",
@@ -2631,7 +2844,10 @@ class Box(Workdir):
     @staticmethod
     def objects_over_512k(inv_py):
         mod = load_module(inv_py, "inv_case")
-        keys = [("t/h1/l/a", 512 * 1024), ("t/h1/l/b", 512 * 1024 + 1), ("t/h1/l/c", 10), ("t/h2/l/d", 1 << 30)]
+        keys = [("t/h1/l/l0/0000/a.1.1.0000000000000000.rseg", 512 * 1024),
+                ("t/h1/l/l0/0000/b.1.1.0000000000000000.rseg", 512 * 1024 + 1),
+                ("t/h1/l/l0/0001/c.1.1.0000000000000000.rseg", 10),
+                ("t/h2/l/l0/0000/d.1.1.0000000000000000.rseg", 1 << 30)]
         got = mod.tenant_census(keys, "h1")["data"]["logs"]
         return [] if (got["objects"], got["objects_over_512k"]) == (3, 1) else [f"census {got}"]
 
@@ -2651,6 +2867,83 @@ class Box(Workdir):
         self.assertTrue(failures)
         line = src[: src.index(old)].count("\n") + 1
         print(f"flip 'objects at 512 KiB counted' at box/lib/inv.py:{line} fails the row 6 floor: {failures}",
+              file=sys.stderr)
+
+    # A listing of one hour: 4 L0 objects, their 4 commit records, the
+    # provenance object and one L1 part. One commit
+    # record is given a data-object size so a count over the signal prefix
+    # shows in objects_over_512k too.
+    CENSUS_KEYS = [
+        *((f"t/h1/l/l0/000{i}/w.1.{i}.000000000000000{i}.rseg", 600 * 1024 if i < 2 else 1000) for i in range(4)),
+        *((f"t/h1/l/c/000{i}/2026110300/w.1.{i}.cmt", 700 * 1024 if i == 0 else 300) for i in range(4)),
+        ("t/h1/l/prov", 33),
+        ("t/h1/l/l1/0000/2026110300/abcdabcdabcdabcd.0000.0123456701234567.rseg", 900 * 1024),
+    ]
+
+    @classmethod
+    def census_of_hits(cls, inv_py):
+        """(problems, census figures) of CENSUS_KEYS as the hits tenant, and
+        row 6's keyIndex GET verdicts at the 2 x objects ceiling and one past
+        it."""
+        inv = load_module(inv_py, "inv_census")
+        tc = inv.tenant_census(cls.CENSUS_KEYS, "h1")
+        got = tc["data"]["logs"]
+        out = []
+        want = {"objects": 5, "l0_objects": 4, "l1_objects": 1, "objects_over_512k": 3,
+                "bytes": 2 * 600 * 1024 + 2 * 1000 + 900 * 1024}
+        for k, v in want.items():
+            if got.get(k) != v:
+                out.append(f"census {k} {got.get(k)}, want {v}")
+        for cls_name, n in (("l/l0", 4), ("l/c", 4), ("l/prov", 1), ("l/l1", 1)):
+            if tc["classes"].get(cls_name, {}).get("objects") != n:
+                out.append(f"class {cls_name} {tc['classes'].get(cls_name)}, want {n} objects")
+        for key, want_cls in (("t/h1/l/l0/0000/x.rseg", "l/l0"), ("t/h1/s/c/0000/h/x.cmt", "s/c"),
+                              ("t/h1/l/prov", "l/prov"), ("t/h1/catalog/s/HEAD", "catalog/s")):
+            if inv.object_class(key) != want_cls:
+                out.append(f"object_class({key}) {inv.object_class(key)!r}, want {want_cls!r}")
+        mod = load_module(EVALUATE, "evaluate_census_row6")
+        with open(BANDS, "rb") as f:
+            bands = {"row": [r for r in tomllib.load(f)["row"] if r["key"] == "row_06"]}
+        census = {("unfolded",): {"state": "unfolded", "census": {"tenants": {"hits": tc}}}}
+        cfg = {"lane": "local", "hits": True, "tenant": "inv", "scales": [1], "baseline": False,
+               "states": ["unfolded"]}
+        for gets, verdict in ((10, "pass"), (11, "miss")):
+            def fixed(calls, cfg, statement, state, metric, candidates=None, gets=gets):
+                return ("value", gets, "") if metric == "cold.max.keyindex_gets" else ("missing", None, "not set")
+            mod.statement_figure = fixed
+            figs = mod.run_rows(bands, cfg, {"unfolded": None}, None, None, {}, census, None, {}, {})
+            fig = next(f for f in figs if f["id"] == "row_06.keyindex_gets")
+            if fig["verdict"] != verdict:
+                out.append(f"{gets} keyIndex GETs over {got.get('objects')} objects read {fig['verdict']}, "
+                           f"want {verdict}")
+        return out
+
+    def test_census_counts_data_objects_only(self):
+        # Item 1 (round 5): data objects are the .rseg keys under l0/ and l1/;
+        # commit records, provenance and compaction records are classes.
+        inv = os.path.join(BOX, "lib", "inv.py")
+        self.assertEqual(self.census_of_hits(inv), [])
+        with open(inv) as f:
+            src = f.read()
+        old = "            if is_data_key(rest):\n"
+        self.assertEqual(src.count(old), 1)
+        flipped = self.path("inv_census_flipped.py")
+        with open(flipped, "w") as f:
+            f.write(src.replace(old, "            if True:\n"))
+        failures = self.census_of_hits(flipped)
+        self.assertIn("census objects 10, want 5", failures)
+        self.assertIn("11 keyIndex GETs over 10 objects read pass, want miss", failures)
+        line = src[: src.index(old)].count("\n") + 1
+        print(f"flip 'every signal key counted as a data object' at box/lib/inv.py:{line} fails the census: "
+              f"{failures}", file=sys.stderr)
+        old = "    if head in SIGNAL_DIR and len(rest) > 1:\n"
+        self.assertEqual(src.count(old), 1)
+        with open(flipped, "w") as f:
+            f.write(src.replace(old, '    if head in ("logs", "spans", "metrics") and len(rest) > 1:\n'))
+        failures = self.census_of_hits(flipped)
+        self.assertIn("object_class(t/h1/l/l0/0000/x.rseg) 'l', want 'l/l0'", failures)
+        line = src[: src.index(old)].count("\n") + 1
+        print(f"flip 'object_class by long signal names' at box/lib/inv.py:{line} fails the census: {failures}",
               file=sys.stderr)
 
     def test_fetch_dry_run(self):
