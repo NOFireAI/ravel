@@ -220,7 +220,8 @@ def truth_key_of(call, statements, cold_runs):
     run = 0
     if st.get("per_run") == "saved_trace":
         run = (cold_runs or 1) - 1 if call.get("temp", "cold") == "warm" else call.get("try", 0)
-    return (f"{sub}." if sub else "") + st["truth_key"].replace("{run}", str(run))
+    key = (st.get("truth_key_in") or {}).get(state, st["truth_key"])
+    return (f"{sub}." if sub else "") + key.replace("{run}", str(run))
 
 
 def judge(call, answers, key):
@@ -383,7 +384,7 @@ class Calls:
                     if c.get("outcome") != "ok":
                         continue
                     tk = truth_key_of(c, statements, cfg["cold_runs"])
-                    unfolded_oracle = st is not None and (
+                    unfolded_oracle = st is not None and state not in (st.get("truth_key_in") or {}) and (
                         state in ORACLE_STATES or (st.get("oracle") == "unfolded" and state != "unfolded"))
                     if st is not None and st.get("oracle") == "unfolded" and state == "unfolded":
                         if c.get("truth_key") != tk:

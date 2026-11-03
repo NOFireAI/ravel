@@ -506,6 +506,7 @@ def main(argv):
             if r != present_row and r not in needle_of and tid not in busy_tids and rid not in busy_rids:
                 victim = {"request_id": rid, "trace_id": tid}
                 answers["erasure_victim.present"] = answer(1, row_set=[tid])
+                answers["erasure_victim.erased"] = answer(0, row_set=[])
                 break
 
     # Journey C build sides: the first k root spans of the failing hour.

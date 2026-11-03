@@ -38,6 +38,9 @@
 #              run asks for a different key; the warm repeat reads the last
 #              cold run's trace, the data that call just pulled in
 #   truth_key  key into truth.json's answers; {run} is the saved-trace index
+#   truth_key_in  {state = key}: the truth key in those states instead, judged
+#              against truth.json even where the state's oracle is the
+#              unfolded answer
 #   states     the states the statement runs in
 #   cold_only  true: no warm repeat
 #   control    true: one of the 43 ClickBench statements of the
@@ -530,8 +533,11 @@ truth_key = "mixed.needle.needlerare"
 states = ["mixed"]
 cold_only = true
 
-# The erasure_in_flight state's victim row, read before the erasure (the
-# unfolded state, the oracle) and while it is pending.
+# The erasure_in_flight state's victim row: present before the erasure,
+# and gone while the request is pending, since a snapshot resolved after the
+# request's ack filters its records (docs/catalog-and-mvcc.md, resolution
+# step 6: "a query whose snapshot resolves after the request ack can never
+# return matching records").
 [[statement]]
 id = "logs_erasure_victim"
 tenant = "inv"
@@ -541,6 +547,7 @@ sql = "SELECT trace_id FROM logs WHERE request_id = '{erasure_victim_rid}'"
 window = "none"
 requires = "erasure_victim"
 truth_key = "erasure_victim.present"
+truth_key_in = { erasure_in_flight = "erasure_victim.erased" }
 states = ["unfolded", "erasure_in_flight"]
 cold_only = true
 

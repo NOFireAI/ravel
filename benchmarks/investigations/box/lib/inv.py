@@ -652,7 +652,8 @@ def cmd_plan(args):
             run = (args.runs - 1 if temp == "warm" else i) if st.get("per_run") == "saved_trace" else 0
             p = placeholders(t, run)
             start, end = window_bounds(st, t, run, args.ingest_shift_ns)
-            line = {**base, "temp": temp, "try": i, "truth_key": prefix + fill(st["truth_key"], p)}
+            key = (st.get("truth_key_in") or {}).get(args.state, st["truth_key"])
+            line = {**base, "temp": temp, "try": i, "truth_key": prefix + fill(key, p)}
             if st.get("oracle"):
                 line["oracle"] = st["oracle"]
             if st.get("expect_refusal_on_main"):

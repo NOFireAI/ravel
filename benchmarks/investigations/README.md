@@ -181,14 +181,18 @@ and row 6 reads 2 x the census's hits objects.
   unsealed tail together, with ids from both. Its oracle is the base answer
   plus the tail's. Then it folds that hour (`fold_advance`).
 - `compaction_in_flight`: waits until every earlier hour is sealed (310 s
-  into the hour), starts `maintain compact-tenant` on both signals as one
-  background child, runs the statement set while it runs (temp `inflight`,
+  into the hour), starts `maintain compact-tenant` on both signals at once as
+  background children, runs the statement set while they run (temp `inflight`,
   against one restarted server), waits for the child, and stamps
   `compaction.jsonl`. `compaction_done` runs the same set after it. The
   oracle of both passes is the unfolded state's own answer.
 - `erasure_in_flight`: `erase submit` on the erasure victim's request id,
   `erase status` before and after (the run fails unless it reads pending),
-  then the statement set against the pre-erasure answer. The pass after the
+  then the statement set against the pre-erasure answer, except
+  `logs_erasure_victim`, the victim's own lookup, which must return no row:
+  a snapshot resolved after the request's ack filters its records while it
+  is pending (`docs/catalog-and-mvcc.md`, resolution step 6;
+  `truth_key_in` in statements.toml). The pass after the
   erasure is applied is not run: nothing in this flow applies a pending
   request. A corpus with no victim row (every row read by some other
   statement, as at 1,000 traces) records the state `not-run` with that

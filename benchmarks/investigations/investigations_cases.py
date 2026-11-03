@@ -1370,8 +1370,8 @@ class Box(Workdir):
         cx = b["state:compaction_in_flight"]
         cj = "\n".join(cx)
         self.assertLess(cj.index("wait until 310 s past the current hour start"), cj.index("compact-spans"))
-        self.assertEqual(cj.count("the compaction above runs as a background child"), 1)
-        self.assertLess(cj.index("background child"), cj.index("--state compaction_in_flight"))
+        self.assertEqual(cj.count("the compactions above run as background children, both signals at once"), 1)
+        self.assertLess(cj.index("background children"), cj.index("--state compaction_in_flight"))
         self.assertLess(cj.index("RQ_STATS=1"), cj.index("kv-report"))
         self.assertEqual(cx.count("STAMP stamps/compaction.jsonl"), 2)
         self.assertEqual(cx.count("STAMP stamps/transitions.jsonl"), 2)
@@ -1559,7 +1559,7 @@ class Box(Workdir):
         self.assertIn("PARTIAL", text)
 
     # Arrays box/ scripts expand bare: each is assigned non-empty before use.
-    NON_EMPTY_ARRAYS = {"CLI", "tenants", "args"}
+    NON_EMPTY_ARRAYS = {"CLI", "tenants", "args", "pids"}
 
     def test_possibly_empty_arrays_are_guarded_for_bash_3_2(self):
         # bash before 4.4 treats "${x[@]}" of an empty x as unbound under

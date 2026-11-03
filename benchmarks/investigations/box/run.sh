@@ -725,16 +725,21 @@ needle_blocks() {
 }
 
 # compact_child: maintain compact-tenant over every sealed hour of both
-# signals, run in the background while the in-flight statements run.
+# signals, run in the background while the in-flight statements run. The two
+# signals compact at once, so each signal's calls can overlap its own
+# compaction whichever order the statements run in.
 compact_child() {
-  local sig code
+  local sig pid pids=() code=0
   for sig in spans logs; do
-    code=0
     "$PY" "$LIB" measure --out "$WORK/compact-$sig.measure.json" --stdout "$WORK/compact-$sig.out" -- \
       "${CLI[@]}" maintain compact-tenant --tenant "$TENANT" --signal "$sig" --shards "$SHARDS" \
-      --max-flush-lifetime 0s --no-claim || code=$?
-    [ "$code" = 0 ] || return "$code"
+      --max-flush-lifetime 0s --no-claim &
+    pids+=("$!")
   done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || code=$?
+  done
+  return "$code"
 }
 
 # wait_sealed: compact-tenant seals an hour at its end plus
@@ -763,7 +768,7 @@ state_compaction() {
         "${CLI[@]}" maintain compact-tenant --tenant "$TENANT" --signal "$sig" --shards "$SHARDS" \
         --max-flush-lifetime 0s --no-claim
     done
-    printf 'DRY-RUN: the compaction above runs as a background child while the in-flight calls run\n'
+    printf 'DRY-RUN: the compactions above run as background children, both signals at once, while the in-flight calls run\n'
     statements compaction_in_flight --temp inflight
     printf 'DRY-RUN: wait for the compaction child before the next transition\n'
   else
