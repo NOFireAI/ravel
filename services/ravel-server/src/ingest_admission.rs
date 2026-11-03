@@ -1934,6 +1934,17 @@ mod tests {
         assert_eq!(controller.shed_total(), 2);
     }
 
+    /// Issue #3744: the drain cap is the request body limit itself, so the
+    /// two cannot drift.
+    #[test]
+    fn the_drain_cap_is_the_request_body_limit() {
+        assert_eq!(
+            HEAD_REFUSAL_DRAIN_MAX_BYTES,
+            crate::ingest_decode::MAX_REQUEST_BODY_BYTES as u64
+        );
+        assert_eq!(HEAD_REFUSAL_DRAIN_MAX_BYTES, 16 * 1024 * 1024);
+    }
+
     /// Issue #3744: the drain cap is the request body limit, so a refused
     /// 2 MiB body, the size the logs benchmark sends, is read to its end and
     /// answered without `Connection: close`, with `over_cap` unmoved.
@@ -1941,10 +1952,6 @@ mod tests {
     async fn a_shed_body_of_two_mib_is_drained() {
         use tower::ServiceExt;
 
-        assert_eq!(
-            HEAD_REFUSAL_DRAIN_MAX_BYTES,
-            crate::ingest_decode::MAX_REQUEST_BODY_BYTES as u64
-        );
         let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(0));
         let response = tokio::time::timeout(
             TEST_DEADLINE,
@@ -1985,9 +1992,10 @@ mod tests {
         assert_eq!(undrained_counts(&controller), [0, 1, 0, 0]);
     }
 
-    /// A chunked shed body is read only until it passes the cap: of twice the
-    /// cap in 64 KiB frames, the frame that crosses it is the last one read,
-    /// and the refusal carries `Connection: close`, counted under `over_cap`.
+    /// A chunked shed body is read only until it passes the 16 MiB cap: of
+    /// 17 MiB in 64 KiB frames, the frame that crosses the cap is the last one
+    /// read, and the refusal carries `Connection: close`, counted under
+    /// `over_cap`.
     #[tokio::test(start_paused = true)]
     async fn a_chunked_shed_body_past_the_cap_stops_the_drain() {
         use tower::ServiceExt;
@@ -1998,7 +2006,7 @@ mod tests {
         let response = tokio::time::timeout(
             TEST_DEADLINE,
             http_router(&controller).oneshot(http_upload(axum::body::Body::new(ChunkedBody {
-                chunks: (2 * HEAD_REFUSAL_DRAIN_MAX_BYTES / FRAME) as usize,
+                chunks: (17 * 1024 * 1024 / FRAME) as usize,
                 polled: polled.clone(),
             }))),
         )

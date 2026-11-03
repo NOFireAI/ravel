@@ -858,13 +858,11 @@ async fn a_shed_two_mib_body_is_drained_and_keeps_its_connection() {
 }
 
 /// Issue #2926, case C: an authenticated shed whose `Content-Length` is
-/// above the drain cap, the 16 MiB request body limit, is answered at once,
-/// without reading, with `Connection: close`, and counted under `over_cap`.
-/// "At once" is read off the drain counters, as in case B.
+/// 17 MiB, above the drain cap (the 16 MiB request body limit, #3744), is
+/// answered at once, without reading, with `Connection: close`, and counted
+/// under `over_cap`. "At once" is read off the drain counters, as in case B.
 #[tokio::test]
 async fn an_authenticated_shed_over_the_cap_is_answered_without_a_drain() {
-    use ravel_server::ingest_admission::HEAD_REFUSAL_DRAIN_MAX_BYTES;
-
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let running = start_test_server(store, IngestConcurrencyLimit::Bounded(0)).await;
     let base = format!("http://{}", running.http_addr);
@@ -874,7 +872,7 @@ async fn an_authenticated_shed_over_the_cap_is_answered_without_a_drain() {
         running.http_addr,
         "/v1/metrics",
         Some(TOKEN),
-        &format!("content-length: {}", HEAD_REFUSAL_DRAIN_MAX_BYTES + 1),
+        &format!("content-length: {}", 17 * 1024 * 1024),
     );
     let shed = exchange(running.http_addr, &head, &[], Duration::from_secs(10)).await;
 
