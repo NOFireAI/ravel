@@ -494,7 +494,11 @@ fn memo_offsets<T: Copy + Into<i64>>(
     {
         return None;
     }
-    Some(OffsetBuffer::new(ScalarBuffer::new(buffer, 0, offsets.len())))
+    Some(OffsetBuffer::new(ScalarBuffer::new(
+        buffer,
+        0,
+        offsets.len(),
+    )))
 }
 
 /// The memo array over a cached column's `buffers`, sharing every byte
@@ -1606,6 +1610,13 @@ fn chunk_keys(keys: &Int32Array, start: usize, end: usize) -> Int32Array {
 /// value is appended past the record's values: on a plain page once per
 /// distinct stream in the block, on a dictionary page once per distinct value,
 /// sorted ([`canonical_fallbacks`]).
+///
+/// When a decoded-cache entry holds the column (ADR-3326, values-memo
+/// amendment), a dictionary's base values are the entry's memo array, and a
+/// plain column that meets the fast path's preconditions
+/// ([`StrCursor::plain_memo`], plus a single-typed key) skips the loop: its
+/// keys are the identity and its values the memo array, byte-identical to the
+/// loop's (`memo_str_block_is_byte_identical_to_the_loop`).
 fn build_str_block(
     view: &ColumnarBlockView<'_>,
     resolver: &mut DeclaredResolver<'_, '_, '_>,
@@ -4984,7 +4995,9 @@ mod tests {
             let mut cache = lock_str_values(&shared);
             let arrays = [
                 cache.values(&dict, Vec::new(), None).expect("base"),
-                cache.values(&dict, extra(&["ra"]), None).expect("first extended"),
+                cache
+                    .values(&dict, extra(&["ra"]), None)
+                    .expect("first extended"),
                 cache
                     .values(&dict, extra(&["rb", "scope-fallback-value"]), None)
                     .expect("second extended"),
@@ -5657,8 +5670,7 @@ mod tests {
                         let cid = str_column_id(&view).expect("a Str column");
                         assert_eq!(view.str_dict(cid).is_none(), plain, "page kind");
                         let pool = unbounded_pool();
-                        let batches =
-                            str_batches(&view, &test_str_values(&pool), &Count::new());
+                        let batches = str_batches(&view, &test_str_values(&pool), &Count::new());
                         let memo = view.str_values_memo(cid).expect("an entry holds it");
                         assert!(memo.get().is_some(), "the build filled the memo");
                         let columns = batches.iter().map(|b| Arc::clone(b.column(0)));
@@ -5682,7 +5694,9 @@ mod tests {
                     );
                     assert_eq!(budget.reserved(), str_bytes, "{case}");
 
-                    clock.0.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+                    clock
+                        .0
+                        .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
                     assert_eq!(cache.sweep_expired(), 1, "{case}: evicted by age");
                     assert!(cache.is_empty());
                     assert_eq!(
@@ -5744,9 +5758,8 @@ mod tests {
                 let shared_b = test_str_values(&pool_b);
                 let batches_a = str_batches(&view_a, &shared_a, &Count::new());
                 let batches_b = str_batches(&view_b, &shared_b, &Count::new());
-                let values = |b: &[RecordBatch]| {
-                    Arc::clone(b[0].column(0).as_any_dictionary().values())
-                };
+                let values =
+                    |b: &[RecordBatch]| Arc::clone(b[0].column(0).as_any_dictionary().values());
                 let (va, vb) = (values(&batches_a), values(&batches_b));
                 assert!(!Arc::ptr_eq(&va, &vb), "one Arc per scan");
                 assert_eq!(
@@ -5778,7 +5791,11 @@ mod tests {
                         "the entry holds the dictionary, so its base values stay"
                     );
                 }
-                assert_eq!(pool_b.reserved(), layout, "plain {plain}: the other still holds");
+                assert_eq!(
+                    pool_b.reserved(),
+                    layout,
+                    "plain {plain}: the other still holds"
+                );
 
                 drop(batches_b);
                 drop((view_a, view_b));
@@ -5823,7 +5840,10 @@ mod tests {
                             .scan_blocks(pred, &[], &ColumnSelection::all())
                             .expect("scan");
                         scan.attach_decoded_cache(attach(&cache));
-                        let view = scan.next_block_columnar(&obj).expect("exit").expect("block");
+                        let view = scan
+                            .next_block_columnar(&obj)
+                            .expect("exit")
+                            .expect("block");
                         let pool = unbounded_pool();
                         let shared = test_str_values(&pool);
                         [(); 2].map(|_| {
