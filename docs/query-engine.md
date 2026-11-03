@@ -5531,10 +5531,14 @@ the flag.
   and a dictionary takes the memo instead of a per-scan copy. Either result
   is byte-identical to the loop
   (`memo_str_block_is_byte_identical_to_the_loop`). Each scan holds its own
-  `Arc` over a clone of the memo and charges its layout bytes, released once
-  no batch of that scan holds it
-  (`str_values_releases_a_memo_arrays_charge_once_no_batch_holds_it`), and
-  takes nothing from `strDictValuesBuilt`. `offer` charges such a column
+  `Arc` over a clone of the memo and charges its layout bytes. For a plain
+  column the charge is released once no batch of that scan holds the
+  array. For a dictionary it stays while the cache entry holds the
+  dictionary, as a dictionary's values have always stayed while the
+  dictionary is alive, and is released once the batches, the blocks and
+  the cache are all gone
+  (`str_values_releases_a_memo_arrays_charge_once_no_batch_holds_it`, both
+  cases). The scan takes nothing from `strDictValuesBuilt`. `offer` charges such a column
   `VALUES_MEMO_BYTES` (512) beyond its `heap_bytes` for the memo
   (`the_entry_charge_includes_the_memo_constant`). Every other column, and
   a row group dictionary, keeps the per-scan build.
