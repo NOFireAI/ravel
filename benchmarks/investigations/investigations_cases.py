@@ -51,6 +51,7 @@ STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_
 SMOKE_STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight",
                 "erasure_in_flight", "many_parts_24")
 UNSUPPORTED = "unsupported-on-this-build"
+GUARD = "refused-by-guard"
 REFUSAL_1000 = ("server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of "
                 "1000 tokens; simplify the statement")
 
@@ -709,8 +710,8 @@ class LocalSmoke(Workdir):
                 self.assertTrue(f["reason"], f["id"])
                 continue
             if f["state"] in covered:
-                self.assertIn(f["status"], ("value", UNSUPPORTED, "dead_counter"), f["id"])
-            if f["status"] == UNSUPPORTED:
+                self.assertIn(f["status"], ("value", UNSUPPORTED, GUARD, "dead_counter"), f["id"])
+            if f["status"] in (UNSUPPORTED, GUARD):
                 self.assertTrue(f["reason"], f["id"])
 
     def test_states_section(self):
@@ -737,7 +738,7 @@ class LocalSmoke(Workdir):
         for prefix in ("spans", "logs_trace", "logs_request"):
             f = figure(res, f"row_11.{prefix}_control_1001")
             self.assertEqual((f["status"], f["value"], f["verdict"], f["reason"]),
-                             (UNSUPPORTED, None, UNSUPPORTED, f"the 1,000-key list was refused: {REFUSAL_1000}"))
+                             (GUARD, None, GUARD, f"refused by the SQL complexity guard: {REFUSAL_1000}"))
         self.assertEqual(figure(res, "row_11.spans_1000_rows_exact")["reason"], REFUSAL_1000)
 
     def test_many_parts_24(self):
@@ -1440,34 +1441,63 @@ class Evaluate(Workdir):
     def test_refused(self):
         self.assertEqual(self.check_refused(), [])
 
-    def served_1000(self, statement, keys):
-        """Turn statement's folded_leaves cold calls into ok calls probing keys keys."""
+    def served_1000(self, statement, keys=None, parts=1, scan=True):
+        """Turn statement's folded_leaves cold calls into ok calls copied from spans_in_100, which scanned 4
+        objects. keys None drops the keyIndex section; scan False zeros the probe and scan GETs and blocks."""
         src = {c["try"]: c for c in self.select("spans_in_100")}
         for i, c in enumerate(self.calls):
             if c["statement"] == statement and c["state"] == "folded_leaves" and c.get("temp") == "cold":
                 new = copy.deepcopy(src[c["try"]])
                 new.update(statement=statement, truth_key=c.get("truth_key", new.get("truth_key")))
-                new["stats"]["keyIndex"] = dict(new["stats"].get("keyIndex") or {}, keysProbed=keys, partsCovered=1)
+                if keys is None:
+                    new["stats"].pop("keyIndex", None)
+                else:
+                    new["stats"]["keyIndex"] = dict(new["stats"].get("keyIndex") or {}, keysProbed=keys,
+                                                    partsCovered=parts)
+                if not scan:
+                    for p in new["stats"]["phases"]:
+                        if p["phase"] in ("probe", "scan"):
+                            p["s3GetRequests"] = 0
+                    new["stats"]["pruning"]["blocksScanned"] = 0
                 self.calls[i] = new
 
+    CONTROL = {
+        # mode: (1,000-key arm, 1,001-key arm, (status, value, verdict), reason fragment)
+        "guard": (None, None, (GUARD, None, GUARD), "refused by the SQL complexity guard: " + REFUSAL_1000),
+        "unsupported": (dict(), None, (UNSUPPORTED, None, UNSUPPORTED), "carries no keyIndex.keysProbed"),
+        "pass": (dict(keys=1000), None, ("value", 1, "pass"), ""),
+        "miss": (dict(keys=1000), dict(keys=1001), ("value", 0, "miss"), "was index-served"),
+        "served-with-scan": (dict(keys=1000), dict(), ("value", 1, "pass"), ""),
+        "served-with-keyindex": (dict(keys=1000), dict(keys=1001, scan=False), ("value", 0, "miss"),
+                                 "was index-served: keysProbed 1001 partsCovered 1"),
+        "served-without-scan": (dict(keys=1000), dict(scan=False), ("value", 0, "miss"),
+                                "served without a visible path"),
+        "zeros-without-scan": (dict(keys=1000), dict(keys=0, parts=0, scan=False), ("value", 0, "miss"),
+                               "served without a visible path"),
+        "zero-parts-covered": (dict(keys=1000, parts=0), None, ("value", 0, "miss"),
+                               "probed 1000 keys with partsCovered 0"),
+    }
+
     def check_control(self, mode, evaluate_py=EVALUATE):
-        want = {"unsupported": (UNSUPPORTED, None, "unsupported-on-this-build"),
-                "pass": ("value", 1, "pass"), "miss": ("value", 0, "miss")}[mode]
-        if mode in ("pass", "miss"):
-            self.served_1000("spans_in_1000", 1000)
-        if mode == "miss":
-            self.served_1000("spans_in_1001", 1001)
+        arm_1000, arm_1001, want, reason = self.CONTROL[mode]
+        if arm_1000 is not None:
+            self.served_1000("spans_in_1000", **arm_1000)
+        if arm_1001 is not None:
+            self.served_1000("spans_in_1001", **arm_1001)
         self.save_calls()
         _, res, _ = self.go(BANDS, evaluate_py)
         f = figure(res, "row_11.spans_control_1001")
         out = [] if (f["status"], f["value"], f["verdict"]) == want else [f"{f['status']} {f['value']} {f['verdict']}"]
-        reason = {"unsupported": "the 1,000-key list was refused: ", "miss": "was index-served", "pass": ""}[mode]
         if reason not in (f["reason"] or ""):
             out.append(f"reason {f['reason']}")
         return out
 
+    def check_control_guard(self, evaluate_py=EVALUATE):
+        """Row 11 on main: the 1,000-key list refused by the complexity guard reads refused-by-guard."""
+        return self.check_control("guard", evaluate_py)
+
     def check_control_unsupported(self, evaluate_py=EVALUATE):
-        """Row 11 on main: the 1,000-key list refused by the complexity guard reads unsupported."""
+        """A 1,000-key list served with no tier-2 figures: unsupported."""
         return self.check_control("unsupported", evaluate_py)
 
     def check_control_pass(self, evaluate_py=EVALUATE):
@@ -1478,6 +1508,29 @@ class Evaluate(Workdir):
         """A 1,001-key list the index served: the control misses."""
         return self.check_control("miss", evaluate_py)
 
+    def check_control_served_with_scan(self, evaluate_py=EVALUATE):
+        """A 1,001-key list served by a scan with no keyIndex figure: the control passes."""
+        return self.check_control("served-with-scan", evaluate_py)
+
+    def check_control_served_with_keyindex(self, evaluate_py=EVALUATE):
+        """A 1,001-key list served with keyIndex figures and no scan: the control misses."""
+        return self.check_control("served-with-keyindex", evaluate_py)
+
+    def check_control_served_without_scan(self, evaluate_py=EVALUATE):
+        """Reviewer mutation (a): a 1,001-key list served with no keyIndex figure and zero GETs: miss."""
+        return self.check_control("served-without-scan", evaluate_py)
+
+    def check_control_zeros_without_scan(self, evaluate_py=EVALUATE):
+        """Reviewer mutation (b): a 1,001-key list whose keyIndex figures are zeros, with no scan: miss."""
+        return self.check_control("zeros-without-scan", evaluate_py)
+
+    def check_control_zero_parts_covered(self, evaluate_py=EVALUATE):
+        """A 1,000-key list that probed 1,000 keys but covered no part: miss."""
+        return self.check_control("zero-parts-covered", evaluate_py)
+
+    def test_control_guard(self):
+        self.assertEqual(self.check_control_guard(), [])
+
     def test_control_unsupported(self):
         self.assertEqual(self.check_control_unsupported(), [])
 
@@ -1486,6 +1539,21 @@ class Evaluate(Workdir):
 
     def test_control_miss(self):
         self.assertEqual(self.check_control_miss(), [])
+
+    def test_control_served_with_scan(self):
+        self.assertEqual(self.check_control_served_with_scan(), [])
+
+    def test_control_served_with_keyindex(self):
+        self.assertEqual(self.check_control_served_with_keyindex(), [])
+
+    def test_control_served_without_scan(self):
+        self.assertEqual(self.check_control_served_without_scan(), [])
+
+    def test_control_zeros_without_scan(self):
+        self.assertEqual(self.check_control_zeros_without_scan(), [])
+
+    def test_control_zero_parts_covered(self):
+        self.assertEqual(self.check_control_zero_parts_covered(), [])
 
     # --- incomplete, truth-derived budgets, absent fields -------------------
 
@@ -1665,19 +1733,24 @@ FLIPS = {
         '    v = doc.get("parts_declared", 24)\n',
         "check_part_count",
     ),
-    "every server refusal read unsupported": (
-        '                    if outcome == UNSUPPORTED and "http_status" in c and not (',
-        '                    if False and not (',
+    "every server refusal read refused-by-guard": (
+        '                        outcome = c["outcome"] = GUARD if probe else "refused"',
+        '                        outcome = c["outcome"] = GUARD',
         "check_refused",
     ),
     "only cap-probe refusals taken as refused": (
-        '                    if outcome == UNSUPPORTED and "http_status" in c and not (',
-        '                    if outcome == UNSUPPORTED and "http_status" in c and (',
+        '                        outcome = c["outcome"] = GUARD if probe else "refused"',
+        '                        outcome = c["outcome"] = "refused" if probe else GUARD',
         "check_refused",
     ),
-    "a refused 1,000-key list read as missing": (
-        "    if refused:\n",
+    "a guard-refused 1,000-key list read as missing": (
+        "    if guarded:\n",
         "    if False:\n",
+        "check_control_guard",
+    ),
+    "a 1,000-key list without tier-2 figures read as a miss": (
+        '            return UNSUPPORTED, None, f"{where(c)} carries no keyIndex.keysProbed and partsCovered',
+        '            return "value", 0, f"{where(c)} carries no keyIndex.keysProbed and partsCovered',
         "check_control_unsupported",
     ),
     "1,000 keys probed read as a miss": (
@@ -1685,10 +1758,35 @@ FLIPS = {
         '        if ki["keysProbed"] != 999:',
         "check_control_pass",
     ),
+    "a 1,000-key list covering no part passed": (
+        '        if not ki["partsCovered"]:',
+        "        if False:",
+        "check_control_zero_parts_covered",
+    ),
     "an index-served 1,001-key list not seen": (
-        "    if served:\n",
-        "    if False:\n",
+        "        if key_index_nonzero(c):\n",
+        "        if False:\n",
         "check_control_miss",
+    ),
+    "a 1,001-key list served with keyIndex figures and no scan passed": (
+        "        if key_index_nonzero(c):\n",
+        "        if c.get(\"_never\"):\n",
+        "check_control_served_with_keyindex",
+    ),
+    "scan GETs not counted as a visible path": (
+        '        if m["probe_gets"] == 0 and m["scan_gets"] == 0 and m["blocks_scanned"] == 0:',
+        '        if m["probe_gets"] == 0:',
+        "check_control_served_with_scan",
+    ),
+    "a 1,001-key list served with no visible path passed": (
+        '        if m["probe_gets"] == 0 and m["scan_gets"] == 0 and m["blocks_scanned"] == 0:',
+        "        if False:",
+        "check_control_served_without_scan",
+    ),
+    "keyIndex zeros read as index-served or passed": (
+        '    return isinstance(ki, dict) and bool(ki.get("keysProbed") or ki.get("partsCovered"))',
+        '    return isinstance(ki, dict)',
+        "check_control_zeros_without_scan",
     ),
     "full overlap not counted": (
         'overlapped = sum(1 for c in lines if c["started_unix_s"] < ended and',

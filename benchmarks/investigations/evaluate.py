@@ -535,7 +535,7 @@ def control_1001(calls, cfg, statement, state, temp):
         return bad[0], None, bad[1]
     for c in lines_over:
         outcome = c.get("outcome")
-        if outcome in (GUARD, UNSUPPORTED):
+        if outcome in (GUARD, UNSUPPORTED, "refused"):
             continue
         if outcome != "ok" or c.get("_invalid"):
             return "missing", None, f"{where(c)} neither served nor refused"
