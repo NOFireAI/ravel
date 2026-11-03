@@ -205,6 +205,22 @@ services:
       # uncached reads.
       - "--max-samples"
       - "500000000"
+      # FETCH CONCURRENCY (disclosed): replaces the derived default,
+      # max(MIN_DERIVED_FETCH_CONCURRENCY 8, FETCH_CONCURRENCY_PER_CORE 2 x
+      # cores) (services/ravel-server/src/config.rs,
+      # resolve_performance_defaults), which is 8 in this 2-CPU container,
+      # with 32. The flag sets the shared GET permits, the PromQL per-object
+      # fan-out and the SQL partition count together (ADR-1195); the
+      # MetricsBench corpus issues no SQL. On real S3 the cardinality
+      # read-back is bound by GETs in flight: on the folded 1,000,000-series
+      # tenant its /api/v1/series listing took 264 to 277 s at 8 and 71 to
+      # 74 s at 32, with the same GETs and bytes and no memory refusal
+      # (#2821 comment 6601589888), so at 8 it cannot answer inside the
+      # 120 s deadline above. Not measured at 32: the unfolded catalog, and
+      # the s3s-fs lane, where the store's own CPU bounded the read at 8.
+      # Ravel's shipped derivation is unchanged.
+      - "--fetch-concurrency"
+      - "32"
       # Points per range series (11,000) and total range evaluation points
       # (1,000,000) are compiled into the image and have no flag; the
       # README's "Frozen limits" table lists them.
