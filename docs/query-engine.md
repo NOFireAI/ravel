@@ -4848,6 +4848,26 @@ The probe trades block reads for index reads: a selective equality reads
 fewer bytes, but every object probed pays the prefix GET and up to one bucket
 GET per key whether or not it holds the key.
 
+**Tier-2 router (ADR-3692 decisions 1 and 2).** `ravel_query::key_index_route`
+is the one per-part leaf router the spans and logs read paths share. Given a
+snapshot resolved with `Catalog::resolve_pruned_with_parts`, which returns
+each sealed segment's `(part, ordinal)` and each part's handle (blake3,
+entry count, hours and leaf refs), it answers every segment `Pruned` (the
+part's leaves prove every key of the set absent), `Blocks` (the blocks
+holding the set) or `Uncovered` (tier 1 decides), from the leaves alone: it
+reads no part object and no HEAD. The admission order, the `L_max`, `P_max`
+and `B_run` ceilings, the bridged read and the decoded-bound reservation are
+the leaf reader's rules in docs/catalog-and-mvcc.md, "Per-part key-index
+leaves". A part the ceilings leave out, a rejected leaf, a refused
+reservation and a part without a leaf for the field are `Uncovered`, never
+sent to a scan; a leaf of another tenant or signal fails the statement and
+moves `ravel_catalog_isolation_breach_total`. Leaf reads are charged to the
+`keyIndex` phase with the caller's access intent, and its figures
+(`partsCovered`, `partsUncovered`, `partsBeyondCeiling`, `leavesRejected`,
+`reservationsRefused`, `skippedByBudget`, leaf GETs and wire bytes, keys
+probed) come back with the routes. No query path calls it yet: the spans
+fetcher is wired by T4 (#3702) and the logs scan by T5 (#3703).
+
 There is also a wire-size trade for a *high-cardinality* `str` column. ADR-0099
 decision 5's "leaves that case exactly as expensive as it is today" is a
 statement about CPU, not egress: a plain (all-distinct) page becomes a
