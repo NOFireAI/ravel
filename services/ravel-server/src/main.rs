@@ -90,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     // ADR-3718: the flush-backlog head hold. A zero max wait turns it off.
     let ingest_hold = cli.resolve_ingest_hold();
     tracing::info!(
-        queued_flushes = ingest_hold.queued_flushes,
+        queued_flushes_override = ?ingest_hold.queued_flushes,
         max_wait_ms = ingest_hold.max_wait.as_millis() as u64,
         "ingest head hold (ADR-3718) resolved"
     );

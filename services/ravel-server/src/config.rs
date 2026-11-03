@@ -468,10 +468,23 @@ fn parse_ingest_hold_queued_flushes(value: &str) -> Result<u64, String> {
     Ok(bound)
 }
 
+/// The longest `--ingest-hold-max-wait` accepted: the listener-join slice of
+/// the default `--shutdown-timeout` (four fifths of 25 s), so a request held
+/// when shutdown starts is answered before the listener join is abandoned.
+pub const INGEST_HOLD_MAX_WAIT_LIMIT: Duration = Duration::from_secs(20);
+
 /// Parses `--ingest-hold-max-wait` (ADR-3718, flush-backlog hold amendment):
-/// a humantime duration, where `0` turns the hold off.
+/// a humantime duration of at most [`INGEST_HOLD_MAX_WAIT_LIMIT`], where `0`
+/// turns the hold off.
 fn parse_ingest_hold_max_wait(value: &str) -> Result<Duration, String> {
-    humantime::parse_duration(value).map_err(|err| err.to_string())
+    let wait = humantime::parse_duration(value).map_err(|err| err.to_string())?;
+    if wait > INGEST_HOLD_MAX_WAIT_LIMIT {
+        return Err(format!(
+            "must be at most {}",
+            humantime::format_duration(INGEST_HOLD_MAX_WAIT_LIMIT)
+        ));
+    }
+    Ok(wait)
 }
 
 /// Parses `--cache-bulk-scan-min-bytes`: a positive byte count. `0` would read
@@ -3087,27 +3100,31 @@ pub struct Cli {
     )]
     pub cpu_gate_write_inline_floor_bytes: u64,
 
-    /// The process-wide queued-flush count above which the node counts as
-    /// congested for ADR-3718's head hold: the sum of flush tasks spawned and
-    /// not yet reaped across every ingest router, the figure `/metrics`
-    /// exports as `ravel_ingest_queued_flushes`. The node is also congested
-    /// while at least 10 flush triggers were deferred over the last second.
-    /// While congested, an admitted ingest request waits at the head, holding
-    /// its in-flight permit, for the backlog to clear, up to
-    /// `--ingest-hold-max-wait`. Default 16. Must be at least 1.
+    /// Overrides every ingest router's queued-flush bound for ADR-3718's head
+    /// hold. The node counts as congested while any one router's queued
+    /// flushes (flush tasks spawned and not yet reaped, which `/metrics`
+    /// sums across routers as `ravel_ingest_queued_flushes`) exceed that
+    /// router's bound, or while at least 10 flush triggers were deferred
+    /// across all routers over the last second. While congested, an admitted
+    /// ingest request waits at the head, holding its in-flight permit, for
+    /// the backlog to clear, up to `--ingest-hold-max-wait`. Unset, each
+    /// router's bound is its own queued-flush cap: its shard count times
+    /// `--max-queued-flushes` (32 at the default 4 shards and 8 queued
+    /// flushes). When set, must be at least 1.
     #[arg(
         long = "ingest-hold-queued-flushes",
         value_name = "COUNT",
-        default_value_t = 16,
         value_parser = parse_ingest_hold_queued_flushes
     )]
-    pub ingest_hold_queued_flushes: u64,
+    pub ingest_hold_queued_flushes: Option<u64>,
 
     /// The longest an admitted ingest request waits at the head while the
     /// node is congested (ADR-3718's head hold), as a humantime duration
     /// (e.g. `1s`, `500ms`). A request still congested when it runs out is
     /// refused with 429 and `Retry-After: 1` (gRPC `RESOURCE_EXHAUSTED`).
-    /// Default 1s. `0` turns the hold off, and no detector task is spawned.
+    /// Default 1s, at most 20s (the listener-join share of the default
+    /// `--shutdown-timeout`). `0` turns the hold off, and no detector task is
+    /// spawned.
     #[arg(
         long = "ingest-hold-max-wait",
         value_name = "DURATION",
@@ -4875,9 +4892,10 @@ impl Default for CpuGatePermits {
 /// crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestHoldConfig {
-    /// `--ingest-hold-queued-flushes`: the process-wide queued-flush count
-    /// above which the node counts as congested.
-    pub queued_flushes: u64,
+    /// `--ingest-hold-queued-flushes`: when set, the queued-flush bound every
+    /// ingest router is held to in place of its own queued-flush cap (shard
+    /// count times `--max-queued-flushes`).
+    pub queued_flushes: Option<u64>,
     /// `--ingest-hold-max-wait`: the longest a request is held while
     /// congested. Zero turns the hold off and spawns no detector.
     pub max_wait: Duration,
@@ -4886,7 +4904,7 @@ pub struct IngestHoldConfig {
 impl Default for IngestHoldConfig {
     fn default() -> Self {
         IngestHoldConfig {
-            queued_flushes: 16,
+            queued_flushes: None,
             max_wait: Duration::ZERO,
         }
     }
@@ -22880,7 +22898,7 @@ mod tests {
             ("0s", Duration::ZERO),
             ("200ms", Duration::from_millis(200)),
             ("1s", Duration::from_secs(1)),
-            ("2m", Duration::from_secs(120)),
+            ("20s", Duration::from_secs(20)),
         ] {
             assert_eq!(
                 parse_ingest_hold_max_wait(value).unwrap_or_else(|err| panic!("{value}: {err}")),
@@ -22897,14 +22915,37 @@ mod tests {
     }
 
     #[test]
-    fn ingest_hold_flags_default_to_sixteen_flushes_and_one_second() {
+    fn ingest_hold_max_wait_refuses_values_above_twenty_seconds() {
+        for value in ["20001ms", "21s", "30s", "2m"] {
+            let err = parse_ingest_hold_max_wait(value).expect_err(value);
+            assert_eq!(err, "must be at most 20s", "{value}");
+        }
+        assert!(
+            Cli::try_parse_from(["ravel-server", "--ingest-hold-max-wait", "21s"]).is_err(),
+            "the flag refuses 21s at parse time"
+        );
+    }
+
+    #[test]
+    fn ingest_hold_flags_default_to_the_per_router_cap_and_one_second() {
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         assert_eq!(
             cli.resolve_ingest_hold(),
             IngestHoldConfig {
-                queued_flushes: 16,
+                queued_flushes: None,
                 max_wait: Duration::from_secs(1),
             }
+        );
+    }
+
+    #[test]
+    fn ingest_hold_queued_flushes_flag_sets_the_override() {
+        let cli = Cli::try_parse_from(["ravel-server", "--ingest-hold-queued-flushes", "16"])
+            .expect("override parses");
+        assert_eq!(cli.resolve_ingest_hold().queued_flushes, Some(16));
+        assert!(
+            Cli::try_parse_from(["ravel-server", "--ingest-hold-queued-flushes", "0"]).is_err(),
+            "an override of 0 is refused"
         );
     }
 }

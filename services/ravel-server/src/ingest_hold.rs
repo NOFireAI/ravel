@@ -2,9 +2,9 @@
 //! head while the node's flush backlog is over a bound.
 //!
 //! A background detector (spawned in [`crate::start`] when
-//! `--ingest-hold-max-wait` is above zero) samples the process-wide queued
-//! flush count and the ingest routers' deferred-flush-trigger counters every
-//! 100 ms and publishes one congested flag. `admit_ingest_request` and
+//! `--ingest-hold-max-wait` is above zero) samples each ingest router's queued
+//! flush count and the routers' deferred-flush-trigger counters every 100 ms
+//! and publishes one congested flag. `admit_ingest_request` and
 //! `GrpcIngestAdmissionLayer::call` call [`IngestHoldGate::hold`] right after
 //! the in-flight permit and before tenant resolution: not congested, the
 //! request proceeds at the cost of one relaxed load; congested, it waits in
@@ -76,6 +76,10 @@ pub struct IngestHoldGate {
     /// Test-only override of the published flag: 0 none, 1 on, 2 off.
     #[cfg(any(test, feature = "ingest-hold-test-support"))]
     forced: std::sync::atomic::AtomicU8,
+    /// Test-only: set once a detector task publishing into this gate has
+    /// exited.
+    #[cfg(any(test, feature = "ingest-hold-test-support"))]
+    detector_exited: AtomicBool,
     admitted_total: AtomicU64,
     refused_total: AtomicU64,
     held_buckets: [AtomicU64; LATENCY_BUCKET_COUNT],
@@ -97,6 +101,8 @@ impl IngestHoldGate {
             congested: AtomicBool::new(false),
             #[cfg(any(test, feature = "ingest-hold-test-support"))]
             forced: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(any(test, feature = "ingest-hold-test-support"))]
+            detector_exited: AtomicBool::new(false),
             admitted_total: AtomicU64::new(0),
             refused_total: AtomicU64::new(0),
             held_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -195,23 +201,55 @@ impl IngestHoldGate {
         };
         self.forced.store(forced, Ordering::Relaxed);
     }
+
+    /// Test-only seam: whether a detector task publishing into this gate has
+    /// exited, so a shutdown test can see the task was stopped.
+    #[cfg(any(test, feature = "ingest-hold-test-support"))]
+    pub fn detector_exited_for_test(&self) -> bool {
+        self.detector_exited.load(Ordering::SeqCst)
+    }
 }
 
-/// One detector sample: the process-wide queued flush count (the sum of
-/// `flushes_queued_total` over every router, `ravel_ingest_queued_flushes`)
-/// and the cumulative deferred-flush-trigger count.
+/// A router's queued-flush cap: its shard count times its per-shard
+/// `max_queued_flushes`, floored at 1 as the shard actors floor it. A shard
+/// at its cap defers further triggers, so only a buffer over its memory
+/// backstop takes a router's queued flushes above this.
+pub fn queued_flush_cap(shard_count: u32, max_queued_flushes: u32) -> u64 {
+    u64::from(shard_count) * u64::from(max_queued_flushes.max(1))
+}
+
+/// One ingest router's figures in one detector sample.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CongestionSample {
+pub struct RouterQueue {
+    /// The router's `flushes_queued_total`, over all its shards.
     pub queued_flushes: u64,
+    /// The router's [`queued_flush_cap`], its bound unless
+    /// `--ingest-hold-queued-flushes` overrides it.
+    pub cap: u64,
+}
+
+/// One detector sample: each ingest router's queued flushes against its cap,
+/// and the cumulative deferred-flush-trigger count summed over every router.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CongestionSample {
+    /// One entry per ingest router this process built.
+    pub routers: Vec<RouterQueue>,
     pub deferred_total: u64,
 }
 
-/// The congestion rule: queued flushes above `queued_bound`, or at least
+/// The congestion rule: any one router's queued flushes above its own bound
+/// (`bound_override` when set, else that router's cap), or at least
 /// [`DEFERRED_TRIGGERS_PER_WINDOW`] deferred triggers over a full window of
 /// per-sample deltas. A window short of [`WINDOW_SAMPLES`] never counts on
 /// deferrals.
-fn congested(queued_flushes: u64, queued_bound: u64, deferred_window: &VecDeque<u64>) -> bool {
-    queued_flushes > queued_bound
+fn congested(
+    routers: &[RouterQueue],
+    bound_override: Option<u64>,
+    deferred_window: &VecDeque<u64>,
+) -> bool {
+    routers
+        .iter()
+        .any(|router| router.queued_flushes > bound_override.unwrap_or(router.cap))
         || (deferred_window.len() == WINDOW_SAMPLES
             && deferred_window.iter().sum::<u64>() >= DEFERRED_TRIGGERS_PER_WINDOW)
 }
@@ -219,20 +257,24 @@ fn congested(queued_flushes: u64, queued_bound: u64, deferred_window: &VecDeque<
 /// The congestion detector: publishes [`congested`] into the shared gate
 /// once per sample.
 pub struct Detector {
-    queued_bound: u64,
+    bound_override: Option<u64>,
     gate: Arc<IngestHoldGate>,
 }
 
 impl Detector {
-    pub fn new(queued_bound: u64, gate: Arc<IngestHoldGate>) -> Self {
-        Detector { queued_bound, gate }
+    /// `bound_override` is `--ingest-hold-queued-flushes`: `Some` replaces
+    /// every router's cap as its bound.
+    pub fn new(bound_override: Option<u64>, gate: Arc<IngestHoldGate>) -> Self {
+        Detector {
+            bound_override,
+            gate,
+        }
     }
 
     /// Runs forever, sampling every 100 ms on `clock`. `sample` reads the
-    /// current figures across whichever of the metrics, log and span routers
-    /// this process built; the deferred count is cumulative, and the window
-    /// holds its per-sample deltas from a baseline read before the first
-    /// sleep.
+    /// current figures of whichever of the metrics, log and span routers this
+    /// process built; the deferred count is cumulative, and the window holds
+    /// its per-sample deltas from a baseline read before the first sleep.
     pub async fn run(
         self,
         clock: Arc<dyn Clock>,
@@ -250,8 +292,8 @@ impl Detector {
             }
             deferred_window.push_back(deferred_delta);
             self.gate.publish(congested(
-                now.queued_flushes,
-                self.queued_bound,
+                &now.routers,
+                self.bound_override,
                 &deferred_window,
             ));
         }
@@ -274,7 +316,13 @@ impl DetectorTask {
         clock: Arc<dyn Clock>,
         sample: impl Fn() -> CongestionSample + Send + 'static,
     ) -> Self {
-        DetectorTask(tokio::spawn(detector.run(clock, sample)))
+        #[cfg(any(test, feature = "ingest-hold-test-support"))]
+        let exit_mark = DetectorExitMark(detector.gate.clone());
+        DetectorTask(tokio::spawn(async move {
+            #[cfg(any(test, feature = "ingest-hold-test-support"))]
+            let _exit_mark = exit_mark;
+            detector.run(clock, sample).await;
+        }))
     }
 
     /// Spawns the detector for `config`, or nothing when its max wait is
@@ -304,6 +352,18 @@ impl DetectorTask {
     }
 }
 
+/// Test-only: marks the gate when the detector task's future is dropped,
+/// whether it was aborted or the runtime tore it down.
+#[cfg(any(test, feature = "ingest-hold-test-support"))]
+struct DetectorExitMark(Arc<IngestHoldGate>);
+
+#[cfg(any(test, feature = "ingest-hold-test-support"))]
+impl Drop for DetectorExitMark {
+    fn drop(&mut self) {
+        self.0.detector_exited.store(true, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -323,24 +383,80 @@ mod tests {
         deltas.iter().copied().collect()
     }
 
+    fn router(queued_flushes: u64, cap: u64) -> RouterQueue {
+        RouterQueue {
+            queued_flushes,
+            cap,
+        }
+    }
+
     /// 6e, the rule: the queued bound is exclusive, the deferred threshold
     /// inclusive, and a short window never counts on deferrals.
     #[test]
     fn congestion_rule_bounds() {
         let quiet = window(&[0; WINDOW_SAMPLES]);
-        assert!(!congested(16, 16, &quiet), "queued at the bound");
-        assert!(congested(17, 16, &quiet), "queued at bound + 1");
+        assert!(!congested(&[router(16, 16)], None, &quiet), "at the cap");
+        assert!(congested(&[router(17, 16)], None, &quiet), "at cap + 1");
 
         let nine = window(&[1, 1, 1, 1, 1, 1, 1, 1, 1, 0]);
-        assert!(!congested(0, 16, &nine), "9 deferrals in a full window");
+        assert!(
+            !congested(&[router(0, 16)], None, &nine),
+            "9 deferrals in a full window"
+        );
         let ten = window(&[1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
-        assert!(congested(0, 16, &ten), "10 deferrals in a full window");
+        assert!(
+            congested(&[router(0, 16)], None, &ten),
+            "10 deferrals in a full window"
+        );
 
         let short = window(&[100; WINDOW_SAMPLES - 1]);
         assert!(
-            !congested(0, 16, &short),
+            !congested(&[router(0, 16)], None, &short),
             "fewer than 10 samples never counts on deferrals"
         );
+    }
+
+    /// Each router is held to its own bound: two routers each under their
+    /// cap of 16 are not congested, though their queued flushes sum to 28,
+    /// above 16.
+    ///
+    /// Non-vacuity: a rule that sums the routers' queued flushes and compares
+    /// the sum against 16 reads this as congested.
+    #[test]
+    fn routers_each_under_their_own_bound_are_not_congested_whatever_their_sum() {
+        let quiet = window(&[0; WINDOW_SAMPLES]);
+        let routers = [router(14, 16), router(14, 16)];
+        assert!(!congested(&routers, None, &quiet));
+    }
+
+    /// One router one flush above its own cap is congested, while the others
+    /// sit idle.
+    #[test]
+    fn one_router_one_above_its_bound_is_congested() {
+        let quiet = window(&[0; WINDOW_SAMPLES]);
+        let routers = [router(0, 16), router(33, 32), router(0, 16)];
+        assert!(congested(&routers, None, &quiet));
+        let at_cap = [router(0, 16), router(32, 32), router(0, 16)];
+        assert!(!congested(&at_cap, None, &quiet), "at the cap is not over it");
+    }
+
+    /// `--ingest-hold-queued-flushes` replaces every router's cap: 20 queued
+    /// on a router capped at 32 is congested under an override of 16, and 20
+    /// queued on a router capped at 16 is not under an override of 32.
+    #[test]
+    fn the_override_replaces_every_routers_cap() {
+        let quiet = window(&[0; WINDOW_SAMPLES]);
+        assert!(!congested(&[router(20, 32)], None, &quiet));
+        assert!(congested(&[router(20, 32)], Some(16), &quiet));
+        assert!(congested(&[router(20, 16)], None, &quiet));
+        assert!(!congested(&[router(20, 16)], Some(32), &quiet));
+    }
+
+    #[test]
+    fn queued_flush_cap_is_shards_times_the_per_shard_cap_floored_at_one() {
+        assert_eq!(queued_flush_cap(4, 8), 32);
+        assert_eq!(queued_flush_cap(2, 8), 16);
+        assert_eq!(queued_flush_cap(4, 0), 4);
     }
 
     /// 6e, through the running detector: queued flushes alone flip the flag
@@ -350,10 +466,10 @@ mod tests {
         let gate = Arc::new(IngestHoldGate::new(Duration::from_secs(1)));
         let queued = Arc::new(AtomicU64::new(0));
         let queued_for_task = queued.clone();
-        let handle = tokio::spawn(Detector::new(16, gate.clone()).run(
+        let handle = tokio::spawn(Detector::new(None, gate.clone()).run(
             Arc::new(SystemClock),
             move || CongestionSample {
-                queued_flushes: queued_for_task.load(Ordering::Relaxed),
+                routers: vec![router(0, 4), router(queued_for_task.load(Ordering::Relaxed), 16)],
                 deferred_total: 0,
             },
         ));
@@ -379,10 +495,10 @@ mod tests {
         let gate = Arc::new(IngestHoldGate::new(Duration::from_secs(1)));
         let deferred = Arc::new(AtomicU64::new(0));
         let deferred_for_task = deferred.clone();
-        let handle = tokio::spawn(Detector::new(16, gate.clone()).run(
+        let handle = tokio::spawn(Detector::new(None, gate.clone()).run(
             Arc::new(SystemClock),
             move || CongestionSample {
-                queued_flushes: 0,
+                routers: vec![router(0, 16)],
                 deferred_total: deferred_for_task.load(Ordering::Relaxed),
             },
         ));
@@ -427,10 +543,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn deferred_is_a_per_sample_delta_not_the_raw_cumulative_counter() {
         let gate = Arc::new(IngestHoldGate::new(Duration::from_secs(1)));
-        let handle = tokio::spawn(Detector::new(16, gate.clone()).run(
+        let handle = tokio::spawn(Detector::new(None, gate.clone()).run(
             Arc::new(SystemClock),
             || CongestionSample {
-                queued_flushes: 0,
+                routers: vec![router(0, 16)],
                 deferred_total: 1000,
             },
         ));
@@ -498,7 +614,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn zero_max_wait_spawns_no_detector_and_never_holds() {
         let config = IngestHoldConfig {
-            queued_flushes: 16,
+            queued_flushes: None,
             max_wait: Duration::ZERO,
         };
         let gate = Arc::new(IngestHoldGate::new(config.max_wait));
@@ -507,10 +623,7 @@ mod tests {
         let task =
             DetectorTask::spawn_for(&config, gate.clone(), Arc::new(SystemClock), move || {
                 sampled_for_task.store(true, Ordering::Relaxed);
-                CongestionSample {
-                    queued_flushes: 0,
-                    deferred_total: 0,
-                }
+                CongestionSample::default()
             });
         assert!(task.is_none(), "no detector for a zero max wait");
         tick().await;
@@ -527,13 +640,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn nonzero_max_wait_spawns_the_detector() {
         let config = IngestHoldConfig {
-            queued_flushes: 16,
+            queued_flushes: None,
             max_wait: Duration::from_secs(1),
         };
         let gate = Arc::new(IngestHoldGate::new(config.max_wait));
         let task = DetectorTask::spawn_for(&config, gate.clone(), Arc::new(SystemClock), || {
             CongestionSample {
-                queued_flushes: 17,
+                routers: vec![router(17, 16)],
                 deferred_total: 0,
             }
         })
@@ -541,7 +654,12 @@ mod tests {
         tokio::task::yield_now().await;
         tick().await;
         assert!(gate.is_congested());
+        assert!(!gate.detector_exited_for_test(), "running");
         task.stop().await;
+        assert!(
+            gate.detector_exited_for_test(),
+            "stop returns once the task has exited"
+        );
     }
 
     /// The closed-loop plant behind the #3756 decision, ported line for line
@@ -555,7 +673,9 @@ mod tests {
         const COST_BAD: f64 = 75e-6;
         const TIP: f64 = 300_000.0;
         const RECOVER: f64 = 60_000.0;
-        /// Declared by the reference and never read by it.
+        /// The reference reads this to fill its deferral window `def_w`, which
+        /// only its shed laws read; law_off ignores it, so the port keeps
+        /// neither in use.
         #[allow(dead_code)]
         const DEFER: f64 = 150_000.0;
         pub(super) const HOLD: f64 = 100_000.0;
@@ -746,11 +866,12 @@ mod tests {
         assert!(above_tip.collapsed_share > 0.5, "{above_tip:?}");
     }
 
-    /// Case B: 320k, twice capacity, for 80 s.
+    /// Case B: 320k, twice capacity, for 80 s. The bar is the Python
+    /// reference's: 0.95 x its 163.3 capacity figure, 155.1.
     #[test]
     fn plant_case_b_hold_stores_capacity_under_double_load() {
         let hold = plant_span(&[(0.0, 320_000.0)], 80.0, Some(plant::HOLD), 20.0, 80.0);
-        assert!(hold.stored >= 155.0, "{hold:?}");
+        assert!(hold.stored >= 0.95 * 163.3, "{hold:?}");
         assert_eq!(hold.collapsed_share, 0.0, "{hold:?}");
     }
 

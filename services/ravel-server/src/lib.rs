@@ -1185,12 +1185,11 @@ pub struct Running {
     #[cfg(any(test, feature = "ingest-hold-test-support"))]
     pub ingest_hold: Arc<ingest_hold::IngestHoldGate>,
     /// ADR-3718's background backlog detector, `Some` exactly when
-    /// `--ingest-hold-max-wait` is above 0. Stopped (aborted and
-    /// awaited) at the top of [`Running::shutdown`], before the ingest
-    /// routers are drained: left running, it is a long-lived task that never
-    /// releases its own clones of whatever it captures, which is exactly the
-    /// shape of handle that keeps [`drain_router`]'s best-effort
-    /// `Arc::try_unwrap` from ever seeing sole ownership.
+    /// `--ingest-hold-max-wait` is above 0. Stopped (aborted and awaited) in
+    /// [`Running::shutdown`] after the listener join and the idle-tenant sweep
+    /// stop, and before the ingest routers are drained: it captures metrics
+    /// handles rather than router clones, but left running it is a task with
+    /// no owner left to join it.
     ingest_hold_detector_task: Option<ingest_hold::DetectorTask>,
     /// Whether every router [`drain_router`] was given during this shutdown
     /// actually reached sole ownership and joined its shard actors, read
@@ -1452,6 +1451,52 @@ fn ingest_health_sources(
         sources.push(router.metrics_handle() as Arc<dyn health::IngestHealth>);
     }
     sources
+}
+
+/// The sampler ADR-3718's head-hold detector polls: one
+/// [`ingest_hold::RouterQueue`] per configured ingest router, carrying that
+/// router's queued flushes and its own queued-flush cap (its shard count times
+/// `max_queued_flushes`, the value every router is built with), plus the
+/// routers' summed deferred-flush-trigger counters.
+///
+/// Captures metrics handles only, never router `Arc` clones, for the reason
+/// [`ingest_health_sources`] gives: a clone held by the detector would keep
+/// [`drain_router`]'s `Arc::try_unwrap` from joining the shard actors.
+fn ingest_hold_sample_source(
+    metrics_router: Option<&Arc<IngestRouter>>,
+    log_router: Option<&Arc<LogIngestRouter>>,
+    span_router: Option<&Arc<SpanIngestRouter>>,
+    max_queued_flushes: u32,
+) -> impl Fn() -> ingest_hold::CongestionSample + Send + 'static {
+    let cap = |shards: u32| ingest_hold::queued_flush_cap(shards, max_queued_flushes);
+    let metrics = metrics_router.map(|r| (r.metrics_handle(), cap(r.shard_count())));
+    let log = log_router.map(|r| (r.metrics_handle(), cap(r.shard_count())));
+    let span = span_router.map(|r| (r.metrics_handle(), cap(r.shard_count())));
+    move || {
+        let mut sample = ingest_hold::CongestionSample::default();
+        if let Some((m, cap)) = &metrics {
+            sample.routers.push(ingest_hold::RouterQueue {
+                queued_flushes: m.snapshot().flushes_queued_total,
+                cap: *cap,
+            });
+            sample.deferred_total += m.flush_trigger_deferred_total();
+        }
+        if let Some((m, cap)) = &log {
+            sample.routers.push(ingest_hold::RouterQueue {
+                queued_flushes: m.snapshot().flushes_queued_total,
+                cap: *cap,
+            });
+            sample.deferred_total += m.flush_trigger_deferred_total();
+        }
+        if let Some((m, cap)) = &span {
+            sample.routers.push(ingest_hold::RouterQueue {
+                queued_flushes: m.snapshot().flushes_queued_total,
+                cap: *cap,
+            });
+            sample.deferred_total += m.flush_trigger_deferred_total();
+        }
+        sample
+    }
 }
 
 /// Attempt to flush a router's buffers, then join its shard actors only as a
@@ -2904,44 +2949,24 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         ingest_hold::IngestHoldGate::new(config.ingest_hold.max_wait),
     );
 
-    // ADR-3718, flush-backlog hold amendment: the detector samples the sum of
-    // every ingest router's queued flushes and deferred-flush-trigger
-    // counter, and publishes a congested flag into the hold gate every ingest
-    // admission path already reads off `ingest_concurrency`
-    // (`crate::ingest_admission`). `spawn_for` spawns nothing when
-    // `--ingest-hold-max-wait` is 0, since the gate then never holds.
-    //
-    // Metrics handles only, never router `Arc` clones: the same rule
-    // `ingest_health_sources` follows. A router clone held by this closure
-    // would keep `Arc::try_unwrap` in `drain_router` from ever seeing sole
-    // ownership, so graceful shutdown's shard-actor join would silently stop
-    // joining for as long as the detector task runs.
-    let ingest_hold_detector_task = {
-        let metrics_handle = ingest_router.as_ref().map(|r| r.metrics_handle());
-        let log_handle = log_ingest_router.as_ref().map(|r| r.metrics_handle());
-        let span_handle = span_ingest_router.as_ref().map(|r| r.metrics_handle());
-        ingest_hold::DetectorTask::spawn_for(
-            &config.ingest_hold,
-            ingest_concurrency.ingest_hold_handle(),
-            Arc::new(SystemClock),
-            move || {
-                let mut sample = ingest_hold::CongestionSample::default();
-                if let Some(m) = &metrics_handle {
-                    sample.queued_flushes += m.snapshot().flushes_queued_total;
-                    sample.deferred_total += m.flush_trigger_deferred_total();
-                }
-                if let Some(m) = &log_handle {
-                    sample.queued_flushes += m.snapshot().flushes_queued_total;
-                    sample.deferred_total += m.flush_trigger_deferred_total();
-                }
-                if let Some(m) = &span_handle {
-                    sample.queued_flushes += m.snapshot().flushes_queued_total;
-                    sample.deferred_total += m.flush_trigger_deferred_total();
-                }
-                sample
-            },
-        )
-    };
+    // ADR-3718, flush-backlog hold amendment: the detector samples each
+    // ingest router's queued flushes against that router's own bound, plus
+    // the routers' deferred-flush-trigger counters, and publishes a congested
+    // flag into the hold gate every ingest admission path already reads off
+    // `ingest_concurrency` (`crate::ingest_admission`). `spawn_for` spawns
+    // nothing when `--ingest-hold-max-wait` is 0, since the gate then never
+    // holds.
+    let ingest_hold_detector_task = ingest_hold::DetectorTask::spawn_for(
+        &config.ingest_hold,
+        ingest_concurrency.ingest_hold_handle(),
+        Arc::new(SystemClock),
+        ingest_hold_sample_source(
+            ingest_router.as_ref(),
+            log_ingest_router.as_ref(),
+            span_ingest_router.as_ref(),
+            config.max_queued_flushes,
+        ),
+    );
 
     // Per-tenant wire (compressed) request-body byte counter (ADR-0084 decision
     // 5): one shared instance per process, threaded into every `GatewayState`
@@ -5171,6 +5196,17 @@ mod shutdown_drain_tests {
         );
     }
 
+    /// A request held at the head (ADR-3718) when shutdown starts is answered
+    /// within the listener join at the default `--shutdown-timeout`: the
+    /// longest accepted `--ingest-hold-max-wait` equals that join budget.
+    #[test]
+    fn ingest_hold_max_wait_limit_is_the_default_listener_join_budget() {
+        assert_eq!(
+            config::INGEST_HOLD_MAX_WAIT_LIMIT,
+            listener_join_budget(DEFAULT_SHUTDOWN_TIMEOUT)
+        );
+    }
+
     /// The listener join sub-budget must be strictly below the whole shutdown
     /// timeout AND leave a positive reserve for the remaining drain steps, so the
     /// listener join can never starve them. This is the numeric relation
@@ -5320,6 +5356,75 @@ mod shutdown_drain_tests {
             readiness.is_ready(),
             "the health sources must keep answering after the routers are dropped"
         );
+    }
+
+    /// ADR-3718, flush-backlog hold amendment: with no
+    /// `--ingest-hold-queued-flushes`, each router's hold bound is its own
+    /// queued-flush cap, shard count times `--max-queued-flushes`; at
+    /// `--shards 4` and the default 8 that is 32 for every router. The sampler
+    /// holds no router clone, so `drain_router` can still join the actors.
+    #[tokio::test]
+    async fn ingest_hold_default_bound_is_shards_times_max_queued_flushes() {
+        let cli = <crate::config::Cli as clap::Parser>::try_parse_from([
+            "ravel-server",
+            "--shards",
+            "4",
+        ])
+        .expect("cli parses");
+        let max_queued_flushes = cli.resolve_flush_concurrency().max_queued_flushes;
+        assert_eq!(max_queued_flushes, 8);
+        assert_eq!(cli.resolve_ingest_hold().queued_flushes, None);
+        let ingest_config = IngestConfig {
+            shard_count: cli.shards,
+            max_queued_flushes: max_queued_flushes as usize,
+            ..IngestConfig::default()
+        };
+        let store = Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let router = Arc::new(IngestRouter::new(
+            ingest_config.clone(),
+            store.clone(),
+            Signal::Metrics,
+            Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
+        ));
+        let log_router = Arc::new(LogIngestRouter::new(
+            ingest_config.clone(),
+            store.clone(),
+            Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
+        ));
+        let span_router = Arc::new(SpanIngestRouter::new(
+            ingest_config,
+            store,
+            Arc::new(SystemClock),
+            Arc::new(PendingAckBudget::new(0)),
+        ));
+
+        let sample = ingest_hold_sample_source(
+            Some(&router),
+            Some(&log_router),
+            Some(&span_router),
+            max_queued_flushes,
+        );
+        let taken = sample();
+        assert_eq!(
+            taken.routers,
+            vec![
+                ingest_hold::RouterQueue {
+                    queued_flushes: 0,
+                    cap: 32,
+                };
+                3
+            ]
+        );
+        assert_eq!(taken.deferred_total, 0);
+        assert_eq!(Arc::strong_count(&router), 1);
+        assert_eq!(Arc::strong_count(&log_router), 1);
+        assert_eq!(Arc::strong_count(&span_router), 1);
+
+        drain_router(Some(router), "metrics").await;
+        drain_router(Some(log_router), "log").await;
+        drain_router(Some(span_router), "span").await;
     }
 
     /// A fake [`DrainRouter`] recording that its flush and join ran, so the

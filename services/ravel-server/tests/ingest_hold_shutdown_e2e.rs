@@ -3,10 +3,10 @@
 //! `Running::shutdown` best-effort-joins each ingest router's shard actors by
 //! `Arc::try_unwrap`-ing it (`drain_router` in `services/ravel-server/src/
 //! lib.rs`): that only succeeds once every other strong reference is gone.
-//! The ingest-hold detector task, once spawned, must therefore be stopped
-//! before that join runs, and must never itself hold a router `Arc` clone in
-//! the first place. This file proves the join still happens with the
-//! detector enabled and sampling.
+//! The ingest-hold detector task must never hold a router `Arc` clone, and
+//! shutdown must stop it rather than leave it running with no owner. This
+//! file proves the detector task has exited when shutdown returns and that
+//! the join still happens with the detector enabled and sampling.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -87,7 +87,7 @@ async fn start_test_server_with_detector(
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
         ingest_hold: IngestHoldConfig {
-            queued_flushes: 16,
+            queued_flushes: None,
             max_wait: Duration::from_secs(1),
         },
         max_pending_strict_acks: 8_192,
@@ -111,15 +111,18 @@ async fn start_test_server_with_detector(
 }
 
 /// With the ADR-3718 detector enabled and genuinely sampling (not merely
-/// configured), graceful shutdown still joins every ingest router's shard
-/// actors.
+/// configured), graceful shutdown stops the detector task and still joins
+/// every ingest router's shard actors.
 ///
-/// Distinguishing test: a detector whose sample closure captured a full
-/// `Arc<IngestRouter>` clone (rather than `.metrics_handle()`), or whose
-/// task was never stopped before the `drain_router` calls (the
-/// `ingest_hold_detector_task` stop in `Running::shutdown`), keeps a router
-/// clone alive past the point `drain_router`'s `Arc::try_unwrap` needs sole
-/// ownership, and `shard_actors_joined_handle()` reads `false`.
+/// What this pins: the detector task has exited by the time
+/// `Running::shutdown` returns (deleting the `ingest_hold_detector_task`
+/// stop there leaves `detector_exited_for_test()` false, since the task then
+/// outlives the shutdown on the test's runtime), and the shard-actor join
+/// still succeeds with the detector sampling. It does not pin that the stop
+/// runs before rather than after the `drain_router` calls. A sample closure
+/// capturing a router `Arc` clone is pinned by the unit test
+/// `ingest_hold_default_bound_is_shards_times_max_queued_flushes` in
+/// `src/lib.rs`, which checks each router's strong count.
 #[tokio::test]
 async fn shutdown_joins_shard_actors_with_the_detector_running() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -130,9 +133,18 @@ async fn shutdown_joins_shard_actors_with_the_detector_running() {
     // it.
     tokio::time::sleep(Duration::from_millis(350)).await;
 
+    let gate = running.ingest_hold.clone();
+    assert!(
+        !gate.detector_exited_for_test(),
+        "the detector task runs until shutdown"
+    );
     let joined = running.shard_actors_joined_handle();
     running.shutdown().await.expect("graceful shutdown");
 
+    assert!(
+        gate.detector_exited_for_test(),
+        "shutdown must stop the ADR-3718 detector task before it returns"
+    );
     assert!(
         joined.load(Ordering::SeqCst),
         "shutdown must join every ingest router's shard actors even while \

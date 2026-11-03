@@ -1753,6 +1753,52 @@ mod tests {
         );
     }
 
+    /// 6b over gRPC: congested for 300 ms and then cleared, an export held at
+    /// the head reaches the service behind the layer exactly once, after the
+    /// clear, and is answered with that service's own response, counted once
+    /// as admitted.
+    ///
+    /// Non-vacuity: answering the admitted export with the hold's refusal
+    /// status instead fails the status check, and skipping the inner call
+    /// after the hold fails the call count.
+    #[tokio::test(start_paused = true)]
+    async fn congestion_cleared_within_the_max_wait_admits_the_held_grpc_export() {
+        let controller = IngestConcurrencyController::shared_with_hold(
+            IngestConcurrencyLimit::Bounded(1),
+            IngestHoldGate::new(Duration::from_secs(1)),
+        );
+        controller.ingest_hold().force_for_test(Some(true));
+        let inner = CountingInner::default();
+        let mut service = layer(&controller).layer(inner.clone());
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let request = poisoned_request(EXPORT_PATH, polls, Some(TOKEN));
+        let held = tokio::spawn(async move { service.call(request).await });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!held.is_finished(), "still held while congested");
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            0,
+            "the inner service is not reached while held"
+        );
+        controller.ingest_hold().force_for_test(Some(false));
+
+        let response = tokio::time::timeout(TEST_DEADLINE, held)
+            .await
+            .expect("the held export is answered after the clear")
+            .expect("task does not panic")
+            .expect("the layer is infallible");
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            tonic::Status::from_header_map(response.headers()).is_none(),
+            "the inner service's own response, not the hold's refusal status"
+        );
+        let gate = controller.ingest_hold();
+        assert_eq!(gate.hold_total(HoldOutcome::Admitted), 1);
+        assert_eq!(gate.hold_total(HoldOutcome::Refused), 0);
+    }
+
     /// 6c over gRPC: congested throughout, an export is answered
     /// RESOURCE_EXHAUSTED with the hold's message at the max wait, without
     /// its body being polled or the service behind the layer being reached.

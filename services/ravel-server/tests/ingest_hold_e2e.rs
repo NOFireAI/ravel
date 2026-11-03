@@ -169,7 +169,7 @@ async fn start_test_server(
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
         ingest_hold: IngestHoldConfig {
-            queued_flushes: 16,
+            queued_flushes: None,
             max_wait,
         },
         max_pending_strict_acks: 8_192,
