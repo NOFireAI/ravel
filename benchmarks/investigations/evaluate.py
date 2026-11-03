@@ -22,44 +22,52 @@ present exactly once: absent is `missing`, two inputs for it are
 `duplicate` (never the last of them), a figure this build cannot produce is
 `unsupported-on-this-build` with its reason, and a figure of a row whose
 tenant, state, scale or baseline the run lacks is `not-run` with the reason.
-Each answer is judged here against truth.json, under the truth key
-statements.toml gives the call; a call whose rows differ from the oracle, or
-that names another key, is `wrong_answer`. Exit 0 only when nothing is missing,
-duplicated, wrong or outside its band; 1 otherwise; 64 on usage.
+Only the fields ALLOWLISTED below may read as unsupported when a successful
+call lacks them; any other absent field is `missing`, and no figure
+defaults to 0. Each answer is judged here against truth.json, under the
+truth key statements.toml gives the call, or, in the states whose oracle is
+the unfolded run, against the unfolded call of the same statement and try;
+a call whose rows differ from its oracle, or that names another key, is
+`wrong_answer`. Exit 0 only when nothing is missing, duplicated, wrong,
+dead or outside its band; 1 otherwise; 64 on usage.
 """
 
 import argparse
 import json
 import math
 import os
+import re
 import sys
 import tomllib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UNSUPPORTED = "unsupported-on-this-build"
 PHASES = ("resolve", "plan", "probe", "scan", "keyIndex")
-# leaf_rebuild is the folded_leaves state's `--rebuild-key-index` step: the
-# leaves fold before it re-encodes nothing when the plain fold already sealed
-# every hour.
-FOLD_ORDER = ("folded_no_leaves", "folded_leaves", "leaf_rebuild", "fold_advance")
-LEAF_TRANSITIONS = ("folded_leaves", "leaf_rebuild", "fold_advance")
+PHASE_FIELDS = ("s3GetRequests", "s3GetWireBytes", "s3ListRequests", "segmentsOpened",
+                "decompressedOutputBytes", "cacheServedBytes")
+# States whose oracle is the unfolded state's own answer to the same
+# statement and try: their data is the unfolded data mid-rewrite.
+ORACLE_STATES = ("compaction_in_flight", "compaction_done", "erasure_in_flight")
+# States run.sh enters as a step of another one: live exactly when it is.
+DERIVED = {"fold_advance": "mixed", "compaction_done": "compaction_in_flight"}
+INFLIGHT_STATES = ("compaction_in_flight",)
 SIGNALS = ("spans", "logs")
-# The census class of each signal's own objects (docs/catalog-and-mvcc.md):
-# t/<tenant_hash>/s/... and t/<tenant_hash>/l/...; leaves sit under catalog/.
-SIGNAL_CLASS = {"spans": "s", "logs": "l"}
 
-# A statement metric read from a nested stats member: absent from a call's
-# stats means this build does not report it.
-STATS_PATHS = {
-    "leaf_gets": ("keyIndex", "leafGets"),
-    "parts_covered": ("keyIndex", "partsCovered"),
-    "keys_probed": ("keyIndex", "keysProbed"),
-    "parts_beyond_ceiling": ("keyIndex", "partsBeyondCeiling"),
-    "skip_idx_dropped": ("pruning", "skipIdxDropped"),
-    "blocks_scanned": ("pruning", "blocksScanned"),
-    "segments": ("pruning", "segments"),
-    "dependency_depth": ("io", "dependencyDepth"),
+# The only stats fields this build does not report. A successful call lacking
+# one of them reads unsupported-on-this-build; lacking anything else, missing.
+KEY_INDEX_METRICS = {
+    "leaf_gets": "leafGetRequests",
+    "parts_covered": "partsCovered",
+    "parts_uncovered": "partsUncovered",
+    "parts_beyond_ceiling": "partsBeyondCeiling",
+    "leaves_rejected": "leavesRejected",
+    "reservations_refused": "reservationsRefused",
+    "keys_probed": "keysProbed",
 }
+ALLOWLIST_BREAKDOWNS = {"per_object": "stats carry no per-object breakdown",
+                        "per_part": "stats carry no per-part breakdown"}
+# Fold report fields this build does not write.
+FOLD_ALLOWLIST = ("key_index_build_passes", "head_bytes_per_part_field")
 
 # Fold report fields under their names in a `catalog fold --json` report and
 # in a `--rebuild-key-index` report.
@@ -70,6 +78,7 @@ FOLD_FIELDS = {
 }
 
 PRICE_KEYS = ("get_per_1000", "put_per_1000", "storage_gb_month", "instance_per_hour")
+COMPLEXITY_REFUSAL = "statement complexity"
 
 
 class Problems:
@@ -77,7 +86,9 @@ class Problems:
         self.lines = []
 
     def add(self, kind, what):
-        self.lines.append(f"{kind} {what}")
+        line = f"{kind} {what}"
+        if line not in self.lines:
+            self.lines.append(line)
 
 
 def load_jsonl(path, problems, name):
@@ -121,23 +132,94 @@ def rnd(v):
     return round(v, 9) if isinstance(v, float) else v
 
 
+def where(c):
+    return f"{c.get('statement')}/{c.get('state')}/{c.get('temp', 'cold')} try {c.get('try', 0)}"
+
+
+# --- the run's configuration and states ---------------------------------------
+
+
+def load_cfg(run_dir, problems):
+    path = os.path.join(run_dir, "run.toml")
+    if not os.path.exists(path):
+        problems.add("missing", "run.toml")
+        return None
+    with open(path, "rb") as f:
+        doc = tomllib.load(f)
+    run = doc.get("run", {})
+    cfg = {
+        "lane": run.get("lane"),
+        "states": run.get("states", []),
+        "cold_runs": run.get("cold_runs"),
+        "warm_runs": run.get("warm_runs", 1),
+        "hits": run.get("hits", False),
+        "scales": run.get("scales", [1]),
+        "baseline": run.get("baseline", False),
+        "tenant": doc.get("server", {}).get("tenant", "inv"),
+        "prices": doc.get("prices", {}),
+        "cost": doc.get("cost", {}),
+    }
+    for k in ("lane", "cold_runs"):
+        if cfg[k] is None:
+            problems.add("missing", f"run.toml run.{k}")
+    if cfg["cold_runs"] is None:
+        cfg["cold_runs"] = 0
+    for k in PRICE_KEYS:
+        if not isinstance(cfg["prices"].get(k), (int, float)):
+            problems.add("missing", f"run.toml prices.{k}")
+            cfg["prices"][k] = 0.0
+    return cfg
+
+
+def live_states(cfg, not_run, all_states):
+    """{state: None if live else the reason it is not}."""
+    out = {}
+    for s in all_states:
+        parent = DERIVED.get(s)
+        if s in cfg["states"] or (parent and parent in cfg["states"]):
+            reason = not_run.get(s) or (not_run.get(parent) if parent else None)
+            out[s] = reason
+        else:
+            out[s] = not_run.get(s) or "not in run.toml states"
+    return out
+
+
+def tenant_of(state, label, cfg):
+    if state.startswith("many_parts_"):
+        return "mp" + state[len("many_parts_"):]
+    return "hits" if label == "hits" else cfg["tenant"]
+
+
+def labels_of(state, cfg):
+    if state.startswith("many_parts_"):
+        return ["spans"]
+    return list(SIGNALS) + (["hits"] if cfg["hits"] else [])
+
+
+def signal_of(label):
+    return "logs" if label == "hits" else label
+
+
 # --- answers ------------------------------------------------------------------
 
 
 def truth_key_of(call, statements, cold_runs):
     """The truth key statements.toml gives this call, or None for an unknown
-    statement. A saved-trace statement's cold try i reads saved trace i and
-    its warm repeat the last cold try's (box/lib/inv.py plan)."""
+    statement. A saved-trace statement's cold (or in-flight) try i reads saved
+    trace i and its warm repeat the last cold try's; a many-parts state reads
+    its own corpus's answers (box/lib/inv.py plan)."""
     sid = call.get("statement") or ""
     if sid.startswith("control_"):
         return "hits.control"
     st = statements.get(sid)
     if st is None:
         return None
+    state = call.get("state") or ""
+    sub = state if state.startswith("many_parts_") else st.get("truth_sub")
     run = 0
     if st.get("per_run") == "saved_trace":
-        run = call.get("try", 0) if call.get("temp", "cold") == "cold" else (cold_runs or 1) - 1
-    return st["truth_key"].replace("{run}", str(run))
+        run = (cold_runs or 1) - 1 if call.get("temp", "cold") == "warm" else call.get("try", 0)
+    return (f"{sub}." if sub else "") + st["truth_key"].replace("{run}", str(run))
 
 
 def judge(call, answers, key):
@@ -164,56 +246,96 @@ def judge(call, answers, key):
     return "correct", ""
 
 
-# --- per-call metrics ---------------------------------------------------------
+def answer_of(c):
+    if "values" in c:
+        return ("values", sorted(str(v).lower() for v in c["values"]))
+    return ("sha256", c.get("values_sha256"))
 
 
-def call_metrics(stats):
-    """(metrics, unsupported reasons) of one call's stats member."""
-    vals, unsup = {}, {}
-    phases = {}
-    if isinstance(stats.get("phases"), list):
-        phases = {p.get("phase"): p for p in stats["phases"] if isinstance(p, dict)}
-    else:
-        unsup["phases"] = "stats carry no phases list"
+def same_answer(a, b):
+    return a.get("rows") == b.get("rows") and answer_of(a) == answer_of(b)
 
-    def ph(name, field):
-        return int(phases.get(name, {}).get(field, 0) or 0)
 
-    if phases:
-        for p in PHASES:
-            vals[f"{p.lower()}_gets"] = ph(p, "s3GetRequests")
-            vals[f"{p.lower()}_wire_bytes"] = ph(p, "s3GetWireBytes")
-        vals["total_gets"] = sum(ph(p, "s3GetRequests") for p in phases)
-        vals["data_gets"] = ph("probe", "s3GetRequests") + ph("scan", "s3GetRequests")
-        vals["list_requests"] = sum(ph(p, "s3ListRequests") for p in phases)
-        vals["wire_bytes"] = sum(ph(p, "s3GetWireBytes") for p in phases)
-        vals["decompressed_bytes"] = sum(ph(p, "decompressedOutputBytes") for p in phases)
-        vals["segments_opened"] = sum(ph(p, "segmentsOpened") for p in phases)
-    else:
-        for name in ("total_gets", "data_gets", "list_requests", "wire_bytes", "decompressed_bytes",
-                     "segments_opened", "keyindex_gets", "scan_gets", "probe_gets", "resolve_gets",
-                     "scan_wire_bytes", "probe_wire_bytes"):
-            unsup[name] = "stats carry no phases list"
-    for name, (member, field) in STATS_PATHS.items():
-        obj = stats.get(member)
-        if isinstance(obj, dict) and field in obj:
-            vals[name] = obj[field]
+# --- per-call validation and metrics ------------------------------------------
+
+
+def validate_call(c, problems):
+    """Mark an ok call that lacks a field it must carry; True when valid."""
+    at = where(c)
+    lacking = [k for k in ("wall_s", "server_cpu_s", "server_hwm_bytes", "rows", "stats") if k not in c]
+    stats = c.get("stats")
+    if isinstance(stats, dict):
+        phases = stats.get("phases")
+        if not isinstance(phases, list):
+            lacking.append("stats.phases")
         else:
-            unsup[name] = f"stats carry no {member}.{field}"
-    if isinstance(stats.get("signals"), list):
-        vals["signals_entries"] = len(stats["signals"])
-    else:
-        unsup["signals_entries"] = "stats carry no signals list"
-    return vals, unsup
+            by = {p.get("phase"): p for p in phases if isinstance(p, dict)}
+            for p in PHASES:
+                if p not in by:
+                    lacking.append(f"stats.phases.{p}")
+                    continue
+                lacking += [f"stats.phases.{p}.{f}" for f in PHASE_FIELDS if f not in by[p]]
+        for member, field in (("pruning", "blocksScanned"), ("pruning", "segments"), ("io", "dependencyDepth")):
+            if not isinstance(stats.get(member), dict) or field not in stats[member]:
+                lacking.append(f"stats.{member}.{field}")
+        if not isinstance(stats.get("signals"), list):
+            lacking.append("stats.signals")
+    elif "stats" in c:
+        lacking.append("stats")
+    for name in lacking:
+        problems.add("missing", f"{name} in {at}")
+    if lacking:
+        c["_invalid"] = lacking[0]
+    return not lacking
+
+
+def phase_map(stats):
+    return {p["phase"]: p for p in stats["phases"]}
+
+
+def call_metrics(c):
+    """Every metric of one validated ok call."""
+    stats = c["stats"]
+    ph = phase_map(stats)
+    v = {}
+    for p in PHASES:
+        v[f"{p.lower()}_gets"] = ph[p]["s3GetRequests"]
+        v[f"{p.lower()}_wire_bytes"] = ph[p]["s3GetWireBytes"]
+    v["total_gets"] = sum(ph[p]["s3GetRequests"] for p in PHASES)
+    v["data_gets"] = ph["probe"]["s3GetRequests"] + ph["scan"]["s3GetRequests"]
+    v["list_requests"] = sum(ph[p]["s3ListRequests"] for p in PHASES)
+    v["wire_bytes"] = sum(ph[p]["s3GetWireBytes"] for p in PHASES)
+    v["decompressed_bytes"] = sum(ph[p]["decompressedOutputBytes"] for p in PHASES)
+    v["segments_opened"] = sum(ph[p]["segmentsOpened"] for p in PHASES)
+    v["cache_served_bytes"] = sum(ph[p]["cacheServedBytes"] for p in PHASES)
+    v["blocks_scanned"] = stats["pruning"]["blocksScanned"]
+    v["segments"] = stats["pruning"]["segments"]
+    v["dependency_depth"] = stats["io"]["dependencyDepth"]
+    v["signals_entries"] = len(stats["signals"])
+    v["rows"] = c["rows"]
+    return v
+
+
+def allowlisted(c, name):
+    """(value, None) or (None, unsupported reason) for an allowlisted metric."""
+    stats = c["stats"]
+    if name == "skip_idx_dropped":
+        if "skipIdxDropped" in stats["pruning"]:
+            return stats["pruning"]["skipIdxDropped"], None
+        return None, "stats carry no pruning.skipIdxDropped on this build"
+    field = KEY_INDEX_METRICS[name]
+    ki = stats.get("keyIndex")
+    if isinstance(ki, dict) and field in ki:
+        return ki[field], None
+    return None, f"stats carry no keyIndex.{field} on this build"
 
 
 # --- the run's calls ----------------------------------------------------------
 
 
 class Calls:
-    def __init__(self, calls, answers, problems, statements, cold_runs):
+    def __init__(self, calls, problems):
         self.groups = {}  # (statement, state, temp) -> {try: [lines]}
-        self.unsupported = {}  # (statement, state, temp) -> reason
         self.wrong = []
         self.errors = []
         self.unjudged = 0
@@ -225,88 +347,223 @@ class Calls:
                 if len(lines) > 1:
                     problems.add("duplicate", f"call {key[0]}/{key[1]}/{key[2]} try {t}")
                 for c in lines:
-                    if c.get("outcome") == UNSUPPORTED:
-                        self.unsupported[key] = c.get("reason") or "no reason given"
+                    outcome = c.get("outcome")
+                    if outcome == "ok":
+                        validate_call(c, problems)
+                    elif outcome in (UNSUPPORTED, "not-run"):
                         if not c.get("reason"):
-                            problems.add("missing", f"reason for unsupported {key[0]}/{key[1]}")
-                    elif c.get("outcome") == "ok":
-                        verdict, detail = judge(c, answers, truth_key_of(c, statements, cold_runs))
-                        c["_judged"] = verdict
-                        if verdict == "wrong_answer":
-                            self.wrong.append(f"{key[0]}/{key[1]}/{key[2]} try {t}: {detail}")
-                        elif verdict == "unjudged":
-                            self.unjudged += 1
+                            problems.add("missing", f"reason for {outcome} {where(c)}")
+                        if outcome == UNSUPPORTED and "http_status" in c and "wall_s" not in c:
+                            problems.add("missing", f"wall_s in {where(c)}")
                     else:
                         c["_judged"] = "error"
-                        self.errors.append(f"{key[0]}/{key[1]}/{key[2]} try {t}: HTTP {c.get('http_status')}")
+                        self.errors.append(f"{where(c)}: outcome {outcome!r} HTTP {c.get('http_status')}")
 
     def tries(self, statement, state, temp):
         return self.groups.get((statement, state, temp), {})
 
+    def judge_all(self, answers, statements, cfg, problems):
+        """Judge every ok call: against truth, or against its unfolded twin."""
+        for key, tries in sorted(self.groups.items()):
+            statement, state, temp = key
+            st = statements.get(statement or "")
+            for t, lines in sorted(tries.items()):
+                for c in lines:
+                    if c.get("outcome") != "ok":
+                        continue
+                    tk = truth_key_of(c, statements, cfg["cold_runs"])
+                    unfolded_oracle = st is not None and (
+                        state in ORACLE_STATES or (st.get("oracle") == "unfolded" and state != "unfolded"))
+                    if st is not None and st.get("oracle") == "unfolded" and state == "unfolded":
+                        if c.get("truth_key") != tk:
+                            verdict, detail = "wrong_answer", (f"call names truth key {c.get('truth_key')!r}, "
+                                                               f"statements.toml gives {tk!r}")
+                        else:
+                            verdict, detail = "reference", ""
+                    elif unfolded_oracle:
+                        verdict, detail = self.judge_against_unfolded(c, tk, problems)
+                    else:
+                        verdict, detail = judge(c, answers, tk)
+                    c["_judged"] = verdict
+                    if verdict == "wrong_answer":
+                        self.wrong.append(f"{where(c)}: {detail}")
+                    elif verdict == "unjudged":
+                        self.unjudged += 1
 
-def expected_tries(temp, cfg):
-    return cfg["cold_runs"] if temp == "cold" else cfg["warm_runs"]
+    def judge_against_unfolded(self, c, tk, problems):
+        if c.get("truth_key") != tk:
+            return "wrong_answer", f"call names truth key {c.get('truth_key')!r}, statements.toml gives {tk!r}"
+        temp = "warm" if c.get("temp") == "warm" else "cold"
+        twin = self.tries(c["statement"], "unfolded", temp).get(c.get("try", 0), [])
+        if len(twin) != 1 or twin[0].get("outcome") != "ok":
+            problems.add("missing", f"oracle call {c['statement']}/unfolded/{temp} try {c.get('try', 0)} "
+                                    f"for {where(c)}")
+            return "missing", "no unfolded call to compare against"
+        if not same_answer(c, twin[0]):
+            return "wrong_answer", (f"rows {c.get('rows')} differ from the unfolded answer's "
+                                    f"{twin[0].get('rows')} or its row set")
+        return "correct", ""
+
+
+def static_group(tries):
+    """A plan line that was never sent: one try 0, not-run, or unsupported
+    with no HTTP status."""
+    if list(tries) != [0] or len(tries[0]) != 1:
+        return False
+    c = tries[0][0]
+    return c.get("outcome") == "not-run" or (c.get("outcome") == UNSUPPORTED and "http_status" not in c)
+
+
+def check_tries(calls, cfg, problems):
+    for (statement, state, temp), tries in sorted(calls.groups.items()):
+        if static_group(tries):
+            continue
+        want = cfg["warm_runs"] if temp == "warm" else cfg["cold_runs"]
+        absent = [t for t in range(want) if t not in tries]
+        if absent:
+            problems.add("missing", f"{temp} tries {absent} of {statement} in {state}")
+        extra = sorted(t for t in tries if t >= want or t < 0)
+        if extra:
+            problems.add("duplicate", f"{temp} tries {extra} of {statement} in {state} beyond the {want} "
+                                      f"the run declares")
+
+
+def expected_temps(st, state, cfg):
+    if state in INFLIGHT_STATES:
+        return ["inflight"]
+    temps = ["cold"]
+    if not st.get("cold_only", True) and cfg["warm_runs"]:
+        temps.append("warm")
+    return temps
+
+
+def check_coverage(calls, statements, cfg, live, problems):
+    """Every (statement, live query state) statements.toml names has calls.
+    Returns {state: "run" | "missing"} for the query states that are live."""
+    seen = {}
+    for (statement, state, _temp) in calls.groups:
+        seen.setdefault(state, set()).add(statement)
+    out = {}
+    for state, reason in sorted(live.items()):
+        if reason is not None or state not in {s for st in statements.values() for s in st.get("states", [])}:
+            continue
+        if not seen.get(state):
+            problems.add("missing", f"state {state}: no calls in calls.jsonl")
+            out[state] = "missing"
+            continue
+        out[state] = "run"
+        for sid, st in sorted(statements.items()):
+            if state not in st.get("states", []):
+                continue
+            if st.get("tenant") == "hits" and not cfg["hits"]:
+                continue
+            if st.get("control"):
+                if not any(s.startswith("control_") for s in seen[state]):
+                    problems.add("missing", f"calls of control_* in {state}")
+                continue
+            cold = calls.tries(sid, state, "inflight" if state in INFLIGHT_STATES else "cold")
+            if not cold:
+                problems.add("missing", f"calls of {sid} in {state}")
+                continue
+            if static_group(cold):
+                continue
+            for temp in expected_temps(st, state, cfg)[1:]:
+                if not calls.tries(sid, state, temp):
+                    problems.add("missing", f"{temp} calls of {sid} in {state}")
+    return out
+
+
+def group_lines(calls, cfg, statement, state, temp):
+    """(lines, None) for a complete group, or (None, (status, reason))."""
+    tries = calls.tries(statement, state, temp)
+    if not tries:
+        return None, ("missing", f"no {temp} call of {statement} in {state}")
+    if any(len(v) > 1 for v in tries.values()):
+        return None, ("duplicate", f"two calls for one {temp} try of {statement} in {state}")
+    if static_group(tries):
+        c = tries[0][0]
+        return [c], None
+    want = cfg["warm_runs"] if temp == "warm" else cfg["cold_runs"]
+    absent = [t for t in range(want) if t not in tries]
+    if absent:
+        return None, ("missing", f"{temp} tries {absent} of {statement} in {state}")
+    extra = sorted(t for t in tries if t >= want)
+    if extra:
+        return None, ("duplicate", f"{temp} tries {extra} beyond the {want} the run declares")
+    return [tries[t][0] for t in range(want)], None
 
 
 def statement_figure(calls, cfg, statement, state, metric):
     """(status, value, reason) of one statement figure.
 
     metric is "<temp>.<agg>.<name>", "<temp>.rows_exact",
-    "<temp>.rows_match_state.<other>" or "<temp>.wall_p50_s".
+    "<temp>.rows_match_state.<other>", "<temp>.wall_p50_s" or
+    "<temp>.refused_by_complexity".
     """
     temp, _, rest = metric.partition(".")
-    key = (statement, state, temp)
-    if key in calls.unsupported:
-        return UNSUPPORTED, None, calls.unsupported[key]
-    tries = calls.tries(statement, state, temp)
-    if not tries:
-        return "missing", None, f"no {temp} call of {statement} in {state}"
-    if any(len(v) > 1 for v in tries.values()):
-        return "duplicate", None, f"two calls for one {temp} try of {statement} in {state}"
-    want = expected_tries(temp, cfg)
-    absent = [t for t in range(want) if t not in tries]
-    if absent:
-        return "missing", None, f"{temp} tries {absent} of {statement} in {state}"
-    extra = sorted(t for t in tries if t >= want)
-    if extra:
-        return "duplicate", None, f"{temp} tries {extra} beyond the {want} the run declares"
-    lines = [tries[t][0] for t in range(want)]
+    lines, bad = group_lines(calls, cfg, statement, state, temp)
+    if bad:
+        return bad[0], None, bad[1]
+    outcomes = {c.get("outcome") for c in lines}
+    if rest == "refused_by_complexity":
+        refused = all(c.get("outcome") == UNSUPPORTED and COMPLEXITY_REFUSAL in (c.get("reason") or "")
+                      and "http_status" in c for c in lines)
+        if not refused and outcomes != {"ok"}:
+            return "missing", None, f"{temp} calls of {statement} in {state} neither served nor refused"
+        return "value", int(refused), ""
+    if outcomes == {"not-run"}:
+        return "not-run", None, lines[0].get("reason") or "no reason given"
+    if outcomes == {UNSUPPORTED}:
+        return UNSUPPORTED, None, lines[0].get("reason") or "no reason given"
+    if outcomes != {"ok"}:
+        return "missing", None, f"a {temp} call of {statement} in {state} failed"
+    invalid = [c for c in lines if c.get("_invalid")]
+    if invalid:
+        return "missing", None, f"{invalid[0]['_invalid']} in {where(invalid[0])}"
     if rest == "rows_exact":
-        return "value", int(all(c.get("_judged") == "correct" for c in lines)), ""
+        if any(c.get("_judged") == "missing" for c in lines):
+            return "missing", None, f"no oracle for {statement} in {state}"
+        return "value", int(all(c.get("_judged") in ("correct", "reference") for c in lines)), ""
     if rest.startswith("rows_match_state."):
         other = rest.split(".", 1)[1]
-        theirs = calls.tries(statement, other, temp)
-        if not theirs or any(len(theirs.get(t, [])) != 1 for t in range(want)):
+        theirs, bad = group_lines(calls, cfg, statement, other, temp)
+        if bad or len(theirs) != len(lines):
             return "missing", None, f"{temp} calls of {statement} in {other} to compare against"
-        same = all(
-            c.get("outcome") == "ok"
-            and theirs[t][0].get("outcome") == "ok"
-            and c.get("rows") == theirs[t][0].get("rows")
-            and c.get("values", c.get("values_sha256")) == theirs[t][0].get("values", theirs[t][0].get("values_sha256"))
-            for t, c in enumerate(lines)
-        )
+        same = all(c.get("outcome") == "ok" and o.get("outcome") == "ok" and same_answer(c, o)
+                   for c, o in zip(lines, theirs))
         return "value", int(same), ""
-    if any(c.get("outcome") != "ok" for c in lines):
-        return "missing", None, f"a {temp} call of {statement} in {state} failed"
     if rest == "wall_p50_s":
         return "value", rnd(percentile([c["wall_s"] for c in lines], 0.5)), ""
     agg, _, name = rest.partition(".")
-    if name.startswith("per_object."):
-        return UNSUPPORTED, None, "stats carry no per-object breakdown"
+    head = name.split(".", 1)[0]
+    if head in ALLOWLIST_BREAKDOWNS:
+        return UNSUPPORTED, None, ALLOWLIST_BREAKDOWNS[head]
     vals = []
     for c in lines:
-        if not isinstance(c.get("stats"), dict):
-            return "missing", None, f"{temp} try {c.get('try')} of {statement} in {state} has no stats (RQ_STATS unset?)"
-        v, unsup = call_metrics(c["stats"])
-        if name in unsup:
-            return UNSUPPORTED, None, unsup[name]
-        if name not in v:
+        m = call_metrics(c)
+        if name in KEY_INDEX_METRICS or name == "skip_idx_dropped":
+            v, why = allowlisted(c, name)
+            if why:
+                return UNSUPPORTED, None, why
+        elif name == "probe_wire_per_object":
+            if m["probe_gets"] == 0:
+                return "missing", None, f"no probe GET in {where(c)} to divide the probe wire by"
+            v = rnd(m["probe_wire_bytes"] / m["probe_gets"])
+        elif name in m:
+            v = m[name]
+        else:
             return "missing", None, f"unknown metric {name}"
-        vals.append(v[name])
-    return "value", (max(vals) if agg == "max" else min(vals)), ""
+        vals.append(v)
+    value = max(vals) if agg == "max" else min(vals)
+    if name == "segments_opened" and value == 0:
+        scanned = [c for c in lines if call_metrics(c)["scan_gets"] >= 1]
+        if scanned:
+            return "dead_counter", 0, (f"segmentsOpened 0 while {where(scanned[0])} issued "
+                                       f"{call_metrics(scanned[0])['scan_gets']} scan GETs")
+    return "value", value, ""
 
 
-# --- folds --------------------------------------------------------------------
+# --- stamps -------------------------------------------------------------------
 
 
 def index_lines(lines, key_fields, name, problems):
@@ -321,6 +578,201 @@ def index_lines(lines, key_fields, name, problems):
     return out
 
 
+class Stamps:
+    def __init__(self, run_dir):
+        self.dir = os.path.join(run_dir, "stamps")
+        self.cache = {}
+
+    def doc(self, state, label, kind):
+        """stamps/STATE.LABEL.KIND.json, or None when absent or unreadable."""
+        name = f"{state}.{label}.{kind}.json"
+        if name not in self.cache:
+            path = os.path.join(self.dir, name)
+            try:
+                with open(path) as f:
+                    self.cache[name] = json.load(f)
+            except (OSError, ValueError):
+                self.cache[name] = None
+        return self.cache[name]
+
+
+def required_stamps(run_dir, cfg, live, problems):
+    stamps = os.path.join(run_dir, "stamps")
+    docs = {}
+    names = ["build.json", "host.json", "declare.json", "store.json", "corpus.json", "tenants.json"]
+    if live.get("unfolded") is None:
+        names.append("needle_blocks.json")
+    for name in names:
+        docs[name] = load_json(os.path.join(stamps, name), problems, f"stamps/{name}")
+
+    def jsonl(name, keys):
+        return index_lines(load_jsonl(os.path.join(stamps, name), problems, f"stamps/{name}"),
+                           keys, f"stamps/{name}", problems)
+
+    loads = jsonl("loads.jsonl", ("hour", "tenant", "signal"))
+    folds = jsonl("folds.jsonl", ("transition", "tenant", "signal"))
+    census = jsonl("census.jsonl", ("state",))
+    restarts = jsonl("restarts.jsonl", ("statement", "state", "try"))
+    transitions = jsonl("transitions.jsonl", ("state",))
+    compaction = (jsonl("compaction.jsonl", ("signal",))
+                  if live.get("compaction_in_flight") is None else {})
+    erasure = jsonl("erasure.jsonl", ()) if live.get("erasure_in_flight") is None else {}
+    on = [s for s, r in sorted(live.items()) if r is None]
+    tenant = cfg["tenant"]
+
+    want_loads = [("base", tenant, s) for s in SIGNALS]
+    if "mixed" in on:
+        want_loads += [("tail", tenant, s) for s in SIGNALS]
+    if cfg["hits"]:
+        want_loads.append(("base", "hits", "hits"))
+    want_loads += [(s, tenant_of(s, "spans", cfg), "spans") for s in on if s.startswith("many_parts_")]
+    for k in want_loads:
+        line = loads.get(k, "absent")
+        if line == "absent":
+            problems.add("missing", f"stamps/loads.jsonl {'/'.join(k)}")
+        elif line and line.get("exit") != 0:
+            problems.add("failed", f"load {'/'.join(k)} exit {line.get('exit')}")
+        elif line and not (line.get("report") or {}).get("objects_written"):
+            problems.add("wrong", f"load {'/'.join(k)} report shows no objects_written")
+
+    labels = labels_of("unfolded", cfg)
+    want_folds = []
+    for transition, when in (("folded_no_leaves", "folded_no_leaves"), ("folded_leaves", "folded_leaves"),
+                             ("leaf_rebuild", "folded_leaves"), ("fold_advance", "mixed")):
+        if when in on:
+            want_folds += [(transition, tenant_of(transition, lab, cfg), lab) for lab in labels]
+    for s in on:
+        if s.startswith("many_parts_"):
+            t = tenant_of(s, "spans", cfg)
+            want_folds += [(s, t, "spans"), (f"{s}_leaf_rebuild", t, "spans")]
+    for k in want_folds:
+        line = folds.get(k, "absent")
+        if line == "absent":
+            problems.add("missing", f"stamps/folds.jsonl {'/'.join(k)}")
+        elif line and line.get("exit") != 0:
+            problems.add("failed", f"fold {'/'.join(k)} exit {line.get('exit')}")
+
+    if live.get("compaction_in_flight") is None:
+        for sig in SIGNALS:
+            line = compaction.get((sig,), "absent")
+            if line == "absent":
+                problems.add("missing", f"stamps/compaction.jsonl {sig}")
+            elif line and line.get("exit") != 0:
+                problems.add("failed", f"compaction {sig} exit {line.get('exit')}")
+            elif line and not ((line.get("report") or {}).get("fields") or {}).get("compacted"):
+                problems.add("wrong", f"compaction {sig} compacted nothing, so no statement ran against a "
+                                      f"compaction in flight")
+    if live.get("erasure_in_flight") is None and not erasure:
+        problems.add("missing", "stamps/erasure.jsonl")
+
+    st = Stamps(run_dir)
+    for s in on:
+        if s != "compaction_in_flight":
+            if (s,) not in census:
+                problems.add("missing", f"stamps/census.jsonl {s}")
+            for lab in labels_of(s, cfg):
+                if st.doc(s, lab, "catalog") is None:
+                    problems.add("missing", f"covering_parts.{s}.{lab}")
+            if not os.path.exists(os.path.join(stamps, f"{s}.server.json")):
+                problems.add("missing", f"stamps/{s}.server.json")
+        if (s,) not in transitions:
+            problems.add("missing", f"stamps/transitions.jsonl {s}")
+    return docs, loads, folds, census, restarts, st
+
+
+def check_loads(loads, truth, cfg, problems):
+    rows = (truth or {}).get("rows_written", {})
+    for sig in SIGNALS:
+        line = loads.get(("base", cfg["tenant"], sig))
+        if not line or sig not in rows:
+            continue
+        report = line.get("report") or {}
+        # This build's load report counts objects, not rows; the row count is
+        # then proven by the statements judged against truth.json.
+        if "rows_written" in report and report["rows_written"] != rows[sig]:
+            problems.add("wrong", f"load base/{sig} wrote {report['rows_written']} rows, "
+                                  f"truth.json says {rows[sig]}")
+
+
+def check_restarts(calls, restarts, problems):
+    for (statement, state, temp), tries in sorted(calls.groups.items()):
+        if temp != "cold":
+            continue
+        for t, lines in sorted(tries.items()):
+            sent = any(c.get("outcome") == "ok" or (c.get("outcome") == UNSUPPORTED and "http_status" in c)
+                       for c in lines)
+            if sent and (statement, state, t) not in restarts:
+                problems.add("missing", f"stamps/restarts.jsonl {statement}/{state}/{t}")
+
+
+def catalog_entries(doc):
+    if "entries" in doc:
+        return doc["entries"]
+    return sum(p.get("entry_count", 0) for p in doc.get("parts", []))
+
+
+def leaf_bytes(doc, field=None):
+    return sum(leaf.get("bytes", 0) for p in doc.get("parts", []) for leaf in p.get("leaves", [])
+               if field is None or leaf.get("field") == field)
+
+
+def stamp_figure(stamps, census, cfg, state, metric):
+    """(status, value, reason) of stamp.*, leaf_share.* and census.* figures."""
+    kind, _, rest = metric.partition(".")
+    if kind == "census":
+        tenant, signal, field = rest.split(".")
+        line = census.get((state,), "absent")
+        if line == "absent":
+            return "missing", None, f"no census of {state}"
+        if line is None:
+            return "duplicate", None, f"two censuses of {state}"
+        data = ((line.get("census") or {}).get("tenants") or {}).get(tenant, {}).get("data", {}).get(signal)
+        if not data or field not in data:
+            return "missing", None, f"census of {state} has no {tenant}/{signal} {field}"
+        return "value", data[field], ""
+    if kind == "leaf_share":
+        label, field = rest.split(".")
+        doc = stamps.doc(state, label, "catalog")
+        if doc is None:
+            return "missing", None, f"covering_parts.{state}.{label}"
+        line = census.get((state,))
+        tenant = tenant_of(state, label, cfg)
+        data = (((line or {}).get("census") or {}).get("tenants") or {}).get(tenant, {}).get(
+            "data", {}).get(signal_of(label), {})
+        if not data.get("bytes"):
+            return "missing", None, f"census of {state} has no {tenant}/{signal_of(label)} bytes"
+        if not any(leaf.get("field") == field for p in doc.get("parts", []) for leaf in p.get("leaves", [])):
+            return "missing", None, f"stamps/{state}.{label}.catalog.json names no {field} leaf"
+        return "value", rnd(100.0 * leaf_bytes(doc, field) / data["bytes"]), ""
+    what, _, label = rest.partition(".")
+    if what == "footer_len":
+        doc = stamps.doc(state, label, "object")
+        if doc is None:
+            return "missing", None, f"no stamps/{state}.{label}.object.json"
+        if "footer_len" not in doc:
+            return "value", 0, "the inspector printed no footer length; the footer term is taken as 0"
+        return "value", doc["footer_len"], ""
+    if what == "buckets":
+        doc = stamps.doc(state, label, "kidx")
+        if doc is None or not doc.get("buckets"):
+            return "missing", None, f"no leaf bucket count in stamps/{state}.{label}.kidx.json"
+        return "value", int(str(doc["buckets"]).split()[0]), ""
+    doc = stamps.doc(state, label, "catalog")
+    if doc is None:
+        return "missing", None, f"covering_parts.{state}.{label}"
+    if what == "covering_parts":
+        return "value", doc.get("part_count", len(doc.get("parts", []))), ""
+    if what == "entries":
+        return "value", catalog_entries(doc), ""
+    if what == "leaves":
+        return "value", sum(len(p.get("leaves", [])) for p in doc.get("parts", [])), ""
+    if what == "part_entries":
+        return "value", max([p.get("entry_count", 0) for p in doc.get("parts", [])] or [0]), ""
+    if what == "leaf_bytes":
+        return "value", leaf_bytes(doc), ""
+    return "missing", None, f"unknown stamp figure {what}"
+
+
 def fold_field(report, field):
     for name in FOLD_FIELDS.get(field, (field,)):
         if name in report:
@@ -328,75 +780,33 @@ def fold_field(report, field):
     return None
 
 
-def rebuild_requests(report):
-    """(GETs, PUTs) a `--rebuild-key-index` report counts: per attempt, the
-    part GETs and ranged section GETs, and the leaf PUTs plus one HEAD publish
-    per CAS try. It counts no HEAD read and no listing."""
-    attempts = report.get("attempts") or []
-    gets = sum(int(a.get("part_gets", 0)) + int(a.get("ranged_gets", 0)) for a in attempts)
-    puts = sum(int(a.get("leaf_puts", 0)) + int(a.get("head_cas_tries", 0)) for a in attempts)
-    return gets, puts
-
-
-def fold_figure(folds, census, transition, signal, field):
-    """(status, value, reason) of fold.<signal>.<field> for one transition."""
-    line = folds.get((transition, signal), "absent")
+def fold_figure(folds, transition, tenant, label, field):
+    """(status, value, reason) of fold.<tenant>.<label>.<field>."""
+    line = folds.get((transition, tenant, label), "absent")
     if line == "absent":
-        return "missing", None, f"no fold stamp for {transition}/{signal}"
+        return "missing", None, f"no fold stamp for {transition}/{tenant}/{label}"
     if line is None:
-        return "duplicate", None, f"two fold stamps for {transition}/{signal}"
-    report = line.get("report") or {}
+        return "duplicate", None, f"two fold stamps for {transition}/{tenant}/{label}"
     if field == "peak_rss_bytes":
         v = (line.get("measure") or {}).get("peak_rss_bytes")
         return ("value", v, "") if v is not None else ("missing", None, "fold stamp has no measure")
-    earlier = [t for t in FOLD_ORDER[: FOLD_ORDER.index(transition)]] if transition in FOLD_ORDER else []
-    if field == "new_entries":
-        prev = [folds.get((t, signal)) for t in earlier]
-        prev = [p for p in prev if p not in (None, "absent") and "entry_count" in (p.get("report") or {})
-                and not p["report"].get("no_op")]
-        if "entry_count" not in report:
-            return UNSUPPORTED, None, "fold report carries no entry_count"
-        if not prev:
-            return "missing", None, f"no earlier fold of {signal} to difference entry_count against"
-        return "value", report["entry_count"] - prev[-1]["report"]["entry_count"], ""
-    if field == "previous_leaves":
-        total = 0
-        for t in earlier:
-            p = folds.get((t, signal))
-            if p in (None, "absent"):
-                continue
-            total += fold_field(p.get("report") or {}, "leaves_written") or 0
-        return "value", total, ""
-    if field == "leaf_bytes_pct":
-        leaf = fold_field(report, "leaf_bytes")
-        if leaf is None:
-            return UNSUPPORTED, None, "fold report carries no leaf bytes"
-        # The fold report's part_bytes is the snapshot part, not the data it
-        # indexes: the denominator is the signal's own objects in the census
-        # of the state the leaves were built for.
-        state = "folded_leaves" if transition == "leaf_rebuild" else transition
-        line = census.get((state,), "absent")
-        if line in (None, "absent"):
-            return "missing", None, f"no census of {state} for the {signal} data bytes"
-        data = ((line.get("census") or {}).get("classes") or {}).get(SIGNAL_CLASS[signal], {}).get("bytes")
-        if not data:
-            return "missing", None, f"census of {state} has no {SIGNAL_CLASS[signal]}/ bytes for {signal}"
-        return "value", rnd(100.0 * leaf / data), ""
-    v = fold_field(report, field)
+    v = fold_field(line.get("report") or {}, field)
     if v is None:
-        return UNSUPPORTED, None, f"fold report carries no {field}"
+        if field in FOLD_ALLOWLIST:
+            return UNSUPPORTED, None, f"fold report carries no {field} on this build"
+        return "missing", None, f"fold report {transition}/{tenant}/{label} has no {field}"
     return "value", v, ""
 
 
 # --- rows ---------------------------------------------------------------------
 
 
-def row_not_run(row, cfg):
+def row_not_run(row, cfg, live):
     if row.get("requires_tenant") == "hits" and not cfg["hits"]:
         return "the hits tenant is not loaded (run.toml hits = false)"
-    lacking = [s for s in row.get("requires_states", []) if s not in cfg["states"]]
+    lacking = [s for s in row.get("requires_states", []) if live.get(s, "unknown state") is not None]
     if lacking:
-        return f"states {lacking} not in run.toml states"
+        return f"states {lacking} not run: " + "; ".join(f"{s}: {live.get(s, 'unknown state')}" for s in lacking)
     scales = [s for s in row.get("requires_scales", []) if s not in cfg["scales"]]
     if scales:
         return f"scales {scales} not in run.toml scales"
@@ -405,28 +815,57 @@ def row_not_run(row, cfg):
     return None
 
 
+def figure_not_run(fig, live):
+    states = list(fig.get("requires_states", []))
+    if fig["state"] != "all":
+        states.append(fig["state"])
+    lacking = [s for s in states if live.get(s, "unknown state") is not None]
+    if lacking:
+        return "; ".join(f"{s}: {live.get(s, 'unknown state')}" for s in lacking)
+    return None
+
+
 def evaluate_expr(expr, v, m):
-    return bool(eval(expr, {"__builtins__": {}}, {"v": v, "m": m}))  # noqa: S307 - bands.toml is repo-controlled
+    return bool(eval(expr, {"__builtins__": {"min": min, "max": max}}, {"v": v, "m": m}))  # noqa: S307 - bands.toml is repo-controlled
 
 
-def run_rows(bands, cfg, calls, folds, census, matrix, cost_figs):
+def derived_value(expr, figures_by_id):
+    """(status, value, reason) of a derived figure's expression."""
+    values = {k: e["value"] for k, e in figures_by_id.items() if e["status"] == "value"}
+    try:
+        v = eval(expr, {"__builtins__": {"min": min, "max": max}}, {"m": values})  # noqa: S307
+    except KeyError as e:
+        ref = figures_by_id.get(e.args[0])
+        if ref is None:
+            return "missing", None, f"refers to figure {e.args[0]} that bands.toml does not define before it"
+        if ref["status"] in ("not-run", UNSUPPORTED):
+            return ref["status"], None, f"{e.args[0]} is {ref['status']}: {ref['reason']}"
+        return "missing", None, f"{e.args[0]} has no value ({ref['status']})"
+    return "value", rnd(v), ""
+
+
+def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs):
     figures = []
+    by_id = {}
     for row in bands["row"]:
-        reason = row_not_run(row, cfg)
+        reason = row_not_run(row, cfg, live)
         for fig in row["figure"]:
             fid = f"{row['key']}.{fig['name']}"
             entry = {"id": fid, "row": row["adr_row"], "statement": fig["statement"], "state": fig["state"],
                      "metric": fig["metric"], "lane": fig["lane"]}
             metric = fig["metric"]
-            if reason:
-                status, value, why = "not-run", None, reason
-            elif fig["state"] in cfg["unsupported_states"]:
-                status, value, why = UNSUPPORTED, None, cfg["unsupported_states"][fig["state"]]
+            why_not = reason or figure_not_run(fig, live)
+            if why_not:
+                status, value, why = "not-run", None, why_not
+            elif metric == "derived":
+                status, value, why = derived_value(fig["expr"], by_id)
+            elif metric.startswith(("stamp.", "leaf_share.", "census.")):
+                status, value, why = stamp_figure(stamps, census, cfg, fig["state"], metric)
             elif metric.startswith("fold."):
-                _, signal, field = metric.split(".", 2)
-                status, value, why = fold_figure(folds, census, fig.get("transition", fig["state"]), signal, field)
+                _, tenant, label, field = metric.split(".", 3)
+                status, value, why = fold_figure(folds, fig.get("transition", fig["state"]), tenant, label, field)
             elif metric.startswith("matrix."):
-                status, value, why = matrix[metric]
+                status, value, why = matrix(metric, fig["state"])
             elif metric.startswith("cost."):
                 status, value, why = "value", cost_figs[metric], ""
             elif metric.startswith(("scale.", "control.")):
@@ -435,9 +874,10 @@ def run_rows(bands, cfg, calls, folds, census, matrix, cost_figs):
                 status, value, why = statement_figure(calls, cfg, fig["statement"], fig["state"], metric)
             entry.update(status=status, value=value, reason=why)
             figures.append(entry)
-    by_id = {f["id"]: f["value"] for f in figures if f["status"] == "value"}
+            by_id[fid] = entry
+    values = {f["id"]: f["value"] for f in figures if f["status"] == "value"}
     for row, f in ((r, f) for r in bands["row"] for f in r["figure"]):
-        entry = next(e for e in figures if e["id"] == f"{row['key']}.{f['name']}")
+        entry = by_id[f"{row['key']}.{f['name']}"]
         if entry["status"] != "value":
             entry["verdict"] = entry["status"]
             continue
@@ -445,13 +885,20 @@ def run_rows(bands, cfg, calls, folds, census, matrix, cost_figs):
             entry["verdict"] = "reported (timing is judged on the s3 lane only)"
             continue
         try:
-            ok = evaluate_expr(f.get("target_if", "True"), entry["value"], by_id)
-            miss = evaluate_expr(f.get("miss_if", "False"), entry["value"], by_id)
+            ok = evaluate_expr(f.get("target_if", "True"), entry["value"], values)
+            miss = evaluate_expr(f.get("miss_if", "False"), entry["value"], values)
         except KeyError as e:
-            entry["verdict"] = "missing"
-            entry["reason"] = f"band refers to figure {e.args[0]} that has no value"
+            ref = by_id.get(e.args[0])
+            if ref is not None and ref["status"] in ("not-run", UNSUPPORTED):
+                entry["verdict"] = ref["status"]
+                entry["reason"] = f"band refers to figure {e.args[0]}, {ref['status']}: {ref['reason']}"
+            else:
+                entry["verdict"] = "missing"
+                entry["reason"] = f"band refers to figure {e.args[0]} that has no value"
             continue
         entry["verdict"] = "pass" if ok and not miss else "miss"
+        if miss and f.get("miss_reason"):
+            entry["reason"] = f["miss_reason"]
     return figures
 
 
@@ -460,276 +907,213 @@ def run_rows(bands, cfg, calls, folds, census, matrix, cost_figs):
 
 def price_basis(cfg):
     prices = cfg["prices"]
-    basis = {}
-    for k in PRICE_KEYS:
-        basis[k] = {"value": prices.get(k), "source": prices.get(f"{k}_source")}
-    return basis
+    return {k: {"value": prices.get(k), "source": prices.get(f"{k}_source")} for k in PRICE_KEYS}
 
 
 def statement_cost(calls, cfg):
-    """Dollars per cold call of every (statement, state) with clean ok calls."""
+    """Dollars per cold call of every (statement, state) with valid ok calls."""
     p = cfg["prices"]
     out = []
     for (statement, state, temp), tries in sorted(calls.groups.items()):
-        lines = [v[0] for v in tries.values() if len(v) == 1 and v[0].get("outcome") == "ok"]
+        lines = [v[0] for v in tries.values() if len(v) == 1 and v[0].get("outcome") == "ok"
+                 and not v[0].get("_invalid")]
         if temp != "cold" or not lines or len(lines) != len(tries):
             continue
-        gets, lists, cpu = [], [], []
-        for c in lines:
-            if not isinstance(c.get("stats"), dict):
-                break
-            v, _ = call_metrics(c["stats"])
-            if "total_gets" not in v:
-                break
-            gets.append(v["total_gets"])
-            lists.append(v["list_requests"])
-            cpu.append(c.get("server_cpu_s", 0.0))
-        else:
-            n = len(lines)
-            g, li, s = sum(gets) / n, sum(lists) / n, sum(cpu) / n
-            dollars = g * p["get_per_1000"] / 1000 + li * p["put_per_1000"] / 1000 + s * p["instance_per_hour"] / 3600
-            out.append({
-                "statement": statement, "state": state, "calls": n,
-                "mean_gets": rnd(g), "mean_list_requests": rnd(li), "mean_server_cpu_s": rnd(s),
-                "server_cpu_s_p50": rnd(percentile(cpu, 0.5)),
-                "server_hwm_bytes_max": max((c.get("server_hwm_bytes") or 0) for c in lines),
-                "dollars_per_call": rnd(dollars),
-                "basis": "get_per_1000, put_per_1000 (LIST), instance_per_hour",
-            })
+        mets = [call_metrics(c) for c in lines]
+        cpu = [c["server_cpu_s"] for c in lines]
+        n = len(lines)
+        g = sum(m["total_gets"] for m in mets) / n
+        li = sum(m["list_requests"] for m in mets) / n
+        s = sum(cpu) / n
+        dollars = g * p["get_per_1000"] / 1000 + li * p["put_per_1000"] / 1000 + s * p["instance_per_hour"] / 3600
+        out.append({
+            "statement": statement, "state": state, "calls": n,
+            "mean_gets": rnd(g), "mean_list_requests": rnd(li), "mean_server_cpu_s": rnd(s),
+            "server_cpu_s_p50": rnd(percentile(cpu, 0.5)),
+            "server_hwm_bytes_max": max(c["server_hwm_bytes"] for c in lines),
+            "dollars_per_call": rnd(dollars),
+            "basis": "get_per_1000, put_per_1000 (LIST), instance_per_hour",
+        })
     return out
 
 
-def maintenance_cost(folds, census, cfg):
-    """Each fold transition's dollars, from its report and measured CPU."""
+def maintenance_cost(folds, stamps, cfg, live, problems):
+    """Decision 8's amortised maintenance per signal and part-month: the leaf
+    rebuild's section GETs (report `ranged_gets`) at the GET price and leaf
+    PUTs (`attempts[].leaf_puts`) at the PUT price, over amortise_months,
+    plus the leaf bytes the folded_leaves catalog stamp names at the storage
+    price, divided by that stamp's part count."""
     p = cfg["prices"]
+    months = cfg["cost"].get("amortise_months", 1) or 1
     out = []
-    for (transition, signal), line in sorted(folds.items()):
-        if not line:
+    if live.get("folded_leaves") is not None:
+        return out
+    for label in labels_of("folded_leaves", cfg):
+        tenant = tenant_of("folded_leaves", label, cfg)
+        line = folds.get(("leaf_rebuild", tenant, label))
+        doc = stamps.doc("folded_leaves", label, "catalog")
+        entry = {"signal": label, "tenant": tenant, "basis":
+                 "leaf_rebuild report ranged_gets x get_per_1000 + attempts[].leaf_puts x put_per_1000, "
+                 "over amortise_months; folded_leaves catalog stamp leaf bytes x storage_gb_month; "
+                 "per stamped part"}
+        report = (line or {}).get("report") or {}
+        if not line or "ranged_gets" not in report or "attempts" not in report or doc is None:
+            entry["status"] = "missing"
+            problems.add("missing", f"maintenance inputs for {label} (leaf_rebuild report ranged_gets and "
+                                    f"attempts, stamps/folded_leaves.{label}.catalog.json)")
+            out.append(entry)
             continue
-        r = line.get("report") or {}
-        if "get_requests" in r:
-            gets, puts, lists = r["get_requests"], r.get("put_requests", 0), r.get("list_requests", 0)
-        else:
-            (gets, puts), lists = rebuild_requests(r), 0
-        cpu = (line.get("measure") or {}).get("cpu_s", 0.0)
-        leaf = fold_field(r, "leaf_bytes") or 0
-        dollars = gets * p["get_per_1000"] / 1000 + (puts + lists) * p["put_per_1000"] / 1000 + cpu * p["instance_per_hour"] / 3600
-        out.append({
-            "transition": transition, "signal": signal, "kind": line.get("kind", "fold"),
-            "get_requests": gets, "put_requests": puts, "list_requests": lists, "cpu_s": cpu,
-            "leaf_bytes": leaf, "parts_total": r.get("parts_total", r.get("parts_rebuilt")),
-            "dollars": rnd(dollars),
-            "leaf_storage_dollars_per_month": rnd(leaf / 1e9 * p["storage_gb_month"]),
-            "basis": "get_per_1000, put_per_1000 (PUT and LIST), instance_per_hour, storage_gb_month",
-        })
-    storage = []
-    for (state,), line in sorted(census.items()):
-        if not line:
-            continue
-        b = (line.get("census") or {}).get("bytes", 0)
-        storage.append({"state": state, "objects": (line.get("census") or {}).get("objects"), "bytes": b,
-                        "dollars_per_month": rnd(b / 1e9 * p["storage_gb_month"]), "basis": "storage_gb_month"})
-    return out, storage
-
-
-def break_even(stmt_cost, maint, cfg):
-    """Per lookup statement: saving per call of folded_leaves over unfolded,
-    and the lookups per part-month the leaf build needs to pay for itself."""
-    c = cfg["cost"]
-    freq = c.get("lookups_per_part_month")
-    months = c.get("amortise_months", 1)
-    leaf_folds = [m for m in maint if m["transition"] in LEAF_TRANSITIONS]
-    leaf_dollars = sum(m["dollars"] for m in leaf_folds) / months + sum(m["leaf_storage_dollars_per_month"] for m in leaf_folds)
-    parts = max([m["parts_total"] or 0 for m in leaf_folds] or [0]) or 1
-    per_part_month = leaf_dollars / parts
-    by = {(s["statement"], s["state"]): s for s in stmt_cost}
-    out = []
-    for (statement, state), s in sorted(by.items()):
-        if state != "folded_leaves" or (statement, "unfolded") not in by:
-            continue
-        saving = by[(statement, "unfolded")]["dollars_per_call"] - s["dollars_per_call"]
-        entry = {"statement": statement, "dollars_unfolded": by[(statement, "unfolded")]["dollars_per_call"],
-                 "dollars_folded_leaves": s["dollars_per_call"], "saving_per_call": rnd(saving),
-                 "maintenance_per_part_month": rnd(per_part_month), "parts": parts,
-                 "lookups_per_part_month_assumed": freq, "amortise_months": months}
-        if saving > 0:
-            entry["break_even_lookups_per_part_month"] = rnd(per_part_month / saving)
-            if freq is not None:
-                entry["net_per_part_month_at_assumed_frequency"] = rnd(freq * saving - per_part_month)
-        else:
-            entry["break_even_lookups_per_part_month"] = "never (no saving per call)"
+        gets = report["ranged_gets"]
+        puts = sum(a.get("leaf_puts", 0) for a in report["attempts"])
+        leaf = leaf_bytes(doc)
+        parts = doc.get("part_count", len(doc.get("parts", [])))
+        build = gets * p["get_per_1000"] / 1000 + puts * p["put_per_1000"] / 1000
+        storage = leaf / 1e9 * p["storage_gb_month"]
+        total = build / months + storage
+        entry.update(status="value", section_gets=gets, leaf_puts=puts, leaf_bytes=leaf, parts=parts,
+                     amortise_months=months, build_dollars=rnd(build), storage_dollars_per_month=rnd(storage),
+                     maintenance_per_part_month=rnd(total / parts) if parts else None)
+        if not parts:
+            entry["status"] = "missing"
+            problems.add("missing", f"part count in stamps/folded_leaves.{label}.catalog.json")
         out.append(entry)
     return out
 
 
-# --- stamps -------------------------------------------------------------------
-
-
-def required_stamps(run_dir, cfg, problems):
-    stamps = os.path.join(run_dir, "stamps")
-    docs = {}
-    for name in ("build.json", "host.json", "declare.json"):
-        docs[name] = load_json(os.path.join(stamps, name), problems, f"stamps/{name}")
-    loads = index_lines(load_jsonl(os.path.join(stamps, "loads.jsonl"), problems, "stamps/loads.jsonl"),
-                        ("hour", "signal"), "stamps/loads.jsonl", problems)
-    folds = index_lines(load_jsonl(os.path.join(stamps, "folds.jsonl"), problems, "stamps/folds.jsonl"),
-                        ("transition", "signal"), "stamps/folds.jsonl", problems)
-    census = index_lines(load_jsonl(os.path.join(stamps, "census.jsonl"), problems, "stamps/census.jsonl"),
-                         ("state",), "stamps/census.jsonl", problems)
-    restarts = index_lines(load_jsonl(os.path.join(stamps, "restarts.jsonl"), problems, "stamps/restarts.jsonl"),
-                           ("statement", "state", "try"), "stamps/restarts.jsonl", problems)
-    transitions = index_lines(load_jsonl(os.path.join(stamps, "transitions.jsonl"), problems,
-                                         "stamps/transitions.jsonl"), ("state",), "stamps/transitions.jsonl", problems)
-    live = [s for s in cfg["states"] if s not in cfg["unsupported_states"]]
-    hours = ["base", "extra"] if "mixed" in live else ["base"]
-    for hour in hours:
-        for sig in SIGNALS:
-            if (hour, sig) not in loads:
-                problems.add("missing", f"stamps/loads.jsonl {hour}/{sig}")
-            elif loads[(hour, sig)]:
-                line = loads[(hour, sig)]
-                if line.get("exit") != 0:
-                    problems.add("failed", f"load {hour}/{sig} exit {line.get('exit')}")
-    # fold_advance and leaf_rebuild are no query states: the first is the fold
-    # that follows the mixed state's extra hour, the second a step of
-    # folded_leaves, so those states being live is what requires them.
-    for t in FOLD_ORDER:
-        if (t in live or (t == "fold_advance" and "mixed" in live)
-                or (t == "leaf_rebuild" and "folded_leaves" in live)):
-            for sig in SIGNALS:
-                if (t, sig) not in folds:
-                    problems.add("missing", f"stamps/folds.jsonl {t}/{sig}")
-                elif folds[(t, sig)] and folds[(t, sig)].get("exit") != 0:
-                    problems.add("failed", f"fold {t}/{sig} exit {folds[(t, sig)].get('exit')}")
-    for s in live:
-        if (s,) not in census:
-            problems.add("missing", f"stamps/census.jsonl {s}")
-        if (s,) not in transitions:
-            problems.add("missing", f"stamps/transitions.jsonl {s}")
-    return docs, loads, folds, census, restarts
-
-
-def check_loads(loads, truth, problems):
-    rows = (truth or {}).get("rows_written", {})
-    for sig in SIGNALS:
-        line = loads.get(("base", sig))
-        if not line or sig not in rows:
+def storage_cost(census, cfg):
+    p = cfg["prices"]
+    out = []
+    for (state,), line in sorted(census.items()):
+        if not line:
             continue
-        report = line.get("report") or {}
-        # This build's load report counts objects, not rows; the row count is
-        # then proven by the statements judged against truth.json.
-        if "rows_written" in report:
-            if report["rows_written"] != rows[sig]:
-                problems.add("wrong", f"load base/{sig} wrote {report['rows_written']} rows, "
-                                      f"truth.json says {rows[sig]}")
-        elif not report.get("objects_written"):
-            problems.add("wrong", f"load base/{sig} report shows no objects_written")
+        b = (line.get("census") or {}).get("bytes", 0)
+        out.append({"state": state, "objects": (line.get("census") or {}).get("objects"), "bytes": b,
+                    "dollars_per_month": rnd(b / 1e9 * p["storage_gb_month"]), "basis": "storage_gb_month"})
+    return out
 
 
-def check_restarts(calls, restarts, problems):
-    for (statement, state, temp), tries in sorted(calls.groups.items()):
-        if temp != "cold" or (statement, state, temp) in calls.unsupported:
+def break_even(stmt_cost, maint, statements):
+    """Per statement and signal: the lookups per part-month at which the
+    saving of folded_leaves over unfolded pays the leaf's maintenance."""
+    by = {(s["statement"], s["state"]): s for s in stmt_cost}
+    per_label = {m["signal"]: m for m in maint}
+    out = []
+    for (statement, state), s in sorted(by.items()):
+        if state != "folded_leaves" or (statement, "unfolded") not in by:
             continue
-        for t in sorted(tries):
-            line = restarts.get((statement, state, t), "absent")
-            if line == "absent":
-                problems.add("missing", f"stamps/restarts.jsonl {statement}/{state}/{t}")
+        st = statements.get(statement, {})
+        label = "hits" if st.get("tenant") == "hits" else st.get("table", "spans")
+        m = per_label.get(label)
+        saving = by[(statement, "unfolded")]["dollars_per_call"] - s["dollars_per_call"]
+        entry = {"statement": statement, "signal": label,
+                 "dollars_unfolded": by[(statement, "unfolded")]["dollars_per_call"],
+                 "dollars_folded_leaves": s["dollars_per_call"], "saving_per_call": rnd(saving)}
+        if m is None or m["status"] != "value":
+            entry["break_even_lookups_per_part_month"] = "missing (no maintenance figure for the signal)"
+        elif saving > 0:
+            entry["maintenance_per_part_month"] = m["maintenance_per_part_month"]
+            entry["break_even_lookups_per_part_month"] = rnd(m["maintenance_per_part_month"] / saving)
+        else:
+            entry["maintenance_per_part_month"] = m["maintenance_per_part_month"]
+            entry["break_even_lookups_per_part_month"] = "not applicable (folded cost per lookup is not below unfolded)"
+        out.append(entry)
+    return out
 
 
-# --- main ---------------------------------------------------------------------
-
-
-def load_cfg(run_dir, problems):
-    path = os.path.join(run_dir, "run.toml")
-    if not os.path.exists(path):
-        problems.add("missing", "run.toml")
-        return None
-    with open(path, "rb") as f:
-        doc = tomllib.load(f)
-    run = doc.get("run", {})
-    cfg = {
-        "lane": run.get("lane"),
-        "states": run.get("states", []),
-        "unsupported_states": doc.get("unsupported_states", {}),
-        "cold_runs": run.get("cold_runs"),
-        "warm_runs": run.get("warm_runs", 1),
-        "hits": run.get("hits", False),
-        "scales": run.get("scales", [1]),
-        "baseline": run.get("baseline", False),
-        "prices": doc.get("prices", {}),
-        "cost": doc.get("cost", {}),
-    }
-    for k in ("lane", "cold_runs"):
-        if cfg[k] is None:
-            problems.add("missing", f"run.toml run.{k}")
-    for k in PRICE_KEYS:
-        if not isinstance(cfg["prices"].get(k), (int, float)):
-            problems.add("missing", f"run.toml prices.{k}")
-            cfg["prices"][k] = 0.0
-    return cfg
-
-
-def summary_text(res):
-    out = [f"selective investigations, lane {res['lane']}: {res['verdict']}", ""]
-    out.append(f"{'figure':44} {'status':12} {'value':>14}  verdict")
-    for f in res["figures"]:
-        v = "" if f["value"] is None else str(f["value"])
-        out.append(f"{f['id']:44} {f['status'][:12]:12} {v:>14}  {f['verdict']}"
-                   + (f"  ({f['reason']})" if f["reason"] else ""))
-    out.append("")
-    out.append("statement                       state             p50_s     p95_s     p99_s  gets  wire_B   cpu_s   $/call")
-    for s in res["statements"]:
-        if s.get("status") == UNSUPPORTED:
-            out.append(f"{s['statement'][:31]:31} {s['state'][:17]:17} {UNSUPPORTED} ({s['reason']})")
-            continue
-        out.append(f"{s['statement'][:31]:31} {s['state'][:17]:17} {s['wall_p50_s']:>7} {s['wall_p95_s']:>9} "
-                   f"{s['wall_p99_s']:>9} {s.get('max_total_gets', '')!s:>5} {s.get('max_wire_bytes', '')!s:>7} "
-                   f"{s['server_cpu_s_p50']:>7} {s.get('dollars_per_call', '')!s:>8}")
-    out.append("")
-    out.append("prices:")
-    for k, b in res["cost"]["prices"].items():
-        out.append(f"  {k} = {b['value']}  source: {b['source']}")
-    c = res["cost"]
-    out.append(f"query frequency assumed: {c['lookups_per_part_month_assumed']} lookups per part-month"
-               f" (source: {c['lookups_per_part_month_source']}); leaf build amortised over {c['amortise_months']} month(s)")
-    for b in c["break_even"]:
-        out.append(f"  {b['statement']}: unfolded ${b['dollars_unfolded']} folded ${b['dollars_folded_leaves']} "
-                   f"saving ${b['saving_per_call']}/call; maintenance ${b['maintenance_per_part_month']}/part-month; "
-                   f"break-even {b['break_even_lookups_per_part_month']} lookups/part-month")
-    for m in c["maintenance"]:
-        out.append(f"  fold {m['transition']}/{m['signal']} ({m['kind']}): {m['get_requests']} GET {m['put_requests']} PUT "
-                   f"{m['list_requests']} LIST {m['cpu_s']} cpu_s = ${m['dollars']}")
-    if res["problems"]:
-        out.append("")
-        out.extend(res["problems"])
-    return "\n".join(out) + "\n"
+# --- reports ------------------------------------------------------------------
 
 
 def statement_detail(calls):
     out = []
     for (statement, state, temp), tries in sorted(calls.groups.items()):
         lines = [v[0] for _, v in sorted(tries.items())]
-        if (statement, state, temp) in calls.unsupported:
-            out.append({"statement": statement, "state": state, "temp": temp, "status": UNSUPPORTED,
-                        "reason": calls.unsupported[(statement, state, temp)]})
+        outcomes = {c.get("outcome") for c in lines}
+        if outcomes in ({UNSUPPORTED}, {"not-run"}):
+            out.append({"statement": statement, "state": state, "temp": temp, "status": outcomes.pop(),
+                        "reason": lines[0].get("reason")})
             continue
-        ok = [c for c in lines if c.get("outcome") == "ok"]
-        walls = [c["wall_s"] for c in ok] or [0.0]
-        cpu = [c.get("server_cpu_s", 0.0) for c in ok] or [0.0]
-        d = {"statement": statement, "state": state, "temp": temp, "calls": len(lines),
-             "ok": len(ok), "correct": sum(1 for c in ok if c.get("_judged") == "correct"),
-             "wall_p50_s": rnd(percentile(walls, 0.5)), "wall_p95_s": rnd(percentile(walls, 0.95)),
-             "wall_p99_s": rnd(percentile(walls, 0.99)), "server_cpu_s_p50": rnd(percentile(cpu, 0.5)),
-             "server_hwm_bytes_max": max((c.get("server_hwm_bytes") or 0) for c in lines)}
-        mets = [call_metrics(c["stats"])[0] for c in ok if isinstance(c.get("stats"), dict)]
-        for name in ("total_gets", "data_gets", "resolve_gets", "probe_gets", "scan_gets", "keyindex_gets",
-                     "list_requests", "wire_bytes", "decompressed_bytes", "segments_opened", "blocks_scanned",
-                     "segments", "dependency_depth", "signals_entries"):
-            vs = [m[name] for m in mets if name in m]
-            if vs and len(vs) == len(ok):
-                d[f"max_{name}"] = max(vs)
+        ok = [c for c in lines if c.get("outcome") == "ok" and not c.get("_invalid")]
+        d = {"statement": statement, "state": state, "temp": temp, "calls": len(lines), "ok": len(ok),
+             "correct": sum(1 for c in ok if c.get("_judged") in ("correct", "reference"))}
+        if ok:
+            walls = [c["wall_s"] for c in ok]
+            cpu = [c["server_cpu_s"] for c in ok]
+            d.update(wall_p50_s=rnd(percentile(walls, 0.5)), wall_p95_s=rnd(percentile(walls, 0.95)),
+                     wall_p99_s=rnd(percentile(walls, 0.99)), server_cpu_s_p50=rnd(percentile(cpu, 0.5)),
+                     server_hwm_bytes_max=max(c["server_hwm_bytes"] for c in ok))
+            mets = [call_metrics(c) for c in ok]
+            for name in ("total_gets", "data_gets", "resolve_gets", "probe_gets", "scan_gets", "keyindex_gets",
+                         "list_requests", "wire_bytes", "decompressed_bytes", "segments_opened", "blocks_scanned",
+                         "segments", "dependency_depth", "signals_entries", "cache_served_bytes"):
+                d[f"max_{name}"] = max(m[name] for m in mets)
+            if temp == "cold":
+                d["warm_served"] = sum(1 for m in mets if m["cache_served_bytes"] > 0)
         out.append(d)
     return out
+
+
+def warm_served_calls(calls):
+    out = []
+    for (statement, state, temp), tries in sorted(calls.groups.items()):
+        if temp != "cold":
+            continue
+        for t, lines in sorted(tries.items()):
+            for c in lines:
+                if c.get("outcome") == "ok" and not c.get("_invalid") and call_metrics(c)["cache_served_bytes"] > 0:
+                    out.append({"statement": statement, "state": state, "try": t,
+                                "cache_served_bytes": call_metrics(c)["cache_served_bytes"]})
+    return out
+
+
+def summary_text(res):
+    out = [f"selective investigations, lane {res['lane']}: {res['verdict']}", ""]
+    out.append("states:")
+    for s in res["states"]:
+        out.append(f"  {s['state']:24} {s['status']}" + (f"  ({s['reason']})" if s.get("reason") else ""))
+    out.append("")
+    out.append(f"{'figure':44} {'status':12} {'value':>14}  verdict")
+    for f in res["figures"]:
+        v = "" if f["value"] is None else str(f["value"])
+        out.append(f"{f['id']:44} {f['status'][:12]:12} {v:>14}  {f['verdict']}"
+                   + (f"  ({f['reason']})" if f["reason"] else ""))
+    out.append("")
+    out.append("statement                       state                temp      p50_s     p95_s  gets  wire_B"
+               "   cpu_s   $/call  warm_served")
+    for s in res["statements"]:
+        head = f"{s['statement'][:31]:31} {s['state'][:20]:20} {s['temp'][:8]:8}"
+        if "status" in s:
+            out.append(f"{head} {s['status']} ({s['reason']})")
+            continue
+        if not s["ok"]:
+            out.append(f"{head} no valid ok call")
+            continue
+        out.append(f"{head} {s['wall_p50_s']:>7} {s['wall_p95_s']:>9} {s['max_total_gets']!s:>5} "
+                   f"{s['max_wire_bytes']!s:>7} {s['server_cpu_s_p50']:>7} {s.get('dollars_per_call', '')!s:>8}"
+                   f"  {s.get('warm_served', '')}")
+    out.append("")
+    out.append("prices:")
+    c = res["cost"]
+    for k, b in c["prices"].items():
+        out.append(f"  {k} = {b['value']}  source: {b['source']}")
+    out.append(f"query frequency assumed (once, for every break-even below): "
+               f"{c['lookups_per_part_month_assumed']} lookups per part-month "
+               f"(source: {c['lookups_per_part_month_source']}); leaf build amortised over "
+               f"{c['amortise_months']} month(s)")
+    for m in c["maintenance"]:
+        if m["status"] != "value":
+            out.append(f"  maintenance {m['signal']}: missing")
+            continue
+        out.append(f"  maintenance {m['signal']}: {m['section_gets']} section GET, {m['leaf_puts']} leaf PUT, "
+                   f"{m['leaf_bytes']} leaf B over {m['parts']} part(s) = ${m['maintenance_per_part_month']}"
+                   f"/part-month")
+    for b in c["break_even"]:
+        out.append(f"  {b['statement']} ({b['signal']}): unfolded ${b['dollars_unfolded']} folded "
+                   f"${b['dollars_folded_leaves']} saving ${b['saving_per_call']}/call; break-even "
+                   f"{b['break_even_lookups_per_part_month']} lookups/part-month")
+    if res["problems"]:
+        out.append("")
+        out.extend(res["problems"])
+    return "\n".join(out) + "\n"
 
 
 def main(argv):
@@ -759,26 +1143,43 @@ def main(argv):
     if cfg["hits"]:
         with open(args.hits_truth) as f:
             answers.update(json.load(f))
-    calls = Calls(calls_raw, answers, problems, statements, cfg["cold_runs"])
-    docs, loads, folds, census, restarts = required_stamps(args.run, cfg, problems)
-    check_loads(loads, truth, problems)
+
+    not_run_path = os.path.join(args.run, "stamps", "not_run.jsonl")
+    not_run = {}
+    if os.path.exists(not_run_path):
+        for line in load_jsonl(not_run_path, problems, "stamps/not_run.jsonl"):
+            not_run.setdefault(line.get("state"), line.get("reason") or "no reason given")
+    query_states = sorted({s for st in statements.values() for s in st.get("states", [])})
+    all_states = sorted(set(query_states) | set(DERIVED) | set(cfg["states"]))
+    live = live_states(cfg, not_run, all_states)
+
+    calls = Calls(calls_raw, problems)
+    calls.judge_all(answers, statements, cfg, problems)
+    check_tries(calls, cfg, problems)
+    coverage = check_coverage(calls, statements, cfg, live, problems)
+    docs, loads, folds, census, restarts, stamps = required_stamps(args.run, cfg, live, problems)
+    check_loads(loads, truth, cfg, problems)
     check_restarts(calls, restarts, problems)
     for w in calls.wrong:
         problems.add("wrong_answer", w)
     for e in calls.errors:
         problems.add("error", e)
 
-    mixed = [(k, v) for k, v in calls.groups.items() if k[1] == "mixed" and k not in calls.unsupported]
-    matrix = {
-        "matrix.wrong_answers": ("value", len(calls.wrong) + len(calls.errors), ""),
-        "matrix.state_rows_exact": (
-            ("value", int(all(c[0].get("_judged") in ("correct", "unjudged") for _, t in mixed for c in t.values())), "")
-            if mixed else ("missing", None, "no calls in mixed")),
-        "matrix.negative_controls": (UNSUPPORTED, None, "the decision 9 mutants are not built or run by this harness"),
-    }
+    def matrix(metric, state):
+        if metric == "matrix.wrong_answers":
+            return "value", len(calls.wrong) + len(calls.errors), ""
+        if metric == "matrix.negative_controls":
+            return UNSUPPORTED, None, "the decision 9 mutants are not built or run by this harness"
+        ok = [c for (_, s, _), t in calls.groups.items() if s == state for v in t.values() for c in v
+              if c.get("outcome") == "ok"]
+        if not ok:
+            return "missing", None, f"no ok call in {state}"
+        return "value", int(all(c.get("_judged") in ("correct", "reference", "unjudged") for c in ok)), ""
+
     stmt_cost = statement_cost(calls, cfg)
-    maint, storage = maintenance_cost(folds, census, cfg)
-    be = break_even(stmt_cost, maint, cfg)
+    maint = maintenance_cost(folds, stamps, cfg, live, problems)
+    storage = storage_cost(census, cfg)
+    be = break_even(stmt_cost, maint, statements)
     basis = price_basis(cfg)
     no_basis = [k for k, b in basis.items() if not b["source"]]
     cost_figs = {
@@ -788,9 +1189,11 @@ def main(argv):
             len(be) if cfg["cost"].get("lookups_per_part_month") is None
             or not cfg["cost"].get("lookups_per_part_month_source") else 0),
     }
-    figures = run_rows(bands, cfg, calls, folds, census, matrix, cost_figs)
+    figures = run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs)
     for f in figures:
-        if f["verdict"] in ("missing", "duplicate", "miss"):
+        if f["verdict"] == "dead_counter":
+            problems.add("dead_counter", f"segmentsOpened {f['statement']} {f['state']}")
+        elif f["verdict"] in ("missing", "duplicate", "miss"):
             problems.add(f["verdict"], f"{f['id']}" + (f": {f['reason']}" if f["reason"] else ""))
     detail = statement_detail(calls)
     costs = {(s["statement"], s["state"]): s for s in stmt_cost}
@@ -799,13 +1202,21 @@ def main(argv):
         if c:
             d["dollars_per_call"] = c["dollars_per_call"]
             d["mean_server_cpu_s"] = c["mean_server_cpu_s"]
+    states = []
+    for s in all_states:
+        if live[s] is not None:
+            states.append({"state": s, "status": "not-run", "reason": live[s]})
+        else:
+            states.append({"state": s, "status": coverage.get(s, "run")})
     verdict = "fail" if problems.lines else "pass"
     res = {
         "lane": cfg["lane"],
         "verdict": verdict,
         "problems": problems.lines,
+        "states": states,
         "figures": figures,
         "statements": detail,
+        "warm_served": warm_served_calls(calls),
         "unjudged_calls": calls.unjudged,
         "cost": {
             "prices": basis,
@@ -821,7 +1232,9 @@ def main(argv):
             "build": docs.get("build.json"),
             "host": docs.get("host.json"),
             "declare": docs.get("declare.json"),
-            "loads": [v for _, v in sorted(loads.items()) if v],
+            "store": docs.get("store.json"),
+            "corpus": docs.get("corpus.json"),
+            "loads": [{k: v for k, v in line.items() if k != "stdout"} for _, line in sorted(loads.items()) if line],
             "folds": [{k: v for k, v in line.items() if k != "stdout"} for _, line in sorted(folds.items()) if line],
         },
     }
