@@ -12,6 +12,12 @@ use ravel_proto::catalog::v1::SnapshotPartRef;
 use super::*;
 use crate::CatalogConfig;
 
+thread_local! {
+    /// zstd decompressions `decode_frame` started on this thread: a frame
+    /// refused before allocation leaves it unchanged.
+    pub(super) static FRAME_DECOMPRESSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 const TENANT: TenantHash = TenantHash([7u8; 16]);
 const SIGNAL: Signal = Signal::Logs;
 const PART_ENTRY_COUNT: u64 = 8;

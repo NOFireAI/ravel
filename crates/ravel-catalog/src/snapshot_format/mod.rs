@@ -23,6 +23,10 @@ pub use error::SnapshotFormatError;
 pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head};
 pub use kidx::{
     DEFAULT_MAX_KEY_INDEX_LEAF_BODY_BYTES, EncodedKeyIndexLeaf, KEY_INDEX_LEAF_FORMAT_VERSION,
+    KEY_INDEX_LEAF_GET_CEILING, KEY_INDEX_MAX_PROBED_PARTS, KEY_INDEX_SET_PROBE_MAX_RUNS,
+    KEY_INDEX_T1_BYTES, KeyIndexKeyAnswer, KeyIndexSetAnswer, KeyIndexSetDecline,
+    KeyIndexSetPolicy, KeyIndexSetProbe, decoded_bound, key_index_root_shape,
+    probe_key_index_leaf_set_ranged,
     KEY_INDEX_LEAF_MAGIC, KEY_INDEX_LEAF_MIN_BUCKET_BITS, KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS,
     KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS, KeyIndexBucketRange, KeyIndexLeafBreach,
     KeyIndexLeafEncodeError, KeyIndexLeafEntry, KeyIndexLeafError, KeyIndexLeafInput,
