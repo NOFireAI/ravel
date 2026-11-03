@@ -19,6 +19,10 @@ pub(super) struct PlanCounts {
     /// blocks from that read ([`open_segment_whole`]); its `segs` entry is
     /// `None`.
     unplanned: Vec<bool>,
+    /// Per segment, in snapshot order: the KEY_IDX probe decoded its footer
+    /// and recorded that open under the plan phase (issue #3745), so an
+    /// unplanned open of it does not record a second one.
+    probed: Vec<bool>,
     /// Relevant segments the plan phase read whole instead of counting from the
     /// skip index (#761). A segment planned from footer alone or from the skip
     /// index carries its plan footer forward (`PlannedUnit::footer` is `Some`); the
@@ -534,6 +538,7 @@ async fn compute_plan_counts(
     // this `Send` boxed future needs.
     let mut prunes = Vec::with_capacity(segments.len());
     let mut unplanned = vec![false; segments.len()];
+    let mut probed = vec![false; segments.len()];
     let skip_sub_bound = skips_sub_bound_plans(ctx, segments, plan_concurrency);
     for (idx, seg) in segments.iter().enumerate() {
         // Refuse an unreadable version BEFORE the plan probe, not after. This
@@ -604,6 +609,7 @@ async fn compute_plan_counts(
             PlanPassRead::Probed(probe) => {
                 key_index.segments_pruned += probe.segments_pruned;
                 unplanned[idx] = probe.segments_pruned == 0;
+                probed[idx] = true;
                 continue;
             }
         };
@@ -703,6 +709,7 @@ async fn compute_plan_counts(
         by_min_ts,
     );
     counts.deferred = deferred;
+    counts.probed = probed;
     Ok(Arc::new(counts))
 }
 
@@ -745,6 +752,7 @@ impl PlanCounts {
         PlanCounts {
             segs,
             unplanned,
+            probed: Vec::new(),
             full_reads,
             global,
             key_index,
@@ -862,6 +870,7 @@ impl PlanCounts {
                         whole_object: None,
                         dirs: None,
                         unplanned: true,
+                        footer_counted: self.probed.get(seg_idx).copied().unwrap_or(false),
                     });
                 }
                 let unit = self.segs.get(seg_idx)?.as_ref()?;
@@ -885,6 +894,7 @@ impl PlanCounts {
                     whole_object,
                     dirs,
                     unplanned: false,
+                    footer_counted: true,
                 })
             })
             .collect()
@@ -1175,6 +1185,10 @@ pub(super) struct OwnedSeg {
     /// `whole_object` and `dirs` all empty. The open's own pruning supplies
     /// the survivor list a row-ref resolves against.
     pub(super) unplanned: bool,
+    /// The plan pass already recorded this object's footer open (a planned
+    /// segment, or an unplanned one the KEY_IDX probe read), so the scan's
+    /// open of this unit records none (issue #3745).
+    pub(super) footer_counted: bool,
 }
 
 /// Groups `indices` (a segment's surviving whole-object block indices,
@@ -1237,6 +1251,7 @@ pub(super) fn owned_whole_segments(
                 whole_object: None,
                 dirs: None,
                 unplanned: false,
+                footer_counted: false,
             });
         }
         ordinal += 1;
@@ -3551,6 +3566,7 @@ mod carried_directory_reservation_tests {
                 footer: None,
             })],
             unplanned: vec![false],
+            probed: vec![false],
             full_reads: 1,
             global: None,
             key_index: KeyIndexPruning::default(),

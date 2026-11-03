@@ -1817,6 +1817,9 @@ impl LogSegmentFetcher {
         let result = self
             .settle_version_refusal(seg_ref, ReadPhases::SCAN.blocks, accounting, result)
             .await;
+        if let Ok(Some(_)) = &result {
+            accounting.add_segments_opened(1);
+        }
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
         result
     }
@@ -1888,6 +1891,9 @@ impl LogSegmentFetcher {
         let result = self
             .settle_version_refusal(seg_ref, ReadPhases::SCAN.metadata, accounting, result)
             .await;
+        if let Ok(Some(_)) = &result {
+            accounting.add_segments_opened(1);
+        }
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
         result
     }
@@ -1934,6 +1940,28 @@ impl LogSegmentFetcher {
     /// handle directly; no in-scope caller does, which is a #796 report
     /// finding, not a bug fixed here.
     pub async fn scan_accounted_with_tenant(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<LogSegmentScan>, LogFetchError> {
+        let result = self
+            .scan_accounted_with_tenant_uncounted(seg_ref, tenant_hash, query, columns, accounting)
+            .await;
+        if let Ok(Some(_)) = &result {
+            accounting.add_segments_opened(1);
+        }
+        result
+    }
+
+    /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant)
+    /// without the one `segments_opened` it records on a successful open
+    /// (issue #3745), for a caller that records the open itself because it
+    /// can open the same object more than once per query (a retried or
+    /// reopened segment, or one the keyed probe already opened).
+    pub async fn scan_accounted_with_tenant_uncounted(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
@@ -2026,6 +2054,33 @@ impl LogSegmentFetcher {
     /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant)'s doc
     /// comment.
     pub async fn scan_whole_accounted_with_tenant(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<LogSegmentScan>, LogFetchError> {
+        let result = self
+            .scan_whole_accounted_with_tenant_uncounted(
+                seg_ref,
+                tenant_hash,
+                query,
+                columns,
+                accounting,
+            )
+            .await;
+        if let Ok(Some(_)) = &result {
+            accounting.add_segments_opened(1);
+        }
+        result
+    }
+
+    /// [`scan_whole_accounted_with_tenant`](Self::scan_whole_accounted_with_tenant)
+    /// without the one `segments_opened` it records on a successful open, for
+    /// the same callers as
+    /// [`scan_accounted_with_tenant_uncounted`](Self::scan_accounted_with_tenant_uncounted).
+    pub async fn scan_whole_accounted_with_tenant_uncounted(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
@@ -2426,14 +2481,8 @@ impl LogSegmentFetcher {
         {
             caller_accounting.add_data_objects_touched(1);
         }
-        // Issue #3745: every `Ok(Some(..))` branch above opened this object's
-        // footer (the fast path and the skip-decidable branch read it
-        // directly; the fallback's `tenant_bytes_with_footer` reads it as
-        // part of resolving `bytes`) -- unlike `data_objects_touched` above,
-        // this does not gate on `touched`, since a block-level prune that
-        // leaves zero survivors still opened the footer to get there. Only
-        // `Ok(None)` (the ts-relevance check inside `tenant_bytes_with_footer`
-        // dropped the segment before any fetch) opens nothing.
+        // Every `Ok(Some(..))` branch decoded this object's footer, a
+        // zero-survivor prune included; `Ok(None)` read nothing.
         if let Ok(Some(_)) = &result {
             caller_accounting.add_segments_opened(1);
         }
@@ -2541,14 +2590,9 @@ impl LogSegmentFetcher {
                 key_blocks,
             } => (fetch, Some((footer, dirs, survivors, stats, key_blocks))),
         };
-        // Issue #3745: `fetch_keyed_plan`'s `probe_footer_and_keys` reads this
-        // object's footer unconditionally before it can tell `Absent` from
-        // `Planned` apart -- an absent key is dropped only *after* the tail
-        // probe decoded it (docs/query-engine.md, "Exact-key probe"), so both
-        // arms here opened the footer. The `Unkeyed` arm above already
-        // returned through `plan_segment_primed`, which records its own
-        // footer open, so counting it again here would double it for the
-        // same object.
+        // Both arms decoded the footer before the key probe could tell them
+        // apart; the `Unkeyed` arm returned above and was recorded by
+        // `plan_segment_primed`.
         plan_accounting.add_segments_opened(1);
         let requests = fetch.probe_gets + fetch.metadata_gets + fetch.block_range_gets;
         fetch_span.record("s3_requests", requests);
@@ -2640,10 +2684,7 @@ impl LogSegmentFetcher {
         plan_accounting.merge_snapshot(snapshot.phase(QueryPhase::Plan));
         key_index_accounting.merge_snapshot(snapshot.phase(QueryPhase::KeyIndex));
         let (absent, fetch) = result?;
-        // Issue #3745: `fetch_key_probe` always reads the footer probe (the
-        // doc comment above: "no directory past the footer, no block"), for
-        // an absent key exactly as for a present or declined one, so this
-        // site records one open whatever `absent` turns out to be.
+        // The footer is decoded whether or not the key turns out absent.
         plan_accounting.add_segments_opened(1);
         fetch_span.record("s3_requests", fetch.probe_gets + fetch.metadata_gets);
         fetch_span.record("s3_bytes", fetch.block_bytes_fetched);

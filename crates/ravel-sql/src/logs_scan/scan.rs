@@ -146,18 +146,14 @@ impl PartitionCtx {
         self.phase_accounting.scan().add_data_objects_touched(1);
     }
 
-    /// Record this query's one footer open of the data object the caller
-    /// just opened (issue #3745), under `stats.phases[scan].segmentsOpened`.
-    ///
-    /// Same designated-recorder rule as
-    /// [`record_data_object_touched`](Self::record_data_object_touched) and
-    /// called beside it at every site: each route opens a given object's
-    /// footer at most once per query, so counting here (rather than at every
-    /// GET the open issues) keeps one ranged open's several block GETs at one
-    /// segment, and the planned route's own recorder
-    /// (`ravel_query::LogSegmentFetcher::plan_segment`) is the only other
-    /// place this figure is touched, under the same route-exclusivity
-    /// argument.
+    /// Record the footer open of the segment a fast-path or unplanned open
+    /// just returned (issue #3745), under the scan phase its reads were
+    /// charged to. The scan opens through the fetcher's uncounted entry
+    /// points and calls this once per segment, on the first open that
+    /// succeeds, so a retried open, a row-path reopen and a revoked prefetch
+    /// add nothing. A segment the plan pass opened (planned, or probed for
+    /// its KEY_IDX) was recorded there under the plan phase and is not
+    /// recorded here ([`OwnedSeg::footer_counted`]).
     fn record_segment_opened(&self) {
         self.phase_accounting.scan().add_segments_opened(1);
     }
@@ -271,7 +267,7 @@ fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
         refuse_unreadable_version(&seg)?;
         let mut scan = ctx
             .fetcher
-            .scan_whole_accounted_with_tenant(
+            .scan_whole_accounted_with_tenant_uncounted(
                 &seg,
                 ctx.tenant_hash,
                 &ctx.query,
@@ -308,7 +304,7 @@ fn open_segment_ranged(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
         refuse_unreadable_version(&seg)?;
         let mut scan = ctx
             .fetcher
-            .scan_accounted_with_tenant(
+            .scan_accounted_with_tenant_uncounted(
                 &seg,
                 ctx.tenant_hash,
                 &ctx.query,
@@ -1624,7 +1620,7 @@ impl LogScanStream {
                         this.blocks.record_fast_path_route(true);
                         this.ctx.record_open_shape(true);
                         this.ctx.record_data_object_touched();
-                        this.ctx.record_segment_opened();
+                        this.count_current_open = true;
                         match open {
                             PrefetchOpen::InFlight(fut) => {
                                 this.open_started = Some(issued);
@@ -1637,6 +1633,9 @@ impl LogScanStream {
                                     .add_duration(at.saturating_duration_since(issued));
                                 match *opened {
                                     Ok(Some(scan)) => {
+                                        if std::mem::take(&mut this.count_current_open) {
+                                            this.ctx.record_segment_opened();
+                                        }
                                         if this.fast_path_records_survivors() {
                                             this.current_survivors =
                                                 Some(Arc::new(scan.survivor_block_indices()));
@@ -1675,6 +1674,7 @@ impl LogScanStream {
                             whole_object,
                             dirs,
                             unplanned,
+                            footer_counted,
                         }) => {
                             // ADR-2677 decision 6: a segment whose every row
                             // is above the TopK threshold is not opened for
@@ -1705,6 +1705,7 @@ impl LogScanStream {
                             // follow-up).
                             this.current_whole_object = whole_object;
                             this.current_unplanned = unplanned;
+                            this.count_current_open = !footer_counted;
                             this.retrying = false;
                             this.block_cursor = 0;
                             this.consecutive_fallbacks = 0;
@@ -1727,7 +1728,6 @@ impl LogScanStream {
                                 // this site is once per segment per query and why
                                 // the planned route's recorder cannot also fire.
                                 this.ctx.record_data_object_touched();
-                                this.ctx.record_segment_opened();
                                 LogScanState::Opening(open_segment_fast(
                                     Arc::clone(&this.ctx),
                                     seg,
@@ -1741,7 +1741,6 @@ impl LogScanStream {
                                 this.current_by_chunk = false;
                                 this.blocks.unplanned_segments.add(1);
                                 this.ctx.record_data_object_touched();
-                                this.ctx.record_segment_opened();
                                 LogScanState::Opening(open_segment_whole(
                                     Arc::clone(&this.ctx),
                                     seg,
@@ -1778,6 +1777,9 @@ impl LogScanStream {
                 LogScanState::Opening(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(Some(scan))) => {
                         this.retrying = false;
+                        if std::mem::take(&mut this.count_current_open) {
+                            this.ctx.record_segment_opened();
+                        }
                         if let Some(started) = this.open_started.take() {
                             this.blocks.open_elapsed.add_elapsed(started);
                         }
