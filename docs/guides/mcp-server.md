@@ -8,13 +8,13 @@ which has its own guide: [Ravel Agents](agents.md).
 > off by default. Build `ravel-server` with `--features mcp`, then run it
 > with `--mcp` (only supported under `--mode all` or `--mode query`) to
 > mount `POST /mcp` on the query router; `--mcp-allowed-origins` is required
-> once that listener is reachable from anywhere but localhost. Seven tools are
+> once that listener is reachable from anywhere but localhost. Eight tools are
 > served today: `ravel_capabilities`, `ravel_describe_data`,
 > `ravel_find_labels`, `ravel_explain_query`, `ravel_query_sql`,
-> `ravel_query_promql` and `ravel_get_trace`. The other two are catalogued, so
-> `tools/list` returns them, and a call to one refuses with a
-> `method_not_found` protocol error until its body lands; the sections below
-> describe the surface as designed. The [MCP reference](../reference/mcp.md)
+> `ravel_query_promql`, `ravel_get_trace` and `ravel_analyze_timeseries`. The
+> other one, `ravel_search_logs`, is catalogued, so `tools/list` returns it,
+> and a call to it refuses with a `method_not_found` protocol error until its
+> body lands; the sections below describe the surface as designed. The [MCP reference](../reference/mcp.md)
 > carries the split `ravel_capabilities` reports at runtime.
 
 The published image built from `main` compiles in the `mcp` feature, so with
@@ -180,9 +180,13 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   optional logs pass are not built, and a call asking for the logs pass is
   refused as unsupported.
 - `ravel_analyze_timeseries`: change-point detection or a summary statistic
-  over a PromQL range result. The result names the method as a heuristic,
-  states the minimum point count that the method needs, and states whether
-  the input was downsampled first.
+  over each series of a PromQL range result, one row per series. The result
+  names the method as a heuristic (`accuracy.exact` is `false`), and each
+  row states the minimum point count that the method needs and whether the
+  series was downsampled first. A series with too few points is a row
+  marked `too_few_points`, not a failed call. The range rules are
+  `ravel_query_promql`'s, and a read that skipped part of its coverage is
+  refused; read the partial series through `ravel_query_promql` instead.
 
 ## Ravel Agents
 

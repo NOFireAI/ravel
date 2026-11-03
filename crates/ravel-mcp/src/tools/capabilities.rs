@@ -253,8 +253,8 @@ mod tests {
             .clone();
         assert_eq!(rows[0][1]["revisions"], json!(["2026-07-28", "2025-11-25"]));
         // Served and catalogued are separate lists, and the exact split is
-        // what this build does today: seven bodies, two declared names that
-        // refuse every call.
+        // what this build does today: eight bodies, one declared name that
+        // refuses every call.
         assert_eq!(
             rows[1][1]["enabled"],
             json!([
@@ -264,13 +264,11 @@ mod tests {
                 "ravel_explain_query",
                 "ravel_query_sql",
                 "ravel_query_promql",
-                "ravel_get_trace"
+                "ravel_get_trace",
+                "ravel_analyze_timeseries"
             ])
         );
-        assert_eq!(
-            rows[1][1]["catalogued"],
-            json!(["ravel_search_logs", "ravel_analyze_timeseries"])
-        );
+        assert_eq!(rows[1][1]["catalogued"], json!(["ravel_search_logs"]));
         assert_eq!(rows[3][1]["hash"], json!(ctx.tenant_hash.to_hex()));
         assert_eq!(rows[4][1]["enabled"], json!(["metrics", "logs", "traces"]));
     }

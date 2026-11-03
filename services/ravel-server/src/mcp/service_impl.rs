@@ -12,7 +12,10 @@
 //! filter (ADR-1374 amendment 2026-09-12 item 6: the tool layer owns
 //! envelope finishing), and so do `promql_instant` and `promql_range`,
 //! because `ravel_query_promql` groups the per-sample rows into one row per
-//! series and caps series, not samples. Nothing else: the admission permit, the
+//! series and caps series, not samples. `analytics` also stops before the
+//! caps, after it runs the op over each series of the range result: its rows
+//! are already one per series, and `ravel_analyze_timeseries` caps them and
+//! labels the result a heuristic. Nothing else: the admission permit, the
 //! deadline clamp, the cost record, the usage guard, the audit submission, the
 //! partial-coverage gate, and the error redaction all live inside the service
 //! layer, and a tool call takes exactly one permit because it makes exactly
@@ -40,18 +43,23 @@
 
 use std::time::Duration;
 
+use ravel_analytics::{AnalyticsError, ChangeKind, ChangePointParams, SummaryParams};
 use ravel_catalog::MetricKind;
 use ravel_mcp::budget::McpEffectiveBudgets;
+use ravel_mcp::catalog::AnalyzeOp;
 use ravel_mcp::draft::{Draft, EstimateComponent, ExplainColumn, ExplainOutcome, cursor_signal};
-use ravel_mcp::envelope::{AnyJson, Cell, Envelope, Failure};
+use ravel_mcp::envelope::{AnyJson, Cell, Column, Data, Envelope, Failure, FailureClass, Row};
 use ravel_mcp::service::{
     DescribeOutcome, DescribeRequest, DescribedColumn, DescribedCoverage, DescribedFamily,
     QueryBackend, TraceLookupRequest,
 };
-use ravel_promql::{RangeValue, Value as PromValue};
+use ravel_mcp::tools::analyze_timeseries::{
+    AnalyticsCall, CHANGE_POINT_MIN_POINTS, SUMMARY_MIN_POINTS,
+};
+use ravel_promql::{RangeMatrix, RangeValue, Value as PromValue};
 use ravel_query::http::{InstantRequest, MetadataRequest, RangeRequest};
 use ravel_query::{PhaseAccountingSnapshot, QueryPhase, QueryStats, RequestBudgets};
-use ravel_types::{CommitToken, Signal, TenantHash};
+use ravel_types::{CommitToken, LabelSet, Signal, TenantHash};
 use rmcp::model::{ProgressNotificationParam, ProgressToken};
 use rmcp::service::{Peer, RoleServer};
 use serde::Deserialize;
@@ -129,22 +137,9 @@ impl ServiceBackend {
     }
 
     /// The envelope of an operation whose outcome carries a full
-    /// [`QueryStats`]: its spend, its per-phase split, and its coverage.
-    fn stats_envelope(
-        &self,
-        envelope: Envelope,
-        stats: &QueryStats,
-        partial: bool,
-        warnings: Vec<String>,
-    ) -> Envelope {
-        d4::finish(
-            self.uncapped_stats_envelope(envelope, stats, partial, warnings),
-            &self.budgets,
-        )
-    }
-
-    /// [`Self::stats_envelope`] before the caps, for a tool that reshapes
-    /// the rows before it caps them.
+    /// [`QueryStats`]: its spend, its per-phase split, and its coverage,
+    /// before the caps, for a tool that reshapes the rows before it caps
+    /// them.
     fn uncapped_stats_envelope(
         &self,
         mut envelope: Envelope,
@@ -206,26 +201,14 @@ impl ProgressReporter {
     }
 }
 
-/// `ravel_analyze_timeseries`'s request, as it crosses the port: the
-/// caller-visible shape of [`AnalyticsRequest`], whose own type is not
-/// reachable from `ravel-mcp`.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AnalyticsArgs {
-    query: String,
-    start_ms: i64,
-    end_ms: i64,
-    step_ms: i64,
-    #[serde(default)]
-    min_tokens: Vec<String>,
-    #[serde(default)]
-    deadline_ms: Option<u64>,
-    #[serde(default)]
-    allow_partial: bool,
-}
+/// ADR-0028 decision 4's per-call series cap, the bound `POST
+/// /api/v1/analytics` applies before any op runs. More is refused as
+/// `budget_exceeded`, never truncated.
+const ANALYTICS_MAX_SERIES: usize = 1000;
 
-/// The exemplar query's request, same reachability reason as
-/// [`AnalyticsArgs`].
+/// The exemplar query's request, as it crosses the port: the caller-visible
+/// shape of [`ExemplarsRequest`], whose own type is not reachable from
+/// `ravel-mcp`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExemplarsArgs {
@@ -259,6 +242,154 @@ fn deadline(requested_ms: Option<u64>, ceiling: Duration) -> Duration {
         Some(ms) => Duration::from_millis(ms).min(ceiling),
         None => ceiling,
     }
+}
+
+/// One row per series of `op`'s output, in [`AnalyzeOp::columns`] order.
+///
+/// `change_point` always downsamples a series over the 2000-point cap, so a
+/// long series is a row rather than a refusal. A series below the op's
+/// minimum point count is a row with `too_few_points: true` and null
+/// figures, not a failed call. The op reads each sample's `ts_ns`, which the
+/// evaluator already emits in nanoseconds.
+fn analysis_data(op: AnalyzeOp, matrix: RangeMatrix) -> Result<Data, Failure> {
+    let rows = matrix
+        .into_iter()
+        .map(|(labels, samples)| {
+            let points: Vec<(i64, f64)> = samples
+                .into_iter()
+                .map(|sample| (sample.ts_ns, sample.value))
+                .collect();
+            let series = labels_cell(&labels);
+            match op {
+                AnalyzeOp::ChangePoint => change_point_row(series, &points),
+                AnalyzeOp::Summary => summary_row(series, &points),
+            }
+        })
+        .collect::<Result<Vec<Row>, Failure>>()?;
+    let types: &[&str] = match op {
+        AnalyzeOp::ChangePoint => &[
+            "json",
+            "string",
+            "timestamp",
+            "double",
+            "int64",
+            "int64",
+            "bool",
+            "int64",
+            "bool",
+        ],
+        AnalyzeOp::Summary => &[
+            "json", "double", "double", "double", "double", "int64", "int64", "bool", "int64",
+            "bool",
+        ],
+    };
+    Ok(Data {
+        columns: op
+            .columns()
+            .iter()
+            .zip(types)
+            .map(|(name, r#type)| Column {
+                name: (*name).to_string(),
+                r#type: (*r#type).to_string(),
+            })
+            .collect(),
+        row_count: rows.len() as u64,
+        rows,
+    })
+}
+
+fn change_point_row(series: Cell, points: &[(i64, f64)]) -> Result<Row, Failure> {
+    let min_points = Cell::Int(i128::from(CHANGE_POINT_MIN_POINTS));
+    let result =
+        match ravel_analytics::change_point(points, &ChangePointParams { downsample: true }) {
+            Ok(result) => result,
+            Err(AnalyticsError::EmptySeries) => {
+                return Ok(vec![
+                    series,
+                    Cell::Str(change_kind(ChangeKind::Indeterminable).to_string()),
+                    Cell::Null,
+                    Cell::Null,
+                    Cell::Int(0),
+                    Cell::Int(0),
+                    Cell::Bool(false),
+                    min_points,
+                    Cell::Bool(true),
+                ]);
+            }
+            Err(error) => return Err(d4::internal(format!("change_point: {error}"))),
+        };
+    let too_few = (result.original_points as u64) < CHANGE_POINT_MIN_POINTS;
+    Ok(vec![
+        series,
+        Cell::Str(change_kind(result.kind).to_string()),
+        result.ts_ns.map_or(Cell::Null, Cell::Timestamp),
+        if too_few {
+            Cell::Null
+        } else {
+            Cell::Float(result.score)
+        },
+        Cell::Int(result.original_points as i128),
+        Cell::Int(result.nan_excluded as i128),
+        Cell::Bool(result.downsampled),
+        min_points,
+        Cell::Bool(too_few),
+    ])
+}
+
+fn summary_row(series: Cell, points: &[(i64, f64)]) -> Result<Row, Failure> {
+    let min_points = Cell::Int(i128::from(SUMMARY_MIN_POINTS));
+    let (figures, counted, nan_excluded) = match ravel_analytics::summary(
+        points,
+        &SummaryParams {
+            percentiles: Vec::new(),
+        },
+    ) {
+        Ok(result) => {
+            let counted = points.len().saturating_sub(result.nan_excluded);
+            let figures = [result.median, result.mad, result.stddev, result.variance];
+            (Some(figures), counted, result.nan_excluded)
+        }
+        Err(AnalyticsError::EmptySeries) => (None, 0, 0),
+        Err(error) => return Err(d4::internal(format!("summary: {error}"))),
+    };
+    let too_few = (counted as u64) < SUMMARY_MIN_POINTS;
+    let mut row = vec![series];
+    match figures {
+        Some(figures) if !too_few => row.extend(figures.map(Cell::Float)),
+        _ => row.extend([Cell::Null, Cell::Null, Cell::Null, Cell::Null]),
+    }
+    row.extend([
+        Cell::Int(counted as i128),
+        Cell::Int(nan_excluded as i128),
+        Cell::Bool(false),
+        min_points,
+        Cell::Bool(too_few),
+    ]);
+    Ok(row)
+}
+
+/// The kind's name, spelled as `POST /api/v1/analytics` serializes it.
+fn change_kind(kind: ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Spike => "spike",
+        ChangeKind::Dip => "dip",
+        ChangeKind::StepChange => "step_change",
+        ChangeKind::TrendChange => "trend_change",
+        ChangeKind::DistributionChange => "distribution_change",
+        ChangeKind::Stationary => "stationary",
+        ChangeKind::Indeterminable => "indeterminable",
+    }
+}
+
+fn labels_cell(labels: &LabelSet) -> Cell {
+    let mut map = serde_json::Map::new();
+    for label in labels.iter() {
+        map.insert(
+            label.name.clone(),
+            serde_json::Value::String(label.value.clone()),
+        );
+    }
+    Cell::Map(map)
 }
 
 fn args_of<T: for<'de> Deserialize<'de>>(request: &AnyJson, tool: &str) -> Result<T, Failure> {
@@ -382,7 +513,7 @@ impl QueryBackend for ServiceBackend {
         tenant_hash: TenantHash,
         request: &AnyJson,
     ) -> Result<Envelope, Failure> {
-        let args: AnalyticsArgs = args_of(request, "ravel_analyze_timeseries")?;
+        let args = AnalyticsCall::from_json(request)?;
         let native = AnalyticsRequest {
             query: args.query.clone(),
             start_ms: args.start_ms,
@@ -421,8 +552,29 @@ impl QueryBackend for ServiceBackend {
                 )
             })
             .collect();
-        envelope.data = Self::value_data(outcome.value);
-        Ok(self.stats_envelope(envelope, &outcome.stats, outcome.partial, Vec::new()))
+        let matrix = match outcome.value {
+            PromValue::Matrix(matrix) => matrix,
+            other => {
+                return Err(d4::invalid_argument(format!(
+                    "query evaluates to {}, but ravel_analyze_timeseries requires a range vector",
+                    other.type_name()
+                )));
+            }
+        };
+        if matrix.len() > ANALYTICS_MAX_SERIES {
+            return Err(Failure {
+                class: FailureClass::BudgetExceeded,
+                message: format!(
+                    "analytics call matched {} series, exceeding the limit of \
+                     {ANALYTICS_MAX_SERIES}",
+                    matrix.len()
+                ),
+                counter: Some("series".to_string()),
+            });
+        }
+        envelope.data = analysis_data(args.op, matrix)?;
+        let warnings = outcome.stats.warnings.clone();
+        Ok(self.uncapped_stats_envelope(envelope, &outcome.stats, outcome.partial, warnings))
     }
 
     async fn exemplars(
