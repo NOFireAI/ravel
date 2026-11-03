@@ -1718,10 +1718,13 @@ call-deadline amendment settles both.
 3. D7: a `ravel_search_logs` call with predicates takes two admission
    permits, one for each service call, one after the other. The service
    layer takes and releases each permit; the call never holds two at once,
-   so it cannot deadlock against itself at a concurrency ceiling of 1, and
-   both permits sit inside the one deadline of item 1. Taking one permit
-   for the whole tool call in the adapter as well would hold it while the
-   service layer asks for a second, which deadlocks at a ceiling of 1.
+   so at a concurrency ceiling of 1 its second service call does not find
+   the ceiling taken by its own first, and both permits sit inside the one
+   deadline of item 1. Admission never waits: `QueryControls::admit`
+   (`crates/ravel-query/src/http/service.rs`) is `try_admit`, which rejects
+   at the ceiling rather than queueing. Taking one permit for the whole tool
+   call in the adapter as well would hold it while the service layer asks
+   for its own, which at a ceiling of 1 rejects that call as `unavailable`.
    Every other tool call makes one service call and takes one permit.
 4. D5: a cursor lives until `horizon - grace` from its `mint_ns`, where
    `horizon` is the deployment's protection horizon as a duration and

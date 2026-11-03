@@ -416,6 +416,13 @@ false.
   enforces `max_store_requests` and `max_bytes_scanned` at scan time and
   refuses the read that would cross either.
 
+A tool that runs a PromQL, analytics or SQL query reports its estimate in
+`budget.estimate` in the same spelling: a component the server cannot bound
+is `null` there and is named in `budget.estimate.unbounded`, and
+`estimate_is_upper_envelope` is true only when that list is empty. One statement gets the same flag from
+`ravel_explain_query` and from `ravel_query_sql`. A PromQL or analytics call
+reads `samples`, so its estimate is bounded.
+
 ### Running a statement
 
 `ravel_query_sql` checks the statement from its text, in this order, before

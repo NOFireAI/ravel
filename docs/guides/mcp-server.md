@@ -337,10 +337,15 @@ How the server shaped the result to fit the response cap:
 - `effective`: the server ceiling, the tenant ceiling, and your request,
   combined to their minimum
 - `actual`: what the call spent
-- `estimate`: for `ravel_explain_query`
+- `estimate`: what the server estimated before it read anything, from
+  `ravel_explain_query` and from each tool that runs a PromQL, analytics or
+  SQL query (the exemplars tool computes no estimate). A component
+  the server cannot bound is `null`, not 0, and `estimate.unbounded` names
+  it.
 - `estimate_is_upper_envelope`: true when every component of the estimate
-  is bounded, so the estimate is an upper envelope; false when the explain
-  names a component unbounded
+  is bounded, so the estimate is an upper envelope; false when
+  `estimate.unbounded` names a component. `ravel_explain_query` and
+  `ravel_query_sql` report the same value for one statement.
 
 ### `evidence`
 
