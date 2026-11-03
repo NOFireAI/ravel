@@ -1066,7 +1066,7 @@ async fn otap_batch_is_refused_by_the_ingest_hold() {
         store.clone(),
         IngestConcurrencyLimit::Unlimited,
         ravel_server::config::IngestHoldConfig {
-            queued_flushes: 16,
+            queued_flushes: None,
             max_wait: std::time::Duration::from_millis(200),
         },
     )
