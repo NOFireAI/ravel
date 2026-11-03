@@ -351,12 +351,20 @@ class Corpus(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             t, rows = gen(d, traces=1, hours=1, seed=11)
         present = t["request_id"]["present"]
+        self.assertEqual(len(rows["logs"]), 5)
+        self.assertEqual(sum(1 for r in rows["logs"] if r["request_id"] == present), 1)
+        # The planted row carries the planted id in the data, so its drawn
+        # form (request_id_of its trace and position) exists in no log row:
+        # a list that holds every unplanted row's id, and only ids the data
+        # holds, has excluded it. assertNotIn(present, ids) alone cannot
+        # fail, because the lists never spell the planted constant.
+        unplanted = {r["request_id"] for r in rows["logs"] if r["request_id"] != present}
+        self.assertEqual(len(unplanted), 4)
         for size, ids in t["in_lists"]["request_id"].items():
             self.assertEqual(len(ids), min(int(size), 4), size)
             self.assertEqual(len(set(ids)), len(ids), size)
-            self.assertNotIn(present, ids, size)
-        self.assertEqual(len(rows["logs"]), 5)
-        self.assertEqual(sum(1 for r in rows["logs"] if r["request_id"] == present), 1)
+            self.assertLessEqual(set(ids), unplanted, size)
+        self.assertEqual(set(t["in_lists"]["request_id"]["1000"]), unplanted)
 
     def test_trace_id_in_lists_recount(self):
         t = self.truth
