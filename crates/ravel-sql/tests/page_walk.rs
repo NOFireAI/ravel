@@ -195,8 +195,8 @@ use datafusion::sql::sqlparser::ast::{
     Expr as SqlExpr, Ident, OrderBy, OrderByExpr, OrderByKind, OrderByOptions, Statement,
 };
 use ravel_sql::{
-    LOGS_TABLE, NotTotalOrder, PagePlan, PagePlanError, ResumePosition, SAMPLES_TABLE, logs_schema,
-    plan_page, public_schema, resume_value,
+    LOGS_TABLE, NotTotalOrder, PagePlan, PagePlanError, ResumePosition, ResumeValue, SAMPLES_TABLE,
+    logs_schema, plan_page, public_schema, resume_value,
 };
 
 /// The `ts` the two tied rows share.
@@ -1134,6 +1134,58 @@ async fn a_desc_term_under_an_appended_tiebreak_walks_every_row_once_in_order() 
     );
     let reference =
         rows_of(&execute(&ctx, &reference_statement(DESC_TIEBREAK_STATEMENT, &plan)).await);
+    assert_eq!(sequence_finding(&reference, &found), None);
+}
+
+/// A statement ordered first by `-9223372036854775808`, which DataFusion types
+/// `Int64` by its signed value.
+const NEGATED_MIN_STATEMENT: &str =
+    "SELECT ts, series_id, -9223372036854775808 AS neg FROM samples ORDER BY neg, ts, series_id";
+
+/// A negated literal term takes the kind of the value DataFusion computes for
+/// it, so the cursor minted from page one's last row the way `ravel_query_sql`
+/// mints it (`resume_value` over the page's own output) plans page two, and
+/// the walk delivers every row once in order.
+///
+/// FLIP: with `expression_cursor_support` stripping the minus before it
+/// classifies the literal by its text, the term is proven `UInt` from the text
+/// `9223372036854775808`, the page's `Int64` column mints `Int`, and page two
+/// is refused with `ResumeValueTypeMismatch { position: 1, column: "neg",
+/// expected: "UInt", found: "Int" }`.
+#[tokio::test]
+async fn a_negated_i64_min_term_pages_past_its_first_page() {
+    let ctx = context();
+    let first = plan_page(NEGATED_MIN_STATEMENT, None).expect("planned");
+    assert_eq!(first.not_total, None);
+    let batches = execute(&ctx, &first.statement).await;
+    let (batch, offset) = row_at(&batches, 0);
+    let column = batch.column_by_name("neg").expect("neg column");
+    assert_eq!(
+        resume_value(column.as_ref(), offset),
+        Some(ResumeValue::Int(i64::MIN)),
+    );
+    let tuple = first
+        .order_by
+        .iter()
+        .map(|term| {
+            let column = batch.column_by_name(&term.column).expect("order column");
+            resume_value(column.as_ref(), offset).expect("a resume value")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tuple.len(), 3, "{:?}", first.order_by);
+    let second = plan_page(NEGATED_MIN_STATEMENT, Some(&ResumePosition::new(tuple)));
+    assert!(second.is_ok(), "page two should plan, got {second:?}");
+
+    let found = walk(&ctx, NEGATED_MIN_STATEMENT).await;
+    assert_eq!(found.stopped_at_null, None);
+    assert_eq!(
+        found.pages,
+        FIXTURE.len() + 1,
+        "pages, the empty last one included"
+    );
+    let reference =
+        rows_of(&execute(&ctx, &reference_statement(NEGATED_MIN_STATEMENT, &first)).await);
+    assert_eq!(reference.len(), FIXTURE.len());
     assert_eq!(sequence_finding(&reference, &found), None);
 }
 
