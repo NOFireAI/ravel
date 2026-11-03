@@ -30,6 +30,151 @@ RAVEL_UPDATE_MCP_REFERENCE=1 cargo test -p ravel-mcp --test mcp_reference
 ### Query tools
 
 <!-- BEGIN GENERATED MCP TOOLS -->
+#### `ravel_capabilities`
+
+- Title: Capabilities
+- Description: Protocol and server version, enabled tools, effective budget ceilings, dialect summaries, tenant hash, enabled signals
+- Annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`
+
+No arguments.
+
+#### `ravel_describe_data`
+
+- Title: Describe data
+- Description: Effective schema, indexed keys, metric families, freshness watermark, coverage window, committed row count (an upper bound)
+- Annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`
+
+| Argument | Type | Required | Description |
+| --- | --- | --- | --- |
+| `signal` | string | yes |  |
+| `cursor` | string | no |  |
+
+#### `ravel_find_labels`
+
+- Title: Find labels
+- Description: Metric names, label names, or label values for a selector
+- Annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`
+
+| Argument | Type | Required | Description |
+| --- | --- | --- | --- |
+| `time_range` | object {`end_ns`: string, `start_ns`: string} | yes |  |
+| `deadline_ms` | integer | no |  |
+| `filter` | string | no |  |
+| `label_name` | string | no |  |
+| `max_response_bytes` | integer | no | Bounds the whole serialized envelope; default 512 KiB, floored at 256 KiB. A label list is bounded by its own page, but the page is still what a caller may need to make smaller. |
+| `selector` | string | no |  |
+
+#### `ravel_explain_query`
+
+- Title: Explain query
+- Description: Validate a SQL statement, estimate its cost, and return the plan shape. No scan runs.
+- Annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`
+
+| Argument | Type | Required | Description |
+| --- | --- | --- | --- |
+| `query` | string | yes |  |
+| `time_range` | object {`end_ns`: string, `start_ns`: string} | yes |  |
+| `deadline_ms` | integer | no |  |
+| `max_response_bytes` | integer | no | Bounds the whole serialized envelope; default 512 KiB, floored at 256 KiB. An explain returns a plan and an effective schema, both of which grow with the statement. |
+
+#### `ravel_query_sql`
+
+- Title: Query SQL
+- Description: One SELECT over one table
+- Annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`
+
+| Argument | Type | Required | Description |
+| --- | --- | --- | --- |
+| `query` | string | yes |  |
+| `time_range` | object {`end_ns`: string, `start_ns`: string} | yes |  |
+| `cursor` | string | no |  |
+| `deadline_ms` | integer | no |  |
+| `evidence_ref` | string | no | Not served by this build: any value is refused as `unsupported`. |
+| `max_bytes_scanned` | integer | no |  |
+| `max_response_bytes` | integer | no | Bounds the whole serialized envelope; default 512 KiB, floored at 256 KiB. |
+| `max_rows` | integer | no | Rows returned; default 200, ceiling 5,000. |
+| `max_segments` | integer | no |  |
+| `max_store_requests` | integer | no |  |
+
+#### `ravel_query_promql`
+
+- Title: Query PromQL
+- Description: Instant or range PromQL evaluation
+- Annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`
+
+| Argument | Type | Required | Description |
+| --- | --- | --- | --- |
+| `query` | string | yes |  |
+| `allow_partial_coverage` | boolean | no | Absent means no consent: a partial-coverage result is refused rather than the whole call failing to deserialize. |
+| `deadline_ms` | integer | no |  |
+| `evaluation_time` | string | no | Set alone for an instant evaluation. Exactly one of this or the `time_range`/`step` pair must be present. |
+| `evidence_ref` | string | no | Not served by this build: any value is refused as `unsupported`. |
+| `max_bytes_scanned` | integer | no |  |
+| `max_response_bytes` | integer | no | Bounds the whole serialized envelope; default 512 KiB, floored at 256 KiB. |
+| `max_rows` | integer | no | Series rows returned; default 200, ceiling 5,000. |
+| `max_segments` | integer | no |  |
+| `max_store_requests` | integer | no |  |
+| `step` | string | no | A duration with a unit, such as `30s`. The step and every time must be a whole millisecond. |
+| `time_range` | object {`end_ns`: string, `start_ns`: string} | no | Set together with `step` for a range evaluation. Exactly one of this pair or `evaluation_time` must be present. Steps run from `start_ns` while below `end_ns`. |
+
+#### `ravel_search_logs`
+
+- Title: Search logs
+- Description: Typed log search compiled to SQL, ordered by (ts, observed_ts). Rows grouped by attribute key set; __ravel_group_attrs lists attributes the group shares once
+- Annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`
+
+| Argument | Type | Required | Description |
+| --- | --- | --- | --- |
+| `time_range` | object {`end_ns`: string, `start_ns`: string} | yes |  |
+| `cursor` | string | no |  |
+| `deadline_ms` | integer | no |  |
+| `evidence_ref` | string | no | Not served by this build: any value is refused as `unsupported`. |
+| `has_word` | string | no | Rows whose body holds these words as a run of whole tokens. |
+| `max_bytes_scanned` | integer | no |  |
+| `max_response_bytes` | integer | no | Bounds the whole serialized envelope; default 512 KiB, floored at 256 KiB. |
+| `max_rows` | integer | no | Rows returned; default 200, ceiling 5,000. |
+| `max_segments` | integer | no |  |
+| `max_store_requests` | integer | no |  |
+| `predicates` | array of object {`key`: string, `op`: string (`eq`, `ne`, `in` or `exists`), `value`?: string or array of string} | no |  |
+| `severity` | string | no | trace, debug, info, warn, error or fatal: that level or above. |
+| `trace_id` | string | no | 32 hex characters, either case. |
+
+#### `ravel_get_trace`
+
+- Title: Get trace
+- Description: Every span of one trace id, ordered by start time, with __ravel_depth and __ravel_parent (root, present, missing, not_returned, cycle). time_range is optional; without it every span the tenant retains is read
+- Annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`
+
+| Argument | Type | Required | Description |
+| --- | --- | --- | --- |
+| `trace_id` | string | yes | 32 hex characters, either case. |
+| `deadline_ms` | integer | no |  |
+| `evidence_ref` | string | no | Not served by this build: any value is refused as `unsupported`. |
+| `include_logs` | boolean | no | Not served by this build: `true` is refused as `unsupported`; for logs, use ravel_search_logs. |
+| `max_bytes_scanned` | integer | no |  |
+| `max_response_bytes` | integer | no | Bounds the whole serialized envelope; default 512 KiB, floored at 256 KiB. |
+| `max_rows` | integer | no | Spans returned; default 200, ceiling 5,000. |
+| `max_segments` | integer | no |  |
+| `max_store_requests` | integer | no |  |
+| `time_range` | object {`end_ns`: string, `start_ns`: string} | no | Optional. Omitted, the lookup reads every span the tenant retains. |
+
+#### `ravel_analyze_timeseries`
+
+- Title: Analyze timeseries
+- Description: change_point or summary over a PromQL range result
+- Annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`
+
+| Argument | Type | Required | Description |
+| --- | --- | --- | --- |
+| `op` | string (`change_point` or `summary`) | yes |  |
+| `query` | string | yes |  |
+| `step` | string | yes | A duration with a unit, such as `30s`. The step and every time must be a whole millisecond. |
+| `time_range` | object {`end_ns`: string, `start_ns`: string} | yes |  |
+| `deadline_ms` | integer | no |  |
+| `evidence_ref` | string | no | Not served by this build: any value is refused as `unsupported`. |
+| `max_response_bytes` | integer | no | Bounds the whole serialized envelope; default 512 KiB, floored at 256 KiB. An analysis runs a PromQL range evaluation underneath, so it takes the same deadline and response bound the evaluation would. |
+| `max_rows` | integer | no | Series rows returned; default 200, ceiling 5,000. |
+
 <!-- END GENERATED MCP TOOLS -->
 
 ### What each query tool returns
@@ -131,6 +276,89 @@ this page whatever the build; the paragraphs above say when a server serves
 them.
 
 <!-- BEGIN GENERATED MCP AGENTS TOOLS -->
+#### `ravel_agent_describe`
+
+- Title: Describe agent
+- Description: Ravel Agents: an agent's identity, state version, open turn and inbox depth, without its state
+- Annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`
+
+| Argument | Type | Required | Description |
+| --- | --- | --- | --- |
+| `key` | string | yes |  |
+| `kind` | string | yes |  |
+| `deadline_ms` | integer | no |  |
+| `max_response_bytes` | integer | no | Bounds the whole serialized envelope; default 512 KiB, floored at 256 KiB. |
+
+#### `ravel_agent_send`
+
+- Title: Send to agent
+- Description: Ravel Agents: accept one input into an agent's inbox and return its operation. A repeat with the same idempotency_key returns the same operation and accepts nothing new
+- Annotations: `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`
+
+| Argument | Type | Required | Description |
+| --- | --- | --- | --- |
+| `handler` | string | yes |  |
+| `idempotency_key` | string | yes | Becomes the send's request id: a repeat with the same key answers the same operation and accepts nothing new. |
+| `key` | string | yes |  |
+| `kind` | string | yes |  |
+| `deadline_ms` | integer | no |  |
+| `max_response_bytes` | integer | no | Bounds the whole serialized envelope; default 512 KiB, floored at 256 KiB. |
+| `payload` | any JSON | no | The handler's input, any JSON value. |
+
+#### `ravel_agent_operation`
+
+- Title: Agent operation
+- Description: Ravel Agents: an operation's status, and the effect blocking it
+- Annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`
+
+| Argument | Type | Required | Description |
+| --- | --- | --- | --- |
+| `operation` | string | yes | The handle a send answered. |
+| `deadline_ms` | integer | no |  |
+| `max_response_bytes` | integer | no | Bounds the whole serialized envelope; default 512 KiB, floored at 256 KiB. |
+
+#### `ravel_agent_state`
+
+- Title: Agent state
+- Description: Ravel Agents: an agent's state at its current version, open turn and inbox
+- Annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`
+
+| Argument | Type | Required | Description |
+| --- | --- | --- | --- |
+| `key` | string | yes |  |
+| `kind` | string | yes |  |
+| `deadline_ms` | integer | no |  |
+| `max_response_bytes` | integer | no | Bounds the whole serialized envelope; default 512 KiB, floored at 256 KiB. |
+
+#### `ravel_agent_events`
+
+- Title: Agent events
+- Description: Ravel Agents: an agent's events in order, one page after the cursor
+- Annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`
+
+| Argument | Type | Required | Description |
+| --- | --- | --- | --- |
+| `key` | string | yes |  |
+| `kind` | string | yes |  |
+| `cursor` | string | no | Resume after this cursor; omitted reads from the oldest event. |
+| `deadline_ms` | integer | no |  |
+| `max_response_bytes` | integer | no | Bounds the whole serialized envelope; default 512 KiB, floored at 256 KiB. |
+| `max_rows` | integer | no | Events per page; default 200, at most 1,000. |
+| `operation` | string | no | Only this operation's events. |
+
+#### `ravel_agent_blocked_effects`
+
+- Title: Blocked effects
+- Description: Ravel Agents: an agent's effects in doubt and the reconcile request that unblocks each
+- Annotations: `readOnlyHint: true`, `destructiveHint: false`, `openWorldHint: false`
+
+| Argument | Type | Required | Description |
+| --- | --- | --- | --- |
+| `key` | string | yes |  |
+| `kind` | string | yes |  |
+| `deadline_ms` | integer | no |  |
+| `max_response_bytes` | integer | no | Bounds the whole serialized envelope; default 512 KiB, floored at 256 KiB. |
+
 <!-- END GENERATED MCP AGENTS TOOLS -->
 
 | Tool | Returns | Agents route | Bounds | Failure classes |

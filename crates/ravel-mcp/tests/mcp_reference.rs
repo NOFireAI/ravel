@@ -74,11 +74,17 @@ fn json_type(schema: &JsonObject, root: &JsonObject) -> String {
         return alternatives.join(" or ");
     }
     if let Some(values) = schema.get("enum").and_then(Value::as_array) {
-        let names: Vec<String> = values
+        let mut names: Vec<String> = values
             .iter()
             .map(|value| format!("`{}`", value.as_str().expect("an enum value is a string")))
             .collect();
-        return format!("string, one of {}", names.join(", "));
+        let last = names.pop().expect("an enum lists at least one value");
+        let listed = if names.is_empty() {
+            last
+        } else {
+            format!("{} or {last}", names.join(", "))
+        };
+        return format!("string ({listed})");
     }
     let types: Vec<&str> = match schema.get("type") {
         None => {
@@ -259,7 +265,9 @@ fn argument_rows_carry_type_and_requiredness() {
     for row in [
         "| `query` | string | yes |",
         "| `time_range` | object {`end_ns`: string, `start_ns`: string} | yes |",
-        "| `op` | string, one of `change_point`, `summary` | yes |",
+        "| `op` | string (`change_point` or `summary`) | yes |",
+        "| `predicates` | array of object {`key`: string, `op`: string (`eq`, `ne`, `in` or \
+         `exists`), `value`?: string or array of string} | no |",
         "| `max_rows` | integer | no |",
         "| `allow_partial_coverage` | boolean | no |",
     ] {
