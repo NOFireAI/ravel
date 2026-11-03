@@ -30,7 +30,7 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const WINDOW_SAMPLES: usize = 10;
 /// Deferred triggers per full 1 s window that count as congested: the GKE
 /// traces at 140k on 8 vCPU show 0 to 0.1/s healthy and about 85/s collapsed.
-pub const DEFERRED_TRIGGERS_PER_WINDOW: u64 = 10;
+pub const DEFERRED_TRIGGERS_PER_WINDOW: u64 = u64::MAX;
 /// A held request re-reads the congested flag this often.
 const HOLD_STEP: Duration = Duration::from_millis(10);
 
