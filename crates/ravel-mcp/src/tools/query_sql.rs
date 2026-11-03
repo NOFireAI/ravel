@@ -6,9 +6,13 @@
 //! this order: the one-table rule (`ravel_sql::refuse_several_tables`), the
 //! read-only gate (`ravel_sql::validate_query`), and the page planner
 //! (`ravel_sql::plan_page`). A planner refusal is `invalid_argument` naming
-//! the reason, with one exception: a statement with no `ORDER BY` over a
-//! table with no row identity runs unpaged, and a capped result is
-//! `ok_bounded` with no cursor.
+//! the reason, with two exceptions, which run unpaged so that a capped result
+//! is `ok_bounded` with no cursor: a statement with no `ORDER BY` over a table
+//! with no row identity, and a statement whose `ORDER BY` uses a value
+//! computed from other rows (an aggregate, a window function or a subquery).
+//! A row committed after a cursor was minted can change such a value for a
+//! row already served and move that row after the cursor, so no position on
+//! it resumes without repeating rows.
 //!
 //! `time_range` is applied as a half-open row filter (`row_window`), not
 //! only as the segment-listing bound, so a row outside it is excluded even
@@ -83,10 +87,57 @@ struct Call {
     query: String,
     window: ravel_types::TimeRange,
     cursor: Option<String>,
-    /// Page one's plan, or `None` for a statement with no ordering to page
-    /// by, which runs unpaged.
-    plan: Option<PagePlan>,
+    /// Page one's plan, or why the statement runs unpaged.
+    plan: Result<PagePlan, Unpaged>,
     argument_hash: [u8; 32],
+}
+
+/// Why a statement the planner gives no plan still runs, unpaged.
+#[derive(Clone, Copy)]
+enum Unpaged {
+    /// No `ORDER BY`, over a table with no row identity
+    /// (`PagePlanError::NoOrdering`).
+    NoOrder,
+    /// An `ORDER BY` term computed from other rows
+    /// (`PagePlanError::OrderTermFromOtherRows`).
+    OrderFromOtherRows,
+}
+
+impl Unpaged {
+    fn of(error: &PagePlanError) -> Option<Unpaged> {
+        match error {
+            PagePlanError::NoOrdering { .. } => Some(Unpaged::NoOrder),
+            PagePlanError::OrderTermFromOtherRows { .. } => Some(Unpaged::OrderFromOtherRows),
+            _ => None,
+        }
+    }
+
+    fn no_cursor(self) -> &'static str {
+        match self {
+            Unpaged::NoOrder => "the result has no order",
+            Unpaged::OrderFromOtherRows => {
+                "the result is ordered by a value computed from other rows"
+            }
+        }
+    }
+
+    fn next_step(self) -> NextStep {
+        match self {
+            Unpaged::NoOrder => step(
+                "add_an_order_by",
+                "the statement has no ORDER BY and its table has no row identity to page by, \
+                 so the rest of the result has no cursor; order by non-null columns to page \
+                 through it, or narrow time_range",
+            ),
+            Unpaged::OrderFromOtherRows => step(
+                "order_by_the_rows_own_columns",
+                "the ORDER BY uses a value computed from other rows (an aggregate, a window \
+                 function or a subquery), which a row committed later can change for rows \
+                 already served, so the rest of the result has no cursor; paging needs an \
+                 order on the row's own non-null columns, or narrow time_range",
+            ),
+        }
+    }
 }
 
 impl Call {
@@ -132,9 +183,11 @@ impl Call {
         })?;
         validate(&input.query)?;
         let plan = match ravel_sql::plan_page(&input.query, None) {
-            Ok(plan) => Some(plan),
-            Err(PagePlanError::NoOrdering { .. }) => None,
-            Err(error) => return Err(plan_refusal(&error)),
+            Ok(plan) => Ok(plan),
+            Err(error) => match Unpaged::of(&error) {
+                Some(unpaged) => Err(unpaged),
+                None => return Err(plan_refusal(&error)),
+            },
         };
         let argument_hash = argument_hash(&input.query, &window, ctx.budgets.max_rows);
         Ok(Call {
@@ -177,8 +230,9 @@ impl Call {
 }
 
 async fn first_page<B: QueryBackend>(call: &Call, ctx: &ToolContext<'_>, backend: &B) -> Envelope {
-    let Some(plan) = &call.plan else {
-        return unordered(call, ctx, backend).await;
+    let plan = match &call.plan {
+        Ok(plan) => plan,
+        Err(unpaged) => return unordered(call, *unpaged, ctx, backend).await,
     };
     let request = call.request(plan.statement.clone(), ctx);
     let columns = order_columns(plan);
@@ -248,7 +302,7 @@ async fn later_page<B: QueryBackend>(
 /// statement's own effective order. A position this tool could not have
 /// minted for these arguments is `cursor_invalid`.
 fn resume_plan(call: &Call, position: &CursorPosition) -> Result<PagePlan, Failure> {
-    let (Some(first), CursorPosition::Keyset { tuple, order_by }) = (&call.plan, position) else {
+    let (Ok(first), CursorPosition::Keyset { tuple, order_by }) = (&call.plan, position) else {
         return Err(CursorError::Invalid.failure());
     };
     if *order_by != rendered_order(first) {
@@ -266,10 +320,14 @@ fn resume_plan(call: &Call, position: &CursorPosition) -> Result<PagePlan, Failu
     }
 }
 
-/// A statement with no `ORDER BY` over a table with no row identity: run as
-/// written, with no position to resume from, so a capped result is
-/// `ok_bounded` with no cursor.
-async fn unordered<B: QueryBackend>(call: &Call, ctx: &ToolContext<'_>, backend: &B) -> Envelope {
+/// A statement with no position to resume from, run as written, so a capped
+/// result is `ok_bounded` with no cursor and the step `unpaged` names.
+async fn unordered<B: QueryBackend>(
+    call: &Call,
+    unpaged: Unpaged,
+    ctx: &ToolContext<'_>,
+    backend: &B,
+) -> Envelope {
     if call.cursor.is_some() {
         return refused_with(CursorError::Invalid.failure(), Vec::new(), ctx);
     }
@@ -285,15 +343,10 @@ async fn unordered<B: QueryBackend>(call: &Call, ctx: &ToolContext<'_>, backend:
         &ctx.budgets,
         &call.scope(ctx),
         PageOrder::Partial,
-        |_, _, _| Err(NoCursor::because("the result has no order".to_string())),
+        |_, _, _| Err(NoCursor::because(unpaged.no_cursor().to_string())),
     );
     if envelope.status == Status::OkBounded {
-        envelope.next_steps.push(step(
-            "add_an_order_by",
-            "the statement has no ORDER BY and its table has no row identity to page by, \
-             so the rest of the result has no cursor; order by non-null columns to page \
-             through it, or narrow time_range",
-        ));
+        envelope.next_steps.push(unpaged.next_step());
     }
     envelope
 }

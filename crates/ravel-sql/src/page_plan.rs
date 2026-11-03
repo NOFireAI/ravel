@@ -104,10 +104,23 @@
 //! did not come from, so none of them yields that variant.
 //!
 //! A [`Provenance::Expression`] is answered by the expression itself
-//! ([`expression_is_non_null`]), with no schema involved: a literal and a
-//! `count(...)` are NON NULL wherever they are selected from. `SUM`, `MIN`,
-//! `MAX` and `AVG` are not, and keep refusing, because each is NULL over
-//! empty and over all-NULL input.
+//! ([`expression_is_non_null`]), with no schema involved: a literal is NON
+//! NULL wherever it is selected from. An aggregate never reaches that proof,
+//! `count(...)` included, although it is never NULL: see the next section.
+//!
+//! # A term computed from other rows has no position
+//!
+//! An aggregate, a window function and a subquery each compute a row's value
+//! from rows other than that one ([`depends_on_other_rows`]), and such a
+//! value is not a stable keyset position. A cursor pins the ingest hours its
+//! mint instant lists, not what those hours hold, so a row committed into one
+//! of them after the mint changes `count(*)` for its group, or `count(*) OVER
+//! ()` for every row. A group already served then sorts back in after the
+//! cursor and is served again, and ADR-1374's 2026-09-12 amendment, item 4,
+//! says a row is never repeated. So a term that names or is such an
+//! expression is [`PagePlanError::OrderTermFromOtherRows`], which the paging
+//! tool answers by running the statement as written, with no cursor, the way
+//! it answers [`PagePlanError::NoOrdering`].
 //!
 //! The other clauses of the rule are read off the term's TYPE, from the same
 //! two routes: the public schema's field type for a base column
@@ -241,11 +254,14 @@
 //!   limit spelled in a way the row-limit refusal does not recognise.
 //!
 //! A window function is NOT in the class: `OVER (ORDER BY ...)` carries its
-//! own ordering and no SQL window inherits the statement's. It is still paged
-//! correctly for a second reason, which is the wrap itself: the window is
-//! computed inside the derived table over all the statement's rows, while the
-//! keyset predicate filters outside it, so `count(*) OVER ()` reports the same
-//! total on every page rather than counting down as the walk advances.
+//! own ordering and no SQL window inherits the statement's. The wrap computes
+//! the window inside the derived table over all the statement's rows, while
+//! the keyset predicate filters outside it, so the walk advancing does not
+//! change a window's value: `count(*) OVER ()` is not counted down page by
+//! page. A late row does change it, because a later page reads the rows
+//! committed since the mint into the hours the mint lists, so a window value
+//! is projected on every page and is never an order term a cursor resumes on
+//! (see "A term computed from other rows has no position" above).
 //!
 //! The wrap is what makes the keyset predicate land on the statement's OUTPUT
 //! rows. Injected into the caller's own `WHERE`, it would filter before any
@@ -1143,8 +1159,8 @@ mod resolution {
         },
         /// A computed expression, carried in full. No schema describes it and
         /// no row identity attaches to it, but the expression alone settles
-        /// some nullability cases outright: a literal and a `count(...)` are
-        /// NON NULL wherever they are selected from.
+        /// some nullability cases outright: a literal is NON NULL wherever it
+        /// is selected from.
         Expression(&'a SqlExpr),
         /// The statement projects this name and the text does not say what it
         /// is built from, for this reason.
@@ -1592,8 +1608,8 @@ mod unproven {
     pub(super) const NO_PUBLIC_SCHEMA: &str = "the target table has no public schema here";
     pub(super) const AMBIGUOUS_NAME: &str =
         "the projection gives that output name twice, from different sources";
-    pub(super) const EXPRESSION_NOT_PROVABLE: &str = "the expression it is defined by is not one this planner proves NON NULL, and \
-         SUM, MIN, MAX and AVG are NULL over empty or all-NULL input";
+    pub(super) const EXPRESSION_NOT_PROVABLE: &str =
+        "the expression it is defined by is not one this planner proves NON NULL";
     pub(super) const RENAMED_COLUMNS: &str = "its FROM relation carries a positional column-rename list, so an output name \
          is not the base column of that name";
     pub(super) const SAMPLED_RELATION: &str =
@@ -1738,8 +1754,8 @@ fn type_label(data_type: &DataType) -> String {
 /// The cursor support of an expression term, from the expression alone.
 ///
 /// Only reached for an expression [`expression_is_non_null`] admits, so the
-/// shapes that arrive are a non-NULL literal, a `count(...)`, parentheses and
-/// a unary sign. Everything else is unrepresentable rather than assumed, on
+/// shapes that arrive are a non-NULL literal, parentheses and a unary sign.
+/// Everything else is unrepresentable rather than assumed, on
 /// the same fail-closed reading as [`cursor_support`]'s catch-all.
 ///
 /// A sign follows DataFusion's typing of it. A minus written directly on a
@@ -1840,10 +1856,11 @@ fn negated_number_cursor_support(text: &str) -> CursorSupport {
 ///
 /// A [`Provenance::Expression`] is answered by [`expression_is_non_null`] and
 /// [`expression_cursor_support`] reading the expression itself, with no schema
-/// consulted and no basis required: a literal and a `count(...)` are NON NULL
-/// whatever relation they are selected from, including under an outer join or
-/// a `ROLLUP`, because neither is a grouping column that a super-aggregate row
-/// can null.
+/// consulted and no basis required: a literal is NON NULL whatever relation it
+/// is selected from, including under an outer join or a `ROLLUP`, because it
+/// is not a grouping column that a super-aggregate row can null. An
+/// expression computed from other rows does not arrive here:
+/// [`statement_order_terms`] answers it first.
 fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
     let (table, source) = match names.resolve(column) {
         Provenance::BaseColumn { table, column } => (table, column),
@@ -1892,19 +1909,12 @@ fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
 ///
 /// - a literal other than `NULL`, and other than a placeholder, whose value
 ///   arrives at execution time;
-/// - `count(...)` in any spelling, `count(*)` and `count(DISTINCT x)`
-///   included, which returns 0 rather than NULL over empty and over all-NULL
-///   input;
 /// - parentheses, and a unary `+` or `-`, which are NULL exactly when their
 ///   operand is.
 ///
-/// `SUM`, `MIN`, `MAX` and `AVG` are NOT admitted, and this is a decision
-/// rather than an omission. Each returns NULL over empty input and over input
-/// that is entirely NULL, so an ordering on one can carry a NULL row that the
-/// keyset predicate would drop from every page. Telling the safe uses apart
-/// means knowing whether the statement is grouped and whether any group can be
-/// empty or all-NULL, which is a different analysis from this one; until it
-/// exists all four keep refusing.
+/// No function is admitted. `count(...)` is never NULL, but it is an
+/// aggregate, and an aggregate is answered before this is asked
+/// ([`depends_on_other_rows`]).
 ///
 /// Anything else answers `false`, which is a refusal rather than a plan. A
 /// case added here has to hold for every input, not merely for the inputs a
@@ -2844,7 +2854,6 @@ mod tests {
     #[tokio::test]
     async fn datafusion_types_the_proven_expressions_as_their_kinds_say() {
         let cases = [
-            ("n", "count(*)", DataType::Int64),
             ("signed", "9223372036854775807", DataType::Int64),
             ("unsigned", "9223372036854775808", DataType::UInt64),
             ("s", "'x'", DataType::Utf8),
@@ -2857,7 +2866,6 @@ mod tests {
             ("neg_neg", "-(-5)", DataType::Int64),
             ("plus", "+5", DataType::Int64),
             ("plus_unsigned", "+9223372036854775808", DataType::UInt64),
-            ("neg_count", "-count(*)", DataType::Int64),
         ];
         let projection = cases
             .iter()
@@ -2905,14 +2913,14 @@ mod tests {
     }
 
     /// The kinds an expression term and a literal term are proven to take:
-    /// `count(*)` is `Int64`, an integer literal past `i64::MAX` is `UInt64`,
-    /// a quoted string is `Utf8`.
+    /// `-3` is `Int64`, an integer literal past `i64::MAX` is `UInt64`, a
+    /// quoted string is `Utf8`.
     ///
     /// FLIP: with `literal_cursor_support` answering `ResumeKind::Int` for
     /// every number, the `u64` literal's `UInt` value is refused.
     #[test]
     fn expression_and_literal_terms_take_their_engine_types() {
-        let sql = "SELECT severity_text, count(*) AS n, 18446744073709551615 AS big, \
+        let sql = "SELECT severity_text, -3 AS n, 18446744073709551615 AS big, \
                    'x' AS s FROM logs GROUP BY severity_text \
                    ORDER BY n, big, s, severity_text";
         let plan = plan_page(sql, None).expect("planned");
@@ -4283,37 +4291,170 @@ mod tests {
         }
     }
 
-    /// `count(...)` is NON NULL in every spelling: it returns 0, never NULL,
-    /// over empty and over all-NULL input.
+    /// An order term whose value is computed from rows other than its own
+    /// carries no cursor, whether it is an aggregate, a window function or a
+    /// subquery, written in ORDER BY or reached through an alias, bare or
+    /// inside another expression.
     ///
-    /// Ordering on the bare call is still refused, one step earlier and for a
-    /// different reason: every effective term has to be a projected output
-    /// column so the wrap can reference it, and `PagePlanError::
-    /// OrderTermNotColumn` is that rule. The alias is the spelling that
-    /// reaches this prover.
+    /// A row committed after a cursor was minted, into an hour the mint lists,
+    /// changes such a value for rows already served, so a group served on
+    /// page one can sort back in after the cursor and be served again.
+    ///
+    /// FLIP: with the `count(...)` arm restored in `expression_cursor_support`
+    /// and the pre-pass in `statement_order_terms` checking only a bare
+    /// `count(*)`, the `count(trace_id)`, `sum(value)` and window cases plan.
     #[test]
-    fn count_star_plans_through_an_alias() {
-        for sql in [
-            "SELECT count(*) AS c FROM logs GROUP BY severity_text ORDER BY c",
-            "SELECT COUNT(*) AS c FROM logs GROUP BY severity_text ORDER BY c",
-            "SELECT count(DISTINCT trace_id) AS c FROM logs GROUP BY severity_text ORDER BY c",
-            "SELECT count(trace_id) AS c FROM logs GROUP BY severity_text ORDER BY c",
-            // A grouping construct nulls a grouping COLUMN, never an
-            // aggregate, so ordering on the count alone still plans.
-            "SELECT count(*) AS c FROM logs GROUP BY ROLLUP(severity_text) ORDER BY c",
-        ] {
-            let plan = plan_page(sql, None);
-            assert!(plan.is_ok(), "refused {sql:?}: {plan:?}");
+    fn an_order_term_from_other_rows_carries_no_cursor() {
+        let cases: Vec<(&str, &str)> = vec![
+            (
+                "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY c, ts",
+                "c",
+            ),
+            (
+                "SELECT severity_text, COUNT(*) AS c FROM logs GROUP BY severity_text ORDER BY c",
+                "c",
+            ),
+            (
+                "SELECT severity_text, count(trace_id) AS c FROM logs GROUP BY severity_text \
+                 ORDER BY c, severity_text",
+                "c",
+            ),
+            (
+                "SELECT count(DISTINCT trace_id) AS c FROM logs GROUP BY severity_text ORDER BY c",
+                "c",
+            ),
+            (
+                "SELECT count(*) AS c FROM logs GROUP BY ROLLUP(severity_text) ORDER BY c",
+                "c",
+            ),
+            (
+                "SELECT series_id, sum(value) AS s FROM samples GROUP BY series_id \
+                 ORDER BY s, series_id",
+                "s",
+            ),
+            (
+                "SELECT series_id, SUM(value) AS s FROM samples GROUP BY series_id ORDER BY s",
+                "s",
+            ),
+            (
+                "SELECT series_id, min(ts) AS s FROM samples GROUP BY series_id ORDER BY s",
+                "s",
+            ),
+            (
+                "SELECT series_id, max(ts) AS s FROM samples GROUP BY series_id ORDER BY s",
+                "s",
+            ),
+            (
+                "SELECT series_id, avg(value) AS s FROM samples GROUP BY series_id ORDER BY s",
+                "s",
+            ),
+            // Written in ORDER BY itself rather than through an alias.
+            (
+                "SELECT count(*) FROM logs ORDER BY count(*)",
+                "count(*)",
+            ),
+            (
+                "SELECT series_id FROM samples GROUP BY series_id ORDER BY sum(value)",
+                "sum(value)",
+            ),
+            // Inside another expression.
+            (
+                "SELECT -count(*) AS c FROM logs GROUP BY severity_text ORDER BY c",
+                "c",
+            ),
+            (
+                "SELECT nullif(count(*), 0) AS c FROM logs GROUP BY severity_text ORDER BY c",
+                "c",
+            ),
+            // Window functions, over an ungrouped statement whose rows are the
+            // table's own.
+            (
+                "SELECT ts, series_id, count(*) OVER () AS c FROM samples \
+                 ORDER BY c, ts, series_id",
+                "c",
+            ),
+            (
+                "SELECT ts, series_id, row_number() OVER (ORDER BY ts, series_id) AS rn \
+                 FROM samples ORDER BY rn",
+                "rn",
+            ),
+            (
+                "SELECT ts, series_id, rank() OVER (ORDER BY ts) AS r FROM samples \
+                 ORDER BY r, ts, series_id",
+                "r",
+            ),
+            (
+                "SELECT ts, series_id FROM samples ORDER BY row_number() OVER (ORDER BY ts)",
+                "row_number() OVER (ORDER BY ts)",
+            ),
+            // A scalar subquery reads the whole table.
+            (
+                "SELECT ts, series_id, (SELECT count(*) FROM samples) AS n FROM samples \
+                 ORDER BY n, ts, series_id",
+                "n",
+            ),
+        ];
+        for (sql, term) in cases {
+            let err = plan_page(sql, None).expect_err("no cursor");
+            assert_eq!(
+                err,
+                PagePlanError::OrderTermFromOtherRows {
+                    term: term.to_string(),
+                },
+                "unexpected answer for {sql:?}"
+            );
         }
 
-        let bare =
-            plan_page("SELECT count(*) FROM logs ORDER BY count(*)", None).expect_err("refused");
-        assert_eq!(
-            bare,
-            PagePlanError::OrderTermNotColumn {
-                term: "count(*)".to_string(),
-            },
+        // A grouping column beside the aggregate is a group key: a late row
+        // can add a group but cannot move one, so it still pages.
+        let keyed = plan_page(
+            "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY ts",
+            None,
         );
+        assert!(keyed.is_ok(), "refused the group key: {keyed:?}");
+    }
+
+    /// The call-level rule reads the clauses, not only the name: a call with
+    /// `OVER`, `FILTER`, `WITHIN GROUP` or `DISTINCT` reads other rows
+    /// whatever it is called, and a plain scalar call does not.
+    ///
+    /// The statements are parsed without the security gate, so a name no
+    /// allowlist carries reaches the rule.
+    ///
+    /// FLIP: with `function_reads_other_rows` answering from the name alone,
+    /// `abs(value) OVER ()` and the other unlisted calls with a clause are
+    /// not caught.
+    #[test]
+    fn a_call_with_an_aggregate_or_window_clause_reads_other_rows() {
+        for (text, expected) in [
+            ("count(*)", true),
+            ("count(value)", true),
+            ("sum(value)", true),
+            ("count(*) OVER ()", true),
+            ("row_number() OVER (ORDER BY ts)", true),
+            ("abs(value) OVER ()", true),
+            ("abs(value) OVER (PARTITION BY series_id)", true),
+            ("abs(value) FILTER (WHERE ts > 0)", true),
+            ("some_fn(DISTINCT value)", true),
+            ("some_fn(value) WITHIN GROUP (ORDER BY ts)", true),
+            ("-(1 + count(*))", true),
+            ("coalesce(abs(value), (SELECT 1))", true),
+            ("abs(value)", false),
+            ("abs(-ts) + 1", false),
+            ("lower('x')", false),
+            ("ts", false),
+        ] {
+            let query = parse_query(&format!("SELECT {text} AS t")).expect("parsed");
+            let SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("not a select");
+            };
+            let Some(datafusion::sql::sqlparser::ast::SelectItem::ExprWithAlias { expr, .. }) =
+                select.projection.first()
+            else {
+                panic!("{text} is not an aliased expression");
+            };
+            assert_eq!(depends_on_other_rows(expr), expected, "{text}");
+        }
     }
 
     /// An alias resolves through to the expression that defines it, so the
@@ -4323,15 +4464,11 @@ mod tests {
     fn an_alias_resolves_through_to_its_defining_expression() {
         // Same alias, same statement shape, opposite answers: the defining
         // expression is the only thing that differs.
-        let provable = plan_page(
-            "SELECT count(*) AS ordering FROM logs GROUP BY severity_text ORDER BY ordering",
-            None,
-        );
-        assert!(provable.is_ok(), "refused the count: {provable:?}");
+        let provable = plan_page("SELECT -1 AS ordering ORDER BY ordering", None);
+        assert!(provable.is_ok(), "refused the literal: {provable:?}");
 
         let not_provable = plan_page(
-            "SELECT nullif(count(*), 0) AS ordering FROM logs GROUP BY severity_text \
-             ORDER BY ordering",
+            "SELECT nullif(1, 0) AS ordering ORDER BY ordering",
             None,
         )
         .expect_err("refused");
@@ -4345,11 +4482,8 @@ mod tests {
 
         // Unary `+`/`-` and parentheses are NULL exactly when their operand
         // is, so the answer passes through them in both directions.
-        let through = plan_page(
-            "SELECT -count(*) AS ordering FROM logs GROUP BY severity_text ORDER BY ordering",
-            None,
-        );
-        assert!(through.is_ok(), "refused the negated count: {through:?}");
+        let through = plan_page("SELECT -(+(2)) AS ordering ORDER BY ordering", None);
+        assert!(through.is_ok(), "refused the negated literal: {through:?}");
 
         let through_null =
             plan_page("SELECT -(NULL) AS ordering ORDER BY ordering", None).expect_err("refused");
@@ -4360,43 +4494,6 @@ mod tests {
                 reason: unproven::EXPRESSION_NOT_PROVABLE,
             },
         );
-    }
-
-    /// `SUM`, `MIN`, `MAX` and `AVG` keep refusing, deliberately.
-    ///
-    /// Each returns NULL over empty input and over input that is entirely
-    /// NULL, so an ordering on one can carry a row the keyset predicate drops
-    /// from every page. Admitting them needs the grouped-versus-ungrouped
-    /// analysis this prover does not do; until that exists the refusal is the
-    /// correct answer and this test is what stops it being widened by
-    /// analogy with `count`.
-    #[test]
-    fn sum_min_max_and_avg_still_refuse() {
-        for call in [
-            "sum(value)",
-            "min(value)",
-            "max(value)",
-            "avg(value)",
-            "SUM(value)",
-        ] {
-            let sql = format!(
-                "SELECT {call} AS ordering FROM samples GROUP BY series_id ORDER BY ordering"
-            );
-            let err = plan_page(&sql, None).expect_err("refused");
-            assert_eq!(
-                err,
-                PagePlanError::OrderTermNullabilityUnknown {
-                    column: "ordering".to_string(),
-                    reason: unproven::EXPRESSION_NOT_PROVABLE,
-                },
-                "unexpected refusal for {sql:?}"
-            );
-            assert!(
-                err.to_string()
-                    .contains("SUM, MIN, MAX and AVG are NULL over empty or all-NULL input"),
-                "the message does not say why: {err}"
-            );
-        }
     }
 
     /// The ClickBench corpus, the largest body of real statements this
@@ -4479,6 +4576,9 @@ mod tests {
             Err(PagePlanError::OrderTermNotRepresentable { .. }) => {
                 "OrderTermNotRepresentable".to_string()
             }
+            Err(PagePlanError::OrderTermFromOtherRows { .. }) => {
+                "OrderTermFromOtherRows".to_string()
+            }
             Err(PagePlanError::SelectInto) => "SelectInto".to_string(),
             Err(PagePlanError::ResumeArity { .. }) => "ResumeArity".to_string(),
             Err(PagePlanError::ResumeValueTypeMismatch { .. }) => {
@@ -4514,11 +4614,12 @@ mod tests {
     /// Two passes. The first is the corpus as written, where 32 of the 43
     /// statements carry their own `LIMIT` and are refused for that alone.
     /// The second strips a trailing `LIMIT n [OFFSET m]`, which is what
-    /// exposes the nullability prover underneath: 22 of the 43 plan, and 3
-    /// of the 21 refusals are about nullability. The remaining 18 are about
-    /// the ordering itself, not about NULLs -- no `ORDER BY` at all, a term
-    /// that is not a column, a term the statement does not project -- and
-    /// each is a separate piece of work.
+    /// exposes the planner underneath: 1 of the 43 plans. 27 order by an
+    /// aggregate (the corpus's top-N shape, `ORDER BY c DESC`), which has no
+    /// cursor position because a later row changes it; the paging tool runs
+    /// those, and the 11 with no `ORDER BY`, unpaged. 1 refusal is about
+    /// nullability, and the remaining 3 are about the ordering itself -- a
+    /// term that is not a column, a term the statement does not project.
     ///
     /// What this does NOT cover: the total-order path. The corpus is
     /// logs-only, `logs` has no row identity, and every statement in it is
@@ -4562,7 +4663,7 @@ mod tests {
             as_written,
             expected(&[
                 ("NoOrdering", 10),
-                ("OrderTermNotColumn", 1),
+                ("OrderTermFromOtherRows", 1),
                 ("RowLimitInStatement", 32),
             ]),
             "outcomes for the corpus as written",
@@ -4576,17 +4677,11 @@ mod tests {
 
         let mut want = expected(&[
             ("NoOrdering", 11),
-            ("OrderTermNotColumn", 5),
+            ("OrderTermFromOtherRows", 27),
+            ("OrderTermNotColumn", 1),
             ("OrderTermNotProjected", 2),
-            ("plans, not a total order", 22),
+            ("plans, not a total order", 1),
         ]);
-        want.insert(
-            format!(
-                "OrderTermNullabilityUnknown: {}",
-                unproven::EXPRESSION_NOT_PROVABLE
-            ),
-            2,
-        );
         want.insert(
             format!(
                 "OrderTermNullabilityUnknown: {}",
@@ -4600,17 +4695,17 @@ mod tests {
         );
         assert_eq!(
             tally(&without_row_limit, "plans"),
-            22,
+            1,
             "plans, row limit set aside",
         );
         assert_eq!(
             statements - tally(&without_row_limit, "plans"),
-            21,
+            42,
             "refusals, row limit set aside",
         );
         assert_eq!(
             tally(&without_row_limit, "OrderTermNullab"),
-            3,
+            1,
             "nullability refusals, row limit set aside",
         );
     }
