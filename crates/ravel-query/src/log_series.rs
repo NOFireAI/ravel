@@ -749,8 +749,16 @@ pub async fn fetch_log_series(
             });
         }
 
+        // Uncounted: `fetch_stream_dir` above recorded this object's open
+        // under `plan`, where its footer was first decoded.
         let Some(mut scan) = fetcher
-            .scan_accounted_with_tenant(seg_ref, tenant_hash, &query, &columns, accounting.scan())
+            .scan_accounted_with_tenant_uncounted(
+                seg_ref,
+                tenant_hash,
+                &query,
+                &columns,
+                accounting.scan(),
+            )
             .await?
         else {
             segments_pruned += 1;

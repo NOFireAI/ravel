@@ -858,6 +858,61 @@ async fn ordinary_named_metric_query_never_resolves_signal_logs() {
     assert_eq!(vector_results(&body).len(), 1);
 }
 
+/// `stats.phases[].segmentsOpened` for a log selector on `GET /api/v1/query`
+/// (issue #3745): both objects' footers are decoded under `plan` to read
+/// their STREAM_DIR, the `worker` object is pruned there, and only the `api`
+/// object is scanned, without recording a second open under `scan`.
+///
+/// FLIPs, in `crates/ravel-query`: dropping the `add_segments_opened` in
+/// `LogSegmentFetcher::fetch_stream_dir` reads `plan` 0 and `scan` 0;
+/// scanning through the counted `scan_accounted_with_tenant` in
+/// `log_series::fetch_log_series` reads `scan` 1.
+#[tokio::test]
+async fn log_selector_on_api_v1_query_counts_each_footer_once_under_plan() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    fixture(&store, tid.hash()).await;
+    let app = build_router(store, EngineConfig::default(), &tid);
+
+    let uri = format!(
+        "/api/v1/query?query={}&time={}",
+        encode_query_param(r#"sum(count_over_time(ravel_log_lines{job="api"}[1h]))"#),
+        secs(BASE + 20 * NS)
+    );
+    let (status, body) = call(&app, &uri, Some("secret-a")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(vector_results(&body)[0]["value"][1], "8", "body: {body}");
+    let phases = body["data"]["stats"]["phases"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no phases: {body}"));
+    let field = |name: &str, key: &str| -> u64 {
+        phases
+            .iter()
+            .find(|p| p["phase"] == name)
+            .unwrap_or_else(|| panic!("no {name} phase: {body}"))[key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{name}.{key} is a u64: {body}"))
+    };
+    let opened: Vec<(&str, u64)> = ["resolve", "plan", "probe", "scan", "keyIndex"]
+        .into_iter()
+        .map(|name| (name, field(name, "segmentsOpened")))
+        .collect();
+    assert_eq!(
+        opened,
+        [
+            ("resolve", 0),
+            ("plan", 2),
+            ("probe", 0),
+            ("scan", 0),
+            ("keyIndex", 0)
+        ],
+        "body: {body}"
+    );
+    // The scan did read the matching object: its zero is not for want of a
+    // read.
+    assert!(field("scan", "s3GetRequests") >= 1, "body: {body}");
+}
+
 // ---------------------------------------------------------------------------
 // Budgets: max_samples / max_series -> HTTP 422.
 // ---------------------------------------------------------------------------

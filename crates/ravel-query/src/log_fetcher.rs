@@ -1960,7 +1960,8 @@ impl LogSegmentFetcher {
     /// without the one `segments_opened` it records on a successful open
     /// (issue #3745), for a caller that records the open itself because it
     /// can open the same object more than once per query (a retried or
-    /// reopened segment, or one the keyed probe already opened).
+    /// reopened segment, or one the keyed probe or
+    /// [`fetch_stream_dir`](Self::fetch_stream_dir) already opened).
     pub async fn scan_accounted_with_tenant_uncounted(
         &self,
         seg_ref: &SegmentRef,
@@ -3998,8 +3999,15 @@ impl LogSegmentFetcher {
         let result = self
             .fetch_stream_dir_unsettled(seg_ref, tenant_hash, accounting)
             .await;
-        self.settle_version_refusal(seg_ref, QueryPhase::Plan, accounting, result)
-            .await
+        let result = self
+            .settle_version_refusal(seg_ref, QueryPhase::Plan, accounting, result)
+            .await;
+        // Both `Ok` arms decoded the footer, a directory-less one included
+        // (issue #3745).
+        if result.is_ok() {
+            accounting.add_segments_opened(1);
+        }
+        result
     }
 
     /// The body of the public method of the same name, before
