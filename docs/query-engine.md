@@ -3686,7 +3686,12 @@ and block-level reported independently:
   plain-page `Str` cell of a surviving row its declared and per-key
   `attrs['k']` cursors validated: every such cell of a page the decode did
   not validate (no cache attached, a miss the cache will not admit, such as
-  a bulk scan's first touch, or a page that is not all UTF-8). The row path, taken when `attrs` is
+  a bulk scan's first touch, or a page that is not all UTF-8), plus the
+  cells a cached column's values memo validates when it is built, once per
+  cache entry on the call that builds it: the block's rows for a plain
+  column, the dictionary's entries for a dictionary (ADR-3326, values-memo
+  amendment, decision 6;
+  `str_cells_validated_counts_the_memo_build_once_per_entry`). The row path, taken when `attrs` is
   projected or an erasure is pending, validates no plain page at decode and
   validates its cells per row without counting them. With a pushed `Contains` arm the reader
   validates only the dictionary entries the arm read as text or a kept row
@@ -3712,7 +3717,10 @@ counts.
 `stats.accounting.strDictValuesBuilt` counts the string dictionary values
 arrays the scans built for declared `Str` columns: one per row group
 dictionary per scan opening, one per per-block dictionary page, one per
-plain-page block. With a pushed `Contains` arm the reader hands each block
+plain-page block. A block whose values come from a decoded-cache entry's
+values memo builds nothing and counts nothing
+(`str_values_releases_a_memo_arrays_charge_once_no_batch_holds_it`).
+With a pushed `Contains` arm the reader hands each block
 a dictionary narrowed to its surviving rows, so a dictionary column builds
 one per block that keeps a row instead.
 
@@ -5481,14 +5489,22 @@ the flag.
 - Memory: each entry holds a reservation on the process memory budget. The
   reservation is taken by an atomic check-and-reserve that keeps
   `max(1 GiB, 5% of the limit)` unreserved with the memory gate open, and it
-  lives inside the entry's `Arc`, so it is released when the last handle
-  drops, not when the index lets go of the entry. A scan holds the entries it
+  lives in a cell that the entry, its string column and every Arrow buffer
+  over that column's bytes hold (`ReservationCell`), so it is released when
+  the last of them drops, not when the index lets go of the entry
+  (`the_reservation_is_released_by_the_last_handle_not_by_eviction` in
+  `crates/ravel-logseg/src/decoded_cache.rs`;
+  `an_arrow_array_is_the_last_holder_of_an_evicted_entrys_reservation` in
+  `crates/ravel-sql/src/logs_scan/batch.rs`). A scan holds the entries it
   was served, and its own resident charge excludes them, so a cached column
   is charged once, to the process budget. The per-query and per-tenant
   ceilings (`--sql-max-query-bytes`, `--sql-tenant-max-bytes`) do not count
   served columns (ADR-3326, tenant-ceiling amendment). When the budget refuses a reservation, the cache's
-  registered evictor frees the shortfall plus the same margin from entries no
-  scan holds, and the reservation is retried once; `reserve_best_effort`
+  registered evictor frees the shortfall plus the same margin from entries
+  nothing outside the cache holds: no scan holds the entry, and no batch
+  holds a buffer of its column's values array (next item;
+  `pressure_eviction_counts_an_entry_whose_memo_is_held_outside_as_held`),
+  and the reservation is retried once; `reserve_best_effort`
   never evicts. Each pressure pass logs one INFO line, and a refusal that
   stands logs WARN. The cache evicts to fit the cap before it reserves, so a
   full cache swaps one entry for another rather than needing room for both.
@@ -5496,9 +5512,32 @@ the flag.
   below twice the margin, since admission then rarely succeeds, and when the
   cap plus the margin exceeds the limit, since the cache then cannot fill to
   its cap without eating into the margin.
+- Shared string values (ADR-3326, the 2026-10-31 amendment on an Arrow
+  values array kept with each cached string column, here the values-memo
+  amendment): a
+  cached plain `Str` column whose text the decode validated, and a block's
+  own dictionary built validated, keep one Arrow `StringArray` in a memo
+  slot, built once over the column's own buffers with safe constructors
+  (`build_str_memo` in `crates/ravel-sql/src/logs_scan/batch.rs`). A hit
+  then copies none of the column's string bytes into its values array; the
+  array's buffers are the entry's (the "values share the memo's buffer"
+  assertion): a served or just-admitted plain column
+  that no filter narrowed, with a single-typed key and every row present,
+  takes identity keys and the memo's buffers instead of the per-row loop,
+  and a dictionary takes the memo instead of a per-scan copy. Either result
+  is byte-identical to the loop
+  (`memo_str_block_is_byte_identical_to_the_loop`). Each scan holds its own
+  `Arc` over a clone of the memo and charges its layout bytes, released once
+  no batch of that scan holds it
+  (`str_values_releases_a_memo_arrays_charge_once_no_batch_holds_it`), and
+  takes nothing from `strDictValuesBuilt`. `offer` charges such a column
+  `VALUES_MEMO_BYTES` (512) beyond its `heap_bytes` for the memo
+  (`the_entry_charge_includes_the_memo_constant`). Every other column, and
+  a row group dictionary, keeps the per-scan build.
 - Known under-count: a dictionary column's entry is charged its share of the
-  dictionary but can keep the whole dictionary alive, and Arrow buffers
-  exported from an entry outlive it.
+  dictionary but can keep the whole dictionary alive. An Arrow buffer over
+  an entry's bytes is not under-counted: it holds the entry's reservation
+  (`an_arrow_array_is_the_last_holder_of_an_evicted_entrys_reservation`).
 - Known over-count: an `i64` column-reference column and its target are
   charged separately when both are cached.
 
