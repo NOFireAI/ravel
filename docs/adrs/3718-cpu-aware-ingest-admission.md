@@ -369,11 +369,12 @@ reads:
   routers, as before.
 
 The node is **congested** while any one router's queued flush count is above
-that router's bound (D3 below), or while at least 10 deferred triggers fell
-in the last full 1 s window (10 samples). A window shorter than 10 samples
-never counts as congested on deferrals. The 10 per second sits between the
-healthy traces (0 to 0.1 per second) and the collapsed ones (about 85). The
-detector publishes one congested flag, which replaces `p`.
+that router's bound (D3 below) and at least 1 deferred trigger fell in the
+last full 1 s window (10 samples). A window shorter than 10 samples is never
+congested. The detector publishes one congested flag, which replaces `p`.
+This rule is the one "GKE acceptance: both signals required" below sets; the
+first image of this amendment held on either signal, with 10 deferred
+triggers per window as the deferral half's threshold, and missed the bar.
 
 The queued half is per router, not the process-wide sum `/metrics` exports
 as `ravel_ingest_queued_flushes`. Each router's queue is capped per shard by
@@ -421,7 +422,9 @@ D3's threshold and cap flags are removed; no release carried them. In their plac
   that is 16, above the healthy traces' 6 to 14 queued flushes and well
   below the collapsed ones' 40. The collapsed figure can exceed the cap
   because a tenant buffer over its memory backstop spawns its flush
-  whatever the queue depth. At the default `--shards 4` the bound is 32.
+  whatever the queue depth; two more cases spawn past the cap with no
+  backlog, listed under "GKE acceptance: both signals required" below. At
+  the default `--shards 4` the bound is 32.
 - `--ingest-hold-queued-flushes`, unset by default, at least 1 when set:
   overrides every router's bound with one count.
 - `--ingest-hold-max-wait`, a duration, default `1s`, at most `20s`: the
@@ -473,15 +476,73 @@ of the plant this port was taken from (#3756).
 
 | Case | Offered | Span | Bar, hold | Rust, hold | Bar, no gate | Rust, no gate | Python reference | Source |
 |---|---|---|---|---|---|---|---|---|
-| A | 160k for 80 s, 400k start burst | 20 to 80 s | stored at least 152, drops at most 3.2, collapsed 0 | stored 163.4, drops 0, collapsed 0 | collapsed above 0.5 | stored 106.7, collapsed 1.0 | hold 163.4, 0, 0; no gate 106.7, collapsed 1.0 | `services/ravel-server/src/ingest_hold.rs:861` |
-| A, bound 1,000,000 (above the 300k tip) | as A | 20 to 80 s | collapsed above 0.5 | stored 106.7, collapsed 1.0 | - | - | stored 106.7, collapsed 1.0 | `services/ravel-server/src/ingest_hold.rs:861` |
-| B | 320k for 80 s | 20 to 80 s | stored at least 155.1 (0.95 x the Python reference's 163.3), collapsed 0 | stored 163.4, collapsed 0 | - | - | - | `services/ravel-server/src/ingest_hold.rs:878` |
-| C | 140k for 120 s, start burst | 60 to 120 s | stored at least 139, drops 0, collapsed 0 | stored 140.0, drops 0, collapsed 0 | collapsed above 0.5 | stored 105.8, collapsed 1.0 | - | `services/ravel-server/src/ingest_hold.rs:886` |
-| D | 160k, then 100k from 40 s, 70 s | 45 to 70 s | stored within 1 of 100, cores under 5.5 | stored 100.1, cores 4.9 | - | - | - | `services/ravel-server/src/ingest_hold.rs:900` |
+| A | 160k for 80 s, 400k start burst | 20 to 80 s | stored at least 152, drops at most 3.2, collapsed 0 | stored 163.4, drops 0, collapsed 0 | collapsed above 0.5 | stored 106.7, collapsed 1.0 | hold 163.4, 0, 0; no gate 106.7, collapsed 1.0 | `services/ravel-server/src/ingest_hold.rs:960` |
+| A, bound 1,000,000 (above the 300k tip) | as A | 20 to 80 s | collapsed above 0.5 | stored 106.7, collapsed 1.0 | - | - | stored 106.7, collapsed 1.0 | `services/ravel-server/src/ingest_hold.rs:960` |
+| B | 320k for 80 s | 20 to 80 s | stored at least 155.1 (0.95 x the Python reference's 163.3), collapsed 0 | stored 163.4, collapsed 0 | - | - | - | `services/ravel-server/src/ingest_hold.rs:977` |
+| C | 140k for 120 s, start burst | 60 to 120 s | stored at least 139, drops 0, collapsed 0 | stored 140.0, drops 0, collapsed 0 | collapsed above 0.5 | stored 105.8, collapsed 1.0 | - | `services/ravel-server/src/ingest_hold.rs:985` |
+| D | 160k, then 100k from 40 s, 70 s | 45 to 70 s | stored within 1 of 100, cores under 5.5 | stored 100.1, cores 4.9 | - | - | - | `services/ravel-server/src/ingest_hold.rs:999` |
 
-The bound-1,000,000 row is the distinguishing case: with the queued bound
+The bound-1,000,000 row is the distinguishing case: with the hold's bound
 above the tip point the hold never engages, and the plant collapses as it
-does with no gate.
+does with no gate. The plant's hold keys on its backlog in lines alone, a
+stand-in for the queued-flush half of the detector. It models no deferrals,
+so it does not test the detector's rule, and it could not show the deferral
+behaviour the GKE runs below found.
+
+### GKE acceptance: both signals required
+
+The first image of this amendment counted a node as congested on either
+signal: a router over its queued bound, or at least 10 deferred triggers in
+the last full second. On GKE that rule held healthy nodes. At a fixed 160k
+offered, healthy nodes defer 15 to 27 flush triggers per second with the
+queue at its cap (max 15 to 16, never above), and the deferral half marked
+them congested 60 to 63% of the time (#3718 comment 6604099387). At 140k the
+hold created the deferrals it reacted to, about 23 per second, where the
+same nodes without the hold defer 0 to 0.1 per second (#3718 comments
+6605267841 and 6599055872). Collapsed nodes show both signals together: the
+queue at 40 to 51, above the cap, and about 85 deferrals per second.
+
+A second image ran with the deferral half turned off, so the queued bound
+alone decided. The fleet review of #3760 (comment 4454759612) found why that
+rule is not safe either. `queued_flush_cap_reached` in
+`crates/ravel-ingest/src/shard.rs` lets a router's queued count exceed
+shard count times `max_queued_flushes` in three cases:
+
+- a buffer crossing its memory backstop spawns its flush past the cap;
+- a buffer crossing its object backstop does the same;
+- a tenant with no flush in flight on the shard gets one window past the
+  cap.
+
+The third scales with the number of tenants, not with the backlog, so a
+node with many tenants can sit above the bound with no backlog and no
+deferrals; a queued-only rule would hold every request there for the max
+wait and then refuse it. So the rule is now an AND: a router over its bound,
+and at least 1 deferred trigger over a full 1 s window. A healthy node at
+its cap is not over the bound; an exempt node over the bound is not
+deferring; a collapse is both. `flush_trigger_deferred` also counts
+per-tenant share refusals (ADR-2708 D3), so a refusal of that kind alone
+does not mark the node congested either, and one that coincides with a
+router over its bound is a node whose flushes are queuing, which is the
+case the hold is for. The congested set under the AND is a subset of the
+queued-only set, so on the second image's runs the AND holds no more often
+than the figures below. The second image's result was reported to this
+task without a posted comment id; its bars and band are the
+pre-registration's.
+
+| Node | Image | Stored at fixed 160k | Bar | Congested share | Holds admitted, refused | Source |
+|---|---|---|---|---|---|---|
+| ravel-buffered | first, either signal | 103.6k, a miss | 142.5k (0.95 x 150k, since its gate-off 150k reference collapsed at 112.5k) | 0.60 | about 9.5/s, about 9.5/s | #3718 comment 6604099387; bar from comment 6605159425 |
+| ravel-d250 | first, either signal | 125.1k, a miss | 143.7k (0.95 x its gate-off 151.3k) | 0.63 | about 9/s, about 11/s | #3718 comment 6604099387; bar from comment 6605159425 |
+| ravel-buffered | second, queued bound only | 162.0k, a pass | 142.5k | 0, never congested | 0, 0 | bar from #3718 comment 6605159425 |
+| ravel-d250 | second, queued bound only | 158.3k at 7.85 cores, a pass; queue max 19 while deferring 68/s | 143.7k | 0.37 | 14,410, 0; mean hold 0.25 s | bar from #3718 comment 6605159425 |
+
+The pre-registration also set one band, and the second image missed it:
+ravel-d250 was congested 37% of the time against a predicted under 10%
+(#3718 comment 6605159425). Its queue went over the cap while it deferred
+68 triggers per second, and at that rate a full 1 s window with no deferral
+is rare, so the AND would have held it about as often: the miss is in the
+band's prediction, not a case the AND removes. Every hold there was
+admitted, at a mean of 0.25 s, and the node cleared its bar.
 
 ### Consequences of the change
 
@@ -493,8 +554,9 @@ does with no gate.
 - A held request keeps its in-flight permit, so a long hold can shed new
   requests on the in-flight ceiling (`ravel_ingest_concurrency_shed_total`)
   before they reach the hold.
-- Deferral with spare cores (one stalled tenant on a multi-tenant node) can
-  now mark the node congested on its own, since CPU is no longer read, and
-  hold every tenant's requests while it lasts. Only the 10-per-second
-  threshold separates that case from the collapse; no measurement here
-  covers it.
+- Deferral with spare cores (one stalled tenant on a multi-tenant node)
+  does not mark the node congested on its own: with every router's queue at
+  or under its bound the node is not congested, however many triggers are
+  deferred. A stalled tenant whose deferrals coincide with a router over its
+  bound does hold every tenant's requests while both last, since CPU is no
+  longer read; no measurement here covers that case.

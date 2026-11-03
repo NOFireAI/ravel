@@ -3680,7 +3680,7 @@ fn render_ingest_hold_family(
     write_header(
         out,
         "ravel_ingest_head_hold_total",
-        "Ingest requests held at the head while the node was congested (ADR-3718), by mode and outcome: admitted once congestion cleared, or refused at --ingest-hold-max-wait. Congested means any ingest router's queued flushes exceed its bound (its shard count times --max-queued-flushes, or --ingest-hold-queued-flushes when set), or at least 10 flush triggers were deferred across all routers over the last second. A request that is not held is not counted.",
+        "Ingest requests held at the head while the node was congested (ADR-3718), by mode and outcome: admitted once congestion cleared, or refused at --ingest-hold-max-wait. Congested means any ingest router's queued flushes exceed its bound (its shard count times --max-queued-flushes, or --ingest-hold-queued-flushes when set) and at least 1 flush trigger was deferred across all routers over the last full second. A request that is not held is not counted.",
         "counter",
     );
     for outcome in crate::ingest_hold::HoldOutcome::ALL {
@@ -3706,7 +3706,7 @@ fn render_ingest_hold_family(
     write_header(
         out,
         "ravel_ingest_head_congested",
-        "1 while the node is congested and admitted ingest requests are held at the head (ADR-3718), else 0, by mode. Congested means any ingest router's queued flushes exceed its bound (its shard count times --max-queued-flushes, or --ingest-hold-queued-flushes when set), or at least 10 flush triggers were deferred across all routers over the last second. Always 0 with --ingest-hold-max-wait 0.",
+        "1 while the node is congested and admitted ingest requests are held at the head (ADR-3718), else 0, by mode. Congested means any ingest router's queued flushes exceed its bound (its shard count times --max-queued-flushes, or --ingest-hold-queued-flushes when set) and at least 1 flush trigger was deferred across all routers over the last full second. Always 0 with --ingest-hold-max-wait 0.",
         "gauge",
     );
     write_sample(
