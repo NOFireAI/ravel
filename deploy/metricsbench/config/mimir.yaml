@@ -16,14 +16,47 @@ multitenancy_enabled: false
 server:
   http_listen_port: 9009
   grpc_listen_port: 9095
-  # gRPC message ceilings sized for high-cardinality remote-write batches from
-  # the ADR-0927 cardinality profile (1,000,000 series). In 3.2.3 this equals
-  # the default (-server.grpc-max-recv-msg-size-bytes and
-  # -server.grpc-max-send-msg-size-bytes, default 104857600); it stays pinned
-  # so a future default change cannot shrink the ceiling below what the
-  # benchmark's own batches need. Not a performance optimisation.
-  grpc_server_max_recv_msg_size: 104857600
-  grpc_server_max_send_msg_size: 104857600
+  # GRPC MESSAGE CEILINGS (disclosed; replaces the 3.2.3 default 104857600,
+  # -server.grpc-max-recv-msg-size-bytes and -server.grpc-max-send-msg-size-
+  # bytes). In -target=all every component talks to the others over gRPC
+  # inside this one process, so one response passes several ceilings: this
+  # server's, and the client ones in ingester_client, querier
+  # store_gateway_client, frontend, frontend_worker and query_scheduler
+  # below, all raised to the same 536870912 (512 MiB). At the default, the
+  # harness read-back's /api/v1/series over the cardinality profile's
+  # 1,000,000 series answered 500 with "grpc: trying to send message larger
+  # than max (133231002 vs. 104857600)" on both MetricsBench runs of
+  # 2026-11-03 (#2821). 512 MiB is about four times that message. A
+  # capacity limit, not a performance optimisation: it lets a response
+  # through that the default refuses, and changes nothing on a response
+  # under 100 MiB.
+  grpc_server_max_recv_msg_size: 536870912
+  grpc_server_max_send_msg_size: 536870912
+
+# The client side of the GRPC MESSAGE CEILINGS above: the querier's client
+# to the ingester (-ingester.client.grpc-max-*-msg-size), the querier worker's
+# clients to the query-frontend and the query-scheduler
+# (-querier.frontend-client.grpc-max-*-msg-size and
+# -querier.scheduler-client.grpc-max-*-msg-size), and the scheduler's client
+# (-query-scheduler.grpc-client-config.grpc-max-*-msg-size). Each defaults to
+# 104857600 in 3.2.3.
+ingester_client:
+  grpc_client_config:
+    max_recv_msg_size: 536870912
+    max_send_msg_size: 536870912
+
+frontend_worker:
+  grpc_client_config:
+    max_recv_msg_size: 536870912
+    max_send_msg_size: 536870912
+  query_scheduler_grpc_client_config:
+    max_recv_msg_size: 536870912
+    max_send_msg_size: 536870912
+
+query_scheduler:
+  grpc_client_config:
+    max_recv_msg_size: 536870912
+    max_send_msg_size: 536870912
 
 # Single connection to s3s-fs shared by every S3-backed storage below.
 # DURABILITY: this points Mimir's durable state at S3 (s3s-fs in this stack).
@@ -124,6 +157,11 @@ querier:
   # to exceed query-store-after: the ingester keeps every block it shipped for
   # 25h, and the querier merges the overlap.
   query_store_after: 0s
+  # Client side of the GRPC MESSAGE CEILINGS under `server` above
+  # (-querier.store-gateway-client.grpc-max-*-msg-size, default 104857600).
+  store_gateway_client:
+    max_recv_msg_size: 536870912
+    max_send_msg_size: 536870912
   # Sample budget: replaces the default 50000000 with the Prometheus
   # comparator's 500000000, sized the same way (see docker-compose.yml): it
   # counts the samples a query holds at its peak, and the corpus's largest
@@ -151,6 +189,12 @@ frontend:
   # printed, so false). Written for parity with VictoriaMetrics'
   # -search.disableCache=true; a production_cache regime enables it per run.
   cache_results: false
+  # Client side of the GRPC MESSAGE CEILINGS under `server` above
+  # (-query-frontend.grpc-client-config.grpc-max-*-msg-size, default
+  # 104857600).
+  grpc_client_config:
+    max_recv_msg_size: 536870912
+    max_send_msg_size: 536870912
 
 # READINESS BEFORE THE FIRST STATEMENT (ADR-0927 amendment 2026-10-26 F): a
 # run proves historical blocks are visible before it issues a statement, and
