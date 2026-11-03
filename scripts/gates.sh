@@ -398,14 +398,17 @@ run_feature_lanes() {
   # ravel-server's `mcp` feature (ADR-1374): the /mcp route and its tests
   # compile only under it. Same shape as the agents lane above: mcp_e2e,
   # trace_by_id (whose `with_mcp` module compiles only under the feature),
-  # mcp_conformance, mcp_escape_routes and mcp_audit whole, and the lib tests
-  # whole. Every binary gated on `feature = "mcp"` belongs in this list: one
-  # left out compiles in every lane and runs in none. The Ravel Agents MCP tools compile only
+  # mcp_conformance, mcp_escape_routes, mcp_audit and the five
+  # mcp_adversarial_* binaries whole, and the lib tests whole. Every binary
+  # gated on `feature = "mcp"` belongs in this list: one left out compiles in
+  # every lane and runs in none. This command is the list;
+  # scripts/affected-tests.sh, ci.yml's features-mcp job and CLAUDE.md run or
+  # point at the same selection without restating it. The Ravel Agents MCP tools compile only
   # with both features, so mcp_agents_e2e and the clippy run that covers the
   # adapter's agents path run under `mcp,agents`.
   if [[ ${want_mcp} -eq 1 ]]; then
     run cargo clippy --locked -p ravel-server --features mcp --all-targets -- -D warnings
-    run_lane_tests -p ravel-server --features mcp --test mcp_e2e --test trace_by_id --test mcp_conformance --test mcp_escape_routes --test mcp_audit
+    run_lane_tests -p ravel-server --features mcp --test mcp_e2e --test trace_by_id --test mcp_conformance --test mcp_escape_routes --test mcp_audit --test mcp_adversarial_isolation --test mcp_adversarial_replay --test mcp_adversarial_hostile --test mcp_adversarial_precision --test mcp_adversarial_paging
     run_lane_tests -p ravel-server --features mcp --lib
     run cargo clippy --locked -p ravel-server --features mcp,agents --all-targets -- -D warnings
     run_lane_tests -p ravel-server --features mcp,agents --test mcp_agents_e2e
