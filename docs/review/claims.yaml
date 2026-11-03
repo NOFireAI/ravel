@@ -27,13 +27,13 @@
 
 - id: readme-mcp-one-tool-served
   doc: README.md
-  quote: "the other two are catalogued and refuse calls until their bodies land."
+  quote: "the other one, `ravel_search_logs`, is catalogued and refuses calls until its body lands."
   kind: positive
   binds:
     - crates/ravel-mcp/src/tools/mod.rs::SERVED_TOOLS
     - crates/ravel-mcp/src/tools/mod.rs::tests::dispatch_routes_every_catalog_name_and_refuses_unknown_names
   status: verified
-  note: "SERVED_TOOLS holds ravel_capabilities, ravel_describe_data, ravel_find_labels, ravel_explain_query, ravel_query_sql, ravel_query_promql and ravel_get_trace; dispatch answers the other two catalog names with ToolError::NotShipped, and the bound test pins the list against dispatch."
+  note: "SERVED_TOOLS holds ravel_capabilities, ravel_describe_data, ravel_find_labels, ravel_explain_query, ravel_query_sql, ravel_query_promql, ravel_get_trace and ravel_analyze_timeseries; dispatch answers the other catalog name, ravel_search_logs, with ToolError::NotShipped, and the bound test pins the list against dispatch."
 
 - id: agents-mcp-ships
   doc: docs/guides/mcp-server.md
@@ -47,14 +47,14 @@
 
 - id: agents-mcp-one-tool-served
   doc: docs/guides/mcp-server.md
-  quote: "Seven tools are served today: `ravel_capabilities`, `ravel_describe_data`, `ravel_find_labels`, `ravel_explain_query`, `ravel_query_sql`, `ravel_query_promql` and `ravel_get_trace`."
+  quote: "Eight tools are served today: `ravel_capabilities`, `ravel_describe_data`, `ravel_find_labels`, `ravel_explain_query`, `ravel_query_sql`, `ravel_query_promql`, `ravel_get_trace` and `ravel_analyze_timeseries`."
   kind: positive
   binds:
     - crates/ravel-mcp/src/tools/mod.rs::SERVED_TOOLS
     - crates/ravel-mcp/src/tools/mod.rs::ToolError
     - crates/ravel-mcp/src/tools/mod.rs::tests::dispatch_routes_every_catalog_name_and_refuses_unknown_names
   status: verified
-  note: "The other two catalog names answer ToolError::NotShipped, which the adapter renders as the method_not_found protocol error the banner names."
+  note: "The other catalog name, ravel_search_logs, answers ToolError::NotShipped, which the adapter renders as the method_not_found protocol error the banner names."
 
 - id: guide-query-audit-pipeline-installed
   doc: docs/guides/query.md

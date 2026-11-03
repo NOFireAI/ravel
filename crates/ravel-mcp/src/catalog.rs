@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::envelope::{AnyJson, TimeRange};
@@ -161,7 +161,7 @@ pub struct GetTraceInput {
     pub evidence_ref: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AnalyzeOp {
     ChangePoint,
@@ -172,13 +172,18 @@ pub enum AnalyzeOp {
 pub struct AnalyzeTimeseriesInput {
     pub query: String,
     pub time_range: TimeRange,
+    /// A duration with a unit, such as `30s`. The step and every time must be
+    /// a whole millisecond.
     pub step: String,
     pub op: AnalyzeOp,
+    /// Series rows returned; default 200, ceiling 5,000.
+    pub max_rows: Option<u32>,
     /// Bounds the whole serialized envelope; default 512 KiB, floored at
     /// 256 KiB. An analysis runs a PromQL range evaluation underneath, so it
     /// takes the same deadline and response bound the evaluation would.
     pub max_response_bytes: Option<u64>,
     pub deadline_ms: Option<u64>,
+    /// Not served by this build: any value is refused as `unsupported`.
     pub evidence_ref: Option<String>,
 }
 
@@ -455,7 +460,7 @@ mod tests {
     /// every client parses on every reconnect, and it should be read in a
     /// diff rather than absorbed silently anywhere under the bound. Update
     /// it in the same commit as the schema change that moves it.
-    const TOOLS_LIST_SERIALIZED_LEN: usize = 15_972;
+    const TOOLS_LIST_SERIALIZED_LEN: usize = 16_297;
 
     /// D2 bounds `tools/list` so the catalog itself never competes with a
     /// data response for the response-size budget.
@@ -545,6 +550,10 @@ mod tests {
     /// missing one advertises no way to lower it, so a caller that cannot
     /// afford the default has only the server ceiling to fall back on.
     ///
+    /// `ravel_analyze_timeseries` returns a caller-sized set of series rows
+    /// but takes no scan knob, because the analytics service call it reaches
+    /// applies no per-request scan budget; it refuses one as `unsupported`.
+    ///
     /// `ravel_capabilities` and `ravel_describe_data` are the two tools with
     /// no budget knob at all: the first reads nothing from the store, and
     /// the second answers from the metadata cache and one resolve per
@@ -562,6 +571,7 @@ mod tests {
         /// The subset that applies to a tool returning no caller-sized row
         /// set: it still occupies a response and still spends wall clock.
         const SHARED_BUDGET_KEYS: [&str; 2] = ["deadline_ms", "max_response_bytes"];
+        const UNSCANNED_ROW_KEYS: [&str; 3] = ["deadline_ms", "max_response_bytes", "max_rows"];
 
         let expected: [(&str, &[&str]); 7] = [
             ("ravel_query_sql", &ROW_BUDGET_KEYS),
@@ -570,7 +580,7 @@ mod tests {
             ("ravel_get_trace", &ROW_BUDGET_KEYS),
             ("ravel_find_labels", &SHARED_BUDGET_KEYS),
             ("ravel_explain_query", &SHARED_BUDGET_KEYS),
-            ("ravel_analyze_timeseries", &SHARED_BUDGET_KEYS),
+            ("ravel_analyze_timeseries", &UNSCANNED_ROW_KEYS),
         ];
 
         let catalog = tool_catalog();
@@ -758,7 +768,7 @@ mod tests {
     /// `agents` and run with both enabled answers it. Pinned for the same
     /// reason as [`TOOLS_LIST_SERIALIZED_LEN`], under the same D2 budget
     /// (ADR-3331 decision 10).
-    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 23_861;
+    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 24_186;
 
     const _: () = assert!(
         COMBINED_TOOLS_LIST_SERIALIZED_LEN < 24_576,
