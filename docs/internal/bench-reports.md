@@ -84,13 +84,16 @@ report's `stamp`.
 
 ## Selective investigations (benchmarks/investigations)
 
-Issue #3699 (ADR-3692 decision 8, T1). Not a `ravel-bench` report: a
-standalone box flow that generates a correlated spans+logs corpus, loads it
-across a key-index state matrix (unfolded, folded without leaves, folded
-with leaves, mixed, many-parts), and runs a pre-registered statement set
-cold and warm, scoring every figure against the bands in
-`benchmarks/investigations/bands.toml` (the 17 rows of ADR-3692's
-Acceptance table). See `benchmarks/investigations/README.md` for how to
-launch a run on the local/RustFS lane or the real-S3 lane, and
-`benchmarks/investigations/kit.test.sh` (wired into CI's `doc-scripts` job)
-for the harness's own self-tests.
+Issue #3699 (ADR-3692 decision 8, T1). Not a `ravel-bench` report: a box
+flow that generates a seeded spans and logs corpus, loads it with `ravel-cli
+load`, folds it through the key-index state matrix (unfolded, folded
+without leaves, folded with leaves, mixed; many-parts is unsupported on this
+build), and runs the statements of `statements.toml` against a restarted
+`ravel-server` cold and warm. `evaluate.py` judges every answer against the
+generator's oracle and every figure against
+`benchmarks/investigations/bands.toml` (ADR-3692 Acceptance rows 1 to 17);
+timing is judged on the real-S3 lane only. `benchmarks/investigations/README.md`
+covers both lanes, and `benchmarks/investigations/investigations.test.sh`,
+run by CI's `doc-scripts` job, holds the harness's cases, including a
+committed local-lane run under `fixtures/local-smoke/` that it re-evaluates
+byte for byte.
