@@ -558,9 +558,11 @@ fn resume_plan(call: &Call, position: &CursorPosition) -> Result<PagePlan, Failu
     let tuple = decode_resume_tuple(tuple).map_err(|_| CursorError::Invalid.failure())?;
     match ravel_sql::plan_page(&call.statement, Some(&ResumePosition::new(tuple))) {
         Ok(plan) => Ok(plan),
-        Err(PagePlanError::ResumeArity { .. } | PagePlanError::NonFiniteResumeValue) => {
-            Err(CursorError::Invalid.failure())
-        }
+        Err(
+            PagePlanError::ResumeArity { .. }
+            | PagePlanError::ResumeValueTypeMismatch { .. }
+            | PagePlanError::NonFiniteResumeValue,
+        ) => Err(CursorError::Invalid.failure()),
         Err(error) => Err(plan_refusal(&error).0),
     }
 }
@@ -1444,5 +1446,33 @@ mod tests {
             );
         }
         assert_eq!(stub.executed.borrow().len(), 2);
+    }
+
+    /// A cursor whose tuple does not have the order terms' types is
+    /// `cursor_invalid` before the backend. Page one mints it from `Int`
+    /// values where `ts` and `observed_ts` take `TimestampNanos`.
+    ///
+    /// FLIP: dropping `ResumeValueTypeMismatch` from `resume_plan`'s cursor
+    /// arm sends it to `plan_refusal`, which answers `invalid_argument`.
+    #[test]
+    fn a_cursor_whose_tuple_has_another_type_is_invalid() {
+        let key = key();
+        let stub = Stub::default();
+        let ints = |i: i64| Some(vec![ResumeValue::Int(i), ResumeValue::Int(i)]);
+        stub.sql.borrow_mut().push_back(
+            plain(&[("a", 1, 1), ("b", 2, 2), ("c", 3, 3)]).with_order_tuples(vec![
+                ints(1),
+                ints(2),
+                ints(3),
+            ]),
+        );
+        let one = block_on(run(args(json!({})), &context(&key), &stub));
+        let cursor = one.presentation.cursor.clone().expect("page one's cursor");
+
+        let mut resumed = args(json!({}));
+        resumed["cursor"] = json!(cursor);
+        let two = block_on(run(resumed, &later(&key), &stub));
+        assert_eq!(failure_class(&two), FailureClass::CursorInvalid);
+        assert_eq!(stub.executed.borrow().len(), 1);
     }
 }

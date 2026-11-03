@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
-use ravel_commit::{keys, publish, record};
+use ravel_commit::{erasure, keys, publish, record, signal};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::fault::{
@@ -34,7 +34,8 @@ use ravel_object_store::fault::{
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_sql::{PhaseWallTiming, SqlConfig, SqlError};
+use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
+use ravel_sql::{ErasurePredicate, PhaseWallTiming, SqlConfig, SqlError};
 use ravel_types::{Signal, TenantId, logstream};
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 use uuid::Uuid;
@@ -386,6 +387,121 @@ async fn the_retry_reuses_the_same_now_ns_and_window() {
         outcome.stats.segments, 2,
         "the re-resolve must see the same two segments as the first"
     );
+}
+
+/// Writes a metrics erasure request matching `job = value`, which the next
+/// `Catalog::resolve` reads into its snapshot's `pending_erasure`.
+async fn put_metrics_erasure(store: &dyn ObjectStoreBackend, tenant: &TenantId, value: &str) {
+    let request_id = Uuid::new_v4();
+    let request = ErasureRequest {
+        format_version: 1,
+        tenant_hash: tenant.hash().0.to_vec(),
+        signal: signal::to_proto(Signal::Metrics) as i32,
+        request_id: request_id.to_string(),
+        created_unix_ns: 1,
+        predicate: vec![ErasurePredicateMatcher {
+            key: "job".to_string(),
+            value: value.to_string(),
+        }],
+        window_start_ns: 0,
+        window_end_ns: 0,
+        reason: String::new(),
+    };
+    let key = keys::erasure_request_key(&tenant.hash(), Signal::Metrics, request_id)
+        .expect("erasure request key");
+    store
+        .put(
+            &key,
+            erasure::encode_request(&request),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("put erasure request");
+}
+
+/// `SqlOutcome::pending_erasure` describes the attempt whose rows were
+/// returned. The first attempt resolves a snapshot pending one erasure; a
+/// second erasure is written while that attempt's only segment GET is held,
+/// and the GET then fails `NotFound`, so the retry resolves a snapshot
+/// pending both. The outcome carries exactly the retry's two predicates.
+///
+/// FLIP: with `run`'s `let pending_erasure = lanes...collect();` replaced by
+/// the predicates of the first attempt's snapshot (kept across the loop), the
+/// outcome carries one predicate rather than two; replaced by `Vec::new()`,
+/// it carries none.
+#[tokio::test]
+async fn pending_erasure_describes_the_retried_attempt_whose_rows_were_returned() {
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+            .with_key_contains(".rseg")
+            .with_occurrence(Occurrence::Nth(1)),
+    );
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
+    let tenant = tenant_id("acme");
+    // One segment, so the held GET is the first attempt's only data read and
+    // no other GET can take the `NotFound` and start the retry early.
+    let seg_specs = vec![SegSpec::new(
+        10,
+        1,
+        1,
+        vec![SeriesSpec::new("m", vec![(100, 1.0), (200, 2.0)])],
+    )];
+    let fixture = Fixture::build(
+        Arc::clone(&backend),
+        &[(&tenant, &seg_specs)],
+        SqlConfig::default(),
+        1 << 30,
+    )
+    .await;
+    put_metrics_erasure(backend.as_ref(), &tenant, "first").await;
+
+    let gate = store.hold(Op::Get, Some(".rseg".to_string()), Occurrence::Nth(1));
+    let writer = {
+        let backend = Arc::clone(&backend);
+        let tenant = tenant.clone();
+        tokio::spawn(async move {
+            gate.wait_until_held(1).await;
+            put_metrics_erasure(backend.as_ref(), &tenant, "second").await;
+            for id in gate.held() {
+                gate.release(id);
+            }
+        })
+    };
+
+    let outcome = fixture
+        .executor
+        .execute(tenant.hash(), &request("SELECT ts, value FROM samples"))
+        .await
+        .expect("the retry must recover the query");
+    writer.await.expect("the writer ran to completion");
+
+    assert_eq!(
+        store.fault_count(Op::Get, FaultKind::NotFoundBlip),
+        1,
+        "the injected NotFound must actually have fired"
+    );
+    assert_eq!(outcome.stats.resolves, 2);
+    assert_eq!(
+        outcome.output.num_rows(),
+        2,
+        "neither erasure matches a row"
+    );
+    let predicate =
+        |value: &str| ErasurePredicate::new(vec![("job".to_string(), value.to_string())], 0, 0);
+    assert_eq!(
+        outcome.pending_erasure.len(),
+        2,
+        "the retry's snapshot pends two erasures: {:?}",
+        outcome.pending_erasure
+    );
+    for expected in [predicate("first"), predicate("second")] {
+        assert!(
+            outcome.pending_erasure.contains(&expected),
+            "{expected:?} missing from {:?}",
+            outcome.pending_erasure
+        );
+    }
 }
 
 fn count_of(output: &ravel_sql::QueryOutput) -> i64 {
