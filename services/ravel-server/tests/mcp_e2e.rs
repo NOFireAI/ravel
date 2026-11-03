@@ -3423,6 +3423,9 @@ mod with_mcp {
         let failure = envelope.failure.as_ref().expect("an error carries one");
         assert_eq!(failure.class, FailureClass::Deadline, "{failure:?}");
         assert_eq!(scan.held_count(), 1, "the statement reached its data read");
+        // hygiene-allow: wall-clock -- `started` is a tokio Instant under
+        // tokio::time::pause(), so `elapsed` is the virtual time this test
+        // advances itself, not real time.
         assert!(
             elapsed >= deadline && elapsed <= deadline + Duration::from_millis(1),
             "answered after {elapsed:?} under a {deadline:?} deadline: {failure:?}"
