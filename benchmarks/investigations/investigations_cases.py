@@ -211,6 +211,26 @@ target_if = "v < 0"
 """
 
 
+MATRIX_BANDS = PASS_BANDS + """
+[[row]]
+key = "row_t2"
+adr_row = 13
+check = "case"
+target = "case"
+miss = "case"
+source = "predicted"
+requires_tenant = "inv"
+
+[[row.figure]]
+name = "mixed_rows_exact"
+statement = "all"
+state = "mixed"
+metric = "matrix.state_rows_exact"
+lane = "counter"
+target_if = "v == 1"
+"""
+
+
 class Workdir(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -740,6 +760,31 @@ class LocalSmoke(Workdir):
             self.assertEqual((f["status"], f["value"], f["verdict"], f["reason"]),
                              (GUARD, None, GUARD, f"refused by the SQL complexity guard: {REFUSAL_1000}"))
         self.assertEqual(figure(res, "row_11.spans_1000_rows_exact")["reason"], REFUSAL_1000)
+        # Item 8: the guard's refusals are counted apart from unsupported figures.
+        self.assertEqual(res["refusal_classes"], {GUARD: {"figures": 15, "calls": 24},
+                                                  UNSUPPORTED: {"figures": 23, "calls": 0}})
+        guarded = sorted(f["id"] for f in res["figures"] if f["status"] == GUARD)
+        self.assertEqual(len(guarded), 15)
+        self.assertTrue(all(i.startswith("row_11.") for i in guarded), guarded)
+
+    def test_not_requested_rows_listed_beside_the_verdict(self):
+        # Item 9: gated rows run.toml never asked for, in results and summary.
+        _, res, text = evaluate(smoke_run(self.path("run")), self.path("out"))
+        self.assertEqual(res["not_requested"], [
+            {"row": 5, "key": "row_05", "reason": "run.toml hits = false"},
+            {"row": 6, "key": "row_06", "reason": "run.toml hits = false"},
+            {"row": 10, "key": "row_10", "reason": "run.toml states lacks ['many_parts_2160']"},
+            {"row": 12, "key": "row_12", "reason": "run.toml scales lacks [10, 100]"},
+            {"row": 16, "key": "row_16", "reason": "run.toml hits = false, baseline = false"},
+        ])
+        self.assertEqual(text.splitlines()[:3], [
+            "selective investigations, lane local: fail",
+            "not requested: row 5 (run.toml hits = false); row 6 (run.toml hits = false); row 10 (run.toml "
+            "states lacks ['many_parts_2160']); row 12 (run.toml scales lacks [10, 100]); row 16 (run.toml "
+            "hits = false, baseline = false)",
+            "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 23 figure(s), "
+            "0 call(s)",
+        ])
 
     def test_many_parts_24(self):
         # Item 9: the smoke's many-parts state is a real 24-part catalog.
@@ -1589,6 +1634,76 @@ class Evaluate(Workdir):
     def test_deadline_mid_state(self):
         self.assertEqual(self.check_deadline_mid_state(), [])
 
+    def check_not_requested(self, evaluate_py=EVALUATE):
+        """Gated rows run.toml never asked for are listed, each with the setting that leaves it out."""
+        _, res, text = self.go(BANDS, evaluate_py)
+        got = [(r["row"], r["reason"]) for r in res["not_requested"]]
+        want = [(5, "run.toml hits = false"), (6, "run.toml hits = false"),
+                (10, "run.toml states lacks ['many_parts_2160']"), (12, "run.toml scales lacks [10, 100]"),
+                (16, "run.toml hits = false, baseline = false")]
+        out = [] if got == want else [f"not_requested {got}"]
+        if "not requested: row 5 (run.toml hits = false); row 6 " not in text:
+            out.append("summary carries no not-requested line")
+        return out
+
+    def test_not_requested(self):
+        self.assertEqual(self.check_not_requested(), [])
+
+    def check_refusal_classes(self, evaluate_py=EVALUATE):
+        """Guard refusals and unsupported figures are counted apart."""
+        _, res, text = self.go(BANDS, evaluate_py)
+        want = {GUARD: {"figures": 15, "calls": 24}, UNSUPPORTED: {"figures": 23, "calls": 0}}
+        out = [] if res["refusal_classes"] == want else [f"classes {res['refusal_classes']}"]
+        if "refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 23" not in text:
+            out.append("summary carries no refusal-class line")
+        return out
+
+    def test_refusal_classes(self):
+        self.assertEqual(self.check_refusal_classes(), [])
+
+    def unsend(self, keep):
+        """Turn every mixed call whose (statement, temp) keep rejects into a not-run line."""
+        for i, c in enumerate(self.calls):
+            if c["state"] == "mixed" and not keep(c["statement"], c.get("temp")):
+                self.calls[i] = {k: c[k] for k in ("statement", "state", "temp", "try", "tenant")}
+                self.calls[i].update(outcome="not-run", reason="case: run deadline")
+        self.save_calls()
+
+    def check_matrix_all_not_run(self, evaluate_py=EVALUATE):
+        """Every call group of a state not run: its rows_exact figure is not-run and the run incomplete."""
+        self.unsend(lambda statement, temp: False)
+        code, res, _ = self.go(self.pass_bands(MATRIX_BANDS), evaluate_py)
+        f = figure(res, "row_t2.mixed_rows_exact")
+        out = [] if (f["status"], f["value"], f["verdict"]) == ("not-run", None, "not-run") else [
+            f"figure {f['status']} {f['value']} {f['verdict']}"]
+        if (code, res["verdict"]) != (1, "incomplete"):
+            out.append(f"exit {code} {res['verdict']} {res['problems']}")
+        if ("figure row_t2.mixed_rows_exact not run: every call group in mixed not run: case: run deadline"
+                not in res["incomplete"]):
+            out.append(f"incomplete {res['incomplete']}")
+        return out
+
+    def test_matrix_all_not_run(self):
+        self.assertEqual(self.check_matrix_all_not_run(), [])
+
+    def check_matrix_some_not_run(self, evaluate_py=EVALUATE):
+        """Some call groups of a state not run: the figure passes over the groups that ran and names the rest."""
+        self.unsend(lambda statement, temp: (statement, temp) not in (("journey_b", "cold"),
+                                                                      ("spans_lookup_1h", "warm")))
+        code, res, _ = self.go(self.pass_bands(MATRIX_BANDS), evaluate_py)
+        f = figure(res, "row_t2.mixed_rows_exact")
+        out = [] if (f["status"], f["value"], f["verdict"]) == ("value", 1, "pass") else [
+            f"figure {f['status']} {f['value']} {f['verdict']}"]
+        if f["reason"] != ("over the 23 call group(s) that ran; 2 not run: journey_b/cold, "
+                           "spans_lookup_1h/warm"):
+            out.append(f"reason {f['reason']}")
+        if res["verdict"] != "incomplete":
+            out.append(f"verdict {res['verdict']} {res['problems']}")
+        return out
+
+    def test_matrix_some_not_run(self):
+        self.assertEqual(self.check_matrix_some_not_run(), [])
+
     def check_budget_from_truth(self, evaluate_py=EVALUATE):
         """Row 15's GET budget charges truth.json's holders times its rows per holder."""
         path = os.path.join(self.run_dir, "truth.json")
@@ -1787,6 +1902,26 @@ FLIPS = {
         '    return isinstance(ki, dict) and bool(ki.get("keysProbed") or ki.get("partsCovered"))',
         '    return isinstance(ki, dict)',
         "check_control_zeros_without_scan",
+    ),
+    "a state with every call group unsent read as missing": (
+        "        if groups and len(unsent) == len(groups):\n",
+        "        if False:\n",
+        "check_matrix_all_not_run",
+    ),
+    "unsent call groups not named beside the figure": (
+        "        if unsent:\n            names = ",
+        "        if False:\n            names = ",
+        "check_matrix_some_not_run",
+    ),
+    "a hits-gated row not listed as not requested": (
+        '        if row.get("requires_tenant") == "hits" and not cfg["hits"]:\n            why.append',
+        '        if False:\n            why.append',
+        "check_not_requested",
+    ),
+    "guard refusals counted with unsupported figures": (
+        '                                             if c.get("outcome") == k)}',
+        '                                             if c.get("outcome") in (GUARD, UNSUPPORTED))}',
+        "check_refusal_classes",
     ),
     "full overlap not counted": (
         'overlapped = sum(1 for c in lines if c["started_unix_s"] < ended and',

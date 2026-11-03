@@ -993,6 +993,27 @@ def row_not_run(row, cfg, live):
     return None
 
 
+def not_requested(bands, cfg, live):
+    """Gated rows run.toml never asked for, each with the setting that leaves
+    it out. A requested state that did not run is incomplete, not listed."""
+    out = []
+    for row in bands["row"]:
+        why = []
+        if row.get("requires_tenant") == "hits" and not cfg["hits"]:
+            why.append("hits = false")
+        scales = [s for s in row.get("requires_scales", []) if s not in cfg["scales"]]
+        if scales:
+            why.append(f"scales lacks {scales}")
+        if row.get("requires_baseline") and not cfg["baseline"]:
+            why.append("baseline = false")
+        states = [s for s in row.get("requires_states", []) if live.get(s) == "not in run.toml states"]
+        if states:
+            why.append(f"states lacks {states}")
+        if why:
+            out.append({"row": row["adr_row"], "key": row["key"], "reason": "run.toml " + ", ".join(why)})
+    return out
+
+
 def figure_not_run(fig, live):
     states = list(fig.get("requires_states", []))
     if fig["state"] != "all":
@@ -1298,7 +1319,13 @@ def incomplete_reasons(cfg, live, calls, figures):
 
 
 def summary_text(res):
-    out = [f"selective investigations, lane {res['lane']}: {res['verdict']}", ""]
+    out = [f"selective investigations, lane {res['lane']}: {res['verdict']}"]
+    if res["not_requested"]:
+        out.append("not requested: " + "; ".join(f"row {r['row']} ({r['reason']})" for r in res["not_requested"]))
+    k = res["refusal_classes"]
+    out.append(f"refusal classes: {GUARD} {k[GUARD]['figures']} figure(s), {k[GUARD]['calls']} call(s); "
+               f"{UNSUPPORTED} {k[UNSUPPORTED]['figures']} figure(s), {k[UNSUPPORTED]['calls']} call(s)")
+    out.append("")
     out.append("states:")
     for s in res["states"]:
         out.append(f"  {s['state']:24} {s['status']}" + (f"  ({s['reason']})" if s.get("reason") else ""))
@@ -1409,15 +1436,20 @@ def main(argv):
             return "value", len(calls.wrong) + len(calls.errors), ""
         if metric == "matrix.negative_controls":
             return "not-run", None, "mutant controls not implemented"
-        ok = [c for (_, s, _), t in calls.groups.items() if s == state for v in t.values() for c in v
-              if c.get("outcome") == "ok"]
+        groups = {k: [c for v in t.values() for c in v] for k, t in sorted(calls.groups.items()) if k[1] == state}
+        unsent = {k: lines for k, lines in groups.items() if all(c.get("outcome") == "not-run" for c in lines)}
+        ok = [c for k, lines in groups.items() if k not in unsent for c in lines if c.get("outcome") == "ok"]
+        if groups and len(unsent) == len(groups):
+            first = next(iter(unsent.values()))[0]
+            return "not-run", None, f"every call group in {state} not run: {first.get('reason') or 'no reason given'}"
         if not ok:
-            unsent = [c for (_, s, _), t in sorted(calls.groups.items()) if s == state for v in t.values()
-                      for c in v if c.get("outcome") == "not-run"]
-            if unsent:
-                return "not-run", None, unsent[0].get("reason") or "no reason given"
             return "missing", None, f"no ok call in {state}"
-        return "value", int(all(c.get("_judged") in ("correct", "reference", "unjudged") for c in ok)), ""
+        value = int(all(c.get("_judged") in ("correct", "reference", "unjudged") for c in ok))
+        if unsent:
+            names = ", ".join(f"{k[0]}/{k[2]}" for k in unsent)
+            return "value", value, (f"over the {len(groups) - len(unsent)} call group(s) that ran; "
+                                    f"{len(unsent)} not run: {names}")
+        return "value", value, ""
 
     stmt_cost = statement_cost(calls, cfg)
     maint = maintenance_cost(folds, stamps, cfg, live, problems)
@@ -1458,6 +1490,11 @@ def main(argv):
         "verdict": verdict,
         "problems": problems.lines,
         "incomplete": incomplete,
+        "not_requested": not_requested(bands, cfg, live),
+        "refusal_classes": {k: {"figures": sum(1 for f in figures if f["status"] == k),
+                                "calls": sum(1 for t in calls.groups.values() for v in t.values() for c in v
+                                             if c.get("outcome") == k)}
+                            for k in (GUARD, UNSUPPORTED)},
         "needle_blocks": needles,
         "states": states,
         "figures": figures,
