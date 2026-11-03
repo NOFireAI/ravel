@@ -86,8 +86,10 @@ pub const fn key_index_root_shape() -> (usize, u32) {
 /// with the raw buffer already dropped. 8 bytes per wire byte covers the
 /// larger of those two peaks; the 64 covers the fixed `Vec` headers.
 /// [`KeyIndexLeafPrefix`]'s decode refuses a frame claiming more than
-/// `uncompressed_len / 10` entries before it allocates, which is what makes
-/// the count side of this arithmetic hold for a hostile frame.
+/// `uncompressed_len / 10` entries before it allocates, and an entry whose
+/// `block_count` leaves fewer than 10 bytes for each entry still to come,
+/// which is what makes this arithmetic hold for a hostile frame: the entry
+/// capacity and the blocks together stay within 4 bytes per wire byte.
 pub const fn decoded_bound(uncompressed_len: u32) -> u64 {
     8 * uncompressed_len as u64 + 64
 }
@@ -1024,7 +1026,7 @@ impl KeyIndexLeafPrefix {
         let mut entries = Vec::with_capacity(entry_count as usize);
         let mut pos = 0usize;
         let mut prev: Option<(Key8, u64)> = None;
-        for _ in 0..entry_count {
+        for index in 0..entry_count {
             let key8: Key8 = raw
                 .get(pos..pos + 8)
                 .and_then(|s| s.try_into().ok())
@@ -1037,9 +1039,16 @@ impl KeyIndexLeafPrefix {
                     "bucket {bucket} entry has an empty block set"
                 )));
             }
-            if block_count > (raw.len() - pos) as u64 {
+            // Each later entry keeps its minimum wire bytes, so the blocks
+            // allocated so far stay within `decoded_bound` even when the
+            // claimed count is larger than what the frame really holds.
+            let later = u64::from(entry_count - 1 - index);
+            let room = ((raw.len() - pos) as u64)
+                .saturating_sub(later * u64::from(MIN_FRAME_ENTRY_WIRE_BYTES));
+            if block_count > room {
                 return Err(corrupted(format_args!(
-                    "bucket {bucket} block_count {block_count} exceeds the bytes left"
+                    "bucket {bucket} block_count {block_count} exceeds the bytes left \
+                     with {later} entries still to come"
                 )));
             }
             let mut blocks = Vec::with_capacity(block_count as usize);
