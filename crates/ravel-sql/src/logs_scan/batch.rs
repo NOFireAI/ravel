@@ -5723,9 +5723,9 @@ mod tests {
             /// Flipped: dropping the `all_present` precondition from
             /// `StrCursor::plain_memo` fails "keys" on a block with absent
             /// rows. Dropping the `all_valid` check from
-            /// `StrCursor::dict_memo_keys` fails "key nulls" on a block with
-            /// a non-UTF-8 dictionary entry: the shared key of that row points
-            /// at the NULL entry where the loop writes a NULL key.
+            /// `StrCursor::dict_memo_keys` fails "keys" on a block with a
+            /// non-UTF-8 dictionary entry: the shared key of that row points
+            /// at the NULL entry where the loop writes a NULL key (0).
             #[test]
             fn memo_str_block_is_byte_identical_to_the_loop(case in memo_case()) {
                 let block = memo_block(&case);
