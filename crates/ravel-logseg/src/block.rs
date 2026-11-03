@@ -1926,6 +1926,28 @@ impl CachedColumn {
         self.memo_slot().is_some_and(MemoSlot::held_outside)
     }
 
+    /// Whether something beyond one handle holds the column object that
+    /// carries its reservation cell ([`Self::reservation_cell`]): a plain
+    /// column's `Arc`, or a dictionary's values `Arc` when the entry charges
+    /// it in full. Called on an entry's own column, whose handle is the one.
+    pub(crate) fn cell_column_held_outside(&self) -> bool {
+        match self {
+            CachedColumn::Plain(p) => Arc::strong_count(p) > 1,
+            CachedColumn::Dict(d) if !d.narrow => Arc::strong_count(&d.values) > 1,
+            _ => false,
+        }
+    }
+
+    /// The dictionary a dictionary column reads, as a scan's dictionary
+    /// cache holds it. Test accessor.
+    #[cfg(test)]
+    pub(crate) fn dict_values_for_test(&self) -> Option<Arc<DictValues>> {
+        match self {
+            CachedColumn::Dict(d) => Some(Arc::clone(&d.values)),
+            _ => None,
+        }
+    }
+
     /// The reservation cell an entry over this column shares with the
     /// column: a plain column's own, and a dictionary's when the entry
     /// charges it in full. `None` for any other column, whose entry gets a

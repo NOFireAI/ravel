@@ -194,6 +194,7 @@ pub fn decoded_cache_json(stats: &DecodedCacheStats) -> Json {
         "evictions": stats.counters.evictions,
         "ghostHits": stats.counters.ghost_hits,
         "marginSkips": stats.counters.margin_skips,
+        "filledCellRefusals": stats.counters.filled_cell_refusals,
         "residentBytes": stats.resident_bytes,
         "pressureEvictions": stats.pressure.evictions,
         "pressureFreedBytes": stats.pressure.freed_bytes,
@@ -279,9 +280,9 @@ mod tests {
         assert_eq!(total_requests, snapshot.pooled().total_s3_requests());
     }
 
-    /// `decoded_cache_json` renders exactly the eleven ADR-3326 keys for a
+    /// `decoded_cache_json` renders exactly the twelve ADR-3326 keys for a
     /// statement whose scan has a `Contains` arm, each carrying its own
-    /// distinct source figure, and the ten without
+    /// distinct source figure, and the eleven without
     /// `deferredSetEstimateBytes` for one with no estimate.
     #[test]
     fn decoded_cache_json_names_every_field_exactly_once() {
@@ -294,6 +295,7 @@ mod tests {
                 ghost_hits: 5,
                 margin_skips: 9,
                 unvalidated_refusals: 11,
+                filled_cell_refusals: 12,
                 deferred_set_estimate_bytes: Some(10),
                 deferred_served: true,
             },
@@ -312,6 +314,7 @@ mod tests {
                 "evictions": 4,
                 "ghostHits": 5,
                 "marginSkips": 9,
+                "filledCellRefusals": 12,
                 "residentBytes": 6,
                 "pressureEvictions": 7,
                 "pressureFreedBytes": 8,
@@ -330,6 +333,7 @@ mod tests {
                 "evictions": 4,
                 "ghostHits": 5,
                 "marginSkips": 9,
+                "filledCellRefusals": 12,
                 "residentBytes": 6,
                 "pressureEvictions": 7,
                 "pressureFreedBytes": 8,
