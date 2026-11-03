@@ -43,6 +43,10 @@ use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot};
 use crate::request_budgets::RequestBudgets;
 use crate::segment_admission::{self, RequestBudget};
 
+mod sample_fold;
+
+use sample_fold::{HistogramFold, ScalarFold};
+
 /// Which evaluation shape a prefetch is being computed for: an instant
 /// query has one lookup instant, a range query spans a step grid whose
 /// first and last instants bound every `PlanAnchor::Window` selector's own
@@ -1983,14 +1987,11 @@ impl QueryEngine {
             // blanket impl ("implementation of FnOnce is not general
             // enough") at the router call site in `http/mod.rs`. Cloning
             // each `SelectorPlan` into the future sidesteps that entirely.
-            // Per-plan local result: this selector's raw scalar runs (kept
-            // un-merged so cross-cluster federation runs can join the same
-            // pool and merge once, below), the merged native-histogram series
-            // (federation contributes no histograms), the page stats, and any
-            // honored ADR-0103 pushdown partials (`Some` only for the single
-            // eligible matcher set; `None` for every other plan).
+            // Per-plan local result: the merged native-histogram series, the
+            // page stats, and any honored ADR-0103 pushdown partials (`Some`
+            // only for the single eligible matcher set; `None` for every other
+            // plan). Every plan's scalar runs go into `scalar_fold`, below.
             type PerPlan = (
-                Vec<Vec<FetchedSeriesSoa>>,
                 Vec<HistogramSeriesData>,
                 FetchStats,
                 Option<Vec<crate::distrib::codec::PartialAggregate>>,
@@ -2033,11 +2034,19 @@ impl QueryEngine {
             // candidate.
             let pushdown_target =
                 count_over_time_pushdown_target(plans, eval_window, snapshot_eligible)?;
+            // One scalar fold for the whole attempt: every selector's runs,
+            // and the federation runs below, fold into it as each object's
+            // fetch completes (issue #3747), so the caps and the budget charge
+            // apply to the union and no object's decoded runs are held past
+            // its own fold.
+            let scalar_fold =
+                std::sync::Mutex::new(ScalarFold::new(Arc::clone(&self.memory_budget), max_series));
             let results: Vec<Result<PerPlan, QueryError>> = stream::iter(distinct_plans)
                 .map(|plan| {
                     let snapshot = &snapshot;
                     let accounting = &accounting;
                     let pushdown_target = &pushdown_target;
+                    let scalar_fold = &scalar_fold;
                     async move {
                         // ADR-0103 live: send the partial-aggregate request for
                         // the one eligible matcher set, `None` for every other
@@ -2075,7 +2084,9 @@ impl QueryEngine {
                         // fetch charges into -- so the budget bounds the whole
                         // query's scan and cancels it mid-fetch, not after the
                         // merge has already paid for every byte.
-                        let (scalar_fetched, page_stats, hist_fetched, pushdown_partials) = self
+                        let mut histogram_fold =
+                            HistogramFold::new(Arc::clone(&self.memory_budget), max_series);
+                        let (page_stats, pushdown_partials) = self
                             .fetch_samples_and_histograms_maybe_distributed(
                                 tenant_hash,
                                 snapshot,
@@ -2085,56 +2096,48 @@ impl QueryEngine {
                                 RequestBudget::new(max_s3_requests, fold_lag),
                                 wall_deadline,
                                 partial_req,
+                                scalar_fold,
+                                &mut histogram_fold,
                             )
                             .await?;
-                        let histograms =
-                            merge_histogram_soa_runs(hist_fetched, max_series, max_samples)?;
-                        Ok::<PerPlan, QueryError>((
-                            scalar_fetched,
-                            histograms,
-                            page_stats,
-                            pushdown_partials,
-                        ))
+                        let histograms = histogram_fold.into_series(max_samples)?;
+                        Ok::<PerPlan, QueryError>((histograms, page_stats, pushdown_partials))
                     }
                 })
                 .buffer_unordered(concurrency)
                 .collect()
                 .await;
 
-            // Collect every distinct matcher set's raw scalar runs into one
-            // pool and every distinct matcher set's histogram series into one
-            // deduplicated map. Scalar runs are merged once, below, after
-            // federation has appended its runs,
-            // so a single k-way `merge_soa_runs` unions across selectors,
-            // segments, AND clusters with the one deterministic `is_greater`
-            // total order. Two plans that select the same series decode
-            // byte-identical raw runs (the decode is a pure function of
-            // segment bytes + series id, no per-plan window trim; per-selector
-            // window clipping happens downstream in `MergedSource::query`), so
-            // pooling their runs is loss-free -- documented in
-            // docs/query-engine.md.
+            // Every distinct matcher set's scalar runs were folded into
+            // `scalar_fold` as their objects completed; federation's runs join
+            // it below, so the one fold unions across selectors, segments, AND
+            // clusters under the one deterministic `is_greater` total order,
+            // exactly as a single `merge_soa_runs` over the pooled runs would.
+            // Two plans that select the same series decode byte-identical raw
+            // runs (the decode is a pure function of segment bytes + series
+            // id, no per-plan window trim; per-selector window clipping
+            // happens downstream in `MergedSource::query`), so folding both is
+            // loss-free -- documented in docs/query-engine.md. Each distinct
+            // matcher set's histogram series go into one deduplicated map.
             //
-            // Enforcement scope: because the runs are pooled, the single
-            // `merge_soa_runs` below enforces `max_series`/`max_samples` ONCE
-            // over the union of every selector's (and every remote cluster's)
-            // runs. That makes the caps a query-wide bound on the
-            // coordinator's peak memory, not a per-selector budget: a
-            // multi-selector or federated query is bounded by the cap as a
-            // whole rather than by cap-times-selectors. This is intentional --
-            // the caps exist to bound this process's memory for the whole
-            // query -- and it is why the merge must be the one reachable place
-            // the scalar caps are checked (the per-selector loop above
-            // deliberately does not check them for scalars; histograms, merged
-            // per selector, still check there).
-            let mut all_scalar_runs: Vec<Vec<FetchedSeriesSoa>> = Vec::new();
+            // Enforcement scope: because the runs share one fold, it enforces
+            // `max_series` (as each new series arrives) and `max_samples` (when
+            // the result is built) ONCE over the union of every selector's (and
+            // every remote cluster's) runs. That makes the caps a query-wide
+            // bound on the coordinator's peak memory, not a per-selector
+            // budget: a multi-selector or federated query is bounded by the cap
+            // as a whole rather than by cap-times-selectors. This is
+            // intentional -- the caps exist to bound this process's memory for
+            // the whole query -- and it is why the fold must be the one
+            // reachable place the scalar caps are checked (histograms, folded
+            // per selector, check them per selector).
             let mut combined_histograms: HashMap<LabelSet, HistogramSeriesData> = HashMap::new();
             let mut page_stats = FetchStats::default();
             // At most one plan (the eligible pushdown target) yields honored
             // partials; every other yields `None`. Collect the one that did.
             let mut collected_pushdown: Option<Vec<crate::distrib::codec::PartialAggregate>> = None;
             for r in results {
-                let (scalar_runs, histograms, per_plan_stats, pushdown_partials) = r?;
-                all_scalar_runs.extend(scalar_runs);
+                let (histograms, per_plan_stats, pushdown_partials) = r?;
                 for series in histograms {
                     insert_or_union_histogram_series(&mut combined_histograms, series);
                 }
@@ -2147,9 +2150,9 @@ impl QueryEngine {
 
             // Cross-cluster federation (ADR-0071): fan each
             // selector's matchers and window out to every configured remote
-            // cluster and append the returned runs to the same pool the local
-            // fetch produced, so the k-way merge below unions across cluster
-            // boundaries exactly as it unions across segments. Each remote
+            // cluster and fold the returned runs into the same fold the local
+            // fetch fed, so it unions across cluster boundaries exactly as it
+            // unions across segments. Each remote
             // resolves its own snapshot and enforces its own
             // admission/limits/erasure, so the coordinator sends no erasure
             // predicates and no cluster-local commit tokens across the
@@ -2179,7 +2182,13 @@ impl QueryEngine {
             let (fed_runs, fed_hist_runs, fed_stats, fed_warnings, fed_partial) = self
                 .federate_scalar(tenant_hash, fed_plans, &accounting, fold_lag, wall_deadline)
                 .await?;
-            all_scalar_runs.extend(fed_runs);
+            // Bind the lock to its own statement so the guard is dropped
+            // before the next await.
+            let absorbed = scalar_fold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .absorb(fed_runs.into_iter().flatten());
+            absorbed?;
             // Merge every remote's native-histogram runs into the same
             // deduplicated pool the local per-selector histograms populated
             // (ADR-0096 decision 3 step 4): each remote resolved its own
@@ -2211,7 +2220,10 @@ impl QueryEngine {
                 .raw_f64_bytes
                 .saturating_add(fed_stats.raw_f64_bytes);
 
-            let mut series = merge_soa_runs(all_scalar_runs, max_series, max_samples)?;
+            let mut series = scalar_fold
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .into_series(max_samples)?;
             series.sort_by(|a, b| a.labels.iter().cmp(b.labels.iter()));
             let mut histogram_series: Vec<HistogramSeriesData> =
                 combined_histograms.into_values().collect();
@@ -2658,13 +2670,14 @@ impl QueryEngine {
     }
 
     /// Fetches every matched series from each snapshot segment in a single
-    /// open+decode pass per segment, returning the scalar SoA
-    /// runs and the native-histogram runs as parallel per-segment vectors
-    /// (one entry per segment, same order), plus the per-segment
-    /// `FetchStats` summed across the snapshot (no longer
-    /// discarded, ADR-0044). Replaces the former separate
-    /// `fetch_all_samples_soa` + `fetch_all_histograms` passes, which opened
-    /// and catalog-decoded every segment twice.
+    /// open+decode pass per segment and folds each segment's scalar runs into
+    /// `scalar` and its native-histogram runs into `histograms` as that
+    /// segment's fetch completes (issue #3747), returning the per-segment
+    /// `FetchStats` summed across the snapshot (ADR-0044). No segment's decoded
+    /// runs outlive the fold that absorbs them, so the read holds one copy of
+    /// each `(series, ts)` sample however many objects carry it, charged to
+    /// the memory budget by the fold.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_all_samples_and_histograms(
         &self,
         tenant_hash: TenantHash,
@@ -2673,14 +2686,9 @@ impl QueryEngine {
         accounting: &PhaseAccounting,
         max_bytes_scanned: ByteLimit,
         max_s3_requests: RequestBudget,
-    ) -> Result<
-        (
-            Vec<Vec<FetchedSeriesSoa>>,
-            FetchStats,
-            Vec<Vec<FetchedHistogramSeries>>,
-        ),
-        QueryError,
-    > {
+        scalar: &std::sync::Mutex<ScalarFold>,
+        histograms: &mut HistogramFold,
+    ) -> Result<FetchStats, QueryError> {
         let concurrency = self.config.promql_fetch_fanout().max(1);
         let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
         let mut stream = stream::iter(snapshot.segments.iter().cloned())
@@ -2700,20 +2708,22 @@ impl QueryEngine {
                 }
             })
             .buffer_unordered(concurrency);
-        let mut scalar_out = Vec::with_capacity(snapshot.segments.len());
-        let mut histogram_out = Vec::with_capacity(snapshot.segments.len());
+        // Selective-erasure exclusion (ADR-0064 decision 2): drop erased
+        // series/samples from each segment's decoded results, after the fetch
+        // and after any cache tier `fetch_soa_and_histograms_accounted`
+        // consulted, before they are folded. A no-op when the snapshot carries
+        // no pending erasure predicate.
+        let erasure = snapshot_erasure_predicates(snapshot);
         let mut page_stats = FetchStats::default();
         // Consume the fetch fan-out one completed segment at a time so the
         // bytes-scanned budget (ADR-0061 decision 1) can short-circuit here,
-        // at the stage that owns segment concurrency, instead of after
-        // `.collect()` has already drained (and paid for) every segment.
-        // Returning early drops `stream`, which stops polling the remaining
-        // segment fetch futures and cancels their in-flight GETs
-        // cooperatively (proven by tests/bytes_scanned_budget.rs).
+        // at the stage that owns segment concurrency, instead of after every
+        // segment has been drained (and paid for). Returning early drops
+        // `stream`, which stops polling the remaining segment fetch futures
+        // and cancels their in-flight GETs cooperatively (proven by
+        // tests/bytes_scanned_budget.rs).
         while let Some(r) = stream.next().await {
-            let (scalar, stats, histograms) = r?;
-            scalar_out.push(scalar);
-            histogram_out.push(histograms);
+            let (mut scalar_runs, stats, mut histogram_runs) = r?;
             page_stats.raw_f64_pages += stats.raw_f64_pages;
             page_stats.raw_f64_bytes += stats.raw_f64_bytes;
             if let Some(err) = bytes_scanned_exceeded(
@@ -2728,22 +2738,17 @@ impl QueryEngine {
             ) {
                 return Err(err);
             }
-        }
-        // Selective-erasure exclusion (ADR-0064 decision 2): drop
-        // erased series/samples from every segment's decoded results, after the
-        // fetch and after any cache tier `fetch_soa_and_histograms_accounted`
-        // consulted, before these results reach the PromQL evaluator. A no-op
-        // when the snapshot carries no pending erasure predicate.
-        let erasure = snapshot_erasure_predicates(snapshot);
-        if !erasure.is_empty() {
-            for series in &mut scalar_out {
-                crate::erasure::retain_series_soa(series, &erasure);
+            if !erasure.is_empty() {
+                crate::erasure::retain_series_soa(&mut scalar_runs, &erasure);
+                crate::erasure::retain_histogram_series(&mut histogram_runs, &erasure);
             }
-            for series in &mut histogram_out {
-                crate::erasure::retain_histogram_series(series, &erasure);
-            }
+            scalar
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .absorb(scalar_runs)?;
+            histograms.absorb(histogram_runs)?;
         }
-        Ok((scalar_out, page_stats, histogram_out))
+        Ok(page_stats)
     }
 
     /// The distribution seam (ADR-0071). When this engine has a
@@ -2752,13 +2757,12 @@ impl QueryEngine {
     /// below-threshold query, or a worker that signalled a fall-back) run the
     /// byte-identical local [`Self::fetch_all_samples_and_histograms`].
     ///
-    /// The distributed path returns the same triple the local path does, with
-    /// erasure already applied worker-side (so this method does not re-apply
-    /// it), so the caller's merge step is identical for both. When
+    /// Both paths fold their runs into `scalar` and `histograms`. The
+    /// distributed path's runs arrive with erasure already applied
+    /// worker-side, so this method does not re-apply it. When
     /// `self.distributed` is `None` this is exactly a call to the local
     /// fetch, which is why an engine that never opts in behaves precisely as
     /// it did before this seam existed.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     async fn fetch_samples_and_histograms_maybe_distributed(
         &self,
@@ -2770,11 +2774,11 @@ impl QueryEngine {
         max_s3_requests: RequestBudget,
         wall_deadline: WallDeadline,
         partial_aggregate: Option<pb::PartialAggregateRequest>,
+        scalar: &std::sync::Mutex<ScalarFold>,
+        histograms: &mut HistogramFold,
     ) -> Result<
         (
-            Vec<Vec<FetchedSeriesSoa>>,
             FetchStats,
-            Vec<Vec<FetchedHistogramSeries>>,
             // `Some` only when a pushdown request was both sent AND honored by
             // the distributed workers (an empty inner `Vec` then means a
             // legitimate zero-series answer, not a fallback). `None` whenever
@@ -2838,14 +2842,26 @@ impl QueryEngine {
                     ) {
                         return Err(err);
                     }
-                    let (scalar, stats, hist) = triple;
+                    let (scalar_runs, stats, histogram_runs) = triple;
+                    // The coordinator returns every slice's runs at once
+                    // (`distrib/mod.rs`), so this fold bounds what the merged
+                    // result holds, not the slices' own peak.
+                    for runs in scalar_runs {
+                        scalar
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .absorb(runs)?;
+                    }
+                    for runs in histogram_runs {
+                        histograms.absorb(runs)?;
+                    }
                     // Distinguish "pushdown honored" (workers ran the partial
                     // request; `scalar` is empty and `partials` is the answer,
                     // possibly zero series) from "no pushdown asked" (raw runs
                     // in `scalar`, `partials` empty): only the former yields a
                     // pushdown result the caller may stash.
                     let pushdown = want_pushdown.then_some(partials);
-                    return Ok((scalar, stats, hist, pushdown));
+                    return Ok((stats, pushdown));
                 }
                 // `None`: a worker asked for local fallback (version skew, a
                 // histogram-bearing slice). Fall through to the local path.
@@ -2858,7 +2874,7 @@ impl QueryEngine {
                 // that is the true total cost, not a double-count.
             }
         }
-        let (scalar, stats, hist) = self
+        let stats = self
             .fetch_all_samples_and_histograms(
                 tenant_hash,
                 snapshot,
@@ -2866,19 +2882,22 @@ impl QueryEngine {
                 accounting,
                 max_bytes_scanned,
                 max_s3_requests,
+                scalar,
+                histograms,
             )
             .await?;
         // The local path has no worker to compute a partial: pushdown is a
         // distributed-only optimization, so an eligible query that does not trip
         // the cost gate (or a query with no distributed context at all) simply
         // fetches raw and returns no pushdown result.
-        Ok((scalar, stats, hist, None))
+        Ok((stats, None))
     }
 
     /// Cross-cluster federation fan-out for the metrics path (ADR-0071, ADR-0096).
     ///
-    /// Returns the remote scalar series runs (to be unioned into the local pool
-    /// and merged once, since [`merge_soa_runs`] keys by canonical `SeriesId`),
+    /// Returns the remote scalar series runs (to be folded into the local
+    /// sample fold, which keys by canonical `SeriesId` as [`merge_soa_runs`]
+    /// does),
     /// the remote native-histogram series runs (merged per cluster and unioned
     /// into the local histogram pool, ADR-0096 decision 3 step 4), the folded
     /// remote `FetchStats`, the deduplicated `skip_unavailable` warnings, and
@@ -7940,6 +7959,127 @@ mod prefetch_tests {
         );
     }
 
+    /// Reads `max_over_time(m[1h])` at `BASE_NS` over `LISTING_SEGMENTS`
+    /// objects of `LISTING_SERIES` padded series each, one object fetched at
+    /// a time against a `LISTING_BUDGET` memory budget. Object `seq` writes
+    /// one sample per series at `BASE_NS - seq` seconds. `distinct` gives
+    /// every object its own series; otherwise every object repeats the same
+    /// fifty, at its own timestamp.
+    async fn read_padded_samples(
+        distinct: bool,
+    ) -> (
+        Result<Vec<SeriesData>, QueryError>,
+        Arc<ravel_memory::MemoryBudget>,
+    ) {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let hour_bucket = u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket");
+        for seq in 1..=LISTING_SEGMENTS {
+            let prefix = if distinct {
+                format!("{seq}-")
+            } else {
+                String::new()
+            };
+            let ids = padded_ids(&prefix, LISTING_SERIES);
+            let ts_ns = BASE_NS - i64::try_from(seq).expect("seq") * NS_PER_SEC;
+            let series = ids
+                .iter()
+                .map(|id| {
+                    (
+                        id.as_str(),
+                        vec![Sample {
+                            ts_ns,
+                            value: seq as f64,
+                        }],
+                    )
+                })
+                .collect();
+            publish_metric_segment_multi(
+                &store,
+                tenant_hash,
+                seq,
+                "m",
+                series,
+                hour_bucket,
+                BASE_NS,
+            )
+            .await;
+        }
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(LISTING_BUDGET));
+        let eng = listing_engine(store, &budget);
+        let plans = plan_selectors("max_over_time(m[1h])", BASE_MS, BASE_MS).expect("plans");
+        let read = eng
+            .prefetch(
+                tenant_hash,
+                &plans,
+                &EvalWindow::Instant { t_ns: BASE_NS },
+                &[],
+                BASE_NS,
+                far_deadline(),
+            )
+            .await
+            .map(|(source, _)| source.series);
+        (read, budget)
+    }
+
+    /// Issue #3747: a sample read holds one copy of each series however many
+    /// objects carry it. Forty objects repeat the same fifty padded series,
+    /// one sample each: the merged result (one copy of the labels, about
+    /// 17 KB, plus 2,000 samples) fits the 256 KiB budget, and one copy of
+    /// the labels per object (about 690 KB) would not, so holding or
+    /// charging each object's runs until the last one arrives refuses it.
+    #[tokio::test]
+    async fn a_sample_read_holds_one_copy_of_each_series_across_objects() {
+        let (read, budget) = read_padded_samples(false).await;
+        let series = read.expect("one copy of fifty series fits the budget");
+        assert_eq!(series.len(), LISTING_SERIES);
+        for s in &series {
+            assert_eq!(
+                s.samples.len(),
+                LISTING_SEGMENTS as usize,
+                "every object's sample is kept"
+            );
+        }
+        assert_eq!(budget.accounted_refusals(), 0);
+        assert_eq!(budget.gate_refusals(), 0);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the read releases its charge once handed off"
+        );
+    }
+
+    /// Issue #3747: a sample read whose merged result outgrows the memory
+    /// budget is refused against the budget's own limit, not the host-memory
+    /// gate. Forty objects of fifty distinct padded series each retain about
+    /// 690 KB against a 256 KiB budget; before the fold was charged, nothing
+    /// held a reservation once an object's fetch returned and this read
+    /// answered all 2,000 series.
+    #[tokio::test]
+    async fn a_sample_read_that_outgrows_the_budget_is_refused_against_it() {
+        let (read, budget) = read_padded_samples(true).await;
+        let err = read.expect_err("2,000 retained series outgrow a 256 KiB budget");
+        match err {
+            QueryError::Fetch(FetchError::FetchMemoryExhausted {
+                reserved,
+                limit,
+                cause,
+                ..
+            }) => {
+                assert_eq!(cause, ravel_memory::ExhaustionCause::Accounted);
+                assert_eq!(limit, LISTING_BUDGET);
+                assert!(
+                    reserved > LISTING_BUDGET / 2,
+                    "the retained series were held at the refusal: {reserved}"
+                );
+            }
+            other => panic!("expected a budget refusal, got {other:?}"),
+        }
+        assert!(budget.accounted_refusals() > 0);
+        assert_eq!(budget.gate_refusals(), 0, "no host-floor refusal");
+        assert_eq!(budget.reserved(), 0, "a refused read releases what it held");
+    }
+
     /// Issue #3481: once every series an object holds has been seen, the
     /// listing skips that object's catalog. Forty objects repeat the same
     /// fifty series and only the first one's labels are materialized; a
@@ -8255,15 +8395,17 @@ mod prefetch_tests {
 
     /// Issue #3105: a range query's selector-cache entries are charged to the
     /// engine's memory budget. Eight keys of about 2.5 KB each against a
-    /// 4096-byte budget: the first is cached, the other seven are read at
-    /// every step, the response carries one info naming them, the answer is
-    /// the unconstrained one, and the budget is back to zero afterwards. The
-    /// seven fallbacks are not refusals the budget counts: the query
+    /// 6144-byte budget, which also holds the fetch's sample fold (about
+    /// 5.9 KB, released before evaluation): the first two are cached, the
+    /// other six are read at every step, the response carries one info naming
+    /// them, the answer is the unconstrained one, and the budget is back to
+    /// zero afterwards. The six fallbacks are not refusals the budget counts:
+    /// the query
     /// succeeded, so `ravel_memory_budget_refusals_total` and
     /// `ravel_memory_gate_refusals_total` must not move.
     #[tokio::test]
     async fn a_range_query_over_its_memory_budget_reads_per_step_and_says_so() {
-        let budget = Arc::new(ravel_memory::MemoryBudget::new(4096));
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(6144));
         let (value, annotations, _) =
             eight_offsets_range(EngineConfig::default(), Arc::clone(&budget))
                 .await
@@ -8281,13 +8423,14 @@ mod prefetch_tests {
         assert_eq!(budget.gate_refusals(), 0);
         assert!(annotations.warnings().is_empty());
         assert_eq!(annotations.infos().len(), 1, "{:?}", annotations.infos());
-        // The first refusal is `m offset 1s`, against `m`'s cached entry: `m`
-        // reads 141 points and each offset key 140, one 16-byte `Sample` less.
+        // The first refusal is the third key, against the two cached entries:
+        // `m` reads 141 points and each offset key 140, one 16-byte `Sample`
+        // less, so 2505 + 2489 bytes are held.
         assert_eq!(
             annotations.infos()[0],
-            "7 selector(s) read at every step instead of once per query: \
-             7 refused by the query memory budget (first refusal: memory exhausted: \
-             requested 2489 bytes, 2505 of 4096 byte limit already reserved)"
+            "6 selector(s) read at every step instead of once per query: \
+             6 refused by the query memory budget (first refusal: memory exhausted: \
+             requested 2489 bytes, 4994 of 6144 byte limit already reserved)"
         );
 
         let unconstrained = Arc::new(ravel_memory::MemoryBudget::unlimited());
