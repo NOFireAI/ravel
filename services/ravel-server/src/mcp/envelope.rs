@@ -211,8 +211,8 @@ pub(crate) fn failure(error: &ServiceError) -> Failure {
     Failure {
         class,
         message: error.message.clone(),
-        // The service layer does not name which counter tripped, so a budget
-        // failure reports the class alone rather than a guessed counter.
+        // `ServiceError` carries no counter, only the message that names it,
+        // so a budget failure reports none rather than one parsed from text.
         counter: None,
     }
 }
@@ -836,6 +836,59 @@ mod tests {
         assert_eq!(failure.class, FailureClass::Unauthorized);
         assert_eq!(failure.message, error.message);
         assert!(failure.counter.is_none());
+    }
+
+    /// Every engine budget the service layer classifies as `budget_exceeded`
+    /// reaches the envelope with a message naming the counter that tripped
+    /// and with `failure.counter` unset: `ServiceError` carries the class and
+    /// the redacted message, not the counter, so this layer has none to
+    /// report.
+    ///
+    /// FLIP: a mapping that guessed a counter fails `counter.is_none()`; a
+    /// redaction that replaced the engine's text with a fixed message fails
+    /// the quantity match.
+    #[test]
+    fn a_service_budget_failure_names_its_counter_in_the_message_only() {
+        use ravel_query::{FoldLag, QueryError};
+        let cases = [
+            (
+                QueryError::TooManySegments { count: 9, max: 8 },
+                "9 segments",
+            ),
+            (QueryError::TooManySeries { count: 9, max: 8 }, "9 series"),
+            (QueryError::TooManySamples { count: 9, max: 8 }, "9 samples"),
+            (
+                QueryError::TooManyBytesScanned { scanned: 9, max: 8 },
+                "scanned 9 bytes",
+            ),
+            (
+                QueryError::TooManySliceFrames { frames: 9, max: 8 },
+                "9 response frames",
+            ),
+            (
+                QueryError::TooManySliceBytes { bytes: 9, max: 8 },
+                "9 response frame wire bytes",
+            ),
+            (
+                QueryError::RequestBudgetExceeded {
+                    requests: 9,
+                    max: 8,
+                    fold_lag: FoldLag::Healthy,
+                },
+                "9 S3 requests",
+            ),
+        ];
+        for (error, quantity) in cases {
+            let failure = failure(&ServiceError::from_query(error));
+
+            assert_eq!(failure.class, FailureClass::BudgetExceeded, "{quantity}");
+            assert!(
+                failure.message.contains(quantity),
+                "{quantity}: {}",
+                failure.message
+            );
+            assert!(failure.counter.is_none(), "{quantity}");
+        }
     }
 
     /// The pooled figures and the per-phase split are both reported, and the
