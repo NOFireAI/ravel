@@ -91,13 +91,16 @@ credentials on gRPC.
 A second, CPU-aware shed draws right between the in-flight permit and the
 credential check (ADR-3718): a background detector samples the process's own
 CPU use and the ingest routers' deferred-flush-trigger rate every 100 ms, and
-while both are elevated at once (CPU at or above `--ingest-cpu-shed-threshold`,
-default 0.95 of the resolved core count, and at least one deferred trigger in
-the last second) it raises a shed fraction `p`, capped at
-`--ingest-cpu-shed-max` (default 0.9). Every admitted request then draws once
-against the published `p`; CPU use alone never trips it; see ADR-3718 D1/D2
-for the exact three-way rule that moves `p` and the hold band that lets it
-settle instead of cycling. A drawn refusal goes through the same
+moves a shed fraction `p`, capped at `--ingest-cpu-shed-max` (default 0.9),
+to steer the 1-second CPU average toward `--ingest-cpu-shed-threshold` minus
+0.05 (0.90 of the resolved core count at the default 0.95). Each sample `p`
+rises by 0.03 times the CPU error while CPU is more than 0.02 above that
+target and at least one deferred trigger happened in the last second, falls
+by 0.03 times the error while CPU is more than 0.02 below it, and holds
+inside that band, rather than releasing whenever CPU dips below a fixed level
+(ADR-3718, deadband integrator amendment). CPU use alone never raises
+`p`. Every admitted request then draws once against the published `p`. A
+drawn refusal goes through the same
 `refuse_from_head` path and the same drain caps as the in-flight shed above
 (`ravel_ingest_head_refusal_undrained_total` counts it the same way), with the
 in-flight permit released first, so an unauthenticated request that arrives

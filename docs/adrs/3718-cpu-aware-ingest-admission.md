@@ -87,7 +87,8 @@ the ceiling runs at about 91% of the node (#3492 comment 6579509683), close
 enough that CPU alone would shed good load. Deferred triggers alone do not
 trip it either: a multi-tenant node can defer one stalled tenant's trigger
 with cores to spare (ADR-2708 D3). The two together mark the state measured
-above and no clean step.
+above and no clean step. The CPU level at which `p` rises moved below the
+threshold in the deadband integrator amendment below.
 
 ### D2. While saturated, refuse a growing fraction of new ingest requests at the head
 
@@ -96,7 +97,8 @@ resolved; see the OTAP batch amendment below.
 
 The detector keeps a shed fraction `p` between 0 and `--ingest-cpu-shed-max`
 (default 0.9). Each sample it moves `p` by one of three rules, with CPU use
-and deferred triggers averaged over 1 s as in D1:
+and deferred triggers averaged over 1 s as in D1. This table and the three
+paragraphs after it are replaced by the deadband integrator amendment below:
 
 | CPU use | Deferred triggers | `p` |
 |---|---|---|
@@ -162,7 +164,10 @@ over time, and a cycle that drops back into overload fails D4's first bar.
 The threshold is a fraction of the resolved core count, so the same default
 holds on 8, 16 or more vCPU without tuning. `--ingest-cpu-shed-threshold 0`
 disables shedding, which is today's behaviour. The resolved threshold and the
-core count are logged at startup with the other derived defaults.
+core count are logged at startup with the other derived defaults. The
+detector box in the diagram below shows D2's original step, and nonzero
+thresholds must now be above 0.07; see the deadband integrator amendment
+below.
 
 It is on by default: a server that saturates loses 5% to 24% of its peak
 stored rate (Context), which no operator wants. Shedding is process-wide and does not
@@ -298,3 +303,71 @@ Three changes from implementing D1 and D2 (#3720).
 - **The refusal is documented in `docs/ingest.md`.** It is not in the
   "Admission rejections" section of `docs/guides/ingest-affinity.md`, which
   is about Kubernetes CRD validation, not runtime ingest admission.
+
+## Amendment (2026-11-03): the shed step settles on a deadband integrator (#3741)
+
+<!-- amendment-applies: sections="D1. A saturation detector reads two signals the process already has|D2. While saturated, refuse a growing fraction of new ingest requests at the head|D3. Defaults scale with the node; one flag turns it off" pointer="deadband integrator amendment" -->
+
+D2's three-row step cycled instead of settling. At a fixed 160k lines/s on
+8 vCPU, `p` swung from 0.10 to 0.90 about every 15 s, and acceptance part 1
+stored 133.2k and 133.4k lines/s against D4's 145k bar (comment 6596936397).
+Two things combined:
+
+- **The release level sat above the bar's operating point.** 145k lines/s
+  is about 0.89 of 8 cores at the measured 49 us per line, below D2's 0.90
+  release level, so at every rate the bar accepts the old rule was in its
+  decay row and released the shed.
+- **Clients return together.** The benchmark's 32 writers back off on a 429
+  (retry after 100 ms, doubling to 5 s). Once `p` fell, they all came back
+  at once, deferrals fired, and `p` climbed back to the cap.
+
+D2's step table is replaced by a deadband integrator. Each 100 ms sample,
+with `target = threshold - TARGET_OFFSET` (0.90 at the default threshold)
+and `e = cpu_avg - target`:
+
+| Error | Deferred triggers | `p` |
+|---|---|---|
+| `e` above `DEADBAND` | above zero | rises by `GAIN * e`, capped at `--ingest-cpu-shed-max` |
+| `e` below `-DEADBAND` | any | falls by `GAIN * -e`, and snaps to 0 below 0.01 |
+| anything else | any | holds |
+
+`TARGET_OFFSET` is 0.05, `DEADBAND` is 0.02 and `GAIN` is 0.03 (constants
+in `services/ravel-server/src/cpu_shed.rs`, `step`). `p` moves in
+proportion to how far CPU is from the target and rests anywhere within 0.02
+of it, instead of moving by a fixed step at fixed CPU levels. D1's
+two-signal rule still governs the rise: CPU alone never raises `p`, but the
+rise now starts when CPU is more than 0.02 above the target (about 0.92 by
+default), not at the threshold. The rise is slow: CPU cannot exceed 1.0,
+so at the default threshold `p` gains at most 0.003 per sample, and 0.5
+takes about 17 s from 0. The fall is faster, up to 0.027 per sample with
+CPU at 0.
+
+With this law the fall row is reachable only while `target - DEADBAND` is
+above 0, so `--ingest-cpu-shed-threshold` now refuses any nonzero value at
+or below 0.07 (it refused at or below 0.05 before). 0 still disables
+shedding.
+
+The law is checked against a deterministic closed-loop model of the 8 vCPU
+run (`cpu_shed.rs`, module `tests::plant`): 32 writers offering 80 requests
+per second of 2,000 lines with the client backoff above, 49 us of CPU per
+admitted line on 8 cores (work above the cores in one sample carries into
+the next), and a flush path that keeps up with 149k lines/s,
+with deferrals counted while its backlog is above zero. Over 60 s after a
+20 s warm-up at 160k offered, the model measured:
+
+| Law | Mean `p` | `p` range | Admitted / offered | Ticks deferring |
+|---|---|---|---|---|
+| deadband integrator | 0.200 | 0.169 to 0.239 | 0.921 | 100% |
+| D2's three-row step | 0.178 | 0.049 to 0.407 | 0.932 | 100% |
+| same target, no deadband, gain 0.3 | 0.206 | 0.019 to 0.327 | 0.919 | 100% |
+
+These are model outputs, not benchmark measurements. The integrator's `p`
+range is about a fifth of the old step's, and after the offered load drops
+to 100k it releases to exactly 0 within 2.8 s. It does not meet three of
+the bars #3741 set for the model: `p` within 0.03 of its mean (it strays
+0.039), deferrals on fewer than 20% of ticks (the deadband spans 143.7k to
+150.2k admitted lines/s, across the 149k flush capacity, so the backlog is
+above zero at least once in every 1 s window), and settling at 320k offered
+(`p` reaches the 0.9 cap). Those three tests are committed ignored
+with their measured values, pending a decision on #3741. D4's bars are
+unchanged.
