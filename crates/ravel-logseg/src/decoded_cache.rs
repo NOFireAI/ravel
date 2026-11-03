@@ -26,11 +26,21 @@
 //!
 //! Each entry holds a reservation on the process [`MemoryBudget`], taken
 //! best effort and only when it leaves [`admission_margin`] unreserved
-//! (decision 4). The reservation lives in the [`DecodedEntry`] itself, not in
-//! the index slot, so it is released when the last handle to the entry
-//! drops: an entry a scan still holds keeps its bytes charged after the index
-//! has let it go. [`DecodedColumnCache::evict_for_pressure`] is the budget's
-//! evictor and frees only entries no scan holds.
+//! (decision 4). The reservation lives in a [`ReservationCell`] that the
+//! entry, its string column, and every Arrow buffer owner a scan builds over
+//! that column's buffers hold (ADR-3326, zero-copy values amendment, decision
+//! 5), so it is released when the last of them drops: an entry a scan or a
+//! batch still holds keeps its bytes charged after the index has let it go
+//! (`the_reservation_is_released_by_the_last_handle_not_by_eviction`).
+//! [`DecodedColumnCache::evict_for_pressure`] is the budget's evictor and
+//! frees only entries nothing outside the cache holds: no scan holds the
+//! entry and, when its column's [`ValuesMemo`] is filled, the memo reports no
+//! buffer held outside it.
+//!
+//! A cached string column whose text was validated carries a memo slot
+//! ([`MemoSlot`]): `ravel-sql` fills it with an Arrow values array sharing
+//! the column's buffers, through [`MemoSource`]. This crate names no Arrow
+//! type; the slot holds a [`ValuesMemo`] trait object.
 //!
 //! Entries age out on the ravel-cache bound (ADR-0064): an entry older than
 //! [`DEFAULT_MAX_ENTRY_AGE_NS`] is dropped at its first access, and
@@ -40,9 +50,10 @@
 //! [`decode_columns`]: crate::block
 //! [`DEFAULT_SWEEP_INTERVAL_NS`]: ravel_cache::DEFAULT_SWEEP_INTERVAL_NS
 
+use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use ravel_cache::{Clock, DEFAULT_MAX_ENTRY_AGE_NS, SystemClock};
 use ravel_memory::{ExhaustionCause, MemoryBudget, Reservation};
@@ -100,13 +111,194 @@ pub struct DecodedKey {
     pub layout: u8,
 }
 
-/// One cached column and the budget reservation for its bytes. Dropping the
-/// last `Arc` to it releases the reservation.
+/// What a cached string column's memo is to the cache: a value built over the
+/// column's own buffers by a crate this one does not depend on (`ravel-sql`'s
+/// Arrow values array), held in the column's [`MemoSlot`] for as long as the
+/// column lives (ADR-3326, zero-copy values amendment, decision 1).
+pub trait ValuesMemo: Send + Sync {
+    /// Whether any holder beyond the memo itself shares one of its buffers.
+    /// [`DecodedColumnCache::evict_for_pressure`] counts an entry as held
+    /// while this is true, since evicting it would free nothing.
+    fn held_outside(&self) -> bool;
+
+    /// The implementing type, for its crate to downcast to.
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// The bytes [`DecodedColumnCache::offer`] adds to a memo-capable column's
+/// charge for the memo it may later hold: the Arrow array struct and its
+/// buffer headers, which share the column's bytes rather than copy them. Set
+/// above the amendment's inferred 200 to 500 bytes; not measured here.
+/// `the_entry_charge_includes_the_memo_constant` pins that `offer` adds it.
+pub const VALUES_MEMO_BYTES: u64 = 512;
+
+/// A cached string column's memo slot, filled at most once.
+#[derive(Default)]
+pub struct MemoSlot(OnceLock<Arc<dyn ValuesMemo>>);
+
+impl MemoSlot {
+    /// The memo, once filled.
+    pub fn get(&self) -> Option<&Arc<dyn ValuesMemo>> {
+        self.0.get()
+    }
+
+    /// Whether the memo is filled and reports a buffer held outside it.
+    pub(crate) fn held_outside(&self) -> bool {
+        self.0.get().is_some_and(|m| m.held_outside())
+    }
+
+    /// Fills the slot for a test, returning `false` when it was already full.
+    #[cfg(test)]
+    pub(crate) fn fill_for_test(&self, memo: Arc<dyn ValuesMemo>) -> bool {
+        self.0.set(memo).is_ok()
+    }
+}
+
+impl std::fmt::Debug for MemoSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoSlot")
+            .field("filled", &self.0.get().is_some())
+            .finish()
+    }
+}
+
+/// The budget reservation for one entry's bytes and nothing else, so no
+/// holder reaches the column through it (ADR-3326, zero-copy values
+/// amendment, decisions 3 and 5). Shared by the entry, its string column and
+/// every buffer owner over that column's buffers; the reservation is released
+/// when the last `Arc` to the cell drops. Filled by
+/// [`DecodedColumnCache::offer`] only.
+#[derive(Default)]
+pub struct ReservationCell(OnceLock<Reservation>);
+
+impl ReservationCell {
+    /// Puts `reservation` in the cell, handing it back when the cell already
+    /// holds one.
+    fn fill(&self, reservation: Reservation) -> Result<(), Reservation> {
+        self.0.set(reservation)
+    }
+
+    /// Whether the cell holds a reservation.
+    pub fn is_filled(&self) -> bool {
+        self.0.get().is_some()
+    }
+}
+
+impl std::fmt::Debug for ReservationCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReservationCell")
+            .field("filled", &self.is_filled())
+            .finish()
+    }
+}
+
+/// A cached string column's buffers, each behind its own `Arc`, for building
+/// a [`ValuesMemo`] that shares them. No buffer holds the column, so a memo
+/// stored in the column cannot keep it alive (decision 3).
+#[derive(Clone, Debug)]
+pub enum StrBuffers {
+    /// A plain column's values and `rows + 1` `u32` offsets, every row
+    /// present ([`MemoSource::all_present`] says when).
+    Plain {
+        values: Arc<String>,
+        offsets: Arc<Vec<u32>>,
+    },
+    /// A dictionary's UTF-8 text and `len + 1` `i32` offsets into it, with
+    /// each entry's validity when some entry is not UTF-8 (a non-UTF-8
+    /// entry's span is empty).
+    Dict {
+        values: Arc<String>,
+        offsets: Arc<Vec<i32>>,
+        valid: Option<Arc<crate::dict_values::Validity>>,
+    },
+}
+
+/// The memo slot of one string column a decoded-cache entry holds, served or
+/// just admitted, with the buffers a memo shares
+/// ([`ColumnarBlockView::str_values_memo`](crate::ColumnarBlockView::str_values_memo)).
+pub struct MemoSource<'a> {
+    slot: &'a MemoSlot,
+    cell: &'a Arc<ReservationCell>,
+    buffers: MemoBuffers<'a>,
+}
+
+/// Where [`MemoSource`] reads its buffers from.
+pub(crate) enum MemoBuffers<'a> {
+    Plain(&'a crate::block::PlainColumn),
+    Dict(&'a crate::dict_values::DictValues),
+}
+
+impl<'a> MemoSource<'a> {
+    pub(crate) fn new(
+        slot: &'a MemoSlot,
+        cell: &'a Arc<ReservationCell>,
+        buffers: MemoBuffers<'a>,
+    ) -> Self {
+        MemoSource {
+            slot,
+            cell,
+            buffers,
+        }
+    }
+
+    /// The memo, once filled.
+    pub fn get(&self) -> Option<&'a Arc<dyn ValuesMemo>> {
+        self.slot.get()
+    }
+
+    /// The memo, built by `build` from the column's buffers and its entry's
+    /// reservation cell when the slot is empty. Concurrent callers wait for
+    /// the first build (`OnceLock::get_or_init`), so each column builds once.
+    pub fn get_or_build(
+        &self,
+        build: impl FnOnce(StrBuffers, Arc<ReservationCell>) -> Arc<dyn ValuesMemo>,
+    ) -> &'a Arc<dyn ValuesMemo> {
+        self.slot
+            .0
+            .get_or_init(|| build(self.buffers.shared(), Arc::clone(self.cell)))
+    }
+
+    /// Whether this is a plain column (a dictionary's otherwise).
+    pub fn is_plain(&self) -> bool {
+        matches!(self.buffers, MemoBuffers::Plain(_))
+    }
+
+    /// Whether every row of a plain column is present, by a popcount of its
+    /// presence bitmap; `false` for a dictionary.
+    pub fn all_present(&self) -> bool {
+        match self.buffers {
+            MemoBuffers::Plain(p) => p.all_present(),
+            MemoBuffers::Dict(_) => false,
+        }
+    }
+
+    /// A plain column's last offset, the total of its value bytes; `None` for
+    /// a dictionary.
+    pub fn last_offset(&self) -> Option<u32> {
+        match self.buffers {
+            MemoBuffers::Plain(p) => Some(p.last_offset()),
+            MemoBuffers::Dict(_) => None,
+        }
+    }
+}
+
+impl MemoBuffers<'_> {
+    fn shared(&self) -> StrBuffers {
+        match self {
+            MemoBuffers::Plain(p) => p.shared_buffers(),
+            MemoBuffers::Dict(d) => d.shared_buffers(),
+        }
+    }
+}
+
+/// One cached column and the cell holding the budget reservation for its
+/// bytes. Dropping the last `Arc` to the entry drops its handle on the cell;
+/// the reservation goes with the cell's last holder.
 pub struct DecodedEntry {
     col: CachedColumn,
     bytes: u64,
     inserted_ns: u64,
-    _reservation: Option<Reservation>,
+    cell: Arc<ReservationCell>,
 }
 
 impl DecodedEntry {
@@ -117,6 +309,17 @@ impl DecodedEntry {
     /// The bytes the entry is charged.
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// The cell holding the entry's reservation.
+    pub fn reservation_cell(&self) -> &Arc<ReservationCell> {
+        &self.cell
+    }
+
+    /// Whether something outside the cache holds the entry: a handle beyond
+    /// the index's own, or a buffer of its column's memo.
+    fn held(entry: &Arc<DecodedEntry>) -> bool {
+        Arc::strong_count(entry) > 1 || entry.col.memo_held_outside()
     }
 }
 
@@ -545,10 +748,12 @@ impl DecodedColumnCache {
     }
 
     /// The budget's pressure evictor (ADR-3326 decision 4): evicts, in CLOCK
-    /// order, entries no scan holds until `want` bytes are freed or none
-    /// remains, and returns the bytes freed. An entry a scan still holds
-    /// stays, and its bytes count for nothing: its reservation would not be
-    /// released by removing it from the index. Each pass logs one INFO line;
+    /// order, entries nothing outside the cache holds until `want` bytes are
+    /// freed or none remains, and returns the bytes freed. An entry a scan
+    /// still holds, or whose column's memo reports a buffer held outside it
+    /// ([`ValuesMemo::held_outside`]), stays, and its bytes count for
+    /// nothing: its reservation would not be released by removing it from the
+    /// index. Each pass logs one INFO line;
     /// `slack` is the part of `want` the budget asks beyond the refused
     /// caller's shortfall (logged only).
     pub fn evict_for_pressure(&self, want: u64, slack: u64, cause: ExhaustionCause) -> u64 {
@@ -570,7 +775,7 @@ impl DecodedColumnCache {
                 let Some(slot) = inner.slots[i].as_mut() else {
                     continue;
                 };
-                if Arc::strong_count(&slot.entry) > 1 {
+                if DecodedEntry::held(&slot.entry) {
                     if step < n {
                         held = held.saturating_add(slot.entry.bytes);
                     }
@@ -671,7 +876,14 @@ impl DecodedColumnCache {
         intent: AccessIntent,
         counters: &DecodedCacheCounters,
     ) -> Option<Arc<DecodedEntry>> {
-        let bytes = col.heap_bytes() as u64;
+        // The memo a string column may hold later is charged now, since the
+        // charge is fixed here (ADR-3326, zero-copy values amendment).
+        let memo = if col.memo_capable() {
+            VALUES_MEMO_BYTES
+        } else {
+            0
+        };
+        let bytes = (col.heap_bytes() as u64).saturating_add(memo);
         if bytes > self.max_bytes {
             return None;
         }
@@ -741,13 +953,23 @@ impl DecodedColumnCache {
                 inner.process.ghost_hits += 1;
                 DecodedCacheCounters::bump(&counters.ghost_hits, 1);
             }
+            // The column's own cell when it has one, so the Arrow buffer
+            // owners a scan builds over its buffers hold the reservation too.
+            let cell = col.reservation_cell().unwrap_or_default();
+            if let Some(reservation) = reservation
+                && cell.fill(reservation).is_err()
+            {
+                // Already admitted under another key; the reservation drops
+                // here and this one is not admitted.
+                return None;
+            }
             // Entries admitted between the two locks may have refilled the cap.
             self.evict_for(&mut inner, bytes, &mut evicted, counters);
             let entry = Arc::new(DecodedEntry {
                 col: col.clone(),
                 bytes,
                 inserted_ns: self.clock.now_ns(),
-                _reservation: reservation,
+                cell,
             });
             let slot = Slot {
                 key,
@@ -1138,14 +1360,60 @@ mod tests {
         assert_eq!(budget.reserved(), 0);
     }
 
-    /// The reservation travels with the bytes (ADR-3326 decision 4): an entry
-    /// a scan holds past its eviction from the index keeps its bytes reserved
-    /// until the scan's handle, the last one, drops.
+    /// The reservation travels with the bytes (ADR-3326 decision 4, and the
+    /// zero-copy values amendment's decision 5, which moves it into the
+    /// [`ReservationCell`]): an entry a scan holds past its eviction from the
+    /// index keeps its bytes reserved until the scan's handle, the last one,
+    /// drops. A second case, a plain string column whose cell an outside
+    /// holder shares (what an Arrow buffer owner over the column's buffers
+    /// is; `ravel-sql`'s
+    /// `an_arrow_array_is_the_last_holder_of_an_evicted_entrys_reservation`
+    /// runs it with a real Arrow array), keeps the bytes reserved after the
+    /// entry and the column are gone, until that holder drops.
     ///
-    /// FLIP: move the reservation from `DecodedEntry` into `Slot` and the
-    /// budget reads `bytes` short right after the eviction.
+    /// FLIP: move the reservation from the cell into `Slot` and the budget
+    /// reads `bytes` short right after the eviction; fill a fresh cell in
+    /// `offer` instead of the column's and the plain case fails "one cell".
     #[test]
     fn the_reservation_is_released_by_the_last_handle_not_by_eviction() {
+        // An Arrow buffer owner holds the cell and the column's buffers, never
+        // the column or the entry.
+        {
+            let v = CachedColumn::plain_for_test(&[Some(b"ab".to_vec()), Some(b"c".to_vec())])
+                .expect("plain");
+            let budget = Arc::new(MemoryBudget::new(4 << 30));
+            let bytes = v.heap_bytes() as u64 + VALUES_MEMO_BYTES;
+            let cache = DecodedColumnCache::new(bytes, Some(Arc::clone(&budget)));
+            let c = DecodedCacheCounters::default();
+            let entry = cache
+                .offer(key(0, 1), &v, AccessIntent::Interactive, &c)
+                .expect("admitted");
+            assert_eq!(entry.bytes(), bytes);
+            let owner = Arc::clone(v.reservation_cell().as_ref().expect("plain has a cell"));
+            assert!(Arc::ptr_eq(&owner, entry.reservation_cell()), "one cell");
+            drop((v, entry));
+
+            // Admitting a second entry evicts the first; the index held its
+            // last handle, and the column goes with it.
+            let second = cache
+                .offer(key(1, 1), &col(8), AccessIntent::Interactive, &c)
+                .expect("admitted");
+            let second_bytes = second.bytes();
+            drop(second);
+            assert_eq!(c.snapshot().evictions, 1);
+            assert!(cache.lookup(&key(0, 1), 2, &c).is_none(), "evicted");
+            assert_eq!(
+                budget.reserved(),
+                bytes + second_bytes,
+                "the outside holder of the cell keeps the bytes reserved"
+            );
+            drop(owner);
+            assert_eq!(
+                budget.reserved(),
+                second_bytes,
+                "the last holder released it"
+            );
+        }
         let v = col(8);
         let bytes = v.heap_bytes() as u64;
         let budget = Arc::new(MemoryBudget::new(4 << 30));
@@ -1221,6 +1489,104 @@ mod tests {
             "nothing left"
         );
         assert_eq!(cache.pressure_counters().evictions, 2);
+    }
+
+    /// A memo whose outside-held answer the test sets.
+    struct FlagMemo(Arc<AtomicBool>);
+
+    impl ValuesMemo for FlagMemo {
+        fn held_outside(&self) -> bool {
+            self.0.load(Ordering::Relaxed)
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn plain(cells: &[&[u8]]) -> CachedColumn {
+        let cells: Vec<Option<Vec<u8>>> = cells.iter().map(|c| Some(c.to_vec())).collect();
+        CachedColumn::plain_for_test(&cells).expect("plain")
+    }
+
+    /// ADR-3326, zero-copy values amendment, "Memory": `offer` charges a
+    /// column that can hold a memo its `heap_bytes` plus
+    /// [`VALUES_MEMO_BYTES`], and the reservation and the resident total
+    /// carry the same figure. A validated plain column and a block's own
+    /// validated dictionary can hold one; an integer column, a plain column
+    /// with a non-UTF-8 cell and an unvalidated dictionary cannot, and are
+    /// charged `heap_bytes` alone.
+    ///
+    /// FLIP: drop the constant from `offer` and the first assertion reads
+    /// `heap_bytes` for the plain column.
+    #[test]
+    fn the_entry_charge_includes_the_memo_constant() {
+        let entries = vec![b"a".to_vec(), b"bc".to_vec()];
+        let raw_plain = CachedColumn::plain_for_test(&[Some(vec![b'a', 0xff])]).expect("plain");
+        let cases = [
+            (plain(&[b"ab", b"", b"c"]), true),
+            (
+                CachedColumn::dict_for_test(&entries, &[0, 1, 1], true).expect("dict"),
+                true,
+            ),
+            (col(8), false),
+            (raw_plain, false),
+        ];
+        for (i, (v, memo)) in cases.iter().enumerate() {
+            assert_eq!(v.memo_capable(), *memo, "case {i}");
+            let budget = Arc::new(MemoryBudget::new(4 << 30));
+            let cache = DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)));
+            let c = DecodedCacheCounters::default();
+            let entry = cache
+                .offer(key(0, 1), v, AccessIntent::Interactive, &c)
+                .expect("admitted");
+            let want = v.heap_bytes() as u64 + if *memo { VALUES_MEMO_BYTES } else { 0 };
+            assert_eq!(entry.bytes(), want, "case {i}");
+            assert_eq!(budget.reserved(), want, "case {i}");
+            assert_eq!(cache.resident_bytes(), want, "case {i}");
+        }
+    }
+
+    /// ADR-3326, zero-copy values amendment, decision 5: the pressure pass
+    /// counts an entry as held while its column's memo reports a buffer held
+    /// outside it, though no scan holds the entry, and frees it once the memo
+    /// reports none.
+    ///
+    /// FLIP: drop the `memo_held_outside` term from `DecodedEntry::held` and
+    /// the first pass frees the entry's bytes.
+    #[test]
+    fn pressure_eviction_counts_an_entry_whose_memo_is_held_outside_as_held() {
+        let v = plain(&[b"ab", b"c"]);
+        let budget = Arc::new(MemoryBudget::new(4 << 30));
+        let cache = DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)));
+        let c = DecodedCacheCounters::default();
+        let bytes = cache
+            .offer(key(0, 1), &v, AccessIntent::Interactive, &c)
+            .expect("admitted")
+            .bytes();
+        let flag = Arc::new(AtomicBool::new(true));
+        assert!(
+            v.memo_slot()
+                .expect("a validated plain column has a slot")
+                .fill_for_test(Arc::new(FlagMemo(Arc::clone(&flag))))
+        );
+        drop(v);
+
+        assert_eq!(
+            cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted),
+            0,
+            "held through its memo"
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(budget.reserved(), bytes);
+
+        flag.store(false, Ordering::Relaxed);
+        assert_eq!(
+            cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted),
+            bytes
+        );
+        assert!(cache.is_empty());
+        assert_eq!(budget.reserved(), 0);
     }
 
     /// An entry is served up to the age bound and dropped at the first access

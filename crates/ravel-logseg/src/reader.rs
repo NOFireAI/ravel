@@ -1574,7 +1574,8 @@ impl BlockScan {
         }
         Ok(Some(
             ColumnarBlockView::new(&self.stream_dir, &self.field_dir, decoded, &self.surviving)
-                .with_served(&self.served),
+                .with_served(&self.served)
+                .with_pins(&self.pins),
         ))
     }
 
