@@ -206,6 +206,10 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Result<
             counter: None,
         });
     }
+    if envelope.coverage.partial {
+        envelope.accuracy.exact = false;
+        envelope.accuracy.approximation = Some(PARTIAL_APPROXIMATION.to_string());
+    }
     report_scope(&mut envelope, plan.mode);
 
     let names: Vec<&str> = envelope
@@ -495,6 +499,13 @@ fn column(name: &str) -> Column {
 /// This tool's spelling of the service's partial-coverage remedy.
 const CONSENT_REMEDY: &str = "set allow_partial_coverage: true to receive partial results";
 
+/// `accuracy.approximation` of a partial result returned with consent: the
+/// values are computed without the data the query could not reach, so an
+/// aggregate over it is not the exact answer.
+const PARTIAL_APPROXIMATION: &str = "partial coverage, returned under \
+     allow_partial_coverage: the result omits the data the query could not reach, \
+     and warnings name what was skipped";
+
 /// Whether `failure` is the service's partial-coverage refusal, recognised by
 /// the class and the prefix `partial_refusal_message` writes; if so, its
 /// remedy clause, which names the HTTP route's `allow_partial`, is replaced
@@ -518,7 +529,7 @@ fn backend_refusal(mut failure: Failure, plan: &Plan, ctx: &ToolContext<'_>) -> 
         next_steps.push(NextStep {
             action: TOOL.to_string(),
             detail: "resend with allow_partial_coverage: true to receive the partial result, \
-                     reported with coverage.partial: true"
+                     reported with coverage.partial: true and accuracy.exact: false"
                 .to_string(),
         });
     }
@@ -1144,11 +1155,15 @@ mod tests {
     /// Without consent a partial result is refused as `unavailable`, the
     /// class the HTTP route's 503 maps to, with a next step naming the
     /// consent argument; with consent the request carries it and the result
-    /// comes back with `coverage.partial` set.
+    /// comes back with `coverage.partial` set, `accuracy.exact: false` and
+    /// an approximation naming the missing coverage. The status stays `ok`:
+    /// D4's `ok_bounded` and `ok_page` say a cap stopped the result, which
+    /// no cap did.
     ///
     /// FLIP: ignoring the flag (always sending `allow_partial: false`) fails
     /// the consenting request assertion; dropping the body's own gate
-    /// answers the unconsented partial result as `ok`.
+    /// answers the unconsented partial result as `ok`; passing the
+    /// backend's `exact: true` through fails the accuracy assertions.
     #[test]
     fn partial_coverage_is_refused_without_consent_and_returned_with_it() {
         let key = key();
@@ -1157,6 +1172,8 @@ mod tests {
             let mut envelope = sample_rows(&[("m", START_NS, 1.0)]);
             envelope.coverage.complete = false;
             envelope.coverage.partial = true;
+            // What the server's base envelope carries before the tool runs.
+            envelope.accuracy.exact = true;
             envelope
         };
         let stub = answering(vec![Ok(partial()), Ok(partial())]);
@@ -1179,7 +1196,37 @@ mod tests {
         assert_eq!(answered.status, Status::Ok, "{answered:?}");
         assert!(answered.coverage.partial);
         assert!(!answered.coverage.complete);
+        assert!(!answered.accuracy.exact, "{answered:?}");
+        assert_eq!(
+            answered.accuracy.approximation.as_deref(),
+            Some(PARTIAL_APPROXIMATION)
+        );
+        assert!(PARTIAL_APPROXIMATION.starts_with("partial coverage"));
         assert!(stub.instants.borrow()[1].allow_partial);
+    }
+
+    /// A complete result keeps the backend's `exact: true` and carries no
+    /// approximation: the partial rule fires on coverage, not on consent.
+    ///
+    /// FLIP: marking every consenting call inexact fails this.
+    #[test]
+    fn a_complete_result_under_consent_stays_exact() {
+        let key = key();
+        let ctx = test_context(&key);
+        let mut complete = sample_rows(&[("m", START_NS, 1.0)]);
+        complete.accuracy.exact = true;
+        let stub = answering(vec![Ok(complete)]);
+        let consenting = json!({
+            "query": "m",
+            "evaluation_time": START_NS.to_string(),
+            "allow_partial_coverage": true,
+        });
+
+        let answered = block_on(run(consenting, &ctx, &stub));
+
+        assert_eq!(answered.status, Status::Ok, "{answered:?}");
+        assert!(answered.accuracy.exact);
+        assert_eq!(answered.accuracy.approximation, None);
     }
 
     /// The service's own partial refusal names the HTTP parameter; the tool
