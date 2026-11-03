@@ -1,4 +1,6 @@
 selective investigations, lane local: fail
+not requested: row 5 (run.toml hits = false); row 6 (run.toml hits = false); row 10 (run.toml states lacks ['many_parts_2160']); row 12 (run.toml scales lacks [10, 100]); row 16 (run.toml hits = false, baseline = false)
+refusal classes: refused-by-guard 15 figure(s), 24 call(s); unsupported-on-this-build 23 figure(s), 0 call(s)
 
 states:
   compaction_done          run
@@ -12,6 +14,12 @@ states:
   many_parts_744           not-run  (not in run.toml states)
   mixed                    run
   unfolded                 run
+
+needle blocks, planted / storage, over 4 of 4 logs object(s):
+  needlerare     needle_rare        1 / 1     exact       match
+  needlesparse   needle_sparse      2 / -     within 25%  missing
+  needlecommon   needle_common      3 / -     within 25%  missing
+  any            tag                5 / 4     reported    reported
 
 figure                                       status                value  verdict
 row_01.covering_parts                        value                     1  pass
@@ -29,7 +37,7 @@ row_02.data_gets                             value                     3  pass
 row_02.wire_bytes                            value                333841  miss
 row_02.wall_p50_s                            value             0.0204685  reported (timing is judged on the s3 lane only)
 row_03.absent_object_gets                    unsupported-                 unsupported-on-this-build  (stats carry no per-object breakdown)
-row_03.probe_wire_per_object                 value               65536.0  miss
+row_03.probe_wire_per_object                 missing                      missing  (stamps/unfolded.spans.ranges.json absent: no per-object event ranges to count the window's candidate objects)
 row_03.keyindex_gets_without_kidx            unsupported-                 unsupported-on-this-build  (stats carry no per-object breakdown)
 row_03.skip_idx_dropped_reported             unsupported-                 unsupported-on-this-build  (stats carry no pruning.skipIdxDropped on this build)
 row_03.rows_exact                            value                     1  pass
@@ -90,40 +98,40 @@ row_10.rows_exact                            not-run                      not-ru
 row_11.spans_1_rows_exact                    value                     1  pass
 row_11.spans_10_rows_exact                   value                     1  pass
 row_11.spans_100_rows_exact                  value                     1  pass
-row_11.spans_1000_rows_exact                 unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.spans_1000_rows_exact                 refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 row_11.logs_trace_1_rows_exact               value                     1  pass
 row_11.logs_trace_10_rows_exact              value                     1  pass
 row_11.logs_trace_100_rows_exact             value                     1  pass
-row_11.logs_trace_1000_rows_exact            unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.logs_trace_1000_rows_exact            refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 row_11.logs_1_rows_exact                     value                     1  pass
 row_11.logs_10_rows_exact                    value                     1  pass
 row_11.logs_100_rows_exact                   value                     1  pass
-row_11.logs_1000_rows_exact                  unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.logs_1000_rows_exact                  refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 row_11.spans_1_keys_probed                   unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.keysProbed on this build)
 row_11.spans_10_keys_probed                  unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.keysProbed on this build)
 row_11.spans_100_keys_probed                 unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.keysProbed on this build)
-row_11.spans_1000_keys_probed                unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.spans_1000_keys_probed                refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 row_11.logs_trace_1_keys_probed              unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.keysProbed on this build)
 row_11.logs_trace_10_keys_probed             unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.keysProbed on this build)
 row_11.logs_trace_100_keys_probed            unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.keysProbed on this build)
-row_11.logs_trace_1000_keys_probed           unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.logs_trace_1000_keys_probed           refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 row_11.logs_1_keys_probed                    unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.keysProbed on this build)
 row_11.logs_10_keys_probed                   unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.keysProbed on this build)
 row_11.logs_100_keys_probed                  unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.keysProbed on this build)
-row_11.logs_1000_keys_probed                 unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.logs_1000_keys_probed                 refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 row_11.spans_buckets                         value                   256  pass
 row_11.spans_part_entries                    value                     4  pass
 row_11.logs_buckets                          value                   512  pass
 row_11.logs_part_entries                     value                     4  pass
-row_11.spans_1000_leaf_gets_per_part         unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-row_11.spans_1000_leaf_bytes_per_part        unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-row_11.logs_trace_1000_leaf_gets_per_part    unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-row_11.logs_trace_1000_leaf_bytes_per_part   unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-row_11.logs_1000_leaf_gets_per_part          unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-row_11.logs_1000_leaf_bytes_per_part         unsupported-                 unsupported-on-this-build  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-row_11.spans_control_1001                    unsupported-                 unsupported-on-this-build  (the 1,000-key list was refused: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-row_11.logs_trace_control_1001               unsupported-                 unsupported-on-this-build  (the 1,000-key list was refused: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-row_11.logs_request_control_1001             unsupported-                 unsupported-on-this-build  (the 1,000-key list was refused: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.spans_1000_leaf_gets_per_part         refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.spans_1000_leaf_bytes_per_part        refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.logs_trace_1000_leaf_gets_per_part    refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.logs_trace_1000_leaf_bytes_per_part   refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.logs_1000_leaf_gets_per_part          refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.logs_1000_leaf_bytes_per_part         refused-by-g                 refused-by-guard  (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.spans_control_1001                    refused-by-g                 refused-by-guard  (refused by the SQL complexity guard: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.logs_trace_control_1001               refused-by-g                 refused-by-guard  (refused by the SQL complexity guard: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+row_11.logs_request_control_1001             refused-by-g                 refused-by-guard  (refused by the SQL complexity guard: server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 row_12.gets_growth_10x                       not-run                      not-run  (scales [10, 100] not in run.toml scales)
 row_12.gets_growth_100x                      not-run                      not-run  (scales [10, 100] not in run.toml scales)
 row_13.wrong_answers                         value                     0  pass
@@ -212,10 +220,10 @@ logs_request_in_10              folded_leaves        cold     0.025818 0.0261744
 logs_request_in_10              unfolded             cold     0.026312 0.0266999     5  524321    0.03 2.21e-05  2
 logs_request_in_100             folded_leaves        cold     0.027887 0.0279266     5  524321   0.035 1.295e-05  2
 logs_request_in_100             unfolded             cold     0.0293505 0.02999445     5  524321   0.035 2.295e-05  2
-logs_request_in_1000            folded_leaves        cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-logs_request_in_1000            unfolded             cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-logs_request_in_1001            folded_leaves        cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-logs_request_in_1001            unfolded             cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_request_in_1000            folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_request_in_1000            unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_request_in_1001            folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_request_in_1001            unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 logs_tag_common                 folded_leaves        cold     0.020586 0.0209622     5  524321   0.025 1.125e-05  2
 logs_tag_common                 unfolded             cold     0.0215315 0.02179565     5  524321   0.025 2.125e-05  2
 logs_tag_mixed_rare             mixed                cold     0.0415185 0.04259535     9 2635818    0.03 2.37e-05  2
@@ -239,10 +247,10 @@ logs_trace_in_10                folded_leaves        cold     0.036661 0.0370552
 logs_trace_in_10                unfolded             cold     0.0376435 0.03772765     5  524321    0.06 2.72e-05  2
 logs_trace_in_100               folded_leaves        cold     0.0404045 0.04089185     5  524321    0.06 1.72e-05  2
 logs_trace_in_100               unfolded             cold     0.0400435 0.04015915     5  524321    0.06 2.72e-05  2
-logs_trace_in_1000              folded_leaves        cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-logs_trace_in_1000              unfolded             cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-logs_trace_in_1001              folded_leaves        cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-logs_trace_in_1001              unfolded             cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_trace_in_1000              folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_trace_in_1000              unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_trace_in_1001              folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+logs_trace_in_1001              unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 logs_trace_norange              compaction_done      cold     0.0377285 0.03958655    17 1190932   0.025 1.545e-05  2
 logs_trace_norange              compaction_in_flight inflight 0.0444665 0.06032315    14 1166686    0.02           
 logs_trace_norange              erasure_in_flight    cold     0.0535565 0.06216995    18 1812743   0.035 1.755e-05  2
@@ -263,10 +271,10 @@ spans_in_10                     folded_leaves        cold     0.0629205 0.063942
 spans_in_10                     unfolded             cold     0.06591 0.0660279    11 5169583   0.145 4.405e-05  0
 spans_in_100                    folded_leaves        cold     0.065121 0.0659958     8 5169307    0.16 3.54e-05  0
 spans_in_100                    unfolded             cold     0.066788 0.0685385    11 5169583   0.135 4.235e-05  0
-spans_in_1000                   folded_leaves        cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-spans_in_1000                   unfolded             cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-spans_in_1001                   folded_leaves        cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
-spans_in_1001                   unfolded             cold     unsupported-on-this-build (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+spans_in_1000                   folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+spans_in_1000                   unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+spans_in_1001                   folded_leaves        cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
+spans_in_1001                   unfolded             cold     refused-by-guard (server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the statement)
 spans_lookup_1h                 folded_leaves        cold     0.0204685 0.02228515     7  333841    0.01  9.5e-06  0
 spans_lookup_1h                 folded_leaves        warm     0.008129  0.008129     1      33     0.0           
 spans_lookup_1h                 folded_no_leaves     cold     0.020636 0.0217268     7  333650    0.01  9.5e-06  0
@@ -343,9 +351,11 @@ query frequency assumed (once, for every break-even below): 1000 lookups per par
   spans_lookup_wide (spans): unfolded $2.32e-05 folded $1.03e-05 (with maintenance $1.0313e-05) saving $1.29e-05/call; break-even 1.027674419 lookups/part-month
   spans_sql_trace_1h (spans): unfolded $2.07e-05 folded $1.035e-05 (with maintenance $1.0363e-05) saving $1.035e-05/call; break-even 1.280869565 lookups/part-month
 
+missing needle_blocks needlesparse: stamps/needle_blocks.json needle_sparse_present_blocks absent or null
+missing needle_blocks needlecommon: stamps/needle_blocks.json needle_common_present_blocks absent or null
 miss row_01.wire_bytes
 miss row_02.wire_bytes
-miss row_03.probe_wire_per_object
+missing row_03.probe_wire_per_object: stamps/unfolded.spans.ranges.json absent: no per-object event ranges to count the window's candidate objects
 miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
 miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
 miss row_08.logs_trace_id_leaf_pct

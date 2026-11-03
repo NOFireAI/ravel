@@ -1425,7 +1425,8 @@ def summary_text(res):
                    f"logs object(s):")
         for value, e in nb["needles"].items():
             band = f"within {NEEDLE_BLOCK_BAND:.0%}" if e["band"] == "band" else e["band"]
-            out.append(f"  {value:14} {e['column']:14} {e['planted']!s:>5} / {e['storage']!s:<5} "
+            planted, storage = ("-" if n is None else str(n) for n in (e["planted"], e["storage"]))
+            out.append(f"  {value:14} {e['column']:14} {planted:>5} / {storage:<5} "
                        f"{band:11} {e['status']}")
     out.append("")
     out.append(f"{'figure':44} {'status':12} {'value':>14}  verdict")

@@ -547,9 +547,11 @@ the fixture under 300 KB; `summary.local.txt` and `run.toml` are plain.
 Its verdict is `fail`. The problem list, pinned by the suite:
 
 ```
+missing needle_blocks needlesparse: stamps/needle_blocks.json needle_sparse_present_blocks absent or null
+missing needle_blocks needlecommon: stamps/needle_blocks.json needle_common_present_blocks absent or null
 miss row_01.wire_bytes
 miss row_02.wire_bytes
-miss row_03.probe_wire_per_object
+missing row_03.probe_wire_per_object: stamps/unfolded.spans.ranges.json absent: no per-object event ranges to count the window's candidate objects
 miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
 miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
 miss row_08.logs_trace_id_leaf_pct
@@ -576,9 +578,10 @@ not implemented`.
   trace id leaf is 4.3 %, inside 6 %.
 - Rows 1 and 2: 464,913 wire bytes for the no-range lookup and 333,841 for
   the 1 h lookup, against 300 KB; the run's real figures.
-- Rows 11 and 13: the 1,000-key IN lists are refused by the complexity
-  guard (1,001 units), so their figures and the 1,001-key controls read
-  `unsupported-on-this-build` with the server's text. Every inflight try of
+- Row 11: the 1,000-key IN lists are refused by the complexity guard
+  (1,001 units), so their figures and the 1,001-key controls read
+  `refused-by-guard` with the server's text (15 figures over 24 calls on
+  the summary's `refusal classes` line). Row 13: every in-flight try of
   compaction_in_flight's four statements overlapped its own signal's
   compaction (the two signals compact concurrently, 1.36 s and 2.15 s), and
   under the pending erasure the victim's lookup returned no row on

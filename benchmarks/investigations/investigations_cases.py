@@ -770,9 +770,11 @@ class LocalSmoke(Workdir):
         _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
         self.assertEqual(res["verdict"], "fail")
         self.assertEqual(res["problems"], [
+            "missing needle_blocks needlesparse: stamps/needle_blocks.json needle_sparse_present_blocks absent or null",
+            "missing needle_blocks needlecommon: stamps/needle_blocks.json needle_common_present_blocks absent or null",
             "miss row_01.wire_bytes",
             "miss row_02.wire_bytes",
-            "miss row_03.probe_wire_per_object",
+            "missing row_03.probe_wire_per_object: stamps/unfolded.spans.ranges.json absent: no per-object event ranges to count the window's candidate objects",
             "miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count",
             "miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count",
             "miss row_08.logs_trace_id_leaf_pct",
@@ -789,6 +791,10 @@ class LocalSmoke(Workdir):
         self.assertEqual(sorted(f["id"] for f in res["figures"]), sorted(want))
         covered = set(SMOKE_STATES) | {"fold_advance", "compaction_done"}
         for f in res["figures"]:
+            if f["id"] == "row_03.probe_wire_per_object":
+                # The smoke predates the ranges stamp the denominator reads.
+                self.assertEqual(f["status"], "missing")
+                continue
             self.assertNotIn(f["status"], ("missing", "duplicate"), f["id"])
             if f["status"] == "not-run":
                 self.assertTrue(f["reason"], f["id"])
@@ -889,11 +895,15 @@ class LocalSmoke(Workdir):
         self.assertTrue(any(p["phase"] == "scan" and p["s3GetRequests"] >= 1
                             for c in calls for p in c["stats"]["phases"]))
 
-    def test_probe_wire_per_object_records_a_miss(self):
-        # Item 6: one 64 KiB probe read per object, against <= 8192.
+    def test_probe_wire_per_object_reads_missing_without_ranges(self):
+        # The smoke predates the ranges stamp, so the per-object denominator
+        # is missing rather than guessed; check_probe_per_object covers the
+        # figure itself.
         _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
         f = figure(res, "row_03.probe_wire_per_object")
-        self.assertEqual((f["value"], f["verdict"]), (65536.0, "miss"))
+        self.assertEqual((f["status"], f["value"], f["reason"]), (
+            "missing", None, "stamps/unfolded.spans.ranges.json absent: no per-object event ranges to count the "
+            "window's candidate objects"))
 
     def test_leaf_share_is_per_field_over_the_census_bytes(self):
         # Item 14, recomputed by hand from the stamps.
@@ -1024,6 +1034,10 @@ class Evaluate(Workdir):
         self.run_dir = smoke_run(self.path("run"))
         self.calls_path = os.path.join(self.run_dir, "calls.jsonl")
         self.calls = read_jsonl(self.calls_path)
+        # The smoke's stamp predates the sparse and common needle columns;
+        # these cases start from the planted counts so only their own
+        # mutation can fail them.
+        self.needle_stamp(needle_sparse_present_blocks=2, needle_common_present_blocks=3)
 
     def save_calls(self):
         write_jsonl(self.calls_path, self.calls)
@@ -1703,7 +1717,8 @@ class Evaluate(Workdir):
         _, res, _ = self.go(BANDS)
         self.assertEqual([p for p in res["problems"] if "compaction_in_flight" in p], [])
         f = figure(res, "row_13.compaction_in_flight_rows_exact")
-        self.assertEqual((f["status"], f["reason"]), ("not-run", "compaction finished in 1000 ms before the first call"))
+        self.assertEqual((f["status"], f["reason"]), ("not-run", "every call group in compaction_in_flight not run: "
+                                                       "compaction finished in 1000 ms before the first call"))
 
     def check_refused(self, evaluate_py=EVALUATE):
         """A refusal of a statement not planned as a cap probe is the problem refused; a cap probe's reads
@@ -2195,8 +2210,8 @@ FLIPS = {
         "check_overlap_too_short",
     ),
     "an unsent state read as missing": (
-        "            if unsent:\n",
-        "            if False:\n",
+        "        if groups and len(unsent) == len(groups):\n",
+        "        if False:\n",
         "check_overlap_too_short",
     ),
     "a skipped state passed over": (
