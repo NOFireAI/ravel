@@ -1016,6 +1016,98 @@ async fn otap_batch_over_inflight_ceiling_is_shed() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
+/// Scrapes `/metrics` and returns the value of the single sample whose line
+/// starts with `prefix`, or 0 when the family has not been emitted yet.
+async fn scrape_counter(http_base: &str, prefix: &str) -> u64 {
+    let body = reqwest::Client::new()
+        .get(format!("{http_base}/metrics"))
+        .send()
+        .await
+        .expect("metrics scrape completes")
+        .text()
+        .await
+        .expect("metrics body is text");
+    body.lines()
+        .find(|line| line.starts_with(prefix))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// ADR-3718's CPU-aware shed must reach OTAP batches, not just unary OTLP
+/// exports: `GrpcIngestAdmissionService` takes no permit for the OTAP arm (it
+/// passes the stream straight through, since each batch admits itself inside
+/// `process_batch`), so the draw at the gRPC layer never runs for it, and the
+/// only place left to apply ADR-3718 is the per-batch `try_admit` site itself.
+/// With `p` pinned to 1.0, a batch on a fresh stream is shed `RESOURCE_EXHAUSTED`
+/// with the CPU-shed message, ingests nothing, and -- like the in-flight-ceiling
+/// shed above -- tears the stream down so a queued second batch never gets a
+/// status. `ravel_ingest_cpu_shed_total` counts the refusal.
+///
+/// Drives the real `ArrowMetricsService::arrow_metrics` handler over gRPC. To
+/// watch this test fail (proving the gap it closes, not just a passing
+/// wire-up), delete the `cpu_shed().draw()` block `process_batch` added right
+/// after its `try_admit` block: the shed batch would then be admitted and ack
+/// OK instead of `RESOURCE_EXHAUSTED`.
+#[tokio::test]
+async fn otap_batch_is_shed_by_the_cpu_shed() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_test_server_fault(store.clone(), IngestConcurrencyLimit::Unlimited).await;
+    let grpc_addr = running.grpc_addr.expect("gateway binds gRPC");
+    let http_base = format!("http://{}", running.http_addr);
+
+    running.cpu_shed.set_for_test(1.0);
+
+    let ts = now_ns();
+    let shed_statuses = open_stream_send(
+        grpc_addr,
+        otap_stream_batches(&[&["cpu_shed_a"], &["cpu_shed_b"]], ts),
+    )
+    .await;
+    assert_eq!(
+        shed_statuses.len(),
+        1,
+        "a CPU shed must tear the stream down: the second batch must never get a status, got {shed_statuses:?}"
+    );
+    assert_eq!(
+        shed_statuses[0].status_code,
+        StatusCode::ResourceExhausted as i32,
+        "a CPU-shed batch must be RESOURCE_EXHAUSTED: {}",
+        shed_statuses[0].status_message
+    );
+    assert_eq!(
+        shed_statuses[0].status_message, "node is CPU-saturated, shedding ingest requests",
+        "shed message must be the CPU-shed reason, not another RESOURCE_EXHAUSTED \
+         (in-flight ceiling, byte rate, buffer budget): {:?}",
+        shed_statuses[0].status_message
+    );
+    assert_eq!(
+        scrape_counter(&http_base, "ravel_ingest_cpu_shed_total").await,
+        1,
+        "the CPU-shed counter must count the batch's refusal"
+    );
+
+    // With `p` back at 0, the next export is admitted on its own merits.
+    running.cpu_shed.set_for_test(0.0);
+    let after = send_one_batch(grpc_addr, otap_gauge_batch("cpu_shed_after", ts)).await;
+    assert_eq!(
+        after.status_code,
+        StatusCode::Ok as i32,
+        "once p drops back to 0, the next OTAP export must be admitted: {}",
+        after.status_message
+    );
+
+    // The shed batch ingested nothing: only the one admitted batch ("after")
+    // ever became durable.
+    assert_eq!(
+        durable_metric_object_count(store.as_ref()).await,
+        1,
+        "the shed batch must write nothing durable: only the admitted batch's flush persists"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
 /// With the ceiling at 1 and every data PUT held, an OTAP stream's first
 /// batch is enqueued and waits for its strict ack, and an OTLP export is
 /// still admitted in that state: the batch returned its permit at enqueue,

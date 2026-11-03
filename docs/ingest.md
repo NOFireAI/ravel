@@ -107,6 +107,16 @@ as the gauge `ravel_ingest_cpu_shed_fraction`. `--ingest-cpu-shed-threshold 0`
 disables the detector entirely (today's pre-ADR-3718 behavior, no background
 task spawned).
 
+OTAP batches draw against the same `p` too, but not at this gRPC-layer point:
+`GrpcIngestAdmissionService` takes no permit for the OTAP arm (see the OTAP
+paragraph below), so its own draw is skipped for every OTAP request. The draw
+instead runs once per `BatchArrowRecords`, right after that batch's own
+in-flight permit (`process_batch` in `otap_grpc.rs`), the only place left
+where ADR-3718 can reach an OTAP batch. A drawn batch is answered
+`RESOURCE_EXHAUSTED` with the same message and counts on the same
+`ravel_ingest_cpu_shed_total`, and ends the stream, like an in-flight-ceiling
+shed.
+
 An HTTP/1 server that answers and closes a connection with request bytes still
 unread can reach the client as a reset or a broken pipe instead of the
 response, and a pooled HTTP/1.1 client that is still uploading sees exactly

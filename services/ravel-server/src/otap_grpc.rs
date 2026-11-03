@@ -186,6 +186,27 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
         }
     };
 
+    // CPU-aware shed (ADR-3718): drawn right after the in-flight permit, the
+    // same relative position `admit_ingest_request` draws it in for a unary
+    // OTLP export (`ingest_admission.rs`). `GrpcIngestAdmissionService` takes
+    // no permit of its own for the OTAP arm (`permit` is `None` there, so its
+    // own draw is skipped), so this is the only place an OTAP batch is ever
+    // weighed against the shed fraction; without it CPU saturation never
+    // sheds an Arrow metrics stream. `permit` is not released explicitly: it
+    // holds no release method of its own (unlike the gRPC layer's
+    // `IngestPermitHandle`), and dropping it here on the way out returns the
+    // slot the same way an early decode error does below.
+    if ctx.state.ingest_concurrency.cpu_shed().draw() {
+        return (
+            nack(
+                batch_id,
+                StatusCode::ResourceExhausted,
+                crate::ingest_admission::CPU_SHED_MESSAGE.to_string(),
+            ),
+            true,
+        );
+    }
+
     // Layer 2 (ADR-0051 section 1, layer 2): byte rate on this
     // batch's wire bytes, charged before decode so over-rate bytes cost one
     // buffered body and nothing else. `WireByteCountLayer` parses this

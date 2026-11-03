@@ -266,6 +266,8 @@ third shows whether `p` settled or cycled (D2).
   case stays with ADR-2708 D3's share.
 - The detector adds one background task and two atomic reads per sample. A
   shed draw is one atomic load and one random number per request.
-- `docs/ingest.md` and `docs/guides/ingest-affinity.md` ("Admission
-  rejections") gain the new refusal, and `docs/reference/ravel-server-flags.md`
-  the two flags.
+- `docs/ingest.md` ("Structure") gains the new refusal, including the OTAP
+  per-batch draw point, and `docs/reference/ravel-server-flags.md` the two
+  flags. `docs/guides/ingest-affinity.md`'s "Admission rejections" section is
+  unrelated (Kubernetes CRD/operator validation, not runtime ingest
+  admission) and does not need it.
