@@ -147,7 +147,7 @@ async fn fixture(specs: &[PartSpec], recents: &[Rows], key_type: KeyType) -> Fix
                 });
             }
         }
-        entries.sort_by(|a, b| (a.key8, a.entry_ordinal).cmp(&(b.key8, b.entry_ordinal)));
+        entries.sort_by_key(|a| (a.key8, a.entry_ordinal));
         let uncovered: Vec<u64> = (0..n).filter(|o| spec.uncovered[*o as usize]).collect();
         let cut = 1u64 << 63;
         let slices: Vec<(u64, u64)> = match spec.leaf {
@@ -315,12 +315,7 @@ struct Run {
     reader: CountingReader,
 }
 
-async fn run(
-    fx: &Fixture,
-    keys: &KeySet,
-    budget: &dyn LeafDecodeBudget,
-    ceiling: Ceiling,
-) -> Run {
+async fn run(fx: &Fixture, keys: &KeySet, budget: &dyn LeafDecodeBudget, ceiling: Ceiling) -> Run {
     let accounting = PhaseAccounting::new();
     let reader = CountingReader::new(fx.store.clone());
     let result = route_under(
@@ -364,7 +359,9 @@ fn violations(routes: &[SegmentRoute], rows: &[Rows], query: &BTreeSet<u16>) -> 
             SegmentRoute::Blocks(blocks) => {
                 let got: BTreeSet<u32> = blocks.iter().copied().collect();
                 if !needed.is_subset(&got) || blocks.is_empty() {
-                    found.push(format!("segment {i} routed to {blocks:?}, needs {needed:?}"));
+                    found.push(format!(
+                        "segment {i} routed to {blocks:?}, needs {needed:?}"
+                    ));
                 }
             }
             _ => {}
@@ -380,8 +377,14 @@ fn assert_accounting(run: &Run, figures: &RouteFigures) {
     let key_index = run.accounting.key_index().snapshot();
     let calls = run.reader.calls.load(Ordering::Relaxed);
     let bytes = run.reader.bytes.load(Ordering::Relaxed);
-    assert_eq!(key_index.s3_requests(AccountedOp::Get), figures.leaf_get_requests);
-    assert_eq!(key_index.s3_bytes(AccountedOp::Get), figures.leaf_wire_bytes);
+    assert_eq!(
+        key_index.s3_requests(AccountedOp::Get),
+        figures.leaf_get_requests
+    );
+    assert_eq!(
+        key_index.s3_bytes(AccountedOp::Get),
+        figures.leaf_wire_bytes
+    );
     assert_eq!(figures.leaf_get_requests, calls);
     assert_eq!(figures.leaf_wire_bytes, bytes);
     let phases = run.accounting.snapshot();
@@ -413,11 +416,7 @@ fn leaf_kind() -> impl Strategy<Value = LeafKind> {
 }
 
 fn rows_strategy() -> impl Strategy<Value = Rows> {
-    prop::collection::btree_map(
-        0u16..30,
-        prop::collection::btree_set(0u32..8, 1..=3),
-        0..=4,
-    )
+    prop::collection::btree_map(0u16..30, prop::collection::btree_set(0u32..8, 1..=3), 0..=4)
 }
 
 fn part_spec() -> impl Strategy<Value = PartSpec> {
@@ -705,7 +704,10 @@ async fn another_tenants_leaf_fails_the_statement_and_counts_a_breach() {
     assert_eq!(fx.catalog.isolation_breaches(), before + 1);
     // The reads issued before the failure are still charged.
     assert_eq!(
-        run.accounting.key_index().snapshot().s3_requests(AccountedOp::Get),
+        run.accounting
+            .key_index()
+            .snapshot()
+            .s3_requests(AccountedOp::Get),
         run.reader.calls.load(Ordering::Relaxed)
     );
 }
@@ -867,7 +869,12 @@ async fn leaf_reads_are_charged_to_the_key_index_phase_with_exact_decompressed_b
 
 #[tokio::test]
 async fn origins_that_do_not_match_the_snapshot_are_invalid_input() {
-    let mut fx = fixture(&[PartSpec::simple(vec![rows(&[(1, &[0])])])], &[], KeyType::Str).await;
+    let mut fx = fixture(
+        &[PartSpec::simple(vec![rows(&[(1, &[0])])])],
+        &[],
+        KeyType::Str,
+    )
+    .await;
     fx.snapshot.segments.push(segment(9));
     let budget = ThresholdBudget::new(u64::MAX);
     let run = run(
@@ -892,14 +899,19 @@ fn key_sets_are_sorted_distinct_and_bounded() {
         KeySet::new(FIELD, KeyType::Str, Vec::new()),
         Err(KeySetError::Empty)
     );
-    let many: Vec<Key8> = (0..=KEY_SET_MAX_KEYS as u64).map(u64::to_be_bytes).collect();
+    let many: Vec<Key8> = (0..=KEY_SET_MAX_KEYS as u64)
+        .map(u64::to_be_bytes)
+        .collect();
     assert_eq!(
         KeySet::new(FIELD, KeyType::Str, many),
         Err(KeySetError::TooMany(KEY_SET_MAX_KEYS + 1))
     );
     let max: Vec<Key8> = (0..KEY_SET_MAX_KEYS as u64).map(u64::to_be_bytes).collect();
     assert_eq!(
-        KeySet::new(FIELD, KeyType::Str, max).expect("k keys").keys().len(),
+        KeySet::new(FIELD, KeyType::Str, max)
+            .expect("k keys")
+            .keys()
+            .len(),
         KEY_SET_MAX_KEYS
     );
 }

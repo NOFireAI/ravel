@@ -1441,9 +1441,10 @@ where
                 Err(rejection) => return reject(probe, rejection),
             };
             let Some(guard) = reserve(declared) else {
-                probe.answer = KeyIndexSetAnswer::Declined(
-                    KeyIndexSetDecline::ReservationRefused { bytes: declared },
-                );
+                probe.answer =
+                    KeyIndexSetAnswer::Declined(KeyIndexSetDecline::ReservationRefused {
+                        bytes: declared,
+                    });
                 return Ok(probe);
             };
             guards.push(guard);

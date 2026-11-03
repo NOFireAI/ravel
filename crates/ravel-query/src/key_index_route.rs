@@ -273,9 +273,7 @@ const ADR_CEILING: Ceiling = Ceiling {
 /// are parallel to `snapshot.segments`. A leaf breach is the only
 /// statement-failing outcome besides a `parts`/`snapshot` mismatch; every
 /// other failure leaves the part [`SegmentRoute::Uncovered`] and counts it.
-pub async fn route(
-    input: RouteInput<'_>,
-) -> Result<(Vec<SegmentRoute>, RouteFigures), RouteError> {
+pub async fn route(input: RouteInput<'_>) -> Result<(Vec<SegmentRoute>, RouteFigures), RouteError> {
     route_under(input, ADR_CEILING).await
 }
 

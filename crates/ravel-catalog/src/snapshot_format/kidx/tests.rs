@@ -1397,8 +1397,8 @@ fn decoded_bound_dominates_the_adversarial_frame() {
             ..request(&part)
         };
         let prefix_len = leaf.1.prefix_len as usize;
-        let prefix = KeyIndexLeafPrefix::parse(&leaf.0[..prefix_len], &leaf.1, &req)
-            .expect("parses");
+        let prefix =
+            KeyIndexLeafPrefix::parse(&leaf.0[..prefix_len], &leaf.1, &req).expect("parses");
         let len = raw.len() as u32;
         let peak = measured_decode_peak(&prefix, bucket, &leaf.0[prefix_len..]);
         assert!(
@@ -1472,7 +1472,10 @@ fn set_probe_with(
     request: &KeyIndexLeafRequest<'_>,
     keys: &[Key8],
     policy: &KeyIndexSetPolicy,
-) -> (Result<KeyIndexSetProbe, KeyIndexLeafBreach>, Vec<Range<u64>>) {
+) -> (
+    Result<KeyIndexSetProbe, KeyIndexLeafBreach>,
+    Vec<Range<u64>>,
+) {
     let reads = RefCell::new(Vec::new());
     let result = block_on(probe_key_index_leaf_set_ranged(
         leaf_ref,
@@ -1510,7 +1513,7 @@ fn wide_leaf() -> (
             )
         })
         .collect();
-    entries.sort_by(|a, b| (a.key8, a.entry_ordinal).cmp(&(b.key8, b.entry_ordinal)));
+    entries.sort_by_key(|a| (a.key8, a.entry_ordinal));
     let leaf = encode_key_index_leaf_with_bucket_bits(
         &input(part, &entries, &UNCOVERED),
         13,
@@ -1571,12 +1574,16 @@ fn set_probe_reads_at_most_b_run_gets_and_bridges_above_it() {
         .iter()
         .filter_map(|k| prefix.locate(k).expect("in slice").map(|l| l.bucket))
         .collect();
-    assert!(distinct.len() > KEY_INDEX_SET_PROBE_MAX_RUNS, "{}", distinct.len());
+    assert!(
+        distinct.len() > KEY_INDEX_SET_PROBE_MAX_RUNS,
+        "{}",
+        distinct.len()
+    );
     let frames_uncompressed: u64 = distinct
         .iter()
         .map(|&bucket| {
-            let start = (prefix.prefix_len() + prefix.bucket_body_range(bucket as usize).start)
-                as usize;
+            let start =
+                (prefix.prefix_len() + prefix.bucket_body_range(bucket as usize).start) as usize;
             u64::from(le_u32(&leaf.bytes[start..], 4).expect("frame header"))
         })
         .sum();
@@ -1589,7 +1596,11 @@ fn set_probe_reads_at_most_b_run_gets_and_bridges_above_it() {
     let probe = result.expect("no breach");
     expect_answered(&probe, &keys, &truth);
     assert_eq!(reads[0], prefix_range);
-    assert!(reads.len() - 1 <= KEY_INDEX_SET_PROBE_MAX_RUNS, "{}", reads.len());
+    assert!(
+        reads.len() - 1 <= KEY_INDEX_SET_PROBE_MAX_RUNS,
+        "{}",
+        reads.len()
+    );
     assert_eq!(probe.get_requests as usize, reads.len());
     assert_eq!(probe.distinct_buckets, distinct.len());
     let read_bytes: u64 = reads.iter().map(|r| r.end - r.start).sum();
@@ -1666,9 +1677,7 @@ fn set_probe_refused_reservation_declines_and_bad_keys_are_rejected() {
     assert_eq!(reserved.len(), 1, "the first refusal ends the probe");
     assert_eq!(
         probe.answer,
-        KeyIndexSetAnswer::Declined(KeyIndexSetDecline::ReservationRefused {
-            bytes: reserved[0]
-        })
+        KeyIndexSetAnswer::Declined(KeyIndexSetDecline::ReservationRefused { bytes: reserved[0] })
     );
     assert_eq!(probe.decompressed_bytes, 0);
 

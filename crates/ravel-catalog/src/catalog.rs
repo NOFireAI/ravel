@@ -2536,9 +2536,8 @@ impl Catalog {
                 true,
             )
             .await?;
-        let parts = parts.unwrap_or_else(|| {
-            SnapshotParts::new(Vec::new(), vec![None; snapshot.segments.len()])
-        });
+        let parts = parts
+            .unwrap_or_else(|| SnapshotParts::new(Vec::new(), vec![None; snapshot.segments.len()]));
         let charge = self.reserve_decoded(parts.heap_bytes(), u64::MAX)?;
         Ok((snapshot, origins, parts.with_charge(charge)))
     }
