@@ -549,7 +549,8 @@ instant or a range evaluation, one row per series, `ravel_log_lines` and
 `has_word`, severity and trace id compiled to one `SELECT` over `logs`,
 ordered by `(ts, observed_ts)`, rows grouped by attribute key set with the
 shared attributes listed once), `ravel_get_trace` (whose `time_range` is
-optional: omitted, it reads every span the tenant retains) and
+optional: omitted, it reads every span the tenant retains; each span carries
+its tree depth and whether its parent was returned) and
 `ravel_analyze_timeseries` (`change_point` or `summary` over each series of
 a PromQL range result, the same analysis `POST /api/v1/analytics` runs,
 reported as a heuristic).

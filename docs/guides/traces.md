@@ -365,6 +365,9 @@ happens in two ways:
 
 To read a whole trace regardless of the window, use
 [`GET /api/traces/<trace_id>`](#fetching-one-trace-by-id) without `start`
-and `end`, or query by `trace_id` over SQL with `"start": 0`. Ravel does
-not flag a result as incomplete, on that route or anywhere else. It returns
-the spans in view and never waits for a missing root or sibling.
+and `end`, or query by `trace_id` over SQL with `"start": 0`. Neither that
+route nor SQL flags a result as incomplete. The MCP tool `ravel_get_trace`
+is the one place that does: it labels each span whose parent is not among
+the returned spans `missing` or, when a cap cut the result, `not_returned`
+(see the [MCP reference](../reference/mcp.md#span-tree)). No route waits
+for a missing root or sibling; each returns the spans in view.

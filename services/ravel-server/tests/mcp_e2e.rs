@@ -3691,4 +3691,197 @@ mod with_mcp {
         client.cancel().await.expect("client stops");
         running.shutdown().await.expect("server stops");
     }
+
+    const TRACE_T: [u8; 16] = [0x7e; 16];
+
+    /// `(span_id, parent_span_id, start_ts_ns)`.
+    type TraceSpan = ([u8; 8], Option<[u8; 8]>, i64);
+
+    /// One RSPAN object of [`TENANT`] holding trace [`TRACE_T`]'s spans.
+    async fn publish_trace(store: &dyn ObjectStoreBackend, spans: &[TraceSpan]) {
+        use ravel_commit::publish::RetryPolicy;
+        use ravel_commit::record::NewCommitRecord;
+        use ravel_commit::{keys, publish, record};
+        use ravel_object_store::PutOptions;
+        use ravel_types::Signal;
+
+        let tenant_hash = TenantId::new(TENANT).hash();
+        let writer_id = uuid::Uuid::from_u128(4_000);
+        let mut writer = ravel_rspan::RspanWriter::new(
+            ravel_rspan::RspanConfig::default(),
+            ravel_rspan::ObjectIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.into_bytes(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        for &(span_id, parent_span_id, start_ts_ns) in spans {
+            writer.push(ravel_rspan::SpanRecord {
+                trace_id: TRACE_T,
+                span_id,
+                parent_span_id,
+                name: "op".to_string(),
+                start_ts_ns,
+                end_ts_ns: start_ts_ns + 1_000,
+                status_code: ravel_rspan::StatusCode::Ok,
+                status_message: None,
+                attrs: vec![("service.name".to_string(), "svc".to_string())],
+            });
+        }
+        let bytes = writer.finish().expect("finish rspan object");
+        let min_ts = spans.iter().map(|span| span.2).min().expect("a span");
+        let max_ts = spans
+            .iter()
+            .map(|span| span.2 + 1_000)
+            .max()
+            .expect("a span");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Spans,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash: *blake3::hash(&bytes).as_bytes(),
+            sample_count: spans.len() as u64,
+            series_count: spans.len() as u64,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: min_ts,
+            max_ingest_ts_ns: max_ts,
+            segment_format_version: u32::from(ravel_ingest::SPAN_SEGMENT_FORMAT_VERSION),
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid span commit record");
+        store
+            .put(
+                &keys::reconstruct_data_key(&rec).expect("data key"),
+                bytes::Bytes::from(bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put span data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish span commit");
+    }
+
+    /// Each returned span as `[span_id, __ravel_depth, __ravel_parent]`,
+    /// read by column name.
+    fn span_tree(envelope: &serde_json::Value) -> Vec<serde_json::Value> {
+        let columns = envelope["data"]["columns"]
+            .as_array()
+            .expect("columns")
+            .iter()
+            .map(|column| column["name"].as_str().expect("a column name"))
+            .collect::<Vec<_>>();
+        let at = |name: &str| {
+            columns
+                .iter()
+                .position(|column| *column == name)
+                .unwrap_or_else(|| panic!("no {name} column in {columns:?}"))
+        };
+        let (span, depth, parent) = (at("span_id"), at("__ravel_depth"), at("__ravel_parent"));
+        envelope["data"]["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| serde_json::json!([row[span], row[depth], row[parent]]))
+            .collect()
+    }
+
+    /// A trace whose root starts at 10 s, its child at 20 s and grandchild
+    /// at 30 s. Over the whole trace the tree is root, depth 1, depth 2. A
+    /// `time_range` from 15 s drops the root: the child is `missing` at depth
+    /// 0, the grandchild `present` at depth 1, both added columns lead the
+    /// row, and the one next step is to widen the window.
+    ///
+    /// FLIP: the body that returns the port's envelope as it comes has no
+    /// `__ravel_depth` column.
+    #[tokio::test]
+    async fn get_trace_reports_the_span_tree_and_a_dropped_root() {
+        let (store, metrics) = instrumented_memory();
+        let (root, child, grandchild) = ([0x01; 8], [0x02; 8], [0x03; 8]);
+        publish_trace(
+            store.as_ref(),
+            &[
+                (root, None, 10 * NS_PER_SEC),
+                (child, Some(root), 20 * NS_PER_SEC),
+                (grandchild, Some(child), 30 * NS_PER_SEC),
+            ],
+        )
+        .await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+        let trace_id = "7e".repeat(16);
+
+        let (is_error, whole) = call(
+            &client,
+            "ravel_get_trace",
+            serde_json::json!({"trace_id": trace_id}),
+        )
+        .await;
+        assert_eq!(is_error, Some(false), "{whole}");
+        assert_eq!(whole["status"], serde_json::json!("ok"), "{whole}");
+        assert_eq!(
+            span_tree(&whole),
+            [
+                serde_json::json!(["0101010101010101", "0", "root"]),
+                serde_json::json!(["0202020202020202", "1", "present"]),
+                serde_json::json!(["0303030303030303", "2", "present"]),
+            ]
+        );
+        assert_eq!(whole["next_steps"], serde_json::json!([]), "{whole}");
+
+        let (is_error, windowed) = call(
+            &client,
+            "ravel_get_trace",
+            serde_json::json!({
+                "trace_id": trace_id,
+                "time_range": {
+                    "start_ns": (15 * NS_PER_SEC).to_string(),
+                    "end_ns": (60 * NS_PER_SEC).to_string(),
+                },
+            }),
+        )
+        .await;
+        assert_eq!(is_error, Some(false), "{windowed}");
+        assert_eq!(windowed["status"], serde_json::json!("ok"), "{windowed}");
+        assert_eq!(
+            windowed["data"]["columns"][0]["name"],
+            serde_json::json!("__ravel_depth")
+        );
+        assert_eq!(
+            windowed["data"]["columns"][1]["name"],
+            serde_json::json!("__ravel_parent")
+        );
+        assert_eq!(
+            span_tree(&windowed),
+            [
+                serde_json::json!(["0202020202020202", "0", "missing"]),
+                serde_json::json!(["0303030303030303", "1", "present"]),
+            ]
+        );
+        let actions: Vec<&serde_json::Value> = windowed["next_steps"]
+            .as_array()
+            .expect("next_steps")
+            .iter()
+            .map(|next| &next["action"])
+            .collect();
+        assert_eq!(
+            actions,
+            [&serde_json::json!("widen_time_range")],
+            "{windowed}"
+        );
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
 }

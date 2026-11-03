@@ -15,7 +15,10 @@
 //! series and caps series, not samples. `analytics` also stops before the
 //! caps, after it runs the op over each series of the range result: its rows
 //! are already one per series, and `ravel_analyze_timeseries` caps them and
-//! labels the result a heuristic. Nothing else: the admission permit, the
+//! labels the result a heuristic. `trace_lookup` stops before the caps too,
+//! because `ravel_get_trace` labels each span's parent over the rows that
+//! survive the byte cap, and only the tool can order those two steps.
+//! Nothing else: the admission permit, the
 //! deadline clamp, the cost record, the usage guard, the audit submission, the
 //! partial-coverage gate, and the error redaction all live inside the service
 //! layer, and a tool call takes exactly one permit because it makes exactly
@@ -666,7 +669,7 @@ impl QueryBackend for ServiceBackend {
             .sql_execute(tenant_hash, &native)
             .await
             .map_err(failure)?;
-        let mut envelope = d4::finish(self.sql_envelope(&native, &outcome)?, &self.budgets);
+        let mut envelope = self.sql_envelope(&native, &outcome)?;
         envelope.scope.signal = "traces".to_string();
         envelope.scope.table = "spans".to_string();
         Ok(envelope)

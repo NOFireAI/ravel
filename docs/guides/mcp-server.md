@@ -183,10 +183,15 @@ server offers over MCP, `ravel_agent_send`, belongs to the
 
 - `ravel_get_trace`: every span of one trace id. The time range is
   optional: omitted, the lookup reads every span the tenant retains; given,
-  it bounds the read and filters the rows. As served today it returns the
-  span rows only: the span tree, missing-parent and orphan reporting and the
-  optional logs pass are not built, and a call asking for the logs pass is
-  refused as unsupported.
+  it bounds the read and filters the rows. Each span comes with its depth in
+  the span tree (`__ravel_depth`) and whether its parent was returned
+  (`__ravel_parent`: `root`, `present`, `missing`, `not_returned` or
+  `cycle`). A capped result never calls a parent `missing`: it says
+  `not_returned`, because the parent may be among the dropped rows. The
+  [reference](../reference/mcp.md#span-tree) gives the exact rules. The
+  optional logs pass is not built yet, and a call asking for it is refused
+  as unsupported; `ravel_search_logs` with the trace id and a time range
+  returns the trace's logs.
 - `ravel_analyze_timeseries`: change-point detection or a summary statistic
   over each series of a PromQL range result, one row per series. The result
   names the method as a heuristic (`accuracy.exact` is `false`), and each
@@ -474,9 +479,10 @@ Paging order differs per tool:
 - `ravel_search_logs` orders by `(ts, observed_ts)`, which is not always
   unique, because `logs` rows carry no row identity. The equal-group rule
   applies.
-- `ravel_get_trace` mints no cursor as served today: it returns the trace's
-  spans in one page, ordered by `start_ts` and `span_id`, and a trace larger
-  than the row cap comes back bounded (`row_cap_hit`) rather than paged.
+- `ravel_get_trace` mints no cursor: it returns the trace's spans in one
+  page, ordered by `start_ts` and `span_id`, and a trace larger than the row
+  cap comes back bounded (`row_cap_hit`) rather than paged. Raise `max_rows`
+  (up to 5,000) or narrow the time range to read more of it.
 - `ravel_query_promql` mints no cursor: a PromQL result has no order a
   cursor could resume. Its row cap counts series, and a result with more
   series than `max_rows` comes back `ok_bounded`.
@@ -524,8 +530,10 @@ whether the same query returns that row today.
 The server does not promise these things:
 
 - **Completeness of a trace.** `ravel_get_trace` reports the spans that it
-  found; it does not yet report which parents are missing or which spans have
-  no known parent. It does not promise that every span of a trace has arrived. Distributed
+  found, and for each one whether its parent is among them. A `missing`
+  parent tells you a span is absent from what the server holds or from the
+  window you asked for; it does not tell you whether that span will still
+  arrive. The tool does not promise that every span of a trace has arrived. Distributed
   tracing is best-effort, and a trace can still be receiving spans when you
   ask.
 - **Immunity to prompt injection.** Telemetry text (a log body, a span
