@@ -67,7 +67,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::catalog::{Predicate, PredicateOp, PredicateValue, SearchLogsInput};
-use crate::cursor::{Cursor, CursorError, CursorPosition};
+use crate::cursor::{
+    Confirmed, Cursor, CursorError, CursorPosition, SEGMENT_SET_MOVED_WARNING, SegmentSetPin,
+};
 use crate::draft::{Draft, NoCursor, PageOrder, PinScope};
 use crate::envelope::{
     CURSOR_BOUND, Cell, Column, Data, Envelope, Failure, FailureClass, NextStep, serialized_str_len,
@@ -550,11 +552,27 @@ async fn later_page<B: QueryBackend>(
         .map(|predicate| (signal, predicate.clone()))
         .collect();
     let declared = draft.declared_columns.clone();
-    let confirmed = match pending.confirm(ctx.now_ns, &observed_erasure, &declared) {
+    let observed_segment_set = draft.segment_set_digest;
+    let Confirmed {
+        cursor: confirmed,
+        segment_set_moved,
+    } = match pending.confirm(
+        ctx.now_ns,
+        &observed_erasure,
+        &declared,
+        observed_segment_set,
+        SegmentSetPin::Advisory,
+    ) {
         Ok(confirmed) => confirmed,
         Err(error) => return refused_with(error.failure(), Vec::new(), ctx),
     };
-    let draft = draft.pinned_to(&confirmed, declared);
+    let mut draft = draft.pinned_to(&confirmed, declared);
+    if segment_set_moved {
+        draft
+            .envelope
+            .warnings
+            .push(SEGMENT_SET_MOVED_WARNING.to_string());
+    }
     finish(draft, call, &plan, &PinScope::of(&confirmed), ctx)
 }
 
@@ -915,6 +933,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Some(2),
+            None,
             END_NS,
         )
         .with_order_tuples(tuples)

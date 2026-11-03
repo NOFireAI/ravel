@@ -34,8 +34,8 @@
 //! one already listed, or a compaction that replaced its objects, is in the
 //! redeeming resolve's result although every resolve input above is equal.
 //! So a cursor also pins [`Cursor::segment_set_digest`], the
-//! `ravel_sql::segment_set_digest` of the data-object keys page one's
-//! resolve returned (the pinned segment set amendment to ADR-1374), and
+//! [`segment_set_digest`] of the data-object keys page one's resolve
+//! returned (the pinned segment set amendment to ADR-1374), and
 //! [`PendingRedemption::confirm`] compares it with the redeeming resolve's.
 //! Data objects are immutable and a data-object key embeds its content hash
 //! (ADR-0010 item 7), so equal digests mean the two pages read the same
@@ -503,7 +503,7 @@ pub struct Cursor {
     /// resolve returned no segment. Carried forward so every later page
     /// reports page one's value; never compared with anything.
     pub ingest_watermark_hour: Option<u32>,
-    /// `ravel_sql::segment_set_digest` of the data-object keys page one's
+    /// [`segment_set_digest`] of the data-object keys page one's
     /// resolve returned, which [`PendingRedemption::confirm`] compares with
     /// the redeeming resolve's (see this module's "The pinned segment set"
     /// docs). `None` when the backend reported no segment set. A later page
@@ -1143,6 +1143,42 @@ pub struct Confirmed {
     pub segment_set_moved: bool,
 }
 
+/// The warning a later page served under [`SegmentSetPin::Advisory`] carries
+/// when [`Confirmed::segment_set_moved`] is set.
+pub const SEGMENT_SET_MOVED_WARNING: &str = "segment set changed since page one: a row \
+    committed since may appear on this page or be omitted (ADR-1374, 2026-09-12 \
+    amendment, item 4)";
+
+/// Domain-separation context for [`segment_set_digest`], in BLAKE3's
+/// derive-key mode. It names what is hashed, the segment set ravel-sql
+/// resolved, rather than the crate that hashes it.
+const SEGMENT_SET_CONTEXT: &str = "ravel-sql resolved segment set v1";
+
+/// The digest a cursor pins for the segments a statement resolved: BLAKE3-256
+/// in derive-key mode under [`SEGMENT_SET_CONTEXT`], over each data-object key
+/// behind its `u32` little-endian byte length, the keys sorted and
+/// deduplicated first. The order `keys` lists them in and any repeats do not
+/// change the digest, and an empty set has a digest of its own.
+///
+/// The keys are the ones `ravel_sql::SqlOutcome::segment_set` reports. A data
+/// object is immutable and its key embeds its content hash, so an equal digest
+/// means the same rows were read, and a compaction, which writes new keys,
+/// changes it.
+pub fn segment_set_digest<'a>(keys: impl Iterator<Item = &'a str>) -> [u8; 32] {
+    let mut keys: Vec<&str> = keys.collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let mut hasher = blake3::Hasher::new_derive_key(SEGMENT_SET_CONTEXT);
+    for key in keys {
+        // A data-object key is a short fixed layout (docs/catalog-and-mvcc.md),
+        // nowhere near `u32::MAX` bytes.
+        let len = u32::try_from(key.len()).unwrap_or(u32::MAX);
+        hasher.update(&len.to_le_bytes());
+        hasher.update(key.as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
 /// Domain-separation context for [`declared_column_set_digest`], in BLAKE3's
 /// derive-key mode.
 const DECLARED_COLUMN_SET_CONTEXT: &str = "ravel-mcp cursor declared_column_set v1";
@@ -1644,6 +1680,10 @@ mod tests {
     /// check is inert in every test but the three that exercise it.
     const NO_ERASURE: &[(Signal, ErasurePredicate)] = &[];
 
+    /// The segment set digest [`sample_cursor`] pins, observed unchanged by
+    /// every redemption that is not about the segment set.
+    const SAMPLE_SEGMENTS: Option<[u8; 32]> = Some([0x5Eu8; 32]);
+
     fn test_key() -> CursorKey {
         CursorKey::from_process_secret([0x11u8; CURSOR_KEY_LEN])
     }
@@ -1729,6 +1769,7 @@ mod tests {
             )])],
             declared_column_set_digest: declared_column_set_digest(&sample_declared()),
             ingest_watermark_hour: Some(472_222),
+            segment_set_digest: SAMPLE_SEGMENTS,
             position: CursorPosition::Keyset {
                 tuple: vec![1, 2, 3],
                 order_by: vec!["timestamp desc".to_owned()],
@@ -2213,6 +2254,7 @@ mod tests {
             ],
             declared_column_set_digest: declared_column_set_digest(&declared),
             ingest_watermark_hour: Some(472_223),
+            segment_set_digest: SAMPLE_SEGMENTS,
             position: CursorPosition::Keyset {
                 tuple: vec![7, 8, 9, 10],
                 order_by: vec!["timestamp desc".to_owned(), "trace_id asc".to_owned()],
@@ -2535,6 +2577,42 @@ mod tests {
                 .expect_err(what);
             assert_eq!(err, CursorError::Expired, "{what}");
         }
+    }
+
+    /// The segment set digest does not depend on the order the keys arrive
+    /// in or on repeats, changes when a key is added, removed or changed,
+    /// separates keys by their length prefix rather than by concatenation,
+    /// and has a value of its own for the empty set: the BLAKE3 derive-key
+    /// hash of nothing under the context.
+    ///
+    /// FLIP E: with the `sort_unstable` removed from `segment_set_digest`,
+    /// the order-independence assertion fails.
+    #[test]
+    fn the_segment_set_digest_is_over_the_sorted_deduplicated_keys() {
+        let digest = |keys: &[&str]| segment_set_digest(keys.iter().copied());
+        let ab = digest(&["a.rseg", "b.rseg"]);
+        assert_eq!(digest(&["b.rseg", "a.rseg"]), ab, "order-independent");
+        assert_eq!(digest(&["a.rseg", "b.rseg", "a.rseg"]), ab, "deduplicated");
+        assert_ne!(digest(&["a.rseg"]), ab, "a key removed");
+        assert_ne!(digest(&["a.rseg", "b.rseg", "c.rseg"]), ab, "a key added");
+        assert_ne!(digest(&["a.rseg", "B.rseg"]), ab, "a key changed");
+        assert_ne!(digest(&["ab", "c"]), digest(&["a", "bc"]), "length-prefixed");
+
+        let empty = digest(&[]);
+        assert_eq!(
+            empty,
+            *blake3::Hasher::new_derive_key(SEGMENT_SET_CONTEXT)
+                .finalize()
+                .as_bytes(),
+        );
+        assert_ne!(empty, digest(&[""]), "the empty key is a key");
+
+        let mut by_hand = blake3::Hasher::new_derive_key("ravel-sql resolved segment set v1");
+        for key in ["a.rseg", "b.rseg"] {
+            by_hand.update(&6u32.to_le_bytes());
+            by_hand.update(key.as_bytes());
+        }
+        assert_eq!(ab, *by_hand.finalize().as_bytes(), "the pinned encoding");
     }
 
     /// A cursor is bound to the tool that minted it: handing a

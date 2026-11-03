@@ -697,6 +697,9 @@ impl QueryBackend for ServiceBackend {
             outcome.pending_erasure,
             outcome.declared_columns,
             outcome.ingest_watermark_hour,
+            Some(ravel_mcp::cursor::segment_set_digest(
+                outcome.segment_set.iter().map(String::as_str),
+            )),
             resolve_at_ns,
         )
         .with_order_tuples(order_tuples))
