@@ -29,7 +29,7 @@ use crate::store::{StoreSelection, require_tenant_data_present};
 /// Duplicated here rather than imported: `ravel-catalog` only exposes the
 /// equivalent helper as `pub(crate)` (`ravel_server::fold` duplicates it the
 /// same way, for the same reason).
-fn head_key(tenant: &TenantHash, signal: Signal) -> String {
+pub(crate) fn head_key(tenant: &TenantHash, signal: Signal) -> String {
     format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
 }
 
@@ -133,6 +133,47 @@ pub async fn fold_with_writers_stopped(
     now_ns: i64,
     json: bool,
 ) -> anyhow::Result<(FoldReport, String)> {
+    fold_with_part_cap(
+        store,
+        selection,
+        tenant,
+        shard_count,
+        signal,
+        max_flush_lifetime_ns,
+        writers_stopped,
+        build_key_index_leaves,
+        None,
+        now_ns,
+        json,
+    )
+    .await
+}
+
+/// [`fold_with_writers_stopped`], plus `--snapshot-part-max-entries`:
+/// `Some(n)` replaces [`CatalogConfig::snapshot_part_max_entries`]
+/// ([`ravel_catalog::DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`]) for this fold only,
+/// so a part the fold writes holds at most `n` entries. `Some(0)` is refused
+/// before the store is read. Both report forms name the value used.
+#[allow(clippy::too_many_arguments)]
+pub async fn fold_with_part_cap(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shard_count: u32,
+    signal: SignalArg,
+    max_flush_lifetime_ns: Option<i64>,
+    writers_stopped: bool,
+    build_key_index_leaves: bool,
+    snapshot_part_max_entries: Option<usize>,
+    now_ns: i64,
+    json: bool,
+) -> anyhow::Result<(FoldReport, String)> {
+    if snapshot_part_max_entries == Some(0) {
+        anyhow::bail!(
+            "--snapshot-part-max-entries must be at least 1 (the most entries one snapshot part \
+             holds); 0 was given"
+        );
+    }
     let seal_through_hour = if writers_stopped {
         Some(hour_bucket(now_ns)?)
     } else {
@@ -147,6 +188,7 @@ pub async fn fold_with_writers_stopped(
         max_flush_lifetime_ns,
         seal_through_hour,
         build_key_index_leaves,
+        snapshot_part_max_entries,
         now_ns,
         json,
         None,
@@ -204,6 +246,7 @@ pub async fn fold_inner(
         max_flush_lifetime_ns,
         None,
         false,
+        None,
         now_ns,
         json,
         column_stats_ceiling_override,
@@ -221,6 +264,7 @@ async fn fold_core(
     max_flush_lifetime_ns: Option<i64>,
     seal_through_hour: Option<u32>,
     build_key_index_leaves: bool,
+    snapshot_part_max_entries: Option<usize>,
     now_ns: i64,
     json: bool,
     column_stats_ceiling_override: Option<u64>,
@@ -233,6 +277,10 @@ async fn fold_core(
     if let Some(ns) = max_flush_lifetime_ns {
         catalog_config.max_flush_lifetime_ns = ns;
     }
+    if let Some(entries) = snapshot_part_max_entries {
+        catalog_config.snapshot_part_max_entries = entries;
+    }
+    let part_max_entries = catalog_config.snapshot_part_max_entries;
     let seal_margin_ns = seal_margin_ns(&catalog_config)?;
     let tenant_hash = TenantId::new(tenant).hash();
     require_tenant_data_present(
@@ -264,7 +312,14 @@ async fn fold_core(
         .await
         .map_err(|err| anyhow::anyhow!("fold failed: {err}"))?;
 
-    let out = render_fold_report(&report, selection, signal, seal_margin_ns, json)?;
+    let out = render_fold_report(
+        &report,
+        selection,
+        signal,
+        seal_margin_ns,
+        part_max_entries,
+        json,
+    )?;
     print!("{out}");
     Ok((report, out))
 }
@@ -278,6 +333,7 @@ fn render_fold_report(
     selection: StoreSelection,
     signal: SignalArg,
     seal_margin_ns: i64,
+    snapshot_part_max_entries: usize,
     json: bool,
 ) -> anyhow::Result<String> {
     if json {
@@ -329,6 +385,19 @@ fn render_fold_report(
             // loudly rather than silently dropping the store from the output.
             None => anyhow::bail!("fold report did not serialize to a JSON object"),
         }
+        if let Some(obj) = value.as_object_mut()
+            && obj
+                .insert(
+                    "snapshot_part_max_entries".to_string(),
+                    serde_json::Value::from(snapshot_part_max_entries),
+                )
+                .is_some()
+        {
+            anyhow::bail!(
+                "FoldReport now has a `snapshot_part_max_entries` field, which collides with the \
+                 report-level key of the same name; rename one of them"
+            );
+        }
         let body = serde_json::to_string_pretty(&value)
             .map_err(|err| anyhow::anyhow!("failed to serialize fold report: {err}"))?;
         return Ok(format!("{body}\n"));
@@ -352,6 +421,9 @@ fn render_fold_report(
     out.push_str(&format!(
         "seal_through_hour: {:?}\n",
         report.seal_through_hour
+    ));
+    out.push_str(&format!(
+        "snapshot_part_max_entries: {snapshot_part_max_entries}\n"
     ));
     out.push_str(&format!("buckets_folded: {}\n", report.buckets_folded));
     out.push_str(&format!("entry_count: {}\n", report.entry_count));

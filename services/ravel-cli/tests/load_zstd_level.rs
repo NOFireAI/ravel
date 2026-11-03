@@ -123,6 +123,7 @@ async fn load_at(level: i32, parquet: &Path, mapping: &Path, now_ns: i64) -> Loa
         None,
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),
+        None,
         now_ns,
     )
     .await

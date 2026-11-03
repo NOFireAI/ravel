@@ -231,9 +231,10 @@ pub async fn run(
     load_memory_bytes: Option<u64>,
     fold_after_load: bool,
     ipcrypt: &IpcryptPolicy,
+    ingest_hour_stride: Option<IngestHourStride>,
     now_ns: i64,
 ) -> anyhow::Result<()> {
-    run_fold_warning_to(
+    run_load_reporting(
         store,
         parquet_path,
         tenant,
@@ -255,11 +256,13 @@ pub async fn run(
         LoadMemoryRequest::from_flag_on_host(load_memory_bytes),
         fold_after_load,
         ipcrypt,
+        ingest_hour_stride,
         now_ns,
         Arc::new(SystemClock),
         &mut std::io::stderr(),
     )
     .await
+    .map(|_| ())
 }
 
 /// [`run`] with its warning stream injected, so a test can prove the warnings
@@ -370,6 +373,7 @@ pub(crate) async fn run_memory_warning_to(
 /// [`run_memory_warning_to`] with `--fold-after-load` (ADR-2677 decision 1).
 /// Only a logs load folds; a metrics or spans load given the flag is refused
 /// before anything is written.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_fold_warning_to(
     store: Arc<dyn ObjectStoreBackend>,
@@ -397,6 +401,72 @@ pub(crate) async fn run_fold_warning_to(
     clock: Arc<dyn Clock>,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
+    run_load_reporting(
+        store,
+        parquet_path,
+        tenant,
+        mapping_path,
+        signal,
+        shards,
+        batch_rows,
+        skip_rows,
+        read_cursors,
+        pipeline_depth,
+        max_inflight_flushes,
+        decode_queue_batches,
+        target_bytes,
+        max_flush_delay,
+        ack_margin,
+        zstd_level,
+        group_target_blocks,
+        chunk_order,
+        load_memory,
+        fold_after_load,
+        ipcrypt,
+        None,
+        now_ns,
+        clock,
+        warnings,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`run`] with its clock and warning stream injected and the memory request
+/// resolved, returning the layout report the summary printed as JSON.
+///
+/// With a stride, [`prepare_hour_stride`] runs before the ipcrypt marker read
+/// (which can write) and so before any object is written; it fixes
+/// `--pipeline-depth 1`, `--read-cursors 1` and `--target-bytes 1`, and the
+/// load then runs on the lane's shifted clock and store.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_load_reporting(
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping_path: &Path,
+    signal: SignalArg,
+    shards: u32,
+    batch_rows: usize,
+    skip_rows: u64,
+    read_cursors: Option<usize>,
+    pipeline_depth: Option<usize>,
+    max_inflight_flushes: u32,
+    decode_queue_batches: usize,
+    target_bytes: Option<usize>,
+    max_flush_delay: Option<Duration>,
+    ack_margin: Option<Duration>,
+    zstd_level: RlogZstdLevel,
+    group_target_blocks: RlogGroupTargetBlocks,
+    chunk_order: RlogChunkOrder,
+    load_memory: LoadMemoryRequest,
+    fold_after_load: bool,
+    ipcrypt: &IpcryptPolicy,
+    ingest_hour_stride: Option<IngestHourStride>,
+    now_ns: i64,
+    clock: Arc<dyn Clock>,
+    warnings: &mut dyn std::io::Write,
+) -> anyhow::Result<LoadLayoutReport> {
     let refused = match signal {
         SignalArg::Metrics => Some("metrics"),
         SignalArg::Spans => Some("spans"),
@@ -437,6 +507,47 @@ pub(crate) async fn run_fold_warning_to(
         .map_err(|e| anyhow::anyhow!("failed to read --mapping {}: {e}", mapping_path.display()))?;
 
     let section = parse_mapping_document(&mapping_text, signal)?;
+
+    let (store, clock, read_cursors, pipeline_depth, target_bytes, lane) = match ingest_hour_stride
+    {
+        None => (
+            store,
+            clock,
+            read_cursors,
+            pipeline_depth,
+            target_bytes,
+            None,
+        ),
+        Some(stride) => {
+            let levers = StrideLevers {
+                read_cursors,
+                pipeline_depth,
+                target_bytes,
+                fold_after_load,
+            };
+            let lane = prepare_hour_stride(
+                stride,
+                &store,
+                tenant,
+                signal,
+                parquet_path,
+                batch_rows,
+                skip_rows,
+                levers,
+                clock,
+            )
+            .await?;
+            let forced = levers.forced();
+            (
+                lane.store(store),
+                lane.clock(),
+                forced.read_cursors,
+                forced.pipeline_depth,
+                forced.target_bytes,
+                Some(Arc::new(lane)),
+            )
+        }
+    };
 
     // Every load reads the marker, with or without --ipcrypt-config, before
     // its first write; the tenant's rules are built once for the whole run.
@@ -496,6 +607,7 @@ pub(crate) async fn run_fold_warning_to(
                 now_ns,
                 Arc::clone(&clock),
                 rules,
+                lane.as_deref(),
                 warnings,
             )
             .await;
@@ -521,6 +633,7 @@ pub(crate) async fn run_fold_warning_to(
 
     let mut memory_options = LoadMemoryOptions::new(load_memory);
     memory_options.ack_margin = ack_margin;
+    memory_options.hour_stride = lane;
     let one_batch_warning = Arc::clone(&memory_options.one_batch_warning);
 
     // The production entry point drives the columnar fast path (ADR-0109) with
@@ -560,7 +673,7 @@ pub(crate) async fn run_fold_warning_to(
         Ok(report) => {
             print_summary(&report, true);
             write_report_warnings(warnings, &report);
-            Ok(())
+            Ok(report.layout_report())
         }
         Err(err) => {
             print_durable_tokens(&err, LOGS_RESUMABLE_SETTINGS);
@@ -694,7 +807,7 @@ async fn run_metrics(
     clock: Arc<dyn Clock>,
     rules: Arc<TenantRules>,
     warnings: &mut dyn std::io::Write,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<LoadLayoutReport> {
     check_sequential_levers(
         read_cursors,
         decode_queue_batches,
@@ -737,7 +850,7 @@ async fn run_metrics(
             if let Some(warning) = &report.target_bytes_no_effect_warning {
                 let _ = writeln!(warnings, "{warning}");
             }
-            Ok(())
+            Ok(report.layout_report())
         }
         Err(err) => {
             print_durable_tokens(&err, SEQUENTIAL_RESUMABLE_SETTINGS);
@@ -789,8 +902,9 @@ async fn run_spans(
     now_ns: i64,
     clock: Arc<dyn Clock>,
     rules: Arc<TenantRules>,
+    hour_stride: Option<&HourStrideLane>,
     warnings: &mut dyn std::io::Write,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<LoadLayoutReport> {
     check_sequential_levers(
         read_cursors,
         decode_queue_batches,
@@ -804,7 +918,7 @@ async fn run_spans(
     // that did land.
     let mut report = SpansLoadReport::default();
     let loaded = printing_geometry("spans", warnings, |on_geometry| {
-        load_spans_into(
+        load_spans_into_lane(
             &mut report,
             store,
             parquet_path,
@@ -825,6 +939,7 @@ async fn run_spans(
             now_ns,
             clock,
             rules,
+            hour_stride,
         )
     })
     .await;
@@ -839,7 +954,7 @@ async fn run_spans(
             if let Some(warning) = &report.target_bytes_no_effect_warning {
                 let _ = writeln!(warnings, "{warning}");
             }
-            Ok(())
+            Ok(report.layout_report())
         }
         Err(err) => {
             print_durable_tokens(&err, SEQUENTIAL_RESUMABLE_SETTINGS);
