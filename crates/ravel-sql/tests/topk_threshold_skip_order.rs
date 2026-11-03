@@ -60,7 +60,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -85,7 +85,7 @@ use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{LogSegmentFetcher, PhaseAccounting};
+use ravel_query::{LogSegmentFetcher, PhaseAccounting, QueryPhase};
 use ravel_sql::{
     CeilingBreach, LogsScanExec, LogsTableProvider, SessionTable, SpillDecision, SqlConfig,
     TenantDelegatingPool, TenantMemoryAccountant, build_session,
@@ -419,6 +419,8 @@ struct Outcome {
     blocks_skipped: usize,
     segments_skipped: usize,
     route: RouteMetrics,
+    /// `segmentsOpened` per query phase, every phase present.
+    opened: BTreeMap<&'static str, u64>,
     /// Keys read before the threshold was published, if it was.
     read_before_publish: Option<BTreeSet<String>>,
     /// Keys read after the threshold was published, if it was.
@@ -452,12 +454,12 @@ async fn drive(route: Route, publish: Publish) -> Outcome {
         segments_pruned: 0,
         pending_erasure: Vec::new(),
     };
-    let accounting = QueryAccounting::new();
+    let accounting = PhaseAccounting::new();
     let provider = LogsTableProvider::new(
         snapshot,
         TenantHash(TENANT),
         route.fetcher(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>),
-        PhaseAccounting::pooled_over(&accounting),
+        accounting.clone(),
     );
     let ctx = session(provider);
     let plan = ctx
@@ -534,6 +536,13 @@ async fn drive(route: Route, publish: Publish) -> Outcome {
         blocks_skipped: metric(&scan, "blocks_skipped_by_threshold"),
         segments_skipped: metric(&scan, "segments_skipped_by_threshold"),
         route: RouteMetrics::of(&scan),
+        opened: {
+            let phases = accounting.snapshot();
+            QueryPhase::ALL
+                .into_iter()
+                .map(|p| (p.name(), phases.phase(p).segments_opened))
+                .collect()
+        },
         read_before_publish,
         read_after_publish: published_at.map(|at| store.keys_read_from(at)),
         read: store.keys_read_from(0),
@@ -552,6 +561,21 @@ async fn drive(route: Route, publish: Publish) -> Outcome {
         store.gets.lock().unwrap(),
     );
     outcome
+}
+
+/// The `segmentsOpened` split a run of `route` that decodes `opened` footers
+/// reports: the plan decodes all three on the planned route, a segment the
+/// threshold then skips included, and the other routes decode at the scan,
+/// so a segment skipped before its open counts in no phase there.
+fn opened_by_phase(route: Route, opened: u64) -> BTreeMap<&'static str, u64> {
+    let (phase, n) = match route {
+        Route::Planned => (QueryPhase::Plan, 3),
+        _ => (QueryPhase::Scan, opened),
+    };
+    QueryPhase::ALL
+        .into_iter()
+        .map(|p| (p.name(), if p == phase { n } else { 0 }))
+        .collect()
 }
 
 fn ts_offsets(batch: &datafusion::arrow::record_batch::RecordBatch) -> Vec<i64> {
@@ -610,6 +634,11 @@ async fn threshold_published_before_the_second_segment_skips_exactly_its_late_bl
         );
         assert_eq!(run.blocks_skipped, 2, "{route:?}: B's 200 and 201 blocks");
         assert_eq!(run.segments_skipped, 1, "{route:?}: C skipped whole");
+        assert_eq!(
+            run.opened,
+            opened_by_phase(route, 2),
+            "{route:?}: C counts under plan where the plan pass decoded its footer, in no phase otherwise"
+        );
         // The plan phase counts every planned segment's blocks, C's included;
         // the other routes count the blocks of the segments they open.
         let total = if route == Route::Planned { 10 } else { 8 };
@@ -659,6 +688,7 @@ async fn threshold_never_published_during_the_scan_skips_nothing() {
         assert_eq!(run.route, RouteMetrics::expected(route, 3), "{route:?}");
         assert_eq!(run.blocks_skipped, 0, "{route:?}");
         assert_eq!(run.segments_skipped, 0, "{route:?}");
+        assert_eq!(run.opened, opened_by_phase(route, 3), "{route:?}");
         assert_eq!(run.blocks_total, 10, "{route:?}");
         assert_eq!(run.blocks_scanned, 10, "{route:?}");
         assert_eq!(run.emitted, all_offsets(&[KEY_A, KEY_B, KEY_C]));

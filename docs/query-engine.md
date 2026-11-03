@@ -3436,7 +3436,18 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `s3ListBytes`, `s3HeadRequests`/`s3HeadBytes`), plus `cacheHits`/
   `cacheMisses`/`cacheBytes`, `lateServedBytes`, `decompressedBytes`,
   `segmentsOpened`, `seriesMatched`, `bytesReused`, `peakIntermediateBytes`, and the
-  pre-existing per-run `rawF64Pages`/`rawF64Bytes`. No `segmentsPruned`
+  pre-existing per-run `rawF64Pages`/`rawF64Bytes`. `segmentsOpened` is the
+  number of data objects whose footer this query decoded, counted once per
+  object per selector fetch: an object pruned before its footer was opened
+  does not count, and one object read by several ranged GETs still counts
+  once. The engine does not dedupe across selectors, so an expression with
+  N log selectors that all read one object counts that object N times
+  (`two_log_selectors_on_api_v1_query_count_each_footer_once_per_selector`
+  in `crates/ravel-query/tests/log_series_engine.rs`). The metrics lane
+  fetches once per distinct matcher set (`distinct_plans_by_matcher`) and
+  each such fetch opens its objects through the RSEG fetcher, so selectors
+  with identical matchers share one count and selectors with different
+  matchers count an object once each. No `segmentsPruned`
   here: `stats.segmentsPruned` (below) is the sole source. For the metrics
   lane it is `Catalog::resolve`'s own postings-pruning count. For the log
   lane it comes from the lane itself: a segment that any plan fetched (it
@@ -3459,7 +3470,72 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `s3GetRequests`, `s3GetWireBytes`, `s3ListRequests`, `cacheHits`,
   `cacheMisses`, `cacheServedBytes`, `lateServedBytes`,
   `decompressedOutputBytes`, `reusedRegionBytes`, `segmentsOpened`,
-  `seriesMatched`.
+  `seriesMatched`. `segmentsOpened` here is the same per-object open count as
+  `stats.accounting.segmentsOpened`, split by one rule: an object counts
+  once, under the phase its footer read is charged to, and a later phase
+  that reuses the open footer does not count it again. On `/api/v1/query`
+  "once" means once per selector fetch, as above; on the SQL and trace
+  surfaces it means once per statement, whether the footer bytes came from
+  a store GET or from the read cache. A prefetched open that the statement
+  never consumes (the scan ended or was cancelled first) does not count,
+  since the count is taken when the scan consumes the open: a prefetch
+  revoked and reopened counts once, and an unconsumed one contributed no
+  rows. A fast-path verdict read dropped mid-flight is likewise left to
+  the scan's own open, which counts it. The counting paths,
+  with the split each reports in the fixtures of
+  `services/ravel-server/tests/stats_segments_opened.rs` unless named
+  otherwise:
+
+  - SQL `logs`: `plan` for a segment the plan pass read (planned, or probed
+    for its KEY_IDX), `scan` for one the scan opens on the fast path or
+    unplanned. An equality over three small objects reads `scan` 3
+    (`small_object_equality_opens_every_object_under_scan`), and through a
+    read cache, which stripes blocks and so plans every segment, `plan` 3 on
+    the cold run and again on the warm run with 0 GETs in every data phase
+    (`warm_logs_statement_opens_the_same_objects_with_zero_data_gets`); a
+    KEY_IDX equality over three large objects reads `plan` 3 over 4 GETs,
+    the scan's ranged read of a surviving object counting no second open
+    (`key_indexed_equality_opens_every_object_under_plan_not_scan`); three
+    objects probed for their KEY_IDX and then scanned whole read `plan` 3
+    and `scan` 0 (`probe_only_keyed_scan_opens_every_object_once_under_plan`).
+    The whole-segment fast path's serve-if-fits verdict reads its footers
+    under `plan`, and the scan that then opens those objects does not count
+    them again (`crates/ravel-sql/tests/logs_decoded_cache.rs`,
+    `a_fitting_contains_scan_on_the_whole_segment_fast_path_is_served`). A GET that
+    fails counts nothing (`a_failed_open_records_no_segment_open` in
+    `crates/ravel-sql/src/logs_scan/scan.rs`). A segment the TopK threshold
+    skips counts under `plan` when the plan pass already decoded its footer
+    and in no phase otherwise: over three segments with the third skipped,
+    the planned route reads `plan` 3 and `scan` 0, and the fast and
+    unplanned routes read `scan` 2; with no threshold published, the planned
+    route reads `plan` 3 and the others `scan` 3
+    (`crates/ravel-sql/tests/topk_threshold_skip_order.rs`).
+  - SQL `logs` and `spans` across a distributed query: a remote slice
+    folds only its wire bytes into the coordinator's accounting, so the
+    coordinator reports 0 `segmentsOpened` for the objects remote workers
+    opened. This is a known gap, not a count of zero opens.
+  - SQL `audit` and `alerts`: `scan`, through the fetcher's
+    `fetch_accounted_with_tenant`; three objects read `scan` 3 on either
+    table (`audit_table_statement_opens_every_object_under_scan`,
+    `alerts_table_statement_opens_every_object_under_scan`).
+  - PromQL over logs: `plan`, where `fetch_stream_dir` decodes the footer
+    to read STREAM_DIR, an object that STREAM_DIR then prunes included; the
+    scan of a surviving object reuses that open. Two objects, one pruned,
+    read `plan` 2 and `scan` 0
+    (`crates/ravel-query/tests/log_series_engine.rs`,
+    `log_selector_on_api_v1_query_counts_each_footer_once_under_plan`).
+  - spans: `probe` for a `trace_id` lookup, whose tail probe decodes the
+    footer, and `scan` for a whole-object read without one. A trace lookup
+    over three objects reads `probe` 3 through SQL and through
+    `GET /api/traces/{id}`
+    (`trace_lookup_by_sql_opens_every_object_under_probe_not_scan`,
+    `trace_lookup_by_get_api_traces_opens_every_object_under_probe_not_scan`),
+    and the warm second run reads `probe` 3 again with 0 GETs in every data
+    phase
+    (`adr_3692_row_4_warm_trace_lookup_opens_the_same_objects_with_zero_data_gets`).
+
+  A window outside every object reads 0 in every phase
+  (`a_window_outside_every_object_opens_nothing`).
 
   Additive to `stats.accounting`, which is unchanged: every per-phase
   counter sums back to its pooled counterpart there. Each byte field

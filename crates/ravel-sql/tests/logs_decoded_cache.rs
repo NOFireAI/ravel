@@ -838,14 +838,19 @@ fn requests(phase: &ravel_types::accounting::QueryAccountingSnapshot) -> u64 {
 /// cache the scan runs as many partitions as segments, so the fast path takes
 /// it. The fast path opens both objects whole in the scan phase (2 scan-phase
 /// GETs, where the planned route reuses its plan read and issues none).
-/// Returns the decoded-cache counters and the plan phase's GETs, which on the
-/// fast path are the verdict's directory reads.
+/// Returns the decoded-cache counters, the plan phase's GETs, which on the
+/// fast path are the verdict's directory reads, and `segmentsOpened` as
+/// `(plan, scan)`.
 async fn fast_path_run(
     cached: &SqlExecutor,
     t: &TenantId,
     expected: &str,
     run: usize,
-) -> (ravel_logseg::decoded_cache::DecodedCacheSnapshot, u64) {
+) -> (
+    ravel_logseg::decoded_cache::DecodedCacheSnapshot,
+    u64,
+    (u64, u64),
+) {
     let outcome = cached
         .execute(t.hash(), &request(CONTAINS_SQL))
         .await
@@ -865,7 +870,11 @@ async fn fast_path_run(
         .decoded_cache
         .expect("decodedCache stats with a cache")
         .counters;
-    (counters, gets(&outcome.phase_accounting.plan))
+    let opened = (
+        outcome.phase_accounting.plan.segments_opened,
+        outcome.phase_accounting.scan.segments_opened,
+    );
+    (counters, gets(&outcome.phase_accounting.plan), opened)
 }
 
 /// ADR-3326, serve-if-fits amendment, implementation note: a fitting
@@ -879,6 +888,13 @@ async fn fast_path_run(
 /// Seen failing against the previous round's fast path, which made no
 /// verdict: the counts assertion reads `(0, 24, 24)` on run 0 where
 /// `(0, 32, 32)` is expected, since `c` is never looked up.
+///
+/// `segmentsOpened` (issue #3745): the cold run's verdict decodes every
+/// object's footer under plan, so each counts there and the scan's open of it
+/// counts none, `(OBJECTS, 0)`. The hot run's verdict reads only the memo, so
+/// the scan's opens count, `(0, OBJECTS)`. Seen failing with the verdict's
+/// count removed, `(0, 2)` on run 0, and with the scan not told the verdict
+/// had counted, `(2, 2)`.
 #[tokio::test]
 async fn a_fitting_contains_scan_on_the_whole_segment_fast_path_is_served() {
     let t = tenant();
@@ -903,7 +919,12 @@ async fn a_fitting_contains_scan_on_the_whole_segment_fast_path_is_served() {
     ));
     let cached = executor(&store, Some(Arc::clone(&cache)));
     for run in 0..2 {
-        let (s, plan_gets) = fast_path_run(&cached, &t, &expected, run).await;
+        let (s, plan_gets, opened) = fast_path_run(&cached, &t, &expected, run).await;
+        assert_eq!(
+            opened,
+            if run == 0 { (OBJECTS, 0) } else { (0, OBJECTS) },
+            "run {run}: segmentsOpened as (plan, scan)"
+        );
         let (hits, misses, admissions) = if run == 0 { (0, 32, 32) } else { (32, 0, 0) };
         assert_eq!(
             (s.hits, s.misses, s.admissions),
@@ -933,6 +954,10 @@ async fn a_fitting_contains_scan_on_the_whole_segment_fast_path_is_served() {
 /// `(0, 24, 24)` cold and `(24, 0, 0)` hot, the cache ending with 24 entries
 /// and no `c`. Against a fast path with no verdict the counts are the same
 /// and the estimate assertion fails (`None` where the estimate is expected).
+///
+/// `segmentsOpened` (issue #3745): each object counts once across plan and
+/// scan on every run, under plan for an object whose footer the verdict
+/// decoded and under scan otherwise.
 #[tokio::test]
 async fn an_over_cap_contains_scan_on_the_whole_segment_fast_path_is_not_served() {
     let t = tenant();
@@ -957,7 +982,14 @@ async fn an_over_cap_contains_scan_on_the_whole_segment_fast_path_is_not_served(
     ));
     let cached = executor(&store, Some(Arc::clone(&cache)));
     for run in 0..2 {
-        let (s, plan_gets) = fast_path_run(&cached, &t, &expected, run).await;
+        let (s, plan_gets, (plan_opened, scan_opened)) =
+            fast_path_run(&cached, &t, &expected, run).await;
+        assert_eq!(
+            plan_opened + scan_opened,
+            OBJECTS,
+            "run {run}: each object counts once across plan and scan"
+        );
+        assert_eq!(plan_opened, plan_gets, "run {run}: one count per read");
         let (hits, misses, admissions) = if run == 0 { (0, 24, 24) } else { (24, 0, 0) };
         assert_eq!(
             (s.hits, s.misses, s.admissions),
