@@ -2920,4 +2920,403 @@ mod with_mcp {
         client.cancel().await.expect("client stops");
         running.shutdown().await.expect("server stops");
     }
+
+    /// `values` as samples 10 s apart, the first at 10 s.
+    fn every_ten_seconds(values: &[f64]) -> Vec<(i64, f64)> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| ((index as i64 + 1) * 10 * NS_PER_SEC, value))
+            .collect()
+    }
+
+    /// `n` values at `before` up to index `change_at` and at `after` from
+    /// it, each with a deterministic xorshift noise of at most 0.3, so every
+    /// segment has a variance for the detector's cost to read.
+    fn step_values(n: usize, before: f64, after: f64, change_at: usize) -> Vec<f64> {
+        let mut state: u64 = 0x1234_5678_9abc_def1;
+        (0..n)
+            .map(|index| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let unit = (state >> 11) as f64 / (1u64 << 53) as f64;
+                let level = if index < change_at { before } else { after };
+                level + (unit * 2.0 - 1.0) * 0.3
+            })
+            .collect()
+    }
+
+    /// One `ravel_analyze_timeseries` call over `[start_s, end_s)`.
+    async fn analyze(
+        client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        query: &str,
+        (start_s, end_s): (i64, i64),
+        step: &str,
+        op: &str,
+    ) -> (Option<bool>, serde_json::Value) {
+        call(
+            client,
+            "ravel_analyze_timeseries",
+            serde_json::json!({
+                "query": query,
+                "time_range": {
+                    "start_ns": (start_s * NS_PER_SEC).to_string(),
+                    "end_ns": (end_s * NS_PER_SEC).to_string(),
+                },
+                "step": step,
+                "op": op,
+            }),
+        )
+        .await
+    }
+
+    /// Each row of an analysis envelope as an object keyed by its columns.
+    fn analysis_rows(
+        envelope: &serde_json::Value,
+    ) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        let names: Vec<String> = envelope["data"]["columns"]
+            .as_array()
+            .expect("columns")
+            .iter()
+            .map(|column| column["name"].as_str().expect("a column name").to_string())
+            .collect();
+        envelope["data"]["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| {
+                names
+                    .iter()
+                    .cloned()
+                    .zip(row.as_array().expect("a row").iter().cloned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `change_point` through `POST /mcp` over a series of metric `m` that
+    /// steps from 5 to 25 at its 31st sample (310 s), sampled every 10 s and
+    /// read at a 10 s step, so step k reads sample k: the change lands at
+    /// 310 s, as a `step_change`, over all 60 points. The result is a
+    /// heuristic, not exact, and names its method and minimum.
+    ///
+    /// FLIP: leaving `ravel_analyze_timeseries` off `SERVED_TOOLS` makes the
+    /// call a protocol error.
+    /// FLIP: an adapter writing the change's timestamp in milliseconds
+    /// answers "310000", not "310000000000".
+    /// FLIP: an envelope left at its default `exact: true` fails `accuracy`.
+    #[tokio::test]
+    async fn analyze_timeseries_places_a_change_point_where_it_was_built() {
+        let (store, metrics) = instrumented_memory();
+        let samples = every_ten_seconds(&step_values(60, 5.0, 25.0, 30));
+        publish_series(store.as_ref(), 0, 1, &[(Some("step"), &samples)]).await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let (is_error, envelope) =
+            analyze(&client, r#"m{k="step"}"#, (10, 610), "10s", "change_point").await;
+        assert_eq!(is_error, Some(false), "{envelope}");
+        assert_eq!(envelope["status"], serde_json::json!("ok"), "{envelope}");
+        let rows = analysis_rows(&envelope);
+        assert_eq!(rows.len(), 1, "{envelope}");
+        let row = &rows[0];
+        assert_eq!(
+            row["series"],
+            serde_json::json!({"__name__": "m", "k": "step"})
+        );
+        assert_eq!(row["kind"], serde_json::json!("step_change"));
+        assert_eq!(row["ts_ns"], serde_json::json!("310000000000"));
+        assert!(row["score"].as_f64().expect("a finite score") > 0.0);
+        assert_eq!(row["points"], serde_json::json!("60"));
+        assert_eq!(row["nan_excluded"], serde_json::json!("0"));
+        assert_eq!(row["downsampled"], serde_json::json!(false));
+        assert_eq!(row["min_points"], serde_json::json!("22"));
+        assert_eq!(row["too_few_points"], serde_json::json!(false));
+
+        assert_eq!(envelope["accuracy"]["exact"], serde_json::json!(false));
+        let approximation = envelope["accuracy"]["approximation"]
+            .as_str()
+            .expect("an approximation");
+        assert!(
+            approximation.starts_with("heuristic: change_point"),
+            "{approximation}"
+        );
+        assert!(
+            approximation.contains("needs 22 non-NaN points"),
+            "{approximation}"
+        );
+        assert!(
+            approximation.ends_with("0 of 1 series downsampled"),
+            "{approximation}"
+        );
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// `summary` through `POST /mcp` over the values 1, 2, 3, 4 at 10, 20,
+    /// 30 and 40 s, read at a 10 s step: median 2.5, MAD 1, population
+    /// variance 1.25 and stddev its square root, all exact to the bit. A
+    /// second series holding -0.0 alone keeps the sign of its median. And
+    /// `POST /api/v1/analytics` over the same series and steps, on the same
+    /// server, answers the same figures, with one `analytics` audit record
+    /// per call: both reach `QueryService::analytics`.
+    ///
+    /// FLIP: an adapter computing the sample variance (divide by n - 1)
+    /// answers 1.666..., not 1.25.
+    /// FLIP: writing a figure with `serde_json::json!(f64)` instead of the
+    /// cell's serializer turns -0.0 into 0.0's spelling or a NaN into null.
+    /// FLIP: an adapter evaluating the range itself rather than through the
+    /// service writes no audit record for the tool's call.
+    #[tokio::test]
+    async fn analyze_timeseries_summary_is_exact_and_matches_the_http_route() {
+        let (store, metrics) = instrumented_memory();
+        let quad = every_ten_seconds(&[1.0, 2.0, 3.0, 4.0]);
+        let negative_zero = [(10 * NS_PER_SEC, -0.0)];
+        publish_series(
+            store.as_ref(),
+            0,
+            1,
+            &[(Some("quad"), &quad), (Some("zero"), &negative_zero)],
+        )
+        .await;
+        let mut config = server_config(mcp_on());
+        config.audit_pipeline = Some(ravel_maintain::AuditPipelineConfig {
+            audit_mode: ravel_maintain::AuditMode::Required,
+            ..Default::default()
+        });
+        let running = start_with(config, store.clone(), metrics).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let (is_error, envelope) =
+            analyze(&client, r#"m{k="quad"}"#, (10, 50), "10s", "summary").await;
+        assert_eq!(is_error, Some(false), "{envelope}");
+        assert_eq!(envelope["status"], serde_json::json!("ok"), "{envelope}");
+        let rows = analysis_rows(&envelope);
+        assert_eq!(rows.len(), 1, "{envelope}");
+        let row = &rows[0];
+        let figure = |name: &str| row[name].as_f64().expect("a finite figure").to_bits();
+        assert_eq!(figure("median"), 2.5f64.to_bits());
+        assert_eq!(figure("mad"), 1.0f64.to_bits());
+        assert_eq!(figure("variance"), 1.25f64.to_bits());
+        assert_eq!(figure("stddev"), 1.25f64.sqrt().to_bits());
+        assert_eq!(row["points"], serde_json::json!("4"));
+        assert_eq!(row["downsampled"], serde_json::json!(false));
+        assert_eq!(row["min_points"], serde_json::json!("1"));
+        assert_eq!(row["too_few_points"], serde_json::json!(false));
+        assert_eq!(envelope["accuracy"]["exact"], serde_json::json!(false));
+        let approximation = envelope["accuracy"]["approximation"]
+            .as_str()
+            .expect("an approximation");
+        assert!(
+            approximation.contains("summary never downsamples"),
+            "{approximation}"
+        );
+
+        let (is_error, zero) = analyze(&client, r#"m{k="zero"}"#, (10, 20), "10s", "summary").await;
+        assert_eq!(is_error, Some(false), "{zero}");
+        assert_eq!(
+            zero["data"]["rows"][0][1].to_string(),
+            "-0.0",
+            "the median keeps the sign of zero: {zero}"
+        );
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/api/v1/analytics", running.http_addr))
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/json")
+            .body(
+                serde_json::json!({
+                    "query": r#"m{k="quad"}"#,
+                    "start": 10.0,
+                    "end": 40.0,
+                    "step": 10.0,
+                    "op": {"type": "summary", "percentiles": []},
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("the request reaches the server");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.expect("a JSON body");
+        let http = &body["data"]["result"][0]["result"];
+        for name in ["median", "mad", "variance", "stddev"] {
+            assert_eq!(
+                http[name].as_f64().map(f64::to_bits),
+                Some(figure(name)),
+                "{name}: {body}"
+            );
+        }
+
+        let analytics_records = query_audit_records(store.as_ref())
+            .await
+            .iter()
+            .filter(|row| audit_attr(row, "query.language") == Some("analytics"))
+            .count();
+        assert_eq!(analytics_records, 3);
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// A series read at 21 steps is below `change_point`'s minimum of 22: it
+    /// comes back as a row of an `ok` result with `too_few_points: true`,
+    /// `min_points: 22`, `points: 21`, an `indeterminable` kind and null
+    /// location and score. The same series read at 22 steps is analyzed.
+    ///
+    /// FLIP: refusing the call when a series is short makes the first call
+    /// an error envelope.
+    /// FLIP: a minimum of 21, or `<=` in the too-few test, flips one of the
+    /// two `too_few_points` assertions.
+    #[tokio::test]
+    async fn analyze_timeseries_reports_too_few_points_per_row() {
+        let (store, metrics) = instrumented_memory();
+        let samples = every_ten_seconds(&step_values(22, 5.0, 25.0, 11));
+        publish_samples(store.as_ref(), 0, 1, &samples).await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let (is_error, short) = analyze(&client, "m", (10, 220), "10s", "change_point").await;
+        assert_eq!(is_error, Some(false), "{short}");
+        assert_eq!(short["status"], serde_json::json!("ok"), "{short}");
+        let rows = analysis_rows(&short);
+        assert_eq!(rows.len(), 1, "{short}");
+        let row = &rows[0];
+        assert_eq!(row["too_few_points"], serde_json::json!(true));
+        assert_eq!(row["min_points"], serde_json::json!("22"));
+        assert_eq!(row["points"], serde_json::json!("21"));
+        assert_eq!(row["kind"], serde_json::json!("indeterminable"));
+        assert_eq!(row["ts_ns"], serde_json::Value::Null);
+        assert_eq!(row["score"], serde_json::Value::Null);
+
+        let (is_error, enough) = analyze(&client, "m", (10, 230), "10s", "change_point").await;
+        assert_eq!(is_error, Some(false), "{enough}");
+        let rows = analysis_rows(&enough);
+        assert_eq!(rows[0]["too_few_points"], serde_json::json!(false));
+        assert_eq!(rows[0]["points"], serde_json::json!("22"));
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// A series read at 2,500 steps is over `change_point`'s 2,000-point cap:
+    /// it is bucket-averaged and its row says `downsampled: true`, as does
+    /// the approximation's count. `summary` over the same range reads all
+    /// 2,500 points and says `downsampled: false`, because it never
+    /// downsamples.
+    ///
+    /// FLIP: an adapter that does not set `downsample` refuses the
+    /// change-point call as too long.
+    /// FLIP: a summary row copying the change-point flag says `true`.
+    #[tokio::test]
+    async fn analyze_timeseries_reports_downsampling_and_summary_never_does() {
+        let (store, metrics) = instrumented_memory();
+        let samples = every_ten_seconds(&step_values(26, 5.0, 25.0, 13));
+        publish_samples(store.as_ref(), 0, 1, &samples).await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let (is_error, changed) = analyze(&client, "m", (10, 260), "100ms", "change_point").await;
+        assert_eq!(is_error, Some(false), "{changed}");
+        let rows = analysis_rows(&changed);
+        assert_eq!(rows.len(), 1, "{changed}");
+        assert_eq!(rows[0]["points"], serde_json::json!("2500"));
+        assert_eq!(rows[0]["downsampled"], serde_json::json!(true));
+        let approximation = changed["accuracy"]["approximation"]
+            .as_str()
+            .expect("an approximation");
+        assert!(
+            approximation.ends_with("1 of 1 series downsampled"),
+            "{approximation}"
+        );
+
+        let (is_error, summarized) = analyze(&client, "m", (10, 260), "100ms", "summary").await;
+        assert_eq!(is_error, Some(false), "{summarized}");
+        let rows = analysis_rows(&summarized);
+        assert_eq!(rows[0]["points"], serde_json::json!("2500"));
+        assert_eq!(rows[0]["downsampled"], serde_json::json!(false));
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// Through `POST /mcp`, a bare-number step, a sub-millisecond start, a
+    /// range of 11,001 steps and an unknown op are each `invalid_argument`
+    /// from `ravel_analyze_timeseries` with no store request, and the three
+    /// range cases get the same message from `ravel_query_promql`.
+    ///
+    /// FLIP: a range check left to the engine reads the store before it
+    /// refuses, and the store counter moves.
+    #[tokio::test]
+    async fn analyze_timeseries_refuses_bad_ranges_before_the_store() {
+        let (store, metrics) = instrumented_memory();
+        let running = start_server(store, Arc::clone(&metrics), mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let range = |start_ns: i64, end_ns: i64| serde_json::json!({"start_ns": start_ns.to_string(), "end_ns": end_ns.to_string()});
+        let cases = [
+            (range(0, 60 * NS_PER_SEC), "30"),
+            (range(1, 60 * NS_PER_SEC), "30s"),
+            (range(0, 11_001 * NS_PER_SEC), "1s"),
+        ];
+        let before = total_store_calls(&metrics);
+        for (time_range, step) in cases {
+            let (is_error, analyzed) = call(
+                &client,
+                "ravel_analyze_timeseries",
+                serde_json::json!({
+                    "query": "m", "time_range": time_range, "step": step, "op": "summary",
+                }),
+            )
+            .await;
+            assert_eq!(is_error, Some(true), "{analyzed}");
+            assert_eq!(
+                analyzed["failure"]["class"],
+                serde_json::json!("invalid_argument"),
+                "{analyzed}"
+            );
+            let (_, evaluated) = call(
+                &client,
+                "ravel_query_promql",
+                serde_json::json!({"query": "m", "time_range": time_range, "step": step}),
+            )
+            .await;
+            assert_eq!(analyzed["failure"], evaluated["failure"], "{step}");
+        }
+        let (is_error, unknown) = call(
+            &client,
+            "ravel_analyze_timeseries",
+            serde_json::json!({
+                "query": "m", "time_range": range(0, 60 * NS_PER_SEC), "step": "30s",
+                "op": "forecast",
+            }),
+        )
+        .await;
+        assert_eq!(is_error, Some(true), "{unknown}");
+        assert_eq!(
+            unknown["failure"]["class"],
+            serde_json::json!("invalid_argument")
+        );
+        assert_eq!(total_store_calls(&metrics), before);
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
 }

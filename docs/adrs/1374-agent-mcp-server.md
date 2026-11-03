@@ -1039,9 +1039,11 @@ Shipping the explain changed its catalog description to name SQL only, and
 with all fifteen. Since the committed row count amendment below it was
 15,652 bytes with the nine tools and 23,541 bytes with all fifteen. Since
 the query-sql amendment below it was 15,733 bytes with the nine tools and
-23,622 bytes with all fifteen, and since the query-promql amendment below
-it is 15,972 bytes with the nine tools and 23,861 bytes with all fifteen,
-against the 24,576-byte budget; both
+23,622 bytes with all fifteen. Since the query-promql amendment below it
+was 15,972 bytes with the nine tools and 23,861 bytes with all fifteen, and
+since the analyze-timeseries amendment below it is 16,297 bytes with the
+nine tools and 24,186 bytes with all fifteen, against the 24,576-byte
+budget; both
 figures are pinned in
 `crates/ravel-mcp/src/catalog.rs` and
 `services/ravel-server/tests/mcp_agents_e2e.rs`.
@@ -1328,3 +1330,60 @@ written, and records here the choices they leave open.
     `cells_truncated` counts the cut series and `rows_omitted` every series
     dropped, the result is `ok_bounded`, and a next step says to widen
     `step`, narrow `time_range` or narrow the query.
+
+## Amendment (2026-11-03, #3721): the analyze-timeseries amendment, `ravel_analyze_timeseries` ships, one row per series, refusing partial coverage
+
+<!-- amendment-applies: sections="Amendment (2026-11-02): a Parquet explain names its unbounded figures and does not refuse" pointer="analyze-timeseries amendment" -->
+
+`ravel_analyze_timeseries` is served
+(`crates/ravel-mcp/src/tools/analyze_timeseries.rs`), the eighth tool body.
+It keeps D2's row and D4's precision rule, and records here the choices
+they leave open and the places it departs from the row.
+
+1. The range arguments are `ravel_query_promql`'s, checked by the same
+   function (`crates/ravel-mcp/src/tools/promql_range.rs::eval_range`),
+   before any backend call: whole milliseconds, a step with a unit, the
+   end after the start, at most 11,000 steps, the half-open range sent to
+   the engine with a closed end one millisecond earlier. Both tools answer
+   the same message for the same bad range, and a unit test asserts it
+   with a backend that panics if called. An `op` other than
+   `change_point` or `summary` is `invalid_argument`.
+2. The call crosses the port as one typed `AnalyticsCall` (query, start,
+   closed end and step in milliseconds, op, min tokens, deadline, partial
+   consent), which the server's adapter maps field for field to the
+   service's `AnalyticsRequest` and sends through
+   `QueryService::analytics`, the method `POST /api/v1/analytics` calls.
+   Admission, the deadline clamp, the usage record, the audit event and
+   the partial-coverage gate are the service's.
+3. The result is one row per series: the label set, the op's figures, and
+   `points`, `nan_excluded`, `downsampled`, `min_points` and
+   `too_few_points`. `change_point` needs 22 non-NaN points and
+   bucket-averages a series over 2,000 points to 2,000 (the adapter always
+   asks for downsampling, where the HTTP route makes it opt-in); `summary`
+   needs one and never downsamples. A series under its minimum is a row
+   with `too_few_points: true` and null figures, not a failed call. Both
+   ops are reported as heuristics: `accuracy.exact` is `false` and
+   `accuracy.approximation` names the method, the minimum, and how many
+   series were downsampled. `summary`'s figures are exact over the step
+   values, but the step values are a lookback sample of the stored
+   samples, which is why it is labelled a heuristic too.
+4. Partial coverage is refused as `unavailable`. D2's row gives the tool no
+   consent argument, and the rows carry no per-series coverage, so an
+   analysis over a subset of the series would read as complete. The
+   tool sends no consent, rewrites the service's refusal so it does not
+   name the HTTP parameter, and adds next steps to retry or to read the
+   partial series through `ravel_query_promql` with
+   `allow_partial_coverage: true`. An envelope that reports partial
+   coverage anyway is refused the same way.
+5. Departing from the row's inputs: `max_rows` is accepted (default 200,
+   ceiling 5,000, counting series, `ok_bounded` with no cursor past it, as
+   on `ravel_query_promql`), and `max_bytes_scanned`, `max_segments` and
+   `max_store_requests` are refused as `unsupported`, because
+   `QueryService::analytics` takes no per-request scan budget. A query
+   matching more than 1,000 series is `budget_exceeded`, the HTTP route's
+   own series cap. `evidence_ref` stays in the input schema and is refused
+   as `unsupported`, so the row's `evidence` block is not emitted.
+6. Serving the tool moves the served count from seven to eight and the
+   catalogued count from two to one. The input descriptions move
+   `tools/list` from 15,972 to 16,297 bytes with the nine tools and from
+   23,861 to 24,186 bytes with all fifteen, under the 24,576-byte budget.
