@@ -453,11 +453,21 @@ fn values_memo_charge_covers_the_measured_memo_and_no_more() {
             m.stats.bytes_allocated, m.stats.allocations, m.per_window,
         );
 
-        let (want_len, want_nulls) = match case {
-            Case::PlainText => (ROWS, 0),
-            Case::DictText => (ENTRIES, 0),
-            Case::DictMixed => (ENTRIES, 1),
+        // The figures `VALUES_MEMO_BYTES`'s doc comment and docs/query-engine.md
+        // state: a layout change that moves any of them fails here.
+        let (want_len, want_nulls, want_live) = match case {
+            Case::PlainText => (ROWS, 0, 392),
+            Case::DictText => (ENTRIES, 0, 392),
+            Case::DictMixed => (ENTRIES, 1, 520),
         };
+        assert_eq!(
+            live, want_live,
+            "{case:?}: the memo's live bytes, as the docs state them"
+        );
+        assert_eq!(
+            m.stats.bytes_deallocated, 0,
+            "{case:?}: every byte the fill allocates stays live"
+        );
         assert_eq!(m.array_len, want_len, "{case:?}: array length");
         assert_eq!(
             m.array_nulls, want_nulls,
