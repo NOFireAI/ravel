@@ -22,7 +22,8 @@ Subcommands:
                             into truth.json (sub.<name>, answers <name>.*)
   inspect-stamp             one state's inspect stamps for one tenant and
                             signal: catalog, data object header, leaf,
-                            typed-attr-column show
+                            typed-attr-column show, and with --ranges-keys
+                            every data object's event range
   needle-blocks             storage blocks holding a needle, from rlog
                             inspect's field directory
   stamp                     write or append one stamp document
@@ -418,6 +419,28 @@ def parse_object_inspect(lines):
     return doc
 
 
+# The header fields rspan and rlog inspect print for an object's event range.
+RANGE_FIELDS = {"spans": ("min_start_ts_ns", "max_end_ts_ns"), "logs": ("min_ts_ns", "max_ts_ns")}
+
+
+def object_ranges(base, keys_path, tenant_hash, signal):
+    """Every data object (.rseg) of one tenant and signal in a census keys
+    file, with its size and the event range its header gives; a field the
+    header does not carry is null."""
+    prefix = f"t/{tenant_hash}/{'l' if signal == 'logs' else 's'}/"
+    lo, hi = RANGE_FIELDS[signal]
+    out = []
+    with open(keys_path) as f:
+        keys = sorted((line.rstrip("\n").split("\t", 1) for line in f if "\t" in line), key=lambda p: p[1])
+    for size, key in keys:
+        if not (key.startswith(prefix) and key.endswith(".rseg")):
+            continue
+        tool = "rlog" if signal == "logs" else "rspan"
+        obj = parse_object_inspect(run_cli(base + [tool, "inspect", key], stop_at="records ("))
+        out.append({"key": key, "bytes": as_int(size), "min_ns": obj.get(lo), "max_ns": obj.get(hi)})
+    return out
+
+
 def cmd_inspect_stamp(args):
     """The per-state inspect stamps of one tenant and signal: catalog inspect,
     rspan/rlog inspect of the census's largest data object, inspect kidx of
@@ -444,6 +467,9 @@ def cmd_inspect_stamp(args):
                                            "objects": data["objects"], **obj})
     else:
         write_json(stem + ".object.json", {**meta, "key": None, "reason": "no data object in the census"})
+    if args.ranges_keys:
+        write_json(stem + ".ranges.json", {**meta, "objects": object_ranges(base, args.ranges_keys, tc["hash"],
+                                                                            store_signal)})
     leaf = next((lf for p in catalog["parts"] for lf in p["leaves"]), None)
     if leaf:
         kidx = {}
@@ -1059,6 +1085,7 @@ def main():
     ins.add_argument("--label", required=True)
     ins.add_argument("--state", required=True)
     ins.add_argument("--out-dir", required=True)
+    ins.add_argument("--ranges-keys", help="census keys file: also write STATE.LABEL.ranges.json")
     ins.set_defaults(fn=cmd_inspect_stamp)
 
     nb = sub.add_parser("needle-blocks")

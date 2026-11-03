@@ -373,9 +373,13 @@ not print is `missing`, never 0.
 Some bands, as transcribed:
 
 - Row 3: probe wire per object at most 8,192 B, miss over 16,384 B. The
-  denominator is the distinct objects probed: the per-object breakdown's
-  entry count when the build reports one, else the candidate objects the
-  window resolved (`stats.pruning.segments`), never the probe GET count.
+  denominator comes from the stamps, never from the call: the unfolded
+  spans data objects whose event range overlaps the call's window, read
+  from `stamps/unfolded.spans.ranges.json` (written by `inv.py
+  inspect-stamp --ranges-keys`, one `{key, bytes, min_ns, max_ns}` per
+  object). A call that reports a `perObject` breakdown must list exactly
+  that many entries, or the figure is `missing`; an absent ranges stamp is
+  `missing` too.
 - Row 6: keyIndex GETs at most 2 x the census's hits objects and at least
   one per hits object above 512 KiB (the census's `objects_over_512k`): the
   logs keyed plan probes every object past that size (#3117).
@@ -521,8 +525,10 @@ The only incomplete line is
 `figure row_13.negative_controls_failing_on_mutant not run: mutant controls
 not implemented`.
 
-- Row 3: 131,072 probe wire bytes over 2 probe GETs, 65,536 B per object,
-  the old 64 KiB read (#3118, fixed by T4, not on main).
+- Row 3: the call moved 131,072 probe wire bytes in 2 probe GETs, the old
+  64 KiB read (#3118, fixed by T4, not on main). The smoke predates the
+  ranges stamp, so the figure reads `missing`: no per-object event ranges
+  to count the window's candidate objects.
 - Row 7: the fold_advance rebuild issued 12 section GETs on each signal,
   2 x the 6 entries of the whole tail, against targets of 2 x 2 new + 1
   previous leaf = 5 (spans) and 2 x 2 + 2 = 6 (logs). Main rebuilds the leaf

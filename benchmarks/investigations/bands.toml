@@ -203,10 +203,11 @@ metric = "cold.max.per_object.absent_object_gets"
 lane = "counter"
 target_if = "v <= 3"
 
-# Probe wire over distinct probed objects: the per-object breakdown's entry
-# count when the build reports one, else the candidate objects the window
-# resolved (stats.pruning.segments). The GET count is not the denominator: an
-# object probed in two GETs would halve the figure. It does not split absent
+# Probe wire over the candidate objects: the unfolded spans data objects whose
+# event range (stamps/unfolded.spans.ranges.json) overlaps the call's window,
+# counted from the stamps, never from the call. A perObject breakdown must list
+# that many entries. The GET count is not the denominator: an object probed in
+# two GETs would halve the figure. It does not split absent
 # objects from holders (that needs the per-object breakdown); a holder's
 # probe is the same footer read.
 [[row.figure]]

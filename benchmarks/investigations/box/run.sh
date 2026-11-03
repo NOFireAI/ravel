@@ -640,7 +640,7 @@ rebuild_leaves() {
 # for every $TRIPLES entry, the state's inspect stamps; then the binaries and
 # server flags the state's calls run against.
 census() {
-  local state="$1" f="$WORK/census-$1.json" keys="$WORK/keys-$1.tsv" triple tenant sig label
+  local state="$1" f="$WORK/census-$1.json" keys="$WORK/keys-$1.tsv" triple tenant sig label ranges
   local tenants=(--tenants "$STAMPS/tenants.json" --keys-out "$keys")
   if [ "$LANE" = local ]; then
     run "$PY" "$LIB" s3 census "${tenants[@]}" --out "$f" || fail "census $state"
@@ -654,8 +654,16 @@ census() {
   for triple in $TRIPLES; do
     IFS=: read -r tenant sig label <<<"$triple"
     printf 'STAMP stamps/%s.%s.{catalog,object,kidx}.json stamps/%s.%s.tenant.txt\n' "$state" "$label" "$state" "$label"
+    # Row 3 divides probe wire by the unfolded window's candidate objects,
+    # counted from every data object's event range.
+    ranges=()
+    if [ "$state" = unfolded ]; then
+      ranges=(--ranges-keys "$keys")
+      printf 'STAMP stamps/%s.%s.ranges.json\n' "$state" "$label"
+    fi
     run "$PY" "$LIB" inspect-stamp --cli-bin "$BIN" --census "$f" --tenant "$tenant" --signal "$sig" \
-      --label "$label" --state "$state" --out-dir "$STAMPS" || fail "inspect stamps $state/$label"
+      --label "$label" --state "$state" --out-dir "$STAMPS" ${ranges[@]+"${ranges[@]}"} \
+      || fail "inspect stamps $state/$label"
   done
   stamp "$state.server.json" state="$state" sha="${SHA:-$(git -C "$INV_DIR" rev-parse HEAD 2>/dev/null)}" \
     ravel_cli_sha256="$(sha256 "$BIN")" ravel_server_sha256="$(sha256 "$SERVER_BIN")" \

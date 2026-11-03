@@ -520,6 +520,45 @@ class Statements(unittest.TestCase):
             for run in runs:
                 self.assertIn(prefix + s["truth_key"].replace("{run}", str(run)), self.truth["answers"], s["id"])
 
+    def test_object_ranges_reads_every_data_object(self):
+        # Item 3: the ranges stamp lists every .rseg of the tenant and signal,
+        # not commit records, provenance or the other signal's objects.
+        tenant = "a" * 32
+        keys = os.path.join(self._tmp.name, "keys.tsv")
+        with open(keys, "w") as f:
+            for size, key in ((10, f"t/{tenant}/s/l0/0000/b.rseg"), (20, f"t/{tenant}/s/l0/0001/a.rseg"),
+                              (5, f"t/{tenant}/s/c/0000/x.commit"), (3, f"t/{tenant}/s/prov"),
+                              (7, f"t/{tenant}/l/l0/0000/c.rseg"), (9, f"t/{'b' * 32}/s/l0/0000/d.rseg")):
+                f.write(f"{size}\t{key}\n")
+        seen = []
+
+        def run_cli(argv, stop_at=None):
+            seen.append(argv[-1])
+            lo = 100 if argv[-1].endswith("a.rseg") else 200
+            return [f"min_start_ts_ns: {lo}", f"max_end_ts_ns: {lo + 50}"] + (
+                [] if argv[-1].endswith("a.rseg") else ["min_trace_id: 00"])
+
+        old, self.inv.run_cli = self.inv.run_cli, run_cli
+        try:
+            got = self.inv.object_ranges(["ravel-cli"], keys, tenant, "spans")
+        finally:
+            self.inv.run_cli = old
+        self.assertEqual(got, [
+            {"key": f"t/{tenant}/s/l0/0000/b.rseg", "bytes": 10, "min_ns": 200, "max_ns": 250},
+            {"key": f"t/{tenant}/s/l0/0001/a.rseg", "bytes": 20, "min_ns": 100, "max_ns": 150},
+        ])
+        self.assertEqual(seen, [f"t/{tenant}/s/l0/0000/b.rseg", f"t/{tenant}/s/l0/0001/a.rseg"])
+
+    def test_evaluator_window_matches_the_plan(self):
+        # Item 3: the evaluator's window for a candidate count is the one
+        # inv.py's plan sent.
+        ev = load_module(EVALUATE, "evaluate_window")
+        st = next(s for s in self.st if s["id"] == "spans_lookup_1h")
+        for run in range(len(self.truth["saved_traces"])):
+            start_s, end_s = self.inv.window_bounds(st, self.truth, run, 0)
+            start, end = ev.call_window_ns(st, self.truth, {"try": run})
+            self.assertEqual((round(start / 1e9, 6), round(end / 1e9, 6)), (round(start_s, 6), round(end_s, 6)))
+
     def test_every_placeholder_fills(self):
         for s in self.st:
             t, _ = self.inv.sub_truth(self.truth, s.get("truth_sub"))
@@ -1225,12 +1264,28 @@ class Evaluate(Workdir):
         self.assertIn("miss row_14.objects_opened_1", res["problems"])
         self.assertNotIn("dead_counter segmentsOpened journey_c_1 folded_leaves", res["problems"])
 
+    def write_ranges(self, inside=4, outside=2):
+        """stamps/unfolded.spans.ranges.json: inside objects overlapping every saved-trace window the cold
+        tries read, outside objects two hours before them."""
+        with open(os.path.join(self.run_dir, "truth.json")) as f:
+            saved = json.load(f)["saved_traces"]
+        starts = [saved[c["try"] % len(saved)]["start_ns"] for c in self.select("spans_lookup_1h", "unfolded")]
+        lo, hi = min(starts), max(starts)
+        objects = [{"key": f"in{i}.rseg", "bytes": 1, "min_ns": lo - 60 * 10**9, "max_ns": hi + 60 * 10**9}
+                   for i in range(inside)]
+        objects += [{"key": f"out{i}.rseg", "bytes": 1, "min_ns": lo - 3 * HOUR_NS, "max_ns": lo - 2 * HOUR_NS}
+                    for i in range(outside)]
+        with open(self.stamp_path("unfolded.spans.ranges.json"), "w") as f:
+            json.dump({"state": "unfolded", "label": "spans", "objects": objects}, f)
+
     def check_probe_per_object(self, evaluate_py=EVALUATE):
-        """Row 3's probe band is per distinct probed object (pruning.segments
-        without a per-object breakdown), not per GET and not the call's total."""
+        """Row 3's probe band is per candidate object: the unfolded objects whose event range overlaps the
+        call's window, from the ranges stamp; not per GET, not the call's own pruning.segments, not every
+        object in the state."""
+        self.write_ranges(inside=4, outside=2)
         for c in self.select("spans_lookup_1h", "unfolded"):
             c["stats"].pop("perObject", None)
-            c["stats"]["pruning"]["segments"] = 4
+            c["stats"]["pruning"]["segments"] = 9
             for p in c["stats"]["phases"]:
                 if p["phase"] == "probe":
                     p["s3GetRequests"], p["s3GetWireBytes"] = 8, 16388
@@ -1238,6 +1293,21 @@ class Evaluate(Workdir):
         _, res, _ = self.go(BANDS, evaluate_py)
         f = figure(res, "row_03.probe_wire_per_object")
         return [] if (f["value"], f["verdict"]) == (4097.0, "pass") else [f"{f['value']} {f['verdict']}"]
+
+    def check_probe_per_object_cross_check(self, evaluate_py=EVALUATE):
+        """A per-object breakdown whose entry count differs from the stamp's candidate count is a problem."""
+        self.write_ranges(inside=4, outside=2)
+        for c in self.select("spans_lookup_1h", "unfolded"):
+            c["stats"]["perObject"] = [{"probeGets": 1}] * 3
+        self.save_calls()
+        _, res, _ = self.go(BANDS, evaluate_py)
+        f = figure(res, "row_03.probe_wire_per_object")
+        want = ("missing row_03.probe_wire_per_object: spans_lookup_1h/unfolded/cold try 0 perObject has 3 "
+                "entries, the ranges stamp 4 candidate objects")
+        return [] if want in res["problems"] else [f"{f['status']} {f['reason']}"]
+
+    def test_probe_per_object_cross_check(self):
+        self.assertEqual(self.check_probe_per_object_cross_check(), [])
 
     def test_probe_per_object(self):
         self.assertEqual(self.check_probe_per_object(), [])
@@ -1828,10 +1898,25 @@ FLIPS = {
         "    if False:",
         "check_dead_counter",
     ),
-    "probe wire divided per GET": (
-        '            probed = len(per_object) if isinstance(per_object, list) else m["segments"]',
-        '            probed = len(per_object) if isinstance(per_object, list) else m["probe_gets"]',
+    "probe wire divided by the call's own segment count": (
+        '            probed, why = candidates(c) if candidates else (None, "no ranges stamp reader")',
+        '            probed, why = m["segments"], None',
         "check_probe_per_object",
+    ),
+    "probe wire divided per GET": (
+        '            probed, why = candidates(c) if candidates else (None, "no ranges stamp reader")',
+        '            probed, why = m["probe_gets"], None',
+        "check_probe_per_object",
+    ),
+    "every object in the state taken as a candidate": (
+        '    return sum(1 for o in objects if o["min_ns"] < end and o["max_ns"] >= start), None',
+        '    return len(objects), None',
+        "check_probe_per_object",
+    ),
+    "a per-object breakdown not cross-checked against the stamp": (
+        '            if isinstance(per_object, list) and len(per_object) != probed:',
+        '            if False:',
+        "check_probe_per_object_cross_check",
     ),
     "miss reason dropped": (
         '        if miss and f.get("miss_reason"):',

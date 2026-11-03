@@ -83,6 +83,9 @@ FOLD_FIELDS = {
 
 PRICE_KEYS = ("get_per_1000", "put_per_1000", "storage_gb_month", "instance_per_hour")
 NEEDLE_RARE = "needlerare"
+# inv.py window_bounds' windows.
+HOUR_NS = 3_600_000_000_000
+NARROW_NS = 300_000_000_000
 
 
 class Problems:
@@ -567,8 +570,10 @@ def control_1001(calls, cfg, statement, state, temp):
     return "value", 1, ""
 
 
-def statement_figure(calls, cfg, statement, state, metric):
-    """(status, value, reason) of one statement figure.
+def statement_figure(calls, cfg, statement, state, metric, candidates=None):
+    """(status, value, reason) of one statement figure. candidates(c) is
+    (count, None) or (None, reason): the objects the state's ranges stamp
+    says overlap call c's window.
 
     metric is "<temp>.<agg>.<name>", "<temp>.rows_exact",
     "<temp>.rows_match_state.<other>", "<temp>.wall_p50_s" or
@@ -624,13 +629,18 @@ def statement_figure(calls, cfg, statement, state, metric):
             if why:
                 return UNSUPPORTED, None, why
         elif name == "probe_wire_per_object":
-            # Distinct probed objects: the per-object breakdown when the build
-            # reports one, else the candidate objects the window resolved
-            # (pruning.segments), never the GET count.
+            # Candidate objects: the state's data objects whose event range
+            # overlaps the call's window, from the ranges stamp, never a
+            # figure the call reports about itself.
+            probed, why = candidates(c) if candidates else (None, "no ranges stamp reader")
+            if why:
+                return "missing", None, why
             per_object = c["stats"].get("perObject")
-            probed = len(per_object) if isinstance(per_object, list) else m["segments"]
+            if isinstance(per_object, list) and len(per_object) != probed:
+                return "missing", None, (f"{where(c)} perObject has {len(per_object)} entries, the ranges stamp "
+                                         f"{probed} candidate objects")
             if probed == 0:
-                return "missing", None, f"no probed object in {where(c)} to divide the probe wire by"
+                return "missing", None, f"no candidate object for {where(c)} to divide the probe wire by"
             v = rnd(m["probe_wire_bytes"] / probed)
         elif name in m:
             v = m[name]
@@ -677,6 +687,38 @@ class Stamps:
             except (OSError, ValueError):
                 self.cache[name] = None
         return self.cache[name]
+
+
+def call_window_ns(st, truth, c):
+    """(start_ns, end_ns) of a trace-anchored windowed call, as inv.py
+    window_bounds computes it for the tenant's own corpus: the saved trace
+    try c["try"] reads, plus or minus half the window."""
+    half = {"1h": HOUR_NS // 2, "narrow": NARROW_NS // 2}.get(st.get("window"))
+    saved = (truth or {}).get("saved_traces") or []
+    if half is None or st.get("anchor", "trace") != "trace" or not saved or not isinstance(c.get("try"), int):
+        return None
+    centre = saved[c["try"] % len(saved)].get("start_ns")
+    return (centre - half, centre + half) if isinstance(centre, int) else None
+
+
+def window_candidates(stamps, statements, truth, c):
+    """(count, None) of the data objects stamps/STATE.LABEL.ranges.json says
+    overlap call c's window, or (None, reason)."""
+    st = statements.get(c.get("statement")) or {}
+    label = st.get("table", "spans")
+    name = f"stamps/{c.get('state')}.{label}.ranges.json"
+    doc = stamps.doc(c.get("state"), label, "ranges")
+    if doc is None:
+        return None, f"{name} absent: no per-object event ranges to count the window's candidate objects"
+    window = call_window_ns(st, truth, c) if not str(c.get("state")).startswith("many_parts_") else None
+    if window is None:
+        return None, f"no trace-anchored window for {where(c)} in truth.json"
+    objects = doc.get("objects")
+    if not isinstance(objects, list) or not objects or any(
+            not isinstance(o.get("min_ns"), int) or not isinstance(o.get("max_ns"), int) for o in objects):
+        return None, f"{name} carries no min_ns and max_ns for every object"
+    start, end = window
+    return sum(1 for o in objects if o["min_ns"] < end and o["max_ns"] >= start), None
 
 
 def required_stamps(run_dir, cfg, live, problems):
@@ -1053,7 +1095,7 @@ def truth_figure(truth, metric):
     return "value", v, ""
 
 
-def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, truth):
+def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, truth, candidates=None):
     figures = []
     by_id = {}
     for row in bands["row"]:
@@ -1086,7 +1128,8 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
             elif metric.startswith(("scale.", "control.")):
                 status, value, why = "missing", None, f"{metric} needs a run this harness lane does not perform"
             else:
-                status, value, why = statement_figure(calls, cfg, fig["statement"], fig["state"], metric)
+                status, value, why = statement_figure(calls, cfg, fig["statement"], fig["state"], metric,
+                                                      candidates)
             entry.update(status=status, value=value, reason=why)
             figures.append(entry)
             by_id[fid] = entry
@@ -1464,7 +1507,8 @@ def main(argv):
             len(be) if cfg["cost"].get("lookups_per_part_month") is None
             or not cfg["cost"].get("lookups_per_part_month_source") else 0),
     }
-    figures = run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, truth)
+    figures = run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, truth,
+                       lambda c: window_candidates(stamps, statements, truth, c))
     for f in figures:
         if f["verdict"] == "dead_counter":
             problems.add("dead_counter", f"segmentsOpened {f['statement']} {f['state']}")
