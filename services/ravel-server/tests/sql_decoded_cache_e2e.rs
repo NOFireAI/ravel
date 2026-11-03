@@ -67,6 +67,15 @@ async fn start(
     store: Arc<dyn ObjectStoreBackend>,
     decoded_cache_max_bytes: u64,
 ) -> ravel_server::Running {
+    start_with(store, decoded_cache_max_bytes, decoded_cache_max_bytes > 0).await
+}
+
+/// [`start`] with the read cache chosen apart from the flag.
+async fn start_with(
+    store: Arc<dyn ObjectStoreBackend>,
+    decoded_cache_max_bytes: u64,
+    read_cache: bool,
+) -> ravel_server::Running {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
     ravel_server::start(
@@ -74,7 +83,7 @@ async fn start(
         store.clone(),
         store,
         Arc::new(ravel_object_store::StoreMetrics::default()),
-        (decoded_cache_max_bytes > 0).then(|| {
+        read_cache.then(|| {
             let bytes = 64 * 1024 * 1024;
             ravel_query::ReadCache::Ram(Arc::new(ravel_cache::Cache::new(
                 ravel_cache::CacheLimits::new(bytes, 16_384, bytes),
@@ -149,6 +158,17 @@ async fn run(
     base_ts_ns: i64,
     statement: &str,
 ) -> (String, Value) {
+    run_counting(client, base, base_ts_ns, statement, ROWS).await
+}
+
+/// [`run`] over a store holding `rows` rows.
+async fn run_counting(
+    client: &reqwest::Client,
+    base: &str,
+    base_ts_ns: i64,
+    statement: &str,
+    rows: usize,
+) -> (String, Value) {
     let start = (base_ts_ns - NS_PER_HOUR) as f64 / 1e9;
     let end = (base_ts_ns + NS_PER_HOUR) as f64 / 1e9;
     let response = client
@@ -163,7 +183,7 @@ async fn run(
     let body = response.text().await.expect("sql response body");
     let value: Value = serde_json::from_str(&body).expect("sql response is JSON");
     assert_eq!(status, 200, "{value}");
-    assert_eq!(value["data"]["rows"][0][0], ROWS as u64, "{value}");
+    assert_eq!(value["data"]["rows"][0][0], rows as u64, "{value}");
     (body, value["stats"].clone())
 }
 
@@ -294,6 +314,56 @@ async fn decoded_cache_stats_appear_once_when_enabled_and_never_at_zero() {
         assert_eq!(hot["misses"].as_u64(), Some(0), "{hot}");
         assert!(hot["residentBytes"].as_u64().unwrap() > 0, "{hot}");
     }
+}
+
+/// A cap one segment's decoded set already passes 0.95 of.
+const TINY_DECODED_CACHE: u64 = 4096;
+
+/// ADR-3326, serve-if-fits amendment, implementation note, on the HTTP stats
+/// surface: two ingested objects, a server with no read cache, so the `LIKE`
+/// statement takes the whole-segment fast path, and a cap the first segment's
+/// estimate passes 0.95 of. The verdict stops after that segment, so
+/// `stats.decodedCache` carries `deferredSetEstimatePartial: true`, an
+/// estimate over 0.95 of the cap, and `deferredServed` false.
+#[tokio::test]
+async fn an_over_cap_fast_path_statement_reports_a_partial_estimate() {
+    let memory = Arc::new(MemoryStore::new());
+    let config = TenantConfig {
+        typed_attr_columns: Some(vec![DeclaredTypedColumn {
+            key: URL.to_string(),
+            ty: DeclaredColumnType::Str,
+        }]),
+        ..TenantConfig::new(TenantLifecycleState::Active)
+    };
+    ravel_catalog::set_tenant_config(memory.as_ref(), &tenant_hash(), &config, now_ns())
+        .await
+        .expect("tenant config");
+    let store: Arc<dyn ObjectStoreBackend> = memory;
+    let client = reqwest::Client::new();
+    let base_ts_ns = now_ns();
+
+    let server = start_with(store, TINY_DECODED_CACHE, false).await;
+    let base = format!("http://{}", server.http_addr);
+    ingest(&client, &base, base_ts_ns).await;
+    ingest(&client, &base, base_ts_ns + ROWS as i64).await;
+    let (body, stats) = run_counting(&client, &base, base_ts_ns, LIKE_STATEMENT, 2 * ROWS).await;
+    server.shutdown().await.expect("server shuts down");
+
+    assert_eq!(body.matches("\"decodedCache\"").count(), 1, "{body}");
+    let decoded = stats["decodedCache"]
+        .as_object()
+        .unwrap_or_else(|| panic!("stats.decodedCache: {stats}"));
+    assert_eq!(decoded.len(), FIELDS.len() + 2, "{stats}");
+    assert_eq!(
+        decoded["deferredSetEstimatePartial"],
+        Value::Bool(true),
+        "{stats}"
+    );
+    assert_eq!(decoded["deferredServed"], Value::Bool(false), "{stats}");
+    let estimate = decoded["deferredSetEstimateBytes"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("deferredSetEstimateBytes: {stats}"));
+    assert!(estimate * 20 > TINY_DECODED_CACHE * 19, "{stats}");
 }
 
 const METRIC_FAMILIES: [&str; 11] = [
