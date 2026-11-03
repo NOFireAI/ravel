@@ -94,8 +94,8 @@ them, and evaluate and the upload still happen. Either makes the verdict
 #### Runtime estimate
 
 From the smoke's own figures (`fixtures/local-smoke/`): a cold-call restart
-(server stop, start, `/readyz`, warmup) took 0.841 s on average over its 199
-restarts, and a call 0.039 s on average over its 221 timed calls. The s3
+(server stop, start, `/readyz`, warmup) took 1.181 s on average over its 221
+restarts, and a call 0.034 s on average over its 244 timed calls. The s3
 lane's default states plan, at 20 cold runs and 1 warm run per statement
 that is not `cold_only` (statement counts from `statements.toml`):
 
@@ -111,17 +111,25 @@ that is not `cold_only` (statement counts from `statements.toml`):
 | many_parts_744 | 2 | 40 | 2 |
 | many_parts_2160 | 2 | 40 | 2 |
 
-That is 2,299 calls and 2,201 restarts: 2,201 x 0.841 s = 1,851 s, plus
-2,299 x 0.039 s = 90 s, so 1,941 s, about 32 minutes of calls. The fixed
+That is 2,299 calls and 2,201 restarts: 2,201 x 1.181 s = 2,599 s, plus
+2,299 x 0.034 s = 78 s, so 2,677 s, about 45 minutes of calls. The fixed
 waits add at most 60 minutes for mixed (the next ingest hour) and at most 60
-for compaction_in_flight (310 s into an hour; in the smoke they took 54 and
-4 minutes). Corpus generation, the loads and the folds at 20,000,000 traces
-are not in this estimate: the smoke's figures for them (0.07 s per load, at
-most 0.21 s per fold) are fixed-cost dominated and do not scale. The
-estimate is about 152 minutes before those, against the 540-minute
-deadline. A call on S3 at the ADR's corpus is slower than a call on
-loopback at 1,000 traces; at ten times the smoke's restart and call time
-the calls alone take 323 minutes. If a run reaches the deadline, drop these
+for compaction_in_flight (310 s into an hour; in the smoke they took 48 and
+3 minutes). The estimate is about 165 minutes, against the 540-minute
+deadline, and it covers calls and waits only. It omits corpus generation,
+every load (the `hits` tenant's included) and every fold at 20,000,000
+traces: the smoke's figures for them (0.30 to 1.03 s per load, at most
+0.27 s per fold) are fixed-cost dominated and do not scale, and neither
+ADR-3692 nor ADR-2707's T12 amendment records a duration for any of them
+(T12 records GETs, bytes and lookup times). The nearest recorded figures
+are ADR-2707's Stage 0, on 200 M spans: a load of 110 s with 1 M-row
+batches and 597 s at the old default, and a fold of 2,411 s after
+compacting that default's 80,000 objects, a geometry the default load no
+longer produces
+(`docs/adrs/2707-exact-key-index-for-spans-and-logs.md:39-41`). A call on
+S3 at the ADR's corpus is slower than a call on loopback at 20,000 traces;
+at ten times the smoke's restart and call time the calls alone take 446
+minutes. If a run reaches the deadline, drop these
 states from `run.toml` first, in this order: `many_parts_2160` (2,160
 strided ingest hours loaded and folded one part per hour), `many_parts_744`,
 then `erasure_in_flight`; rows 10, 9 and 13's erasure figure then report
@@ -195,8 +203,8 @@ and row 6 reads 2 x the census's hits objects.
   `truth_key_in` in statements.toml). The pass after the
   erasure is applied is not run: nothing in this flow applies a pending
   request. A corpus with no victim row (every row read by some other
-  statement, as at 1,000 traces) records the state `not-run` with that
-  reason.
+  statement) records the state `not-run` with that reason; the smoke's
+  20,000 traces have one.
 - `many_parts_N` (744 and 2,160 on the s3 lane, 24 in the smoke): a fresh
   spans tenant `mpN` loaded with `--ingest-hour-stride 1` and an
   `--ingest-hour-start` that puts the last hour below the current one, one
@@ -240,8 +248,9 @@ page-cache drop, not an empty query cache, and some cold calls are served
 partly from that cache: in the smoke the logs journeys read about every
 logs byte from it and issue no scan GET. Every cold call whose
 `cacheServedBytes` is above 0 is flagged `warm_served` in the results and
-counted per statement and state in the summary (118 of the smoke's 199 cold
-calls). The flag is a reported figure, not a problem. Each restart stamp
+counted per statement and state in the summary: in the smoke, 126 of the 196
+cold calls that returned an answer (of 220 cold calls; the other 24 are the
+refused 1,000-key lists, which carry no stats). The flag is a reported figure, not a problem. Each restart stamp
 records what the warmup loaded.
 
 ## run.toml
@@ -475,19 +484,21 @@ tier within 20 % of its target (issue #3699's spec, not the ADR, allows the
 20 %). `truth.json` records the exact counts every answer is judged
 against.
 
-The store's own blocks are not 256 rows. `stamps/needle_blocks.json`
-records both counts: in the smoke the generator planted needles in 6 of its
-256-row blocks (common 3, sparse 2, rare 1), while `rlog inspect` over all
-4 logs objects reports 4 blocks for 5,000 records, one per object, with the
-needle tag present in 3 of them. At that scale a store block holds about
-1,250 rows, so several planted blocks share one.
+`stamps/needle_blocks.json` records both counts. In the smoke the generator
+planted needles in 5 of its 8,192-row blocks over 100,000 log rows (common
+3, sparse 2, rare 1; one block holds two tiers), and `rlog inspect` over all 4 logs objects reports 14
+blocks for 100,000 records, with the needle tag present in 4 of them and the
+rare needle in exactly 1, as truth predicts. The suite pins those figures.
 
 ## fixtures/local-smoke
 
-A local-lane run of `box/run.local-smoke.toml` on an x86_64 machine (8
-cores, 16 GB): 1,000 traces over 2 hours plus a 500-trace tail hour, 2 cold
-runs, hits = false, over unfolded, folded_no_leaves, folded_leaves, mixed,
-compaction_in_flight and many_parts_24, against a loopback RustFS. Imported
+A local-lane run of `box/run.local-smoke.toml` on an aarch64 machine (4
+cores, 8 GB, `CARGO_BUILD_JOBS=2`): 20,000 traces over 2 hours plus a
+10,000-trace tail hour, 2 cold runs, hits = false, over unfolded,
+folded_no_leaves, folded_leaves, mixed, compaction_in_flight,
+erasure_in_flight and many_parts_24, against a loopback RustFS. Its 100,000
+log rows fill 14 store blocks. It took 57 minutes, 48 of them the mixed
+state's wait for the next ingest hour. Imported
 with `investigations_cases.py --import-local-smoke DIR`. Its `calls.jsonl`,
 `truth.json`, `results.local.json` and every stamp are gzipped, which keeps
 the fixture under 300 KB; `summary.local.txt` and `run.toml` are plain.
@@ -496,6 +507,7 @@ Its verdict is `fail`. The problem list, pinned by the suite:
 
 ```
 miss row_01.wire_bytes
+miss row_02.wire_bytes
 miss row_03.probe_wire_per_object
 miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
 miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
@@ -505,6 +517,10 @@ dead_counter segmentsOpened journey_c_1 folded_leaves
 dead_counter segmentsOpened journey_c_10240 folded_leaves
 ```
 
+The only incomplete line is
+`figure row_13.negative_controls_failing_on_mutant not run: mutant controls
+not implemented`.
+
 - Row 3: 131,072 probe wire bytes over 2 probe GETs, 65,536 B per object,
   the old 64 KiB read (#3118, fixed by T4, not on main).
 - Row 7: the fold_advance rebuild issued 12 section GETs on each signal,
@@ -512,10 +528,18 @@ dead_counter segmentsOpened journey_c_10240 folded_leaves
   previous leaf = 5 (spans) and 2 x 2 + 2 = 6 (logs). Main rebuilds the leaf
   from scratch on an advancing fold, which T6 of the epic changes; this is
   not a scale effect.
-- Row 8: the logs `request_id` leaf is 25.2 % of the logs data bytes (one
-  key per row) and the logs trace id leaf 5.5 %, against 2.5 %; the spans
-  trace id leaf is 4.6 %, inside 6 %.
-- Row 1: 319,459 wire bytes for the no-range lookup, the run's real figure.
+- Row 8: the logs `request_id` leaf is 27.5 % of the logs data bytes (one
+  key per row) and the logs trace id leaf 5.9 %, against 2.5 %; the spans
+  trace id leaf is 4.3 %, inside 6 %.
+- Rows 1 and 2: 464,913 wire bytes for the no-range lookup and 333,841 for
+  the 1 h lookup, against 300 KB; the run's real figures.
+- Rows 11 and 13: the 1,000-key IN lists are refused by the complexity
+  guard (1,001 units), so their figures and the 1,001-key controls read
+  `unsupported-on-this-build` with the server's text. Every inflight try of
+  compaction_in_flight's four statements overlapped its own signal's
+  compaction (the two signals compact concurrently, 1.36 s and 2.15 s), and
+  under the pending erasure the victim's lookup returned no row on
+  both cold tries while `erase status` read PENDING.
 - `dead_counter`: segmentsOpened is 0 on every SQL call while scan GETs move
   bytes; journey C's objects-opened figures (row 14) report it.
 
