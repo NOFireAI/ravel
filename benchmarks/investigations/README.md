@@ -1,164 +1,269 @@
 # Selective investigations
 
-Issue #3699, ADR-3692 decision 8 (T1). An in-tree measurement harness for
-"selective" read paths: a point lookup by trace id or request id, an
-IN-list, a sparse tag/body needle, a narrow-join, against a corpus that
-mimics 20M-trace-scale spans+logs data, across the key-index state matrix
-(unfolded, folded without leaves, folded with leaves, mixed, many-parts).
-Every figure it reports is checked against a pre-registered band in
-`bands.toml`, which encodes the 17 rows of ADR-3692's Acceptance table.
+Issue #3699, ADR-3692 decision 8 (T1 of epic #3692). A measurement harness
+for the selective read paths of NOFire AI's telemetry store: a lookup by
+trace id or request id, an IN list, a rare, sparse or common needle, and the
+narrow joins of the investigation journeys. It runs them against a seeded
+spans and logs corpus in each state of the key-index matrix (unfolded,
+folded without leaves, folded with leaves, mixed, many parts), judges every
+answer against the generator's oracle, and judges every figure against
+`bands.toml`, which transcribes the 17 rows of ADR-3692's Acceptance table.
 
-This is not a `ravel-bench` report (see `docs/internal/bench-reports.md`
-for those): it is a standalone box flow, because it needs a real S3-backed
-`ravel-server` and `ravel-cli load`/`catalog fold` runs, not an in-process
-benchmark.
+This is not a `ravel-bench` report: it drives the real binaries, `ravel-cli
+load`, `ravel-cli catalog fold` and a restarted `ravel-server`, against an
+S3-compatible store, from an empty bucket to `results.<lane>.json`.
 
 ## Files
 
-- `gen_corpus.py` -- seeded corpus generator. Writes `spans.jsonl` /
-  `logs.jsonl` always, `spans.parquet` / `logs.parquet` when `pyarrow` is
-  importable (see "Parquet availability" below), mapping TOMLs for
-  `ravel-cli load`, and `truth.json` (the planted answers every statement
-  in `statements.toml` is checked against).
-- `statements.toml` -- the statement set: id, table, SQL (or the
-  trace-by-id GET), which states it runs in, its `truth.json` key, whether
-  it only runs cold, whether current `main` supports it, and which
-  Acceptance-table row(s) it feeds.
-- `bands.toml` -- the 17 Acceptance-table rows as named figures with
-  `target`/`miss` expressions, evaluated over a `value` variable.
-- `box/run.sh` -- the one-run box flow: bootstrap, store, corpus, declare
-  tenants, load, state matrix (stamp before/after every transition),
-  statement execution, upload, done/failed marker. `--dry-run` prints
-  every step without touching a store, a server, or AWS.
-- `box/launch.sh` / `box/fetch.sh` -- thin EC2 launch/poll wrappers for the
-  real-S3 lane, matching `benchmarks/clickbench/kit/launch.sh` /
-  `fetch.sh`'s `--dry-run` shape.
-- `evaluate.py` -- reads `calls.jsonl` + `truth.json` + the state-matrix
-  stamps + load/fold reports, computes every figure `bands.toml` names
-  exactly once, and writes `results.json` + `summary.txt`. Fails the run
-  (nonzero exit, `missing <figure>` / `duplicate <figure>` in `errors`) if
-  a figure is absent or reported more than once -- see "Class closure"
-  below.
-- `kit.test.sh` -- the harness's own test suite (gen_corpus correctness,
-  evaluate.py fixture-based correctness, `run.sh --dry-run` step ordering,
-  `statements.toml` validity). Runs in under two minutes with no AWS
-  access and no running server; wired into CI's `doc-scripts` job.
+- `gen_corpus.py`: seeded corpus generator. Writes `spans.jsonl` and
+  `logs.jsonl` (`--format jsonl`), `spans.parquet` and `logs.parquet`
+  (`--format parquet`, needs pyarrow), the two `ravel-cli load` mapping files,
+  and `truth.json`, the exact answer of every planted key. Its module
+  docstring states the time and determinism rules.
+- `statements.toml`: the statements, one `[[statement]]` each: tenant, table,
+  SQL or trace GET, the states it runs in, its `truth.json` key, whether it
+  runs cold only, and `unsupported_reason` when this build cannot run it.
+- `bands.toml`: ADR-3692 Acceptance rows 1 to 17, the ADR's cells verbatim,
+  each with the figures evaluate.py extracts and the `target_if` and
+  `miss_if` expressions it judges them with. Its header documents the fields.
+- `hits.truth.json`: the oracle of the two statements on the ClickBench hits
+  tenant (q20 and the control set).
+- `box/run.sh`: one run, from an empty store to `results.<lane>.json`.
+  `--dry-run` prints every step, command and stamp in order and runs nothing.
+- `box/launch.sh`, `box/fetch.sh`: start the s3 lane's EC2 instance, and
+  wait for and download its `out/`. Both take `--dry-run`.
+- `box/lib/inv.py`: run.sh's helpers (TOML reads, the call plan, one call,
+  stamps, the restart warmup wait).
+- `box/run.example.toml`: the s3 lane's run file, every key commented.
+  `box/run.local-smoke.toml` is the local lane's.
+- `evaluate.py`: reads a run directory and writes `results.<lane>.json` and
+  `summary.<lane>.txt`.
+- `investigations.test.sh`, `investigations_cases.py`: the harness's cases.
+- `fixtures/local-smoke/`: a committed local-lane run (see below).
 
-## Launching a run
+## Lanes
 
-### Local / RustFS lane
+Results are always `results.<lane>.json` and `summary.<lane>.txt`, so a local
+run never overwrites or reads as an s3 one.
 
-For iterating on the harness itself, not for a reportable figure (no real
-S3 request/latency behavior):
+### s3 lane (the only lane timing is judged on)
 
-```sh
-bash benchmarks/investigations/box/run.sh run.local.toml
-```
-
-### Real-S3 lane
+Fill in a copy of `box/run.example.toml` (`box.sha`, `box.bucket`,
+`box.store_bucket`), then:
 
 ```sh
-bash benchmarks/investigations/box/launch.sh run.s3.toml
-# box/run.sh runs on the launched instance (via its user-data), then:
-bash benchmarks/investigations/box/fetch.sh run.s3.toml ./out
+bash benchmarks/investigations/box/launch.sh run.toml     # prints the run id
+bash benchmarks/investigations/box/fetch.sh run.toml RUN_ID
 ```
 
-Both `launch.sh` and `run.sh` accept `--dry-run`, which prints every `aws`
-or `ravel-cli` command they would run (via the same `run()`/`capture()`
-wrapper shape as `benchmarks/clickbench/kit/launch.sh`) and performs no
-network or filesystem action beyond reading `run.toml`.
+`launch.sh` uploads this directory and `run.toml` to
+`s3://<bucket>/<prefix>/runs/<run-id>/in/`, checks the instance role's
+permissions, and starts one on-demand instance (default `c6a.4xlarge`; no
+spot) with `--instance-initiated-shutdown-behavior terminate`. Its user-data
+arms `shutdown -h +<box.max_minutes>` (default 600, at most 600) before
+anything else, writes `/root/inv/RUN_ID`, and runs `run.sh --lane s3`.
+`run.sh` checks out `box.sha` detached, builds `ravel-cli` and `ravel-server
+--features sql` in separate `cargo build --release --locked` runs with frame
+pointers on, installs pyarrow, runs the flow against `box.store_bucket`
+through the instance role, uploads `out/`, and terminates the instance, on
+success and failure alike: an error trap writes `out/FAILED` with the step
+that failed. The shutdown timer terminates the instance whatever run.sh is
+doing. `fetch.sh` polls for `out/DONE` or `out/FAILED` and gives up
+`box.max_minutes + 30` minutes after it starts.
 
-## run.toml keys
+At the ADR's 20,000,000 traces and 20 cold runs, each cold call costing a
+server restart, a run is not known to fit inside 600 minutes; the first
+s3 run should be pre-registered with that as an open question.
 
-| Key | Meaning | Default |
-|---|---|---|
-| `sha` | git sha to build `ravel-cli`/`ravel-server` at | required |
-| `lane` | `"local"` or `"s3"` | `"local"` |
-| `bucket`, `region`, `prefix`, `run_id` | s3 lane only | required for `lane = "s3"` |
-| `states` | comma-separated state-matrix entries to run | `"unfolded,folded_no_leaves,folded_leaves"` |
-| `control` | run the ClickBench `hits` control corpus too | `false` |
-| `tenant_spans`, `tenant_logs` | tenant names to load into | `"inv-spans"`, `"inv-logs"` |
-| `shards` | `ravel-cli load --shards` | `4` |
-| `corpus.traces`, `corpus.hours`, `corpus.logs_per_trace`, `corpus.seed`, `corpus.scale` | passed through to `gen_corpus.py` | see `gen_corpus.py --help` |
+### local lane (counters only)
 
-`many_parts` in `states` is accepted but always recorded as
-`unsupported-on-this-build`: it needs T2's `--ingest-hour-stride`, which is
-not on `main` yet.
+A loopback RustFS started by run.sh itself, and release binaries built
+beforehand:
 
-## Pre-registration
+```sh
+RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --locked -p ravel-cli
+RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --locked -p ravel-server --features sql
+bash benchmarks/investigations/box/run.sh --lane local \
+  --run-toml benchmarks/investigations/box/run.local-smoke.toml \
+  --out /tmp/inv-local --bin-dir target/release --rustfs /path/to/rustfs \
+  [--pylib DIR-with-pyarrow]
+```
 
-Before a reportable run (one whose figures will be cited on the epic or an
-Acceptance-table row), write the expected figures and the band that would
-count as a miss as a comment on issue #3699 first, per the repository's
-measurement-discipline rule (see the root `CLAUDE.md`, "Measurement and
-cost discipline"). `bands.toml` is the pre-registration for the
-Acceptance-table rows themselves; a run against a different corpus size or
-tenant shape needs its own pre-registration comment, since the bands
-assume the `corpus.*` defaults above.
+Build the two packages in separate commands: one `cargo build -p ravel-cli
+-p ravel-server --features ravel-server/sql` does not build ravel-server
+with its SQL surface. The local lane drops the page cache only when run as
+root; otherwise each restart stamp says `"cache_drop": "unavailable (not
+root)"`. It reports timing figures but never judges them.
+
+## The flow
+
+`run.sh` steps, in order: `bootstrap` (build stamp), `store` (`store qualify`; the
+local lane creates a fresh bucket in its own RustFS, the s3 lane refuses a
+`store_bucket` that holds any object), `host`, `corpus` (gen_corpus.py at
+`run.toml [corpus]`), `declare` (the tenant's typed attribute columns from
+the mappings, `request_id` as key index, `--index-trace-id true`),
+`load-base`, one step per state, `evaluate`, `finish` (`out/DONE` with the
+verdict). The states:
+
+- `unfolded`: the loads only.
+- `folded_no_leaves`: `catalog fold --writers-stopped` per signal.
+- `folded_leaves`: `catalog fold --key-index-leaves` per signal, then
+  `catalog fold --rebuild-key-index`. The leaves fold right after a plain
+  fold has nothing left to seal and writes no leaf; the rebuild writes them
+  (stamped as transition `leaf_rebuild`).
+- `mixed`: waits for the ingest hour after the last fold's (at most
+  `run.mixed_wait_max_minutes`), loads an extra hour of new traces, runs the
+  statements over folded and unfolded data together, then folds that hour
+  (`fold_advance`).
+- `many_parts`: unsupported on this build (see below).
+
+In each state, every statement planned for it runs `run.cold_runs` times
+cold, each call after a server stop, a page-cache drop and a server start
+that waits for `/readyz` and for the server's startup cache warmup to end,
+then `run.warm_runs` times warm, without a restart, unless the statement is
+`cold_only`. Every call runs with `RQ_STATS=1` and writes one line to
+`calls.jsonl`. The server runs `--mode query`: `--mode all` runs scheduled
+folds and compaction that would move the state under the measurement, so
+run.sh stops the server before every fold.
+
+The startup warmup loads recent parts into the cache before the first call,
+so a "cold" call means a fresh process after a page-cache drop, not an empty
+query cache. Each restart stamp records what the warmup loaded.
+
+## run.toml
+
+`box/run.example.toml` comments every key. In short: `[run]` (lane, states,
+`cold_runs`, `warm_runs`, `hits`, `scales`, `baseline`,
+`mixed_wait_max_minutes`), `[box]` (s3 lane only: `sha`, `repo_url`,
+`region`, `bucket`, `prefix`, `store_bucket`, `instance_profile`,
+`instance_type`, `volume_gb`, `max_minutes`), `[corpus]` (gen_corpus.py's
+`traces`, `hours`, `seed`, `spans_per_trace`, `logs_per_trace`),
+`[server]` (`tenant`, `shards`, `memory_budget_bytes`), `[hits]`,
+`[unsupported_states]` (state = reason), `[prices]` and `[cost]`.
+
+`[prices]` holds `get_per_1000`, `put_per_1000` (PUT and LIST),
+`storage_gb_month` and `instance_per_hour`, each beside a `<key>_source`
+naming where the number was read. A price without a number is `missing`; a
+price without a source makes `cost.figures_without_basis` non-zero, which
+misses row 17. `[cost]` holds `lookups_per_part_month`, the assumed query
+frequency, with its `_source`, and `amortise_months`.
 
 ## Stamps
 
-`box/run.sh` writes `out/stamps/<state>.before.json` and
-`out/stamps/<state>.after.json` around every state-matrix transition
-(wall-clock seconds since epoch, plus the state name), and the state
-transition itself writes its own report under `out/` (`load_spans.json`,
-`load_logs.json`, `fold_no_leaves.json`, `fold_leaves.json` -- produced by
-`ravel-cli load` / `ravel-cli catalog fold`, not by this harness).
-`evaluate.py` reads these to compute the fold-duration and leaf-overhead
-figures (Acceptance rows 9-10) and to confirm a load or fold happened
-before the state whose statements depend on it.
+What the run proves about its own state, under `out/stamps/`. evaluate.py
+reports `missing stamps/<name>` for any it needs and does not find.
 
-## Lane separation
+| Stamp | Proves |
+|---|---|
+| `build.json` | the commit and how the binaries were built, with their sha256 |
+| `store.json` | the store bucket was qualified and empty at the start |
+| `host.json` | the machine (arch, nproc, memory, disk), `RQ_STATS=1`, and whether the page cache can be dropped |
+| `corpus.json` | the generator's parameters and the sha256 of `truth.json` |
+| `declare.json` | the tenant's declared columns and key index, as `tenant show` printed them |
+| `loads.jsonl` | one line per load (hour, signal): exit code, ingest hour and the load report |
+| `folds.jsonl` | one line per fold (transition, signal): exit code, the `--json` report, wall time, CPU seconds and peak RSS |
+| `census.jsonl` | one line per state: object count and bytes per key class, listed from the store |
+| `transitions.jsonl` | one line per state entered: when, and in which ingest hour |
+| `restarts.jsonl` | one line per cold call: the server pid, the cache-drop result and the warmup |
 
-A result file is always named `results.<lane>.json` /
-`summary.<lane>.txt`, never a bare `results.json`, so a local-lane
-iteration run can never be mistaken for (or silently overwrite) a real-S3
-reportable run sitting in the same `out/` directory.
+## Evaluation
 
-## Unsupported statements
+```sh
+python3 benchmarks/investigations/evaluate.py --run OUT [--out-dir DIR]
+```
 
-`statements.toml` marks a statement `supported = false` when current
-`main` cannot run it; `run.sh` records
-`<id>/<state>: unsupported-on-this-build` and continues rather than
-failing or silently skipping it, and `evaluate.py` reports its figures
-with the string value `"unsupported-on-this-build"` (verdict
-`UNSUPPORTED` in `summary.txt`) instead of a number. As of this writing
-that is every `*_in_trace_id_*`, `*_in_request_id_*`, and
-`journey_b_logs_by_trace_ids` statement: `main` has no IN-list equality
-pushdown for `trace_id`/`request_id` yet.
+Each answer is judged against `truth.json` under the truth key
+`statements.toml` gives the call: a row count or row set that differs, or a
+call naming another key, is `wrong_answer`. Every figure `bands.toml` names
+goes through one list and is present exactly once: absent is `missing`, two
+inputs for it (calls or stamps) are `duplicate` and neither is used, a
+figure this build cannot produce is `unsupported-on-this-build` with the
+reason, and the figures of a row whose tenant, states, scales or baseline
+the run lacks are `not-run` with the reason. `timing` figures are judged on
+the s3 lane and only reported on the local one. Exit 0 only when nothing is
+missing, duplicated, wrong or missed; the output is a pure function of the
+run directory, so re-evaluating it is byte-identical.
 
-## Block-size assumption
+Metrics a band can name: `cold.max.<m>` and `cold.min.<m>` (over the cold
+tries; `<m>` from the call's stats phases and members, such as `total_gets`,
+`data_gets`, `wire_bytes`, `leaf_gets`), `warm.max.<m>`, `cold.rows_exact`
+(1 when every try's answer was correct), `cold.rows_match_state.<state>`,
+`cold.wall_p50_s`, `fold.<signal>.<field>` (from the fold report;
+`leaf_bytes_pct` is leaf bytes over the signal's own object bytes in the
+state's census, `new_entries` the difference from the previous fold),
+`matrix.*`, `cost.*`, `scale.*` and `control.*`.
 
-`gen_corpus.py` plants needles (request id, tag/body frequency tiers) at
-block granularity using its own `BLOCK_ROWS = 256` constant. This is the
-generator's own assumption, not read from `ravel-logseg`'s real writer
-block size, and is deliberately disjoint from production segment geometry;
-a needle's planted block count is exact by construction (the generator
-chooses disjoint block indices directly), so the 20% tolerance ADR-3692
-allows for needle-frequency figures is headroom, not something the
-generator relies on to hit its target.
+Cost: per (statement, state), the mean cold call's GETs, LISTs and server
+CPU seconds times the named prices; per fold, its report's requests and its
+measured CPU; per state, storage from the census. Break-even compares each
+statement folded with leaves against unfolded at the assumed
+`lookups_per_part_month`, which the summary prints beside every figure.
 
-## Parquet availability
+## Unsupported on this build
 
-`gen_corpus.py` always writes `spans.jsonl` / `logs.jsonl` (pure stdlib).
-It additionally writes `spans.parquet` / `logs.parquet` when `pyarrow` is
-importable, and records whether it did so in `truth.json`
-(`spans_parquet_written` / `logs_parquet_written`). A real box run is
-expected to have `pyarrow` available (bootstrap installs it) so
-`ravel-cli load --parquet` always gets genuine Parquet; `kit.test.sh` runs
-the generator's correctness checks against the JSONL output so the test
-suite does not require `pyarrow` to be installed.
+- `many_parts`: needs `ravel-cli load --ingest-hour-stride`, which this build
+  lacks. Every call planned for it is a `calls.jsonl` line with outcome
+  `unsupported-on-this-build` and the reason from `[unsupported_states]`.
+- `spans_in_1000`, `logs_request_in_1000`: the SQL surface refuses a
+  statement over 1,000 complexity tokens, and a 1,000-literal IN list counts
+  1,001. `statements.toml` carries the reason; run.sh records the call as
+  unsupported instead of sending it.
+- Key-index stats (`keyIndex.leafGets`, `partsCovered`, `keysProbed`),
+  `pruning.skipIdxDropped`, a per-object breakdown, and the fold report's
+  `key_index_build_passes` and `head_bytes_per_part_field`: absent from this
+  build's output, so their figures are unsupported with that reason.
+- Row 13's negative controls: decision 9's mutants are not built here.
 
-## Class closure
+Rows 5, 6 and 16 need `hits = true`; row 12 needs scales 10 and 100, and row
+16 a baseline build. This flow loads scale 1 and builds one commit, so those
+rows report `not-run`.
 
-Every figure named in `bands.toml` must appear in `results.json`'s
-`figures` list exactly once. `evaluate.py`'s `check_bands()` is the single
-function that reads that list and decides presence/duplication; every
-number `evaluate.py` computes is appended to that one list and reaches
-`results.json`/`summary.txt` only through it, so a figure the code forgets
-to compute fails as `missing <name>` and a figure computed twice (by two
-code paths, or a fixed and a per-state path both wired to the same name)
-fails as `duplicate <name>`, rather than one silently overwriting the
-other. `kit.test.sh` demonstrates both failure shapes directly against
-`check_bands()`, and demonstrates two specific wrong evaluators the real
-check rules out (see that file's comments for the exact flips).
+## Pre-registration
+
+Before a reportable run, write the expected figures and the band that would
+count as a miss as a comment on epic #3692, per the root `CLAUDE.md`
+"Measurement and cost discipline". `bands.toml` is the pre-registration of
+the Acceptance rows at the ADR's corpus; a run at another corpus size needs
+its own comment.
+
+## Corpus
+
+Sizes, hours and the needle tiers are `gen_corpus.py` parameters; the ADR's
+corpus is `--traces 20000000 --hours 24`. Needles are planted by row index
+against the generator's own 256-row blocks: the common needle fills whole
+blocks covering 10 % of them, the sparse one 0.1 % of rows outside those,
+the rare one a single row. Those block frequencies are approximate with
+respect to the store's real segment geometry, which the generator does not
+read. Issue #3699's spec, not the ADR, allows them 20 % of slack;
+`truth.json` records the exact counts every answer is judged against.
+
+## fixtures/local-smoke
+
+A local-lane run of `box/run.local-smoke.toml` on an aarch64 machine (4
+cores, 8 GB): 1,000 traces over 2 hours, 2 cold runs, every state, against a
+loopback RustFS. Its `calls.jsonl`, `truth.json` and `results.local.json`
+are gzipped to keep the fixture under 200 KB; `summary.local.txt` and the
+stamps are plain. Its verdict is `fail`, from two counter misses at this
+scale: `row_07.spans_section_gets` (8 ranged GETs against a target of
+3 x 2 new entries + 1 previous leaf = 7) and `row_08.logs_leaf_pct` (leaf
+bytes 33.7 % of the logs objects against a 2.5 % target stated for the ADR's
+corpus, measured here over 5,000 log rows). They are the run's real figures.
+
+`investigations.test.sh` re-evaluates it and requires byte-identical output.
+After a deliberate change to evaluate.py, `bands.toml` or `statements.toml`,
+regenerate the expected output and review the summary diff:
+
+```sh
+python3 benchmarks/investigations/investigations_cases.py --refresh-local-smoke
+```
+
+## Tests
+
+`bash benchmarks/investigations/investigations.test.sh`, in CI's
+`doc-scripts` job: no AWS, no server, under two minutes. It runs `bash -n`
+over every script, generator recounts at 1,000 traces (and at scale 10),
+the shape of `statements.toml` and `bands.toml`, evaluate.py on the fixture
+and on mutations of it (missing, duplicate, miss, wrong answer, exact cost),
+two wrong evaluators that must fail those cases, and the dry runs of
+`run.sh`, `launch.sh` (with an `aws` stub that fails if called) and
+`fetch.sh`.
