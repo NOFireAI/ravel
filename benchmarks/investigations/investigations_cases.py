@@ -36,6 +36,8 @@ EVALUATE = os.path.join(HERE, "evaluate.py")
 GEN = os.path.join(HERE, "gen_corpus.py")
 STATEMENTS = os.path.join(HERE, "statements.toml")
 BANDS = os.path.join(HERE, "bands.toml")
+README = os.path.join(HERE, "README.md")
+ADR = os.path.join(HERE, "..", "..", "docs", "adrs", "3692-selective-investigations-logs-traces.md")
 HITS_TRUTH = os.path.join(HERE, "hits.truth.json")
 SMOKE = os.path.join(HERE, "fixtures", "local-smoke")
 BOX = os.path.join(HERE, "box")
@@ -534,6 +536,90 @@ class Statements(unittest.TestCase):
         self.assertEqual(row5["rows_match_unfolded"]["metric"], "cold.rows_match_state.unfolded")
         self.assertEqual((row5["rows_predicted"]["metric"], row5["rows_predicted"]["target_if"]),
                          ("cold.max.rows", "v == 4"))
+
+    @staticmethod
+    def guard_units(sql):
+        """complexity_guard's scan for the statements here: one unit per token
+        start, a word run or a quoted literal one token, any other character
+        one token. An X'..' literal is the X run plus the quoted literal."""
+        n = i = 0
+        while i < len(sql):
+            c = sql[i]
+            if c.isspace():
+                i += 1
+                continue
+            n += 1
+            if c == "'":
+                i = sql.index("'", i + 1) + 1
+            elif c.isalnum() or c in "_$":
+                while i < len(sql) and (sql[i].isalnum() or sql[i] in "_$"):
+                    i += 1
+            else:
+                i += 1
+        return n
+
+    def test_in_list_caps_from_the_complexity_guard(self):
+        # Item 9: an X list holds at most 330 keys (3n + 8) and a quoted list
+        # at most 496 (2n + 8) under MAX_STATEMENT_COMPLEXITY = 1,000. Kills a
+        # cap stated from 2 units per X element (495) or from 1,000 / 2.
+        with open(os.path.join(HERE, "..", "..", "crates", "ravel-sql", "src", "complexity_guard.rs")) as f:
+            guard = f.read().splitlines()
+        self.assertEqual(guard[256], "pub const MAX_STATEMENT_COMPLEXITY: usize = 1_000;")
+        self.assertIn("count > MAX_STATEMENT_COMPLEXITY", guard[380])
+        self.assertIn("scan(sql, MAX_STATEMENT_COMPLEXITY)", guard[379])
+        self.assertEqual(guard[639].strip(), "count += 1;")
+        self.assertIn("if c == '\\''", guard[673])
+        self.assertTrue(any("BackslashEscaped" in line for line in guard[673:684]))
+        by = {x["id"]: x for x in self.st}
+        caps = {}
+        for sid, elem in (("spans_in_1000", "X'{:032x}'"), ("logs_trace_in_1000", "X'{:032x}'"),
+                          ("logs_request_in_1000", "'req-{:016x}-000'")):
+            sql = by[sid]["sql"]
+            fill = lambda n: re.sub(r"\{[a-z_0-9]+\}", ", ".join(elem.format(k) for k in range(n)), sql)
+            per = 3 if elem.startswith("X") else 2
+            for n in (1, 2, 330):
+                self.assertEqual(self.guard_units(fill(n)), per * n + 8, (sid, n))
+            caps[sid] = max(n for n in range(1, 1001) if self.guard_units(fill(n)) <= 1000)
+            self.assertGreater(self.guard_units(fill(1000)), 1000, sid)
+            self.assertGreater(self.guard_units(fill(1001)), 1000, sid)
+            self.assertTrue(by[sid].get("expect_refusal_on_main"), sid)
+            self.assertTrue(by[sid.replace("1000", "1001")].get("expect_refusal_on_main"), sid)
+        self.assertEqual(caps, {"spans_in_1000": 330, "logs_trace_in_1000": 330, "logs_request_in_1000": 496})
+        for doc in (README, STATEMENTS):
+            with open(doc) as f:
+                text = " ".join(f.read().split())
+            self.assertIn("330", text, doc)
+            self.assertIn("496", text, doc)
+            self.assertIn("3n + 8", text, doc)
+            self.assertIn("2n + 8", text, doc)
+
+    def adr_band_rows(self):
+        with open(ADR) as f:
+            lines = f.read().splitlines()
+        head = lines.index("| check | target | miss | source |")
+        self.assertEqual(lines[head + 1], "|---|---|---|---|")
+        rows = []
+        for line in lines[head + 2:]:
+            if not line.startswith("|"):
+                break
+            cells = [c.strip() for c in line.strip().strip("|").split(" | ")]
+            self.assertEqual(len(cells), 4, line[:60])
+            rows.append(cells)
+        return head + 1, rows
+
+    def test_band_text_is_the_adr_table_verbatim(self):
+        # Item 17: each row's check, target, miss and source text is the ADR
+        # Acceptance table's cell, the check without its "N. " number.
+        head, adr = self.adr_band_rows()
+        self.assertEqual(head, 730)
+        self.assertEqual(len(adr), 17)
+        rows = self.bands["row"]
+        for n, (r, cells) in enumerate(zip(rows, adr), 1):
+            num, _, check = cells[0].partition(". ")
+            self.assertEqual(num, str(n))
+            self.assertEqual(r["check"].strip(), check, f"{r['key']}.check")
+            for k, cell in zip(("target", "miss", "source"), cells[1:]):
+                self.assertEqual(r[k].strip(), cell, f"{r['key']}.{k}")
 
     def test_bands_rows_1_to_17(self):
         rows = self.bands["row"]
