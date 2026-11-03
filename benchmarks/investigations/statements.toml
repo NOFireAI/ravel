@@ -51,8 +51,9 @@
 #              No statement sets it today.
 #   expect_refusal_on_main  true: the statement is sent, and a refusal the
 #              server returns (the 1,000- and 1,001-key IN lists against the
-#              SQL complexity cap) is recorded as unsupported-on-this-build
-#              with the response's status and text. A refusal of any other
+#              SQL complexity cap) is recorded as refused-by-guard with the
+#              response's status and text, counted apart from
+#              unsupported-on-this-build. A refusal of any other
 #              statement is the problem `refused`.
 
 [[statement]]
@@ -157,7 +158,7 @@ cold_only = true
 # 1,000 (:257, checked at :380-381) and the 8 units of the rest of the
 # statement, an X list holds at most 330 keys (3n + 8) and a quoted list at
 # most 496 (2n + 8). The server's 400 and its text are recorded as
-# unsupported-on-this-build; the 1,001-key list beside it is row 11's control.
+# refused-by-guard; the 1,001-key list beside it is row 11's control.
 [[statement]]
 id = "spans_in_1000"
 tenant = "inv"

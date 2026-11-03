@@ -84,7 +84,14 @@ hour inside the shutdown timer: a state that would start after it is
 recorded `not-run` with reason `deadline`, a state already running when it
 passes records each of its remaining calls `not-run` ("run deadline
 (max_minutes) passed before this call") without restarting the server for
-them, and evaluate and the upload still happen. Either makes the verdict
+them, and evaluate and the upload still happen. Before each long step (a
+fold, a leaf rebuild, a load, a compaction, and the waits for the next
+ingest hour and for 310 s into an hour) run.sh checks that the time left
+holds the step's bound: the waits are bounded by their maxima, the other
+steps by `[step_estimate_minutes]` (per state, else `default`, 30 minutes
+when the table is absent). A step the time left cannot hold records its
+state `not-run` with reason `deadline: <step> needs up to N s, M s left of
+run.max_minutes` before it starts. Each of these makes the verdict
 `incomplete`. The upload copies `out/` without the marker first, then writes
 `DONE` (or `FAILED`) as its own final PUT, only after that copy exited 0.
 `fetch.sh` polls for `out/DONE` or `out/FAILED`, gives up `box.max_minutes +
@@ -113,9 +120,9 @@ that is not `cold_only` (statement counts from `statements.toml`):
 
 That is 2,299 calls and 2,201 restarts: 2,201 x 1.181 s = 2,599 s, plus
 2,299 x 0.034 s = 78 s, so 2,677 s, about 45 minutes of calls. The fixed
-waits add at most 60 minutes for mixed (the next ingest hour) and at most 60
-for compaction_in_flight (310 s into an hour; in the smoke they took 48 and
-3 minutes). The estimate is about 165 minutes, against the 540-minute
+waits add at most 60 minutes for mixed (the next ingest hour) and at most
+310 s, about 5 minutes, for compaction_in_flight (until 310 s into an hour;
+in the smoke they took 48 and 3 minutes). The estimate is about 110 minutes, against the 540-minute
 deadline, and it covers calls and waits only. It omits corpus generation,
 every load (the `hits` tenant's included) and every fold at 20,000,000
 traces: the smoke's figures for them (0.30 to 1.03 s per load, at most
@@ -199,8 +206,13 @@ and row 6 reads 2 x the census's hits objects.
   then the statement set against the pre-erasure answer, except
   `logs_erasure_victim`, the victim's own lookup, which must return no row:
   a snapshot resolved after the request's ack filters its records while it
-  is pending (`docs/catalog-and-mvcc.md`, resolution step 6;
-  `truth_key_in` in statements.toml). The pass after the
+  is pending (`docs/catalog-and-mvcc.md`, "Snapshot resolution by listing",
+  step 6; `truth_key_in` in statements.toml). That step backs 0 rows under
+  PENDING for a resolve by listing only: the tenant here is folded, and
+  "Snapshot resolution from a folded snapshot" in the same document does not
+  say it attaches pending erasures. That gap in the document is filed
+  separately; the smoke observed 0 rows on its folded tenant, so the
+  expectation stands on the run's own reading. The pass after the
   erasure is applied is not run: nothing in this flow applies a pending
   request. A corpus with no victim row (every row read by some other
   statement) records the state `not-run` with that reason; the smoke's
@@ -249,8 +261,9 @@ partly from that cache: in the smoke the logs journeys read about every
 logs byte from it and issue no scan GET. Every cold call whose
 `cacheServedBytes` is above 0 is flagged `warm_served` in the results and
 counted per statement and state in the summary: in the smoke, 126 of the 196
-cold calls that returned an answer (of 220 cold calls; the other 24 are the
-refused 1,000-key lists, which carry no stats). The flag is a reported figure, not a problem. Each restart stamp
+cold calls that returned an answer (of 220 cold calls; the other 24, 12 on the 1,000-key lists
+and 12 on their 1,001-key controls, were refused by the SQL complexity guard
+and carry no stats). The flag is a reported figure, not a problem. Each restart stamp
 records what the warmup loaded.
 
 ## run.toml
@@ -270,7 +283,10 @@ records what the warmup loaded.
 naming where the number was read. A price without a number is `missing`; a
 price without a source makes `cost.figures_without_basis` non-zero, which
 misses row 17. `[cost]` holds `lookups_per_part_month`, the assumed query
-frequency, with its `_source`, and `amortise_months`.
+frequency, with its `_source`, and `amortise_months`, the months a leaf
+build is amortised over. It has no default: absent or not a whole number of
+at least 1, it is the problem `missing` and the maintenance figures read
+`missing`.
 
 ## Stamps
 
@@ -346,7 +362,10 @@ planned call that was not sent in a state that did (the run deadline, an
 in-flight window too short), or a figure `not-run` for a reason other than
 its row or figure needing a tenant, state, scale or baseline the run never
 asked for. Each reason is listed under `incomplete` in the results and the
-summary. Otherwise it is `pass`. Exit 0 only on `pass`; `DONE` carries the
+summary. The rows left out that way are not silent either: each is listed
+with the setting that leaves it out (`hits = false`, `baseline = false`, a
+state or scale `run.toml` does not list) under `not_requested` in the results and on the
+summary's `not requested:` line. Otherwise it is `pass`. Exit 0 only on `pass`; `DONE` carries the
 verdict.
 
 Every in-flight call must overlap the compaction of the signal its
@@ -387,8 +406,9 @@ Some bands, as transcribed:
   footer exceeds 8 KiB plus one per previous leaf, miss over 2 x tail
   entries, the from-scratch rebuild. New entries, previous leaves and footer
   lengths come from the stamps; `rlog inspect` and `rspan inspect` print a
-  footer length, so the footer term is real (0 at the smoke's 196 and 241
-  bytes).
+  footer length, so the footer term is real (0 at the smoke's 199 and 248
+  bytes). The miss reads "over" as at least: a from-scratch rebuild is
+  exactly 2 x tail entries, so equality is its signature.
 - Row 8: leaf bytes per field over the label's census data bytes, banded at
   2.5 % on logs and 6 % on spans, with the field named in the figure. The
   ADR's band was measured on one repeated-key column (hits `UserID`, 2.06
@@ -404,8 +424,9 @@ Some bands, as transcribed:
   control is 1 (pass) when every 1,000-key call reports `keysProbed` 1000
   and `partsCovered` and no 1,001-key call is index-served (`keysProbed` or
   `partsCovered` non-zero); 0 (miss) when a 1,001-key call is index-served
-  or the 1,000-key list probed another count; `unsupported-on-this-build`
-  when the 1,000-key list was refused or carries no tier-2 figures.
+  or the 1,000-key list probed another count; `refused-by-guard` when the
+  1,000-key list was refused by the SQL complexity guard, and
+  `unsupported-on-this-build` when it carries no tier-2 figures.
 - Row 15: the sum of the three steps' p50 under 5 s, miss over 20 s, and the
   journey's GET total within resolve + 2 x covering parts on spans + (1 +
   min(distinct buckets, 64)) per covering part on logs + 50 x (footer +
@@ -446,14 +467,17 @@ unchanged.
   server refuses them with HTTP 400 and `statement complexity 1001 exceeds
   the maximum of 1000 tokens; simplify the statement`. These statements
   carry `expect_refusal_on_main = true`, and evaluate.py records each such
-  refusal as unsupported with that text. A refusal of any other statement
+  refusal as `refused-by-guard` ("refused by the SQL complexity guard") with
+  that text, a class of its own: the summary's `refusal classes` line counts
+  its figures and calls apart from `unsupported-on-this-build`, and neither
+  is a problem. A refusal of any other statement
   is the problem `refused` with its status and text. The SQL complexity
   guard charges one unit per token start
   (`crates/ravel-sql/src/complexity_guard.rs:640`): an identifier or number
   run is one unit, an opening quote is one, and an `X'..'` literal is an X
   run plus a quote (`:674-684`), so an element costs 3 units with its comma
   in an X list and 2 in a quoted one. Against `MAX_STATEMENT_COMPLEXITY =
-  1_000` (`:257`, checked at `:380-381`) and the 9 units outside the list,
+  1_000` (`:257`, checked at `:380-381`) and the 8 units of the rest of the statement,
   an X list (3n + 8) holds at most 330 keys and a quoted list (2n + 8) at
   most 496. The guard stops counting at the cap plus one, so it reports 1001
   for any statement over the cap.
@@ -488,11 +512,24 @@ tier within 20 % of its target (issue #3699's spec, not the ADR, allows the
 20 %). `truth.json` records the exact counts every answer is judged
 against.
 
-`stamps/needle_blocks.json` records both counts. In the smoke the generator
-planted needles in 5 of its 8,192-row blocks over 100,000 log rows (common
-3, sparse 2, rare 1; one block holds two tiers), and `rlog inspect` over all 4 logs objects reports 14
-blocks for 100,000 records, with the needle tag present in 4 of them and the
-rare needle in exactly 1, as truth predicts. The suite pins those figures.
+The plant counts are blocks of the generator's row order, not of storage:
+the writer sorts each object's records by `(stream_ref, ts_ns)`
+(`docs/log-segment-format.md`, "BLOCKS"), per shard and ingest hour, so a
+needle row lands in whichever storage block the sort puts it in.
+`stamps/needle_blocks.json` records the storage counts per needle column
+(`<column>_present_blocks`, null when an inspected object's block or column
+counts are unreadable, never 0), and evaluate.py compares each against the
+planted count by tier: the rare needle exactly (one row is one block in any
+order), the sparse and common needles within 25 % of planted, and the tag
+column, which every tier sets, reported only. Each needle's planted and
+storage figures are listed in the results (`needle_blocks.<value>.planted`
+and `.storage`) and in the summary's needle block lines. In the smoke the
+generator planted needles in 5 of its 8,192-row blocks over 100,000 log rows
+(common 3, sparse 2, rare 1; one block holds two tiers), and `rlog inspect`
+over all 4 logs objects reports 14 blocks for 100,000 records, with the
+needle tag present in 4 of them against 5 planted and the rare needle in
+exactly 1. The smoke's stamp predates the sparse and common columns, so
+those two read `missing`. The suite pins those figures.
 
 ## fixtures/local-smoke
 

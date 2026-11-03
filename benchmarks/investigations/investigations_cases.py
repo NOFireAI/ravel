@@ -682,8 +682,14 @@ class Statements(unittest.TestCase):
     def adr_band_rows(self):
         with open(ADR) as f:
             lines = f.read().splitlines()
-        head = lines.index("| check | target | miss | source |")
+        header = "| check | target | miss | source |"
+        self.assertEqual(lines.count(header), 1)
+        head = lines.index(header)
         self.assertEqual(lines[head + 1], "|---|---|---|---|")
+        # The table is the one under the Acceptance heading, wherever the ADR
+        # puts it: the nearest heading above it.
+        above = next(x for x in reversed(lines[:head]) if x.startswith("#"))
+        self.assertTrue(above.startswith("## Acceptance"), above)
         rows = []
         for line in lines[head + 2:]:
             if not line.startswith("|"):
@@ -696,8 +702,7 @@ class Statements(unittest.TestCase):
     def test_band_text_is_the_adr_table_verbatim(self):
         # Item 17: each row's check, target, miss and source text is the ADR
         # Acceptance table's cell, the check without its "N. " number.
-        head, adr = self.adr_band_rows()
-        self.assertEqual(head, 730)
+        _, adr = self.adr_band_rows()
         self.assertEqual(len(adr), 17)
         rows = self.bands["row"]
         for n, (r, cells) in enumerate(zip(rows, adr), 1):
