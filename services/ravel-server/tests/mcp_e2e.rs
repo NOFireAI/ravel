@@ -3294,6 +3294,135 @@ mod with_mcp {
         running.shutdown().await.expect("server stops");
     }
 
+    /// A started server over a held-gate store holding [`search_corpus`]
+    /// with `attr_00` declared, the query service, the store's counters, and
+    /// the gate store itself.
+    async fn held_logs_server() -> (
+        ravel_server::Running,
+        ravel_server::service::QueryService,
+        Arc<ravel_object_store::StoreMetrics>,
+        Arc<FaultStore<ravel_object_store::InstrumentedStore<MemoryStore>>>,
+    ) {
+        let metrics = Arc::new(ravel_object_store::StoreMetrics::default());
+        let faults = Arc::new(FaultStore::new(
+            ravel_object_store::InstrumentedStore::with_metrics(
+                MemoryStore::new(),
+                Arc::clone(&metrics),
+            ),
+            FaultPlan::empty(),
+        ));
+        let store: Arc<dyn ObjectStoreBackend> = faults.clone();
+        declare_columns(store.as_ref(), 1).await;
+        publish_logs(store.as_ref(), &search_corpus()).await;
+        let running = start_server(store, Arc::clone(&metrics), mcp_on()).await;
+        let service = running
+            .query_service
+            .clone()
+            .expect("a query-serving mode builds one");
+        (running, service, metrics, faults)
+    }
+
+    /// `ravel_search_logs` arguments with one predicate, so the call reads
+    /// the declared columns before its statement.
+    fn search_with_predicate() -> serde_json::Value {
+        serde_json::json!({
+            "time_range": {"start_ns": "0", "end_ns": (3_600 * NS_PER_SEC).to_string()},
+            "predicates": [{"key": "attr_00", "op": "eq", "value": "web"}],
+        })
+    }
+
+    /// A `ravel_search_logs` call with predicates is bounded by one deadline
+    /// across its declared-column lookup and its statement. The lookup's
+    /// first catalog LIST is held while the paused clock moves 90% of the
+    /// deadline on, and the statement's data GET is then held until a timer
+    /// fires: the call answers `deadline` once the call's own deadline has
+    /// passed, having reached the statement, with the time the lookup took
+    /// counted against it.
+    ///
+    /// FLIP: building the backend without `with_call_start`, which gives the
+    /// statement a whole deadline of its own from its own start, answers
+    /// `deadline` only at 1.9 deadlines.
+    #[tokio::test]
+    async fn search_logs_lookup_and_statement_share_one_deadline() {
+        let (running, service, _, faults) = held_logs_server().await;
+        let budgets = sql_budgets();
+        let deadline = budgets.deadline;
+        let key = ravel_mcp::cursor::CursorKey::from_process_secret(
+            [0x53; ravel_mcp::cursor::CURSOR_KEY_LEN],
+        );
+        let ctx = describe_context(wall_now_ns(), &key);
+
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let backend = ServiceBackend::new(service, budgets).with_call_start(started);
+        let lookup = faults.hold(Op::List, None, Occurrence::Nth(1));
+        let scan = faults.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Nth(1));
+
+        let call = ravel_mcp::tools::search_logs::run(search_with_predicate(), &ctx, &backend);
+        tokio::pin!(call);
+        tokio::select! {
+            _ = &mut call => panic!("the held lookup cannot complete"),
+            () = lookup.wait_until_held(1) => {}
+        }
+        tokio::time::advance(deadline * 9 / 10).await;
+        for id in lookup.held() {
+            lookup.release(id);
+        }
+        let envelope = call.await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(envelope.status, Status::Error, "{envelope:?}");
+        let failure = envelope.failure.as_ref().expect("an error carries one");
+        assert_eq!(failure.class, FailureClass::Deadline, "{failure:?}");
+        assert_eq!(scan.held_count(), 1, "the statement reached its data read");
+        assert!(
+            elapsed >= deadline && elapsed <= deadline + Duration::from_millis(1),
+            "answered after {elapsed:?} under a {deadline:?} deadline: {failure:?}"
+        );
+        for id in scan.held() {
+            scan.release(id);
+        }
+
+        tokio::time::resume();
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// A service call that would start with none of the tool call's deadline
+    /// left fails as `deadline` without running: the declared-column lookup
+    /// of a call whose whole deadline has passed issues no store request.
+    ///
+    /// FLIP: dropping the zero check from `ServiceBackend::remaining` runs
+    /// both calls under a zero deadline. `tokio::time::timeout` polls its
+    /// future once before it reads the timer, and over an in-memory store the
+    /// lookup and the statement finish inside that poll, so the call answers
+    /// `ok` after reading the store.
+    #[tokio::test]
+    async fn a_service_call_with_no_time_left_fails_as_deadline_before_the_store() {
+        let (running, service, metrics, _) = held_logs_server().await;
+        let budgets = sql_budgets();
+        let deadline = budgets.deadline;
+        let key = ravel_mcp::cursor::CursorKey::from_process_secret(
+            [0x54; ravel_mcp::cursor::CURSOR_KEY_LEN],
+        );
+        let ctx = describe_context(wall_now_ns(), &key);
+
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        tokio::time::advance(deadline).await;
+        let backend = ServiceBackend::new(service, budgets).with_call_start(started);
+        let before = total_store_calls(&metrics);
+        let envelope =
+            ravel_mcp::tools::search_logs::run(search_with_predicate(), &ctx, &backend).await;
+
+        assert_eq!(envelope.status, Status::Error, "{envelope:?}");
+        let failure = envelope.failure.as_ref().expect("an error carries one");
+        assert_eq!(failure.class, FailureClass::Deadline, "{failure:?}");
+        assert_eq!(total_store_calls(&metrics), before);
+
+        tokio::time::resume();
+        running.shutdown().await.expect("server stops");
+    }
+
     /// `values` as samples 10 s apart, the first at 10 s.
     fn every_ten_seconds(values: &[f64]) -> Vec<(i64, f64)> {
         values

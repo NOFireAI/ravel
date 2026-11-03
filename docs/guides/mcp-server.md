@@ -400,6 +400,11 @@ server's ceiling, the tenant's ceiling, and the value you sent. You can
 lower `deadline`, `max_rows`, `max_bytes_scanned`, `max_store_requests`, and
 `max_response_bytes`. You cannot raise any of them past its ceiling.
 
+The deadline covers the whole tool call. A `ravel_search_logs` call with
+`predicates` first looks up the typed attribute columns and then runs its
+search, and the search only gets the time the lookup left. Its
+`budget.actual` counts the search only, and a warning on the page says so.
+
 Defaults and floors:
 
 - `max_rows`: 200, with a ceiling of 5,000.
@@ -462,8 +467,10 @@ key, a tenant name, or a credential.
 
 ### Cursors
 
-A cursor stays valid until the earlier of the call's remaining deadline
-and the protection horizon minus the grace period.
+A cursor stays valid until the protection horizon minus the grace period,
+counted from when the cursor was minted. The deadline of the call that
+returned it does not shorten it, so you can take your time before asking
+for the next page; that call runs under its own deadline.
 
 | Case | Failure |
 |---|---|
