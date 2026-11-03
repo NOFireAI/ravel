@@ -1056,7 +1056,7 @@ fn head_shard_count_mismatch(
     }
 }
 
-fn build_segment_ref_from_entry(
+pub(crate) fn build_segment_ref_from_entry(
     tenant: &TenantHash,
     signal: Signal,
     entry: &SnapshotEntry,

@@ -7542,6 +7542,214 @@ mod tests {
         assert_folded_snapshot_fan_out_peaks_at(32, 128, 32).await;
     }
 
+    /// ADR-3692 decision 1: three sealed parts (one hour each) and one listed
+    /// hour above the watermark. Every sealed segment's origin names a part
+    /// handle and an ordinal whose entry in that part's own bytes is the same
+    /// data key, the listed segment's origin is `None`, and the snapshot and
+    /// origins equal what `resolve_pruned_with_admission` returns for the
+    /// same call.
+    #[tokio::test]
+    async fn resolve_pruned_with_parts_returns_origins_parallel_to_segments() {
+        let (store, range, now) = three_sealed_parts_and_a_listed_hour().await;
+
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let (snapshot, origins, parts) = catalog
+            .resolve_pruned_with_parts(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                &[],
+                now,
+                None,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("resolve with parts");
+        assert_eq!(snapshot.segments.len(), 4);
+        assert_eq!(parts.origin.len(), snapshot.segments.len());
+        assert_eq!(parts.parts.len(), 3);
+        assert_eq!(parts.charged_bytes(), parts.heap_bytes());
+        assert!(parts.heap_bytes() > 0);
+
+        let fresh = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let (plain_snapshot, plain_origins) = fresh
+            .resolve_pruned_with_admission(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                &[],
+                now,
+                None,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("resolve");
+        assert_eq!(snapshot, plain_snapshot);
+        assert_eq!(origins, plain_origins);
+
+        let mut part_bytes: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let snap_prefix = format!(
+            "t/{}/catalog/{}/snap/",
+            tenant().to_hex(),
+            Signal::Metrics.key_prefix()
+        );
+        for meta in ravel_object_store::list_all(store.as_ref(), &snap_prefix)
+            .await
+            .expect("list parts")
+        {
+            if !meta.key.ends_with(".csnap") {
+                continue;
+            }
+            let bytes = store
+                .get(&meta.key, GetRange::Full)
+                .await
+                .expect("part")
+                .data
+                .to_vec();
+            part_bytes.insert(blake3::hash(&bytes).as_bytes().to_vec(), bytes);
+        }
+
+        let mut sealed = 0;
+        for ((segment, origin), part_origin) in snapshot
+            .segments
+            .iter()
+            .zip(&origins.origins)
+            .zip(&parts.origin)
+        {
+            match origin {
+                SegmentOrigin::SealedBelowWatermark => {
+                    sealed += 1;
+                    let at = part_origin.expect("a sealed segment names its part");
+                    let handle = &parts.parts[at.part as usize];
+                    let bytes = part_bytes.get(&handle.blake3).expect("the part object");
+                    let decoded = crate::snapshot_format::decode_part(
+                        bytes,
+                        &crate::snapshot_format::PartLimits::default(),
+                    )
+                    .expect("decode part");
+                    assert_eq!(decoded.entries.len() as u64, handle.entry_count);
+                    let from_part = crate::snapshot_resolve::build_segment_ref_from_entry(
+                        &tenant(),
+                        Signal::Metrics,
+                        &decoded.entries[at.ordinal as usize],
+                    )
+                    .expect("entry");
+                    assert_eq!(from_part.data_object_key, segment.data_object_key);
+                    assert_eq!(decoded.header.watermark_hour, handle.watermark_hour);
+                }
+                other => {
+                    assert_eq!(*other, SegmentOrigin::Recent);
+                    assert_eq!(*part_origin, None, "a listed segment has no part");
+                }
+            }
+        }
+        assert_eq!(sealed, 3);
+    }
+
+    /// `resolve_pruned_with_parts` builds its handles behind `want_parts`;
+    /// every other resolve entry passes `false` and runs the code it ran
+    /// before, so its output is unchanged by construction (the equality in
+    /// the test above is the output half). This is the cost half: two fresh
+    /// catalogs over one store, and the one that did not ask for handles
+    /// holds exactly the handles' charge less on the budget.
+    #[tokio::test]
+    async fn the_other_resolve_methods_are_byte_for_byte_unchanged() {
+        let (store, range, now) = three_sealed_parts_and_a_listed_hour().await;
+        let plain = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let with_parts = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let (plain_snapshot, _) = plain
+            .resolve_pruned_with_admission(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                &[],
+                now,
+                None,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("resolve");
+        let (snapshot, _, parts) = with_parts
+            .resolve_pruned_with_parts(
+                &tenant(),
+                Signal::Metrics,
+                range,
+                &[],
+                now,
+                None,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("resolve with parts");
+        assert_eq!(snapshot, plain_snapshot);
+        assert_eq!(
+            with_parts.memory_budget.reserved(),
+            plain.memory_budget.reserved() + parts.charged_bytes()
+        );
+        drop(parts);
+        assert_eq!(
+            with_parts.memory_budget.reserved(),
+            plain.memory_budget.reserved(),
+            "the handles' charge is released with them"
+        );
+    }
+
+    /// Three hours folded into one sealed part each, and one more hour
+    /// published above the watermark; returns the store, a range over all
+    /// four and the resolve's `now_ns`.
+    async fn three_sealed_parts_and_a_listed_hour() -> (Arc<MemoryStore>, TimeRange, i64) {
+        let store = Arc::new(MemoryStore::new());
+        let base_hour = 500_000u32;
+        let margin = crate::DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + crate::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + crate::DEFAULT_FOLD_SAFETY_MARGIN_NS;
+        for offset in 0..3u32 {
+            let hour = base_hour + offset;
+            let created = (i64::from(hour) + 1) * NS_PER_HOUR - 1_000;
+            publish_segment(
+                &store,
+                0,
+                u64::from(offset) + 1,
+                hour,
+                created,
+                created - 1_000,
+                created,
+            )
+            .await;
+        }
+        let fold_now = (i64::from(base_hour + 2) + 1) * NS_PER_HOUR + margin;
+        let fold_catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                snapshot_part_max_entries: 1,
+                ..config(1)
+            },
+        )
+        .expect("fold catalog");
+        let report = fold_catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                fold_now,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert_eq!(report.parts_total, 3);
+
+        let recent_hour = base_hour + 4;
+        let created = (i64::from(recent_hour) + 1) * NS_PER_HOUR - 1_000;
+        publish_segment(&store, 0, 9, recent_hour, created, created - 1_000, created).await;
+        let now = created + 1_000;
+        let range = TimeRange {
+            start_ns: i64::from(base_hour) * NS_PER_HOUR,
+            end_ns: now,
+        };
+        (store, range, now)
+    }
+
     /// ADR-1733 decision 1, the per-prefix half: every part of one snapshot
     /// sits under that snapshot's single `.../snap/` prefix, and the part
     /// fan-out runs at the ceiling's width, so at a ceiling above the
