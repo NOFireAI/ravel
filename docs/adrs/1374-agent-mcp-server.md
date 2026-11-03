@@ -274,9 +274,10 @@ cursor points at the last kept row and the status is `ok_page`. The omitted
 rows are then reachable on the next page. When it has no total order, the
 status is `ok_bounded`.
 
-A page always keeps its first row when the query produced one. When the
-first row alone does not fit under the cap, the server keeps the row and
-shortens its cells. The cell budget is `max(256 B, (cap - fixed_part) /
+A page always keeps its first row when the query produced one. (This is a
+rule of the byte cap; see the equal-group bound amendment below for the row
+cap.) When the first row alone does not fit under the cap, the server keeps
+the row and shortens its cells. The cell budget is `max(256 B, (cap - fixed_part) /
 column_count)`, where `fixed_part` is the serialized size of the envelope
 without `data.rows`. The rule applies to every cell type. A number, a
 timestamp, a boolean, or a hex binary id never exceeds 64 B and is never
@@ -395,7 +396,9 @@ the last kept tuple equals the first omitted tuple, the tool drops that
 whole equal group from the page. The cursor then points at the last
 complete group.
 If no complete group fits in the page, the status is `ok_bounded` with no
-cursor and a `next_steps` entry that says to narrow `time_range`. The same
+cursor and a `next_steps` entry that says to narrow `time_range`. (The rows
+the page has are still returned; see the equal-group bound amendment
+below.) The same
 rule applies to `ravel_query_sql` when its appended tiebreak is not unique.
 `ravel_get_trace` orders by `(start_ts, span_id)`. A test paginates a
 fixture with equal tuples across a page boundary and asserts that every row
@@ -1520,3 +1523,24 @@ E. The logs leg is deferred and still owed under #1382; D2's row keeps it.
 F. The new description and the `include_logs` input doc move `tools/list`
    from 16,058 to 16,177 bytes with the nine tools and from 23,947 to
    24,066 bytes with all fifteen, under the 24,576-byte budget.
+
+## Amendment (2026-11-03, #1386): the equal-group bound amendment, a page with no complete group keeps its rows
+
+<!-- amendment-applies: sections="D4. The result envelope|D5. Consistency, cursors, and evidence references" pointer="equal-group bound amendment" -->
+
+D5 says a page on which no complete group fits is `ok_bounded` with no
+cursor, and does not say which rows it carries. D4 says a page always keeps
+its first row. This equal-group bound amendment states how the two meet, as
+`ravel_query_sql` and `ravel_search_logs` already behave: both finish a page
+through `Draft::finish_page` (`crates/ravel-mcp/src/draft.rs`).
+
+1. When the equal-group rule finds no complete group inside the row cap,
+   the server returns the rows it has, up to the row cap, sets the status
+   to `ok_bounded`, mints no cursor, adds a `narrow_time_range` next step,
+   and warns `no cursor: no complete group of rows equal under the order
+   fits one page`. The `one_group` case of
+   `a_grouped_page_holds_back_its_open_trailing_group` in `draft.rs` pins
+   this: five equal rows under a row cap of four return four rows.
+2. D4's first-row guarantee is a rule of the byte cap: the byte fit never
+   drops the first row and shortens its cells instead. It says nothing about
+   the row cap, which item 1 governs.
