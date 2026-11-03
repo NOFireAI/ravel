@@ -9757,6 +9757,48 @@ mod whole_object_get_limiter_tests {
         (fault, seg_ref(size))
     }
 
+    /// A GET that fails before any byte arrives decodes no footer, so it
+    /// records no `segments_opened`; the retry that succeeds records the one
+    /// open. Fails against counting the open before the GET returns.
+    #[tokio::test]
+    async fn a_failed_get_records_no_segment_open() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let plan = FaultPlan::default().with_rule(
+            ravel_object_store::fault::Rule::new(
+                Op::Get,
+                ravel_object_store::fault::ScriptedFault::Permanent("injected".into()),
+            )
+            .with_key_contains(KEY)
+            .with_occurrence(Occurrence::Nth(1)),
+        );
+        let fault = Arc::new(FaultStore::new(store_with_object(bytes).await, plan));
+        let fetcher = LogSegmentFetcher::new(Arc::clone(&fault) as Arc<dyn ObjectStoreBackend>);
+        let seg = seg_ref(size);
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let failed = QueryAccounting::new();
+        let err = fetcher
+            .fetch_accounted_with_tenant(&seg, TenantHash([7u8; 16]), &query, &failed)
+            .await;
+        assert!(err.is_err(), "the injected GET failure surfaces: {err:?}");
+        assert_eq!(
+            fault.fault_count(Op::Get, ravel_object_store::fault::FaultKind::Permanent),
+            1,
+            "the fault fired"
+        );
+        assert_eq!(failed.snapshot().segments_opened, 0);
+
+        let retried = QueryAccounting::new();
+        let out = fetcher
+            .fetch_accounted_with_tenant(&seg, TenantHash([7u8; 16]), &query, &retried)
+            .await
+            .expect("the second GET passes through")
+            .expect("ts-relevant");
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(retried.snapshot().segments_opened, 1);
+    }
+
     const CONTENT_HASH_A: [u8; 32] = [10u8; 32];
     const CONTENT_HASH_B: [u8; 32] = [11u8; 32];
     const KEY_A: &str = "t/whole_a.rlog";
@@ -14203,6 +14245,111 @@ mod read_gate_tests {
                 AccessIntent::BulkScan => assert!(bulk > 0, "admitted outside the bulk region"),
                 _ => assert_eq!(bulk, 0, "{intent:?}"),
             }
+        }
+    }
+
+    /// `segments_opened` read off a plan handle and a key-index handle.
+    fn opened(plan: &QueryAccounting, key_index: &QueryAccounting) -> (u64, u64) {
+        (
+            plan.snapshot().segments_opened,
+            key_index.snapshot().segments_opened,
+        )
+    }
+
+    /// `plan_segment_primed`, reached through `plan_segment`, records one
+    /// footer open under the plan handle for a relevant object and none for
+    /// one the catalog ts pre-check rules out, which it never reads.
+    ///
+    /// Fails against counting the `Ok(None)` outcome too, and against
+    /// counting before the ts pre-check.
+    #[tokio::test]
+    async fn plan_segment_primed_counts_one_open_under_plan() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let after = seg_ref.max_event_ts_ns + 1;
+        for (query, want) in [
+            (LogQuery::new(i64::MIN, i64::MAX), 1),
+            (LogQuery::new(after, i64::MAX), 0),
+        ] {
+            let plan = QueryAccounting::new();
+            let out = fetcher
+                .plan_segment(&seg_ref, TENANT, &query, &plan)
+                .await
+                .expect("plan");
+            assert_eq!(out.is_some(), want == 1, "{query:?}");
+            assert_eq!(plan.snapshot().segments_opened, want, "{query:?}");
+        }
+    }
+
+    /// `plan_segment_keyed` records one footer open under the plan handle on
+    /// each route that reads the object (planned with the key present, pruned
+    /// with it absent, and the unkeyed route of a query with no arm) and none
+    /// on the key-index handle; an object outside the query window is never
+    /// read and records none.
+    ///
+    /// Fails against a keyed route that also lets `plan_segment_primed` count
+    /// the probe it was handed, against charging the open to the key-index
+    /// handle the KEY_IDX reads land on, and against dropping the count on
+    /// the `Absent` arm.
+    #[tokio::test]
+    async fn plan_segment_keyed_counts_one_open_under_plan() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let all = LogQuery::new(i64::MIN, i64::MAX);
+        let absent = all.clone().with_key_equals(KeyEquals::new(
+            "request.id",
+            KeyType::Str,
+            ravel_logseg::key_index::key8_str("absent"),
+        ));
+        let after = keyed_on_r2(LogQuery::new(seg_ref.max_event_ts_ns + 1, i64::MAX));
+        for (name, query, planned, want) in [
+            ("present", keyed_on_r2(all.clone()), true, 1),
+            ("absent", absent, false, 1),
+            ("unkeyed", all, true, 1),
+            ("outside the window", after, false, 0),
+        ] {
+            let plan = QueryAccounting::new();
+            let key_index = QueryAccounting::new();
+            let keyed = fetcher
+                .plan_segment_keyed(&seg_ref, TENANT, &query, &plan, &key_index)
+                .await
+                .expect("keyed plan");
+            assert_eq!(keyed.plan.is_some(), planned, "{name}");
+            assert_eq!(opened(&plan, &key_index), (want, 0), "{name}");
+        }
+    }
+
+    /// `probe_segment_keyed` records one footer open under the plan handle
+    /// whether the key is present or absent, none on the key-index handle,
+    /// and none for an object outside the query window, which it never reads.
+    ///
+    /// Fails against counting before the ts pre-check, against charging the
+    /// open to the key-index handle, and against counting only an absent key.
+    #[tokio::test]
+    async fn probe_segment_keyed_counts_one_open_under_plan() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let absent = LogQuery::new(i64::MIN, i64::MAX).with_key_equals(KeyEquals::new(
+            "request.id",
+            KeyType::Str,
+            ravel_logseg::key_index::key8_str("absent"),
+        ));
+        let after = keyed_on_r2(LogQuery::new(seg_ref.max_event_ts_ns + 1, i64::MAX));
+        for (name, query, pruned, want) in [
+            (
+                "present",
+                keyed_on_r2(LogQuery::new(i64::MIN, i64::MAX)),
+                0,
+                1,
+            ),
+            ("absent", absent, 1, 1),
+            ("outside the window", after, 0, 0),
+        ] {
+            let plan = QueryAccounting::new();
+            let key_index = QueryAccounting::new();
+            let pruning = fetcher
+                .probe_segment_keyed(&seg_ref, TENANT, &query, &plan, &key_index)
+                .await
+                .expect("key probe");
+            assert_eq!(pruning.segments_pruned, pruned, "{name}");
+            assert_eq!(opened(&plan, &key_index), (want, 0), "{name}");
         }
     }
 
