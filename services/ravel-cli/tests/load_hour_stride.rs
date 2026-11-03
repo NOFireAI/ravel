@@ -724,7 +724,10 @@ fn spans_fixture(
         ("trace_id", bin(&trace_ids)),
         ("span_id", bin(&span_ids)),
         ("name", Arc::new(StringArray::from(names)) as ArrayRef),
-        ("start_ns", Arc::new(Int64Array::from(ts.clone())) as ArrayRef),
+        (
+            "start_ns",
+            Arc::new(Int64Array::from(ts.clone())) as ArrayRef,
+        ),
         ("end_ns", Arc::new(Int64Array::from(ts)) as ArrayRef),
     ])
     .expect("batch");
@@ -732,8 +735,7 @@ fn spans_fixture(
         .set_max_row_group_row_count(Some(row_group_rows))
         .build();
     let file = std::fs::File::create(&parquet).expect("create parquet");
-    let mut writer =
-        ArrowWriter::try_new(file, batch.schema(), Some(props)).expect("arrow writer");
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).expect("arrow writer");
     writer.write(&batch).expect("write batch");
     writer.close().expect("close writer");
     Fixture {
@@ -769,8 +771,15 @@ async fn strided_spans_land_one_record_per_shard_in_each_planned_hour() {
     let mut per_hour: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for record in signal_commit_records(store.as_ref(), "s").await {
         let planned = hour_of(record.min_event_ts_ns);
-        assert_eq!(hour_of(record.max_event_ts_ns), planned, "one batch per record");
-        assert_eq!(record.ingest_hour_bucket, planned, "bucket is the planned hour");
+        assert_eq!(
+            hour_of(record.max_event_ts_ns),
+            planned,
+            "one batch per record"
+        );
+        assert_eq!(
+            record.ingest_hour_bucket, planned,
+            "bucket is the planned hour"
+        );
         assert_eq!(
             hour_of(record.created_unix_ns),
             planned,
@@ -837,8 +846,10 @@ async fn a_list_store_error_fails_the_load_before_any_put() {
         "a store error is not a refusal: {err:#}"
     );
     assert!(
-        err.to_string()
-            .contains(&format!("--ingest-hour-stride: could not list t/{}/l/c/", tenant_hex())),
+        err.to_string().contains(&format!(
+            "--ingest-hour-stride: could not list t/{}/l/c/",
+            tenant_hex()
+        )),
         "{err:#}"
     );
     assert!(faults.fault_count(Op::List, FaultKind::Permanent) >= 1);
@@ -968,7 +979,11 @@ async fn a_head_that_appears_mid_load_stops_the_next_batch() {
         })
         .collect();
     buckets.sort_unstable();
-    assert_eq!(buckets, vec![start, start + 1, start + 2], "batches 0 to 2 intact");
+    assert_eq!(
+        buckets,
+        vec![start, start + 1, start + 2],
+        "batches 0 to 2 intact"
+    );
 }
 
 /// A start below the write path's plausible-clock floor is refused before any

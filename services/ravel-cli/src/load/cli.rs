@@ -961,10 +961,7 @@ async fn run_spans(
         }
         Err(err) => {
             let strided = hour_stride.is_some();
-            print_durable_tokens(
-                &err,
-                (!strided).then_some(SEQUENTIAL_RESUMABLE_SETTINGS),
-            );
+            print_durable_tokens(&err, (!strided).then_some(SEQUENTIAL_RESUMABLE_SETTINGS));
             print_spans_attrs_dropped(&report, AttrsDroppedScope::Failed);
             if strided {
                 let _ = writeln!(warnings, "{STRIDED_NOT_RESUMABLE}");
