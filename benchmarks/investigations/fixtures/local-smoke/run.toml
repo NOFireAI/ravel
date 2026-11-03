@@ -7,13 +7,18 @@
 
 [run]
 lane = "local"
-states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed", "many_parts"]
+states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight", "many_parts_24"]
 cold_runs = 2
 warm_runs = 1
 hits = false
 scales = [1]
 baseline = false
 mixed_wait_max_minutes = 70
+max_minutes = 540
+# Every logs object is inspected for the needle-block count at this scale.
+needle_blocks_max_objects = 0
+# Two L0 objects per shard and hour, so compaction_in_flight has inputs.
+split_base_load = true
 
 [corpus]
 traces = 1000
@@ -27,8 +32,9 @@ tenant = "inv"
 shards = 2
 memory_budget_bytes = 1000000000
 
-[unsupported_states]
-many_parts = "ravel-cli load has no --ingest-hour-stride on this build, so the many-parts state (one part per ingest hour across the corpus) cannot be built"
+[many_parts]
+traces_per_hour = 10
+snapshot_part_max_entries = 1
 
 [prices]
 get_per_1000 = 0.0004

@@ -1,8 +1,0 @@
-{
- "build": "prebuilt binaries from --bin-dir; README.md \"Local lane\" gives the build",
- "dirty_paths": 12,
- "lane": "local",
- "ravel_cli_sha256": "cabeac6a4e413161a19102af4edbec83e3fa63b9d2de31f7f024596eeb069058",
- "ravel_server_sha256": "691cc29b2b06b8016a0e4b239adc4977719acc512e87663bf9712c8bd87dc03f",
- "sha": "462a2cddfd6e82cc2008c79f0d84dee3f6efb1e1"
-}
