@@ -270,7 +270,10 @@ jobs:
     runs-on: ubuntu-latest
     # The job took 7.5 to 9.5 minutes on main before the ClickBench kit's
     # sampler cases were added, and the kit suite alone now runs over 5.
-    timeout-minutes: 20
+    # Measured on 2026-11-03 over the last four main runs: 14.5 to 19.4
+    # minutes, and the investigations harness cases add about 100 s, so
+    # 20 was crossed on the first run that carried them.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
