@@ -324,12 +324,20 @@ async fn alerts_table_statement_opens_every_object_under_scan() {
 /// under the fetcher's 512 KiB whole-object threshold, so the unplanned
 /// route (ADR-2677 decision 2) opens each under `scan`.
 async fn small_logs_router() -> Router {
+    small_logs_router_with_cache(None).await
+}
+
+/// [`small_logs_router`] with the logs fetcher reading through `cache`.
+async fn small_logs_router_with_cache(cache: Option<ReadCache>) -> Router {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     for (seq, code) in [(0, 500), (1, 400), (2, 400)] {
         publish_small_log(store.as_ref(), seq, code).await;
     }
     let catalog = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
-    let logs = LogSegmentFetcher::new(store.clone());
+    let mut logs = LogSegmentFetcher::new(store.clone());
+    if let Some(cache) = cache {
+        logs = logs.with_cache(cache);
+    }
     let executor = SqlExecutor::new(
         catalog,
         SegmentFetcher::new(store.clone()),
@@ -385,6 +393,32 @@ async fn small_object_equality_opens_every_object_under_scan() {
         "{v}"
     );
     assert_eq!(segments_opened(&v), want(0, 0, 0, 3, 0), "{v}");
+}
+
+/// The logs counterpart of the warm trace lookup below: the same statement
+/// twice through one read cache records the same three opens under `plan`
+/// (the fast-path verdict decodes every footer there),
+/// the second run with no data GET in any phase, so `segmentsOpened` counts
+/// decoded footers whatever served their bytes.
+#[tokio::test]
+async fn warm_logs_statement_opens_the_same_objects_with_zero_data_gets() {
+    let app = small_logs_router_with_cache(Some(server_cache(64 * 1024 * 1024))).await;
+    let sql = "SELECT body FROM logs WHERE status_code = 500";
+    let cold = post_sql(&app, sql, 0.0, NOW_NS as f64 / 1e9).await;
+    let warm = post_sql(&app, sql, 0.0, NOW_NS as f64 / 1e9).await;
+    assert_eq!(value_rows(&warm), value_rows(&cold), "{warm}");
+    assert_eq!(value_rows(&cold).len(), 4, "{cold}");
+    assert_eq!(segments_opened(&cold), want(0, 3, 0, 0, 0), "{cold}");
+    assert_eq!(segments_opened(&warm), want(0, 3, 0, 0, 0), "{warm}");
+    assert_eq!(phase_field(&cold, "plan", "s3GetRequests"), 3, "{cold}");
+    for phase in DATA_PHASES {
+        assert_eq!(
+            phase_field(&warm, phase, "s3GetRequests"),
+            0,
+            "{phase}: {warm}"
+        );
+    }
+    assert!(phase_field(&warm, "plan", "cacheHits") >= 3, "{warm}");
 }
 
 fn value_rows(v: &Value) -> Vec<String> {
@@ -560,6 +594,10 @@ async fn key_indexed_equality_opens_every_object_under_plan_not_scan() {
     // footer is still opened to run the probe, so the open counts under
     // `plan`, not `scan`.
     assert_eq!(segments_opened(&v), want(0, 3, 0, 0, 0), "{v}");
+    // Object 0 is read by two ranged GETs, the plan pass's tail probe and the
+    // scan's block run, and counts once: 4 GETs over 3 objects, 3 opens.
+    assert_eq!(phase_field(&v, "plan", "s3GetRequests"), 3, "{v}");
+    assert_eq!(phase_field(&v, "scan", "s3GetRequests"), 1, "{v}");
 }
 
 /// The same three objects under the fetcher's default thresholds and two SQL
@@ -619,7 +657,7 @@ fn phase_field(v: &Value, phase: &str, field: &str) -> u64 {
 /// none is pruned (every object holds `status_code = 400`), and the scan
 /// reads each survivor whole under `scan` without recording a second open.
 ///
-/// FLIP: setting `footer_counted` to `false` for `SegmentPlan::Unplanned` in
+/// FLIP: setting `footer_counted` to `false` for `UnitBlocks::Unplanned` in
 /// `OwnedSeg` publication (`crates/ravel-sql/src/logs_scan/plan.rs`) records
 /// each object again under `scan`: `left: {.., "plan": 3, .., "scan": 3}`.
 #[tokio::test]
