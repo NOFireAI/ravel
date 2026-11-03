@@ -84,6 +84,7 @@ async fn row_groups_at(
         None,
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),
+        None,
         now_ns,
     )
     .await

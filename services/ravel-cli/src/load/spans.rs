@@ -53,6 +53,8 @@ pub struct SpansLoadReport {
     /// (`DepthWindow::realign_gave_up`): 0, or 1 when the shards had not
     /// handled a batch within the 30 s settle timeout.
     pub realign_gave_up: u64,
+    /// `--ingest-hour-stride`'s report fields, set when the stride was.
+    pub synthetic_ingest_hours: Option<SyntheticIngestHours>,
 }
 
 impl SpansLoadReport {
@@ -75,6 +77,7 @@ impl SpansLoadReport {
             flush_mix: self.flush_mix.clone(),
             target_bytes_no_effect_warning: self.target_bytes_no_effect_warning.clone(),
             realign_gave_up: self.realign_gave_up,
+            synthetic_ingest_hours: self.synthetic_ingest_hours.clone(),
         }
     }
 }
@@ -1030,6 +1033,48 @@ pub(super) async fn load_spans_into(
     clock: Arc<dyn Clock>,
     rules: Arc<TenantRules>,
 ) -> Result<(), LoadError> {
+    load_spans_into_lane(
+        report,
+        store,
+        parquet_path,
+        tenant,
+        mapping,
+        shards,
+        batch_rows,
+        skip_rows,
+        request,
+        on_geometry,
+        max_inflight_flushes,
+        max_flush_delay,
+        now_ns,
+        clock,
+        rules,
+        None,
+    )
+    .await
+}
+
+/// [`load_spans_into`] with `--ingest-hour-stride`'s lane, which moves the
+/// clock to each batch's hour immediately before the batch is submitted.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn load_spans_into_lane(
+    report: &mut SpansLoadReport,
+    store: Arc<dyn ObjectStoreBackend>,
+    parquet_path: &Path,
+    tenant: &str,
+    mapping: &SpansMapping,
+    shards: u32,
+    batch_rows: usize,
+    skip_rows: u64,
+    request: GeometryRequest,
+    on_geometry: Option<GeometryHook>,
+    max_inflight_flushes: u32,
+    max_flush_delay: Option<Duration>,
+    now_ns: i64,
+    clock: Arc<dyn Clock>,
+    rules: Arc<TenantRules>,
+    hour_stride: Option<&HourStrideLane>,
+) -> Result<(), LoadError> {
     // Same operator-facing lever guards as the other paths: a value that
     // cannot express what the flag means is rejected, never silently clamped.
     if batch_rows == 0 {
@@ -1203,6 +1248,37 @@ pub(super) async fn load_spans_into(
             continue;
         }
 
+        // `--ingest-hour-stride`: at depth 1 the previous batch is acked by
+        // now, so its hour holds all of its flushes; move to this batch's.
+        if let Some(lane) = hour_stride {
+            let max_event_ns = spans.iter().map(|s| s.end_ts_ns).max().unwrap_or(i64::MIN);
+            if let Err(error) = lane.admit_batch(max_event_ns).await {
+                let refusal = error.to_string();
+                let (durable, reason) = drain_sequential_before_refusal(
+                    &mut inflight,
+                    report,
+                    refusal.clone(),
+                    lazy.as_ref().map(|(r, _, _)| r.as_ref()),
+                    &mut enqueue,
+                )
+                .await;
+                // An earlier write that failed while draining is named beside
+                // the refusal, so the error is no longer only the lane's.
+                if reason != refusal {
+                    return Err(LoadError::BatchFailed {
+                        reason,
+                        durable,
+                        resume: report.resume(),
+                    });
+                }
+                return Err(LoadError::HourStride {
+                    error,
+                    durable,
+                    resume: report.resume(),
+                });
+            }
+        }
+
         let announce = lazy.is_none() && on_geometry.is_some();
         let (router, geometry, window) = lazy.get_or_insert_with(|| {
             let resolved = resolve_geometry(
@@ -1303,6 +1379,7 @@ pub(super) async fn load_spans_into(
     // `--target-bytes`, so its writes' acks would otherwise wait out the age
     // trigger. Every submit is enqueued first, so the flush drains every
     // buffered write; the ticker is a backstop that should find nothing.
+    report.synthetic_ingest_hours = hour_stride.map(HourStrideLane::report);
     let Some((router, geometry, window)) = lazy else {
         // Nothing was decoded, so nothing was submitted.
         report.elapsed = started.elapsed();
@@ -1331,6 +1408,14 @@ pub(super) async fn load_spans_into(
         result
     };
     drain_result?;
+    if let Some(lane) = hour_stride {
+        lane.check_hour_kept()
+            .map_err(|error| LoadError::HourStride {
+                error,
+                durable: report.tokens.clone(),
+                resume: report.resume(),
+            })?;
+    }
 
     let m = router.metrics_snapshot();
     let totals = FlushMixCounts {

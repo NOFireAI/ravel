@@ -100,6 +100,7 @@ async fn field_dir_ids_at(
         None,
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),
+        None,
         now_ns,
     )
     .await
