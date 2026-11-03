@@ -911,9 +911,11 @@ the cursor pinned it, and a digest cannot answer that.
 ### Redemption
 
 A cursor stays valid until the protection horizon minus the grace period,
-measured from the instant the cursor was minted. The deadline of the call
-that minted it does not bound it: a cursor is redeemed by a later call,
-which runs under its own deadline.
+measured from its mint instant, which is the instant page one resolved: a
+later page resolves at that same instant and carries it into the cursor it
+mints, so every cursor of one walk shares one window. The deadline of the
+call that minted a cursor does not bound it: a cursor is redeemed by a later
+call, which runs under its own deadline.
 
 Redeeming a cursor does two things. The server holds nothing in between
 calls.
