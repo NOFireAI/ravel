@@ -23,7 +23,9 @@
     evaltool.py score DIR ID TRANSCRIPT CONTEXT OUT
                                              score one transcript
     evaltool.py summarize RESULTS_DIR OUT    write summary.tsv over record.json
-    evaltool.py field JSON_FILE DOTTED.KEY   print one value, empty when absent
+    evaltool.py field JSON_FILE DOTTED.KEY   print one value; exit 1 when absent
+    evaltool.py field-opt JSON_FILE DOTTED.KEY
+                                             print one value, empty when absent
     evaltool.py kv OUT KEY=VALUE ...         write a flat JSON object
     evaltool.py now                          print the wall clock in unix ns
 
@@ -60,6 +62,9 @@ OFFSET_RE = re.compile(r"^(T0|now)(([+-])(\d+)([smhd]))?$")
 UNIT_NS = {"s": 10**9, "m": 60 * 10**9, "h": 3600 * 10**9, "d": 86400 * 10**9}
 PLACEHOLDER_RE = re.compile(r"\{(hhmm:[^}]+|prior_snapshot_id|late_label)\}")
 
+# Every envelope status that is not an error (ravel_mcp::envelope::Status).
+SUCCESS_STATUSES = ("ok", "ok_bounded", "ok_page")
+
 # Summary columns, each with its unit, in the order summary.tsv writes them.
 SUMMARY_COLUMNS = [
     ("case", "id"), ("run", "index"), ("status", "ran|not_run"),
@@ -67,7 +72,8 @@ SUMMARY_COLUMNS = [
     ("evidence_completeness", "ratio 0-1"), ("completed", "bool"),
     ("tool_calls", "count"), ("within_call_bound", "bool"),
     ("invalid_queries", "count"), ("max_retries_per_failure_class", "count"),
-    ("profile_violations", "count"), ("wall_time_ms", "ms"),
+    ("profile_violations", "count"), ("budget_violations", "count"),
+    ("unrepaired_failure_classes", "list"), ("wall_time_ms", "ms"),
     ("store_requests", "count, server budget.actual.store_requests"),
     ("store_wire_bytes", "bytes, server budget.actual.bytes_scanned (object-store wire bytes)"),
     ("calls_without_actual", "count"),
@@ -594,7 +600,7 @@ def retries(calls, envs):
             if calls[j].get("tool") != tool:
                 continue
             n += 1
-            if envs[j].get("status") in ("ok", "ok_bounded"):
+            if envs[j].get("status") in SUCCESS_STATUSES:
                 repaired = n
                 break
         out[cls] = repaired
@@ -619,9 +625,18 @@ def budget_violations(calls, budget):
             if v is None or c.get("tool") not in tools:
                 continue
             got = args.get(k)
-            if not isinstance(got, int) or got > v:
+            if isinstance(got, bool) or not isinstance(got, int) or got > v:
                 n += 1
     return n
+
+
+def cell(value):
+    """One summary.tsv cell: empty for an absent figure, JSON for a list."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return str(value)
 
 
 def summarize(results_dir, out):
@@ -634,16 +649,19 @@ def summarize(results_dir, out):
         f.write("# units: " + "; ".join("%s=%s" % c for c in SUMMARY_COLUMNS) + "\n")
         f.write("\t".join(c for c, _ in SUMMARY_COLUMNS) + "\n")
         for r in rows:
-            f.write("\t".join("" if r.get(c) is None else str(r.get(c)) for c, _ in SUMMARY_COLUMNS) + "\n")
+            f.write("\t".join(cell(r.get(c)) for c, _ in SUMMARY_COLUMNS) + "\n")
     sys.stdout.write("summary: %d records in %s\n" % (len(rows), out))
     return 0
 
 
-def field(path, dotted):
+def field(path, dotted, required=True):
     obj = load_json(path)
     for part in dotted.split("."):
         obj = obj.get(part) if isinstance(obj, dict) else None
     if obj is None:
+        if required:
+            sys.stderr.write("%s: %s is absent\n" % (path, dotted))
+            return 1
         return 0
     sys.stdout.write((obj if isinstance(obj, str) else json.dumps(obj)) + "\n")
     return 0
@@ -692,6 +710,8 @@ def main(argv):
             return summarize(a[1], a[2])
         if a[:1] == ["field"] and len(a) == 3:
             return field(a[1], a[2])
+        if a[:1] == ["field-opt"] and len(a) == 3:
+            return field(a[1], a[2], required=False)
         if a[:1] == ["kv"] and len(a) >= 2:
             return write_kv(a[1], a[2:])
         if a[:1] == ["now"] and len(a) == 1:

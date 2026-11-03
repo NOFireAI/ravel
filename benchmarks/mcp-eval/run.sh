@@ -101,8 +101,9 @@ require_token() {
 check_out_dir() {
   out=$1
   [ -n "$out" ] || die 64 "--out DIR is required"
-  mkdir -p "$out" || die 64 "cannot create $out"
-  out_abs=$(cd "$out" && pwd -P) || die 64 "cannot resolve $out"
+  parent=$(dirname "$out")
+  parent_abs=$(cd "$parent" && pwd -P) || die 64 "the parent of $out does not exist"
+  out_abs="$parent_abs/$(basename "$out")"
   repo=$(cd "$HERE" && git rev-parse --show-toplevel 2>/dev/null) || repo=""
   if [ -n "$repo" ]; then
     repo=$(cd "$repo" && pwd -P)
@@ -110,6 +111,7 @@ check_out_dir() {
       "$repo"/*) die 64 "--out $out_abs is inside the repository $repo; name a directory outside it" ;;
     esac
   fi
+  mkdir -p "$out_abs" || die 64 "cannot create $out_abs"
   OUT=$out_abs
 }
 
@@ -207,7 +209,7 @@ run_case() {
   cid=$3
   cdir="$pass_dir/$cid"
   mkdir -p "$cdir" || die 1 "cannot create $cdir"
-  setup=$(py field "$ROOT/corpus/$cid.json" setup) || die 1 "cannot read case $cid"
+  setup=$(py field-opt "$ROOT/corpus/$cid.json" setup) || die 1 "cannot read case $cid"
   if [ "$setup" = "storage_fault" ] && [ -z "${MCP_EVAL_FAULT_CMD:-}" ]; then
     py kv "$cdir/record.json" "case=$cid" "run=$n" "profile=$PROFILE" "condition=$CONDITION" \
       "ravel_sha=$MCP_EVAL_RAVEL_SHA" "status=not_run" \
