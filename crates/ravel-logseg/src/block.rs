@@ -15,6 +15,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::decoded_cache::{MemoSlot, ReservationCell, StrBuffers};
 use crate::dict_values::{DictValues, Validity};
 use crate::encoding::{
     DecodedStrings, Enc, count_present, decode_bitmap, decode_f64, decode_fixed, decode_i64_into,
@@ -1604,10 +1605,18 @@ const PLAIN_VALUES_MAX: usize = crate::columnar_batch::VAR_BYTES_MAX;
 /// and the rows' presence. Row `r` spans `offsets[r]..offsets[r + 1]`; an
 /// absent row's span is empty and its presence bit unset, so it reads `None`
 /// while a present empty string reads `Some(&[])`.
+///
+/// The validated values and the offsets sit behind `Arc`s of their own, so an
+/// Arrow buffer built over them shares the bytes without holding the column
+/// (ADR-3326, zero-copy values amendment, decision 3). `memo` holds that
+/// array once `ravel-sql` builds it, and `cell` the decoded-cache
+/// reservation once the column is admitted.
 pub(crate) struct PlainColumn {
     values: PlainValues,
-    offsets: Vec<u32>,
+    offsets: Arc<Vec<u32>>,
     present: Validity,
+    memo: MemoSlot,
+    cell: Arc<ReservationCell>,
 }
 
 /// A plain column's values buffer. `Text` when the decode checked that the
@@ -1617,7 +1626,7 @@ pub(crate) struct PlainColumn {
 /// and a reader validates the cell it reads, as [`DictValues`] does for a
 /// dictionary.
 enum PlainValues {
-    Text(String),
+    Text(Arc<String>),
     Raw(Vec<u8>),
 }
 
@@ -1693,8 +1702,10 @@ impl PlainColumn {
         }
         Ok(PlainColumn {
             values: PlainValues::Raw(blob.to_vec()),
-            offsets,
+            offsets: Arc::new(offsets),
             present: bits,
+            memo: MemoSlot::default(),
+            cell: Arc::default(),
         })
     }
 
@@ -1709,11 +1720,13 @@ impl PlainColumn {
             values,
             offsets,
             present,
+            memo,
+            cell,
         } = self;
         let values = match values {
             PlainValues::Raw(raw) => match String::from_utf8(raw) {
                 Ok(s) if offsets.iter().all(|&o| s.is_char_boundary(o as usize)) => {
-                    PlainValues::Text(s)
+                    PlainValues::Text(Arc::new(s))
                 }
                 Ok(s) => PlainValues::Raw(s.into_bytes()),
                 Err(e) => PlainValues::Raw(e.into_bytes()),
@@ -1724,6 +1737,43 @@ impl PlainColumn {
             values,
             offsets,
             present,
+            memo,
+            cell,
+        }
+    }
+
+    /// Whether every row is present, by a popcount of the presence bitmap.
+    pub(crate) fn all_present(&self) -> bool {
+        self.present.count_set() == self.rows()
+    }
+
+    /// The last offset: the column's value bytes.
+    pub(crate) fn last_offset(&self) -> u32 {
+        self.offsets.last().copied().unwrap_or(0)
+    }
+
+    /// The memo slot, for a column whose text was validated; `None` for a
+    /// `Raw` one, which never holds a memo.
+    pub(crate) fn memo_slot(&self) -> Option<&MemoSlot> {
+        self.text_validated().then_some(&self.memo)
+    }
+
+    /// The column's reservation cell.
+    pub(crate) fn reservation_cell(&self) -> &Arc<ReservationCell> {
+        &self.cell
+    }
+
+    /// The validated values and the offsets, each shared. A `Raw` column
+    /// shares only its offsets and an empty text, and is never asked: it
+    /// holds no memo slot ([`Self::memo_slot`]).
+    pub(crate) fn shared_buffers(&self) -> StrBuffers {
+        let values = match &self.values {
+            PlainValues::Text(s) => Arc::clone(s),
+            PlainValues::Raw(_) => Arc::default(),
+        };
+        StrBuffers::Plain {
+            values,
+            offsets: Arc::clone(&self.offsets),
         }
     }
 
@@ -1848,6 +1898,54 @@ impl CachedColumn {
     /// [`crate::decoded_cache::DecodedColumnCache::offer`] refuses.
     pub(crate) fn is_unvalidated_dict(&self) -> bool {
         matches!(self, CachedColumn::Dict(d) if !d.values.validated())
+    }
+
+    /// The memo slot a scan may fill for this column (ADR-3326, zero-copy
+    /// values amendment, decision 1): a plain column's when its text was
+    /// validated, and a dictionary's when this entry charges the dictionary
+    /// in full (a block's own, not a row group's share) and it was built
+    /// validated, as text alone or as text beside non-UTF-8 entries.
+    pub(crate) fn memo_slot(&self) -> Option<&MemoSlot> {
+        match self {
+            CachedColumn::Plain(p) => p.memo_slot(),
+            CachedColumn::Dict(d) if !d.narrow => d.values.memo_slot(),
+            _ => None,
+        }
+    }
+
+    /// Whether [`Self::memo_slot`] is `Some`: whether
+    /// [`DecodedColumnCache::offer`](crate::decoded_cache::DecodedColumnCache::offer)
+    /// charges the memo constant.
+    pub(crate) fn memo_capable(&self) -> bool {
+        self.memo_slot().is_some()
+    }
+
+    /// Whether the column's memo is filled and reports a buffer held outside
+    /// it.
+    pub(crate) fn memo_held_outside(&self) -> bool {
+        self.memo_slot().is_some_and(MemoSlot::held_outside)
+    }
+
+    /// The reservation cell an entry over this column shares with the
+    /// column: a plain column's own, and a dictionary's when the entry
+    /// charges it in full. `None` for any other column, whose entry gets a
+    /// cell of its own: a row group dictionary is shared by several entries,
+    /// each with its own reservation.
+    pub(crate) fn reservation_cell(&self) -> Option<Arc<ReservationCell>> {
+        match self {
+            CachedColumn::Plain(p) => Some(Arc::clone(p.reservation_cell())),
+            CachedColumn::Dict(d) if !d.narrow => Some(Arc::clone(d.values.reservation_cell())),
+            _ => None,
+        }
+    }
+
+    /// A plain column over `cells`, one per block row, validated as the
+    /// decode validates a column it offers the cache. Test constructor.
+    #[cfg(test)]
+    pub(crate) fn plain_for_test(cells: &[Option<Vec<u8>>]) -> Result<Self, LogSegError> {
+        Ok(CachedColumn::Plain(Arc::new(
+            PlainColumn::from_cells(cells)?.validate_text(),
+        )))
     }
 
     /// A per-block dictionary column over `entries`, one id per row, built
@@ -2470,6 +2568,34 @@ impl DecodedBlock {
     pub(crate) fn str_column(&self, column_id: u32) -> Option<&StrColumn> {
         self.bump_lookup();
         self.str_cols.get(column_id)
+    }
+
+    /// The memo slot of string column `column_id` when one of `pins` holds
+    /// the very column the block reads (ADR-3326, zero-copy values amendment,
+    /// decision 1): the same plain column, or the same dictionary charged in
+    /// full by the entry. `None` for a column no entry holds, one a narrowing
+    /// replaced, a row group dictionary, or one with no memo slot
+    /// ([`CachedColumn::memo_slot`]).
+    pub(crate) fn memo_source<'a>(
+        &'a self,
+        column_id: u32,
+        pins: &'a [Arc<crate::decoded_cache::DecodedEntry>],
+    ) -> Option<crate::decoded_cache::MemoSource<'a>> {
+        use crate::decoded_cache::{MemoBuffers, MemoSource};
+        let col = self.str_cols.get(column_id)?;
+        let entry = pins.iter().find(|e| match (col, e.column()) {
+            (StrColumn::Plain(p), CachedColumn::Plain(q)) => Arc::ptr_eq(p, q),
+            (StrColumn::Dict(d), CachedColumn::Dict(parts)) => {
+                !parts.narrow && Arc::ptr_eq(d.values(), &parts.values)
+            }
+            _ => false,
+        })?;
+        let slot = entry.column().memo_slot()?;
+        let buffers = match col {
+            StrColumn::Plain(p) => MemoBuffers::Plain(p),
+            StrColumn::Dict(d) => MemoBuffers::Dict(d.values()),
+        };
+        Some(MemoSource::new(slot, entry.reservation_cell(), buffers))
     }
 
     /// [`Self::str_column`], mutable, for the scan's survivor-only build.
