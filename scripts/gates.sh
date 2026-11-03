@@ -368,7 +368,9 @@ run_feature_lanes() {
   # `--agents` and `--mcp` are declared in every build
   # (services/ravel-server/src/config.rs), so `tests/cli_reference.rs`
   # passes under either feature, and the binaries that do not mention the
-  # feature already run in the main suite without it. This is the one
+  # feature already run in the main suite without it. A binary whose tests
+  # compile only under the feature has no such second run, so each lane
+  # names every one of those. This is the one
   # statement of that reason; scripts/affected-tests.sh and ci.yml's
   # features-agents and features-mcp jobs point here.
   # The classification test stays in ravel-catalog and covers
@@ -394,14 +396,16 @@ run_feature_lanes() {
     fi
   fi
   # ravel-server's `mcp` feature (ADR-1374): the /mcp route and its tests
-  # compile only under it. Same shape as the agents lane above: mcp_e2e and
-  # trace_by_id (whose `with_mcp` module compiles only under the feature)
-  # whole, and the lib tests whole. The Ravel Agents MCP tools compile only
+  # compile only under it. Same shape as the agents lane above: mcp_e2e,
+  # trace_by_id (whose `with_mcp` module compiles only under the feature),
+  # mcp_conformance, mcp_escape_routes and mcp_audit whole, and the lib tests
+  # whole. Every binary gated on `feature = "mcp"` belongs in this list: one
+  # left out compiles in every lane and runs in none. The Ravel Agents MCP tools compile only
   # with both features, so mcp_agents_e2e and the clippy run that covers the
   # adapter's agents path run under `mcp,agents`.
   if [[ ${want_mcp} -eq 1 ]]; then
     run cargo clippy --locked -p ravel-server --features mcp --all-targets -- -D warnings
-    run_lane_tests -p ravel-server --features mcp --test mcp_e2e --test trace_by_id
+    run_lane_tests -p ravel-server --features mcp --test mcp_e2e --test trace_by_id --test mcp_conformance --test mcp_escape_routes --test mcp_audit
     run_lane_tests -p ravel-server --features mcp --lib
     run cargo clippy --locked -p ravel-server --features mcp,agents --all-targets -- -D warnings
     run_lane_tests -p ravel-server --features mcp,agents --test mcp_agents_e2e

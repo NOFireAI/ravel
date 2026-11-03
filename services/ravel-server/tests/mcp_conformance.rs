@@ -142,22 +142,24 @@ async fn an_unsupported_revision_header_is_refused() {
 
     let store_calls_before = metrics.snapshot();
     for unsupported in ["2025-06-18", "2024-11-05", "1999-01-01"] {
-        assert_refused_by_the_header_check(
+        assert_refused_for_revision(
             post_raw(
                 &running,
                 &call_headers(unsupported),
                 tools_call_body(unsupported).to_string(),
             )
             .await,
+            unsupported,
         )
         .await;
-        assert_refused_by_the_header_check(
+        assert_refused_for_revision(
             post_raw(
                 &running,
                 &[("mcp-protocol-version", unsupported)],
                 initialize_body(unsupported).to_string(),
             )
             .await,
+            unsupported,
         )
         .await;
     }

@@ -64,6 +64,7 @@ fn expected_record(tool: &str) -> Option<(&'static str, String)> {
             "describe_data",
             "describe_data signal=metrics after_name=None limit=100".to_string(),
         ),
+        // An empty text is the defect #3734 tracks, pinned until it lands.
         "ravel_find_labels" => ("label_values", String::new()),
         "ravel_explain_query" | "ravel_query_sql" => {
             ("sql", "SELECT value FROM samples".to_string())

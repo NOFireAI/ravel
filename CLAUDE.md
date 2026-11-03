@@ -120,7 +120,8 @@ the page-size-2 runtime and sim run, and the lib tests, plus
 ravel-catalog's sys_proto_format_version_classification test;
 agents_real_store prints a skip line and passes unless
 RAVEL_REAL_STORE_URL is set) and `mcp` (clippy, the
-mcp_e2e and trace_by_id binaries and the lib tests), so `-p ravel-query`
+mcp_e2e, trace_by_id, mcp_conformance, mcp_escape_routes and mcp_audit
+binaries and the lib tests), so `-p ravel-query`
 runs five lanes, and each of them builds into the same `target/` as the
 other four (the disk figures below predate these two lanes). The agents
 lane has one more run with its own trigger, ravel-agents-runtime or
