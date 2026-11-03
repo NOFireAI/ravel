@@ -1068,6 +1068,7 @@ mod tests {
 
     use super::*;
     use crate::ingest_concurrency::IngestConcurrencyLimit;
+    use crate::ingest_hold::{HoldOutcome, IngestHoldGate};
 
     const TOKEN: &str = "t-acme";
 
@@ -1638,6 +1639,162 @@ mod tests {
             "the stalled upload's permit was released"
         );
         assert_eq!(controller.shed_total(), 0, "nothing was shed");
+    }
+
+    /// Observations in a held-time histogram.
+    fn held_count(gate: &IngestHoldGate) -> u64 {
+        gate.held_seconds().buckets.iter().sum()
+    }
+
+    /// 6b over HTTP: congested for 300 ms and then cleared, an upload is
+    /// held, keeps its in-flight permit while held (the `Bounded(1)` ceiling
+    /// has no slot to spare), and is admitted 300 to 310 ms after it arrived,
+    /// counted once as admitted with one held-time sample.
+    ///
+    /// Non-vacuity: a gate that refused at once instead of holding answers
+    /// 429 here, and one that let the request through at once answers before
+    /// the force is lifted.
+    #[tokio::test(start_paused = true)]
+    async fn congestion_cleared_within_the_max_wait_admits_the_held_upload() {
+        use tower::ServiceExt;
+
+        let controller = IngestConcurrencyController::shared_with_hold(
+            IngestConcurrencyLimit::Bounded(1),
+            IngestHoldGate::new(Duration::from_secs(1)),
+        );
+        let app = http_router(&controller);
+        controller.ingest_hold().force_for_test(Some(true));
+
+        let started = tokio::time::Instant::now();
+        let held = tokio::spawn(async move {
+            let response = app
+                .oneshot(http_upload(axum::body::Body::from("payload")))
+                .await
+                .expect("infallible router");
+            (response, started.elapsed())
+        });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            controller.try_admit().is_err(),
+            "the held upload keeps its in-flight permit"
+        );
+        assert!(!held.is_finished(), "still held while congested");
+        controller.ingest_hold().force_for_test(Some(false));
+
+        let (response, waited) = held.await.expect("task does not panic");
+        assert_eq!(response.status(), StatusCode::OK);
+        // hygiene-allow: wall-clock -- `start_paused` makes this tokio's
+        // virtual clock, which moves only when a timer fires.
+        assert!(
+            waited >= Duration::from_millis(300) && waited <= Duration::from_millis(310),
+            "admitted within one hold step of the clear, after {waited:?}"
+        );
+        let gate = controller.ingest_hold();
+        assert_eq!(gate.hold_total(HoldOutcome::Admitted), 1);
+        assert_eq!(gate.hold_total(HoldOutcome::Refused), 0);
+        assert_eq!(held_count(gate), 1);
+        assert_eq!(
+            controller.shed_total(),
+            1,
+            "the only in-flight shed is this test's own probe; the hold is not one"
+        );
+    }
+
+    /// 6c over HTTP: congested throughout, an upload is refused at the max
+    /// wait with 429, `Retry-After: 1` and the hold's message, counted once
+    /// as refused, and its permit is released.
+    ///
+    /// Non-vacuity: a gate with no time limit leaves the upload unanswered at
+    /// `TEST_DEADLINE`.
+    #[tokio::test(start_paused = true)]
+    async fn congestion_through_the_max_wait_refuses_the_upload_429() {
+        use tower::ServiceExt;
+
+        let controller = IngestConcurrencyController::shared_with_hold(
+            IngestConcurrencyLimit::Bounded(1),
+            IngestHoldGate::new(Duration::from_millis(200)),
+        );
+        let app = http_router(&controller);
+        controller.ingest_hold().force_for_test(Some(true));
+
+        let started = tokio::time::Instant::now();
+        let response = tokio::time::timeout(
+            TEST_DEADLINE,
+            app.oneshot(http_upload(axum::body::Body::from("payload"))),
+        )
+        .await
+        .expect("the held upload is answered at the max wait, not left hanging")
+        .expect("infallible router");
+        let waited = started.elapsed();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("refusal body reads");
+        assert_eq!(&body[..], INGEST_HOLD_MESSAGE.as_bytes());
+        // hygiene-allow: wall-clock -- `start_paused` makes this tokio's
+        // virtual clock, which moves only when a timer fires.
+        assert!(
+            waited >= Duration::from_millis(200) && waited < TEST_DEADLINE,
+            "refused at the max wait, after {waited:?}"
+        );
+        let gate = controller.ingest_hold();
+        assert_eq!(gate.hold_total(HoldOutcome::Refused), 1);
+        assert_eq!(gate.hold_total(HoldOutcome::Admitted), 0);
+        assert_eq!(held_count(gate), 1);
+        assert!(
+            controller.try_admit().is_ok(),
+            "the refused upload released its permit"
+        );
+    }
+
+    /// 6c over gRPC: congested throughout, an export is answered
+    /// RESOURCE_EXHAUSTED with the hold's message at the max wait, without
+    /// its body being polled or the service behind the layer being reached.
+    #[tokio::test(start_paused = true)]
+    async fn congestion_through_the_max_wait_refuses_a_grpc_export() {
+        let controller = IngestConcurrencyController::shared_with_hold(
+            IngestConcurrencyLimit::Bounded(1),
+            IngestHoldGate::new(Duration::from_millis(200)),
+        );
+        controller.ingest_hold().force_for_test(Some(true));
+        let mut service = layer(&controller).layer(UnreachableInner);
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let started = tokio::time::Instant::now();
+        let response = tokio::time::timeout(
+            TEST_DEADLINE,
+            service.call(poisoned_request(EXPORT_PATH, polls.clone(), Some(TOKEN))),
+        )
+        .await
+        .expect("the held export is answered at the max wait")
+        .expect("the refusal arm is infallible");
+        let waited = started.elapsed();
+
+        assert_eq!(polls.load(Ordering::SeqCst), 0, "the body is never polled");
+        assert_eq!(
+            grpc_status_of(&response),
+            (
+                tonic::Code::ResourceExhausted,
+                INGEST_HOLD_MESSAGE.to_string()
+            )
+        );
+        // hygiene-allow: wall-clock -- `start_paused` makes this tokio's
+        // virtual clock, which moves only when a timer fires.
+        assert!(
+            waited >= Duration::from_millis(200) && waited < TEST_DEADLINE,
+            "refused at the max wait, after {waited:?}"
+        );
+        assert_eq!(controller.ingest_hold().hold_total(HoldOutcome::Refused), 1);
+        assert!(
+            controller.try_admit().is_ok(),
+            "the refused export released its permit"
+        );
     }
 
     /// A chunked body with no length in its head: `chunks` frames of 64 KiB,
