@@ -918,7 +918,7 @@ mod tests {
     }
 
     /// ADR-3718 D2's three-row step as written before the #3741 amendment,
-    /// kept so the plant below can show that it cycles.
+    /// kept so the plant below can measure its swing.
     fn old_step_for_plant_test(
         p: f64,
         cpu_avg: f64,

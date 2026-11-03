@@ -91,22 +91,25 @@ credentials on gRPC.
 A second, CPU-aware shed draws right between the in-flight permit and the
 credential check (ADR-3718): a background detector samples the process's own
 CPU use and the ingest routers' deferred-flush-trigger rate every 100 ms, and
-moves a shed fraction `p`, capped at `--ingest-cpu-shed-max` (default 0.9),
-to steer the 1-second CPU average toward `--ingest-cpu-shed-threshold` minus
-0.05 (0.90 of the resolved core count at the default 0.95). Each sample `p`
-rises by 0.03 times the CPU error while CPU is more than 0.02 above that
-target and at least one deferred trigger happened in the last second, falls
-by 0.03 times the error while CPU is more than 0.02 below it, and holds
-inside that band, rather than releasing whenever CPU dips below a fixed level
-(ADR-3718, deadband integrator amendment). CPU use alone never raises
-`p`. Every admitted request then draws once against the published `p`. A
+moves a shed fraction `p`, capped at `--ingest-cpu-shed-max` (default 0.5,
+since a client that retries a refused batch after a doubling backoff parks
+every worker once `p` is above 0.5), to steer the 1-second CPU average toward
+`--ingest-cpu-shed-threshold` minus 0.05 (0.90 of the resolved core count at
+the default 0.95). While at least one deferred trigger happened in the last
+second, each sample `p` rises by 0.03 times the CPU error, at least 0.0006,
+unless CPU is more than 0.02 below that target, where it holds. With no
+deferred trigger it falls by 0.03 times the error, at most 0.005 per sample,
+while CPU is more than 0.02 below the target, and holds otherwise, rather
+than releasing whenever CPU dips below a fixed level (ADR-3718, deadband
+integrator amendment). CPU use alone never raises `p`. Every admitted
+request then draws once against the published `p`. A
 drawn refusal goes through the same
 `refuse_from_head` path and the same drain caps as the in-flight shed above
 (`ravel_ingest_head_refusal_undrained_total` counts it the same way), with the
 in-flight permit released first, so an unauthenticated request that arrives
 while shedding also gets 429, not 401: the draw runs before tenant resolution.
 Refusals count on `ravel_ingest_cpu_shed_total{mode}`; the current `p` exports
-as the gauge `ravel_ingest_cpu_shed_fraction`. `--ingest-cpu-shed-threshold 0`
+as the gauge `ravel_ingest_cpu_shed_fraction{mode}`. `--ingest-cpu-shed-threshold 0`
 disables the detector entirely (today's pre-ADR-3718 behavior, no background
 task spawned).
 

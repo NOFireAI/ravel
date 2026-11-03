@@ -96,7 +96,7 @@ OTAP batches draw at a second point, after their stream's tenant is
 resolved; see the OTAP batch amendment below.
 
 The detector keeps a shed fraction `p` between 0 and `--ingest-cpu-shed-max`
-(default 0.9). Each sample it moves `p` by one of three rules, with CPU use
+(default 0.9, 0.5 since the deadband integrator amendment). Each sample it moves `p` by one of three rules, with CPU use
 and deferred triggers averaged over 1 s as in D1. This table and the three
 paragraphs after it are replaced by the deadband integrator amendment below:
 
@@ -165,9 +165,9 @@ The threshold is a fraction of the resolved core count, so the same default
 holds on 8, 16 or more vCPU without tuning. `--ingest-cpu-shed-threshold 0`
 disables shedding, which is today's behaviour. The resolved threshold and the
 core count are logged at startup with the other derived defaults. The
-detector box in the diagram below shows D2's original step, and nonzero
-thresholds must now be above 0.07; see the deadband integrator amendment
-below.
+detector box in the diagram below shows D2's original step, nonzero
+thresholds must now be above 0.07, and `--ingest-cpu-shed-max` now defaults
+to 0.5; see the deadband integrator amendment below.
 
 It is on by default: a server that saturates loses 5% to 24% of its peak
 stored rate (Context), which no operator wants. Shedding is process-wide and does not
@@ -321,53 +321,108 @@ Two things combined:
   (retry after 100 ms, doubling to 5 s). Once `p` fell, they all came back
   at once, deferrals fired, and `p` climbed back to the cap.
 
+A first version of this amendment let `p` rise only with CPU more than 0.02
+above the target and fall by up to 0.027 per sample, symmetric about the
+band, and checked it on a model that counted deferrals whenever the flush
+backlog was above zero. In that model deferrals showed on 100% of samples at
+160k offered: the band spans 143.7k to 150.2k admitted lines/s, across the
+149k flush capacity, and that law held `p` anywhere inside it, so the
+backlog never cleared for a full second. #3741's review replaced both
+the law and the model with the ones below.
+
 D2's step table is replaced by a deadband integrator. Each 100 ms sample,
-with `target = threshold - TARGET_OFFSET` (0.90 at the default threshold)
-and `e = cpu_avg - target`:
+with `target = threshold - TARGET_OFFSET` (0.90 at the default threshold),
+`e = cpu_avg - target` and `d` the 1 s deferred-trigger average of D1:
 
-| Error | Deferred triggers | `p` |
+| `d` | `e` | `p` |
 |---|---|---|
-| `e` above `DEADBAND` | above zero | rises by `GAIN * e`, capped at `--ingest-cpu-shed-max` |
-| `e` below `-DEADBAND` | any | falls by `GAIN * -e`, and snaps to 0 below 0.01 |
-| anything else | any | holds |
+| above 0 | at least `-DEADBAND` | rises by `GAIN * max(e, DEADBAND)`, capped at `--ingest-cpu-shed-max` |
+| above 0 | below `-DEADBAND` | holds |
+| 0 | within `DEADBAND` of 0, either side | holds |
+| 0 | below `-DEADBAND` | falls by `min(GAIN * -e, MAX_FALL_PER_TICK)`, and snaps to 0 below 0.01 |
+| 0 | above `DEADBAND` | holds |
 
-`TARGET_OFFSET` is 0.05, `DEADBAND` is 0.02 and `GAIN` is 0.03 (constants
-in `services/ravel-server/src/cpu_shed.rs`, `step`). `p` moves in
-proportion to how far CPU is from the target and rests anywhere within 0.02
-of it, instead of moving by a fixed step at fixed CPU levels. D1's
-two-signal rule still governs the rise: CPU alone never raises `p`, but the
-rise now starts when CPU is more than 0.02 above the target (about 0.92 by
-default), not at the threshold. The rise is slow: CPU cannot exceed 1.0,
-so at the default threshold `p` gains at most 0.003 per sample, and 0.5
-takes about 17 s from 0. The fall is faster, up to 0.027 per sample with
-CPU at 0.
+`TARGET_OFFSET` is 0.05, `DEADBAND` is 0.02, `GAIN` is 0.03 and
+`MAX_FALL_PER_TICK` is 0.005 (constants in
+`services/ravel-server/src/cpu_shed.rs`, `step`; its unit tests pin every
+row and each row's edges). While triggers are deferred `p` rises by at least
+0.0006 per sample even with CPU inside the band, since a backlog is the
+overload D1 measures whatever CPU reads, and it stops rising only once CPU
+is more than 0.02 below the target. Without deferrals it falls only from
+below the band, by at most 0.005 per sample, so a release from 0.5 to 0
+takes at least 98 samples (9.8 s). D1's two-signal rule still governs the
+rise: CPU alone never raises `p`. At the default threshold CPU cannot exceed
+1.0, so `p` gains at most 0.003 per sample, and 0.5 takes about 17 s from 0.
 
 With this law the fall row is reachable only while `target - DEADBAND` is
 above 0, so `--ingest-cpu-shed-threshold` now refuses any nonzero value at
 or below 0.07 (it refused at or below 0.05 before). 0 still disables
 shedding.
 
+**The cap default moves from 0.9 to 0.5** (D3). A batch refused with
+probability `p` and retried after a doubling backoff waits, on average, the
+sum over `k` of `p^(k+1) * min(100 ms * 2^k, 5 s)`, whose terms grow by `2p`
+each step until the 5 s ceiling. At `p` 0.5 a writer of 2,000-line batches
+with 50 ms sends spends 0.79 of its time backed off and the benchmark's 32
+writers deliver about 134k lines/s; at 0.6 that is 0.88 and 60k lines/s,
+and at 0.9 it is 0.98 and 2.3k lines/s. Above 0.5 such a client parks every
+worker, so a higher cap only stalls it.
+
 The law is checked against a deterministic closed-loop model of the 8 vCPU
-run (`cpu_shed.rs`, module `tests::plant`): 32 writers offering 80 requests
-per second of 2,000 lines with the client backoff above, 49 us of CPU per
-admitted line on 8 cores (work above the cores in one sample carries into
-the next), and a flush path that keeps up with 149k lines/s,
-with deferrals counted while its backlog is above zero. Over 60 s after a
-20 s warm-up at 160k offered, the model measured:
+run (`cpu_shed.rs`, module `tests::plant`, seed `0x3741`, 1 ms steps):
 
-| Law | Mean `p` | `p` range | Admitted / offered | Ticks deferring |
-|---|---|---|---|---|
-| deadband integrator | 0.200 | 0.169 to 0.239 | 0.921 | 100% |
-| D2's three-row step | 0.178 | 0.049 to 0.407 | 0.932 | 100% |
-| same target, no deadband, gain 0.3 | 0.206 | 0.019 to 0.327 | 0.919 | 100% |
+- **Generator.** One shared queue, filled at the offered rate, 400,000 lines
+  deep; lines offered to a full queue are dropped and counted as writer
+  drops.
+- **Writers.** 32 workers each take 2,000 lines from the queue when free. A
+  send takes 50 ms and draws against the `p` the previous sample published.
+  A refused send backs off `min(100 ms * 2^k, 5 s)`, `k` the batch's earlier
+  refusals, then retries the same batch.
+- **CPU.** 49 us per admitted line while the flush backlog is under 75,000
+  lines and 65 us above it (the Context's 59 to 76 us), on 8 cores. Work
+  above the cores in one sample carries into the next, so a sample reads at
+  most 1.0.
+- **Flush.** 149k lines/s of capacity. Deferral is a hysteresis: on once the
+  backlog passes 75,000 lines, off once it returns to 0, and the per-sample
+  deferral reading is 1 while on, else 0, averaged over D1's 10 samples.
 
-These are model outputs, not benchmark measurements. The integrator's `p`
-range is about a fifth of the old step's, and after the offered load drops
-to 100k it releases to exactly 0 within 2.8 s. It does not meet three of
-the bars #3741 set for the model: `p` within 0.03 of its mean (it strays
-0.039), deferrals on fewer than 20% of ticks (the deadband spans 143.7k to
-150.2k admitted lines/s, across the 149k flush capacity, so the backlog is
-above zero at least once in every 1 s window), and settling at 320k offered
-(`p` reaches the 0.9 cap). Those three tests are committed ignored
-with their measured values, pending a decision on #3741. D4's bars are
-unchanged.
+Over the 60 s after a 20 s warm-up the model measured (2026-11-03, the
+`plant` module's output):
+
+| Law | Offered | Mean `p` | `p` range | Largest distance from mean | Admitted / offered | Admitted / 149k | Samples deferring | Writer drops |
+|---|---|---|---|---|---|---|---|---|
+| deadband integrator | 160k | 0.4969 | 0.3957 to 0.5 | 0.1012 | 0.8713 | 0.9356 | 43.8% | 800,080 |
+| deadband integrator | 320k | 0.5 | 0.5 throughout | 0 | 0.4373 | 0.9391 | 100% | 10,798,000 |
+| D2's three-row step | 160k | 0.4945 | 0.1743 to 0.5 | 0.3202 | 0.9060 | 0.9729 | 71.3% | 608,080 |
+| D2's three-row step | 320k | 0.5 | 0.5 throughout | 0 | 0.4729 | 1.0157 | 100% | 10,128,000 |
+| same target, no deadband, gain 0.3 | 160k | 0.5 | 0.5 throughout | 0 | 0.9629 | 1.0340 | 100% | 80,080 |
+| same target, no deadband, gain 0.3 | 320k | 0.5 | 0.5 throughout | 0 | 0.4367 | 0.9378 | 56.2% | 10,822,000 |
+
+These are model outputs, not benchmark measurements, and all three laws run
+at the 0.5 cap. #3741 set seven bars for the model, and the integrator meets
+two: at 320k it admits 0.94 of capacity (at least 0.85) and `p` stays within
+0.15 of its mean. It misses `p` within 0.05 of its mean at 160k (0.1012),
+admitting at least 0.90 of offered at 160k (0.8713), deferring on fewer than
+20% of samples at 160k (43.8%), `p` below the cap at 320k (it sits at 0.5),
+and a release to exactly 0 within 5 s of the offered load dropping from 160k
+to 100k at 40 s (`p` is 0.5 at the drop and still above 0 10 s later). Those
+five tests are committed ignored with their measured values. The model
+shows why. Once the backlog passes 75,000 lines a line costs 65 us, and
+149k lines/s at 65 us is 1.21 of 8 cores, so the carried CPU grows while
+the backlog lasts and the CPU average reads 1.0 across the span at 160k.
+`p` rises at 0.003 per sample until it reaches the cap 23.5 s in, so its
+160k range is the end of that rise. Once deferrals stop, `e` is far above
+the band and the deferral-free rows hold `p` at the cap instead of releasing
+it, and at `p` 0.5 the writers' backoff, not the shed, limits admission to
+about 140k lines/s. The release bar also cannot be met from the cap by
+construction: the fall bound alone takes at least 9.8 s from 0.5, and 5 s
+reaches 0 only from below 0.26, even with the fall row active on the first
+sample after the drop.
+
+No assertion the integrator passes separates it from either wrong law: both
+also admit at least 0.85 of capacity at 320k and hold `p` within 0.15 of its
+mean there. Each wrong law's test asserts the bar it fails instead: D2's
+step strays 0.3202 from its mean at 160k, against 0.05, and gain 0.3 defers
+on every span sample at 160k, against 20%. The integrator fails both of
+those bars as well (0.1012 and 43.8%), so neither test is a discriminator.
+D4's bars are unchanged.

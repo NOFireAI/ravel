@@ -3105,13 +3105,14 @@ pub struct Cli {
     /// probability a new ingest request is refused at the head, before
     /// tenant resolution) steers the 1-second rolling-average CPU toward
     /// `threshold - 0.05`. Every 100ms sample, with `e` the average minus
-    /// that target, `p` rises by `0.03 * e` when `e` is above 0.02 AND the
-    /// 1-second rolling-average rate of deferred flush triggers across every
-    /// ingest router is above zero, capped at `--ingest-cpu-shed-max`; it
-    /// falls by `0.03 * -e` when `e` is below -0.02, snapping to exactly 0
-    /// under 0.01; otherwise it holds, so it stops moving while CPU is
-    /// within 0.02 of the target. CPU alone never raises `p`, since a clean
-    /// ceiling run can sit at over 90% CPU with no backlog at all. Default
+    /// that target: while the 1-second rolling-average rate of deferred
+    /// flush triggers across every ingest router is above zero, `p` rises by
+    /// `0.03 * max(e, 0.02)` when `e` is at least -0.02, capped at
+    /// `--ingest-cpu-shed-max`, and holds otherwise; with no deferrals it
+    /// falls by `0.03 * -e`, at most 0.005, when `e` is below -0.02,
+    /// snapping to exactly 0 under 0.01, and holds otherwise. CPU alone
+    /// never raises `p`, since a clean ceiling run can sit at over 90% CPU
+    /// with no backlog at all. Default
     /// 0.95 is tuned to this scaling so it needs no manual adjustment from
     /// 8 to 16+ vCPU hosts; `0` disables CPU-aware shedding entirely
     /// (today's behavior, with no detector task spawned). Must be `0` or
@@ -3128,16 +3129,18 @@ pub struct Cli {
     pub ingest_cpu_shed_threshold: f64,
 
     /// The cap on ADR-3718's CPU-aware ingest admission shed fraction `p`:
-    /// each 100ms sample `p` rises by 0.03 times how far the CPU average
-    /// sits above `--ingest-cpu-shed-threshold` minus 0.05 (once that is
-    /// more than 0.02 and flush triggers are deferred), and never above this
-    /// value, so at most this fraction of incoming ingest requests is ever
-    /// refused at the head. Default 0.9.
+    /// each 100ms sample with flush triggers deferred, unless the CPU
+    /// average is more than 0.02 below `--ingest-cpu-shed-threshold` minus
+    /// 0.05, `p` rises by 0.03 times how far the average sits above that
+    /// target, by at least 0.0006, and never above this value, so at most
+    /// this fraction of incoming ingest requests is ever refused at the
+    /// head. Default 0.5: a client that retries a refused batch after a
+    /// doubling backoff parks every one of its workers once `p` is above 0.5.
     /// Must be between 0 and 1 inclusive; refused otherwise.
     #[arg(
         long = "ingest-cpu-shed-max",
         value_name = "FRACTION",
-        default_value_t = 0.9,
+        default_value_t = 0.5,
         value_parser = parse_ingest_cpu_shed_max
     )]
     pub ingest_cpu_shed_max: f64,
@@ -4918,7 +4921,7 @@ impl Default for CpuShedConfig {
     fn default() -> Self {
         CpuShedConfig {
             threshold: 0.0,
-            max: 0.9,
+            max: 0.5,
             cores: 1,
         }
     }
@@ -22929,6 +22932,15 @@ mod tests {
                 parse_ingest_cpu_shed_max(value).unwrap_or_else(|err| panic!("{value}: {err}"));
             assert_eq!(parsed, value.parse::<f64>().expect("test value parses"));
         }
+    }
+
+    /// ADR-3718 D3 as amended by #3741: the cap defaults to 0.5, on the flag
+    /// and on `CpuShedConfig::default()` alike.
+    #[test]
+    fn ingest_cpu_shed_max_defaults_to_one_half() {
+        let cli = Cli::parse_validated_from(["ravel-server"]).expect("default config validates");
+        assert_eq!(cli.ingest_cpu_shed_max, 0.5);
+        assert_eq!(CpuShedConfig::default().max, 0.5);
     }
 
     #[test]
