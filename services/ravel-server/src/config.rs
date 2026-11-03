@@ -7249,7 +7249,8 @@ impl Cli {
     ///
     /// This resolves the flag *syntax* and the type spelling; the declaration
     /// rules (empty key, duplicate key, the same key with two types, a
-    /// collision with one of the nine fixed logs SQL columns) are checked by
+    /// collision with one of the nine fixed logs SQL columns, a key starting
+    /// with the reserved `__ravel_` prefix) are checked by
     /// [`TypedAttrColumnConfig::from_policy`](crate::typed_attr_config::TypedAttrColumnConfig::from_policy),
     /// which calls `ravel_catalog::validate_typed_attr_columns` -- the same
     /// function guarding a durable write -- so the flags and the durable record
