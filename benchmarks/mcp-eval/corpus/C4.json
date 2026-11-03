@@ -1,0 +1,8 @@
+{
+  "id": "C4",
+  "journey": "C",
+  "question": "Build a timeline of user u-9999 across logs and spans this hour. Say which keys you searched, which you scanned without an index, and which sources you did not cover.",
+  "window": {"from": "T0", "to": "T0+60m"},
+  "budget": {"deadline_ms": 30000, "max_rows": null, "max_bytes_scanned": null, "max_store_requests": null},
+  "tags": ["no_data"]
+}

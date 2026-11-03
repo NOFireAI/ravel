@@ -1,0 +1,21 @@
+{
+  "id": "C1",
+  "answer_facts": [
+    {"fact": "three failed logins", "pattern": "login failed"},
+    {"fact": "a password reset", "pattern": "password reset"},
+    {"fact": "a successful login", "pattern": "login succeeded"},
+    {"fact": "user trace 5eed...000d", "pattern": "5eed056900000000000000000000000d"},
+    {"fact": "user trace 5eed...0030", "pattern": "5eed0569000000000000000000000030"},
+    {"fact": "user trace 5eed...0060", "pattern": "5eed0569000000000000000000000060"},
+    {"fact": "searched on user.id", "pattern": "user\\.id"},
+    {"fact": "metrics not covered", "pattern": "metric"}
+  ],
+  "evidence": [
+    {"item": "the keys searched", "pattern": "user\\.id"},
+    {"item": "the keys scanned without an index, or none", "pattern": "unindexed|without an index|not indexed|no index|scanned"},
+    {"item": "the sources not covered", "pattern": "not covered|did not (search|cover)|no user\\.id label|metrics"}
+  ],
+  "tools_expected": ["ravel_search_logs", "ravel_query_sql"],
+  "call_bound": 8,
+  "fixture_refs": ["entities.security.user_id", "entities.security.user_trace_ids", "entities.security.auth_events", "counts.target_user_log_rows", "counts.target_user_spans"]
+}

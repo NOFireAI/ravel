@@ -1,0 +1,8 @@
+{
+  "id": "F1",
+  "journey": "F",
+  "question": "How many ERROR log rows did the billing service write this hour? If the answer is empty, classify why: zero matches, window newer than the watermark, refused by budget, storage unavailable, or window outside retention.",
+  "window": {"from": "T0", "to": "T0+60m"},
+  "budget": {"deadline_ms": 30000, "max_rows": null, "max_bytes_scanned": null, "max_store_requests": null},
+  "tags": ["no_data"]
+}

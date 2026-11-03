@@ -1,0 +1,17 @@
+{
+  "id": "A1",
+  "answer_facts": [
+    {"fact": "metrics hold data", "pattern": "metric"},
+    {"fact": "logs hold data", "pattern": "\\blogs?\\b"},
+    {"fact": "traces hold data", "pattern": "trace|span"},
+    {"fact": "3840 samples", "pattern": "3,?840"},
+    {"fact": "725 log rows", "pattern": "\\b725\\b"},
+    {"fact": "480 spans", "pattern": "\\b480\\b"}
+  ],
+  "evidence": [
+    {"item": "the time range read", "pattern": "time.?range|start_ns|window|\\d{4}-\\d{2}-\\d{2}"}
+  ],
+  "tools_expected": ["ravel_describe_data"],
+  "call_bound": 3,
+  "fixture_refs": ["counts.samples", "counts.log_rows", "counts.spans"]
+}

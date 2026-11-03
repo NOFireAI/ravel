@@ -1,0 +1,17 @@
+{
+  "id": "E3",
+  "evidence_ref_served": false,
+  "answer_facts": [
+    {"fact": "4 rows exist now", "pattern": "\\b(4|four)\\b"},
+    {"fact": "the rows committed after the prior snapshot", "pattern": "after|later|since|not (yet )?visible|newer"},
+    {"fact": "the prior snapshot id is cited", "pattern": "{prior_snapshot_id}"}
+  ],
+  "evidence": [
+    {"item": "the prior snapshot id", "pattern": "{prior_snapshot_id}"},
+    {"item": "the new snapshot id", "pattern": "@any_snapshot_id_except_prior"},
+    {"item": "the label queried", "pattern": "{late_label}"}
+  ],
+  "tools_expected": ["ravel_search_logs", "ravel_query_sql"],
+  "call_bound": 3,
+  "fixture_refs": ["counts.late_batch_rows", "entities.late_batch"]
+}

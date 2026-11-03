@@ -1,0 +1,16 @@
+{
+  "id": "A4",
+  "answer_facts": [
+    {"fact": "the request counter family", "pattern": "http_server_requests_total"},
+    {"fact": "the latency gauge family in milliseconds", "pattern": "http_server_duration_p99_milliseconds"},
+    {"fact": "the memory gauge family in bytes", "pattern": "process_resident_memory_bytes"},
+    {"fact": "a counter type is named", "pattern": "counter|monotonic|\\bsum\\b"},
+    {"fact": "a gauge type is named", "pattern": "gauge"},
+    {"fact": "the row ceiling of 5000", "pattern": "5,?000"},
+    {"fact": "a response-byte bound", "pattern": "max_response_bytes|response.bytes|KiB|MiB"}
+  ],
+  "evidence": [],
+  "tools_expected": ["ravel_capabilities", "ravel_describe_data"],
+  "call_bound": 3,
+  "fixture_refs": ["entities.metric_families", "counts.metric_families"]
+}
