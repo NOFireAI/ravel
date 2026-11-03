@@ -116,15 +116,40 @@ pub struct QueryPromqlInput {
     pub evidence_ref: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PredicateOp {
+    Eq,
+    Ne,
+    In,
+    Exists,
+}
+
+/// One string for `eq` and `ne`, a list for `in`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum PredicateValue {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// A condition on a declared or indexed key.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Predicate {
+    pub key: String,
+    pub op: PredicateOp,
+    pub value: Option<PredicateValue>,
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SearchLogsInput {
-    /// Indexed and typed-attribute predicates. Shape is per-predicate; this
-    /// tool has no fixed predicate schema, so each entry is caller-supplied
-    /// JSON.
     #[serde(default)]
-    pub predicates: Vec<AnyJson>,
+    pub predicates: Vec<Predicate>,
     pub has_word: Option<String>,
+    /// trace, debug, info, warn, error or fatal: that level or above.
     pub severity: Option<String>,
+    /// 32 hex characters, either case.
     pub trace_id: Option<String>,
     pub time_range: TimeRange,
     /// Rows returned; default 200, ceiling 5,000.
@@ -137,6 +162,7 @@ pub struct SearchLogsInput {
     pub max_response_bytes: Option<u64>,
     pub deadline_ms: Option<u64>,
     pub cursor: Option<String>,
+    /// Not served by this build: any value is refused as `unsupported`.
     pub evidence_ref: Option<String>,
 }
 

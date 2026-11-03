@@ -354,7 +354,7 @@ impl JsonSchema for Cell {
 /// block's `effective`/`actual`/`estimate` sub-objects) whose concrete shape
 /// is defined elsewhere (ADR-1374 D6) and not reconstructed here. Also reused
 /// by [`crate::catalog`] for tool-input fields whose shape is caller-defined
-/// (`ravel_search_logs`'s `predicates`), hence the `Deserialize` derive
+/// (`ravel_agent_send`'s `payload`), hence the `Deserialize` derive
 /// alongside the manual `Serialize` impl.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct AnyJson(pub Value);
@@ -394,8 +394,9 @@ pub struct Data {
     pub row_count: u64,
 }
 
-/// Also reused by [`crate::catalog`] as a tool-input field type, hence the
-/// `Deserialize` derive here alongside `Serialize`.
+// Also a tool-input field type in `crate::catalog`, hence `Deserialize`. A
+// line comment rather than a doc comment: a doc comment becomes the schema
+// description every tool with a `time_range` advertises in `tools/list`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct TimeRange {
     pub start_ns: String,

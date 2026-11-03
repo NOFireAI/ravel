@@ -22,6 +22,7 @@ pub mod get_trace;
 pub mod promql_range;
 pub mod query_promql;
 pub mod query_sql;
+pub mod search_logs;
 
 use crate::budget::McpEffectiveBudgets;
 use crate::cursor::CursorKey;
@@ -69,10 +70,10 @@ pub enum ToolError {
 
 /// The catalog names [`dispatch`] routes to a body in this build.
 ///
-/// Every other catalog name is declared but answers [`ToolError::NotShipped`],
-/// so `ravel_capabilities` reports the two sets under separate keys: a caller
-/// that reads one list of names cannot tell which of them it can actually
-/// call. `dispatch_routes_every_catalog_name_and_refuses_unknown_names` pins
+/// This build serves all nine catalog names. A catalog name missing from this
+/// list would answer [`ToolError::NotShipped`], and `ravel_capabilities`
+/// reports such names under `catalogued`, apart from `enabled`: a caller that
+/// reads one list of names could not tell which of them it can actually call. `dispatch_routes_every_catalog_name_and_refuses_unknown_names` pins
 /// this list against what `dispatch` does, so adding a body without adding it
 /// here fails the test rather than under-reporting the surface.
 pub const SERVED_TOOLS: &[&str] = &[
@@ -82,6 +83,7 @@ pub const SERVED_TOOLS: &[&str] = &[
     "ravel_explain_query",
     "ravel_query_sql",
     "ravel_query_promql",
+    "ravel_search_logs",
     "ravel_get_trace",
     "ravel_analyze_timeseries",
 ];
@@ -103,7 +105,7 @@ pub async fn dispatch<B: QueryBackend>(
         "ravel_explain_query" => Ok(explain_query::run(args, ctx, backend).await),
         "ravel_query_sql" => Ok(query_sql::run(args, ctx, backend).await),
         "ravel_query_promql" => Ok(query_promql::run(args, ctx, backend).await),
-        "ravel_search_logs" => Err(ToolError::NotShipped("ravel_search_logs")),
+        "ravel_search_logs" => Ok(search_logs::run(args, ctx, backend).await),
         "ravel_get_trace" => Ok(get_trace::run(args, ctx, backend).await),
         "ravel_analyze_timeseries" => Ok(analyze_timeseries::run(args, ctx, backend).await),
         other => Err(ToolError::UnknownTool(other.to_string())),
@@ -445,10 +447,9 @@ mod tests {
     }
 
     /// Every name in the catalog reaches `dispatch`, and `dispatch` refuses
-    /// anything else. The counts are exact on purpose: the one body not in
-    /// this build must answer `NotShipped` rather than a placeholder
-    /// envelope, and the eight bodies this build carries must answer an
-    /// envelope.
+    /// anything else. The counts are exact on purpose: all nine bodies this
+    /// build carries must answer an envelope, and none may answer
+    /// `NotShipped`.
     #[test]
     fn dispatch_routes_every_catalog_name_and_refuses_unknown_names() {
         let key = CursorKey::from_process_secret([7u8; CURSOR_KEY_LEN]);
@@ -477,6 +478,7 @@ mod tests {
                         || name == "ravel_explain_query"
                         || name == "ravel_query_sql"
                         || name == "ravel_query_promql"
+                        || name == "ravel_search_logs"
                         || name == "ravel_analyze_timeseries" =>
                 {
                     // Served, and an empty argument object has no time_range
@@ -512,11 +514,12 @@ mod tests {
                 "ravel_explain_query".to_string(),
                 "ravel_query_sql".to_string(),
                 "ravel_query_promql".to_string(),
+                "ravel_search_logs".to_string(),
                 "ravel_get_trace".to_string(),
                 "ravel_analyze_timeseries".to_string()
             ]
         );
-        assert_eq!(not_shipped, vec!["ravel_search_logs".to_string()]);
+        assert_eq!(not_shipped, Vec::<String>::new());
 
         // What `ravel_capabilities` reports is the same split, name for name:
         // `enabled` is what dispatch runs, `catalogued` is what it refuses. A
