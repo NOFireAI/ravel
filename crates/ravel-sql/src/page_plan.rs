@@ -262,8 +262,9 @@ use std::ops::ControlFlow;
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
-    Distinct, Expr as SqlExpr, GroupByExpr, Ident, ObjectName, OrderBy, OrderByKind, Query, Select,
-    SetExpr, Statement, TableFactor, UnaryOperator, Value, Visit, Visitor,
+    Distinct, Expr as SqlExpr, GroupByExpr, Ident, ObjectName, OrderBy, OrderByExpr, OrderByKind,
+    OrderByOptions, Query, Select, SetExpr, Statement, TableFactor, UnaryOperator, Value, Visit,
+    Visitor,
 };
 
 use crate::alerts_schema::alerts_schema;
@@ -1220,20 +1221,30 @@ mod resolution {
     /// (DataFusion 55 refuses to plan the last two outright, which makes the
     /// refusal here the same answer the caller would have got for the
     /// statement it handed in.)
+    ///
+    /// Every field is named, with no `..`, so an option a later sqlparser
+    /// adds is a compile error here rather than a name it silently removes.
     fn wildcard_rest(options: &WildcardAdditionalOptions) -> Rest {
-        if options.opt_ilike.is_some()
-            || options.opt_rename.is_some()
-            || options.opt_alias.is_some()
-        {
+        let WildcardAdditionalOptions {
+            // Source span of the `*`. Carries no semantics.
+            wildcard_token: _,
+            opt_ilike,
+            opt_exclude,
+            opt_except,
+            opt_replace,
+            opt_rename,
+            opt_alias,
+        } = options;
+        if opt_ilike.is_some() || opt_rename.is_some() || opt_alias.is_some() {
             return Rest::Unreadable(unproven::WILDCARD_OPTION);
         }
         let mut removed: BTreeSet<String> = BTreeSet::new();
-        if let Some(except) = &options.opt_except {
+        if let Some(except) = opt_except {
             for ident in std::iter::once(&except.first_element).chain(&except.additional_elements) {
                 removed.insert(ident_name(ident));
             }
         }
-        if let Some(exclude) = &options.opt_exclude {
+        if let Some(exclude) = opt_exclude {
             let names = match exclude {
                 datafusion::sql::sqlparser::ast::ExcludeSelectItem::Single(name) => {
                     std::slice::from_ref(name)
@@ -1253,7 +1264,7 @@ mod resolution {
                 }
             }
         }
-        if let Some(replace) = &options.opt_replace {
+        if let Some(replace) = opt_replace {
             for item in &replace.items {
                 removed.insert(ident_name(&item.column_name));
             }
@@ -1264,8 +1275,22 @@ mod resolution {
     /// The output names a wildcard's `REPLACE` declares, with the expressions
     /// they are built from. `* REPLACE (nullif(value, 0) AS ts)` projects `ts`
     /// from that expression, not from `samples.ts`.
+    ///
+    /// Every field is named, with no `..`, for the reason [`wildcard_rest`]
+    /// gives.
     fn wildcard_replacements(options: &WildcardAdditionalOptions) -> Vec<(String, OutputSource)> {
-        let Some(replace) = &options.opt_replace else {
+        let WildcardAdditionalOptions {
+            wildcard_token: _,
+            // The options that remove or rename a name rather than declare
+            // one. `wildcard_rest` reads each of them.
+            opt_ilike: _,
+            opt_exclude: _,
+            opt_except: _,
+            opt_rename: _,
+            opt_alias: _,
+            opt_replace,
+        } = options;
+        let Some(replace) = opt_replace else {
             return Vec::new();
         };
         replace
@@ -1845,7 +1870,8 @@ fn shape_of<'a>(query: &'a Query) -> Option<SelectShape<'a>> {
 /// Both fields of the `OrderBy` are named, with no `..`. The wildcard hid
 /// `interpolate`, and the rewrite drops the statement's own `ORDER BY`
 /// whenever it only orders, so the clause was dropped with it and the page
-/// ran under an ordering the caller had not written.
+/// ran under an ordering the caller had not written. Each term's
+/// `OrderByExpr` and its `OrderByOptions` are named the same way.
 fn statement_order_terms(query: &Query) -> Result<Vec<OrderTerm>, PagePlanError> {
     let Some(OrderBy {
         kind,
@@ -1867,19 +1893,24 @@ fn statement_order_terms(query: &Query) -> Result<Vec<OrderTerm>, PagePlanError>
         OrderByKind::Expressions(exprs) => exprs,
     };
     let mut terms = Vec::with_capacity(exprs.len());
-    for expr in exprs {
-        let Some(column) = column_of(&expr.expr) else {
+    for OrderByExpr {
+        expr,
+        options: OrderByOptions { asc, nulls_first },
+        with_fill,
+    } in exprs
+    {
+        let Some(column) = column_of(expr) else {
             return Err(PagePlanError::OrderTermNotColumn {
-                term: expr.expr.to_string(),
+                term: expr.to_string(),
             });
         };
-        if expr.options.nulls_first.is_some() {
+        if nulls_first.is_some() {
             return Err(PagePlanError::UnsupportedOrderOption {
                 column,
                 option: "NULLS FIRST/LAST",
             });
         }
-        if expr.with_fill.is_some() {
+        if with_fill.is_some() {
             return Err(PagePlanError::UnsupportedOrderOption {
                 column,
                 option: "WITH FILL",
@@ -1887,7 +1918,7 @@ fn statement_order_terms(query: &Query) -> Result<Vec<OrderTerm>, PagePlanError>
         }
         terms.push(OrderTerm {
             column,
-            descending: expr.options.asc == Some(false),
+            descending: *asc == Some(false),
         });
     }
     Ok(terms)
