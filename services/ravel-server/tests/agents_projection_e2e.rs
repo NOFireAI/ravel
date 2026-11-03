@@ -222,7 +222,7 @@ fn server_config(agents: AgentsConfig, mode: Mode) -> ServerConfig {
         cache_dir: None,
         catalog_resolve_concurrency: None,
         cpu_gate_permits: Default::default(),
-        cpu_shed: Default::default(),
+        ingest_hold: Default::default(),
         max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: Duration::from_secs(3600),

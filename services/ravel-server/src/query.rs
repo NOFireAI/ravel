@@ -1972,7 +1972,7 @@ mod catalog_cache_tests {
             cache_dir: None,
             catalog_resolve_concurrency: None,
             cpu_gate_permits: Default::default(),
-            cpu_shed: Default::default(),
+            ingest_hold: Default::default(),
             ingest_concurrency_limit: crate::ingest_concurrency::IngestConcurrencyLimit::Bounded(
                 1024,
             ),
