@@ -147,15 +147,15 @@ unauthenticated caller's body is never read. A drained
 body is never inflated, decoded or charged to the byte budget, and the drain
 holds no admission permit. Three fixed bounds apply, constants in
 `ingest_admission.rs` rather than flags: the drain stops once it has read
-1 MiB of body as sent (before any inflate; the frame that crosses the cap is
-the last one read), at most 1 second, and at most 64 drains at once in the process,
+16 MiB of body as sent, the request body limit (before any inflate; the frame
+that crosses the cap is the last one read), at most 1 second, and at most 64 drains at once in the process,
 a slot taken without waiting. A drained 429 is answered as before; a shed it
 does not drain keeps its status, `Retry-After` and body and adds
 `Connection: close`. The first reason that applies is counted in
 `ravel_ingest_head_refusal_undrained_total{reason}`, checked in this order:
 `unauthenticated` (the credential did not resolve), `over_cap` (the
-`Content-Length` is above 1 MiB, nothing read), `busy` (no drain slot free),
-then, during the drain, `over_cap` (a chunked body passed 1 MiB) or `timeout`
+`Content-Length` is above 16 MiB, nothing read), `busy` (no drain slot free),
+then, during the drain, `over_cap` (a chunked body passed 16 MiB) or `timeout`
 (the body did not finish within 1 second). `Connection: close` does not
 prevent the reset: a client still uploading when the connection closes can
 see a transport error regardless. An HTTP/2 shed refuses one stream and keeps
