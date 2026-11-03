@@ -10,7 +10,10 @@
 //! keys through `describe_data`, at the call's own clock, and refuses a key
 //! that is neither a declared column nor `trace_id` with `trace_id` indexed
 //! as `invalid_argument` before any statement runs. An indexed key other
-//! than `trace_id` is accepted only as the declared column it names.
+//! than `trace_id` is accepted only as the declared column it names. The
+//! lookup and the statement are two backend calls under the call's one
+//! deadline, and the page's `budget.actual` counts the statement only, which
+//! [`UNCOUNTED_LOOKUP_WARNING`] says on every page of such a call.
 //!
 //! The filters compile to `SELECT * FROM logs WHERE ... ORDER BY "ts",
 //! "observed_ts"`, which must pass `ravel_sql::refuse_several_tables`,
@@ -102,6 +105,13 @@ const GROUP_COLUMN: &str = "__ravel_group";
 
 /// The output column listing each group's shared attributes once.
 const GROUP_ATTRS_COLUMN: &str = "__ravel_group_attrs";
+
+/// The warning a page of a call with predicates carries: the declared-column
+/// lookup those predicates need is a service call of its own, and its reads
+/// are not in the page's `budget.actual`.
+pub const UNCOUNTED_LOOKUP_WARNING: &str = "budget.actual counts the search statement only; \
+     the declared-column lookup the predicates needed ran under the same deadline and its \
+     reads are not counted";
 
 type Refusal = (Failure, Vec<NextStep>);
 
@@ -387,6 +397,8 @@ struct Call {
     cursor: Option<String>,
     plan: PagePlan,
     argument_hash: [u8; 32],
+    /// The call read the declared columns before its statement.
+    described: bool,
 }
 
 impl Call {
@@ -430,6 +442,7 @@ impl Call {
         let plan = ravel_sql::plan_page(&statement, None).map_err(|error| plan_refusal(&error))?;
         let argument_hash = argument_hash(&statement, &input.window, ctx.budgets.max_rows);
         Ok(Call {
+            described: !input.predicates.is_empty(),
             statement,
             conditions,
             window: input.window,
@@ -582,6 +595,12 @@ fn finish(
     draft.envelope.scope.table = "logs".to_string();
     draft.envelope.scope.order_by = order_by.clone();
     draft.envelope.scope.predicates_applied = call.conditions.clone();
+    if call.described {
+        draft
+            .envelope
+            .warnings
+            .push(UNCOUNTED_LOOKUP_WARNING.to_string());
+    }
     let narrow_groups = step(
         "narrow_time_range",
         "more rows share one (ts, observed_ts) pair than fit one page; shorten time_range \
@@ -1474,5 +1493,97 @@ mod tests {
         let two = block_on(run(resumed, &later(&key), &stub));
         assert_eq!(failure_class(&two), FailureClass::CursorInvalid);
         assert_eq!(stub.executed.borrow().len(), 1);
+    }
+
+    /// A page of a call with predicates says its `budget.actual` leaves out
+    /// the declared-column lookup, on page one and on a later page (each
+    /// reads the declared columns again); a call without predicates makes no
+    /// lookup and carries no such warning.
+    ///
+    /// FLIP: dropping the warning push in `finish` fails the first two
+    /// assertions; pushing it on every page fails the third.
+    #[test]
+    fn a_page_says_its_spend_leaves_out_the_declared_column_lookup() {
+        let key = key();
+        let warned = |envelope: &Envelope| {
+            envelope
+                .warnings
+                .iter()
+                .filter(|warning| *warning == UNCOUNTED_LOOKUP_WARNING)
+                .count()
+        };
+        let stub = Stub::default();
+        stub.describe
+            .borrow_mut()
+            .extend([described(), described()]);
+        stub.sql.borrow_mut().extend([
+            plain(&[("a", 1, 1), ("b", 2, 2), ("c", 3, 3)]),
+            plain(&[("c", 3, 3)]),
+        ]);
+        let filters = json!({
+            "predicates": [{"key": "service.name", "op": "eq", "value": "api"}],
+        });
+
+        let one = block_on(run(args(filters.clone()), &context(&key), &stub));
+        assert_eq!(one.status, Status::OkPage, "{one:?}");
+        assert_eq!(warned(&one), 1, "{:?}", one.warnings);
+        let mut resumed = args(filters);
+        resumed["cursor"] = json!(one.presentation.cursor.clone().expect("a cursor"));
+        let two = block_on(run(resumed, &later(&key), &stub));
+        assert_eq!(two.status, Status::Ok, "{two:?}");
+        assert_eq!(warned(&two), 1, "{:?}", two.warnings);
+        assert_eq!(stub.described.borrow().len(), 2);
+
+        let stub = Stub::default();
+        stub.sql.borrow_mut().push_back(plain(&[("a", 1, 1)]));
+        let bare = block_on(run(args(json!({"has_word": "boom"})), &context(&key), &stub));
+        assert_eq!(bare.status, Status::Ok, "{bare:?}");
+        assert_eq!(warned(&bare), 0, "{:?}", bare.warnings);
+        assert!(stub.described.borrow().is_empty());
+    }
+
+    /// A cursor outlives the call that minted it: it lives until the mint
+    /// instant plus the protection horizon less [`GRACE_NS`], not until the
+    /// minting call's deadline. Page one runs at 3 h with its deadline at
+    /// 4 h and a 27 h horizon, so its cursor redeems at 5 h, past that
+    /// deadline, and is `cursor_expired` at 6 h, `3 h + 27 h - 24 h`.
+    ///
+    /// FLIP: minting with `ctx.deadline_ns` in place of `i64::MAX` makes the
+    /// 5 h redemption `cursor_expired`; dropping the bound from
+    /// `Cursor::mint` lets the 6 h one run its page (the redeeming call's own
+    /// clamp alone allows 9 h).
+    ///
+    /// [`GRACE_NS`]: crate::cursor::GRACE_NS
+    #[test]
+    fn a_cursor_lives_until_the_horizon_less_grace_not_the_calls_deadline() {
+        const HOUR_NS: i64 = 3_600_000_000_000;
+        let key = key();
+        let first = context(&key);
+        assert_eq!(
+            (first.now_ns, first.deadline_ns, first.protection_horizon_ns),
+            (3 * HOUR_NS, 4 * HOUR_NS, 30 * HOUR_NS)
+        );
+        let at = |now_ns: i64| {
+            let mut ctx = context(&key);
+            ctx.now_ns = now_ns;
+            ctx.protection_horizon_ns = now_ns + 27 * HOUR_NS;
+            ctx
+        };
+        let stub = Stub::default();
+        stub.sql.borrow_mut().extend([
+            plain(&[("a", 1, 1), ("b", 2, 2), ("c", 3, 3)]),
+            plain(&[("c", 3, 3)]),
+        ]);
+        let one = block_on(run(args(json!({})), &first, &stub));
+        let mut resumed = args(json!({}));
+        resumed["cursor"] = json!(one.presentation.cursor.clone().expect("a cursor"));
+
+        let past_deadline = block_on(run(resumed.clone(), &at(5 * HOUR_NS), &stub));
+        assert_eq!(past_deadline.status, Status::Ok, "{past_deadline:?}");
+        assert_eq!(ids(&past_deadline), ["c"]);
+
+        let at_bound = block_on(run(resumed, &at(6 * HOUR_NS), &stub));
+        assert_eq!(failure_class(&at_bound), FailureClass::CursorExpired);
+        assert_eq!(stub.executed.borrow().len(), 2);
     }
 }
