@@ -560,10 +560,9 @@ async fn first_listed_key(
 ) -> anyhow::Result<Option<String>> {
     let mut token = None;
     for _ in 0..DEFAULT_MAX_CATALOG_LIST_REQUESTS {
-        let page = store
-            .list(prefix, token)
-            .await
-            .map_err(|err| anyhow::anyhow!("--ingest-hour-stride: could not list {prefix}: {err}"))?;
+        let page = store.list(prefix, token).await.map_err(|err| {
+            anyhow::anyhow!("--ingest-hour-stride: could not list {prefix}: {err}")
+        })?;
         if let Some(found) = page.objects.first() {
             return Ok(Some(found.key.clone()));
         }
