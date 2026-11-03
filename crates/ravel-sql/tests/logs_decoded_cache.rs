@@ -604,13 +604,16 @@ async fn decoded_cache_leaves_statement_errors_unchanged() {
 /// validation its decode did. `p` is a plain page whose cells are all UTF-8,
 /// one per row, 48 over the tenant; `n` is an integer and `ts` a timestamp,
 /// so `p` is the only string column the statement decodes. The cold run
-/// validates every `p` cell once, at decode; each hot run is served `p` from
-/// the cache and validates nothing. Without a cache every run validates the
-/// 48 cells again, per cell in the build.
+/// validates every `p` cell twice: once at decode, and once when the build
+/// makes the entry's values memo (ADR-3326, values-memo amendment, decision
+/// 6). Each hot run is served `p` from the cache, reuses the memo, and
+/// validates nothing. Without a cache every run validates the 48 cells
+/// again, per cell in the build.
 ///
-/// Flipped assertion, seen failing: `StrCursor::text_at` ignoring
-/// `validated_text_at` validates every cell a second time in the build, so
-/// the cold cached run reports 96 where 48 is expected.
+/// Every row here takes the memo's fast path, so this test no longer reaches
+/// `StrCursor::text_at`; its use of the decode's validation is pinned by
+/// `a_plain_page_validated_at_decode_is_not_validated_again` in
+/// `src/logs_scan/batch.rs`, whose block has absent rows and takes the loop.
 #[tokio::test]
 async fn a_cache_hit_on_a_plain_str_column_validates_nothing() {
     let t = tenant();
@@ -653,7 +656,11 @@ async fn a_cache_hit_on_a_plain_str_column_validates_nothing() {
             .counters;
         if run == 0 {
             assert_eq!(counters.hits, 0, "the cold run decodes");
-            assert_eq!(outcome.stats.str_cells_validated, cells, "cold run");
+            assert_eq!(
+                outcome.stats.str_cells_validated,
+                2 * cells,
+                "cold run: the decode and the memo build"
+            );
         } else {
             assert_eq!(counters.misses, 0, "hot run {run} is fully served");
             assert_eq!(
