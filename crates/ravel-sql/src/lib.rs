@@ -179,7 +179,7 @@ pub use executor::{
     AnalyzedRun, DecodedCacheStats, ExplainReport, HISTOGRAM_EXCLUDED_WARNING, LiveAccounting,
     ParquetPlan, PhaseWallTiming, PinnedLanes, PinnedPlanInputs, PinnedQuery, PinnedResolve,
     PinnedStream, ScanTiming, SegmentTiming, SignalStats, SqlExecutor, SqlOutcome, SqlRequest,
-    SqlStats, TargetSignal, refuse_several_tables,
+    SqlStats, TargetSignal, refuse_several_tables, segment_set_keys,
 };
 #[cfg(feature = "flight-sql")]
 pub use flight::{
