@@ -1,6 +1,9 @@
 //! Resolved snapshot types (docs/catalog-and-mvcc.md "Snapshot resolution",
 //! "MVCC rules").
 
+use std::sync::Arc;
+
+use ravel_proto::catalog::v1::SnapshotKeyIndexLeafRef;
 use ravel_proto::commit::v1::ErasureRequest;
 use uuid::Uuid;
 
@@ -189,6 +192,99 @@ pub struct SegmentOrigins {
     /// Count of `Recent` plus `TokenResolved` entries: exempt from
     /// `max_segments` (ADR-0073 decision 2).
     pub exempt_count: u64,
+}
+
+/// One folded snapshot part a resolve loaded, as a key-index router needs it
+/// (ADR-3692 decision 1): the part's identity and hour range from HEAD, and
+/// the refs of its key-index leaves.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotPartHandle {
+    /// The part's blake3 in HEAD (32 bytes), which every leaf of the part
+    /// binds to.
+    pub blake3: Vec<u8>,
+    pub entry_count: u64,
+    pub min_hour: u32,
+    pub watermark_hour: u32,
+    pub key_index: Vec<SnapshotKeyIndexLeafRef>,
+}
+
+/// Where a sealed segment sits in the parts of [`SnapshotParts`]: the part's
+/// index there and the entry's position in that decoded part's entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SegmentPartOrigin {
+    pub part: u32,
+    pub ordinal: u32,
+}
+
+/// The parts one resolve read its sealed segments from, and each segment's
+/// place in them (ADR-3692 decision 1). A sibling of [`Snapshot`] for the
+/// reason [`SegmentOrigin`] is one. Produced by
+/// [`crate::Catalog::resolve_pruned_with_parts`].
+///
+/// The handles' bytes are charged to the catalog's memory budget for as long
+/// as this value (or a clone) lives, the same budget the decoded parts are
+/// charged to. A value built with [`SnapshotParts::new`] carries no charge.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotParts {
+    /// The loaded parts, in HEAD order. A range-scoped resolve loads only
+    /// the parts intersecting its window, so this can be a subsequence of
+    /// HEAD's parts.
+    pub parts: Vec<SnapshotPartHandle>,
+    /// Parallel to `Snapshot::segments`: `Some` for a segment extracted from
+    /// a part (`SegmentOrigin::SealedBelowWatermark`), `None` for a listed
+    /// (`Recent`) or token-resolved one.
+    pub origin: Vec<Option<SegmentPartOrigin>>,
+    charge: Option<Arc<ravel_memory::Reservation>>,
+}
+
+impl SnapshotParts {
+    pub fn new(parts: Vec<SnapshotPartHandle>, origin: Vec<Option<SegmentPartOrigin>>) -> Self {
+        SnapshotParts {
+            parts,
+            origin,
+            charge: None,
+        }
+    }
+
+    pub(crate) fn with_charge(mut self, charge: ravel_memory::Reservation) -> Self {
+        self.charge = Some(Arc::new(charge));
+        self
+    }
+
+    /// The bytes these handles and origins hold, as charged: struct sizes plus
+    /// every owned string and byte buffer.
+    pub fn heap_bytes(&self) -> u64 {
+        let leaf = |r: &SnapshotKeyIndexLeafRef| {
+            std::mem::size_of::<SnapshotKeyIndexLeafRef>()
+                + r.key.len()
+                + r.blake3.len()
+                + r.field.len()
+                + r.part_blake3.len()
+        };
+        let parts: usize = self
+            .parts
+            .iter()
+            .map(|p| {
+                std::mem::size_of::<SnapshotPartHandle>()
+                    + p.blake3.len()
+                    + p.key_index.iter().map(leaf).sum::<usize>()
+            })
+            .sum();
+        let origin = self.origin.len() * std::mem::size_of::<Option<SegmentPartOrigin>>();
+        (parts + origin) as u64
+    }
+
+    /// The bytes this value's reservation holds, 0 when it carries none.
+    pub fn charged_bytes(&self) -> u64 {
+        self.charge.as_ref().map_or(0, |r| r.size())
+    }
+}
+
+impl PartialEq for SnapshotParts {
+    /// Compares the handles and origins; the charge is bookkeeping.
+    fn eq(&self, other: &Self) -> bool {
+        self.parts == other.parts && self.origin == other.origin
+    }
 }
 
 impl SegmentOrigins {

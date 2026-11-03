@@ -104,7 +104,10 @@ pub use seal_divergence::{
     EntryIdentity, SealDivergenceError, SealDivergenceReport, SnapshotCoverage, snapshot_coverage,
     verify_seal_divergence,
 };
-pub use snapshot::{SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentRef, Snapshot};
+pub use snapshot::{
+    SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentPartOrigin, SegmentRef, Snapshot,
+    SnapshotPartHandle, SnapshotParts,
+};
 pub use snapshot_format::{
     ColumnStatsHeaderPeek, ColumnStatsLimits, DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES,
     DEFAULT_MAX_COLUMN_STATS_BYTES, DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES,

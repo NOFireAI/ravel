@@ -41,7 +41,19 @@ use crate::config::CatalogConfig;
 use crate::declared_stats::DeclaredColumnStats;
 use crate::error::CatalogError;
 use crate::provisioning::ShardGeneration;
-use crate::snapshot::{SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentRef, Snapshot};
+use crate::snapshot::{
+    SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentPartOrigin, SegmentRef, Snapshot,
+    SnapshotParts,
+};
+
+/// One resolve's full output: the snapshot, its origins, the generation
+/// history it scanned under, and, when asked for, its part handles.
+type Resolved = (
+    Snapshot,
+    SegmentOrigins,
+    Vec<ShardGeneration>,
+    Option<SnapshotParts>,
+);
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// One shard's listed commit-bucket entries, keyed by `(shard, ingest_hour)`,
@@ -2493,6 +2505,44 @@ impl Catalog {
         .map(|(snapshot, origins, _generations)| (snapshot, origins))
     }
 
+    /// Like [`Catalog::resolve_pruned_with_admission`], with the same
+    /// parameters, but also returns the parts the sealed segments came from
+    /// and each segment's place in them (ADR-3692 decision 1): what the
+    /// tier-2 key-index router (`ravel_query::key_index_route`) reads. The
+    /// snapshot and origins are what `resolve_pruned_with_admission` returns
+    /// for the same call; the handles are built only on this entry and
+    /// charged to the catalog's memory budget, so a refused charge fails the
+    /// resolve with [`CatalogError::MemoryExhausted`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_pruned_with_parts(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        range: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        name_filter: Option<&str>,
+        accounting: &QueryAccounting,
+    ) -> Result<(Snapshot, SegmentOrigins, SnapshotParts), CatalogError> {
+        let (snapshot, origins, _generations, parts) = self
+            .resolve_traced(
+                tenant,
+                signal,
+                range,
+                min_tokens,
+                now_ns,
+                name_filter,
+                accounting,
+                true,
+            )
+            .await?;
+        let parts = parts.unwrap_or_else(|| {
+            SnapshotParts::new(Vec::new(), vec![None; snapshot.segments.len()])
+        });
+        let charge = self.reserve_decoded(parts.heap_bytes(), u64::MAX)?;
+        Ok((snapshot, origins, parts.with_charge(charge)))
+    }
+
     /// Like [`Catalog::resolve_pruned_with_admission`], but also returns the
     /// shard-generation history **this resolve itself** computed its scan set
     /// from (ADR-0052 section 4), for the ADR-0103 pushdown eligibility gate.
@@ -2562,6 +2612,34 @@ impl Catalog {
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
     ) -> Result<(Snapshot, SegmentOrigins, Vec<ShardGeneration>), CatalogError> {
+        self.resolve_traced(
+            tenant,
+            signal,
+            range,
+            min_tokens,
+            now_ns,
+            name_filter,
+            accounting,
+            false,
+        )
+        .await
+        .map(|(snapshot, origins, generations, _parts)| (snapshot, origins, generations))
+    }
+
+    /// [`Self::resolve_impl`]'s span and fan-out; `want_parts` also builds the
+    /// part handles and per-segment part origins.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_traced(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        range: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        name_filter: Option<&str>,
+        accounting: &QueryAccounting,
+        want_parts: bool,
+    ) -> Result<Resolved, CatalogError> {
         // Idle-tenant eviction last-touch (ADR-0069 decision 2):
         // stamp this tenant's activity with the caller's injected `now_ns`
         // before the fan-out. Every resolve entry point funnels through here,
@@ -2586,6 +2664,7 @@ impl Catalog {
                 now_ns,
                 name_filter,
                 accounting,
+                want_parts,
             )
             .instrument(span.clone())
             .await;
@@ -2607,7 +2686,7 @@ impl Catalog {
                 .total_s3_bytes()
                 .saturating_sub(before.total_s3_bytes()),
         );
-        if let Ok((snapshot, _origins, _generations)) = &result {
+        if let Ok((snapshot, _origins, _generations, _parts)) = &result {
             span.record("segments_pruned", snapshot.segments_pruned);
         }
         result
@@ -2626,7 +2705,8 @@ impl Catalog {
         now_ns: i64,
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
-    ) -> Result<(Snapshot, SegmentOrigins, Vec<ShardGeneration>), CatalogError> {
+        want_parts: bool,
+    ) -> Result<Resolved, CatalogError> {
         // Durable shard_count enforcement on the read path (ADR-0050 section 5): fail before the `0..shard_count` listing loop below if this
         // catalog's configured shard_count disagrees with the (tenant, signal)'s
         // provisioning record, so a lower value never silently drops the shards
@@ -2671,6 +2751,11 @@ impl Catalog {
         // from an earlier, higher-precedence source (sealed over recent,
         // either over token-resolved) keeps its original tag.
         let mut origin_by_key: HashMap<String, SegmentOrigin> = HashMap::new();
+        // Only when `want_parts`: the window's part handles, and each sealed
+        // key's (part, ordinal), recorded by the same insertion gate.
+        let mut part_handles = Vec::new();
+        let mut part_origin_by_key: Option<HashMap<String, SegmentPartOrigin>> =
+            want_parts.then(HashMap::new);
 
         // The pending-erasure LIST (ADR-0064 decision 2) is started before the
         // listing fan-out and joined with it, so its round trip overlaps the
@@ -2727,7 +2812,11 @@ impl Catalog {
                         name_filter,
                         &mut segments_pruned,
                         &mut segments,
+                        part_origin_by_key.as_mut(),
                     )?;
+                    if want_parts {
+                        part_handles = window.part_handles();
+                    }
                     // `segments` is empty before this call (the first
                     // population in this branch), so every key it holds
                     // afterwards came from `extract_into`: sealed-below-
@@ -2891,6 +2980,17 @@ impl Catalog {
                 .unwrap_or(SegmentOrigin::SealedBelowWatermark);
             origins.push(origin);
         }
+        let parts = part_origin_by_key.map(|mut by_key| {
+            let origin = segments
+                .iter()
+                .zip(&origins.origins)
+                .map(|(segment, origin)| match origin {
+                    SegmentOrigin::SealedBelowWatermark => by_key.remove(&segment.data_object_key),
+                    SegmentOrigin::Recent | SegmentOrigin::TokenResolved => None,
+                })
+                .collect();
+            SnapshotParts::new(part_handles, origin)
+        });
         Ok((
             Snapshot {
                 segments,
@@ -2899,6 +2999,7 @@ impl Catalog {
             },
             origins,
             generations,
+            parts,
         ))
     }
 
