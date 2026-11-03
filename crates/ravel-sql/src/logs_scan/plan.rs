@@ -572,9 +572,9 @@ async fn compute_plan_counts(
             {
                 continue;
             }
-            if ctx.query.key_equals.is_empty()
-                || seg.object_size <= ctx.fetcher.block_range_threshold()
-            {
+            // The probe is issued only where it reads, so a `Probed` result
+            // below always stands for a decoded footer (`probed`).
+            if !ctx.fetcher.key_probe_reads(seg, &ctx.query) {
                 unplanned[idx] = true;
                 continue;
             }

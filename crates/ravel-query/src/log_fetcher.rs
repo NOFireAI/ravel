@@ -2629,6 +2629,21 @@ impl LogSegmentFetcher {
         })
     }
 
+    /// Whether [`probe_segment_keyed`](Self::probe_segment_keyed) reads
+    /// `seg_ref`, and so decodes its footer and records one segment open: the
+    /// query has a key arm, the object is above
+    /// [`block_range_threshold`](Self::block_range_threshold), and its event
+    /// span is ordered and overlaps the query window. A committed record never
+    /// carries an unordered span (`ravel_commit::record` refuses it on
+    /// decode), so that arm only guards a hand-built [`SegmentRef`].
+    #[must_use]
+    pub fn key_probe_reads(&self, seg_ref: &SegmentRef, query: &LogQuery) -> bool {
+        !query.key_equals.is_empty()
+            && seg_ref.object_size > self.block_range_threshold
+            && seg_ref.min_event_ts_ns <= seg_ref.max_event_ts_ns
+            && Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
+    }
+
     /// The KEY_IDX probe of [`plan_segment_keyed`](Self::plan_segment_keyed)
     /// without the plan, for a segment the caller opens whole and unplanned
     /// (ADR-2677 decision 2) unless the probe drops it. It reads the footer
@@ -2641,7 +2656,8 @@ impl LogSegmentFetcher {
     /// declined) and the caller reads the object as it would with no key. On
     /// the segments `plan_segment_keyed` does not probe (no arm, an object at
     /// or under [`block_range_threshold`](Self::block_range_threshold), a span
-    /// outside the query window) this reads nothing and prunes nothing.
+    /// outside the query window) this reads nothing and prunes nothing
+    /// ([`key_probe_reads`](Self::key_probe_reads)).
     pub async fn probe_segment_keyed(
         &self,
         seg_ref: &SegmentRef,
@@ -2650,11 +2666,7 @@ impl LogSegmentFetcher {
         plan_accounting: &QueryAccounting,
         key_index_accounting: &QueryAccounting,
     ) -> Result<KeyIndexPruning, LogFetchError> {
-        if query.key_equals.is_empty()
-            || seg_ref.object_size <= self.block_range_threshold
-            || seg_ref.min_event_ts_ns > seg_ref.max_event_ts_ns
-            || !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
-        {
+        if !self.key_probe_reads(seg_ref, query) {
             return Ok(KeyIndexPruning::default());
         }
         let phase = PhaseAccounting::new();
@@ -11931,6 +11943,88 @@ mod fetch_stream_dir_tests {
             }
         }
     }
+    /// `fetch_stream_dir` records one segment open on the handle its reads are
+    /// charged to, on both branches (the whole-object read at or under the
+    /// bound, the ranged probe above it), and none when the read fails: the
+    /// first GET of the object fails, so no footer is decoded, and the second
+    /// call records the one open.
+    ///
+    /// FLIP: counting unconditionally, before the `is_ok()` check, reads
+    /// `left: 1, right: 0` on the failed call of the first branch.
+    #[tokio::test]
+    async fn fetch_stream_dir_counts_one_open_on_its_handle_and_none_on_a_failed_read() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        };
+        let records = [record(0), record(1)];
+        let bytes = build_object(&records);
+        let seg = seg_ref(bytes.len() as u64, &records);
+        for above in [false, true] {
+            let plan = FaultPlan::default().with_rule(
+                Rule::new(Op::Get, ScriptedFault::Permanent("injected".into()))
+                    .with_key_contains(KEY)
+                    .with_occurrence(Occurrence::Nth(1)),
+            );
+            let fault = Arc::new(FaultStore::new(
+                store_with_object(bytes.clone()).await,
+                plan,
+            ));
+            let backend: Arc<dyn ObjectStoreBackend> = fault.clone();
+            let fetcher = if above {
+                LogSegmentFetcher::new(Arc::clone(&backend))
+                    .with_block_range_threshold(0)
+                    .with_block_range(BlockRangeFetcher::new(backend).with_whole_object_threshold(0))
+            } else {
+                LogSegmentFetcher::new(backend)
+            };
+            assert_eq!(
+                seg.object_size > fetcher.plan_whole_object_bound(),
+                above,
+                "fixture precondition"
+            );
+
+            let failed = PhaseAccounting::new();
+            let err = fetcher.fetch_stream_dir(&seg, TENANT, failed.plan()).await;
+            assert!(err.is_err(), "above {above}: the injected GET failure surfaces");
+            assert_eq!(
+                fault.fault_count(Op::Get, FaultKind::Permanent),
+                1,
+                "above {above}: the fault fired"
+            );
+            let snap = failed.snapshot();
+            assert_eq!(
+                snap.phase(QueryPhase::Plan).segments_opened,
+                0,
+                "above {above}: a failed read records no open"
+            );
+
+            let read = PhaseAccounting::new();
+            fetcher
+                .fetch_stream_dir(&seg, TENANT, read.plan())
+                .await
+                .expect("the second GET passes through")
+                .expect("STREAM_DIR present");
+            let snap = read.snapshot();
+            let plan = snap.phase(QueryPhase::Plan);
+            assert!(
+                plan.s3_requests.iter().sum::<u64>() > 0,
+                "above {above}: the reads are charged to the plan handle"
+            );
+            assert_eq!(plan.segments_opened, 1, "above {above}");
+            for phase in [
+                QueryPhase::Resolve,
+                QueryPhase::Probe,
+                QueryPhase::Scan,
+                QueryPhase::KeyIndex,
+            ] {
+                assert_eq!(
+                    snap.phase(phase).segments_opened,
+                    0,
+                    "above {above}: {phase:?} records none"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -14350,6 +14444,70 @@ mod read_gate_tests {
                 .expect("key probe");
             assert_eq!(pruning.segments_pruned, pruned, "{name}");
             assert_eq!(opened(&plan, &key_index), (want, 0), "{name}");
+        }
+    }
+
+    /// A key arm on a field KEY_IDX does not declare reaches the probe, which
+    /// declines, and `plan_segment_keyed` hands the footer probe it read to
+    /// the unkeyed route (`KeyedPlanRead::Unkeyed { primed }`). That route
+    /// records the one open: one under plan, none on the key-index handle the
+    /// probe's KEY_IDX read is charged to.
+    ///
+    /// FLIP: also counting in the `Unkeyed` arm before the hand-off reads
+    /// `left: (2, 0), right: (1, 0)`.
+    #[tokio::test]
+    async fn a_declined_key_probe_hands_off_one_open_under_plan() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let query = LogQuery::new(i64::MIN, i64::MAX).with_key_equals(KeyEquals::new(
+            "user.id",
+            KeyType::Str,
+            ravel_logseg::key_index::key8_str("u1"),
+        ));
+        let plan = QueryAccounting::new();
+        let key_index = QueryAccounting::new();
+        let keyed = fetcher
+            .plan_segment_keyed(&seg_ref, TENANT, &query, &plan, &key_index)
+            .await
+            .expect("keyed plan");
+        assert!(keyed.plan.is_some(), "the unkeyed route plans the object");
+        assert_eq!(keyed.key_blocks, None, "the probe named no block subset");
+        assert_eq!(keyed.key_index, KeyIndexPruning::default());
+        assert!(
+            key_index.snapshot().decompressed_bytes > 0,
+            "the probe decoded the KEY_IDX prefix before it declined"
+        );
+        assert_eq!(opened(&plan, &key_index), (1, 0));
+    }
+
+    /// `key_probe_reads` is the guard `probe_segment_keyed` reads nothing
+    /// outside, and a probe outside it records no open: a hand-built ref with
+    /// an unordered event span (which a committed record cannot carry), an
+    /// object at the block-range threshold, and a query with no key arm.
+    ///
+    /// FLIP: dropping the unordered-span arm from `key_probe_reads` makes the
+    /// first case read `true` where `false` is expected.
+    #[tokio::test]
+    async fn the_key_probe_guard_matches_the_probes_reads() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let keyed = keyed_on_r2(LogQuery::new(i64::MIN, i64::MAX));
+        let mut unordered = seg_ref.clone();
+        unordered.min_event_ts_ns = seg_ref.max_event_ts_ns + 1;
+        let mut at_threshold = seg_ref.clone();
+        at_threshold.object_size = fetcher.block_range_threshold();
+        for (name, seg, query, reads) in [
+            ("unordered span", &unordered, &keyed, false),
+            ("at the threshold", &at_threshold, &keyed, false),
+            ("no key arm", &seg_ref, &LogQuery::new(i64::MIN, i64::MAX), false),
+            ("read", &seg_ref, &keyed, true),
+        ] {
+            assert_eq!(fetcher.key_probe_reads(seg, query), reads, "{name}");
+            let plan = QueryAccounting::new();
+            let key_index = QueryAccounting::new();
+            fetcher
+                .probe_segment_keyed(seg, TENANT, query, &plan, &key_index)
+                .await
+                .expect("key probe");
+            assert_eq!(opened(&plan, &key_index), (u64::from(reads), 0), "{name}");
         }
     }
 
