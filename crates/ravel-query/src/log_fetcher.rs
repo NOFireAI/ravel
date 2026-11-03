@@ -2426,6 +2426,17 @@ impl LogSegmentFetcher {
         {
             caller_accounting.add_data_objects_touched(1);
         }
+        // Issue #3745: every `Ok(Some(..))` branch above opened this object's
+        // footer (the fast path and the skip-decidable branch read it
+        // directly; the fallback's `tenant_bytes_with_footer` reads it as
+        // part of resolving `bytes`) -- unlike `data_objects_touched` above,
+        // this does not gate on `touched`, since a block-level prune that
+        // leaves zero survivors still opened the footer to get there. Only
+        // `Ok(None)` (the ts-relevance check inside `tenant_bytes_with_footer`
+        // dropped the segment before any fetch) opens nothing.
+        if let Ok(Some(_)) = &result {
+            caller_accounting.add_segments_opened(1);
+        }
         result.map(|opt| {
             opt.map(|(indices, dirs, stats, footer, _, carried)| {
                 (indices, dirs, stats, footer, carried)
@@ -2530,6 +2541,15 @@ impl LogSegmentFetcher {
                 key_blocks,
             } => (fetch, Some((footer, dirs, survivors, stats, key_blocks))),
         };
+        // Issue #3745: `fetch_keyed_plan`'s `probe_footer_and_keys` reads this
+        // object's footer unconditionally before it can tell `Absent` from
+        // `Planned` apart -- an absent key is dropped only *after* the tail
+        // probe decoded it (docs/query-engine.md, "Exact-key probe"), so both
+        // arms here opened the footer. The `Unkeyed` arm above already
+        // returned through `plan_segment_primed`, which records its own
+        // footer open, so counting it again here would double it for the
+        // same object.
+        plan_accounting.add_segments_opened(1);
         let requests = fetch.probe_gets + fetch.metadata_gets + fetch.block_range_gets;
         fetch_span.record("s3_requests", requests);
         fetch_span.record("s3_bytes", fetch.block_bytes_fetched);
@@ -2620,6 +2640,11 @@ impl LogSegmentFetcher {
         plan_accounting.merge_snapshot(snapshot.phase(QueryPhase::Plan));
         key_index_accounting.merge_snapshot(snapshot.phase(QueryPhase::KeyIndex));
         let (absent, fetch) = result?;
+        // Issue #3745: `fetch_key_probe` always reads the footer probe (the
+        // doc comment above: "no directory past the footer, no block"), for
+        // an absent key exactly as for a present or declined one, so this
+        // site records one open whatever `absent` turns out to be.
+        plan_accounting.add_segments_opened(1);
         fetch_span.record("s3_requests", fetch.probe_gets + fetch.metadata_gets);
         fetch_span.record("s3_bytes", fetch.block_bytes_fetched);
         self.record_probe_misses(&fetch_span, &fetch, ProbePhase::Plan);

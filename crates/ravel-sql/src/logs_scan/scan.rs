@@ -145,6 +145,22 @@ impl PartitionCtx {
     fn record_data_object_touched(&self) {
         self.phase_accounting.scan().add_data_objects_touched(1);
     }
+
+    /// Record this query's one footer open of the data object the caller
+    /// just opened (issue #3745), under `stats.phases[scan].segmentsOpened`.
+    ///
+    /// Same designated-recorder rule as
+    /// [`record_data_object_touched`](Self::record_data_object_touched) and
+    /// called beside it at every site: each route opens a given object's
+    /// footer at most once per query, so counting here (rather than at every
+    /// GET the open issues) keeps one ranged open's several block GETs at one
+    /// segment, and the planned route's own recorder
+    /// (`ravel_query::LogSegmentFetcher::plan_segment`) is the only other
+    /// place this figure is touched, under the same route-exclusivity
+    /// argument.
+    fn record_segment_opened(&self) {
+        self.phase_accounting.scan().add_segments_opened(1);
+    }
 }
 
 /// Refuse a segment whose declared RLOG format version this build cannot read,
@@ -1608,6 +1624,7 @@ impl LogScanStream {
                         this.blocks.record_fast_path_route(true);
                         this.ctx.record_open_shape(true);
                         this.ctx.record_data_object_touched();
+                        this.ctx.record_segment_opened();
                         match open {
                             PrefetchOpen::InFlight(fut) => {
                                 this.open_started = Some(issued);
@@ -1710,6 +1727,7 @@ impl LogScanStream {
                                 // this site is once per segment per query and why
                                 // the planned route's recorder cannot also fire.
                                 this.ctx.record_data_object_touched();
+                                this.ctx.record_segment_opened();
                                 LogScanState::Opening(open_segment_fast(
                                     Arc::clone(&this.ctx),
                                     seg,
@@ -1723,6 +1741,7 @@ impl LogScanStream {
                                 this.current_by_chunk = false;
                                 this.blocks.unplanned_segments.add(1);
                                 this.ctx.record_data_object_touched();
+                                this.ctx.record_segment_opened();
                                 LogScanState::Opening(open_segment_whole(
                                     Arc::clone(&this.ctx),
                                     seg,

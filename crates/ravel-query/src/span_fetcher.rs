@@ -837,6 +837,11 @@ impl SpanSegmentFetcher {
         // `open_scan` re-opens it for the BLOCKS section descriptor.
         let footer = open(&bytes)
             .map_err(|source| settle_version_refusal(seg_ref, &bytes, corrupt(key, source)))?;
+        // Issue #3745: the footer is decoded above; `open_scan` below re-opens
+        // the same bytes for the BLOCKS descriptor (see the comment on
+        // `footer`), so this is the one recording site for this object, not
+        // that one.
+        accounting.add_segments_opened(1);
         if footer.tenant_hash != tenant_hash.0 {
             return Err(SpanFetchError::TenantMismatch {
                 key: key.to_string(),
@@ -913,6 +918,12 @@ impl SpanSegmentFetcher {
                 }
             }
         };
+        // Issue #3745: whichever branch above resolved `footer`, this object's
+        // footer is now decoded exactly once for this call; `new_scan` below
+        // builds the scan from the already-open `footer`/candidates and does
+        // not reopen it, so Probe is the one phase this object's open is
+        // charged to.
+        metadata.add_segments_opened(1);
         if let Some(tenant_hash) = tenant_hash
             && footer.tenant_hash != tenant_hash.0
         {
