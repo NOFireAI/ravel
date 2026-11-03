@@ -42,23 +42,27 @@
 //! (in the header and in a `# shared` line), the failure message, every
 //! warning, and every `next_steps` action and detail are rendered through
 //! `escape_text`. [`Cell::Map`] cells, the `# shared` line's map and each
-//! row's diff against it are serialized by `serde_json` first and then go
-//! through the same `escape_text`, since `serde_json` itself escapes only
-//! characters below U+0020, the quote and the backslash, and leaves U+007F,
-//! U+0085, U+2028 and the bidi controls raw.
+//! row's diff against it are serialized by `serde_json`, which escapes only
+//! characters below U+0020, the quote and the backslash; every other
+//! character in the set below that it left raw is then written as JSON's
+//! own `\uXXXX`, so each stays JSON that parses back to the original map.
 //!
-//! `escape_text` writes the newline, carriage return and tab as `\n`,
-//! `\r` and `\t`, the backslash as `\\`, and as `\u{XXXX}` every other
-//! control character (category Cc: U+0000 to U+001F, U+007F, U+0080 to
-//! U+009F), U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR, and the bidi
-//! controls U+202A to U+202E and U+2066 to U+2069. So no caller string can
-//! break a line in the text block, add a column, or reorder what a reader
-//! sees, and none can print something a reader takes for the server's own
-//! summary, `# shared`, or `row_count:` line. `structuredContent` is not
-//! touched: it still carries the exact original strings.
+//! The escaped set is every control character (category Cc: U+0000 to
+//! U+001F, U+007F, U+0080 to U+009F), U+2028 LINE SEPARATOR, U+2029
+//! PARAGRAPH SEPARATOR, the bidi controls U+202A to U+202E and U+2066 to
+//! U+2069, and the bidi marks U+200E, U+200F and U+061C. `escape_text`
+//! writes the newline, carriage return and tab as `\n`, `\r` and `\t`, the
+//! backslash as `\\`, and every other character in the set as `\u{XXXX}`.
+//! So no caller string can break a line in the text block, add a column, or
+//! reorder what a reader sees, and none can print something a reader takes
+//! for the server's own summary, `# shared`, or `row_count:` line.
+//! `structuredContent` is not touched: it still carries the exact original
+//! strings.
 //!
 //! Warnings share one line, each quoted with its own `"` written as `\"`
-//! and separated by `; `, so one warning containing `; ` reads as one.
+//! and separated by `; `, so one warning containing `; ` reads as one. A
+//! `next_step:` line quotes its action the same way before the ` - ` that
+//! precedes the detail, so an action containing ` - ` reads as one.
 //!
 //! The byte bound applies to the table alone. The summary lines (status,
 //! failure, warnings, next steps) are what a caller acts on when a result
@@ -110,13 +114,20 @@ fn failure_class_label(class: FailureClass) -> &'static str {
 /// Whether `ch` is escaped as `\u{XXXX}`: a control character (Unicode
 /// category Cc, which includes U+007F DEL and the C1 range such as U+0085
 /// NEL and U+009B CSI), U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR,
-/// or a bidi embedding, override or isolate control (U+202A to U+202E,
-/// U+2066 to U+2069).
+/// a bidi embedding, override or isolate control (U+202A to U+202E,
+/// U+2066 to U+2069), or a bidi mark (U+200E LEFT-TO-RIGHT MARK, U+200F
+/// RIGHT-TO-LEFT MARK, U+061C ARABIC LETTER MARK).
 fn needs_unicode_escape(ch: char) -> bool {
     ch.is_control()
         || matches!(
             ch,
-            '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{061c}'
         )
 }
 
@@ -154,11 +165,25 @@ fn escape_text(text: &str) -> String {
     out
 }
 
-/// A map's JSON, passed through [`escape_text`]. `serde_json` escapes only
-/// characters below U+0020, the quote and the backslash, so U+0085, U+2028
-/// or a bidi control in a key or value would otherwise reach the text raw.
+/// A map's JSON, with every character [`needs_unicode_escape`] selects that
+/// `serde_json` left raw written as JSON's own `\uXXXX`. `serde_json`
+/// escapes only characters below U+0020, the quote and the backslash, so
+/// U+0085, U+2028 or a bidi control in a key or value would otherwise reach
+/// the text raw. Those characters can only occur inside a JSON string, and
+/// every one is in the Basic Multilingual Plane, so the result is still JSON
+/// that parses back to `map`; the escapes `serde_json` wrote are left as
+/// they are.
 fn escape_json_map(map: Map<String, Value>) -> String {
-    escape_text(&serde_json::to_string(&Value::Object(map)).unwrap_or_default())
+    let json = serde_json::to_string(&Value::Object(map)).unwrap_or_default();
+    let mut out = String::with_capacity(json.len());
+    for ch in json.chars() {
+        if needs_unicode_escape(ch) {
+            out.push_str(&format!("\\u{:04x}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// The warnings line: each warning escaped, then quoted with its own `"`
@@ -320,8 +345,8 @@ pub fn render(envelope: &Envelope) -> String {
     }
     for step in &envelope.next_steps {
         tail.push_str(&format!(
-            "next_step: {} - {}\n",
-            escape_text(&step.action),
+            "next_step: \"{}\" - {}\n",
+            escape_text(&step.action).replace('"', "\\\""),
             escape_text(&step.detail)
         ));
     }
@@ -579,10 +604,10 @@ mod tests {
         let text = render(&envelope);
         assert_eq!(
             text,
-            concat!("status: ok\n", "next_step: n\\nstatus: ok - d\n",)
+            concat!("status: ok\n", "next_step: \"n\\nstatus: ok\" - d\n",)
         );
         assert_eq!(text.lines().count(), 2);
-        assert!(!text.contains("\nstatus: ok - d"));
+        assert!(!text.contains("\nstatus: ok"));
     }
 
     /// The tab is the column separator, so it is escaped for the same reason
@@ -621,9 +646,10 @@ mod tests {
 
     /// The characters every caller-string path must not write raw: line and
     /// paragraph separators, C1 controls (NEL, CSI), DEL, a bidi override and
-    /// a bidi isolate, the newline and NUL.
-    const HOSTILE_CHARS: [char; 9] = [
-        '\u{2028}', '\u{2029}', '\u{85}', '\u{9b}', '\u{7f}', '\u{202e}', '\u{2066}', '\n', '\u{0}',
+    /// a bidi isolate, the three bidi marks, the newline and NUL.
+    const HOSTILE_CHARS: [char; 12] = [
+        '\u{2028}', '\u{2029}', '\u{85}', '\u{9b}', '\u{7f}', '\u{202e}', '\u{2066}', '\u{200e}',
+        '\u{200f}', '\u{61c}', '\n', '\u{0}',
     ];
 
     fn string_column(name: &str) -> Column {
@@ -816,14 +842,18 @@ mod tests {
     }
 
     /// The escaped set's spelling: the newline as `\n`, every other
-    /// character in the set as `\u{XXXX}`, in a string cell and, after
-    /// `serde_json` wrote its own `\n` and `\u0000`, in a map cell.
+    /// character in the set as `\u{XXXX}` in a string cell, and in a map
+    /// cell JSON's own `\uXXXX` beside the `\n` and `\u0000` `serde_json`
+    /// wrote itself, which are left as written.
     #[test]
     fn escaped_characters_use_the_cell_escape_spelling() {
         let all: String = HOSTILE_CHARS.iter().collect();
         assert_eq!(
             escape_text(&all),
-            "\\u{2028}\\u{2029}\\u{0085}\\u{009b}\\u{007f}\\u{202e}\\u{2066}\\n\\u{0000}"
+            concat!(
+                "\\u{2028}\\u{2029}\\u{0085}\\u{009b}\\u{007f}\\u{202e}\\u{2066}",
+                "\\u{200e}\\u{200f}\\u{061c}\\n\\u{0000}",
+            )
         );
         assert_eq!(
             escape_text("\u{202a}\u{202b}\u{202c}\u{202d}\u{2067}\u{2068}\u{2069}"),
@@ -834,8 +864,8 @@ mod tests {
             concat!(
                 "status: ok\n",
                 "attrs\n",
-                "{\"k\":\"\\u{2028}\\u{2029}\\u{0085}\\u{009b}\\u{007f}\\u{202e}\\u{2066}",
-                "\\\\n\\\\u0000\"}\n",
+                "{\"k\":\"\\u2028\\u2029\\u0085\\u009b\\u007f\\u202e\\u2066",
+                "\\u200e\\u200f\\u061c\\n\\u0000\"}\n",
                 "row_count: 1\n",
             )
         );
@@ -862,5 +892,99 @@ mod tests {
         let quoted = with(&["a\"; \"b"]);
         assert_eq!(quoted, "status: ok\nwarnings: \"a\\\"; \\\"b\"\n");
         assert_ne!(quoted, two);
+    }
+
+    /// A map cell, the `# shared` line and a row diff are JSON a reader can
+    /// parse back to the original map, whatever the value holds: a backslash
+    /// and a quote keep `serde_json`'s own escapes, and U+2028, U+0085 and
+    /// U+202E are written as JSON `\uXXXX` rather than raw.
+    #[test]
+    fn json_cells_parse_back_to_the_original_map() {
+        let parse = |json: &str| -> Value {
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("{json:?} is not JSON: {e}"))
+        };
+        let object = |pairs: &[(&str, &str)]| match map_of(pairs) {
+            Cell::Map(m) => Value::Object(m),
+            _ => unreachable!(),
+        };
+        let raw_forbidden = ['\u{2028}', '\u{85}', '\u{202e}'];
+        let values = [
+            "C:\\logs".to_string(),
+            "a\"b".to_string(),
+            "a\u{2028}b".to_string(),
+            "a\u{85}b".to_string(),
+            "a\u{202e}b".to_string(),
+            "\\\"\u{2028}\u{85}\u{202e}".to_string(),
+        ];
+        for v in &values {
+            let v = v.as_str();
+
+            let text = render(&rows_envelope("attrs", vec![map_of(&[("k", v)])]));
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(parse(lines[2]), object(&[("k", v)]), "map cell in {text:?}");
+            for ch in raw_forbidden {
+                assert!(!text.contains(ch), "raw {ch:?} in {text:?}");
+            }
+
+            let text = render(&rows_envelope(
+                "attrs",
+                vec![
+                    map_of(&[("k", v), ("id", "1")]),
+                    map_of(&[("k", v), ("id", "2")]),
+                ],
+            ));
+            let lines: Vec<&str> = text.lines().collect();
+            let shared = lines[2]
+                .strip_prefix("# shared attrs: ")
+                .unwrap_or_else(|| panic!("no shared line in {text:?}"));
+            assert_eq!(
+                parse(shared),
+                object(&[("k", v)]),
+                "shared line in {text:?}"
+            );
+            for ch in raw_forbidden {
+                assert!(!text.contains(ch), "raw {ch:?} in {text:?}");
+            }
+
+            let text = render(&rows_envelope(
+                "attrs",
+                vec![
+                    map_of(&[("s", "x"), ("k", v)]),
+                    map_of(&[("s", "x"), ("k", "other")]),
+                ],
+            ));
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines[2], "# shared attrs: {\"s\":\"x\"}", "{text:?}");
+            assert_eq!(parse(lines[3]), object(&[("k", v)]), "row diff in {text:?}");
+            for ch in raw_forbidden {
+                assert!(!text.contains(ch), "raw {ch:?} in {text:?}");
+            }
+        }
+    }
+
+    /// One action containing ` - ` renders differently from an action and a
+    /// detail split at that ` - `, and so does one containing `" - "`, the
+    /// quoted separator itself.
+    #[test]
+    fn one_next_step_action_containing_the_separator_is_not_read_as_a_split() {
+        let with = |action: &str, detail: &str| {
+            render(&Envelope {
+                next_steps: vec![crate::envelope::NextStep {
+                    action: action.to_string(),
+                    detail: detail.to_string(),
+                }],
+                ..Default::default()
+            })
+        };
+
+        let joined = with("a - b", "c");
+        let split = with("a", "b - c");
+        assert_eq!(joined, "status: ok\nnext_step: \"a - b\" - c\n");
+        assert_eq!(split, "status: ok\nnext_step: \"a\" - b - c\n");
+        assert_ne!(joined, split);
+
+        let quoted = with("a\" - \"b", "c");
+        assert_eq!(quoted, "status: ok\nnext_step: \"a\\\" - \\\"b\" - c\n");
+        assert_ne!(quoted, with("a", "b - c"));
     }
 }
