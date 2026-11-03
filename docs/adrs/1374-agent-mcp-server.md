@@ -1456,6 +1456,7 @@ the choices D2's row leaves open.
    names because a declared attribute column may be named `group` or
    `group_attrs` and `SELECT *` returns it; the tenant config's declaration
    check does not yet refuse a declared key starting `__ravel_`.
+   (Superseded: it now does; see the reserved-prefix amendment below.)
 6. `evidence_ref` stays in the input schema and is refused as
    `unsupported`, so no `evidence` block is emitted, as on the other query
    tools.
@@ -1507,6 +1508,7 @@ B. Output. Two columns come first in every row. `__ravel_parent` is `root`
    synthetic names, as on `ravel_search_logs`; it is a convention, not a
    guarantee, since nothing yet refuses a declared attribute starting
    `__ravel_` (issue #3730).
+   (Superseded: now refused; see the reserved-prefix amendment below.)
 C. No cursor. A trace over `max_rows` (default 200, ceiling 5,000) is
    `ok_bounded` with `row_cap_hit` set and no cursor. A trace is one
    bounded object an agent reads whole, and a tree labelled per page would
@@ -1642,3 +1644,31 @@ measures. This envelope-claims amendment makes each say what the code does.
    counter, so `failure.counter` is `null` there rather than parsed from
    the message. `a_service_budget_failure_names_its_counter_in_the_message_only`
    in `services/ravel-server/src/mcp/envelope.rs` pins each engine budget.
+
+## Amendment (2026-11-03, #3730): the reserved-prefix amendment, a new declared key starting `__ravel_` is refused
+
+<!-- amendment-supersedes: phrase="does not yet refuse a declared key starting `__ravel_`" pointer="reserved-prefix amendment" -->
+<!-- amendment-supersedes: phrase="it is a convention, not a guarantee, since nothing yet refuses a declared attribute starting `__ravel_`" pointer="reserved-prefix amendment" -->
+
+The search-logs amendment (item 5) and the span-tree amendment (B) name
+the tool columns `__ravel_group`, `__ravel_group_attrs`, `__ravel_depth`
+and `__ravel_parent` after the `logs` schema's synthetic names, and say
+that nothing refuses a declared attribute key with that prefix. This
+reserved-prefix amendment records that the tenant config's declaration
+check now refuses one.
+
+1. `ravel_catalog::validate_typed_attr_columns` refuses a declared typed
+   attribute column whose key starts with `__ravel_`
+   (`TypedAttrColumnError::ReservedPrefix`). The comparison is
+   case-sensitive, as the synthetic names are spelled, so `__Ravel_x`,
+   `_ravel_x` and `ravel_x` are ordinary keys. The rule binds every path
+   that takes a new declaration: `ravel-server`'s `--typed-attr-column`
+   and `--typed-attr-column-tenant` flags, `ravel-cli typed-attr-column
+   set`, and a durable `set_tenant_config` write.
+2. The one exception is a tenant config record stored before the rule. It
+   is read, not re-validated: it decodes, the server's declared-column
+   overlay still applies its list, and a write that carries a stored
+   `__ravel_` key through unchanged (a write of another field) succeeds. A
+   write that adds a `__ravel_` key the stored record does not already
+   declare is refused. Such a record is the only way a declared column can
+   still take one of the tool columns' names.

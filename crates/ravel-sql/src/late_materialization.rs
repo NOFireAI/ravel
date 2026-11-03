@@ -148,10 +148,12 @@ use crate::logs_scan::{LogsScanExec, RowFetchSource, records_memory};
 
 /// The name of the synthetic row-ref column phase 1 appends.
 ///
-/// It is not in the `logs` schema and cannot be written by a client: the SQL
-/// surface has no way to declare an attribute whose column name starts with
-/// `__ravel_`, and the column is appended past every projected index, so no
-/// remapped column reference can collide with it. It never reaches a result --
+/// It is not in the `logs` schema. Its name takes the reserved `__ravel_`
+/// prefix, which `ravel_catalog::validate_typed_attr_columns` refuses on a new
+/// declared key (a tenant config record stored before that rule is still read
+/// with its `__ravel_` keys), and the column is appended past every projected
+/// index, so no remapped column reference can collide with it. It never
+/// reaches a result --
 /// [`LogsRowFetchExec`] consumes it and emits the original schema.
 pub const ROW_REF_COLUMN: &str = "__ravel_row_ref";
 
