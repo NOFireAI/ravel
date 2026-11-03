@@ -166,11 +166,38 @@ case_h() {
   code=0
   MCP_EVAL_AGENT_CMD=$TMP/agent.sh MCP_EVAL_RAVEL_SHA=abc1234 MCP_EVAL_TOKEN=t \
     bash "$1" --run full http://127.0.0.1:9 --out "$out" --runs 1 >"$TMP/h.log" 2>&1 || code=$?
-  leaked=0
-  if [ -e "$out/results" ] || [ -e "$out/prime" ]; then leaked=1; fi
+  created=0
+  if [ -e "$out" ]; then created=1; fi
   rm -rf "$out"
   expect h 64 "$code" "$TMP/h.log" "is inside the repository" || return 1
-  [ "$leaked" -eq 0 ] || { echo "  h: results were written inside the repository" >&2; return 1; }
+  [ "$created" -eq 0 ] || { echo "  h: a refused --out was still created inside the repository" >&2; return 1; }
+}
+
+# A failure repaired by a later call that answers ok_page counts as repaired.
+case_j() {
+  python3 -I - "$(dirname "$1")/lib" <<'EOF'
+import sys
+sys.path.insert(0, sys.argv[1])
+import evaltool
+calls = [{"tool": "ravel_query_sql"}, {"tool": "ravel_query_sql"}]
+envs = [{"status": "error", "failure": {"class": "validation"}}, {"status": "ok_page"}]
+got = evaltool.retries(calls, envs)
+if got != {"validation": 1}:
+    sys.stderr.write("  j: retries over an ok_page repair: got %r, want {'validation': 1}\n" % got)
+    sys.exit(1)
+EOF
+}
+
+# field exits non-zero on an absent key; field-opt prints nothing and exits 0.
+case_k() {
+  printf '{"visibility": {}}\n' >"$TMP/k.json"
+  tool="$(dirname "$1")/lib/evaltool.py"
+  code=0
+  python3 -I "$tool" field "$TMP/k.json" visibility.snapshot_id >"$TMP/k.out" 2>"$TMP/k.err" || code=$?
+  [ "$code" -eq 1 ] || { echo "  k: field on an absent key exited $code, want 1" >&2; return 1; }
+  code=0
+  python3 -I "$tool" field-opt "$TMP/k.json" visibility.snapshot_id >"$TMP/k.out" 2>"$TMP/k.err" || code=$?
+  [ "$code" -eq 0 ] && [ ! -s "$TMP/k.out" ] || { echo "  k: field-opt on an absent key exited $code" >&2; return 1; }
 }
 
 case_i() {
@@ -208,7 +235,7 @@ for k in ("store_source", "response_bytes_source", "wall_time_ms"):
 EOF
 }
 
-CASES="a b c d e f g h i"
+CASES="a b c d e f g h i j k"
 for c in $CASES; do
   if "case_$c" "$RUN_SH"; then ok "case $c"; else bad "case $c"; fi
 done
@@ -254,6 +281,8 @@ f|lib/evaltool.py|        if not got:|        if not got and False:
 g|run.sh|[ -n "${MCP_EVAL_AGENT_CMD:-}" ]|true
 h|run.sh|      "$repo"/*) die 64|      "$repo"/no-such-dir/*) die 64
 i|lib/evaltool.py|"bytes_scanned"|"bytes_read"
+j|lib/evaltool.py|("ok", "ok_bounded", "ok_page")|("ok", "ok_bounded")
+k|lib/evaltool.py|        if required:|        if False:
 MUTANTS
 
 echo "run.test.sh: $pass passed, $fail failed"
