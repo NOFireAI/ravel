@@ -392,13 +392,16 @@ async fn query_sql_pages_exactly_once_through_ingest_fold_and_compaction() {
 /// of the cursor, a fold, and the compaction of the earliest hour's two RLOG
 /// objects. The six lines committed before the mint appear exactly once, in
 /// `(ts, observed_ts)` order; none of the late ones does, though a fresh walk
-/// sees all of them.
+/// sees all of them. The compaction moved the segment set, so page two says
+/// so in a warning and is still served.
 ///
 /// FLIP: `later_page` in `crates/ravel-mcp/src/tools/search_logs.rs` passing
 /// `ctx.now_ns` instead of the pending redemption's resolve instant serves
 /// `late-25` on page two.
 /// FLIP: `keyset_predicate` in `crates/ravel-sql/src/page_plan.rs` resuming
 /// at `>=` repeats `e-20` on page two.
+/// FLIP J: the same `later_page` never pushing `SEGMENT_SET_MOVED_WARNING`
+/// serves page two with no warning.
 #[tokio::test]
 async fn search_logs_pages_exactly_once_through_ingest_fold_and_compaction() {
     let clock = Clock::now();
@@ -632,9 +635,9 @@ fn assert_each_group_once(pages: &[Vec<(String, String)>]) {
 /// FLIP K: `later_page` in `crates/ravel-mcp/src/tools/query_sql.rs` passing
 /// `SegmentSetPin::Advisory` for an `order_from_other_rows` plan serves page
 /// two as `(10, 3), (30, 3)`, and ts 10 repeats.
-/// FLIP L: `segment_set_digest` in `crates/ravel-mcp/src/cursor.rs` hashing
-/// each key's ingest hour instead of the key: the late rows change no hour,
-/// page two is served, and ts 10 repeats.
+/// FLIP L: the `segment_set` of `crates/ravel-sql/src/executor.rs` built from
+/// the resolved segments' ingest hours instead of their keys: the late rows
+/// change no hour, page two is served, and ts 10 repeats.
 #[tokio::test]
 async fn query_sql_a_count_order_pages_and_a_late_row_ends_the_walk_instead_of_repeating_a_group()
  {

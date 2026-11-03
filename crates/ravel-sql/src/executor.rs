@@ -7348,8 +7348,9 @@ pub(crate) mod tests {
     /// commit whose rows do not.
     ///
     /// FLIP D: with `segment_set` built from `ingest_watermark_hour` instead
-    /// of the segments' keys in `run`, the overlapping-commit assertion fails
-    /// (no fold runs here, so the watermark is `None` both times).
+    /// of the segments' keys in `run`, the overlapping-commit assertion fails:
+    /// the late segment lands in the hour already listed, so the watermark
+    /// does not move.
     #[tokio::test]
     async fn the_segment_set_moves_with_an_overlapping_commit_and_only_then() {
         let tenant = TenantId::new("acme-sql-segment-set".to_string());
@@ -7375,7 +7376,6 @@ pub(crate) mod tests {
 
         let first = resolved_segment_set(&store, tenant_hash, window, now_ns).await;
         assert_eq!(first.len(), 1, "test setup: one segment resolved: {first:?}");
-        assert!(first[0].ends_with(".rseg"), "a data-object key: {first:?}");
         let again = resolved_segment_set(&store, tenant_hash, window, now_ns).await;
         assert_eq!(first, again, "an unchanged store resolves the same set");
 
@@ -7393,6 +7393,10 @@ pub(crate) mod tests {
         assert_ne!(moved, first, "an overlapping commit moves the set");
         assert_eq!(moved.len(), 2, "both segments resolved: {moved:?}");
         assert!(moved.contains(&first[0]));
+        assert!(
+            moved.iter().all(|key| key.ends_with(".rseg")),
+            "data-object keys: {moved:?}"
+        );
 
         // A commit whose rows are outside the window, in a later hour.
         publish_fold_lag_segment(
