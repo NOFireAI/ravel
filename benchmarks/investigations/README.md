@@ -4,36 +4,43 @@ Issue #3699, ADR-3692 decision 8 (T1 of epic #3692). A measurement harness
 for the selective read paths of NOFire AI's telemetry store: a lookup by
 trace id or request id, an IN list, a rare, sparse or common needle, and the
 narrow joins of the investigation journeys. It runs them against a seeded
-spans and logs corpus in each state of the key-index matrix (unfolded,
-folded without leaves, folded with leaves, mixed, many parts), judges every
-answer against the generator's oracle, and judges every figure against
-`bands.toml`, which transcribes the 17 rows of ADR-3692's Acceptance table.
+spans and logs corpus in each state of the key-index matrix (see "States"),
+judges every answer against the generator's oracle, and judges every figure
+against `bands.toml`, which transcribes the 17 rows of ADR-3692's Acceptance
+table.
 
 This is not a `ravel-bench` report: it drives the real binaries, `ravel-cli
-load`, `ravel-cli catalog fold` and a restarted `ravel-server`, against an
-S3-compatible store, from an empty bucket to `results.<lane>.json`.
+load`, `ravel-cli catalog fold`, `ravel-cli maintain compact-tenant`,
+`ravel-cli erase` and a restarted `ravel-server`, against an S3-compatible
+store, from an empty bucket to `results.<lane>.json`.
 
 ## Files
 
 - `gen_corpus.py`: seeded corpus generator. Writes `spans.jsonl` and
   `logs.jsonl` (`--format jsonl`), `spans.parquet` and `logs.parquet`
   (`--format parquet`, needs pyarrow), the two `ravel-cli load` mapping files,
-  and `truth.json`, the exact answer of every planted key. Its module
+  and `truth.json`, the exact answer of every planted key. `--tail` writes
+  the mixed state's extra hour, with planted answers of its own. Its module
   docstring states the time and determinism rules.
 - `statements.toml`: the statements, one `[[statement]]` each: tenant, table,
   SQL or trace GET, the states it runs in, its `truth.json` key, whether it
-  runs cold only, and `unsupported_reason` when this build cannot run it.
-- `bands.toml`: ADR-3692 Acceptance rows 1 to 17, the ADR's cells verbatim,
-  each with the figures evaluate.py extracts and the `target_if` and
-  `miss_if` expressions it judges them with. Its header documents the fields.
-- `hits.truth.json`: the oracle of the two statements on the ClickBench hits
-  tenant (q20 and the control set).
+  runs cold only, and `requires` when it needs a planted key the corpus may
+  not hold.
+- `bands.toml`: ADR-3692 Acceptance rows 1 to 17. The text of each row's
+  `check`, `target`, `miss` and `source` cells is the ADR's, verbatim; the
+  `target_if` and `miss_if` expressions are transcriptions of that text into
+  figures this harness extracts, and where a transcription had to choose, a
+  comment above the figure says what it chose. Its header documents the
+  fields.
+- `hits.truth.json`: the pre-registered figures of the two statements on the
+  ClickBench hits tenant (q20's predicted row count and the control set).
 - `box/run.sh`: one run, from an empty store to `results.<lane>.json`.
   `--dry-run` prints every step, command and stamp in order and runs nothing.
 - `box/launch.sh`, `box/fetch.sh`: start the s3 lane's EC2 instance, and
   wait for and download its `out/`. Both take `--dry-run`.
 - `box/lib/inv.py`: run.sh's helpers (TOML reads, the call plan, one call,
-  stamps, the restart warmup wait).
+  stamps, inspect stamps, the census, the truth merge, the restart warmup
+  wait).
 - `box/run.example.toml`: the s3 lane's run file, every key commented.
   `box/run.local-smoke.toml` is the local lane's.
 - `evaluate.py`: reads a run directory and writes `results.<lane>.json` and
@@ -66,21 +73,61 @@ arms `shutdown -h +<box.max_minutes>` (default 600, at most 600) before
 anything else, writes `/root/inv/RUN_ID`, and runs `run.sh --lane s3`.
 `run.sh` checks out `box.sha` detached, builds `ravel-cli` and `ravel-server
 --features sql` in separate `cargo build --release --locked` runs with frame
-pointers on, installs pyarrow, runs the flow against `box.store_bucket`
-through the instance role, uploads `out/`, and terminates the instance, on
-success and failure alike: an error trap writes `out/FAILED` with the step
-that failed. The shutdown timer terminates the instance whatever run.sh is
-doing. `fetch.sh` polls for `out/DONE` or `out/FAILED` and gives up
-`box.max_minutes + 30` minutes after it starts.
+pointers on, installs pyarrow 17.0.0 (T12's pin; the generator uses only
+`pyarrow.Table` and `pyarrow.parquet.write_table`, which 17.0.0 has), runs
+the flow against `box.store_bucket` through the instance role, and
+terminates the instance, on success and failure alike: an error trap writes
+`out/FAILED` with the step that failed.
 
-At the ADR's 20,000,000 traces and 20 cold runs, each cold call costing a
-server restart, a run is not known to fit inside 600 minutes; the first
-s3 run should be pre-registered with that as an open question.
+`run.toml [run] max_minutes` (default 540) is the run's own deadline, an
+hour inside the shutdown timer: a state that would start after it is
+recorded `not-run` with reason `deadline`, and evaluate and the upload still
+happen. The upload copies `out/` without the marker first, then writes
+`DONE` (or `FAILED`) as its own final PUT, only after that copy exited 0.
+`fetch.sh` polls for `out/DONE` or `out/FAILED`, gives up `box.max_minutes +
+30` minutes after it starts, and refuses a prefix with neither marker unless
+`--partial` is given.
+
+#### Runtime estimate
+
+From the smoke's own figures (`fixtures/local-smoke/`): a cold-call restart
+(server stop, start, `/readyz`, warmup) took 0.841 s on average over its 199
+restarts, and a call 0.039 s on average over its 221 timed calls. The s3
+lane's default states plan, at 20 cold runs and 1 warm run per statement
+that is not `cold_only` (statement counts from `statements.toml`):
+
+| state | statements | cold | warm |
+|---|---|---|---|
+| unfolded | 36 | 720 | 3 |
+| folded_no_leaves | 5 | 100 | 3 |
+| folded_leaves | 35 | 700 | 3 |
+| mixed | 22 | 440 | 3 |
+| compaction_in_flight | 4 | 80 (one restart) | 1 |
+| compaction_done | 4 | 80 | 1 |
+| erasure_in_flight | 4 | 80 | 1 |
+| many_parts_744 | 2 | 40 | 2 |
+| many_parts_2160 | 2 | 40 | 2 |
+
+That is 2,299 calls and 2,201 restarts: 2,201 x 0.841 s = 1,851 s, plus
+2,299 x 0.039 s = 90 s, so 1,941 s, about 32 minutes of calls. The fixed
+waits add at most 60 minutes for mixed (the next ingest hour) and at most 60
+for compaction_in_flight (310 s into an hour; in the smoke they took 54 and
+4 minutes). Corpus generation, the loads and the folds at 20,000,000 traces
+are not in this estimate: the smoke's figures for them (0.07 s per load, at
+most 0.21 s per fold) are fixed-cost dominated and do not scale. The
+estimate is about 152 minutes before those, against the 540-minute
+deadline. A call on S3 at the ADR's corpus is slower than a call on
+loopback at 1,000 traces; at ten times the smoke's restart and call time
+the calls alone take 323 minutes. If a run reaches the deadline, drop these
+states from `run.toml` first, in this order: `many_parts_2160` (2,160
+strided ingest hours loaded and folded one part per hour), `many_parts_744`,
+then `erasure_in_flight`; rows 10, 9 and 13's erasure figure then report
+`not-run`.
 
 ### Local lane
 
-Counters only. A loopback RustFS started by run.sh itself, and release binaries built
-beforehand:
+Counters only. A loopback RustFS started by run.sh itself, and release
+binaries built beforehand:
 
 ```sh
 RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --locked -p ravel-cli
@@ -99,60 +146,108 @@ root)"`. It reports timing figures but never judges them.
 
 ## The flow
 
-`run.sh` steps, in order: `bootstrap` (build stamp), `store` (`store qualify`; the
-local lane creates a fresh bucket in its own RustFS, the s3 lane refuses a
-`store_bucket` that holds any object), `host`, `corpus` (gen_corpus.py at
-`run.toml [corpus]`), `declare` (the tenant's typed attribute columns from
-the mappings, `request_id` as key index, `--index-trace-id true`),
-`load-base`, one step per state, `evaluate`, `finish` (`out/DONE` with the
-verdict). The states:
+`run.sh` steps, in order: `bootstrap` (build stamp), `store` (`store
+qualify`; the local lane creates a fresh bucket in its own RustFS, the s3
+lane refuses a `store_bucket` that holds any object), `host`, `corpus`
+(gen_corpus.py at `run.toml [corpus]`, the mixed state's tail hour and one
+corpus per many_parts state, merged into one `truth.json`), `declare` (per
+tenant: the typed attribute columns from the mappings, `request_id` as key
+index on inv with `--index-trace-id true`, `UserID` on hits, each with
+`--readers-rolled-out`), `load-base`, one step per state, `evaluate`,
+`finish` (`out/DONE` with the verdict).
 
-- `unfolded`: the loads only.
-- `folded_no_leaves`: `catalog fold --writers-stopped` per signal.
-- `folded_leaves`: `catalog fold --key-index-leaves` per signal, then
-  `catalog fold --rebuild-key-index`. The leaves fold right after a plain
-  fold has nothing left to seal and writes no leaf; the rebuild writes them
-  (stamped as transition `leaf_rebuild`).
+With `run.hits = true` the hits tenant is loaded with T12's recipe
+(`--batch-rows 100000 --target-bytes 1850000000 --max-flush-delay 30s
+--pipeline-depth 32 --load-memory-bytes 6500000000`), and every fold, leaf
+rebuild, inspect stamp and census line covers each loaded tenant and signal,
+hits included. Its object count, 398, is a census band of its own (row 6),
+and row 6 reads 2 x the census's hits objects.
+
+### States
+
+- `unfolded`: the base loads only.
+- `folded_no_leaves`: `catalog fold --writers-stopped` per tenant and signal.
+- `folded_leaves`: `catalog fold --key-index-leaves`, then `catalog fold
+  --rebuild-key-index` (stamped as transition `leaf_rebuild`). The leaves
+  fold right after a plain fold has nothing left to seal and writes no leaf;
+  the rebuild writes them.
 - `mixed`: waits for the ingest hour after the last fold's (at most
-  `run.mixed_wait_max_minutes`), loads an extra hour of new traces, runs the
-  statements over folded and unfolded data together, then folds that hour
-  (`fold_advance`).
-- `many_parts`: unsupported on this build (see below).
+  `run.mixed_wait_max_minutes`), loads the tail hour (traces with planted
+  answers of their own: saved trace ids, a request id, needle rows, failing
+  cell traces), and runs the statements over the folded hours and the
+  unsealed tail together, with ids from both. Its oracle is the base answer
+  plus the tail's. Then it folds that hour (`fold_advance`).
+- `compaction_in_flight`: waits until every earlier hour is sealed (310 s
+  into the hour), starts `maintain compact-tenant` on both signals as one
+  background child, runs the statement set while it runs (temp `inflight`,
+  against one restarted server), waits for the child, and stamps
+  `compaction.jsonl`. `compaction_done` runs the same set after it. The
+  oracle of both passes is the unfolded state's own answer.
+- `erasure_in_flight`: `erase submit` on the erasure victim's request id,
+  `erase status` before and after (the run fails unless it reads pending),
+  then the statement set against the pre-erasure answer. The pass after the
+  erasure is applied is not run: nothing in this flow applies a pending
+  request. A corpus with no victim row (every row read by some other
+  statement, as at 1,000 traces) records the state `not-run` with that
+  reason.
+- `many_parts_N` (744 and 2,160 on the s3 lane, 24 in the smoke): a fresh
+  spans tenant `mpN` loaded with `--ingest-hour-stride 1` and an
+  `--ingest-hour-start` that puts the last hour below the current one, one
+  batch per hour, with no fold during the loads (the load refuses once a HEAD
+  appears), then folded with `--writers-stopped --snapshot-part-max-entries
+  1` so each hour is its own part, then leaves rebuilt. The stamped part
+  count is banded (rows 9 and 10).
+
+`mixed` is followed by `fold_advance` and `compaction_in_flight` by
+`compaction_done`; each derived state is live exactly when its parent is. A
+state the run lists and does not reach is `not-run` with the reason, and a
+state absent from both the results and the not-run list is a missing figure.
 
 In each state, every statement planned for it runs `run.cold_runs` times
 cold, each call after a server stop, a page-cache drop and a server start
 that waits for `/readyz` and for the server's startup cache warmup to end,
 then `run.warm_runs` times warm, without a restart, unless the statement is
 `cold_only`. Every call runs with `RQ_STATS=1` and writes one line to
-`calls.jsonl`. The server runs `--mode query`: `--mode all` runs scheduled
-folds and compaction that would move the state under the measurement, so
-run.sh stops the server before every fold.
+`calls.jsonl`. The server runs `--mode query`, which runs no scheduled fold
+or compaction (`--mode all` would move the state under the measurement, and
+ravel-server refuses `--disable-fold` in query mode, so the flag is not
+passed); run.sh stops the server before every transition.
 
 ### Placeholders
 
 A statement's SQL names planted keys as `{placeholders}`, filled from
 `truth.json` by `box/lib/inv.py plan`: `{trace}` (saved trace `run`),
 `{cell_service}`, `{cell_start_ns}`, `{cell_end_ns}`, `{request_present}`,
-`{request_absent}`, `{in_trace_ids_x_N}` and `{in_request_ids_N}` (the IN
-lists, as plain SQL literals), and `{jc_start_ns_K}` and `{jc_cut_ns_K}`
-(journey C's build windows). A placeholder left unfilled stops the run.
+`{request_absent}`, `{in_trace_ids_x_N}` (the trace id IN lists, as binary
+literals, used on spans and on logs) and `{in_request_ids_N}` (the
+request id IN lists, as string literals),
+`{erasure_victim_rid}`, and `{jc_start_ns_K}` and `{jc_cut_ns_K}` (journey
+C's build windows). A placeholder left unfilled stops the run.
 
 ### Cold and warm
 
-The startup warmup loads recent parts into the cache before the first call,
-so a "cold" call means a fresh process after a page-cache drop, not an empty
-query cache. Each restart stamp records what the warmup loaded.
+The ADR-0046 startup warmup loads recent parts into the cache before the
+first call, and the server skips it only with the cache disabled, which
+this harness does not do. So a "cold" call means a fresh process after a
+page-cache drop, not an empty query cache, and some cold calls are served
+partly from that cache: in the smoke the logs journeys read about every
+logs byte from it and issue no scan GET. Every cold call whose
+`cacheServedBytes` is above 0 is flagged `warm_served` in the results and
+counted per statement and state in the summary (118 of the smoke's 199 cold
+calls). The flag is a reported figure, not a problem. Each restart stamp
+records what the warmup loaded.
 
 ## run.toml
 
 `box/run.example.toml` comments every key. In short: `[run]` (lane, states,
-`cold_runs`, `warm_runs`, `hits`, `scales`, `baseline`,
-`mixed_wait_max_minutes`), `[box]` (s3 lane only: `sha`, `repo_url`,
-`region`, `bucket`, `prefix`, `store_bucket`, `instance_profile`,
-`instance_type`, `volume_gb`, `max_minutes`), `[corpus]` (gen_corpus.py's
-`traces`, `hours`, `seed`, `spans_per_trace`, `logs_per_trace`),
-`[server]` (`tenant`, `shards`, `memory_budget_bytes`), `[hits]`,
-`[unsupported_states]` (state = reason), `[prices]` and `[cost]`.
+`max_minutes`, `cold_runs`, `warm_runs`, `hits`, `scales`, `baseline`,
+`mixed_wait_max_minutes`, `needle_blocks_max_objects`, `split_base_load`),
+`[box]` (s3 lane only: `sha`, `repo_url`, `region`, `bucket`, `prefix`,
+`store_bucket`, `instance_profile`, `instance_type`, `volume_gb`,
+`max_minutes`), `[corpus]` (gen_corpus.py's `traces`, `hours`, `seed`,
+`spans_per_trace`, `logs_per_trace`), `[server]` (`tenant`, `shards`,
+`memory_budget_bytes`), `[hits]`, `[many_parts]` (`traces_per_hour`,
+`snapshot_part_max_entries`), `[prices]` and `[cost]`.
 
 `[prices]` holds `get_per_1000`, `put_per_1000` (PUT and LIST),
 `storage_gb_month` and `instance_per_hour`, each beside a `<key>_source`
@@ -164,20 +259,33 @@ frequency, with its `_source`, and `amortise_months`.
 ## Stamps
 
 What the run proves about its own state, under `out/stamps/`. evaluate.py
-reports `missing stamps/<name>` for any it needs and does not find.
+reports `missing stamps/<name>` for any it needs and does not find;
+`store.json` and `corpus.json` are always required.
 
 | Stamp | Proves |
 |---|---|
 | `build.json` | the commit and how the binaries were built, with their sha256 |
 | `store.json` | the store bucket was qualified and empty at the start |
 | `host.json` | the machine (arch, nproc, memory, disk), `RQ_STATS=1`, and whether the page cache can be dropped |
-| `corpus.json` | the generator's parameters and the sha256 of `truth.json` |
-| `declare.json` | the tenant's declared columns and key index, as `tenant show` printed them |
-| `loads.jsonl` | one line per load (hour, signal): exit code, ingest hour and the load report |
-| `folds.jsonl` | one line per fold (transition, signal): exit code, the `--json` report, wall time, CPU seconds and peak RSS |
-| `census.jsonl` | one line per state: object count and bytes per key class, listed from the store |
+| `corpus.json` | the generator's parameters for every sub-corpus and the sha256 of `truth.json` |
+| `declare.json` | each tenant's declared columns and key index, as `typed-attr-column show` printed them |
+| `tenants.json` | the tenants the run loaded and their store prefixes |
+| `loads.jsonl` | one line per load (hour, tenant, signal): exit code, ingest hour and the load report |
+| `folds.jsonl` | one line per fold (transition, tenant, signal): exit code, the `--json` report, wall time, CPU seconds and peak RSS |
+| `census.jsonl` | one line per state: object count and bytes per tenant, signal and key class, listed from the store |
 | `transitions.jsonl` | one line per state entered: when, and in which ingest hour |
 | `restarts.jsonl` | one line per cold call: the server pid, the cache-drop result and the warmup |
+| `STATE.SIG.catalog.json` | `catalog inspect` before the state's first statement: HEAD id, part count, entries per part, the leaves each part carries |
+| `STATE.SIG.object.json` | `rspan inspect` or `rlog inspect` of one object named from the census: format version, sections, KEY_IDX presence, footer length |
+| `STATE.SIG.kidx.json` | `inspect kidx` of one leaf, when the state has leaves |
+| `STATE.SIG.tenant.txt` | `typed-attr-column show` at that state |
+| `STATE.server.json` | the server binary's sha256 and its flags |
+| `needle_blocks.json` | the logs needles' block counts as `rlog inspect` reads them, beside the generator's |
+| `compaction.jsonl`, `erasure.jsonl`, `not_run.jsonl` | the compaction child's reports, the erase submit and status, and each state recorded not-run |
+
+Covering parts, entry counts and leaf presence come from the catalog stamps,
+never from a fold report. A state whose catalog stamp is absent is the
+missing figure `covering_parts.STATE.SIG`.
 
 ## Evaluation
 
@@ -186,50 +294,106 @@ python3 benchmarks/investigations/evaluate.py --run OUT [--out-dir DIR]
 ```
 
 Each answer is judged against `truth.json` under the truth key
-`statements.toml` gives the call: a row count or row set that differs, or a
-call naming another key, is `wrong_answer`. Every figure `bands.toml` names
-goes through one list and is present exactly once: absent is `missing`, two
-inputs for it (calls or stamps) are `duplicate` and neither is used, a
-figure this build cannot produce is `unsupported-on-this-build` with the
-reason, and the figures of a row whose tenant, states, scales or baseline
-the run lacks are `not-run` with the reason. `timing` figures are judged on
-the s3 lane and only reported on the local one. Exit 0 only when nothing is
-missing, duplicated, wrong or missed; the output is a pure function of the
-run directory, so re-evaluating it is byte-identical.
+`statements.toml` gives the call, or, in the compaction and erasure states,
+against the unfolded state's answer to the same statement and try: a row
+count or row set that differs, or a call naming another key, is
+`wrong_answer`. q20's oracle is likewise the unfolded run's own rows;
+`hits.truth.json`'s predicted 4 rows is reported beside it as the
+pre-registered figure. Every figure `bands.toml` names goes through one
+list and is present exactly once: absent is `missing`, two inputs for it
+(calls or stamps) are `duplicate` and neither is used, and the figures of a
+row whose tenant, states, scales or baseline the run lacks are `not-run`
+with the reason.
+
+Only an allowlist of fields this build does not report may read as
+`unsupported-on-this-build`, and only when the call itself succeeded:
+`stats.keyIndex` and its members (`partsCovered`, `partsUncovered`,
+`partsBeyondCeiling`, `leavesRejected`, `reservationsRefused`,
+`leafGetRequests`, `keysProbed`), `pruning.skipIdxDropped`, the per-object
+and per-part breakdowns, and the fold report's `key_index_build_passes` and
+`head_bytes_per_part_field`. Any other absent field (`phases`, `pruning`,
+`signals`, `io`, `server_cpu_s`, `server_rss_peak`, `rows`, the duration)
+is `missing`, and no figure defaults to 0. A figure read from
+`segmentsOpened` (rows 5, 6 and 14, "objects opened") whose value is 0
+while the same call's scan phase issued a GET is `dead_counter
+segmentsOpened STATEMENT STATE`, a problem: on this build the rlog and rspan
+scan paths never increment that counter.
+
+`timing` figures (rows 2, 5, 15 and 16) are judged on the s3 lane and only
+reported on the local one. Exit 0 only when nothing is missing, duplicated,
+wrong, dead or missed; the output is a pure function of the run directory,
+so re-evaluating it is byte-identical.
 
 Metrics a band can name: `cold.max.<m>` and `cold.min.<m>` (over the cold
 tries; `<m>` from the call's stats phases and members, such as `total_gets`,
-`data_gets`, `wire_bytes`, `leaf_gets`), `warm.max.<m>`, `cold.rows_exact`
-(1 when every try's answer was correct), `cold.rows_match_state.<state>`,
-`cold.wall_p50_s`, `fold.<signal>.<field>` (from the fold report;
-`leaf_bytes_pct` is leaf bytes over the signal's own object bytes in the
-state's census, `new_entries` the difference from the previous fold),
-`matrix.*`, `cost.*`, `scale.*` and `control.*`.
+`data_gets`, `wire_bytes`, `leaf_gets`, `probe_wire_per_object`),
+`warm.max.<m>`, `cold.rows_exact` (1 when every try's answer was correct),
+`cold.rows_match_state.<state>`, `cold.wall_p50_s`,
+`cold.refused_by_complexity`, `stamp.<what>.<label>` (covering parts, entry
+counts, previous leaves, footer length, leaf buckets),
+`leaf_share.<label>.<field>`, `census.<tenant>.<signal>.objects|bytes`,
+`fold.<tenant>.<label>.<field>`, and `derived` figures over those.
+
+Some bands, as transcribed:
+
+- Row 3: probe wire per object (probe wire bytes over probe GETs; this build
+  issues one probe GET per candidate object) at most 8,192 B, miss over
+  16,384 B.
+- Row 7: section GETs at most 2 x new entries plus one per entry whose
+  footer exceeds 8 KiB plus one per previous leaf, miss over 2 x tail
+  entries, the from-scratch rebuild. New entries, previous leaves and footer
+  lengths come from the stamps; `rlog inspect` and `rspan inspect` print a
+  footer length, so the footer term is real (0 at the smoke's 196 and 241
+  bytes).
+- Row 8: leaf bytes per field over the label's census data bytes, banded at
+  2.5 % on logs and 6 % on spans, with the field named in the figure. The
+  ADR's band was measured on one repeated-key column (hits `UserID`, 2.06
+  %); the `request_id` leaf holds one key per row and is over that band on
+  any build, so its miss carries the reason "key cardinality equals the row
+  count".
+- Row 11: rows exact and `keysProbed` equal to the list size at 1, 10, 100
+  and 1,000 keys, leaf GETs at most 1 + min(distinct buckets, 64) and leaf
+  bytes at most entry_count x 11 KiB per covered part, and a 1,001-key
+  control that the index must not serve.
+- Row 15: the sum of the three steps' p50 under 5 s, miss over 20 s, and the
+  journey's GET total within resolve + 2 x covering parts on spans + (1 +
+  min(distinct buckets, 64)) per covering part on logs + 50 x (footer +
+  SKIP_IDX + block runs) on spans + the logs holders' block reads.
 
 Cost: per (statement, state), the mean cold call's GETs, LISTs and server
-CPU seconds times the named prices; per fold, its report's requests and its
-measured CPU; per state, storage from the census. Break-even compares each
-statement folded with leaves against unfolded at the assumed
-`lookups_per_part_month`, which the summary prints beside every figure.
+CPU seconds times the named prices. Amortised maintenance per signal is
+decision 8's: the leaf rebuild report's `ranged_gets` (section GETs) at the
+GET price plus its `attempts[].leaf_puts` at the PUT price, over
+`amortise_months`, plus the folded_leaves catalog stamp's leaf bytes in GB
+at the storage price, per stamped part and month. Break-even per statement
+and signal is that maintenance over (unfolded cost per lookup minus folded
+cost per lookup), "not applicable" when the folded cost is not below the
+unfolded one, at the assumed `lookups_per_part_month`, which the summary
+prints once, above the break-even lines.
 
 ## Unsupported on this build
 
-- `many_parts`: needs `ravel-cli load --ingest-hour-stride`, which this build
-  lacks. Every call planned for it is a `calls.jsonl` line with outcome
-  `unsupported-on-this-build` and the reason from `[unsupported_states]`.
-- `spans_in_1000`, `logs_request_in_1000`: the SQL surface refuses a
-  statement over 1,000 complexity tokens, and a 1,000-literal IN list counts
-  1,001. `statements.toml` carries the reason; run.sh records the call as
-  unsupported instead of sending it.
-- Key-index stats (`keyIndex.leafGets`, `partsCovered`, `keysProbed`),
-  `pruning.skipIdxDropped`, a per-object breakdown, and the fold report's
-  `key_index_build_passes` and `head_bytes_per_part_field`: absent from this
-  build's output, so their figures are unsupported with that reason.
+- Key-index stats (`stats.keyIndex` and its members),
+  `pruning.skipIdxDropped`, the per-object and per-part breakdowns, and the
+  fold report's `key_index_build_passes` and `head_bytes_per_part_field`:
+  absent from this build's output, so their figures are unsupported with
+  that reason (the allowlist above). The many_parts leaf-GET figures are
+  among them: main has no tier-2 reader.
+- The 1,000-key IN lists (`spans_in_1000`, `logs_trace_in_1000`,
+  `logs_request_in_1000`) are sent, and the server refuses them with HTTP 400
+  and `statement complexity 1001 exceeds the maximum of 1000 tokens;
+  simplify the statement`. evaluate.py records each as unsupported with
+  that text. The SQL complexity guard
+  (`crates/ravel-sql/src/complexity_guard.rs:257`, `MAX_STATEMENT_COMPLEXITY
+  = 1_000`) charges one unit per non-whitespace token, commas included, so
+  an IN list costs about two units per element and the cap sits near 495
+  keys. The guard stops counting at the cap plus one, so it reports 1001
+  for any statement over the cap.
 - Row 13's negative controls: decision 9's mutants are not built here.
 
 Rows 5, 6 and 16 need `hits = true`; row 12 needs scales 10 and 100, and row
-16 a baseline build. This flow loads scale 1 and builds one commit, so those
-rows report `not-run`.
+16 a baseline build. This flow loads scale 1 and builds one commit, so rows
+12 and 16 report `not-run`, and rows 5 and 6 do too unless `hits = true`.
 
 ## Pre-registration
 
@@ -242,29 +406,64 @@ its own comment.
 ## Corpus
 
 Sizes, hours and the needle tiers are `gen_corpus.py` parameters; the ADR's
-corpus is `--traces 20000000 --hours 24`. Needles are planted by row index
-against the generator's own 256-row blocks: the common needle fills whole
-blocks covering 10 % of them, the sparse one 0.1 % of rows outside those,
-the rare one a single row. Those block frequencies are approximate with
-respect to the store's real segment geometry, which the generator does not
-read. Issue #3699's spec, not the ADR, allows them 20 % of slack;
-`truth.json` records the exact counts every answer is judged against.
+corpus is `--traces 20000000 --hours 24`. Needles are planted per block of
+the generator's documented geometry (256 rows per block after ingest's
+timestamp sort): the common needle in one row of 10 % of block indices, the
+sparse one in one row of 0.1 % of block indices (at least 2, and the common
+one at least one more), the rare one in a single row, so the tiers order rare < sparse < common by blocks touched. The suite
+recounts blocks from the data rows under that geometry and requires each
+tier within 20 % of its target (issue #3699's spec, not the ADR, allows the
+20 %). `truth.json` records the exact counts every answer is judged
+against.
+
+The store's own blocks are not 256 rows. `stamps/needle_blocks.json`
+records both counts: in the smoke the generator planted needles in 6 of its
+256-row blocks (common 3, sparse 2, rare 1), while `rlog inspect` over all
+4 logs objects reports 4 blocks for 5,000 records, one per object, with the
+needle tag present in 3 of them. At that scale a store block holds about
+1,250 rows, so several planted blocks share one.
 
 ## fixtures/local-smoke
 
-A local-lane run of `box/run.local-smoke.toml` on an aarch64 machine (4
-cores, 8 GB): 1,000 traces over 2 hours, 2 cold runs, every state, against a
-loopback RustFS. Its `calls.jsonl`, `truth.json` and `results.local.json`
-are gzipped to keep the fixture under 200 KB; `summary.local.txt` and the
-stamps are plain. Its verdict is `fail`, from two counter misses at this
-scale: `row_07.spans_section_gets` (8 ranged GETs against a target of
-3 x 2 new entries + 1 previous leaf = 7) and `row_08.logs_leaf_pct` (leaf
-bytes 33.7 % of the logs objects against a 2.5 % target stated for the ADR's
-corpus, measured here over 5,000 log rows). They are the run's real figures.
+A local-lane run of `box/run.local-smoke.toml` on an x86_64 machine (8
+cores, 16 GB): 1,000 traces over 2 hours plus a 500-trace tail hour, 2 cold
+runs, hits = false, over unfolded, folded_no_leaves, folded_leaves, mixed,
+compaction_in_flight and many_parts_24, against a loopback RustFS. Imported
+with `investigations_cases.py --import-local-smoke DIR`. Its `calls.jsonl`,
+`truth.json`, `results.local.json` and every stamp are gzipped, which keeps
+the fixture under 300 KB; `summary.local.txt` and `run.toml` are plain.
 
-`investigations.test.sh` re-evaluates it and requires byte-identical output.
-After a deliberate change to evaluate.py, `bands.toml` or `statements.toml`,
-regenerate the expected output and review the summary diff:
+Its verdict is `fail`. The problem list, pinned by the suite:
+
+```
+miss row_01.wire_bytes
+miss row_03.probe_wire_per_object
+miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
+miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count
+miss row_08.logs_trace_id_leaf_pct
+miss row_08.logs_request_id_leaf_pct: key cardinality equals the row count
+dead_counter segmentsOpened journey_c_1 folded_leaves
+dead_counter segmentsOpened journey_c_10240 folded_leaves
+```
+
+- Row 3: 131,072 probe wire bytes over 2 probe GETs, 65,536 B per object,
+  the old 64 KiB read (#3118, fixed by T4, not on main).
+- Row 7: the fold_advance rebuild issued 12 section GETs on each signal,
+  2 x the 6 entries of the whole tail, against targets of 2 x 2 new + 1
+  previous leaf = 5 (spans) and 2 x 2 + 2 = 6 (logs). Main rebuilds the leaf
+  from scratch on an advancing fold, which T6 of the epic changes; this is
+  not a scale effect.
+- Row 8: the logs `request_id` leaf is 25.2 % of the logs data bytes (one
+  key per row) and the logs trace id leaf 5.5 %, against 2.5 %; the spans
+  trace id leaf is 4.6 %, inside 6 %.
+- Row 1: 319,459 wire bytes for the no-range lookup, the run's real figure.
+- `dead_counter`: segmentsOpened is 0 on every SQL call while scan GETs move
+  bytes; journey C's objects-opened figures (row 14) report it.
+
+`investigations.test.sh` re-evaluates it and requires byte-identical output
+and that exact problem list. After a deliberate change to evaluate.py,
+`bands.toml` or `statements.toml`, regenerate the expected output and
+review the summary diff:
 
 ```sh
 python3 benchmarks/investigations/investigations_cases.py --refresh-local-smoke
@@ -274,9 +473,12 @@ python3 benchmarks/investigations/investigations_cases.py --refresh-local-smoke
 
 `bash benchmarks/investigations/investigations.test.sh`, in CI's
 `doc-scripts` job: no AWS, no server, under two minutes. It runs `bash -n`
-over every script, generator recounts at 1,000 traces (and at scale 10),
-the shape of `statements.toml` and `bands.toml`, evaluate.py on the fixture
-and on mutations of it (missing, duplicate, miss, wrong answer, exact cost),
-two wrong evaluators that must fail those cases, and the dry runs of
-`run.sh`, `launch.sh` (with an `aws` stub that fails if called) and
-`fetch.sh`.
+over every script, generator recounts at 1,000 traces (and at scale 10,
+with the block-frequency recount), the shape of `statements.toml` and
+`bands.toml`, evaluate.py on the fixture and on mutations of it (missing,
+duplicate, miss, wrong answer, a deleted catalog stamp, absent phases and
+CPU, dead counters, the IN refusal, the unsealed tail, a state absent from
+the results, exact cost and maintenance dollars), the wrong evaluators each
+of those cases must reject, and the dry runs of `run.sh` (local, s3, s3
+with hits, and past the deadline), `launch.sh` (with an `aws` stub that
+fails if called) and `fetch.sh`.
