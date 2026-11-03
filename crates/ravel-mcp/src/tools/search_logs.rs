@@ -734,7 +734,7 @@ fn argument_hash(statement: &str, window: &ravel_types::TimeRange, max_rows: u32
 
 fn decode_hex(raw: &str) -> Option<Vec<u8>> {
     let digits = raw.as_bytes();
-    if digits.is_empty() || digits.len() % 2 != 0 {
+    if digits.is_empty() || !digits.len().is_multiple_of(2) {
         return None;
     }
     digits
