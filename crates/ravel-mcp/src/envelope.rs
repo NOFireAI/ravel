@@ -461,6 +461,11 @@ pub struct Coverage {
 pub struct Accuracy {
     pub exact: bool,
     pub approximation: Option<String>,
+    /// Reserved, and `false` on every envelope: no tool sets it. A count
+    /// over `logs` or `spans` can include rows an at-least-once retry
+    /// stored twice, which makes it an upper bound on distinct records,
+    /// not a lower bound, and the SQL tool does not classify a statement's
+    /// aggregates.
     pub lower_bound_count: bool,
 }
 
@@ -562,7 +567,11 @@ pub enum FailureClass {
 pub struct Failure {
     pub class: FailureClass,
     pub message: String,
-    /// The counter that tripped, for `budget_exceeded`; absent otherwise.
+    /// The counter that tripped, for a `budget_exceeded` refused by code that
+    /// holds the counter itself (the analytics series cap reports `series`).
+    /// Absent otherwise, including for every budget the query service
+    /// enforces: its error carries a message naming the counter, not the
+    /// counter.
     pub counter: Option<String>,
 }
 

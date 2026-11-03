@@ -328,7 +328,9 @@ analytic sets `exact: false` and names the method.
 Missing coverage sets `complete: false` and names the reason. A budget
 failure or a deadline is an `error`. The server never returns a partial exact
 aggregate as `ok`. A `COUNT` over `logs` or `spans` sets
-`lower_bound_count: true`, because ingest is at-least-once.
+`lower_bound_count: true`, because ingest is at-least-once (retired by the
+envelope-claims amendment below: the field is reserved and always `false`,
+and a consented partial PromQL result reports `exact: false`).
 
 Time. Every data tool requires a time input. There is no default window.
 Inputs are RFC 3339 strings or integer nanoseconds as strings. Range tools
@@ -348,7 +350,8 @@ are numbers with the sign of zero preserved (the rule of
 Failure classes: `unauthorized`, `invalid_argument`, `missing_argument` (a
 required argument is absent), `validation` (the engine text, safe to echo),
 `unsupported`, `budget_estimate_exceeds_ceiling`, `budget_exceeded` (with the
-counter that tripped), `deadline`, `unavailable` (retryable),
+counter that tripped; the envelope-claims amendment below says where
+`failure.counter` carries it), `deadline`, `unavailable` (retryable),
 `snapshot_invalidated` (retryable once), `cursor_expired`, `cursor_invalid`,
 and `internal` (fixed message). A failure is a tool result with
 `isError: true`, so the model can correct itself. Protocol errors are for
@@ -1544,3 +1547,41 @@ through `Draft::finish_page` (`crates/ravel-mcp/src/draft.rs`).
 2. D4's first-row guarantee is a rule of the byte cap: the byte fit never
    drops the first row and shortens its cells instead. It says nothing about
    the row cap, which item 1 governs.
+
+## Amendment (2026-11-03, #3751): the envelope-claims amendment, three envelope fields say only what the code measured
+
+<!-- amendment-applies: sections="D4. The result envelope" pointer="envelope-claims amendment" -->
+<!-- amendment-supersedes: phrase="`lower_bound_count: true`" pointer="envelope-claims amendment" -->
+
+The #1388 review found three D4 fields claiming more than the served code
+measures. This envelope-claims amendment makes each say what the code does.
+
+1. A `ravel_query_promql` result returned under
+   `allow_partial_coverage: true` with `coverage.partial: true` reports
+   `accuracy.exact: false`, and `accuracy.approximation` is
+   `PARTIAL_APPROXIMATION` in `crates/ravel-mcp/src/tools/query_promql.rs`,
+   saying the result omits the data the query could not reach. D4 gives a
+   partial answer no status of its own, and `ok_bounded` and `ok_page` say
+   a cap stopped the result, so the status stays `ok` when no cap did; the
+   rule "never a partial exact aggregate as `ok`" holds because the result
+   is no longer exact. `partial_coverage_is_refused_without_consent_and_returned_with_it`
+   pins it.
+2. `accuracy.lower_bound_count` stays in the envelope and is reserved: no
+   tool sets it, and it is `false` on every envelope. D4's reason,
+   at-least-once ingest, points the other way: a retry can store a log or
+   span row twice and logs and spans have no query-time dedup
+   (docs/consistency-model.md), so a `COUNT` there is an upper bound on
+   distinct records, as the committed row count amendment already says of
+   `committed_rows`. `ravel_query_sql` also does not classify a statement's
+   aggregates, so it cannot tell a count from another aggregate.
+   `query_sql_count_over_logs_leaves_lower_bound_count_unset` in
+   `services/ravel-server/tests/mcp_e2e.rs` counts a duplicated log line as
+   two rows with the flag `false`.
+3. `budget_exceeded` names the counter that tripped in `failure.message`.
+   `failure.counter` is set only where the MCP server enforces the limit
+   itself, today the 1,000-series cap of `ravel_analyze_timeseries`
+   (`series`). A budget the query service enforces reaches the adapter as a
+   `ServiceError`, which carries the class and the redacted message and no
+   counter, so `failure.counter` is `null` there rather than parsed from
+   the message. `a_service_budget_failure_names_its_counter_in_the_message_only`
+   in `services/ravel-server/src/mcp/envelope.rs` pins each engine budget.
