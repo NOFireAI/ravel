@@ -4,7 +4,7 @@
 # truth.json's `answers[truth_key]` and judges it against bands.toml.
 #
 # Fields:
-#   id         unique, used in calls.jsonl, results.json and bands.toml
+#   id         unique, used in calls.jsonl, results.<lane>.json and bands.toml
 #   tenant     "inv" (the generated corpus, spans and logs in one tenant) or
 #              "hits" (the ClickBench tenant; only when run.toml sets
 #              hits = true)
