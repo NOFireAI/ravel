@@ -137,7 +137,7 @@ agents_name_filter='==> cargo nextest run --locked -p ravel-server --features ag
 agents_classification='==> cargo nextest run --locked -p ravel-catalog --test sys_proto_format_version_classification'
 agents_small_pages='==> env RAVEL_AGENTS_PAGE_ENTRIES=2 cargo nextest run --locked -p ravel-agents-runtime -p ravel-agents-sim'
 mcp_clippy='==> cargo clippy --locked -p ravel-server --features mcp --all-targets -- -D warnings'
-mcp_test='==> cargo nextest run --locked -p ravel-server --features mcp --test mcp_e2e --test trace_by_id'
+mcp_test='==> cargo nextest run --locked -p ravel-server --features mcp --test mcp_e2e --test trace_by_id --test mcp_conformance --test mcp_escape_routes --test mcp_audit'
 mcp_lib_test='==> cargo nextest run --locked -p ravel-server --features mcp --lib'
 mcp_agents_clippy='==> cargo clippy --locked -p ravel-server --features mcp,agents --all-targets -- -D warnings'
 mcp_agents_test='==> cargo nextest run --locked -p ravel-server --features mcp,agents --test mcp_agents_e2e'
@@ -385,7 +385,7 @@ check_eq "affected-tests -p ravel-query: no bare agents name filter" "0" \
 check_eq "affected-tests -p ravel-query: classification test" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-catalog --test sys_proto_format_version_classification')"
 check_eq "affected-tests -p ravel-query: mcp binaries" "1" \
-  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features mcp --test mcp_e2e --test trace_by_id')"
+  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features mcp --test mcp_e2e --test trace_by_id --test mcp_conformance --test mcp_escape_routes --test mcp_audit')"
 check_eq "affected-tests -p ravel-query: mcp lib tests" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features mcp --lib')"
 check_eq "affected-tests -p ravel-query: mcp agents binary" "1" \

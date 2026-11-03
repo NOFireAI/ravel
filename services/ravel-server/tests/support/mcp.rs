@@ -227,15 +227,21 @@ pub async fn post_raw(
         .expect("the request reaches the server")
 }
 
-/// A 400 raised by the adapter's per-revision header check, told apart from
-/// one the protocol layer raises by its body: the adapter answers the
-/// `errorType`-tagged JSON of the HTTP query routes, rmcp a JSON-RPC error.
-pub async fn assert_refused_by_the_header_check(response: reqwest::Response) {
+/// A 400 raised by the adapter's per-revision header check because it does
+/// not serve `revision`, told apart from one the protocol layer raises by its
+/// body (the adapter answers the `errorType`-tagged JSON of the HTTP query
+/// routes, rmcp a JSON-RPC error) and from the header check's other
+/// refusals by its message, which names the revision.
+pub async fn assert_refused_for_revision(response: reqwest::Response, revision: &str) {
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
     let body: Value = response.json().await.expect("a JSON error body");
     assert_eq!(body["status"], json!("error"), "{body}");
     assert_eq!(body["errorType"], json!("bad_data"), "{body}");
-    assert!(body["error"].is_string(), "{body}");
+    let message = body["error"].as_str().expect("an error message");
+    assert!(
+        message.contains("unsupported MCP protocol version") && message.contains(revision),
+        "{body}"
+    );
 }
 
 /// A JSON-RPC `initialize` body stating `revision`.

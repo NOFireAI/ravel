@@ -1600,8 +1600,9 @@ jobs:
 
   # ravel-server's `mcp` feature (ADR-1374), the same shape as
   # `features-agents` above. Mirrors scripts/gates.sh's mcp lane: `cargo
-  # clippy -p ravel-server --features mcp --all-targets`, the mcp_e2e and
-  # trace_by_id test binaries, the lib tests whose path contains `mcp`, and
+  # clippy -p ravel-server --features mcp --all-targets`, the mcp_e2e,
+  # trace_by_id, mcp_conformance, mcp_escape_routes and mcp_audit test
+  # binaries, the lib tests whose path contains `mcp`, and
   # under `--features mcp,agents` clippy and the mcp_agents_e2e binary. Gated on
   # server_or_operator, since the feature lives entirely in ravel-server and
   # ravel-mcp, and any unlisted path forces server_or_operator true.
@@ -1636,11 +1637,11 @@ jobs:
       - name: Clippy ravel-server --features mcp
         run: cargo clippy --locked --profile ci -p ravel-server --features mcp --all-targets -- -D warnings
         # Same shape as `features-agents` above, with the reasons in
-        # scripts/gates.sh's run_feature_lanes: mcp_e2e and trace_by_id
-        # (whose `with_mcp` module compiles only under the feature) whole,
-        # and the lib tests whole.
-      - name: Test ravel-server --features mcp (mcp_e2e and trace_by_id binaries)
-        run: cargo test --locked --profile ci -p ravel-server --features mcp --test mcp_e2e --test trace_by_id
+        # scripts/gates.sh's run_feature_lanes: mcp_e2e, trace_by_id (whose
+        # `with_mcp` module compiles only under the feature), mcp_conformance,
+        # mcp_escape_routes and mcp_audit whole, and the lib tests whole.
+      - name: Test ravel-server --features mcp (feature-gated binaries)
+        run: cargo test --locked --profile ci -p ravel-server --features mcp --test mcp_e2e --test trace_by_id --test mcp_conformance --test mcp_escape_routes --test mcp_audit
       - name: Test ravel-server --features mcp (lib tests)
         run: cargo test --locked --profile ci -p ravel-server --features mcp --lib
         # The Ravel Agents MCP tools compile only with both features.
