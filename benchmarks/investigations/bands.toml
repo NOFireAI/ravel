@@ -11,7 +11,7 @@
 #   transition optional, fold figures only: the fold stamp to read when it is
 #              not the state's own ("leaf_rebuild", the folded_leaves
 #              state's --rebuild-key-index step)
-#   metric     what evaluate.py extracts (README.md "Metrics")
+#   metric     what evaluate.py extracts (README.md "Evaluation")
 #   lane       "counter": judged on every lane; "timing": judged on the s3
 #              lane only (decision 8: the local lane is counter-only), and
 #              reported but not judged on the local lane

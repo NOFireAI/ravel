@@ -46,7 +46,9 @@ S3-compatible store, from an empty bucket to `results.<lane>.json`.
 Results are always `results.<lane>.json` and `summary.<lane>.txt`, so a local
 run never overwrites or reads as an s3 one.
 
-### s3 lane (the only lane timing is judged on)
+### S3 lane
+
+The only lane timing is judged on.
 
 Fill in a copy of `box/run.example.toml` (`box.sha`, `box.bucket`,
 `box.store_bucket`), then:
@@ -75,9 +77,9 @@ At the ADR's 20,000,000 traces and 20 cold runs, each cold call costing a
 server restart, a run is not known to fit inside 600 minutes; the first
 s3 run should be pre-registered with that as an open question.
 
-### local lane (counters only)
+### Local lane
 
-A loopback RustFS started by run.sh itself, and release binaries built
+Counters only. A loopback RustFS started by run.sh itself, and release binaries built
 beforehand:
 
 ```sh
@@ -125,6 +127,17 @@ then `run.warm_runs` times warm, without a restart, unless the statement is
 `calls.jsonl`. The server runs `--mode query`: `--mode all` runs scheduled
 folds and compaction that would move the state under the measurement, so
 run.sh stops the server before every fold.
+
+### Placeholders
+
+A statement's SQL names planted keys as `{placeholders}`, filled from
+`truth.json` by `box/lib/inv.py plan`: `{trace}` (saved trace `run`),
+`{cell_service}`, `{cell_start_ns}`, `{cell_end_ns}`, `{request_present}`,
+`{request_absent}`, `{in_trace_ids_x_N}` and `{in_request_ids_N}` (the IN
+lists, as plain SQL literals), and `{jc_start_ns_K}` and `{jc_cut_ns_K}`
+(journey C's build windows). A placeholder left unfilled stops the run.
+
+### Cold and warm
 
 The startup warmup loads recent parts into the cache before the first call,
 so a "cold" call means a fresh process after a page-cache drop, not an empty
