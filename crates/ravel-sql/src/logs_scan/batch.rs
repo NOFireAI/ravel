@@ -286,6 +286,9 @@ thread_local! {
     /// Blocks [`build_str_block`] built through the plain memo fast path on
     /// this thread, so a test can show the path ran.
     static PLAIN_MEMO_FAST_PATHS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Blocks [`build_str_block`] built with a dictionary's keys shared with
+    /// the cache entry on this thread, so a test can show the key path ran.
+    static DICT_MEMO_KEY_PATHS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// A `Str` cell's bytes as text, or `None` when they are not UTF-8. The
@@ -361,6 +364,39 @@ impl<'a> StrCursor<'a> {
         memo_array(memo, &self.validated, entries as u64)
     }
 
+    /// The dictionary's memo array and the block's keys shared with the
+    /// cache entry, when a block of `surviving` rows out of `record_count`
+    /// meets the key path's preconditions (ADR-3326, zero-copy values
+    /// amendment, decision 2, second paragraph): identity rows, every row
+    /// present ([`StrDictColumn::block_keys`]), and every entry UTF-8
+    /// (`all_valid`), so no key points at a NULL entry. A row group
+    /// dictionary has no memo ([`Self::dict_memo`]). The caller checks
+    /// `single_matching`.
+    fn dict_memo_keys(
+        &self,
+        surviving: usize,
+        record_count: usize,
+    ) -> Option<(StringArray, ScalarBuffer<i32>)> {
+        let d = self.dict.as_ref()?;
+        if surviving != record_count || !d.values().all_valid() {
+            return None;
+        }
+        let keys = d.block_keys().filter(|k| k.len() == record_count)?;
+        let values = self.dict_memo()?;
+        let memo = self
+            .memo
+            .as_ref()?
+            .get()?
+            .as_any()
+            .downcast_ref::<StrMemo>()?;
+        let buffer = memo
+            .keys
+            .get_or_init(|| memo_buffer(Arc::clone(keys), &memo.cell));
+        let shares = std::ptr::eq(buffer.as_ptr(), keys.as_ptr().cast::<u8>())
+            && buffer.len() == std::mem::size_of_val::<[i32]>(keys);
+        shares.then(|| (values, ScalarBuffer::new(buffer.clone(), 0, keys.len())))
+    }
+
     /// The dictionary key of surviving row `i` when the row has a value and
     /// its entry is UTF-8; `None` on a plain page.
     fn dict_key(&self, i: usize) -> Option<i32> {
@@ -408,13 +444,20 @@ impl<'a> StrCursor<'a> {
 /// a scan then takes the per-scan build, and the column never retries.
 struct StrMemo {
     array: Option<StringArray>,
+    /// The entry's reservation cell, for the keys buffer below.
+    cell: Arc<ReservationCell>,
+    /// A dictionary block's keys as an Arrow buffer sharing them, built on
+    /// the first [`StrCursor::dict_memo_keys`] that takes the key path.
+    keys: std::sync::OnceLock<Buffer>,
 }
 
 impl ValuesMemo for StrMemo {
     /// True while any of the array's buffers has a holder beyond the memo's
     /// own reference: a scan's clone of the array, a batch holding that, or a
-    /// view array a cast built over the values buffer. Each of those clones a
-    /// `Buffer`, which moves `Buffer::strong_count`.
+    /// view array a cast built over the values buffer, or a batch holding the
+    /// keys buffer. Each of those clones a `Buffer`, which moves
+    /// `Buffer::strong_count`
+    /// (`a_batch_holding_only_the_shared_keys_keeps_the_entry_held`).
     fn held_outside(&self) -> bool {
         let Some(array) = &self.array else {
             return false;
@@ -423,6 +466,7 @@ impl ValuesMemo for StrMemo {
             || array.offsets().inner().inner().strong_count() > 1
             || datafusion::arrow::array::Array::nulls(array)
                 .is_some_and(|n| n.buffer().strong_count() > 1)
+            || self.keys.get().is_some_and(|k| k.strong_count() > 1)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -434,9 +478,9 @@ impl ValuesMemo for StrMemo {
 /// own `Arc` and the entry's reservation cell, never the column (decision 3),
 /// so the reservation lasts as long as any Arrow buffer over the bytes
 /// (decision 5).
-struct MemoOwner<T> {
-    buf: Arc<T>,
+struct MemoOwner<T: ?Sized> {
     _cell: Arc<ReservationCell>,
+    buf: Arc<T>,
 }
 
 impl AsRef<[u8]> for MemoOwner<String> {
@@ -457,6 +501,12 @@ impl AsRef<[u8]> for MemoOwner<Vec<i32>> {
     }
 }
 
+impl AsRef<[u8]> for MemoOwner<[i32]> {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.to_byte_slice()
+    }
+}
+
 impl AsRef<[u8]> for MemoOwner<Validity> {
     fn as_ref(&self) -> &[u8] {
         self.buf.words().to_byte_slice()
@@ -467,7 +517,7 @@ impl AsRef<[u8]> for MemoOwner<Validity> {
 fn memo_buffer<T>(buf: Arc<T>, cell: &Arc<ReservationCell>) -> Buffer
 where
     MemoOwner<T>: AsRef<[u8]>,
-    T: Send + Sync + 'static,
+    T: Send + Sync + ?Sized + 'static,
 {
     Buffer::from(bytes::Bytes::from_owner(MemoOwner {
         buf,
@@ -543,11 +593,15 @@ fn memo_array(
     cells: u64,
 ) -> Option<StringArray> {
     let memo = source.get_or_build(|buffers, cell| {
-        let array = build_str_memo(buffers, cell);
+        let array = build_str_memo(buffers, Arc::clone(&cell));
         if array.is_some() {
             validated.set(validated.get() + cells);
         }
-        Arc::new(StrMemo { array })
+        Arc::new(StrMemo {
+            array,
+            cell,
+            keys: std::sync::OnceLock::new(),
+        })
     });
     memo.as_any().downcast_ref::<StrMemo>()?.array.clone()
 }
@@ -1620,7 +1674,10 @@ fn chunk_keys(keys: &Int32Array, start: usize, end: usize) -> Int32Array {
 /// plain column that meets the fast path's preconditions
 /// ([`StrCursor::plain_memo`], plus a single-typed key) skips the loop: its
 /// keys are the identity and its values the memo array, byte-identical to the
-/// loop's (`memo_str_block_is_byte_identical_to_the_loop`).
+/// loop's (`memo_str_block_is_byte_identical_to_the_loop`). A dictionary
+/// block that meets the key path's preconditions ([`StrCursor::dict_memo_keys`],
+/// plus a single-typed key) skips it too: its keys are the entry's own,
+/// shared, with the same bytes the loop would write (same test).
 fn build_str_block(
     view: &ColumnarBlockView<'_>,
     resolver: &mut DeclaredResolver<'_, '_, '_>,
@@ -1650,6 +1707,25 @@ fn build_str_block(
         PLAIN_MEMO_FAST_PATHS.with(|c| c.set(c.get() + 1));
         return Ok(StrBlock {
             keys: Int32Array::new(keys.into(), None),
+            values,
+        });
+    }
+    // A served or just-admitted block's own dictionary, every entry UTF-8,
+    // no filter narrowing it, every row present: every row's key is its
+    // page key, so the keys are the entry's own and the values the memo
+    // array, the bytes the loop below would produce (decision 2, second
+    // paragraph).
+    if single_matching
+        && let Some(cursor) = matching_str
+        && let Some((memo, keys)) = cursor.dict_memo_keys(n, view.record_count())
+        && let Some(dict) = cursor.dict.as_ref()
+    {
+        let values =
+            lock_str_values(&resolver.str_values).values(dict.values(), Vec::new(), Some(&memo))?;
+        #[cfg(test)]
+        DICT_MEMO_KEY_PATHS.with(|c| c.set(c.get() + 1));
+        return Ok(StrBlock {
+            keys: Int32Array::new(keys, None),
             values,
         });
     }
