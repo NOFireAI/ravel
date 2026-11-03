@@ -265,16 +265,19 @@ use std::ops::ControlFlow;
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
-    Distinct, Expr as SqlExpr, GroupByExpr, Ident, ObjectName, OrderBy, OrderByExpr, OrderByKind,
-    OrderByOptions, Query, Select, SetExpr, Statement, TableFactor, UnaryOperator, Value, Visit,
-    Visitor,
+    Distinct, Expr as SqlExpr, Function, FunctionArguments, GroupByExpr, Ident, ObjectName,
+    OrderBy, OrderByExpr, OrderByKind, OrderByOptions, Query, Select, SetExpr, Statement,
+    TableFactor, UnaryOperator, Value, Visit, Visitor,
 };
 
 use crate::alerts_schema::alerts_schema;
 use crate::audit_schema::audit_schema;
 use crate::logs_schema::logs_schema;
 use crate::schema::public_schema;
-use crate::session::{ALERTS_TABLE, AUDIT_TABLE, LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE};
+use crate::session::{
+    ADMITTED_AGGREGATES, ADMITTED_WINDOWS, ALERTS_TABLE, AUDIT_TABLE, LOGS_TABLE,
+    REWRITE_ONLY_AGGREGATES, SAMPLES_TABLE, SPANS_TABLE,
+};
 use crate::spans_schema::spans_schema;
 use crate::validate::{ValidationError, referenced_base_tables, validate_query};
 
@@ -533,6 +536,27 @@ pub enum PagePlanError {
          after it would appear on no page"
     )]
     OrderTermNotRepresentable { column: String, kind: String },
+
+    /// An `ORDER BY` term whose value is computed from rows other than its
+    /// own: an aggregate, a window function, or a subquery, anywhere in the
+    /// expression the term names or is.
+    ///
+    /// Not a refusal of the statement, and the paging tool does not answer it
+    /// as one: like [`Self::NoOrdering`], it says the statement has no
+    /// position a cursor can resume from, so it runs as written and its first
+    /// page carries no cursor. A keyset position on such a term is not
+    /// stable. A row committed after the mint into an ingest hour the mint
+    /// lists changes `count(*)` for its group, or `count(*) OVER ()` for
+    /// every row, so a row already served sorts back in after the cursor and
+    /// is served again, which ADR-1374's 2026-09-12 amendment, item 4, says
+    /// never happens.
+    #[error(
+        "the ORDER BY term `{term}` is computed from rows other than its own \
+         (an aggregate, a window function or a subquery), so a row committed \
+         after a cursor was minted can move a row already served to after the \
+         cursor position; no cursor is minted on it"
+    )]
+    OrderTermFromOtherRows { term: String },
 
     /// `SELECT ... INTO ...` at any depth.
     ///
@@ -798,7 +822,7 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
     // itself.
     let names = OutputResolution::of(&query, target);
 
-    let mut terms = statement_order_terms(&query)?;
+    let mut terms = statement_order_terms(&query, &names)?;
     for term in &terms {
         if matches!(names.resolve(&term.column), Provenance::NotProjected) {
             return Err(PagePlanError::OrderTermNotProjected {
@@ -1750,16 +1774,6 @@ fn expression_cursor_support(expr: &SqlExpr) -> CursorSupport {
             }
             _ => CursorSupport::Unrepresentable(format!("the expression `{expr}`")),
         },
-        // `count(...)` is a row count: a non-negative integer, which
-        // `ResumeValue::Int` carries exactly. The name is re-checked here
-        // rather than inherited from the nullability proof, so the two cannot
-        // drift into admitting different function sets.
-        SqlExpr::Function(function)
-            if bare_name(&function.name)
-                .is_some_and(|name| name.eq_ignore_ascii_case(COUNT_FUNCTION)) =>
-        {
-            CursorSupport::Exact(ResumeKind::Int)
-        }
         other => CursorSupport::Unrepresentable(format!("the expression `{other}`")),
     }
 }
@@ -1903,16 +1917,90 @@ fn expression_is_non_null(expr: &SqlExpr) -> bool {
             op: UnaryOperator::Plus | UnaryOperator::Minus,
             expr,
         } => expression_is_non_null(expr),
-        SqlExpr::Function(function) => {
-            bare_name(&function.name).is_some_and(|name| name.eq_ignore_ascii_case(COUNT_FUNCTION))
-        }
         _ => false,
     }
 }
 
-/// The one aggregate this planner proves NON NULL. Lowercase: [`bare_name`]
-/// lowercases an unquoted identifier.
-const COUNT_FUNCTION: &str = "count";
+/// Whether an expression's value for a row is computed from rows other than
+/// that one: it calls an aggregate or a window function, or reads a subquery,
+/// anywhere inside it.
+///
+/// Such a value is no keyset position. A row committed after a cursor was
+/// minted, into an ingest hour the mint lists, changes `count(*)` for its
+/// group and `count(*) OVER ()` for every row, so a row already served can
+/// sort back in after the cursor and be served twice. ADR-1374's 2026-09-12
+/// amendment, item 4, says a row is never repeated.
+///
+/// A function is an aggregate or a window function when its name is one the
+/// session registers as either ([`ADMITTED_AGGREGATES`],
+/// [`REWRITE_ONLY_AGGREGATES`], [`ADMITTED_WINDOWS`]), or when its call
+/// carries a clause only those take: `OVER`, `FILTER`, `WITHIN GROUP`, a
+/// null treatment, `DISTINCT`/`ALL` or an argument-list clause, or a
+/// parameter list. The name is matched on its last part, in any case, so a
+/// qualified or quoted spelling is caught too. Reading too wide here is safe:
+/// a term this answers true for runs once with no cursor, and no other
+/// function term is proven NON NULL, so none would get a cursor either way.
+fn depends_on_other_rows(expr: &SqlExpr) -> bool {
+    struct OtherRows;
+    impl Visitor for OtherRows {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _: &Query) -> ControlFlow<()> {
+            ControlFlow::Break(())
+        }
+
+        fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<()> {
+            match expr {
+                SqlExpr::Function(function) if function_reads_other_rows(function) => {
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+    expr.visit(&mut OtherRows).is_break()
+}
+
+/// Whether one call is an aggregate or a window function, by the rule
+/// [`depends_on_other_rows`] states. Every field is named, with no `..`, so
+/// a clause a later sqlparser adds is a compile error here.
+fn function_reads_other_rows(function: &Function) -> bool {
+    let Function {
+        name,
+        // ODBC `{fn ...}` braces; the name inside is what is called.
+        uses_odbc_syntax: _,
+        parameters,
+        args,
+        filter,
+        null_treatment,
+        over,
+        within_group,
+    } = function;
+    let named = name
+        .0
+        .last()
+        .and_then(|part| part.as_ident())
+        .is_some_and(|ident| {
+            ADMITTED_AGGREGATES
+                .iter()
+                .chain(&REWRITE_ONLY_AGGREGATES)
+                .chain(&ADMITTED_WINDOWS)
+                .any(|known| ident.value.eq_ignore_ascii_case(known))
+        });
+    let aggregate_clause = match args {
+        FunctionArguments::List(list) => {
+            list.duplicate_treatment.is_some() || !list.clauses.is_empty()
+        }
+        FunctionArguments::None | FunctionArguments::Subquery(_) => false,
+    };
+    named
+        || aggregate_clause
+        || !matches!(parameters, FunctionArguments::None)
+        || filter.is_some()
+        || null_treatment.is_some()
+        || over.is_some()
+        || !within_group.is_empty()
+}
 
 /// The parts of a single `SELECT` body that decide whether it projects the
 /// scanned rows one-for-one.
@@ -2038,7 +2126,16 @@ fn shape_of<'a>(query: &'a Query) -> Option<SelectShape<'a>> {
 /// whenever it only orders, so the clause was dropped with it and the page
 /// ran under an ordering the caller had not written. Each term's
 /// `OrderByExpr` and its `OrderByOptions` are named the same way.
-fn statement_order_terms(query: &Query) -> Result<Vec<OrderTerm>, PagePlanError> {
+///
+/// A term computed from other rows ([`PagePlanError::OrderTermFromOtherRows`])
+/// is looked for across every term before any other term is read, whether it
+/// is written in the `ORDER BY` or names an output column defined by one:
+/// such a statement runs as written with no cursor, so no other term's
+/// refusal applies to it.
+fn statement_order_terms(
+    query: &Query,
+    names: &OutputResolution,
+) -> Result<Vec<OrderTerm>, PagePlanError> {
     let Some(OrderBy {
         kind,
         // `INTERPOLATE` is defined only in terms of a `WITH FILL`, which is
@@ -2058,6 +2155,26 @@ fn statement_order_terms(query: &Query) -> Result<Vec<OrderTerm>, PagePlanError>
         OrderByKind::All(_) => return Err(PagePlanError::OrderByAll),
         OrderByKind::Expressions(exprs) => exprs,
     };
+    for OrderByExpr {
+        expr,
+        // Read per term by the loop below.
+        options: _,
+        with_fill: _,
+    } in exprs
+    {
+        let from_other_rows = match column_of(expr) {
+            Some(column) => matches!(
+                names.resolve(&column),
+                Provenance::Expression(defining) if depends_on_other_rows(defining)
+            ),
+            None => depends_on_other_rows(expr),
+        };
+        if from_other_rows {
+            return Err(PagePlanError::OrderTermFromOtherRows {
+                term: expr.to_string(),
+            });
+        }
+    }
     let mut terms = Vec::with_capacity(exprs.len());
     for OrderByExpr {
         expr,
@@ -4590,7 +4707,7 @@ mod tests {
             )
             .expect("parsed");
             let names = OutputResolution::of(&query, PageTarget::Samples);
-            let terms = statement_order_terms(&query).expect("terms");
+            let terms = statement_order_terms(&query, &names).expect("terms");
             tiebreak(&query, PageTarget::Samples, &names, &terms)
         };
         assert_eq!(
