@@ -167,12 +167,16 @@ server offers over MCP, `ravel_agent_send`, belongs to the
 - `ravel_search_logs`: a typed log search compiled to one SQL `SELECT`
   over `logs`. It takes predicates on typed attribute columns and the `trace_id`
   key (`eq`, `ne`, `in`, `exists`), a `has_word` body search, a minimum
-  severity, and a trace id, and requires `time_range`. A predicate key that
-  is not a typed attribute column or an indexed key is refused before the search
-  runs; `ravel_describe_data` with signal `logs` lists the ones it accepts.
+  severity, and a trace id, and requires `time_range`. A predicate key must
+  be a typed attribute column of the tenant's `logs` table, or `trace_id`
+  when it is an indexed key. Any other key is refused before the search
+  runs, including an indexed key that is not a typed attribute column, with
+  a next step naming `ravel_describe_data`. Call it with signal `logs`: a
+  key the search accepts is a `column` row marked `declared: true`, or
+  `trace_id` when it has an `indexed_key` row.
   Results order by `(ts, observed_ts)`. Rows with the same attribute key set
   form a group, and the attributes every row of the group shares are listed
-  once, in the group's first row's `group_attrs`. The
+  once, in the group's first row's `__ravel_group_attrs`. The
   [reference](../reference/mcp.md#searching-logs) gives the exact shape.
 
 ### Trace and time series

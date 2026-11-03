@@ -1435,13 +1435,17 @@ the choices D2's row leaves open.
    pin as on `ravel_query_sql`. The cursor binds the compiled statement (so
    every filter), `time_range` and the effective `max_rows`.
 5. Output. D2's "groups rows by attribute set" is read as the attribute key
-   set: rows stay in page order, a column `group` numbers each row's key
-   set in order of first appearance on the page, a column `group_attrs`
-   on the group's first row lists the attributes (key and value) every row
-   of the group on the page carries, and each row's `attrs` keeps the rest.
-   Grouping by the whole attribute map would make every attribute shared
-   by definition and split rows that differ in one value into separate
-   groups. Groups are computed per page.
+   set: rows stay in page order, a column `__ravel_group` numbers each
+   row's key set in order of first appearance on the page, a column
+   `__ravel_group_attrs` on the group's first row lists the attributes (key
+   and value) every row of the group on the page carries, and each row's
+   `attrs` keeps the rest. Grouping by the whole attribute map would make
+   every attribute shared by definition and split rows that differ in one
+   value into separate groups. Groups are computed per page. The two
+   columns take the `__ravel_` prefix of the `logs` schema's synthetic
+   names because a declared attribute column may be named `group` or
+   `group_attrs` and `SELECT *` returns it; the tenant config's declaration
+   check does not yet refuse a declared key starting `__ravel_`.
 6. `evidence_ref` stays in the input schema and is refused as
    `unsupported`, so no `evidence` block is emitted, as on the other query
    tools.
