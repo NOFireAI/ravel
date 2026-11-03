@@ -2459,6 +2459,90 @@ class Box(Workdir):
         self.assertEqual(self.steps(text)[-2:], ["evaluate", "finish"])
         self.assertNotIn("RQ_STATS=1", text)
 
+    def deadline_lines(self, text):
+        # The seconds left move with the clock; everything else is pinned.
+        return [re.sub(r", \d+ s left of", ", N s left of", x) for x in text.splitlines()
+                if x.startswith("NOT-RUN ")]
+
+    def test_s3_dry_run_skips_steps_the_deadline_cannot_hold(self):
+        # Item 6: with 20 minutes of deadline, every state whose next long
+        # step is bounded past what is left is NOT-RUN before that step starts:
+        # the 30-minute default estimate for loads, folds, leaf rebuilds and
+        # compaction, the 70-minute wait for the mixed state's hour. States
+        # with no long step run, and evaluate and finish still follow.
+        code, text = run_sh("s3", self.example_toml(("max_minutes = 540", "max_minutes = 20")), self.path("out"))
+        self.assertEqual(code, 0, text)
+        left = "N s left of run.max_minutes 20"
+        self.assertEqual(self.deadline_lines(text), [
+            f"NOT-RUN folded_no_leaves: deadline: fold needs up to 1800 s, {left}",
+            f"NOT-RUN folded_leaves: deadline: fold needs up to 1800 s, {left}",
+            f"NOT-RUN mixed: deadline: the wait for the next ingest hour needs up to 4200 s, {left}",
+            f"NOT-RUN compaction_in_flight: deadline: compaction needs up to 1800 s, {left}",
+            f"NOT-RUN many_parts_744: deadline: load needs up to 1800 s, {left}",
+            f"NOT-RUN many_parts_2160: deadline: load needs up to 1800 s, {left}",
+        ])
+        b = self.blocks(text)
+        self.assertNotIn("catalog fold", "\n".join(b["state:folded_no_leaves"] + b["state:folded_leaves"]))
+        self.assertNotIn("wait until the ingest hour", text)
+        self.assertNotIn("maintain compact-tenant", text)
+        self.assertIn("needle-blocks", "\n".join(b["state:unfolded"]))
+        self.assertIn("erase submit", "\n".join(b["state:erasure_in_flight"]))
+        self.assertEqual(self.steps(text)[-2:], ["evaluate", "finish"])
+
+    def test_s3_dry_run_per_state_estimate(self):
+        # Item 6: a per-state estimate in run.toml replaces the default for
+        # that state alone; the 310 s sealed-hour wait is bounded on its own.
+        code, text = run_sh("s3", self.example_toml(
+            ("max_minutes = 540", "max_minutes = 20"),
+            ("[step_estimate_minutes]\ndefault = 30\n",
+             "[step_estimate_minutes]\ndefault = 30\nfolded_no_leaves = 5\ncompaction_in_flight = 15\n")),
+            self.path("out"))
+        self.assertEqual(code, 0, text)
+        lines = self.deadline_lines(text)
+        self.assertNotIn("folded_no_leaves", "\n".join(lines))
+        self.assertNotIn("compaction_in_flight", "\n".join(lines))
+        self.assertIn("NOT-RUN folded_leaves: deadline: fold needs up to 1800 s, N s left of run.max_minutes 20",
+                      lines)
+        self.assertIn("catalog fold", "\n".join(self.blocks(text)["state:folded_no_leaves"]))
+        self.assertIn("maintain compact-tenant", text)
+        code, text = run_sh("s3", self.example_toml(
+            ("max_minutes = 540", "max_minutes = 5"), ("states = [\"unfolded\"", "states = [\"compaction_in_flight\""),
+            ("[step_estimate_minutes]\ndefault = 30\n", "[step_estimate_minutes]\ndefault = 0\n")),
+            self.path("out"))
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.deadline_lines(text)[0], "NOT-RUN compaction_in_flight: deadline: wait_sealed needs "
+                                                       "up to 310 s, N s left of run.max_minutes 5")
+        code, text = run_sh("s3", self.example_toml(
+            ("[step_estimate_minutes]\ndefault = 30\n", "[step_estimate_minutes]\ndefault = \"half\"\n")),
+            self.path("out"))
+        self.assertEqual(code, 1, text)
+        self.assertIn("run.toml step_estimate_minutes.unfolded", text)
+
+    def test_deadline_check_flip_fails_its_case(self):
+        # Item 6: a run.sh whose step check never refuses starts the fold
+        # the deadline cannot hold.
+        with open(os.path.join(BOX, "run.sh")) as f:
+            src = f.read()
+        old = '  [ "$left" -lt "$3" ] || return 0\n'
+        self.assertEqual(src.count(old), 1)
+        inv = self.path("inv")
+        os.mkdir(inv)
+        for name in os.listdir(HERE):
+            if name != "box":
+                os.symlink(os.path.join(HERE, name), os.path.join(inv, name))
+        shutil.copytree(BOX, os.path.join(inv, "box"))
+        with open(os.path.join(inv, "box", "run.sh"), "w") as f:
+            f.write(src.replace(old, "  return 0\n"))
+        toml = self.example_toml(("max_minutes = 540", "max_minutes = 20"))
+        p = subprocess.run([BASH, os.path.join(inv, "box", "run.sh"), "--dry-run", "--lane", "s3", "--run-toml",
+                            toml, "--out", self.path("out")], capture_output=True, text=True)
+        lines = self.deadline_lines(p.stdout + p.stderr)
+        self.assertNotIn("NOT-RUN folded_no_leaves: deadline: fold needs up to 1800 s, N s left of "
+                         "run.max_minutes 20", lines)
+        line = src[: src.index(old)].count("\n") + 1
+        print(f"flip 'a step the deadline cannot hold started' at box/run.sh:{line} fails "
+              f"test_s3_dry_run_skips_steps_the_deadline_cannot_hold: NOT-RUN lines {lines}", file=sys.stderr)
+
     def test_local_dry_run(self):
         code, text = run_sh("local", os.path.join(BOX, "run.local-smoke.toml"), self.path("out"))
         self.assertEqual(code, 0, text)

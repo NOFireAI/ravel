@@ -101,6 +101,15 @@ rows_expected = 99997497
 traces_per_hour = 10
 snapshot_part_max_entries = 1
 
+# Before each load, fold, leaf rebuild and compaction run.sh checks that the
+# run deadline (run.max_minutes) leaves this many minutes for it, and records
+# the state not-run otherwise, so evaluate and the upload always happen. The
+# waits are bounded by their own maxima instead (mixed_wait_max_minutes; 310 s
+# for compaction_in_flight's wait for the sealed hour). A state not named
+# here takes default; default absent is 30.
+[step_estimate_minutes]
+default = 30
+
 # Every price evaluate.py multiplies by, with the source it was read from.
 # A price without a source is reported missing.
 [prices]
@@ -118,4 +127,5 @@ instance_per_hour_source = "AWS EC2 on-demand pricing, us-east-1, Linux: c6a.4xl
 # measurement: evaluate.py prints it beside every break-even figure.
 lookups_per_part_month = 1000
 lookups_per_part_month_source = "assumption: 1,000 selective lookups per snapshot part per month, ADR-3692 gives no frequency"
+# Required: the months a leaf build is amortised over (no default).
 amortise_months = 1

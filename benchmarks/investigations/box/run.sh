@@ -290,6 +290,7 @@ load_config() {
   HITS="$(cfg run.hits --default false)"
   MIXED_WAIT="$(cfg run.mixed_wait_max_minutes --default 70)"
   RUN_MAX_MINUTES="$(cfg run.max_minutes --default 540)"
+  STEP_ESTIMATE_DEFAULT="$(cfg step_estimate_minutes.default --default 30)"
   NEEDLE_MAX="$(cfg run.needle_blocks_max_objects --default 0)"
   SPLIT_BASE="$(cfg run.split_base_load --default false)"
   MP_TPH="$(cfg many_parts.traces_per_hour --default 10)"
@@ -347,6 +348,7 @@ load_config() {
       unfolded | folded_no_leaves | folded_leaves | mixed | compaction_in_flight | erasure_in_flight) ;;
       *) fail "run.toml run.states: unknown state $s" ;;
     esac
+    estimate_s "$s" >/dev/null || fail "run.toml step_estimate_minutes.$s"
   done
   SERVER_FLAGS="--mode query --store s3 --shards $SHARDS --tenant-hash-unkeyed --audit-mode off ${SERVER_EXTRA[*]+${SERVER_EXTRA[*]}}"
   RUN_START="$(date +%s)"
@@ -385,7 +387,7 @@ step_bootstrap() {
   else
     local sha dirty
     sha="$(git -C "$INV_DIR" rev-parse HEAD 2>/dev/null)" || sha=unknown
-    dirty="$(git -C "$INV_DIR" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    dirty="$(git -C "$INV_DIR" status --porcelain -- . 2>/dev/null | wc -l | tr -d ' ')"
     stamp build.json lane=local sha="$sha" dirty_paths:="${dirty:-0}" \
       build="prebuilt binaries from --bin-dir; README.md \"Local lane\" gives the build" \
       ravel_cli_sha256="$(sha256 "$BIN")" ravel_server_sha256="$(sha256 "$SERVER_BIN")"
@@ -723,6 +725,26 @@ not_run() {
   stamp not_run.jsonl state="$1" reason="$2" at="$(utc_now)"
 }
 
+# estimate_s STATE: the seconds one load, fold, leaf rebuild or compaction of
+# STATE is taken to need at most, from run.toml [step_estimate_minutes]
+# (STATE, else default, else 30 minutes). load_config checks every state's.
+estimate_s() {
+  local m
+  m="$(cfg "step_estimate_minutes.$1" --default "$STEP_ESTIMATE_DEFAULT")" || return 1
+  [[ "$m" =~ ^[0-9]+$ ]] || { printf 'run.toml step_estimate_minutes.%s = %s: not whole minutes\n' "$1" "$m" >&2; return 1; }
+  printf '%s\n' "$((m * 60))"
+}
+
+# fits STATE STEP BOUND_S: true when the run deadline leaves BOUND_S seconds
+# for STEP; otherwise STATE is recorded not-run, so evaluate and the upload
+# still run before the instance's own cap.
+fits() {
+  local left=$((RUN_START + RUN_MAX_MINUTES * 60 - $(date +%s)))
+  [ "$left" -lt "$3" ] || return 0
+  not_run "$1" "deadline: $2 needs up to $3 s, $left s left of run.max_minutes $RUN_MAX_MINUTES"
+  return 1
+}
+
 # needle_blocks: the logs needles' block counts as rlog inspect reads them,
 # beside the generator's own count in truth.json (README "Needles").
 needle_blocks() {
@@ -753,18 +775,21 @@ compact_child() {
 # wait_sealed: compact-tenant seals an hour at its end plus
 # --max-flush-lifetime (0s) plus the compactor's 300 s clock-skew allowance,
 # so every hour before the current one is compactable 310 s into it.
+WAIT_SEALED_MAX_S=310
 wait_sealed() {
   if [ "$DRY_RUN" = 1 ]; then
     printf 'DRY-RUN: wait until 310 s past the current hour start, so every earlier hour is sealed\n'
     return 0
   fi
-  while [ "$(( $(date +%s) % 3600 ))" -lt 310 ]; do
+  while [ "$(( $(date +%s) % 3600 ))" -lt "$WAIT_SEALED_MAX_S" ]; do
     sleep 10
   done
 }
 
 state_compaction() {
   local code=0 sig
+  fits compaction_in_flight wait_sealed "$WAIT_SEALED_MAX_S" || return 0
+  fits compaction_in_flight compaction "$(estimate_s compaction_in_flight)" || return 0
   stop_server
   wait_sealed
   # One restart before the in-flight calls; they run against this server.
@@ -830,12 +855,17 @@ state_erasure() {
 # hour, folded into parts of at most MP_MAX_ENTRIES entries.
 state_many_parts() {
   local n="$1" t="mp$1" dir="$WORK/corpus-mp$1" saved="$TRIPLES" start
+  local est
+  est="$(estimate_s "many_parts_$n")"
   start="$("$HOST_PY" -c 'import sys; print(int(sys.argv[1]) - int(sys.argv[2]) - 3)' "$CORPUS_H0" "$n")"
+  fits "many_parts_$n" load "$est" || return 0
   stop_server
   load_signal "many_parts_$n" spans "$dir" "$t" --ingest-hour-stride 1 --ingest-hour-start "$start" \
     --batch-rows "$(batch_rows "$(corpus_rows "$dir" spans)" "$n")" --target-bytes 1
   TRIPLES="$t:spans:spans"
+  fits "many_parts_$n" fold "$est" || { TRIPLES="$saved"; return 0; }
   fold "many_parts_$n" --snapshot-part-max-entries "$MP_MAX_ENTRIES"
+  fits "many_parts_$n" "leaf rebuild" "$est" || { TRIPLES="$saved"; return 0; }
   rebuild_leaves "many_parts_${n}_leaf_rebuild"
   transition "many_parts_$n" "tenant $t: $n strided ingest hours from $start, parts of at most $MP_MAX_ENTRIES entries"
   census "many_parts_$n"
@@ -853,24 +883,30 @@ run_state() {
       needle_blocks
       statements unfolded ;;
     folded_no_leaves)
+      fits folded_no_leaves fold "$(estimate_s folded_no_leaves)" || return 0
       fold folded_no_leaves
       transition folded_no_leaves "catalog fold --writers-stopped, no leaves"
       census folded_no_leaves
       statements folded_no_leaves ;;
     folded_leaves)
+      fits folded_leaves fold "$(estimate_s folded_leaves)" || return 0
       fold folded_leaves --key-index-leaves
+      fits folded_leaves "leaf rebuild" "$(estimate_s folded_leaves)" || return 0
       rebuild_leaves leaf_rebuild
       transition folded_leaves "catalog fold --writers-stopped --key-index-leaves, then catalog fold --rebuild-key-index"
       census folded_leaves
       statements folded_leaves ;;
     mixed)
+      fits mixed "the wait for the next ingest hour" "$((MIXED_WAIT * 60))" || return 0
       wait_next_hour
+      fits mixed load "$(estimate_s mixed)" || return 0
       stop_server
       load_signal tail spans "$WORK/corpus-tail" "$TENANT"
       load_signal tail logs "$WORK/corpus-tail" "$TENANT"
       transition mixed "folded hours plus one unfolded tail hour"
       census mixed
       statements mixed
+      fits fold_advance fold "$(estimate_s mixed)" || return 0
       fold fold_advance --key-index-leaves
       transition fold_advance "the fold that seals the mixed state's tail hour"
       census fold_advance ;;
