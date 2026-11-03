@@ -252,13 +252,13 @@ mod tests {
     }
 
     /// A backend whose `sql_explain`, `sql_execute`, `labels`, `label_values`,
-    /// `describe_data`, `promql_instant`, `promql_range` and `analytics`
-    /// answer what the test configured and record the request they were
-    /// handed. Every other method, and any of those left unconfigured,
-    /// panics: a test built on it proves the body never reached that call.
-    /// `describe`, `sql`, `promql` and `analytics` are queues, one answer per
-    /// call, so a paging test configures each page's answer in order; the two
-    /// PromQL methods share `promql`.
+    /// `describe_data`, `promql_instant`, `promql_range`, `analytics` and
+    /// `trace_lookup` answer what the test configured and record the request
+    /// they were handed. Every other method, and any of those left
+    /// unconfigured, panics: a test built on it proves the body never reached
+    /// that call. `describe`, `sql`, `promql`, `analytics` and `trace` are
+    /// queues, one answer per call, so a paging test configures each page's
+    /// answer in order; the two PromQL methods share `promql`.
     #[derive(Default)]
     pub(crate) struct Stub {
         pub(crate) promql:
@@ -277,6 +277,8 @@ mod tests {
         pub(crate) described: std::cell::RefCell<Vec<crate::service::DescribeRequest>>,
         pub(crate) sql: std::cell::RefCell<std::collections::VecDeque<crate::draft::Draft>>,
         pub(crate) executed: std::cell::RefCell<Vec<SqlCall>>,
+        pub(crate) trace: std::cell::RefCell<std::collections::VecDeque<Result<Envelope, Failure>>>,
+        pub(crate) traced: std::cell::RefCell<Vec<crate::service::TraceLookupRequest>>,
     }
 
     impl Stub {
@@ -387,9 +389,13 @@ mod tests {
         async fn trace_lookup(
             &self,
             _tenant_hash: TenantHash,
-            _request: &crate::service::TraceLookupRequest,
+            request: &crate::service::TraceLookupRequest,
         ) -> Result<Envelope, Failure> {
-            panic!("trace_lookup must not be reached")
+            let Some(answer) = self.trace.borrow_mut().pop_front() else {
+                panic!("trace_lookup must not be reached");
+            };
+            self.traced.borrow_mut().push(*request);
+            answer
         }
 
         async fn sql_explain(

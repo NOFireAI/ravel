@@ -171,7 +171,7 @@ amendment below.
 | `ravel_query_sql` | One `SELECT` over one table, with a required `time_range` applied as a row filter, `max_rows`, budgets that can only be lowered, and a keyset cursor | D3 |
 | `ravel_query_promql` | Instant or range evaluation, partial-coverage consent, step alignment, the two log pseudo-metrics | `QueryEngine` through the service layer |
 | `ravel_search_logs` | Typed log search compiled to SQL. Uses indexed and declared predicates, `has_word`, severity, and trace id. Orders by `ts`. Groups rows by attribute set and hoists shared attributes once | D3 |
-| `ravel_get_trace` | Spans of one trace id inside a required window, the span tree, the missing parents, and the orphans. An optional logs leg, reported as an unindexed scan with its own cost | `spans_pushdown` fast path |
+| `ravel_get_trace` | Spans of one trace id inside a required window, the span tree, the missing parents, and the orphans. An optional logs leg, reported as an unindexed scan with its own cost (the span-tree amendment below records the tree's columns and defers the logs leg) | `spans_pushdown` fast path |
 | `ravel_analyze_timeseries` | `change_point` or `summary` over a PromQL range result. The output says "heuristic", the minimum point count, and if it was downsampled | `analytics.rs::run` through the service layer, which adds admission |
 
 Phase 2 tools: `ravel_compare_windows` and `ravel_correlate_signals`
@@ -399,7 +399,8 @@ cursor and a `next_steps` entry that says to narrow `time_range`. The same
 rule applies to `ravel_query_sql` when its appended tiebreak is not unique.
 `ravel_get_trace` orders by `(start_ts, span_id)`. A test paginates a
 fixture with equal tuples across a page boundary and asserts that every row
-appears exactly once.
+appears exactly once (superseded by the span-tree amendment below: the tool
+mints no cursor, so there is no page boundary).
 
 An evidence reference is a token of the same family. It adds the sha256 of
 the canonical row bytes. Redemption re-executes against the pin while the pin
@@ -1044,9 +1045,11 @@ the query-sql amendment below it was 15,733 bytes with the nine tools and
 23,622 bytes with all fifteen. Since the query-promql amendment below it
 was 15,972 bytes with the nine tools and 23,861 bytes with all fifteen.
 Since the analyze-timeseries amendment below it was 16,297 bytes with the
-nine tools and 24,186 bytes with all fifteen, and since the search-logs
-amendment below it is 16,058 bytes with the nine tools and 23,947 bytes
-with all fifteen, against the 24,576-byte budget; both
+nine tools and 24,186 bytes with all fifteen. Since the search-logs
+amendment below it was 16,058 bytes with the nine tools and 23,947 bytes
+with all fifteen, and since the span-tree amendment below it is 16,177
+bytes with the nine tools and 24,066 bytes with all fifteen, against the
+24,576-byte budget; both
 figures are pinned in
 `crates/ravel-mcp/src/catalog.rs` and
 `services/ravel-server/tests/mcp_agents_e2e.rs`.
@@ -1456,3 +1459,64 @@ the choices D2's row leaves open.
    take a time range. Together they move `tools/list` from 16,297 to
    16,058 bytes with the nine tools and from 24,186 to 23,947 bytes with
    all fifteen, under the 24,576-byte budget.
+
+## Amendment (2026-11-03, #1382): the span-tree amendment, `ravel_get_trace` reports each span's depth and parent
+
+<!-- amendment-applies: sections="D2. Nine tools, three resources, two prompts|D5. Consistency, cursors, and evidence references|Amendment (2026-11-02): a Parquet explain names its unbounded figures and does not refuse" pointer="span-tree amendment" -->
+<!-- amendment-supersedes: phrase="A test paginates a fixture with equal tuples across a page boundary" pointer="span-tree amendment" -->
+
+D2's row gives `ravel_get_trace` the span tree, the missing parents and the
+orphans, plus a logs leg. This span-tree amendment records how the tree is
+reported, why the tool mints no cursor, and that the logs leg is deferred.
+
+A. Where the tree is computed. The tool body
+   (`crates/ravel-mcp/src/tools/get_trace.rs`) computes it over the rows the
+   lookup returns. The lookup is unchanged: the same statement and window
+   rule as `GET /api/traces/{trace_id}`, ordered by `(start_ts, span_id)`,
+   and the rows keep that order. The server's `trace_lookup` now stops
+   before the D6 caps and returns every row the executor produced, with the
+   executor's own row cap in `presentation.row_cap_hit`, so the tool can
+   apply the caps first and label the rows that survive them.
+B. Output. Two columns come first in every row. `__ravel_parent` is `root`
+   when the span's `parent_span_id` is null, `present` when a returned span
+   has that id, `cycle` when following parents from the span leads back to
+   it, and otherwise `missing` when the result is complete and
+   `not_returned` when it is not. Complete means no row cap and no byte cap
+   fired, no row was omitted, and coverage is complete, so an absent parent
+   in a capped result is never called `missing`. `__ravel_depth` counts the
+   span's returned ancestors: 0 for a root and for a span whose parent is
+   absent, null for a span on a cycle and for one whose ancestors lead into
+   one. When two rows share a span id, the first in row order is the parent
+   its children resolve to. The walk is iterative and marks the path it is
+   on, so a cycle ends it, and a child that starts before its parent (clock
+   skew) still resolves. Order of work: the tool truncates to `max_rows`,
+   adds both columns holding the widest value each can take (the depth as
+   the larger of the row count and 10, which is at least as wide as any
+   real depth and as `null`, and the label `not_returned`, the longest),
+   reserves both next steps, runs the byte fit, then writes the real values
+   and drops the steps that do not apply. Each of those writes keeps or
+   shortens what the fit measured, so the tree adds no byte after the fit.
+   The `__ravel_` prefix follows the `logs` schema's
+   synthetic names, as on `ravel_search_logs`; it is a convention, not a
+   guarantee, since nothing yet refuses a declared attribute starting
+   `__ravel_` (issue #3730).
+C. No cursor. A trace over `max_rows` (default 200, ceiling 5,000) is
+   `ok_bounded` with `row_cap_hit` set and no cursor. A trace is one
+   bounded object an agent reads whole, and a tree labelled per page would
+   call a parent on a later page `not_returned`. D5's ordering sentence
+   stays in force; its paginated equal-tuple test has nothing to test and
+   is superseded.
+D. Next steps. A `missing` parent under a `time_range` adds
+   `widen_time_range`, since the parent may start outside the window. A
+   `not_returned` parent adds `raise_max_rows` (up to 5,000, or narrow
+   `time_range`). Any other result carries neither, including a `missing`
+   parent with no `time_range`, where widening has nothing to widen.
+E. The logs leg is deferred and still owed under #1382; D2's row keeps it.
+   Its acceptance test is `logs_leg_reports_unindexed_scan_cost`: the leg
+   reports its scan as unindexed, with its own cost. Until it ships,
+   `include_logs: true` is refused as `unsupported`, and the message names
+   `ravel_search_logs` with a `trace_id` predicate and a `time_range` as
+   the call that serves a trace's logs today.
+F. The new description and the `include_logs` input doc move `tools/list`
+   from 16,058 to 16,177 bytes with the nine tools and from 23,947 to
+   24,066 bytes with all fifteen, under the 24,576-byte budget.

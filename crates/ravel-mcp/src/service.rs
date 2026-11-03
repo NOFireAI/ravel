@@ -233,6 +233,9 @@ pub trait QueryBackend {
     /// Mirrors `QueryService::trace_request` followed by
     /// `QueryService::sql_execute`: the statement and window rule of
     /// `GET /api/traces/{trace_id}`, run through the same SQL execution path.
+    /// It stops before the D6 caps: the envelope carries every row the
+    /// executor returned, with its own row cap reported in
+    /// `presentation.row_cap_hit`, and `ravel_get_trace` caps and fits it.
     async fn trace_lookup(
         &self,
         tenant_hash: TenantHash,
