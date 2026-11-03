@@ -22,7 +22,7 @@
 #![cfg(feature = "sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -254,11 +254,11 @@ async fn publish_small_rlog(
     key
 }
 
-/// Three small RLOG objects in the `Signal::Audit` keyspace.
-async fn audit_router() -> Router {
+/// Three small RLOG objects in `signal`'s keyspace.
+async fn rlog_signal_router(signal: Signal) -> Router {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     for seq in 0..3 {
-        publish_small_rlog(store.as_ref(), Signal::Audit, seq, 400).await;
+        publish_small_rlog(store.as_ref(), signal, seq, 400).await;
     }
     let catalog = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
     let executor = SqlExecutor::new(
@@ -280,7 +280,7 @@ async fn audit_router() -> Router {
 /// (`crates/ravel-query/src/log_fetcher.rs`) reads `scan` 0.
 #[tokio::test]
 async fn audit_table_statement_opens_every_object_under_scan() {
-    let app = audit_router().await;
+    let app = rlog_signal_router(Signal::Audit).await;
     let v = post_sql(
         &app,
         "SELECT body FROM audit ORDER BY body",
@@ -292,6 +292,30 @@ async fn audit_table_statement_opens_every_object_under_scan() {
         .flat_map(|seq| (0..4).map(move |i| format!("seq{seq}rec{i}")))
         .collect();
     assert_eq!(value_rows(&v), want_rows, "{v}");
+    assert_eq!(segments_opened(&v), want(0, 0, 0, 3, 0), "{v}");
+}
+
+/// The `alerts` table reads each object through the same
+/// `fetch_accounted_with_tenant` as `audit`, so it records one open per
+/// object under `scan` too. The fixture's records carry no alert fields;
+/// `writer_id`, stamped from the object each row came from, tells the three
+/// objects apart.
+///
+/// FLIP: dropping the `add_segments_opened` in `fetch_accounted_with_tenant`
+/// reads `scan` 0.
+#[tokio::test]
+async fn alerts_table_statement_opens_every_object_under_scan() {
+    let app = rlog_signal_router(Signal::Alerts).await;
+    let v = post_sql(
+        &app,
+        "SELECT writer_id FROM alerts ORDER BY writer_id",
+        0.0,
+        NOW_NS as f64 / 1e9,
+    )
+    .await;
+    let rows = value_rows(&v);
+    assert_eq!(rows.len(), 12, "{v}");
+    assert_eq!(rows.iter().collect::<BTreeSet<_>>().len(), 3, "{v}");
     assert_eq!(segments_opened(&v), want(0, 0, 0, 3, 0), "{v}");
 }
 

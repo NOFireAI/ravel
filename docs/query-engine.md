@@ -3443,12 +3443,45 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `cacheMisses`, `cacheServedBytes`, `lateServedBytes`,
   `decompressedOutputBytes`, `reusedRegionBytes`, `segmentsOpened`,
   `seriesMatched`. `segmentsOpened` here is the same per-object open count as
-  `stats.accounting.segmentsOpened`, attributed to whichever phase opened
-  each object's footer; it is the per-object denominator beside
-  `data_objects_touched` (an object whose footer opened but whose blocks
-  were never read counts here but not there), and an object opened under one
-  phase is not re-counted if a later phase in the same query reuses its
-  already-open footer.
+  `stats.accounting.segmentsOpened`, split by one rule: an object counts
+  once, under the phase its footer read is charged to, and a later phase
+  that reuses the open footer does not count it again. The counting paths,
+  with the split each reports in the fixtures of
+  `services/ravel-server/tests/stats_segments_opened.rs` unless named
+  otherwise:
+
+  - SQL `logs`: `plan` for a segment the plan pass read (planned, or probed
+    for its KEY_IDX), `scan` for one the scan opens on the fast path or
+    unplanned. An equality over three small objects reads `scan` 3
+    (`small_object_equality_opens_every_object_under_scan`); a KEY_IDX
+    equality over three large objects reads `plan` 3
+    (`key_indexed_equality_opens_every_object_under_plan_not_scan`); three
+    objects probed for their KEY_IDX and then scanned whole read `plan` 3
+    and `scan` 0 (`probe_only_keyed_scan_opens_every_object_once_under_plan`).
+    A segment the TopK threshold skips before its open counts in no phase
+    (`crates/ravel-sql/tests/topk_threshold_skip_order.rs`).
+  - SQL `audit` and `alerts`: `scan`, through the fetcher's
+    `fetch_accounted_with_tenant`; three objects read `scan` 3 on either
+    table (`audit_table_statement_opens_every_object_under_scan`,
+    `alerts_table_statement_opens_every_object_under_scan`).
+  - PromQL over logs: `plan`, where `fetch_stream_dir` decodes the footer
+    to read STREAM_DIR, an object that STREAM_DIR then prunes included; the
+    scan of a surviving object reuses that open. Two objects, one pruned,
+    read `plan` 2 and `scan` 0
+    (`crates/ravel-query/tests/log_series_engine.rs`,
+    `log_selector_on_api_v1_query_counts_each_footer_once_under_plan`).
+  - spans: `probe` for a `trace_id` lookup, whose tail probe decodes the
+    footer, and `scan` for a whole-object read without one. A trace lookup
+    over three objects reads `probe` 3 through SQL and through
+    `GET /api/traces/{id}`
+    (`trace_lookup_by_sql_opens_every_object_under_probe_not_scan`,
+    `trace_lookup_by_get_api_traces_opens_every_object_under_probe_not_scan`),
+    and the warm second run reads `probe` 3 again with 0 GETs in every data
+    phase
+    (`adr_3692_row_4_warm_trace_lookup_opens_the_same_objects_with_zero_data_gets`).
+
+  A window outside every object reads 0 in every phase
+  (`a_window_outside_every_object_opens_nothing`).
 
   Additive to `stats.accounting`, which is unchanged: every per-phase
   counter sums back to its pooled counterpart there. Each byte field

@@ -298,7 +298,7 @@ pub struct LogSeriesRequest<'a> {
     pub max_samples: usize,
     pub max_series: usize,
     /// Checked once per fetched segment, after
-    /// [`LogSegmentFetcher::scan_accounted_with_tenant`] has already fetched
+    /// [`LogSegmentFetcher::scan_accounted_with_tenant_uncounted`] has already fetched
     /// and charged it (see the check at the end of the `for seg_ref in
     /// segments` loop in [`fetch_log_series`]). This bound is therefore a
     /// per-segment limit in practice, not an exact byte ceiling: a query can
@@ -839,7 +839,7 @@ pub async fn fetch_log_series(
         blocks_scanned += u64::from(scan_stats.blocks_scanned);
         blocks_total += u64::from(scan_stats.blocks_total);
 
-        // Checked only here, once per completed segment: `scan_accounted_with_tenant`
+        // Checked only here, once per completed segment: the scan open above
         // has already fetched and charged this segment's bytes above, and
         // `next_block` only decodes bytes already resident, so nothing inside
         // the block loop can react to the budget mid-segment. A query can
