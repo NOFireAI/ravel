@@ -1,13 +1,15 @@
 # The local lane's smoke run, whose outputs are committed under
 # fixtures/local-smoke/ (issue #3699): every state and statement of the s3
-# lane's flow against a loopback RustFS, at 1,000 traces and 2 cold runs, so
-# it finishes on one small machine. Its figures prove the flow, not the bands:
+# lane's flow against a loopback RustFS, at 20,000 traces and 2 cold runs, so
+# it finishes on one small machine while its 100,000 log rows still span more
+# than ten 8,192-row logs blocks. Its figures prove the flow, not the bands:
 # timing is judged on the s3 lane only. README.md "Local lane" gives the
 # command.
 
 [run]
 lane = "local"
-states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight", "many_parts_24"]
+states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight",
+          "erasure_in_flight", "many_parts_24"]
 cold_runs = 2
 warm_runs = 1
 hits = false
@@ -21,7 +23,7 @@ needle_blocks_max_objects = 0
 split_base_load = true
 
 [corpus]
-traces = 1000
+traces = 20000
 hours = 2
 seed = 7
 spans_per_trace = 10

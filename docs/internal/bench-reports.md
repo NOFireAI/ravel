@@ -87,12 +87,13 @@ report's `stamp`.
 Issue #3699 (ADR-3692 decision 8, T1). Not a `ravel-bench` report: a box
 flow that generates a seeded spans and logs corpus, loads it with `ravel-cli
 load`, folds it through the key-index state matrix (unfolded, folded
-without leaves, folded with leaves, mixed; many-parts is unsupported on this
-build), and runs the statements of `statements.toml` against a restarted
-`ravel-server` cold and warm. `evaluate.py` judges every answer against the
-generator's oracle and every figure against
-`benchmarks/investigations/bands.toml` (ADR-3692 Acceptance rows 1 to 17);
-timing is judged on the real-S3 lane only. `benchmarks/investigations/README.md`
+without leaves, folded with leaves, mixed, compaction in flight, erasure in
+flight, and many parts over N ingest hours), and runs the statements of
+`statements.toml` against a restarted `ravel-server` cold and warm.
+`evaluate.py` judges every answer against the generator's oracle and every
+figure against `benchmarks/investigations/bands.toml` (ADR-3692 Acceptance
+rows 1 to 17), and prints pass, fail or incomplete; timing is judged on the
+real-S3 lane only. `benchmarks/investigations/README.md`
 covers both lanes, and `benchmarks/investigations/investigations.test.sh`,
 run by CI's `doc-scripts` job, holds the harness's cases, including a
 committed local-lane run under `fixtures/local-smoke/` that it re-evaluates

@@ -129,7 +129,7 @@ stamp() {
   printf 'STAMP stamps/%s\n' "$file"
   [ "$DRY_RUN" = 1 ] && return 0
   case "$file" in *.jsonl) append=(--append) ;; esac
-  "$PY" "$LIB" stamp --file "$STAMPS/$file" "${append[@]}" "$@" || fail "stamp $file"
+  "$PY" "$LIB" stamp --file "$STAMPS/$file" ${append[@]+"${append[@]}"} "$@" || fail "stamp $file"
 }
 
 cfg() { "$HOST_PY" "$LIB" get "$RUN_TOML_IN" "$@"; }
@@ -224,7 +224,7 @@ start_server() {
   "$SERVER_BIN" --mode query --store s3 --shards "$SHARDS" --tenant-hash-unkeyed \
     --tenant-token-file "$TOKEN_FILE" --listen-http "127.0.0.1:$HTTP_PORT" \
     --listen-health "127.0.0.1:$HEALTH_PORT" --listen-grpc "127.0.0.1:$GRPC_PORT" \
-    --audit-mode off "${SERVER_EXTRA[@]}" </dev/null >"$SERVER_LOG" 2>&1 &
+    --audit-mode off ${SERVER_EXTRA[@]+"${SERVER_EXTRA[@]}"} </dev/null >"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
   local i
   for ((i = 1; i <= 600; i++)); do
@@ -252,9 +252,11 @@ drop_page_cache() {
 # call, then the startup cache warmup's end, stamped with the call's key.
 restart_for() {
   local line="$1" statement state try warm
-  [[ "$line" =~ \"statement\":\ \"([^\"]+)\" ]] && statement="${BASH_REMATCH[1]}"
-  [[ "$line" =~ \"state\":\ \"([^\"]+)\" ]] && state="${BASH_REMATCH[1]}"
-  [[ "$line" =~ \"try\":\ ([0-9]+) ]] && try="${BASH_REMATCH[1]}"
+  # Regexes with groups live in variables: bash 3.2 cannot parse them inline.
+  local re_statement='"statement": "([^"]+)"' re_state='"state": "([^"]+)"' re_try='"try": ([0-9]+)'
+  [[ "$line" =~ $re_statement ]] && statement="${BASH_REMATCH[1]}"
+  [[ "$line" =~ $re_state ]] && state="${BASH_REMATCH[1]}"
+  [[ "$line" =~ $re_try ]] && try="${BASH_REMATCH[1]}"
   if [ "$DRY_RUN" = 1 ]; then
     printf 'DRY-RUN: restart the server for %s/%s, drop the page cache, wait for the warmup\n' "$statement" "$state"
     return 0
@@ -346,7 +348,7 @@ load_config() {
       *) fail "run.toml run.states: unknown state $s" ;;
     esac
   done
-  SERVER_FLAGS="--mode query --store s3 --shards $SHARDS --tenant-hash-unkeyed --audit-mode off ${SERVER_EXTRA[*]}"
+  SERVER_FLAGS="--mode query --store s3 --shards $SHARDS --tenant-hash-unkeyed --audit-mode off ${SERVER_EXTRA[*]+${SERVER_EXTRA[*]}}"
   RUN_START="$(date +%s)"
 }
 
@@ -411,17 +413,17 @@ write_secrets() {
 
 # stamp_tenants: every tenant's hash, for the per-tenant census.
 stamp_tenants() {
-  local t out fields=()
+  local t out fields=() re_hash='t/([0-9a-f]+)/'
   for t in $TENANTS; do
     if [ "$DRY_RUN" = 1 ]; then
       run "${CLI[@]}" tenancy resolve "$t"
       continue
     fi
     out="$("${CLI[@]}" tenancy resolve "$t" 2>&1)" || fail "tenancy resolve $t: $out"
-    [[ "$out" =~ t/([0-9a-f]+)/ ]] || fail "tenancy resolve $t printed no t/<hash>/: $out"
+    [[ "$out" =~ $re_hash ]] || fail "tenancy resolve $t printed no t/<hash>/: $out"
     fields+=("$t=${BASH_REMATCH[1]}")
   done
-  stamp tenants.json "${fields[@]}"
+  stamp tenants.json ${fields[@]+"${fields[@]}"}
 }
 
 step_store() {
@@ -509,7 +511,7 @@ step_corpus() {
     mp="$("$HOST_PY" -c 'import json, sys; d = json.loads(sys.argv[1]); d[sys.argv[2]] = {"traces": int(sys.argv[3]), "hours": int(sys.argv[2]), "seed": int(sys.argv[4]), "start_hour": int(sys.argv[5]), "ingest_hour_start": int(sys.argv[5]) + 1}; print(json.dumps(d))' \
       "$mp" "$n" $((n * MP_TPH)) $((SEED + n)) $((h0 - n - 4)))" || fail "many_parts corpus record"
   done
-  run "$PY" "$LIB" merge-truth --base "$WORK/corpus/truth.json" "${subs[@]}" --out "$OUT/truth.json" \
+  run "$PY" "$LIB" merge-truth --base "$WORK/corpus/truth.json" ${subs[@]+"${subs[@]}"} --out "$OUT/truth.json" \
     || fail "merge-truth"
   stamp corpus.json traces:="$TRACES" hours:="$HOURS" seed:="$SEED" start_hour:=$((h0 - HOURS)) \
     tail_traces:="$extra_traces" tail_seed:=$((SEED + 1)) tail_start_hour:="$h0" many_parts:="$mp" \
@@ -589,7 +591,7 @@ step_load_base() {
       # the inputs compaction_in_flight's compaction needs.
       flags=(--batch-rows "$(batch_rows "$(corpus_rows "$WORK/corpus" "$sig")" 2)" --target-bytes 1)
     fi
-    load_signal base "$sig" "$WORK/corpus" "$TENANT" "${flags[@]}"
+    load_signal base "$sig" "$WORK/corpus" "$TENANT" ${flags[@]+"${flags[@]}"}
   done
   [ "$HITS" != true ] || load_hits
 }
@@ -662,9 +664,10 @@ census() {
 }
 
 # statements STATE [PLAN_FLAG...]: every planned call of STATE. A cold call
-# follows a server restart; an inflight call (--temp inflight) does not.
+# follows a server restart; an inflight call (--temp inflight) does not. Past
+# the run deadline every remaining call is recorded not-run, unsent.
 statements() {
-  local state="$1" plan="$WORK/plan-$1.jsonl" line flags=()
+  local state="$1" plan="$WORK/plan-$1.jsonl" line flags=() deadline=$((RUN_START + RUN_MAX_MINUTES * 60))
   shift
   local args=(plan --statements "$STATEMENTS" --state "$state" --runs "$COLD_RUNS" --warm-runs "$WARM_RUNS"
     --truth "$OUT/truth.json" --out "$plan" "$@")
@@ -674,16 +677,18 @@ statements() {
   if [ "$DRY_RUN" = 1 ]; then
     printf 'DRY-RUN: per planned cold call: stop server, drop page cache, start server, wait for readyz and the cache warmup\n'
     stamp restarts.jsonl
-    printf 'DRY-RUN: per planned call: RQ_STATS=%s inv.py call --rq-stats into calls.jsonl\n' "$RQ_STATS"
+    printf 'DRY-RUN: per planned call: RQ_STATS=%s inv.py call --rq-stats --deadline-unix-s RUN_START+%s min into calls.jsonl\n' \
+      "$RQ_STATS" "$RUN_MAX_MINUTES"
     return 0
   fi
   while IFS= read -r line; do
     case "$line" in
       *'"unsupported_reason"'* | *'"not_run_reason"'*) ;;
-      *'"temp": "cold"'*) restart_for "$line" ;;
+      *'"temp": "cold"'*) [ "$(date +%s)" -ge "$deadline" ] || restart_for "$line" ;;
     esac
     "$PY" "$LIB" call --line "$line" --server "http://127.0.0.1:$HTTP_PORT" --auth-dir "$AUTH_DIR" \
-      --pid "${SERVER_PID:-0}" --calls "$CALLS" "${flags[@]}" || fail "call against an unreachable server"
+      --pid "${SERVER_PID:-0}" --calls "$CALLS" --deadline-unix-s "$deadline" ${flags[@]+"${flags[@]}"} \
+      || fail "call against an unreachable server"
   done <"$plan"
 }
 
@@ -794,7 +799,9 @@ state_erasure() {
   [ "$code" = 0 ] || fail "erase submit exit $code"
   run "${CLI[@]}" erase status --tenant "$TENANT" --signal logs >"$WORK/erase-status-after.out" 2>&1 \
     || fail "erase status after submit"
-  if [ "$DRY_RUN" = 0 ] && ! grep -qi pending "$WORK/erase-status-after.out"; then
+  # ravel-cli erase status prints "<request id>: PENDING" for a request with
+  # a .dreq and no .done (services/ravel-cli/src/erase.rs print_state).
+  if [ "$DRY_RUN" = 0 ] && ! grep -q ': PENDING$' "$WORK/erase-status-after.out"; then
     fail "erase status after submit shows no PENDING request"
   fi
   stamp erasure.jsonl victim_request_id="$rid" \
@@ -868,7 +875,11 @@ step_evaluate() {
   run "$PY" "$INV_DIR/evaluate.py" --run "$OUT" >"$WORK/evaluate.out" 2>&1 || code=$?
   case "$code" in
     0) VERDICT=pass ;;
-    1) VERDICT=fail ;;
+    1)
+      # fail or incomplete: the results file names which.
+      VERDICT=fail
+      [ "$DRY_RUN" = 1 ] || VERDICT="$("$HOST_PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["verdict"])' \
+        "$OUT/results.$LANE.json")" || fail "read the verdict from results.$LANE.json" ;;
     *) fail "evaluate.py exit $code" ;;
   esac
   [ "$DRY_RUN" = 1 ] || cat "$WORK/evaluate.out"

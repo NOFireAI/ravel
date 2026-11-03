@@ -45,9 +45,12 @@
 #   unsupported_reason  set when this build cannot run the statement as the
 #              ADR words it; run.sh still writes one calls.jsonl line per
 #              state with outcome unsupported-on-this-build and this reason.
-#              No statement sets it today: a refusal the server returns (the
-#              1,000-key IN lists against the SQL complexity cap) is recorded
-#              from the response itself.
+#              No statement sets it today.
+#   expect_refusal_on_main  true: the statement is sent, and a refusal the
+#              server returns (the 1,000- and 1,001-key IN lists against the
+#              SQL complexity cap) is recorded as unsupported-on-this-build
+#              with the response's status and text. A refusal of any other
+#              statement is the problem `refused`.
 
 [[statement]]
 id = "spans_lookup_norange"
@@ -144,10 +147,14 @@ truth_key = "in_trace_id.100.spans"
 states = ["unfolded", "folded_leaves"]
 cold_only = true
 
-# Sent as written. ravel-sql's complexity guard counts about two tokens per
-# list element (the literal and its comma) against MAX_STATEMENT_COMPLEXITY =
-# 1,000, so a list near 495 keys is the most this build accepts; the server's
-# 400 and its text are recorded as unsupported-on-this-build.
+# Sent as written. ravel-sql's complexity guard (complexity_guard.rs:640,
+# :674-684) counts one unit per token start: an X'..' literal is an X run
+# plus a quoted string, so an element with its comma costs 3, and a quoted
+# '..' element with its comma costs 2. Against MAX_STATEMENT_COMPLEXITY =
+# 1,000 (:257, checked at :380-381) and the 8 units of the rest of the
+# statement, an X list holds at most 330 keys (3n + 8) and a quoted list at
+# most 496 (2n + 8). The server's 400 and its text are recorded as
+# unsupported-on-this-build; the 1,001-key list beside it is row 11's control.
 [[statement]]
 id = "spans_in_1000"
 tenant = "inv"
@@ -158,6 +165,21 @@ window = "none"
 truth_key = "in_trace_id.1000.spans"
 states = ["unfolded", "folded_leaves"]
 cold_only = true
+expect_refusal_on_main = true
+
+# Row 11's control: the 1,000-key list plus one key it does not hold, past
+# the ceiling, so the key index must not serve it.
+[[statement]]
+id = "spans_in_1001"
+tenant = "inv"
+table = "spans"
+kind = "sql"
+sql = "SELECT span_id FROM spans WHERE trace_id IN ({in_trace_ids_x_1001})"
+window = "none"
+truth_key = "in_trace_id.1001.spans"
+states = ["unfolded", "folded_leaves"]
+cold_only = true
+expect_refusal_on_main = true
 
 # Logs trace_id is FixedSizeBinary(16) like the spans column: an equality
 # coerces a quoted string, an IN list of strings does not plan.
@@ -204,6 +226,19 @@ window = "none"
 truth_key = "in_trace_id.1000.logs"
 states = ["unfolded", "folded_leaves"]
 cold_only = true
+expect_refusal_on_main = true
+
+[[statement]]
+id = "logs_trace_in_1001"
+tenant = "inv"
+table = "logs"
+kind = "sql"
+sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_x_1001})"
+window = "none"
+truth_key = "in_trace_id.1001.logs"
+states = ["unfolded", "folded_leaves"]
+cold_only = true
+expect_refusal_on_main = true
 
 [[statement]]
 id = "failing_cell"
@@ -314,6 +349,20 @@ anchor = "cell"
 truth_key = "in_request_id.1000"
 states = ["unfolded", "folded_leaves"]
 cold_only = true
+expect_refusal_on_main = true
+
+[[statement]]
+id = "logs_request_in_1001"
+tenant = "inv"
+table = "logs"
+kind = "sql"
+sql = "SELECT request_id FROM logs WHERE request_id IN ({in_request_ids_1001})"
+window = "wide"
+anchor = "cell"
+truth_key = "in_request_id.1001"
+states = ["unfolded", "folded_leaves"]
+cold_only = true
+expect_refusal_on_main = true
 
 # The tag column holds the needle alone on a needle row and is null on every
 # other row; LIKE is the substring form of the probe the ADR words.

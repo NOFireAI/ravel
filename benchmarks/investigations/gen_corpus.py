@@ -31,7 +31,9 @@ TRACE_MARGIN_NS = 120 * 1_000_000_000
 CHILD_START_MAX_NS = 2_000_000_000
 SPAN_DUR_MAX_NS = 1_000_000_000
 LOG_OFFSET_MAX_NS = 60 * 1_000_000_000
-BLOCK_ROWS = 256
+# The rlog writer's block target: docs/log-segment-format.md:438,
+# crates/ravel-logseg/src/writer.rs:99.
+BLOCK_ROWS = 8192
 DEFAULT_START_HOUR = 1767225600 // 3600  # 2026-01-01T00:00Z
 
 SERVICES = [f"svc-{i:02d}" for i in range(20)]
@@ -183,6 +185,7 @@ def logs_schema(pa):
         ("service", pa.string()),
         ("request_id", pa.string()),
         ("tag", pa.string()),
+        ("needle_rare", pa.string()),
     ]
 
 
@@ -240,6 +243,7 @@ def emit_logs(rng, tr, tid, logs_per_trace, logs_sink, row_base, needle_of, pres
                 "service": SERVICES[tr.service],
                 "request_id": rid,
                 "tag": tag,
+                "needle_rare": tag if tag == NEEDLE_RARE else None,
             }
         )
 
@@ -298,6 +302,11 @@ type = "str"
 [[logs.attribute]]
 key = "tag"
 column = "tag"
+type = "str"
+
+[[logs.attribute]]
+key = "needle_rare"
+column = "needle_rare"
 type = "str"
 """
     return spans, logs
@@ -426,9 +435,11 @@ def main(argv):
     answers["failing_cell.logs_count"] = answer(1, value=len(failing_ids) * lpt)
 
     in_lists = {"trace_id": {}, "request_id": {}}
+    drawn = {}
     for size in IN_SIZES:
         got = min(size, args.traces)
-        ids = sorted(tids[i] for i in rng.sample(range(args.traces), got))
+        drawn[("trace_id", size)] = rng.sample(range(args.traces), got)
+        ids = sorted(tids[i] for i in drawn[("trace_id", size)])
         in_lists["trace_id"][str(size)] = ids
         answers[f"in_trace_id.{size}.spans"] = answer(got * spt, requested=size * spt)
         answers[f"in_trace_id.{size}.logs"] = answer(got * lpt, requested=size * lpt)
@@ -436,9 +447,32 @@ def main(argv):
     for size in IN_SIZES:
         got = min(size, len(pool))
         rows = rng.sample(pool, got)
+        drawn[("request_id", size)] = rows
         ids = sorted(request_id_of(tids[r // lpt], r % lpt) for r in rows)
         in_lists["request_id"][str(size)] = ids
         answers[f"in_request_id.{size}"] = answer(got, row_set=ids, requested=size)
+
+    # The 1,001-key controls: each 1000 list plus one key it does not hold,
+    # or None when every key is already in it.
+    top = IN_SIZES[-1]
+    control_extra = {"trace_id": None, "request_id": None}
+    taken = set(drawn[("trace_id", top)])
+    if len(taken) < args.traces:
+        i = rng.randrange(args.traces)
+        while i in taken:
+            i = rng.randrange(args.traces)
+        control_extra["trace_id"] = tids[i]
+    taken = set(drawn[("request_id", top)])
+    if len(taken) < len(pool):
+        r = pool[rng.randrange(len(pool))]
+        while r in taken:
+            r = pool[rng.randrange(len(pool))]
+        control_extra["request_id"] = request_id_of(tids[r // lpt], r % lpt)
+    got = len(in_lists["trace_id"][str(top)]) + (control_extra["trace_id"] is not None)
+    answers[f"in_trace_id.{top + 1}.spans"] = answer(got * spt, requested=(top + 1) * spt)
+    answers[f"in_trace_id.{top + 1}.logs"] = answer(got * lpt, requested=(top + 1) * lpt)
+    got = len(in_lists["request_id"][str(top)]) + (control_extra["request_id"] is not None)
+    answers[f"in_request_id.{top + 1}"] = answer(got, requested=top + 1)
 
     if not args.noise_only:
         present_tid = tids[present_row // lpt]
@@ -458,7 +492,9 @@ def main(argv):
         busy_traces = set(saved_idx) | set(planted)
         busy_traces |= {i for i, t in enumerate(base) if hour_of(t.start_ns, args.start_hour) == failing_hour}
         busy_tids = {tids[i] for i in busy_traces} | {t for ids in in_lists["trace_id"].values() for t in ids}
+        busy_tids.add(control_extra["trace_id"])
         busy_rids = {r for ids in in_lists["request_id"].values() for r in ids}
+        busy_rids.add(control_extra["request_id"])
         for r in range(n_log_rows):
             tid = tids[r // lpt]
             rid = request_id_of(tid, r % lpt)
@@ -514,6 +550,7 @@ def main(argv):
         "erasure_victim": victim,
         "request_id": {"present": present_id, "absent": REQUEST_ID_ABSENT},
         "in_lists": in_lists,
+        "control_extra": control_extra,
         "journey_c": journey,
         "answers": answers,
     }

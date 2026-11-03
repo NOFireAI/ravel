@@ -20,6 +20,7 @@
 #   3   no DONE or FAILED within the bound (nothing downloaded), or
 #       --partial found none (the incomplete out/ downloaded)
 #   64  bad usage
+#   69  a marker check could not be answered (aws exited other than 0 or 1)
 set -uo pipefail
 
 usage() {
@@ -75,13 +76,27 @@ fi
 
 deadline=$(($(date +%s) + (MAX_MINUTES + 30) * 60))
 [ "$PARTIAL" = 0 ] || deadline=0
+# aws s3 ls exits 1 for a key that is not there; anything else (255 for a
+# credential or endpoint error, 124 from timeout) means the question was
+# never answered, which must not read as "no marker yet".
+has_marker() {
+  local code=0
+  aws_call s3 ls "$URI/$1" >/dev/null 2>"$ERR_LOG" || code=$?
+  case "$code" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) echo "fetch: could not ask for $URI/$1 (aws exit $code):" >&2; cat "$ERR_LOG" >&2; exit 69 ;;
+  esac
+}
+ERR_LOG="$(mktemp)"
+trap 'rm -f "$ERR_LOG"' EXIT
 marker=""
 while :; do
-  if aws_call s3 ls "$URI/DONE" >/dev/null 2>&1; then
+  if has_marker DONE; then
     marker=DONE
     break
   fi
-  if aws_call s3 ls "$URI/FAILED" >/dev/null 2>&1; then
+  if has_marker FAILED; then
     marker=FAILED
     break
   fi

@@ -201,6 +201,9 @@ def cmd_s3(args):
 
 
 SIGNAL_DIR = {"s": "spans", "l": "logs", "m": "metrics"}
+# The logs keyed plan probes every data object past this size (#3117), so
+# row 6 expects at least one keyIndex GET for each.
+LARGE_OBJECT_BYTES = 512 * 1024
 
 
 def tenant_census(keys, tenant_hash):
@@ -218,9 +221,11 @@ def tenant_census(keys, tenant_hash):
             catalog[key] = size
         elif rest[0] in SIGNAL_DIR:
             cls = "/".join(rest[:2])
-            d = data.setdefault(SIGNAL_DIR[rest[0]], {"objects": 0, "bytes": 0, "largest": None, "largest_bytes": -1})
+            d = data.setdefault(SIGNAL_DIR[rest[0]], {"objects": 0, "bytes": 0, "largest": None, "largest_bytes": -1,
+                                                      "objects_over_512k": 0})
             d["objects"] += 1
             d["bytes"] += size
+            d["objects_over_512k"] += size > LARGE_OBJECT_BYTES
             if size > d["largest_bytes"] or (size == d["largest_bytes"] and key < d["largest"]):
                 d["largest"], d["largest_bytes"] = key, size
         else:
@@ -372,7 +377,9 @@ def parse_catalog_inspect(lines, catalog_objects):
             doc["parts_declared"] = int(s.split(":", 1)[1])
     doc["part_count"] = len(doc["parts"])
     doc["parts_with_leaves"] = sum(1 for p in doc["parts"] if p["leaves"])
-    doc["entries"] = sum(p["entry_count"] or 0 for p in doc["parts"])
+    counts = [p["entry_count"] for p in doc["parts"]]
+    # A part whose entry count did not parse leaves the total unknown, not short.
+    doc["entries"] = sum(counts) if all(isinstance(c, int) for c in counts) else None
     return doc
 
 
@@ -456,7 +463,9 @@ def cmd_needle_blocks(args):
     """Storage blocks holding a needle, from rlog inspect's field directory:
     the tag column is null on every row but a needle row, so its
     present_blocks summed over the logs objects is the count gen_corpus
-    predicts in units of its own row order (truth needle_blocks.any)."""
+    predicts in units of its own row order (truth needle_blocks.any). The
+    storage re-sorts rows, so only needle_rare (one row, so one block
+    whatever the order) compares exactly; tag is reported beside it."""
     with open(args.census) as f:
         census = json.load(f)
     tc = census["tenants"][args.tenant]
@@ -469,7 +478,8 @@ def cmd_needle_blocks(args):
                 keys.append(key)
     keys.sort()
     picked = keys if args.max_objects <= 0 else keys[: args.max_objects]
-    tot = {"tag_present_blocks": 0, "block_count": 0, "tag_null_count": 0, "record_count": 0}
+    tot = {"tag_present_blocks": 0, "block_count": 0, "tag_null_count": 0, "record_count": 0,
+           "needle_rare_present_blocks": 0}
     for key in picked:
         obj = parse_object_inspect(run_cli(cli_base(args) + ["rlog", "inspect", key], stop_at="records ("))
         tot["block_count"] += obj.get("block_count") or 0
@@ -478,6 +488,9 @@ def cmd_needle_blocks(args):
         if tag:
             tot["tag_present_blocks"] += tag.get("present_blocks") or 0
             tot["tag_null_count"] += tag.get("null_count") or 0
+        rare = next((c for c in obj["field_dir"] if c.get("name") == "needle_rare"), None)
+        if rare:
+            tot["needle_rare_present_blocks"] += rare.get("present_blocks") or 0
     with open(args.truth) as f:
         truth = json.load(f)
     write_json(args.out, {"tenant": args.tenant, "objects_total": len(keys), "objects_inspected": len(picked),
@@ -522,6 +535,16 @@ def placeholders(truth, run):
         p[f"in_trace_ids_x_{size}"] = ", ".join(f"X'{t}'" for t in ids)
     for size, ids in truth["in_lists"]["request_id"].items():
         p[f"in_request_ids_{size}"] = ", ".join(f"'{r}'" for r in ids)
+    # The 1,001-key controls: the largest list plus one key outside it.
+    extra = truth.get("control_extra") or {}
+    for field, fmt, name in (("trace_id", "X'{}'", "in_trace_ids_x"), ("request_id", "'{}'", "in_request_ids")):
+        sizes = sorted(truth["in_lists"][field], key=int)
+        if not sizes:
+            continue
+        ids = list(truth["in_lists"][field][sizes[-1]])
+        if extra.get(field):
+            ids.append(extra[field])
+        p[f"{name}_{int(sizes[-1]) + 1}"] = ", ".join(fmt.format(i) for i in ids)
     for k, jc in truth["journey_c"].items():
         p[f"jc_start_ns_{k}"] = str(jc["start_ns"])
         p[f"jc_cut_ns_{k}"] = str(jc["cut_ns"])
@@ -632,6 +655,8 @@ def cmd_plan(args):
             line = {**base, "temp": temp, "try": i, "truth_key": prefix + fill(st["truth_key"], p)}
             if st.get("oracle"):
                 line["oracle"] = st["oracle"]
+            if st.get("expect_refusal_on_main"):
+                line["expect_refusal_on_main"] = True
             if st["kind"] == "trace_get":
                 q = {}
                 if start is not None:
@@ -733,6 +758,11 @@ def cmd_call(args):
         append_line(args.calls, {"statement": plan["statement"], "state": plan["state"], "temp": plan["temp"],
                                  "try": 0, "outcome": "not-run", "reason": plan["not_run_reason"]})
         return
+    if args.deadline_unix_s and time.time() >= args.deadline_unix_s:
+        append_line(args.calls, {"statement": plan["statement"], "state": plan["state"], "temp": plan["temp"],
+                                 "try": plan["try"], "outcome": "not-run",
+                                 "reason": "run deadline (max_minutes) passed before this call"})
+        return
     auth = open(os.path.join(args.auth_dir, plan["tenant"] + ".auth")).read().strip()
     name, _, value = auth.partition(":")
     headers = {name.strip(): value.strip(), "Accept": "application/json"}
@@ -777,7 +807,9 @@ def cmd_call(args):
         doc = None
     refusal = complexity_refusal(code, raw)
     if refusal:
-        line["outcome"] = "unsupported-on-this-build"
+        # Only a statement planned as a cap probe may read as unsupported; any
+        # other refusal is a defect evaluate.py reports.
+        line["outcome"] = "unsupported-on-this-build" if plan.get("expect_refusal_on_main") else "refused"
         line["reason"] = f"server refused the statement (HTTP {code}): {refusal}"
         append_line(args.calls, line)
         return
@@ -1062,6 +1094,8 @@ def main():
     c.add_argument("--calls", required=True)
     c.add_argument("--timeout", type=float, default=600)
     c.add_argument("--rq-stats", action="store_true")
+    c.add_argument("--deadline-unix-s", type=float, default=0,
+                   help="past this Unix time the call is recorded not-run instead of sent")
     c.set_defaults(fn=cmd_call)
 
     u = sub.add_parser("unsupported")

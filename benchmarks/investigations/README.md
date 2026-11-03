@@ -81,8 +81,11 @@ terminates the instance, on success and failure alike: an error trap writes
 
 `run.toml [run] max_minutes` (default 540) is the run's own deadline, an
 hour inside the shutdown timer: a state that would start after it is
-recorded `not-run` with reason `deadline`, and evaluate and the upload still
-happen. The upload copies `out/` without the marker first, then writes
+recorded `not-run` with reason `deadline`, a state already running when it
+passes records each of its remaining calls `not-run` ("run deadline
+(max_minutes) passed before this call") without restarting the server for
+them, and evaluate and the upload still happen. Either makes the verdict
+`incomplete`. The upload copies `out/` without the marker first, then writes
 `DONE` (or `FAILED`) as its own final PUT, only after that copy exited 0.
 `fetch.sh` polls for `out/DONE` or `out/FAILED`, gives up `box.max_minutes +
 30` minutes after it starts, and refuses a prefix with neither marker unless
@@ -320,25 +323,49 @@ segmentsOpened STATEMENT STATE`, a problem: on this build the rlog and rspan
 scan paths never increment that counter.
 
 `timing` figures (rows 2, 5, 15 and 16) are judged on the s3 lane and only
-reported on the local one. Exit 0 only when nothing is missing, duplicated,
-wrong, dead or missed; the output is a pure function of the run directory,
-so re-evaluating it is byte-identical.
+reported on the local one. The output is a pure function of the run
+directory, so re-evaluating it is byte-identical.
+
+The verdict is `fail` when anything is missing, duplicated, wrong, refused,
+dead, not in flight or missed. Otherwise it is `incomplete` when the run
+proved less than it was asked: a state `run.toml` lists that did not run, a
+planned call that was not sent in a state that did (the run deadline, an
+in-flight window too short), or a figure `not-run` for a reason other than
+its row or figure needing a tenant, state, scale or baseline the run never
+asked for. Each reason is listed under `incomplete` in the results and the
+summary. Otherwise it is `pass`. Exit 0 only on `pass`; `DONE` carries the
+verdict.
+
+Every in-flight call must overlap the compaction of the signal its
+statement reads: the call's `[started_unix_s, started_unix_s + wall_s]`
+against the compaction measure's `[started_unix_s, ended_unix_s]`. When
+the compaction finished before the first call ("compaction finished in N ms
+before the first call") or ran shorter than one call, no call could overlap
+it, and the statement's in-flight calls are `not-run` with that reason. Any
+other partial overlap is the problem `not_in_flight`.
 
 Metrics a band can name: `cold.max.<m>` and `cold.min.<m>` (over the cold
 tries; `<m>` from the call's stats phases and members, such as `total_gets`,
 `data_gets`, `wire_bytes`, `leaf_gets`, `probe_wire_per_object`),
 `warm.max.<m>`, `cold.rows_exact` (1 when every try's answer was correct),
 `cold.rows_match_state.<state>`, `cold.wall_p50_s`,
-`cold.refused_by_complexity`, `stamp.<what>.<label>` (covering parts, entry
-counts, previous leaves, footer length, leaf buckets),
-`leaf_share.<label>.<field>`, `census.<tenant>.<signal>.objects|bytes`,
-`fold.<tenant>.<label>.<field>`, and `derived` figures over those.
+`cold.control_1001` (row 11's control, below), `stamp.<what>.<label>`
+(covering parts, entry counts, previous leaves, footer length, leaf
+buckets), `leaf_share.<label>.<field>`,
+`census.<tenant>.<signal>.objects|bytes|objects_over_512k`,
+`fold.<tenant>.<label>.<field>`, `truth.<path>` (an integer `truth.json`
+holds), and `derived` figures over those. A stamp field the inspector did
+not print is `missing`, never 0.
 
 Some bands, as transcribed:
 
-- Row 3: probe wire per object (probe wire bytes over probe GETs; this build
-  issues one probe GET per candidate object) at most 8,192 B, miss over
-  16,384 B.
+- Row 3: probe wire per object at most 8,192 B, miss over 16,384 B. The
+  denominator is the distinct objects probed: the per-object breakdown's
+  entry count when the build reports one, else the candidate objects the
+  window resolved (`stats.pruning.segments`), never the probe GET count.
+- Row 6: keyIndex GETs at most 2 x the census's hits objects and at least
+  one per hits object above 512 KiB (the census's `objects_over_512k`): the
+  logs keyed plan probes every object past that size (#3117).
 - Row 7: section GETs at most 2 x new entries plus one per entry whose
   footer exceeds 8 KiB plus one per previous leaf, miss over 2 x tail
   entries, the from-scratch rebuild. New entries, previous leaves and footer
@@ -354,14 +381,27 @@ Some bands, as transcribed:
 - Row 11: rows exact and `keysProbed` equal to the list size at 1, 10, 100
   and 1,000 keys, leaf GETs at most 1 + min(distinct buckets, 64) and leaf
   bytes at most entry_count x 11 KiB per covered part, and a 1,001-key
-  control that the index must not serve.
+  control on each of `spans_in_1000`, `logs_trace_in_1000` and
+  `logs_request_in_1000`: the same list plus one key it does not hold
+  (`spans_in_1001`, `logs_trace_in_1001`, `logs_request_in_1001`). The
+  control is 1 (pass) when every 1,000-key call reports `keysProbed` 1000
+  and `partsCovered` and no 1,001-key call is index-served (`keysProbed` or
+  `partsCovered` non-zero); 0 (miss) when a 1,001-key call is index-served
+  or the 1,000-key list probed another count; `unsupported-on-this-build`
+  when the 1,000-key list was refused or carries no tier-2 figures.
 - Row 15: the sum of the three steps' p50 under 5 s, miss over 20 s, and the
   journey's GET total within resolve + 2 x covering parts on spans + (1 +
   min(distinct buckets, 64)) per covering part on logs + 50 x (footer +
-  SKIP_IDX + block runs) on spans + the logs holders' block reads.
+  SKIP_IDX + block runs) on spans + the logs holders' block reads. The last
+  term comes from `truth.json`, not from the measured call: the failing
+  cell's traces (`failing_cell.count`, the holders) x the logs rows planted
+  per trace (`generator.logs_per_trace`), each row at most one block read.
 
 Cost: per (statement, state), the mean cold call's GETs, LISTs and server
-CPU seconds times the named prices. Amortised maintenance per signal is
+CPU seconds times the named prices. Server CPU is `/proc/<pid>/stat` utime
+plus stime, which advance in 10 ms ticks, so a single cheap call can read
+0 s; each cost line also carries `server_cpu_s_cold_sum`, the sum over the
+cold tries, the per-statement figure the tick distorts least. Amortised maintenance per signal is
 decision 8's: the leaf rebuild report's `ranged_gets` (section GETs) at the
 GET price plus its `attempts[].leaf_puts` at the PUT price, over
 `amortise_months`, plus the folded_leaves catalog stamp's leaf bytes in GB
@@ -369,7 +409,12 @@ at the storage price, per stamped part and month. Break-even per statement
 and signal is that maintenance over (unfolded cost per lookup minus folded
 cost per lookup), "not applicable" when the folded cost is not below the
 unfolded one, at the assumed `lookups_per_part_month`, which the summary
-prints once, above the break-even lines.
+prints once, above the break-even lines. Each break-even line also carries
+the folded arm's cost per lookup with maintenance amortised in
+(`dollars_folded_leaves_with_maintenance`: the folded cost per call plus
+maintenance per part-month over `lookups_per_part_month`, the frequency
+named in `maintenance_per_lookup_basis`); the break-even itself is
+unchanged.
 
 ## Unsupported on this build
 
@@ -379,17 +424,25 @@ prints once, above the break-even lines.
   absent from this build's output, so their figures are unsupported with
   that reason (the allowlist above). The many_parts leaf-GET figures are
   among them: main has no tier-2 reader.
-- The 1,000-key IN lists (`spans_in_1000`, `logs_trace_in_1000`,
-  `logs_request_in_1000`) are sent, and the server refuses them with HTTP 400
-  and `statement complexity 1001 exceeds the maximum of 1000 tokens;
-  simplify the statement`. evaluate.py records each as unsupported with
-  that text. The SQL complexity guard
-  (`crates/ravel-sql/src/complexity_guard.rs:257`, `MAX_STATEMENT_COMPLEXITY
-  = 1_000`) charges one unit per non-whitespace token, commas included, so
-  an IN list costs about two units per element and the cap sits near 495
-  keys. The guard stops counting at the cap plus one, so it reports 1001
+- The 1,000- and 1,001-key IN lists (`spans_in_1000`, `logs_trace_in_1000`,
+  `logs_request_in_1000` and their `_1001` controls) are sent, and the
+  server refuses them with HTTP 400 and `statement complexity 1001 exceeds
+  the maximum of 1000 tokens; simplify the statement`. These statements
+  carry `expect_refusal_on_main = true`, and evaluate.py records each such
+  refusal as unsupported with that text. A refusal of any other statement
+  is the problem `refused` with its status and text. The SQL complexity
+  guard charges one unit per token start
+  (`crates/ravel-sql/src/complexity_guard.rs:640`): an identifier or number
+  run is one unit, an opening quote is one, and an `X'..'` literal is an X
+  run plus a quote (`:674-684`), so an element costs 3 units with its comma
+  in an X list and 2 in a quoted one. Against `MAX_STATEMENT_COMPLEXITY =
+  1_000` (`:257`, checked at `:380-381`) and the 9 units outside the list,
+  an X list (3n + 8) holds at most 330 keys and a quoted list (2n + 8) at
+  most 496. The guard stops counting at the cap plus one, so it reports 1001
   for any statement over the cap.
-- Row 13's negative controls: decision 9's mutants are not built here.
+- Row 13's negative controls: decision 9's mutants are not built here, so
+  the figure is `not-run` ("mutant controls not implemented") and the
+  verdict is at best `incomplete`.
 
 Rows 5, 6 and 16 need `hits = true`; row 12 needs scales 10 and 100, and row
 16 a baseline build. This flow loads scale 1 and builds one commit, so rows
@@ -407,8 +460,10 @@ its own comment.
 
 Sizes, hours and the needle tiers are `gen_corpus.py` parameters; the ADR's
 corpus is `--traces 20000000 --hours 24`. Needles are planted per block of
-the generator's documented geometry (256 rows per block after ingest's
-timestamp sort): the common needle in one row of 10 % of block indices, the
+the store's logs block geometry, 8,192 rows per block
+(`docs/log-segment-format.md:438`, "Target 8192 records per block";
+`block_target_records: 8192` at `crates/ravel-logseg/src/writer.rs:99`), in
+the generator's row order: the common needle in one row of 10 % of block indices, the
 sparse one in one row of 0.1 % of block indices (at least 2, and the common
 one at least one more), the rare one in a single row, so the tiers order rare < sparse < common by blocks touched. The suite
 recounts blocks from the data rows under that geometry and requires each

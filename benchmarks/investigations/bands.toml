@@ -20,11 +20,12 @@
 #   metric      what evaluate.py extracts (README.md "Evaluation"):
 #                 <temp>.max|min.<name>       a statement's call counters
 #                 <temp>.rows_exact, <temp>.rows_match_state.<state>,
-#                 <temp>.wall_p50_s, <temp>.refused_by_complexity
+#                 <temp>.wall_p50_s, <temp>.control_1001
 #                 stamp.<what>.<label>        stamps/STATE.LABEL.*.json
 #                 leaf_share.<label>.<field>  that field's leaf bytes over the
 #                                             label's census data bytes, in %
-#                 census.<tenant>.<signal>.objects|bytes
+#                 census.<tenant>.<signal>.objects|bytes|objects_over_512k
+#                 truth.<path>                an integer truth.json holds
 #                 fold.<tenant>.<label>.<field>
 #                 derived (with expr, over m: the figures defined above it)
 #   expr        derived figures only: a Python expression over m
@@ -202,10 +203,12 @@ metric = "cold.max.per_object.absent_object_gets"
 lane = "counter"
 target_if = "v <= 3"
 
-# Probe wire over probe GETs: the build issues one probe GET per candidate
-# object, so this is the per-object probe read the ADR bands. It does not
-# split absent objects from holders (that needs the per-object breakdown);
-# a holder's probe is the same footer read.
+# Probe wire over distinct probed objects: the per-object breakdown's entry
+# count when the build reports one, else the candidate objects the window
+# resolved (stats.pruning.segments). The GET count is not the denominator: an
+# object probed in two GETs would halve the figure. It does not split absent
+# objects from holders (that needs the per-object breakdown); a holder's
+# probe is the same footer read.
 [[row.figure]]
 name = "probe_wire_per_object"
 statement = "spans_lookup_1h"
@@ -388,13 +391,23 @@ metric = "census.hits.logs.objects"
 lane = "counter"
 target_if = "v == 398"
 
+# Every object above 512 KiB is probed, so each costs at least one keyIndex
+# GET: the census count of those objects is the floor.
+[[row.figure]]
+name = "hits_objects_over_512k"
+statement = "stamp"
+state = "unfolded"
+metric = "census.hits.logs.objects_over_512k"
+lane = "counter"
+target_if = "v >= 1"
+
 [[row.figure]]
 name = "keyindex_gets"
 statement = "q20_hits"
 state = "unfolded"
 metric = "cold.max.keyindex_gets"
 lane = "counter"
-target_if = "v <= 2 * m['row_06.hits_objects']"
+target_if = "m['row_06.hits_objects_over_512k'] <= v <= 2 * m['row_06.hits_objects']"
 
 [[row.figure]]
 name = "objects_past_probe"
@@ -1055,16 +1068,36 @@ metric = "cold.max.per_part.leaf_bytes"
 lane = "counter"
 target_if = "v <= m['row_11.logs_part_entries'] * 11 * 1024"
 
-# The 1,001-key control: this build's SQL complexity guard already refuses
-# the 1,000-key list (about 2 units per element against a cap of 1,000,
-# crates/ravel-sql/src/complexity_guard.rs:257), so a 1,001-key list cannot
-# reach the index either. The figure is 1 when every cold call of the
-# 1,000-key list was refused by that guard.
+# The 1,001-key controls, one per table and key kind: 1 when every cold call
+# of the 1,000-key list probed 1,000 keys with partsCovered reported and no
+# call of its 1,001-key twin was index-served; 0 when the twin was served or
+# the 1,000-key list probed another count; unsupported-on-this-build when the
+# 1,000-key list was refused or carries no tier-2 figures. This build's SQL
+# complexity guard refuses both lists (3n + 8 units for an X list, 2n + 8 for
+# a quoted one, against MAX_STATEMENT_COMPLEXITY = 1,000,
+# crates/ravel-sql/src/complexity_guard.rs:257), so on main it reads
+# unsupported.
 [[row.figure]]
-name = "control_1001_not_served"
+name = "spans_control_1001"
 statement = "spans_in_1000"
 state = "folded_leaves"
-metric = "cold.refused_by_complexity"
+metric = "cold.control_1001"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_trace_control_1001"
+statement = "logs_trace_in_1000"
+state = "folded_leaves"
+metric = "cold.control_1001"
+lane = "counter"
+target_if = "v == 1"
+
+[[row.figure]]
+name = "logs_request_control_1001"
+statement = "logs_request_in_1000"
+state = "folded_leaves"
+metric = "cold.control_1001"
 lane = "counter"
 target_if = "v == 1"
 
@@ -1270,7 +1303,10 @@ requires_states = ["folded_leaves"]
 # target's terms: each step's resolve GETs; 2 x the spans covering parts;
 # (1 + min(traces, 64)) x the logs covering parts, the trace count bounding
 # the distinct buckets; 3 GETs (footer, SKIP_IDX, one block run) per trace on
-# spans; and journey_b's scanned blocks as the logs holders' block reads.
+# spans; and the logs holders' block reads from truth.json: the cell's
+# traces (the holders) x the logs rows planted per trace, each row at most
+# one block read. journey_b's own blocks_scanned is reported beside it and
+# is not part of the budget, which a measured figure cannot set.
 
 [[row.figure]]
 name = "cell_rows_exact"
@@ -1411,11 +1447,27 @@ lane = "counter"
 target_if = "v >= 0"
 
 [[row.figure]]
+name = "truth_holders"
+statement = "truth"
+state = "folded_leaves"
+metric = "truth.failing_cell.count"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
+name = "truth_rows_per_holder"
+statement = "truth"
+state = "folded_leaves"
+metric = "truth.generator.logs_per_trace"
+lane = "counter"
+target_if = "v >= 1"
+
+[[row.figure]]
 name = "journey_gets_budget"
 statement = "derived"
 state = "folded_leaves"
 metric = "derived"
-expr = "m['row_15.cell_resolve_gets'] + m['row_15.logs_resolve_gets'] + m['row_15.lookup_resolve_gets'] + 2 * m['row_15.spans_covering_parts'] + (1 + min(m['row_15.cell_traces'], 64)) * m['row_15.logs_covering_parts'] + 3 * m['row_15.cell_traces'] + m['row_15.logs_blocks_scanned']"
+expr = "m['row_15.cell_resolve_gets'] + m['row_15.logs_resolve_gets'] + m['row_15.lookup_resolve_gets'] + 2 * m['row_15.spans_covering_parts'] + (1 + min(m['row_15.cell_traces'], 64)) * m['row_15.logs_covering_parts'] + 3 * m['row_15.cell_traces'] + m['row_15.truth_holders'] * m['row_15.truth_rows_per_holder']"
 lane = "counter"
 target_if = "v >= 1"
 
