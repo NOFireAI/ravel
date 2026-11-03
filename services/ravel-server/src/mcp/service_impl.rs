@@ -59,11 +59,12 @@ use ravel_mcp::tools::analyze_timeseries::{
 use ravel_promql::{RangeMatrix, RangeValue, Value as PromValue};
 use ravel_query::http::{InstantRequest, MetadataRequest, RangeRequest};
 use ravel_query::{PhaseAccountingSnapshot, QueryPhase, QueryStats, RequestBudgets};
-use ravel_types::{CommitToken, LabelSet, Signal, TenantHash};
+use ravel_types::{CommitToken, Signal, TenantHash};
 use rmcp::model::{ProgressNotificationParam, ProgressToken};
 use rmcp::service::{Peer, RoleServer};
 use serde::Deserialize;
 
+use crate::analytics;
 use crate::service::describe::{DescribeColumn, DescribeDataRequest, IndexedKeysSource};
 use crate::service::{AnalyticsRequest, ExemplarsRequest, QueryService, ServiceError};
 use crate::traces::TraceLookup;
@@ -201,10 +202,19 @@ impl ProgressReporter {
     }
 }
 
-/// ADR-0028 decision 4's per-call series cap, the bound `POST
+/// ADR-0028 decision 4's per-call series cap, the bound and the text `POST
 /// /api/v1/analytics` applies before any op runs. More is refused as
 /// `budget_exceeded`, never truncated.
-const ANALYTICS_MAX_SERIES: usize = 1000;
+fn analytics_series_cap(series: usize) -> Result<(), Failure> {
+    if series > analytics::MAX_SERIES {
+        return Err(Failure {
+            class: FailureClass::BudgetExceeded,
+            message: analytics::series_cap_message(series),
+            counter: Some("series".to_string()),
+        });
+    }
+    Ok(())
+}
 
 /// The exemplar query's request, as it crosses the port: the caller-visible
 /// shape of [`ExemplarsRequest`], whose own type is not reachable from
@@ -259,7 +269,7 @@ fn analysis_data(op: AnalyzeOp, matrix: RangeMatrix) -> Result<Data, Failure> {
                 .into_iter()
                 .map(|sample| (sample.ts_ns, sample.value))
                 .collect();
-            let series = labels_cell(&labels);
+            let series = d4::labels_cell(&labels);
             match op {
                 AnalyzeOp::ChangePoint => change_point_row(series, &points),
                 AnalyzeOp::Summary => summary_row(series, &points),
@@ -379,17 +389,6 @@ fn change_kind(kind: ChangeKind) -> &'static str {
         ChangeKind::Stationary => "stationary",
         ChangeKind::Indeterminable => "indeterminable",
     }
-}
-
-fn labels_cell(labels: &LabelSet) -> Cell {
-    let mut map = serde_json::Map::new();
-    for label in labels.iter() {
-        map.insert(
-            label.name.clone(),
-            serde_json::Value::String(label.value.clone()),
-        );
-    }
-    Cell::Map(map)
 }
 
 fn args_of<T: for<'de> Deserialize<'de>>(request: &AnyJson, tool: &str) -> Result<T, Failure> {
@@ -561,17 +560,7 @@ impl QueryBackend for ServiceBackend {
                 )));
             }
         };
-        if matrix.len() > ANALYTICS_MAX_SERIES {
-            return Err(Failure {
-                class: FailureClass::BudgetExceeded,
-                message: format!(
-                    "analytics call matched {} series, exceeding the limit of \
-                     {ANALYTICS_MAX_SERIES}",
-                    matrix.len()
-                ),
-                counter: Some("series".to_string()),
-            });
-        }
+        analytics_series_cap(matrix.len())?;
         envelope.data = analysis_data(args.op, matrix)?;
         let warnings = outcome.stats.warnings.clone();
         Ok(self.uncapped_stats_envelope(envelope, &outcome.stats, outcome.partial, warnings))
@@ -885,4 +874,27 @@ impl ServiceBackend {
 
 fn failure(error: ServiceError) -> Failure {
     d4::failure(&error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The adapter's series cap is the HTTP route's: `MAX_SERIES` series
+    /// pass, one more is `budget_exceeded` on the `series` counter with the
+    /// route's own refusal text.
+    ///
+    /// FLIP: a separate copy of the cap at another bound fails one of the
+    /// two edges, and a separate copy of the message fails the text.
+    #[test]
+    fn the_series_cap_is_the_http_routes() {
+        assert!(analytics_series_cap(analytics::MAX_SERIES).is_ok());
+        let over = analytics::MAX_SERIES + 1;
+        let Err(failure) = analytics_series_cap(over) else {
+            panic!("{over} series passed the cap");
+        };
+        assert_eq!(failure.class, FailureClass::BudgetExceeded);
+        assert_eq!(failure.message, analytics::series_cap_message(over));
+        assert_eq!(failure.counter.as_deref(), Some("series"));
+    }
 }

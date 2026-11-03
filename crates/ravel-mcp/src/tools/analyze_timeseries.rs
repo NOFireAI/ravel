@@ -26,6 +26,7 @@
 
 use std::time::Duration;
 
+use ravel_query::http::service::PARTIAL_REFUSAL_PREFIX;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -36,7 +37,7 @@ use crate::service::QueryBackend;
 use super::ToolContext;
 use super::capabilities::refused_with;
 use super::promql_range::{EvalRange, Refusal, eval_range};
-use super::query_promql::report_range_scope;
+use super::query_promql::{report_range_scope, rewrite_partial_refusal};
 
 const TOOL: &str = "ravel_analyze_timeseries";
 
@@ -319,8 +320,6 @@ fn column_index(columns: &[&str], name: &str) -> Result<usize, Failure> {
 
 /// The service's own refusal names the HTTP route's consent parameter; this
 /// tool has none, so the remedy is replaced by the rule.
-const SERVICE_PARTIAL_REMEDY: &str = "set allow_partial=true to receive partial results";
-
 fn no_partial_consent() -> String {
     format!("{TOOL} takes no partial-coverage consent, so it does not analyze a partial read")
 }
@@ -329,7 +328,7 @@ fn partial_refusal() -> Failure {
     Failure {
         class: FailureClass::Unavailable,
         message: format!(
-            "partial results: coverage is incomplete; {}",
+            "{PARTIAL_REFUSAL_PREFIX} coverage is incomplete; {}",
             no_partial_consent()
         ),
         counter: None,
@@ -341,11 +340,7 @@ fn partial_refusal() -> Failure {
 /// route's `allow_partial`, and says where a partial read can be had.
 fn backend_refusal(mut failure: Failure, ctx: &ToolContext<'_>) -> Envelope {
     let mut next_steps = Vec::new();
-    if failure.class == FailureClass::Unavailable && failure.message.starts_with("partial results:")
-    {
-        failure.message = failure
-            .message
-            .replace(SERVICE_PARTIAL_REMEDY, &no_partial_consent());
+    if rewrite_partial_refusal(&mut failure, &no_partial_consent()) {
         next_steps.push(NextStep {
             action: TOOL.to_string(),
             detail: "retry once the skipped remote is reachable again".to_string(),
@@ -821,16 +816,7 @@ mod tests {
         let mut partial = change_point_rows(&[("m", 60, false)]);
         partial.coverage.partial = true;
         partial.coverage.complete = false;
-        let stub = answering(vec![
-            Err(Failure {
-                class: FailureClass::Unavailable,
-                message: "partial results: coverage is incomplete (eu: unreachable); set \
-                          allow_partial=true to receive partial results"
-                    .to_string(),
-                counter: None,
-            }),
-            Ok(partial),
-        ]);
+        let stub = answering(vec![Err(service_partial_refusal()), Ok(partial)]);
         for _ in 0..2 {
             let envelope = block_on(run(
                 args(START_NS, END_NS, "15s", "change_point"),
@@ -864,19 +850,76 @@ mod tests {
             );
         }
         // The clusters the service named survive the rewrite.
-        let stub = answering(vec![Err(Failure {
-            class: FailureClass::Unavailable,
-            message: "partial results: coverage is incomplete (eu: unreachable); set \
-                      allow_partial=true to receive partial results"
-                .to_string(),
-            counter: None,
-        })]);
+        let stub = answering(vec![Err(service_partial_refusal())]);
         let envelope = block_on(run(
             args(START_NS, END_NS, "15s", "change_point"),
             &ctx,
             &stub,
         ));
         assert!(failure_of(&envelope).message.contains("(eu: unreachable)"));
+    }
+
+    /// The service's partial refusal, built by the function the HTTP route's
+    /// gate calls rather than copied from it.
+    fn service_partial_refusal() -> Failure {
+        Failure {
+            class: FailureClass::Unavailable,
+            message: ravel_query::http::partial_refusal_message(&["eu: unreachable".into()]),
+            counter: None,
+        }
+    }
+
+    /// The rewrite matches the service's own remedy clause: over
+    /// `partial_refusal_message` the whole clause is replaced by this tool's
+    /// rule, nothing of `allow_partial` is left in the message, and the next
+    /// steps name `ravel_query_promql`'s `allow_partial_coverage`.
+    ///
+    /// FLIP: matching a hardcoded copy of the remedy clause that differs
+    /// from `PARTIAL_REFUSAL_REMEDY` (the copy after the service rewords
+    /// it) replaces nothing and leaves `set allow_partial=true` in the
+    /// message; recognising the refusal by a prefix other than
+    /// `PARTIAL_REFUSAL_PREFIX` skips the rewrite and the next steps.
+    #[test]
+    fn the_partial_rewrite_follows_the_services_own_wording() {
+        let service = service_partial_refusal().message;
+        assert!(service.starts_with(PARTIAL_REFUSAL_PREFIX), "{service}");
+        assert!(
+            service.ends_with(ravel_query::http::service::PARTIAL_REFUSAL_REMEDY),
+            "{service}"
+        );
+
+        let key = key();
+        let ctx = test_context(&key);
+        let stub = answering(vec![Err(service_partial_refusal())]);
+        let envelope = block_on(run(
+            args(START_NS, END_NS, "15s", "change_point"),
+            &ctx,
+            &stub,
+        ));
+        let failure = failure_of(&envelope);
+        assert_eq!(
+            failure.message,
+            format!(
+                "{PARTIAL_REFUSAL_PREFIX} coverage is incomplete (eu: unreachable); {}",
+                no_partial_consent()
+            )
+        );
+        assert!(
+            !failure.message.contains("allow_partial"),
+            "{}",
+            failure.message
+        );
+        let actions: Vec<&str> = envelope
+            .next_steps
+            .iter()
+            .map(|step| step.action.as_str())
+            .collect();
+        assert_eq!(actions, vec![TOOL, "ravel_query_promql"]);
+        assert!(
+            envelope.next_steps[1]
+                .detail
+                .contains("allow_partial_coverage: true")
+        );
     }
 
     /// A port answer in another row shape is an internal failure rather than

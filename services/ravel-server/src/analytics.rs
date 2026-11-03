@@ -122,8 +122,15 @@ const MAX_BODY_BYTES: usize = 1 << 20;
 const MS_PER_SEC: f64 = 1_000.0;
 
 /// ADR-0028 decision 4: an analytics call processes at most this many series;
-/// more is a typed error before any op runs, never a silent truncation.
-const MAX_SERIES: usize = 1000;
+/// more is a typed error before any op runs, never a silent truncation. The
+/// MCP adapter's `ravel_analyze_timeseries` applies this same constant.
+pub(crate) const MAX_SERIES: usize = 1000;
+
+/// The refusal text for a call that matched `count` series, more than
+/// [`MAX_SERIES`]; the HTTP route and the MCP adapter both send it.
+pub(crate) fn series_cap_message(count: usize) -> String {
+    format!("analytics call matched {count} series, exceeding the limit of {MAX_SERIES}")
+}
 
 /// Shared state for the analytics route: the query engine (the same instance
 /// the Prometheus-shaped routes use, so the evaluation is byte-for-byte the
@@ -480,9 +487,7 @@ impl ApiError {
         ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             error_type: "execution",
-            message: format!(
-                "analytics call matched {count} series, exceeding the limit of {MAX_SERIES}"
-            ),
+            message: series_cap_message(count),
         }
     }
 
@@ -714,6 +719,7 @@ mod tests {
             ApiError::series_cap(1001).status,
             StatusCode::UNPROCESSABLE_ENTITY
         );
+        assert_eq!(ApiError::series_cap(1001).message, series_cap_message(1001));
         assert_eq!(
             ApiError::from_analytics(AnalyticsError::SeriesTooLong {
                 max: 2000,

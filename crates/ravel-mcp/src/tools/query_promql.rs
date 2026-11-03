@@ -34,6 +34,7 @@
 //! text and cut that.
 
 use ravel_query::RequestBudgets;
+use ravel_query::http::service::{PARTIAL_REFUSAL_PREFIX, PARTIAL_REFUSAL_REMEDY};
 use ravel_query::http::{InstantRequest, RangeRequest};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -201,9 +202,7 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Result<
     if envelope.coverage.partial && !plan.allow_partial {
         return Err(Failure {
             class: FailureClass::Unavailable,
-            message: "partial results: coverage is incomplete; set allow_partial_coverage: \
-                      true to receive partial results"
-                .to_string(),
+            message: format!("{PARTIAL_REFUSAL_PREFIX} coverage is incomplete; {CONSENT_REMEDY}"),
             counter: None,
         });
     }
@@ -493,18 +492,29 @@ fn column(name: &str) -> Column {
     }
 }
 
+/// This tool's spelling of the service's partial-coverage remedy.
+const CONSENT_REMEDY: &str = "set allow_partial_coverage: true to receive partial results";
+
+/// Whether `failure` is the service's partial-coverage refusal, recognised by
+/// the class and the prefix `partial_refusal_message` writes; if so, its
+/// remedy clause, which names the HTTP route's `allow_partial`, is replaced
+/// by `remedy`.
+pub(super) fn rewrite_partial_refusal(failure: &mut Failure, remedy: &str) -> bool {
+    if failure.class != FailureClass::Unavailable
+        || !failure.message.starts_with(PARTIAL_REFUSAL_PREFIX)
+    {
+        return false;
+    }
+    failure.message = failure.message.replace(PARTIAL_REFUSAL_REMEDY, remedy);
+    true
+}
+
 /// A failure from the backend, or from this body's own partial gate. A
 /// partial-coverage refusal is rewritten to name this tool's consent
 /// argument rather than the HTTP route's, and says how to consent.
 fn backend_refusal(mut failure: Failure, plan: &Plan, ctx: &ToolContext<'_>) -> Envelope {
     let mut next_steps = Vec::new();
-    if failure.class == FailureClass::Unavailable
-        && failure.message.starts_with("partial results:")
-        && !plan.allow_partial
-    {
-        failure.message = failure
-            .message
-            .replace("allow_partial=true", "allow_partial_coverage: true");
+    if !plan.allow_partial && rewrite_partial_refusal(&mut failure, CONSENT_REMEDY) {
         next_steps.push(NextStep {
             action: TOOL.to_string(),
             detail: "resend with allow_partial_coverage: true to receive the partial result, \

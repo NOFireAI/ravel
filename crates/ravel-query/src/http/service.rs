@@ -346,6 +346,15 @@ impl QueryControls {
     }
 }
 
+/// How [`partial_refusal_message`] begins, for a caller that recognises the
+/// refusal after it has crossed a boundary that keeps only the text.
+pub const PARTIAL_REFUSAL_PREFIX: &str = "partial results:";
+
+/// The remedy clause [`partial_refusal_message`] ends with. It names the HTTP
+/// route's `allow_partial`, so a surface whose consent argument is spelled
+/// differently replaces this clause.
+pub const PARTIAL_REFUSAL_REMEDY: &str = "set allow_partial=true to receive partial results";
+
 /// The refusal message for partial coverage the caller did not opt into. It
 /// names the degraded clusters (the same operator-facing, already-redacted
 /// names the `warnings` array carries) and names `allow_partial` as the
@@ -357,8 +366,7 @@ pub fn partial_refusal_message(skipped: &[String]) -> String {
         skipped.join("; ")
     };
     format!(
-        "partial results: coverage is incomplete ({clusters}); \
-         set allow_partial=true to receive partial results"
+        "{PARTIAL_REFUSAL_PREFIX} coverage is incomplete ({clusters}); {PARTIAL_REFUSAL_REMEDY}"
     )
 }
 
