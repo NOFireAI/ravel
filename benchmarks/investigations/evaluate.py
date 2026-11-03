@@ -930,7 +930,6 @@ def check_inflight(calls, statements, compaction, problems):
                                           f"overlapped the {sig} compaction")
             continue
         for c in lines:
-            c["_ran_outcome"] = c["outcome"]
             c["outcome"] = "not-run"
             c["reason"] = reason
 

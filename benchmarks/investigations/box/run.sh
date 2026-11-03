@@ -289,6 +289,9 @@ load_config() {
   WARM_RUNS="$(cfg run.warm_runs --default 1)"
   HITS="$(cfg run.hits --default false)"
   MIXED_WAIT="$(cfg run.mixed_wait_max_minutes --default 70)"
+  # Set by fold(); empty until a fold ran, which the mixed state checks
+  # before it waits (set -u would otherwise end the run there).
+  FOLD_HOUR=""
   RUN_MAX_MINUTES="$(cfg run.max_minutes --default 540)"
   STEP_ESTIMATE_DEFAULT="$(cfg step_estimate_minutes.default --default 30)"
   NEEDLE_MAX="$(cfg run.needle_blocks_max_objects --default 0)"
@@ -908,6 +911,10 @@ run_state() {
       statements folded_leaves ;;
     mixed)
       fits mixed "the wait for the next ingest hour" "$((MIXED_WAIT * 60))" || return 0
+      if [ -z "$FOLD_HOUR" ]; then
+        not_run mixed "no fold ran before the mixed state (its fold states were skipped or not listed), so the tail hour has no sealed hour to follow"
+        return 0
+      fi
       wait_next_hour
       fits mixed load "$(estimate_s mixed)" || return 0
       stop_server
