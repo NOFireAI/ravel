@@ -14,6 +14,7 @@ pub mod cache_warm;
 pub mod cli_reference;
 pub mod config;
 pub mod cpu_gates;
+pub mod cpu_shed;
 #[cfg(feature = "sql")]
 pub mod declared_columns;
 pub mod distrib;
@@ -89,7 +90,7 @@ pub mod wire_byte_count;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -809,6 +810,13 @@ pub struct ServerConfig {
     /// from [`config::Cli::resolve_cpu_gate_permits`]. [`start`] builds both
     /// gates from this in every mode.
     pub cpu_gate_permits: config::CpuGatePermits,
+    /// ADR-3718's CPU-aware ingest admission settings, from
+    /// [`config::Cli::resolve_cpu_shed`]. [`start`] spawns the saturation
+    /// detector (`cpu_shed::Detector`) from this when `threshold > 0.0`, and
+    /// publishes its shed fraction into the shared
+    /// [`ingest_concurrency::IngestConcurrencyController`] every ingest
+    /// admission path already reads.
+    pub cpu_shed: config::CpuShedConfig,
     /// The process-wide in-flight ingest-request ceiling, from
     /// `--max-inflight-ingest-requests` (default `Bounded(1024)`, `0` maps to
     /// `Unlimited`). [`start`] builds one shared
@@ -1170,6 +1178,31 @@ pub struct Running {
     /// transport that receives it, through its own router state rather than
     /// an axum route.
     pub query_service: Option<service::QueryService>,
+    /// ADR-3718's CPU-aware shed gauge, for a reachability test to pin `p`
+    /// directly with [`cpu_shed::CpuShedGauge::set_for_test`] rather than
+    /// drive the real detector loop or real CPU load. Test-only seam, behind
+    /// the same feature that exposes `set_for_test` itself.
+    #[cfg(any(test, feature = "cpu-shed-test-support"))]
+    pub cpu_shed: Arc<cpu_shed::CpuShedGauge>,
+    /// ADR-3718's background CPU sampler, `Some` exactly when
+    /// `--ingest-cpu-shed-threshold` is above 0. Stopped (aborted and
+    /// awaited) at the top of [`Running::shutdown`], before the ingest
+    /// routers are drained: left running, it is a long-lived task that never
+    /// releases its own clones of whatever it captures, which is exactly the
+    /// shape of handle that keeps [`drain_router`]'s best-effort
+    /// `Arc::try_unwrap` from ever seeing sole ownership.
+    cpu_shed_detector_task: Option<cpu_shed::DetectorTask>,
+    /// Whether every router [`drain_router`] was given during this shutdown
+    /// actually reached sole ownership and joined its shard actors, read
+    /// through [`Running::shard_actors_joined_handle`] once `shutdown` has
+    /// run. Not itself behind the test-support feature (a single
+    /// `Arc<AtomicBool>` costs nothing in production and keeping it
+    /// unconditional avoids threading a second cfg through the shutdown
+    /// body): a regression that leaks a router clone (the CPU-shed
+    /// detector's own former bug) turns this `false` instead of failing
+    /// loudly, so a shutdown test asserts on it directly rather than on
+    /// `drain_router`'s best-effort warning log.
+    shard_actors_joined: Arc<AtomicBool>,
     /// The query service backing the mTLS router's query surfaces, `Some`
     /// exactly when a query-serving mode was configured with an mTLS
     /// listener. A separate instance from [`Running::query_service`] because
@@ -1435,17 +1468,23 @@ fn ingest_health_sources(
 /// contract is unit-testable; deleting the flush here makes that test fail
 /// rather than passing on the incidental flush a later owner's own shutdown
 /// would perform.
-async fn drain_router<R: DrainRouter>(router: Option<Arc<R>>, label: &str) {
+async fn drain_router<R: DrainRouter>(router: Option<Arc<R>>, label: &str) -> bool {
     let Some(router) = router else {
-        return;
+        return true;
     };
     router.flush_all().await;
     match Arc::try_unwrap(router) {
-        Ok(sole) => sole.join_actors().await,
-        Err(_) => tracing::warn!(
-            "{label} ingest router still has outstanding references; ingest flush completed, shard \
-             actors not joined"
-        ),
+        Ok(sole) => {
+            sole.join_actors().await;
+            true
+        }
+        Err(_) => {
+            tracing::warn!(
+                "{label} ingest router still has outstanding references; ingest flush completed, \
+                 shard actors not joined"
+            );
+            false
+        }
     }
 }
 
@@ -1470,6 +1509,14 @@ impl Running {
     /// sampler on (ADR-2633 task 2).
     pub fn process_memory_budget(&self) -> Arc<ravel_memory::MemoryBudget> {
         self.process_memory_budget.clone()
+    }
+
+    /// The [`Running::shard_actors_joined`] handle, read after
+    /// [`Running::shutdown`] consumes `self` and returns. Test-only seam,
+    /// behind the same feature as [`Running::cpu_shed`].
+    #[cfg(any(test, feature = "cpu-shed-test-support"))]
+    pub fn shard_actors_joined_handle(&self) -> Arc<AtomicBool> {
+        self.shard_actors_joined.clone()
     }
 
     /// Gracefully stop the server: flip readiness to draining so a probe sees
@@ -1524,6 +1571,8 @@ impl Running {
             drain_settle_interval,
             query_worker_heartbeat,
             runtime_heartbeat_task: _runtime_heartbeat_task,
+            cpu_shed_detector_task,
+            shard_actors_joined,
             #[cfg(feature = "sql")]
                 sql_spill_owner: _sql_spill_owner,
             // `..` drops the fields with no shutdown behavior: the bound addresses
@@ -1666,11 +1715,25 @@ impl Running {
             // `try_unwrap` join in `drain_router` succeed.
             idle_tenant_state_task.shutdown().await;
 
+            // Stop the ADR-3718 CPU sampler before the router join below.
+            // Even though it now captures metrics handles rather than router
+            // clones (so it does not itself hold `drain_router`'s
+            // `Arc::try_unwrap` open), it is a task that otherwise runs
+            // forever: left unstopped here it leaks past this shutdown with
+            // no owner left to join it.
+            if let Some(task) = cpu_shed_detector_task {
+                task.stop().await;
+            }
+
             // Flush again (idempotent; catches anything buffered while the
             // listeners closed) and best-effort join each router's shard actors.
-            drain_router(ingest_router, "metrics").await;
-            drain_router(log_ingest_router, "log").await;
-            drain_router(span_ingest_router, "span").await;
+            let metrics_joined = drain_router(ingest_router, "metrics").await;
+            let log_joined = drain_router(log_ingest_router, "log").await;
+            let span_joined = drain_router(span_ingest_router, "span").await;
+            shard_actors_joined.store(
+                metrics_joined && log_joined && span_joined,
+                Ordering::SeqCst,
+            );
 
             fold_tasks.shutdown().await;
             maintenance_tasks.shutdown().await;
@@ -2454,6 +2517,36 @@ pub async fn start_with_heartbeat(
     .await
 }
 
+/// [`start_with_heartbeat_and_ipcrypt`] with the ADR-3718 CPU sampler driven
+/// by a fake [`cpu_shed::CpuSource`] instead of `/proc/self/stat`, so a test
+/// can force the detector into saturation deterministically (and off Linux)
+/// rather than waiting on real CPU load. `config.cpu_shed.threshold` must
+/// still be above 0 for the detector to spawn at all; this only replaces
+/// which source it samples. Test-only seam, same feature as
+/// [`Running::cpu_shed`].
+#[cfg(any(test, feature = "cpu-shed-test-support"))]
+pub async fn start_for_test_with_cpu_source(
+    config: ServerConfig,
+    store: Arc<dyn ObjectStoreBackend>,
+    store_background: Arc<dyn ObjectStoreBackend>,
+    store_metrics: Arc<StoreMetrics>,
+    cache: Option<ravel_query::ReadCache>,
+    heartbeat: health_listener::Heartbeat,
+    cpu_source: Box<dyn cpu_shed::CpuSource>,
+) -> anyhow::Result<Running> {
+    start_inner(
+        config,
+        store,
+        store_background,
+        store_metrics,
+        cache,
+        heartbeat,
+        ipcrypt::IpcryptPolicy::disabled(),
+        Some(cpu_source),
+    )
+    .await
+}
+
 /// Drops the decoded column-block cache's expired entries every
 /// `ravel_cache::DEFAULT_SWEEP_INTERVAL_NS` (ADR-3326 decision 2). The task
 /// holds a `Weak`, so it ends once the cache is gone.
@@ -2482,6 +2575,35 @@ fn spawn_decoded_cache_sweeper(cache: &Arc<ravel_logseg::decoded_cache::DecodedC
 /// built or bound, and refuses to start on a mismatch or a failed read
 /// (ADR-2993 decision 9); see [`ipcrypt::check_startup_marker`].
 pub async fn start_with_heartbeat_and_ipcrypt(
+    config: ServerConfig,
+    store: Arc<dyn ObjectStoreBackend>,
+    store_background: Arc<dyn ObjectStoreBackend>,
+    store_metrics: Arc<StoreMetrics>,
+    cache: Option<ravel_query::ReadCache>,
+    heartbeat: health_listener::Heartbeat,
+    ipcrypt: Arc<ipcrypt::IpcryptPolicy>,
+) -> anyhow::Result<Running> {
+    start_inner(
+        config,
+        store,
+        store_background,
+        store_metrics,
+        cache,
+        heartbeat,
+        ipcrypt,
+        None,
+    )
+    .await
+}
+
+/// The real body behind [`start_with_heartbeat_and_ipcrypt`] and
+/// [`start_for_test_with_cpu_source`]: `cpu_source_for_test`, `Some` only
+/// from the latter, replaces the ADR-3718 detector's `/proc/self/stat`
+/// source so a test can drive it deterministically. `None` (every
+/// production caller, through the public wrapper above) keeps the real
+/// [`cpu_shed::ProcSelfStatCpuSource`].
+#[allow(clippy::too_many_arguments)]
+async fn start_inner(
     mut config: ServerConfig,
     store: Arc<dyn ObjectStoreBackend>,
     store_background: Arc<dyn ObjectStoreBackend>,
@@ -2489,6 +2611,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     cache: Option<ravel_query::ReadCache>,
     heartbeat: health_listener::Heartbeat,
     ipcrypt: Arc<ipcrypt::IpcryptPolicy>,
+    cpu_source_for_test: Option<Box<dyn cpu_shed::CpuSource>>,
 ) -> anyhow::Result<Running> {
     validate_idle_flush_byte_floor(&config)?;
     // The same checks, in the same order, as `Cli::validate`.
@@ -2838,6 +2961,56 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // sheds independently against its own local bound.
     let ingest_concurrency =
         ingest_concurrency::IngestConcurrencyController::shared(config.ingest_concurrency_limit);
+
+    // ADR-3718: CPU-aware ingest admission. The saturation detector samples
+    // this process's own CPU time and the sum of every ingest router's
+    // deferred-flush-trigger counter, and publishes a shed fraction into the
+    // gauge every ingest admission path already reads off `ingest_concurrency`
+    // (`crate::ingest_admission`). Spawned only when
+    // `--ingest-cpu-shed-threshold` is above 0: at 0 there is
+    // nothing for the detector to do (`step`'s `saturated` check can never
+    // trip), so leaving the task unspawned there makes "threshold 0 means no
+    // detector task" (docs/ingest.md and the flag's own help text) actually
+    // true, instead of merely a documented claim an always-spawned task
+    // contradicted at zero cost.
+    let cpu_shed_detector_task = if config.cpu_shed.threshold > 0.0 {
+        // Metrics handles only, never router `Arc` clones: the same rule
+        // `ingest_health_sources` follows. A router clone held by this
+        // closure would keep `Arc::try_unwrap` in `drain_router` from ever
+        // seeing sole ownership, so graceful shutdown's shard-actor join
+        // would silently stop joining for as long as the detector task runs.
+        let metrics_handle = ingest_router.as_ref().map(|r| r.metrics_handle());
+        let log_handle = log_ingest_router.as_ref().map(|r| r.metrics_handle());
+        let span_handle = span_ingest_router.as_ref().map(|r| r.metrics_handle());
+        let deferred_total = move || {
+            metrics_handle
+                .as_ref()
+                .map(|m| m.flush_trigger_deferred_total())
+                .unwrap_or(0)
+                + log_handle
+                    .as_ref()
+                    .map(|m| m.flush_trigger_deferred_total())
+                    .unwrap_or(0)
+                + span_handle
+                    .as_ref()
+                    .map(|m| m.flush_trigger_deferred_total())
+                    .unwrap_or(0)
+        };
+        let detector = cpu_shed::Detector::new(
+            cpu_source_for_test.unwrap_or_else(|| Box::new(cpu_shed::ProcSelfStatCpuSource)),
+            config.cpu_shed.cores,
+            config.cpu_shed.threshold,
+            config.cpu_shed.max,
+            ingest_concurrency.cpu_shed_handle(),
+        );
+        Some(cpu_shed::DetectorTask::spawn(
+            detector,
+            Arc::new(SystemClock),
+            deferred_total,
+        ))
+    } else {
+        None
+    };
 
     // Per-tenant wire (compressed) request-body byte counter (ADR-0084 decision
     // 5): one shared instance per process, threaded into every `GatewayState`
@@ -4901,6 +5074,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         ingest_router,
         metadata_sink,
         query_accounting,
+        #[cfg(any(test, feature = "cpu-shed-test-support"))]
+        cpu_shed: ingest_concurrency.cpu_shed_handle(),
         query_service: query_service_handle,
         mtls_query_service: mtls_query_service_handle,
         published_alerts,
@@ -4930,6 +5105,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         drain_settle_interval: config.drain_settle_interval,
         query_worker_heartbeat,
         runtime_heartbeat_task: None,
+        cpu_shed_detector_task,
+        shard_actors_joined: Arc::new(AtomicBool::new(false)),
         process_memory_budget,
         #[cfg(feature = "sql")]
         sql_spill_owner,
@@ -5938,6 +6115,7 @@ mod startup_test_support {
             cache_dir: None,
             catalog_resolve_concurrency: None,
             cpu_gate_permits: Default::default(),
+            cpu_shed: Default::default(),
             ingest_concurrency_limit: ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
             max_pending_strict_acks: 8_192,
             ingest_buffer_budget_limit: ravel_ingest::IngestByteBudgetLimit::Unlimited,

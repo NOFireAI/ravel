@@ -87,6 +87,16 @@ async fn main() -> anyhow::Result<()> {
         "CPU gate permits resolved"
     );
 
+    // ADR-3718: CPU-aware ingest admission settings, scaled by the same host
+    // profile. `threshold == 0.0` means shedding stays off, same as today.
+    let cpu_shed = cli.resolve_cpu_shed(host);
+    tracing::info!(
+        threshold = cpu_shed.threshold,
+        max = cpu_shed.max,
+        cores = cpu_shed.cores,
+        "CPU-aware ingest admission (ADR-3718) resolved"
+    );
+
     // OTAP (ADR-0011) is opt-in even in a build with the `otap` feature: the
     // feature links the arrow decode stack, `--otap` decides whether this
     // process registers the ArrowMetricsService (ServerConfig::otap, read by
@@ -670,6 +680,7 @@ async fn main() -> anyhow::Result<()> {
         cache_dir: cli.cache_dir.clone(),
         catalog_resolve_concurrency: Some(performance.catalog_resolve_concurrency),
         cpu_gate_permits,
+        cpu_shed,
         ingest_concurrency_limit: cli
             .parse_ingest_concurrency_limit()
             .context("failed to parse --max-inflight-ingest-requests")?,

@@ -603,6 +603,17 @@ impl ShardSkew {
         }
     }
 
+    /// Sum of `flush_trigger_deferred` across every shard, as one relaxed
+    /// atomic load per shard rather than the full [`Self::by_shard`] snapshot
+    /// (ADR-3718 D1): the CPU-aware admission detector samples this every
+    /// 100 ms and must not build a per-shard map to do it.
+    pub(crate) fn flush_trigger_deferred_total(&self) -> u64 {
+        self.shards
+            .iter()
+            .map(|s| s.flush_trigger_deferred.load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// Point-in-time per-shard figures, sorted by shard index. A shard with no
     /// recorded activity is simply absent. `queue_depth` is derived here as
     /// `messages_enqueued - messages_processed`, saturating at 0.
@@ -1092,6 +1103,12 @@ impl IngestMetrics {
     /// next tick.
     pub(crate) fn record_shard_flush_trigger_deferred(&self, shard: u32) {
         self.shard_skew.record_flush_trigger_deferred(shard);
+    }
+
+    /// Sum across shards of `flush_trigger_deferred`, one relaxed atomic load
+    /// per shard (ADR-3718 D1).
+    pub fn flush_trigger_deferred_total(&self) -> u64 {
+        self.shard_skew.flush_trigger_deferred_total()
     }
 
     /// Point-in-time per-shard skew figures, sorted by shard index (issue

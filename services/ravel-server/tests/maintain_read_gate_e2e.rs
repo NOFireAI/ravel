@@ -95,6 +95,7 @@ fn maintain_config(tenant: &TenantId) -> ServerConfig {
             write: 1,
             ..Default::default()
         },
+        cpu_shed: Default::default(),
         max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: Duration::from_secs(3600),

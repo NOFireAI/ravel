@@ -3664,6 +3664,36 @@ fn render_ingest_concurrency_family(out: &mut String, mode: Mode, shed_total: u6
     );
 }
 
+/// ADR-3718's CPU-aware ingest admission: the cumulative head-refusal count
+/// and the current shed fraction `p`, read off the same process-wide
+/// controller as `render_ingest_concurrency_family` above.
+fn render_cpu_shed_family(out: &mut String, mode: Mode, cpu_shed: &crate::cpu_shed::CpuShedGauge) {
+    write_header(
+        out,
+        "ravel_ingest_cpu_shed_total",
+        "Ingest requests refused at the head by the CPU-aware admission detector while the node is saturated (--ingest-cpu-shed-threshold, ADR-3718).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_ingest_cpu_shed_total",
+        &[Label::Mode(mode)],
+        cpu_shed.shed_total(),
+    );
+    write_header(
+        out,
+        "ravel_ingest_cpu_shed_fraction",
+        "Current CPU-aware admission shed fraction p (ADR-3718 D2): the probability a new ingest request is refused at the head. 0 when the node is not saturated or shedding is disabled (--ingest-cpu-shed-threshold 0).",
+        "gauge",
+    );
+    write_sample_f64(
+        out,
+        "ravel_ingest_cpu_shed_fraction",
+        &[Label::Mode(mode)],
+        cpu_shed.load(),
+    );
+}
+
 /// The ingest signals a ruled value can be stored under.
 const IPCRYPT_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
 
@@ -10268,6 +10298,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         state.mode,
         state.ingest_concurrency.head_refusal_drain(),
     );
+    render_cpu_shed_family(&mut body, state.mode, state.ingest_concurrency.cpu_shed());
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],

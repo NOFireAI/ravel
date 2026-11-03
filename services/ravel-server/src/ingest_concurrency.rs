@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
+use crate::cpu_shed::CpuShedGauge;
 use crate::ingest_admission::HeadRefusalDrain;
 
 /// `--max-inflight-ingest-requests`: `Bounded(n)` caps process-wide in-flight
@@ -45,6 +46,11 @@ pub struct IngestConcurrencyController {
     semaphore: Option<Arc<Semaphore>>,
     shed_total: AtomicU64,
     head_refusal_drain: HeadRefusalDrain,
+    /// `Arc`-wrapped so [`Self::cpu_shed_handle`] can hand the background
+    /// detector task (`crate::cpu_shed::Detector::run`, spawned once in
+    /// `crate::start`) its own owned clone to publish into, independent of
+    /// this controller's own lifetime.
+    cpu_shed: Arc<CpuShedGauge>,
 }
 
 /// A held admission slot. Carries no reference back to the controller: the
@@ -107,6 +113,7 @@ impl IngestConcurrencyController {
             semaphore,
             shed_total: AtomicU64::new(0),
             head_refusal_drain: HeadRefusalDrain::default(),
+            cpu_shed: Arc::new(CpuShedGauge::default()),
         }
     }
 
@@ -152,6 +159,22 @@ impl IngestConcurrencyController {
     /// uses when it answers a shed request (`crate::ingest_admission`).
     pub fn head_refusal_drain(&self) -> &HeadRefusalDrain {
         &self.head_refusal_drain
+    }
+
+    /// ADR-3718's shed fraction and refusal counter: published by the
+    /// background saturation detector (`crate::cpu_shed::Detector`, spawned
+    /// in `crate::start`) and drawn against at the head of every ingest
+    /// admission path, alongside this same controller's `try_admit`.
+    pub fn cpu_shed(&self) -> &CpuShedGauge {
+        &self.cpu_shed
+    }
+
+    /// An owned clone of the shed-fraction gauge, for the background
+    /// detector task to publish into independent of this controller's own
+    /// lifetime (`crate::start` spawns the detector with this, right after
+    /// building the shared controller).
+    pub fn cpu_shed_handle(&self) -> Arc<CpuShedGauge> {
+        self.cpu_shed.clone()
     }
 }
 
