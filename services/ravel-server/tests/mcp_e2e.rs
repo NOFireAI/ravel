@@ -1510,6 +1510,83 @@ mod with_mcp {
         running.shutdown().await.expect("server stops");
     }
 
+    /// `ravel_query_sql` and `ravel_explain_query` report the same
+    /// `estimate_is_upper_envelope` for one statement, through the route: true
+    /// over `samples`, whose estimate is bounded, and false over `logs` and
+    /// `spans`, whose decompressed-byte figure the estimator cannot bound. The
+    /// executed call reports that figure as unknown, `null` and named in
+    /// `unbounded`, in the spelling the explain uses, not as its structural 0.
+    ///
+    /// FLIP: `estimate_is_upper_envelope: true` hard-coded on the SQL execute
+    /// path fails the logs statement's flag; rendering the raw figure fails
+    /// its `null`.
+    #[tokio::test]
+    async fn query_sql_and_explain_agree_on_the_upper_envelope() {
+        let (store, metrics) = instrumented_memory();
+        publish_sample(store.as_ref(), 0, 1).await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        for (query, upper_envelope, unbounded) in [
+            ("SELECT value FROM samples", true, serde_json::json!([])),
+            (
+                "SELECT * FROM logs",
+                false,
+                serde_json::json!(["estimated_decompressed_bytes"]),
+            ),
+            (
+                "SELECT * FROM spans",
+                false,
+                serde_json::json!(["estimated_decompressed_bytes"]),
+            ),
+        ] {
+            let arguments = serde_json::json!({"query": query, "time_range": sql_window()});
+            let (is_error, executed) = call(&client, "ravel_query_sql", arguments.clone()).await;
+            assert_eq!(is_error, Some(false), "{query}: {executed}");
+            let (is_error, explained) = call(&client, "ravel_explain_query", arguments).await;
+            assert_eq!(is_error, Some(false), "{query}: {explained}");
+
+            let executed_budget = &executed["budget"];
+            assert_eq!(
+                executed_budget["estimate_is_upper_envelope"],
+                serde_json::json!(upper_envelope),
+                "{query}: {executed}"
+            );
+            assert_eq!(
+                executed_budget["estimate_is_upper_envelope"],
+                explained["budget"]["estimate_is_upper_envelope"],
+                "{query}"
+            );
+            assert_eq!(
+                executed_budget["estimate"]["unbounded"], unbounded,
+                "{query}: {executed}"
+            );
+            assert_eq!(
+                executed_budget["estimate"]["unbounded"],
+                explained["budget"]["estimate"]["unbounded"],
+                "{query}"
+            );
+            if upper_envelope {
+                assert!(
+                    executed_budget["estimate"]["decompressed_bytes"].is_u64(),
+                    "{query}: {executed}"
+                );
+            } else {
+                assert_eq!(
+                    executed_budget["estimate"]["decompressed_bytes"],
+                    serde_json::Value::Null,
+                    "{query}: {executed}"
+                );
+            }
+        }
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
     /// Write the test tenant's metric metadata record with one gauge family
     /// per name.
     async fn write_families(store: &dyn ObjectStoreBackend, names: &[String]) {
