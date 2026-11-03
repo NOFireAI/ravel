@@ -15,6 +15,7 @@
 //! reads, which is what `max_store_requests` bounds.
 
 use ravel_mcp::budget::McpEffectiveBudgets;
+use ravel_mcp::draft::EstimateComponent;
 use ravel_mcp::envelope::{
     AnyJson, Budget, Cell, Column, Data, Envelope, Failure, FailureClass, Row, TimeRange,
 };
@@ -26,7 +27,8 @@ use serde_json::{Map, Value, json};
 
 use crate::service::{ServiceError, ServiceErrorKind};
 
-/// What one operation spent, and whether its estimate is an upper envelope.
+/// What one operation spent, and which of its estimate's components the
+/// estimator could not bound.
 ///
 /// Both figures ride together because the envelope's `budget` block reports
 /// them together and a reader comparing them has to know they came from the
@@ -38,7 +40,10 @@ pub(crate) struct Spend<'a> {
     /// phases that issued them. `None` for an operation whose outcome type
     /// carries no split, which is every metadata and exemplar operation.
     pub phases: Option<&'a PhaseAccountingSnapshot>,
-    pub estimate_is_upper_envelope: bool,
+    /// The components the estimator cannot bound for what the operation
+    /// read, as `ravel_explain_query` names them for the same statement. The
+    /// estimate is an upper envelope only when this is empty.
+    pub unbounded: &'a [EstimateComponent],
 }
 
 /// A fresh envelope for one operation: its scope, the effective ceilings the
@@ -90,8 +95,8 @@ pub(crate) fn spend(envelope: &mut Envelope, budgets: &McpEffectiveBudgets, spen
     envelope.budget = Budget {
         effective: AnyJson(ceilings(budgets)),
         actual: AnyJson(actual),
-        estimate: AnyJson(estimated(spend.estimate)),
-        estimate_is_upper_envelope: spend.estimate_is_upper_envelope,
+        estimate: AnyJson(estimated(spend.estimate, spend.unbounded)),
+        estimate_is_upper_envelope: spend.unbounded.is_empty(),
     };
 }
 
@@ -290,12 +295,25 @@ fn actual(accounting: &QueryAccountingSnapshot) -> Value {
     })
 }
 
-fn estimated(estimate: &CostEstimate) -> Value {
+/// The estimate in the spelling `ravel_explain_query` uses: a figure the
+/// estimator cannot bound is `null` and named in `unbounded`, never a zero
+/// that would read as an estimate of zero.
+fn estimated(estimate: &CostEstimate, unbounded: &[EstimateComponent]) -> Value {
+    let bounded = |component: EstimateComponent, figure: u64| {
+        (!unbounded.contains(&component)).then_some(figure)
+    };
     json!({
-        "bytes_scanned": estimate.estimated_store_bytes,
-        "store_requests": estimate.estimated_requests,
+        "bytes_scanned": bounded(EstimateComponent::StoreBytes, estimate.estimated_store_bytes),
+        "store_requests": bounded(EstimateComponent::Requests, estimate.estimated_requests),
         "segments_read": estimate.segments,
-        "decompressed_bytes": estimate.estimated_decompressed_bytes,
+        "decompressed_bytes": bounded(
+            EstimateComponent::DecompressedBytes,
+            estimate.estimated_decompressed_bytes,
+        ),
+        "unbounded": unbounded
+            .iter()
+            .map(|component| component.field_name())
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -962,7 +980,7 @@ mod tests {
                 accounting: &accounting,
                 estimate: &estimate,
                 phases: Some(&phases),
-                estimate_is_upper_envelope: true,
+                unbounded: &[],
             },
         );
 
@@ -978,6 +996,43 @@ mod tests {
             assert_eq!(split[phase.name()]["wire_bytes"], json!(0));
         }
         assert!(envelope.budget.estimate_is_upper_envelope);
+        assert_eq!(envelope.budget.estimate.0["unbounded"], json!([]));
+    }
+
+    /// A component the estimator cannot bound is reported as unknown: `null`
+    /// rather than the structural zero the estimate carries, named in
+    /// `unbounded`, and the estimate is not called an upper envelope. The
+    /// bounded figures beside it are reported as they are.
+    ///
+    /// FLIP: `estimate_is_upper_envelope: true` regardless of `unbounded`
+    /// fails the flag; rendering the raw figure fails the `null`.
+    #[test]
+    fn an_unbounded_component_is_unknown_and_not_an_upper_envelope() {
+        let budgets = budgets();
+        let accounting = QueryAccountingSnapshot::default();
+        let mut estimate = ravel_query::http::service::zero_estimate();
+        estimate.estimated_requests = 4;
+        let mut envelope = base("logs", "logs", &budgets);
+
+        spend(
+            &mut envelope,
+            &budgets,
+            &Spend {
+                accounting: &accounting,
+                estimate: &estimate,
+                phases: None,
+                unbounded: &[EstimateComponent::DecompressedBytes],
+            },
+        );
+
+        let estimated = &envelope.budget.estimate.0;
+        assert_eq!(estimated["decompressed_bytes"], Value::Null);
+        assert_eq!(estimated["store_requests"], json!(4));
+        assert_eq!(
+            estimated["unbounded"],
+            json!(["estimated_decompressed_bytes"])
+        );
+        assert!(!envelope.budget.estimate_is_upper_envelope);
     }
 
     /// An operation that reports its spend in the exemplars surface's own
