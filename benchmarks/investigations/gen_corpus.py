@@ -462,10 +462,20 @@ def main(argv):
         in_lists["trace_id"][str(size)] = ids
         answers[f"in_trace_id.{size}.spans"] = answer(got * spt, requested=size * spt)
         answers[f"in_trace_id.{size}.logs"] = answer(got * lpt, requested=size * lpt)
-    pool = [r for r in range(n_log_rows) if r != present_row]
+    # Log rows other than the planted request_id row. The draw indexes the
+    # pool of the other rows without building it (a list of every row would
+    # hold traces x logs_per_trace ints, 100,000,000 at the real lane's
+    # scale): index j of that pool is row j below the planted row and row
+    # j + 1 at or above it, which is what the pool list held, so the random
+    # stream and the drawn rows are the same as before for every seed.
+    pool_size = n_log_rows - (1 if 0 <= present_row < n_log_rows else 0)
+
+    def pool_row(j):
+        return j if present_row < 0 or j < present_row else j + 1
+
     for size in IN_SIZES:
-        got = min(size, len(pool))
-        rows = rng.sample(pool, got)
+        got = min(size, pool_size)
+        rows = [pool_row(j) for j in rng.sample(range(pool_size), got)]
         drawn[("request_id", size)] = rows
         ids = sorted(request_id_of(tids[r // lpt], r % lpt) for r in rows)
         in_lists["request_id"][str(size)] = ids
@@ -482,10 +492,10 @@ def main(argv):
             i = rng.randrange(args.traces)
         control_extra["trace_id"] = tids[i]
     taken = set(drawn[("request_id", top)])
-    if len(taken) < len(pool):
-        r = pool[rng.randrange(len(pool))]
+    if len(taken) < pool_size:
+        r = pool_row(rng.randrange(pool_size))
         while r in taken:
-            r = pool[rng.randrange(len(pool))]
+            r = pool_row(rng.randrange(pool_size))
         control_extra["request_id"] = request_id_of(tids[r // lpt], r % lpt)
     got = len(in_lists["trace_id"][str(top)]) + (control_extra["trace_id"] is not None)
     answers[f"in_trace_id.{top + 1}.spans"] = answer(got * spt, requested=(top + 1) * spt)

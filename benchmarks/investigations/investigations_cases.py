@@ -340,6 +340,24 @@ class Corpus(unittest.TestCase):
             self.assertEqual(sum(counts.get(i, 0) for i in ids), int(size))
             self.assertEqual(t["answers"][f"in_request_id.{size}"]["rows"], int(size))
 
+    def test_request_id_lists_exclude_the_planted_row_in_a_tiny_corpus(self):
+        # One trace, five log rows, so every list above size 4 must take all
+        # four unplanted rows and the planted row (drawn with probability
+        # 4 in 5 by a plain sample of the range) must be redrawn, not kept.
+        # FLIP: dropping the pool_row mapping (sampling range(n_log_rows)
+        # directly) puts the present id in the 1,000 list about four runs in
+        # five; building the pool as a list instead would hold 100,000,000
+        # ints at the real lane's scale.
+        with tempfile.TemporaryDirectory() as d:
+            t, rows = gen(d, traces=1, hours=1, seed=11)
+        present = t["request_id"]["present"]
+        for size, ids in t["in_lists"]["request_id"].items():
+            self.assertEqual(len(ids), min(int(size), 4), size)
+            self.assertEqual(len(set(ids)), len(ids), size)
+            self.assertNotIn(present, ids, size)
+        self.assertEqual(len(rows["logs"]), 5)
+        self.assertEqual(sum(1 for r in rows["logs"] if r["request_id"] == present), 1)
+
     def test_trace_id_in_lists_recount(self):
         t = self.truth
         for size, ids in t["in_lists"]["trace_id"].items():
@@ -2650,6 +2668,27 @@ class Box(Workdir):
         self.assertNotIn("maintain compact-tenant", text)
         self.assertIn("needle-blocks", "\n".join(b["state:unfolded"]))
         self.assertIn("erase submit", "\n".join(b["state:erasure_in_flight"]))
+        self.assertEqual(self.steps(text)[-2:], ["evaluate", "finish"])
+
+    def test_s3_dry_run_records_mixed_not_run_when_no_fold_ran(self):
+        # run.toml may list mixed without its fold states (load_config checks
+        # names only), and the fold states can also be skipped by their own
+        # deadline checks while the mixed wait still fits. Either way no fold
+        # ran, so FOLD_HOUR is empty and the mixed state is recorded not-run
+        # before the wait; evaluate and finish still follow.
+        # FLIP: without the check, wait_next_hour reads the unset FOLD_HOUR,
+        # and under set -u the run ends there with status 1, so on_exit writes
+        # FAILED and neither evaluate nor the upload runs.
+        code, text = run_sh("s3", self.example_toml(
+            ("states = [\"unfolded\", \"folded_no_leaves\", \"folded_leaves\", \"mixed\", \"compaction_in_flight\",\n"
+             "          \"erasure_in_flight\", \"many_parts_744\", \"many_parts_2160\"]",
+             "states = [\"unfolded\", \"mixed\"]")), self.path("out"))
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.deadline_lines(text), [
+            "NOT-RUN mixed: no fold ran before the mixed state (its fold states were skipped or not listed), "
+            "so the tail hour has no sealed hour to follow",
+        ])
+        self.assertNotIn("wait until the ingest hour", text)
         self.assertEqual(self.steps(text)[-2:], ["evaluate", "finish"])
 
     def test_s3_dry_run_per_state_estimate(self):
