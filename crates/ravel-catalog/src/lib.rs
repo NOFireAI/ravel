@@ -129,12 +129,13 @@ pub use snapshot_format::{
 pub use tenant_config::{
     BloomScope, ClusteringBucketWidth, ClusteringKey, ClusteringKeyState, DeclaredColumnType,
     DeclaredTypedColumn, FIXED_LOGS_SQL_COLUMNS, MAX_CLUSTERING_KEY_COLUMNS,
-    MAX_KEY_INDEX_COLUMN_KEY_LEN, MAX_KEY_INDEX_COLUMNS, SetOutcome as TenantConfigSetOutcome,
+    MAX_KEY_INDEX_COLUMN_KEY_LEN, MAX_KEY_INDEX_COLUMNS, RESERVED_COLUMN_PREFIX,
+    SetOutcome as TenantConfigSetOutcome,
     StorageLayoutConfigError, StorageLayoutWrite, StoredBloomScope, StoredClusteringKey,
     StoredKeyIndex, TENANT_CONFIG_FORMAT_VERSION, TENANT_CONFIG_KEY_INDEX_WRITER_VERSION,
     TENANT_CONFIG_MAX_READ_VERSION, TENANT_CONFIG_MIN_READ_VERSION,
     TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION, TenantConfig, TenantConfigError,
     TenantLifecycleState, TypedAttrColumnError, config_key, read_config, read_config_values,
     resolve_declared_columns, resolve_retention_window, set_tenant_config,
-    validate_typed_attr_columns,
+    validate_stored_typed_attr_columns, validate_typed_attr_columns,
 };
