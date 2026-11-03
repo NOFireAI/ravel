@@ -1127,6 +1127,9 @@ const CONTAINS_P_SQL: &str = "SELECT ts, p, c FROM logs WHERE c LIKE '%x%' ORDER
 struct Verdict {
     estimate: u64,
     served: bool,
+    /// `deferredSetEstimatePartial`: the verdict stopped before reading
+    /// every segment.
+    partial: bool,
     /// Plan-phase requests plus plan-phase read-cache hits: the segments
     /// whose directories the verdict read.
     directory_reads: u64,
@@ -1169,6 +1172,7 @@ async fn verdict_of(
             .deferred_set_estimate_bytes
             .expect("a Contains scan reports its estimate"),
         served: s.deferred_served,
+        partial: s.deferred_set_estimate_partial,
         directory_reads: requests(plan) + plan.cache_hits,
         plan_decompressed_bytes: plan.decompressed_bytes,
     }
@@ -1308,5 +1312,194 @@ async fn a_segment_added_between_runs_is_the_only_one_the_verdict_reads() {
         second.estimate,
         first.estimate + added_alone.estimate,
         "the second estimate is the first plus the added segment's own"
+    );
+}
+
+/// The first object of the many-segment fixture. Every object from here on
+/// carries timestamps of the same width, so every segment's estimate is the
+/// same and a running sum lands on exact multiples of it.
+const MANY_FIRST: u64 = 10;
+
+/// Objects in the many-segment fixture: three times the read-cache
+/// executor's 8 partitions, so a verdict that stops early leaves reads
+/// unissued.
+const MANY: u64 = 24;
+
+/// Segments summed before the over-cap verdict stops: the cap is this many
+/// segments' estimate, so the sum first exceeds 0.95 of the cap here, one
+/// segment before it exceeds the cap itself.
+const STOP_AFTER: u64 = 10;
+
+fn many_seqs() -> std::ops::RangeInclusive<u64> {
+    MANY_FIRST..=MANY_FIRST + MANY - 1
+}
+
+/// The one estimate every segment of the many-segment fixture reports, each
+/// read alone through a fresh cache.
+async fn many_segment_estimate(t: &TenantId) -> u64 {
+    let mut estimates = Vec::new();
+    for seq in many_seqs() {
+        let alone = fast_store(t, seq..=seq).await;
+        let v = verdict_of(
+            &executor(&alone, Some(fresh_cache())),
+            &alone,
+            t,
+            CONTAINS_SQL,
+        )
+        .await;
+        assert_eq!(v.directory_reads, 1, "seq {seq}");
+        estimates.push(v.estimate);
+    }
+    assert!(
+        estimates.windows(2).all(|w| w[0] == w[1]),
+        "every segment estimates the same: {estimates:?}"
+    );
+    estimates[0]
+}
+
+/// ADR-3326, serve-if-fits amendment, implementation note: once the running
+/// estimate is over 0.95 of the cap the fast-path verdict stops reading. The
+/// cap is [`STOP_AFTER`] segments' estimate, so the verdict sums exactly that
+/// many segments, reports their sum as a partial estimate (over 0.95 of the
+/// cap, a lower bound of the scan's decoded set), serves nothing, and reads
+/// fewer directories than the [`MANY`] relevant segments, cold.
+///
+/// Seen failing against an early stop at the bare cap: the estimate reads 11
+/// segments' worth where 10 are expected.
+#[tokio::test]
+async fn an_over_cap_fast_path_verdict_stops_reading_once_past_the_threshold() {
+    let t = tenant();
+    let e = many_segment_estimate(&t).await;
+    let store = fast_store(&t, many_seqs()).await;
+    let cap = STOP_AFTER * e;
+    let cache = Arc::new(DecodedColumnCache::new(
+        cap,
+        Some(Arc::new(MemoryBudget::unlimited())),
+    ));
+    let v = verdict_of(
+        &executor_with(&store, Some(cache), true, None),
+        &store,
+        &t,
+        CONTAINS_SQL,
+    )
+    .await;
+    assert!(
+        v.directory_reads < MANY,
+        "stopped before reading every segment: {v:?}"
+    );
+    assert!(!v.served, "{v:?}");
+    assert!(v.partial, "{v:?}");
+    assert!(u128::from(v.estimate) * 20 > u128::from(cap) * 19, "{v:?}");
+    assert_eq!(
+        v.estimate, cap,
+        "the sum of the segments read before the stop"
+    );
+}
+
+/// The fitting half of the early stop: a verdict whose sum never passes the
+/// threshold reads every segment's directories cold, reports no partial
+/// flag, and its estimate is the sum of every segment's own.
+#[tokio::test]
+async fn a_fitting_fast_path_verdict_reads_and_sums_every_segment() {
+    let t = tenant();
+    let e = many_segment_estimate(&t).await;
+    let store = fast_store(&t, many_seqs()).await;
+    let v = verdict_of(
+        &executor_with(&store, Some(fresh_cache()), true, None),
+        &store,
+        &t,
+        CONTAINS_SQL,
+    )
+    .await;
+    assert_eq!(
+        (v.directory_reads, v.estimate, v.served, v.partial),
+        (MANY, MANY * e, true, false)
+    );
+}
+
+/// The cells of every data row of `batches`, trimmed, header dropped.
+fn rows_of(batches: &[datafusion::arrow::array::RecordBatch]) -> Vec<Vec<String>> {
+    pretty_format_batches(batches)
+        .expect("format")
+        .to_string()
+        .lines()
+        .filter(|line| line.starts_with('|'))
+        .skip(1)
+        .map(|line| {
+            line.trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+/// A `LIKE` scan with a `LIMIT` and no `ORDER BY`: three of the matching rows.
+const LIMIT_SQL: &str = "SELECT ts, d, c FROM logs WHERE c LIKE '%x%' LIMIT 3";
+
+/// ADR-3326, serve-if-fits amendment, implementation note: a fast-path scan
+/// with a `LIMIT` and no TopK makes no verdict. It reads no directory in the
+/// plan phase, reports no `deferredSetEstimateBytes` and serves nothing, and
+/// returns three distinct rows of the matching set.
+///
+/// Seen failing against the verdict installed for every fast-path scan: the
+/// estimate reads `Some(..)` where `None` is expected.
+#[tokio::test]
+async fn a_plain_limit_fast_path_scan_makes_no_verdict() {
+    let t = tenant();
+    let store = fast_store(&t, many_seqs()).await;
+    let all = executor(&store, None)
+        .execute(t.hash(), &request(CONTAINS_SQL))
+        .await
+        .expect("uncached statement executes");
+    let all = rows_of(all.output.batches());
+    let got = executor_with(&store, Some(fresh_cache()), true, None)
+        .execute(t.hash(), &request(LIMIT_SQL))
+        .await
+        .expect("cached statement executes");
+    let rows = rows_of(got.output.batches());
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    for row in &rows {
+        assert!(all.contains(row), "{row:?} matches");
+    }
+    let mut distinct = rows.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), 3, "{rows:?}");
+    let s = got
+        .stats
+        .decoded_cache
+        .expect("decodedCache stats with a cache")
+        .counters;
+    assert_eq!(s.deferred_set_estimate_bytes, None);
+    assert!(!s.deferred_served && !s.deferred_set_estimate_partial);
+    let plan = &got.phase_accounting.plan;
+    assert_eq!(
+        (requests(plan), plan.cache_hits),
+        (0, 0),
+        "no plan-phase directory read"
+    );
+}
+
+/// The TopK half of the `LIMIT` skip: `ORDER BY ts LIMIT 3` keeps its verdict,
+/// reading and summing every segment cold as a scan with no `LIMIT` does.
+///
+/// Seen failing against a skip that also covers TopK scans: `verdict_of`
+/// finds no estimate.
+#[tokio::test]
+async fn an_order_by_limit_fast_path_scan_keeps_its_verdict() {
+    let t = tenant();
+    let e = many_segment_estimate(&t).await;
+    let store = fast_store(&t, many_seqs()).await;
+    let v = verdict_of(
+        &executor_with(&store, Some(fresh_cache()), true, None),
+        &store,
+        &t,
+        "SELECT ts, d, c FROM logs WHERE c LIKE '%x%' ORDER BY ts LIMIT 3",
+    )
+    .await;
+    assert_eq!(
+        (v.directory_reads, v.estimate, v.served, v.partial),
+        (MANY, MANY * e, true, false)
     );
 }

@@ -184,8 +184,11 @@ pub fn cache_json(cache: &StatementCacheStats) -> Json {
 /// own; `residentBytes` is the process-wide cache size when it finished, and
 /// the two pressure figures are the budget evictor's work over the statement's
 /// lifetime (see [`DecodedCacheStats`]). `deferredServed` is always present;
-/// `deferredSetEstimateBytes` only when a scan with a `Contains` arm ran its
-/// plan pass (ADR-3326, serve-if-fits amendment).
+/// `deferredSetEstimateBytes` only when a scan with a `Contains` arm made a
+/// serve-if-fits verdict, in its plan pass or on the whole-segment fast path
+/// (`compute_fast_path_verdict`), and `deferredSetEstimatePartial: true` only
+/// when such a scan stopped reading directories early, making that estimate a
+/// lower bound (ADR-3326, serve-if-fits amendment).
 pub fn decoded_cache_json(stats: &DecodedCacheStats) -> Json {
     let mut out = json!({
         "hits": stats.counters.hits,
@@ -204,6 +207,12 @@ pub fn decoded_cache_json(stats: &DecodedCacheStats) -> Json {
         out.as_object_mut(),
     ) {
         map.insert("deferredSetEstimateBytes".into(), json!(estimate));
+    }
+    if let (true, Some(map)) = (
+        stats.counters.deferred_set_estimate_partial,
+        out.as_object_mut(),
+    ) {
+        map.insert("deferredSetEstimatePartial".into(), json!(true));
     }
     out
 }
@@ -279,10 +288,11 @@ mod tests {
         assert_eq!(total_requests, snapshot.pooled().total_s3_requests());
     }
 
-    /// `decoded_cache_json` renders exactly the eleven ADR-3326 keys for a
-    /// statement whose scan has a `Contains` arm, each carrying its own
-    /// distinct source figure, and the ten without
-    /// `deferredSetEstimateBytes` for one with no estimate.
+    /// `decoded_cache_json` renders exactly the twelve ADR-3326 keys for a
+    /// statement whose scan has a `Contains` arm and stopped its estimate
+    /// early, each carrying its own distinct source figure, and the ten
+    /// without `deferredSetEstimateBytes` or `deferredSetEstimatePartial` for
+    /// one with no estimate.
     #[test]
     fn decoded_cache_json_names_every_field_exactly_once() {
         let mut stats = DecodedCacheStats {
@@ -296,6 +306,7 @@ mod tests {
                 unvalidated_refusals: 11,
                 deferred_set_estimate_bytes: Some(10),
                 deferred_served: true,
+                deferred_set_estimate_partial: true,
             },
             resident_bytes: 6,
             pressure: ravel_logseg::decoded_cache::PressureSnapshot {
@@ -317,8 +328,13 @@ mod tests {
                 "pressureFreedBytes": 8,
                 "deferredServed": true,
                 "deferredSetEstimateBytes": 10,
+                "deferredSetEstimatePartial": true,
             })
         );
+        stats.counters.deferred_set_estimate_partial = false;
+        let whole = decoded_cache_json(&stats);
+        assert_eq!(whole.get("deferredSetEstimateBytes"), Some(&json!(10)));
+        assert_eq!(whole.get("deferredSetEstimatePartial"), None);
         stats.counters.deferred_set_estimate_bytes = None;
         stats.counters.deferred_served = false;
         assert_eq!(

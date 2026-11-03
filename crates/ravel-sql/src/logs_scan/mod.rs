@@ -3215,6 +3215,7 @@ impl ExecutionPlan for LogsScanExec {
                         Arc::clone(&ctx),
                         Arc::clone(&self.segments),
                         self.target_partitions,
+                        self.fetch.is_some() && self.active_topk().is_none(),
                         blocks.plan_init_elapsed.clone(),
                     ) {
                         Some(verdict) => LogScanState::Planning(verdict),
