@@ -154,9 +154,10 @@ fn published_accounting(stats: &Value) -> Option<Value> {
 /// byte cap measures the envelope the caller will actually receive, then
 /// D4's byte-cap algorithm.
 ///
-/// `Envelope::fit` reports only what its own byte cap dropped (it resets
-/// `rows_omitted` when the envelope already fits), so the row cap's own
-/// count is folded back in afterwards. No operation here has a total order
+/// The row cap's own count goes in through `Envelope::fit_row_capped`, which
+/// folds it into `rows_omitted` and sets `row_cap_hit` before it measures, so
+/// the byte cap holds for the envelope with both written and with the status
+/// `finish` then derives from them. No operation here has a total order
 /// to page over, so no cursor is minted and the capped status is
 /// `ok_bounded`.
 ///
@@ -182,9 +183,7 @@ pub(crate) fn finish(mut envelope: Envelope, budgets: &McpEffectiveBudgets) -> E
     let row_cap_omitted = envelope.data.rows.len().saturating_sub(max_rows) as u64;
     envelope.data.rows.truncate(max_rows);
 
-    let mut fitted = envelope.fit(budgets.max_response_bytes);
-    fitted.presentation.rows_omitted += row_cap_omitted;
-    fitted.presentation.row_cap_hit |= row_cap_omitted > 0;
+    let mut fitted = envelope.fit_row_capped(budgets.max_response_bytes, row_cap_omitted);
     fitted.data.row_count = produced_rows;
     fitted.finish(false)
 }
@@ -606,6 +605,61 @@ mod tests {
 
     fn budgets() -> McpEffectiveBudgets {
         McpRequestBudgets::default().clamp(&EngineConfig::default(), &McpBudgetConfig::default())
+    }
+
+    /// A row-capped envelope packed right up to the byte cap stays inside it
+    /// once `finish` has written the row cap's count, `row_cap_hit`, the
+    /// `ok_bounded` status they make, and the identity warnings. The sweep is
+    /// the widest envelope the byte cap leaves alone, the 16 below it, and
+    /// the narrowest it cuts.
+    ///
+    /// FLIP: fitting first and folding the row cap in afterward puts the
+    /// widest of these 8 B over the cap: `rows_omitted` goes from `0` to `12`
+    /// and the status from `ok` to `ok_bounded`, nine bytes against one of
+    /// slack.
+    #[test]
+    fn a_row_capped_envelope_at_its_byte_cap_finishes_inside_it() {
+        let mut budgets = budgets();
+        budgets.max_rows = 1;
+        budgets.max_response_bytes = ravel_mcp::budget::MAX_RESPONSE_BYTES_FLOOR;
+        let cap = budgets.max_response_bytes as usize;
+        let run_with = |len: usize| {
+            let mut envelope = base("metrics", "samples", &budgets);
+            envelope.visibility.resolved_no_segments = true;
+            envelope.data.columns = vec![Column {
+                name: "value".to_string(),
+                r#type: "Utf8".to_string(),
+            }];
+            envelope.data.rows = (0..13).map(|_| vec![Cell::Str("x".repeat(len))]).collect();
+            envelope.data.row_count = 13;
+            finish(envelope, &budgets)
+        };
+        let (mut lo, mut hi) = (0usize, cap);
+        assert!(!run_with(lo).presentation.bytes_cap_hit);
+        assert!(run_with(hi).presentation.bytes_cap_hit);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if run_with(mid).presentation.bytes_cap_hit {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let mut widest = 0;
+        for len in lo - 16..=hi {
+            let finished = run_with(len);
+            assert_eq!(finished.status, Status::OkBounded, "{len}");
+            assert!(finished.presentation.row_cap_hit, "{len}");
+            assert_eq!(finished.presentation.rows_omitted, 12, "{len}");
+            assert_eq!(finished.data.row_count, 13, "{len}");
+            assert_eq!(finished.data.rows.len(), 1, "{len}");
+            let size = serde_json::to_vec(&finished)
+                .expect("an envelope serializes")
+                .len();
+            assert!(size <= cap, "len {len}: {size} B, over the {cap} B cap");
+            widest = widest.max(size);
+        }
+        assert!(widest + 16 >= cap, "the sweep never came near the cap");
     }
 
     fn labels(name: &str) -> LabelSet {

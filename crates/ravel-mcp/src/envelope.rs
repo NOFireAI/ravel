@@ -1257,7 +1257,29 @@ impl Envelope {
     /// it adds afterward; reserving that room here, once, is what keeps the
     /// envelope `finish` returns inside the cap it reports, without `finish`
     /// having to re-measure or re-cut anything.
-    pub fn fit(mut self, requested_max_response_bytes: u64) -> Envelope {
+    ///
+    /// `fit` also measures the envelope under the status `finish` will give
+    /// it (the widest one, `ok_bounded`, whenever a cap stopped the result),
+    /// so the status change `finish` makes cannot push the envelope past the
+    /// cap either. A caller that applied a row cap of its own before calling
+    /// this uses [`fit_row_capped`](Self::fit_row_capped) instead, so that
+    /// count and `row_cap_hit` are inside what is measured too.
+    pub fn fit(self, requested_max_response_bytes: u64) -> Envelope {
+        self.fit_row_capped(requested_max_response_bytes, 0)
+    }
+
+    /// [`fit`](Self::fit) for an envelope whose caller already dropped
+    /// `row_cap_omitted` rows to its own `max_rows`. That count is folded
+    /// into `presentation.rows_omitted`, and `row_cap_hit` is set when it is
+    /// positive, before anything is measured, so the envelope `fit` packs
+    /// under the cap is the one the caller returns. Writing either after
+    /// `fit` adds bytes `fit` never measured: the count's digits, and the
+    /// `ok` to `ok_bounded` status change `row_cap_hit` makes in `finish`.
+    pub fn fit_row_capped(
+        mut self,
+        requested_max_response_bytes: u64,
+        row_cap_omitted: u64,
+    ) -> Envelope {
         let cursor_len = self.cursor_serialized_len();
         let mut cursor_dropped_over_bound = false;
         if cursor_len > CURSOR_BOUND {
@@ -1293,32 +1315,42 @@ impl Envelope {
         self.presentation.floor_applied = requested_max_response_bytes < MAX_RESPONSE_BYTES_FLOOR;
         let cap = fit_cap(requested_max_response_bytes);
 
+        self.presentation.row_cap_hit |= row_cap_omitted > 0;
+        self.presentation.bytes_cap_hit = false;
+        self.presentation.rows_omitted = row_cap_omitted;
+        self.presentation.cells_truncated = 0;
+        let caller_status = self.status;
+        self.status = self.finished_status_bound(false);
         if serialized_len(&self) <= cap {
-            self.presentation.bytes_cap_hit = false;
-            self.presentation.rows_omitted = 0;
-            self.presentation.cells_truncated = 0;
+            self.status = caller_status;
             return self;
         }
         self.presentation.bytes_cap_hit = true;
+        self.status = self.finished_status_bound(true);
 
         // Measure the fixed part and every row's own serialized size once
         // each, rather than re-serializing the whole envelope on every
         // dropped row: `rows_fitting_prefix` turns those measurements into
         // the longest kept prefix with one linear scan.
+        // The fixed part is measured with `rows_omitted` at the largest value
+        // it can end at (every row dropped), so the count's own digits are
+        // inside it whatever prefix is kept.
         let row_lens: Vec<usize> = self.data.rows.iter().map(entry_serialized_len).collect();
         let saved_rows = std::mem::take(&mut self.data.rows);
+        self.presentation.rows_omitted = row_cap_omitted.saturating_add(row_lens.len() as u64);
         let fixed = serialized_len(&self);
         self.data.rows = saved_rows;
 
         let kept = rows_fitting_prefix(fixed, cap, &row_lens);
-        let mut rows_omitted = (row_lens.len() - kept) as u64;
+        let mut rows_omitted = row_cap_omitted.saturating_add((row_lens.len() - kept) as u64);
         self.data.rows.truncate(kept);
         self.presentation.rows_omitted = rows_omitted;
 
-        // `rows_fitting_prefix`'s model is exact for this envelope: `rows`
-        // serializes as a plain JSON array with one comma between adjacent
-        // elements and no trailing separator, and no other field's
-        // serialized size depends on how many rows are kept (`row_count` is
+        // `rows_fitting_prefix`'s model is an upper bound for this envelope:
+        // `rows` serializes as a plain JSON array with one comma between
+        // adjacent elements and no trailing separator, and the one other
+        // field whose size depends on how many rows are kept,
+        // `rows_omitted`, was measured at its largest value (`row_count` is
         // set independently by the caller, not derived here). So this
         // confirming call should never find the envelope still over `cap`;
         // it exists as a defensive check, and the existing shorten-then-clear
@@ -1334,7 +1366,23 @@ impl Envelope {
             // what is returned was truncated.
             self.presentation.cells_truncated = 0;
         }
+        self.status = caller_status;
         self
+    }
+
+    /// The widest status [`finish`](Self::finish) can give this envelope,
+    /// which is what [`fit_row_capped`](Self::fit_row_capped) measures under.
+    /// `finish` reports `error` for any envelope carrying a failure, and
+    /// otherwise `ok_page` or `ok_bounded` once a cap took something;
+    /// `ok_bounded` is the wider of those two.
+    fn finished_status_bound(&self, bytes_cap_took_something: bool) -> Status {
+        if self.status == Status::Error || self.failure.is_some() {
+            Status::Error
+        } else if self.presentation.row_cap_hit || bytes_cap_took_something {
+            Status::OkBounded
+        } else {
+            Status::Ok
+        }
     }
 
     /// Cuts the cells of the one kept row until the whole envelope fits
@@ -1587,12 +1635,13 @@ mod tests {
     /// after the first row and 300,872 after the second (one more byte for
     /// the comma between them). `fit` packs rows against its cap minus
     /// [`IDENTITY_WARNINGS_ALLOWANCE`] (the room it reserves for
-    /// [`Envelope::finish`]'s identity warnings), so the requested cap here
-    /// is that total plus the allowance: internally `fit` targets exactly
-    /// 300,872 again, keeps exactly those two rows and omits the other two,
-    /// and the fitted envelope's real serialized size lands on that same
-    /// total, unaffected by the reservation because `finish` is never called
-    /// in this test.
+    /// [`Envelope::finish`]'s identity warnings), and measures them under
+    /// `ok_bounded`, the status `finish` gives an envelope the byte cap cut,
+    /// which is 8 B wider than the `ok` it returns with. So the requested cap
+    /// here is that total plus 8 plus the allowance: internally `fit` keeps
+    /// exactly those two rows and omits the other two, and the fitted
+    /// envelope's real serialized size lands on that same total, unaffected
+    /// by either reservation because `finish` is never called in this test.
     #[test]
     fn row_prefix_is_chosen_from_measured_sizes() {
         let sizes = [150_000usize, 150_000, 150_000, 150_000];
@@ -1602,7 +1651,7 @@ mod tests {
             .map(|&n| vec![Cell::Str("a".repeat(n))])
             .collect();
 
-        let fitted = envelope.fit(300_872 + IDENTITY_WARNINGS_ALLOWANCE as u64);
+        let fitted = envelope.fit(300_872 + 8 + IDENTITY_WARNINGS_ALLOWANCE as u64);
 
         assert_eq!(fitted.presentation.rows_omitted, 2);
         assert_eq!(fitted.data.rows.len(), 2);
@@ -1700,23 +1749,25 @@ mod tests {
     /// The single-column envelopes below all resolve to the same per-cell
     /// budget (one column, the same fixed part), so the kept cell serializes
     /// to the same exact size in each: `cap - fixed_part - 8` rounded down at
-    /// a character boundary of the source body. Pinning it is what makes the
-    /// three tests detect a cut measured in source bytes: such a cut either
-    /// overruns the cap or, once the re-measure loop has clamped it, lands on
-    /// the 256 B floor instead of this figure.
-    const KEPT_CELL_SERIALIZED_LEN: usize = 261_000;
-    /// The whole envelope's exact serialized size for those same cases.
-    const FITTED_ENVELOPE_SERIALIZED_LEN: usize = 261_897;
+    /// a character boundary of the source body, with the fixed part measured
+    /// under `ok_bounded`. Pinning it is what makes the three tests detect a
+    /// cut measured in source bytes: such a cut either overruns the cap or,
+    /// once the re-measure loop has clamped it, lands on the 256 B floor
+    /// instead of this figure.
+    const KEPT_CELL_SERIALIZED_LEN: usize = 260_992;
+    /// The whole envelope's exact serialized size for those same cases, with
+    /// the `ok` status `fit` hands back.
+    const FITTED_ENVELOPE_SERIALIZED_LEN: usize = 261_889;
 
     /// `\n ` alternates a character that serializes to two bytes with one
-    /// that serializes to one, and that is what makes the kept cell one byte
-    /// wider here than for the pure quote body above. A cut lands on a source
-    /// character boundary, so a body of nothing but two-byte escapes can only
-    /// reach an even serialized length; a mixed body can also reach the odd
-    /// one just below the budget. The two constants below are not required to
-    /// agree, and today they do not.
-    const KEPT_CONTROL_CELL_SERIALIZED_LEN: usize = 261_001;
-    const FITTED_CONTROL_ENVELOPE_SERIALIZED_LEN: usize = 261_898;
+    /// that serializes to one. A cut lands on a source character boundary,
+    /// so a body of nothing but two-byte escapes can only reach an even
+    /// serialized length, and this body only the lengths its three-byte pairs
+    /// and a trailing two-byte escape add up to. Which of those sits nearest
+    /// under the budget differs, so the two constants below are not required
+    /// to agree with the ones above; at today's budget they do.
+    const KEPT_CONTROL_CELL_SERIALIZED_LEN: usize = 260_992;
+    const FITTED_CONTROL_ENVELOPE_SERIALIZED_LEN: usize = 261_889;
 
     /// Serialized size of a 200-row page of one hex id column, every id at
     /// the 64-character bound: 13,801 B of rows (200 cells of 68 B, their
@@ -2938,5 +2989,100 @@ mod tests {
 
         assert_eq!(finished.status, Status::Error);
         assert_eq!(finished.presentation.cursor, None);
+    }
+
+    /// The largest `len` in `0..MAX_RESPONSE_BYTES_FLOOR` that `fits` holds
+    /// for, given it holds at 0, fails at the floor, and flips once.
+    fn last_fitting_len(fits: impl Fn(usize) -> bool) -> usize {
+        let (mut lo, mut hi) = (0usize, MAX_RESPONSE_BYTES_FLOOR as usize);
+        assert!(fits(lo) && !fits(hi), "no boundary in 0..{hi}");
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if fits(mid) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// 13 rows of `len` bytes each, cut to 1 by a caller's own row cap, with
+    /// every identity field unmeasured so `finish` adds its widest warnings.
+    fn row_capped(len: usize) -> Envelope {
+        let mut envelope = envelope_with_rows(13, |_| vec![Cell::Str("x".repeat(len))]);
+        envelope.visibility.resolved_no_segments = true;
+        envelope.data.rows.truncate(1);
+        envelope.fit_row_capped(MAX_RESPONSE_BYTES_FLOOR, 12)
+    }
+
+    /// An envelope packed right up to its byte cap with a row cap that fired
+    /// stays inside the cap once `finish` has written `ok_bounded` and the
+    /// identity warnings. The sweep covers the widest envelope the byte cap
+    /// leaves alone and the 16 below it, plus the narrowest it cuts.
+    ///
+    /// FLIP: fitting with `fit` and folding the 12 rows and `row_cap_hit` in
+    /// afterwards puts the widest of these 8 B over the cap: `rows_omitted`
+    /// goes from `0` to `12` (one byte) and the status from `ok` to
+    /// `ok_bounded` (eight), against one byte of slack in the identity
+    /// allowance.
+    #[test]
+    fn a_row_capped_envelope_at_its_byte_cap_finishes_inside_it() {
+        let last = last_fitting_len(|len| !row_capped(len).presentation.bytes_cap_hit);
+        let cap = MAX_RESPONSE_BYTES_FLOOR as usize;
+        let mut widest = 0;
+        for len in last - 16..=last + 1 {
+            let finished = row_capped(len).finish(false);
+            assert_eq!(finished.status, Status::OkBounded, "{len}");
+            assert!(finished.presentation.row_cap_hit, "{len}");
+            assert_eq!(finished.presentation.rows_omitted, 12, "{len}");
+            assert_eq!(finished.data.rows.len(), 1, "{len}");
+            let size = serialized_len(&finished);
+            assert!(size <= cap, "len {len}: {size} B, over the {cap} B cap");
+            widest = widest.max(size);
+        }
+        assert!(widest + 16 >= cap, "the sweep never came near the cap");
+    }
+
+    /// Two rows, the second of 10 bytes, the first of `len`: the byte cap
+    /// drops the second once the first fills the envelope.
+    fn byte_capped(len: usize) -> Envelope {
+        let mut envelope = envelope_with_rows(2, |i| {
+            vec![Cell::Str("x".repeat(if i == 0 { len } else { 10 }))]
+        });
+        envelope.visibility.resolved_no_segments = true;
+        envelope.fit(MAX_RESPONSE_BYTES_FLOOR)
+    }
+
+    /// The same bound with no row cap at all: the byte cap dropping a row is
+    /// what turns `ok` into `ok_bounded`, after `fit` measured. The sweep is
+    /// the widest envelope whose one row is kept whole and the 7 below it;
+    /// any narrower and both rows fit.
+    ///
+    /// FLIP: measuring under the caller's `ok` puts the widest of these 7 B
+    /// over the cap.
+    #[test]
+    fn a_byte_capped_envelope_at_its_cap_finishes_inside_it() {
+        let last = last_fitting_len(|len| byte_capped(len).presentation.cells_truncated == 0);
+        let cap = MAX_RESPONSE_BYTES_FLOOR as usize;
+        let mut widest = 0;
+        for len in last - 7..=last {
+            let finished = byte_capped(len).finish(false);
+            assert_eq!(finished.status, Status::OkBounded, "{len}");
+            assert_eq!(finished.presentation.rows_omitted, 1, "{len}");
+            let size = serialized_len(&finished);
+            assert!(size <= cap, "len {len}: {size} B, over the {cap} B cap");
+            widest = widest.max(size);
+        }
+        assert!(widest + 16 >= cap, "the sweep never came near the cap");
+    }
+
+    /// `fit` hands back the status it was given: the widest status is what
+    /// it measures under, not what it writes.
+    #[test]
+    fn fit_leaves_the_status_to_finish() {
+        let fitted = row_capped(MAX_RESPONSE_BYTES_FLOOR as usize);
+        assert!(fitted.presentation.bytes_cap_hit);
+        assert_eq!(fitted.status, Status::Ok);
     }
 }

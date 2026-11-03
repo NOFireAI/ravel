@@ -249,9 +249,7 @@ fn finish(
         "a parent was not returned; raise max_rows (up to 5,000) or narrow time_range",
     ));
 
-    let mut fitted = envelope.fit(ctx.budgets.max_response_bytes);
-    fitted.presentation.rows_omitted += row_cap_omitted;
-    fitted.presentation.row_cap_hit |= row_cap_omitted > 0;
+    let mut fitted = envelope.fit_row_capped(ctx.budgets.max_response_bytes, row_cap_omitted);
     fitted.data.row_count = produced;
 
     let shown = &fitted.presentation;
@@ -544,6 +542,58 @@ mod tests {
             serialized_len(&envelope)
         );
         assert_eq!(actions(&envelope), [RAISE_STEP]);
+    }
+
+    /// A row-capped trace packed right up to the byte cap stays inside it
+    /// once the row cap's count, `row_cap_hit` and the `ok_bounded` status
+    /// they make are written. The sweep is the widest response the byte cap
+    /// leaves alone, the 16 below it, and the narrowest it cuts.
+    ///
+    /// FLIP: folding the row cap in after the fit does not fail here. The
+    /// fit measures the `widen_time_range` step, and a row-capped trace is
+    /// never complete, so that step is always removed afterward, which frees
+    /// more than the 8 B status change and the count's digits add.
+    #[test]
+    fn a_row_capped_trace_at_its_byte_cap_finishes_inside_it() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
+        ctx.budgets.max_rows = 1;
+        let ids: Vec<String> = (0..13).map(|n| format!("s{n:02}")).collect();
+        let run_with = |len: usize| {
+            let name = "x".repeat(len);
+            let rows: Vec<_> = ids
+                .iter()
+                .map(|id| (id.as_str(), None, name.as_str()))
+                .collect();
+            let mut port = spans(&rows);
+            port.visibility.resolved_no_segments = true;
+            call(port, untimed(), &ctx)
+        };
+        let cap = MAX_RESPONSE_BYTES_FLOOR as usize;
+        let (mut lo, mut hi) = (0usize, cap);
+        assert!(!run_with(lo).presentation.bytes_cap_hit);
+        assert!(run_with(hi).presentation.bytes_cap_hit);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if run_with(mid).presentation.bytes_cap_hit {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let mut widest = 0;
+        for len in lo - 16..=hi {
+            let envelope = run_with(len);
+            assert_eq!(envelope.status, Status::OkBounded, "{len}");
+            assert!(envelope.presentation.row_cap_hit, "{len}");
+            assert_eq!(envelope.presentation.rows_omitted, 12, "{len}");
+            assert_eq!(envelope.data.rows.len(), 1, "{len}");
+            let size = serialized_len(&envelope);
+            assert!(size <= cap, "len {len}: {size} B, over the {cap} B cap");
+            widest = widest.max(size);
+        }
+        assert!(widest + 256 >= cap, "the sweep never came near the cap");
     }
 
     /// A child that starts before its parent (clock skew) comes first in row
