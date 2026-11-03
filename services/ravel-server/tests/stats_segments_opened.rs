@@ -171,6 +171,17 @@ async fn get_trace(app: &Router, trace_hex: &str) -> Value {
 /// Writes one small RLOG object (no KEY_IDX) with a handful of records; `i`
 /// seeds the object's single distinguishing record.
 async fn publish_small_log(store: &dyn ObjectStoreBackend, seq: usize, status_code: i64) -> String {
+    publish_small_rlog(store, Signal::Logs, seq, status_code).await
+}
+
+/// [`publish_small_log`] under `signal`: the `alerts` and `audit` tables read
+/// the same RLOG layout from their own signal's keyspace.
+async fn publish_small_rlog(
+    store: &dyn ObjectStoreBackend,
+    signal: Signal,
+    seq: usize,
+    status_code: i64,
+) -> String {
     let tenant_hash = tenant().hash();
     let writer_id = Uuid::from_u128(3_745_000 + seq as u128);
     let mut writer = RlogWriter::new(
@@ -214,7 +225,7 @@ async fn publish_small_log(store: &dyn ObjectStoreBackend, seq: usize, status_co
     let bytes = writer.finish().expect("finish rlog object");
     let rec = record::build(NewCommitRecord {
         tenant_hash,
-        signal: Signal::Logs,
+        signal,
         shard: 0,
         writer_id,
         writer_epoch: 1,
@@ -241,6 +252,47 @@ async fn publish_small_log(store: &dyn ObjectStoreBackend, seq: usize, status_co
         .await
         .expect("publish log commit");
     key
+}
+
+/// Three small RLOG objects in the `Signal::Audit` keyspace.
+async fn audit_router() -> Router {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    for seq in 0..3 {
+        publish_small_rlog(store.as_ref(), Signal::Audit, seq, 400).await;
+    }
+    let catalog = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+    let executor = SqlExecutor::new(
+        catalog,
+        SegmentFetcher::new(store.clone()),
+        LogSegmentFetcher::new(store.clone()),
+        SpanSegmentFetcher::new(store.clone()),
+        SqlConfig::default(),
+        1 << 30,
+    );
+    sql_router(executor, store)
+}
+
+/// The `audit` table reads each object through
+/// `LogSegmentFetcher::fetch_accounted_with_tenant`, which records one open
+/// per decoded footer on the handle the executor gives the lane, `scan`.
+///
+/// FLIP: dropping the `add_segments_opened` in `fetch_accounted_with_tenant`
+/// (`crates/ravel-query/src/log_fetcher.rs`) reads `scan` 0.
+#[tokio::test]
+async fn audit_table_statement_opens_every_object_under_scan() {
+    let app = audit_router().await;
+    let v = post_sql(
+        &app,
+        "SELECT body FROM audit ORDER BY body",
+        0.0,
+        NOW_NS as f64 / 1e9,
+    )
+    .await;
+    let want_rows: Vec<String> = (0..3)
+        .flat_map(|seq| (0..4).map(move |i| format!("seq{seq}rec{i}")))
+        .collect();
+    assert_eq!(value_rows(&v), want_rows, "{v}");
+    assert_eq!(segments_opened(&v), want(0, 0, 0, 3, 0), "{v}");
 }
 
 /// Three small, undeclared-key-index RLOG objects: object 0 carries
