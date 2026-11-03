@@ -763,6 +763,28 @@ pub(super) async fn load_with_drain_reflush_period(
             continue;
         }
 
+        // `--ingest-hour-stride`: at depth 1 the previous batch is acked by
+        // now, so its hour holds all of its flushes; move to this batch's.
+        if let Some(lane) = &memory_options.hour_stride
+            && let Err(reason) = lane.begin_batch()
+        {
+            drain_inflight(
+                &mut inflight,
+                &router,
+                &mut enqueue,
+                &mut report,
+                &mut shards_seen,
+                &mut data_batches_flushed,
+                shards,
+            )
+            .await?;
+            return Err(LoadError::BatchFailed {
+                reason,
+                durable: report.tokens.clone(),
+                resume: ResumeFigures::from_report(&report),
+            });
+        }
+
         // Spawn this batch's write onto its own task so it runs concurrently
         // with the writes already in flight and with the decoder's next batch. A
         // `tokio::spawn`ed write begins executing immediately; a merely-
@@ -1015,6 +1037,16 @@ pub(super) async fn load_with_drain_reflush_period(
         result
     };
     drain_result?;
+    if let Some(lane) = &memory_options.hour_stride {
+        if let Err(reason) = lane.check_hour_kept() {
+            return Err(LoadError::BatchFailed {
+                reason,
+                durable: report.tokens.clone(),
+                resume: ResumeFigures::from_report(&report),
+            });
+        }
+        report.synthetic_ingest_hours = Some(lane.report());
+    }
 
     // Snapshot the router's cumulative counters before it drops: the caller
     // reads the dynamic-column figures to warn on overflow or near-cap pressure

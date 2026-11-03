@@ -2071,6 +2071,92 @@ window. Sort the input by event time before the load where the mapping
 allows it. This is a performance recommendation, not a correctness
 requirement.
 
+### Hour-ranged measurement lane
+
+A plain load writes every object into the ingest hour current at its flush,
+so a load that finishes within an hour leaves its tenant in one ingest hour
+however many rows it wrote. To measure read
+paths that depend on how many ingest hours a tenant spans,
+`--ingest-hour-stride` spreads the batches of one load across past ingest
+hours:
+
+```sh
+ravel-cli load --parquet events.parquet --tenant bench-24h --mapping map.toml \
+  --shards 1 --batch-rows 250000 \
+  --ingest-hour-stride 1 --ingest-hour-start "$(( $(date +%s) / 3600 - 48 ))"
+ravel-cli catalog fold --signal logs --tenant bench-24h --shards 1 \
+  --writers-stopped --snapshot-part-max-entries 2
+```
+
+`--ingest-hour-start` is a unix hour (unix seconds divided by 3600) and
+`--ingest-hour-stride` is a number of hours. The two are required together.
+Batch `i`, counting only batches that carry a row, is written into ingest
+hour `start + i * stride`. The stride is in hours because the ingest hour
+is the unit the commit key, fold sealing and retention all bucket by.
+
+The hours are synthetic, and nothing downstream can tell. Every clock
+reading the write path takes during batch `i` comes from a clock shifted
+into that hour, so each commit record's `ingest_hour_bucket` and its
+`created_unix_ns` both fall in hour `start + i * stride`. Everything that
+reads `ingest_hour_bucket` then treats the hour as real:
+`ravel_commit::keys::commit_key` puts it in the commit key; the fold
+(`Catalog::fold_with_seal_through` in ravel-catalog) seals and partitions
+by it; retention (`ravel_maintain::retention`) walks and seals buckets by
+it through `ravel_maintain::Bucket`; and readers list it through
+`Catalog::resolve`. The object store's observed clock, which a flush is
+checked against for skew, is shifted by the same offset.
+
+The lane's contract:
+
+- The synthetic hours are non-decreasing, and hour `start + i * stride`
+  holds exactly batch `i`'s flushes, one per shard the batch reaches.
+- To make that hold, the lane forces `--pipeline-depth 1`, `--read-cursors
+  1` and `--target-bytes 1` (`per_batch_target_bytes`), and refuses another
+  value for any of them. Batch `i` is fully acked before the clock moves to
+  batch `i + 1`'s hour, and the clock moves immediately before that batch
+  is submitted. The flush age trigger reads the shifted clock and stays on.
+- A batch whose clock readings leave its hour (the batch took over an
+  hour) fails the load: a later flush of it could otherwise land in the
+  next hour. Lower `--batch-rows` if that happens.
+- Logs and spans only; `--signal metrics` is refused. Not combinable with
+  `--fold-after-load`: fold afterwards with `catalog fold --writers-stopped`.
+
+Before any object is written, the lane refuses, exiting with code 2, when:
+
+- `--ingest-hour-start` is not strictly before the current hour;
+- `start + batches * stride` is not below the current hour, with
+  `batches` counted from the Parquet footer at `--batch-rows` after
+  `--skip-rows`;
+- the signal's catalog HEAD exists, a tenant already folded; the refusal
+  names the HEAD's watermark hour (`found watermark hour <h>`);
+- one LIST page of the signal's commit prefix `t/<hex>/<signal>/c/` is not
+  empty, which catches a tenant that was loaded but never folded.
+
+So use a fresh tenant for every hour-ranged load.
+
+A strided load's report JSON carries `ingest_hour_stride`,
+`ingest_hour_start`, `ingest_hour_last` (the hour of the last batch
+submitted), `synthetic_ingest_hours: true` and `ingest_hour_flush:
+"per_batch_target_bytes"`. A plain load's report has none of these fields.
+
+Readers caveat: `Catalog::resolve` lists the ingest hours from the query
+window's start minus `max_ingest_lag` (2 hours by default) up to now plus
+the clock-skew allowance. A row is therefore found by a window that starts
+at its event time only when that event time is at most its ingest hour
+plus `max_ingest_lag`. Give each batch event times inside, or before, its
+synthetic hour; a row whose event time is later than its hour plus the lag
+is missed by windows that start after it.
+
+`catalog fold --snapshot-part-max-entries <n>` overrides the most entries
+one snapshot part may hold, for that invocation only. The default stays
+250,000 (`ravel_catalog::DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`) and `0` is
+refused. Parts still split at hour boundaries, so with one flush per hour
+on one shard, `--snapshot-part-max-entries 2` folds 24 strided hours into
+12 parts of two hours each. The fold's JSON and human reports name the
+value used as `snapshot_part_max_entries`. Because `--writers-stopped`
+seals through the fold's own current hour, the last part's watermark hour
+is that hour, not the last loaded hour.
+
 ## Bulk export (`ravel-cli export`)
 
 `export` is the inverse of `load`. It reads the stored records of a tenant

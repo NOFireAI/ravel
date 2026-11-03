@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use ravel_ingest::{IngestByteBudget, IngestByteBudgetLimit};
 
-use crate::load::GeometryHook;
+use crate::load::{GeometryHook, HourStrideLane};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -115,6 +115,9 @@ pub struct LoadMemoryOptions {
     /// `--ack-margin` ([`GeometryRequest::ack_margin`]), carried here for
     /// the same reason as `on_geometry`.
     pub ack_margin: Option<Duration>,
+    /// `--ingest-hour-stride`'s lane, carried here for the same reason as
+    /// `on_geometry`: the load advances its clock before each batch.
+    pub hour_stride: Option<Arc<HourStrideLane>>,
 }
 
 impl LoadMemoryOptions {
@@ -126,6 +129,7 @@ impl LoadMemoryOptions {
             one_batch_warning: Arc::default(),
             on_geometry: None,
             ack_margin: None,
+            hour_stride: None,
         }
     }
 }

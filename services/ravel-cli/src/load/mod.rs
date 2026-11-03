@@ -354,6 +354,8 @@ mod spans;
 pub use spans::*;
 mod geometry;
 pub use geometry::*;
+mod hour_stride;
+pub use hour_stride::*;
 
 /// Result of a successful (or partially-durable) load, for the summary output.
 #[derive(Debug, Clone, Default)]
@@ -430,6 +432,8 @@ pub struct LoadReport {
     /// (`DepthWindow::realign_gave_up`): 0, or 1 when the shards had not
     /// handled a batch within the 30 s settle timeout.
     pub realign_gave_up: u64,
+    /// `--ingest-hour-stride`'s report fields, set when the stride was.
+    pub synthetic_ingest_hours: Option<SyntheticIngestHours>,
     /// The early shard-skew warning (issue #560), set at most once, the first
     /// time the check at [`SKEW_CHECK_AFTER_BATCHES`](logs::SKEW_CHECK_AFTER_BATCHES) data batches finds the
     /// spread at or below the [`SKEW_WARN_DENOMINATOR`](logs::SKEW_WARN_DENOMINATOR) threshold. `None` when
@@ -537,6 +541,7 @@ impl LoadReport {
             flush_mix: self.flush_mix_report(),
             target_bytes_no_effect_warning: self.target_bytes_no_effect_warning.clone(),
             realign_gave_up: self.realign_gave_up,
+            synthetic_ingest_hours: self.synthetic_ingest_hours.clone(),
         }
     }
 }

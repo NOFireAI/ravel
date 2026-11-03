@@ -645,6 +645,10 @@ pub struct LoadLayoutReport {
     /// loader's clock), 0 otherwise.
     #[serde(default)]
     pub realign_gave_up: u64,
+    /// `--ingest-hour-stride`'s fields, at the top level of the JSON; absent
+    /// from a load that did not set the stride.
+    #[serde(flatten, default, skip_serializing_if = "Option::is_none")]
+    pub synthetic_ingest_hours: Option<SyntheticIngestHours>,
 }
 
 /// The prefix of the summary line carrying [`LoadLayoutReport`] as JSON.
