@@ -3104,8 +3104,8 @@ pub struct Cli {
     /// hold. The node counts as congested while any one router's queued
     /// flushes (flush tasks spawned and not yet reaped, which `/metrics`
     /// sums across routers as `ravel_ingest_queued_flushes`) exceed that
-    /// router's bound, or while at least 10 flush triggers were deferred
-    /// across all routers over the last second. While congested, an admitted
+    /// router's bound and at least 1 flush trigger was deferred across all
+    /// routers over the last full second. While congested, an admitted
     /// ingest request waits at the head, holding its in-flight permit, for
     /// the backlog to clear, up to `--ingest-hold-max-wait`. Unset, each
     /// router's bound is its own queued-flush cap: its shard count times

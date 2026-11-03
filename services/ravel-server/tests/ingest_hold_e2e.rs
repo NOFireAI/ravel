@@ -333,6 +333,10 @@ async fn forced_congestion_refuses_an_http_export_at_the_max_wait_and_releases_i
     let (held_response, elapsed) = held_request.await.expect("task does not panic");
     let held_response = held_response.expect("request completes");
     assert_eq!(held_response.status(), 429);
+    // hygiene-allow: wall-clock -- a lower bound, not a band: the hold's
+    // tokio sleeps cannot end before the max wait, so a loaded box only
+    // lengthens it. The server answers on real sockets, so paused time
+    // cannot drive this test.
     assert!(
         elapsed >= Duration::from_millis(200),
         "refused no sooner than the max wait, after {elapsed:?}"
@@ -418,6 +422,9 @@ async fn congestion_cleared_during_the_hold_admits_the_export() {
 
     let (response, elapsed) = held_request.await.expect("task does not panic");
     assert_eq!(response.expect("request completes").status(), 200);
+    // hygiene-allow: wall-clock -- a lower bound, not a band: the clear is
+    // forced 100 ms after the send and a loaded box only delays the answer.
+    // The server answers on real sockets, so paused time cannot drive it.
     assert!(
         elapsed >= Duration::from_millis(100),
         "held until the clear, answered after {elapsed:?}"
@@ -529,6 +536,9 @@ async fn hold_refuses_a_grpc_export_at_the_max_wait() {
 
     assert_eq!(status.code(), tonic::Code::ResourceExhausted);
     assert_eq!(status.message(), HOLD_MESSAGE);
+    // hygiene-allow: wall-clock -- a lower bound, as for the HTTP refusal:
+    // a loaded box only lengthens the hold, and real sockets rule out
+    // paused time.
     assert!(
         elapsed >= Duration::from_millis(200),
         "refused after {elapsed:?}"

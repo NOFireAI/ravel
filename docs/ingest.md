@@ -92,10 +92,15 @@ A head hold runs right between the in-flight permit and the credential check
 (ADR-3718, flush-backlog hold amendment). A background detector samples each
 ingest router's queued flush count and the routers' deferred flush triggers
 every 100 ms, and marks the node congested while any one router's queued count
-is above that router's bound, or at least 10 triggers were deferred across all
-routers over the last full second. A router's bound is its own queued-flush
-cap, its shard count times `--max-queued-flushes` (32 at the defaults of 4
-shards and 8), unless `--ingest-hold-queued-flushes` is set, which replaces
+is above that router's bound and at least 1 trigger was deferred across all
+routers over the last full second (10 samples; a shorter window is never
+congested). Neither signal decides alone. A healthy node at a fixed 160k on
+ADR-3718's benchmark defers triggers with its queue at its cap, and a deferral
+can also be a per-tenant share refusal (ADR-2708 D3). A router's queued count
+can exceed its cap with no backlog, since a tenant with no flush in flight on
+a shard, and a buffer past its memory or object backstop, spawn past the cap.
+A router's bound is its own queued-flush cap, its shard count times
+`--max-queued-flushes` (32 at the defaults of 4 shards and 8), unless `--ingest-hold-queued-flushes` is set, which replaces
 every router's bound. Routers are not summed against one bound: the
 `ravel_ingest_queued_flushes` gauge is that sum, and a node ingesting several
 signals can carry more queued flushes than any one router's bound with no
