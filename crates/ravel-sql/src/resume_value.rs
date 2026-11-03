@@ -126,7 +126,10 @@ mod tests {
     /// last row passes the planner's resume type check.
     fn exact(array: ArrayRef) -> ResumeValue {
         let CursorSupport::Exact(kind) = cursor_support(array.data_type()) else {
-            panic!("plan_page admits an order term of type {}", array.data_type());
+            panic!(
+                "plan_page admits an order term of type {}",
+                array.data_type()
+            );
         };
         let value = resume_value(array.as_ref(), 0).expect("a non-NULL cell of an admitted type");
         assert!(

@@ -2636,8 +2636,8 @@ mod tests {
             ),
         ];
         for (sql, tuple, expected) in cases {
-            let err = plan_page(sql, Some(&ResumePosition::new(tuple.clone())))
-                .expect_err("refused");
+            let err =
+                plan_page(sql, Some(&ResumePosition::new(tuple.clone()))).expect_err("refused");
             assert_eq!(err, expected, "{sql} at {tuple:?}");
         }
         assert_eq!(
@@ -2902,7 +2902,10 @@ mod tests {
             },
         );
         let query = parse_query("SELECT * FROM logs").expect("parsed");
-        let terms = [OrderTerm::ascending("severity_text"), OrderTerm::ascending("ts")];
+        let terms = [
+            OrderTerm::ascending("severity_text"),
+            OrderTerm::ascending("ts"),
+        ];
         assert_eq!(
             render_statement(&query, &terms, Some(&nan)).expect_err("refused"),
             PagePlanError::NonFiniteResumeValue,

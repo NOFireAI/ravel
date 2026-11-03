@@ -482,7 +482,11 @@ async fn pending_erasure_describes_the_retried_attempt_whose_rows_were_returned(
         "the injected NotFound must actually have fired"
     );
     assert_eq!(outcome.stats.resolves, 2);
-    assert_eq!(outcome.output.num_rows(), 2, "neither erasure matches a row");
+    assert_eq!(
+        outcome.output.num_rows(),
+        2,
+        "neither erasure matches a row"
+    );
     let predicate =
         |value: &str| ErasurePredicate::new(vec![("job".to_string(), value.to_string())], 0, 0);
     assert_eq!(

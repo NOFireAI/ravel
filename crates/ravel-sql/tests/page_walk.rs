@@ -1106,7 +1106,11 @@ async fn a_desc_term_under_an_appended_tiebreak_walks_every_row_once_in_order() 
     let found = walk(&ctx, DESC_TIEBREAK_STATEMENT).await;
     let rows = found.rows();
     let unpaged = rows_of(&execute(&ctx, DESC_TIEBREAK_STATEMENT).await);
-    assert_eq!(unpaged.len(), FIXTURE.len(), "the statement's own row count");
+    assert_eq!(
+        unpaged.len(),
+        FIXTURE.len(),
+        "the statement's own row count"
+    );
     assert!(
         multiset(&unpaged).values().all(|&count| count == 1),
         "the fixture has no duplicate (ts, series_id) row",
@@ -1116,13 +1120,20 @@ async fn a_desc_term_under_an_appended_tiebreak_walks_every_row_once_in_order() 
         multiset(&unpaged),
         "the walk did not deliver every row exactly once",
     );
-    assert_eq!(found.pages, FIXTURE.len() + 1, "pages, the empty last one included");
     assert_eq!(
-        rows.iter().map(|row| row[1].as_str()).collect::<Vec<&str>>(),
+        found.pages,
+        FIXTURE.len() + 1,
+        "pages, the empty last one included"
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row[1].as_str())
+            .collect::<Vec<&str>>(),
         DESC_TIEBREAK_SERIES,
         "the walk's series_id sequence",
     );
-    let reference = rows_of(&execute(&ctx, &reference_statement(DESC_TIEBREAK_STATEMENT, &plan)).await);
+    let reference =
+        rows_of(&execute(&ctx, &reference_statement(DESC_TIEBREAK_STATEMENT, &plan)).await);
     assert_eq!(sequence_finding(&reference, &found), None);
 }
 
