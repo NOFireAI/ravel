@@ -396,10 +396,12 @@ async fn small_object_equality_opens_every_object_under_scan() {
 }
 
 /// The logs counterpart of the warm trace lookup below: the same statement
-/// twice through one read cache records the same three opens under `plan`
-/// (the fast-path verdict decodes every footer there),
-/// the second run with no data GET in any phase, so `segmentsOpened` counts
-/// decoded footers whatever served their bytes.
+/// twice through one read cache records the same three opens, the second run
+/// with no data GET in any phase, so `segmentsOpened` counts decoded footers
+/// whatever served their bytes. With a read cache the scan stripes blocks
+/// and so plans every segment, which puts the opens under `plan` where the
+/// uncached [`small_object_equality_opens_every_object_under_scan`] reads
+/// `scan`.
 #[tokio::test]
 async fn warm_logs_statement_opens_the_same_objects_with_zero_data_gets() {
     let app = small_logs_router_with_cache(Some(server_cache(64 * 1024 * 1024))).await;

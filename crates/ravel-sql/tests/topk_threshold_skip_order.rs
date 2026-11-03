@@ -564,8 +564,9 @@ async fn drive(route: Route, publish: Publish) -> Outcome {
 }
 
 /// The `segmentsOpened` split a run of `route` that decodes `opened` footers
-/// reports: the plan decodes all three on the planned route, the other routes
-/// decode at the scan.
+/// reports: the plan decodes all three on the planned route, a segment the
+/// threshold then skips included, and the other routes decode at the scan,
+/// so a segment skipped before its open counts in no phase there.
 fn opened_by_phase(route: Route, opened: u64) -> BTreeMap<&'static str, u64> {
     let (phase, n) = match route {
         Route::Planned => (QueryPhase::Plan, 3),
@@ -636,7 +637,7 @@ async fn threshold_published_before_the_second_segment_skips_exactly_its_late_bl
         assert_eq!(
             run.opened,
             opened_by_phase(route, 2),
-            "{route:?}: C, skipped before its footer decoded, counts in no phase"
+            "{route:?}: C counts under plan where the plan pass decoded its footer, in no phase otherwise"
         );
         // The plan phase counts every planned segment's blocks, C's included;
         // the other routes count the blocks of the segments they open.
