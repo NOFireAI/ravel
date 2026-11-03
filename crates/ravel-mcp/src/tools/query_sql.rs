@@ -916,11 +916,7 @@ mod tests {
                 assert_eq!(executed[0].request.sql, query);
                 assert!(executed[0].order_columns.is_empty(), "{query}");
                 if status == Status::OkBounded {
-                    assert_eq!(
-                        actions(&page),
-                        ["order_by_the_rows_own_columns"],
-                        "{query}"
-                    );
+                    assert_eq!(actions(&page), ["order_by_the_rows_own_columns"], "{query}");
                     let detail = &page.next_steps[0].detail;
                     assert!(
                         detail.contains("computed from other rows")

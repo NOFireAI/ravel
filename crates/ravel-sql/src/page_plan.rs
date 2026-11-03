@@ -4349,10 +4349,7 @@ mod tests {
                 "s",
             ),
             // Written in ORDER BY itself rather than through an alias.
-            (
-                "SELECT count(*) FROM logs ORDER BY count(*)",
-                "count(*)",
-            ),
+            ("SELECT count(*) FROM logs ORDER BY count(*)", "count(*)"),
             (
                 "SELECT series_id FROM samples GROUP BY series_id ORDER BY sum(value)",
                 "sum(value)",
@@ -4467,11 +4464,8 @@ mod tests {
         let provable = plan_page("SELECT -1 AS ordering ORDER BY ordering", None);
         assert!(provable.is_ok(), "refused the literal: {provable:?}");
 
-        let not_provable = plan_page(
-            "SELECT nullif(1, 0) AS ordering ORDER BY ordering",
-            None,
-        )
-        .expect_err("refused");
+        let not_provable = plan_page("SELECT nullif(1, 0) AS ordering ORDER BY ordering", None)
+            .expect_err("refused");
         assert_eq!(
             not_provable,
             PagePlanError::OrderTermNullabilityUnknown {
