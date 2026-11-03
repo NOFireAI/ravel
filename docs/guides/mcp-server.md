@@ -162,7 +162,8 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   series whose samples do not fit `max_response_bytes` comes back with a
   prefix of them, counted in `samples.samples_omitted`. A result that
   skipped part of its coverage is refused as `unavailable` unless the call
-  sets `allow_partial_coverage: true`. The
+  sets `allow_partial_coverage: true`, and is then `ok` with
+  `accuracy.exact: false`. The
   [reference](../reference/mcp.md#evaluating-promql) lists each answer.
 
 ### Search logs
@@ -306,9 +307,15 @@ index.
 ### `accuracy`
 
 `exact` states whether the result is precise. `approximation` names the
-method when it is not. `lower_bound_count` is `true` on a `COUNT` over `logs`
-or `spans`. Ingest there is at-least-once, and a retry can add rows that a
-count cannot tell apart from originals.
+method when it is not. A `ravel_query_promql` result returned under
+`allow_partial_coverage: true` with `coverage.partial: true` reports
+`exact: false`, and `approximation` says the result omits the data the query
+could not reach.
+
+`lower_bound_count` is reserved and always `false`. Ingest into `logs` and
+`spans` is at-least-once, so a retry can store a row twice and a `COUNT`
+there can include duplicates: the count is an upper bound on distinct
+records, not a lower bound, and no tool marks it.
 
 ### `presentation`
 

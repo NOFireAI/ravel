@@ -588,7 +588,11 @@ A result that skipped part of its coverage, such as an unreachable
 federated cluster, is refused as `unavailable` unless the call sets
 `allow_partial_coverage: true`, the class the HTTP route's 503 maps to.
 The refusal carries a next step naming the argument. With consent the
-result is returned with `coverage.partial: true`.
+result is returned with `coverage.partial: true`, `accuracy.exact: false`,
+and `accuracy.approximation` saying the result omits the data the query
+could not reach; `warnings` name what was skipped. The status stays `ok`
+when no cap stopped the result, since `ok_bounded` and `ok_page` say a cap
+did.
 
 The log metric names `ravel_log_lines` and `ravel_log_bytes` are
 queryable here as on `/api/v1/query`; see
@@ -711,6 +715,11 @@ of each field.
 
 Integers and timestamps travel as JSON strings for every value, whatever
 its magnitude, so parse them as strings.
+
+`accuracy.lower_bound_count` is reserved and always `false`; no tool sets
+it. A `COUNT` over `logs` or `spans` can include a row an at-least-once
+retry stored twice, so it is an upper bound on distinct records, not a
+lower bound.
 
 A time input, such as a `time_range` bound, is either an RFC 3339 timestamp
 in UTC (ending in Z or +00:00) or a decimal nanosecond epoch, both as
@@ -849,7 +858,7 @@ covers in event time.
 | `validation` | The query engine rejected the statement itself. The message is the engine's own text, safe to show. |
 | `unsupported` | The request names a construct or an operation the tool does not implement. For `ravel_query_sql` this also covers a result column the JSON encoding cannot hold: the message is `column "<name>" of type <arrow type> cannot be encoded as JSON: <reason>; cast the column in the query to a type JSON can hold, or read it over /api/v1/sql with the Arrow IPC format`, and never carries the value. |
 | `budget_estimate_exceeds_ceiling` | `ravel_explain_query` found the statement's estimated cost above the effective budget. The failure names the factor to narrow by. |
-| `budget_exceeded` | A running call passed one of its budgets. The failure names the counter that tripped. |
+| `budget_exceeded` | A running call passed one of its budgets. `failure.message` names the counter that tripped. `failure.counter` is set only where the MCP server enforces the limit itself, which today is the 1,000-series cap of `ravel_analyze_timeseries` (`series`); a budget the query service enforces leaves it `null`. |
 | `deadline` | The call passed its effective deadline. |
 | `unavailable` | A transient storage or catalog fault. Retryable. |
 | `snapshot_invalidated` | The pinned snapshot was invalidated by concurrent maintenance. Retryable once. |

@@ -2952,6 +2952,54 @@ mod with_mcp {
         running.shutdown().await.expect("server stops");
     }
 
+    /// A `COUNT` over `logs` through `ravel_query_sql` counts a line a retry
+    /// stored twice as two rows, and `accuracy.lower_bound_count` stays
+    /// `false`: the field is reserved, and a count that can include
+    /// duplicates is not a lower bound.
+    ///
+    /// FLIP: a SQL body that set `lower_bound_count` on a count over logs
+    /// fails the accuracy assertion.
+    #[tokio::test]
+    async fn query_sql_count_over_logs_leaves_lower_bound_count_unset() {
+        let (store, metrics) = instrumented_memory();
+        publish_log_lines(
+            store.as_ref(),
+            &[(10 * NS_PER_SEC, "alpha"), (10 * NS_PER_SEC, "alpha")],
+        )
+        .await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let (is_error, counted) = call(
+            &client,
+            "ravel_query_sql",
+            serde_json::json!({
+                "query": "SELECT count(*) AS n FROM logs",
+                "time_range": sql_window(),
+            }),
+        )
+        .await;
+
+        assert_eq!(is_error, Some(false), "{counted}");
+        assert_eq!(counted["status"], serde_json::json!("ok"), "{counted}");
+        assert_eq!(
+            counted["data"]["rows"],
+            serde_json::json!([["2"]]),
+            "{counted}"
+        );
+        assert_eq!(
+            counted["accuracy"]["lower_bound_count"],
+            serde_json::json!(false),
+            "{counted}"
+        );
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
     const TRACE_A: [u8; 16] = [0xab; 16];
     const HOSTILE: &str = "x' OR 1=1; -- /*";
 
