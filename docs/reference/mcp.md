@@ -2,13 +2,13 @@
 
 > The `POST /mcp` route exists in builds compiled with the `mcp` cargo
 > feature, and is mounted when `--mcp` is passed; both are off by default.
-> Seven tools are served today: `ravel_capabilities`, `ravel_describe_data`,
+> Eight tools are served today: `ravel_capabilities`, `ravel_describe_data`,
 > `ravel_find_labels`, `ravel_explain_query`, `ravel_query_sql`,
-> `ravel_query_promql` and `ravel_get_trace`. The other two are in the
-> catalog (so `tools/list` returns them) and refuse
-> every call with a
-> `method_not_found` protocol error until their bodies land; their entries
-> below describe the surface as designed. `ravel_capabilities` reports the
+> `ravel_query_promql`, `ravel_get_trace` and `ravel_analyze_timeseries`.
+> The other one, `ravel_search_logs`, is in the catalog (so `tools/list`
+> returns it) and refuses every call with a `method_not_found` protocol
+> error until its body lands; its entry below describes the surface as
+> designed. `ravel_capabilities` reports the
 > split at runtime: `tools.enabled` is what this deployment will actually
 > run, `tools.catalogued` is what it declares but does not yet serve.
 
@@ -30,7 +30,7 @@ grouping, the envelope fields, and the empty-result checklist.
 | `ravel_query_promql` | Instant or range PromQL evaluation, one row per series. See [Evaluating PromQL](#evaluating-promql) | `query`, either `time_range` and `step` or `evaluation_time` (exactly one mode), `allow_partial_coverage`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests`. An `evidence_ref` is refused with `unsupported` | `data` (`series`, `samples`), `scope` (the instant or range, the step alignment, the lookback), `coverage`, `accuracy`, `budget` | `max_rows` 200 series, ceiling 5,000; past it the result is `ok_bounded` with no cursor; a range of at most 11,000 steps; `max_response_bytes` 512 KiB default, 256 KiB floor, a series over it cut to a prefix of its samples | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
 | `ravel_search_logs` | Typed log search compiled to SQL | indexed and typed-attribute predicates, `has_word`, severity, trace id, `time_range` (required), an optional `cursor`, an optional `evidence_ref`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
 | `ravel_get_trace` | Every span of one trace id, as rows of the `spans` table ordered by `(start_ts, span_id)` | `trace_id` (32 hexadecimal characters, either case), an optional `time_range`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests`. Without `time_range`, every span the tenant retains is read; with it, only spans that start inside it are returned | `data`, `scope`, `presentation`, `budget` | the shared budgets in the section below; past `max_rows` the result is cut, with status `ok_bounded` and `presentation.row_cap_hit` set | `unauthorized`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
-| `ravel_analyze_timeseries` | `change_point` or `summary` over a PromQL range result | `query`, `time_range`, `step`, `op`, an optional `evidence_ref`, `deadline_ms`, `max_response_bytes` | `data`, `accuracy`, `budget`, `evidence` | reports the minimum point count the method needs | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `deadline`, `unavailable`, `internal` |
+| `ravel_analyze_timeseries` | `change_point` or `summary` over each series of a PromQL range result, one row per series, reported as a heuristic. See [Analyzing a series](#analyzing-a-series) | `query`, `time_range`, `step` and `op` (`change_point` or `summary`), all required; `deadline_ms`, `max_response_bytes`, `max_rows`. `max_bytes_scanned`, `max_segments`, `max_store_requests` and an `evidence_ref` are refused with `unsupported` | `data`, `scope` (the range, the step alignment, the lookback), `coverage`, `accuracy` (`exact: false`, naming the heuristic), `presentation`, `budget` | `max_rows` 200 series, ceiling 5,000; past it the result is `ok_bounded` with no cursor; at most 1,000 matched series; a range of at most 11,000 steps; `max_response_bytes` 512 KiB default, 256 KiB floor; every row reports the method's minimum point count | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
 <!-- mcp-tools:end -->
 
 `ravel_capabilities` and `ravel_describe_data` return metadata only.
@@ -80,7 +80,7 @@ size it used, `max_rows` held to 1,000, as both `presentation.max_rows` and
 | `ravel_agent_events` | One page of the agent's events in `event_seq` order, optionally one operation's | `kind`, `key`, an optional `cursor`, an optional `operation`, `deadline_ms`, `max_response_bytes`, `max_rows` | `POST /api/v1/agents/events` | `max_rows` 200, at most 1,000; a full or byte-capped page carries `presentation.cursor`, the last event it kept | `unauthorized`, `invalid_argument`, `cursor_expired` (with a `restart_from_oldest_cursor` next step), `deadline`, `unavailable`, `internal` |
 | `ravel_agent_blocked_effects` | Effects in doubt, each with the inspector's text and the two reconcile requests that unblock it | `kind`, `key`, `deadline_ms`, `max_response_bytes` | `GET /api/v1/agents/effects` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
 
-The `tools/list` result is 15,972 bytes with the nine tools and 23,861
+The `tools/list` result is 16,297 bytes with the nine tools and 24,186
 bytes with all fifteen, against a budget of 24,576 bytes. A test pins both
 figures exactly.
 
@@ -233,6 +233,55 @@ result is returned with `coverage.partial: true`.
 The log metric names `ravel_log_lines` and `ravel_log_bytes` are
 queryable here as on `/api/v1/query`; see
 [the query guide](../guides/query.md).
+
+### Analyzing a series
+
+`ravel_analyze_timeseries` evaluates `query` over `time_range` at `step`,
+then runs `op` over each series of the result. Its range arguments follow
+the [Evaluating PromQL](#evaluating-promql) rules exactly, through the same
+check, and are refused with the same messages before anything is read: a
+step with a unit, whole milliseconds, the end after the start, and at most
+11,000 steps. An `op` other than `change_point` or `summary` is
+`invalid_argument`. A query that does not evaluate to a range vector is
+`invalid_argument`, and one matching more than 1,000 series is
+`budget_exceeded`.
+
+The call goes through the same service method as
+`POST /api/v1/analytics`, so admission, the deadline clamp, the usage
+record and the query audit event (language `analytics`) are the route's.
+`scope` reports the range, the step alignment and the lookback as on
+`ravel_query_promql`: each step reads the latest sample in `(t - 5m, t]`,
+so the analysis is over the step values, not every stored sample.
+
+The result is one row per series. Both ops are reported as heuristics:
+`accuracy.exact` is `false`, and `accuracy.approximation` names the
+method, its minimum point count, and how many of the series were
+downsampled. Every row carries `series` (the label set), `points` (the
+non-NaN step values analyzed), `nan_excluded`, `downsampled`, `min_points`
+and `too_few_points`. A series with fewer than `min_points` points is a
+row with `too_few_points: true` and null figures; the call does not fail.
+
+| `op` | Figures | `min_points` | Downsampled |
+| --- | --- | --- | --- |
+| `change_point` | `kind` (`spike`, `dip`, `step_change`, `trend_change`, `distribution_change`, `stationary` or `indeterminable`), `ts_ns` (the change's timestamp, a nanosecond string, null when none was found), `score` | 22 | over 2,000 points, bucket-averaged to 2,000 before the search |
+| `summary` | `median`, `mad`, `stddev`, `variance` (population) | 1 | never |
+
+The figures follow the precision rule: `NaN`, `+Inf` and `-Inf` as
+strings, the sign of zero kept.
+
+`max_rows` counts series, as on `ravel_query_promql`: past it the first
+`max_rows` rows are returned, `data.row_count` is the number of series
+analyzed, and the status is `ok_bounded` with no cursor.
+
+The tool takes no partial-coverage consent. A read that skipped part of
+its coverage, such as an unreachable federated cluster, is refused as
+`unavailable`, with next steps to retry or to read the partial series
+through `ravel_query_promql` with `allow_partial_coverage: true`: an
+analysis over a subset of the series is not marked anywhere in its rows.
+The scan budgets `max_bytes_scanned`, `max_segments` and
+`max_store_requests` are refused with `unsupported`, because the analytics
+service call takes no per-request scan budget; the deadline and the query
+engine's configured limits bound the read, as on `POST /api/v1/analytics`.
 
 ### Which list `ravel_find_labels` returns
 
@@ -659,7 +708,8 @@ page says so in `warnings`.
 
 Every data tool except `ravel_find_labels` accepts an optional
 `evidence_ref` input. Of the served tools, `ravel_query_sql`,
-`ravel_query_promql` and `ravel_get_trace` refuse one with `unsupported`
+`ravel_query_promql`, `ravel_get_trace` and `ravel_analyze_timeseries`
+refuse one with `unsupported`
 in this build, and none
 emits an `evidence` block yet; this section describes the design. Redeeming a reference re-executes the tool with the
 reference's own arguments. The re-execution runs against the reference's
