@@ -633,6 +633,7 @@ pub async fn run_load_reporting(
 
     let mut memory_options = LoadMemoryOptions::new(load_memory);
     memory_options.ack_margin = ack_margin;
+    let strided = lane.is_some();
     memory_options.hour_stride = lane;
     let one_batch_warning = Arc::clone(&memory_options.one_batch_warning);
 
@@ -676,7 +677,7 @@ pub async fn run_load_reporting(
             Ok(report.layout_report())
         }
         Err(err) => {
-            print_durable_tokens(&err, LOGS_RESUMABLE_SETTINGS);
+            print_durable_tokens(&err, (!strided).then_some(LOGS_RESUMABLE_SETTINGS));
             // A --fold-after-load failure keeps the finished report: every
             // object landed, so its end-of-load warnings still describe the
             // run, and re-running the load is not the remedy that would show
@@ -693,7 +694,9 @@ pub async fn run_load_reporting(
             // they are the only thing an operator can act on to resume: print
             // them beside the error, with the settings precondition that says
             // whether they are an offset at all.
-            if let Some(hint) = resume_hint(&err, read_cursors, pipeline_depth) {
+            if strided {
+                let _ = writeln!(warnings, "{STRIDED_NOT_RESUMABLE}");
+            } else if let Some(hint) = resume_hint(&err, read_cursors, pipeline_depth) {
                 let _ = writeln!(warnings, "{hint}");
             }
             Err(anyhow::Error::new(err))
@@ -853,7 +856,7 @@ async fn run_metrics(
             Ok(report.layout_report())
         }
         Err(err) => {
-            print_durable_tokens(&err, SEQUENTIAL_RESUMABLE_SETTINGS);
+            print_durable_tokens(&err, Some(SEQUENTIAL_RESUMABLE_SETTINGS));
             if let Some(hint) = sequential_resume_hint(&err, pipeline_depth) {
                 let _ = writeln!(warnings, "{hint}");
                 if mapping.is_histogram() {
@@ -957,9 +960,15 @@ async fn run_spans(
             Ok(report.layout_report())
         }
         Err(err) => {
-            print_durable_tokens(&err, SEQUENTIAL_RESUMABLE_SETTINGS);
+            let strided = hour_stride.is_some();
+            print_durable_tokens(
+                &err,
+                (!strided).then_some(SEQUENTIAL_RESUMABLE_SETTINGS),
+            );
             print_spans_attrs_dropped(&report, AttrsDroppedScope::Failed);
-            if let Some(hint) = sequential_resume_hint(&err, pipeline_depth) {
+            if strided {
+                let _ = writeln!(warnings, "{STRIDED_NOT_RESUMABLE}");
+            } else if let Some(hint) = sequential_resume_hint(&err, pipeline_depth) {
                 let _ = writeln!(warnings, "{hint}");
             }
             Err(anyhow::Error::new(err))
@@ -973,6 +982,11 @@ const LOGS_RESUMABLE_SETTINGS: &str = "--read-cursors 1 --pipeline-depth 1";
 /// The same for the metrics and spans loads, which each read one sequential
 /// cursor and take `--read-cursors` out of the question.
 const SEQUENTIAL_RESUMABLE_SETTINGS: &str = "--pipeline-depth 1";
+
+/// Why a failed `--ingest-hour-stride` load gets no `--skip-rows` figures.
+const STRIDED_NOT_RESUMABLE: &str = "A failed --ingest-hour-stride load cannot be resumed: a \
+     second strided run is refused on the commit records this one left, so drop and recreate \
+     the tenant and load the file again";
 
 /// `--read-cursors 0`, rejected on both signals.
 pub(super) const READ_CURSORS_ZERO: &str = "--read-cursors must be at least 1, or omitted for automatic \
@@ -1417,8 +1431,9 @@ fn print_stage_timings(report: &LoadReport) {
 ///
 /// `resumable_with` is the flag set under which this signal's failed load is a
 /// resumable prefix ([`LOGS_RESUMABLE_SETTINGS`] or
-/// [`SEQUENTIAL_RESUMABLE_SETTINGS`]).
-fn print_durable_tokens(err: &LoadError, resumable_with: &str) {
+/// [`SEQUENTIAL_RESUMABLE_SETTINGS`]), or `None` for a `--ingest-hour-stride`
+/// load, which no flag set makes resumable.
+fn print_durable_tokens(err: &LoadError, resumable_with: Option<&str>) {
     let tokens = err.durable_tokens();
     // A `--fold-after-load` failure happens after every row is durable: the
     // load itself finished, so its summary is printed and nothing is partial.
@@ -1465,13 +1480,21 @@ fn print_durable_tokens(err: &LoadError, resumable_with: &str) {
     } else {
         ""
     };
-    println!(
-        "{} commit token(s)/segment(s) were durable before the failure (a partial load, not a \
-         rollback; --skip-rows can resume it instead of re-ingesting the whole file, but only \
-         when this run used {resumable_with} -- see the resume figures printed with the error. \
-         There is still no deduplication: nothing checks the offset a re-run is given){suffix}:",
-        tokens.len()
-    );
+    match resumable_with {
+        Some(resumable_with) => println!(
+            "{} commit token(s)/segment(s) were durable before the failure (a partial load, not \
+             a rollback; --skip-rows can resume it instead of re-ingesting the whole file, but \
+             only when this run used {resumable_with} -- see the resume figures printed with the \
+             error. There is still no deduplication: nothing checks the offset a re-run is \
+             given){suffix}:",
+            tokens.len()
+        ),
+        None => println!(
+            "{} commit token(s)/segment(s) were durable before the failure (a partial load, not \
+             a rollback). {STRIDED_NOT_RESUMABLE}{suffix}:",
+            tokens.len()
+        ),
+    }
     for token in tokens {
         println!("  {}", token.encode());
     }

@@ -549,6 +549,9 @@ pub(super) async fn load_with_drain_reflush_period(
     if budget.is_some() {
         report.load_memory = load_memory;
     }
+    // Set before any early return, so a strided load that writes no row still
+    // reports its lane; refreshed once the batches are drained.
+    report.synthetic_ingest_hours = memory_options.hour_stride.as_ref().map(|l| l.report());
     // `--skip-rows` is a positional offset against the file's total row count,
     // known entirely from the footer metadata already parsed above -- no need
     // to wait for the decode pipeline to find out how many rows it dropped.
@@ -766,7 +769,7 @@ pub(super) async fn load_with_drain_reflush_period(
         // `--ingest-hour-stride`: at depth 1 the previous batch is acked by
         // now, so its hour holds all of its flushes; move to this batch's.
         if let Some(lane) = &memory_options.hour_stride
-            && let Err(reason) = lane.begin_batch()
+            && let Err(error) = lane.admit_batch(built.max_event_ns()).await
         {
             drain_inflight(
                 &mut inflight,
@@ -778,8 +781,8 @@ pub(super) async fn load_with_drain_reflush_period(
                 shards,
             )
             .await?;
-            return Err(LoadError::BatchFailed {
-                reason,
+            return Err(LoadError::HourStride {
+                error,
                 durable: report.tokens.clone(),
                 resume: ResumeFigures::from_report(&report),
             });
@@ -1038,9 +1041,9 @@ pub(super) async fn load_with_drain_reflush_period(
     };
     drain_result?;
     if let Some(lane) = &memory_options.hour_stride {
-        if let Err(reason) = lane.check_hour_kept() {
-            return Err(LoadError::BatchFailed {
-                reason,
+        if let Err(error) = lane.check_hour_kept() {
+            return Err(LoadError::HourStride {
+                error,
                 durable: report.tokens.clone(),
                 resume: ResumeFigures::from_report(&report),
             });
@@ -1744,6 +1747,16 @@ impl Built {
             Built::Row(records) => records.len(),
             Built::Columnar(batch, _) => batch.num_rows,
         }
+    }
+
+    /// The latest event time in the batch, as its commit records' `max_event_ts_ns`
+    /// takes it. `i64::MIN` for an empty batch.
+    fn max_event_ns(&self) -> i64 {
+        match self {
+            Built::Row(records) => records.iter().map(|r| r.ts_ns).max(),
+            Built::Columnar(batch, _) => batch.ts_ns.iter().copied().max(),
+        }
+        .unwrap_or(i64::MIN)
     }
 }
 

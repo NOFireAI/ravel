@@ -4,15 +4,24 @@
 //! A strided load writes batch `i` (0-based, counting batches that carry at
 //! least one row) into ingest hour `start + i * stride`. It does so by
 //! handing the router an [`OffsetClock`] that reads `start + i * stride`
-//! hours plus the time elapsed since the batch began, so every reading the
-//! write path takes during batch `i` (the flush-open stamp, which sets both
+//! hours plus the time elapsed since the batch began. The router's and shard
+//! actors' readings during batch `i` (the flush-open stamp, which sets both
 //! `ingest_hour_bucket` and `created_unix_ns`, the age trigger, the routing
-//! cache) comes from the shifted clock. The lane forces `--pipeline-depth 1`,
-//! `--read-cursors 1` and `--target-bytes 1` (`PER_BATCH_TARGET_BYTES`): each
-//! Strict batch flushes inside its own write, one object per shard, and is
-//! fully acked before the clock moves to the next batch's hour. The synthetic
-//! hours are therefore non-decreasing, and hour `start + i * stride` holds
-//! exactly batch `i`'s flushes.
+//! cache) come from the shifted clock. The loader's own `now_ns`, read once
+//! at the start of the load, is not shifted: the decode admission check
+//! (future skew) and the provisioning record use the real time. The lane
+//! forces `--pipeline-depth 1`, `--read-cursors 1` and `--target-bytes 1`
+//! (`PER_BATCH_TARGET_BYTES`): each Strict batch flushes inside its own
+//! write, one object per shard at the tested batch sizes, and is fully acked
+//! before the clock moves to the next batch's hour. The synthetic hours are
+//! therefore non-decreasing, and hour `start + i * stride` holds exactly
+//! batch `i`'s flushes.
+//!
+//! Before each batch [`HourStrideLane::admit_batch`] re-reads the signal's
+//! catalog HEAD and checks the batch's latest event time against its hour's
+//! end plus the catalog's `max_ingest_lag`, so a fold that ran during the
+//! load, or a row the catalog's listing window would not reach, stops the
+//! load before that batch writes anything.
 
 use std::future::Future;
 use std::path::Path;
@@ -22,13 +31,13 @@ use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use ravel_catalog::CatalogConfig;
-use ravel_ingest::Clock;
+use ravel_catalog::{CatalogConfig, DEFAULT_MAX_CATALOG_LIST_REQUESTS, DEFAULT_MAX_INGEST_LAG_NS};
+use ravel_ingest::{Clock, MIN_PLAUSIBLE_INGEST_CLOCK_NS};
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
     ObjectStoreBackend, PageToken, Pin, PinnedRead, PutOptions, PutOutcome, StoreError,
 };
-use ravel_types::{Signal, TenantId};
+use ravel_types::{Signal, TenantHash, TenantId};
 use serde::{Deserialize, Serialize};
 
 use super::input::{FileInput, read_input_metadata, row_group_row_counts};
@@ -75,6 +84,63 @@ pub struct SyntheticIngestHours {
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct IngestHourStrideRefused(pub String);
+
+/// Why a strided load stopped before submitting batch `batch`, once the load
+/// has begun. Nothing of that batch was written; earlier batches are durable.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HourStrideBatchError {
+    #[error(
+        "--ingest-hour-stride: batch {batch} was not planned for: the guard counted {planned} \
+         batches from the Parquet footer"
+    )]
+    Unplanned { batch: u32, planned: u64 },
+    #[error("--ingest-hour-stride: batch {batch}'s hour {hour} overflows")]
+    HourOverflow { batch: u32, hour: u64 },
+    #[error(
+        "--ingest-hour-stride: the batch written into ingest hour {hour} ran past the end of \
+         that hour (the shifted clock reads {now_ns} ns), so a later flush of it may have \
+         landed in hour {next_hour}; lower --batch-rows so one batch takes under an hour"
+    )]
+    HourOverrun {
+        hour: u32,
+        now_ns: i64,
+        next_hour: u64,
+    },
+    #[error(
+        "--ingest-hour-stride stopped the load before batch {batch}: the {signal} catalog HEAD \
+         appeared during the load (found watermark hour {watermark}). A fold or maintain \
+         process ran against the tenant and may have sealed the hours this batch and later \
+         ones would commit into, where queries without a commit token would not see them"
+    )]
+    HeadAppeared {
+        batch: u32,
+        signal: &'static str,
+        watermark: String,
+    },
+    #[error(
+        "--ingest-hour-stride stopped the load before batch {batch}: could not check for the \
+         {signal} catalog HEAD: {cause}"
+    )]
+    HeadUnreadable {
+        batch: u32,
+        signal: &'static str,
+        cause: String,
+    },
+    #[error(
+        "--ingest-hour-stride refused batch {batch} before submitting it: its latest event time \
+         {max_event_ns} ns is not before {bound_ns} ns, the end of its ingest hour {hour} plus \
+         max_ingest_lag ({lag_ns} ns). A query window starting after that bound does not list \
+         hour {hour}, so those rows would be stored and not found; give each batch event times \
+         before its hour's end plus the lag"
+    )]
+    EventTimePastLag {
+        batch: u32,
+        hour: u32,
+        max_event_ns: i64,
+        bound_ns: i64,
+        lag_ns: i64,
+    },
+}
 
 /// A [`Clock`] that reads `inner` plus an offset set by
 /// [`OffsetClock::advance_to_hour`]: right after `advance_to_hour(h)` it reads
@@ -134,22 +200,40 @@ impl Clock for OffsetClock {
     }
 }
 
-/// A strided load's state: the shifted clock and the batch counter.
+/// Where a lane reads the catalog HEAD it checks before every batch.
+pub struct LaneTarget {
+    pub store: Arc<dyn ObjectStoreBackend>,
+    pub tenant: TenantHash,
+    pub signal: Signal,
+}
+
+/// A strided load's state: the shifted clock, the batch counter, and the
+/// (store, tenant, signal) whose HEAD must stay absent.
 pub struct HourStrideLane {
     stride: IngestHourStride,
     clock: Arc<OffsetClock>,
     batches_begun: AtomicU32,
     planned_batches: u64,
+    target: LaneTarget,
+    max_ingest_lag_ns: i64,
 }
 
 impl HourStrideLane {
-    /// A lane over `inner` that may submit at most `planned_batches` batches.
-    pub fn new(stride: IngestHourStride, inner: Arc<dyn Clock>, planned_batches: u64) -> Self {
+    /// A lane over `inner` that may submit at most `planned_batches` batches
+    /// into `target`.
+    pub fn new(
+        stride: IngestHourStride,
+        inner: Arc<dyn Clock>,
+        planned_batches: u64,
+        target: LaneTarget,
+    ) -> Self {
         Self {
             stride,
             clock: Arc::new(OffsetClock::new(inner, stride.start_hour)),
             batches_begun: AtomicU32::new(0),
             planned_batches,
+            target,
+            max_ingest_lag_ns: DEFAULT_MAX_INGEST_LAG_NS,
         }
     }
 
@@ -170,46 +254,86 @@ impl HourStrideLane {
         })
     }
 
+    /// Everything checked before the next batch is submitted, then the clock
+    /// move: one HEAD request confirming the signal's catalog HEAD is still
+    /// absent (a fold during the load would have sealed hours later batches
+    /// write into), then [`Self::begin_batch`]. `max_event_ns` is the batch's
+    /// latest event time, as its commit records will carry it.
+    pub async fn admit_batch(&self, max_event_ns: i64) -> Result<u32, HourStrideBatchError> {
+        let batch = self.batches_begun.load(Ordering::SeqCst);
+        let signal = signal_word(self.target.signal);
+        match head_watermark(&self.target.store, &self.target.tenant, self.target.signal).await {
+            Ok(None) => {}
+            Ok(Some(watermark)) => {
+                return Err(HourStrideBatchError::HeadAppeared {
+                    batch,
+                    signal,
+                    watermark,
+                });
+            }
+            Err(err) => {
+                return Err(HourStrideBatchError::HeadUnreadable {
+                    batch,
+                    signal,
+                    cause: err.to_string(),
+                });
+            }
+        }
+        self.begin_batch(max_event_ns)
+    }
+
     /// Moves the clock to the next batch's hour and returns it. Called
     /// immediately before a batch is submitted, once the previous batch is
-    /// acked. Refuses a batch the guard did not plan for, and a previous batch
+    /// acked. Refuses a batch the guard did not plan for, a previous batch
     /// whose readings left its hour (it took longer than an hour), since
     /// either would break "hour `start + i * stride` holds exactly batch
-    /// `i`".
-    pub fn begin_batch(&self) -> Result<u32, String> {
-        let index = self.batches_begun.load(Ordering::SeqCst);
-        if u64::from(index) >= self.planned_batches {
-            return Err(format!(
-                "--ingest-hour-stride: batch {index} was not planned for: the guard counted \
-                 {} batches from the Parquet footer",
-                self.planned_batches
-            ));
+    /// `i`", and a batch whose latest event time is at or past its hour's end
+    /// plus `max_ingest_lag`, which the catalog's listing window would miss.
+    /// A refusal leaves the clock where it was.
+    pub fn begin_batch(&self, max_event_ns: i64) -> Result<u32, HourStrideBatchError> {
+        let batch = self.batches_begun.load(Ordering::SeqCst);
+        if u64::from(batch) >= self.planned_batches {
+            return Err(HourStrideBatchError::Unplanned {
+                batch,
+                planned: self.planned_batches,
+            });
         }
-        if index > 0 {
+        if batch > 0 {
             self.check_hour_kept()?;
         }
         let hour = u64::from(self.stride.start_hour)
-            + u64::from(index) * u64::from(self.stride.stride_hours);
-        let hour = u32::try_from(hour)
-            .map_err(|_| format!("--ingest-hour-stride: batch {index}'s hour {hour} overflows"))?;
+            + u64::from(batch) * u64::from(self.stride.stride_hours);
+        let hour =
+            u32::try_from(hour).map_err(|_| HourStrideBatchError::HourOverflow { batch, hour })?;
+        let bound_ns = (i64::from(hour) + 1)
+            .saturating_mul(NS_PER_HOUR)
+            .saturating_add(self.max_ingest_lag_ns);
+        if max_event_ns >= bound_ns {
+            return Err(HourStrideBatchError::EventTimePastLag {
+                batch,
+                hour,
+                max_event_ns,
+                bound_ns,
+                lag_ns: self.max_ingest_lag_ns,
+            });
+        }
         self.clock.advance_to_hour(hour);
-        self.batches_begun.store(index + 1, Ordering::SeqCst);
+        self.batches_begun.store(batch + 1, Ordering::SeqCst);
         Ok(hour)
     }
 
     /// Refuses when the clock has left the hour of the batch in progress.
     /// Run before the next batch and once after the last.
-    pub fn check_hour_kept(&self) -> Result<(), String> {
+    pub fn check_hour_kept(&self) -> Result<(), HourStrideBatchError> {
         let hour = self.clock.hour();
         let end_ns = (i64::from(hour) + 1) * NS_PER_HOUR;
         let now_ns = self.clock.now_ns();
         if now_ns >= end_ns {
-            return Err(format!(
-                "--ingest-hour-stride: the batch written into ingest hour {hour} ran past the end \
-                 of that hour (the shifted clock reads {now_ns} ns), so a later flush of it may \
-                 have landed in hour {}; lower --batch-rows so one batch takes under an hour",
-                u64::from(hour) + 1
-            ));
+            return Err(HourStrideBatchError::HourOverrun {
+                hour,
+                now_ns,
+                next_hour: u64::from(hour) + 1,
+            });
         }
         Ok(())
     }
@@ -274,9 +398,11 @@ fn refused(reason: String) -> anyhow::Error {
 /// - `start` is strictly before the current hour of `inner`;
 /// - `start + batches * stride` is below the current hour, `batches` counted
 ///   from the Parquet footer with [`planned_batches`];
+/// - `start` is not below the write path's plausible-clock floor,
+///   [`MIN_PLAUSIBLE_INGEST_CLOCK_NS`];
 /// - the signal's catalog HEAD does not exist;
-/// - one LIST page of the signal's commit prefix `t/<hex>/<signal>/c/` is
-///   empty.
+/// - the signal's commit prefix `t/<hex>/<signal>/c/` lists no addressable
+///   key, walking pages until one appears or the listing ends.
 ///
 /// A failed check is an [`IngestHourStrideRefused`]. A store error while
 /// checking is a plain error: the guard could not tell.
@@ -337,6 +463,13 @@ pub async fn prepare_hour_stride(
 
     let now_hour = inner.now_ns().div_euclid(NS_PER_HOUR);
     let start = i64::from(stride.start_hour);
+    let floor_hour = MIN_PLAUSIBLE_INGEST_CLOCK_NS.div_euclid(NS_PER_HOUR);
+    if start < floor_hour {
+        return Err(refused(format!(
+            "--ingest-hour-start {start} is below hour {floor_hour}, the earliest ingest clock \
+             the write path accepts (MIN_PLAUSIBLE_INGEST_CLOCK_NS, 2020-01-01T00:00:00Z)"
+        )));
+    }
     if start >= now_hour {
         return Err(refused(format!(
             "--ingest-hour-start {start} is not strictly in the past: the current ingest hour is \
@@ -358,48 +491,91 @@ pub async fn prepare_hour_stride(
     }
 
     let tenant_hash = TenantId::new(tenant).hash();
-    let head_key = crate::catalog::head_key(&tenant_hash, signal);
-    match store.head(&head_key).await {
-        Ok(_) => {
-            let catalog =
-                crate::catalog::enforcing_catalog(Arc::clone(store), CatalogConfig::default());
-            // A HEAD that exists but does not decode still refuses; it only
-            // has no watermark to name.
-            let watermark = match catalog {
-                Ok(catalog) => catalog
-                    .head_watermark_hour(&tenant_hash, signal)
-                    .await
-                    .ok()
-                    .flatten(),
-                Err(_) => None,
-            };
-            let watermark = watermark.map_or_else(|| "none".to_string(), |h| h.to_string());
+    match head_watermark(store, &tenant_hash, signal).await {
+        Ok(Some(watermark)) => {
             return Err(refused(format!(
                 "ingest-hour-stride is only honored on a tenant whose {word} HEAD does not exist \
                  (found watermark hour {watermark})"
             )));
         }
-        Err(StoreError::NotFound) => {}
+        Ok(None) => {}
         Err(err) => {
             anyhow::bail!(
-                "--ingest-hour-stride: could not check for the {word} catalog HEAD {head_key}: \
-                 {err}"
+                "--ingest-hour-stride: could not check for the {word} catalog HEAD {}: {err}",
+                crate::catalog::head_key(&tenant_hash, signal)
             )
         }
     }
     let prefix = commit_prefix(&tenant_hash, signal);
-    let page = store
-        .list(&prefix, None)
-        .await
-        .map_err(|err| anyhow::anyhow!("--ingest-hour-stride: could not list {prefix}: {err}"))?;
-    if let Some(found) = page.objects.first() {
+    if let Some(found) = first_listed_key(store, &prefix).await? {
         return Err(refused(format!(
             "ingest-hour-stride is only honored on a tenant with no {word} commit records \
-             (found {} under {prefix})",
-            found.key
+             (found {found} under {prefix})"
         )));
     }
-    Ok(HourStrideLane::new(stride, inner, batches))
+    Ok(HourStrideLane::new(
+        stride,
+        inner,
+        batches,
+        LaneTarget {
+            store: Arc::clone(store),
+            tenant: tenant_hash,
+            signal,
+        },
+    ))
+}
+
+/// The watermark hour of the signal's catalog HEAD, `"none"` for a HEAD
+/// that exists but does not decode, or `None` when there is no HEAD.
+async fn head_watermark(
+    store: &Arc<dyn ObjectStoreBackend>,
+    tenant: &TenantHash,
+    signal: Signal,
+) -> Result<Option<String>, StoreError> {
+    match store.head(&crate::catalog::head_key(tenant, signal)).await {
+        Ok(_) => {}
+        Err(StoreError::NotFound) => return Ok(None),
+        Err(err) => return Err(err),
+    }
+    let watermark =
+        match crate::catalog::enforcing_catalog(Arc::clone(store), CatalogConfig::default()) {
+            Ok(catalog) => catalog
+                .head_watermark_hour(tenant, signal)
+                .await
+                .ok()
+                .flatten(),
+            Err(_) => None,
+        };
+    Ok(Some(
+        watermark.map_or_else(|| "none".to_string(), |h| h.to_string()),
+    ))
+}
+
+/// The first addressable key under `prefix`, walking pages past ones that
+/// carry no addressable key (a page can hold only unaddressable ones) until
+/// the listing ends, within the catalog's list-request cap.
+async fn first_listed_key(
+    store: &Arc<dyn ObjectStoreBackend>,
+    prefix: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut token = None;
+    for _ in 0..DEFAULT_MAX_CATALOG_LIST_REQUESTS {
+        let page = store
+            .list(prefix, token)
+            .await
+            .map_err(|err| anyhow::anyhow!("--ingest-hour-stride: could not list {prefix}: {err}"))?;
+        if let Some(found) = page.objects.first() {
+            return Ok(Some(found.key.clone()));
+        }
+        match page.next {
+            Some(next) => token = Some(next),
+            None => return Ok(None),
+        }
+    }
+    anyhow::bail!(
+        "--ingest-hour-stride: listing {prefix} did not end within \
+         {DEFAULT_MAX_CATALOG_LIST_REQUESTS} pages"
+    )
 }
 
 /// The prefix covering every commit record of one (tenant, signal), across
@@ -591,6 +767,18 @@ mod tests {
 
     const NOW_NS: i64 = 1_700_000_000_000_000_000;
 
+    fn target() -> LaneTarget {
+        LaneTarget {
+            store: Arc::new(ravel_object_store::memory::MemoryStore::new()),
+            tenant: TenantId::new("acme").hash(),
+            signal: Signal::Logs,
+        }
+    }
+
+    fn event_in(hour: u32) -> i64 {
+        i64::from(hour) * NS_PER_HOUR
+    }
+
     #[test]
     fn planned_batches_counts_blocks_after_the_skip() {
         assert_eq!(planned_batches(24, 0, 1), 24);
@@ -622,16 +810,21 @@ mod tests {
             },
             Arc::new(FixedClock(NOW_NS)),
             3,
+            target(),
         );
         let clock = lane.clock();
         assert_eq!(clock.now_ns(), i64::from(start) * NS_PER_HOUR);
         assert_eq!(lane.report().ingest_hour_last, None);
-        assert_eq!(lane.begin_batch(), Ok(start));
-        assert_eq!(lane.begin_batch(), Ok(start + 3));
+        assert_eq!(lane.begin_batch(event_in(start)), Ok(start));
+        assert_eq!(lane.begin_batch(event_in(start + 3)), Ok(start + 3));
         assert_eq!(clock.now_ns(), i64::from(start + 3) * NS_PER_HOUR);
-        assert_eq!(lane.begin_batch(), Ok(start + 6));
-        assert!(
-            lane.begin_batch().is_err(),
+        assert_eq!(lane.begin_batch(event_in(start + 6)), Ok(start + 6));
+        assert_eq!(
+            lane.begin_batch(event_in(start + 9)),
+            Err(HourStrideBatchError::Unplanned {
+                batch: 3,
+                planned: 3
+            }),
             "a fourth batch was not planned"
         );
         assert_eq!(
@@ -644,6 +837,35 @@ mod tests {
                 ingest_hour_flush: "per_batch_target_bytes".to_string(),
             }
         );
+    }
+
+    /// The bound is exclusive at the hour's end plus the lag, and a refused
+    /// batch leaves the clock and the batch count where they were.
+    #[test]
+    fn begin_batch_refuses_events_past_the_hour_end_plus_the_lag() {
+        let start = u32::try_from(NOW_NS / NS_PER_HOUR - 10).unwrap();
+        let lane = HourStrideLane::new(
+            IngestHourStride {
+                stride_hours: 1,
+                start_hour: start,
+            },
+            Arc::new(FixedClock(NOW_NS)),
+            2,
+            target(),
+        );
+        let bound_ns = event_in(start + 1) + DEFAULT_MAX_INGEST_LAG_NS;
+        assert_eq!(
+            lane.begin_batch(bound_ns),
+            Err(HourStrideBatchError::EventTimePastLag {
+                batch: 0,
+                hour: start,
+                max_event_ns: bound_ns,
+                bound_ns,
+                lag_ns: DEFAULT_MAX_INGEST_LAG_NS,
+            })
+        );
+        assert_eq!(lane.report().ingest_hour_last, None);
+        assert_eq!(lane.begin_batch(bound_ns - 1), Ok(start));
     }
 
     /// A store that reports its own clock reads it on the lane's shifted scale.
@@ -700,6 +922,7 @@ mod tests {
             },
             Arc::new(FixedClock(NOW_NS)),
             1,
+            target(),
         );
         let store = lane.store(Arc::new(Observing(
             ravel_object_store::memory::MemoryStore::new(),

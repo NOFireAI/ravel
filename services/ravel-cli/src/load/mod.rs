@@ -644,6 +644,16 @@ pub enum LoadError {
         durable: Vec<CommitToken>,
         resume: ResumeFigures,
     },
+    /// A `--ingest-hour-stride` load stopped before submitting a batch (see
+    /// [`hour_stride::HourStrideBatchError`]). Nothing of that batch was
+    /// written; earlier batches are durable. A strided load cannot be
+    /// resumed: its guard refuses a tenant that already has commit records.
+    #[error("{error}")]
+    HourStride {
+        error: hour_stride::HourStrideBatchError,
+        durable: Vec<CommitToken>,
+        resume: ResumeFigures,
+    },
     /// A row failed a kept admission check (future skew, length cap, or the
     /// loader per-record attribute cap). Fail-fast: the run stops at the first
     /// bad row. Any tokens listed are batches durable before this row.
@@ -741,6 +751,7 @@ impl LoadError {
         match self {
             LoadError::Setup(_) | LoadError::HourAlreadySealed { .. } => &[],
             LoadError::BatchFailed { durable, .. }
+            | LoadError::HourStride { durable, .. }
             | LoadError::RowRejected { durable, .. }
             | LoadError::Flush { durable, .. }
             | LoadError::Fold { durable, .. }
@@ -761,6 +772,7 @@ impl LoadError {
             | LoadError::Fold { .. }
             | LoadError::FoldLeftCommitsUncovered { .. } => None,
             LoadError::BatchFailed { resume, .. }
+            | LoadError::HourStride { resume, .. }
             | LoadError::RowRejected { resume, .. }
             | LoadError::Flush { resume, .. } => Some(*resume),
         }
@@ -774,6 +786,7 @@ impl LoadError {
         match self {
             LoadError::Setup(_) | LoadError::HourAlreadySealed { .. } => None,
             LoadError::BatchFailed { durable, .. }
+            | LoadError::HourStride { durable, .. }
             | LoadError::RowRejected { durable, .. }
             | LoadError::Flush { durable, .. }
             | LoadError::Fold { durable, .. }
@@ -791,6 +804,7 @@ impl LoadError {
             LoadError::Setup(_)
             | LoadError::HourAlreadySealed { .. }
             | LoadError::BatchFailed { .. }
+            | LoadError::HourStride { .. }
             | LoadError::RowRejected { .. }
             | LoadError::Flush { .. } => None,
         }

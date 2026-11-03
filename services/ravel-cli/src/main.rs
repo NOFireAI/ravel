@@ -986,19 +986,29 @@ enum Command {
         /// Hour-ranged measurement lane (ADR-3692 decision 8): write batch i
         /// (counting batches that carry a row) into ingest hour
         /// `--ingest-hour-start` + i x HOURS instead of the current hour. The
-        /// hours are synthetic: every clock reading the write path takes
-        /// during batch i, including each object's `created_unix_ns`, comes
-        /// from a clock shifted into that hour, and retention, fold sealing
-        /// and readers then treat them as real ingest hours. Needs
+        /// hours are synthetic: the router's and shard actors' clock readings
+        /// during batch i (the flush-open stamp that sets each object's
+        /// `ingest_hour_bucket` and `created_unix_ns`, the age trigger) come
+        /// from a clock shifted into that hour, while the decode admission
+        /// (future-skew) check and tenant provisioning read the real time.
+        /// Retention, fold sealing and readers treat the hours as real ingest
+        /// hours; the load report marks them synthetic. Needs
         /// `--ingest-hour-start`; logs and spans only. Forces
         /// `--pipeline-depth 1`, `--read-cursors 1` and `--target-bytes 1`
-        /// (refusing another value), so each batch is one Strict flush per
-        /// shard, fully acked before the clock moves on, and the hours are
-        /// non-decreasing. Before anything is written, refused (exit 2) when
-        /// the start is not strictly before the current hour, when start +
-        /// batches x HOURS is not below it (batches counted from the Parquet
-        /// footer), when the signal's catalog HEAD exists, or when its commit
-        /// prefix holds any record: use a fresh tenant. Not combinable with
+        /// (refusing another value), so each batch flushes once per shard
+        /// (pinned at the tested batch sizes), fully acked before the clock
+        /// moves on, and the hours are non-decreasing. Before anything is
+        /// written, refused (exit 2) when the start is below unix hour 438288
+        /// (2020-01-01) or not strictly before the current hour, when start +
+        /// batches x HOURS is not below the current hour (batches counted
+        /// from the Parquet footer), when the signal's catalog HEAD exists,
+        /// or when its commit prefix holds any record: use a fresh tenant.
+        /// Before each batch the load fails (exit 1), writing nothing of that
+        /// batch, when the catalog HEAD has appeared (no fold or maintain may
+        /// run against the tenant during the load), or when the batch's
+        /// latest event time is not before its hour's end plus the catalog's
+        /// default max_ingest_lag (2h). A failed strided load cannot be
+        /// resumed: drop and recreate the tenant. Not combinable with
         /// `--fold-after-load`; fold with `catalog fold --writers-stopped`.
         #[arg(long, value_name = "HOURS", requires = "ingest_hour_start",
               conflicts_with = "fold_after_load",
@@ -1006,7 +1016,8 @@ enum Command {
         ingest_hour_stride: Option<u32>,
         /// The unix hour (unix seconds / 3600) batch 0 of an
         /// `--ingest-hour-stride` load is written into. Must be strictly
-        /// before the current hour. Needs `--ingest-hour-stride`.
+        /// before the current hour and at least 438288 (2020-01-01, the
+        /// write path's plausible-clock floor). Needs `--ingest-hour-stride`.
         #[arg(long, value_name = "UNIX_HOUR", requires = "ingest_hour_stride")]
         ingest_hour_start: Option<u32>,
     },
