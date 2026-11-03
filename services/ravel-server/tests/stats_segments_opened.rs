@@ -30,6 +30,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
+use clap::Parser;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -41,7 +42,9 @@ use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_by
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_query::http::StaticBearerTokenResolver;
-use ravel_query::{LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{
+    DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, EngineConfig, LogSegmentFetcher, ReadCache, SegmentFetcher,
+};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, KeyIndexDeclaration, SpanSegmentFetcher, SqlConfig, SqlExecutor,
     StaticDeclaredColumns,
@@ -483,6 +486,89 @@ async fn key_indexed_equality_opens_every_object_under_plan_not_scan() {
     assert_eq!(segments_opened(&v), want(0, 3, 0, 0, 0), "{v}");
 }
 
+/// The same three objects under the fetcher's default thresholds and two SQL
+/// partitions. Each object sits between the 512 KiB whole-object threshold
+/// and `plan_whole_object_bound()`, so the plan pass leaves all three
+/// unplanned (three skippable objects, two partitions) and probes their
+/// KEY_IDX instead; the scan then opens each survivor whole.
+async fn probe_only_logs_router() -> Router {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let logs = LogSegmentFetcher::new(store.clone());
+    for seq in 0..3 {
+        let key = publish_large_log(store.as_ref(), seq).await;
+        let size = store.head(&key).await.expect("head").size;
+        assert!(
+            size > DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD && size <= logs.plan_whole_object_bound(),
+            "object {seq} is {size} bytes, outside ({DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD}, {}]",
+            logs.plan_whole_object_bound()
+        );
+    }
+    let catalog = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+    let executor = SqlExecutor::new(
+        catalog,
+        SegmentFetcher::new(store.clone()),
+        logs,
+        SpanSegmentFetcher::new(store.clone()),
+        SqlConfig {
+            engine: EngineConfig {
+                sql_partition_count: Some(2),
+                ..EngineConfig::default()
+            },
+            ..SqlConfig::default()
+        },
+        1 << 30,
+    )
+    .with_declared_column_source(Arc::new(
+        StaticDeclaredColumns::new(vec![DeclaredColumn::new("status_code", DeclaredType::I64)])
+            .with_key_index(KeyIndexDeclaration {
+                columns: vec!["status_code".to_string()],
+                trace_id: false,
+            }),
+    ));
+    sql_router(executor, store)
+}
+
+fn phase_field(v: &Value, phase: &str, field: &str) -> u64 {
+    v["stats"]["phases"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no phases in {v}"))
+        .iter()
+        .find(|p| p["phase"] == phase)
+        .unwrap_or_else(|| panic!("no {phase} phase in {v}"))[field]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{phase}.{field} is a u64 in {v}"))
+}
+
+/// The keyed probe-only route: every object's KEY_IDX is probed under `plan`,
+/// none is pruned (every object holds `status_code = 400`), and the scan
+/// reads each survivor whole under `scan` without recording a second open.
+///
+/// FLIP: setting `footer_counted` to `false` for `SegmentPlan::Unplanned` in
+/// `OwnedSeg` publication (`crates/ravel-sql/src/logs_scan/plan.rs`) records
+/// each object again under `scan`: `left: {.., "plan": 3, .., "scan": 3}`.
+#[tokio::test]
+async fn probe_only_keyed_scan_opens_every_object_once_under_plan() {
+    let app = probe_only_logs_router().await;
+    let v = post_sql(
+        &app,
+        "SELECT count(*) AS n FROM logs WHERE status_code = 400",
+        0.0,
+        NOW_NS as f64 / 1e9,
+    )
+    .await;
+    assert_eq!(v["data"]["rows"][0][0], 3 * RECORDS as u64 - 1, "{v}");
+    assert_eq!(segments_opened(&v), want(0, 3, 0, 0, 0), "{v}");
+    // The probe's tail GET (which holds the KEY_IDX under the default suffix
+    // length) and the scan's whole-object GET each read every object once:
+    // `scan` reads at zero opens because the plan pass recorded them.
+    assert_eq!(phase_field(&v, "plan", "s3GetRequests"), 3, "{v}");
+    assert!(
+        phase_field(&v, "keyIndex", "decompressedOutputBytes") > 0,
+        "{v}"
+    );
+    assert_eq!(phase_field(&v, "scan", "s3GetRequests"), 3, "{v}");
+}
+
 fn value_rows_named(v: &Value, column: &str) -> Vec<String> {
     let columns = v["data"]["columns"].as_array().expect("columns");
     let at = columns
@@ -597,20 +683,67 @@ async fn publish_span_object(
 /// Three RSPAN objects, each padded past the tail-probe threshold: object 0
 /// holds [`TARGET_TRACE`], objects 1 and 2 carry only decoys.
 async fn spans_router() -> Router {
+    spans_router_with_cache(None).await
+}
+
+/// [`spans_router`] with every fetcher sharing `cache` the way
+/// `query::build_sql_executor` attaches the server's read cache.
+async fn spans_router_with_cache(cache: Option<ReadCache>) -> Router {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     for (seq, holds) in [(0u64, true), (1, false), (2, false)] {
         publish_span_object(store.as_ref(), seq, holds).await;
     }
     let catalog = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
-    let executor = SqlExecutor::new(
-        catalog,
-        SegmentFetcher::new(store.clone()),
-        LogSegmentFetcher::new(store.clone()),
-        SpanSegmentFetcher::new(store.clone()),
-        SqlConfig::default(),
-        1 << 30,
-    );
+    let mut metrics = SegmentFetcher::new(store.clone());
+    let mut logs = LogSegmentFetcher::new(store.clone());
+    let mut spans = SpanSegmentFetcher::new(store.clone());
+    if let Some(cache) = cache {
+        metrics = metrics.with_cache(cache.clone());
+        logs = logs.with_cache(cache.clone());
+        spans = spans.with_cache(cache);
+    }
+    let executor = SqlExecutor::new(catalog, metrics, logs, spans, SqlConfig::default(), 1 << 30);
     sql_router(executor, store)
+}
+
+/// The fetcher cache the server builds for `--cache-max-bytes max_bytes`.
+fn server_cache(max_bytes: u64) -> ReadCache {
+    let max = max_bytes.to_string();
+    let cli =
+        ravel_server::Cli::try_parse_from(["ravel-server", "--cache-max-bytes", max.as_str()])
+            .expect("cache flags parse");
+    ravel_server::store::build_cache(&cli, max_bytes).expect("a nonzero cache is built")
+}
+
+const DATA_PHASES: [&str; 4] = ["plan", "probe", "scan", "keyIndex"];
+
+/// ADR-3692 acceptance row 4 (a warm spans lookup reads no data object) on
+/// an unfolded tail: the same trace lookup twice through one read cache. The
+/// second run opens the same objects under the same phases as the first,
+/// every one served from the cache, so `segmentsOpened` counts decoded
+/// footers whatever served their bytes.
+#[tokio::test]
+async fn adr_3692_row_4_warm_trace_lookup_opens_the_same_objects_with_zero_data_gets() {
+    let app = spans_router_with_cache(Some(server_cache(64 * 1024 * 1024))).await;
+    let sql = format!(
+        "SELECT name FROM spans WHERE trace_id = X'{}'",
+        hex(&TARGET_TRACE)
+    );
+    let cold = post_sql(&app, &sql, 0.0, NOW_NS as f64 / 1e9).await;
+    let warm = post_sql(&app, &sql, 0.0, NOW_NS as f64 / 1e9).await;
+    assert_eq!(value_rows(&cold), vec!["target".to_string()], "{cold}");
+    assert_eq!(value_rows(&warm), vec!["target".to_string()], "{warm}");
+    assert_eq!(segments_opened(&cold), want(0, 0, 3, 0, 0), "{cold}");
+    assert_eq!(segments_opened(&warm), want(0, 0, 3, 0, 0), "{warm}");
+    for phase in DATA_PHASES {
+        assert_eq!(
+            phase_field(&warm, phase, "s3GetRequests"),
+            0,
+            "{phase}: {warm}"
+        );
+    }
+    assert!(phase_field(&cold, "probe", "s3GetRequests") >= 3, "{cold}");
+    assert!(phase_field(&warm, "probe", "cacheHits") >= 3, "{warm}");
 }
 
 #[tokio::test]
