@@ -48,7 +48,8 @@ BASH = os.environ.get("INV_BASH", "bash")
 HOUR_NS = 3600 * 1_000_000_000
 STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight", "compaction_done",
           "erasure_in_flight", "many_parts_24", "many_parts_744", "many_parts_2160")
-SMOKE_STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight", "many_parts_24")
+SMOKE_STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight",
+                "erasure_in_flight", "many_parts_24")
 UNSUPPORTED = "unsupported-on-this-build"
 REFUSAL_1000 = ("server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of "
                 "1000 tokens; simplify the statement")
@@ -70,6 +71,11 @@ def gen(out, traces=1000, hours=2, seed=7, *extra):
 SMALL_CORPUS = {"traces": 1000, "hours": 2, "seed": 7, "start_hour": 498248, "tail_traces": 500, "tail_seed": 8,
                 "tail_start_hour": 498250,
                 "many_parts": {"24": {"traces": 240, "hours": 24, "seed": 31, "start_hour": 498222}}}
+# The corpus.json the committed smoke run stamped.
+SMOKE_CORPUS = {"traces": 20000, "hours": 2, "seed": 7, "start_hour": 498253, "tail_traces": 10000, "tail_seed": 8,
+                "tail_start_hour": 498255,
+                "many_parts": {"24": {"traces": 240, "hours": 24, "seed": 31, "start_hour": 498227,
+                                      "ingest_hour_start": 498228}}}
 
 
 def merged_truth(out, c=SMALL_CORPUS):
@@ -680,6 +686,7 @@ class LocalSmoke(Workdir):
         self.assertEqual(res["verdict"], "fail")
         self.assertEqual(res["problems"], [
             "miss row_01.wire_bytes",
+            "miss row_02.wire_bytes",
             "miss row_03.probe_wire_per_object",
             "miss row_07.spans_section_gets: from-scratch rebuild: section GETs = 2 x entry_count",
             "miss row_07.logs_section_gets: from-scratch rebuild: section GETs = 2 x entry_count",
@@ -711,8 +718,7 @@ class LocalSmoke(Workdir):
         _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
         got = {s["state"]: (s["status"], s.get("reason")) for s in res["states"]}
         want = {s: ("run", None) for s in SMOKE_STATES + ("fold_advance", "compaction_done")}
-        want.update({s: ("not-run", "not in run.toml states")
-                     for s in ("erasure_in_flight", "many_parts_744", "many_parts_2160")})
+        want.update({s: ("not-run", "not in run.toml states") for s in ("many_parts_744", "many_parts_2160")})
         self.assertEqual(got, want)
 
     def test_in_1000_is_sent_and_refused_by_the_complexity_guard(self):
@@ -727,8 +733,11 @@ class LocalSmoke(Workdir):
                 for c in lines:
                     self.assertEqual((c["outcome"], c["http_status"], c["reason"]), (UNSUPPORTED, 400, REFUSAL_1000))
                     self.assertIn("wall_s", c)
-        f = figure(res, "row_11.control_1001_not_served")
-        self.assertEqual((f["value"], f["verdict"]), (1, "pass"))
+        # The 1,001-key control has no 1,000-key answer to compare against.
+        for prefix in ("spans", "logs_trace", "logs_request"):
+            f = figure(res, f"row_11.{prefix}_control_1001")
+            self.assertEqual((f["status"], f["value"], f["verdict"], f["reason"]),
+                             (UNSUPPORTED, None, UNSUPPORTED, f"the 1,000-key list was refused: {REFUSAL_1000}"))
         self.assertEqual(figure(res, "row_11.spans_1000_rows_exact")["reason"], REFUSAL_1000)
 
     def test_many_parts_24(self):
@@ -789,19 +798,19 @@ class LocalSmoke(Workdir):
             data = census["census"]["tenants"]["inv"]["data"][label]["bytes"]
             got = figure(res, f"row_08.{label}_{field}_leaf_pct")["value"]
             self.assertEqual(got, round(100.0 * leaf / data, 9), (label, field))
-        self.assertEqual(figure(res, "row_08.logs_request_id_leaf_pct")["value"], 25.174788981)
+        self.assertEqual(figure(res, "row_08.logs_request_id_leaf_pct")["value"], 27.52645665)
 
     def test_maintenance_per_part_month(self):
         # Item 13: spans leaf rebuild, 8 section GET x $0.0004/1000 + 1 leaf
-        # PUT x $0.005/1000 = $8.2e-06 over 1 month, plus 12712 leaf bytes
-        # x $0.023/GB-month = $2.92376e-07, over 1 part = $8.492376e-06,
-        # $8.492e-06 at evaluate.py's nine decimal places.
+        # PUT x $0.005/1000 = $8.2e-06 over 1 month, plus 219887 leaf bytes
+        # x $0.023/GB-month = $5.057401e-06, over 1 part = $1.3257401e-05,
+        # $1.3257e-05 at evaluate.py's nine decimal places.
         _, res, _ = evaluate(smoke_run(self.path("run")), self.path("out"))
         m = next(m for m in res["cost"]["maintenance"] if m["signal"] == "spans")
-        self.assertEqual((m["section_gets"], m["leaf_puts"], m["leaf_bytes"], m["parts"]), (8, 1, 12712, 1))
+        self.assertEqual((m["section_gets"], m["leaf_puts"], m["leaf_bytes"], m["parts"]), (8, 1, 219887, 1))
         self.assertEqual(m["maintenance_per_part_month"], round(8 * 0.0004 / 1000 + 1 * 0.005 / 1000
-                                                                + 12712 / 1e9 * 0.023, 9))
-        self.assertEqual(m["maintenance_per_part_month"], 8.492e-06)
+                                                                + 219887 / 1e9 * 0.023, 9))
+        self.assertEqual(m["maintenance_per_part_month"], 1.3257e-05)
 
     def test_warm_served_counts_cold_calls_the_cache_served(self):
         # Item 18: a cold call after a restart and page-cache drop can still
@@ -812,7 +821,7 @@ class LocalSmoke(Workdir):
                       if c.get("temp") == "cold" and c["outcome"] == "ok"
                       and sum(p.get("cacheServedBytes", 0) for p in c["stats"]["phases"]) > 0)
         self.assertEqual(sorted((w["statement"], w["state"], w["try"]) for w in res["warm_served"]), want)
-        self.assertEqual(len(want), 118)
+        self.assertEqual(len(want), 126)
         self.assertIn("warm_served", text)
 
     def test_flow_stamps(self):
@@ -830,7 +839,7 @@ class LocalSmoke(Workdir):
         trans = read_jsonl(os.path.join(run, "stamps", "transitions.jsonl"))
         self.assertEqual([t["state"] for t in trans], [
             "unfolded", "folded_no_leaves", "folded_leaves", "mixed", "fold_advance", "compaction_in_flight",
-            "compaction_done", "many_parts_24"])
+            "compaction_done", "erasure_in_flight", "many_parts_24"])
         mixed = next(t for t in trans if t["state"] == "mixed")
         self.assertGreater(mixed["ingest_hour"], trans[0]["ingest_hour"])
         compaction = read_jsonl(os.path.join(run, "stamps", "compaction.jsonl"))
@@ -851,6 +860,35 @@ class LocalSmoke(Workdir):
         with open(os.path.join(run, "stamps", "host.json")) as f:
             self.assertEqual(json.load(f)["rq_stats"], "1")
 
+    def test_needle_blocks_over_ten_written_blocks(self):
+        # Item 10: every logs object inspected; 100,000 rows in 8,192-row
+        # blocks; the rare needle sits in exactly the blocks truth predicts.
+        with open(os.path.join(smoke_run(self.path("run")), "stamps", "needle_blocks.json")) as f:
+            nb = json.load(f)
+        self.assertEqual((nb["objects_inspected"], nb["record_count"], nb["truth_block_rows"]),
+                         (nb["objects_total"], 100_000, 8192))
+        self.assertEqual(nb["block_count"], 14)
+        self.assertGreaterEqual(nb["block_count"], 10)
+        self.assertEqual(nb["needle_rare_present_blocks"], nb["truth_needle_blocks"]["needlerare"])
+        self.assertEqual(nb["needle_rare_present_blocks"], 1)
+
+    def test_erasure_in_flight_reads_pending_and_filters_the_victim(self):
+        # Item 12: run.sh's PENDING check saw the request, and the victim's
+        # lookup returned no row under it while the unfolded state returned one.
+        run = smoke_run(self.path("run"))
+        _, res, _ = evaluate(run, self.path("out"))
+        er = read_jsonl(os.path.join(run, "stamps", "erasure.jsonl"))
+        self.assertEqual(len(er), 1)
+        victim = er[0]["victim_request_id"]
+        self.assertEqual(er[0]["status_after"]["fields"]["predicate"], f"request_id={victim}")
+        self.assertEqual(sum(line.endswith(": PENDING") for line in er[0]["status_after"]["lines"]), 1)
+        rows = {(c["state"], c["temp"], c["try"]): c["rows"] for c in read_jsonl(os.path.join(run, "calls.jsonl"))
+                if c["statement"] == "logs_erasure_victim" and c["outcome"] == "ok"}
+        self.assertEqual({k: v for k, v in rows.items() if k[0] == "erasure_in_flight"},
+                         {("erasure_in_flight", "cold", 0): 0, ("erasure_in_flight", "cold", 1): 0})
+        self.assertEqual(rows[("unfolded", "cold", 0)], 1)
+        self.assertEqual(figure(res, "row_13.erasure_in_flight_rows_exact")["value"], 1)
+
     def test_truth_regenerates_from_the_stamped_corpus(self):
         run = smoke_run(self.path("run"))
         with open(os.path.join(run, "stamps", "corpus.json")) as f:
@@ -858,9 +896,7 @@ class LocalSmoke(Workdir):
         with open(os.path.join(SMOKE, "run.toml"), "rb") as f:
             corpus = tomllib.load(f)["corpus"]
         self.assertEqual((c["traces"], c["hours"], c["seed"]), (corpus["traces"], corpus["hours"], corpus["seed"]))
-        self.assertEqual(c, {**SMALL_CORPUS, "many_parts": {"24": {**SMALL_CORPUS["many_parts"]["24"],
-                                                                   "ingest_hour_start": 498223}},
-                             "truth_sha256": c["truth_sha256"]})
+        self.assertEqual(c, {**SMOKE_CORPUS, "truth_sha256": c["truth_sha256"]})
         truth = merged_truth(self.path("g"), c)
         with gzip.open(os.path.join(SMOKE, "truth.json.gz")) as f:
             committed = json.load(f)
@@ -1625,8 +1661,8 @@ FLIPS = {
         "check_leaf_share",
     ),
     "part count read from the declaration": (
-        '        return "value", doc.get("part_count", len(doc.get("parts", []))), ""',
-        '        return "value", doc.get("parts_declared", 24), ""',
+        '    v = doc.get("part_count")\n',
+        '    v = doc.get("parts_declared", 24)\n',
         "check_part_count",
     ),
     "every server refusal read unsupported": (
