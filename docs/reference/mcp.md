@@ -464,7 +464,8 @@ these cases:
 | The last row's order values could not be read, or one is NaN or infinite | `narrow_time_range` |
 | The cursor after the last row is over its 4 KiB bound, as a long string order value makes it | `narrow_time_range` |
 
-A warning names the reason in each case. None of them is a failure.
+A warning names the reason in each case but the first two, where the next
+step alone says it. None of them is a failure.
 
 A cursor is bound to the statement, `time_range` and the effective
 `max_rows`; a call that changes any of them is refused as

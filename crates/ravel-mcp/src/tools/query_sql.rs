@@ -927,12 +927,6 @@ mod tests {
                             && detail.contains("the row's own non-null columns"),
                         "{query}: {detail}"
                     );
-                    assert!(
-                        page.warnings.iter().any(|w| w.starts_with("no cursor:")
-                            && w.contains("a value computed from other rows")),
-                        "{query}: {:?}",
-                        page.warnings
-                    );
                 } else {
                     assert!(actions(&page).is_empty(), "{query}");
                 }

@@ -1580,10 +1580,10 @@ finding of review #1388). This other-rows order amendment closes that.
 2. The statement is not refused. `ravel_query_sql` treats this outcome as
    the query-sql amendment, item 1, treats `NoOrdering`: it runs the
    statement as written, unpaged, and returns the rows up to `max_rows`; a
-   capped result is `ok_bounded` with no cursor, a `no cursor:` warning
-   saying the result is ordered by a value computed from other rows, and an
-   `order_by_the_rows_own_columns` next step saying that paging needs an
-   order on the row's own non-null columns. The planner names the outcome
+   capped result is `ok_bounded` with no cursor and an
+   `order_by_the_rows_own_columns` next step saying that the order uses a
+   value computed from other rows and that paging needs an order on the
+   row's own non-null columns. The planner names the outcome
    and the tool maps it (`Unpaged` in
    `crates/ravel-mcp/src/tools/query_sql.rs`); the tool does not classify
    planner error text.
