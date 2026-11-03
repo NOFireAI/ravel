@@ -173,7 +173,8 @@ pub struct GetTraceInput {
     pub trace_id: String,
     /// Optional. Omitted, the lookup reads every span the tenant retains.
     pub time_range: Option<TimeRange>,
-    /// Not served by this build: `true` is refused as `unsupported`.
+    /// Not served by this build: `true` is refused as `unsupported`; for
+    /// logs, use ravel_search_logs.
     pub include_logs: Option<bool>,
     /// Spans returned; default 200, ceiling 5,000.
     pub max_rows: Option<u32>,
@@ -462,8 +463,10 @@ pub fn tool_catalog() -> Vec<Tool> {
         tool::<GetTraceInput>(
             "ravel_get_trace",
             "Get trace",
-            "Every span of one trace id, ordered by start time. time_range is \
-             optional; without it every span the tenant retains is read",
+            "Every span of one trace id, ordered by start time, with \
+             __ravel_depth and __ravel_parent (root, present, missing, \
+             not_returned, cycle). time_range is optional; without it every \
+             span the tenant retains is read",
         ),
         tool::<AnalyzeTimeseriesInput>(
             "ravel_analyze_timeseries",
@@ -489,7 +492,7 @@ mod tests {
     /// every client parses on every reconnect, and it should be read in a
     /// diff rather than absorbed silently anywhere under the bound. Update
     /// it in the same commit as the schema change that moves it.
-    const TOOLS_LIST_SERIALIZED_LEN: usize = 16_058;
+    const TOOLS_LIST_SERIALIZED_LEN: usize = 16_177;
 
     /// D2 bounds `tools/list` so the catalog itself never competes with a
     /// data response for the response-size budget.
@@ -797,7 +800,7 @@ mod tests {
     /// `agents` and run with both enabled answers it. Pinned for the same
     /// reason as [`TOOLS_LIST_SERIALIZED_LEN`], under the same D2 budget
     /// (ADR-3331 decision 10).
-    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 23_947;
+    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 24_066;
 
     const _: () = assert!(
         COMBINED_TOOLS_LIST_SERIALIZED_LEN < 24_576,

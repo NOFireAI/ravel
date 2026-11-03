@@ -26,7 +26,7 @@ grouping, the envelope fields, and the empty-result checklist.
 | `ravel_query_sql` | One read-only `SELECT` over one table, its rows filtered to `time_range` and paged by a keyset cursor. See [Running a statement](#running-a-statement) | `query`, `time_range` (required), `max_rows`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_segments`, `max_store_requests`, an optional `cursor`. An `evidence_ref` is refused with `unsupported` | `data`, `scope` (`order_by` is the effective order, tiebreak included), `visibility`, `presentation`, `budget` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
 | `ravel_query_promql` | Instant or range PromQL evaluation, one row per series. See [Evaluating PromQL](#evaluating-promql) | `query`, either `time_range` and `step` or `evaluation_time` (exactly one mode), `allow_partial_coverage`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests`. An `evidence_ref` is refused with `unsupported` | `data` (`series`, `samples`), `scope` (the instant or range, the step alignment, the lookback), `coverage`, `accuracy`, `budget` | `max_rows` 200 series, ceiling 5,000; past it the result is `ok_bounded` with no cursor; a range of at most 11,000 steps; `max_response_bytes` 512 KiB default, 256 KiB floor, a series over it cut to a prefix of its samples | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
 | `ravel_search_logs` | Typed log search compiled to one SQL `SELECT` over `logs`, ordered by `(ts, observed_ts)`, rows grouped by attribute key set with the shared attributes listed once per group. See [Searching logs](#searching-logs) | `predicates` (each `key`, `op` and `value`), `has_word`, `severity`, `trace_id`, `time_range` (required), `max_rows`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_segments`, `max_store_requests`, an optional `cursor`. An `evidence_ref` is refused with `unsupported` | `data` (`__ravel_group`, `__ravel_group_attrs`, then the `logs` columns), `scope` (`predicates_applied`, `order_by`), `visibility`, `presentation`, `budget` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_get_trace` | Every span of one trace id, as rows of the `spans` table ordered by `(start_ts, span_id)` | `trace_id` (32 hexadecimal characters, either case), an optional `time_range`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests`. Without `time_range`, every span the tenant retains is read; with it, only spans that start inside it are returned | `data`, `scope`, `presentation`, `budget` | the shared budgets in the section below; past `max_rows` the result is cut, with status `ok_bounded` and `presentation.row_cap_hit` set | `unauthorized`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
+| `ravel_get_trace` | Every span of one trace id, as rows of the `spans` table ordered by `(start_ts, span_id)`, each with its depth in the span tree and whether its parent was returned. See [Span tree](#span-tree) | `trace_id` (32 hexadecimal characters, either case), an optional `time_range`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests`. Without `time_range`, every span the tenant retains is read; with it, only spans that start inside it are returned | `data` (`__ravel_depth`, `__ravel_parent`, then the `spans` columns), `scope`, `presentation`, `budget` | `max_rows` 200, ceiling 5,000; past it the result is cut, with status `ok_bounded`, `presentation.row_cap_hit` set and no cursor; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
 | `ravel_analyze_timeseries` | `change_point` or `summary` over each series of a PromQL range result, one row per series, reported as a heuristic. See [Analyzing a series](#analyzing-a-series) | `query`, `time_range`, `step` and `op` (`change_point` or `summary`), all required; `deadline_ms`, `max_response_bytes`, `max_rows`. `max_bytes_scanned`, `max_segments`, `max_store_requests` and an `evidence_ref` are refused with `unsupported` | `data`, `scope` (the range, the step alignment, the lookback), `coverage`, `accuracy` (`exact: false`, naming the heuristic), `presentation`, `budget` | `max_rows` 200 series, ceiling 5,000; past it the result is `ok_bounded` with no cursor; at most 1,000 matched series; a range of at most 11,000 steps; `max_response_bytes` 512 KiB default, 256 KiB floor; every row reports the method's minimum point count | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
 <!-- mcp-tools:end -->
 
@@ -42,10 +42,51 @@ mints no reference.
 reads every folded part and the unsealed tail the tenant still retains, so its
 cost grows with retention. With it, the bounds are kept exactly. Unlike the
 HTTP route, where `start` and `end` only choose which objects are read, the
-tool also drops every span that starts outside `time_range`. The tool
-returns the spans in view and does not build the span tree or report missing
-parents or orphans. `include_logs: true` and an `evidence_ref` are refused
-with `unsupported`.
+tool also drops every span that starts outside `time_range`. `include_logs:
+true` is refused with `unsupported`; for a trace's logs, call
+`ravel_search_logs` with a `trace_id` and a `time_range`. An `evidence_ref`
+is refused with `unsupported`.
+
+#### Span tree
+
+The tool adds two columns in front of the `spans` columns. They describe
+the tree over the rows returned; the row order stays `(start_ts, span_id)`.
+
+| Column | Value |
+| --- | --- |
+| `__ravel_parent` | `root`: the span has no parent id. `present`: a returned span has the parent's id. `missing`: no returned span has it, and the result is complete. `not_returned`: no returned span has it, and the result is not complete. `cycle`: following parents from this span leads back to it |
+| `__ravel_depth` | how many returned ancestors the span has: 0 for a `root`, and 0 for a span whose parent is `missing` or `not_returned`. Null for a `cycle` span, and for a span whose ancestors lead into a cycle |
+
+A result is complete when `presentation.row_cap_hit` and
+`presentation.bytes_cap_hit` are false, `presentation.rows_omitted` is 0,
+and `coverage.complete` is true. In any other result an absent parent is
+`not_returned`, never `missing`: it may be among the rows the caps
+dropped. A `missing` parent is not among the spans the lookup returned:
+it was never stored, it is no longer retained, or, with a `time_range`, it
+starts outside the window.
+
+When two returned spans share a span id, the first in row order is the
+parent: its children resolve to it, and their depth follows it.
+
+The labels are computed after the row and byte caps, over the rows that
+survive them. The byte cap is applied with both columns already filled
+with the widest value each can take, and the real values are written
+afterwards, so the two columns cannot push the response past the cap the
+byte fit applied.
+
+`next_steps` names the remedy:
+
+- `widen_time_range`: a parent is `missing` and the call named a
+  `time_range`. The parent may start outside it; widen or drop the window.
+- `raise_max_rows`: a parent is `not_returned`. Raise `max_rows` (up to
+  5,000) or narrow `time_range`.
+
+Otherwise neither step is listed, including for a `missing` parent when
+the call named no `time_range`.
+
+The two column names carry the `__ravel_` prefix by convention; the
+server does not reserve the prefix, so a declared attribute column with
+the same name is not refused.
 
 ### Ravel Agents tools
 
@@ -77,7 +118,7 @@ size it used, `max_rows` held to 1,000, as both `presentation.max_rows` and
 | `ravel_agent_events` | One page of the agent's events in `event_seq` order, optionally one operation's | `kind`, `key`, an optional `cursor`, an optional `operation`, `deadline_ms`, `max_response_bytes`, `max_rows` | `POST /api/v1/agents/events` | `max_rows` 200, at most 1,000; a full or byte-capped page carries `presentation.cursor`, the last event it kept | `unauthorized`, `invalid_argument`, `cursor_expired` (with a `restart_from_oldest_cursor` next step), `deadline`, `unavailable`, `internal` |
 | `ravel_agent_blocked_effects` | Effects in doubt, each with the inspector's text and the two reconcile requests that unblock it | `kind`, `key`, `deadline_ms`, `max_response_bytes` | `GET /api/v1/agents/effects` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `deadline`, `unavailable`, `internal` |
 
-The `tools/list` result is 16,058 bytes with the nine tools and 23,947
+The `tools/list` result is 16,177 bytes with the nine tools and 24,066
 bytes with all fifteen, against a budget of 24,576 bytes. A test pins both
 figures exactly.
 
@@ -657,10 +698,10 @@ resumes after the last complete group. To request the second page, pass the
 cursor from `presentation.cursor` back as `cursor`, with the same
 arguments.
 
-`ravel_get_trace` mints no cursor as served today: it returns the trace's
-spans in one page ordered by `(start_ts, span_id)`, and a trace larger than
-the row cap comes back with status `ok_bounded` and `row_cap_hit` rather
-than paged.
+`ravel_get_trace` mints no cursor: it returns the trace's spans in one
+page ordered by `(start_ts, span_id)`, and a trace larger than the row cap
+comes back with status `ok_bounded` and `row_cap_hit` rather than paged.
+Raise `max_rows` (up to 5,000) or narrow `time_range` to read more of it.
 
 When no complete group fits in the row cap, the server returns the
 rows it has, up to the row cap, with status `ok_bounded` and no cursor.
