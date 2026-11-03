@@ -91,6 +91,9 @@ above and no clean step.
 
 ### D2. While saturated, refuse a growing fraction of new ingest requests at the head
 
+OTAP batches draw at a second point, after their stream's tenant is
+resolved; see the OTAP batch amendment below.
+
 The detector keeps a shed fraction `p` between 0 and `--ingest-cpu-shed-max`
 (default 0.9). Each sample it moves `p` by one of three rules, with CPU use
 and deferred triggers averaged over 1 s as in D1:
@@ -268,4 +271,30 @@ third shows whether `p` settled or cycled (D2).
   shed draw is one atomic load and one random number per request.
 - `docs/ingest.md` and `docs/guides/ingest-affinity.md` ("Admission
   rejections") gain the new refusal, and `docs/reference/ravel-server-flags.md`
-  the two flags.
+  the two flags. The guide pointer is corrected by the OTAP batch amendment
+  below.
+
+## Amendment (2026-11-03): OTAP batches, a full window, and the guide pointer (#3720)
+
+<!-- amendment-applies: sections="D2. While saturated, refuse a growing fraction of new ingest requests at the head|Consequences" pointer="OTAP batch amendment" -->
+
+Three changes from implementing D1 and D2 (#3720).
+
+- **OTAP batches draw per batch.** An OTAP Arrow stream takes no in-flight
+  permit at the gRPC layer, so the draw D2 places there never runs for it.
+  The implementation draws once per `BatchArrowRecords` batch in
+  `process_batch` (`services/ravel-server/src/otap_grpc.rs`), right after
+  that batch's own in-flight permit and before its byte-rate check and
+  decode.
+  - The stream's tenant was resolved when it opened, so this draw runs after
+    the tenant, unlike D2's head refusal.
+  - A refused batch ends the stream with `RESOURCE_EXHAUSTED`, as the
+    in-flight ceiling already does: skipping one batch would leave the
+    stream's decoder state out of step with the sender.
+- **Saturation needs a full window.** Until the detector holds 1 s of
+  samples, the deferred average it feeds to D2's rules reads 0. A single
+  100 ms sample at startup therefore cannot raise `p`, while the hold and
+  decay rows apply from the first sample.
+- **The refusal is documented in `docs/ingest.md`.** It is not in the
+  "Admission rejections" section of `docs/guides/ingest-affinity.md`, which
+  is about Kubernetes CRD validation, not runtime ingest admission.

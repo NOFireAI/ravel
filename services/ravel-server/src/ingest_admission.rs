@@ -528,6 +528,18 @@ pub async fn admit_ingest_request<S: IngestAdmissionState>(
         }
     };
 
+    if state.ingest_concurrency().cpu_shed().draw() {
+        permit.release();
+        let resolver = state.tenant_resolver();
+        return refuse_from_head(
+            state.ingest_concurrency().head_refusal_drain(),
+            request,
+            cpu_shed_response(),
+            |headers| resolver.resolve(headers).is_ok(),
+        )
+        .await;
+    }
+
     let tenant = match state.tenant_resolver().resolve(request.headers()) {
         Ok(tenant) => tenant,
         Err(_) => {
@@ -778,6 +790,13 @@ where
         } else {
             None
         };
+        if let Some(permit) = &permit
+            && self.controller.cpu_shed().draw()
+        {
+            permit.release();
+            let response = cpu_shed_status().into_http();
+            return Box::pin(async move { Ok(response) });
+        }
         let (mut parts, body) = req.into_parts();
         let headers = grpc_head_headers(&parts.headers);
         let tenant = match self.resolver.resolve(&headers) {
@@ -969,6 +988,30 @@ pub(crate) fn pending_ack_shed_status() -> Status {
 /// client sees one status and one message whichever of them refused it.
 pub(crate) fn unauthenticated_status() -> Status {
     Status::unauthenticated("invalid or missing tenant credentials")
+}
+
+/// The message for a request refused by ADR-3718's CPU-aware shed draw.
+/// Shared with the gRPC status so both transports say the same thing.
+pub(crate) const CPU_SHED_MESSAGE: &str = "node is CPU-saturated, shedding ingest requests";
+
+/// 429 for a request refused by [`crate::cpu_shed::CpuShedGauge::draw`]
+/// (ADR-3718 D2): drawn right after the in-flight permit, before tenant
+/// resolution, so a saturated node does no tenant resolution for a request it
+/// will refuse. Same `Retry-After` shape as the in-flight and pending-ack
+/// sheds: the detector can release the fraction within seconds, so there is
+/// no per-caller refill time to report.
+pub(crate) fn cpu_shed_response() -> Response {
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, CPU_SHED_MESSAGE).into_response();
+    if let Ok(value) = HeaderValue::from_str(&INGEST_CONCURRENCY_RETRY_AFTER_SECONDS.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// A request refused by the CPU-aware shed draw, as `RESOURCE_EXHAUSTED`.
+/// Shared by every gRPC ingest service.
+pub(crate) fn cpu_shed_status() -> Status {
+    Status::resource_exhausted(CPU_SHED_MESSAGE)
 }
 
 #[cfg(test)]

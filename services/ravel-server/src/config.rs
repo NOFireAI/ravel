@@ -457,6 +457,33 @@ fn parse_cache_bulk_share(value: &str) -> Result<f64, String> {
     }
 }
 
+/// Parses `--ingest-cpu-shed-threshold` (ADR-3718 D2/D3): `0` disables CPU-aware
+/// shedding entirely, and any other value must be strictly above the 0.05
+/// release-level gap and at most `1.0`, since a smaller gap would make the
+/// release level negative.
+fn parse_ingest_cpu_shed_threshold(value: &str) -> Result<f64, String> {
+    let threshold: f64 = value.parse().map_err(|err| format!("{err}"))?;
+    if threshold == 0.0 {
+        return Ok(0.0);
+    }
+    if threshold > 0.05 && threshold <= 1.0 {
+        Ok(threshold)
+    } else {
+        Err("must be 0 (disabled) or strictly greater than 0.05 and at most 1".to_string())
+    }
+}
+
+/// Parses `--ingest-cpu-shed-max` (ADR-3718 D2): the cap on the shed fraction
+/// `p`, between 0 and 1 inclusive.
+fn parse_ingest_cpu_shed_max(value: &str) -> Result<f64, String> {
+    let cap: f64 = value.parse().map_err(|err| format!("{err}"))?;
+    if (0.0..=1.0).contains(&cap) {
+        Ok(cap)
+    } else {
+        Err("must be between 0 and 1".to_string())
+    }
+}
+
 /// Parses `--cache-bulk-scan-min-bytes`: a positive byte count. `0` would read
 /// every filtered `logs` statement as bulk; omitting the flag is how it stays
 /// off.
@@ -3070,6 +3097,45 @@ pub struct Cli {
     )]
     pub cpu_gate_write_inline_floor_bytes: u64,
 
+    /// The 1-second rolling-average process CPU fraction (of resolved cores,
+    /// ADR-3718 D3), at or above which the node counts as saturated for
+    /// ADR-3718's CPU-aware ingest admission, PROVIDED the 1-second
+    /// rolling-average rate of deferred flush triggers across every ingest
+    /// router is also above zero: CPU alone never trips shedding, since a
+    /// clean ceiling run can sit at over 90% CPU with no backlog at all. Once
+    /// saturated, the shed fraction `p` (the probability a new ingest request
+    /// is refused at the head, before tenant resolution) rises by 0.05 per
+    /// 100ms sample, capped at `--ingest-cpu-shed-max`; `p` holds while CPU
+    /// stays at or above `threshold - 0.05` even if deferrals have cleared
+    /// (closing the gap where a request would otherwise flap in and out of
+    /// shedding as deferrals momentarily hit zero); below that it decays by
+    /// 10% of itself per sample, snapping to exactly 0 under 0.01. Default
+    /// 0.95 is tuned to this scaling so it needs no manual adjustment from
+    /// 8 to 16+ vCPU hosts; `0` disables CPU-aware shedding entirely
+    /// (today's behavior, with no detector task spawned). Must be `0` or
+    /// strictly greater than 0.05 and at most 1; refused otherwise, not
+    /// clamped. The resolved threshold and core count are logged at startup
+    /// beside the other derived defaults.
+    #[arg(
+        long = "ingest-cpu-shed-threshold",
+        value_name = "FRACTION",
+        default_value_t = 0.95,
+        value_parser = parse_ingest_cpu_shed_threshold
+    )]
+    pub ingest_cpu_shed_threshold: f64,
+
+    /// The cap on ADR-3718's CPU-aware ingest admission shed fraction `p`:
+    /// however long the node stays saturated, at most this fraction of
+    /// incoming ingest requests is ever refused at the head. Default 0.9.
+    /// Must be between 0 and 1 inclusive; refused otherwise.
+    #[arg(
+        long = "ingest-cpu-shed-max",
+        value_name = "FRACTION",
+        default_value_t = 0.9,
+        value_parser = parse_ingest_cpu_shed_max
+    )]
+    pub ingest_cpu_shed_max: f64,
+
     /// Disables every ADR-0046 read cache in the process entirely: the query
     /// fetcher cache (`store::build_cache`) and the catalog's byte cache
     /// (`query::build_catalog`) both, not just the fetcher cache.
@@ -4819,6 +4885,36 @@ impl CpuGatePermits {
 impl Default for CpuGatePermits {
     fn default() -> Self {
         CpuGatePermits::derive(1)
+    }
+}
+
+/// The resolved ADR-3718 CPU-aware ingest admission settings, from
+/// [`Cli::resolve_cpu_shed`]. `Default` is `threshold: 0.0` (disabled), the
+/// one-core-equivalent default a test building a `ServerConfig` by hand gets,
+/// matching the stock no-shedding posture of every other admission ceiling's
+/// `Default` in this crate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CpuShedConfig {
+    /// `--ingest-cpu-shed-threshold`: the 1-second rolling average CPU
+    /// fraction (of resolved cores) at or above which the node counts as
+    /// saturated, provided deferred flushes are also above zero (ADR-3718
+    /// D1). `0.0` disables shedding entirely.
+    pub threshold: f64,
+    /// `--ingest-cpu-shed-max`: the cap on the shed fraction `p` (ADR-3718
+    /// D2).
+    pub max: f64,
+    /// The resolved core count the CPU signal is divided by (ADR-3718 D3),
+    /// from [`HostProfile::cores`].
+    pub cores: usize,
+}
+
+impl Default for CpuShedConfig {
+    fn default() -> Self {
+        CpuShedConfig {
+            threshold: 0.0,
+            max: 0.9,
+            cores: 1,
+        }
     }
 }
 
@@ -7737,6 +7833,18 @@ impl Cli {
             read: self.cpu_gate_read_permits.unwrap_or(derived.read),
             write: self.cpu_gate_write_permits.unwrap_or(derived.write),
             write_inline_floor_bytes: self.cpu_gate_write_inline_floor_bytes,
+        }
+    }
+
+    /// Resolve the ADR-3718 CPU-aware ingest admission settings: both flags
+    /// verbatim (their value parsers already enforce the legal ranges), plus
+    /// `host`'s resolved core count as the CPU signal's divisor (ADR-3718
+    /// D3).
+    pub fn resolve_cpu_shed(&self, host: HostProfile) -> CpuShedConfig {
+        CpuShedConfig {
+            threshold: self.ingest_cpu_shed_threshold,
+            max: self.ingest_cpu_shed_max,
+            cores: host.cores,
         }
     }
 
@@ -22773,6 +22881,53 @@ mod tests {
                 clap::error::ErrorKind::ValueValidation,
                 "{value}"
             );
+        }
+    }
+
+    /// ADR-3718 D2/D3: `0` disables the detector, and any other value must
+    /// clear the 0.05 release-level gap and stay at or below 1.
+    #[test]
+    fn ingest_cpu_shed_threshold_accepts_zero_and_the_valid_range() {
+        assert_eq!(
+            parse_ingest_cpu_shed_threshold("0").expect("0 disables"),
+            0.0
+        );
+        assert_eq!(
+            parse_ingest_cpu_shed_threshold("0.06").expect("just above the gap"),
+            0.06
+        );
+        assert_eq!(
+            parse_ingest_cpu_shed_threshold("0.95").expect("within range"),
+            0.95
+        );
+        assert_eq!(
+            parse_ingest_cpu_shed_threshold("1").expect("the inclusive upper bound"),
+            1.0
+        );
+    }
+
+    #[test]
+    fn ingest_cpu_shed_threshold_rejects_the_gap_boundary_and_out_of_range_values() {
+        for value in ["0.05", "1.01", "-0.1", "NaN"] {
+            parse_ingest_cpu_shed_threshold(value).expect_err(value);
+        }
+    }
+
+    /// ADR-3718 D2: the shed-fraction cap is a plain `[0, 1]` range, with no
+    /// release-level gap (unlike the threshold above).
+    #[test]
+    fn ingest_cpu_shed_max_accepts_the_closed_unit_range() {
+        for value in ["0", "0.05", "0.06", "0.95", "1"] {
+            let parsed =
+                parse_ingest_cpu_shed_max(value).unwrap_or_else(|err| panic!("{value}: {err}"));
+            assert_eq!(parsed, value.parse::<f64>().expect("test value parses"));
+        }
+    }
+
+    #[test]
+    fn ingest_cpu_shed_max_rejects_out_of_range_and_non_numeric_values() {
+        for value in ["1.01", "-0.1", "NaN"] {
+            parse_ingest_cpu_shed_max(value).expect_err(value);
         }
     }
 }
