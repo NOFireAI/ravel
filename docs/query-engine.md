@@ -3415,7 +3415,11 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `s3ListBytes`, `s3HeadRequests`/`s3HeadBytes`), plus `cacheHits`/
   `cacheMisses`/`cacheBytes`, `lateServedBytes`, `decompressedBytes`,
   `segmentsOpened`, `seriesMatched`, `bytesReused`, `peakIntermediateBytes`, and the
-  pre-existing per-run `rawF64Pages`/`rawF64Bytes`. No `segmentsPruned`
+  pre-existing per-run `rawF64Pages`/`rawF64Bytes`. `segmentsOpened` is the
+  number of distinct data objects whose footer this query decoded, counted
+  once per object whether the footer came from a store GET or from cached
+  bytes; an object pruned before its footer was opened does not count, and
+  one object read by several ranged GETs still counts once. No `segmentsPruned`
   here: `stats.segmentsPruned` (below) is the sole source. For the metrics
   lane it is `Catalog::resolve`'s own postings-pruning count. For the log
   lane it comes from the lane itself: a segment that any plan fetched (it
@@ -3438,7 +3442,13 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `s3GetRequests`, `s3GetWireBytes`, `s3ListRequests`, `cacheHits`,
   `cacheMisses`, `cacheServedBytes`, `lateServedBytes`,
   `decompressedOutputBytes`, `reusedRegionBytes`, `segmentsOpened`,
-  `seriesMatched`.
+  `seriesMatched`. `segmentsOpened` here is the same per-object open count as
+  `stats.accounting.segmentsOpened`, attributed to whichever phase opened
+  each object's footer; it is the per-object denominator beside
+  `data_objects_touched` (an object whose footer opened but whose blocks
+  were never read counts here but not there), and an object opened under one
+  phase is not re-counted if a later phase in the same query reuses its
+  already-open footer.
 
   Additive to `stats.accounting`, which is unchanged: every per-phase
   counter sums back to its pooled counterpart there. Each byte field
