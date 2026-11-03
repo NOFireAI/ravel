@@ -47,6 +47,7 @@ use crate::service::QueryBackend;
 
 use super::ToolContext;
 use super::capabilities::refused_with;
+use super::promql_range::{EvalRange, NS_PER_MS, Refusal, eval_range, whole_ms};
 
 const TOOL: &str = "ravel_query_promql";
 
@@ -56,20 +57,13 @@ const TOOL: &str = "ravel_query_promql";
 /// block reports, and the server's MCP tests pin the two equal.
 pub const LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
 
-/// The most steps one range evaluation may have. The evaluator owns the
-/// figure (`ravel_promql::DEFAULT_MAX_RANGE_POINTS`) and refuses past it as
-/// `unsupported` with no next step; this crate does not depend on the
-/// evaluator, so this copy refuses first as `invalid_argument` with a next
-/// step, and the server's MCP tests pin the two equal.
-pub const MAX_RANGE_POINTS: usize = 11_000;
+pub use super::promql_range::MAX_RANGE_POINTS;
 
 /// Room left below the fit cap for the presentation counters `fit` and this
 /// body set after the series are measured: four `u64` counters, zero when
 /// measured and at most 20 digits each, and two flags one byte longer when
 /// set.
 const COUNTER_SLACK: usize = 128;
-
-const NS_PER_MS: i64 = 1_000_000;
 
 /// The column names of the port's per-sample rows, in order.
 const SAMPLE_COLUMNS: [&str; 4] = ["series", "ts_ns", "value", "histogram"];
@@ -78,22 +72,8 @@ const SAMPLE_COLUMNS: [&str; 4] = ["series", "ts_ns", "value", "histogram"];
 /// millisecond.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
-    Instant {
-        at_ns: i64,
-    },
-    Range {
-        start_ns: i64,
-        end_ns: i64,
-        step_ns: i64,
-    },
-}
-
-impl Mode {
-    /// The last step a range evaluates: the greatest `start + k * step`
-    /// below `end`.
-    fn last_step_ns(start_ns: i64, end_ns: i64, step_ns: i64) -> i64 {
-        start_ns + (end_ns - 1 - start_ns) / step_ns * step_ns
-    }
+    Instant { at_ns: i64 },
+    Range(EvalRange),
 }
 
 #[derive(Debug, Clone)]
@@ -102,8 +82,6 @@ struct Plan {
     mode: Mode,
     allow_partial: bool,
 }
-
-type Refusal = (Failure, Vec<NextStep>);
 
 /// Run the tool. Every argument refusal answers before `backend` is called.
 pub async fn run<B: QueryBackend>(args: Value, ctx: &ToolContext<'_>, backend: &B) -> Envelope {
@@ -130,19 +108,12 @@ pub async fn run<B: QueryBackend>(args: Value, ctx: &ToolContext<'_>, backend: &
             };
             backend.promql_instant(ctx.tenant_hash, &request).await
         }
-        Mode::Range {
-            start_ns,
-            end_ns,
-            step_ns,
-        } => {
-            // The engine's range is closed, so the half-open end becomes the
-            // millisecond before it. Both bounds are whole milliseconds and
-            // the end is after the start, so that is never before the start.
+        Mode::Range(range) => {
             let request = RangeRequest {
                 query: plan.query.clone(),
-                start_ms: start_ns / NS_PER_MS,
-                end_ms: end_ns / NS_PER_MS - 1,
-                step_ms: step_ns / NS_PER_MS,
+                start_ms: range.start_ms(),
+                end_ms: range.closed_end_ms(),
+                step_ms: range.step_ms(),
                 min_tokens: Vec::new(),
                 deadline: ctx.budgets.deadline,
                 allow_partial: plan.allow_partial,
@@ -187,7 +158,7 @@ fn plan(args: Value) -> Result<Plan, Refusal> {
         (Some(at), None, None) => Mode::Instant {
             at_ns: whole_ms("evaluation_time", crate::time::to_ns("evaluation_time", at))?,
         },
-        (None, Some(range), Some(step)) => range_mode(range, step)?,
+        (None, Some(range), Some(step)) => Mode::Range(eval_range(TOOL, range, step)?),
         (None, None, None) => {
             return Err(mode_refusal("neither an instant nor a range was given"));
         }
@@ -208,84 +179,6 @@ fn plan(args: Value) -> Result<Plan, Refusal> {
         mode,
         allow_partial: input.allow_partial_coverage,
     })
-}
-
-fn range_mode(range: &TimeRange, step: &str) -> Result<Mode, Refusal> {
-    let start_ns = whole_ms(
-        "time_range.start_ns",
-        crate::time::to_ns("time_range.start_ns", &range.start_ns),
-    )?;
-    let end_ns = whole_ms(
-        "time_range.end_ns",
-        crate::time::to_ns("time_range.end_ns", &range.end_ns),
-    )?;
-    if end_ns <= start_ns {
-        return Err(refusal(
-            FailureClass::InvalidArgument,
-            "time_range.end_ns must be after time_range.start_ns: the range is half-open, \
-             so an empty one has no step to evaluate"
-                .to_string(),
-        ));
-    }
-    let step_ns = whole_ms("step", step_ns(step))?;
-    let span_ns = i128::from(end_ns) - i128::from(start_ns);
-    let steps = (span_ns - 1) / i128::from(step_ns) + 1;
-    if steps > MAX_RANGE_POINTS as i128 {
-        // The smallest whole-millisecond step that brings the range under the
-        // limit: ceil(span / limit), since the steps number ceil(span / step).
-        let limit = MAX_RANGE_POINTS as i128;
-        let min_step_ms = (span_ns / i128::from(NS_PER_MS) + limit - 1) / limit;
-        return Err((
-            invalid(format!(
-                "time_range and step evaluate {steps} steps, over the {MAX_RANGE_POINTS} a \
-                 range evaluation may have"
-            )),
-            vec![NextStep {
-                action: TOOL.to_string(),
-                detail: format!(
-                    "widen step to at least {min_step_ms}ms, or narrow time_range, so the \
-                     range evaluates at most {MAX_RANGE_POINTS} steps"
-                ),
-            }],
-        ));
-    }
-    Ok(Mode::Range {
-        start_ns,
-        end_ns,
-        step_ns,
-    })
-}
-
-/// A step is a positive duration with a unit (`15s`, `1m`, `1h30m`). A bare
-/// number is refused: Prometheus reads it as seconds and every other D4 time
-/// input as nanoseconds, so either reading would surprise someone.
-fn step_ns(raw: &str) -> Result<i64, Failure> {
-    let duration = humantime::parse_duration(raw).map_err(|err| {
-        invalid(format!(
-            "step {raw:?} is not a duration with a unit, such as 30s or 1m: {err}"
-        ))
-    })?;
-    if duration.is_zero() {
-        return Err(invalid(format!("step {raw:?} must be positive")));
-    }
-    i64::try_from(duration.as_nanos())
-        .map_err(|_| invalid(format!("step {raw:?} does not fit an i64 nanosecond count")))
-}
-
-/// Refuse a figure that is not a whole millisecond, naming it in
-/// nanoseconds so the caller sees exactly what was left over.
-fn whole_ms(name: &str, ns: Result<i64, Failure>) -> Result<i64, Refusal> {
-    let ns = ns.map_err(|failure| (failure, Vec::new()))?;
-    if ns.rem_euclid(NS_PER_MS) != 0 {
-        return Err(refusal(
-            FailureClass::InvalidArgument,
-            format!(
-                "{name} is {ns} ns, not a whole millisecond: PromQL evaluates at millisecond \
-                 resolution, and rounding would evaluate a time the call did not name"
-            ),
-        ));
-    }
-    Ok(ns)
 }
 
 fn mode_refusal(what: &str) -> Refusal {
@@ -358,27 +251,39 @@ fn report_scope(envelope: &mut Envelope, mode: Mode) {
                 end_ns: at_ns.to_string(),
             });
             predicates.push(format!("instant evaluation at {at_ns} ns"));
+            predicates.push(lookback_predicate());
         }
-        Mode::Range {
-            start_ns,
-            end_ns,
-            step_ns,
-        } => {
-            envelope.scope.time_range = Some(TimeRange {
-                start_ns: start_ns.to_string(),
-                end_ns: end_ns.to_string(),
-            });
-            let last_ns = Mode::last_step_ns(start_ns, end_ns, step_ns);
-            predicates.push(format!(
-                "steps aligned to time_range.start_ns: {start_ns} + k * {step_ns} ns, every \
-                 step before {end_ns} ns, the last at {last_ns} ns"
-            ));
-        }
+        Mode::Range(range) => report_range_scope(envelope, range),
     }
+}
+
+/// State a range evaluation's half-open range in nanosecond strings, its
+/// step alignment, and the lookback. `ravel_analyze_timeseries` reports its
+/// range with the same lines.
+pub(crate) fn report_range_scope(envelope: &mut Envelope, range: EvalRange) {
+    let EvalRange {
+        start_ns,
+        end_ns,
+        step_ns,
+    } = range;
+    envelope.scope.time_range = Some(TimeRange {
+        start_ns: start_ns.to_string(),
+        end_ns: end_ns.to_string(),
+    });
+    let last_ns = range.last_step_ns();
+    let predicates = &mut envelope.scope.predicates_applied;
     predicates.push(format!(
+        "steps aligned to time_range.start_ns: {start_ns} + k * {step_ns} ns, every \
+         step before {end_ns} ns, the last at {last_ns} ns"
+    ));
+    predicates.push(lookback_predicate());
+}
+
+fn lookback_predicate() -> String {
+    format!(
         "lookback {LOOKBACK_NS} ns (5m): an instant selector at step t reads the latest \
          sample in (t - 5m, t]"
-    ));
+    )
 }
 
 /// One row per series from the port's one row per `(series, step)`. The
@@ -500,7 +405,7 @@ fn fit_series(
 
 fn bytes_next_step(mode: Mode) -> NextStep {
     let detail = match mode {
-        Mode::Range { .. } => {
+        Mode::Range(_) => {
             "the series did not fit max_response_bytes: widen step or narrow time_range for \
              fewer samples per series, or narrow the query for fewer series"
         }

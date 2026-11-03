@@ -18,6 +18,7 @@ pub mod describe_data;
 pub mod explain_query;
 pub mod find_labels;
 pub mod get_trace;
+pub mod promql_range;
 pub mod query_promql;
 pub mod query_sql;
 
