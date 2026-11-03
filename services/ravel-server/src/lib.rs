@@ -14,6 +14,7 @@ pub mod cache_warm;
 pub mod cli_reference;
 pub mod config;
 pub mod cpu_gates;
+pub mod cpu_shed;
 #[cfg(feature = "sql")]
 pub mod declared_columns;
 pub mod distrib;
@@ -809,6 +810,13 @@ pub struct ServerConfig {
     /// from [`config::Cli::resolve_cpu_gate_permits`]. [`start`] builds both
     /// gates from this in every mode.
     pub cpu_gate_permits: config::CpuGatePermits,
+    /// ADR-3718's CPU-aware ingest admission settings, from
+    /// [`config::Cli::resolve_cpu_shed`]. [`start`] spawns the saturation
+    /// detector (`cpu_shed::Detector`) from this when `threshold > 0.0`, and
+    /// publishes its shed fraction into the shared
+    /// [`ingest_concurrency::IngestConcurrencyController`] every ingest
+    /// admission path already reads.
+    pub cpu_shed: config::CpuShedConfig,
     /// The process-wide in-flight ingest-request ceiling, from
     /// `--max-inflight-ingest-requests` (default `Bounded(1024)`, `0` maps to
     /// `Unlimited`). [`start`] builds one shared
@@ -1170,6 +1178,12 @@ pub struct Running {
     /// transport that receives it, through its own router state rather than
     /// an axum route.
     pub query_service: Option<service::QueryService>,
+    /// ADR-3718's CPU-aware shed gauge, for a reachability test to pin `p`
+    /// directly with [`cpu_shed::CpuShedGauge::set_for_test`] rather than
+    /// drive the real detector loop or real CPU load. Test-only seam, behind
+    /// the same feature that exposes `set_for_test` itself.
+    #[cfg(any(test, feature = "cpu-shed-test-support"))]
+    pub cpu_shed: Arc<cpu_shed::CpuShedGauge>,
     /// The query service backing the mTLS router's query surfaces, `Some`
     /// exactly when a query-serving mode was configured with an mTLS
     /// listener. A separate instance from [`Running::query_service`] because
@@ -2838,6 +2852,42 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // sheds independently against its own local bound.
     let ingest_concurrency =
         ingest_concurrency::IngestConcurrencyController::shared(config.ingest_concurrency_limit);
+
+    // ADR-3718: CPU-aware ingest admission. The saturation detector samples
+    // this process's own CPU time and the sum of every ingest router's
+    // deferred-flush-trigger counter, and publishes a shed fraction into the
+    // gauge every ingest admission path already reads off `ingest_concurrency`
+    // (`crate::ingest_admission`). `Detector::run` itself no-ops when
+    // `config.cpu_shed.threshold <= 0.0` (`--ingest-cpu-shed-threshold 0`) or
+    // when `/proc/self/stat` is unavailable (off Linux), so spawning
+    // unconditionally costs nothing extra in either case.
+    {
+        let metrics_router = ingest_router.clone();
+        let log_router = log_ingest_router.clone();
+        let span_router = span_ingest_router.clone();
+        let deferred_total = move || {
+            metrics_router
+                .as_ref()
+                .map(|r| r.metrics().flush_trigger_deferred_total())
+                .unwrap_or(0)
+                + log_router
+                    .as_ref()
+                    .map(|r| r.metrics().flush_trigger_deferred_total())
+                    .unwrap_or(0)
+                + span_router
+                    .as_ref()
+                    .map(|r| r.metrics().flush_trigger_deferred_total())
+                    .unwrap_or(0)
+        };
+        let detector = cpu_shed::Detector::new(
+            Box::new(cpu_shed::ProcSelfStatCpuSource),
+            config.cpu_shed.cores,
+            config.cpu_shed.threshold,
+            config.cpu_shed.max,
+            ingest_concurrency.cpu_shed_handle(),
+        );
+        tokio::spawn(detector.run(Arc::new(SystemClock), deferred_total));
+    }
 
     // Per-tenant wire (compressed) request-body byte counter (ADR-0084 decision
     // 5): one shared instance per process, threaded into every `GatewayState`
@@ -4901,6 +4951,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         ingest_router,
         metadata_sink,
         query_accounting,
+        #[cfg(any(test, feature = "cpu-shed-test-support"))]
+        cpu_shed: ingest_concurrency.cpu_shed_handle(),
         query_service: query_service_handle,
         mtls_query_service: mtls_query_service_handle,
         published_alerts,
@@ -5938,6 +5990,7 @@ mod startup_test_support {
             cache_dir: None,
             catalog_resolve_concurrency: None,
             cpu_gate_permits: Default::default(),
+            cpu_shed: Default::default(),
             ingest_concurrency_limit: ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
             max_pending_strict_acks: 8_192,
             ingest_buffer_budget_limit: ravel_ingest::IngestByteBudgetLimit::Unlimited,

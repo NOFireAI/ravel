@@ -294,6 +294,12 @@ heap-profiling = ["tikv-jemallocator/profiling"]
 # production configuration can send unsigned GCS requests.
 gcs-test-endpoint = ["ravel-object-store/test-support"]
 
+# Test-only: exposes `cpu_shed::CpuShedGauge::set_for_test` to the integration
+# test binaries under `tests/`, which pin `p` directly (ADR-3718) rather than
+# drive the real detector loop or real CPU load. The dev-dependency on this
+# crate below turns it on for test builds; no published build enables it.
+cpu-shed-test-support = []
+
 # Examples default to `test = false`; this one carries a test module that
 # pins its no-argument output, which a test target is needed to run.
 [[example]]
@@ -364,7 +370,7 @@ zstd = { workspace = true }
 # (`ravel_object_store::gcs::fake`), which needs unsigned requests; this crate's
 # own `gcs-test-endpoint` feature is what lets `--gcs-endpoint` skip them.
 ravel-object-store = { workspace = true, features = ["test-support"] }
-ravel-server = { path = ".", features = ["gcs-test-endpoint"] }
+ravel-server = { path = ".", features = ["gcs-test-endpoint", "cpu-shed-test-support"] }
 
 [lints]
 workspace = true

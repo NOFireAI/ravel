@@ -607,6 +607,12 @@ impl LogIngestMetrics {
         self.shard_skew.record_flush_trigger_deferred(shard);
     }
 
+    /// Sum across shards of `flush_trigger_deferred`, one relaxed atomic load
+    /// per shard (ADR-3718 D1).
+    pub fn flush_trigger_deferred_total(&self) -> u64 {
+        self.shard_skew.flush_trigger_deferred_total()
+    }
+
     /// Point-in-time per-shard skew figures, sorted by shard index (issue #865),
     /// the log counterpart of [`crate::IngestMetrics::shard_skew_by_shard`]. A
     /// shard with no recorded activity is simply absent.

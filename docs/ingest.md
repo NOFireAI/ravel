@@ -78,7 +78,7 @@ not covered.
 
 For OTLP metrics, logs and traces on both transports and for Remote Write,
 the permit is taken from the request head, before the request body is read or
-decoded, and the tenant credential is checked right after it in the same
+decoded, and the tenant credential is checked right after it, in the same
 place: on the HTTP surfaces by a middleware layer that runs ahead of the body
 extractor, and on the gRPC OTLP services by a tower layer on the listener that
 runs before tonic reads a body frame. So a shed request is never decoded or
@@ -87,6 +87,25 @@ inflate a body, and the ceiling bounds concurrent decode rather than following
 it. A refusal keeps its status and message: `RESOURCE_EXHAUSTED` for a shed,
 and `UNAUTHENTICATED` with "invalid or missing tenant credentials" for bad
 credentials on gRPC.
+
+A second, CPU-aware shed draws right between the in-flight permit and the
+credential check (ADR-3718): a background detector samples the process's own
+CPU use and the ingest routers' deferred-flush-trigger rate every 100 ms, and
+while both are elevated at once (CPU at or above `--ingest-cpu-shed-threshold`,
+default 0.95 of the resolved core count, and at least one deferred trigger in
+the last second) it raises a shed fraction `p`, capped at
+`--ingest-cpu-shed-max` (default 0.9). Every admitted request then draws once
+against the published `p`; CPU use alone never trips it; see ADR-3718 D1/D2
+for the exact three-way rule that moves `p` and the hold band that lets it
+settle instead of cycling. A drawn refusal goes through the same
+`refuse_from_head` path and the same drain caps as the in-flight shed above
+(`ravel_ingest_head_refusal_undrained_total` counts it the same way), with the
+in-flight permit released first, so an unauthenticated request that arrives
+while shedding also gets 429, not 401: the draw runs before tenant resolution.
+Refusals count on `ravel_ingest_cpu_shed_total{mode}`; the current `p` exports
+as the gauge `ravel_ingest_cpu_shed_fraction`. `--ingest-cpu-shed-threshold 0`
+disables the detector entirely (today's pre-ADR-3718 behavior, no background
+task spawned).
 
 An HTTP/1 server that answers and closes a connection with request bytes still
 unread can reach the client as a reset or a broken pipe instead of the
