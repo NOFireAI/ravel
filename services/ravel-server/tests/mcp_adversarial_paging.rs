@@ -23,7 +23,9 @@
 //! listed and not what they hold, so a row committed after the mint into an
 //! hour it does list can still appear on a later page if it sorts after the
 //! cursor position, and is silently omitted from every page if it sorts
-//! before it; the last three tests pin both.
+//! before it; three tests pin both. Because a row committed that way can also
+//! change a value computed from other rows, an order on such a value mints no
+//! cursor at all (issue #3749), which one more test pins.
 
 #![cfg(feature = "mcp")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -529,6 +531,111 @@ async fn a_row_committed_into_the_mint_hour_after_the_mint_may_appear_on_a_later
     )
     .await;
     assert_eq!(values(&two), [3.0, 3.5], "{two}");
+
+    running.shutdown().await.expect("server stops");
+}
+
+/// Each row of a `SELECT ts, count(*) AS c` page as its `(ts, c)` cells.
+fn counts(page: &Value) -> Vec<(String, String)> {
+    rows(page)
+        .iter()
+        .map(|row| {
+            let cell = |at: usize| row[at].as_str().expect("an integer cell").to_string();
+            (cell(0), cell(1))
+        })
+        .collect()
+}
+
+/// ADR-1374's 2026-09-12 amendment, item 4 ("a row is never repeated"),
+/// against an order term computed from other rows (issue #3749). Page one of
+/// `ORDER BY c, ts` over `count(*) AS c` serves the groups ts 10 (one row) and
+/// ts 20 (two rows). Two rows at ts 10 are then committed into the mint
+/// instant's own ingest hour, which a fresh page one at the mint instant
+/// counts, so ts 10 now sorts after where a cursor on `(c, ts)` would sit.
+/// The statement carries no cursor: page one is `ok_bounded` with an
+/// `order_by_the_rows_own_columns` next step, nothing resumes, and no group
+/// is served twice.
+///
+/// FLIP: restoring the `count(...)` arm of `expression_cursor_support` in
+/// `crates/ravel-sql/src/page_plan.rs` and making `depends_on_other_rows`
+/// answer false mints a cursor after `(2, 20)`, and the rest of the walk
+/// serves ts 10 again with a count of 3.
+#[tokio::test]
+async fn query_sql_an_order_by_a_count_mints_no_cursor_so_a_late_row_repeats_no_group() {
+    let clock = Clock::now();
+    let store = memory_store();
+    metrics(
+        store.as_ref(),
+        clock.early(),
+        1,
+        "a",
+        &[(10, 1.0), (20, 2.0), (30, 3.0)],
+    )
+    .await;
+    metrics(
+        store.as_ref(),
+        clock.early(),
+        2,
+        "b",
+        &[(20, 2.0), (30, 3.0)],
+    )
+    .await;
+    metrics(store.as_ref(), clock.early(), 3, "c", &[(30, 3.0)]).await;
+    let running = start(server_config(), store.clone()).await;
+    let backend = backend(&running);
+    let arguments = json!({
+        "query": "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY c, ts",
+        "time_range": window(),
+    });
+
+    let one = page("ravel_query_sql", &backend, &arguments, None, clock.mint).await;
+    assert_eq!(
+        counts(&one),
+        [("10".into(), "1".into()), ("20".into(), "2".into())],
+        "{one}"
+    );
+
+    metrics(store.as_ref(), hour(clock.mint), 4, "late", &[(10, 1.5)]).await;
+    metrics(store.as_ref(), hour(clock.mint), 5, "later", &[(10, 1.5)]).await;
+
+    let listed = page("ravel_query_sql", &backend, &arguments, None, clock.mint).await;
+    assert_eq!(
+        counts(&listed),
+        [("20".into(), "2".into()), ("10".into(), "3".into())],
+        "{listed}"
+    );
+
+    let rest = match cursor_of(&one) {
+        Some(cursor) => {
+            rest_of_walk(
+                "ravel_query_sql",
+                &backend,
+                &arguments,
+                cursor,
+                clock.later,
+                counts,
+            )
+            .await
+        }
+        None => Vec::new(),
+    };
+    let mut served: Vec<String> = counts(&one)
+        .into_iter()
+        .chain(rest.iter().flatten().cloned())
+        .map(|(ts, _)| ts)
+        .collect();
+    let walked = served.clone();
+    served.sort();
+    served.dedup();
+    assert_eq!(served.len(), walked.len(), "a group served twice: {rest:?}");
+
+    assert_eq!(cursor_of(&one), None, "{one}");
+    assert_eq!(one["status"], json!("ok_bounded"), "{one}");
+    assert_eq!(
+        one["next_steps"][0]["action"],
+        json!("order_by_the_rows_own_columns"),
+        "{one}"
+    );
 
     running.shutdown().await.expect("server stops");
 }
