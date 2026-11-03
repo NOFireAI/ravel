@@ -882,23 +882,8 @@ async fn log_selector_on_api_v1_query_counts_each_footer_once_under_plan() {
     let (status, body) = call(&app, &uri, Some("secret-a")).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(vector_results(&body)[0]["value"][1], "8", "body: {body}");
-    let phases = body["data"]["stats"]["phases"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no phases: {body}"));
-    let field = |name: &str, key: &str| -> u64 {
-        phases
-            .iter()
-            .find(|p| p["phase"] == name)
-            .unwrap_or_else(|| panic!("no {name} phase: {body}"))[key]
-            .as_u64()
-            .unwrap_or_else(|| panic!("{name}.{key} is a u64: {body}"))
-    };
-    let opened: Vec<(&str, u64)> = ["resolve", "plan", "probe", "scan", "keyIndex"]
-        .into_iter()
-        .map(|name| (name, field(name, "segmentsOpened")))
-        .collect();
     assert_eq!(
-        opened,
+        segments_opened_by_phase(&body),
         [
             ("resolve", 0),
             ("plan", 2),
@@ -910,7 +895,62 @@ async fn log_selector_on_api_v1_query_counts_each_footer_once_under_plan() {
     );
     // The scan did read the matching object: its zero is not for want of a
     // read.
-    assert!(field("scan", "s3GetRequests") >= 1, "body: {body}");
+    assert!(phase_field(&body, "scan", "s3GetRequests") >= 1, "body: {body}");
+}
+
+/// The count is per selector fetch, not per query (issue #3745): an
+/// expression with two log selectors over the same two objects fetches once
+/// per selector, and each fetch decodes both footers under `plan`, so `plan`
+/// reads 2 x objects = 4. The engine does not dedupe objects across
+/// selectors; a per-query count would read 2.
+#[tokio::test]
+async fn two_log_selectors_on_api_v1_query_count_each_footer_once_per_selector() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    fixture(&store, tid.hash()).await;
+    let app = build_router(store, EngineConfig::default(), &tid);
+
+    let uri = format!(
+        "/api/v1/query?query={}&time={}",
+        encode_query_param(
+            r#"sum(count_over_time(ravel_log_lines{job="api"}[1h])) / sum(count_over_time(ravel_log_lines{job="worker"}[1h]))"#
+        ),
+        secs(BASE + 20 * NS)
+    );
+    let (status, body) = call(&app, &uri, Some("secret-a")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(vector_results(&body)[0]["value"][1], "2", "8 / 4: {body}");
+    assert_eq!(
+        segments_opened_by_phase(&body),
+        [
+            ("resolve", 0),
+            ("plan", 4),
+            ("probe", 0),
+            ("scan", 0),
+            ("keyIndex", 0)
+        ],
+        "body: {body}"
+    );
+}
+
+/// `stats.phases[name][key]` of a `/api/v1/query` response.
+fn phase_field(body: &JsonValue, name: &str, key: &str) -> u64 {
+    body["data"]["stats"]["phases"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no phases: {body}"))
+        .iter()
+        .find(|p| p["phase"] == name)
+        .unwrap_or_else(|| panic!("no {name} phase: {body}"))[key]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{name}.{key} is a u64: {body}"))
+}
+
+/// `segmentsOpened` of every phase of a `/api/v1/query` response.
+fn segments_opened_by_phase(body: &JsonValue) -> Vec<(&'static str, u64)> {
+    ["resolve", "plan", "probe", "scan", "keyIndex"]
+        .into_iter()
+        .map(|name| (name, phase_field(body, name, "segmentsOpened")))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
