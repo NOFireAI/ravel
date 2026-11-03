@@ -520,7 +520,6 @@ def placeholders(truth, run):
     }
     for size, ids in truth["in_lists"]["trace_id"].items():
         p[f"in_trace_ids_x_{size}"] = ", ".join(f"X'{t}'" for t in ids)
-        p[f"in_trace_ids_s_{size}"] = ", ".join(f"'{t}'" for t in ids)
     for size, ids in truth["in_lists"]["request_id"].items():
         p[f"in_request_ids_{size}"] = ", ".join(f"'{r}'" for r in ids)
     for k, jc in truth["journey_c"].items():

@@ -159,13 +159,14 @@ truth_key = "in_trace_id.1000.spans"
 states = ["unfolded", "folded_leaves"]
 cold_only = true
 
-# Logs trace_id is a string column, so its IN lists are quoted strings.
+# Logs trace_id is FixedSizeBinary(16) like the spans column: an equality
+# coerces a quoted string, an IN list of strings does not plan.
 [[statement]]
 id = "logs_trace_in_1"
 tenant = "inv"
 table = "logs"
 kind = "sql"
-sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_s_1})"
+sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_x_1})"
 window = "none"
 truth_key = "in_trace_id.1.logs"
 states = ["unfolded", "folded_leaves"]
@@ -176,7 +177,7 @@ id = "logs_trace_in_10"
 tenant = "inv"
 table = "logs"
 kind = "sql"
-sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_s_10})"
+sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_x_10})"
 window = "none"
 truth_key = "in_trace_id.10.logs"
 states = ["unfolded", "folded_leaves"]
@@ -187,7 +188,7 @@ id = "logs_trace_in_100"
 tenant = "inv"
 table = "logs"
 kind = "sql"
-sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_s_100})"
+sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_x_100})"
 window = "none"
 truth_key = "in_trace_id.100.logs"
 states = ["unfolded", "folded_leaves"]
@@ -198,7 +199,7 @@ id = "logs_trace_in_1000"
 tenant = "inv"
 table = "logs"
 kind = "sql"
-sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_s_1000})"
+sql = "SELECT body FROM logs WHERE trace_id IN ({in_trace_ids_x_1000})"
 window = "none"
 truth_key = "in_trace_id.1000.logs"
 states = ["unfolded", "folded_leaves"]
