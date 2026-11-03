@@ -540,7 +540,7 @@ fn json_cell(value: Value) -> Cell {
     }
 }
 
-fn labels_cell(labels: &LabelSet) -> Cell {
+pub(crate) fn labels_cell(labels: &LabelSet) -> Cell {
     let mut map = Map::new();
     for label in labels.iter() {
         map.insert(label.name.clone(), Value::String(label.value.clone()));
