@@ -246,9 +246,11 @@ byte fit applied.
 Otherwise neither step is listed, including for a `missing` parent when
 the call named no `time_range`.
 
-The two column names carry the `__ravel_` prefix by convention; the
-server does not reserve the prefix, so a declared attribute column with
-the same name is not refused.
+The two column names carry the reserved `__ravel_` prefix. A new declared
+typed attribute column whose key starts with `__ravel_` is refused, so no
+new declaration can take either name. The one exception is a tenant config
+record stored before that rule: its declared `__ravel_` keys are still read
+and served.
 
 ### Ravel Agents tools
 
@@ -506,7 +508,9 @@ The result's first two columns are added by the tool, and the `logs`
 columns follow in table order. The two tool columns carry the `__ravel_`
 prefix of the `logs` schema's own synthetic names, so a typed
 attribute column named `group` or `group_attrs` is returned once, under its
-own name, beside them:
+own name, beside them. A new declared key starting with `__ravel_` is
+refused; only a tenant config record stored before that rule can still
+declare one:
 
 | Column | Value |
 | --- | --- |

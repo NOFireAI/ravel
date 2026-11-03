@@ -1871,7 +1871,15 @@ has no per-key remove, so pass the full intended list.
 `set` validates on the same rules as the flags. It rejects an empty key, a
 duplicate key, the same key with two types, and a key that collides with one
 of the nine fixed logs columns (`ts`, `observed_ts`, `severity_num`,
-`severity_text`, `body`, `trace_id`, `span_id`, `flags`, `attrs`). It then
+`severity_text`, `body`, `trace_id`, `span_id`, `flags`, `attrs`). It also
+rejects a key that starts with `__ravel_`, the prefix of Ravel's own
+synthetic column names. The comparison is case-sensitive, so `__Ravel_x` is
+accepted. A tenant record stored before that rule keeps any `__ravel_` key
+it already declares: it still loads and is still served, and a command that
+changes another field of that record carries the key through and is
+accepted. A declaration `set` passes is new input, so `set` refuses a
+`__ravel_` key even when the stored record already has it, and the flags
+refuse one at startup. It then
 swaps the record with a compare-and-set, so a concurrent write is a reported
 conflict and not a silent overwrite.
 
