@@ -409,6 +409,8 @@ state = "unfolded"
 metric = "cold.max.keyindex_gets"
 lane = "counter"
 target_if = "m['row_06.hits_objects_over_512k'] <= v <= 2 * m['row_06.hits_objects']"
+miss_if = "v < m['row_06.hits_objects_over_512k']"
+miss_reason = "fewer keyIndex GETs than objects above 512 KiB: one was read without its probe"
 
 [[row.figure]]
 name = "objects_past_probe"

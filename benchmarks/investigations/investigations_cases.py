@@ -1256,6 +1256,32 @@ class Evaluate(Workdir):
     def test_storage_bytes_missing(self):
         self.assertEqual(self.check_storage_bytes_missing(), [])
 
+    def check_row_6_floor(self, evaluate_py=EVALUATE):
+        """Item 4: row 6's keyIndex GETs below the census's objects over 512 KiB read miss, with the reason."""
+        mod = load_module(evaluate_py, "evaluate_row6")
+        with open(BANDS, "rb") as f:
+            bands = {"row": [r for r in tomllib.load(f)["row"] if r["key"] == "row_06"]}
+        census = {("unfolded",): {"state": "unfolded", "census": {"tenants": {
+            "hits": {"data": {"logs": {"objects": 398, "objects_over_512k": 3}}}}}}}
+        cfg = {"lane": "local", "hits": True, "tenant": "inv", "scales": [1], "baseline": False,
+               "states": ["unfolded"]}
+        out = []
+        for gets, want in ((2, "miss"), (3, "pass"), (796, "pass"), (797, "miss")):
+            def fixed(calls, cfg, statement, state, metric, candidates=None, gets=gets):
+                return ("value", gets, "") if metric == "cold.max.keyindex_gets" else ("missing", None, "not set")
+            mod.statement_figure = fixed
+            figs = mod.run_rows(bands, cfg, {"unfolded": None}, None, None, {}, census, None, {}, {})
+            got = next(f for f in figs if f["id"] == "row_06.keyindex_gets")
+            if got["verdict"] != want:
+                out.append(f"{gets} keyIndex GETs read {got['verdict']}, want {want}")
+            if gets == 2 and got["reason"] != ("fewer keyIndex GETs than objects above 512 KiB: one was read "
+                                               "without its probe"):
+                out.append(f"2 keyIndex GETs reason {got['reason']!r}")
+        return out
+
+    def test_row_6_floor(self):
+        self.assertEqual(self.check_row_6_floor(), [])
+
     def needle_stamp(self, **fields):
         path = self.stamp_path("needle_blocks.json")
         with open(path) as f:
@@ -2223,6 +2249,13 @@ FLIPS = {
         '        b = (line.get("census") or {}).get("bytes")\n',
         '        b = (line.get("census") or {}).get("bytes", 0)\n',
         "check_storage_bytes_missing",
+    ),
+    "a band's lower bound not applied": (
+        '            ok = evaluate_expr(f.get("target_if", "True"), entry["value"], values)\n'
+        '            miss = evaluate_expr(f.get("miss_if", "False"), entry["value"], values)\n',
+        '            ok = evaluate_expr(f.get("target_if", "True").split(" <= ", 1)[-1], entry["value"], values)\n'
+        '            miss = False\n',
+        "check_row_6_floor",
     ),
     "a needle outside 25 % of planted passed": (
         "        elif abs(got - want) <= NEEDLE_BLOCK_BAND * want:\n",
