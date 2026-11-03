@@ -133,9 +133,9 @@ async fn seed(store: &dyn ObjectStoreBackend) {
 
 /// The envelope's shape is the D4 one and nothing in it but `data` speaks for
 /// the hostile strings: exactly the fourteen blocks, a success status, no
-/// failure, no next step, and no warning carrying a probe. The text block has
-/// exactly one `status:` line and one `row_count:` line, and no `failure:` or
-/// `next_step:` line at all.
+/// failure, no next step, and no probe in any string or key of any block
+/// other than `data`. The text block has exactly one `status:` line and one
+/// `row_count:` line, and no `failure:` or `next_step:` line at all.
 fn assert_data_only(what: &str, is_error: Option<bool>, envelope: &Value, text: &[String]) {
     assert_eq!(is_error, Some(false), "{what}: {envelope}");
     let keys: BTreeSet<&str> = envelope
@@ -157,6 +157,28 @@ fn assert_data_only(what: &str, is_error: Option<bool>, envelope: &Value, text: 
             assert!(!warning.contains(probe), "{what}: warning {warning:?}");
         }
     }
+    let mut outside_data = envelope.clone();
+    outside_data
+        .as_object_mut()
+        .expect("an envelope object")
+        .remove("data");
+    let serialized = outside_data.to_string();
+    for probe in PROBES {
+        assert!(
+            !serialized.contains(probe),
+            "{what}: {probe:?} outside data: {serialized}"
+        );
+    }
+    let mut strings = Vec::new();
+    strings_in(&outside_data, &mut strings);
+    for string in &strings {
+        for probe in PROBES {
+            assert!(
+                !string.contains(probe),
+                "{what}: {probe:?} outside data in {string:?}"
+            );
+        }
+    }
 
     assert_eq!(text.len(), 1, "{what}: one text block");
     let lines: Vec<&str> = text[0].lines().collect();
@@ -169,6 +191,21 @@ fn assert_data_only(what: &str, is_error: Option<bool>, envelope: &Value, text: 
         if let Some(warnings) = line.strip_prefix("warnings: ") {
             assert!(!warnings.contains("forged"), "{what}: {line:?}");
         }
+    }
+}
+
+/// Every string value and object key in `value`, unescaped.
+fn strings_in<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+    match value {
+        Value::String(string) => out.push(string),
+        Value::Array(items) => items.iter().for_each(|item| strings_in(item, out)),
+        Value::Object(map) => {
+            for (key, item) in map {
+                out.push(key);
+                strings_in(item, out);
+            }
+        }
+        _ => {}
     }
 }
 

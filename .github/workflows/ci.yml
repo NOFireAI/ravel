@@ -1601,7 +1601,7 @@ jobs:
   # ravel-server's `mcp` feature (ADR-1374), the same shape as
   # `features-agents` above. Mirrors scripts/gates.sh's mcp lane: `cargo
   # clippy -p ravel-server --features mcp --all-targets`, the feature-gated
-  # test binaries that lane lists, the lib tests whose path contains `mcp`, and
+  # test binaries that lane lists, the lib tests whole, and
   # under `--features mcp,agents` clippy and the mcp_agents_e2e binary. Gated on
   # server_or_operator, since the feature lives entirely in ravel-server and
   # ravel-mcp, and any unlisted path forces server_or_operator true.
