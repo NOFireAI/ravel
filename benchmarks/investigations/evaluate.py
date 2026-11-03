@@ -43,6 +43,9 @@ import tomllib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UNSUPPORTED = "unsupported-on-this-build"
+# A server refusal of a statement statements.toml marks
+# expect_refusal_on_main: the SQL complexity guard working as designed.
+GUARD = "refused-by-guard"
 PHASES = ("resolve", "plan", "probe", "scan", "keyIndex")
 PHASE_FIELDS = ("s3GetRequests", "s3GetWireBytes", "s3ListRequests", "segmentsOpened",
                 "decompressedOutputBytes", "cacheServedBytes")
@@ -351,21 +354,21 @@ class Calls:
                     problems.add("duplicate", f"call {key[0]}/{key[1]}/{key[2]} try {t}")
                 for c in lines:
                     outcome = c.get("outcome")
-                    # A refusal the server returned reads unsupported only on
-                    # a statement planned as a cap probe.
-                    if outcome == UNSUPPORTED and "http_status" in c and not (
-                            statements.get(c.get("statement") or "") or {}).get("expect_refusal_on_main"):
-                        outcome = c["outcome"] = "refused"
+                    # A refusal the server returned is refused-by-guard only on
+                    # a statement planned as a cap probe, refused on any other.
+                    if outcome in (UNSUPPORTED, GUARD) and "http_status" in c:
+                        probe = (statements.get(c.get("statement") or "") or {}).get("expect_refusal_on_main")
+                        outcome = c["outcome"] = GUARD if probe else "refused"
                     if outcome == "ok":
                         validate_call(c, problems)
                     elif outcome == "refused":
                         c["_judged"] = "refused"
                         problems.add("refused", f"{where(c)}: HTTP {c.get('http_status')} "
                                                 f"{c.get('reason') or c.get('error') or 'no text'}")
-                    elif outcome in (UNSUPPORTED, "not-run"):
+                    elif outcome in (UNSUPPORTED, GUARD, "not-run"):
                         if not c.get("reason"):
                             problems.add("missing", f"reason for {outcome} {where(c)}")
-                        if outcome == UNSUPPORTED and "http_status" in c and "wall_s" not in c:
+                        if outcome == GUARD and "wall_s" not in c:
                             problems.add("missing", f"wall_s in {where(c)}")
                     else:
                         c["_judged"] = "error"
@@ -505,18 +508,24 @@ def group_lines(calls, cfg, statement, state, temp):
     return [tries[t][0] for t in range(want)], None
 
 
-def index_served(c):
-    """True when an ok call's stats show the key index answered it."""
-    ki = (c.get("stats") or {}).get("keyIndex") if c.get("outcome") == "ok" else None
+def key_index_nonzero(c):
+    """True when an ok call's stats carry a nonzero keyIndex figure."""
+    ki = (c.get("stats") or {}).get("keyIndex")
     return isinstance(ki, dict) and bool(ki.get("keysProbed") or ki.get("partsCovered"))
 
 
 def control_1001(calls, cfg, statement, state, temp):
-    """Row 11's 1,001-key control of a 1,000-key IN statement: 1 when every
-    1,000-key call probed 1,000 keys with partsCovered reported and no
-    1,001-key call was index-served; 0 when the 1,001-key list was
-    index-served or the 1,000-key list probed another count; unsupported when
-    the 1,000-key list was refused or carries no tier-2 figures."""
+    """Row 11's 1,001-key control of a 1,000-key IN statement.
+
+    1 when every 1,000-key call probed exactly 1,000 keys with a nonzero
+    partsCovered, and every 1,001-key call was either refused or served by a
+    visible scan (probe or scan GETs, or blocks scanned) with no keyIndex
+    figure above zero. 0 when a 1,001-key call carries a nonzero keyIndex
+    figure, or was served with neither a keyIndex figure nor a scan, or a
+    1,000-key call probed another count or covered no part. The 1,001-key
+    arm is judged first; only a 1,000-key list that was itself refused, or
+    that carries no tier-2 figures, makes the figure refused-by-guard or
+    unsupported."""
     over = statement.replace("_1000", "_1001")
     lines, bad = group_lines(calls, cfg, statement, state, temp)
     if bad:
@@ -524,17 +533,28 @@ def control_1001(calls, cfg, statement, state, temp):
     lines_over, bad = group_lines(calls, cfg, over, state, temp)
     if bad:
         return bad[0], None, bad[1]
-    served = [c for c in lines_over if index_served(c)]
-    if served:
-        ki = served[0]["stats"]["keyIndex"]
-        return "value", 0, (f"{where(served[0])} was index-served: keysProbed {ki.get('keysProbed')} "
-                            f"partsCovered {ki.get('partsCovered')}")
-    if any(c.get("outcome") not in ("ok", UNSUPPORTED) for c in lines_over):
-        return "missing", None, f"a {temp} call of {over} in {state} neither served nor refused"
+    for c in lines_over:
+        outcome = c.get("outcome")
+        if outcome in (GUARD, UNSUPPORTED):
+            continue
+        if outcome != "ok" or c.get("_invalid"):
+            return "missing", None, f"{where(c)} neither served nor refused"
+        if key_index_nonzero(c):
+            ki = c["stats"]["keyIndex"]
+            return "value", 0, (f"{where(c)} was index-served: keysProbed {ki.get('keysProbed')} "
+                                f"partsCovered {ki.get('partsCovered')}")
+        m = call_metrics(c)
+        if m["probe_gets"] == 0 and m["scan_gets"] == 0 and m["blocks_scanned"] == 0:
+            return "value", 0, (f"{where(c)} served without a visible path: no keyIndex figure, "
+                                f"no probe or scan GET, no block scanned")
+    guarded = [c for c in lines if c.get("outcome") == GUARD]
+    if guarded:
+        return GUARD, None, ("refused by the SQL complexity guard: "
+                             + (guarded[0].get("reason") or "no reason given"))
     refused = [c for c in lines if c.get("outcome") == UNSUPPORTED]
     if refused:
-        return UNSUPPORTED, None, f"the 1,000-key list was refused: {refused[0].get('reason') or 'no reason given'}"
-    if any(c.get("outcome") != "ok" for c in lines):
+        return UNSUPPORTED, None, f"the 1,000-key list is unsupported: {refused[0].get('reason') or 'no reason given'}"
+    if any(c.get("outcome") != "ok" or c.get("_invalid") for c in lines):
         return "missing", None, f"a {temp} call of {statement} in {state} failed"
     for c in lines:
         ki = (c.get("stats") or {}).get("keyIndex")
@@ -542,6 +562,8 @@ def control_1001(calls, cfg, statement, state, temp):
             return UNSUPPORTED, None, f"{where(c)} carries no keyIndex.keysProbed and partsCovered on this build"
         if ki["keysProbed"] != 1000:
             return "value", 0, f"{where(c)} probed {ki['keysProbed']} keys, not 1000"
+        if not ki["partsCovered"]:
+            return "value", 0, f"{where(c)} probed 1000 keys with partsCovered {ki['partsCovered']}"
     return "value", 1, ""
 
 
@@ -569,8 +591,8 @@ def statement_figure(calls, cfg, statement, state, metric):
         n = sum(1 for c in lines if c.get("outcome") == "not-run")
         return "not-run", None, (c.get("reason") or "no reason given") + (
             f" ({n} of {len(lines)} tries)" if n != len(lines) else "")
-    if outcomes == {UNSUPPORTED}:
-        return UNSUPPORTED, None, lines[0].get("reason") or "no reason given"
+    if outcomes in ({UNSUPPORTED}, {GUARD}):
+        return outcomes.pop(), None, lines[0].get("reason") or "no reason given"
     if outcomes != {"ok"}:
         return "missing", None, f"a {temp} call of {statement} in {state} failed"
     invalid = [c for c in lines if c.get("_invalid")]
@@ -832,8 +854,7 @@ def check_restarts(calls, restarts, problems):
         if temp != "cold":
             continue
         for t, lines in sorted(tries.items()):
-            sent = any(c.get("outcome") in ("ok", "refused") or (c.get("outcome") == UNSUPPORTED and "http_status" in c)
-                       for c in lines)
+            sent = any(c.get("outcome") in ("ok", "refused", GUARD) for c in lines)
             if sent and (statement, state, t) not in restarts:
                 problems.add("missing", f"stamps/restarts.jsonl {statement}/{state}/{t}")
 
@@ -995,7 +1016,7 @@ def derived_value(expr, figures_by_id):
         ref = figures_by_id.get(e.args[0])
         if ref is None:
             return "missing", None, f"refers to figure {e.args[0]} that bands.toml does not define before it"
-        if ref["status"] in ("not-run", UNSUPPORTED):
+        if ref["status"] in ("not-run", UNSUPPORTED, GUARD):
             return ref["status"], None, f"{e.args[0]} is {ref['status']}: {ref['reason']}"
         return "missing", None, f"{e.args[0]} has no value ({ref['status']})"
     return "value", rnd(v), ""
@@ -1062,7 +1083,7 @@ def run_rows(bands, cfg, live, calls, stamps, folds, census, matrix, cost_figs, 
             miss = evaluate_expr(f.get("miss_if", "False"), entry["value"], values)
         except KeyError as e:
             ref = by_id.get(e.args[0])
-            if ref is not None and ref["status"] in ("not-run", UNSUPPORTED):
+            if ref is not None and ref["status"] in ("not-run", UNSUPPORTED, GUARD):
                 entry["verdict"] = ref["status"]
                 entry["reason"] = f"band refers to figure {e.args[0]}, {ref['status']}: {ref['reason']}"
             else:
@@ -1216,7 +1237,7 @@ def statement_detail(calls):
     for (statement, state, temp), tries in sorted(calls.groups.items()):
         lines = [v[0] for _, v in sorted(tries.items())]
         outcomes = {c.get("outcome") for c in lines}
-        if outcomes in ({UNSUPPORTED}, {"not-run"}):
+        if outcomes in ({UNSUPPORTED}, {GUARD}, {"not-run"}):
             out.append({"statement": statement, "state": state, "temp": temp, "status": outcomes.pop(),
                         "reason": lines[0].get("reason")})
             continue
