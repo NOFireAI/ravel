@@ -2582,8 +2582,15 @@ mod fast_path_prefetch_tests {
         };
 
         let failed = PhaseAccounting::new();
-        assert!(run(failed.clone()).await, "segment 2's failed GET fails the statement");
-        assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1, "the fault fired");
+        assert!(
+            run(failed.clone()).await,
+            "segment 2's failed GET fails the statement"
+        );
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            1,
+            "the fault fired"
+        );
         assert_eq!(
             failed.scan().snapshot().segments_opened,
             1,
@@ -2591,7 +2598,10 @@ mod fast_path_prefetch_tests {
         );
 
         let retried = PhaseAccounting::new();
-        assert!(!run(retried.clone()).await, "the second execution passes through");
+        assert!(
+            !run(retried.clone()).await,
+            "the second execution passes through"
+        );
         assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
         assert_eq!(retried.scan().snapshot().segments_opened, 3);
     }

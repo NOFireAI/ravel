@@ -11973,7 +11973,9 @@ mod fetch_stream_dir_tests {
             let fetcher = if above {
                 LogSegmentFetcher::new(Arc::clone(&backend))
                     .with_block_range_threshold(0)
-                    .with_block_range(BlockRangeFetcher::new(backend).with_whole_object_threshold(0))
+                    .with_block_range(
+                        BlockRangeFetcher::new(backend).with_whole_object_threshold(0),
+                    )
             } else {
                 LogSegmentFetcher::new(backend)
             };
@@ -11985,7 +11987,10 @@ mod fetch_stream_dir_tests {
 
             let failed = PhaseAccounting::new();
             let err = fetcher.fetch_stream_dir(&seg, TENANT, failed.plan()).await;
-            assert!(err.is_err(), "above {above}: the injected GET failure surfaces");
+            assert!(
+                err.is_err(),
+                "above {above}: the injected GET failure surfaces"
+            );
             assert_eq!(
                 fault.fault_count(Op::Get, FaultKind::Permanent),
                 1,
@@ -14497,7 +14502,12 @@ mod read_gate_tests {
         for (name, seg, query, reads) in [
             ("unordered span", &unordered, &keyed, false),
             ("at the threshold", &at_threshold, &keyed, false),
-            ("no key arm", &seg_ref, &LogQuery::new(i64::MIN, i64::MAX), false),
+            (
+                "no key arm",
+                &seg_ref,
+                &LogQuery::new(i64::MIN, i64::MAX),
+                false,
+            ),
             ("read", &seg_ref, &keyed, true),
         ] {
             assert_eq!(fetcher.key_probe_reads(seg, query), reads, "{name}");

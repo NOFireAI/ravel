@@ -895,7 +895,10 @@ async fn log_selector_on_api_v1_query_counts_each_footer_once_under_plan() {
     );
     // The scan did read the matching object: its zero is not for want of a
     // read.
-    assert!(phase_field(&body, "scan", "s3GetRequests") >= 1, "body: {body}");
+    assert!(
+        phase_field(&body, "scan", "s3GetRequests") >= 1,
+        "body: {body}"
+    );
 }
 
 /// The count is per selector fetch, not per query (issue #3745): an
