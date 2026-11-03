@@ -7,7 +7,10 @@
 //! per-block dictionary page (tag 7) decodes into the same shape once per
 //! block.
 
+use std::sync::Arc;
+
 use crate::LogSegError;
+use crate::decoded_cache::{MemoSlot, ReservationCell, StrBuffers};
 
 /// One bit per position: a dictionary entry's UTF-8 validity, or a block row's
 /// presence.
@@ -50,22 +53,36 @@ impl Validity {
     pub(crate) fn heap_bytes(&self) -> usize {
         self.words.capacity() * std::mem::size_of::<u64>()
     }
+
+    /// The number of set positions.
+    pub(crate) fn count_set(&self) -> usize {
+        self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// The bits as 64-bit words, position `i` at bit `i % 64` of word
+    /// `i / 64`; bits past [`len`](Self::len) are unset.
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
 }
 
 /// The entries' bytes, concatenated. Held as one `String` when every entry is
 /// UTF-8; otherwise the raw bytes beside a `String` of the UTF-8 entries alone,
 /// with its own offsets. Either way [`DictValues::text`] is a slice and a
-/// boundary check, never a second validation.
+/// boundary check, never a second validation. The text and its offsets sit
+/// behind `Arc`s of their own so an Arrow buffer built over them shares the
+/// bytes without holding the dictionary (ADR-3326, zero-copy values
+/// amendment, decision 3).
 #[derive(Debug)]
 enum Region {
-    Text(String),
+    Text(Arc<String>),
     Mixed {
         raw: Vec<u8>,
         /// The UTF-8 entries concatenated in dictionary order; a non-UTF-8
         /// entry contributes nothing.
-        text: String,
+        text: Arc<String>,
         /// `len + 1` offsets into `text`; a non-UTF-8 entry's span is empty.
-        text_offsets: Vec<i32>,
+        text_offsets: Arc<Vec<i32>>,
     },
     /// The entries' bytes with no entry validated yet
     /// ([`DictValues::unvalidated`]): every entry reads as not UTF-8 until an
@@ -97,11 +114,72 @@ fn check_offset_range(entries: usize, total: usize) -> Result<(), LogSegError> {
 /// A decoded string dictionary: one contiguous byte region, `len + 1` `i32`
 /// offsets into it, and a per-entry validity bit that is set when the entry's
 /// bytes are UTF-8. Validity is decided once, when the dictionary is built.
+///
+/// A dictionary a decoded-cache entry charges in full carries the memo slot
+/// `ravel-sql` fills with its Arrow values array, and shares its reservation
+/// cell with that entry (ADR-3326, zero-copy values amendment, decisions 1
+/// and 5).
 #[derive(Debug)]
 pub struct DictValues {
     region: Region,
-    offsets: Vec<i32>,
-    valid: Validity,
+    offsets: Arc<Vec<i32>>,
+    valid: Arc<Validity>,
+    memo: MemoSlot,
+    cell: Arc<ReservationCell>,
+}
+
+impl DictValues {
+    fn assemble(region: Region, offsets: Vec<i32>, valid: Validity) -> Self {
+        DictValues {
+            region,
+            offsets: Arc::new(offsets),
+            valid: Arc::new(valid),
+            memo: MemoSlot::default(),
+            cell: Arc::default(),
+        }
+    }
+
+    /// The memo slot, for a dictionary built validated; `None` for an
+    /// [`unvalidated`](Self::unvalidated) one, and for one holding a
+    /// non-UTF-8 entry on a big-endian target, whose validity words are not
+    /// in Arrow's bit order.
+    pub(crate) fn memo_slot(&self) -> Option<&MemoSlot> {
+        match self.region {
+            Region::Text(_) => Some(&self.memo),
+            Region::Mixed { .. } if cfg!(target_endian = "little") => Some(&self.memo),
+            Region::Mixed { .. } | Region::Raw(_) => None,
+        }
+    }
+
+    /// The dictionary's reservation cell.
+    pub(crate) fn reservation_cell(&self) -> &Arc<ReservationCell> {
+        &self.cell
+    }
+
+    /// The text, its offsets and, when an entry is not UTF-8, the entries'
+    /// validity, each shared. A `Raw` dictionary shares an empty text and is
+    /// never asked: it holds no memo slot ([`Self::memo_slot`]).
+    pub(crate) fn shared_buffers(&self) -> StrBuffers {
+        match &self.region {
+            Region::Text(s) => StrBuffers::Dict {
+                values: Arc::clone(s),
+                offsets: Arc::clone(&self.offsets),
+                valid: None,
+            },
+            Region::Mixed {
+                text, text_offsets, ..
+            } => StrBuffers::Dict {
+                values: Arc::clone(text),
+                offsets: Arc::clone(text_offsets),
+                valid: Some(Arc::clone(&self.valid)),
+            },
+            Region::Raw(_) => StrBuffers::Dict {
+                values: Arc::default(),
+                offsets: Arc::clone(&self.offsets),
+                valid: Some(Arc::clone(&self.valid)),
+            },
+        }
+    }
 }
 
 impl DictValues {
@@ -130,7 +208,7 @@ impl DictValues {
         let region = if texts.iter().all(Option::is_some) {
             let mut s = String::with_capacity(total);
             s.extend(texts.iter().flatten().copied());
-            Region::Text(s)
+            Region::Text(Arc::new(s))
         } else {
             let mut raw = Vec::with_capacity(total);
             for entry in entries {
@@ -146,15 +224,11 @@ impl DictValues {
             }
             Region::Mixed {
                 raw,
-                text,
-                text_offsets,
+                text: Arc::new(text),
+                text_offsets: Arc::new(text_offsets),
             }
         };
-        Ok(DictValues {
-            region,
-            offsets,
-            valid,
-        })
+        Ok(DictValues::assemble(region, offsets, valid))
     }
 
     /// The dictionary over `entries` with no entry validated: what a scan
@@ -172,11 +246,11 @@ impl DictValues {
             raw.extend_from_slice(entry);
             offsets.push(raw.len() as i32);
         }
-        Ok(DictValues {
-            region: Region::Raw(raw),
+        Ok(DictValues::assemble(
+            Region::Raw(raw),
             offsets,
-            valid: Validity::unset(entries.len()),
-        })
+            Validity::unset(entries.len()),
+        ))
     }
 
     /// Whether each entry's UTF-8 was decided when the dictionary was built,
@@ -400,8 +474,8 @@ impl EntryTexts {
             }
             Region::Mixed {
                 raw,
-                text,
-                text_offsets,
+                text: Arc::new(text),
+                text_offsets: Arc::new(text_offsets),
             }
         } else {
             let mut text = String::with_capacity(total);
@@ -414,13 +488,9 @@ impl EntryTexts {
                 valid.set(k);
                 offsets.push(text.len() as i32);
             }
-            Region::Text(text)
+            Region::Text(Arc::new(text))
         };
-        Ok(DictValues {
-            region,
-            offsets,
-            valid,
-        })
+        Ok(DictValues::assemble(region, offsets, valid))
     }
 }
 

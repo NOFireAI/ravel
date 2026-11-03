@@ -40,6 +40,7 @@
 use std::sync::Arc;
 
 use crate::block::{BytesColRef, DecodedBlock, DictColumn, I64Column};
+use crate::decoded_cache::{DecodedEntry, MemoSource};
 use crate::dict_values::DictValues;
 use crate::field_dir::FieldDir;
 use crate::record::{
@@ -395,6 +396,9 @@ pub struct ColumnarBlockView<'a> {
     rows: &'a [usize],
     /// Column ids served from the decoded-column cache (ADR-3326).
     served: &'a [u32],
+    /// The decoded-cache entries the block shares columns with, served or
+    /// just admitted.
+    pins: &'a [Arc<DecodedEntry>],
 }
 
 /// Shape only. Formatting a block's cells would defeat the point of a view that
@@ -424,12 +428,29 @@ impl<'a> ColumnarBlockView<'a> {
             block,
             rows,
             served: &[],
+            pins: &[],
         }
     }
 
     pub(crate) fn with_served(mut self, served: &'a [u32]) -> Self {
         self.served = served;
         self
+    }
+
+    pub(crate) fn with_pins(mut self, pins: &'a [Arc<DecodedEntry>]) -> Self {
+        self.pins = pins;
+        self
+    }
+
+    /// The memo slot of string column `column_id`, `Some` only when a
+    /// decoded-cache entry holds the very column this block reads, served or
+    /// just admitted, and the column can hold a memo: a plain column whose
+    /// text the decode validated, or a block's own dictionary built
+    /// validated (ADR-3326, zero-copy values amendment, decision 1). A
+    /// column a survivor narrowing replaced, a row group dictionary, and any
+    /// column of a scan without a decoded cache read `None`.
+    pub fn str_values_memo(&self, column_id: u32) -> Option<MemoSource<'a>> {
+        self.block.memo_source(column_id, self.pins)
     }
 
     /// The block's total row count, before the content predicate.
