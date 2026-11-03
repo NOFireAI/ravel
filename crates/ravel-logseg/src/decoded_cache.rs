@@ -34,8 +34,10 @@
 //! (`the_reservation_is_released_by_the_last_handle_not_by_eviction`).
 //! [`DecodedColumnCache::evict_for_pressure`] is the budget's evictor and
 //! frees only entries nothing outside the cache holds: no scan holds the
-//! entry and, when its column's [`ValuesMemo`] is filled, the memo reports no
-//! buffer held outside it.
+//! entry, nothing beyond the entry holds the column object carrying its
+//! reservation cell, and, when its column's [`ValuesMemo`] is filled, the memo
+//! reports no buffer held outside it
+//! (`pressure_eviction_counts_an_entry_whose_column_is_held_outside_as_held`).
 //!
 //! A cached string column whose text was validated carries a memo slot
 //! ([`MemoSlot`]): `ravel-sql` fills it with an Arrow values array sharing
@@ -317,9 +319,14 @@ impl DecodedEntry {
     }
 
     /// Whether something outside the cache holds the entry: a handle beyond
-    /// the index's own, or a buffer of its column's memo.
+    /// the index's own, a handle beyond the entry's on the column object that
+    /// shares its reservation cell, or a buffer of its column's memo. Each of
+    /// them keeps the reservation alive, so removing the entry would free
+    /// nothing (`pressure_eviction_counts_an_entry_whose_column_is_held_outside_as_held`).
     fn held(entry: &Arc<DecodedEntry>) -> bool {
-        Arc::strong_count(entry) > 1 || entry.col.memo_held_outside()
+        Arc::strong_count(entry) > 1
+            || entry.col.cell_column_held_outside()
+            || entry.col.memo_held_outside()
     }
 }
 
@@ -342,6 +349,7 @@ pub struct DecodedCacheCounters {
     ghost_hits: AtomicU64,
     margin_skips: AtomicU64,
     unvalidated_refusals: AtomicU64,
+    filled_cell_refusals: AtomicU64,
     deferred_set_estimate_bytes: AtomicU64,
     deferred_estimated: AtomicBool,
     deferred_served: AtomicBool,
@@ -362,6 +370,11 @@ pub struct DecodedCacheSnapshot {
     /// Offers refused because the column was a dictionary whose entries were
     /// not validated (ADR-3326, LIKE-deferred amendment, decision 4).
     pub unvalidated_refusals: u64,
+    /// Offers refused because the column already carries a filled
+    /// reservation cell: it was admitted concurrently under another key, or
+    /// its entry was evicted while something still held the column
+    /// (ADR-3326, zero-copy values amendment, decision 5).
+    pub filled_cell_refusals: u64,
     /// The plan-time estimate of the decoded set of the statement's scans
     /// that carry a Contains arm, summed over those scans; `None` when no
     /// such scan made a verdict (ADR-3326, serve-if-fits amendment). The SQL
@@ -399,6 +412,9 @@ impl DecodedCacheSnapshot {
             unvalidated_refusals: self
                 .unvalidated_refusals
                 .saturating_add(other.unvalidated_refusals),
+            filled_cell_refusals: self
+                .filled_cell_refusals
+                .saturating_add(other.filled_cell_refusals),
             deferred_set_estimate_bytes: match (
                 self.deferred_set_estimate_bytes,
                 other.deferred_set_estimate_bytes,
@@ -423,6 +439,7 @@ impl DecodedCacheCounters {
             ghost_hits: self.ghost_hits.load(Ordering::Relaxed),
             margin_skips: self.margin_skips.load(Ordering::Relaxed),
             unvalidated_refusals: self.unvalidated_refusals.load(Ordering::Relaxed),
+            filled_cell_refusals: self.filled_cell_refusals.load(Ordering::Relaxed),
             deferred_set_estimate_bytes: self
                 .deferred_estimated
                 .load(Ordering::Relaxed)
@@ -750,10 +767,13 @@ impl DecodedColumnCache {
     /// The budget's pressure evictor (ADR-3326 decision 4): evicts, in CLOCK
     /// order, entries nothing outside the cache holds until `want` bytes are
     /// freed or none remains, and returns the bytes freed. An entry a scan
-    /// still holds, or whose column's memo reports a buffer held outside it
-    /// ([`ValuesMemo::held_outside`]), stays, and its bytes count for
-    /// nothing: its reservation would not be released by removing it from the
-    /// index. Each pass logs one INFO line;
+    /// still holds, whose column object carrying its reservation cell has a
+    /// holder beyond the entry, or whose column's memo reports a buffer
+    /// held outside it ([`ValuesMemo::held_outside`]), stays, and its bytes
+    /// count for nothing: its reservation would not be released by removing
+    /// it from the index ([`DecodedEntry::held`];
+    /// `pressure_eviction_counts_an_entry_whose_column_is_held_outside_as_held`).
+    /// Each pass logs one INFO line;
     /// `slack` is the part of `want` the budget asks beyond the refused
     /// caller's shortfall (logged only).
     pub fn evict_for_pressure(&self, want: u64, slack: u64, cause: ExhaustionCause) -> u64 {
@@ -806,8 +826,9 @@ impl DecodedColumnCache {
             .fetch_add(evicted.len() as u64, Ordering::Relaxed);
         self.pressure_freed_bytes
             .fetch_add(freed, Ordering::Relaxed);
-        // The entries were the index's last handles: dropping them here,
-        // outside the lock, releases their reservations.
+        // `held` passed them over, so the index held each entry's last handle
+        // and nothing else held its cell's column or a memo buffer: dropping
+        // them here, outside the lock, releases their reservations.
         drop(evicted);
         freed
     }
@@ -959,8 +980,12 @@ impl DecodedColumnCache {
             if let Some(reservation) = reservation
                 && cell.fill(reservation).is_err()
             {
-                // Already admitted under another key; the reservation drops
-                // here and this one is not admitted.
+                // The column already carries a reservation: it was admitted
+                // concurrently under another key, or its entry was evicted
+                // while something outside the cache still held the column.
+                // The new reservation drops here and nothing is admitted.
+                inner.process.filled_cell_refusals += 1;
+                DecodedCacheCounters::bump(&counters.filled_cell_refusals, 1);
                 return None;
             }
             // Entries admitted between the two locks may have refilled the cap.
@@ -1587,6 +1612,92 @@ mod tests {
         );
         assert!(cache.is_empty());
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// ADR-3326, zero-copy values amendment, decision 5: the column object
+    /// that carries an entry's reservation cell keeps the reservation alive,
+    /// so the pressure pass counts the entry as held while anything beyond
+    /// the entry holds that column, with no scan holding the entry and no
+    /// memo built: a holder of a block's own dictionary's `DictValues`, as a
+    /// scan's `DictCache` holds a row group's, and a holder of a plain
+    /// column. Nothing is reported freed
+    /// for it, the resident total does not drop, and the budget's reserved
+    /// figure matches it. Once the outside holder drops, the pass frees it.
+    ///
+    /// FLIP: drop the `cell_column_held_outside` term from
+    /// `DecodedEntry::held` and the first pass of each case reports the
+    /// entry's bytes freed ("held through its column").
+    #[test]
+    fn pressure_eviction_counts_an_entry_whose_column_is_held_outside_as_held() {
+        let entries = vec![b"a".to_vec(), b"bc".to_vec()];
+        let dict = CachedColumn::dict_for_test(&entries, &[0, 1, 1], true).expect("dict");
+        let dict_holder: Box<dyn Any> =
+            Box::new(dict.dict_values_for_test().expect("a dictionary column"));
+        let plain_col = plain(&[b"ab", b"c"]);
+        let plain_holder: Box<dyn Any> = Box::new(plain_col.clone());
+        for (case, v, holder) in [
+            ("dict", dict, dict_holder),
+            ("plain", plain_col, plain_holder),
+        ] {
+            let budget = Arc::new(MemoryBudget::new(4 << 30));
+            let cache = DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)));
+            let c = DecodedCacheCounters::default();
+            let bytes = cache
+                .offer(key(0, 1), &v, AccessIntent::Interactive, &c)
+                .expect("admitted")
+                .bytes();
+            assert!(v.memo_slot().expect("memo capable").get().is_none());
+            drop(v);
+
+            assert_eq!(
+                cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted),
+                0,
+                "{case}: held through its column"
+            );
+            assert_eq!(cache.len(), 1, "{case}");
+            assert_eq!(cache.resident_bytes(), bytes, "{case}");
+            assert_eq!(budget.reserved(), bytes, "{case}");
+            assert_eq!(cache.pressure_counters().freed_bytes, 0, "{case}");
+
+            drop(holder);
+            assert_eq!(
+                cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted),
+                bytes,
+                "{case}"
+            );
+            assert!(cache.is_empty(), "{case}");
+            assert_eq!(budget.reserved(), 0, "{case}");
+        }
+    }
+
+    /// An offer of a column whose reservation cell is already filled is
+    /// refused and counted in `filled_cell_refusals`, on the statement's
+    /// counters and the process's, and the reservation it took is released:
+    /// here the same column object offered under a second key.
+    ///
+    /// FLIP: drop the two bumps from the `cell.fill` failure arm of `offer`
+    /// and both counters read 0.
+    #[test]
+    fn an_offer_of_a_column_with_a_filled_cell_is_refused_and_counted() {
+        let v = plain(&[b"ab", b"c"]);
+        let budget = Arc::new(MemoryBudget::new(4 << 30));
+        let cache = DecodedColumnCache::new(1 << 20, Some(Arc::clone(&budget)));
+        let c = DecodedCacheCounters::default();
+        let bytes = cache
+            .offer(key(0, 1), &v, AccessIntent::Interactive, &c)
+            .expect("admitted")
+            .bytes();
+        assert!(
+            cache
+                .offer(key(1, 1), &v, AccessIntent::Interactive, &c)
+                .is_none()
+        );
+        let s = c.snapshot();
+        assert_eq!((s.filled_cell_refusals, s.admissions), (1, 1));
+        assert_eq!(cache.process_counters().filled_cell_refusals, 1);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.resident_bytes(), bytes);
+        assert_eq!(budget.reserved(), bytes, "nothing extra stays reserved");
     }
 
     /// An entry is served up to the age bound and dropped at the first access
