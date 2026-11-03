@@ -535,8 +535,9 @@ async fn main() -> anyhow::Result<()> {
     // (ravel_catalog::validate_typed_attr_columns), so an empty key, a
     // duplicate, a conflicting type, a collision with a fixed logs column, or a
     // key starting with the reserved `__ravel_` prefix fails startup rather
-    // than silently declaring a schema the operator did not ask for. `ravel_server::start` wraps this in the cache-aside overlay
-    // that resolves each query's declaration.
+    // than silently declaring a schema the operator did not ask for.
+    // `ravel_server::start` wraps this in the cache-aside overlay that
+    // resolves each query's declaration.
     let typed_attr_columns = ravel_server::typed_attr_config::TypedAttrColumnConfig::from_policy(
         cli.parse_typed_attr_column_policy()?,
     )

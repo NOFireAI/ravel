@@ -21,12 +21,13 @@
 //! zero-declaration base schema `ravel_sql::logs_schema` already returns.
 //!
 //! Validation is not reimplemented here: [`TypedAttrColumnConfig::from_policy`]
-//! calls `ravel_catalog::validate_typed_attr_columns`, the SAME operator-input
-//! gate `ravel_catalog::set_tenant_config` runs before a durable write, so a
-//! CLI-declared list and a durably-written one are rejected on identical rules
+//! calls `ravel_catalog::validate_typed_attr_columns`, the operator-input gate
 //! (empty key, duplicate key, the same key declared with two types, a
 //! collision with one of the nine fixed logs SQL column names, and a key
-//! starting with the reserved `__ravel_` prefix).
+//! starting with the reserved `__ravel_` prefix). A durable write through
+//! `ravel_catalog::set_tenant_config` applies the same rules with one
+//! difference: it keeps a reserved key the record it replaces already
+//! declares, so a record stored before the prefix rule can still be rewritten.
 //!
 //! Where this list reaches a query: [`crate::start`] builds one
 //! [`TypedAttrColumnConfig`] as the CLI-derived base, then wraps it in
