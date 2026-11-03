@@ -495,7 +495,7 @@ truth_key = "erasure_victim.present"
 states = ["unfolded", "erasure_in_flight"]
 cold_only = true
 
-# Journey B (ADR row 14, the join baseline): the failing cell's logs.
+# Journey B (ADR row 15, the journey's second step): the failing cell's logs.
 [[statement]]
 id = "journey_b"
 tenant = "inv"
@@ -508,8 +508,8 @@ truth_key = "failing_cell.logs_count"
 states = ["unfolded", "folded_leaves", "mixed"]
 cold_only = true
 
-# Journey C (ADR row 15): logs joined to the first K root spans of the
-# failing hour, K the build side (1, 102, 1,024, 10,240; truth.json marks a
+# Journey C (ADR row 14, the join baseline): logs joined to the first K
+# root spans of the failing hour, K the build side (1, 102, 1,024, 10,240; truth.json marks a
 # tier the corpus cannot fill as capped).
 [[statement]]
 id = "journey_c_1"

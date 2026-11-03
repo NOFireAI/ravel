@@ -732,9 +732,23 @@ compact_child() {
   done
 }
 
+# wait_sealed: compact-tenant seals an hour at its end plus
+# --max-flush-lifetime (0s) plus the compactor's 300 s clock-skew allowance,
+# so every hour before the current one is compactable 310 s into it.
+wait_sealed() {
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'DRY-RUN: wait until 310 s past the current hour start, so every earlier hour is sealed\n'
+    return 0
+  fi
+  while [ "$(( $(date +%s) % 3600 ))" -lt 310 ]; do
+    sleep 10
+  done
+}
+
 state_compaction() {
   local code=0 sig
   stop_server
+  wait_sealed
   # One restart before the in-flight calls; they run against this server.
   restart_for '{"statement": "compaction_in_flight", "state": "compaction_in_flight", "try": 0}'
   transition compaction_in_flight "maintain compact-tenant running in the background"
