@@ -19,6 +19,12 @@ pub(super) struct PlanCounts {
     /// blocks from that read ([`open_segment_whole`]); its `segs` entry is
     /// `None`.
     unplanned: Vec<bool>,
+    /// Per segment, in snapshot order: the plan pass decoded its footer
+    /// without planning it (the KEY_IDX probe, or the fast-path verdict's
+    /// directory read) and recorded that open under the plan phase (issue
+    /// #3745), so the scan's open of it does not record a second one
+    /// ([`Self::footer_opened`]).
+    probed: Vec<bool>,
     /// Relevant segments the plan phase read whole instead of counting from the
     /// skip index (#761). A segment planned from footer alone or from the skip
     /// index carries its plan footer forward (`PlannedUnit::footer` is `Some`); the
@@ -342,7 +348,7 @@ async fn compute_fast_path_verdict(
     cap: u64,
 ) -> DFResult<Arc<PlanCounts>> {
     let mut reads = Vec::new();
-    for seg in segments {
+    for (idx, seg) in segments.iter().enumerate() {
         if !LogSegmentFetcher::ts_range_relevant(seg, ctx.query.ts_min_ns, ctx.query.ts_max_ns) {
             continue;
         }
@@ -353,7 +359,7 @@ async fn compute_fast_path_verdict(
             if let Some(bytes) =
                 memo.and_then(|m| m.memoised_estimate(tenant, seg.content_hash, &ctx.columns))
             {
-                return Ok::<u64, SqlError>(bytes);
+                return Ok::<(usize, u64, bool), SqlError>((idx, bytes, false));
             }
             let plan = ctx.phase_accounting.plan();
             let (footer, dirs, _) = ctx
@@ -381,15 +387,25 @@ async fn compute_fast_path_verdict(
             if let Some(m) = memo {
                 m.memoise_estimate(tenant, seg.content_hash, &ctx.columns, bytes);
             }
-            Ok(bytes)
+            Ok((idx, bytes, true))
         });
     }
     let relevant = reads.len();
     let mut stream = futures::stream::iter(reads).buffer_unordered(concurrency.max(1));
     let mut summed = 0usize;
     let mut verdict = deferred_verdict(0, cap, false);
+    let mut footer_opened = vec![false; segments.len()];
     while let Some(read) = stream.next().await {
-        let bytes = read?;
+        let (idx, bytes, decoded) = read?;
+        // Recorded where the read is consumed, not inside it: a read dropped
+        // with the stream below leaves its object to the scan's open to
+        // record, so each object is recorded once either way (issue #3745).
+        if decoded {
+            ctx.phase_accounting.plan().add_segments_opened(1);
+            if let Some(flag) = footer_opened.get_mut(idx) {
+                *flag = true;
+            }
+        }
         ctx.budget.check()?;
         summed += 1;
         verdict = deferred_verdict(verdict.estimate_bytes.saturating_add(bytes), cap, false);
@@ -417,6 +433,7 @@ async fn compute_fast_path_verdict(
         false,
     );
     counts.deferred = Some(verdict);
+    counts.probed = footer_opened;
     Ok(Arc::new(counts))
 }
 
@@ -534,6 +551,7 @@ async fn compute_plan_counts(
     // this `Send` boxed future needs.
     let mut prunes = Vec::with_capacity(segments.len());
     let mut unplanned = vec![false; segments.len()];
+    let mut probed = vec![false; segments.len()];
     let skip_sub_bound = skips_sub_bound_plans(ctx, segments, plan_concurrency);
     for (idx, seg) in segments.iter().enumerate() {
         // Refuse an unreadable version BEFORE the plan probe, not after. This
@@ -554,9 +572,9 @@ async fn compute_plan_counts(
             {
                 continue;
             }
-            if ctx.query.key_equals.is_empty()
-                || seg.object_size <= ctx.fetcher.block_range_threshold()
-            {
+            // The probe is issued only where it reads, so a `Probed` result
+            // below always stands for a decoded footer (`probed`).
+            if !ctx.fetcher.key_probe_reads(seg, &ctx.query) {
                 unplanned[idx] = true;
                 continue;
             }
@@ -604,6 +622,7 @@ async fn compute_plan_counts(
             PlanPassRead::Probed(probe) => {
                 key_index.segments_pruned += probe.segments_pruned;
                 unplanned[idx] = probe.segments_pruned == 0;
+                probed[idx] = true;
                 continue;
             }
         };
@@ -703,6 +722,7 @@ async fn compute_plan_counts(
         by_min_ts,
     );
     counts.deferred = deferred;
+    counts.probed = probed;
     Ok(Arc::new(counts))
 }
 
@@ -745,6 +765,7 @@ impl PlanCounts {
         PlanCounts {
             segs,
             unplanned,
+            probed: Vec::new(),
             full_reads,
             global,
             key_index,
@@ -756,6 +777,13 @@ impl PlanCounts {
     /// cache: the plan pass's [`DeferredVerdict`], false when it made none.
     pub(super) fn serves_deferred(&self) -> bool {
         self.deferred.is_some_and(|v| v.serve)
+    }
+
+    /// Whether the plan pass decoded segment `seg_idx`'s footer without
+    /// planning it and recorded that open under the plan phase: the scan's
+    /// open of it records none (issue #3745).
+    pub(super) fn footer_opened(&self, seg_idx: usize) -> bool {
+        self.probed.get(seg_idx).copied().unwrap_or(false)
     }
 
     /// The plan pass's decoded-set verdict, when it made one.
@@ -862,6 +890,7 @@ impl PlanCounts {
                         whole_object: None,
                         dirs: None,
                         unplanned: true,
+                        footer_counted: self.footer_opened(seg_idx),
                     });
                 }
                 let unit = self.segs.get(seg_idx)?.as_ref()?;
@@ -885,6 +914,7 @@ impl PlanCounts {
                     whole_object,
                     dirs,
                     unplanned: false,
+                    footer_counted: true,
                 })
             })
             .collect()
@@ -1175,6 +1205,10 @@ pub(super) struct OwnedSeg {
     /// `whole_object` and `dirs` all empty. The open's own pruning supplies
     /// the survivor list a row-ref resolves against.
     pub(super) unplanned: bool,
+    /// The plan pass already recorded this object's footer open (a planned
+    /// segment, or an unplanned one the KEY_IDX probe read), so the scan's
+    /// open of this unit records none (issue #3745).
+    pub(super) footer_counted: bool,
 }
 
 /// Groups `indices` (a segment's surviving whole-object block indices,
@@ -1237,6 +1271,7 @@ pub(super) fn owned_whole_segments(
                 whole_object: None,
                 dirs: None,
                 unplanned: false,
+                footer_counted: false,
             });
         }
         ordinal += 1;
@@ -3551,6 +3586,7 @@ mod carried_directory_reservation_tests {
                 footer: None,
             })],
             unplanned: vec![false],
+            probed: vec![false],
             full_reads: 1,
             global: None,
             key_index: KeyIndexPruning::default(),

@@ -837,6 +837,8 @@ impl SpanSegmentFetcher {
         // `open_scan` re-opens it for the BLOCKS section descriptor.
         let footer = open(&bytes)
             .map_err(|source| settle_version_refusal(seg_ref, &bytes, corrupt(key, source)))?;
+        // `open_scan` re-opens these bytes; this decode is the one counted.
+        accounting.add_segments_opened(1);
         if footer.tenant_hash != tenant_hash.0 {
             return Err(SpanFetchError::TenantMismatch {
                 key: key.to_string(),
@@ -913,6 +915,8 @@ impl SpanSegmentFetcher {
                 }
             }
         };
+        // Counted on the handle the footer reads were charged to.
+        metadata.add_segments_opened(1);
         if let Some(tenant_hash) = tenant_hash
             && footer.tenant_hash != tenant_hash.0
         {
@@ -3452,6 +3456,158 @@ mod tests {
         assert_eq!(a_out.stats.blocks_scanned, 2);
         assert_eq!(b_out.stats.blocks_total, 5);
         assert_eq!(b_out.stats.blocks_after_skip, 0);
+    }
+
+    /// A ranged trace lookup's footer open (the tail probe at
+    /// `ranged_trace_scan`) is charged to `stats.phases[probe].segmentsOpened`
+    /// (issue #3745); the scan built from the already-open footer never calls
+    /// `open_scan`, so `stats.phases[scan].segmentsOpened` stays 0 for the
+    /// same object.
+    ///
+    /// Fails against an implementation that increments on every GET the probe
+    /// and run reads issue (2, one per `fx.probe_of`/`fx.run` request), and
+    /// against one that charges the open to `scan()` because the scan is the
+    /// phase that ends up reading block data.
+    #[tokio::test]
+    async fn ranged_trace_segment_open_counts_once_under_probe() {
+        let mut fx = trace_fixture().await;
+        let log = Arc::new(GetLog::new(fx.memory.take().expect("memory")));
+        let fetcher = SpanSegmentFetcher::new(log.clone()).with_trace_probe_bytes(fx.probe);
+        let query = SpanQuery::trace(trace(3), i64::MIN, i64::MAX);
+        let accounting = PhaseAccounting::new();
+
+        let out = fetcher
+            .fetch_accounted_in_blocks(&fx.a, TENANT, &query, None, None, &[], None, &accounting)
+            .await
+            .expect("fetch A")
+            .expect("A is ts-relevant");
+        assert_eq!(out.records.len(), 4, "every trace-3 span");
+
+        let phases = accounting.snapshot();
+        for phase in QueryPhase::ALL {
+            let want = u64::from(phase == QueryPhase::Probe);
+            assert_eq!(
+                phases.phase(phase).segments_opened,
+                want,
+                "{}: the tail probe opened this object's footer exactly once, \
+                 and the block-run read reuses it",
+                phase.name()
+            );
+        }
+    }
+
+    /// A GET that fails before any byte arrives decodes no footer, so it
+    /// records no `segmentsOpened` in any phase, on the ranged trace path
+    /// (whose footer open is charged to probe) or the whole-object path
+    /// (charged to scan); the second fetch, whose GET passes through, records
+    /// the one open under that phase.
+    ///
+    /// FLIP: counting the open before the probe GET on the ranged path, or
+    /// before the whole-object GET, reads `left: 1, right: 0` on the failed
+    /// fetch's phase.
+    #[tokio::test]
+    async fn a_failed_get_records_no_segment_open() {
+        use ravel_object_store::fault::ScriptedFault;
+        use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule};
+
+        for (query, counted) in [
+            (
+                SpanQuery::trace(trace(3), i64::MIN, i64::MAX),
+                QueryPhase::Probe,
+            ),
+            (SpanQuery::ts_range(i64::MIN, i64::MAX), QueryPhase::Scan),
+        ] {
+            let mut fx = trace_fixture().await;
+            let plan = FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::Permanent("injected".into()))
+                    .with_key_contains(fx.a.data_object_key.clone())
+                    .with_occurrence(Occurrence::Nth(1)),
+            );
+            let fault = Arc::new(FaultStore::new(
+                GetLog::new(fx.memory.take().expect("memory")),
+                plan,
+            ));
+            let fetcher = SpanSegmentFetcher::new(fault.clone()).with_trace_probe_bytes(fx.probe);
+
+            let failed = PhaseAccounting::new();
+            let err = fetcher
+                .fetch_accounted_in_blocks(&fx.a, TENANT, &query, None, None, &[], None, &failed)
+                .await;
+            assert!(err.is_err(), "{query:?}: the injected GET failure surfaces");
+            assert_eq!(
+                fault.fault_count(Op::Get, FaultKind::Permanent),
+                1,
+                "{query:?}: the fault fired"
+            );
+            let phases = failed.snapshot();
+            for phase in QueryPhase::ALL {
+                assert_eq!(
+                    phases.phase(phase).segments_opened,
+                    0,
+                    "{query:?}, {}: the failed GET decoded no footer",
+                    phase.name()
+                );
+            }
+
+            let retried = PhaseAccounting::new();
+            fetcher
+                .fetch_accounted_in_blocks(&fx.a, TENANT, &query, None, None, &[], None, &retried)
+                .await
+                .expect("the second GET passes through")
+                .expect("A is ts-relevant");
+            let phases = retried.snapshot();
+            for phase in QueryPhase::ALL {
+                assert_eq!(
+                    phases.phase(phase).segments_opened,
+                    u64::from(phase == counted),
+                    "{query:?}, {}",
+                    phase.name()
+                );
+            }
+        }
+    }
+
+    /// A segment the catalog ts pre-check rules out is never opened, on the
+    /// ranged trace path or the whole-object path, so no phase counts it.
+    ///
+    /// Fails against an `open_accounted_scan` that counts the open before the
+    /// `ts_range_relevant` check returns `Ok(None)`.
+    #[tokio::test]
+    async fn ts_irrelevant_segment_counts_in_no_phase() {
+        let mut fx = trace_fixture().await;
+        let log = Arc::new(GetLog::new(fx.memory.take().expect("memory")));
+        let fetcher = SpanSegmentFetcher::new(log.clone()).with_trace_probe_bytes(fx.probe);
+        let after = fx.a.max_event_ts_ns + 1;
+        for query in [
+            SpanQuery::trace(trace(3), after, i64::MAX),
+            SpanQuery::ts_range(after, i64::MAX),
+        ] {
+            let accounting = PhaseAccounting::new();
+            let out = fetcher
+                .fetch_accounted_in_blocks(
+                    &fx.a,
+                    TENANT,
+                    &query,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    &accounting,
+                )
+                .await
+                .expect("fetch A");
+            assert!(out.is_none(), "A ends before the query's window");
+            assert_eq!(log.total(), 0, "no GET was issued for A");
+            let phases = accounting.snapshot();
+            for phase in QueryPhase::ALL {
+                assert_eq!(
+                    phases.phase(phase).segments_opened,
+                    0,
+                    "{}: {query:?}",
+                    phase.name()
+                );
+            }
+        }
     }
 
     /// The columnar exit takes the same ranged read and names it; a query with

@@ -3331,6 +3331,8 @@ impl ExecutionPlan for LogsScanExec {
             current_whole_object: None,
             current_dirs: None,
             current_unplanned: false,
+            count_current_open: false,
+            plan_counts: None,
             state,
             decoded: None,
             fetch: self.fetch,
@@ -3552,6 +3554,17 @@ struct LogScanStream {
     /// recorded by this owner at exhaustion as on the fast path, since the
     /// plan produced none for partition 0 to publish.
     current_unplanned: bool,
+    /// The current segment's open still owes this query its one
+    /// `segments_opened` record ([`PartitionCtx::record_segment_opened`]):
+    /// set when the segment is taken unless the plan pass already recorded
+    /// it, and cleared by the first open that succeeds.
+    count_current_open: bool,
+    /// The shared plan pass's result once this partition leaves `Planning`
+    /// (the fast-path verdict's on the whole-segment fast path), read for the
+    /// segments whose footer it already recorded
+    /// ([`PlanCounts::footer_opened`]). `None` before then and when no plan
+    /// pass ran.
+    plan_counts: Option<Arc<PlanCounts>>,
     state: LogScanState,
     /// The block a [`LogScanState::DecodingColumnar`] or
     /// [`LogScanState::DecodingRows`] job decoded, taken by the state the job

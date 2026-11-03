@@ -145,6 +145,18 @@ impl PartitionCtx {
     fn record_data_object_touched(&self) {
         self.phase_accounting.scan().add_data_objects_touched(1);
     }
+
+    /// Record the footer open of the segment a fast-path or unplanned open
+    /// just returned (issue #3745), under the scan phase its reads were
+    /// charged to. The scan opens through the fetcher's uncounted entry
+    /// points and calls this once per segment, on the first open that
+    /// succeeds, so a retried open, a row-path reopen and a revoked prefetch
+    /// add nothing. A segment the plan pass opened (planned, or probed for
+    /// its KEY_IDX) was recorded there under the plan phase and is not
+    /// recorded here ([`OwnedSeg::footer_counted`]).
+    fn record_segment_opened(&self) {
+        self.phase_accounting.scan().add_segments_opened(1);
+    }
 }
 
 /// Refuse a segment whose declared RLOG format version this build cannot read,
@@ -255,7 +267,7 @@ fn open_segment_whole(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
         refuse_unreadable_version(&seg)?;
         let mut scan = ctx
             .fetcher
-            .scan_whole_accounted_with_tenant(
+            .scan_whole_accounted_with_tenant_uncounted(
                 &seg,
                 ctx.tenant_hash,
                 &ctx.query,
@@ -292,7 +304,7 @@ fn open_segment_ranged(ctx: Arc<PartitionCtx>, seg: SegmentRef) -> OpenFuture {
         refuse_unreadable_version(&seg)?;
         let mut scan = ctx
             .fetcher
-            .scan_accounted_with_tenant(
+            .scan_accounted_with_tenant_uncounted(
                 &seg,
                 ctx.tenant_hash,
                 &ctx.query,
@@ -1130,6 +1142,15 @@ impl LogScanStream {
         }
     }
 
+    /// Whether the shared plan pass already recorded the open of the segment
+    /// at snapshot ordinal `ordinal` ([`PlanCounts::footer_opened`]), so this
+    /// partition's open of it records none (issue #3745).
+    fn plan_opened(&self, ordinal: usize) -> bool {
+        self.plan_counts
+            .as_ref()
+            .is_some_and(|counts| counts.footer_opened(ordinal))
+    }
+
     /// Whether this whole-segment fast-path open carries a block-level arm, so
     /// the open's survivor list, not the whole segment, is what a row ref
     /// indexes. It tests only that the prune or content list is non-empty:
@@ -1571,6 +1592,7 @@ impl LogScanStream {
                                 )
                             })
                         });
+                        this.plan_counts = Some(counts);
                         this.state = LogScanState::NextSegment;
                     }
                     Poll::Ready(Err(e)) => return this.fail(e),
@@ -1608,6 +1630,7 @@ impl LogScanStream {
                         this.blocks.record_fast_path_route(true);
                         this.ctx.record_open_shape(true);
                         this.ctx.record_data_object_touched();
+                        this.count_current_open = !this.plan_opened(ordinal);
                         match open {
                             PrefetchOpen::InFlight(fut) => {
                                 this.open_started = Some(issued);
@@ -1620,6 +1643,9 @@ impl LogScanStream {
                                     .add_duration(at.saturating_duration_since(issued));
                                 match *opened {
                                     Ok(Some(scan)) => {
+                                        if std::mem::take(&mut this.count_current_open) {
+                                            this.ctx.record_segment_opened();
+                                        }
                                         if this.fast_path_records_survivors() {
                                             this.current_survivors =
                                                 Some(Arc::new(scan.survivor_block_indices()));
@@ -1658,6 +1684,7 @@ impl LogScanStream {
                             whole_object,
                             dirs,
                             unplanned,
+                            footer_counted,
                         }) => {
                             // ADR-2677 decision 6: a segment whose every row
                             // is above the TopK threshold is not opened for
@@ -1688,6 +1715,8 @@ impl LogScanStream {
                             // follow-up).
                             this.current_whole_object = whole_object;
                             this.current_unplanned = unplanned;
+                            this.count_current_open =
+                                !(footer_counted || this.plan_opened(ordinal));
                             this.retrying = false;
                             this.block_cursor = 0;
                             this.consecutive_fallbacks = 0;
@@ -1759,6 +1788,9 @@ impl LogScanStream {
                 LogScanState::Opening(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(Some(scan))) => {
                         this.retrying = false;
+                        if std::mem::take(&mut this.count_current_open) {
+                            this.ctx.record_segment_opened();
+                        }
                         if let Some(started) = this.open_started.take() {
                             this.blocks.open_elapsed.add_elapsed(started);
                         }
@@ -2256,7 +2288,15 @@ mod fast_path_prefetch_tests {
     /// `SEGMENTS` segments in one store, segment `overflow` (if any) built
     /// with an overflowing last block.
     async fn fixture(overflow: Option<usize>) -> (Arc<FaultStore<MemoryStore>>, Vec<SegmentRef>) {
-        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        fixture_with_faults(overflow, FaultPlan::empty()).await
+    }
+
+    /// [`fixture`] over a store that injects `faults`.
+    async fn fixture_with_faults(
+        overflow: Option<usize>,
+        faults: FaultPlan,
+    ) -> (Arc<FaultStore<MemoryStore>>, Vec<SegmentRef>) {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), faults));
         let mut segments = Vec::new();
         for seq in 0..SEGMENTS {
             let obj = object(seq, overflow == Some(seq));
@@ -2496,9 +2536,74 @@ mod fast_path_prefetch_tests {
         assert_eq!(piped.data_objects_touched, 3);
         assert_eq!(piped.logs_ranged_opens, 3);
         assert_eq!(
+            piped.segments_opened, 3,
+            "one open per object (issue #3745)"
+        );
+        assert_eq!(
             piped, scan,
             "scan-phase accounting equals the sequential walk's"
         );
+    }
+
+    /// Partition 0 owns segments 0, 2 and 4; the first GET of segment 2
+    /// fails. Segment 0's open is recorded, segment 2's failed open is not
+    /// (no footer was decoded) and the statement fails there. A second
+    /// execution over the same store, whose GETs pass through, records each
+    /// of the three opens once (issue #3745).
+    ///
+    /// FLIP: recording the open where the segment is taken, before its open
+    /// resolves (where `count_current_open` is set), reads `left: 2, right: 1`
+    /// on the failed execution.
+    #[tokio::test]
+    async fn a_failed_open_records_no_segment_open() {
+        use ravel_object_store::fault::{FaultKind, Rule, ScriptedFault};
+
+        let faults = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("injected".into()))
+                .with_key_contains(key(2))
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let (store, segments) = fixture_with_faults(None, faults).await;
+        let run = |accounting: PhaseAccounting| {
+            let plan = exec(&store, &segments, 2, 4, accounting);
+            async move {
+                let mut stream = plan
+                    .execute(0, Arc::new(TaskContext::default()))
+                    .expect("execute");
+                let mut failed = false;
+                while let Some(batch) = stream.next().await {
+                    if batch.is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                failed
+            }
+        };
+
+        let failed = PhaseAccounting::new();
+        assert!(
+            run(failed.clone()).await,
+            "segment 2's failed GET fails the statement"
+        );
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            1,
+            "the fault fired"
+        );
+        assert_eq!(
+            failed.scan().snapshot().segments_opened,
+            1,
+            "segment 0 only: segment 2's open never decoded a footer"
+        );
+
+        let retried = PhaseAccounting::new();
+        assert!(
+            !run(retried.clone()).await,
+            "the second execution passes through"
+        );
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
+        assert_eq!(retried.scan().snapshot().segments_opened, 3);
     }
 
     #[tokio::test]
@@ -2558,13 +2663,17 @@ mod fast_path_prefetch_tests {
     /// every row comes once, in order.
     ///
     /// Fails against a reopen that drops the in-flight prefetches (segment 4's
-    /// rows are missing) and against counting the reopened segment again
-    /// (`segments_opened` reads 4).
+    /// rows are missing) and against counting the reopened segment again,
+    /// whether in the DataFusion metric (`segments_opened` reads 4) or in
+    /// `stats.phases[scan].segmentsOpened` (issue #3745): one object read by
+    /// several ranged GETs (the prefetch open, then the fallback reopen)
+    /// still counts once.
     #[tokio::test]
     async fn a_fallback_reopen_drains_the_prefetches_behind_it() {
         let (store, segments) = fixture(Some(2)).await;
         let gate = store.hold(Op::Get, Some(key(4)), Occurrence::Always);
-        let plan = exec(&store, &segments, 2, 4, PhaseAccounting::new());
+        let accounting = PhaseAccounting::new();
+        let plan = exec(&store, &segments, 2, 4, accounting.clone());
         let mut stream = plan
             .execute(0, Arc::new(TaskContext::default()))
             .expect("execute");
@@ -2597,6 +2706,11 @@ mod fast_path_prefetch_tests {
         );
         assert_eq!(metric_total(&plan, "reopens"), 1);
         assert_eq!(metric_total(&plan, "segments_opened"), 3);
+        assert_eq!(
+            accounting.scan().snapshot().segments_opened,
+            3,
+            "the reopened segment's second GET does not add a second open"
+        );
         let (sequential_rows, _, _) = sequential(Some(2), 4).await;
         assert_eq!(rows, sequential_rows);
     }

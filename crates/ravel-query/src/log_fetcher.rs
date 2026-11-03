@@ -1817,6 +1817,9 @@ impl LogSegmentFetcher {
         let result = self
             .settle_version_refusal(seg_ref, ReadPhases::SCAN.blocks, accounting, result)
             .await;
+        if let Ok(Some(_)) = &result {
+            accounting.add_segments_opened(1);
+        }
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
         result
     }
@@ -1888,6 +1891,9 @@ impl LogSegmentFetcher {
         let result = self
             .settle_version_refusal(seg_ref, ReadPhases::SCAN.metadata, accounting, result)
             .await;
+        if let Ok(Some(_)) = &result {
+            accounting.add_segments_opened(1);
+        }
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
         result
     }
@@ -1934,6 +1940,29 @@ impl LogSegmentFetcher {
     /// handle directly; no in-scope caller does, which is a #796 report
     /// finding, not a bug fixed here.
     pub async fn scan_accounted_with_tenant(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<LogSegmentScan>, LogFetchError> {
+        let result = self
+            .scan_accounted_with_tenant_uncounted(seg_ref, tenant_hash, query, columns, accounting)
+            .await;
+        if let Ok(Some(_)) = &result {
+            accounting.add_segments_opened(1);
+        }
+        result
+    }
+
+    /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant)
+    /// without the one `segments_opened` it records on a successful open
+    /// (issue #3745), for a caller that records the open itself because it
+    /// can open the same object more than once per query (a retried or
+    /// reopened segment, or one the keyed probe or
+    /// [`fetch_stream_dir`](Self::fetch_stream_dir) already opened).
+    pub async fn scan_accounted_with_tenant_uncounted(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
@@ -2026,6 +2055,33 @@ impl LogSegmentFetcher {
     /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant)'s doc
     /// comment.
     pub async fn scan_whole_accounted_with_tenant(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<LogSegmentScan>, LogFetchError> {
+        let result = self
+            .scan_whole_accounted_with_tenant_uncounted(
+                seg_ref,
+                tenant_hash,
+                query,
+                columns,
+                accounting,
+            )
+            .await;
+        if let Ok(Some(_)) = &result {
+            accounting.add_segments_opened(1);
+        }
+        result
+    }
+
+    /// [`scan_whole_accounted_with_tenant`](Self::scan_whole_accounted_with_tenant)
+    /// without the one `segments_opened` it records on a successful open, for
+    /// the same callers as
+    /// [`scan_accounted_with_tenant_uncounted`](Self::scan_accounted_with_tenant_uncounted).
+    pub async fn scan_whole_accounted_with_tenant_uncounted(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
@@ -2426,6 +2482,11 @@ impl LogSegmentFetcher {
         {
             caller_accounting.add_data_objects_touched(1);
         }
+        // Every `Ok(Some(..))` branch decoded this object's footer, a
+        // zero-survivor prune included; `Ok(None)` read nothing.
+        if let Ok(Some(_)) = &result {
+            caller_accounting.add_segments_opened(1);
+        }
         result.map(|opt| {
             opt.map(|(indices, dirs, stats, footer, _, carried)| {
                 (indices, dirs, stats, footer, carried)
@@ -2530,6 +2591,10 @@ impl LogSegmentFetcher {
                 key_blocks,
             } => (fetch, Some((footer, dirs, survivors, stats, key_blocks))),
         };
+        // Both arms decoded the footer before the key probe could tell them
+        // apart; the `Unkeyed` arm returned above and was recorded by
+        // `plan_segment_primed`.
+        plan_accounting.add_segments_opened(1);
         let requests = fetch.probe_gets + fetch.metadata_gets + fetch.block_range_gets;
         fetch_span.record("s3_requests", requests);
         fetch_span.record("s3_bytes", fetch.block_bytes_fetched);
@@ -2564,6 +2629,21 @@ impl LogSegmentFetcher {
         })
     }
 
+    /// Whether [`probe_segment_keyed`](Self::probe_segment_keyed) reads
+    /// `seg_ref`, and so decodes its footer and records one segment open: the
+    /// query has a key arm, the object is above
+    /// [`block_range_threshold`](Self::block_range_threshold), and its event
+    /// span is ordered and overlaps the query window. A committed record never
+    /// carries an unordered span (`ravel_commit::record` refuses it on
+    /// decode), so that arm only guards a hand-built [`SegmentRef`].
+    #[must_use]
+    pub fn key_probe_reads(&self, seg_ref: &SegmentRef, query: &LogQuery) -> bool {
+        !query.key_equals.is_empty()
+            && seg_ref.object_size > self.block_range_threshold
+            && seg_ref.min_event_ts_ns <= seg_ref.max_event_ts_ns
+            && Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
+    }
+
     /// The KEY_IDX probe of [`plan_segment_keyed`](Self::plan_segment_keyed)
     /// without the plan, for a segment the caller opens whole and unplanned
     /// (ADR-2677 decision 2) unless the probe drops it. It reads the footer
@@ -2576,7 +2656,8 @@ impl LogSegmentFetcher {
     /// declined) and the caller reads the object as it would with no key. On
     /// the segments `plan_segment_keyed` does not probe (no arm, an object at
     /// or under [`block_range_threshold`](Self::block_range_threshold), a span
-    /// outside the query window) this reads nothing and prunes nothing.
+    /// outside the query window) this reads nothing and prunes nothing
+    /// ([`key_probe_reads`](Self::key_probe_reads)).
     pub async fn probe_segment_keyed(
         &self,
         seg_ref: &SegmentRef,
@@ -2585,11 +2666,7 @@ impl LogSegmentFetcher {
         plan_accounting: &QueryAccounting,
         key_index_accounting: &QueryAccounting,
     ) -> Result<KeyIndexPruning, LogFetchError> {
-        if query.key_equals.is_empty()
-            || seg_ref.object_size <= self.block_range_threshold
-            || seg_ref.min_event_ts_ns > seg_ref.max_event_ts_ns
-            || !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
-        {
+        if !self.key_probe_reads(seg_ref, query) {
             return Ok(KeyIndexPruning::default());
         }
         let phase = PhaseAccounting::new();
@@ -2620,6 +2697,8 @@ impl LogSegmentFetcher {
         plan_accounting.merge_snapshot(snapshot.phase(QueryPhase::Plan));
         key_index_accounting.merge_snapshot(snapshot.phase(QueryPhase::KeyIndex));
         let (absent, fetch) = result?;
+        // The footer is decoded whether or not the key turns out absent.
+        plan_accounting.add_segments_opened(1);
         fetch_span.record("s3_requests", fetch.probe_gets + fetch.metadata_gets);
         fetch_span.record("s3_bytes", fetch.block_bytes_fetched);
         self.record_probe_misses(&fetch_span, &fetch, ProbePhase::Plan);
@@ -3932,8 +4011,15 @@ impl LogSegmentFetcher {
         let result = self
             .fetch_stream_dir_unsettled(seg_ref, tenant_hash, accounting)
             .await;
-        self.settle_version_refusal(seg_ref, QueryPhase::Plan, accounting, result)
-            .await
+        let result = self
+            .settle_version_refusal(seg_ref, QueryPhase::Plan, accounting, result)
+            .await;
+        // Both `Ok` arms decoded the footer, a directory-less one included
+        // (issue #3745).
+        if result.is_ok() {
+            accounting.add_segments_opened(1);
+        }
+        result
     }
 
     /// The body of the public method of the same name, before
@@ -9683,6 +9769,48 @@ mod whole_object_get_limiter_tests {
         (fault, seg_ref(size))
     }
 
+    /// A GET that fails before any byte arrives decodes no footer, so it
+    /// records no `segments_opened`; the retry that succeeds records the one
+    /// open. Fails against counting the open before the GET returns.
+    #[tokio::test]
+    async fn a_failed_get_records_no_segment_open() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let plan = FaultPlan::default().with_rule(
+            ravel_object_store::fault::Rule::new(
+                Op::Get,
+                ravel_object_store::fault::ScriptedFault::Permanent("injected".into()),
+            )
+            .with_key_contains(KEY)
+            .with_occurrence(Occurrence::Nth(1)),
+        );
+        let fault = Arc::new(FaultStore::new(store_with_object(bytes).await, plan));
+        let fetcher = LogSegmentFetcher::new(Arc::clone(&fault) as Arc<dyn ObjectStoreBackend>);
+        let seg = seg_ref(size);
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let failed = QueryAccounting::new();
+        let err = fetcher
+            .fetch_accounted_with_tenant(&seg, TenantHash([7u8; 16]), &query, &failed)
+            .await;
+        assert!(err.is_err(), "the injected GET failure surfaces: {err:?}");
+        assert_eq!(
+            fault.fault_count(Op::Get, ravel_object_store::fault::FaultKind::Permanent),
+            1,
+            "the fault fired"
+        );
+        assert_eq!(failed.snapshot().segments_opened, 0);
+
+        let retried = QueryAccounting::new();
+        let out = fetcher
+            .fetch_accounted_with_tenant(&seg, TenantHash([7u8; 16]), &query, &retried)
+            .await
+            .expect("the second GET passes through")
+            .expect("ts-relevant");
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(retried.snapshot().segments_opened, 1);
+    }
+
     const CONTENT_HASH_A: [u8; 32] = [10u8; 32];
     const CONTENT_HASH_B: [u8; 32] = [11u8; 32];
     const KEY_A: &str = "t/whole_a.rlog";
@@ -11811,6 +11939,93 @@ mod fetch_stream_dir_tests {
                     f.plans_segment(&seg_ref(size, &records)),
                     planned,
                     "threshold {threshold}, break-even {break_even}, size {size}"
+                );
+            }
+        }
+    }
+    /// `fetch_stream_dir` records one segment open on the handle its reads are
+    /// charged to, on both branches (the whole-object read at or under the
+    /// bound, the ranged probe above it), and none when the read fails: the
+    /// first GET of the object fails, so no footer is decoded, and the second
+    /// call records the one open.
+    ///
+    /// FLIP: counting unconditionally, before the `is_ok()` check, reads
+    /// `left: 1, right: 0` on the failed call of the first branch.
+    #[tokio::test]
+    async fn fetch_stream_dir_counts_one_open_on_its_handle_and_none_on_a_failed_read() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        };
+        let records = [record(0), record(1)];
+        let bytes = build_object(&records);
+        let seg = seg_ref(bytes.len() as u64, &records);
+        for above in [false, true] {
+            let plan = FaultPlan::default().with_rule(
+                Rule::new(Op::Get, ScriptedFault::Permanent("injected".into()))
+                    .with_key_contains(KEY)
+                    .with_occurrence(Occurrence::Nth(1)),
+            );
+            let fault = Arc::new(FaultStore::new(
+                store_with_object(bytes.clone()).await,
+                plan,
+            ));
+            let backend: Arc<dyn ObjectStoreBackend> = fault.clone();
+            let fetcher = if above {
+                LogSegmentFetcher::new(Arc::clone(&backend))
+                    .with_block_range_threshold(0)
+                    .with_block_range(
+                        BlockRangeFetcher::new(backend).with_whole_object_threshold(0),
+                    )
+            } else {
+                LogSegmentFetcher::new(backend)
+            };
+            assert_eq!(
+                seg.object_size > fetcher.plan_whole_object_bound(),
+                above,
+                "fixture precondition"
+            );
+
+            let failed = PhaseAccounting::new();
+            let err = fetcher.fetch_stream_dir(&seg, TENANT, failed.plan()).await;
+            assert!(
+                err.is_err(),
+                "above {above}: the injected GET failure surfaces"
+            );
+            assert_eq!(
+                fault.fault_count(Op::Get, FaultKind::Permanent),
+                1,
+                "above {above}: the fault fired"
+            );
+            let snap = failed.snapshot();
+            assert_eq!(
+                snap.phase(QueryPhase::Plan).segments_opened,
+                0,
+                "above {above}: a failed read records no open"
+            );
+
+            let read = PhaseAccounting::new();
+            fetcher
+                .fetch_stream_dir(&seg, TENANT, read.plan())
+                .await
+                .expect("the second GET passes through")
+                .expect("STREAM_DIR present");
+            let snap = read.snapshot();
+            let plan = snap.phase(QueryPhase::Plan);
+            assert!(
+                plan.s3_requests.iter().sum::<u64>() > 0,
+                "above {above}: the reads are charged to the plan handle"
+            );
+            assert_eq!(plan.segments_opened, 1, "above {above}");
+            for phase in [
+                QueryPhase::Resolve,
+                QueryPhase::Probe,
+                QueryPhase::Scan,
+                QueryPhase::KeyIndex,
+            ] {
+                assert_eq!(
+                    snap.phase(phase).segments_opened,
+                    0,
+                    "above {above}: {phase:?} records none"
                 );
             }
         }
@@ -14129,6 +14344,180 @@ mod read_gate_tests {
                 AccessIntent::BulkScan => assert!(bulk > 0, "admitted outside the bulk region"),
                 _ => assert_eq!(bulk, 0, "{intent:?}"),
             }
+        }
+    }
+
+    /// `segments_opened` read off a plan handle and a key-index handle.
+    fn opened(plan: &QueryAccounting, key_index: &QueryAccounting) -> (u64, u64) {
+        (
+            plan.snapshot().segments_opened,
+            key_index.snapshot().segments_opened,
+        )
+    }
+
+    /// `plan_segment_primed`, reached through `plan_segment`, records one
+    /// footer open under the plan handle for a relevant object and none for
+    /// one the catalog ts pre-check rules out, which it never reads.
+    ///
+    /// Fails against counting the `Ok(None)` outcome too, and against
+    /// counting before the ts pre-check.
+    #[tokio::test]
+    async fn plan_segment_primed_counts_one_open_under_plan() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let after = seg_ref.max_event_ts_ns + 1;
+        for (query, want) in [
+            (LogQuery::new(i64::MIN, i64::MAX), 1),
+            (LogQuery::new(after, i64::MAX), 0),
+        ] {
+            let plan = QueryAccounting::new();
+            let out = fetcher
+                .plan_segment(&seg_ref, TENANT, &query, &plan)
+                .await
+                .expect("plan");
+            assert_eq!(out.is_some(), want == 1, "{query:?}");
+            assert_eq!(plan.snapshot().segments_opened, want, "{query:?}");
+        }
+    }
+
+    /// `plan_segment_keyed` records one footer open under the plan handle on
+    /// each route that reads the object (planned with the key present, pruned
+    /// with it absent, and the unkeyed route of a query with no arm) and none
+    /// on the key-index handle; an object outside the query window is never
+    /// read and records none.
+    ///
+    /// Fails against a keyed route that also lets `plan_segment_primed` count
+    /// the probe it was handed, against charging the open to the key-index
+    /// handle the KEY_IDX reads land on, and against dropping the count on
+    /// the `Absent` arm.
+    #[tokio::test]
+    async fn plan_segment_keyed_counts_one_open_under_plan() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let all = LogQuery::new(i64::MIN, i64::MAX);
+        let absent = all.clone().with_key_equals(KeyEquals::new(
+            "request.id",
+            KeyType::Str,
+            ravel_logseg::key_index::key8_str("absent"),
+        ));
+        let after = keyed_on_r2(LogQuery::new(seg_ref.max_event_ts_ns + 1, i64::MAX));
+        for (name, query, planned, want) in [
+            ("present", keyed_on_r2(all.clone()), true, 1),
+            ("absent", absent, false, 1),
+            ("unkeyed", all, true, 1),
+            ("outside the window", after, false, 0),
+        ] {
+            let plan = QueryAccounting::new();
+            let key_index = QueryAccounting::new();
+            let keyed = fetcher
+                .plan_segment_keyed(&seg_ref, TENANT, &query, &plan, &key_index)
+                .await
+                .expect("keyed plan");
+            assert_eq!(keyed.plan.is_some(), planned, "{name}");
+            assert_eq!(opened(&plan, &key_index), (want, 0), "{name}");
+        }
+    }
+
+    /// `probe_segment_keyed` records one footer open under the plan handle
+    /// whether the key is present or absent, none on the key-index handle,
+    /// and none for an object outside the query window, which it never reads.
+    ///
+    /// Fails against counting before the ts pre-check, against charging the
+    /// open to the key-index handle, and against counting only an absent key.
+    #[tokio::test]
+    async fn probe_segment_keyed_counts_one_open_under_plan() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let absent = LogQuery::new(i64::MIN, i64::MAX).with_key_equals(KeyEquals::new(
+            "request.id",
+            KeyType::Str,
+            ravel_logseg::key_index::key8_str("absent"),
+        ));
+        let after = keyed_on_r2(LogQuery::new(seg_ref.max_event_ts_ns + 1, i64::MAX));
+        for (name, query, pruned, want) in [
+            (
+                "present",
+                keyed_on_r2(LogQuery::new(i64::MIN, i64::MAX)),
+                0,
+                1,
+            ),
+            ("absent", absent, 1, 1),
+            ("outside the window", after, 0, 0),
+        ] {
+            let plan = QueryAccounting::new();
+            let key_index = QueryAccounting::new();
+            let pruning = fetcher
+                .probe_segment_keyed(&seg_ref, TENANT, &query, &plan, &key_index)
+                .await
+                .expect("key probe");
+            assert_eq!(pruning.segments_pruned, pruned, "{name}");
+            assert_eq!(opened(&plan, &key_index), (want, 0), "{name}");
+        }
+    }
+
+    /// A key arm on a field KEY_IDX does not declare reaches the probe, which
+    /// declines, and `plan_segment_keyed` hands the footer probe it read to
+    /// the unkeyed route (`KeyedPlanRead::Unkeyed { primed }`). That route
+    /// records the one open: one under plan, none on the key-index handle the
+    /// probe's KEY_IDX read is charged to.
+    ///
+    /// FLIP: also counting in the `Unkeyed` arm before the hand-off reads
+    /// `left: (2, 0), right: (1, 0)`.
+    #[tokio::test]
+    async fn a_declined_key_probe_hands_off_one_open_under_plan() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let query = LogQuery::new(i64::MIN, i64::MAX).with_key_equals(KeyEquals::new(
+            "user.id",
+            KeyType::Str,
+            ravel_logseg::key_index::key8_str("u1"),
+        ));
+        let plan = QueryAccounting::new();
+        let key_index = QueryAccounting::new();
+        let keyed = fetcher
+            .plan_segment_keyed(&seg_ref, TENANT, &query, &plan, &key_index)
+            .await
+            .expect("keyed plan");
+        assert!(keyed.plan.is_some(), "the unkeyed route plans the object");
+        assert_eq!(keyed.key_blocks, None, "the probe named no block subset");
+        assert_eq!(keyed.key_index, KeyIndexPruning::default());
+        assert!(
+            key_index.snapshot().decompressed_bytes > 0,
+            "the probe decoded the KEY_IDX prefix before it declined"
+        );
+        assert_eq!(opened(&plan, &key_index), (1, 0));
+    }
+
+    /// `key_probe_reads` is the guard `probe_segment_keyed` reads nothing
+    /// outside, and a probe outside it records no open: a hand-built ref with
+    /// an unordered event span (which a committed record cannot carry), an
+    /// object at the block-range threshold, and a query with no key arm.
+    ///
+    /// FLIP: dropping the unordered-span arm from `key_probe_reads` makes the
+    /// first case read `true` where `false` is expected.
+    #[tokio::test]
+    async fn the_key_probe_guard_matches_the_probes_reads() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let keyed = keyed_on_r2(LogQuery::new(i64::MIN, i64::MAX));
+        let mut unordered = seg_ref.clone();
+        unordered.min_event_ts_ns = seg_ref.max_event_ts_ns + 1;
+        let mut at_threshold = seg_ref.clone();
+        at_threshold.object_size = fetcher.block_range_threshold();
+        for (name, seg, query, reads) in [
+            ("unordered span", &unordered, &keyed, false),
+            ("at the threshold", &at_threshold, &keyed, false),
+            (
+                "no key arm",
+                &seg_ref,
+                &LogQuery::new(i64::MIN, i64::MAX),
+                false,
+            ),
+            ("read", &seg_ref, &keyed, true),
+        ] {
+            assert_eq!(fetcher.key_probe_reads(seg, query), reads, "{name}");
+            let plan = QueryAccounting::new();
+            let key_index = QueryAccounting::new();
+            fetcher
+                .probe_segment_keyed(seg, TENANT, query, &plan, &key_index)
+                .await
+                .expect("key probe");
+            assert_eq!(opened(&plan, &key_index), (u64::from(reads), 0), "{name}");
         }
     }
 
