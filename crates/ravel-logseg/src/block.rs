@@ -1454,6 +1454,13 @@ impl DictColumn {
         self.keys.len()
     }
 
+    /// The block's keys, shared, when every row is present by a popcount of
+    /// the presence bitmap: then every key indexes `values` ([`Self::new`]
+    /// checked each one) and none is an absent row's placeholder.
+    pub(crate) fn keys_if_all_present(&self) -> Option<&Arc<[i32]>> {
+        (self.present.count_set() == self.keys.len()).then_some(&self.keys)
+    }
+
     /// The entries the rows in `rows` reference, one bit per entry.
     pub(crate) fn entries_used_by(&self, rows: &[usize]) -> Validity {
         let mut used = Validity::unset(self.values.len());
