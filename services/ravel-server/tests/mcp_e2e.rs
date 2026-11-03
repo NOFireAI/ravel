@@ -3170,6 +3170,129 @@ mod with_mcp {
         running.shutdown().await.expect("server stops");
     }
 
+    /// A tenant that declares attribute columns named `group` and
+    /// `group_attrs` gets each of them once beside the tool's own
+    /// `__ravel_group` and `__ravel_group_attrs`, and every one of the four
+    /// carries its own values: the declared columns the rows' attributes, the
+    /// tool's the group number and the hoisted shared attributes.
+    ///
+    /// FLIP: naming the tool's columns `group` and `group_attrs`, as before,
+    /// puts each name in `data.columns` twice.
+    #[tokio::test]
+    async fn search_logs_group_columns_cannot_collide_with_a_declared_column() {
+        let (store, metrics) = instrumented_memory();
+        let declared = ["group", "group_attrs"]
+            .into_iter()
+            .map(|key| ravel_catalog::DeclaredTypedColumn {
+                key: key.to_string(),
+                ty: ravel_catalog::DeclaredColumnType::Str,
+            })
+            .collect();
+        let config = ravel_catalog::TenantConfig {
+            typed_attr_columns: Some(declared),
+            ..ravel_catalog::TenantConfig::new(ravel_catalog::TenantLifecycleState::Active)
+        };
+        ravel_catalog::set_tenant_config(
+            store.as_ref(),
+            &expected_tenant(),
+            &config,
+            wall_now_ns(),
+        )
+        .await
+        .expect("tenant config written");
+        publish_logs(
+            store.as_ref(),
+            &[
+                TestLog {
+                    ts_ns: 10 * NS_PER_SEC,
+                    severity_num: 9,
+                    body: "one",
+                    trace_id: None,
+                    attrs: vec![("group", "blue"), ("group_attrs", "x")],
+                },
+                TestLog {
+                    ts_ns: 20 * NS_PER_SEC,
+                    severity_num: 9,
+                    body: "two",
+                    trace_id: None,
+                    attrs: vec![("group", "green"), ("group_attrs", "x")],
+                },
+            ],
+        )
+        .await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let (is_error, found) = call(
+            &client,
+            "ravel_search_logs",
+            serde_json::json!({
+                "time_range": {"start_ns": "0", "end_ns": (3_600 * NS_PER_SEC).to_string()},
+            }),
+        )
+        .await;
+        assert_eq!(is_error, Some(false), "{found}");
+        assert_eq!(found["status"], serde_json::json!("ok"), "{found}");
+
+        let names: Vec<&str> = found["data"]["columns"]
+            .as_array()
+            .expect("columns")
+            .iter()
+            .map(|column| column["name"].as_str().expect("a column name"))
+            .collect();
+        let at = |name: &str| {
+            let found: Vec<usize> = names
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| **column == name)
+                .map(|(index, _)| index)
+                .collect();
+            let [at] = found.as_slice() else {
+                panic!("{name} is a column exactly once: {names:?}");
+            };
+            *at
+        };
+        assert_eq!(
+            (at("__ravel_group"), at("__ravel_group_attrs")),
+            (0, 1),
+            "{names:?}"
+        );
+        let column = |name: &str| -> Vec<serde_json::Value> {
+            let at = at(name);
+            found["data"]["rows"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|row| row[at].clone())
+                .collect()
+        };
+        assert_eq!(
+            column("group"),
+            [serde_json::json!("blue"), serde_json::json!("green")]
+        );
+        assert_eq!(
+            column("group_attrs"),
+            [serde_json::json!("x"), serde_json::json!("x")]
+        );
+        assert_eq!(
+            column("__ravel_group"),
+            [serde_json::json!("0"), serde_json::json!("0")]
+        );
+        assert_eq!(
+            column("__ravel_group_attrs"),
+            [
+                serde_json::json!({"group_attrs": "x", "service.name": "api"}),
+                serde_json::Value::Null,
+            ]
+        );
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
     /// `values` as samples 10 s apart, the first at 10 s.
     fn every_ten_seconds(values: &[f64]) -> Vec<(i64, f64)> {
         values

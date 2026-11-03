@@ -8,7 +8,9 @@
 //! characters, and each predicate's op must take the value it was given. A
 //! call with predicates then reads the tenant's declared columns and indexed
 //! keys through `describe_data`, at the call's own clock, and refuses a key
-//! that is neither as `invalid_argument` before any statement runs.
+//! that is neither a declared column nor `trace_id` with `trace_id` indexed
+//! as `invalid_argument` before any statement runs. An indexed key other
+//! than `trace_id` is accepted only as the declared column it names.
 //!
 //! The filters compile to `SELECT * FROM logs WHERE ... ORDER BY "ts",
 //! "observed_ts"`, which must pass `ravel_sql::refuse_several_tables`,
@@ -36,18 +38,23 @@
 //! One data row per log record, in page order. The first two columns are
 //! added by this tool:
 //!
-//! - `group`: the row's attribute group, numbered from 0 in order of first
-//!   appearance on the page. A group is the rows whose `attrs` maps have the
-//!   same set of keys.
-//! - `group_attrs`: on the first row of each group, the attributes (key and
-//!   value) every row of the group on this page carries, listed once; null on
-//!   the group's other rows.
+//! - `__ravel_group`: the row's attribute group, numbered from 0 in order of
+//!   first appearance on the page. A group is the rows whose `attrs` maps
+//!   have the same set of keys.
+//! - `__ravel_group_attrs`: on the first row of each group, the attributes
+//!   (key and value) every row of the group on this page carries, listed
+//!   once; null on the group's other rows.
+//!
+//! Both names carry the `__ravel_` prefix of the `logs` schema's synthetic
+//! names, so a declared attribute column named `group` or `group_attrs`
+//! keeps its own column beside them.
 //!
 //! The `logs` columns follow in table order, with `attrs` holding only the
-//! row's attributes not in its group's `group_attrs`. Groups and hoisting are
-//! computed per page over the rows under `max_rows`; when the byte cap or a
-//! held-back group drops rows from the end, the shared set is still shared by
-//! every kept row, but it may be smaller than what the kept rows alone share.
+//! row's attributes not in its group's `__ravel_group_attrs`. Groups and
+//! hoisting are computed per page over the rows under `max_rows`; when the
+//! byte cap or a held-back group drops rows from the end, the shared set is
+//! still shared by every kept row, but it may be smaller than what the kept
+//! rows alone share.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -89,6 +96,12 @@ pub const SEVERITY_LEVELS: [(&str, u8); 6] = [
 
 /// The indexed key a predicate may name besides the declared columns.
 const TRACE_ID: &str = "trace_id";
+
+/// The output column numbering each row's attribute group.
+const GROUP_COLUMN: &str = "__ravel_group";
+
+/// The output column listing each group's shared attributes once.
+const GROUP_ATTRS_COLUMN: &str = "__ravel_group_attrs";
 
 type Refusal = (Failure, Vec<NextStep>);
 
@@ -305,14 +318,14 @@ impl Keys {
                     failure(
                         FailureClass::InvalidArgument,
                         format!(
-                            "predicate key {key:?} is neither a declared column nor an indexed \
-                             key of the logs table"
+                            "predicate key {key:?} is neither a declared column of the logs \
+                             table nor trace_id with trace_id indexed"
                         ),
                     ),
                     vec![step(
                         "ravel_describe_data",
-                        "call ravel_describe_data with signal logs for the declared columns \
-                         and indexed keys a predicate may name",
+                        "call ravel_describe_data with signal logs: a predicate may name a \
+                         column row marked declared, or trace_id when it is an indexed_key row",
                     )],
                 ));
             }
@@ -608,9 +621,10 @@ fn finish(
     })
 }
 
-/// Prepend the `group` and `group_attrs` columns and hoist each group's
-/// shared attributes out of `attrs`, over the first `considered` rows. A row
-/// past them is one the row cap drops, and keeps null in both new columns.
+/// Prepend the [`GROUP_COLUMN`] and [`GROUP_ATTRS_COLUMN`] columns and hoist
+/// each group's shared attributes out of `attrs`, over the first `considered`
+/// rows. A row past them is one the row cap drops, and keeps null in both new
+/// columns.
 fn group_by_attribute_set(data: &mut Data, considered: usize) {
     let attrs_at = data
         .columns
@@ -667,11 +681,11 @@ fn group_by_attribute_set(data: &mut Data, considered: usize) {
         0..0,
         [
             Column {
-                name: "group".to_string(),
+                name: GROUP_COLUMN.to_string(),
                 r#type: "Int64".to_string(),
             },
             Column {
-                name: "group_attrs".to_string(),
+                name: GROUP_ATTRS_COLUMN.to_string(),
                 r#type: attrs_type,
             },
         ],
@@ -1022,9 +1036,7 @@ mod tests {
 
     /// A predicate key that is neither declared nor indexed is refused after
     /// `describe_data` (read at the call's clock) and before any statement
-    /// runs, with a next step naming `ravel_describe_data`. An indexed key
-    /// that is not `trace_id` and not declared has no column to filter and is
-    /// unknown too.
+    /// runs, with a next step naming `ravel_describe_data`.
     ///
     /// FLIP: passing the key through as a column name reaches `sql_execute`,
     /// which the stub refuses by panicking.
@@ -1053,6 +1065,50 @@ mod tests {
             assert_eq!(
                 (described[0].resolve_at_ns, described[0].caller_now_ns),
                 (END_NS, END_NS)
+            );
+        }
+    }
+
+    /// The key rule as the guide states it: a predicate may name a declared
+    /// column, or `trace_id` when it is indexed. An indexed key that is not
+    /// declared and is not `trace_id`, and `trace_id` on a tenant that does
+    /// not index it, are each refused before any statement runs, with the
+    /// `ravel_describe_data` next step saying which rows name a usable key.
+    ///
+    /// FLIP: accepting every key `describe_data` lists as indexed reaches
+    /// `sql_execute` for `k8s.namespace`, which the stub refuses by
+    /// panicking.
+    #[test]
+    fn an_indexed_key_other_than_trace_id_is_refused_unless_declared() {
+        let key = key();
+        let mut indexes_more = described();
+        indexes_more.indexed_keys.push("k8s.namespace".to_string());
+        let mut no_trace_index = described();
+        no_trace_index.indexed_keys.retain(|key| key != TRACE_ID);
+        for (name, outcome, refused) in [
+            ("undeclared indexed key", indexes_more, "k8s.namespace"),
+            ("trace_id not indexed", no_trace_index, "trace_id"),
+        ] {
+            let stub = Stub::default();
+            stub.describe.borrow_mut().push_back(outcome);
+            let envelope = block_on(run(
+                args(json!({
+                    "predicates": [{"key": refused, "op": "exists"}],
+                })),
+                &context(&key),
+                &stub,
+            ));
+            assert_eq!(
+                failure_class(&envelope),
+                FailureClass::InvalidArgument,
+                "{name}"
+            );
+            assert_eq!(actions(&envelope), ["ravel_describe_data"], "{name}");
+            assert_eq!(
+                envelope.next_steps[0].detail,
+                "call ravel_describe_data with signal logs: a predicate may name a column row \
+                 marked declared, or trace_id when it is an indexed_key row",
+                "{name}"
             );
         }
     }
@@ -1267,8 +1323,9 @@ mod tests {
     }
 
     /// Rows with the same attribute key set form one group; an attribute
-    /// equal on every row of the group is listed once in `group_attrs` on
-    /// the group's first row, and one that differs stays on each row.
+    /// equal on every row of the group is listed once in
+    /// `__ravel_group_attrs` on the group's first row, and one that differs
+    /// stays on each row.
     ///
     /// FLIP: hoisting every attribute of the group's first row lists
     /// `pod=p1` as shared and drops `pod=p2` from row b.
@@ -1295,7 +1352,14 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["group", "group_attrs", "id", "ts", "observed_ts", "attrs"]
+            [
+                "__ravel_group",
+                "__ravel_group_attrs",
+                "id",
+                "ts",
+                "observed_ts",
+                "attrs"
+            ]
         );
         let map = |value: Value| match value {
             Value::Object(map) => Cell::Map(map),
