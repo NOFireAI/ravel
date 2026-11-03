@@ -379,7 +379,9 @@ the keyset position, and the deadline. It also carries the pinned segment
 set, with the pending erasure predicates and the declared columns. (The
 declared columns are now pinned as a fixed-size digest of the set; see the
 declared-set digest amendment below.) The server stores nothing. A page
-re-executes the statement against the pin with a keyset predicate. A cursor
+re-executes the statement against the pin with a keyset predicate. (The
+cursor also pins a digest of the resolved segment set; see the pinned
+segment set amendment below.) A cursor
 from a dead process fails with `cursor_expired`. Only the process that minted
 a cursor can redeem it. The documentation says this, and it names sticky
 routing as the option for a load balancer. The server also compares the
@@ -780,7 +782,7 @@ against the 256 KiB `max_response_bytes` floor.
    which ingest-hour buckets are listed, not which records those buckets
    hold. So the pagination guarantee
    is three-part. A row is never repeated (an order term computed from
-   other rows mints no cursor so that this holds; see the other-rows order amendment below). A row may appear on a later page.
+   other rows pins the segment set so that this holds; see the other-rows order amendment and the pinned segment set amendment below). A row may appear on a later page.
    A late-arriving row that sorts before the cursor position is silently
    omitted from every page. The third part is the one a caller must know.
 5. D2: `ravel_find_labels` states whether its list is complete for the
@@ -1588,7 +1590,8 @@ finding of review #1388). This other-rows order amendment closes that.
    `nullif(count(*), 0)`), whether the term is written in the `ORDER BY` or
    names a projected alias that defines it. `count(...)` was the only
    function an order term could carry before this; it no longer can, and
-   no function is admitted.
+   no function is admitted. (Superseded for count(...): see the pinned
+   segment set amendment below.)
 2. The statement is not refused. `ravel_query_sql` treats this outcome as
    the query-sql amendment, item 1, treats `NoOrdering`: it runs the
    statement as written, unpaged, and returns the rows up to `max_rows`; a
@@ -1748,3 +1751,85 @@ check now refuses one.
    write that adds a `__ravel_` key the stored record does not already
    declare is refused. Such a record is the only way a declared column can
    still take one of the tool columns' names.
+
+## Amendment (2026-11-03, #3774): the pinned segment set amendment, a cursor pins a digest of the segment set and a count order pages again
+
+<!-- amendment-applies: sections="D5. Consistency, cursors, and evidence references|Consequences|Amendment (2026-11-03, #3749): the other-rows order amendment, an aggregate or window order term carries no cursor" pointer="pinned segment set amendment" -->
+<!-- amendment-supersedes: phrase="no function is admitted" pointer="pinned segment set amendment" -->
+
+The other-rows order amendment removed the cursor from any `ORDER BY` term
+computed from other rows because a cursor pinned the inputs of a resolve
+and not its result: a later page re-lists page one's ingest hours and
+reads whatever they hold at that moment, so a row committed into one of
+them after page one changes a group's count and moves a group already
+served. This pinned segment set amendment makes the pin exact where that
+matters and gives the count order its cursor back.
+
+1. A cursor carries a BLAKE3-256 digest of the segment set page one
+   resolved: the sorted, deduplicated data-object keys of every segment
+   the statement's lanes resolved, each prefixed with its length as a
+   little-endian `u32`, hashed in derive-key mode under
+   `"ravel-sql resolved segment set v1"`. ravel-sql reports the keys
+   (`SqlOutcome::segment_set`, `ravel_sql::segment_set_keys`) and
+   ravel-mcp digests them (`ravel_mcp::cursor::segment_set_digest`). A
+   key embeds the object's content hash (ADR-0010 section 7), so equal
+   digests mean byte-identical segments and so identical values for every
+   expression over them. `CURSOR_VERSION` goes from 6 to 7, and a version
+   6 token decodes as `cursor_invalid`, as versions 3, 4 and 5 do. The
+   digest is 33 bytes in the token with its presence byte (1 when no
+   digest is pinned) and does not grow with the segment count, which the
+   segment-enumeration cursor the 2026-09-09 amendment replaced did.
+2. A redemption compares the digest of its own resolve with the pinned
+   one, after the erasure and declared-set checks, in one of two modes the
+   tool chooses from the plan. Required: a difference, or a digest missing
+   on either side, is `cursor_expired`, with a `rerun_page_one` next step.
+   Advisory: the page is served and carries a warning that the segment set
+   changed since page one. `ravel_query_sql` requires the pin when the
+   effective order has a term computed from other rows
+   (`PagePlan::order_from_other_rows`) and advises otherwise;
+   `ravel_search_logs` advises; `ravel_describe_data` pins no digest this
+   round and its redemption compares nothing.
+3. The guarantee of the 2026-09-12 amendment, item 4, splits by order. For
+   an order on the row's own columns it stands as written: a row is not
+   repeated, a row committed after page one may appear on a later page or
+   be omitted, and since this amendment a page that observed the change
+   says so. For an order with a term computed from other rows it is
+   tightened: every page is computed over page one's segment set or is
+   not served, so within such a walk a row is not repeated and not
+   dropped, and a row committed after page one is in none of its pages.
+4. `ravel_sql::plan_page` admits `count(...)` as an order term again
+   (`count(*)`, `count(x)`, `count(DISTINCT x)`, a `FILTER` clause,
+   `count(*) OVER (PARTITION BY ..)`, a negated count), written in the
+   `ORDER BY` or through an alias: a count is not NULL and is an `Int64`.
+   It is the one function admitted; the other-rows order amendment's item
+   1 said that no function is admitted, and that now holds for every
+   function but count. Two count forms stay unpaged: a count over a
+   `ROWS` frame or a named window, which counts positions that ties under
+   the window's ordering leave unfixed, and a count written in the
+   `ORDER BY` that no single projected output column is defined as, which
+   leaves no output name to resume on. A term computed from other rows
+   that the text does not prove non-null (`sum`, `min`, `max`, `avg`, a
+   window function other than a count, a subquery) still answers
+   `OrderTermFromOtherRows` and runs unpaged, as item 2 of that amendment
+   says; its `order_by_the_rows_own_columns` next step now says the term
+   is not proven non-null, and that a `count(...)` term or the row's own
+   non-null columns page.
+5. What can end such a walk, each with `cursor_expired`: a commit whose
+   event range overlaps the window into a listed hour (a commit whose
+   event range does not overlap the window leaves the digest unchanged,
+   since a resolve drops that record, so a window that ends before the
+   most recent ingest is stable against live ingest); a compaction of a
+   bucket the window covers, because the keys change although the rows
+   are conserved; and anything else that changes the resolved set, such
+   as a fold that seals an hour the window covers under a name-pruned
+   statement, a completed erasure rewrite, or a retention tombstone over
+   the window. A rewrite's outputs are new level-1 keys
+   (docs/catalog-and-mvcc.md, "Key layout"), so a completed erasure is a
+   correct expiry that the 2026-09-11 amendment's item 3 and the cursor
+   module's "fourth case" could not detect before. A digest over the
+   logical L0 identity set would survive the compaction and fold cases
+   and is the follow-up, since `SegmentRef` carries no L0 identity for a
+   level-1 part.
+6. The ClickBench corpus, with each trailing row limit set aside, plans 22
+   of its 43 statements as pages again (6 answer `OrderTermFromOtherRows`),
+   from the 1 and 27 of the other-rows order amendment's item 4.

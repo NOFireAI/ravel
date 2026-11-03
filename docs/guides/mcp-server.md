@@ -146,11 +146,15 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   anything is read: two tables, a write, a statement-level `LIMIT`, and an
   `ORDER BY` the tool cannot page by (a float column, a column that may be
   NULL, one the statement does not project) are refused with a next step.
-  A statement with no `ORDER BY` over a table with no row identity runs
-  unpaged, and so does one ordered by an aggregate, a window function or a
-  subquery (`ORDER BY count(*)`), whose value a row committed later can
-  change for rows already served: a full page of either is `ok_bounded`
-  with no cursor and a next step saying how to order it to page. An
+  A statement ordered by a `count(...)` (`ORDER BY c` over
+  `count(*) AS c`) pages only over the segments page one read, since a row
+  committed later can change a count for groups already served: a later
+  page whose segments changed is `cursor_expired` with a `rerun_page_one`
+  next step. A statement with no `ORDER BY` over a table with no row
+  identity runs unpaged, and so does one ordered by another aggregate, a
+  window function or a subquery (`ORDER BY sum(value)`): a full page of
+  either is `ok_bounded` with no cursor and a next step saying how to order
+  it to page. An
   `evidence_ref` is refused as unsupported. The
   [reference](../reference/mcp.md#running-a-statement) lists each answer.
 - `ravel_query_promql`: an instant or a range PromQL evaluation, with
@@ -488,6 +492,7 @@ it; the next call runs under its own deadline.
 | Case | Failure |
 |---|---|
 | The server process that minted the cursor has since restarted. Only that process can redeem it. | `cursor_expired` |
+| A `ravel_query_sql` walk ordered by a count read different segments than page one. | `cursor_expired` |
 | The cursor is sent back for the wrong tenant, or is altered. | `cursor_invalid` |
 
 Paging order differs per tool:
@@ -499,12 +504,20 @@ Paging order differs per tool:
   so, the equal-group rule applies as for `ravel_search_logs`, and cursor
   paging continues. A page whose last row has no cursor position (a NaN
   or infinite order value, or a cursor over its 4 KiB bound) ends
-  `ok_bounded` with no cursor and a `narrow_time_range` next step. An
-  `ORDER BY` on an aggregate or window value mints no cursor at all; order
-  by the row's own columns to page such a result.
+  `ok_bounded` with no cursor and a `narrow_time_range` next step. The
+  cursor pins a digest of the segments page one read. Under an `ORDER BY`
+  on a `count(...)`, a later page is served only over those same segments,
+  else it is `cursor_expired` with a `rerun_page_one` next step; a
+  `time_range` that ends before the most recent ingest keeps them stable.
+  Under an order on the row's own columns, a later page over changed
+  segments is served with a warning that a row committed since may appear
+  or be omitted. An `ORDER BY` on any other aggregate or window value mints
+  no cursor at all; order by a count or by the row's own columns to page
+  such a result.
 - `ravel_search_logs` orders by `(ts, observed_ts)`, which is not always
   unique, because `logs` rows carry no row identity. The equal-group rule
-  applies.
+  applies. A later page over segments that changed since page one carries
+  the same warning.
 - `ravel_get_trace` mints no cursor: it returns the trace's spans in one
   page, ordered by `start_ts` and `span_id`, and a trace larger than the row
   cap comes back bounded (`row_cap_hit`) rather than paged. Raise `max_rows`

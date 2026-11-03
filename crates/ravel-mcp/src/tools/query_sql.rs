@@ -9,10 +9,17 @@
 //! the reason, with two exceptions, which run unpaged so that a capped result
 //! is `ok_bounded` with no cursor: a statement with no `ORDER BY` over a table
 //! with no row identity, and a statement whose `ORDER BY` uses a value
-//! computed from other rows (an aggregate, a window function or a subquery).
-//! A row committed after a cursor was minted can change such a value for a
-//! row already served and move that row after the cursor, so no position on
-//! it resumes without repeating rows.
+//! computed from other rows that the planner does not prove non-null (`sum`,
+//! `min`, `max`, `avg`, a window function other than `count`, a subquery).
+//!
+//! An order on `count(...)` pages (`PagePlan::order_from_other_rows`). A row
+//! committed after a cursor was minted can change a count for a row already
+//! served and move that row after the cursor, so such a walk pins the segment
+//! set page one read ([`SegmentSetPin::Required`]): a later page is served
+//! only over the same segments, and is otherwise `cursor_expired` with the
+//! single next step `rerun_page_one`. A walk ordered by the row's own columns
+//! is served over whatever segments its resolve returns
+//! ([`SegmentSetPin::Advisory`]) and warns when they moved.
 //!
 //! `time_range` is applied as a half-open row filter (`row_window`), not
 //! only as the segment-listing bound, so a row outside it is excluded even
@@ -32,7 +39,8 @@
 //! [`crate::resume_tuple`], together with the effective `ORDER BY`. A later
 //! page resolves at page one's instant, audits at its own clock, and is
 //! refused as `cursor_expired` when a newer erasure or a changed declared
-//! column set moved what page one's pin describes.
+//! column set moved what page one's pin describes, or, for a `count` order,
+//! when its segment set moved.
 //!
 //! Three boundaries have no cursor position, and each ends the page
 //! `ok_bounded` with no cursor and a `next_steps` entry rather than a
@@ -48,7 +56,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::catalog::QuerySqlInput;
-use crate::cursor::{Cursor, CursorError, CursorPosition};
+use crate::cursor::{
+    Confirmed, Cursor, CursorError, CursorPosition, SEGMENT_SET_MOVED_WARNING, SegmentSetPin,
+};
 use crate::draft::{Draft, NoCursor, PageOrder, PinScope};
 use crate::envelope::{
     CURSOR_BOUND, Envelope, Failure, FailureClass, NextStep, Status, serialized_str_len,
@@ -131,10 +141,10 @@ impl Unpaged {
             ),
             Unpaged::OrderFromOtherRows => step(
                 "order_by_the_rows_own_columns",
-                "the ORDER BY uses a value computed from other rows (an aggregate, a window \
-                 function or a subquery), which a row committed later can change for rows \
-                 already served, so the rest of the result has no cursor; paging needs an \
-                 order on the row's own non-null columns, or narrow time_range",
+                "the ORDER BY uses a value computed from other rows that the statement does \
+                 not prove non-null (sum, min, max, avg, a window function other than count, \
+                 a subquery), so the rest of the result has no cursor; order by count(...) or \
+                 by the row's own non-null columns to page, or narrow time_range",
             ),
         }
     }
@@ -284,11 +294,35 @@ async fn later_page<B: QueryBackend>(
         .map(|predicate| (signal, predicate.clone()))
         .collect();
     let declared = draft.declared_columns.clone();
-    let confirmed = match pending.confirm(ctx.now_ns, &observed_erasure, &declared) {
+    let pin = if plan.order_from_other_rows {
+        SegmentSetPin::Required
+    } else {
+        SegmentSetPin::Advisory
+    };
+    let observed_segment_set = draft.segment_set_digest;
+    let Confirmed {
+        cursor: confirmed,
+        segment_set_moved,
+    } = match pending.confirm(
+        ctx.now_ns,
+        &observed_erasure,
+        &declared,
+        observed_segment_set,
+        pin,
+    ) {
         Ok(confirmed) => confirmed,
+        Err(error @ CursorError::SegmentSetMoved) => {
+            return refused_with(error.failure(), vec![rerun_page_one()], ctx);
+        }
         Err(error) => return refused_with(error.failure(), Vec::new(), ctx),
     };
-    let draft = draft.pinned_to(&confirmed, declared);
+    let mut draft = draft.pinned_to(&confirmed, declared);
+    if segment_set_moved {
+        draft
+            .envelope
+            .warnings
+            .push(SEGMENT_SET_MOVED_WARNING.to_string());
+    }
     finish(
         draft,
         &plan,
@@ -379,7 +413,15 @@ fn finish(
             }
         }
     };
+    let order_from_other_rows = plan.order_from_other_rows;
     draft.finish_page(&ctx.budgets, scope, order, |pins, _, tuple| {
+        if order_from_other_rows && pins.segment_set_digest.is_none() {
+            return Err(NoCursor::because(
+                "the order depends on values computed from other rows and the backend \
+                 reported no segment set to pin"
+                    .to_string(),
+            ));
+        }
         let tuple = tuple.ok_or_else(|| {
             unmintable("the last row's ORDER BY values could not be read".to_string())
         })?;
@@ -405,6 +447,18 @@ fn finish(
         }
         Ok(token)
     })
+}
+
+/// What a walk ordered by a value computed from other rows does once its
+/// segment set moved: start over.
+fn rerun_page_one() -> NextStep {
+    step(
+        "rerun_page_one",
+        "a row, a compaction or an erasure changed the segments this walk reads since page \
+         one, and its order depends on values computed from other rows, so no later page can \
+         be exact; run page one again (a time_range that ends before the most recent ingest \
+         stays stable), or order by the row's own columns to page through a moving window",
+    )
 }
 
 /// A capped page whose last row has no cursor position.
@@ -531,6 +585,11 @@ mod tests {
     const END_NS: i64 = 3 * 3_600_000_000_000;
     /// The later pages' clock, a minute after page one's.
     const LATER_NS: i64 = END_NS + 60_000_000_000;
+    /// The segment set digest every draft reports unless a test moves it.
+    const SEGMENTS: [u8; 32] = [0x5Eu8; 32];
+    /// A digest other than [`SEGMENTS`]: the segment set after a move.
+    const MOVED: [u8; 32] = [0x77u8; 32];
+    const COUNT_ORDER: &str = "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY c, ts";
 
     fn key() -> CursorKey {
         CursorKey::from_process_secret([0x51u8; CURSOR_KEY_LEN])
@@ -586,6 +645,7 @@ mod tests {
             erasure,
             Vec::new(),
             Some(2),
+            Some(SEGMENTS),
             resolve_at_ns,
         )
         .with_order_tuples(tuples)
@@ -879,10 +939,11 @@ mod tests {
         assert!(executed[0].order_columns.is_empty());
     }
 
-    /// A statement ordered by a value computed from other rows runs as
-    /// written, unpaged: capped, it is `ok_bounded` with no cursor and a
-    /// next step saying paging needs an order on the row's own columns.
-    /// Uncapped, it is `ok` with every row.
+    /// A statement ordered by a value computed from other rows that the
+    /// planner does not prove non-null runs as written, unpaged: capped, it
+    /// is `ok_bounded` with no cursor and a next step naming the orders that
+    /// page. Uncapped, it is `ok` with every row. A `count` written in the
+    /// `ORDER BY` with no projected column defined as it is one of these.
     ///
     /// FLIP: sending `OrderTermFromOtherRows` to `plan_refusal` answers
     /// `invalid_argument` with `rewrite_the_statement`, and the backend is
@@ -890,9 +951,10 @@ mod tests {
     #[test]
     fn a_statement_ordered_by_an_aggregate_runs_unpaged() {
         let queries = [
-            "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY c, ts",
             "SELECT series_id, sum(value) AS s FROM samples GROUP BY series_id ORDER BY s",
-            "SELECT ts, series_id, count(*) OVER () AS c FROM samples ORDER BY c, ts, series_id",
+            "SELECT ts, min(series_id) AS m FROM samples GROUP BY ts ORDER BY m, ts",
+            "SELECT ts, series_id, row_number() OVER () AS r FROM samples ORDER BY r, ts, series_id",
+            "SELECT ts, count(*) FROM samples GROUP BY ts ORDER BY count(*), ts",
         ];
         for query in queries {
             for (rows, status) in [(3, Status::OkBounded), (2, Status::Ok)] {
@@ -920,6 +982,7 @@ mod tests {
                     let detail = &page.next_steps[0].detail;
                     assert!(
                         detail.contains("computed from other rows")
+                            && detail.contains("order by count(...)")
                             && detail.contains("the row's own non-null columns"),
                         "{query}: {detail}"
                     );
@@ -928,6 +991,166 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The `COUNT_ORDER` tuple of a group at `ts` offset `i` counting `c`.
+    fn counted(c: i64, i: u8) -> Vec<ResumeValue> {
+        vec![
+            ResumeValue::Int(c),
+            ResumeValue::TimestampNanos(START_NS + i64::from(i) * 1_000),
+        ]
+    }
+
+    fn count_page(groups: &[(i64, u8)], digest: Option<[u8; 32]>) -> Draft {
+        let mut draft = draft_of(
+            Signal::Metrics,
+            groups.iter().map(|&(c, i)| Some(counted(c, i))).collect(),
+            Vec::new(),
+            END_NS,
+        );
+        draft.segment_set_digest = digest;
+        draft
+    }
+
+    fn decoded(envelope: &Envelope, key: &CursorKey) -> Cursor {
+        let token = envelope.presentation.cursor.as_deref().expect("a cursor");
+        Cursor::decode(token, key).expect("decodes")
+    }
+
+    /// An order on `count(...)` pages, and its cursor pins page one's segment
+    /// set as required: a later page whose resolve reports another digest is
+    /// `cursor_expired` with `rerun_page_one` as its one next step and no
+    /// rows, and one reporting page one's digest is served, pinned, and mints
+    /// a cursor carrying page one's digest. A page one whose backend reported
+    /// no segment set mints no cursor.
+    ///
+    /// FLIP H: passing `SegmentSetPin::Advisory` for every walk serves the
+    /// moved page.
+    /// FLIP I: a `pinned_to` that keeps the draft's own digest is shown in
+    /// `an_own_column_walk_warns_on_every_page_after_a_move`.
+    #[test]
+    fn a_count_order_pages_only_over_page_ones_segment_set() {
+        let plan = ravel_sql::plan_page(COUNT_ORDER, None).expect("a count order plans");
+        assert!(plan.order_from_other_rows);
+        assert_eq!(order_columns(&plan), ["c", "ts"]);
+
+        let key = key();
+        let stub = Stub::default();
+        stub.sql.borrow_mut().extend([
+            count_page(&[(1, 1), (2, 2), (3, 3)], Some(SEGMENTS)),
+            count_page(&[(3, 3), (4, 4), (5, 5)], Some(MOVED)),
+            count_page(&[(3, 3), (4, 4), (5, 5)], Some(SEGMENTS)),
+        ]);
+
+        let one = block_on(run(args(COUNT_ORDER, None), &context(&key), &stub));
+        assert_eq!(one.status, Status::OkPage, "{one:?}");
+        assert_eq!(one.data.rows.len(), 2);
+        assert_eq!(decoded(&one, &key).segment_set_digest, Some(SEGMENTS));
+        let cursor = one.presentation.cursor.clone().expect("page one's cursor");
+
+        let moved = block_on(run(args(COUNT_ORDER, Some(&cursor)), &later(&key), &stub));
+        assert_eq!(failure_class(&moved), FailureClass::CursorExpired);
+        assert_eq!(actions(&moved), ["rerun_page_one"]);
+        assert_eq!(
+            moved.next_steps[0].detail,
+            "a row, a compaction or an erasure changed the segments this walk reads since \
+             page one, and its order depends on values computed from other rows, so no later \
+             page can be exact; run page one again (a time_range that ends before the most \
+             recent ingest stays stable), or order by the row's own columns to page through \
+             a moving window"
+        );
+        assert!(moved.data.rows.is_empty());
+
+        let same = block_on(run(args(COUNT_ORDER, Some(&cursor)), &later(&key), &stub));
+        assert_eq!(same.status, Status::OkPage, "{same:?}");
+        assert!(same.visibility.pinned);
+        assert_eq!(same.visibility.snapshot_id, one.visibility.snapshot_id);
+        assert!(
+            !same
+                .warnings
+                .contains(&SEGMENT_SET_MOVED_WARNING.to_owned()),
+            "{:?}",
+            same.warnings
+        );
+        assert_eq!(decoded(&same, &key).segment_set_digest, Some(SEGMENTS));
+        assert_eq!(
+            stub.executed.borrow()[2].request.sql,
+            statement(COUNT_ORDER, Some(counted(2, 2)))
+        );
+
+        let unpinned = Stub::default();
+        unpinned
+            .sql
+            .borrow_mut()
+            .push_back(count_page(&[(1, 1), (2, 2), (3, 3)], None));
+        let page = block_on(run(args(COUNT_ORDER, None), &context(&key), &unpinned));
+        assert_eq!(page.status, Status::OkBounded, "{page:?}");
+        assert_eq!(page.presentation.cursor, None);
+        assert!(
+            page.warnings.first().is_some_and(|w| w
+                == "no cursor: the order depends on values computed from other rows and the \
+                    backend reported no segment set to pin"),
+            "{:?}",
+            page.warnings
+        );
+    }
+
+    /// A walk ordered by the row's own columns is served over a moved segment
+    /// set with a warning, on page two and again on page three, because each
+    /// page compares against page one's digest, not the previous page's.
+    /// Over an unchanged set it carries no such warning.
+    ///
+    /// FLIP I: a `pinned_to` that keeps the draft's own digest mints page
+    /// two's cursor over `MOVED`, so page three, also over `MOVED`, compares
+    /// equal and does not warn.
+    /// FLIP J: dropping the warning serves page two silently.
+    #[test]
+    fn an_own_column_walk_warns_on_every_page_after_a_move() {
+        let key = key();
+        let stub = Stub::default();
+        let mut two = samples(&[3, 4, 5]);
+        two.segment_set_digest = Some(MOVED);
+        let mut three = samples(&[5, 6, 7]);
+        three.segment_set_digest = Some(MOVED);
+        stub.sql
+            .borrow_mut()
+            .extend([samples(&[1, 2, 3]), two, three]);
+
+        let one = block_on(run(args(TOTAL, None), &context(&key), &stub));
+        assert!(!one.warnings.contains(&SEGMENT_SET_MOVED_WARNING.to_owned()));
+        let cursor = one.presentation.cursor.clone().expect("page one's cursor");
+
+        let two = block_on(run(args(TOTAL, Some(&cursor)), &later(&key), &stub));
+        assert_eq!(two.status, Status::OkPage, "{two:?}");
+        assert_eq!(two.data.rows.len(), 2);
+        assert!(
+            two.warnings.contains(&SEGMENT_SET_MOVED_WARNING.to_owned()),
+            "{:?}",
+            two.warnings
+        );
+        let cursor = two.presentation.cursor.clone().expect("page two's cursor");
+
+        let three = block_on(run(args(TOTAL, Some(&cursor)), &later(&key), &stub));
+        assert_eq!(three.status, Status::OkPage, "{three:?}");
+        assert!(
+            three
+                .warnings
+                .contains(&SEGMENT_SET_MOVED_WARNING.to_owned()),
+            "{:?}",
+            three.warnings
+        );
+        assert_eq!(decoded(&three, &key).segment_set_digest, Some(SEGMENTS));
+
+        let quiet = Stub::default();
+        quiet
+            .sql
+            .borrow_mut()
+            .extend([samples(&[1, 2, 3]), samples(&[3])]);
+        let one = block_on(run(args(TOTAL, None), &context(&key), &quiet));
+        let cursor = one.presentation.cursor.clone().expect("page one's cursor");
+        let two = block_on(run(args(TOTAL, Some(&cursor)), &later(&key), &quiet));
+        assert_eq!(two.status, Status::Ok, "{two:?}");
+        assert!(!two.warnings.contains(&SEGMENT_SET_MOVED_WARNING.to_owned()));
     }
 
     /// Every statement-level refusal comes back before the backend is
