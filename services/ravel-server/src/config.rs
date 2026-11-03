@@ -7260,10 +7260,12 @@ impl Cli {
     /// collision with one of the nine fixed logs SQL columns, a key starting
     /// with the reserved `__ravel_` prefix) are checked by
     /// [`TypedAttrColumnConfig::from_policy`](crate::typed_attr_config::TypedAttrColumnConfig::from_policy),
-    /// which calls `ravel_catalog::validate_typed_attr_columns` -- the same
-    /// function guarding a durable write -- so the flags and the durable record
-    /// are held to identical rules. `main` calls both, so any violation fails
-    /// startup, never a silent partial parse. The same deferral of validation to
+    /// which calls `ravel_catalog::validate_typed_attr_columns`, the gate for
+    /// new operator input. A durable write applies the same rules with one
+    /// difference: it keeps a reserved key the record it replaces already
+    /// declares, so a record stored before the prefix rule can still be
+    /// rewritten. `main` calls both, so any violation fails startup, never a
+    /// silent partial parse. The same deferral of validation to
     /// `from_policy` that `parse_indexed_field_policy` uses.
     ///
     /// A key may itself contain `:` (the type is split off the right), but a

@@ -1389,8 +1389,8 @@ pub fn resolve_retention_window(
 
 /// The tenant's effective declared typed attribute columns: the record's
 /// [`TenantConfig::typed_attr_columns`] override when the record is present and
-/// carries a `Some` list that passes [`validate_stored_typed_attr_columns`] (including
-/// `Some(vec![])`, an override to no declared columns), otherwise
+/// carries a `Some` list that passes [`validate_stored_typed_attr_columns`]
+/// (including `Some(vec![])`, an override to no declared columns), otherwise
 /// `base_columns`, which is the tenant's base columns as the server resolves
 /// them (`TypedAttrColumnConfig::columns_for`: the tenant's
 /// `--typed-attr-column-tenant` override when one is set, else the
@@ -1868,8 +1868,10 @@ enum ReadExpectation<'a> {
 }
 
 /// Refuse a declared key starting with [`RESERVED_COLUMN_PREFIX`] unless the
-/// record being replaced already declares it, so a read-modify-write that
-/// carries a record stored before the rule through unchanged still succeeds.
+/// record being replaced already declares a column with that key, so a
+/// read-modify-write over a record stored before the rule still succeeds. The
+/// match is by key alone: such a write may change the stored column's type,
+/// but it cannot add a reserved name.
 fn refuse_new_reserved_keys(
     config: &TenantConfig,
     existing: Option<&TenantConfig>,
