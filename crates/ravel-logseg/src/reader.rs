@@ -7521,6 +7521,73 @@ mod tests {
             assert_eq!(cache.column_hits(deferred), 6, "two hot runs over 3 blocks");
         }
 
+        /// ADR-3326, zero-copy values amendment, decision 5: a block's own
+        /// dictionary (an `Enc::Dict` page) is decoded into a `DictValues` of
+        /// its own, never into the scan's `DictCache`, which holds row group
+        /// dictionaries only. Its entry shares that dictionary's reservation
+        /// cell, and while the scan is on its block the scan pins the entry
+        /// and holds the column, so a pressure pass keeps it. Once the scan
+        /// is on block 1 of the same row group nothing outside the cache
+        /// holds that column, so a pressure pass evicts the entry, reports
+        /// its bytes freed, and leaves the budget's reserved figure equal to
+        /// the cache's resident total.
+        ///
+        /// FLIP: make `CachedColumn::cell_column_held_outside` answer `true`
+        /// for every dictionary and the block 0 entry is never freed
+        /// ("evicted once the scan moved on").
+        #[test]
+        fn a_block_dictionary_is_freed_by_pressure_once_the_scan_moves_on() {
+            use ravel_memory::{ExhaustionCause, MemoryBudget};
+            let cfg = RlogConfig {
+                block_target_records: 4,
+                ..RlogConfig::default()
+            };
+            let recs: Vec<LogRecord> = (0..8)
+                .map(|i| {
+                    rec_attrs(
+                        0,
+                        100 + i,
+                        &format!("body {i}"),
+                        vec![attr("svc", AttrValue::Str(format!("svc-{}", i / 4)))],
+                    )
+                })
+                .collect();
+            let obj = build(cfg, recs);
+            let reader = RlogReader::new(&obj, &cfg).expect("open object");
+            assert_eq!(reader.row_group_count(), 1);
+            let budget = Arc::new(MemoryBudget::new(4 << 30));
+            let cache = Arc::new(DecodedColumnCache::new(1 << 30, Some(Arc::clone(&budget))));
+            let counters = Arc::new(DecodedCacheCounters::default());
+            let attach = attach_to(&cache, &counters);
+            let mut scan = reader
+                .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                .expect("open cursor");
+            scan.attach_decoded_cache(attach_to(&cache, &counters));
+            assert!(scan.next_block_columnar(&obj).expect("block 0").is_some());
+            let block = scan.current.as_ref().expect("a decoded block");
+            let dict = (0..FIRST_DYNAMIC_COL + 64)
+                .find(|&cid| {
+                    block
+                        .cached_column(cid)
+                        .is_some_and(|c| matches!(c, CachedColumn::Dict(_)) && c.memo_capable())
+                })
+                .expect("block 0 has a dictionary of its own");
+            let key = attach.key(0, dict);
+            let bytes = cache.entry_bytes(&key).expect("admitted on block 0");
+            cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted);
+            assert_eq!(cache.entry_bytes(&key), Some(bytes), "held on its block");
+
+            assert!(scan.next_block_columnar(&obj).expect("block 1").is_some());
+            let freed = cache.evict_for_pressure(u64::MAX, 0, ExhaustionCause::Accounted);
+            assert_eq!(
+                cache.entry_bytes(&key),
+                None,
+                "evicted once the scan moved on"
+            );
+            assert!(freed >= bytes, "freed {freed}, entry {bytes}");
+            assert_eq!(budget.reserved(), cache.resident_bytes());
+        }
+
         /// The deterministic corpus reaches every cached column kind, so the
         /// property below is not vacuous for any of them.
         #[test]

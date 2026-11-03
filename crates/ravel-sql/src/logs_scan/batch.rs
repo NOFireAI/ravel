@@ -748,7 +748,11 @@ impl StrValuesCache {
 
     /// One plain-page block's values as this scan's handle on the block's
     /// memo array ([`Self::share`]), held and charged as
-    /// [`Self::block_values`] holds and charges a built array.
+    /// [`Self::block_values`] holds and charges a built array. The charge
+    /// covers the whole values buffer, which the entry's own `heap_bytes`
+    /// already counts on the process budget; that double count is intended
+    /// (ADR-3326, zero-copy values amendment, decision 5, "The scan's own
+    /// charge stays").
     fn memo_block_values(&mut self, memo: &StringArray) -> DFResult<ArrayRef> {
         self.retain_live();
         let layout = ValuesLayout {

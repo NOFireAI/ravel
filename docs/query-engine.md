@@ -5501,8 +5501,12 @@ the flag.
   ceilings (`--sql-max-query-bytes`, `--sql-tenant-max-bytes`) do not count
   served columns (ADR-3326, tenant-ceiling amendment). When the budget refuses a reservation, the cache's
   registered evictor frees the shortfall plus the same margin from entries
-  nothing outside the cache holds: no scan holds the entry, and no batch
-  holds a buffer of its column's values array (next item;
+  nothing outside the cache holds: no scan holds the entry, nothing beyond
+  the entry holds the column object that carries its reservation cell
+  (`pressure_eviction_counts_an_entry_whose_column_is_held_outside_as_held`;
+  a block's own dictionary is freed once the scan has left its block,
+  `a_block_dictionary_is_freed_by_pressure_once_the_scan_moves_on`), and
+  no batch holds a buffer of its column's values array (next item;
   `pressure_eviction_counts_an_entry_whose_memo_is_held_outside_as_held`),
   and the reservation is retried once; `reserve_best_effort`
   never evicts. Each pressure pass logs one INFO line, and a refusal that
@@ -5543,8 +5547,14 @@ the flag.
 
 When the cap is nonzero each SQL response's `stats` carries `decodedCache`
 once per statement: `hits`, `misses`, `admissions`, `evictions`, `ghostHits`,
-`marginSkips`, `pressureEvictions`, `pressureFreedBytes`, `residentBytes`,
-`deferredServed`, and `deferredSetEstimateBytes`. `deferredSetEstimateBytes`
+`marginSkips`, `filledCellRefusals`, `pressureEvictions`,
+`pressureFreedBytes`, `residentBytes`, `deferredServed`, and
+`deferredSetEstimateBytes`. `filledCellRefusals` counts offers refused
+because the column already carries a filled reservation cell: it was
+admitted concurrently under another key, or its entry was evicted (by the
+cap or the age bound) while something outside the cache still held the
+column (`an_offer_of_a_column_with_a_filled_cell_is_refused_and_counted` in
+`crates/ravel-logseg/src/decoded_cache.rs`). `deferredSetEstimateBytes`
 is the plan-time decoded-set estimate, summed over the statement's scans with
 a `Contains` arm, and is present when such a scan ran its plan pass or took
 the whole-segment fast path.

@@ -39,13 +39,14 @@ const STATEMENT: &str = "SELECT count(*) AS n FROM logs WHERE severity_text = 'I
 /// `Contains` arm.
 const URL: &str = "url";
 const LIKE_STATEMENT: &str = "SELECT count(*) AS n FROM logs WHERE url LIKE '%example%'";
-const FIELDS: [&str; 10] = [
+const FIELDS: [&str; 11] = [
     "hits",
     "misses",
     "admissions",
     "evictions",
     "ghostHits",
     "marginSkips",
+    "filledCellRefusals",
     "residentBytes",
     "pressureEvictions",
     "pressureFreedBytes",

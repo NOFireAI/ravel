@@ -138,7 +138,9 @@ arrow-flight = { workspace = true, optional = true }
 #    into the opaque `Ticket` bytes the protocol dispatches on.
 #  - `bytes` supplies the `Bytes` the Flight protobuf fields are typed as. It
 #    is an unconditional dependency below, since the Parquet resolve's
-#    `ObjectStoreBackend` wrapper (crate::parquet) names it too.
+#    `ObjectStoreBackend` wrapper (crate::parquet) names it too, and the
+#    decoded cache's values memo (`build_str_memo` in logs_scan/batch.rs)
+#    wraps a cached column's buffers with `Bytes::from_owner`.
 #  - `uuid` types `SegmentPin::writer_id`, one of the `SegmentRef` fields the
 #    snapshot-pinning ticket carries.
 #  - `blake3` keys the ticket's integrity MAC; already a
