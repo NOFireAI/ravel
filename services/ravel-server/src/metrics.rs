@@ -10321,7 +10321,11 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         state.mode,
         state.ingest_concurrency.head_refusal_drain(),
     );
-    render_ingest_hold_family(&mut body, state.mode, state.ingest_concurrency.ingest_hold());
+    render_ingest_hold_family(
+        &mut body,
+        state.mode,
+        state.ingest_concurrency.ingest_hold(),
+    );
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],

@@ -504,13 +504,14 @@ mod tests {
         let gate = Arc::new(IngestHoldGate::new(config.max_wait));
         let sampled = Arc::new(AtomicBool::new(false));
         let sampled_for_task = sampled.clone();
-        let task = DetectorTask::spawn_for(&config, gate.clone(), Arc::new(SystemClock), move || {
-            sampled_for_task.store(true, Ordering::Relaxed);
-            CongestionSample {
-                queued_flushes: 0,
-                deferred_total: 0,
-            }
-        });
+        let task =
+            DetectorTask::spawn_for(&config, gate.clone(), Arc::new(SystemClock), move || {
+                sampled_for_task.store(true, Ordering::Relaxed);
+                CongestionSample {
+                    queued_flushes: 0,
+                    deferred_total: 0,
+                }
+            });
         assert!(task.is_none(), "no detector for a zero max wait");
         tick().await;
         assert!(!sampled.load(Ordering::Relaxed), "nothing sampled");
@@ -708,7 +709,13 @@ mod tests {
 
     const JITTER: f64 = 0.25;
 
-    fn plant_span(phases: &[(f64, f64)], seconds: f64, hold_bound: Option<f64>, a: f64, b: f64) -> plant::Span {
+    fn plant_span(
+        phases: &[(f64, f64)],
+        seconds: f64,
+        hold_bound: Option<f64>,
+        a: f64,
+        b: f64,
+    ) -> plant::Span {
         let trace = plant::run(&plant::Run {
             phases: phases.to_vec(),
             seconds,

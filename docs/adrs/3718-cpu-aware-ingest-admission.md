@@ -66,6 +66,9 @@ lines 225 to 226). No admission control looks at CPU today.
 
 ### D1. A saturation detector reads two signals the process already has
 
+Replaced: the detector now reads the queued flush count and the deferred
+triggers, and no CPU; see the flush-backlog hold amendment below.
+
 A background task samples every 100 ms:
 
 - **CPU use:** the process's own CPU time (user plus system, fields 14 and
@@ -93,6 +96,10 @@ above and no clean step.
 
 OTAP batches draw at a second point, after their stream's tenant is
 resolved; see the OTAP batch amendment below.
+
+Replaced: the shed fraction and its draw are gone, and a congested node
+holds each request at the same point instead; see the flush-backlog hold
+amendment below.
 
 The detector keeps a shed fraction `p` between 0 and `--ingest-cpu-shed-max`
 (default 0.9). Each sample it moves `p` by one of three rules, with CPU use
@@ -159,6 +166,9 @@ over time, and a cycle that drops back into overload fails D4's first bar.
 
 ### D3. Defaults scale with the node; one flag turns it off
 
+Replaced: the two flags below are removed and two others take their place;
+see the flush-backlog hold amendment below.
+
 The threshold is a fraction of the resolved core count, so the same default
 holds on 8, 16 or more vCPU without tuning. `--ingest-cpu-shed-threshold 0`
 disables shedding, which is today's behaviour. The resolved threshold and the
@@ -190,6 +200,9 @@ flowchart LR
 
 ### D4. Acceptance on the benchmark
 
+The first bar below is replaced, and the shed-fraction figure no longer
+exists; see the flush-backlog hold amendment below.
+
 Each figure below is pre-registered as predicted. The epic exits when all
 three hold on the logs benchmark (GKE, GCS store, buffered acks), with the
 detector on its defaults:
@@ -212,6 +225,9 @@ The first two show how many refusals forced a reconnect (Consequences). The
 third shows whether `p` settled or cycled (D2).
 
 ## Rejected alternatives
+
+The third bullet, queueing at the head, is reversed by the flush-backlog
+hold amendment below.
 
 - **A lower fixed `--max-inflight-ingest-requests`.** It bounds a count, not
   CPU, so no single default fits 8 and 16 vCPU. Its permit is released at
@@ -298,3 +314,160 @@ Three changes from implementing D1 and D2 (#3720).
 - **The refusal is documented in `docs/ingest.md`.** It is not in the
   "Admission rejections" section of `docs/guides/ingest-affinity.md`, which
   is about Kubernetes CRD validation, not runtime ingest admission.
+
+## Amendment (2026-11-03): hold at the head while the flush backlog is over a bound, replacing the shed fraction (#3756)
+
+<!-- amendment-applies: sections="D1. A saturation detector reads two signals the process already has|D2. While saturated, refuse a growing fraction of new ingest requests at the head|D3. Defaults scale with the node; one flag turns it off|D4. Acceptance on the benchmark|Rejected alternatives" pointer="flush-backlog hold amendment" -->
+
+The shed fraction `p` of D2 missed D4's first bar, and a model of the
+benchmark explains why no rule for `p` can meet it. This amendment replaces
+D1's signals and D2's draw with a bounded hold at the same point, and
+replaces D3's flags.
+
+### Why the shed fraction is replaced
+
+Acceptance part 1 (8 vCPU, fixed 160k offered) stored 133.2k and 133.4k
+lines/s in two runs against the 145k bar, with `p` cycling between 0.1 and
+0.9 instead of settling (#3718 comment 6596936397).
+
+A closed-loop plant was calibrated to GKE traces of 140k offered on 8 vCPU
+(#3756). In those traces:
+- **Healthy:** 6.4 cores busy, 0 to 0.1 deferred flush triggers per second,
+  6 to 14 queued flushes.
+- **Collapsed:** about 112k stored, 8.0 cores busy, about 85 deferred
+  triggers per second, about 40 queued flushes.
+
+The plant shows three things.
+- **The collapse is a start-burst transient that locks in.** A burst at
+  startup builds a backlog that keeps the node in the overloaded state for
+  as long as the load stays near capacity.
+- **Every rule for `p` hits the client's retry-backoff cliff.** A refused
+  batch is retried, not lost, so the exporter's doubling backoff parks its
+  whole worker pool at a `p` of about 0.45 to 0.6, whatever the rule.
+- **Holding instead of refusing makes the client's own latency the
+  throttle.** An exporter has a fixed pool of workers, so a held request
+  slows the sender without a retry. At 160k the plant stored 163k with no
+  collapse and no drops, and below capacity it holds nothing.
+
+### D1 replaced: the congestion detector
+
+The 100 ms background task stays, with its shutdown handling (stopped
+before the shard actors are joined). It no longer reads CPU. Each sample it
+reads:
+- the process-wide queued flush count, the sum of `flushes_queued_total`
+  over every ingest router (metrics, logs, spans), the figure `/metrics`
+  exports as `ravel_ingest_queued_flushes`;
+- the deferred flush triggers since the last sample, as before.
+
+The node is **congested** while the queued flush count is above
+`--ingest-hold-queued-flushes`, or while at least 10 deferred triggers fell
+in the last full 1 s window (10 samples). A window shorter than 10 samples
+never counts as congested on deferrals. The 10 per second sits between the
+healthy traces (0 to 0.1 per second) and the collapsed ones (about 85). The
+detector publishes one congested flag, which replaces `p`.
+
+### D2 replaced: the hold
+
+At the point D2 drew against `p` (in `admit_ingest_request` and
+`GrpcIngestAdmissionLayer::call`, right after the in-flight permit and
+before tenant resolution; per `BatchArrowRecords` batch in OTAP's
+`process_batch`, as the OTAP batch amendment placed it):
+- **Not congested:** the request proceeds at once, at the cost of one
+  relaxed atomic load. Nothing is counted.
+- **Congested:** the request waits in 10 ms steps while the flag stays set,
+  for at most `--ingest-hold-max-wait`, keeping its in-flight permit.
+  - If the flag clears in time, the request proceeds, counted as
+    `outcome="admitted"`.
+  - If the wait runs out, the permit is released and the request is
+    refused exactly as D2's draw refused it: through `refuse_from_head`,
+    429 with `Retry-After: 1` on OTLP HTTP and Remote Write,
+    `RESOURCE_EXHAUSTED` on gRPC and OTAP. It is counted as
+    `outcome="refused"`.
+
+An unauthenticated request that arrives while congested is held and, if
+still congested at the max wait, refused 429 rather than 401, as D2's draw
+was.
+
+Metrics, with the label set the removed families had:
+`ravel_ingest_head_hold_total{mode,outcome}` (counter),
+`ravel_ingest_head_hold_seconds{mode}` (histogram of time held, one sample
+per held request) and `ravel_ingest_head_congested{mode}` (0 or 1 gauge).
+They replace the refusal counter and the shed-fraction gauge D2 named, which
+no release carried.
+
+### D3 replaced: the flags
+
+D3's threshold and cap flags are removed; no release carried them. In their place:
+- `--ingest-hold-queued-flushes`, default 16, at least 1: the queued flush
+  count above which the node is congested. 16 is above the healthy traces'
+  6 to 14 and well below the collapsed ones' 40.
+- `--ingest-hold-max-wait`, a duration, default `1s`: the longest a request
+  is held. `0` turns the gate off entirely and spawns no detector.
+
+Both are logged at startup with the other derived defaults. The gate is
+still on by default and still process-wide.
+
+### Rejected alternatives: queueing at the head is reversed
+
+The rejected alternative "queue requests at the head instead of refusing
+them" assumed an unbounded queue. The hold is bounded twice:
+- **in time,** by `--ingest-hold-max-wait`, after which a held request is
+  refused as before;
+- **in count,** by `--max-inflight-ingest-requests` (default 1024), since a
+  held request keeps its in-flight permit, so the requests held at once
+  never exceed the in-flight ceiling. With that ceiling at `0`
+  (unlimited), the max wait is the only bound.
+
+Within those bounds a held request costs the server a connection and an
+in-flight slot, with its body not yet read, and the client sees latency up
+to the max wait instead of an immediate 429. A 429 still answers what the
+hold cannot absorb.
+
+### D4: the first bar
+
+The owner set D4's first bar to at least 0.95 times the same node's stored
+rate at a fixed 150k offered with the gate off (`--ingest-hold-max-wait 0`),
+in place of the absolute 145k (#3718 comment 6597954798). The shed-fraction
+figure D4 asked each run to report is replaced by
+`ravel_ingest_head_congested` over time and the held and refused counts.
+
+| Figure | Bar | Source |
+|---|---|---|
+| 8 vCPU, fixed 160k offered: stored | at least 0.95 x the same node's stored rate at fixed 150k with `--ingest-hold-max-wait 0` | #3718 comment 6597954798 |
+| Acceptance part 1 of the shed fraction, two runs: stored | 133.2k and 133.4k against the old 145k, `p` cycling 0.1 to 0.9 | #3718 comment 6596936397 |
+
+### The plant
+
+A line-for-line Rust port of the plant, deterministic with SplitMix64 and
+run at jitter 0.25, is a test in the gate module. Stored and drops are in
+thousands of lines per second over the span; collapsed is the share of the
+span spent in the overloaded state. The Python reference values are those
+of the plant this port was taken from (#3756).
+
+| Case | Offered | Span | Bar, hold | Rust, hold | Bar, no gate | Rust, no gate | Python reference | Source |
+|---|---|---|---|---|---|---|---|---|
+| A | 160k for 80 s, 400k start burst | 20 to 80 s | stored at least 152, drops at most 3.2, collapsed 0 | stored 163.4, drops 0, collapsed 0 | collapsed above 0.5 | stored 106.7, collapsed 1.0 | hold 163.4, 0, 0; no gate 106.7, collapsed 1.0 | `services/ravel-server/src/ingest_hold.rs:735` |
+| A, bound 1,000,000 (above the 300k tip) | as A | 20 to 80 s | collapsed above 0.5 | stored 106.7, collapsed 1.0 | - | - | stored 106.7, collapsed 1.0 | `services/ravel-server/src/ingest_hold.rs:735` |
+| B | 320k for 80 s | 20 to 80 s | stored at least 155, collapsed 0 | stored 163.4, collapsed 0 | - | - | - | `services/ravel-server/src/ingest_hold.rs:751` |
+| C | 140k for 120 s, start burst | 60 to 120 s | stored at least 139, drops 0, collapsed 0 | stored 140.0, drops 0, collapsed 0 | collapsed above 0.5 | stored 105.8, collapsed 1.0 | - | `services/ravel-server/src/ingest_hold.rs:759` |
+| D | 160k, then 100k from 40 s, 70 s | 45 to 70 s | stored within 1 of 100, cores under 5.5 | stored 100.1, cores 4.9 | - | - | - | `services/ravel-server/src/ingest_hold.rs:773` |
+
+The bound-1,000,000 row is the distinguishing case: with the queued bound
+above the tip point the hold never engages, and the plant collapses as it
+does with no gate.
+
+### Consequences of the change
+
+- A request on a node that is not congested pays one relaxed atomic load;
+  there is no random draw.
+- Under sustained excess load the hold turns into refusals at the max wait,
+  so the drain and reconnect costs listed under Consequences apply to the
+  requests that are refused, each after a held second by default.
+- A held request keeps its in-flight permit, so a long hold can shed new
+  requests on the in-flight ceiling (`ravel_ingest_concurrency_shed_total`)
+  before they reach the hold.
+- Deferral with spare cores (one stalled tenant on a multi-tenant node) can
+  now mark the node congested on its own, since CPU is no longer read, and
+  hold every tenant's requests while it lasts. Only the 10-per-second
+  threshold separates that case from the collapse; no measurement here
+  covers it.

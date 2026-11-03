@@ -35,7 +35,8 @@ use ravel_types::TenantId;
 
 const TOKEN: &str = "testtoken";
 const TENANT: &str = "acme";
-const HOLD_MESSAGE: &str = "node flush backlog stayed over its bound for the ingest hold's max wait";
+const HOLD_MESSAGE: &str =
+    "node flush backlog stayed over its bound for the ingest hold's max wait";
 const IN_FLIGHT_SHED_MESSAGE: &str = "process in-flight ingest-request limit reached";
 const ADMITTED: &str = "ravel_ingest_head_hold_total{mode=\"all\",outcome=\"admitted\"}";
 const REFUSED: &str = "ravel_ingest_head_hold_total{mode=\"all\",outcome=\"refused\"}";
@@ -343,7 +344,10 @@ async fn forced_congestion_refuses_an_http_export_at_the_max_wait_and_releases_i
             .and_then(|v| v.to_str().ok()),
         Some("1"),
     );
-    assert_eq!(held_response.text().await.expect("body reads"), HOLD_MESSAGE);
+    assert_eq!(
+        held_response.text().await.expect("body reads"),
+        HOLD_MESSAGE
+    );
 
     let body = scrape_metrics(&client, &base).await;
     assert_eq!(sample(&body, REFUSED), 1, "one request was refused");
