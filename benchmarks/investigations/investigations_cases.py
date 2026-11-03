@@ -40,6 +40,9 @@ HITS_TRUTH = os.path.join(HERE, "hits.truth.json")
 SMOKE = os.path.join(HERE, "fixtures", "local-smoke")
 BOX = os.path.join(HERE, "box")
 PY = sys.executable
+# investigations.test.sh passes the bash running it, so a run under bash 3.2
+# runs every box/ script under 3.2 too.
+BASH = os.environ.get("INV_BASH", "bash")
 HOUR_NS = 3600 * 1_000_000_000
 STATES = ("unfolded", "folded_no_leaves", "folded_leaves", "mixed", "compaction_in_flight", "compaction_done",
           "erasure_in_flight", "many_parts_24", "many_parts_744", "many_parts_2160")
@@ -226,6 +229,10 @@ class Corpus(unittest.TestCase):
         cls._tmp = tempfile.TemporaryDirectory()
         cls.truth, cls.rows = gen(os.path.join(cls._tmp.name, "s1"))
         cls.truth10, cls.rows10 = gen(os.path.join(cls._tmp.name, "s10"), 1000, 2, 7, "--scale", "10")
+        # 25,000 log rows span four BLOCK_ROWS blocks, the fewest that give
+        # every needle tier its own block count.
+        cls.truthb, cls.rowsb = gen(os.path.join(cls._tmp.name, "b1"), 5000, 2, 7)
+        cls.truthb10, cls.rowsb10 = gen(os.path.join(cls._tmp.name, "b10"), 5000, 2, 7, "--scale", "10")
 
     @classmethod
     def tearDownClass(cls):
@@ -315,11 +322,11 @@ class Corpus(unittest.TestCase):
             self.assertEqual(spans, int(size) * 10)
 
     def test_needle_tiers_recount_and_are_distinguishable(self):
-        t = self.truth
-        counts = {v: sum(1 for r in self.rows["logs"] if r["tag"] == v) for v in t["needles"]}
+        t, rows = self.truthb, self.rowsb
+        counts = {v: sum(1 for r in rows["logs"] if r["tag"] == v) for v in t["needles"]}
         self.assertEqual(counts, t["needles"])
         for v, n in counts.items():
-            self.assertEqual(n, sum(1 for r in self.rows["logs"] if r["body"].endswith(" " + v)))
+            self.assertEqual(n, sum(1 for r in rows["logs"] if r["body"].endswith(" " + v)))
             self.assertEqual(t["answers"][f"needle.{v}"]["value"], n)
         self.assertEqual(counts["needlerare"], 1)
         self.assertLess(counts["needlerare"], counts["needlesparse"])
@@ -328,8 +335,9 @@ class Corpus(unittest.TestCase):
     def test_needle_blocks_recount_within_20_percent(self):
         # Item 7: tiers are ordered by blocks touched, and a recount over the
         # written file in BLOCK_ROWS-row blocks agrees with truth within 20 %.
-        for truth, rows in ((self.truth, self.rows), (self.truth10, self.rows10)):
+        for truth, rows in ((self.truthb, self.rowsb), (self.truthb10, self.rowsb10)):
             br = truth["generator"]["block_rows"]
+            self.assertEqual(br, 8192)
             nb = dict(truth["needle_blocks"])
             want = nb.pop("any")
             got = len({i // br for i, r in enumerate(rows["logs"]) if r["tag"] in nb})
@@ -347,11 +355,21 @@ class Corpus(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("gen_corpus", GEN)
         g = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(g)
-        n_blocks = -(-100_000_000 // 256)
+        self.assertEqual(g.BLOCK_ROWS, 8192)
+        n_blocks = -(-100_000_000 // g.BLOCK_ROWS)
         got = g.needle_block_counts(100_000_000)
         self.assertEqual(got["needlerare"], 1)
         self.assertEqual(got["needlesparse"], round(0.001 * n_blocks))
         self.assertEqual(got["needlecommon"], round(0.10 * n_blocks))
+
+    def test_under_one_block_plants_no_needle(self):
+        # 5,000 log rows fill less than one block, so no needle row exists
+        # and every needle answer is 0.
+        for truth in (self.truth, self.truth10):
+            self.assertEqual(truth["needles"], {"needlecommon": 0, "needlerare": 0, "needlesparse": 0})
+            for v in truth["needles"]:
+                self.assertEqual(truth["answers"][f"needle.{v}"]["value"], 0)
+        self.assertFalse([r for r in self.rows["logs"] if r["tag"] is not None])
 
     def test_tail_corpus_plants_its_own_request_id(self):
         with tempfile.TemporaryDirectory() as d:
@@ -521,7 +539,7 @@ class Statements(unittest.TestCase):
         rows = self.bands["row"]
         self.assertEqual([r["adr_row"] for r in rows], list(range(1, 18)))
         self.assertEqual([r["key"] for r in rows], [f"row_{n:02d}" for n in range(1, 18)])
-        ids = {s["id"] for s in self.st} | {"fold", "all", "control", "stamp", "derived"}
+        ids = {s["id"] for s in self.st} | {"fold", "all", "control", "stamp", "derived", "truth"}
         for r in rows:
             for k in ("check", "target", "miss", "source"):
                 self.assertTrue(r.get(k), f"{r['key']}.{k}")
@@ -1288,7 +1306,7 @@ class Flips(Workdir):
 
 
 def run_sh(lane, toml, out, *extra):
-    p = subprocess.run(["bash", os.path.join(BOX, "run.sh"), "--dry-run", "--lane", lane, "--run-toml", toml,
+    p = subprocess.run([BASH, os.path.join(BOX, "run.sh"), "--dry-run", "--lane", lane, "--run-toml", toml,
                         "--out", out, *extra], capture_output=True, text=True)
     return p.returncode, p.stdout + p.stderr
 
@@ -1308,7 +1326,7 @@ class Box(Workdir):
                 out[cur].append(line)
         return out
 
-    LANE_STATES = {"local": ("compaction_in_flight", "many_parts_24"),
+    LANE_STATES = {"local": ("compaction_in_flight", "erasure_in_flight", "many_parts_24"),
                    "s3": ("compaction_in_flight", "erasure_in_flight", "many_parts_744", "many_parts_2160")}
 
     def assert_flow(self, text, lane, hits=False):
@@ -1449,7 +1467,7 @@ class Box(Workdir):
         self.assertNotIn("shutdown", text)
 
     def test_s3_lane_refuses_off_the_box(self):
-        p = subprocess.run(["bash", os.path.join(BOX, "run.sh"), "--lane", "s3", "--run-toml",
+        p = subprocess.run([BASH, os.path.join(BOX, "run.sh"), "--lane", "s3", "--run-toml",
                             os.path.join(BOX, "run.example.toml"), "--out", self.path("out")],
                            capture_output=True, text=True)
         self.assertNotEqual(p.returncode, 0)
@@ -1485,7 +1503,7 @@ class Box(Workdir):
 
     def test_launch_dry_run(self):
         env = dict(os.environ, PATH=self.stub_path())
-        p = subprocess.run(["bash", os.path.join(BOX, "launch.sh"), "--dry-run", self.filled_toml()],
+        p = subprocess.run([BASH, os.path.join(BOX, "launch.sh"), "--dry-run", self.filled_toml()],
                            capture_output=True, text=True, env=env, cwd=self.tmp)
         text = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, text)
@@ -1499,22 +1517,90 @@ class Box(Workdir):
         self.assertIn("RUN_ID", user)
 
     def test_launch_refuses_an_unfilled_toml(self):
-        p = subprocess.run(["bash", os.path.join(BOX, "launch.sh"), "--dry-run", os.path.join(BOX, "run.example.toml")],
+        p = subprocess.run([BASH, os.path.join(BOX, "launch.sh"), "--dry-run", os.path.join(BOX, "run.example.toml")],
                            capture_output=True, text=True, env=dict(os.environ, PATH=self.stub_path()))
         self.assertEqual(p.returncode, 64)
 
     def test_fetch_dry_run(self):
         env = dict(os.environ, PATH=self.stub_path())
         run_id = "investigations-20261103T000000Z-1-1"
-        p = subprocess.run(["bash", os.path.join(BOX, "fetch.sh"), "--dry-run", self.filled_toml(), run_id],
+        p = subprocess.run([BASH, os.path.join(BOX, "fetch.sh"), "--dry-run", self.filled_toml(), run_id],
                            capture_output=True, text=True, env=env, cwd=self.tmp)
         text = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, text)
         self.assertFalse(os.path.exists(self.path("aws-called")))
         self.assertIn(f"s3://case-bucket/investigations/runs/{run_id}/out", text)
-        p = subprocess.run(["bash", os.path.join(BOX, "fetch.sh"), "--dry-run", self.filled_toml(), "case-run"],
+        p = subprocess.run([BASH, os.path.join(BOX, "fetch.sh"), "--dry-run", self.filled_toml(), "case-run"],
                            capture_output=True, text=True, env=env, cwd=self.tmp)
         self.assertEqual(p.returncode, 64)
+
+    def fetch_with_aws(self, ls_exit, *flags):
+        d = self.path(f"stub-{ls_exit}")
+        os.makedirs(d)
+        with open(os.path.join(d, "aws"), "w") as f:
+            f.write(f"#!/bin/sh\ncase \"$*\" in *' s3 ls '*) echo denied >&2; exit {ls_exit} ;; esac\nexit 0\n")
+        os.chmod(os.path.join(d, "aws"), 0o755)
+        env = dict(os.environ, PATH=d + os.pathsep + os.environ["PATH"])
+        p = subprocess.run([BASH, os.path.join(BOX, "fetch.sh"), *flags, "--interval", "1", self.filled_toml(),
+                            "investigations-20261103T000000Z-1-1"], capture_output=True, text=True, env=env,
+                           cwd=self.tmp, timeout=60)
+        return p.returncode, p.stdout + p.stderr
+
+    def test_fetch_exits_69_when_a_marker_check_cannot_be_answered(self):
+        # Kills fetch.sh's has_marker `*) ... exit 69` arm: an aws error
+        # (255) read as "no marker yet" polls until the bound and exits 3.
+        code, text = self.fetch_with_aws(255, "--partial")
+        self.assertEqual(code, 69, text)
+        self.assertIn("aws exit 255", text)
+        self.assertIn("denied", text)
+        # aws's own "not there" (exit 1) is an answer: --partial downloads.
+        code, text = self.fetch_with_aws(1, "--partial")
+        self.assertEqual(code, 3, text)
+        self.assertIn("PARTIAL", text)
+
+    # Arrays box/ scripts expand bare: each is assigned non-empty before use.
+    NON_EMPTY_ARRAYS = {"CLI", "tenants", "args"}
+
+    def test_possibly_empty_arrays_are_guarded_for_bash_3_2(self):
+        # bash before 4.4 treats "${x[@]}" of an empty x as unbound under
+        # set -u; any array outside NON_EMPTY_ARRAYS must use the
+        # ${x[@]+"${x[@]}"} form.
+        bare = re.compile(r'(?<!\+)"\$\{([A-Za-z_][A-Za-z_0-9]*)\[@\]\}"')
+        found = []
+        for name in sorted(os.listdir(BOX)) + ["../investigations.test.sh"]:
+            if not name.endswith(".sh"):
+                continue
+            with open(os.path.join(BOX, name)) as f:
+                for n, line in enumerate(f, 1):
+                    for m in bare.finditer(line):
+                        if m.group(1) not in self.NON_EMPTY_ARRAYS:
+                            found.append(f"{name}:{n}: {m.group(1)}")
+        self.assertEqual(found, [])
+        self.assertTrue(bare.search('run "${CLI[@]}" x'))
+        self.assertFalse(bare.search('${flags[@]+"${flags[@]}"}'))
+
+    def test_empty_flags_dry_run_under_bash_3_2(self):
+        # Kills an unguarded "${flags[@]}" at run.sh's load-base step:
+        # run.example.toml has split_base_load = false, so flags is empty.
+        ver = subprocess.run([BASH, "-c", "echo ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"], capture_output=True,
+                             text=True).stdout.strip()
+        if tuple(int(x) for x in ver.split(".")) >= (4, 4):
+            self.skipTest(f"bash {ver} accepts an empty array under set -u; run under bash 3.2 to check")
+        code, text = run_sh("s3", os.path.join(BOX, "run.example.toml"), self.path("out"))
+        self.assertEqual(code, 0, text)
+        copy = self.path("inv")
+        shutil.copytree(HERE, copy, ignore=shutil.ignore_patterns("fixtures", "__pycache__"))
+        p = os.path.join(copy, "box", "run.sh")
+        with open(p) as f:
+            src = f.read()
+        guarded = 'load_signal base "$sig" "$WORK/corpus" "$TENANT" ${flags[@]+"${flags[@]}"}'
+        self.assertEqual(src.count(guarded), 1)
+        with open(p, "w") as f:
+            f.write(src.replace(guarded, 'load_signal base "$sig" "$WORK/corpus" "$TENANT" "${flags[@]}"'))
+        m = subprocess.run([BASH, p, "--dry-run", "--lane", "s3", "--run-toml", os.path.join(BOX, "run.example.toml"),
+                            "--out", self.path("out2")], capture_output=True, text=True)
+        self.assertNotEqual(m.returncode, 0, m.stdout + m.stderr)
+        self.assertIn("unbound variable", m.stderr)
 
 
 def refresh_local_smoke():

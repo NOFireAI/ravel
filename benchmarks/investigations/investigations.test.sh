@@ -8,14 +8,16 @@
 # bands.toml shape, evaluate.py on the committed local-lane run
 # (fixtures/local-smoke/, re-evaluated byte for byte) and on mutations of it,
 # two wrong evaluators that must fail their cases, and the box/ scripts'
-# dry runs.
+# dry runs. The scripts run, and are syntax-checked, under the bash that runs
+# this file, so `/path/to/bash-3.2 investigations.test.sh` checks them under
+# bash 3.2.
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 failed=0
 
 while IFS= read -r -d '' script; do
-  if ! bash -n "$script"; then
+  if ! "$BASH" -n "$script"; then
     echo "FAIL: bash -n ${script#"$HERE"/}" >&2
     failed=1
   fi
@@ -26,7 +28,8 @@ python3 -c 'import tomllib' 2>/dev/null || {
   exit 2
 }
 
-PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/investigations_cases.py" -v || failed=1
+echo "investigations.test.sh: bash $BASH_VERSION at $BASH"
+INV_BASH="$BASH" PYTHONDONTWRITEBYTECODE=1 python3 "$HERE/investigations_cases.py" -v || failed=1
 
 if [ "$failed" -ne 0 ]; then
   echo "investigations.test.sh: FAILED" >&2

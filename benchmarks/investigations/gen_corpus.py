@@ -225,7 +225,8 @@ def request_id_of(tid, l):
     return f"req-{tid[:16]}-{l:03d}"
 
 
-def emit_logs(rng, tr, tid, logs_per_trace, logs_sink, row_base, needle_of, present_row, present_id=REQUEST_ID_PRESENT):
+def emit_logs(rng, tr, tid, logs_per_trace, logs_sink, row_base, needle_of, present_row, present_id=REQUEST_ID_PRESENT,
+              needle_at=None):
     for l in range(logs_per_trace):
         r = row_base + l
         ts = tr.start_ns + rng.randrange(LOG_OFFSET_MAX_NS)
@@ -235,6 +236,7 @@ def emit_logs(rng, tr, tid, logs_per_trace, logs_sink, row_base, needle_of, pres
         tag = needle_of.get(r)
         if tag is not None:
             body = f"{body} {tag}"
+            needle_at[tag].add(logs_sink.count)
         logs_sink.add(
             {
                 "ts": ts,
@@ -397,6 +399,9 @@ def main(argv):
     logs_sink = Sink(args.out, "logs", logs_schema, fmt)
     saved_spans = {}
     tids = []
+    # Needle rows by their position in the written file, which is what a
+    # BLOCK_ROWS block boundary cuts once noise rows are interleaved.
+    needle_at = {v: set() for v in needles}
     # Interleave base and noise by start so each file is sorted by trace start.
     bi = ni = 0
     while bi < len(base) or ni < len(noise):
@@ -405,7 +410,7 @@ def main(argv):
             tr = base[bi]
             tid = emit_trace(rng, tr, args.spans_per_trace, spans_sink, saved_spans if bi in saved_set else None)
             emit_logs(rng, tr, tid, args.logs_per_trace, logs_sink, bi * args.logs_per_trace, needle_of, present_row,
-                      present_id)
+                      present_id, needle_at)
             tids.append(tid)
             bi += 1
         else:
@@ -482,8 +487,8 @@ def main(argv):
     answers["request_id.absent"] = answer(0, row_set=[])
     for value, rows in needles.items():
         answers[f"needle.{value}"] = answer(1, value=len(rows))
-    needle_blocks = {v: len({r // BLOCK_ROWS for r in rows}) for v, rows in needles.items()}
-    needle_blocks["any"] = len({r // BLOCK_ROWS for r in needle_of})
+    needle_blocks = {v: len({r // BLOCK_ROWS for r in rows}) for v, rows in needle_at.items()}
+    needle_blocks["any"] = len({r // BLOCK_ROWS for rows in needle_at.values() for r in rows})
 
     # The erasure_in_flight state's victim: one log row no statement reads, so
     # a pending erasure leaves every answer as truth.json gives it.
