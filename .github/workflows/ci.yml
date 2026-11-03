@@ -289,6 +289,10 @@ jobs:
         run: bash deploy/metricsbench/tests/capture-effective-config.test.sh
       - name: MetricsBench end-to-end driver cases (issue #940)
         run: bash deploy/metricsbench/tests/run.test.sh
+      - name: MCP agent evaluation runner cases (issue #1385)
+        run: bash benchmarks/mcp-eval/run.test.sh
+      - name: MCP agent evaluation corpus check (issue #1385)
+        run: bash benchmarks/mcp-eval/run.sh --check
       - name: Check derived-doc drift (docs/query-engine.md)
         run: scripts/check-doc-drift.sh
       # The rehearsal harness's own helper suite. It runs here rather than only
