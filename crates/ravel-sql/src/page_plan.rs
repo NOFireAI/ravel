@@ -145,9 +145,12 @@
 //! normalised: `NaN = NaN` is TRUE, and a negative NaN sorts first and
 //! compares below zero while a positive one sorts last and compares above it;
 //! a NaN boundary is refused, as above. Because float terms are refused, no
-//! cursor minted from a page's own rows carries a float; a zero still reaches
-//! the predicate through a caller's resume tuple, whose variants are not
-//! checked against the term's type.
+//! cursor minted from a page's own rows carries a float, and [`plan_page`]
+//! refuses a float in a caller's resume tuple
+//! ([`PagePlanError::ResumeValueTypeMismatch`]): every position of the tuple
+//! is checked against the kind its term's type was proven to take, before
+//! the predicate is written. The zero handling stays in [`keyset_predicate`],
+//! which writes whatever tuple it is given.
 //!
 //! # Every clause of the body is read, or discarded by name
 //!
@@ -262,8 +265,9 @@ use std::ops::ControlFlow;
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
-    Distinct, Expr as SqlExpr, GroupByExpr, Ident, ObjectName, OrderBy, OrderByKind, Query, Select,
-    SetExpr, Statement, TableFactor, UnaryOperator, Value, Visit, Visitor,
+    Distinct, Expr as SqlExpr, GroupByExpr, Ident, ObjectName, OrderBy, OrderByExpr, OrderByKind,
+    OrderByOptions, Query, Select, SetExpr, Statement, TableFactor, UnaryOperator, Value, Visit,
+    Visitor,
 };
 
 use crate::alerts_schema::alerts_schema;
@@ -547,6 +551,25 @@ pub enum PagePlanError {
     #[error("the resume position has {found} values for {expected} ORDER BY terms")]
     ResumeArity { expected: usize, found: usize },
 
+    /// A resume value whose variant is not the one its term's proven type
+    /// takes. `position` counts from 1, in [`PagePlan::order_by`] order.
+    ///
+    /// Every effective term's type is proven before a tuple is read, and the
+    /// tuple is checked against those types at every position before it is
+    /// rendered. A value of another variant renders a literal of another type,
+    /// which the engine would coerce under rules this planner does not choose,
+    /// or refuse.
+    #[error(
+        "resume value {position} is {found}, but the ORDER BY term `{column}` at \
+         that position takes {expected}"
+    )]
+    ResumeValueTypeMismatch {
+        position: usize,
+        column: String,
+        expected: String,
+        found: String,
+    },
+
     /// A NaN or infinite resume value. Neither has a SQL literal to splice, so
     /// there is no page to plan rather than a page that is wrong by a row.
     #[error("a resume value is not finite, so it has no SQL literal")]
@@ -619,6 +642,96 @@ impl ResumeValue {
             ),
         })
     }
+
+    /// This value's variant, as [`PagePlanError::ResumeValueTypeMismatch`]
+    /// names it.
+    fn variant_label(&self) -> String {
+        match self {
+            ResumeValue::Int(_) => "Int".to_string(),
+            ResumeValue::UInt(_) => "UInt".to_string(),
+            ResumeValue::Bool(_) => "Bool".to_string(),
+            ResumeValue::Float(_) => "Float".to_string(),
+            ResumeValue::Str(_) => "Str".to_string(),
+            ResumeValue::TimestampNanos(_) => "TimestampNanos".to_string(),
+            ResumeValue::Binary(_) => "Binary".to_string(),
+            ResumeValue::FixedSizeBinary(bytes) => format!("FixedSizeBinary({})", bytes.len()),
+        }
+    }
+}
+
+/// The [`ResumeValue`] variant that carries every value of a proven order
+/// term, as [`cursor_support`] and [`expression_cursor_support`] prove it.
+///
+/// There is no float kind: no float term is proven, so a
+/// [`ResumeValue::Float`] matches no term.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeKind {
+    Int,
+    UInt,
+    Bool,
+    Str,
+    TimestampNanos,
+    Binary,
+    /// With the column's byte width, which the value's length must equal.
+    FixedSizeBinary(i32),
+}
+
+impl ResumeKind {
+    /// Whether `value` is this kind's variant.
+    pub(crate) fn admits(self, value: &ResumeValue) -> bool {
+        match (self, value) {
+            (ResumeKind::Int, ResumeValue::Int(_))
+            | (ResumeKind::UInt, ResumeValue::UInt(_))
+            | (ResumeKind::Bool, ResumeValue::Bool(_))
+            | (ResumeKind::Str, ResumeValue::Str(_))
+            | (ResumeKind::TimestampNanos, ResumeValue::TimestampNanos(_))
+            | (ResumeKind::Binary, ResumeValue::Binary(_)) => true,
+            (ResumeKind::FixedSizeBinary(width), ResumeValue::FixedSizeBinary(bytes)) => {
+                i32::try_from(bytes.len()).is_ok_and(|len| len == width)
+            }
+            _ => false,
+        }
+    }
+
+    /// This kind as [`PagePlanError::ResumeValueTypeMismatch`] names it, in
+    /// the same spelling as [`ResumeValue::variant_label`].
+    fn label(self) -> String {
+        match self {
+            ResumeKind::Int => "Int".to_string(),
+            ResumeKind::UInt => "UInt".to_string(),
+            ResumeKind::Bool => "Bool".to_string(),
+            ResumeKind::Str => "Str".to_string(),
+            ResumeKind::TimestampNanos => "TimestampNanos".to_string(),
+            ResumeKind::Binary => "Binary".to_string(),
+            ResumeKind::FixedSizeBinary(width) => format!("FixedSizeBinary({width})"),
+        }
+    }
+}
+
+/// Refuse a resume tuple unless it has one value per term and each value is
+/// the variant its term's proven kind takes. `kinds` is in `terms` order.
+fn check_resume_types(
+    terms: &[OrderTerm],
+    kinds: &[ResumeKind],
+    tuple: &[ResumeValue],
+) -> Result<(), PagePlanError> {
+    if terms.len() != tuple.len() {
+        return Err(PagePlanError::ResumeArity {
+            expected: terms.len(),
+            found: tuple.len(),
+        });
+    }
+    for (index, ((term, kind), value)) in terms.iter().zip(kinds).zip(tuple).enumerate() {
+        if !kind.admits(value) {
+            return Err(PagePlanError::ResumeValueTypeMismatch {
+                position: index + 1,
+                column: term.column.clone(),
+                expected: kind.label(),
+                found: value.variant_label(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Where the previous page stopped: its last row's values, in the order of the
@@ -708,9 +821,10 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
     // proves it NON NULL, and a `ResumeValue` variant carries every value its
     // column admits, exactly. Both fail the same way, by leaving a row on no
     // page with no error raised.
+    let mut kinds = Vec::with_capacity(terms.len());
     for term in &terms {
         match term_admissibility(&names, &term.column) {
-            TermProof::Admissible => {}
+            TermProof::Admissible(kind) => kinds.push(kind),
             TermProof::Nullable => {
                 return Err(PagePlanError::OrderTermNullable {
                     column: term.column.clone(),
@@ -731,6 +845,9 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
         }
     }
 
+    if let Some(position) = resume {
+        check_resume_types(&terms, &kinds, &position.tuple)?;
+    }
     let statement = render_statement(&query, &terms, resume)?;
     Ok(PagePlan {
         statement,
@@ -1220,20 +1337,30 @@ mod resolution {
     /// (DataFusion 55 refuses to plan the last two outright, which makes the
     /// refusal here the same answer the caller would have got for the
     /// statement it handed in.)
+    ///
+    /// Every field is named, with no `..`, so an option a later sqlparser
+    /// adds is a compile error here rather than a name it silently removes.
     fn wildcard_rest(options: &WildcardAdditionalOptions) -> Rest {
-        if options.opt_ilike.is_some()
-            || options.opt_rename.is_some()
-            || options.opt_alias.is_some()
-        {
+        let WildcardAdditionalOptions {
+            // Source span of the `*`. Carries no semantics.
+            wildcard_token: _,
+            opt_ilike,
+            opt_exclude,
+            opt_except,
+            opt_replace,
+            opt_rename,
+            opt_alias,
+        } = options;
+        if opt_ilike.is_some() || opt_rename.is_some() || opt_alias.is_some() {
             return Rest::Unreadable(unproven::WILDCARD_OPTION);
         }
         let mut removed: BTreeSet<String> = BTreeSet::new();
-        if let Some(except) = &options.opt_except {
+        if let Some(except) = opt_except {
             for ident in std::iter::once(&except.first_element).chain(&except.additional_elements) {
                 removed.insert(ident_name(ident));
             }
         }
-        if let Some(exclude) = &options.opt_exclude {
+        if let Some(exclude) = opt_exclude {
             let names = match exclude {
                 datafusion::sql::sqlparser::ast::ExcludeSelectItem::Single(name) => {
                     std::slice::from_ref(name)
@@ -1253,7 +1380,7 @@ mod resolution {
                 }
             }
         }
-        if let Some(replace) = &options.opt_replace {
+        if let Some(replace) = opt_replace {
             for item in &replace.items {
                 removed.insert(ident_name(&item.column_name));
             }
@@ -1264,8 +1391,22 @@ mod resolution {
     /// The output names a wildcard's `REPLACE` declares, with the expressions
     /// they are built from. `* REPLACE (nullif(value, 0) AS ts)` projects `ts`
     /// from that expression, not from `samples.ts`.
+    ///
+    /// Every field is named, with no `..`, for the reason [`wildcard_rest`]
+    /// gives.
     fn wildcard_replacements(options: &WildcardAdditionalOptions) -> Vec<(String, OutputSource)> {
-        let Some(replace) = &options.opt_replace else {
+        let WildcardAdditionalOptions {
+            wildcard_token: _,
+            // The options that remove or rename a name rather than declare
+            // one. `wildcard_rest` reads each of them.
+            opt_ilike: _,
+            opt_exclude: _,
+            opt_except: _,
+            opt_rename: _,
+            opt_alias: _,
+            opt_replace,
+        } = options;
+        let Some(replace) = opt_replace else {
             return Vec::new();
         };
         replace
@@ -1481,8 +1622,9 @@ fn grouping_can_null_a_grouping_column(group_by: &GroupByExpr) -> bool {
 /// names what would.
 enum TermProof {
     /// NON NULL, and carried exactly by a [`ResumeValue`] variant for every
-    /// value the column admits.
-    Admissible,
+    /// value the column admits. The kind is that variant, which a resume
+    /// tuple's value at this term's position must be.
+    Admissible(ResumeKind),
     /// The target table's public schema declares this column nullable.
     Nullable,
     /// No [`ResumeValue`] variant carries every value of this term's type. The
@@ -1505,8 +1647,9 @@ enum TermProof {
 /// cursor, so the string carries the distinction into the refusal instead.
 pub(crate) enum CursorSupport {
     /// A [`ResumeValue`] variant carries every value of the type, and the
-    /// literal it renders reads back as the same value.
-    Exact,
+    /// literal it renders reads back as the same value. The kind names that
+    /// variant.
+    Exact(ResumeKind),
     /// Some value of the type reaches no [`ResumeValue`]. The string names the
     /// type and what it admits that no variant holds.
     Unrepresentable(String),
@@ -1522,21 +1665,21 @@ pub(crate) enum CursorSupport {
 /// compare a nanosecond count against a differently scaled column.
 pub(crate) fn cursor_support(data_type: &DataType) -> CursorSupport {
     match data_type {
-        DataType::Boolean
-        | DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::UInt8
-        | DataType::UInt16
-        | DataType::UInt32
-        | DataType::UInt64
-        | DataType::Utf8
-        | DataType::LargeUtf8
-        | DataType::Binary
-        | DataType::LargeBinary
-        | DataType::FixedSizeBinary(_)
-        | DataType::Timestamp(TimeUnit::Nanosecond, None) => CursorSupport::Exact,
+        DataType::Boolean => CursorSupport::Exact(ResumeKind::Bool),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            CursorSupport::Exact(ResumeKind::Int)
+        }
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            CursorSupport::Exact(ResumeKind::UInt)
+        }
+        DataType::Utf8 | DataType::LargeUtf8 => CursorSupport::Exact(ResumeKind::Str),
+        DataType::Binary | DataType::LargeBinary => CursorSupport::Exact(ResumeKind::Binary),
+        DataType::FixedSizeBinary(width) => {
+            CursorSupport::Exact(ResumeKind::FixedSizeBinary(*width))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+            CursorSupport::Exact(ResumeKind::TimestampNanos)
+        }
         DataType::Float16 | DataType::Float32 | DataType::Float64 => {
             CursorSupport::Unrepresentable(format!(
                 "type {} admits NaN and the infinities, which no resume value carries",
@@ -1590,7 +1733,7 @@ fn expression_cursor_support(expr: &SqlExpr) -> CursorSupport {
             if bare_name(&function.name)
                 .is_some_and(|name| name.eq_ignore_ascii_case(COUNT_FUNCTION)) =>
         {
-            CursorSupport::Exact
+            CursorSupport::Exact(ResumeKind::Int)
         }
         other => CursorSupport::Unrepresentable(format!("the expression `{other}`")),
     }
@@ -1603,18 +1746,24 @@ fn expression_cursor_support(expr: &SqlExpr) -> CursorSupport {
 /// does. A decimal or exponent literal is parsed to a type the dialect
 /// chooses, `Decimal128` among them, and comparing it against a rendered
 /// float is neither of this planner's decisions to make, so it is refused.
+/// An integer that fits `i64` is typed `Int64` and one that only fits `u64`
+/// is typed `UInt64`, so the two take [`ResumeKind::Int`] and
+/// [`ResumeKind::UInt`].
 fn literal_cursor_support(value: &Value) -> CursorSupport {
     match value {
         Value::Number(text, _) => {
-            if text.parse::<i64>().is_ok() || text.parse::<u64>().is_ok() {
-                CursorSupport::Exact
+            if text.parse::<i64>().is_ok() {
+                CursorSupport::Exact(ResumeKind::Int)
+            } else if text.parse::<u64>().is_ok() {
+                CursorSupport::Exact(ResumeKind::UInt)
             } else {
                 CursorSupport::Unrepresentable(format!("the numeric literal {text}"))
             }
         }
-        Value::SingleQuotedString(_) | Value::DoubleQuotedString(_) | Value::Boolean(_) => {
-            CursorSupport::Exact
+        Value::SingleQuotedString(_) | Value::DoubleQuotedString(_) => {
+            CursorSupport::Exact(ResumeKind::Str)
         }
+        Value::Boolean(_) => CursorSupport::Exact(ResumeKind::Bool),
         other => CursorSupport::Unrepresentable(format!("the literal {other}")),
     }
 }
@@ -1647,7 +1796,7 @@ fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
                 return TermProof::Unproven(unproven::EXPRESSION_NOT_PROVABLE);
             }
             return match expression_cursor_support(expr) {
-                CursorSupport::Exact => TermProof::Admissible,
+                CursorSupport::Exact(kind) => TermProof::Admissible(kind),
                 CursorSupport::Unrepresentable(kind) => TermProof::NotRepresentable(kind),
             };
         }
@@ -1674,7 +1823,7 @@ fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
         return TermProof::Nullable;
     }
     match cursor_support(field.data_type()) {
-        CursorSupport::Exact => TermProof::Admissible,
+        CursorSupport::Exact(kind) => TermProof::Admissible(kind),
         CursorSupport::Unrepresentable(kind) => TermProof::NotRepresentable(kind),
     }
 }
@@ -1845,7 +1994,8 @@ fn shape_of<'a>(query: &'a Query) -> Option<SelectShape<'a>> {
 /// Both fields of the `OrderBy` are named, with no `..`. The wildcard hid
 /// `interpolate`, and the rewrite drops the statement's own `ORDER BY`
 /// whenever it only orders, so the clause was dropped with it and the page
-/// ran under an ordering the caller had not written.
+/// ran under an ordering the caller had not written. Each term's
+/// `OrderByExpr` and its `OrderByOptions` are named the same way.
 fn statement_order_terms(query: &Query) -> Result<Vec<OrderTerm>, PagePlanError> {
     let Some(OrderBy {
         kind,
@@ -1867,19 +2017,24 @@ fn statement_order_terms(query: &Query) -> Result<Vec<OrderTerm>, PagePlanError>
         OrderByKind::Expressions(exprs) => exprs,
     };
     let mut terms = Vec::with_capacity(exprs.len());
-    for expr in exprs {
-        let Some(column) = column_of(&expr.expr) else {
+    for OrderByExpr {
+        expr,
+        options: OrderByOptions { asc, nulls_first },
+        with_fill,
+    } in exprs
+    {
+        let Some(column) = column_of(expr) else {
             return Err(PagePlanError::OrderTermNotColumn {
-                term: expr.expr.to_string(),
+                term: expr.to_string(),
             });
         };
-        if expr.options.nulls_first.is_some() {
+        if nulls_first.is_some() {
             return Err(PagePlanError::UnsupportedOrderOption {
                 column,
                 option: "NULLS FIRST/LAST",
             });
         }
-        if expr.with_fill.is_some() {
+        if with_fill.is_some() {
             return Err(PagePlanError::UnsupportedOrderOption {
                 column,
                 option: "WITH FILL",
@@ -1887,7 +2042,7 @@ fn statement_order_terms(query: &Query) -> Result<Vec<OrderTerm>, PagePlanError>
         }
         terms.push(OrderTerm {
             column,
-            descending: expr.options.asc == Some(false),
+            descending: *asc == Some(false),
         });
     }
     Ok(terms)
@@ -2433,10 +2588,176 @@ mod tests {
         );
     }
 
-    /// A caller's tuple is not checked against the terms' types, so a float
-    /// zero reaches the keyset predicate even though no float term plans. It
-    /// is written as `0.0` with its sign read through `atan2`, in the earlier
-    /// term's equality and in the last term's comparison alike.
+    /// A resume tuple of the right length is refused when a value is not the
+    /// variant its term's proven type takes, at the first position and at a
+    /// later one, and the refusal names the position and both types. A
+    /// fixed-width binary of another width is another type.
+    ///
+    /// FLIP: with `check_resume_types`'s loop reading
+    /// `.zip(tuple).enumerate().take(1)`, only the first position is checked
+    /// and the two later-position cases plan.
+    /// FLIP: with the loop removed, so only the length is checked, every case
+    /// plans.
+    #[test]
+    fn a_resume_value_of_another_type_is_refused_at_any_position() {
+        let mismatch = |position: usize, column: &str, expected: &str, found: &str| {
+            PagePlanError::ResumeValueTypeMismatch {
+                position,
+                column: column.to_string(),
+                expected: expected.to_string(),
+                found: found.to_string(),
+            }
+        };
+        let cases = [
+            (
+                "SELECT * FROM samples ORDER BY ts",
+                vec![
+                    ResumeValue::Int(500),
+                    ResumeValue::FixedSizeBinary(SERIES_ID.to_vec()),
+                ],
+                mismatch(1, "ts", "TimestampNanos", "Int"),
+            ),
+            (
+                "SELECT * FROM samples ORDER BY ts",
+                vec![
+                    ResumeValue::TimestampNanos(500),
+                    ResumeValue::FixedSizeBinary(vec![0x11; 8]),
+                ],
+                mismatch(2, "series_id", "FixedSizeBinary(16)", "FixedSizeBinary(8)"),
+            ),
+            (
+                "SELECT * FROM logs ORDER BY severity_text, ts, flags",
+                vec![
+                    ResumeValue::Str("info".to_string()),
+                    ResumeValue::TimestampNanos(500),
+                    ResumeValue::Int(5),
+                ],
+                mismatch(3, "flags", "UInt", "Int"),
+            ),
+        ];
+        for (sql, tuple, expected) in cases {
+            let err =
+                plan_page(sql, Some(&ResumePosition::new(tuple.clone()))).expect_err("refused");
+            assert_eq!(err, expected, "{sql} at {tuple:?}");
+        }
+        assert_eq!(
+            mismatch(3, "flags", "UInt", "Int").to_string(),
+            "resume value 3 is Int, but the ORDER BY term `flags` at that position \
+             takes UInt",
+        );
+
+        // The same tuples with every value of its term's type plan.
+        for (sql, tuple) in [
+            (
+                "SELECT * FROM samples ORDER BY ts",
+                vec![
+                    ResumeValue::TimestampNanos(500),
+                    ResumeValue::FixedSizeBinary(SERIES_ID.to_vec()),
+                ],
+            ),
+            (
+                "SELECT * FROM logs ORDER BY severity_text, ts, flags",
+                vec![
+                    ResumeValue::Str("info".to_string()),
+                    ResumeValue::TimestampNanos(500),
+                    ResumeValue::UInt(5),
+                ],
+            ),
+        ] {
+            let plan = plan_page(sql, Some(&ResumePosition::new(tuple)));
+            assert!(plan.is_ok(), "{sql} should plan, got {plan:?}");
+        }
+    }
+
+    /// The types DataFusion gives the expressions and literals whose kinds
+    /// `expression_cursor_support` and `literal_cursor_support` prove, read
+    /// off a planned statement's schema.
+    #[tokio::test]
+    async fn datafusion_types_the_proven_expressions_as_their_kinds_say() {
+        let ctx = SessionContext::new();
+        let frame = ctx
+            .sql(
+                "SELECT count(*) AS n, 9223372036854775807 AS signed, \
+                 9223372036854775808 AS unsigned, 'x' AS s, TRUE AS b \
+                 FROM (VALUES (1)) AS t(c)",
+            )
+            .await
+            .expect("planned");
+        let types: Vec<(String, DataType)> = frame
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| (field.name().clone(), field.data_type().clone()))
+            .collect();
+        let expected = [
+            ("n", DataType::Int64, ResumeKind::Int),
+            ("signed", DataType::Int64, ResumeKind::Int),
+            ("unsigned", DataType::UInt64, ResumeKind::UInt),
+            ("s", DataType::Utf8, ResumeKind::Str),
+            ("b", DataType::Boolean, ResumeKind::Bool),
+        ];
+        assert_eq!(
+            types,
+            expected
+                .iter()
+                .map(|(name, ty, _)| ((*name).to_string(), ty.clone()))
+                .collect::<Vec<_>>(),
+        );
+        for (name, ty, kind) in expected {
+            assert!(
+                matches!(cursor_support(&ty), CursorSupport::Exact(proven) if proven == kind),
+                "{name} is proven {kind:?}",
+            );
+        }
+    }
+
+    /// The kinds an expression term and a literal term are proven to take:
+    /// `count(*)` is `Int64`, an integer literal past `i64::MAX` is `UInt64`,
+    /// a quoted string is `Utf8`.
+    ///
+    /// FLIP: with `literal_cursor_support` answering `ResumeKind::Int` for
+    /// every number, the `u64` literal's `UInt` value is refused.
+    #[test]
+    fn expression_and_literal_terms_take_their_engine_types() {
+        let sql = "SELECT severity_text, count(*) AS n, 18446744073709551615 AS big, \
+                   'x' AS s FROM logs GROUP BY severity_text \
+                   ORDER BY n, big, s, severity_text";
+        let plan = plan_page(sql, None).expect("planned");
+        assert_eq!(plan.order_by.len(), 4, "{:?}", plan.order_by);
+        let tuple = vec![
+            ResumeValue::Int(3),
+            ResumeValue::UInt(u64::MAX),
+            ResumeValue::Str("x".to_string()),
+            ResumeValue::Str("info".to_string()),
+        ];
+        let plan = plan_page(sql, Some(&ResumePosition::new(tuple)));
+        assert!(plan.is_ok(), "{sql} should plan, got {plan:?}");
+        let err = plan_page(
+            sql,
+            Some(&ResumePosition::new(vec![
+                ResumeValue::UInt(3),
+                ResumeValue::UInt(u64::MAX),
+                ResumeValue::Str("x".to_string()),
+                ResumeValue::Str("info".to_string()),
+            ])),
+        )
+        .expect_err("refused");
+        assert_eq!(
+            err,
+            PagePlanError::ResumeValueTypeMismatch {
+                position: 1,
+                column: "n".to_string(),
+                expected: "Int".to_string(),
+                found: "UInt".to_string(),
+            },
+        );
+    }
+
+    /// A float zero in a tuple is written as `0.0` with its sign read through
+    /// `atan2`, in the earlier term's equality and in the last term's
+    /// comparison alike. `plan_page` refuses a float against the `ts` term by
+    /// type, so the statements are rendered through [`render_statement`], the
+    /// step that writes the keyset predicate.
     ///
     /// FLIP: with `keyset_predicate` splicing the rendered literal for a zero
     /// (the planner before #3682), the statement reads `"ts" > -0.0` and
@@ -2444,14 +2765,35 @@ mod tests {
     #[test]
     fn a_float_zero_in_a_callers_tuple_is_compared_with_its_sign() {
         let series = format!("arrow_cast(decode('{SERIES_ID_HEX}', 'hex'), 'FixedSizeBinary(16)')");
+        let query = parse_query("SELECT * FROM samples").expect("parsed");
+        let render = |descending: bool, position: &ResumePosition| {
+            let ts = if descending {
+                OrderTerm::descending("ts")
+            } else {
+                OrderTerm::ascending("ts")
+            };
+            render_statement(
+                &query,
+                &[ts, OrderTerm::ascending("series_id")],
+                Some(position),
+            )
+            .expect("rendered")
+        };
         let negative = ResumePosition::new(vec![
             ResumeValue::Float(-0.0),
             ResumeValue::FixedSizeBinary(SERIES_ID.to_vec()),
         ]);
-        let ascending =
-            plan_page("SELECT * FROM samples ORDER BY ts", Some(&negative)).expect("planned");
         assert_eq!(
-            ascending.statement,
+            plan_page("SELECT * FROM samples ORDER BY ts", Some(&negative)).expect_err("refused"),
+            PagePlanError::ResumeValueTypeMismatch {
+                position: 1,
+                column: "ts".to_string(),
+                expected: "TimestampNanos".to_string(),
+                found: "Float".to_string(),
+            },
+        );
+        assert_eq!(
+            render(false, &negative),
             format!(
                 "SELECT * FROM (SELECT * FROM samples) AS ravel_page \
                  WHERE (((\"ts\" > 0.0 OR (\"ts\" = 0.0 AND atan2(\"ts\", -1.0) > 0.0))) \
@@ -2460,10 +2802,8 @@ mod tests {
                  ORDER BY \"ts\" ASC, \"series_id\" ASC"
             ),
         );
-        let descending =
-            plan_page("SELECT * FROM samples ORDER BY ts DESC", Some(&negative)).expect("planned");
         assert_eq!(
-            descending.statement,
+            render(true, &negative),
             format!(
                 "SELECT * FROM (SELECT * FROM samples) AS ravel_page \
                  WHERE ((\"ts\" < -0.0) \
@@ -2477,10 +2817,8 @@ mod tests {
             ResumeValue::Float(0.0),
             ResumeValue::FixedSizeBinary(SERIES_ID.to_vec()),
         ]);
-        let descending =
-            plan_page("SELECT * FROM samples ORDER BY ts DESC", Some(&positive)).expect("planned");
         assert_eq!(
-            descending.statement,
+            render(true, &positive),
             format!(
                 "SELECT * FROM (SELECT * FROM samples) AS ravel_page \
                  WHERE (((\"ts\" < 0.0 OR (\"ts\" = 0.0 AND atan2(\"ts\", -1.0) < 0.0))) \
@@ -2495,8 +2833,9 @@ mod tests {
     /// against without coercion, and a string closes over its own quote.
     #[test]
     fn resume_values_render_as_their_sql_literals() {
+        // The signed variant, on the non-nullable Int64 `spans.duration_ns`.
         let plan = plan_page(
-            "SELECT * FROM logs ORDER BY severity_text, ts",
+            "SELECT * FROM spans ORDER BY name, duration_ns",
             Some(&ResumePosition::new(vec![
                 ResumeValue::Str("it's here".to_string()),
                 ResumeValue::Int(-7),
@@ -2505,10 +2844,10 @@ mod tests {
         .expect("planned");
         assert_eq!(
             plan.statement,
-            "SELECT * FROM (SELECT * FROM logs) AS ravel_page \
-             WHERE ((\"severity_text\" > 'it''s here') \
-             OR (\"severity_text\" = 'it''s here' AND \"ts\" > -7)) \
-             ORDER BY \"severity_text\" ASC, \"ts\" ASC",
+            "SELECT * FROM (SELECT * FROM spans) AS ravel_page \
+             WHERE ((\"name\" > 'it''s here') \
+             OR (\"name\" = 'it''s here' AND \"duration_ns\" > -7)) \
+             ORDER BY \"name\" ASC, \"duration_ns\" ASC",
         );
 
         // The unsigned variant, on the one non-nullable UInt column any public
@@ -2545,19 +2884,32 @@ mod tests {
             fixed.statement
         );
 
-        // `NonFiniteResumeValue` stays reachable through `plan_page` even
-        // though no float column can be an order term any more: the resume
-        // tuple is the caller's, and nothing binds a tuple position's variant
-        // to the type of the term it is compared against.
-        let err = plan_page(
-            "SELECT * FROM logs ORDER BY severity_text, ts",
-            Some(&ResumePosition::new(vec![
-                ResumeValue::Float(f64::NAN),
-                ResumeValue::TimestampNanos(1),
-            ])),
-        )
-        .expect_err("refused");
-        assert_eq!(err, PagePlanError::NonFiniteResumeValue);
+        // No float term is proven, so `plan_page` refuses a NaN by its type
+        // before rendering it; rendering one is refused on its own.
+        let nan = ResumePosition::new(vec![
+            ResumeValue::Float(f64::NAN),
+            ResumeValue::TimestampNanos(1),
+        ]);
+        let err = plan_page("SELECT * FROM logs ORDER BY severity_text, ts", Some(&nan))
+            .expect_err("refused");
+        assert_eq!(
+            err,
+            PagePlanError::ResumeValueTypeMismatch {
+                position: 1,
+                column: "severity_text".to_string(),
+                expected: "Str".to_string(),
+                found: "Float".to_string(),
+            },
+        );
+        let query = parse_query("SELECT * FROM logs").expect("parsed");
+        let terms = [
+            OrderTerm::ascending("severity_text"),
+            OrderTerm::ascending("ts"),
+        ];
+        assert_eq!(
+            render_statement(&query, &terms, Some(&nan)).expect_err("refused"),
+            PagePlanError::NonFiniteResumeValue,
+        );
     }
 
     /// Every [`ResumeValue`] variant's exact rendered literal, including the
@@ -2570,9 +2922,9 @@ mod tests {
     /// position for a different reason:
     /// [`PagePlanError::OrderTermNotRepresentable`] refuses every float
     /// order term, so no page statement renders one either. The literal is
-    /// still this module's contract with whatever mints a cursor, and a
-    /// caller-supplied tuple can still carry any variant against any term, so
-    /// it is pinned here rather than left unasserted.
+    /// still this module's contract with whatever mints a cursor and with
+    /// [`render_statement`], which writes whatever tuple it is given, so it is
+    /// pinned here rather than left unasserted.
     #[test]
     fn every_resume_variant_renders_its_exact_sql_literal() {
         let cases: Vec<(ResumeValue, String)> = vec![
@@ -3936,6 +4288,9 @@ mod tests {
             }
             Err(PagePlanError::SelectInto) => "SelectInto".to_string(),
             Err(PagePlanError::ResumeArity { .. }) => "ResumeArity".to_string(),
+            Err(PagePlanError::ResumeValueTypeMismatch { .. }) => {
+                "ResumeValueTypeMismatch".to_string()
+            }
             Err(PagePlanError::NonFiniteResumeValue) => "NonFiniteResumeValue".to_string(),
         }
     }

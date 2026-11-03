@@ -785,6 +785,28 @@ const WINDOW_COUNTS: [&str; 7] = ["7", "7", "7", "7", "7", "7", "7"];
 /// 3 unused.
 const WINDOW_RANKS: [&str; 7] = ["1", "2", "2", "4", "5", "6", "7"];
 
+/// A `DESC` term with no tiebreak of its own: the planner appends
+/// `series_id ASC`, so the effective ordering runs its two terms in opposite
+/// directions and the keyset predicate has to compare each term in its own.
+/// Over [`FIXTURE`] the pair tied at [`TIED_TS`] is where the two directions
+/// meet: the walk crosses it from [`REPEATED_SERIES`] to [`TIED_HIGH_SERIES`].
+const DESC_TIEBREAK_STATEMENT: &str = "SELECT ts, series_id FROM samples ORDER BY ts DESC";
+
+/// [`DESC_TIEBREAK_STATEMENT`]'s `series_id` column in its ordering over
+/// [`FIXTURE`]: `ts` descending is 1234567, 4000, 3000, 2000, 1000, 1000,
+/// 500, and the pair at 1000 runs in ascending `series_id`. Spelled out
+/// rather than read off the reference, so the walk is checked against the
+/// ordering by value and not only against another run of the same statement.
+const DESC_TIEBREAK_SERIES: [&str; 7] = [
+    "04040404040404040404040404040404",
+    REPEATED_SERIES_HEX,
+    "05050505050505050505050505050505",
+    "03030303030303030303030303030303",
+    REPEATED_SERIES_HEX,
+    TIED_HIGH_SERIES_HEX,
+    "09090909090909090909090909090909",
+];
+
 /// The statements this suite walks, plus the shapes that must keep walking so
 /// a fix cannot be a blanket refusal.
 ///
@@ -813,6 +835,9 @@ const STATEMENTS: &[&str] = &[
     COMMENT_TERMINATED_STATEMENT,
     "SELECT ts, series_id FROM samples ORDER BY ts",
     "SELECT ts, series_id, value FROM samples ORDER BY ts DESC, series_id",
+    // A DESC term the planner appends an ASC tiebreak to. See
+    // [`DESC_TIEBREAK_STATEMENT`].
+    DESC_TIEBREAK_STATEMENT,
     "SELECT ts, series_id FROM samples ORDER BY series_id",
     "SELECT * FROM samples WHERE value > 0.5 ORDER BY ts",
     // An order term whose output name is a reserved word under a quoted alias
@@ -931,17 +956,17 @@ async fn a_total_order_claim_survives_an_executed_page_walk() {
         findings.len(),
         findings.join("\n  "),
     );
-    // Ten per fixture, three fixtures. Pinned exactly rather than as
+    // Eleven per fixture, three fixtures. Pinned exactly rather than as
     // `walked > 0`: a change that drops a statement out of the total-order
     // class leaves this gate passing over a smaller set, which is the way a
     // suite of this shape goes quiet without going red.
     //
-    // What the 30 is and is not: see the module docs. Ten of the walks are
+    // What the 33 is and is not: see the module docs. Eleven of the walks are
     // over seven rows and are what every mutation caught so far was caught by;
-    // the other twenty are over a one-row and a zero-row table, and what they
-    // exercise is the walk's page boundaries, not any ordering.
+    // the other twenty-two are over a one-row and a zero-row table, and what
+    // they exercise is the walk's page boundaries, not any ordering.
     assert_eq!(
-        walked, 30,
+        walked, 33,
         "the walked set changed size, so this gate is asserting about a different \
          set of statements than the one it was sized for",
     );
@@ -1001,7 +1026,7 @@ async fn a_walk_terminates_on_an_empty_page_at_both_table_boundaries() {
 /// Membership in [`STATEMENTS`] is asserted here rather than left to the
 /// count in [`a_total_order_claim_survives_an_executed_page_walk`]: that count
 /// moves with any edit to the table, so deleting the entry and adjusting the
-/// 30 left the whole suite green while nothing walked a window statement.
+/// count left the whole suite green while nothing walked a window statement.
 #[tokio::test]
 async fn a_count_window_reports_the_whole_row_count_on_every_page() {
     assert!(
@@ -1047,6 +1072,69 @@ async fn a_rank_window_ranks_against_the_whole_row_set() {
          statement's whole row set, so the keyset predicate reached the rows \
          the window was computed over",
     );
+}
+
+/// A `DESC` term under an appended `ASC` tiebreak walks to the end over the
+/// fixture's tied pair with every row on exactly one page, in the ordering's
+/// sequence.
+///
+/// FLIP: with `keyset_predicate`'s `let operator = if term.descending { "<" }
+/// else { ">" };` reading `terms[0].descending` in place of
+/// `term.descending`, every term is compared in the first term's direction:
+/// the page after [`REPEATED_SERIES`] at [`TIED_TS`] asks for a smaller
+/// `series_id` at that `ts`, so [`TIED_HIGH_SERIES`] appears on no page and
+/// the walk delivers six rows.
+#[tokio::test]
+async fn a_desc_term_under_an_appended_tiebreak_walks_every_row_once_in_order() {
+    assert!(
+        STATEMENTS.contains(&DESC_TIEBREAK_STATEMENT),
+        "the DESC tiebreak statement left STATEMENTS, so the gate walk no longer covers it",
+    );
+    let plan = plan_page(DESC_TIEBREAK_STATEMENT, None).expect("planned");
+    assert_eq!(
+        plan.order_by
+            .iter()
+            .map(|term| term.render())
+            .collect::<Vec<String>>(),
+        ["\"ts\" DESC", "\"series_id\" ASC"],
+        "the effective ordering",
+    );
+    assert_eq!(plan.tiebreak_appended, ["series_id"]);
+    assert_eq!(plan.not_total, None);
+
+    let ctx = context();
+    let found = walk(&ctx, DESC_TIEBREAK_STATEMENT).await;
+    let rows = found.rows();
+    let unpaged = rows_of(&execute(&ctx, DESC_TIEBREAK_STATEMENT).await);
+    assert_eq!(
+        unpaged.len(),
+        FIXTURE.len(),
+        "the statement's own row count"
+    );
+    assert!(
+        multiset(&unpaged).values().all(|&count| count == 1),
+        "the fixture has no duplicate (ts, series_id) row",
+    );
+    assert_eq!(
+        multiset(&rows),
+        multiset(&unpaged),
+        "the walk did not deliver every row exactly once",
+    );
+    assert_eq!(
+        found.pages,
+        FIXTURE.len() + 1,
+        "pages, the empty last one included"
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row[1].as_str())
+            .collect::<Vec<&str>>(),
+        DESC_TIEBREAK_SERIES,
+        "the walk's series_id sequence",
+    );
+    let reference =
+        rows_of(&execute(&ctx, &reference_statement(DESC_TIEBREAK_STATEMENT, &plan)).await);
+    assert_eq!(sequence_finding(&reference, &found), None);
 }
 
 /// The window column of a walk over [`WINDOW_COUNT_STATEMENT`] or
