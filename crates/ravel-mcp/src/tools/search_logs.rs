@@ -183,12 +183,16 @@ impl Input {
             .as_deref()
             .map(|raw| trace_id_bytes("trace_id", raw))
             .transpose()?;
+        // A term with no letter or digit tokenizes to no word, which
+        // `has_word` matches on every row.
         if input
             .has_word
             .as_deref()
-            .is_some_and(|term| term.trim().is_empty())
+            .is_some_and(|term| !term.chars().any(char::is_alphanumeric))
         {
-            return Err(invalid("has_word must name at least one word".to_string()));
+            return Err(invalid(
+                "has_word must hold at least one letter or digit".to_string(),
+            ));
         }
         for predicate in &input.predicates {
             check_arity(predicate)?;
@@ -1059,6 +1063,7 @@ mod tests {
             ("short trace_id", json!({"trace_id": "abc"}), FailureClass::InvalidArgument),
             ("non-hex trace_id", json!({"trace_id": "g".repeat(32)}), FailureClass::InvalidArgument),
             ("blank has_word", json!({"has_word": "  "}), FailureClass::InvalidArgument),
+            ("wordless has_word", json!({"has_word": "-- ;"}), FailureClass::InvalidArgument),
             ("evidence_ref", json!({"evidence_ref": "e"}), FailureClass::Unsupported),
         ];
         for (name, extra, class) in cases {

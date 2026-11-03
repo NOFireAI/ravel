@@ -146,6 +146,7 @@ pub struct Predicate {
 pub struct SearchLogsInput {
     #[serde(default)]
     pub predicates: Vec<Predicate>,
+    /// Rows whose body holds these words as a run of whole tokens.
     pub has_word: Option<String>,
     /// trace, debug, info, warn, error or fatal: that level or above.
     pub severity: Option<String>,
@@ -454,7 +455,9 @@ pub fn tool_catalog() -> Vec<Tool> {
         tool::<SearchLogsInput>(
             "ravel_search_logs",
             "Search logs",
-            "Typed log search compiled to SQL",
+            "Typed log search compiled to SQL, ordered by (ts, observed_ts). \
+             Rows are grouped by attribute key set; group_attrs lists the \
+             attributes the group shares once",
         ),
         tool::<GetTraceInput>(
             "ravel_get_trace",
@@ -486,7 +489,7 @@ mod tests {
     /// every client parses on every reconnect, and it should be read in a
     /// diff rather than absorbed silently anywhere under the bound. Update
     /// it in the same commit as the schema change that moves it.
-    const TOOLS_LIST_SERIALIZED_LEN: usize = 16_297;
+    const TOOLS_LIST_SERIALIZED_LEN: usize = 16_058;
 
     /// D2 bounds `tools/list` so the catalog itself never competes with a
     /// data response for the response-size budget.
@@ -794,7 +797,7 @@ mod tests {
     /// `agents` and run with both enabled answers it. Pinned for the same
     /// reason as [`TOOLS_LIST_SERIALIZED_LEN`], under the same D2 budget
     /// (ADR-3331 decision 10).
-    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 24_186;
+    const COMBINED_TOOLS_LIST_SERIALIZED_LEN: usize = 23_947;
 
     const _: () = assert!(
         COMBINED_TOOLS_LIST_SERIALIZED_LEN < 24_576,
