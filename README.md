@@ -538,19 +538,21 @@ runtime `--mcp` flag, both off by default: build with the feature, then pass
 reachable from outside localhost) to mount `POST /mcp` on the query router.
 The published image built from `main` compiles the feature in, so with that
 image you only pass the flag.
-Eight tools are served today, `ravel_capabilities`, `ravel_describe_data`
+All nine tools are served, `ravel_capabilities`, `ravel_describe_data`
 (one signal's schema, indexed keys, committed rows, coverage window and
 metric families, 100 families per page behind a cursor),
 `ravel_find_labels`, `ravel_explain_query`, `ravel_query_sql` (one
 read-only `SELECT` over one table, its rows filtered to a required
 `time_range` and paged by a keyset cursor), `ravel_query_promql` (an
 instant or a range evaluation, one row per series, `ravel_log_lines` and
-`ravel_log_bytes` included), `ravel_get_trace` (whose `time_range` is
+`ravel_log_bytes` included), `ravel_search_logs` (typed predicates,
+`has_word`, severity and trace id compiled to one `SELECT` over `logs`,
+ordered by `(ts, observed_ts)`, rows grouped by attribute key set with the
+shared attributes listed once), `ravel_get_trace` (whose `time_range` is
 optional: omitted, it reads every span the tenant retains) and
 `ravel_analyze_timeseries` (`change_point` or `summary` over each series of
 a PromQL range result, the same analysis `POST /api/v1/analytics` runs,
-reported as a heuristic); the other one, `ravel_search_logs`, is catalogued
-and refuses calls until its body lands.
+reported as a heuristic).
 
 ## Container images
 

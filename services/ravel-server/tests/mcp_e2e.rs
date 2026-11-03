@@ -3020,7 +3020,8 @@ mod with_mcp {
     #[tokio::test]
     async fn search_logs_filters_and_pages_a_logs_tenant() {
         let (store, metrics) = instrumented_memory();
-        declare_columns(store.as_ref(), 1).await;
+        // attr_01 is declared and no line carries it, so it is null on every row.
+        declare_columns(store.as_ref(), 2).await;
         publish_logs(store.as_ref(), &search_corpus()).await;
         let running = start_server(store, metrics, mcp_on()).await;
         let client =
@@ -3042,6 +3043,11 @@ mod with_mcp {
         let cases = [
             ("has_word", serde_json::json!({"has_word": "timeout"}), vec!["disk timeout on node"]),
             ("has_word token", serde_json::json!({"has_word": "time"}), vec!["time drift"]),
+            (
+                "has_word case",
+                serde_json::json!({"has_word": "DISK Timeout"}),
+                vec!["disk timeout on node"],
+            ),
             (
                 "hostile has_word",
                 serde_json::json!({"has_word": "it's down; -- /* now"}),
@@ -3066,6 +3072,16 @@ mod with_mcp {
                 "ne predicate",
                 serde_json::json!({"predicates": [{"key": "attr_00", "op": "ne", "value": HOSTILE}]}),
                 vec!["user login ok", "time drift", "it's down; -- /* now"],
+            ),
+            (
+                "ne on a null column",
+                serde_json::json!({"predicates": [{"key": "attr_01", "op": "ne", "value": "x"}]}),
+                vec![],
+            ),
+            (
+                "exists on a null column",
+                serde_json::json!({"predicates": [{"key": "attr_01", "op": "exists"}]}),
+                vec![],
             ),
         ];
         for (name, extra, expected) in cases {

@@ -8,7 +8,8 @@
 //!
 //! Two failures are the caller's protocol error rather than a result: a name
 //! outside the catalog ([`ToolError::UnknownTool`]) and a catalog name whose
-//! body this build does not carry ([`ToolError::NotShipped`]). Everything
+//! body this build does not carry ([`ToolError::NotShipped`], which this
+//! build, serving every catalog name, does not produce). Everything
 //! else is an [`Envelope`] with a D4 failure class, because ADR-1374 D4
 //! reserves protocol errors for malformed JSON-RPC and unknown tools.
 
