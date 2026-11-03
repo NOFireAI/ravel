@@ -1,4 +1,8 @@
 use super::*;
+use datafusion::arrow::buffer::{BooleanBuffer, Buffer, OffsetBuffer, ScalarBuffer};
+use datafusion::arrow::datatypes::ToByteSlice;
+use ravel_logseg::Validity;
+use ravel_logseg::decoded_cache::{MemoSource, ReservationCell, StrBuffers, ValuesMemo};
 
 /// Decode a slice of records into one [`RecordBatch`] over `schema`, which is
 /// `logs_schema_with_declared(&declared)` projected by `projection`.
@@ -279,6 +283,9 @@ thread_local! {
     /// UTF-8 validations [`cell_text`] ran on this thread, so a test can pin how
     /// often a declared `Str` cell's bytes are validated.
     static CELL_TEXT_VALIDATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Blocks [`build_str_block`] built through the plain memo fast path on
+    /// this thread, so a test can show the path ran.
+    static PLAIN_MEMO_FAST_PATHS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// A `Str` cell's bytes as text, or `None` when they are not UTF-8. The
@@ -310,8 +317,12 @@ struct StrCursor<'a> {
     /// page.
     dict: Option<StrDictColumn<'a>>,
     /// Plain-page cells [`cell_text`] validated through this cursor: none on
-    /// a page the decode validated.
+    /// a page the decode validated. A memo build adds the cells it validates
+    /// ([`memo_array`]).
     validated: std::cell::Cell<u64>,
+    /// The column's memo slot, `Some` only when a decoded-cache entry holds
+    /// the column ([`ColumnarBlockView::str_values_memo`]).
+    memo: Option<MemoSource<'a>>,
 }
 
 impl<'a> StrCursor<'a> {
@@ -320,7 +331,34 @@ impl<'a> StrCursor<'a> {
             cells: view.bytes_cursor(column_id),
             dict: view.str_dict(column_id),
             validated: std::cell::Cell::new(0),
+            memo: view.str_values_memo(column_id),
         }
+    }
+
+    /// The plain column's memo array, when the decoded-cache entry holding
+    /// the column can share it with a block of `surviving` rows out of
+    /// `record_count` under the fast path's preconditions (ADR-3326,
+    /// zero-copy values amendment, decision 2): a validated `Text` buffer
+    /// (the only plain kind with a memo slot), identity rows, every row
+    /// present by popcount, and a last offset at most `i32::MAX`. The caller
+    /// checks `single_matching`.
+    fn plain_memo(&self, surviving: usize, record_count: usize) -> Option<StringArray> {
+        let memo = self.memo.as_ref()?;
+        let fits = memo
+            .last_offset()
+            .is_some_and(|last| i32::try_from(last).is_ok());
+        if !memo.is_plain() || surviving != record_count || !memo.all_present() || !fits {
+            return None;
+        }
+        memo_array(memo, &self.validated, record_count as u64)
+    }
+
+    /// The dictionary's memo array, when a decoded-cache entry holds the
+    /// dictionary in full (decision 1).
+    fn dict_memo(&self) -> Option<StringArray> {
+        let memo = self.memo.as_ref().filter(|m| !m.is_plain())?;
+        let entries = self.dict.as_ref()?.values().len();
+        memo_array(memo, &self.validated, entries as u64)
     }
 
     /// The dictionary key of surviving row `i` when the row has a value and
@@ -362,6 +400,152 @@ impl<'a> StrCursor<'a> {
         }
         self.text_at(i).map_or(Presence::Absent, Presence::Text)
     }
+}
+
+/// The Arrow values array a cached string column keeps in its memo slot
+/// (ADR-3326, zero-copy values amendment, decision 1), built once over the
+/// column's own buffers. `None` when the buffers did not form a valid array;
+/// a scan then takes the per-scan build, and the column never retries.
+struct StrMemo {
+    array: Option<StringArray>,
+}
+
+impl ValuesMemo for StrMemo {
+    /// True while any of the array's buffers has a holder beyond the memo's
+    /// own reference: a scan's clone of the array, a batch holding that, or a
+    /// view array a cast built over the values buffer. Each of those clones a
+    /// `Buffer`, which moves `Buffer::strong_count`.
+    fn held_outside(&self) -> bool {
+        let Some(array) = &self.array else {
+            return false;
+        };
+        array.values().strong_count() > 1
+            || array.offsets().inner().inner().strong_count() > 1
+            || datafusion::arrow::array::Array::nulls(array)
+                .is_some_and(|n| n.buffer().strong_count() > 1)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// One of a cached column's buffers as an Arrow buffer owner: the buffer's
+/// own `Arc` and the entry's reservation cell, never the column (decision 3),
+/// so the reservation lasts as long as any Arrow buffer over the bytes
+/// (decision 5).
+struct MemoOwner<T> {
+    buf: Arc<T>,
+    _cell: Arc<ReservationCell>,
+}
+
+impl AsRef<[u8]> for MemoOwner<String> {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.as_bytes()
+    }
+}
+
+impl AsRef<[u8]> for MemoOwner<Vec<u32>> {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.as_slice().to_byte_slice()
+    }
+}
+
+impl AsRef<[u8]> for MemoOwner<Vec<i32>> {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.as_slice().to_byte_slice()
+    }
+}
+
+impl AsRef<[u8]> for MemoOwner<Validity> {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.words().to_byte_slice()
+    }
+}
+
+/// An Arrow buffer over `buf`'s bytes, sharing them.
+fn memo_buffer<T>(buf: Arc<T>, cell: &Arc<ReservationCell>) -> Buffer
+where
+    MemoOwner<T>: AsRef<[u8]>,
+    T: Send + Sync + 'static,
+{
+    Buffer::from(bytes::Bytes::from_owner(MemoOwner {
+        buf,
+        _cell: Arc::clone(cell),
+    }))
+}
+
+/// `offsets` as Arrow `Utf8` offsets over `buffer`, its bytes, when they are
+/// non-empty, start at 0, never decrease and end at most at `values_len` and
+/// `i32::MAX`: the checks `OffsetBuffer::new` would otherwise panic on, plus
+/// the bound the `u32` offsets of a plain column need to read as `i32`.
+fn memo_offsets<T: Copy + Into<i64>>(
+    offsets: &[T],
+    values_len: usize,
+    buffer: Buffer,
+) -> Option<OffsetBuffer<i32>> {
+    let first: i64 = (*offsets.first()?).into();
+    let last: i64 = (*offsets.last()?).into();
+    let ordered = offsets.windows(2).all(|w| w[0].into() <= w[1].into());
+    if first != 0
+        || !ordered
+        || last > i64::from(i32::MAX)
+        || usize::try_from(last).ok()? > values_len
+    {
+        return None;
+    }
+    Some(OffsetBuffer::new(ScalarBuffer::new(buffer, 0, offsets.len())))
+}
+
+/// The memo array over a cached column's `buffers`, sharing every byte
+/// (decision 4: safe constructors only; `StringArray::try_new` validates the
+/// values as UTF-8 and checks every offset falls on a char boundary).
+fn build_str_memo(buffers: StrBuffers, cell: Arc<ReservationCell>) -> Option<StringArray> {
+    let (values, offsets, valid) = match buffers {
+        StrBuffers::Plain { values, offsets } => {
+            let len = values.len();
+            let o = memo_offsets(&offsets, len, memo_buffer(Arc::clone(&offsets), &cell))?;
+            (values, o, None)
+        }
+        StrBuffers::Dict {
+            values,
+            offsets,
+            valid,
+        } => {
+            let len = values.len();
+            let o = memo_offsets(&offsets, len, memo_buffer(Arc::clone(&offsets), &cell))?;
+            (values, o, valid)
+        }
+    };
+    let entries = offsets.len() - 1;
+    let nulls = match valid {
+        Some(valid) if valid.len() == entries => Some(NullBuffer::new(BooleanBuffer::new(
+            memo_buffer(valid, &cell),
+            0,
+            entries,
+        ))),
+        Some(_) => return None,
+        None => None,
+    };
+    StringArray::try_new(offsets, memo_buffer(values, &cell), nulls).ok()
+}
+
+/// The memo array of a cached column, built on first use. A build adds
+/// `cells` to `validated`, once per column: the call whose closure runs is
+/// the one that validated (ADR-3326, zero-copy values amendment, decision 6).
+fn memo_array(
+    source: &MemoSource<'_>,
+    validated: &std::cell::Cell<u64>,
+    cells: u64,
+) -> Option<StringArray> {
+    let memo = source.get_or_build(|buffers, cell| {
+        let array = build_str_memo(buffers, cell);
+        if array.is_some() {
+            validated.set(validated.get() + cells);
+        }
+        Arc::new(StrMemo { array })
+    });
+    memo.as_any().downcast_ref::<StrMemo>()?.array.clone()
 }
 
 /// The Arrow values of each shared string dictionary one partition's scan has
@@ -461,7 +645,17 @@ impl StrValuesCache {
     ///
     /// A build is reserved first: when the pool refuses the array's bytes this
     /// returns the pool's resources-exhausted error and builds nothing.
-    fn values(&mut self, dict: &Arc<DictValues>, extra: Vec<String>) -> DFResult<ArrayRef> {
+    ///
+    /// `memo` is the dictionary's memo array when a decoded-cache entry holds
+    /// the dictionary in full (ADR-3326, zero-copy values amendment): the
+    /// base values are then a clone of it sharing its buffers, charged as a
+    /// build is, and nothing is built. An extended array is built either way.
+    fn values(
+        &mut self,
+        dict: &Arc<DictValues>,
+        extra: Vec<String>,
+        memo: Option<&StringArray>,
+    ) -> DFResult<ArrayRef> {
         let at = match self
             .entries
             .iter()
@@ -470,7 +664,14 @@ impl StrValuesCache {
             Some(at) => at,
             None => {
                 self.retain_live();
-                let values = self.build(dict, &[])?;
+                let values = match memo {
+                    Some(memo) => Self::share(
+                        &mut self.reservation,
+                        memo,
+                        ValuesLayout::of(dict, &[]).bytes(),
+                    )?,
+                    None => self.build(dict, &[])?,
+                };
                 self.entries.push(SharedStrValues {
                     dict: Arc::downgrade(dict),
                     values: Some(values),
@@ -486,7 +687,14 @@ impl StrValuesCache {
             return match &self.entries[at].values {
                 Some(values) => Ok(Arc::clone(&values.array)),
                 None => {
-                    let values = self.build(dict, &[])?;
+                    let values = match memo {
+                        Some(memo) => Self::share(
+                            &mut self.reservation,
+                            memo,
+                            ValuesLayout::of(dict, &[]).bytes(),
+                        )?,
+                        None => self.build(dict, &[])?,
+                    };
                     let array = Arc::clone(&values.array);
                     self.entries[at].values = Some(values);
                     Ok(array)
@@ -513,6 +721,41 @@ impl StrValuesCache {
             array: dict_values_array(dict, extra, &layout),
             charge,
         })
+    }
+
+    /// A memo array for this scan: a new `Arc` around a clone sharing the
+    /// memo's buffers, so [`ChargedValues::held`], [`Self::owns`] and the
+    /// `ptr_eq` checks see this scan's handle alone and never the memo's
+    /// (ADR-3326, zero-copy values amendment, decision 1). `charge`, the
+    /// array's layout bytes, is reserved first, as a build's is (decision 5).
+    /// Nothing is built, so [`BlockMetrics::str_dict_values_built`] does not
+    /// move.
+    fn share(
+        reservation: &mut MemoryReservation,
+        memo: &StringArray,
+        charge: usize,
+    ) -> DFResult<ChargedValues> {
+        reservation.try_grow(charge)?;
+        Ok(ChargedValues {
+            array: Arc::new(memo.clone()),
+            charge,
+        })
+    }
+
+    /// One plain-page block's values as this scan's handle on the block's
+    /// memo array ([`Self::share`]), held and charged as
+    /// [`Self::block_values`] holds and charges a built array.
+    fn memo_block_values(&mut self, memo: &StringArray) -> DFResult<ArrayRef> {
+        self.retain_live();
+        let layout = ValuesLayout {
+            len: datafusion::arrow::array::Array::len(memo),
+            data: memo.values().len(),
+            nulls: false,
+        };
+        let values = Self::share(&mut self.reservation, memo, layout.bytes())?;
+        let array = Arc::clone(&values.array);
+        self.plain.push(values);
+        Ok(array)
     }
 
     /// One plain-page block's values, `texts` then `extra`, as a `StringArray`
@@ -1377,6 +1620,24 @@ fn build_str_block(
         Some(DeclaredCursor::Str(c)) => Some(c),
         _ => None,
     };
+    // A served or just-admitted plain column no filter narrowed, every row
+    // present: every row's text is its record's, so the keys are the identity
+    // and the values the column's memo array, the same bytes the loop below
+    // would copy (ADR-3326, zero-copy values amendment, decision 2).
+    if single_matching
+        && let Some(cursor) = matching_str
+        && cursor.dict.is_none()
+        && let Some(memo) = cursor.plain_memo(n, view.record_count())
+    {
+        let keys: Vec<i32> = (0..str_key(n)?).collect();
+        let values = lock_str_values(&resolver.str_values).memo_block_values(&memo)?;
+        #[cfg(test)]
+        PLAIN_MEMO_FAST_PATHS.with(|c| c.set(c.get() + 1));
+        return Ok(StrBlock {
+            keys: Int32Array::new(keys.into(), None),
+            values,
+        });
+    }
     let mut keys: Vec<i32> = Vec::with_capacity(n);
     let mut nulls = NullBufferBuilder::new(n);
     let mut fallbacks = StrFallbacks::default();
@@ -1414,7 +1675,8 @@ fn build_str_block(
                     })?;
                 *k = base + slot;
             }
-            lock_str_values(&resolver.str_values).values(shared, extra)?
+            let memo = cursor.dict_memo();
+            lock_str_values(&resolver.str_values).values(shared, extra, memo.as_ref())?
         }
         None => {
             let mut texts: Vec<&str> = Vec::with_capacity(n);
@@ -4666,7 +4928,7 @@ mod tests {
         other.try_grow(OTHER).expect("the other consumer fits");
         let shared = test_str_values(&pool);
         let err = lock_str_values(&shared)
-            .values(&dict, Vec::new())
+            .values(&dict, Vec::new(), None)
             .expect_err("a pool below one dictionary's values refuses it");
         assert!(
             matches!(err, DataFusionError::ResourcesExhausted(_)),
@@ -4687,10 +4949,10 @@ mod tests {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(base));
         let shared = test_str_values(&pool);
         lock_str_values(&shared)
-            .values(&dict, Vec::new())
+            .values(&dict, Vec::new(), None)
             .expect("the base values fit");
         let err = lock_str_values(&shared)
-            .values(&dict, ext)
+            .values(&dict, ext, None)
             .expect_err("no room for the extended values");
         assert!(
             matches!(err, DataFusionError::ResourcesExhausted(_)),
@@ -4721,10 +4983,10 @@ mod tests {
             let shared = test_str_values(&pool);
             let mut cache = lock_str_values(&shared);
             let arrays = [
-                cache.values(&dict, Vec::new()).expect("base"),
-                cache.values(&dict, extra(&["ra"])).expect("first extended"),
+                cache.values(&dict, Vec::new(), None).expect("base"),
+                cache.values(&dict, extra(&["ra"]), None).expect("first extended"),
                 cache
-                    .values(&dict, extra(&["rb", "scope-fallback-value"]))
+                    .values(&dict, extra(&["rb", "scope-fallback-value"]), None)
                     .expect("second extended"),
             ];
             assert_eq!(cache.built.value(), 3, "three arrays built");
@@ -4754,8 +5016,8 @@ mod tests {
         let (base, ext) = {
             let mut cache = lock_str_values(&shared);
             (
-                cache.values(&dict, Vec::new()).expect("base"),
-                cache.values(&dict, extra(&["ra"])).expect("extended"),
+                cache.values(&dict, Vec::new(), None).expect("base"),
+                cache.values(&dict, extra(&["ra"]), None).expect("extended"),
             )
         };
         let batch = |values: &ArrayRef| {
@@ -4801,7 +5063,7 @@ mod tests {
         let pool = unbounded_pool();
         let shared = test_str_values(&pool);
         let base = lock_str_values(&shared)
-            .values(&dict, Vec::new())
+            .values(&dict, Vec::new(), None)
             .expect("base");
         let bytes = base.get_array_memory_size();
 
@@ -4830,8 +5092,8 @@ mod tests {
         let pool = unbounded_pool();
         let shared = test_str_values(&pool);
         let mut cache = lock_str_values(&shared);
-        let base = cache.values(&dict, Vec::new()).expect("base");
-        let ext = cache.values(&dict, extra(&["ra"])).expect("extended");
+        let base = cache.values(&dict, Vec::new(), None).expect("base");
+        let ext = cache.values(&dict, extra(&["ra"]), None).expect("extended");
         let ext_bytes = ext.get_array_memory_size();
         assert_eq!(
             pool.reserved(),
@@ -4869,7 +5131,7 @@ mod tests {
         let pool = unbounded_pool();
         let shared = test_str_values(&pool);
         let mut cache = lock_str_values(&shared);
-        let first = cache.values(&dict, Vec::new()).expect("base");
+        let first = cache.values(&dict, Vec::new(), None).expect("base");
         let first_ptr = Arc::as_ptr(&first);
         let bytes = first.get_array_memory_size();
         drop(first);
@@ -4877,7 +5139,7 @@ mod tests {
         cache.retain_live();
         assert_eq!(cache.entries.len(), 1, "the entry stays");
         assert_eq!(pool.reserved(), bytes, "and stays charged");
-        let again = cache.values(&dict, Vec::new()).expect("base again");
+        let again = cache.values(&dict, Vec::new(), None).expect("base again");
         assert!(
             std::ptr::addr_eq(Arc::as_ptr(&again), first_ptr),
             "the same array, not a rebuild"
@@ -4960,7 +5222,7 @@ mod tests {
         let shared = test_str_values(&pool);
         let stream = MemoryConsumer::new("stream").register(&pool);
         let cached = lock_str_values(&shared)
-            .values(&dict, Vec::new())
+            .values(&dict, Vec::new(), None)
             .expect("base");
         let plain: ArrayRef = Arc::new(StringArray::from(vec!["p0", "p1", "p2"]));
         let batch = |keys: Vec<i32>| {
