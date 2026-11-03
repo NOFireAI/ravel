@@ -1147,3 +1147,66 @@ write each and no corrupted read, but no earlier run was checked for this
 race beyond that counter. The ClickBench entry still runs `ravel.1`, which
 has the same race. Decision 10 is unchanged: only the real-S3 lane produces
 publishable Ravel performance and cost figures.
+
+## Amendment (2026-11-03): the Ravel row runs a disclosed fetch concurrency of 32
+
+<!-- amendment-applies: none reason="no section above sets Ravel's fetch concurrency; this records a disclosed deployment setting for the Ravel row beside the flush-setting amendment and retires no earlier wording" -->
+
+Context. On real S3 the harness read-back of the `cardinality` profile could
+not answer inside the frozen 120 s deadline. The read-back lists all
+1,000,000 series through `/api/v1/series`, then reads samples. Run R3 on
+#2821 (comment 6597777837) hit the deadline on both the unfolded and the
+folded catalog. With only 102 catalog GETs on the folded one, it averaged
+7.8 GETs in flight at about 72 ms each.
+
+Ravel derives its fetch concurrency as `max(8, 2 x cores)`
+(`resolve_performance_defaults`, ADR-1195). In the row's 2-CPU envelope
+that is 8.
+
+A pre-registered single-variable A/B on #2821 (pre-registration comment
+6598040099, readout comment 6601589888) tested it:
+- ravel-server alone, in query mode, 2 CPUs and 8 GiB, on R3's folded
+  bucket of 15,236 objects;
+- three interleaved cold reps per arm, the deadline raised to 1200 s so
+  that the slow arm finished.
+
+| Ravel setting | `series` | GETs/s | mean GET latency | GETs in flight | ravel-server CPU, median | source |
+|---|---|---|---|---|---|---|
+| derived default (8) | 264 to 277 s | 107 to 117 | 66 to 73 ms | 7.8 | about 33 % of 200 % | comment 6601589888 |
+| `--fetch-concurrency 32` | 71 to 74 s | 493 to 508 | 55 to 57 ms | 28.1 to 28.4 | about 117 % of 200 % | comment 6601589888 |
+
+Both arms did the same work: 102,715 to 102,741 GETs, 29.36 GB and
+102,655 fetch-cache misses over the five read-back queries. Every read-back
+matched, and no rep was refused for memory. Mean GET latency fell as the
+concurrency rose, so S3 was not the bound at either value.
+
+Decision: the MetricsBench Ravel row runs `--fetch-concurrency 32` on every
+profile and in both the portable and the real-S3 lanes.
+- The flag sets the shared GET permits, the PromQL per-object fan-out and
+  the SQL partition count together. The corpus issues no SQL, so the third
+  is inert here. The flag used is the one the A/B measured.
+- It is a deployment setting, disclosed beside the flush setting and
+  recorded in each run's effective configuration.
+- It is not a change to Ravel's shipped derivation. Whether that derivation
+  should take a higher floor against a remote object store is an ADR-1195
+  question, left open here.
+- No frozen limit changes: the per-query request and byte budgets count
+  requests and bytes, not their concurrency, and the GET count was the
+  same in both arms.
+
+Rejected: the derived default, because on real S3 it reports Ravel's
+default GET concurrency as the read path's latency, and the read-back
+cannot finish inside the frozen deadline.
+
+Consequences.
+- Figures measured at the derived 8 are not compared with figures measured
+  at 32. Each run's effective configuration records which; R3's published
+  cardinality figures were taken at 8.
+- Two cases were not measured at 32, and the next cardinality pair
+  measures both, pre-registered on #2821:
+  - the unfolded catalog, which adds one commit-record GET per object;
+  - the s3s-fs lane, where the store's own CPU bounded the read at 8.
+- The setting does not give the row its full `cardinality` query phase:
+  8 of its 21 statements are refused by the host memory floor at 8 (#3747),
+  and they have not been run at 32. Until that is fixed, those entries'
+  cardinality result is a refusal.

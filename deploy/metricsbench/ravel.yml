@@ -205,7 +205,8 @@ services:
       # uncached reads.
       - "--max-samples"
       - "500000000"
-      # FETCH CONCURRENCY (disclosed): replaces the derived default,
+      # FETCH CONCURRENCY (disclosed, ADR-0927 fetch-concurrency amendment
+      # 2026-11-03): replaces the derived default,
       # max(MIN_DERIVED_FETCH_CONCURRENCY 8, FETCH_CONCURRENCY_PER_CORE 2 x
       # cores) (services/ravel-server/src/config.rs,
       # resolve_performance_defaults), which is 8 in this 2-CPU container,
