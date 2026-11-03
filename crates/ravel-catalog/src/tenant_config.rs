@@ -2945,7 +2945,10 @@ mod tests {
         for key in ["__ravel_x", "__ravel_group"] {
             let err = validate_typed_attr_columns(&[str_col(key)])
                 .expect_err("a key with the reserved prefix must be rejected");
-            assert_eq!(err, TypedAttrColumnError::ReservedPrefix { key: key.into() });
+            assert_eq!(
+                err,
+                TypedAttrColumnError::ReservedPrefix { key: key.into() }
+            );
             let message = err.to_string();
             assert!(message.contains(&format!("{key:?}")), "{message}");
             assert!(message.contains("\"__ravel_\""), "{message}");
@@ -3067,7 +3070,10 @@ mod tests {
             .await
             .expect("read")
             .expect("present");
-        assert_eq!(now, carried, "the refused write must leave the record as it was");
+        assert_eq!(
+            now, carried,
+            "the refused write must leave the record as it was"
+        );
     }
 
     /// A durable write carrying an invalid declaration is refused before it

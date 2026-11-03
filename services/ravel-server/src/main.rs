@@ -533,8 +533,8 @@ async fn main() -> anyhow::Result<()> {
     // Per-tenant declared typed attribute columns for the logs SQL table
     // (ADR-0090 decision 1). Validated here, on the same rules a durable write
     // is held to (ravel_catalog::validate_typed_attr_columns), so an empty key,
-    // a duplicate, a conflicting type, or a collision with a fixed logs column
-    // fails startup rather than silently declaring a schema the operator did
+    // a duplicate, a conflicting type, a collision with a fixed logs column, or
+    // a key starting with the reserved `__ravel_` prefix fails startup rather than silently declaring a schema the operator did
     // not ask for. `ravel_server::start` wraps this in the cache-aside overlay
     // that resolves each query's declaration.
     let typed_attr_columns = ravel_server::typed_attr_config::TypedAttrColumnConfig::from_policy(

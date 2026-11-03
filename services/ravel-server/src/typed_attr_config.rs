@@ -24,8 +24,9 @@
 //! calls `ravel_catalog::validate_typed_attr_columns`, the SAME operator-input
 //! gate `ravel_catalog::set_tenant_config` runs before a durable write, so a
 //! CLI-declared list and a durably-written one are rejected on identical rules
-//! (empty key, duplicate key, the same key declared with two types, and a
-//! collision with one of the nine fixed logs SQL column names).
+//! (empty key, duplicate key, the same key declared with two types, a
+//! collision with one of the nine fixed logs SQL column names, and a key
+//! starting with the reserved `__ravel_` prefix).
 //!
 //! Where this list reaches a query: [`crate::start`] builds one
 //! [`TypedAttrColumnConfig`] as the CLI-derived base, then wraps it in
@@ -274,9 +275,10 @@ mod tests {
         );
     }
 
-    /// The four validation rules are `ravel_catalog`'s, reached through
-    /// `from_policy`: an empty key, a duplicate key, a conflicting type, and a
-    /// fixed-column collision, each tagged with the scope it failed in.
+    /// The five validation rules are `ravel_catalog`'s, reached through
+    /// `from_policy`: an empty key, a duplicate key, a conflicting type, a
+    /// fixed-column collision, and a reserved `__ravel_` prefix, each tagged
+    /// with the scope it failed in.
     #[test]
     fn the_catalog_validation_rules_apply_to_both_scopes() {
         let empty = TypedAttrColumnConfig::from_policy(TypedAttrColumnPolicy {
@@ -328,6 +330,19 @@ mod tests {
             collision,
             Err(TypedAttrColumnConfigError::Invalid { source: TypedAttrColumnError::FixedColumnCollision { ref key }, .. })
                 if key == "body"
+        ));
+
+        let reserved = TypedAttrColumnConfig::from_policy(TypedAttrColumnPolicy {
+            default: Vec::new(),
+            tenants: vec![(
+                "acme".to_string(),
+                vec![col("__ravel_group", DeclaredColumnType::Str)],
+            )],
+        });
+        assert!(matches!(
+            reserved,
+            Err(TypedAttrColumnConfigError::Invalid { ref scope, source: TypedAttrColumnError::ReservedPrefix { ref key } })
+                if scope == "acme" && key == "__ravel_group"
         ));
     }
 

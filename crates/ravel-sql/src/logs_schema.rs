@@ -54,10 +54,12 @@ pub const FIRST_DECLARED_COL: usize = LOG_COL_ATTRS + 1;
 /// #1768). A per-key column renders one `attrs['k']` subscript as a `Utf8`
 /// column using the merged map's own rules, so a projection that reaches the
 /// map only through literal-key subscripts can take the columnar path and
-/// decode only that key's FIELD_DIR pages. The name is deliberately
-/// unspellable through the SQL surface (no client can declare an attribute
-/// whose name starts with `__ravel_`), so it never collides with a fixed or
-/// declared column name and never reaches a query result: the
+/// decode only that key's FIELD_DIR pages. The name takes the reserved
+/// `__ravel_` prefix: `ravel_catalog::validate_typed_attr_columns` refuses a
+/// new declared key starting with it, so it does not collide with a fixed or
+/// declared column name. The one exception is a tenant config record stored
+/// before that rule, whose declared `__ravel_` keys are still read. The name
+/// never reaches a query result: the
 /// `AttrsPerKeyProjection` rule that introduces these columns rewrites the
 /// `get_field(attrs, 'k')` above the scan into a reference to this column and
 /// the client-visible output name stays whatever alias the projection carried.

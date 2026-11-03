@@ -998,6 +998,10 @@ entry into a typed attribute column of the same-named type (`str`/`i64`/`bool`/
 - A key declared twice is rejected, and nothing is written.
 - A key that collides with a fixed logs column name is rejected, and nothing
   is written.
+- A key that starts with `__ravel_` (case-sensitive) is rejected, and
+  nothing is written. That prefix is reserved for Ravel's own synthetic
+  columns. A tenant record stored before this rule keeps the `__ravel_` keys
+  it already declares.
 
 **Queries do not see a new declaration instantly.** A `set` is durable at
 once. A query-serving process resolves the durable declaration behind a
