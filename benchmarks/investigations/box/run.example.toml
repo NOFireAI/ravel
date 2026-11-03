@@ -1,0 +1,105 @@
+# One selective-investigations run (issue #3699, ADR-3692 decision 8): copy
+# this file, fill it in, and pass it to box/launch.sh (s3 lane) or to
+# box/run.sh --lane local. box/run.sh copies it into the run directory, and
+# evaluate.py reads that copy. No key here is a credential: on the s3 lane the
+# instance role carries every permission the box needs.
+
+[run]
+# "s3" (an EC2 box against a real S3 bucket; the only lane timing is judged
+# on) or "local" (a loopback RustFS on the machine running run.sh).
+lane = "s3"
+# The states the statement matrix runs in, in this order. many_parts needs
+# ravel-cli load --ingest-hour-stride, which this build lacks: it is listed
+# here and under [unsupported_states], and run.sh records every statement
+# planned for it as unsupported-on-this-build.
+states = ["unfolded", "folded_no_leaves", "folded_leaves", "mixed", "many_parts"]
+# Cold calls per (statement, state); each one follows a server restart and a
+# page-cache drop. The warm repeat follows the last cold call without a
+# restart, once, for statements whose cold_only is false.
+cold_runs = 20
+warm_runs = 1
+# true: load the ClickBench hits tenant and run q20 and the 43-statement
+# control (ADR rows 5, 6, 16). Needs [hits] below.
+hits = false
+# The corpus scales the run loads (gen_corpus.py --scale). Row 12 needs 10 and
+# 100; this flow loads scale 1 only, so those rows report not-run.
+scales = [1]
+# true only when a baseline build's control figures are in the run (row 16).
+# This flow builds one commit, so row 16 reports not-run.
+baseline = false
+# The mixed state's extra hour must land in the ingest hour after the folded
+# one: run.sh waits for the next hour boundary, at most this long, and fails
+# rather than load into the sealed hour.
+mixed_wait_max_minutes = 70
+
+[box]
+# The commit to build and measure, a full 40-character SHA.
+sha = "FILL-IN-COMMIT"
+repo_url = "https://github.com/NOFireAI/ravel.git"
+region = "us-east-1"
+# The run's in/ and out/: s3://<bucket>/<prefix>/runs/<run-id>/.
+bucket = "FILL-IN-BUCKET-NAME"
+prefix = "investigations"
+# The store under test. Ravel keys a whole bucket (t/<tenant_hash>/...,
+# sys/...), so this is a dedicated bucket in the same region, and run.sh
+# refuses one that already holds an object.
+store_bucket = "FILL-IN-EMPTY-STORE-BUCKET"
+# Its role needs s3:GetObject on <prefix>/runs/*/in/*, s3:PutObject on
+# <prefix>/runs/*/out/*, and GetObject, PutObject, DeleteObject and
+# ListBucket on store_bucket; launch.sh checks all of them before launching. With ec2:TerminateInstances the box
+# terminates itself through the API; without it, it shuts itself down, which
+# terminates it too (launch.sh sets
+# --instance-initiated-shutdown-behavior terminate).
+instance_profile = "ravel-investigations-instance-profile"
+instance_type = "c6a.4xlarge"
+volume_gb = 200
+# The instance's life cap: its user-data arms `shutdown -h +max_minutes`
+# before anything else, and the shutdown terminates it whatever run.sh is
+# doing. 1 to 600; fetch.sh stops waiting 30 minutes after it.
+max_minutes = 600
+# Optional: ami (default: the latest Amazon Linux 2023 from SSM), subnet,
+# security_group, key_name.
+# ami = "ami-..."
+
+[corpus]
+# gen_corpus.py parameters. The ADR's corpus is 20,000,000 traces over 24
+# hours; seed 3692 is the generator's default.
+traces = 20000000
+hours = 24
+seed = 3692
+spans_per_trace = 10
+logs_per_trace = 5
+
+[server]
+tenant = "inv"
+shards = 8
+# Optional: memory_budget_bytes (ravel-server --memory-budget-bytes).
+# memory_budget_bytes = 25769803776
+
+[hits]
+# Read only when run.hits = true. The same dataset the ClickBench kit loads.
+dataset_url = "https://datasets.clickhouse.com/hits_compatible/hits.parquet"
+dataset_sha256 = "a390f6cb782f6aaef278c72fc1dd86c4f30bc843ebab3c159e9bd4d45ddb079f"
+rows_expected = 99997497
+
+[unsupported_states]
+many_parts = "ravel-cli load has no --ingest-hour-stride on this build, so the many-parts state (one part per ingest hour across the corpus) cannot be built"
+
+# Every price evaluate.py multiplies by, with the source it was read from.
+# A price without a source is reported missing.
+[prices]
+get_per_1000 = 0.0004
+get_per_1000_source = "AWS S3 Standard pricing, us-east-1: GET, SELECT and all other requests, $0.0004 per 1,000 requests"
+put_per_1000 = 0.005
+put_per_1000_source = "AWS S3 Standard pricing, us-east-1: PUT, COPY, POST, LIST requests, $0.005 per 1,000 requests"
+storage_gb_month = 0.023
+storage_gb_month_source = "AWS S3 Standard pricing, us-east-1: first 50 TB per month, $0.023 per GB"
+instance_per_hour = 0.612
+instance_per_hour_source = "AWS EC2 on-demand pricing, us-east-1, Linux: c6a.4xlarge $0.612 per hour"
+
+[cost]
+# The lookup frequency break-even is judged at. An assumption, not a
+# measurement: evaluate.py prints it beside every break-even figure.
+lookups_per_part_month = 1000
+lookups_per_part_month_source = "assumption: 1,000 selective lookups per snapshot part per month, ADR-3692 gives no frequency"
+amortise_months = 1

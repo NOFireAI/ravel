@@ -1,0 +1,7 @@
+{
+ "from_mapping": "logs.mapping.toml",
+ "index_trace_id": true,
+ "key_index": "request_id",
+ "show": "tenant inv declares 3 typed attribute column(s), in schema-append order:\n  service.name:str\n  request_id:str\n  tag:str\nkey_index, in declaration order:\n  request_id:str\nindex_trace_id: true",
+ "tenant": "inv"
+}

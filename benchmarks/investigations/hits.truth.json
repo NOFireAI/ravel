@@ -1,0 +1,10 @@
+{
+ "hits.control": {
+  "oracle": "none",
+  "reason": "the nonselective control compares this build with the baseline build (ADR-3692 row 16), not with an oracle"
+ },
+ "hits.q20": {
+  "rows": 4,
+  "source": "ADR-3692 Acceptance row 5, target cell: 4 rows (benchmarks/clickbench/hits.corpus.json carries no expected_rows for q20_userid_lookup)"
+ }
+}

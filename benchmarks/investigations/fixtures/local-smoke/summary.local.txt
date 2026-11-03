@@ -1,0 +1,234 @@
+selective investigations, lane local: fail
+
+figure                                       status                value  verdict
+row_01.leaf_gets                             unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.leafGets)
+row_01.absent_object_gets                    unsupported-                 unsupported-on-this-build  (stats carry no per-object breakdown)
+row_01.data_gets                             value                     3  pass
+row_01.total_gets                            value                     7  pass
+row_01.wire_bytes                            value                247904  pass
+row_01.rows_exact                            value                     1  pass
+row_01.rows_match_unfolded                   value                     1  pass
+row_01.parts_covered                         unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.partsCovered)
+row_02.leaf_gets                             unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.leafGets)
+row_02.data_gets                             value                     3  pass
+row_02.wire_bytes                            value                247904  pass
+row_02.wall_p50_s                            value             0.0223055  reported (timing is judged on the s3 lane only)
+row_03.absent_object_gets                    unsupported-                 unsupported-on-this-build  (stats carry no per-object breakdown)
+row_03.probe_wire_per_absent_object          unsupported-                 unsupported-on-this-build  (stats carry no per-object breakdown)
+row_03.keyindex_gets_without_kidx            unsupported-                 unsupported-on-this-build  (stats carry no per-object breakdown)
+row_03.skip_idx_dropped_reported             unsupported-                 unsupported-on-this-build  (stats carry no pruning.skipIdxDropped)
+row_03.probe_wire_bytes                      value                131072  pass
+row_03.rows_exact                            value                     1  pass
+row_04.data_gets                             value                     0  pass
+row_04.leaf_gets                             unsupported-                 unsupported-on-this-build  (stats carry no keyIndex.leafGets)
+row_04.resolve_gets                          value                     1  pass
+row_05.leaf_gets                             not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_05.parts_covered                         not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_05.objects_opened                        not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_05.total_gets                            not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_05.wire_bytes                            not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_05.wall_p50_s                            not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_05.rows_exact                            not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_06.keyindex_gets                         not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_06.objects_past_probe                    not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_06.gets_beyond_probe                     not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_06.scan_wire_bytes                       not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_06.whole_reads_absent_key                not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_06.rows_exact                            not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_07.spans_section_gets                    value                     8  miss
+row_07.spans_new_entries                     value                     2  pass
+row_07.spans_tail_entries                    value                     4  pass
+row_07.spans_previous_leaves                 value                     1  pass
+row_07.spans_build_passes                    unsupported-                 unsupported-on-this-build  (fold report carries no key_index_build_passes)
+row_07.spans_peak_rss_bytes                  value              22118400  pass
+row_07.logs_section_gets                     value                     8  pass
+row_07.logs_new_entries                      value                     2  pass
+row_07.logs_tail_entries                     value                     4  pass
+row_07.logs_previous_leaves                  value                     2  pass
+row_07.logs_build_passes                     unsupported-                 unsupported-on-this-build  (fold report carries no key_index_build_passes)
+row_07.logs_peak_rss_bytes                   value              24215552  pass
+row_08.spans_leaf_pct                        value           4.755171511  pass
+row_08.logs_leaf_pct                         value          33.692949215  miss
+row_08.head_bytes_per_part_field             unsupported-                 unsupported-on-this-build  (fold report carries no head_bytes_per_part_field)
+row_09.leaf_gets                             unsupported-                 unsupported-on-this-build  (ravel-cli load has no --ingest-hour-stride on this build, so the many-parts state (one part per ingest hour across the corpus) cannot be built)
+row_09.parts_beyond_ceiling                  unsupported-                 unsupported-on-this-build  (ravel-cli load has no --ingest-hour-stride on this build, so the many-parts state (one part per ingest hour across the corpus) cannot be built)
+row_09.rows_exact                            unsupported-                 unsupported-on-this-build  (ravel-cli load has no --ingest-hour-stride on this build, so the many-parts state (one part per ingest hour across the corpus) cannot be built)
+row_10.leaf_gets                             unsupported-                 unsupported-on-this-build  (ravel-cli load has no --ingest-hour-stride on this build, so the many-parts state (one part per ingest hour across the corpus) cannot be built)
+row_10.parts_beyond_ceiling                  unsupported-                 unsupported-on-this-build  (ravel-cli load has no --ingest-hour-stride on this build, so the many-parts state (one part per ingest hour across the corpus) cannot be built)
+row_11.spans_1_rows_exact                    value                     1  pass
+row_11.spans_10_rows_exact                   value                     1  pass
+row_11.spans_100_rows_exact                  value                     1  pass
+row_11.spans_1000_rows_exact                 unsupported-                 unsupported-on-this-build  (the SQL surface refuses statements over 1,000 complexity tokens (ravel-sql complexity_guard::MAX_STATEMENT_COMPLEXITY, a constant); an IN list of 1,000 literals counts 1,001 (HTTP 400 bad_data))
+row_11.logs_1_rows_exact                     value                     1  pass
+row_11.logs_10_rows_exact                    value                     1  pass
+row_11.logs_100_rows_exact                   value                     1  pass
+row_11.logs_1000_rows_exact                  unsupported-                 unsupported-on-this-build  (the SQL surface refuses statements over 1,000 complexity tokens (ravel-sql complexity_guard::MAX_STATEMENT_COMPLEXITY, a constant); an IN list of 1,000 literals counts 1,001 (HTTP 400 bad_data))
+row_11.spans_1000_leaf_gets                  unsupported-                 unsupported-on-this-build  (the SQL surface refuses statements over 1,000 complexity tokens (ravel-sql complexity_guard::MAX_STATEMENT_COMPLEXITY, a constant); an IN list of 1,000 literals counts 1,001 (HTTP 400 bad_data))
+row_11.logs_1000_leaf_gets                   unsupported-                 unsupported-on-this-build  (the SQL surface refuses statements over 1,000 complexity tokens (ravel-sql complexity_guard::MAX_STATEMENT_COMPLEXITY, a constant); an IN list of 1,000 literals counts 1,001 (HTTP 400 bad_data))
+row_11.spans_1000_keys_probed                unsupported-                 unsupported-on-this-build  (the SQL surface refuses statements over 1,000 complexity tokens (ravel-sql complexity_guard::MAX_STATEMENT_COMPLEXITY, a constant); an IN list of 1,000 literals counts 1,001 (HTTP 400 bad_data))
+row_11.logs_1000_keys_probed                 unsupported-                 unsupported-on-this-build  (the SQL surface refuses statements over 1,000 complexity tokens (ravel-sql complexity_guard::MAX_STATEMENT_COMPLEXITY, a constant); an IN list of 1,000 literals counts 1,001 (HTTP 400 bad_data))
+row_12.gets_growth_10x                       not-run                      not-run  (scales [10, 100] not in run.toml scales)
+row_12.gets_growth_100x                      not-run                      not-run  (scales [10, 100] not in run.toml scales)
+row_13.wrong_answers                         value                     0  pass
+row_13.mixed_rows_exact                      value                     1  pass
+row_13.negative_controls_failing_on_mutant   unsupported-                 unsupported-on-this-build  (the decision 9 mutants are not built or run by this harness)
+row_14.signals_1                             value                     2  pass
+row_14.signals_102                           value                     2  pass
+row_14.signals_1024                          value                     2  pass
+row_14.signals_10240                         value                     2  pass
+row_14.gets_1                                value                     7  pass
+row_14.wire_1                                value                267581  pass
+row_14.objects_opened_1                      value                     0  pass
+row_14.blocks_scanned_1                      value                     2  pass
+row_14.gets_10240                            value                     7  pass
+row_14.wire_10240                            value                267581  pass
+row_15.cell_rows_exact                       value                     1  pass
+row_15.logs_rows_exact                       value                     1  pass
+row_15.cell_wall_p50_s                       value             0.0226085  reported (timing is judged on the s3 lane only)
+row_15.logs_wall_p50_s                       value             0.0289255  reported (timing is judged on the s3 lane only)
+row_15.logs_total_gets                       value                     7  pass
+row_15.non_holder_whole_reads                unsupported-                 unsupported-on-this-build  (stats carry no per-object breakdown)
+row_16.max_slowdown_pct                      not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_16.added_requests                        not-run                      not-run  (the hits tenant is not loaded (run.toml hits = false))
+row_17.cost_figures_without_basis            value                     0  pass
+row_17.cost_statements                       value                    74  pass
+row_17.break_even_without_frequency          value                     0  pass
+
+statement                       state             p50_s     p95_s     p99_s  gets  wire_B   cpu_s   $/call
+failing_cell                    folded_leaves     0.0226085 0.02348465 0.02356253     6  267548    0.02 2.08e-05
+failing_cell                    folded_no_leaves  0.0278235 0.03261375 0.03303955     6  267359   0.015 1.995e-05
+failing_cell                    mixed             0.023586 0.0239766 0.02401132     8  268156   0.015 2.075e-05
+failing_cell                    unfolded          0.024007 0.0247018 0.02476356     7  267363   0.025 2.205e-05
+journey_b                       folded_leaves     0.0289255 0.02940475 0.02944735     7  267581   0.025 3.705e-05
+journey_b                       mixed             0.030249 0.0303399 0.03034798     9  268189   0.025 3.785e-05
+journey_b                       unfolded          0.030367 0.0321679 0.03232798     8  267396    0.02 3.66e-05
+journey_c_1                     folded_leaves     0.0270385 0.02716945 0.02718109     7  267581    0.01 3.45e-05
+journey_c_1                     mixed             0.0299095 0.03087475 0.03096055     9  268189   0.025 3.785e-05
+journey_c_1                     unfolded          0.027098 0.0276551 0.02770462     8  267396    0.02 3.66e-05
+journey_c_102                   folded_leaves     0.026311 0.0267853 0.02682746     7  267581    0.02 3.62e-05
+journey_c_102                   mixed             0.028215 0.0282384 0.02824048     9  268189   0.015 3.615e-05
+journey_c_102                   unfolded          0.02676 0.0271497 0.02718434     8  267396    0.02 3.66e-05
+journey_c_1024                  folded_leaves     0.026064 0.0261945 0.0262061     7  267581    0.02 3.62e-05
+journey_c_1024                  mixed             0.029289  0.030297 0.0303866     9  268189   0.015 3.615e-05
+journey_c_1024                  unfolded          0.0280555 0.02811805 0.02812361     8  267396    0.02 3.66e-05
+journey_c_10240                 folded_leaves     0.0260595 0.02614995 0.02615799     7  267581    0.02 3.62e-05
+journey_c_10240                 mixed             0.0290065 0.02927065 0.02929413     9  268189    0.02  3.7e-05
+journey_c_10240                 unfolded          0.028247 0.0288788 0.02893496     8  267396   0.025 3.745e-05
+logs_request_id_absent          folded_leaves     0.013548  0.013557 0.0135578     1      33   0.015 1.795e-05
+logs_request_id_absent          mixed             0.015831  0.016038 0.0160564     1      33   0.015 1.795e-05
+logs_request_id_absent          unfolded          0.01453 0.0147568 0.01477696     1      33   0.015 1.795e-05
+logs_request_id_present         folded_leaves     0.0136975 0.01382485 0.01383617     1      33    0.01 1.71e-05
+logs_request_id_present         mixed             0.01496 0.0150212 0.01502664     1      33    0.01 1.71e-05
+logs_request_id_present         unfolded          0.01466 0.0148823 0.01490206     1      33    0.01 1.71e-05
+logs_request_in_1               folded_leaves     0.0135455 0.01379795 0.01382039     1      33   0.015 1.795e-05
+logs_request_in_1               unfolded          0.013996 0.0142921 0.01431842     1      33    0.01 1.71e-05
+logs_request_in_10              folded_leaves     0.0135125 0.01367405 0.01368841     1      33    0.01 1.71e-05
+logs_request_in_10              unfolded          0.0143695 0.01449235 0.01450327     1      33    0.01 1.71e-05
+logs_request_in_100             folded_leaves     0.015899 0.0159728 0.01597936     1      33    0.02 1.88e-05
+logs_request_in_100             unfolded          0.016488 0.0170091 0.01705542     1      33    0.01 1.71e-05
+logs_request_in_1000            folded_leaves     unsupported-on-this-build (the SQL surface refuses statements over 1,000 complexity tokens (ravel-sql complexity_guard::MAX_STATEMENT_COMPLEXITY, a constant); an IN list of 1,000 literals counts 1,001 (HTTP 400 bad_data))
+logs_request_in_1000            unfolded          unsupported-on-this-build (the SQL surface refuses statements over 1,000 complexity tokens (ravel-sql complexity_guard::MAX_STATEMENT_COMPLEXITY, a constant); an IN list of 1,000 literals counts 1,001 (HTTP 400 bad_data))
+logs_tag_common                 folded_leaves     0.0138975 0.01403295 0.01404499     1      33   0.005 1.625e-05
+logs_tag_common                 unfolded          0.0151755 0.01525875 0.01526615     1      33    0.01 1.71e-05
+logs_tag_rare                   folded_leaves     0.014164 0.0142405 0.0142473     1      33    0.01 1.71e-05
+logs_tag_rare                   unfolded          0.014348 0.0144533 0.01446266     1      33   0.005 1.625e-05
+logs_tag_sparse                 folded_leaves     0.014064 0.0141927 0.01420414     1      33    0.01 1.71e-05
+logs_tag_sparse                 unfolded          0.0146855 0.01484345 0.01485749     1      33    0.02 1.88e-05
+logs_trace_1h                   folded_leaves     0.0133275 0.01334595 0.01334759     1      33    0.01 1.71e-05
+logs_trace_1h                   folded_leaves     0.00899   0.00899   0.00899     1      33     0.0         
+logs_trace_1h                   folded_no_leaves  0.0139985 0.01406735 0.01407347     1      33    0.01 1.71e-05
+logs_trace_1h                   folded_no_leaves  0.009522  0.009522  0.009522     1      33     0.0         
+logs_trace_1h                   mixed             0.0150655 0.01518925 0.01520025     1      33    0.01 1.71e-05
+logs_trace_1h                   mixed             0.009492  0.009492  0.009492     1      33    0.01         
+logs_trace_1h                   unfolded          0.0149415 0.01517775 0.01519875     1      33    0.01 1.71e-05
+logs_trace_1h                   unfolded          0.009841  0.009841  0.009841     1      33    0.01         
+logs_trace_norange              folded_leaves     0.016523 0.0165806 0.01658572     1      33   0.015 1.795e-05
+logs_trace_norange              folded_no_leaves  0.0165405 0.01666425 0.01667525     1      33    0.01 1.71e-05
+logs_trace_norange              mixed             0.017134  0.017152 0.0171536     1      33   0.015 1.795e-05
+logs_trace_norange              unfolded          0.017814 0.0184908 0.01855096     1      33   0.015 1.795e-05
+logs_word_common                folded_leaves     0.015045 0.0154149 0.01544778     1      33    0.01 1.71e-05
+logs_word_common                unfolded          0.016741 0.0174844 0.01755048     1      33   0.015 1.795e-05
+logs_word_rare                  folded_leaves     0.0151935 0.01527405 0.01528121     1      33   0.025 1.965e-05
+logs_word_rare                  unfolded          0.01521 0.0153378 0.01534916     1      33    0.01 1.71e-05
+logs_word_sparse                folded_leaves     0.0154165 0.01592995 0.01597559     1      33   0.015 1.795e-05
+logs_word_sparse                unfolded          0.015923 0.0163316 0.01636792     1      33    0.01 1.71e-05
+spans_in_1                      folded_leaves     0.0230275 0.02305045 0.02305249     7  260274   0.015 2.035e-05
+spans_in_1                      unfolded          0.0227105 0.02287925 0.02289425     8  260089    0.01 1.99e-05
+spans_in_10                     folded_leaves     0.021992 0.0222872 0.02231344     6  267548    0.02 2.08e-05
+spans_in_10                     unfolded          0.0237015 0.02446335 0.02453107     7  267363    0.02 2.12e-05
+spans_in_100                    folded_leaves     0.02596  0.027571 0.0277142     6  267548    0.02 2.08e-05
+spans_in_100                    unfolded          0.0247995 0.02491245 0.02492249     7  267363   0.015 2.035e-05
+spans_in_1000                   folded_leaves     unsupported-on-this-build (the SQL surface refuses statements over 1,000 complexity tokens (ravel-sql complexity_guard::MAX_STATEMENT_COMPLEXITY, a constant); an IN list of 1,000 literals counts 1,001 (HTTP 400 bad_data))
+spans_in_1000                   unfolded          unsupported-on-this-build (the SQL surface refuses statements over 1,000 complexity tokens (ravel-sql complexity_guard::MAX_STATEMENT_COMPLEXITY, a constant); an IN list of 1,000 literals counts 1,001 (HTTP 400 bad_data))
+spans_lookup_1h                 folded_leaves     0.0223055 0.02242475 0.02243535     7  247904    0.01 1.95e-05
+spans_lookup_1h                 folded_leaves     0.010931  0.010931  0.010931     1      33    0.01         
+spans_lookup_1h                 folded_no_leaves  0.0230215 0.02397865 0.02406373     7  247715    0.02 2.12e-05
+spans_lookup_1h                 folded_no_leaves  0.013844  0.013844  0.013844     1      33    0.01         
+spans_lookup_1h                 many_parts        unsupported-on-this-build (ravel-cli load has no --ingest-hour-stride on this build, so the many-parts state (one part per ingest hour across the corpus) cannot be built)
+spans_lookup_1h                 mixed             0.0242565 0.02425875 0.02425895     9  248512    0.01 2.03e-05
+spans_lookup_1h                 mixed             0.011372  0.011372  0.011372     1      33    0.01         
+spans_lookup_1h                 unfolded          0.0232405 0.02325895 0.02326059     8  247719   0.015 2.075e-05
+spans_lookup_1h                 unfolded          0.011522  0.011522  0.011522     1      33    0.01         
+spans_lookup_narrow             folded_leaves     0.021801 0.0219675 0.0219823     7  247904   0.015 2.035e-05
+spans_lookup_narrow             mixed             0.024068 0.0241202 0.02412484     9  248512   0.015 2.115e-05
+spans_lookup_narrow             unfolded          0.0235635 0.02374575 0.02376195     8  247719    0.01 1.99e-05
+spans_lookup_norange            folded_leaves     0.024148 0.0241615 0.0241627     7  247904   0.015 2.035e-05
+spans_lookup_norange            folded_leaves     0.012931  0.012931  0.012931     1      33     0.0         
+spans_lookup_norange            folded_no_leaves  0.0239275 0.02404765 0.02405833     7  247715    0.02 2.12e-05
+spans_lookup_norange            folded_no_leaves  0.012992  0.012992  0.012992     1      33     0.0         
+spans_lookup_norange            many_parts        unsupported-on-this-build (ravel-cli load has no --ingest-hour-stride on this build, so the many-parts state (one part per ingest hour across the corpus) cannot be built)
+spans_lookup_norange            mixed             0.027874 0.0280765 0.0280945    11  379584   0.025 2.365e-05
+spans_lookup_norange            mixed             0.013701  0.013701  0.013701     1      33    0.01         
+spans_lookup_norange            unfolded          0.024973 0.0249901 0.02499162     8  247719   0.015 2.075e-05
+spans_lookup_norange            unfolded          0.013927  0.013927  0.013927     1      33    0.01         
+spans_lookup_wide               folded_leaves     0.023442 0.0248775 0.0250051     7  247904   0.015 2.035e-05
+spans_lookup_wide               mixed             0.0268905 0.02762085 0.02768577    11  379584   0.015 2.195e-05
+spans_lookup_wide               unfolded          0.0234245 0.02347085 0.02347497     8  247719   0.015 2.075e-05
+spans_sql_trace_1h              folded_leaves     0.0204605 0.02060765 0.02062073     7  247904    0.01 1.95e-05
+spans_sql_trace_1h              mixed             0.0253695 0.02832825 0.02859125     9  248512    0.01 2.03e-05
+spans_sql_trace_1h              unfolded          0.020711 0.0212195 0.0212647     8  247719   0.015 2.075e-05
+
+prices:
+  get_per_1000 = 0.0004  source: AWS S3 Standard pricing, us-east-1: GET, SELECT and all other requests, $0.0004 per 1,000 requests
+  put_per_1000 = 0.005  source: AWS S3 Standard pricing, us-east-1: PUT, COPY, POST, LIST requests, $0.005 per 1,000 requests
+  storage_gb_month = 0.023  source: AWS S3 Standard pricing, us-east-1: first 50 TB per month, $0.023 per GB
+  instance_per_hour = 0.612  source: AWS EC2 on-demand pricing, us-east-1, Linux: c6a.4xlarge $0.612 per hour
+query frequency assumed: 1000 lookups per part-month (source: assumption: 1,000 selective lookups per snapshot part per month, ADR-3692 gives no frequency); leaf build amortised over 1 month(s)
+  failing_cell: unfolded $2.205e-05 folded $2.08e-05 saving $1.25e-06/call; maintenance $0.000758233/part-month; break-even 606.5864 lookups/part-month
+  journey_b: unfolded $3.66e-05 folded $3.705e-05 saving $-4.5e-07/call; maintenance $0.000758233/part-month; break-even never (no saving per call) lookups/part-month
+  journey_c_1: unfolded $3.66e-05 folded $3.45e-05 saving $2.1e-06/call; maintenance $0.000758233/part-month; break-even 361.063333333 lookups/part-month
+  journey_c_102: unfolded $3.66e-05 folded $3.62e-05 saving $4e-07/call; maintenance $0.000758233/part-month; break-even 1895.5825 lookups/part-month
+  journey_c_1024: unfolded $3.66e-05 folded $3.62e-05 saving $4e-07/call; maintenance $0.000758233/part-month; break-even 1895.5825 lookups/part-month
+  journey_c_10240: unfolded $3.745e-05 folded $3.62e-05 saving $1.25e-06/call; maintenance $0.000758233/part-month; break-even 606.5864 lookups/part-month
+  logs_request_id_absent: unfolded $1.795e-05 folded $1.795e-05 saving $0.0/call; maintenance $0.000758233/part-month; break-even never (no saving per call) lookups/part-month
+  logs_request_id_present: unfolded $1.71e-05 folded $1.71e-05 saving $0.0/call; maintenance $0.000758233/part-month; break-even never (no saving per call) lookups/part-month
+  logs_request_in_1: unfolded $1.71e-05 folded $1.795e-05 saving $-8.5e-07/call; maintenance $0.000758233/part-month; break-even never (no saving per call) lookups/part-month
+  logs_request_in_10: unfolded $1.71e-05 folded $1.71e-05 saving $0.0/call; maintenance $0.000758233/part-month; break-even never (no saving per call) lookups/part-month
+  logs_request_in_100: unfolded $1.71e-05 folded $1.88e-05 saving $-1.7e-06/call; maintenance $0.000758233/part-month; break-even never (no saving per call) lookups/part-month
+  logs_tag_common: unfolded $1.71e-05 folded $1.625e-05 saving $8.5e-07/call; maintenance $0.000758233/part-month; break-even 892.038823529 lookups/part-month
+  logs_tag_rare: unfolded $1.625e-05 folded $1.71e-05 saving $-8.5e-07/call; maintenance $0.000758233/part-month; break-even never (no saving per call) lookups/part-month
+  logs_tag_sparse: unfolded $1.88e-05 folded $1.71e-05 saving $1.7e-06/call; maintenance $0.000758233/part-month; break-even 446.019411765 lookups/part-month
+  logs_trace_1h: unfolded $1.71e-05 folded $1.71e-05 saving $0.0/call; maintenance $0.000758233/part-month; break-even never (no saving per call) lookups/part-month
+  logs_trace_norange: unfolded $1.795e-05 folded $1.795e-05 saving $0.0/call; maintenance $0.000758233/part-month; break-even never (no saving per call) lookups/part-month
+  logs_word_common: unfolded $1.795e-05 folded $1.71e-05 saving $8.5e-07/call; maintenance $0.000758233/part-month; break-even 892.038823529 lookups/part-month
+  logs_word_rare: unfolded $1.71e-05 folded $1.965e-05 saving $-2.55e-06/call; maintenance $0.000758233/part-month; break-even never (no saving per call) lookups/part-month
+  logs_word_sparse: unfolded $1.71e-05 folded $1.795e-05 saving $-8.5e-07/call; maintenance $0.000758233/part-month; break-even never (no saving per call) lookups/part-month
+  spans_in_1: unfolded $1.99e-05 folded $2.035e-05 saving $-4.5e-07/call; maintenance $0.000758233/part-month; break-even never (no saving per call) lookups/part-month
+  spans_in_10: unfolded $2.12e-05 folded $2.08e-05 saving $4e-07/call; maintenance $0.000758233/part-month; break-even 1895.5825 lookups/part-month
+  spans_in_100: unfolded $2.035e-05 folded $2.08e-05 saving $-4.5e-07/call; maintenance $0.000758233/part-month; break-even never (no saving per call) lookups/part-month
+  spans_lookup_1h: unfolded $2.075e-05 folded $1.95e-05 saving $1.25e-06/call; maintenance $0.000758233/part-month; break-even 606.5864 lookups/part-month
+  spans_lookup_narrow: unfolded $1.99e-05 folded $2.035e-05 saving $-4.5e-07/call; maintenance $0.000758233/part-month; break-even never (no saving per call) lookups/part-month
+  spans_lookup_norange: unfolded $2.075e-05 folded $2.035e-05 saving $4e-07/call; maintenance $0.000758233/part-month; break-even 1895.5825 lookups/part-month
+  spans_lookup_wide: unfolded $2.075e-05 folded $2.035e-05 saving $4e-07/call; maintenance $0.000758233/part-month; break-even 1895.5825 lookups/part-month
+  spans_sql_trace_1h: unfolded $2.075e-05 folded $1.95e-05 saving $1.25e-06/call; maintenance $0.000758233/part-month; break-even 606.5864 lookups/part-month
+  fold fold_advance/logs (fold --key-index-leaves): 17 GET 5 PUT 56 LIST 0.085 cpu_s = $0.00032625
+  fold fold_advance/spans (fold --key-index-leaves): 15 GET 4 PUT 56 LIST 0.075 cpu_s = $0.00031875
+  fold folded_leaves/logs (fold --key-index-leaves): 4 GET 0 PUT 4 LIST 0.051 cpu_s = $3.027e-05
+  fold folded_leaves/spans (fold --key-index-leaves): 4 GET 0 PUT 4 LIST 0.051 cpu_s = $3.027e-05
+  fold folded_no_leaves/logs (fold): 7 GET 3 PUT 4 LIST 0.062 cpu_s = $4.834e-05
+  fold folded_no_leaves/spans (fold): 5 GET 3 PUT 4 LIST 0.064 cpu_s = $4.788e-05
+  fold leaf_rebuild/logs (rebuild-key-index): 5 GET 3 PUT 0 LIST 0.055 cpu_s = $2.635e-05
+  fold leaf_rebuild/spans (rebuild-key-index): 5 GET 2 PUT 0 LIST 0.057 cpu_s = $2.169e-05
+
+miss row_07.spans_section_gets
+miss row_08.logs_leaf_pct
