@@ -294,11 +294,12 @@ heap-profiling = ["tikv-jemallocator/profiling"]
 # production configuration can send unsigned GCS requests.
 gcs-test-endpoint = ["ravel-object-store/test-support"]
 
-# Test-only: exposes `cpu_shed::CpuShedGauge::set_for_test` to the integration
-# test binaries under `tests/`, which pin `p` directly (ADR-3718) rather than
-# drive the real detector loop or real CPU load. The dev-dependency on this
-# crate below turns it on for test builds; no published build enables it.
-cpu-shed-test-support = []
+# Test-only: exposes `ingest_hold::IngestHoldGate::force_for_test` to the
+# integration test binaries under `tests/`, which force the congested flag
+# directly (ADR-3718) rather than drive a real flush backlog. The
+# dev-dependency on this crate below turns it on for test builds; no
+# published build enables it.
+ingest-hold-test-support = []
 
 # Examples default to `test = false`; this one carries a test module that
 # pins its no-argument output, which a test target is needed to run.
@@ -318,7 +319,7 @@ rmcp = { workspace = true, features = [
 ] }
 # `query` on top of the normal dependency's `json`: the test client builds
 # query strings the server binary itself never needs to. `stream` lets a
-# permit-release test (tests/cpu_shed_e2e.rs) send a request body that
+# permit-release test (tests/ingest_hold_e2e.rs) send a request body that
 # trickles in slowly, so the server-side drain is still running when a
 # concurrent request needs the ceiling slot the drain's permit is supposed
 # to have already freed.
@@ -374,7 +375,7 @@ zstd = { workspace = true }
 # (`ravel_object_store::gcs::fake`), which needs unsigned requests; this crate's
 # own `gcs-test-endpoint` feature is what lets `--gcs-endpoint` skip them.
 ravel-object-store = { workspace = true, features = ["test-support"] }
-ravel-server = { path = ".", features = ["gcs-test-endpoint", "cpu-shed-test-support"] }
+ravel-server = { path = ".", features = ["gcs-test-endpoint", "ingest-hold-test-support"] }
 
 [lints]
 workspace = true

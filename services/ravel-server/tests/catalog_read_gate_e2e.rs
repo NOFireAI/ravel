@@ -164,7 +164,7 @@ async fn start_query_server(store: Arc<MemoryStore>) -> ravel_server::Running {
             write: 1,
             ..Default::default()
         },
-        cpu_shed: Default::default(),
+        ingest_hold: Default::default(),
         max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),

@@ -76,6 +76,7 @@ use tonic::body::Body as TonicBody;
 use tower::{Layer, Service};
 
 use crate::ingest_concurrency::{IngestConcurrencyController, IngestPermitHandle};
+use crate::ingest_hold::HoldVerdict;
 
 /// The gRPC service path prefix every unary OTLP ingest service shares
 /// (`opentelemetry.proto.collector.{metrics,logs,trace}.v1`).
@@ -491,6 +492,11 @@ pub trait IngestAdmissionState: Send + Sync + 'static {
 /// request that arrives over the ceiling is therefore shed (429) rather than
 /// rejected (401) even when its credentials are also bad.
 ///
+/// Between the two, an admitted request waits on the head hold (ADR-3718,
+/// flush-backlog hold amendment) while the node is congested, keeping its
+/// permit, and is refused with 429 through [`refuse_from_head`] when the
+/// hold's max wait runs out.
+///
 /// The permit is bound for the whole of `next.run(...)` unless the handler
 /// releases it first, so it covers the body read and the decode, and the
 /// layer's clone of its handle returns the slot on every exit path including
@@ -528,13 +534,13 @@ pub async fn admit_ingest_request<S: IngestAdmissionState>(
         }
     };
 
-    if state.ingest_concurrency().cpu_shed().draw() {
+    if state.ingest_concurrency().ingest_hold().hold().await == HoldVerdict::Refused {
         permit.release();
         let resolver = state.tenant_resolver();
         return refuse_from_head(
             state.ingest_concurrency().head_refusal_drain(),
             request,
-            cpu_shed_response(),
+            ingest_hold_response(),
             |headers| resolver.resolve(headers).is_ok(),
         )
         .await;
@@ -755,10 +761,17 @@ pub struct GrpcIngestAdmissionService<S> {
     strict_flush_policy: crate::config::StrictFlushPolicy,
 }
 
+type GrpcAdmissionFuture<E> =
+    Pin<Box<dyn Future<Output = Result<http::Response<TonicBody>, E>> + Send>>;
+
 impl<S> Service<http::Request<TonicBody>> for GrpcIngestAdmissionService<S>
 where
-    S: Service<http::Request<TonicBody>, Response = http::Response<TonicBody>>,
+    S: Service<http::Request<TonicBody>, Response = http::Response<TonicBody>>
+        + Clone
+        + Send
+        + 'static,
     S::Future: Send + 'static,
+    S::Error: Send + 'static,
 {
     type Response = http::Response<TonicBody>;
     type Error = S::Error;
@@ -766,7 +779,7 @@ where
     // the inner future and the shed arm resolves without one, so the two arms
     // are different types. One allocation per unary ingest request, against a
     // protobuf decode and a durable write.
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = GrpcAdmissionFuture<S::Error>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -790,13 +803,38 @@ where
         } else {
             None
         };
-        if let Some(permit) = &permit
-            && self.controller.cpu_shed().draw()
-        {
-            permit.release();
-            let response = cpu_shed_status().into_http();
-            return Box::pin(async move { Ok(response) });
+        if permit.is_some() && self.controller.ingest_hold().should_hold() {
+            // The hold awaits, so the rest of the head runs inside the
+            // returned future, on the service `poll_ready` readied; `self`
+            // keeps a clone, readied by the next `poll_ready`.
+            let clone = self.clone();
+            let mut this = std::mem::replace(self, clone);
+            return Box::pin(async move {
+                if this.controller.ingest_hold().hold().await == HoldVerdict::Refused {
+                    if let Some(permit) = &permit {
+                        permit.release();
+                    }
+                    return Ok(ingest_hold_status().into_http());
+                }
+                this.admit_after_hold(req, permit).await
+            });
         }
+        self.admit_after_hold(req, permit)
+    }
+}
+
+impl<S> GrpcIngestAdmissionService<S>
+where
+    S: Service<http::Request<TonicBody>, Response = http::Response<TonicBody>>,
+    S::Future: Send + 'static,
+{
+    /// The head after the in-flight permit and the hold: tenant resolution,
+    /// the pending strict-ack permit, and the call into the service behind.
+    fn admit_after_hold(
+        &mut self,
+        req: http::Request<TonicBody>,
+        permit: Option<IngestPermitHandle>,
+    ) -> GrpcAdmissionFuture<S::Error> {
         let (mut parts, body) = req.into_parts();
         let headers = grpc_head_headers(&parts.headers);
         let tenant = match self.resolver.resolve(&headers) {
@@ -990,28 +1028,30 @@ pub(crate) fn unauthenticated_status() -> Status {
     Status::unauthenticated("invalid or missing tenant credentials")
 }
 
-/// The message for a request refused by ADR-3718's CPU-aware shed draw.
-/// Shared with the gRPC status so both transports say the same thing.
-pub(crate) const CPU_SHED_MESSAGE: &str = "node is CPU-saturated, shedding ingest requests";
+/// The message for a request refused by ADR-3718's head hold once its max
+/// wait ran out. Shared with the gRPC status so both transports say the same
+/// thing.
+pub(crate) const INGEST_HOLD_MESSAGE: &str =
+    "node flush backlog stayed over its bound for the ingest hold's max wait";
 
-/// 429 for a request refused by [`crate::cpu_shed::CpuShedGauge::draw`]
-/// (ADR-3718 D2): drawn right after the in-flight permit, before tenant
-/// resolution, so a saturated node does no tenant resolution for a request it
-/// will refuse. Same `Retry-After` shape as the in-flight and pending-ack
-/// sheds: the detector can release the fraction within seconds, so there is
-/// no per-caller refill time to report.
-pub(crate) fn cpu_shed_response() -> Response {
-    let mut response = (StatusCode::TOO_MANY_REQUESTS, CPU_SHED_MESSAGE).into_response();
+/// 429 for a request refused by [`crate::ingest_hold::IngestHoldGate::hold`]
+/// (ADR-3718 D2, flush-backlog hold amendment): held right after the
+/// in-flight permit, before tenant resolution, so a congested node does no
+/// tenant resolution for a request it will refuse. Same `Retry-After` shape
+/// as the in-flight and pending-ack sheds: the backlog can clear within
+/// seconds, so there is no per-caller refill time to report.
+pub(crate) fn ingest_hold_response() -> Response {
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, INGEST_HOLD_MESSAGE).into_response();
     if let Ok(value) = HeaderValue::from_str(&INGEST_CONCURRENCY_RETRY_AFTER_SECONDS.to_string()) {
         response.headers_mut().insert(header::RETRY_AFTER, value);
     }
     response
 }
 
-/// A request refused by the CPU-aware shed draw, as `RESOURCE_EXHAUSTED`.
-/// Shared by every gRPC ingest service.
-pub(crate) fn cpu_shed_status() -> Status {
-    Status::resource_exhausted(CPU_SHED_MESSAGE)
+/// A request refused by the head hold, as `RESOURCE_EXHAUSTED`. Shared by
+/// every gRPC ingest service.
+pub(crate) fn ingest_hold_status() -> Status {
+    Status::resource_exhausted(INGEST_HOLD_MESSAGE)
 }
 
 #[cfg(test)]

@@ -41,8 +41,8 @@
 //! build since issue #3533 for the logs phase histograms, and `source` added
 //! by ADR-3541 decision 3 for the subject-drop counter, and `cause` added by
 //! issue #3653 for the provisioning read-failure counter). The keys come from
-//! forty-seven `Label` variants, fifty in a `sql` build (`DdlKind`,
-//! `DdlOutcome` and `DdlPhase`) and fifty-one in a `flight-sql` build,
+//! forty-eight `Label` variants, fifty-one in a `sql` build (`DdlKind`,
+//! `DdlOutcome` and `DdlPhase`) and fifty-two in a `flight-sql` build,
 //! which enables `sql`, because some variants share a
 //! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason`,
 //! `AlertRetentionSkipReason`, `SupersededHeldReason`,
@@ -54,7 +54,7 @@
 //! severity) and `ScrubLevel` (issue #1686, which part of the commit lineage
 //! -- `l0`/`l1`/`rewrite` -- a scrub target came from) both render `level`,
 //! `MergeMemoryKind`, `DeletedObjectKind` and, in a `sql` build, `DdlKind`
-//! render `kind`, `AlertOutcome`, `IpcryptOutcome` and, in a `sql` build,
+//! render `kind`, `AlertOutcome`, `IpcryptOutcome`, `HeadHoldOutcome` and, in a `sql` build,
 //! `DdlOutcome` render `outcome`, `ReadGateSite`, `WriteGateSite` and `MemoryRefusalSite`
 //! render `site`, and `FlushPhase`, `StrictAckPhase` and, in a `sql` build,
 //! `DdlPhase` render `phase`. `Label::RuntimeWorker(u32)` is bounded like `Label::Shard`, by its
@@ -507,6 +507,9 @@ pub enum Label {
     /// `decode`. A closed enum owned by `ravel_ingest`, which also owns the
     /// spelling. The only variant with the `cause` key.
     ProvisioningReadCause(ProvisioningReadCause),
+    /// How a request held at the head ended (ADR-3718): `admitted` or
+    /// `refused`. Shares the `outcome` key with `AlertOutcome`.
+    HeadHoldOutcome(crate::ingest_hold::HoldOutcome),
 }
 
 /// The closed `phase` set of `ravel_agents_sweep_list_pages_total`.
@@ -785,6 +788,7 @@ impl Label {
             Label::FlushPhase(_) => "phase",
             Label::StrictAckPhase(_) => "phase",
             Label::ProvisioningReadCause(_) => "cause",
+            Label::HeadHoldOutcome(_) => "outcome",
         }
     }
 
@@ -855,6 +859,7 @@ impl Label {
             Label::FlushPhase(phase) => phase.name().to_string(),
             Label::StrictAckPhase(phase) => phase.name().to_string(),
             Label::ProvisioningReadCause(cause) => cause.label().to_string(),
+            Label::HeadHoldOutcome(outcome) => outcome.name().to_string(),
         }
     }
 
@@ -3664,33 +3669,51 @@ fn render_ingest_concurrency_family(out: &mut String, mode: Mode, shed_total: u6
     );
 }
 
-/// ADR-3718's CPU-aware ingest admission: the cumulative head-refusal count
-/// and the current shed fraction `p`, read off the same process-wide
-/// controller as `render_ingest_concurrency_family` above.
-fn render_cpu_shed_family(out: &mut String, mode: Mode, cpu_shed: &crate::cpu_shed::CpuShedGauge) {
+/// ADR-3718's flush-backlog head hold: held requests by outcome, time held,
+/// and the congested flag, read off the same process-wide controller as
+/// `render_ingest_concurrency_family` above.
+fn render_ingest_hold_family(
+    out: &mut String,
+    mode: Mode,
+    gate: &crate::ingest_hold::IngestHoldGate,
+) {
     write_header(
         out,
-        "ravel_ingest_cpu_shed_total",
-        "Ingest requests refused at the head by the CPU-aware admission detector while the node is saturated (--ingest-cpu-shed-threshold, ADR-3718).",
+        "ravel_ingest_head_hold_total",
+        "Ingest requests held at the head while the node's flush backlog was over its bound (ADR-3718), by outcome: admitted once the backlog cleared, or refused at --ingest-hold-max-wait. A request that is not held is not counted.",
         "counter",
+    );
+    for outcome in crate::ingest_hold::HoldOutcome::ALL {
+        write_sample(
+            out,
+            "ravel_ingest_head_hold_total",
+            &[Label::Mode(mode), Label::HeadHoldOutcome(outcome)],
+            gate.hold_total(outcome),
+        );
+    }
+    write_header(
+        out,
+        "ravel_ingest_head_hold_seconds",
+        "Time ingest requests spent held at the head while the node's flush backlog was over its bound (ADR-3718), admitted and refused alike.",
+        "histogram",
+    );
+    write_phase_histogram(
+        out,
+        "ravel_ingest_head_hold_seconds",
+        &[Label::Mode(mode)],
+        &gate.held_seconds(),
+    );
+    write_header(
+        out,
+        "ravel_ingest_head_congested",
+        "1 while the node's flush backlog is over its bound and admitted ingest requests are held at the head (ADR-3718), else 0. Always 0 with --ingest-hold-max-wait 0.",
+        "gauge",
     );
     write_sample(
         out,
-        "ravel_ingest_cpu_shed_total",
+        "ravel_ingest_head_congested",
         &[Label::Mode(mode)],
-        cpu_shed.shed_total(),
-    );
-    write_header(
-        out,
-        "ravel_ingest_cpu_shed_fraction",
-        "Current CPU-aware admission shed fraction p (ADR-3718 D2): the probability a new ingest request is refused at the head. 0 when the node is not saturated or shedding is disabled (--ingest-cpu-shed-threshold 0).",
-        "gauge",
-    );
-    write_sample_f64(
-        out,
-        "ravel_ingest_cpu_shed_fraction",
-        &[Label::Mode(mode)],
-        cpu_shed.load(),
+        u64::from(gate.should_hold()),
     );
 }
 
@@ -10298,7 +10321,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         state.mode,
         state.ingest_concurrency.head_refusal_drain(),
     );
-    render_cpu_shed_family(&mut body, state.mode, state.ingest_concurrency.cpu_shed());
+    render_ingest_hold_family(&mut body, state.mode, state.ingest_concurrency.ingest_hold());
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -10703,6 +10726,7 @@ mod tests {
             Label::FlushPhase(FlushPhase::Total),
             Label::StrictAckPhase(StrictAckPhase::Request),
             Label::ProvisioningReadCause(ProvisioningReadCause::Store),
+            Label::HeadHoldOutcome(crate::ingest_hold::HoldOutcome::Refused),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -10774,6 +10798,7 @@ mod tests {
                 Label::FlushPhase(_) => "phase",
                 Label::StrictAckPhase(_) => "phase",
                 Label::ProvisioningReadCause(_) => "cause",
+                Label::HeadHoldOutcome(_) => "outcome",
             })
             .collect();
         assert_eq!(
@@ -10874,6 +10899,8 @@ mod tests {
                 // ProvisioningReadCause (issue #3653) is the twenty-seventh
                 // key, for the provisioning read-failure counter only.
                 "cause",
+                // HeadHoldOutcome (ADR-3718) reuses the `outcome` key.
+                "outcome",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), ADR-1692 decision 2's `shard` \
@@ -10888,8 +10915,8 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            47,
-            "exactly 47 label variants every build has, 27 distinct keys (sql adds DdlKind, \
+            48,
+            "exactly 48 label variants every build has, 27 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(

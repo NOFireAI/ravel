@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
-use crate::cpu_shed::CpuShedGauge;
 use crate::ingest_admission::HeadRefusalDrain;
+use crate::ingest_hold::IngestHoldGate;
 
 /// `--max-inflight-ingest-requests`: `Bounded(n)` caps process-wide in-flight
 /// ingest requests at `n`; `Unlimited` (the flag's `0` value) disables the
@@ -46,11 +46,11 @@ pub struct IngestConcurrencyController {
     semaphore: Option<Arc<Semaphore>>,
     shed_total: AtomicU64,
     head_refusal_drain: HeadRefusalDrain,
-    /// `Arc`-wrapped so [`Self::cpu_shed_handle`] can hand the background
-    /// detector task (`crate::cpu_shed::Detector::run`, spawned once in
+    /// `Arc`-wrapped so [`Self::ingest_hold_handle`] can hand the background
+    /// detector task (`crate::ingest_hold::Detector::run`, spawned once in
     /// `crate::start`) its own owned clone to publish into, independent of
     /// this controller's own lifetime.
-    cpu_shed: Arc<CpuShedGauge>,
+    ingest_hold: Arc<IngestHoldGate>,
 }
 
 /// A held admission slot. Carries no reference back to the controller: the
@@ -104,7 +104,13 @@ impl IngestPermitHandle {
 pub struct IngestShed;
 
 impl IngestConcurrencyController {
+    /// A controller whose head hold is off.
     pub fn new(limit: IngestConcurrencyLimit) -> Self {
+        Self::with_hold(limit, IngestHoldGate::default())
+    }
+
+    /// A controller that holds admitted requests at the head through `hold`.
+    pub fn with_hold(limit: IngestConcurrencyLimit, hold: IngestHoldGate) -> Self {
         let semaphore = match limit {
             IngestConcurrencyLimit::Bounded(n) => Some(Arc::new(Semaphore::new(n as usize))),
             IngestConcurrencyLimit::Unlimited => None,
@@ -113,12 +119,17 @@ impl IngestConcurrencyController {
             semaphore,
             shed_total: AtomicU64::new(0),
             head_refusal_drain: HeadRefusalDrain::default(),
-            cpu_shed: Arc::new(CpuShedGauge::default()),
+            ingest_hold: Arc::new(hold),
         }
     }
 
     pub fn shared(limit: IngestConcurrencyLimit) -> Arc<Self> {
         Arc::new(Self::new(limit))
+    }
+
+    /// [`Self::with_hold`], shared.
+    pub fn shared_with_hold(limit: IngestConcurrencyLimit, hold: IngestHoldGate) -> Arc<Self> {
+        Arc::new(Self::with_hold(limit, hold))
     }
 
     /// Admits the caller immediately or sheds it: this never queues. Call
@@ -161,20 +172,20 @@ impl IngestConcurrencyController {
         &self.head_refusal_drain
     }
 
-    /// ADR-3718's shed fraction and refusal counter: published by the
-    /// background saturation detector (`crate::cpu_shed::Detector`, spawned
-    /// in `crate::start`) and drawn against at the head of every ingest
-    /// admission path, alongside this same controller's `try_admit`.
-    pub fn cpu_shed(&self) -> &CpuShedGauge {
-        &self.cpu_shed
+    /// ADR-3718's head hold and its counters: the congested flag is
+    /// published by the background detector (`crate::ingest_hold::Detector`,
+    /// spawned in `crate::start`), and every ingest admission path holds on
+    /// it right after this same controller's `try_admit`.
+    pub fn ingest_hold(&self) -> &IngestHoldGate {
+        &self.ingest_hold
     }
 
-    /// An owned clone of the shed-fraction gauge, for the background
-    /// detector task to publish into independent of this controller's own
-    /// lifetime (`crate::start` spawns the detector with this, right after
-    /// building the shared controller).
-    pub fn cpu_shed_handle(&self) -> Arc<CpuShedGauge> {
-        self.cpu_shed.clone()
+    /// An owned clone of the hold gate, for the background detector task to
+    /// publish into independent of this controller's own lifetime
+    /// (`crate::start` spawns the detector with this, right after building
+    /// the shared controller).
+    pub fn ingest_hold_handle(&self) -> Arc<IngestHoldGate> {
+        self.ingest_hold.clone()
     }
 }
 
