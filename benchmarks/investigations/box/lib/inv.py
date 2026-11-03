@@ -485,13 +485,52 @@ def cmd_inspect_stamp(args):
         f.write("\n".join(show) + "\n")
 
 
+# The logs columns whose present_blocks count a needle's storage blocks: tag
+# holds every needle, each needle_<tier> column only its own tier's.
+NEEDLE_COLUMNS = ("tag", "needle_rare", "needle_sparse", "needle_common")
+
+
+def needle_totals(objs):
+    """Block, record and per-column present_blocks/null_count totals over
+    parsed rlog inspect headers. A total no object can vouch for is None,
+    never 0: every total when an object printed no field directory or no
+    integer block_count/record_count, a column's totals when an object listed
+    it without an integer count or when no object listed it at all. A column
+    absent from one object's non-empty directory holds no value there and
+    adds 0."""
+    tot = {"block_count": 0, "record_count": 0}
+    for col in NEEDLE_COLUMNS:
+        tot[f"{col}_present_blocks"] = 0
+        tot[f"{col}_null_count"] = 0
+    seen = set()
+    for obj in objs:
+        if not obj.get("field_dir") or not all(isinstance(obj.get(k), int) for k in ("block_count", "record_count")):
+            return {k: None for k in tot}
+        for k in ("block_count", "record_count"):
+            tot[k] += obj[k]
+        for col in NEEDLE_COLUMNS:
+            entry = next((c for c in obj["field_dir"] if c.get("name") == col), None)
+            if entry is None:
+                continue
+            seen.add(col)
+            for field in ("present_blocks", "null_count"):
+                k = f"{col}_{field}"
+                v = entry.get(field)
+                tot[k] = tot[k] + v if isinstance(v, int) and isinstance(tot[k], int) else None
+    for col in NEEDLE_COLUMNS:
+        if col not in seen:
+            tot[f"{col}_present_blocks"] = tot[f"{col}_null_count"] = None
+    return tot
+
+
 def cmd_needle_blocks(args):
-    """Storage blocks holding a needle, from rlog inspect's field directory:
-    the tag column is null on every row but a needle row, so its
-    present_blocks summed over the logs objects is the count gen_corpus
-    predicts in units of its own row order (truth needle_blocks.any). The
-    storage re-sorts rows, so only needle_rare (one row, so one block
-    whatever the order) compares exactly; tag is reported beside it."""
+    """Storage blocks holding each needle, from rlog inspect's field
+    directory: a needle column is null on every row but its needle's, so its
+    present_blocks summed over the logs objects is the storage block count.
+    gen_corpus predicts the count in units of its own row order (truth
+    needle_blocks); storage sorts rows by (stream_ref, ts) within a shard and
+    hour, so only needle_rare (one row, so one block whatever the order)
+    compares exactly."""
     with open(args.census) as f:
         census = json.load(f)
     tc = census["tenants"][args.tenant]
@@ -504,24 +543,13 @@ def cmd_needle_blocks(args):
                 keys.append(key)
     keys.sort()
     picked = keys if args.max_objects <= 0 else keys[: args.max_objects]
-    tot = {"tag_present_blocks": 0, "block_count": 0, "tag_null_count": 0, "record_count": 0,
-           "needle_rare_present_blocks": 0}
-    for key in picked:
-        obj = parse_object_inspect(run_cli(cli_base(args) + ["rlog", "inspect", key], stop_at="records ("))
-        tot["block_count"] += obj.get("block_count") or 0
-        tot["record_count"] += obj.get("record_count") or 0
-        tag = next((c for c in obj["field_dir"] if c.get("name") == "tag"), None)
-        if tag:
-            tot["tag_present_blocks"] += tag.get("present_blocks") or 0
-            tot["tag_null_count"] += tag.get("null_count") or 0
-        rare = next((c for c in obj["field_dir"] if c.get("name") == "needle_rare"), None)
-        if rare:
-            tot["needle_rare_present_blocks"] += rare.get("present_blocks") or 0
+    objs = [parse_object_inspect(run_cli(cli_base(args) + ["rlog", "inspect", key], stop_at="records ("))
+            for key in picked]
     with open(args.truth) as f:
         truth = json.load(f)
     write_json(args.out, {"tenant": args.tenant, "objects_total": len(keys), "objects_inspected": len(picked),
-                          **tot, "truth_needle_blocks": truth["needle_blocks"], "truth_needles": truth["needles"],
-                          "truth_block_rows": truth["generator"]["block_rows"]})
+                          **needle_totals(objs), "truth_needle_blocks": truth["needle_blocks"],
+                          "truth_needles": truth["needles"], "truth_block_rows": truth["generator"]["block_rows"]})
 
 
 # --- plan ---------------------------------------------------------------------

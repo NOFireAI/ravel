@@ -83,6 +83,16 @@ FOLD_FIELDS = {
 
 PRICE_KEYS = ("get_per_1000", "put_per_1000", "storage_gb_month", "instance_per_hour")
 NEEDLE_RARE = "needlerare"
+# (truth needle_blocks key, logs column, band): the rare needle exact, the
+# sparse and common needles within NEEDLE_BLOCK_BAND, tag (every needle,
+# truth "any") reported only.
+NEEDLE_GEOMETRY = (
+    (NEEDLE_RARE, "needle_rare", "exact"),
+    ("needlesparse", "needle_sparse", "band"),
+    ("needlecommon", "needle_common", "band"),
+    ("any", "tag", "reported"),
+)
+NEEDLE_BLOCK_BAND = 0.25
 # inv.py window_bounds' windows.
 HOUR_NS = 3_600_000_000_000
 NARROW_NS = 300_000_000_000
@@ -175,6 +185,10 @@ def load_cfg(run_dir, problems):
         if not isinstance(cfg["prices"].get(k), (int, float)):
             problems.add("missing", f"run.toml prices.{k}")
             cfg["prices"][k] = 0.0
+    months = cfg["cost"].get("amortise_months")
+    if isinstance(months, bool) or not isinstance(months, int) or months < 1:
+        problems.add("missing", "run.toml cost.amortise_months (a whole number of months, at least 1)")
+        cfg["cost"]["amortise_months"] = None
     return cfg
 
 
@@ -820,29 +834,51 @@ def check_loads(loads, truth, cfg, problems):
 
 
 def check_needle_blocks(doc, problems):
-    """The rare needle is one row, so it sits in exactly the block count
-    gen_corpus predicts whatever order storage keeps rows in; the other
-    needles' counts depend on that order and are reported only. Returns the
-    comparison for the results file."""
+    """Per needle, the blocks gen_corpus planted it in (truth needle_blocks)
+    beside the storage blocks its column is present in (inv.py
+    needle-blocks). The rare needle is one row, so storage holds it in
+    exactly the planted count whatever order it keeps rows in; storage sorts
+    rows by (stream_ref, ts) within a shard and hour, so the sparse and common
+    needles' counts move with that order and are banded within
+    NEEDLE_BLOCK_BAND of planted, and the tag column (every needle) is
+    reported only. Returns the comparison for the results file."""
     if not doc:
         return None
-    want = (doc.get("truth_needle_blocks") or {}).get(NEEDLE_RARE)
-    got = doc.get("needle_rare_present_blocks")
-    out = {"truth": want, "storage": got, "block_count": doc.get("block_count"),
-           "record_count": doc.get("record_count"), "objects_inspected": doc.get("objects_inspected"),
-           "objects_total": doc.get("objects_total")}
-    if not isinstance(want, int) or not isinstance(got, int):
-        out["status"] = "missing"
-        problems.add("missing", f"stamps/needle_blocks.json needle_rare_present_blocks or truth {NEEDLE_RARE}")
-    elif got == want:
-        out["status"] = "match"
-    elif doc.get("objects_inspected") != doc.get("objects_total"):
-        # A partial inspection (needle_blocks_max_objects) can miss the one
-        # object holding the row; that is a sample, not a mismatch.
-        out["status"] = "partial"
-    else:
-        out["status"] = "wrong"
-        problems.add("wrong", f"needle_rare in {got} storage blocks, truth.json says {want}")
+    planted = doc.get("truth_needle_blocks") or {}
+    partial = doc.get("objects_inspected") != doc.get("objects_total")
+    out = {"block_count": doc.get("block_count"), "record_count": doc.get("record_count"),
+           "objects_inspected": doc.get("objects_inspected"), "objects_total": doc.get("objects_total"),
+           "needles": {}, "figures": []}
+    for value, column, band in NEEDLE_GEOMETRY:
+        want = planted.get(value)
+        got = doc.get(f"{column}_present_blocks")
+        entry = {"column": column, "planted": want, "storage": got, "band": band}
+        if isinstance(want, bool) or not isinstance(want, int):
+            entry["status"] = "missing"
+            problems.add("missing", f"needle_blocks {value}: truth.json needle_blocks carries no {value}")
+        elif isinstance(got, bool) or not isinstance(got, int):
+            entry["status"] = "missing"
+            problems.add("missing", f"needle_blocks {value}: stamps/needle_blocks.json {column}_present_blocks "
+                                    f"absent or null")
+        elif band == "reported":
+            entry["status"] = "reported"
+        elif partial:
+            # A partial inspection (needle_blocks_max_objects) can miss an
+            # object holding a needle row; that is a sample, not a mismatch.
+            entry["status"] = "partial"
+        elif band == "exact":
+            entry["status"] = "match" if got == want else "wrong"
+            if got != want:
+                problems.add("wrong", f"{column} in {got} storage blocks, truth.json says {want}")
+        elif abs(got - want) <= NEEDLE_BLOCK_BAND * want:
+            entry["status"] = "within"
+        else:
+            entry["status"] = "miss"
+            problems.add("miss", f"needle_blocks {value}: {column} in {got} storage blocks, {want} planted, "
+                                 f"outside {NEEDLE_BLOCK_BAND:.0%}")
+        out["needles"][value] = entry
+        out["figures"].append({"id": f"needle_blocks.{value}.planted", "value": want})
+        out["figures"].append({"id": f"needle_blocks.{value}.storage", "value": got, "status": entry["status"]})
     return out
 
 
@@ -1206,7 +1242,7 @@ def maintenance_cost(folds, stamps, cfg, live, problems):
     plus the leaf bytes the folded_leaves catalog stamp names at the storage
     price, divided by that stamp's part count."""
     p = cfg["prices"]
-    months = cfg["cost"].get("amortise_months", 1) or 1
+    months = cfg["cost"].get("amortise_months")
     out = []
     if live.get("folded_leaves") is not None:
         return out
@@ -1224,6 +1260,10 @@ def maintenance_cost(folds, stamps, cfg, live, problems):
                 else None)
         leaf = leaf_bytes(doc) if doc is not None else None
         parts = part_count(doc) if doc is not None else None
+        if months is None:
+            entry["status"] = "missing"
+            out.append(entry)
+            continue
         if not line or not isinstance(report.get("ranged_gets"), int) or puts is None or leaf is None or not parts:
             entry["status"] = "missing"
             problems.add("missing", f"maintenance inputs for {label} (leaf_rebuild report ranged_gets and "
@@ -1242,15 +1282,21 @@ def maintenance_cost(folds, stamps, cfg, live, problems):
     return out
 
 
-def storage_cost(census, cfg):
+def storage_cost(census, cfg, problems):
     p = cfg["prices"]
     out = []
     for (state,), line in sorted(census.items()):
         if not line:
             continue
-        b = (line.get("census") or {}).get("bytes", 0)
-        out.append({"state": state, "objects": (line.get("census") or {}).get("objects"), "bytes": b,
-                    "dollars_per_month": rnd(b / 1e9 * p["storage_gb_month"]), "basis": "storage_gb_month"})
+        b = (line.get("census") or {}).get("bytes")
+        entry = {"state": state, "objects": (line.get("census") or {}).get("objects"), "bytes": b,
+                 "basis": "storage_gb_month"}
+        if isinstance(b, bool) or not isinstance(b, int):
+            entry.update(status="missing", dollars_per_month=None)
+            problems.add("missing", f"storage cost for {state}: census line carries no census.bytes")
+        else:
+            entry.update(status="value", dollars_per_month=rnd(b / 1e9 * p["storage_gb_month"]))
+        out.append(entry)
     return out
 
 
@@ -1372,6 +1418,15 @@ def summary_text(res):
     out.append("states:")
     for s in res["states"]:
         out.append(f"  {s['state']:24} {s['status']}" + (f"  ({s['reason']})" if s.get("reason") else ""))
+    nb = res.get("needle_blocks")
+    if nb:
+        out.append("")
+        out.append(f"needle blocks, planted / storage, over {nb['objects_inspected']} of {nb['objects_total']} "
+                   f"logs object(s):")
+        for value, e in nb["needles"].items():
+            band = f"within {NEEDLE_BLOCK_BAND:.0%}" if e["band"] == "band" else e["band"]
+            out.append(f"  {value:14} {e['column']:14} {e['planted']!s:>5} / {e['storage']!s:<5} "
+                       f"{band:11} {e['status']}")
     out.append("")
     out.append(f"{'figure':44} {'status':12} {'value':>14}  verdict")
     for f in res["figures"]:
@@ -1400,7 +1455,8 @@ def summary_text(res):
     out.append(f"query frequency assumed (once, for every break-even below): "
                f"{c['lookups_per_part_month_assumed']} lookups per part-month "
                f"(source: {c['lookups_per_part_month_source']}); leaf build amortised over "
-               f"{c['amortise_months']} month(s)")
+               + (f"{c['amortise_months']} month(s)" if c["amortise_months"] is not None
+                  else "missing (run.toml cost.amortise_months absent)"))
     for m in c["maintenance"]:
         if m["status"] != "value":
             out.append(f"  maintenance {m['signal']}: missing")
@@ -1496,7 +1552,7 @@ def main(argv):
 
     stmt_cost = statement_cost(calls, cfg)
     maint = maintenance_cost(folds, stamps, cfg, live, problems)
-    storage = storage_cost(census, cfg)
+    storage = storage_cost(census, cfg, problems)
     be = break_even(stmt_cost, maint, statements, cfg)
     basis = price_basis(cfg)
     no_basis = [k for k, b in basis.items() if not b["source"]]
@@ -1553,7 +1609,7 @@ def main(argv):
             "break_even": be,
             "lookups_per_part_month_assumed": cfg["cost"].get("lookups_per_part_month"),
             "lookups_per_part_month_source": cfg["cost"].get("lookups_per_part_month_source"),
-            "amortise_months": cfg["cost"].get("amortise_months", 1),
+            "amortise_months": cfg["cost"].get("amortise_months"),
         },
         "stamps": {
             "build": docs.get("build.json"),

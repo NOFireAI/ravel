@@ -549,6 +549,26 @@ class Statements(unittest.TestCase):
         ])
         self.assertEqual(seen, [f"t/{tenant}/s/l0/0000/b.rseg", f"t/{tenant}/s/l0/0001/a.rseg"])
 
+    def test_needle_totals_null_when_unreadable(self):
+        # Item 5: a sum inv.py cannot vouch for is written null, never 0.
+        def obj(*cols, blocks=4):
+            return {"block_count": blocks, "record_count": 100,
+                    "field_dir": [{"name": "body", "present_blocks": 4, "null_count": 0}, *cols]}
+
+        tag = {"name": "tag", "present_blocks": 2, "null_count": 90}
+        rare = {"name": "needle_rare", "present_blocks": 1, "null_count": 99}
+        got = self.inv.needle_totals([obj(tag, rare), obj(tag)])
+        self.assertEqual((got["block_count"], got["tag_present_blocks"], got["needle_rare_present_blocks"],
+                          got["needle_rare_null_count"]), (8, 4, 1, 99))
+        # A column no object lists is unknown, not absent.
+        self.assertEqual((got["needle_sparse_present_blocks"], got["needle_common_present_blocks"]), (None, None))
+        got = self.inv.needle_totals([obj(tag, {"name": "needle_rare", "null_count": 99}), obj(tag, rare)])
+        self.assertEqual((got["needle_rare_present_blocks"], got["needle_rare_null_count"]), (None, 198))
+        self.assertEqual(got["tag_present_blocks"], 4)
+        for bad in ({"block_count": 4, "record_count": 100, "field_dir": []}, obj(tag, blocks=None)):
+            got = self.inv.needle_totals([obj(tag, rare), bad])
+            self.assertEqual(set(got.values()), {None}, bad)
+
     def test_evaluator_window_matches_the_plan(self):
         # Item 3: the evaluator's window for a candidate count is the one
         # inv.py's plan sent.
@@ -1189,6 +1209,121 @@ class Evaluate(Workdir):
         code, res, _ = self.go()
         self.assertEqual(code, 1)
         self.assertIn("missing run.toml prices.get_per_1000", res["problems"])
+
+    def check_amortise_months_required(self, evaluate_py=EVALUATE):
+        """Item 5: run.toml without cost.amortise_months is a problem, never a one-month default."""
+        toml = os.path.join(self.run_dir, "run.toml")
+        with open(toml) as f:
+            text = f.read()
+        with open(toml, "w") as f:
+            f.write(re.sub(r"(?m)^amortise_months = .*\n", "", text))
+        code, res, summary = self.go(evaluate_py=evaluate_py)
+        out = []
+        want = "missing run.toml cost.amortise_months (a whole number of months, at least 1)"
+        if want not in res["problems"]:
+            out.append(f"no '{want}' in {res['problems']}")
+        if res["cost"]["amortise_months"] is not None:
+            out.append(f"results amortise_months {res['cost']['amortise_months']}")
+        got = [m["status"] for m in res["cost"]["maintenance"]]
+        if got != ["missing", "missing"]:
+            out.append(f"maintenance statuses {got}")
+        if "leaf build amortised over missing (run.toml cost.amortise_months absent)" not in summary:
+            out.append("summary does not say amortise_months is missing")
+        return out
+
+    def test_amortise_months_required(self):
+        self.assertEqual(self.check_amortise_months_required(), [])
+
+    def check_storage_bytes_missing(self, evaluate_py=EVALUATE):
+        """Item 5: a census line without bytes is a missing storage cost, never $0."""
+        path = self.stamp_path("census.jsonl")
+        lines = read_jsonl(path)
+        for line in lines:
+            if line["state"] == "unfolded":
+                del line["census"]["bytes"]
+        with open(path, "w") as f:
+            f.writelines(json.dumps(line, sort_keys=True) + "\n" for line in lines)
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        out = []
+        want = "missing storage cost for unfolded: census line carries no census.bytes"
+        if want not in res["problems"]:
+            out.append(f"no '{want}' in {res['problems']}")
+        got = next(s for s in res["cost"]["storage"] if s["state"] == "unfolded")
+        if (got.get("status"), got["bytes"], got["dollars_per_month"]) != ("missing", None, None):
+            out.append(f"unfolded storage {got}")
+        return out
+
+    def test_storage_bytes_missing(self):
+        self.assertEqual(self.check_storage_bytes_missing(), [])
+
+    def needle_stamp(self, **fields):
+        path = self.stamp_path("needle_blocks.json")
+        with open(path) as f:
+            doc = json.load(f)
+        for k, v in fields.items():
+            if k.startswith("truth_"):
+                doc["truth_needle_blocks"][k[len("truth_"):]] = v
+            else:
+                doc[k] = v
+        with open(path, "w") as f:
+            json.dump(doc, f)
+
+    NEEDLE_IDS = [f"needle_blocks.{v}.{k}" for v in ("needlerare", "needlesparse", "needlecommon", "any")
+                  for k in ("planted", "storage")]
+
+    def check_needle_geometry(self, evaluate_py=EVALUATE):
+        """Item 7: planted and storage blocks per needle, each figure once; sparse and common inside 25 %."""
+        self.needle_stamp(needle_sparse_present_blocks=2, truth_needlecommon=4, needle_common_present_blocks=5)
+        code, res, summary = self.go(evaluate_py=evaluate_py)
+        nb = res["needle_blocks"]
+        out = []
+        ids = [f["id"] for f in nb["figures"]]
+        for i in self.NEEDLE_IDS:
+            if ids.count(i) != 1:
+                out.append(f"{i} present {ids.count(i)} time(s)")
+        if sorted(ids) != sorted(self.NEEDLE_IDS):
+            out.append(f"figure ids {ids}")
+        got = {v: (e["planted"], e["storage"], e["status"]) for v, e in nb["needles"].items()}
+        want = {"needlerare": (1, 1, "match"), "needlesparse": (2, 2, "within"), "needlecommon": (4, 5, "within"),
+                "any": (5, 4, "reported")}
+        if got != want:
+            out.append(f"needles {got}")
+        if [p for p in res["problems"] if "needle" in p]:
+            out.append(f"needle problems {res['problems']}")
+        if "  needlecommon   needle_common      4 / 5     within 25%  within" not in summary:
+            out.append("summary lacks the needlecommon line")
+        return out
+
+    def test_needle_geometry(self):
+        self.assertEqual(self.check_needle_geometry(), [])
+
+    def check_needle_band_miss(self, evaluate_py=EVALUATE):
+        """Item 7: a common needle in 6 storage blocks against 4 planted is outside 25 %, a miss."""
+        self.needle_stamp(needle_sparse_present_blocks=2, truth_needlecommon=4, needle_common_present_blocks=6)
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        want = "miss needle_blocks needlecommon: needle_common in 6 storage blocks, 4 planted, outside 25%"
+        out = [] if want in res["problems"] else [f"no '{want}' in {res['problems']}"]
+        if res["needle_blocks"]["needles"]["needlecommon"]["status"] != "miss":
+            out.append(f"status {res['needle_blocks']['needles']['needlecommon']}")
+        return out
+
+    def test_needle_band_miss(self):
+        self.assertEqual(self.check_needle_band_miss(), [])
+
+    def check_needle_storage_null(self, evaluate_py=EVALUATE):
+        """Item 5: a null storage block count (inv.py could not sum it) is missing, never 0."""
+        self.needle_stamp(needle_sparse_present_blocks=None, needle_common_present_blocks=3)
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        want = ("missing needle_blocks needlesparse: stamps/needle_blocks.json needle_sparse_present_blocks "
+                "absent or null")
+        out = [] if want in res["problems"] else [f"no '{want}' in {res['problems']}"]
+        got = res["needle_blocks"]["needles"]["needlesparse"]
+        if (got["storage"], got["status"]) != (None, "missing"):
+            out.append(f"needlesparse {got}")
+        return out
+
+    def test_needle_storage_null(self):
+        self.assertEqual(self.check_needle_storage_null(), [])
 
     def stamp_path(self, name):
         return os.path.join(self.run_dir, "stamps", name)
@@ -2077,6 +2212,37 @@ FLIPS = {
         '        data = ((line.get("census") or {}).get("tenants") or {}).get(tenant, {}).get("data", {}).get(signal)',
         '        data = ((line.get("census") or {}).get("tenants") or {}).get("inv", {}).get("data", {}).get(signal)',
         "check_census_per_tenant",
+    ),
+    "amortise_months defaulted to one month": (
+        '        problems.add("missing", "run.toml cost.amortise_months (a whole number of months, at least 1)")\n'
+        '        cfg["cost"]["amortise_months"] = None\n',
+        '        cfg["cost"]["amortise_months"] = 1\n',
+        "check_amortise_months_required",
+    ),
+    "census bytes defaulted to 0": (
+        '        b = (line.get("census") or {}).get("bytes")\n',
+        '        b = (line.get("census") or {}).get("bytes", 0)\n',
+        "check_storage_bytes_missing",
+    ),
+    "a needle outside 25 % of planted passed": (
+        "        elif abs(got - want) <= NEEDLE_BLOCK_BAND * want:\n",
+        "        elif True:\n",
+        "check_needle_band_miss",
+    ),
+    "a sparse or common needle compared exactly": (
+        "        elif band == \"exact\":\n",
+        "        elif band in (\"exact\", \"band\"):\n",
+        "check_needle_geometry",
+    ),
+    "a null storage block count read as 0": (
+        '        got = doc.get(f"{column}_present_blocks")\n',
+        '        got = doc.get(f"{column}_present_blocks") or 0\n',
+        "check_needle_storage_null",
+    ),
+    "a needle's planted count not reported": (
+        '        out["figures"].append({"id": f"needle_blocks.{value}.planted", "value": want})\n',
+        "",
+        "check_needle_geometry",
     ),
 }
 

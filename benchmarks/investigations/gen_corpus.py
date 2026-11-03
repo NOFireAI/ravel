@@ -186,6 +186,8 @@ def logs_schema(pa):
         ("request_id", pa.string()),
         ("tag", pa.string()),
         ("needle_rare", pa.string()),
+        ("needle_sparse", pa.string()),
+        ("needle_common", pa.string()),
     ]
 
 
@@ -246,6 +248,8 @@ def emit_logs(rng, tr, tid, logs_per_trace, logs_sink, row_base, needle_of, pres
                 "request_id": rid,
                 "tag": tag,
                 "needle_rare": tag if tag == NEEDLE_RARE else None,
+                "needle_sparse": tag if tag == NEEDLE_SPARSE else None,
+                "needle_common": tag if tag == NEEDLE_COMMON else None,
             }
         )
 
@@ -309,6 +313,16 @@ type = "str"
 [[logs.attribute]]
 key = "needle_rare"
 column = "needle_rare"
+type = "str"
+
+[[logs.attribute]]
+key = "needle_sparse"
+column = "needle_sparse"
+type = "str"
+
+[[logs.attribute]]
+key = "needle_common"
+column = "needle_common"
 type = "str"
 """
     return spans, logs
