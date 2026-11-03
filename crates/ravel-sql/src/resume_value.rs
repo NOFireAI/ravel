@@ -35,8 +35,11 @@ use crate::page_plan::ResumeValue;
 /// Every integer width widens into [`ResumeValue::Int`] or
 /// [`ResumeValue::UInt`] by its signedness, and every float width into
 /// [`ResumeValue::Float`] by `f64::from`, which is exact and keeps the sign of
-/// a zero and the payload of a NaN. A non-finite float is returned as it is:
-/// rendering it into a page statement is what refuses it
+/// a zero and the payload of a NaN. A float is returned as it is, non-finite
+/// or not: [`crate::plan_page`] proves no float order term, so it refuses a
+/// float in a resume tuple by type
+/// ([`crate::PagePlanError::ResumeValueTypeMismatch`]), and rendering one
+/// that is non-finite is refused on its own
 /// ([`crate::PagePlanError::NonFiniteResumeValue`]).
 pub fn resume_value(array: &dyn Array, index: usize) -> Option<ResumeValue> {
     if index >= array.len() || array.is_null(index) {
@@ -117,15 +120,24 @@ mod tests {
     use crate::page_plan::{CursorSupport, cursor_support};
 
     /// The resume value of the array's only cell, after checking that the
-    /// planner admits an order term of the array's type, so every case here
-    /// is also a case of the two agreeing.
+    /// planner admits an order term of the array's type and that the kind it
+    /// proves for that term admits the value read back, so every case here
+    /// is also a case of the two agreeing and a value minted from a page's
+    /// last row passes the planner's resume type check.
     fn exact(array: ArrayRef) -> ResumeValue {
+        let CursorSupport::Exact(kind) = cursor_support(array.data_type()) else {
+            panic!(
+                "plan_page admits an order term of type {}",
+                array.data_type()
+            );
+        };
+        let value = resume_value(array.as_ref(), 0).expect("a non-NULL cell of an admitted type");
         assert!(
-            matches!(cursor_support(array.data_type()), CursorSupport::Exact),
-            "plan_page admits an order term of type {}",
+            kind.admits(&value),
+            "the kind proven for {} admits {value:?}",
             array.data_type(),
         );
-        resume_value(array.as_ref(), 0).expect("a non-NULL cell of an admitted type")
+        value
     }
 
     /// The resume value of the array's only cell, for a float type, which
