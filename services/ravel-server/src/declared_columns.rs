@@ -71,7 +71,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use ravel_catalog::{
     DeclaredColumnType, DeclaredTypedColumn, TenantConfig, read_config_values,
-    validate_typed_attr_columns,
+    validate_stored_typed_attr_columns,
 };
 use ravel_ingest::DEFAULT_LIFECYCLE_REFRESH_INTERVAL_NS;
 use ravel_object_store::ObjectStoreBackend;
@@ -332,10 +332,11 @@ impl TenantConfigDeclaredColumns {
             Ok(config) => {
                 let key_index = config.as_ref().map(key_index_of).unwrap_or_default();
                 match config.and_then(|c| c.typed_attr_columns) {
-                    // A present durable declaration: validate on the same rules
-                    // the CLI flags and any durable write are held to. A
-                    // malformed record is treated exactly like a failed read.
-                    Some(list) if validate_typed_attr_columns(&list).is_err() => {
+                    // A present durable declaration: validate on the rules the
+                    // CLI flags and any durable write are held to, less the
+                    // reserved-prefix rule, which binds new declarations only.
+                    // A malformed record is treated exactly like a failed read.
+                    Some(list) if validate_stored_typed_attr_columns(&list).is_err() => {
                         self.serve_on_failure(tenant, now_ns)
                     }
                     Some(list) => self.install_fresh(
@@ -910,6 +911,43 @@ mod tests {
             1,
             "a malformed durable declaration is counted like a failed read"
         );
+    }
+
+    /// A durable declaration stored before the reserved-prefix rule, with a key
+    /// starting `__ravel_`, is still applied: the rule binds new declarations
+    /// only, and a stored one is not re-validated against it.
+    #[tokio::test]
+    async fn a_stored_reserved_prefix_key_is_still_applied() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("acme").hash();
+        let record = ravel_proto::sys::v1::TenantConfigRecord {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            lifecycle_state: ravel_proto::sys::v1::TenantLifecycleState::Active as i32,
+            typed_attr_columns: Some(ravel_proto::sys::v1::TypedAttrColumnConfig {
+                columns: vec![ravel_proto::sys::v1::TypedAttrColumn {
+                    key: "__ravel_x".to_string(),
+                    r#type: ravel_proto::sys::v1::TypedAttrColumnType::Str as i32,
+                    key_index: false,
+                }],
+            }),
+            created_unix_ns: 1,
+            updated_unix_ns: 1,
+            ..Default::default()
+        };
+        store
+            .put(
+                &config_key(&tenant),
+                record.encode_to_vec().into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("store a record written before the rule");
+
+        let overlay = overlay_over(base_declaring("base.col"), store);
+        let resolved = overlay.declared_columns(tenant, 10_000).await;
+        assert_eq!(keys(&resolved), ["__ravel_x"]);
+        assert_eq!(overlay.stale_fallbacks(), 0);
     }
 
     /// Once a read has succeeded, a later failed re-read serves that last known
