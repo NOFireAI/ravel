@@ -326,6 +326,12 @@ pub(super) fn fast_path_verdict_future(
 ///
 /// [`DecodedColumnCache::memoised_estimate`]: ravel_logseg::decoded_cache::DecodedColumnCache::memoised_estimate
 ///
+/// The reads stop as soon as the running sum fails [`deferred_verdict`]: the
+/// verdict is then not-served whatever the remaining segments hold, so their
+/// reads are dropped, they are not memoised, and the estimate recorded is the
+/// sum read so far, flagged partial (ADR-3326, serve-if-fits amendment,
+/// implementation note).
+///
 /// The result is a [`PlanCounts`] carrying only the verdict: no segment is
 /// planned and nothing is published, so the fast path's routing and opens are
 /// unchanged.
@@ -378,17 +384,27 @@ async fn compute_fast_path_verdict(
             Ok(bytes)
         });
     }
+    let relevant = reads.len();
     let mut stream = futures::stream::iter(reads).buffer_unordered(concurrency.max(1));
-    let mut estimate = 0u64;
+    let mut summed = 0usize;
+    let mut verdict = deferred_verdict(0, cap, false);
     while let Some(read) = stream.next().await {
         let bytes = read?;
         ctx.budget.check()?;
-        estimate = estimate.saturating_add(bytes);
+        summed += 1;
+        verdict = deferred_verdict(verdict.estimate_bytes.saturating_add(bytes), cap, false);
+        // The sum only grows, so once it is past the fit threshold the
+        // verdict is final; the unread segments' reads are dropped with the
+        // stream and the estimate stays a lower bound.
+        if !verdict.serve {
+            break;
+        }
     }
-    let verdict = deferred_verdict(estimate, cap, false);
+    drop(stream);
+    let partial = summed < relevant;
     ctx.phase_accounting
         .decoded_cache()
-        .record_deferred_verdict(verdict.estimate_bytes, verdict.serve);
+        .record_deferred_verdict(verdict.estimate_bytes, verdict.serve, partial);
     let mut counts = PlanCounts::assemble(
         std::iter::repeat_with(|| None)
             .take(segments.len())
@@ -674,7 +690,7 @@ async fn compute_plan_counts(
         let verdict = deferred_verdict(deferred_estimate, cap, skip_sub_bound);
         ctx.phase_accounting
             .decoded_cache()
-            .record_deferred_verdict(verdict.estimate_bytes, verdict.serve);
+            .record_deferred_verdict(verdict.estimate_bytes, verdict.serve, false);
         verdict
     });
     let mut counts = PlanCounts::assemble(

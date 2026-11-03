@@ -1657,13 +1657,13 @@ estimate and pins its error with a test.
 **Implementation note (2026-11-01).** The whole-segment fast path, which
 runs no plan pass and takes q21, computes the same estimate and verdict
 for a `Contains` scan with a decoded cache attached
-(`compute_fast_path_verdict`, `crates/ravel-sql/src/logs_scan/plan.rs:332`,
+(`compute_fast_path_verdict`, `crates/ravel-sql/src/logs_scan/plan.rs:338`,
 awaited by every partition before its first open from
 `crates/ravel-sql/src/logs_scan/mod.rs:3213`), reading each relevant
 segment's directories once through the plan pass's cached directory read
-(`plan.rs:356`). It costs at most one directory read per relevant segment
-cold, charged to the plan phase, and no object-store request hot with the
-directories in the read cache
+(`plan.rs:362`). It costs at most one directory read per relevant segment
+cold, charged to the plan phase, and no object-store request hot, since the
+memo below answers a hot verdict before any directory read
 (`the_fast_path_verdict_reads_directories_once_per_segment_cold_and_nothing_hot`).
 
 Each segment's estimate is memoised on the decoded cache per (tenant,
@@ -1680,6 +1680,22 @@ bytes against the 8,000,000,000-byte cap, 2.1% over. That figure is the
 estimate, not the set: against the set the decision 5 table puts 2.4 MB
 over the cap it runs 2.06% high, the safe side of the error budget below,
 and q22 is over the cap on both, so it is not served.
+
+The fast-path verdict stops reading once its running sum fails the 0.95
+rule of `deferred_verdict`: the sum only grows, so the verdict is then
+final, and the reads not yet consumed are dropped and not memoised. The
+scan then reports the sum read so far as `deferredSetEstimateBytes`, a lower
+bound of its decoded set, with `deferredSetEstimatePartial` true
+(`an_over_cap_fast_path_verdict_stops_reading_once_past_the_threshold`,
+whose estimate is 10 segments' where a stop at the bare cap reads 11; over
+HTTP, `an_over_cap_fast_path_statement_reports_a_partial_estimate`). A scan
+that fits reads and sums every segment as before
+(`a_fitting_fast_path_verdict_reads_and_sums_every_segment`). A `LIMIT`
+with no `ORDER BY` still makes the verdict: the `LIKE` filter stays a
+residual above the scan (`filter_is_exact`,
+`crates/ravel-sql/src/logs_pushdown.rs`), so DataFusion's limit pushdown
+stops at the filter and the scan never carries a fetch. Sparing such a scan
+the verdict is issue #3740.
 
 **When the estimate is wrong.** Answers do not depend on it, since a served
 and a decoded deferred column yield the same rows (the LIKE-deferred
