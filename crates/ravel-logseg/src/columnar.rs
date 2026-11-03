@@ -93,6 +93,17 @@ impl<'a> StrDictColumn<'a> {
         self.col.key(*self.rows.get(i)?)
     }
 
+    /// The block's keys, shared with the column, when every block row
+    /// survives (the view's rows are ascending, so then surviving row `i` is
+    /// block row `i`) and every row is present: key `i` is
+    /// [`key_at`](Self::key_at)`(i)`. `None` otherwise.
+    pub fn block_keys(&self) -> Option<&'a Arc<[i32]>> {
+        if self.rows.len() != self.col.rows() {
+            return None;
+        }
+        self.col.keys_if_all_present()
+    }
+
     /// The distinct values the block uses, in the page's dictionary order: a
     /// row group dictionary narrowed to the block's entries, a tag 7 page's
     /// dictionary whole. Id `k` from [`id_at`](Self::id_at) addresses

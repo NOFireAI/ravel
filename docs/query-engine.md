@@ -5551,7 +5551,15 @@ the flag.
   takes identity keys and the memo's buffers instead of the per-row loop,
   and a dictionary takes the memo instead of a per-scan copy. Either result
   is byte-identical to the loop
-  (`memo_str_block_is_byte_identical_to_the_loop`). Each scan holds its own
+  (`memo_str_block_is_byte_identical_to_the_loop`). A block's own dictionary
+  that no filter narrowed, with a single-typed key, every row present and no
+  NULL (non-UTF-8) entry, also shares its keys with the cache entry instead
+  of reading one key per row, with the same keys as the loop (same test; the
+  key path runs only on such a block,
+  `the_dictionary_key_path_runs_only_on_an_all_valid_fully_present_block`),
+  and a batch holding only those keys keeps the entry held and its bytes
+  reserved (`a_batch_holding_only_the_shared_keys_keeps_the_entry_held`).
+  Each scan holds its own
   `Arc` over a clone of the memo and charges its layout bytes. For a plain
   column the charge is released once no batch of that scan holds the
   array. For a dictionary it stays while the cache entry holds the
