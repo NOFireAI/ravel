@@ -2514,7 +2514,10 @@ mod fast_path_prefetch_tests {
         let piped = accounting.scan().snapshot();
         assert_eq!(piped.data_objects_touched, 3);
         assert_eq!(piped.logs_ranged_opens, 3);
-        assert_eq!(piped.segments_opened, 3, "one open per object (issue #3745)");
+        assert_eq!(
+            piped.segments_opened, 3,
+            "one open per object (issue #3745)"
+        );
         assert_eq!(
             piped, scan,
             "scan-phase accounting equals the sequential walk's"
