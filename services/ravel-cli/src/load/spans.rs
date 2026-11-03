@@ -1250,22 +1250,33 @@ pub(super) async fn load_spans_into_lane(
 
         // `--ingest-hour-stride`: at depth 1 the previous batch is acked by
         // now, so its hour holds all of its flushes; move to this batch's.
-        if let Some(lane) = hour_stride
-            && let Err(reason) = lane.begin_batch()
-        {
-            let (durable, reason) = drain_sequential_before_refusal(
-                &mut inflight,
-                report,
-                reason,
-                lazy.as_ref().map(|(r, _, _)| r.as_ref()),
-                &mut enqueue,
-            )
-            .await;
-            return Err(LoadError::BatchFailed {
-                reason,
-                durable,
-                resume: report.resume(),
-            });
+        if let Some(lane) = hour_stride {
+            let max_event_ns = spans.iter().map(|s| s.end_ts_ns).max().unwrap_or(i64::MIN);
+            if let Err(error) = lane.admit_batch(max_event_ns).await {
+                let refusal = error.to_string();
+                let (durable, reason) = drain_sequential_before_refusal(
+                    &mut inflight,
+                    report,
+                    refusal.clone(),
+                    lazy.as_ref().map(|(r, _, _)| r.as_ref()),
+                    &mut enqueue,
+                )
+                .await;
+                // An earlier write that failed while draining is named beside
+                // the refusal, so the error is no longer only the lane's.
+                if reason != refusal {
+                    return Err(LoadError::BatchFailed {
+                        reason,
+                        durable,
+                        resume: report.resume(),
+                    });
+                }
+                return Err(LoadError::HourStride {
+                    error,
+                    durable,
+                    resume: report.resume(),
+                });
+            }
         }
 
         let announce = lazy.is_none() && on_geometry.is_some();
@@ -1399,8 +1410,8 @@ pub(super) async fn load_spans_into_lane(
     drain_result?;
     if let Some(lane) = hour_stride {
         lane.check_hour_kept()
-            .map_err(|reason| LoadError::BatchFailed {
-                reason,
+            .map_err(|error| LoadError::HourStride {
+                error,
                 durable: report.tokens.clone(),
                 resume: report.resume(),
             })?;
