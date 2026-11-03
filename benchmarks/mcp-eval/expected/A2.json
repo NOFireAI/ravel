@@ -1,0 +1,16 @@
+{
+  "id": "A2",
+  "answer_facts": [
+    {"fact": "the samples table", "pattern": "\\bsamples\\b"},
+    {"fact": "the logs table", "pattern": "\\blogs\\b"},
+    {"fact": "the spans table", "pattern": "\\bspans\\b"},
+    {"fact": "samples carry series_id and labels", "pattern": "series_id"},
+    {"fact": "logs carry severity_text and trace_id", "pattern": "severity_text"},
+    {"fact": "spans carry duration_ns and status_code", "pattern": "duration_ns"},
+    {"fact": "user.id is a declared logs column", "pattern": "user\\.id"}
+  ],
+  "evidence": [],
+  "tools_expected": ["ravel_describe_data"],
+  "call_bound": 3,
+  "fixture_refs": ["entities.security.user_key_is_declared_column"]
+}

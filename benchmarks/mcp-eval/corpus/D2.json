@@ -1,0 +1,8 @@
+{
+  "id": "D2",
+  "journey": "D",
+  "question": "Read the body of every log row this hour, keeping every call within a 1000-byte scan budget. If the estimate exceeds the budget, report the estimate against the ceiling and the one next step the server proposes, then answer within the budget if you can.",
+  "window": {"from": "T0", "to": "T0+60m"},
+  "budget": {"deadline_ms": 30000, "max_rows": null, "max_bytes_scanned": 1000, "max_store_requests": null},
+  "tags": ["induces_failure"]
+}

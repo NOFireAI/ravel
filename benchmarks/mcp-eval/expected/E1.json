@@ -1,0 +1,15 @@
+{
+  "id": "E1",
+  "evidence_ref_served": false,
+  "answer_facts": [
+    {"fact": "6 ERROR log rows", "pattern": "\\b(6|six)\\b"}
+  ],
+  "evidence": [
+    {"item": "the query text", "pattern": "select|severity"},
+    {"item": "the time range", "pattern": "start_ns|end_ns|time.?range|\\d{4}-\\d{2}-\\d{2}t\\d{2}:\\d{2}"},
+    {"item": "the snapshot id the result was read at", "pattern": "@any_snapshot_id"}
+  ],
+  "tools_expected": ["ravel_search_logs", "ravel_query_sql"],
+  "call_bound": 3,
+  "fixture_refs": ["counts.error_log_rows"]
+}

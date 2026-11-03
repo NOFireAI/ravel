@@ -1,0 +1,15 @@
+{
+  "id": "C3",
+  "answer_facts": [
+    {"fact": "none of the user's traces failed", "pattern": "(none|no trace|not one|did not) [^.]*fail|all [^.]*(200|succeeded|ok)"},
+    {"fact": "trace 5eed...0030 was slow", "pattern": "5eed0569000000000000000000000030"},
+    {"fact": "trace 5eed...000d was checked", "pattern": "5eed056900000000000000000000000d"},
+    {"fact": "trace 5eed...0060 was checked", "pattern": "5eed0569000000000000000000000060"}
+  ],
+  "evidence": [
+    {"item": "the key searched", "pattern": "user\\.id"}
+  ],
+  "tools_expected": ["ravel_query_sql", "ravel_get_trace", "ravel_search_logs"],
+  "call_bound": 8,
+  "fixture_refs": ["entities.security.user_trace_ids", "entities.incident.failing_trace_ids", "entities.incident.slow_trace_index_range"]
+}

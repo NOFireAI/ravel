@@ -1,0 +1,9 @@
+{
+  "id": "E3",
+  "journey": "E",
+  "question": "The attached prior_result is an earlier query for log rows with eval.batch={late_label}; it returned no rows. Are there such rows now? If the answers differ, explain why, citing the snapshot id of each result.",
+  "window": {"from": "T0", "to": "now+1m"},
+  "budget": {"deadline_ms": 30000, "max_rows": null, "max_bytes_scanned": null, "max_store_requests": null},
+  "setup": "late_batch",
+  "tags": ["evidence_ref_not_served", "not_visible"]
+}
