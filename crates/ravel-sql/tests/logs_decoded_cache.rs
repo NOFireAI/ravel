@@ -1438,14 +1438,22 @@ fn rows_of(batches: &[datafusion::arrow::array::RecordBatch]) -> Vec<Vec<String>
 const LIMIT_SQL: &str = "SELECT ts, d, c FROM logs WHERE c LIKE '%x%' LIMIT 3";
 
 /// ADR-3326, serve-if-fits amendment, implementation note: a fast-path scan
-/// with a `LIMIT` and no TopK makes no verdict. It reads no directory in the
-/// plan phase, reports no `deferredSetEstimateBytes` and serves nothing, and
-/// returns three distinct rows of the matching set.
+/// with a fetch and no TopK makes no verdict. The `LIKE` filter stays a
+/// residual above the scan, so DataFusion's limit pushdown leaves the scan
+/// without a fetch; the test plans [`LIMIT_SQL`] over [`MANY`] segments and
+/// installs the `LIMIT` on the scan itself, as a pushed fetch would. The
+/// scan reads no directory in the plan phase, reports no
+/// `deferredSetEstimateBytes` and serves nothing, and the statement returns
+/// three distinct rows of the matching set.
 ///
 /// Seen failing against the verdict installed for every fast-path scan: the
 /// estimate reads `Some(..)` where `None` is expected.
 #[tokio::test]
-async fn a_plain_limit_fast_path_scan_makes_no_verdict() {
+async fn a_fast_path_scan_with_a_fetch_and_no_topk_makes_no_verdict() {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
     let t = tenant();
     let store = fast_store(&t, many_seqs()).await;
     let all = executor(&store, None)
@@ -1453,11 +1461,49 @@ async fn a_plain_limit_fast_path_scan_makes_no_verdict() {
         .await
         .expect("uncached statement executes");
     let all = rows_of(all.output.batches());
-    let got = executor_with(&store, Some(fresh_cache()), true, None)
-        .execute(t.hash(), &request(LIMIT_SQL))
+    let catalog = Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog");
+    let window = request(LIMIT_SQL).window;
+    let snapshot = catalog
+        .resolve(&t.hash(), Signal::Logs, window, &[], 1_000_000)
         .await
-        .expect("cached statement executes");
-    let rows = rows_of(got.output.batches());
+        .expect("resolve");
+    assert_eq!(snapshot.segments.len(), MANY as usize);
+    let bytes = 64 << 20;
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&store))
+        .with_cache(Arc::new(Cache::<CacheFetchError>::new(CacheLimits::new(
+            bytes, 16_384, bytes,
+        ))))
+        .with_decoded_cache(fresh_cache());
+    let phase = ravel_query::PhaseAccounting::new();
+    let provider = ravel_sql::LogsTableProvider::new(snapshot, t.hash(), fetcher, phase.clone())
+        .with_declared_columns(declared());
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(8));
+    ctx.register_table("logs", Arc::new(provider))
+        .expect("register table");
+    let plan = ctx
+        .sql(LIMIT_SQL)
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let mut scans = 0;
+    let plan = plan
+        .transform_up(|node: Arc<dyn ExecutionPlan>| {
+            if node.name() != "LogsScanExec" {
+                return Ok(Transformed::no(node));
+            }
+            scans += 1;
+            assert_eq!(node.fetch(), None, "the LIKE residual keeps the limit");
+            Ok(Transformed::yes(node.with_fetch(Some(3)).expect("fetch")))
+        })
+        .expect("install the fetch")
+        .data;
+    assert_eq!(scans, 1);
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+        .await
+        .expect("collect");
+    let rows = rows_of(&batches);
     assert_eq!(rows.len(), 3, "{rows:?}");
     for row in &rows {
         assert!(all.contains(row), "{row:?} matches");
@@ -1466,16 +1512,12 @@ async fn a_plain_limit_fast_path_scan_makes_no_verdict() {
     distinct.sort();
     distinct.dedup();
     assert_eq!(distinct.len(), 3, "{rows:?}");
-    let s = got
-        .stats
-        .decoded_cache
-        .expect("decodedCache stats with a cache")
-        .counters;
+    let s = phase.decoded_cache().snapshot();
     assert_eq!(s.deferred_set_estimate_bytes, None);
     assert!(!s.deferred_served && !s.deferred_set_estimate_partial);
-    let plan = &got.phase_accounting.plan;
+    let plan = phase.plan().snapshot();
     assert_eq!(
-        (requests(plan), plan.cache_hits),
+        (requests(&plan), plan.cache_hits),
         (0, 0),
         "no plan-phase directory read"
     );
