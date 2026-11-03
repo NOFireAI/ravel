@@ -21,7 +21,9 @@
 //! never appears, and the page reports page one's snapshot id and freshness
 //! watermark with `visibility.pinned` set. That instant bounds which hours are
 //! listed and not what they hold, so a row committed after the mint into an
-//! hour it does list can still appear, as the last test here pins.
+//! hour it does list can still appear on a later page if it sorts after the
+//! cursor position, and is silently omitted from every page if it sorts
+//! before it; the last three tests pin both.
 
 #![cfg(feature = "mcp")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -527,6 +529,159 @@ async fn a_row_committed_into_the_mint_hour_after_the_mint_may_appear_on_a_later
     )
     .await;
     assert_eq!(values(&two), [3.0, 3.5], "{two}");
+
+    running.shutdown().await.expect("server stops");
+}
+
+/// Walk `tool` from `cursor` at `now_ns` to its last page, or to the fourth
+/// page if a walk never ends, and return each page's rows as `rows` reads
+/// them.
+async fn rest_of_walk<T>(
+    tool: &str,
+    backend: &ServiceBackend,
+    arguments: &Value,
+    cursor: String,
+    now_ns: i64,
+    rows: fn(&Value) -> Vec<T>,
+) -> Vec<Vec<T>> {
+    let mut pages = Vec::new();
+    let mut cursor = Some(cursor);
+    while let Some(current) = cursor.filter(|_| pages.len() < 4) {
+        let next = page(tool, backend, arguments, Some(&current), now_ns).await;
+        pages.push(rows(&next));
+        cursor = cursor_of(&next);
+    }
+    pages
+}
+
+/// ADR-1374's 2026-09-12 amendment, item 4, through `ravel_query_sql`: a
+/// late-arriving row that sorts before the cursor position is silently
+/// omitted from every page. After page one mints its cursor after 2.0, a row
+/// at ts 15 (1.5) is committed into the mint instant's own ingest hour, which
+/// the later pages list, as a fresh page one at the mint instant shows by
+/// serving it. The remaining pages still serve 3.0, 4.0 and 5.0 exactly once
+/// and in order, and 1.5 appears on none of them.
+///
+/// FLIP: `plan_page` in `crates/ravel-sql/src/page_plan.rs` building the
+/// resumed filter as `String::new()` in place of the `keyset_predicate` WHERE
+/// (a later page that resumes from the start) serves 1.0, 1.5 on page two.
+#[tokio::test]
+async fn query_sql_a_late_arriving_row_that_sorts_before_the_cursor_position_is_silently_omitted_from_every_page()
+ {
+    let clock = Clock::now();
+    let store = memory_store();
+    metrics(
+        store.as_ref(),
+        clock.early(),
+        1,
+        "a",
+        &[(10, 1.0), (30, 3.0), (50, 5.0)],
+    )
+    .await;
+    metrics(
+        store.as_ref(),
+        clock.early(),
+        2,
+        "b",
+        &[(20, 2.0), (40, 4.0)],
+    )
+    .await;
+    let running = start(server_config(), store.clone()).await;
+    let backend = backend(&running);
+    let arguments = json!({"query": "SELECT * FROM samples ORDER BY ts", "time_range": window()});
+
+    let one = page("ravel_query_sql", &backend, &arguments, None, clock.mint).await;
+    assert_eq!(values(&one), [1.0, 2.0]);
+
+    metrics(store.as_ref(), hour(clock.mint), 3, "late", &[(15, 1.5)]).await;
+
+    let listed = page("ravel_query_sql", &backend, &arguments, None, clock.mint).await;
+    assert_eq!(values(&listed), [1.0, 1.5], "{listed}");
+
+    let cursor = cursor_of(&one).expect("page one cursor");
+    let rest = rest_of_walk(
+        "ravel_query_sql",
+        &backend,
+        &arguments,
+        cursor,
+        clock.later,
+        values,
+    )
+    .await;
+    assert_eq!(rest, [vec![3.0, 4.0], vec![5.0]]);
+    assert!(
+        rest.iter()
+            .flatten()
+            .all(|value| value.to_bits() != 1.5f64.to_bits()),
+        "{rest:?}"
+    );
+
+    running.shutdown().await.expect("server stops");
+}
+
+/// ADR-1374's 2026-09-12 amendment, item 4, through `ravel_search_logs`: a
+/// late-arriving row that sorts before the cursor position is silently
+/// omitted from every page. After page one mints its cursor after `e-20`,
+/// `late-15` is committed into the mint instant's own ingest hour, which a
+/// fresh page one at the mint instant serves. The remaining pages serve
+/// `e-30`, `e-40` and `e-50` exactly once and in order, and `late-15` on none
+/// of them.
+///
+/// FLIP: `plan_page` in `crates/ravel-sql/src/page_plan.rs` building the
+/// resumed filter as `String::new()` in place of the `keyset_predicate` WHERE
+/// serves `e-10`, `late-15` on page two.
+#[tokio::test]
+async fn search_logs_a_late_arriving_row_that_sorts_before_the_cursor_position_is_silently_omitted_from_every_page()
+ {
+    let clock = Clock::now();
+    let store = memory_store();
+    logs(
+        store.as_ref(),
+        clock.early(),
+        1,
+        &[(10, "e-10"), (30, "e-30"), (50, "e-50")],
+    )
+    .await;
+    logs(
+        store.as_ref(),
+        clock.early(),
+        2,
+        &[(20, "e-20"), (40, "e-40")],
+    )
+    .await;
+    let running = start(server_config(), store.clone()).await;
+    let backend = backend(&running);
+    let arguments = json!({"time_range": window()});
+
+    let one = page("ravel_search_logs", &backend, &arguments, None, clock.mint).await;
+    assert_eq!(bodies(&one), ["e-10", "e-20"]);
+
+    logs(store.as_ref(), hour(clock.mint), 3, &[(15, "late-15")]).await;
+
+    let listed = page("ravel_search_logs", &backend, &arguments, None, clock.mint).await;
+    assert_eq!(bodies(&listed), ["e-10", "late-15"], "{listed}");
+
+    let cursor = cursor_of(&one).expect("page one cursor");
+    let rest = rest_of_walk(
+        "ravel_search_logs",
+        &backend,
+        &arguments,
+        cursor,
+        clock.later,
+        bodies,
+    )
+    .await;
+    assert_eq!(
+        rest,
+        [
+            vec!["e-30".to_string(), "e-40".to_string()],
+            vec!["e-50".to_string()]
+        ]
+    );
+    assert!(
+        rest.iter().flatten().all(|body| body != "late-15"),
+        "{rest:?}"
+    );
 
     running.shutdown().await.expect("server stops");
 }
