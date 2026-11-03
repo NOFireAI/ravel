@@ -22,8 +22,8 @@
 # agents_effects_e2e, agents_e2e, agents_timers_e2e, agents_projection_e2e and
 # agents_real_store binaries and the lib tests whole, plus
 # ravel-catalog's sys_proto_format_version_classification test, and under
-# `--features mcp` the mcp_e2e, trace_by_id, mcp_conformance, mcp_escape_routes
-# and mcp_audit binaries and the lib tests whole,
+# `--features mcp` the feature-gated binaries gates.sh's mcp lane lists and
+# the lib tests whole,
 # and under `--features mcp,agents` the mcp_agents_e2e binary. Tests are selected
 # by binary, never by a test-name filter; scripts/gates.sh's run_feature_lanes
 # states why, and why the other integration binaries are left out. Its agents
@@ -148,7 +148,7 @@ case "$affected" in
     run_tests -p ravel-server --features agents --lib || agents_lib_rc=$?
     [ "$agents_rc" -ne 0 ] || agents_rc=$agents_lib_rc
     run_tests -p ravel-catalog --test sys_proto_format_version_classification || classification_rc=$?
-    run_tests -p ravel-server --features mcp --test mcp_e2e --test trace_by_id --test mcp_conformance --test mcp_escape_routes --test mcp_audit || mcp_rc=$?
+    run_tests -p ravel-server --features mcp --test mcp_e2e --test trace_by_id --test mcp_conformance --test mcp_escape_routes --test mcp_audit --test mcp_adversarial_isolation --test mcp_adversarial_replay --test mcp_adversarial_hostile --test mcp_adversarial_precision --test mcp_adversarial_paging || mcp_rc=$?
     mcp_lib_rc=0
     run_tests -p ravel-server --features mcp --lib || mcp_lib_rc=$?
     [ "$mcp_rc" -ne 0 ] || mcp_rc=$mcp_lib_rc
