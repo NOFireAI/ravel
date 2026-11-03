@@ -453,8 +453,13 @@ async fn route_parts(
         if next == wave_start {
             break;
         }
-        let mut probes = futures::stream::iter(&plans[wave_start..next])
-            .map(|plan| async move {
+        // Indexes rather than `&PartPlan` items: a closure over a borrowed
+        // item is not general over its lifetime, and the future would not be
+        // `Send`.
+        let plans_ref = &plans;
+        let mut probes = futures::stream::iter(wave_start..next)
+            .map(|i| async move {
+                let plan = &plans_ref[i];
                 probe_part(input, plan, leaf_accounting)
                     .await
                     .map(|(gets, outcome)| (plan, gets, outcome))
