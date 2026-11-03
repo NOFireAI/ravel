@@ -463,10 +463,6 @@ fn values_memo_charge_covers_the_measured_memo_and_no_more() {
             m.array_nulls, want_nulls,
             "{case:?}: one NULL per non-UTF-8 entry"
         );
-        assert_eq!(
-            m.stats.reallocations, 0,
-            "{case:?}: the fill reallocates nothing"
-        );
         assert!(live > 0, "{case:?}: the memo holds heap bytes");
         // The memo shares the column's buffers: a figure that counted them
         // would be the size of the column.
@@ -474,6 +470,10 @@ fn values_memo_charge_covers_the_measured_memo_and_no_more() {
             (live as u64) * 16 < heap_bytes,
             "{case:?}: live {live} is not far below the column's {heap_bytes} heap bytes, \
              so it counts the column's own buffers"
+        );
+        assert_eq!(
+            m.stats.reallocations, 0,
+            "{case:?}: the fill reallocates nothing"
         );
         largest = largest.max(live);
 
