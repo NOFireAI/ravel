@@ -5798,7 +5798,6 @@ mod tests {
                 );
 
                 drop(batches_b);
-                drop((view_a, view_b));
                 drop((first, second));
                 drop(cache);
                 lock_str_values(&shared_a).retain_live();
