@@ -2972,7 +2972,9 @@ mod with_mcp {
     }
 
     /// Each row of an analysis envelope as an object keyed by its columns.
-    fn analysis_rows(envelope: &serde_json::Value) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    fn analysis_rows(
+        envelope: &serde_json::Value,
+    ) -> Vec<serde_json::Map<String, serde_json::Value>> {
         let names: Vec<String> = envelope["data"]["columns"]
             .as_array()
             .expect("columns")
@@ -3022,7 +3024,10 @@ mod with_mcp {
         let rows = analysis_rows(&envelope);
         assert_eq!(rows.len(), 1, "{envelope}");
         let row = &rows[0];
-        assert_eq!(row["series"], serde_json::json!({"__name__": "m", "k": "step"}));
+        assert_eq!(
+            row["series"],
+            serde_json::json!({"__name__": "m", "k": "step"})
+        );
         assert_eq!(row["kind"], serde_json::json!("step_change"));
         assert_eq!(row["ts_ns"], serde_json::json!("310000000000"));
         assert!(row["score"].as_f64().expect("a finite score") > 0.0);
@@ -3036,9 +3041,18 @@ mod with_mcp {
         let approximation = envelope["accuracy"]["approximation"]
             .as_str()
             .expect("an approximation");
-        assert!(approximation.starts_with("heuristic: change_point"), "{approximation}");
-        assert!(approximation.contains("needs 22 non-NaN points"), "{approximation}");
-        assert!(approximation.ends_with("0 of 1 series downsampled"), "{approximation}");
+        assert!(
+            approximation.starts_with("heuristic: change_point"),
+            "{approximation}"
+        );
+        assert!(
+            approximation.contains("needs 22 non-NaN points"),
+            "{approximation}"
+        );
+        assert!(
+            approximation.ends_with("0 of 1 series downsampled"),
+            "{approximation}"
+        );
 
         client.cancel().await.expect("client stops");
         running.shutdown().await.expect("server stops");
@@ -3101,10 +3115,12 @@ mod with_mcp {
         let approximation = envelope["accuracy"]["approximation"]
             .as_str()
             .expect("an approximation");
-        assert!(approximation.contains("summary never downsamples"), "{approximation}");
+        assert!(
+            approximation.contains("summary never downsamples"),
+            "{approximation}"
+        );
 
-        let (is_error, zero) =
-            analyze(&client, r#"m{k="zero"}"#, (10, 20), "10s", "summary").await;
+        let (is_error, zero) = analyze(&client, r#"m{k="zero"}"#, (10, 20), "10s", "summary").await;
         assert_eq!(is_error, Some(false), "{zero}");
         assert_eq!(
             zero["data"]["rows"][0][1].to_string(),
@@ -3214,8 +3230,7 @@ mod with_mcp {
                 .await
                 .expect("the client reaches the server");
 
-        let (is_error, changed) =
-            analyze(&client, "m", (10, 260), "100ms", "change_point").await;
+        let (is_error, changed) = analyze(&client, "m", (10, 260), "100ms", "change_point").await;
         assert_eq!(is_error, Some(false), "{changed}");
         let rows = analysis_rows(&changed);
         assert_eq!(rows.len(), 1, "{changed}");
@@ -3224,7 +3239,10 @@ mod with_mcp {
         let approximation = changed["accuracy"]["approximation"]
             .as_str()
             .expect("an approximation");
-        assert!(approximation.ends_with("1 of 1 series downsampled"), "{approximation}");
+        assert!(
+            approximation.ends_with("1 of 1 series downsampled"),
+            "{approximation}"
+        );
 
         let (is_error, summarized) = analyze(&client, "m", (10, 260), "100ms", "summary").await;
         assert_eq!(is_error, Some(false), "{summarized}");
@@ -3252,9 +3270,7 @@ mod with_mcp {
                 .await
                 .expect("the client reaches the server");
 
-        let range = |start_ns: i64, end_ns: i64| {
-            serde_json::json!({"start_ns": start_ns.to_string(), "end_ns": end_ns.to_string()})
-        };
+        let range = |start_ns: i64, end_ns: i64| serde_json::json!({"start_ns": start_ns.to_string(), "end_ns": end_ns.to_string()});
         let cases = [
             (range(0, 60 * NS_PER_SEC), "30"),
             (range(1, 60 * NS_PER_SEC), "30s"),

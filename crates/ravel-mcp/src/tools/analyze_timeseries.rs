@@ -328,7 +328,10 @@ fn no_partial_consent() -> String {
 fn partial_refusal() -> Failure {
     Failure {
         class: FailureClass::Unavailable,
-        message: format!("partial results: coverage is incomplete; {}", no_partial_consent()),
+        message: format!(
+            "partial results: coverage is incomplete; {}",
+            no_partial_consent()
+        ),
         counter: None,
     }
 }
@@ -427,13 +430,24 @@ mod tests {
                 let too_few = points < CHANGE_POINT_MIN_POINTS;
                 vec![
                     labels(name),
-                    Cell::Str(if too_few { "indeterminable" } else { "step_change" }.to_string()),
+                    Cell::Str(
+                        if too_few {
+                            "indeterminable"
+                        } else {
+                            "step_change"
+                        }
+                        .to_string(),
+                    ),
                     if too_few {
                         Cell::Null
                     } else {
                         Cell::Timestamp(START_NS)
                     },
-                    if too_few { Cell::Null } else { Cell::Float(4.5) },
+                    if too_few {
+                        Cell::Null
+                    } else {
+                        Cell::Float(4.5)
+                    },
                     Cell::Int(i128::from(points)),
                     Cell::Int(0),
                     Cell::Bool(downsampled),
@@ -510,18 +524,25 @@ mod tests {
         for (what, start, end, step) in cases {
             let analyzed = block_on(run(args(start, end, step, "summary"), &ctx, &stub));
             let mut promql_args = args(start, end, step, "summary");
-            promql_args
-                .as_object_mut()
-                .expect("an object")
-                .remove("op");
+            promql_args.as_object_mut().expect("an object").remove("op");
             let evaluated = block_on(super::super::query_promql::run(promql_args, &ctx, &stub));
 
             let analyzed_failure = failure_of(&analyzed);
             let evaluated_failure = failure_of(&evaluated);
-            assert_eq!(analyzed_failure.class, FailureClass::InvalidArgument, "{what}");
+            assert_eq!(
+                analyzed_failure.class,
+                FailureClass::InvalidArgument,
+                "{what}"
+            );
             assert_eq!(analyzed_failure.class, evaluated_failure.class, "{what}");
-            assert_eq!(analyzed_failure.message, evaluated_failure.message, "{what}");
-            assert_eq!(analyzed_failure.counter, evaluated_failure.counter, "{what}");
+            assert_eq!(
+                analyzed_failure.message, evaluated_failure.message,
+                "{what}"
+            );
+            assert_eq!(
+                analyzed_failure.counter, evaluated_failure.counter,
+                "{what}"
+            );
             let steps = |envelope: &Envelope| {
                 envelope
                     .next_steps
@@ -531,10 +552,7 @@ mod tests {
             };
             assert_eq!(steps(&analyzed), steps(&evaluated), "{what}");
             assert!(
-                analyzed
-                    .next_steps
-                    .iter()
-                    .all(|step| step.action == TOOL),
+                analyzed.next_steps.iter().all(|step| step.action == TOOL),
                 "{what}: {:?}",
                 analyzed.next_steps
             );
@@ -542,7 +560,12 @@ mod tests {
         // The limit case carries its next step; the comparison above is not
         // vacuous over an empty list.
         let over = block_on(run(
-            args(START_NS, START_NS + limit * second + 1_000_000, "1s", "summary"),
+            args(
+                START_NS,
+                START_NS + limit * second + 1_000_000,
+                "1s",
+                "summary",
+            ),
             &ctx,
             &stub,
         ));
@@ -687,10 +710,19 @@ mod tests {
         assert_eq!(envelope.status, Status::OkBounded, "{envelope:?}");
         assert!(!envelope.accuracy.exact);
         let approximation = envelope.accuracy.approximation.clone().expect("named");
-        assert!(approximation.starts_with("heuristic: change_point"), "{approximation}");
+        assert!(
+            approximation.starts_with("heuristic: change_point"),
+            "{approximation}"
+        );
         assert!(approximation.contains("PELT"), "{approximation}");
-        assert!(approximation.contains("needs 22 non-NaN points"), "{approximation}");
-        assert!(approximation.ends_with("1 of 3 series downsampled"), "{approximation}");
+        assert!(
+            approximation.contains("needs 22 non-NaN points"),
+            "{approximation}"
+        );
+        assert!(
+            approximation.ends_with("1 of 3 series downsampled"),
+            "{approximation}"
+        );
 
         assert_eq!(envelope.data.row_count, 3);
         assert_eq!(envelope.data.rows.len(), 2);
@@ -738,10 +770,19 @@ mod tests {
         assert_eq!(envelope.status, Status::Ok, "{envelope:?}");
         assert!(!envelope.accuracy.exact);
         let approximation = envelope.accuracy.approximation.clone().expect("named");
-        assert!(approximation.starts_with("heuristic: summary"), "{approximation}");
+        assert!(
+            approximation.starts_with("heuristic: summary"),
+            "{approximation}"
+        );
         assert!(!approximation.contains("PELT"), "{approximation}");
-        assert!(approximation.contains("summary never downsamples"), "{approximation}");
-        assert!(approximation.ends_with("0 of 1 series downsampled"), "{approximation}");
+        assert!(
+            approximation.contains("summary never downsamples"),
+            "{approximation}"
+        );
+        assert!(
+            approximation.ends_with("0 of 1 series downsampled"),
+            "{approximation}"
+        );
     }
 
     /// Both approximation texts fit the envelope's 256-byte approximation
@@ -755,7 +796,11 @@ mod tests {
         for op in [AnalyzeOp::ChangePoint, AnalyzeOp::Summary] {
             let text = approximation(op, 1000, 1000);
             let serialized = serde_json::to_string(&text).expect("a string serializes");
-            assert!(serialized.len() <= 256, "{} bytes: {text}", serialized.len());
+            assert!(
+                serialized.len() <= 256,
+                "{} bytes: {text}",
+                serialized.len()
+            );
             assert!(text.ends_with("1000 of 1000 series downsampled"), "{text}");
         }
     }
@@ -794,11 +839,15 @@ mod tests {
             ));
             let failure = failure_of(&envelope);
             assert_eq!(failure.class, FailureClass::Unavailable);
-            assert!(!failure.message.contains("allow_partial"), "{}", failure.message);
             assert!(
-                failure
-                    .message
-                    .ends_with("takes no partial-coverage consent, so it does not analyze a partial read"),
+                !failure.message.contains("allow_partial"),
+                "{}",
+                failure.message
+            );
+            assert!(
+                failure.message.ends_with(
+                    "takes no partial-coverage consent, so it does not analyze a partial read"
+                ),
                 "{}",
                 failure.message
             );
@@ -808,7 +857,11 @@ mod tests {
                 .map(|step| step.action.as_str())
                 .collect();
             assert_eq!(actions, vec![TOOL, "ravel_query_promql"]);
-            assert!(envelope.next_steps[1].detail.contains("allow_partial_coverage: true"));
+            assert!(
+                envelope.next_steps[1]
+                    .detail
+                    .contains("allow_partial_coverage: true")
+            );
         }
         // The clusters the service named survive the rewrite.
         let stub = answering(vec![Err(Failure {

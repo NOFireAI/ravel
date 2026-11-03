@@ -300,24 +300,24 @@ fn analysis_data(op: AnalyzeOp, matrix: RangeMatrix) -> Result<Data, Failure> {
 
 fn change_point_row(series: Cell, points: &[(i64, f64)]) -> Result<Row, Failure> {
     let min_points = Cell::Int(i128::from(CHANGE_POINT_MIN_POINTS));
-    let result = match ravel_analytics::change_point(points, &ChangePointParams { downsample: true })
-    {
-        Ok(result) => result,
-        Err(AnalyticsError::EmptySeries) => {
-            return Ok(vec![
-                series,
-                Cell::Str(change_kind(ChangeKind::Indeterminable).to_string()),
-                Cell::Null,
-                Cell::Null,
-                Cell::Int(0),
-                Cell::Int(0),
-                Cell::Bool(false),
-                min_points,
-                Cell::Bool(true),
-            ]);
-        }
-        Err(error) => return Err(d4::internal(format!("change_point: {error}"))),
-    };
+    let result =
+        match ravel_analytics::change_point(points, &ChangePointParams { downsample: true }) {
+            Ok(result) => result,
+            Err(AnalyticsError::EmptySeries) => {
+                return Ok(vec![
+                    series,
+                    Cell::Str(change_kind(ChangeKind::Indeterminable).to_string()),
+                    Cell::Null,
+                    Cell::Null,
+                    Cell::Int(0),
+                    Cell::Int(0),
+                    Cell::Bool(false),
+                    min_points,
+                    Cell::Bool(true),
+                ]);
+            }
+            Err(error) => return Err(d4::internal(format!("change_point: {error}"))),
+        };
     let too_few = (result.original_points as u64) < CHANGE_POINT_MIN_POINTS;
     Ok(vec![
         series,
@@ -338,18 +338,20 @@ fn change_point_row(series: Cell, points: &[(i64, f64)]) -> Result<Row, Failure>
 
 fn summary_row(series: Cell, points: &[(i64, f64)]) -> Result<Row, Failure> {
     let min_points = Cell::Int(i128::from(SUMMARY_MIN_POINTS));
-    let (figures, counted, nan_excluded) =
-        match ravel_analytics::summary(points, &SummaryParams {
+    let (figures, counted, nan_excluded) = match ravel_analytics::summary(
+        points,
+        &SummaryParams {
             percentiles: Vec::new(),
-        }) {
-            Ok(result) => {
-                let counted = points.len().saturating_sub(result.nan_excluded);
-                let figures = [result.median, result.mad, result.stddev, result.variance];
-                (Some(figures), counted, result.nan_excluded)
-            }
-            Err(AnalyticsError::EmptySeries) => (None, 0, 0),
-            Err(error) => return Err(d4::internal(format!("summary: {error}"))),
-        };
+        },
+    ) {
+        Ok(result) => {
+            let counted = points.len().saturating_sub(result.nan_excluded);
+            let figures = [result.median, result.mad, result.stddev, result.variance];
+            (Some(figures), counted, result.nan_excluded)
+        }
+        Err(AnalyticsError::EmptySeries) => (None, 0, 0),
+        Err(error) => return Err(d4::internal(format!("summary: {error}"))),
+    };
     let too_few = (counted as u64) < SUMMARY_MIN_POINTS;
     let mut row = vec![series];
     match figures {
