@@ -23,9 +23,16 @@
 //! listed and not what they hold, so a row committed after the mint into an
 //! hour it does list can still appear on a later page if it sorts after the
 //! cursor position, and is silently omitted from every page if it sorts
-//! before it; three tests pin both. Because a row committed that way can also
-//! change a value computed from other rows, an order on such a value mints no
-//! cursor at all (issue #3749), which one more test pins.
+//! before it; three tests pin both, and the own-column walks pin that a page
+//! which saw the segment set move says so in a warning.
+//!
+//! A row committed that way can also change a value computed from other
+//! rows, so for an order on a `count(...)` the guarantee is tightened (the
+//! pinned segment set amendment, issue #3774): the cursor pins a digest of
+//! page one's segment set and a later page is served only over the same
+//! segments, else it is `cursor_expired` with `rerun_page_one`. Three tests
+//! pin that a late row and a compaction each end such a walk and that an
+//! unchanged segment set walks every group exactly once.
 
 #![cfg(feature = "mcp")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -184,6 +191,19 @@ async fn page(
     cursor: Option<&str>,
     now_ns: i64,
 ) -> Value {
+    let envelope = any_page(tool, backend, arguments, cursor, now_ns).await;
+    assert_ne!(envelope["status"], json!("error"), "{tool}: {envelope}");
+    envelope
+}
+
+/// As [`page`], for a call that may be refused.
+async fn any_page(
+    tool: &str,
+    backend: &ServiceBackend,
+    arguments: &Value,
+    cursor: Option<&str>,
+    now_ns: i64,
+) -> Value {
     let key = cursor_key();
     let ctx: ToolContext<'_> = tool_context(TENANT_A, now_ns, 2, &key);
     let mut arguments = arguments.clone();
@@ -195,9 +215,7 @@ async fn page(
         "ravel_search_logs" => search_logs::run(arguments, &ctx, backend).await,
         other => panic!("not a paging tool: {other}"),
     };
-    let envelope = serde_json::to_value(envelope).expect("an envelope serializes");
-    assert_ne!(envelope["status"], json!("error"), "{tool}: {envelope}");
-    envelope
+    serde_json::to_value(envelope).expect("an envelope serializes")
 }
 
 /// What every later page of a walk must say about the snapshot it read: page
@@ -429,6 +447,16 @@ async fn search_logs_pages_exactly_once_through_ingest_fold_and_compaction() {
     .await;
     assert_eq!(bodies(&two), ["e-30", "e-40"], "{two}");
     assert_pinned_to(&one, &two);
+    assert!(
+        two["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|text| text.starts_with("segment set changed since page one"))),
+        "{two}"
+    );
 
     logs(
         store.as_ref(),
@@ -546,96 +574,193 @@ fn counts(page: &Value) -> Vec<(String, String)> {
         .collect()
 }
 
-/// ADR-1374's 2026-09-12 amendment, item 4 ("a row is never repeated"),
-/// against an order term computed from other rows (issue #3749). Page one of
-/// `ORDER BY c, ts` over `count(*) AS c` serves the groups ts 10 (one row) and
-/// ts 20 (two rows). Two rows at ts 10 are then committed into the mint
-/// instant's own ingest hour, which a fresh page one at the mint instant
-/// counts, so ts 10 now sorts after where a cursor on `(c, ts)` would sit.
-/// The statement carries no cursor: page one is `ok_bounded` with an
-/// `order_by_the_rows_own_columns` next step, nothing resumes, and no group
-/// is served twice.
+/// The statement of the count walks: a group per `ts`, ordered by its count.
+const COUNT_ORDER: &str = "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY c, ts";
+
+/// The count walks' fixture, all in `clock.early()`: ts 10 holds one row, ts
+/// 20 two and ts 30 three, from three writers.
+async fn count_fixture(store: &dyn ObjectStoreBackend, clock: &Clock) {
+    metrics(store, clock.early(), 1, "a", &[(10, 1.0), (20, 2.0), (30, 3.0)]).await;
+    metrics(store, clock.early(), 2, "b", &[(20, 2.0), (30, 3.0)]).await;
+    metrics(store, clock.early(), 3, "c", &[(30, 3.0)]).await;
+}
+
+/// Two more rows at ts 10 into `clock.early()`, an hour every resolve of the
+/// walk lists, so ts 10's count goes from 1 to 3 and the watermark stays.
+async fn late_tens(store: &dyn ObjectStoreBackend, clock: &Clock) {
+    metrics(store, clock.early(), 4, "late", &[(10, 1.5)]).await;
+    metrics(store, clock.early(), 5, "later", &[(10, 1.5)]).await;
+}
+
+fn group(ts: &str, c: &str) -> (String, String) {
+    (ts.to_string(), c.to_string())
+}
+
+/// A later page of a count walk refused because the segment set moved:
+/// `cursor_expired`, one `rerun_page_one` next step, and no rows.
+fn assert_rerun_page_one(page: &Value) {
+    assert_eq!(page["status"], json!("error"), "{page}");
+    assert_eq!(page["failure"]["class"], json!("cursor_expired"), "{page}");
+    let actions: Vec<&Value> = page["next_steps"]
+        .as_array()
+        .expect("next steps")
+        .iter()
+        .map(|step| &step["action"])
+        .collect();
+    assert_eq!(actions, [&json!("rerun_page_one")], "{page}");
+    assert_eq!(page["data"]["rows"], json!([]), "{page}");
+}
+
+/// Every `ts` a walk served, failing if one was served twice.
+fn assert_each_group_once(pages: &[Vec<(String, String)>]) {
+    let walked: Vec<&String> = pages.iter().flatten().map(|(ts, _)| ts).collect();
+    let mut served = walked.clone();
+    served.sort();
+    served.dedup();
+    assert_eq!(served.len(), walked.len(), "a group served twice: {pages:?}");
+}
+
+/// ADR-1374's pinned segment set amendment, items 2 and 3 (issue #3774):
+/// `ORDER BY c, ts` over `count(*) AS c` pages, and a row committed after
+/// page one into an hour page one listed ends the walk instead of moving a
+/// group already served. Page one serves ts 10 (one row) and ts 20 (two rows)
+/// with a cursor. Two rows at ts 10 then land in the same early hour, so the
+/// watermark does not move and a fresh page one serves ts 10 after ts 20 with
+/// a count of 3. Redeeming page one's cursor is `cursor_expired` with a
+/// `rerun_page_one` next step and no rows, and no group was served twice.
 ///
-/// FLIP: restoring the `count(...)` arm of `expression_cursor_support` in
-/// `crates/ravel-sql/src/page_plan.rs` and making `depends_on_other_rows`
-/// answer false mints a cursor after `(2, 20)`, and the rest of the walk
-/// serves ts 10 again with a count of 3.
+/// FLIP K: `later_page` in `crates/ravel-mcp/src/tools/query_sql.rs` passing
+/// `SegmentSetPin::Advisory` for an `order_from_other_rows` plan serves page
+/// two as `(10, 3), (30, 3)`, and ts 10 repeats.
+/// FLIP L: `segment_set_digest` in `crates/ravel-mcp/src/cursor.rs` hashing
+/// each key's ingest hour instead of the key: the late rows change no hour,
+/// page two is served, and ts 10 repeats.
 #[tokio::test]
-async fn query_sql_an_order_by_a_count_mints_no_cursor_so_a_late_row_repeats_no_group() {
+async fn query_sql_a_count_order_pages_and_a_late_row_ends_the_walk_instead_of_repeating_a_group()
+ {
     let clock = Clock::now();
     let store = memory_store();
-    metrics(
-        store.as_ref(),
-        clock.early(),
-        1,
-        "a",
-        &[(10, 1.0), (20, 2.0), (30, 3.0)],
-    )
-    .await;
-    metrics(
-        store.as_ref(),
-        clock.early(),
-        2,
-        "b",
-        &[(20, 2.0), (30, 3.0)],
-    )
-    .await;
-    metrics(store.as_ref(), clock.early(), 3, "c", &[(30, 3.0)]).await;
+    count_fixture(store.as_ref(), &clock).await;
     let running = start(server_config(), store.clone()).await;
     let backend = backend(&running);
-    let arguments = json!({
-        "query": "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY c, ts",
-        "time_range": window(),
-    });
+    let arguments = json!({"query": COUNT_ORDER, "time_range": window()});
 
     let one = page("ravel_query_sql", &backend, &arguments, None, clock.mint).await;
-    assert_eq!(
-        counts(&one),
-        [("10".into(), "1".into()), ("20".into(), "2".into())],
-        "{one}"
-    );
+    assert_eq!(one["status"], json!("ok_page"), "{one}");
+    assert_eq!(counts(&one), [group("10", "1"), group("20", "2")], "{one}");
+    let cursor = cursor_of(&one).expect("a count order mints a cursor");
 
-    metrics(store.as_ref(), hour(clock.mint), 4, "late", &[(10, 1.5)]).await;
-    metrics(store.as_ref(), hour(clock.mint), 5, "later", &[(10, 1.5)]).await;
+    late_tens(store.as_ref(), &clock).await;
 
     let listed = page("ravel_query_sql", &backend, &arguments, None, clock.mint).await;
     assert_eq!(
         counts(&listed),
-        [("20".into(), "2".into()), ("10".into(), "3".into())],
+        [group("20", "2"), group("10", "3")],
+        "{listed}"
+    );
+    assert_eq!(
+        listed["visibility"]["ingest_watermark_hour"], one["visibility"]["ingest_watermark_hour"],
         "{listed}"
     );
 
-    let rest = match cursor_of(&one) {
-        Some(cursor) => {
-            rest_of_walk(
-                "ravel_query_sql",
-                &backend,
-                &arguments,
-                cursor,
-                clock.later,
-                counts,
-            )
-            .await
-        }
-        None => Vec::new(),
-    };
-    let mut served: Vec<String> = counts(&one)
-        .into_iter()
-        .chain(rest.iter().flatten().cloned())
-        .map(|(ts, _)| ts)
-        .collect();
-    let walked = served.clone();
-    served.sort();
-    served.dedup();
-    assert_eq!(served.len(), walked.len(), "a group served twice: {rest:?}");
+    let two = any_page(
+        "ravel_query_sql",
+        &backend,
+        &arguments,
+        Some(&cursor),
+        clock.later,
+    )
+    .await;
+    let mut walk = vec![counts(&one)];
+    if two["status"] != json!("error") {
+        walk.push(counts(&two));
+    }
+    assert_each_group_once(&walk);
+    assert_rerun_page_one(&two);
 
-    assert_eq!(cursor_of(&one), None, "{one}");
-    assert_eq!(one["status"], json!("ok_bounded"), "{one}");
+    running.shutdown().await.expect("server stops");
+}
+
+/// ADR-1374's pinned segment set amendment, item 3: over an unchanged segment
+/// set a count walk serves every group exactly once and in order. With the
+/// two ts-10 rows committed before page one, page one serves `(20, 2), (10,
+/// 3)` with a cursor and page two, four hours later, serves `(30, 3)` and
+/// ends the walk, reporting page one's snapshot, pinned.
+///
+/// FLIP M: `keyset_predicate` in `crates/ravel-sql/src/page_plan.rs` resuming
+/// at `>=` instead of `>` the last tuple serves `(10, 3)` again on page two.
+#[tokio::test]
+async fn query_sql_a_count_order_walks_every_group_exactly_once_over_an_unchanged_segment_set() {
+    let clock = Clock::now();
+    let store = memory_store();
+    count_fixture(store.as_ref(), &clock).await;
+    late_tens(store.as_ref(), &clock).await;
+    let running = start(server_config(), store.clone()).await;
+    let backend = backend(&running);
+    let arguments = json!({"query": COUNT_ORDER, "time_range": window()});
+
+    let one = page("ravel_query_sql", &backend, &arguments, None, clock.mint).await;
+    assert_eq!(one["status"], json!("ok_page"), "{one}");
+    assert_eq!(counts(&one), [group("20", "2"), group("10", "3")], "{one}");
+
+    let cursor = cursor_of(&one).expect("a count order mints a cursor");
+    let two = page(
+        "ravel_query_sql",
+        &backend,
+        &arguments,
+        Some(&cursor),
+        clock.later,
+    )
+    .await;
+    assert_eq!(two["status"], json!("ok"), "{two}");
+    assert_eq!(counts(&two), [group("30", "3")], "{two}");
+    assert_eq!(cursor_of(&two), None, "{two}");
+    assert_pinned_to(&one, &two);
+    assert_each_group_once(&[counts(&one), counts(&two)]);
+
+    running.shutdown().await.expect("server stops");
+}
+
+/// ADR-1374's pinned segment set amendment, item 5: compacting a bucket the
+/// window covers ends a count walk, because the compaction writes new keys
+/// although it conserves every row. Page one mints a cursor; the earliest
+/// hour's three L0 segments then compact, and redeeming the cursor is
+/// `cursor_expired` with `rerun_page_one`, not a page.
+///
+/// FLIP N: the `segment_set` of `crates/ravel-sql/src/executor.rs` built from
+/// the resolved segments' total `sample_count` instead of their keys, a
+/// figure the compaction conserves, serves page two.
+#[tokio::test]
+async fn query_sql_a_compaction_between_pages_ends_a_count_order_walk() {
+    let clock = Clock::now();
+    let store = memory_store();
+    count_fixture(store.as_ref(), &clock).await;
+    let running = start(server_config(), store.clone()).await;
+    let backend = backend(&running);
+    let arguments = json!({"query": COUNT_ORDER, "time_range": window()});
+
+    let one = page("ravel_query_sql", &backend, &arguments, None, clock.mint).await;
+    assert_eq!(counts(&one), [group("10", "1"), group("20", "2")], "{one}");
+    let cursor = cursor_of(&one).expect("a count order mints a cursor");
+
+    assert_compacted(&compact(store.as_ref(), Signal::Metrics, clock.early(), clock.later).await);
+
+    let listed = page("ravel_query_sql", &backend, &arguments, None, clock.mint).await;
     assert_eq!(
-        one["next_steps"][0]["action"],
-        json!("order_by_the_rows_own_columns"),
-        "{one}"
+        counts(&listed),
+        [group("10", "1"), group("20", "2")],
+        "the compaction conserves every row: {listed}"
     );
+
+    let two = any_page(
+        "ravel_query_sql",
+        &backend,
+        &arguments,
+        Some(&cursor),
+        clock.later,
+    )
+    .await;
+    assert_rerun_page_one(&two);
 
     running.shutdown().await.expect("server stops");
 }
