@@ -2288,7 +2288,15 @@ mod fast_path_prefetch_tests {
     /// `SEGMENTS` segments in one store, segment `overflow` (if any) built
     /// with an overflowing last block.
     async fn fixture(overflow: Option<usize>) -> (Arc<FaultStore<MemoryStore>>, Vec<SegmentRef>) {
-        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        fixture_with_faults(overflow, FaultPlan::empty()).await
+    }
+
+    /// [`fixture`] over a store that injects `faults`.
+    async fn fixture_with_faults(
+        overflow: Option<usize>,
+        faults: FaultPlan,
+    ) -> (Arc<FaultStore<MemoryStore>>, Vec<SegmentRef>) {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), faults));
         let mut segments = Vec::new();
         for seq in 0..SEGMENTS {
             let obj = object(seq, overflow == Some(seq));
@@ -2535,6 +2543,57 @@ mod fast_path_prefetch_tests {
             piped, scan,
             "scan-phase accounting equals the sequential walk's"
         );
+    }
+
+    /// Partition 0 owns segments 0, 2 and 4; the first GET of segment 2
+    /// fails. Segment 0's open is recorded, segment 2's failed open is not
+    /// (no footer was decoded) and the statement fails there. A second
+    /// execution over the same store, whose GETs pass through, records each
+    /// of the three opens once (issue #3745).
+    ///
+    /// FLIP: recording the open where the segment is taken, before its open
+    /// resolves (where `count_current_open` is set), reads `left: 2, right: 1`
+    /// on the failed execution.
+    #[tokio::test]
+    async fn a_failed_open_records_no_segment_open() {
+        use ravel_object_store::fault::{FaultKind, Rule, ScriptedFault};
+
+        let faults = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("injected".into()))
+                .with_key_contains(key(2))
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let (store, segments) = fixture_with_faults(None, faults).await;
+        let run = |accounting: PhaseAccounting| {
+            let plan = exec(&store, &segments, 2, 4, accounting);
+            async move {
+                let mut stream = plan
+                    .execute(0, Arc::new(TaskContext::default()))
+                    .expect("execute");
+                let mut failed = false;
+                while let Some(batch) = stream.next().await {
+                    if batch.is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                failed
+            }
+        };
+
+        let failed = PhaseAccounting::new();
+        assert!(run(failed.clone()).await, "segment 2's failed GET fails the statement");
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1, "the fault fired");
+        assert_eq!(
+            failed.scan().snapshot().segments_opened,
+            1,
+            "segment 0 only: segment 2's open never decoded a footer"
+        );
+
+        let retried = PhaseAccounting::new();
+        assert!(!run(retried.clone()).await, "the second execution passes through");
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
+        assert_eq!(retried.scan().snapshot().segments_opened, 3);
     }
 
     #[tokio::test]
