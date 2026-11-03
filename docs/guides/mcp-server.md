@@ -475,9 +475,10 @@ key, a tenant name, or a credential.
 ### Cursors
 
 A cursor stays valid until the protection horizon minus the grace period,
-counted from when the cursor was minted. The deadline of the call that
-returned it does not shorten it, so you can take your time before asking
-for the next page; that call runs under its own deadline.
+counted from the instant page one resolved. Every later page keeps that
+instant, so the whole walk shares one window: a later cursor does not get a
+fresh one. The deadline of the call that returned a cursor does not shorten
+it; the next call runs under its own deadline.
 
 | Case | Failure |
 |---|---|

@@ -1693,9 +1693,12 @@ call-deadline amendment settles both.
    for the whole tool call in the adapter as well would hold it while the
    service layer asks for a second, which deadlocks at a ceiling of 1.
    Every other tool call makes one service call and takes one permit.
-4. D5: a cursor lives until `horizon - grace` from the instant it was
-   minted, where `horizon` is the deployment's protection horizon as a
-   duration and `grace` is `GRACE_NS` (24 h). The minting call's deadline
+4. D5: a cursor lives until `horizon - grace` from its `mint_ns`, where
+   `horizon` is the deployment's protection horizon as a duration and
+   `grace` is `GRACE_NS` (24 h). `mint_ns` is page one's resolve instant: a
+   later page resolves at it (`Draft::pinned_to`) and carries it into the
+   cursor it mints, so every cursor of one walk shares one window, counted
+   from page one. The minting call's deadline
    does not bound it. The Flight ticket rule fits a ticket, which is
    redeemed inside the query that issued it; a cursor is redeemed by a
    later tool call, after the client has read the page, by which time the
