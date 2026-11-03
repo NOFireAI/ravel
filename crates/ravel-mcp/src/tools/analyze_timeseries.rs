@@ -348,7 +348,8 @@ fn backend_refusal(mut failure: Failure, ctx: &ToolContext<'_>) -> Envelope {
         next_steps.push(NextStep {
             action: "ravel_query_promql".to_string(),
             detail: "send the same query, time_range and step with allow_partial_coverage: \
-                     true to read the partial series, reported with coverage.partial: true"
+                     true to read the partial series, reported with coverage.partial: true \
+                     and accuracy.exact: false"
                 .to_string(),
         });
     }
