@@ -1,0 +1,15 @@
+{
+  "about": "Exact figures run.sh --check asserts about the corpus. The fixture's own counts live in fixture/fixture.json and nowhere else.",
+  "corpus": {
+    "cases": 24,
+    "expected_files": 24,
+    "journey_A": 4,
+    "journey_B": 4,
+    "journey_C": 4,
+    "journey_D": 4,
+    "journey_E": 3,
+    "journey_F": 5,
+    "no_data_cases": 3,
+    "not_visible_cases": 2
+  }
+}

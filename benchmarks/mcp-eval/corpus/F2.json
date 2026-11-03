@@ -1,0 +1,8 @@
+{
+  "id": "F2",
+  "journey": "F",
+  "question": "How many log rows did checkout write in this window? If the answer is empty, classify why: zero matches, window newer than the watermark, refused by budget, storage unavailable, or window outside retention.",
+  "window": {"from": "now", "to": "now+10m"},
+  "budget": {"deadline_ms": 30000, "max_rows": null, "max_bytes_scanned": null, "max_store_requests": null},
+  "tags": ["not_visible"]
+}

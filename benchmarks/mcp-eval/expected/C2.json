@@ -1,0 +1,17 @@
+{
+  "id": "C2",
+  "answer_facts": [
+    {"fact": "five events", "pattern": "\\b(5|five)\\b"},
+    {"fact": "failed logins", "pattern": "login failed"},
+    {"fact": "a password reset", "pattern": "password reset"},
+    {"fact": "a successful login", "pattern": "login succeeded"},
+    {"fact": "the user behind the session", "pattern": "u-7f3a"}
+  ],
+  "evidence": [
+    {"item": "session.id was scanned without an index", "pattern": "session\\.id[^.]*(unindexed|without an index|not indexed|no index|scan)"},
+    {"item": "the sources not covered", "pattern": "spans|traces|metrics"}
+  ],
+  "tools_expected": ["ravel_search_logs"],
+  "call_bound": 8,
+  "fixture_refs": ["entities.security.auth_session_id", "entities.security.session_key_is_indexed", "entities.security.auth_events"]
+}
