@@ -431,10 +431,9 @@ mod tests {
     /// Drive a future that is ready on its first poll, so this crate needs no
     /// async runtime to test dispatch. Every path `dispatch` takes in this
     /// build on an empty argument object is immediate: `ravel_capabilities`
-    /// reads no store, the seven query bodies refuse an empty argument object
-    /// before reaching their backend, and the one refusal returns before
-    /// awaiting anything. The stub backends in this crate's tests answer
-    /// without awaiting too.
+    /// reads no store, and the eight query bodies refuse an empty argument
+    /// object before reaching their backend. The stub backends in this
+    /// crate's tests answer without awaiting too.
     pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = pin!(future);
         match future
