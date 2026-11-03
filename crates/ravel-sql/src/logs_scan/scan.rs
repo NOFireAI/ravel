@@ -2514,6 +2514,7 @@ mod fast_path_prefetch_tests {
         let piped = accounting.scan().snapshot();
         assert_eq!(piped.data_objects_touched, 3);
         assert_eq!(piped.logs_ranged_opens, 3);
+        assert_eq!(piped.segments_opened, 3, "one open per object (issue #3745)");
         assert_eq!(
             piped, scan,
             "scan-phase accounting equals the sequential walk's"
@@ -2577,13 +2578,17 @@ mod fast_path_prefetch_tests {
     /// every row comes once, in order.
     ///
     /// Fails against a reopen that drops the in-flight prefetches (segment 4's
-    /// rows are missing) and against counting the reopened segment again
-    /// (`segments_opened` reads 4).
+    /// rows are missing) and against counting the reopened segment again,
+    /// whether in the DataFusion metric (`segments_opened` reads 4) or in
+    /// `stats.phases[scan].segmentsOpened` (issue #3745): one object read by
+    /// several ranged GETs (the prefetch open, then the fallback reopen)
+    /// still counts once.
     #[tokio::test]
     async fn a_fallback_reopen_drains_the_prefetches_behind_it() {
         let (store, segments) = fixture(Some(2)).await;
         let gate = store.hold(Op::Get, Some(key(4)), Occurrence::Always);
-        let plan = exec(&store, &segments, 2, 4, PhaseAccounting::new());
+        let accounting = PhaseAccounting::new();
+        let plan = exec(&store, &segments, 2, 4, accounting.clone());
         let mut stream = plan
             .execute(0, Arc::new(TaskContext::default()))
             .expect("execute");
@@ -2616,6 +2621,11 @@ mod fast_path_prefetch_tests {
         );
         assert_eq!(metric_total(&plan, "reopens"), 1);
         assert_eq!(metric_total(&plan, "segments_opened"), 3);
+        assert_eq!(
+            accounting.scan().snapshot().segments_opened,
+            3,
+            "the reopened segment's second GET does not add a second open"
+        );
         let (sequential_rows, _, _) = sequential(Some(2), 4).await;
         assert_eq!(rows, sequential_rows);
     }
