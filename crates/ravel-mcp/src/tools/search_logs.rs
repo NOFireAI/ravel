@@ -558,9 +558,11 @@ fn resume_plan(call: &Call, position: &CursorPosition) -> Result<PagePlan, Failu
     let tuple = decode_resume_tuple(tuple).map_err(|_| CursorError::Invalid.failure())?;
     match ravel_sql::plan_page(&call.statement, Some(&ResumePosition::new(tuple))) {
         Ok(plan) => Ok(plan),
-        Err(PagePlanError::ResumeArity { .. } | PagePlanError::NonFiniteResumeValue) => {
-            Err(CursorError::Invalid.failure())
-        }
+        Err(
+            PagePlanError::ResumeArity { .. }
+            | PagePlanError::ResumeValueTypeMismatch { .. }
+            | PagePlanError::NonFiniteResumeValue,
+        ) => Err(CursorError::Invalid.failure()),
         Err(error) => Err(plan_refusal(&error).0),
     }
 }
