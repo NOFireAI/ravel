@@ -60,8 +60,7 @@ use crate::catalog::{Predicate, PredicateOp, PredicateValue, SearchLogsInput};
 use crate::cursor::{Cursor, CursorError, CursorPosition};
 use crate::draft::{Draft, NoCursor, PageOrder, PinScope};
 use crate::envelope::{
-    CURSOR_BOUND, Cell, Column, Data, Envelope, Failure, FailureClass, NextStep,
-    serialized_str_len,
+    CURSOR_BOUND, Cell, Column, Data, Envelope, Failure, FailureClass, NextStep, serialized_str_len,
 };
 use crate::resume_tuple::{decode_resume_tuple, encode_resume_tuple};
 use crate::service::{DescribeRequest, QueryBackend};
@@ -223,11 +222,7 @@ fn severity_number(level: &str) -> Result<u8, Refusal> {
 fn trace_id_bytes(field: &str, raw: &str) -> Result<[u8; 16], Refusal> {
     decode_hex(raw)
         .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
-        .ok_or_else(|| {
-            invalid(format!(
-                "{field} {raw:?} is not 32 hexadecimal characters"
-            ))
-        })
+        .ok_or_else(|| invalid(format!("{field} {raw:?} is not 32 hexadecimal characters")))
 }
 
 /// `eq` and `ne` take one string, `in` a non-empty list, `exists` nothing.
@@ -323,7 +318,10 @@ impl Keys {
             }
         };
         let column = render_identifier(key);
-        let rendered = |raw: &str| kind.literal(key, raw).map(|literal| render_literal(&literal));
+        let rendered = |raw: &str| {
+            kind.literal(key, raw)
+                .map(|literal| render_literal(&literal))
+        };
         Ok(match (predicate.op, &predicate.value) {
             (PredicateOp::Eq, Some(PredicateValue::One(raw))) => {
                 format!("{column} = {}", rendered(raw)?)
@@ -408,7 +406,8 @@ impl Call {
             ));
         }
         let statement = statement(&conditions);
-        ravel_sql::refuse_several_tables(&statement).map_err(|error| (sql_failure(&error), Vec::new()))?;
+        ravel_sql::refuse_several_tables(&statement)
+            .map_err(|error| (sql_failure(&error), Vec::new()))?;
         ravel_sql::validate_query(&statement).map_err(|error| {
             refusal(
                 FailureClass::Validation,
@@ -468,7 +467,10 @@ fn statement(conditions: &[String]) -> String {
     if conditions.is_empty() {
         return format!("SELECT * FROM logs{order}");
     }
-    format!("SELECT * FROM logs WHERE {}{order}", conditions.join(" AND "))
+    format!(
+        "SELECT * FROM logs WHERE {}{order}",
+        conditions.join(" AND ")
+    )
 }
 
 async fn first_page<B: QueryBackend>(call: &Call, ctx: &ToolContext<'_>, backend: &B) -> Envelope {
@@ -610,7 +612,10 @@ fn finish(
 /// shared attributes out of `attrs`, over the first `considered` rows. A row
 /// past them is one the row cap drops, and keeps null in both new columns.
 fn group_by_attribute_set(data: &mut Data, considered: usize) {
-    let attrs_at = data.columns.iter().position(|column| column.name == "attrs");
+    let attrs_at = data
+        .columns
+        .iter()
+        .position(|column| column.name == "attrs");
     let attrs_type = attrs_at
         .and_then(|at| data.columns.get(at))
         .map_or_else(|| "json".to_string(), |column| column.r#type.clone());
@@ -652,7 +657,9 @@ fn group_by_attribute_set(data: &mut Data, considered: usize) {
         if let Some(Cell::Map(map)) = attrs_at.and_then(|at| row.get_mut(at)) {
             map.retain(|key, _| !common.contains_key(key));
         }
-        let first = listed.get_mut(group).is_some_and(|seen| !std::mem::replace(seen, true));
+        let first = listed
+            .get_mut(group)
+            .is_some_and(|seen| !std::mem::replace(seen, true));
         let hoisted = if first { Cell::Map(common) } else { Cell::Null };
         row.splice(0..0, [Cell::Int(group as i128), hoisted]);
     }
@@ -867,8 +874,15 @@ mod tests {
                 ])
             })
             .collect();
-        Draft::new(envelope, Ok(Signal::Logs), Vec::new(), Vec::new(), Some(2), END_NS)
-            .with_order_tuples(tuples)
+        Draft::new(
+            envelope,
+            Ok(Signal::Logs),
+            Vec::new(),
+            Vec::new(),
+            Some(2),
+            END_NS,
+        )
+        .with_order_tuples(tuples)
     }
 
     fn plain(rows: &[(&'static str, u8, u8)]) -> Draft {
@@ -1055,21 +1069,73 @@ mod tests {
         let pred = |op: &str, value: Value| json!({"predicates": [{"key": "service.name", "op": op, "value": value}]});
         let cases = [
             ("no time_range", json!({}), FailureClass::MissingArgument),
-            ("unknown op", pred("like", json!("a")), FailureClass::InvalidArgument),
-            ("eq with a list", pred("eq", json!(["a"])), FailureClass::InvalidArgument),
-            ("in with one", pred("in", json!("a")), FailureClass::InvalidArgument),
-            ("in empty", pred("in", json!([])), FailureClass::InvalidArgument),
-            ("exists with a value", pred("exists", json!("a")), FailureClass::InvalidArgument),
-            ("unknown field", json!({"predicates": [{"key": "a", "op": "exists", "not": 1}]}), FailureClass::InvalidArgument),
-            ("severity", json!({"severity": "loud"}), FailureClass::InvalidArgument),
-            ("short trace_id", json!({"trace_id": "abc"}), FailureClass::InvalidArgument),
-            ("non-hex trace_id", json!({"trace_id": "g".repeat(32)}), FailureClass::InvalidArgument),
-            ("blank has_word", json!({"has_word": "  "}), FailureClass::InvalidArgument),
-            ("wordless has_word", json!({"has_word": "-- ;"}), FailureClass::InvalidArgument),
-            ("evidence_ref", json!({"evidence_ref": "e"}), FailureClass::Unsupported),
+            (
+                "unknown op",
+                pred("like", json!("a")),
+                FailureClass::InvalidArgument,
+            ),
+            (
+                "eq with a list",
+                pred("eq", json!(["a"])),
+                FailureClass::InvalidArgument,
+            ),
+            (
+                "in with one",
+                pred("in", json!("a")),
+                FailureClass::InvalidArgument,
+            ),
+            (
+                "in empty",
+                pred("in", json!([])),
+                FailureClass::InvalidArgument,
+            ),
+            (
+                "exists with a value",
+                pred("exists", json!("a")),
+                FailureClass::InvalidArgument,
+            ),
+            (
+                "unknown field",
+                json!({"predicates": [{"key": "a", "op": "exists", "not": 1}]}),
+                FailureClass::InvalidArgument,
+            ),
+            (
+                "severity",
+                json!({"severity": "loud"}),
+                FailureClass::InvalidArgument,
+            ),
+            (
+                "short trace_id",
+                json!({"trace_id": "abc"}),
+                FailureClass::InvalidArgument,
+            ),
+            (
+                "non-hex trace_id",
+                json!({"trace_id": "g".repeat(32)}),
+                FailureClass::InvalidArgument,
+            ),
+            (
+                "blank has_word",
+                json!({"has_word": "  "}),
+                FailureClass::InvalidArgument,
+            ),
+            (
+                "wordless has_word",
+                json!({"has_word": "-- ;"}),
+                FailureClass::InvalidArgument,
+            ),
+            (
+                "evidence_ref",
+                json!({"evidence_ref": "e"}),
+                FailureClass::Unsupported,
+            ),
         ];
         for (name, extra, class) in cases {
-            let call = if name == "no time_range" { extra } else { args(extra) };
+            let call = if name == "no time_range" {
+                extra
+            } else {
+                args(extra)
+            };
             let envelope = block_on(run(call, &context(&key), &Stub::default()));
             assert_eq!(failure_class(&envelope), class, "{name}");
         }
@@ -1115,9 +1181,15 @@ mod tests {
                 "\"trace_id\" = X'0123456789abcdef0123456789abcdef'",
             ]
         );
-        assert_eq!(envelope.scope.order_by, ["\"ts\" ASC", "\"observed_ts\" ASC"]);
         assert_eq!(
-            (envelope.scope.signal.as_str(), envelope.scope.table.as_str()),
+            envelope.scope.order_by,
+            ["\"ts\" ASC", "\"observed_ts\" ASC"]
+        );
+        assert_eq!(
+            (
+                envelope.scope.signal.as_str(),
+                envelope.scope.table.as_str()
+            ),
             ("logs", "logs")
         );
         let executed = stub.executed.borrow();
@@ -1238,7 +1310,11 @@ mod tests {
         assert_eq!(
             shape,
             [
-                (Cell::Int(0), map(json!({"svc": "api"})), map(json!({"pod": "p1"}))),
+                (
+                    Cell::Int(0),
+                    map(json!({"svc": "api"})),
+                    map(json!({"pod": "p1"}))
+                ),
                 (Cell::Int(0), Cell::Null, map(json!({"pod": "p2"}))),
                 (Cell::Int(1), map(json!({"code": "7"})), map(json!({}))),
             ]
@@ -1257,9 +1333,10 @@ mod tests {
     fn a_later_page_resolves_at_the_mint_instant_and_binds_its_inputs() {
         let key = key();
         let stub = Stub::default();
-        stub.sql
-            .borrow_mut()
-            .extend([plain(&[("a", 1, 1), ("b", 2, 2), ("c", 3, 3)]), plain(&[("c", 3, 3)])]);
+        stub.sql.borrow_mut().extend([
+            plain(&[("a", 1, 1), ("b", 2, 2), ("c", 3, 3)]),
+            plain(&[("c", 3, 3)]),
+        ]);
         let filters = json!({"has_word": "boom", "severity": "error"});
 
         let one = block_on(run(args(filters.clone()), &context(&key), &stub));

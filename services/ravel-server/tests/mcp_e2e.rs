@@ -3028,7 +3028,8 @@ mod with_mcp {
             ().serve_with_lifecycle(transport(&running), current_revision())
                 .await
                 .expect("the client reaches the server");
-        let window = serde_json::json!({"start_ns": "0", "end_ns": (3_600 * NS_PER_SEC).to_string()});
+        let window =
+            serde_json::json!({"start_ns": "0", "end_ns": (3_600 * NS_PER_SEC).to_string()});
         let search = |extra: serde_json::Value| {
             let mut arguments = serde_json::json!({"time_range": window});
             if let (Some(arguments), serde_json::Value::Object(extra)) =
@@ -3041,8 +3042,16 @@ mod with_mcp {
         let trace_a: String = TRACE_A.iter().map(|byte| format!("{byte:02X}")).collect();
 
         let cases = [
-            ("has_word", serde_json::json!({"has_word": "timeout"}), vec!["disk timeout on node"]),
-            ("has_word token", serde_json::json!({"has_word": "time"}), vec!["time drift"]),
+            (
+                "has_word",
+                serde_json::json!({"has_word": "timeout"}),
+                vec!["disk timeout on node"],
+            ),
+            (
+                "has_word token",
+                serde_json::json!({"has_word": "time"}),
+                vec!["time drift"],
+            ),
             (
                 "has_word case",
                 serde_json::json!({"has_word": "DISK Timeout"}),
@@ -3125,7 +3134,10 @@ mod with_mcp {
         )
         .await;
         assert_eq!(is_error, Some(true), "{unknown}");
-        assert_eq!(unknown["failure"]["class"], serde_json::json!("invalid_argument"));
+        assert_eq!(
+            unknown["failure"]["class"],
+            serde_json::json!("invalid_argument")
+        );
         assert_eq!(
             unknown["next_steps"][0]["action"],
             serde_json::json!("ravel_describe_data")
@@ -3149,7 +3161,10 @@ mod with_mcp {
         .await;
         assert_eq!(two["status"], serde_json::json!("ok"), "{two}");
         assert_eq!(bodies(&two), ["time drift", "it's down; -- /* now"]);
-        assert_eq!(one["visibility"]["snapshot_id"], two["visibility"]["snapshot_id"]);
+        assert_eq!(
+            one["visibility"]["snapshot_id"],
+            two["visibility"]["snapshot_id"]
+        );
 
         client.cancel().await.expect("client stops");
         running.shutdown().await.expect("server stops");
