@@ -131,10 +131,7 @@ impl ServiceBackend {
         if left.is_zero() {
             return Err(Failure {
                 class: FailureClass::Deadline,
-                message: format!(
-                    "query exceeded its deadline of {:?}",
-                    self.budgets.deadline
-                ),
+                message: format!("query exceeded its deadline of {:?}", self.budgets.deadline),
                 counter: None,
             });
         }

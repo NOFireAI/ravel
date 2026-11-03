@@ -3355,7 +3355,7 @@ mod with_mcp {
         tokio::time::pause();
         let started = tokio::time::Instant::now();
         let backend = ServiceBackend::new(service, budgets).with_call_start(started);
-        let lookup =faults.hold(Op::List, None, Occurrence::Nth(1));
+        let lookup = faults.hold(Op::List, None, Occurrence::Nth(1));
         let scan = faults.hold(Op::Get, Some("/l0/".to_string()), Occurrence::Nth(1));
 
         let call = ravel_mcp::tools::search_logs::run(search_with_predicate(), &ctx, &backend);

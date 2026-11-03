@@ -1536,7 +1536,11 @@ mod tests {
 
         let stub = Stub::default();
         stub.sql.borrow_mut().push_back(plain(&[("a", 1, 1)]));
-        let bare = block_on(run(args(json!({"has_word": "boom"})), &context(&key), &stub));
+        let bare = block_on(run(
+            args(json!({"has_word": "boom"})),
+            &context(&key),
+            &stub,
+        ));
         assert_eq!(bare.status, Status::Ok, "{bare:?}");
         assert_eq!(warned(&bare), 0, "{:?}", bare.warnings);
         assert!(stub.described.borrow().is_empty());
