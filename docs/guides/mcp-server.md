@@ -8,14 +8,12 @@ which has its own guide: [Ravel Agents](agents.md).
 > off by default. Build `ravel-server` with `--features mcp`, then run it
 > with `--mcp` (only supported under `--mode all` or `--mode query`) to
 > mount `POST /mcp` on the query router; `--mcp-allowed-origins` is required
-> once that listener is reachable from anywhere but localhost. Eight tools are
-> served today: `ravel_capabilities`, `ravel_describe_data`,
+> once that listener is reachable from anywhere but localhost. All nine tools
+> are served: `ravel_capabilities`, `ravel_describe_data`,
 > `ravel_find_labels`, `ravel_explain_query`, `ravel_query_sql`,
-> `ravel_query_promql`, `ravel_get_trace` and `ravel_analyze_timeseries`. The
-> other one, `ravel_search_logs`, is catalogued, so `tools/list` returns it,
-> and a call to it refuses with a `method_not_found` protocol error until its
-> body lands; the sections below describe the surface as designed. The [MCP reference](../reference/mcp.md)
-> carries the split `ravel_capabilities` reports at runtime.
+> `ravel_query_promql`, `ravel_search_logs`, `ravel_get_trace` and
+> `ravel_analyze_timeseries`. The [MCP reference](../reference/mcp.md)
+> describes each one.
 
 The published image built from `main` compiles in the `mcp` feature, so with
 that image you only pass `--mcp`. On Kubernetes, query pods the operator
@@ -166,10 +164,16 @@ server offers over MCP, `ravel_agent_send`, belongs to the
 
 ### Search logs
 
-- `ravel_search_logs`: a typed log search compiled to SQL. It uses indexed
-  and typed-attribute predicates, `has_word` body search, severity, and
-  trace id. Results order by timestamp. Rows that share an attribute set are
-  grouped, so the shared attributes are not repeated.
+- `ravel_search_logs`: a typed log search compiled to one SQL `SELECT`
+  over `logs`. It takes predicates on typed attribute columns and the `trace_id`
+  key (`eq`, `ne`, `in`, `exists`), a `has_word` body search, a minimum
+  severity, and a trace id, and requires `time_range`. A predicate key that
+  is not a typed attribute column or an indexed key is refused before the search
+  runs; `ravel_describe_data` with signal `logs` lists the ones it accepts.
+  Results order by `(ts, observed_ts)`. Rows with the same attribute key set
+  form a group, and the attributes every row of the group shares are listed
+  once, in the group's first row's `group_attrs`. The
+  [reference](../reference/mcp.md#searching-logs) gives the exact shape.
 
 ### Trace and time series
 
@@ -463,8 +467,9 @@ Paging order differs per tool:
   paging continues. A page whose last row has no cursor position (a NaN
   or infinite order value, or a cursor over its 4 KiB bound) ends
   `ok_bounded` with no cursor and a `narrow_time_range` next step.
-- `ravel_search_logs` orders by a tuple that is not always unique, because
-  `logs` rows carry no row identity. The equal-group rule applies.
+- `ravel_search_logs` orders by `(ts, observed_ts)`, which is not always
+  unique, because `logs` rows carry no row identity. The equal-group rule
+  applies.
 - `ravel_get_trace` mints no cursor as served today: it returns the trace's
   spans in one page, ordered by `start_ts` and `span_id`, and a trace larger
   than the row cap comes back bounded (`row_cap_hit`) rather than paged.

@@ -385,8 +385,10 @@ tenant-mismatch signal.
 `ravel_query_sql` mints a cursor only when the `ORDER BY`, plus a
 deterministic tiebreak that the tool appends, is a total order over the
 projection. `ravel_search_logs` orders by
-`(ts, observed_ts, trace_id, span_id, body_hash)`. That tuple is not unique,
-because `logs` has no row identity and ingest is at-least-once. A strict
+`(ts, observed_ts, trace_id, span_id, body_hash)`. (It orders and pages by
+`(ts, observed_ts)` instead; see the search-logs amendment below.) That
+tuple is not unique, because `logs` has no row identity and ingest is
+at-least-once. A strict
 keyset predicate would skip an equal row on the next page. So a page never
 ends inside a group of equal tuples. The tool fetches `k + 1` rows. When
 the last kept tuple equals the first omitted tuple, the tool drops that
@@ -1040,10 +1042,11 @@ with all fifteen. Since the committed row count amendment below it was
 15,652 bytes with the nine tools and 23,541 bytes with all fifteen. Since
 the query-sql amendment below it was 15,733 bytes with the nine tools and
 23,622 bytes with all fifteen. Since the query-promql amendment below it
-was 15,972 bytes with the nine tools and 23,861 bytes with all fifteen, and
-since the analyze-timeseries amendment below it is 16,297 bytes with the
-nine tools and 24,186 bytes with all fifteen, against the 24,576-byte
-budget; both
+was 15,972 bytes with the nine tools and 23,861 bytes with all fifteen.
+Since the analyze-timeseries amendment below it was 16,297 bytes with the
+nine tools and 24,186 bytes with all fifteen, and since the search-logs
+amendment below it is 16,058 bytes with the nine tools and 23,947 bytes
+with all fifteen, against the 24,576-byte budget; both
 figures are pinned in
 `crates/ravel-mcp/src/catalog.rs` and
 `services/ravel-server/tests/mcp_agents_e2e.rs`.
@@ -1387,3 +1390,65 @@ they leave open and the places it departs from the row.
    catalogued count from two to one. The input descriptions move
    `tools/list` from 15,972 to 16,297 bytes with the nine tools and from
    23,861 to 24,186 bytes with all fifteen, under the 24,576-byte budget.
+
+## Amendment (2026-11-03, #3725): the search-logs amendment, `ravel_search_logs` ships and pages by `(ts, observed_ts)`
+
+<!-- amendment-applies: sections="D5. Consistency, cursors, and evidence references|Amendment (2026-11-02): a Parquet explain names its unbounded figures and does not refuse" pointer="search-logs amendment" -->
+<!-- amendment-supersedes: phrase="(ts, observed_ts, trace_id, span_id, body_hash)" pointer="search-logs amendment" -->
+
+`ravel_search_logs` is served (`crates/ravel-mcp/src/tools/search_logs.rs`),
+the ninth tool body, so every catalog name now has one. This search-logs
+amendment records the owner decision of 2026-11-02 on its page order and
+the choices D2's row leaves open.
+
+1. Page order (owner decision, 2026-11-02). D5's tuple
+   `(ts, observed_ts, trace_id, span_id, body_hash)` cannot be built:
+   `trace_id` and `span_id` are nullable, and `ravel_sql::plan_page` does
+   not page on a term that may be NULL, and `logs` has no `body_hash`
+   column. The tool orders and pages by `(ts, observed_ts)` only, with D5's
+   equal-group rule: a page never ends inside a group of rows equal on that
+   pair. When a group does not fit in a page, the tool returns the rows it
+   has, `ok_bounded`, mints no cursor, and adds a `narrow_time_range` next
+   step. The rule was needed for the five-column tuple too, since
+   at-least-once ingest can store a record twice.
+2. Inputs. `predicates` is a typed list of `{key, op, value}`, with `op`
+   one of `eq` and `ne` (one string), `in` (a non-empty list of strings)
+   and `exists` (no value). A key must be one of the tenant's typed
+   attribute columns, or `trace_id` when it is an indexed key, as the
+   describe path reports them at the call's own clock; any other key is
+   `invalid_argument` with a next step naming `ravel_describe_data`, and a
+   value that does not parse as the column's type is `invalid_argument`
+   too. `severity` is one of `trace`, `debug`, `info`, `warn`, `error` and
+   `fatal`, meaning that level or above. `trace_id` is 32 hexadecimal
+   characters in either case. `has_word` must hold a letter or digit,
+   because a term the tokenizer reduces to no word matches every row.
+   `time_range` is required. Every check but the key lookup runs before
+   any backend call, and the key lookup runs before any statement.
+3. The filters compile to one `SELECT * FROM logs WHERE ... ORDER BY "ts",
+   "observed_ts"`, with `time_range` applied as a row filter. Every caller
+   value reaches the text through one function, `render_literal`, which
+   quotes a string with its quotes doubled and renders bytes as
+   `X'<hex>'`; `has_word` is the `ravel_sql::HAS_WORD_UDF` function over
+   `body`. The statement then passes the same one-table rule, SQL
+   validation and page planning as a `ravel_query_sql` statement.
+4. A later page resolves at page one's instant and is checked against the
+   pin as on `ravel_query_sql`. The cursor binds the compiled statement (so
+   every filter), `time_range` and the effective `max_rows`.
+5. Output. D2's "groups rows by attribute set" is read as the attribute key
+   set: rows stay in page order, a column `group` numbers each row's key
+   set in order of first appearance on the page, a column `group_attrs`
+   on the group's first row lists the attributes (key and value) every row
+   of the group on the page carries, and each row's `attrs` keeps the rest.
+   Grouping by the whole attribute map would make every attribute shared
+   by definition and split rows that differ in one value into separate
+   groups. Groups are computed per page.
+6. `evidence_ref` stays in the input schema and is refused as
+   `unsupported`, so no `evidence` block is emitted, as on the other query
+   tools.
+7. Serving the tool moves the served count from eight to nine and the
+   catalogued count from one to zero. Typed predicates replace the
+   free-form `predicates` schema, and the `TimeRange` type no longer has a
+   doc comment, which the schema repeated in each of the seven tools that
+   take a time range. Together they move `tools/list` from 16,297 to
+   16,058 bytes with the nine tools and from 24,186 to 23,947 bytes with
+   all fifteen, under the 24,576-byte budget.
