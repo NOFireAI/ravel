@@ -3483,16 +3483,60 @@ mod tests {
             .expect("A is ts-relevant");
         assert_eq!(out.records.len(), 4, "every trace-3 span");
 
-        assert_eq!(
-            accounting.probe().snapshot().segments_opened,
-            1,
-            "the tail probe opened this object's footer exactly once"
-        );
-        assert_eq!(
-            accounting.scan().snapshot().segments_opened,
-            0,
-            "the block-run read reuses the probe's footer, not a second open"
-        );
+        let phases = accounting.snapshot();
+        for phase in QueryPhase::ALL {
+            let want = u64::from(phase == QueryPhase::Probe);
+            assert_eq!(
+                phases.phase(phase).segments_opened,
+                want,
+                "{}: the tail probe opened this object's footer exactly once, \
+                 and the block-run read reuses it",
+                phase.name()
+            );
+        }
+    }
+
+    /// A segment the catalog ts pre-check rules out is never opened, on the
+    /// ranged trace path or the whole-object path, so no phase counts it.
+    ///
+    /// Fails against an `open_accounted_scan` that counts the open before the
+    /// `ts_range_relevant` check returns `Ok(None)`.
+    #[tokio::test]
+    async fn ts_irrelevant_segment_counts_in_no_phase() {
+        let mut fx = trace_fixture().await;
+        let log = Arc::new(GetLog::new(fx.memory.take().expect("memory")));
+        let fetcher = SpanSegmentFetcher::new(log.clone()).with_trace_probe_bytes(fx.probe);
+        let after = fx.a.max_event_ts_ns + 1;
+        for query in [
+            SpanQuery::trace(trace(3), after, i64::MAX),
+            SpanQuery::ts_range(after, i64::MAX),
+        ] {
+            let accounting = PhaseAccounting::new();
+            let out = fetcher
+                .fetch_accounted_in_blocks(
+                    &fx.a,
+                    TENANT,
+                    &query,
+                    None,
+                    None,
+                    &[],
+                    None,
+                    &accounting,
+                )
+                .await
+                .expect("fetch A");
+            assert!(out.is_none(), "A ends before the query's window");
+            assert_eq!(log.total(), 0, "no GET was issued for A");
+            let phases = accounting.snapshot();
+            for phase in QueryPhase::ALL {
+                assert_eq!(
+                    phases.phase(phase).segments_opened,
+                    0,
+                    "{}: {query:?}",
+                    phase.name()
+                );
+            }
+        }
     }
 
     /// The columnar exit takes the same ranged read and names it; a query with
