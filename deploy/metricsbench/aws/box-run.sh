@@ -38,7 +38,7 @@ docker pull "$RAVEL_IMAGE" || finish 18
 store_args=()
 ci_args=()
 if [ -n "$REAL_S3_PREFIX" ]; then
-  region=${AWS_DEFAULT_REGION:-us-east-1}
+  region=${AWS_DEFAULT_REGION:?/mb/env names no region}
   store_args=(--real-s3-bucket-prefix "$REAL_S3_PREFIX" --real-s3-region "$region")
   ci_args=(--real-s3-bucket-prefix "${REAL_S3_PREFIX}-ci" --real-s3-region "$region")
 fi
@@ -87,4 +87,4 @@ if [ -n "$REAL_S3_PREFIX" ]; then
   put /mb/buckets.txt
 fi
 status_line "$PROFILE" "$code"
-finish 0 5
+finish "$code" 5

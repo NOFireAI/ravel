@@ -27,6 +27,14 @@ profile=${MB_PROFILE:-cardinality}
 instance_type=${MB_INSTANCE_TYPE:-m6a.4xlarge}
 cap_min=${MB_CAP_MIN:-2160}
 volume_gb=${MB_VOLUME_GB:-150}
+# The default bands are the cardinality profile's pre-registered ones (#2821
+# comment 6590940753 for the Prometheus RSS band, comment 6611923577 for the
+# data-object band). Another profile needs both bands chosen and
+# pre-registered for it: they are refused here rather than defaulted.
+if [ "$profile" != cardinality ] && { [ -z "${MB_RSS_BAND:-}" ] || [ -z "${MB_OBJECTS_BAND:-}" ]; }; then
+  echo "MB_PROFILE=$profile needs MB_RSS_BAND and MB_OBJECTS_BAND set for it; the defaults are cardinality's" >&2
+  exit 64
+fi
 rss_band=${MB_RSS_BAND:-prometheus:2147483648:6442450944}
 objects_band=${MB_OBJECTS_BAND:-14000:16500}
 boxrun="$here/box-run.sh"
@@ -47,19 +55,16 @@ boxrun_sha256=$(shasum -a 256 "$boxrun" | cut -d' ' -f1)
 aws s3 cp --only-show-errors "$work/src.tar.gz" "s3://${MB_RESULTS_BUCKET}/${prefix}/src.tar.gz"
 aws s3 cp --only-show-errors "$boxrun" "s3://${MB_RESULTS_BUCKET}/${prefix}/box-run.sh"
 
-env_block="BUCKET=${MB_RESULTS_BUCKET}
-PREFIX=${prefix}
-SRC_SHA256=${src_sha256}
-BOXRUN_SHA256=${boxrun_sha256}
-HARNESS_COMMIT=${harness_sha}
-RAVEL_IMAGE=${ravel_image}
-RAVEL_SOURCE_COMMIT=${ravel_source_commit}
-ANCHOR_MS=${anchor_ms}
-PROFILE=${profile}
-RSS_BAND=${rss_band}
-OBJECTS_BAND=${objects_band}
-REAL_S3_PREFIX=${real_s3_prefix}
-AWS_DEFAULT_REGION=${region}"
+# Each value is shell-quoted: /mb/env is sourced on the box.
+env_block=$(
+  for kv in "BUCKET=${MB_RESULTS_BUCKET}" "PREFIX=${prefix}" "SRC_SHA256=${src_sha256}" \
+    "BOXRUN_SHA256=${boxrun_sha256}" "HARNESS_COMMIT=${harness_sha}" "RAVEL_IMAGE=${ravel_image}" \
+    "RAVEL_SOURCE_COMMIT=${ravel_source_commit}" "ANCHOR_MS=${anchor_ms}" "PROFILE=${profile}" \
+    "RSS_BAND=${rss_band}" "OBJECTS_BAND=${objects_band}" "REAL_S3_PREFIX=${real_s3_prefix}" \
+    "AWS_DEFAULT_REGION=${region}"; do
+    printf '%s=%q\n' "${kv%%=*}" "${kv#*=}"
+  done
+)
 python3 -I - "$here/user-data.tpl" "$work/user-data.sh" "$env_block" "$cap_min" <<'PY'
 import sys
 tpl, out, env, cap = sys.argv[1:5]
