@@ -1886,14 +1886,36 @@ async fn gcs_store_contract_against_the_fake() {
     let mut config = fake.config();
     config.list_page_size = 2;
     let store = GcsStore::new(config).expect("GcsStore against the fake");
-    // Exactly the mandatory set: no multipart and no upload checksums
-    // (ADR-3456 D1).
-    assert_eq!(store.capabilities(), Capabilities::mandatory());
+    assert_eq!(store.capabilities(), gcs_expected_capabilities());
 
     run_contract_suite(&store, "gcs-fake").await;
     gcs_pinned_read_ordering(&store, "gcs-fake").await;
     gcs_foreign_control_character_name(&store, "gcs-fake").await;
     assert_eq!(fake.data_of("gcs-fake/foreign-u0001/a\u{1}b"), None);
+
+    // The multipart cases ran rather than taking the `multipart: false`
+    // refusal branch: the fake saw initiations, and the completed object is
+    // there.
+    let initiations = fake
+        .requests()
+        .iter()
+        .filter(|r| r.method == "POST" && r.query_param("uploads").is_some())
+        .count();
+    assert!(initiations > 0, "no multipart upload reached the fake");
+    assert_eq!(
+        fake.data_of("gcs-fake/multipart/object").map(|d| d.len()),
+        Some(MULTIPART_PART_SIZE + MULTIPART_TAIL_SIZE)
+    );
+}
+
+/// What `GcsStore` declares: the same set as [`s3_expected_capabilities`],
+/// [`Capabilities::mandatory()`] plus `multipart` (ADR-3456, amendment for
+/// #3802) and no upload checksums (ADR-3456 D1).
+fn gcs_expected_capabilities() -> Capabilities {
+    Capabilities {
+        multipart: true,
+        ..Capabilities::mandatory()
+    }
 }
 
 /// `GcsStore` against a real bucket, gated on `RAVEL_GCS_TEST_BUCKET`. The
@@ -1917,7 +1939,7 @@ async fn gcs_contract() {
         .as_nanos();
     let root = format!("contract-gcs-{run_id}");
 
-    assert_eq!(store.capabilities(), Capabilities::mandatory());
+    assert_eq!(store.capabilities(), gcs_expected_capabilities());
     run_contract_suite(&store, &root).await;
     gcs_pinned_read_ordering(&store, &root).await;
     gcs_foreign_control_character_name(&store, &root).await;

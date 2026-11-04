@@ -36,6 +36,27 @@
 //! - `HEAD /{bucket}/{key}`: the GET headers for the whole object, no body; a
 //!   missing object is a bodiless 404.
 //! - `DELETE /{bucket}/{key}`: 204, or 404 `NoSuchKey` for a missing object.
+//! - The XML API multipart upload. `POST /{bucket}/{key}?uploads` opens an
+//!   upload and answers 200 with an `InitiateMultipartUploadResult` naming its
+//!   `UploadId`. `PUT /{bucket}/{key}?partNumber=N&uploadId=X` stores part `N`
+//!   (1 to 10000, else 400 `InvalidArgument`), replacing an earlier part `N`,
+//!   and answers 200 with the part's `ETag`, the quoted MD5 of its bytes.
+//!   `POST /{bucket}/{key}?uploadId=X` with a `CompleteMultipartUpload` body
+//!   publishes the listed parts, concatenated, under a new generation assigned
+//!   as a PUT's is, and closes the upload. A body it cannot read is 400
+//!   `MalformedXML`; no parts, or part numbers not strictly ascending, is 400
+//!   `InvalidPartOrder`; a listed part not uploaded, or with another ETag, is
+//!   400 `NoSuchPart`; a part other than the last below
+//!   [`crate::MULTIPART_MIN_PART_SIZE`] is 400 `EntityTooSmall`. Each of those
+//!   publishes nothing and leaves the upload open. Success answers 200 with
+//!   `x-goog-generation`, `x-goog-metageneration`,
+//!   `x-goog-stored-content-length`, `x-goog-hash: crc32c=...` and no `ETag`
+//!   header, and a `CompleteMultipartUploadResult` body whose `ETag` is the
+//!   object's: the quoted hex MD5 of the parts' MD5s, a dash and the part
+//!   count. The object has no MD5: its JSON resource carries neither `md5Hash`
+//!   nor `componentCount`. `DELETE /{bucket}/{key}?uploadId=X` discards the
+//!   upload, 204. An upload id the fake did not issue for that key is 404
+//!   `NoSuchUpload`; any other method with an `uploadId` is 501.
 //! - `GET /storage/v1/b/{bucket}/o`: the JSON API's `objects.list`, in
 //!   lexicographic order of the names' bytes, honouring `prefix`,
 //!   `delimiter` (rolled up into `prefixes`, each counted as one result),
@@ -136,12 +157,31 @@ struct StoredObject {
     last_modified_secs: i64,
     /// `Some` for a composite object: no MD5, a dash-prefixed ETag.
     component_count: Option<u32>,
+    /// Whether the JSON resource carries `md5Hash`: false for a composite
+    /// object and for one an XML multipart upload completed.
+    md5: bool,
+}
+
+/// One open XML multipart upload, by part number.
+#[derive(Debug)]
+struct Upload {
+    key: String,
+    parts: BTreeMap<u32, Part>,
+}
+
+#[derive(Debug)]
+struct Part {
+    etag: String,
+    md5: [u8; 16],
+    data: Bytes,
 }
 
 #[derive(Debug)]
 struct Inner {
     bucket: String,
     objects: Mutex<BTreeMap<String, StoredObject>>,
+    uploads: Mutex<BTreeMap<String, Upload>>,
+    next_upload: AtomicU64,
     next_generation: AtomicU64,
     requests: Mutex<Vec<RecordedRequest>>,
     /// Each with whether its body carries an XML error code.
@@ -169,6 +209,8 @@ impl FakeGcs {
         let inner = Arc::new(Inner {
             bucket: bucket.to_string(),
             objects: Mutex::new(BTreeMap::new()),
+            uploads: Mutex::new(BTreeMap::new()),
+            next_upload: AtomicU64::new(1),
             next_generation: AtomicU64::new(FIRST_GENERATION),
             requests: Mutex::new(Vec::new()),
             failures: Mutex::new(VecDeque::new()),
@@ -293,6 +335,7 @@ impl FakeGcs {
         let mut object = self.inner.new_object(data.into());
         object.etag = format!("\"-{}\"", json_etag(object.generation));
         object.component_count = Some(component_count);
+        object.md5 = false;
         let generation = object.generation;
         self.inner.objects.lock().insert(key.to_string(), object);
         generation
@@ -301,6 +344,12 @@ impl FakeGcs {
     /// Remove `key` without a request. Whether it was present.
     pub fn remove_object(&self, key: &str) -> bool {
         self.inner.objects.lock().remove(key).is_some()
+    }
+
+    /// How many XML multipart uploads are open: initiated, and neither
+    /// completed nor aborted.
+    pub fn open_uploads(&self) -> usize {
+        self.inner.uploads.lock().len()
     }
 
     /// The `nextPageToken` an objects.list response carries when its page
@@ -332,6 +381,7 @@ impl Inner {
             generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
             last_modified_secs: self.date_secs.load(Ordering::Relaxed),
             component_count: None,
+            md5: true,
             data,
         }
     }
@@ -447,15 +497,178 @@ impl Inner {
                         "bad object name",
                     );
                 };
-                match *method {
-                    Method::PUT => self.put(&key, headers, body),
-                    Method::GET => self.get(&key, query, headers, true),
-                    Method::HEAD => self.get(&key, query, headers, false),
-                    Method::DELETE => self.delete(&key),
+                let uploads = query_param(query, "uploads").is_some();
+                match (method, query_param(query, "uploadId")) {
+                    (&Method::POST, None) if uploads => self.initiate(&key),
+                    (&Method::POST, Some(id)) => self.complete(&key, id, &body),
+                    (&Method::PUT, Some(id)) => self.upload_part(&key, id, query, body),
+                    (&Method::DELETE, Some(id)) => self.abort(&key, id),
+                    (_, Some(_)) => error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "method"),
+                    (&Method::PUT, None) => self.put(&key, headers, body),
+                    (&Method::GET, None) => self.get(&key, query, headers, true),
+                    (&Method::HEAD, None) => self.get(&key, query, headers, false),
+                    (&Method::DELETE, None) => self.delete(&key),
                     _ => error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "method"),
                 }
             }
         }
+    }
+
+    /// `POST /{bucket}/{key}?uploads`: opens an upload with no parts.
+    fn initiate(&self, key: &str) -> Response {
+        let id = format!(
+            "fake-upload-{}",
+            self.next_upload.fetch_add(1, Ordering::Relaxed)
+        );
+        self.uploads.lock().insert(
+            id.clone(),
+            Upload {
+                key: key.to_string(),
+                parts: BTreeMap::new(),
+            },
+        );
+        let mut xml =
+            String::from("<?xml version='1.0' encoding='UTF-8'?><InitiateMultipartUploadResult>");
+        push_element(&mut xml, "Bucket", &self.bucket);
+        push_element(&mut xml, "Key", key);
+        push_element(&mut xml, "UploadId", &id);
+        xml.push_str("</InitiateMultipartUploadResult>");
+        xml_response(xml)
+    }
+
+    /// `PUT /{bucket}/{key}?partNumber=N&uploadId=X`: stores part `N`,
+    /// replacing an earlier part with the same number, and answers its ETag.
+    fn upload_part(
+        &self,
+        key: &str,
+        id: &str,
+        query: &[(String, String)],
+        body: Bytes,
+    ) -> Response {
+        let number = match query_param(query, "partNumber").map(str::parse::<u32>) {
+            Some(Ok(n)) if (1..=crate::MULTIPART_MAX_PARTS as u32).contains(&n) => n,
+            _ => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "partNumber must be an integer from 1 to 10000",
+                );
+            }
+        };
+        let mut uploads = self.uploads.lock();
+        let Some(upload) = uploads.get_mut(id).filter(|u| u.key == key) else {
+            return no_such_upload();
+        };
+        let digest = md5(&body);
+        let etag = format!("\"{}\"", hex(&digest));
+        upload.parts.insert(
+            number,
+            Part {
+                etag: etag.clone(),
+                md5: digest,
+                data: body,
+            },
+        );
+        let mut response = Response::new(Body::empty());
+        set_header(response.headers_mut(), "etag", etag);
+        response
+    }
+
+    /// `POST /{bucket}/{key}?uploadId=X` with a `CompleteMultipartUpload`
+    /// body: publishes the listed parts as one object under a new generation.
+    fn complete(&self, key: &str, id: &str, body: &[u8]) -> Response {
+        let Some(listed) = parse_complete_body(body) else {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "MalformedXML",
+                "The XML you provided was not well-formed.",
+            );
+        };
+        let mut uploads = self.uploads.lock();
+        let Some(upload) = uploads.get(id).filter(|u| u.key == key) else {
+            return no_such_upload();
+        };
+        if listed.is_empty() || listed.windows(2).any(|w| w[0].0 >= w[1].0) {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "InvalidPartOrder",
+                "The list of parts was not in ascending order.",
+            );
+        }
+        let mut parts = Vec::with_capacity(listed.len());
+        for (number, etag) in &listed {
+            match upload.parts.get(number) {
+                Some(part) if part.etag == *etag => parts.push(part),
+                _ => {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "NoSuchPart",
+                        "One or more of the specified parts could not be found.",
+                    );
+                }
+            }
+        }
+        let last = parts.len() - 1;
+        if parts[..last]
+            .iter()
+            .any(|part| part.data.len() < crate::MULTIPART_MIN_PART_SIZE)
+        {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "EntityTooSmall",
+                "Your proposed upload is smaller than the minimum allowed object size.",
+            );
+        }
+        let mut data = Vec::with_capacity(parts.iter().map(|p| p.data.len()).sum());
+        let mut digests = Vec::with_capacity(parts.len() * 16);
+        for part in &parts {
+            data.extend_from_slice(&part.data);
+            digests.extend_from_slice(&part.md5);
+        }
+        let count = parts.len();
+        uploads.remove(id);
+        drop(uploads);
+        let mut object = self.new_object(Bytes::from(data));
+        object.etag = format!("\"{}-{count}\"", hex(&md5(&digests)));
+        object.md5 = false;
+        let mut xml =
+            String::from("<?xml version='1.0' encoding='UTF-8'?><CompleteMultipartUploadResult>");
+        push_element(&mut xml, "Location", &format!("/{}/{key}", self.bucket));
+        push_element(&mut xml, "Bucket", &self.bucket);
+        push_element(&mut xml, "Key", key);
+        push_element(&mut xml, "ETag", &object.etag);
+        xml.push_str("</CompleteMultipartUploadResult>");
+        let mut response = xml_response(xml);
+        let headers = response.headers_mut();
+        set_header(headers, "x-goog-generation", object.generation.to_string());
+        set_header(headers, "x-goog-metageneration", "1".into());
+        set_header(
+            headers,
+            "x-goog-stored-content-length",
+            object.data.len().to_string(),
+        );
+        set_header(
+            headers,
+            "x-goog-hash",
+            format!(
+                "crc32c={}",
+                STANDARD.encode(crc32c::crc32c(&object.data).to_be_bytes())
+            ),
+        );
+        self.objects.lock().insert(key.to_string(), object);
+        response
+    }
+
+    /// `DELETE /{bucket}/{key}?uploadId=X`: discards the upload and its parts.
+    fn abort(&self, key: &str, id: &str) -> Response {
+        let mut uploads = self.uploads.lock();
+        if uploads.get(id).is_none_or(|u| u.key != key) {
+            return no_such_upload();
+        }
+        uploads.remove(id);
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::NO_CONTENT;
+        response
     }
 
     fn put(&self, key: &str, headers: &HeaderMap, body: Bytes) -> Response {
@@ -599,9 +812,11 @@ impl Inner {
             "updated": iso8601(object.last_modified_secs),
             "etag": json_etag(object.generation),
         });
-        match object.component_count {
-            Some(count) => resource["componentCount"] = serde_json::json!(count),
-            None => resource["md5Hash"] = serde_json::json!(STANDARD.encode(md5(&object.data))),
+        if let Some(count) = object.component_count {
+            resource["componentCount"] = serde_json::json!(count);
+        }
+        if object.md5 {
+            resource["md5Hash"] = serde_json::json!(STANDARD.encode(md5(&object.data)));
         }
         resource
     }
@@ -806,6 +1021,53 @@ fn set_header(headers: &mut HeaderMap, name: &'static str, value: String) {
     }
 }
 
+fn no_such_upload() -> Response {
+    error(
+        StatusCode::NOT_FOUND,
+        "NoSuchUpload",
+        "The requested upload was not found.",
+    )
+}
+
+fn xml_response(xml: String) -> Response {
+    let mut response = Response::new(Body::from(xml));
+    set_header(
+        response.headers_mut(),
+        "content-type",
+        "application/xml".into(),
+    );
+    response
+}
+
+/// The `(PartNumber, ETag)` pairs of a `CompleteMultipartUpload` body, in
+/// document order, entities in the ETag resolved. `None` when it is not one.
+fn parse_complete_body(body: &[u8]) -> Option<Vec<(u32, String)>> {
+    let text = std::str::from_utf8(body).ok()?;
+    let inner = text
+        .split_once("<CompleteMultipartUpload")?
+        .1
+        .split_once('>')?
+        .1
+        .split_once("</CompleteMultipartUpload>")?
+        .0;
+    let mut parts = Vec::new();
+    let mut rest = inner;
+    while let Some((_, after)) = rest.split_once("<Part>") {
+        let (part, tail) = after.split_once("</Part>")?;
+        let number = element_text(part, "PartNumber")?.trim().parse().ok()?;
+        let etag = quick_xml::escape::unescape(element_text(part, "ETag")?).ok()?;
+        parts.push((number, etag.into_owned()));
+        rest = tail;
+    }
+    Some(parts)
+}
+
+fn element_text<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    Some(xml.split_once(&open)?.1.split_once(&close)?.0)
+}
+
 fn no_such_key() -> Response {
     error(
         StatusCode::NOT_FOUND,
@@ -917,7 +1179,7 @@ fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(super) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -1007,7 +1269,7 @@ fn iso8601(secs: i64) -> String {
 }
 
 /// RFC 1321 MD5, for the ETag GCS gives a single-request upload.
-fn md5(data: &[u8]) -> [u8; 16] {
+pub(super) fn md5(data: &[u8]) -> [u8; 16] {
     const SHIFTS: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
         9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
