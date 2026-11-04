@@ -27,6 +27,31 @@
 //! pin and that reaches its signal and time range; or the declared column set
 //! differs from the pinned one (the 2026-09-12 amendment, item 3).
 //!
+//! # The pinned segment set
+//!
+//! The resolve instant bounds which ingest-hour buckets a resolve lists, not
+//! what those buckets hold: a row committed after page one into a bucket page
+//! one already listed, or a compaction that replaced its objects, is in the
+//! redeeming resolve's result although every resolve input above is equal.
+//! So a cursor also pins [`Cursor::segment_set_digest`], the
+//! [`segment_set_digest`] of the data-object keys page one's resolve
+//! returned (the pinned segment set amendment to ADR-1374), and
+//! [`PendingRedemption::confirm`] compares it with the redeeming resolve's.
+//! Data objects are immutable and a data-object key embeds its content hash
+//! (ADR-0010 item 7), so equal digests mean the two pages read the same
+//! objects, short of a collision in the digest; a compaction writes new keys,
+//! so it changes the digest even though it conserves every row.
+//!
+//! What a difference costs is the tool's choice, as a [`SegmentSetPin`]. A
+//! walk whose order depends on values computed from other rows (a `count`
+//! order) cannot place one more row without moving others, so it passes
+//! [`SegmentSetPin::Required`] and a moved set ends the walk as
+//! [`CursorError::SegmentSetMoved`]. A walk ordered by each row's own columns
+//! keeps its keyset exact for the rows that did not move, so it passes
+//! [`SegmentSetPin::Advisory`] and is served with
+//! [`Confirmed::segment_set_moved`] set. The digest is a measured result, not
+//! a resolve input, so [`snapshot_id`] does not hash it.
+//!
 //! # The declared column set is pinned as a digest
 //!
 //! The declared set is the one resolve input whose only use at redemption is
@@ -100,7 +125,11 @@
 //! erasure's completion time; that time is the cursor's lifetime plus however
 //! long the caller takes between stage one and its resolve.
 //! [`PendingRedemption::confirm`] states the assumption with both quantities
-//! named.
+//! named. A completed rewrite whose output parts overlap the cursor's window
+//! replaces data objects the redeeming resolve lists, so it changes the
+//! segment set (see "The pinned segment set" above): the digest detects it,
+//! refusing the page under [`SegmentSetPin::Required`] and reporting it under
+//! [`SegmentSetPin::Advisory`].
 //!
 //! # The pinned ingest watermark and the snapshot id
 //!
@@ -172,8 +201,9 @@
 //! paginated result means something only against page 1's snapshot, so
 //! [`Cursor::redeem`] reports [`CursorError::Expired`] for a passed deadline
 //! or a foreign nonce, and [`PendingRedemption::confirm`] for a newer erasure
-//! over its range or a changed declared column set. An evidence reference
-//! is different. It names one row,
+//! over its range or a changed declared column set, and
+//! [`CursorError::SegmentSetMoved`] for a moved segment set a walk requires
+//! unchanged. An evidence reference is different. It names one row,
 //! and every field a fresh re-execution needs (the tenant, the tool, the
 //! argument hash, and the row digest to compare the re-read row against) is
 //! in the token itself. [`EvidenceRef::redeem`] therefore answers
@@ -277,12 +307,14 @@ const CURSOR_MAGIC: [u8; 4] = *b"RMC1";
 /// watermark, pending erasure, declared columns, keyset position); version 5
 /// adds the pinned ingest watermark hour of the 2026-09-13 amendment; version
 /// 6 replaces the declared column set with its 32-byte
-/// [`declared_column_set_digest`] (the 2026-11-02 amendment). A token
+/// [`declared_column_set_digest`] (the 2026-11-02 amendment); version 7 adds
+/// the optional [`Cursor::segment_set_digest`] after the ingest watermark
+/// hour (the pinned segment set amendment). A token
 /// of any earlier version decodes as [`CursorError::Invalid`] like any other
 /// unsupported version, which is correct and costs nothing: these tokens are
 /// process-local and deadline-bounded, so none survives the deploy that
 /// changes the number.
-const CURSOR_VERSION: u8 = 6;
+const CURSOR_VERSION: u8 = 7;
 const EVIDENCE_MAGIC: [u8; 4] = *b"RME1";
 /// Version 2 adds the same plaintext process nonce [`CURSOR_VERSION`] 3 does;
 /// version 3 adds the argument hash, which an unpinned redemption needs to
@@ -354,6 +386,13 @@ pub enum CursorError {
     /// [`Redeemed::Unpinned`] instead.
     #[error("cursor has expired")]
     Expired,
+    /// From [`PendingRedemption::confirm`] under [`SegmentSetPin::Required`]:
+    /// the redeeming resolve's segment set digest differs from the pinned
+    /// one, or either side reported none. The pin's resolve inputs still
+    /// reproduce, but the segments they resolve to do not, so a walk whose
+    /// order depends on other rows cannot resume exactly.
+    #[error("cursor has expired: the segments this walk reads changed since page one")]
+    SegmentSetMoved,
     /// The wire token is longer than [`MAX_TOKEN_BYTES`], refused before it is
     /// base64-decoded or allocated. Reports the length the caller sent, which
     /// the caller already knows.
@@ -372,7 +411,9 @@ impl CursorError {
     ///
     /// [`CursorError::Expired`] is `cursor_expired`, and that includes a token
     /// minted by a process that has since restarted: its nonce is foreign, so
-    /// it decodes as expired, not invalid. [`CursorError::Invalid`] and
+    /// it decodes as expired, not invalid. [`CursorError::SegmentSetMoved`] is
+    /// `cursor_expired` too: the token is sound and the snapshot it pins is
+    /// what no longer reproduces. [`CursorError::Invalid`] and
     /// [`CursorError::TokenTooLong`] are `cursor_invalid`: both are a token
     /// the caller sent that no redemption can use, and the second only names
     /// the length the caller already knows. [`CursorError::FieldTooLong`] is
@@ -382,7 +423,7 @@ impl CursorError {
     /// before it compiles.
     pub fn failure(self) -> Failure {
         let class = match self {
-            CursorError::Expired => FailureClass::CursorExpired,
+            CursorError::Expired | CursorError::SegmentSetMoved => FailureClass::CursorExpired,
             CursorError::Invalid | CursorError::TokenTooLong { .. } => FailureClass::CursorInvalid,
             CursorError::FieldTooLong { .. } => FailureClass::Internal,
         };
@@ -462,6 +503,13 @@ pub struct Cursor {
     /// resolve returned no segment. Carried forward so every later page
     /// reports page one's value; never compared with anything.
     pub ingest_watermark_hour: Option<u32>,
+    /// [`segment_set_digest`] of the data-object keys page one's
+    /// resolve returned, which [`PendingRedemption::confirm`] compares with
+    /// the redeeming resolve's (see this module's "The pinned segment set"
+    /// docs). `None` when the backend reported no segment set. A later page
+    /// carries page one's value forward, so every page of a walk compares
+    /// against page one.
+    pub segment_set_digest: Option<[u8; 32]>,
     pub position: CursorPosition,
     /// The instant page one resolved at, and the instant every redeeming
     /// resolve runs at ([`PendingRedemption::resolve_at_ns`]).
@@ -563,6 +611,14 @@ impl Cursor {
             Some(hour) => {
                 buf.push(1);
                 buf.extend_from_slice(&hour.to_le_bytes());
+            }
+        }
+
+        match &self.segment_set_digest {
+            None => buf.push(0),
+            Some(digest) => {
+                buf.push(1);
+                buf.extend_from_slice(digest);
             }
         }
 
@@ -697,6 +753,12 @@ impl Cursor {
             _ => return Err(CursorError::Invalid),
         };
 
+        let segment_set_digest = match cur.read_u8()? {
+            0 => None,
+            1 => Some(cur.read_array::<32>()?),
+            _ => return Err(CursorError::Invalid),
+        };
+
         let position = match cur.read_u8()? {
             0 => {
                 let tuple = read_bytes_vec(&mut cur)?;
@@ -733,6 +795,7 @@ impl Cursor {
             pending_erasure,
             declared_column_set_digest,
             ingest_watermark_hour,
+            segment_set_digest,
             position,
             mint_ns,
             deadline_ns,
@@ -767,16 +830,16 @@ impl Cursor {
     /// either cannot read past the pin's protection.
     ///
     /// That clamp is also the compaction check of the 2026-09-10 amendment to
-    /// ADR-1374 D5, and the only one. `protection_horizon_ns` minus
-    /// [`GRACE_NS`] is the instant past which a sweep may compact away what
-    /// the pin resolves to, so a cursor whose pin is no longer protected is
-    /// [`CursorError::Expired`] before anything else here runs. Nothing else
-    /// in this codec can observe a compaction, and a second mechanism for it
-    /// would only be a second thing to keep in agreement with this one.
+    /// ADR-1374 D5. `protection_horizon_ns` minus [`GRACE_NS`] is the instant
+    /// past which a sweep may delete what the pin resolves to, so a cursor
+    /// whose pin is no longer protected is [`CursorError::Expired`] before
+    /// anything else here runs. A compaction inside the horizon leaves the
+    /// pin readable; it changes the segment set, which only
+    /// [`PendingRedemption::confirm`] can see.
     ///
-    /// The erasure and declared-column checks are not here: both compare the
-    /// pin with what the redeeming resolve observed, which does not exist yet.
-    /// They are [`PendingRedemption::confirm`].
+    /// The erasure, declared-column and segment-set checks are not here: each
+    /// compares the pin with what the redeeming resolve observed, which does
+    /// not exist yet. They are [`PendingRedemption::confirm`].
     //
     // Every parameter is a distinct precondition of a single redemption, and
     // a caller that omits one has skipped a check. Grouping them into a
@@ -871,13 +934,13 @@ impl Cursor {
 ///
 /// ```
 /// #![deny(unused_must_use)]
-/// use ravel_mcp::cursor::{Cursor, CursorError, CursorKey};
+/// use ravel_mcp::cursor::{Cursor, CursorError, CursorKey, SegmentSetPin};
 /// use ravel_types::TenantHash;
 ///
 /// fn page_two(token: &str, key: &CursorKey) -> Result<(), CursorError> {
 ///     let pending =
 ///         Cursor::redeem(token, key, TenantHash([0; 16]), "ravel_search_logs", &[0; 32], 0, 0)?;
-///     pending.confirm(0, &[], &[])?;
+///     pending.confirm(0, &[], &[], None, SegmentSetPin::Advisory)?;
 ///     Ok(())
 /// }
 /// # fn main() {}
@@ -933,7 +996,7 @@ impl PendingRedemption {
 
     /// Stage two of a redemption: compare what the redeeming resolve observed
     /// with the pin, and hand back the cursor and its position only when
-    /// nothing moved.
+    /// nothing the walk depends on moved.
     ///
     /// `now_ns` is the redeeming call's clock read when its resolve finished.
     /// The deadline stage one checked is tested again against it, so a
@@ -1014,12 +1077,23 @@ impl PendingRedemption {
     /// arrives per call as an absolute instant, the crate has no startup step
     /// of its own, and it holds no ravel-catalog or ravel-maintain dependency
     /// to read either configured value from.
+    ///
+    /// `observed_segment_set` is the segment set digest the redeeming resolve
+    /// reported, checked last, after every check above passed. Under
+    /// [`SegmentSetPin::Required`] it must be `Some` and equal to the pinned
+    /// digest, which must be `Some` too; anything else is
+    /// [`CursorError::SegmentSetMoved`]. Under [`SegmentSetPin::Advisory`] the
+    /// cursor is confirmed whatever the digests say, and
+    /// [`Confirmed::segment_set_moved`] is set when both are `Some` and
+    /// differ.
     pub fn confirm(
         self,
         now_ns: i64,
         observed_erasure: &[(Signal, ErasurePredicate)],
         observed_declared_columns: &[DeclaredColumn],
-    ) -> Result<Cursor, CursorError> {
+        observed_segment_set: Option<[u8; 32]>,
+        pin: SegmentSetPin,
+    ) -> Result<Confirmed, CursorError> {
         if now_ns >= self.cursor.deadline_ns {
             return Err(CursorError::Expired);
         }
@@ -1031,8 +1105,78 @@ impl PendingRedemption {
         {
             return Err(CursorError::Expired);
         }
-        Ok(self.cursor)
+        let segment_set_moved = match (self.cursor.segment_set_digest, observed_segment_set) {
+            (Some(pinned), Some(observed)) => pinned != observed,
+            // Nothing to compare: only a walk that needs the pin refuses.
+            _ => pin == SegmentSetPin::Required,
+        };
+        if segment_set_moved && pin == SegmentSetPin::Required {
+            return Err(CursorError::SegmentSetMoved);
+        }
+        Ok(Confirmed {
+            cursor: self.cursor,
+            segment_set_moved,
+        })
     }
+}
+
+/// How [`PendingRedemption::confirm`] treats a segment set that moved since
+/// page one (see this module's "The pinned segment set" docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentSetPin {
+    /// The page is exact only over page one's segments: a different digest,
+    /// or a digest missing on either side, is
+    /// [`CursorError::SegmentSetMoved`].
+    Required,
+    /// The page is served over whatever the redeeming resolve returned, and
+    /// a difference is reported as [`Confirmed::segment_set_moved`].
+    Advisory,
+}
+
+/// A cursor [`PendingRedemption::confirm`] accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Confirmed {
+    pub cursor: Cursor,
+    /// Under [`SegmentSetPin::Advisory`], whether both digests were reported
+    /// and differ. Always `false` under [`SegmentSetPin::Required`], where a
+    /// difference is an error instead.
+    pub segment_set_moved: bool,
+}
+
+/// The warning a later page served under [`SegmentSetPin::Advisory`] carries
+/// when [`Confirmed::segment_set_moved`] is set.
+pub const SEGMENT_SET_MOVED_WARNING: &str = "segment set changed since page one: a row \
+    committed since may appear on this page or be omitted (ADR-1374, 2026-09-12 \
+    amendment, item 4)";
+
+/// Domain-separation context for [`segment_set_digest`], in BLAKE3's
+/// derive-key mode. It names what is hashed, the segment set ravel-sql
+/// resolved, rather than the crate that hashes it.
+const SEGMENT_SET_CONTEXT: &str = "ravel-sql resolved segment set v1";
+
+/// The digest a cursor pins for the segments a statement resolved: BLAKE3-256
+/// in derive-key mode under [`SEGMENT_SET_CONTEXT`], over each data-object key
+/// behind its `u32` little-endian byte length, the keys sorted and
+/// deduplicated first. The order `keys` lists them in and any repeats do not
+/// change the digest, and an empty set has a digest of its own.
+///
+/// The keys are the ones `ravel_sql::SqlOutcome::segment_set` reports. A data
+/// object is immutable and its key embeds its content hash, so an equal digest
+/// means the same rows were read, and a compaction, which writes new keys,
+/// changes it.
+pub fn segment_set_digest<'a>(keys: impl Iterator<Item = &'a str>) -> [u8; 32] {
+    let mut keys: Vec<&str> = keys.collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let mut hasher = blake3::Hasher::new_derive_key(SEGMENT_SET_CONTEXT);
+    for key in keys {
+        // A data-object key is a short fixed layout (docs/catalog-and-mvcc.md),
+        // nowhere near `u32::MAX` bytes.
+        let len = u32::try_from(key.len()).unwrap_or(u32::MAX);
+        hasher.update(&len.to_le_bytes());
+        hasher.update(key.as_bytes());
+    }
+    *hasher.finalize().as_bytes()
 }
 
 /// Domain-separation context for [`declared_column_set_digest`], in BLAKE3's
@@ -1536,6 +1680,10 @@ mod tests {
     /// check is inert in every test but the three that exercise it.
     const NO_ERASURE: &[(Signal, ErasurePredicate)] = &[];
 
+    /// The segment set digest [`sample_cursor`] pins, observed unchanged by
+    /// every redemption that is not about the segment set.
+    const SAMPLE_SEGMENTS: Option<[u8; 32]> = Some([0x5Eu8; 32]);
+
     fn test_key() -> CursorKey {
         CursorKey::from_process_secret([0x11u8; CURSOR_KEY_LEN])
     }
@@ -1579,7 +1727,15 @@ mod tests {
             now_ns,
             protection_horizon_ns,
         )?;
-        pending.confirm(now_ns, erasure, &sample_declared())
+        pending
+            .confirm(
+                now_ns,
+                erasure,
+                &sample_declared(),
+                SAMPLE_SEGMENTS,
+                SegmentSetPin::Required,
+            )
+            .map(|confirmed| confirmed.cursor)
     }
 
     /// The declared column set [`sample_cursor`] pins the digest of.
@@ -1613,6 +1769,7 @@ mod tests {
             )])],
             declared_column_set_digest: declared_column_set_digest(&sample_declared()),
             ingest_watermark_hour: Some(472_222),
+            segment_set_digest: SAMPLE_SEGMENTS,
             position: CursorPosition::Keyset {
                 tuple: vec![1, 2, 3],
                 order_by: vec!["timestamp desc".to_owned()],
@@ -2052,7 +2209,14 @@ mod tests {
                 NOW_NS,
                 FAR_HORIZON_NS,
             )?
-            .confirm(NOW_NS, NO_ERASURE, &declared)
+            .confirm(
+                NOW_NS,
+                NO_ERASURE,
+                &declared,
+                SAMPLE_SEGMENTS,
+                SegmentSetPin::Required,
+            )
+            .map(|confirmed| confirmed.cursor)
         };
         let cursor = Cursor {
             tenant,
@@ -2090,6 +2254,7 @@ mod tests {
             ],
             declared_column_set_digest: declared_column_set_digest(&declared),
             ingest_watermark_hour: Some(472_223),
+            segment_set_digest: SAMPLE_SEGMENTS,
             position: CursorPosition::Keyset {
                 tuple: vec![7, 8, 9, 10],
                 order_by: vec!["timestamp desc".to_owned(), "trace_id asc".to_owned()],
@@ -2211,6 +2376,247 @@ mod tests {
         )
         .expect_err("must be refused");
         assert_eq!(err, CursorError::Invalid);
+    }
+
+    /// Version 7 added the segment set digest after the ingest watermark
+    /// hour, so a version 6 token reads its position tag where this layout
+    /// reads the digest's presence byte: it is refused at the header, through
+    /// `decode` and through stage one, as the version 3, 4 and 5 tokens are.
+    ///
+    /// FLIP: with `CURSOR_VERSION` left at 6 over the new layout the token
+    /// decodes.
+    #[test]
+    fn a_version_6_token_is_invalid() {
+        let tenant = TenantHash([0x62u8; 16]);
+        let key = test_key();
+        let token = sample_cursor(tenant).encode(&key).expect("encodes");
+        assert!(
+            Cursor::decode(&token, &key).is_ok(),
+            "the unedited token decodes, so the edit below is what refuses it"
+        );
+
+        let mut bytes = token_bytes(&token);
+        assert_eq!(bytes[CURSOR_MAGIC.len()], CURSOR_VERSION);
+        bytes[CURSOR_MAGIC.len()] = 6;
+        let stale = remint(bytes, &key);
+
+        let err = Cursor::decode(&stale, &key).expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+        let err = Cursor::redeem(
+            &stale,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+    }
+
+    /// The pinned segment set digest round-trips as `Some` and as `None`,
+    /// `Some` costs exactly its 32 digest bytes over `None` (33 bytes against
+    /// the one presence byte), and a presence byte other than 0 or 1,
+    /// re-signed so the MAC is not what refuses it, is `Invalid`.
+    ///
+    /// FLIP: an encode that never writes the digest (decode always `None`)
+    /// fails the `Some` case. FLIP: a decode that reads any non-zero presence
+    /// byte as `Some` decodes the presence byte 2 token.
+    #[test]
+    fn the_pinned_segment_set_round_trips_and_its_presence_byte_is_checked() {
+        let tenant = TenantHash([0x63u8; 16]);
+        let key = test_key();
+        for digest in [Some([0xC4u8; 32]), None] {
+            let mut cursor = sample_cursor(tenant);
+            cursor.segment_set_digest = digest;
+            let token = cursor.encode(&key).expect("encodes");
+            let decoded = Cursor::decode(&token, &key).expect("round-trips");
+            assert_eq!(decoded.segment_set_digest, digest);
+            assert_eq!(decoded, cursor);
+        }
+
+        let encoded = |digest: Option<[u8; 32]>| {
+            let mut cursor = sample_cursor(tenant);
+            cursor.segment_set_digest = digest;
+            token_bytes(&cursor.encode(&key).expect("encodes"))
+        };
+        assert_eq!(encoded(Some([0xC4u8; 32])).len(), encoded(None).len() + 32);
+
+        let mut bytes = encoded(Some([0xC4u8; 32]));
+        let mut needle = vec![1u8];
+        needle.extend_from_slice(&[0xC4u8; 32]);
+        let at = bytes
+            .windows(needle.len())
+            .position(|window| window == needle.as_slice())
+            .expect("the presence byte and the digest are in the payload");
+        assert!(at > HEADER_LEN, "must edit the body, not the header");
+        bytes[at] = 2;
+        let err = Cursor::decode(&remint(bytes, &key), &key).expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+    }
+
+    /// Under `SegmentSetPin::Required` a cursor confirms only when both the
+    /// pinned and the observed digest are present and equal; a different
+    /// digest, or a missing one on either side, is `SegmentSetMoved`, which
+    /// the D4 envelope reports as `cursor_expired`.
+    ///
+    /// FLIP F: a `confirm` that ignores the digest confirms the moved case.
+    /// FLIP G: a `confirm` that treats a missing digest as a match confirms
+    /// the three cases with `None` on a side.
+    #[test]
+    fn a_required_segment_set_confirms_only_an_equal_digest() {
+        let tenant = TenantHash([0x65u8; 16]);
+        let key = test_key();
+        let pinned = [0xC4u8; 32];
+        let moved = [0xC5u8; 32];
+        let confirm = |cursor_digest: Option<[u8; 32]>, observed: Option<[u8; 32]>| {
+            let mut cursor = sample_cursor(tenant);
+            cursor.segment_set_digest = cursor_digest;
+            let token = cursor.encode(&key).expect("encodes");
+            pending_for(&token, &key, tenant).confirm(
+                NOW_NS,
+                &pinned_erasure(&cursor),
+                &sample_declared(),
+                observed,
+                SegmentSetPin::Required,
+            )
+        };
+
+        let confirmed = confirm(Some(pinned), Some(pinned)).expect("the same segment set");
+        assert!(!confirmed.segment_set_moved);
+        assert_eq!(confirmed.cursor.segment_set_digest, Some(pinned));
+
+        for (what, cursor_digest, observed) in [
+            ("a different digest", Some(pinned), Some(moved)),
+            ("no observed digest", Some(pinned), None),
+            ("no pinned digest", None, Some(pinned)),
+            ("no digest on either side", None, None),
+        ] {
+            let err = confirm(cursor_digest, observed).expect_err(what);
+            assert_eq!(err, CursorError::SegmentSetMoved, "{what}");
+            assert_eq!(err.failure().class, FailureClass::CursorExpired, "{what}");
+        }
+    }
+
+    /// Under `SegmentSetPin::Advisory` a cursor confirms whatever the
+    /// digests say, and `segment_set_moved` is set exactly when both are
+    /// present and differ.
+    ///
+    /// FLIP F: a `confirm` that ignores the digest leaves `segment_set_moved`
+    /// false on the different-digest row.
+    #[test]
+    fn an_advisory_segment_set_confirms_and_reports_a_move() {
+        let tenant = TenantHash([0x66u8; 16]);
+        let key = test_key();
+        let pinned = [0xC4u8; 32];
+        let moved = [0xC5u8; 32];
+        for (cursor_digest, observed, expected) in [
+            (Some(pinned), Some(pinned), false),
+            (Some(pinned), Some(moved), true),
+            (Some(pinned), None, false),
+            (None, Some(pinned), false),
+            (None, None, false),
+        ] {
+            let mut cursor = sample_cursor(tenant);
+            cursor.segment_set_digest = cursor_digest;
+            let token = cursor.encode(&key).expect("encodes");
+            let confirmed = pending_for(&token, &key, tenant)
+                .confirm(
+                    NOW_NS,
+                    &pinned_erasure(&cursor),
+                    &sample_declared(),
+                    observed,
+                    SegmentSetPin::Advisory,
+                )
+                .expect("advisory never refuses on the segment set");
+            assert_eq!(
+                confirmed.segment_set_moved, expected,
+                "{cursor_digest:?} against {observed:?}"
+            );
+            assert_eq!(confirmed.cursor, cursor);
+        }
+    }
+
+    /// The segment set is checked last: a redemption that fails the
+    /// deadline, the erasure or the declared-set check reports `Expired`
+    /// even when its segment set also moved under `Required`.
+    ///
+    /// FLIP: checking the segment set first answers `SegmentSetMoved` on
+    /// every row.
+    #[test]
+    fn the_segment_set_is_checked_after_the_other_pins() {
+        let tenant = TenantHash([0x68u8; 16]);
+        let key = test_key();
+        let cursor = sample_cursor(tenant);
+        let token = cursor.encode(&key).expect("encodes");
+        let moved = Some([0xC5u8; 32]);
+        let newer = (
+            Signal::Logs,
+            ErasurePredicate::windowless(vec![("user.id".to_owned(), "u-7".to_owned())]),
+        );
+        let other_declared = vec![DeclaredColumn::new("error", DeclaredType::Bool)];
+        let cases = [
+            (
+                "deadline",
+                cursor.deadline_ns,
+                pinned_erasure(&cursor),
+                sample_declared(),
+            ),
+            ("erasure", NOW_NS, vec![newer], sample_declared()),
+            (
+                "declared set",
+                NOW_NS,
+                pinned_erasure(&cursor),
+                other_declared,
+            ),
+        ];
+        for (what, now_ns, erasure, declared) in cases {
+            let err = pending_for(&token, &key, tenant)
+                .confirm(now_ns, &erasure, &declared, moved, SegmentSetPin::Required)
+                .expect_err(what);
+            assert_eq!(err, CursorError::Expired, "{what}");
+        }
+    }
+
+    /// The segment set digest does not depend on the order the keys arrive
+    /// in or on repeats, changes when a key is added, removed or changed,
+    /// separates keys by their length prefix rather than by concatenation,
+    /// and has a value of its own for the empty set: the BLAKE3 derive-key
+    /// hash of nothing under the context.
+    ///
+    /// FLIP E: with the `sort_unstable` removed from `segment_set_digest`,
+    /// the order-independence assertion fails.
+    #[test]
+    fn the_segment_set_digest_is_over_the_sorted_deduplicated_keys() {
+        let digest = |keys: &[&str]| segment_set_digest(keys.iter().copied());
+        let ab = digest(&["a.rseg", "b.rseg"]);
+        assert_eq!(digest(&["b.rseg", "a.rseg"]), ab, "order-independent");
+        assert_eq!(digest(&["a.rseg", "b.rseg", "a.rseg"]), ab, "deduplicated");
+        assert_ne!(digest(&["a.rseg"]), ab, "a key removed");
+        assert_ne!(digest(&["a.rseg", "b.rseg", "c.rseg"]), ab, "a key added");
+        assert_ne!(digest(&["a.rseg", "B.rseg"]), ab, "a key changed");
+        assert_ne!(
+            digest(&["ab", "c"]),
+            digest(&["a", "bc"]),
+            "length-prefixed"
+        );
+
+        let empty = digest(&[]);
+        assert_eq!(
+            empty,
+            *blake3::Hasher::new_derive_key(SEGMENT_SET_CONTEXT)
+                .finalize()
+                .as_bytes(),
+        );
+        assert_ne!(empty, digest(&[""]), "the empty key is a key");
+
+        let mut by_hand = blake3::Hasher::new_derive_key("ravel-sql resolved segment set v1");
+        for key in ["a.rseg", "b.rseg"] {
+            by_hand.update(&6u32.to_le_bytes());
+            by_hand.update(key.as_bytes());
+        }
+        assert_eq!(ab, *by_hand.finalize().as_bytes(), "the pinned encoding");
     }
 
     /// A cursor is bound to the tool that minted it: handing a
@@ -2928,7 +3334,14 @@ mod tests {
         assert_eq!(pending.deadline_ns(), cursor.deadline_ns);
 
         let redeemed = pending
-            .confirm(NOW_NS, &pinned_erasure(&cursor), &sample_declared())
+            .confirm(
+                NOW_NS,
+                &pinned_erasure(&cursor),
+                &sample_declared(),
+                SAMPLE_SEGMENTS,
+                SegmentSetPin::Required,
+            )
+            .map(|confirmed| confirmed.cursor)
             .expect("nothing moved");
         assert_eq!(redeemed, cursor);
     }
@@ -2956,7 +3369,14 @@ mod tests {
         let newer = ErasurePredicate::windowless(user.clone());
 
         let err = pending_for(&token, &key, tenant)
-            .confirm(NOW_NS, &[(Signal::Logs, newer.clone())], &sample_declared())
+            .confirm(
+                NOW_NS,
+                &[(Signal::Logs, newer.clone())],
+                &sample_declared(),
+                SAMPLE_SEGMENTS,
+                SegmentSetPin::Required,
+            )
+            .map(|confirmed| confirmed.cursor)
             .expect_err("a newer erasure over the pinned signal and range");
         assert_eq!(err, CursorError::Expired);
 
@@ -2969,7 +3389,14 @@ mod tests {
         ] {
             assert_ne!(other, cursor.signal);
             let redeemed = pending_for(&token, &key, tenant)
-                .confirm(NOW_NS, &[(other, newer.clone())], &sample_declared())
+                .confirm(
+                    NOW_NS,
+                    &[(other, newer.clone())],
+                    &sample_declared(),
+                    SAMPLE_SEGMENTS,
+                    SegmentSetPin::Required,
+                )
+                .map(|confirmed| confirmed.cursor)
                 .expect("an erasure on another signal cannot touch this page");
             assert_eq!(redeemed, cursor);
         }
@@ -2980,12 +3407,26 @@ mod tests {
             cursor.range_start_ns,
         );
         let redeemed = pending_for(&token, &key, tenant)
-            .confirm(NOW_NS, &[(cursor.signal, before)], &sample_declared())
+            .confirm(
+                NOW_NS,
+                &[(cursor.signal, before)],
+                &sample_declared(),
+                SAMPLE_SEGMENTS,
+                SegmentSetPin::Required,
+            )
+            .map(|confirmed| confirmed.cursor)
             .expect("an erasure wholly before the range cannot touch this page");
         assert_eq!(redeemed, cursor);
 
         let redeemed = pending_for(&token, &key, tenant)
-            .confirm(NOW_NS, &pinned_erasure(&cursor), &sample_declared())
+            .confirm(
+                NOW_NS,
+                &pinned_erasure(&cursor),
+                &sample_declared(),
+                SAMPLE_SEGMENTS,
+                SegmentSetPin::Required,
+            )
+            .map(|confirmed| confirmed.cursor)
             .expect("the pinned predicate still pending is not newer");
         assert_eq!(redeemed, cursor);
     }
@@ -3043,7 +3484,14 @@ mod tests {
         ];
         for (what, observed) in &changed {
             let err = pending_for(&token, &key, tenant)
-                .confirm(NOW_NS, &pinned_erasure(&cursor), observed)
+                .confirm(
+                    NOW_NS,
+                    &pinned_erasure(&cursor),
+                    observed,
+                    SAMPLE_SEGMENTS,
+                    SegmentSetPin::Required,
+                )
+                .map(|confirmed| confirmed.cursor)
                 .expect_err(what);
             assert_eq!(err, CursorError::Expired, "{what}");
         }
@@ -3054,7 +3502,14 @@ mod tests {
             vec![status.clone(), route.clone(), status.clone()],
         ] {
             let redeemed = pending_for(&token, &key, tenant)
-                .confirm(NOW_NS, &pinned_erasure(&cursor), &observed)
+                .confirm(
+                    NOW_NS,
+                    &pinned_erasure(&cursor),
+                    &observed,
+                    SAMPLE_SEGMENTS,
+                    SegmentSetPin::Required,
+                )
+                .map(|confirmed| confirmed.cursor)
                 .expect("the same set redeems in any order and with repeats");
             assert_eq!(redeemed, cursor);
         }
@@ -3099,12 +3554,26 @@ mod tests {
 
         let reversed: Vec<DeclaredColumn> = declared.iter().rev().cloned().collect();
         let redeemed = pending_for(&token, &key, tenant)
-            .confirm(NOW_NS, &pinned_erasure(&cursor), &reversed)
+            .confirm(
+                NOW_NS,
+                &pinned_erasure(&cursor),
+                &reversed,
+                SAMPLE_SEGMENTS,
+                SegmentSetPin::Required,
+            )
+            .map(|confirmed| confirmed.cursor)
             .expect("the same set redeems");
         assert_eq!(redeemed, cursor);
 
         let err = pending_for(&token, &key, tenant)
-            .confirm(NOW_NS, &pinned_erasure(&cursor), &declared[1..])
+            .confirm(
+                NOW_NS,
+                &pinned_erasure(&cursor),
+                &declared[1..],
+                SAMPLE_SEGMENTS,
+                SegmentSetPin::Required,
+            )
+            .map(|confirmed| confirmed.cursor)
             .expect_err("one column fewer is a changed set");
         assert_eq!(err, CursorError::Expired);
     }
@@ -3144,7 +3613,14 @@ mod tests {
             ("reordered", on_logs(&[&user, &region])),
         ] {
             let redeemed = pending_for(&token, &key, tenant)
-                .confirm(NOW_NS, &in_force, &sample_declared())
+                .confirm(
+                    NOW_NS,
+                    &in_force,
+                    &sample_declared(),
+                    SAMPLE_SEGMENTS,
+                    SegmentSetPin::Required,
+                )
+                .map(|confirmed| confirmed.cursor)
                 .expect(what);
             assert_eq!(redeemed.pending_erasure, cursor.pending_erasure, "{what}");
         }
@@ -3154,7 +3630,10 @@ mod tests {
                 NOW_NS,
                 &on_logs(&[&region, &user, &host]),
                 &sample_declared(),
+                SAMPLE_SEGMENTS,
+                SegmentSetPin::Required,
             )
+            .map(|confirmed| confirmed.cursor)
             .expect_err("a newer predicate in scope");
         assert_eq!(err, CursorError::Expired);
     }
@@ -3328,7 +3807,14 @@ mod tests {
         let resolve_at_ns = pending.resolve_at_ns();
         let observed: Vec<DeclaredColumn> = declared.iter().rev().cloned().collect();
         let redeemed = pending
-            .confirm(NOW_NS, &pinned_erasure(&cursor), &observed)
+            .confirm(
+                NOW_NS,
+                &pinned_erasure(&cursor),
+                &observed,
+                SAMPLE_SEGMENTS,
+                SegmentSetPin::Required,
+            )
+            .map(|confirmed| confirmed.cursor)
             .expect("nothing moved");
         let page_two = snapshot_id(
             redeemed.tenant,
@@ -3461,19 +3947,40 @@ mod tests {
 
         assert_eq!(
             redeem()
-                .confirm(cursor.deadline_ns, NO_ERASURE, &declared)
+                .confirm(
+                    cursor.deadline_ns,
+                    NO_ERASURE,
+                    &declared,
+                    SAMPLE_SEGMENTS,
+                    SegmentSetPin::Required
+                )
+                .map(|confirmed| confirmed.cursor)
                 .expect_err("a resolve finishing on the deadline is refused"),
             CursorError::Expired
         );
         assert_eq!(
             redeem()
-                .confirm(cursor.deadline_ns + 1, NO_ERASURE, &declared)
+                .confirm(
+                    cursor.deadline_ns + 1,
+                    NO_ERASURE,
+                    &declared,
+                    SAMPLE_SEGMENTS,
+                    SegmentSetPin::Required
+                )
+                .map(|confirmed| confirmed.cursor)
                 .expect_err("a resolve finishing past the deadline is refused"),
             CursorError::Expired
         );
         assert_eq!(
             redeem()
-                .confirm(cursor.deadline_ns - 1, NO_ERASURE, &declared)
+                .confirm(
+                    cursor.deadline_ns - 1,
+                    NO_ERASURE,
+                    &declared,
+                    SAMPLE_SEGMENTS,
+                    SegmentSetPin::Required
+                )
+                .map(|confirmed| confirmed.cursor)
                 .expect("a resolve finishing before the deadline confirms"),
             cursor
         );
@@ -3556,6 +4063,7 @@ mod tests {
     fn cursor_error_failure_mapping_is_exhaustive() {
         let all = [
             CursorError::Expired,
+            CursorError::SegmentSetMoved,
             CursorError::Invalid,
             CursorError::TokenTooLong { len: 9, max: 8 },
             CursorError::FieldTooLong { len: 9, max: 8 },
@@ -3563,6 +4071,7 @@ mod tests {
         for error in all {
             let expected = match error {
                 CursorError::Expired => FailureClass::CursorExpired,
+                CursorError::SegmentSetMoved => FailureClass::CursorExpired,
                 CursorError::Invalid => FailureClass::CursorInvalid,
                 CursorError::TokenTooLong { .. } => FailureClass::CursorInvalid,
                 CursorError::FieldTooLong { .. } => FailureClass::Internal,

@@ -46,7 +46,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::catalog::DescribeDataInput;
-use crate::cursor::{Cursor, CursorError, CursorPosition};
+use crate::cursor::{Cursor, CursorError, CursorPosition, SegmentSetPin};
 use crate::draft::{Draft, PageOrder, PinScope};
 use crate::envelope::{
     AnyJson, Budget, Cell, Column, Envelope, Failure, FailureClass, Row, TimeRange,
@@ -129,6 +129,7 @@ async fn first_page<B: QueryBackend>(
         outcome.pending_erasure.clone(),
         outcome.declared_column_set.clone(),
         outcome.ingest_watermark_hour,
+        None,
         outcome.resolved_at_ns,
     );
     let scope = PinScope {
@@ -180,11 +181,17 @@ async fn later_page<B: QueryBackend>(
         .iter()
         .map(|predicate| (signal, predicate.clone()))
         .collect();
-    let confirmed =
-        match pending.confirm(ctx.now_ns, &observed_erasure, &outcome.declared_column_set) {
-            Ok(confirmed) => confirmed,
-            Err(error) => return refused(error.failure(), ctx),
-        };
+    // No segment set to pin: `None` under `Advisory` checks nothing, as before.
+    let confirmed = match pending.confirm(
+        ctx.now_ns,
+        &observed_erasure,
+        &outcome.declared_column_set,
+        None,
+        SegmentSetPin::Advisory,
+    ) {
+        Ok(confirmed) => confirmed.cursor,
+        Err(error) => return refused(error.failure(), ctx),
+    };
     if let Err(failure) = resume.still_listed(&outcome) {
         return refused(failure, ctx);
     }
@@ -212,6 +219,7 @@ async fn later_page<B: QueryBackend>(
         outcome.pending_erasure.clone(),
         outcome.declared_column_set.clone(),
         outcome.ingest_watermark_hour,
+        None,
         outcome.resolved_at_ns,
     )
     .pinned_to(&confirmed, outcome.declared_column_set.clone());

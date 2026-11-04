@@ -105,22 +105,37 @@
 //!
 //! A [`Provenance::Expression`] is answered by the expression itself
 //! ([`expression_is_non_null`]), with no schema involved: a literal is NON
-//! NULL wherever it is selected from. An aggregate never reaches that proof,
-//! `count(...)` included, although it is never NULL: see the next section.
+//! NULL wherever it is selected from, and so is `count(...)`, which is 0
+//! over no rows. `count` is the one function that proof admits, and an
+//! aggregate reaches it only through the next section.
 //!
-//! # A term computed from other rows has no position
+//! # A term computed from other rows has a position only over fixed segments
 //!
 //! An aggregate, a window function and a subquery each compute a row's value
 //! from rows other than that one ([`depends_on_other_rows`]), and such a
-//! value is not a stable keyset position. A cursor pins the ingest hours its
-//! mint instant lists, not what those hours hold, so a row committed into one
-//! of them after the mint changes `count(*)` for its group, or `count(*) OVER
-//! ()` for every row. A group already served then sorts back in after the
-//! cursor and is served again, and ADR-1374's 2026-09-12 amendment, item 4,
-//! says a row is never repeated. So a term that names or is such an
-//! expression is [`PagePlanError::OrderTermFromOtherRows`], which the paging
-//! tool answers by running the statement as written, with no cursor, the way
-//! it answers [`PagePlanError::NoOrdering`].
+//! value is a keyset position only while the rows it is computed from stay
+//! the same. A cursor's resolve instant pins the ingest hours it lists, not
+//! what those hours hold, so a row committed into one of them after the mint
+//! changes `count(*)` for its group, or `count(*) OVER ()` for every row. A
+//! group already served then sorts back in after the cursor and is served
+//! again, and ADR-1374's 2026-09-12 amendment, item 4, says a row is never
+//! repeated.
+//!
+//! So a term that names or is such an expression plans only when
+//! [`expression_is_non_null`] proves it, which for an aggregate means
+//! `count(...)`, and only when no window inside it counts over a `ROWS`
+//! frame or a named window ([`calls_a_positional_window`]). Its plan sets
+//! [`PagePlan::order_from_other_rows`], and the paging tool then serves a
+//! later page only over the segment set page one resolved, which it pins in
+//! the cursor (ADR-1374, pinned segment set amendment): over the same
+//! segments the value is the same, and a walk whose segments changed ends
+//! rather than repeating a row. Every other such term (`sum`, `min`, `max`,
+//! `avg`, any other window function, a subquery) is
+//! [`PagePlanError::OrderTermFromOtherRows`], which the paging tool answers
+//! by running the statement as written, with no cursor, the way it answers
+//! [`PagePlanError::NoOrdering`]. A `count` written in the `ORDER BY` rather
+//! than named there plans as the one output column the projection defines as
+//! that same expression, and is that refusal when there is none.
 //!
 //! The other clauses of the rule are read off the term's TYPE, from the same
 //! two routes: the public schema's field type for a base column
@@ -260,8 +275,11 @@
 //! change a window's value: `count(*) OVER ()` is not counted down page by
 //! page. A late row does change it, because a later page reads the rows
 //! committed since the mint into the hours the mint lists, so a window value
-//! is projected on every page and is never an order term a cursor resumes on
-//! (see "A term computed from other rows has no position" above).
+//! is an order term a cursor resumes on only when it is a `count` and the
+//! paging tool holds the walk to page one's segment set (see "A term computed
+//! from other rows has a position only over fixed segments" above); any other
+//! window value is projected on every page and ordered by nothing a cursor
+//! carries.
 //!
 //! The wrap is what makes the keyset predicate land on the statement's OUTPUT
 //! rows. Injected into the caller's own `WHERE`, it would filter before any
@@ -283,7 +301,7 @@ use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
     Distinct, Expr as SqlExpr, Function, FunctionArguments, GroupByExpr, Ident, ObjectName,
     OrderBy, OrderByExpr, OrderByKind, OrderByOptions, Query, Select, SetExpr, Statement,
-    TableFactor, UnaryOperator, Value, Visit, Visitor,
+    TableFactor, UnaryOperator, Value, Visit, Visitor, WindowFrameUnits, WindowType,
 };
 
 use crate::alerts_schema::alerts_schema;
@@ -554,23 +572,22 @@ pub enum PagePlanError {
     OrderTermNotRepresentable { column: String, kind: String },
 
     /// An `ORDER BY` term whose value is computed from rows other than its
-    /// own: an aggregate, a window function, or a subquery, anywhere in the
-    /// expression the term names or is.
+    /// own (an aggregate, a window function, or a subquery, anywhere in the
+    /// expression the term names or is) and that is not proven NON NULL:
+    /// anything but `count(...)`, and a `count` over a `ROWS` frame or a
+    /// named window.
     ///
     /// Not a refusal of the statement, and the paging tool does not answer it
     /// as one: like [`Self::NoOrdering`], it says the statement has no
     /// position a cursor can resume from, so it runs as written and its first
-    /// page carries no cursor. A keyset position on such a term is not
-    /// stable. A row committed after the mint into an ingest hour the mint
-    /// lists changes `count(*)` for its group, or `count(*) OVER ()` for
-    /// every row, so a row already served sorts back in after the cursor and
-    /// is served again, which ADR-1374's 2026-09-12 amendment, item 4, says
-    /// never happens.
+    /// page carries no cursor. `sum`, `min`, `max` and `avg` are NULL over an
+    /// empty input, and a keyset predicate resumed at NULL selects nothing; a
+    /// window function other than `count` and a subquery are not read for
+    /// nullability at all.
     #[error(
         "the ORDER BY term `{term}` is computed from rows other than its own \
-         (an aggregate, a window function or a subquery), so a row committed \
-         after a cursor was minted can move a row already served to after the \
-         cursor position; no cursor is minted on it"
+         (an aggregate, a window function or a subquery) and is not proven \
+         non-null, so no cursor is minted on it; only count(...) is"
     )]
     OrderTermFromOtherRows { term: String },
 
@@ -804,6 +821,12 @@ pub struct PagePlan {
     pub tiebreak_appended: Vec<String>,
     /// Why [`Self::order_by`] is not a total order, or `None` when it is.
     pub not_total: Option<NotTotalOrder>,
+    /// Whether one of the statement's own order terms is computed from other
+    /// rows (a `count`, the one such term that plans): its value moves when a
+    /// row lands in the segments the walk reads, so a later page is exact
+    /// only over the segment set page one resolved (ADR-1374, pinned segment
+    /// set amendment). A tiebreak column never sets it.
+    pub order_from_other_rows: bool,
 }
 
 impl PagePlan {
@@ -838,7 +861,7 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
     // itself.
     let names = OutputResolution::of(&query, target);
 
-    let mut terms = statement_order_terms(&query, &names)?;
+    let (mut terms, order_from_other_rows) = statement_order_terms(&query, &names)?;
     for term in &terms {
         if matches!(names.resolve(&term.column), Provenance::NotProjected) {
             return Err(PagePlanError::OrderTermNotProjected {
@@ -894,6 +917,7 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
         order_by: terms,
         tiebreak_appended,
         not_total,
+        order_from_other_rows,
     })
 }
 
@@ -1251,6 +1275,25 @@ mod resolution {
                 Source::Opaque(reason) => Provenance::Opaque(reason),
                 Source::Absent => Provenance::NotProjected,
             }
+        }
+
+        /// The one output name the projection declares as exactly `expr`,
+        /// compared by its rendered text, or `None` when no name or more than
+        /// one does.
+        pub(super) fn name_defined_as(&self, expr: &SqlExpr) -> Option<&str> {
+            let written = expr.to_string();
+            let mut names =
+                self.projection
+                    .declared
+                    .iter()
+                    .filter_map(|(name, source)| match source {
+                        OutputSource::Expression(defining) if defining.to_string() == written => {
+                            Some(name.as_str())
+                        }
+                        _ => None,
+                    });
+            let name = names.next()?;
+            names.next().is_none().then_some(name)
         }
     }
 
@@ -1790,6 +1833,10 @@ fn expression_cursor_support(expr: &SqlExpr) -> CursorSupport {
             }
             _ => CursorSupport::Unrepresentable(format!("the expression `{expr}`")),
         },
+        // `count` is typed `Int64` in every spelling.
+        SqlExpr::Function(function) if is_count_call(function) => {
+            CursorSupport::Exact(ResumeKind::Int)
+        }
         other => CursorSupport::Unrepresentable(format!("the expression `{other}`")),
     }
 }
@@ -1858,9 +1905,9 @@ fn negated_number_cursor_support(text: &str) -> CursorSupport {
 /// [`expression_cursor_support`] reading the expression itself, with no schema
 /// consulted and no basis required: a literal is NON NULL whatever relation it
 /// is selected from, including under an outer join or a `ROLLUP`, because it
-/// is not a grouping column that a super-aggregate row can null. An
-/// expression computed from other rows does not arrive here:
-/// [`statement_order_terms`] answers it first.
+/// is not a grouping column that a super-aggregate row can null, and the same
+/// holds for `count`. An expression computed from other rows arrives here
+/// only when [`statement_order_terms`] admitted it, which is a `count`.
 fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
     let (table, source) = match names.resolve(column) {
         Provenance::BaseColumn { table, column } => (table, column),
@@ -1910,11 +1957,13 @@ fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
 /// - a literal other than `NULL`, and other than a placeholder, whose value
 ///   arrives at execution time;
 /// - parentheses, and a unary `+` or `-`, which are NULL exactly when their
-///   operand is.
+///   operand is;
+/// - a call of `count` ([`is_count_call`]), in any spelling and with any
+///   arguments, `FILTER`, `DISTINCT` or `OVER`: it counts rows or non-null
+///   values, so an empty input is 0 rather than NULL.
 ///
-/// No function is admitted. `count(...)` is never NULL, but it is an
-/// aggregate, and an aggregate is answered before this is asked
-/// ([`depends_on_other_rows`]).
+/// `count` is the one function admitted. Every other aggregate is NULL over
+/// an empty input, and no other function's nullability is read here.
 ///
 /// Anything else answers `false`, which is a refusal rather than a plan. A
 /// case added here has to hold for every input, not merely for the inputs a
@@ -1927,19 +1976,73 @@ fn expression_is_non_null(expr: &SqlExpr) -> bool {
             op: UnaryOperator::Plus | UnaryOperator::Minus,
             expr,
         } => expression_is_non_null(expr),
+        SqlExpr::Function(function) => is_count_call(function),
         _ => false,
     }
+}
+
+/// Whether a call is `count`: its name's last part is `count` in any case,
+/// quoted or qualified. Its arguments and clauses are not read.
+fn is_count_call(function: &Function) -> bool {
+    function
+        .name
+        .0
+        .last()
+        .and_then(|part| part.as_ident())
+        .is_some_and(|ident| ident.value.eq_ignore_ascii_case("count"))
+}
+
+/// Whether an expression calls a window function over a `ROWS` frame or a
+/// named window, anywhere inside it.
+///
+/// A `ROWS` frame counts positions, and the engine places rows that tie under
+/// the window's own ordering in no fixed order, so the same rows can give a
+/// row a different value on the next execution. A named window's frame is
+/// written in the `WINDOW` clause, which this does not resolve. Either way the
+/// value is no position a later page can resume from, so a `count` written
+/// with one is not admitted as an order term.
+fn calls_a_positional_window(expr: &SqlExpr) -> bool {
+    struct Positional;
+    impl Visitor for Positional {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<()> {
+            let SqlExpr::Function(function) = expr else {
+                return ControlFlow::Continue(());
+            };
+            let positional = match &function.over {
+                None => false,
+                Some(WindowType::NamedWindow(_)) => true,
+                Some(WindowType::WindowSpec(spec)) => {
+                    spec.window_name.is_some()
+                        || spec
+                            .window_frame
+                            .as_ref()
+                            .is_some_and(|frame| frame.units == WindowFrameUnits::Rows)
+                }
+            };
+            if positional {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+    expr.visit(&mut Positional).is_break()
 }
 
 /// Whether an expression's value for a row is computed from rows other than
 /// that one: it calls an aggregate or a window function, or reads a subquery,
 /// anywhere inside it.
 ///
-/// Such a value is no keyset position. A row committed after a cursor was
-/// minted, into an ingest hour the mint lists, changes `count(*)` for its
-/// group and `count(*) OVER ()` for every row, so a row already served can
-/// sort back in after the cursor and be served twice. ADR-1374's 2026-09-12
-/// amendment, item 4, says a row is never repeated.
+/// Such a value is a keyset position only over the rows page one read. A row
+/// committed after a cursor was minted, into an ingest hour the mint lists,
+/// changes `count(*)` for its group and `count(*) OVER ()` for every row, so
+/// a row already served can sort back in after the cursor and be served
+/// twice. ADR-1374's 2026-09-12 amendment, item 4, says a row is never
+/// repeated, so a term this answers true for sets
+/// [`PagePlan::order_from_other_rows`], and the paging tool serves a later
+/// page only over the segment set page one resolved.
 ///
 /// A function is an aggregate or a window function when its name is one the
 /// session registers as either ([`ADMITTED_AGGREGATES`],
@@ -1948,8 +2051,9 @@ fn expression_is_non_null(expr: &SqlExpr) -> bool {
 /// null treatment, `DISTINCT`/`ALL` or an argument-list clause, or a
 /// parameter list. The name is matched on its last part, in any case, so a
 /// qualified or quoted spelling is caught too. Reading too wide here is safe:
-/// a term this answers true for runs once with no cursor, and no other
-/// function term is proven NON NULL, so none would get a cursor either way.
+/// a term this answers true for runs once with no cursor unless
+/// [`expression_is_non_null`] proves it, and the only function that proves is
+/// `count`, which is an aggregate either way.
 fn depends_on_other_rows(expr: &SqlExpr) -> bool {
     struct OtherRows;
     impl Visitor for OtherRows {
@@ -2137,15 +2241,22 @@ fn shape_of<'a>(query: &'a Query) -> Option<SelectShape<'a>> {
 /// ran under an ordering the caller had not written. Each term's
 /// `OrderByExpr` and its `OrderByOptions` are named the same way.
 ///
-/// A term computed from other rows ([`PagePlanError::OrderTermFromOtherRows`])
-/// is looked for across every term before any other term is read, whether it
-/// is written in the `ORDER BY` or names an output column defined by one:
-/// such a statement runs as written with no cursor, so no other term's
-/// refusal applies to it.
+/// A term computed from other rows is looked for across every term before any
+/// other term is read, whether it is written in the `ORDER BY` or names an
+/// output column defined by one. One that [`expression_is_non_null`] does not
+/// prove, or that calls a window function over a `ROWS` frame or a named
+/// window ([`calls_a_positional_window`]), is
+/// [`PagePlanError::OrderTermFromOtherRows`]: such a statement runs as written
+/// with no cursor, so no other term's refusal applies to it. One that is
+/// proven pages, and the second value returned says so
+/// ([`PagePlan::order_from_other_rows`]). Written in the `ORDER BY` rather
+/// than named, it is taken as the one output column the projection defines as
+/// that same expression ([`OutputResolution::name_defined_as`]), and is
+/// [`PagePlanError::OrderTermFromOtherRows`] when there is no such column.
 fn statement_order_terms(
     query: &Query,
     names: &OutputResolution,
-) -> Result<Vec<OrderTerm>, PagePlanError> {
+) -> Result<(Vec<OrderTerm>, bool), PagePlanError> {
     let Some(OrderBy {
         kind,
         // `INTERPOLATE` is defined only in terms of a `WITH FILL`, which is
@@ -2159,12 +2270,19 @@ fn statement_order_terms(
         interpolate: _,
     }) = &query.order_by
     else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     };
     let exprs = match kind {
         OrderByKind::All(_) => return Err(PagePlanError::OrderByAll),
         OrderByKind::Expressions(exprs) => exprs,
     };
+    let proven = |defining: &SqlExpr| {
+        expression_is_non_null(defining) && !calls_a_positional_window(defining)
+    };
+    let mut order_from_other_rows = false;
+    // The output column each written term orders by, where it is not a column
+    // reference but an expression the projection defines under a name.
+    let mut named = Vec::with_capacity(exprs.len());
     for OrderByExpr {
         expr,
         // Read per term by the loop below.
@@ -2172,27 +2290,40 @@ fn statement_order_terms(
         with_fill: _,
     } in exprs
     {
-        let from_other_rows = match column_of(expr) {
-            Some(column) => matches!(
-                names.resolve(&column),
-                Provenance::Expression(defining) if depends_on_other_rows(defining)
-            ),
-            None => depends_on_other_rows(expr),
+        let (from_other_rows, admitted, defined_as) = match column_of(expr) {
+            Some(column) => match names.resolve(&column) {
+                Provenance::Expression(defining) if depends_on_other_rows(defining) => {
+                    (true, proven(defining), None)
+                }
+                _ => (false, true, None),
+            },
+            None if depends_on_other_rows(expr) => {
+                let defined_as = names.name_defined_as(expr).filter(|name| {
+                    matches!(names.resolve(name), Provenance::Expression(defining) if proven(defining))
+                });
+                (true, defined_as.is_some(), defined_as.map(str::to_owned))
+            }
+            None => (false, true, None),
         };
-        if from_other_rows {
+        if !admitted {
             return Err(PagePlanError::OrderTermFromOtherRows {
                 term: expr.to_string(),
             });
         }
+        order_from_other_rows |= from_other_rows;
+        named.push(defined_as);
     }
     let mut terms = Vec::with_capacity(exprs.len());
-    for OrderByExpr {
-        expr,
-        options: OrderByOptions { asc, nulls_first },
-        with_fill,
-    } in exprs
+    for (
+        OrderByExpr {
+            expr,
+            options: OrderByOptions { asc, nulls_first },
+            with_fill,
+        },
+        defined_as,
+    ) in exprs.iter().zip(named)
     {
-        let Some(column) = column_of(expr) else {
+        let Some(column) = defined_as.or_else(|| column_of(expr)) else {
             return Err(PagePlanError::OrderTermNotColumn {
                 term: expr.to_string(),
             });
@@ -2214,7 +2345,7 @@ fn statement_order_terms(
             descending: *asc == Some(false),
         });
     }
-    Ok(terms)
+    Ok((terms, order_from_other_rows))
 }
 
 /// The tiebreak columns to append, and why the result is not total when it is
@@ -4291,42 +4422,19 @@ mod tests {
         }
     }
 
-    /// An order term whose value is computed from rows other than its own
+    /// An order term computed from other rows that is not proven NON NULL
     /// carries no cursor, whether it is an aggregate, a window function or a
     /// subquery, written in ORDER BY or reached through an alias, bare or
-    /// inside another expression.
+    /// inside another expression. Only `count(...)` is proven, and only where
+    /// no window inside it counts positions.
     ///
-    /// A row committed after a cursor was minted, into an hour the mint lists,
-    /// changes such a value for rows already served, so a group served on
-    /// page one can sort back in after the cursor and be served again.
-    ///
-    /// FLIP: with the `count(...)` arm restored in `expression_cursor_support`
-    /// and the pre-pass in `statement_order_terms` checking only a bare
-    /// `count(*)`, the `count(trace_id)`, `sum(value)` and window cases plan.
+    /// FLIP C: with `expression_is_non_null` and `expression_cursor_support`
+    /// admitting every `SqlExpr::Function` rather than `count` alone, the
+    /// `sum`, `min`, `max`, `avg`, `row_number` and `rank` cases plan
+    /// (the `sum` direct case fails first).
     #[test]
     fn an_order_term_from_other_rows_carries_no_cursor() {
         let cases: Vec<(&str, &str)> = vec![
-            (
-                "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY c, ts",
-                "c",
-            ),
-            (
-                "SELECT severity_text, COUNT(*) AS c FROM logs GROUP BY severity_text ORDER BY c",
-                "c",
-            ),
-            (
-                "SELECT severity_text, count(trace_id) AS c FROM logs GROUP BY severity_text \
-                 ORDER BY c, severity_text",
-                "c",
-            ),
-            (
-                "SELECT count(DISTINCT trace_id) AS c FROM logs GROUP BY severity_text ORDER BY c",
-                "c",
-            ),
-            (
-                "SELECT count(*) AS c FROM logs GROUP BY ROLLUP(severity_text) ORDER BY c",
-                "c",
-            ),
             (
                 "SELECT series_id, sum(value) AS s FROM samples GROUP BY series_id \
                  ORDER BY s, series_id",
@@ -4349,27 +4457,40 @@ mod tests {
                 "s",
             ),
             // Written in ORDER BY itself rather than through an alias.
-            ("SELECT count(*) FROM logs ORDER BY count(*)", "count(*)"),
             (
                 "SELECT series_id FROM samples GROUP BY series_id ORDER BY sum(value)",
                 "sum(value)",
             ),
-            // Inside another expression.
+            // A count written in ORDER BY that no output column is defined
+            // as: there is no output name to resume on.
+            ("SELECT count(*) FROM logs ORDER BY count(*)", "count(*)"),
             (
-                "SELECT -count(*) AS c FROM logs GROUP BY severity_text ORDER BY c",
-                "c",
+                "SELECT count(*) AS a, count(*) AS b FROM logs ORDER BY count(*)",
+                "count(*)",
             ),
+            // Inside another expression that is not proven.
             (
                 "SELECT nullif(count(*), 0) AS c FROM logs GROUP BY severity_text ORDER BY c",
                 "c",
             ),
-            // Window functions, over an ungrouped statement whose rows are the
-            // table's own.
             (
-                "SELECT ts, series_id, count(*) OVER () AS c FROM samples \
-                 ORDER BY c, ts, series_id",
+                "SELECT count(*) + 1 AS c FROM logs GROUP BY severity_text ORDER BY c",
                 "c",
             ),
+            // A count over a ROWS frame or a named window counts positions,
+            // which ties under the window's ordering leave unfixed.
+            (
+                "SELECT ts, series_id, count(*) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING \
+                 AND CURRENT ROW) AS c FROM samples ORDER BY c, ts, series_id",
+                "c",
+            ),
+            (
+                "SELECT ts, series_id, count(*) OVER w AS c FROM samples \
+                 WINDOW w AS (ORDER BY ts) ORDER BY c, ts, series_id",
+                "c",
+            ),
+            // Window functions, over an ungrouped statement whose rows are the
+            // table's own.
             (
                 "SELECT ts, series_id, row_number() OVER (ORDER BY ts, series_id) AS rn \
                  FROM samples ORDER BY rn",
@@ -4409,6 +4530,161 @@ mod tests {
             None,
         );
         assert!(keyed.is_ok(), "refused the group key: {keyed:?}");
+    }
+
+    /// A `count(...)` order term plans, through an alias or written in ORDER
+    /// BY, bare or negated, grouped or as a window over the whole result, and
+    /// its plan says the order is computed from other rows. Its resume value
+    /// is an `Int`.
+    ///
+    /// FLIP A: with `order_from_other_rows` hardcoded to `false` in
+    /// `plan_page`, the first case's flag assertion fails.
+    /// FLIP B: with the pre-pass in `statement_order_terms` refusing every
+    /// term that `depends_on_other_rows`, as before, the first case is
+    /// `OrderTermFromOtherRows`.
+    #[test]
+    fn a_count_order_term_plans_and_marks_the_order_as_from_other_rows() {
+        let cases: Vec<(&str, Vec<&str>)> = vec![
+            (
+                "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY c, ts",
+                vec!["c", "ts"],
+            ),
+            (
+                "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY count(*), ts",
+                vec!["c", "ts"],
+            ),
+            (
+                "SELECT ts, count(DISTINCT series_id) AS c FROM samples GROUP BY ts ORDER BY c",
+                vec!["c"],
+            ),
+            (
+                "SELECT ts, -count(*) AS n FROM samples GROUP BY ts ORDER BY n",
+                vec!["n"],
+            ),
+            (
+                "SELECT ts, series_id, count(*) OVER () AS total FROM samples \
+                 ORDER BY total, ts, series_id",
+                vec!["total", "ts", "series_id"],
+            ),
+            (
+                "SELECT severity_text, COUNT(trace_id) AS c FROM logs GROUP BY severity_text \
+                 ORDER BY c DESC",
+                vec!["c"],
+            ),
+            (
+                "SELECT count(*) AS c FROM logs GROUP BY ROLLUP(severity_text) ORDER BY c",
+                vec!["c"],
+            ),
+        ];
+        for (sql, order) in cases {
+            let plan = plan_page(sql, None).unwrap_or_else(|e| panic!("{sql:?}: {e}"));
+            assert!(plan.order_from_other_rows, "flag for {sql:?}");
+            assert_eq!(
+                plan.order_by
+                    .iter()
+                    .map(|term| term.column.as_str())
+                    .collect::<Vec<_>>(),
+                order,
+                "order for {sql:?}"
+            );
+        }
+
+        // The window over the whole result is a total order over samples.
+        let window = plan_page(
+            "SELECT ts, series_id, count(*) OVER () AS total FROM samples \
+             ORDER BY total, ts, series_id",
+            None,
+        )
+        .expect("planned");
+        assert!(window.total_order());
+
+        // The resume value is an Int, and only an Int.
+        let grouped = "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY c, ts";
+        let resumed = plan_page(
+            grouped,
+            Some(&ResumePosition::new(vec![
+                ResumeValue::Int(3),
+                ResumeValue::TimestampNanos(10),
+            ])),
+        )
+        .expect("an Int resumes");
+        assert!(
+            resumed.statement.contains("\"c\" > 3"),
+            "{}",
+            resumed.statement
+        );
+        assert_eq!(
+            plan_page(
+                grouped,
+                Some(&ResumePosition::new(vec![
+                    ResumeValue::Str("3".to_string()),
+                    ResumeValue::TimestampNanos(10),
+                ])),
+            ),
+            Err(PagePlanError::ResumeValueTypeMismatch {
+                position: 1,
+                column: "c".to_string(),
+                expected: "Int".to_string(),
+                found: "Str".to_string(),
+            }),
+        );
+
+        // Own-row orders, a count projected but not ordered by, and an
+        // appended tiebreak column leave the flag unset.
+        for sql in [
+            "SELECT ts, series_id FROM samples ORDER BY ts, series_id",
+            "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY ts",
+            "SELECT ts, series_id FROM samples ORDER BY ts",
+        ] {
+            let plan = plan_page(sql, None).expect("planned");
+            assert!(!plan.order_from_other_rows, "flag for {sql:?}");
+        }
+    }
+
+    /// `count` is recognised by its name's last part in any case, quoted or
+    /// qualified, whatever its arguments and clauses, and no other function
+    /// is proven NON NULL. Parsed without the security gate, so a spelling
+    /// the allowlist would refuse still reaches the rule.
+    ///
+    /// FLIP C: with `expression_is_non_null` answering `true` for every
+    /// `SqlExpr::Function`, the `sum(value)` row fails.
+    #[test]
+    fn count_is_the_one_function_proven_non_null() {
+        for (text, expected) in [
+            ("count(*)", true),
+            ("COUNT(value)", true),
+            ("\"Count\"(*)", true),
+            ("ravel.count(*)", true),
+            ("count(DISTINCT value)", true),
+            ("count(*) FILTER (WHERE ts > 0)", true),
+            ("count(*) OVER (PARTITION BY series_id)", true),
+            ("-count(*)", true),
+            ("sum(value)", false),
+            ("min(ts)", false),
+            ("avg(value)", false),
+            ("row_number() OVER (ORDER BY ts)", false),
+            ("coalesce(count(*), 0)", false),
+            ("count_distinct(value)", false),
+        ] {
+            let query = parse_query(&format!("SELECT {text} AS t")).expect("parsed");
+            let SetExpr::Select(select) = query.body.as_ref() else {
+                panic!("not a select");
+            };
+            let Some(datafusion::sql::sqlparser::ast::SelectItem::ExprWithAlias { expr, .. }) =
+                select.projection.first()
+            else {
+                panic!("{text} is not an aliased expression");
+            };
+            assert_eq!(expression_is_non_null(expr), expected, "{text}");
+            assert_eq!(
+                matches!(
+                    expression_cursor_support(expr),
+                    CursorSupport::Exact(ResumeKind::Int)
+                ),
+                expected,
+                "{text}"
+            );
+        }
     }
 
     /// The call-level rule reads the clauses, not only the name: a call with
@@ -4608,10 +4884,13 @@ mod tests {
     /// Two passes. The first is the corpus as written, where 32 of the 43
     /// statements carry their own `LIMIT` and are refused for that alone.
     /// The second strips a trailing `LIMIT n [OFFSET m]`, which is what
-    /// exposes the planner underneath: 1 of the 43 plans. 27 order by an
-    /// aggregate (the corpus's top-N shape, `ORDER BY c DESC`), which has no
-    /// cursor position because a later row changes it; the paging tool runs
-    /// those, and the 11 with no `ORDER BY`, unpaged. 1 refusal is about
+    /// exposes the planner underneath: 22 of the 43 plan, 21 of them on a
+    /// `count` (the corpus's top-N shape, `ORDER BY c DESC`), which pages
+    /// over the segment set page one resolved. 6 order by a term computed
+    /// from other rows that does not plan: 4 write `COUNT(*)` in the `ORDER
+    /// BY` with no output column defined as it, and 2 order by an `AVG`. The
+    /// paging tool runs those, and the 11 with no `ORDER BY`, unpaged. 1
+    /// refusal is about
     /// nullability, and the remaining 3 are about the ordering itself -- a
     /// term that is not a column, a term the statement does not project.
     ///
@@ -4671,10 +4950,10 @@ mod tests {
 
         let mut want = expected(&[
             ("NoOrdering", 11),
-            ("OrderTermFromOtherRows", 27),
+            ("OrderTermFromOtherRows", 6),
             ("OrderTermNotColumn", 1),
             ("OrderTermNotProjected", 2),
-            ("plans, not a total order", 1),
+            ("plans, not a total order", 22),
         ]);
         want.insert(
             format!(
@@ -4689,12 +4968,12 @@ mod tests {
         );
         assert_eq!(
             tally(&without_row_limit, "plans"),
-            1,
+            22,
             "plans, row limit set aside",
         );
         assert_eq!(
             statements - tally(&without_row_limit, "plans"),
-            42,
+            21,
             "refusals, row limit set aside",
         );
         assert_eq!(
@@ -4796,7 +5075,7 @@ mod tests {
             )
             .expect("parsed");
             let names = OutputResolution::of(&query, PageTarget::Samples);
-            let terms = statement_order_terms(&query, &names).expect("terms");
+            let (terms, _) = statement_order_terms(&query, &names).expect("terms");
             tiebreak(&query, PageTarget::Samples, &names, &terms)
         };
         assert_eq!(

@@ -444,21 +444,31 @@ it reads anything:
 | fails SQL validation | `validation`, with the engine's text and a `next_steps` entry naming `ravel_query_promql` |
 | cannot be paged: for example its own `LIMIT`, `OFFSET`, `FETCH` or `TOP`, an `ORDER BY` term that is not a projected column or may be NULL, or a float `ORDER BY` term | `invalid_argument` naming the planner's reason, with a `rewrite_the_statement` next step |
 | no `ORDER BY`, and no projected row identity to order by (only `samples` has one: `ts` and `series_id`) | runs as written, unpaged |
-| an `ORDER BY` term computed from rows other than its own: an aggregate such as `count(*)` or `sum(value)`, a window function such as `count(*) OVER ()` or `row_number() OVER (...)`, or a subquery, whether ordered by directly or through an alias | runs as written, unpaged |
+| an `ORDER BY` term that is a `count(...)`, such as `count(*)`, `count(DISTINCT x)`, a count with `FILTER`, `-count(*)` or `count(*) OVER ()`, through an alias or written as the expression a projected column is defined as | runs, paged over page one's segment set |
+| any other `ORDER BY` term computed from rows other than its own: an aggregate such as `sum(value)` or `avg(value)`, a window function such as `row_number() OVER (...)`, a count over a `ROWS` frame or a named window, or a subquery, whether ordered by directly or through an alias | runs as written, unpaged |
 | any other `SELECT` over one table | runs, paged |
 
 A float `ORDER BY` term is refused because a NaN or infinite value has no
 cursor position: the rows after it could not be reached. Order by another
 column to page the same rows.
 
-An `ORDER BY` term computed from other rows has no cursor position either,
-for a different reason. A cursor pins the ingest hours page one listed, not
-their contents, so a row committed into one of those hours after page one
-can change an aggregate or window value for a row already served and sort
-that row after the cursor, where a later page would serve it again. The
-statement runs once, in its own order, and a capped result ends
-`ok_bounded` with no cursor. To page it, order by the row's own non-null
-columns, such as a grouping column.
+An `ORDER BY` term computed from other rows is a cursor position only over
+the rows it was computed from. A row committed into one of page one's
+ingest hours after page one can change an aggregate or window value for a
+row already served and sort that row after the cursor, where a later page
+would serve it again. So the cursor pins a digest of the segment set page
+one resolved, and a later page of such a walk is served only when its own
+resolve hashes to the same digest; otherwise it is `cursor_expired` with a
+`rerun_page_one` next step and no rows. A commit, a compaction or an
+erasure rewrite that changes the segments the window reads ends the walk.
+A commit whose rows fall outside `time_range` does not, so a `time_range`
+that ends before the most recent ingest pages stably.
+
+A `count(...)` term pages this way because a count is not NULL. Any other
+such term is not proven non-null, so the statement runs once, in its own
+order, and a capped result ends `ok_bounded` with no cursor. To page it,
+order by a `count(...)` or by the row's own non-null columns, such as a
+grouping column.
 
 `time_range` filters rows, not only segments: a row whose timestamp is
 outside the half-open window is not returned, even when its segment
@@ -471,19 +481,26 @@ cursor resumes after the page's last row. Under an order that is not
 total, a warning says so, and the page ends before the last group of rows
 equal under the order; see [Page order](#page-order).
 
-A full page ends `ok_bounded` with no cursor, and a `next_steps` entry, in
-these cases:
+A page that ends a walk carries a `next_steps` entry saying why. In every
+case but the last, a full page ends `ok_bounded` with no cursor; in the
+last, a later page is refused:
 
 | Case | Next step |
 | --- | --- |
 | The statement has no order to page by | `add_an_order_by` |
-| The statement's order uses a value computed from other rows | `order_by_the_rows_own_columns` |
+| The statement's order uses a value computed from other rows that it does not prove non-null | `order_by_the_rows_own_columns` |
 | No complete group of equal rows fits the page | `narrow_time_range` |
 | The last row's order values could not be read, or one is NaN or infinite | `narrow_time_range` |
 | The cursor after the last row is over its 4 KiB bound, as a long string order value makes it | `narrow_time_range` |
+| A later page of a walk ordered by a value computed from other rows resolved a different segment set than page one: `cursor_expired`, no rows | `rerun_page_one` |
 
-A warning names the reason in each case but the first two, where the next
-step alone says it. None of them is a failure.
+A warning names the reason in each `ok_bounded` case but the first two,
+where the next step alone says it. None of those is a failure.
+
+Under an order on the row's own columns, a later page that resolved a
+different segment set than page one is served, and carries a warning
+starting `segment set changed since page one`: a row committed since may
+appear on that page or be omitted. `ravel_search_logs` pages the same way.
 
 A cursor is bound to the statement, `time_range` and the effective
 `max_rows`; a call that changes any of them is refused as
@@ -889,7 +906,7 @@ covers in event time.
 | `deadline` | The call passed its effective deadline. |
 | `unavailable` | A transient storage or catalog fault. Retryable. |
 | `snapshot_invalidated` | The pinned snapshot was invalidated by concurrent maintenance. Retryable once. |
-| `cursor_expired` | The cursor's minting process or its deadline is gone, or an erasure it did not pin now reaches its signal and time range. |
+| `cursor_expired` | The cursor's minting process or its deadline is gone, or an erasure it did not pin now reaches its signal and time range, or a `ravel_query_sql` walk ordered by a value computed from other rows resolved a different segment set than page one. |
 | `cursor_invalid` | The cursor does not match the tenant, the tool, or the arguments presented with it. |
 | `internal` | A server-side fault, including corrupt stored data. Not retryable. The message is fixed and carries no storage detail. |
 
@@ -913,9 +930,15 @@ mints it fresh for each call and does not store it. It carries:
 - the minimum commit-token watermark that the page was resolved against
 - which erasure predicates were pending
 - a 32-byte digest of the typed attribute columns that were declared
+- for `ravel_query_sql` and `ravel_search_logs`, a 32-byte digest of the
+  segment set page one resolved
 - the position to resume from
 
 It pins a snapshot by these resolve inputs, not by enumerating segments.
+The segment set is pinned as a digest over the sorted, deduplicated
+data-object keys, so the token's size does not depend on how many segments
+page one read. A data-object key embeds the object's content hash, so two
+resolves with one digest read byte-identical segments.
 
 The typed attribute columns are pinned as a digest, not as a list, so the
 token's size does not depend on how many columns a tenant declares. The digest is
@@ -956,7 +979,7 @@ fails with `cursor_invalid`.
 ### Expiry
 
 Redemption refuses a structurally valid, correctly bound cursor with
-`cursor_expired` in three cases. In each case the caller re-runs the query.
+`cursor_expired` in four cases. In each case the caller re-runs the query.
 
 - The effective deadline of the cursor has passed. That deadline is already
   clamped to the protection horizon minus the grace period. So this is also
@@ -970,11 +993,17 @@ Redemption refuses a structurally valid, correctly bound cursor with
 - The typed attribute columns the redeeming resolve observed hash to a
   different digest than the pinned one: a column was added, removed,
   renamed or retyped. The same columns in another order do not expire it.
+- A `ravel_query_sql` walk ordered by a value computed from other rows
+  resolved a segment set whose digest differs from the pinned one. The
+  refusal carries a `rerun_page_one` next step. Under any other order the
+  page is served with a warning instead.
 
-Those are the three cases that a redemption can detect. An erasure that arrives
+Those are the four cases that a redemption can detect. An erasure that arrives
 after a cursor is minted and finishes before it is redeemed is in neither
-set, so no check sees it. That case stays empty only while a cursor cannot
-outlive an erasure:
+erasure set. Its rewrite replaces data objects, so it changes the segment
+set, and the fourth case refuses it for a walk that requires the pin; for
+any other cursor no check refuses it. That case stays empty only while a
+cursor cannot outlive an erasure:
 
 | Quantity | Bound | Under the defaults |
 | --- | --- | --- |
@@ -994,9 +1023,12 @@ When the tiebreak is not unique, the equal-group rule applies as for
 `ravel_search_logs`. A page never ends inside a group of equal tuples.
 The cursor points at the last complete group. Cursor paging continues.
 An `ORDER BY` term computed from other rows (an aggregate, a window
-function or a subquery) carries no cursor: a row committed after page one
-can change its value for a row already served, so no position on it
-resumes without serving that row again.
+function or a subquery) is a position only over fixed rows: a row committed
+after page one can change its value for a row already served. A
+`count(...)` term pages, and every page of its walk is computed over page
+one's segment set or is refused with `cursor_expired`, so within the walk
+a row is not served twice and not skipped. Any other such term carries no
+cursor.
 
 `ravel_search_logs` orders by `(ts, observed_ts)`. That pair is not
 unique, because `logs` rows carry no row identity and ingest is

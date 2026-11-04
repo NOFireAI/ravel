@@ -115,6 +115,10 @@ pub struct Draft {
     /// resolved, in whole hours since the epoch; `None` when it resolved no
     /// segment.
     pub ingest_watermark_hour: Option<u32>,
+    /// [`cursor::segment_set_digest`] of the data-object keys the snapshot
+    /// resolved; `None` when the backend reported no segment set. A cursor
+    /// over the draft pins it (see [`Cursor::segment_set_digest`]).
+    pub segment_set_digest: Option<[u8; 32]>,
     /// The instant the snapshot was resolved at.
     pub resolve_at_ns: i64,
     /// The typed value of each order column, row for row with `data.rows`,
@@ -137,6 +141,7 @@ impl Draft {
         pending_erasure: Vec<ErasurePredicate>,
         declared_columns: Vec<DeclaredColumn>,
         ingest_watermark_hour: Option<u32>,
+        segment_set_digest: Option<[u8; 32]>,
         resolve_at_ns: i64,
     ) -> Draft {
         let mut draft = Draft {
@@ -145,6 +150,7 @@ impl Draft {
             pending_erasure,
             declared_columns,
             ingest_watermark_hour,
+            segment_set_digest,
             resolve_at_ns,
             order_tuples: Vec::new(),
         };
@@ -181,6 +187,8 @@ impl Draft {
     /// that the observed erasure and declared columns did not move; the
     /// watermark and the resolve instant are page one's by definition, so
     /// every page of one sequence reports one snapshot id and one watermark.
+    /// The segment set digest is page one's too, so the cursor this page
+    /// mints compares the next page against page one, not against this one.
     ///
     /// The cursor carries only a digest of its declared column set, so the
     /// caller passes `confirmed_declared_columns`, the set `confirm` accepted
@@ -196,6 +204,7 @@ impl Draft {
         self.pending_erasure = cursor.pending_erasure.clone();
         self.declared_columns = confirmed_declared_columns;
         self.ingest_watermark_hour = cursor.ingest_watermark_hour;
+        self.segment_set_digest = cursor.segment_set_digest;
         self.resolve_at_ns = cursor.mint_ns;
         self.envelope.visibility.pinned = true;
         self.report_watermark();
@@ -243,6 +252,7 @@ impl Draft {
             pending_erasure,
             declared_columns,
             ingest_watermark_hour,
+            segment_set_digest,
             resolve_at_ns,
             order_tuples,
         } = self;
@@ -252,6 +262,7 @@ impl Draft {
             pending_erasure: &pending_erasure,
             declared_columns: &declared_columns,
             ingest_watermark_hour,
+            segment_set_digest,
             resolve_at_ns,
         });
         if let Ok(pins) = &pins {
@@ -448,6 +459,7 @@ pub struct PagePins<'a> {
     pub pending_erasure: &'a [ErasurePredicate],
     pub declared_columns: &'a [DeclaredColumn],
     pub ingest_watermark_hour: Option<u32>,
+    pub segment_set_digest: Option<[u8; 32]>,
     pub resolve_at_ns: i64,
 }
 
@@ -485,6 +497,7 @@ impl PagePins<'_> {
             pending_erasure: self.pending_erasure.to_vec(),
             declared_column_set_digest: cursor::declared_column_set_digest(self.declared_columns),
             ingest_watermark_hour: self.ingest_watermark_hour,
+            segment_set_digest: self.segment_set_digest,
             position,
             mint_ns: self.resolve_at_ns,
             deadline_ns,
@@ -557,13 +570,14 @@ mod tests {
 
     use super::*;
     use crate::budget::{McpBudgetConfig, McpRequestBudgets};
-    use crate::cursor::{CURSOR_KEY_LEN, CursorKey, GRACE_NS};
+    use crate::cursor::{CURSOR_KEY_LEN, CursorKey, GRACE_NS, SegmentSetPin};
     use crate::envelope::{Cell, Column, MAX_RESPONSE_BYTES_FLOOR, Status};
 
     const TOOL: &str = "ravel_query_sql";
     const ARGS: [u8; 32] = [3u8; 32];
     const NOW_NS: i64 = 1_700_000_000_000_000_000;
     const HORIZON_NS: i64 = NOW_NS + GRACE_NS + 3_600 * 1_000_000_000;
+    const SEGMENTS: [u8; 32] = [0x5Eu8; 32];
 
     fn key() -> CursorKey {
         CursorKey::from_process_secret([0x5Au8; CURSOR_KEY_LEN])
@@ -624,6 +638,7 @@ mod tests {
             )])],
             vec![DeclaredColumn::new("http.status_code", DeclaredType::I64)],
             Some(472_223),
+            Some(SEGMENTS),
             NOW_NS,
         )
         .with_order_tuples(tuples)
@@ -794,10 +809,13 @@ mod tests {
     /// Page one's `snapshot_id` is `cursor::snapshot_id` over its pins, and
     /// page two, resolved later and observing page one's two declared columns
     /// in the reverse order, reports the same id and page one's watermark once
-    /// pinned to the cursor. A page two observing a third column expires.
+    /// pinned to the cursor, and its cursor carries page one's segment set
+    /// digest. A page two observing a third column expires.
     ///
     /// FLIP: deriving page two's id from its own resolve instant (or its own
     /// watermark) instead of the cursor's changes it.
+    /// FLIP I: a `pinned_to` that keeps the draft's own segment set digest
+    /// mints page three's cursor over page two's segments.
     /// FLIP: hashing anything but `cursor::snapshot_id`'s inputs fails the
     /// first equality.
     /// FLIP: a digest or snapshot id over the declared columns in list order
@@ -844,7 +862,13 @@ mod tests {
         observed.push(DeclaredColumn::new("b", DeclaredType::Str));
         observed.reverse();
         let cursor = pending
-            .confirm(NOW_NS + 2, &[], &observed)
+            .confirm(
+                NOW_NS + 2,
+                &[],
+                &observed,
+                Some(SEGMENTS),
+                SegmentSetPin::Advisory,
+            )
             .expect_err("an added declared column expires the cursor");
         assert_eq!(cursor, CursorError::Expired);
 
@@ -861,13 +885,21 @@ mod tests {
         let mut second = draft(5, 8, |i| i as i128 + 2);
         second.resolve_at_ns = pending.resolve_at_ns() + 7;
         second.ingest_watermark_hour = Some(472_299);
+        second.segment_set_digest = Some([0x77u8; 32]);
         let mut observed = page_one_set.clone();
         observed.reverse();
         assert_ne!(observed, page_one_set, "the observed list is reordered");
         second.declared_columns = observed.clone();
         let confirmed = pending
-            .confirm(NOW_NS + 2, &[], &observed)
-            .expect("a reordered declared set has not moved");
+            .confirm(
+                NOW_NS + 2,
+                &[],
+                &observed,
+                Some(SEGMENTS),
+                SegmentSetPin::Advisory,
+            )
+            .expect("a reordered declared set has not moved")
+            .cursor;
         let page_two = second.pinned_to(&confirmed, observed).finish_page(
             &budgets,
             &PinScope::of(&confirmed),
@@ -888,6 +920,11 @@ mod tests {
         assert_eq!(
             next.mint_ns, NOW_NS,
             "page three resolves at page one's instant"
+        );
+        assert_eq!(
+            next.segment_set_digest,
+            Some(SEGMENTS),
+            "page three compares against page one's segment set"
         );
     }
 
@@ -915,8 +952,15 @@ mod tests {
         )
         .expect("stage one");
         let confirmed = pending
-            .confirm(NOW_NS + 2, &[], &page_one_set)
-            .expect("nothing moved");
+            .confirm(
+                NOW_NS + 2,
+                &[],
+                &page_one_set,
+                Some(SEGMENTS),
+                SegmentSetPin::Advisory,
+            )
+            .expect("nothing moved")
+            .cursor;
         let mut second = draft(5, 8, |i| i as i128 + 2);
         second.declared_columns = vec![DeclaredColumn::new("user.id", DeclaredType::Str)];
 
@@ -1109,6 +1153,7 @@ mod tests {
             vec![],
             vec![],
             Some(472_223),
+            None,
             0,
         );
         assert!(!no_table.envelope.visibility.resolved_no_segments);
@@ -1126,6 +1171,7 @@ mod tests {
             vec![],
             vec![],
             None,
+            None,
             0,
         );
         assert!(empty.envelope.visibility.resolved_no_segments);
@@ -1134,6 +1180,7 @@ mod tests {
             Err(NoCursorSignal::Parquet),
             vec![],
             vec![],
+            None,
             None,
             0,
         );
