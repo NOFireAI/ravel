@@ -1310,9 +1310,7 @@ fn metrics_router(catalog: Arc<Catalog>) -> Router {
             ravel_server::admission_reconcile::ReconcileCycleMetrics::default(),
         ),
         metrics_tenant_labels: false,
-        query_accounting: Arc::new(QueryAccountingMetrics::new(
-            std::collections::HashSet::new(),
-        )),
+        query_accounting: Arc::new(QueryAccountingMetrics::new(std::collections::HashSet::new())),
         metrics_tenant_allowlist: Arc::new(std::collections::HashSet::new()),
         ingest_buffer_budget: ravel_ingest::IngestByteBudget::shared(
             ravel_ingest::IngestByteBudgetLimit::Unlimited,
@@ -1424,7 +1422,10 @@ async fn the_metrics_page_renders_both_key_index_route_families_after_a_lookup()
     );
     assert_eq!(count_lines(&page, LEAF_GETS_HELP), 1, "{page}");
     assert_eq!(
-        count_lines(&page, "# TYPE ravel_query_key_index_leaf_gets_total counter"),
+        count_lines(
+            &page,
+            "# TYPE ravel_query_key_index_leaf_gets_total counter"
+        ),
         1,
         "{page}"
     );
@@ -1432,11 +1433,7 @@ async fn the_metrics_page_renders_both_key_index_route_families_after_a_lookup()
         .lines()
         .filter(|l| l.starts_with("ravel_query_key_index_parts_total{"))
         .count();
-    assert_eq!(
-        parts_samples,
-        2 * KeyIndexPartOutcome::ALL.len(),
-        "{page}"
-    );
+    assert_eq!(parts_samples, 2 * KeyIndexPartOutcome::ALL.len(), "{page}");
     let leaf_samples = page
         .lines()
         .filter(|l| l.starts_with("ravel_query_key_index_leaf_gets_total{"))
@@ -1521,7 +1518,10 @@ async fn budget_fixture() -> (Arc<RecordingStore>, Vec<Published>, Router) {
         )
         .await;
     assert!(
-        matches!(refused, Err(ravel_catalog::CatalogError::MemoryExhausted(_))),
+        matches!(
+            refused,
+            Err(ravel_catalog::CatalogError::MemoryExhausted(_))
+        ),
         "the parts' charge exceeds the budget: {:?}",
         refused.map(|(snapshot, _, parts)| (snapshot.segments.len(), parts.heap_bytes()))
     );
