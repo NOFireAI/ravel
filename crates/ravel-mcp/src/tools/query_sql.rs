@@ -1309,7 +1309,9 @@ mod tests {
 
     /// A cursor sent with a statement that has no `ORDER BY` is
     /// `cursor_invalid`, before the backend: no position resumes a result
-    /// with no order.
+    /// with no order. `run` routes every cursor to `later_page`, so the
+    /// argument hash refuses it and `unordered`'s own cursor check is not
+    /// reached.
     #[test]
     fn a_cursor_with_an_unordered_statement_is_refused() {
         let key = key();
