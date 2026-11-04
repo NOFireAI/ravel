@@ -104,7 +104,7 @@ pub async fn dispatch<B: QueryBackend>(
     ctx: &ToolContext<'_>,
     backend: &B,
 ) -> Result<Envelope, ToolError> {
-    if let Some(failure) = evidence_ref_refusal(name, &args, &tool_catalog()) {
+    if let Some(failure) = evidence_ref_refusal(name, &args, tool_catalog) {
         return Ok(capabilities::refused(failure, ctx));
     }
     match name {
@@ -122,7 +122,8 @@ pub async fn dispatch<B: QueryBackend>(
 }
 
 /// The one refusal of an `evidence_ref` argument, read off `catalog`, the
-/// schemas the caller was shown. A tool whose input schema lists the field
+/// schemas the caller was shown; `catalog` is built only when `args` carries
+/// the field. A tool whose input schema lists the field
 /// does not serve it in this build: `unsupported`. A tool whose schema lacks
 /// it does not take it: `invalid_argument`. `None` when `args` carries no
 /// `evidence_ref` (a null is no value, as for every optional argument) or
@@ -133,10 +134,10 @@ pub async fn dispatch<B: QueryBackend>(
 pub(crate) fn evidence_ref_refusal(
     name: &str,
     args: &serde_json::Value,
-    catalog: &[Tool],
+    catalog: impl FnOnce() -> Vec<Tool>,
 ) -> Option<Failure> {
     args.get("evidence_ref").filter(|value| !value.is_null())?;
-    let tool = catalog.iter().find(|tool| tool.name == name)?;
+    let tool = catalog().into_iter().find(|tool| tool.name == name)?;
     let listed = tool
         .input_schema
         .get("properties")
@@ -496,10 +497,6 @@ mod tests {
         }
     }
 
-    /// Every name in the catalog reaches `dispatch`, and `dispatch` refuses
-    /// anything else. The counts are exact on purpose: all nine bodies this
-    /// build carries must answer an envelope, and none may answer
-    /// `NotShipped`.
     /// `evidence_ref` is refused by every tool, by one rule over the schema
     /// the caller was shown: `unsupported` where the schema lists it,
     /// `invalid_argument` where it does not. A null is no value.
@@ -547,6 +544,10 @@ mod tests {
         assert_eq!(envelope.status, crate::envelope::Status::Ok);
     }
 
+    /// Every name in the catalog reaches `dispatch`, and `dispatch` refuses
+    /// anything else. The counts are exact on purpose: all nine bodies this
+    /// build carries must answer an envelope, and none may answer
+    /// `NotShipped`.
     #[test]
     fn dispatch_routes_every_catalog_name_and_refuses_unknown_names() {
         let key = CursorKey::from_process_secret([7u8; CURSOR_KEY_LEN]);
