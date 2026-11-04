@@ -807,9 +807,9 @@ every such record of an MCP call carries:
 The record's body reads `mcp:<tool> query <status>`. A call that makes two
 service calls writes two records under one `query.id`: `ravel_search_logs`
 with `predicates` checks its keys with a `describe_data` call, then runs its
-SQL page. `ravel_find_labels` records its matcher set as `query.text`: each
-selector in PromQL's canonical form, joined by `; `, or `{}` when the call
-names no selector. Text redaction under `--audit-text redacted` follows
+SQL page. `ravel_find_labels` records its matcher set as `query.text`: the
+selectors as the caller sent them, joined by `; ` as the HTTP routes join
+them, or `{}` when the call names no selector. Text redaction under `--audit-text redacted` follows
 `query.engine_language`, so an MCP SQL statement is redacted as SQL.
 
 `ravel_capabilities` writes no audit record. It answers from compile-time

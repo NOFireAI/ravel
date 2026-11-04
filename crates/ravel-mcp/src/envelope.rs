@@ -1612,6 +1612,11 @@ impl Envelope {
     /// success the id takes the warning's room, and on an error, where no
     /// identity warning was added, it takes part of the unused
     /// [`IDENTITY_WARNINGS_ALLOWANCE`].
+    ///
+    /// `finish` has already capped `warnings` at `MAX_WARNINGS` with the
+    /// removed warning counted in, so an envelope that arrived with that many
+    /// caller warnings keeps one fewer than the cap would allow, and the one
+    /// it dropped is counted in `presentation.metadata_elided`.
     pub fn with_query_id(mut self, query_id: &str) -> Envelope {
         let warning = format!(
             "{}{IDENTITY_WARNING_SUFFIX}",

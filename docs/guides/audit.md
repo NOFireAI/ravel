@@ -255,7 +255,7 @@ statements and not records, leave out the `attempted` rows.
 | `promql`, `analytics` | The PromQL expression. |
 | `labels`, `label_values`, `series` | The joined selector list. |
 | `exemplars` | The selector. |
-| `mcp:<tool>` | The text for its `query.engine_language` above, except `mcp:ravel_find_labels`: its matcher set, each selector in canonical PromQL form joined by `; `, or `{}` with no selector. |
+| `mcp:<tool>` | The text for its `query.engine_language` above, except `mcp:ravel_find_labels`: its selectors as sent, joined by `; ` like the `labels` row, or `{}` with no selector. |
 
 The window attributes hold this range for each surface:
 

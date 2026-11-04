@@ -876,28 +876,19 @@ impl QueryBackend for ServiceBackend {
     }
 }
 
-/// Prometheus' lowercase spelling of a metric family's type, as
-/// `GET /api/v1/metadata` renders it.
-/// The matcher set a metadata call reads, as its audit text: each selector
-/// in the parser's canonical PromQL form, joined by `; ` (the separator the
-/// audit redactor splits on), and `{}` for no selector, which matches every
-/// series. A selector the parser refuses is recorded as given; the service
-/// call refuses it too.
+/// The matcher set a metadata call reads, as its audit text: the selectors
+/// as the caller sent them, joined by `; ` as the HTTP routes join them (and
+/// the separator the audit redactor splits on), and `{}` for no selector,
+/// which matches every series.
 fn matcher_set_text(selectors: &[String]) -> String {
     if selectors.is_empty() {
         return "{}".to_string();
     }
-    selectors
-        .iter()
-        .map(|selector| {
-            ravel_promql::complexity_guard::parse_guarded(selector)
-                .map(|expr| expr.to_string())
-                .unwrap_or_else(|_| selector.clone())
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
+    selectors.join("; ")
 }
 
+/// Prometheus' lowercase spelling of a metric family's type, as
+/// `GET /api/v1/metadata` renders it.
 fn metric_kind_name(kind: MetricKind) -> &'static str {
     match kind {
         MetricKind::Counter => "counter",
@@ -1032,15 +1023,15 @@ fn failure(error: ServiceError) -> Failure {
 mod tests {
     use super::*;
 
-    /// No selector is the whole matcher set `{}`; a selector is recorded in
-    /// the parser's canonical form, so spacing does not change the text.
+    /// No selector is the whole matcher set `{}`; selectors are recorded as
+    /// the caller sent them, spacing included, joined the way the HTTP
+    /// routes join theirs.
     #[test]
-    fn the_matcher_set_text_is_canonical_and_never_empty() {
+    fn the_matcher_set_text_is_verbatim_and_never_empty() {
         assert_eq!(matcher_set_text(&[]), "{}");
-        assert_eq!(
-            matcher_set_text(&["m{ k = \"v\" }".to_string(), "{job=\"a\"}".to_string()]),
-            "m{k=\"v\"}; {job=\"a\"}"
-        );
+        let selectors = ["m{ k = \"v\" }".to_string(), "{job=\"a\"}".to_string()];
+        assert_eq!(matcher_set_text(&selectors), "m{ k = \"v\" }; {job=\"a\"}");
+        assert_eq!(matcher_set_text(&selectors), selectors.join("; "));
         assert_eq!(matcher_set_text(&["m{".to_string()]), "m{");
     }
 
