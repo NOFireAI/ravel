@@ -690,7 +690,9 @@ verification (step 6), after which the run goes on as a diagnostic:
     the capture recorded (case a). Its `ravel_git_commit` is
     `--ravel-source-commit`, not this checkout.
 11. `fold-state`: `ravel_catalog_fold_last_success_timestamp_seconds` from
-    Ravel's `/metrics` (case a), or `absent` (case j).
+    Ravel's `/metrics` (case a), or `absent` (case j). That scrape is kept
+    as `ravel-metrics-at-query.txt`, and Mimir's `/metrics` is scraped
+    beside it into `mimir-metrics-at-query.txt` (case w).
 12. `query`: `metricsbench_query` against all four engines into
     `report.json`, with `--diagnostics diagnostics.json` for the per-entry
     ULP gaps against the oracle and every oracle retry (case a; the
@@ -700,6 +702,21 @@ verification (step 6), after which the run goes on as a diagnostic:
     `run_verdict: "failed"` and `failed_bands` (case q). When the failed row
     is the Prometheus oracle's, `metricsbench_query` refuses instead, writes
     no report, and the run ends here (case q4).
+    Once `metricsbench_query` has written the report, and before `validate`,
+    `memory` or `stop`, Ravel's and Mimir's `/metrics` are scraped again
+    into `ravel-metrics-after-query.txt` and `mimir-metrics-after-query.txt`
+    (case w). These four scrapes are ADR-0927's 2026-11-04 cache-state
+    disclosure: each engine's cache and object-store figures over the query
+    phase are its after scrape less its before scrape. The outcomes are
+    stamped as `query_scrapes`, below. A failed scrape (connection refused,
+    a status other than 200, an empty body) is stamped and never fails the
+    run, and leaves no `mimir-metrics-at-query.txt`,
+    `ravel-metrics-after-query.txt` or `mimir-metrics-after-query.txt`
+    (cases w1 to w3); a run with an `--rss-band` breach and a failed Mimir
+    scrape exits 75 as without the failed scrape (case w4). `ravel-metrics-at-query.txt` keeps whatever Ravel answered,
+    since step 11 and `readback-folded` read it. A run that ends at `query`
+    takes no after pair, and both are stamped `not taken: the query step did
+    not complete` (case q4).
 13. `validate`: `metricsbench_report validate report.json` exits 0 (case a).
     After a failed ingest verification it must refuse the report, naming it
     a diagnostic of a failed run; a validate that accepts it fails the run
@@ -908,7 +925,11 @@ and `anchor_source`, `started_at` and `ended_at`, `store_kind: s3s-fs`, `host.ar
 `instance_type` (EC2 IMDSv2, else `unknown`), `comparator_images` (each
 comparator's image block as the capture recorded it), `ravel_catalog_fold`,
 `ravel_catalog_fold_writers_stopped`, `ravel_restart` and `readback_folded`
-(steps 15 to 18; cases u, u7 and u9), `mimir_readiness`, `ravel_objects`
+(steps 15 to 18; cases u, u7 and u9), `query_scrapes` (an object with
+`ravel_before`, `mimir_before`, `ravel_after` and `mimir_after`, each `ok`,
+`failed: curl exit N`, `failed: HTTP N`, `failed: empty body` or `not taken:
+...`, step 12; cases w, w1 to w3 and q4; `not applicable` in the diagnostic
+mode, case f; `null` when the run ended before step 11), `mimir_readiness`, `ravel_objects`
 (the contents of `ravel-objects.json`, case v; `not applicable` in the
 diagnostic mode, case f), `in_process_row` (`present` or `skipped`, cases a, l and
 f), `object_store` (release, asset arch, engine arch and its source, sha256,
@@ -961,7 +982,7 @@ query once as an instant query at the newest sample. `falsification.json`
 records the HTTP status, `status`, `errorType`, `error` and the result's
 series count; no `report.json` is written and stamps say `diagnostic: true`
 (case f). `--ravel-image` and `--ravel-source-commit` are optional here,
-since no Ravel starts; for the same reason the `objects` step does not run there (case f). A `--profile` the corpus does not declare
+since no Ravel starts; for the same reason the `objects` step does not run there (case f). It starts no Ravel or Mimir and runs no query step, so it takes none of the scrapes around the query step and stamps `query_scrapes` `not applicable` (case f). A `--profile` the corpus does not declare
 `mb_long_range_7d_avg` for (today only `history`) is refused with exit 65
 before anything starts: elsewhere the query loads too few samples to reach
 the limit, and its success would falsify nothing (case f2). A failed ingest

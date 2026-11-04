@@ -167,6 +167,21 @@
 #                                       exits 70; u23: --folded-catalog-get-
 #                                       floor 0 is stamped; u24-u27: a floor
 #                                       that is not a whole number exits 64
+#   w  scrapes around the query    -> w (case a's output): Ravel's and Mimir's
+#      step                             /metrics before and after the query
+#                                       step written, query_scrapes stamps ok
+#                                       for all four, the before pair ahead of
+#                                       the query run and the after pair
+#                                       after it and ahead of validate and the
+#                                       stop step; w1: Mimir refusing the
+#                                       connection, w2: answering 503 and w3:
+#                                       an empty body exit 0, stamped why,
+#                                       with no Mimir files; w4: the same with
+#                                       an --rss-band breach exits 75 as d;
+#                                       q4: a refused query takes no after
+#                                       pair, stamped not taken; f: the
+#                                       diagnostic mode scrapes neither,
+#                                       stamped not applicable
 #   v  Ravel's objects               -> v: a listing of every kind splits into
 #                                       data, commit, qualify and other with
 #                                       their sum as total, stamped the same,
@@ -406,8 +421,9 @@ esac
 exit 0
 STUB
 
-# curl: readiness 200, IMDS unreachable, /metrics with or without the fold
-# gauge, Prometheus' refusal of the falsification query, and the s3s-fs
+# curl: readiness 200, IMDS unreachable, Ravel's /metrics with or without the
+# fold gauge, Mimir's /metrics (STUB_MIMIR_METRICS refused, 503 or empty makes
+# it fail that way), Prometheus' refusal of the falsification query, and the s3s-fs
 # release asset as stub bytes (STUB_S3S_BYTES replaces them).
 cat >"${BIN}/curl" <<'STUB'
 #!/usr/bin/env bash
@@ -424,6 +440,14 @@ while [ $# -gt 0 ]; do
 done
 case "$url" in
   *imds.invalid*) exit 7 ;;
+  *:9009/metrics)
+    case "${STUB_MIMIR_METRICS:-}" in
+      refused) exit 7 ;;
+      503) printf 'unavailable' >"$out"; printf 503 ;;
+      empty) : >"$out"; printf 200 ;;
+      *) printf 'thanos_objstore_bucket_operations_total{bucket="blocks",component="store-gateway",operation="get_range"} 25037\n' >"$out"; printf 200 ;;
+    esac
+    ;;
   */releases/download/s3s-fs-0.17.0-ravel.3/s3s-fs-linux-*)
     [ -z "${STUB_S3S_CURL_EXIT:-}" ] || exit "${STUB_S3S_CURL_EXIT}"
     printf '%s' "${STUB_S3S_BYTES:-stub-s3s-fs-${url##*-linux-}}" >"$out"
@@ -1373,9 +1397,10 @@ expect_err "u3: message names step readback-folded and the error" "step readback
 check "u3: stamps name step readback-folded, exit 1 and the error stamped" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["exit_code"] == 1 and j("stamps.json")["readback_folded"]["error"] == "query series failed: 503" and "start" in j("stamps.json")["steps_completed"]'
 expect_file u3 ravel-metrics-after-folded-readback.txt
 
-# u4: the scrape after the folded read-back fails (scrape 1 is fold-state's).
+# u4: the scrape after the folded read-back fails (scrape 1 is fold-state's,
+# scrape 2 the one after the query step).
 mapfile -t args < <(full_args "${TMP}/u4/out")
-STUB_METRICS_DOWN_FROM=3 run_case u4 "${args[@]}"
+STUB_METRICS_DOWN_FROM=4 run_case u4 "${args[@]}"
 expect_rc u4 70
 expect_err "u4: message names step readback-folded and the scrape" "step readback-folded failed: the after scrape"
 check "u4: no delta without the second scrape" 'j("stamps.json")["failed_step"] == "readback-folded" and j("stamps.json")["readback_folded"]["store_get_calls_delta"] is None'
@@ -1619,6 +1644,63 @@ expect_rc "v8 real-S3 lane" 0
 expect_log "v8: the real-S3 lane lists PREFIX-ravel" "run --rm --no-deps -T --entrypoint aws createbuckets s3api list-objects-v2 --output json --bucket mb-run1-ravel"
 expect_no_log "v8: no endpoint override" "--endpoint-url"
 check "v8: stamped bucket mb-run1-ravel" 'j("stamps.json")["ravel_objects"]["bucket"] == "mb-run1-ravel"'
+
+# --- w: the scrapes around the query step --------------------------------------
+OUT="${TMP}/a/out"
+LOG="${TMP}/a/calls.log"
+for f in ravel-metrics-at-query.txt mimir-metrics-at-query.txt ravel-metrics-after-query.txt mimir-metrics-after-query.txt; do
+  expect_file w "$f"
+done
+check "w: query_scrapes stamps ok for all four" 'j("stamps.json")["query_scrapes"] == {"ravel_before": "ok", "mimir_before": "ok", "ravel_after": "ok", "mimir_after": "ok"}'
+if python3 -I - "${LOG}" <<'PY'; then
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+def idx(s):
+    return [i for i, l in enumerate(lines) if l.startswith("curl ") and s in l]
+ravel, mimir = idx("127.0.0.1:4318/metrics"), idx("127.0.0.1:9009/metrics")
+query = next(i for i, l in enumerate(lines) if l.startswith("metricsbench_query --"))
+validate = next(i for i, l in enumerate(lines) if l.startswith("metricsbench_report validate"))
+stop = next(i for i, l in enumerate(lines) if " stop ravel-server" in l)
+ok = (len(mimir) == 2 and len(ravel) == 4
+      and ravel[0] < query and mimir[0] < query
+      and query < ravel[1] < validate and query < mimir[1] < validate and validate < stop)
+sys.exit(0 if ok else 1)
+PY
+  pass "w: before pair ahead of the query run, after pair after it and ahead of validate and stop"
+else
+  fail "w: scrapes around the query step out of order in ${LOG}"
+fi
+
+for mode in "refused:1:failed: curl exit 7" "503:2:failed: HTTP 503" "empty:3:failed: empty body"; do
+  how="${mode%%:*}"
+  rest="${mode#*:}"
+  n="w${rest%%:*}"
+  reason="${rest#*:}"
+  mapfile -t args < <(full_args "${TMP}/${n}/out")
+  STUB_MIMIR_METRICS="${how}" run_case "${n}" "${args[@]}"
+  expect_rc "${n} Mimir scrape ${how}" 0
+  check "${n}: both Mimir scrapes stamped ${reason}, Ravel's ok, the run passed" 'j("stamps.json")["query_scrapes"] == {"ravel_before": "ok", "mimir_before": "'"${reason}"'", "ravel_after": "ok", "mimir_after": "'"${reason}"'"} and j("stamps.json")["status"] == "passed"'
+  expect_no_file "${n}" mimir-metrics-at-query.txt
+  expect_no_file "${n}" mimir-metrics-after-query.txt
+  expect_file "${n}" ravel-metrics-after-query.txt
+done
+
+mapfile -t args < <(full_args "${TMP}/w4/out")
+STUB_MIMIR_METRICS=refused STUB_MEM_ravel_server=2GiB run_case w4 "${args[@]}" --rss-band ravel-server:0:1073741824
+expect_rc "w4 Mimir refused plus an --rss-band breach" 75
+check "w4: stamps name memory, the Mimir scrapes stamped" 'j("stamps.json")["failed_step"] == "memory" and j("stamps.json")["query_scrapes"]["mimir_after"] == "failed: curl exit 7"'
+
+OUT="${TMP}/q4/out"
+check "q4: a refused query takes no after pair, stamped not taken" 'j("stamps.json")["query_scrapes"] == {"ravel_before": "ok", "mimir_before": "ok", "ravel_after": "not taken: the query step did not complete", "mimir_after": "not taken: the query step did not complete"}'
+expect_no_file q4 ravel-metrics-after-query.txt
+expect_no_file q4 mimir-metrics-after-query.txt
+
+OUT="${TMP}/f/out"
+LOG="${TMP}/f/calls.log"
+check "f: query_scrapes stamped not applicable" 'j("stamps.json")["query_scrapes"] == "not applicable: diagnostic run starts no Ravel or Mimir and runs no query step"'
+expect_no_log "f: no scrape of Ravel's /metrics" "127.0.0.1:4318/metrics"
+expect_no_log "f: no scrape of Mimir's /metrics" "127.0.0.1:9009/metrics"
+expect_no_file f mimir-metrics-at-query.txt
 
 echo
 echo "${passes} passed, ${fails} failed"
