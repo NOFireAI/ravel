@@ -2590,6 +2590,10 @@ class Box(Workdir):
         self.assertIn("checkout -q --detach", boot)
         self.assertIn("force-frame-pointers=yes", boot)
         self.assertIn("-p ravel-server --features sql", boot)
+        # The builds run inside the clone: rustup reads rust-toolchain.toml
+        # from the current directory, and the installer sets no default
+        # toolchain. A build run from the box root fails at once.
+        self.assertIn("env -C /root/inv/ravel", boot)
         self.assertIn("pyarrow", boot)
         self.assertIn("store qualify", "\n".join(b["store"]))
         self.assertIn("--index-trace-id true", "\n".join(b["declare"]))
