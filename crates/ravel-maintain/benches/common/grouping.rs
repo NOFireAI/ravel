@@ -19,7 +19,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use ravel_maintain::read::SeriesPlan;
 use ravel_segment::ValueKind;
-use ravel_types::{LabelSet, SeriesId};
+use ravel_types::SeriesId;
 
 /// The RNG seed every geometry's series ids are drawn from.
 pub const SEED: u64 = 0x3254_0B7E_E5EE_D001;
@@ -94,7 +94,7 @@ pub fn fixture(g: &Geometry) -> Vec<Vec<SeriesPlan>> {
             ids.into_iter()
                 .map(|id| SeriesPlan {
                     series_id: SeriesId(id),
-                    labels: LabelSet::default(),
+                    labels: Default::default(),
                     kind: ValueKind::Scalar,
                     runs: Vec::new(),
                 })

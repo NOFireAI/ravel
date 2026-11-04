@@ -411,6 +411,7 @@ pub struct RlogCodec;
 
 impl SegmentCodec for RlogCodec {
     type Catalog = RlogInputCatalog;
+    type LoadState = ();
 
     async fn load_input_catalog(
         store: &dyn ObjectStoreBackend,

@@ -9,15 +9,26 @@
 //! their `series_index` remapped (ADR-0047 decision 3). Exemplar records are
 //! small and bounded by the ingest admission cap, so they stay inside this
 //! metadata bound. The verbatim TS/VAL/HIST page bytes are
-//! fetched lazily during the merge ([`crate::build`]) with ranged GETs, so
-//! peak memory is catalog metadata plus one fetch window, plus the series being
-//! materialized -- a finished part releases its encoded bytes at its PUT
-//! (ADR-0979 decision 3), so the parts are not a term -- not the whole bucket's
-//! page data ([`crate::build`]'s header comment splits those terms and says
-//! which of them a config knob sizes).
+//! fetched lazily during the merge ([`crate::build`]) with ranged GETs, so the
+//! page data is one fetch window plus the series being materialized -- a
+//! finished part releases its encoded bytes at its PUT (ADR-0979 decision 3), so
+//! the parts are not a term -- not the whole bucket's page data
+//! ([`crate::build`]'s header comment splits those terms and says which of them
+//! a config knob sizes).
+//!
+//! The catalog metadata itself is retained for every input at once, from load
+//! until the merge ends, so it is not bounded by one part or one series: it
+//! holds one [`SeriesPlan`] and its [`RunPlan`]s per (input, series) entry and
+//! grows with the input count times the series each input carries. A series'
+//! label set is shared rather than copied per entry:
+//! [`intern_catalog_labels`] points every input's plan for one series id at
+//! the first input's copy, so the retained labels are one set per distinct
+//! series in the bucket, whatever the input count (issue #3817).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::erasure::compute_compaction_input_set_hash;
@@ -330,10 +341,15 @@ pub struct RunPlan {
 
 /// One series' merge input from one object: identity, labels, value kind, and
 /// its ordered runs.
+///
+/// `labels` is shared: a series' label set is the same in every input that
+/// carries it (its id is derived from them), so once a merge admits catalogs
+/// through [`intern_catalog_labels`] every input's plan for one series points
+/// at one allocation instead of holding its own copy.
 #[derive(Debug, Clone)]
 pub struct SeriesPlan {
     pub series_id: SeriesId,
-    pub labels: LabelSet,
+    pub labels: Arc<LabelSet>,
     pub kind: ValueKind,
     pub runs: Vec<RunPlan>,
 }
@@ -358,6 +374,60 @@ pub struct InputCatalog {
     /// the "catalog metadata" memory bound rather than scaling with the
     /// bucket's data.
     pub exemplars: Vec<ExemplarInput>,
+}
+
+impl InputCatalog {
+    /// Decoded heap this catalog holds while retained for planning, labels
+    /// excluded: the series and run plan structs, the run vectors and the
+    /// object key, plus the exemplar records shallowly. Charged to
+    /// [`crate::config::MergeMemoryTracker::add_catalog_plan_bytes`].
+    pub fn plan_heap_bytes(&self) -> u64 {
+        let mut plans = std::mem::size_of::<InputCatalog>()
+            + self.object_key.capacity()
+            + self.series.capacity() * std::mem::size_of::<SeriesPlan>()
+            + self.exemplars.capacity() * std::mem::size_of::<ExemplarInput>();
+        for series in &self.series {
+            plans += series.runs.capacity() * std::mem::size_of::<RunPlan>();
+        }
+        plans as u64
+    }
+}
+
+/// Decoded heap one shared label set holds: its `Arc` allocation and each
+/// label's two strings.
+pub fn label_heap_bytes(labels: &LabelSet) -> u64 {
+    let mut bytes = 2 * std::mem::size_of::<usize>()
+        + std::mem::size_of::<LabelSet>()
+        + labels.len() * std::mem::size_of::<ravel_types::Label>();
+    for label in labels.iter() {
+        bytes += label.name.len() + label.value.len();
+    }
+    bytes as u64
+}
+
+/// Label sets already retained by a merge's admitted catalogs, keyed by
+/// series id. Lives for one bucket's catalog load.
+pub type LabelInterner = HashMap<SeriesId, Arc<LabelSet>>;
+
+/// Point every series plan of `catalog` at the label set an earlier admitted
+/// catalog retained for the same series, or retain this catalog's own when
+/// the series is new. Returns the label heap newly retained.
+///
+/// Admitting catalogs in canonical input order keeps the first input's label
+/// set for each series, the one the merge used before it shared them, so the
+/// merged output does not change.
+pub fn intern_catalog_labels(interner: &mut LabelInterner, catalog: &mut InputCatalog) -> u64 {
+    let mut retained = 0u64;
+    for series in &mut catalog.series {
+        match interner.get(&series.series_id) {
+            Some(shared) => series.labels = Arc::clone(shared),
+            None => {
+                retained += label_heap_bytes(&series.labels);
+                interner.insert(series.series_id, Arc::clone(&series.labels));
+            }
+        }
+    }
+    retained
 }
 
 /// Decode one input's catalog into per-run absolute page ranges, stamping
@@ -567,7 +637,7 @@ fn decode_catalog_plans(
         }
         series.push(SeriesPlan {
             series_id: entry.entry.series_id,
-            labels: entry.entry.labels.clone(),
+            labels: Arc::new(entry.entry.labels.clone()),
             kind,
             runs,
         });
