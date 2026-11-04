@@ -93,12 +93,14 @@ def bump_count():
 
 
 def should_die(n):
-    die_at = os.environ.get("STUB_DIE_AT", "")
-    if not die_at:
-        return False
-    if die_at.endswith("+"):
-        return n >= int(die_at[:-1])
-    return n == int(die_at)
+    # STUB_DIE_AT: comma-separated request numbers (1-based, counted across
+    # restarts), each "N" (that request) or "N+" (that one and every later).
+    for item in filter(None, os.environ.get("STUB_DIE_AT", "").split(",")):
+        if item.endswith("+") and n >= int(item[:-1]):
+            return True
+        if not item.endswith("+") and n == int(item):
+            return True
+    return False
 
 
 class Health(http.server.BaseHTTPRequestHandler):
@@ -137,6 +139,9 @@ def main():
     health = socketserver.TCPServer(addr("--listen-health"), Health)
     main_srv = socketserver.TCPServer(addr("--listen-http"), Main)
     threading.Thread(target=health.serve_forever, daemon=True).start()
+    if os.environ.get("STUB_ARGV_FILE"):
+        with open(os.environ["STUB_ARGV_FILE"], "a") as f:
+            f.write(json.dumps(sys.argv[1:]) + "\\n")
     print("cache warmup: pass complete parts_warmed=0 elapsed_ms=1", flush=True)
     main_srv.serve_forever()
 
@@ -1328,6 +1333,37 @@ class Evaluate(Workdir):
         self.assertEqual((f["status"], f["verdict"], f["reason"]), ("missing", "missing", reason))
         self.assertEqual(res["verdict"], "fail")
         self.assertIn(f"missing row_t1.spans_1_rows_exact: {reason}", res["problems"])
+
+    def check_server_died_everywhere(self, evaluate_py=EVALUATE):
+        """A server_died call is a problem of the run whichever group it is
+        in, read by a band figure or not: with try 0 of every call group of
+        the fixture replaced by one, each group's death is a named problem
+        and the verdict is fail."""
+        groups = {}
+        for c in self.calls:
+            if c.get("try", 0) == 0 and c.get("outcome") == "ok":
+                groups.setdefault((c["statement"], c["state"], c.get("temp", "cold")), c)
+        for (statement, state, temp), c in groups.items():
+            c["outcome"] = "server_died"
+            c["reason"] = f"server died during {statement}/{state} try 0, signal 9"
+            for k in ("rows", "columns", "values", "values_sha256", "stats"):
+                c.pop(k, None)
+        self.save_calls()
+        _, res, _ = self.go(evaluate_py=evaluate_py)
+        out = []
+        if res["verdict"] != "fail":
+            out.append(f"verdict {res['verdict']}")
+        for statement, state, temp in groups:
+            want = (f"server_died {statement}/{state}/{temp} try 0: "
+                    f"server died during {statement}/{state} try 0, signal 9")
+            if want not in res["problems"]:
+                out.append(f"no problem for {statement}/{state}/{temp}")
+        if ("spans_in_10", "unfolded", "cold") not in groups:
+            out.append("the fixture has no spans_in_10/unfolded cold call (box B's death)")
+        return out
+
+    def test_server_died_everywhere(self):
+        self.assertEqual(self.check_server_died_everywhere(), [])
 
     def test_empty_stamps_directory(self):
         stamps = os.path.join(self.run_dir, "stamps")
@@ -2742,6 +2778,11 @@ FLIPS = {
         '                             ("leaf_rebuild", "folded_leaves"), ("fold_advance", "mixed")):\n',
         "check_failed_fold_advance",
     ),
+    "a server_died call a problem only where a band figure reads it": (
+        '                        if outcome == "server_died":\n',
+        '                        if False:\n',
+        "check_server_died_everywhere",
+    ),
 }
 
 
@@ -3634,10 +3675,70 @@ FINISHED=1
             "SERVER_FLAGS=--mode query --store s3 --shards 2 --tenant-hash-unkeyed --audit-mode off "
             "--memory-budget-bytes 1000000000 --sql-max-query-bytes=1048576 --audit-log-sample-rate=1", text)
 
+    def test_process_readers_return_none_for_a_gone_process(self):
+        # A server that died mid-call leaves nothing for the "after" reading;
+        # both readers return None on either platform, so cmd_call still
+        # exits 75 rather than with a traceback. The darwin branch is forced
+        # here so a Linux run checks it too.
+        inv = load_module(os.path.join(BOX, "lib", "inv.py"), "inv_readers")
+        gone = 2 ** 22 + 12345
+        self.assertIsNone(inv.proc_cpu_s(gone))
+        self.assertIsNone(inv.proc_hwm_bytes(gone))
+
+        def refuse(pid):
+            raise OSError(f"proc_pid_rusage({pid}) failed")
+
+        inv.darwin_rusage = refuse
+        platform = inv.sys.platform
+        inv.sys.platform = "darwin"
+        try:
+            self.assertIsNone(inv.proc_cpu_s(gone))
+            self.assertIsNone(inv.proc_hwm_bytes(gone))
+        finally:
+            inv.sys.platform = platform
+
+    def test_a_body_cut_short_is_a_connection_failure(self):
+        # A server killed after its headers (Content-Length promised, body
+        # cut short) is an IncompleteRead, not an OSError: inv.py call still
+        # exits 75 and writes no calls.jsonl line, so run.sh decides from the
+        # process whether the server died.
+        import socket
+        import threading
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def answer():
+            conn, _ = srv.accept()
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"da")
+            conn.close()
+
+        t = threading.Thread(target=answer, daemon=True)
+        t.start()
+        auth = self.path("auth")
+        os.makedirs(auth, exist_ok=True)
+        with open(os.path.join(auth, "inv.auth"), "w") as f:
+            f.write("Authorization: Bearer x\n")
+        calls = self.path("calls.jsonl")
+        line = json.dumps({"statement": "s", "state": "unfolded", "temp": "cold", "try": 0, "tenant": "inv",
+                           "kind": "trace_get", "path": "/api/traces/x"})
+        p = subprocess.run([PY, os.path.join(BOX, "lib", "inv.py"), "call", "--line", line,
+                            "--server", f"http://127.0.0.1:{port}", "--auth-dir", auth, "--pid", "0",
+                            "--calls", calls], capture_output=True, text=True, timeout=60)
+        t.join(5)
+        srv.close()
+        self.assertEqual(p.returncode, 75, p.stderr)
+        self.assertIn("IncompleteRead", p.stderr)
+        self.assertFalse(os.path.exists(calls) and os.path.getsize(calls))
+
     def test_extra_flags_bad_element_refused_before_anything_runs(self):
+        # inv.py server-extra-flags refuses with 64; run.sh turns that into
+        # FAILED naming the key, exit 1, before any step runs.
         toml = self.local_smoke_toml_with('extra_flags = ["sql-max-query-bytes=1048576"]\n')
         code, text = run_sh("local", toml, self.path("out"))
-        self.assertNotEqual(code, 0, text)
+        self.assertEqual(code, 1, text)
         self.assertNotIn("STEP ", text)
         self.assertIn("run.toml server.extra_flags", text)
         self.assertIn("'sql-max-query-bytes=1048576' is not a single --flag token", text)
@@ -3648,26 +3749,41 @@ FINISHED=1
         self.assertNotIn("STEP ", text2)
         self.assertIn("'--has space' is not a single --flag token", text2)
 
-    def died_run(self, cold_runs, die_at, script=None, tag=""):
-        """A single trace_fetch statement, cold_only, against a stub server
-        that answers normally until STUB_DIE_AT, then dies by SIGKILL with no
-        response: run.sh's statements() driven directly (no census or
-        needle_blocks, which need a real store and CLI the stub does not
-        provide). TAG disambiguates a second call in the same test (its own
-        out dir and death counter, not left over from the first). Returns
-        (exit of the statements() call, output, out dir)."""
+    # Two statements for the death cases: a_fetch with a warm repeat after its
+    # cold tries, b_fetch cold only, so a death can land on the last cold try,
+    # on the warm call, or before another statement's cold calls.
+    DEATH_STATEMENTS = ('[[statement]]\n'
+                        'id = "a_fetch"\n'
+                        'kind = "trace_get"\n'
+                        'states = ["unfolded"]\n'
+                        'truth_key = "ok"\n'
+                        'cold_only = false\n'
+                        '\n'
+                        '[[statement]]\n'
+                        'id = "b_fetch"\n'
+                        'kind = "trace_get"\n'
+                        'states = ["unfolded"]\n'
+                        'truth_key = "ok"\n'
+                        'cold_only = true\n')
+
+    def died_run(self, cold_runs, die_at, script=None, tag="", warm_runs=1, inflight=False, toml=None,
+                 then_empty_state=False):
+        """run.sh's run_state for the unfolded state, with state_unfolded
+        replaced by the statements() loop alone (no census or needle_blocks,
+        which need a real store and CLI), against a stub server that answers
+        normally except on the requests STUB_DIE_AT names, where it dies by
+        SIGKILL with no response. INFLIGHT starts one server and runs every
+        call --temp inflight (no restarts), as the compaction state does.
+        THEN_EMPTY_STATE runs a second state afterwards whose function does
+        nothing. TAG disambiguates a second run in the same test. Returns
+        (exit, output, out dir, argv file of every server the stub started)."""
         stub = self.path(f"stub-server{tag}")
         with open(stub, "w") as f:
             f.write(STUB_SERVER_PY)
         os.chmod(stub, 0o755)
         statements_toml = self.path(f"statements{tag}.toml")
         with open(statements_toml, "w") as f:
-            f.write('[[statement]]\n'
-                    'id = "trace_fetch"\n'
-                    'kind = "trace_get"\n'
-                    'states = ["unfolded"]\n'
-                    'truth_key = "ok"\n'
-                    'cold_only = true\n')
+            f.write(self.DEATH_STATEMENTS)
         truth = self.path(f"truth{tag}.json")
         with open(truth, "w") as f:
             json.dump({
@@ -3679,15 +3795,19 @@ FINISHED=1
             }, f)
         out = self.path(f"out{tag}")
         count_file = self.path(f"stub-count{tag}")
+        argv_file = self.path(f"stub-argv{tag}")
         driver = self.path(f"driver-died{tag}.sh")
+        body = ("state_unfolded() { start_server || return 1; statements unfolded --temp inflight; }"
+                if inflight else "state_unfolded() { statements unfolded; }")
+        tail = ("state_erasure() { return 0; }\nrun_state erasure_in_flight\n" if then_empty_state else "")
         with open(driver, "w") as f:
             f.write(f"""set -u
-source {script or os.path.join(BOX, "run.sh")} --dry-run --lane local --run-toml {os.path.join(BOX, "run.local-smoke.toml")} --out {out}
+source {script or os.path.join(BOX, "run.sh")} --dry-run --lane local --run-toml {toml or os.path.join(BOX, "run.local-smoke.toml")} --out {out}
 DRY_RUN=0
 load_config
 STATEMENTS={statements_toml}
 COLD_RUNS={cold_runs}
-WARM_RUNS=0
+WARM_RUNS={warm_runs}
 SERVER_BIN={stub}
 write_secrets
 HTTP_PORT="$(free_port)"
@@ -3698,88 +3818,189 @@ cp {truth} "$OUT/truth.json"
 : >"$CALLS"
 export STUB_DIE_AT="{die_at}"
 export STUB_COUNT_FILE={count_file}
-code=0
-statements unfolded || code=$?
-keep_state_log unfolded
-if [ "$code" != 0 ]; then
-  STATE=unfolded
-  state_failed
-fi
-stop_server
-printf 'STATEMENTS-RETURNED code=%s\\n' "$code"
+export STUB_ARGV_FILE={argv_file}
+{body}
+run_state unfolded
+{tail}stop_server
+printf 'STATES-DONE\\n'
 FINISHED=1
-exit "$code"
 """)
         p = subprocess.run([BASH, driver], capture_output=True, text=True, timeout=120)
-        return p.returncode, p.stdout + p.stderr, out
+        return p.returncode, p.stdout + p.stderr, out, argv_file
+
+    def death_calls(self, out):
+        return [(c["statement"], c["temp"], c["try"], c["outcome"])
+                for c in read_jsonl(os.path.join(out, "calls.jsonl"))]
+
+    def restart_keys(self, out):
+        path = os.path.join(out, "stamps", "restarts.jsonl")
+        lines = read_jsonl(path) if os.path.exists(path) else []
+        for r in lines:
+            # Every restart a cold call is measured after dropped the cache
+            # (the local lane says why when it cannot).
+            self.assertTrue(r.get("cache_drop"), r)
+        return [(r["statement"], r["try"]) for r in lines]
 
     def test_server_death_is_recorded_and_the_run_moves_to_the_next_call(self):
-        # Deliverable 1: a died try is not retried. The 2nd of 3 planned
-        # cold tries dies; the 3rd runs as the next planned call against a
-        # freshly restarted server, not a repeat of the dead try.
-        code, text, out = self.died_run(3, "2")
+        # A died try is not retried. a_fetch's 2nd of 3 cold tries dies (the
+        # 2nd request); its 3rd cold try restarts the server for itself and
+        # runs; nothing is restarted for the dead try, so restarts.jsonl holds
+        # exactly one stamp per cold try, under that try's own key.
+        code, text, out, _ = self.died_run(3, "2", warm_runs=0)
         self.assertEqual(code, 0, text)
-        self.assertIn("STATEMENTS-RETURNED code=0", text)
+        self.assertIn("STATES-DONE", text)
         self.assertFalse(os.path.exists(os.path.join(out, "FAILED")))
-        calls = read_jsonl(os.path.join(out, "calls.jsonl"))
-        self.assertEqual([(c["try"], c["outcome"]) for c in calls],
-                         [(0, "ok"), (1, "server_died"), (2, "ok")])
-        died = calls[1]
+        self.assertEqual(self.death_calls(out), [
+            ("a_fetch", "cold", 0, "ok"), ("a_fetch", "cold", 1, "server_died"), ("a_fetch", "cold", 2, "ok"),
+            ("b_fetch", "cold", 0, "ok"), ("b_fetch", "cold", 1, "ok"), ("b_fetch", "cold", 2, "ok")])
+        died = read_jsonl(os.path.join(out, "calls.jsonl"))[1]
         self.assertEqual(died["signal"], 9)
-        self.assertEqual(died["reason"], "server died during trace_fetch/unfolded try 1, signal 9")
-        self.assertTrue(died["log"].startswith("out/logs/server-"), died["log"])
-        with open(os.path.join(out, died["log"][len("out/"):])) as f:
-            pass  # the dying server's log was kept; just prove it is readable
-        # 3 restarts, same as COLD_RUNS with no death: one before each of
-        # try0 and try1's own cold calls, one more on the death itself, and
-        # try2's own would-be restart is the one just_restarted suppresses
-        # (it reuses the death's restart instead of a 4th).
-        restarts = read_jsonl(os.path.join(out, "stamps", "restarts.jsonl"))
-        self.assertEqual(len(restarts), 3)
+        self.assertEqual(died["reason"], "server died during a_fetch/unfolded try 1, signal 9")
+        self.assertTrue(os.path.exists(os.path.join(out, died["log"][len("out/"):])), died["log"])
+        self.assertEqual(self.restart_keys(out), [("a_fetch", 0), ("a_fetch", 1), ("a_fetch", 2),
+                                                  ("b_fetch", 0), ("b_fetch", 1), ("b_fetch", 2)])
         old = '    [ "$code" = 75 ] && ! kill -0 "${SERVER_PID:-0}" 2>/dev/null || fail "call against an ' \
               'unreachable server"\n'
         flipped, line = self.flipped_box(old, '    fail "call against an unreachable server"\n')
-        code2, text2, _ = self.died_run(3, "2", flipped, tag="-flip")
+        code2, text2, _, _ = self.died_run(3, "2", flipped, tag="-flip", warm_runs=0)
         self.assertNotEqual(code2, 0, text2)
         print(f"flip 'a died try fails the run instead of being recorded' at box/run.sh:{line} fails "
               f"test_server_death_is_recorded_and_the_run_moves_to_the_next_call: exit {code2}", file=sys.stderr)
 
-    def test_three_deaths_in_one_statement_fail_the_state(self):
-        # Deliverable 1: three deaths across one statement's own tries (not
-        # three retries of one try) fail the state through the existing
-        # state_failed() mechanism; the run does not hard-fail.
-        code, text, out = self.died_run(3, "1+")
-        self.assertEqual(code, 1, text)
-        self.assertIn("STATEMENTS-RETURNED code=1", text)
-        self.assertFalse(os.path.exists(os.path.join(out, "FAILED")))
-        calls = read_jsonl(os.path.join(out, "calls.jsonl"))
-        self.assertEqual([c["outcome"] for c in calls], ["server_died"] * 3)
-        failed = read_jsonl(os.path.join(out, "stamps", "failed_states.jsonl"))
-        self.assertEqual(len(failed), 1)
-        self.assertEqual(failed[0]["state"], "unfolded")
-        self.assertEqual(failed[0]["step"], "server died 3 times during trace_fetch")
-        self.assertEqual(failed[0]["exit"], 75)
-        old = "    if [ \"$deaths\" -ge 3 ]; then\n"
-        flipped, line = self.flipped_box(old, "    if false; then\n")
-        code2, text2, out2 = self.died_run(3, "1+", flipped, tag="-flip")
-        self.assertNotEqual(code2, 1, text2)
-        print(f"flip 'three deaths do not fail the state' at box/run.sh:{line} fails "
-              f"test_three_deaths_in_one_statement_fail_the_state: code {code2}", file=sys.stderr)
+    def test_death_on_the_last_cold_try_leaves_the_warm_call_not_run(self):
+        # a_fetch's last cold try dies (request 2 of cold_runs 2). Its warm
+        # repeat, defined by the server it follows, is recorded not-run with
+        # the reason, and b_fetch's first cold call restarts the server for
+        # itself: a restart for the dead try under its key, then no restart
+        # for b_fetch's cold 0 (a warm server measured as cold), is the shape
+        # this rules out.
+        code, text, out, _ = self.died_run(2, "2")
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.death_calls(out), [
+            ("a_fetch", "cold", 0, "ok"), ("a_fetch", "cold", 1, "server_died"), ("a_fetch", "warm", 0, "not-run"),
+            ("b_fetch", "cold", 0, "ok"), ("b_fetch", "cold", 1, "ok")])
+        warm = read_jsonl(os.path.join(out, "calls.jsonl"))[2]
+        self.assertEqual(warm["reason"], "the server died earlier in unfolded and no cold call has restarted it")
+        self.assertEqual(self.restart_keys(out), [("a_fetch", 0), ("a_fetch", 1), ("b_fetch", 0), ("b_fetch", 1)])
+        flipped, line = self.flipped_box("    server_down=1\n", '    restart_for "$line"\n    server_down=0\n')
+        code2, text2, out2, _ = self.died_run(2, "2", flipped, tag="-flip")
+        self.assertEqual(code2, 0, text2)
+        self.assertNotEqual(self.restart_keys(out2),
+                            [("a_fetch", 0), ("a_fetch", 1), ("b_fetch", 0), ("b_fetch", 1)])
+        print(f"flip 'restart for the dead try' at box/run.sh:{line} fails "
+              f"test_death_on_the_last_cold_try_leaves_the_warm_call_not_run: restarts {self.restart_keys(out2)}",
+              file=sys.stderr)
+
+    def test_death_on_a_warm_call_stamps_no_restart(self):
+        # The warm repeat dies (request 3 of cold_runs 2): it is recorded
+        # server_died, and the next statement's cold calls restart for
+        # themselves, one stamp each, none duplicating a cold key.
+        code, text, out, _ = self.died_run(2, "3")
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.death_calls(out), [
+            ("a_fetch", "cold", 0, "ok"), ("a_fetch", "cold", 1, "ok"), ("a_fetch", "warm", 0, "server_died"),
+            ("b_fetch", "cold", 0, "ok"), ("b_fetch", "cold", 1, "ok")])
+        self.assertEqual(self.restart_keys(out), [("a_fetch", 0), ("a_fetch", 1), ("b_fetch", 0), ("b_fetch", 1)])
+
+    def test_death_on_an_inflight_call_leaves_the_rest_of_the_state_not_run(self):
+        # Inflight calls run against the state's one server with no restart.
+        # After that server dies (request 2), every later inflight call is
+        # recorded not-run with the reason; nothing is restarted or stamped.
+        code, text, out, _ = self.died_run(2, "2", inflight=True)
+        self.assertEqual(code, 0, text)
+        calls = self.death_calls(out)
+        self.assertEqual(calls[:2], [("a_fetch", "inflight", 0, "ok"), ("a_fetch", "inflight", 1, "server_died")])
+        self.assertTrue(calls[2:], calls)
+        self.assertTrue(all(c[1] == "inflight" and c[3] == "not-run" for c in calls[2:]), calls)
+        self.assertEqual(self.restart_keys(out), [])
+
+    def test_three_deaths_stop_the_statement_not_the_state(self):
+        # Three deaths across a_fetch's own tries (requests 1, 2 and 3; every
+        # cold try restarts for itself in between) stop a_fetch: its remaining
+        # tries are recorded not-run with the reason, and b_fetch still runs.
+        # The state is not failed: the deaths reach the verdict through
+        # evaluate.py's server_died problems instead.
+        code, text, out, _ = self.died_run(5, "1,2,3", warm_runs=0)
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.death_calls(out), [
+            ("a_fetch", "cold", 0, "server_died"), ("a_fetch", "cold", 1, "server_died"),
+            ("a_fetch", "cold", 2, "server_died"), ("a_fetch", "cold", 3, "not-run"),
+            ("a_fetch", "cold", 4, "not-run"),
+            ("b_fetch", "cold", 0, "ok"), ("b_fetch", "cold", 1, "ok"), ("b_fetch", "cold", 2, "ok"),
+            ("b_fetch", "cold", 3, "ok"), ("b_fetch", "cold", 4, "ok")])
+        stopped = read_jsonl(os.path.join(out, "calls.jsonl"))[3]
+        self.assertEqual(stopped["reason"],
+                         "the server died 3 times during a_fetch in unfolded; its remaining tries were not sent")
+        self.assertFalse(os.path.exists(os.path.join(out, "stamps", "failed_states.jsonl")))
+        flipped, line = self.flipped_box('    [ "$deaths" -lt 3 ] || stopped="$stmt"\n', "")
+        code2, text2, out2, _ = self.died_run(5, "1,2,3", flipped, tag="-flip", warm_runs=0)
+        self.assertEqual(code2, 0, text2)
+        self.assertNotIn(("a_fetch", "cold", 3, "not-run"), self.death_calls(out2))
+        print(f"flip 'three deaths do not stop the statement' at box/run.sh:{line} fails "
+              f"test_three_deaths_stop_the_statement_not_the_state", file=sys.stderr)
 
     def test_server_death_keeps_the_dying_log_and_the_states_last_log(self):
-        # Deliverable 2: the dying server's own log lands under out/logs/
-        # (named by record_server_death's "log" field), and the state's last
-        # server log is copied too, separately, at the end of the state.
-        code, text, out = self.died_run(3, "2")
+        # The dying server's own log lands under out/logs/ (the server_died
+        # line names it), and run_state copies the state's last server log,
+        # the one of the server that answered b_fetch's last call.
+        code, text, out, argv_file = self.died_run(2, "2")
         self.assertEqual(code, 0, text)
-        calls = read_jsonl(os.path.join(out, "calls.jsonl"))
-        died_log = calls[1]["log"]
-        self.assertTrue(os.path.exists(os.path.join(out, died_log[len("out/"):])), died_log)
+        died_log = read_jsonl(os.path.join(out, "calls.jsonl"))[1]["log"]
+        self.assertEqual(died_log, "out/logs/server-2.log")
+        self.assertTrue(os.path.exists(os.path.join(out, "logs", "server-2.log")))
         last_log = os.path.join(out, "logs", "server-unfolded-last.log")
         self.assertTrue(os.path.exists(last_log))
-        # A second, later server (the restart after the death) wrote the
-        # last-log copy: it is a different file from the dying server's own.
-        self.assertNotEqual(os.path.realpath(os.path.join(out, died_log[len("out/"):])), os.path.realpath(last_log))
+        with open(argv_file) as f:
+            servers = len(f.read().splitlines())
+        self.assertEqual(servers, 4)
+        with open(last_log, "rb") as f, open(os.path.join(out, "work", "server-4.log"), "rb") as g:
+            self.assertEqual(f.read(), g.read())
+        flipped, line = self.flipped_box('  keep_state_log "$state"\n', "")
+        code2, text2, out2, _ = self.died_run(2, "2", flipped, tag="-flip")
+        self.assertFalse(os.path.exists(os.path.join(out2, "logs", "server-unfolded-last.log")))
+        print(f"flip 'run_state keeps no state log' at box/run.sh:{line} fails "
+              f"test_server_death_keeps_the_dying_log_and_the_states_last_log", file=sys.stderr)
+
+    def test_a_state_with_no_server_copies_no_earlier_log(self):
+        # A state that neither starts a server nor sends a call (here a state
+        # function that does nothing, after unfolded ran) copies no log under
+        # its own name: the previous state's server log is not its log.
+        code, text, out, _ = self.died_run(1, "", warm_runs=0, then_empty_state=True)
+        self.assertEqual(code, 0, text)
+        self.assertTrue(os.path.exists(os.path.join(out, "logs", "server-unfolded-last.log")))
+        self.assertFalse(os.path.exists(os.path.join(out, "logs", "server-erasure_in_flight-last.log")))
+        flipped, line = self.flipped_box('  STATE_SERVER_LOG=""\n', "")
+        code2, text2, out2, _ = self.died_run(1, "", flipped, tag="-flip", warm_runs=0, then_empty_state=True)
+        self.assertTrue(os.path.exists(os.path.join(out2, "logs", "server-erasure_in_flight-last.log")))
+        print(f"flip 'the state log is not reset per state' at box/run.sh:{line} fails "
+              f"test_a_state_with_no_server_copies_no_earlier_log", file=sys.stderr)
+
+    def test_extra_flags_reach_the_server_command_line(self):
+        # The flags run.toml [server] extra_flags names are on the argv of
+        # every server start_server launches, after --memory-budget-bytes, as
+        # written: "--x=*" is not glob-expanded against a file named
+        # "--x=GLOBBED" in the working directory.
+        toml = self.local_smoke_toml_with('extra_flags = ["--sql-max-query-bytes=1048576", "--x=*"]\n')
+        open(os.path.join(self.path(""), "--x=GLOBBED"), "w").close()
+        cwd = os.getcwd()
+        os.chdir(self.path(""))
+        try:
+            code, text, out, argv_file = self.died_run(1, "", warm_runs=0, toml=toml)
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(code, 0, text)
+        with open(argv_file) as f:
+            argvs = [json.loads(line) for line in f]
+        self.assertTrue(argvs)
+        for argv in argvs:
+            i = argv.index("--memory-budget-bytes")
+            self.assertEqual(argv[i + 2:i + 4], ["--sql-max-query-bytes=1048576", "--x=*"], argv)
+        flipped, line = self.flipped_box(' ${SERVER_EXTRA[@]+"${SERVER_EXTRA[@]}"} </dev/null', " </dev/null")
+        code2, text2, _, argv2 = self.died_run(1, "", flipped, tag="-flip", warm_runs=0, toml=toml)
+        with open(argv2) as f:
+            self.assertNotIn("--sql-max-query-bytes=1048576", f.read())
+        print(f"flip 'extra flags left off the server command' at box/run.sh:{line} fails "
+              f"test_extra_flags_reach_the_server_command_line", file=sys.stderr)
 
     def test_server_last_log_is_truncated_past_2mb(self):
         # Deliverable 2: keep_state_log truncates to the last 2000 lines once
@@ -3798,7 +4019,7 @@ exit "$code"
 source {os.path.join(BOX, "run.sh")} --dry-run --lane local --run-toml {os.path.join(BOX, "run.local-smoke.toml")} --out {out}
 DRY_RUN=0
 mkdir -p "$OUT"
-SERVER_LOG={server_log}
+STATE_SERVER_LOG={server_log}
 keep_state_log truncstate
 FINISHED=1
 """)
@@ -3807,7 +4028,8 @@ FINISHED=1
         kept = os.path.join(out, "logs", "server-truncstate-last.log")
         with open(kept) as f:
             lines = f.read().splitlines()
-        self.assertTrue(lines[0].startswith("... truncated to the last 2000 lines"), lines[0])
+        self.assertEqual(lines[0], f"... truncated to the last 2000 lines (original "
+                                   f"{os.path.getsize(server_log)} bytes) ...")
         self.assertEqual(len(lines), 2001)
         self.assertEqual(lines[-1], "line 59999 padding padding padding padding padding padding padding")
 
