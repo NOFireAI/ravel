@@ -1617,6 +1617,17 @@ pub struct SqlOutcome {
     /// 2026-09-13 amendment, items 3 and 4). It is read off the snapshot the
     /// rows came from, for the same reason as [`Self::pending_erasure`].
     pub ingest_watermark_hour: Option<u32>,
+    /// The data-object keys of the segments the succeeding attempt resolved,
+    /// over every signal lane, sorted and deduplicated
+    /// ([`segment_set_keys`]).
+    ///
+    /// A paging cursor pins a digest of this set and compares it with the
+    /// redeeming resolve's (ADR-1374, the pinned segment set amendment),
+    /// because the resolve inputs a cursor pins bound which ingest-hour
+    /// buckets are listed and not what they hold. It is the set of data-object
+    /// keys, so a compaction changes it even though the rows it covers are
+    /// conserved.
+    pub segment_set: Vec<String>,
     /// Whether the statement read a Parquet table (ADR-2040), alone or joined
     /// with signal tables. A Parquet table is resolved from its manifest, not
     /// from a signal snapshot, so no cursor pin covers it.
@@ -1632,6 +1643,16 @@ pub struct SqlOutcome {
     /// default `samples` lane it resolved: that lane is not a table the
     /// statement read, so no cursor pin may rest on it.
     pub signal_tables_named: usize,
+}
+
+/// A resolved segment set in canonical form: its data-object keys, sorted
+/// and deduplicated, so two resolves over the same segments compare equal
+/// whatever order their lanes listed them in.
+pub fn segment_set_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut keys: Vec<String> = keys.map(str::to_owned).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 /// The warning a `samples` statement carries when its answer omits the
@@ -2537,6 +2558,12 @@ impl SqlExecutor {
                 .flat_map(|(_, snapshot)| snapshot.segments.iter())
                 .map(|seg| seg.ingest_hour_bucket)
                 .max();
+            let segment_set = segment_set_keys(
+                lanes
+                    .iter()
+                    .flat_map(|(_, snapshot)| snapshot.segments.iter())
+                    .map(|seg| seg.data_object_key.as_str()),
+            );
             let reads_parquet = parquet.is_some();
             let lane_refs: Vec<(TargetSignal, &Snapshot)> = lanes
                 .iter()
@@ -2662,6 +2689,7 @@ impl SqlExecutor {
                         declared_columns: declared.clone(),
                         pending_erasure,
                         ingest_watermark_hour,
+                        segment_set,
                         reads_parquet,
                         unbounded_components,
                         signal_tables_named,
@@ -7303,6 +7331,116 @@ pub(crate) mod tests {
         publish::publish(store, &rec, &RetryPolicy::default())
             .await
             .expect("publish");
+    }
+
+    /// The data-object keys `SqlOutcome::segment_set` reports for one
+    /// `samples` run over `window`, from a fresh executor so no cache of an
+    /// earlier run answers it.
+    async fn resolved_segment_set(
+        store: &Arc<InstrumentedStore<FaultStore<MemoryStore>>>,
+        tenant_hash: TenantHash,
+        window: TimeRange,
+        now_ns: i64,
+    ) -> Vec<String> {
+        let mut req = sql_request("SELECT ts, value FROM samples", window);
+        req.now_ns = now_ns;
+        executor_over(store.clone())
+            .execute(tenant_hash, &req)
+            .await
+            .expect("executes")
+            .segment_set
+    }
+
+    /// The segment set a run reports is the data-object keys of the segments
+    /// it resolved: the same over an unchanged store, changed by a commit into
+    /// an hour the window lists whose rows overlap it, and unchanged by a
+    /// commit whose rows do not.
+    ///
+    /// FLIP D: with `segment_set` built from `ingest_watermark_hour` instead
+    /// of the segments' keys in `run`, the overlapping-commit assertion fails:
+    /// the late segment lands in the hour already listed, so the watermark
+    /// does not move.
+    #[tokio::test]
+    async fn the_segment_set_moves_with_an_overlapping_commit_and_only_then() {
+        let tenant = TenantId::new("acme-sql-segment-set".to_string());
+        let tenant_hash = tenant.hash();
+        let store = wrap_fixture_store(MemoryStore::new());
+        let memory = store.inner().inner();
+        let hour = FOLD_LAG_NOW_HOUR;
+        let hour_ns = i64::from(hour) * FOLD_LAG_NS_PER_HOUR;
+        let window = TimeRange {
+            start_ns: hour_ns,
+            end_ns: hour_ns + FOLD_LAG_NS_PER_HOUR,
+        };
+        let now_ns = hour_ns + FOLD_LAG_NS_PER_HOUR + 30 * FOLD_LAG_NS_PER_MIN;
+        publish_fold_lag_segment(
+            memory,
+            &tenant,
+            tenant_hash,
+            1,
+            hour,
+            hour_ns + 10 * FOLD_LAG_NS_PER_MIN,
+        )
+        .await;
+
+        let first = resolved_segment_set(&store, tenant_hash, window, now_ns).await;
+        assert_eq!(
+            first.len(),
+            1,
+            "test setup: one segment resolved: {first:?}"
+        );
+        let again = resolved_segment_set(&store, tenant_hash, window, now_ns).await;
+        assert_eq!(first, again, "an unchanged store resolves the same set");
+
+        // A late row into the hour the window lists.
+        publish_fold_lag_segment(
+            memory,
+            &tenant,
+            tenant_hash,
+            2,
+            hour,
+            hour_ns + 20 * FOLD_LAG_NS_PER_MIN,
+        )
+        .await;
+        let moved = resolved_segment_set(&store, tenant_hash, window, now_ns).await;
+        assert_ne!(moved, first, "an overlapping commit moves the set");
+        assert_eq!(moved.len(), 2, "both segments resolved: {moved:?}");
+        assert!(moved.contains(&first[0]));
+        assert!(
+            moved.iter().all(|key| key.ends_with(".rseg")),
+            "data-object keys: {moved:?}"
+        );
+
+        // A commit whose rows are outside the window, in a later hour.
+        publish_fold_lag_segment(
+            memory,
+            &tenant,
+            tenant_hash,
+            3,
+            hour + 1,
+            hour_ns + FOLD_LAG_NS_PER_HOUR + 10 * FOLD_LAG_NS_PER_MIN,
+        )
+        .await;
+        let after = resolved_segment_set(&store, tenant_hash, window, now_ns).await;
+        assert_eq!(after, moved, "a non-overlapping commit leaves the set");
+    }
+
+    /// The key set is sorted and deduplicated, so it does not depend on the
+    /// order the lanes and segments were listed in.
+    ///
+    /// FLIP E (keys): with the `sort_unstable` removed from
+    /// `segment_set_keys`, the first assertion fails.
+    #[test]
+    fn the_segment_set_keys_are_sorted_and_deduplicated() {
+        assert_eq!(
+            segment_set_keys(["b.rseg", "a.rseg", "b.rseg"].into_iter()),
+            vec!["a.rseg".to_string(), "b.rseg".to_string()],
+        );
+        assert_eq!(
+            segment_set_keys(["a.rseg", "b.rseg"].into_iter()),
+            segment_set_keys(["b.rseg", "a.rseg", "a.rseg"].into_iter()),
+        );
+        assert!(segment_set_keys(std::iter::empty()).is_empty());
     }
 
     /// The fold-lag fixture: one segment in an hour the fold sealed
