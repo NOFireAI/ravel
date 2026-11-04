@@ -370,11 +370,11 @@ build_pkg() {
   local cmd=(env -C "$BOX_ROOT/ravel" CARGO_TARGET_DIR="$BOX_ROOT/target-fp" RUSTFLAGS="-C force-frame-pointers=yes"
     cargo build --release --locked "$@")
   if [ "$DRY_RUN" = 1 ]; then
-    run "${cmd[@]}"
+    run ${cmd[@]+"${cmd[@]}"}
     return 0
   fi
   mkdir -p "$OUT"
-  run "${cmd[@]}" >"$OUT/build-$name.log" 2>&1
+  run ${cmd[@]+"${cmd[@]}"} >"$OUT/build-$name.log" 2>&1
 }
 
 # keep_run_log: copy the box's own run.log (launch.sh's user-data redirects
