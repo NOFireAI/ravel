@@ -606,6 +606,84 @@ fn memo_array(
     memo.as_any().downcast_ref::<StrMemo>()?.array.clone()
 }
 
+/// A test hook that runs the memo build [`build_str_block`] runs, for a test
+/// outside the crate to measure (`tests/memo_overhead_alloc_pin.rs`). No
+/// production code calls it.
+#[doc(hidden)]
+pub mod values_memo_build {
+    use super::{ColumnarBlockView, StrCursor};
+
+    /// One `Str` column of a block, resolved as [`build_str_block`] resolves
+    /// it, so that [`Self::build`] does nothing but the build.
+    pub struct MemoBuild<'a> {
+        cursor: StrCursor<'a>,
+        surviving: usize,
+        record_count: usize,
+    }
+
+    /// The shape of what a [`MemoBuild::build`] built.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Built {
+        /// The memo array's length: rows for a plain column, entries for a
+        /// dictionary.
+        pub len: usize,
+        /// The memo array's NULL entries.
+        pub null_count: usize,
+        /// The keys buffer's length in keys, when the build shared the
+        /// block's keys.
+        pub keys: Option<usize>,
+    }
+
+    impl<'a> MemoBuild<'a> {
+        /// The column `column_id` of `view`, when a decoded-cache entry holds
+        /// it with a memo slot.
+        pub fn resolve(view: &ColumnarBlockView<'a>, column_id: u32) -> Option<Self> {
+            let cursor = StrCursor::resolve(view, column_id);
+            cursor.memo.as_ref()?;
+            Some(MemoBuild {
+                cursor,
+                surviving: view.surviving_count(),
+                record_count: view.record_count(),
+            })
+        }
+
+        /// Whether the column is a dictionary page.
+        pub fn is_dict(&self) -> bool {
+            self.cursor.dict.is_some()
+        }
+
+        /// Whether the memo slot is still empty.
+        pub fn slot_empty(&self) -> bool {
+            self.cursor.memo.as_ref().is_none_or(|m| m.get().is_none())
+        }
+
+        /// The memo build of [`build_str_block`]'s paths: a plain column's
+        /// fast path; for a dictionary with `keys`, the key path and, when
+        /// that refuses, the loop's values memo; for a dictionary without
+        /// `keys`, the loop's values memo alone.
+        pub fn build(&self, keys: bool) -> Option<Built> {
+            let c = &self.cursor;
+            if c.dict.is_none() {
+                let a = c.plain_memo(self.surviving, self.record_count)?;
+                return Some(built(&a, None));
+            }
+            if keys && let Some((a, k)) = c.dict_memo_keys(self.surviving, self.record_count) {
+                return Some(built(&a, Some(k.len())));
+            }
+            c.dict_memo().map(|a| built(&a, None))
+        }
+    }
+
+    fn built(array: &datafusion::arrow::array::StringArray, keys: Option<usize>) -> Built {
+        use datafusion::arrow::array::Array;
+        Built {
+            len: array.len(),
+            null_count: array.null_count(),
+            keys,
+        }
+    }
+}
+
 /// The Arrow values of each shared string dictionary one partition's scan has
 /// read (ADR-2773 decision D3), found by the dictionary's `Arc` identity, so a
 /// row group dictionary becomes one `StringArray` however many of its blocks

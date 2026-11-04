@@ -1376,10 +1376,12 @@ This amendment makes six decisions.
 
 **Memory.** The memo shares the entry's buffers. Its own cost is the array
 struct and the `Buffer` and `Bytes` headers, about 200 to 500 B per entry
-(inference), or 3 to 7 MB for a column of 13,141 blocks. Measured: 392 B
-for a plain column and for a text dictionary, 520 B for a mixed one
+(inference), or 3 to 7 MB for a column of 13,141 blocks. Measured through
+ravel-sql's own build: 432 B for a plain column and for a text dictionary,
+568 B for a text dictionary with its keys buffer built, 560 B for a mixed
+one, whose keys buffer is never built
 (`values_memo_charge_covers_the_measured_memo_and_no_more`); the charge is
-528 B. The inference's upper end was low. `offer` adds that
+576 B. The inference's upper end was low. `offer` adds that
 constant to the column's `heap_bytes` when it takes the reservation, since
 the memo is filled after `offer` fixes the charge. `heap_bytes` and
 `decoded_heap_bytes` stay unchanged for their other callers

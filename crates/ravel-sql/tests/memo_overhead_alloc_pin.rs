@@ -4,18 +4,21 @@
 //!
 //! Each case decodes one block through a scan with a decoded-column cache
 //! attached, so the column is admitted and its memo slot is empty, then fills
-//! the slot once under a `stats_alloc` `Region`. The fill is the build
-//! `memo_array` runs in `src/logs_scan/batch.rs`: `build_str_memo` over the
-//! column's shared buffers, each wrapped as a `MemoOwner` in `Bytes` and an
-//! Arrow `Buffer`, the `StringArray` over them, and the `Arc<StrMemo>` the slot
-//! holds as `Arc<dyn ValuesMemo>`. Those functions are private to the crate, so
-//! [`build_str_memo`] below is a copy of them, allocation for allocation; a
-//! change to the memo's layout there changes the copy here in the same commit.
+//! the slot once under a `stats_alloc` `Region`. The fill is the crate's own
+//! build, run through the doc-hidden hook
+//! `ravel_sql::values_memo_build::MemoBuild`: the paths `build_str_block`
+//! takes in `src/logs_scan/batch.rs`, so a change to the memo's layout there
+//! moves the figures here.
 //!
 //! The cases are a plain `Text` column and a block-local dictionary of each
 //! region kind that gets a memo: `Text` (every entry UTF-8, no validity
 //! buffer) and `Mixed` (one entry not UTF-8, so the array carries a null
-//! buffer over the dictionary's validity words).
+//! buffer over the dictionary's validity words). Each dictionary is measured
+//! twice: through the loop's path, which builds the values memo alone, and
+//! through the key path, which also builds the memo's keys buffer over the
+//! block's keys. The key path refuses a `Mixed` dictionary, whose keys can
+//! point at a NULL entry, so that case falls back to the loop's build as
+//! `build_str_block` does and builds no keys buffer.
 //!
 //! This file contains EXACTLY ONE test on purpose: the instrumented global
 //! allocator counts every allocation in the process, so a second test running
@@ -31,13 +34,9 @@
 use std::alloc::System;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, StringArray};
-use datafusion::arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
-use datafusion::arrow::datatypes::ToByteSlice;
 use ravel_logseg::block::{ColumnPlan, write_block};
 use ravel_logseg::decoded_cache::{
-    DecodedCacheAttach, DecodedCacheCounters, DecodedColumnCache, ReservationCell, StrBuffers,
-    VALUES_MEMO_BYTES, ValuesMemo,
+    DecodedCacheAttach, DecodedCacheCounters, DecodedColumnCache, VALUES_MEMO_BYTES,
 };
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{
@@ -48,9 +47,10 @@ use ravel_logseg::record::{ColumnValue, ResolvedRow};
 use ravel_logseg::skip_index::SkipIndex;
 use ravel_logseg::writer::{BlocksBuilder, ObjectIdentity};
 use ravel_logseg::{
-    AttrValue, ColumnSelection, FieldType, LogRecord, Predicate, RlogConfig, RlogWriter, Validity,
+    AttrValue, ColumnSelection, FieldType, LogRecord, Predicate, RlogConfig, RlogWriter,
     stream_attrs_bytes,
 };
+use ravel_sql::values_memo_build::{Built, MemoBuild};
 use ravel_types::accounting::AccessIntent;
 use ravel_types::logstream::log_stream_id;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
@@ -63,119 +63,6 @@ const KEY: &str = "k";
 const ROWS: usize = 4096;
 /// Separately counted windows per case, each over a fresh admission.
 const WINDOWS: usize = 5;
-
-// --- the memo build, as `src/logs_scan/batch.rs` runs it ---------------------
-
-struct StrMemo {
-    array: Option<StringArray>,
-}
-
-impl ValuesMemo for StrMemo {
-    fn held_outside(&self) -> bool {
-        let Some(array) = &self.array else {
-            return false;
-        };
-        array.values().strong_count() > 1
-            || array.offsets().inner().inner().strong_count() > 1
-            || array.nulls().is_some_and(|n| n.buffer().strong_count() > 1)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
-struct MemoOwner<T> {
-    buf: Arc<T>,
-    _cell: Arc<ReservationCell>,
-}
-
-impl AsRef<[u8]> for MemoOwner<String> {
-    fn as_ref(&self) -> &[u8] {
-        self.buf.as_bytes()
-    }
-}
-
-impl AsRef<[u8]> for MemoOwner<Vec<u32>> {
-    fn as_ref(&self) -> &[u8] {
-        self.buf.as_slice().to_byte_slice()
-    }
-}
-
-impl AsRef<[u8]> for MemoOwner<Vec<i32>> {
-    fn as_ref(&self) -> &[u8] {
-        self.buf.as_slice().to_byte_slice()
-    }
-}
-
-impl AsRef<[u8]> for MemoOwner<Validity> {
-    fn as_ref(&self) -> &[u8] {
-        self.buf.words().to_byte_slice()
-    }
-}
-
-fn memo_buffer<T>(buf: Arc<T>, cell: &Arc<ReservationCell>) -> Buffer
-where
-    MemoOwner<T>: AsRef<[u8]>,
-    T: Send + Sync + 'static,
-{
-    Buffer::from(bytes::Bytes::from_owner(MemoOwner {
-        buf,
-        _cell: Arc::clone(cell),
-    }))
-}
-
-fn memo_offsets<T: Copy + Into<i64>>(
-    offsets: &[T],
-    values_len: usize,
-    buffer: Buffer,
-) -> Option<OffsetBuffer<i32>> {
-    let first: i64 = (*offsets.first()?).into();
-    let last: i64 = (*offsets.last()?).into();
-    let ordered = offsets.windows(2).all(|w| w[0].into() <= w[1].into());
-    if first != 0
-        || !ordered
-        || last > i64::from(i32::MAX)
-        || usize::try_from(last).ok()? > values_len
-    {
-        return None;
-    }
-    Some(OffsetBuffer::new(ScalarBuffer::new(
-        buffer,
-        0,
-        offsets.len(),
-    )))
-}
-
-fn build_str_memo(buffers: StrBuffers, cell: Arc<ReservationCell>) -> Option<StringArray> {
-    let (values, offsets, valid) = match buffers {
-        StrBuffers::Plain { values, offsets } => {
-            let len = values.len();
-            let o = memo_offsets(&offsets, len, memo_buffer(Arc::clone(&offsets), &cell))?;
-            (values, o, None)
-        }
-        StrBuffers::Dict {
-            values,
-            offsets,
-            valid,
-        } => {
-            let len = values.len();
-            let o = memo_offsets(&offsets, len, memo_buffer(Arc::clone(&offsets), &cell))?;
-            (values, o, valid)
-        }
-    };
-    let entries = offsets.len() - 1;
-    let nulls = match valid {
-        Some(valid) if valid.len() == entries => Some(NullBuffer::new(BooleanBuffer::new(
-            memo_buffer(valid, &cell),
-            0,
-            entries,
-        ))),
-        Some(_) => return None,
-        None => None,
-    };
-    StringArray::try_new(offsets, memo_buffer(values, &cell), nulls).ok()
-}
 
 // --- fixtures ----------------------------------------------------------------
 
@@ -362,12 +249,11 @@ fn resident_after_scan(obj: &[u8], columns: &ColumnSelection) -> u64 {
 
 // --- the measurement ---------------------------------------------------------
 
-/// One case's quietest window, and the memo's array for shape checks.
+/// One case's quietest window, and what the build built for shape checks.
 struct Measured {
     stats: Stats,
     per_window: Vec<usize>,
-    array_len: usize,
-    array_nulls: usize,
+    built: Built,
 }
 
 /// Bytes still held when the region closed: allocated, plus net growth by
@@ -377,8 +263,15 @@ fn live(stats: &Stats) -> i64 {
 }
 
 /// Fills `case`'s memo slot once per window, each over a column freshly
-/// admitted to its own cache, with only the fill inside the region.
-fn measure(case: Case, obj: &[u8], column_id: u32, columns: &ColumnSelection) -> Measured {
+/// admitted to its own cache, with only the build inside the region: the
+/// key path's when `keys`, else the loop's.
+fn measure(
+    case: Case,
+    keys: bool,
+    obj: &[u8],
+    column_id: u32,
+    columns: &ColumnSelection,
+) -> Measured {
     let mut counts = Vec::with_capacity(WINDOWS);
     let mut shape = None;
     for _ in 0..WINDOWS {
@@ -392,33 +285,23 @@ fn measure(case: Case, obj: &[u8], column_id: u32, columns: &ColumnSelection) ->
             .next_block_columnar(obj)
             .expect("columnar exit")
             .expect("one block");
-        let is_dict = view.str_dict(column_id).is_some();
+        let build = MemoBuild::resolve(&view, column_id)
+            .expect("an admitted entry holds a memo-capable column");
         assert_eq!(
-            is_dict,
+            build.is_dict(),
             !matches!(case, Case::PlainText),
             "{case:?}: page kind"
         );
-        let source = view
-            .str_values_memo(column_id)
-            .expect("an admitted entry holds a memo-capable column");
-        assert!(source.get().is_none(), "{case:?}: the slot starts empty");
+        assert!(build.slot_empty(), "{case:?}: the slot starts empty");
 
         let region = Region::new(GLOBAL);
-        let memo = source.get_or_build(|buffers, cell| {
-            Arc::new(StrMemo {
-                array: build_str_memo(buffers, cell),
-            })
-        });
+        let built = build.build(keys);
         counts.push(region.change());
 
-        let array = memo
-            .as_any()
-            .downcast_ref::<StrMemo>()
-            .and_then(|m| m.array.as_ref())
-            .expect("the buffers form a valid array");
-        shape = Some((array.len(), array.null_count()));
+        shape = Some(built.expect("the buffers form a valid array"));
+        assert!(!build.slot_empty(), "{case:?}: the build filled the slot");
     }
-    let (array_len, array_nulls) = shape.expect("at least one window");
+    let built = shape.expect("at least one window");
     let stats = counts
         .iter()
         .copied()
@@ -427,15 +310,20 @@ fn measure(case: Case, obj: &[u8], column_id: u32, columns: &ColumnSelection) ->
     Measured {
         stats,
         per_window: counts.iter().map(|s| s.allocations).collect(),
-        array_len,
-        array_nulls,
+        built,
     }
 }
 
 #[test]
 fn values_memo_charge_covers_the_measured_memo_and_no_more() {
     let mut largest = 0i64;
-    for case in [Case::PlainText, Case::DictText, Case::DictMixed] {
+    for (case, keys) in [
+        (Case::PlainText, false),
+        (Case::DictText, false),
+        (Case::DictText, true),
+        (Case::DictMixed, false),
+        (Case::DictMixed, true),
+    ] {
         let (obj, column_id) = object(case);
         let fixed = ColumnSelection::fixed_only();
         let with_key = ColumnSelection::fixed_only().with_attr(KEY);
@@ -445,51 +333,60 @@ fn values_memo_charge_covers_the_measured_memo_and_no_more() {
             .checked_sub(VALUES_MEMO_BYTES)
             .expect("the entry carries the memo charge");
 
-        let m = measure(case, &obj, column_id, &with_key);
+        let m = measure(case, keys, &obj, column_id, &with_key);
         let live = live(&m.stats);
         eprintln!(
-            "memo_overhead_alloc_pin: {case:?}: live {live} bytes, total {} bytes in {} \
-             allocations (allocations per window {:?}); column heap_bytes {heap_bytes}",
+            "memo_overhead_alloc_pin: {case:?} (key path {keys}): live {live} bytes, total {} \
+             bytes in {} allocations (allocations per window {:?}); column heap_bytes \
+             {heap_bytes}",
             m.stats.bytes_allocated, m.stats.allocations, m.per_window,
         );
 
         // The figures `VALUES_MEMO_BYTES`'s doc comment and docs/query-engine.md
         // state: a layout change that moves any of them fails here.
-        let (want_len, want_nulls, want_live) = match case {
-            Case::PlainText => (ROWS, 0, 392),
-            Case::DictText => (ENTRIES, 0, 392),
-            Case::DictMixed => (ENTRIES, 1, 520),
+        let (want_len, want_nulls, want_keys, want_live) = match (case, keys) {
+            (Case::PlainText, _) => (ROWS, 0, None, 432),
+            (Case::DictText, false) => (ENTRIES, 0, None, 432),
+            (Case::DictText, true) => (ENTRIES, 0, Some(ROWS), 568),
+            (Case::DictMixed, false) => (ENTRIES, 1, None, 560),
+            // The key path refuses a dictionary with a NULL entry.
+            (Case::DictMixed, true) => (ENTRIES, 1, None, 560),
         };
         assert_eq!(
             live, want_live,
-            "{case:?}: the memo's live bytes, as the docs state them"
+            "{case:?} (key path {keys}): the memo's live bytes, as the docs state them"
         );
         assert_eq!(
             m.stats.bytes_deallocated, 0,
-            "{case:?}: every byte the fill allocates stays live"
+            "{case:?} (key path {keys}): every byte the fill allocates stays live"
         );
-        assert_eq!(m.array_len, want_len, "{case:?}: array length");
+        assert_eq!(m.built.len, want_len, "{case:?}: array length");
         assert_eq!(
-            m.array_nulls, want_nulls,
+            m.built.null_count, want_nulls,
             "{case:?}: one NULL per non-UTF-8 entry"
+        );
+        assert_eq!(
+            m.built.keys, want_keys,
+            "{case:?} (key path {keys}): the keys buffer built"
         );
         assert!(live > 0, "{case:?}: the memo holds heap bytes");
         // The memo shares the column's buffers: a figure that counted them
         // would be the size of the column.
         assert!(
             (live as u64) * 16 < heap_bytes,
-            "{case:?}: live {live} is not far below the column's {heap_bytes} heap bytes, \
-             so it counts the column's own buffers"
+            "{case:?} (key path {keys}): live {live} is not far below the column's \
+             {heap_bytes} heap bytes, so it counts the column's own buffers"
         );
         assert_eq!(
             m.stats.reallocations, 0,
-            "{case:?}: the fill reallocates nothing"
+            "{case:?} (key path {keys}): the fill reallocates nothing"
         );
         largest = largest.max(live);
 
         assert!(
             VALUES_MEMO_BYTES >= live as u64,
-            "{case:?}: VALUES_MEMO_BYTES {VALUES_MEMO_BYTES} is below the measured {live}"
+            "{case:?} (key path {keys}): VALUES_MEMO_BYTES {VALUES_MEMO_BYTES} is below the \
+             measured {live}"
         );
     }
     assert!(
