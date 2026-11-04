@@ -1185,7 +1185,9 @@ six budget arguments (`max_rows`, `max_response_bytes`, `deadline_ms`,
 call before the tool runs, the Ravel Agents tools included, whether or not
 the tool's schema lists them. One with the wrong type refuses the call with
 `invalid_argument`; a well-typed one is clamped into the call's effective
-budget.
+budget. A tool can still refuse a budget it does not apply:
+`ravel_analyze_timeseries` refuses `max_bytes_scanned`, `max_store_requests`
+and `max_segments` as `unsupported`.
 
 The rest of this section describes the design. Redeeming a reference
 re-executes the tool with the reference's own arguments. The re-execution runs against the reference's
@@ -1208,6 +1210,7 @@ failure.
 | `max_rows` | 200 | ceiling 5,000 | yes |
 | `max_bytes_scanned` | server ceiling | server ceiling | yes |
 | `max_store_requests` | server ceiling | server ceiling | yes |
+| `max_segments` | server ceiling | server ceiling | yes |
 | `max_response_bytes` | 512 KiB | floor 256 KiB | yes, raised to the floor if lower |
 | `max_response_bytes` ceiling | 4 MiB | fixed; the server builds its MCP budget configuration from defaults and has no setting to lower it | no; a larger request clamps to it |
 | cursor or evidence token length | 1 MiB | fixed | no; a longer token is refused unread |
