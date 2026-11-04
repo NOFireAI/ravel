@@ -7,6 +7,9 @@ use ravel_catalog::{
 };
 use ravel_codec::key_idx::{key8_id16, key8_str};
 use ravel_object_store::PutOptions;
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::memory::MemoryStore;
 
 use super::*;
@@ -33,6 +36,7 @@ enum LeafKind {
     StalePart,
     WrongKeyType,
     OtherTenant,
+    OtherSignal,
 }
 
 #[derive(Debug, Clone)]
@@ -167,7 +171,10 @@ async fn fixture(specs: &[PartSpec], recents: &[Rows], key_type: KeyType) -> Fix
                     LeafKind::OtherTenant => OTHER_TENANT,
                     _ => TENANT,
                 },
-                signal: SIGNAL,
+                signal: match spec.leaf {
+                    LeafKind::OtherSignal => Signal::Logs,
+                    _ => SIGNAL,
+                },
                 part_blake3: match spec.leaf {
                     LeafKind::StalePart => hash(&format!("stale-part-{p}")),
                     _ => part_blake3,
@@ -249,7 +256,7 @@ struct CountingReader {
 }
 
 impl CountingReader {
-    fn new(store: Arc<MemoryStore>) -> Self {
+    fn new(store: Arc<dyn ObjectStoreBackend>) -> Self {
         CountingReader {
             inner: StoreLeafReader::new(store),
             calls: AtomicU64::new(0),
@@ -312,31 +319,56 @@ struct Run {
     result: Result<(Vec<SegmentRoute>, RouteFigures), RouteError>,
     accounting: PhaseAccounting,
     reader: CountingReader,
+    totals: RouteTotals,
 }
 
 async fn run(fx: &Fixture, keys: &KeySet, budget: &dyn LeafDecodeBudget, ceiling: Ceiling) -> Run {
+    run_on(fx, keys, budget, ceiling, fx.store.clone()).await
+}
+
+/// [`run`] with the leaves read through `store` instead of the fixture's.
+async fn run_on(
+    fx: &Fixture,
+    keys: &KeySet,
+    budget: &dyn LeafDecodeBudget,
+    ceiling: Ceiling,
+    store: Arc<dyn ObjectStoreBackend>,
+) -> Run {
     let accounting = PhaseAccounting::new();
-    let reader = CountingReader::new(fx.store.clone());
+    let reader = CountingReader::new(store);
+    let totals = RouteTotals::new();
     let result = route_under(
-        RouteInput {
-            catalog: &fx.catalog,
-            snapshot: &fx.snapshot,
-            parts: &fx.parts,
-            signal: SIGNAL,
-            tenant_hash: TENANT,
-            key_set: keys,
-            accounting: &accounting,
-            reader: &reader,
-            budget,
-            limits: KeyIndexLeafLimits::default(),
-        },
+        input(fx, keys, &accounting, &reader, budget),
         ceiling,
+        &totals,
     )
     .await;
     Run {
         result,
         accounting,
         reader,
+        totals,
+    }
+}
+
+fn input<'a>(
+    fx: &'a Fixture,
+    keys: &'a KeySet,
+    accounting: &'a PhaseAccounting,
+    reader: &'a dyn LeafRangeReader,
+    budget: &'a dyn LeafDecodeBudget,
+) -> RouteInput<'a> {
+    RouteInput {
+        catalog: &fx.catalog,
+        snapshot: &fx.snapshot,
+        parts: &fx.parts,
+        signal: SIGNAL,
+        tenant_hash: TENANT,
+        key_set: keys,
+        accounting,
+        reader,
+        budget,
+        limits: KeyIndexLeafLimits::default(),
     }
 }
 
@@ -988,6 +1020,331 @@ async fn the_bridged_byte_budget_is_the_parts_not_each_slices() {
         "slice 0 alone reads {b0} of {cap}"
     );
     assert_eq!(figures.parts_covered, 1);
+}
+
+/// Two `Str` values whose key8s fall either side of a split part's cut.
+fn values_across_the_cut() -> (u16, u16) {
+    let cut = 1u64 << 63;
+    let below = |v: &u16| u64::from_be_bytes(value_key8(KeyType::Str, *v)) < cut;
+    let lo = (0u16..).find(below).expect("a value below the cut");
+    let hi = (0u16..).find(|v| !below(v)).expect("a value above the cut");
+    (lo, hi)
+}
+
+/// A route future dropped while a leaf GET is in flight still charges the
+/// GETs it issued to the caller's `keyIndex` handle and to the process
+/// totals.
+/// FLIP: merging the leaf accounting after `route_parts` returns (rather
+/// than on drop) leaves both at zero here.
+#[tokio::test]
+async fn a_dropped_route_future_still_charges_the_leaf_gets_it_issued() {
+    let fx = fixture(
+        &[PartSpec::simple(vec![rows(&[(1, &[0])])])],
+        &[],
+        KeyType::Str,
+    )
+    .await;
+    let leaf_key = fx.parts.parts[0].key_index[0].key.clone();
+    let faults = Arc::new(FaultStore::new(fx.store.clone(), FaultPlan::empty()));
+    // The prefix GET is served; the bucket GET is held and never released.
+    let gate = faults.hold(Op::Get, Some(leaf_key), Occurrence::Nth(2));
+    let keys = key_set(KeyType::Str, &BTreeSet::from([1u16]));
+    let accounting = PhaseAccounting::new();
+    let reader = StoreLeafReader::new(faults.clone());
+    let budget = ThresholdBudget::new(u64::MAX);
+    let totals = RouteTotals::new();
+    let mut future = Box::pin(route_under(
+        input(&fx, &keys, &accounting, &reader, &budget),
+        ADR_CEILING,
+        &totals,
+    ));
+    tokio::select! {
+        _ = &mut future => panic!("the route finished past a held GET"),
+        _ = gate.wait_until_held(1) => {}
+    }
+    assert_eq!(
+        accounting
+            .key_index()
+            .snapshot()
+            .s3_requests(AccountedOp::Get),
+        0
+    );
+    drop(future);
+    let key_index = accounting.key_index().snapshot();
+    assert_eq!(
+        key_index.s3_requests(AccountedOp::Get),
+        2,
+        "prefix and bucket GETs"
+    );
+    assert!(
+        key_index.s3_bytes(AccountedOp::Get) > 0,
+        "the prefix's bytes"
+    );
+    assert_eq!(totals.leaf_gets(SIGNAL), 2);
+    for outcome in KeyIndexPartOutcome::ALL {
+        assert_eq!(
+            totals.parts(SIGNAL, outcome),
+            0,
+            "no outcome for an unfinished pass"
+        );
+    }
+}
+
+/// Admission walks the parts largest first and stops at the first whose
+/// worst case does not fit; it does not skip it for a smaller part that
+/// would (ADR-3692 decision 3, "until admitting the next part's worst case
+/// would exceed L_max"). The large part tiles two slices with one key each
+/// (worst 2 x (1 + 1) = 4); the small part holds both keys in one slice
+/// (worst 1 + 2 = 3). Under a 3-GET ceiling a first-fit admission would
+/// probe the small part; largest-first probes nothing.
+/// FLIP: `continue` past a part that does not fit (first fit) covers the
+/// small part under the 3-GET ceiling.
+#[tokio::test]
+async fn admission_is_largest_first_and_stops_at_the_first_part_that_does_not_fit() {
+    let (lo, hi) = values_across_the_cut();
+    let both = rows(&[(lo, &[0]), (hi, &[1])]);
+    let mut large = PartSpec::simple(vec![both.clone(); 4]);
+    large.leaf = LeafKind::Split;
+    let small = PartSpec::simple(vec![both]);
+    let fx = fixture(&[large, small], &[], KeyType::Str).await;
+    let query = BTreeSet::from([lo, hi]);
+    let keys = key_set(KeyType::Str, &query);
+    let worst: Vec<u64> = fx
+        .parts
+        .parts
+        .iter()
+        .enumerate()
+        .map(|(p, handle)| {
+            plan_part(p, handle, &keys)
+                .expect("plan")
+                .expect("covered")
+                .worst_gets
+        })
+        .collect();
+    assert_eq!(worst, vec![4, 3], "fixture: the two parts' worst cases");
+    let budget = ThresholdBudget::new(u64::MAX);
+    let ceiling = |leaf_gets| Ceiling {
+        leaf_gets,
+        parts: KEY_INDEX_MAX_PROBED_PARTS,
+    };
+
+    let tight = run(&fx, &keys, &budget, ceiling(3)).await;
+    let (routes, figures) = tight.result.as_ref().expect("route");
+    assert_eq!(
+        *figures,
+        RouteFigures {
+            parts_beyond_ceiling: 2,
+            keys_probed: 2,
+            ..RouteFigures::default()
+        }
+    );
+    assert!(routes.iter().all(|r| *r == SegmentRoute::Uncovered));
+    assert_eq!(tight.reader.calls.load(Ordering::Relaxed), 0);
+
+    // At 4 the large part is admitted and spends its whole worst case, so
+    // the small one still waits.
+    let four = run(&fx, &keys, &budget, ceiling(4)).await;
+    let (_, figures) = four.result.as_ref().expect("route");
+    assert_eq!(figures.parts_covered, 1);
+    assert_eq!(figures.parts_beyond_ceiling, 1);
+    assert_eq!(figures.leaf_get_requests, 4);
+    assert_accounting(&four, figures);
+}
+
+/// Leaf refs whose slices do not tile the key space reject the part before
+/// any leaf is read.
+/// FLIP: dropping `check_slice_tiling` from `select_key_index_slice` routes
+/// the part through its first slice.
+#[tokio::test]
+async fn slices_that_do_not_tile_the_key_space_reject_the_part_before_any_get() {
+    let (lo, hi) = values_across_the_cut();
+    let mut split = PartSpec::simple(vec![rows(&[(lo, &[0]), (hi, &[1])])]);
+    split.leaf = LeafKind::Split;
+    let mut fx = fixture(&[split], &[], KeyType::Str).await;
+    // A one-key gap between the two slices.
+    fx.parts.parts[0].key_index[1].key8_lo += 1;
+    let budget = ThresholdBudget::new(u64::MAX);
+    let run = run(
+        &fx,
+        &key_set(KeyType::Str, &BTreeSet::from([lo])),
+        &budget,
+        UNBOUNDED,
+    )
+    .await;
+    let (routes, figures) = run.result.as_ref().expect("route");
+    assert_eq!(routes, &vec![SegmentRoute::Uncovered]);
+    assert_eq!(figures.leaves_rejected, 1);
+    assert_eq!(figures.leaf_get_requests, 0);
+    assert_eq!(run.reader.calls.load(Ordering::Relaxed), 0);
+}
+
+/// A leaf GET that fails leaves the part uncovered and counted rejected; the
+/// statement goes on. The fault fires on the bucket GET, after the prefix.
+#[tokio::test]
+async fn a_failed_leaf_get_leaves_the_part_uncovered() {
+    let fx = fixture(
+        &[
+            PartSpec::simple(vec![rows(&[(1, &[0])])]),
+            PartSpec::simple(vec![rows(&[(1, &[2])]), rows(&[(2, &[0])])]),
+        ],
+        &[],
+        KeyType::Str,
+    )
+    .await;
+    let failing = fx.parts.parts[1].key_index[0].key.clone();
+    let faults = Arc::new(FaultStore::new(
+        fx.store.clone(),
+        FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("leaf gone".into()))
+                .with_key_contains(failing)
+                .with_occurrence(Occurrence::Nth(2)),
+        ),
+    ));
+    let budget = ThresholdBudget::new(u64::MAX);
+    let run = run_on(
+        &fx,
+        &key_set(KeyType::Str, &BTreeSet::from([1u16])),
+        &budget,
+        UNBOUNDED,
+        faults.clone(),
+    )
+    .await;
+    assert_eq!(faults.fault_count(Op::Get, FaultKind::Permanent), 1);
+    let (routes, figures) = run.result.as_ref().expect("route");
+    assert_eq!(
+        routes,
+        &vec![
+            SegmentRoute::Blocks(vec![0]),
+            SegmentRoute::Uncovered,
+            SegmentRoute::Uncovered,
+        ]
+    );
+    assert_eq!(figures.parts_covered, 1);
+    assert_eq!(figures.leaves_rejected, 1);
+    // The failed GET was issued and is charged; it returned no bytes.
+    assert_eq!(figures.leaf_get_requests, 4);
+}
+
+/// A flipped byte under the directory's crc, or under the bucket frame's,
+/// leaves the part uncovered and counted rejected.
+#[tokio::test]
+async fn a_leaf_failing_its_crc_leaves_the_part_uncovered() {
+    let entries = vec![rows(&[(1, &[0])])];
+    let good = fixture(&[PartSpec::simple(entries.clone())], &[], KeyType::Str).await;
+    let leaf_ref = &good.parts.parts[0].key_index[0];
+    let prefix_len = leaf_ref.prefix_len as usize;
+    let size = good.store.head(&leaf_ref.key).await.expect("leaf").size as usize;
+    // One entry, so one non-empty bucket: the leaf's last frame.
+    for at in [prefix_len - 1, size - 1] {
+        let mut spec = PartSpec::simple(entries.clone());
+        spec.leaf = LeafKind::Flip(at);
+        let fx = fixture(&[spec], &[], KeyType::Str).await;
+        let budget = ThresholdBudget::new(u64::MAX);
+        let run = run(
+            &fx,
+            &key_set(KeyType::Str, &BTreeSet::from([1u16])),
+            &budget,
+            UNBOUNDED,
+        )
+        .await;
+        let (routes, figures) = run.result.as_ref().expect("route");
+        assert_eq!(routes, &vec![SegmentRoute::Uncovered], "flip at {at}");
+        assert_eq!(figures.leaves_rejected, 1, "flip at {at}");
+        assert_eq!(figures.parts_covered, 0, "flip at {at}");
+    }
+}
+
+/// The signal half of the leaf isolation check: a leaf naming another
+/// signal fails the statement and counts a breach, like another tenant's.
+#[tokio::test]
+async fn another_signals_leaf_fails_the_statement_and_counts_a_breach() {
+    let mut foreign = PartSpec::simple(vec![rows(&[(1, &[0])])]);
+    foreign.leaf = LeafKind::OtherSignal;
+    let fx = fixture(&[foreign], &[], KeyType::Id16).await;
+    let before = fx.catalog.isolation_breaches();
+    let budget = ThresholdBudget::new(u64::MAX);
+    let run = run(
+        &fx,
+        &key_set(KeyType::Id16, &BTreeSet::from([1u16])),
+        &budget,
+        UNBOUNDED,
+    )
+    .await;
+    match &run.result {
+        Err(RouteError::Isolation { source, .. }) => assert!(
+            matches!(source, CatalogError::FieldMismatch { field, .. } if *field == "signal"),
+            "{source:?}"
+        ),
+        other => panic!("expected an isolation error, got {other:?}"),
+    }
+    assert_eq!(fx.catalog.isolation_breaches(), before + 1);
+    assert_eq!(run.totals.leaf_gets(SIGNAL), 1, "the prefix GET is counted");
+}
+
+/// The process totals add each finished pass's six part outcomes and its
+/// leaf GETs under the pass's signal, and nothing under another.
+#[tokio::test]
+async fn route_totals_add_every_part_outcome_and_leaf_get_under_the_signal() {
+    let mut stale = PartSpec::simple(vec![rows(&[(1, &[0])])]);
+    stale.leaf = LeafKind::StalePart;
+    stale.leaf_rows = Some(vec![rows(&[(2, &[0])])]);
+    let mut none = PartSpec::simple(vec![rows(&[(1, &[0])])]);
+    none.leaf = LeafKind::NoLeaf;
+    let specs = [
+        PartSpec::simple(vec![rows(&[(1, &[0])]); 3]),
+        none,
+        stale,
+        PartSpec::simple(vec![rows(&[(1, &[1])])]),
+    ];
+    let fx = fixture(&specs, &[], KeyType::Str).await;
+    let keys = key_set(KeyType::Str, &BTreeSet::from([1u16]));
+    let budget = ThresholdBudget::new(u64::MAX);
+    // Room for the 3-entry part and the stale one, not the last.
+    let run = run(
+        &fx,
+        &keys,
+        &budget,
+        Ceiling {
+            leaf_gets: 4,
+            parts: KEY_INDEX_MAX_PROBED_PARTS,
+        },
+    )
+    .await;
+    let (_, figures) = run.result.as_ref().expect("route");
+    assert_eq!(
+        *figures,
+        RouteFigures {
+            parts_covered: 1,
+            parts_uncovered: 1,
+            parts_beyond_ceiling: 1,
+            leaves_rejected: 1,
+            keys_probed: 1,
+            ..*figures
+        }
+    );
+    for outcome in KeyIndexPartOutcome::ALL {
+        assert_eq!(
+            run.totals.parts(SIGNAL, outcome),
+            figures.parts(outcome),
+            "{}",
+            outcome.as_str()
+        );
+        assert_eq!(run.totals.parts(Signal::Logs, outcome), 0);
+    }
+    assert_eq!(run.totals.leaf_gets(SIGNAL), figures.leaf_get_requests);
+    assert!(figures.leaf_get_requests > 0);
+    assert_eq!(run.totals.leaf_gets(Signal::Logs), 0);
+    assert_eq!(
+        KeyIndexPartOutcome::ALL.map(KeyIndexPartOutcome::as_str),
+        [
+            "covered",
+            "uncovered",
+            "beyond_ceiling",
+            "rejected",
+            "reservation_refused",
+            "skipped_by_budget",
+        ]
+    );
 }
 
 #[test]

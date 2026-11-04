@@ -283,7 +283,13 @@ async fn scrape(app: &Router) -> String {
 fn query_family_label_key_sets(scrape: &str) -> Vec<Vec<String>> {
     scrape
         .lines()
-        .filter(|line| line.starts_with("ravel_query_") && line.contains('{'))
+        // The key-index router families are process-wide counters keyed by
+        // signal and outcome, not part of the per-tenant query cost family.
+        .filter(|line| {
+            line.starts_with("ravel_query_")
+                && !line.starts_with("ravel_query_key_index_")
+                && line.contains('{')
+        })
         .map(|line| {
             let open = line.find('{').expect("open brace");
             let close = line.find('}').expect("close brace");

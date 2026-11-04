@@ -127,7 +127,7 @@ use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
-use ravel_catalog::{Catalog, ColumnStatsRequest, SegmentOrigins, Snapshot};
+use ravel_catalog::{Catalog, ColumnStatsRequest, SegmentOrigins, Snapshot, SnapshotParts};
 use ravel_logseg::decoded_cache::{DecodedCacheSnapshot, PressureSnapshot};
 use ravel_memory::MemoryBudget;
 use ravel_parquet::ReadLimits;
@@ -588,6 +588,9 @@ struct ResolvedLane {
     signal: TargetSignal,
     snapshot: Snapshot,
     admission: SegmentAdmission,
+    /// The parts the snapshot's sealed segments came from, for the spans
+    /// lane's tier-2 key-index router; `None` on every other lane.
+    parts: Option<SnapshotParts>,
 }
 
 impl Resolved {
@@ -628,6 +631,15 @@ impl Resolved {
                 })
             })
             .collect()
+    }
+
+    /// The spans lane's parts, taken out so the plan can route a `trace_id`
+    /// lookup through them.
+    fn take_span_parts(&mut self) -> Option<SnapshotParts> {
+        self.lanes
+            .iter_mut()
+            .find(|lane| lane.signal == TargetSignal::Spans)
+            .and_then(|lane| lane.parts.take())
     }
 
     /// The `(signal, snapshot)` pairs a plan is built over.
@@ -695,6 +707,11 @@ struct PlanExtras {
     /// What the authenticated principal may do; decides, with the executor's
     /// [`IpcryptDeployment`], whether the session registers the ipcrypt UDFs.
     capabilities: SqlCapabilities,
+    /// The spans lane's parts from the same resolve as its snapshot, which
+    /// turn on the tier-2 router for a `trace_id` lookup (ADR-3692 decision
+    /// 3). `None` on the pinned entry points, whose snapshot arrives without
+    /// them; their lookups probe each object's KEY_IDX alone.
+    span_parts: Option<SnapshotParts>,
 }
 
 /// One SQL request, fully resolved from its transport.
@@ -844,12 +861,16 @@ pub struct SqlStats {
     /// prunes the same snapshot again, so the sum can exceed it. Zero for a
     /// metrics query and for a logs plan with no scan node.
     pub segments_pruned_by_stats: u64,
-    /// Segments an exact-key lookup opened and then read no block of, because
-    /// the object's KEY_IDX section says the key is absent (ADR-2707
-    /// decision 5): a spans `trace_id` equality, or a logs equality on an
-    /// indexed declared column or on `trace_id`. Read off the spans and logs
-    /// scans' `segments_pruned_by_key_index` counters. Counted within
-    /// [`Self::segments`]. Zero for any other query.
+    /// Segments an exact-key lookup read no block of because a key index
+    /// proves the key absent: on spans, a `trace_id` equality's segments the
+    /// tier-2 router dropped before the scan because their part's key-index
+    /// leaves prove the trace absent (ADR-3692 decision 3), plus the segments
+    /// the scan opened and whose own KEY_IDX section proves it absent
+    /// (ADR-2707 decision 5); on logs, an equality on an indexed declared
+    /// column or on `trace_id`, by the object's KEY_IDX. Read off the spans
+    /// and logs scans' `segments_pruned_by_key_index` counters. Counted
+    /// within [`Self::segments`]; a segment is counted by one tier only,
+    /// since a tier-2 prune is never opened. Zero for any other query.
     pub segments_pruned_by_key_index: u64,
     /// Blocks of the segments such a lookup did read that the plan's other
     /// pruning kept and KEY_IDX named no entry for, read off the spans and
@@ -859,6 +880,11 @@ pub struct SqlStats {
     /// `RspanWriter::finish` writes every object today. An absent key's
     /// segment is counted in [`Self::segments_pruned_by_key_index`], not here.
     pub blocks_pruned_by_key_index: u64,
+    /// The spans tier-2 router's figures and the scan's SKIP_IDX drops
+    /// (`stats.keyIndex`), summed over every spans scan in the plan. `Some`
+    /// exactly when a spans scan carried a pushed `trace_id`, zeros included;
+    /// `None` for every other statement.
+    pub key_index: Option<KeyIndexStats>,
     /// Blocks of opened segments, and owned segments never opened, that the
     /// successful attempt's logs scans skipped because their minimum `ts` was
     /// above an `ORDER BY ts ... LIMIT k` TopK's threshold (ADR-2677 decision
@@ -1143,6 +1169,80 @@ fn accumulate_scan_timing(metrics: &MetricsSet, timing: &mut ScanTiming) {
     }
 }
 
+/// What a spans `trace_id` lookup's key indexes did (ADR-3692 decision 7),
+/// rendered as `stats.keyIndex` and as the spans entry's `keyIndex` in
+/// `stats.signals`. The first nine are the tier-2 router's
+/// (`ravel_query::key_index_route::RouteFigures`); a part counts in exactly
+/// one of `parts_covered`, `parts_uncovered`, `parts_beyond_ceiling`,
+/// `leaves_rejected`, `reservations_refused` and `skipped_by_budget`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyIndexStats {
+    /// Parts whose leaves answered the trace id.
+    pub parts_covered: u64,
+    /// Parts with no spans leaf; their segments go to tier 1.
+    pub parts_uncovered: u64,
+    /// Parts past the leaf GET or part ceiling; their segments go to tier 1.
+    pub parts_beyond_ceiling: u64,
+    /// Parts whose leaf, or whose leaf refs, did not answer.
+    pub leaves_rejected: u64,
+    /// Parts whose frame decode reservation the statement's pool refused.
+    pub reservations_refused: u64,
+    /// Leaf GETs the router issued, charged to the `keyIndex` phase.
+    pub leaf_get_requests: u64,
+    /// Wire bytes of those GETs.
+    pub leaf_wire_bytes: u64,
+    /// Keys in the probed set: 1 for a `trace_id` equality.
+    pub keys_probed: u64,
+    /// Parts whose bridged bucket read exceeded its byte budget.
+    pub skipped_by_budget: u64,
+    /// Objects whose SKIP_IDX dropped every block KEY_IDX named for the
+    /// trace, after KEY_IDX had said it was present: tier 1's false positives
+    /// that SKIP_IDX's time or status ranges caught.
+    pub skip_idx_dropped: u64,
+}
+
+impl KeyIndexStats {
+    fn add(&mut self, other: &KeyIndexStats) {
+        self.parts_covered += other.parts_covered;
+        self.parts_uncovered += other.parts_uncovered;
+        self.parts_beyond_ceiling += other.parts_beyond_ceiling;
+        self.leaves_rejected += other.leaves_rejected;
+        self.reservations_refused += other.reservations_refused;
+        self.leaf_get_requests += other.leaf_get_requests;
+        self.leaf_wire_bytes += other.leaf_wire_bytes;
+        self.keys_probed += other.keys_probed;
+        self.skipped_by_budget += other.skipped_by_budget;
+        self.skip_idx_dropped += other.skip_idx_dropped;
+    }
+
+    /// The figures one node's metric set publishes, `None` when it publishes
+    /// none of them: only a spans scan carrying a trace key registers them.
+    fn from_metrics(metrics: &datafusion::physical_plan::metrics::MetricsSet) -> Option<Self> {
+        use crate::spans_scan::METRIC_KEY_INDEX_FIGURES as NAMES;
+        let present = NAMES.iter().any(|name| metrics.sum_by_name(name).is_some());
+        if !present {
+            return None;
+        }
+        let v: [u64; 10] = std::array::from_fn(|i| {
+            metrics
+                .sum_by_name(NAMES[i])
+                .map_or(0, |v| v.as_usize() as u64)
+        });
+        Some(KeyIndexStats {
+            parts_covered: v[0],
+            parts_uncovered: v[1],
+            parts_beyond_ceiling: v[2],
+            leaves_rejected: v[3],
+            reservations_refused: v[4],
+            leaf_get_requests: v[5],
+            leaf_wire_bytes: v[6],
+            keys_probed: v[7],
+            skipped_by_budget: v[8],
+            skip_idx_dropped: v[9],
+        })
+    }
+}
+
 /// The `LogsScanExec` block counters, summed over a plan tree, the scan's
 /// wall-clock timing read off the same metric set, and the metrics scan's
 /// skipped-histogram count.
@@ -1170,6 +1270,9 @@ struct BlockCounts {
     /// Whether a `LogsScanExec` in the plan carries KEY_IDX equalities, so
     /// the statement's I/O shape reports the keyed dependency depth.
     keyed_logs_scan: bool,
+    /// The spans scans' key-index figures; `Some` once one carried a trace
+    /// key.
+    key_index: Option<KeyIndexStats>,
 }
 
 /// Sum the `blocks_total` / `blocks_scanned` / `blocks_pruned_by_postings` /
@@ -1212,6 +1315,9 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
         counts.str_cells_validated += sum("str_cells_validated");
         counts.str_dict_values_built += sum("str_dict_values_built");
         counts.histogram_series_skipped += sum(crate::scan::HISTOGRAM_SERIES_SKIPPED_METRIC);
+        if let Some(figures) = KeyIndexStats::from_metrics(&metrics) {
+            counts.key_index.get_or_insert_default().add(&figures);
+        }
         accumulate_scan_timing(&metrics, &mut counts.timing);
     }
     for child in plan.children() {
@@ -1451,6 +1557,10 @@ pub struct SignalStats {
     /// statement total against, and how many checks it ran (issue #1409).
     /// `None` when no scan of this table was built with a budget.
     pub budgets: Option<EnforcedBudgets>,
+    /// The `spans` entry's [`SqlStats::key_index`]: `Some` exactly when that
+    /// is, and `None` on every other table and on an explain, which runs no
+    /// scan.
+    pub key_index: Option<KeyIndexStats>,
 }
 
 /// Merges `view`'s statement total into `into` when dropped, so a caller
@@ -1478,7 +1588,12 @@ struct LaneCounts {
 }
 
 /// The [`SignalStats`] of `lanes`, each read from its own handle in `view`.
-fn signal_stats(lanes: &[LaneCounts], view: &StatementAccounting) -> Vec<SignalStats> {
+/// `spans_key_index` is reported on the `spans` entry only.
+fn signal_stats(
+    lanes: &[LaneCounts],
+    view: &StatementAccounting,
+    spans_key_index: Option<KeyIndexStats>,
+) -> Vec<SignalStats> {
     lanes
         .iter()
         .map(|lane| SignalStats {
@@ -1487,6 +1602,7 @@ fn signal_stats(lanes: &[LaneCounts], view: &StatementAccounting) -> Vec<SignalS
             segments_pruned: lane.segments_pruned,
             phases: view.lane(lane.signal).snapshot(),
             budgets: view.enforced_budgets(lane.signal),
+            key_index: spans_key_index.filter(|_| lane.signal == TargetSignal::Spans),
         })
         .collect()
 }
@@ -1824,6 +1940,9 @@ pub struct SqlExecutor {
     /// alone; the server installs `--cache-bulk-scan-min-bytes`, raised to its
     /// read cache's size, with [`Self::with_cache_bulk_scan_min_bytes`].
     cache_bulk_scan_min_bytes: Option<u64>,
+    /// A lowered part ceiling for the spans tier-2 router; `None` is the
+    /// ADR's `P_max`.
+    key_index_max_probed_parts: Option<usize>,
     /// The bytes each statement the size trigger considers read on its last
     /// successful execution, recorded only while
     /// [`Self::cache_bulk_scan_min_bytes`] is set.
@@ -1895,6 +2014,7 @@ impl SqlExecutor {
             clock: Arc::new(SystemClock),
             ddl_min_grace_ms: None,
             cache_bulk_scan_min_bytes: None,
+            key_index_max_probed_parts: None,
             statement_read_bytes: StatementReadBytes::new(),
             scan_executions: Arc::new(ScanExecutions::new()),
             ipcrypt: IpcryptDeployment::default(),
@@ -2007,6 +2127,15 @@ impl SqlExecutor {
     /// read cache.
     pub fn with_cache_bulk_scan_min_bytes(mut self, min_bytes: Option<u64>) -> Self {
         self.cache_bulk_scan_min_bytes = min_bytes;
+        self
+    }
+
+    /// Lowers the spans tier-2 router's part ceiling to `max_parts`; it is
+    /// never raised past the ADR's `P_max`. The parts past it are left to
+    /// each object's KEY_IDX, so a test reaches that outcome with a handful
+    /// of parts.
+    pub fn with_key_index_max_probed_parts(mut self, max_parts: Option<usize>) -> Self {
+        self.key_index_max_probed_parts = max_parts;
         self
     }
 
@@ -2433,6 +2562,10 @@ impl SqlExecutor {
                     // principal's capabilities; no caller of it authenticates
                     // one.
                     capabilities: SqlCapabilities::default(),
+                    // An explain builds the physical plan, where the router
+                    // would read leaves; it issues no GET, so it routes
+                    // nothing and shows tier 1's plan.
+                    span_parts: None,
                 },
             )
             .await?;
@@ -2457,7 +2590,7 @@ impl SqlExecutor {
             unbounded_components,
             window_predicate,
             plan_text,
-            signals: signal_stats(&lane_counts, phase_accounting),
+            signals: signal_stats(&lane_counts, phase_accounting, None),
         })
     }
 
@@ -2541,6 +2674,8 @@ impl SqlExecutor {
             let signal_tables_named = resolved.signal_tables_named;
             let unbounded_components =
                 unbounded_lane_components(&resolved.lanes, resolved.parquet.is_some());
+            let mut resolved = resolved;
+            let span_parts = resolved.take_span_parts();
             let (lanes, parquet) = resolved.into_snapshots();
             // Read off this attempt's snapshots, before they are moved into
             // `attempt`, so they describe the snapshots the returned rows were
@@ -2618,6 +2753,7 @@ impl SqlExecutor {
                     &phase_accounting,
                     &declared,
                     parquet,
+                    span_parts,
                 )
                 .await;
             stats.batches_emitted += emitted;
@@ -2640,6 +2776,7 @@ impl SqlExecutor {
                     stats.segments_pruned_by_stats = blocks.segments_pruned_by_stats;
                     stats.segments_pruned_by_key_index = blocks.segments_pruned_by_key_index;
                     stats.blocks_pruned_by_key_index = blocks.blocks_pruned_by_key_index;
+                    stats.key_index = blocks.key_index;
                     stats.blocks_skipped_by_threshold = blocks.blocks_skipped_by_threshold;
                     stats.segments_skipped_by_threshold = blocks.segments_skipped_by_threshold;
                     stats.int_values_buffers = blocks.int_values_buffers;
@@ -2677,7 +2814,7 @@ impl SqlExecutor {
                         accounting,
                         peak_asked_intermediate_bytes: caps.peak_asked_bytes,
                         phase_accounting: phase_snapshot,
-                        signals: signal_stats(&lane_counts, &phase_accounting),
+                        signals: signal_stats(&lane_counts, &phase_accounting, blocks.key_index),
                         io_shape: if blocks.keyed_logs_scan {
                             keyed_io_shape
                         } else {
@@ -3061,6 +3198,7 @@ impl SqlExecutor {
                 // A deliberate narrowing: Flight SQL does not carry a
                 // principal's capabilities; it authenticates a tenant only.
                 capabilities: SqlCapabilities::default(),
+                span_parts: None,
             },
         )
         .await
@@ -3296,6 +3434,7 @@ impl SqlExecutor {
                     .to_string(),
             ));
         }
+        let mut span_parts = extras.span_parts;
         let mut session_tables = Vec::with_capacity(lanes.len());
         if let Some((resolution, tables)) = parquet_tables {
             // ADR-2040 D6: an exact-typed statement scans in up to
@@ -3424,16 +3563,26 @@ impl SqlExecutor {
                     // and its block runs on the scan phase; a whole-object span read
                     // lands on the scan phase. Every fetch is tenant-checked (fails
                     // closed on a footer tenant_hash mismatch).
-                    TargetSignal::Spans => SessionTable::Spans(Arc::new(
-                        SpansTableProvider::new(
+                    //
+                    // With the lane's parts, a `trace_id` lookup routes through
+                    // the parts' key-index leaves first (ADR-3692 decision 3).
+                    TargetSignal::Spans => {
+                        let provider = SpansTableProvider::new(
                             snapshot,
                             tenant_hash,
                             self.span_fetcher.clone(),
                             phase_accounting.lane(signal).scan().clone(),
                         )
                         .with_phase_accounting(phase_accounting.lane(signal).clone())
-                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine)),
-                    )),
+                        .with_scan_budget(phase_accounting.scan_budget(signal, &config.engine));
+                        let provider = match span_parts.take() {
+                            Some(parts) => provider
+                                .with_key_index_route(Arc::clone(&self.catalog), parts)
+                                .with_key_index_max_probed_parts(self.key_index_max_probed_parts),
+                            None => provider,
+                        };
+                        SessionTable::Spans(Arc::new(provider))
+                    }
                     // The two RLOG-backed tables (ADR-1101 decision 1) read through the
                     // executor's existing `log_fetcher`: an alert and an audit record
                     // ride RLOG v1 verbatim, so they share the `logs` table's accounted,
@@ -3844,6 +3993,7 @@ impl SqlExecutor {
                             sealed_count: 0,
                             exempt_count: 0,
                         },
+                        parts: None,
                     }],
                     estimate,
                     unfolded_segments_resolved: 0,
@@ -3909,18 +4059,36 @@ impl SqlExecutor {
             let catalog_requests = self
                 .catalog
                 .estimated_catalog_requests(req.window, clocks.resolve_at_ns);
-            let (snapshot, origins) = self
-                .catalog
-                .resolve_pruned_with_admission(
-                    &tenant_hash,
-                    signal,
-                    req.window,
-                    tokens.for_lane(lane),
-                    clocks.resolve_at_ns,
-                    lane_name_filter,
-                    phase_accounting.lane(lane).resolve(),
-                )
-                .await?;
+            // The spans lane also takes its parts, for the tier-2 router.
+            let (snapshot, origins, parts) = if lane == TargetSignal::Spans {
+                let (snapshot, origins, parts) = self
+                    .catalog
+                    .resolve_pruned_with_parts(
+                        &tenant_hash,
+                        signal,
+                        req.window,
+                        tokens.for_lane(lane),
+                        clocks.resolve_at_ns,
+                        lane_name_filter,
+                        phase_accounting.lane(lane).resolve(),
+                    )
+                    .await?;
+                (snapshot, origins, Some(parts))
+            } else {
+                let (snapshot, origins) = self
+                    .catalog
+                    .resolve_pruned_with_admission(
+                        &tenant_hash,
+                        signal,
+                        req.window,
+                        tokens.for_lane(lane),
+                        clocks.resolve_at_ns,
+                        lane_name_filter,
+                        phase_accounting.lane(lane).resolve(),
+                    )
+                    .await?;
+                (snapshot, origins, None)
+            };
             // Exact count of `SegmentOrigin::Recent` entries (issue #1214): the
             // one origin a folded catalog has not yet sealed, so it is never
             // served from the RSEG cache the way a folded, below-watermark
@@ -3969,6 +4137,7 @@ impl SqlExecutor {
                 signal: lane,
                 snapshot,
                 admission,
+                parts,
             });
         }
         Ok(Resolved {
@@ -5027,6 +5196,7 @@ impl SqlExecutor {
         phase_accounting: &StatementAccounting,
         declared: &[DeclaredColumn],
         parquet: Option<ParquetResolution>,
+        span_parts: Option<SnapshotParts>,
     ) -> (
         Result<QueryOutput, SqlError>,
         usize,
@@ -5054,6 +5224,7 @@ impl SqlExecutor {
                     key_index_now_ns: clocks.caller_now_ns,
                     parquet: ParquetPlan::Resolved(parquet),
                     capabilities,
+                    span_parts,
                 },
             )
             .await

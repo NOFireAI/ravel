@@ -16,6 +16,12 @@
 //! the logs provider: DataFusion always re-applies the originals above the
 //! scan, so pruning may only widen. The trace_id fast path and the ts window
 //! are both re-checked exactly by the reader, so the pushed prune is sound.
+//!
+//! A `trace_id` lookup over a snapshot resolved with its parts runs the
+//! tier-2 router (ADR-3692 decision 3) after the ts prune: a segment whose
+//! part's key-index leaves prove the trace absent is dropped before the scan
+//! is built, a segment they name blocks for reads exactly those blocks, and a
+//! segment with no tier-2 answer is left to its object's own KEY_IDX.
 
 use std::fmt;
 use std::sync::Arc;
@@ -23,18 +29,24 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 #[cfg(feature = "flight-sql")]
 use datafusion::physical_expr::expressions::col;
 use datafusion::physical_plan::ExecutionPlan;
 #[cfg(feature = "flight-sql")]
 use datafusion::physical_plan::projection::ProjectionExec;
-use ravel_catalog::{SegmentRef, Snapshot};
+use ravel_catalog::{Catalog, KeyIndexLeafLimits, SegmentRef, Snapshot, SnapshotParts};
 use ravel_query::PhaseAccounting;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
-use ravel_types::TenantHash;
+use ravel_query::key_index_route::{
+    BudgetRefused, LeafDecodeBudget, LeafDecodeGuard, RouteFigures, RouteInput, SegmentRoute,
+    route, route_with_max_parts,
+};
+use ravel_query::span_fetcher::{SpanLeafRangeReader, trace_key_set};
 use ravel_types::accounting::QueryAccounting;
+use ravel_types::{Signal, TenantHash};
 
 #[cfg(feature = "flight-sql")]
 use crate::distributed::{WorkerSlice, WorkerSliceClient};
@@ -77,6 +89,43 @@ pub struct SpansTableProvider {
     /// passed to the distributed fan-out. Unlimited by default, installed with
     /// [`Self::with_scan_budget`].
     scan_budget: ScanBudget,
+    /// The tier-2 router's inputs, `None` for a snapshot resolved without its
+    /// parts, which leaves every segment to its object's KEY_IDX.
+    key_index_route: Option<KeyIndexRouteContext>,
+}
+
+/// What the tier-2 router needs beyond the snapshot (ADR-3692 decision 3).
+#[derive(Clone)]
+struct KeyIndexRouteContext {
+    catalog: Arc<Catalog>,
+    /// From the same resolve as the provider's snapshot.
+    parts: SnapshotParts,
+    /// A lowered part ceiling; `None` is the ADR's.
+    max_probed_parts: Option<usize>,
+}
+
+/// The tier-2 answer for one scan: the segments to read, each one's block set
+/// (`None` where tier 1 decides), and the figures for `stats.keyIndex`.
+struct RoutedSegments {
+    segments: Vec<SegmentRef>,
+    block_sets: Vec<Option<Vec<u32>>>,
+    figures: RouteFigures,
+    pruned: u64,
+}
+
+/// A frame decode reservation drawn from the statement's memory pool, so a
+/// leaf's decoded bound is counted against the same limit as the scan.
+struct PoolLeafBudget(Arc<dyn MemoryPool>);
+
+impl LeafDecodeBudget for PoolLeafBudget {
+    fn try_reserve(&self, bytes: u64) -> Result<LeafDecodeGuard, BudgetRefused> {
+        let reservation = MemoryConsumer::new("spans key-index leaf").register(&self.0);
+        let size = usize::try_from(bytes).map_err(|_| BudgetRefused { bytes })?;
+        reservation
+            .try_grow(size)
+            .map_err(|_| BudgetRefused { bytes })?;
+        Ok(LeafDecodeGuard::new(reservation))
+    }
 }
 
 impl SpansTableProvider {
@@ -103,7 +152,31 @@ impl SpansTableProvider {
             #[cfg(feature = "flight-sql")]
             distributed: None,
             scan_budget,
+            key_index_route: None,
         }
+    }
+
+    /// Route `trace_id` lookups through the parts' key-index leaves before the
+    /// scan (ADR-3692 decision 3). `parts` must come from the resolve that
+    /// produced this provider's snapshot; a mismatch fails the lookup.
+    #[must_use]
+    pub fn with_key_index_route(mut self, catalog: Arc<Catalog>, parts: SnapshotParts) -> Self {
+        self.key_index_route = Some(KeyIndexRouteContext {
+            catalog,
+            parts,
+            max_probed_parts: None,
+        });
+        self
+    }
+
+    /// Lower the router's part ceiling to `max_parts` (never above the ADR's
+    /// `P_max`). A no-op without [`Self::with_key_index_route`].
+    #[must_use]
+    pub fn with_key_index_max_probed_parts(mut self, max_parts: Option<usize>) -> Self {
+        if let Some(ctx) = &mut self.key_index_route {
+            ctx.max_probed_parts = max_parts;
+        }
+        self
     }
 
     /// Install the statement's scan budget (issue #1409): every
@@ -243,10 +316,25 @@ impl SpansTableProvider {
         projection: Option<Vec<usize>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let segments = self.pruned_segments(pushdown);
-        let scan = SpansScanExec::new(
+        Ok(Arc::new(self.scan_over(
+            &segments,
+            target_partitions,
+            pushdown,
+            projection,
+        )?))
+    }
+
+    fn scan_over(
+        &self,
+        segments: &[SegmentRef],
+        target_partitions: usize,
+        pushdown: &SpansPushdown,
+        projection: Option<Vec<usize>>,
+    ) -> DFResult<SpansScanExec> {
+        SpansScanExec::new(
             self.tenant_hash,
             self.fetcher.clone(),
-            &segments,
+            segments,
             target_partitions,
             pushdown.span_query(),
             pushdown.service_name.clone(),
@@ -256,10 +344,83 @@ impl SpansTableProvider {
             Arc::clone(&self.erasure),
             projection,
             QueryAccounting::new(),
-        )?
-        .with_phase_accounting(self.accounting.clone())
-        .with_scan_budget(self.scan_budget.clone());
-        Ok(Arc::new(scan))
+        )
+        .map(|scan| {
+            scan.with_phase_accounting(self.accounting.clone())
+                .with_scan_budget(self.scan_budget.clone())
+        })
+    }
+
+    /// Run the tier-2 router over the segments the ts prune kept. Pruned
+    /// segments are dropped; the rest keep the snapshot's order.
+    async fn route_trace(
+        &self,
+        ctx: &KeyIndexRouteContext,
+        pool: Arc<dyn MemoryPool>,
+        pushdown: &SpansPushdown,
+        trace_id: &[u8; 16],
+    ) -> DFResult<RoutedSegments> {
+        let segment_count = self.snapshot.segments.len();
+        if ctx.parts.origin.len() != segment_count {
+            return Err(DataFusionError::Internal(format!(
+                "spans key-index route: {} part origins for {segment_count} segments",
+                ctx.parts.origin.len()
+            )));
+        }
+        let (ts_min, ts_max) = (pushdown.ts_min(), pushdown.ts_max());
+        let (kept, origin): (Vec<SegmentRef>, Vec<_>) = self
+            .snapshot
+            .segments
+            .iter()
+            .zip(&ctx.parts.origin)
+            .filter(|(s, _)| SpanSegmentFetcher::ts_range_relevant(s, ts_min, ts_max))
+            .map(|(s, o)| (s.clone(), *o))
+            .unzip();
+        let snapshot = Snapshot {
+            segments: kept,
+            ..Snapshot::default()
+        };
+        let parts = SnapshotParts::new(ctx.parts.parts.clone(), origin);
+        let key_set = trace_key_set(trace_id).map_err(|e| DataFusionError::External(e.into()))?;
+        let reader = SpanLeafRangeReader::new(&self.fetcher, self.tenant_hash);
+        let budget = PoolLeafBudget(pool);
+        let input = RouteInput {
+            catalog: &ctx.catalog,
+            snapshot: &snapshot,
+            parts: &parts,
+            signal: Signal::Spans,
+            tenant_hash: self.tenant_hash,
+            key_set: &key_set,
+            accounting: &self.accounting,
+            reader: &reader,
+            budget: &budget,
+            limits: KeyIndexLeafLimits::default(),
+        };
+        let (routes, figures) = match ctx.max_probed_parts {
+            Some(max_parts) => route_with_max_parts(input, max_parts).await,
+            None => route(input).await,
+        }
+        .map_err(|e| DataFusionError::External(e.into()))?;
+        let mut routed = RoutedSegments {
+            segments: Vec::with_capacity(routes.len()),
+            block_sets: Vec::with_capacity(routes.len()),
+            figures,
+            pruned: 0,
+        };
+        for (segment, segment_route) in snapshot.segments.into_iter().zip(routes) {
+            match segment_route {
+                SegmentRoute::Pruned => routed.pruned += 1,
+                SegmentRoute::Blocks(set) => {
+                    routed.segments.push(segment);
+                    routed.block_sets.push(Some(set));
+                }
+                SegmentRoute::Uncovered => {
+                    routed.segments.push(segment);
+                    routed.block_sets.push(None);
+                }
+            }
+        }
+        Ok(routed)
     }
 
     /// Segments whose event-time span overlaps the extracted ts window.
@@ -352,6 +513,25 @@ impl TableProvider for SpansTableProvider {
         // the projected column indices, so a projection that excludes
         // `events`/`links` skips their decode there too, not only on the
         // columnar path. Either way, no wrapping `ProjectionExec` is needed.
+        if let (Some(ctx), Some(trace_id)) = (&self.key_index_route, pushdown.trace_id) {
+            let routed = self
+                .route_trace(
+                    ctx,
+                    Arc::clone(&state.runtime_env().memory_pool),
+                    &pushdown,
+                    &trace_id,
+                )
+                .await?;
+            let scan = self
+                .scan_over(
+                    &routed.segments,
+                    target_partitions,
+                    &pushdown,
+                    projection.cloned(),
+                )?
+                .with_key_index_route(routed.block_sets, &routed.figures, routed.pruned)?;
+            return Ok(Arc::new(scan));
+        }
         self.build_scan(target_partitions, &pushdown, projection.cloned())
     }
 }

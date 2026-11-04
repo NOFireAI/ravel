@@ -3166,9 +3166,10 @@ doc's own vocabulary:
 - **scan** -- the actual block/page/chunk data reads
   (`SegmentFetcher::fetch_scalar_pages`/`fetch_histogram_pages`,
   `LogSegmentFetcher::scan_accounted_with_tenant`).
-- **keyIndex** -- the KEY_IDX prefix and bucket reads of a spans
-  `trace_id =` lookup (`SpanSegmentFetcher`'s ranged trace path, ADR-2707
-  decision 5) and of a logs exact-key equality
+- **keyIndex** -- the key-index leaf reads of the tier-2 router on a spans
+  `trace_id =` lookup (ADR-3692 decision 3, "Tier-2 router" below), the
+  KEY_IDX prefix and bucket reads of such a lookup (`SpanSegmentFetcher`'s
+  ranged trace path, ADR-2707 decision 5) and of a logs exact-key equality
   (`LogSegmentFetcher::plan_segment_keyed`, see "Exact-key probe" under
   "Declared typed attribute columns" below). The store's GET latency histogram has no key-index slot, so
   these reads are timed there under `probe`. Its `decompressedOutputBytes`
@@ -3177,7 +3178,7 @@ doc's own vocabulary:
   that decodes, at its declared length (`entry_count x 12`, which the decode
   checks the zstd output against). A bucket the prefix names empty is not
   read and adds nothing. The bytes count whether they came from a GET, the
-  read cache or the tail probe, since the read cache holds frames as stored
+  read cache or the footer suffix, since the read cache holds frames as stored
   and each probe decodes them again. On a small bucket this figure can be
   below the wire bytes: the frame's 8-byte header and zstd framing outweigh
   a few entries.
@@ -3752,7 +3753,10 @@ and block-level reported independently:
 - `segmentsPrunedByKeyIndex`: segments a spans `trace_id =` lookup or a logs
   exact-key equality read no blocks of because their KEY_IDX section proved
   the key absent, or, for several logs keys joined by `AND`, named no block
-  every key shares (ADR-2707 decision 5).
+  every key shares (ADR-2707 decision 5). On spans it also counts the
+  segments the tier-2 router dropped before the scan because their part's
+  leaves prove the trace absent (ADR-3692 decision 3); a segment is counted
+  by one tier only, since a tier-2 prune is never opened.
 - `blocksPrunedByKeyIndex`: blocks the skip index kept, in the segments that
   lookup did read, that KEY_IDX named no entry for. On spans it is 0 when the
   skip index already narrows the object to the trace's blocks, which it does
@@ -3823,6 +3827,37 @@ both pruning levels through `POST /api/v1/sql`.
 two key-index counts the same way, and
 `services/ravel-server/tests/sql_like_contains_e2e.rs` the two `LIKE`
 counts.
+
+`stats.keyIndex` and `stats.signals[].keyIndex` (the spans entry) carry the
+tier-2 router's figures and the fetcher's SKIP_IDX drops for a spans
+`trace_id =` lookup, summed over every spans scan in the plan. Both are
+present, zeros included, exactly when a spans scan carried a pushed
+`trace_id`, and absent for every other statement
+(`key_index_stats_are_absent_without_a_trace_key`). The keys, in render
+order (`ravel_sql::key_index_json`):
+
+- `partsCovered`: parts the router answered from their leaves.
+- `partsUncovered`: parts with no leaf for `trace_id`, whose segments go to
+  the tier-1 probe.
+- `partsBeyondCeiling`: parts past `L_max` or the probed-parts ceiling,
+  whose segments go to the tier-1 probe.
+- `leavesRejected`: parts whose leaf failed validation (`Corrupted`, a stale
+  part binding), read as uncovered.
+- `reservationsRefused`: parts whose frame decode reservation the statement's
+  memory budget refused, read as uncovered.
+- `leafGetRequests`: leaf GETs issued to the store; a leaf range served from
+  the read cache is not counted.
+- `leafWireBytes`: the bytes those GETs returned, as transferred.
+- `keysProbed`: keys in the probed set, 1 for a `trace_id =` lookup.
+- `skippedByBudget`: parts the bridged-read allowance left uncovered.
+- `skipIdxDropped`: objects the fetcher read the key present in and then
+  dropped because SKIP_IDX kept none of the key's blocks inside the
+  statement's window (a `duration_ns` floor no block meets, say), with no
+  BLOOM or block read.
+
+`services/ravel-server/tests/trace_by_id_tier2.rs` pins each figure on a
+tenant folded with leaves, through `GET /api/traces/<id>` and
+`POST /api/v1/sql`.
 
 `stats.accounting.strDictValuesBuilt` counts the string dictionary values
 arrays the scans built for declared `Str` columns: one per row group
@@ -4951,11 +4986,46 @@ leaves". A part the ceilings leave out, a rejected leaf, a refused
 reservation and a part without a leaf for the field are `Uncovered`, never
 sent to a scan; a leaf of another tenant or signal fails the statement and
 moves `ravel_catalog_isolation_breach_total`. Leaf reads are charged to the
-`keyIndex` phase with the caller's access intent, and its figures
-(`partsCovered`, `partsUncovered`, `partsBeyondCeiling`, `leavesRejected`,
-`reservationsRefused`, `skippedByBudget`, leaf GETs and wire bytes, keys
-probed) come back with the routes. No query path calls it yet: ADR-3692's
-plan wires the spans fetcher in task T4 and the logs scan in task T5.
+`keyIndex` phase with the caller's access intent, and its figures come back
+with the routes; `stats.keyIndex` above renders them under their exact
+names.
+
+The spans `trace_id =` lookup calls it (ADR-3692 decision 3; the logs scan
+does not yet, task T5). `SpansTableProvider` resolves the window with
+`resolve_pruned_with_parts`, the snapshot it already pins, builds the key set
+from the trace id's `key8`, and routes with `SpanLeafRangeReader`, which reads
+each leaf range through the span fetcher's read path, so leaf bytes share
+the read cache (keyed by the leaf's blake3) and the `keyIndex` phase with
+the KEY_IDX reads. A `Pruned` segment is dropped before any of its bytes are
+read; a `Blocks` segment's block set is passed to the row and columnar fetch
+paths (the columnar path's row fallback carries the same set), which then
+read no KEY_IDX for it; an `Uncovered` segment is fetched with no set and
+probed at tier 1. The ranged fetch of every object reads in this order, each
+by its own range unless an earlier read already holds it:
+
+1. A suffix of `min(object length, 8 KiB)`
+   (`ravel_query::span_fetcher::DEFAULT_TRACE_PROBE_BYTES`, the fold's
+   `KEY_INDEX_FOOTER_SUFFIX_LEN`), on the `probe` phase, chased once when the
+   footer is longer.
+2. With no block set, the KEY_IDX prefix and the trace's bucket, on the
+   `keyIndex` phase. An object the trace is absent from stops here: no
+   SKIP_IDX, BLOOM or block read.
+3. SKIP_IDX, on the `probe` phase, to intersect the known blocks with the
+   statement's window; an object left with none counts in `skipIdxDropped`.
+4. BLOOM, only when the statement pushed predicates that need it.
+5. The kept block runs, on the `scan` phase.
+
+So per lookup: a covering part costs two leaf GETs (prefix and bucket) and
+its pruned segments none; an uncovered object without the trace costs at
+most three GETs, the suffix and the two KEY_IDX reads (fewer when the suffix
+holds KEY_IDX or the trace's bucket is empty), about 11 KB; a holder costs its suffix, SKIP_IDX and its
+runs, plus the two KEY_IDX reads when it is uncovered; a part past the
+ceilings sends its segments to tier 1. The process counters are
+`ravel_query_key_index_parts_total{signal,outcome}`, the parts the router
+settled with `outcome` one of `covered`, `uncovered`, `beyond_ceiling`,
+`rejected`, `reservation_refused` and `skipped_by_budget`, and
+`ravel_query_key_index_leaf_gets_total{signal}`, the leaf GETs it issued.
+The Flight SQL pinned path and `EXPLAIN` do not route: they probe at tier 1.
 
 There is also a wire-size trade for a *high-cardinality* `str` column. ADR-0099
 decision 5's "leaves that case exactly as expensive as it is today" is a
@@ -5793,9 +5863,13 @@ prune and is evaluated as a residual only:
   `SpanQuery::trace` lookup, and the skip index drops every block whose
   `[min_trace_id, max_trace_id]` range excludes the target: a bounded
   single-trace scan instead of a full window scan.
-  Each object the skip index keeps is probed in its KEY_IDX section first, and
-  one that does not hold the trace is not read further (ADR-2707 decision 5,
-  reported in `stats.pruning` and the `keyIndex` phase above). No listed
+  On a catalog folded with key-index leaves the tier-2 router drops every
+  segment whose part's leaves prove the trace absent and hands the rest
+  their block sets ("Tier-2 router" above). Each remaining object without a
+  set is probed in its KEY_IDX section before its SKIP_IDX is read, and one
+  that does not hold the trace is not read further (ADR-2707 decision 5,
+  reported in `stats.pruning`, `stats.keyIndex` and the `keyIndex` phase
+  above). No listed
   object is skipped by its shard: the lookup does not route by shard.
 - `start_ts` / `end_ts` range comparisons (`>=`, `>`, `<`, `<=`, `=`, and
   `BETWEEN`): both columns fold into one inclusive `[ts_min, ts_max]` window
