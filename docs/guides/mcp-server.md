@@ -378,7 +378,11 @@ ask for the bounded form of a listing, retry after a wait. A step for a cap
 names the cap that actually cut the result and never advises raising one
 already at its ceiling. A result whose only cut is shortened cells is
 complete, status `ok` with no cursor, and its `read_full_cells` step says
-how to read those cells in full; the
+to raise `max_response_bytes` up to its configured ceiling, or that the
+cells cannot be returned in full at that ceiling, plus the tool's own way
+to read more of a cell where it has one. A page whose source handed back a
+cursor, such as a `ravel_agent_events` page, keeps it and stays `ok_page`
+even when its only cut is a shortened cell. The
 [reference](../reference/mcp.md#cap-next-steps) has the rule.
 
 ## Time inputs
@@ -423,9 +427,10 @@ because it counts series. When the samples do not fit
 `max_response_bytes`, the series that does not fit comes back with a
 prefix of its samples, `ts_ns` and `value` of one length, and
 `samples.samples_omitted` says how many were left out. When every series
-is present the result is `ok`, and its `read_full_cells` step says to widen
-`step` or narrow `time_range`, or to raise `max_response_bytes`; a result
-that also dropped a series is `ok_bounded`.
+is present the result is `ok`, and its `read_full_cells` step says to raise
+`max_response_bytes` up to its configured ceiling, or to narrow
+`time_range` to a window after the last sample returned; a result that also
+dropped a series is `ok_bounded`.
 
 ## Budgets you can lower
 
