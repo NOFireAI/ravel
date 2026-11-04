@@ -88,7 +88,7 @@ pub async fn dispatch_agents<B: AgentsBackend>(
     ctx: &ToolContext<'_>,
     backend: &B,
 ) -> Option<Envelope> {
-    if let Some(failure) = super::evidence_ref_refusal(name, &args, &agents_tool_catalog()) {
+    if let Some(failure) = super::evidence_ref_refusal(name, &args, agents_tool_catalog) {
         return Some(failed(failure, Vec::new(), ctx));
     }
     let envelope = match name {

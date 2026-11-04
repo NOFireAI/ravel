@@ -1940,7 +1940,8 @@ settled here.
    `ravel_describe_data`, `ravel_get_trace`, `ravel_query_promql`); each
    tool supplies only its own wording for fewer or smaller rows. When the
    byte cap dropped rows with fewer than `max_rows` returned, the step is
-   `raise_max_response_bytes` (below the 4 MiB ceiling) or the tool's own
+   `raise_max_response_bytes` (below the configured `max_response_bytes`
+   ceiling, 4 MiB by default, which the step names) or the tool's own
    smaller-rows action (at it). When the row cap stopped the result, the
    step is `raise_max_rows` (below 5,000) or `narrow_time_range` (at it).
    `ravel_get_trace` used to advise raising `max_rows` for both.
