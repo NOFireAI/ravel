@@ -61,7 +61,7 @@ use crate::cursor::{
 };
 use crate::draft::{Draft, NoCursor, PageOrder, PinScope};
 use crate::envelope::{
-    CURSOR_BOUND, Envelope, Failure, FailureClass, NextStep, Status, serialized_str_len,
+    CURSOR_BOUND, CapAdvice, Envelope, Failure, FailureClass, NextStep, Status, serialized_str_len,
 };
 use crate::resume_tuple::{decode_resume_tuple, encode_resume_tuple};
 use crate::service::QueryBackend;
@@ -73,6 +73,12 @@ use super::explain_query::sql_failure;
 
 /// The catalog name, which a cursor is bound to.
 const TOOL: &str = "ravel_query_sql";
+
+const ADVICE: CapAdvice<'static> = CapAdvice {
+    fewer_rows: "shorten time_range or add WHERE predicates",
+    smaller_rows_action: "narrow_the_projection",
+    smaller_rows: "select fewer or narrower columns",
+};
 
 /// The BLAKE3 derive-key context of the cursor's argument hash.
 const ARGUMENT_HASH_CONTEXT: &str = "ravel-mcp ravel_query_sql arguments v1";
@@ -381,6 +387,7 @@ async fn unordered<B: QueryBackend>(
     let mut envelope = draft.finish_page(
         &ctx.budgets,
         &call.scope(ctx),
+        &ADVICE,
         PageOrder::Partial,
         |_, _, _| Err(NoCursor::because(unpaged.no_cursor().to_string())),
     );
@@ -402,11 +409,6 @@ fn finish(
 ) -> Envelope {
     let order_by = rendered_order(plan);
     draft.envelope.scope.order_by = order_by.clone();
-    let narrow_groups = step(
-        "narrow_time_range",
-        "no group of rows equal under the ORDER BY fits one page; shorten time_range, \
-         raise max_rows, or order by more columns so a whole group fits",
-    );
     let order = match &plan.not_total {
         None => PageOrder::Total,
         Some(reason) => {
@@ -416,12 +418,12 @@ fn finish(
             ));
             PageOrder::Grouped {
                 same_group: &same_tuple,
-                no_complete_group: &narrow_groups,
+                group: "one set of ORDER BY values",
             }
         }
     };
     let order_from_other_rows = plan.order_from_other_rows;
-    draft.finish_page(&ctx.budgets, scope, order, |pins, _, tuple| {
+    draft.finish_page(&ctx.budgets, scope, &ADVICE, order, |pins, _, tuple| {
         if order_from_other_rows && pins.segment_set_digest.is_none() {
             return Err(NoCursor::because(
                 "the order depends on values computed from other rows and the backend \
@@ -706,6 +708,14 @@ mod tests {
             .collect()
     }
 
+    fn steps(envelope: &Envelope) -> Vec<(&str, &str)> {
+        envelope
+            .next_steps
+            .iter()
+            .map(|step| (step.action.as_str(), step.detail.as_str()))
+            .collect()
+    }
+
     fn failure_class(envelope: &Envelope) -> FailureClass {
         assert_eq!(envelope.status, Status::Error, "{envelope:?}");
         envelope
@@ -842,8 +852,8 @@ mod tests {
     }
 
     /// When the k+1 row continues the only group on the page, no complete
-    /// group fits: the page is `ok_bounded` with no cursor and says to narrow
-    /// the range.
+    /// group fits: the page is `ok_bounded` with no cursor, and its one step
+    /// is the row-cap step under the group context.
     ///
     /// FLIP: minting after the open group's last kept row resumes inside the
     /// group and loses its third row.
@@ -857,7 +867,51 @@ mod tests {
 
         assert_eq!(page.status, Status::OkBounded, "{page:?}");
         assert_eq!(page.presentation.cursor, None);
-        assert_eq!(actions(&page), ["narrow_time_range"]);
+        assert_eq!(
+            steps(&page),
+            [(
+                "raise_max_rows",
+                "more rows share one set of ORDER BY values than fit one page; the row cap \
+                 stopped the result; raise max_rows (up to 5,000) or shorten time_range or \
+                 add WHERE predicates"
+            )]
+        );
+    }
+
+    /// One grouped row whose cell is wider than the byte cap: the cap
+    /// shortens the cell and drops no row, so the page is `ok` with no
+    /// cursor, no group step, and only the step to read the cell in full.
+    ///
+    /// FLIP: counting a shortened cell as a cut in `finish_page`'s selection
+    /// sends the one row down the group path, whose step says more rows
+    /// share one set of ORDER BY values than fit one page.
+    #[test]
+    fn one_row_cut_by_the_byte_cap_is_ok_with_only_the_cells_step() {
+        let key = key();
+        let mut ctx = context(&key);
+        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
+        let mut draft = logs(&[4]);
+        draft.envelope.data.rows[0][0] =
+            Cell::Str("x".repeat(MAX_RESPONSE_BYTES_FLOOR as usize + 1));
+        let stub = Stub::default();
+        stub.sql.borrow_mut().push_back(draft);
+
+        let page = block_on(run(args(GROUPED, None), &ctx, &stub));
+
+        assert_eq!(page.status, Status::Ok, "{:?}", page.presentation);
+        assert_eq!(page.presentation.cursor, None);
+        assert_eq!(page.presentation.cells_truncated, 1);
+        assert_eq!(page.presentation.rows_omitted, 0);
+        assert_eq!(page.data.rows.len(), 1);
+        assert_eq!(
+            steps(&page),
+            [(
+                "read_full_cells",
+                "the result is complete but the byte cap shortened cells; select fewer or \
+                 narrower columns, or raise max_response_bytes (up to 4 MiB), to read them \
+                 in full"
+            )]
+        );
     }
 
     /// A NaN order value, a missing order tuple, and a `Str` key long enough

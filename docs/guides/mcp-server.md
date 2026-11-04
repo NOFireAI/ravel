@@ -374,7 +374,12 @@ see [Evidence references](#evidence-references).
 
 `warnings` are non-fatal notes about the call. `next_steps` names a concrete
 follow-up action, on both a success and a failure: narrow the time range,
-ask for the bounded form of a listing, retry after a wait.
+ask for the bounded form of a listing, retry after a wait. A step for a cap
+names the cap that actually cut the result and never advises raising one
+already at its ceiling. A result whose only cut is shortened cells is
+complete, status `ok` with no cursor, and its `read_full_cells` step says
+how to read those cells in full; the
+[reference](../reference/mcp.md#cap-next-steps) has the rule.
 
 ## Time inputs
 
@@ -417,9 +422,10 @@ One series can hold up to 11,000 samples, which `max_rows` does not bound
 because it counts series. When the samples do not fit
 `max_response_bytes`, the series that does not fit comes back with a
 prefix of its samples, `ts_ns` and `value` of one length, and
-`samples.samples_omitted` says how many were left out. The result is
-`ok_bounded`, and its next step says to widen `step` or narrow
-`time_range`.
+`samples.samples_omitted` says how many were left out. When every series
+is present the result is `ok`, and its `read_full_cells` step says to widen
+`step` or narrow `time_range`, or to raise `max_response_bytes`; a result
+that also dropped a series is `ok_bounded`.
 
 ## Budgets you can lower
 
@@ -544,7 +550,8 @@ Paging order differs per tool:
 - `ravel_get_trace` mints no cursor: it returns the trace's spans in one
   page, ordered by `start_ts` and `span_id`, and a trace larger than the row
   cap comes back bounded (`row_cap_hit`) rather than paged. Raise `max_rows`
-  (up to 5,000) or narrow the time range to read more of it.
+  (up to 5,000) or narrow the time range to read more of it; a trace the
+  byte cap cut needs smaller rows or a larger `max_response_bytes` instead.
 - `ravel_query_promql` mints no cursor: a PromQL result has no order a
   cursor could resume. Its row cap counts series, and a result with more
   series than `max_rows` comes back `ok_bounded`.
@@ -570,18 +577,18 @@ starts after it.
 
 When no complete group fits in the row cap, the server returns the rows that
 it has, up to the row cap, with status `ok_bounded` and no cursor.
-`next_steps` names narrowing `time_range`.
+`next_steps` carries the step for the cap that cut the group, by the
+[cap step rule](../reference/mcp.md#cap-next-steps).
 
 ### Evidence references
 
 No tool redeems an `evidence_ref` or emits an `evidence` block in this
-build. `ravel_query_sql`, `ravel_query_promql`, `ravel_search_logs`,
-`ravel_get_trace` and `ravel_analyze_timeseries` refuse an `evidence_ref`
-with `unsupported`, and `ravel_find_labels` refuses one with
-`invalid_argument`. `ravel_capabilities`, `ravel_describe_data`,
-`ravel_explain_query` and the Ravel Agents tools do not list it in their
-input schemas and ignore it. Not every unlisted argument is ignored: the
-server reads the six budget arguments (`max_rows`, `max_response_bytes`,
+build. Every tool refuses an `evidence_ref` before it reads anything:
+`ravel_query_sql`, `ravel_query_promql`, `ravel_search_logs`,
+`ravel_get_trace` and `ravel_analyze_timeseries`, which list it in their
+input schemas, with `unsupported`, and every other tool, Ravel Agents tools
+included, with `invalid_argument`. The budget arguments are the exception
+to a schema's list: the server reads the six budget arguments (`max_rows`, `max_response_bytes`,
 `deadline_ms`, `max_bytes_scanned`, `max_store_requests`, `max_segments`)
 on every tool call, whether or not the tool's schema lists them, refuses a
 call with `invalid_argument` when one of them has the wrong type, and applies

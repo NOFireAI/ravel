@@ -245,7 +245,7 @@ mod with_mcp {
 
     use ravel_mcp::budget::{McpBudgetConfig, McpEffectiveBudgets, McpRequestBudgets};
     use ravel_mcp::draft::{Draft, EstimateComponent, NoCursorSignal, PageOrder, PinScope};
-    use ravel_mcp::envelope::{FailureClass, Status};
+    use ravel_mcp::envelope::{CapAdvice, FailureClass, Status};
     use ravel_mcp::service::QueryBackend;
     use ravel_mcp::tools::{ToolContext, describe_data, query_sql};
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
@@ -997,10 +997,21 @@ mod with_mcp {
             range_end_ns: SQL_NOW_NS,
             min_commit_watermark: Vec::new(),
         };
-        draft.finish_page(&sql_budgets(), &scope, PageOrder::Partial, |_, _, _| {
-            panic!("a partial order never mints")
-        })
+        draft.finish_page(
+            &sql_budgets(),
+            &scope,
+            &SQL_ADVICE,
+            PageOrder::Partial,
+            |_, _, _| panic!("a partial order never mints"),
+        )
     }
+
+    /// The wording `ravel_query_sql` gives the cap step rule.
+    const SQL_ADVICE: CapAdvice<'static> = CapAdvice {
+        fewer_rows: "shorten time_range or add WHERE predicates",
+        smaller_rows_action: "narrow_the_projection",
+        smaller_rows: "select fewer or narrower columns",
+    };
 
     fn sql_request(sql: &str) -> ravel_sql::SqlRequest {
         ravel_sql::SqlRequest {
@@ -1237,9 +1248,13 @@ mod with_mcp {
             range_end_ns: SQL_NOW_NS,
             min_commit_watermark: Vec::new(),
         };
-        let page = draft.finish_page(&budgets, &scope, PageOrder::Total, |_, _, _| {
-            panic!("a statement naming no table must not reach the mint")
-        });
+        let page = draft.finish_page(
+            &budgets,
+            &scope,
+            &SQL_ADVICE,
+            PageOrder::Total,
+            |_, _, _| panic!("a statement naming no table must not reach the mint"),
+        );
 
         let envelope = serde_json::to_value(&page).expect("an envelope serializes");
         assert_eq!(
@@ -2727,8 +2742,9 @@ mod with_mcp {
     /// never reached; a range of exactly 11,000 steps is evaluated, and its
     /// one series, over the 256 KiB floor cap at about 34 B a sample, comes
     /// back as an object of parallel arrays of one length, a prefix of the
-    /// series, with `samples_omitted`, one truncated cell, `ok_bounded`, and
-    /// a next step to widen the step or narrow the range.
+    /// series, with `samples_omitted` and one truncated cell. No series is
+    /// missing, so the result is `ok` with no cursor, and its one next step
+    /// is `read_full_cells`.
     ///
     /// FLIP: dropping the tool's step check lets the engine refuse the first
     /// call as `unsupported`, naming the HTTP route's `step_ms`, with no next
@@ -2773,7 +2789,8 @@ mod with_mcp {
 
         let (is_error, cut) = call(&client, "ravel_query_promql", range(1_100_000)).await;
         assert_eq!(is_error, Some(false), "{}", cut["failure"]);
-        assert_eq!(cut["status"], serde_json::json!("ok_bounded"));
+        assert_eq!(cut["status"], serde_json::json!("ok"));
+        assert_eq!(cut["presentation"]["cursor"], serde_json::Value::Null);
         assert_eq!(cut["presentation"]["cells_truncated"], serde_json::json!(1));
         assert_eq!(cut["presentation"]["rows_omitted"], serde_json::json!(0));
         let rows = cut["data"]["rows"].as_array().expect("rows");
@@ -2792,17 +2809,15 @@ mod with_mcp {
             rows[0][1]["samples_omitted"],
             serde_json::json!((11_000 - ts.len()).to_string())
         );
-        let details: Vec<&str> = cut["next_steps"]
-            .as_array()
-            .expect("next steps")
-            .iter()
-            .filter_map(|step| step["detail"].as_str())
-            .collect();
-        assert!(
-            details
-                .iter()
-                .any(|detail| detail.contains("widen step or narrow time_range")),
-            "{details:?}"
+        assert_eq!(
+            cut["next_steps"],
+            serde_json::json!([{
+                "action": "read_full_cells",
+                "detail": "the result is complete but the byte cap shortened cells; widen step \
+                           or narrow time_range for fewer samples per series, or narrow the \
+                           query for fewer series, or raise max_response_bytes (up to 4 MiB), \
+                           to read them in full",
+            }])
         );
 
         client.cancel().await.expect("client stops");
