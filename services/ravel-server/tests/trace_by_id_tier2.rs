@@ -465,6 +465,16 @@ async fn resolve(recorder: &Arc<RecordingStore>, range: TimeRange) -> (Snapshot,
 /// The SQL and trace routes over the recording store, with the process read
 /// cache attached and the router's part ceiling lowered to `max_parts`.
 fn serve(recorder: &Arc<RecordingStore>, max_parts: Option<usize>) -> Router {
+    serve_with(recorder, max_parts, None)
+}
+
+/// [`serve`], with the catalog's decoded memory charged to `catalog_budget`
+/// when one is given.
+fn serve_with(
+    recorder: &Arc<RecordingStore>,
+    max_parts: Option<usize>,
+    catalog_budget: Option<Arc<ravel_memory::MemoryBudget>>,
+) -> Router {
     let store: Arc<dyn ObjectStoreBackend> = recorder.clone();
     let cli = Cli::try_parse_from(["ravel-server"]).expect("default flags parse");
     let catalog = build_catalog(
@@ -480,6 +490,13 @@ fn serve(recorder: &Arc<RecordingStore>, max_parts: Option<usize>) -> Router {
             .max_flush_delay,
     )
     .expect("catalog");
+    let catalog = match catalog_budget {
+        Some(budget) => match Arc::try_unwrap(catalog) {
+            Ok(catalog) => Arc::new(catalog.with_memory_budget(budget)),
+            Err(_) => panic!("the fresh catalog has one owner"),
+        },
+        None => catalog,
+    };
     let cache = build_cache(&cli, ravel_server::config::DEFAULT_CACHE_MAX_BYTES)
         .expect("cache enabled by default");
     let mut tokens = HashMap::new();
@@ -1174,4 +1191,430 @@ async fn key_index_stats_are_absent_without_a_trace_key() {
     let signals = value["stats"]["signals"].as_array().expect("signals");
     assert_eq!(signals.len(), 1, "{value}");
     assert!(signals[0].get("keyIndex").is_none(), "{value}");
+}
+
+/// The columnar scan path (a `SELECT name` projection, no attrs, events or
+/// links) takes the router's block sets as the row path does: on a fresh
+/// server, so nothing is served from a cache, each holder reads its suffix,
+/// SKIP_IDX and the trace's run with no KEY_IDX, each object the leaves prove
+/// absent is never read, and the keyIndex phase holds exactly the four leaf
+/// GETs.
+///
+/// FLIP: passing `None` for `seg.blocks.as_deref()` in `prepare_columnar`'s
+/// `fetch_accounted_columnar_in_blocks` call (crates/ravel-sql/src/
+/// spans_scan.rs) reads each holder's KEY_IDX, which the holder's read list
+/// and the keyIndex phase count here reject.
+#[tokio::test]
+async fn a_cold_columnar_lookup_reads_only_the_routed_blocks() {
+    let _serial = SERIAL.lock().await;
+    let specs = two_part_specs();
+    let (recorder, objects) = publish_all(&specs).await;
+    let t = trace();
+    let want: Vec<ExpectedReads> = objects
+        .iter()
+        .map(|o| expected_reads(&o.bytes, &t))
+        .collect();
+    fold_with_leaves(&recorder, specs.len()).await;
+    let (snapshot, parts) = resolve(
+        &recorder,
+        TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        },
+    )
+    .await;
+    let layout = part_layout(&snapshot, &parts);
+    assert_eq!(layout.len(), 2, "two parts: {layout:?}");
+
+    let app = serve(&recorder, None);
+    recorder.clear();
+    let before = totals();
+    let value = sql(&app, &names_where(""), 0).await;
+    let moved = delta(before, totals());
+    assert_eq!(
+        value["data"]["rows"],
+        serde_json::json!([["t-0"], ["t-1"], ["t-2"]]),
+        "{value}"
+    );
+    for (object, want) in objects.iter().zip(&want) {
+        let got = recorder.take(&object.key);
+        if object.holder {
+            assert_eq!(
+                got,
+                want.tier2_holder(),
+                "{}: the suffix, SKIP_IDX and the trace's run, no KEY_IDX",
+                object.key
+            );
+        } else {
+            assert!(
+                got.is_empty(),
+                "{}: a pruned object is never read: {got:?}",
+                object.key
+            );
+        }
+    }
+    for (leaves, _) in &layout {
+        let gets: usize = leaves.iter().map(|k| recorder.take(k).len()).sum();
+        assert_eq!(gets, 2, "two leaf GETs per covering part: {leaves:?}");
+    }
+    assert_eq!(key_index(&value, "partsCovered"), 2, "{value}");
+    assert_eq!(key_index(&value, "leafGetRequests"), 4, "{value}");
+    assert_eq!(phase(&value, "keyIndex", "s3GetRequests"), 4, "{value}");
+    assert_eq!(
+        phase(&value, "keyIndex", "s3GetWireBytes"),
+        key_index(&value, "leafWireBytes"),
+        "{value}"
+    );
+    assert_eq!(phase(&value, "probe", "s3GetRequests"), 4, "{value}");
+    assert_eq!(phase(&value, "probe", "segmentsOpened"), 2, "{value}");
+    assert_eq!(phase(&value, "scan", "s3GetRequests"), 2, "{value}");
+    assert_eq!(pruning(&value, "segmentsPrunedByKeyIndex"), 4, "{value}");
+    assert_eq!(
+        moved,
+        Totals {
+            covered: 2,
+            uncovered: 0,
+            beyond_ceiling: 0,
+            leaf_gets: 4,
+        }
+    );
+}
+
+/// The `/metrics` router over `catalog`, wired as `ravel_server::start`
+/// wires it in `Mode::All`.
+fn metrics_router(catalog: Arc<Catalog>) -> Router {
+    use ravel_ingest::{AdmissionController, AdmissionLimits, SystemClock};
+    use ravel_server::metrics::{MetricsState, QueryAccountingMetrics};
+
+    ravel_server::metrics::router(MetricsState {
+        mode: ravel_server::Mode::All,
+        store_metrics: Arc::new(ravel_object_store::StoreMetrics::default()),
+        ingest_router: None,
+        log_ingest_router: None,
+        span_ingest_router: None,
+        catalog,
+        tenant_discovery: None,
+        maintenance_safety: None,
+        maintenance_ownership: None,
+        merge_memory: None,
+        scrub: None,
+        cache_metrics: None,
+        cache_disk_metrics: None,
+        catalog_cache_metrics: None,
+        catalog_cache_disk_metrics: None,
+        admission: Arc::new(AdmissionController::new(
+            Arc::new(SystemClock),
+            AdmissionLimits::default(),
+        )),
+        reconcile_cycle: Arc::new(
+            ravel_server::admission_reconcile::ReconcileCycleMetrics::default(),
+        ),
+        metrics_tenant_labels: false,
+        query_accounting: Arc::new(QueryAccountingMetrics::new(std::collections::HashSet::new())),
+        metrics_tenant_allowlist: Arc::new(std::collections::HashSet::new()),
+        ingest_buffer_budget: ravel_ingest::IngestByteBudget::shared(
+            ravel_ingest::IngestByteBudgetLimit::Unlimited,
+        ),
+        ingest_concurrency: ravel_server::ingest_concurrency::IngestConcurrencyController::shared(
+            ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
+        ),
+        distrib: None,
+        #[cfg(feature = "flight-sql")]
+        sql_slice_rejects: None,
+        #[cfg(feature = "flight-sql")]
+        sql_slice_tls_dials: None,
+        #[cfg(feature = "agents")]
+        agents: None,
+        durable_auth: None,
+        ingest_byte_metrics: Arc::new(ravel_server::ingest_byte_metrics::IngestByteMetrics::new()),
+        normalize_reject_metrics: Arc::new(
+            ravel_server::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+        ),
+        metadata_cache: None,
+        cache: None,
+        cache_max_bytes: 0,
+        catalog_cache_max_bytes: 0,
+        audit_pipeline: None,
+        process_memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
+        process_memory_budget_is_fallback: false,
+        cpu_gates: ravel_server::cpu_gates::CpuGates::new(Default::default()),
+        can_fold: true,
+        fold_loop: Default::default(),
+        refold: Default::default(),
+        heartbeat: ravel_server::health_listener::Heartbeat::new(Arc::new(SystemClock)),
+        decoded_cache: None,
+    })
+}
+
+async fn scrape(app: &Router) -> String {
+    let request = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .body(Body::empty())
+        .expect("build request");
+    let response = app.clone().oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    String::from_utf8(bytes.to_vec()).expect("utf8 metrics")
+}
+
+const PARTS_HELP: &str = "# HELP ravel_query_key_index_parts_total Catalog parts the key-index router settled for an exact-key lookup, by signal and outcome: covered parts answered from their leaves; every other outcome sends the part's segments to the per-object KEY_IDX probe.";
+const LEAF_GETS_HELP: &str = "# HELP ravel_query_key_index_leaf_gets_total Key-index leaf GETs the router issued for exact-key lookups, by signal, including those of a routing pass dropped before it finished.";
+
+/// The lines of `scrape` equal to `line`.
+fn count_lines(scrape: &str, line: &str) -> usize {
+    scrape.lines().filter(|l| *l == line).count()
+}
+
+/// The value of the one sample line of `scrape` that starts with `prefix`
+/// followed by a space.
+fn sample(scrape: &str, prefix: &str) -> u64 {
+    let lines: Vec<&str> = scrape
+        .lines()
+        .filter(|l| l.strip_prefix(prefix).is_some_and(|v| v.starts_with(' ')))
+        .collect();
+    assert_eq!(lines.len(), 1, "{prefix}: {lines:?}");
+    lines[0][prefix.len() + 1..]
+        .parse()
+        .unwrap_or_else(|e| panic!("{}: {e}", lines[0]))
+}
+
+/// After a routed lookup, the real `GET /metrics` renders both key-index
+/// router families with the HELP text docs/guides/observability.md quotes,
+/// one TYPE line each, every outcome once per signal, and the values the
+/// route totals hold, the lookup's two covered parts and four leaf GETs
+/// included.
+///
+/// FLIP: removing the `render_key_index_route_family(...)` call from
+/// `render()` in services/ravel-server/src/metrics.rs drops both families,
+/// and the HELP line count here reads 0.
+#[tokio::test]
+async fn the_metrics_page_renders_both_key_index_route_families_after_a_lookup() {
+    let _serial = SERIAL.lock().await;
+    let specs = two_part_specs();
+    let (recorder, _) = publish_all(&specs).await;
+    fold_with_leaves(&recorder, specs.len()).await;
+    let app = serve(&recorder, None);
+    let metrics = metrics_router(Arc::new(leaf_catalog(recorder.clone())));
+
+    let before = totals();
+    let value = trace_route(&app, &trace()).await;
+    assert_eq!(key_index(&value, "partsCovered"), 2, "{value}");
+    let page = scrape(&metrics).await;
+    let after = totals();
+    assert_eq!(
+        delta(before, after),
+        Totals {
+            covered: 2,
+            uncovered: 0,
+            beyond_ceiling: 0,
+            leaf_gets: 4,
+        }
+    );
+
+    assert_eq!(count_lines(&page, PARTS_HELP), 1, "{page}");
+    assert_eq!(
+        count_lines(&page, "# TYPE ravel_query_key_index_parts_total counter"),
+        1,
+        "{page}"
+    );
+    assert_eq!(count_lines(&page, LEAF_GETS_HELP), 1, "{page}");
+    assert_eq!(
+        count_lines(
+            &page,
+            "# TYPE ravel_query_key_index_leaf_gets_total counter"
+        ),
+        1,
+        "{page}"
+    );
+    let parts_samples = page
+        .lines()
+        .filter(|l| l.starts_with("ravel_query_key_index_parts_total{"))
+        .count();
+    assert_eq!(parts_samples, 2 * KeyIndexPartOutcome::ALL.len(), "{page}");
+    let leaf_samples = page
+        .lines()
+        .filter(|l| l.starts_with("ravel_query_key_index_leaf_gets_total{"))
+        .count();
+    assert_eq!(leaf_samples, 2, "{page}");
+    for signal in [Signal::Spans, Signal::Logs] {
+        let name = match signal {
+            Signal::Spans => "spans",
+            _ => "logs",
+        };
+        for outcome in KeyIndexPartOutcome::ALL {
+            let got = sample(
+                &page,
+                &format!(
+                    "ravel_query_key_index_parts_total{{mode=\"all\",signal=\"{name}\",outcome=\"{}\"}}",
+                    outcome.as_str()
+                ),
+            );
+            assert_eq!(
+                got,
+                key_index_parts_total(signal, outcome),
+                "{name} {outcome:?}"
+            );
+        }
+        assert_eq!(
+            sample(
+                &page,
+                &format!("ravel_query_key_index_leaf_gets_total{{mode=\"all\",signal=\"{name}\"}}"),
+            ),
+            key_index_leaf_gets_total(signal),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        sample(
+            &page,
+            "ravel_query_key_index_parts_total{mode=\"all\",signal=\"spans\",outcome=\"covered\"}",
+        ),
+        after.covered
+    );
+    assert!(after.covered >= 2 && after.leaf_gets >= 4, "{after:?}");
+}
+
+/// Three unfolded objects, one holding two of the trace's spans, under a
+/// catalog budget the resolve fits and the parts' handles do not.
+async fn budget_fixture() -> (Arc<RecordingStore>, Vec<Published>, Router) {
+    let t = trace();
+    let specs = vec![
+        ObjectSpec {
+            shard: 0,
+            hour: 0,
+            spans: bracket(&t),
+        },
+        ObjectSpec {
+            shard: 1,
+            hour: 0,
+            spans: vec![(t, "t-0"), (t, "t-1")],
+        },
+        ObjectSpec {
+            shard: 1,
+            hour: 1,
+            spans: bracket(&t),
+        },
+    ];
+    let (recorder, objects) = publish_all(&specs).await;
+    let budget = || Arc::new(ravel_memory::MemoryBudget::new(1));
+    let window = TimeRange {
+        start_ns: 0,
+        end_ns: NOW_NS,
+    };
+    let catalog = leaf_catalog(recorder.clone()).with_memory_budget(budget());
+    let tenant = TenantId::new(TENANT).hash();
+    let refused = catalog
+        .resolve_pruned_with_parts(
+            &tenant,
+            Signal::Spans,
+            window,
+            &[],
+            NOW_NS,
+            None,
+            &QueryAccounting::new(),
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(ravel_catalog::CatalogError::MemoryExhausted(_))
+        ),
+        "the parts' charge exceeds the budget: {:?}",
+        refused.map(|(snapshot, _, parts)| (snapshot.segments.len(), parts.heap_bytes()))
+    );
+    let (snapshot, _) = catalog
+        .resolve_pruned_with_admission(
+            &tenant,
+            Signal::Spans,
+            window,
+            &[],
+            NOW_NS,
+            None,
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("the resolve alone fits the budget");
+    assert_eq!(snapshot.segments.len(), 3);
+    let app = serve_with(&recorder, None, Some(budget()));
+    (recorder, objects, app)
+}
+
+/// A spans statement with no trace key never needs the router's parts, and a
+/// refused charge for them does not fail it.
+///
+/// FLIP: returning the `resolve_pruned_with_parts` error as before (the
+/// `Err(CatalogError::MemoryExhausted(_)) => None` arm in
+/// crates/ravel-sql/src/executor.rs re-raised) fails this statement with a
+/// memory error.
+#[tokio::test]
+async fn a_spans_statement_without_a_trace_key_survives_a_refused_parts_charge() {
+    let _serial = SERIAL.lock().await;
+    let (_recorder, _, app) = budget_fixture().await;
+    let value = sql(
+        &app,
+        "SELECT name FROM spans WHERE name LIKE 't-%' ORDER BY name",
+        0,
+    )
+    .await;
+    assert_eq!(
+        value["data"]["rows"],
+        serde_json::json!([["t-0"], ["t-1"]]),
+        "{value}"
+    );
+    assert!(value["stats"].get("keyIndex").is_none(), "{value}");
+}
+
+/// A trace lookup whose parts' charge is refused runs at tier 1 and answers
+/// exactly: every object reads its suffix and its own KEY_IDX, the holder its
+/// SKIP_IDX and run too, the router does not run (`stats.keyIndex` reads
+/// `keysProbed` 0 with every part figure 0, and no route total moves), and
+/// the rows equal the routed answer.
+///
+/// FLIP: the same re-raised arm as above fails this lookup with a memory
+/// error instead of degrading it.
+#[tokio::test]
+async fn a_trace_lookup_degrades_to_tier_one_on_a_refused_parts_charge() {
+    let _serial = SERIAL.lock().await;
+    let (recorder, objects, app) = budget_fixture().await;
+    let t = trace();
+    recorder.clear();
+    let before = totals();
+    let value = sql(&app, &names_where(""), 0).await;
+    assert_eq!(delta(before, totals()), delta(before, before));
+    assert_eq!(
+        value["data"]["rows"],
+        serde_json::json!([["t-0"], ["t-1"]]),
+        "{value}"
+    );
+    // The router did not run: no key was probed against a leaf, and no part
+    // figure moved.
+    for field in [
+        "keysProbed",
+        "partsCovered",
+        "partsUncovered",
+        "partsBeyondCeiling",
+        "leavesRejected",
+        "reservationsRefused",
+        "leafGetRequests",
+        "leafWireBytes",
+        "skippedByBudget",
+        "skipIdxDropped",
+    ] {
+        assert_eq!(key_index(&value, field), 0, "{field}: {value}");
+    }
+    let mut key_idx_gets = 0;
+    for object in &objects {
+        let want = expected_reads(&object.bytes, &t);
+        key_idx_gets += want.key_index.len() as u64;
+        assert_eq!(recorder.take(&object.key), want.tier1(), "{}", object.key);
+    }
+    assert_eq!(
+        phase(&value, "keyIndex", "s3GetRequests"),
+        key_idx_gets,
+        "{value}"
+    );
+    assert_eq!(pruning(&value, "segmentsPrunedByKeyIndex"), 2, "{value}");
 }

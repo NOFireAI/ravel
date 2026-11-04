@@ -24,20 +24,26 @@ The full, normative spec of the on-disk layout is
 
 ## Bounded trace reads
 
-A `trace_id =` query decodes only the blocks that can hold the trace. The
-skip index drops every block whose `trace_id` range excludes the target.
-Each object the skip index keeps is then probed in its KEY_IDX section, which
-indexes the first 8 bytes of every trace id the object holds. The probe is
-answered by small ranged reads: the object's last 8 KiB (its footer), then
-the index directory and one bucket, at most three requests and about 11 KB
-per object, read before the object's skip index. A trace
-KEY_IDX does not find is absent
-from the object, so the object is not read further. The probe trades block
-reads for index reads: a lookup reads fewer bytes, but it can issue more
-requests, since every object the skip index keeps pays those reads
-whether or not it holds the trace. A trace it does find may
-be another trace sharing those 8 bytes; the decoded rows are matched against
-the full trace id, which removes it.
+A `trace_id =` query decodes only the blocks that can hold the trace. Every
+object no key-index leaf covers is probed in its KEY_IDX section, which
+indexes the first 8 bytes of every trace id the object holds, before its
+skip index is read. The probe is answered by small ranged reads: the
+object's last 8 KiB (its footer), then the index directory and one bucket.
+A trace KEY_IDX does not find is absent from the object, so the object is
+not read further: with a footer that fits the 8 KiB suffix that is three
+requests, the first at most 8 KiB and all three under 16 KiB, and no
+SKIP_IDX read
+(`unfolded_absent_object_costs_three_gets_under_sixteen_kib_and_no_skip_idx_read`).
+An object that
+holds the trace then reads its skip index, which drops every block whose
+`trace_id` range excludes the trace or whose bounds miss the statement's
+other predicates, and only the kept block run (the same test, and
+`a_cold_columnar_lookup_reads_only_the_routed_blocks` for the blocks a leaf
+names). The probe trades block reads for index reads: a
+lookup reads fewer bytes, but it can issue more requests, since every
+uncovered object pays those reads whether or not it holds the trace. A
+trace it does find may be another trace sharing those 8 bytes; the decoded
+rows are matched against the full trace id, which removes it.
 
 Ingest routes each span to a shard by its `trace_id`. The router hashes the
 `trace_id` with BLAKE3 and picks the shard from the hash. All spans of one
@@ -46,10 +52,15 @@ into a contiguous block run.
 
 The catalog listing at query time does not use this routing. A `trace_id =`
 query lists the segments of every shard in the matched time window, the same
-as any other query, and probes the KEY_IDX of each one the skip index keeps
-a block in. Objects KEY_IDX ruled out are counted in
-`stats.pruning.segmentsPrunedByKeyIndex`, and the KEY_IDX reads are reported
-under the `keyIndex` entry of `stats.phases`.
+as any other query. On every object no leaf covers, KEY_IDX is probed from
+the footer suffix before the skip index, and an object KEY_IDX proves the
+trace absent from never reads SKIP_IDX
+(`unfolded_absent_object_costs_three_gets_under_sixteen_kib_and_no_skip_idx_read`;
+`parts_past_the_ceiling_are_probed_at_tier_one` pins the same read order on
+the objects of a part the router left to the probe). Objects KEY_IDX ruled
+out are counted in `stats.pruning.segmentsPrunedByKeyIndex` (both tests),
+and the KEY_IDX reads are reported under the `keyIndex` entry of
+`stats.phases` (`a_trace_lookup_degrades_to_tier_one_on_a_refused_parts_charge`).
 
 ### Key-index leaves
 

@@ -2404,6 +2404,26 @@ query incurred up to that point, not zeros:
   of the fetches that had completed by then.
 - Fetches that the query did not issue before it stopped are not counted.
 
+### Key-index routing (`ravel_query_key_index_*`)
+
+Two counters cover the tier-2 key-index router, which answers an exact-key
+lookup (a spans `trace_id =` today) from the per-part key-index leaves. Every mode renders both on every scrape, for both
+`signal="spans"` and `signal="logs"` and every `outcome`, zeros included, so a
+rate over `outcome="covered"` exists before the first lookup. Neither carries
+`tenant_hash` or `workload_class`. The `logs` samples stay 0 until the logs
+scan routes its lookups.
+
+| Metric | Labels | HELP text |
+|---|---|---|
+| `ravel_query_key_index_parts_total` | `mode`, `signal`, `outcome` (`covered`, `uncovered`, `beyond_ceiling`, `rejected`, `reservation_refused`, `skipped_by_budget`) | Catalog parts the key-index router settled for an exact-key lookup, by signal and outcome: covered parts answered from their leaves; every other outcome sends the part's segments to the per-object KEY_IDX probe. |
+| `ravel_query_key_index_leaf_gets_total` | `mode`, `signal` | Key-index leaf GETs the router issued for exact-key lookups, by signal, including those of a routing pass dropped before it finished. |
+
+A single lookup's figures come back in the response's `stats.keyIndex`
+([query engine reference](../query-engine.md)). The test
+`the_metrics_page_renders_both_key_index_route_families_after_a_lookup` pins
+both HELP lines byte for byte, the label sets, and each sample's value
+against the process totals.
+
 ### Ravel Agents settings (`ravel_agents_*`)
 
 Labels: `mode` on every sample. A process built with the `agents` feature
