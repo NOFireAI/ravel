@@ -282,6 +282,16 @@ server can apply a predicate slightly differently than the one you typed.
 `query_id` for this call, and `audit_ref`, which points at the audit record
 of the call when the deployment writes one.
 
+Every query tool except `ravel_capabilities` reports a `query_id`, a random
+UUID v4 minted for the call. Each query audit record the call writes carries
+the same value as `query.id`, with `query.language = mcp:<tool>` and the
+engine surface it ran on as `query.engine_language`, so you can find the
+records of one call from its result. `ravel_find_labels` records its matcher
+set as the query text. `ravel_capabilities` reads no object storage and
+writes no audit record. The
+[reference](../reference/mcp.md#what-an-mcp-calls-audit-record-carries) lists
+the records and text of each tool.
+
 ### `visibility`
 
 The snapshot that this call read:

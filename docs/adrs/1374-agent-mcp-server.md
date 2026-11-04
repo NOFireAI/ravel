@@ -225,7 +225,9 @@ The `tools/list` result for the nine tools must serialize in less than
 6. `AuditPipeline::spawn` in `lib.rs::start` for query modes. Flags
    `--audit-mode required|best-effort` (default `required`) and
    `--audit-text`. This closes #1187. MCP tool calls submit
-   `query.language = mcp:<tool>`.
+   `query.language = mcp:<tool>`. The tool-call audit amendment records how
+   the language and a per-call id reach the record, and which tools write
+   none.
 
 ### D4. The result envelope
 
@@ -1863,3 +1865,43 @@ records what the clamp does instead.
    `max_store_requests`, `max_segments`) from every tool call.
 4. A per-tenant ceiling is follow-up work. When it lands, the clamp takes
    it as a third input, and D6's minimum of three holds as written.
+
+## Amendment (2026-11-04, #3734): the tool-call audit amendment, every audited MCP call carries `mcp:<tool>` and one call id
+
+<!-- amendment-applies: sections="D3. Engine and server prerequisites" pointer="tool-call audit amendment" -->
+
+D3 item 6 says MCP tool calls submit `query.language = mcp:<tool>`, and D4
+reserves `ids.query_id`. Before this tool-call audit amendment, every MCP
+record carried the engine's language, no record carried an id, and
+`ids.query_id` was empty on every tool, so an MCP call's record could not be
+told from the same query over HTTP or matched to the result that produced
+it.
+
+1. The adapter mints one id per tool call, a random UUID v4
+   (`services/ravel-server/src/mcp/adapter.rs`, `call_tool`). The server
+   had no query id scheme to reuse. The envelope reports it as
+   `ids.query_id`, on success and on failure, and drops the warning that
+   the field is unreported (`Envelope::report_query_id`). A call refused
+   for an unreadable budget argument is answered before the id is minted.
+2. The language and the id reach the record through an optional override
+   on the service, not through the engine paths: `QueryService::with_audit_call`
+   wraps the call's audit sink in `ravel_maintain::CallTaggingAuditSink`,
+   which sets `query.language = mcp:<tool>`, keeps the engine's language as
+   `query.engine_language`, adds `query.id`, and rewrites the body's
+   language prefix. A service built without the override, which is every
+   non-MCP caller, writes the records it wrote before. Redaction under
+   `--audit-text redacted` parses the text as `query.engine_language`.
+   Every engine call one tool call makes shares the id: `ravel_search_logs`
+   with predicates writes two records, the declared-column lookup and the
+   statement, under the same `query.id`.
+3. `ravel_capabilities` stays unaudited: it
+   answers from compile-time facts and the resolved caller and reads no
+   object storage, so there is no query to record, and it reports no
+   `ids.query_id`. Its protocol revision list is now read from the
+   transport's `SUPPORTED_REVISIONS` (`services/ravel-server/src/mcp/auth.rs`)
+   through `ToolContext::protocol_revisions`, so the answer cannot drift
+   from the revisions the transport accepts.
+4. `ravel_find_labels` records a non-empty `query.text`: its matcher set,
+   each selector in promql-parser's canonical spelling (matchers sorted),
+   joined by `, `, and `{}` for a call with no selector. A selector that
+   does not parse is recorded as sent.

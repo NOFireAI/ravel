@@ -656,7 +656,10 @@ step with a unit, whole milliseconds, the end after the start, and at most
 
 The call goes through the same service method as
 `POST /api/v1/analytics`, so admission, the deadline clamp, the usage
-record and the query audit event (language `analytics`) are the route's.
+record and the query audit event are the route's, except that the event is
+tagged as an MCP call (`query.language = mcp:ravel_analyze_timeseries`, engine
+language `analytics`; see
+[What an MCP call's audit record carries](#what-an-mcp-calls-audit-record-carries)).
 `scope` reports the range, the step alignment and the lookback as on
 `ravel_query_promql`: each step reads the latest sample in `(t - 5m, t]`,
 so the analysis is over the step values, not every stored sample.
@@ -904,6 +907,41 @@ An empty resolve is a result, not a gap in the tool.
 
 Event-time bounds are a different quantity. `coverage` reports what the data
 covers in event time.
+
+## What an MCP call's audit record carries
+
+Each query tool call is given one id, a random UUID v4, which the result
+reports as `ids.query_id`, on success and on failure. The one exception is a
+call whose budget argument cannot be read: it is refused before it is given
+an id. Every query audit record the call writes carries:
+
+| Attribute | Value |
+| --- | --- |
+| `query.language` | `mcp:<tool>`, such as `mcp:ravel_query_sql`. |
+| `query.engine_language` | The engine surface the call ran on: `sql`, `promql`, `analytics`, `label_values`, `labels` or `describe_data`. |
+| `query.id` | The call's id, equal to the result's `ids.query_id`. |
+| `query.text` | Per tool, below. |
+
+`body` starts with the `mcp:<tool>` language in place of the engine's
+(`mcp:ravel_query_sql query ok`). The tenant, status, window and principal
+attributes are the engine surface's, as the [audit guide](../guides/audit.md)
+describes them, and so is redaction: under `--audit-text redacted` the text
+is parsed as the engine language, not as `mcp:<tool>`.
+
+| Tool | Records | `query.text` |
+| --- | --- | --- |
+| `ravel_capabilities` | None. It answers from compile-time facts and the resolved caller and reads no object storage, so it writes no record and its `ids.query_id` stays empty with the usual warning. | None. |
+| `ravel_describe_data` | One. | `describe_data signal=<signal> after_name=<name> limit=<n>`. |
+| `ravel_find_labels` | One. | The matcher set: each selector in its canonical PromQL spelling, with matchers sorted, joined by `, `; `{}` when the call names no selector. |
+| `ravel_explain_query`, `ravel_query_sql` | One. | The SQL statement. |
+| `ravel_query_promql`, `ravel_analyze_timeseries` | One. | The PromQL expression. |
+| `ravel_search_logs` | One, or two when the call has `predicates`: the declared-column lookup (`describe_data`) and then the statement (`sql`). Both carry the same `query.id`. | The engine call's own text. |
+| `ravel_get_trace` | One. | The trace statement. |
+
+A call refused before it reaches the query service, such as one with an
+invalid argument, writes no record; its result still reports the id. The Ravel Agents tools do not
+run through the query service, so this section does not apply to them and
+their `ids.query_id` stays empty.
 
 ## Failure classes
 

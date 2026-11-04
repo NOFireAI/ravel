@@ -1639,6 +1639,36 @@ mod tests {
 
     use super::*;
 
+    /// A reported id fills `ids.query_id` and removes only that field's
+    /// warning; the other identity warnings and the caller's own stay, the
+    /// envelope does not grow, and an empty id changes nothing.
+    #[test]
+    fn report_query_id_replaces_only_the_query_id_warning() {
+        let mut envelope = Envelope::default();
+        envelope.warnings.push("caller warning".to_string());
+        let finished = envelope.finish(true);
+        let before_len = serialized_len(&finished);
+        let unchanged = finished.clone().report_query_id("");
+        assert_eq!(
+            serde_json::to_value(&unchanged).expect("serializes"),
+            serde_json::to_value(&finished).expect("serializes")
+        );
+
+        let id = "0b4f3a52-6c1e-4d5b-9a07-2f8e1c3d4b5a";
+        let reported = finished.report_query_id(id);
+        assert_eq!(reported.ids.query_id, id);
+        assert_eq!(
+            reported.warnings,
+            [
+                "visibility.snapshot_id is not reported by this operation",
+                "visibility.ingest_watermark_hour is not reported by this operation",
+                "ids.audit_ref is not reported by this operation",
+                "caller warning",
+            ]
+        );
+        assert!(serialized_len(&reported) <= before_len);
+    }
+
     fn envelope_with_rows(row_count: usize, cell: impl Fn(usize) -> Row) -> Envelope {
         let mut envelope = Envelope::default();
         envelope.data.columns = vec![Column {

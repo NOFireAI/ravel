@@ -189,7 +189,14 @@ under a lost key stay readable, but they do not correlate with later records.
 #### Attributes
 
 - `query.language`: the surface that produced the record: `sql`, `esql`, `promql`,
-  `labels`, `label_values`, `series`, `analytics`, or `exemplars`.
+  `labels`, `label_values`, `series`, `analytics`, or `exemplars`, or
+  `mcp:<tool>` for an MCP tool call, such as `mcp:ravel_query_sql`.
+- `query.engine_language` and `query.id`: written on MCP tool call records
+  only. `query.engine_language` is the engine surface the call ran on (one of
+  the values above), and `query.id` is the call's id, the same value the tool
+  result reports as `ids.query_id`. Every record of one tool call carries the
+  same `query.id`. See
+  [What an MCP call's audit record carries](../reference/mcp.md#what-an-mcp-calls-audit-record-carries).
 - `query.tenant`: the hex hash of the resolved tenant. The record names the
   tenant that Ravel authenticated, whatever identity the client claimed.
 - `query.status`: `ok` or `error`, the outcome of the request, or `attempted`.
@@ -247,6 +254,7 @@ statements and not records, leave out the `attempted` rows.
 | `promql`, `analytics` | The PromQL expression. |
 | `labels`, `label_values`, `series` | The joined selector list. |
 | `exemplars` | The selector. |
+| `mcp:<tool>` | The text of the engine surface named by `query.engine_language`, except `ravel_find_labels`, which records its matcher set. |
 
 The window attributes hold this range for each surface:
 
