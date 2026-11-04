@@ -757,8 +757,21 @@ of each field.
 }
 ```
 
-Integers and timestamps travel as JSON strings for every value, whatever
-its magnitude, so parse them as strings.
+Which figures are JSON strings and which are JSON numbers:
+
+- Strings: every integer and timestamp cell in `data.rows`, whatever its
+  magnitude; a float cell that is NaN or infinite (`"NaN"`, `"+Inf"`,
+  `"-Inf"`); `scope.time_range.start_ns` and `end_ns`; and
+  `visibility.ingest_watermark_hour`. Parse these as strings.
+- Numbers: a finite float cell; `data.row_count`; every count and size in
+  `presentation` (`max_rows`, `rows_omitted`, `cells_truncated`,
+  `metadata_elided`, `entries_truncated`, `scalars_truncated`,
+  `effective_max_response_bytes`); and every figure in `budget.effective`,
+  `budget.actual` and `budget.estimate`, each of which is `null` instead
+  where it is unlimited or unbounded.
+
+A tool section below names any other string-encoded field its own `data`
+carries, such as the PromQL samples' `ts_ns`.
 
 `accuracy.lower_bound_count` is reserved and always `false`; no tool sets
 it. A `COUNT` over `logs` or `spans` can include a row an at-least-once
@@ -907,8 +920,8 @@ covers in event time.
 | `unavailable` | A transient storage or catalog fault. Retryable. |
 | `snapshot_invalidated` | The pinned snapshot was invalidated by concurrent maintenance. Retryable once. |
 | `cursor_expired` | The cursor's minting process or its deadline is gone, or an erasure it did not pin now reaches its signal and time range, or a `ravel_query_sql` walk ordered by a value computed from other rows resolved a different segment set than page one. |
-| `cursor_invalid` | The cursor does not match the tenant, the tool, or the arguments presented with it. |
-| `internal` | A server-side fault, including corrupt stored data. Not retryable. The message is fixed and carries no storage detail. |
+| `cursor_invalid` | The cursor is over 1 MiB, does not decode, fails its integrity check, or does not match the tenant, the tool, or the arguments presented with it. [Redemption](#redemption) has the order of the checks. |
+| `internal` | A server-side fault, including corrupt stored data. Not retryable. The message is not fixed: a fault the query service reports carries the service's own message, and a fault in the MCP layer formats its cause into the message, such as the analytic that failed, an estimate component it did not recognise, a result-encoding error, or a trace row that did not have the shape expected. |
 
 A failure is a tool result with an error marker set, not a transport-level
 error, so the calling model can read `next_steps` and correct itself.
@@ -973,8 +986,23 @@ compare. Whether a pinned token is still satisfiable is the catalog's answer
 at resolve time.
 
 Only the process that minted a cursor can redeem it, so a load balancer
-needs sticky routing to a paging client. A tampered or wrong-tenant token
-fails with `cursor_invalid`.
+needs sticky routing to a paging client. Before either step, the server
+checks the token in this order and stops at the first failure:
+
+1. A token over 1 MiB is refused unread, with `cursor_invalid`.
+2. A token that is not valid base64, is too short, or carries another
+   format's magic or version fails with `cursor_invalid`.
+3. A token whose process field names another process fails with
+   `cursor_expired`, without its integrity check: the process that minted
+   it has restarted or is another replica, or the field was edited. The
+   integrity check covers that field, so editing it can only turn the
+   holder's own token into one no process redeems.
+4. A token that fails its integrity check under this process's key, because
+   any other byte was altered, fails with `cursor_invalid`, and so does a
+   body that does not parse.
+5. A cursor sent back for another tenant, to another tool, or with
+   arguments that hash differently fails with `cursor_invalid`.
+6. The four [expiry](#expiry) cases follow, each `cursor_expired`.
 
 ### Expiry
 
@@ -1149,7 +1177,15 @@ build. What each tool does with an `evidence_ref` argument today:
 | --- | --- |
 | `ravel_query_sql`, `ravel_query_promql`, `ravel_search_logs`, `ravel_get_trace`, `ravel_analyze_timeseries` | Listed in the input schema, and refused with `unsupported` |
 | `ravel_find_labels` | Not in the input schema, and refused with `invalid_argument` |
-| `ravel_capabilities`, `ravel_describe_data`, `ravel_explain_query`, and the six Ravel Agents tools | Not in the input schema. Accepted and ignored, like any argument the schema does not list |
+| `ravel_capabilities`, `ravel_describe_data`, `ravel_explain_query`, and the six Ravel Agents tools | Not in the input schema. Accepted and ignored |
+
+Not every argument a schema does not list is ignored. The server reads the
+six budget arguments (`max_rows`, `max_response_bytes`, `deadline_ms`,
+`max_bytes_scanned`, `max_store_requests`, `max_segments`) from every tool
+call before the tool runs, the Ravel Agents tools included, whether or not
+the tool's schema lists them. One with the wrong type refuses the call with
+`invalid_argument`; a well-typed one is clamped into the call's effective
+budget.
 
 The rest of this section describes the design. Redeeming a reference
 re-executes the tool with the reference's own arguments. The re-execution runs against the reference's
@@ -1168,21 +1204,26 @@ failure.
 
 | Budget | Default | Ceiling or floor | Caller can lower |
 | --- | --- | --- | --- |
-| `deadline` | set by the server | server ceiling | yes |
+| `deadline_ms` | set by the server | server ceiling | yes |
 | `max_rows` | 200 | ceiling 5,000 | yes |
 | `max_bytes_scanned` | server ceiling | server ceiling | yes |
 | `max_store_requests` | server ceiling | server ceiling | yes |
 | `max_response_bytes` | 512 KiB | floor 256 KiB | yes, raised to the floor if lower |
-| `max_response_bytes` ceiling | 4 MiB | an operator may configure a lower one | no; a larger request clamps to it |
+| `max_response_bytes` ceiling | 4 MiB | fixed; the server builds its MCP budget configuration from defaults and has no setting to lower it | no; a larger request clamps to it |
 | cursor or evidence token length | 1 MiB | fixed | no; a longer token is refused unread |
 | `presentation.cursor` in the envelope | 4 KiB | fixed | no; a cursor over its bound is dropped, as an `internal` failure on an otherwise-successful result and as a counted drop with a warning on one that already failed; `ravel_query_sql` mints none over it and ends the page `ok_bounded` |
 | metric families per `ravel_describe_data` page | 100 | fixed | no |
 | segments admitted for `ravel_find_labels` resolution | 2,000 | fixed | no |
 | tokens in a SQL statement | 1,000 | fixed | no; a statement over it is refused before it is parsed, as `validation` |
 
-The effective budget for a call is the smallest of the server's ceiling,
-the tenant's ceiling, and the value the caller sent. A caller can never
-raise a value past its ceiling.
+The effective budget for a call is the smaller of the server's ceiling and
+the value the caller sent, or the default when the caller sent none. The
+server's ceilings come from two server-wide configurations: the query
+engine configuration bounds `deadline_ms`, `max_bytes_scanned`,
+`max_store_requests` and `max_segments`, and the MCP budget configuration
+bounds `max_response_bytes`. `max_rows` has the fixed 5,000 ceiling. No
+per-tenant ceiling applies in this build. A caller can never raise a value
+past its ceiling.
 
 The deadline bounds the whole tool call and is measured from the call's
 start. A tool that makes more than one service call runs each under what
@@ -1201,7 +1242,18 @@ against the server's allowed-origins configuration on every request.
 | Revision | Handshake | Headers this revision requires | Session |
 | --- | --- | --- | --- |
 | `2026-07-28` | none | `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` | none; each call stands alone |
-| `2025-11-25` | `initialize` | `MCP-Protocol-Version` required, not `Mcp-Method` or `Mcp-Name` | `Mcp-Session-Id`, held in server memory |
+| `2025-11-25` | `initialize` | none checked; `Mcp-Method` and `Mcp-Name` are not compared | `Mcp-Session-Id`, held in server memory |
 
-A request that mismatches its own revision's header rule will fail before
-the tool layer runs.
+The server checks these headers before the tool layer runs, and a refusal
+is HTTP 400:
+
+- A request with no `MCP-Protocol-Version` header is not refused. It is
+  read as a client of the older revision, whose header checks are none.
+- A `MCP-Protocol-Version` header that is not valid text, or that names a
+  revision not in the table, is refused.
+- On `2025-11-25`, no other header is checked.
+- On `2026-07-28`, a body that is not a single JSON-RPC request object, and
+  an `initialize` request, are not checked further. Any other request must
+  carry an `Mcp-Method` header equal to its method. When its `params` carry
+  a `name`, it must also carry an `Mcp-Name` header equal to that name;
+  without one, `Mcp-Name` is not required.

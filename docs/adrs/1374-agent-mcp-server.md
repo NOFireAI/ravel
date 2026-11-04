@@ -422,8 +422,9 @@ key, a tenant name, or a credential.
 ### D6. Budgets
 
 The effective budget is the minimum of the server ceiling, the enforced
-tenant ceiling, and the caller value. A caller can lower `deadline`,
-`max_rows`, `max_bytes_scanned`, `max_store_requests`, and
+tenant ceiling, and the caller value. (No per-tenant ceiling is applied in
+this phase; see the budget-ceiling amendment below.) A caller can lower
+`deadline`, `max_rows`, `max_bytes_scanned`, `max_store_requests`, and
 `max_response_bytes`. A caller cannot raise a ceiling.
 `ravel_explain_query` returns the estimate beside the effective budget. When
 the estimate exceeds the budget, the tool returns
@@ -1833,3 +1834,32 @@ matters and gives the count order its cursor back.
 6. The ClickBench corpus, with each trailing row limit set aside, plans 22
    of its 43 statements as pages again (6 answer `OrderTermFromOtherRows`),
    from the 1 and 27 of the other-rows order amendment's item 4.
+
+## Amendment (2026-11-04, #3755): the budget-ceiling amendment, the effective budget applies no per-tenant ceiling
+
+<!-- amendment-applies: sections="D6. Budgets" pointer="budget-ceiling amendment" -->
+
+Finding S9 of review #1388. D6 makes the effective budget the minimum of
+the server ceiling, the enforced tenant ceiling, and the caller value. No
+per-tenant ceiling is implemented in this phase: the Context table already
+records the `--limits-file` per-tenant query budgets as parsed and inert,
+and nothing feeds them to the MCP layer. This budget-ceiling amendment
+records what the clamp does instead.
+
+1. `McpRequestBudgets::clamp` (`crates/ravel-mcp/src/budget.rs`) takes
+   two inputs besides the caller's values, both server-wide: the query
+   engine's `EngineConfig`, which bounds the deadline, `max_bytes_scanned`,
+   `max_store_requests` and `max_segments`, and `McpBudgetConfig`, which
+   bounds `max_response_bytes`. `max_rows` is bounded by the fixed
+   `MAX_ROWS_CEILING` of 5,000. The adapter calls it with the same two
+   configurations on every tool call, whatever the tenant
+   (`services/ravel-server/src/mcp/adapter.rs`, `call_tool`).
+2. The server builds `McpBudgetConfig` from its defaults, so the
+   `max_response_bytes` ceiling is the fixed 4 MiB `MAX_RESPONSE_BYTES_CEILING`
+   and no setting lowers it.
+3. The caller's deadline argument is `deadline_ms`, and `max_segments` is
+   lowerable too: the adapter reads all six budget arguments (`max_rows`,
+   `max_response_bytes`, `deadline_ms`, `max_bytes_scanned`,
+   `max_store_requests`, `max_segments`) from every tool call.
+4. A per-tenant ceiling is follow-up work. When it lands, the clamp takes
+   it as a third input, and D6's minimum of three holds as written.
