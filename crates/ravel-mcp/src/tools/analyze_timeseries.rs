@@ -389,7 +389,8 @@ mod tests {
 
     use super::*;
     use crate::cursor::{CURSOR_KEY_LEN, CursorKey};
-    use crate::envelope::{Column, Row, Status};
+    use crate::envelope::row_cap_sweep::assert_finished_inside_cap;
+    use crate::envelope::{Column, MAX_RESPONSE_BYTES_FLOOR, Row, Status};
     use crate::tools::promql_range::MAX_RANGE_POINTS;
     use crate::tools::tests::{Stub, block_on, test_context};
 
@@ -798,6 +799,38 @@ mod tests {
             );
             assert!(text.ends_with("1000 of 1000 series downsampled"), "{text}");
         }
+    }
+
+    /// Thirteen series cut to one by `max_rows`, the kept one named with
+    /// `len` bytes, packed right up to the byte cap: the response stays
+    /// inside the cap once the 12 omitted series, `row_cap_hit` and the
+    /// `ok_bounded` status they make are written.
+    ///
+    /// FLIP: fitting with `fit` and folding the row cap in afterwards puts
+    /// the widest of these 8 B over the cap: `rows_omitted` goes from `0` to
+    /// `12` and the status from `ok` to `ok_bounded`.
+    #[test]
+    fn a_row_capped_result_at_its_byte_cap_finishes_inside_it() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_rows = 1;
+        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
+        let run_with = |len: usize| {
+            let names: Vec<String> = (0..13)
+                .map(|n| if n == 0 { "x".repeat(len) } else { format!("s{n:02}") })
+                .collect();
+            let series: Vec<(&str, u64, bool)> =
+                names.iter().map(|name| (name.as_str(), 60, false)).collect();
+            let mut answer = change_point_rows(&series);
+            answer.visibility.resolved_no_segments = true;
+            let stub = answering(vec![Ok(answer)]);
+            block_on(run(
+                args(START_NS, END_NS, "15s", "change_point"),
+                &ctx,
+                &stub,
+            ))
+        };
+        assert_finished_inside_cap(MAX_RESPONSE_BYTES_FLOOR, 12, run_with);
     }
 
     /// Partial coverage is refused: the service's refusal is rewritten to

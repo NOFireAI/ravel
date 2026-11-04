@@ -568,6 +568,7 @@ mod tests {
     use super::*;
     use crate::budget::{McpBudgetConfig, McpRequestBudgets};
     use crate::cursor::{CURSOR_KEY_LEN, CursorKey, GRACE_NS, SegmentSetPin};
+    use crate::envelope::row_cap_sweep::assert_finished_inside_cap;
     use crate::envelope::{Cell, Column, MAX_RESPONSE_BYTES_FLOOR, Status};
 
     const TOOL: &str = "ravel_query_sql";
@@ -782,6 +783,41 @@ mod tests {
         );
         assert_eq!(partial.status, Status::OkBounded);
         assert!(!partial.warnings.iter().any(|w| w.starts_with("no cursor")));
+    }
+
+    /// 10,001 rows cut to one by `max_rows`, the kept one `len` bytes wide,
+    /// packed right up to the byte cap with no identity field reported: the
+    /// page stays inside the cap once the 10,000 omitted rows are counted.
+    ///
+    /// FLIP: fitting with `fit` and adding the row cap's count afterwards
+    /// puts the widest of these 3 B over the cap: `rows_omitted` goes from
+    /// `0` to `10000` against one byte of slack in the identity allowance.
+    #[test]
+    fn a_row_capped_page_at_its_byte_cap_finishes_inside_it() {
+        let run_with = |len: usize| {
+            let mut envelope = Envelope::default();
+            envelope.data.columns = vec![Column {
+                name: "body".to_owned(),
+                r#type: "string".to_owned(),
+            }];
+            envelope.data.rows = (0..10_001)
+                .map(|i| vec![Cell::Str(if i == 0 { "x".repeat(len) } else { String::new() })])
+                .collect();
+            envelope.data.row_count = 10_001;
+            Draft::new(
+                envelope,
+                Err(NoCursorSignal::ParquetJoin),
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                NOW_NS,
+            )
+            .finish_page(&budgets(1), &scope(), PageOrder::Partial, |_, _, _| {
+                panic!("a partial order must not reach the mint")
+            })
+        };
+        assert_finished_inside_cap(MAX_RESPONSE_BYTES_FLOOR, 10_000, run_with);
     }
 
     /// Under both caps the result is complete: `ok`, no cursor, and the mint

@@ -385,16 +385,15 @@ async fn events<B: AgentsBackend>(args: Value, ctx: &ToolContext<'_>, backend: &
     let next_cursor = scalar_text(&body["next_cursor"]);
 
     // The fit measures the envelope with a stand-in cursor as wide as any
-    // cursor this page can end with, and with the resume step an `ok` page
-    // carries; a page that is not `ok` loses the step again, which only
-    // shrinks it.
+    // cursor this page can end with, or as the `null` an unpaged one ends
+    // with, and with the resume step an `ok` page carries; a page that is
+    // not `ok` loses the step again, which only shrinks it.
     let input_cursor = input.cursor.clone().unwrap_or_default();
     let widest_cursor = seqs
         .iter()
         .chain([&next_cursor, &input_cursor])
         .map(|cursor| serialized_str_len(cursor))
-        .max()
-        .unwrap_or(2)
+        .fold("null".len(), usize::max)
         .min(CURSOR_BOUND);
     envelope.presentation.cursor = Some("c".repeat(widest_cursor.saturating_sub(2)));
     if !envelope.presentation.row_cap_hit {
@@ -732,6 +731,7 @@ mod tests {
 
     use super::*;
     use crate::cursor::{CURSOR_KEY_LEN, CursorKey};
+    use crate::envelope::{MAX_RESPONSE_BYTES_FLOOR, serialized_len};
     use crate::tools::tests::test_context;
 
     /// A backend that records every call and answers one canned reply.
@@ -1050,6 +1050,66 @@ mod tests {
             envelope["presentation"]["rows_omitted"],
             json!(150 - rows.len())
         );
+    }
+
+    /// One event whose payload is `len` bytes wide, answered as a short page,
+    /// under the smallest byte cap a call can resolve to.
+    fn events_at_the_floor(len: usize, terminal: Option<&str>) -> Envelope {
+        let key = CursorKey::from_process_secret([7u8; CURSOR_KEY_LEN]);
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
+        let mut body = json!({"events": [{"event_seq": 1, "accept_seq": 1, "turn_id": "t",
+                              "event_type": "e", "payload": {"blob": "x".repeat(len)}}],
+                              "next_cursor": "1"});
+        if let Some(terminal) = terminal {
+            body["terminal"] = json!(terminal);
+        }
+        block_on(dispatch_agents(
+            "ravel_agent_events",
+            agent_args(),
+            &ctx,
+            &Canned::new(200, body),
+        ))
+        .expect("an agents tool name routes")
+    }
+
+    /// An `ok` events page packed to its byte cap still carries its resume
+    /// step and stays inside the cap: the step is in what the fit measured.
+    /// Pushing it after `finish`, as the tool used to, puts the page over the
+    /// cap at the widest payload the cap leaves alone.
+    #[test]
+    fn an_ok_events_page_at_its_byte_cap_keeps_its_resume_step_inside_it() {
+        let cap = MAX_RESPONSE_BYTES_FLOOR as usize;
+        for terminal in [None, Some("completed")] {
+            let run_with = |len| events_at_the_floor(len, terminal);
+            let (mut lo, mut hi) = (0usize, cap);
+            assert!(!run_with(lo).presentation.bytes_cap_hit, "cut at 0");
+            assert!(run_with(hi).presentation.bytes_cap_hit, "not cut at {hi}");
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if run_with(mid).presentation.bytes_cap_hit {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            let mut widest = 0;
+            for len in lo.saturating_sub(16)..=lo {
+                let envelope = run_with(len);
+                assert_eq!(envelope.status, Status::Ok, "len {len}");
+                assert_eq!(envelope.presentation.cursor, None, "len {len}");
+                let actions: Vec<&str> = envelope
+                    .next_steps
+                    .iter()
+                    .map(|next| next.action.as_str())
+                    .collect();
+                assert_eq!(actions, [RESUME_STEP], "len {len}");
+                let size = serialized_len(&envelope);
+                assert!(size <= cap, "len {len}: {size} B, over the {cap} B cap");
+                widest = widest.max(size);
+            }
+            assert!(widest + 16 >= cap, "the sweep peaked at {widest} B");
+        }
     }
 
     #[test]

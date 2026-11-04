@@ -569,7 +569,8 @@ mod tests {
 
     use super::*;
     use crate::cursor::{CURSOR_KEY_LEN, CursorKey};
-    use crate::envelope::Status;
+    use crate::envelope::row_cap_sweep::assert_finished_inside_cap;
+    use crate::envelope::{MAX_RESPONSE_BYTES_FLOOR, Status};
     use crate::tools::tests::{Stub, block_on, test_context};
 
     /// 1000 s and 1060 s after the epoch, in nanoseconds.
@@ -943,6 +944,40 @@ mod tests {
             };
             assert_eq!(samples["value"], json!([0.0, 1.0, 2.0, 3.0]));
         }
+    }
+
+    /// An answer that is not sample rows (a scalar or string result) skips
+    /// the series fit and goes to `fit` whole. Thirteen such rows cut to one
+    /// by `max_rows`, the kept one `len` bytes wide, packed right up to the
+    /// byte cap: the response stays inside the cap once the 12 omitted rows,
+    /// `row_cap_hit` and the `ok_bounded` status they make are written.
+    ///
+    /// FLIP: fitting with `fit` and folding the row cap in afterwards puts
+    /// the widest of these 8 B over the cap: `rows_omitted` goes from `0` to
+    /// `12` and the status from `ok` to `ok_bounded`.
+    #[test]
+    fn a_row_capped_answer_at_its_byte_cap_finishes_inside_it() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_rows = 1;
+        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
+        let run_with = |len: usize| {
+            let mut answer = Envelope::default();
+            answer.data.columns = vec![Column {
+                name: "value".to_string(),
+                r#type: "string".to_string(),
+            }];
+            answer.data.rows = (0..13)
+                .map(|n| vec![Cell::Str(if n == 0 { "x".repeat(len) } else { n.to_string() })])
+                .collect();
+            answer.data.row_count = 13;
+            answer.coverage.complete = true;
+            answer.visibility.resolved_no_segments = true;
+            let stub = answering(vec![Ok(answer)]);
+            let instant = json!({"query": "m", "evaluation_time": START_NS.to_string()});
+            block_on(run(instant, &ctx, &stub))
+        };
+        assert_finished_inside_cap(MAX_RESPONSE_BYTES_FLOOR, 12, run_with);
     }
 
     /// A range one step over [`MAX_RANGE_POINTS`] is `invalid_argument`
