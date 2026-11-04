@@ -287,6 +287,11 @@ impl ServerHandler for RavelMcp {
                 Some(route) => dispatch_agents(&request.name, args, &ctx, route)
                     .await
                     .ok_or_else(|| ToolError::UnknownTool(request.name.to_string())),
+                // `ravel_capabilities` reads no storage and writes no audit
+                // record, so an id would name a record that does not exist.
+                None if request.name == "ravel_capabilities" => {
+                    dispatch(&request.name, args, &ctx, &backend).await
+                }
                 None => dispatch(&request.name, args, &ctx, &backend)
                     .await
                     .map(|envelope| envelope.report_query_id(&query_id)),
