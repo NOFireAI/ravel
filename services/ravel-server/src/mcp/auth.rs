@@ -49,11 +49,10 @@ const MCP_METHOD: HeaderName = HeaderName::from_static("mcp-method");
 /// SEP-2243's target name (for `tools/call`, the tool), restated as a header.
 const MCP_NAME: HeaderName = HeaderName::from_static("mcp-name");
 
-/// The revisions this adapter serves: the current one and the last legacy one.
-/// A request naming any other revision is refused rather than served under a
-/// revision it did not ask for.
-pub(crate) static SUPPORTED_REVISIONS: [ProtocolVersion; 2] =
-    [ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25];
+/// The revisions this adapter serves, the same list `ravel_capabilities`
+/// reports. A request naming any other revision is refused rather than served
+/// under a revision it did not ask for.
+pub(crate) use ravel_mcp::tools::capabilities::SUPPORTED_REVISIONS;
 
 /// The principal this request's credential resolved to, carried in the
 /// request extensions from this module to the tool handler: its tenant scopes
@@ -145,7 +144,7 @@ async fn read_body(auth: &McpAuth, body: Body) -> Result<Bytes, ApiError> {
 /// `2026-07-28`'s own addition), and an `initialize` is exempt on every
 /// revision: it is the message that establishes which revision applies, so it
 /// cannot be judged against one.
-fn check_standard_headers(headers: &HeaderMap, body: &Bytes) -> Result<(), ApiError> {
+pub(super) fn check_standard_headers(headers: &HeaderMap, body: &Bytes) -> Result<(), ApiError> {
     let revision = match headers.get(PROTOCOL_VERSION) {
         None => return Ok(()),
         Some(value) => value

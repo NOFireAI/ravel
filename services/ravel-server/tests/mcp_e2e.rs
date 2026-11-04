@@ -3879,12 +3879,21 @@ mod with_mcp {
             );
         }
 
-        let analytics_records = query_audit_records(store.as_ref())
-            .await
+        // The MCP calls' records name the tool in `query.language` and keep
+        // the engine's in `query.engine_language`; the HTTP call's does not.
+        let records = query_audit_records(store.as_ref()).await;
+        let mcp_records = records
+            .iter()
+            .filter(|row| {
+                audit_attr(row, "query.language") == Some("mcp:ravel_analyze_timeseries")
+                    && audit_attr(row, "query.engine_language") == Some("analytics")
+            })
+            .count();
+        let http_records = records
             .iter()
             .filter(|row| audit_attr(row, "query.language") == Some("analytics"))
             .count();
-        assert_eq!(analytics_records, 3);
+        assert_eq!((mcp_records, http_records), (2, 1));
 
         client.cancel().await.expect("client stops");
         running.shutdown().await.expect("server stops");
