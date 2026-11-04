@@ -943,18 +943,21 @@ def cmd_call(args):
     else:
         line["outcome"] = "error"
         line["error"] = (raw or b"")[:500].decode("utf-8", "replace")
+    if code is None:
+        # No calls.jsonl line here: the caller (run.sh statements()) checks
+        # whether the server process is still alive, and either records this
+        # try itself (a dead server, richer diagnostic: signal, restart, kept
+        # log) or treats it as an ordinary unreachable-server failure. Either
+        # way, writing a line here would duplicate whichever one it writes.
+        print(f"{plan['statement']} ({plan['state']}, {plan['temp']} try {plan['try']}): "
+              f"connection failed: {line['error'][:200]}", file=sys.stderr)
+        sys.exit(75)
     append_line(args.calls, line)
     if line["outcome"] != "ok":
         # The error is on record for evaluate.py; only a server that did not
         # answer at all stops the run.
         print(f"{plan['statement']} ({plan['state']}, {plan['temp']} try {plan['try']}): "
               f"HTTP {code}: {line['error'][:200]}", file=sys.stderr)
-        if code is None:
-            # Distinct from any other non-zero exit: the caller (run.sh
-            # statements()) checks whether the server process is still alive
-            # before deciding this is a dead server rather than an ordinary
-            # unreachable-server failure.
-            sys.exit(75)
 
 
 def cmd_unsupported(args):

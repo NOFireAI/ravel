@@ -861,8 +861,11 @@ record_server_death() {
 # follows a server restart; an inflight call (--temp inflight) does not. Past
 # the run deadline every remaining call is recorded not-run, unsent. A call
 # whose server died (inv.py call exit 75, and the process is actually gone)
-# is recorded server_died and retried after a restart; three deaths on the
-# same call fail the state (state_failed; run_states goes on).
+# is recorded server_died, the server is restarted, and the loop moves on to
+# the next planned call; the dead try itself is not retried. Three deaths
+# across one statement's own tries (an intervening success does not reset
+# the count; moving on to a different statement's calls does) fail the
+# state (state_failed; run_states goes on).
 statements() {
   local state="$1" plan="$WORK/plan-$1.jsonl" line flags=() deadline=$((RUN_START + RUN_MAX_MINUTES * 60))
   shift
@@ -878,31 +881,41 @@ statements() {
       "$RQ_STATS" "$RUN_MAX_MINUTES"
     return 0
   fi
+  local death_statement="" deaths=0 just_restarted=0 stmt code
   while IFS= read -r line; do
+    stmt="$(line_statement "$line")"
+    [ "$stmt" = "$death_statement" ] || { death_statement="$stmt"; deaths=0; }
     case "$line" in
       *'"unsupported_reason"'* | *'"not_run_reason"'*) ;;
-      *'"temp": "cold"'*) [ "$(date +%s)" -ge "$deadline" ] || restart_for "$line" ;;
+      *'"temp": "cold"'*)
+        if [ "$just_restarted" = 1 ]; then
+          just_restarted=0
+        else
+          [ "$(date +%s)" -ge "$deadline" ] || restart_for "$line"
+        fi
+        ;;
     esac
-    local deaths=0 code
-    while :; do
-      code=0
-      "$PY" "$LIB" call --line "$line" --server "http://127.0.0.1:$HTTP_PORT" --auth-dir "$AUTH_DIR" \
-        --pid "${SERVER_PID:-0}" --calls "$CALLS" --deadline-unix-s "$deadline" ${flags[@]+"${flags[@]}"} \
-        || code=$?
-      [ "$code" = 0 ] && break
-      # 75 (inv.py call's own code): the connection failed. A server still
-      # alive and merely unreachable (a hung request, a refused connection
-      # with the process up) is the old, ordinary failure; only an actually
-      # dead server is retried.
-      [ "$code" = 75 ] && ! kill -0 "${SERVER_PID:-0}" 2>/dev/null || fail "call against an unreachable server"
-      deaths=$((deaths + 1))
-      record_server_death "$line" "$deaths"
-      if [ "$deaths" -ge 3 ]; then
-        failed_at "server died 3 times during $(line_statement "$line")" 75 ""
-        return 1
-      fi
-      restart_for "$line"
-    done
+    code=0
+    "$PY" "$LIB" call --line "$line" --server "http://127.0.0.1:$HTTP_PORT" --auth-dir "$AUTH_DIR" \
+      --pid "${SERVER_PID:-0}" --calls "$CALLS" --deadline-unix-s "$deadline" ${flags[@]+"${flags[@]}"} \
+      || code=$?
+    [ "$code" = 0 ] && continue
+    # 75 (inv.py call's own code): the connection failed, and inv.py wrote no
+    # calls.jsonl line for it. A server still alive and merely unreachable (a
+    # hung request, a refused connection with the process up) is the old,
+    # ordinary failure; only an actually dead server is recorded and moved
+    # past, not retried: the try is lost (missing from calls.jsonl's view of
+    # it, present in the server_died line evaluate.py reads instead), and the
+    # loop goes on to the next planned call rather than repeating this one.
+    [ "$code" = 75 ] && ! kill -0 "${SERVER_PID:-0}" 2>/dev/null || fail "call against an unreachable server"
+    deaths=$((deaths + 1))
+    record_server_death "$line" "$deaths"
+    if [ "$deaths" -ge 3 ]; then
+      failed_at "server died 3 times during $stmt" 75 ""
+      return 1
+    fi
+    restart_for "$line"
+    just_restarted=1
   done <"$plan"
   return 0
 }
