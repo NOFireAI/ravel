@@ -198,6 +198,7 @@ fail() {
   mkdir -p "$OUT"
   printf 'FAILED step=%s at=%s: %s\n' "$CURRENT_STEP" "$(utc_now)" "$*" >"$OUT/FAILED"
   if [ "$LANE" = s3 ]; then
+    keep_run_log
     upload_out && upload_marker FAILED
     terminate_self
   fi
@@ -361,16 +362,29 @@ load_config() {
 # it, with frame pointers, into the shared target; its output goes to
 # out/build-NAME.log so a failed build travels with the FAILED marker.
 build_pkg() {
-  local name="$1" src="$BOX_ROOT/ravel" target="$BOX_ROOT/target-fp"
+  local name="$1"
   shift
+  # One command for the dry run and the real run, so the dry run shows the
+  # directory the build runs in (env -C: coreutils 8.28 and later; Amazon
+  # Linux 2023 ships 9.x).
+  local cmd=(env -C "$BOX_ROOT/ravel" CARGO_TARGET_DIR="$BOX_ROOT/target-fp" RUSTFLAGS="-C force-frame-pointers=yes"
+    cargo build --release --locked "$@")
   if [ "$DRY_RUN" = 1 ]; then
-    run env CARGO_TARGET_DIR="$target" RUSTFLAGS="-C force-frame-pointers=yes" \
-      cargo build --release --locked "$@"
+    run "${cmd[@]}"
     return 0
   fi
   mkdir -p "$OUT"
-  (cd "$src" && env CARGO_TARGET_DIR="$target" RUSTFLAGS="-C force-frame-pointers=yes" \
-    cargo build --release --locked "$@") >"$OUT/build-$name.log" 2>&1
+  run "${cmd[@]}" >"$OUT/build-$name.log" 2>&1
+}
+
+# keep_run_log: copy the box's own run.log (launch.sh's user-data redirects
+# run.sh's output there, outside out/) into out/, so one upload carries
+# whatever a FAILED marker names.
+keep_run_log() {
+  [ "$LANE" = s3 ] && [ "$DRY_RUN" = 0 ] || return 0
+  [ -f "$BOX_ROOT/run.log" ] || return 0
+  mkdir -p "$OUT"
+  cp "$BOX_ROOT/run.log" "$OUT/run.log" 2>/dev/null || true
 }
 
 step_bootstrap() {
@@ -978,6 +992,7 @@ finish() {
     exit 0
   fi
   if [ "$LANE" = s3 ]; then
+    keep_run_log
     upload_out || { FINISHED=0; fail "upload out/"; }
   fi
   printf 'DONE verdict=%s at=%s\n' "$VERDICT" "$(utc_now)" >"$OUT/DONE"
