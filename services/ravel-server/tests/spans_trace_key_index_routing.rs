@@ -626,7 +626,10 @@ async fn trace_lookup_on_a_folded_tenant_reads_index_buckets_and_the_trace_block
         len(&scan[0]),
         "{value}"
     );
-    let probe: Vec<GetRange> = want.iter().flat_map(|r| r.probe.iter().chain(&r.skip).copied()).collect();
+    let probe: Vec<GetRange> = want
+        .iter()
+        .flat_map(|r| r.probe.iter().chain(&r.skip).copied())
+        .collect();
     assert_eq!(
         phase(&value, "probe", "s3GetRequests"),
         probe.len() as u64,

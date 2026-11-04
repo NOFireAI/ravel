@@ -39,12 +39,12 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{Catalog, KeyIndexLeafLimits, SegmentRef, Snapshot, SnapshotParts};
 use ravel_query::PhaseAccounting;
+use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_query::key_index_route::{
     BudgetRefused, LeafDecodeBudget, LeafDecodeGuard, RouteFigures, RouteInput, SegmentRoute,
     route, route_with_max_parts,
 };
 use ravel_query::span_fetcher::{SpanLeafRangeReader, trace_key_set};
-use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Signal, TenantHash};
 

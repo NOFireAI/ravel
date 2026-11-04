@@ -2779,11 +2779,7 @@ impl SqlExecutor {
                         accounting,
                         peak_asked_intermediate_bytes: caps.peak_asked_bytes,
                         phase_accounting: phase_snapshot,
-                        signals: signal_stats(
-                            &lane_counts,
-                            &phase_accounting,
-                            blocks.key_index,
-                        ),
+                        signals: signal_stats(&lane_counts, &phase_accounting, blocks.key_index),
                         io_shape: if blocks.keyed_logs_scan {
                             keyed_io_shape
                         } else {

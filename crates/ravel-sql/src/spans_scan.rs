@@ -433,7 +433,11 @@ impl SpansScanExec {
         counters.add_route(figures, tier2_pruned);
         let n = self.partitions.len();
         for (i, set) in block_sets.into_iter().enumerate() {
-            if let Some(slot) = self.partitions.get_mut(i % n).and_then(|p| p.get_mut(i / n)) {
+            if let Some(slot) = self
+                .partitions
+                .get_mut(i % n)
+                .and_then(|p| p.get_mut(i / n))
+            {
                 slot.blocks = set.map(Arc::from);
             }
         }

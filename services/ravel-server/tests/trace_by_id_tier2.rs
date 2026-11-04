@@ -23,7 +23,7 @@ use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use clap::Parser;
 use ravel_catalog::{
-    AbsentPolicy, Catalog, CatalogConfig, SnapshotParts, Snapshot, validate_or_adopt,
+    AbsentPolicy, Catalog, CatalogConfig, Snapshot, SnapshotParts, validate_or_adopt,
 };
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -446,10 +446,7 @@ async fn fold_with_leaves(recorder: &Arc<RecordingStore>, objects: usize) {
 }
 
 /// The catalog's own resolve of `range` with its parts.
-async fn resolve(
-    recorder: &Arc<RecordingStore>,
-    range: TimeRange,
-) -> (Snapshot, SnapshotParts) {
+async fn resolve(recorder: &Arc<RecordingStore>, range: TimeRange) -> (Snapshot, SnapshotParts) {
     let (snapshot, _, parts) = leaf_catalog(recorder.clone())
         .resolve_pruned_with_parts(
             &TenantId::new(TENANT).hash(),
@@ -674,11 +671,19 @@ fn two_part_specs() -> Vec<ObjectSpec> {
 }
 
 /// Per part of `parts`: its leaf keys and the data keys of its segments.
-fn part_layout(snapshot: &Snapshot, parts: &SnapshotParts) -> Vec<(BTreeSet<String>, BTreeSet<String>)> {
+fn part_layout(
+    snapshot: &Snapshot,
+    parts: &SnapshotParts,
+) -> Vec<(BTreeSet<String>, BTreeSet<String>)> {
     let mut layout: Vec<(BTreeSet<String>, BTreeSet<String>)> = parts
         .parts
         .iter()
-        .map(|p| (p.key_index.iter().map(|r| r.key.clone()).collect(), BTreeSet::new()))
+        .map(|p| {
+            (
+                p.key_index.iter().map(|r| r.key.clone()).collect(),
+                BTreeSet::new(),
+            )
+        })
         .collect();
     for (segment, origin) in snapshot.segments.iter().zip(&parts.origin) {
         let origin = origin.expect("every segment is sealed into a part");
@@ -707,7 +712,10 @@ async fn folded_lookup_reads_two_leaf_gets_and_no_pruned_object() {
     let specs = two_part_specs();
     let (recorder, objects) = publish_all(&specs).await;
     let t = trace();
-    let want: Vec<ExpectedReads> = objects.iter().map(|o| expected_reads(&o.bytes, &t)).collect();
+    let want: Vec<ExpectedReads> = objects
+        .iter()
+        .map(|o| expected_reads(&o.bytes, &t))
+        .collect();
     for (object, want) in objects.iter().zip(&want) {
         assert_eq!(want.scan.is_some(), object.holder, "{}", object.key);
     }
@@ -722,7 +730,14 @@ async fn folded_lookup_reads_two_leaf_gets_and_no_pruned_object() {
     );
 
     fold_with_leaves(&recorder, specs.len()).await;
-    let (snapshot, parts) = resolve(&recorder, TimeRange { start_ns: 0, end_ns: NOW_NS }).await;
+    let (snapshot, parts) = resolve(
+        &recorder,
+        TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        },
+    )
+    .await;
     let layout = part_layout(&snapshot, &parts);
     assert_eq!(layout.len(), 2, "two parts: {layout:?}");
     for (leaves, segments) in &layout {
@@ -744,7 +759,10 @@ async fn folded_lookup_reads_two_leaf_gets_and_no_pruned_object() {
     let before = totals();
     let folded = trace_route(&app, &t).await;
     let moved = delta(before, totals());
-    assert_eq!(folded["data"], unfolded_rows, "rows equal the unfolded answer");
+    assert_eq!(
+        folded["data"], unfolded_rows,
+        "rows equal the unfolded answer"
+    );
 
     for (object, want) in objects.iter().zip(&want) {
         let got = recorder.take(&object.key);
@@ -756,7 +774,11 @@ async fn folded_lookup_reads_two_leaf_gets_and_no_pruned_object() {
                 object.key
             );
         } else {
-            assert!(got.is_empty(), "{}: a pruned object is never read: {got:?}", object.key);
+            assert!(
+                got.is_empty(),
+                "{}: a pruned object is never read: {got:?}",
+                object.key
+            );
         }
     }
     for (leaves, _) in &layout {
@@ -790,7 +812,10 @@ async fn folded_lookup_reads_two_leaf_gets_and_no_pruned_object() {
     assert_eq!(phase(&folded, "probe", "s3GetRequests"), 4, "{folded}");
     assert_eq!(
         phase(&folded, "probe", "s3GetWireBytes"),
-        holders.iter().map(|w| len(&w.probe[0]) + len(&w.skip)).sum::<u64>(),
+        holders
+            .iter()
+            .map(|w| len(&w.probe[0]) + len(&w.skip))
+            .sum::<u64>(),
         "{folded}"
     );
     assert_eq!(phase(&folded, "probe", "segmentsOpened"), 2, "{folded}");
@@ -823,7 +848,11 @@ async fn folded_lookup_reads_two_leaf_gets_and_no_pruned_object() {
     recorder.clear();
     let warm = trace_route(&app, &t).await;
     for key in objects.iter().map(|o| &o.key).chain(&leaf_keys) {
-        assert_eq!(recorder.take(key), Vec::new(), "{key}: served from the cache");
+        assert_eq!(
+            recorder.take(key),
+            Vec::new(),
+            "{key}: served from the cache"
+        );
     }
     assert_eq!(warm["data"], unfolded_rows);
     assert_eq!(key_index(&warm, "partsCovered"), 2, "{warm}");
@@ -868,13 +897,20 @@ async fn unfolded_absent_object_costs_three_gets_under_sixteen_kib_and_no_skip_i
         },
     ];
     let (recorder, objects) = publish_all(&specs).await;
-    let want: Vec<ExpectedReads> = objects.iter().map(|o| expected_reads(&o.bytes, &t)).collect();
+    let want: Vec<ExpectedReads> = objects
+        .iter()
+        .map(|o| expected_reads(&o.bytes, &t))
+        .collect();
     let app = serve(&recorder, None);
 
     recorder.clear();
     let before = totals();
     let value = sql(&app, &names_where(""), 0).await;
-    assert_eq!(delta(before, totals()), delta(before, before), "no part to route");
+    assert_eq!(
+        delta(before, totals()),
+        delta(before, before),
+        "no part to route"
+    );
     assert_eq!(
         value["data"]["rows"],
         serde_json::json!([["t-0"], ["t-1"]]),
@@ -884,20 +920,34 @@ async fn unfolded_absent_object_costs_three_gets_under_sixteen_kib_and_no_skip_i
         let got = recorder.take(&object.key);
         assert_eq!(got, want.tier1(), "{}", object.key);
         if object.holder {
-            assert!(got.contains(&want.skip), "{}: the holder reads SKIP_IDX", object.key);
+            assert!(
+                got.contains(&want.skip),
+                "{}: the holder reads SKIP_IDX",
+                object.key
+            );
             continue;
         }
         assert_eq!(want.key_index.len(), 2, "fixture: KEY_IDX is two reads");
         assert_eq!(got.len(), 3, "{}: {got:?}", object.key);
-        assert!(len(&got[0]) <= SUFFIX, "{}: probe wire {}", object.key, len(&got[0]));
+        assert!(
+            len(&got[0]) <= SUFFIX,
+            "{}: probe wire {}",
+            object.key,
+            len(&got[0])
+        );
         assert!(
             got.iter().map(len).sum::<u64>() < 16 << 10,
             "{}: {got:?}",
             object.key
         );
-        assert!(!got.contains(&want.skip), "{}: no SKIP_IDX read", object.key);
         assert!(
-            got.iter().all(|r| matches!(*r, GetRange::Range(s, _) if s >= want.blocks_end)),
+            !got.contains(&want.skip),
+            "{}: no SKIP_IDX read",
+            object.key
+        );
+        assert!(
+            got.iter()
+                .all(|r| matches!(*r, GetRange::Range(s, _) if s >= want.blocks_end)),
             "{}: no block read",
             object.key
         );
@@ -947,9 +997,19 @@ async fn parts_past_the_ceiling_are_probed_at_tier_one() {
     let specs = two_part_specs();
     let (recorder, objects) = publish_all(&specs).await;
     let t = trace();
-    let want: Vec<ExpectedReads> = objects.iter().map(|o| expected_reads(&o.bytes, &t)).collect();
+    let want: Vec<ExpectedReads> = objects
+        .iter()
+        .map(|o| expected_reads(&o.bytes, &t))
+        .collect();
     fold_with_leaves(&recorder, specs.len()).await;
-    let (snapshot, parts) = resolve(&recorder, TimeRange { start_ns: 0, end_ns: NOW_NS }).await;
+    let (snapshot, parts) = resolve(
+        &recorder,
+        TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        },
+    )
+    .await;
     let layout = part_layout(&snapshot, &parts);
     assert_eq!(layout.len(), 2);
 
@@ -1019,12 +1079,23 @@ async fn a_range_scoped_resolve_routes_through_the_remaining_parts_own_leaves() 
     let (recorder, objects) = publish_all(&specs).await;
     fold_with_leaves(&recorder, specs.len()).await;
 
-    let (full_snapshot, full) = resolve(&recorder, TimeRange { start_ns: 0, end_ns: NOW_NS }).await;
+    let (full_snapshot, full) = resolve(
+        &recorder,
+        TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        },
+    )
+    .await;
     assert_eq!(full.parts.len(), 2);
     for part in &full.parts {
         assert!(!part.key_index.is_empty());
         for leaf in &part.key_index {
-            assert_eq!(leaf.part_blake3, part.blake3, "{}: bound to its own part", leaf.key);
+            assert_eq!(
+                leaf.part_blake3, part.blake3,
+                "{}: bound to its own part",
+                leaf.key
+            );
         }
     }
     let full_layout = part_layout(&full_snapshot, &full);
@@ -1042,21 +1113,39 @@ async fn a_range_scoped_resolve_routes_through_the_remaining_parts_own_leaves() 
         scoped.parts.len(),
         1,
         "the hour-0 part is dropped: watermarks {:?}",
-        full.parts.iter().map(|p| p.watermark_hour).collect::<Vec<_>>()
+        full.parts
+            .iter()
+            .map(|p| p.watermark_hour)
+            .collect::<Vec<_>>()
     );
     assert_eq!(scoped.parts[0].blake3, full.parts[1].blake3);
     assert_eq!(scoped.parts[0].key_index, full.parts[1].key_index);
     let layout = part_layout(&snapshot, &scoped);
-    assert_eq!(layout[0].1, full_layout[1].1, "origins renumbered to part 0");
+    assert_eq!(
+        layout[0].1, full_layout[1].1,
+        "origins renumbered to part 0"
+    );
 
     let app = serve(&recorder, None);
     recorder.clear();
     let value = sql(&app, &names_where(""), window.start_ns).await;
-    assert_eq!(value["data"]["rows"], serde_json::json!([["t-2"]]), "{value}");
+    assert_eq!(
+        value["data"]["rows"],
+        serde_json::json!([["t-2"]]),
+        "{value}"
+    );
     assert_eq!(key_index(&value, "partsCovered"), 1, "{value}");
     assert_eq!(key_index(&value, "leafGetRequests"), 2, "{value}");
-    let scoped_gets: usize = full_layout[1].0.iter().map(|k| recorder.take(k).len()).sum();
-    let dropped_gets: usize = full_layout[0].0.iter().map(|k| recorder.take(k).len()).sum();
+    let scoped_gets: usize = full_layout[1]
+        .0
+        .iter()
+        .map(|k| recorder.take(k).len())
+        .sum();
+    let dropped_gets: usize = full_layout[0]
+        .0
+        .iter()
+        .map(|k| recorder.take(k).len())
+        .sum();
     assert_eq!((scoped_gets, dropped_gets), (2, 0));
     for object in objects.iter().filter(|o| full_layout[0].1.contains(&o.key)) {
         assert_eq!(recorder.take(&object.key), Vec::new(), "{}", object.key);
@@ -1073,7 +1162,12 @@ async fn key_index_stats_are_absent_without_a_trace_key() {
     fold_with_leaves(&recorder, specs.len()).await;
     let app = serve(&recorder, None);
     let before = totals();
-    let value = sql(&app, "SELECT count(*) AS n FROM spans WHERE name = 't-2'", 0).await;
+    let value = sql(
+        &app,
+        "SELECT count(*) AS n FROM spans WHERE name = 't-2'",
+        0,
+    )
+    .await;
     assert_eq!(value["data"]["rows"], serde_json::json!([[1]]), "{value}");
     assert_eq!(delta(before, totals()), delta(before, before));
     assert!(value["stats"].get("keyIndex").is_none(), "{value}");

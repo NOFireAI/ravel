@@ -4438,7 +4438,11 @@ fn render_heartbeat_age_family(out: &mut String, mode: Mode, age: std::time::Dur
 /// outcome, and leaf GETs per routed signal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KeyIndexRouteTotals {
-    parts: Vec<(Signal, ravel_query::key_index_route::KeyIndexPartOutcome, u64)>,
+    parts: Vec<(
+        Signal,
+        ravel_query::key_index_route::KeyIndexPartOutcome,
+        u64,
+    )>,
     leaf_gets: Vec<(Signal, u64)>,
 }
 
@@ -4453,9 +4457,9 @@ impl KeyIndexRouteTotals {
             parts: signals
                 .iter()
                 .flat_map(|signal| {
-                    KeyIndexPartOutcome::ALL
-                        .iter()
-                        .map(|outcome| (*signal, *outcome, key_index_parts_total(*signal, *outcome)))
+                    KeyIndexPartOutcome::ALL.iter().map(|outcome| {
+                        (*signal, *outcome, key_index_parts_total(*signal, *outcome))
+                    })
                 })
                 .collect(),
             leaf_gets: signals

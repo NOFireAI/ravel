@@ -30,8 +30,7 @@ use ravel_types::accounting::{AccessIntent, AccountedOp};
 use serde_json::{Value as Json, json};
 
 use crate::{
-    DecodedCacheStats, IntentCacheCounts, KeyIndexStats, SignalStats, SqlStats,
-    StatementCacheStats,
+    DecodedCacheStats, IntentCacheCounts, KeyIndexStats, SignalStats, SqlStats, StatementCacheStats,
 };
 
 /// One entry per [`QueryPhase`], in [`QueryPhase::ALL`] order, each phase
@@ -598,7 +597,9 @@ mod tests {
             key_index_json(&KeyIndexStats::default())
         );
         assert_eq!(entries[0]["keyIndex"]["partsCovered"], 0);
-        let logs_entry = entries[1].as_object().expect("signal entry renders an object");
+        let logs_entry = entries[1]
+            .as_object()
+            .expect("signal entry renders an object");
         assert!(!logs_entry.contains_key("keyIndex"));
     }
 

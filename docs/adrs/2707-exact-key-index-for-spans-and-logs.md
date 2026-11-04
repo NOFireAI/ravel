@@ -498,7 +498,9 @@ flowchart LR
   validation, every segment above the watermark (the unsealed tail), and
   every token-resolved segment (ADR-0849 section 3); plus, scan-only and
   never tier-1 probed, every segment of a part the per-query ceiling left
-  unprobed, which goes straight to the scan path. No false negatives.
+  unprobed, which goes straight to the scan path (retired: such a part is
+  probed at tier 1, see the tier-2 trace lookup amendment below). No false
+  negatives.
 - **Tier 1.** A candidate with no block set (an uncovered segment, other
   than a ceiling remainder) is
   probed in the object: the footer, the KEY_IDX directory, one bucket. A
@@ -514,7 +516,9 @@ flowchart LR
   suffix covers the footer, BLOOM and SKIP_IDX (a reader choice, as RLOG's
   probe length is) and stops there, since KEY_IDX sits below SKIP_IDX and
   its bucket frames lie between its directory and the tail, and the suffix
-  is never sized to reach the directory.
+  is never sized to reach the directory. The spans suffix is now the fold's
+  8 KiB and KEY_IDX is read before SKIP_IDX: see the tier-2 trace lookup
+  amendment below.
 - **Blocks.** Spans read the trace's block run by range: the new
   `RspanRangeReader::block_run_span(trace_id, blocks)` per contiguous run
   of the intersected block set, then `decode_trace`
@@ -534,7 +538,8 @@ flowchart LR
 - **Budget.** `L_point` is `2 x min(p, P_max)` leaf GETs for `p` covering
   parts, with `P_max` = 1,024 a constant of the layout fixed in root
   validation (a ceiling of 2,048 leaf GETs, not a measurement). Beyond
-  `P_max` the remaining parts are scanned, not probed, and the shape lint
+  `P_max` the remaining parts are scanned, not probed (retired by the
+  tier-2 trace lookup amendment below: they go to tier 1), and the shape lint
   reports it. A probe count that follows the covering part count is a
   second root shape under ADR-0849 section 2, which this ADR amends (the
   part-bound point root amendment there): root validation requires
@@ -613,7 +618,8 @@ flowchart LR
   T11 landed this wiring inside the fetcher's plan rather than in
   `logs_provider.rs`: see the logs probe amendment below.
 - **Statistics.** `stats.pruning` gains `segmentsPrunedByKeyIndex` and
-  `blocksPrunedByKeyIndex` beside the #2680 fields; `stats.phases` gains a
+  `blocksPrunedByKeyIndex` beside the #2680 fields (on spans, `stats.keyIndex`
+  joins them; see the tier-2 trace lookup amendment below); `stats.phases` gains a
   `keyIndex` phase whose requests and wire bytes (as transferred, ranged
   reads and retries included, the `stats.phases` convention) cover leaf and
   section probes and nothing else. An index that removes data GETs and adds
@@ -1199,7 +1205,8 @@ bottleneck.
   charged to `probe`, then the KEY_IDX prefix and a bucket under
   `keyIndex` (828 `probe` and 1,600 `keyIndex` GETs over 828 objects, in
   the no-range row above). The restated band is three requests per spans
-  object today, and two once #3118 sizes the first read from the footer's
+  object today (the tier-2 trace lookup amendment below restates the rest),
+  and two once #3118 sizes the first read from the footer's
   `prefix_len` and charges it to `keyIndex`. The logs probe is not
   restated: q20 measured 1.6 GETs per object.
 - **Spans 1 h lookup bytes.** "About 200 KB" assumed the first read was
@@ -1411,3 +1418,60 @@ What this amendment decides, with no format change:
   object exists for a later compaction to wedge on.
 
 Refs: #2707, #2759, #2985
+
+## Amendment (issue #3702): the tier-2 trace lookup and the 8 KiB footer suffix
+
+<!-- amendment-applies: sections="5. Lookup: route, probe tier 2, probe tier 1, read blocks; exact by the safety lemma|7. Read-path wiring and statistics|Amendment (issue #2763): T12 Stage 1 measured the acceptance table" pointer="tier-2 trace lookup amendment" -->
+<!-- amendment-supersedes: phrase="which goes straight to the scan path" pointer="tier-2 trace lookup amendment" -->
+<!-- amendment-supersedes: phrase="the remaining parts are scanned, not probed" pointer="tier-2 trace lookup amendment" -->
+<!-- amendment-supersedes: phrase="and two once #3118 sizes the first read" pointer="tier-2 trace lookup amendment" -->
+
+ADR-3692 task T4 (decisions 3 and 9) wires the tier-2 router into the spans
+`trace_id =` lookup and fixes #3118's bytes at the same request count. What
+changes here:
+
+- **Tier 2 runs for spans.** `SpansTableProvider` resolves the window with
+  `Catalog::resolve_pruned_with_parts` and routes the trace's `key8` through
+  `ravel_query::key_index_route`, reading leaves through the span fetcher's
+  read path and read cache. A covering part costs two leaf GETs, the prefix
+  and one bucket, and its segments the leaves prove absent are never read.
+  A segment the leaves name is fetched with its block set and reads no
+  KEY_IDX.
+- **The ceiling remainder goes to tier 1.** A part past `L_max` or `P_max`
+  is uncovered and its segments are probed at tier 1 like every other
+  uncovered segment, never scanned (ADR-3692 decision 2), so decision 5's
+  "Candidates" and "Budget" remainder rule is retired.
+- **The first read is the fold's 8 KiB suffix.** The spans fetcher's first
+  read of an object is `min(object length, 8 KiB)`
+  (`KEY_INDEX_FOOTER_SUFFIX_LEN`, the same suffix the fold reads), on the
+  `probe` phase, chased once when the footer is longer. With no block set
+  the KEY_IDX prefix and bucket follow, on `keyIndex`, before SKIP_IDX is
+  read, so an uncovered object without the trace costs three requests, at
+  most about 11 KB, and no SKIP_IDX read; a holder then reads SKIP_IDX,
+  BLOOM only with predicates, and its block runs. The T12 restatement's
+  "two once #3118 sizes the first read" is replaced by this: the request
+  count stays three, the bytes fall from 65,536 B to at most 8,192 B for
+  the first read.
+- **Statistics.** `stats.keyIndex` and the spans entry of
+  `stats.signals[].keyIndex` carry `partsCovered`, `partsUncovered`,
+  `partsBeyondCeiling`, `leavesRejected`, `reservationsRefused`,
+  `leafGetRequests`, `leafWireBytes`, `keysProbed`, `skippedByBudget` and
+  `skipIdxDropped` whenever a spans scan carried a pushed `trace_id`, and
+  are absent otherwise; the process exports
+  `ravel_query_key_index_parts_total{signal,outcome}` and
+  `ravel_query_key_index_leaf_gets_total{signal}`. A tier-2 prune counts in
+  `segmentsPrunedByKeyIndex`, one tier per segment.
+
+The bands below are pinned in process against `MemoryStore` with an exact
+GET recorder; the real-S3 figure stays predicted until a lane measures it.
+
+| check | band | figure | source |
+|---|---|---|---|
+| first read per object | at most 8,192 B | the 8 KiB suffix, or the whole object when shorter | services/ravel-server/tests/trace_by_id_tier2.rs:892; crates/ravel-query/src/span_fetcher.rs:4843 |
+| uncovered object without the trace | 3 requests, under 16 KiB, no SKIP_IDX or block read | 3 requests, under 16 KiB, no SKIP_IDX read | services/ravel-server/tests/trace_by_id_tier2.rs:891 |
+| covering part | 2 leaf GETs | 2 per part, `leafGetRequests` 4 over 2 parts | services/ravel-server/tests/trace_by_id_tier2.rs:764 |
+| object a covering part's leaves prune | 0 GETs | 0 | services/ravel-server/tests/trace_by_id_tier2.rs:759 |
+| part past the ceiling | tier-1 probe, never a scan | the suffix and KEY_IDX reads, no block of a non-holder | services/ravel-server/tests/trace_by_id_tier2.rs:995 |
+| spans 1 h lookup, cold, folded, real S3: bytes | 2 leaf GETs per covering part plus the holders' reads | not measured | predicted |
+
+Refs: #3702, #3692, #3118
