@@ -20,8 +20,10 @@ store, from an empty bucket to `results.<lane>.json`.
   `logs.jsonl` (`--format jsonl`), `spans.parquet` and `logs.parquet`
   (`--format parquet`, needs pyarrow), the two `ravel-cli load` mapping files,
   and `truth.json`, the exact answer of every planted key. `--tail` writes
-  the mixed state's extra hour, with planted answers of its own. Its module
-  docstring states the time and determinism rules.
+  the mixed state's extra hour, with planted answers of its own.
+  `--even-hours` puts exactly traces / hours traces in every hour (the
+  many_parts_N corpora). Its module docstring states the time and
+  determinism rules.
 - `statements.toml`: the statements, one `[[statement]]` each: tenant, table,
   SQL or trace GET, the states it runs in, its `truth.json` key, whether it
   runs cold only, and `requires` when it needs a planted key the corpus may
@@ -40,7 +42,8 @@ store, from an empty bucket to `results.<lane>.json`.
   wait for and download its `out/`. Both take `--dry-run`.
 - `box/lib/inv.py`: run.sh's helpers (TOML reads, the call plan, one call,
   stamps, inspect stamps, the census, the truth merge, the restart warmup
-  wait).
+  wait, and `stride-check`, a strided load's per-batch event-time check run
+  over the whole corpus before the load).
 - `box/run.example.toml`: the s3 lane's run file, every key commented.
   `box/run.local-smoke.toml` is the local lane's.
 - `evaluate.py`: reads a run directory and writes `results.<lane>.json` and
@@ -74,10 +77,13 @@ anything else, writes `/root/inv/RUN_ID`, and runs `run.sh --lane s3`.
 `run.sh` checks out `box.sha` detached, builds `ravel-cli` and `ravel-server
 --features sql` in separate `cargo build --release --locked` runs with frame
 pointers on, installs pyarrow 17.0.0 (T12's pin; the generator uses only
-`pyarrow.Table` and `pyarrow.parquet.write_table`, which 17.0.0 has), runs
+`pyarrow.Table` and `pyarrow.parquet.write_table`, and `inv.py
+stride-check` only `pyarrow.parquet.read_table` and an int64 cast, which
+17.0.0 has), runs
 the flow against `box.store_bucket` through the instance role, and
 terminates the instance, on success and failure alike: an error trap writes
-`out/FAILED` with the step that failed.
+`out/FAILED` with the step that failed (a failed command inside a state
+fails that state only; see "The flow").
 
 `run.toml [run] max_minutes` (default 540) is the run's own deadline, an
 hour inside the shutdown timer: a state that would start after it is
