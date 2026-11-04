@@ -470,11 +470,9 @@ mod tests {
     /// `verify_block_ordinals` returns the summary rather than an error.
     #[test]
     fn summary_reports_no_finding_when_every_ordinal_is_below_the_count() {
-        let encoded = encode_trace_key_idx([
-            (trace_id_in_bucket(5, 0), 0),
-            (trace_id_in_bucket(5, 1), 1),
-        ])
-        .expect("encode");
+        let encoded =
+            encode_trace_key_idx([(trace_id_in_bucket(5, 0), 0), (trace_id_in_bucket(5, 1), 1)])
+                .expect("encode");
 
         let inspection = summarize(&encoded.bytes, encoded.prefix_len, 2).expect("summary");
         assert!(inspection.findings.is_empty());

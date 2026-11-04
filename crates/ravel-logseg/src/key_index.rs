@@ -792,8 +792,14 @@ mod tests {
         );
 
         // The probe path refuses the same section on one of the bad keys.
-        let probe_err = probe_source(&footer, &rewritten[..], "user_id", KeyType::I64, &key8_i64(100))
-            .expect_err("probe refuses");
+        let probe_err = probe_source(
+            &footer,
+            &rewritten[..],
+            "user_id",
+            KeyType::I64,
+            &key8_i64(100),
+        )
+        .expect_err("probe refuses");
         assert!(
             matches!(&probe_err, LogSegError::Corrupted(m) if m.contains("object has 4 blocks")),
             "{probe_err:?}"

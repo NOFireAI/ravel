@@ -512,16 +512,19 @@ fn rlog_inspect_prints_no_key_idx_for_an_object_without_one() {
 fn block_ordinal_past_the_count_prints_finding_and_fails() {
     use ravel_logseg::key_index::{self, KeyType};
 
-    let good = build_object_with(|w| {
-        w.with_key_index_fields(vec![("svc".to_string(), KeyType::Str)])
-    });
+    let good =
+        build_object_with(|w| w.with_key_index_fields(vec![("svc".to_string(), KeyType::Str)]));
     let footer = ravel_logseg::footer::open(&good).expect("known-good object opens");
     let block_count = footer.block_count;
     let bad_ordinal = block_count as u32;
-    let bad = key_index::rewrite_key_index(&good, key_index::RLOG_KEY_IDX_VERSION, |_, _, mut entries| {
-        entries.push((ravel_codec::key_idx::key8_str("zz"), bad_ordinal));
-        entries
-    })
+    let bad = key_index::rewrite_key_index(
+        &good,
+        key_index::RLOG_KEY_IDX_VERSION,
+        |_, _, mut entries| {
+            entries.push((ravel_codec::key_idx::key8_str("zz"), bad_ordinal));
+            entries
+        },
+    )
     .expect("rewrite with a bad ordinal");
 
     let path = temp_path("bad-key-idx-ordinal");
