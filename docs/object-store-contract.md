@@ -1065,7 +1065,9 @@ generation the complete response's `x-goog-generation` header names. As on
 S3, the multipart requests are not counted into `StoreMetrics`. An
 object completed this way has no `md5Hash`, so a listing that reaches one
 fails, as for any listed item with neither `md5Hash` nor `componentCount`
-(above), until the real-bucket lane shows what GCS lists for it. The
+(above). What real GCS lists for such an object is unmeasured; the
+real-bucket lane deletes its multipart objects before it lists, so it does
+not measure it (ADR-3456, amendment for multipart). The
 "Visibility and abort" rule that the bucket configure
 `AbortIncompleteMultipartUpload` applies to a GCS bucket too (GCS lifecycle
 rules carry that action), and nothing in Ravel checks it there.
