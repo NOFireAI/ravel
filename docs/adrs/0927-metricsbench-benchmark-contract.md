@@ -255,6 +255,10 @@ listed so a later reader does not mistake a zero for a measurement:
 anywhere in production. `peak_intermediate_bytes` is SQL-only and is always
 zero on a PromQL query.
 
+The response half of this decision has shipped: every Ravel PromQL response
+carries `data.stats.accounting` and `data.stats.phases`. The 2026-11-04
+amendment sends the report half to the `--diagnostics` sidecar.
+
 ### 8. Request counts are logical-call counts, and the report says so
 
 `object_store` retries **below** `InstrumentedStore` with `max_retries = 10`.
@@ -374,7 +378,8 @@ The 2026-10-26 amendment changes this list: band 1 depends on each
 profile's declared range-evaluation grid (section E), band 4 becomes the
 per-type line accounting of section D, and section B adds band 6, the
 cross-row accepted-set digest. The 2026-10-27 amendment, section D, computes
-band 6 per payload class.
+band 6 per payload class. The 2026-11-04 amendment fixes the first reference
+run's single regime as `steady-state` and moves the cold regime to M9.
 
 ## Lane boundary
 
@@ -1210,3 +1215,57 @@ Consequences.
   8 of its 21 statements are refused by the host memory floor at 8 (#3747),
   and they have not been run at 32. Until that is fixed, those entries'
   cardinality result is a refusal.
+
+## Amendment (2026-11-04): the first reference run reports one regime, and per-query cost rides in the diagnostics sidecar
+
+<!-- amendment-applies: sections="Bands pre-registered for the first reference run|7. The diagnostic lane exposes what is already measured" pointer="2026-11-04 amendment" -->
+
+Context. `metricsbench_query` runs one untimed pass and five timed passes,
+with the engines interleaved per entry. It has no cold regime: nothing
+restarts an engine or drops the host page cache before a statement. Calling
+its passes "warm" would misstate what each engine served from.
+
+The first reference measurement, R4 on #2821, was released as
+`metricsbench-r4-20261103`. Over its query phase:
+- Ravel's fetch cache answered 749,928 of 1,906,834 lookups (39.3 %), and
+  Ravel made 1,109,184 GETs reading 365.7 GB from S3;
+- Mimir's store-gateway made 25,037 `get_range` calls to S3 (#940 comment
+  6625947090).
+
+Neither engine was warm in the sense band 3 uses.
+
+Every Ravel PromQL response already carries `data.stats.accounting`
+(requests and bytes by operation) and `data.stats.phases`. That is the
+response half of decision 7. The report does not record them yet.
+
+Decision.
+1. The first reference run reports one regime, `steady-state`, recorded in
+   the provenance `config`. Each engine's cache state is disclosed beside
+   the results: Ravel's fetch-cache hit fraction and GETs from its
+   `/metrics` totals; Mimir's store-gateway S3 operations;
+   Prometheus's and VictoriaMetrics' local storage. Band 3's rule that cold
+   and warm are never compared applies between regimes, and this run has
+   one.
+2. A cold regime is milestone M9 (#3794). Its per-engine procedure (restart,
+   page-cache drop, WAL handling, statement ordering) is amended here, with
+   the owner's approval, before its first run.
+3. Per-query object-store cost comes from each Ravel response's
+   `data.stats`. The harness records it per entry and per pass in the
+   `--diagnostics` sidecar, never in `report.json`. Decision 9 still holds:
+   the run-level `/metrics` totals are published beside the sidecar, as
+   run totals only, never divided into per-query figures, and with decision
+   8's logical-call caveat.
+
+Rejected: a cold regime defined in a sentence. "Cold" is a restart for
+Ravel, a page-cache drop for Prometheus and VictoriaMetrics, and WAL
+replay for Mimir. The host page cache is shared by every container, so an
+undefined cold pass would warm one engine while it chills another.
+
+Consequences.
+- #940's requirement for per-query cold and warm results is met by the
+  steady-state regime now, and by M9 for cold.
+- Its requirement for S3 request and byte accounting is met by the sidecar,
+  for Ravel. The comparators expose no per-query object-store figure, so
+  their cost is reported as run totals only.
+- A run before this amendment carries no `regime` key and no per-query cost.
+  It is not compared with one after it on either.
