@@ -352,6 +352,7 @@ pub fn build_catalog_for_server(
     let catalog = build_catalog_from(
         CatalogConfig {
             build_key_index_leaves: config.fold.build_key_index_leaves,
+            key_index_build_max_pairs: config.fold.key_index_build_max_pairs,
             ..server_catalog_config_base()
         },
         store,
@@ -2050,6 +2051,28 @@ mod catalog_cache_tests {
         assert!(
             !crate::FoldTaskConfig::default().build_key_index_leaves,
             "the leaf build is off by default"
+        );
+    }
+
+    /// `--fold-key-index-build-max-pairs` reaches the catalog the folds run
+    /// with, and its default is the catalog's.
+    #[test]
+    fn build_catalog_for_server_maps_the_key_index_pair_budget() {
+        let config = crate::ServerConfig {
+            fold: crate::FoldTaskConfig {
+                key_index_build_max_pairs: 1_234,
+                ..crate::FoldTaskConfig::default()
+            },
+            cpu_gate_permits: Default::default(),
+            ..server_config()
+        };
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            build_catalog_for_server(store, &config, 7_200_000_000_000).expect("catalog builds");
+        assert_eq!(catalog.config().key_index_build_max_pairs, 1_234);
+        assert_eq!(
+            crate::FoldTaskConfig::default().key_index_build_max_pairs,
+            ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS
         );
     }
 

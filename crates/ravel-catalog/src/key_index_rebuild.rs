@@ -440,6 +440,9 @@ impl Catalog {
                     unread.push((key.clone(), entry.object_size));
                 }
             }
+            // Every section is read: the parts the rebuild visits have no leaf
+            // for these fields, so there is no previous leaf to carry from, and
+            // the fold's incremental build does not apply.
             let store = self.store();
             let unread_ref = &unread;
             let fresh: Vec<EntryKeyIndexRead> = stream::iter(0..unread.len())
@@ -489,6 +492,9 @@ impl Catalog {
                     Err(read) => read,
                 })
                 .collect();
+            // One pass with no pair budget, as the fold built before
+            // `key_index_build_max_pairs`: a rebuild part has no previous leaf
+            // to carry, and its reads are already held whole per batch.
             let leaves = build_part_key_index_leaves(
                 tenant,
                 signal,

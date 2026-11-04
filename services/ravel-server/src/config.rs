@@ -1291,6 +1291,17 @@ pub struct Cli {
     #[arg(long)]
     pub fold_key_index_leaves: bool,
 
+    /// The most (entry, key8) pairs the key-index leaf build holds for one
+    /// (part, field) at a time (ADR-3692 decision 5). A field over it is
+    /// built in ceil(pairs / budget) passes over disjoint key8 ranges, each
+    /// pass re-reading the sections it needs, with leaves identical to a
+    /// one-pass build. The default of 8,000,000 is about 550 MB at 68 B a
+    /// pair. At least 1. Read only when `--fold-key-index-leaves` is on;
+    /// refused in `--mode gateway`, which runs no fold.
+    #[arg(long, default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+          value_parser = clap::value_parser!(u64).range(1..))]
+    pub fold_key_index_build_max_pairs: u64,
+
     /// The interval, in seconds, of the scheduled fold another process runs
     /// for this one's catalog: set it to the maintain tier's
     /// `--fold-interval-secs`. Read only by the request-budget refusal, which
@@ -6942,17 +6953,24 @@ impl Cli {
                 }
             }
         }
-        if !cli.mode.runs_scheduled_fold()
-            && !cli.mode.mounts_on_demand_fold()
-            && passed("fold_key_index_leaves")
-        {
-            return Err(Self::command().error(
-                clap::error::ErrorKind::ArgumentConflict,
-                format!(
-                    "--fold-key-index-leaves configures the catalog fold, which --mode {mode} \
-                     never runs by any route. Drop the flag, or set it on the maintain tier."
+        if !cli.mode.runs_scheduled_fold() && !cli.mode.mounts_on_demand_fold() {
+            for (id, flag) in [
+                ("fold_key_index_leaves", "--fold-key-index-leaves"),
+                (
+                    "fold_key_index_build_max_pairs",
+                    "--fold-key-index-build-max-pairs",
                 ),
-            ));
+            ] {
+                if passed(id) {
+                    return Err(Self::command().error(
+                        clap::error::ErrorKind::ArgumentConflict,
+                        format!(
+                            "{flag} configures the catalog fold, which --mode {mode} never \
+                             runs by any route. Drop the flag, or set it on the maintain tier."
+                        ),
+                    ));
+                }
+            }
         }
         if !cli.mode.runs_scheduled_fold() {
             for (id, flag) in [
@@ -11802,6 +11820,40 @@ mod tests {
         let message = err.to_string();
         assert!(
             message.contains("--fold-key-index-leaves") && message.contains("gateway"),
+            "the refusal must name the flag and the mode, got: {message}"
+        );
+    }
+
+    /// ADR-3692 decision 5: `--fold-key-index-build-max-pairs` defaults to
+    /// the catalog's 8,000,000, is accepted wherever a fold runs, and is
+    /// refused in `gateway`.
+    #[test]
+    fn fold_key_index_build_max_pairs_defaults_and_is_refused_where_no_fold_runs() {
+        for mode in ["maintain", "all", "query"] {
+            let cli = Cli::parse_validated_from(["ravel-server", "--mode", mode])
+                .unwrap_or_else(|err| panic!("--mode {mode} starts without the flag: {err}"));
+            assert_eq!(cli.fold_key_index_build_max_pairs, 8_000_000);
+            let cli = Cli::parse_validated_from([
+                "ravel-server",
+                "--mode",
+                mode,
+                "--fold-key-index-build-max-pairs",
+                "1000",
+            ])
+            .unwrap_or_else(|err| panic!("--mode {mode} must accept the flag: {err}"));
+            assert_eq!(cli.fold_key_index_build_max_pairs, 1000);
+        }
+        let err = Cli::parse_validated_from([
+            "ravel-server",
+            "--mode",
+            "gateway",
+            "--fold-key-index-build-max-pairs",
+            "1000",
+        ])
+        .expect_err("a gateway runs no fold and must refuse the flag");
+        let message = err.to_string();
+        assert!(
+            message.contains("--fold-key-index-build-max-pairs") && message.contains("gateway"),
             "the refusal must name the flag and the mode, got: {message}"
         );
     }

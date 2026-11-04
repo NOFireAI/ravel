@@ -142,3 +142,59 @@ async fn the_key_index_leaves_flag_reaches_the_fold() {
     assert_eq!(on.key_index_leaves_written, 1, "on: one leaf");
     assert_eq!(on_leaves, 1, "on: one .kidx object");
 }
+
+async fn fold_spans_with_budget(max_pairs: u64) -> (ravel_catalog::FoldReport, String) {
+    let now = ravel_cli::now_ns().expect("system clock readable");
+    let store = Arc::new(MemoryStore::new());
+    publish_spans(&store, now).await;
+    catalog::fold_with_key_index_budget(
+        Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
+        TENANT,
+        1,
+        SignalArg::Spans,
+        None,
+        false,
+        true,
+        max_pairs,
+        None,
+        now,
+        false,
+    )
+    .await
+    .expect("fold succeeds")
+}
+
+/// `--key-index-build-max-pairs` (ADR-3692 decision 5) reaches the fold: the
+/// one entry's three trace ids are three (entry, key8) pairs, so a budget of
+/// 1 builds the leaf in ceil(3 / 1) = 3 passes, each reading the entry's
+/// section, where the default budget builds it in one. The text report
+/// prints each of the four build figures.
+#[tokio::test]
+async fn the_pair_budget_reaches_the_fold_and_the_report_prints_the_build_figures() {
+    let (one_pass, one_pass_printed) =
+        fold_spans_with_budget(ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS).await;
+    assert_eq!(one_pass.key_index_build_passes, 1, "default: one pass");
+    assert_eq!(one_pass.key_index_sections_read, 1, "default: one read");
+
+    let (budgeted, printed) = fold_spans_with_budget(1).await;
+    assert_eq!(budgeted.key_index_build_passes, 3, "budget 1: three passes");
+    assert_eq!(budgeted.key_index_sections_read, 3, "one read per pass");
+    assert_eq!(budgeted.key_index_entries_carried, 0, "a first fold carries none");
+    assert_eq!(budgeted.key_index_leaf_gets, 0, "no previous tail leaf");
+    assert_eq!(budgeted.key_index_leaves_written, 1, "still one leaf");
+
+    for line in [
+        "key_index_sections_read: 3\n",
+        "key_index_entries_carried: 0\n",
+        "key_index_build_passes: 3\n",
+        "key_index_leaf_gets: 0\n",
+    ] {
+        assert_eq!(printed.matches(line).count(), 1, "printed once: {line:?}");
+    }
+    assert_eq!(
+        one_pass_printed.matches("key_index_build_passes: 1\n").count(),
+        1,
+        "the default run prints its own pass count"
+    );
+}
