@@ -3270,12 +3270,18 @@ planner cannot bound exactly takes the worst case, because
 under-estimating is the failure that matters once a later ADR enforces a
 budget on this number.
 
-That envelope covers the metrics snapshot only. A query whose selector
-names a log metric (`ravel_log_lines`, `ravel_log_bytes`) also resolves and
-fetches the log lane, and that spend lands in `QueryStats::accounting` but
-not in the estimate. `QueryStats::estimate_excludes_log_lane` is true for
-such a query, and the MCP envelope then reports every estimate component
-unbounded.
+The PromQL estimate covers the coordinator's own resolve of the metrics
+snapshot; a query naming a log metric (`ravel_log_lines`,
+`ravel_log_bytes`) also spends through the log lane, and a federated query
+also spends through each remote that answered; neither is in the estimate,
+so such a query reports every estimate component unbounded and
+`estimate_is_upper_envelope` false. A distributed fetch that falls back to
+fetching locally after a worker answered `UNSUPPORTED` spends on the same
+segments twice, which the estimate does not count either. That spend lands
+in `QueryStats::accounting`, and `QueryStats::estimate_excludes_spend` is
+true for each of these queries; the MCP envelope reads it. A federation
+whose remotes were all skipped unanswered folds no remote spend and leaves
+the flag false.
 
 Constants (crates/ravel-query/src/engine.rs):
 

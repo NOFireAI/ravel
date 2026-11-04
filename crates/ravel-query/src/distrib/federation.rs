@@ -212,6 +212,11 @@ pub struct FederationOutcome {
     /// True when at least one configured remote was skipped, so the query's
     /// coverage is partial.
     pub partial: bool,
+    /// True when at least one remote answered and its reported spend was
+    /// folded into the query's accounting: a healthy remote, or one that
+    /// answered `TIMEOUT` before this coordinator's deadline and was then
+    /// skipped. False when no remote was dialed or none answered.
+    pub spend_folded: bool,
 }
 
 impl Federation {
@@ -449,7 +454,7 @@ impl Federation {
 
             match response.status {
                 pb::status::Code::Ok => {
-                    fold_remote(&accounting, &mut running, &mut outcome.stats, &response);
+                    fold_remote(&accounting, &mut running, &mut outcome, &response);
                     for fs in &response.scalar {
                         if !distinct.contains(&fs.series_id) && distinct.len() >= config.max_series
                         {
@@ -520,7 +525,7 @@ impl Federation {
                     // WHICH cap is named, and a message matching no known cap
                     // falls back to `Federation` rather than being labelled as
                     // a cap that may not be the one that was hit.
-                    fold_remote(&accounting, &mut running, &mut outcome.stats, &response);
+                    fold_remote(&accounting, &mut running, &mut outcome, &response);
                     return Err(typed_budget_refusal(
                         running.total_s3_bytes(),
                         config.max_bytes_scanned,
@@ -566,7 +571,7 @@ impl Federation {
                     // the remote's clock runs ahead of this one, and the
                     // remote is unavailable to this query like one that never
                     // answered. Its spend is folded either way.
-                    fold_remote(&accounting, &mut running, &mut outcome.stats, &response);
+                    fold_remote(&accounting, &mut running, &mut outcome, &response);
                     if deadline.has_passed() {
                         return Err(super::slice_deadline_exceeded(deadline));
                     }
@@ -656,11 +661,13 @@ fn skipped_cluster_warning(name: &str) -> String {
 fn fold_remote(
     live: &QueryAccounting,
     running: &mut QueryAccountingSnapshot,
-    stats: &mut FetchStats,
+    outcome: &mut FederationOutcome,
     response: &SliceResponse,
 ) {
     live.merge_snapshot(&response.accounting);
     *running = running.saturating_merge(&response.accounting);
+    outcome.spend_folded = true;
+    let stats = &mut outcome.stats;
     stats.raw_f64_pages = stats
         .raw_f64_pages
         .saturating_add(response.stats.raw_f64_pages);

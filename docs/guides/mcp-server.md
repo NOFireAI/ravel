@@ -345,7 +345,9 @@ How the server shaped the result to fit the response cap:
 - `estimate_is_upper_envelope`: true when every component of the estimate
   is bounded, so the estimate is an upper envelope; false when
   `estimate.unbounded` names a component. `ravel_explain_query` and
-  `ravel_query_sql` report the same value for one statement.
+  `ravel_query_sql` report the same value for one statement. A PromQL or
+  analytics query that reads the log lane or a federated remote reports
+  false, since neither is in the estimate.
 
 ### `evidence`
 

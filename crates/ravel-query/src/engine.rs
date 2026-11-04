@@ -103,13 +103,15 @@ pub struct QueryStats {
     /// Upper-envelope cost estimate computed after snapshot resolution and
     /// before any page fetch (ADR-0044 decision 3).
     pub estimate: CostEstimate,
-    /// True when the query also read the log lane (a selector naming a log
-    /// metric, ADR-1103). `estimate` is computed over the metrics lane's
-    /// snapshot only, so the log lane's requests and bytes, which do land in
-    /// `accounting` and `phase_accounting`, are outside it and `estimate` is
-    /// then no upper envelope on the query's spend. Set in `prefetch` once the
-    /// log lane has resolved.
-    pub estimate_excludes_log_lane: bool,
+    /// True when `accounting` and `phase_accounting` include spend that
+    /// `estimate` does not cover, so `estimate` is no upper envelope on the
+    /// query's spend. `estimate` covers the coordinator's own resolve of the
+    /// metrics snapshot and the fetches of that snapshot's segments; this is
+    /// set when the query also spent through the log lane (a selector naming a
+    /// log metric, ADR-1103), through a federated remote that answered
+    /// (ADR-0071), or through distributed workers whose fetch then fell back to
+    /// a local re-fetch of the same segments.
+    pub estimate_excludes_spend: bool,
     /// True when the query's coverage is partial: at least one federated
     /// remote cluster was skipped because it was unavailable and its
     /// `skip_unavailable` was set (ADR-0071). Always false for a
@@ -147,7 +149,7 @@ impl QueryStats {
             accounting: phase_accounting.pooled(),
             phase_accounting,
             estimate,
-            estimate_excludes_log_lane: false,
+            estimate_excludes_spend: false,
             partial: false,
             warnings: Vec::new(),
             io_shape,
@@ -167,7 +169,7 @@ impl Default for QueryStats {
             accounting: QueryAccountingSnapshot::default(),
             phase_accounting: PhaseAccountingSnapshot::default(),
             estimate: CostEstimate::new(0, 0, 0, 0, 0),
-            estimate_excludes_log_lane: false,
+            estimate_excludes_spend: false,
             partial: false,
             warnings: Vec::new(),
             io_shape: QueryIoShape::default(),
@@ -1322,7 +1324,7 @@ impl QueryEngine {
             // change), but its budget re-check needs `pooled()` to see the
             // local resolve/plan/probe spend `fetch_all_series` already
             // recorded too.
-            let (fed_series, fed_warnings, fed_partial) = self
+            let (fed_series, fed_warnings, fed_partial, fed_spend_folded) = self
                 .federate_discovery(
                     tenant_hash,
                     matchers.to_vec(),
@@ -1343,14 +1345,19 @@ impl QueryEngine {
             // provenance.
             fetched.absorb(fed_series)?;
             Ok((
-                (fetched.into_series(), fed_warnings, fed_partial),
+                (
+                    fetched.into_series(),
+                    fed_warnings,
+                    fed_partial,
+                    fed_spend_folded,
+                ),
                 FetchStats::default(),
             ))
         };
 
         // resolve_series never re-opens the snapshot's segments more than
         // once, unlike `prefetch`'s per-selector fan-out.
-        let ((series, warnings, partial), mut stats) = self
+        let ((series, warnings, partial, excludes_spend), mut stats) = self
             .resolve_snapshot_with_retry(
                 tenant_hash,
                 Signal::Metrics,
@@ -1366,6 +1373,7 @@ impl QueryEngine {
             .await?;
         stats.partial = partial;
         stats.warnings = warnings;
+        stats.estimate_excludes_spend = excludes_spend;
         Ok((series, stats))
     }
 
@@ -1487,10 +1495,10 @@ impl QueryEngine {
         accounting: &PhaseAccounting,
         fold_lag: FoldLag,
         wall_deadline: WallDeadline,
-    ) -> Result<(Vec<(SeriesId, LabelSet)>, Vec<String>, bool), QueryError> {
+    ) -> Result<(Vec<(SeriesId, LabelSet)>, Vec<String>, bool, bool), QueryError> {
         let mut series: Vec<(SeriesId, LabelSet)> = Vec::new();
         let Some(federation) = &self.federation else {
-            return Ok((series, Vec::new(), false));
+            return Ok((series, Vec::new(), false, false));
         };
         // Empty erasure and empty min-commit-tokens cross the boundary, exactly
         // as in `federate_scalar`: the remote resolves its own snapshot and
@@ -1541,7 +1549,12 @@ impl QueryEngine {
                 series.push((fs.series_id, fs.labels));
             }
         }
-        Ok((series, outcome.warnings, outcome.partial))
+        Ok((
+            series,
+            outcome.warnings,
+            outcome.partial,
+            outcome.spend_folded,
+        ))
     }
 
     /// Prefetches every selector `plan_selectors` reported, for BOTH signals
@@ -1789,7 +1802,7 @@ impl QueryEngine {
         stats.phase_accounting =
             combine_phase_accounting(&stats.phase_accounting, &log_accounting.snapshot());
         stats.accounting = stats.phase_accounting.pooled();
-        stats.estimate_excludes_log_lane = true;
+        stats.estimate_excludes_spend = true;
 
         // Fold the log lane's own io_shape contribution into the metrics
         // lane's, mirroring the `combine_phase_accounting` fold above. The
@@ -2005,6 +2018,7 @@ impl QueryEngine {
                 Vec<HistogramSeriesData>,
                 FetchStats,
                 Option<Vec<crate::distrib::codec::PartialAggregate>>,
+                bool,
             );
             // Two plans with equal `matchers` fetch byte-identical results
             // off the same snapshot: the fetch is matchers-only with no
@@ -2096,7 +2110,7 @@ impl QueryEngine {
                         // merge has already paid for every byte.
                         let mut histogram_fold =
                             HistogramFold::new(Arc::clone(&self.memory_budget), max_series);
-                        let (page_stats, pushdown_partials) = self
+                        let (page_stats, pushdown_partials, fell_back) = self
                             .fetch_samples_and_histograms_maybe_distributed(
                                 tenant_hash,
                                 snapshot,
@@ -2111,7 +2125,12 @@ impl QueryEngine {
                             )
                             .await?;
                         let histograms = histogram_fold.into_series(max_samples)?;
-                        Ok::<PerPlan, QueryError>((histograms, page_stats, pushdown_partials))
+                        Ok::<PerPlan, QueryError>((
+                            histograms,
+                            page_stats,
+                            pushdown_partials,
+                            fell_back,
+                        ))
                     }
                 })
                 .buffer_unordered(concurrency)
@@ -2146,8 +2165,13 @@ impl QueryEngine {
             // At most one plan (the eligible pushdown target) yields honored
             // partials; every other yields `None`. Collect the one that did.
             let mut collected_pushdown: Option<Vec<crate::distrib::codec::PartialAggregate>> = None;
+            // Whether `accounting` now holds spend the snapshot's estimate does
+            // not cover: a distributed fetch that fell back to a local re-fetch,
+            // or a federated remote that answered (below).
+            let mut excludes_spend = false;
             for r in results {
-                let (histograms, per_plan_stats, pushdown_partials) = r?;
+                let (histograms, per_plan_stats, pushdown_partials, fell_back) = r?;
+                excludes_spend |= fell_back;
                 for series in histograms {
                     insert_or_union_histogram_series(&mut combined_histograms, series);
                 }
@@ -2189,9 +2213,10 @@ impl QueryEngine {
             // sub-handle (issue #796 finding: an opaque remote fetch has no
             // phase breakdown of its own), but its budget re-check needs
             // `pooled()` to see the local resolve/plan/probe spend too.
-            let (fed_runs, fed_hist_runs, fed_stats, fed_warnings, fed_partial) = self
-                .federate_scalar(tenant_hash, fed_plans, &accounting, fold_lag, wall_deadline)
-                .await?;
+            let (fed_runs, fed_hist_runs, fed_stats, fed_warnings, fed_partial, fed_spend_folded) =
+                self.federate_scalar(tenant_hash, fed_plans, &accounting, fold_lag, wall_deadline)
+                    .await?;
+            excludes_spend |= fed_spend_folded;
             // Bind the lock to its own statement so the guard is dropped
             // before the next await.
             let absorbed = scalar_fold
@@ -2275,12 +2300,13 @@ impl QueryEngine {
                     },
                     fed_warnings,
                     fed_partial,
+                    excludes_spend,
                 ),
                 page_stats,
             ))
         };
 
-        let ((source, warnings, partial), mut stats) = self
+        let ((source, warnings, partial, excludes_spend), mut stats) = self
             .resolve_snapshot_with_retry(
                 tenant_hash,
                 Signal::Metrics,
@@ -2296,6 +2322,7 @@ impl QueryEngine {
             .await?;
         stats.partial = partial;
         stats.warnings = warnings;
+        stats.estimate_excludes_spend = excludes_spend;
         Ok((source, stats))
     }
 
@@ -2797,10 +2824,15 @@ impl QueryEngine {
             // never mistakes an eligible-but-fell-back query for a pushdown
             // result and must use the raw samples it also returned.
             Option<Vec<crate::distrib::codec::PartialAggregate>>,
+            // True when a distributed fetch folded worker spend and then fell
+            // back to the local path, which fetches the same segments again:
+            // the snapshot's estimate counts each segment fetch once.
+            bool,
         ),
         QueryError,
     > {
         let want_pushdown = partial_aggregate.is_some();
+        let mut fell_back = false;
         if let Some(distributed) = &self.distributed {
             // The cost gate reads the same estimate shape the engine already
             // computes (ADR-0044); a single per-segment pass (multiplier 1, no
@@ -2871,7 +2903,7 @@ impl QueryEngine {
                     // in `scalar`, `partials` empty): only the former yields a
                     // pushdown result the caller may stash.
                     let pushdown = want_pushdown.then_some(partials);
-                    return Ok((stats, pushdown));
+                    return Ok((stats, pushdown, false));
                 }
                 // `None`: a worker asked for local fallback (version skew, a
                 // histogram-bearing slice). Fall through to the local path.
@@ -2882,6 +2914,7 @@ impl QueryEngine {
                 // fallback query can trip the byte budget with distribution
                 // enabled where the identical query succeeds without it --
                 // that is the true total cost, not a double-count.
+                fell_back = true;
             }
         }
         let stats = self
@@ -2900,7 +2933,7 @@ impl QueryEngine {
         // distributed-only optimization, so an eligible query that does not trip
         // the cost gate (or a query with no distributed context at all) simply
         // fetches raw and returns no pushdown result.
-        Ok((stats, None))
+        Ok((stats, None, fell_back))
     }
 
     /// Cross-cluster federation fan-out for the metrics path (ADR-0071, ADR-0096).
@@ -2910,8 +2943,10 @@ impl QueryEngine {
     /// does),
     /// the remote native-histogram series runs (merged per cluster and unioned
     /// into the local histogram pool, ADR-0096 decision 3 step 4), the folded
-    /// remote `FetchStats`, the deduplicated `skip_unavailable` warnings, and
-    /// whether any cluster was skipped (partial coverage).
+    /// remote `FetchStats`, the deduplicated `skip_unavailable` warnings,
+    /// whether any cluster was skipped (partial coverage), and whether any
+    /// remote's spend was folded into `accounting`
+    /// ([`crate::distrib::FederationOutcome::spend_folded`]).
     ///
     /// This is a named `async fn` on purpose: its future is higher-ranked over
     /// its input lifetimes, so borrows taken across the inner `SliceFetcher`
@@ -2934,6 +2969,7 @@ impl QueryEngine {
             FetchStats,
             Vec<String>,
             bool,
+            bool,
         ),
         QueryError,
     > {
@@ -2942,8 +2978,9 @@ impl QueryEngine {
         let mut stats = FetchStats::default();
         let mut warnings: Vec<String> = Vec::new();
         let mut partial = false;
+        let mut spend_folded = false;
         let Some(federation) = &self.federation else {
-            return Ok((runs, hist_runs, stats, warnings, partial));
+            return Ok((runs, hist_runs, stats, warnings, partial, spend_folded));
         };
         for (matchers, start_ns, end_ns) in plan_matchers_windows {
             // `tenant_hash` selects which remotes this local tenant may use
@@ -3004,6 +3041,7 @@ impl QueryEngine {
                 .raw_f64_bytes
                 .saturating_add(outcome.stats.raw_f64_bytes);
             partial |= outcome.partial;
+            spend_folded |= outcome.spend_folded;
             for w in outcome.warnings {
                 if !warnings.contains(&w) {
                     warnings.push(w);
@@ -3012,7 +3050,7 @@ impl QueryEngine {
             runs.extend(outcome.series);
             hist_runs.extend(outcome.histogram);
         }
-        Ok((runs, hist_runs, stats, warnings, partial))
+        Ok((runs, hist_runs, stats, warnings, partial, spend_folded))
     }
 
     async fn fetch_all_series(
@@ -6090,12 +6128,13 @@ mod tests {
 
     /// `QueryStats::estimate` is computed over the metrics lane's snapshot
     /// only, so a query that also reads the log lane must say its estimate
-    /// excludes that lane's spend, and a metrics-only query must not.
+    /// excludes spend, and a metrics-only query on an engine without
+    /// federation must not.
     ///
     /// FLIP: leaving the field false on the log lane in `prefetch` fails both
     /// log queries.
     #[tokio::test]
-    async fn estimate_excludes_log_lane_only_when_the_log_lane_is_read() {
+    async fn estimate_excludes_spend_only_when_the_log_lane_is_read() {
         let tenant_hash = ravel_types::TenantId::new("acme-log-lane-estimate").hash();
         let now_ns = 60 * 1_000_000_000;
         let t_ms = now_ns / 1_000_000;
@@ -6106,7 +6145,7 @@ mod tests {
             .await
             .expect("a metrics-only query over an empty store succeeds");
         assert!(
-            !metrics_only.estimate_excludes_log_lane,
+            !metrics_only.estimate_excludes_spend,
             "a metrics-only query reads no lane outside its estimate"
         );
 
@@ -6119,7 +6158,7 @@ mod tests {
                 .await
                 .expect("a log-lane query over an empty store succeeds");
             assert!(
-                stats.estimate_excludes_log_lane,
+                stats.estimate_excludes_spend,
                 "{query}: a query naming ravel_log_lines reads the log lane, which the \
                  estimate does not cover"
             );
@@ -8795,6 +8834,78 @@ mod prefetch_tests {
             "one slice dispatched on the initial attempt and once more after \
              exactly one re-resolve"
         );
+    }
+
+    /// A worker that answers every slice with one fixed status and no data.
+    struct FixedStatus(ravel_proto::queryfrag::v1::status::Code);
+
+    #[async_trait::async_trait]
+    impl crate::distrib::client::SliceFetcher for FixedStatus {
+        async fn fetch(
+            &self,
+            _request: ravel_proto::queryfrag::v1::FetchRequest,
+        ) -> Result<crate::distrib::client::SliceResponse, crate::distrib::client::DistribError>
+        {
+            Ok(crate::distrib::client::SliceResponse {
+                scalar: Vec::new(),
+                histogram: Vec::new(),
+                partials: Vec::new(),
+                accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+                stats: crate::fetcher::FetchStats::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: self.0,
+                status_message: String::new(),
+            })
+        }
+    }
+
+    /// A distributed fetch the workers served fetches each segment once, which
+    /// the estimate covers. One a worker answered `Unsupported` folds that
+    /// worker's spend and then fetches the same segments again locally, which
+    /// the estimate counts once, so only the fallback says it excludes spend.
+    ///
+    /// FLIP: leaving `fell_back` false in
+    /// `fetch_samples_and_histograms_maybe_distributed` fails the fallback case.
+    #[tokio::test]
+    async fn estimate_excludes_spend_only_when_a_distributed_fetch_fell_back() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+        for (code, fell_back) in [
+            (ravel_proto::queryfrag::v1::status::Code::Ok, false),
+            (ravel_proto::queryfrag::v1::status::Code::Unsupported, true),
+        ] {
+            let distributed = Arc::new(crate::distrib::Distributed::new(
+                Arc::new(FixedStatus(code)),
+                crate::distrib::partition::DistribThresholds {
+                    min_store_bytes: 0,
+                    min_segments: 0,
+                    max_parallel_slices: 1,
+                },
+            ));
+            let eng = engine(Arc::clone(&store)).with_distributed(distributed);
+            let (_value, stats) = eng
+                .instant_with_stats(
+                    tenant_hash,
+                    "metric_a",
+                    BASE_MS,
+                    &[],
+                    BASE_NS,
+                    Duration::from_secs(30),
+                )
+                .await
+                .expect("instant");
+            assert_eq!(stats.estimate_excludes_spend, fell_back, "{code:?}");
+        }
     }
 
     /// Publishes one real RSEG segment holding a single series (`metric`) with
@@ -11500,6 +11611,64 @@ mod coverage_wrapper_tests {
     #[tokio::test]
     async fn resolve_series_reports_partial_coverage_matching_its_stats() {
         assert_resolve_series_parity(false).await;
+    }
+
+    /// A remote that answered folds its spend into the query's accounting,
+    /// which the coordinator's estimate over its own snapshot does not cover,
+    /// so the instant, range and discovery paths all say the estimate excludes
+    /// spend. A remote skipped without answering folds nothing, so the same
+    /// three report false.
+    ///
+    /// FLIP: dropping `spend_folded |= outcome.spend_folded` in
+    /// `federate_scalar` fails the instant and range assertions.
+    #[tokio::test]
+    async fn estimate_excludes_spend_only_when_a_remote_answered() {
+        for available in [true, false] {
+            let engine = engine(available);
+            let end_ms = WINDOW_END_NS / 1_000_000;
+            let (_value, instant) = engine
+                .instant_with_stats(tenant(), "m", end_ms, &[], WINDOW_END_NS, DEADLINE)
+                .await
+                .expect("instant_with_stats");
+            let (_value, range) = engine
+                .range_with_stats(
+                    tenant(),
+                    "m",
+                    end_ms - 60_000,
+                    end_ms,
+                    15_000,
+                    &[],
+                    WINDOW_END_NS,
+                    DEADLINE,
+                )
+                .await
+                .expect("range_with_stats");
+            let window = TimeRange {
+                start_ns: 0,
+                end_ns: WINDOW_END_NS,
+            };
+            let (_series, discovery) = engine
+                .resolve_series_with_stats(
+                    tenant(),
+                    &matchers(),
+                    window,
+                    &[],
+                    WINDOW_END_NS,
+                    DEADLINE,
+                )
+                .await
+                .expect("resolve_series_with_stats");
+            for (path, stats) in [
+                ("instant", &instant),
+                ("range", &range),
+                ("discovery", &discovery),
+            ] {
+                assert_eq!(
+                    stats.estimate_excludes_spend, available,
+                    "{path}, remote available = {available}"
+                );
+            }
+        }
     }
 }
 
