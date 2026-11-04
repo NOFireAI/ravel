@@ -308,10 +308,19 @@ pub const DEFAULT_MAX_CONCURRENT_GETS: usize = 16;
 /// whole-object threshold ([`MAX_GETS_PER_L0_SEGMENT_FETCH`], ADR-1306). On
 /// the RSEG path a bridge that would build a run longer than
 /// `SegmentFetcher::max_run_len` is skipped, so the ceiling is guaranteed
-/// only for an object no longer than that per-GET share of the fetch budget. L1
+/// only for an object no longer than that cap, which is at least
+/// [`MIN_MAX_RUN_LEN`]. L1
 /// segments are left unbounded on both paths: they can be far larger than a
 /// flush, so bridging would move far more bytes.
 pub const MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT: usize = 4;
+/// Floor of the per-run byte cap `SegmentFetcher::max_run_len`: the cap never
+/// drops below 8 MiB, ingest's flush `target_bytes`, however small the fetch
+/// budget's per-GET share is. For an object of at most this size the cap never
+/// binds, so the runs a fetch plans do not depend on the budget's limit: the
+/// object keeps the [`MAX_GETS_PER_L0_SEGMENT_FETCH`] request law, and a
+/// refusal's requested figure is what the same fetch asks for under a larger
+/// budget.
+pub const MIN_MAX_RUN_LEN: u64 = 8 * 1024 * 1024;
 /// Most GETs one fetch of an L0 segment issues: the first GET (whole object,
 /// footer tail, or suffix), at most one footer chase (a second `NeedRange` is
 /// `Truncated`), one catalog GET (the catalog sections are fetched as one
@@ -1108,6 +1117,8 @@ pub struct SegmentFetcher {
     /// 4). `None`, the default, decodes inline on the calling task exactly as
     /// before the gate existed.
     read_gate: Option<std::sync::Arc<ReadGate>>,
+    /// Floor of [`Self::max_run_len`]; [`MIN_MAX_RUN_LEN`] outside tests.
+    min_run_len: u64,
 }
 
 impl SegmentFetcher {
@@ -1126,7 +1137,17 @@ impl SegmentFetcher {
             label_sets_materialized: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             memory_budget: std::sync::Arc::new(ravel_memory::MemoryBudget::unlimited()),
             read_gate: None,
+            min_run_len: MIN_MAX_RUN_LEN,
         }
+    }
+
+    /// Lowers the [`Self::max_run_len`] floor, so a test can drive the
+    /// budget-derived cap on a fixture object of a few KiB.
+    #[cfg(test)]
+    #[must_use]
+    fn with_min_run_len(mut self, n: u64) -> Self {
+        self.min_run_len = n;
+        self
     }
 
     /// Runs this fetcher's catalog decodes on `gate` (ADR-1702 decision 4):
@@ -1704,14 +1725,16 @@ impl SegmentFetcher {
 
     /// Longest run, in bytes, that coalescing or bridging may build out of more
     /// than one needed range: the fetch budget's limit divided by the GET
-    /// limiter's permit count. The limiter bounds how many GETs are in flight
-    /// at once, so this is each in-flight GET's even share of the budget, and
-    /// joining unwanted gap bytes never makes one GET reserve more than that.
-    /// At least one byte; on the default unlimited budget it is far above any
-    /// object size, so nothing changes there.
+    /// limiter's permit count, and never less than `min_run_len`
+    /// ([`MIN_MAX_RUN_LEN`] by default). The limiter bounds how many GETs are
+    /// in flight at once, so the quotient is each in-flight GET's even share of
+    /// the budget, and joining unwanted gap bytes never makes one GET reserve
+    /// more than that share or the floor, whichever is larger. On the default
+    /// unlimited budget it is far above any object size, so nothing changes
+    /// there.
     fn max_run_len(&self) -> u64 {
         let permits = u64::try_from(self.get_limiter.permits().max(1)).unwrap_or(u64::MAX);
-        (self.memory_budget.limit() / permits).max(1)
+        (self.memory_budget.limit() / permits).max(self.min_run_len.max(1))
     }
 
     /// Fetches the parts of `needed` that `regions` does not already hold, in
@@ -6715,7 +6738,8 @@ mod tests {
             .with_suffix_len(16)
             .with_coalesce_gap(coalesce_gap)
             .with_max_concurrent_gets(CAPPED_PERMITS)
-            .with_memory_budget(budget.clone());
+            .with_memory_budget(budget.clone())
+            .with_min_run_len(1);
         assert_eq!(fetcher.max_run_len(), CAPPED_RUN_LEN);
         let (_footer, _total, suffix_etag, mut regions) = fetcher
             .open_segment(tenant_hash, &seg_ref, &QueryAccounting::new())
@@ -6754,6 +6778,21 @@ mod tests {
             requests: snapshot.s3_requests(AccountedOp::Get),
             wire_bytes: snapshot.s3_bytes(AccountedOp::Get),
         })
+    }
+
+    /// The cap is the budget's per-GET share, floored at `MIN_MAX_RUN_LEN`.
+    #[test]
+    fn max_run_len_is_the_per_get_share_with_a_floor() {
+        let fetcher = |limit: u64| {
+            SegmentFetcher::new(Arc::new(MemoryStore::new()))
+                .with_max_concurrent_gets(32)
+                .with_memory_budget(Arc::new(ravel_memory::MemoryBudget::new(limit)))
+        };
+        assert_eq!(fetcher(4_380_866_643).max_run_len(), 136_902_082);
+        assert_eq!(fetcher(1 << 20).max_run_len(), MIN_MAX_RUN_LEN);
+        assert_eq!(fetcher(1 << 20).with_min_run_len(0).max_run_len(), 32_768);
+        assert_eq!(fetcher(1).with_min_run_len(0).max_run_len(), 1);
+        assert_eq!(fetcher(u64::MAX).max_run_len(), u64::MAX / 32);
     }
 
     /// Eight 16-byte needed ranges, 64 bytes apart: 128 needed bytes over a
