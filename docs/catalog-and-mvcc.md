@@ -1066,8 +1066,9 @@ directory alone. At most two ranged GETs per covering
 part for one key, issued concurrently across parts, under the per-statement
 ceilings `KEY_INDEX_LEAF_GET_CEILING` (`L_max`, 2,048 leaf GETs) and
 `KEY_INDEX_MAX_PROBED_PARTS` (`P_max`, 1,024 parts), both in
-`ravel_catalog` and asserted by root validation's shape lint
-(ADR-3692 decision 2). Parts are admitted in descending `entry_count`, ties
+`ravel_catalog` and read together through `key_index_root_shape`, which a
+test pins (ADR-3692 decision 2 asks root validation to lint them as well;
+no root shape lint exists yet). Parts are admitted in descending `entry_count`, ties
 by descending `watermark_hour`, until the next part's worst case would
 exceed `L_max` or the admitted count would exceed `P_max`; a part beyond
 either ceiling is uncovered and goes to the tier-1 probe like every other

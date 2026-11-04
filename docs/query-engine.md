@@ -4865,8 +4865,8 @@ moves `ravel_catalog_isolation_breach_total`. Leaf reads are charged to the
 `keyIndex` phase with the caller's access intent, and its figures
 (`partsCovered`, `partsUncovered`, `partsBeyondCeiling`, `leavesRejected`,
 `reservationsRefused`, `skippedByBudget`, leaf GETs and wire bytes, keys
-probed) come back with the routes. No query path calls it yet: the spans
-fetcher is wired by T4 (#3702) and the logs scan by T5 (#3703).
+probed) come back with the routes. No query path calls it yet: ADR-3692's
+plan wires the spans fetcher in task T4 and the logs scan in task T5.
 
 There is also a wire-size trade for a *high-cardinality* `str` column. ADR-0099
 decision 5's "leaves that case exactly as expensive as it is today" is a
