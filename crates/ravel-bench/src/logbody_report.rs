@@ -14,6 +14,9 @@
 //! - integer pages: the production page size and decode throughput against a
 //!   FastLanes-style transposed bit-packed layout ([`fastlanes`]).
 //!
+//! With [`Config::rei`] set it also runs the REI arm ([`crate::logbody`]) over
+//! the same blocks.
+//!
 //! Nothing here changes what any crate writes or reads; the Bloom, template,
 //! and FastLanes code exists only in this module.
 
@@ -46,6 +49,8 @@ use serde::Serialize;
 
 use self::fastlanes::Variant;
 use self::trigram::{TrigramBloom, distinct_trigrams, mix64};
+use crate::logbody::grams::BlockText;
+use crate::logbody::{ReiInput, ReiReport, ReiRun};
 
 /// Runs per timed decode; the report states the median.
 pub const DEFAULT_DECODE_RUNS: usize = 5;
@@ -102,6 +107,8 @@ pub struct Config {
     pub git_sha: String,
     /// The host CPU model, stamped verbatim; throughput figures depend on it.
     pub cpu_model: String,
+    /// The REI arm's corpus and parameters; `None` skips it.
+    pub rei: Option<ReiRun>,
 }
 
 impl Config {
@@ -119,6 +126,7 @@ impl Config {
             date,
             git_sha,
             cpu_model: "unknown".to_string(),
+            rei: None,
         }
     }
 
@@ -156,6 +164,8 @@ pub struct Report {
     pub trigram_sizing: Vec<TrigramSizing>,
     pub body_encoding: BodySection,
     pub integer_pages: IntegerSection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rei: Option<ReiReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -372,6 +382,9 @@ impl Report {
         if self.integer_pages.columns.is_empty() || self.integer_pages.per_page.is_empty() {
             out.push("integer_pages: no integer pages".to_string());
         }
+        if let Some(rei) = &self.rei {
+            out.extend(rei.problems.iter().map(|p| format!("rei: {p}")));
+        }
         out
     }
 }
@@ -563,6 +576,8 @@ struct State {
     // Integer pages, indexed like INT_COLUMNS.
     ints: Vec<IntAcc>,
     int_pages: Vec<IntegerPage>,
+    // Every block's bodies, kept for the REI arm when it runs.
+    rei_blocks: Option<Vec<BlockText>>,
 }
 
 fn enc_name(enc: Enc) -> String {
@@ -698,6 +713,14 @@ pub fn run(cfg: &Config) -> Result<Report, ReportError> {
     if cfg.decode_runs == 0 {
         return Err(fail("decode_runs must be nonzero"));
     }
+    if let Some(rei) = &cfg.rei
+        && rei.spec.block_records != cfg.block_records
+    {
+        return Err(fail(format!(
+            "rei corpus {} is pre-registered at {} records per block, the run uses {}",
+            rei.spec.name, rei.spec.block_records, cfg.block_records
+        )));
+    }
     let needles = read_needles(&cfg.needles)?;
     let (sha256, byte_count) = file_digest(&cfg.corpus)?;
     let rlog = cfg.rlog();
@@ -735,6 +758,7 @@ pub fn run(cfg: &Config) -> Result<Report, ReportError> {
         variable_count: 0,
         ints: INT_COLUMNS.iter().map(|_| IntAcc::default()).collect(),
         int_pages: Vec::new(),
+        rei_blocks: cfg.rei.as_ref().map(|_| Vec::new()),
     };
 
     let mut input = open_text(&cfg.corpus)?;
@@ -765,7 +789,8 @@ pub fn run(cfg: &Config) -> Result<Report, ReportError> {
         st.object(line_count - object.len() as u64, &object)?;
     }
 
-    Ok(st.finish(Stamp {
+    let rei_blocks = st.rei_blocks.take();
+    let mut report = st.finish(Stamp {
         corpus_path: cfg.corpus.display().to_string(),
         line_count,
         byte_count,
@@ -788,7 +813,17 @@ pub fn run(cfg: &Config) -> Result<Report, ReportError> {
         line_rule: LINE_RULE,
         needle_rule: NEEDLE_RULE,
         record_rule: RECORD_RULE,
-    }))
+    });
+    if let (Some(rei), Some(blocks)) = (&cfg.rei, rei_blocks) {
+        let input = ReiInput {
+            blocks: &blocks,
+            lines: report.stamp.line_count,
+            compressed_bytes: report.stamp.compressed_object_bytes,
+            zstd_level: report.stamp.zstd_level,
+        };
+        report.rei = Some(crate::logbody::measure(&rei.spec, &input, &rei.params).map_err(fail)?);
+    }
+    Ok(report)
 }
 
 /// One block read back from an object.
@@ -918,6 +953,12 @@ impl State {
                 }
             }
             next += block.bodies.len();
+            if let Some(rei) = &mut self.rei_blocks {
+                rei.push(
+                    BlockText::from_lines(&block.bodies)
+                        .ok_or_else(|| fail(format!("block {index}: a body holds 0x0A")))?,
+                );
+            }
             self.block(&dir, index as u32, &block)?;
             self.blocks += 1;
         }
@@ -1311,6 +1352,7 @@ impl State {
                 excluded,
                 per_page: self.int_pages,
             },
+            rei: None,
         }
     }
 }
@@ -1693,6 +1735,68 @@ mod tests {
         cfg.decode_runs = 0;
         let err = run(&cfg).expect_err("decode_runs=0 must be rejected");
         assert!(err.to_string().contains("decode_runs"), "{err}");
+    }
+
+    fn rei_cfg(block_records: usize, spec_block_records: usize) -> Config {
+        let text = std::fs::read_to_string(fixture("rei_needles.toml")).unwrap();
+        let mut spec = crate::logbody::spec::parse(&text)
+            .unwrap()
+            .corpus("hdfs")
+            .unwrap()
+            .clone();
+        spec.block_records = spec_block_records;
+        let mut cfg = Config::new(
+            fixture("corpus.log"),
+            fixture("needles.txt"),
+            "2026-11-04".to_string(),
+            "test".to_string(),
+        );
+        cfg.block_records = block_records;
+        cfg.object_records = BLOCK * 32;
+        cfg.decode_runs = 1;
+        cfg.rei = Some(ReiRun {
+            spec,
+            params: crate::logbody::grams::Params::default(),
+        });
+        cfg
+    }
+
+    #[test]
+    fn rei_run_at_another_block_size_is_refused() {
+        let err = run(&rei_cfg(BLOCK, 8192)).expect_err("block size mismatch");
+        assert!(
+            err.to_string()
+                .contains("pre-registered at 8192 records per block, the run uses 64"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rei_arm_measures_the_written_blocks_and_reports_band_misses() {
+        let report = run(&rei_cfg(BLOCK, BLOCK)).expect("report runs");
+        let rei = report.rei.as_ref().expect("rei section");
+        let figure = |key: &str| {
+            let found: Vec<f64> = rei
+                .figures
+                .iter()
+                .filter(|f| f.key == key)
+                .map(|f| f.value)
+                .collect();
+            assert_eq!(found.len(), 1, "{key}");
+            found[0]
+        };
+        assert_eq!(figure("hdfs/lines"), 400.0);
+        assert_eq!(figure("hdfs/blocks"), 400usize.div_ceil(BLOCK) as f64);
+        // The fixture is not the HDFS corpus, so its line count misses the
+        // pre-registered band and the report carries it as a problem.
+        assert!(
+            report
+                .problems()
+                .iter()
+                .any(|p| p.starts_with("rei: hdfs/lines: 400 outside band")),
+            "{:?}",
+            report.problems()
+        );
     }
 
     /// The pre-fix behaviour, reproduced only to prove the fix matters: `at`

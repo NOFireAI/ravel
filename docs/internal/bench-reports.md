@@ -82,6 +82,50 @@ The intended corpora are the LogHub datasets from
 They are not checked in. Results are posted on issue #2977, each with its
 report's `stamp`.
 
+### REI arm (selected n-gram index)
+
+Issue #3709 (ADR-3692 Plan row T11). With `--rei-needles` and
+`--rei-corpus`, the report also measures a REI-style selected-gram block
+index against the exact per-block trigram set, over the same blocks, and
+prints a pre-registered go/no-go. The selection rule, the two arms, the
+figures and the CPU clock are in the module doc of
+`crates/ravel-bench/src/logbody/mod.rs`. The selected arm's grams are 3 to 6
+byte substrings of the corpus's template needles, kept when at most 10% of
+blocks hold them (`--rei-df-threshold`), dropping one a kept shorter
+substring already matches block for block, rarest first under a byte cap of
+5% of the compressed object bytes (`--rei-budget-share`); `--rei-max-gram`
+sets the longest gram (3 to 7). An exact residual scan gives the true holders,
+and an arm that drops a holding block fails the run.
+
+The needles and every band live in
+`crates/ravel-bench/fixtures/logbody/rei_needles.toml`: per corpus (HDFS, BGL,
+OpenSSH and Apache from LogHub), its block geometry, five template needles
+and one id needle, each with the reason it was chosen. The id needle is the
+negative control and is not part of the selection workload. Every figure is
+printed once as `rei figure KEY = VALUE band [LOW, HIGH] ok|MISS`; a figure
+that is missing, printed twice or outside its band exits 1, after the report
+is written.
+
+```sh
+cargo run --release -p ravel-bench --bin logbody_report -- \
+  --corpus HDFS.log --needles crates/ravel-bench/fixtures/logbody/needles.txt \
+  --out hdfs.json --rei-needles crates/ravel-bench/fixtures/logbody/rei_needles.toml \
+  --rei-corpus hdfs
+cargo run --release -p ravel-bench --bin logbody_report -- \
+  --rei-needles crates/ravel-bench/fixtures/logbody/rei_needles.toml \
+  --rei-decide hdfs.json bgl.json ssh.json apache.json
+```
+
+`--block-records` defaults to the corpus's pre-registered value and a run
+with any other value is refused. The per-corpus decision is GO when the
+selected arm keeps at most 10% of blocks on at least 3 of the 5 template
+needles, its index is at most 5% of the compressed bytes, and its build CPU
+is at most twice zstd's over the same blocks. `--rei-decide` reads written
+reports and prints the overall line: GO only when every pre-registered corpus
+has exactly one report, that report is GO, and it has no band miss; it exits
+0 only on GO. The 2026-11-04 run's output is committed as
+`crates/ravel-bench/fixtures/logbody/rei_run_2026-11-04.txt`.
+
 ## Selective investigations (benchmarks/investigations)
 
 Issue #3699 (ADR-3692 decision 8, T1). Not a `ravel-bench` report: a box
