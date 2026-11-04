@@ -3270,6 +3270,13 @@ planner cannot bound exactly takes the worst case, because
 under-estimating is the failure that matters once a later ADR enforces a
 budget on this number.
 
+That envelope covers the metrics snapshot only. A query whose selector
+names a log metric (`ravel_log_lines`, `ravel_log_bytes`) also resolves and
+fetches the log lane, and that spend lands in `QueryStats::accounting` but
+not in the estimate. `QueryStats::estimate_excludes_log_lane` is true for
+such a query, and the MCP envelope then reports every estimate component
+unbounded.
+
 Constants (crates/ravel-query/src/engine.rs):
 
 - `OPEN_REQUESTS_PER_SEGMENT = 2`: `open_segment`'s footer GET plus the
