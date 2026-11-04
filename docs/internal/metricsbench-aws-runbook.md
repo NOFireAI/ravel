@@ -122,10 +122,14 @@ function of the anchor and the seed.
 
 **Optional environment:**
 - `MB_PROFILE`, default `cardinality`;
-- `MB_RSS_BAND`, default `prometheus:2147483648:6442450944`;
-- `MB_OBJECTS_BAND`, default `14000:16500`, which is the `cardinality` profile's;
+- `MB_RSS_BAND`, one `--rss-band` value, default `prometheus:2147483648:6442450944`: the 2 to 6 GiB Prometheus band pre-registered for `cardinality` (#2821 comment 6590940753);
+- `MB_OBJECTS_BAND`, default `14000:16500`: the data-object band pre-registered for `cardinality` (#2821 comment 6611923577);
 - `MB_CAP_MIN`, the self-termination cap, default 2,160 minutes (36 h);
 - `MB_INSTANCE_TYPE`.
+
+Both bands default only for `cardinality`. Another profile's count and memory
+differ, so `launch.sh` refuses a different `MB_PROFILE` unless both bands
+are set, and chosen in that run's pre-registration.
 
 A `cardinality` run takes 8 to 10 h. R4 took 8.7 h, F4 9.25 h.
 
@@ -146,7 +150,7 @@ aws s3 cp s3://$MB_RESULTS_BUCKET/metricsbench/<run-id>/cpu.log - | tail -1
 - `ci exit=0`;
 - `<profile>-start exit=0`;
 - `<profile> exit=N`, where N is `run.sh`'s exit code;
-- `DONE`.
+- `DONE exit=N`, carrying the same code (20 after a failed `ci`).
 
 The box terminates itself 5 minutes after `DONE`, 30 minutes after a failed
 `ci`, or at the cap. Nothing on it depends on the machine that launched it,
