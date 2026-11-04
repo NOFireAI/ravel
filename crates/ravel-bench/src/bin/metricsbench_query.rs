@@ -34,8 +34,8 @@ use clap::Parser;
 use ravel_bench::metrics_correctness::Engine;
 use ravel_bench::metrics_ingest::MetricsIngestReport;
 use ravel_bench::metrics_query::{
-    BindError, Diagnostics, EngineSpec, RAVEL_COST_NOTE, RunOptions, bind, bind_diagnostic,
-    endpoints, parse_engine_spec, run, system_name,
+    BindError, Diagnostics, EngineSpec, RAVEL_COST_NOTE, REGIME_CONFIG_KEY, REGIME_STEADY_STATE,
+    RunOptions, bind, bind_diagnostic, endpoints, parse_engine_spec, run, system_name,
 };
 use ravel_bench::metrics_workload::load_workload;
 use ravel_bench::promql_corpus::load_corpus;
@@ -227,6 +227,7 @@ async fn run_main(args: Args) -> Result<(), Failure> {
     set_config(config, "warmup_passes", args.warmup_passes.to_string());
     set_config(config, "passes", args.passes.to_string());
     set_config(config, "reps_per_pass", args.reps_per_pass.to_string());
+    set_config(config, REGIME_CONFIG_KEY, REGIME_STEADY_STATE.to_string());
     set_config(
         config,
         "query_timeout_ms",

@@ -1212,6 +1212,29 @@ async fn a_summation_tolerance_admits_last_bit_residue_and_not_a_semantic_gap() 
     );
 }
 
+/// ADR-0927's 2026-11-04 amendment, decision 1: the report's provenance
+/// config names the run's one regime, `steady-state`, exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_provenance_config_records_the_steady_state_regime_once() {
+    let s = stubs().await;
+    let run = run_bin(ingest_report(&s.urls), &s.urls).await;
+    assert!(
+        run.output.status.success(),
+        "metricsbench_query failed: {}",
+        stderr(&run.output)
+    );
+    let text = std::fs::read_to_string(&run.out).expect("report written");
+    let report: MetricsBenchReport = serde_json::from_str(&text).expect("report parses");
+    let regimes: Vec<&str> = report
+        .provenance
+        .config
+        .iter()
+        .filter(|c| c.key == "regime")
+        .map(|c| c.value.as_str())
+        .collect();
+    assert_eq!(regimes, vec!["steady-state"]);
+}
+
 fn config<'a>(report: &'a MetricsBenchReport, key: &str) -> Option<&'a str> {
     report
         .provenance
