@@ -87,10 +87,20 @@
 #   capture    capture-effective-config.sh into <out>/effective-config.json
 #   provenance  metricsbench_report provenance into <out>/provenance.json
 #   fold-state  ravel_catalog_fold_last_success_timestamp_seconds from Ravel's
-#               /metrics, stamped
+#               /metrics, stamped. The same scrape is kept as
+#               <out>/ravel-metrics-at-query.txt, and Mimir's /metrics is
+#               scraped beside it into <out>/mimir-metrics-at-query.txt
 #   query       metricsbench_query against all four engines into
 #               <out>/report.json, with the per-entry ULP gaps and oracle
-#               retries in <out>/diagnostics.json
+#               retries in <out>/diagnostics.json. Once it has written the
+#               report, Ravel's and Mimir's /metrics are scraped again into
+#               <out>/ravel-metrics-after-query.txt and
+#               <out>/mimir-metrics-after-query.txt. The four scrapes are
+#               ADR-0927's 2026-11-04 cache-state disclosure (each engine's
+#               after scrape less its before scrape). Their outcomes are
+#               stamped as query_scrapes, each "ok" or why not; a failed
+#               scrape never fails the run, and a failed new scrape leaves
+#               no file
 #   validate    metricsbench_report validate <out>/report.json
 #   memory      the sampler stopped, <out>/memory-summary.json written (peak
 #               and final bytes per container, OOMKilled from docker inspect),
@@ -151,7 +161,8 @@
 # <out>/falsification.json) and memory. It writes no report.json, and
 # stamps.json says diagnostic: true. --ravel-image and --ravel-source-commit
 # are optional there, since no Ravel is started; objects does not run
-# (ravel_objects is stamped not applicable) and --ravel-objects-band is a
+# (ravel_objects is stamped not applicable), no scrape is taken around a query
+# step (query_scrapes is stamped not applicable) and --ravel-objects-band is a
 # usage error.
 #
 # With --real-s3-bucket-prefix and --real-s3-region the run is the real-S3 lane
@@ -1122,6 +1133,7 @@ stamp_set readback_folded null
 stamp_set ravel_objects null
 stamp_set object_store null
 stamp_set in_process_row null
+stamp_set query_scrapes null
 stamp_set steps_completed '[]'
 stamp_set failed_after_ingest '[]'
 stamp_set deferred_failures '[]'
@@ -1438,6 +1450,31 @@ start_step() {
   step_done start
 }
 
+# scrape_reason CURL_EXIT HTTP FILE: "ok" for a scrape that answered 200 with
+# a body, else why not.
+scrape_reason() {
+  if [ "$1" -ne 0 ]; then
+    echo "failed: curl exit $1"
+  elif [ "$2" != "200" ]; then
+    echo "failed: HTTP $2"
+  elif [ ! -s "$3" ]; then
+    echo "failed: empty body"
+  else
+    echo ok
+  fi
+}
+
+# scrape_query_metrics URL FILE KEY: one of the scrapes around the query step
+# into FILE, its outcome stamped as query_scrapes.KEY. A failure is stamped,
+# never fatal (ADR-0927's 2026-11-04 amendment), and leaves no FILE.
+scrape_query_metrics() {
+  local code=0 http reason
+  http="$(curl -sS --max-time 10 -o "$2" -w '%{http_code}' "$1" 2>/dev/null)" || code=$?
+  reason="$(scrape_reason "$code" "$http" "$2")"
+  [ "$reason" = ok ] || { rm -f "$2"; say "query scrape $3: $reason"; }
+  stamp_str "query_scrapes.$3" "$reason"
+}
+
 # scrape_ravel_metrics FILE: Ravel's /metrics into FILE; non-zero unless it
 # answered 200 with a body.
 scrape_ravel_metrics() {
@@ -1606,6 +1643,7 @@ run_diagnostic() {
   stamp_str ravel_restart "not applicable: diagnostic run starts no Ravel"
   stamp_str readback_folded "not applicable: diagnostic run starts no Ravel"
   stamp_str ravel_objects "not applicable: diagnostic run starts no Ravel"
+  stamp_str query_scrapes "not applicable: diagnostic run starts no Ravel or Mimir and runs no query step"
 
   wait_ready prometheus "${PROM_BASE}/-/ready"
   step_done ready
@@ -1776,6 +1814,10 @@ run_full() {
     fold="$(py fold-gauge "${out_dir}/ravel-metrics-at-query.txt")" || fold=""
   fi
   stamp_str ravel_catalog_fold "${fold:-absent}"
+  stamp_str query_scrapes.ravel_before "$(scrape_reason "$code" "$http" "${out_dir}/ravel-metrics-at-query.txt")"
+  scrape_query_metrics "${MIMIR_BASE}/metrics" "${out_dir}/mimir-metrics-at-query.txt" mimir_before
+  stamp_str query_scrapes.ravel_after "not taken: the query step did not complete"
+  stamp_str query_scrapes.mimir_after "not taken: the query step did not complete"
   step_done fold-state
 
   local query_args=(--ingest-report "${out_dir}/ingest.json" --workload "$WORKLOAD" --corpus "$CORPUS"
@@ -1796,6 +1838,8 @@ run_full() {
     fail_step query "metricsbench_query exited $code"
   fi
   [ -s "${out_dir}/report.json" ] || fail_step query "metricsbench_query exited 0 and wrote no report.json"
+  scrape_query_metrics "${RAVEL_BASE}/metrics" "${out_dir}/ravel-metrics-after-query.txt" ravel_after
+  scrape_query_metrics "${MIMIR_BASE}/metrics" "${out_dir}/mimir-metrics-after-query.txt" mimir_after
   step_done query
 
   code=0
