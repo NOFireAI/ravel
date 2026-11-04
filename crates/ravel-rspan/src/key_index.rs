@@ -12,7 +12,8 @@ use std::ops::Range;
 
 use ravel_codec::key_idx::{
     KEY_IDX_WRITER_BUCKET_BITS, Key8, KeyIdxBucket, KeyIdxFieldInput, KeyIdxPrefix, bucket_index,
-    encode_key_idx_with_bucket_bits, key_idx_prefix_range, key8_id16, verify_key_idx,
+    decode_key_idx, encode_key_idx_with_bucket_bits, key_idx_prefix_range, key8_id16,
+    verify_key_idx,
 };
 
 use crate::error::SpanSegError;
@@ -125,11 +126,73 @@ pub(crate) fn check_section(section: &[u8], prefix_len: u32) -> Result<(), SpanS
     check_parameters(&prefix)
 }
 
-/// Verifies every frame of a whole section and applies the RSPAN parameter
-/// rules, for inspection.
-pub(crate) fn summarize(section: &[u8], prefix_len: u32) -> Result<KeyIdxSummary, SpanSegError> {
+/// One KEY_IDX entry whose block ordinal is at or past the object's block
+/// count: the same bound [`finish`]'s probe-path refusal applies, reported
+/// for every entry a full walk finds instead of failing on the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyIdxBlockFinding {
+    pub field: String,
+    pub bucket: u32,
+    pub ordinal: u32,
+}
+
+/// A verified KEY_IDX summary together with every [`KeyIdxBlockFinding`] a
+/// full walk of the section reports. An empty `findings` is a clean section.
+#[derive(Debug, Clone)]
+pub struct KeyIdxInspection {
+    pub summary: KeyIdxSummary,
+    pub findings: Vec<KeyIdxBlockFinding>,
+}
+
+/// Verifies every frame of a whole section, applies the RSPAN parameter
+/// rules, and reports every entry whose block ordinal is at or past
+/// `block_count` (the decoded SKIP_IDX's block count: the footer also stores
+/// a redundant `block_count`, but [`finish`]'s probe path binds against the
+/// decoded SKIP_IDX length, so inspection uses that same bound), for
+/// inspection.
+pub(crate) fn summarize(
+    section: &[u8],
+    prefix_len: u32,
+    block_count: usize,
+) -> Result<KeyIdxInspection, SpanSegError> {
     check_section(section, prefix_len)?;
-    Ok(verify_key_idx(section, prefix_len)?)
+    let summary = verify_key_idx(section, prefix_len)?;
+    let mut findings = Vec::new();
+    for field in decode_key_idx(section, prefix_len)? {
+        for (key8, ordinal) in field.entries {
+            if ordinal as usize >= block_count {
+                findings.push(KeyIdxBlockFinding {
+                    field: field.name.clone(),
+                    bucket: bucket_index(&key8, summary.bucket_bits)?,
+                    ordinal,
+                });
+            }
+        }
+    }
+    // `decode_key_idx` orders each field's entries by `(key8, block)`, not by
+    // ordinal, so findings come out in an order a key's hash determines.
+    // Sort for a report that reads the same across runs and does not depend
+    // on that incidental order.
+    findings.sort_by(|a, b| (&a.field, a.bucket, a.ordinal).cmp(&(&b.field, b.bucket, b.ordinal)));
+    Ok(KeyIdxInspection { summary, findings })
+}
+
+/// Like [`summarize`], but fails fast: the first entry whose block ordinal is
+/// at or past `block_count` is a typed error naming it, in the same words
+/// [`finish`]'s probe-path refusal uses, rather than collecting every one.
+pub fn verify_block_ordinals(
+    section: &[u8],
+    prefix_len: u32,
+    block_count: usize,
+) -> Result<KeyIdxSummary, SpanSegError> {
+    let inspection = summarize(section, prefix_len, block_count)?;
+    if let Some(finding) = inspection.findings.first() {
+        return Err(SpanSegError::Corrupted(format!(
+            "KEY_IDX bucket {} names block {}, object has {block_count} blocks",
+            finding.bucket, finding.ordinal
+        )));
+    }
+    Ok(inspection.summary)
 }
 
 /// What a KEY_IDX probe for one trace says about one object (ADR-2707
@@ -332,5 +395,92 @@ mod tests {
             Err(SpanSegError::KeyIdxBucketOverflow { bucket: 40, .. }) => {}
             other => panic!("expected the lowest bucket, 40, got {other:?}"),
         }
+    }
+
+    /// `summarize` names every entry whose ordinal is at or past the block
+    /// count (not just the first), `verify_block_ordinals` fails fast on the
+    /// first, and the probe path (`locate` + `finish`) refuses the same
+    /// bucket for the same reason, so the three agree.
+    ///
+    /// FLIP: comparing against the entry count (3 here) instead of the block
+    /// count (2) drops the ordinal-2 finding (2 < 3) and keeps only
+    /// ordinal-5, so the exact-set assertion below catches it. Reporting only
+    /// the first finding instead of every one also leaves out ordinal 5 and
+    /// is caught the same way.
+    #[test]
+    fn summary_reports_block_ordinals_past_the_count() {
+        let block_count = 2usize;
+        let good = trace_id_in_bucket(5, 0);
+        let bad_low = trace_id_in_bucket(5, 1);
+        let bad_high = trace_id_in_bucket(5, 2);
+        let encoded = encode_trace_key_idx([(good, 0), (bad_low, 2), (bad_high, 5)])
+            .expect("encode three entries in one bucket");
+
+        let inspection =
+            summarize(&encoded.bytes, encoded.prefix_len, block_count).expect("summary");
+        assert_eq!(
+            inspection.findings,
+            vec![
+                KeyIdxBlockFinding {
+                    field: TRACE_ID_FIELD.to_string(),
+                    bucket: 5,
+                    ordinal: 2,
+                },
+                KeyIdxBlockFinding {
+                    field: TRACE_ID_FIELD.to_string(),
+                    bucket: 5,
+                    ordinal: 5,
+                },
+            ]
+        );
+
+        let err = verify_block_ordinals(&encoded.bytes, encoded.prefix_len, block_count)
+            .expect_err("an ordinal past the count is corrupted");
+        assert!(
+            matches!(&err, SpanSegError::Corrupted(m) if m.contains("names block 2, object has 2 blocks")),
+            "{err:?}"
+        );
+
+        // The probe path refuses a bucket holding a single bad ordinal (no
+        // other entry to pick first instead), naming the same block and
+        // block count the inspector's finding does, so the two agree.
+        let single = encode_trace_key_idx([(bad_low, 2)]).expect("encode one entry");
+        let prefix_range = key_idx_prefix_range(single.prefix_len, single.bytes.len() as u64)
+            .expect("prefix range");
+        let prefix_bytes = &single.bytes[prefix_range.start as usize..prefix_range.end as usize];
+        let located = locate(
+            single.bytes.len() as u64,
+            single.prefix_len,
+            &bad_low,
+            prefix_bytes,
+        )
+        .expect("locate");
+        let Located::Bucket(bucket) = located else {
+            panic!("expected a bucket, the trace is present: {located:?}");
+        };
+        let frame = &single.bytes[bucket.range().start as usize..bucket.range().end as usize];
+        let probe_err = finish(&bucket, frame, block_count).expect_err("block 2 of 2");
+        assert!(
+            matches!(&probe_err, SpanSegError::Corrupted(m) if m.contains("names block 2, object has 2 blocks")),
+            "{probe_err:?}"
+        );
+    }
+
+    /// Every ordinal strictly below the block count: no finding, and
+    /// `verify_block_ordinals` returns the summary rather than an error.
+    #[test]
+    fn summary_reports_no_finding_when_every_ordinal_is_below_the_count() {
+        let encoded = encode_trace_key_idx([
+            (trace_id_in_bucket(5, 0), 0),
+            (trace_id_in_bucket(5, 1), 1),
+        ])
+        .expect("encode");
+
+        let inspection = summarize(&encoded.bytes, encoded.prefix_len, 2).expect("summary");
+        assert!(inspection.findings.is_empty());
+
+        let summary = verify_block_ordinals(&encoded.bytes, encoded.prefix_len, 2)
+            .expect("a clean section verifies");
+        assert_eq!(summary.fields[0].entry_count, 2);
     }
 }

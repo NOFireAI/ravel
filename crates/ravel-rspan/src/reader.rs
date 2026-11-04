@@ -13,7 +13,7 @@ use ravel_codec::bloom_section::BloomSection;
 use crate::block::{DEFAULT_MAX_UNCOMP, read_block};
 use crate::error::SpanSegError;
 use crate::footer::{SpanFooter, kind, open, read_section};
-use crate::key_index::{self, KeyIdxSummary, TraceKeyProbe};
+use crate::key_index::{self, KeyIdxInspection, TraceKeyProbe};
 use crate::record::SpanRecord;
 use crate::skip_index::SkipIndex;
 use crate::writer::RspanConfig;
@@ -151,9 +151,11 @@ impl<'a> RspanReader<'a> {
     }
 
     /// Verifies every KEY_IDX bucket frame and summarizes the section (field,
-    /// key type, entry count, entries per bucket), for inspection.
-    pub fn key_idx_summary(&self) -> Result<KeyIdxSummary, SpanSegError> {
-        key_index::summarize(self.key_idx, self.key_idx_prefix_len)
+    /// key type, entry count, entries per bucket), plus every entry whose
+    /// block ordinal is at or past the object's block count (the same bound
+    /// [`Self::probe_trace`]'s refusal applies), for inspection.
+    pub fn key_idx_summary(&self) -> Result<KeyIdxInspection, SpanSegError> {
+        key_index::summarize(self.key_idx, self.key_idx_prefix_len, self.skip.blocks.len())
     }
 
     /// Parses the object's BLOOM section (v3, ADR-0054). Entry `i` covers block

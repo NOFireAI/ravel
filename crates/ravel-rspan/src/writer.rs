@@ -663,12 +663,13 @@ mod tests {
             .finish()
             .expect("a bucket at the cap writes");
         let cfg = RspanConfig::default();
-        let summary = RspanReader::new(&bytes, &cfg)
+        let inspection = RspanReader::new(&bytes, &cfg)
             .expect("open")
             .key_idx_summary()
             .expect("summary");
-        assert_eq!(summary.fields[0].name, TRACE_ID_FIELD);
-        assert_eq!(summary.fields[0].bucket_entry_counts[17], 4);
+        assert_eq!(inspection.summary.fields[0].name, TRACE_ID_FIELD);
+        assert_eq!(inspection.summary.fields[0].bucket_entry_counts[17], 4);
+        assert!(inspection.findings.is_empty());
     }
 
     /// A default writer carries the codec's cap.

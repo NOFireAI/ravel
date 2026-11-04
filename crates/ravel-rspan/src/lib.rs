@@ -48,8 +48,9 @@ pub use columnar::{BytesColumn, ColumnarBlockView, I64Column};
 pub use error::SpanSegError;
 pub use footer::{SpanFooter, SuffixOutcome, decode_section, open, open_from_suffix, read_section};
 pub use key_index::{
-    KEY_IDX_BUCKET_MAX_ENTRIES, KeyIdxSummary, TRACE_ID_FIELD, TRACE_KEY_IDX_BUCKET_BITS,
-    TRACE_KEY_IDX_BUCKETS, TraceKeyProbe, encode_trace_key_idx, trace_key_idx_bucket,
+    KEY_IDX_BUCKET_MAX_ENTRIES, KeyIdxBlockFinding, KeyIdxInspection, KeyIdxSummary,
+    TRACE_ID_FIELD, TRACE_KEY_IDX_BUCKET_BITS, TRACE_KEY_IDX_BUCKETS, TraceKeyProbe,
+    encode_trace_key_idx, trace_key_idx_bucket, verify_block_ordinals,
 };
 pub use ranged::{BlockLoc, RspanRangeReader, TraceBlockSpan, TraceKeyBucket, TraceKeyStep};
 pub use reader::{RspanReader, ScanStats, SpanQuery};
