@@ -366,21 +366,28 @@ async fn unordered<B: QueryBackend>(
         return refused_with(CursorError::Invalid.failure(), Vec::new(), ctx);
     }
     let request = call.request(call.query.clone(), ctx);
-    let draft = match backend
+    let mut draft = match backend
         .sql_execute(ctx.tenant_hash, &request, ctx.now_ns, &[])
         .await
     {
         Ok(draft) => draft,
         Err(failure) => return refused_with(failure, Vec::new(), ctx),
     };
+    // The bounded page's next step goes in before the fit measures it, and
+    // comes out again from a page that is not bounded, which only shrinks it.
+    let bounded_step = unpaged.next_step();
+    let bounded_action = bounded_step.action.clone();
+    draft.envelope.next_steps.push(bounded_step);
     let mut envelope = draft.finish_page(
         &ctx.budgets,
         &call.scope(ctx),
         PageOrder::Partial,
         |_, _, _| Err(NoCursor::because(unpaged.no_cursor().to_string())),
     );
-    if envelope.status == Status::OkBounded {
-        envelope.next_steps.push(unpaged.next_step());
+    if envelope.status != Status::OkBounded {
+        envelope
+            .next_steps
+            .retain(|next| next.action != bounded_action);
     }
     envelope
 }
@@ -576,7 +583,9 @@ mod tests {
 
     use super::*;
     use crate::cursor::{CURSOR_KEY_LEN, CursorKey};
-    use crate::envelope::{Cell, Column};
+    use crate::draft::NoCursorSignal;
+    use crate::envelope::row_cap_sweep::assert_finished_inside_cap;
+    use crate::envelope::{Cell, Column, MAX_RESPONSE_BYTES_FLOOR};
     use crate::tools::tests::{Stub, block_on, test_context};
 
     const TOTAL: &str = "SELECT * FROM samples ORDER BY ts";
@@ -937,6 +946,52 @@ mod tests {
         let executed = stub.executed.borrow();
         assert_eq!(executed[0].request.sql, "SELECT * FROM logs");
         assert!(executed[0].order_columns.is_empty());
+    }
+
+    /// An unpaged statement's 13 rows cut to one by `max_rows`, the kept one
+    /// `len` bytes wide, packed right up to the byte cap with no identity
+    /// field reported: the page stays inside the cap with its
+    /// `add_an_order_by` step, the 12 omitted rows and `ok_bounded` written.
+    ///
+    /// Pushing the step after `finish_page` puts these over the cap, since
+    /// the fit never measured it.
+    #[test]
+    fn a_row_capped_unpaged_page_at_its_byte_cap_finishes_inside_it() {
+        let key = key();
+        let mut ctx = context(&key);
+        ctx.budgets.max_rows = 1;
+        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
+        let run_with = |len: usize| {
+            let mut envelope = Envelope::default();
+            envelope.data.columns = vec![Column {
+                name: "body".to_owned(),
+                r#type: "string".to_owned(),
+            }];
+            envelope.data.rows = (0..13)
+                .map(|i| {
+                    vec![Cell::Str(if i == 0 {
+                        "x".repeat(len)
+                    } else {
+                        String::new()
+                    })]
+                })
+                .collect();
+            envelope.data.row_count = 13;
+            let stub = Stub::default();
+            stub.sql.borrow_mut().push_back(Draft::new(
+                envelope,
+                Err(NoCursorSignal::ParquetJoin),
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                END_NS,
+            ));
+            let page = block_on(run(args("SELECT * FROM logs", None), &ctx, &stub));
+            assert_eq!(actions(&page), ["add_an_order_by"], "len {len}");
+            page
+        };
+        assert_finished_inside_cap(MAX_RESPONSE_BYTES_FLOOR, 12, run_with);
     }
 
     /// A statement ordered by a value computed from other rows that the

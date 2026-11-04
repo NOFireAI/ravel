@@ -1588,6 +1588,47 @@ impl Envelope {
     }
 }
 
+/// The byte-cap sweep every tool that applies a row cap of its own runs.
+#[cfg(test)]
+pub(crate) mod row_cap_sweep {
+    use super::{Envelope, Status, serialized_len};
+
+    /// Runs `run_with(len)`, a tool call whose response grows with `len` and
+    /// whose row cap omits `omitted` rows, at the widest response a
+    /// `requested_cap` byte cap leaves alone, the 16 below it, and the
+    /// narrowest it cuts. Each must finish `ok_bounded` with `row_cap_hit`,
+    /// count exactly `omitted` rows, and serialize to at most the cap.
+    pub(crate) fn assert_finished_inside_cap(
+        requested_cap: u64,
+        omitted: u64,
+        run_with: impl Fn(usize) -> Envelope,
+    ) {
+        let cap = requested_cap as usize;
+        let (mut lo, mut hi) = (0usize, cap);
+        assert!(!run_with(lo).presentation.bytes_cap_hit, "cut at 0");
+        assert!(run_with(hi).presentation.bytes_cap_hit, "not cut at {hi}");
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if run_with(mid).presentation.bytes_cap_hit {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let mut widest = 0;
+        for len in lo.saturating_sub(16)..=hi {
+            let envelope = run_with(len);
+            assert_eq!(envelope.status, Status::OkBounded, "len {len}");
+            assert!(envelope.presentation.row_cap_hit, "len {len}");
+            assert_eq!(envelope.presentation.rows_omitted, omitted, "len {len}");
+            let size = serialized_len(&envelope);
+            assert!(size <= cap, "len {len}: {size} B, over the {cap} B cap");
+            widest = widest.max(size);
+        }
+        assert!(widest + 16 >= cap, "the sweep peaked at {widest} B");
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
