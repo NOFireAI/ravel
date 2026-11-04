@@ -29,7 +29,9 @@ use ravel_query::{PhaseAccountingSnapshot, QueryPhase};
 use ravel_types::accounting::{AccessIntent, AccountedOp};
 use serde_json::{Value as Json, json};
 
-use crate::{DecodedCacheStats, IntentCacheCounts, SignalStats, SqlStats, StatementCacheStats};
+use crate::{
+    DecodedCacheStats, IntentCacheCounts, KeyIndexStats, SignalStats, SqlStats, StatementCacheStats,
+};
 
 /// One entry per [`QueryPhase`], in [`QueryPhase::ALL`] order, each phase
 /// exactly once: a phase added to the enum cannot be silently dropped from
@@ -146,14 +148,37 @@ pub fn signals_json(signals: &[SignalStats]) -> Vec<Json> {
     signals
         .iter()
         .map(|signal| {
-            json!({
+            let mut entry = json!({
                 "table": signal.table,
                 "segments": signal.segments,
                 "segmentsPruned": signal.segments_pruned,
                 "phases": phase_costs_json(&signal.phases),
-            })
+            });
+            if let (Some(figures), Some(object)) = (&signal.key_index, entry.as_object_mut()) {
+                object.insert("keyIndex".to_owned(), key_index_json(figures));
+            }
+            entry
         })
         .collect()
+}
+
+/// A spans `trace_id` lookup's key-index figures (ADR-3692 decision 7),
+/// rendered as `stats.keyIndex` and as the spans entry's `keyIndex` in
+/// `stats.signals`. See [`KeyIndexStats`] for what each counts;
+/// `leafWireBytes` is wire bytes of the leaf GETs.
+pub fn key_index_json(figures: &KeyIndexStats) -> Json {
+    json!({
+        "partsCovered": figures.parts_covered,
+        "partsUncovered": figures.parts_uncovered,
+        "partsBeyondCeiling": figures.parts_beyond_ceiling,
+        "leavesRejected": figures.leaves_rejected,
+        "reservationsRefused": figures.reservations_refused,
+        "leafGetRequests": figures.leaf_get_requests,
+        "leafWireBytes": figures.leaf_wire_bytes,
+        "keysProbed": figures.keys_probed,
+        "skippedByBudget": figures.skipped_by_budget,
+        "skipIdxDropped": figures.skip_idx_dropped,
+    })
 }
 
 /// The segment cache's movement over the statement's run, rendered under
@@ -467,6 +492,7 @@ mod tests {
                 segments_pruned: 2,
                 phases: samples.snapshot(),
                 budgets: None,
+                key_index: None,
             },
             SignalStats {
                 table: "logs",
@@ -474,6 +500,7 @@ mod tests {
                 segments_pruned: 0,
                 phases: logs.snapshot(),
                 budgets: None,
+                key_index: None,
             },
         ];
         let entries = signals_json(&signals);
@@ -497,6 +524,83 @@ mod tests {
         }
         assert_eq!(entries[0]["phases"][0]["s3ListRequests"], 1);
         assert_eq!(entries[1]["phases"][3]["s3GetRequests"], 1);
+    }
+
+    /// `key_index_json`'s key set is exactly the ten figures below, each
+    /// carrying its own field's value (distinct values, so a crossed wire
+    /// fails).
+    #[test]
+    fn key_index_json_names_every_field_exactly_once() {
+        let figures = KeyIndexStats {
+            parts_covered: 1,
+            parts_uncovered: 2,
+            parts_beyond_ceiling: 3,
+            leaves_rejected: 4,
+            reservations_refused: 5,
+            leaf_get_requests: 6,
+            leaf_wire_bytes: 7,
+            keys_probed: 8,
+            skipped_by_budget: 9,
+            skip_idx_dropped: 10,
+        };
+        let rendered = key_index_json(&figures);
+        let object = rendered.as_object().expect("keyIndex renders an object");
+        let expected = [
+            ("partsCovered", 1),
+            ("partsUncovered", 2),
+            ("partsBeyondCeiling", 3),
+            ("leavesRejected", 4),
+            ("reservationsRefused", 5),
+            ("leafGetRequests", 6),
+            ("leafWireBytes", 7),
+            ("keysProbed", 8),
+            ("skippedByBudget", 9),
+            ("skipIdxDropped", 10),
+        ];
+        let keys: std::collections::BTreeSet<&str> = object.keys().map(String::as_str).collect();
+        let names: std::collections::BTreeSet<&str> =
+            expected.iter().map(|(name, _)| *name).collect();
+        assert_eq!(keys, names);
+        for (name, value) in expected {
+            assert_eq!(rendered[name], value, "{name}");
+        }
+    }
+
+    /// A signal entry carrying key-index figures renders them under
+    /// `keyIndex` even when every figure is zero, and an entry without them
+    /// renders no `keyIndex` key.
+    #[test]
+    fn signals_json_renders_key_index_when_present_even_all_zero() {
+        let spans = PhaseAccounting::new();
+        let logs = PhaseAccounting::new();
+        let signals = [
+            SignalStats {
+                table: "spans",
+                segments: 0,
+                segments_pruned: 0,
+                phases: spans.snapshot(),
+                budgets: None,
+                key_index: Some(KeyIndexStats::default()),
+            },
+            SignalStats {
+                table: "logs",
+                segments: 0,
+                segments_pruned: 0,
+                phases: logs.snapshot(),
+                budgets: None,
+                key_index: None,
+            },
+        ];
+        let entries = signals_json(&signals);
+        assert_eq!(
+            entries[0]["keyIndex"],
+            key_index_json(&KeyIndexStats::default())
+        );
+        assert_eq!(entries[0]["keyIndex"]["partsCovered"], 0);
+        let logs_entry = entries[1]
+            .as_object()
+            .expect("signal entry renders an object");
+        assert!(!logs_entry.contains_key("keyIndex"));
     }
 
     /// `io_shape_json`'s key set is exactly the six fields below, no more and

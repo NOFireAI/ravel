@@ -28,8 +28,9 @@ A `trace_id =` query decodes only the blocks that can hold the trace. The
 skip index drops every block whose `trace_id` range excludes the target.
 Each object the skip index keeps is then probed in its KEY_IDX section, which
 indexes the first 8 bytes of every trace id the object holds. The probe is
-answered by small ranged reads: a 64 KiB first read of the object, then
-the index directory and one bucket, three requests per object. A trace
+answered by small ranged reads: the object's last 8 KiB (its footer), then
+the index directory and one bucket, at most three requests and about 11 KB
+per object, read before the object's skip index. A trace
 KEY_IDX does not find is absent
 from the object, so the object is not read further. The probe trades block
 reads for index reads: a lookup reads fewer bytes, but it can issue more
@@ -44,11 +45,35 @@ trace land on the same shard. In the objects of that shard they sort together
 into a contiguous block run.
 
 The catalog listing at query time does not use this routing. A `trace_id =`
-query lists and opens the segments of every shard in the matched time window,
-the same as any other query, and probes the KEY_IDX of each one the skip
-index keeps a block in. Objects KEY_IDX ruled out are counted in
+query lists the segments of every shard in the matched time window, the same
+as any other query, and probes the KEY_IDX of each one the skip index keeps
+a block in. Objects KEY_IDX ruled out are counted in
 `stats.pruning.segmentsPrunedByKeyIndex`, and the KEY_IDX reads are reported
-under the `keyIndex` entry of `stats.phases`. A `trace_id =` filter on the
+under the `keyIndex` entry of `stats.phases`.
+
+### Key-index leaves
+
+When the catalog is folded with key-index leaves (`ravel-server
+--fold-key-index-leaves`, or `ravel-cli catalog fold --key-index-leaves`),
+each folded part also carries a small index of the trace ids its objects
+hold. A `trace_id =` lookup reads two ranged GETs of that index per part,
+then opens only the objects that hold the trace, each at the blocks the
+index names, without reading their KEY_IDX. Objects of the part that do not
+hold the trace are not read at all. Objects no leaf covers (the unsealed
+tail, a part folded without leaves, and the parts past the lookup's
+ceiling of 1,024 parts or 2,048 leaf GETs) fall back to the per-object
+KEY_IDX probe above.
+
+Objects a leaf ruled out are also counted in
+`stats.pruning.segmentsPrunedByKeyIndex`. The response's `stats.keyIndex`
+reports what the lookup did: `partsCovered`, `partsUncovered`,
+`partsBeyondCeiling`, `leavesRejected`, `reservationsRefused`,
+`leafGetRequests`, `leafWireBytes`, `keysProbed`, `skippedByBudget` and
+`skipIdxDropped`. It is present only on a statement with a `trace_id`
+filter. [The query engine reference](../query-engine.md) defines each
+figure. The process exports `ravel_query_key_index_parts_total` by
+`signal` and `outcome`, and `ravel_query_key_index_leaf_gets_total` by
+`signal`. A `trace_id =` filter on the
 `logs` table probes log objects the same way when the tenant indexes
 `trace_id` (see
 [exact-key index fields](operations/configuration.md#exact-key-index-fields)).
@@ -124,10 +149,11 @@ SQL, pass `"start": 0`.
 
 A lookup without a window resolves every part of the tenant, so its cost
 grows with retention. Each covering part costs catalog reads, and each
-segment still costs a skip-index probe, even though only the blocks that can
-hold the trace are decoded. That stays true until Ravel gains an exact-key
-index for trace ids. When you know roughly when the trace ran, pass `start`
-and `end`.
+segment no leaf covers still costs a KEY_IDX probe, even though only the
+blocks that can hold the trace are decoded. On a catalog folded with
+key-index leaves, a covered part costs two leaf reads instead of one probe
+per object. When you know roughly when the trace ran, pass `start` and
+`end`.
 
 ## The `spans` table
 

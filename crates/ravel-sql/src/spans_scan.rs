@@ -81,6 +81,7 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_query::PhaseAccounting;
 use ravel_query::erasure::{ErasurePredicate, is_erased_span};
+use ravel_query::key_index_route::RouteFigures;
 use ravel_query::span_fetcher::KeyIndexPruning;
 use ravel_rspan::block::DecodedBlock;
 use ravel_rspan::record::{
@@ -126,6 +127,23 @@ const METRIC_SEGMENTS_PRUNED_BY_KEY_INDEX: &str = "segments_pruned_by_key_index"
 /// Metric name for the skip-index candidate blocks of an opened segment that
 /// KEY_IDX named no entry for.
 const METRIC_BLOCKS_PRUNED_BY_KEY_INDEX: &str = "blocks_pruned_by_key_index";
+
+/// The tier-2 router's figures (ADR-3692 decision 7), one global counter each,
+/// registered only when the scan carries a `trace_id` key so their presence is
+/// what tells the stats renderer a trace key was pushed down. Order matches
+/// [`KeyIndexFigureCounters::counts`].
+pub(crate) const METRIC_KEY_INDEX_FIGURES: [&str; 10] = [
+    "key_index_parts_covered",
+    "key_index_parts_uncovered",
+    "key_index_parts_beyond_ceiling",
+    "key_index_leaves_rejected",
+    "key_index_reservations_refused",
+    "key_index_leaf_get_requests",
+    "key_index_leaf_wire_bytes",
+    "key_index_keys_probed",
+    "key_index_skipped_by_budget",
+    "key_index_skip_idx_dropped",
+];
 
 /// The query-shape half of the columnar fast-path eligibility rule (ADR-0110
 /// decision 3), decided once at plan time by the provider and re-derived by the
@@ -207,7 +225,7 @@ pub struct SpansScanExec {
     fetcher: SpanSegmentFetcher,
     /// Round-robin segment assignment; `partitions[k]` runs as DataFusion
     /// partition `k`.
-    partitions: Vec<Vec<SegmentRef>>,
+    partitions: Vec<Vec<ScanSegment>>,
     /// The shared query handed to every segment fetch: the ts window and, on
     /// the fast path, the trace_id key. One query covers the whole scan.
     query: SpanQuery,
@@ -259,6 +277,59 @@ pub struct SpansScanExec {
     /// counters are written on both paths (#669), so a zero always means the
     /// decode did that much and never that the arm forgot to count.
     metrics: ExecutionPlanMetricsSet,
+    /// The tier-2 figures, `Some` exactly when `query` carries a trace key.
+    key_index_figures: Option<KeyIndexFigureCounters>,
+}
+
+/// One segment of a partition and the block set the tier-2 router named for
+/// it: `Some` reads exactly those blocks instead of the object's SKIP_IDX
+/// candidates, `None` leaves the choice to the object's own sections.
+#[derive(Clone)]
+struct ScanSegment {
+    seg: SegmentRef,
+    blocks: Option<Arc<[u32]>>,
+}
+
+/// The scan-wide `stats.keyIndex` counters. The router's figures are added
+/// once at plan time; `skip_idx_dropped` is shared with every partition.
+#[derive(Clone)]
+struct KeyIndexFigureCounters {
+    figures: [Count; 9],
+    skip_idx_dropped: Count,
+    tier2_pruned: Count,
+}
+
+impl KeyIndexFigureCounters {
+    fn register(metrics: &ExecutionPlanMetricsSet) -> Self {
+        let figures = std::array::from_fn(|i| {
+            MetricBuilder::new(metrics).global_counter(METRIC_KEY_INDEX_FIGURES[i])
+        });
+        KeyIndexFigureCounters {
+            figures,
+            skip_idx_dropped: MetricBuilder::new(metrics)
+                .global_counter(METRIC_KEY_INDEX_FIGURES[9]),
+            tier2_pruned: MetricBuilder::new(metrics)
+                .global_counter(METRIC_SEGMENTS_PRUNED_BY_KEY_INDEX),
+        }
+    }
+
+    fn add_route(&self, f: &RouteFigures, tier2_pruned: u64) {
+        let values = [
+            f.parts_covered,
+            f.parts_uncovered,
+            f.parts_beyond_ceiling,
+            f.leaves_rejected,
+            f.reservations_refused,
+            f.leaf_get_requests,
+            f.leaf_wire_bytes,
+            f.keys_probed,
+            f.skipped_by_budget,
+        ];
+        for (count, v) in self.figures.iter().zip(values) {
+            count.add(v as usize);
+        }
+        self.tier2_pruned.add(tier2_pruned as usize);
+    }
 }
 
 impl SpansScanExec {
@@ -282,9 +353,12 @@ impl SpansScanExec {
         accounting: QueryAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
-        let mut partitions: Vec<Vec<SegmentRef>> = vec![Vec::new(); n];
+        let mut partitions: Vec<Vec<ScanSegment>> = vec![Vec::new(); n];
         for (i, seg) in segments.iter().enumerate() {
-            partitions[i % n].push(seg.clone());
+            partitions[i % n].push(ScanSegment {
+                seg: seg.clone(),
+                blocks: None,
+            });
         }
         let full = spans_schema();
         // `Some(proj)` projects the schema so the scan emits the projected
@@ -306,6 +380,11 @@ impl SpansScanExec {
         let properties = Arc::new(Self::compute_properties(&schema, n, projection.as_deref())?);
         let accounting = PhaseAccounting::pooled_over(&accounting);
         let budget = ScanBudget::unlimited(&accounting);
+        let metrics = ExecutionPlanMetricsSet::new();
+        let key_index_figures = query
+            .trace_id
+            .is_some()
+            .then(|| KeyIndexFigureCounters::register(&metrics));
         Ok(SpansScanExec {
             tenant_hash,
             fetcher,
@@ -322,8 +401,47 @@ impl SpansScanExec {
             properties,
             accounting,
             budget,
-            metrics: ExecutionPlanMetricsSet::new(),
+            metrics,
+            key_index_figures,
         })
+    }
+
+    /// Apply the tier-2 router's answer for a `trace_id` lookup (ADR-3692
+    /// decision 3): `block_sets[i]` is the block set of the `i`th segment
+    /// [`new`](Self::new) took (`None` for one the router left to tier 1),
+    /// `figures` the router's figures, and `tier2_pruned` the segments it
+    /// pruned before this scan was built. Refuses a length mismatch, and a
+    /// scan with no trace key, which has nothing for the router to answer.
+    pub(crate) fn with_key_index_route(
+        mut self,
+        block_sets: Vec<Option<Vec<u32>>>,
+        figures: &RouteFigures,
+        tier2_pruned: u64,
+    ) -> DFResult<Self> {
+        let total: usize = self.partitions.iter().map(Vec::len).sum();
+        if block_sets.len() != total {
+            return Err(DataFusionError::Internal(format!(
+                "spans key-index route names {} block sets for {total} segments",
+                block_sets.len()
+            )));
+        }
+        let Some(counters) = &self.key_index_figures else {
+            return Err(DataFusionError::Internal(
+                "spans key-index route on a scan without a trace key".into(),
+            ));
+        };
+        counters.add_route(figures, tier2_pruned);
+        let n = self.partitions.len();
+        for (i, set) in block_sets.into_iter().enumerate() {
+            if let Some(slot) = self
+                .partitions
+                .get_mut(i % n)
+                .and_then(|p| p.get_mut(i / n))
+            {
+                slot.blocks = set.map(Arc::from);
+            }
+        }
+        Ok(self)
     }
 
     /// Record this scan's reads on `phases`, split by the phase that issued
@@ -475,6 +593,9 @@ impl ExecutionPlan for SpansScanExec {
             self.budget.clone(),
             metrics.blocks_decoded.clone(),
             metrics.key_index.clone(),
+            self.key_index_figures
+                .as_ref()
+                .map(|k| k.skip_idx_dropped.clone()),
         ));
         Ok(Box::pin(SpanScanStream {
             schema,
@@ -631,7 +752,7 @@ enum ColumnarAttempt {
 async fn prepare_partition(
     fetcher: SpanSegmentFetcher,
     tenant_hash: TenantHash,
-    segs: Vec<SegmentRef>,
+    segs: Vec<ScanSegment>,
     query: SpanQuery,
     service_name: Option<String>,
     name: Option<String>,
@@ -644,6 +765,7 @@ async fn prepare_partition(
     budget: ScanBudget,
     blocks_decoded: Count,
     key_index: KeyIndexCounters,
+    skip_idx_dropped: Option<Count>,
 ) -> DFResult<Prepared> {
     // The bloom predicates for this scan: one per pushed literal, field-scoped
     // to the column it names (ADR-0054). The same set applies to every segment.
@@ -685,6 +807,7 @@ async fn prepare_partition(
             &budget,
             &blocks_decoded,
             &key_index,
+            skip_idx_dropped.as_ref(),
         )
         .await?
         {
@@ -706,13 +829,13 @@ async fn prepare_partition(
     for seg in &segs {
         let fetched = fetcher
             .fetch_accounted_in_blocks(
-                seg,
+                &seg.seg,
                 tenant_hash,
                 &query,
                 duration_ns,
                 status_mask,
                 &predicates,
-                None,
+                seg.blocks.as_deref(),
                 &accounting,
             )
             .await
@@ -730,6 +853,9 @@ async fn prepare_partition(
         pages_skipped += output.pages_skipped;
         blocks_decoded.add(output.stats.blocks_scanned as usize);
         key_index.add(output.key_index);
+        if let Some(c) = &skip_idx_dropped {
+            c.add(output.skip_idx_dropped as usize);
+        }
         out.extend(output.records);
     }
     // Selective-erasure exclusion (ADR-0064 decision 2): applied
@@ -763,7 +889,7 @@ async fn prepare_partition(
 async fn prepare_columnar(
     fetcher: &SpanSegmentFetcher,
     tenant_hash: TenantHash,
-    segs: &[SegmentRef],
+    segs: &[ScanSegment],
     query: &SpanQuery,
     duration_ns: Option<(i64, i64)>,
     status_mask: Option<u8>,
@@ -773,25 +899,27 @@ async fn prepare_columnar(
     budget: &ScanBudget,
     blocks_decoded: &Count,
     key_index: &KeyIndexCounters,
+    skip_idx_dropped: Option<&Count>,
 ) -> DFResult<ColumnarAttempt> {
     let union = union_projected_columns(projection);
     let mut blocks: Vec<HeldBlock> = Vec::new();
     // Published only when the attempt is kept: a fallback re-fetches every
     // segment on the row path, which counts the same probes itself.
     let mut pruned = KeyIndexPruning::default();
+    let mut dropped = 0u64;
     let mut pages_decoded = 0usize;
     let mut pages_skipped = 0usize;
     for seg in segs {
         let fetched = fetcher
             .fetch_accounted_columnar_in_blocks(
-                seg,
+                &seg.seg,
                 tenant_hash,
                 query,
                 duration_ns,
                 status_mask,
                 predicates,
                 &union,
-                None,
+                seg.blocks.as_deref(),
                 accounting,
             )
             .await
@@ -803,6 +931,7 @@ async fn prepare_columnar(
         };
         pruned.segments_pruned += scan.key_index().segments_pruned;
         pruned.blocks_pruned += scan.key_index().blocks_pruned;
+        dropped += scan.skip_idx_dropped();
         // A block at or above the inline floor of the fetcher's read gate, when
         // it carries one (`SpanSegmentFetcher::with_read_gate`), decodes on the
         // gate, so this partition's future is pending and the worker free.
@@ -855,6 +984,9 @@ async fn prepare_columnar(
     keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let order: Vec<(usize, usize)> = keyed.into_iter().map(|(_, _, bi, r)| (bi, r)).collect();
     key_index.add(pruned);
+    if let Some(c) = skip_idx_dropped {
+        c.add(dropped as usize);
+    }
 
     Ok(ColumnarAttempt::Ready(ColumnarPartition {
         blocks,

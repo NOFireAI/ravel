@@ -54,7 +54,8 @@
 //! severity) and `ScrubLevel` (issue #1686, which part of the commit lineage
 //! -- `l0`/`l1`/`rewrite` -- a scrub target came from) both render `level`,
 //! `MergeMemoryKind`, `DeletedObjectKind` and, in a `sql` build, `DdlKind`
-//! render `kind`, `AlertOutcome`, `IpcryptOutcome`, `HeadHoldOutcome` and, in a `sql` build,
+//! render `kind`, `AlertOutcome`, `IpcryptOutcome`, `HeadHoldOutcome`, `KeyIndexOutcome` and,
+//! in a `sql` build,
 //! `DdlOutcome` render `outcome`, `ReadGateSite`, `WriteGateSite` and `MemoryRefusalSite`
 //! render `site`, and `FlushPhase`, `StrictAckPhase` and, in a `sql` build,
 //! `DdlPhase` render `phase`. `Label::RuntimeWorker(u32)` is bounded like `Label::Shard`, by its
@@ -510,6 +511,12 @@ pub enum Label {
     /// How a request held at the head ended (ADR-3718): `admitted` or
     /// `refused`. Shares the `outcome` key with `AlertOutcome`.
     HeadHoldOutcome(crate::ingest_hold::HoldOutcome),
+    /// How the key-index router settled one part (ADR-3692 decision 7):
+    /// `covered`, `uncovered`, `beyond_ceiling`, `rejected`,
+    /// `reservation_refused` or `skipped_by_budget`. A closed enum owned by
+    /// `ravel_query`, which also owns the spelling. Shares the `outcome` key
+    /// with `AlertOutcome`.
+    KeyIndexOutcome(ravel_query::key_index_route::KeyIndexPartOutcome),
 }
 
 /// The closed `phase` set of `ravel_agents_sweep_list_pages_total`.
@@ -789,6 +796,7 @@ impl Label {
             Label::StrictAckPhase(_) => "phase",
             Label::ProvisioningReadCause(_) => "cause",
             Label::HeadHoldOutcome(_) => "outcome",
+            Label::KeyIndexOutcome(_) => "outcome",
         }
     }
 
@@ -860,6 +868,7 @@ impl Label {
             Label::StrictAckPhase(phase) => phase.name().to_string(),
             Label::ProvisioningReadCause(cause) => cause.label().to_string(),
             Label::HeadHoldOutcome(outcome) => outcome.name().to_string(),
+            Label::KeyIndexOutcome(outcome) => outcome.as_str().to_string(),
         }
     }
 
@@ -4422,6 +4431,83 @@ fn render_heartbeat_age_family(out: &mut String, mode: Mode, age: std::time::Dur
         &[Label::Mode(mode)],
         age.as_secs_f64(),
     );
+}
+
+/// The key-index router's process totals (ADR-3692 decision 7), read from
+/// `ravel_query::key_index_route`'s globals: parts per routed signal and
+/// outcome, and leaf GETs per routed signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyIndexRouteTotals {
+    parts: Vec<(
+        Signal,
+        ravel_query::key_index_route::KeyIndexPartOutcome,
+        u64,
+    )>,
+    leaf_gets: Vec<(Signal, u64)>,
+}
+
+impl KeyIndexRouteTotals {
+    fn read() -> Self {
+        use ravel_query::key_index_route::{
+            KeyIndexPartOutcome, key_index_leaf_gets_total, key_index_parts_total,
+            key_index_routed_signals,
+        };
+        let signals = key_index_routed_signals();
+        KeyIndexRouteTotals {
+            parts: signals
+                .iter()
+                .flat_map(|signal| {
+                    KeyIndexPartOutcome::ALL.iter().map(|outcome| {
+                        (*signal, *outcome, key_index_parts_total(*signal, *outcome))
+                    })
+                })
+                .collect(),
+            leaf_gets: signals
+                .iter()
+                .map(|signal| (*signal, key_index_leaf_gets_total(*signal)))
+                .collect(),
+        }
+    }
+}
+
+/// The key-index router family (ADR-3692 decision 7): every part a trace or
+/// log key lookup routed, by the outcome that settled it, and the leaf GETs
+/// the routing issued. Every routed signal and outcome renders, zeros
+/// included, so a rate over `outcome="covered"` exists before the first
+/// lookup. Labels are `{mode, signal}` and `outcome`, all closed sets.
+fn render_key_index_route_family(out: &mut String, mode: Mode, totals: &KeyIndexRouteTotals) {
+    write_header(
+        out,
+        "ravel_query_key_index_parts_total",
+        "Catalog parts the key-index router settled for an exact-key lookup, by signal and outcome: covered parts answered from their leaves; every other outcome sends the part's segments to the per-object KEY_IDX probe.",
+        "counter",
+    );
+    for (signal, outcome, parts) in &totals.parts {
+        write_sample(
+            out,
+            "ravel_query_key_index_parts_total",
+            &[
+                Label::Mode(mode),
+                Label::Signal(*signal),
+                Label::KeyIndexOutcome(*outcome),
+            ],
+            *parts,
+        );
+    }
+    write_header(
+        out,
+        "ravel_query_key_index_leaf_gets_total",
+        "Key-index leaf GETs the router issued for exact-key lookups, by signal, including those of a routing pass dropped before it finished.",
+        "counter",
+    );
+    for (signal, gets) in &totals.leaf_gets {
+        write_sample(
+            out,
+            "ravel_query_key_index_leaf_gets_total",
+            &[Label::Mode(mode), Label::Signal(*signal)],
+            *gets,
+        );
+    }
 }
 
 /// The logs prune-selectivity family (ADR-0049):
@@ -9588,6 +9674,7 @@ pub fn render(
         render_audit_family(&mut out, mode, metrics);
     }
     render_query_postings_family(&mut out, mode, crate::query_postings_metrics::snapshot());
+    render_key_index_route_family(&mut out, mode, &KeyIndexRouteTotals::read());
     render_typed_attr_columns_family(&mut out, mode, crate::typed_attr_metrics::stale_fallbacks());
     if let Some(counters) = metadata_cache {
         render_metadata_cache_family(&mut out, mode, counters);
@@ -10731,6 +10818,7 @@ mod tests {
             Label::StrictAckPhase(StrictAckPhase::Request),
             Label::ProvisioningReadCause(ProvisioningReadCause::Store),
             Label::HeadHoldOutcome(crate::ingest_hold::HoldOutcome::Refused),
+            Label::KeyIndexOutcome(ravel_query::key_index_route::KeyIndexPartOutcome::Covered),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -10803,6 +10891,7 @@ mod tests {
                 Label::StrictAckPhase(_) => "phase",
                 Label::ProvisioningReadCause(_) => "cause",
                 Label::HeadHoldOutcome(_) => "outcome",
+                Label::KeyIndexOutcome(_) => "outcome",
             })
             .collect();
         assert_eq!(
@@ -10905,6 +10994,9 @@ mod tests {
                 "cause",
                 // HeadHoldOutcome (ADR-3718) reuses the `outcome` key.
                 "outcome",
+                // KeyIndexOutcome (ADR-3692 decision 7) reuses the `outcome`
+                // key.
+                "outcome",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), ADR-1692 decision 2's `shard` \
@@ -10919,8 +11011,8 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            48,
-            "exactly 48 label variants every build has, 27 distinct keys (sql adds DdlKind, \
+            49,
+            "exactly 49 label variants every build has, 27 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
@@ -11465,6 +11557,59 @@ mod tests {
                 "the dynamic-column budget is a log-only family: {line}"
             );
         }
+    }
+
+    /// The key-index router family renders one header per family, a parts
+    /// sample for every routed signal and every one of the six outcomes, and a
+    /// leaf-GET sample per routed signal, each carrying its own figure.
+    #[test]
+    fn key_index_route_family_renders_every_signal_and_outcome() {
+        use ravel_query::key_index_route::KeyIndexPartOutcome;
+        let signals = ravel_query::key_index_route::key_index_routed_signals();
+        let mut figure = 0;
+        let totals = KeyIndexRouteTotals {
+            parts: signals
+                .iter()
+                .flat_map(|signal| KeyIndexPartOutcome::ALL.map(|outcome| (*signal, outcome)))
+                .map(|(signal, outcome)| {
+                    figure += 1;
+                    (signal, outcome, figure)
+                })
+                .collect(),
+            leaf_gets: signals.iter().map(|signal| (*signal, 900)).collect(),
+        };
+        let mut out = String::new();
+        render_key_index_route_family(&mut out, Mode::Query, &totals);
+        for (name, kind) in [
+            ("ravel_query_key_index_parts_total", "counter"),
+            ("ravel_query_key_index_leaf_gets_total", "counter"),
+        ] {
+            assert_eq!(
+                out.matches(&format!("# TYPE {name} {kind}\n")).count(),
+                1,
+                "{out}"
+            );
+        }
+        assert_eq!(totals.parts.len(), 12, "two signals by six outcomes");
+        for (signal, outcome, parts) in &totals.parts {
+            let line = format!(
+                "ravel_query_key_index_parts_total{{mode=\"query\",signal=\"{}\",outcome=\"{}\"}} {parts}\n",
+                Label::Signal(*signal).value(),
+                outcome.as_str(),
+            );
+            assert_eq!(out.matches(&line).count(), 1, "{line} in:\n{out}");
+        }
+        for signal in ["spans", "logs"] {
+            let line = format!(
+                "ravel_query_key_index_leaf_gets_total{{mode=\"query\",signal=\"{signal}\"}} 900\n"
+            );
+            assert_eq!(out.matches(&line).count(), 1, "{line} in:\n{out}");
+        }
+        assert_eq!(
+            out.lines().filter(|l| !l.starts_with('#')).count(),
+            14,
+            "{out}"
+        );
     }
 
     /// The prune-selectivity family renders its three counters,
@@ -18926,11 +19071,18 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         )
     }
 
-    /// Every distinct `tenant_hash` value across the `ravel_query_*` lines.
+    /// A sample of the per-query cost family: a `ravel_query_*` line outside
+    /// the key-index router family, which is process-wide and carries no
+    /// tenant.
+    fn is_query_cost_line(line: &str) -> bool {
+        line.starts_with("ravel_query_") && !line.starts_with("ravel_query_key_index_")
+    }
+
+    /// Every distinct `tenant_hash` value across the per-query cost lines.
     fn query_tenant_hashes(body: &str) -> HashSet<String> {
         let mut out = HashSet::new();
         for line in body.lines() {
-            if !line.starts_with("ravel_query_") {
+            if !is_query_cost_line(line) {
                 continue;
             }
             let brace = line.find('{').expect("query sample carries labels");
@@ -18973,7 +19125,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         // The label set on every query sample is exactly {mode, tenant_hash,
         // workload_class} -- never a raw per-tenant dimension beyond the fold.
         for line in body.lines() {
-            if !line.starts_with("ravel_query_") {
+            if !is_query_cost_line(line) {
                 continue;
             }
             let brace = line.find('{').expect("query sample carries labels");
