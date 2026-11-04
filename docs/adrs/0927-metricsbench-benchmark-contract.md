@@ -1242,17 +1242,23 @@ Decision.
    the provenance `config`. It is neither cold nor warm in band 3's sense,
    and is not presented as either.
 2. Each engine's cache state over the query phase is disclosed beside the
-   results, in the run's readout and release notes:
-   - Ravel's fetch-cache hits, misses and GETs are the difference between the
-     two `/metrics` scrapes `run.sh` already writes:
-     `ravel-metrics-at-query.txt` before the query step and
-     `ravel-metrics-before-folded-readback.txt` after `validate`.
-   - Mimir's store-gateway S3 operations come from the box's
-     `store-metrics.log`.
-   - Prometheus and VictoriaMetrics serve from local storage.
+   results, in the run's readout and release notes. Each figure is the
+   difference between two `/metrics` scrapes `run.sh` takes immediately
+   before and after the query step, in the run's output directory:
+   - Ravel's fetch-cache hits and misses and its GET calls and bytes. Today
+     `run.sh` takes only the before scrape, `ravel-metrics-at-query.txt`. The
+     next scrape it writes, `ravel-metrics-before-folded-readback.txt`,
+     follows a restart and cannot be differenced with it.
+   - Mimir's store-gateway S3 operations. `run.sh` scrapes no Mimir
+     `/metrics` today.
 
-   All of these files are published with the run. The disclosure is
-   descriptive and never a gate.
+   Adding the after-query Ravel scrape and Mimir's before and after pair to
+   `run.sh` is a precondition of the first run under this amendment. A
+   minute-level scrape taken outside `run.sh` is not a substitute, since its
+   window is not the query step's.
+
+   Prometheus and VictoriaMetrics serve from local storage, which is stated,
+   not measured. The disclosure is descriptive and never a gate.
 3. Cold and warm regimes are both milestone M9 (#3794). Each regime's
    per-engine procedure (restart, page-cache drop, WAL handling, priming,
    statement ordering) is amended here, with the owner's approval, before
