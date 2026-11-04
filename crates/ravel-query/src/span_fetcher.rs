@@ -4711,7 +4711,7 @@ mod tests {
             .await
             .expect("fetch")
             .expect("relevant");
-        let mut want = vec![suffix.clone()];
+        let mut want = vec![suffix];
         want.extend(absent_reads.iter().cloned());
         let got = log.take(&fx.seg.data_object_key);
         assert_eq!(got, want, "suffix, then KEY_IDX, and nothing else");
@@ -4786,9 +4786,9 @@ mod tests {
             .await
             .expect("fetch")
             .expect("relevant");
-        let mut want = vec![suffix.clone()];
+        let mut want = vec![suffix];
         want.extend(key_reads.iter().cloned());
-        want.push(skip.clone());
+        want.push(skip);
         let got = log.take(&fx.seg.data_object_key);
         assert_eq!(got, want, "no BLOOM and no block read");
         assert!(!got.contains(&bloom));
