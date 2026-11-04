@@ -524,10 +524,16 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
     for input in &inputs {
         pending.push(load_input_catalog_noting_version::<C>(store, config, input));
     }
-    let mut catalogs: Vec<C::Catalog> = stream_iter(pending)
-        .buffered(config.input_read_concurrency.max(1))
-        .try_collect()
-        .await?;
+    let mut catalogs: Vec<C::Catalog> = Vec::with_capacity(inputs.len());
+    {
+        let mut loads =
+            std::pin::pin!(stream_iter(pending).buffered(config.input_read_concurrency.max(1)));
+        let mut load_state = C::LoadState::default();
+        while let Some(mut catalog) = loads.try_next().await? {
+            C::admit_catalog(config, &mut load_state, &mut catalog);
+            catalogs.push(catalog);
+        }
+    }
     // Both arms below pair inputs with catalogs by zipping, which stops at the
     // shorter side and would pass an input it never checked.
     if inputs.len() != catalogs.len() {

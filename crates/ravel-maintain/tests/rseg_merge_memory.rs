@@ -15,6 +15,7 @@
 mod common;
 
 use common::*;
+use ravel_maintain::read::label_heap_bytes;
 use ravel_maintain::{
     CompactionOutcome, CompactorConfig, FixedClock, MergeMemoryTracker, MergePhasePeaks,
     compact_bucket,
@@ -119,13 +120,29 @@ fn report(m: &Measured) {
     );
 }
 
+/// The exact label heap one copy of every bucket series' label set holds,
+/// as [`label_heap_bytes`] charges it. Depends on `S` and the label lengths
+/// only, never on `N`.
+fn bucket_label_heap_bytes() -> u64 {
+    (0..BUCKET_SERIES)
+        .map(|s| {
+            let labels = series_labels(s);
+            let pairs: Vec<(&str, &str)> = labels
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_str()))
+                .collect();
+            let (_, ls, _) = raw_series("http_requests_total", &pairs, &[]);
+            label_heap_bytes(&ls)
+        })
+        .sum()
+}
+
 /// Which components grow with `N * M` (the number of (input, series) catalog
-/// entries) and which with a single series or part. The ratios are asserted,
-/// not only printed: the catalog terms are a fixed cost per (input, series)
-/// entry, so 8x the inputs is close to 8x their bytes, while the decoded term
-/// is one series' merge (which grows with that series' contributions, `N / 8`)
-/// and the fetched and writer terms track the bucket's data, one sample per
-/// entry.
+/// entries) and which do not. The ratios are asserted, not only printed: the
+/// plan and index terms are a fixed cost per (input, series) entry, so 8x the
+/// inputs at the same `M` is close to 8x their bytes, while the label term is
+/// one shared copy per bucket series and the decoded, fetched and writer terms
+/// track one series, one window or one part.
 #[tokio::test]
 async fn rseg_merge_peak_resident_bytes_by_component() {
     let small = measure(64).await;
@@ -146,44 +163,42 @@ async fn rseg_merge_peak_resident_bytes_by_component() {
     }
 
     let ratio = |a: u64, b: u64| b as f64 / a as f64;
-    let catalog_ratio = ratio(
-        small.peaks.catalog_plan_heap_bytes + small.peaks.catalog_label_heap_bytes,
-        large.peaks.catalog_plan_heap_bytes + large.peaks.catalog_label_heap_bytes,
+    let plan_ratio = ratio(
+        small.peaks.catalog_plan_heap_bytes,
+        large.peaks.catalog_plan_heap_bytes,
     );
     let index_ratio = ratio(
         small.peaks.plan_index_heap_bytes,
         large.peaks.plan_index_heap_bytes,
     );
     println!(
-        "[rseg-merge-memory] N 64 -> 512: catalog x{catalog_ratio:.2} index x{index_ratio:.2}"
+        "[rseg-merge-memory] N 64 -> 512: catalog plan x{plan_ratio:.2} index x{index_ratio:.2}"
     );
-    // The planning catalogs and the index derived from them hold one entry per
+    // The plan structs and the index derived from them hold one entry per
     // (input, series): 8x the inputs at the same M is 8x the bytes, within the
     // fixed per-input and per-series overheads.
     assert!(
-        (7.5..=8.5).contains(&catalog_ratio),
-        "catalog terms grow with N * M: x{catalog_ratio:.2}"
+        (7.5..=8.5).contains(&plan_ratio),
+        "catalog plan term grows with N * M: x{plan_ratio:.2}"
     );
     assert!(
         (5.0..=8.5).contains(&index_ratio),
         "index term grows with N * M: x{index_ratio:.2}"
     );
-    // At the larger count the label sets the catalogs retain, one copy per
-    // (input, series), are the largest single component.
-    let p = &large.peaks;
-    let largest = [
-        p.catalog_plan_heap_bytes,
-        p.plan_index_heap_bytes,
-        p.fetched_raw_bytes,
-        p.decoded_heap_bytes,
-        large.writer,
-    ]
-    .into_iter()
-    .max()
-    .unwrap_or(0);
-    assert!(
-        p.catalog_label_heap_bytes > largest,
-        "catalog labels {} must dominate the other components (largest {largest})",
-        p.catalog_label_heap_bytes
-    );
+}
+
+/// The bound issue #3817 adds: the planning catalogs retain one label set per
+/// bucket series, shared by every input that carries it, so the label term is
+/// exactly one copy of the bucket's label sets at any input count.
+#[tokio::test]
+async fn rseg_merge_label_heap_is_independent_of_input_count() {
+    let bound = bucket_label_heap_bytes();
+    for inputs in [64, 512] {
+        let m = measure(inputs).await;
+        report(&m);
+        assert_eq!(
+            m.peaks.catalog_label_heap_bytes, bound,
+            "N={inputs}: the catalogs must retain one label set per bucket series"
+        );
+    }
 }

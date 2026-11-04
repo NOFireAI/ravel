@@ -77,6 +77,9 @@ pub trait SegmentCodec {
     /// stream/series directory), never the page/block bytes themselves.
     type Catalog;
 
+    /// State [`Self::admit_catalog`] keeps across one bucket's catalog loads.
+    type LoadState: Default;
+
     /// Decode one input object's footer/identity/catalog metadata (read.rs's
     /// job). MUST NOT retain page/block bytes: peak memory across all inputs is
     /// bounded by this metadata, not by the bucket's data.
@@ -105,6 +108,16 @@ pub trait SegmentCodec {
         catalogs: Vec<Self::Catalog>,
         input_set_hash: &[u8; 32],
     ) -> Result<Vec<BuiltPart>>;
+
+    /// Called once per loaded catalog, in canonical input order, before the
+    /// merge sees it. A codec may share metadata between inputs here; the
+    /// default keeps every catalog as loaded.
+    fn admit_catalog(
+        _config: &CompactorConfig,
+        _state: &mut Self::LoadState,
+        _catalog: &mut Self::Catalog,
+    ) {
+    }
 
     /// Reject an input set [`crate::rewrite::rewrite_and_publish`] must not
     /// run over, ahead of any decode or PUT. The default accepts everything:
@@ -149,6 +162,21 @@ pub struct RsegCodec;
 
 impl SegmentCodec for RsegCodec {
     type Catalog = crate::read::InputCatalog;
+    type LoadState = crate::read::LabelInterner;
+
+    /// Shares each series' label set across the inputs that carry it
+    /// ([`crate::read::intern_catalog_labels`]), so the retained labels are
+    /// one copy per distinct series rather than one per (input, series).
+    fn admit_catalog(
+        config: &CompactorConfig,
+        state: &mut Self::LoadState,
+        catalog: &mut Self::Catalog,
+    ) {
+        let labels = crate::read::intern_catalog_labels(state, catalog);
+        if let Some(t) = config.merge_memory_tracker.as_ref() {
+            t.add_catalog_plan_bytes(catalog.plan_heap_bytes(), labels);
+        }
+    }
 
     fn validate_rewrite_inputs(inputs: &[InputRecord]) -> Result<()> {
         use crate::build::OUTPUT_FORMAT_VERSION;
@@ -187,12 +215,7 @@ impl SegmentCodec for RsegCodec {
         config: &CompactorConfig,
         input: &InputRecord,
     ) -> Result<Self::Catalog> {
-        let catalog = crate::read::load_input_catalog(store, config, input).await?;
-        if let Some(t) = config.merge_memory_tracker.as_ref() {
-            let (plans, labels) = catalog.heap_estimate();
-            t.add_catalog_plan_bytes(plans, labels);
-        }
-        Ok(catalog)
+        crate::read::load_input_catalog(store, config, input).await
     }
 
     async fn build_parts(

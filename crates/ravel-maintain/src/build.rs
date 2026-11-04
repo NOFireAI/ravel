@@ -190,12 +190,24 @@ pub async fn build_parts(
     let input_set_hash16 = hex::encode(&input_set_hash[..8]);
     let ledger = config.request_ledger.as_ref();
     let tracker = config.merge_memory_tracker.as_ref();
-    // What `RsegCodec::load_input_catalog` charged for these catalogs; released
-    // when they drop at the end of this call.
-    let (catalog_plan_bytes, catalog_label_bytes) = catalogs
-        .iter()
-        .map(InputCatalog::heap_estimate)
-        .fold((0u64, 0u64), |(p, l), (cp, cl)| (p + cp, l + cl));
+    // What `RsegCodec::admit_catalog` charged for these catalogs, each shared
+    // label set once; released when they drop at the end of this call.
+    let (catalog_plan_bytes, catalog_label_bytes) = match tracker {
+        Some(_) => {
+            let mut seen = HashSet::new();
+            let mut labels = 0u64;
+            for series in catalogs.iter().flat_map(|c| &c.series) {
+                if seen.insert(std::sync::Arc::as_ptr(&series.labels)) {
+                    labels += crate::read::label_heap_bytes(&series.labels);
+                }
+            }
+            (
+                catalogs.iter().map(InputCatalog::plan_heap_bytes).sum(),
+                labels,
+            )
+        }
+        None => (0, 0),
+    };
 
     // Every input's exemplars, grouped by the series they name, in canonical
     // input order then each object's own stored order (ADR-0047 decision 3).
@@ -260,7 +272,7 @@ pub async fn build_parts(
         for (input_idx, plan) in contributions {
             let object_key = object_keys[input_idx];
             if labels.is_none() {
-                labels = Some(&plan.labels);
+                labels = Some(&*plan.labels);
                 kind = Some(plan.kind);
                 series_id = Some(plan.series_id);
             } else if kind != Some(plan.kind) {

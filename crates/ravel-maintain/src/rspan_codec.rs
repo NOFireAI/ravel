@@ -186,6 +186,7 @@ pub struct SpanCodec;
 
 impl SegmentCodec for SpanCodec {
     type Catalog = SpanInputCatalog;
+    type LoadState = ();
 
     async fn load_input_catalog(
         store: &dyn ObjectStoreBackend,

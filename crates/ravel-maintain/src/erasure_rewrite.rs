@@ -1119,7 +1119,7 @@ pub async fn build_rewrite(
     for (_id, contributions) in by_series {
         let (_, first) = contributions[0];
         let series_id = first.series_id;
-        let labels = first.labels.clone();
+        let labels = LabelSet::clone(&first.labels);
 
         let applicable: Vec<usize> = requests
             .iter()
@@ -3843,7 +3843,7 @@ mod tests {
             object_key: object_key.to_string(),
             series: vec![SeriesPlan {
                 series_id: series_id("alpha"),
-                labels: labels("alpha"),
+                labels: labels("alpha").into(),
                 kind: ValueKind::Scalar,
                 runs: vec![RunPlan {
                     created_unix_ns: 0,
