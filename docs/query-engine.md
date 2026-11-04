@@ -31,7 +31,8 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
             LABEL_DICT)
          -> plan page ranges, coalesce adjacent (gap <= 64 KiB), then on an
             L0 segment bridge the smallest remaining gaps down to at most
-            MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT (4) runs
+            MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT (4) runs; neither step joins
+            ranges into a run longer than the per-GET fetch share (below)
          -> ranged GETs -> decode pages -> per-series samples
        -> selective-erasure exclusion: every series or sample matching a
           predicate the snapshot carries in `pending_erasure` is dropped
@@ -1065,9 +1066,10 @@ leaves 48 runs that coalescing cannot join, which would be 48 page GETs.
 (`bound_runs`) until at most `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4) runs are
 left, on an L0 segment only.
 Scalar and histogram runs are planned and fetched in one batch, and the
-catalog sections go as one run (three on the dense path, four on the sparse
-catalog-probe path), so the bound holds per segment fetch whichever page
-kinds a query selects. One L0 fetch therefore costs at most
+catalog sections go as one run while they fit the byte cap below (three on the
+dense path, four on the sparse catalog-probe path), so the bound holds per segment fetch whichever page
+kinds a query selects. One L0 fetch of an object no longer than the byte cap
+described below therefore costs at most
 `MAX_GETS_PER_L0_SEGMENT_FETCH` = 7 GETs: the first GET, one footer chase, one
 catalog GET and 4 page GETs. Bridging moves the bytes in a bridged gap that
 the query did not ask for, which is the trade the bound makes: a bounded,
@@ -1081,6 +1083,22 @@ or under the threshold, or a sparse object that does not qualify for the
 catalog-probe path, whole.
 An L1 segment keeps unbounded page runs, since a compacted segment can be far
 larger than one flush and bridging its gaps would move far more.
+
+Both steps are capped in bytes (issue #3818). Neither coalescing nor bridging
+joins two non-overlapping needed ranges into a run longer than
+`SegmentFetcher::max_run_len`, the fetch memory budget's limit divided by the
+GET limiter's permit count: each in-flight GET's even share of the budget.
+Under `--memory-budget-bytes 6442450944` and `--fetch-concurrency 32` that is
+4,380,866,643 / 32 = 136,902,082 bytes. Without the cap, 64 KiB gaps between
+small pages of a large L1 part chain into one run spanning most of the part,
+and its gap bytes are reserved against the budget with the pages. The cap
+never splits a needed range: a range longer than the cap, or overlapping
+ranges, are fetched whole in one GET. A bridge the cap refuses stays open, so
+an L0 fetch can issue more than 4 page GETs when its object is longer than the
+cap; when more than the bound remain, every two adjacent runs span more than
+the cap, so a fetch over an object span `S` issues at most `2 * S /
+max_run_len + 1` page GETs. On the default unlimited budget the cap exceeds
+any object and nothing changes.
 
 ## Fetch-layer memory reservations
 
@@ -1131,7 +1149,10 @@ Reservation sites, each taken **before** its GET, with the guard's lifetime
 tied to the buffer it accounts for:
 
 - **RSEG range fetch** (`SegmentFetcher::ensure_ranges`): the sum of the
-  coalesced run lengths, reserved once ahead of the concurrent GETs. The guard
+  coalesced run lengths, reserved once ahead of the concurrent GETs. No run
+  joins needed ranges past `SegmentFetcher::max_run_len` (see the page-run
+  bound above), so a run that carries gap bytes is never longer than that
+  cap. The guard
   is held by the `FetchedRegions` the runs fill, so it releases when those
   region bytes drop.
 - **RLOG block-range fetch** (`BlockRangeFetcher`): a ranged read holds only
