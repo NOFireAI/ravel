@@ -299,17 +299,18 @@ step, still ends the run with `out/FAILED`, which names the failed
 command's log under `out/logs/` when it has one.
 
 A server that dies mid-call (the request connection drops rather than
-returning an HTTP error) fails that call, not the state: run.sh keeps the
-dying server's log under `out/logs/server-<N>.log`, appends a `calls.jsonl`
-line with outcome `server_died` (the statement, state, try, temp, the
-signal the server died on, and that log's path), restarts the server and
-retries the call. evaluate.py reports every figure a `server_died` call
-would have fed `missing`, with reason `server died during <statement>/
-<state> try N, signal S`, and the summary's problems list names the
-statement. Three deaths on the same call fail the state through the same
-`failed_states.jsonl`/`not-run` mechanism as any other failed command
-(step `server died 3 times during <statement>`), and the run goes on with
-the next state. At the end of every state, whether it failed or not, its
+returning an HTTP error) loses that one try, not the state: run.sh keeps
+the dying server's log under `out/logs/server-<N>.log`, appends a
+`calls.jsonl` line with outcome `server_died` (the statement, state, try,
+temp, the signal the server died on, and that log's path), restarts the
+server and moves on to the next planned call rather than repeating the
+dead one. evaluate.py reports every figure a `server_died` call would
+have fed `missing`, with reason `server died during <statement>/<state>
+try N, signal S`, and the summary's problems list names the statement.
+Three deaths across one statement's own tries fail the state through the
+same `failed_states.jsonl`/`not-run` mechanism as any other failed
+command (step `server died 3 times during <statement>`), and the run goes
+on with the next state. At the end of every state, whether it failed or not, its
 last server's log is also copied whole to `out/logs/server-<state>-last.log`
 (past 2 MB, only its last 2,000 lines, with a first line noting the
 truncation and the original size), so a state's server behavior is
