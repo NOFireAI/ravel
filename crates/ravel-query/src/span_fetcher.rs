@@ -645,11 +645,11 @@ impl SpanSegmentFetcher {
     /// decision 7, a key-index entry's block set).
     ///
     /// With a `trace_id`, the object is never read through `GetRange::Full`.
-    /// One ranged GET of the object's tail ([`DEFAULT_TRACE_PROBE_BYTES`];
-    /// an object no larger than that is read in one ranged GET of its full
-    /// length) yields the footer and, when the probe reaches them, SKIP_IDX
-    /// and BLOOM; a section it does not reach is one ranged GET of exactly
-    /// that section. The block run comes from
+    /// One ranged GET of the object's last 8 KiB, the fold's footer suffix
+    /// ([`DEFAULT_TRACE_PROBE_BYTES`]; an object no larger than that is read
+    /// in one ranged GET of its full length), yields the footer and, when the
+    /// suffix reaches them, KEY_IDX, SKIP_IDX and BLOOM; a section it does not
+    /// reach is one ranged GET of exactly that section. The block run comes from
     /// [`RspanRangeReader::trace_block_span`] when `blocks` is `None`, or,
     /// otherwise, from one [`RspanRangeReader::block_run_span`] per
     /// contiguous run of the intersection of `blocks` with this object's
@@ -675,15 +675,18 @@ impl SpanSegmentFetcher {
     /// ranged GET is a typed [`SpanFetchError::Store`], never a fallback to a
     /// whole-object read.
     ///
-    /// With `blocks` `None` and at least one candidate, the object's KEY_IDX
-    /// section is probed first (ADR-2707 decision 5): its `[0, prefix_len)`
-    /// and the one bucket the trace mixes to, the bucket skipped when the
-    /// directory says it is empty, each sliced from the tail probe when the
-    /// probe holds it and otherwise one ranged GET on `accounting.key_index()`.
-    /// An absent trace reads no block and counts the object in
-    /// [`SpanFetchOutput::key_index`]; a present one keeps the candidates the
-    /// index names, each adjacent run read from its first kept candidate to
-    /// its last. A corrupt or declining section is logged with the object key
+    /// With `blocks` `None`, the object's KEY_IDX section is probed before
+    /// SKIP_IDX is read (ADR-2707 decision 5): its `[0, prefix_len)` and the
+    /// one bucket the trace mixes to, the bucket skipped when the directory
+    /// says it is empty, each sliced from the footer suffix when the suffix
+    /// holds it and otherwise one ranged GET on `accounting.key_index()`. An
+    /// absent trace reads neither SKIP_IDX nor any block and counts the object
+    /// in [`SpanFetchOutput::key_index`]; a present one keeps the candidates
+    /// the index names, each adjacent run read from its first kept candidate
+    /// to its last. With a caller's set no KEY_IDX is read. When the known
+    /// blocks, the probe's or the caller's, hold no SKIP_IDX candidate of the
+    /// query window, the object is dropped after SKIP_IDX with no BLOOM or
+    /// block read and counted in [`SpanFetchOutput::skip_idx_dropped`]. A corrupt or declining section is logged with the object key
     /// and prunes nothing, so the rows are SKIP_IDX's; a failed probe GET is a
     /// [`SpanFetchError::Store`] like any other.
     ///
@@ -691,7 +694,7 @@ impl SpanSegmentFetcher {
     /// `(tenant_hash, content_hash, offset, len)`, so a repeated lookup is
     /// served from the cache with no GET. Each read is recorded on the phase
     /// that issued it, as one request plus the wire bytes it returned, or as
-    /// a cache hit or miss: the tail probe, the footer chase and the
+    /// a cache hit or miss: the footer suffix, the footer chase and the
     /// SKIP_IDX/BLOOM section reads on `accounting.probe()`, the phase the
     /// RLOG data read charges the same GET kinds to (`ReadPhases::SCAN`), each
     /// block-run GET on `accounting.scan()`. A run sliced out of the probe
