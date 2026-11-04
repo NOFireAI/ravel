@@ -268,12 +268,12 @@ pub(crate) fn report_range_scope(envelope: &mut Envelope, range: EvalRange) {
         start_ns,
         end_ns,
         step_ns,
+        last_step_ns: last_ns,
     } = range;
     envelope.scope.time_range = Some(TimeRange {
         start_ns: start_ns.to_string(),
         end_ns: end_ns.to_string(),
     });
-    let last_ns = range.last_step_ns();
     let predicates = &mut envelope.scope.predicates_applied;
     predicates.push(format!(
         "steps aligned to time_range.start_ns: {start_ns} + k * {step_ns} ns, every \
@@ -992,6 +992,30 @@ mod tests {
         ));
         assert_eq!(envelope.status, Status::Ok, "{envelope:?}");
         assert_eq!(stub.ranges.borrow().len(), 1);
+    }
+
+    /// A range whose `end - 1 - start` does not fit an `i64` is
+    /// `invalid_argument` before the backend runs, although its 9,001 steps
+    /// are under the step limit, because its last step cannot be computed.
+    ///
+    /// FLIP: computing the last step unchecked panics on the overflow in a
+    /// debug build and wraps to a wrong instant in a release build.
+    #[test]
+    fn a_range_whose_last_step_overflows_is_refused_before_the_backend() {
+        let key = key();
+        let ctx = test_context(&key);
+        let stub = Stub::default();
+        let start_ns = -9_000_000_000_000_000_000;
+        let end_ns = 9_000_000_000_000_000_000;
+        let envelope = block_on(run(range_args(start_ns, end_ns, "2000000s"), &ctx, &stub));
+        let failure = failure_of(&envelope);
+        assert_eq!(failure.class, FailureClass::InvalidArgument);
+        assert_eq!(
+            failure.message,
+            "time_range from -9000000000000000000 ns to 9000000000000000000 ns spans more \
+             than an i64 nanosecond count can hold, so its last step cannot be computed"
+        );
+        assert!(envelope.next_steps.is_empty(), "{:?}", envelope.next_steps);
     }
 
     /// `n` consecutive one-second samples of `name` from [`START_NS`].
