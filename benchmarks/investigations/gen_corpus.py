@@ -18,6 +18,12 @@ Time: every event-time hour is a function of the timestamp,
 hour = ts // 3600e9 - start_hour. A trace starts at least TRACE_MARGIN_NS
 before its hour ends, and every span and log of it lands before that end, so
 a trace and all of its rows share one hour.
+
+--even-hours gives every hour exactly traces / hours traces (trace i of the
+draw goes to hour i mod hours) instead of a uniform random hour per trace.
+Rows are written in trace-start order, so the file's rows then come in equal
+runs, one per hour: a strided load (`ravel-cli load --ingest-hour-stride`) at
+--batch-rows = rows / hours writes hour k's rows, and only those, as batch k.
 """
 import argparse
 import json
@@ -80,15 +86,15 @@ def hour_of(ts_ns, start_hour):
     return ts_ns // HOUR_NS - start_hour
 
 
-def draw_traces(rng, n, hours, start_hour, seen_ids):
+def draw_traces(rng, n, hours, start_hour, seen_ids, even=False):
     traces = []
     base_ns = start_hour * HOUR_NS
-    for _ in range(n):
+    for i in range(n):
         tid = rng.getrandbits(128)
         while tid in seen_ids or tid == 0:
             tid = rng.getrandbits(128)
         seen_ids.add(tid)
-        hour = rng.randrange(hours)
+        hour = i % hours if even else rng.randrange(hours)
         start = base_ns + hour * HOUR_NS + rng.randrange(HOUR_NS - TRACE_MARGIN_NS)
         traces.append(Trace(tid, start, rng.randrange(len(SERVICES)), rng.random() < 0.02))
     traces.sort(key=lambda t: (t.start_ns, t.trace_id))
@@ -359,7 +365,15 @@ def main(argv):
         action="store_true",
         help=f"the mixed state's extra hour: planted like the base corpus, with {REQUEST_ID_TAIL} as its present request id",
     )
+    ap.add_argument(
+        "--even-hours",
+        action="store_true",
+        help="exactly traces / hours traces in every hour (a many_parts_N strided load's corpus); "
+        "--traces must be a multiple of --hours",
+    )
     args = ap.parse_args(argv)
+    if args.even_hours and args.traces % args.hours:
+        ap.error(f"--even-hours needs --traces ({args.traces}) to be a multiple of --hours ({args.hours})")
     if args.traces < 1 or args.hours < 1 or args.spans_per_trace < 1 or args.logs_per_trace < 1:
         ap.error("--traces, --hours, --spans-per-trace and --logs-per-trace must be positive")
     if args.tail and args.noise_only:
@@ -370,7 +384,7 @@ def main(argv):
 
     rng = random.Random(args.seed)
     seen = set()
-    base = draw_traces(rng, args.traces, args.hours, args.start_hour, seen)
+    base = draw_traces(rng, args.traces, args.hours, args.start_hour, seen, args.even_hours)
     failing_hour = args.hours // 2
     hour_start_ns = (args.start_hour + failing_hour) * HOUR_NS
     hour_end_ns = hour_start_ns + HOUR_NS
@@ -401,7 +415,7 @@ def main(argv):
     noise = []
     if args.scale > 1:
         nrng = random.Random(f"{args.seed}:noise")
-        noise = draw_traces(nrng, (args.scale - 1) * args.traces, args.hours, args.start_hour, seen)
+        noise = draw_traces(nrng, (args.scale - 1) * args.traces, args.hours, args.start_hour, seen, args.even_hours)
         for t in noise:
             # Off the failing cell by timestamp: the hour is the trace's own.
             if t.service == FAILING_SERVICE and hour_of(t.start_ns, args.start_hour) == failing_hour:
@@ -561,6 +575,9 @@ def main(argv):
             "format": fmt,
             "noise_only": args.noise_only,
             "tail": args.tail,
+            # Only an even-hours corpus carries the key, so every other
+            # truth.json stays byte-identical to what it was.
+            **({"even_hours": True} if args.even_hours else {}),
         },
         "rows_written": {"spans": spans_sink.count, "logs": logs_sink.count},
         "unplanted_rows": {"spans": len(noise) * spt, "logs": len(noise) * lpt, "noise_traces": len(noise)},
