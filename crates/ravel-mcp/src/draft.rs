@@ -218,7 +218,11 @@ impl Draft {
     /// draft's pins and `scope` whenever the draft has a signal, capped or
     /// not. `presentation.rows_omitted` counts every row the caller does not
     /// get: the rows over `budgets.max_rows`, the rows the byte cap dropped,
-    /// and a trailing group [`PageOrder::Grouped`] held back.
+    /// and a trailing group [`PageOrder::Grouped`] held back. Every fit goes
+    /// through [`Envelope::fit_row_capped`], so the row cap's count and
+    /// `row_cap_hit` are inside what the byte cap measured; a held-back group
+    /// adds to the count only as its rows leave the page, which frees more
+    /// bytes than the count's digits grow by.
     ///
     /// The envelope is fitted with a stand-in cursor exactly [`CURSOR_BOUND`]
     /// serialized bytes long before `mint` runs, so the token, which is never
@@ -269,35 +273,28 @@ impl Draft {
             envelope.visibility.snapshot_id = hex(&pins.snapshot_id());
         }
 
-        let produced_rows = envelope.data.row_count;
         let max_rows = budgets.max_rows as usize;
         let pristine = envelope.data.rows.clone();
         let row_cap_omitted = pristine.len().saturating_sub(max_rows) as u64;
         envelope.data.rows.truncate(max_rows);
-        envelope.presentation.row_cap_hit |= row_cap_omitted > 0;
         envelope.presentation.cursor = None;
 
         let cap = budgets.max_response_bytes;
-        let finish = |mut fitted: Envelope, has_total_order: bool| {
-            fitted.presentation.rows_omitted += row_cap_omitted;
-            fitted.data.row_count = produced_rows;
-            fitted.finish(has_total_order)
-        };
         let unpaged = |mut envelope: Envelope, refusal: NoCursor| {
             envelope
                 .warnings
                 .insert(0, format!("no cursor: {}", refusal.reason));
             envelope.next_steps.extend(refusal.next_step);
-            finish(envelope.fit(cap), false)
+            envelope.fit_row_capped(cap, row_cap_omitted).finish(false)
         };
 
-        let probe = envelope.clone().fit(cap);
+        let probe = envelope.clone().fit_row_capped(cap, row_cap_omitted);
         let presentation = &probe.presentation;
         let capped = presentation.row_cap_hit
             || (presentation.bytes_cap_hit
                 && (presentation.rows_omitted > 0 || presentation.cells_truncated > 0));
         if !capped || probe.failure.is_some() || matches!(order, PageOrder::Partial) {
-            return finish(probe, false);
+            return probe.finish(false);
         }
         let pins = match pins {
             Ok(pins) => pins,
@@ -306,7 +303,7 @@ impl Draft {
 
         let mut placed = envelope.clone();
         placed.presentation.cursor = Some("c".repeat(CURSOR_BOUND - 2));
-        let mut fitted = placed.fit(cap);
+        let mut fitted = placed.fit_row_capped(cap, row_cap_omitted);
         let fit_rows = fitted.data.rows.len();
         let mut kept = fit_rows;
         let mut no_complete_group = None;
@@ -339,9 +336,9 @@ impl Draft {
                 let over_bound = serialized_str_len(&token) > CURSOR_BOUND;
                 fitted.presentation.cursor = Some(token);
                 if over_bound {
-                    fitted = fitted.fit(cap);
+                    fitted = fitted.fit_row_capped(cap, row_cap_omitted);
                 }
-                finish(fitted, true)
+                fitted.finish(true)
             }
             Err(refusal) => unpaged(envelope, refusal),
         }

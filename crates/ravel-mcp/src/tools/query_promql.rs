@@ -60,10 +60,10 @@ pub const LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
 
 pub use super::promql_range::MAX_RANGE_POINTS;
 
-/// Room left below the fit cap for the presentation counters `fit` and this
-/// body set after the series are measured: four `u64` counters, zero when
-/// measured and at most 20 digits each, and two flags one byte longer when
-/// set.
+/// Room left below the fit cap for what `fit` and this body write after the
+/// series are measured: four `u64` counters, zero when measured and at most
+/// 20 digits each, and the 8 B a status grows by from `ok` to `ok_bounded`.
+/// A flag costs nothing here: `true` is shorter than `false`.
 const COUNTER_SLACK: usize = 128;
 
 /// The column names of the port's per-sample rows, in order.
@@ -234,12 +234,11 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Result<
     } else {
         SeriesCut::default()
     };
-    let mut fitted = envelope.fit(ctx.budgets.max_response_bytes);
-    fitted.presentation.rows_omitted += row_cap_omitted + cut.rows_omitted;
+    envelope.data.row_count = produced as u64;
+    let mut fitted = envelope.fit_row_capped(ctx.budgets.max_response_bytes, row_cap_omitted);
+    fitted.presentation.rows_omitted += cut.rows_omitted;
     fitted.presentation.cells_truncated += cut.samples_cut;
     fitted.presentation.bytes_cap_hit |= cut.rows_omitted > 0 || cut.samples_cut > 0;
-    fitted.presentation.row_cap_hit |= row_cap_omitted > 0;
-    fitted.data.row_count = produced as u64;
     Ok(fitted.finish(false))
 }
 

@@ -181,10 +181,8 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Envelop
     }
     envelope.warnings.push(basis(&plan.mode));
 
-    let matched = envelope.data.rows.len() as u64;
-    let mut fitted = envelope.fit(ctx.budgets.max_response_bytes);
-    fitted.data.row_count = matched;
-    fitted.finish(false)
+    envelope.data.row_count = envelope.data.rows.len() as u64;
+    envelope.fit(ctx.budgets.max_response_bytes).finish(false)
 }
 
 /// What the list is, stated once per response: which mode ran and what the

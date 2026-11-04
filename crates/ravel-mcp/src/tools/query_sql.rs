@@ -366,21 +366,28 @@ async fn unordered<B: QueryBackend>(
         return refused_with(CursorError::Invalid.failure(), Vec::new(), ctx);
     }
     let request = call.request(call.query.clone(), ctx);
-    let draft = match backend
+    let mut draft = match backend
         .sql_execute(ctx.tenant_hash, &request, ctx.now_ns, &[])
         .await
     {
         Ok(draft) => draft,
         Err(failure) => return refused_with(failure, Vec::new(), ctx),
     };
+    // The bounded page's next step goes in before the fit measures it, and
+    // comes out again from a page that is not bounded, which only shrinks it.
+    let bounded_step = unpaged.next_step();
+    let bounded_action = bounded_step.action.clone();
+    draft.envelope.next_steps.push(bounded_step);
     let mut envelope = draft.finish_page(
         &ctx.budgets,
         &call.scope(ctx),
         PageOrder::Partial,
         |_, _, _| Err(NoCursor::because(unpaged.no_cursor().to_string())),
     );
-    if envelope.status == Status::OkBounded {
-        envelope.next_steps.push(unpaged.next_step());
+    if envelope.status != Status::OkBounded {
+        envelope
+            .next_steps
+            .retain(|next| next.action != bounded_action);
     }
     envelope
 }

@@ -14,10 +14,14 @@ use serde_json::{Map, Value, json};
 
 use crate::catalog::{AgentEventsInput, AgentInput, AgentOperationInput, AgentSendInput};
 use crate::envelope::{
-    AnyJson, Budget, Cell, Column, Data, Envelope, Failure, FailureClass, NextStep, Row, Status,
+    AnyJson, Budget, CURSOR_BOUND, Cell, Column, Data, Envelope, Failure, FailureClass, NextStep,
+    Row, Status, serialized_str_len,
 };
 
 use super::ToolContext;
+
+/// The next step an `ok` events page carries.
+const RESUME_STEP: &str = "resume_events";
 
 /// The names [`dispatch_agents`] serves, in catalog order.
 pub const AGENTS_TOOLS: [&str; 6] = [
@@ -379,29 +383,52 @@ async fn events<B: AgentsBackend>(args: Value, ctx: &ToolContext<'_>, backend: &
     envelope.scope.order_by = vec!["event_seq".to_string()];
     envelope.presentation.row_cap_hit = returned >= limit as usize;
     let next_cursor = scalar_text(&body["next_cursor"]);
-    envelope.presentation.cursor = Some(next_cursor.clone());
 
-    let mut envelope = envelope.fit(ctx.budgets.max_response_bytes);
-    let kept = envelope.data.rows.len();
-    if kept < returned {
-        let resume = match kept.checked_sub(1) {
-            Some(last) => seqs[last].clone(),
-            None => input.cursor.clone().unwrap_or_default(),
-        };
-        envelope.presentation.cursor = Some(resume);
-    }
-    let resume_cursor = envelope.presentation.cursor.clone().unwrap_or(next_cursor);
-    let mut envelope = envelope.finish(true);
-    if envelope.status == Status::Ok {
+    // The fit measures the envelope with a stand-in cursor as wide as any
+    // cursor this page can end with, and with the resume step an `ok` page
+    // carries; a page that is not `ok` loses the step again, which only
+    // shrinks it.
+    let input_cursor = input.cursor.clone().unwrap_or_default();
+    let widest_cursor = seqs
+        .iter()
+        .chain([&next_cursor, &input_cursor])
+        .map(|cursor| serialized_str_len(cursor))
+        .max()
+        .unwrap_or(2)
+        .min(CURSOR_BOUND);
+    envelope.presentation.cursor = Some("c".repeat(widest_cursor.saturating_sub(2)));
+    if !envelope.presentation.row_cap_hit {
         let detail = match body.get("terminal").and_then(Value::as_str) {
             Some(terminal) => {
                 format!("the operation finished {terminal}; no later page holds its events")
             }
             None => format!(
-                "ravel_agent_events with cursor {resume_cursor} returns events after this page"
+                "ravel_agent_events with cursor {next_cursor} returns events after this page"
             ),
         };
-        envelope.next_steps.push(step("resume_events", &detail));
+        envelope.next_steps.push(step(RESUME_STEP, &detail));
+    }
+
+    let mut envelope = envelope.fit(ctx.budgets.max_response_bytes);
+    let kept = envelope.data.rows.len();
+    let cursor = if kept < returned {
+        match kept.checked_sub(1) {
+            Some(last) => seqs[last].clone(),
+            None => input_cursor,
+        }
+    } else {
+        next_cursor
+    };
+    if envelope.presentation.cursor.is_some() {
+        let wider = serialized_str_len(&cursor) > widest_cursor;
+        envelope.presentation.cursor = Some(cursor);
+        if wider {
+            envelope = envelope.fit(ctx.budgets.max_response_bytes);
+        }
+    }
+    let mut envelope = envelope.finish(true);
+    if envelope.status != Status::Ok {
+        envelope.next_steps.retain(|next| next.action != RESUME_STEP);
     }
     envelope
 }

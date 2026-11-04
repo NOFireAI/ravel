@@ -284,11 +284,10 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Result<
     let row_cap_omitted = produced.saturating_sub(max_rows) as u64;
     envelope.data.rows.truncate(max_rows);
     envelope.presentation.max_rows = ctx.budgets.max_rows;
-    let mut fitted = envelope.fit(ctx.budgets.max_response_bytes);
-    fitted.presentation.rows_omitted += row_cap_omitted;
-    fitted.presentation.row_cap_hit |= row_cap_omitted > 0;
-    fitted.data.row_count = produced as u64;
-    Ok(fitted.finish(false))
+    envelope.data.row_count = produced as u64;
+    Ok(envelope
+        .fit_row_capped(ctx.budgets.max_response_bytes, row_cap_omitted)
+        .finish(false))
 }
 
 /// What `accuracy.approximation` says: the word heuristic, the method, the
