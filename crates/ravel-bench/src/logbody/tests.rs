@@ -257,7 +257,12 @@ fn selected_grams_prune_more_than_trigrams_on_a_templated_needle() {
     let blocks = synthetic_blocks();
     let p = Pattern::parse("Exception writing block").unwrap();
     let tri = TrigramSets::build(&blocks);
-    let sel = GramIndex::build(&blocks, &[p.clone()], u64::MAX, &Params::default());
+    let sel = GramIndex::build(
+        &blocks,
+        std::slice::from_ref(&p),
+        u64::MAX,
+        &Params::default(),
+    );
     assert!(tri.survivors(&p).iter().all(|&k| k));
     let kept: Vec<usize> = (0..BLOCKS).filter(|&b| sel.survivors(&p)[b]).collect();
     assert_eq!(kept, [3, 11]);
@@ -275,7 +280,12 @@ fn selected_grams_prune_nothing_on_an_id() {
     }
     let blocks = synthetic_blocks();
     let p = Pattern::parse("7f3a9c2e").unwrap();
-    let sel = GramIndex::build(&blocks, &[p.clone()], u64::MAX, &Params::default());
+    let sel = GramIndex::build(
+        &blocks,
+        std::slice::from_ref(&p),
+        u64::MAX,
+        &Params::default(),
+    );
     // Every candidate is in every block, above the frequency threshold.
     assert_eq!(sel.candidates, 6 + 5 + 4 + 3);
     assert!(sel.grams.is_empty());
@@ -304,7 +314,12 @@ fn arms_never_drop_a_holder_and_agree_with_the_residual() {
 fn frequency_rule_redundancy_rule_and_byte_cap() {
     let blocks = synthetic_blocks();
     let p = Pattern::parse("Exception writing block").unwrap();
-    let sel = GramIndex::build(&blocks, &[p.clone()], u64::MAX, &Params::default());
+    let sel = GramIndex::build(
+        &blocks,
+        std::slice::from_ref(&p),
+        u64::MAX,
+        &Params::default(),
+    );
     let max_df = BLOCKS / 10;
     for (g, list) in &sel.grams {
         assert!(list.len() <= max_df, "{g:?}");
@@ -319,12 +334,17 @@ fn frequency_rule_redundancy_rule_and_byte_cap() {
     assert!(!sel.grams.iter().any(|(g, _)| g == b"on wr"));
 
     // A cap below one entry keeps nothing and so prunes nothing.
-    let tight = GramIndex::build(&blocks, &[p.clone()], 100, &Params::default());
+    let tight = GramIndex::build(&blocks, std::slice::from_ref(&p), 100, &Params::default());
     assert!(tight.bytes() <= 5);
     assert!(tight.survivors(&p).iter().all(|&k| k));
     // The cap holds at every size.
     for compressed in [200u64, 400, 800, 1600, 3200] {
-        let i = GramIndex::build(&blocks, &[p.clone()], compressed, &Params::default());
+        let i = GramIndex::build(
+            &blocks,
+            std::slice::from_ref(&p),
+            compressed,
+            &Params::default(),
+        );
         assert!(i.bytes() <= compressed / 20, "{compressed}: {}", i.bytes());
     }
 }

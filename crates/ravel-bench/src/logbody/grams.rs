@@ -455,8 +455,12 @@ impl GramIndex {
     }
 }
 
-/// Reads an index in [`INDEX_LAYOUT`] back into its grams and postings.
-pub fn decode(bytes: &[u8]) -> Option<(u32, Vec<(Vec<u8>, Vec<u32>)>)> {
+/// A gram and the blocks holding it.
+pub type Posting = (Vec<u8>, Vec<u32>);
+
+/// Reads an index in [`INDEX_LAYOUT`] back into its block count and its
+/// grams with their postings.
+pub fn decode(bytes: &[u8]) -> Option<(u32, Vec<Posting>)> {
     fn varint(b: &[u8], at: &mut usize) -> Option<u64> {
         let mut v = 0u64;
         for shift in (0..64).step_by(7) {
