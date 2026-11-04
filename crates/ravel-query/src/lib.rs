@@ -12,6 +12,7 @@ mod error;
 mod fetcher;
 pub mod http;
 pub mod io_shape;
+pub mod key_index_route;
 mod limiter;
 mod log_fetcher;
 pub mod log_series;

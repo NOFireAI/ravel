@@ -1034,7 +1034,8 @@ the part. The reader subtracts exactly those from coverage and scans them
 Coverage is read from the leaf header and never inferred from the tenant's
 current declaration.
 
-**Reader (proposed: no query path calls the probe yet).** For a lookup on
+**Reader (proposed: `ravel_query::key_index_route` implements it, and no
+query path calls the router yet).** For a lookup on
 `field = value`, the resolve narrows HEAD's parts
 to the window as `load_snapshot` does; a lookup with no time bound covers
 every part. A (part, field)'s slices tile the whole `key8` space: a single
@@ -1062,14 +1063,41 @@ is allocated, then the frame crc and the exact decompressed length are
 verified, and a binary search yields the `(entry_ordinal, block set)`
 matches; an empty bucket needs no GET 2 and answers absent from the
 directory alone. At most two ranged GETs per covering
-part, issued concurrently across parts, under a per-query ceiling of 2,048
-leaf GETs; parts beyond the ceiling are scanned, not probed, at either
-tier. Candidates are the matches over covered entries plus every uncovered
-segment: the entries a leaf lists as uncovered, every part without a leaf
-for the field, every leaf that failed validation, every segment above the
-watermark (the unsealed tail, listed) and every token-resolved segment, each
-of which the tier-1 probe may still prune; plus, scan-only and excluded
-from the tier-1 probe, every segment of a part the ceiling left unprobed.
+part for one key, issued concurrently across parts, under the per-statement
+ceilings `KEY_INDEX_LEAF_GET_CEILING` (`L_max`, 2,048 leaf GETs) and
+`KEY_INDEX_MAX_PROBED_PARTS` (`P_max`, 1,024 parts), both in
+`ravel_catalog` and read together through `key_index_root_shape`, which a
+test pins (ADR-3692 decision 2 asks root validation to lint them as well;
+no root shape lint exists yet). Parts are admitted in descending `entry_count`, ties
+by descending `watermark_hour`, until the next part's worst case would
+exceed `L_max` or the admitted count would exceed `P_max`; a part beyond
+either ceiling is uncovered and goes to the tier-1 probe like every other
+uncovered segment, never to a scan (ADR-3692 decision 2 amends ADR-2707
+decision 5's remainder rule). Candidates are the matches over covered
+entries plus every uncovered segment: the entries a leaf lists as
+uncovered, every part without a leaf for the field, every leaf that failed
+validation, every part the ceilings left unprobed, every segment above the
+watermark (the unsealed tail, listed) and every token-resolved segment,
+each of which the tier-1 probe may still prune.
+
+A key set of 1 to 1,024 keys (`IN`, ADR-3692 decision 2) issues GET 1 once
+per (part, slice) the set touches. A part's worst case, admitted against
+`L_max` before GET 1, is `1 + min(k, 2^bucket_bits, B_run)` per touched
+slice, with `B_run` = `KEY_INDEX_SET_PROBE_MAX_RUNS` (64); once the probe
+has run, the GETs it did not issue go back to the budget and the first
+part that did not fit is evaluated again, so the admitted set is the one
+sequential evaluation would give. When the set touches at most `B_run`
+non-empty buckets of a slice, each is one GET 2. Above `B_run`, the buckets
+are sorted by body offset and the smallest gaps between them are bridged
+until at most `B_run` ranged reads remain; the bridged gap bytes are read
+and discarded, and the read is taken only when they total at most
+`entry_count x KEY_INDEX_T1_BYTES` (11 KiB) for the part, the tier-1 cost
+the part's segments would otherwise pay. Otherwise the part is uncovered
+for the statement and no further leaf byte is read. Before a frame is
+decoded, its decoded bound (`decoded_bound`, `8 x uncompressed_len + 64`
+bytes) is reserved through the statement's memory handle; a refused
+reservation leaves the part uncovered and counts it, and never fails the
+statement.
 Spans lookups also drop
 every entry and tail object outside the shard `shard_for_span` selects for
 that hour's generation (ADR-0052). These probes are their own cost phase
