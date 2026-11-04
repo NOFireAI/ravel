@@ -74,7 +74,6 @@ use ravel_mcp::tools::analyze_timeseries::{
 use ravel_promql::{RangeMatrix, RangeValue, Value as PromValue};
 use ravel_query::http::{InstantRequest, MetadataRequest, RangeRequest};
 use ravel_query::{PhaseAccountingSnapshot, QueryPhase, QueryStats, RequestBudgets};
-use ravel_sql::TargetSignal;
 use ravel_types::{CommitToken, Signal, TenantHash};
 use rmcp::model::{ProgressNotificationParam, ProgressToken};
 use rmcp::service::{Peer, RoleServer};
@@ -200,8 +199,10 @@ impl ServiceBackend {
     /// The envelope of an operation whose outcome carries a full
     /// [`QueryStats`]: its spend, its per-phase split, and its coverage,
     /// before the caps, for a tool that reshapes the rows before it caps
-    /// them. Every such operation reads the metrics catalog, so its estimate
-    /// is bounded exactly where a `samples` statement's is.
+    /// them. Every such operation's estimate comes from
+    /// `ravel_query::engine::estimate_cost`, which bounds all three
+    /// components from the resolved snapshot's segment metadata, so none is
+    /// reported unbounded.
     fn uncapped_stats_envelope(
         &self,
         mut envelope: Envelope,
@@ -217,7 +218,7 @@ impl ServiceBackend {
                 accounting: &stats.accounting,
                 estimate: &stats.estimate,
                 phases: Some(&stats.phase_accounting),
-                unbounded: unbounded_for(TargetSignal::Metrics),
+                unbounded: &[],
             },
         );
         envelope
@@ -750,15 +751,7 @@ impl QueryBackend for ServiceBackend {
             .sql_explain(tenant_hash, request)
             .await
             .map_err(failure)?;
-        let unbounded = report
-            .unbounded_components
-            .iter()
-            .map(|name| {
-                EstimateComponent::from_field_name(name).ok_or_else(|| {
-                    d4::internal(format!("sql explain: unknown estimate component {name}"))
-                })
-            })
-            .collect::<Result<Vec<_>, Failure>>()?;
+        let unbounded = estimate_components("sql explain", &report.unbounded_components)?;
         Ok(ExplainOutcome {
             target: report.target,
             plan_text: report.plan_text,
@@ -866,54 +859,22 @@ fn metric_kind_name(kind: MetricKind) -> &'static str {
     }
 }
 
-/// The estimate components the SQL estimator cannot bound for one target.
-///
-/// The same table, target by target, as ravel-sql's private
-/// `unbounded_estimate_components`, which `sql_explain` reports through
-/// [`ExplainOutcome::unbounded`]; the two must agree, or `ravel_explain_query`
-/// and `ravel_query_sql` call one statement's estimate bounded and unbounded.
-fn unbounded_for(target: TargetSignal) -> &'static [EstimateComponent] {
-    match target {
-        TargetSignal::Metrics => &[],
-        TargetSignal::Logs | TargetSignal::Spans | TargetSignal::Alerts | TargetSignal::Audit => {
-            &[EstimateComponent::DecompressedBytes]
-        }
-        TargetSignal::Parquet => &[
-            EstimateComponent::Requests,
-            EstimateComponent::StoreBytes,
-            EstimateComponent::DecompressedBytes,
-        ],
-    }
-}
-
-/// [`unbounded_for`] over every signal table an executed statement resolved,
-/// and over its Parquet tables when it read any, each component once. A
-/// summed estimate is unbounded wherever one of its terms is.
-fn sql_unbounded(outcome: &ravel_sql::SqlOutcome) -> Result<Vec<EstimateComponent>, Failure> {
-    let mut targets = outcome
-        .signals
+/// ravel-sql's names for the estimate components it cannot bound, as the
+/// envelope's [`EstimateComponent`]s. `sql_explain` and `sql_envelope` both
+/// map the list ravel-sql computed over their own resolve with one rule, so
+/// explain and execute name the same components for one statement.
+fn estimate_components(
+    operation: &str,
+    names: &[&'static str],
+) -> Result<Vec<EstimateComponent>, Failure> {
+    names
         .iter()
-        .map(|signal| match signal.table {
-            "samples" => Ok(TargetSignal::Metrics),
-            "logs" => Ok(TargetSignal::Logs),
-            "spans" => Ok(TargetSignal::Spans),
-            "alerts" => Ok(TargetSignal::Alerts),
-            "audit" => Ok(TargetSignal::Audit),
-            other => Err(d4::internal(format!(
-                "sql execute: no estimate bound is known for table {other}"
-            ))),
+        .map(|name| {
+            EstimateComponent::from_field_name(name).ok_or_else(|| {
+                d4::internal(format!("{operation}: unknown estimate component {name}"))
+            })
         })
-        .collect::<Result<Vec<_>, Failure>>()?;
-    if outcome.reads_parquet {
-        targets.push(TargetSignal::Parquet);
-    }
-    let mut unbounded = Vec::new();
-    for component in targets.into_iter().flat_map(unbounded_for) {
-        if !unbounded.contains(component) {
-            unbounded.push(*component);
-        }
-    }
-    Ok(unbounded)
+        .collect()
 }
 
 impl ServiceBackend {
@@ -957,7 +918,7 @@ impl ServiceBackend {
         // The executor's own row cap stopped the stream, which is a cap this
         // envelope must report even when the D6 row cap did not fire.
         envelope.presentation.row_cap_hit = outcome.stats.row_cap_hit;
-        let unbounded = sql_unbounded(outcome)?;
+        let unbounded = estimate_components("sql execute", &outcome.unbounded_components)?;
         d4::spend(
             &mut envelope,
             &self.budgets,

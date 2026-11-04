@@ -1512,10 +1512,13 @@ mod with_mcp {
 
     /// `ravel_query_sql` and `ravel_explain_query` report the same
     /// `estimate_is_upper_envelope` for one statement, through the route: true
-    /// over `samples`, whose estimate is bounded, and false over `logs` and
-    /// `spans`, whose decompressed-byte figure the estimator cannot bound. The
-    /// executed call reports that figure as unknown, `null` and named in
-    /// `unbounded`, in the spelling the explain uses, not as its structural 0.
+    /// over `samples`, whose estimate is bounded, and false over `logs`,
+    /// `spans`, `alerts` and `audit`, whose decompressed-byte figure the
+    /// estimator cannot bound. The executed call reports that figure as
+    /// unknown, `null` and named in `unbounded`, in the spelling the explain
+    /// uses, not as its structural 0. A Parquet table is not reachable here
+    /// (the server runs with no `parquet_profiles`); ravel-sql's
+    /// `explain_and_execute_name_the_same_unbounded_components` pins that arm.
     ///
     /// FLIP: `estimate_is_upper_envelope: true` hard-coded on the SQL execute
     /// path fails the logs statement's flag; rendering the raw figure fails
@@ -1539,6 +1542,16 @@ mod with_mcp {
             ),
             (
                 "SELECT * FROM spans",
+                false,
+                serde_json::json!(["estimated_decompressed_bytes"]),
+            ),
+            (
+                "SELECT * FROM alerts",
+                false,
+                serde_json::json!(["estimated_decompressed_bytes"]),
+            ),
+            (
+                "SELECT * FROM audit",
                 false,
                 serde_json::json!(["estimated_decompressed_bytes"]),
             ),
