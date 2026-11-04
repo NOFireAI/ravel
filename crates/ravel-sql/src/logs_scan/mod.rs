@@ -427,6 +427,7 @@ use crate::scan_budget::ScanBudget;
 use ravel_logseg::record::canonical_value_bytes;
 
 mod batch;
+mod limit_hint;
 mod plan;
 mod scan;
 mod threshold;
@@ -439,6 +440,7 @@ use threshold::*;
 
 #[doc(hidden)]
 pub use batch::values_memo_build;
+pub(crate) use limit_hint::LogsLimitHint;
 pub(crate) use threshold::ConfirmTopKThreshold;
 
 /// Rows accumulated into one output batch before it is emitted.
@@ -1247,6 +1249,18 @@ pub struct LogsScanExec {
     /// fewer than `fetch` while more of a partition's owned data remains would
     /// silently under-answer the query and must never happen.
     fetch: Option<usize>,
+    /// The `fetch` of a `FilterExec` above this scan, installed by
+    /// [`LogsLimitHint`] when only pass-through nodes sit between them and no
+    /// TopK sits above. Unlike [`Self::fetch`] it never truncates output or
+    /// stops a partition: the filter above is inexact, so the scan cannot know
+    /// how many of its rows the filter keeps. It only tells the whole-segment
+    /// fast path that the query may stop early, so the serve-if-fits verdict's
+    /// directory reads are not awaited before the first open
+    /// ([`fast_path_verdict_future`]). Pinned by
+    /// `the_hint_does_not_truncate_a_scan_whose_filter_drops_most_rows` and
+    /// `a_like_limit_scan_skips_the_verdict_and_a_topk_keeps_it` in
+    /// `tests/logs_limit_hint.rs`.
+    limit_hint: Option<usize>,
     /// A dynamic filter pushed into this scan whose leading child is `ts`
     /// (ADR-2677 decision 6), kept for its `ts` threshold and never applied
     /// to a row: the TopK stays the exact evaluator. It changes nothing until
@@ -1800,6 +1814,7 @@ impl LogsScanExec {
                 .with_segments_pruned_by_stats(self.segments_pruned_by_stats)
                 .with_key_equals(Arc::clone(&self.key_equals))
                 .with_fetch_pushed(self.fetch)
+                .with_limit_hint(self.limit_hint)
                 .with_topk(self.topk.clone())
                 .with_scan_executions(self.scan_executions.clone())
                 .with_scan_budget(self.budget.clone())
@@ -1846,6 +1861,7 @@ impl LogsScanExec {
                 .with_segments_pruned_by_stats(self.segments_pruned_by_stats)
                 .with_key_equals(Arc::clone(&self.key_equals))
                 .with_fetch_pushed(self.fetch)
+                .with_limit_hint(self.limit_hint)
                 .with_topk(self.topk.clone())
                 .with_scan_executions(self.scan_executions.clone())
                 .with_scan_budget(self.budget.clone())
@@ -1931,6 +1947,13 @@ impl LogsScanExec {
     /// struct itself rather than starting from [`Self::build`].
     fn with_fetch_pushed(mut self, fetch: Option<usize>) -> Self {
         self.fetch = fetch;
+        self
+    }
+
+    /// Install (or carry across a rebuild) the non-truncating limit hint
+    /// [`LogsLimitHint`] computes; see [`Self::limit_hint`] the field.
+    fn with_limit_hint(mut self, limit_hint: Option<usize>) -> Self {
+        self.limit_hint = limit_hint;
         self
     }
 
@@ -2020,6 +2043,7 @@ impl LogsScanExec {
             segment_timing: self.segment_timing,
             segments_pruned_by_stats: self.segments_pruned_by_stats,
             fetch,
+            limit_hint: self.limit_hint,
             topk,
             full_schema: Arc::clone(&self.full_schema),
             schema: Arc::clone(&self.schema),
@@ -2171,6 +2195,7 @@ impl LogsScanExec {
             segment_timing: false,
             segments_pruned_by_stats: 0,
             fetch: None,
+            limit_hint: None,
             topk: None,
             full_schema: full,
             schema,
@@ -2916,7 +2941,11 @@ impl fmt::Debug for LogsScanExec {
             "LogsScanExec {{ partitions: {}, segments: {} }}",
             self.target_partitions,
             self.segments.len()
-        )
+        )?;
+        if let Some(hint) = self.limit_hint {
+            write!(f, " limit_hint={hint}")?;
+        }
+        Ok(())
     }
 }
 
@@ -2937,6 +2966,9 @@ impl DisplayAs for LogsScanExec {
         )?;
         if self.active_topk().is_some() {
             write!(f, ", topk_threshold=ts")?;
+        }
+        if let Some(hint) = self.limit_hint {
+            write!(f, ", limit_hint={hint}")?;
         }
         Ok(())
     }
@@ -3211,8 +3243,10 @@ impl ExecutionPlan for LogsScanExec {
                     );
                     // ADR-3326, serve-if-fits amendment: a `Contains` scan with
                     // a decoded cache awaits the one shared verdict before its
-                    // first open; the opens themselves are unchanged.
+                    // first open, unless it carries a limit hint and no
+                    // confirmed TopK; the opens themselves are unchanged.
                     let state = match fast_path_verdict_future(
+                        self.limit_hint.is_some() && self.active_topk().is_none(),
                         Arc::clone(&self.counts),
                         Arc::clone(&ctx),
                         Arc::clone(&self.segments),

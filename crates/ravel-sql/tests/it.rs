@@ -92,6 +92,8 @@ mod logs_differential;
 mod logs_fast_path_projection_routing;
 #[path = "logs_key_idx_reader_rule.rs"]
 mod logs_key_idx_reader_rule;
+#[path = "logs_limit_hint.rs"]
+mod logs_limit_hint;
 #[path = "logs_metadata_agg.rs"]
 mod logs_metadata_agg;
 #[path = "logs_not_equal_route.rs"]
