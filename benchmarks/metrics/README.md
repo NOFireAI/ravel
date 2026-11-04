@@ -1107,7 +1107,14 @@ step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
   `report.json` is computed from
   (`ravel_cost_latency_is_the_repetitions_own`). `accounting` and `phases`
   are `data.stats.accounting` and `data.stats.phases` copied as returned.
-  Comparator engines (Prometheus, VictoriaMetrics, Mimir) add nothing here
+  A `phases[]` entry carries Ravel's per-phase field names
+  (`s3GetRequests`, `s3GetWireBytes`, `s3ListRequests`, `cacheHits`,
+  `cacheMisses`, `cacheServedBytes` and more, `PhaseCostJson` in
+  `crates/ravel-query/src/http/json.rs`), not the pooled ones. A phase's
+  `s3GetWireBytes` and the pooled `accounting.s3GetBytes` count different
+  things, one phase's GET wire bytes with cache-served bytes excluded
+  against the whole query's pooled counter, and nothing here compares or
+  sums them. Comparator engines (Prometheus, VictoriaMetrics, Mimir) add nothing here
   (`ravel_cost_excludes_comparator_answers`). An answer with no
   `data.stats`, such as a timeout, still records its object, with
   `accounting` and `phases` both `null`
@@ -1137,7 +1144,7 @@ step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
     {"entry": "mb_single_counter_rate", "pass": 1, "rep": 1, "status": "ok",
      "latency_ms": 12.4,
      "accounting": {"s3GetRequests": 7, "s3GetBytes": 4096, "s3ListRequests": 1},
-     "phases": [{"phase": "scan", "s3GetRequests": 7, "s3GetBytes": 4096}]},
+     "phases": [{"phase": "scan", "s3GetRequests": 7, "s3GetWireBytes": 4096}]},
     {"entry": "mb_single_counter_rate", "pass": 1, "rep": 2, "status": "timeout",
      "latency_ms": 1000.9, "accounting": null, "phases": null}
   ],
