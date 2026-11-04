@@ -269,7 +269,10 @@ its keyIndex GETs at 2 x that count.
   path. Before the load `run.sh` runs the loader's check over the whole
   file (`box/lib/inv.py stride-check`, the same bound per batch); a corpus
   it would refuse records the state `not-run` with that refusal, instead
-  of loading a partial tenant. With the fix, the local lane with `states =
+  of loading a partial tenant; a check that could not run at all (no
+  pyarrow, an unreadable file: exit 70, its error on stderr) fails the
+  state with that log, since an unchecked corpus is not a refused one.
+  With the fix, the local lane with `states =
   ["unfolded", "many_parts_744"]` at 1,000 traces and `traces_per_hour = 1`
   loaded 744 objects into ingest hours 497525 to 498268 and measured row
   9 (744 covering parts, 747 resolve GETs, exact rows).
@@ -548,17 +551,20 @@ unchanged.
   in an X list and 2 in a quoted one. Against `MAX_STATEMENT_COMPLEXITY =
   1_000` (`:257`, checked at `:380-381`) and the 8 units of the rest of the statement,
   an X list (3n + 8) holds at most 330 keys and a quoted list (2n + 8) at
-  most 496. The guard stops counting at the cap plus one
-  (`complexity_guard.rs:469-472`, `:640-643`), so it reports 1001 for any
-  statement over the cap, whatever its length: the 1001 in a refusal is
-  where the scan stopped, not the statement's count. Box A's s3 run
-  (`investigations-20261104T001915Z-46224-17727`, main 3465163df) refused
-  its 1,000-key lists with exactly that text, which says nothing of one
-  unit per key or of a cap one key below 1,000. Measured against this tree's release
-  `ravel-server --features sql` on the local lane: an X list of 330 keys is
-  admitted and one of 331 refused, a quoted list of 496 admitted and one of
-  497 refused, and a 999-key list of either kind refused with the same
-  `statement complexity 1001`.
+  most 496. The guard stops counting once the count passes the cap
+  (`complexity_guard.rs:469-472`, `:640-643`), so for the IN lists the
+  harness sends, which add one unit at a time, it reports 1001 whatever the
+  list's length (a hint comment adds 2 or 3 units in one step, `:495-499`
+  and `:611`, so a refusal can also read 1002 or 1003): the figure in a
+  refusal is where the scan stopped, not the statement's count. Box A's s3
+  run (`investigations-20261104T001915Z-46224-17727`, main 3465163df)
+  refused its 1,000-key lists with exactly that text, which says nothing of
+  one unit per key or of a cap one key below 1,000. Measured 2026-11-04
+  against a release `ravel-server --features sql` built from main c322a283c
+  on the local lane: an X list of 330 keys is admitted and one of 331
+  refused, a quoted list of 496 admitted and one of 497 refused, and a
+  999-key list of either kind refused with the same `statement complexity
+  1001`.
 - Row 13's negative controls: decision 9's mutants are not built here, so
   the figure is `not-run` ("mutant controls not implemented") and the
   verdict is at best `incomplete`.

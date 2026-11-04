@@ -1123,20 +1123,23 @@ def stride_refusal(ends_ns, batch_rows, start_hour, stride, lag_ns, batches):
 
 
 def cmd_stride_check(args):
-    """Exit 0 printing the batch count when every batch passes, else exit 1
-    with the refusal on stdout (run.sh records it as the state's not-run
-    reason)."""
+    """Exit 0 printing the batch count when every batch passes; exit 1 with
+    the refusal on stdout when the loader would refuse a batch (run.sh
+    records it as the state's not-run reason); exit 70 with the error on
+    stderr when the check itself could not run (no pyarrow, an unreadable
+    file, a null event time), which run.sh records as a failed state, and
+    64 on a bad argument. Exit 1 means refused and nothing else."""
     try:
         import pyarrow.parquet as pq
     except ImportError as e:
         die(f"stride-check: {e}", 70)
-    try:
-        col = pq.read_table(args.parquet, columns=[args.event_column]).column(0)
-    except Exception as e:  # pyarrow raises its own error types
-        die(f"stride-check: {args.parquet}: {e}")
-    ends = [int(v) for v in col.cast("int64").to_pylist()]
     if args.batch_rows < 1:
         die("stride-check: --batch-rows must be at least 1", 64)
+    try:
+        col = pq.read_table(args.parquet, columns=[args.event_column]).column(0)
+        ends = [int(v) for v in col.cast("int64").to_pylist()]
+    except Exception as e:  # pyarrow raises its own error types; None fails int()
+        die(f"stride-check: {args.parquet}: {e}", 70)
     why = stride_refusal(ends, args.batch_rows, args.ingest_hour_start, args.stride, args.lag_ns, args.batches)
     if why:
         print(why)
