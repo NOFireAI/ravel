@@ -375,6 +375,12 @@ fn build_stats_json(
             "pruning".to_string(),
             ravel_sql::stats_json::pruning_json(&outcome.stats),
         );
+        if let Some(figures) = &outcome.stats.key_index {
+            map.insert(
+                "keyIndex".to_string(),
+                ravel_sql::stats_json::key_index_json(figures),
+            );
+        }
         if let Some(serde_json::Value::Object(accounting)) = map.get_mut("accounting") {
             accounting.insert(
                 "intValuesBuffers".to_string(),
