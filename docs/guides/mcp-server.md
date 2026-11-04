@@ -338,8 +338,8 @@ How the server shaped the result to fit the response cap:
 
 ### `budget`
 
-- `effective`: the server ceiling, the tenant ceiling, and your request,
-  combined to their minimum
+- `effective`: the server's ceiling and your request, combined to their
+  minimum. No per-tenant ceiling applies in this build.
 - `actual`: what the call spent
 - `estimate`: what the server estimated before it read anything, from
   `ravel_explain_query` and from each tool that runs a PromQL, analytics or
@@ -413,9 +413,15 @@ prefix of its samples, `ts_ns` and `value` of one length, and
 
 ## Budgets you can lower
 
-The effective budget for a call is the smallest of three values: the
-server's ceiling, the tenant's ceiling, and the value you sent. You can
-lower `deadline`, `max_rows`, `max_bytes_scanned`, `max_store_requests`, and
+The effective budget for a call is the smaller of two values: the
+server's ceiling and the value you sent. The server's ceilings come from two
+places, both server-wide: its query engine configuration sets the ceiling
+for `deadline_ms`, `max_bytes_scanned`, `max_store_requests` and
+`max_segments`, and its MCP budget configuration sets the ceiling for
+`max_response_bytes`, 4 MiB in this build, which has no setting to change
+it. `max_rows` has a fixed ceiling of 5,000. No per-tenant
+ceiling applies in this build. You can lower `deadline_ms`, `max_rows`,
+`max_bytes_scanned`, `max_store_requests`, `max_segments` and
 `max_response_bytes`. You cannot raise any of them past its ceiling.
 
 The deadline covers the whole tool call. A `ravel_search_logs` call with
@@ -491,11 +497,16 @@ instant, so the whole walk shares one window: a later cursor does not get a
 fresh one. The deadline of the call that returned a cursor does not shorten
 it; the next call runs under its own deadline.
 
+The server checks a cursor in this order and stops at the first failure:
+
 | Case | Failure |
 |---|---|
-| The server process that minted the cursor has since restarted. Only that process can redeem it. | `cursor_expired` |
-| A `ravel_query_sql` walk ordered by a count read different segments than page one. | `cursor_expired` |
-| The cursor is sent back for the wrong tenant, or is altered. | `cursor_invalid` |
+| The token is over 1 MiB, is not valid base64, or is not a cursor of this format and version. | `cursor_invalid` |
+| The token names another server process: the process that minted it has since restarted, or the process field was edited. Only the minting process can redeem a cursor, so this is checked before the token's integrity. | `cursor_expired` |
+| The token was altered in any other way, so its integrity check fails. | `cursor_invalid` |
+| The cursor is sent back for another tenant, to another tool, or with different arguments. | `cursor_invalid` |
+| The cursor's lifetime has passed. | `cursor_expired` |
+| A newer pending erasure, a change to the typed attribute columns, or (for a `ravel_query_sql` walk ordered by a count) a different segment set than page one read. | `cursor_expired` |
 
 Paging order differs per tool:
 
@@ -559,7 +570,12 @@ build. `ravel_query_sql`, `ravel_query_promql`, `ravel_search_logs`,
 with `unsupported`, and `ravel_find_labels` refuses one with
 `invalid_argument`. `ravel_capabilities`, `ravel_describe_data`,
 `ravel_explain_query` and the Ravel Agents tools do not list it in their
-input schemas, and ignore it like any other argument they do not list. The
+input schemas and ignore it. Not every unlisted argument is ignored: the
+server reads the six budget arguments (`max_rows`, `max_response_bytes`,
+`deadline_ms`, `max_bytes_scanned`, `max_store_requests`, `max_segments`)
+on every tool call, whether or not the tool's schema lists them, refuses a
+call with `invalid_argument` when one of them has the wrong type, and applies
+a well-typed one to the call's budget, clamped to its ceiling. The
 [reference](../reference/mcp.md#evidence-references) has the same list.
 
 The rest of this section describes the design. Redeeming a reference
