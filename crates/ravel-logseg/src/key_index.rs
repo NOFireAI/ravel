@@ -20,8 +20,8 @@ use std::ops::Range;
 
 use ravel_codec::key_idx::{
     KEY_IDX_MAX_NAME_LEN, KEY_IDX_VERSION_2, KEY_IDX_WRITER_BUCKET_BITS, KeyIdxBucket,
-    KeyIdxFieldInput, KeyIdxPrefix, bucket_index, encode_key_idx_with, key_idx_prefix_range,
-    verify_key_idx,
+    KeyIdxFieldInput, KeyIdxPrefix, bucket_index, decode_key_idx, encode_key_idx_with,
+    key_idx_prefix_range, verify_key_idx,
 };
 
 use crate::error::LogSegError;
@@ -567,10 +567,33 @@ where
     Ok(out)
 }
 
+/// One KEY_IDX entry whose block ordinal is at or past the object's level-0
+/// block count (`footer.block_count`): the same bound [`probe_ranged`]'s and
+/// [`KeyProbeBucket::finish`]'s refusals apply, reported for every entry a
+/// full walk finds instead of failing on the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyIdxBlockFinding {
+    pub field: String,
+    pub bucket: u32,
+    pub ordinal: u32,
+}
+
+/// A verified KEY_IDX summary together with every [`KeyIdxBlockFinding`] a
+/// full walk of the section reports. An empty `findings` is a clean section.
+#[derive(Debug, Clone)]
+pub struct KeyIdxInspection {
+    pub summary: KeyIdxSummary,
+    pub findings: Vec<KeyIdxBlockFinding>,
+}
+
 /// Verifies the section crc and every crc and frame of the object's whole
-/// KEY_IDX section, given its stored bytes, and returns its shape, for
-/// inspection. `Ok(None)` when the object has no KEY_IDX.
-pub fn summarize(footer: &LogFooter, section: &[u8]) -> Result<Option<KeyIdxSummary>, LogSegError> {
+/// KEY_IDX section, given its stored bytes, and reports every entry whose
+/// block ordinal is at or past `footer.block_count`, for inspection. `Ok(None)`
+/// when the object has no KEY_IDX.
+pub fn summarize(
+    footer: &LogFooter,
+    section: &[u8],
+) -> Result<Option<KeyIdxInspection>, LogSegError> {
     let Some(desc) = key_index_section(footer) else {
         return Ok(None);
     };
@@ -579,7 +602,44 @@ pub fn summarize(footer: &LogFooter, section: &[u8]) -> Result<Option<KeyIdxSumm
             "KEY_IDX section crc mismatch".into(),
         ));
     }
-    Ok(Some(verify_key_idx(section, desc.prefix_len)?))
+    let summary = verify_key_idx(section, desc.prefix_len)?;
+    let mut findings = Vec::new();
+    for field in decode_key_idx(section, desc.prefix_len)? {
+        for (key8, ordinal) in field.entries {
+            if u64::from(ordinal) >= footer.block_count {
+                findings.push(KeyIdxBlockFinding {
+                    field: field.name.clone(),
+                    bucket: bucket_index(&key8, summary.bucket_bits)?,
+                    ordinal,
+                });
+            }
+        }
+    }
+    // `decode_key_idx` orders each field's entries by `(key8, block)`, not by
+    // ordinal, so findings come out in an order a key's hash determines. Sort
+    // for a report that reads the same across runs and does not depend on
+    // that incidental order.
+    findings.sort_by(|a, b| (&a.field, a.bucket, a.ordinal).cmp(&(&b.field, b.bucket, b.ordinal)));
+    Ok(Some(KeyIdxInspection { summary, findings }))
+}
+
+/// Like [`summarize`], but fails fast: the first entry whose block ordinal is
+/// at or past `footer.block_count` is a typed error naming its field, bucket
+/// and ordinal, rather than collecting every one.
+pub fn verify_block_ordinals(
+    footer: &LogFooter,
+    section: &[u8],
+) -> Result<Option<KeyIdxSummary>, LogSegError> {
+    let Some(inspection) = summarize(footer, section)? else {
+        return Ok(None);
+    };
+    if let Some(finding) = inspection.findings.first() {
+        return Err(LogSegError::Corrupted(format!(
+            "KEY_IDX field {:?} bucket {} names block {}, object has {} blocks",
+            finding.field, finding.bucket, finding.ordinal, footer.block_count
+        )));
+    }
+    Ok(Some(inspection.summary))
 }
 
 #[cfg(test)]
@@ -688,6 +748,77 @@ mod tests {
         );
     }
 
+    /// A section with several entries whose block ordinal is at or past the
+    /// object's block count: `summarize` names every one (field, bucket,
+    /// ordinal), `verify_block_ordinals` fails on the first, and the probe
+    /// path refuses the same section, so inspector and probe agree.
+    #[test]
+    fn summary_reports_block_ordinals_past_the_count() {
+        let obj = object();
+        let footer = open(&obj).expect("open");
+        assert_eq!(footer.block_count, 4);
+        // Three fabricated entries, two different bad ordinals (4 and 5),
+        // both at or past the real block count of 4. This also makes the
+        // field's entry_count (4 real + 3 fabricated = 7) differ from the
+        // block count (4), so a mutant comparing against entry_count instead
+        // of block_count would find nothing here.
+        let rewritten = rewrite_key_index(&obj, RLOG_KEY_IDX_VERSION, |_, _, mut entries| {
+            entries.push((key8_i64(100), 4));
+            entries.push((key8_i64(101), 4));
+            entries.push((key8_i64(102), 5));
+            entries
+        })
+        .expect("rewrite");
+        let footer = open(&rewritten).expect("open");
+        assert_eq!(footer.block_count, 4);
+        let section = section_of(&rewritten, &footer);
+
+        let inspection = summarize(&footer, section)
+            .expect("summarize")
+            .expect("present");
+        assert_eq!(inspection.summary.fields[0].entry_count, 7);
+        assert_eq!(inspection.findings.len(), 3, "{:?}", inspection.findings);
+        for finding in &inspection.findings {
+            assert_eq!(finding.field, "user_id");
+        }
+        let mut ordinals: Vec<u32> = inspection.findings.iter().map(|f| f.ordinal).collect();
+        ordinals.sort_unstable();
+        assert_eq!(ordinals, vec![4, 4, 5]);
+
+        let err = verify_block_ordinals(&footer, section).expect_err("corrupted");
+        assert!(
+            matches!(&err, LogSegError::Corrupted(m) if m.contains("user_id") && m.contains("object has 4 blocks")),
+            "{err:?}"
+        );
+
+        // The probe path refuses the same section on one of the bad keys.
+        let probe_err = probe_source(&footer, &rewritten[..], "user_id", KeyType::I64, &key8_i64(100))
+            .expect_err("probe refuses");
+        assert!(
+            matches!(&probe_err, LogSegError::Corrupted(m) if m.contains("object has 4 blocks")),
+            "{probe_err:?}"
+        );
+    }
+
+    /// Every ordinal below the block count reports no finding (the unmodified
+    /// `object()` fixture: entry_count equals block_count at 4, and every
+    /// entry names a block strictly below it).
+    #[test]
+    fn summary_reports_no_finding_when_every_ordinal_is_below_the_count() {
+        let obj = object();
+        let footer = open(&obj).expect("open");
+        let section = section_of(&obj, &footer);
+        let inspection = summarize(&footer, section)
+            .expect("summarize")
+            .expect("present");
+        assert!(inspection.findings.is_empty());
+        assert_eq!(inspection.summary.fields[0].entry_count, 4);
+        let summary = verify_block_ordinals(&footer, section)
+            .expect("verify")
+            .expect("present");
+        assert_eq!(summary.fields[0].entry_count, 4);
+    }
+
     /// A flipped byte in the prefix or in a bucket fails its own crc as
     /// `Corrupted`, and `summarize` checks the section crc.
     #[test]
@@ -712,11 +843,12 @@ mod tests {
             ));
         }
         let section = &obj[desc.offset as usize..(desc.offset + desc.len) as usize];
-        let summary = summarize(&footer, section)
+        let inspection = summarize(&footer, section)
             .expect("summarize")
             .expect("present");
-        assert_eq!(summary.fields.len(), 1);
-        assert_eq!(summary.fields[0].entry_count, 4);
+        assert!(inspection.findings.is_empty());
+        assert_eq!(inspection.summary.fields.len(), 1);
+        assert_eq!(inspection.summary.fields[0].entry_count, 4);
     }
 
     fn section_of<'a>(obj: &'a [u8], footer: &LogFooter) -> &'a [u8] {
@@ -755,8 +887,10 @@ mod tests {
         let s2 = summarize(&f2, section_of(&v2, &f2))
             .expect("v2")
             .expect("present");
-        assert_eq!((s1.version, s2.version), (1, 2));
-        assert_eq!(s1.fields, s2.fields);
+        assert!(s1.findings.is_empty());
+        assert!(s2.findings.is_empty());
+        assert_eq!((s1.summary.version, s2.summary.version), (1, 2));
+        assert_eq!(s1.summary.fields, s2.summary.fields);
         assert_eq!(
             key_index_fields(&f1, whole(&v1)).expect("v1"),
             key_index_fields(&f2, whole(&v2)).expect("v2")
