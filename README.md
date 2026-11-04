@@ -18,12 +18,14 @@ Ravel can also run durable agents on the same bucket. See
 
 ![Ingesting one sample under strict acknowledgement, SIGKILLing the ravel-server container, replacing it with a fresh one, and reading the pre-kill sample back by its commit token.](docs/demo.gif)
 
-Strict acknowledgement is the default. Ravel acknowledges a request only after
-every batch its points contributed to has its data object durably stored and
-its commit record created. The response carries one commit token per shard
-those points flushed through.
+Strict acknowledgement is the default for OTLP and OTAP. Ravel acknowledges a
+request only after every batch its points contributed to has its data object
+durably stored and its commit record created. The response carries one commit
+token per shard those points flushed through.
 
-Buffered acknowledgement is opt-in per request. It
+Buffered acknowledgement is opt-in per request on OTLP and OTAP, and it is the
+default for Prometheus Remote Write, where the operator sets the mode for the
+whole process with `--remote-write-mode buffered|strict`. It
 acknowledges after admission and enqueue to a shard actor, and it returns no
 commit token. It gives up the crash guarantee of strict acknowledgement for
 lower write latency. A crash between that acknowledgement and the flush loses

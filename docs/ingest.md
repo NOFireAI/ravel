@@ -36,14 +36,21 @@ POST /api/v1/write (axum)
   -> negotiate RW1 vs RW2 (Content-Type, then X-Prometheus-Remote-Write-Version; else 415)
   -> snappy-decompress (capped) + protobuf decode (ravel-remote-write) -> ResolvedRequest
   -> normalize_resolved (ravel-remote-write) -> Vec<NormalizedPoint> + rejects
-  -> IngestRouter::write(tenant, points, mode=<strict flush policy>) -> WriteReceipt
+  -> IngestRouter::write(tenant, points, mode=<--remote-write-mode>) -> WriteReceipt
 ```
 
-This surface always writes in strict mode, with the flush policy
-`--strict-flush-policy` selects (`aged` by default, see Modes): it never
-reads `x-ravel-ingest-mode`, since a Remote Write sender treats any 2xx as
-durable and drops its WAL entry on that basis. A commit token still comes
-back in `x-ravel-commit-token`; RW2 responses additionally carry
+The operator sets this surface's mode for the whole process with
+`--remote-write-mode buffered|strict` (`RAVEL_REMOTE_WRITE_MODE`, default
+`buffered`; ADR-2793, Remote Write mode amendment). It never reads
+`x-ravel-ingest-mode`, so a client cannot choose its own mode. Under
+`buffered` a request is acknowledged after admission and enqueue, takes no
+pending strict-ack slot, and carries no commit token; a crash before the
+flush loses the acknowledged window, which matters here because a Remote
+Write sender treats any 2xx as durable and drops its WAL entry on that
+basis. Under `strict` a request is acknowledged after its commit record is
+stored, with the flush policy `--strict-flush-policy` selects (`aged` by
+default, see Modes), and its commit token comes back in
+`x-ravel-commit-token`. RW2 responses additionally carry
 `X-Prometheus-Remote-Write-Samples-Written` (and the histogram- and
 exemplar-written counterparts, currently always 0). Malformed input is
 400; shard backpressure and retryable store failures are mapped to a
@@ -198,8 +205,8 @@ OTLP gRPC services, the same admission layer takes a strict request's slot on
 its head, right after the in-flight permit and the credential check and before
 the body is read (ADR-2793, head pending-ack amendment). Strictness is the
 surface's: OTLP resolves `x-ravel-ingest-mode` exactly as the handler does,
-gRPC over the metadata the handler sees, and every Remote Write is strict
-whatever it carries. The slot is held through the body read and the decode,
+gRPC over the metadata the handler sees, and Remote Write is strict exactly
+when `--remote-write-mode strict` is set, whatever the request carries. The slot is held through the body read and the decode,
 handed to the router's submit, and returned when the ack resolves, the request
 deadline elapses, or the request ends without a write; a buffered write never
 takes one. Over the bound the request is refused at the head, with its
@@ -1906,7 +1913,8 @@ points landed in (a request spanning shards awaits all of them; the receipt
 carries max token per shard).
 `mode=buffered`: ack at enqueue. Selected per request with the header
 `x-ravel-ingest-mode: buffered`, honored for any tenant; Remote Write
-ignores the header and stays strict.
+ignores the header and takes its mode from `--remote-write-mode` (default
+`buffered`).
 
 Strict mode has two flush policies (ADR-2793). Both ack on the same
 contract; they differ only in when the flush a strict write waits on opens.
@@ -1933,8 +1941,8 @@ the stream-open metadata and applies to every batch on that stream:
 | `strict-aged` | strict, `aged` policy |
 | `strict`, absent, or any other value | strict, process default policy |
 
-Prometheus Remote Write reads no header and always uses the process
-default.
+Prometheus Remote Write reads no header; under `--remote-write-mode strict`
+it uses the process default policy.
 
 The arrival policy issues at most one flush per flush duration per (shard,
 tenant), about 60-70 ms on S3, so at most about 16 flushes per second
@@ -1955,7 +1963,8 @@ is refused at startup rather than clamped.
 On OTLP/HTTP, Remote Write and the unary OTLP gRPC services, ravel-server's
 admission layer takes the permit from that same budget at the request head,
 after the in-flight permit and the credential check, before the body is read,
-and only for a request the surface writes strictly (every Remote Write is).
+and only for a request the surface writes strictly (a Remote Write is only
+under `--remote-write-mode strict`).
 The refusal there is a head shed like the in-flight request ceiling above,
 answered after the in-flight permit is returned. The permit travels to the
 handler in a clonable `PendingAckHandle`, of which the layer keeps a clone

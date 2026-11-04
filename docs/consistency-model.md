@@ -30,7 +30,19 @@ through it, and keeping them apart is how to read it:
 
 ## Acknowledgement semantics
 
-Strict mode (default):
+Which mode a request gets depends on its surface:
+- OTLP (HTTP and gRPC) and OTAP: strict unless the request selects buffered
+  with `x-ravel-ingest-mode: buffered` (on OTAP, on the stream-open
+  metadata).
+- Prometheus Remote Write: the operator's `--remote-write-mode
+  buffered|strict` for the whole process, default `buffered` (ADR-2793,
+  Remote Write mode amendment). Remote Write reads no `x-ravel-ingest-mode`
+  header, so a client cannot choose. A Remote Write sender drops its WAL
+  entry on any 2xx, so under the default a crash between the ack and the
+  flush loses points the sender no longer holds; `strict` restores a
+  durable 2xx.
+
+Strict mode (default on OTLP and OTAP):
 - An OTLP export is acknowledged only after every batch it contributed to has
   (a) its L0 data object durably stored and (b) its commit record created.
 - The response carries a commit token set (header `x-ravel-commit-token`,
@@ -57,7 +69,8 @@ Strict mode (default):
   whose capped shard fails after a sibling committed answers the partial
   multi-shard commit error instead, which takes 503.
 
-Buffered mode (opt-in per request, named "buffered"):
+Buffered mode (opt-in per request on OTLP and OTAP, named "buffered"; the
+default on Remote Write):
 - Acknowledged after admission and enqueue to a shard actor. A crash between
   ack and flush loses the buffered window. Max flush delay bounds when the
   flush is triggered, not when it completes: the flush task then waits for a

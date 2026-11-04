@@ -147,24 +147,29 @@ a query can see the data. They are separate properties with separate rules.
 
 There are two acknowledgement modes.
 
-Strict acknowledgement is the default. An export is acknowledged only after
-every batch it contributed to has its L0 data object durably stored and its
-commit record created. The response carries a commit token set in the
-`x-ravel-commit-token` header, as a comma-separated list. The set has one
-token per shard that the request's points flushed through. After a strict
-acknowledgement, no crash of any Ravel process can lose that data.
+Strict acknowledgement is the default for OTLP ingest. An export is
+acknowledged only after every batch it contributed to has its L0 data
+object durably stored and its commit record created. The response carries a
+commit token set in the `x-ravel-commit-token` header, as a comma-separated
+list. The set has one token per shard that the request's points flushed
+through. After a strict acknowledgement, no crash of any Ravel process can lose that data.
 Object-store durability is the floor: the data survives anything that the
 object store survives.
 
-Buffered acknowledgement is opt-in per request. The response comes after
-admission and enqueue to a shard actor, and it returns no commit token. It is
-never described as durable. A crash between the acknowledgement and the flush
-loses the buffered window, which the maximum flush delay bounds. A clean
+Buffered acknowledgement is opt-in per request on OTLP ingest, and the
+default for Remote Write. The response comes after admission and enqueue to
+a shard actor, and it returns no commit token. It is never described as
+durable. A crash between the acknowledgement and the flush loses the
+buffered window, which the maximum flush delay bounds. A clean
 shutdown drains that window, so an orderly restart loses nothing. An abrupt
 process death does lose it.
 
-Buffered mode is offered on OTLP ingest only. Remote Write is strict-only,
-and it ignores a buffered-mode header on a request.
+On OTLP ingest a request selects buffered mode with a header. Remote Write
+ignores that header: the operator sets its mode for the whole process with
+the `--remote-write-mode buffered|strict` server flag, default `buffered`.
+A Remote Write sender drops its own copy of the points on any 2xx, so an
+operator who needs that 2xx to mean durable sets `--remote-write-mode
+strict`.
 
 A strict write's flush opens under one of two flush policies, with the
 same acknowledgement either way. `aged` waits for the buffer's age threshold
@@ -173,8 +178,8 @@ or as soon as the tenant's in-flight flush on that shard completes: lower
 latency, more object-store PUTs. The `--strict-flush-policy` server flag
 sets the default, `aged`. On OTLP ingest the `x-ravel-ingest-mode` header
 values `strict-arrival` and `strict-aged` override it for one request, and
-`strict`, an absent header, or an unknown value use it. Remote Write always
-uses the flag.
+`strict`, an absent header, or an unknown value use it. Remote Write under
+`--remote-write-mode strict` uses the flag.
 
 In both modes, admission failures such as limits, authentication, and quota
 reject before anything is buffered. So a rejection is never a silent loss.

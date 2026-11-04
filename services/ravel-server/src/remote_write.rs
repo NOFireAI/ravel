@@ -463,8 +463,8 @@ async fn remote_write(
         sink.observe(&tenant, tenant.hash(), metadata);
     }
 
-    // Strict mode only: a Remote Write 2xx must mean durable, so the
-    // buffered-mode header override is never consulted on this surface.
+    // The mode is the operator's `--remote-write-mode`; the
+    // `x-ravel-ingest-mode` header is never consulted on this surface.
     // The tenant's IPCrypt rules (ADR-2993). A resolve failure stores
     // nothing: writing the ruled labels in the clear is what the policy
     // exists to prevent, and the cause (logged with the tenant hash and rule
