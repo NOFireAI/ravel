@@ -805,8 +805,12 @@ def required_stamps(run_dir, cfg, live, problems):
 
     labels = labels_of("unfolded", cfg)
     want_folds = []
+    # fold_advance's fold stamps are wanted when fold_advance itself is live:
+    # live_states resolves it through DERIVED, so that is "mixed live and
+    # fold_advance neither failed nor not-run". Gating them on mixed would
+    # demand stamps a failed or skipped fold never wrote.
     for transition, when in (("folded_no_leaves", "folded_no_leaves"), ("folded_leaves", "folded_leaves"),
-                             ("leaf_rebuild", "folded_leaves"), ("fold_advance", "mixed")):
+                             ("leaf_rebuild", "folded_leaves"), ("fold_advance", "fold_advance")):
         if when in on:
             want_folds += [(transition, tenant_of(transition, lab, cfg), lab) for lab in labels]
     for s in on:
