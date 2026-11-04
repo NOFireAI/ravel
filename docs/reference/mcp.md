@@ -422,8 +422,12 @@ is `null` there and is named in `budget.estimate.unbounded`, and
 `estimate_is_upper_envelope` is true only when that list is empty. One
 statement gets the same list and the same flag from `ravel_explain_query`
 and from `ravel_query_sql`. A PromQL or analytics call takes its estimate
-from the PromQL engine's estimator, which bounds every component from the
-resolved segments, so its list is empty.
+from the PromQL engine's estimator, which covers the metrics lane and bounds
+every component of it from the resolved segments, so its list is empty. A
+query naming a log metric (`ravel_log_lines` or `ravel_log_bytes`) also
+spends through the log lane, which the estimate does not count, so it names
+every component in `unbounded` and reports `estimate_is_upper_envelope`
+false.
 
 ### Running a statement
 

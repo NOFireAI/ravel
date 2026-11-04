@@ -200,16 +200,22 @@ impl ServiceBackend {
     /// [`QueryStats`]: its spend, its per-phase split, and its coverage,
     /// before the caps, for a tool that reshapes the rows before it caps
     /// them. Every such operation's estimate comes from
-    /// `ravel_query::engine::estimate_cost`, which bounds all three
-    /// components from the resolved snapshot's segment metadata, so none is
-    /// reported unbounded.
+    /// `ravel_query::engine::estimate_cost` over the metrics lane's resolved
+    /// snapshot, which bounds all three components of that lane's spend. A
+    /// query naming a log metric also spends through the log lane, which the
+    /// estimate does not count, so it reports every component unbounded.
     fn uncapped_stats_envelope(
         &self,
         mut envelope: Envelope,
         stats: &QueryStats,
         partial: bool,
         warnings: Vec<String>,
-    ) -> Envelope {
+    ) -> Result<Envelope, Failure> {
+        let unbounded = if stats.estimate_excludes_log_lane {
+            estimate_components("promql log lane", &LOG_LANE_UNBOUNDED_COMPONENTS)?
+        } else {
+            Vec::new()
+        };
         d4::coverage(&mut envelope, partial, warnings);
         d4::spend(
             &mut envelope,
@@ -218,10 +224,10 @@ impl ServiceBackend {
                 accounting: &stats.accounting,
                 estimate: &stats.estimate,
                 phases: Some(&stats.phase_accounting),
-                unbounded: &[],
+                unbounded: &unbounded,
             },
         );
-        envelope
+        Ok(envelope)
     }
 
     /// One PromQL result value, as this envelope's data block. A scalar or a
@@ -480,7 +486,7 @@ impl QueryBackend for ServiceBackend {
         envelope.data = Self::value_data(outcome.value);
         let mut warnings = outcome.warnings;
         warnings.extend(outcome.infos);
-        Ok(self.uncapped_stats_envelope(envelope, &outcome.stats, outcome.partial, warnings))
+        self.uncapped_stats_envelope(envelope, &outcome.stats, outcome.partial, warnings)
     }
 
     async fn promql_range(
@@ -511,7 +517,7 @@ impl QueryBackend for ServiceBackend {
         };
         let mut warnings = outcome.warnings;
         warnings.extend(outcome.infos);
-        Ok(self.uncapped_stats_envelope(envelope, &outcome.stats, outcome.partial, warnings))
+        self.uncapped_stats_envelope(envelope, &outcome.stats, outcome.partial, warnings)
     }
 
     async fn labels(
@@ -630,7 +636,7 @@ impl QueryBackend for ServiceBackend {
         analytics_series_cap(matrix.len())?;
         envelope.data = analysis_data(args.op, matrix)?;
         let warnings = outcome.stats.warnings.clone();
-        Ok(self.uncapped_stats_envelope(envelope, &outcome.stats, outcome.partial, warnings))
+        self.uncapped_stats_envelope(envelope, &outcome.stats, outcome.partial, warnings)
     }
 
     async fn exemplars(
@@ -858,6 +864,14 @@ fn metric_kind_name(kind: MetricKind) -> &'static str {
         MetricKind::Unknown => "unknown",
     }
 }
+
+/// The estimate components a PromQL query that read the log lane cannot
+/// bound: the metrics-lane estimate counts none of that lane's spend.
+const LOG_LANE_UNBOUNDED_COMPONENTS: [&str; 3] = [
+    "estimated_requests",
+    "estimated_store_bytes",
+    "estimated_decompressed_bytes",
+];
 
 /// ravel-sql's names for the estimate components it cannot bound, as the
 /// envelope's [`EstimateComponent`]s. `sql_explain` and `sql_envelope` both
