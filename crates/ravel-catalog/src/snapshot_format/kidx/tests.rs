@@ -12,6 +12,12 @@ use ravel_proto::catalog::v1::SnapshotPartRef;
 use super::*;
 use crate::CatalogConfig;
 
+thread_local! {
+    /// zstd decompressions `decode_frame` started on this thread: a frame
+    /// refused before allocation leaves it unchanged.
+    pub(super) static FRAME_DECOMPRESSIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 const TENANT: TenantHash = TenantHash([7u8; 16]);
 const SIGNAL: Signal = Signal::Logs;
 const PART_ENTRY_COUNT: u64 = 8;
@@ -927,7 +933,19 @@ fn every_frame_corruption_is_a_typed_rejection() {
         "at or past part_entry_count",
     );
     expect_rejected(&one(raw_entry(k, 2, &[1]), 0), &k, &limits, "zero entries");
-    expect_rejected(&one(raw_entry(k, 2, &[1]), 2), &k, &limits, "truncated");
+    // Long enough that two entries pass the one-per-10-bytes bound, so the
+    // second entry's unterminated varint is what trips.
+    let mut cut = raw_entry(k, 2, &[1]);
+    cut.extend_from_slice(&k);
+    cut.extend_from_slice(&[0x80, 0x80]);
+    expect_rejected(&one(cut, 2), &k, &limits, "truncated");
+    // One entry spending the bytes a claimed second entry would need.
+    expect_rejected(
+        &one(raw_entry(k, 2, &[1; 11]), 2),
+        &k,
+        &limits,
+        "with 1 entries still to come",
+    );
     let mut trailing = raw_entry(k, 2, &[1]);
     trailing.push(0);
     expect_rejected(&one(trailing, 1), &k, &limits, "past its 1 entries");
@@ -1294,6 +1312,392 @@ fn whole_object_verify_checks_what_a_probe_cannot() {
         verify_key_index_leaf(&f.leaf.bytes, &KeyIndexLeafLimits { max_body_bytes: per_frame_max }),
         Err(KeyIndexLeafRejection::Corrupted(m)) if m.contains("frames decompress to")
     ));
+}
+
+fn frame_decompressions() -> u64 {
+    FRAME_DECOMPRESSIONS.with(|n| n.get())
+}
+
+#[test]
+fn frame_claiming_more_entries_than_bytes_is_corrupted_before_allocation() {
+    let k = key8_str("hand-key");
+    let raw = raw_entry(k, 2, &[4]);
+    assert_eq!(raw.len(), 11);
+    let limits = KeyIndexLeafLimits::default();
+    let part = part_hash(b"hand");
+
+    // The honest frame decodes, so the counter is live on this path.
+    let honest = assemble(base_header(1), &single_bucket(k, frame(1, &raw)), None);
+    let before = frame_decompressions();
+    let (result, _) = probe_with(&honest.0, &honest.1, &request(&part), &k, &limits);
+    assert!(matches!(
+        result.expect("no breach"),
+        KeyIndexLeafProbe::Matches { .. }
+    ));
+    assert_eq!(frame_decompressions(), before + 1);
+
+    // 11 bytes hold at most one entry; a frame claiming two, or a million,
+    // is refused on its header and never reaches zstd or `with_capacity`.
+    for claimed in [2u32, 1_000_000, u32::MAX] {
+        let hostile = assemble(
+            base_header(1),
+            &single_bucket(k, frame(claimed, &raw)),
+            None,
+        );
+        let before = frame_decompressions();
+        expect_rejected(&hostile, &k, &limits, "more than one per 10 bytes");
+        assert_eq!(
+            frame_decompressions(),
+            before,
+            "a frame claiming {claimed} entries reached the decompressor"
+        );
+    }
+}
+
+/// Heap one decode of `frame` holds at its peak, measured from the decoded
+/// value's own capacities: the raw buffer beside the entries, or the entries
+/// beside the matches a probe copies out of them (at most the entries).
+fn measured_decode_peak(prefix: &KeyIndexLeafPrefix, bucket: u32, frame: &[u8]) -> u64 {
+    let decoded = prefix
+        .decode_frame(bucket, frame, &KeyIndexLeafLimits::default())
+        .expect("decodes");
+    let entries = (decoded.entries.capacity() * std::mem::size_of::<KeyIndexLeafEntry>()) as u64
+        + decoded
+            .entries
+            .iter()
+            .map(|e| (e.blocks.capacity() * std::mem::size_of::<u32>()) as u64)
+            .sum::<u64>();
+    let raw = u64::from(decoded.uncompressed_len);
+    (raw + entries).max(2 * entries)
+}
+
+#[test]
+fn decoded_bound_dominates_the_adversarial_frame() {
+    assert_eq!(std::mem::size_of::<KeyIndexLeafEntry>(), 40);
+    let k = key8_str("hand-key");
+    let bucket = bucket_index(&k, 1).expect("bits");
+    let n = 100u32;
+
+    // Most entries per byte: the same key8 at ordinals 0..n, one block each,
+    // 11 bytes apiece.
+    let many: Vec<u8> = (0..n)
+        .flat_map(|ordinal| raw_entry(k, u64::from(ordinal), &[1]))
+        .collect();
+    // Most blocks per byte: one entry whose block list is all one-byte deltas.
+    let wide = raw_entry(k, 0, &[1; 4_000]);
+
+    for (raw, entry_count) in [(&many, n), (&wide, 1)] {
+        let mut header = base_header(1);
+        header.entry_count = u64::from(entry_count);
+        header.part_entry_count = u64::from(n);
+        let leaf = assemble(header, &single_bucket(k, frame(entry_count, raw)), None);
+        let part = part_hash(b"hand");
+        let req = KeyIndexLeafRequest {
+            part_entry_count: u64::from(n),
+            ..request(&part)
+        };
+        let prefix_len = leaf.1.prefix_len as usize;
+        let prefix =
+            KeyIndexLeafPrefix::parse(&leaf.0[..prefix_len], &leaf.1, &req).expect("parses");
+        let len = raw.len() as u32;
+        let peak = measured_decode_peak(&prefix, bucket, &leaf.0[prefix_len..]);
+        assert!(
+            peak <= decoded_bound(len),
+            "{entry_count}-entry frame of {len} bytes peaks at {peak}, bound {}",
+            decoded_bound(len)
+        );
+    }
+
+    // A hostile header claiming `c` entries makes `with_capacity` allocate
+    // 40c before a single entry decodes, and the block-count check leaves
+    // the decoded entries `len - 10c` bytes of deltas at most. Whatever
+    // split the frame really holds, that heap beside the raw buffer, or
+    // twice it once matches are copied out, stays under the bound.
+    for len in [10u32, 11, 4_096, 1 << 20, u32::MAX] {
+        let len64 = u64::from(len);
+        for claimed in [1, u64::from(len / MIN_FRAME_ENTRY_WIRE_BYTES)] {
+            let with_capacity = claimed * std::mem::size_of::<KeyIndexLeafEntry>() as u64;
+            let blocks = 4 * (len64 - u64::from(MIN_FRAME_ENTRY_WIRE_BYTES) * claimed);
+            let entries = with_capacity + blocks;
+            assert!(
+                (len64 + entries).max(2 * entries) <= decoded_bound(len),
+                "{len} bytes claiming {claimed}"
+            );
+        }
+    }
+
+    // That split refused: one entry spending the deltas the claimed others
+    // would need is corrupted before its blocks are allocated.
+    let mut header = base_header(1);
+    header.entry_count = 100;
+    let hostile = assemble(
+        header,
+        &single_bucket(k, frame(100, &raw_entry(k, 0, &[1; 990]))),
+        None,
+    );
+    expect_rejected(
+        &hostile,
+        &k,
+        &KeyIndexLeafLimits::default(),
+        "with 99 entries still to come",
+    );
+}
+
+#[test]
+fn leaf_get_ceiling_and_part_cap_are_the_adr_constants() {
+    assert_eq!(KEY_INDEX_MAX_PROBED_PARTS, 1_024);
+    assert_eq!(KEY_INDEX_LEAF_GET_CEILING, 2_048);
+    assert_eq!(
+        KEY_INDEX_LEAF_GET_CEILING as usize,
+        2 * KEY_INDEX_MAX_PROBED_PARTS,
+        "L_max is two GETs per probed part"
+    );
+    assert_eq!(key_index_root_shape(), (1_024, 2_048));
+    assert_eq!(KEY_INDEX_SET_PROBE_MAX_RUNS, 64);
+    assert_eq!(KEY_INDEX_T1_BYTES, 11 * 1024);
+    assert_eq!(
+        KeyIndexSetPolicy::for_part(3),
+        KeyIndexSetPolicy {
+            b_run: 64,
+            max_bridged_bytes: 3 * 11 * 1024,
+        }
+    );
+}
+
+/// A set probe through an in-memory ranged source, returning the result and
+/// every range read.
+fn set_probe_with(
+    leaf: &[u8],
+    leaf_ref: &SnapshotKeyIndexLeafRef,
+    request: &KeyIndexLeafRequest<'_>,
+    keys: &[Key8],
+    policy: &KeyIndexSetPolicy,
+) -> (
+    Result<KeyIndexSetProbe, KeyIndexLeafBreach>,
+    Vec<Range<u64>>,
+) {
+    let reads = RefCell::new(Vec::new());
+    let result = block_on(probe_key_index_leaf_set_ranged(
+        leaf_ref,
+        request,
+        keys,
+        &KeyIndexLeafLimits::default(),
+        policy,
+        |range: Range<u64>| {
+            reads.borrow_mut().push(range.clone());
+            let end = (range.end as usize).min(leaf.len());
+            let out = leaf
+                .get(range.start as usize..end)
+                .map(Bytes::copy_from_slice)
+                .ok_or_else(|| "range starts past the object".to_string());
+            async move { out }
+        },
+        |_bytes| Some(()),
+    ));
+    (result, reads.into_inner())
+}
+
+/// A 13-bit leaf over 1000 distinct keys, and each key's truth.
+fn wide_leaf() -> (
+    [u8; 32],
+    EncodedKeyIndexLeaf,
+    BTreeMap<Key8, Vec<KeyIndexMatch>>,
+) {
+    let part = part_hash(b"wide part");
+    let mut entries: Vec<KeyIndexLeafEntry> = (0..1000u32)
+        .map(|i| {
+            entry(
+                key8_str(&format!("wide-{i}")),
+                [0u64, 1, 2, 4, 5, 7][i as usize % 6],
+                &[i, i + 1],
+            )
+        })
+        .collect();
+    entries.sort_by_key(|a| (a.key8, a.entry_ordinal));
+    let leaf = encode_key_index_leaf_with_bucket_bits(
+        &input(part, &entries, &UNCOVERED),
+        13,
+        &KeyIndexLeafLimits::default(),
+    )
+    .expect("encode");
+    let mut truth: BTreeMap<Key8, Vec<KeyIndexMatch>> = BTreeMap::new();
+    for e in &entries {
+        truth.entry(e.key8).or_default().push(KeyIndexMatch {
+            entry_ordinal: e.entry_ordinal,
+            blocks: e.blocks.clone(),
+        });
+    }
+    (part, leaf, truth)
+}
+
+fn expect_answered(
+    probe: &KeyIndexSetProbe,
+    keys: &[Key8],
+    truth: &BTreeMap<Key8, Vec<KeyIndexMatch>>,
+) {
+    let KeyIndexSetAnswer::Answered {
+        per_key,
+        uncovered_entry_ordinals,
+    } = &probe.answer
+    else {
+        panic!("expected Answered, got {:?}", probe.answer);
+    };
+    assert_eq!(uncovered_entry_ordinals, &UNCOVERED.to_vec());
+    assert_eq!(per_key.len(), keys.len());
+    for (key8, answer) in keys.iter().zip(per_key) {
+        let want = match truth.get(key8) {
+            Some(matches) => KeyIndexKeyAnswer::Matches(matches.clone()),
+            None => KeyIndexKeyAnswer::Absent,
+        };
+        assert_eq!(answer, &want, "key {key8:?}");
+    }
+}
+
+#[test]
+fn set_probe_reads_at_most_b_run_gets_and_bridges_above_it() {
+    let (part, leaf, truth) = wide_leaf();
+    assert_eq!(leaf.leaf_ref.bucket_bits, 13);
+    let req = request(&part);
+    let prefix_range = 0..u64::from(leaf.leaf_ref.prefix_len);
+    let prefix = KeyIndexLeafPrefix::parse(
+        &leaf.bytes[..leaf.leaf_ref.prefix_len as usize],
+        &leaf.leaf_ref,
+        &req,
+    )
+    .expect("parses");
+
+    // Every key, plus one absent key: far more distinct buckets than B_run.
+    let mut keys: Vec<Key8> = truth.keys().copied().collect();
+    keys.push(key8_str("not-in-the-leaf"));
+    keys.sort_unstable();
+    let distinct: std::collections::BTreeSet<u32> = keys
+        .iter()
+        .filter_map(|k| prefix.locate(k).expect("in slice").map(|l| l.bucket))
+        .collect();
+    assert!(
+        distinct.len() > KEY_INDEX_SET_PROBE_MAX_RUNS,
+        "{}",
+        distinct.len()
+    );
+    let frames_uncompressed: u64 = distinct
+        .iter()
+        .map(|&bucket| {
+            let start =
+                (prefix.prefix_len() + prefix.bucket_body_range(bucket as usize).start) as usize;
+            u64::from(le_u32(&leaf.bytes[start..], 4).expect("frame header"))
+        })
+        .sum();
+
+    let roomy = KeyIndexSetPolicy {
+        b_run: KEY_INDEX_SET_PROBE_MAX_RUNS,
+        max_bridged_bytes: u64::MAX,
+    };
+    let (result, reads) = set_probe_with(&leaf.bytes, &leaf.leaf_ref, &req, &keys, &roomy);
+    let probe = result.expect("no breach");
+    expect_answered(&probe, &keys, &truth);
+    assert_eq!(reads[0], prefix_range);
+    assert!(
+        reads.len() - 1 <= KEY_INDEX_SET_PROBE_MAX_RUNS,
+        "{}",
+        reads.len()
+    );
+    assert_eq!(probe.get_requests as usize, reads.len());
+    assert_eq!(probe.distinct_buckets, distinct.len());
+    let read_bytes: u64 = reads.iter().map(|r| r.end - r.start).sum();
+    assert_eq!(probe.wire_bytes, read_bytes);
+    assert_eq!(
+        probe.bridged_bytes,
+        read_bytes - prefix_range.end,
+        "bridged bytes are the bucket GETs' bytes, gaps included"
+    );
+    assert!(probe.bridged_bytes > 0);
+    assert_eq!(probe.decompressed_bytes, frames_uncompressed);
+
+    // One byte short of what the bridged runs need: declined on the prefix.
+    let tight = KeyIndexSetPolicy {
+        max_bridged_bytes: probe.bridged_bytes - 1,
+        ..roomy
+    };
+    let (result, reads) = set_probe_with(&leaf.bytes, &leaf.leaf_ref, &req, &keys, &tight);
+    let declined = result.expect("no breach");
+    assert_eq!(
+        declined.answer,
+        KeyIndexSetAnswer::Declined(KeyIndexSetDecline::OverBudget {
+            distinct_buckets: distinct.len(),
+            bridged_bytes: probe.bridged_bytes,
+        })
+    );
+    assert_eq!(reads, vec![prefix_range.clone()], "no read past the prefix");
+    assert_eq!(declined.get_requests, 1);
+    assert_eq!(declined.decompressed_bytes, 0);
+
+    // At or under B_run buckets: one GET per bucket, nothing bridged, and the
+    // byte budget does not apply.
+    let few: Vec<Key8> = keys.iter().copied().take(20).collect();
+    let few_buckets: std::collections::BTreeSet<u32> = few
+        .iter()
+        .filter_map(|k| prefix.locate(k).expect("in slice").map(|l| l.bucket))
+        .collect();
+    let starved = KeyIndexSetPolicy {
+        max_bridged_bytes: 0,
+        ..roomy
+    };
+    let (result, reads) = set_probe_with(&leaf.bytes, &leaf.leaf_ref, &req, &few, &starved);
+    let probe = result.expect("no breach");
+    expect_answered(&probe, &few, &truth);
+    assert_eq!(reads.len(), 1 + few_buckets.len());
+    assert_eq!(probe.bridged_bytes, 0);
+}
+
+#[test]
+fn set_probe_refused_reservation_declines_and_bad_keys_are_rejected() {
+    let (part, leaf, truth) = wide_leaf();
+    let req = request(&part);
+    let keys: Vec<Key8> = truth.keys().copied().take(3).collect();
+    let reserved = RefCell::new(Vec::new());
+    let probe = block_on(probe_key_index_leaf_set_ranged(
+        &leaf.leaf_ref,
+        &req,
+        &keys,
+        &KeyIndexLeafLimits::default(),
+        &KeyIndexSetPolicy::for_part(PART_ENTRY_COUNT),
+        |range: Range<u64>| {
+            let out = Ok(Bytes::copy_from_slice(
+                &leaf.bytes[range.start as usize..range.end as usize],
+            ));
+            async move { out }
+        },
+        |bytes| {
+            reserved.borrow_mut().push(bytes);
+            None::<()>
+        },
+    ))
+    .expect("no breach");
+    let reserved = reserved.into_inner();
+    assert_eq!(reserved.len(), 1, "the first refusal ends the probe");
+    assert_eq!(
+        probe.answer,
+        KeyIndexSetAnswer::Declined(KeyIndexSetDecline::ReservationRefused { bytes: reserved[0] })
+    );
+    assert_eq!(probe.decompressed_bytes, 0);
+
+    for bad in [Vec::new(), vec![keys[1], keys[0]], vec![keys[0], keys[0]]] {
+        let (result, reads) = set_probe_with(
+            &leaf.bytes,
+            &leaf.leaf_ref,
+            &req,
+            &bad,
+            &KeyIndexSetPolicy::for_part(PART_ENTRY_COUNT),
+        );
+        assert!(
+            matches!(
+                result.expect("no breach").answer,
+                KeyIndexSetAnswer::Rejected(KeyIndexLeafRejection::RequestMismatch(_))
+            ),
+            "{bad:?}"
+        );
+        assert!(reads.is_empty());
+    }
 }
 
 fn entries_strategy() -> impl Strategy<Value = Vec<KeyIndexLeafEntry>> {

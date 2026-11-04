@@ -21,7 +21,7 @@ use futures::stream::{self, StreamExt};
 use ravel_commit::{keys, signal};
 use ravel_cpu_gate::ReadSite;
 use ravel_object_store::{GetRange, StoreError};
-use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead};
+use ravel_proto::catalog::v1::{SnapshotEntry, SnapshotHead, SnapshotPartRef};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Signal, TenantHash, TimeRange};
 use uuid::Uuid;
@@ -34,7 +34,7 @@ use crate::error::CatalogError;
 use crate::fold::head_object_key;
 use crate::provisioning::{ShardGeneration, shard_ceiling};
 use crate::read_gate::run_snapshot_decode;
-use crate::snapshot::{SegmentLevel, SegmentRef};
+use crate::snapshot::{SegmentLevel, SegmentPartOrigin, SegmentRef, SnapshotPartHandle};
 use crate::snapshot_format::{self, PartLimits, PostingsLimits};
 
 /// Leading sentinel that marks a `name_filter` string as a literal-prefix
@@ -80,6 +80,9 @@ pub(crate) struct SnapshotWindow {
     /// list, so a postings object covering the full HEAD no longer binds and
     /// pruning safely declines.
     part_blake3: Vec<Vec<u8>>,
+    /// The HEAD ref of each part in `parts`, same order: what the per-part
+    /// handles a key-index router reads are built from (ADR-3692 decision 1).
+    part_refs: Vec<SnapshotPartRef>,
     /// Decoded, part-bound name postings, or `None` when postings are absent, unreadable, corrupt, or
     /// don't cleanly bind to `parts`. Always safe to treat as absent:
     /// postings are a pure pruning optimization, never a correctness
@@ -111,6 +114,11 @@ impl SnapshotWindow {
     /// exactly as `Catalog::resolve` always has. This can only ever narrow the
     /// result set matched by `query_range`, never widen it: exact semantics by
     /// default.
+    ///
+    /// `part_origins`, when `Some`, also records for every key newly inserted
+    /// into `out` the part (index into this window's parts) and part-local
+    /// entry ordinal it came from (ADR-3692 decision 1). A key already in
+    /// `out` keeps the segment and origin it had.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn extract_into(
         &self,
@@ -122,6 +130,7 @@ impl SnapshotWindow {
         name_filter: Option<&str>,
         pruned: &mut u64,
         out: &mut HashMap<String, SegmentRef>,
+        mut part_origins: Option<&mut HashMap<String, SegmentPartOrigin>>,
     ) -> Result<(), CatalogError> {
         let ordinals = self.postings_ordinals_for_filter(name_filter);
         // Postings ordinals index the concatenation of every loaded part's
@@ -131,14 +140,23 @@ impl SnapshotWindow {
         // global ordinals map back to local indices. For a single part
         // `part_base` stays 0, exactly the pre-multi-part behavior.
         let mut part_base = 0usize;
-        for part in &self.parts {
+        for (part_index, part) in self.parts.iter().enumerate() {
             let entries = &part.entries;
             let start = entries.partition_point(|e| e.ingest_hour_bucket < lower_hour);
             let end = entries.partition_point(|e| e.ingest_hour_bucket <= upper_hour);
+            let mut insert = |local: usize| {
+                let origin = match (u32::try_from(part_index), u32::try_from(local)) {
+                    (Ok(part), Ok(ordinal)) => part_origins
+                        .as_deref_mut()
+                        .map(|map| (map, SegmentPartOrigin { part, ordinal })),
+                    _ => None,
+                };
+                self.maybe_insert(tenant, signal, &entries[local], query_range, out, origin)
+            };
             match ordinals.as_deref() {
                 None => {
-                    for entry in &entries[start..end] {
-                        self.maybe_insert(tenant, signal, entry, query_range, out)?;
+                    for local in start..end {
+                        insert(local)?;
                     }
                 }
                 Some(ords) => {
@@ -148,8 +166,7 @@ impl SnapshotWindow {
                     let hi = ords.partition_point(|&o| (o as usize) < global_end);
                     *pruned += ((end - start) - (hi - lo)) as u64;
                     for &ordinal in &ords[lo..hi] {
-                        let local = ordinal as usize - part_base;
-                        self.maybe_insert(tenant, signal, &entries[local], query_range, out)?;
+                        insert(ordinal as usize - part_base)?;
                     }
                 }
             }
@@ -165,6 +182,7 @@ impl SnapshotWindow {
         entry: &SnapshotEntry,
         query_range: &TimeRange,
         out: &mut HashMap<String, SegmentRef>,
+        origin: Option<(&mut HashMap<String, SegmentPartOrigin>, SegmentPartOrigin)>,
     ) -> Result<(), CatalogError> {
         let event_range = TimeRange {
             start_ns: entry.min_event_ts_ns,
@@ -174,9 +192,30 @@ impl SnapshotWindow {
             return Ok(());
         }
         let segment_ref = build_segment_ref_from_entry(tenant, signal, entry)?;
-        out.entry(segment_ref.data_object_key.clone())
-            .or_insert(segment_ref);
+        if let std::collections::hash_map::Entry::Vacant(slot) =
+            out.entry(segment_ref.data_object_key.clone())
+        {
+            if let Some((origins, origin)) = origin {
+                origins.insert(segment_ref.data_object_key.clone(), origin);
+            }
+            slot.insert(segment_ref);
+        }
         Ok(())
+    }
+
+    /// One handle per loaded part, in this window's part order (ADR-3692
+    /// decision 1): the refs a key-index router probes, copied from HEAD.
+    pub(crate) fn part_handles(&self) -> Vec<SnapshotPartHandle> {
+        self.part_refs
+            .iter()
+            .map(|r| SnapshotPartHandle {
+                blake3: r.blake3.clone(),
+                entry_count: r.entry_count,
+                min_hour: r.min_hour,
+                watermark_hour: r.watermark_hour,
+                key_index: r.key_index.clone(),
+            })
+            .collect()
     }
 
     /// Whether this window's postings bind to exactly the parts it holds, in
@@ -404,6 +443,7 @@ impl Catalog {
                         watermark_hour: head.watermark_hour,
                         parts,
                         part_blake3: ref_blake3s(&refs),
+                        part_refs: refs,
                         postings,
                     }),
                     revalidated,
@@ -440,6 +480,7 @@ impl Catalog {
                                 watermark_hour: fresh_head.watermark_hour,
                                 parts,
                                 part_blake3: ref_blake3s(&refs),
+                                part_refs: refs,
                                 postings,
                             }),
                             revalidated,
@@ -1015,7 +1056,7 @@ fn head_shard_count_mismatch(
     }
 }
 
-fn build_segment_ref_from_entry(
+pub(crate) fn build_segment_ref_from_entry(
     tenant: &TenantHash,
     signal: Signal,
     entry: &SnapshotEntry,
@@ -1771,6 +1812,7 @@ mod tests {
             watermark_hour: 0,
             parts,
             part_blake3,
+            part_refs: Vec::new(),
             postings: Some(Arc::new(Charged::for_test(postings))),
         }
     }
@@ -2031,10 +2073,12 @@ mod tests {
             watermark_hour: 4,
             parts: vec![part0, part1],
             part_blake3,
+            part_refs: Vec::new(),
             postings: Some(Arc::new(Charged::for_test(postings))),
         };
 
         let mut out = HashMap::new();
+        let mut part_origins = HashMap::new();
         let mut pruned = 0u64;
         let range = TimeRange {
             start_ns: 0,
@@ -2050,10 +2094,18 @@ mod tests {
                 Some("keep"),
                 &mut pruned,
                 &mut out,
+                Some(&mut part_origins),
             )
             .expect("extract");
         // Only the hour-4 entry (global ordinal 3, part1 local index 1) survives.
         assert_eq!(out.len(), 1);
+        assert_eq!(
+            part_origins.values().copied().collect::<Vec<_>>(),
+            vec![SegmentPartOrigin {
+                part: 1,
+                ordinal: 1
+            }]
+        );
         // The other three in-range entries were pruned.
         assert_eq!(pruned, 3);
     }
