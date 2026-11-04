@@ -7741,7 +7741,8 @@ impl SeriesFetch for DeadlineWorker {
 /// fetched and while its second is in flight ends in the expired `TIMEOUT`
 /// summary, and the coordinator fails the query with `DeadlineExceeded` naming
 /// the request's own deadline, after folding exactly what the first segment
-/// cost. No record crosses.
+/// cost plus, on spans, the GET the second had in flight, which the span
+/// fetcher counts once issued and charges no bytes. No record crosses.
 ///
 /// What this covers is the coordinator: the `Timeout` arm of the log and span
 /// fan-out and the fold of the expired slice's spend. It runs no server code:
@@ -7833,10 +7834,14 @@ fn a_record_slice_stopped_at_its_deadline_fails_the_query_with_its_spend() {
                 }],
                 "{signal:?}: the expired summary ended the slice and no record crossed"
             );
+            let mut want = oracle;
+            if signal == Signal::Spans {
+                want.s3_requests[AccountedOp::Get.index()] += 1;
+            }
             assert_eq!(
                 accounting.snapshot(),
-                oracle,
-                "{signal:?}: the query reports exactly the first segment's cost"
+                want,
+                "{signal:?}: the query reports exactly the first segment's cost and the stalled GET"
             );
         }
     });
