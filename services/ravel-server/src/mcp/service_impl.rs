@@ -60,6 +60,7 @@ use std::time::Duration;
 
 use ravel_analytics::{AnalyticsError, ChangeKind, ChangePointParams, SummaryParams};
 use ravel_catalog::MetricKind;
+use ravel_maintain::AuditCallTag;
 use ravel_mcp::budget::McpEffectiveBudgets;
 use ravel_mcp::catalog::AnalyzeOp;
 use ravel_mcp::draft::{Draft, EstimateComponent, ExplainColumn, ExplainOutcome, cursor_signal};
@@ -100,6 +101,9 @@ pub struct ServiceBackend {
     budgets: McpEffectiveBudgets,
     progress: Option<ProgressReporter>,
     call_deadline: Option<tokio::time::Instant>,
+    /// The service before [`Self::with_audit_call`] tagged it, and the tag,
+    /// for an operation that adds its own audit text to the call's tag.
+    audit_call: Option<(QueryService, AuditCallTag)>,
 }
 
 impl ServiceBackend {
@@ -112,6 +116,30 @@ impl ServiceBackend {
             budgets,
             progress: None,
             call_deadline: None,
+            audit_call: None,
+        }
+    }
+
+    /// Stamp `tag` (the call's `mcp:<tool>` language and call id) on every
+    /// audit record this backend's service calls write, so the records of
+    /// one tool call carry one id however many service calls it makes.
+    pub fn with_audit_call(mut self, tag: AuditCallTag) -> Self {
+        let untagged = self.service.clone();
+        self.service = untagged.clone().with_audit_call(tag.clone());
+        self.audit_call = Some((untagged, tag));
+        self
+    }
+
+    /// The service to run a metadata operation through: tagged as the call
+    /// is, with `query.text` replaced by the matcher set the request runs,
+    /// which the engine's own record leaves empty when no selector was sent.
+    fn metadata_service(&self, request: &MetadataRequest) -> QueryService {
+        match &self.audit_call {
+            Some((untagged, tag)) => untagged.clone().with_audit_call(AuditCallTag {
+                text: Some(matcher_set_text(&request.selectors)),
+                ..tag.clone()
+            }),
+            None => self.service.clone(),
         }
     }
 
@@ -519,7 +547,7 @@ impl QueryBackend for ServiceBackend {
     ) -> Result<Envelope, Failure> {
         let request = &self.bounded(request, |request| &mut request.deadline)?;
         let outcome = self
-            .service
+            .metadata_service(request)
             .labels(tenant_hash, request)
             .await
             .map_err(failure)?;
@@ -539,7 +567,7 @@ impl QueryBackend for ServiceBackend {
     ) -> Result<Envelope, Failure> {
         let request = &self.bounded(request, |request| &mut request.deadline)?;
         let outcome = self
-            .service
+            .metadata_service(request)
             .label_values(tenant_hash, request, name, include_log_metric_names)
             .await
             .map_err(failure)?;
@@ -976,6 +1004,27 @@ impl ServiceBackend {
     }
 }
 
+/// The matcher set a metadata request runs, as `ravel_find_labels` audits it:
+/// each selector in promql-parser's canonical spelling (matchers sorted,
+/// values quoted and escaped), joined by `, `, and `{}` for the empty set,
+/// which matches every series. A selector that does not parse is recorded as
+/// sent; the engine refuses it, and the record's status says so.
+fn matcher_set_text(selectors: &[String]) -> String {
+    if selectors.is_empty() {
+        return "{}".to_string();
+    }
+    selectors
+        .iter()
+        .map(
+            |selector| match ravel_promql::complexity_guard::parse_guarded(selector) {
+                Ok(expr) => expr.to_string(),
+                Err(_) => selector.clone(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn failure(error: ServiceError) -> Failure {
     d4::failure(&error)
 }
@@ -983,6 +1032,21 @@ fn failure(error: ServiceError) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The audited matcher set is one stable spelling whatever order and
+    /// spacing the caller sent, `{}` when no selector narrows the request,
+    /// and the raw text for a selector that does not parse.
+    #[test]
+    fn the_matcher_set_text_is_canonical() {
+        let spelled = |selector: &str| matcher_set_text(&[selector.to_string()]);
+        assert_eq!(matcher_set_text(&[]), "{}");
+        assert_eq!(
+            spelled(r#"{ zone = "b", job=~"api.*" }"#),
+            spelled(r#"{job=~"api.*",zone="b"}"#)
+        );
+        assert_eq!(spelled(r#"{job="api",zone="b"}"#), r#"{job="api",zone="b"}"#);
+        assert_eq!(spelled("{job="), "{job=");
+    }
 
     /// The adapter's series cap is the HTTP route's: `MAX_SERIES` series
     /// pass, one more is `budget_exceeded` on the `series` counter with the

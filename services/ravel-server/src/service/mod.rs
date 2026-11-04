@@ -56,7 +56,9 @@ use std::time::Duration;
 
 use axum::http::HeaderMap;
 use ravel_ingest::Clock;
-use ravel_maintain::{AuditSubject, QueryAuditSink, QueryStatus};
+use ravel_maintain::{
+    AuditCallTag, AuditSubject, CallTaggingAuditSink, QueryAuditSink, QueryStatus,
+};
 use ravel_promql::Value;
 use ravel_query::http::service as core;
 use ravel_query::http::{
@@ -354,6 +356,19 @@ impl QueryService {
     /// `ravel_query::http::audit_subject` of the principal it authenticated.
     pub fn with_audit_subject(mut self, subject: Option<AuditSubject>) -> Self {
         self.audit_subject = subject;
+        self
+    }
+
+    /// This service, stamping `tag` on the audit record of every operation it
+    /// runs: the language override, call id and optional text a caller that
+    /// serves one call through several operations (the MCP adapter) sets once
+    /// per call. A service built without it audits under each operation's own
+    /// language, so every other transport is unchanged.
+    pub fn with_audit_call(mut self, tag: AuditCallTag) -> Self {
+        self.controls.audit_sink = Arc::new(CallTaggingAuditSink::new(
+            Arc::clone(&self.controls.audit_sink),
+            tag,
+        ));
         self
     }
 

@@ -27,7 +27,7 @@ use axum::routing::post;
 use rand::TryRng;
 use rand::rngs::SysRng;
 use ravel_ingest::Clock;
-use ravel_maintain::AuditSubject;
+use ravel_maintain::{AuditCallTag, AuditSubject};
 use ravel_mcp::budget::{McpBudgetConfig, McpEffectiveBudgets, McpRequestBudgets};
 use ravel_mcp::catalog::{agents_tool_catalog, tool_catalog};
 use ravel_mcp::compact;
@@ -262,10 +262,19 @@ impl ServerHandler for RavelMcp {
             .meta
             .get_progress_token()
             .map(|token| ProgressReporter::new(context.peer.clone(), token));
+        // One id per tool call (a random UUID v4): the envelope reports it as
+        // `ids.query_id`, and every audit record the call's service calls
+        // write carries it as `query.id`, under the language `mcp:<tool>`.
+        let query_id = uuid::Uuid::new_v4().to_string();
         let backend =
             ServiceBackend::new(self.service.clone().with_audit_subject(subject), budgets)
                 .with_call_start(started)
-                .with_progress(progress);
+                .with_progress(progress)
+                .with_audit_call(AuditCallTag {
+                    language: format!("mcp:{}", request.name),
+                    query_id: query_id.clone(),
+                    text: None,
+                });
 
         let agents = match &self.agents {
             Some(router) if AGENTS_TOOLS.contains(&request.name.as_ref()) => {
@@ -278,7 +287,9 @@ impl ServerHandler for RavelMcp {
                 Some(route) => dispatch_agents(&request.name, args, &ctx, route)
                     .await
                     .ok_or_else(|| ToolError::UnknownTool(request.name.to_string())),
-                None => dispatch(&request.name, args, &ctx, &backend).await,
+                None => dispatch(&request.name, args, &ctx, &backend)
+                    .await
+                    .map(|envelope| envelope.report_query_id(&query_id)),
             }
         };
         // The cancellation arm is biased first so a token already cancelled
@@ -545,6 +556,7 @@ fn build_tool_context<'a>(
         protection_horizon_ns: now_ns.saturating_add(protection_horizon_ns),
         budgets,
         cursor_key,
+        protocol_revisions: auth::SUPPORTED_REVISIONS.as_slice(),
     }
 }
 
@@ -621,5 +633,33 @@ mod tests {
             ctx.protection_horizon_ns
         );
         assert_eq!(ctx.protection_horizon_ns, now_ns + configured_horizon_ns);
+    }
+
+    /// `ravel_capabilities` reports exactly the revisions the transport's
+    /// header check accepts, in the same order: the tool reads the list off
+    /// the context the adapter builds rather than keeping one of its own.
+    ///
+    /// FLIP: a hardcoded `revisions` list in `capabilities.rs` with one entry
+    /// changed fails this comparison.
+    #[test]
+    fn capabilities_reports_the_revisions_the_transport_accepts() {
+        let clock = FixedClock(1_700_000_000_000_000_000);
+        let key = CursorKey::from_process_secret([0x12u8; CURSOR_KEY_LEN]);
+        let budgets = McpRequestBudgets::default()
+            .clamp(&EngineConfig::default(), &McpBudgetConfig::default());
+        let ctx = build_tool_context(TenantHash([0x42u8; 16]), &clock, 0, budgets, &key);
+
+        let envelope = ravel_mcp::tools::capabilities::run(Value::Object(Default::default()), &ctx);
+        let value = serde_json::to_value(&envelope).expect("envelope serializes");
+        let accepted: Vec<&str> = auth::SUPPORTED_REVISIONS
+            .iter()
+            .map(ProtocolVersion::as_str)
+            .collect();
+        assert!(!accepted.is_empty());
+        assert_eq!(value["data"]["rows"][0][0], serde_json::json!("protocol"));
+        assert_eq!(
+            value["data"]["rows"][0][1]["revisions"],
+            serde_json::json!(accepted)
+        );
     }
 }

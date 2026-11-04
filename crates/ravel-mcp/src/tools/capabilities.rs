@@ -1,11 +1,10 @@
 //! `ravel_capabilities` (ADR-1374 D2): what this deployment serves, in one
 //! call that reads no object storage.
 //!
-//! Everything reported here is either a compile-time fact (the protocol
-//! revisions this build speaks, the server version, the tool catalog, the
-//! query dialects) or already resolved on the call's own
-//! [`ToolContext`](super::ToolContext) (the tenant hash, the effective budget
-//! ceilings). Nothing is discovered, so the tool costs zero store requests
+//! Everything reported here is either a compile-time fact (the server
+//! version, the tool catalog, the query dialects) or already resolved on the
+//! call's own [`ToolContext`](super::ToolContext) (the protocol revisions the
+//! transport accepts, the tenant hash, the effective budget ceilings). Nothing is discovered, so the tool costs zero store requests
 //! and zero scanned bytes, and its `budget.actual` block says so.
 
 use rmcp::model::ProtocolVersion;
@@ -71,10 +70,11 @@ fn capability_rows(ctx: &ToolContext<'_>) -> Vec<Row> {
         row(
             "protocol",
             json!({
-                "revisions": [
-                    ProtocolVersion::V_2026_07_28.as_str(),
-                    ProtocolVersion::V_2025_11_25.as_str(),
-                ],
+                "revisions": ctx
+                    .protocol_revisions
+                    .iter()
+                    .map(ProtocolVersion::as_str)
+                    .collect::<Vec<_>>(),
                 "server_version": env!("CARGO_PKG_VERSION"),
             }),
         ),
@@ -251,7 +251,8 @@ mod tests {
             .as_array()
             .expect("rows is an array")
             .clone();
-        assert_eq!(rows[0][1]["revisions"], json!(["2026-07-28", "2025-11-25"]));
+        // The context's list, not a list of the tool's own.
+        assert_eq!(rows[0][1]["revisions"], json!(["2025-11-25"]));
         // Served and catalogued are separate lists, and the exact split is
         // what this build does: nine bodies, and no declared name that
         // refuses every call.

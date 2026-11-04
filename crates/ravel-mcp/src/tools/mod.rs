@@ -30,6 +30,7 @@ use crate::cursor::CursorKey;
 use crate::envelope::Envelope;
 use crate::service::QueryBackend;
 use ravel_types::TenantHash;
+use rmcp::model::ProtocolVersion;
 
 /// Everything a tool body needs about the call it is serving, beyond the
 /// arguments the caller sent.
@@ -56,6 +57,10 @@ pub struct ToolContext<'a> {
     /// The process-local MAC key cursors and evidence references are minted
     /// and redeemed with (D5).
     pub cursor_key: &'a CursorKey,
+    /// The protocol revisions the transport accepts, newest first, as the
+    /// adapter's own header check holds them. `ravel_capabilities` reports
+    /// this list rather than one of its own, so the two cannot disagree.
+    pub protocol_revisions: &'a [ProtocolVersion],
 }
 
 /// A tool call that never reaches a result envelope.
@@ -434,8 +439,14 @@ mod tests {
             budgets: McpRequestBudgets::default()
                 .clamp(&EngineConfig::default(), &McpBudgetConfig::default()),
             cursor_key: key,
+            protocol_revisions: &TEST_PROTOCOL_REVISIONS,
         }
     }
+
+    /// Deliberately not the adapter's list, so a capabilities answer that
+    /// matches it can only have come from the context.
+    pub(crate) static TEST_PROTOCOL_REVISIONS: [ProtocolVersion; 1] =
+        [ProtocolVersion::V_2025_11_25];
 
     /// Drive a future that is ready on its first poll, so this crate needs no
     /// async runtime to test dispatch. Every path `dispatch` takes in this

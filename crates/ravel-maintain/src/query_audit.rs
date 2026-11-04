@@ -68,6 +68,13 @@
 //! The record's `ts_ns` is the request timestamp (the handler's injected
 //! clock), and its severity reflects the status: `INFO` for `ok`, `ERROR` for
 //! `error`.
+//!
+//! A surface that serves one call through several engine operations (the MCP
+//! adapter, ADR-1374 decision 3 item 6) submits through a
+//! [`CallTaggingAuditSink`], which rewrites `query.language` to the call's own
+//! language (`mcp:<tool>`), keeps the engine's under `query.engine_language`,
+//! and adds `query.id`, the id the surface minted for the call, so every
+//! record one call writes carries the same id.
 
 use std::sync::Arc;
 
@@ -110,6 +117,11 @@ const ATTR_TEXT: &str = "query.text";
 pub const ATTR_PRINCIPAL_SUBJECT: &str = "query.principal.subject";
 /// `attrs` key holding where the subject came from, [`AuditSubject::source`].
 pub const ATTR_PRINCIPAL_SUBJECT_SOURCE: &str = "query.principal.subject_source";
+/// `attrs` key holding the call id a [`CallTaggingAuditSink`] stamps.
+pub const ATTR_QUERY_ID: &str = "query.id";
+/// `attrs` key holding the engine's own language when a
+/// [`CallTaggingAuditSink`] replaced `query.language`.
+pub const ATTR_ENGINE_LANGUAGE: &str = "query.engine_language";
 
 /// Resource-attr `record_type` value for the shared query-audit log stream.
 const STREAM_RECORD_TYPE: &str = "query_audit";
@@ -264,21 +276,29 @@ impl QueryAuditSink for RedactingAuditSink {
     }
 }
 
+/// The value of `event`'s string attr `key`, if it has one.
+fn str_attr_of(event: &AuditEvent, key: &str) -> Option<String> {
+    event
+        .attrs
+        .iter()
+        .find(|(name, _)| name == key)
+        .and_then(|(_, value)| match value {
+            AttrValue::Str(text) => Some(text.clone()),
+            _ => None,
+        })
+}
+
 /// Replace `event`'s `query.text` attr with `redactor`'s form of it, picking
-/// the language from its `query.language` attr.
+/// the language from its `query.engine_language` attr when a
+/// [`CallTaggingAuditSink`] set one, else from `query.language`: the
+/// redactor parses the engine's text, so it needs the engine's language.
 ///
 /// An event carrying no `query.text` is left untouched: a legal-hold or
 /// reshard record has no query text to redact, and neither reaches this sink
 /// today.
 fn redact_event_text(event: &mut AuditEvent, redactor: &dyn QueryTextRedactor) {
-    let language = event
-        .attrs
-        .iter()
-        .find(|(key, _)| key == ATTR_LANGUAGE)
-        .and_then(|(_, value)| match value {
-            AttrValue::Str(language) => Some(language.clone()),
-            _ => None,
-        })
+    let language = str_attr_of(event, ATTR_ENGINE_LANGUAGE)
+        .or_else(|| str_attr_of(event, ATTR_LANGUAGE))
         .unwrap_or_default();
     for (key, value) in event.attrs.iter_mut() {
         if key == ATTR_TEXT
@@ -286,6 +306,75 @@ fn redact_event_text(event: &mut AuditEvent, redactor: &dyn QueryTextRedactor) {
         {
             *text = redactor.redact(&language, text);
         }
+    }
+}
+
+/// What a [`CallTaggingAuditSink`] stamps on every record of one call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditCallTag {
+    /// Replaces `query.language`; the engine's language moves to
+    /// `query.engine_language`.
+    pub language: String,
+    /// Written as `query.id`. Empty writes no `query.id`.
+    pub query_id: String,
+    /// When `Some`, replaces `query.text`: the call's own statement of what
+    /// it ran, where the engine operation's text does not say it.
+    pub text: Option<String>,
+}
+
+/// A [`QueryAuditSink`] that stamps one call's [`AuditCallTag`] on every event
+/// before the sink it wraps sees it.
+///
+/// It is built per call around the process's sink, which under the redacted
+/// posture is a [`RedactingAuditSink`]: the tag is applied first and the
+/// redactor then reads `query.engine_language`, so the text is still parsed
+/// as the engine's language.
+pub struct CallTaggingAuditSink {
+    inner: Arc<dyn QueryAuditSink>,
+    tag: AuditCallTag,
+}
+
+impl CallTaggingAuditSink {
+    /// Wrap `inner` so every event it receives carries `tag`.
+    pub fn new(inner: Arc<dyn QueryAuditSink>, tag: AuditCallTag) -> Self {
+        CallTaggingAuditSink { inner, tag }
+    }
+}
+
+#[async_trait::async_trait]
+impl QueryAuditSink for CallTaggingAuditSink {
+    async fn submit(&self, mut event: AuditEvent) -> Result<()> {
+        tag_event(&mut event, &self.tag);
+        self.inner.submit(event).await
+    }
+}
+
+/// Apply `tag` to `event`: `query.language` and the body's leading language
+/// become the tag's, the engine's language is kept under
+/// `query.engine_language`, and `query.id` and the text override are set.
+fn tag_event(event: &mut AuditEvent, tag: &AuditCallTag) {
+    let engine_language = str_attr_of(event, ATTR_LANGUAGE).unwrap_or_default();
+    for (key, value) in event.attrs.iter_mut() {
+        if key == ATTR_LANGUAGE {
+            *value = AttrValue::Str(tag.language.clone());
+        } else if key == ATTR_TEXT
+            && let Some(text) = &tag.text
+        {
+            *value = AttrValue::Str(text.clone());
+        }
+    }
+    event.attrs.push((
+        ATTR_ENGINE_LANGUAGE.to_string(),
+        AttrValue::Str(engine_language.clone()),
+    ));
+    if !tag.query_id.is_empty() {
+        event.attrs.push((
+            ATTR_QUERY_ID.to_string(),
+            AttrValue::Str(tag.query_id.clone()),
+        ));
+    }
+    if let Some(rest) = event.body.strip_prefix(&format!("{engine_language} ")) {
+        event.body = format!("{} {rest}", tag.language);
     }
 }
 
@@ -828,5 +917,93 @@ mod tests {
             check.is_empty(),
             "a query-audit record must never be mistaken for an active hold"
         );
+    }
+
+    /// The call tag replaces the language, keeps the engine's beside it, adds
+    /// the id and the text override, and a redacting sink inside it still
+    /// parses the text as the engine's language.
+    #[tokio::test]
+    async fn the_call_tag_relabels_the_record_and_redaction_keeps_the_engine_language() {
+        let inner = Arc::new(RecordingSink::default());
+        let redactor = Arc::new(RecordingRedactor::default());
+        let redacting = AuditTextPolicy::Redacted(redactor.clone()).wrap(inner.clone());
+        let sink = CallTaggingAuditSink::new(
+            redacting,
+            AuditCallTag {
+                language: "mcp:ravel_find_labels".to_string(),
+                query_id: "0b8f2e6a-1d1c-4a43-9a5e-1f0e6c3b2a10".to_string(),
+                text: Some(r#"{job="api"}"#.to_string()),
+            },
+        );
+
+        let tenant = TenantHash([17u8; 16]);
+        let event = query_audit_event(
+            &tenant,
+            42,
+            "",
+            "label_values",
+            QueryStatus::Ok,
+            None,
+            0,
+            42,
+        );
+        sink.submit(event).await.expect("submit");
+
+        assert_eq!(
+            redactor.seen.lock().unwrap().clone(),
+            vec![("label_values".to_string(), r#"{job="api"}"#.to_string())]
+        );
+        let events = inner.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let attr = |key: &str| str_attr_of(&events[0], key);
+        assert_eq!(
+            attr(ATTR_LANGUAGE).as_deref(),
+            Some("mcp:ravel_find_labels")
+        );
+        assert_eq!(attr(ATTR_ENGINE_LANGUAGE).as_deref(), Some("label_values"));
+        assert_eq!(
+            attr(ATTR_QUERY_ID).as_deref(),
+            Some("0b8f2e6a-1d1c-4a43-9a5e-1f0e6c3b2a10")
+        );
+        assert_eq!(attr(ATTR_TEXT).as_deref(), Some("redacted<label_values>"));
+        assert_eq!(events[0].body, "mcp:ravel_find_labels query ok");
+    }
+
+    /// With no text override and no id, the tag changes only the language,
+    /// and the engine text passes through.
+    #[tokio::test]
+    async fn a_tag_without_text_or_id_keeps_the_engine_text_and_adds_no_id() {
+        let inner = Arc::new(RecordingSink::default());
+        let sink = CallTaggingAuditSink::new(
+            inner.clone(),
+            AuditCallTag {
+                language: "mcp:ravel_query_sql".to_string(),
+                query_id: String::new(),
+                text: None,
+            },
+        );
+        let event = query_audit_event(
+            &TenantHash([19u8; 16]),
+            42,
+            "SELECT 1",
+            "sql",
+            QueryStatus::Error,
+            None,
+            0,
+            42,
+        );
+        sink.submit(event).await.expect("submit");
+
+        let events = inner.events.lock().unwrap();
+        assert_eq!(
+            str_attr_of(&events[0], ATTR_LANGUAGE).as_deref(),
+            Some("mcp:ravel_query_sql")
+        );
+        assert_eq!(
+            str_attr_of(&events[0], ATTR_TEXT).as_deref(),
+            Some("SELECT 1")
+        );
+        assert_eq!(str_attr_of(&events[0], ATTR_QUERY_ID), None);
+        assert_eq!(events[0].body, "mcp:ravel_query_sql query error");
     }
 }

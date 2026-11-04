@@ -801,6 +801,28 @@ const _: () = assert!(
     "the empty-resolve warning must point at the ingest watermark field"
 );
 
+/// Index in [`IDENTITY_FIELDS`] of `ids.query_id`, the field
+/// [`Envelope::report_query_id`] fills after `finish`.
+const QUERY_ID_IDENTITY_INDEX: usize = 2;
+
+const _: () = assert!(
+    ascii_eq(IDENTITY_FIELDS[QUERY_ID_IDENTITY_INDEX], "ids.query_id"),
+    "the reported query id must replace the ids.query_id warning"
+);
+
+/// The serialized size [`Envelope::report_query_id`] bounds an id to: the
+/// size of the not-reported warning it replaces, so swapping one for the
+/// other never grows an envelope past the room `fit` reserved.
+const REPORTED_QUERY_ID_BOUND: usize = ascii_pair_serialized_len(
+    IDENTITY_FIELDS[QUERY_ID_IDENTITY_INDEX],
+    IDENTITY_WARNING_SUFFIX,
+);
+
+const _: () = assert!(
+    REPORTED_QUERY_ID_BOUND >= 36 + 2,
+    "a hyphenated UUID must fit the reported query id bound uncut"
+);
+
 /// Whether two ASCII strings are equal, for the const assertions above:
 /// `str` has no `const` equality on stable Rust.
 const fn ascii_eq(a: &str, b: &str) -> bool {
@@ -1584,6 +1606,28 @@ impl Envelope {
         } else {
             Status::Ok
         };
+        self
+    }
+
+    /// Sets `ids.query_id` on a finished envelope to the id the caller minted
+    /// for this call, and drops the warning [`finish`](Self::finish) added
+    /// for that field alone. An empty id reports nothing and changes nothing.
+    ///
+    /// The id is bounded to the serialized size of the identity warning it
+    /// replaces, so a success envelope does not grow. An error envelope
+    /// carries no identity warnings and grows by the id alone, which fits in
+    /// the headroom `fit` reserved for the warnings it never received.
+    pub fn report_query_id(mut self, query_id: &str) -> Envelope {
+        if query_id.is_empty() {
+            return self;
+        }
+        self.ids.query_id = query_id.to_string();
+        bound_scalar(&mut self.ids.query_id, REPORTED_QUERY_ID_BOUND);
+        let unreported = format!(
+            "{}{IDENTITY_WARNING_SUFFIX}",
+            IDENTITY_FIELDS[QUERY_ID_IDENTITY_INDEX]
+        );
+        self.warnings.retain(|warning| *warning != unreported);
         self
     }
 }

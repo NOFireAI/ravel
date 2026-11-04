@@ -2004,6 +2004,8 @@ mod with_mcp {
                 + ravel_maintain::GcConfigValues::maintain_defaults().protection_horizon_ns,
             budgets,
             cursor_key: key,
+            // Read only by `ravel_capabilities`, not by the describe body.
+            protocol_revisions: &[],
         }
     }
 
@@ -2516,6 +2518,8 @@ mod with_mcp {
             protection_horizon_ns: now_ns + 30 * NS_PER_HOUR,
             budgets,
             cursor_key: key,
+            // Read only by `ravel_capabilities`, not by the SQL body.
+            protocol_revisions: &[],
         }
     }
 

@@ -745,6 +745,9 @@ pub fn tool_context<'k>(
         protection_horizon_ns: now_ns + 30 * NS_PER_HOUR,
         budgets,
         cursor_key: key,
+        // Read only by `ravel_capabilities`, which no caller of this
+        // context runs.
+        protocol_revisions: &[],
     }
 }
 
