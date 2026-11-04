@@ -407,7 +407,9 @@ the last kept tuple equals the first omitted tuple, the tool drops that
 whole equal group from the page. The cursor then points at the last
 complete group.
 If no complete group fits in the page, the status is `ok_bounded` with no
-cursor and a `next_steps` entry that says to narrow `time_range`. (The rows
+cursor and a `next_steps` entry that says to narrow `time_range`; the
+cap next-step amendment at the end replaces that step with one chosen
+from the cap that cut the group (`raise_max_rows` below 5,000). (The rows
 the page has are still returned; see the equal-group bound amendment
 below.) The same
 rule applies to `ravel_query_sql` when its appended tiebreak is not unique.
@@ -1358,7 +1360,11 @@ written, and records here the choices they leave open.
     whose samples fit is dropped when an earlier one was kept.
     `cells_truncated` counts the cut series and `rows_omitted` every series
     dropped, the result is `ok_bounded`, and a next step says to widen
-    `step`, narrow `time_range` or narrow the query.
+    `step`, narrow `time_range` or narrow the query. The
+    cap next-step amendment at the end changes this: a result whose
+    only cut is a shortened series, with no series dropped, is `ok` with a
+    `read_full_cells` step, and the step for dropped series comes from
+    the cap that dropped them.
 
 ## Amendment (2026-11-03, #3721): the analyze-timeseries amendment, `ravel_analyze_timeseries` ships, one row per series, refusing partial coverage
 
@@ -1435,7 +1441,9 @@ the choices D2's row leaves open.
    equal-group rule: a page never ends inside a group of rows equal on that
    pair. When a group does not fit in a page, the tool returns the rows it
    has, `ok_bounded`, mints no cursor, and adds a `narrow_time_range` next
-   step. The rule was needed for the five-column tuple too, since
+   step (the cap next-step amendment at the end now chooses that step
+   from the cap that cut the group). The rule was needed for the five-column
+   tuple too, since
    at-least-once ingest can store a record twice.
 2. Inputs. `predicates` is a typed list of `{key, op, value}`, with `op`
    one of `eq` and `ne` (one string), `in` (a non-empty list of strings)
@@ -1558,8 +1566,11 @@ through `Draft::finish_page` (`crates/ravel-mcp/src/draft.rs`).
 
 1. When the equal-group rule finds no complete group inside the row cap,
    the server returns the rows it has, up to the row cap, sets the status
-   to `ok_bounded`, mints no cursor, adds a `narrow_time_range` next step,
-   and warns `no cursor: no complete group of rows equal under the order
+   to `ok_bounded`, mints no cursor, adds a next step (`narrow_time_range`
+   when this amendment was written; the
+   cap next-step amendment at the end now chooses it from the cap that
+   cut the group, `raise_max_rows` below
+   5,000), and warns `no cursor: no complete group of rows equal under the order
    fits one page`. The `one_group` case of
    `a_grouped_page_holds_back_its_open_trailing_group` in `draft.rs` pins
    this: five equal rows under a row cap of four return four rows.
@@ -1913,7 +1924,7 @@ records now carry.
 
 ## Amendment (2026-11-04, #3737): uniform evidence_ref refusal and the cap next-step rule
 
-<!-- amendment-applies: sections="D4. The result envelope|D5. Consistency, cursors, and evidence references" pointer="cap next-step amendment" -->
+<!-- amendment-applies: sections="D4. The result envelope|D5. Consistency, cursors, and evidence references|Amendment (2026-11-02, #3695): the query-promql amendment, `ravel_query_promql` ships, and its row cap counts series|Amendment (2026-11-03, #3725): the search-logs amendment, `ravel_search_logs` ships and pages by `(ts, observed_ts)`|Amendment (2026-11-03, #1386): the equal-group bound amendment, a page with no complete group keeps its rows" pointer="cap next-step amendment" -->
 
 Review #1388 (findings S10 and N3) found two places where a tool's answer
 depended on which tool was asked rather than on what happened. Both are
