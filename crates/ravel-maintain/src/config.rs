@@ -116,7 +116,7 @@ use crate::request_ledger::RequestLedger;
 ///
 /// Two fields of different byte kinds (encoded vs decoded heap) must never be
 /// summed (the repo measurement rule). The tracker is one PER CONCURRENT
-/// COMPACTION RUN: the retained-parts and catalog terms accumulate and are
+/// COMPACTION RUN: the retained-parts and catalog-directory terms accumulate and are
 /// not released within a run. SERIAL reuse across buckets is repaired
 /// mechanically -- `rewrite_and_publish` calls [`Self::reset_for_run`] before
 /// any accounting, so each bucket's figures are its own -- but two runs
@@ -137,7 +137,9 @@ pub struct MergeMemoryTracker {
 
 #[derive(Debug, Default)]
 struct MergeMemoryInner {
-    /// Raw block bytes fetched but not yet decoded-and-dropped.
+    /// Raw block bytes fetched but not yet decoded-and-dropped. The RSEG
+    /// merge's window, like its `decoded` and `writer` charges, is released
+    /// on every exit through [`MergeCharges`].
     fetched: AtomicU64,
     /// Decoded bytes currently resident across all merge cursors: the RLOG
     /// merge's columnar `heap_estimate()` per open cursor since ADR-0979
@@ -205,18 +207,21 @@ struct MergeMemoryInner {
     peak_fetched: AtomicU64,
     /// RSEG only: live decoded heap of the retained per-input planning
     /// catalogs (`SeriesPlan`/`RunPlan` structs and the run vectors), labels
-    /// excluded. Charged as each input's catalog loads, released when the
-    /// merge drops the catalogs.
+    /// excluded. Charged when `build::build_parts` takes the catalogs and
+    /// released on every exit from it (`Ok`, an error, a panic unwind)
+    /// through [`MergeCharges`].
     catalog_plan: AtomicU64,
     /// High-water of `catalog_plan`.
     peak_catalog_plan: AtomicU64,
     /// RSEG only: live decoded heap of the label sets the retained catalogs
-    /// carry, one copy per (input, series).
+    /// carry, each shared label set once. Charged and released with
+    /// `catalog_plan`.
     catalog_labels: AtomicU64,
     /// High-water of `catalog_labels`.
     peak_catalog_labels: AtomicU64,
     /// RSEG only: live heap of the merge's whole-bucket group-by index (the
     /// per-series contribution lists and the flattened per-series build plan).
+    /// Released on every exit from `build::build_parts`, like `catalog_plan`.
     plan_index: AtomicU64,
     /// High-water of `plan_index`.
     peak_plan_index: AtomicU64,
@@ -306,14 +311,14 @@ impl MergeMemoryTracker {
     pub fn block_decoded(&self, raw: u64, decoded: u64) {
         self.inner.decoded.fetch_add(decoded, Ordering::Relaxed);
         self.note();
-        self.inner.fetched.fetch_sub(raw, Ordering::Relaxed);
+        saturating_release(&self.inner.fetched, raw);
     }
 
     /// Account a decoded block leaving a cursor (its rows were drained into the
     /// writer and the block's buffer is dropped). `decoded` must be the value
     /// [`Self::block_decoded`] charged for that same block.
     pub fn block_released(&self, decoded: u64) {
-        self.inner.decoded.fetch_sub(decoded, Ordering::Relaxed);
+        saturating_release(&self.inner.decoded, decoded);
     }
 
     /// Set the in-progress part's writer buffer estimate to `bytes`. Passing 0
@@ -349,7 +354,7 @@ impl MergeMemoryTracker {
     /// Account `raw` fetched bytes released without a decode taking their
     /// place (the RSEG merge drops a whole fetch window at once).
     pub fn fetch_released(&self, raw: u64) {
-        self.inner.fetched.fetch_sub(raw, Ordering::Relaxed);
+        saturating_release(&self.inner.fetched, raw);
     }
 
     /// Account one RSEG input catalog retained for planning: `plan` bytes of
@@ -365,10 +370,8 @@ impl MergeMemoryTracker {
     /// Account RSEG planning catalog bytes dropped; the arguments must match
     /// what [`Self::add_catalog_plan_bytes`] charged for the same catalogs.
     pub fn release_catalog_plan_bytes(&self, plan: u64, labels: u64) {
-        self.inner.catalog_plan.fetch_sub(plan, Ordering::Relaxed);
-        self.inner
-            .catalog_labels
-            .fetch_sub(labels, Ordering::Relaxed);
+        saturating_release(&self.inner.catalog_plan, plan);
+        saturating_release(&self.inner.catalog_labels, labels);
     }
 
     /// Account `bytes` of RSEG group-by index heap built.
@@ -379,7 +382,7 @@ impl MergeMemoryTracker {
 
     /// Account `bytes` of RSEG group-by index heap dropped.
     pub fn release_plan_index_bytes(&self, bytes: u64) {
-        self.inner.plan_index.fetch_sub(bytes, Ordering::Relaxed);
+        saturating_release(&self.inner.plan_index, bytes);
     }
 
     /// High-water of the RSEG planning catalogs' series and run plans.
@@ -655,6 +658,176 @@ impl MergeMemoryTracker {
     /// assuming it.
     pub fn probes_run(&self) -> u64 {
         self.inner.probes_run.load(Ordering::Relaxed)
+    }
+
+    /// The live (not high-water) value of every term a merge charges and
+    /// releases. All zero once a merge has returned, whatever it returned.
+    pub fn live_bytes(&self) -> MergeLiveBytes {
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        MergeLiveBytes {
+            fetched: load(&self.inner.fetched),
+            decoded: load(&self.inner.decoded),
+            writer: load(&self.inner.writer),
+            probe: load(&self.inner.probe),
+            catalog_plan: load(&self.inner.catalog_plan),
+            catalog_labels: load(&self.inner.catalog_labels),
+            plan_index: load(&self.inner.plan_index),
+        }
+    }
+}
+
+/// The live values [`MergeMemoryTracker::live_bytes`] reads, one per term the
+/// merge releases; byte kinds as in [`MergePhasePeaks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MergeLiveBytes {
+    /// Raw fetched bytes not yet released.
+    pub fetched: u64,
+    /// Decoded merge state not yet released.
+    pub decoded: u64,
+    /// The in-progress part writer term.
+    pub writer: u64,
+    /// The in-flight exact-encode probe term.
+    pub probe: u64,
+    /// RSEG planning catalogs' series and run plans.
+    pub catalog_plan: u64,
+    /// RSEG planning catalogs' label sets.
+    pub catalog_labels: u64,
+    /// RSEG group-by index.
+    pub plan_index: u64,
+}
+
+/// Subtract `bytes` from a live term, stopping at zero rather than wrapping.
+fn saturating_release(term: &AtomicU64, bytes: u64) {
+    let _ = term.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(bytes))
+    });
+}
+
+/// The charges one merge holds against a [`MergeMemoryTracker`], released when
+/// this guard drops, so an `Ok` return, a `?` and a panic unwind all leave the
+/// tracker's live terms where they were before the merge. Every release names
+/// at most what this guard charged, so no path releases bytes it did not
+/// charge. With no tracker installed every method is a no-op.
+#[derive(Debug)]
+pub(crate) struct MergeCharges<'t> {
+    tracker: Option<&'t MergeMemoryTracker>,
+    catalog_plan: u64,
+    catalog_labels: u64,
+    plan_index: u64,
+    fetched: u64,
+    decoded: u64,
+    writer: u64,
+}
+
+impl<'t> MergeCharges<'t> {
+    pub(crate) fn new(tracker: Option<&'t MergeMemoryTracker>) -> Self {
+        MergeCharges {
+            tracker,
+            catalog_plan: 0,
+            catalog_labels: 0,
+            plan_index: 0,
+            fetched: 0,
+            decoded: 0,
+            writer: 0,
+        }
+    }
+
+    /// Whether a tracker is installed (so an estimate is worth computing).
+    pub(crate) fn tracking(&self) -> bool {
+        self.tracker.is_some()
+    }
+
+    /// [`MergeMemoryTracker::add_catalog_plan_bytes`], held until drop.
+    pub(crate) fn add_catalog(&mut self, plan: u64, labels: u64) {
+        if let Some(t) = self.tracker {
+            t.add_catalog_plan_bytes(plan, labels);
+            self.catalog_plan = self.catalog_plan.saturating_add(plan);
+            self.catalog_labels = self.catalog_labels.saturating_add(labels);
+        }
+    }
+
+    /// [`MergeMemoryTracker::add_plan_index_bytes`], held until released.
+    pub(crate) fn add_plan_index(&mut self, bytes: u64) {
+        if let Some(t) = self.tracker {
+            t.add_plan_index_bytes(bytes);
+            self.plan_index = self.plan_index.saturating_add(bytes);
+        }
+    }
+
+    /// Release up to `bytes` of this guard's plan-index charge.
+    pub(crate) fn release_plan_index(&mut self, bytes: u64) {
+        let bytes = bytes.min(self.plan_index);
+        if let Some(t) = self.tracker {
+            t.release_plan_index_bytes(bytes);
+        }
+        self.plan_index -= bytes;
+    }
+
+    /// [`MergeMemoryTracker::block_fetched`], held until released.
+    pub(crate) fn fetched(&mut self, bytes: u64) {
+        if let Some(t) = self.tracker {
+            t.block_fetched(bytes);
+            self.fetched = self.fetched.saturating_add(bytes);
+        }
+    }
+
+    /// Release up to `bytes` of this guard's fetched charge.
+    pub(crate) fn release_fetched(&mut self, bytes: u64) {
+        let bytes = bytes.min(self.fetched);
+        if let Some(t) = self.tracker {
+            t.fetch_released(bytes);
+        }
+        self.fetched -= bytes;
+    }
+
+    /// [`MergeMemoryTracker::block_decoded`]: up to `raw` of this guard's
+    /// fetched charge gives way to `decoded`, held until released.
+    pub(crate) fn decoded(&mut self, raw: u64, decoded: u64) {
+        let raw = raw.min(self.fetched);
+        if let Some(t) = self.tracker {
+            t.block_decoded(raw, decoded);
+            self.decoded = self.decoded.saturating_add(decoded);
+        }
+        self.fetched -= raw;
+    }
+
+    /// Release up to `bytes` of this guard's decoded charge.
+    pub(crate) fn release_decoded(&mut self, bytes: u64) {
+        let bytes = bytes.min(self.decoded);
+        if let Some(t) = self.tracker {
+            t.block_released(bytes);
+        }
+        self.decoded -= bytes;
+    }
+
+    /// Hand this guard's decoded charge to a caller that releases it with
+    /// [`MergeMemoryTracker::block_released`], returning the amount.
+    pub(crate) fn hand_off_decoded(&mut self) -> u64 {
+        std::mem::take(&mut self.decoded)
+    }
+
+    /// [`MergeMemoryTracker::set_writer_bytes`]; a nonzero value is reset to
+    /// zero at drop.
+    pub(crate) fn set_writer(&mut self, bytes: u64) {
+        if let Some(t) = self.tracker {
+            t.set_writer_bytes(bytes);
+            self.writer = bytes;
+        }
+    }
+}
+
+impl Drop for MergeCharges<'_> {
+    fn drop(&mut self) {
+        let Some(t) = self.tracker else {
+            return;
+        };
+        t.release_catalog_plan_bytes(self.catalog_plan, self.catalog_labels);
+        t.release_plan_index_bytes(self.plan_index);
+        t.fetch_released(self.fetched);
+        t.block_released(self.decoded);
+        if self.writer > 0 {
+            t.set_writer_bytes(0);
+        }
     }
 }
 

@@ -90,7 +90,7 @@ use ravel_types::{LabelSet, Sample, SeriesId};
 use tokio::sync::Semaphore;
 
 use crate::bucket::Bucket;
-use crate::config::CompactorConfig;
+use crate::config::{CompactorConfig, MergeCharges};
 use crate::error::{MaintainError, Result};
 use crate::read::{InputCatalog, InputRecord, RunPlan, SeriesPlan};
 use crate::request_ledger::{RequestLedger, RequestPhase, note_get, note_put};
@@ -198,25 +198,24 @@ pub async fn build_parts(
     let ingest_bounds = merged_ingest_bounds(inputs);
     let input_set_hash16 = hex::encode(&input_set_hash[..8]);
     let ledger = config.request_ledger.as_ref();
-    let tracker = config.merge_memory_tracker.as_ref();
-    // What `RsegCodec::admit_catalog` charged for these catalogs, each shared
-    // label set once; released when they drop at the end of this call.
-    let (catalog_plan_bytes, catalog_label_bytes) = match tracker {
-        Some(_) => {
-            let mut seen = HashSet::new();
-            let mut labels = 0u64;
-            for series in catalogs.iter().flat_map(|c| &c.series) {
-                if seen.insert(std::sync::Arc::as_ptr(&series.labels)) {
-                    labels += crate::read::label_heap_bytes(&series.labels);
-                }
+    // Every charge below is held by this guard and released when it drops,
+    // which is every exit from this call. The catalogs are charged here, each
+    // shared label set once, rather than as they load, so the owner that
+    // releases them is the one that charged them.
+    let mut charges = MergeCharges::new(config.merge_memory_tracker.as_ref());
+    if charges.tracking() {
+        let mut seen = HashSet::new();
+        let mut labels = 0u64;
+        for series in catalogs.iter().flat_map(|c| &c.series) {
+            if seen.insert(std::sync::Arc::as_ptr(&series.labels)) {
+                labels += crate::read::label_heap_bytes(&series.labels);
             }
-            (
-                catalogs.iter().map(InputCatalog::plan_heap_bytes).sum(),
-                labels,
-            )
         }
-        None => (0, 0),
-    };
+        charges.add_catalog(
+            catalogs.iter().map(InputCatalog::plan_heap_bytes).sum(),
+            labels,
+        );
+    }
 
     // Every input's exemplars, grouped by the series they name, in canonical
     // input order then each object's own stored order (ADR-0047 decision 3).
@@ -261,9 +260,7 @@ pub async fn build_parts(
         })
         .sum::<u64>()
         + (object_keys.capacity() * std::mem::size_of::<&str>()) as u64;
-    if let Some(t) = tracker {
-        t.add_plan_index_bytes(by_series_bytes);
-    }
+    charges.add_plan_index(by_series_bytes);
 
     // Flatten the group-by into an ordered per-series build plan (metadata
     // only, no page bytes). This is the exact series-then-run emission order
@@ -313,12 +310,10 @@ pub async fn build_parts(
             .iter()
             .map(|b| b.runs.capacity() * std::mem::size_of::<(&str, &RunPlan)>())
             .sum::<usize>()) as u64;
-    if let Some(t) = tracker {
-        // The group-by map was drained into `builds` above; charging both at
-        // once is the upper bound of the instant the last entry moved.
-        t.add_plan_index_bytes(builds_bytes);
-        t.release_plan_index_bytes(by_series_bytes);
-    }
+    // The group-by map was drained into `builds` above; charging both at
+    // once is the upper bound of the instant the last entry moved.
+    charges.add_plan_index(builds_bytes);
+    charges.release_plan_index(by_series_bytes);
 
     // One shared cap for every window's fetches (windows run sequentially, so
     // this bounds total in-flight GETs at `FETCH_CONCURRENCY`).
@@ -382,27 +377,21 @@ pub async fn build_parts(
             .values()
             .flat_map(|buffers| buffers.iter().map(|(_, b)| b.len() as u64))
             .sum();
-        if let Some(t) = tracker {
-            t.block_fetched(window_raw_bytes);
-        }
+        charges.fetched(window_raw_bytes);
         for build in window {
             // Decode, merge and re-encode on the read gate (ADR-1702), one job
             // per series, sized by the series' input page bytes. The job owns
             // its pages, so nothing it reads is released while it waits.
             let pages = slice_series_pages(build, &regions, migrate_keys)?;
             let decoded_bytes = decoded_series_bytes(&pages);
-            if let Some(t) = tracker {
-                t.block_decoded(0, decoded_bytes);
-            }
+            charges.decoded(0, decoded_bytes);
             let series_v7 = config
                 .read_gate
                 .run(ReadSite::Compaction, build.page_bytes, move || {
                     materialize_series(pages, limits)
                 })
                 .await??;
-            if let Some(t) = tracker {
-                t.block_released(decoded_bytes);
-            }
+            charges.release_decoded(decoded_bytes);
             pending_estimate.push_series(&series_v7);
             pending.push(series_v7);
             if let Some(mut records) = exemplars_by_series.remove(&build.series_id.0) {
@@ -410,9 +399,7 @@ pub async fn build_parts(
                 pending_estimate.push_exemplars(&records);
                 pending_exemplars.append(&mut records);
             }
-            if let Some(t) = tracker {
-                t.set_writer_bytes(pending_estimate.bytes());
-            }
+            charges.set_writer(pending_estimate.bytes());
             if pending_estimate.bytes() >= config.max_l1_part_bytes {
                 let mut part = flush_part(
                     bucket,
@@ -426,11 +413,9 @@ pub async fn build_parts(
                     pending_estimate.bytes(),
                 )
                 .await?;
-                note_encoded_part(tracker, &part);
+                note_encoded_part(&mut charges, &part);
                 put_and_release_part(store, &mut part, config.dry_run, ledger).await?;
-                if let Some(t) = tracker {
-                    t.set_writer_bytes(0);
-                }
+                charges.set_writer(0);
                 // Cancellation checkpoint 4: a part boundary, after the PUT
                 // returned.
                 crate::claim_guard::checkpoint(
@@ -444,9 +429,7 @@ pub async fn build_parts(
                 pending_estimate.reset();
             }
         }
-        if let Some(t) = tracker {
-            t.fetch_released(window_raw_bytes);
-        }
+        charges.release_fetched(window_raw_bytes);
         drop(regions);
         window_start = i + 1;
         window_input_bytes = 0;
@@ -466,11 +449,9 @@ pub async fn build_parts(
             pending_estimate.bytes(),
         )
         .await?;
-        note_encoded_part(tracker, &part);
+        note_encoded_part(&mut charges, &part);
         put_and_release_part(store, &mut part, config.dry_run, ledger).await?;
-        if let Some(t) = tracker {
-            t.set_writer_bytes(0);
-        }
+        charges.set_writer(0);
         // Cancellation checkpoint 4 for the tail part.
         crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::PartBoundary)
             .await?;
@@ -497,10 +478,7 @@ pub async fn build_parts(
         )));
     }
 
-    if let Some(t) = tracker {
-        t.release_plan_index_bytes(builds_bytes);
-        t.release_catalog_plan_bytes(catalog_plan_bytes, catalog_label_bytes);
-    }
+    drop(charges);
     Ok(parts)
 }
 
@@ -536,10 +514,8 @@ fn decoded_series_bytes(series: &SeriesPages) -> u64 {
 
 /// Charge a just-encoded part's object bytes as the writer term until its PUT
 /// releases them.
-fn note_encoded_part(tracker: Option<&crate::config::MergeMemoryTracker>, part: &BuiltPart) {
-    if let Some(t) = tracker {
-        t.set_writer_bytes(part.bytes.as_ref().map_or(0, |b| b.len() as u64));
-    }
+fn note_encoded_part(charges: &mut MergeCharges<'_>, part: &BuiltPart) {
+    charges.set_writer(part.bytes.as_ref().map_or(0, |b| b.len() as u64));
 }
 
 /// One output series' merge plan without its page bytes: identity, borrowed
