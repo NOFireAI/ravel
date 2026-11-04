@@ -77,7 +77,7 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_BUDGET_SHARE)]
     rei_budget_share: f64,
     /// Print the overall REI decision over these written reports and exit.
-    #[arg(long, requires = "rei_needles")]
+    #[arg(long, requires = "rei_needles", num_args = 1..)]
     rei_decide: Vec<PathBuf>,
 }
 

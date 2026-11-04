@@ -515,18 +515,18 @@ fn overall_needs_every_pre_registered_corpus_go_and_clean() {
     let names = ["a".to_string(), "b".to_string()];
     let d = overall(&names, &[saved("a", true, 0), saved("b", true, 0)]);
     assert!(d.go);
-    assert_eq!(d.line, "rei decision overall: GO; a=GO b=GO");
+    assert_eq!(d.line, "rei decision overall: GO; a=GO, b=GO");
 
     let d = overall(&names, &[saved("a", true, 0)]);
     assert!(!d.go);
-    assert_eq!(d.line, "rei decision overall: NO-GO; a=GO b=missing");
+    assert_eq!(d.line, "rei decision overall: NO-GO; a=GO, b=missing");
 
     let d = overall(&names, &[saved("a", true, 0), saved("b", false, 0)]);
-    assert_eq!(d.line, "rei decision overall: NO-GO; a=GO b=NO-GO");
+    assert_eq!(d.line, "rei decision overall: NO-GO; a=GO, b=NO-GO");
 
     let d = overall(&names, &[saved("a", true, 0), saved("b", true, 2)]);
     assert!(!d.go);
-    assert!(d.line.contains("b=GO with 2 problems, not a result"));
+    assert!(d.line.contains("b=GO but 2 figure problems (not a result)"));
 
     let d = overall(
         &names,

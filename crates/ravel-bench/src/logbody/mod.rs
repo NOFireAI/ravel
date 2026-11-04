@@ -513,7 +513,7 @@ pub fn overall(corpora: &[String], saved: &[SavedDecision]) -> Decision {
         let part = match mine.as_slice() {
             [] => "missing".to_string(),
             [s] if s.problems > 0 => format!(
-                "{} with {} problems, not a result",
+                "{} but {} figure problems (not a result)",
                 if s.decision.go { "GO" } else { "NO-GO" },
                 s.problems
             ),
@@ -535,7 +535,7 @@ pub fn overall(corpora: &[String], saved: &[SavedDecision]) -> Decision {
         line: format!(
             "rei decision overall: {}; {}",
             if go { "GO" } else { "NO-GO" },
-            parts.join(" ")
+            parts.join(", ")
         ),
     }
 }

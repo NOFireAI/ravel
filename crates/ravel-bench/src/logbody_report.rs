@@ -1737,6 +1737,68 @@ mod tests {
         assert!(err.to_string().contains("decode_runs"), "{err}");
     }
 
+    fn rei_cfg(block_records: usize, spec_block_records: usize) -> Config {
+        let text = std::fs::read_to_string(fixture("rei_needles.toml")).unwrap();
+        let mut spec = crate::logbody::spec::parse(&text)
+            .unwrap()
+            .corpus("hdfs")
+            .unwrap()
+            .clone();
+        spec.block_records = spec_block_records;
+        let mut cfg = Config::new(
+            fixture("corpus.log"),
+            fixture("needles.txt"),
+            "2026-11-04".to_string(),
+            "test".to_string(),
+        );
+        cfg.block_records = block_records;
+        cfg.object_records = BLOCK * 32;
+        cfg.decode_runs = 1;
+        cfg.rei = Some(ReiRun {
+            spec,
+            params: crate::logbody::grams::Params::default(),
+        });
+        cfg
+    }
+
+    #[test]
+    fn rei_run_at_another_block_size_is_refused() {
+        let err = run(&rei_cfg(BLOCK, 8192)).expect_err("block size mismatch");
+        assert!(
+            err.to_string()
+                .contains("pre-registered at 8192 records per block, the run uses 64"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rei_arm_measures_the_written_blocks_and_reports_band_misses() {
+        let report = run(&rei_cfg(BLOCK, BLOCK)).expect("report runs");
+        let rei = report.rei.as_ref().expect("rei section");
+        let figure = |key: &str| {
+            let found: Vec<f64> = rei
+                .figures
+                .iter()
+                .filter(|f| f.key == key)
+                .map(|f| f.value)
+                .collect();
+            assert_eq!(found.len(), 1, "{key}");
+            found[0]
+        };
+        assert_eq!(figure("hdfs/lines"), 400.0);
+        assert_eq!(figure("hdfs/blocks"), 400usize.div_ceil(BLOCK) as f64);
+        // The fixture is not the HDFS corpus, so its line count misses the
+        // pre-registered band and the report carries it as a problem.
+        assert!(
+            report
+                .problems()
+                .iter()
+                .any(|p| p.starts_with("rei: hdfs/lines: 400 outside band")),
+            "{:?}",
+            report.problems()
+        );
+    }
+
     /// The pre-fix behaviour, reproduced only to prove the fix matters: `at`
     /// advances solely from `template::placeholder_count` on the decoded
     /// dictionary entry, inside an `and_then` chain that one corrupted row's
