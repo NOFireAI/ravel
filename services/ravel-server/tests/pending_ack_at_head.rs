@@ -2,7 +2,9 @@
 //! head pending-ack amendment, issue #2805): OTLP HTTP, Remote Write and the
 //! unary OTLP gRPC services take it once the in-flight permit is held and the
 //! credential resolves, for a request the surface writes strictly, and hold
-//! it until that request's durability acknowledgement.
+//! it until that request's durability acknowledgement. Remote Write writes
+//! strictly only under `--remote-write-mode strict` (ADR-2793, 2026-11-04
+//! amendment).
 //!
 //! Every case runs against `ravel_server::start` with every logs data PUT
 //! held by a `FaultStore` gate, so "an ack is pending" is a held PUT rather
@@ -23,7 +25,7 @@ use opentelemetry_proto::tonic::common::v1::AnyValue;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use prost::Message;
-use ravel_server::config::StrictFlushPolicy;
+use ravel_server::config::{RemoteWriteMode, StrictFlushPolicy};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -201,10 +203,43 @@ async fn pending_ack_shed_total(server: &PolicyServer) -> u64 {
 }
 
 async fn start(max_pending_strict_acks: u64) -> PolicyServer {
+    start_rw(max_pending_strict_acks, RemoteWriteMode::Buffered).await
+}
+
+/// [`start`], with `remote_write_mode` as `--remote-write-mode`.
+async fn start_rw(
+    max_pending_strict_acks: u64,
+    remote_write_mode: RemoteWriteMode,
+) -> PolicyServer {
     strict_flush::start_with(StrictFlushPolicy::Arrival, Signal::Logs, |config| {
         config.max_pending_strict_acks = max_pending_strict_acks;
+        config.remote_write_mode = remote_write_mode;
     })
     .await
+}
+
+/// One snappy-compressed RW 1.0 sample of `metric`, timestamped now.
+fn remote_write_body(metric: &str) -> Vec<u8> {
+    use ravel_remote_write::proto::prometheus::{Label, Sample, TimeSeries, WriteRequest};
+
+    let request = WriteRequest {
+        timeseries: vec![TimeSeries {
+            labels: vec![Label {
+                name: "__name__".to_string(),
+                value: metric.to_string(),
+            }],
+            samples: vec![Sample {
+                value: 1.0,
+                timestamp: now_ns() / 1_000_000,
+            }],
+            exemplars: vec![],
+            histograms: vec![],
+        }],
+        metadata: vec![],
+    };
+    snap::raw::Encoder::new()
+        .compress_vec(&request.encode_to_vec())
+        .expect("compress")
 }
 
 /// With a budget of 1 held by a strict export parked between its head and
@@ -440,14 +475,15 @@ async fn an_undecodable_strict_grpc_export_over_the_bound_is_refused_by_the_laye
     server.shutdown().await;
 }
 
-/// Remote Write reads no mode header: with a budget of 1 held by a strict
-/// export waiting on its held data PUT, a Remote Write carrying
-/// `x-ravel-ingest-mode: buffered` is still refused with the pending-ack 429.
-/// It negotiates protocol 0.1.0 and its body does not decode, so a head that
-/// let the header make it buffered would answer the decode's 400 instead.
+/// Remote Write reads no mode header: under `--remote-write-mode strict`,
+/// with a budget of 1 held by a strict export waiting on its held data PUT, a
+/// Remote Write carrying `x-ravel-ingest-mode: buffered` is still refused with
+/// the pending-ack 429. It negotiates protocol 0.1.0 and its body does not
+/// decode, so a head that let the header make it buffered would answer the
+/// decode's 400 instead.
 #[tokio::test]
 async fn a_remote_write_marked_buffered_is_still_bounded_as_strict() {
-    let server = start(1).await;
+    let server = start_rw(1, RemoteWriteMode::Strict).await;
 
     let pending = spawn_export(&server, Some("strict"), "pending strict log line");
     server.wait_for_data_put().await;
@@ -499,6 +535,49 @@ async fn pending_strict_acks_gauge_counts_a_request_admitted_at_its_head() {
     assert_eq!(held.status(), 200);
     assert_eq!(parked, 200);
     assert_eq!(pending_strict_acks(&server).await, 0);
+
+    server.shutdown().await;
+}
+
+/// ADR-2793, 2026-11-04 amendment, Acceptance row "default flag": under the
+/// default `--remote-write-mode buffered`, with a budget of 1 held by a strict
+/// OTLP export waiting on its held data PUT, a Remote Write is answered 204
+/// with no commit token and the pending-ack gauge still reads 1: it took no
+/// permit, so the held one does not refuse it.
+#[tokio::test]
+async fn a_buffered_remote_write_takes_no_pending_ack_permit() {
+    let server = start(1).await;
+
+    let pending = spawn_export(&server, Some("strict"), "pending strict log line");
+    server.wait_for_data_put().await;
+    assert_eq!(pending_strict_acks(&server).await, 1);
+
+    let response = server
+        .client
+        .post(format!("{}/api/v1/write", server.base))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/x-protobuf")
+        .header("x-prometheus-remote-write-version", "0.1.0")
+        .body(remote_write_body("buffered_rw_metric"))
+        .send()
+        .await
+        .expect("remote write completes");
+    assert_eq!(response.status(), 204, "the buffered write is admitted");
+    assert!(
+        response.headers().get("x-ravel-commit-token").is_none(),
+        "a buffered remote write carries no commit token"
+    );
+    assert_eq!(
+        pending_strict_acks(&server).await,
+        1,
+        "the gauge still counts only the held export"
+    );
+    assert_eq!(pending_ack_shed_total(&server).await, 0);
+
+    let pending = release_until(&server.gate, pending)
+        .await
+        .expect("export task");
+    assert_eq!(pending.status(), 200);
 
     server.shutdown().await;
 }

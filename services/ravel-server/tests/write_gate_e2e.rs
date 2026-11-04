@@ -133,7 +133,8 @@ async fn start_ingest_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server
         audit_text: Default::default(),
         query_budgets: Default::default(),
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
-        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
+        // These Remote Write cases rely on the 2xx following the commit.
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Strict,
         max_inflight_flushes: 1,
         max_inflight_flushes_per_tenant: None,
         flush_object_backstop_multiple: 4,

@@ -10861,6 +10861,45 @@ mod tests {
         assert_eq!(cli.max_pending_strict_acks, 0);
     }
 
+    /// `--remote-write-mode` defaults to buffered (ADR-2793, 2026-11-04
+    /// amendment), reads `RAVEL_REMOTE_WRITE_MODE`, and resolves each value
+    /// to its write mode: buffered to `Buffered`, strict through
+    /// `--strict-flush-policy`.
+    #[test]
+    fn remote_write_mode_defaults_to_buffered_and_reads_its_env_var() {
+        use clap::CommandFactory;
+        use ravel_ingest::WriteMode;
+
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(cli.remote_write_mode, RemoteWriteMode::Buffered);
+        let arg = Cli::command()
+            .get_arguments()
+            .find(|a| a.get_id() == "remote_write_mode")
+            .map(|a| a.get_env().map(|env| env.to_os_string()))
+            .expect("flag is defined");
+        assert_eq!(
+            arg,
+            Some(std::ffi::OsString::from("RAVEL_REMOTE_WRITE_MODE"))
+        );
+        let cli = Cli::try_parse_from(["ravel-server", "--remote-write-mode", "strict"])
+            .expect("strict parses");
+        assert_eq!(cli.remote_write_mode, RemoteWriteMode::Strict);
+        assert!(Cli::try_parse_from(["ravel-server", "--remote-write-mode", "durable"]).is_err());
+
+        assert_eq!(
+            RemoteWriteMode::Buffered.write_mode(StrictFlushPolicy::Arrival),
+            WriteMode::Buffered
+        );
+        assert_eq!(
+            RemoteWriteMode::Strict.write_mode(StrictFlushPolicy::Aged),
+            WriteMode::Strict
+        );
+        assert_eq!(
+            RemoteWriteMode::Strict.write_mode(StrictFlushPolicy::Arrival),
+            WriteMode::StrictArrival
+        );
+    }
+
     #[test]
     fn cache_bulk_share_defaults_to_one_half_and_refuses_values_outside_zero_to_one() {
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");

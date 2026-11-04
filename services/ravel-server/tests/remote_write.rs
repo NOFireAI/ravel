@@ -1,13 +1,15 @@
 //! End-to-end coverage for `POST /api/v1/write`: real RW1 and RW2 wire
 //! payloads (snappy + protobuf) against an in-process server backed by
 //! `MemoryStore`, followed by a query for the ingested sample
-//! (read-your-write via the returned commit token).
+//! (read-your-write via the returned commit token under
+//! `--remote-write-mode strict`, or after the flush under the default
+//! `buffered`).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use ravel_ingest::{AdmissionLimits, CountLimit, RateLimit};
@@ -27,7 +29,7 @@ use ravel_types::TenantId;
 #[path = "support/strict_flush.rs"]
 mod strict_flush;
 
-use ravel_server::config::StrictFlushPolicy;
+use ravel_server::config::{RemoteWriteMode, StrictFlushPolicy};
 use strict_flush::{PolicyServer, Signal, release_until};
 
 const TOKEN: &str = "testtoken";
@@ -262,12 +264,26 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
     .expect("server starts")
 }
 
+/// Sets `--remote-write-mode strict`, for the tests whose subject is the
+/// strict Remote Write contract or that read their write back by its commit
+/// token.
+fn strict_remote_write(config: &mut ServerConfig) {
+    config.remote_write_mode = RemoteWriteMode::Strict;
+}
+
 async fn start_test_server() -> ravel_server::Running {
+    start_test_server_with(|_| {}).await
+}
+
+/// [`start_test_server`], with `configure` applied to the configuration last.
+async fn start_test_server_with(
+    configure: impl FnOnce(&mut ServerConfig),
+) -> ravel_server::Running {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
-    let config = ServerConfig {
+    let mut config = ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
         audit_pipeline: Default::default(),
@@ -332,6 +348,7 @@ async fn start_test_server() -> ravel_server::Running {
             1024,
         ),
     };
+    configure(&mut config);
     ravel_server::start(
         config,
         store.clone(),
@@ -364,7 +381,7 @@ async fn query_one(base: &str, client: &reqwest::Client, metric: &str, commit_to
 
 #[tokio::test]
 async fn rw1_write_then_query_round_trips_sample() {
-    let running = start_test_server().await;
+    let running = start_test_server_with(strict_remote_write).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
@@ -404,7 +421,7 @@ async fn rw1_write_then_query_round_trips_sample() {
 
 #[tokio::test]
 async fn rw2_write_then_query_round_trips_sample_with_stats_headers() {
-    let running = start_test_server().await;
+    let running = start_test_server_with(strict_remote_write).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
@@ -623,7 +640,7 @@ async fn missing_credentials_yield_401() {
 
 #[tokio::test]
 async fn buffered_mode_header_is_refused_and_write_is_still_strict() {
-    let running = start_test_server().await;
+    let running = start_test_server_with(strict_remote_write).await;
     let base = format!("http://{}", running.http_addr);
     let client = reqwest::Client::new();
 
@@ -783,13 +800,18 @@ fn assert_strict_ack(response: &reqwest::Response) {
     );
 }
 
-/// Remote Write reads no ingest mode header, so `--strict-flush-policy` alone
-/// decides its flush: `arrival` flushes the write on arrival, the default
+/// Remote Write reads no ingest mode header, so under `--remote-write-mode
+/// strict` the `--strict-flush-policy` alone decides its flush: `arrival` flushes the write on arrival, the default
 /// `aged` opens no flush before the age threshold, and a `strict-arrival`
 /// header under `aged` changes nothing.
 #[tokio::test]
 async fn strict_flush_policy_arrival_applies_to_remote_write() {
-    let server = strict_flush::start(StrictFlushPolicy::Arrival, Signal::Metrics).await;
+    let server = strict_flush::start_with(
+        StrictFlushPolicy::Arrival,
+        Signal::Metrics,
+        strict_remote_write,
+    )
+    .await;
     let write = spawn_write(&server, None, "arrival_rw_metric");
     server.wait_for_data_put().await;
     assert!(
@@ -804,7 +826,12 @@ async fn strict_flush_policy_arrival_applies_to_remote_write() {
     assert_eq!(server.flushes_by_arrival().await, 1);
     server.shutdown().await;
 
-    let server = strict_flush::start(StrictFlushPolicy::Aged, Signal::Metrics).await;
+    let server = strict_flush::start_with(
+        StrictFlushPolicy::Aged,
+        Signal::Metrics,
+        strict_remote_write,
+    )
+    .await;
     let plain = spawn_write(&server, None, "aged_rw_metric");
     let headed = spawn_write(&server, Some("strict-arrival"), "headed_rw_metric");
     server.assert_no_flush_yet(2).await;
@@ -823,13 +850,14 @@ async fn strict_flush_policy_arrival_applies_to_remote_write() {
     server.shutdown().await;
 }
 
-/// Remote Write is strict-only, so every write waits for its ack. With the
+/// Under `--remote-write-mode strict` every write waits for its ack. With the
 /// in-flight ceiling at one, the first write returns its permit once its
 /// sample is enqueued, and a second write is admitted while the first still
 /// waits on its held data PUT; both ack with a token once the gate releases.
 #[tokio::test]
 async fn in_flight_permit_is_released_before_the_strict_ack() {
     let server = strict_flush::start_with(StrictFlushPolicy::Arrival, Signal::Metrics, |config| {
+        strict_remote_write(config);
         config.ingest_concurrency_limit =
             ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1);
     })
@@ -865,13 +893,14 @@ async fn in_flight_permit_is_released_before_the_strict_ack() {
     server.shutdown().await;
 }
 
-/// With the pending strict-ack budget at one, a Remote Write takes that one
-/// permit at its head and the router takes no second one: the write reaches
+/// Under `--remote-write-mode strict`, with the pending strict-ack budget at
+/// one, a Remote Write takes that one permit at its head and the router takes no second one: the write reaches
 /// its buffer instead of being refused, the gauge reads one while it waits on
 /// its held data PUT, and it acks once the gate releases.
 #[tokio::test]
 async fn a_remote_write_takes_its_head_permit_once() {
     let server = strict_flush::start_with(StrictFlushPolicy::Arrival, Signal::Metrics, |config| {
+        strict_remote_write(config);
         config.max_pending_strict_acks = 1;
     })
     .await;
@@ -892,6 +921,142 @@ async fn a_remote_write_takes_its_head_permit_once() {
         strict_flush::process_sample(&server.scrape().await, "ravel_ingest_pending_strict_acks"),
         0
     );
+
+    server.shutdown().await;
+}
+
+/// Bounds the wait for an answer that must not depend on a flush, and for a
+/// buffered write to become queryable after its flush. Generous against a
+/// loaded machine; no outcome is decided by it.
+const ANSWER_WAIT: Duration = Duration::from_secs(10);
+
+fn assert_buffered_ack(response: &reqwest::Response) {
+    assert_eq!(response.status(), 204, "remote write should succeed");
+    assert!(
+        response.headers().get("x-ravel-commit-token").is_none(),
+        "a buffered remote write acks with no commit token"
+    );
+}
+
+/// ADR-2793, 2026-11-04 amendment, Acceptance row "buffered, header strict":
+/// under `--remote-write-mode buffered` a Remote Write carrying
+/// `x-ravel-ingest-mode: strict` is still buffered. Every metrics data PUT is
+/// held and `--strict-flush-policy arrival` would open a strict write's flush
+/// on arrival, so a write the header made strict would wait on the held PUT;
+/// this one is answered 204, with no commit token, before any data PUT.
+#[tokio::test]
+async fn buffered_remote_write_ignores_a_strict_mode_header() {
+    let server = strict_flush::start_with(StrictFlushPolicy::Arrival, Signal::Metrics, |config| {
+        config.remote_write_mode = RemoteWriteMode::Buffered;
+    })
+    .await;
+
+    let write = spawn_write(&server, Some("strict"), "header_strict_rw_metric");
+    let response = tokio::time::timeout(ANSWER_WAIT, write)
+        .await
+        .expect("a buffered write is answered while its data PUT is held")
+        .expect("write task");
+    assert_buffered_ack(&response);
+    assert_eq!(
+        server.gate.held_count(),
+        0,
+        "the ack came before any data PUT"
+    );
+
+    server.shutdown().await;
+}
+
+/// ADR-2793, 2026-11-04 amendment, Acceptance row "buffered, then the flush":
+/// a buffered Remote Write acks with no commit token, and once the idle-tier
+/// flush stores it (here 2 s), the sample is queryable without one.
+#[tokio::test]
+async fn buffered_remote_write_is_queryable_after_its_flush() {
+    let running = start_test_server_with(|config| {
+        config.remote_write_mode = RemoteWriteMode::Buffered;
+        config.max_flush_delay_idle = config.max_flush_delay;
+    })
+    .await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{base}/api/v1/write"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header(
+            "content-type",
+            "application/x-protobuf;proto=prometheus.WriteRequest",
+        )
+        .body(rw1_body("buffered_rw_metric", "demo", 3.5, now_ms()))
+        .send()
+        .await
+        .expect("write request succeeds");
+    assert_buffered_ack(&response);
+
+    let mut last_body = serde_json::Value::Null;
+    let found = tokio::time::timeout(ANSWER_WAIT, async {
+        loop {
+            let query = client
+                .get(format!("{base}/api/v1/query"))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .query(&[("query", "buffered_rw_metric")])
+                .send()
+                .await
+                .expect("query request succeeds");
+            assert_eq!(query.status(), 200, "query should succeed");
+            last_body = query.json().await.expect("query response is JSON");
+            let series = last_body["data"]["result"].as_array().map_or(0, Vec::len);
+            if series == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        found.is_ok(),
+        "the buffered sample is queryable after its flush: {last_body}"
+    );
+    assert_eq!(last_body["data"]["result"][0]["value"][1], "3.5");
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// ADR-2793, 2026-11-04 amendment, Acceptance row "strict": under
+/// `--remote-write-mode strict` a Remote Write is not answered while its data
+/// PUT is held, then acks with a commit token, and a query bounded by that
+/// token reads the sample at once.
+#[tokio::test]
+async fn strict_remote_write_acks_after_its_commit_with_a_token() {
+    let server = strict_flush::start_with(
+        StrictFlushPolicy::Arrival,
+        Signal::Metrics,
+        strict_remote_write,
+    )
+    .await;
+
+    let write = spawn_write(&server, None, "strict_mode_rw_metric");
+    server.wait_for_data_put().await;
+    assert!(
+        !write.is_finished(),
+        "the strict ack waits for the held data PUT"
+    );
+    let response = release_until(&server.gate, write)
+        .await
+        .expect("write task");
+    assert_strict_ack(&response);
+    let token = response
+        .headers()
+        .get("x-ravel-commit-token")
+        .and_then(|value| value.to_str().ok())
+        .expect("commit token is ascii")
+        .to_string();
+    query_one(
+        &server.base,
+        &server.client,
+        "strict_mode_rw_metric",
+        &token,
+    )
+    .await;
 
     server.shutdown().await;
 }
