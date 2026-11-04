@@ -603,7 +603,12 @@ mod tests {
             let wide = "x".repeat(cap as usize + 1);
             let envelope = call(spans(&[("r", None, wide.as_str())]), untimed(), &ctx);
 
-            assert_eq!(envelope.status, Status::Ok, "{cap}: {:?}", envelope.presentation);
+            assert_eq!(
+                envelope.status,
+                Status::Ok,
+                "{cap}: {:?}",
+                envelope.presentation
+            );
             assert_eq!(envelope.presentation.cells_truncated, 1, "{cap}");
             assert_eq!(envelope.presentation.rows_omitted, 0, "{cap}");
             assert_eq!(
@@ -612,7 +617,11 @@ mod tests {
                 "{cap}"
             );
             for next in &envelope.next_steps {
-                assert!(!next.detail.contains("time_range"), "{cap}: {}", next.detail);
+                assert!(
+                    !next.detail.contains("time_range"),
+                    "{cap}: {}",
+                    next.detail
+                );
             }
             assert!(serialized_len(&envelope) <= cap as usize, "{cap}");
         }

@@ -1131,7 +1131,12 @@ mod tests {
         ))
         .expect("an agents tool name routes");
 
-        assert_eq!(envelope.status, Status::OkPage, "{:?}", envelope.presentation);
+        assert_eq!(
+            envelope.status,
+            Status::OkPage,
+            "{:?}",
+            envelope.presentation
+        );
         assert_eq!(envelope.presentation.cursor.as_deref(), Some("9"));
         assert_eq!(envelope.presentation.cells_truncated, 1);
         assert_eq!(envelope.presentation.rows_omitted, 0);

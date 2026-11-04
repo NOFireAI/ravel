@@ -1423,15 +1423,28 @@ mod tests {
 
             let envelope = block_on(run(args(json!({})), &ctx, &stub));
 
-            assert_eq!(envelope.status, Status::Ok, "{cap}: {:?}", envelope.presentation);
+            assert_eq!(
+                envelope.status,
+                Status::Ok,
+                "{cap}: {:?}",
+                envelope.presentation
+            );
             assert_eq!(envelope.presentation.cursor, None, "{cap}");
             assert_eq!(envelope.presentation.cells_truncated, 1, "{cap}");
             assert_eq!(envelope.presentation.rows_omitted, 0, "{cap}");
             assert_eq!(ids(&envelope), ["a"], "{cap}");
             assert_eq!(steps(&envelope), [("read_full_cells", detail)], "{cap}");
             for step in &envelope.next_steps {
-                assert!(!step.detail.contains("time_range"), "{cap}: {}", step.detail);
-                assert!(!step.detail.contains("predicates"), "{cap}: {}", step.detail);
+                assert!(
+                    !step.detail.contains("time_range"),
+                    "{cap}: {}",
+                    step.detail
+                );
+                assert!(
+                    !step.detail.contains("predicates"),
+                    "{cap}: {}",
+                    step.detail
+                );
             }
         }
     }
