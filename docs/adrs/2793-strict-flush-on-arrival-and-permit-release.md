@@ -58,7 +58,8 @@ in-process, still one tick, two PUTs per write on both arms.
 Selection today is per request: `x-ravel-ingest-mode: buffered` on the OTLP
 HTTP, gRPC and OTAP surfaces (`otlp_http.rs:685-694`), honored for any
 tenant. Remote Write ignores the header and is strict-only, because a
-Remote Write sender drops its WAL entry on any 2xx. `docs/ingest.md:1486`
+Remote Write sender drops its WAL entry on any 2xx (since the Remote Write mode amendment
+below, an operator flag chooses the mode, default buffered). `docs/ingest.md:1486`
 claims a per-tenant gate on buffered mode; no such gate exists in the tree,
 and `docs/guides/ingest.md:139` says so. That stale sentence is reported
 with this ADR, not fixed by it.
@@ -79,7 +80,8 @@ Selection:
   is the process default: what a strict request gets when it does not
   name a policy. It applies to every strict surface, Remote Write
   included, since Remote Write reads no header and its ack contract is
-  unchanged by the policy.
+  unchanged by the policy. Since the Remote Write mode amendment below,
+  Remote Write is a strict surface only under `--remote-write-mode strict`.
 - The header `x-ravel-ingest-mode` on the OTLP HTTP, gRPC and OTAP
   surfaces, read by the same parser that reads `buffered` today, gains two
   explicit values that override the process default for one request:
@@ -585,9 +587,11 @@ it does not carry today and gains in this change:
   agree on the tenant and the mode. Calling the same function on the raw header map
   would not be the same input, since the round trip drops binary entries
   and names that fail to parse.
-- On Remote Write the state answers strict unconditionally, whatever the
-  request carries, because the handler writes every Remote Write request
-  strictly.
+- On Remote Write (see the Remote Write mode amendment below) the state
+  answers strict unconditionally, whatever the request carries, because
+  the handler writes every Remote Write request strictly (superseded by
+  the Remote Write mode amendment below: the state answers strict only
+  under `--remote-write-mode strict`, still whatever the request carries).
 - A buffered request takes no permit.
 
 The gRPC rule covers the layer and also the direct-call path, where
@@ -658,7 +662,7 @@ beside it.
 | Budget 1, one strict ack held by a gated data PUT. A second strict request with an undecodable body. | The pending-ack 429 text, not a 400. | A refusal still taken in `submit`: the 400 comes first. |
 | Budget 2, PUT held. Two concurrent strict writes. | Both admitted, gauge 2, and a third refused. | Acquiring at the head and again in `submit`: the second is refused. Releasing at `submit`: the third is admitted. |
 | Budget 1, one ack held. A `buffered` request on HTTP and on gRPC. | 200 and OK. | Taking a permit for every mode. Reading the mode from the wrong source on one transport. |
-| Budget 1, one ack held. A Remote Write request carrying `x-ravel-ingest-mode: buffered`. | The pending-ack 429. | Reading the header on Remote Write, which would let any client opt out of the bound. |
+| Budget 1, one ack held. A Remote Write request carrying `x-ravel-ingest-mode: buffered`. Under `--remote-write-mode strict` since the Remote Write mode amendment below. | The pending-ack 429. | Reading the header on Remote Write, which would let any client opt out of the bound. |
 | Budget 1, its permit held by a strict gRPC request admitted through the layer and parked on a held PUT. A direct-call gRPC request, with no layer, invoking the service method in-process. | `RESOURCE_EXHAUSTED`, with normalization and `submit` never reached: the router and ingest counters do not move. | A no-layer path that takes no permit at the head: it refuses only after decode. A bare permit dropped with tonic's extensions: the second request is admitted. |
 | In-flight ceiling 1, budget 1, one ack held. A strict request is refused by the pending-ack bound, and its body below the drain cap is still draining. A second request, buffered, arrives during that drain. | The second is admitted: the refused request's in-flight slot was returned before its drain. | A drain that runs while the in-flight permit is still held: the second is shed. |
 
@@ -738,3 +742,56 @@ The doc comment on the over-ceiling case in
 the shed path's credential check has no side effect. That is true of that
 test's own request, which carries no credential, but not of the shed path
 in general. It is corrected with the next change to that file.
+
+## Amendment (2026-11-04): Remote Write's ack mode is an operator flag, default buffered (issue #3808)
+
+<!-- amendment-applies: sections="Context|Decision|Amendment (2026-10-14): the pending strict-ack permit is taken at the request head (issue #2805)" pointer="Remote Write mode amendment" -->
+<!-- amendment-supersedes: phrase="answers strict unconditionally" pointer="Remote Write mode amendment" -->
+<!-- amendment-supersedes: phrase="is strict-only" pointer="Remote Write mode amendment" -->
+
+Decision 4's 2026-10-14 amendment says that on Remote Write the state
+answers strict unconditionally, whatever the request carries. The
+maintainer decided on 2026-11-04 that the operator chooses instead.
+
+**Decision.** `ravel-server` gains `--remote-write-mode buffered|strict`
+(env `RAVEL_REMOTE_WRITE_MODE`). The default is `buffered`. The flag is
+process-wide and applies to every Remote Write request, RW 1.0 and RW 2.0
+alike.
+
+- `buffered`: a Remote Write request is acknowledged after admission and
+  enqueue, under the buffered-mode contract of
+  `docs/consistency-model.md`. A process crash between the ack and the
+  flush loses the acknowledged window. The request takes no pending-ack
+  permit. The response carries no `x-ravel-commit-token`. The buffered
+  memory ceiling (`--max-ingest-buffer-bytes`) sheds it as it sheds
+  buffered OTLP.
+- `strict`: today's behaviour exactly, under `--strict-flush-policy`.
+- Remote Write still reads no `x-ravel-ingest-mode` header. A client
+  cannot choose its own mode, so the rejected alternative in the
+  Acceptance table above (reading the header would let any client opt out
+  of the bound) still stands. Only the operator chooses.
+
+**Why the default flips.** A strict Remote Write 2xx waits for the flush
+that stores its points, so Remote Write throughput is bounded by the flush
+clock (E2 on #2821: 42,142 points a second at a 2 s flush delay, 114,356
+at 500 ms). The comparable engines acknowledge before their data is in
+object storage too.
+
+**The trade-off.** A Remote Write sender treats any 2xx as durable and
+drops its WAL entry on that basis. Under `buffered`, a Ravel process crash
+therefore loses points the sender no longer holds. The comparable engines
+acknowledge from a local WAL that survives a process crash. Ravel keeps no
+local durable state, by invariant, so its buffered window is in process
+memory only. An operator who needs a 2xx to mean durable sets
+`--remote-write-mode strict`.
+
+**Acceptance.** Each test below rules out the wrong implementations named
+beside it.
+
+| Setup | Expected | Rules out |
+|---|---|---|
+| Default flag, pending-ack budget 1, one strict OTLP ack held by a gated PUT. A Remote Write request. | 2xx, no `x-ravel-commit-token`, pending-ack gauge unchanged. | A surface still strict by default. Buffered Remote Write taking a permit. |
+| `--remote-write-mode strict`, budget 1, one ack held. A Remote Write request carrying `x-ravel-ingest-mode: buffered`. | The pending-ack 429. | Reading the header (the 2026-10-14 row, now under strict). |
+| `--remote-write-mode buffered`. A Remote Write request carrying `x-ravel-ingest-mode: strict`. | Buffered: 2xx with no commit token while the data PUT is held. | Reading the header in the other direction. |
+| `--remote-write-mode buffered`. A Remote Write request, then the flush. | Its points are stored and queryable after the flush. | A buffered path that drops points. |
+| `--remote-write-mode strict`. A Remote Write request. | `x-ravel-commit-token` present and the commit record stored before the 2xx, as before. | Strict mode changed by this amendment. |
