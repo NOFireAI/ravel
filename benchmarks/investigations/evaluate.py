@@ -407,7 +407,7 @@ class Calls:
                         c["_judged"] = "refused"
                         problems.add("refused", f"{where(c)}: HTTP {c.get('http_status')} "
                                                 f"{c.get('reason') or c.get('error') or 'no text'}")
-                    elif outcome in (UNSUPPORTED, GUARD, "not-run"):
+                    elif outcome in (UNSUPPORTED, GUARD, "not-run", "server_died"):
                         if not c.get("reason"):
                             problems.add("missing", f"reason for {outcome} {where(c)}")
                         if outcome == GUARD and "wall_s" not in c:
@@ -637,6 +637,9 @@ def statement_figure(calls, cfg, statement, state, metric, candidates=None):
             f" ({n} of {len(lines)} tries)" if n != len(lines) else "")
     if outcomes in ({UNSUPPORTED}, {GUARD}):
         return outcomes.pop(), None, lines[0].get("reason") or "no reason given"
+    if "server_died" in outcomes:
+        c = next(c for c in lines if c.get("outcome") == "server_died")
+        return "missing", None, c.get("reason") or f"server died during {statement}/{state}"
     if outcomes != {"ok"}:
         return "missing", None, f"a {temp} call of {statement} in {state} failed"
     invalid = [c for c in lines if c.get("_invalid")]

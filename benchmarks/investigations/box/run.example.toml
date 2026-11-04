@@ -87,6 +87,14 @@ tenant = "inv"
 shards = 8
 # Optional: memory_budget_bytes (ravel-server --memory-budget-bytes).
 # memory_budget_bytes = 25769803776
+# Optional: extra_flags, appended verbatim after --memory-budget-bytes on
+# every ravel-server command line (and stamped into <state>.server.json's
+# server_flags as passed). Each element is one argv token: no shell
+# evaluation and no word splitting, so a flag that takes a value is one
+# "--flag=value" element, not two. Refused at load time (exit 64, naming
+# the element) when an element contains whitespace or does not start with
+# "--".
+# extra_flags = ["--sql-max-query-bytes=1048576"]
 
 [hits]
 # Read only when run.hits = true. The same dataset the ClickBench kit loads.
