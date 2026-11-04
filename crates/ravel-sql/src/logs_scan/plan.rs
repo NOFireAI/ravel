@@ -296,14 +296,21 @@ pub(super) fn plan_counts_future(
 /// `cell` as [`plan_counts_future`] resolves the plan: the first partition to
 /// poll computes it ([`compute_fast_path_verdict`]) and every partition awaits
 /// that one result before its first open. `None`, and no I/O, unless the scan
-/// has a `Contains` arm and a decoded cache ([`deferred_cap`]).
+/// has a `Contains` arm and a decoded cache ([`deferred_cap`]), and `None`
+/// when `limited`: the scan carries a limit hint and no confirmed TopK, so the
+/// query may stop after its first rows and its partitions go straight to their
+/// opens without the verdict's directory reads.
 pub(super) fn fast_path_verdict_future(
+    limited: bool,
     cell: Arc<OnceCell<Arc<PlanCounts>>>,
     ctx: Arc<PartitionCtx>,
     segments: Arc<Vec<SegmentRef>>,
     concurrency: usize,
     plan_init_elapsed: Time,
 ) -> Option<CountsFuture> {
+    if limited {
+        return None;
+    }
     let cap = deferred_cap(&ctx)?;
     Some(Box::pin(async move {
         let counts = cell

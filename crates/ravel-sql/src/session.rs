@@ -154,7 +154,7 @@ use crate::ipcrypt_udf::SessionPrincipal;
 use crate::late_materialization::TopKLateMaterialization;
 use crate::like_udf::{LikeScope, LikeToUdf};
 use crate::logs_provider::LogsTableProvider;
-use crate::logs_scan::ConfirmTopKThreshold;
+use crate::logs_scan::{ConfirmTopKThreshold, LogsLimitHint};
 use crate::logs_udf::has_word_udf;
 use crate::map_field_planner::map_field_access_planner;
 use crate::memory::AggregateProfileRule;
@@ -886,6 +886,13 @@ pub fn build_session_with_tables(
     // `TopKLateMaterialization`'s phase-1 TopK. See
     // `crate::logs_scan::ConfirmTopKThreshold`.
     builder = builder.with_physical_optimizer_rule(Arc::new(ConfirmTopKThreshold));
+    // ADR-3326, serve-if-fits amendment: copy a `FilterExec`'s fetch onto the
+    // `logs` scan below it as a non-truncating limit hint, which spares the
+    // whole-segment fast path its verdict. After DataFusion's `LimitPushdown`,
+    // which installs that fetch, and after every rule that rebuilds a scan or
+    // inserts a TopK, since it must see the final filter-to-scan path. See
+    // `crate::logs_scan::LogsLimitHint`.
+    builder = builder.with_physical_optimizer_rule(Arc::new(LogsLimitHint));
     // Issue #2720: give an aggregate's output slices buffers of their own
     // before a `RepartitionExec` or a sort charges each slice the whole
     // materialized output. Appended after every rule above because each of

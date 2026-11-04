@@ -1711,6 +1711,9 @@ residual above the scan (`filter_is_exact`,
 `crates/ravel-sql/src/logs_pushdown.rs`), so DataFusion's limit pushdown
 stops at the filter and the scan never carries a fetch. Sparing such a scan
 the verdict is issue #3740.
+A scan under a filter with a fetch, with no TopK above it, now carries a
+non-truncating limit hint and skips the verdict
+(`a_like_limit_scan_skips_the_verdict_and_a_topk_keeps_it`).
 
 **When the estimate is wrong.** Answers do not depend on it, since a served
 and a decoded deferred column yield the same rows (the LIKE-deferred
