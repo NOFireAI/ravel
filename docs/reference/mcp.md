@@ -240,11 +240,16 @@ byte fit applied.
 
 - `widen_time_range`: a parent is `missing` and the call named a
   `time_range`. The parent may start outside it; widen or drop the window.
-- `raise_max_rows`: a parent is `not_returned`. Raise `max_rows` (up to
-  5,000) or narrow `time_range`.
+- A parent is `not_returned`: the step for the cap that cut the trace,
+  chosen by [the cap step rule](#cap-next-steps) and led by "a parent was
+  not returned". It is `raise_max_rows` only when the row cap cut the
+  trace with `max_rows` below 5,000; `raise_max_response_bytes` when the
+  byte cap dropped spans; `narrow_time_range` when the binding cap is at its
+  ceiling.
+- `read_full_cells`: the byte cap shortened cells and dropped no span.
 
-Otherwise neither step is listed, including for a `missing` parent when
-the call named no `time_range`.
+Otherwise none of these steps is listed, including for a `missing` parent
+when the call named no `time_range`.
 
 The two column names carry the reserved `__ravel_` prefix. A new declared
 typed attribute column whose key starts with `__ravel_` is refused, so no
@@ -489,7 +494,7 @@ last, a later page is refused:
 | --- | --- |
 | The statement has no order to page by | `add_an_order_by` |
 | The statement's order uses a value computed from other rows that it does not prove non-null | `order_by_the_rows_own_columns` |
-| No complete group of equal rows fits the page | `narrow_time_range` |
+| No complete group of equal rows fits the page | The step for the cap that cut the group, by [the cap step rule](#cap-next-steps), led by "more rows share one set of ORDER BY values than fit one page" |
 | The last row's order values could not be read, or one is NaN or infinite | `narrow_time_range` |
 | The cursor after the last row is over its 4 KiB bound, as a long string order value makes it | `narrow_time_range` |
 | A later page of a walk ordered by a value computed from other rows resolved a different segment set than page one: `cursor_expired`, no rows | `rerun_page_one` |
@@ -567,7 +572,10 @@ nanosecond strings, as everywhere in the envelope.
 The order `(ts, observed_ts)` is not total. A page never ends inside a
 group of rows equal on that pair; see [Page order](#page-order). A page on
 which no complete group fits returns the rows it has, `ok_bounded`, with no
-cursor and a `narrow_time_range` next step.
+cursor and the next step [the cap step rule](#cap-next-steps) gives for
+the cap that cut the group. One row whose cells the byte cap shortened is
+not a group cut: that page is `ok`, with no cursor and only the
+`read_full_cells` step.
 
 A cursor is bound to the filters, `time_range` and the effective
 `max_rows`; a call that changes any of them is refused as
@@ -614,7 +622,8 @@ result is one row with one `value` column.
 returned whole, `data.row_count` is the number of series the evaluation
 produced, `presentation.rows_omitted` counts the rest, and the status is
 `ok_bounded`. A PromQL result has no order a cursor could resume, so the
-tool mints none; narrow the selector to see the others.
+tool mints none; the `raise_max_rows` step says to raise `max_rows` or
+narrow the query to see the others.
 
 `max_response_bytes` bounds the samples too. When the series do not all
 fit, the series that fit whole come back whole, in order. The first that
@@ -623,10 +632,13 @@ does not comes back with a prefix of its samples: `ts_ns`, `value` and
 string count, giving the samples left out. `samples` stays an object; it
 is not cut to text as other oversized cells are. That series is dropped
 instead when not one of its samples fits and a series before it was
-kept. `presentation.cells_truncated` counts the cut series,
-`presentation.rows_omitted` also counts every series dropped, the status is
-`ok_bounded`, and a next step says to widen `step` or narrow `time_range`
-for fewer samples per series, or to narrow the query for fewer series.
+kept. `presentation.cells_truncated` counts the cut series and
+`presentation.rows_omitted` also counts every series dropped. A series
+dropped makes the status `ok_bounded`; a cut series alone leaves it `ok`,
+since every series is present. The next step, by
+[the cap step rule](#cap-next-steps), says to widen `step` or narrow
+`time_range` for fewer samples per series, or to narrow the query for
+fewer series (an instant evaluation names only the last).
 
 A result that skipped part of its coverage, such as an unreachable
 federated cluster, is refused as `unavailable` unless the call sets
@@ -831,7 +843,9 @@ only `data.rows`. When the envelope exceeds the cap:
   `presentation.rows_omitted`.
 - The server always keeps at least one row when the query produced one. It
   shortens the cells of that row under a per-cell budget and does not drop
-  the row.
+  the row. A result whose only cut is shortened cells is `ok`; a tool that
+  names cap steps adds the `read_full_cells` step of
+  [the cap step rule](#cap-next-steps).
 - A number, a timestamp, a boolean, and a hex-encoded binary id never
   shorten. A string or a structured value that exceeds the per-cell budget
   is cut to that budget.
@@ -865,10 +879,29 @@ The first-row guarantee applies to the byte cap. It does not apply to
 the row cap. When the equal-group rule leaves no complete group inside
 the row cap, the server returns the rows it has, up to the row cap.
 The status is `ok_bounded`. The server mints no cursor. `next_steps`
-names narrowing `time_range` as the fix.
+carries the step [the cap step rule](#cap-next-steps) gives for the cap
+that cut the group.
 
 A result with rows and `ok_bounded` means more rows exist and the
 server minted no cursor. An empty result is `ok` with `row_count` 0.
+
+### Cap next steps
+
+Every tool that names a remedy for a cap picks it by one rule, from what
+the caps actually cut. A tool may lead the detail with its own context,
+such as "a parent was not returned", and names its own way to ask for
+fewer or smaller rows.
+
+| What the caps cut | Status | Next step |
+| --- | --- | --- |
+| The byte cap dropped rows, and fewer than `max_rows` rows came back | `ok_bounded` or `ok_page` | `raise_max_response_bytes`, also naming the tool's way to smaller rows; at the 4 MiB ceiling, the tool's own smaller-rows action alone |
+| The row cap stopped the result | `ok_bounded` or `ok_page` | `raise_max_rows`, also naming the tool's way to fewer rows; with `max_rows` at its 5,000 ceiling, `narrow_time_range` instead |
+| The byte cap shortened cells and dropped no row | `ok`, no cursor | `read_full_cells`: ask for smaller rows, or raise `max_response_bytes` below its ceiling, to read the cells in full |
+| Nothing | `ok` | none |
+
+A step never advises raising a cap that did not bind, or one already at
+its ceiling. A result whose only cut is shortened cells is complete: no
+row is missing, so there is no next page and no cursor.
 
 ## Snapshot identity and freshness
 
@@ -1103,7 +1136,8 @@ arguments.
 `ravel_get_trace` mints no cursor: it returns the trace's spans in one
 page ordered by `(start_ts, span_id)`, and a trace larger than the row cap
 comes back with status `ok_bounded` and `row_cap_hit` rather than paged.
-Raise `max_rows` (up to 5,000) or narrow `time_range` to read more of it.
+Raise `max_rows` (up to 5,000) or narrow `time_range` to read more of it;
+at the ceiling, only narrowing `time_range` reads more.
 
 When no complete group fits in the row cap, the server returns the
 rows it has, up to the row cap, with status `ok_bounded` and no cursor.
@@ -1210,11 +1244,13 @@ build. What each tool does with an `evidence_ref` argument today:
 | Tool | An `evidence_ref` argument |
 | --- | --- |
 | `ravel_query_sql`, `ravel_query_promql`, `ravel_search_logs`, `ravel_get_trace`, `ravel_analyze_timeseries` | Listed in the input schema, and refused with `unsupported` |
-| `ravel_find_labels` | Not in the input schema, and refused with `invalid_argument` |
-| `ravel_capabilities`, `ravel_describe_data`, `ravel_explain_query`, and the six Ravel Agents tools | Not in the input schema. Accepted and ignored |
+| `ravel_capabilities`, `ravel_describe_data`, `ravel_explain_query`, `ravel_find_labels`, and the six Ravel Agents tools | Not in the input schema, and refused with `invalid_argument` |
 
-Not every argument a schema does not list is ignored. The server reads the
-six budget arguments (`max_rows`, `max_response_bytes`, `deadline_ms`,
+The refusal comes before the tool reads anything, with no rows. A JSON
+`null` is an absent argument and is not refused.
+
+The budget arguments are the exception to a schema's list. The server reads
+the six budget arguments (`max_rows`, `max_response_bytes`, `deadline_ms`,
 `max_bytes_scanned`, `max_store_requests`, `max_segments`) from every tool
 call before the tool runs, the Ravel Agents tools included, whether or not
 the tool's schema lists them. One with the wrong type refuses the call with

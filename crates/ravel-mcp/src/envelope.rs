@@ -34,6 +34,8 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 
+use crate::budget::{MAX_RESPONSE_BYTES_CEILING, MAX_ROWS_CEILING};
+
 /// The smallest `max_response_bytes` the server honors; a smaller request is
 /// raised to this floor. Re-exported from [`crate::budget`] so the two
 /// modules cannot disagree about the number.
@@ -527,6 +529,162 @@ pub struct EvidenceEntry {
 pub struct NextStep {
     pub action: String,
     pub detail: String,
+}
+
+/// Which cap took something from a fitted result. Every next step that
+/// advises on a cap is chosen from this, by [`CapAdvice::step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapCut {
+    /// No cap took anything.
+    Nothing,
+    /// The byte cap shortened cells of the one row returned and dropped no
+    /// row. The result is complete.
+    Cells { bytes_at_ceiling: bool },
+    /// The row cap dropped rows and the byte cap dropped none.
+    Rows { at_ceiling: bool },
+    /// The byte cap dropped rows. Raising `max_rows` cannot help.
+    Bytes { at_ceiling: bool },
+}
+
+impl CapCut {
+    /// The cap that bound a result fitted under `max_rows`, with
+    /// `rows_returned` rows kept. The row cap's own count is inside
+    /// `rows_omitted`, so the byte cap dropped rows exactly when it fired and
+    /// fewer rows came back than the row cap left.
+    pub fn of(presentation: &Presentation, rows_returned: usize, max_rows: u32) -> CapCut {
+        let bytes_at_ceiling =
+            presentation.effective_max_response_bytes >= MAX_RESPONSE_BYTES_CEILING;
+        let below_row_cap = !presentation.row_cap_hit || rows_returned < max_rows as usize;
+        if presentation.bytes_cap_hit && presentation.rows_omitted > 0 && below_row_cap {
+            return CapCut::Bytes {
+                at_ceiling: bytes_at_ceiling,
+            };
+        }
+        if presentation.row_cap_hit {
+            return CapCut::Rows {
+                at_ceiling: max_rows >= MAX_ROWS_CEILING,
+            };
+        }
+        if presentation.cells_truncated > 0 {
+            return CapCut::Cells { bytes_at_ceiling };
+        }
+        CapCut::Nothing
+    }
+
+    /// Whether more rows match than came back.
+    pub fn omits_rows(self) -> bool {
+        matches!(self, CapCut::Rows { .. } | CapCut::Bytes { .. })
+    }
+}
+
+/// How one tool phrases the remedies [`CapCut`] chooses between.
+#[derive(Debug, Clone, Copy)]
+pub struct CapAdvice<'a> {
+    /// What makes fewer rows match, e.g. "shorten time_range or add
+    /// predicates".
+    pub fewer_rows: &'a str,
+    /// The action naming what makes each row smaller, or fewer rows match
+    /// where the tool takes no projection.
+    pub smaller_rows_action: &'a str,
+    /// What `smaller_rows_action` asks for, e.g. "select fewer or narrower
+    /// columns".
+    pub smaller_rows: &'a str,
+}
+
+impl CapAdvice<'_> {
+    /// The step for `cut`, its detail led by `context` when that is not
+    /// empty; `None` when no cap took anything.
+    ///
+    /// - The row cap below the `max_rows` ceiling: raise `max_rows`.
+    /// - The row cap at the ceiling: make fewer rows match.
+    /// - The byte cap dropping rows: smaller rows, or raise
+    ///   `max_response_bytes` while it is below its ceiling.
+    /// - The byte cap shortening cells only: the result is complete; smaller
+    ///   rows or a larger `max_response_bytes` return the cells in full.
+    pub fn step(&self, cut: CapCut, context: &str) -> Option<NextStep> {
+        let (action, detail) = match cut {
+            CapCut::Nothing => return None,
+            CapCut::Rows { at_ceiling: false } => (
+                "raise_max_rows",
+                format!(
+                    "the row cap stopped the result; raise max_rows (up to 5,000) or {}",
+                    self.fewer_rows
+                ),
+            ),
+            CapCut::Rows { at_ceiling: true } => (
+                "narrow_time_range",
+                format!(
+                    "the row cap stopped the result with max_rows at its 5,000 ceiling; {}",
+                    self.fewer_rows
+                ),
+            ),
+            CapCut::Bytes { at_ceiling: false } => (
+                "raise_max_response_bytes",
+                format!(
+                    "the byte cap dropped rows; {}, or raise max_response_bytes (up to 4 MiB)",
+                    self.smaller_rows
+                ),
+            ),
+            CapCut::Bytes { at_ceiling: true } => (
+                self.smaller_rows_action,
+                format!(
+                    "the byte cap dropped rows with max_response_bytes at its 4 MiB ceiling; {}",
+                    self.smaller_rows
+                ),
+            ),
+            CapCut::Cells {
+                bytes_at_ceiling: false,
+            } => (
+                "read_full_cells",
+                format!(
+                    "the result is complete but the byte cap shortened cells; {}, or raise \
+                     max_response_bytes (up to 4 MiB), to read them in full",
+                    self.smaller_rows
+                ),
+            ),
+            CapCut::Cells {
+                bytes_at_ceiling: true,
+            } => (
+                "read_full_cells",
+                format!(
+                    "the result is complete but the byte cap shortened cells; {} to read them \
+                     in full",
+                    self.smaller_rows
+                ),
+            ),
+        };
+        let detail = if context.is_empty() {
+            detail
+        } else {
+            format!("{context}; {detail}")
+        };
+        Some(NextStep {
+            action: action.to_string(),
+            detail,
+        })
+    }
+
+    /// The widest step [`step`](Self::step) can return for `context`, to
+    /// hold its room while the envelope is fitted: the step chosen after the
+    /// fit is never longer.
+    pub fn widest(&self, context: &str) -> NextStep {
+        [
+            CapCut::Rows { at_ceiling: false },
+            CapCut::Rows { at_ceiling: true },
+            CapCut::Bytes { at_ceiling: false },
+            CapCut::Bytes { at_ceiling: true },
+            CapCut::Cells {
+                bytes_at_ceiling: false,
+            },
+            CapCut::Cells {
+                bytes_at_ceiling: true,
+            },
+        ]
+        .into_iter()
+        .filter_map(|cut| self.step(cut, context))
+        .max_by_key(entry_serialized_len)
+        .unwrap_or_default()
+    }
 }
 
 /// The four D4 status values. `Ok` is a complete query, including a query
@@ -1283,6 +1441,79 @@ impl Envelope {
         self.fit_row_capped(requested_max_response_bytes, 0)
     }
 
+    /// [`fit_row_capped`](Self::fit_row_capped), plus the [`CapAdvice`] step
+    /// for whatever the fit cut under `max_rows`; see
+    /// [`fit_with_cap_step_by`](Self::fit_with_cap_step_by).
+    pub fn fit_with_cap_step(
+        self,
+        requested_max_response_bytes: u64,
+        row_cap_omitted: u64,
+        max_rows: u32,
+        advice: &CapAdvice<'_>,
+    ) -> Envelope {
+        let fitted: Result<Envelope, std::convert::Infallible> =
+            self.fit_with_cap_step_by(max_rows, advice, |envelope| {
+                Ok(envelope.fit_row_capped(requested_max_response_bytes, row_cap_omitted))
+            });
+        match fitted {
+            Ok(envelope) => envelope,
+            Err(never) => match never {},
+        }
+    }
+
+    /// `fit(self)`, plus the [`CapAdvice`] step for whatever that fit cut
+    /// under `max_rows`, measured inside the fit. A fit that cut nothing, or
+    /// failed, is returned as it was, with no step. Otherwise the envelope
+    /// is fitted again holding the step for that cut; when the cut that fit
+    /// makes calls for a longer step, once more holding
+    /// [`CapAdvice::widest`]. The step for the last fit's cut, never longer
+    /// than the one held, takes the held step's place.
+    pub fn fit_with_cap_step_by<E>(
+        self,
+        max_rows: u32,
+        advice: &CapAdvice<'_>,
+        fit: impl Fn(Envelope) -> Result<Envelope, E>,
+    ) -> Result<Envelope, E> {
+        let cut_of =
+            |fitted: &Envelope| CapCut::of(&fitted.presentation, fitted.data.rows.len(), max_rows);
+        let probe = fit(self.clone())?;
+        let cut = cut_of(&probe);
+        if cut == CapCut::Nothing || probe.failure.is_some() {
+            return Ok(probe);
+        }
+        let mut held = advice.step(cut, "").unwrap_or_default();
+        let mut widest = false;
+        loop {
+            let mut placed = self.clone();
+            placed.next_steps.push(held.clone());
+            let at = placed.next_steps.len() - 1;
+            let mut fitted = fit(placed)?;
+            let step = advice.step(cut_of(&fitted), "");
+            let fits_held =
+                step.as_ref().map_or(0, entry_serialized_len) <= entry_serialized_len(&held);
+            if fits_held || widest {
+                fitted.replace_step(at, step);
+                return Ok(fitted);
+            }
+            held = advice.widest("");
+            widest = true;
+        }
+    }
+
+    /// Put `step` in place of the stand-in at index `at`, or remove the
+    /// stand-in for `None`. A stand-in the metadata caps dropped stays gone.
+    pub fn replace_step(&mut self, at: usize, step: Option<NextStep>) {
+        if self.next_steps.len() != at + 1 {
+            return;
+        }
+        match (step, self.next_steps.last_mut()) {
+            (Some(step), Some(slot)) => *slot = step,
+            _ => {
+                self.next_steps.pop();
+            }
+        }
+    }
+
     /// [`fit`](Self::fit) for an envelope whose caller already dropped
     /// `row_cap_omitted` rows to its own `max_rows`. That count is folded
     /// into `presentation.rows_omitted`, and `row_cap_hit` is set when it is
@@ -1536,12 +1767,14 @@ impl Envelope {
     /// - `ok`: no cap stopped the result. A zero-row match and an unfilled
     ///   `LIMIT` are both complete results and both `ok`.
     ///
-    /// "A cap stopped the result" means the cap took something away, not that
-    /// a cap was consulted. `bytes_cap_hit` says the envelope was over the
-    /// byte cap when `fit` measured it; if the caps that followed dropped no
-    /// row and cut no cell, nothing is missing and the result is `ok`.
-    /// Reporting `ok_bounded` there would tell the caller more rows match
-    /// than came back, which is a claim about the data and would be false.
+    /// "A cap stopped the result" means the cap took a row away, not that a
+    /// cap was consulted. `bytes_cap_hit` says the envelope was over the byte
+    /// cap when `fit` measured it; if the caps that followed dropped no row,
+    /// no row is missing and the result is `ok`, even when cells of the one
+    /// row returned were shortened (`cells_truncated` says so, and
+    /// [`CapAdvice::step`] says how to read them in full). Reporting
+    /// `ok_bounded` there would tell the caller more rows match than came
+    /// back, which is a claim about the data and would be false.
     ///
     /// `has_total_order` is the statement-level fact that decides whether a
     /// cursor may be handed out at all: D5 mints one only when the ordering
@@ -1584,10 +1817,8 @@ impl Envelope {
         self.warn_unreported_identity();
         self.presentation.metadata_elided += truncate_vec(&mut self.warnings, MAX_WARNINGS);
 
-        let bytes_cap_took_something =
-            self.presentation.rows_omitted > 0 || self.presentation.cells_truncated > 0;
         let capped = self.presentation.row_cap_hit
-            || (self.presentation.bytes_cap_hit && bytes_cap_took_something);
+            || (self.presentation.bytes_cap_hit && self.presentation.rows_omitted > 0);
         if !has_total_order || !capped {
             self.presentation.cursor = None;
         }
@@ -2884,8 +3115,12 @@ mod tests {
     /// back and the status is `ok`. A cursor set on such a result points at
     /// no next page and is dropped with it.
     ///
-    /// One dropped row or one cut cell is enough to make the same envelope
-    /// bounded, which is what keeps the flag from being decoration.
+    /// One dropped row is enough to make the same envelope bounded, which is
+    /// what keeps the flag from being decoration. A cut cell is not: every
+    /// row came back, so the result is complete, `ok` with no cursor.
+    ///
+    /// FLIP: counting `cells_truncated` as a cut, as `finish` did, makes the
+    /// last envelope `ok_bounded`.
     #[test]
     fn finish_is_ok_when_the_cap_was_hit_but_nothing_was_dropped() {
         let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i128)]);
@@ -2905,7 +3140,10 @@ mod tests {
         let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i128)]);
         envelope.presentation.bytes_cap_hit = true;
         envelope.presentation.cells_truncated = 1;
-        assert_eq!(envelope.finish(false).status, Status::OkBounded);
+        envelope.presentation.cursor = Some("cursor-token".to_string());
+        let finished = envelope.finish(true);
+        assert_eq!(finished.status, Status::Ok);
+        assert_eq!(finished.presentation.cursor, None);
     }
 
     /// Every envelope that reaches a caller goes through `finish`, so the

@@ -159,16 +159,17 @@ async fn a_cursor_redeemed_by_another_tenant_is_cursor_invalid_for_every_tool() 
     running.shutdown().await.expect("server stops");
 }
 
-/// `evidence_ref` is not served by this build, and every tool that takes it
-/// refuses a value for it as `unsupported` with no row, before reading
-/// anything, rather than running the call and ignoring the reference. The
-/// day one of them serves it this fails loudly, and the test should then be
-/// replaced by a replay case for it. `ravel_find_labels` takes no
-/// `evidence_ref` at all and refuses one as `invalid_argument`.
+/// `evidence_ref` is not served by this build, and every tool refuses a
+/// value for it with no row, before reading anything, rather than running
+/// the call and ignoring the reference: a tool whose schema takes it as
+/// `unsupported`, and a tool whose schema does not (`ravel_capabilities`,
+/// `ravel_describe_data`, `ravel_explain_query`, `ravel_find_labels`) as
+/// `invalid_argument`. The day one of them serves it this fails loudly, and
+/// the test should then be replaced by a replay case for it.
 ///
-/// FLIP: deleting the `input.evidence_ref.is_some()` refusal from
-/// `ravel_query_sql`'s `Call::from_args` (`crates/ravel-mcp/src/tools/query_sql.rs`)
-/// runs the statement and answers `ok` with acme's rows.
+/// FLIP: deleting the `evidence_ref_refusal` call from `dispatch`
+/// (`crates/ravel-mcp/src/tools/mod.rs`) runs `ravel_describe_data` with the
+/// reference ignored, and it reads the store.
 #[tokio::test]
 async fn evidence_ref_is_unsupported_by_every_tool_that_takes_it() {
     let store = memory_store();
@@ -214,6 +215,17 @@ async fn evidence_ref_is_unsupported_by_every_tool_that_takes_it() {
             json!({"label_name": "owner", "time_range": window}),
             "invalid_argument",
         ),
+        (
+            "ravel_describe_data",
+            json!({"signal": "metrics"}),
+            "invalid_argument",
+        ),
+        (
+            "ravel_explain_query",
+            json!({"query": "SELECT * FROM samples", "time_range": window}),
+            "invalid_argument",
+        ),
+        ("ravel_capabilities", json!({}), "invalid_argument"),
     ];
     for (name, arguments, class) in cases {
         // Without the reference the same call is served, so the refusal
@@ -233,13 +245,12 @@ async fn evidence_ref_is_unsupported_by_every_tool_that_takes_it() {
             "{name}: {refused}"
         );
         let message = refused["failure"]["message"].as_str().expect("a message");
-        assert!(message.contains("evidence_ref"), "{name}: {message}");
-        if class == "unsupported" {
-            assert_eq!(
-                message,
-                format!("evidence_ref is not served by {name} in this build")
-            );
-        }
+        let expected = if class == "unsupported" {
+            format!("evidence_ref is not served by {name} in this build")
+        } else {
+            format!("evidence_ref is not an argument of {name}")
+        };
+        assert_eq!(message, expected, "{name}");
         assert_eq!(rows(&refused).len(), 0, "{name}: {refused}");
         assert_eq!(refused["data"]["row_count"], json!(0), "{name}: {refused}");
         assert_eq!(refused["evidence"], json!([]), "{name}: {refused}");

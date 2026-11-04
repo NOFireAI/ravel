@@ -25,9 +25,12 @@ pub mod query_promql;
 pub mod query_sql;
 pub mod search_logs;
 
+use rmcp::model::Tool;
+
 use crate::budget::McpEffectiveBudgets;
+use crate::catalog::tool_catalog;
 use crate::cursor::CursorKey;
-use crate::envelope::Envelope;
+use crate::envelope::{Envelope, Failure, FailureClass};
 use crate::service::QueryBackend;
 use ravel_types::TenantHash;
 
@@ -101,6 +104,9 @@ pub async fn dispatch<B: QueryBackend>(
     ctx: &ToolContext<'_>,
     backend: &B,
 ) -> Result<Envelope, ToolError> {
+    if let Some(failure) = evidence_ref_refusal(name, &args, &tool_catalog()) {
+        return Ok(capabilities::refused(failure, ctx));
+    }
     match name {
         "ravel_capabilities" => Ok(capabilities::run(args, ctx)),
         "ravel_describe_data" => Ok(describe_data::run(args, ctx, backend).await),
@@ -113,6 +119,42 @@ pub async fn dispatch<B: QueryBackend>(
         "ravel_analyze_timeseries" => Ok(analyze_timeseries::run(args, ctx, backend).await),
         other => Err(ToolError::UnknownTool(other.to_string())),
     }
+}
+
+/// The one refusal of an `evidence_ref` argument, read off `catalog`, the
+/// schemas the caller was shown. A tool whose input schema lists the field
+/// does not serve it in this build: `unsupported`. A tool whose schema lacks
+/// it does not take it: `invalid_argument`. `None` when `args` carries no
+/// `evidence_ref` (a null is no value, as for every optional argument) or
+/// `name` is not in `catalog`.
+///
+/// The six budget arguments are the one exception to "an argument the schema
+/// lacks": the transport reads them from every call, listed or not.
+pub(crate) fn evidence_ref_refusal(
+    name: &str,
+    args: &serde_json::Value,
+    catalog: &[Tool],
+) -> Option<Failure> {
+    args.get("evidence_ref").filter(|value| !value.is_null())?;
+    let tool = catalog.iter().find(|tool| tool.name == name)?;
+    let listed = tool
+        .input_schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|properties| properties.contains_key("evidence_ref"));
+    Some(if listed {
+        Failure {
+            class: FailureClass::Unsupported,
+            message: format!("evidence_ref is not served by {name} in this build"),
+            counter: None,
+        }
+    } else {
+        Failure {
+            class: FailureClass::InvalidArgument,
+            message: format!("evidence_ref is not an argument of {name}"),
+            counter: None,
+        }
+    })
 }
 
 #[cfg(test)]
@@ -458,6 +500,53 @@ mod tests {
     /// anything else. The counts are exact on purpose: all nine bodies this
     /// build carries must answer an envelope, and none may answer
     /// `NotShipped`.
+    /// `evidence_ref` is refused by every tool, by one rule over the schema
+    /// the caller was shown: `unsupported` where the schema lists it,
+    /// `invalid_argument` where it does not. A null is no value.
+    ///
+    /// FLIP: dropping the refusal from `dispatch` lets capabilities,
+    /// describe_data and explain_query accept and ignore it.
+    #[test]
+    fn an_evidence_ref_is_refused_by_the_class_its_schema_implies() {
+        let key = CursorKey::from_process_secret([7u8; CURSOR_KEY_LEN]);
+        let ctx = test_context(&key);
+        let mut classes = Vec::new();
+        for tool in tool_catalog() {
+            let name = tool.name.to_string();
+            let args = serde_json::json!({"evidence_ref": "e"});
+            let envelope = block_on(dispatch(&name, args, &ctx, &NoBackend)).expect("routes");
+            let failure = envelope.failure.expect("refused");
+            let expected = match failure.class {
+                FailureClass::Unsupported => {
+                    format!("evidence_ref is not served by {name} in this build")
+                }
+                _ => format!("evidence_ref is not an argument of {name}"),
+            };
+            assert_eq!(failure.message, expected);
+            classes.push((name, failure.class));
+        }
+        assert_eq!(
+            classes,
+            [
+                ("ravel_capabilities", FailureClass::InvalidArgument),
+                ("ravel_describe_data", FailureClass::InvalidArgument),
+                ("ravel_find_labels", FailureClass::InvalidArgument),
+                ("ravel_explain_query", FailureClass::InvalidArgument),
+                ("ravel_query_sql", FailureClass::Unsupported),
+                ("ravel_query_promql", FailureClass::Unsupported),
+                ("ravel_search_logs", FailureClass::Unsupported),
+                ("ravel_get_trace", FailureClass::Unsupported),
+                ("ravel_analyze_timeseries", FailureClass::Unsupported),
+            ]
+            .map(|(name, class)| (name.to_string(), class))
+        );
+
+        let null = serde_json::json!({"evidence_ref": null});
+        let envelope =
+            block_on(dispatch("ravel_capabilities", null, &ctx, &NoBackend)).expect("routes");
+        assert_eq!(envelope.status, crate::envelope::Status::Ok);
+    }
+
     #[test]
     fn dispatch_routes_every_catalog_name_and_refuses_unknown_names() {
         let key = CursorKey::from_process_secret([7u8; CURSOR_KEY_LEN]);

@@ -12,7 +12,9 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
-use crate::catalog::{AgentEventsInput, AgentInput, AgentOperationInput, AgentSendInput};
+use crate::catalog::{
+    AgentEventsInput, AgentInput, AgentOperationInput, AgentSendInput, agents_tool_catalog,
+};
 use crate::envelope::{
     AnyJson, Budget, CURSOR_BOUND, Cell, Column, Data, Envelope, Failure, FailureClass, NextStep,
     Row, Status, serialized_str_len,
@@ -86,6 +88,9 @@ pub async fn dispatch_agents<B: AgentsBackend>(
     ctx: &ToolContext<'_>,
     backend: &B,
 ) -> Option<Envelope> {
+    if let Some(failure) = super::evidence_ref_refusal(name, &args, &agents_tool_catalog()) {
+        return Some(failed(failure, Vec::new(), ctx));
+    }
     let envelope = match name {
         "ravel_agent_describe" => describe(args, ctx, backend).await,
         "ravel_agent_send" => send(args, ctx, backend).await,
@@ -808,6 +813,30 @@ mod tests {
             .is_none()
         );
         assert!(backend.calls.borrow().is_empty());
+    }
+
+    /// No agents tool's schema lists `evidence_ref`, so every one refuses
+    /// it as `invalid_argument` before the backend is called.
+    ///
+    /// FLIP: dropping the refusal from `dispatch_agents` accepts and ignores
+    /// it, and the backend is called.
+    #[test]
+    fn an_evidence_ref_is_not_an_argument_of_any_agents_tool() {
+        for name in AGENTS_TOOLS {
+            let backend = Canned::new(200, json!({}));
+            let envelope = run(name, json!({"evidence_ref": "e"}), &backend);
+            assert_eq!(envelope["status"], json!("error"), "{name}");
+            assert_eq!(
+                envelope["failure"]["class"],
+                json!("invalid_argument"),
+                "{name}"
+            );
+            assert_eq!(
+                envelope["failure"]["message"],
+                json!(format!("evidence_ref is not an argument of {name}")),
+            );
+            assert!(backend.calls.borrow().is_empty(), "{name}");
+        }
     }
 
     #[test]

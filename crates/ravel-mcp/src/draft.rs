@@ -39,7 +39,9 @@ use ravel_types::{CommitToken, Signal, TenantHash};
 
 use crate::budget::McpEffectiveBudgets;
 use crate::cursor::{self, Cursor, CursorError, CursorPosition};
-use crate::envelope::{CURSOR_BOUND, Envelope, NextStep, Row, serialized_str_len};
+use crate::envelope::{
+    CURSOR_BOUND, CapAdvice, CapCut, Envelope, NextStep, Row, serialized_str_len,
+};
 
 /// Why a statement's result cannot carry a cursor. A cursor pins exactly one
 /// signal snapshot (D5), so every other shape of statement is refused here
@@ -237,13 +239,19 @@ impl Draft {
     /// complete group fits a grouped page, or when `mint` refuses. Each case
     /// but the first carries a `no cursor:` warning naming the reason; the
     /// first is what every tool without a total order already reports. A
-    /// grouped page with no complete group also carries the order's
-    /// `no_complete_group` next step, and a refusing mint its own, if any.
-    /// Under both caps nothing is minted and the status is `ok`.
+    /// grouped page with no complete group also carries the `advice` step
+    /// for the cap that cut the group, led by the order's `group`, and a
+    /// refusing mint its own step, if any.
+    ///
+    /// Under both caps nothing is minted and the status is `ok`. That holds
+    /// when the byte cap only shortened cells of the one row returned: no
+    /// row is missing, so there is no next page, and the result carries the
+    /// `advice` step saying how to read the cells in full.
     pub fn finish_page<M>(
         self,
         budgets: &McpEffectiveBudgets,
         scope: &PinScope,
+        advice: &CapAdvice<'_>,
         order: PageOrder<'_>,
         mint: M,
     ) -> Envelope
@@ -289,11 +297,13 @@ impl Draft {
         };
 
         let probe = envelope.clone().fit_row_capped(cap, row_cap_omitted);
-        let presentation = &probe.presentation;
-        let capped = presentation.row_cap_hit
-            || (presentation.bytes_cap_hit
-                && (presentation.rows_omitted > 0 || presentation.cells_truncated > 0));
-        if !capped || probe.failure.is_some() || matches!(order, PageOrder::Partial) {
+        let cut = CapCut::of(&probe.presentation, probe.data.rows.len(), budgets.max_rows);
+        if probe.failure.is_none() && matches!(cut, CapCut::Cells { .. }) {
+            return envelope
+                .fit_with_cap_step(cap, row_cap_omitted, budgets.max_rows, advice)
+                .finish(false);
+        }
+        if !cut.omits_rows() || probe.failure.is_some() || matches!(order, PageOrder::Partial) {
             return probe.finish(false);
         }
         let pins = match pins {
@@ -305,25 +315,25 @@ impl Draft {
         placed.presentation.cursor = Some("c".repeat(CURSOR_BOUND - 2));
         let mut fitted = placed.fit_row_capped(cap, row_cap_omitted);
         let fit_rows = fitted.data.rows.len();
+        let fit_cut = CapCut::of(&fitted.presentation, fit_rows, budgets.max_rows);
         let mut kept = fit_rows;
         let mut no_complete_group = None;
-        if let PageOrder::Grouped {
-            same_group,
-            no_complete_group: step,
-        } = order
-        {
+        if let PageOrder::Grouped { same_group, group } = order {
             kept = complete_groups(&order_tuples, pristine.len(), kept, same_group);
             let held_back = fit_rows - kept;
             fitted.data.rows.truncate(kept);
             fitted.presentation.rows_omitted += held_back as u64;
-            no_complete_group = Some(step);
+            no_complete_group = Some(group);
         }
         let Some(last) = kept.checked_sub(1).and_then(|index| pristine.get(index)) else {
             let refusal = match no_complete_group.filter(|_| fit_rows > 0) {
-                Some(step) => NoCursor {
+                Some(group) => NoCursor {
                     reason: "no complete group of rows equal under the order fits one page"
                         .to_string(),
-                    next_step: Some(step.clone()),
+                    next_step: advice.step(
+                        fit_cut,
+                        &format!("more rows share {group} than fit one page"),
+                    ),
                 },
                 None => NoCursor::because("no row fits one page beside a cursor".to_string()),
             };
@@ -418,9 +428,10 @@ pub enum PageOrder<'a> {
     Grouped {
         /// Whether two rows' [`Draft::order_tuples`] put them in one group.
         same_group: &'a dyn Fn(&[ResumeValue], &[ResumeValue]) -> bool,
-        /// What a capped page on which no complete group fits tells the
-        /// caller to do.
-        no_complete_group: &'a NextStep,
+        /// What the rows of one group share, as in "more rows share {group}
+        /// than fit one page", the lead of the next step a capped page on
+        /// which no complete group fits carries.
+        group: &'a str,
     },
 }
 
@@ -566,7 +577,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::budget::{McpBudgetConfig, McpRequestBudgets};
+    use crate::budget::{MAX_RESPONSE_BYTES_CEILING, McpBudgetConfig, McpRequestBudgets};
     use crate::cursor::{CURSOR_KEY_LEN, CursorKey, GRACE_NS, SegmentSetPin};
     use crate::envelope::row_cap_sweep::assert_finished_inside_cap;
     use crate::envelope::{Cell, Column, MAX_RESPONSE_BYTES_FLOOR, Status};
@@ -678,12 +689,11 @@ mod tests {
         a == b
     }
 
-    fn narrow() -> NextStep {
-        NextStep {
-            action: "narrow_time_range".to_owned(),
-            detail: "d".to_owned(),
-        }
-    }
+    const ADVICE: CapAdvice<'static> = CapAdvice {
+        fewer_rows: "narrow time_range",
+        smaller_rows_action: "narrow_the_projection",
+        smaller_rows: "select fewer columns",
+    };
 
     fn serialized_len(envelope: &Envelope) -> u64 {
         serde_json::to_vec(envelope).expect("serializes").len() as u64
@@ -706,7 +716,7 @@ mod tests {
         let draft = draft(50, width, |i| i as i128);
         let budgets = budgets(10);
 
-        let page = draft.finish_page(&budgets, &scope(), PageOrder::Total, token_mint);
+        let page = draft.finish_page(&budgets, &scope(), &ADVICE, PageOrder::Total, token_mint);
 
         assert_eq!(page.status, Status::OkPage);
         assert!(page.presentation.row_cap_hit);
@@ -748,6 +758,7 @@ mod tests {
         let refused = draft(5, 8, |i| i as i128).finish_page(
             &budgets,
             &scope(),
+            &ADVICE,
             PageOrder::Total,
             |_, _, _| Err(CursorError::Expired.into()),
         );
@@ -764,9 +775,10 @@ mod tests {
 
         let mut parquet = draft(5, 8, |i| i as i128);
         parquet.signal = Err(NoCursorSignal::Parquet);
-        let parquet = parquet.finish_page(&budgets, &scope(), PageOrder::Total, |_, _, _| {
-            panic!("a draft with no signal must not reach the mint")
-        });
+        let parquet =
+            parquet.finish_page(&budgets, &scope(), &ADVICE, PageOrder::Total, |_, _, _| {
+                panic!("a draft with no signal must not reach the mint")
+            });
         assert_eq!(parquet.status, Status::OkBounded);
         assert!(parquet.visibility.snapshot_id.is_empty());
         assert!(
@@ -778,6 +790,7 @@ mod tests {
         let partial = draft(5, 8, |i| i as i128).finish_page(
             &budgets,
             &scope(),
+            &ADVICE,
             PageOrder::Partial,
             |_, _, _| panic!("a partial order must not reach the mint"),
         );
@@ -820,9 +833,13 @@ mod tests {
                 None,
                 NOW_NS,
             )
-            .finish_page(&budgets(1), &scope(), PageOrder::Partial, |_, _, _| {
-                panic!("a partial order must not reach the mint")
-            })
+            .finish_page(
+                &budgets(1),
+                &scope(),
+                &ADVICE,
+                PageOrder::Partial,
+                |_, _, _| panic!("a partial order must not reach the mint"),
+            )
         };
         assert_finished_inside_cap(MAX_RESPONSE_BYTES_FLOOR, 10_000, run_with);
     }
@@ -837,6 +854,7 @@ mod tests {
         let page = draft(3, 8, |i| i as i128).finish_page(
             &budgets(3),
             &scope(),
+            &ADVICE,
             PageOrder::Total,
             |_, _, _| panic!("an uncapped page must not mint"),
         );
@@ -878,7 +896,7 @@ mod tests {
             &first.declared_columns,
             NOW_NS,
         );
-        let page_one = first.finish_page(&budgets, &scope(), PageOrder::Total, token_mint);
+        let page_one = first.finish_page(&budgets, &scope(), &ADVICE, PageOrder::Total, token_mint);
         assert_eq!(page_one.status, Status::OkPage);
         assert_eq!(page_one.visibility.snapshot_id, hex(&expected));
         assert_eq!(page_one.visibility.ingest_watermark_hour, "472223");
@@ -943,6 +961,7 @@ mod tests {
         let page_two = second.pinned_to(&confirmed, observed).finish_page(
             &budgets,
             &PinScope::of(&confirmed),
+            &ADVICE,
             PageOrder::Total,
             token_mint,
         );
@@ -979,7 +998,7 @@ mod tests {
         let budgets = budgets(2);
         let first = draft(5, 8, |i| i as i128);
         let page_one_set = first.declared_columns.clone();
-        let page_one = first.finish_page(&budgets, &scope(), PageOrder::Total, token_mint);
+        let page_one = first.finish_page(&budgets, &scope(), &ADVICE, PageOrder::Total, token_mint);
         let token = page_one.presentation.cursor.as_deref().expect("a cursor");
         let pending = Cursor::redeem(
             token,
@@ -1007,6 +1026,7 @@ mod tests {
         let page_two = second.pinned_to(&confirmed, page_one_set).finish_page(
             &budgets,
             &PinScope::of(&confirmed),
+            &ADVICE,
             PageOrder::Total,
             token_mint,
         );
@@ -1027,19 +1047,19 @@ mod tests {
     /// resuming after key 1, skips the third.
     /// FLIP: leaving the held-back rows out of `rows_omitted` under-reports
     /// what the caller did not get.
-    /// FLIP: dropping `no_complete_group` leaves the bounded page with no
-    /// next step.
+    /// FLIP: dropping the no-complete-group step leaves the bounded page
+    /// with no next step.
     #[test]
     fn a_grouped_page_holds_back_its_open_trailing_group() {
         let keys = [0, 0, 1, 1, 1, 2];
-        let step = narrow();
         let grouped = PageOrder::Grouped {
             same_group: &same_int,
-            no_complete_group: &step,
+            group: "one k",
         };
         let page = draft(keys.len(), 8, |i| keys[i]).finish_page(
             &budgets(4),
             &scope(),
+            &ADVICE,
             grouped,
             token_mint,
         );
@@ -1063,7 +1083,7 @@ mod tests {
         // page, so whether the last group is complete is unknown.
         let mut open = draft(4, 8, |i| [0, 0, 1, 1][i]);
         open.envelope.presentation.row_cap_hit = true;
-        let page = open.finish_page(&budgets(4), &scope(), grouped, token_mint);
+        let page = open.finish_page(&budgets(4), &scope(), &ADVICE, grouped, token_mint);
         assert_eq!(
             page.data.rows.iter().map(key_of).collect::<Vec<_>>(),
             [0, 0]
@@ -1072,7 +1092,7 @@ mod tests {
         assert_eq!(page.status, Status::OkPage);
 
         let one_group =
-            draft(5, 8, |_| 7).finish_page(&budgets(4), &scope(), grouped, |_, _, _| {
+            draft(5, 8, |_| 7).finish_page(&budgets(4), &scope(), &ADVICE, grouped, |_, _, _| {
                 panic!("no complete group, nothing to mint after")
             });
         assert_eq!(one_group.status, Status::OkBounded);
@@ -1083,9 +1103,13 @@ mod tests {
             one_group
                 .next_steps
                 .iter()
-                .map(|step| step.action.as_str())
+                .map(|step| (step.action.as_str(), step.detail.as_str()))
                 .collect::<Vec<_>>(),
-            ["narrow_time_range"]
+            [(
+                "raise_max_rows",
+                "more rows share one k than fit one page; the row cap stopped the result; \
+                 raise max_rows (up to 5,000) or narrow time_range"
+            )]
         );
         assert!(
             one_group.warnings.contains(
@@ -1109,9 +1133,13 @@ mod tests {
         let mut wide = draft(2, 8, |i| i as i128);
         let row: Row = (0..20_000).map(|_| Cell::Int(i128::MAX)).collect();
         wide.envelope.data.rows = vec![row.clone(), row];
-        let page = wide.finish_page(&budgets(2), &scope(), PageOrder::Total, |_, _, _| {
-            panic!("no row kept, nothing to mint after")
-        });
+        let page = wide.finish_page(
+            &budgets(2),
+            &scope(),
+            &ADVICE,
+            PageOrder::Total,
+            |_, _, _| panic!("no row kept, nothing to mint after"),
+        );
         assert_eq!(page.status, Status::OkBounded);
         assert_eq!(page.presentation.cursor, None);
         assert!(page.data.rows.is_empty());
@@ -1134,6 +1162,7 @@ mod tests {
         let page = draft(5, 8, |i| i as i128).finish_page(
             &budgets(2),
             &scope(),
+            &ADVICE,
             PageOrder::Total,
             |_, _, _| Ok("t".repeat(5000)),
         );
@@ -1244,5 +1273,52 @@ mod tests {
             );
         }
         assert_eq!(EstimateComponent::from_field_name("segments"), None);
+    }
+
+    /// One row of a total order, its body wider than the byte cap: the cap
+    /// shortens the cell and drops no row, so the page is complete, `ok`
+    /// with no cursor, and its one step says how to read the cell in full,
+    /// below the byte ceiling and at it.
+    ///
+    /// FLIP: selecting the cursor path when only cells were shortened (the
+    /// `capped` test before this rule) answers with no next step at all.
+    #[test]
+    fn a_complete_page_with_a_shortened_cell_is_ok_with_the_cells_step() {
+        let cases = [
+            (
+                MAX_RESPONSE_BYTES_FLOOR,
+                "the result is complete but the byte cap shortened cells; select fewer \
+                 columns, or raise max_response_bytes (up to 4 MiB), to read them in full",
+            ),
+            (
+                MAX_RESPONSE_BYTES_CEILING,
+                "the result is complete but the byte cap shortened cells; select fewer \
+                 columns to read them in full",
+            ),
+        ];
+        for (cap, detail) in cases {
+            let mut budgets = budgets(10);
+            budgets.max_response_bytes = cap;
+            let page = draft(1, cap as usize + 1, |i| i as i128).finish_page(
+                &budgets,
+                &scope(),
+                &ADVICE,
+                PageOrder::Total,
+                token_mint,
+            );
+
+            assert_eq!(page.status, Status::Ok, "{cap}: {:?}", page.presentation);
+            assert_eq!(page.presentation.cursor, None, "{cap}");
+            assert_eq!(page.presentation.cells_truncated, 1, "{cap}");
+            assert_eq!(page.presentation.rows_omitted, 0, "{cap}");
+            assert_eq!(page.data.rows.len(), 1, "{cap}");
+            let steps: Vec<(&str, &str)> = page
+                .next_steps
+                .iter()
+                .map(|step| (step.action.as_str(), step.detail.as_str()))
+                .collect();
+            assert_eq!(steps, [("read_full_cells", detail)], "{cap}");
+            assert!(serialized_len(&page) <= cap, "{cap}");
+        }
     }
 }

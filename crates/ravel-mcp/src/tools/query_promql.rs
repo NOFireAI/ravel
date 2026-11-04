@@ -41,8 +41,8 @@ use serde_json::{Map, Value};
 
 use crate::catalog::QueryPromqlInput;
 use crate::envelope::{
-    Cell, Column, Data, Envelope, Failure, FailureClass, NextStep, Row, TimeRange, fit_cap,
-    serialized_len,
+    CapAdvice, Cell, Column, Data, Envelope, Failure, FailureClass, NextStep, Row, TimeRange,
+    fit_cap, serialized_len,
 };
 use crate::service::QueryBackend;
 
@@ -228,17 +228,21 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Result<
     let row_cap_omitted = produced.saturating_sub(max_rows) as u64;
     envelope.data.rows.truncate(max_rows);
     envelope.presentation.max_rows = ctx.budgets.max_rows;
-
-    let cut = if grouped {
-        fit_series(&mut envelope, ctx.budgets.max_response_bytes, plan.mode)?
-    } else {
-        SeriesCut::default()
-    };
     envelope.data.row_count = produced as u64;
-    let mut fitted = envelope.fit_row_capped(ctx.budgets.max_response_bytes, row_cap_omitted);
-    fitted.presentation.rows_omitted += cut.rows_omitted;
-    fitted.presentation.cells_truncated += cut.samples_cut;
-    fitted.presentation.bytes_cap_hit |= cut.rows_omitted > 0 || cut.samples_cut > 0;
+
+    let fit = |mut envelope: Envelope| -> Result<Envelope, Failure> {
+        let cut = if grouped {
+            fit_series(&mut envelope, ctx.budgets.max_response_bytes)?
+        } else {
+            SeriesCut::default()
+        };
+        let mut fitted = envelope.fit_row_capped(ctx.budgets.max_response_bytes, row_cap_omitted);
+        fitted.presentation.rows_omitted += cut.rows_omitted;
+        fitted.presentation.cells_truncated += cut.samples_cut;
+        fitted.presentation.bytes_cap_hit |= cut.rows_omitted > 0 || cut.samples_cut > 0;
+        Ok(fitted)
+    };
+    let fitted = envelope.fit_with_cap_step_by(ctx.budgets.max_rows, &advice(plan.mode), fit)?;
     Ok(fitted.finish(false))
 }
 
@@ -370,13 +374,11 @@ struct SeriesCut {
 fn fit_series(
     envelope: &mut Envelope,
     requested_max_response_bytes: u64,
-    mode: Mode,
 ) -> Result<SeriesCut, Failure> {
     let cap = fit_cap(requested_max_response_bytes).saturating_sub(COUNTER_SLACK);
     if serialized_len(envelope) <= cap {
         return Ok(SeriesCut::default());
     }
-    envelope.next_steps.push(bytes_next_step(mode));
     let mut rows = std::mem::take(&mut envelope.data.rows).into_iter();
     let mut used = serialized_len(envelope);
     let mut cut = SeriesCut::default();
@@ -399,25 +401,24 @@ fn fit_series(
         break;
     }
     cut.rows_omitted += rows.count() as u64;
-    if cut.rows_omitted == 0 && cut.samples_cut == 0 {
-        envelope.next_steps.pop();
-    }
     Ok(cut)
 }
 
-fn bytes_next_step(mode: Mode) -> NextStep {
-    let detail = match mode {
-        Mode::Range(_) => {
-            "the series did not fit max_response_bytes: widen step or narrow time_range for \
-             fewer samples per series, or narrow the query for fewer series"
-        }
-        Mode::Instant { .. } => {
-            "the series did not fit max_response_bytes: narrow the query for fewer series"
-        }
-    };
-    NextStep {
-        action: TOOL.to_string(),
-        detail: detail.to_string(),
+/// What a capped result tells the caller to do: a range can also carry
+/// fewer samples per series, an instant only fewer series.
+fn advice(mode: Mode) -> CapAdvice<'static> {
+    match mode {
+        Mode::Range(_) => CapAdvice {
+            fewer_rows: "narrow the query for fewer series",
+            smaller_rows_action: "widen_step",
+            smaller_rows: "widen step or narrow time_range for fewer samples per series, or \
+                           narrow the query for fewer series",
+        },
+        Mode::Instant { .. } => CapAdvice {
+            fewer_rows: "narrow the query for fewer series",
+            smaller_rows_action: "narrow_the_query",
+            smaller_rows: "narrow the query for fewer series",
+        },
     }
 }
 
@@ -937,6 +938,14 @@ mod tests {
         assert_eq!(envelope.presentation.rows_omitted, 1);
         assert_eq!(envelope.data.row_count, 3);
         assert_eq!(envelope.data.rows.len(), 2);
+        assert_eq!(
+            steps(&envelope),
+            [(
+                "raise_max_rows",
+                "the row cap stopped the result; raise max_rows (up to 5,000) or narrow the \
+                 query for fewer series"
+            )]
+        );
         for (row, name) in envelope.data.rows.iter().zip(["a", "b"]) {
             assert_eq!(row[0], labels(name));
             let Cell::Map(samples) = &row[1] else {
@@ -1086,6 +1095,14 @@ mod tests {
     }
 
     /// 11,000 one-second steps, the most a range may have.
+    fn steps(envelope: &Envelope) -> Vec<(&str, &str)> {
+        envelope
+            .next_steps
+            .iter()
+            .map(|step| (step.action.as_str(), step.detail.as_str()))
+            .collect()
+    }
+
     fn range_at_the_step_limit() -> Value {
         range_args(
             START_NS,
@@ -1097,9 +1114,9 @@ mod tests {
     /// One series whose samples are over the byte cap keeps an aligned
     /// prefix: `samples` stays an object, `ts_ns` and `value` hold the same
     /// first `k` samples of the series, `samples_omitted` counts the rest,
-    /// the cut is one truncated cell, the result is `ok_bounded`, and a next
-    /// step says to widen the step or narrow the range. The envelope still
-    /// fits the cap.
+    /// the cut is one truncated cell, the result is `ok` because no row was
+    /// dropped, and a next step says to widen the step or narrow the range.
+    /// The envelope still fits the cap.
     ///
     /// FLIP: leaving the cell to `Envelope::fit` (the code before this rule)
     /// answers a string; cutting `ts_ns` alone leaves arrays of different
@@ -1114,12 +1131,7 @@ mod tests {
 
         let envelope = block_on(run(range_at_the_step_limit(), &ctx, &stub));
 
-        assert_eq!(
-            envelope.status,
-            Status::OkBounded,
-            "{:?}",
-            envelope.presentation
-        );
+        assert_eq!(envelope.status, Status::Ok, "{:?}", envelope.presentation);
         assert!(envelope.presentation.bytes_cap_hit);
         assert_eq!(envelope.presentation.cells_truncated, 1);
         assert_eq!(envelope.presentation.rows_omitted, 0);
@@ -1137,13 +1149,14 @@ mod tests {
             samples["samples_omitted"],
             json!((full.len() - kept).to_string())
         );
-        assert!(
-            envelope
-                .next_steps
-                .iter()
-                .any(|step| step.detail.contains("widen step or narrow time_range")),
-            "{:?}",
-            envelope.next_steps
+        assert_eq!(
+            steps(&envelope),
+            [(
+                "read_full_cells",
+                "the result is complete but the byte cap shortened cells; widen step or \
+                 narrow time_range for fewer samples per series, or narrow the query for \
+                 fewer series, or raise max_response_bytes (up to 4 MiB), to read them in full"
+            )]
         );
         let size = serde_json::to_vec(&envelope).expect("serializes").len() as u64;
         let cap = envelope.presentation.effective_max_response_bytes;
@@ -1176,6 +1189,15 @@ mod tests {
         assert_eq!(envelope.data.rows.len(), 2);
         assert_eq!(envelope.presentation.cells_truncated, 1);
         assert_eq!(envelope.presentation.rows_omitted, 1);
+        assert_eq!(
+            steps(&envelope),
+            [(
+                "raise_max_response_bytes",
+                "the byte cap dropped rows; widen step or narrow time_range for fewer samples \
+                 per series, or narrow the query for fewer series, or raise max_response_bytes \
+                 (up to 4 MiB)"
+            )]
+        );
         let (a, a_ts, a_values) = samples_of(&envelope.data.rows[0]);
         assert_eq!(envelope.data.rows[0][0], labels("a"));
         assert_eq!((a_ts.len(), a_values.len()), (10, 10));
