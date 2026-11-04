@@ -791,7 +791,9 @@ mod tests {
             "{err:?}"
         );
 
-        // The probe path refuses the same section on one of the bad keys.
+        // The probe path refuses the same section on one of the bad keys, and
+        // the block it names is one of the inspector's findings (4 or 5), so
+        // the two bounds agree on the same bytes.
         let probe_err = probe_source(
             &footer,
             &rewritten[..],
@@ -801,7 +803,9 @@ mod tests {
         )
         .expect_err("probe refuses");
         assert!(
-            matches!(&probe_err, LogSegError::Corrupted(m) if m.contains("object has 4 blocks")),
+            matches!(&probe_err, LogSegError::Corrupted(m)
+                if m.contains("object has 4 blocks")
+                    && (m.contains("names block 4") || m.contains("names block 5"))),
             "{probe_err:?}"
         );
     }

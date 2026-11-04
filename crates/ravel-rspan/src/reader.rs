@@ -155,7 +155,11 @@ impl<'a> RspanReader<'a> {
     /// block ordinal is at or past the object's block count (the same bound
     /// [`Self::probe_trace`]'s refusal applies), for inspection.
     pub fn key_idx_summary(&self) -> Result<KeyIdxInspection, SpanSegError> {
-        key_index::summarize(self.key_idx, self.key_idx_prefix_len, self.skip.blocks.len())
+        key_index::summarize(
+            self.key_idx,
+            self.key_idx_prefix_len,
+            self.skip.blocks.len(),
+        )
     }
 
     /// Parses the object's BLOOM section (v3, ADR-0054). Entry `i` covers block
