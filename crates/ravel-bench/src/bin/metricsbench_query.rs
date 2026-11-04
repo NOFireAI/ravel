@@ -34,8 +34,8 @@ use clap::Parser;
 use ravel_bench::metrics_correctness::Engine;
 use ravel_bench::metrics_ingest::MetricsIngestReport;
 use ravel_bench::metrics_query::{
-    BindError, Diagnostics, EngineSpec, RunOptions, bind, bind_diagnostic, endpoints,
-    parse_engine_spec, run, system_name,
+    BindError, Diagnostics, EngineSpec, RAVEL_COST_NOTE, RunOptions, bind, bind_diagnostic,
+    endpoints, parse_engine_spec, run, system_name,
 };
 use ravel_bench::metrics_workload::load_workload;
 use ravel_bench::promql_corpus::load_corpus;
@@ -294,6 +294,8 @@ async fn run_main(args: Args) -> Result<(), Failure> {
             oracle: system_name(Engine::Prometheus),
             ulp_gaps: &output.ulp_gaps,
             oracle_retries: &output.oracle_retries,
+            ravel_cost: &output.ravel_cost,
+            ravel_cost_note: RAVEL_COST_NOTE,
         };
         let json = serde_json::to_vec_pretty(&diagnostics).map_err(|e| {
             (
