@@ -278,16 +278,26 @@ async fn scrape(app: &Router) -> String {
     String::from_utf8(bytes.to_vec()).expect("utf8 metrics")
 }
 
+/// The key-index router's two families: process-wide counters keyed by
+/// signal (and outcome), not part of the per-tenant query cost family.
+const KEY_INDEX_ROUTE_FAMILIES: [&str; 2] = [
+    "ravel_query_key_index_parts_total",
+    "ravel_query_key_index_leaf_gets_total",
+];
+
+/// The metric name of a sample line: everything before its label set or value.
+fn sample_name(line: &str) -> &str {
+    line.split(['{', ' ']).next().unwrap_or(line)
+}
+
 /// The label keys on the first `ravel_query_*` sample line (not a `# HELP` or
 /// `# TYPE` comment) that actually carries a `{...}` label set.
 fn query_family_label_key_sets(scrape: &str) -> Vec<Vec<String>> {
     scrape
         .lines()
-        // The key-index router families are process-wide counters keyed by
-        // signal and outcome, not part of the per-tenant query cost family.
         .filter(|line| {
             line.starts_with("ravel_query_")
-                && !line.starts_with("ravel_query_key_index_")
+                && !KEY_INDEX_ROUTE_FAMILIES.contains(&sample_name(line))
                 && line.contains('{')
         })
         .map(|line| {
@@ -426,6 +436,20 @@ async fn the_rendered_query_family_uses_only_the_allowlisted_label_keys_after_a_
         assert_eq!(
             keys, &expected,
             "a ravel_query_* line carried a label key outside the allowlist subset:\n{scrape}"
+        );
+    }
+    // The two families the filter above skips are rendered, each with its
+    // TYPE line and at least one sample, so the skip names what is there.
+    for family in KEY_INDEX_ROUTE_FAMILIES {
+        assert!(
+            scrape
+                .lines()
+                .any(|line| line == format!("# TYPE {family} counter")),
+            "{family} has no TYPE line:\n{scrape}"
+        );
+        assert!(
+            scrape.lines().any(|line| sample_name(line) == family),
+            "{family} renders no sample:\n{scrape}"
         );
     }
 }
