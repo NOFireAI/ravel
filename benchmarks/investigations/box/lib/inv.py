@@ -776,8 +776,35 @@ def load_corpus(path):
 # --- call ---------------------------------------------------------------------
 
 
+def darwin_rusage(pid):
+    """(user + system CPU seconds, lifetime peak physical footprint bytes) of
+    pid from libproc's proc_pid_rusage (RUSAGE_INFO_V4): the local lane's
+    stand-in for /proc on macOS, where no process exposes VmHWM. Its CPU
+    times are mach absolute time units, scaled by mach_timebase_info."""
+    import ctypes
+    import ctypes.util
+
+    class Timebase(ctypes.Structure):
+        _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+    system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    libproc = ctypes.CDLL(ctypes.util.find_library("proc") or "/usr/lib/libSystem.B.dylib")
+    tb = Timebase()
+    system.mach_timebase_info(ctypes.byref(tb))
+    # rusage_info_v4: a 16-byte uuid, then 35 uint64 fields; 40 is headroom.
+    buf = (ctypes.c_uint64 * 40)()
+    if libproc.proc_pid_rusage(int(pid), 4, ctypes.byref(buf)) != 0:
+        raise OSError(f"proc_pid_rusage({pid}) failed")
+    f = list(buf)[2:]
+    cpu_s = (f[0] + f[1]) * tb.numer / tb.denom / 1e9
+    return cpu_s, f[28]
+
+
 def proc_cpu_s(pid):
-    """utime + stime of pid in seconds, from /proc/<pid>/stat."""
+    """utime + stime of pid in seconds, from /proc/<pid>/stat (on macOS,
+    darwin_rusage)."""
+    if sys.platform == "darwin":
+        return darwin_rusage(pid)[0]
     with open(f"/proc/{pid}/stat") as f:
         stat = f.read()
     fields = stat[stat.rindex(")") + 2 :].split()
@@ -786,6 +813,9 @@ def proc_cpu_s(pid):
 
 
 def proc_hwm_bytes(pid):
+    """VmHWM of pid (on macOS, the lifetime peak physical footprint)."""
+    if sys.platform == "darwin":
+        return darwin_rusage(pid)[1]
     with open(f"/proc/{pid}/status") as f:
         for line in f:
             if line.startswith("VmHWM:"):

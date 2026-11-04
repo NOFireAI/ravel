@@ -1132,15 +1132,9 @@ finish() {
   exit $?
 }
 
-main() {
-  load_config
-  [ "$DRY_RUN" = 1 ] || : >"$CALLS"
-  step_bootstrap
-  step_store
-  step_host
-  step_corpus
-  step_declare
-  step_load_base
+# run_states: every run.toml state in order; a failed one is recorded and
+# the next one runs.
+run_states() {
   local s elapsed
   for s in $STATES; do
     elapsed=$(($(date +%s) - RUN_START))
@@ -1150,8 +1144,24 @@ main() {
     fi
     run_state "$s"
   done
+}
+
+main() {
+  load_config
+  [ "$DRY_RUN" = 1 ] || : >"$CALLS"
+  step_bootstrap
+  step_store
+  step_host
+  step_corpus
+  step_declare
+  step_load_base
+  run_states
   step_evaluate
   finish
 }
 
-main
+# Sourced (the cases' harness for the real, non-dry-run state paths), run.sh
+# only defines its functions and parses the arguments given to `source`.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main
+fi

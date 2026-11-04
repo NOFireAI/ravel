@@ -138,7 +138,12 @@ longer produces
 (`docs/adrs/2707-exact-key-index-for-spans-and-logs.md:39-41`). A call on
 S3 at the ADR's corpus is slower than a call on loopback at 20,000 traces;
 at ten times the smoke's restart and call time the calls alone take 446
-minutes. If a run reaches the deadline, drop these
+minutes. Measured on box A (run `investigations-20261104T001915Z-46224-17727`,
+main 3465163df, 2,000,000 traces, real S3; from its `progress.log`): the
+two release builds took 13 minutes, corpus generation 4 minutes, the
+`unfolded` state 57 minutes, `folded_leaves` 53, `mixed` 33 including the
+wait for the next hour, the compaction state 9 and the erasure state 6. If
+a run reaches the deadline, drop these
 states from `run.toml` first, in this order: `many_parts_2160` (2,160
 strided ingest hours loaded and folded one part per hour), `many_parts_744`,
 then `erasure_in_flight`; rows 10, 9 and 13's erasure figure then report
@@ -160,7 +165,11 @@ bash benchmarks/investigations/box/run.sh --lane local \
 
 Build the two packages in separate commands: one `cargo build -p ravel-cli
 -p ravel-server --features ravel-server/sql` does not build ravel-server
-with its SQL surface. The local lane drops the page cache only when run as
+with its SQL surface. On macOS, where there is no `/proc`, `inv.py call`
+reads the server's CPU seconds and its lifetime peak physical footprint (in
+place of VmHWM) from libproc's `proc_pid_rusage`, and `host.json` takes
+memory from `hw.memsize`; give run.sh a `python3` with pyarrow on `PATH`
+(or `--pylib`). The local lane drops the page cache only when run as
 root; otherwise each restart stamp says `"cache_drop": "unavailable (not
 root)"`. It reports timing figures but never judges them.
 
@@ -231,10 +240,54 @@ its keyIndex GETs at 2 x that count.
   1` so each hour is its own part, then leaves rebuilt. The stamped part
   count is banded (rows 9 and 10).
 
+  The corpus is generated with `gen_corpus.py --even-hours`: exactly
+  `many_parts.traces_per_hour` traces in every event hour, written in hour
+  order, so the load's fixed `--batch-rows` (rows / N) makes batch k exactly
+  event hour k, written into ingest hour k + 1. Before each batch the
+  loader refuses one whose latest event time (a span's `end_ts`) is not
+  before its ingest hour's end plus `max_ingest_lag`, 2 hours
+  (`HourStrideBatchError::EventTimePastLag`,
+  `services/ravel-cli/src/load/hour_stride.rs:311`; the lag is
+  `DEFAULT_MAX_INGEST_LAG_NS`, `crates/ravel-catalog/src/config.rs:8`).
+  Without `--even-hours` every trace takes a random hour, the hours hold
+  unequal row counts, and the batches drift off their hours by about the
+  square root of the trace count: box A's many_parts_744 (7,440 traces)
+  exited 1 six seconds into its load, and a local reproduction at 744
+  traces refused batch 23 with `--ingest-hour-stride refused batch 23
+  before submitting it: its latest event time 1791182427140145961 ns is not
+  before 1791180000000000000 ns, the end of its ingest hour 497547 plus
+  max_ingest_lag (7200000000000 ns)`: its latest row is from event hour
+  497550, four hours after hour 497546, the one batch 23 should hold.
+  At 24 hours the drift stays inside the lag, which is why many_parts_24
+  passed. The cause was the harness's corpus, not the loader or the write
+  path. Before the load `run.sh` runs the loader's check over the whole
+  file (`box/lib/inv.py stride-check`, the same bound per batch); a corpus
+  it would refuse records the state `not-run` with that refusal, instead
+  of loading a partial tenant. With the fix, the local lane with `states =
+  ["unfolded", "many_parts_744"]` at 1,000 traces and `traces_per_hour = 1`
+  loaded 744 objects into ingest hours 497525 to 498268 and measured row
+  9 (744 covering parts, 747 resolve GETs, exact rows).
+
 `mixed` is followed by `fold_advance` and `compaction_in_flight` by
 `compaction_done`; each derived state is live exactly when its parent is. A
 state the run lists and does not reach is `not-run` with the reason, and a
 state absent from both the results and the not-run list is a missing figure.
+
+A load, fold, leaf rebuild, compaction or erasure command that exits
+non-zero inside a state fails that state, not the run: run.sh copies the
+command's log to `out/logs/`, appends a `stamps/failed_states.jsonl` line
+(the state, the step, the command's exit code, the log's `out/logs/` path),
+prints `STATE-FAILED`, stops the server and goes on with the next state,
+then evaluates and uploads as usual. evaluate.py reports every figure of
+that state, and of the state derived from it, `not-run` with the reason
+`state failed at <step> (exit N)`, lists the state as `failed` with its
+step, exit code and log, and the verdict reads `incomplete` naming it. A
+failed state's store is left as the command left it (a half-loaded tenant,
+one signal folded), and later states measure what is there, as their own
+census and catalog stamps record. A failure in bootstrap, store, host,
+corpus, declare or load-base, where nothing can be measured without the
+step, still ends the run with `out/FAILED`, which names the failed
+command's log under `out/logs/` when it has one.
 
 In each state, every statement planned for it runs `run.cold_runs` times
 cold, each call after a server stop, a page-cache drop and a server start
@@ -320,6 +373,7 @@ reports `missing stamps/<name>` for any it needs and does not find;
 | `STATE.server.json` | the server binary's sha256 and its flags |
 | `needle_blocks.json` | the logs needles' block counts as `rlog inspect` reads them, beside the generator's |
 | `compaction.jsonl`, `erasure.jsonl`, `not_run.jsonl` | the compaction child's reports, the erase submit and status, and each state recorded not-run |
+| `failed_states.jsonl` | each state a failed command stopped: the step, the command's exit code and the `out/logs/` path of its log |
 
 Covering parts, entry counts and leaf presence come from the catalog stamps,
 never from a fold report. A state whose catalog stamp is absent is the
@@ -488,8 +542,17 @@ unchanged.
   in an X list and 2 in a quoted one. Against `MAX_STATEMENT_COMPLEXITY =
   1_000` (`:257`, checked at `:380-381`) and the 8 units of the rest of the statement,
   an X list (3n + 8) holds at most 330 keys and a quoted list (2n + 8) at
-  most 496. The guard stops counting at the cap plus one, so it reports 1001
-  for any statement over the cap.
+  most 496. The guard stops counting at the cap plus one
+  (`complexity_guard.rs:469-472`, `:640-643`), so it reports 1001 for any
+  statement over the cap, whatever its length: the 1001 in a refusal is
+  where the scan stopped, not the statement's count. Box A's s3 run
+  (`investigations-20261104T001915Z-46224-17727`, main 3465163df) refused
+  its 1,000-key lists with exactly that text, which says nothing of one
+  unit per key or of a cap one key below 1,000. Measured against this tree's release
+  `ravel-server --features sql` on the local lane: an X list of 330 keys is
+  admitted and one of 331 refused, a quoted list of 496 admitted and one of
+  497 refused, and a 999-key list of either kind refused with the same
+  `statement complexity 1001`.
 - Row 13's negative controls: decision 9's mutants are not built here, so
   the figure is `not-run` ("mutant controls not implemented") and the
   verdict is at best `incomplete`.
@@ -623,8 +686,13 @@ and a mid-state deadline, the unsealed tail, the pending-erasure victim, a
 state absent from the results, row 3's per-object denominator, row 15's
 budget from `truth.json`, exact cost and maintenance dollars), the wrong
 evaluators each of those cases must reject (each printed with the
-evaluate.py line it flips), and the dry runs of `run.sh` (local, s3, s3
-with hits, and past the deadline), `launch.sh` (with an `aws` stub that
+evaluate.py line it flips), a failed state (its figures `not-run` with
+`state failed at <step> (exit N)`, never pass or missing), the even-hours
+corpus and the strided-load check over it at 744 hours, and the dry runs of
+`run.sh` (local, s3, s3 with hits, past the deadline, a failed state that
+continues and a failed base load that ends the run), `run.sh` sourced with
+a stub `ravel-cli` that fails (its log copied to `out/logs/`, the next
+state still run), `launch.sh` (with an `aws` stub that
 fails if called) and `fetch.sh` (including an `aws` stub that exits 255,
 which must exit 69).
 

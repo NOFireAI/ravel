@@ -88,7 +88,8 @@ def merged_truth(out, c=SMALL_CORPUS):
     subs = ["--sub", f"tail={os.path.join(out, 'tail', 'truth.json')}"]
     for n, mp in sorted(c["many_parts"].items()):
         d = os.path.join(out, f"mp{n}")
-        gen(d, mp["traces"], mp["hours"], mp["seed"], "--start-hour", str(mp["start_hour"]))
+        gen(d, mp["traces"], mp["hours"], mp["seed"], "--start-hour", str(mp["start_hour"]),
+            *(["--even-hours"] if mp.get("even_hours") else []))
         subs += ["--sub", f"many_parts_{n}={os.path.join(d, 'truth.json')}"]
     path = os.path.join(out, "truth.json")
     subprocess.run([PY, os.path.join(BOX, "lib", "inv.py"), "merge-truth", "--base",
@@ -710,6 +711,20 @@ class Statements(unittest.TestCase):
             self.assertIn("496", text, doc)
             self.assertIn("3n + 8", text, doc)
             self.assertIn("2n + 8", text, doc)
+            self.assertNotRegex(text, r"\b999 keys\b", doc)
+        # Box A's refusal of a 1,000-key list read "statement complexity 1001
+        # exceeds the maximum of 1000 tokens": check stops scanning at the cap
+        # plus one, so 1001 is the stop point, not one unit per key. Kills a
+        # README that reads the cap off the refusal text (999 keys).
+        self.assertIn("The returned count is then `stop_above + 1`, never the full", guard[469])
+        self.assertEqual(guard[640].strip(), "if count > stop_above {")
+        with open(README) as f:
+            text = " ".join(f.read().split())
+        for claim in ("an X list of 330 keys is admitted and one of 331 refused",
+                      "a quoted list of 496 admitted and one of 497 refused",
+                      "a 999-key list of either kind refused with the same `statement complexity 1001`",
+                      "investigations-20261104T001915Z-46224-17727"):
+            self.assertIn(claim, text)
 
     def adr_band_rows(self):
         with open(ADR) as f:
@@ -1955,6 +1970,88 @@ class Evaluate(Workdir):
     def test_skipped_state(self):
         self.assertEqual(self.check_skipped_state(), [])
 
+    MP24_FAILED = "state failed at load many_parts_24/spans (exit 1)"
+    MIXED_FAILED = "state failed at fold fold_advance/logs (exit 101)"
+
+    def fail_states(self):
+        """The fixture as run.sh leaves it when many_parts_24's load exits 1
+        (no calls, census, transition, folds or stamps of it) and mixed's
+        fold_advance logs fold exits 101 after its statements ran."""
+        self.calls = [c for c in self.calls if c["state"] != "many_parts_24"]
+        self.save_calls()
+        stamps = os.path.join(self.run_dir, "stamps")
+        for name in os.listdir(stamps):
+            if name.startswith(("many_parts_24.", "fold_advance.")):
+                os.remove(os.path.join(stamps, name))
+        for name in ("census.jsonl", "transitions.jsonl"):
+            lines = read_jsonl(self.stamp_path(name))
+            write_jsonl(self.stamp_path(name), [x for x in lines if x["state"] not in ("many_parts_24", "fold_advance")])
+        folds = [x for x in read_jsonl(self.stamp_path("folds.jsonl"))
+                 if not x["transition"].startswith("many_parts_24")]
+        for x in folds:
+            if (x["transition"], x["signal"]) == ("fold_advance", "logs"):
+                x["exit"] = 101
+        write_jsonl(self.stamp_path("folds.jsonl"), folds)
+        loads = read_jsonl(self.stamp_path("loads.jsonl"))
+        for x in loads:
+            if x["hour"] == "many_parts_24":
+                x["exit"] = 1
+        write_jsonl(self.stamp_path("loads.jsonl"), loads)
+        write_jsonl(self.stamp_path("failed_states.jsonl"), [
+            {"state": "many_parts_24", "step": "load many_parts_24/spans", "exit": 1,
+             "log": "out/logs/load-many_parts_24-spans.out", "at": "2026-11-04T00:00:00Z"},
+            {"state": "mixed", "step": "fold fold_advance/logs", "exit": 101,
+             "log": "out/logs/fold-fold_advance-logs.out", "at": "2026-11-04T00:00:00Z"}])
+
+    def check_failed_state(self, evaluate_py=EVALUATE):
+        """Item 1: a state run.sh recorded failed is not-run with "state
+        failed at <step> (exit N)" in every figure of it and of its derived
+        state, never pass and never missing, and the verdict is incomplete
+        naming it."""
+        _, base, _ = self.go(BANDS, evaluate_py)
+        self.fail_states()
+        out = []
+        code, res, _ = self.go(evaluate_py=evaluate_py)
+        if (code, res["verdict"], res["problems"]) != (1, "incomplete", []):
+            out.append(f"exit {code} {res['verdict']} {res['problems']}")
+        for s, why in (("many_parts_24", self.MP24_FAILED), ("mixed", self.MIXED_FAILED)):
+            if f"state {s} not run: {why}" not in res["incomplete"]:
+                out.append(f"incomplete {res['incomplete']}")
+        code, res, text = self.go(BANDS, evaluate_py)
+        new = sorted(set(res["problems"]) - set(base["problems"]))
+        if new:
+            out.append(f"new problems {new}")
+        for f in res["figures"]:
+            if f["id"].startswith("row_09.") and f["id"].endswith("_24"):
+                want = f"many_parts_24: {self.MP24_FAILED}"
+            elif f["id"].startswith("row_07."):
+                want = self.MIXED_FAILED
+            else:
+                continue
+            if f["status"] != "not-run" or f["verdict"] != "not-run" or want not in (f["reason"] or ""):
+                out.append(f"{f['id']} {f['status']} {f['verdict']} {f['reason']}")
+        states = {x["state"]: x for x in res["states"]}
+        mp = states["many_parts_24"]
+        if (mp["status"], mp.get("step"), mp.get("exit"), mp.get("log")) != (
+                "failed", "load many_parts_24/spans", 1, "out/logs/load-many_parts_24-spans.out"):
+            out.append(f"states many_parts_24 {mp}")
+        if (states["fold_advance"]["status"], states["fold_advance"].get("reason")) != ("not-run", self.MIXED_FAILED):
+            out.append(f"states fold_advance {states['fold_advance']}")
+        if f"  many_parts_24            failed  ({self.MP24_FAILED})" not in text:
+            out.append("summary carries no failed line for many_parts_24")
+        return out
+
+    def test_failed_state(self):
+        self.assertEqual(self.check_failed_state(), [])
+
+    def test_failed_state_line_without_exit_is_missing(self):
+        write_jsonl(self.stamp_path("failed_states.jsonl"), [{"state": "mixed", "step": "fold fold_advance/logs"}])
+        code, res, _ = self.go()
+        self.assertEqual((code, res["verdict"]), (1, "fail"))
+        self.assertEqual([p for p in res["problems"] if "failed_states" in p], [
+            'missing stamps/failed_states.jsonl line without a state, step or integer exit: '
+            '{"state": "mixed", "step": "fold fold_advance/logs"}'])
+
     def check_deadline_mid_state(self, evaluate_py=EVALUATE):
         """A deadline that stopped a state part way: its unsent calls make the run incomplete."""
         for i, c in enumerate(self.calls):
@@ -2393,6 +2490,11 @@ FLIPS = {
         "        if False:\n            out.append(",
         "check_deadline_mid_state",
     ),
+    "a failed state read as live": (
+        "    for state, line in failed.items():\n        not_run[state] = failed_reason(line)\n",
+        "    for state, line in failed.items():\n        pass\n",
+        "check_failed_state",
+    ),
     "truth figures not read from truth.json": (
         "    return \"value\", v, \"\"\n\n\ndef run_rows",
         "    return \"value\", 1, \"\"\n\n\ndef run_rows",
@@ -2579,6 +2681,11 @@ class Box(Workdir):
             self.assertIn(f"--tenant {tenant}", pj)
             self.assertIn(f"--state {state} ", pj)
             self.assertIn(f"--tenant {tenant} --sub {state}", pj)
+            # Item 3: the even-hours corpus, and the loader's per-batch check
+            # over the whole file before the load.
+            self.assertIn(f"--even-hours --spans-per-trace 10 --logs-per-trace 5 --start-hour", "\n".join(
+                x for x in b["corpus"] if f"corpus-{tenant}" in x))
+            self.assertLess(pj.index(f"stride-check --parquet "), pj.index(f"load-{state}-spans"))
         self.assertIn("evaluate.py --run", "\n".join(b["evaluate"]))
         return b
 
@@ -3078,6 +3185,180 @@ class Box(Workdir):
                             "--out", self.path("out2")], capture_output=True, text=True)
         self.assertNotEqual(m.returncode, 0, m.stdout + m.stderr)
         self.assertIn("unbound variable", m.stderr)
+
+    def flipped_box(self, old, new, script="run.sh"):
+        """A copy of this directory whose box/SCRIPT has OLD (present once)
+        replaced by NEW; returns (path of the copy's script, the 1-based line
+        of OLD in the real one)."""
+        with open(os.path.join(BOX, script)) as f:
+            src = f.read()
+        self.assertEqual(src.count(old), 1, old)
+        inv = self.path("inv-flipped")
+        os.mkdir(inv)
+        for name in os.listdir(HERE):
+            if name != "box":
+                os.symlink(os.path.join(HERE, name), os.path.join(inv, name))
+        shutil.copytree(BOX, os.path.join(inv, "box"))
+        dst = os.path.join(inv, "box", script)
+        with open(dst, "w") as f:
+            f.write(src.replace(old, new))
+        return dst, src[: src.index(old)].count("\n") + 1
+
+    def failed_state_dry_run(self, script=None):
+        p = subprocess.run([BASH, script or os.path.join(BOX, "run.sh"), "--dry-run", "--lane", "s3", "--run-toml",
+                            os.path.join(BOX, "run.example.toml"), "--out", self.path("out")],
+                           capture_output=True, text=True, env=dict(os.environ, INV_DRY_RUN_FAIL="--tenant mp744"))
+        return p.returncode, p.stdout + p.stderr
+
+    # The line in run_state that records a failed state and returns, so the
+    # run goes on; flipped to fail_logged it ends the run at the state.
+    STATE_FAILED_LINE = '  [ -n "$FAIL_STEP" ] || fail "state $state returned $code with no failed command named"\n  state_failed\n'
+
+    def test_failed_state_continues_dry_run(self):
+        # Item 1: many_parts_744's load exits 3; the state is recorded failed
+        # with its log's out/ path, and the run goes on to many_parts_2160,
+        # evaluate and the upload.
+        code, text = self.failed_state_dry_run()
+        self.assertEqual(code, 0, text)
+        steps = self.steps(text)
+        self.assertEqual(steps[-4:], ["state:many_parts_744", "state:many_parts_2160", "evaluate", "finish"])
+        b = self.blocks(text)
+        mp = b["state:many_parts_744"]
+        self.assertIn("STATE-FAILED many_parts_744: load many_parts_744/spans exit 3 "
+                      "(log out/logs/load-many_parts_744-spans.out); the run goes on", mp)
+        self.assertIn("STAMP stamps/failed_states.jsonl", mp)
+        self.assertLess(mp.index("STAMP stamps/loads.jsonl"), mp.index("STAMP stamps/failed_states.jsonl"))
+        self.assertTrue(any(x.startswith("DRY-RUN: copy ") and x.endswith(
+            "/work/load-many_parts_744-spans.out to out/logs/load-many_parts_744-spans.out") for x in mp), mp)
+        self.assertNotIn("catalog fold", "\n".join(mp))
+        self.assertIn("catalog fold --tenant mp2160", "\n".join(b["state:many_parts_2160"]))
+        self.assertIn("upload out/ (no DONE, FAILED or work/)", "\n".join(b["finish"]))
+        flipped, line = self.flipped_box(self.STATE_FAILED_LINE, self.STATE_FAILED_LINE.replace(
+            "  state_failed\n", "  fail_logged\n"))
+        code, text = self.failed_state_dry_run(flipped)
+        self.assertEqual(code, 1, text)
+        self.assertNotIn("evaluate", self.steps(text))
+        print(f"flip 'a failed state ends the run' at box/run.sh:{line + 1} fails "
+              f"test_failed_state_continues_dry_run: exit {code}, steps end {self.steps(text)[-1:]}",
+              file=sys.stderr)
+
+    def test_failed_base_load_ends_the_run_dry_run(self):
+        # Item 1: load-base is not a state; nothing can be measured without
+        # it, so its failure still ends the run, naming the kept log.
+        p = subprocess.run([BASH, os.path.join(BOX, "run.sh"), "--dry-run", "--lane", "s3", "--run-toml",
+                            os.path.join(BOX, "run.example.toml"), "--out", self.path("out")],
+                           capture_output=True, text=True, env=dict(os.environ, INV_DRY_RUN_FAIL="load-base-logs"))
+        text = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 1, text)
+        self.assertIn("run.sh: FAILED step=load-base: load base/logs exit 3 (log out/logs/load-base-logs.out)", text)
+        self.assertNotIn("STEP state:", text)
+
+    def sourced_states(self, script=None):
+        """run.sh sourced, outside a dry run, with a ravel-cli stub that
+        prints its arguments and exits 7: the folded_no_leaves and
+        folded_leaves states' folds fail for real (inv.py measure runs the
+        stub), and run_states runs both. Returns (exit, output, out dir)."""
+        stub = self.path("stub-cli")
+        with open(stub, "w") as f:
+            f.write('#!/bin/sh\necho "stub ravel-cli refused: $*"\nexit 7\n')
+        os.chmod(stub, 0o755)
+        out = self.path("out")
+        driver = self.path("driver.sh")
+        with open(driver, "w") as f:
+            f.write(f"""set -u
+source {script or os.path.join(BOX, "run.sh")} --dry-run --lane local --run-toml {os.path.join(BOX, "run.local-smoke.toml")} --out {out}
+DRY_RUN=0
+load_config
+CLI=({stub})
+STATES="folded_no_leaves folded_leaves"
+run_states
+echo RUN-STATES-RETURNED
+FINISHED=1
+""")
+        p = subprocess.run([BASH, driver], capture_output=True, text=True, timeout=120)
+        return p.returncode, p.stdout + p.stderr, out
+
+    def test_failed_state_keeps_its_log_and_the_run_goes_on(self):
+        # Items 1 and 2: each failed fold's log is copied to out/logs/ and
+        # named by its failed_states line, and run_states returns after the
+        # second state instead of the run ending at the first.
+        code, text, out = self.sourced_states()
+        self.assertEqual(code, 0, text)
+        self.assertIn("RUN-STATES-RETURNED", text)
+        self.assertFalse(os.path.exists(os.path.join(out, "FAILED")))
+        lines = read_jsonl(os.path.join(out, "stamps", "failed_states.jsonl"))
+        self.assertEqual([(x["state"], x["step"], x["exit"], x["log"]) for x in lines], [
+            ("folded_no_leaves", "fold folded_no_leaves/spans", 7, "out/logs/fold-folded_no_leaves-spans.out"),
+            ("folded_leaves", "fold folded_leaves/spans", 7, "out/logs/fold-folded_leaves-spans.out")])
+        with open(os.path.join(out, "logs", "fold-folded_no_leaves-spans.out")) as f:
+            self.assertEqual(f.read(), "stub ravel-cli refused: catalog fold --tenant inv --shards 2 --signal spans "
+                                       "--writers-stopped --json\n")
+        folds = read_jsonl(os.path.join(out, "stamps", "folds.jsonl"))
+        self.assertEqual([(x["transition"], x["exit"]) for x in folds], [("folded_no_leaves", 7), ("folded_leaves", 7)])
+        old = '  elif ! { mkdir -p "$OUT/logs" && cp "$1" "$OUT/logs/"; } 2>/dev/null; then\n'
+        flipped, line = self.flipped_box(old, "  elif false; then\n")
+        shutil.rmtree(out)
+        code, text, out = self.sourced_states(flipped)
+        self.assertEqual(code, 0, text)
+        self.assertFalse(os.path.exists(os.path.join(out, "logs")))
+        print(f"flip 'the failed command's log not copied' at box/run.sh:{line} fails "
+              f"test_failed_state_keeps_its_log_and_the_run_goes_on: out/logs/ absent", file=sys.stderr)
+
+    @staticmethod
+    def stride_check_744(gen_corpus, even, inv_py=os.path.join(BOX, "lib", "inv.py"), out=None):
+        """The strided-load check over a many_parts_744 spans corpus at
+        traces_per_hour 1, as run.sh deals it (batch rows = rows / 744,
+        ingest hour start one past the first event hour)."""
+        start = 497516
+        subprocess.run([PY, gen_corpus, "--traces", "744", "--hours", "744", "--seed", "751", "--spans-per-trace",
+                        "10", "--logs-per-trace", "5", "--format", "jsonl", "--start-hour", str(start), "--out", out,
+                        *(["--even-hours"] if even else [])], check=True, capture_output=True)
+        with open(os.path.join(out, "spans.jsonl")) as f:
+            rows = [json.loads(line) for line in f]
+        inv = load_module(inv_py, "inv_stride")
+        return inv.stride_refusal([r["end_ts"] for r in rows], len(rows) // 744, start + 1, 1,
+                                  inv.MAX_INGEST_LAG_NS, 744), rows
+
+    def test_many_parts_744_strided_load_check(self):
+        # Item 3: box A's many_parts_744 load exited 1 because a random hour
+        # per trace leaves the hours unequal, so a fixed --batch-rows drifts
+        # off its hours and the loader refuses the first batch whose events
+        # pass its ingest hour's end plus the 2 h lag (EventTimePastLag).
+        # The even-hours corpus holds one trace per hour and passes; the
+        # random one is refused, as the loader refused it on the local lane.
+        with open(os.path.join(HERE, "..", "..", "services", "ravel-cli", "src", "load", "hour_stride.rs")) as f:
+            stride = f.read().splitlines()
+        self.assertEqual(stride[310].strip(), "if max_event_ns >= bound_ns {")
+        with open(os.path.join(HERE, "..", "..", "crates", "ravel-catalog", "src", "config.rs")) as f:
+            self.assertEqual(f.read().splitlines()[7],
+                             "pub const DEFAULT_MAX_INGEST_LAG_NS: i64 = 2 * 60 * 60 * 1_000_000_000;")
+        why, rows = self.stride_check_744(GEN, True, out=self.path("even"))
+        self.assertIsNone(why)
+        hours = {}
+        for r in rows:
+            hours.setdefault(r["start_ts"] // HOUR_NS, set()).add(r["trace_id"])
+        self.assertEqual(sorted(len(v) for v in hours.values()), [1] * 744)
+        why, _ = self.stride_check_744(GEN, False, out=self.path("random"))
+        self.assertRegex(why or "", r"^--ingest-hour-stride would refuse batch \d+ before submitting it: its latest "
+                                    r"event time \d+ ns is not before \d+ ns, the end of its ingest hour \d+ plus "
+                                    r"max_ingest_lag \(7200000000000 ns\) \(EventTimePastLag, "
+                                    r"services/ravel-cli/src/load/hour_stride.rs:311\)$")
+        inv = load_module(os.path.join(BOX, "lib", "inv.py"), "inv_stride_bound")
+        bound = 11 * HOUR_NS + inv.MAX_INGEST_LAG_NS
+        self.assertIsNone(inv.stride_refusal([bound - 1], 1, 10, 1, inv.MAX_INGEST_LAG_NS, 1))
+        self.assertIn("batch 0 ", inv.stride_refusal([bound], 1, 10, 1, inv.MAX_INGEST_LAG_NS, 1))
+        self.assertIn("deals 2 batches", inv.stride_refusal([0, 0, 0], 2, 10, 1, inv.MAX_INGEST_LAG_NS, 1))
+        with open(GEN) as f:
+            src = f.read()
+        old = "        hour = i % hours if even else rng.randrange(hours)\n"
+        self.assertEqual(src.count(old), 1)
+        flipped = self.path("gen_corpus_flipped.py")
+        with open(flipped, "w") as f:
+            f.write(src.replace(old, "        hour = rng.randrange(hours)\n"))
+        why, _ = self.stride_check_744(flipped, True, out=self.path("flipped"))
+        self.assertIsNotNone(why)
+        print(f"flip 'a random hour per trace' at gen_corpus.py:{src[: src.index(old)].count(chr(10)) + 1} fails "
+              f"test_many_parts_744_strided_load_check: {why}", file=sys.stderr)
 
 
 def refresh_local_smoke():
