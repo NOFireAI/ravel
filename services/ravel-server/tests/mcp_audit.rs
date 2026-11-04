@@ -2,14 +2,13 @@
 //! ADR-1374 decisions 3 and 7), with the audit pipeline in `required` mode,
 //! so a call's record is durable before the call answers.
 //!
-//! A call cannot be keyed by its query id: the server reports none, either in
-//! the envelope (`ids.query_id` is empty on every tool) or on the audit
-//! record (`ravel_maintain::query_audit` writes no id attribute). Each call is
-//! keyed instead by the records it added to the audit shard, compared as a
-//! multiset against the shard before the call, and by those records'
-//! `query.language` and `query.text`. The languages are the engine's own
-//! (`sql`, `promql`, ...), not ADR-1374 decision 3 item 6's `mcp:<tool>`, so
-//! an MCP call's record cannot be told from the same query over HTTP.
+//! Each audited tool call carries one query id (issue #3734): the adapter
+//! mints it, reports it as the envelope's `ids.query_id`, and every audit
+//! record the call writes carries it as `query.id`, with `query.language =
+//! mcp:<tool>` (ADR-1374 decision 3 item 6) and the engine's own language as
+//! `query.engine_language`. A call's records are found as the records it
+//! added to the audit shard, compared as a multiset against the shard before
+//! the call, and then matched to the envelope by that id.
 //!
 //! Already pinned elsewhere and not repeated here: `ravel_get_trace`'s record
 //! carrying the caller's configured subject
@@ -53,19 +52,21 @@ fn new_records(before: &[LogRecord], after: Vec<LogRecord>) -> Vec<LogRecord> {
         .collect()
 }
 
-/// The `query.language` and `query.text` each tool's fixture call is audited
-/// under, or `None` for a tool that writes no audit record.
+/// The engine language (`query.engine_language`) and `query.text` each tool's
+/// fixture call is audited under, or `None` for a tool that writes no audit
+/// record.
 fn expected_record(tool: &str) -> Option<(&'static str, String)> {
     let text = match tool {
         // Answers from compile-time facts and the resolved caller, reads no
-        // object storage, and so submits no audit event.
+        // object storage, and so submits no audit event (ADR-1374, the
+        // tool-call audit amendment).
         "ravel_capabilities" => return None,
         "ravel_describe_data" => (
             "describe_data",
             "describe_data signal=metrics after_name=None limit=100".to_string(),
         ),
-        // An empty text is the defect #3734 tracks, pinned until it lands.
-        "ravel_find_labels" => ("label_values", String::new()),
+        // The fixture call names no selector, so its matcher set is empty.
+        "ravel_find_labels" => ("label_values", "{}".to_string()),
         "ravel_explain_query" | "ravel_query_sql" => {
             ("sql", "SELECT value FROM samples".to_string())
         }
@@ -83,10 +84,32 @@ fn expected_record(tool: &str) -> Option<(&'static str, String)> {
     Some(text)
 }
 
+/// The envelope warning a tool answer carries while it reports no query id.
+const QUERY_ID_UNREPORTED: &str = "ids.query_id is not reported by this operation";
+
+/// The envelope's `ids.query_id`, asserted to be a non-empty string.
+fn envelope_query_id(name: &str, envelope: &serde_json::Value) -> String {
+    let id = envelope["ids"]["query_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{name}: no ids.query_id string in {envelope}"));
+    assert!(!id.is_empty(), "{name}: empty ids.query_id");
+    id.to_string()
+}
+
+/// Whether the envelope still carries the unreported-query-id warning.
+fn warns_query_id_unreported(envelope: &serde_json::Value) -> bool {
+    envelope["warnings"]
+        .as_array()
+        .is_some_and(|warnings| warnings.iter().any(|w| w == QUERY_ID_UNREPORTED))
+}
+
 /// Each of the nine read tools, called once over the fixture, adds exactly
 /// one `kind=query` record to the tenant's audit shard (none for
 /// `ravel_capabilities`, which reads nothing), with `query.status=ok`, the
-/// caller's tenant and the call's own language and statement.
+/// caller's tenant, `query.language = mcp:<tool>`, the engine's language
+/// under `query.engine_language`, the call's statement, and `query.id` equal
+/// to the envelope's non-empty `ids.query_id`. `ravel_find_labels`' text is
+/// its matcher set.
 ///
 /// FLIP: replacing `self.audit_sink.submit(event).await...?` in
 /// `QueryControls::audit` (`crates/ravel-query/src/http/service.rs`) with a
@@ -104,19 +127,32 @@ async fn every_tool_call_writes_exactly_one_audit_record() {
         let before = query_audit_records(store.as_ref()).await;
         let (is_error, envelope) = call(&client, name, arguments).await;
         assert_eq!(is_error, Some(false), "{name}: {envelope}");
-        assert_eq!(envelope["ids"]["query_id"], json!(""), "{name}");
         let new = new_records(&before, query_audit_records(store.as_ref()).await);
 
-        let Some((language, text)) = expected_record(name) else {
+        let Some((engine_language, text)) = expected_record(name) else {
             assert!(new.is_empty(), "{name} wrote {new:?}");
+            assert_eq!(envelope["ids"]["query_id"], json!(""), "{name}");
+            assert!(warns_query_id_unreported(&envelope), "{name}: {envelope}");
             continue;
         };
         audited += 1;
+        let query_id = envelope_query_id(name, &envelope);
+        assert!(!warns_query_id_unreported(&envelope), "{name}: {envelope}");
         assert_eq!(new.len(), 1, "{name} wrote {new:?}");
         let record = &new[0];
         assert_eq!(
             audit_attr(record, "query.language"),
-            Some(language),
+            Some(format!("mcp:{name}").as_str()),
+            "{name}"
+        );
+        assert_eq!(
+            audit_attr(record, "query.engine_language"),
+            Some(engine_language),
+            "{name}"
+        );
+        assert_eq!(
+            audit_attr(record, "query.id"),
+            Some(query_id.as_str()),
             "{name}"
         );
         assert_eq!(
@@ -204,7 +240,14 @@ async fn a_call_ended_by_its_deadline_audits_and_records_its_spend() {
 
     let new = new_records(&before, query_audit_records(store.as_ref()).await);
     assert_eq!(new.len(), 1, "{new:?}");
-    assert_eq!(audit_attr(&new[0], "query.language"), Some("promql"));
+    assert_eq!(
+        audit_attr(&new[0], "query.language"),
+        Some("mcp:ravel_query_promql")
+    );
+    assert_eq!(audit_attr(&new[0], "query.engine_language"), Some("promql"));
+    // A failed call reports its id too, so the record can be found from it.
+    let query_id = envelope_query_id("ravel_query_promql", &late);
+    assert_eq!(audit_attr(&new[0], "query.id"), Some(query_id.as_str()));
     assert_eq!(audit_attr(&new[0], "query.text"), Some("m"));
     assert_eq!(audit_attr(&new[0], "query.status"), Some("error"));
 
@@ -233,5 +276,90 @@ async fn a_call_ended_by_its_deadline_audits_and_records_its_spend() {
     );
 
     client.cancel().await.expect("client stops");
+    running.shutdown().await.expect("server stops");
+}
+
+/// `ravel_search_logs` with a predicate makes two engine calls, the
+/// declared-column lookup and then the statement, and both records carry the
+/// call's one id and its `mcp:ravel_search_logs` language.
+///
+/// FLIP: minting a fresh id per engine call instead of one per tool call
+/// gives the two records different ids.
+#[tokio::test]
+async fn a_search_with_predicates_audits_both_engine_calls_under_one_id() {
+    let (store, metrics) = instrumented_memory();
+    seed_fixture(store.as_ref()).await;
+    let config = ravel_catalog::TenantConfig {
+        typed_attr_columns: Some(vec![ravel_catalog::DeclaredTypedColumn {
+            key: "attr_00".to_string(),
+            ty: ravel_catalog::DeclaredColumnType::Str,
+        }]),
+        ..ravel_catalog::TenantConfig::new(ravel_catalog::TenantLifecycleState::Active)
+    };
+    // The declared-column lookup resolves at the server's clock, so the
+    // config is written at a time already in its past.
+    ravel_catalog::set_tenant_config(store.as_ref(), &expected_tenant(), &config, 0)
+        .await
+        .expect("tenant config written");
+    let running = start_with(server_config(), Arc::clone(&store), metrics).await;
+    let client = connect(&running).await;
+
+    let before = query_audit_records(store.as_ref()).await;
+    let (is_error, envelope) = call(
+        &client,
+        "ravel_search_logs",
+        json!({
+            "time_range": window(),
+            "predicates": [{"key": "attr_00", "op": "eq", "value": "web"}],
+        }),
+    )
+    .await;
+    assert_eq!(is_error, Some(false), "{envelope}");
+    let query_id = envelope_query_id("ravel_search_logs", &envelope);
+    let new = new_records(&before, query_audit_records(store.as_ref()).await);
+    assert_eq!(new.len(), 2, "{new:?}");
+    let mut engines: Vec<&str> = new
+        .iter()
+        .map(|record| {
+            assert_eq!(
+                audit_attr(record, "query.language"),
+                Some("mcp:ravel_search_logs")
+            );
+            assert_eq!(audit_attr(record, "query.id"), Some(query_id.as_str()));
+            audit_attr(record, "query.engine_language").expect("engine language")
+        })
+        .collect();
+    engines.sort_unstable();
+    assert_eq!(engines, ["describe_data", "sql"]);
+
+    client.cancel().await.expect("client stops");
+    running.shutdown().await.expect("server stops");
+}
+
+/// The same PromQL query over the HTTP API, outside MCP, keeps its engine
+/// language and carries no call id or engine-language attribute: the call tag
+/// is an MCP-only override.
+#[tokio::test]
+async fn a_query_outside_mcp_keeps_its_engine_language() {
+    let (store, metrics) = instrumented_memory();
+    seed_fixture(store.as_ref()).await;
+    let running = start_with(server_config(), Arc::clone(&store), metrics).await;
+
+    let before = query_audit_records(store.as_ref()).await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{}/api/v1/query", running.http_addr))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .query(&[("query", "m"), ("time", "100")])
+        .send()
+        .await
+        .expect("query request completes");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let new = new_records(&before, query_audit_records(store.as_ref()).await);
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(audit_attr(&new[0], "query.language"), Some("promql"));
+    assert_eq!(audit_attr(&new[0], "query.text"), Some("m"));
+    assert_eq!(audit_attr(&new[0], "query.id"), None);
+    assert_eq!(audit_attr(&new[0], "query.engine_language"), None);
+
     running.shutdown().await.expect("server stops");
 }
