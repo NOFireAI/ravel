@@ -371,6 +371,23 @@ Field by field:
   The section is crc-verified before anything is printed. No query reads
   the index yet.
 
+- Beyond the crc, each entry's block ordinal is checked against the object's
+  block count (RLOG's footer `block_count`; RSPAN uses the decoded SKIP_IDX's
+  block count, the same bound the probe path binds against). An entry naming
+  a block at or past that count is a finding, one line per finding, naming
+  the field, the bucket, and the bad ordinal:
+
+  ```
+  key_idx finding: field=svc bucket=5 names block 2, object has 2 blocks
+  ```
+
+  Every bad entry is reported, not just the first. A section with one or more
+  findings fails the inspect the same way a corrupt crc does (below): the
+  finding lines print, then the command exits non-zero. `inspect kidx` (the
+  leaf inspector, below) checks only the `.kidx` object's own grammar: a leaf
+  carries no block count to check an ordinal against, so this check runs only
+  on `rspan inspect` and `rlog inspect`.
+
 A corrupt object never inspects as a success. The footer open protocol and
 every section decode return a typed `Corrupted` error with a non-zero exit.
 The lines printed before the failing section stay on stdout.
@@ -380,6 +397,9 @@ The lines printed before the failing section stay on stdout.
 - BLOOM and KEY_IDX are read with their whole-section crc verified, so a
   damaged BLOOM or KEY_IDX fails `rlog inspect`. A query scan over the same
   object at worst prunes fewer blocks and still answers exactly.
+- A KEY_IDX block-ordinal finding (above) is the same non-zero exit, even
+  though the section's own crc is clean: the index resolved to a value the
+  object cannot back.
 
 ## `rlog footprint`
 

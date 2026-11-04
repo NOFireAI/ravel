@@ -414,9 +414,11 @@ fn rlog_inspect_prints_the_key_idx_summary() {
     let footer = ravel_logseg::footer::open(&object).expect("object opens");
     let desc = key_index::key_index_section(&footer).expect("KEY_IDX section");
     let raw = &object[desc.offset as usize..(desc.offset + desc.len) as usize];
-    let summary = key_index::summarize(&footer, raw)
+    let inspection = key_index::summarize(&footer, raw)
         .expect("summary verifies")
         .expect("summary present");
+    assert!(inspection.findings.is_empty());
+    let summary = &inspection.summary;
 
     let stdout = inspect_stdout(&object, "key-idx");
     let section_line = format!(
@@ -500,6 +502,51 @@ fn rlog_inspect_prints_no_key_idx_for_an_object_without_one() {
     let stdout = inspect_stdout(&build_object(), "no-key-idx");
     assert!(!stdout.contains("KEY_IDX"), "{stdout}");
     assert!(block(&stdout, "key_idx: ").is_empty(), "{stdout}");
+}
+
+/// A KEY_IDX entry naming a block at or past the object's real block count is
+/// a finding, printed on its own line, and a non-zero exit, the same
+/// discipline `corrupt_key_idx_prints_typed_error_not_panic` applies to a
+/// flipped byte, never a silent clean inspect.
+#[test]
+fn block_ordinal_past_the_count_prints_finding_and_fails() {
+    use ravel_logseg::key_index::{self, KeyType};
+
+    let good =
+        build_object_with(|w| w.with_key_index_fields(vec![("svc".to_string(), KeyType::Str)]));
+    let footer = ravel_logseg::footer::open(&good).expect("known-good object opens");
+    let block_count = footer.block_count;
+    let bad_ordinal = block_count as u32;
+    let bad = key_index::rewrite_key_index(
+        &good,
+        key_index::RLOG_KEY_IDX_VERSION,
+        |_, _, mut entries| {
+            entries.push((ravel_codec::key_idx::key8_str("zz"), bad_ordinal));
+            entries
+        },
+    )
+    .expect("rewrite with a bad ordinal");
+
+    let path = temp_path("bad-key-idx-ordinal");
+    std::fs::write(&path, &bad).expect("writes object");
+    let output = run_inspect(&path);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !output.status.success(),
+        "an object naming a block past its own count must be refused"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let expected_prefix = "key_idx finding: field=svc bucket=";
+    let expected_suffix = format!("names block {block_count}, object has {block_count} blocks");
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l.starts_with(expected_prefix) && l.ends_with(&expected_suffix)),
+        "expected a key_idx finding line for svc/{block_count} in:\n{stdout}"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(!stderr.contains("panicked"), "inspector panicked: {stderr}");
 }
 
 /// A flipped KEY_IDX byte fails the whole-section crc and surfaces as a typed
