@@ -5647,7 +5647,9 @@ fn failed_log_slice_reports_the_segments_it_already_paid_for() {
 }
 
 /// The worker half of issue #1723 on the Spans path, on the same terms as
-/// [`failed_log_slice_reports_the_segments_it_already_paid_for`].
+/// [`failed_log_slice_reports_the_segments_it_already_paid_for`], except that
+/// the span fetcher counts a GET once issued, so the refused GET is one more
+/// request and no byte.
 ///
 /// Mutation proof: RED against the reverted line. Dropping
 /// `.with_spend(&accounting, &stats)` from the fetch-error site in
@@ -5722,9 +5724,9 @@ fn failed_span_slice_reports_the_segments_it_already_paid_for() {
         );
         assert_eq!(
             response.accounting.total_s3_requests(),
-            oracle.total_s3_requests(),
-            "and the requests that served them; the refused GET is charged for \
-             neither bytes nor a request on this path"
+            oracle.total_s3_requests() + 1,
+            "and the requests that served them plus the refused GET, which the \
+             span fetcher counts once issued"
         );
     });
 }
