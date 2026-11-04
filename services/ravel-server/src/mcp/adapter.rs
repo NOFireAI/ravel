@@ -580,6 +580,7 @@ fn tool_result(envelope: &Envelope) -> Result<CallToolResponse, McpError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use ravel_mcp::budget::{McpBudgetConfig, McpRequestBudgets};
     use ravel_query::EngineConfig;
