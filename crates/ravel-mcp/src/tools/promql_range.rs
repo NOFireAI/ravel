@@ -23,21 +23,17 @@ pub(crate) const NS_PER_MS: i64 = 1_000_000;
 pub(crate) type Refusal = (Failure, Vec<NextStep>);
 
 /// A validated range in nanoseconds, every figure a whole millisecond and
-/// `end_ns` after `start_ns`.
+/// `end_ns` after `start_ns`. `last_step_ns` is the last step the range
+/// evaluates: the greatest `start + k * step` below `end`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EvalRange {
     pub start_ns: i64,
     pub end_ns: i64,
     pub step_ns: i64,
+    pub last_step_ns: i64,
 }
 
 impl EvalRange {
-    /// The last step the range evaluates: the greatest `start + k * step`
-    /// below `end`.
-    pub fn last_step_ns(&self) -> i64 {
-        self.start_ns + (self.end_ns - 1 - self.start_ns) / self.step_ns * self.step_ns
-    }
-
     pub fn start_ms(&self) -> i64 {
         self.start_ns / NS_PER_MS
     }
@@ -97,11 +93,29 @@ pub(crate) fn eval_range(tool: &str, range: &TimeRange, step: &str) -> Result<Ev
             }],
         ));
     }
+    let last_step_ns = last_step_ns(start_ns, end_ns, step_ns).ok_or_else(|| {
+        (
+            invalid(format!(
+                "time_range from {start_ns} ns to {end_ns} ns spans more than an i64 \
+                 nanosecond count can hold, so its last step cannot be computed"
+            )),
+            Vec::new(),
+        )
+    })?;
     Ok(EvalRange {
         start_ns,
         end_ns,
         step_ns,
+        last_step_ns,
     })
+}
+
+/// The greatest `start + k * step` below `end`, or `None` when `end - 1 -
+/// start` does not fit an `i64`.
+fn last_step_ns(start_ns: i64, end_ns: i64, step_ns: i64) -> Option<i64> {
+    let span = end_ns.checked_sub(1)?.checked_sub(start_ns)?;
+    let offset = span.checked_div(step_ns)?.checked_mul(step_ns)?;
+    start_ns.checked_add(offset)
 }
 
 /// A step is a positive duration with a unit (`15s`, `1m`, `1h30m`). A bare

@@ -1,26 +1,29 @@
 //! The D1 port trait `ravel-server` implements in #1381, mirroring
 //! `services/ravel-server`'s `QueryService` operations.
 //!
-//! `QueryService` is a concrete struct there, not a trait, and two of its
-//! nine operations (`analytics`, `exemplars`) take request/outcome types
+//! `QueryService` is a concrete struct there, not a trait, and two of the
+//! operations it serves (`analytics`, `exemplars`) take request/outcome types
 //! (`AnalyticsRequest`, `AnalyticsOutcome`, `ExemplarsRequest`,
 //! `ExemplarsOutcome`) defined in that same crate. `ravel-mcp` cannot import
 //! any of the four: #1381 makes `ravel-server` depend on `ravel-mcp`, so the
 //! reverse import would cycle. [`QueryBackend`] is the port side of that
-//! adapter pair instead: one trait, one method per `QueryService` operation,
-//! named and ordered identically, that #1381 implements for the real
-//! `QueryService`. Seven of the nine methods take the exact request type
-//! `QueryService` takes -- all seven already live in `ravel_query`, an
-//! existing dependency of this crate. `analytics` and `exemplars` take
+//! adapter pair instead: one trait of eleven methods, each mirroring the
+//! `QueryService` operation its doc names, that #1381 implements for the
+//! real `QueryService`. Seven of the eleven take the exact request type
+//! `QueryService` takes, from `ravel_query` (`InstantRequest`,
+//! `RangeRequest`, `MetadataRequest`) or `ravel_sql` (`SqlRequest`), both
+//! existing dependencies of this crate. `analytics` and `exemplars` take
 //! [`crate::envelope::AnyJson`] instead, since their concrete request shape
 //! is the one unreachable pair; #1381's adapter is where that JSON becomes a
-//! real `AnalyticsRequest`/`ExemplarsRequest`.
+//! real `AnalyticsRequest`/`ExemplarsRequest`. `trace_lookup` and
+//! `describe_data` take this crate's own [`TraceLookupRequest`] and
+//! [`DescribeRequest`].
 //!
 //! Every method but three returns the D4 envelope directly (`Result<Envelope,
 //! Failure>`) rather than each operation's native outcome type. Turning a
 //! native outcome into an envelope is exactly what every tool body (#1380,
-//! #1382) needs regardless of which operation answered it, so returning nine
-//! different outcome types here would only move that same conversion to a
+//! #1382) needs regardless of which operation answered it, so returning each
+//! operation's own outcome type here would only move that same conversion to a
 //! later, harder-to-name place; the port trait states the shape the tool
 //! layer actually consumes. Two of the exceptions are SQL's: `sql_execute`
 //! returns a [`Draft`], an envelope no cap has run on beside the inputs a D5
@@ -141,7 +144,8 @@ pub struct TraceLookupRequest {
     pub window: Option<ravel_types::TimeRange>,
 }
 
-/// The eleven `QueryService` operations, as the tool layer needs them.
+/// The eleven operations the tool layer calls, each mirroring the
+/// `QueryService` operation its doc names.
 ///
 /// The lint allow is intentional: this trait is a crate-internal seam with
 /// exactly one production implementer (#1381's adapter over the real
