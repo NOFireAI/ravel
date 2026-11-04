@@ -1563,6 +1563,9 @@ impl SpanSegmentFetcher {
                         "GetLimiter semaphore closed unexpectedly".to_string(),
                     ),
                 })?;
+            // The request is counted once issued, so a GET whose future is
+            // dropped mid-flight is still charged; bytes count on arrival.
+            accounting.record_s3_request(AccountedOp::Get);
             let got = self
                 .store
                 .get(key, range)
@@ -1571,7 +1574,6 @@ impl SpanSegmentFetcher {
                     key: key.to_string(),
                     source,
                 })?;
-            accounting.record_s3_request(AccountedOp::Get);
             accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
             return Ok(attach_reservation(got.data, reservation));
         };
@@ -1594,8 +1596,8 @@ impl SpanSegmentFetcher {
                 let _permit = self.get_limiter.acquire().await.map_err(|_| {
                     StoreError::Transient("GetLimiter semaphore closed unexpectedly".to_string())
                 })?;
-                let got = self.store.get(key, range).await?;
                 accounting.record_s3_request(AccountedOp::Get);
+                let got = self.store.get(key, range).await?;
                 accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
                 if let Some(want) = want
                     && got.data.len() as u64 != want
@@ -4838,7 +4840,8 @@ mod tests {
     /// fold's footer suffix, not a larger tail.
     ///
     /// FLIP: `DEFAULT_TRACE_PROBE_BYTES` back at `64 << 10` makes the first
-    /// GET the whole object's length here.
+    /// GET a 64 KiB range, the last 65,536 B of this fixture's 84,220 B
+    /// object.
     #[tokio::test]
     async fn the_default_first_read_is_the_8_kib_footer_suffix() {
         assert_eq!(KEY_INDEX_FOOTER_SUFFIX_LEN, 8 * 1024);
