@@ -2608,16 +2608,34 @@ enum CatalogCommand {
         #[arg(long)]
         writers_stopped: bool,
         /// Build per-part key-index leaves (ADR-2707 decision 4) in this
-        /// fold. Off by default pending measurement, and no query reads the
-        /// leaves yet. When on, every part the fold re-encodes has each
+        /// fold. Off by default pending measurement (ADR-3692 decision 5);
+        /// the spans `trace_id` lookup reads the leaves where they exist
+        /// (tier 2). When on, every part the fold re-encodes has each new
         /// entry's KEY_IDX section read by ranged GET, up to three GETs per
-        /// entry, and the tail part is re-encoded on every fold that advances
-        /// the watermark, so each such fold reads the section of every entry
-        /// in the tail. Applies to `--signal spans` and to a logs tenant that
+        /// entry; the tail part, re-encoded on every fold that advances the
+        /// watermark, carries the entries its previous leaves cover by one
+        /// GET per leaf instead, and reads again each entry those leaves left
+        /// uncovered. Applies to `--signal spans` and to a logs tenant that
         /// declares a key-index column or turns on trace-id indexing; other
         /// signals ignore it.
         #[arg(long)]
         key_index_leaves: bool,
+        /// With `--key-index-leaves`, the most (entry, key8) pairs, read and
+        /// carried from the previous tail's leaves, the leaf build holds for
+        /// one part at a time (ADR-3692 decision 5). Each field the build
+        /// indexes gets a fixed share, max(1, N / fields). A part over it is
+        /// built in passes over disjoint key8 ranges, each pass holding the
+        /// whole key8s that fit, re-reading the sections it needs and closing
+        /// its leaf slices before the next; one key8 is never split, so one
+        /// over the share is held whole. A pass holds at most max(share,
+        /// largest key8 run) + 1 pairs per field, pinned by the catalog test
+        /// every_pass_holds_at_most_its_share_open_slice_included; about 88 B
+        /// a one-block pair is an upper-bound estimate. The leaves equal a
+        /// build from scratch at the same budget. At least 1.
+        #[arg(long, value_name = "N", requires = "key_index_leaves",
+              default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+              value_parser = clap::value_parser!(u64).range(1..))]
+        key_index_build_max_pairs: u64,
         /// Instead of folding, attach key-index leaves to the parts already in
         /// HEAD that lack a ref for a declared field (ADR-2707 decision 4,
         /// "Lifecycle"; docs/catalog-and-mvcc.md "Rollout"). Each such part is
@@ -3107,12 +3125,13 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     max_flush_lifetime,
                     writers_stopped,
                     key_index_leaves,
+                    key_index_build_max_pairs,
                     snapshot_part_max_entries,
                     json,
                     tenant_kms,
                     ..
                 },
-        } => catalog::fold_with_part_cap(
+        } => catalog::fold_with_key_index_budget(
             store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
                 .await?,
             cli.store.selection(),
@@ -3122,6 +3141,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             max_flush_lifetime,
             writers_stopped,
             key_index_leaves,
+            key_index_build_max_pairs,
             snapshot_part_max_entries
                 .map(usize::try_from)
                 .transpose()
@@ -5364,6 +5384,48 @@ mod tests {
         };
         assert!(!parse(&[]), "the leaf build is off by default");
         assert!(parse(&["--key-index-leaves"]), "the flag turns it on");
+    }
+
+    /// `catalog fold --key-index-build-max-pairs` (ADR-3692 decision 5)
+    /// defaults to 8,000,000, refuses 0 at parse time, and is refused
+    /// without `--key-index-leaves`, the build it bounds.
+    #[test]
+    fn catalog_fold_key_index_build_max_pairs_flag() {
+        let try_parse = |extra: &[&str]| {
+            let argv = ["ravel", "catalog", "fold", "--tenant", "acme"]
+                .iter()
+                .chain(extra)
+                .copied()
+                .collect::<Vec<_>>();
+            Cli::try_parse_from(argv).map(|cli| match cli.command {
+                Command::Catalog {
+                    command:
+                        super::CatalogCommand::Fold {
+                            key_index_build_max_pairs,
+                            ..
+                        },
+                } => key_index_build_max_pairs,
+                _ => panic!("expected the catalog fold subcommand"),
+            })
+        };
+        assert_eq!(
+            try_parse(&[]).expect("a plain fold parses"),
+            8_000_000,
+            "the default budget is 8,000,000 pairs"
+        );
+        assert_eq!(
+            try_parse(&["--key-index-leaves", "--key-index-build-max-pairs", "1000"])
+                .expect("a budget beside the leaf build parses"),
+            1000
+        );
+        assert!(
+            try_parse(&["--key-index-leaves", "--key-index-build-max-pairs", "0"]).is_err(),
+            "a budget of 0 is refused"
+        );
+        assert!(
+            try_parse(&["--key-index-build-max-pairs", "1000"]).is_err(),
+            "the budget is refused without --key-index-leaves"
+        );
     }
 
     /// `catalog fold --rebuild-key-index` (ADR-2707 decision 4): `--field`

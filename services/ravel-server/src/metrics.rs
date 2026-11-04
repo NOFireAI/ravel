@@ -3638,6 +3638,50 @@ fn render_declared_stats_family(
     );
 }
 
+/// The fold's key-index leaf build figures (ADR-3692 decisions 5 and 7),
+/// summed over every fold in this process that returned a report, a no-op
+/// included. `None`
+/// under the same `can_fold` gate as the stamp-coverage families, for the
+/// same reason: absent where no fold can run, never pinned at zero.
+const FOLD_KEY_INDEX_FAMILIES: [(&str, &str); 4] = [
+    (
+        "ravel_catalog_fold_key_index_sections_read_total",
+        "KEY_IDX sections the fold's key-index leaf build read, one per entry per build pass. An entry carried from the previous tail's leaf reads none.",
+    ),
+    (
+        "ravel_catalog_fold_key_index_entries_carried_total",
+        "Entries whose key-index pairs the fold carried from the previous tail's leaves, matched by data object key, instead of reading their sections.",
+    ),
+    (
+        "ravel_catalog_fold_key_index_build_passes_total",
+        "Passes of the fold's key-index leaf build over disjoint key8 ranges: one per re-encoded part whose pairs fit the pair budget, one per key8 range above it, and the ranges of a field rebuilt after a pass found a new uncovered entry.",
+    ),
+    (
+        "ravel_catalog_fold_key_index_leaf_gets_total",
+        "GETs of the previous tail's key-index leaves the fold issued to carry their pairs forward, one per leaf.",
+    ),
+];
+
+fn render_fold_key_index_family(
+    out: &mut String,
+    mode: Mode,
+    totals: Option<ravel_catalog::FoldKeyIndexTotals>,
+) {
+    let Some(totals) = totals else {
+        return;
+    };
+    let values = [
+        totals.sections_read,
+        totals.entries_carried,
+        totals.build_passes,
+        totals.leaf_gets,
+    ];
+    for ((name, help), value) in FOLD_KEY_INDEX_FAMILIES.iter().zip(values) {
+        write_header(out, name, help, "counter");
+        write_sample(out, name, &[Label::Mode(mode)], value);
+    }
+}
+
 /// Tenancy adoption counter (ADR-0050 section 3). Counts buckets this process
 /// pinned to `V1_UNKEYED` because they held `t/` data but no `sys/tenancy`
 /// marker (a pre-ADR-0050 bucket adopted once, permanently). A nonzero value
@@ -9633,6 +9677,11 @@ pub fn render(
             )
         }),
     );
+    render_fold_key_index_family(
+        &mut out,
+        mode,
+        can_fold.then(ravel_catalog::fold_key_index_totals),
+    );
     render_tenancy_family(&mut out, mode, crate::tenancy::v1_unkeyed_adoption_count());
     render_provisioning_family(
         &mut out,
@@ -10011,7 +10060,8 @@ pub struct MetricsState {
     /// here.
     ///
     /// Gates the `ravel_catalog_fold_stamped_records_total` /
-    /// `ravel_catalog_fold_stamped_entries_total` pair. Both routes fold
+    /// `ravel_catalog_fold_stamped_entries_total` pair and the four
+    /// `ravel_catalog_fold_key_index_*_total` families. Both routes fold
     /// into the same process-global totals, so either one opens the gate and
     /// only a process with neither omits the pair. Each single-route gate
     /// gets a different config wrong: following the mode alone leaves

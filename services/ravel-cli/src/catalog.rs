@@ -168,6 +168,42 @@ pub async fn fold_with_part_cap(
     now_ns: i64,
     json: bool,
 ) -> anyhow::Result<(FoldReport, String)> {
+    fold_with_key_index_budget(
+        store,
+        selection,
+        tenant,
+        shard_count,
+        signal,
+        max_flush_lifetime_ns,
+        writers_stopped,
+        build_key_index_leaves,
+        ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
+        snapshot_part_max_entries,
+        now_ns,
+        json,
+    )
+    .await
+}
+
+/// [`fold_with_part_cap`], plus `--key-index-build-max-pairs`: sets
+/// [`CatalogConfig::key_index_build_max_pairs`] for this fold, the pair
+/// budget past which the leaf build of one part runs in several
+/// passes over disjoint key8 ranges (ADR-3692 decision 5).
+#[allow(clippy::too_many_arguments)]
+pub async fn fold_with_key_index_budget(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shard_count: u32,
+    signal: SignalArg,
+    max_flush_lifetime_ns: Option<i64>,
+    writers_stopped: bool,
+    build_key_index_leaves: bool,
+    key_index_build_max_pairs: u64,
+    snapshot_part_max_entries: Option<usize>,
+    now_ns: i64,
+    json: bool,
+) -> anyhow::Result<(FoldReport, String)> {
     if snapshot_part_max_entries == Some(0) {
         anyhow::bail!(
             "--snapshot-part-max-entries must be at least 1 (the most entries one snapshot part \
@@ -188,6 +224,7 @@ pub async fn fold_with_part_cap(
         max_flush_lifetime_ns,
         seal_through_hour,
         build_key_index_leaves,
+        key_index_build_max_pairs,
         snapshot_part_max_entries,
         now_ns,
         json,
@@ -246,6 +283,7 @@ pub async fn fold_inner(
         max_flush_lifetime_ns,
         None,
         false,
+        ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
         None,
         now_ns,
         json,
@@ -264,6 +302,7 @@ async fn fold_core(
     max_flush_lifetime_ns: Option<i64>,
     seal_through_hour: Option<u32>,
     build_key_index_leaves: bool,
+    key_index_build_max_pairs: u64,
     snapshot_part_max_entries: Option<usize>,
     now_ns: i64,
     json: bool,
@@ -272,6 +311,7 @@ async fn fold_core(
     let mut catalog_config = CatalogConfig {
         shard_count,
         build_key_index_leaves,
+        key_index_build_max_pairs,
         ..CatalogConfig::default()
     };
     if let Some(ns) = max_flush_lifetime_ns {
@@ -480,6 +520,22 @@ fn render_fold_report(
     out.push_str(&format!(
         "key_index_uncovered_entries: {}\n",
         report.key_index_uncovered_entries
+    ));
+    out.push_str(&format!(
+        "key_index_sections_read: {}\n",
+        report.key_index_sections_read
+    ));
+    out.push_str(&format!(
+        "key_index_entries_carried: {}\n",
+        report.key_index_entries_carried
+    ));
+    out.push_str(&format!(
+        "key_index_build_passes: {}\n",
+        report.key_index_build_passes
+    ));
+    out.push_str(&format!(
+        "key_index_leaf_gets: {}\n",
+        report.key_index_leaf_gets
     ));
     Ok(out)
 }

@@ -1960,6 +1960,46 @@ that the flush writes after the ingest process reads the new record. An
 object written before keeps its own field list, and
 [`rlog inspect`](../inspecting-data.md#rlog-inspect) prints it.
 
+### Key-index leaf build budget
+
+With `--fold-key-index-leaves` on, the fold builds per-part key-index
+leaves from the KEY_IDX sections. The tail part is re-encoded on every fold
+that advances the watermark, and its build takes the entries the previous
+tail's leaves already cover from those leaves, one GET per leaf, and reads
+the sections of the new entries and of the entries those leaves left
+uncovered, which are read again on every such fold while they stay
+uncovered.
+
+`--fold-key-index-build-max-pairs N` (ravel-server) and
+`--key-index-build-max-pairs N` (`ravel-cli catalog fold`) bound the
+(entry, key8) pairs the build holds for one part at once, the pairs read
+and the pairs carried from the previous tail together. Every field the
+build indexes gets a fixed share, `max(1, N / fields)`. Each flag is
+refused without its leaf build flag (`--fold-key-index-leaves`,
+`--key-index-leaves`) and at 0; the default is 8,000,000. A part over the
+budget is built in passes over disjoint key8 ranges, each pass reading the
+sections it needs again and closing its leaf slices before the next, so a
+smaller budget trades memory for section reads and leaves. One key8's
+pairs are never split, so a key8 over the share is held whole, and a key8
+shared by several entries counts once per entry: a field's passes are the
+greedy packing of its key8 runs into groups of at most its share, more
+than `ceil(pairs / share)` when keys repeat across entries, and the part
+takes as many passes as its slowest field. A pass holds at most
+`max(share, largest key8 run) + 1` pairs per field (catalog test
+`every_pass_holds_at_most_its_share_open_slice_included`); about 88 B a
+one-block pair is an upper-bound estimate, not a measured figure. The
+leaves depend on the budget: they equal a build from scratch at the same
+budget, and lookups read them the same at any budget. A section read that
+fails in some passes only leaves its entry uncovered. The budget
+does not cover the previous tail's stored leaf bytes, the one frame of a
+previous leaf being decoded, the sections in flight or one pass's encoded
+leaves; the
+[catalog spec](../../catalog-and-mvcc.md#per-part-key-index-leaves-adr-2707)
+states the pass rule and that list. `--mode gateway` refuses the server
+flag, since it runs no fold. The fold report and `/metrics` count the work
+in `key_index_sections_read`, `key_index_entries_carried`,
+`key_index_build_passes` and `key_index_leaf_gets`.
+
 ## Per-query budgets
 
 Eight flags bound what one query can spend. Unset, each resolves at startup:
