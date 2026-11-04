@@ -2044,6 +2044,69 @@ class Evaluate(Workdir):
     def test_failed_state(self):
         self.assertEqual(self.check_failed_state(), [])
 
+    FOLD_ADVANCE_FAILED = "state failed at fold fold_advance/spans (exit 3)"
+
+    def fail_fold_advance(self):
+        """The fixture as run.sh leaves it when mixed's fold_advance spans
+        fold exits 3 after mixed's statements ran: the failure is recorded
+        against fold_advance, its spans fold stamp carries exit 3, its logs
+        fold never ran, and no fold_advance census, transition or inspect
+        stamps exist; mixed's own stamps are untouched."""
+        stamps = os.path.join(self.run_dir, "stamps")
+        for name in os.listdir(stamps):
+            if name.startswith("fold_advance."):
+                os.remove(os.path.join(stamps, name))
+        for name in ("census.jsonl", "transitions.jsonl"):
+            lines = read_jsonl(self.stamp_path(name))
+            write_jsonl(self.stamp_path(name), [x for x in lines if x["state"] != "fold_advance"])
+        folds = []
+        for x in read_jsonl(self.stamp_path("folds.jsonl")):
+            if x["transition"] == "fold_advance":
+                if x["signal"] == "logs":
+                    continue
+                x["exit"] = 3
+            folds.append(x)
+        write_jsonl(self.stamp_path("folds.jsonl"), folds)
+        write_jsonl(self.stamp_path("failed_states.jsonl"), [
+            {"state": "fold_advance", "step": "fold fold_advance/spans", "exit": 3,
+             "log": "out/logs/fold-fold_advance-spans.out", "at": "2026-11-04T00:00:00Z"}])
+
+    def check_failed_fold_advance(self, evaluate_py=EVALUATE):
+        """A fold_advance failure recorded against fold_advance keeps mixed
+        live: its fold stamps are not wanted (no new problem, so the verdict
+        is incomplete, not fail), fold_advance's figures are not-run with the
+        reason, mixed's figures stay live, and incomplete names fold_advance
+        and not mixed."""
+        _, base, _ = self.go(BANDS, evaluate_py)
+        self.fail_fold_advance()
+        out = []
+        code, res, _ = self.go(BANDS, evaluate_py)
+        new = sorted(set(res["problems"]) - set(base["problems"]))
+        if new:
+            out.append(f"new problems {new}")
+        if res["verdict"] == "pass":
+            out.append(f"verdict pass with a failed state: {res['incomplete']}")
+        if not any(self.FOLD_ADVANCE_FAILED in e for e in res["incomplete"]):
+            out.append(f"incomplete {res['incomplete']}")
+        if any(e.startswith("state mixed not run") for e in res["incomplete"]):
+            out.append(f"mixed not run {res['incomplete']}")
+        for f in res["figures"]:
+            if f["id"] == "row_07.spans_tail_entries":
+                if f["status"] != "not-run" or self.FOLD_ADVANCE_FAILED not in (f["reason"] or ""):
+                    out.append(f"{f['id']} {f['status']} {f['reason']}")
+            elif f["id"] == "row_07.spans_mixed_entries" and f["status"] == "not-run":
+                out.append(f"{f['id']} not-run {f['reason']}")
+        states = {x["state"]: x for x in res["states"]}
+        fa = states["fold_advance"]
+        if (fa["status"], fa.get("step"), fa.get("exit")) != ("failed", "fold fold_advance/spans", 3):
+            out.append(f"states fold_advance {fa}")
+        if states["mixed"]["status"] == "failed":
+            out.append(f"states mixed {states['mixed']}")
+        return out
+
+    def test_failed_fold_advance(self):
+        self.assertEqual(self.check_failed_fold_advance(), [])
+
     def test_failed_state_line_without_exit_is_missing(self):
         write_jsonl(self.stamp_path("failed_states.jsonl"), [{"state": "mixed", "step": "fold fold_advance/logs"}])
         code, res, _ = self.go()
@@ -2567,6 +2630,11 @@ FLIPS = {
         '        out["figures"].append({"id": f"needle_blocks.{value}.planted", "value": want})\n',
         "",
         "check_needle_geometry",
+    ),
+    "fold_advance's fold stamps gated on mixed": (
+        '                             ("leaf_rebuild", "folded_leaves"), ("fold_advance", "fold_advance")):\n',
+        '                             ("leaf_rebuild", "folded_leaves"), ("fold_advance", "mixed")):\n',
+        "check_failed_fold_advance",
     ),
 }
 
