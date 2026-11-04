@@ -128,17 +128,21 @@ pub trait ValuesMemo: Send + Sync {
 }
 
 /// The bytes [`DecodedColumnCache::offer`] adds to a memo-capable column's
-/// charge for the memo it may later hold: the Arrow array struct and its
-/// buffer headers, which share the column's bytes rather than copy them.
-/// Measured by `ravel-sql`'s `tests/memo_overhead_alloc_pin.rs` as the heap
-/// bytes one memo fill leaves live: 392 for a plain `Text` column, 392 for a
-/// block-local `Text` dictionary, and 520 for a `Mixed` dictionary, whose
-/// validity adds a third shared buffer; every byte allocated stays live. Set
-/// to the largest, rounded up to a multiple of 16; that test fails when the
-/// constant falls below a measured figure or exceeds the largest by more than
-/// 16. `the_entry_charge_includes_the_memo_constant` pins that `offer` adds
-/// it.
-pub const VALUES_MEMO_BYTES: u64 = 528;
+/// charge for the memo it may later hold: the memo struct, the Arrow array
+/// and its buffer headers, and a dictionary's keys buffer, all of which share
+/// the column's bytes rather than copy them. Measured by `ravel-sql`'s
+/// `tests/memo_overhead_alloc_pin.rs`
+/// (`values_memo_charge_covers_the_measured_memo_and_no_more`), through the
+/// crate's own build, as the heap bytes one memo fill leaves live: 432 for a
+/// plain `Text` column; 432 for a block-local `Text` dictionary, and 568 once
+/// the key path has also built its keys buffer; 560 for a `Mixed`
+/// dictionary, whose validity adds a shared buffer, both with and without the
+/// key path, which refuses it and builds no keys buffer. Every byte allocated
+/// stays live. Set to the largest, rounded up to a multiple of 16; that test
+/// fails when the constant falls below a measured figure or exceeds the
+/// largest by more than 16. `the_entry_charge_includes_the_memo_constant`
+/// pins that `offer` adds it.
+pub const VALUES_MEMO_BYTES: u64 = 576;
 
 /// A cached string column's memo slot, filled at most once.
 #[derive(Default)]
