@@ -1145,4 +1145,29 @@ mod tests {
         let names: Vec<&str> = figures.iter().map(|(phase, _, _)| phase.name()).collect();
         assert_eq!(names, vec!["resolve", "plan", "probe", "scan", "keyIndex"]);
     }
+
+    /// `budget.actual` reports each pooled figure under its own name: four
+    /// distinct non-zero counters, so no two fields can trade places
+    /// unnoticed. The pooled store figures sum across operations.
+    ///
+    /// FLIP: swapping `bytes_scanned` and `store_requests` reports 7 bytes
+    /// and 1024 requests.
+    #[test]
+    fn actual_reports_each_figure_under_its_own_name() {
+        let mut accounting = QueryAccountingSnapshot::default();
+        accounting.s3_bytes[0] = 1_000;
+        accounting.s3_bytes[1] = 24;
+        accounting.s3_requests[0] = 3;
+        accounting.s3_requests[1] = 4;
+        accounting.segments_opened = 5;
+        accounting.decompressed_bytes = 9_000;
+
+        let actual = actual(&accounting);
+
+        assert_eq!(actual["bytes_scanned"], json!(1_024u64));
+        assert_eq!(actual["store_requests"], json!(7u64));
+        assert_eq!(actual["segments_read"], json!(5u64));
+        assert_eq!(actual["decompressed_bytes"], json!(9_000u64));
+        assert_eq!(actual.as_object().map(Map::len), Some(4));
+    }
 }
