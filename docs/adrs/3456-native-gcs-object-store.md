@@ -420,8 +420,9 @@ ETag HEAD reports from `md5Hash` or `componentCount`, and fails the call on
 an item with neither (see the XML listing correction above). Whether GCS
 lists such an object with a `componentCount` is unmeasured. The fake lists it
 with neither, and `gcs::tests::listing_over_a_multipart_object_fails_the_call`
-pins that the listing then fails. The real-bucket contract lane's cleanup
-lists the multipart object its suite leaves behind, so its first run answers
-the question. Until then, an object this path writes may fail a listing over
-its prefix on real GCS. No production writer uses `put_multipart` today
+pins that the listing then fails. The real-bucket contract lane deletes
+every object its multipart probes complete before its cleanup listing, so it
+does not answer the question either; #3805 tracks a probe that does. Until
+then, an object this path writes may fail a listing over its prefix on real
+GCS. No production writer uses `put_multipart` today
 (above), so no Ravel-written object reaches that listing yet.

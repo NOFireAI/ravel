@@ -104,8 +104,9 @@
 //! Google documents no MD5 for an object an XML multipart upload completed,
 //! and whether its listing item carries `componentCount` is not verified. An
 //! item with neither fails the listing call (above), so a listing over such an
-//! object is unproven until the real-bucket contract lane, whose cleanup lists
-//! the multipart probe's object, has run. The fake serves one with neither.
+//! object is unproven on real GCS. The real-bucket contract lane deletes its
+//! multipart objects before it lists, so it does not answer this; #3805 tracks
+//! a probe that does. The fake serves one with neither.
 //!
 //! # What this backend does not do
 //!
