@@ -49,7 +49,7 @@ use crate::catalog::DescribeDataInput;
 use crate::cursor::{Cursor, CursorError, CursorPosition, SegmentSetPin};
 use crate::draft::{Draft, PageOrder, PinScope};
 use crate::envelope::{
-    AnyJson, Budget, Cell, Column, Envelope, Failure, FailureClass, Row, TimeRange,
+    AnyJson, Budget, CapAdvice, Cell, Column, Envelope, Failure, FailureClass, Row, TimeRange,
 };
 use crate::service::{DescribeOutcome, DescribeRequest, QueryBackend};
 use ravel_types::Signal;
@@ -59,6 +59,13 @@ use super::capabilities::refused;
 
 /// The catalog name, which a cursor is bound to.
 const TOOL: &str = "ravel_describe_data";
+
+/// The page is the row cap here, so only the byte cap can cut it.
+const ADVICE: CapAdvice<'static> = CapAdvice {
+    fewer_rows: "name one signal",
+    smaller_rows_action: "name_one_signal",
+    smaller_rows: "name one signal",
+};
 
 /// Families per page: the service's own page bound.
 pub const FAMILIES_PER_PAGE: usize = 100;
@@ -284,22 +291,28 @@ fn finish(
 ) -> Envelope {
     let mut budgets = ctx.budgets;
     budgets.max_rows = u32::try_from(draft.envelope.data.rows.len()).unwrap_or(u32::MAX);
-    draft.finish_page(&budgets, scope, PageOrder::Total, |pins, last, _| {
-        let (kind, name) = kind_and_name(last).ok_or(CursorError::Invalid)?;
-        let position = CursorPosition::Keyset {
-            tuple: Resume {
-                kind,
-                name: name.to_string(),
-            }
-            .tuple(),
-            order_by: ORDER_BY.map(str::to_string).to_vec(),
-        };
-        Ok(pins.cursor(TOOL, argument_hash, position, i64::MAX).mint(
-            ctx.cursor_key,
-            ctx.now_ns,
-            ctx.protection_horizon_ns,
-        )?)
-    })
+    draft.finish_page(
+        &budgets,
+        scope,
+        &ADVICE,
+        PageOrder::Total,
+        |pins, last, _| {
+            let (kind, name) = kind_and_name(last).ok_or(CursorError::Invalid)?;
+            let position = CursorPosition::Keyset {
+                tuple: Resume {
+                    kind,
+                    name: name.to_string(),
+                }
+                .tuple(),
+                order_by: ORDER_BY.map(str::to_string).to_vec(),
+            };
+            Ok(pins.cursor(TOOL, argument_hash, position, i64::MAX).mint(
+                ctx.cursor_key,
+                ctx.now_ns,
+                ctx.protection_horizon_ns,
+            )?)
+        },
+    )
 }
 
 /// The kinds of row a page carries, in page order. The discriminant is the

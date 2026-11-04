@@ -358,7 +358,9 @@ counter that tripped; the envelope-claims amendment below says where
 and `internal` (fixed message). A failure is a tool result with
 `isError: true`, so the model can correct itself. Protocol errors are for
 malformed JSON-RPC and unknown tools only. Every failure carries
-`next_steps`.
+`next_steps`. (Which step a cap earns, and the status of a result whose
+only cut is shortened cells, are set by the cap next-step amendment at the
+end of this file.)
 
 A cursor or evidence reference presented for the wrong tenant fails with
 `cursor_invalid`. The class matches a forged token, so the failure leaks no
@@ -419,7 +421,9 @@ the canonical row bytes. Redemption re-executes against the pin while the pin
 is valid and compares hashes. After the deadline, redemption re-executes
 fresh, reports `pinned: false`, and reports if the hash matched. A matching
 hash proves identical bytes and nothing more. No reference carries an object
-key, a tenant name, or a credential.
+key, a tenant name, or a credential. (No tool redeems one in this build;
+how each tool refuses one is set by the cap next-step amendment at the end
+of this file.)
 
 ### D6. Budgets
 
@@ -1906,3 +1910,43 @@ records now carry.
    the route's header check accepts
    (`ravel_mcp::tools::capabilities::SUPPORTED_REVISIONS`), with no second
    copy to drift.
+
+## Amendment (2026-11-04, #3737): uniform evidence_ref refusal and the cap next-step rule
+
+<!-- amendment-applies: sections="D4. The result envelope|D5. Consistency, cursors, and evidence references" pointer="cap next-step amendment" -->
+
+Review #1388 (findings S10 and N3) found two places where a tool's answer
+depended on which tool was asked rather than on what happened. Both are
+settled here.
+
+1. D5: no tool redeems an `evidence_ref` in this build, and every tool now
+   refuses one the same way, before it reads anything and with no rows. A
+   tool whose input schema lists `evidence_ref` refuses it as
+   `unsupported` ("evidence_ref is not served by <tool> in this build"). A
+   tool whose schema does not list it, `ravel_capabilities`,
+   `ravel_describe_data`, `ravel_explain_query`, `ravel_find_labels` and
+   the six Ravel Agents tools, refuses it as `invalid_argument`
+   ("evidence_ref is not an argument of <tool>"). Before, the last three
+   readers and the Agents tools ran the call and ignored the reference. The
+   refusal is one function, applied by the two dispatchers
+   (`ravel_mcp::tools::dispatch` and the Agents dispatcher) against each
+   tool's own schema, so a new tool inherits it. A JSON `null` is an absent argument. The six budget
+   arguments stay the exception to a schema's list: they are read from
+   every call.
+2. D4: a next step for a cap names the cap that actually cut the result,
+   and never advises raising a cap already at its ceiling. One rule,
+   `ravel_mcp::envelope::CapCut` and `CapAdvice`, chooses it for every
+   tool that emits one (`ravel_search_logs`, `ravel_query_sql`,
+   `ravel_describe_data`, `ravel_get_trace`, `ravel_query_promql`); each
+   tool supplies only its own wording for fewer or smaller rows. When the
+   byte cap dropped rows with fewer than `max_rows` returned, the step is
+   `raise_max_response_bytes` (below the 4 MiB ceiling) or the tool's own
+   smaller-rows action (at it). When the row cap stopped the result, the
+   step is `raise_max_rows` (below 5,000) or `narrow_time_range` (at it).
+   `ravel_get_trace` used to advise raising `max_rows` for both.
+3. D4: a result whose only cut is shortened cells (`cells_truncated` above
+   zero, `rows_omitted` zero, the row cap not hit) is complete: status
+   `ok`, no cursor, and a `read_full_cells` step saying how to read the
+   cells in full. Before, `ravel_search_logs` and `ravel_query_sql`
+   answered one shortened row with a cursor and an equal-group step, and a
+   cells-only result elsewhere was `ok_bounded` with no step.

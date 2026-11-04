@@ -37,7 +37,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::catalog::GetTraceInput;
-use crate::envelope::{Cell, Column, Envelope, Failure, FailureClass, NextStep, Row};
+use crate::envelope::{
+    CapAdvice, CapCut, Cell, Column, Envelope, Failure, FailureClass, NextStep, Row,
+};
 use crate::service::{QueryBackend, TraceLookupRequest};
 
 use super::ToolContext;
@@ -46,7 +48,17 @@ use super::capabilities::refused;
 const DEPTH_COLUMN: &str = "__ravel_depth";
 const PARENT_COLUMN: &str = "__ravel_parent";
 const WIDEN_STEP: &str = "widen_time_range";
-const RAISE_STEP: &str = "raise_max_rows";
+
+/// The lead of the cap step a trace with a `not_returned` parent carries.
+const NOT_RETURNED: &str = "a parent was not returned";
+
+/// The lookup takes no projection, so only fewer spans make the trace
+/// smaller.
+const ADVICE: CapAdvice<'static> = CapAdvice {
+    fewer_rows: "narrow time_range",
+    smaller_rows_action: "narrow_time_range",
+    smaller_rows: "narrow time_range",
+};
 
 /// Run the tool. An argument the body cannot use is an `invalid_argument`
 /// envelope and reaches no store.
@@ -244,13 +256,16 @@ fn finish(
         WIDEN_STEP,
         "a parent is missing and may start outside time_range; widen time_range or drop it",
     ));
-    envelope.next_steps.push(step(
-        RAISE_STEP,
-        "a parent was not returned; raise max_rows (up to 5,000) or narrow time_range",
-    ));
+    envelope.next_steps.push(ADVICE.widest(NOT_RETURNED));
+    let cap_step_at = envelope.next_steps.len() - 1;
 
     let mut fitted = envelope.fit_row_capped(ctx.budgets.max_response_bytes, row_cap_omitted);
     fitted.data.row_count = produced;
+    let cut = CapCut::of(
+        &fitted.presentation,
+        fitted.data.rows.len(),
+        ctx.budgets.max_rows,
+    );
 
     let shown = &fitted.presentation;
     let complete = !shown.row_cap_hit
@@ -267,11 +282,15 @@ fn finish(
     let missing = tree.iter().any(|p| p.parent == ParentState::Missing);
     let not_returned = tree.iter().any(|p| p.parent == ParentState::NotReturned);
     let widen = missing && request.window.is_some();
-    fitted.next_steps.retain(|next| match next.action.as_str() {
-        WIDEN_STEP => widen,
-        RAISE_STEP => not_returned,
-        _ => true,
-    });
+    let cap_step = match cut {
+        CapCut::Cells { .. } => ADVICE.step(cut, ""),
+        _ if not_returned => ADVICE.step(cut, NOT_RETURNED),
+        _ => None,
+    };
+    fitted.replace_step(cap_step_at, cap_step);
+    if !widen {
+        fitted.next_steps.retain(|next| next.action != WIDEN_STEP);
+    }
     Ok(fitted.finish(false))
 }
 
@@ -511,7 +530,8 @@ mod tests {
     /// `not_returned`, and the envelope with both columns is inside the cap.
     ///
     /// FLIP: labelling before the fit calls `c` `present`; prepending the
-    /// columns after the fit puts the envelope over the cap.
+    /// columns after the fit puts the envelope over the cap; the fixed
+    /// `raise_max_rows` step answers a cut the row cap did not make.
     #[test]
     fn a_byte_capped_result_labels_after_the_fit_and_stays_inside_the_cap() {
         let key = key();
@@ -541,7 +561,63 @@ mod tests {
             "{} bytes",
             serialized_len(&envelope)
         );
-        assert_eq!(actions(&envelope), [RAISE_STEP]);
+        assert_eq!(
+            steps(&envelope),
+            [(
+                "raise_max_response_bytes",
+                "a parent was not returned; the byte cap dropped rows; narrow time_range, or \
+                 raise max_response_bytes (up to 4 MiB)"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// The row cap firing with `max_rows` at its ceiling cannot be answered
+    /// by raising `max_rows`; below the ceiling it can.
+    ///
+    /// FLIP: choosing `raise_max_rows` whenever the row cap fired, as the
+    /// fixed step did, lists it at the ceiling too.
+    #[test]
+    fn the_row_cap_step_follows_max_rows_against_its_ceiling() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        let capped = || {
+            let mut envelope = spans(&[("c", Some("r"), "child")]);
+            envelope.presentation.row_cap_hit = true;
+            envelope
+        };
+        ctx.budgets.max_rows = crate::budget::MAX_ROWS_CEILING;
+        let envelope = call(capped(), untimed(), &ctx);
+        assert_eq!(envelope.status, Status::OkBounded, "{envelope:?}");
+        assert_eq!(
+            steps(&envelope),
+            [(
+                "narrow_time_range",
+                "a parent was not returned; the row cap stopped the result with max_rows at \
+                 its 5,000 ceiling; narrow time_range"
+                    .to_string()
+            )]
+        );
+
+        ctx.budgets.max_rows = crate::budget::MAX_ROWS_CEILING - 1;
+        let envelope = call(capped(), untimed(), &ctx);
+        assert_eq!(
+            steps(&envelope),
+            [(
+                "raise_max_rows",
+                "a parent was not returned; the row cap stopped the result; raise max_rows \
+                 (up to 5,000) or narrow time_range"
+                    .to_string()
+            )]
+        );
+    }
+
+    fn steps(envelope: &Envelope) -> Vec<(&str, String)> {
+        envelope
+            .next_steps
+            .iter()
+            .map(|next| (next.action.as_str(), next.detail.clone()))
+            .collect()
     }
 
     /// A row-capped trace packed right up to the byte cap stays inside it
@@ -593,7 +669,8 @@ mod tests {
             assert!(size <= cap, "len {len}: {size} B, over the {cap} B cap");
             widest = widest.max(size);
         }
-        assert!(widest + 256 >= cap, "the sweep never came near the cap");
+        // The reserved steps, both removed from these traces, are the gap.
+        assert!(widest + 512 >= cap, "the sweep never came near the cap");
     }
 
     /// A child that starts before its parent (clock skew) comes first in row
@@ -724,13 +801,13 @@ mod tests {
                 "not returned, windowed",
                 capped(),
                 windowed(),
-                vec![RAISE_STEP],
+                vec!["raise_max_rows"],
             ),
             (
                 "not returned, no window",
                 capped(),
                 untimed(),
-                vec![RAISE_STEP],
+                vec!["raise_max_rows"],
             ),
             ("all present, windowed", whole(), windowed(), vec![]),
         ] {

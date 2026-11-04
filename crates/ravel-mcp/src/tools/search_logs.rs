@@ -72,7 +72,8 @@ use crate::cursor::{
 };
 use crate::draft::{Draft, NoCursor, PageOrder, PinScope};
 use crate::envelope::{
-    CURSOR_BOUND, Cell, Column, Data, Envelope, Failure, FailureClass, NextStep, serialized_str_len,
+    CURSOR_BOUND, CapAdvice, Cell, Column, Data, Envelope, Failure, FailureClass, NextStep,
+    serialized_str_len,
 };
 use crate::resume_tuple::{decode_resume_tuple, encode_resume_tuple};
 use crate::service::{DescribeRequest, QueryBackend};
@@ -84,6 +85,13 @@ use super::explain_query::sql_failure;
 
 /// The catalog name, which a cursor is bound to.
 const TOOL: &str = "ravel_search_logs";
+
+/// The tool takes no projection, so only fewer rows make the page smaller.
+const ADVICE: CapAdvice<'static> = CapAdvice {
+    fewer_rows: "shorten time_range or add predicates",
+    smaller_rows_action: "narrow_time_range",
+    smaller_rows: "shorten time_range or add predicates",
+};
 
 /// The BLAKE3 derive-key context of the cursor's argument hash.
 const ARGUMENT_HASH_CONTEXT: &str = "ravel-mcp ravel_search_logs arguments v1";
@@ -619,20 +627,15 @@ fn finish(
             .warnings
             .push(UNCOUNTED_LOOKUP_WARNING.to_string());
     }
-    let narrow_groups = step(
-        "narrow_time_range",
-        "more rows share one (ts, observed_ts) pair than fit one page; shorten time_range \
-         or add predicates so the group fits, or raise max_rows",
-    );
     let order = match &plan.not_total {
         None => PageOrder::Total,
         Some(_) => PageOrder::Grouped {
             same_group: &same_tuple,
-            no_complete_group: &narrow_groups,
+            group: "one (ts, observed_ts) pair",
         },
     };
     let argument_hash = call.argument_hash;
-    draft.finish_page(&ctx.budgets, scope, order, |pins, _, tuple| {
+    draft.finish_page(&ctx.budgets, scope, &ADVICE, order, |pins, _, tuple| {
         let tuple = tuple.ok_or_else(|| {
             unmintable("the last row's (ts, observed_ts) could not be read".to_string())
         })?;
@@ -835,7 +838,7 @@ mod tests {
 
     use super::*;
     use crate::cursor::{CURSOR_KEY_LEN, CursorKey};
-    use crate::envelope::Status;
+    use crate::envelope::{MAX_RESPONSE_BYTES_FLOOR, Status};
     use crate::service::DescribeOutcome;
     use crate::tools::tests::{Stub, block_on, test_context};
 
@@ -984,6 +987,14 @@ mod tests {
             .next_steps
             .iter()
             .map(|step| step.action.as_str())
+            .collect()
+    }
+
+    fn steps(envelope: &Envelope) -> Vec<(&str, &str)> {
+        envelope
+            .next_steps
+            .iter()
+            .map(|step| (step.action.as_str(), step.detail.as_str()))
             .collect()
     }
 
@@ -1341,8 +1352,8 @@ mod tests {
     }
 
     /// Three rows equal on `(ts, observed_ts)` with a two-row cap: the page
-    /// returns the two it has, `ok_bounded`, with no cursor and a next step
-    /// to narrow `time_range`.
+    /// returns the two it has, `ok_bounded`, with no cursor and the row-cap
+    /// step under the group context.
     ///
     /// FLIP: answering an empty page, or minting a cursor after the second
     /// row, which resumes past the third.
@@ -1359,7 +1370,51 @@ mod tests {
         assert_eq!(envelope.status, Status::OkBounded, "{envelope:?}");
         assert_eq!(ids(&envelope), ["a", "b"]);
         assert_eq!(envelope.presentation.cursor, None);
-        assert_eq!(actions(&envelope), ["narrow_time_range"]);
+        assert_eq!(
+            steps(&envelope),
+            [(
+                "raise_max_rows",
+                "more rows share one (ts, observed_ts) pair than fit one page; the row cap \
+                 stopped the result; raise max_rows (up to 5,000) or shorten time_range or \
+                 add predicates"
+            )]
+        );
+    }
+
+    /// One log row whose attribute is wider than the byte cap: the cap
+    /// shortens the cell and drops no row, so the page is `ok` with no
+    /// cursor, no group step, and only the step to read the cell in full.
+    ///
+    /// FLIP: counting a shortened cell as a cut in `finish_page`'s selection
+    /// sends the one row down the group path, whose step says more rows
+    /// share one (ts, observed_ts) pair than fit one page.
+    #[test]
+    fn one_row_cut_by_the_byte_cap_is_ok_with_only_the_cells_step() {
+        let key = key();
+        let mut ctx = context(&key);
+        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
+        let wide = "x".repeat(MAX_RESPONSE_BYTES_FLOOR as usize + 1);
+        let stub = Stub::default();
+        stub.sql
+            .borrow_mut()
+            .push_back(page(&[("a", 4, 4, json!({ "msg": wide }))]));
+
+        let envelope = block_on(run(args(json!({})), &ctx, &stub));
+
+        assert_eq!(envelope.status, Status::Ok, "{:?}", envelope.presentation);
+        assert_eq!(envelope.presentation.cursor, None);
+        assert_eq!(envelope.presentation.cells_truncated, 1);
+        assert_eq!(envelope.presentation.rows_omitted, 0);
+        assert_eq!(ids(&envelope), ["a"]);
+        assert_eq!(
+            steps(&envelope),
+            [(
+                "read_full_cells",
+                "the result is complete but the byte cap shortened cells; shorten time_range \
+                 or add predicates, or raise max_response_bytes (up to 4 MiB), to read them \
+                 in full"
+            )]
+        );
     }
 
     /// Rows with the same attribute key set form one group; an attribute
