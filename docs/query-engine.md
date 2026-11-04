@@ -1151,13 +1151,21 @@ the HTTP layer maps to 422 `execution` with the budget's own message
 Reservation sites, each taken **before** its GET, with the guard's lifetime
 tied to the buffer it accounts for:
 
-- **RSEG range fetch** (`SegmentFetcher::ensure_ranges`): the sum of the
-  coalesced run lengths, reserved once ahead of the concurrent GETs. No run
-  joins needed ranges past `SegmentFetcher::max_run_len` (see the page-run
-  bound above), so a run that carries gap bytes is never longer than that
-  cap. The guard
-  is held by the `FetchedRegions` the runs fill, so it releases when those
-  region bytes drop.
+- **RSEG range fetch** (`SegmentFetcher::ensure_ranges`): the coalesced runs,
+  reserved and fetched in batches, in offset order. A run joins the current
+  batch while the batch's summed length stays at or under
+  `SegmentFetcher::max_run_len`; a run longer than that is a batch of its own.
+  Each batch is reserved ahead of its concurrent GETs, and its reservation is
+  released once its bytes are in the `FetchedRegions` and before the next
+  batch reserves; the last batch's guard is held by the `FetchedRegions`, so
+  it releases when those region bytes drop. One call therefore never holds
+  more than `max(max_run_len, longest run)` bytes reserved
+  (`one_call_never_reserves_more_than_one_batch`), while every run it fetched
+  stays resident in the `FetchedRegions` until the caller drops them. Batching
+  changes when bytes are reserved, not which GETs are issued or the wire bytes
+  they move (`batching_keeps_the_gets_and_wire_bytes`). No run joins needed
+  ranges past `max_run_len` (see the page-run bound above), so a run that
+  carries gap bytes is never longer than that cap.
 - **RLOG block-range fetch** (`BlockRangeFetcher`): a ranged read holds only
   the regions it placed, with no object-sized buffer. Each GET that places
   bytes reserves its length first; the chunk runs of `fetch_chunk_ranges` and
@@ -1176,7 +1184,8 @@ tied to the buffer it accounts for:
   and on the upstream arm alike, the shape the RLOG block-range path has.
 
 The guard is never released because a GET completed; it releases only when the
-buffer it accounts for drops.
+buffer it accounts for drops. The one exception is an RSEG range fetch's
+earlier batches, released inside the call as described above.
 
 **Handoff.** When a fetched buffer goes through the read cache -- a consumer
 with its own byte ledger -- the reservation is marked handed off
@@ -1196,8 +1205,10 @@ fetcher's error enum), mapped onto the query error path. The refusal carries
 only byte counts and the budget class that refused (the ledger's limit or the
 host-memory gate) -- never an object key or tenant identity -- and is never a smaller fetch
 or a partial result: no GET is issued for the refused bytes, and the budget is
-left unchanged. This holds before any GET for the RSEG range, whole-object and
-covering reservations. A ranged RLOG read reserves per placement, so a refusal
+left unchanged. This holds before any GET for the whole-object and covering
+reservations, and for an RSEG range fetch's first batch; a refusal of a later
+batch comes after the earlier batches' GETs, whose bytes stay in the
+`FetchedRegions` the failed fetch drops. A ranged RLOG read reserves per placement, so a refusal
 after its probe and directory-section GETs aborts a read that has already
 issued those; the refused GET itself is never issued, and the regions already
 placed release with the read.

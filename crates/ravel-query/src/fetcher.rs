@@ -897,9 +897,9 @@ struct FetchedRegions {
     /// Fetch-layer byte reservations (ADR-1170 decision 2) covering the GETs
     /// that filled `buffers`. Owned here so a reservation lives exactly as long
     /// as the fetched regions it accounts for: dropping this `FetchedRegions`
-    /// releases them. The reservation guards the coalesced run lengths reserved
-    /// once before the `join_all` in `ensure_ranges`, never a per-GET or
-    /// request-scoped claim.
+    /// releases them. Each `ensure_ranges` call hands over the reservation of
+    /// its last batch of coalesced runs only; its earlier batches' reservations
+    /// are released inside the call (see `ensure_ranges`).
     reservations: Vec<ravel_memory::Reservation>,
 }
 
@@ -1047,6 +1047,30 @@ fn bound_runs_capped(runs: Vec<(u64, u64)>, max_runs: usize, max_run_len: u64) -
         bridge_previous = bridge_next;
     }
     out
+}
+
+/// Splits `runs` into consecutive index ranges whose byte lengths sum to at
+/// most `max_batch_len`, in order: a run joins the current batch while the sum
+/// stays within the limit and starts the next one otherwise. A run longer than
+/// the limit is a batch of its own, so no batch exceeds `max_batch_len` or its
+/// one run's length, whichever is larger.
+fn reservation_batches(runs: &[(u64, u64)], max_batch_len: u64) -> Vec<std::ops::Range<usize>> {
+    let mut batches = Vec::new();
+    let mut first = 0;
+    let mut sum: u64 = 0;
+    for (i, (start, end)) in runs.iter().enumerate() {
+        let len = end.saturating_sub(*start);
+        if i > first && sum.saturating_add(len) > max_batch_len {
+            batches.push(first..i);
+            first = i;
+            sum = 0;
+        }
+        sum = sum.saturating_add(len);
+    }
+    if first < runs.len() {
+        batches.push(first..runs.len());
+    }
+    batches
 }
 
 /// Fetches and decodes one segment at a time: suffix-GET the footer, verify
@@ -1744,6 +1768,17 @@ impl SegmentFetcher {
     /// [`Self::max_run_len`]; a needed range longer than that is fetched whole
     /// in one GET. When the cap blocks a bridge the fetch can issue more than
     /// `max_runs` GETs ([`bound_runs_capped`] states the worst case).
+    ///
+    /// The runs are reserved and fetched in [`reservation_batches`] of at most
+    /// [`Self::max_run_len`] bytes (or one longer run alone), one batch after
+    /// another; the runs inside a batch are fetched concurrently. A batch's
+    /// reservation is released once its bytes are in `regions` and before the
+    /// next batch reserves, and the last batch's reservation is handed to
+    /// `regions`, so this call never holds more than one batch reserved: at
+    /// most `max(max_run_len, longest run)` bytes. What is resident at the
+    /// call's peak is every run it fetched, since `regions` keeps them all for
+    /// the caller; only the last batch of them stays reserved. Batching changes
+    /// when bytes are reserved, not which GETs are issued or what they move.
     #[allow(clippy::too_many_arguments)]
     async fn ensure_ranges(
         &self,
@@ -1774,63 +1809,69 @@ impl SegmentFetcher {
         if missing.is_empty() {
             return Ok(GetCost::default());
         }
-        // Fetch the coalesced ranges concurrently rather than one await at a
-        // time: a multi-page selection over a large segment
-        // used to pay one round trip per coalesced range in series. The
-        // shared semaphore inside `guarded_get` bounds the actual in-flight
-        // GETs; `join_all` preserves input order, so the resulting
-        // `regions` insert order is identical to the old sequential loop.
         let max_run_len = self.max_run_len();
         let runs = bound_runs_capped(
             coalesce_ranges_capped(missing, self.coalesce_gap, max_run_len),
             max_runs,
             max_run_len,
         );
-        // Reserve the memory the coalesced runs will materialize before the
-        // `join_all` issues a single GET (ADR-1170 decision 2): a refusal
-        // fails the whole fetch typed, with zero GETs issued, never a smaller
-        // fetch. The guard is owned by `regions`, so it lives exactly as long
-        // as the bytes it accounts for and releases on their drop, never
-        // because the GETs completed.
-        let reserved: u64 = runs
-            .iter()
-            .map(|(start, end)| end.saturating_sub(*start))
-            .fold(0u64, u64::saturating_add);
-        let mut reservation = self.reserve_fetch(reserved)?;
-        if self.cache.is_some() {
-            // Every run below is a `GetRange::Range`, so `guarded_get` routes
-            // all of them through `cached_get` when a cache is configured: the
-            // bytes this reservation covers land in the cache's own ledger too,
-            // on a hit, a late serve or a fetch alike (every `ReadOutcome` arm of
-            // `cached_get`), the same overlap `whole_object_bytes`'s arms
-            // mark, decided once here for the whole coalesced batch
-            // rather than per source.
-            reservation.mark_handed_off();
-        }
-        regions.hold_reservation(reservation);
-        let gets = join_all(runs.into_iter().map(|(start, end)| async move {
-            let (got, got_cost) = self
-                .guarded_get(
-                    seg_ref,
-                    tenant_hash,
-                    GetRange::Range(start, end),
-                    Some(suffix_etag),
-                    accounting,
-                )
-                .await?;
-            Ok::<(u64, Bytes, GetCost), FetchError>((start, got.data, got_cost))
-        }))
-        .await;
-        // Each coalesced GET reports its own store-vs-cache cost, so a range
-        // served from a warm cache adds nothing here while a store GET adds one
-        // request and its bytes (ADR-0044 decision 5). Summing the per-call
-        // costs never sweeps in a cache hit's served bytes.
         let mut cost = GetCost::default();
-        for got in gets {
-            let (start, data, got_cost) = got?;
-            cost.requests = cost.requests.saturating_add(got_cost.requests);
-            cost.bytes = cost.bytes.saturating_add(got_cost.bytes);
-            regions.insert(start, data);
+        let mut held: Option<ravel_memory::Reservation> = None;
+        for batch in reservation_batches(&runs, max_run_len) {
+            let batch = &runs[batch];
+            // The previous batch's bytes are already in `regions`; its
+            // reservation goes before this batch reserves.
+            drop(held.take());
+            // Reserve the memory this batch's runs will materialize before the
+            // `join_all` issues any of its GETs (ADR-1170 decision 2): a
+            // refusal fails the fetch typed with none of this batch's GETs
+            // issued, never a smaller fetch.
+            let reserved: u64 = batch
+                .iter()
+                .map(|(start, end)| end.saturating_sub(*start))
+                .fold(0u64, u64::saturating_add);
+            let mut reservation = self.reserve_fetch(reserved)?;
+            if self.cache.is_some() {
+                // Every run below is a `GetRange::Range`, so `guarded_get`
+                // routes all of them through `cached_get` when a cache is
+                // configured: the bytes this reservation covers land in the
+                // cache's own ledger too, on a hit, a late serve or a fetch
+                // alike (every `ReadOutcome` arm of `cached_get`), the same
+                // overlap `whole_object_bytes`'s arms mark, decided once here
+                // for the whole batch rather than per source.
+                reservation.mark_handed_off();
+            }
+            // The shared semaphore inside `guarded_get` bounds the actual
+            // in-flight GETs; `join_all` preserves input order, so `regions`
+            // is filled in run order.
+            let gets = join_all(batch.iter().map(|&(start, end)| async move {
+                let (got, got_cost) = self
+                    .guarded_get(
+                        seg_ref,
+                        tenant_hash,
+                        GetRange::Range(start, end),
+                        Some(suffix_etag),
+                        accounting,
+                    )
+                    .await?;
+                Ok::<(u64, Bytes, GetCost), FetchError>((start, got.data, got_cost))
+            }))
+            .await;
+            // Each coalesced GET reports its own store-vs-cache cost, so a
+            // range served from a warm cache adds nothing here while a store
+            // GET adds one request and its bytes (ADR-0044 decision 5).
+            // Summing the per-call costs never sweeps in a cache hit's served
+            // bytes.
+            for got in gets {
+                let (start, data, got_cost) = got?;
+                cost.requests = cost.requests.saturating_add(got_cost.requests);
+                cost.bytes = cost.bytes.saturating_add(got_cost.bytes);
+                regions.insert(start, data);
+            }
+            held = Some(reservation);
+        }
+        if let Some(reservation) = held {
+            regions.hold_reservation(reservation);
         }
         Ok(cost)
     }
@@ -6707,14 +6748,65 @@ mod tests {
     const CAPPED_RUN_LEN: u64 = CAPPED_LIMIT / CAPPED_PERMITS as u64;
 
     /// What one capped `ensure_ranges` call did: each GET's `(start, len)` in
-    /// offset order, the bytes reserved while the regions are held, and the
-    /// call's GET requests and wire bytes as recorded on its phase handle.
+    /// offset order, the bytes reserved while the regions are held, the most
+    /// the budget held reserved while any GET was in flight, and the call's GET
+    /// requests and wire bytes as recorded on its phase handle.
     #[derive(Debug)]
     struct CappedFetch {
         gets: Vec<(u64, u64)>,
         reserved: u64,
+        peak_reserved: u64,
         requests: u64,
         wire_bytes: u64,
+    }
+
+    /// A store that reads its budget's `reserved()` on every GET and keeps the
+    /// largest reading. `ensure_ranges` reserves a batch before issuing any of
+    /// its GETs and releases it only after all of them return, so the largest
+    /// reading is the largest reservation the call held.
+    struct PeakReservedStore {
+        inner: MemoryStore,
+        budget: Arc<ravel_memory::MemoryBudget>,
+        peak: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for PeakReservedStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.peak
+                .fetch_max(self.budget.reserved(), std::sync::atomic::Ordering::SeqCst);
+            self.inner.get(key, range).await
+        }
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
     }
 
     /// Runs `ensure_ranges` for `needed` on the many-run segment under a
@@ -6725,19 +6817,36 @@ mod tests {
         coalesce_gap: u64,
         max_runs: usize,
     ) -> Result<CappedFetch, FetchError> {
+        capped_ensure_ranges_under(needed, coalesce_gap, max_runs, CAPPED_LIMIT, CAPPED_PERMITS)
+            .await
+    }
+
+    /// [`capped_ensure_ranges`] under a `limit`-byte budget and `permits` GET
+    /// permits, whose quotient must still be [`CAPPED_RUN_LEN`].
+    async fn capped_ensure_ranges_under(
+        needed: &[(u64, u64)],
+        coalesce_gap: u64,
+        max_runs: usize,
+        limit: u64,
+        permits: usize,
+    ) -> Result<CappedFetch, FetchError> {
         let (bytes, tenant_hash, seg_ref, _) = many_run_segment();
-        let store = Arc::new(MemoryStore::new());
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let store = Arc::new(PeakReservedStore {
+            inner: MemoryStore::new(),
+            budget: budget.clone(),
+            peak: std::sync::atomic::AtomicU64::new(0),
+        });
         store
             .put(&seg_ref.data_object_key, bytes, PutOptions::default())
             .await
             .expect("put segment object");
-        let backend: Arc<dyn ObjectStoreBackend> = store;
-        let budget = Arc::new(ravel_memory::MemoryBudget::new(CAPPED_LIMIT));
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
         let fetcher = SegmentFetcher::new(backend)
             .with_whole_object_threshold(0)
             .with_suffix_len(16)
             .with_coalesce_gap(coalesce_gap)
-            .with_max_concurrent_gets(CAPPED_PERMITS)
+            .with_max_concurrent_gets(permits)
             .with_memory_budget(budget.clone())
             .with_min_run_len(1);
         assert_eq!(fetcher.max_run_len(), CAPPED_RUN_LEN);
@@ -6775,6 +6884,7 @@ mod tests {
         Ok(CappedFetch {
             gets,
             reserved: budget.reserved(),
+            peak_reserved: store.peak.load(std::sync::atomic::Ordering::SeqCst),
             requests: snapshot.s3_requests(AccountedOp::Get),
             wire_bytes: snapshot.s3_bytes(AccountedOp::Get),
         })
@@ -6818,7 +6928,10 @@ mod tests {
         let largest = fetched.gets.iter().map(|g| g.1).max();
         assert_eq!(largest, Some(80));
         assert!(largest <= Some(CAPPED_RUN_LEN));
-        assert_eq!(fetched.reserved, 320);
+        // Two 80-byte runs pass the 100-byte cap, so each is its own batch and
+        // the regions keep only the last one reserved.
+        assert_eq!(fetched.reserved, 80);
+        assert_eq!(fetched.peak_reserved, 80);
         assert_eq!(fetched.requests, 4);
         assert_eq!(fetched.wire_bytes, 320);
     }
@@ -6841,7 +6954,10 @@ mod tests {
         assert!(fetched.gets.iter().all(|g| g.1 <= CAPPED_RUN_LEN));
         let span = 464;
         assert!(fetched.requests <= 2 * span / CAPPED_RUN_LEN + 1);
-        assert_eq!(fetched.reserved, 320);
+        // Two 80-byte runs pass the 100-byte cap, so each is its own batch and
+        // the regions keep only the last one reserved.
+        assert_eq!(fetched.reserved, 80);
+        assert_eq!(fetched.peak_reserved, 80);
         assert_eq!(fetched.wire_bytes, 320);
     }
 
@@ -6863,8 +6979,87 @@ mod tests {
             fetched.gets,
             vec![(0, 200), (200, 16), (300, 10), (400, 120)]
         );
-        assert_eq!(fetched.reserved, 346);
+        // Batches (0,200), then (200,216) with (300,310), then (400,520): the
+        // long range alone is the peak, the last batch is what stays reserved.
+        assert_eq!(fetched.reserved, 120);
+        assert_eq!(fetched.peak_reserved, 200);
         assert_eq!(fetched.wire_bytes, 346);
+    }
+
+    /// Five 90-byte needed ranges, 10 bytes apart: at a zero coalesce gap each
+    /// is its own run, every run under the 100-byte cap, 450 bytes in total.
+    fn five_short_runs() -> Vec<(u64, u64)> {
+        (0..5).map(|i| (100 * i, 100 * i + 90)).collect()
+    }
+
+    /// The second half of issue #3818: runs that are each under the cap can
+    /// still sum past the budget. The call's 450 bytes exceed the 400-byte
+    /// budget, yet it succeeds, because it reserves one batch of at most
+    /// `max_run_len` bytes at a time.
+    ///
+    /// FLIP: reserving the summed runs once (round one's `ensure_ranges`)
+    /// fails the `expect` with `FetchMemoryExhausted { requested: 450, .. }`.
+    /// Batching by run count instead of bytes (four runs, one per GET permit)
+    /// fits the budget but holds 360 bytes at once, and the `peak_reserved`
+    /// bound fails with 360 against 190.
+    #[tokio::test]
+    async fn one_call_never_reserves_more_than_one_batch() {
+        let needed = five_short_runs();
+        let fetched = capped_ensure_ranges(&needed, 0, usize::MAX)
+            .await
+            .expect("runs that each fit the per-GET share are fetched");
+        assert_eq!(fetched.wire_bytes, 450);
+        assert!(
+            fetched.wire_bytes > CAPPED_LIMIT,
+            "the call needs more than the whole budget"
+        );
+        let largest_needed = needed.iter().map(|r| r.1 - r.0).max().unwrap_or(0);
+        assert!(
+            fetched.peak_reserved <= CAPPED_RUN_LEN + largest_needed,
+            "peak reservation {} passes max_run_len {CAPPED_RUN_LEN} plus the largest \
+             needed range {largest_needed}",
+            fetched.peak_reserved
+        );
+        // No run here is longer than the cap, so the tighter bound holds too.
+        assert_eq!(fetched.peak_reserved, 90);
+        assert_eq!(fetched.reserved, 90);
+    }
+
+    /// Batching moves when bytes are reserved, not what is fetched: the same
+    /// call under a budget that admits its summed runs (4000 bytes over 40
+    /// permits, the same 100-byte `max_run_len`), where round one's single
+    /// reservation succeeds, issues the same GETs and moves the same wire bytes,
+    /// each GET counted once on the phase handle. The roomy call runs first so
+    /// its figures are checked against round one's code as well, where the
+    /// tight call is refused.
+    #[tokio::test]
+    async fn batching_keeps_the_gets_and_wire_bytes() {
+        let needed = five_short_runs();
+        let expected: Vec<(u64, u64)> = needed.iter().map(|r| (r.0, r.1 - r.0)).collect();
+        let roomy = capped_ensure_ranges_under(&needed, 0, usize::MAX, 4_000, 40)
+            .await
+            .expect("roomy budget");
+        assert_eq!(roomy.gets, expected);
+        assert_eq!(roomy.requests, 5);
+        assert_eq!(roomy.wire_bytes, 450);
+        let tight = capped_ensure_ranges(&needed, 0, usize::MAX)
+            .await
+            .expect("tight budget");
+        assert_eq!(tight.gets, roomy.gets);
+        assert_eq!(tight.requests, roomy.requests);
+        assert_eq!(tight.wire_bytes, roomy.wire_bytes);
+    }
+
+    #[test]
+    fn reservation_batches_split_by_bytes() {
+        let runs = [(0, 40), (50, 90), (100, 120), (200, 450), (500, 510)];
+        assert_eq!(
+            reservation_batches(&runs, 100),
+            vec![0..3, 3..4, 4..5],
+            "40 + 40 + 20 fills the first batch, the 250-byte run is alone"
+        );
+        assert_eq!(reservation_batches(&runs, u64::MAX), vec![0..5]);
+        assert!(reservation_batches(&[], 100).is_empty());
     }
 
     /// An L0 segment of 16 scalar series `s00`..`s15` and 16 histogram series
