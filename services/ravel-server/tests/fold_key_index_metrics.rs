@@ -13,8 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ravel_catalog::{
-    DeclaredColumnType, DeclaredTypedColumn, StorageLayoutWrite, TenantConfig,
-    TenantLifecycleState,
+    DeclaredColumnType, DeclaredTypedColumn, StorageLayoutWrite, TenantConfig, TenantLifecycleState,
 };
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
@@ -280,7 +279,7 @@ async fn a_leaf_building_fold_renders_the_key_index_build_families() {
         ),
         (
             "ravel_catalog_fold_key_index_build_passes_total",
-            "Passes of the fold's key-index leaf build over disjoint key8 ranges: one per (part, field) within the pair budget, ceil(pairs / budget) above it.",
+            "Passes of the fold's key-index leaf build over disjoint key8 ranges: one per re-encoded part whose pairs fit the pair budget, one per key8 range above it.",
             1,
         ),
         (

@@ -382,7 +382,9 @@ flowchart LR
     whose decompressed body would exceed the ceiling is sliced by key
     range, one leaf per slice, so a lookup opens exactly one leaf per
     (part, field). The build ships off by default behind a switch, for the
-    cost the leaf build switch amendment below sets out.
+    cost the leaf build switch amendment below sets out; the tail's build
+    carries its previous leaves and runs under a pair budget (see the
+    incremental tail build amendment below).
   - **Lifecycle.** `sweep_unreferenced_catalog_objects` names
     `parts[].key_index[].key` in its reference set in the same change as
     the first leaf writer (ADR-0849 section 1a). With the switch off, a
@@ -982,10 +984,12 @@ It is off because of what the build costs on the tail. The fold re-encodes
 the tail part on every fold that advances the watermark, and a leaf binds
 the part's exact `part_blake3`, so the tail's leaves are rebuilt on each
 such fold from the section of every entry in the tail, not only the new
-ones. A tenant under the seal threshold stays one tail part for good, so
+ones (the incremental tail build amendment below reads the new ones only).
+A tenant under the seal threshold stays one tail part for good, so
 it pays that rebuild on every advancing fold for as long as it exists. The
 build holds every (key8, entry ordinal) pair of the part in memory at
-once, so memory grows with the part, and the reads of every part a fold
+once (the incremental tail build amendment below bounds that by a pair
+budget), so memory grows with the part, and the reads of every part a fold
 re-encodes are kept for the whole fold so a lost HEAD CAS does not repeat
 them. A fold that rebuilds HEAD re-encodes every part, so in that case
 the kept reads cover the whole (tenant, signal) at once.
@@ -1011,7 +1015,8 @@ decided after T12 measures: an incremental tail build, smaller tail parts
 through partitioning, or a per-(part, field) budget. The incremental merge
 decision 6 left to the implementing task "if measured necessary" is
 therefore known to be necessary, in one of those forms, before the switch
-defaults on.
+defaults on. ADR-3692 decision 5 chose the incremental tail build and the
+budget together (the incremental tail build amendment below).
 
 Refs: #2707, #2961, #2994
 
@@ -1475,3 +1480,65 @@ GET recorder; the real-S3 figure stays predicted until a lane measures it.
 | spans 1 h lookup, cold, folded, real S3: bytes | 2 leaf GETs per covering part plus the holders' reads | not measured | predicted |
 
 Refs: #3702, #3692, #3118
+
+## Amendment (issue #3704): the tail's leaf build is incremental and runs under a pair budget
+
+<!-- amendment-applies: sections="4. Tier 2: one `.kidx` leaf per (snapshot part, field, key slice), built at fold from the sections|Amendment (issue #2994): the leaf build ships off by default behind a switch" pointer="incremental tail build amendment" -->
+<!-- amendment-supersedes: phrase="from the section of every entry in the tail" pointer="incremental tail build amendment" -->
+<!-- amendment-supersedes: phrase="holds every (key8, entry ordinal) pair of the part in memory" pointer="incremental tail build amendment" -->
+
+ADR-3692 task T6 (decisions 5 and 7) answers the leaf build switch
+amendment's open question with two of its three forms, an incremental tail
+build and a budget, and leaves the switch off by default. The normative
+rules are in docs/catalog-and-mvcc.md, "Per-part key-index leaves", under
+"Incremental tail build" and "Pair budget". What changes here:
+
+- **The tail carries its previous leaves.** When a part the fold
+  re-encodes shares a data object with the previous HEAD's tail part, the
+  build GETs each of that tail's leaves once and verifies it against its
+  ref and the tail's tenant, signal, `part_blake3` and entry count, then
+  takes every entry those leaves cover for every field from them. Entries
+  are matched by data object key, never by ordinal, because a late entry
+  sorting into the middle of the part shifts every ordinal after it. Only
+  new entries and entries the previous leaves list as uncovered have their
+  sections read. The leaves are byte-identical to a build that reads every
+  section. A leaf that cannot be read or verified drops the carry for
+  that part, and every entry is read, as before this amendment. A sealed
+  part carried forward by reference keeps its refs and costs nothing.
+  The advancing fold's section reads fall from `2T` ranged GETs, `T` the
+  tail's entry count, to `2N` for `N` new entries, plus one leaf GET per
+  (field, slice) of the previous tail.
+- **The build runs under a pair budget.** `key_index_build_max_pairs`
+  (default 8,000,000, about 550 MB at the 68 B a pair the leaf build switch
+  amendment estimated) bounds the (entry, key8) pairs held for one part
+  across its fields. The first pass counts pairs as it reads and spills
+  nothing. Past the budget it keeps the lowest key8 range that fits, and
+  each later pass re-reads the sections and keeps the next range, so a
+  part of `P` pairs over distinct key8 values takes `ceil(P / budget)`
+  passes over disjoint ranges, with leaves identical to one pass. One
+  key8's pairs are never split, so a single key8 over the budget is held
+  whole. The carried pairs are outside the budget: they are held for the
+  whole build at 40 B plus 4 B per block each, so the carry adds at most
+  the previous tail's pair count at that size. The `--rebuild-key-index`
+  repair is unchanged: one pass, no budget, no carry.
+- **Reporting.** `FoldReport` gains `key_index_sections_read`,
+  `key_index_entries_carried`, `key_index_build_passes` and
+  `key_index_leaf_gets`, printed by `ravel-cli catalog fold` and exported
+  as `ravel_catalog_fold_key_index_*_total` counters on `/metrics`.
+
+The bands below are pinned in process against `MemoryStore` with an exact
+GET recorder; the real-S3 figures stay predicted until a lane measures them.
+
+| check | band | figure | source |
+|---|---|---|---|
+| advancing fold, 3 carried and 2 new entries: section GETs | 2 per new entry, none for a carried one | 4 ranged GETs, `key_index_sections_read` 2, `key_index_entries_carried` 3 | crates/ravel-catalog/src/fold.rs:13713 |
+| advancing fold: previous leaf GETs | 1 per (field, slice) of the previous tail | 1 | crates/ravel-catalog/src/fold.rs:13721 |
+| carried build against a from-scratch build | byte-identical leaves | identical | crates/ravel-catalog/src/fold.rs:13730 |
+| failed or corrupt previous leaf | every entry read, nothing carried | 5 sections, 10 GETs, 0 carried | crates/ravel-catalog/src/fold.rs:13771; crates/ravel-catalog/src/fold.rs:13806 |
+| 12 pairs under a budget of 5 | `ceil(12 / 5)` = 3 passes, slices tiling the key space | 3 passes, 9 section reads, same refs and bytes as one pass | crates/ravel-catalog/src/fold.rs:13901; crates/ravel-catalog/src/fold.rs:13908 |
+| sealed part carried by reference | 0 GETs | 0 | crates/ravel-catalog/src/fold.rs:13959 |
+| carried pair, in memory | 40 B plus 4 B per block | 40 B `KeyIndexLeafEntry` | crates/ravel-catalog/src/fold.rs:13858 |
+| advancing fold on a 250,000-entry tail, real S3 | about `2N` section GETs plus one leaf GET per slice | not measured | predicted |
+| build memory at the default budget | about 550 MB plus the carried pairs | not measured | predicted |
+
+Refs: #3704, #3692

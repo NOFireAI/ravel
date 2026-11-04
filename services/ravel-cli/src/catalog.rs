@@ -187,7 +187,7 @@ pub async fn fold_with_part_cap(
 
 /// [`fold_with_part_cap`], plus `--key-index-build-max-pairs`: sets
 /// [`CatalogConfig::key_index_build_max_pairs`] for this fold, the pair
-/// budget past which the leaf build of one (part, field) runs in several
+/// budget past which the leaf build of one part runs in several
 /// passes over disjoint key8 ranges (ADR-3692 decision 5).
 #[allow(clippy::too_many_arguments)]
 pub async fn fold_with_key_index_budget(

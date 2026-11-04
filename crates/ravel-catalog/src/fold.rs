@@ -1743,8 +1743,8 @@ async fn load_carried_key_index(
             .get(&leaf.key, GetRange::Full)
             .await
             .map_err(|e| format!("leaf {} GET: {e}", leaf.key))?;
-        let summary =
-            verify_key_index_leaf(&got.data, limits).map_err(|e| format!("leaf {}: {e}", leaf.key))?;
+        let summary = verify_key_index_leaf(&got.data, limits)
+            .map_err(|e| format!("leaf {}: {e}", leaf.key))?;
         let expected = SnapshotKeyIndexLeafRef {
             key: String::new(),
             ..leaf.clone()
@@ -1763,7 +1763,10 @@ async fn load_carried_key_index(
                 leaf.key
             ));
         }
-        by_field.entry(leaf.field.as_str()).or_default().push(summary);
+        by_field
+            .entry(leaf.field.as_str())
+            .or_default()
+            .push(summary);
     }
     let onto: Vec<Option<u64>> = tail
         .object_keys
@@ -1850,11 +1853,7 @@ impl OpenSlice {
             .fold(0u64, u64::saturating_add);
         let mut closed = None;
         if !self.entries.is_empty() && self.body.saturating_add(run_body) > max_body_bytes {
-            closed = Some((
-                self.key8_lo,
-                key8 - 1,
-                std::mem::take(&mut self.entries),
-            ));
+            closed = Some((self.key8_lo, key8 - 1, std::mem::take(&mut self.entries)));
             self.key8_lo = key8;
             self.body = 0;
         }
@@ -2173,11 +2172,15 @@ pub(crate) async fn build_part_key_index(
                             if key8 < field.lo || field.end.is_some_and(|end| key8 >= end) {
                                 continue;
                             }
-                            field.held.entry(run[0].0).or_default().push(KeyIndexLeafEntry {
-                                key8: run[0].0,
-                                entry_ordinal: ordinal,
-                                blocks: run.iter().map(|&(_, block)| block).collect(),
-                            });
+                            field
+                                .held
+                                .entry(run[0].0)
+                                .or_default()
+                                .push(KeyIndexLeafEntry {
+                                    key8: run[0].0,
+                                    entry_ordinal: ordinal,
+                                    blocks: run.iter().map(|&(_, block)| block).collect(),
+                                });
                             field.held_pairs += 1;
                             total_held += 1;
                         }
@@ -2338,39 +2341,41 @@ fn end_key_index_pass(
         return;
     }
     let uncovered: Vec<u64> = field.uncovered.iter().copied().collect();
-    let mut emit = |field: &mut FieldBuild, (key8_lo, key8_hi, entries): (u64, u64, Vec<KeyIndexLeafEntry>)| {
-        let encoded = encode_part_key_index_leaf(
-            &KeyIndexLeafInput {
-                tenant_hash: *tenant,
-                signal,
-                part_blake3,
-                part_entry_count,
-                field: name,
-                key_type: field.key_type,
-                key8_lo,
-                key8_hi,
-                uncovered_entry_ordinals: &uncovered,
-                entries: &entries,
-            },
-            limits,
-        );
-        match encoded {
-            Ok(leaf) => {
-                pending.push((name.to_string(), field.attempt, leaf));
-                true
+    let mut emit =
+        |field: &mut FieldBuild,
+         (key8_lo, key8_hi, entries): (u64, u64, Vec<KeyIndexLeafEntry>)| {
+            let encoded = encode_part_key_index_leaf(
+                &KeyIndexLeafInput {
+                    tenant_hash: *tenant,
+                    signal,
+                    part_blake3,
+                    part_entry_count,
+                    field: name,
+                    key_type: field.key_type,
+                    key8_lo,
+                    key8_hi,
+                    uncovered_entry_ordinals: &uncovered,
+                    entries: &entries,
+                },
+                limits,
+            );
+            match encoded {
+                Ok(leaf) => {
+                    pending.push((name.to_string(), field.attempt, leaf));
+                    true
+                }
+                Err(err) => {
+                    tracing::error!(
+                        tenant = %tenant.to_hex(),
+                        field = name,
+                        error = %err,
+                        "key-index leaf encode refused; the part is uncovered for the field"
+                    );
+                    field.give_up();
+                    false
+                }
             }
-            Err(err) => {
-                tracing::error!(
-                    tenant = %tenant.to_hex(),
-                    field = name,
-                    error = %err,
-                    "key-index leaf encode refused; the part is uncovered for the field"
-                );
-                field.give_up();
-                false
-            }
-        }
-    };
+        };
     if !field.stale {
         for run in runs {
             let run: Vec<KeyIndexLeafEntry> = run
@@ -13643,7 +13648,12 @@ pub(crate) mod tests {
     /// fold, inside [`KIDX_HOUR`]'s natural margin, so it re-lists the
     /// held-open hour and picks the late writers up.
     async fn advancing_fold(catalog: &Catalog) -> FoldReport {
-        fold_logs_sealing(catalog, now_inside(KIDX_HOUR) + 5 * 60 * 1_000_000_000, None).await
+        fold_logs_sealing(
+            catalog,
+            now_inside(KIDX_HOUR) + 5 * 60 * 1_000_000_000,
+            None,
+        )
+        .await
     }
 
     /// The incremental-build fixture: an operator-sealed fold over writers
@@ -13657,8 +13667,16 @@ pub(crate) mod tests {
         declare_user_id_key_index(inner.as_ref()).await;
         for seq in [10u64, 20, 30] {
             let own = seq as i64;
-            publish_user_id_logs(inner.as_ref(), seq, KIDX_HOUR, &[7, own, own + 1], 2, 0, true)
-                .await;
+            publish_user_id_logs(
+                inner.as_ref(),
+                seq,
+                KIDX_HOUR,
+                &[7, own, own + 1],
+                2,
+                0,
+                true,
+            )
+            .await;
         }
         let catalog = Catalog::new(inner.clone(), kidx_config()).expect("catalog");
         fold_logs_sealing(&catalog, now_inside(KIDX_HOUR), Some(KIDX_HOUR)).await;
@@ -13704,7 +13722,10 @@ pub(crate) mod tests {
         assert_eq!(report.key_index_build_passes, 1, "{report:?}");
         let previous_covered =
             first.parts[0].entry_count - first.parts[0].key_index[0].uncovered_count;
-        assert_eq!(report.key_index_entries_carried, previous_covered, "{report:?}");
+        assert_eq!(
+            report.key_index_entries_carried, previous_covered,
+            "{report:?}"
+        );
         assert_eq!(previous_covered, 3);
         assert_eq!(
             stored_leaves(inner.as_ref(), &second.parts[0]).await,
@@ -13829,6 +13850,14 @@ pub(crate) mod tests {
         (store, report, head)
     }
 
+    /// The basis of the carried-pair bound `CatalogConfig::key_index_build_max_pairs`
+    /// states: each carried (entry, key8) is one `KeyIndexLeafEntry` held for
+    /// the whole build, 40 B inline plus a `u32` per block on the heap.
+    #[test]
+    fn a_carried_pair_is_forty_bytes_plus_four_per_block() {
+        assert_eq!(std::mem::size_of::<KeyIndexLeafEntry>(), 40);
+    }
+
     /// ADR-3692 decision 5: a (part, field) over the pair budget is built in
     /// ceil(pairs / budget) passes over disjoint key8 ranges, each pass
     /// re-reading the sections, and the slices tile `[0, u64::MAX]` with no
@@ -13864,7 +13893,11 @@ pub(crate) mod tests {
         let pairs: u64 = part.key_index.iter().map(|leaf| leaf.entry_count).sum();
         assert_eq!(pairs, 12);
         assert_eq!(part.key_index.len(), 4, "slices of three under the ceiling");
-        assert_eq!(report.key_index_build_passes, pairs.div_ceil(5), "{report:?}");
+        assert_eq!(
+            report.key_index_build_passes,
+            pairs.div_ceil(5),
+            "{report:?}"
+        );
         assert_eq!(report.key_index_build_passes, 3);
         assert_eq!(report.key_index_sections_read, 3 * 3, "{report:?}");
         assert_eq!(data_object_ranged_gets(&store).len(), 3 * 2 * 3);
@@ -13927,7 +13960,10 @@ pub(crate) mod tests {
         assert_eq!(gets_containing(&store, ".kidx"), 0);
         assert_eq!(report.key_index_leaf_gets, 0, "{report:?}");
         assert_eq!(report.key_index_entries_carried, 0, "{report:?}");
-        assert_eq!(report.key_index_sections_read, 2, "the new tail's two entries");
+        assert_eq!(
+            report.key_index_sections_read, 2,
+            "the new tail's two entries"
+        );
         assert_eq!(report.key_index_build_passes, 1, "{report:?}");
     }
 

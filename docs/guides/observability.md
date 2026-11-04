@@ -931,6 +931,29 @@ that state, and neither is in the exposition:
   shape a compactor writes. Upgrade every `maintain` process before you read
   the pair as an answer about the whole fleet.
 
+### Key-index leaf build
+
+Four counters cover the work the fold's key-index leaf build does with
+`--fold-key-index-leaves` on, one per figure of the same name on the fold
+report. Each is labelled by `mode`, sums every successful fold in the
+process across tenants and signals, and is rendered under the same gate as
+the declared-column statistics pair above: only where a fold can run by
+either route. All four stay at zero with the switch off.
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `ravel_catalog_fold_key_index_sections_read_total` | `mode` | KEY_IDX sections the build read, one per entry per build pass. An entry carried from the previous tail's leaf reads none. |
+| `ravel_catalog_fold_key_index_entries_carried_total` | `mode` | Entries whose pairs the build carried from the previous tail's leaves, matched by data object key, instead of reading their sections. |
+| `ravel_catalog_fold_key_index_build_passes_total` | `mode` | Build passes over disjoint key8 ranges: one per re-encoded part whose pairs fit `--fold-key-index-build-max-pairs`, one per key8 range above it. |
+| `ravel_catalog_fold_key_index_leaf_gets_total` | `mode` | GETs of the previous tail's leaves issued to carry their pairs, one per leaf. |
+
+On a tenant whose tail advances every fold, sections read should track the
+new entries per fold, not the tail's size; a sections rate that climbs with
+the tail while the carried rate stays flat means the carry is falling back
+(a warn-level log names the reason). The
+[catalog spec](../catalog-and-mvcc.md#per-part-key-index-leaves-adr-2707)
+states the rules behind each figure.
+
 ### Tenancy adoption (`ravel_tenancy_v1_unkeyed_adoptions_total`)
 
 Labels: `mode`.

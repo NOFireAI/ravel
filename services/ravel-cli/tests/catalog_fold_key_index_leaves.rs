@@ -136,6 +136,16 @@ async fn the_key_index_leaves_flag_reaches_the_fold() {
     assert_eq!(off.key_index_ranged_gets, 0, "off: no KEY_IDX read");
     assert_eq!(off.key_index_leaves_written, 0, "off: no leaf");
     assert_eq!(off_leaves, 0, "off: no .kidx object");
+    assert_eq!(
+        (
+            off.key_index_sections_read,
+            off.key_index_entries_carried,
+            off.key_index_build_passes,
+            off.key_index_leaf_gets,
+        ),
+        (0, 0, 0, 0),
+        "off: no build figure moves"
+    );
 
     let (on, on_leaves) = fold_spans(true).await;
     assert!(on.key_index_ranged_gets > 0, "on: the section is read");
@@ -180,7 +190,10 @@ async fn the_pair_budget_reaches_the_fold_and_the_report_prints_the_build_figure
     let (budgeted, printed) = fold_spans_with_budget(1).await;
     assert_eq!(budgeted.key_index_build_passes, 3, "budget 1: three passes");
     assert_eq!(budgeted.key_index_sections_read, 3, "one read per pass");
-    assert_eq!(budgeted.key_index_entries_carried, 0, "a first fold carries none");
+    assert_eq!(
+        budgeted.key_index_entries_carried, 0,
+        "a first fold carries none"
+    );
     assert_eq!(budgeted.key_index_leaf_gets, 0, "no previous tail leaf");
     assert_eq!(budgeted.key_index_leaves_written, 1, "still one leaf");
 
@@ -193,7 +206,9 @@ async fn the_pair_budget_reaches_the_fold_and_the_report_prints_the_build_figure
         assert_eq!(printed.matches(line).count(), 1, "printed once: {line:?}");
     }
     assert_eq!(
-        one_pass_printed.matches("key_index_build_passes: 1\n").count(),
+        one_pass_printed
+            .matches("key_index_build_passes: 1\n")
+            .count(),
         1,
         "the default run prints its own pass count"
     );

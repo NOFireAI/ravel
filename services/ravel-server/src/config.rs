@@ -1283,19 +1283,19 @@ pub struct Cli {
     /// Builds per-part key-index leaves (ADR-2707 decision 4) in every fold
     /// this process runs, scheduled and on-demand. Off by default pending
     /// measurement, and no query reads the leaves yet. When on, every part a
-    /// fold re-encodes has each entry's KEY_IDX section read by ranged GET,
-    /// up to three GETs per entry, and the tail part is re-encoded on every
-    /// fold that advances the watermark, so each such fold reads the section
-    /// of every entry in the tail. Refused in `--mode gateway`, which runs no
-    /// fold.
+    /// fold re-encodes has each new entry's KEY_IDX section read by ranged
+    /// GET, up to three GETs per entry; the tail part, re-encoded on every
+    /// fold that advances the watermark, carries the entries its previous
+    /// leaves cover by one GET per leaf instead. Refused in `--mode gateway`,
+    /// which runs no fold.
     #[arg(long)]
     pub fold_key_index_leaves: bool,
 
     /// The most (entry, key8) pairs the key-index leaf build holds for one
-    /// (part, field) at a time (ADR-3692 decision 5). A field over it is
-    /// built in ceil(pairs / budget) passes over disjoint key8 ranges, each
-    /// pass re-reading the sections it needs, with leaves identical to a
-    /// one-pass build. The default of 8,000,000 is about 550 MB at 68 B a
+    /// part at a time, across its fields (ADR-3692 decision 5). A part over
+    /// it is built in about ceil(pairs / budget) passes over disjoint key8
+    /// ranges, each pass re-reading the sections it needs, with leaves
+    /// identical to a one-pass build. The default of 8,000,000 is about 550 MB at 68 B a
     /// pair. At least 1. Read only when `--fold-key-index-leaves` is on;
     /// refused in `--mode gateway`, which runs no fold.
     #[arg(long, default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,

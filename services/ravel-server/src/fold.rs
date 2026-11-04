@@ -72,7 +72,7 @@ pub struct FoldTaskConfig {
     /// [`crate::query::build_catalog_for_server`] maps it onto
     /// `CatalogConfig::build_key_index_leaves`. Default `false`.
     pub build_key_index_leaves: bool,
-    /// The leaf build's pair budget per (part, field)
+    /// The leaf build's pair budget per part, across its fields
     /// (`--fold-key-index-build-max-pairs`, ADR-3692 decision 5), mapped onto
     /// `CatalogConfig::key_index_build_max_pairs` by
     /// [`crate::query::build_catalog_for_server`]. Default

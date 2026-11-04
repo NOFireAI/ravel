@@ -1960,6 +1960,29 @@ that the flush writes after the ingest process reads the new record. An
 object written before keeps its own field list, and
 [`rlog inspect`](../inspecting-data.md#rlog-inspect) prints it.
 
+### Key-index leaf build budget
+
+With `--fold-key-index-leaves` on, the fold builds per-part key-index
+leaves from the KEY_IDX sections. The tail part is re-encoded on every fold
+that advances the watermark, and its build takes the entries the previous
+tail's leaves already cover from those leaves, one GET per leaf, and reads
+the sections of the new entries only.
+
+`--fold-key-index-build-max-pairs N` (ravel-server) and
+`--key-index-build-max-pairs N` (`ravel-cli catalog fold`, beside
+`--key-index-leaves`) bound the (entry, key8) pairs the build holds for one
+part. The default is 8,000,000, about 550 MB at 68 B a pair, and the floor
+is 1. A part over the budget is built in passes over disjoint key8 ranges,
+each pass reading the sections it needs again, so a smaller budget trades
+memory for section reads; the leaves are the same either way. One key8's
+pairs are never split, and the pairs carried from the previous tail are
+held outside the budget, at about 40 B plus 4 B per block each.
+`--mode gateway` refuses the server flag, since it runs no fold. The
+[catalog spec](../../catalog-and-mvcc.md#per-part-key-index-leaves-adr-2707)
+states the pass rule, and the fold report and `/metrics` count the work in
+`key_index_sections_read`, `key_index_entries_carried`,
+`key_index_build_passes` and `key_index_leaf_gets`.
+
 ## Per-query budgets
 
 Eight flags bound what one query can spend. Unset, each resolves at startup:

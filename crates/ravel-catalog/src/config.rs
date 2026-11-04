@@ -400,7 +400,7 @@ pub const DEFAULT_SNAPSHOT_PART_MAX_ENTRIES: usize = 250_000;
 pub const DEFAULT_FOLD_BUCKET_CONCURRENCY: usize = 8;
 /// Default `key_index_build_max_pairs`: 8,000,000 (key8, block set) pairs,
 /// about 550 MB at the 68 B a pair ADR-2707's leaf build switch amendment
-/// measured (ADR-3692 decision 5).
+/// estimated (ADR-3692 decision 5).
 pub const DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS: u64 = 8_000_000;
 /// Default `fold_reconcile_window_hours`: how far back of the previous fold's
 /// watermark the post-fold reconcile pass re-lists commit buckets to catch a

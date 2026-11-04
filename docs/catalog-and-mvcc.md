@@ -1217,6 +1217,90 @@ footer and section GETs and the bytes they returned, also counted in
 no leaf covers) for the CAS attempt that published. All five are zero with
 the switch off.
 
+**Incremental tail build (ADR-3692 decision 5).** The tail part is
+re-encoded on every fold that advances the watermark, but most of its
+entries were in the previous HEAD's tail, whose leaves already hold their
+pairs. When a part the fold re-encodes shares a data object with the
+previous tail, the build GETs each of that tail's leaves, verifies it
+(the leaf's own checks, its ref, and its tenant, signal, part hash and
+part entry count) and takes each entry the leaves cover for every field
+from them, matched by data object key and never by ordinal, since the
+new part's ordinals shift wherever a late entry sorts in
+(`load_carried_key_index`, `crates/ravel-catalog/src/fold.rs`). Only the
+entries new to the part, and the entries the previous leaves listed as
+uncovered, have their sections read; the leaves are byte-identical to a
+build that read every section (test
+`advancing_fold_reads_sections_for_new_entries_only`: three carried
+entries, two late ones read, and the leaf equal to a from-scratch build).
+A previous leaf that cannot be read or does not verify drops the carry
+for that part and every entry's section is read
+(`a_failed_previous_leaf_get_falls_back_to_section_reads`,
+`a_corrupt_previous_leaf_falls_back_to_section_reads`), as does a section
+naming a field the tenant does not declare. A part carried forward by
+reference, a sealed part included, keeps its refs and costs no GET at all
+(`sealed_tail_carries_its_leaf_refs_without_a_build`,
+`a_part_carried_forward_keeps_its_key_index_refs`).
+
+**Pair budget (ADR-3692 decision 5).** `key_index_build_max_pairs`
+(default 8,000,000, about 550 MB at the 68 B a pair the leaf build switch
+amendment of ADR-2707 estimated from the code, not measured; `DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`,
+`crates/ravel-catalog/src/config.rs`) bounds the (entry, key8) pairs the
+build holds for one part, across its fields. The first pass counts pairs
+as it reads and spills nothing: once the held pairs pass the budget, the
+field holding most gives up its highest key8 run until the rest fit, and
+that key8 becomes the exclusive end of the pass's range. Each later pass
+re-reads the sections it needs and keeps the next range, so a part of `P`
+pairs over distinct key8 values takes `ceil(P / budget)` passes, and the
+slices tile the key space with no gap and no overlap, the slices and
+bytes of a one-pass build (`build_part_key_index`; test
+`pair_budget_builds_in_passes_with_identical_leaves`: 12 pairs under a
+budget of 5 build in 3 passes). One key8's pairs are never split across
+passes, so a single key8 holding more pairs than the budget is held
+whole. The budget does not bound the carried pairs, which are held for
+the whole build: one `KeyIndexLeafEntry` per carried (entry, key8), 40 B
+plus 4 B per block (`a_carried_pair_is_forty_bytes_plus_four_per_block`),
+so the carry adds at most the previous tail's own pair count at that
+size. The server sets it with `--fold-key-index-build-max-pairs` and
+`ravel-cli catalog fold` with `--key-index-build-max-pairs`; the
+`--rebuild-key-index` repair builds in one pass with no budget, since a
+part it visits has no previous leaf to carry and its reads are held per
+batch.
+
+The fold report carries four figures for this build, each also a
+`/metrics` counter in the `mode` label set the other fold counters use
+(`services/ravel-server/tests/fold_key_index_metrics.rs`):
+
+- `key_index_sections_read` (`ravel_catalog_fold_key_index_sections_read_total`):
+  KEY_IDX section reads the build issued, one per (entry, pass) whatever
+  GETs each cost, which `key_index_ranged_gets` counts. A carried entry
+  is not read. It is 2 for the two late entries of
+  `advancing_fold_reads_sections_for_new_entries_only` and 9 for three
+  entries over three passes in
+  `pair_budget_builds_in_passes_with_identical_leaves`.
+- `key_index_entries_carried` (`ravel_catalog_fold_key_index_entries_carried_total`):
+  entries whose pairs came from the previous tail's leaves instead of a
+  section read. It is 3 in `advancing_fold_reads_sections_for_new_entries_only`
+  and 0 whenever the carry was dropped
+  (`a_failed_previous_leaf_get_falls_back_to_section_reads`).
+- `key_index_build_passes` (`ravel_catalog_fold_key_index_build_passes_total`):
+  build passes summed over the re-encoded parts, one per part whose pairs
+  fit the budget and one per key8 range above it. A field a later pass
+  finds a new uncovered entry for is rebuilt once from the first range,
+  which adds its passes here. It is 3 under a budget of 5 and 1 under
+  `u64::MAX` in `pair_budget_builds_in_passes_with_identical_leaves`.
+- `key_index_leaf_gets` (`ravel_catalog_fold_key_index_leaf_gets_total`):
+  whole-object GETs of the previous tail's leaves, one per (field, slice),
+  also counted in `get_requests`. It is 1 in
+  `advancing_fold_reads_sections_for_new_entries_only` and 0 in
+  `sealed_tail_carries_its_leaf_refs_without_a_build`, where no
+  re-encoded part shares an object with the previous tail.
+
+All four are zero with the switch off (test
+`the_key_index_leaves_flag_reaches_the_fold`), and `ravel-cli catalog fold`
+prints each (test
+`the_pair_budget_reaches_the_fold_and_the_report_prints_the_build_figures`;
+both in `services/ravel-cli/tests/catalog_fold_key_index_leaves.rs`).
+
 When a compaction or erasure rewrite record lands, the fold re-encodes the
 part and rebuilds its leaves from the new entry set. An erasure rewrite
 therefore removes the subject's `key8` from the next leaf; the stale leaf is

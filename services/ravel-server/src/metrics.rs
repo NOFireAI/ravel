@@ -3653,7 +3653,7 @@ const FOLD_KEY_INDEX_FAMILIES: [(&str, &str); 4] = [
     ),
     (
         "ravel_catalog_fold_key_index_build_passes_total",
-        "Passes of the fold's key-index leaf build over disjoint key8 ranges: one per (part, field) within the pair budget, ceil(pairs / budget) above it.",
+        "Passes of the fold's key-index leaf build over disjoint key8 ranges: one per re-encoded part whose pairs fit the pair budget, one per key8 range above it.",
     ),
     (
         "ravel_catalog_fold_key_index_leaf_gets_total",
@@ -10059,7 +10059,8 @@ pub struct MetricsState {
     /// here.
     ///
     /// Gates the `ravel_catalog_fold_stamped_records_total` /
-    /// `ravel_catalog_fold_stamped_entries_total` pair. Both routes fold
+    /// `ravel_catalog_fold_stamped_entries_total` pair and the four
+    /// `ravel_catalog_fold_key_index_*_total` families. Both routes fold
     /// into the same process-global totals, so either one opens the gate and
     /// only a process with neither omits the pair. Each single-route gate
     /// gets a different config wrong: following the mode alone leaves

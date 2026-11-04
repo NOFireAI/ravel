@@ -2609,18 +2609,19 @@ enum CatalogCommand {
         writers_stopped: bool,
         /// Build per-part key-index leaves (ADR-2707 decision 4) in this
         /// fold. Off by default pending measurement, and no query reads the
-        /// leaves yet. When on, every part the fold re-encodes has each
+        /// leaves yet. When on, every part the fold re-encodes has each new
         /// entry's KEY_IDX section read by ranged GET, up to three GETs per
-        /// entry, and the tail part is re-encoded on every fold that advances
-        /// the watermark, so each such fold reads the section of every entry
-        /// in the tail. Applies to `--signal spans` and to a logs tenant that
+        /// entry; the tail part, re-encoded on every fold that advances the
+        /// watermark, carries the entries its previous leaves cover by one
+        /// GET per leaf instead. Applies to `--signal spans` and to a logs tenant that
         /// declares a key-index column or turns on trace-id indexing; other
         /// signals ignore it.
         #[arg(long)]
         key_index_leaves: bool,
         /// With `--key-index-leaves`, the most (entry, key8) pairs the leaf
-        /// build holds for one (part, field) at a time (ADR-3692 decision 5).
-        /// A field over it is built in ceil(pairs / budget) passes over
+        /// build holds for one part at a time, across its fields (ADR-3692
+        /// decision 5). A part over it is built in about ceil(pairs / budget)
+        /// passes over
         /// disjoint key8 ranges, each re-reading the sections it needs, with
         /// leaves identical to a one-pass build. The default of 8,000,000 is
         /// about 550 MB at 68 B a pair. At least 1.
