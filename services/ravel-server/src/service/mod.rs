@@ -357,6 +357,21 @@ impl QueryService {
         self
     }
 
+    /// This service, stamping `call` on every audit record it submits: its
+    /// language replaces the engine's (which moves to
+    /// `query.engine_language`), its id goes on as `query.id`, and its text,
+    /// when set, replaces the engine's. A transport that names the call
+    /// rather than the engine (MCP, ADR-1374 decision 3 item 6) sets it once
+    /// per service it builds; every other caller leaves the engine's own
+    /// language on the record.
+    pub fn with_audit_call(mut self, call: ravel_maintain::AuditCall) -> Self {
+        self.controls.audit_sink = Arc::new(ravel_maintain::AuditCallSink::new(
+            self.controls.audit_sink,
+            call,
+        ));
+        self
+    }
+
     /// The subject [`Self::with_audit_subject`] set, for a transport that
     /// submits its own audit events through [`Self::controls`].
     pub fn audit_subject(&self) -> Option<&AuditSubject> {

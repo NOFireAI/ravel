@@ -24,6 +24,12 @@ use super::{SERVED_TOOLS, ToolContext};
 /// listed.
 const ENABLED_SIGNALS: [&str; 3] = ["metrics", "logs", "traces"];
 
+/// The protocol revisions this build serves: the current one and the last
+/// legacy one. The one list both this tool's `protocol.revisions` and the
+/// server's revision check read, so the two cannot disagree.
+pub static SUPPORTED_REVISIONS: [ProtocolVersion; 2] =
+    [ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25];
+
 /// The two column names of the capability table.
 const CAPABILITY_COLUMN: &str = "capability";
 const VALUE_COLUMN: &str = "value";
@@ -71,10 +77,10 @@ fn capability_rows(ctx: &ToolContext<'_>) -> Vec<Row> {
         row(
             "protocol",
             json!({
-                "revisions": [
-                    ProtocolVersion::V_2026_07_28.as_str(),
-                    ProtocolVersion::V_2025_11_25.as_str(),
-                ],
+                "revisions": SUPPORTED_REVISIONS
+                    .iter()
+                    .map(ProtocolVersion::as_str)
+                    .collect::<Vec<_>>(),
                 "server_version": env!("CARGO_PKG_VERSION"),
             }),
         ),

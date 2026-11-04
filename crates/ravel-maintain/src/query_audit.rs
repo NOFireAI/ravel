@@ -68,6 +68,12 @@
 //! The record's `ts_ns` is the request timestamp (the handler's injected
 //! clock), and its severity reflects the status: `INFO` for `ok`, `ERROR` for
 //! `error`.
+//!
+//! A record submitted through an [`AuditCallSink`] (an MCP tool call,
+//! ADR-1374 decision 3 item 6) also carries `query.id`, the call's id, and
+//! `query.engine_language`, the engine's language, while its
+//! `query.language` names the call (`mcp:<tool>`). Every other record
+//! carries neither.
 
 use std::sync::Arc;
 
@@ -110,6 +116,11 @@ const ATTR_TEXT: &str = "query.text";
 pub const ATTR_PRINCIPAL_SUBJECT: &str = "query.principal.subject";
 /// `attrs` key holding where the subject came from, [`AuditSubject::source`].
 pub const ATTR_PRINCIPAL_SUBJECT_SOURCE: &str = "query.principal.subject_source";
+/// `attrs` key holding the id of the call a record belongs to, [`AuditCall::query_id`].
+pub const ATTR_QUERY_ID: &str = "query.id";
+/// `attrs` key holding the engine's own language on a record whose
+/// `query.language` names the calling surface instead, [`AuditCall::language`].
+pub const ATTR_ENGINE_LANGUAGE: &str = "query.engine_language";
 
 /// Resource-attr `record_type` value for the shared query-audit log stream.
 const STREAM_RECORD_TYPE: &str = "query_audit";
@@ -265,20 +276,16 @@ impl QueryAuditSink for RedactingAuditSink {
 }
 
 /// Replace `event`'s `query.text` attr with `redactor`'s form of it, picking
-/// the language from its `query.language` attr.
+/// the language from its `query.engine_language` attr when it has one and
+/// from its `query.language` attr otherwise, so an MCP call's `mcp:<tool>`
+/// text still goes through its engine's redactor.
 ///
 /// An event carrying no `query.text` is left untouched: a legal-hold or
 /// reshard record has no query text to redact, and neither reaches this sink
 /// today.
 fn redact_event_text(event: &mut AuditEvent, redactor: &dyn QueryTextRedactor) {
-    let language = event
-        .attrs
-        .iter()
-        .find(|(key, _)| key == ATTR_LANGUAGE)
-        .and_then(|(_, value)| match value {
-            AttrValue::Str(language) => Some(language.clone()),
-            _ => None,
-        })
+    let language = str_attr_of(event, ATTR_ENGINE_LANGUAGE)
+        .or_else(|| str_attr_of(event, ATTR_LANGUAGE))
         .unwrap_or_default();
     for (key, value) in event.attrs.iter_mut() {
         if key == ATTR_TEXT
@@ -286,6 +293,82 @@ fn redact_event_text(event: &mut AuditEvent, redactor: &dyn QueryTextRedactor) {
         {
             *text = redactor.redact(&language, text);
         }
+    }
+}
+
+fn str_attr_of(event: &AuditEvent, key: &str) -> Option<String> {
+    event
+        .attrs
+        .iter()
+        .find(|(name, _)| name == key)
+        .and_then(|(_, value)| match value {
+            AttrValue::Str(text) => Some(text.clone()),
+            _ => None,
+        })
+}
+
+/// The identity one call stamps on every query-audit record it causes
+/// (ADR-1374 decision 3 item 6): the language naming the call, the call's
+/// id, and, when the engine's own text does not say what the call asked,
+/// the text to record instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditCall {
+    /// Replaces `query.language`, e.g. `mcp:ravel_query_sql`.
+    pub language: String,
+    /// Recorded as `query.id`; every record of one call carries the same one.
+    pub query_id: String,
+    /// Replaces `query.text` when `Some`.
+    pub text: Option<String>,
+}
+
+impl AuditCall {
+    /// Rewrite `event` to carry this call's identity. The engine's language
+    /// moves to `query.engine_language`, so redaction and a reader can still
+    /// tell a SQL statement from a PromQL expression.
+    pub fn apply(&self, event: &mut AuditEvent) {
+        let engine = str_attr_of(event, ATTR_LANGUAGE).unwrap_or_default();
+        for (key, value) in event.attrs.iter_mut() {
+            if key == ATTR_LANGUAGE {
+                *value = AttrValue::Str(self.language.clone());
+            } else if key == ATTR_TEXT
+                && let Some(text) = &self.text
+            {
+                *value = AttrValue::Str(text.clone());
+            }
+        }
+        event.attrs.push((
+            ATTR_ENGINE_LANGUAGE.to_string(),
+            AttrValue::Str(engine.clone()),
+        ));
+        event.attrs.push((
+            ATTR_QUERY_ID.to_string(),
+            AttrValue::Str(self.query_id.clone()),
+        ));
+        if let Some(rest) = event.body.strip_prefix(engine.as_str()) {
+            event.body = format!("{}{rest}", self.language);
+        }
+    }
+}
+
+/// A sink that stamps one [`AuditCall`] on every event before `inner` sees
+/// it. Wrapped outside the process's [`RedactingAuditSink`], which reads the
+/// `query.engine_language` this adds.
+pub struct AuditCallSink {
+    inner: Arc<dyn QueryAuditSink>,
+    call: AuditCall,
+}
+
+impl AuditCallSink {
+    pub fn new(inner: Arc<dyn QueryAuditSink>, call: AuditCall) -> Self {
+        AuditCallSink { inner, call }
+    }
+}
+
+#[async_trait::async_trait]
+impl QueryAuditSink for AuditCallSink {
+    async fn submit(&self, mut event: AuditEvent) -> Result<()> {
+        self.call.apply(&mut event);
+        self.inner.submit(event).await
     }
 }
 
@@ -828,5 +911,84 @@ mod tests {
             check.is_empty(),
             "a query-audit record must never be mistaken for an active hold"
         );
+    }
+
+    /// A call's sink names the call in `query.language` and the body, adds
+    /// its id, keeps the engine's language beside it, and the redactor
+    /// behind it is still asked under the engine's language.
+    #[tokio::test]
+    async fn an_audit_call_sink_stamps_the_call_and_redacts_under_the_engine_language() {
+        let inner = Arc::new(RecordingSink::default());
+        let redactor = Arc::new(RecordingRedactor::default());
+        let redacting = AuditTextPolicy::Redacted(redactor.clone()).wrap(inner.clone());
+        let sink = AuditCallSink::new(
+            redacting,
+            AuditCall {
+                language: "mcp:ravel_query_sql".to_string(),
+                query_id: "call-1".to_string(),
+                text: None,
+            },
+        );
+
+        let tenant = TenantHash([14u8; 16]);
+        let event = query_audit_event(&tenant, 42, "SELECT 1", "sql", QueryStatus::Ok, None, 0, 42);
+        sink.submit(event).await.expect("submit");
+
+        assert_eq!(
+            redactor.seen.lock().unwrap().clone(),
+            vec![("sql".to_string(), "SELECT 1".to_string())]
+        );
+        let events = inner.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(
+            str_attr_of(event, ATTR_LANGUAGE).as_deref(),
+            Some("mcp:ravel_query_sql")
+        );
+        assert_eq!(
+            str_attr_of(event, ATTR_ENGINE_LANGUAGE).as_deref(),
+            Some("sql")
+        );
+        assert_eq!(str_attr_of(event, ATTR_QUERY_ID).as_deref(), Some("call-1"));
+        assert_eq!(
+            str_attr_of(event, ATTR_TEXT).as_deref(),
+            Some("redacted<sql>")
+        );
+        assert_eq!(event.body, "mcp:ravel_query_sql query ok");
+    }
+
+    /// A call's text replaces the engine's, and each attr appears once.
+    #[test]
+    fn an_audit_call_with_text_replaces_the_query_text() {
+        let tenant = TenantHash([15u8; 16]);
+        let mut event = query_audit_event(
+            &tenant,
+            42,
+            "",
+            "label_values",
+            QueryStatus::Ok,
+            None,
+            0,
+            42,
+        );
+        AuditCall {
+            language: "mcp:ravel_find_labels".to_string(),
+            query_id: "call-2".to_string(),
+            text: Some("{}".to_string()),
+        }
+        .apply(&mut event);
+        assert_eq!(str_attr_of(&event, ATTR_TEXT).as_deref(), Some("{}"));
+        for key in [
+            ATTR_LANGUAGE,
+            ATTR_ENGINE_LANGUAGE,
+            ATTR_QUERY_ID,
+            ATTR_TEXT,
+        ] {
+            assert_eq!(
+                event.attrs.iter().filter(|(name, _)| name == key).count(),
+                1,
+                "{key}"
+            );
+        }
     }
 }

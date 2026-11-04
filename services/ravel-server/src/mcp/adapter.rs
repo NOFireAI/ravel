@@ -235,6 +235,17 @@ impl ServerHandler for RavelMcp {
     ) -> Result<CallToolResponse, McpError> {
         let started = tokio::time::Instant::now();
         let (tenant_hash, subject) = tenant(&context)?;
+        // One id per query tool call, on its envelope and on every audit
+        // record its service calls write (ADR-1374 decision 3 item 6).
+        let query_id = uuid::Uuid::new_v4().to_string();
+        let is_agents = self.agents.is_some() && AGENTS_TOOLS.contains(&request.name.as_ref());
+        let stamp = |envelope: Envelope| {
+            if is_agents {
+                envelope
+            } else {
+                envelope.with_query_id(&query_id)
+            }
+        };
         let args = Value::Object(request.arguments.unwrap_or_default());
         let budgets = match requested_budgets(&args) {
             Ok(requested) => requested.clamp(&self.engine_config, &self.budget_config),
@@ -244,7 +255,7 @@ impl ServerHandler for RavelMcp {
             Err(message) => {
                 let default =
                     McpRequestBudgets::default().clamp(&self.engine_config, &self.budget_config);
-                return tool_result(&invalid_budget(message, &default));
+                return tool_result(&stamp(invalid_budget(message, &default)));
             }
         };
         let ctx = build_tool_context(
@@ -265,12 +276,11 @@ impl ServerHandler for RavelMcp {
         let backend =
             ServiceBackend::new(self.service.clone().with_audit_subject(subject), budgets)
                 .with_call_start(started)
-                .with_progress(progress);
+                .with_progress(progress)
+                .with_audit_call(&request.name, &query_id);
 
         let agents = match &self.agents {
-            Some(router) if AGENTS_TOOLS.contains(&request.name.as_ref()) => {
-                Some(AgentsRoute::new(router.clone(), &context))
-            }
+            Some(router) if is_agents => Some(AgentsRoute::new(router.clone(), &context)),
             _ => None,
         };
         let call = async {
@@ -297,7 +307,7 @@ impl ServerHandler for RavelMcp {
         };
 
         match dispatched {
-            Ok(envelope) => tool_result(&envelope),
+            Ok(envelope) => tool_result(&stamp(envelope)),
             // D4 reserves protocol errors for malformed JSON-RPC and for a
             // tool that cannot be routed. Both of these are the latter: a
             // name outside the catalog, and a catalog name whose body this
@@ -570,6 +580,7 @@ fn tool_result(envelope: &Envelope) -> Result<CallToolResponse, McpError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use ravel_mcp::budget::{McpBudgetConfig, McpRequestBudgets};
     use ravel_query::EngineConfig;
@@ -621,5 +632,57 @@ mod tests {
             ctx.protection_horizon_ns
         );
         assert_eq!(ctx.protection_horizon_ns, now_ns + configured_horizon_ns);
+    }
+
+    /// `ravel_capabilities` reports exactly the revisions the route accepts:
+    /// every reported revision passes the revision check, and the list is
+    /// the one the check and `supported_protocol_versions` read.
+    ///
+    /// FLIP: a hardcoded list in `capability_rows` with one entry changed
+    /// fails the equality, and its changed entry is refused by the check.
+    #[test]
+    fn capabilities_reports_the_revisions_the_route_accepts() {
+        let clock = FixedClock(1_700_000_000_000_000_000);
+        let key = CursorKey::from_process_secret([0x11u8; CURSOR_KEY_LEN]);
+        let budgets = McpRequestBudgets::default()
+            .clamp(&EngineConfig::default(), &McpBudgetConfig::default());
+        let ctx = build_tool_context(TenantHash([0x42u8; 16]), &clock, 0, budgets, &key);
+
+        let envelope = ravel_mcp::tools::capabilities::run(serde_json::json!({}), &ctx);
+        let value = serde_json::to_value(&envelope).expect("envelope serializes");
+        let reported: Vec<String> = value["data"]["rows"][0][1]["revisions"]
+            .as_array()
+            .expect("revisions is an array")
+            .iter()
+            .map(|revision| revision.as_str().expect("a string").to_string())
+            .collect();
+        let accepted: Vec<String> = auth::SUPPORTED_REVISIONS
+            .iter()
+            .map(|revision| revision.as_str().to_string())
+            .collect();
+        assert_eq!(reported, accepted);
+
+        let body = axum::body::Bytes::from_static(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ravel_capabilities"}}"#,
+        );
+        for revision in &reported {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "mcp-protocol-version",
+                HeaderValue::from_str(revision).expect("header value"),
+            );
+            headers.insert("mcp-method", HeaderValue::from_static("tools/call"));
+            headers.insert("mcp-name", HeaderValue::from_static("ravel_capabilities"));
+            assert!(
+                auth::check_standard_headers(&headers, &body).is_ok(),
+                "{revision} is reported but refused"
+            );
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "mcp-protocol-version",
+            HeaderValue::from_static("2025-06-18"),
+        );
+        assert!(auth::check_standard_headers(&headers, &body).is_err());
     }
 }

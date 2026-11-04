@@ -801,6 +801,21 @@ const _: () = assert!(
     "the empty-resolve warning must point at the ingest watermark field"
 );
 
+/// Index in [`IDENTITY_FIELDS`] of the field [`Envelope::with_query_id`] fills.
+const QUERY_ID_IDENTITY_INDEX: usize = 2;
+
+const _: () = assert!(
+    ascii_eq(IDENTITY_FIELDS[QUERY_ID_IDENTITY_INDEX], "ids.query_id"),
+    "with_query_id must remove the query id's own warning"
+);
+
+/// The serialized size of the not-reported warning for `ids.query_id`, which
+/// bounds the id [`Envelope::with_query_id`] puts in its place.
+const QUERY_ID_STAMP_BOUND: usize = ascii_pair_serialized_len(
+    IDENTITY_FIELDS[QUERY_ID_IDENTITY_INDEX],
+    IDENTITY_WARNING_SUFFIX,
+);
+
 /// Whether two ASCII strings are equal, for the const assertions above:
 /// `str` has no `const` equality on stable Rust.
 const fn ascii_eq(a: &str, b: &str) -> bool {
@@ -1584,6 +1599,29 @@ impl Envelope {
         } else {
             Status::Ok
         };
+        self
+    }
+
+    /// A finished envelope carrying `query_id`, the id the transport minted
+    /// for this call and put on its audit records (ADR-1374 decision 3 item
+    /// 6), with the `ids.query_id` not-reported warning [`finish`](Self::finish)
+    /// added removed. The other identity warnings stay.
+    ///
+    /// The id is bounded to [`QUERY_ID_STAMP_BOUND`], the serialized size of
+    /// the warning it replaces, so the byte cap `fit` held still holds: on a
+    /// success the id takes the warning's room, and on an error, where no
+    /// identity warning was added, it takes part of the unused
+    /// [`IDENTITY_WARNINGS_ALLOWANCE`].
+    pub fn with_query_id(mut self, query_id: &str) -> Envelope {
+        let warning = format!(
+            "{}{IDENTITY_WARNING_SUFFIX}",
+            IDENTITY_FIELDS[QUERY_ID_IDENTITY_INDEX]
+        );
+        self.warnings.retain(|entry| *entry != warning);
+        self.ids.query_id = query_id.to_string();
+        if bound_scalar(&mut self.ids.query_id, QUERY_ID_STAMP_BOUND) {
+            self.presentation.scalars_truncated += 1;
+        }
         self
     }
 }
@@ -3125,5 +3163,27 @@ mod tests {
         let fitted = row_capped(MAX_RESPONSE_BYTES_FLOOR as usize);
         assert!(fitted.presentation.bytes_cap_hit);
         assert_eq!(fitted.status, Status::Ok);
+    }
+
+    /// A stamped id removes only the query id's own warning, and a row-packed
+    /// envelope stays under its cap with the id in.
+    #[test]
+    fn with_query_id_fills_the_field_and_drops_only_its_warning() {
+        let id = "0b1e4f3a-8c2d-4d6e-9f10-2a3b4c5d6e7f";
+        let unstamped = row_capped(MAX_RESPONSE_BYTES_FLOOR as usize).finish(false);
+        let own = format!("ids.query_id{IDENTITY_WARNING_SUFFIX}");
+        assert!(unstamped.warnings.contains(&own));
+        assert_eq!(unstamped.warnings.len(), 4);
+        let finished = unstamped.clone().with_query_id(id);
+        assert_eq!(finished.ids.query_id, id);
+        let expected: Vec<String> = unstamped
+            .warnings
+            .iter()
+            .filter(|warning| **warning != own)
+            .cloned()
+            .collect();
+        assert_eq!(finished.warnings, expected);
+        assert!(serialized_len(&finished) <= MAX_RESPONSE_BYTES_FLOOR as usize);
+        assert_eq!(finished.presentation.scalars_truncated, 0);
     }
 }

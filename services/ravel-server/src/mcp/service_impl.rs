@@ -100,6 +100,7 @@ pub struct ServiceBackend {
     budgets: McpEffectiveBudgets,
     progress: Option<ProgressReporter>,
     call_deadline: Option<tokio::time::Instant>,
+    audit_call: Option<(String, String)>,
 }
 
 impl ServiceBackend {
@@ -112,6 +113,33 @@ impl ServiceBackend {
             budgets,
             progress: None,
             call_deadline: None,
+            audit_call: None,
+        }
+    }
+
+    /// Audit every service call this backend makes as one call of `tool`:
+    /// `query.language = mcp:<tool>` and `query.id = query_id` on each
+    /// record (ADR-1374 decision 3 item 6). A tool that makes two service
+    /// calls writes two records under the one id.
+    pub fn with_audit_call(mut self, tool: &str, query_id: &str) -> Self {
+        self.audit_call = Some((format!("mcp:{tool}"), query_id.to_string()));
+        self
+    }
+
+    /// The service the next call runs on, with this backend's audit call
+    /// stamped on it, and `text` replacing the engine's audit text when set.
+    fn audited(&self, text: Option<String>) -> QueryService {
+        match &self.audit_call {
+            Some((language, query_id)) => {
+                self.service
+                    .clone()
+                    .with_audit_call(ravel_maintain::AuditCall {
+                        language: language.clone(),
+                        query_id: query_id.clone(),
+                        text,
+                    })
+            }
+            None => self.service.clone(),
         }
     }
 
@@ -464,7 +492,7 @@ impl QueryBackend for ServiceBackend {
     ) -> Result<Envelope, Failure> {
         let request = &self.bounded(request, |request| &mut request.deadline)?;
         let outcome = self
-            .service
+            .audited(None)
             .promql_instant(tenant_hash, request)
             .await
             .map_err(failure)?;
@@ -488,7 +516,7 @@ impl QueryBackend for ServiceBackend {
     ) -> Result<Envelope, Failure> {
         let request = &self.bounded(request, |request| &mut request.deadline)?;
         let outcome = self
-            .service
+            .audited(None)
             .promql_range(tenant_hash, request)
             .await
             .map_err(failure)?;
@@ -519,7 +547,7 @@ impl QueryBackend for ServiceBackend {
     ) -> Result<Envelope, Failure> {
         let request = &self.bounded(request, |request| &mut request.deadline)?;
         let outcome = self
-            .service
+            .audited(Some(matcher_set_text(&request.selectors)))
             .labels(tenant_hash, request)
             .await
             .map_err(failure)?;
@@ -539,7 +567,7 @@ impl QueryBackend for ServiceBackend {
     ) -> Result<Envelope, Failure> {
         let request = &self.bounded(request, |request| &mut request.deadline)?;
         let outcome = self
-            .service
+            .audited(Some(matcher_set_text(&request.selectors)))
             .label_values(tenant_hash, request, name, include_log_metric_names)
             .await
             .map_err(failure)?;
@@ -561,7 +589,7 @@ impl QueryBackend for ServiceBackend {
     ) -> Result<Envelope, Failure> {
         let request = &self.bounded(request, |request| &mut request.deadline)?;
         let outcome = self
-            .service
+            .audited(Some(matcher_set_text(&request.selectors)))
             .series(tenant_hash, request)
             .await
             .map_err(failure)?;
@@ -589,7 +617,7 @@ impl QueryBackend for ServiceBackend {
         };
 
         let outcome = self
-            .service
+            .audited(None)
             .analytics(tenant_hash, &native)
             .await
             .map_err(failure)?;
@@ -646,7 +674,7 @@ impl QueryBackend for ServiceBackend {
         };
 
         let outcome = self
-            .service
+            .audited(None)
             .exemplars(tenant_hash, &native)
             .await
             .map_err(failure)?;
@@ -675,7 +703,7 @@ impl QueryBackend for ServiceBackend {
     ) -> Result<Draft, Failure> {
         let request = &self.bounded(request, |request| &mut request.deadline)?;
         let outcome = self
-            .service
+            .audited(None)
             .sql_execute_at(tenant_hash, request, resolve_at_ns)
             .await
             .map_err(failure)?;
@@ -731,7 +759,7 @@ impl QueryBackend for ServiceBackend {
             .trace_request(&lookup)
             .map_err(|error| failure(error.into()))?;
         let outcome = self
-            .service
+            .audited(None)
             .sql_execute(tenant_hash, &native)
             .await
             .map_err(failure)?;
@@ -748,7 +776,7 @@ impl QueryBackend for ServiceBackend {
     ) -> Result<ExplainOutcome, Failure> {
         let request = &self.bounded(request, |request| &mut request.deadline)?;
         let report = self
-            .service
+            .audited(None)
             .sql_explain(tenant_hash, request)
             .await
             .map_err(failure)?;
@@ -790,7 +818,7 @@ impl QueryBackend for ServiceBackend {
             }
         };
         let data = self
-            .service
+            .audited(None)
             .describe_data(
                 tenant_hash,
                 &DescribeDataRequest {
@@ -850,6 +878,26 @@ impl QueryBackend for ServiceBackend {
 
 /// Prometheus' lowercase spelling of a metric family's type, as
 /// `GET /api/v1/metadata` renders it.
+/// The matcher set a metadata call reads, as its audit text: each selector
+/// in the parser's canonical PromQL form, joined by `; ` (the separator the
+/// audit redactor splits on), and `{}` for no selector, which matches every
+/// series. A selector the parser refuses is recorded as given; the service
+/// call refuses it too.
+fn matcher_set_text(selectors: &[String]) -> String {
+    if selectors.is_empty() {
+        return "{}".to_string();
+    }
+    selectors
+        .iter()
+        .map(|selector| {
+            ravel_promql::complexity_guard::parse_guarded(selector)
+                .map(|expr| expr.to_string())
+                .unwrap_or_else(|_| selector.clone())
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn metric_kind_name(kind: MetricKind) -> &'static str {
     match kind {
         MetricKind::Counter => "counter",
@@ -983,6 +1031,18 @@ fn failure(error: ServiceError) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No selector is the whole matcher set `{}`; a selector is recorded in
+    /// the parser's canonical form, so spacing does not change the text.
+    #[test]
+    fn the_matcher_set_text_is_canonical_and_never_empty() {
+        assert_eq!(matcher_set_text(&[]), "{}");
+        assert_eq!(
+            matcher_set_text(&["m{ k = \"v\" }".to_string(), "{job=\"a\"}".to_string()]),
+            "m{k=\"v\"}; {job=\"a\"}"
+        );
+        assert_eq!(matcher_set_text(&["m{".to_string()]), "m{");
+    }
 
     /// The adapter's series cap is the HTTP route's: `MAX_SERIES` series
     /// pass, one more is `budget_exceeded` on the `series` counter with the
