@@ -242,7 +242,7 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Result<
         fitted.presentation.bytes_cap_hit |= cut.rows_omitted > 0 || cut.samples_cut > 0;
         Ok(fitted)
     };
-    let fitted = envelope.fit_with_cap_step_by(ctx.budgets.max_rows, &advice(plan.mode), fit)?;
+    let fitted = envelope.fit_with_cap_step_by(&ctx.budgets, &advice(plan.mode), fit)?;
     Ok(fitted.finish(false))
 }
 
@@ -1094,7 +1094,7 @@ mod tests {
         (samples, ts, values)
     }
 
-    /// 11,000 one-second steps, the most a range may have.
+    /// The action and detail of each next step of `envelope`.
     fn steps(envelope: &Envelope) -> Vec<(&str, &str)> {
         envelope
             .next_steps
@@ -1103,6 +1103,7 @@ mod tests {
             .collect()
     }
 
+    /// 11,000 one-second steps, the most a range may have.
     fn range_at_the_step_limit() -> Value {
         range_args(
             START_NS,
@@ -1208,6 +1209,87 @@ mod tests {
         assert_eq!(
             b["samples_omitted"],
             json!((11_000 - b_ts.len()).to_string())
+        );
+    }
+
+    /// Budgets resolved against an operator ceiling of 1 MiB on
+    /// `max_response_bytes`, with the caller asking for `requested` bytes.
+    fn under_a_1_mib_ceiling(requested: u64) -> crate::budget::McpEffectiveBudgets {
+        crate::budget::McpRequestBudgets {
+            max_response_bytes: Some(requested),
+            ..crate::budget::McpRequestBudgets::default()
+        }
+        .clamp(
+            &ravel_query::EngineConfig::default(),
+            &crate::budget::McpBudgetConfig {
+                max_response_bytes_ceiling: 1024 * 1024,
+            },
+        )
+    }
+
+    /// Four series of 11,000 samples, each about 400 KiB, so the byte cap
+    /// drops rows under a 512 KiB or a 1 MiB cap.
+    fn four_long_series() -> Envelope {
+        let mut rows = long_series("a", 11_000, wide);
+        rows.extend(long_series("b", 11_000, wide));
+        rows.extend(long_series("c", 11_000, wide));
+        rows.extend(long_series("d", 11_000, wide));
+        sample_rows(&rows)
+    }
+
+    /// With the operator's ceiling at 1 MiB and a caller asking for more,
+    /// `max_response_bytes` clamps to 1 MiB, which is that ceiling: the byte
+    /// cap dropping rows advises the tool's own smaller-rows step, never a
+    /// raise the clamp would undo.
+    ///
+    /// FLIP: judging the ceiling against the 4 MiB default instead advises
+    /// `raise_max_response_bytes` here.
+    #[test]
+    fn a_byte_cap_at_the_configured_ceiling_advises_smaller_rows() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets = under_a_1_mib_ceiling(64 * 1024 * 1024);
+        assert_eq!(ctx.budgets.max_response_bytes, 1024 * 1024);
+        let stub = answering(vec![Ok(four_long_series())]);
+
+        let envelope = block_on(run(range_at_the_step_limit(), &ctx, &stub));
+
+        assert_eq!(envelope.status, Status::OkBounded);
+        assert!(envelope.presentation.bytes_cap_hit);
+        assert!(envelope.presentation.rows_omitted > 0);
+        assert_eq!(
+            steps(&envelope),
+            [(
+                "widen_step",
+                "the byte cap dropped rows with max_response_bytes at its 1 MiB ceiling; widen \
+                 step or narrow time_range for fewer samples per series, or narrow the query \
+                 for fewer series"
+            )]
+        );
+    }
+
+    /// Below a configured 1 MiB ceiling, the byte cap dropping rows advises
+    /// raising `max_response_bytes` up to that ceiling, not the 4 MiB
+    /// default.
+    #[test]
+    fn a_byte_cap_below_the_configured_ceiling_names_it() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets = under_a_1_mib_ceiling(512 * 1024);
+        let stub = answering(vec![Ok(four_long_series())]);
+
+        let envelope = block_on(run(range_at_the_step_limit(), &ctx, &stub));
+
+        assert_eq!(envelope.status, Status::OkBounded);
+        assert!(envelope.presentation.rows_omitted > 0);
+        assert_eq!(
+            steps(&envelope),
+            [(
+                "raise_max_response_bytes",
+                "the byte cap dropped rows; widen step or narrow time_range for fewer samples \
+                 per series, or narrow the query for fewer series, or raise max_response_bytes \
+                 (up to 1 MiB)"
+            )]
         );
     }
 

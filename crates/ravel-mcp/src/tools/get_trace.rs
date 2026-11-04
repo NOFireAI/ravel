@@ -256,16 +256,14 @@ fn finish(
         WIDEN_STEP,
         "a parent is missing and may start outside time_range; widen time_range or drop it",
     ));
-    envelope.next_steps.push(ADVICE.widest(NOT_RETURNED));
+    envelope
+        .next_steps
+        .push(ADVICE.widest(NOT_RETURNED, &ctx.budgets));
     let cap_step_at = envelope.next_steps.len() - 1;
 
     let mut fitted = envelope.fit_row_capped(ctx.budgets.max_response_bytes, row_cap_omitted);
     fitted.data.row_count = produced;
-    let cut = CapCut::of(
-        &fitted.presentation,
-        fitted.data.rows.len(),
-        ctx.budgets.max_rows,
-    );
+    let cut = CapCut::of(&fitted.presentation, fitted.data.rows.len(), &ctx.budgets);
 
     let shown = &fitted.presentation;
     let complete = !shown.row_cap_hit
