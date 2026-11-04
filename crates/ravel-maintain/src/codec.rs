@@ -182,15 +182,15 @@ impl SegmentCodec for RsegCodec {
     /// Shares each series' label set across the inputs that carry it
     /// ([`crate::read::intern_catalog_labels`]), so the retained labels are
     /// one copy per distinct series rather than one per (input, series).
+    /// Charges nothing to the merge memory tracker:
+    /// [`crate::build::build_parts`] charges the retained catalogs and
+    /// releases them on every exit.
     fn admit_catalog(
-        config: &CompactorConfig,
+        _config: &CompactorConfig,
         state: &mut Self::LoadState,
         catalog: &mut Self::Catalog,
     ) {
-        let labels = crate::read::intern_catalog_labels(state, catalog);
-        if let Some(t) = config.merge_memory_tracker.as_ref() {
-            t.add_catalog_plan_bytes(catalog.plan_heap_bytes(), labels);
-        }
+        crate::read::intern_catalog_labels(state, catalog);
     }
 
     fn validate_rewrite_inputs(inputs: &[InputRecord]) -> Result<()> {
