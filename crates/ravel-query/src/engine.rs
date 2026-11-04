@@ -103,6 +103,13 @@ pub struct QueryStats {
     /// Upper-envelope cost estimate computed after snapshot resolution and
     /// before any page fetch (ADR-0044 decision 3).
     pub estimate: CostEstimate,
+    /// True when the query also read the log lane (a selector naming a log
+    /// metric, ADR-1103). `estimate` is computed over the metrics lane's
+    /// snapshot only, so the log lane's requests and bytes, which do land in
+    /// `accounting` and `phase_accounting`, are outside it and `estimate` is
+    /// then no upper envelope on the query's spend. Set in `prefetch` once the
+    /// log lane has resolved.
+    pub estimate_excludes_log_lane: bool,
     /// True when the query's coverage is partial: at least one federated
     /// remote cluster was skipped because it was unavailable and its
     /// `skip_unavailable` was set (ADR-0071). Always false for a
@@ -140,6 +147,7 @@ impl QueryStats {
             accounting: phase_accounting.pooled(),
             phase_accounting,
             estimate,
+            estimate_excludes_log_lane: false,
             partial: false,
             warnings: Vec::new(),
             io_shape,
@@ -159,6 +167,7 @@ impl Default for QueryStats {
             accounting: QueryAccountingSnapshot::default(),
             phase_accounting: PhaseAccountingSnapshot::default(),
             estimate: CostEstimate::new(0, 0, 0, 0, 0),
+            estimate_excludes_log_lane: false,
             partial: false,
             warnings: Vec::new(),
             io_shape: QueryIoShape::default(),
@@ -1780,6 +1789,7 @@ impl QueryEngine {
         stats.phase_accounting =
             combine_phase_accounting(&stats.phase_accounting, &log_accounting.snapshot());
         stats.accounting = stats.phase_accounting.pooled();
+        stats.estimate_excludes_log_lane = true;
 
         // Fold the log lane's own io_shape contribution into the metrics
         // lane's, mirroring the `combine_phase_accounting` fold above. The
@@ -6076,6 +6086,44 @@ mod tests {
             METRICS_LANE_REQUESTS + LOG_LANE_REQUESTS,
             "the combined-budget control must account the same combined resolve cost as the trip"
         );
+    }
+
+    /// `QueryStats::estimate` is computed over the metrics lane's snapshot
+    /// only, so a query that also reads the log lane must say its estimate
+    /// excludes that lane's spend, and a metrics-only query must not.
+    ///
+    /// FLIP: leaving the field false on the log lane in `prefetch` fails both
+    /// log queries.
+    #[tokio::test]
+    async fn estimate_excludes_log_lane_only_when_the_log_lane_is_read() {
+        let tenant_hash = ravel_types::TenantId::new("acme-log-lane-estimate").hash();
+        let now_ns = 60 * 1_000_000_000;
+        let t_ms = now_ns / 1_000_000;
+        let deadline = Duration::from_secs(30);
+
+        let (_value, _annotations, metrics_only) = empty_store_engine()
+            .instant_with_budgets(tenant_hash, "m", t_ms, &[], now_ns, deadline, None)
+            .await
+            .expect("a metrics-only query over an empty store succeeds");
+        assert!(
+            !metrics_only.estimate_excludes_log_lane,
+            "a metrics-only query reads no lane outside its estimate"
+        );
+
+        for query in [
+            r#"count_over_time(ravel_log_lines{job="x"}[1h])"#,
+            r#"m or count_over_time(ravel_log_lines{job="x"}[1h])"#,
+        ] {
+            let (_value, _annotations, stats) = empty_store_engine()
+                .instant_with_budgets(tenant_hash, query, t_ms, &[], now_ns, deadline, None)
+                .await
+                .expect("a log-lane query over an empty store succeeds");
+            assert!(
+                stats.estimate_excludes_log_lane,
+                "{query}: a query naming ravel_log_lines reads the log lane, which the \
+                 estimate does not cover"
+            );
+        }
     }
 
     /// Issue #529: the labels/series HTTP endpoints
