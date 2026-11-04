@@ -379,7 +379,7 @@ profile's declared range-evaluation grid (section E), band 4 becomes the
 per-type line accounting of section D, and section B adds band 6, the
 cross-row accepted-set digest. The 2026-10-27 amendment, section D, computes
 band 6 per payload class. The 2026-11-04 amendment fixes the first reference
-run's single regime as `steady-state` and moves the cold regime to M9.
+run's single regime as `steady-state` and moves the cold and warm regimes to M9.
 
 ## Lane boundary
 
@@ -1226,11 +1226,10 @@ restarts an engine or drops the host page cache before a statement. Calling
 its passes "warm" would misstate what each engine served from.
 
 The first reference measurement, R4 on #2821, was released as
-`metricsbench-r4-20261103`. Over its query phase:
+`metricsbench-r4-20261103`. Over its query phase (#940 comment 6625947090):
 - Ravel's fetch cache answered 749,928 of 1,906,834 lookups (39.3 %), and
   Ravel made 1,109,184 GETs reading 365.7 GB from S3;
-- Mimir's store-gateway made 25,037 `get_range` calls to S3 (#940 comment
-  6625947090).
+- Mimir's store-gateway made 25,037 `get_range` calls to S3.
 
 Neither engine was warm in the sense band 3 uses.
 
@@ -1240,21 +1239,37 @@ response half of decision 7. The report does not record them yet.
 
 Decision.
 1. The first reference run reports one regime, `steady-state`, recorded in
-   the provenance `config`. Each engine's cache state is disclosed beside
-   the results: Ravel's fetch-cache hit fraction and GETs from its
-   `/metrics` totals; Mimir's store-gateway S3 operations;
-   Prometheus's and VictoriaMetrics' local storage. Band 3's rule that cold
-   and warm are never compared applies between regimes, and this run has
-   one.
-2. A cold regime is milestone M9 (#3794). Its per-engine procedure (restart,
-   page-cache drop, WAL handling, statement ordering) is amended here, with
-   the owner's approval, before its first run.
-3. Per-query object-store cost comes from each Ravel response's
-   `data.stats`. The harness records it per entry and per pass in the
-   `--diagnostics` sidecar, never in `report.json`. Decision 9 still holds:
-   the run-level `/metrics` totals are published beside the sidecar, as
-   run totals only, never divided into per-query figures, and with decision
-   8's logical-call caveat.
+   the provenance `config`. It is neither cold nor warm in band 3's sense,
+   and is not presented as either.
+2. Each engine's cache state over the query phase is disclosed beside the
+   results, in the run's readout and release notes:
+   - Ravel's fetch-cache hits, misses and GETs are the difference between the
+     two `/metrics` scrapes `run.sh` already writes:
+     `ravel-metrics-at-query.txt` before the query step and
+     `ravel-metrics-before-folded-readback.txt` after `validate`.
+   - Mimir's store-gateway S3 operations come from the box's
+     `store-metrics.log`.
+   - Prometheus and VictoriaMetrics serve from local storage.
+
+   All of these files are published with the run. The disclosure is
+   descriptive and never a gate.
+3. Cold and warm regimes are both milestone M9 (#3794). Each regime's
+   per-engine procedure (restart, page-cache drop, WAL handling, priming,
+   statement ordering) is amended here, with the owner's approval, before
+   its first run. Band 3's rule that cold and warm are never compared
+   applies from then on.
+4. Per-query object-store cost comes from each Ravel response's
+   `data.stats`. The harness records it in the `--diagnostics` sidecar,
+   never in `report.json`.
+   - It is recorded for every repetition of every timed pass, with its
+     entry, pass and repetition index. Figures are never summed or pooled
+     across repetitions, so a repetition's cost sits beside that
+     repetition's own latency.
+   - Like the sidecar's ULP gaps, these figures are descriptive and never a
+     gate: no band in this ADR reads the sidecar.
+   - Decision 9 still holds: the run-level `/metrics` totals are published
+     beside the sidecar as run totals only, never divided into per-query
+     figures, and with decision 8's logical-call caveat.
 
 Rejected: a cold regime defined in a sentence. "Cold" is a restart for
 Ravel, a page-cache drop for Prometheus and VictoriaMetrics, and WAL
@@ -1262,8 +1277,9 @@ replay for Mimir. The host page cache is shared by every container, so an
 undefined cold pass would warm one engine while it chills another.
 
 Consequences.
-- #940's requirement for per-query cold and warm results is met by the
-  steady-state regime now, and by M9 for cold.
+- #940's requirement for per-query cold and warm results is not met by
+  the first reference run. It publishes steady-state only, and both
+  regimes are M9's (#3794).
 - Its requirement for S3 request and byte accounting is met by the sidecar,
   for Ravel. The comparators expose no per-query object-store figure, so
   their cost is reported as run totals only.
