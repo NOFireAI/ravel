@@ -332,19 +332,35 @@ async fn a_like_limit_scan_skips_the_verdict_and_a_topk_keeps_it() {
     let store = store_with(dense).await;
     let plain = run(&store, PLAIN_SQL).await;
     assert_eq!(plan_directory_reads(&plain), 0, "no verdict read");
-    let served = plain
+    let counters = plain
         .stats
         .decoded_cache
         .expect("decodedCache stats with a cache")
-        .counters
-        .deferred_served;
-    assert!(!served, "no verdict, so the deferred column is not served");
+        .counters;
+    assert!(
+        !counters.deferred_served,
+        "no verdict, so the deferred column is not served"
+    );
+    assert_eq!(
+        counters.deferred_set_estimate_bytes, None,
+        "no verdict, so no decoded-set estimate is reported"
+    );
     let c = c_values(&plain);
     assert_eq!(c.len(), 3, "exactly the limit: {c:?}");
     assert!(c.iter().all(|v| v.contains('x')), "{c:?}");
 
     let topk = run(&store, TOPK_SQL).await;
     assert_eq!(plan_directory_reads(&topk), OBJECTS, "the verdict reads");
+    assert!(
+        topk.stats
+            .decoded_cache
+            .as_ref()
+            .expect("decodedCache stats with a cache")
+            .counters
+            .deferred_set_estimate_bytes
+            .is_some(),
+        "the verdict reports its decoded-set estimate"
+    );
     assert_eq!(
         c_values(&topk),
         vec!["has-x-1001", "has-x-1004", "has-x-1007"],

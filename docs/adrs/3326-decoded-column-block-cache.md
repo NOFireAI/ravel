@@ -1706,13 +1706,12 @@ whose estimate is 10 segments' where a stop at the bare cap reads 11; over
 HTTP, `an_over_cap_fast_path_statement_reports_a_partial_estimate`). A scan
 that fits reads and sums every segment as before
 (`a_fitting_fast_path_verdict_reads_and_sums_every_segment`). A `LIMIT`
-with no `ORDER BY` still makes the verdict: the `LIKE` filter stays a
-residual above the scan (`filter_is_exact`,
+with no `ORDER BY` made the verdict until issue #3740: the `LIKE` filter
+stays a residual above the scan (`filter_is_exact`,
 `crates/ravel-sql/src/logs_pushdown.rs`), so DataFusion's limit pushdown
-stops at the filter and the scan never carries a fetch. Sparing such a scan
-the verdict is issue #3740.
-A scan under a filter with a fetch, with no TopK above it, now carries a
-non-truncating limit hint and skips the verdict
+stops at the filter and the scan never carries a fetch. Such a scan now
+carries a separate, non-truncating limit hint instead, and with no TopK
+above it skips the verdict and reports no `deferredSetEstimateBytes`
 (`a_like_limit_scan_skips_the_verdict_and_a_topk_keeps_it`).
 
 **When the estimate is wrong.** Answers do not depend on it, since a served
