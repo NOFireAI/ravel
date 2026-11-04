@@ -43,9 +43,11 @@
 use std::sync::Arc;
 
 use crate::fetcher::{ReadCache, gate_not_run};
+use crate::key_index_route::LeafRangeReader;
 use crate::phase_accounting::{PhaseAccounting, QueryPhase};
 use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use ravel_cache::{CacheKey, ReadOutcome, SingleFlightError};
 use ravel_catalog::SegmentRef;
 use ravel_codec::key_idx::{
@@ -54,6 +56,7 @@ use ravel_codec::key_idx::{
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_object_store::get_latency::InGetPhase;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
+use ravel_proto::catalog::v1::SnapshotKeyIndexLeafRef;
 use ravel_rspan::block::{DEFAULT_MAX_UNCOMP, DecodedBlock, read_block, read_block_projected};
 use ravel_rspan::footer::{SectionDesc, kind};
 use ravel_rspan::record::{
@@ -1515,7 +1518,31 @@ impl SpanSegmentFetcher {
         range: GetRange,
         accounting: &QueryAccounting,
     ) -> Result<Bytes, SpanFetchError> {
-        let key = &seg_ref.data_object_key;
+        self.read_object_extent(
+            &seg_ref.data_object_key,
+            seg_ref.content_hash,
+            tenant_hash,
+            offset,
+            len,
+            range,
+            accounting,
+        )
+        .await
+    }
+
+    /// [`Self::read_extent`] for any immutable object named by its key and
+    /// content hash: a data object, or a key-index leaf.
+    #[allow(clippy::too_many_arguments)]
+    async fn read_object_extent(
+        &self,
+        key: &str,
+        content_hash: [u8; 32],
+        tenant_hash: Option<TenantHash>,
+        offset: u64,
+        len: u64,
+        range: GetRange,
+        accounting: &QueryAccounting,
+    ) -> Result<Bytes, SpanFetchError> {
         // Reserve the extent's bytes before the GET (ADR-1170 decision 2): a
         // refusal fails typed with zero GETs. The guard travels with the
         // returned bytes, owned for the fetched buffer's lifetime rather than
@@ -1546,7 +1573,7 @@ impl SpanSegmentFetcher {
             return Ok(attach_reservation(got.data, reservation));
         };
 
-        let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, offset, len);
+        let cache_key = CacheKey::new(tenant_hash.0, content_hash, offset, len);
         // An exact range names the byte count it must return; a short answer
         // is refused inside the closure so the cache never admits it (the
         // logs fetcher's `check_extent_len` placement), and a later lookup of
@@ -2159,6 +2186,71 @@ fn build_span_row(block: &DecodedBlock, row: usize) -> Result<SpanRow, SpanSegEr
         record,
         service_name,
     })
+}
+
+/// The tier-2 router's [`LeafRangeReader`] for spans: each leaf range goes
+/// through the fetcher's ranged read, so it shares the read cache (keyed by
+/// the leaf's `blake3`), the GET limiter and the fetch reservation with the
+/// data reads, and a GET that reaches the store is timed under
+/// [`QueryPhase::KeyIndex`] and charged to the router's accounting handle.
+pub struct SpanLeafRangeReader<'a> {
+    fetcher: &'a SpanSegmentFetcher,
+    tenant_hash: TenantHash,
+}
+
+impl<'a> SpanLeafRangeReader<'a> {
+    pub fn new(fetcher: &'a SpanSegmentFetcher, tenant_hash: TenantHash) -> Self {
+        SpanLeafRangeReader {
+            fetcher,
+            tenant_hash,
+        }
+    }
+}
+
+impl LeafRangeReader for SpanLeafRangeReader<'_> {
+    fn read_range<'b>(
+        &'b self,
+        leaf: &'b SnapshotKeyIndexLeafRef,
+        range: std::ops::Range<u64>,
+        accounting: &'b QueryAccounting,
+    ) -> BoxFuture<'b, Result<Bytes, String>> {
+        Box::pin(async move {
+            let content_hash: [u8; 32] = leaf
+                .blake3
+                .as_slice()
+                .try_into()
+                .map_err(|_| format!("leaf {}: blake3 is not 32 bytes", leaf.key))?;
+            let len = range.end.saturating_sub(range.start);
+            if len == 0 || range.end > leaf.size {
+                return Err(format!(
+                    "leaf {}: range {range:?} outside {} bytes",
+                    leaf.key, leaf.size
+                ));
+            }
+            let bytes = self
+                .fetcher
+                .read_object_extent(
+                    &leaf.key,
+                    content_hash,
+                    Some(self.tenant_hash),
+                    range.start,
+                    len,
+                    GetRange::Range(range.start, range.end),
+                    accounting,
+                )
+                .in_get_phase(QueryPhase::KeyIndex.into())
+                .await
+                .map_err(|e| e.to_string())?;
+            if bytes.len() as u64 != len {
+                return Err(format!(
+                    "leaf {}: short read, {} bytes of {len}",
+                    leaf.key,
+                    bytes.len()
+                ));
+            }
+            Ok(bytes)
+        })
+    }
 }
 
 /// Drain a full [`BlockProjection::All`] scan into the row exit's

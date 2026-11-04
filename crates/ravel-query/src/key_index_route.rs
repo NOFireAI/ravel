@@ -22,6 +22,7 @@ use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -269,17 +270,157 @@ const ADR_CEILING: Ceiling = Ceiling {
     parts: KEY_INDEX_MAX_PROBED_PARTS,
 };
 
+/// The `outcome` label of `ravel_query_key_index_parts_total`: the six part
+/// outcomes of [`RouteFigures`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum KeyIndexPartOutcome {
+    Covered,
+    Uncovered,
+    BeyondCeiling,
+    Rejected,
+    ReservationRefused,
+    SkippedByBudget,
+}
+
+impl KeyIndexPartOutcome {
+    pub const ALL: [KeyIndexPartOutcome; 6] = [
+        KeyIndexPartOutcome::Covered,
+        KeyIndexPartOutcome::Uncovered,
+        KeyIndexPartOutcome::BeyondCeiling,
+        KeyIndexPartOutcome::Rejected,
+        KeyIndexPartOutcome::ReservationRefused,
+        KeyIndexPartOutcome::SkippedByBudget,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyIndexPartOutcome::Covered => "covered",
+            KeyIndexPartOutcome::Uncovered => "uncovered",
+            KeyIndexPartOutcome::BeyondCeiling => "beyond_ceiling",
+            KeyIndexPartOutcome::Rejected => "rejected",
+            KeyIndexPartOutcome::ReservationRefused => "reservation_refused",
+            KeyIndexPartOutcome::SkippedByBudget => "skipped_by_budget",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+impl RouteFigures {
+    /// This pass's count for `outcome`.
+    pub fn parts(&self, outcome: KeyIndexPartOutcome) -> u64 {
+        match outcome {
+            KeyIndexPartOutcome::Covered => self.parts_covered,
+            KeyIndexPartOutcome::Uncovered => self.parts_uncovered,
+            KeyIndexPartOutcome::BeyondCeiling => self.parts_beyond_ceiling,
+            KeyIndexPartOutcome::Rejected => self.leaves_rejected,
+            KeyIndexPartOutcome::ReservationRefused => self.reservations_refused,
+            KeyIndexPartOutcome::SkippedByBudget => self.skipped_by_budget,
+        }
+    }
+}
+
+/// The signals the router serves, as metric rows.
+const ROUTED_SIGNALS: [Signal; 2] = [Signal::Spans, Signal::Logs];
+
+/// Process totals behind `ravel_query_key_index_parts_total{signal,
+/// outcome}` and `ravel_query_key_index_leaf_gets_total{signal}`.
+struct RouteTotals {
+    parts: [[AtomicU64; 6]; ROUTED_SIGNALS.len()],
+    leaf_gets: [AtomicU64; ROUTED_SIGNALS.len()],
+}
+
+impl RouteTotals {
+    const fn new() -> Self {
+        RouteTotals {
+            parts: [const { [const { AtomicU64::new(0) }; 6] }; ROUTED_SIGNALS.len()],
+            leaf_gets: [const { AtomicU64::new(0) }; ROUTED_SIGNALS.len()],
+        }
+    }
+
+    fn row(signal: Signal) -> Option<usize> {
+        ROUTED_SIGNALS.iter().position(|s| *s == signal)
+    }
+
+    fn add_leaf_gets(&self, signal: Signal, gets: u64) {
+        if let Some(row) = Self::row(signal) {
+            self.leaf_gets[row].fetch_add(gets, Ordering::Relaxed);
+        }
+    }
+
+    fn add_parts(&self, signal: Signal, figures: &RouteFigures) {
+        if let Some(row) = Self::row(signal) {
+            for outcome in KeyIndexPartOutcome::ALL {
+                self.parts[row][outcome.index()]
+                    .fetch_add(figures.parts(outcome), Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn parts(&self, signal: Signal, outcome: KeyIndexPartOutcome) -> u64 {
+        Self::row(signal).map_or(0, |row| {
+            self.parts[row][outcome.index()].load(Ordering::Relaxed)
+        })
+    }
+
+    fn leaf_gets(&self, signal: Signal) -> u64 {
+        Self::row(signal).map_or(0, |row| self.leaf_gets[row].load(Ordering::Relaxed))
+    }
+}
+
+static ROUTE_TOTALS: RouteTotals = RouteTotals::new();
+
+/// The signals [`key_index_parts_total`] and [`key_index_leaf_gets_total`]
+/// carry rows for.
+pub fn key_index_routed_signals() -> &'static [Signal] {
+    &ROUTED_SIGNALS
+}
+
+/// Parts this process's routing passes counted under `outcome`, for
+/// `signal`, since start.
+pub fn key_index_parts_total(signal: Signal, outcome: KeyIndexPartOutcome) -> u64 {
+    ROUTE_TOTALS.parts(signal, outcome)
+}
+
+/// Leaf GETs this process's routing passes issued for `signal` since start,
+/// including those of a pass dropped before it finished.
+pub fn key_index_leaf_gets_total(signal: Signal) -> u64 {
+    ROUTE_TOTALS.leaf_gets(signal)
+}
+
 /// Routes every segment of `input.snapshot` for `input.key_set`. The routes
 /// are parallel to `snapshot.segments`. A leaf breach is the only
 /// statement-failing outcome besides a `parts`/`snapshot` mismatch; every
 /// other failure leaves the part [`SegmentRoute::Uncovered`] and counts it.
 pub async fn route(input: RouteInput<'_>) -> Result<(Vec<SegmentRoute>, RouteFigures), RouteError> {
-    route_under(input, ADR_CEILING).await
+    route_under(input, ADR_CEILING, &ROUTE_TOTALS).await
+}
+
+/// Owns the leaf reads' accounting for one pass and merges it into the
+/// caller's `keyIndex` handle when dropped, so a pass that errors, or whose
+/// future is dropped mid-probe, still charges every GET it issued.
+struct LeafCharge<'a> {
+    leaf: QueryAccounting,
+    into: &'a PhaseAccounting,
+    totals: &'a RouteTotals,
+    signal: Signal,
+}
+
+impl Drop for LeafCharge<'_> {
+    fn drop(&mut self) {
+        let leaf = self.leaf.snapshot();
+        self.into.key_index().merge_snapshot(&leaf);
+        self.totals
+            .add_leaf_gets(self.signal, leaf.s3_requests(AccountedOp::Get));
+    }
 }
 
 async fn route_under(
     input: RouteInput<'_>,
     ceiling: Ceiling,
+    totals: &RouteTotals,
 ) -> Result<(Vec<SegmentRoute>, RouteFigures), RouteError> {
     let segment_count = input.snapshot.segments.len();
     if input.parts.origin.len() != segment_count {
@@ -304,19 +445,19 @@ async fn route_under(
         ..RouteFigures::default()
     };
     // Leaf reads are charged here first, so the figures count leaf GETs
-    // only, and merged into the caller's `keyIndex` handle on every exit.
-    let leaf_accounting = QueryAccounting::new();
-    leaf_accounting.set_access_intent(input.accounting.key_index().access_intent());
-    let answered = route_parts(
-        &input,
-        ceiling,
-        &has_segment,
-        &leaf_accounting,
-        &mut figures,
-    )
-    .await;
-    let leaf = leaf_accounting.snapshot();
-    input.accounting.key_index().merge_snapshot(&leaf);
+    // only.
+    let charge = LeafCharge {
+        leaf: QueryAccounting::new(),
+        into: input.accounting,
+        totals,
+        signal: input.signal,
+    };
+    charge
+        .leaf
+        .set_access_intent(input.accounting.key_index().access_intent());
+    let answered = route_parts(&input, ceiling, &has_segment, &charge.leaf, &mut figures).await;
+    let leaf = charge.leaf.snapshot();
+    drop(charge);
     figures.leaf_get_requests = leaf.s3_requests(AccountedOp::Get);
     figures.leaf_wire_bytes = leaf.s3_bytes(AccountedOp::Get);
     let answered = answered?;
@@ -339,6 +480,7 @@ async fn route_under(
             None => SegmentRoute::Pruned,
         };
     }
+    totals.add_parts(input.signal, &figures);
     Ok((routes, figures))
 }
 
