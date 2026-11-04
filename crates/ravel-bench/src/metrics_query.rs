@@ -638,6 +638,41 @@ pub struct OracleRetry {
     pub attempt: u32,
 }
 
+/// One Ravel repetition's per-query object-store cost, for the
+/// `--diagnostics` sidecar (ADR-0927's 2026-11-04 amendment, decision 3).
+/// Every timed repetition of every entry is recorded separately, not just a
+/// pass's median or its first repetition, so the per-repetition variance the
+/// amendment asks for (decision 9: never pooled) is visible rather than
+/// collapsed. `accounting` and `phases` are `data.stats.accounting` and
+/// `data.stats.phases` copied from the answer body exactly as returned
+/// (`serde_json::Value`, not re-modelled into named counters), so a new
+/// counter the query engine starts reporting reaches the sidecar with no
+/// harness change. Both are `None` when the answer carries no `data.stats`
+/// at all: a timeout, a transport error, a refusal, or a successful answer
+/// the engine chose not to annotate.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct RavelCost {
+    pub entry: String,
+    /// The timed pass, from 1.
+    pub pass: u32,
+    /// The repetition within the pass, from 1.
+    pub rep: u32,
+    pub status: ResultStatus,
+    pub accounting: Option<Json>,
+    pub phases: Option<Json>,
+}
+
+/// `data.stats.accounting` and `data.stats.phases` from a query answer, read
+/// independently so one present without the other is not forced to null the
+/// other. Both are `None` for any outcome that is not a successful envelope
+/// (`answer_body`), and for one that is but carries no `data.stats`.
+fn ravel_cost_fields(outcome: &QueryOutcome) -> (Option<Json>, Option<Json>) {
+    match answer_body(outcome).and_then(|body| body["data"].get("stats").cloned()) {
+        Some(stats) => (stats.get("accounting").cloned(), stats.get("phases").cloned()),
+        None => (None, None),
+    }
+}
+
 /// Whether an oracle outcome is worth re-sending: a timeout, a transport
 /// failure before a complete body arrived, or a 502, 503 or 504 (a gateway or
 /// an overloaded server saying "not now"), whether its body is a JSON envelope
@@ -695,6 +730,9 @@ pub struct RunOutput {
     /// One per (entry, engine other than the oracle), engine-major in the
     /// binding's engine order.
     pub ulp_gaps: Vec<UlpGap>,
+    /// Ravel's per-query object-store cost, one per (entry, timed pass,
+    /// repetition); empty when Ravel is not among `binding`'s engines.
+    pub ravel_cost: Vec<RavelCost>,
 }
 
 /// The `--diagnostics` sidecar: figures a pre-registered check needs that
@@ -707,7 +745,23 @@ pub struct Diagnostics<'a> {
     pub oracle: &'static str,
     pub ulp_gaps: &'a [UlpGap],
     pub oracle_retries: &'a [OracleRetry],
+    /// Ravel's own per-query object-store cost (ADR-0927's 2026-11-04
+    /// amendment, decision 3): one entry per timed repetition, Ravel only.
+    pub ravel_cost: &'a [RavelCost],
+    /// Explains `ravel_cost`'s two caveats so a reader of the sidecar alone
+    /// (without the amendment) does not mistake it for billed usage or for a
+    /// process-wide total.
+    pub ravel_cost_note: &'static str,
 }
+
+/// `ravel_cost`'s caveats (ADR-0927's 2026-11-04 amendment, decisions 8 and
+/// 9): the figures are logical object-store calls as the query engine itself
+/// counted them, not requests billed by the object-store provider, and each
+/// one is read off a single response, never pooled across queries or
+/// processes.
+pub const RAVEL_COST_NOTE: &str = "ravel_cost figures are logical object-store call counts as \
+     the query engine counted them (not billed provider requests), read per response, never \
+     pooled across queries or processes (ADR-0927 decisions 8 and 9)";
 
 /// The largest ULP gap between one engine's answers to one entry and the
 /// oracle's, over every timed pass and repetition, for the diagnostics
@@ -1023,6 +1077,7 @@ pub async fn run(
         })
         .collect();
     let mut oracle_retries: Vec<OracleRetry> = Vec::new();
+    let mut ravel_cost: Vec<RavelCost> = Vec::new();
     for pass in 1..=options.passes {
         for (entry_index, entry) in entries.iter().enumerate() {
             let expectation = EntryExpectation {
@@ -1064,6 +1119,17 @@ pub async fn run(
                     }
                     if let Some(citation) = &record.unsupported_citation {
                         record.unsupported_answer = Some(summarize(&outcome));
+                        if engine.engine == Engine::Ravel {
+                            let (accounting, phases) = ravel_cost_fields(&outcome);
+                            ravel_cost.push(RavelCost {
+                                entry: entry.id.clone(),
+                                pass,
+                                rep: repetition,
+                                status: ResultStatus::UnsupportedConstruct,
+                                accounting,
+                                phases,
+                            });
+                        }
                         reps.push((
                             Classified {
                                 status: ResultStatus::UnsupportedConstruct,
@@ -1085,6 +1151,17 @@ pub async fn run(
                     {
                         ulp_gaps[engine_index][entry_index]
                             .add(oracle.envelope(), answer_body(&outcome));
+                    }
+                    if engine.engine == Engine::Ravel {
+                        let (accounting, phases) = ravel_cost_fields(&outcome);
+                        ravel_cost.push(RavelCost {
+                            entry: entry.id.clone(),
+                            pass,
+                            rep: repetition,
+                            status: classified.status,
+                            accounting,
+                            phases,
+                        });
                     }
                     reps.push((classified, latency_ms));
                 }
@@ -1151,6 +1228,7 @@ pub async fn run(
             .filter(|(engine, _)| engine.engine != Engine::Prometheus)
             .flat_map(|(_, gaps)| gaps)
             .collect(),
+        ravel_cost,
     })
 }
 
