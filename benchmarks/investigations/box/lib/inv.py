@@ -950,7 +950,11 @@ def cmd_call(args):
         print(f"{plan['statement']} ({plan['state']}, {plan['temp']} try {plan['try']}): "
               f"HTTP {code}: {line['error'][:200]}", file=sys.stderr)
         if code is None:
-            sys.exit(1)
+            # Distinct from any other non-zero exit: the caller (run.sh
+            # statements()) checks whether the server process is still alive
+            # before deciding this is a dead server rather than an ordinary
+            # unreachable-server failure.
+            sys.exit(75)
 
 
 def cmd_unsupported(args):
@@ -1064,6 +1068,20 @@ def cmd_get(args):
         die(f"{args.toml}: {args.key} is a table", 64)
     else:
         print(v)
+
+
+def cmd_server_extra_flags(args):
+    """run.toml [server] extra_flags, space-joined for bash, each element
+    already a single argv token (no shell evaluation, no word splitting
+    within an element): refuses (exit 64, naming the element) any entry that
+    contains whitespace or does not start with "--"."""
+    v = load_toml(args.toml).get("server", {}).get("extra_flags", [])
+    if not isinstance(v, list):
+        die("run.toml server.extra_flags is not an array", 64)
+    for elem in v:
+        if not isinstance(elem, str) or any(c.isspace() for c in elem) or not elem.startswith("--"):
+            die(f"run.toml server.extra_flags: {elem!r} is not a single --flag token", 64)
+    print(" ".join(v))
 
 
 def strip_ansi(text):
@@ -1184,6 +1202,10 @@ def main():
     g.add_argument("key")
     g.add_argument("--default")
     g.set_defaults(fn=cmd_get)
+
+    sef = sub.add_parser("server-extra-flags")
+    sef.add_argument("toml")
+    sef.set_defaults(fn=cmd_server_extra_flags)
 
     w = sub.add_parser("warmup")
     w.add_argument("--log", required=True)

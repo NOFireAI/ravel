@@ -298,6 +298,23 @@ corpus, declare or load-base, where nothing can be measured without the
 step, still ends the run with `out/FAILED`, which names the failed
 command's log under `out/logs/` when it has one.
 
+A server that dies mid-call (the request connection drops rather than
+returning an HTTP error) fails that call, not the state: run.sh keeps the
+dying server's log under `out/logs/server-<N>.log`, appends a `calls.jsonl`
+line with outcome `server_died` (the statement, state, try, temp, the
+signal the server died on, and that log's path), restarts the server and
+retries the call. evaluate.py reports every figure a `server_died` call
+would have fed `missing`, with reason `server died during <statement>/
+<state> try N, signal S`, and the summary's problems list names the
+statement. Three deaths on the same call fail the state through the same
+`failed_states.jsonl`/`not-run` mechanism as any other failed command
+(step `server died 3 times during <statement>`), and the run goes on with
+the next state. At the end of every state, whether it failed or not, its
+last server's log is also copied whole to `out/logs/server-<state>-last.log`
+(past 2 MB, only its last 2,000 lines, with a first line noting the
+truncation and the original size), so a state's server behavior is
+inspectable even when no single call named a log.
+
 In each state, every statement planned for it runs `run.cold_runs` times
 cold, each call after a server stop, a page-cache drop and a server start
 that waits for `/readyz` and for the server's startup cache warmup to end,
@@ -343,8 +360,16 @@ records what the warmup loaded.
 `store_bucket`, `instance_profile`, `instance_type`, `volume_gb`,
 `max_minutes`), `[corpus]` (gen_corpus.py's `traces`, `hours`, `seed`,
 `spans_per_trace`, `logs_per_trace`), `[server]` (`tenant`, `shards`,
-`memory_budget_bytes`), `[hits]`, `[many_parts]` (`traces_per_hour`,
-`snapshot_part_max_entries`), `[prices]` and `[cost]`.
+`memory_budget_bytes`, `extra_flags`), `[hits]`, `[many_parts]`
+(`traces_per_hour`, `snapshot_part_max_entries`), `[prices]` and `[cost]`.
+
+`[server] extra_flags` is a list of extra `ravel-server` command-line
+flags, appended verbatim after `--memory-budget-bytes` and stamped into
+`<state>.server.json`'s `server_flags` exactly as given. Each element is
+one argv token, passed with no shell evaluation and no word splitting: a
+flag that takes a value is one `--flag=value` element, not two. An
+element that contains whitespace or does not start with `--` is refused
+before the run starts (exit 64, naming the element).
 
 `[prices]` holds `get_per_1000`, `put_per_1000` (PUT and LIST),
 `storage_gb_month` and `instance_per_hour`, each beside a `<key>_source`
