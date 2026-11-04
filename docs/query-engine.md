@@ -5817,9 +5817,10 @@ running sum passes 0.95 of the cap; then `deferredSetEstimatePartial` is
 `true` and `deferredSetEstimateBytes` is a lower bound of the decoded set.
 The key is absent otherwise
 (`an_over_cap_fast_path_verdict_stops_reading_once_past_the_threshold` in
-`crates/ravel-sql/tests/logs_decoded_cache.rs`). A `LIMIT` without
-`ORDER BY` changes none of this: the `LIKE` filter stays above the scan, so
-such a statement reads and reports the estimate like any other.
+`crates/ravel-sql/tests/logs_decoded_cache.rs`). A scan that carries a
+limit hint (a `LIKE` filter with a `LIMIT` and no `ORDER BY ... LIMIT` above
+it) makes no verdict, so the key is absent for it
+(`a_like_limit_scan_skips_the_verdict_and_a_topk_keeps_it`).
 `deferredServed` is true when a scan of the statement serves its deferred
 columns, and false otherwise (`decoded_cache_json` in
 `crates/ravel-sql/src/stats_json.rs`;
