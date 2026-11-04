@@ -693,6 +693,7 @@ mod tests {
         fewer_rows: "narrow time_range",
         smaller_rows_action: "narrow_the_projection",
         smaller_rows: "select fewer columns",
+        read_cell: Some("select only the cut column"),
     };
 
     fn serialized_len(envelope: &Envelope) -> u64 {
@@ -1287,13 +1288,15 @@ mod tests {
         let cases = [
             (
                 MAX_RESPONSE_BYTES_FLOOR,
-                "the result is complete but the byte cap shortened cells; select fewer \
-                 columns, or raise max_response_bytes (up to 4 MiB), to read them in full",
+                "the result is complete but the byte cap shortened cells; raise \
+                 max_response_bytes (up to 4 MiB) to read them in full, or select only the \
+                 cut column",
             ),
             (
                 MAX_RESPONSE_BYTES_CEILING,
-                "the result is complete but the byte cap shortened cells; select fewer \
-                 columns to read them in full",
+                "the result is complete but the byte cap shortened cells, which cannot be \
+                 returned in full under the 4 MiB max_response_bytes ceiling; select only \
+                 the cut column",
             ),
         ];
         for (cap, detail) in cases {

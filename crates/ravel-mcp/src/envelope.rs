@@ -537,9 +537,11 @@ pub struct NextStep {
 pub enum CapCut {
     /// No cap took anything.
     Nothing,
-    /// The byte cap shortened cells of the one row returned and dropped no
-    /// row. The result is complete. `bytes_ceiling` is the configured
-    /// `max_response_bytes` ceiling.
+    /// The byte cap shortened cells and dropped no row. The result is
+    /// complete. [`Envelope::fit`] cuts cells only of the one row it keeps; a
+    /// tool that cuts its own cells, as `ravel_query_promql` cuts the samples
+    /// of its last series, can return more. `bytes_ceiling` is the
+    /// configured `max_response_bytes` ceiling.
     Cells {
         bytes_at_ceiling: bool,
         bytes_ceiling: u64,
@@ -605,6 +607,11 @@ pub struct CapAdvice<'a> {
     /// What `smaller_rows_action` asks for, e.g. "select fewer or narrower
     /// columns".
     pub smaller_rows: &'a str,
+    /// A clause naming how to read more of a shortened cell, e.g. "select
+    /// fewer or narrower columns to give the cut cells more room"; `None`
+    /// where the tool has no such argument. It is never a way to fewer rows:
+    /// those cannot return more of a row that came back.
+    pub read_cell: Option<&'a str>,
 }
 
 impl CapAdvice<'_> {
@@ -616,8 +623,10 @@ impl CapAdvice<'_> {
     /// - The byte cap dropping rows: smaller rows, or raise
     ///   `max_response_bytes` while it is below its configured ceiling, which
     ///   the detail names.
-    /// - The byte cap shortening cells only: the result is complete; smaller
-    ///   rows or a larger `max_response_bytes` return the cells in full.
+    /// - The byte cap shortening cells and dropping no row: the result is
+    ///   complete. Below the ceiling, raise `max_response_bytes`, which the
+    ///   detail names; at it, the cells cannot be returned in full. Either way
+    ///   the detail adds `read_cell` when the tool has one.
     pub fn step(&self, cut: CapCut, context: &str) -> Option<NextStep> {
         let (action, detail) = match cut {
             CapCut::Nothing => return None,
@@ -658,28 +667,29 @@ impl CapAdvice<'_> {
                 ),
             ),
             CapCut::Cells {
-                bytes_at_ceiling: false,
+                bytes_at_ceiling,
                 bytes_ceiling,
-            } => (
-                "read_full_cells",
-                format!(
-                    "the result is complete but the byte cap shortened cells; {}, or raise \
-                     max_response_bytes (up to {}), to read them in full",
-                    self.smaller_rows,
-                    byte_size(bytes_ceiling)
-                ),
-            ),
-            CapCut::Cells {
-                bytes_at_ceiling: true,
-                ..
-            } => (
-                "read_full_cells",
-                format!(
-                    "the result is complete but the byte cap shortened cells; {} to read them \
-                     in full",
-                    self.smaller_rows
-                ),
-            ),
+            } => {
+                let cut = if bytes_at_ceiling {
+                    format!(
+                        "the result is complete but the byte cap shortened cells, which cannot \
+                         be returned in full under the {} max_response_bytes ceiling",
+                        byte_size(bytes_ceiling)
+                    )
+                } else {
+                    format!(
+                        "the result is complete but the byte cap shortened cells; raise \
+                         max_response_bytes (up to {}) to read them in full",
+                        byte_size(bytes_ceiling)
+                    )
+                };
+                let detail = match (self.read_cell, bytes_at_ceiling) {
+                    (Some(read_cell), true) => format!("{cut}; {read_cell}"),
+                    (Some(read_cell), false) => format!("{cut}, or {read_cell}"),
+                    (None, _) => cut,
+                };
+                ("read_full_cells", detail)
+            }
         };
         let detail = if context.is_empty() {
             detail
@@ -821,6 +831,11 @@ pub struct Envelope {
     pub evidence: Vec<EvidenceEntry>,
     pub warnings: Vec<String>,
     pub next_steps: Vec<NextStep>,
+    /// `presentation.cursor` is the source's own next-page cursor, not one
+    /// minted because a cap cut the page: [`finish`](Self::finish) keeps it
+    /// under a total order whatever the caps took. Never serialized.
+    #[serde(skip)]
+    pub source_cursor: bool,
 }
 
 pub(crate) fn serialized_len(envelope: &Envelope) -> usize {
@@ -1835,7 +1850,10 @@ impl Envelope {
     /// total order gets the cursor dropped and `ok_bounded`, not `ok_page`:
     /// the status and the cursor cannot disagree, and dropping is the safe
     /// direction. A cursor set when no cap stopped the result is dropped for
-    /// the same reason -- there is no next page to point at.
+    /// the same reason -- there is no next page to point at -- unless
+    /// [`source_cursor`](Self::source_cursor) says the source handed it back:
+    /// that cursor does not depend on a cap, so it is kept and the result is
+    /// `ok_page` even when the only cut was a shortened cell.
     ///
     /// An `Error` envelope keeps its status and loses its cursor: a failure
     /// is never a page. Since a failed operation never measured anything,
@@ -1870,7 +1888,7 @@ impl Envelope {
 
         let capped = self.presentation.row_cap_hit
             || (self.presentation.bytes_cap_hit && self.presentation.rows_omitted > 0);
-        if !has_total_order || !capped {
+        if !has_total_order || !(capped || self.source_cursor) {
             self.presentation.cursor = None;
         }
 

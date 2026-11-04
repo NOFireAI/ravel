@@ -1958,7 +1958,20 @@ settled here.
    `ravel_get_trace` used to advise raising `max_rows` for both.
 3. D4: a result whose only cut is shortened cells (`cells_truncated` above
    zero, `rows_omitted` zero, the row cap not hit) is complete: status
-   `ok`, no cursor, and a `read_full_cells` step saying how to read the
-   cells in full. Before, `ravel_search_logs` and `ravel_query_sql`
-   answered one shortened row with a cursor and an equal-group step, and a
-   cells-only result elsewhere was `ok_bounded` with no step.
+   `ok`, no cursor, and a `read_full_cells` step. Below the configured
+   `max_response_bytes` ceiling the step says to raise `max_response_bytes`
+   and names that ceiling; at it, the step says the cells cannot be
+   returned in full. Either way it adds the tool's own way to read more of
+   a cell where the tool has one (`ravel_query_sql`: select fewer or
+   narrower columns; `ravel_query_promql` in range mode: narrow
+   `time_range` to a window after the last sample returned), and never a
+   way to fewer rows, which cannot return more of a row that came back.
+   Before, `ravel_search_logs` and `ravel_query_sql` answered one
+   shortened row with a cursor and an equal-group step, and a cells-only
+   result elsewhere was `ok_bounded` with no step.
+4. D5: a cursor the source handed back, rather than one minted because a
+   cap cut the page, does not depend on the caps and survives a
+   cells-only cut: the page is `ok_page` with that cursor.
+   `ravel_agent_events` is the tool this applies to; its events page
+   carries the route's `next_cursor` when its only cut is a shortened
+   payload.
