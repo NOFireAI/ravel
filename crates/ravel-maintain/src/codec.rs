@@ -26,10 +26,20 @@
 //! actually needs -- RSEG's `ravel_segment::open_from_suffix` fetching the
 //! page bytes of one series' runs, RLOG's `ravel_logseg::open_from_suffix`
 //! plus `RlogRangeReader` fetching the blocks of one stream. For
-//! those two, peak resident bytes -- decoded and raw -- are bounded by
-//! catalog metadata plus one part plus one series/stream, never the whole
-//! bucket. The earlier RLOG merge held every input object whole (RLOG then
-//! had no ranged `.rlog` section reader); that gap is now closed.
+//! those two, the page and block terms -- decoded and raw -- are one part plus
+//! one series/stream, never the whole bucket. The earlier RLOG merge held every
+//! input object whole (RLOG then had no ranged `.rlog` section reader); that
+//! gap is now closed.
+//!
+//! "Catalog metadata" is not a small constant for RSEG. Every input's catalog
+//! is loaded before the merge starts and retained until it ends, with one
+//! series plan and its run plans per (input, series) entry, and `build.rs`
+//! groups those plans into a per-series index that also holds one entry per
+//! (input, series). Both grow with `N * M` (inputs times series per input) and
+//! no configured number sizes them; `tests/rseg_merge_memory.rs` measures each term at two input counts.
+//! The series' label sets are the exception: [`SegmentCodec::admit_catalog`]
+//! interns them by series id as each catalog loads, so they are one copy per
+//! bucket series whatever `N` is (issue #3817).
 //!
 //! [`crate::rspan_codec::SpanCodec`] (RSPAN, spans) is the third
 //! implementation and holds the same shape: `ravel-rspan`'s `RspanRangeReader` fetches SKIP_IDX by
@@ -42,8 +52,10 @@
 //! a bound ([`crate::config::CompactorConfig::l1_part_memory_target_bytes`]):
 //! the RLOG merge checks it after every record, the RSPAN merge only at a trace
 //! boundary (so a bucket carrying one large trace really is one part), and the
-//! RSEG builder does not read it. The trait-wide claim is about not holding the
-//! bucket's inputs at once; it is not a ceiling on the output part.
+//! RSEG builder does not read it: its parts split on the stored-size target
+//! `max_l1_part_bytes` alone. The trait-wide claim is about not holding the
+//! bucket's page and block bytes at once; it is not a ceiling on the output
+//! part, and for RSEG it is not a ceiling on the retained catalogs either.
 //!
 //! [`RsegCodec`] wraps the existing `read.rs`/`build.rs` RSEG logic: since the
 //! run-merged rewrite the verbatim page copy is taken only by a single-run
@@ -77,9 +89,14 @@ pub trait SegmentCodec {
     /// stream/series directory), never the page/block bytes themselves.
     type Catalog;
 
+    /// State [`Self::admit_catalog`] keeps across one bucket's catalog loads.
+    type LoadState: Default;
+
     /// Decode one input object's footer/identity/catalog metadata (read.rs's
-    /// job). MUST NOT retain page/block bytes: peak memory across all inputs is
-    /// bounded by this metadata, not by the bucket's data.
+    /// job). MUST NOT retain page/block bytes: what every input's catalog holds
+    /// is its metadata, not the bucket's data. That metadata is still retained
+    /// for every input at once, so it grows with the input count (for RSEG, one
+    /// series plan per (input, series) entry).
     async fn load_input_catalog(
         store: &dyn ObjectStoreBackend,
         config: &CompactorConfig,
@@ -91,9 +108,10 @@ pub trait SegmentCodec {
     /// with `inputs` in canonical input order and is taken by value: this is
     /// the catalogs' last use, so a codec may move records out of them rather
     /// than clone (RSEG moves exemplars). RSEG and RLOG fetch page/block
-    /// bytes lazily by range, bounding peak *decoded* memory to catalog
-    /// metadata plus one in-flight part, and additionally bound raw fetched
-    /// bytes via their ranged readers (RSEG's `open_from_suffix`, RLOG's
+    /// bytes lazily by range, bounding peak *decoded* memory to the retained
+    /// catalogs (and, for RSEG, the per-series index built from them, which
+    /// also holds one entry per (input, series)) plus one in-flight part, and
+    /// additionally bound raw fetched bytes via their ranged readers (RSEG's `open_from_suffix`, RLOG's
     /// `RlogRangeReader`; RSPAN's `RspanRangeReader`)
     /// to one part plus one series/stream/block-per-input -- see the trait doc
     /// above, [`crate::rlog::RlogCodec`], and [`crate::rspan_codec::SpanCodec`].
@@ -105,6 +123,16 @@ pub trait SegmentCodec {
         catalogs: Vec<Self::Catalog>,
         input_set_hash: &[u8; 32],
     ) -> Result<Vec<BuiltPart>>;
+
+    /// Called once per loaded catalog, in canonical input order, before the
+    /// merge sees it. A codec may share metadata between inputs here; the
+    /// default keeps every catalog as loaded.
+    fn admit_catalog(
+        _config: &CompactorConfig,
+        _state: &mut Self::LoadState,
+        _catalog: &mut Self::Catalog,
+    ) {
+    }
 
     /// Reject an input set [`crate::rewrite::rewrite_and_publish`] must not
     /// run over, ahead of any decode or PUT. The default accepts everything:
@@ -149,6 +177,21 @@ pub struct RsegCodec;
 
 impl SegmentCodec for RsegCodec {
     type Catalog = crate::read::InputCatalog;
+    type LoadState = crate::read::LabelInterner;
+
+    /// Shares each series' label set across the inputs that carry it
+    /// ([`crate::read::intern_catalog_labels`]), so the retained labels are
+    /// one copy per distinct series rather than one per (input, series).
+    fn admit_catalog(
+        config: &CompactorConfig,
+        state: &mut Self::LoadState,
+        catalog: &mut Self::Catalog,
+    ) {
+        let labels = crate::read::intern_catalog_labels(state, catalog);
+        if let Some(t) = config.merge_memory_tracker.as_ref() {
+            t.add_catalog_plan_bytes(catalog.plan_heap_bytes(), labels);
+        }
+    }
 
     fn validate_rewrite_inputs(inputs: &[InputRecord]) -> Result<()> {
         use crate::build::OUTPUT_FORMAT_VERSION;
