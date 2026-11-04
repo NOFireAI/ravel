@@ -981,6 +981,19 @@ row has no map (`ravel_receives_the_full_multi_shard_commit_token`,
 stream digest, pass counts and query URLs are recorded in the provenance
 config.
 
+**Regime.** The provenance config key `regime` names the regime the run's
+timed passes represent, and every report carries it once
+(`metrics_query::REGIME_STEADY_STATE`;
+`the_provenance_config_records_the_steady_state_regime_once`). Its one value
+today is `steady-state`: `--warmup-passes` untimed passes (default 1), then
+`--passes` timed passes (default 5), each pass sending every corpus entry to
+every engine in turn before the next entry (`metrics_query::run`). The
+harness only sends queries: it restarts no engine and drops no cache before
+or between passes. It is neither cold nor warm in band 3's sense (ADR-0927
+2026-11-04 amendment, decision 1). The cold and warm regimes are milestone
+M9 (#3794). A report written before the key existed carries no `regime` and
+is not compared with one that does.
+
 An instant entry is evaluated at the newest generated sample, `anchor_ms +
 (steps - 1) * scrape_interval_secs * 1000`. A range entry is one
 `/api/v1/query_range` request per repetition over the profile's `range_eval`
