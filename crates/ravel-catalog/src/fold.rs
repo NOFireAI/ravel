@@ -354,9 +354,10 @@ pub struct FoldReport {
     /// those leaves listed as uncovered is read again, and every entry of a
     /// part whose previous leaves could not be read or verified is read.
     pub key_index_sections_read: u64,
-    /// (entry, field) pairs the leaf build took from the previous tail
-    /// part's leaves instead of reading the entry's section: matched by data
-    /// object key, never by ordinal, for entries those leaves covered.
+    /// Entries of the re-encoded parts whose pairs the leaf build took from
+    /// the previous tail part's leaves instead of reading the entry's
+    /// section: matched by data object key, never by ordinal, and only for an
+    /// entry those leaves covered for every field.
     pub key_index_entries_carried: u64,
     /// Build passes over the re-encoded parts, summed. A part whose held
     /// pairs fit
@@ -364,8 +365,8 @@ pub struct FoldReport {
     /// takes one; a part over it takes one pass per key8 range, and each pass
     /// reads every section the build needs again. A field a later pass finds
     /// a new uncovered entry for (a transient read failure, or a key8 over the
-    /// body ceiling) is rebuilt once with the complete uncovered list, which
-    /// adds its passes here.
+    /// body ceiling) is rebuilt once from its first range with the complete
+    /// uncovered list, which adds its passes here.
     pub key_index_build_passes: u64,
     /// GETs of the previous tail part's leaves, whole objects, one per
     /// (field, slice), issued when a re-encoded part shares a data object
@@ -2247,7 +2248,7 @@ pub(crate) async fn build_part_key_index(
         }
 
         let carried_entries = carried_all.iter().filter(|&&carried| carried).count() as u64;
-        counters.key_index_entries_carried += carried_entries * fields.len() as u64;
+        counters.key_index_entries_carried += carried_entries;
         let mut built = BuiltPartKeyIndex {
             refs: Vec::new(),
             uncovered_entries: 0,
@@ -2388,8 +2389,7 @@ fn end_key_index_pass(
         }
     }
     match end {
-        Some(end) => field.lo = end,
-        None if field.stale && field.attempt == 0 => {
+        _ if field.stale && field.attempt == 0 => {
             tracing::warn!(
                 tenant = %tenant.to_hex(),
                 field = name,
@@ -2402,7 +2402,7 @@ fn end_key_index_pass(
             field.slice = OpenSlice::new();
             field.refs.clear();
         }
-        None if field.stale => {
+        _ if field.stale => {
             tracing::warn!(
                 tenant = %tenant.to_hex(),
                 field = name,
@@ -2410,6 +2410,7 @@ fn end_key_index_pass(
             );
             field.give_up();
         }
+        Some(end) => field.lo = end,
         None => {
             let last = field.slice.finish();
             if emit(field, last) {
@@ -13183,9 +13184,11 @@ pub(crate) mod tests {
             "the carried part's ref, key_index included, is forwarded unchanged"
         );
         assert_eq!(
-            report.key_index_ranged_gets, 4,
-            "two GETs for each of the tail's two entries, none for the carried part"
+            report.key_index_ranged_gets, 2,
+            "two GETs for the tail's new entry; the tail's carried entry and the carried part read none"
         );
+        assert_eq!(report.key_index_leaf_gets, 1, "{report:?}");
+        assert_eq!(report.key_index_entries_carried, 1, "{report:?}");
         assert_eq!(second.parts[1].key_index.len(), 1);
     }
 
@@ -13499,10 +13502,10 @@ pub(crate) mod tests {
     }
 
     /// A fold whose first HEAD CAS is lost reads each object's KEY_IDX section
-    /// once in all: the attempt that publishes re-encodes the same part from
-    /// the reads the lost attempt made. Three entries: three footer suffix
-    /// GETs and three section GETs, not six of each, and the leaf counters
-    /// report the publishing attempt's one leaf.
+    /// once in all: the attempt that publishes re-encodes the same part and
+    /// takes the leaf refs the lost attempt built for it. Three entries: three
+    /// footer suffix GETs and three section GETs, not six of each, and the
+    /// leaf counters report the one leaf PUT.
     #[tokio::test]
     async fn a_lost_head_cas_reuses_the_section_reads() {
         let inner = recording_store();
@@ -13548,6 +13551,384 @@ pub(crate) mod tests {
             report.key_index_leaf_bytes_written,
             head.parts[0].key_index[0].size
         );
+    }
+
+    /// GETs of any range the recording store saw on a key containing
+    /// `pattern`.
+    fn gets_containing(store: &RangeRecordingStore, pattern: &str) -> usize {
+        store
+            .gets
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|(key, _, _)| key.contains(pattern))
+            .count()
+    }
+
+    /// `part`'s leaves as stored, in HEAD order.
+    async fn stored_leaves(store: &dyn ObjectStoreBackend, part: &SnapshotPartRef) -> Vec<Vec<u8>> {
+        let mut leaves = Vec::new();
+        for leaf in &part.key_index {
+            let got = store
+                .get(&leaf.key, GetRange::Full)
+                .await
+                .expect("the leaf HEAD names is stored");
+            leaves.push(got.data.to_vec());
+        }
+        leaves
+    }
+
+    /// `part`'s `user_id` leaves as [`build_part_key_index_leaves`] builds
+    /// them from every entry's section, under the limits the fold builds
+    /// with: the from-scratch build the incremental one must equal.
+    async fn from_scratch_leaves(
+        store: &dyn ObjectStoreBackend,
+        part: &SnapshotPartRef,
+    ) -> Vec<Vec<u8>> {
+        let got = store
+            .get(&part.key, GetRange::Full)
+            .await
+            .expect("part present");
+        let entries = snapshot_format::decode_part(&got.data, &PartLimits::default())
+            .expect("part decodes")
+            .entries;
+        let mut reads = Vec::new();
+        for entry in &entries {
+            let key = column_stats_build::segment_data_key(&tenant(), Signal::Logs, entry)
+                .expect("data key");
+            reads.push(
+                read_entry_key_index(store, &tenant(), Signal::Logs, &key, entry.object_size)
+                    .await
+                    .fields,
+            );
+        }
+        let part_blake3: [u8; 32] = part.blake3.as_slice().try_into().expect("32-byte hash");
+        build_part_key_index_leaves(
+            &tenant(),
+            Signal::Logs,
+            part_blake3,
+            &[(USER_ID.to_string(), KeyType::I64)],
+            true,
+            &reads.iter().collect::<Vec<_>>(),
+            &key_index_leaf_limits(),
+        )
+        .leaves
+        .into_iter()
+        .map(|leaf| leaf.bytes)
+        .collect()
+    }
+
+    /// Folds logs at `now_ns`, sealing through `seal_through_hour`.
+    async fn fold_logs_sealing(
+        catalog: &Catalog,
+        now_ns: i64,
+        seal_through_hour: Option<u32>,
+    ) -> FoldReport {
+        catalog
+            .fold_with_seal_through(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_ns,
+                &[],
+                None,
+                &RefoldRequest::new(),
+                seal_through_hour,
+            )
+            .await
+            .expect("fold")
+    }
+
+    /// The fold after [`advancing_fixture`]: five minutes after its first
+    /// fold, inside [`KIDX_HOUR`]'s natural margin, so it re-lists the
+    /// held-open hour and picks the late writers up.
+    async fn advancing_fold(catalog: &Catalog) -> FoldReport {
+        fold_logs_sealing(catalog, now_inside(KIDX_HOUR) + 5 * 60 * 1_000_000_000, None).await
+    }
+
+    /// The incremental-build fixture: an operator-sealed fold over writers
+    /// 10, 20 and 30 in [`KIDX_HOUR`] leaves one part with one leaf, then
+    /// writers 15 and 35 publish late into the same held-open hour. Writer 15
+    /// sorts between 10 and 20, so the next fold's tail is 10, 15, 20, 30, 35
+    /// and writers 20 and 30 move from ordinals 1 and 2 to 2 and 3. Every
+    /// writer's values include 7. Returns the first HEAD, with the GET record
+    /// cleared.
+    async fn advancing_fixture(inner: &Arc<RangeRecordingStore>) -> SnapshotHead {
+        declare_user_id_key_index(inner.as_ref()).await;
+        for seq in [10u64, 20, 30] {
+            let own = seq as i64;
+            publish_user_id_logs(inner.as_ref(), seq, KIDX_HOUR, &[7, own, own + 1], 2, 0, true)
+                .await;
+        }
+        let catalog = Catalog::new(inner.clone(), kidx_config()).expect("catalog");
+        fold_logs_sealing(&catalog, now_inside(KIDX_HOUR), Some(KIDX_HOUR)).await;
+        let first = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        assert_eq!(first.parts.len(), 1);
+        assert_eq!(first.parts[0].key_index.len(), 1);
+        assert_eq!(first.parts[0].key_index[0].uncovered_count, 0);
+        publish_user_id_logs(inner.as_ref(), 15, KIDX_HOUR, &[7, 15, 16], 2, 0, true).await;
+        publish_user_id_logs(inner.as_ref(), 35, KIDX_HOUR, &[7, 35, 36], 2, 0, true).await;
+        inner.gets.lock().expect("lock").clear();
+        first
+    }
+
+    /// ADR-2707's incremental tail build amendment: an advancing fold GETs
+    /// the previous tail's one leaf, reads the KEY_IDX sections of only the
+    /// two entries that leaf does not cover (two ranged GETs each, the
+    /// objects being shorter than the footer suffix), carries the other
+    /// three by data object key, and writes the leaf a build from every
+    /// section writes, byte for byte, in one pass. A carry by ordinal gives
+    /// writer 15 writer 20's pairs (see [`advancing_fixture`]) and the leaf
+    /// differs.
+    #[tokio::test]
+    async fn advancing_fold_reads_sections_for_new_entries_only() {
+        let inner = recording_store();
+        let first = advancing_fixture(&inner).await;
+        let store = Arc::new(FaultStore::new(Arc::clone(&inner), FaultPlan::empty()));
+        let catalog = Catalog::new(store.clone(), kidx_config()).expect("catalog");
+        let report = advancing_fold(&catalog).await;
+        assert_eq!(report.entry_count, 5, "{report:?}");
+        let second = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        assert_eq!(second.parts.len(), 1, "one re-encoded tail");
+
+        let section_gets = data_object_ranged_gets(&inner);
+        assert_eq!(section_gets.len(), 2 * 2, "{section_gets:?}");
+        assert_eq!(report.key_index_sections_read, 2, "{report:?}");
+        assert_eq!(report.key_index_ranged_gets, 4, "{report:?}");
+        assert_eq!(
+            gets_containing(&inner, ".kidx"),
+            first.parts[0].key_index.len(),
+            "one GET per previous leaf"
+        );
+        assert_eq!(report.key_index_leaf_gets, 1, "{report:?}");
+        assert_eq!(report.key_index_build_passes, 1, "{report:?}");
+        let previous_covered =
+            first.parts[0].entry_count - first.parts[0].key_index[0].uncovered_count;
+        assert_eq!(report.key_index_entries_carried, previous_covered, "{report:?}");
+        assert_eq!(previous_covered, 3);
+        assert_eq!(
+            stored_leaves(inner.as_ref(), &second.parts[0]).await,
+            from_scratch_leaves(inner.as_ref(), &second.parts[0]).await,
+            "the carried build writes the from-scratch leaf"
+        );
+        let ordinal = part_ordinals(inner.as_ref(), &second.parts[0]).await;
+        assert_eq!(
+            probe_part(
+                &catalog,
+                Signal::Logs,
+                &second.parts[0],
+                KeyType::I64,
+                USER_ID,
+                key8_i64(20)
+            )
+            .await,
+            matches(&[(ordinal[&20], &[0])], &[])
+        );
+    }
+
+    /// A previous leaf whose GET fails is not carried: the fold reads every
+    /// entry's section, counts each under `key_index_sections_read`, carries
+    /// nothing, and writes the from-scratch leaf.
+    #[tokio::test]
+    async fn a_failed_previous_leaf_get_falls_back_to_section_reads() {
+        let inner = recording_store();
+        advancing_fixture(&inner).await;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("leaf GET refused".into()))
+                .with_key_contains(".kidx")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = Arc::new(FaultStore::new(Arc::clone(&inner), plan));
+        let catalog = Catalog::new(store.clone(), kidx_config()).expect("catalog");
+        let report = advancing_fold(&catalog).await;
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            1,
+            "the previous leaf GET was refused"
+        );
+        assert_eq!(report.key_index_leaf_gets, 1, "{report:?}");
+        assert_eq!(report.key_index_sections_read, 5, "{report:?}");
+        assert_eq!(data_object_ranged_gets(&inner).len(), 5 * 2);
+        assert_eq!(report.key_index_entries_carried, 0, "{report:?}");
+        let second = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            stored_leaves(inner.as_ref(), &second.parts[0]).await,
+            from_scratch_leaves(inner.as_ref(), &second.parts[0]).await
+        );
+    }
+
+    /// A previous leaf with one byte flipped fails verification and is not
+    /// carried: every entry's section is read and counted, and the fold
+    /// writes the from-scratch leaf.
+    #[tokio::test]
+    async fn a_corrupt_previous_leaf_falls_back_to_section_reads() {
+        let inner = recording_store();
+        let first = advancing_fixture(&inner).await;
+        let leaf_key = &first.parts[0].key_index[0].key;
+        let mut bytes = inner
+            .inner
+            .get(leaf_key, GetRange::Full)
+            .await
+            .expect("leaf stored")
+            .data
+            .to_vec();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        inner
+            .inner
+            .put(leaf_key, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("overwrite the leaf");
+        let catalog = Catalog::new(inner.clone(), kidx_config()).expect("catalog");
+        let report = advancing_fold(&catalog).await;
+        assert_eq!(report.key_index_leaf_gets, 1, "{report:?}");
+        assert_eq!(report.key_index_sections_read, 5, "{report:?}");
+        assert_eq!(data_object_ranged_gets(&inner).len(), 5 * 2);
+        assert_eq!(report.key_index_entries_carried, 0, "{report:?}");
+        let second = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            stored_leaves(inner.as_ref(), &second.parts[0]).await,
+            from_scratch_leaves(inner.as_ref(), &second.parts[0]).await
+        );
+    }
+
+    /// Folds three entries of four distinct `user_id` values each (twelve
+    /// (entry, key8) pairs, every key8 in one entry, values interleaved so
+    /// each key8 range spans all three entries) under `max_pairs` and a
+    /// 40-byte body ceiling, which holds three 11-byte entries to a slice.
+    async fn budget_fixture_fold(
+        max_pairs: u64,
+    ) -> (Arc<RangeRecordingStore>, FoldReport, SnapshotHead) {
+        let store = recording_store();
+        declare_user_id_key_index(store.as_ref()).await;
+        for seq in 1..=3u64 {
+            let own = seq as i64;
+            publish_user_id_logs(
+                store.as_ref(),
+                seq,
+                KIDX_HOUR,
+                &[own, own + 3, own + 6, own + 9],
+                2,
+                0,
+                true,
+            )
+            .await;
+        }
+        store.gets.lock().expect("lock").clear();
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                key_index_build_max_pairs: max_pairs,
+                ..kidx_config()
+            },
+        )
+        .expect("catalog");
+        set_key_index_leaf_body_ceiling_for_test(Some(40));
+        let report = fold_through(&catalog, Signal::Logs, KIDX_HOUR).await;
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        (store, report, head)
+    }
+
+    /// ADR-3692 decision 5: a (part, field) over the pair budget is built in
+    /// ceil(pairs / budget) passes over disjoint key8 ranges, each pass
+    /// re-reading the sections, and the slices tile `[0, u64::MAX]` with no
+    /// gap and no overlap, exactly the slices and bytes of a one-pass build.
+    /// Twelve pairs under a budget of five: passes of five, five and two,
+    /// while the 40-byte ceiling cuts slices of three, so pass boundaries
+    /// fall inside slices.
+    #[tokio::test]
+    async fn pair_budget_builds_in_passes_with_identical_leaves() {
+        let (store, report, head) = budget_fixture_fold(5).await;
+        let part = &head.parts[0];
+        let mut tiles: Vec<(u64, u64)> = part
+            .key_index
+            .iter()
+            .map(|leaf| (leaf.key8_lo, leaf.key8_hi))
+            .collect();
+        tiles.sort_unstable();
+        assert_eq!(tiles.first().map(|t| t.0), Some(0), "{tiles:?}");
+        assert_eq!(tiles.last().map(|t| t.1), Some(u64::MAX), "{tiles:?}");
+        for pair in tiles.windows(2) {
+            assert_eq!(
+                pair[0].1.checked_add(1),
+                Some(pair[1].0),
+                "no gap and no overlap: {tiles:?}"
+            );
+        }
+        let summaries: Vec<KeyIndexLeafSummary> = stored_leaves(store.as_ref(), part)
+            .await
+            .iter()
+            .map(|bytes| verify_key_index_leaf(bytes, &key_index_leaf_limits()).expect("leaf"))
+            .collect();
+        check_key_index_leaf_set(&summaries).expect("the slices form one set");
+        let pairs: u64 = part.key_index.iter().map(|leaf| leaf.entry_count).sum();
+        assert_eq!(pairs, 12);
+        assert_eq!(part.key_index.len(), 4, "slices of three under the ceiling");
+        assert_eq!(report.key_index_build_passes, pairs.div_ceil(5), "{report:?}");
+        assert_eq!(report.key_index_build_passes, 3);
+        assert_eq!(report.key_index_sections_read, 3 * 3, "{report:?}");
+        assert_eq!(data_object_ranged_gets(&store).len(), 3 * 2 * 3);
+
+        let (one_pass_store, one_pass, one_pass_head) = budget_fixture_fold(u64::MAX).await;
+        assert_eq!(one_pass.key_index_build_passes, 1, "{one_pass:?}");
+        assert_eq!(one_pass.key_index_sections_read, 3, "{one_pass:?}");
+        assert_eq!(one_pass_head.parts[0].key_index, part.key_index);
+        assert_eq!(
+            stored_leaves(store.as_ref(), part).await,
+            stored_leaves(one_pass_store.as_ref(), &one_pass_head.parts[0]).await
+        );
+        assert_eq!(
+            stored_leaves(store.as_ref(), part).await,
+            from_scratch_leaves(store.as_ref(), part).await
+        );
+        set_key_index_leaf_body_ceiling_for_test(None);
+    }
+
+    /// A tail the next fold seals unchanged encodes to the same bytes, so the
+    /// fold carries it by reference with its leaf refs and runs no build for
+    /// it: zero section GETs of its entry and zero leaf GETs. The new tail
+    /// shares no data object with the previous one, so no previous leaf is
+    /// read for it either. A part ceiling of two seals hour 1's two entries
+    /// and then hour 2's one entry beside hour 3's two.
+    #[tokio::test]
+    async fn sealed_tail_carries_its_leaf_refs_without_a_build() {
+        let h1 = KIDX_HOUR;
+        let store = recording_store();
+        declare_user_id_key_index(store.as_ref()).await;
+        publish_user_id_logs(store.as_ref(), 1, h1, &[10, 20], 2, 0, true).await;
+        publish_user_id_logs(store.as_ref(), 2, h1, &[10, 30], 2, 0, true).await;
+        let (sealed, _) = publish_user_id_logs(store.as_ref(), 3, h1 + 1, &[40], 2, 0, true).await;
+        let sealed_key = keys::reconstruct_data_key(&sealed).expect("data key");
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                snapshot_part_max_entries: 2,
+                ..kidx_config()
+            },
+        )
+        .expect("catalog");
+        fold_through(&catalog, Signal::Logs, h1 + 1).await;
+        let first = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(first.parts.len(), 2);
+        assert_eq!(first.parts[1].key_index.len(), 1, "the tail had a leaf");
+
+        publish_user_id_logs(store.as_ref(), 4, h1 + 2, &[50], 2, 0, true).await;
+        publish_user_id_logs(store.as_ref(), 5, h1 + 2, &[60], 2, 0, true).await;
+        store.gets.lock().expect("lock").clear();
+        let report = fold_through(&catalog, Signal::Logs, h1 + 2).await;
+        let second = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(second.parts.len(), 3, "{report:?}");
+        assert_eq!(report.parts_reused, 2, "{report:?}");
+        assert_eq!(
+            second.parts[1], first.parts[1],
+            "the sealed part's ref, its leaf refs included, is the last tail's"
+        );
+        assert_eq!(gets_containing(&store, &sealed_key), 0);
+        assert_eq!(gets_containing(&store, ".kidx"), 0);
+        assert_eq!(report.key_index_leaf_gets, 0, "{report:?}");
+        assert_eq!(report.key_index_entries_carried, 0, "{report:?}");
+        assert_eq!(report.key_index_sections_read, 2, "the new tail's two entries");
+        assert_eq!(report.key_index_build_passes, 1, "{report:?}");
     }
 
     /// A leaf encode the encoder refuses leaves the part uncovered for the
