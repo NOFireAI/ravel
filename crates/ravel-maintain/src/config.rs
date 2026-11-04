@@ -195,6 +195,29 @@ struct MergeMemoryInner {
     /// the field answers "the most cursors any single stream needed open at
     /// once", the quantity that bounds the merge's cursor fan-out.
     max_open_cursors: AtomicU64,
+    /// High-water of `fetched` alone (raw fetched bytes, stored kind).
+    peak_fetched: AtomicU64,
+    /// RSEG only: live decoded heap of the retained per-input planning
+    /// catalogs (`SeriesPlan`/`RunPlan` structs and the run vectors), labels
+    /// excluded. Charged as each input's catalog loads, released when the
+    /// merge drops the catalogs.
+    catalog_plan: AtomicU64,
+    /// High-water of `catalog_plan`.
+    peak_catalog_plan: AtomicU64,
+    /// RSEG only: live decoded heap of the label sets the retained catalogs
+    /// carry, one copy per (input, series).
+    catalog_labels: AtomicU64,
+    /// High-water of `catalog_labels`.
+    peak_catalog_labels: AtomicU64,
+    /// RSEG only: live heap of the merge's whole-bucket group-by index (the
+    /// per-series contribution lists and the flattened per-series build plan).
+    plan_index: AtomicU64,
+    /// High-water of `plan_index`.
+    peak_plan_index: AtomicU64,
+    /// High-water of every live term at once:
+    /// `fetched + decoded + writer + probe + catalog_plan + catalog_labels +
+    /// plan_index`. Mixed byte kinds, like `peak_total`.
+    peak_resident: AtomicU64,
 }
 
 /// A compaction merge's peak resident memory split by the phase that caused it
@@ -232,6 +255,24 @@ pub struct MergePhasePeaks {
     /// (the cloned record heap plus the encoded probe object, mixed decoded
     /// plus encoded kinds). Zero for a run that never probed.
     pub probe_bytes: u64,
+    /// RSEG planning catalogs: high-water of the decoded heap of every
+    /// retained input catalog's series and run plans, labels excluded.
+    /// Decoded heap bytes. Zero for RLOG and RSPAN.
+    pub catalog_plan_heap_bytes: u64,
+    /// RSEG planning catalogs: high-water of the decoded heap of the label
+    /// sets those catalogs carry (one copy per input and series). Decoded heap
+    /// bytes. Zero for RLOG and RSPAN.
+    pub catalog_label_heap_bytes: u64,
+    /// RSEG group-by index: high-water of the heap of the per-series
+    /// contribution lists and build plan the merge derives from the catalogs.
+    /// Decoded heap bytes. Zero for RLOG and RSPAN.
+    pub plan_index_heap_bytes: u64,
+    /// High-water of raw fetched bytes alone (stored/compressed kind): one
+    /// fetch window on the RSEG path.
+    pub fetched_raw_bytes: u64,
+    /// High-water of the decoded merge state alone (decoded heap): one
+    /// series' decoded samples on the RSEG path.
+    pub decoded_heap_bytes: u64,
 }
 
 impl MergeMemoryTracker {
@@ -298,14 +339,98 @@ impl MergeMemoryTracker {
         self.inner.peak_probe.load(Ordering::Relaxed)
     }
 
-    /// Recompute both high-water marks from the live counters.
+    /// Account `raw` fetched bytes released without a decode taking their
+    /// place (the RSEG merge drops a whole fetch window at once).
+    pub fn fetch_released(&self, raw: u64) {
+        self.inner.fetched.fetch_sub(raw, Ordering::Relaxed);
+    }
+
+    /// Account one RSEG input catalog retained for planning: `plan` bytes of
+    /// series and run plans and `labels` bytes of label sets, decoded heap.
+    pub fn add_catalog_plan_bytes(&self, plan: u64, labels: u64) {
+        self.inner.catalog_plan.fetch_add(plan, Ordering::Relaxed);
+        self.inner
+            .catalog_labels
+            .fetch_add(labels, Ordering::Relaxed);
+        self.note();
+    }
+
+    /// Account RSEG planning catalog bytes dropped; the arguments must match
+    /// what [`Self::add_catalog_plan_bytes`] charged for the same catalogs.
+    pub fn release_catalog_plan_bytes(&self, plan: u64, labels: u64) {
+        self.inner.catalog_plan.fetch_sub(plan, Ordering::Relaxed);
+        self.inner
+            .catalog_labels
+            .fetch_sub(labels, Ordering::Relaxed);
+    }
+
+    /// Account `bytes` of RSEG group-by index heap built.
+    pub fn add_plan_index_bytes(&self, bytes: u64) {
+        self.inner.plan_index.fetch_add(bytes, Ordering::Relaxed);
+        self.note();
+    }
+
+    /// Account `bytes` of RSEG group-by index heap dropped.
+    pub fn release_plan_index_bytes(&self, bytes: u64) {
+        self.inner.plan_index.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    /// High-water of the RSEG planning catalogs' series and run plans.
+    pub fn peak_catalog_plan_bytes(&self) -> u64 {
+        self.inner.peak_catalog_plan.load(Ordering::Relaxed)
+    }
+
+    /// High-water of the RSEG planning catalogs' label sets.
+    pub fn peak_catalog_label_bytes(&self) -> u64 {
+        self.inner.peak_catalog_labels.load(Ordering::Relaxed)
+    }
+
+    /// High-water of the RSEG group-by index.
+    pub fn peak_plan_index_bytes(&self) -> u64 {
+        self.inner.peak_plan_index.load(Ordering::Relaxed)
+    }
+
+    /// High-water of raw fetched bytes alone.
+    pub fn peak_fetched_bytes(&self) -> u64 {
+        self.inner.peak_fetched.load(Ordering::Relaxed)
+    }
+
+    /// High-water of every live term summed at one instant (see the field
+    /// doc); mixed byte kinds.
+    pub fn peak_resident_bytes(&self) -> u64 {
+        self.inner.peak_resident.load(Ordering::Relaxed)
+    }
+
+    /// Recompute the high-water marks from the live counters.
     fn note(&self) {
         let fetched = self.inner.fetched.load(Ordering::Relaxed);
         let decoded = self.inner.decoded.load(Ordering::Relaxed);
         let writer = self.inner.writer.load(Ordering::Relaxed);
         let probe = self.inner.probe.load(Ordering::Relaxed);
+        let catalog_plan = self.inner.catalog_plan.load(Ordering::Relaxed);
+        let catalog_labels = self.inner.catalog_labels.load(Ordering::Relaxed);
+        let plan_index = self.inner.plan_index.load(Ordering::Relaxed);
         let transient = fetched.saturating_add(decoded);
         let total = transient.saturating_add(writer).saturating_add(probe);
+        let resident = total
+            .saturating_add(catalog_plan)
+            .saturating_add(catalog_labels)
+            .saturating_add(plan_index);
+        self.inner
+            .peak_resident
+            .fetch_max(resident, Ordering::Relaxed);
+        self.inner
+            .peak_fetched
+            .fetch_max(fetched, Ordering::Relaxed);
+        self.inner
+            .peak_catalog_plan
+            .fetch_max(catalog_plan, Ordering::Relaxed);
+        self.inner
+            .peak_catalog_labels
+            .fetch_max(catalog_labels, Ordering::Relaxed);
+        self.inner
+            .peak_plan_index
+            .fetch_max(plan_index, Ordering::Relaxed);
         self.inner
             .peak_transient
             .fetch_max(transient, Ordering::Relaxed);
@@ -455,6 +580,14 @@ impl MergeMemoryTracker {
             &self.inner.peak_writer,
             &self.inner.peak_publish_record,
             &self.inner.max_open_cursors,
+            &self.inner.peak_fetched,
+            &self.inner.catalog_plan,
+            &self.inner.peak_catalog_plan,
+            &self.inner.catalog_labels,
+            &self.inner.peak_catalog_labels,
+            &self.inner.plan_index,
+            &self.inner.peak_plan_index,
+            &self.inner.peak_resident,
         ] {
             field.store(0, Ordering::Relaxed);
         }
@@ -470,6 +603,11 @@ impl MergeMemoryTracker {
             retained_part_encoded_bytes: self.peak_retained_part_bytes(),
             publish_record_encoded_bytes: self.peak_publish_record_bytes(),
             probe_bytes: self.peak_probe_bytes(),
+            catalog_plan_heap_bytes: self.peak_catalog_plan_bytes(),
+            catalog_label_heap_bytes: self.peak_catalog_label_bytes(),
+            plan_index_heap_bytes: self.peak_plan_index_bytes(),
+            fetched_raw_bytes: self.peak_fetched_bytes(),
+            decoded_heap_bytes: self.peak_cursor_decoded_bytes(),
         }
     }
 

@@ -360,6 +360,29 @@ pub struct InputCatalog {
     pub exemplars: Vec<ExemplarInput>,
 }
 
+impl InputCatalog {
+    /// Decoded heap this catalog holds while retained for planning, as
+    /// `(plans, labels)`: `plans` is the series and run plan structs, the run
+    /// vectors and the object key, plus the exemplar records shallowly;
+    /// `labels` is every series' label set. Charged to
+    /// [`crate::config::MergeMemoryTracker::add_catalog_plan_bytes`].
+    pub fn heap_estimate(&self) -> (u64, u64) {
+        let mut plans = std::mem::size_of::<InputCatalog>()
+            + self.object_key.capacity()
+            + self.series.capacity() * std::mem::size_of::<SeriesPlan>()
+            + self.exemplars.capacity() * std::mem::size_of::<ExemplarInput>();
+        let mut labels = 0usize;
+        for series in &self.series {
+            plans += series.runs.capacity() * std::mem::size_of::<RunPlan>();
+            labels += series.labels.len() * std::mem::size_of::<ravel_types::Label>();
+            for label in series.labels.iter() {
+                labels += label.name.len() + label.value.len();
+            }
+        }
+        (plans as u64, labels as u64)
+    }
+}
+
 /// Decode one input's catalog into per-run absolute page ranges, stamping
 /// every run's provenance from the input's commit record.
 ///

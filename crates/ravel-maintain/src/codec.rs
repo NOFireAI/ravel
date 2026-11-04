@@ -187,7 +187,12 @@ impl SegmentCodec for RsegCodec {
         config: &CompactorConfig,
         input: &InputRecord,
     ) -> Result<Self::Catalog> {
-        crate::read::load_input_catalog(store, config, input).await
+        let catalog = crate::read::load_input_catalog(store, config, input).await?;
+        if let Some(t) = config.merge_memory_tracker.as_ref() {
+            let (plans, labels) = catalog.heap_estimate();
+            t.add_catalog_plan_bytes(plans, labels);
+        }
+        Ok(catalog)
     }
 
     async fn build_parts(

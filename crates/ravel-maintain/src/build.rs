@@ -189,6 +189,13 @@ pub async fn build_parts(
     let ingest_bounds = merged_ingest_bounds(inputs);
     let input_set_hash16 = hex::encode(&input_set_hash[..8]);
     let ledger = config.request_ledger.as_ref();
+    let tracker = config.merge_memory_tracker.as_ref();
+    // What `RsegCodec::load_input_catalog` charged for these catalogs; released
+    // when they drop at the end of this call.
+    let (catalog_plan_bytes, catalog_label_bytes) = catalogs
+        .iter()
+        .map(InputCatalog::heap_estimate)
+        .fold((0u64, 0u64), |(p, l), (cp, cl)| (p + cp, l + cl));
 
     // Every input's exemplars, grouped by the series they name, in canonical
     // input order then each object's own stored order (ADR-0047 decision 3).
@@ -226,6 +233,16 @@ pub async fn build_parts(
         }
     }
     let object_keys: Vec<&str> = catalogs.iter().map(|c| c.object_key.as_str()).collect();
+    let by_series_bytes = by_series
+        .values()
+        .map(|c| {
+            (BTREE_ENTRY_BYTES + c.capacity() * std::mem::size_of::<(usize, &SeriesPlan)>()) as u64
+        })
+        .sum::<u64>()
+        + (object_keys.capacity() * std::mem::size_of::<&str>()) as u64;
+    if let Some(t) = tracker {
+        t.add_plan_index_bytes(by_series_bytes);
+    }
 
     // Flatten the group-by into an ordered per-series build plan (metadata
     // only, no page bytes). This is the exact series-then-run emission order
@@ -269,6 +286,17 @@ pub async fn build_parts(
             runs,
             page_bytes,
         });
+    }
+    let builds_bytes = (builds.capacity() * std::mem::size_of::<SeriesBuild<'_>>()
+        + builds
+            .iter()
+            .map(|b| b.runs.capacity() * std::mem::size_of::<(&str, &RunPlan)>())
+            .sum::<usize>()) as u64;
+    if let Some(t) = tracker {
+        // The group-by map was drained into `builds` above; charging both at
+        // once is the upper bound of the instant the last entry moved.
+        t.add_plan_index_bytes(builds_bytes);
+        t.release_plan_index_bytes(by_series_bytes);
     }
 
     // One shared cap for every window's fetches (windows run sequentially, so
@@ -328,23 +356,40 @@ pub async fn build_parts(
             .await?;
         let window = &builds[window_start..=i];
         let regions = fetch_batch_pages(store, &semaphore, window, ledger).await?;
+        let window_raw_bytes: u64 = regions
+            .values()
+            .flat_map(|buffers| buffers.iter().map(|(_, b)| b.len() as u64))
+            .sum();
+        if let Some(t) = tracker {
+            t.block_fetched(window_raw_bytes);
+        }
         for build in window {
             // Decode, merge and re-encode on the read gate (ADR-1702), one job
             // per series, sized by the series' input page bytes. The job owns
             // its pages, so nothing it reads is released while it waits.
             let pages = slice_series_pages(build, &regions, migrate_keys)?;
+            let decoded_bytes = decoded_series_bytes(&pages);
+            if let Some(t) = tracker {
+                t.block_decoded(0, decoded_bytes);
+            }
             let series_v7 = config
                 .read_gate
                 .run(ReadSite::Compaction, build.page_bytes, move || {
                     materialize_series(pages, limits)
                 })
                 .await??;
+            if let Some(t) = tracker {
+                t.block_released(decoded_bytes);
+            }
             pending_estimate.push_series(&series_v7);
             pending.push(series_v7);
             if let Some(mut records) = exemplars_by_series.remove(&build.series_id.0) {
                 exemplars_assigned += records.len();
                 pending_estimate.push_exemplars(&records);
                 pending_exemplars.append(&mut records);
+            }
+            if let Some(t) = tracker {
+                t.set_writer_bytes(pending_estimate.bytes());
             }
             if pending_estimate.bytes() >= config.max_l1_part_bytes {
                 let mut part = flush_part(
@@ -359,7 +404,11 @@ pub async fn build_parts(
                     pending_estimate.bytes(),
                 )
                 .await?;
+                note_encoded_part(tracker, &part);
                 put_and_release_part(store, &mut part, config.dry_run, ledger).await?;
+                if let Some(t) = tracker {
+                    t.set_writer_bytes(0);
+                }
                 // Cancellation checkpoint 4: a part boundary, after the PUT
                 // returned.
                 crate::claim_guard::checkpoint(
@@ -373,6 +422,10 @@ pub async fn build_parts(
                 pending_estimate.reset();
             }
         }
+        if let Some(t) = tracker {
+            t.fetch_released(window_raw_bytes);
+        }
+        drop(regions);
         window_start = i + 1;
         window_input_bytes = 0;
     }
@@ -391,7 +444,11 @@ pub async fn build_parts(
             pending_estimate.bytes(),
         )
         .await?;
+        note_encoded_part(tracker, &part);
         put_and_release_part(store, &mut part, config.dry_run, ledger).await?;
+        if let Some(t) = tracker {
+            t.set_writer_bytes(0);
+        }
         // Cancellation checkpoint 4 for the tail part.
         crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::PartBoundary)
             .await?;
@@ -418,7 +475,49 @@ pub async fn build_parts(
         )));
     }
 
+    if let Some(t) = tracker {
+        t.release_plan_index_bytes(builds_bytes);
+        t.release_catalog_plan_bytes(catalog_plan_bytes, catalog_label_bytes);
+    }
     Ok(parts)
+}
+
+/// Per-entry heap a `BTreeMap<[u8; 16], Vec<_>>` pays beyond the vector's own
+/// buffer: the key, the vector header, and a share of the node's edges and
+/// length fields. An estimate for the merge-memory accounting only.
+const BTREE_ENTRY_BYTES: usize = 16 + 24 + 16;
+
+/// Decoded heap one series' merge holds at once: the merged
+/// `(sample, provenance)` vector over every contributing run's samples. Zero
+/// for the single-run verbatim copy, which decodes nothing. Scalar and
+/// histogram samples are charged at their own in-memory sizes; a histogram's
+/// bucket vectors are not counted.
+fn decoded_series_bytes(series: &SeriesPages) -> u64 {
+    if let [only] = series.runs.as_slice()
+        && !only.migrate
+    {
+        return 0;
+    }
+    let per_sample = match series.runs.first().map(|r| r.run.kind) {
+        Some(ValueKind::Histogram) => {
+            std::mem::size_of::<(ravel_segment::HistogramSample, SampleProvenance)>()
+        }
+        _ => std::mem::size_of::<(Sample, SampleProvenance)>(),
+    } as u64;
+    series
+        .runs
+        .iter()
+        .map(|r| u64::from(r.run.sample_count))
+        .sum::<u64>()
+        .saturating_mul(per_sample)
+}
+
+/// Charge a just-encoded part's object bytes as the writer term until its PUT
+/// releases them.
+fn note_encoded_part(tracker: Option<&crate::config::MergeMemoryTracker>, part: &BuiltPart) {
+    if let Some(t) = tracker {
+        t.set_writer_bytes(part.bytes.as_ref().map_or(0, |b| b.len() as u64));
+    }
 }
 
 /// One output series' merge plan without its page bytes: identity, borrowed
