@@ -357,6 +357,22 @@ load_config() {
   RUN_START="$(date +%s)"
 }
 
+# build_pkg NAME CARGO_ARGS...: one release build of the clone from inside
+# it, with frame pointers, into the shared target; its output goes to
+# out/build-NAME.log so a failed build travels with the FAILED marker.
+build_pkg() {
+  local name="$1" src="$BOX_ROOT/ravel" target="$BOX_ROOT/target-fp"
+  shift
+  if [ "$DRY_RUN" = 1 ]; then
+    run env CARGO_TARGET_DIR="$target" RUSTFLAGS="-C force-frame-pointers=yes" \
+      cargo build --release --locked "$@"
+    return 0
+  fi
+  mkdir -p "$OUT"
+  (cd "$src" && env CARGO_TARGET_DIR="$target" RUSTFLAGS="-C force-frame-pointers=yes" \
+    cargo build --release --locked "$@") >"$OUT/build-$name.log" 2>&1
+}
+
 step_bootstrap() {
   step bootstrap
   if [ "$LANE" = s3 ]; then
@@ -376,12 +392,11 @@ step_bootstrap() {
     fi
     # Two invocations, not one: a combined -p ravel-cli -p ravel-server
     # --features ravel-server/sql build left ravel-server without its SQL
-    # routes (404) on this tree.
-    run env CARGO_TARGET_DIR="$target" RUSTFLAGS="-C force-frame-pointers=yes" \
-      cargo build --manifest-path "$src/Cargo.toml" --release --locked -p ravel-cli || fail "build ravel-cli"
-    run env CARGO_TARGET_DIR="$target" RUSTFLAGS="-C force-frame-pointers=yes" \
-      cargo build --manifest-path "$src/Cargo.toml" --release --locked -p ravel-server --features sql \
-      || fail "build ravel-server"
+    # routes (404) on this tree. Each runs inside the clone (build_pkg):
+    # rustup reads rust-toolchain.toml from the current directory, not from
+    # --manifest-path, and the installer above sets no default toolchain.
+    build_pkg ravel-cli -p ravel-cli || fail "build ravel-cli (out/build-ravel-cli.log)"
+    build_pkg ravel-server -p ravel-server --features sql || fail "build ravel-server (out/build-ravel-server.log)"
     run install -D -m 0755 "$target/release/ravel-cli" "$BIN" || fail "install ravel-cli"
     run install -D -m 0755 "$target/release/ravel-server" "$SERVER_BIN" || fail "install ravel-server"
     stamp build.json lane=s3 sha="$SHA" build="separate cargo build --release --locked per package, RUSTFLAGS=-C force-frame-pointers=yes, ravel-server --features sql" \
