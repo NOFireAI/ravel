@@ -297,10 +297,10 @@ impl Draft {
         };
 
         let probe = envelope.clone().fit_row_capped(cap, row_cap_omitted);
-        let cut = CapCut::of(&probe.presentation, probe.data.rows.len(), budgets.max_rows);
+        let cut = CapCut::of(&probe.presentation, probe.data.rows.len(), budgets);
         if probe.failure.is_none() && matches!(cut, CapCut::Cells { .. }) {
             return envelope
-                .fit_with_cap_step(cap, row_cap_omitted, budgets.max_rows, advice)
+                .fit_with_cap_step(cap, row_cap_omitted, budgets, advice)
                 .finish(false);
         }
         if !cut.omits_rows() || probe.failure.is_some() || matches!(order, PageOrder::Partial) {
@@ -315,7 +315,7 @@ impl Draft {
         placed.presentation.cursor = Some("c".repeat(CURSOR_BOUND - 2));
         let mut fitted = placed.fit_row_capped(cap, row_cap_omitted);
         let fit_rows = fitted.data.rows.len();
-        let fit_cut = CapCut::of(&fitted.presentation, fit_rows, budgets.max_rows);
+        let fit_cut = CapCut::of(&fitted.presentation, fit_rows, budgets);
         let mut kept = fit_rows;
         let mut no_complete_group = None;
         if let PageOrder::Grouped { same_group, group } = order {

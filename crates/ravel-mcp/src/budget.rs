@@ -88,6 +88,11 @@ pub struct McpRequestBudgets {
 pub struct McpEffectiveBudgets {
     pub max_rows: u32,
     pub max_response_bytes: u64,
+    /// The ceiling `max_response_bytes` was clamped against: the
+    /// operator's [`McpBudgetConfig::max_response_bytes_ceiling`]. A cap
+    /// next step reads it to tell whether raising `max_response_bytes` can
+    /// still help.
+    pub max_response_bytes_ceiling: u64,
     pub deadline: Duration,
     pub query: EffectiveBudgets,
 }
@@ -120,6 +125,7 @@ impl McpRequestBudgets {
         McpEffectiveBudgets {
             max_rows,
             max_response_bytes,
+            max_response_bytes_ceiling: config.max_response_bytes_ceiling,
             deadline,
             query: self.query.clamp(ceiling),
         }

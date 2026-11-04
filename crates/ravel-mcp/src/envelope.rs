@@ -34,7 +34,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 
-use crate::budget::{MAX_RESPONSE_BYTES_CEILING, MAX_ROWS_CEILING};
+use crate::budget::{MAX_ROWS_CEILING, McpEffectiveBudgets};
 
 /// The smallest `max_response_bytes` the server honors; a smaller request is
 /// raised to this floor. Re-exported from [`crate::budget`] so the two
@@ -538,26 +538,39 @@ pub enum CapCut {
     /// No cap took anything.
     Nothing,
     /// The byte cap shortened cells of the one row returned and dropped no
-    /// row. The result is complete.
-    Cells { bytes_at_ceiling: bool },
+    /// row. The result is complete. `bytes_ceiling` is the configured
+    /// `max_response_bytes` ceiling.
+    Cells {
+        bytes_at_ceiling: bool,
+        bytes_ceiling: u64,
+    },
     /// The row cap dropped rows and the byte cap dropped none.
     Rows { at_ceiling: bool },
-    /// The byte cap dropped rows. Raising `max_rows` cannot help.
-    Bytes { at_ceiling: bool },
+    /// The byte cap dropped rows. Raising `max_rows` cannot help. `ceiling`
+    /// is the configured `max_response_bytes` ceiling.
+    Bytes { at_ceiling: bool, ceiling: u64 },
 }
 
 impl CapCut {
-    /// The cap that bound a result fitted under `max_rows`, with
+    /// The cap that bound a result fitted under `budgets`, with
     /// `rows_returned` rows kept. The row cap's own count is inside
     /// `rows_omitted`, so the byte cap dropped rows exactly when it fired and
-    /// fewer rows came back than the row cap left.
-    pub fn of(presentation: &Presentation, rows_returned: usize, max_rows: u32) -> CapCut {
-        let bytes_at_ceiling =
-            presentation.effective_max_response_bytes >= MAX_RESPONSE_BYTES_CEILING;
+    /// fewer rows came back than the row cap left. The byte cap is at its
+    /// ceiling when it reached `budgets.max_response_bytes_ceiling`, the
+    /// ceiling the operator configured.
+    pub fn of(
+        presentation: &Presentation,
+        rows_returned: usize,
+        budgets: &McpEffectiveBudgets,
+    ) -> CapCut {
+        let max_rows = budgets.max_rows;
+        let bytes_ceiling = budgets.max_response_bytes_ceiling;
+        let bytes_at_ceiling = presentation.effective_max_response_bytes >= bytes_ceiling;
         let below_row_cap = !presentation.row_cap_hit || rows_returned < max_rows as usize;
         if presentation.bytes_cap_hit && presentation.rows_omitted > 0 && below_row_cap {
             return CapCut::Bytes {
                 at_ceiling: bytes_at_ceiling,
+                ceiling: bytes_ceiling,
             };
         }
         if presentation.row_cap_hit {
@@ -566,7 +579,10 @@ impl CapCut {
             };
         }
         if presentation.cells_truncated > 0 {
-            return CapCut::Cells { bytes_at_ceiling };
+            return CapCut::Cells {
+                bytes_at_ceiling,
+                bytes_ceiling,
+            };
         }
         CapCut::Nothing
     }
@@ -618,32 +634,43 @@ impl CapAdvice<'_> {
                     self.fewer_rows
                 ),
             ),
-            CapCut::Bytes { at_ceiling: false } => (
+            CapCut::Bytes {
+                at_ceiling: false,
+                ceiling,
+            } => (
                 "raise_max_response_bytes",
                 format!(
-                    "the byte cap dropped rows; {}, or raise max_response_bytes (up to 4 MiB)",
-                    self.smaller_rows
+                    "the byte cap dropped rows; {}, or raise max_response_bytes (up to {})",
+                    self.smaller_rows,
+                    byte_size(ceiling)
                 ),
             ),
-            CapCut::Bytes { at_ceiling: true } => (
+            CapCut::Bytes {
+                at_ceiling: true,
+                ceiling,
+            } => (
                 self.smaller_rows_action,
                 format!(
-                    "the byte cap dropped rows with max_response_bytes at its 4 MiB ceiling; {}",
+                    "the byte cap dropped rows with max_response_bytes at its {} ceiling; {}",
+                    byte_size(ceiling),
                     self.smaller_rows
                 ),
             ),
             CapCut::Cells {
                 bytes_at_ceiling: false,
+                bytes_ceiling,
             } => (
                 "read_full_cells",
                 format!(
                     "the result is complete but the byte cap shortened cells; {}, or raise \
-                     max_response_bytes (up to 4 MiB), to read them in full",
-                    self.smaller_rows
+                     max_response_bytes (up to {}), to read them in full",
+                    self.smaller_rows,
+                    byte_size(bytes_ceiling)
                 ),
             ),
             CapCut::Cells {
                 bytes_at_ceiling: true,
+                ..
             } => (
                 "read_full_cells",
                 format!(
@@ -664,26 +691,49 @@ impl CapAdvice<'_> {
         })
     }
 
-    /// The widest step [`step`](Self::step) can return for `context`, to
-    /// hold its room while the envelope is fitted: the step chosen after the
-    /// fit is never longer.
-    pub fn widest(&self, context: &str) -> NextStep {
+    /// The widest step [`step`](Self::step) can return for `context` under
+    /// `budgets`, to hold its room while the envelope is fitted: the step
+    /// chosen after the fit is never longer.
+    pub fn widest(&self, context: &str, budgets: &McpEffectiveBudgets) -> NextStep {
+        let ceiling = budgets.max_response_bytes_ceiling;
         [
             CapCut::Rows { at_ceiling: false },
             CapCut::Rows { at_ceiling: true },
-            CapCut::Bytes { at_ceiling: false },
-            CapCut::Bytes { at_ceiling: true },
+            CapCut::Bytes {
+                at_ceiling: false,
+                ceiling,
+            },
+            CapCut::Bytes {
+                at_ceiling: true,
+                ceiling,
+            },
             CapCut::Cells {
                 bytes_at_ceiling: false,
+                bytes_ceiling: ceiling,
             },
             CapCut::Cells {
                 bytes_at_ceiling: true,
+                bytes_ceiling: ceiling,
             },
         ]
         .into_iter()
         .filter_map(|cut| self.step(cut, context))
         .max_by_key(entry_serialized_len)
         .unwrap_or_default()
+    }
+}
+
+/// `bytes` as a step names it: whole MiB or KiB when it divides evenly
+/// ("4 MiB", "640 KiB"), bytes otherwise.
+fn byte_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    if bytes >= MIB && bytes % MIB == 0 {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= KIB && bytes % KIB == 0 {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -1442,17 +1492,17 @@ impl Envelope {
     }
 
     /// [`fit_row_capped`](Self::fit_row_capped), plus the [`CapAdvice`] step
-    /// for whatever the fit cut under `max_rows`; see
+    /// for whatever the fit cut under `budgets`; see
     /// [`fit_with_cap_step_by`](Self::fit_with_cap_step_by).
     pub fn fit_with_cap_step(
         self,
         requested_max_response_bytes: u64,
         row_cap_omitted: u64,
-        max_rows: u32,
+        budgets: &McpEffectiveBudgets,
         advice: &CapAdvice<'_>,
     ) -> Envelope {
         let fitted: Result<Envelope, std::convert::Infallible> =
-            self.fit_with_cap_step_by(max_rows, advice, |envelope| {
+            self.fit_with_cap_step_by(budgets, advice, |envelope| {
                 Ok(envelope.fit_row_capped(requested_max_response_bytes, row_cap_omitted))
             });
         match fitted {
@@ -1462,7 +1512,7 @@ impl Envelope {
     }
 
     /// `fit(self)`, plus the [`CapAdvice`] step for whatever that fit cut
-    /// under `max_rows`, measured inside the fit. A fit that cut nothing, or
+    /// under `budgets`, measured inside the fit. A fit that cut nothing, or
     /// failed, is returned as it was, with no step. Otherwise the envelope
     /// is fitted again holding the step for that cut; when the cut that fit
     /// makes calls for a longer step, once more holding
@@ -1470,12 +1520,12 @@ impl Envelope {
     /// than the one held, takes the held step's place.
     pub fn fit_with_cap_step_by<E>(
         self,
-        max_rows: u32,
+        budgets: &McpEffectiveBudgets,
         advice: &CapAdvice<'_>,
         fit: impl Fn(Envelope) -> Result<Envelope, E>,
     ) -> Result<Envelope, E> {
         let cut_of =
-            |fitted: &Envelope| CapCut::of(&fitted.presentation, fitted.data.rows.len(), max_rows);
+            |fitted: &Envelope| CapCut::of(&fitted.presentation, fitted.data.rows.len(), budgets);
         let probe = fit(self.clone())?;
         let cut = cut_of(&probe);
         if cut == CapCut::Nothing || probe.failure.is_some() {
@@ -1495,7 +1545,7 @@ impl Envelope {
                 fitted.replace_step(at, step);
                 return Ok(fitted);
             }
-            held = advice.widest("");
+            held = advice.widest("", budgets);
             widest = true;
         }
     }

@@ -242,7 +242,7 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Result<
         fitted.presentation.bytes_cap_hit |= cut.rows_omitted > 0 || cut.samples_cut > 0;
         Ok(fitted)
     };
-    let fitted = envelope.fit_with_cap_step_by(ctx.budgets.max_rows, &advice(plan.mode), fit)?;
+    let fitted = envelope.fit_with_cap_step_by(&ctx.budgets,&advice(plan.mode), fit)?;
     Ok(fitted.finish(false))
 }
 
