@@ -496,7 +496,13 @@ async fn probe_part(
         field: &input.key_set.field,
         key_type: input.key_set.key_type,
     };
-    let policy = KeyIndexSetPolicy::for_part(plan.handle.entry_count);
+    // The bridged-byte allowance is the part's, `entry_count x
+    // KEY_INDEX_T1_BYTES` (the tier-1 cost the part's segments would
+    // otherwise pay), shared by every slice the key set tiles: each slice's
+    // probe is bounded by what the earlier slices left, so a set across S
+    // slices cannot read S times the part's allowance.
+    let part_policy = KeyIndexSetPolicy::for_part(plan.handle.entry_count);
+    let mut bridged_left = part_policy.max_bridged_bytes;
     let mut gets = 0u64;
     let mut answer = PartAnswer {
         blocks: BTreeMap::new(),
@@ -504,6 +510,10 @@ async fn probe_part(
     };
     for (leaf_ref, keys) in &plan.slices {
         let leaf_ref: &SnapshotKeyIndexLeafRef = leaf_ref;
+        let policy = KeyIndexSetPolicy {
+            b_run: part_policy.b_run,
+            max_bridged_bytes: bridged_left,
+        };
         let probe = input
             .catalog
             .probe_key_index_leaf_set_with(
@@ -520,6 +530,7 @@ async fn probe_part(
                 leaf_key: leaf_ref.key.clone(),
                 source,
             })?;
+        bridged_left = bridged_left.saturating_sub(probe.bridged_bytes);
         gets += u64::from(probe.get_requests);
         leaf_accounting.add_decompressed_bytes(probe.decompressed_bytes);
         match probe.answer {

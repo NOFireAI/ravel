@@ -211,7 +211,6 @@ impl SnapshotWindow {
             .map(|r| SnapshotPartHandle {
                 blake3: r.blake3.clone(),
                 entry_count: r.entry_count,
-                min_hour: r.min_hour,
                 watermark_hour: r.watermark_hour,
                 key_index: r.key_index.clone(),
             })

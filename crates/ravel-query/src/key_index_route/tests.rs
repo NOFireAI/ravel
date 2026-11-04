@@ -208,7 +208,6 @@ async fn fixture(specs: &[PartSpec], recents: &[Rows], key_type: KeyType) -> Fix
         handles.push(SnapshotPartHandle {
             blake3: part_blake3.to_vec(),
             entry_count: n,
-            min_hour: 0,
             watermark_hour: spec.watermark_hour,
             key_index: refs,
         });
@@ -885,6 +884,110 @@ async fn origins_that_do_not_match_the_snapshot_are_invalid_input() {
     )
     .await;
     assert!(matches!(run.result, Err(RouteError::InvalidInput(_))));
+}
+
+#[tokio::test]
+async fn the_bridged_byte_budget_is_the_parts_not_each_slices() {
+    // Str keys hash to key8 (an Id16 key8 is the id's first 8 bytes, and
+    // the fixture's ids all sit below the cut), so the set tiles both
+    // slices of a split part. It is sized so that each
+    // slice's bridged runs fit the part's allowance (`entry_count x
+    // KEY_INDEX_T1_BYTES`, entry_count 1 here) on their own while their sum
+    // does not. The allowance is the part's, so the second slice must
+    // decline and the part reads skipped_by_budget.
+    // FLIP: handing each slice the full allowance (the pre-fix form) answers
+    // both slices and covers the part.
+    let cap = ravel_catalog::KEY_INDEX_T1_BYTES;
+    let cut = 1u64 << 63;
+    let budget = ThresholdBudget::new(u64::MAX);
+    let permissive = KeyIndexSetPolicy {
+        b_run: KEY_INDEX_SET_PROBE_MAX_RUNS,
+        max_bridged_bytes: u64::MAX,
+    };
+    let mut chosen = None;
+    for n in (128u16..=1000).step_by(32) {
+        let values: BTreeSet<u16> = (0..n).collect();
+        let entry: Rows = values
+            .iter()
+            .map(|v| (*v, BTreeSet::from([0u32])))
+            .collect();
+        let mut spec = PartSpec::simple(vec![entry]);
+        spec.leaf = LeafKind::Split;
+        spec.bucket_bits = 8;
+        let fx = fixture(&[spec], &[], KeyType::Str).await;
+        let keys = key_set(KeyType::Str, &values);
+        let handle = &fx.parts.parts[0];
+        assert_eq!(handle.key_index.len(), 2, "a split part has two slices");
+        let request = KeyIndexLeafRequest {
+            tenant_hash: TENANT,
+            signal: SIGNAL,
+            part_blake3: &handle.blake3,
+            part_entry_count: handle.entry_count,
+            field: keys.field(),
+            key_type: keys.key_type(),
+        };
+        let reader = CountingReader::new(fx.store.clone());
+        let accounting = QueryAccounting::new();
+        let mut per_slice = Vec::new();
+        for (s, leaf_ref) in handle.key_index.iter().enumerate() {
+            let slice_keys: Vec<Key8> = keys
+                .keys()
+                .iter()
+                .copied()
+                .filter(|k| (u64::from_be_bytes(*k) < cut) == (s == 0))
+                .collect();
+            let probe = fx
+                .catalog
+                .probe_key_index_leaf_set_with(
+                    leaf_ref,
+                    &request,
+                    &slice_keys,
+                    &KeyIndexLeafLimits::default(),
+                    |range| reader.read_range(leaf_ref, range, &accounting),
+                    &permissive,
+                    |bytes| budget.try_reserve(bytes).ok(),
+                )
+                .await
+                .expect("probe");
+            assert!(
+                matches!(probe.answer, KeyIndexSetAnswer::Answered { .. }),
+                "slice {s} answers under a permissive policy: {:?}",
+                probe.answer
+            );
+            per_slice.push(probe.bridged_bytes);
+        }
+        let (b0, b1) = (per_slice[0], per_slice[1]);
+        if b0 > 0 && b1 > 0 && b0 <= cap && b1 <= cap && b0 + b1 > cap {
+            chosen = Some((fx, keys, values, b0, b1));
+            break;
+        }
+    }
+    let (fx, keys, values, b0, b1) =
+        chosen.expect("a key count whose slices each fit the part's allowance but not together");
+
+    let both = run(&fx, &keys, &budget, ADR_CEILING).await;
+    let (routes, figures) = both.result.as_ref().expect("route");
+    assert_eq!(
+        figures.skipped_by_budget, 1,
+        "slices {b0} + {b1} over {cap}"
+    );
+    assert_eq!(figures.parts_covered, 0);
+    assert!(routes.iter().all(|r| *r == SegmentRoute::Uncovered));
+
+    // The same keys confined to the first slice fit the allowance alone and
+    // the part is covered: the decline above was the sum, not one slice.
+    let low: BTreeSet<u16> = values
+        .iter()
+        .copied()
+        .filter(|v| u64::from_be_bytes(value_key8(KeyType::Str, *v)) < cut)
+        .collect();
+    let one = run(&fx, &key_set(KeyType::Str, &low), &budget, ADR_CEILING).await;
+    let (_, figures) = one.result.as_ref().expect("route");
+    assert_eq!(
+        figures.skipped_by_budget, 0,
+        "slice 0 alone reads {b0} of {cap}"
+    );
+    assert_eq!(figures.parts_covered, 1);
 }
 
 #[test]

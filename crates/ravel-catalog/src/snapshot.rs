@@ -195,15 +195,15 @@ pub struct SegmentOrigins {
 }
 
 /// One folded snapshot part a resolve loaded, as a key-index router needs it
-/// (ADR-3692 decision 1): the part's identity and hour range from HEAD, and
-/// the refs of its key-index leaves.
+/// (ADR-3692 decision 1): the part's identity, size and watermark hour from
+/// HEAD, and the refs of its key-index leaves. A reader that needs the
+/// part's first hour adds it when it does; nothing reads one yet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotPartHandle {
     /// The part's blake3 in HEAD (32 bytes), which every leaf of the part
     /// binds to.
     pub blake3: Vec<u8>,
     pub entry_count: u64,
-    pub min_hour: u32,
     pub watermark_hour: u32,
     pub key_index: Vec<SnapshotKeyIndexLeafRef>,
 }
