@@ -223,6 +223,7 @@ async fn the_server_floors_the_bulk_scan_threshold_at_its_cache_size() {
 fn server_config(tokens: HashMap<String, TenantId>, cache_max_bytes: u64) -> ServerConfig {
     ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
         audit_pipeline: None,
         audit_text: Default::default(),
         query_budgets: QueryBudgets {

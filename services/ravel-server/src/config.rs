@@ -331,7 +331,8 @@ impl LogsFetchPolicyArg {
 /// value). The header's own `strict-arrival`/`strict-aged` values override
 /// this per request on the OTLP HTTP and OTLP gRPC paths, and per stream on
 /// OTAP, which reads the mode once at stream open; Remote Write reads no
-/// header at all (ADR-2793 decision 1) and is governed by this flag alone.
+/// header at all (ADR-2793 decision 1) and, under
+/// `--remote-write-mode strict`, is governed by this flag alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum StrictFlushPolicy {
     /// A strict write's flush opens on the age threshold or the size
@@ -350,6 +351,33 @@ impl StrictFlushPolicy {
         match self {
             StrictFlushPolicy::Aged => ravel_ingest::WriteMode::Strict,
             StrictFlushPolicy::Arrival => ravel_ingest::WriteMode::StrictArrival,
+        }
+    }
+}
+
+/// The `--remote-write-mode` values (ADR-2793, 2026-11-04 amendment): when
+/// a Prometheus Remote Write request is acknowledged. The operator chooses
+/// once for the process; Remote Write reads no `x-ravel-ingest-mode` header,
+/// so a client cannot choose its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum RemoteWriteMode {
+    /// Acknowledged after admission and enqueue, under the buffered-mode
+    /// contract. A crash before the flush loses the acknowledged window; the
+    /// response carries no commit token.
+    #[default]
+    Buffered,
+    /// Acknowledged after the commit record is stored, under
+    /// `--strict-flush-policy`; the response carries the commit token.
+    Strict,
+}
+
+impl RemoteWriteMode {
+    /// The [`ravel_ingest::WriteMode`] a Remote Write request resolves to
+    /// under this mode, with `policy` choosing the strict flush.
+    pub fn write_mode(self, policy: StrictFlushPolicy) -> ravel_ingest::WriteMode {
+        match self {
+            RemoteWriteMode::Buffered => ravel_ingest::WriteMode::Buffered,
+            RemoteWriteMode::Strict => policy.write_mode(),
         }
     }
 }
@@ -2212,8 +2240,9 @@ pub struct Cli {
     /// it is submitted.
     /// Over the limit, the request is refused before it is buffered and holds
     /// no buffer byte charge: HTTP gets 429 with `Retry-After`, gRPC gets
-    /// `RESOURCE_EXHAUSTED`. Every Remote Write is strict; buffered OTLP
-    /// writes never take a slot.
+    /// `RESOURCE_EXHAUSTED`. A Remote Write request takes a slot only under
+    /// `--remote-write-mode strict`; buffered Remote Write and buffered OTLP
+    /// writes take none.
     /// Because a slot is held while the body is still being read or decoded,
     /// a limit below `--max-inflight-ingest-requests`, or any limit while
     /// that ceiling is `0`, also bounds strict requests still in that phase,
@@ -2516,7 +2545,7 @@ pub struct Cli {
     /// `strict-arrival` and `strict-aged` override this flag for one
     /// request (on OTAP, for one stream); `strict`, an absent header, and an unknown value use it, and
     /// `buffered` is unaffected. Prometheus Remote Write reads no header
-    /// and always uses this flag.
+    /// and, under `--remote-write-mode strict`, uses this flag.
     #[arg(
         long = "strict-flush-policy",
         value_enum,
@@ -2524,6 +2553,23 @@ pub struct Cli {
         default_value_t = StrictFlushPolicy::Aged
     )]
     pub strict_flush_policy: StrictFlushPolicy,
+
+    /// When a Prometheus Remote Write request is acknowledged, process-wide,
+    /// for RW 1.0 and RW 2.0 alike (ADR-2793, 2026-11-04 amendment).
+    /// `buffered` (the default) acknowledges after admission and enqueue:
+    /// a crash before the flush loses the acknowledged window, the request
+    /// takes no `--max-pending-strict-acks` slot, and the response carries
+    /// no commit token. `strict` acknowledges after the commit record is
+    /// stored, under `--strict-flush-policy`, and returns the commit token
+    /// in `x-ravel-commit-token`. Remote Write reads no
+    /// `x-ravel-ingest-mode` header in either mode.
+    #[arg(
+        long = "remote-write-mode",
+        value_enum,
+        env = "RAVEL_REMOTE_WRITE_MODE",
+        default_value_t = RemoteWriteMode::Buffered
+    )]
+    pub remote_write_mode: RemoteWriteMode,
 
     /// Fast-tier flush age threshold, shared by all three ingest pipelines
     /// (ADR-0076 decision 4), as a humantime duration (e.g. `2s`). Applied

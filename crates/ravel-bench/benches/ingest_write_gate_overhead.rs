@@ -740,6 +740,7 @@ fn remote_write_state(
     let state = Arc::new(RemoteWriteState {
         tenant_resolver: Arc::new(FixedTenant),
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Strict,
         router: router.clone(),
         limits: IngestLimits::default(),
         ack_deadline: Duration::from_secs(30),

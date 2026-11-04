@@ -77,6 +77,7 @@ async fn start_server(
     ]);
     let config = ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: QueryBudgets {

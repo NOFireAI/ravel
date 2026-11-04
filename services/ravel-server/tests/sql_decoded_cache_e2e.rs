@@ -409,6 +409,7 @@ fn sample(body: &str, name: &str) -> u64 {
 fn server_config(tokens: HashMap<String, TenantId>, decoded_cache_max_bytes: u64) -> ServerConfig {
     ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
         audit_pipeline: None,
         audit_text: Default::default(),
         query_budgets: QueryBudgets {

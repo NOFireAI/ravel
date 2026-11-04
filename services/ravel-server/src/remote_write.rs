@@ -1,13 +1,13 @@
 //! `POST /api/v1/write`: Prometheus Remote Write 1.0 and 2.0 ingest
 //! (ADR-0015).
 //!
-//! This surface is strict-mode only regardless of the OTLP ingest mode
-//! header: a Remote Write sender expects a 2xx to mean the samples are
-//! durable, so the buffered-mode override honored by `otlp_http`/`otlp_grpc`
-//! is never read here. Which strict write mode that is comes from the
-//! process `--strict-flush-policy` default alone (ADR-2793 decision 1):
-//! this surface has no per-request override, since there is no header read
-//! here to carry one.
+//! The acknowledgement mode is the operator's `--remote-write-mode`
+//! (ADR-2793, 2026-11-04 amendment), process-wide: `buffered` (the default)
+//! acknowledges after admission and enqueue, `strict` after the commit
+//! record is stored, under the process `--strict-flush-policy` (ADR-2793
+//! decision 1). The `x-ravel-ingest-mode` header honored by
+//! `otlp_http`/`otlp_grpc` is never read here, so a client cannot choose
+//! its own mode or opt out of the pending-ack bound.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -223,9 +223,13 @@ pub struct RemoteWriteState {
     pub write_gate: Option<Arc<WriteGate>>,
     /// The process default strict flush policy (ADR-2793 decision 1),
     /// resolved from `--strict-flush-policy`. This surface reads no header
-    /// (see the module doc comment above), so every write resolves through
+    /// (see the module doc comment above), so under
+    /// [`crate::config::RemoteWriteMode::Strict`] every write resolves through
     /// this value alone.
     pub strict_flush_policy: crate::config::StrictFlushPolicy,
+    /// The operator's `--remote-write-mode`: whether every write on this
+    /// surface is acknowledged buffered or strict.
+    pub remote_write_mode: crate::config::RemoteWriteMode,
     /// The process's IPCrypt policy, as [`crate::ingest::IngestState::ipcrypt`].
     pub ipcrypt: Arc<crate::ipcrypt::IpcryptPolicy>,
     /// The normalize-layer counters the OTLP and OTAP surfaces share; this
@@ -252,10 +256,11 @@ impl crate::ingest_admission::IngestAdmissionState for RemoteWriteState {
         self.router.pending_ack_budget()
     }
 
-    /// Every Remote Write is strict: this surface reads no mode header, so a
-    /// client cannot opt out of the pending-ack bound.
+    /// Strict exactly when the operator chose `--remote-write-mode strict`:
+    /// this surface reads no mode header, so a client can neither opt out of
+    /// the pending-ack bound nor into it.
     fn strict_write(&self, _headers: &HeaderMap) -> bool {
-        true
+        self.remote_write_mode == crate::config::RemoteWriteMode::Strict
     }
 }
 
@@ -534,16 +539,18 @@ async fn remote_write(
     // charge and the router's buffered charge never coexist for the same
     // request (issue #1297 finding 3).
     drop(inflate_charge);
-    // The in-flight permit goes back once the write is enqueued, before the
-    // strict ack is awaited (ADR-2793 decision 4): every Remote Write is
-    // strict, so this is the surface whose ack wait the permit covered most.
+    // The in-flight permit goes back once the write is enqueued, before a
+    // strict ack is awaited (ADR-2793 decision 4). A buffered write's acks
+    // resolve without waiting for a flush.
     let written = match state
         .router
         .submit_admitted(
             tenant,
             ingest_points,
             Vec::new(),
-            state.strict_flush_policy.write_mode(),
+            state
+                .remote_write_mode
+                .write_mode(state.strict_flush_policy),
             state.ack_deadline,
             pending_ack.take(),
         )
@@ -788,6 +795,7 @@ pub(crate) mod tests {
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
             write_gate: None,
             strict_flush_policy: crate::config::StrictFlushPolicy::Aged,
+            remote_write_mode: crate::config::RemoteWriteMode::Strict,
         })
     }
 

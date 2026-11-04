@@ -47,6 +47,7 @@ const METRIC_SAMPLES: i64 = 5;
 fn server_config(tokens: HashMap<String, TenantId>) -> ServerConfig {
     ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

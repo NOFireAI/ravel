@@ -1987,6 +1987,7 @@ mod catalog_cache_tests {
             drain_settle_interval: Duration::ZERO,
             max_ingest_lag: crate::DEFAULT_MAX_INGEST_LAG,
             strict_flush_policy: crate::config::StrictFlushPolicy::Aged,
+            remote_write_mode: crate::config::RemoteWriteMode::Buffered,
         }
     }
 

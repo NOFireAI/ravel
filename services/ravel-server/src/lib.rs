@@ -935,6 +935,10 @@ pub struct ServerConfig {
     /// [`remote_write_state`]. See [`crate::config::StrictFlushPolicy`] for
     /// the header-interaction semantics.
     pub strict_flush_policy: crate::config::StrictFlushPolicy,
+    /// The Remote Write acknowledgement mode from `--remote-write-mode`
+    /// (ADR-2793, 2026-11-04 amendment), carried onto
+    /// [`remote_write::RemoteWriteState`] by [`remote_write_state`].
+    pub remote_write_mode: crate::config::RemoteWriteMode,
 }
 
 impl ServerConfig {
@@ -2024,6 +2028,7 @@ fn remote_write_state(
     write_gate: &Arc<ravel_cpu_gate::WriteGate>,
     max_ingest_lag_ns: i64,
     strict_flush_policy: config::StrictFlushPolicy,
+    remote_write_mode: config::RemoteWriteMode,
     normalize_reject_metrics: &Arc<normalize_reject_metrics::NormalizeRejectMetrics>,
     ipcrypt: &Arc<ipcrypt::IpcryptPolicy>,
 ) -> Arc<remote_write::RemoteWriteState> {
@@ -2045,6 +2050,7 @@ fn remote_write_state(
         budget: ingest_buffer_budget.clone(),
         write_gate: Some(write_gate.clone()),
         strict_flush_policy,
+        remote_write_mode,
         ipcrypt: ipcrypt.clone(),
         normalize_metrics: normalize_reject_metrics.clone(),
     })
@@ -3168,6 +3174,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             &cpu_gates.write,
             ingest_lag.admission_lag_ns,
             config.strict_flush_policy,
+            config.remote_write_mode,
             &normalize_reject_metrics,
             &ipcrypt,
         );
@@ -3205,6 +3212,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 &cpu_gates.write,
                 ingest_lag.admission_lag_ns,
                 config.strict_flush_policy,
+                config.remote_write_mode,
                 &normalize_reject_metrics,
                 &ipcrypt,
             );
@@ -6161,6 +6169,7 @@ mod startup_test_support {
             drain_settle_interval: Duration::ZERO,
             max_ingest_lag: DEFAULT_MAX_INGEST_LAG,
             strict_flush_policy: config::StrictFlushPolicy::Aged,
+            remote_write_mode: config::RemoteWriteMode::Buffered,
         }
     }
 }

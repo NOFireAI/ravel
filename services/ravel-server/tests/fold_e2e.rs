@@ -342,6 +342,7 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
     let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
     let config = ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),
@@ -506,6 +507,7 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
 
     let config = ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

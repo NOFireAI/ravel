@@ -57,6 +57,7 @@ async fn start_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::Runni
 
     let config = ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
         audit_pipeline: Some(ravel_maintain::AuditPipelineConfig {
             audit_mode: ravel_maintain::AuditMode::Required,
             ..Default::default()

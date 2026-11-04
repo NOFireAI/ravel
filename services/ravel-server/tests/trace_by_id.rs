@@ -74,6 +74,7 @@ fn server_config(mcp_enabled: bool) -> ServerConfig {
     tokens.insert(OTHER_TOKEN.to_string(), TenantId::new(OTHER_TENANT));
     ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
         audit_pipeline: Some(ravel_maintain::AuditPipelineConfig {
             audit_mode: ravel_maintain::AuditMode::Required,
             ..Default::default()

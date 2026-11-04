@@ -136,6 +136,7 @@ async fn start_test_server_with_store_metrics(
             1024,
         ),
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
     };
     match heartbeat {
         Some(heartbeat) => ravel_server::start_with_heartbeat(
@@ -1385,6 +1386,7 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
             ..LimitsConfig::default()
         },
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
     };
     ravel_server::start(
         config,
@@ -1621,6 +1623,7 @@ async fn start_attribution_server() -> ravel_server::Running {
             ..LimitsConfig::default()
         },
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
     };
     ravel_server::start(
         config,

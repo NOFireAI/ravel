@@ -48,6 +48,7 @@ fn maintain_record_keys(mode: Mode) -> Option<ravel_maintain::worker_set::Mainta
 fn maintain_config(mode: Mode, tenant: &TenantId) -> ServerConfig {
     ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

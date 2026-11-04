@@ -60,6 +60,7 @@ pub fn server_config() -> ServerConfig {
     tokens.insert(TOKEN_B.to_string(), TenantId::new(TENANT_B));
     ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
         audit_pipeline: None,
         audit_text: ravel_maintain::AuditTextPolicy::default(),
         query_budgets: QueryBudgets {

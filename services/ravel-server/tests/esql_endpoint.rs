@@ -38,6 +38,7 @@ fn server_config(mtls: bool) -> ServerConfig {
     mtls_tokens.insert(MTLS_TOKEN.to_string(), TenantId::new(TENANT));
     ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
         audit_pipeline: None,
         audit_text: Default::default(),
         query_budgets: Default::default(),

@@ -307,6 +307,7 @@ pub async fn start_server_with(
     let loopback: SocketAddr = "127.0.0.1:0".parse()?;
     let config = ServerConfig {
         strict_flush_policy: options.strict_flush_policy,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Strict,
         // The query audit is off (#2791): no audit PUT and no flush await per
         // query. The ADR-1702 task 11 bands in `saturation` were published
         // against an audited server; see the note there.

@@ -108,6 +108,7 @@ pub async fn start_with(
     let store: Arc<dyn ObjectStoreBackend> = faults;
     let mut config = ServerConfig {
         strict_flush_policy: policy,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
         audit_pipeline: Default::default(),
         audit_text: Default::default(),
         query_budgets: Default::default(),

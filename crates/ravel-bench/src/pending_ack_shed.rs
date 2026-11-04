@@ -496,6 +496,7 @@ pub async fn start_ingest_server(
     let loopback: std::net::SocketAddr = "127.0.0.1:0".parse()?;
     let config = ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Arrival,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Strict,
         audit_pipeline: None,
         audit_text: Default::default(),
         query_budgets: Default::default(),

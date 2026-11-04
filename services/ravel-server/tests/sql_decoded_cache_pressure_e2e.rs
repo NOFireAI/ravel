@@ -207,6 +207,7 @@ async fn a_full_budget_admits_a_statement_by_evicting_unheld_cache_entries() {
 fn server_config(tokens: HashMap<String, TenantId>) -> ServerConfig {
     ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        remote_write_mode: ravel_server::config::RemoteWriteMode::Buffered,
         audit_pipeline: None,
         audit_text: Default::default(),
         query_budgets: QueryBudgets {
