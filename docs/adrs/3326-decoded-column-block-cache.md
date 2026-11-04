@@ -1510,14 +1510,14 @@ The investigation also predicts the 43-statement CPU geomean 0.012 lower
 than A (predicted, `predict.out`).
 
 The second pull request's paired run also carried a decoded-cache hits and
-misses row, within 1% of A per statement, on the basis that a keys buffer
-left out of the charge moves no admission. That basis was incomplete, and
-the row missed: q34 read 283 misses per call in A and 788 in B, and all
-misses read 1.019 of A, in both directions across statements, while no
-speed row moved (measured 2026-11-04, #3326 comment 6624033130). The key
-path also changes eviction: a batch that holds an entry's keys makes the
-entry held, so a pressure pass evicts a different one. That is the likely
-cause; it was not measured.
+misses row, within 1% of A per statement. It missed: q34 read 283 misses
+per call in A and 788 in B, and all misses read 1.019 of A, while no speed
+row moved (measured 2026-11-04, #3326 comment 6624033130). The row is noise
+at that grain: a later run whose arms differ only in the memo charge moved
+the same counters as much, in both directions (q34 1,395 in A, 672 in B),
+and q34's misses vary from 57 to 1,731 per round within one arm (measured
+2026-11-04, #3326 comment 6626899753). Whole-loop misses per round stay
+within about 1.5% within one arm.
 
 **Out of scope.**
 - **A view memo for GROUP BY.** The dictionary-to-view cast costs 1.07 s
