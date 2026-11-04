@@ -6,6 +6,21 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.30.1] - 2026-11-04
+
+### Fixed
+
+- **`ravel-server --mode maintain --store gcs` now starts** (#3802).
+  Previously the GCS backend reported no multipart upload support, so
+  maintain mode refused to start with "unsupported: multipart" and a GCS
+  deployment never compacted or garbage-collected its objects. The GCS
+  backend now supports multipart upload through the XML API, using the same
+  upload handle as S3, with the object's generation as the completed
+  version (`maintain_mode_accepts_the_gcs_backend`,
+  `multipart_three_parts_complete_to_the_concatenated_bytes`,
+  `multipart_abort_after_two_parts_leaves_no_object`). No re-qualification
+  is needed.
+
 ## [0.30.0] - 2026-11-03
 
 ### Fixed
