@@ -30,6 +30,11 @@ Subcommands:
   get                       print one run.toml value for bash
   warmup                    wait for the server's startup cache warmup and
                             print what it warmed
+  stride-check              the event-time check a strided load runs before
+                            each batch, run over the whole Parquet file
+                            before the load (reads it through pyarrow, the
+                            corpus generator's own dependency; every other
+                            subcommand is stdlib only)
 
 Every failure exits non-zero with one line on stderr.
 """
@@ -52,6 +57,9 @@ import xml.etree.ElementTree as ET
 
 ROW_SET_MAX = 100
 HOUR_NS = 3_600_000_000_000
+# ravel_catalog::DEFAULT_MAX_INGEST_LAG_NS (crates/ravel-catalog/src/config.rs:8),
+# the lag a strided load's per-batch check adds to each ingest hour's end.
+MAX_INGEST_LAG_NS = 2 * HOUR_NS
 NARROW_NS = 300_000_000_000
 
 
@@ -1060,6 +1068,52 @@ def cmd_warmup(args):
         time.sleep(0.2)
 
 
+def stride_refusal(ends_ns, batch_rows, start_hour, stride, lag_ns, batches):
+    """The reason a strided load of rows with these event times (in file
+    order) would refuse a batch, or None. Mirrors `HourStrideLane::begin_batch`
+    (services/ravel-cli/src/load/hour_stride.rs:293): batch i, the file's
+    rows [i * batch_rows, (i + 1) * batch_rows), goes into ingest hour
+    start_hour + i * stride and is refused (EventTimePastLag, line 311) when
+    its latest event time is not before that hour's end plus the lag. Also
+    refuses a file that deals other than `batches` batches, since each batch
+    is one of the state's hours."""
+    dealt = -(-len(ends_ns) // batch_rows)
+    if dealt != batches:
+        return (f"the corpus deals {dealt} batches of {batch_rows} rows ({len(ends_ns)} rows), not the "
+                f"{batches} strided ingest hours the state loads")
+    for i in range(dealt):
+        top = max(ends_ns[i * batch_rows:(i + 1) * batch_rows])
+        hour = start_hour + i * stride
+        bound = (hour + 1) * HOUR_NS + lag_ns
+        if top >= bound:
+            return (f"--ingest-hour-stride would refuse batch {i} before submitting it: its latest event time "
+                    f"{top} ns is not before {bound} ns, the end of its ingest hour {hour} plus max_ingest_lag "
+                    f"({lag_ns} ns) (EventTimePastLag, services/ravel-cli/src/load/hour_stride.rs:311)")
+    return None
+
+
+def cmd_stride_check(args):
+    """Exit 0 printing the batch count when every batch passes, else exit 1
+    with the refusal on stdout (run.sh records it as the state's not-run
+    reason)."""
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as e:
+        die(f"stride-check: {e}", 70)
+    try:
+        col = pq.read_table(args.parquet, columns=[args.event_column]).column(0)
+    except Exception as e:  # pyarrow raises its own error types
+        die(f"stride-check: {args.parquet}: {e}")
+    ends = [int(v) for v in col.cast("int64").to_pylist()]
+    if args.batch_rows < 1:
+        die("stride-check: --batch-rows must be at least 1", 64)
+    why = stride_refusal(ends, args.batch_rows, args.ingest_hour_start, args.stride, args.lag_ns, args.batches)
+    if why:
+        print(why)
+        sys.exit(1)
+    print(json.dumps({"batches": args.batches, "batch_rows": args.batch_rows, "rows": len(ends)}))
+
+
 def cmd_kv_report(args):
     """A text tool report as JSON: each `key: value` line (an integer value
     as a number), a count per `outcome=X` line (maintain compact-tenant), and
@@ -1188,6 +1242,16 @@ def main():
     m.add_argument("--stdout", required=True)
     m.add_argument("cmd", nargs=argparse.REMAINDER)
     m.set_defaults(fn=cmd_measure)
+
+    sc = sub.add_parser("stride-check")
+    sc.add_argument("--parquet", required=True)
+    sc.add_argument("--event-column", default="end_ts", help="the column the loader reads a batch's latest event from")
+    sc.add_argument("--batch-rows", type=int, required=True)
+    sc.add_argument("--batches", type=int, required=True, help="the strided ingest hours the state loads")
+    sc.add_argument("--ingest-hour-start", type=int, required=True)
+    sc.add_argument("--stride", type=int, default=1)
+    sc.add_argument("--lag-ns", type=int, default=MAX_INGEST_LAG_NS)
+    sc.set_defaults(fn=cmd_stride_check)
 
     kv = sub.add_parser("kv-report")
     kv.add_argument("--log", required=True)
