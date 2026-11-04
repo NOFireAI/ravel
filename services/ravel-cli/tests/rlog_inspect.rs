@@ -414,9 +414,11 @@ fn rlog_inspect_prints_the_key_idx_summary() {
     let footer = ravel_logseg::footer::open(&object).expect("object opens");
     let desc = key_index::key_index_section(&footer).expect("KEY_IDX section");
     let raw = &object[desc.offset as usize..(desc.offset + desc.len) as usize];
-    let summary = key_index::summarize(&footer, raw)
+    let inspection = key_index::summarize(&footer, raw)
         .expect("summary verifies")
         .expect("summary present");
+    assert!(inspection.findings.is_empty());
+    let summary = &inspection.summary;
 
     let stdout = inspect_stdout(&object, "key-idx");
     let section_line = format!(

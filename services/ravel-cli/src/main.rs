@@ -4619,10 +4619,22 @@ fn rlog_inspect(bytes: &[u8]) -> anyhow::Result<()> {
             .zip(usize::try_from(desc.len).ok())
             .and_then(|(start, len)| bytes.get(start..start.checked_add(len)?))
             .ok_or_else(|| anyhow::anyhow!("KEY_IDX section range is past the object"))?;
-        let summary = key_index::summarize(&footer, raw)
+        let inspection = key_index::summarize(&footer, raw)
             .map_err(|err| anyhow::anyhow!("failed to verify KEY_IDX section: {err}"))?
             .ok_or_else(|| anyhow::anyhow!("KEY_IDX section vanished from the footer"))?;
-        print_key_idx_summary(&summary);
+        print_key_idx_summary(&inspection.summary);
+        for finding in &inspection.findings {
+            println!(
+                "key_idx finding: field={} bucket={} names block {}, object has {} blocks",
+                finding.field, finding.bucket, finding.ordinal, footer.block_count
+            );
+        }
+        if !inspection.findings.is_empty() {
+            anyhow::bail!(
+                "KEY_IDX section names {} block ordinal(s) at or past the object's block count",
+                inspection.findings.len()
+            );
+        }
     }
 
     Ok(())
@@ -4855,7 +4867,22 @@ fn rspan_inspect(bytes: &[u8]) -> anyhow::Result<()> {
         let key_idx = reader
             .key_idx_summary()
             .map_err(|err| anyhow::anyhow!("failed to verify KEY_IDX section: {err}"))?;
-        print_key_idx_summary(&key_idx);
+        print_key_idx_summary(&key_idx.summary);
+        for finding in &key_idx.findings {
+            println!(
+                "key_idx finding: field={} bucket={} names block {}, object has {} blocks",
+                finding.field,
+                finding.bucket,
+                finding.ordinal,
+                skip.blocks.len()
+            );
+        }
+        if !key_idx.findings.is_empty() {
+            anyhow::bail!(
+                "KEY_IDX section names {} block ordinal(s) at or past the object's block count",
+                key_idx.findings.len()
+            );
+        }
 
         // One line per span, in the object's stored (trace_id, start_ts) order.
         // `service_name` is the column lifted out of the attribute map (v3,
