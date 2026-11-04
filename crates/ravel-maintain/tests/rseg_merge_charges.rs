@@ -1,9 +1,10 @@
 //! The RSEG merge releases every merge memory tracker charge on every exit
 //! from `build_parts`, not only on success (issue #3817).
 //!
-//! In Mode::Maintain one tracker is shared for the life of the process, so a
-//! charge a failed merge leaves behind is carried by every later figure read
-//! from it. Each test here drives one exit of the merge with a tracker
+//! A charge a failed merge leaves behind stays in the tracker's live terms
+//! until the next run's `reset_for_run`, and every figure read from the
+//! tracker in between carries it. Each test here drives one exit of the merge
+//! with a tracker
 //! installed and asserts every live term is zero afterwards
 //! ([`MergeMemoryTracker::live_bytes`]), while the high-water figures the run
 //! recorded stay readable.
@@ -107,8 +108,8 @@ fn assert_peaks_recorded(tracker: &MergeMemoryTracker) {
 /// A page GET that fails with a transient store error mid-merge fails the run
 /// and leaves every live term at zero.
 ///
-/// Shown failing against the release-on-`Ok`-only merge: `catalog_plan`,
-/// `catalog_labels` and `plan_index` read nonzero.
+/// Shown failing on the `live_bytes` assertion against the release-on-`Ok`-only
+/// merge: `catalog_plan`, `catalog_labels` and `plan_index` read nonzero.
 #[tokio::test]
 async fn a_failed_page_get_releases_every_charge() {
     let inner = MemoryStore::new();
@@ -142,10 +143,11 @@ async fn a_failed_page_get_releases_every_charge() {
 /// A page whose bytes come back corrupted fails the series' decode on the read
 /// gate, and that exit also leaves every live term at zero.
 ///
-/// Shown failing against the release-on-`Ok`-only merge (`catalog_plan`,
-/// `catalog_labels`, `plan_index` and `fetched` nonzero), and against a merge
-/// that releases by hand before each `?` except the read gate's: `decoded`
-/// and `fetched` nonzero.
+/// Shown failing on the `live_bytes` assertion against the release-on-`Ok`-only
+/// merge, and against a merge that releases by hand before every return except
+/// the read gate's error: in both, `fetched`, `decoded`, `catalog_plan`,
+/// `catalog_labels` and `plan_index` read nonzero. The second is the only one
+/// of these tests that merge fails.
 #[tokio::test]
 async fn a_failed_series_decode_releases_every_charge() {
     let inner = MemoryStore::new();

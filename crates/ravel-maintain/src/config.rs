@@ -3099,4 +3099,55 @@ mod tests {
         let bytes = detect_host_memory_total_bytes().expect("MemTotal readable on Linux");
         assert!(bytes >= 256 * MIB, "detected {bytes} bytes");
     }
+
+    /// Fill every term a [`MergeCharges`] owns.
+    fn charge_every_term(charges: &mut MergeCharges<'_>) {
+        charges.add_catalog(1_000, 200);
+        charges.add_plan_index(300);
+        charges.fetched(400);
+        charges.decoded(100, 500);
+        charges.set_writer(600);
+    }
+
+    /// A panic while a merge holds charges still releases them as it unwinds.
+    #[test]
+    fn merge_charges_release_on_panic_unwind() {
+        let tracker = MergeMemoryTracker::new();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut charges = MergeCharges::new(Some(&tracker));
+            charge_every_term(&mut charges);
+            assert_ne!(tracker.live_bytes(), MergeLiveBytes::default());
+            panic!("mid-merge");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(tracker.live_bytes(), MergeLiveBytes::default());
+        assert_eq!(tracker.phase_peaks().catalog_plan_heap_bytes, 1_000);
+    }
+
+    /// A release larger than the guard's own charge takes only that charge,
+    /// leaving bytes another holder charged in place.
+    #[test]
+    fn merge_charges_release_only_what_they_charged() {
+        let tracker = MergeMemoryTracker::new();
+        tracker.block_fetched(7);
+        tracker.add_plan_index_bytes(11);
+        {
+            let mut charges = MergeCharges::new(Some(&tracker));
+            charge_every_term(&mut charges);
+            charges.release_fetched(u64::MAX);
+            charges.release_plan_index(u64::MAX);
+            charges.release_decoded(u64::MAX);
+            assert_eq!(tracker.live_bytes().fetched, 7);
+            assert_eq!(tracker.live_bytes().plan_index, 11);
+            assert_eq!(tracker.live_bytes().decoded, 0);
+        }
+        assert_eq!(
+            tracker.live_bytes(),
+            MergeLiveBytes {
+                fetched: 7,
+                plan_index: 11,
+                ..MergeLiveBytes::default()
+            }
+        );
+    }
 }
