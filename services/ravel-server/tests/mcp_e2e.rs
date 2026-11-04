@@ -1011,6 +1011,7 @@ mod with_mcp {
         fewer_rows: "shorten time_range or add WHERE predicates",
         smaller_rows_action: "narrow_the_projection",
         smaller_rows: "select fewer or narrower columns",
+        read_cell: Some("select fewer or narrower columns to give the cut cells more room"),
     };
 
     fn sql_request(sql: &str) -> ravel_sql::SqlRequest {
