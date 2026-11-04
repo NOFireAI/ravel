@@ -931,16 +931,7 @@ mod tests {
         );
 
         let tenant = TenantHash([14u8; 16]);
-        let event = query_audit_event(
-            &tenant,
-            42,
-            "SELECT 1",
-            "sql",
-            QueryStatus::Ok,
-            None,
-            0,
-            42,
-        );
+        let event = query_audit_event(&tenant, 42, "SELECT 1", "sql", QueryStatus::Ok, None, 0, 42);
         sink.submit(event).await.expect("submit");
 
         assert_eq!(
@@ -987,7 +978,12 @@ mod tests {
         }
         .apply(&mut event);
         assert_eq!(str_attr_of(&event, ATTR_TEXT).as_deref(), Some("{}"));
-        for key in [ATTR_LANGUAGE, ATTR_ENGINE_LANGUAGE, ATTR_QUERY_ID, ATTR_TEXT] {
+        for key in [
+            ATTR_LANGUAGE,
+            ATTR_ENGINE_LANGUAGE,
+            ATTR_QUERY_ID,
+            ATTR_TEXT,
+        ] {
             assert_eq!(
                 event.attrs.iter().filter(|(name, _)| name == key).count(),
                 1,

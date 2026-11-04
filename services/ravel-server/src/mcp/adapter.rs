@@ -238,8 +238,7 @@ impl ServerHandler for RavelMcp {
         // One id per query tool call, on its envelope and on every audit
         // record its service calls write (ADR-1374 decision 3 item 6).
         let query_id = uuid::Uuid::new_v4().to_string();
-        let is_agents =
-            self.agents.is_some() && AGENTS_TOOLS.contains(&request.name.as_ref());
+        let is_agents = self.agents.is_some() && AGENTS_TOOLS.contains(&request.name.as_ref());
         let stamp = |envelope: Envelope| {
             if is_agents {
                 envelope

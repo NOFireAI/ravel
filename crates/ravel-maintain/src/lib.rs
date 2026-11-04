@@ -129,8 +129,8 @@ pub use publish::{
 };
 pub use query_audit::{
     ATTR_ENGINE_LANGUAGE, ATTR_PRINCIPAL_SUBJECT, ATTR_PRINCIPAL_SUBJECT_SOURCE, ATTR_QUERY_ID,
-    AuditCall, AuditCallSink, AuditSubject, AuditTextPolicy, QUERY_AUDIT_SHARD, QueryStatus, QueryTextRedactor, RedactingAuditSink, query_audit_event,
-    write_query_audit,
+    AuditCall, AuditCallSink, AuditSubject, AuditTextPolicy, QUERY_AUDIT_SHARD, QueryStatus,
+    QueryTextRedactor, RedactingAuditSink, query_audit_event, write_query_audit,
 };
 pub use ravel_fleet::worker_set::{WorkerSet, owner, owns, run_bounded, unit_key};
 pub use reachability::MarkerStats;
