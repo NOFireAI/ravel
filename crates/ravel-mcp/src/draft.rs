@@ -218,7 +218,11 @@ impl Draft {
     /// draft's pins and `scope` whenever the draft has a signal, capped or
     /// not. `presentation.rows_omitted` counts every row the caller does not
     /// get: the rows over `budgets.max_rows`, the rows the byte cap dropped,
-    /// and a trailing group [`PageOrder::Grouped`] held back.
+    /// and a trailing group [`PageOrder::Grouped`] held back. Every fit goes
+    /// through [`Envelope::fit_row_capped`], so the row cap's count and
+    /// `row_cap_hit` are inside what the byte cap measured; a held-back group
+    /// adds to the count only as its rows leave the page, which frees more
+    /// bytes than the count's digits grow by.
     ///
     /// The envelope is fitted with a stand-in cursor exactly [`CURSOR_BOUND`]
     /// serialized bytes long before `mint` runs, so the token, which is never
@@ -269,35 +273,28 @@ impl Draft {
             envelope.visibility.snapshot_id = hex(&pins.snapshot_id());
         }
 
-        let produced_rows = envelope.data.row_count;
         let max_rows = budgets.max_rows as usize;
         let pristine = envelope.data.rows.clone();
         let row_cap_omitted = pristine.len().saturating_sub(max_rows) as u64;
         envelope.data.rows.truncate(max_rows);
-        envelope.presentation.row_cap_hit |= row_cap_omitted > 0;
         envelope.presentation.cursor = None;
 
         let cap = budgets.max_response_bytes;
-        let finish = |mut fitted: Envelope, has_total_order: bool| {
-            fitted.presentation.rows_omitted += row_cap_omitted;
-            fitted.data.row_count = produced_rows;
-            fitted.finish(has_total_order)
-        };
         let unpaged = |mut envelope: Envelope, refusal: NoCursor| {
             envelope
                 .warnings
                 .insert(0, format!("no cursor: {}", refusal.reason));
             envelope.next_steps.extend(refusal.next_step);
-            finish(envelope.fit(cap), false)
+            envelope.fit_row_capped(cap, row_cap_omitted).finish(false)
         };
 
-        let probe = envelope.clone().fit(cap);
+        let probe = envelope.clone().fit_row_capped(cap, row_cap_omitted);
         let presentation = &probe.presentation;
         let capped = presentation.row_cap_hit
             || (presentation.bytes_cap_hit
                 && (presentation.rows_omitted > 0 || presentation.cells_truncated > 0));
         if !capped || probe.failure.is_some() || matches!(order, PageOrder::Partial) {
-            return finish(probe, false);
+            return probe.finish(false);
         }
         let pins = match pins {
             Ok(pins) => pins,
@@ -306,7 +303,7 @@ impl Draft {
 
         let mut placed = envelope.clone();
         placed.presentation.cursor = Some("c".repeat(CURSOR_BOUND - 2));
-        let mut fitted = placed.fit(cap);
+        let mut fitted = placed.fit_row_capped(cap, row_cap_omitted);
         let fit_rows = fitted.data.rows.len();
         let mut kept = fit_rows;
         let mut no_complete_group = None;
@@ -339,9 +336,9 @@ impl Draft {
                 let over_bound = serialized_str_len(&token) > CURSOR_BOUND;
                 fitted.presentation.cursor = Some(token);
                 if over_bound {
-                    fitted = fitted.fit(cap);
+                    fitted = fitted.fit_row_capped(cap, row_cap_omitted);
                 }
-                finish(fitted, true)
+                fitted.finish(true)
             }
             Err(refusal) => unpaged(envelope, refusal),
         }
@@ -571,6 +568,7 @@ mod tests {
     use super::*;
     use crate::budget::{McpBudgetConfig, McpRequestBudgets};
     use crate::cursor::{CURSOR_KEY_LEN, CursorKey, GRACE_NS, SegmentSetPin};
+    use crate::envelope::row_cap_sweep::assert_finished_inside_cap;
     use crate::envelope::{Cell, Column, MAX_RESPONSE_BYTES_FLOOR, Status};
 
     const TOOL: &str = "ravel_query_sql";
@@ -785,6 +783,48 @@ mod tests {
         );
         assert_eq!(partial.status, Status::OkBounded);
         assert!(!partial.warnings.iter().any(|w| w.starts_with("no cursor")));
+    }
+
+    /// 10,001 rows cut to one by `max_rows`, the kept one `len` bytes wide,
+    /// packed right up to the byte cap with no identity field reported: the
+    /// page stays inside the cap once the 10,000 omitted rows are counted.
+    ///
+    /// Fitting with `fit` and adding the row cap's count afterwards puts
+    /// these over the cap: `rows_omitted` goes from `0` to `10000` after the
+    /// fit measured it, and the identity allowance has no room for those
+    /// digits.
+    #[test]
+    fn a_row_capped_page_at_its_byte_cap_finishes_inside_it() {
+        let run_with = |len: usize| {
+            let mut envelope = Envelope::default();
+            envelope.data.columns = vec![Column {
+                name: "body".to_owned(),
+                r#type: "string".to_owned(),
+            }];
+            envelope.data.rows = (0..10_001)
+                .map(|i| {
+                    vec![Cell::Str(if i == 0 {
+                        "x".repeat(len)
+                    } else {
+                        String::new()
+                    })]
+                })
+                .collect();
+            envelope.data.row_count = 10_001;
+            Draft::new(
+                envelope,
+                Err(NoCursorSignal::ParquetJoin),
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                NOW_NS,
+            )
+            .finish_page(&budgets(1), &scope(), PageOrder::Partial, |_, _, _| {
+                panic!("a partial order must not reach the mint")
+            })
+        };
+        assert_finished_inside_cap(MAX_RESPONSE_BYTES_FLOOR, 10_000, run_with);
     }
 
     /// Under both caps the result is complete: `ok`, no cursor, and the mint
