@@ -786,6 +786,40 @@ strings. A timestamp with any other offset is refused as
 `visibility.min_commit_tokens_applied` echoes each token in the wire form the
 caller sent: on a SQL call a token qualified by table reads `<table>:<token>`.
 
+### Query ids and audit records
+
+Every query tool call gets one id, a UUID minted when the call arrives.
+`ids.query_id` carries it on every envelope that call returns, failures
+included, and the `ids.query_id is not reported by this operation` warning
+does not appear. The six Ravel Agents tools write no query audit record and
+leave `ids.query_id` empty. `ids.audit_ref` stays empty on every tool.
+
+Each service call a tool makes writes one `kind=query` audit record, and
+every such record of an MCP call carries:
+
+| Attribute | Value |
+| --- | --- |
+| `query.language` | `mcp:<tool>`, for example `mcp:ravel_query_sql` |
+| `query.engine_language` | the language the engine ran, the one the same query over HTTP records: `sql` (which `ravel_explain_query`, `ravel_search_logs` and `ravel_get_trace` run), `promql`, `analytics`, `exemplars`, `describe_data`, `labels`, `label_values` or `series` |
+| `query.id` | the call's `ids.query_id` |
+| `query.text` | the statement the engine ran, as on the HTTP routes |
+
+The record's body reads `mcp:<tool> query <status>`. A call that makes two
+service calls writes two records under one `query.id`: `ravel_search_logs`
+with `predicates` checks its keys with a `describe_data` call, then runs its
+SQL page. `ravel_find_labels` records its matcher set as `query.text`: each
+selector in PromQL's canonical form, joined by `; `, or `{}` when the call
+names no selector. Text redaction under `--audit-text redacted` follows
+`query.engine_language`, so an MCP SQL statement is redacted as SQL.
+
+`ravel_capabilities` writes no audit record. It answers from compile-time
+facts and the authenticated caller, reads no tenant data, and makes no
+service call, so there is nothing to audit; its envelope still carries an
+`ids.query_id`.
+
+A query over the HTTP API keeps the engine's language in `query.language`
+and carries neither `query.engine_language` nor `query.id`.
+
 ### The byte cap
 
 `max_response_bytes` bounds the serialized size of this whole envelope, not
