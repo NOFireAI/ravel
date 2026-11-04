@@ -1912,10 +1912,7 @@ async fn gcs_store_contract_against_the_fake() {
 /// [`Capabilities::mandatory()`] plus `multipart` (ADR-3456, amendment for
 /// #3802) and no upload checksums (ADR-3456 D1).
 fn gcs_expected_capabilities() -> Capabilities {
-    Capabilities {
-        multipart: true,
-        ..Capabilities::mandatory()
-    }
+    s3_expected_capabilities()
 }
 
 /// `GcsStore` against a real bucket, gated on `RAVEL_GCS_TEST_BUCKET`. The
@@ -1948,6 +1945,14 @@ async fn gcs_contract() {
         "every GCS response carries a Date header"
     );
 
+    // The lister refuses an item with neither md5Hash nor componentCount, which
+    // an XML multipart upload may leave on real GCS (ADR-3456, amendment for
+    // #3802). Delete the multipart probe's object by key first, so the cleanup
+    // listing below never meets it.
+    store
+        .delete(&format!("{root}/multipart/object"))
+        .await
+        .expect("delete the multipart probe's object before the cleanup listing");
     let leftovers = list_all(&store, &format!("{root}/"))
         .await
         .expect("list_all for cleanup");
