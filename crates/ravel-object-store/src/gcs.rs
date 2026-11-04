@@ -79,7 +79,8 @@
 //! The client sends through the S3 adapter's connector
 //! ([`crate::s3`]'s `connector` module), installed with
 //! `GoogleCloudStorageBuilder::with_http_connector`. It counts every HTTP
-//! attempt, retries included, into the [`StoreMetrics`] this store was built
+//! attempt of a call, retries included (a multipart upload's requests are not
+//! a call's, below), into the [`StoreMetrics`] this store was built
 //! with, and records each response's `Date` header, which
 //! [`ObjectStoreBackend::observed_store_time_ns`] reports. The listing client
 //! sends through the same connector, around a reqwest client of its own that
@@ -87,11 +88,30 @@
 //! through the connector too; only requests to the store's own host (Google's
 //! endpoint, or [`GcsConfig::base_url`]'s) are counted and read for a `Date`.
 //!
+//! # Multipart upload
+//!
+//! `multipart: true`, which `--mode maintain` requires (ADR-3456, amendment
+//! for #3802). [`ObjectStoreBackend::put_multipart`] opens an XML API
+//! multipart upload through `object_store`'s GCS client (`POST ?uploads`,
+//! `PUT ?partNumber=N&uploadId=X` per part, `POST ?uploadId=X` with a
+//! `CompleteMultipartUpload` body, `DELETE ?uploadId=X` to abort) and drives
+//! it with the S3 adapter's handle, so the part-sequence rules, the poisoning
+//! and the checksum pre-flight are the S3 code. `complete` returns the
+//! generation from `x-goog-generation` as the version, as `put` does. Its
+//! requests are not counted into [`StoreMetrics`], as on S3: a multipart
+//! upload is a handle, not a call.
+//!
+//! Google documents no MD5 for an object an XML multipart upload completed,
+//! and whether its listing item carries `componentCount` is not verified. An
+//! item with neither fails the listing call (above), so a listing over such an
+//! object is unproven until the real-bucket contract lane, whose cleanup lists
+//! the multipart probe's object, has run. The fake serves one with neither.
+//!
 //! # What this backend does not do
 //!
-//! No multipart upload (`multipart: false`; `put_multipart` refuses), no upload
-//! checksum (`upload_checksum: false`; a caller's CRC32C is checked against the
-//! buffer before the request and not sent), and no bucket-protection probes.
+//! No upload checksum (`upload_checksum: false`; a caller's CRC32C is checked
+//! against the buffer before the request and not sent, on a part as on a
+//! `put`), and no bucket-protection probes.
 //! A full-object read is one GET, not split into ranges, so it has to finish
 //! inside [`GcsConfig::request_timeout`]. Every full-object read is counted by
 //! [`GcsStore::get_unverified`], since no stored checksum is checked.
@@ -122,11 +142,11 @@ use object_store::{
 use crate::instrument::{StoreMetrics, StoreOp};
 use crate::s3::connector::{self, ObservedStoreTime, S3HttpConnector};
 use crate::s3::{
-    LIST_PAGE_SIZE, S3HttpConfig, list_http_client, map_error_common, map_get_error, path_of,
-    preflight_checksum,
+    LIST_PAGE_SIZE, S3HttpConfig, S3MultipartUpload, list_http_client, map_error_common,
+    map_get_error, path_of, preflight_checksum,
 };
 use crate::{
-    Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, ObjectMeta,
+    Capabilities, DelimitedList, Etag, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
     ObjectStoreBackend, PageToken, Pin, PinnedRead, PutMode, PutOptions, PutOutcome, StoreError,
     Version,
 };
@@ -483,6 +503,16 @@ fn generation_of(key: &str, generation: Option<String>) -> Result<String, StoreE
     generation.ok_or_else(|| StoreError::Permanent(format!("GCS returned no generation for {key}")))
 }
 
+/// The outcome of a completed multipart upload: the generation from
+/// `x-goog-generation` is the version, as for a single `put`, and the ETag is
+/// the one the `CompleteMultipartUploadResult` body names.
+fn multipart_outcome(key: &str, result: object_store::PutResult) -> Result<PutOutcome, StoreError> {
+    Ok(PutOutcome {
+        etag: Etag(etag_of(key, result.e_tag)?),
+        version: Version(generation_of(key, result.version)?),
+    })
+}
+
 /// Whether `token` can be a GCS generation: a positive decimal integer with
 /// no leading zero and no sign, at most `i64::MAX` (generations are int64).
 fn is_generation(token: &str) -> bool {
@@ -554,6 +584,26 @@ impl ObjectStoreBackend for GcsStore {
             })
         })
         .await
+    }
+
+    /// An XML API multipart upload through `object_store`'s GCS client, driven
+    /// by the S3 adapter's handle (the part-sequence rules, poisoning, and
+    /// finished checks are the same code). Completion returns the generation
+    /// as the version, as a single `put` does.
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+        let upload = self
+            .store
+            .put_multipart(&path_of(key)?)
+            .await
+            .map_err(map_error_common)?;
+        Ok(Box::new(S3MultipartUpload::new(
+            key,
+            upload,
+            multipart_outcome,
+        )))
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
@@ -636,7 +686,7 @@ impl ObjectStoreBackend for GcsStore {
             suffix_range: true,
             upload_checksum: false,
             prefix_list: true,
-            multipart: false,
+            multipart: true,
         }
     }
 
