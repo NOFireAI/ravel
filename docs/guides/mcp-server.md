@@ -575,7 +575,9 @@ server reads the six budget arguments (`max_rows`, `max_response_bytes`,
 `deadline_ms`, `max_bytes_scanned`, `max_store_requests`, `max_segments`)
 on every tool call, whether or not the tool's schema lists them, refuses a
 call with `invalid_argument` when one of them has the wrong type, and applies
-a well-typed one to the call's budget, clamped to its ceiling. The
+a well-typed one to the call's budget, clamped to its ceiling, except that
+`ravel_analyze_timeseries` refuses `max_bytes_scanned`, `max_store_requests`
+and `max_segments` as `unsupported`. The
 [reference](../reference/mcp.md#evidence-references) has the same list.
 
 The rest of this section describes the design. Redeeming a reference
