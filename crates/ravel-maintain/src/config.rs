@@ -16,13 +16,19 @@ use uuid::Uuid;
 use crate::read_gate::MaintainReadGate;
 use crate::request_ledger::RequestLedger;
 
-/// A test-injectable accounting hook for the RLOG and RSPAN compaction
-/// merges' peak resident memory (RLOG and RSPAN, ADR-0065 decision 4).
+/// A test-injectable accounting hook for the RLOG, RSPAN and RSEG compaction
+/// merges' peak resident memory (ADR-0065 decision 4, issue #3817).
 ///
 /// The RLOG k-way merge ([`crate::rlog`]) and the RSPAN k-way merge
 /// ([`crate::rspan_codec`]) drive this at their real allocation/decode points
 /// so a test can assert each merge's residency is bounded independently of a
-/// stream's or trace's size. It is deliberately *load-bearing*, not
+/// stream's or trace's size. The RSEG merge ([`crate::build`]) drives it too:
+/// one fetch window as `fetched`, one series' decoded samples as `decoded`,
+/// the pending part as `writer`, and three terms only RSEG charges, the
+/// retained planning catalogs ([`Self::add_catalog_plan_bytes`], plans and
+/// label sets apart) and the per-series index built from them
+/// ([`Self::add_plan_index_bytes`]). [`Self::peak_resident_bytes`] is the
+/// high-water of all of those together. It is deliberately *load-bearing*, not
 /// decorative: the merge calls [`Self::block_fetched`] when it fetches one
 /// input block's raw bytes, [`Self::block_decoded`]/[`Self::block_released`] as
 /// each decoded block enters and leaves a cursor, and [`Self::set_writer_bytes`]
@@ -260,8 +266,9 @@ pub struct MergePhasePeaks {
     /// Decoded heap bytes. Zero for RLOG and RSPAN.
     pub catalog_plan_heap_bytes: u64,
     /// RSEG planning catalogs: high-water of the decoded heap of the label
-    /// sets those catalogs carry (one copy per input and series). Decoded heap
-    /// bytes. Zero for RLOG and RSPAN.
+    /// sets those catalogs carry (one copy per distinct series id, shared by
+    /// every input that carries the series). Decoded heap bytes. Zero for RLOG
+    /// and RSPAN.
     pub catalog_label_heap_bytes: u64,
     /// RSEG group-by index: high-water of the heap of the per-series
     /// contribution lists and build plan the merge derives from the catalogs.

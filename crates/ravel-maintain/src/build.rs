@@ -55,12 +55,21 @@
 //! re-encoded) in ascending id order and the window's fetched buffers are then
 //! dropped, so peak fetch buffering is one window's worth. A part accumulates
 //! re-encoded series across windows until its estimated STORED bytes reach
-//! `max_l1_part_bytes`, checked between series; the pending output part plus one
-//! series' decoded samples at a time dominate peak memory. Neither term is sized
-//! by a config knob: one series' decoded samples grow with that series, and the
-//! pending part runs one whole series past `max_l1_part_bytes`.
-//! `l1_part_memory_target_bytes` governs the RLOG and RSPAN merges and is not
-//! read on this path.
+//! `max_l1_part_bytes`, checked between series. Of the terms that track the
+//! data, the pending output part and one series' decoded samples are the
+//! largest. Neither is sized by a config knob: one series' decoded samples grow
+//! with that series, and the pending part runs one whole series past
+//! `max_l1_part_bytes`. `l1_part_memory_target_bytes` governs the RLOG and
+//! RSPAN merges and is not read on this path.
+//!
+//! Those terms do not dominate a bucket with many inputs. Every input's
+//! catalog is retained until this function returns, and the per-series index
+//! (`by_series`, then `builds`) holds one entry per (input, series) as well, so
+//! both grow with the input count times the series each input carries and no
+//! config knob sizes them. `tests/rseg_merge_memory.rs` measures every term
+//! through [`crate::config::MergeMemoryTracker`]. The label sets are the one
+//! catalog term that does not grow with the input count: they are shared per
+//! series id ([`crate::read::intern_catalog_labels`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
@@ -331,8 +340,9 @@ pub async fn build_parts(
     // the data, not the pages alone.
     //
     // `l1_part_memory_target_bytes` is not read here at all, so no configured
-    // number sizes this builder's heap. What it holds at once is one fetch
-    // window's raw pages (the stored-size target applied to INPUT page bytes)
+    // number sizes this builder's heap. Besides the retained catalogs and the
+    // per-series index above, what it holds at once is one fetch window's raw
+    // pages (the stored-size target applied to INPUT page bytes)
     // and one series' decoded samples while `materialize_series` decodes,
     // merges, and re-encodes its runs (bounded by that series' own size and by
     // nothing configurable). A finished part's encoded bytes are released at its

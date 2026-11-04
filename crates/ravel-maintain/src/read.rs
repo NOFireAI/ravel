@@ -9,12 +9,21 @@
 //! their `series_index` remapped (ADR-0047 decision 3). Exemplar records are
 //! small and bounded by the ingest admission cap, so they stay inside this
 //! metadata bound. The verbatim TS/VAL/HIST page bytes are
-//! fetched lazily during the merge ([`crate::build`]) with ranged GETs, so
-//! peak memory is catalog metadata plus one fetch window, plus the series being
-//! materialized -- a finished part releases its encoded bytes at its PUT
-//! (ADR-0979 decision 3), so the parts are not a term -- not the whole bucket's
-//! page data ([`crate::build`]'s header comment splits those terms and says
-//! which of them a config knob sizes).
+//! fetched lazily during the merge ([`crate::build`]) with ranged GETs, so the
+//! page data is one fetch window plus the series being materialized -- a
+//! finished part releases its encoded bytes at its PUT (ADR-0979 decision 3), so
+//! the parts are not a term -- not the whole bucket's page data
+//! ([`crate::build`]'s header comment splits those terms and says which of them
+//! a config knob sizes).
+//!
+//! The catalog metadata itself is retained for every input at once, from load
+//! until the merge ends, so it is not bounded by one part or one series: it
+//! holds one [`SeriesPlan`] and its [`RunPlan`]s per (input, series) entry and
+//! grows with the input count times the series each input carries. A series'
+//! label set is shared rather than copied per entry:
+//! [`intern_catalog_labels`] points every input's plan for one series id at
+//! the first input's copy, so the retained labels are one set per distinct
+//! series in the bucket, whatever the input count (issue #3817).
 
 use std::collections::HashMap;
 use std::future::Future;
