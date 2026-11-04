@@ -3048,7 +3048,7 @@ mod with_mcp {
     /// component is `null` and named in `unbounded`, and the estimate is not
     /// called an upper envelope.
     ///
-    /// FLIP: `estimate_excludes_log_lane` left false on the log lane in
+    /// FLIP: `estimate_excludes_spend` left false on the log lane in
     /// `prefetch` fails the log query's assertions.
     #[tokio::test]
     async fn query_promql_names_every_component_unbounded_when_it_reads_the_log_lane() {
