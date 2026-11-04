@@ -1915,6 +1915,12 @@ fn gcs_expected_capabilities() -> Capabilities {
     s3_expected_capabilities()
 }
 
+/// The keys, under `{root}/multipart/`, of every object the multipart probes
+/// complete: [`assert_multipart_upload`]'s object, the sequence rules'
+/// single-short-part upload, and the part-checksum probe's object.
+const MULTIPART_COMPLETED_SUFFIXES: [&str; 3] =
+    ["object", "rules/single-short-part", "part-checksum/object"];
+
 /// `GcsStore` against a real bucket, gated on `RAVEL_GCS_TEST_BUCKET`. The
 /// bucket must already exist; credentials come from Application Default
 /// Credentials (`GOOGLE_APPLICATION_CREDENTIALS`, the gcloud well-known file,
@@ -1947,12 +1953,15 @@ async fn gcs_contract() {
 
     // The lister refuses an item with neither md5Hash nor componentCount, which
     // an XML multipart upload may leave on real GCS (ADR-3456, amendment for
-    // #3802). Delete the multipart probe's object by key first, so the cleanup
-    // listing below never meets it.
-    store
-        .delete(&format!("{root}/multipart/object"))
-        .await
-        .expect("delete the multipart probe's object before the cleanup listing");
+    // #3802). Delete every object the multipart probes complete by key first,
+    // so the cleanup listing below never meets one. Delete is idempotent, so a
+    // key a probe did not leave is not an error.
+    for suffix in MULTIPART_COMPLETED_SUFFIXES {
+        store
+            .delete(&format!("{root}/multipart/{suffix}"))
+            .await
+            .expect("delete a multipart-completed object before the cleanup listing");
+    }
     let leftovers = list_all(&store, &format!("{root}/"))
         .await
         .expect("list_all for cleanup");
