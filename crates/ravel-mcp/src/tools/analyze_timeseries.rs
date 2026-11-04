@@ -817,10 +817,18 @@ mod tests {
         ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
         let run_with = |len: usize| {
             let names: Vec<String> = (0..13)
-                .map(|n| if n == 0 { "x".repeat(len) } else { format!("s{n:02}") })
+                .map(|n| {
+                    if n == 0 {
+                        "x".repeat(len)
+                    } else {
+                        format!("s{n:02}")
+                    }
+                })
                 .collect();
-            let series: Vec<(&str, u64, bool)> =
-                names.iter().map(|name| (name.as_str(), 60, false)).collect();
+            let series: Vec<(&str, u64, bool)> = names
+                .iter()
+                .map(|name| (name.as_str(), 60, false))
+                .collect();
             let mut answer = change_point_rows(&series);
             answer.visibility.resolved_no_segments = true;
             let stub = answering(vec![Ok(answer)]);

@@ -968,7 +968,13 @@ mod tests {
                 r#type: "string".to_string(),
             }];
             answer.data.rows = (0..13)
-                .map(|n| vec![Cell::Str(if n == 0 { "x".repeat(len) } else { n.to_string() })])
+                .map(|n| {
+                    vec![Cell::Str(if n == 0 {
+                        "x".repeat(len)
+                    } else {
+                        n.to_string()
+                    })]
+                })
                 .collect();
             answer.data.row_count = 13;
             answer.coverage.complete = true;

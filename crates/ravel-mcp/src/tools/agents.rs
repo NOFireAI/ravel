@@ -427,7 +427,9 @@ async fn events<B: AgentsBackend>(args: Value, ctx: &ToolContext<'_>, backend: &
     }
     let mut envelope = envelope.finish(true);
     if envelope.status != Status::Ok {
-        envelope.next_steps.retain(|next| next.action != RESUME_STEP);
+        envelope
+            .next_steps
+            .retain(|next| next.action != RESUME_STEP);
     }
     envelope
 }

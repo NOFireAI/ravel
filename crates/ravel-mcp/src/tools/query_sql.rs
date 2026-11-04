@@ -968,7 +968,13 @@ mod tests {
                 r#type: "string".to_owned(),
             }];
             envelope.data.rows = (0..13)
-                .map(|i| vec![Cell::Str(if i == 0 { "x".repeat(len) } else { String::new() })])
+                .map(|i| {
+                    vec![Cell::Str(if i == 0 {
+                        "x".repeat(len)
+                    } else {
+                        String::new()
+                    })]
+                })
                 .collect();
             envelope.data.row_count = 13;
             let stub = Stub::default();
