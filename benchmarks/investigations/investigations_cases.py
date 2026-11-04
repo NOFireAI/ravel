@@ -55,6 +55,96 @@ GUARD = "refused-by-guard"
 REFUSAL_1000 = ("server refused the statement (HTTP 400): statement complexity 1001 exceeds the maximum of "
                 "1000 tokens; simplify the statement")
 
+# A ravel-server stand-in for the server-death tests (issue #3813): answers
+# /readyz always, answers its main port with a minimal trace_get body, and
+# dies by SIGKILL on itself without responding once STUB_DIE_AT says so.
+# STUB_DIE_AT is "N" (die on request N only) or "N+" (die on N and every
+# later request); STUB_COUNT_FILE persists the request count across restarts
+# (a fresh process each time, same file).
+STUB_SERVER_PY = '''#!/usr/bin/env python3
+import http.server
+import json
+import os
+import signal
+import socketserver
+import sys
+import threading
+
+socketserver.TCPServer.allow_reuse_address = True
+
+
+def addr(flag):
+    i = sys.argv.index(flag)
+    host, port = sys.argv[i + 1].rsplit(":", 1)
+    return host, int(port)
+
+
+def bump_count():
+    path = os.environ["STUB_COUNT_FILE"]
+    try:
+        with open(path) as f:
+            n = int(f.read().strip() or "0")
+    except FileNotFoundError:
+        n = 0
+    n += 1
+    with open(path, "w") as f:
+        f.write(str(n))
+    return n
+
+
+def should_die(n):
+    die_at = os.environ.get("STUB_DIE_AT", "")
+    if not die_at:
+        return False
+    if die_at.endswith("+"):
+        return n >= int(die_at[:-1])
+    return n == int(die_at)
+
+
+class Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
+class Main(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self._handle()
+
+    def do_POST(self):
+        self._handle()
+
+    def _handle(self):
+        n = bump_count()
+        if should_die(n):
+            os.kill(os.getpid(), signal.SIGKILL)
+            return
+        body = json.dumps({"data": {"rows": [["s1"]], "columns": [{"name": "span_id"}]}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+def main():
+    health = socketserver.TCPServer(addr("--listen-health"), Health)
+    main_srv = socketserver.TCPServer(addr("--listen-http"), Main)
+    threading.Thread(target=health.serve_forever, daemon=True).start()
+    print("cache warmup: pass complete parts_warmed=0 elapsed_ms=1", flush=True)
+    main_srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+'''
+
 
 def gen(out, traces=1000, hours=2, seed=7, *extra):
     subprocess.run([PY, GEN, "--traces", str(traces), "--hours", str(hours), "--seed", str(seed),
@@ -3557,6 +3647,169 @@ FINISHED=1
         self.assertNotEqual(code2, 0, text2)
         self.assertNotIn("STEP ", text2)
         self.assertIn("'--has space' is not a single --flag token", text2)
+
+    def died_run(self, cold_runs, die_at, script=None, tag=""):
+        """A single trace_fetch statement, cold_only, against a stub server
+        that answers normally until STUB_DIE_AT, then dies by SIGKILL with no
+        response: run.sh's statements() driven directly (no census or
+        needle_blocks, which need a real store and CLI the stub does not
+        provide). TAG disambiguates a second call in the same test (its own
+        out dir and death counter, not left over from the first). Returns
+        (exit of the statements() call, output, out dir)."""
+        stub = self.path(f"stub-server{tag}")
+        with open(stub, "w") as f:
+            f.write(STUB_SERVER_PY)
+        os.chmod(stub, 0o755)
+        statements_toml = self.path(f"statements{tag}.toml")
+        with open(statements_toml, "w") as f:
+            f.write('[[statement]]\n'
+                    'id = "trace_fetch"\n'
+                    'kind = "trace_get"\n'
+                    'states = ["unfolded"]\n'
+                    'truth_key = "ok"\n'
+                    'cold_only = true\n')
+        truth = self.path(f"truth{tag}.json")
+        with open(truth, "w") as f:
+            json.dump({
+                "saved_traces": [{"trace_id": "deadbeef"}],
+                "failing_cell": {"service": "svc", "hour_start_ns": 0, "hour_end_ns": 1},
+                "request_id": {"present": "r1", "absent": "r2"},
+                "in_lists": {"trace_id": {}, "request_id": {}},
+                "journey_c": {},
+            }, f)
+        out = self.path(f"out{tag}")
+        count_file = self.path(f"stub-count{tag}")
+        driver = self.path(f"driver-died{tag}.sh")
+        with open(driver, "w") as f:
+            f.write(f"""set -u
+source {script or os.path.join(BOX, "run.sh")} --dry-run --lane local --run-toml {os.path.join(BOX, "run.local-smoke.toml")} --out {out}
+DRY_RUN=0
+load_config
+STATEMENTS={statements_toml}
+COLD_RUNS={cold_runs}
+WARM_RUNS=0
+SERVER_BIN={stub}
+write_secrets
+HTTP_PORT="$(free_port)"
+HEALTH_PORT="$(free_port)"
+GRPC_PORT="$(free_port)"
+mkdir -p "$OUT"
+cp {truth} "$OUT/truth.json"
+: >"$CALLS"
+export STUB_DIE_AT="{die_at}"
+export STUB_COUNT_FILE={count_file}
+code=0
+statements unfolded || code=$?
+keep_state_log unfolded
+if [ "$code" != 0 ]; then
+  STATE=unfolded
+  state_failed
+fi
+stop_server
+printf 'STATEMENTS-RETURNED code=%s\\n' "$code"
+FINISHED=1
+exit "$code"
+""")
+        p = subprocess.run([BASH, driver], capture_output=True, text=True, timeout=120)
+        return p.returncode, p.stdout + p.stderr, out
+
+    def test_server_death_is_recorded_and_the_run_moves_to_the_next_call(self):
+        # Deliverable 1: a died try is not retried. The 2nd of 3 planned
+        # cold tries dies; the 3rd runs as the next planned call against a
+        # freshly restarted server, not a repeat of the dead try.
+        code, text, out = self.died_run(3, "2")
+        self.assertEqual(code, 0, text)
+        self.assertIn("STATEMENTS-RETURNED code=0", text)
+        self.assertFalse(os.path.exists(os.path.join(out, "FAILED")))
+        calls = read_jsonl(os.path.join(out, "calls.jsonl"))
+        self.assertEqual([(c["try"], c["outcome"]) for c in calls],
+                         [(0, "ok"), (1, "server_died"), (2, "ok")])
+        died = calls[1]
+        self.assertEqual(died["signal"], 9)
+        self.assertEqual(died["reason"], "server died during trace_fetch/unfolded try 1, signal 9")
+        self.assertTrue(died["log"].startswith("out/logs/server-"), died["log"])
+        with open(os.path.join(out, died["log"][len("out/"):])) as f:
+            pass  # the dying server's log was kept; just prove it is readable
+        # 3 restarts, same as COLD_RUNS with no death: one before each of
+        # try0 and try1's own cold calls, one more on the death itself, and
+        # try2's own would-be restart is the one just_restarted suppresses
+        # (it reuses the death's restart instead of a 4th).
+        restarts = read_jsonl(os.path.join(out, "stamps", "restarts.jsonl"))
+        self.assertEqual(len(restarts), 3)
+        old = '    [ "$code" = 75 ] && ! kill -0 "${SERVER_PID:-0}" 2>/dev/null || fail "call against an ' \
+              'unreachable server"\n'
+        flipped, line = self.flipped_box(old, '    fail "call against an unreachable server"\n')
+        code2, text2, _ = self.died_run(3, "2", flipped, tag="-flip")
+        self.assertNotEqual(code2, 0, text2)
+        print(f"flip 'a died try fails the run instead of being recorded' at box/run.sh:{line} fails "
+              f"test_server_death_is_recorded_and_the_run_moves_to_the_next_call: exit {code2}", file=sys.stderr)
+
+    def test_three_deaths_in_one_statement_fail_the_state(self):
+        # Deliverable 1: three deaths across one statement's own tries (not
+        # three retries of one try) fail the state through the existing
+        # state_failed() mechanism; the run does not hard-fail.
+        code, text, out = self.died_run(3, "1+")
+        self.assertEqual(code, 1, text)
+        self.assertIn("STATEMENTS-RETURNED code=1", text)
+        self.assertFalse(os.path.exists(os.path.join(out, "FAILED")))
+        calls = read_jsonl(os.path.join(out, "calls.jsonl"))
+        self.assertEqual([c["outcome"] for c in calls], ["server_died"] * 3)
+        failed = read_jsonl(os.path.join(out, "stamps", "failed_states.jsonl"))
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["state"], "unfolded")
+        self.assertEqual(failed[0]["step"], "server died 3 times during trace_fetch")
+        self.assertEqual(failed[0]["exit"], 75)
+        old = "    if [ \"$deaths\" -ge 3 ]; then\n"
+        flipped, line = self.flipped_box(old, "    if false; then\n")
+        code2, text2, out2 = self.died_run(3, "1+", flipped, tag="-flip")
+        self.assertNotEqual(code2, 1, text2)
+        print(f"flip 'three deaths do not fail the state' at box/run.sh:{line} fails "
+              f"test_three_deaths_in_one_statement_fail_the_state: code {code2}", file=sys.stderr)
+
+    def test_server_death_keeps_the_dying_log_and_the_states_last_log(self):
+        # Deliverable 2: the dying server's own log lands under out/logs/
+        # (named by record_server_death's "log" field), and the state's last
+        # server log is copied too, separately, at the end of the state.
+        code, text, out = self.died_run(3, "2")
+        self.assertEqual(code, 0, text)
+        calls = read_jsonl(os.path.join(out, "calls.jsonl"))
+        died_log = calls[1]["log"]
+        self.assertTrue(os.path.exists(os.path.join(out, died_log[len("out/"):])), died_log)
+        last_log = os.path.join(out, "logs", "server-unfolded-last.log")
+        self.assertTrue(os.path.exists(last_log))
+        # A second, later server (the restart after the death) wrote the
+        # last-log copy: it is a different file from the dying server's own.
+        self.assertNotEqual(os.path.realpath(os.path.join(out, died_log[len("out/"):])), os.path.realpath(last_log))
+
+    def test_server_last_log_is_truncated_past_2mb(self):
+        # Deliverable 2: keep_state_log truncates to the last 2000 lines once
+        # the server log passes 2 MB, and says so on its first line.
+        out = self.path("out")
+        work = self.path("work")
+        os.makedirs(work, exist_ok=True)
+        server_log = os.path.join(work, "server-1.log")
+        with open(server_log, "w") as f:
+            for i in range(60000):
+                f.write(f"line {i} padding padding padding padding padding padding padding\n")
+        self.assertGreater(os.path.getsize(server_log), 2 * 1024 * 1024)
+        driver = self.path("driver-trunc.sh")
+        with open(driver, "w") as f:
+            f.write(f"""set -u
+source {os.path.join(BOX, "run.sh")} --dry-run --lane local --run-toml {os.path.join(BOX, "run.local-smoke.toml")} --out {out}
+DRY_RUN=0
+mkdir -p "$OUT"
+SERVER_LOG={server_log}
+keep_state_log truncstate
+FINISHED=1
+""")
+        p = subprocess.run([BASH, driver], capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        kept = os.path.join(out, "logs", "server-truncstate-last.log")
+        with open(kept) as f:
+            lines = f.read().splitlines()
+        self.assertTrue(lines[0].startswith("... truncated to the last 2000 lines"), lines[0])
+        self.assertEqual(len(lines), 2001)
+        self.assertEqual(lines[-1], "line 59999 padding padding padding padding padding padding padding")
 
 
 def refresh_local_smoke():

@@ -802,24 +802,32 @@ def darwin_rusage(pid):
 
 def proc_cpu_s(pid):
     """utime + stime of pid in seconds, from /proc/<pid>/stat (on macOS,
-    darwin_rusage)."""
+    darwin_rusage); None once the process is gone (a server that died mid-call
+    leaves no /proc entry for the "after" reading)."""
     if sys.platform == "darwin":
         return darwin_rusage(pid)[0]
-    with open(f"/proc/{pid}/stat") as f:
-        stat = f.read()
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+    except FileNotFoundError:
+        return None
     fields = stat[stat.rindex(")") + 2 :].split()
     ticks = os.sysconf("SC_CLK_TCK")
     return (int(fields[11]) + int(fields[12])) / ticks
 
 
 def proc_hwm_bytes(pid):
-    """VmHWM of pid (on macOS, the lifetime peak physical footprint)."""
+    """VmHWM of pid (on macOS, the lifetime peak physical footprint); None
+    once the process is gone."""
     if sys.platform == "darwin":
         return darwin_rusage(pid)[1]
-    with open(f"/proc/{pid}/status") as f:
-        for line in f:
-            if line.startswith("VmHWM:"):
-                return int(line.split()[1]) * 1024
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) * 1024
+    except FileNotFoundError:
+        return None
     return None
 
 
@@ -910,7 +918,7 @@ def cmd_call(args):
         "http_status": code,
         "started_unix_s": round(started, 3),
         "wall_s": round(wall, 6),
-        "server_cpu_s": round(cpu1 - cpu0, 6),
+        "server_cpu_s": round(cpu1 - cpu0, 6) if cpu0 is not None and cpu1 is not None else None,
         "server_hwm_bytes": proc_hwm_bytes(args.pid),
     }
     if plan.get("oracle"):
