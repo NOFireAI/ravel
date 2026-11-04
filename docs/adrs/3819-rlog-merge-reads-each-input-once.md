@@ -2,7 +2,7 @@
 
 - Status: Accepted (2026-11-04)
 - Date: 2026-11-04
-- Refs: #3819, #3492, #3802, #2861, ADR-0018, ADR-0032, ADR-0065, ADR-0979
+- Refs: #3819, #3492, #3802, #2861, ADR-0018, ADR-0032, ADR-0065, ADR-0699, ADR-0979, ADR-2135
 
 ## Context
 
@@ -28,10 +28,11 @@ cores (#3819).
 of its inputs before the next one starts. For each stream it opens a new
 `StreamCursor` on every input that carries that stream. The cursor GETs the
 stream's location (`rlog.rs:2549`), and a location names the whole row group
-(`crates/ravel-logseg/src/ranged.rs:85-95`), so every stream's cursor downloads
-the same bytes. Nothing keeps them between streams. The writer cuts blocks on
-record count, never at a stream boundary (`crates/ravel-logseg/src/writer.rs:1646-1666`),
-so each block holds rows from many streams.
+(`crates/ravel-logseg/src/ranged.rs:85-95`, ADR-0699 decision 2), so every
+stream's cursor downloads the same bytes. Nothing keeps them between streams.
+The writer cuts blocks on a record count or a byte estimate, never at a stream
+boundary (`crates/ravel-logseg/src/writer.rs:1646-1666`), so each block holds
+rows from many streams.
 
 | L0 object (`ravel-cli rlog inspect`) | records | blocks | streams |
 |---|---|---|---|
@@ -58,7 +59,8 @@ is N.
 | streams per L0 object | 804 to 2,471 | five objects inspected, #3819 comment 6637559313 |
 | GETs and bytes after 72 min, two merges | 461,608 GETs, 48.8 GB | #3819 |
 | GETs per shard-hour merge at S = 2,000 | about 34 million (model) | N × S with N = 17,000 |
-| merge wall time per shard-hour at 27 GETs/s | about 350 h (model) | 34 million / 27 |
+| GET rate per merge, this run | about 53 GETs/s, catalog GETs included | 461,608 GETs / 4,320 s / 2 merges, #3819 |
+| merge wall time per shard-hour at that rate | about 180 h (model) | 34 million / 53 |
 | decoded (row heap estimate) over stored, L1 output | 55 to 67 | two L1 parts closed on the 269,565,184-byte memory target at 4,933,909 and 4,024,942 bytes |
 
 ## Decision
@@ -85,18 +87,30 @@ flowchart LR
 
 ### D1. Fetch each input's row groups once, concurrently
 
-After the catalog phase, the merge fetches every input's BLOCKS ranges once
-with `k` GETs in flight. `k` is the existing `input_read_concurrency`. The raw
-bytes stay resident for the whole merge and are charged to the merge's
-memory budget (`merge_cursor_budget_bytes`) at fetch time.
+After the catalog phase, the merge fetches every input's row groups once with
+`k` GETs in flight. `k` is the existing `input_read_concurrency`. The raw bytes
+stay resident for the whole merge and are charged at fetch time to
+`merge_cursor_budget_bytes`, the same running charge `StreamCursor`
+reservations use today (`crates/ravel-maintain/src/rlog.rs:2942, 2978`).
 
-When the inputs' raw bytes do not fit the budget, the merge does not fail. It
-fetches per pass instead (D2), so each input is fetched once per pass. The
-choice is made before any block is fetched, from the PAGE_DIR sizes the
-catalog phase already holds, and the merge logs which one it took.
+The merge takes the resident path only when one sum fits a resident ceiling:
+the inputs' raw bytes, plus one pass's retained rows (D2), plus the worst-case
+cursor charge of any range that will use D3. The worst case is the largest
+D3 range's cursor reservations, with their raw term counted once, since those
+cursors read the resident bytes. Otherwise the merge fetches per pass (D2), so
+each input row group is fetched once per pass. Going over the budget during a
+merge is a hard abort today (`MergeCursorBudgetExceeded`,
+`crates/ravel-maintain/src/error.rs:233`), so the choice is made before any
+block is fetched, from the PAGE_DIR sizes the catalog phase already holds,
+and the merge logs which path it took and the sum it compared.
 
-Admission counts the resident bytes. With `--maintain-unit-concurrency` above
-1, a merge waits for budget rather than over-committing it.
+The resident ceiling is `merge_cursor_budget_bytes` divided by
+`--maintain-unit-concurrency`. The budget is per merge, and ravel-server
+passes it once for all of its concurrent merges
+(`crates/ravel-maintain/src/config.rs:659-664`), so without the division
+four merges could each hold their inputs resident. This bounds the resident
+term per process. It is not a cross-merge admission scheme: a shared budget
+that merges wait on is #3825.
 
 ### D2. Emit in stream-range passes, decoding each block once per pass
 
@@ -108,6 +122,15 @@ It then emits those streams with today's k-way merge, in today's order:
 stream id, then `ts.div_euclid(W)`, then canonical input order. Part cuts
 (`PartSink`, the memory split target and the stored-size target) run on that
 sequence unchanged.
+
+On clustered inputs (W above 1), today's merge splits a stream whose
+per-bucket reservation sum exceeds `merge_cursor_budget_bytes` into several
+batches in input order (ADR-2135 decision 2, `reservation_batches`,
+`crates/ravel-maintain/src/rlog.rs:2594-2644`), and batching changes which
+records share a part (`rlog.rs:2904-2913`). D2 reproduces those batches
+exactly: it computes them per stream from the same reservation inputs, and
+against the same `merge_cursor_budget_bytes` value as today, never against
+the budget less the resident term. The batches then run in today's order.
 
 A range's size comes from per-stream record counts that the catalog phase
 reads, multiplied by a decoded-bytes-per-record estimate. Measuring that
@@ -127,9 +150,10 @@ no path gathers a whole stream's rows.
 <!-- band-sources-allow: these are acceptance commitments of this ADR, predicted until the implementation measures them -->
 | commitment | band | test |
 |---|---|---|
-| L1 parts are byte-identical to today's | same keys and bytes on a many-stream fixture (N ≥ 50 inputs, S ≥ 200 streams per input) and on a one-hot-stream fixture | a golden comparison against the current merge |
-| block fetches per input | exactly 1 with D1, exactly P with the per-pass fallback, counted per (object, range) | a counting `MemoryStore`. It must fail against a per-cursor cache (still N × S) and against a small LRU of row groups (thrashes, because every group spans the whole stream range) |
-| hot-stream memory | unchanged from ADR-0065 decision 4's acceptance bound | the existing growing-hot-stream test, plus the same stream inside a many-stream bucket |
+| L1 parts are byte-identical to today's | same keys and bytes on three fixtures: many-stream (N ≥ 50 inputs, S ≥ 200 streams per input, unkeyed); one hot stream; and clustered inputs at W above 1 with one stream whose per-bucket reservation sum exceeds the budget, so that ADR-2135 batching runs | a golden comparison against the current merge |
+| block fetches per input row group | exactly 1 with D1 and exactly P with the per-pass fallback, counted per (object, row-group range) | a counting `MemoryStore`. It must fail against a per-cursor cache (still N × S) and against a small LRU of row groups (thrashes, because every group spans the whole stream range) |
+| hot-stream memory | unchanged | `peak_memory_on_rlog_input_bucket` (`crates/ravel-maintain/tests/memory.rs:129`), plus the same hot stream inside a many-stream bucket |
+| resident path choice | the merge takes fetch-per-pass whenever raw bytes plus one pass plus the worst-case D3 charge exceed `merge_cursor_budget_bytes` / `--maintain-unit-concurrency`, and never aborts with `MergeCursorBudgetExceeded` where today's merge completes | a fixture sized just over and just under the ceiling, with a D3 range present |
 | this fixture, hours 08 and 09 | GETs per merge at most 1.1 × (N × catalog GETs + N); wall time within 10 × the fetch time at `k` in flight | measured on run 2's bucket, which is kept (predicted) |
 | a mixed fleet | a 0.30.x compactor and a new one converge on the same parts through `CreateIfAbsent` | follows from byte-identical parts; the golden test above pins it |
 
@@ -166,9 +190,9 @@ no path gathers a whole stream's rows.
   decode CPU replaces GET latency as the limit, which is the trigger for the
   shuffle alternative.
 - Resident memory per merge grows by the inputs' raw bytes, about 5 to 7 GB
-  per shard-hour on this fixture, bounded by the merge budget and counted at
-  admission. When it does not fit, the merge falls back to one fetch per
-  pass.
+  per shard-hour on this fixture. It is bounded by D1's resident ceiling,
+  `merge_cursor_budget_bytes` divided by `--maintain-unit-concurrency`. When
+  it does not fit, the merge falls back to one fetch per row group per pass.
 - ADR-0065 decision 4 and the ADR-0032 memory text gain an amendment that
   states the new peak: catalog metadata, plus resident raw bytes (D1), plus
   one pass's retained rows, plus the in-progress part. The `rlog.rs` module
@@ -177,6 +201,8 @@ no path gathers a whole stream's rows.
 
 ### Not in this ADR (separate tickets)
 
+- Cross-merge admission: a shared budget that concurrent merges wait on, in
+  place of D1's per-process division of the per-merge budget (#3825).
 - The catalog phase re-GETs sections already inside its 64 KiB footer probe,
   and reads the whole POSTINGS section only to learn field names: 5 to 8 GETs
   per input, a large share of the 461,608.
