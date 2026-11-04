@@ -894,13 +894,14 @@ fewer or smaller rows.
 
 | What the caps cut | Status | Next step |
 | --- | --- | --- |
-| The byte cap dropped rows, and fewer than `max_rows` rows came back | `ok_bounded` or `ok_page` | `raise_max_response_bytes`, also naming the tool's way to smaller rows; at the 4 MiB ceiling, the tool's own smaller-rows action alone |
+| The byte cap dropped rows, and fewer than `max_rows` rows came back | `ok_bounded` or `ok_page` | `raise_max_response_bytes` up to the configured ceiling (4 MiB by default), also naming the tool's way to smaller rows; at that ceiling, the tool's own smaller-rows action alone |
 | The row cap stopped the result | `ok_bounded` or `ok_page` | `raise_max_rows`, also naming the tool's way to fewer rows; with `max_rows` at its 5,000 ceiling, `narrow_time_range` instead |
 | The byte cap shortened cells and dropped no row | `ok`, no cursor | `read_full_cells`: ask for smaller rows, or raise `max_response_bytes` below its ceiling, to read the cells in full |
 | Nothing | `ok` | none |
 
 A step never advises raising a cap that did not bind, or one already at
-its ceiling. A result whose only cut is shortened cells is complete: no
+its ceiling. For `max_response_bytes` that ceiling is the one the server's
+MCP budget configuration sets, 4 MiB by default, and the step names it. A result whose only cut is shortened cells is complete: no
 row is missing, so there is no next page and no cursor.
 
 ## Snapshot identity and freshness
