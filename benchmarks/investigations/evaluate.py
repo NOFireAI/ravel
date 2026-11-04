@@ -410,6 +410,13 @@ class Calls:
                     elif outcome in (UNSUPPORTED, GUARD, "not-run", "server_died"):
                         if not c.get("reason"):
                             problems.add("missing", f"reason for {outcome} {where(c)}")
+                        if outcome == "server_died":
+                            # Whatever figure reads this group, and whether or
+                            # not its state is live: a server that died under a
+                            # call is a problem of the run, so the verdict is
+                            # fail even when no band figure reads the group.
+                            problems.add("server_died", f"{where(c)}: "
+                                                        f"{c.get('reason') or 'server died, no reason recorded'}")
                         if outcome == GUARD and "wall_s" not in c:
                             problems.add("missing", f"wall_s in {where(c)}")
                     else:

@@ -298,23 +298,37 @@ corpus, declare or load-base, where nothing can be measured without the
 step, still ends the run with `out/FAILED`, which names the failed
 command's log under `out/logs/` when it has one.
 
-A server that dies mid-call (the request connection drops rather than
-returning an HTTP error) loses that one try, not the state: run.sh keeps
-the dying server's log under `out/logs/server-<N>.log`, appends a
-`calls.jsonl` line with outcome `server_died` (the statement, state, try,
-temp, the signal the server died on, and that log's path), restarts the
-server and moves on to the next planned call rather than repeating the
-dead one. evaluate.py reports every figure a `server_died` call would
-have fed `missing`, with reason `server died during <statement>/<state>
-try N, signal S`, and the summary's problems list names the statement.
-Three deaths across one statement's own tries fail the state through the
-same `failed_states.jsonl`/`not-run` mechanism as any other failed
-command (step `server died 3 times during <statement>`), and the run goes
-on with the next state. At the end of every state, whether it failed or not, its
-last server's log is also copied whole to `out/logs/server-<state>-last.log`
-(past 2 MB, only its last 2,000 lines, with a first line noting the
-truncation and the original size), so a state's server behavior is
-inspectable even when no single call named a log.
+A server that dies mid-call (the connection is refused, reset or cut
+short rather than answered with an HTTP status, and the process is gone)
+loses that one try, not the run: run.sh keeps the dying server's log under
+`out/logs/server-<N>.log` and appends a `calls.jsonl` line with outcome
+`server_died` (the statement, state, try, temp, the signal the server died
+on, and that log's path), then moves on to the next planned call; the dead
+try is not repeated (`test_server_death_is_recorded_and_the_run_moves_to_the_next_call`).
+Nothing is restarted for the dead try: the next cold call restarts the
+server for itself, as every cold call does, so `restarts.jsonl` holds one
+stamp per cold try under that try's own key, and a warm or inflight call
+reached while the server is down is recorded `not-run` (`the server died
+earlier in <state> and no cold call has restarted it`), since it is defined
+by the server it follows (`test_death_on_the_last_cold_try_leaves_the_warm_call_not_run`,
+`test_death_on_a_warm_call_stamps_no_restart`,
+`test_death_on_an_inflight_call_leaves_the_rest_of_the_state_not_run`).
+Three deaths across one statement's own tries stop that statement: its
+remaining tries are recorded `not-run` with the reason and the state goes
+on with its next statement (`test_three_deaths_stop_the_statement_not_the_state`).
+evaluate.py reports every `server_died` call as a `server_died` problem
+naming the statement, state, temp and try, whether or not a band figure
+reads that call and whether or not its state is live, so the verdict is
+`fail` (`test_server_died_everywhere`); a figure the call would have fed
+reads `missing` with reason `server died during <statement>/<state> try N,
+signal S`. At the end of every state, whether it failed or not, the log of
+the last server it started or sent a call to is copied to
+`out/logs/server-<state>-last.log` (past 2 MB, only its last 2,000 lines,
+with a first line noting the truncation and the original size); a state
+that started no server and sent no call copies none
+(`test_server_death_keeps_the_dying_log_and_the_states_last_log`,
+`test_a_state_with_no_server_copies_no_earlier_log`,
+`test_server_last_log_is_truncated_past_2mb`).
 
 In each state, every statement planned for it runs `run.cold_runs` times
 cold, each call after a server stop, a page-cache drop and a server start
@@ -365,12 +379,17 @@ records what the warmup loaded.
 (`traces_per_hour`, `snapshot_part_max_entries`), `[prices]` and `[cost]`.
 
 `[server] extra_flags` is a list of extra `ravel-server` command-line
-flags, appended verbatim after `--memory-budget-bytes` and stamped into
-`<state>.server.json`'s `server_flags` exactly as given. Each element is
-one argv token, passed with no shell evaluation and no word splitting: a
-flag that takes a value is one `--flag=value` element, not two. An
-element that contains whitespace or does not start with `--` is refused
-before the run starts (exit 64, naming the element).
+flags, appended verbatim after `--memory-budget-bytes` on every server
+command line and stamped into `<state>.server.json`'s `server_flags` as
+given (`test_extra_flags_reach_the_server_command_line`,
+`test_extra_flags_appear_on_server_command_line_and_stamp`). Each element
+is one argv token, passed with no shell evaluation, no word splitting and
+no globbing: a flag that takes a value is one `--flag=value` element, not
+two. An element that contains whitespace or does not start with `--` is
+refused before any step runs: `inv.py server-extra-flags` exits 64 naming
+the element, and run.sh ends with `FAILED` naming `run.toml
+server.extra_flags`, exit 1
+(`test_extra_flags_bad_element_refused_before_anything_runs`).
 
 `[prices]` holds `get_per_1000`, `put_per_1000` (PUT and LIST),
 `storage_gb_month` and `instance_per_hour`, each beside a `<key>_source`

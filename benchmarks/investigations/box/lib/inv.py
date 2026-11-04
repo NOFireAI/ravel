@@ -43,6 +43,7 @@ import argparse
 import datetime
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import resource
@@ -802,14 +803,15 @@ def darwin_rusage(pid):
 
 def proc_cpu_s(pid):
     """utime + stime of pid in seconds, from /proc/<pid>/stat (on macOS,
-    darwin_rusage); None once the process is gone (a server that died mid-call
-    leaves no /proc entry for the "after" reading)."""
-    if sys.platform == "darwin":
-        return darwin_rusage(pid)[0]
+    darwin_rusage); None once the process is gone, on either platform (a
+    server that died mid-call leaves nothing for the "after" reading, and the
+    call must still exit 75 for run.sh to record the death)."""
     try:
+        if sys.platform == "darwin":
+            return darwin_rusage(pid)[0]
         with open(f"/proc/{pid}/stat") as f:
             stat = f.read()
-    except FileNotFoundError:
+    except OSError:
         return None
     fields = stat[stat.rindex(")") + 2 :].split()
     ticks = os.sysconf("SC_CLK_TCK")
@@ -818,16 +820,17 @@ def proc_cpu_s(pid):
 
 def proc_hwm_bytes(pid):
     """VmHWM of pid (on macOS, the lifetime peak physical footprint); None
-    once the process is gone."""
-    if sys.platform == "darwin":
-        return darwin_rusage(pid)[1]
+    once the process is gone, on either platform."""
     try:
+        if sys.platform == "darwin":
+            return darwin_rusage(pid)[1]
         with open(f"/proc/{pid}/status") as f:
             for line in f:
                 if line.startswith("VmHWM:"):
                     return int(line.split()[1]) * 1024
-    except FileNotFoundError:
+    except OSError:
         return None
+    return None
     return None
 
 
@@ -880,6 +883,10 @@ def cmd_call(args):
         append_line(args.calls, {"statement": plan["statement"], "state": plan["state"], "temp": plan["temp"],
                                  "try": 0, "outcome": "not-run", "reason": plan["not_run_reason"]})
         return
+    if args.not_run:
+        append_line(args.calls, {"statement": plan["statement"], "state": plan["state"], "temp": plan["temp"],
+                                 "try": plan["try"], "outcome": "not-run", "reason": args.not_run})
+        return
     if args.deadline_unix_s and time.time() >= args.deadline_unix_s:
         append_line(args.calls, {"statement": plan["statement"], "state": plan["state"], "temp": plan["temp"],
                                  "try": plan["try"], "outcome": "not-run",
@@ -904,8 +911,11 @@ def cmd_call(args):
             code, raw = resp.status, resp.read()
     except urllib.error.HTTPError as e:
         code, raw = e.code, e.read()
-    except OSError as e:
-        code, raw = None, str(e).encode()
+    except (OSError, http.client.HTTPException) as e:
+        # A refused or reset connection, a timeout, or a body cut short
+        # (IncompleteRead, an HTTPException rather than an OSError): no answer.
+        # run.sh decides from the server process whether that was a death.
+        code, raw = None, f"{type(e).__name__}: {e}".encode()
     wall = time.monotonic() - t0
     cpu1 = proc_cpu_s(args.pid)
     line = {
@@ -1082,9 +1092,10 @@ def cmd_get(args):
 
 
 def cmd_server_extra_flags(args):
-    """run.toml [server] extra_flags, space-joined for bash, each element
-    already a single argv token (no shell evaluation, no word splitting
-    within an element): refuses (exit 64, naming the element) any entry that
+    """run.toml [server] extra_flags, one element per line for run.sh to read
+    into an array (no shell evaluation, no word splitting, no globbing): each
+    element is one argv token, so a value goes in the same element
+    ("--flag=value"). Refuses (exit 64, naming the element) any entry that
     contains whitespace or does not start with "--"."""
     v = load_toml(args.toml).get("server", {}).get("extra_flags", [])
     if not isinstance(v, list):
@@ -1092,7 +1103,8 @@ def cmd_server_extra_flags(args):
     for elem in v:
         if not isinstance(elem, str) or any(c.isspace() for c in elem) or not elem.startswith("--"):
             die(f"run.toml server.extra_flags: {elem!r} is not a single --flag token", 64)
-    print(" ".join(v))
+    for elem in v:
+        print(elem)
 
 
 def strip_ansi(text):
@@ -1293,6 +1305,8 @@ def main():
     c.add_argument("--rq-stats", action="store_true")
     c.add_argument("--deadline-unix-s", type=float, default=0,
                    help="past this Unix time the call is recorded not-run instead of sent")
+    c.add_argument("--not-run", default="",
+                   help="record this planned call not-run with this reason, unsent (run.sh: after a server death)")
     c.set_defaults(fn=cmd_call)
 
     u = sub.add_parser("unsupported")
