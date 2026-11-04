@@ -58,6 +58,7 @@ const ADVICE: CapAdvice<'static> = CapAdvice {
     fewer_rows: "narrow time_range",
     smaller_rows_action: "narrow_time_range",
     smaller_rows: "narrow time_range",
+    read_cell: None,
 };
 
 /// Run the tool. An argument the body cannot use is an `invalid_argument`
@@ -568,6 +569,54 @@ mod tests {
                     .to_string()
             )]
         );
+    }
+
+    /// One span whose name is wider than the byte cap: the cap shortens the
+    /// cell and drops no span, so the trace is `ok` with one step to read
+    /// the cell in full. Under a configured 512 KiB ceiling, a 256 KiB cap
+    /// is told to raise `max_response_bytes` to that ceiling, and a cap at
+    /// it is told the span cannot be returned in full. Neither names
+    /// time_range: a narrower window cannot return more of the one span.
+    ///
+    /// FLIP: building the cells detail from `smaller_rows` names "narrow
+    /// time_range" in both details.
+    #[test]
+    fn one_span_cut_by_the_byte_cap_has_only_the_cells_step() {
+        let ceiling = 2 * MAX_RESPONSE_BYTES_FLOOR;
+        let cases = [
+            (
+                MAX_RESPONSE_BYTES_FLOOR,
+                "the result is complete but the byte cap shortened cells of its one row; \
+                 raise max_response_bytes (up to 512 KiB) to read them in full",
+            ),
+            (
+                ceiling,
+                "the result is complete but the byte cap shortened cells of its one row, \
+                 which cannot be returned in full under the 512 KiB max_response_bytes \
+                 ceiling",
+            ),
+        ];
+        for (cap, detail) in cases {
+            let key = key();
+            let mut ctx = test_context(&key);
+            ctx.budgets.max_response_bytes_ceiling = ceiling;
+            ctx.budgets.max_response_bytes = cap;
+            let wide = "x".repeat(cap as usize + 1);
+            let envelope = call(spans(&[("r", None, wide.as_str())]), untimed(), &ctx);
+
+            assert_eq!(envelope.status, Status::Ok, "{cap}: {:?}", envelope.presentation);
+            assert_eq!(envelope.presentation.cells_truncated, 1, "{cap}");
+            assert_eq!(envelope.presentation.rows_omitted, 0, "{cap}");
+            assert_eq!(
+                steps(&envelope),
+                [("read_full_cells", detail.to_string())],
+                "{cap}"
+            );
+            for next in &envelope.next_steps {
+                assert!(!next.detail.contains("time_range"), "{cap}: {}", next.detail);
+            }
+            assert!(serialized_len(&envelope) <= cap as usize, "{cap}");
+        }
     }
 
     /// The row cap firing with `max_rows` at its ceiling cannot be answered

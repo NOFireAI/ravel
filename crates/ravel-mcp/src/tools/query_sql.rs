@@ -78,6 +78,7 @@ const ADVICE: CapAdvice<'static> = CapAdvice {
     fewer_rows: "shorten time_range or add WHERE predicates",
     smaller_rows_action: "narrow_the_projection",
     smaller_rows: "select fewer or narrower columns",
+    read_cell: Some("select fewer or narrower columns to give the cut cells more room"),
 };
 
 /// The BLAKE3 derive-key context of the cursor's argument hash.
@@ -907,9 +908,9 @@ mod tests {
             steps(&page),
             [(
                 "read_full_cells",
-                "the result is complete but the byte cap shortened cells; select fewer or \
-                 narrower columns, or raise max_response_bytes (up to 4 MiB), to read them \
-                 in full"
+                "the result is complete but the byte cap shortened cells of its one row; \
+                 raise max_response_bytes (up to 4 MiB) to read them in full, or select \
+                 fewer or narrower columns to give the cut cells more room"
             )]
         );
     }

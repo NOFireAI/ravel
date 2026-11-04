@@ -413,11 +413,16 @@ fn advice(mode: Mode) -> CapAdvice<'static> {
             smaller_rows_action: "widen_step",
             smaller_rows: "widen step or narrow time_range for fewer samples per series, or \
                            narrow the query for fewer series",
+            read_cell: Some(
+                "narrow time_range to a window after the last sample returned to read the \
+                 samples the cut omitted",
+            ),
         },
         Mode::Instant { .. } => CapAdvice {
             fewer_rows: "narrow the query for fewer series",
             smaller_rows_action: "narrow_the_query",
             smaller_rows: "narrow the query for fewer series",
+            read_cell: None,
         },
     }
 }
@@ -1154,9 +1159,10 @@ mod tests {
             steps(&envelope),
             [(
                 "read_full_cells",
-                "the result is complete but the byte cap shortened cells; widen step or \
-                 narrow time_range for fewer samples per series, or narrow the query for \
-                 fewer series, or raise max_response_bytes (up to 4 MiB), to read them in full"
+                "the result is complete but the byte cap shortened cells of its one row; \
+                 raise max_response_bytes (up to 4 MiB) to read them in full, or narrow \
+                 time_range to a window after the last sample returned to read the samples \
+                 the cut omitted"
             )]
         );
         let size = serde_json::to_vec(&envelope).expect("serializes").len() as u64;

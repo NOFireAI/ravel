@@ -65,6 +65,7 @@ const ADVICE: CapAdvice<'static> = CapAdvice {
     fewer_rows: "name one signal",
     smaller_rows_action: "name_one_signal",
     smaller_rows: "name one signal",
+    read_cell: None,
 };
 
 /// Families per page: the service's own page bound.

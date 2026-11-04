@@ -430,6 +430,10 @@ async fn events<B: AgentsBackend>(args: Value, ctx: &ToolContext<'_>, backend: &
             envelope = envelope.fit(ctx.budgets.max_response_bytes);
         }
     }
+    // A page whose only cut is a shortened cell hands on the route's own
+    // cursor, as a full page does; a page no cap cut is `ok` and names that
+    // cursor in its resume step.
+    envelope.source_cursor = kept == returned && envelope.presentation.cells_truncated > 0;
     let mut envelope = envelope.finish(true);
     if envelope.status != Status::Ok {
         envelope
@@ -1102,6 +1106,37 @@ mod tests {
             &Canned::new(200, body),
         ))
         .expect("an agents tool name routes")
+    }
+
+    /// A short page whose one event's payload is wider than the byte cap
+    /// drops no event: the cap shortens the payload cell, and the page still
+    /// hands on the route's own next cursor, `ok_page`.
+    ///
+    /// FLIP: leaving `source_cursor` unset lets `finish` drop the cursor,
+    /// since no row was dropped, and the page is `ok` with a null cursor.
+    #[test]
+    fn an_events_page_cut_only_in_a_cell_keeps_the_route_cursor() {
+        let key = CursorKey::from_process_secret([7u8; CURSOR_KEY_LEN]);
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
+        let wide = "x".repeat(MAX_RESPONSE_BYTES_FLOOR as usize + 1);
+        let body = json!({"events": [{"event_seq": 1, "accept_seq": 1, "turn_id": "t",
+                          "event_type": "e", "payload": {"blob": wide}}],
+                          "next_cursor": "9"});
+        let envelope = block_on(dispatch_agents(
+            "ravel_agent_events",
+            agent_args(),
+            &ctx,
+            &Canned::new(200, body),
+        ))
+        .expect("an agents tool name routes");
+
+        assert_eq!(envelope.status, Status::OkPage, "{:?}", envelope.presentation);
+        assert_eq!(envelope.presentation.cursor.as_deref(), Some("9"));
+        assert_eq!(envelope.presentation.cells_truncated, 1);
+        assert_eq!(envelope.presentation.rows_omitted, 0);
+        assert!(!envelope.presentation.row_cap_hit);
+        assert!(serialized_len(&envelope) <= MAX_RESPONSE_BYTES_FLOOR as usize);
     }
 
     /// An `ok` events page packed to its byte cap still carries its resume

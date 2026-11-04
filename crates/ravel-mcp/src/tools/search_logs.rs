@@ -91,6 +91,7 @@ const ADVICE: CapAdvice<'static> = CapAdvice {
     fewer_rows: "shorten time_range or add predicates",
     smaller_rows_action: "narrow_time_range",
     smaller_rows: "shorten time_range or add predicates",
+    read_cell: None,
 };
 
 /// The BLAKE3 derive-key context of the cursor's argument hash.
@@ -1384,37 +1385,56 @@ mod tests {
     /// One log row whose attribute is wider than the byte cap: the cap
     /// shortens the cell and drops no row, so the page is `ok` with no
     /// cursor, no group step, and only the step to read the cell in full.
+    /// Under a configured 512 KiB ceiling, a 256 KiB cap is told to raise
+    /// `max_response_bytes` to that ceiling, and a cap at it is told the row
+    /// cannot be returned in full. Neither names time_range or predicates:
+    /// fewer rows cannot return more of the one row.
     ///
     /// FLIP: counting a shortened cell as a cut in `finish_page`'s selection
     /// sends the one row down the group path, whose step says more rows
-    /// share one (ts, observed_ts) pair than fit one page.
+    /// share one (ts, observed_ts) pair than fit one page. FLIP: building
+    /// the cells detail from `smaller_rows` names "shorten time_range or add
+    /// predicates" in both details.
     #[test]
     fn one_row_cut_by_the_byte_cap_is_ok_with_only_the_cells_step() {
-        let key = key();
-        let mut ctx = context(&key);
-        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
-        let wide = "x".repeat(MAX_RESPONSE_BYTES_FLOOR as usize + 1);
-        let stub = Stub::default();
-        stub.sql
-            .borrow_mut()
-            .push_back(page(&[("a", 4, 4, json!({ "msg": wide }))]));
+        let ceiling = 2 * MAX_RESPONSE_BYTES_FLOOR;
+        let cases = [
+            (
+                MAX_RESPONSE_BYTES_FLOOR,
+                "the result is complete but the byte cap shortened cells of its one row; \
+                 raise max_response_bytes (up to 512 KiB) to read them in full",
+            ),
+            (
+                ceiling,
+                "the result is complete but the byte cap shortened cells of its one row, \
+                 which cannot be returned in full under the 512 KiB max_response_bytes \
+                 ceiling",
+            ),
+        ];
+        for (cap, detail) in cases {
+            let key = key();
+            let mut ctx = context(&key);
+            ctx.budgets.max_response_bytes_ceiling = ceiling;
+            ctx.budgets.max_response_bytes = cap;
+            let wide = "x".repeat(cap as usize + 1);
+            let stub = Stub::default();
+            stub.sql
+                .borrow_mut()
+                .push_back(page(&[("a", 4, 4, json!({ "msg": wide }))]));
 
-        let envelope = block_on(run(args(json!({})), &ctx, &stub));
+            let envelope = block_on(run(args(json!({})), &ctx, &stub));
 
-        assert_eq!(envelope.status, Status::Ok, "{:?}", envelope.presentation);
-        assert_eq!(envelope.presentation.cursor, None);
-        assert_eq!(envelope.presentation.cells_truncated, 1);
-        assert_eq!(envelope.presentation.rows_omitted, 0);
-        assert_eq!(ids(&envelope), ["a"]);
-        assert_eq!(
-            steps(&envelope),
-            [(
-                "read_full_cells",
-                "the result is complete but the byte cap shortened cells; shorten time_range \
-                 or add predicates, or raise max_response_bytes (up to 4 MiB), to read them \
-                 in full"
-            )]
-        );
+            assert_eq!(envelope.status, Status::Ok, "{cap}: {:?}", envelope.presentation);
+            assert_eq!(envelope.presentation.cursor, None, "{cap}");
+            assert_eq!(envelope.presentation.cells_truncated, 1, "{cap}");
+            assert_eq!(envelope.presentation.rows_omitted, 0, "{cap}");
+            assert_eq!(ids(&envelope), ["a"], "{cap}");
+            assert_eq!(steps(&envelope), [("read_full_cells", detail)], "{cap}");
+            for step in &envelope.next_steps {
+                assert!(!step.detail.contains("time_range"), "{cap}: {}", step.detail);
+                assert!(!step.detail.contains("predicates"), "{cap}: {}", step.detail);
+            }
+        }
     }
 
     /// Rows with the same attribute key set form one group; an attribute
