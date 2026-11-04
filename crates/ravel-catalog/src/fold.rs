@@ -43,9 +43,9 @@ use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{
     self, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION, KeyIndexLeafEncodeError, KeyIndexLeafEntry,
-    KeyIndexLeafInput, KeyIndexLeafLimits, NamePostings, PartLimits, SnapshotFormatError,
-    column_stats_segments_concat, encode_key_index_leaf, encoded_entry_len,
-    split_key_index_entries,
+    KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafSummary, NamePostings, PartLimits,
+    SnapshotFormatError, check_key_index_leaf_set, column_stats_segments_concat,
+    encode_key_index_leaf, encoded_entry_len, split_key_index_entries, verify_key_index_leaf,
 };
 use crate::tenant_config::DeclaredTypedColumn;
 
@@ -322,10 +322,10 @@ pub struct FoldReport {
     /// the entries of the parts this fold re-encoded: a footer suffix GET of
     /// at most [`KEY_INDEX_FOOTER_SUFFIX_LEN`] bytes, one more footer GET
     /// only when the footer is longer than that, and a GET of the KEY_IDX
-    /// section when the footer names one. The total this fold issued: an
-    /// object's reads are kept for the whole fold, so a HEAD CAS attempt
-    /// after a lost one reuses them and issues none for it. Also counted in
-    /// `get_requests`. Zero when
+    /// section when the footer names one. The total this fold issued: a
+    /// part's built leaves are kept for the whole fold, so a HEAD CAS attempt
+    /// after a lost one that re-encodes the same part issues none for it.
+    /// Also counted in `get_requests`. Zero when
     /// [`CatalogConfig::build_key_index_leaves`](crate::CatalogConfig::build_key_index_leaves)
     /// is off, for a signal other than logs and spans, and for a logs tenant
     /// that declares no key-index column and leaves `index_trace_id` off.
@@ -334,18 +334,43 @@ pub struct FoldReport {
     /// transferred; a failed GET adds nothing). The total this fold read,
     /// like `key_index_ranged_gets`.
     pub key_index_bytes_read: u64,
-    /// `.kidx` leaves PUT by the HEAD CAS attempt that published (an
+    /// `.kidx` leaves this fold PUT, every HEAD CAS attempt included (an
     /// `AlreadyExists` included: the content-addressed object is there either
     /// way), one per (part, field, key slice) of the re-encoded parts. A part
     /// carried forward by reference keeps its `key_index` refs and adds none.
+    /// A leaf a later pass made stale (see `key_index_build_passes`) counts
+    /// too: it was PUT, and the catalog sweep removes it.
     pub key_index_leaves_written: u64,
-    /// Total bytes of those leaves, for the attempt that published.
+    /// Total bytes of those leaves.
     pub key_index_leaf_bytes_written: u64,
     /// For each part the publishing attempt re-encoded and each field of its
     /// key-index set, the part entries no leaf covers, summed: the entries
     /// whose `uncovered_entry_ordinals` lists them, plus every entry of a
     /// field that wrote no leaf.
     pub key_index_uncovered_entries: u64,
+    /// KEY_IDX section reads the leaf build issued, one per (entry, pass)
+    /// whatever the GETs each cost (`key_index_ranged_gets` counts those).
+    /// An entry carried from the previous tail's leaves is not read; an entry
+    /// those leaves listed as uncovered is read again, and every entry of a
+    /// part whose previous leaves could not be read or verified is read.
+    pub key_index_sections_read: u64,
+    /// (entry, field) pairs the leaf build took from the previous tail
+    /// part's leaves instead of reading the entry's section: matched by data
+    /// object key, never by ordinal, for entries those leaves covered.
+    pub key_index_entries_carried: u64,
+    /// Build passes over the re-encoded parts, summed. A part whose held
+    /// pairs fit
+    /// [`CatalogConfig::key_index_build_max_pairs`](crate::CatalogConfig::key_index_build_max_pairs)
+    /// takes one; a part over it takes one pass per key8 range, and each pass
+    /// reads every section the build needs again. A field a later pass finds
+    /// a new uncovered entry for (a transient read failure, or a key8 over the
+    /// body ceiling) is rebuilt once with the complete uncovered list, which
+    /// adds its passes here.
+    pub key_index_build_passes: u64,
+    /// GETs of the previous tail part's leaves, whole objects, one per
+    /// (field, slice), issued when a re-encoded part shares a data object
+    /// with that tail. Also counted in `get_requests`.
+    pub key_index_leaf_gets: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -355,6 +380,12 @@ pub(crate) struct RequestCounters {
     put_requests: u64,
     key_index_ranged_gets: u64,
     key_index_bytes_read: u64,
+    key_index_sections_read: u64,
+    key_index_entries_carried: u64,
+    key_index_build_passes: u64,
+    key_index_leaf_gets: u64,
+    key_index_leaves_written: u64,
+    key_index_leaf_bytes_written: u64,
 }
 
 /// HEAD as read at the top of one fold attempt.
@@ -795,6 +826,28 @@ thread_local! {
 #[cfg(test)]
 fn refuse_key_index_leaf_encode_for_test(field: Option<&str>) {
     REFUSE_KEY_INDEX_LEAF_ENCODE.with(|f| *f.borrow_mut() = field.map(str::to_string));
+}
+
+// Test-only: a leaf body ceiling below the default, so a fold over a small
+// fixture builds a field in several slices.
+#[cfg(test)]
+thread_local! {
+    static KEY_INDEX_LEAF_BODY_CEILING: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_key_index_leaf_body_ceiling_for_test(ceiling: Option<u64>) {
+    KEY_INDEX_LEAF_BODY_CEILING.with(|c| c.set(ceiling));
+}
+
+/// The leaf limits the fold builds with.
+fn key_index_leaf_limits() -> KeyIndexLeafLimits {
+    #[cfg(test)]
+    if let Some(max_body_bytes) = KEY_INDEX_LEAF_BODY_CEILING.with(std::cell::Cell::get) {
+        return KeyIndexLeafLimits { max_body_bytes };
+    }
+    KeyIndexLeafLimits::default()
 }
 
 fn encode_part_key_index_leaf(
@@ -1558,6 +1611,814 @@ pub(crate) fn build_part_key_index_leaves(
     built
 }
 
+static FOLD_KEY_INDEX_SECTIONS_READ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static FOLD_KEY_INDEX_ENTRIES_CARRIED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static FOLD_KEY_INDEX_BUILD_PASSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static FOLD_KEY_INDEX_LEAF_GETS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The leaf build's [`FoldReport`] figures `key_index_sections_read`,
+/// `key_index_entries_carried`, `key_index_build_passes` and
+/// `key_index_leaf_gets`, summed over every fold that committed its HEAD in
+/// this process since it started. Monotonic and process-local: a scrape
+/// takes the delta between samples.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FoldKeyIndexTotals {
+    pub sections_read: u64,
+    pub entries_carried: u64,
+    pub build_passes: u64,
+    pub leaf_gets: u64,
+}
+
+/// The process-global [`FoldKeyIndexTotals`].
+pub fn fold_key_index_totals() -> FoldKeyIndexTotals {
+    use std::sync::atomic::Ordering::Relaxed;
+    FoldKeyIndexTotals {
+        sections_read: FOLD_KEY_INDEX_SECTIONS_READ.load(Relaxed),
+        entries_carried: FOLD_KEY_INDEX_ENTRIES_CARRIED.load(Relaxed),
+        build_passes: FOLD_KEY_INDEX_BUILD_PASSES.load(Relaxed),
+        leaf_gets: FOLD_KEY_INDEX_LEAF_GETS.load(Relaxed),
+    }
+}
+
+/// Adds one committed fold's leaf-build figures to the process-global
+/// totals, from the same counters its [`FoldReport`] reads.
+fn observe_fold_key_index(counters: &RequestCounters) {
+    use std::sync::atomic::Ordering::Relaxed;
+    FOLD_KEY_INDEX_SECTIONS_READ.fetch_add(counters.key_index_sections_read, Relaxed);
+    FOLD_KEY_INDEX_ENTRIES_CARRIED.fetch_add(counters.key_index_entries_carried, Relaxed);
+    FOLD_KEY_INDEX_BUILD_PASSES.fetch_add(counters.key_index_build_passes, Relaxed);
+    FOLD_KEY_INDEX_LEAF_GETS.fetch_add(counters.key_index_leaf_gets, Relaxed);
+}
+
+/// The previous HEAD's tail part, the carry source of the incremental leaf
+/// build: its ref and each of its entries' data object key by ordinal.
+pub(crate) struct PreviousTail {
+    part: SnapshotPartRef,
+    object_keys: Vec<Option<String>>,
+}
+
+impl PreviousTail {
+    /// `None` when `head` has no part, its last part carries no leaf, or
+    /// `previous_entries` (every part's entries concatenated in HEAD order)
+    /// is shorter than that part.
+    fn from_head(
+        tenant: &TenantHash,
+        signal: Signal,
+        head: &SnapshotHead,
+        previous_entries: &[SnapshotEntry],
+    ) -> Option<Self> {
+        let part = head.parts.last()?;
+        if part.key_index.is_empty() {
+            return None;
+        }
+        let count = usize::try_from(part.entry_count).ok()?;
+        let start = previous_entries.len().checked_sub(count)?;
+        Some(Self {
+            part: part.clone(),
+            object_keys: previous_entries[start..]
+                .iter()
+                .map(|entry| column_stats_build::segment_data_key(tenant, signal, entry).ok())
+                .collect(),
+        })
+    }
+}
+
+/// One field's pairs carried from the previous tail's leaves onto a new
+/// part's ordinals.
+struct CarriedField {
+    /// Sorted by `(key8, entry_ordinal)`, ordinals the new part's.
+    entries: Vec<KeyIndexLeafEntry>,
+    /// Per new ordinal: whether the previous leaves covered its object.
+    covered: Vec<bool>,
+}
+
+/// Reads and verifies every leaf of `tail` and maps its covered entries onto
+/// the new part by data object key. `Err` (the reason) when the leaves cannot
+/// stand in for the sections: a leaf field not in `fields` under its key
+/// type, a field of `fields` with no leaf, a failed GET, a leaf that does not
+/// verify, match its ref or bind `tail`, or a field whose slices do not form
+/// one set.
+#[allow(clippy::too_many_arguments)]
+async fn load_carried_key_index(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    tail: &PreviousTail,
+    fields: &BTreeMap<&str, KeyType>,
+    ordinal_by_key: &HashMap<&str, u64>,
+    part_entry_count: usize,
+    limits: &KeyIndexLeafLimits,
+    counters: &mut RequestCounters,
+) -> Result<BTreeMap<String, CarriedField>, String> {
+    let refs = &tail.part.key_index;
+    if let Some(leaf) = refs.iter().find(|leaf| {
+        fields
+            .get(leaf.field.as_str())
+            .is_none_or(|key_type| u32::from(key_type.as_u8()) != leaf.key_type)
+    }) {
+        return Err(format!(
+            "previous leaf field {:?} is not declared under key type {}",
+            leaf.field, leaf.key_type
+        ));
+    }
+    if let Some(name) = fields
+        .keys()
+        .find(|name| !refs.iter().any(|leaf| leaf.field == **name))
+    {
+        return Err(format!("declared field {name:?} has no previous leaf"));
+    }
+    if tail.object_keys.len() as u64 != tail.part.entry_count {
+        return Err("previous tail entry list does not match its ref".to_string());
+    }
+    let mut by_field: BTreeMap<&str, Vec<KeyIndexLeafSummary>> = BTreeMap::new();
+    for leaf in refs {
+        counters.get_requests += 1;
+        counters.key_index_leaf_gets += 1;
+        let got = store
+            .get(&leaf.key, GetRange::Full)
+            .await
+            .map_err(|e| format!("leaf {} GET: {e}", leaf.key))?;
+        let summary =
+            verify_key_index_leaf(&got.data, limits).map_err(|e| format!("leaf {}: {e}", leaf.key))?;
+        let expected = SnapshotKeyIndexLeafRef {
+            key: String::new(),
+            ..leaf.clone()
+        };
+        if summary.leaf_ref() != expected {
+            return Err(format!("leaf {} does not match its ref", leaf.key));
+        }
+        let header = &summary.header;
+        if header.tenant_hash.as_slice() != tenant.0.as_slice()
+            || header.signal != signal::to_proto(signal) as u32
+            || header.part_blake3 != tail.part.blake3
+            || header.part_entry_count != tail.part.entry_count
+        {
+            return Err(format!(
+                "leaf {} binds another tenant, signal or part",
+                leaf.key
+            ));
+        }
+        by_field.entry(leaf.field.as_str()).or_default().push(summary);
+    }
+    let onto: Vec<Option<u64>> = tail
+        .object_keys
+        .iter()
+        .map(|key| {
+            key.as_deref()
+                .and_then(|key| ordinal_by_key.get(key).copied())
+        })
+        .collect();
+    let mut carried = BTreeMap::new();
+    for (field, leaves) in by_field {
+        check_key_index_leaf_set(&leaves).map_err(|e| format!("field {field:?}: {e}"))?;
+        let uncovered: HashSet<u64> = leaves[0]
+            .header
+            .uncovered_entry_ordinals
+            .iter()
+            .copied()
+            .collect();
+        let mut covered = vec![false; part_entry_count];
+        for (previous, new) in onto.iter().enumerate() {
+            if let Some(new) = new
+                && !uncovered.contains(&(previous as u64))
+                && let Some(slot) = covered.get_mut(*new as usize)
+            {
+                *slot = true;
+            }
+        }
+        let mut entries = Vec::new();
+        for leaf in leaves {
+            for entry in leaf.entries {
+                if uncovered.contains(&entry.entry_ordinal) {
+                    continue;
+                }
+                let Some(new) = usize::try_from(entry.entry_ordinal)
+                    .ok()
+                    .and_then(|previous| onto.get(previous).copied().flatten())
+                else {
+                    continue;
+                };
+                entries.push(KeyIndexLeafEntry {
+                    entry_ordinal: new,
+                    ..entry
+                });
+            }
+        }
+        entries.sort_by_key(|e| (e.key8, e.entry_ordinal));
+        carried.insert(field.to_string(), CarriedField { entries, covered });
+    }
+    Ok(carried)
+}
+
+/// The open slice of one field's leaf build, cut by the rule
+/// [`split_key_index_entries`] applies to a whole sorted list: a slice takes
+/// key8 runs while its body stays at or below the ceiling, and the run that
+/// would cross it opens the next slice at its own key8. Runs arrive in
+/// ascending key8 order across every pass, so the slices of all passes are
+/// the slices of one pass.
+struct OpenSlice {
+    key8_lo: u64,
+    entries: Vec<KeyIndexLeafEntry>,
+    body: u64,
+}
+
+impl OpenSlice {
+    fn new() -> Self {
+        Self {
+            key8_lo: 0,
+            entries: Vec::new(),
+            body: 0,
+        }
+    }
+
+    /// Adds one key8 run (non-empty, sorted by ordinal, body at or below
+    /// `max_body_bytes`) and returns the slice it closed, if any.
+    fn push_run(
+        &mut self,
+        run: Vec<KeyIndexLeafEntry>,
+        max_body_bytes: u64,
+    ) -> Option<(u64, u64, Vec<KeyIndexLeafEntry>)> {
+        let key8 = u64::from_be_bytes(run.first()?.key8);
+        let run_body = run
+            .iter()
+            .map(encoded_entry_len)
+            .fold(0u64, u64::saturating_add);
+        let mut closed = None;
+        if !self.entries.is_empty() && self.body.saturating_add(run_body) > max_body_bytes {
+            closed = Some((
+                self.key8_lo,
+                key8 - 1,
+                std::mem::take(&mut self.entries),
+            ));
+            self.key8_lo = key8;
+            self.body = 0;
+        }
+        self.body = self.body.saturating_add(run_body);
+        self.entries.extend(run);
+        closed
+    }
+
+    /// The last slice, which ends at `u64::MAX`.
+    fn finish(&mut self) -> (u64, u64, Vec<KeyIndexLeafEntry>) {
+        (self.key8_lo, u64::MAX, std::mem::take(&mut self.entries))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldBuildState {
+    Building,
+    Done,
+    /// No leaf: every entry is uncovered, the encoder refused a slice, or a
+    /// rebuild found new uncovered entries again.
+    Uncovered,
+}
+
+/// One field of one part's leaf build.
+struct FieldBuild {
+    key_type: KeyType,
+    /// Pairs carried from the previous tail for entries this build does not
+    /// read, sorted by `(key8, entry_ordinal)`.
+    carried: Vec<KeyIndexLeafEntry>,
+    uncovered: BTreeSet<u64>,
+    /// Pairs read this pass, by key8, inside `[lo, end)`.
+    held: BTreeMap<[u8; 8], Vec<KeyIndexLeafEntry>>,
+    held_pairs: u64,
+    lo: u64,
+    /// Exclusive end of this pass's key8 range, once the budget cut it.
+    end: Option<u64>,
+    slice: OpenSlice,
+    /// Whether any pair reached `slice` this attempt: a new uncovered entry
+    /// after that makes the attempt stale.
+    fed: bool,
+    stale: bool,
+    attempt: u32,
+    state: FieldBuildState,
+    refs: Vec<SnapshotKeyIndexLeafRef>,
+}
+
+impl FieldBuild {
+    fn new(key_type: KeyType, carried: Vec<KeyIndexLeafEntry>, uncovered: BTreeSet<u64>) -> Self {
+        Self {
+            key_type,
+            carried,
+            uncovered,
+            held: BTreeMap::new(),
+            held_pairs: 0,
+            lo: 0,
+            end: None,
+            slice: OpenSlice::new(),
+            fed: false,
+            stale: false,
+            attempt: 0,
+            state: FieldBuildState::Building,
+            refs: Vec::new(),
+        }
+    }
+
+    fn note_uncovered(&mut self, ordinal: u64) {
+        if self.uncovered.insert(ordinal) && self.fed {
+            self.stale = true;
+        }
+    }
+
+    fn give_up(&mut self) {
+        self.state = FieldBuildState::Uncovered;
+        self.refs.clear();
+        self.held.clear();
+        self.held_pairs = 0;
+    }
+}
+
+/// What the leaf build needs beyond the part: the body ceiling, the pair
+/// budget and the read concurrency.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct KeyIndexBuildLimits {
+    pub(crate) leaf: KeyIndexLeafLimits,
+    pub(crate) max_pairs: u64,
+    pub(crate) concurrency: usize,
+}
+
+/// One part's leaf refs, sorted by (field, key8_lo), and its uncovered
+/// (entry, field) count.
+#[derive(Debug, Clone)]
+pub(crate) struct BuiltPartKeyIndex {
+    pub(crate) refs: Vec<SnapshotKeyIndexLeafRef>,
+    pub(crate) uncovered_entries: u64,
+}
+
+/// Builds and PUTs one re-encoded part's leaves (ADR-2707 decision 4, the
+/// incremental tail build amendment), the same leaves
+/// [`build_part_key_index_leaves`] builds from every entry's section, byte
+/// for byte.
+///
+/// Carry: when `previous_tail` shares a data object with this part, its
+/// leaves are read (one GET each) and verified, and each entry they cover is
+/// taken from them, matched by data object key, without reading its section.
+/// Entries they list as uncovered and entries new to the part are read. A
+/// leaf that cannot be read or verified drops the carry and every entry is
+/// read; so does a section naming a field the tenant does not declare, since
+/// a carried entry might name it too.
+///
+/// Passes: the first pass counts pairs as it reads and spills nothing. Once
+/// the pairs held across the part's fields pass `limits.max_pairs`, the
+/// field holding most gives up its highest key8 run until the rest fit, and
+/// that key8 becomes the exclusive end of its range for the pass; each later
+/// pass re-reads the sections and keeps the next range. One key8 run is never
+/// split. The carried pairs are held outside the budget. A field whose later
+/// pass finds an entry uncovered after pairs already reached its slices is
+/// rebuilt once from the first range with the complete uncovered list; a
+/// second such finding leaves it with no leaf.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_part_key_index(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    part_blake3: [u8; 32],
+    part_watermark: u32,
+    part_entries: &[SnapshotEntry],
+    declared: &[(String, KeyType)],
+    previous_tail: Option<&PreviousTail>,
+    limits: &KeyIndexBuildLimits,
+    counters: &mut RequestCounters,
+) -> Result<BuiltPartKeyIndex, StoreError> {
+    let n = part_entries.len();
+    let part_entry_count = n as u64;
+    let max_pairs = limits.max_pairs.max(1);
+    let data_keys: Vec<Result<String, String>> = part_entries
+        .iter()
+        .map(|entry| {
+            column_stats_build::segment_data_key(tenant, signal, entry)
+                .map_err(|e| format!("data key: {e}"))
+        })
+        .collect();
+    let key_errors: BTreeSet<u64> = (0..part_entry_count)
+        .filter(|&o| data_keys[o as usize].is_err())
+        .collect();
+    let mut ordinal_by_key: HashMap<&str, u64> = HashMap::new();
+    for (ordinal, key) in data_keys.iter().enumerate() {
+        if let Ok(key) = key {
+            ordinal_by_key.entry(key.as_str()).or_insert(ordinal as u64);
+        }
+    }
+    let mut declared_types: BTreeMap<&str, KeyType> = BTreeMap::new();
+    for (name, key_type) in declared {
+        declared_types.entry(name.as_str()).or_insert(*key_type);
+    }
+
+    let mut carry = match previous_tail {
+        Some(tail)
+            if tail
+                .object_keys
+                .iter()
+                .flatten()
+                .any(|key| ordinal_by_key.contains_key(key.as_str())) =>
+        {
+            match load_carried_key_index(
+                store,
+                tenant,
+                signal,
+                tail,
+                &declared_types,
+                &ordinal_by_key,
+                n,
+                &limits.leaf,
+                counters,
+            )
+            .await
+            {
+                Ok(carried) => Some(carried),
+                Err(reason) => {
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        reason = %reason,
+                        "previous tail leaves not carried; the leaf build reads every entry's section"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    'build: loop {
+        let mut carried_by_field = carry.take();
+        let carry_active = carried_by_field.is_some();
+        let carried_all: Vec<bool> = (0..n)
+            .map(|o| {
+                carried_by_field
+                    .as_ref()
+                    .is_some_and(|fields| fields.values().all(|field| field.covered[o]))
+            })
+            .collect();
+        let mut fields: BTreeMap<String, FieldBuild> = BTreeMap::new();
+        for (&name, &key_type) in &declared_types {
+            // Only entries carried for every field go unread; an entry read
+            // for one field is indexed from its section for all of them.
+            let carried = carried_by_field
+                .as_mut()
+                .and_then(|fields| fields.remove(name))
+                .map(|field| {
+                    field
+                        .entries
+                        .into_iter()
+                        .filter(|e| carried_all[e.entry_ordinal as usize])
+                        .collect()
+                })
+                .unwrap_or_default();
+            fields.insert(
+                name.to_string(),
+                FieldBuild::new(key_type, carried, key_errors.clone()),
+            );
+        }
+        let mut to_read: Vec<u64> = (0..part_entry_count)
+            .filter(|&o| data_keys[o as usize].is_ok() && !carried_all[o as usize])
+            .collect();
+        let mut first_pass = true;
+
+        loop {
+            counters.key_index_build_passes += 1;
+            let targets: Vec<(u64, String, u64)> = to_read
+                .iter()
+                .filter_map(|&o| {
+                    let key = data_keys[o as usize].as_ref().ok()?;
+                    Some((o, key.clone(), part_entries[o as usize].object_size))
+                })
+                .collect();
+            let mut failed: HashSet<u64> = HashSet::new();
+            let mut total_held: u64 = 0;
+            let mut carry_conflict = false;
+            {
+                let targets_ref = &targets;
+                // Indexed rather than `iter()`, so the stream's item is not a
+                // borrow: a borrowed item makes the fold future fail the
+                // `Send` bound the server's spawned fold loop needs.
+                let mut reads = stream::iter(0..targets.len())
+                    .map(move |i| {
+                        let (_, key, object_size) = &targets_ref[i];
+                        read_entry_key_index(store, tenant, signal, key, *object_size)
+                    })
+                    .buffered(limits.concurrency.max(1));
+                let mut next = 0usize;
+                while let Some(read) = reads.next().await {
+                    let (ordinal, key, _) = &targets[next];
+                    let ordinal = *ordinal;
+                    next += 1;
+                    counters.get_requests += read.gets;
+                    counters.key_index_ranged_gets += read.gets;
+                    counters.key_index_bytes_read += read.bytes;
+                    counters.key_index_sections_read += 1;
+                    let sections = match &read.fields {
+                        Ok(sections) => sections,
+                        Err(reason) => {
+                            if read.get_failed {
+                                tracing::warn!(
+                                    tenant = %tenant.to_hex(),
+                                    object_key = %key,
+                                    reason = %reason,
+                                    "KEY_IDX read GET failed; the entry is uncovered by this fold's key-index leaves"
+                                );
+                            }
+                            failed.insert(ordinal);
+                            for field in fields.values_mut() {
+                                if field.state == FieldBuildState::Building {
+                                    field.note_uncovered(ordinal);
+                                }
+                            }
+                            continue;
+                        }
+                    };
+                    for section in sections {
+                        if fields.contains_key(&section.name) {
+                            continue;
+                        }
+                        if carry_active {
+                            carry_conflict = true;
+                        } else if first_pass {
+                            // The first entry naming an undeclared field
+                            // sets its key type, and every entry before it
+                            // names it under none.
+                            let mut uncovered = key_errors.clone();
+                            uncovered.extend(0..ordinal);
+                            fields.insert(
+                                section.name.clone(),
+                                FieldBuild::new(section.key_type, Vec::new(), uncovered),
+                            );
+                        }
+                    }
+                    if carry_conflict {
+                        break;
+                    }
+                    for (name, field) in fields.iter_mut() {
+                        if field.state != FieldBuildState::Building {
+                            continue;
+                        }
+                        let Some(named) = sections
+                            .iter()
+                            .find(|s| s.name == *name)
+                            .filter(|s| s.key_type == field.key_type)
+                        else {
+                            field.note_uncovered(ordinal);
+                            continue;
+                        };
+                        let mut pairs = named.entries.clone();
+                        pairs.sort_unstable();
+                        pairs.dedup();
+                        for run in pairs.chunk_by(|a, b| a.0 == b.0) {
+                            let key8 = u64::from_be_bytes(run[0].0);
+                            if key8 < field.lo || field.end.is_some_and(|end| key8 >= end) {
+                                continue;
+                            }
+                            field.held.entry(run[0].0).or_default().push(KeyIndexLeafEntry {
+                                key8: run[0].0,
+                                entry_ordinal: ordinal,
+                                blocks: run.iter().map(|&(_, block)| block).collect(),
+                            });
+                            field.held_pairs += 1;
+                            total_held += 1;
+                        }
+                    }
+                    while total_held > max_pairs {
+                        let Some(field) = fields
+                            .values_mut()
+                            .filter(|f| f.held.len() > 1)
+                            .max_by_key(|f| f.held_pairs)
+                        else {
+                            break;
+                        };
+                        let Some((key8, run)) = field.held.pop_last() else {
+                            break;
+                        };
+                        field.held_pairs -= run.len() as u64;
+                        total_held -= run.len() as u64;
+                        field.end = Some(u64::from_be_bytes(key8));
+                    }
+                }
+            }
+            if carry_conflict {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    "a section names a field the tenant does not declare; the leaf build drops the carry and reads every entry's section"
+                );
+                continue 'build;
+            }
+            first_pass = false;
+            to_read.retain(|o| !failed.contains(o));
+
+            let mut pending: Vec<(String, u32, EncodedKeyIndexLeaf)> = Vec::new();
+            for (name, field) in fields.iter_mut() {
+                if field.state == FieldBuildState::Building {
+                    end_key_index_pass(
+                        tenant,
+                        signal,
+                        part_blake3,
+                        part_entry_count,
+                        name,
+                        field,
+                        &limits.leaf,
+                        &mut pending,
+                    );
+                }
+            }
+            for (name, attempt, leaf) in pending {
+                let put_result =
+                    put_key_index_leaf(store, tenant, signal, part_watermark, leaf).await;
+                // Request-issued, like every PUT counter here (#1598).
+                counters.put_requests += 1;
+                let leaf_ref = put_result?;
+                counters.key_index_leaves_written += 1;
+                counters.key_index_leaf_bytes_written += leaf_ref.size;
+                if let Some(field) = fields.get_mut(&name)
+                    && field.attempt == attempt
+                    && field.state != FieldBuildState::Uncovered
+                {
+                    field.refs.push(leaf_ref);
+                }
+            }
+            if fields
+                .values()
+                .all(|field| field.state != FieldBuildState::Building)
+            {
+                break;
+            }
+        }
+
+        let carried_entries = carried_all.iter().filter(|&&carried| carried).count() as u64;
+        counters.key_index_entries_carried += carried_entries * fields.len() as u64;
+        let mut built = BuiltPartKeyIndex {
+            refs: Vec::new(),
+            uncovered_entries: 0,
+        };
+        for field in fields.into_values() {
+            match field.state {
+                FieldBuildState::Done => {
+                    built.uncovered_entries += field.uncovered.len() as u64;
+                    built.refs.extend(field.refs);
+                }
+                FieldBuildState::Building | FieldBuildState::Uncovered => {
+                    built.uncovered_entries += part_entry_count;
+                }
+            }
+        }
+        return Ok(built);
+    }
+}
+
+/// Closes one pass of one field: merges the pass's read pairs with the
+/// carried pairs in its range, uncovers the entries of every key8 whose own
+/// entries exceed the body ceiling, feeds the rest to the open slice and
+/// queues each slice it closes (the last one when the range reaches
+/// `u64::MAX`) on `pending`.
+#[allow(clippy::too_many_arguments)]
+fn end_key_index_pass(
+    tenant: &TenantHash,
+    signal: Signal,
+    part_blake3: [u8; 32],
+    part_entry_count: u64,
+    name: &str,
+    field: &mut FieldBuild,
+    limits: &KeyIndexLeafLimits,
+    pending: &mut Vec<(String, u32, EncodedKeyIndexLeaf)>,
+) {
+    let held = std::mem::take(&mut field.held);
+    field.held_pairs = 0;
+    let lo = field.lo;
+    let end = field.end.take();
+    let key_of = |e: &KeyIndexLeafEntry| u64::from_be_bytes(e.key8);
+    let carried_start = field.carried.partition_point(|e| key_of(e) < lo);
+    let carried_end = end.map_or(field.carried.len(), |end| {
+        field.carried.partition_point(|e| key_of(e) < end)
+    });
+    let mut carried = field.carried[carried_start..carried_end]
+        .chunk_by(|a, b| a.key8 == b.key8)
+        .peekable();
+    let mut held = held.into_iter().peekable();
+    let mut runs: Vec<Vec<KeyIndexLeafEntry>> = Vec::new();
+    loop {
+        let next_carried = carried.peek().map(|run| run[0].key8);
+        let next_held = held.peek().map(|(key8, _)| *key8);
+        let mut run = match (next_carried, next_held) {
+            (None, None) => break,
+            (Some(c), Some(h)) if c == h => {
+                let mut run = carried.next().map(<[_]>::to_vec).unwrap_or_default();
+                run.extend(held.next().map(|(_, run)| run).unwrap_or_default());
+                run
+            }
+            (Some(c), Some(h)) if c < h => carried.next().map(<[_]>::to_vec).unwrap_or_default(),
+            (Some(_), None) => carried.next().map(<[_]>::to_vec).unwrap_or_default(),
+            _ => held.next().map(|(_, run)| run).unwrap_or_default(),
+        };
+        run.sort_by_key(|e| e.entry_ordinal);
+        runs.push(run);
+    }
+    for run in &runs {
+        let body = run
+            .iter()
+            .map(encoded_entry_len)
+            .fold(0u64, u64::saturating_add);
+        if body > limits.max_body_bytes {
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                field = name,
+                entries = run.len(),
+                ceiling = limits.max_body_bytes,
+                "a key8's own index entries exceed the key-index leaf body ceiling; the entries carrying it are uncovered for the field"
+            );
+            for entry in run {
+                field.note_uncovered(entry.entry_ordinal);
+            }
+        }
+    }
+    if field.uncovered.len() as u64 == part_entry_count {
+        field.give_up();
+        return;
+    }
+    let uncovered: Vec<u64> = field.uncovered.iter().copied().collect();
+    let mut emit = |field: &mut FieldBuild, (key8_lo, key8_hi, entries): (u64, u64, Vec<KeyIndexLeafEntry>)| {
+        let encoded = encode_part_key_index_leaf(
+            &KeyIndexLeafInput {
+                tenant_hash: *tenant,
+                signal,
+                part_blake3,
+                part_entry_count,
+                field: name,
+                key_type: field.key_type,
+                key8_lo,
+                key8_hi,
+                uncovered_entry_ordinals: &uncovered,
+                entries: &entries,
+            },
+            limits,
+        );
+        match encoded {
+            Ok(leaf) => {
+                pending.push((name.to_string(), field.attempt, leaf));
+                true
+            }
+            Err(err) => {
+                tracing::error!(
+                    tenant = %tenant.to_hex(),
+                    field = name,
+                    error = %err,
+                    "key-index leaf encode refused; the part is uncovered for the field"
+                );
+                field.give_up();
+                false
+            }
+        }
+    };
+    if !field.stale {
+        for run in runs {
+            let run: Vec<KeyIndexLeafEntry> = run
+                .into_iter()
+                .filter(|e| !field.uncovered.contains(&e.entry_ordinal))
+                .collect();
+            if run.is_empty() {
+                continue;
+            }
+            field.fed = true;
+            if let Some(closed) = field.slice.push_run(run, limits.max_body_bytes)
+                && !emit(field, closed)
+            {
+                return;
+            }
+        }
+    }
+    match end {
+        Some(end) => field.lo = end,
+        None if field.stale && field.attempt == 0 => {
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                field = name,
+                "a later leaf-build pass found new uncovered entries; the field is rebuilt with the complete list"
+            );
+            field.attempt = 1;
+            field.stale = false;
+            field.fed = false;
+            field.lo = 0;
+            field.slice = OpenSlice::new();
+            field.refs.clear();
+        }
+        None if field.stale => {
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                field = name,
+                "the field's rebuild found new uncovered entries again; the part is uncovered for the field"
+            );
+            field.give_up();
+        }
+        None => {
+            let last = field.slice.finish();
+            if emit(field, last) {
+                field.state = FieldBuildState::Done;
+            }
+        }
+    }
+}
+
 impl Catalog {
     /// Fold previous snapshot parts plus newly sealed commit buckets into a
     /// new snapshot part and CAS-swap HEAD to name it.
@@ -1887,10 +2748,11 @@ impl Catalog {
         // attempts is safe by the cache's own contract.
         let mut column_stats_cache =
             column_stats_build::SegmentColumnStatsCache::new(&typed_attr_columns);
-        // Each data object's KEY_IDX read, by object key, for the whole fold
-        // for the same reason: an attempt after a lost HEAD CAS re-encodes
-        // the same tail part and reads none of its sections again.
-        let mut key_index_reads: HashMap<String, EntryKeyIndex> = HashMap::new();
+        // Each part's built leaf refs, by part hash, for the whole fold for the
+        // same reason: an attempt after a lost HEAD CAS that re-encodes the
+        // same part reads none of its sections or previous leaves again. The
+        // leaves are content-addressed and already stored.
+        let mut key_index_built: HashMap<[u8; 32], BuiltPartKeyIndex> = HashMap::new();
 
         loop {
             let head_state = self.get_head(&head_key, &mut counters).await?;
@@ -2038,6 +2900,15 @@ impl Catalog {
                         });
                     }
                 };
+
+            // The carry source of this attempt's incremental leaf build,
+            // taken before `entries` gains this fold's commits.
+            let previous_tail: Option<PreviousTail> = match &head_state {
+                HeadState::Valid { head, .. } if !rebuilt && key_index_fields.is_some() => {
+                    PreviousTail::from_head(tenant, signal, head, &entries)
+                }
+                _ => None,
+            };
 
             // The old watermark the reconcile pass anchors its window to,
             // present ONLY for an incremental fold from a trusted HEAD. Absent
@@ -2582,8 +3453,6 @@ impl Catalog {
             let mut parts_reused: u64 = 0;
             let mut column_stats_part_objects_built: u64 = 0;
             let mut column_stats_dictionaries_dropped: u64 = 0;
-            let mut key_index_leaves_written: u64 = 0;
-            let mut key_index_leaf_bytes_written: u64 = 0;
             let mut key_index_uncovered_entries: u64 = 0;
             for (span, encoding) in spans.iter().zip(span_encodings) {
                 // Single-part fold keeps exact v1 semantics: min_hour 0 (the
@@ -2865,92 +3734,33 @@ impl Catalog {
                 // sweep. The reads share the fold's bucket concurrency bound.
                 let mut key_index = Vec::new();
                 if let Some(declared) = &key_index_fields {
-                    let data_keys: Vec<Result<String, EntryKeyIndex>> = part_entries
-                        .iter()
-                        .map(|entry| {
-                            column_stats_build::segment_data_key(tenant, signal, entry)
-                                .map_err(|e| Err(format!("data key: {e}")))
-                        })
-                        .collect();
-                    let mut unread: Vec<(String, u64)> = Vec::new();
-                    let mut queued: HashSet<&str> = HashSet::new();
-                    for (entry, key) in part_entries.iter().zip(&data_keys) {
-                        if let Ok(key) = key
-                            && !key_index_reads.contains_key(key)
-                            && queued.insert(key.as_str())
-                        {
-                            unread.push((key.clone(), entry.object_size));
+                    let built = match key_index_built.get(part_hash.as_bytes()) {
+                        Some(built) => built.clone(),
+                        None => {
+                            let built = build_part_key_index(
+                                self.store(),
+                                tenant,
+                                signal,
+                                *part_hash.as_bytes(),
+                                part_watermark,
+                                part_entries,
+                                declared,
+                                previous_tail.as_ref(),
+                                &KeyIndexBuildLimits {
+                                    leaf: key_index_leaf_limits(),
+                                    max_pairs: self.config().key_index_build_max_pairs,
+                                    concurrency: self.config().fold_bucket_concurrency,
+                                },
+                                &mut counters,
+                            )
+                            .await
+                            .map_err(CatalogError::Store)?;
+                            key_index_built.insert(*part_hash.as_bytes(), built.clone());
+                            built
                         }
-                    }
-                    let store = self.store();
-                    let unread_ref = &unread;
-                    // Indexed rather than `iter()`, so the stream's item is not a
-                    // borrow: a borrowed item makes the fold future fail the
-                    // `Send` bound the server's spawned fold loop needs.
-                    let reads: Vec<EntryKeyIndexRead> = stream::iter(0..unread.len())
-                        .map(move |i| {
-                            let (key, object_size) = &unread_ref[i];
-                            read_entry_key_index(store, tenant, signal, key, *object_size)
-                        })
-                        .buffered(self.config().fold_bucket_concurrency.max(1))
-                        .collect()
-                        .await;
-                    for ((key, _), read) in unread.into_iter().zip(reads) {
-                        counters.get_requests += read.gets;
-                        counters.key_index_ranged_gets += read.gets;
-                        counters.key_index_bytes_read += read.bytes;
-                        if read.get_failed
-                            && let Err(reason) = &read.fields
-                        {
-                            tracing::warn!(
-                                tenant = %tenant.to_hex(),
-                                object_key = %key,
-                                reason = %reason,
-                                "KEY_IDX read GET failed; the entry is uncovered by this fold's key-index leaves"
-                            );
-                        }
-                        key_index_reads.insert(key, read.fields);
-                    }
-                    let not_read: EntryKeyIndex = Err("KEY_IDX not read".to_string());
-                    let entry_fields: Vec<&EntryKeyIndex> = data_keys
-                        .iter()
-                        .map(|key| match key {
-                            Ok(key) => key_index_reads.get(key).unwrap_or(&not_read),
-                            Err(read) => read,
-                        })
-                        .collect();
-                    for (ordinal, read) in entry_fields.iter().enumerate() {
-                        if let Err(reason) = read {
-                            tracing::debug!(
-                                tenant = %tenant.to_hex(),
-                                part_key = %part_key,
-                                entry_ordinal = ordinal,
-                                reason = %reason,
-                                "part entry is uncovered by the key index"
-                            );
-                        }
-                    }
-                    let built = build_part_key_index_leaves(
-                        tenant,
-                        signal,
-                        *part_hash.as_bytes(),
-                        declared,
-                        true,
-                        &entry_fields,
-                        &KeyIndexLeafLimits::default(),
-                    );
+                    };
                     key_index_uncovered_entries += built.uncovered_entries;
-                    for leaf in built.leaves {
-                        let put_result =
-                            put_key_index_leaf(self.store(), tenant, signal, part_watermark, leaf)
-                                .await;
-                        // Request-issued, like every PUT counter here (#1598).
-                        counters.put_requests += 1;
-                        let leaf_ref = put_result.map_err(CatalogError::Store)?;
-                        key_index_leaves_written += 1;
-                        key_index_leaf_bytes_written += leaf_ref.size;
-                        key_index.push(leaf_ref);
-                    }
+                    key_index = built.refs;
                 }
 
                 let put_result = self
@@ -3169,6 +3979,7 @@ impl Catalog {
                     // abandoned to a CAS loss and retried from zero above is
                     // counted exactly once, by whichever attempt won.
                     declared_stats::observe_fold_stamp_coverage(coverage);
+                    observe_fold_key_index(&counters);
                     return Ok(FoldReport {
                         watermark_hour: Some(watermark_hour),
                         previous_watermark_hour: head_state.watermark_hour(),
@@ -3195,9 +4006,13 @@ impl Catalog {
                         seal_through_hour: applied_seal_through,
                         key_index_ranged_gets: counters.key_index_ranged_gets,
                         key_index_bytes_read: counters.key_index_bytes_read,
-                        key_index_leaves_written,
-                        key_index_leaf_bytes_written,
+                        key_index_leaves_written: counters.key_index_leaves_written,
+                        key_index_leaf_bytes_written: counters.key_index_leaf_bytes_written,
                         key_index_uncovered_entries,
+                        key_index_sections_read: counters.key_index_sections_read,
+                        key_index_entries_carried: counters.key_index_entries_carried,
+                        key_index_build_passes: counters.key_index_build_passes,
+                        key_index_leaf_gets: counters.key_index_leaf_gets,
                     });
                 }
                 // Another folder's HEAD CAS won first. Re-GET HEAD next
@@ -4300,9 +5115,13 @@ fn no_op_report(
         // after building leaves; a no-op attempt itself writes none.
         key_index_ranged_gets: counters.key_index_ranged_gets,
         key_index_bytes_read: counters.key_index_bytes_read,
-        key_index_leaves_written: 0,
-        key_index_leaf_bytes_written: 0,
+        key_index_leaves_written: counters.key_index_leaves_written,
+        key_index_leaf_bytes_written: counters.key_index_leaf_bytes_written,
         key_index_uncovered_entries: 0,
+        key_index_sections_read: counters.key_index_sections_read,
+        key_index_entries_carried: counters.key_index_entries_carried,
+        key_index_build_passes: counters.key_index_build_passes,
+        key_index_leaf_gets: counters.key_index_leaf_gets,
     }
 }
 

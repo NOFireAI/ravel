@@ -398,6 +398,10 @@ pub const DEFAULT_SNAPSHOT_PART_MAX_ENTRIES: usize = 250_000;
 /// mirroring the resolve path's in-flight bound). 8 matches the resolve
 /// path's fan-out order without saturating a small backend.
 pub const DEFAULT_FOLD_BUCKET_CONCURRENCY: usize = 8;
+/// Default `key_index_build_max_pairs`: 8,000,000 (key8, block set) pairs,
+/// about 550 MB at the 68 B a pair ADR-2707's leaf build switch amendment
+/// measured (ADR-3692 decision 5).
+pub const DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS: u64 = 8_000_000;
 /// Default `fold_reconcile_window_hours`: how far back of the previous fold's
 /// watermark the post-fold reconcile pass re-lists commit buckets to catch a
 /// compaction record or retention tombstone that landed in an hour already
@@ -668,6 +672,19 @@ pub struct CatalogConfig {
     /// part it re-encodes carries no `key_index` refs; a part carried forward
     /// by reference keeps the refs it has. Default `false`.
     pub build_key_index_leaves: bool,
+    /// Most (key8, block set) pairs read from KEY_IDX sections the leaf build
+    /// holds at once for one part (ADR-3692 decision 5). The first pass over
+    /// a part counts pairs as it reads, spills nothing, keeps the lowest
+    /// key8 range that fits and schedules the rest: each later pass re-reads
+    /// the sections and keeps the next range, so a part of `P` pairs over
+    /// distinct key8 values takes `ceil(P / budget)` passes. One key8's pairs
+    /// are never split across passes, so a single key8 holding more pairs
+    /// than the budget is held whole. The leaves are identical to a one-pass
+    /// build. The budget does not bound the pairs carried from the previous
+    /// tail's leaves, which are held for the whole build at about 40 B plus
+    /// 4 B per block for each carried (entry, key8). Default
+    /// [`DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`]; 0 is read as 1.
+    pub key_index_build_max_pairs: u64,
     /// How far back of the previous fold's watermark the post-fold reconcile
     /// pass re-lists commit buckets, in hours (ADR-0063 section 4). Each fold
     /// re-lists the window `[watermark_hour_old - fold_reconcile_window_hours,
@@ -815,6 +832,7 @@ impl Default for CatalogConfig {
             snapshot_part_max_entries: DEFAULT_SNAPSHOT_PART_MAX_ENTRIES,
             fold_bucket_concurrency: DEFAULT_FOLD_BUCKET_CONCURRENCY,
             build_key_index_leaves: false,
+            key_index_build_max_pairs: DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
             fold_reconcile_window_hours: DEFAULT_FOLD_RECONCILE_WINDOW_HOURS,
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
             frontier_reconcile_max_hours: DEFAULT_FRONTIER_RECONCILE_MAX_HOURS,
