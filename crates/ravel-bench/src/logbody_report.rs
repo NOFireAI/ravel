@@ -713,13 +713,31 @@ pub fn run(cfg: &Config) -> Result<Report, ReportError> {
     if cfg.decode_runs == 0 {
         return Err(fail("decode_runs must be nonzero"));
     }
-    if let Some(rei) = &cfg.rei
-        && rei.spec.block_records != cfg.block_records
-    {
-        return Err(fail(format!(
-            "rei corpus {} is pre-registered at {} records per block, the run uses {}",
-            rei.spec.name, rei.spec.block_records, cfg.block_records
-        )));
+    if let Some(rei) = &cfg.rei {
+        let spec = &rei.spec;
+        if spec.block_records != cfg.block_records {
+            return Err(fail(format!(
+                "rei corpus {} is pre-registered at {} records per block, the run uses {}",
+                spec.name, spec.block_records, cfg.block_records
+            )));
+        }
+        let p = &rei.params;
+        if p.df_threshold.to_bits() != spec.df_threshold.to_bits()
+            || p.budget_share.to_bits() != spec.budget_share.to_bits()
+            || p.max_gram != spec.max_gram
+        {
+            return Err(fail(format!(
+                "rei corpus {} is pre-registered at df_threshold {} budget_share {} max_gram {}, \
+                 the run uses {} {} {}",
+                spec.name,
+                spec.df_threshold,
+                spec.budget_share,
+                spec.max_gram,
+                p.df_threshold,
+                p.budget_share,
+                p.max_gram
+            )));
+        }
     }
     let needles = read_needles(&cfg.needles)?;
     let (sha256, byte_count) = file_digest(&cfg.corpus)?;
@@ -1769,6 +1787,32 @@ mod tests {
                 .contains("pre-registered at 8192 records per block, the run uses 64"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn rei_run_with_another_selection_parameter_is_refused() {
+        // Each of the three selection parameters is pinned on its own: a run
+        // that changes one and keeps the other two is refused before the
+        // corpus is read, naming both the pinned and the used values.
+        let mut cfg = rei_cfg(BLOCK, BLOCK);
+        cfg.rei.as_mut().unwrap().params.df_threshold = 0.5;
+        let err = run(&cfg).expect_err("df_threshold off the pre-registration");
+        assert!(
+            err.to_string().contains(
+                "pre-registered at df_threshold 0.1 budget_share 0.05 max_gram 6, the run uses 0.5 0.05 6"
+            ),
+            "{err}"
+        );
+
+        let mut cfg = rei_cfg(BLOCK, BLOCK);
+        cfg.rei.as_mut().unwrap().params.budget_share = 0.5;
+        let err = run(&cfg).expect_err("budget_share off the pre-registration");
+        assert!(err.to_string().contains("the run uses 0.1 0.5 6"), "{err}");
+
+        let mut cfg = rei_cfg(BLOCK, BLOCK);
+        cfg.rei.as_mut().unwrap().params.max_gram = 4;
+        let err = run(&cfg).expect_err("max_gram off the pre-registration");
+        assert!(err.to_string().contains("the run uses 0.1 0.05 4"), "{err}");
     }
 
     #[test]

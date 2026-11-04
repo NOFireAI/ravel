@@ -6,10 +6,13 @@
 # `ravel_bench::logbody::spec`.
 #
 # Per corpus: the corpus file inside its LogHub archive (Zenodo record
-# 8196385), the records per block the run must use, five template needles
-# (the decision's needles) and one id needle (the negative control), and a
-# band [low, high] for every figure the arm prints. A run exits non-zero on a
-# figure missing, printed twice, or outside its band.
+# 8196385), the records per block the run must use, the three selection
+# parameters the run must use (df_threshold, budget_share, max_gram: a run
+# with any other value is refused before the corpus is read, and the report
+# prints the values it ran with), five template needles (the decision's
+# needles) and one id needle (the negative control), and a band [low, high]
+# for every figure the arm prints. A run exits non-zero on a figure missing,
+# printed twice, or outside its band.
 #
 # Pattern syntax: literal runs separated by `.*` (any bytes within one line).
 #
@@ -49,6 +52,9 @@ name = "hdfs"
 file = "HDFS.log"
 source = "https://zenodo.org/records/8196385/files/HDFS_v1.zip"
 block_records = 8192
+df_threshold = 0.10
+budget_share = 0.05
+max_gram = 6
 
 [corpus.bands]
 lines = [11175629, 11175629]
@@ -142,6 +148,9 @@ name = "bgl"
 file = "BGL.log"
 source = "https://zenodo.org/records/8196385/files/BGL.zip"
 block_records = 8192
+df_threshold = 0.10
+budget_share = 0.05
+max_gram = 6
 
 [corpus.bands]
 lines = [4747963, 4747963]
@@ -235,6 +244,9 @@ name = "ssh"
 file = "SSH.log"
 source = "https://zenodo.org/records/8196385/files/SSH.tar.gz"
 block_records = 8192
+df_threshold = 0.10
+budget_share = 0.05
+max_gram = 6
 
 [corpus.bands]
 lines = [655147, 655147]
@@ -330,6 +342,9 @@ name = "apache"
 file = "Apache.log"
 source = "https://zenodo.org/records/8196385/files/Apache.tar.gz"
 block_records = 1024
+df_threshold = 0.10
+budget_share = 0.05
+max_gram = 6
 
 [corpus.bands]
 lines = [56482, 56482]

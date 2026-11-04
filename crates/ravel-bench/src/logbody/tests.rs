@@ -42,6 +42,9 @@ name = "syn"
 file = "synthetic"
 source = "logbody::tests"
 block_records = 40
+df_threshold = 0.10
+budget_share = 0.05
+max_gram = 6
 
 [corpus.bands]
 lines = [800, 800]
@@ -236,9 +239,13 @@ fn rei_report_figures_present_once_and_banded() {
         ["syn/stray: no band".to_string()]
     );
 
-    // One printed line per figure, then the decision.
+    // The parameters, one printed line per figure, then the decision.
     let lines = r.lines();
-    assert_eq!(lines.len(), r.figures.len() + 1);
+    assert_eq!(lines.len(), r.figures.len() + 2);
+    assert_eq!(
+        lines[0],
+        "rei params df_threshold=0.1 budget_share=0.05 max_gram=6"
+    );
     assert!(lines.iter().all(|l| !l.ends_with("MISS")));
     assert!(lines.last().unwrap().starts_with("rei decision syn: "));
 }
@@ -590,6 +597,11 @@ fn saved_decision_reads_a_written_report() {
 #[test]
 fn spec_validation_refuses_a_bad_pre_registration() {
     assert!(spec::parse(&SPEC.replace("schema = 1", "schema = 2")).is_err());
+    // The selection parameters are required and range-checked.
+    assert!(spec::parse(&SPEC.replace("df_threshold = 0.10\n", "")).is_err());
+    assert!(spec::parse(&SPEC.replace("df_threshold = 0.10", "df_threshold = 1.5")).is_err());
+    assert!(spec::parse(&SPEC.replace("budget_share = 0.05", "budget_share = 0")).is_err());
+    assert!(spec::parse(&SPEC.replace("max_gram = 6", "max_gram = 8")).is_err());
     // Four template needles.
     assert!(
         spec::parse(&SPEC.replace(

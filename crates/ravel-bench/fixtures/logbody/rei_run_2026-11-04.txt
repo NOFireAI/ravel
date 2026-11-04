@@ -8,7 +8,11 @@
 #   logbody_report --rei-needles fixtures/logbody/rei_needles.toml \
 #     --rei-decide hdfs.json bgl.json ssh.json apache.json
 # Every corpus run exited 1 on its band misses (the MISS lines); the
-# overall run exited 1 on NO-GO.
+# overall run exited 1 on NO-GO. Selection parameters: the defaults,
+# df_threshold 0.10, budget_share 0.05, max_gram 6 (no --rei-df-threshold,
+# --rei-budget-share or --rei-max-gram was passed), the values
+# rei_needles.toml has pinned per corpus since the review of this run; the
+# "rei params" line the report now prints first postdates this record.
 
 # hdfs
 rei figure hdfs/lines = 11175629 band [11175629, 11175629] ok
