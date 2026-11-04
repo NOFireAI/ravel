@@ -58,6 +58,16 @@ use crate::report_schema::{
 /// The query parameter Ravel's HTTP API reads commit tokens from.
 pub const MIN_COMMIT_TOKEN_PARAM: &str = "min_commit_token";
 
+/// The provenance config key naming the regime the run's timed passes
+/// represent.
+pub const REGIME_CONFIG_KEY: &str = "regime";
+
+/// The one regime a `metricsbench_query` run reports. ADR-0927's 2026-11-04
+/// amendment, decision 1: "The first reference run reports one regime,
+/// `steady-state`, recorded in the provenance `config`. It is neither cold
+/// nor warm in band 3's sense, and is not presented as either."
+pub const REGIME_STEADY_STATE: &str = "steady-state";
+
 /// The ingest `system` value that names `engine`.
 pub fn system_name(engine: Engine) -> &'static str {
     match engine {
