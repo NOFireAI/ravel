@@ -1486,6 +1486,34 @@ mod tests {
         assert_eq!(stub.executed.borrow().len(), 2);
     }
 
+    /// A cursor presented under the same filters and `start_ns` but another
+    /// `end_ns` is `cursor_invalid`, before the backend.
+    ///
+    /// FLIP: leaving `end_ns` out of the argument hash resumes page one's
+    /// position under a window that ends elsewhere.
+    #[test]
+    fn a_cursor_for_another_end_ns_is_refused() {
+        let key = key();
+        let stub = Stub::default();
+        stub.sql
+            .borrow_mut()
+            .push_back(plain(&[("a", 1, 1), ("b", 2, 2), ("c", 3, 3)]));
+        let filters = json!({"has_word": "boom"});
+        let one = block_on(run(args(filters.clone()), &context(&key), &stub));
+        let cursor = one.presentation.cursor.clone().expect("page one's cursor");
+
+        let mut other_end = args(filters);
+        other_end["cursor"] = json!(cursor);
+        other_end["time_range"]["end_ns"] = json!((END_NS - 1).to_string());
+        let envelope = block_on(run(other_end, &later(&key), &stub));
+
+        assert_eq!(failure_class(&envelope), FailureClass::CursorInvalid);
+        let message = &envelope.failure.as_ref().expect("failure").message;
+        assert_eq!(message, "cursor is invalid");
+        assert!(envelope.data.rows.is_empty());
+        assert_eq!(stub.executed.borrow().len(), 1);
+    }
+
     /// A cursor whose tuple does not have the order terms' types is
     /// `cursor_invalid` before the backend. Page one mints it from `Int`
     /// values where `ts` and `observed_ts` take `TimestampNanos`.
