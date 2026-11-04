@@ -1453,7 +1453,7 @@ fn ravel_cost_entries<'a>(diagnostics: &'a Json, entry: &str) -> Vec<&'a Json> {
 async fn ravel_cost_records_every_repetitions_accounting_and_phases() {
     let mut s = stubs().await;
     let accounting = json!({"s3GetRequests": 7, "s3GetBytes": 4096, "s3ListRequests": 1});
-    let phases = json!([{"phase": "scan", "s3GetRequests": 7, "s3GetBytes": 4096}]);
+    let phases = json!([{"phase": "scan", "s3GetRequests": 7, "s3GetWireBytes": 4096}]);
     let stats = json!({"accounting": accounting, "phases": phases});
     let (ravel, r) = spawn_stub(
         &[(GAUGE, Answer::WithStats(stats.clone()))],
@@ -1553,6 +1553,66 @@ async fn ravel_cost_records_null_on_an_answer_with_no_stats() {
     }
 }
 
+/// A Ravel repetition whose entry is unsupported by declaration (the Ravel
+/// ingest row lists the native-histogram class) still gets a `ravel_cost`
+/// record for every timed pass and repetition, with status
+/// `unsupported_construct` and `accounting` and `phases` null, since the
+/// stub's answer carries no `data.stats`.
+///
+/// TO SEE THIS FAIL: drop the `ravel_cost` push from the unsupported branch
+/// of the repetition loop -- the `entries.len()` assertion drops from
+/// `PASSES * REPS` to zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_cost_records_an_unsupported_entry_for_every_repetition() {
+    let s = stubs().await;
+    let mut ingest = ingest_report(&s.urls);
+    let ravel_row = ingest
+        .systems
+        .iter_mut()
+        .find(|r| r.system == "ravel")
+        .expect("ravel row");
+    ravel_row.unsupported_classes = UNSUPPORTED_CLASSES
+        .iter()
+        .map(|u| UnsupportedClassRecord {
+            class: u.class,
+            source: u.source.to_string(),
+        })
+        .collect();
+    let run = run_bin_corpus(ingest, &s.urls, 0, &[], &corpus(), true).await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    assert_eq!(
+        row(&report, Engine::Ravel, "mb_histogram_native_p95").status,
+        ResultStatus::UnsupportedConstruct
+    );
+    assert!(s.ravel.count("/api/v1/query", NATIVE_P95) > 0);
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    let entries = ravel_cost_entries(&d, "mb_histogram_native_p95");
+    assert_eq!(entries.len(), (PASSES * REPS) as usize, "{entries:?}");
+    let mut seen: Vec<(u64, u64)> = entries
+        .iter()
+        .map(|c| {
+            (
+                c["pass"].as_u64().expect("pass"),
+                c["rep"].as_u64().expect("rep"),
+            )
+        })
+        .collect();
+    seen.sort_unstable();
+    let expected: Vec<(u64, u64)> = (1..=u64::from(PASSES))
+        .flat_map(|pass| (1..=u64::from(REPS)).map(move |rep| (pass, rep)))
+        .collect();
+    assert_eq!(seen, expected);
+    for c in &entries {
+        assert_eq!(c["status"], "unsupported_construct", "{c}");
+        assert_eq!(c["accounting"], Json::Null, "{c}");
+        assert_eq!(c["phases"], Json::Null, "{c}");
+    }
+}
+
 /// The 0-based request number a [`Answer::Numbered`] answer stamped on a
 /// `ravel_cost` record.
 fn request_number(c: &Json) -> u64 {
@@ -1615,12 +1675,12 @@ async fn ravel_cost_skips_warmup_passes_and_counts_from_one() {
 }
 
 /// Each `ravel_cost` record's `latency_ms` is that repetition's own elapsed
-/// time: the stub delays request `n` (from 1) by `n * 50` ms, so every record
+/// time: the stub delays request `n` (from 1) by `n * 20` ms, so every record
 /// is at least its own request's delay, and the median of a pass's records
 /// equals the pass median `report.json` carries for that pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ravel_cost_latency_is_the_repetitions_own() {
-    const STEP_MS: u64 = 50;
+    const STEP_MS: u64 = 20;
     let mut s = stubs().await;
     let (ravel, r) = spawn_stub(
         &[(GAUGE, Answer::Numbered { step_ms: STEP_MS })],
@@ -1665,7 +1725,7 @@ async fn ravel_cost_latency_is_the_repetitions_own() {
         };
         // serde_json's default float parse can land one ULP off the
         // written value, so this compares to a relative 1e-12, far below the
-        // 50 ms gap between two repetitions.
+        // 20 ms gap between two repetitions.
         let reported = ravel_row.pass_medians_ms[(pass - 1) as usize];
         assert!(
             (median - reported).abs() <= reported.abs() * 1e-12,
