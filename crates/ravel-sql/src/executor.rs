@@ -127,7 +127,9 @@ use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
-use ravel_catalog::{Catalog, ColumnStatsRequest, SegmentOrigins, Snapshot, SnapshotParts};
+use ravel_catalog::{
+    Catalog, CatalogError, ColumnStatsRequest, SegmentOrigins, Snapshot, SnapshotParts,
+};
 use ravel_logseg::decoded_cache::{DecodedCacheSnapshot, PressureSnapshot};
 use ravel_memory::MemoryBudget;
 use ravel_parquet::ReadLimits;
@@ -4059,9 +4061,12 @@ impl SqlExecutor {
             let catalog_requests = self
                 .catalog
                 .estimated_catalog_requests(req.window, clocks.resolve_at_ns);
-            // The spans lane also takes its parts, for the tier-2 router.
-            let (snapshot, origins, parts) = if lane == TargetSignal::Spans {
-                let (snapshot, origins, parts) = self
+            // The spans lane also takes its parts, for the tier-2 router. A
+            // refused charge for the parts' handles costs the lane its router,
+            // not the statement: the lane resolves again without parts and
+            // every segment takes the tier-1 KEY_IDX probe.
+            let with_parts = if lane == TargetSignal::Spans {
+                match self
                     .catalog
                     .resolve_pruned_with_parts(
                         &tenant_hash,
@@ -4072,7 +4077,16 @@ impl SqlExecutor {
                         lane_name_filter,
                         phase_accounting.lane(lane).resolve(),
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(resolved) => Some(resolved),
+                    Err(CatalogError::MemoryExhausted(_)) => None,
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                None
+            };
+            let (snapshot, origins, parts) = if let Some((snapshot, origins, parts)) = with_parts {
                 (snapshot, origins, Some(parts))
             } else {
                 let (snapshot, origins) = self

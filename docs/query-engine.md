@@ -3841,8 +3841,10 @@ order (`ravel_sql::key_index_json`):
   the tier-1 probe.
 - `partsBeyondCeiling`: parts past `L_max` or the probed-parts ceiling,
   whose segments go to the tier-1 probe.
-- `leavesRejected`: parts whose leaf failed validation (`Corrupted`, a stale
-  part binding), read as uncovered.
+- `leavesRejected`: parts whose leaf did not answer, read as uncovered: a
+  leaf that failed validation (`Corrupted`, a stale part binding), a leaf
+  GET that failed, or leaf refs whose slices do not tile the key space
+  (rejected before any GET).
 - `reservationsRefused`: parts whose frame decode reservation the statement's
   memory budget refused, read as uncovered.
 - `leafGetRequests`: leaf GETs issued to the store; a leaf range served from
@@ -5016,9 +5018,12 @@ by its own range unless an earlier read already holds it:
 5. The kept block runs, on the `scan` phase.
 
 So per lookup: a covering part costs two leaf GETs (prefix and bucket) and
-its pruned segments none; an uncovered object without the trace costs at
-most three GETs, the suffix and the two KEY_IDX reads (fewer when the suffix
-holds KEY_IDX or the trace's bucket is empty), about 11 KB; a holder costs its suffix, SKIP_IDX and its
+its pruned segments none; an uncovered object without the trace whose
+footer fits the 8 KiB suffix costs three GETs, the suffix and the two
+KEY_IDX reads, the first at most 8 KiB and all three under 16 KiB (ADR-3692's
+acceptance band: over three is a miss); a footer longer than the suffix adds
+the one chase GET, and the count drops when the suffix already holds KEY_IDX
+or the trace's bucket is empty; a holder costs its suffix, SKIP_IDX and its
 runs, plus the two KEY_IDX reads when it is uncovered; a part past the
 ceilings sends its segments to tier 1. The process counters are
 `ravel_query_key_index_parts_total{signal,outcome}`, the parts the router
@@ -5026,6 +5031,20 @@ settled with `outcome` one of `covered`, `uncovered`, `beyond_ceiling`,
 `rejected`, `reservation_refused` and `skipped_by_budget`, and
 `ravel_query_key_index_leaf_gets_total{signal}`, the leaf GETs it issued.
 The Flight SQL pinned path and `EXPLAIN` do not route: they probe at tier 1.
+
+The parts are charged to the statement's catalog decode budget with the
+snapshot (`Catalog::resolve_pruned_with_parts` reserves their handles' heap
+bytes). A refused charge costs the spans lane its router, not the statement:
+the lane resolves the window again with `resolve_pruned_with_admission`,
+without parts, paying that resolve's requests a second time, and every
+segment takes the tier-1 KEY_IDX probe. The fallback is visible: a
+`trace_id =` lookup still renders `stats.keyIndex`, with every figure 0 and
+`keysProbed` 0, since the router never ran, and
+`ravel_query_key_index_parts_total` does not move
+(`a_trace_lookup_degrades_to_tier_one_on_a_refused_parts_charge`). A spans
+statement without a trace key resolves the same way and answers
+(`a_spans_statement_without_a_trace_key_survives_a_refused_parts_charge`).
+Any other resolve error still fails the statement.
 
 There is also a wire-size trade for a *high-cardinality* `str` column. ADR-0099
 decision 5's "leaves that case exactly as expensive as it is today" is a
