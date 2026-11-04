@@ -802,24 +802,32 @@ def darwin_rusage(pid):
 
 def proc_cpu_s(pid):
     """utime + stime of pid in seconds, from /proc/<pid>/stat (on macOS,
-    darwin_rusage)."""
+    darwin_rusage); None once the process is gone (a server that died mid-call
+    leaves no /proc entry for the "after" reading)."""
     if sys.platform == "darwin":
         return darwin_rusage(pid)[0]
-    with open(f"/proc/{pid}/stat") as f:
-        stat = f.read()
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+    except FileNotFoundError:
+        return None
     fields = stat[stat.rindex(")") + 2 :].split()
     ticks = os.sysconf("SC_CLK_TCK")
     return (int(fields[11]) + int(fields[12])) / ticks
 
 
 def proc_hwm_bytes(pid):
-    """VmHWM of pid (on macOS, the lifetime peak physical footprint)."""
+    """VmHWM of pid (on macOS, the lifetime peak physical footprint); None
+    once the process is gone."""
     if sys.platform == "darwin":
         return darwin_rusage(pid)[1]
-    with open(f"/proc/{pid}/status") as f:
-        for line in f:
-            if line.startswith("VmHWM:"):
-                return int(line.split()[1]) * 1024
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) * 1024
+    except FileNotFoundError:
+        return None
     return None
 
 
@@ -910,7 +918,7 @@ def cmd_call(args):
         "http_status": code,
         "started_unix_s": round(started, 3),
         "wall_s": round(wall, 6),
-        "server_cpu_s": round(cpu1 - cpu0, 6),
+        "server_cpu_s": round(cpu1 - cpu0, 6) if cpu0 is not None and cpu1 is not None else None,
         "server_hwm_bytes": proc_hwm_bytes(args.pid),
     }
     if plan.get("oracle"):
@@ -943,14 +951,21 @@ def cmd_call(args):
     else:
         line["outcome"] = "error"
         line["error"] = (raw or b"")[:500].decode("utf-8", "replace")
+    if code is None:
+        # No calls.jsonl line here: the caller (run.sh statements()) checks
+        # whether the server process is still alive, and either records this
+        # try itself (a dead server, richer diagnostic: signal, restart, kept
+        # log) or treats it as an ordinary unreachable-server failure. Either
+        # way, writing a line here would duplicate whichever one it writes.
+        print(f"{plan['statement']} ({plan['state']}, {plan['temp']} try {plan['try']}): "
+              f"connection failed: {line['error'][:200]}", file=sys.stderr)
+        sys.exit(75)
     append_line(args.calls, line)
     if line["outcome"] != "ok":
         # The error is on record for evaluate.py; only a server that did not
         # answer at all stops the run.
         print(f"{plan['statement']} ({plan['state']}, {plan['temp']} try {plan['try']}): "
               f"HTTP {code}: {line['error'][:200]}", file=sys.stderr)
-        if code is None:
-            sys.exit(1)
 
 
 def cmd_unsupported(args):
@@ -1064,6 +1079,20 @@ def cmd_get(args):
         die(f"{args.toml}: {args.key} is a table", 64)
     else:
         print(v)
+
+
+def cmd_server_extra_flags(args):
+    """run.toml [server] extra_flags, space-joined for bash, each element
+    already a single argv token (no shell evaluation, no word splitting
+    within an element): refuses (exit 64, naming the element) any entry that
+    contains whitespace or does not start with "--"."""
+    v = load_toml(args.toml).get("server", {}).get("extra_flags", [])
+    if not isinstance(v, list):
+        die("run.toml server.extra_flags is not an array", 64)
+    for elem in v:
+        if not isinstance(elem, str) or any(c.isspace() for c in elem) or not elem.startswith("--"):
+            die(f"run.toml server.extra_flags: {elem!r} is not a single --flag token", 64)
+    print(" ".join(v))
 
 
 def strip_ansi(text):
@@ -1184,6 +1213,10 @@ def main():
     g.add_argument("key")
     g.add_argument("--default")
     g.set_defaults(fn=cmd_get)
+
+    sef = sub.add_parser("server-extra-flags")
+    sef.add_argument("toml")
+    sef.set_defaults(fn=cmd_server_extra_flags)
 
     w = sub.add_parser("warmup")
     w.add_argument("--log", required=True)

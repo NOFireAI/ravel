@@ -237,6 +237,31 @@ keep_log() {
 
 # failed_at STEP CODE [LOG]: name the command that exited CODE, for
 # state_failed or fail_logged; returns 1.
+# keep_state_log STATE: copy STATE's last server log to
+# out/logs/server-<state>-last.log, so a state that failed or died without
+# naming a specific failed command (or simply ran to completion) still has
+# its server's log travel with out/. Past 2 MB the copy holds only the last
+# 2000 lines, with a first line noting the truncation and the original
+# size. A state that started no server (not-run before any restart) leaves
+# nothing to copy.
+keep_state_log() {
+  local state="$1" dest size
+  dest="out/logs/server-$state-last.log"
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'DRY-RUN: copy the last server log to %s, truncated to its last 2000 lines past 2 MB\n' "$dest"
+    return 0
+  fi
+  [ -n "$SERVER_LOG" ] && [ -f "$SERVER_LOG" ] || return 0
+  mkdir -p "$OUT/logs" 2>/dev/null || return 0
+  size="$(wc -c <"$SERVER_LOG" 2>/dev/null || echo 0)"
+  if [ "$size" -gt 2097152 ]; then
+    { printf '... truncated to the last 2000 lines (original %s bytes) ...\n' "$size"
+      tail -n 2000 "$SERVER_LOG"; } >"$OUT/logs/server-$state-last.log" 2>/dev/null
+  else
+    cp "$SERVER_LOG" "$OUT/logs/server-$state-last.log" 2>/dev/null
+  fi
+}
+
 failed_at() {
   FAIL_STEP="$1"
   FAIL_CODE="$2"
@@ -375,9 +400,11 @@ load_config() {
   TENANT="$(cfg server.tenant --default inv)"
   SHARDS="$(cfg server.shards --default 8)"
   SERVER_EXTRA=()
-  local budget
+  local budget extra_flags
   budget="$(cfg server.memory_budget_bytes --default "")"
   [ -z "$budget" ] || SERVER_EXTRA+=(--memory-budget-bytes "$budget")
+  extra_flags="$("$HOST_PY" "$LIB" server-extra-flags "$RUN_TOML_IN")" || fail "run.toml server.extra_flags"
+  [ -z "$extra_flags" ] || SERVER_EXTRA+=($extra_flags)
   RQ_STATS="${RQ_STATS:-1}"
   if [ "$LANE" = s3 ]; then
     SHA="$(cfg box.sha)" || fail "run.toml box.sha"
@@ -800,9 +827,45 @@ census() {
     fold_off="--mode query runs no scheduled fold or compaction; ravel-server refuses --disable-fold in query mode, so the flag is not passed"
 }
 
+# line_statement LINE: a planned call line's "statement" field.
+line_statement() {
+  local line="$1" re_statement='"statement": "([^"]+)"'
+  [[ "$line" =~ $re_statement ]] && printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# record_server_death LINE N: the Nth death on LINE's call. The dying
+# server's log is kept under out/logs/ (named in the appended line), and a
+# server_died call is appended to calls.jsonl for LINE's statement/state/
+# try/temp, with the exact reason text evaluate.py reports the figure
+# missing with.
+record_server_death() {
+  local line="$1" n="$2" statement state try temp sig=0 code=0 kept=none
+  local re_statement='"statement": "([^"]+)"' re_state='"state": "([^"]+)"'
+  local re_try='"try": ([0-9]+)' re_temp='"temp": "([^"]+)"'
+  [[ "$line" =~ $re_statement ]] && statement="${BASH_REMATCH[1]}"
+  [[ "$line" =~ $re_state ]] && state="${BASH_REMATCH[1]}"
+  [[ "$line" =~ $re_try ]] && try="${BASH_REMATCH[1]}"
+  [[ "$line" =~ $re_temp ]] && temp="${BASH_REMATCH[1]}"
+  wait "$SERVER_PID" 2>/dev/null || code=$?
+  SERVER_PID=""
+  [ "$code" -le 128 ] || sig=$((code - 128))
+  [ -z "$SERVER_LOG" ] || kept="$(keep_log "$SERVER_LOG")"
+  say "server died (death $n) during $statement/$state try $try, signal $sig; log $kept"
+  "$PY" "$LIB" stamp --file "$CALLS" --append statement="$statement" state="$state" try:="$try" \
+    temp="$temp" outcome=server_died signal:="$sig" exit:="$code" log="$kept" \
+    reason="server died during $statement/$state try $try, signal $sig" at="$(utc_now)" \
+    || fail "stamp calls.jsonl server_died"
+}
+
 # statements STATE [PLAN_FLAG...]: every planned call of STATE. A cold call
 # follows a server restart; an inflight call (--temp inflight) does not. Past
-# the run deadline every remaining call is recorded not-run, unsent.
+# the run deadline every remaining call is recorded not-run, unsent. A call
+# whose server died (inv.py call exit 75, and the process is actually gone)
+# is recorded server_died, the server is restarted, and the loop moves on to
+# the next planned call; the dead try itself is not retried. Three deaths
+# across one statement's own tries (an intervening success does not reset
+# the count; moving on to a different statement's calls does) fail the
+# state (state_failed; run_states goes on).
 statements() {
   local state="$1" plan="$WORK/plan-$1.jsonl" line flags=() deadline=$((RUN_START + RUN_MAX_MINUTES * 60))
   shift
@@ -818,15 +881,43 @@ statements() {
       "$RQ_STATS" "$RUN_MAX_MINUTES"
     return 0
   fi
+  local death_statement="" deaths=0 just_restarted=0 stmt code
   while IFS= read -r line; do
+    stmt="$(line_statement "$line")"
+    [ "$stmt" = "$death_statement" ] || { death_statement="$stmt"; deaths=0; }
     case "$line" in
       *'"unsupported_reason"'* | *'"not_run_reason"'*) ;;
-      *'"temp": "cold"'*) [ "$(date +%s)" -ge "$deadline" ] || restart_for "$line" ;;
+      *'"temp": "cold"'*)
+        if [ "$just_restarted" = 1 ]; then
+          just_restarted=0
+        else
+          [ "$(date +%s)" -ge "$deadline" ] || restart_for "$line"
+        fi
+        ;;
     esac
+    code=0
     "$PY" "$LIB" call --line "$line" --server "http://127.0.0.1:$HTTP_PORT" --auth-dir "$AUTH_DIR" \
       --pid "${SERVER_PID:-0}" --calls "$CALLS" --deadline-unix-s "$deadline" ${flags[@]+"${flags[@]}"} \
-      || fail "call against an unreachable server"
+      || code=$?
+    [ "$code" = 0 ] && continue
+    # 75 (inv.py call's own code): the connection failed, and inv.py wrote no
+    # calls.jsonl line for it. A server still alive and merely unreachable (a
+    # hung request, a refused connection with the process up) is the old,
+    # ordinary failure; only an actually dead server is recorded and moved
+    # past, not retried: the try is lost (missing from calls.jsonl's view of
+    # it, present in the server_died line evaluate.py reads instead), and the
+    # loop goes on to the next planned call rather than repeating this one.
+    [ "$code" = 75 ] && ! kill -0 "${SERVER_PID:-0}" 2>/dev/null || fail "call against an unreachable server"
+    deaths=$((deaths + 1))
+    record_server_death "$line" "$deaths"
+    if [ "$deaths" -ge 3 ]; then
+      failed_at "server died 3 times during $stmt" 75 ""
+      return 1
+    fi
+    restart_for "$line"
+    just_restarted=1
   done <"$plan"
+  return 0
 }
 
 transition() {
@@ -945,8 +1036,10 @@ state_compaction() {
     rm -f "$WORK/compact-failed.txt"
     compact_child </dev/null &
     local child=$!
-    statements compaction_in_flight --temp inflight
+    local stmt_code=0
+    statements compaction_in_flight --temp inflight || stmt_code=1
     wait "$child" || code=$?
+    [ "$stmt_code" = 0 ] || return 1
     [ ! -s "$WORK/compact-failed.txt" ] || read -r failed_sig code <"$WORK/compact-failed.txt"
   fi
   for sig in spans logs; do
@@ -959,7 +1052,7 @@ state_compaction() {
   fi
   transition compaction_done "maintain compact-tenant finished"
   census compaction_done
-  statements compaction_done
+  statements compaction_done || return 1
   return 0
 }
 
@@ -992,7 +1085,7 @@ state_erasure() {
     status_after:="$(run "$PY" "$LIB" kv-report --log "$WORK/erase-status-after.out" || echo null)"
   transition erasure_in_flight "erase submit on the victim's request_id; erase status reads pending"
   census erasure_in_flight
-  statements erasure_in_flight
+  statements erasure_in_flight || return 1
   return 0
 }
 
@@ -1030,7 +1123,7 @@ state_many_parts() {
   rebuild_leaves "many_parts_${n}_leaf_rebuild" || { TRIPLES="$saved"; return 1; }
   transition "many_parts_$n" "tenant $t: $n strided ingest hours from $start, parts of at most $MP_MAX_ENTRIES entries"
   census "many_parts_$n"
-  statements "many_parts_$n" --tenant "$t" --sub "many_parts_$n"
+  statements "many_parts_$n" --tenant "$t" --sub "many_parts_$n" || { TRIPLES="$saved"; return 1; }
   TRIPLES="$saved"
   return 0
 }
@@ -1039,7 +1132,7 @@ state_unfolded() {
   transition unfolded "base hours loaded, no fold"
   census unfolded
   needle_blocks
-  statements unfolded
+  statements unfolded || return 1
   return 0
 }
 
@@ -1048,7 +1141,7 @@ state_folded_no_leaves() {
   fold folded_no_leaves || return 1
   transition folded_no_leaves "catalog fold --writers-stopped, no leaves"
   census folded_no_leaves
-  statements folded_no_leaves
+  statements folded_no_leaves || return 1
   return 0
 }
 
@@ -1059,7 +1152,7 @@ state_folded_leaves() {
   rebuild_leaves leaf_rebuild || return 1
   transition folded_leaves "catalog fold --writers-stopped --key-index-leaves, then catalog fold --rebuild-key-index"
   census folded_leaves
-  statements folded_leaves
+  statements folded_leaves || return 1
   return 0
 }
 
@@ -1076,7 +1169,7 @@ state_mixed() {
   load_signal tail logs "$WORK/corpus-tail" "$TENANT" || return 1
   transition mixed "folded hours plus one unfolded tail hour"
   census mixed
-  statements mixed
+  statements mixed || return 1
   fits fold_advance fold "$(estimate_s mixed)" || return 0
   # A failed fold here is fold_advance's, the derived state (as the deadline
   # check above records it), not mixed's: mixed already measured, and a
@@ -1106,6 +1199,7 @@ run_state() {
     many_parts_*) state_many_parts "${state#many_parts_}" ;;
     *) fail "unknown state $state" ;;
   esac || code=$?
+  keep_state_log "$state"
   [ "$code" = 0 ] && return 0
   [ -n "$FAIL_STEP" ] || fail "state $state returned $code with no failed command named"
   state_failed
