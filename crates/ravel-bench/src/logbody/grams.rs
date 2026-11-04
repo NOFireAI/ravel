@@ -153,28 +153,26 @@ fn pack(gram: &[u8]) -> u64 {
         .fold(gram.len() as u64, |acc, &b| (acc << 8) | u64::from(b))
 }
 
-/// An open-addressing map from packed grams to candidate ids.
+/// An open-addressing map from packed grams to candidate ids, at most a
+/// quarter full.
 struct GramTable {
-    keys: Vec<u64>,
-    ids: Vec<u32>,
+    slots: Vec<(u64, u32)>,
     mask: usize,
 }
 
 impl GramTable {
     fn new(entries: &[(u64, u32)]) -> Self {
-        let cap = (entries.len() * 2).next_power_of_two().max(16);
+        let cap = (entries.len() * 4).next_power_of_two().max(16);
         let mut t = GramTable {
-            keys: vec![0; cap],
-            ids: vec![0; cap],
+            slots: vec![(0, 0); cap],
             mask: cap - 1,
         };
         for &(k, id) in entries {
             let mut slot = t.slot(k);
-            while t.keys[slot] != 0 {
+            while t.slots[slot].0 != 0 {
                 slot = (slot + 1) & t.mask;
             }
-            t.keys[slot] = k;
-            t.ids[slot] = id;
+            t.slots[slot] = (k, id);
         }
         t
     }
@@ -187,9 +185,9 @@ impl GramTable {
     fn get(&self, k: u64) -> Option<u32> {
         let mut slot = self.slot(k);
         loop {
-            match self.keys[slot] {
-                0 => return None,
-                x if x == k => return Some(self.ids[slot]),
+            match self.slots[slot] {
+                (0, _) => return None,
+                (x, id) if x == k => return Some(id),
                 _ => slot = (slot + 1) & self.mask,
             }
         }
@@ -213,14 +211,17 @@ pub fn candidates(workload: &[Pattern], max_gram: usize) -> Vec<Vec<u8>> {
 /// closed under prefixes of at least [`MIN_GRAM`] bytes (a prefix of a
 /// substring of a run is a substring of that run), so the scan extends a
 /// match one byte at a time and stops at the first length that is not a
-/// candidate.
+/// candidate. A 2^16-bit filter over hashed trigrams, small enough for L1,
+/// skips most positions before the table is probed.
 pub fn postings(blocks: &[BlockText], cands: &[Vec<u8>]) -> Vec<Vec<u32>> {
-    let mut first = vec![0u64; 1 << 18];
+    let filter_slot = |t: u32| (t.wrapping_mul(0x9e37_79b1) >> 16) as usize;
+    let mut first = vec![0u64; 1 << 10];
     let mut all = Vec::with_capacity(cands.len());
     for (id, g) in cands.iter().enumerate() {
         if g.len() == MIN_GRAM {
-            let t = (usize::from(g[0]) << 16) | (usize::from(g[1]) << 8) | usize::from(g[2]);
-            first[t >> 6] |= 1 << (t & 63);
+            let t = (u32::from(g[0]) << 16) | (u32::from(g[1]) << 8) | u32::from(g[2]);
+            let f = filter_slot(t);
+            first[f >> 6] |= 1 << (f & 63);
         }
         all.push((pack(g), id as u32));
     }
@@ -232,15 +233,18 @@ pub fn postings(blocks: &[BlockText], cands: &[Vec<u8>]) -> Vec<Vec<u32>> {
         let bi = bi as u32;
         let bytes = block.bytes();
         for i in 0..bytes.len().saturating_sub(MIN_GRAM - 1) {
-            let t = (usize::from(bytes[i]) << 16)
-                | (usize::from(bytes[i + 1]) << 8)
-                | usize::from(bytes[i + 2]);
-            if first[t >> 6] & (1 << (t & 63)) == 0 {
+            let t = (u32::from(bytes[i]) << 16)
+                | (u32::from(bytes[i + 1]) << 8)
+                | u32::from(bytes[i + 2]);
+            let f = filter_slot(t);
+            if first[f >> 6] & (1 << (f & 63)) == 0 {
                 continue;
             }
-            let mut key = pack(&bytes[i..i + MIN_GRAM]);
+            // `pack` of the n bytes from i, extended one byte at a time.
+            let mut val = u64::from(t);
             let mut n = MIN_GRAM;
             loop {
+                let key = ((n as u64) << (8 * n)) | val;
                 let Some(id) = table.get(key) else { break };
                 if last[id as usize] != bi {
                     last[id as usize] = bi;
@@ -249,8 +253,7 @@ pub fn postings(blocks: &[BlockText], cands: &[Vec<u8>]) -> Vec<Vec<u32>> {
                 if n == max_len || i + n >= bytes.len() {
                     break;
                 }
-                // Repack with the next byte and the new length.
-                key = pack(&bytes[i..=i + n]);
+                val = (val << 8) | u64::from(bytes[i + n]);
                 n += 1;
             }
         }
