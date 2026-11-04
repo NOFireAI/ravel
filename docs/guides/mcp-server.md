@@ -282,6 +282,16 @@ server can apply a predicate slightly differently than the one you typed.
 `query_id` for this call, and `audit_ref`, which points at the audit record
 of the call when the deployment writes one.
 
+Every query tool call gets its own `query_id`, a UUID. Each audit record the
+call writes carries it as `query.id`, beside `query.language = mcp:<tool>`
+and the engine's own language in `query.engine_language`, so the records of
+one call can be found by its id and told apart from the same query sent over
+HTTP. A call that runs two statements, such as `ravel_search_logs` with
+`predicates`, writes two records under the one id. `ravel_capabilities`
+reads no data and writes no audit record. `audit_ref` is empty in this
+build. See
+[Query ids and audit records](../reference/mcp.md#query-ids-and-audit-records).
+
 ### `visibility`
 
 The snapshot that this call read:
