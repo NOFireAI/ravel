@@ -19071,11 +19071,23 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         )
     }
 
-    /// A sample of the per-query cost family: a `ravel_query_*` line outside
-    /// the key-index router family, which is process-wide and carries no
+    /// The key-index router's two families, process-wide and carrying no
     /// tenant.
+    const KEY_INDEX_ROUTE_FAMILIES: [&str; 2] = [
+        "ravel_query_key_index_parts_total",
+        "ravel_query_key_index_leaf_gets_total",
+    ];
+
+    /// The metric name of a sample line: everything before its label set or
+    /// value.
+    fn sample_name(line: &str) -> &str {
+        line.split(['{', ' ']).next().unwrap_or(line)
+    }
+
+    /// A sample of the per-query cost family: a `ravel_query_*` line outside
+    /// the key-index router's two families.
     fn is_query_cost_line(line: &str) -> bool {
-        line.starts_with("ravel_query_") && !line.starts_with("ravel_query_key_index_")
+        line.starts_with("ravel_query_") && !KEY_INDEX_ROUTE_FAMILIES.contains(&sample_name(line))
     }
 
     /// Every distinct `tenant_hash` value across the per-query cost lines.
@@ -19157,6 +19169,20 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             ),
             "folded request counter must sum across tenants:\n{body}"
         );
+
+        // The two families `is_query_cost_line` skips are on the same page,
+        // so the skip names families that are there.
+        for family in KEY_INDEX_ROUTE_FAMILIES {
+            assert!(
+                body.lines()
+                    .any(|line| line == format!("# TYPE {family} counter")),
+                "{family} has no TYPE line:\n{body}"
+            );
+            assert!(
+                body.lines().any(|line| sample_name(line) == family),
+                "{family} renders no sample:\n{body}"
+            );
+        }
     }
 
     /// A configured tenant keeps its own `tenant_hash`; an unconfigured one
