@@ -268,6 +268,86 @@ fn corrupt_key_idx_prints_typed_error_not_panic() {
     );
 }
 
+/// Replaces a good object's KEY_IDX section with a freshly encoded one
+/// carrying one entry whose block ordinal is at (or past) the object's real
+/// block count, splicing the new section in and rewriting every later
+/// section's offset plus the footer and trailer, the same recipe
+/// `ravel_logseg::key_index::rewrite_key_index` uses for RLOG fixtures. RSPAN
+/// has no such helper of its own, so this builds it from the crate's public
+/// `open`/`footer`/`write_footer_and_trailer` API instead of reaching into
+/// `ravel-rspan` internals.
+fn object_with_bad_key_idx_ordinal(object: &[u8]) -> Vec<u8> {
+    use ravel_rspan::footer::{TRAILER_LEN, kind, write_footer_and_trailer};
+
+    let mut footer = ravel_rspan::open(object).expect("known-good object opens");
+    let desc = *footer
+        .section(kind::KEY_IDX)
+        .expect("object has a KEY_IDX section");
+    let bad_ordinal = footer.block_count as u32;
+    let encoded = ravel_rspan::encode_trace_key_idx([([1u8; 16], 0u32), ([9u8; 16], bad_ordinal)])
+        .expect("encode a good and a bad entry");
+
+    let start = desc.offset as usize;
+    let end = (desc.offset + desc.len) as usize;
+    let trailer_at = object.len() - TRAILER_LEN;
+    let footer_len = u32::from_le_bytes(
+        object[trailer_at..trailer_at + 4]
+            .try_into()
+            .expect("4 bytes"),
+    );
+    let footer_at = trailer_at - footer_len as usize;
+
+    let new_len = encoded.bytes.len() as u64;
+    let mut out = object[..start].to_vec();
+    out.extend_from_slice(&encoded.bytes);
+    out.extend_from_slice(&object[end..footer_at]);
+    for s in &mut footer.sections {
+        if s.kind == kind::KEY_IDX {
+            s.len = new_len;
+            s.uncomp_len = new_len;
+            s.crc32c = crc32c::crc32c(&encoded.bytes);
+            s.prefix_len = encoded.prefix_len;
+        } else if s.offset > desc.offset {
+            s.offset = s.offset - desc.len + new_len;
+        }
+    }
+    write_footer_and_trailer(&mut out, &footer);
+    out
+}
+
+/// A KEY_IDX entry naming a block at or past the object's real block count is
+/// a finding, printed on its own line, and a non-zero exit (the same
+/// discipline `corrupt_key_idx_prints_typed_error_not_panic` applies to a
+/// flipped byte), never a silent clean inspect.
+#[test]
+fn block_ordinal_past_the_count_prints_finding_and_fails() {
+    let good = build_object();
+    let footer = ravel_rspan::open(&good).expect("known-good object opens");
+    let block_count = footer.block_count;
+    let bad = object_with_bad_key_idx_ordinal(&good);
+
+    let path = temp_path("bad-key-idx-ordinal");
+    std::fs::write(&path, &bad).expect("writes object");
+    let output = run_inspect(&path);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !output.status.success(),
+        "an object naming a block past its own count must be refused"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let expected_line = format!(
+        "key_idx finding: field=trace_id bucket={} names block {block_count}, object has {block_count} blocks",
+        ravel_rspan::trace_key_idx_bucket(&[9u8; 16]).expect("bucket"),
+    );
+    assert!(
+        stdout.lines().any(|l| l == expected_line),
+        "expected {expected_line:?} in:\n{stdout}"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(!stderr.contains("panicked"), "inspector panicked: {stderr}");
+}
+
 /// A corrupt SKIP_IDX must surface a typed `Corrupted` error and a non-zero
 /// exit, never a panic. SKIP_IDX corruption is loud by design
 /// (docs/span-segment-format.md "Pruning soundness"): its bytes carry the block
