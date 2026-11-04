@@ -1,0 +1,417 @@
+# Pre-registration for the logbody_report REI arm (issue #3709, ADR-3692
+# Plan row T11). Written before any run of the arm over these corpora; the
+# needles were chosen from the LogHub template lists and each spelling was
+# checked to occur in its corpus, without counting the lines or blocks that
+# hold it. Read by `logbody_report --rei-needles` and checked by
+# `ravel_bench::logbody::spec`.
+#
+# Per corpus: the corpus file inside its LogHub archive (Zenodo record
+# 8196385), the records per block the run must use, five template needles
+# (the decision's needles) and one id needle (the negative control), and a
+# band [low, high] for every figure the arm prints. A run exits non-zero on a
+# figure missing, printed twice, or outside its band.
+#
+# Pattern syntax: literal runs separated by `.*` (any bytes within one line).
+#
+# Band basis (predicted, 2026-11-04, before the first run):
+# - lines and blocks are exact: wc -l of the file (plus one where the file
+#   has no final newline), and the block count the writer cuts at
+#   block_records per block in objects of 32 blocks.
+# - compressed_bytes: RLOG objects at zstd level 3, predicted 5x to 30x below
+#   the raw file size.
+# - zstd_cpu_s: zstd level 3 at 30 to 3000 MB/s over the bodies.
+# - trigram: 3 bytes per distinct trigram per block, predicted 5 % to 500 %
+#   of compressed bytes; its build sorts every trigram of every block,
+#   predicted 1x to 50x the zstd encode.
+# - selected: the byte cap is 5 % of compressed bytes, and a few hundred
+#   candidate grams with block postings are predicted under 1 %; its build is
+#   one pass over the bodies with a table lookup per candidate trigram hit,
+#   predicted 0.05x to 5x the zstd encode.
+# - needle survival: a gram is a substring of the needle, so it occurs in at
+#   least every block holding the needle, and the selected arm keeps only
+#   grams in at most 10 % of blocks. A needle held by more than 10 % of
+#   blocks therefore survives in every block on the selected arm. "rare"
+#   below predicts a needle held by few blocks: selected survival at most
+#   0.25. "common" predicts one held by most blocks: survival at least 0.5 on
+#   both arms. "open" is no prediction of block spread: survival in [0, 1].
+# - id needles: the selected arm's grams come from the template needles
+#   only, so an id survives in every block unless a template gram is a
+#   substring of it (none of these is); the trigram set keeps nearly every
+#   block for an id (#2977 comment 6221085174: 1,363 of 1,365 HDFS blocks for
+#   a block id), with wider bands where blocks are small or ids clustered.
+
+schema = 1
+
+# ---------------------------------------------------------------------------
+
+[[corpus]]
+name = "hdfs"
+file = "HDFS.log"
+source = "https://zenodo.org/records/8196385/files/HDFS_v1.zip"
+block_records = 8192
+
+[corpus.bands]
+lines = [11175629, 11175629]
+blocks = [1365, 1365]
+compressed_bytes = [50e6, 600e6]
+zstd_cpu_s = [0.5, 60]
+
+[corpus.bands.trigram]
+index_bytes = [5e6, 1.5e9]
+index_bytes_share = [0.05, 5.0]
+build_cpu_s = [1, 300]
+build_cpu_over_zstd = [1, 50]
+
+[corpus.bands.selected]
+index_bytes = [2, 3e6]
+index_bytes_share = [0, 0.01]
+build_cpu_s = [0.05, 120]
+build_cpu_over_zstd = [0.05, 5]
+grams_selected = [0, 2000]
+
+[corpus.bands.template.trigram]
+blocks_surviving = [1, 1365]
+survival_share = [0, 1]
+false_positives = [0, 1365]
+false_positive_share = [0, 1]
+
+[corpus.bands.template.selected]
+blocks_surviving = [1, 1365]
+survival_share = [0, 1]
+false_positives = [0, 1365]
+false_positive_share = [0, 1]
+
+[corpus.bands.id.trigram]
+blocks_surviving = [1229, 1365]
+survival_share = [0.9, 1]
+false_positives = [1000, 1365]
+false_positive_share = [0.9, 1]
+
+[corpus.bands.id.selected]
+blocks_surviving = [1229, 1365]
+survival_share = [0.9, 1]
+false_positives = [1000, 1365]
+false_positive_share = [0.9, 1]
+
+[[corpus.needle]]
+id = "pending-replication-timeout"
+kind = "template"
+pattern = "PendingReplicationMonitor timed out block"
+reason = "rare. Template E29, a NameNode replication timeout; few lines in the corpus. The camel-case name gives trigrams (gRe, nMo) no other template has, so the trigram set may prune it as well."
+bands = { literal_run_bytes = [41, 41], true_holders = [1, 1365], selected = { survival_share = [0, 0.25] }, trigram = { survival_share = [0, 0.5] } }
+
+[[corpus.needle]]
+id = "delete-error"
+kind = "template"
+pattern = "Unexpected error trying to delete block"
+reason = "rare. Template E20, a DataNode delete failure: rare and bursty. Its words are common English, so the trigram set is predicted to keep more blocks than the selected grams."
+bands = { literal_run_bytes = [39, 39], true_holders = [1, 1365], selected = { survival_share = [0, 0.25] } }
+
+[[corpus.needle]]
+id = "serving-exception"
+kind = "template"
+pattern = "Got exception while serving"
+reason = "open. Template E4, a DataNode read failure tied to client behaviour; no prior on how many blocks hold it."
+bands = { literal_run_bytes = [27, 27], true_holders = [1, 1365] }
+
+[[corpus.needle]]
+id = "not-in-any-file"
+kind = "template"
+pattern = "does not belong to any file"
+reason = "rare. Templates E24 and E28, addStoredBlock and blockMap updates for a block already deleted; the shared tail of both."
+bands = { literal_run_bytes = [27, 27], true_holders = [1, 1365], selected = { survival_share = [0, 0.25] } }
+
+[[corpus.needle]]
+id = "verification-succeeded"
+kind = "template"
+pattern = "Verification succeeded for"
+reason = "common. Template E2, the periodic DataBlockScanner line; predicted in most blocks, so no gram of it is under the 10 % threshold. The needle the arm cannot help."
+bands = { literal_run_bytes = [26, 26], true_holders = [1, 1365], selected = { survival_share = [0.5, 1] }, trigram = { survival_share = [0.5, 1] } }
+
+[[corpus.needle]]
+id = "block-id"
+kind = "id"
+pattern = "blk_-1608999687919862906"
+reason = "negative control: the block id on the corpus's first line, digits that recur across blocks."
+bands = { literal_run_bytes = [24, 24], true_holders = [1, 136] }
+
+# ---------------------------------------------------------------------------
+
+[[corpus]]
+name = "bgl"
+file = "BGL.log"
+source = "https://zenodo.org/records/8196385/files/BGL.zip"
+block_records = 8192
+
+[corpus.bands]
+lines = [4747963, 4747963]
+blocks = [580, 580]
+compressed_bytes = [25e6, 300e6]
+zstd_cpu_s = [0.2, 30]
+
+[corpus.bands.trigram]
+index_bytes = [2e6, 1e9]
+index_bytes_share = [0.05, 5.0]
+build_cpu_s = [0.5, 150]
+build_cpu_over_zstd = [1, 50]
+
+[corpus.bands.selected]
+index_bytes = [2, 1.5e6]
+index_bytes_share = [0, 0.01]
+build_cpu_s = [0.02, 60]
+build_cpu_over_zstd = [0.05, 5]
+grams_selected = [0, 2000]
+
+[corpus.bands.template.trigram]
+blocks_surviving = [1, 580]
+survival_share = [0, 1]
+false_positives = [0, 580]
+false_positive_share = [0, 1]
+
+[corpus.bands.template.selected]
+blocks_surviving = [1, 580]
+survival_share = [0, 1]
+false_positives = [0, 580]
+false_positive_share = [0, 1]
+
+[corpus.bands.id.trigram]
+blocks_surviving = [290, 580]
+survival_share = [0.5, 1]
+false_positives = [0, 580]
+false_positive_share = [0, 1]
+
+[corpus.bands.id.selected]
+blocks_surviving = [522, 580]
+survival_share = [0.9, 1]
+false_positives = [0, 580]
+false_positive_share = [0, 1]
+
+[[corpus.needle]]
+id = "double-hummer"
+kind = "template"
+pattern = "double-hummer alignment exceptions"
+reason = "open. A correctable-error summary line that BGL emits in bursts; burst spread over blocks unknown."
+bands = { literal_run_bytes = [34, 34], true_holders = [1, 580] }
+
+[[corpus.needle]]
+id = "data-tlb"
+kind = "template"
+pattern = "data TLB error interrupt"
+reason = "rare. A FATAL kernel interrupt, an alert category in the LogHub labels; predicted confined to a few bursts."
+bands = { literal_run_bytes = [24, 24], true_holders = [1, 580], selected = { survival_share = [0, 0.25] } }
+
+[[corpus.needle]]
+id = "ciod-prefix"
+kind = "template"
+pattern = "ciod: failed to read message prefix on control stream"
+reason = "rare. A ciod job-control failure; predicted in a few job-failure bursts."
+bands = { literal_run_bytes = [53, 53], true_holders = [1, 580], selected = { survival_share = [0, 0.25] } }
+
+[[corpus.needle]]
+id = "ddr-corrected"
+kind = "template"
+pattern = "ddr errors(s) detected and corrected on rank"
+reason = "open. A correctable memory error report, frequent on a few nodes; spread over time unknown. The parentheses are literal."
+bands = { literal_run_bytes = [44, 44], true_holders = [1, 580] }
+
+[[corpus.needle]]
+id = "illegal-instruction"
+kind = "template"
+pattern = "program interrupt: illegal instruction"
+reason = "rare. A FATAL program interrupt; predicted in few blocks."
+bands = { literal_run_bytes = [38, 38], true_holders = [1, 580], selected = { survival_share = [0, 0.25] } }
+
+[[corpus.needle]]
+id = "node-id"
+kind = "id"
+pattern = "R02-M1-N0-C:J12-U11"
+reason = "negative control: a compute-card location; locations are clustered in time, so the trigram set may prune some blocks."
+bands = { literal_run_bytes = [19, 19], true_holders = [1, 580] }
+
+# ---------------------------------------------------------------------------
+
+[[corpus]]
+name = "ssh"
+file = "SSH.log"
+source = "https://zenodo.org/records/8196385/files/SSH.tar.gz"
+block_records = 8192
+
+[corpus.bands]
+lines = [655147, 655147]
+blocks = [80, 80]
+compressed_bytes = [2e6, 30e6]
+zstd_cpu_s = [0.02, 5]
+
+[corpus.bands.trigram]
+index_bytes = [2e5, 1e8]
+index_bytes_share = [0.05, 5.0]
+build_cpu_s = [0.05, 20]
+build_cpu_over_zstd = [1, 50]
+
+[corpus.bands.selected]
+index_bytes = [2, 3e5]
+index_bytes_share = [0, 0.01]
+build_cpu_s = [0.002, 10]
+build_cpu_over_zstd = [0.05, 5]
+grams_selected = [0, 2000]
+
+[corpus.bands.template.trigram]
+blocks_surviving = [1, 80]
+survival_share = [0, 1]
+false_positives = [0, 80]
+false_positive_share = [0, 1]
+
+[corpus.bands.template.selected]
+blocks_surviving = [1, 80]
+survival_share = [0, 1]
+false_positives = [0, 80]
+false_positive_share = [0, 1]
+
+[corpus.bands.id.trigram]
+blocks_surviving = [72, 80]
+survival_share = [0.9, 1]
+false_positives = [0, 80]
+false_positive_share = [0, 1]
+
+[corpus.bands.id.selected]
+blocks_surviving = [72, 80]
+survival_share = [0.9, 1]
+false_positives = [0, 80]
+false_positive_share = [0, 1]
+
+[[corpus.needle]]
+id = "break-in"
+kind = "template"
+pattern = "POSSIBLE BREAK-IN ATTEMPT"
+reason = "common. The reverse-mapping warning sshd prints for most attacking hosts; predicted in most blocks."
+bands = { literal_run_bytes = [25, 25], true_holders = [1, 80], selected = { survival_share = [0.5, 1] }, trigram = { survival_share = [0.5, 1] } }
+
+[[corpus.needle]]
+id = "no-more-methods"
+kind = "template"
+pattern = "No more user authentication methods available"
+reason = "open. The disconnect after the last offered method fails; spread unknown."
+bands = { literal_run_bytes = [45, 45], true_holders = [1, 80] }
+
+[[corpus.needle]]
+id = "no-identification"
+kind = "template"
+pattern = "Did not receive identification string from"
+reason = "open. A scanner that connects and sends nothing; spread unknown."
+bands = { literal_run_bytes = [42, 42], true_holders = [1, 80] }
+
+[[corpus.needle]]
+id = "socket-reset"
+kind = "template"
+pattern = "Read from socket failed: Connection reset by peer"
+reason = "open. A client reset mid-session; spread unknown."
+bands = { literal_run_bytes = [49, 49], true_holders = [1, 80] }
+
+[[corpus.needle]]
+id = "too-many-admin"
+kind = "template"
+pattern = "Too many authentication failures for admin"
+reason = "open. Attempts against one user name; spread unknown."
+bands = { literal_run_bytes = [42, 42], true_holders = [1, 80] }
+
+[[corpus.needle]]
+id = "attacker-ip"
+kind = "id"
+pattern = "173.234.31.186"
+reason = "negative control: an attacking host's address; its digit trigrams occur in nearly every block's other addresses."
+bands = { literal_run_bytes = [14, 14], true_holders = [1, 80] }
+
+# ---------------------------------------------------------------------------
+
+# 1024 records per block: at the production 8192 the corpus is 7 blocks, so
+# the 10 % survival bar would mean zero surviving blocks.
+[[corpus]]
+name = "apache"
+file = "Apache.log"
+source = "https://zenodo.org/records/8196385/files/Apache.tar.gz"
+block_records = 1024
+
+[corpus.bands]
+lines = [56482, 56482]
+blocks = [56, 56]
+compressed_bytes = [0.15e6, 2.5e6]
+zstd_cpu_s = [0.001, 1]
+
+[corpus.bands.trigram]
+index_bytes = [1e4, 1e7]
+index_bytes_share = [0.05, 5.0]
+build_cpu_s = [0.001, 5]
+build_cpu_over_zstd = [1, 50]
+
+[corpus.bands.selected]
+index_bytes = [2, 1.25e5]
+index_bytes_share = [0, 0.05]
+build_cpu_s = [0.0001, 2]
+build_cpu_over_zstd = [0.05, 5]
+grams_selected = [0, 2000]
+
+[corpus.bands.template.trigram]
+blocks_surviving = [1, 56]
+survival_share = [0, 1]
+false_positives = [0, 56]
+false_positive_share = [0, 1]
+
+[corpus.bands.template.selected]
+blocks_surviving = [1, 56]
+survival_share = [0, 1]
+false_positives = [0, 56]
+false_positive_share = [0, 1]
+
+[corpus.bands.id.trigram]
+blocks_surviving = [45, 56]
+survival_share = [0.8, 1]
+false_positives = [0, 56]
+false_positive_share = [0, 1]
+
+[corpus.bands.id.selected]
+blocks_surviving = [51, 56]
+survival_share = [0.9, 1]
+false_positives = [0, 56]
+false_positive_share = [0, 1]
+
+[[corpus.needle]]
+id = "index-forbidden"
+kind = "template"
+pattern = "Directory index forbidden by rule"
+reason = "open. A client error repeated by crawlers; spread unknown."
+bands = { literal_run_bytes = [33, 33], true_holders = [1, 56] }
+
+[[corpus.needle]]
+id = "jk2-scoreboard"
+kind = "template"
+pattern = "jk2_init() Can't find child .* in scoreboard"
+reason = "common. The mod_jk2 startup error with a child number in the gap, repeated at every restart; predicted in most blocks. The one gap pattern."
+bands = { literal_run_bytes = [28, 28], true_holders = [1, 56], selected = { survival_share = [0.5, 1] }, trigram = { survival_share = [0.5, 1] } }
+
+[[corpus.needle]]
+id = "sigterm"
+kind = "template"
+pattern = "still did not exit, sending a SIGTERM"
+reason = "rare. A child that ignores shutdown, only around restarts that hang."
+bands = { literal_run_bytes = [37, 37], true_holders = [1, 56], selected = { survival_share = [0, 0.25] } }
+
+[[corpus.needle]]
+id = "directory-as-script"
+kind = "template"
+pattern = "attempt to invoke directory as script"
+reason = "rare. A CGI misconfiguration error, predicted from few clients."
+bands = { literal_run_bytes = [37, 37], true_holders = [1, 56], selected = { survival_share = [0, 0.25] } }
+
+[[corpus.needle]]
+id = "workerenv-error"
+kind = "template"
+pattern = "mod_jk child workerEnv in error state"
+reason = "common. The mod_jk child state error that accompanies jk2_init at every restart; predicted in most blocks."
+bands = { literal_run_bytes = [37, 37], true_holders = [1, 56], selected = { survival_share = [0.5, 1] }, trigram = { survival_share = [0.5, 1] } }
+
+[[corpus.needle]]
+id = "client-ip"
+kind = "id"
+pattern = "204.100.200.22"
+reason = "negative control: one client's address; 1024-line blocks hold fewer addresses, so the trigram band is wider."
+bands = { literal_run_bytes = [14, 14], true_holders = [1, 56] }

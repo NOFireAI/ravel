@@ -177,9 +177,11 @@ anyhow = { workspace = true, optional = true }
 # The pending-ack shed cost lane (`pending_ack_shed`) reads the process CPU
 # clock through `rustix::time::clock_gettime(ClockId::ProcessCPUTime)`, a safe
 # wrapper with nanosecond reporting on Linux and macOS, where `/proc/self/stat`
-# gives 10 ms ticks on Linux and nothing elsewhere. Workspace pin with its
-# `time` feature added; no new external crate.
-rustix = { workspace = true, optional = true, features = ["time"] }
+# gives 10 ms ticks on Linux and nothing elsewhere. The logbody_report REI arm
+# (issue #3709) reads the thread CPU clock through the same call, so it is a
+# regular dependency. Workspace pin with its `time` feature added; no new
+# external crate.
+rustix = { workspace = true, features = ["time"] }
 
 # The saturation bins install jemalloc as their global allocator the way
 # ravel-server's binary does, so the server they measure allocates as the
@@ -240,7 +242,7 @@ flight-lane = ["sql-latency", "dep:arrow-flight", "dep:futures"]
 # The ADR-1702 task 11 saturation bins (`liveness_under_decode`,
 # `heartbeat_under_query_load`, issue #2670). Off by default: they link
 # ravel-server and its SQL surface. Advisory lanes, run by hand.
-saturation = ["dep:ravel-server", "dep:ravel-cpu-gate", "dep:ravel-memory", "dep:anyhow", "dep:tikv-jemallocator", "dep:rustix"]
+saturation = ["dep:ravel-server", "dep:ravel-cpu-gate", "dep:ravel-memory", "dep:anyhow", "dep:tikv-jemallocator"]
 
 [dev-dependencies]
 criterion = { workspace = true }
