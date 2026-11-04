@@ -3360,6 +3360,32 @@ FINISHED=1
         print(f"flip 'a random hour per trace' at gen_corpus.py:{src[: src.index(old)].count(chr(10)) + 1} fails "
               f"test_many_parts_744_strided_load_check: {why}", file=sys.stderr)
 
+    def test_stride_check_that_cannot_run_is_not_a_refusal(self):
+        # run.sh records exit 1 as the state not-run with the refusal on
+        # stdout, and any other non-zero exit as a failed state with the
+        # stderr log. A check that could not read its file must therefore
+        # not exit 1: a missing Parquet file (or no pyarrow at all) exits 70
+        # with its error on stderr and nothing on stdout, and a bad
+        # --batch-rows exits 64 before any read.
+        missing = self.path("no-such.parquet")
+        p = subprocess.run([PY, os.path.join(BOX, "lib", "inv.py"), "stride-check", "--parquet", missing,
+                            "--batch-rows", "10", "--batches", "3", "--ingest-hour-start", "497517"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 70, p.stderr)
+        self.assertEqual(p.stdout, "")
+        self.assertTrue(p.stderr.startswith("inv.py: stride-check: "), p.stderr)
+        p = subprocess.run([PY, os.path.join(BOX, "lib", "inv.py"), "stride-check", "--parquet", missing,
+                            "--batch-rows", "0", "--batches", "3", "--ingest-hour-start", "497517"],
+                           capture_output=True, text=True)
+        self.assertIn(p.returncode, (64, 70), p.stderr)
+        self.assertEqual(p.stdout, "")
+        with open(os.path.join(BOX, "run.sh")) as f:
+            run_sh = f.read()
+        # The mapping in run.sh: 1 is not-run with stdout, anything else fails
+        # the state with the stderr log.
+        self.assertIn('    1) not_run "many_parts_$n" "$why"; return 0 ;;\n'
+                      '    *) failed_at "stride-check many_parts_$n" "$code" "$stride_log"; return 1 ;;\n', run_sh)
+
 
 def refresh_local_smoke():
     with tempfile.TemporaryDirectory() as d:

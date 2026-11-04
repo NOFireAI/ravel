@@ -251,6 +251,14 @@ fail_logged() {
   fail "$FAIL_STEP exit $FAIL_CODE (log $kept)"
 }
 
+# fail_log MESSAGE LOG: fail, with the command's log kept and named, for the
+# steps before the states whose commands write a log under work/.
+fail_log() {
+  local kept
+  kept="$(keep_log "$2")"
+  fail "$1 (log $kept)"
+}
+
 # state_failed: the command failed_at named stopped the current state. The
 # state is recorded failed with that step, its exit code and its log kept
 # under out/logs/; run_state returns and the run goes on with the next state.
@@ -547,7 +555,7 @@ step_store() {
         "$RUSTFS_BIN" --address "127.0.0.1:$port" "$WORK/rustfs-data" </dev/null >"$WORK/rustfs.log" 2>&1 &
       RUSTFS_PID=$!
     fi
-    run "$PY" "$LIB" s3 wait --timeout 120 || fail "RustFS did not answer"
+    run "$PY" "$LIB" s3 wait --timeout 120 || fail_log "RustFS did not answer" "$WORK/rustfs.log"
     local i ok=0
     for i in 1 2 3 4 5 6 7 8 9 10; do
       run "$PY" "$LIB" s3 mkbucket && { ok=1; break; }
@@ -563,7 +571,7 @@ step_store() {
       fail "store_bucket $STORE_BUCKET is not empty"
     fi
   fi
-  run "${CLI[@]}" store qualify >"$WORK/qualify.out" 2>&1 || fail "store qualify"
+  run "${CLI[@]}" store qualify >"$WORK/qualify.out" 2>&1 || fail_log "store qualify" "$WORK/qualify.out"
   stamp store.json lane="$LANE" bucket="${RAVEL_S3_BUCKET:-}" qualified:=true empty_at_start:=true at="$(utc_now)"
   stamp_tenants
 }
@@ -603,13 +611,14 @@ step_corpus() {
   [ "$extra_traces" -ge 1 ] || extra_traces=1
   run "$PY" "$INV_DIR/gen_corpus.py" --traces "$TRACES" --hours "$HOURS" --seed "$SEED" \
     --spans-per-trace "$SPANS_PER" --logs-per-trace "$LOGS_PER" --start-hour $((h0 - HOURS)) \
-    --format parquet --out "$WORK/corpus" >"$WORK/corpus.out" 2>&1 || fail "gen_corpus base"
+    --format parquet --out "$WORK/corpus" >"$WORK/corpus.out" 2>&1 || fail_log "gen_corpus base" "$WORK/corpus.out"
   # The mixed state's extra hour: planted like the base corpus (its own saved
   # traces, request id, needles and failing cell), a different seed so no
   # trace id repeats, event time the hour after the base corpus.
   run "$PY" "$INV_DIR/gen_corpus.py" --traces "$extra_traces" --hours 1 --seed $((SEED + 1)) \
     --spans-per-trace "$SPANS_PER" --logs-per-trace "$LOGS_PER" --start-hour "$h0" --tail \
-    --format parquet --out "$WORK/corpus-tail" >"$WORK/corpus-tail.out" 2>&1 || fail "gen_corpus tail"
+    --format parquet --out "$WORK/corpus-tail" >"$WORK/corpus-tail.out" 2>&1 \
+    || fail_log "gen_corpus tail" "$WORK/corpus-tail.out"
   subs+=(--sub "tail=$WORK/corpus-tail/truth.json")
   # Each many_parts_N tenant's corpus: N event hours ending four hours before
   # this one, so its strided ingest hours (one later than the event hours)
@@ -622,7 +631,8 @@ step_corpus() {
   for n in $MP_SIZES; do
     run "$PY" "$INV_DIR/gen_corpus.py" --traces $((n * MP_TPH)) --hours "$n" --seed $((SEED + n)) --even-hours \
       --spans-per-trace "$SPANS_PER" --logs-per-trace "$LOGS_PER" --start-hour $((h0 - n - 4)) \
-      --format parquet --out "$WORK/corpus-mp$n" >"$WORK/corpus-mp$n.out" 2>&1 || fail "gen_corpus many_parts_$n"
+      --format parquet --out "$WORK/corpus-mp$n" >"$WORK/corpus-mp$n.out" 2>&1 \
+      || fail_log "gen_corpus many_parts_$n" "$WORK/corpus-mp$n.out"
     subs+=(--sub "many_parts_$n=$WORK/corpus-mp$n/truth.json")
     mp="$("$HOST_PY" -c 'import json, sys; d = json.loads(sys.argv[1]); d[sys.argv[2]] = {"traces": int(sys.argv[3]), "hours": int(sys.argv[2]), "seed": int(sys.argv[4]), "start_hour": int(sys.argv[5]), "ingest_hour_start": int(sys.argv[5]) + 1, "even_hours": True}; print(json.dumps(d))' \
       "$mp" "$n" $((n * MP_TPH)) $((SEED + n)) $((h0 - n - 4)))" || fail "many_parts corpus record"
@@ -651,14 +661,15 @@ step_declare() {
   step declare
   run "${CLI[@]}" typed-attr-column set "$TENANT" --from-mapping "$WORK/corpus/logs.mapping.toml" \
     --key-index request_id --index-trace-id true --readers-rolled-out >"$WORK/declare.out" 2>&1 \
-    || fail "typed-attr-column set $TENANT"
-  run "${CLI[@]}" typed-attr-column show "$TENANT" >"$WORK/declare-show.out" 2>&1 || fail "typed-attr-column show"
+    || fail_log "typed-attr-column set $TENANT" "$WORK/declare.out"
+  run "${CLI[@]}" typed-attr-column show "$TENANT" >"$WORK/declare-show.out" 2>&1 \
+    || fail_log "typed-attr-column show" "$WORK/declare-show.out"
   local hits_show=""
   if [ "$HITS" = true ]; then
     run "${CLI[@]}" typed-attr-column set hits --from-mapping "$HITS_MAPPING" --key-index UserID \
-      --readers-rolled-out >>"$WORK/declare.out" 2>&1 || fail "typed-attr-column set hits"
+      --readers-rolled-out >>"$WORK/declare.out" 2>&1 || fail_log "typed-attr-column set hits" "$WORK/declare.out"
     run "${CLI[@]}" typed-attr-column show hits >"$WORK/declare-show-hits.out" 2>&1 \
-      || fail "typed-attr-column show hits"
+      || fail_log "typed-attr-column show hits" "$WORK/declare-show-hits.out"
     [ "$DRY_RUN" = 1 ] || hits_show="$(cat "$WORK/declare-show-hits.out")"
   fi
   stamp declare.json tenant="$TENANT" key_index=request_id index_trace_id:=true \
@@ -972,7 +983,8 @@ state_erasure() {
   # ravel-cli erase status prints "<request id>: PENDING" for a request with
   # a .dreq and no .done (services/ravel-cli/src/erase.rs print_state).
   if [ "$DRY_RUN" = 0 ] && ! grep -q ': PENDING$' "$WORK/erase-status-after.out"; then
-    fail "erase status after submit shows no PENDING request"
+    failed_at "erase status after submit shows no PENDING request" 1 "$WORK/erase-status-after.out"
+    return 1
   fi
   stamp erasure.jsonl victim_request_id="$rid" \
     submit:="$(run "$PY" "$LIB" kv-report --log "$out" || echo null)" \
@@ -996,13 +1008,17 @@ state_many_parts() {
   # The loader checks each batch's latest event time against its ingest
   # hour's end plus max_ingest_lag before writing it, and a refusal leaves a
   # partial tenant behind. The same check over the whole file first: a
-  # corpus it would refuse records the state not-run with that refusal.
+  # corpus it would refuse records the state not-run with that refusal
+  # (exit 1, the refusal on stdout). A check that could not run (exit 70 or
+  # 64, its error on stderr) fails the state with that log, since an
+  # unchecked corpus is not a refused one.
+  local stride_log="$WORK/stride-check-mp$n.out"
   why="$(run "$PY" "$LIB" stride-check --parquet "$dir/spans.parquet" --batch-rows "$rows" --batches "$n" \
-    --ingest-hour-start "$start")" || code=$?
+    --ingest-hour-start "$start" 2>"$stride_log")" || code=$?
   case "$code" in
     0) ;;
     1) not_run "many_parts_$n" "$why"; return 0 ;;
-    *) failed_at "stride-check many_parts_$n" "$code"; return 1 ;;
+    *) failed_at "stride-check many_parts_$n" "$code" "$stride_log"; return 1 ;;
   esac
   stop_server
   load_signal "many_parts_$n" spans "$dir" "$t" --ingest-hour-stride 1 --ingest-hour-start "$start" \
