@@ -419,9 +419,11 @@ false.
 A tool that runs a PromQL, analytics or SQL query reports its estimate in
 `budget.estimate` in the same spelling: a component the server cannot bound
 is `null` there and is named in `budget.estimate.unbounded`, and
-`estimate_is_upper_envelope` is true only when that list is empty. One statement gets the same flag from
-`ravel_explain_query` and from `ravel_query_sql`. A PromQL or analytics call
-reads `samples`, so its estimate is bounded.
+`estimate_is_upper_envelope` is true only when that list is empty. One
+statement gets the same list and the same flag from `ravel_explain_query`
+and from `ravel_query_sql`. A PromQL or analytics call takes its estimate
+from the PromQL engine's estimator, which bounds every component from the
+resolved segments, so its list is empty.
 
 ### Running a statement
 

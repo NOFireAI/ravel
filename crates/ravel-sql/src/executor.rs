@@ -1621,6 +1621,12 @@ pub struct SqlOutcome {
     /// with signal tables. A Parquet table is resolved from its manifest, not
     /// from a signal snapshot, so no cursor pin covers it.
     pub reads_parquet: bool,
+    /// [`CostEstimate`] fields the estimator cannot bound for this statement,
+    /// from the same rule over the same resolve as
+    /// [`ExplainReport::unbounded_components`], so explain and execute name the
+    /// same components for one statement. Empty for a statement reading only
+    /// `samples`.
+    pub unbounded_components: Vec<&'static str>,
     /// How many signal tables the statement names in its text. Zero for a
     /// statement naming none, which [`Self::signals`] still reports as the
     /// default `samples` lane it resolved: that lane is not a table the
@@ -2512,6 +2518,8 @@ impl SqlExecutor {
             let target = resolved.target;
             let unfolded_segments_resolved = resolved.unfolded_segments_resolved;
             let signal_tables_named = resolved.signal_tables_named;
+            let unbounded_components =
+                unbounded_lane_components(&resolved.lanes, resolved.parquet.is_some());
             let (lanes, parquet) = resolved.into_snapshots();
             // Read off this attempt's snapshots, before they are moved into
             // `attempt`, so they describe the snapshots the returned rows were
@@ -2655,6 +2663,7 @@ impl SqlExecutor {
                         pending_erasure,
                         ingest_watermark_hour,
                         reads_parquet,
+                        unbounded_components,
                         signal_tables_named,
                     });
                 }
@@ -11780,5 +11789,130 @@ pub(crate) mod tests {
             *source.key_index_at.lock().expect("key index lock"),
             vec![CLOCKS_CALLER_NS]
         );
+    }
+
+    /// A one-row Parquet file of `id: Int64`, `name: Utf8`.
+    fn unbounded_parquet_file() -> bytes::Bytes {
+        use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a"])),
+            ],
+        )
+        .expect("batch");
+        let mut out = Vec::new();
+        let mut writer =
+            ::parquet::arrow::ArrowWriter::try_new(&mut out, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        bytes::Bytes::from(out)
+    }
+
+    /// Explain and execute name the same unbounded estimate components for
+    /// every signal table, for a Parquet table, and for a statement joining
+    /// the two, in the order the lanes first name them. An MCP envelope maps
+    /// [`SqlOutcome::unbounded_components`] for `ravel_query_sql` and
+    /// [`ExplainReport::unbounded_components`] for `ravel_explain_query`, so
+    /// a disagreement here is the two tools contradicting each other.
+    #[tokio::test]
+    async fn explain_and_execute_name_the_same_unbounded_components() {
+        use ravel_catalog::Catalog;
+        use ravel_pqtable::clock::FixedClock;
+        use ravel_pqtable::grants;
+
+        const PROFILE: &str = "lake";
+        const GRANT: &str = "s3://lake/t";
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let lake: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let external = Arc::new(crate::ExternalStoreMap::new(HashMap::from([(
+            PROFILE.to_string(),
+            Arc::clone(&lake),
+        )]))) as Arc<dyn crate::ExternalStores>;
+        let sources = ParquetSources::new(
+            Arc::clone(&store),
+            Some(external),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("limiter")),
+            None,
+            crate::DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+        );
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let executor = SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(Arc::clone(&store)),
+            LogSegmentFetcher::new(Arc::clone(&store)),
+            SpanSegmentFetcher::new(Arc::clone(&store)),
+            SqlConfig::default(),
+            1 << 30,
+        )
+        .with_parquet_sources(sources);
+
+        let tenant = TenantId::new("unbounded-components").hash();
+        grants::add(
+            store.as_ref(),
+            &tenant,
+            PROFILE,
+            GRANT,
+            "test",
+            &FixedClock::new(1_700_000_000_000_000_000),
+        )
+        .await
+        .expect("grant");
+        lake.put(
+            "t/hits/0.parquet",
+            unbounded_parquet_file(),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put");
+        executor
+            .execute_ddl(
+                tenant,
+                &format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'"),
+                "test",
+                Duration::from_secs(5),
+            )
+            .await
+            .result
+            .expect("create");
+
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: 1_000,
+        };
+        let decompressed = "estimated_decompressed_bytes";
+        let requests = "estimated_requests";
+        let store_bytes = "estimated_store_bytes";
+        for (sql, expected) in [
+            ("SELECT value FROM samples", vec![]),
+            ("SELECT body FROM logs", vec![decompressed]),
+            ("SELECT name FROM spans", vec![decompressed]),
+            ("SELECT * FROM alerts", vec![decompressed]),
+            ("SELECT * FROM audit", vec![decompressed]),
+            (
+                "SELECT id FROM hits",
+                vec![requests, store_bytes, decompressed],
+            ),
+            (
+                "SELECT h.id FROM hits h JOIN logs l ON h.name = l.body",
+                vec![decompressed, requests, store_bytes],
+            ),
+        ] {
+            let request = sql_request(sql, window);
+            let report = executor.explain(tenant, &request).await.expect("explain");
+            let outcome = executor.execute(tenant, &request).await.expect("execute");
+            assert_eq!(report.unbounded_components, expected, "{sql}: explain");
+            assert_eq!(outcome.unbounded_components, expected, "{sql}: execute");
+        }
     }
 }
