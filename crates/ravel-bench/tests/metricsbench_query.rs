@@ -1465,7 +1465,10 @@ async fn ravel_cost_records_every_repetitions_accounting_and_phases() {
     let d: Json =
         serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
     assert!(
-        d["ravel_cost_note"].as_str().expect("note").contains("logical"),
+        d["ravel_cost_note"]
+            .as_str()
+            .expect("note")
+            .contains("logical"),
         "{}",
         d["ravel_cost_note"]
     );

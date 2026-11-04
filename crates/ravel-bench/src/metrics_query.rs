@@ -668,7 +668,10 @@ pub struct RavelCost {
 /// (`answer_body`), and for one that is but carries no `data.stats`.
 fn ravel_cost_fields(outcome: &QueryOutcome) -> (Option<Json>, Option<Json>) {
     match answer_body(outcome).and_then(|body| body["data"].get("stats").cloned()) {
-        Some(stats) => (stats.get("accounting").cloned(), stats.get("phases").cloned()),
+        Some(stats) => (
+            stats.get("accounting").cloned(),
+            stats.get("phases").cloned(),
+        ),
         None => (None, None),
     }
 }

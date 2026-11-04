@@ -1094,6 +1094,28 @@ step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
   representable steps on the ordered bit line, `-0.0` and `0.0` being one
   point, and two NaNs are 0 apart (`ulp_distance_*` tests in
   `crates/ravel-promql-difftest/src/comparator.rs`).
+- `ravel_cost`: Ravel's own per-query object-store cost, one object per
+  Ravel repetition (ADR-0927's 2026-11-04 amendment, decision 3;
+  `metrics_query::RavelCost`). Every timed repetition of every pass is
+  recorded separately, never just a pass's median or its first repetition,
+  and `accounting`/`phases` are `data.stats.accounting` and
+  `data.stats.phases` copied from the answer body exactly as returned, not
+  re-modelled into named counters
+  (`ravel_cost_records_every_repetitions_accounting_and_phases`). Each
+  object carries `entry`, `pass`, `rep`, `status`, `accounting` and
+  `phases`. Comparator engines (Prometheus,
+  VictoriaMetrics, Mimir) never add an entry here
+  (`ravel_cost_excludes_comparator_answers`). An answer with no
+  `data.stats` at all, a timeout, a transport error, or a refusal, still
+  records its `entry`, `pass`, `rep` and `status`, with `accounting` and
+  `phases` both `null`, never omitted
+  (`ravel_cost_records_null_on_an_answer_with_no_stats`).
+- `ravel_cost_note`: a fixed string stating `ravel_cost`'s two caveats, so a
+  reader of the sidecar alone does not mistake it for billed usage or for a
+  process-wide total: the figures are logical object-store call counts as
+  the query engine counted them, not billed provider requests (decision 8),
+  and each is read per response, never pooled across queries or processes
+  (decision 9).
 
 ```json
 {
@@ -1110,6 +1132,14 @@ step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
   ],
   "oracle_retries": [
     {"entry": "mb_single_gauge_instant", "pass": 1, "repetition": 1, "attempt": 2}
-  ]
+  ],
+  "ravel_cost": [
+    {"entry": "mb_single_counter_rate", "pass": 1, "rep": 1, "status": "ok",
+     "accounting": {"s3GetRequests": 7, "s3GetBytes": 4096, "s3ListRequests": 1},
+     "phases": [{"phase": "scan", "s3GetRequests": 7, "s3GetBytes": 4096}]},
+    {"entry": "mb_single_counter_rate", "pass": 1, "rep": 1, "status": "timeout",
+     "accounting": null, "phases": null}
+  ],
+  "ravel_cost_note": "ravel_cost figures are logical object-store call counts as the query engine counted them (not billed provider requests), read per response, never pooled across queries or processes (ADR-0927 decisions 8 and 9)"
 }
 ```
