@@ -58,12 +58,13 @@ pub use config::{
     DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES,
     DEFAULT_FOLD_RECONCILE_WINDOW_HOURS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
     DEFAULT_FRONTIER_RECONCILE_MAX_HOURS, DEFAULT_HEAD_CACHE_CAPACITY, DEFAULT_HEAD_CACHE_TTL_NS,
-    DEFAULT_MAX_CATALOG_LIST_REQUESTS, DEFAULT_MAX_FLUSH_LIFETIME_NS, DEFAULT_MAX_INGEST_LAG_NS,
-    DEFAULT_POSTINGS_CACHE_ENTRIES, DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS,
-    DEFAULT_PROTECTION_HORIZON_NS, DEFAULT_RESOLVE_PREFIX_CONCURRENCY,
-    DEFAULT_SNAPSHOT_CACHE_PARTS, MAX_CACHE_CAPACITY_PER_TENANT, MAX_RECORD_CACHE_BYTES_PER_TENANT,
-    MAX_RESOLVE_GET_CONCURRENCY, RECORD_CACHE_ENTRY_BYTES, RECORD_CACHES_PER_TENANT,
-    derive_cache_capacity_per_tenant, derive_cache_capacity_per_tenant_within,
+    DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS, DEFAULT_MAX_CATALOG_LIST_REQUESTS,
+    DEFAULT_MAX_FLUSH_LIFETIME_NS, DEFAULT_MAX_INGEST_LAG_NS, DEFAULT_POSTINGS_CACHE_ENTRIES,
+    DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS, DEFAULT_PROTECTION_HORIZON_NS,
+    DEFAULT_RESOLVE_PREFIX_CONCURRENCY, DEFAULT_SNAPSHOT_CACHE_PARTS,
+    MAX_CACHE_CAPACITY_PER_TENANT, MAX_RECORD_CACHE_BYTES_PER_TENANT, MAX_RESOLVE_GET_CONCURRENCY,
+    RECORD_CACHE_ENTRY_BYTES, RECORD_CACHES_PER_TENANT, derive_cache_capacity_per_tenant,
+    derive_cache_capacity_per_tenant_within,
 };
 pub use covering_postings::{LoadPostingsError, LoadedCoveringPostings, load_covering_postings};
 pub use declared_stats::{
@@ -71,7 +72,10 @@ pub use declared_stats::{
     read_snapshot_entry,
 };
 pub use error::CatalogError;
-pub use fold::{FoldReport, PostingsBuildError, RefoldRequest, Transaction, fetch_segment_names};
+pub use fold::{
+    FoldKeyIndexTotals, FoldReport, PostingsBuildError, RefoldRequest, Transaction,
+    fetch_segment_names, fold_key_index_totals,
+};
 pub use key_epoch::{
     EpochDefect, KEY_EPOCH_FORMAT_VERSION, KEY_EPOCH_MAX_READ_VERSION, KEY_EPOCH_MIN_READ_VERSION,
     KeyEpoch, KeyEpochError, KeyEpochOutcome, enc_key, epoch_for_write, read_epochs,

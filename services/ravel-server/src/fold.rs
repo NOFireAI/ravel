@@ -72,6 +72,12 @@ pub struct FoldTaskConfig {
     /// [`crate::query::build_catalog_for_server`] maps it onto
     /// `CatalogConfig::build_key_index_leaves`. Default `false`.
     pub build_key_index_leaves: bool,
+    /// The leaf build's pair budget per part, across its fields
+    /// (`--fold-key-index-build-max-pairs`, ADR-3692 decision 5), mapped onto
+    /// `CatalogConfig::key_index_build_max_pairs` by
+    /// [`crate::query::build_catalog_for_server`]. Default
+    /// [`ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`].
+    pub key_index_build_max_pairs: u64,
 }
 
 /// Why [`spawn`] refused to start the fold loops. Nothing is spawned.
@@ -102,6 +108,7 @@ impl Default for FoldTaskConfig {
             enabled: true,
             fold_interval: DEFAULT_FOLD_INTERVAL,
             build_key_index_leaves: false,
+            key_index_build_max_pairs: ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
         }
     }
 }

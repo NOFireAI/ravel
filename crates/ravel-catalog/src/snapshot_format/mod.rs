@@ -34,7 +34,7 @@ pub use kidx::{
     decoded_bound, encode_key_index_leaf, encode_key_index_leaf_with_bucket_bits,
     encoded_entry_len, key_index_leaf_prefix_range, key_index_root_shape,
     probe_key_index_leaf_ranged, probe_key_index_leaf_set_ranged, select_key_index_slice,
-    split_key_index_entries, verify_key_index_leaf,
+    split_key_index_entries, verify_key_index_leaf, verify_key_index_leaf_frames,
 };
 pub use part::{DecodedPart, decode_part, decode_part_header, encode_part, encode_part_ranged};
 pub use postings::{
