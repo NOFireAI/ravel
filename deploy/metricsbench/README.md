@@ -925,6 +925,10 @@ above layer `real-s3.yml` after `ravel.yml`, which moves Ravel and Mimir onto
 real S3 and changes no other setting. Prometheus and VictoriaMetrics stay on
 local disk.
 
+[docs/internal/metricsbench-aws-runbook.md](../../docs/internal/metricsbench-aws-runbook.md)
+runs this lane end to end with the scripts under [aws/](aws/), from the
+instance role to a published reference run.
+
 Before the run, on an EC2 host:
 
 1. Create four empty buckets in the region: `<PREFIX>-ravel`,

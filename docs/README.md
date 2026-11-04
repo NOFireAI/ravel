@@ -208,6 +208,9 @@ rule as every other page.
 - [internal/clickbench-aws-runbook.md](internal/clickbench-aws-runbook.md):
   the same workload end to end on AWS, from an empty account to a measured
   pass.
+- [internal/metricsbench-aws-runbook.md](internal/metricsbench-aws-runbook.md):
+  MetricsBench on one EC2 box, on real S3 and on the portable lane, from the
+  instance role to a published reference run.
 - [internal/diagrams.md](internal/diagrams.md): what each diagram under
   `diagrams/` shows, which page it illustrates, and the visual language
   they share.
