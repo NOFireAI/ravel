@@ -1288,15 +1288,15 @@ mod tests {
         let cases = [
             (
                 MAX_RESPONSE_BYTES_FLOOR,
-                "the result is complete but the byte cap shortened cells of its one row; \
-                 raise max_response_bytes (up to 4 MiB) to read them in full, or select \
-                 only the cut column",
+                "the result is complete but the byte cap shortened cells; raise \
+                 max_response_bytes (up to 4 MiB) to read them in full, or select only the \
+                 cut column",
             ),
             (
                 MAX_RESPONSE_BYTES_CEILING,
-                "the result is complete but the byte cap shortened cells of its one row, \
-                 which cannot be returned in full under the 4 MiB max_response_bytes \
-                 ceiling; select only the cut column",
+                "the result is complete but the byte cap shortened cells, which cannot be \
+                 returned in full under the 4 MiB max_response_bytes ceiling; select only \
+                 the cut column",
             ),
         ];
         for (cap, detail) in cases {

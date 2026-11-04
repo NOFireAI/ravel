@@ -1159,10 +1159,10 @@ mod tests {
             steps(&envelope),
             [(
                 "read_full_cells",
-                "the result is complete but the byte cap shortened cells of its one row; \
-                 raise max_response_bytes (up to 4 MiB) to read them in full, or narrow \
-                 time_range to a window after the last sample returned to read the samples \
-                 the cut omitted"
+                "the result is complete but the byte cap shortened cells; raise \
+                 max_response_bytes (up to 4 MiB) to read them in full, or narrow time_range \
+                 to a window after the last sample returned to read the samples the cut \
+                 omitted"
             )]
         );
         let size = serde_json::to_vec(&envelope).expect("serializes").len() as u64;

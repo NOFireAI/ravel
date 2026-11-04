@@ -537,9 +537,11 @@ pub struct NextStep {
 pub enum CapCut {
     /// No cap took anything.
     Nothing,
-    /// The byte cap shortened cells of the one row returned and dropped no
-    /// row. The result is complete. `bytes_ceiling` is the configured
-    /// `max_response_bytes` ceiling.
+    /// The byte cap shortened cells and dropped no row. The result is
+    /// complete. [`Envelope::fit`] cuts cells only of the one row it keeps; a
+    /// tool that cuts its own cells, as `ravel_query_promql` cuts the samples
+    /// of its last series, can return more. `bytes_ceiling` is the
+    /// configured `max_response_bytes` ceiling.
     Cells {
         bytes_at_ceiling: bool,
         bytes_ceiling: u64,
@@ -605,10 +607,10 @@ pub struct CapAdvice<'a> {
     /// What `smaller_rows_action` asks for, e.g. "select fewer or narrower
     /// columns".
     pub smaller_rows: &'a str,
-    /// A clause naming how to read more of a shortened cell of the one row
-    /// returned, e.g. "select fewer or narrower columns to give the cut cells
-    /// more room"; `None` where the tool has no such argument. Fewer rows
-    /// cannot help there: only one row came back.
+    /// A clause naming how to read more of a shortened cell, e.g. "select
+    /// fewer or narrower columns to give the cut cells more room"; `None`
+    /// where the tool has no such argument. It is never a way to fewer rows:
+    /// those cannot return more of a row that came back.
     pub read_cell: Option<&'a str>,
 }
 
@@ -621,9 +623,9 @@ impl CapAdvice<'_> {
     /// - The byte cap dropping rows: smaller rows, or raise
     ///   `max_response_bytes` while it is below its configured ceiling, which
     ///   the detail names.
-    /// - The byte cap shortening cells of the one row returned: the result is
+    /// - The byte cap shortening cells and dropping no row: the result is
     ///   complete. Below the ceiling, raise `max_response_bytes`, which the
-    ///   detail names; at it, the row cannot be returned in full. Either way
+    ///   detail names; at it, the cells cannot be returned in full. Either way
     ///   the detail adds `read_cell` when the tool has one.
     pub fn step(&self, cut: CapCut, context: &str) -> Option<NextStep> {
         let (action, detail) = match cut {
@@ -670,15 +672,14 @@ impl CapAdvice<'_> {
             } => {
                 let cut = if bytes_at_ceiling {
                     format!(
-                        "the result is complete but the byte cap shortened cells of its one \
-                         row, which cannot be returned in full under the {} max_response_bytes \
-                         ceiling",
+                        "the result is complete but the byte cap shortened cells, which cannot \
+                         be returned in full under the {} max_response_bytes ceiling",
                         byte_size(bytes_ceiling)
                     )
                 } else {
                     format!(
-                        "the result is complete but the byte cap shortened cells of its one \
-                         row; raise max_response_bytes (up to {}) to read them in full",
+                        "the result is complete but the byte cap shortened cells; raise \
+                         max_response_bytes (up to {}) to read them in full",
                         byte_size(bytes_ceiling)
                     )
                 };

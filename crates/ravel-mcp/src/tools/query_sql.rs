@@ -908,9 +908,9 @@ mod tests {
             steps(&page),
             [(
                 "read_full_cells",
-                "the result is complete but the byte cap shortened cells of its one row; \
-                 raise max_response_bytes (up to 4 MiB) to read them in full, or select \
-                 fewer or narrower columns to give the cut cells more room"
+                "the result is complete but the byte cap shortened cells; raise \
+                 max_response_bytes (up to 4 MiB) to read them in full, or select fewer or \
+                 narrower columns to give the cut cells more room"
             )]
         );
     }
