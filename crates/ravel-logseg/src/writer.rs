@@ -5633,9 +5633,11 @@ mod tests {
 
         // Every declared field is named; one no row carries has no entries.
         let section = &obj[desc.offset as usize..(desc.offset + desc.len) as usize];
-        let summary = summarize(&footer, section)
+        let inspection = summarize(&footer, section)
             .expect("summarize")
             .expect("section present");
+        assert!(inspection.findings.is_empty());
+        let summary = &inspection.summary;
         let named: Vec<(&str, KeyType, u64)> = summary
             .fields
             .iter()
@@ -5750,10 +5752,12 @@ mod tests {
         let footer = open(&obj).expect("open");
         let desc = *footer.section(kind::KEY_IDX).expect("KEY_IDX present");
         let section = &obj[desc.offset as usize..(desc.offset + desc.len) as usize];
-        let summary = summarize(&footer, section)
+        let inspection = summarize(&footer, section)
             .expect("summarize")
             .expect("section present");
-        let named: Vec<(&str, KeyType, u64)> = summary
+        assert!(inspection.findings.is_empty());
+        let named: Vec<(&str, KeyType, u64)> = inspection
+            .summary
             .fields
             .iter()
             .map(|f| (f.name.as_str(), f.key_type, f.entry_count))

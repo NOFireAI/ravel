@@ -312,8 +312,11 @@ pub fn encode_key_idx(fields: &[KeyIdxFieldInput]) -> Result<EncodedKeyIdx, Code
 }
 
 /// [`encode_key_idx`] at an explicit `bucket_bits` (1..=16, the range a reader
-/// accepts). Format writers use [`encode_key_idx`]; this exists so tests and
-/// tools can produce every `bucket_bits` the reader must handle.
+/// accepts). RSPAN's writer calls this directly, at its own fixed
+/// `TRACE_KEY_IDX_BUCKET_BITS` (`ravel_rspan::key_index::encode_trace_key_idx_capped`);
+/// RLOG's writer calls [`encode_key_idx_with`] instead
+/// (`ravel_logseg::key_index::KeyIndexPlan::encode`), passing its own version
+/// byte alongside `KEY_IDX_WRITER_BUCKET_BITS`.
 pub fn encode_key_idx_with_bucket_bits(
     fields: &[KeyIdxFieldInput],
     bucket_bits: u8,

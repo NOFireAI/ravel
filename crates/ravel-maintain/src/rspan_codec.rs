@@ -2403,7 +2403,8 @@ mod tests {
                 let summary = RspanReader::new(bytes, &cfg)
                     .expect("open part")
                     .key_idx_summary()
-                    .expect("KEY_IDX verifies");
+                    .expect("KEY_IDX verifies")
+                    .summary;
                 let records = decode_all(bytes);
                 let mut traces: Vec<[u8; 16]> = records.iter().map(|r| r.trace_id).collect();
                 traces.dedup();
