@@ -1893,9 +1893,11 @@ records now carry.
    language and carries neither attribute. A call that makes two service
    calls, `ravel_search_logs` with `predicates`, writes two records under
    the one id. Text redaction follows `query.engine_language`.
-3. `ravel_find_labels` records its matcher set as `query.text`: each
-   selector in PromQL's canonical form joined by `; `, or `{}` when the
-   call names no selector. The text was empty before.
+3. `ravel_find_labels` records its matcher set as `query.text`: the
+   selectors verbatim, as the caller sent them, joined by `; ` as the
+   HTTP metadata routes join them, or `{}` when the call names no
+   selector. Verbatim, because ADR-0062 records `query.text` as the
+   caller's text. The text was empty before.
 4. `ravel_capabilities` writes no audit record. It answers from
    compile-time facts and the authenticated caller and makes no service
    call, so it reads no tenant data and there is nothing to audit. Its
