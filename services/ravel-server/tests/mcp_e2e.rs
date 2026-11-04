@@ -3042,6 +3042,86 @@ mod with_mcp {
         running.shutdown().await.expect("server stops");
     }
 
+    /// `ravel_query_promql`'s estimate covers the metrics lane only. Over a
+    /// metrics selector it is an upper envelope with nothing unbounded; over
+    /// `ravel_log_lines` the query also spends through the log lane, so every
+    /// component is `null` and named in `unbounded`, and the estimate is not
+    /// called an upper envelope.
+    ///
+    /// FLIP: `estimate_excludes_log_lane` left false on the log lane in
+    /// `prefetch` fails the log query's assertions.
+    #[tokio::test]
+    async fn query_promql_names_every_component_unbounded_when_it_reads_the_log_lane() {
+        let (store, metrics) = instrumented_memory();
+        publish_samples(store.as_ref(), 0, 1, &[(30 * NS_PER_SEC, 1.5)]).await;
+        publish_log_lines(
+            store.as_ref(),
+            &[(10 * NS_PER_SEC, "alpha"), (20 * NS_PER_SEC, "beta two")],
+        )
+        .await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let promql = |query: &str| {
+            serde_json::json!({
+                "query": query,
+                "evaluation_time": (60 * NS_PER_SEC).to_string(),
+            })
+        };
+
+        let (is_error, metric) = call(&client, "ravel_query_promql", promql("m")).await;
+        assert_eq!(is_error, Some(false), "{metric}");
+        assert_eq!(metric["status"], serde_json::json!("ok"), "{metric}");
+        let estimate = &metric["budget"]["estimate"];
+        assert_eq!(estimate["unbounded"], serde_json::json!([]), "{metric}");
+        for field in ["store_requests", "bytes_scanned", "decompressed_bytes"] {
+            assert!(estimate[field].is_u64(), "{field}: {metric}");
+        }
+        assert_eq!(
+            metric["budget"]["estimate_is_upper_envelope"],
+            serde_json::json!(true),
+            "{metric}"
+        );
+
+        let (is_error, logs) = call(
+            &client,
+            "ravel_query_promql",
+            promql("sum(count_over_time(ravel_log_lines[1h]))"),
+        )
+        .await;
+        assert_eq!(is_error, Some(false), "{logs}");
+        assert_eq!(logs["status"], serde_json::json!("ok"), "{logs}");
+        assert_eq!(
+            logs["data"]["rows"],
+            serde_json::json!([[{}, {"ts_ns": ["60000000000"], "value": [2.0]}]]),
+            "{logs}"
+        );
+        let estimate = &logs["budget"]["estimate"];
+        assert_eq!(
+            estimate["unbounded"],
+            serde_json::json!([
+                "estimated_requests",
+                "estimated_store_bytes",
+                "estimated_decompressed_bytes",
+            ]),
+            "{logs}"
+        );
+        for field in ["store_requests", "bytes_scanned", "decompressed_bytes"] {
+            assert!(estimate[field].is_null(), "{field}: {logs}");
+        }
+        assert_eq!(
+            logs["budget"]["estimate_is_upper_envelope"],
+            serde_json::json!(false),
+            "{logs}"
+        );
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
     /// A `COUNT` over `logs` through `ravel_query_sql` counts a line a retry
     /// stored twice as two rows, and `accuracy.lower_bound_count` stays
     /// `false`: the field is reserved, and a count that can include
