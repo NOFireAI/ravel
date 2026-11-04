@@ -568,7 +568,10 @@ fn refusal(class: FailureClass, message: String) -> Refusal {
 mod tests {
     use serde_json::json;
 
+    use ravel_query::EngineConfig;
+
     use super::*;
+    use crate::budget::{McpBudgetConfig, McpRequestBudgets};
     use crate::cursor::{CURSOR_KEY_LEN, CursorKey};
     use crate::envelope::row_cap_sweep::assert_finished_inside_cap;
     use crate::envelope::{MAX_RESPONSE_BYTES_FLOOR, Status};
@@ -1094,7 +1097,7 @@ mod tests {
         (samples, ts, values)
     }
 
-    /// 11,000 one-second steps, the most a range may have.
+    /// The `(action, detail)` of each next step of `envelope`.
     fn steps(envelope: &Envelope) -> Vec<(&str, &str)> {
         envelope
             .next_steps
@@ -1103,6 +1106,7 @@ mod tests {
             .collect()
     }
 
+    /// 11,000 one-second steps, the most a range may have.
     fn range_at_the_step_limit() -> Value {
         range_args(
             START_NS,
@@ -1208,6 +1212,83 @@ mod tests {
         assert_eq!(
             b["samples_omitted"],
             json!((11_000 - b_ts.len()).to_string())
+        );
+    }
+
+    /// `ctx` with `max_response_bytes` asked as `requested` under an
+    /// operator ceiling of 1 MiB.
+    fn under_a_1_mib_ceiling(ctx: &mut ToolContext<'_>, requested: u64) {
+        ctx.budgets = McpRequestBudgets {
+            max_response_bytes: Some(requested),
+            ..McpRequestBudgets::default()
+        }
+        .clamp(
+            &EngineConfig::default(),
+            &McpBudgetConfig {
+                max_response_bytes_ceiling: 1024 * 1024,
+            },
+        );
+    }
+
+    /// Five series of 11,000 samples, about 370 KB each, so a 1 MiB cap
+    /// keeps a prefix and drops rows.
+    fn five_long_series() -> Envelope {
+        let rows: Vec<_> = ["a", "b", "c", "d", "e"]
+            .into_iter()
+            .flat_map(|name| long_series(name, 11_000, wide))
+            .collect();
+        sample_rows(&rows)
+    }
+
+    /// With the operator's ceiling at 1 MiB and `max_response_bytes` at it,
+    /// the byte cap dropping rows advises the tool's own smaller-rows step,
+    /// naming the configured ceiling, not raising a cap that cannot rise.
+    ///
+    /// FLIP: judging the ceiling against the 4 MiB constant advises
+    /// `raise_max_response_bytes` here, which the clamp then undoes.
+    #[test]
+    fn at_a_configured_ceiling_the_byte_cap_advises_smaller_rows() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        under_a_1_mib_ceiling(&mut ctx, 4 * 1024 * 1024);
+        assert_eq!(ctx.budgets.max_response_bytes, 1024 * 1024);
+        let stub = answering(vec![Ok(five_long_series())]);
+
+        let envelope = block_on(run(range_at_the_step_limit(), &ctx, &stub));
+
+        assert!(envelope.presentation.bytes_cap_hit);
+        assert!(envelope.presentation.rows_omitted > 0);
+        assert_eq!(
+            steps(&envelope),
+            [(
+                "widen_step",
+                "the byte cap dropped rows with max_response_bytes at its 1 MiB ceiling; widen \
+                 step or narrow time_range for fewer samples per series, or narrow the query \
+                 for fewer series"
+            )]
+        );
+    }
+
+    /// Below a configured 1 MiB ceiling the same cut advises raising
+    /// `max_response_bytes` up to that ceiling, not up to the 4 MiB default.
+    #[test]
+    fn below_a_configured_ceiling_the_byte_step_names_it() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        under_a_1_mib_ceiling(&mut ctx, MAX_RESPONSE_BYTES_FLOOR);
+        let stub = answering(vec![Ok(five_long_series())]);
+
+        let envelope = block_on(run(range_at_the_step_limit(), &ctx, &stub));
+
+        assert!(envelope.presentation.rows_omitted > 0);
+        assert_eq!(
+            steps(&envelope),
+            [(
+                "raise_max_response_bytes",
+                "the byte cap dropped rows; widen step or narrow time_range for fewer samples \
+                 per series, or narrow the query for fewer series, or raise max_response_bytes \
+                 (up to 1 MiB)"
+            )]
         );
     }
 
