@@ -203,26 +203,27 @@ pub struct ReiReport {
 }
 
 impl ReiReport {
-    /// One line per figure, in key order, then the decision line.
+    /// The selection parameters the run used, one line per figure, in key
+    /// order, then the decision line.
     pub fn lines(&self) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .figures
-            .iter()
-            .map(|f| match self.bands.get(&f.key) {
-                Some(b) => {
-                    let ok = if b[0] <= f.value && f.value <= b[1] {
-                        "ok"
-                    } else {
-                        "MISS"
-                    };
-                    format!(
-                        "rei figure {} = {} band [{}, {}] {ok}",
-                        f.key, f.value, b[0], b[1]
-                    )
-                }
-                None => format!("rei figure {} = {} band none MISS", f.key, f.value),
-            })
-            .collect();
+        let mut out = vec![format!(
+            "rei params df_threshold={} budget_share={} max_gram={}",
+            self.params.df_threshold, self.params.budget_share, self.params.max_gram
+        )];
+        out.extend(self.figures.iter().map(|f| match self.bands.get(&f.key) {
+            Some(b) => {
+                let ok = if b[0] <= f.value && f.value <= b[1] {
+                    "ok"
+                } else {
+                    "MISS"
+                };
+                format!(
+                    "rei figure {} = {} band [{}, {}] {ok}",
+                    f.key, f.value, b[0], b[1]
+                )
+            }
+            None => format!("rei figure {} = {} band none MISS", f.key, f.value),
+        }));
         out.push(self.decision.line.clone());
         out
     }

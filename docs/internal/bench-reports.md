@@ -94,8 +94,10 @@ byte substrings of the corpus's template needles, kept when at most 10% of
 blocks hold them (`--rei-df-threshold`), dropping one a kept shorter
 substring already matches block for block, rarest first under a byte cap of
 5% of the compressed object bytes (`--rei-budget-share`); `--rei-max-gram`
-sets the longest gram (3 to 7). An exact residual scan gives the true holders,
-and an arm that drops a holding block fails the run.
+sets the longest gram (3 to 7). The needles file pins all three per corpus;
+a run passing any other value is refused before the corpus is read, and the
+report's first line states the values it ran with. An exact residual scan
+gives the true holders, and an arm that drops a holding block fails the run.
 
 The needles and every band live in
 `crates/ravel-bench/fixtures/logbody/rei_needles.toml`: per corpus (HDFS, BGL,

@@ -67,13 +67,16 @@ struct Args {
     /// Run the REI arm for this pre-registered corpus.
     #[arg(long, requires = "rei_needles", conflicts_with = "rei_decide")]
     rei_corpus: Option<String>,
-    /// Longest gram the selected arm considers.
+    /// Longest gram the selected arm considers. Must equal the corpus's
+    /// pre-registered max_gram; the run is refused otherwise.
     #[arg(long, default_value_t = DEFAULT_MAX_GRAM)]
     rei_max_gram: usize,
     /// The selected arm keeps a gram held by at most this share of blocks.
+    /// Must equal the corpus's pre-registered df_threshold.
     #[arg(long, default_value_t = DEFAULT_DF_THRESHOLD)]
     rei_df_threshold: f64,
     /// The selected arm's byte cap, as a share of compressed object bytes.
+    /// Must equal the corpus's pre-registered budget_share.
     #[arg(long, default_value_t = DEFAULT_BUDGET_SHARE)]
     rei_budget_share: f64,
     /// Print the overall REI decision over these written reports and exit.

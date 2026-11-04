@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::grams::Pattern;
+use super::grams::{MIN_GRAM, Pattern};
 use super::{ARM_SELECTED, ARMS, TEMPLATE_NEEDLES};
 
 /// An inclusive `[low, high]` band.
@@ -28,6 +28,14 @@ pub struct CorpusSpec {
     pub source: String,
     /// `--block-records` the run must use.
     pub block_records: usize,
+    /// `--rei-df-threshold` the run must use: the selected arm keeps a gram
+    /// held by at most this share of blocks.
+    pub df_threshold: f64,
+    /// `--rei-budget-share` the run must use: the selected index's byte cap
+    /// as a share of the compressed object bytes.
+    pub budget_share: f64,
+    /// `--rei-max-gram` the run must use: the longest gram considered.
+    pub max_gram: usize,
     pub bands: CorpusBands,
     pub needle: Vec<NeedleSpec>,
 }
@@ -151,6 +159,21 @@ impl CorpusSpec {
         let at = |m: String| format!("rei needles: corpus {}: {m}", self.name);
         if self.block_records == 0 {
             return Err(at("block_records is 0".into()));
+        }
+        if !(self.df_threshold > 0.0 && self.df_threshold <= 1.0) {
+            return Err(at(format!(
+                "df_threshold {} is not in (0, 1]",
+                self.df_threshold
+            )));
+        }
+        if !(self.budget_share > 0.0 && self.budget_share <= 1.0) {
+            return Err(at(format!(
+                "budget_share {} is not in (0, 1]",
+                self.budget_share
+            )));
+        }
+        if !(MIN_GRAM..=7).contains(&self.max_gram) {
+            return Err(at(format!("max_gram {} is not in 3..=7", self.max_gram)));
         }
         let templates = self
             .needle
