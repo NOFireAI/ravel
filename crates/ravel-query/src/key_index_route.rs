@@ -398,6 +398,20 @@ pub async fn route(input: RouteInput<'_>) -> Result<(Vec<SegmentRoute>, RouteFig
     route_under(input, ADR_CEILING, &ROUTE_TOTALS).await
 }
 
+/// [`route`] with the part ceiling lowered to `max_parts`, never raised past
+/// the ADR's `P_max`: a test reaches the beyond-ceiling outcome with a
+/// handful of parts instead of a thousand.
+pub async fn route_with_max_parts(
+    input: RouteInput<'_>,
+    max_parts: usize,
+) -> Result<(Vec<SegmentRoute>, RouteFigures), RouteError> {
+    let ceiling = Ceiling {
+        parts: max_parts.min(ADR_CEILING.parts),
+        ..ADR_CEILING
+    };
+    route_under(input, ceiling, &ROUTE_TOTALS).await
+}
+
 /// Owns the leaf reads' accounting for one pass and merges it into the
 /// caller's `keyIndex` handle when dropped, so a pass that errors, or whose
 /// future is dropped mid-probe, still charges every GET it issued.

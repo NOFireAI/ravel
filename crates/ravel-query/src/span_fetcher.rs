@@ -43,7 +43,7 @@
 use std::sync::Arc;
 
 use crate::fetcher::{ReadCache, gate_not_run};
-use crate::key_index_route::LeafRangeReader;
+use crate::key_index_route::{KeySet, KeySetError, LeafRangeReader};
 use crate::phase_accounting::{PhaseAccounting, QueryPhase};
 use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
@@ -2186,6 +2186,12 @@ fn build_span_row(block: &DecodedBlock, row: usize) -> Result<SpanRow, SpanSegEr
         record,
         service_name,
     })
+}
+
+/// The tier-2 router's key set for a `trace_id` lookup: the trace id's key8,
+/// the same one the fold hashes into a spans leaf.
+pub fn trace_key_set(trace_id: &[u8; 16]) -> Result<KeySet, KeySetError> {
+    KeySet::new(TRACE_ID_FIELD, KeyType::Id16, vec![key8_id16(trace_id)])
 }
 
 /// The tier-2 router's [`LeafRangeReader`] for spans: each leaf range goes
