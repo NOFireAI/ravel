@@ -44,6 +44,15 @@ region=${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/nul
 git -C "$repo" cat-file -e "${harness_commit}^{commit}" || { echo "unknown commit $harness_commit" >&2; exit 64; }
 harness_sha=$(git -C "$repo" rev-parse "$harness_commit")
 short=$(git -C "$repo" rev-parse --short=9 "$harness_commit")
+# run.sh refuses a --ravel-source-commit that is not a full 40-character id,
+# and only after the box has built the harness, so resolve it here.
+if git -C "$repo" cat-file -e "${ravel_source_commit}^{commit}" 2>/dev/null; then
+  ravel_source_commit=$(git -C "$repo" rev-parse "${ravel_source_commit}^{commit}")
+fi
+case "$ravel_source_commit" in
+  *[!0-9a-f]*) echo "ravel-source-commit must be a commit in $repo or a full 40-character id" >&2; exit 64;;
+esac
+[ "${#ravel_source_commit}" -eq 40 ] || { echo "ravel-source-commit must be a commit in $repo or a full 40-character id" >&2; exit 64; }
 run_id="mb-${label}-$(date -u +%Y%m%dT%H%M%SZ)-${short}"
 prefix="metricsbench/${run_id}"
 work=$(mktemp -d)
