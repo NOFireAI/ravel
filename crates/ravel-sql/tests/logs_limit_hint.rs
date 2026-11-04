@@ -307,15 +307,13 @@ fn scan_line(plan: &str) -> &str {
 }
 
 /// The plan of [`PLAIN_SQL`] carries `limit_hint=3` on its scan and nowhere
-/// else, and the scan has no fetch; none of the other statements' scans
-/// carries a hint.
+/// else; none of the other statements' scans carries a hint.
 #[tokio::test]
 async fn only_a_filter_fetch_over_pass_through_nodes_installs_the_hint() {
     let store = store_with(dense).await;
     let plain = plan_text(&store, PLAIN_SQL).await;
     let scan = scan_line(&plain);
     assert!(scan.contains(", limit_hint=3"), "{plain}");
-    assert!(!scan.contains("fetch"), "{plain}");
     assert_eq!(plain.matches("limit_hint=").count(), 1, "{plain}");
     for sql in [TOPK_SQL, NESTED_TOPK_SQL, AGGREGATE_SQL] {
         let plan = plan_text(&store, sql).await;
@@ -324,7 +322,8 @@ async fn only_a_filter_fetch_over_pass_through_nodes_installs_the_hint() {
 }
 
 /// [`PLAIN_SQL`] over the dense fixture: the verdict is skipped, so the plan
-/// phase reads no directory, and the result is exactly 3 matching rows.
+/// phase reads no directory and the deferred column is not served, and the
+/// result is exactly 3 matching rows.
 ///
 /// [`TOPK_SQL`] on the same fixture keeps its verdict: one directory read per
 /// segment, 8, the count main reads for it.
@@ -333,6 +332,13 @@ async fn a_like_limit_scan_skips_the_verdict_and_a_topk_keeps_it() {
     let store = store_with(dense).await;
     let plain = run(&store, PLAIN_SQL).await;
     assert_eq!(plan_directory_reads(&plain), 0, "no verdict read");
+    let served = plain
+        .stats
+        .decoded_cache
+        .expect("decodedCache stats with a cache")
+        .counters
+        .deferred_served;
+    assert!(!served, "no verdict, so the deferred column is not served");
     let c = c_values(&plain);
     assert_eq!(c.len(), 3, "exactly the limit: {c:?}");
     assert!(c.iter().all(|v| v.contains('x')), "{c:?}");

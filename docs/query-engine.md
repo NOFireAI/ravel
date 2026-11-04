@@ -5693,6 +5693,14 @@ the flag.
   `a_fitting_contains_scan_on_the_whole_segment_fast_path_is_served`,
   `an_over_cap_contains_scan_on_the_whole_segment_fast_path_is_not_served`,
   `the_fast_path_verdict_reads_directories_once_per_segment_cold_and_nothing_hot`).
+  The exception is a scan under a filter that carries a `LIMIT`, with no
+  `ORDER BY ... LIMIT` above it: the planner gives that scan a limit hint,
+  which never truncates its output, and its partitions open their segments
+  without the verdict, so the plan phase reads no directory and the deferred
+  columns are not served
+  (`a_like_limit_scan_skips_the_verdict_and_a_topk_keeps_it`,
+  `the_hint_does_not_truncate_a_scan_whose_filter_drops_most_rows`,
+  `a_topk_or_an_aggregate_above_the_scan_keeps_the_verdict`).
   Each segment's estimate is memoised on the decoded cache per tenant,
   object and projection, so a hot verdict does no directory read
   (`the_fast_path_verdict_reads_directories_once_per_segment_cold_and_nothing_hot`,
