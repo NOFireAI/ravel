@@ -91,7 +91,7 @@ fn corpus() -> Json {
 }
 
 /// A scripted answer for one query text.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Answer {
     /// The fixed series every correct engine returns.
     Correct,
@@ -113,6 +113,13 @@ enum Answer {
     /// [`Answer::Hang`] on the first `n` requests for the query, then
     /// [`Answer::Correct`].
     HangFirst(usize),
+    /// The fixed correct series, with `data.stats` set to this value (a
+    /// Ravel answer's own cost block, for the `ravel_cost` sidecar tests).
+    WithStats(Json),
+    /// The fixed correct series after a delay of `step_ms` times the
+    /// request's 1-based number for this query, with `data.stats` carrying
+    /// that request's 0-based number as `accounting.request`.
+    Numbered { step_ms: u64 },
 }
 
 #[derive(Clone, Debug)]
@@ -210,7 +217,7 @@ async fn answer(
     } else {
         "range"
     };
-    let scripted = match stub.script.get(&query).copied().unwrap_or(Answer::Correct) {
+    let scripted = match stub.script.get(&query).cloned().unwrap_or(Answer::Correct) {
         Answer::HangFirst(n) if earlier < n => Answer::Hang,
         Answer::HangFirst(_) => Answer::Correct,
         other => other,
@@ -244,12 +251,28 @@ async fn answer(
             tokio::time::sleep(Duration::from_secs(30)).await;
             axum::Json(json!({"status": "success", "data": series("1.5", kind, &params)})).into_response()
         }
+        Answer::Numbered { step_ms } => {
+            tokio::time::sleep(Duration::from_millis(step_ms * (earlier as u64 + 1))).await;
+            let mut data = series("1.5", kind, &params);
+            data["stats"] = json!({"accounting": {"request": earlier}, "phases": []});
+            axum::Json(json!({"status": "success", "data": data})).into_response()
+        }
+        Answer::WithStats(stats) => {
+            let mut data = series("1.5", kind, &params);
+            data["stats"] = stats;
+            axum::Json(json!({"status": "success", "data": data})).into_response()
+        }
     }
 }
 
 async fn spawn_stub(script: &[(&str, Answer)], bearer: Option<&str>) -> (Stub, String) {
     let stub = Stub {
-        script: Arc::new(script.iter().map(|(q, a)| (q.to_string(), *a)).collect()),
+        script: Arc::new(
+            script
+                .iter()
+                .map(|(q, a)| (q.to_string(), a.clone()))
+                .collect(),
+        ),
         bearer: bearer.map(str::to_string),
         requests: Arc::default(),
     };
@@ -1405,6 +1428,251 @@ async fn the_diagnostics_sidecar_records_the_largest_ulp_gap() {
         diverged["max_ulps"].as_u64().expect("aligned") > 1 << 40,
         "{diverged}"
     );
+}
+
+/// Every `ravel_cost` entry for one corpus entry, in no particular order.
+fn ravel_cost_entries<'a>(diagnostics: &'a Json, entry: &str) -> Vec<&'a Json> {
+    diagnostics["ravel_cost"]
+        .as_array()
+        .expect("ravel_cost")
+        .iter()
+        .filter(|c| c["entry"] == entry)
+        .collect()
+}
+
+/// `--diagnostics` carries Ravel's own per-query object-store cost
+/// (ADR-0927's 2026-11-04 amendment, decision 4), read straight off
+/// `data.stats.accounting` and `data.stats.phases` of each answer, one
+/// `ravel_cost` entry per timed repetition.
+///
+/// TO SEE THIS FAIL: record only the first repetition of each pass instead
+/// of every repetition -- the `entries.len()` assertion drops from
+/// `PASSES * REPS` to `PASSES`, and the pass-set assertion still passes,
+/// so the length check is the one that catches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_cost_records_every_repetitions_accounting_and_phases() {
+    let mut s = stubs().await;
+    let accounting = json!({"s3GetRequests": 7, "s3GetBytes": 4096, "s3ListRequests": 1});
+    let phases = json!([{"phase": "scan", "s3GetRequests": 7, "s3GetBytes": 4096}]);
+    let stats = json!({"accounting": accounting, "phases": phases});
+    let (ravel, r) = spawn_stub(
+        &[(GAUGE, Answer::WithStats(stats.clone()))],
+        Some(RAVEL_TOKEN),
+    )
+    .await;
+    s.ravel = ravel;
+    s.urls.ravel = r;
+    let run = run_bin_corpus(ingest_report(&s.urls), &s.urls, 0, &[], &corpus(), true).await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    assert_eq!(
+        row(&report, Engine::Ravel, "mb_single_gauge_instant").status,
+        ResultStatus::Ok
+    );
+
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    assert!(
+        d["ravel_cost_note"]
+            .as_str()
+            .expect("note")
+            .contains("logical"),
+        "{}",
+        d["ravel_cost_note"]
+    );
+    let entries = ravel_cost_entries(&d, "mb_single_gauge_instant");
+    assert_eq!(entries.len(), (PASSES * REPS) as usize, "{entries:?}");
+    let mut passes: Vec<u64> = entries
+        .iter()
+        .map(|c| c["pass"].as_u64().expect("pass"))
+        .collect();
+    passes.sort_unstable();
+    passes.dedup();
+    assert_eq!(passes, (1..=u64::from(PASSES)).collect::<Vec<_>>());
+    for c in &entries {
+        assert_eq!(c["status"], "ok", "{c}");
+        assert_eq!(c["accounting"], stats["accounting"], "{c}");
+        assert_eq!(c["phases"], stats["phases"], "{c}");
+    }
+}
+
+/// `ravel_cost` is Ravel's alone, never a comparator's: the corpus' four
+/// entries by Ravel's one engine, over every timed pass and repetition.
+///
+/// TO SEE THIS FAIL: push a `ravel_cost` entry for every engine instead of
+/// Ravel only -- the length below would be four times the asserted value
+/// (one multiple per comparator engine the corpus runs against).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_cost_excludes_comparator_answers() {
+    let s = stubs().await;
+    let run = run_bin_corpus(ingest_report(&s.urls), &s.urls, 0, &[], &corpus(), true).await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    // `MetricsBenchReport` denies unknown fields, so this parse alone proves
+    // the sidecar's new field never leaked into report.json.
+    let _: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    let cost = d["ravel_cost"].as_array().expect("ravel_cost");
+    assert_eq!(cost.len(), 4 * (PASSES * REPS) as usize, "{cost:?}");
+}
+
+/// A Ravel answer with no `data.stats` at all -- here, a timeout -- still
+/// gets a `ravel_cost` entry, with `accounting` and `phases` null and its
+/// real status, never silently omitted.
+///
+/// TO SEE THIS FAIL: skip the `ravel_cost` push when the answer carries no
+/// `data.stats` instead of recording the nulls -- the `entries.len()`
+/// assertion drops to zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_cost_records_null_on_an_answer_with_no_stats() {
+    let mut s = stubs().await;
+    let (ravel, r) = spawn_stub(&[(COUNTER_RATE, Answer::Hang)], Some(RAVEL_TOKEN)).await;
+    s.ravel = ravel;
+    s.urls.ravel = r;
+    let run = run_bin_corpus(ingest_report(&s.urls), &s.urls, 0, &[], &corpus(), true).await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    assert_eq!(
+        row(&report, Engine::Ravel, "mb_single_counter_rate").status,
+        ResultStatus::Timeout
+    );
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    let entries = ravel_cost_entries(&d, "mb_single_counter_rate");
+    assert_eq!(entries.len(), (PASSES * REPS) as usize, "{entries:?}");
+    for c in &entries {
+        assert_eq!(c["status"], "timeout", "{c}");
+        assert_eq!(c["accounting"], Json::Null, "{c}");
+        assert_eq!(c["phases"], Json::Null, "{c}");
+    }
+}
+
+/// The 0-based request number a [`Answer::Numbered`] answer stamped on a
+/// `ravel_cost` record.
+fn request_number(c: &Json) -> u64 {
+    c["accounting"]["request"].as_u64().expect("request")
+}
+
+/// Warm-up passes add nothing to `ravel_cost`, and `pass` and `rep` count
+/// from 1: with one warm-up pass, the records for an entry are exactly the
+/// timed requests, the first timed request is pass 1 rep 1, and every
+/// (pass, rep) in `1..=PASSES` x `1..=REPS` appears once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_cost_skips_warmup_passes_and_counts_from_one() {
+    let mut s = stubs().await;
+    let (ravel, r) = spawn_stub(
+        &[(GAUGE, Answer::Numbered { step_ms: 1 })],
+        Some(RAVEL_TOKEN),
+    )
+    .await;
+    s.ravel = ravel;
+    s.urls.ravel = r;
+    let run = run_bin_corpus(
+        ingest_report(&s.urls),
+        &s.urls,
+        WARMUP,
+        &[],
+        &corpus(),
+        true,
+    )
+    .await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    let entries = ravel_cost_entries(&d, "mb_single_gauge_instant");
+    assert_eq!(entries.len(), (PASSES * REPS) as usize, "{entries:?}");
+    let mut seen: Vec<(u64, u64, u64)> = entries
+        .iter()
+        .map(|c| {
+            (
+                c["pass"].as_u64().expect("pass"),
+                c["rep"].as_u64().expect("rep"),
+                request_number(c),
+            )
+        })
+        .collect();
+    seen.sort_unstable();
+    let expected: Vec<(u64, u64, u64)> = (1..=u64::from(PASSES))
+        .flat_map(|pass| {
+            (1..=u64::from(REPS)).map(move |rep| {
+                let warmup_requests = u64::from(WARMUP * REPS);
+                (
+                    pass,
+                    rep,
+                    warmup_requests + (pass - 1) * u64::from(REPS) + (rep - 1),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(seen, expected);
+}
+
+/// Each `ravel_cost` record's `latency_ms` is that repetition's own elapsed
+/// time: the stub delays request `n` (from 1) by `n * 50` ms, so every record
+/// is at least its own request's delay, and the median of a pass's records
+/// equals the pass median `report.json` carries for that pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ravel_cost_latency_is_the_repetitions_own() {
+    const STEP_MS: u64 = 50;
+    let mut s = stubs().await;
+    let (ravel, r) = spawn_stub(
+        &[(GAUGE, Answer::Numbered { step_ms: STEP_MS })],
+        Some(RAVEL_TOKEN),
+    )
+    .await;
+    s.ravel = ravel;
+    s.urls.ravel = r;
+    let run = run_bin_corpus(ingest_report(&s.urls), &s.urls, 0, &[], &corpus(), true).await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    let ravel_row = row(&report, Engine::Ravel, "mb_single_gauge_instant");
+    assert_eq!(ravel_row.status, ResultStatus::Ok);
+    assert_eq!(ravel_row.pass_medians_ms.len(), PASSES as usize);
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    let entries = ravel_cost_entries(&d, "mb_single_gauge_instant");
+    assert_eq!(entries.len(), (PASSES * REPS) as usize, "{entries:?}");
+    for c in &entries {
+        let latency = c["latency_ms"].as_f64().expect("latency_ms");
+        let floor = (STEP_MS * (request_number(c) + 1)) as f64;
+        assert!(
+            latency >= floor,
+            "{c}: below its own request's {floor} ms delay"
+        );
+    }
+    for pass in 1..=u64::from(PASSES) {
+        let mut latencies: Vec<f64> = entries
+            .iter()
+            .filter(|c| c["pass"] == pass)
+            .map(|c| c["latency_ms"].as_f64().expect("latency_ms"))
+            .collect();
+        latencies.sort_by(f64::total_cmp);
+        assert_eq!(latencies.len(), REPS as usize, "pass {pass}");
+        let mid = latencies.len() / 2;
+        let median = if latencies.len().is_multiple_of(2) {
+            (latencies[mid - 1] + latencies[mid]) / 2.0
+        } else {
+            latencies[mid]
+        };
+        // serde_json's default float parse can land one ULP off the
+        // written value, so this compares to a relative 1e-12, far below the
+        // 50 ms gap between two repetitions.
+        let reported = ravel_row.pass_medians_ms[(pass - 1) as usize];
+        assert!(
+            (median - reported).abs() <= reported.abs() * 1e-12,
+            "pass {pass}: {latencies:?} vs {:?}",
+            ravel_row.pass_medians_ms
+        );
+    }
 }
 
 /// An ingest report whose row failed its read-back binds no query run: the

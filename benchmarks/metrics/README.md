@@ -1094,6 +1094,28 @@ step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
   representable steps on the ordered bit line, `-0.0` and `0.0` being one
   point, and two NaNs are 0 apart (`ulp_distance_*` tests in
   `crates/ravel-promql-difftest/src/comparator.rs`).
+- `ravel_cost`: Ravel's own per-query object-store cost, read from each
+  Ravel answer's `data.stats` (ADR-0927's 2026-11-04 amendment, decision 4;
+  `metrics_query::RavelCost`). It is recorded here and never in
+  `report.json`. Each object carries `entry`, `pass`, `rep`, `status`,
+  `latency_ms`, `accounting` and `phases`. There is one object per timed
+  repetition of every pass, never summed or pooled across repetitions
+  (`ravel_cost_records_every_repetitions_accounting_and_phases`); `pass` and
+  `rep` count from 1 and warm-up passes add nothing
+  (`ravel_cost_skips_warmup_passes_and_counts_from_one`). `latency_ms` is
+  that repetition's own elapsed time, the figure its pass median in
+  `report.json` is computed from
+  (`ravel_cost_latency_is_the_repetitions_own`). `accounting` and `phases`
+  are `data.stats.accounting` and `data.stats.phases` copied as returned.
+  Comparator engines (Prometheus, VictoriaMetrics, Mimir) add nothing here
+  (`ravel_cost_excludes_comparator_answers`). An answer with no
+  `data.stats`, such as a timeout, still records its object, with
+  `accounting` and `phases` both `null`
+  (`ravel_cost_records_null_on_an_answer_with_no_stats`). The figures are
+  descriptive: no band or exit status reads them.
+- `ravel_cost_note`: a fixed string stating that the `ravel_cost` figures
+  are logical object-store call counts as the query engine counted them,
+  not billed provider requests (ADR-0927 decision 8).
 
 ```json
 {
@@ -1110,6 +1132,15 @@ step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
   ],
   "oracle_retries": [
     {"entry": "mb_single_gauge_instant", "pass": 1, "repetition": 1, "attempt": 2}
-  ]
+  ],
+  "ravel_cost": [
+    {"entry": "mb_single_counter_rate", "pass": 1, "rep": 1, "status": "ok",
+     "latency_ms": 12.4,
+     "accounting": {"s3GetRequests": 7, "s3GetBytes": 4096, "s3ListRequests": 1},
+     "phases": [{"phase": "scan", "s3GetRequests": 7, "s3GetBytes": 4096}]},
+    {"entry": "mb_single_counter_rate", "pass": 1, "rep": 2, "status": "timeout",
+     "latency_ms": 1000.9, "accounting": null, "phases": null}
+  ],
+  "ravel_cost_note": "ravel_cost figures are logical object-store call counts as the query engine counted them, not billed provider requests (ADR-0927 decision 8), one record per timed repetition, never summed or pooled across repetitions"
 }
 ```
