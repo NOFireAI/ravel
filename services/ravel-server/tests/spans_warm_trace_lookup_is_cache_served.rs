@@ -41,7 +41,7 @@ const NS_PER_HOUR: i64 = 3_600 * NS_PER_SEC;
 const NOW_NS: i64 = 4 * NS_PER_HOUR;
 
 /// The trace the lookups ask for. The writer orders spans by trace id, so the
-/// lowest id lands in the first block, far ahead of the 64 KiB tail probe.
+/// lowest id lands in the first block, far ahead of the 8 KiB footer suffix.
 const TARGET_TRACE: [u8; 16] = [1; 16];
 const TRACES: u8 = 40;
 const SPANS_PER_TRACE: u8 = 4;
@@ -346,7 +346,7 @@ async fn spans_warm_trace_lookup_is_cache_served() {
     }
     assert!(
         cold_gets.contains(&GetRange::Range(size - probe, size)),
-        "the first GET is the 64 KiB tail probe: {cold_gets:?}"
+        "the first GET is the 8 KiB footer suffix: {cold_gets:?}"
     );
     // A block-run GET lies inside the BLOCKS section; the probe, a footer
     // chase, and a SKIP_IDX or BLOOM read all reach past it.

@@ -919,9 +919,8 @@ switch amendment describes. Every process that runs a fold for a tenant
 (a maintain-mode process, and a query-mode process serving on-demand
 folds) should agree on the switch: a fold without it writes the re-encoded tail
 without refs; `ravel-cli catalog fold --rebuild-key-index` (under
-"Rollout") attaches them afterwards. One part is proposed and marked so
-below: the query path ("Reader", no query probes a leaf yet). The task
-that lands it removes its marker.
+"Rollout") attaches them afterwards. The query path ("Reader") probes the leaves for a spans `trace_id`
+lookup; the logs lookup does not probe them yet.
 
 The codec is `ravel_catalog::snapshot_format::kidx`, re-exported at the
 crate root: `encode_key_index_leaf` (choosing `bucket_bits` with
@@ -1034,8 +1033,8 @@ the part. The reader subtracts exactly those from coverage and scans them
 Coverage is read from the leaf header and never inferred from the tenant's
 current declaration.
 
-**Reader (proposed: `ravel_query::key_index_route` implements it, and no
-query path calls the router yet).** For a lookup on
+**Reader (`ravel_query::key_index_route`; the spans `trace_id` lookup
+calls it, ADR-3692 decision 3).** For a lookup on
 `field = value`, the resolve narrows HEAD's parts
 to the window as `load_snapshot` does; a lookup with no time bound covers
 every part. A (part, field)'s slices tile the whole `key8` space: a single
@@ -1078,7 +1077,12 @@ entries plus every uncovered segment: the entries a leaf lists as
 uncovered, every part without a leaf for the field, every leaf that failed
 validation, every part the ceilings left unprobed, every segment above the
 watermark (the unsealed tail, listed) and every token-resolved segment,
-each of which the tier-1 probe may still prune.
+each of which the tier-1 probe may still prune. The spans provider
+(`SpansTableProvider`, docs/query-engine.md, "Tier-2 router") drops a
+`Pruned` segment before any of its bytes are read, hands a `Blocks`
+segment's block set to the fetcher, which then reads the segment's footer
+suffix, SKIP_IDX and block runs and no KEY_IDX, and sends an `Uncovered`
+segment to the tier-1 probe.
 
 A key set of 1 to 1,024 keys (`IN`, ADR-3692 decision 2) issues GET 1 once
 per (part, slice) the set touches. A part's worst case, admitted against
@@ -1089,10 +1093,11 @@ part that did not fit is evaluated again, so the admitted set is the one
 sequential evaluation would give. When the set touches at most `B_run`
 non-empty buckets of a slice, each is one GET 2. Above `B_run`, the buckets
 are sorted by body offset and the smallest gaps between them are bridged
-until at most `B_run` ranged reads remain; the bridged gap bytes are read
-and discarded, and the read is taken only when they total at most
-`entry_count x KEY_INDEX_T1_BYTES` (11 KiB) for the part, the tier-1 cost
-the part's segments would otherwise pay. Otherwise the part is uncovered
+until at most `B_run` ranged reads remain; the gap bytes are read and
+discarded, and the read is taken only when the bridged runs, bucket bytes
+and gap bytes together, total at most `entry_count x KEY_INDEX_T1_BYTES`
+(11 KiB) for the part, the tier-1 cost the part's segments would otherwise
+pay. The allowance is the part's, shared by every slice the set touches. Otherwise the part is uncovered
 for the statement and no further leaf byte is read. Before a frame is
 decoded, its decoded bound (`decoded_bound`, `8 x uncompressed_len + 64`
 bytes) is reserved through the statement's memory handle; a refused

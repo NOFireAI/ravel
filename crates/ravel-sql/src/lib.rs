@@ -176,10 +176,10 @@ pub use error::{
     MSG_SPILL_QUOTA_MARKER, MSG_SPILL_UNAVAILABLE, MSG_UNAVAILABLE, MSG_UNSATISFIABLE, SqlError,
 };
 pub use executor::{
-    AnalyzedRun, DecodedCacheStats, ExplainReport, HISTOGRAM_EXCLUDED_WARNING, LiveAccounting,
-    ParquetPlan, PhaseWallTiming, PinnedLanes, PinnedPlanInputs, PinnedQuery, PinnedResolve,
-    PinnedStream, ScanTiming, SegmentTiming, SignalStats, SqlExecutor, SqlOutcome, SqlRequest,
-    SqlStats, TargetSignal, refuse_several_tables, segment_set_keys,
+    AnalyzedRun, DecodedCacheStats, ExplainReport, HISTOGRAM_EXCLUDED_WARNING, KeyIndexStats,
+    LiveAccounting, ParquetPlan, PhaseWallTiming, PinnedLanes, PinnedPlanInputs, PinnedQuery,
+    PinnedResolve, PinnedStream, ScanTiming, SegmentTiming, SignalStats, SqlExecutor, SqlOutcome,
+    SqlRequest, SqlStats, TargetSignal, refuse_several_tables, segment_set_keys,
 };
 #[cfg(feature = "flight-sql")]
 pub use flight::{

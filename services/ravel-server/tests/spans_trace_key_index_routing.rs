@@ -49,9 +49,9 @@ const NOW_NS: i64 = 4 * NS_PER_HOUR;
 const RESHARD_2_TO_3: &[(u32, u32)] = &[(2, 0), (3, 1)];
 const TENANT: &str = "acme";
 const TOKEN: &str = "acme-token";
-/// Single-span traces per object. Enough blocks that the SKIP_IDX section
-/// and the footer past KEY_IDX exceed the fetcher's 64 KiB tail probe, so
-/// every KEY_IDX read is a GET of its own.
+/// Single-span traces per object. Enough blocks that KEY_IDX and SKIP_IDX lie
+/// before the fetcher's 8 KiB footer suffix, so every KEY_IDX and SKIP_IDX
+/// read is a GET of its own.
 const DECOYS: u64 = 2_400;
 const BLOCK_RECORDS: usize = 4;
 
@@ -255,8 +255,12 @@ async fn publish_object(
 /// The reads a trace lookup must issue on one object it keeps, per phase.
 #[derive(Debug, Default)]
 struct ExpectedReads {
+    /// The footer suffix.
     probe: Vec<GetRange>,
     key_index: Vec<GetRange>,
+    /// SKIP_IDX, read on the probe phase only once KEY_IDX says the trace is
+    /// present.
+    skip: Vec<GetRange>,
     scan: Vec<GetRange>,
     present: bool,
     /// The lowest section offset: every block lies before it.
@@ -267,6 +271,7 @@ impl ExpectedReads {
     fn all(&self) -> Vec<GetRange> {
         let mut all = self.probe.clone();
         all.extend(self.key_index.iter().copied());
+        all.extend(self.skip.iter().copied());
         all.extend(self.scan.iter().copied());
         all
     }
@@ -280,11 +285,11 @@ fn len(range: &GetRange) -> u64 {
 }
 
 /// The fetcher's ranged trace path over `bytes`, recomputed from the format
-/// crate: the tail probe, SKIP_IDX unless the probe holds it, the KEY_IDX
-/// reads `RspanRangeReader::probe_trace` asks for, and the trace's block run
-/// when KEY_IDX says it is present. Also asserts the fixture geometry the
+/// crate: the footer suffix, the KEY_IDX reads `RspanRangeReader::probe_trace`
+/// asks for, and, when KEY_IDX says the trace is present, SKIP_IDX unless the
+/// suffix holds it and the trace's block run. Also asserts the fixture geometry the
 /// exact counts rest on: SKIP_IDX keeps a block for `trace`, so KEY_IDX is
-/// probed, and no KEY_IDX or block read falls inside the tail probe, so each
+/// probed, and no KEY_IDX or block read falls inside the footer suffix, so each
 /// is a GET.
 fn expected_reads(bytes: &Bytes, trace: &[u8; 16]) -> ExpectedReads {
     let size = bytes.len() as u64;
@@ -295,7 +300,7 @@ fn expected_reads(bytes: &Bytes, trace: &[u8; 16]) -> ExpectedReads {
     let key_idx = *footer.section(kind::KEY_IDX).expect("KEY_IDX");
     assert!(
         key_idx.offset + key_idx.len <= probe_start,
-        "fixture geometry: KEY_IDX [{}, {}) lies before the tail probe at {probe_start}",
+        "fixture geometry: KEY_IDX [{}, {}) lies before the footer suffix at {probe_start}",
         key_idx.offset,
         key_idx.offset + key_idx.len
     );
@@ -309,11 +314,6 @@ fn expected_reads(bytes: &Bytes, trace: &[u8; 16]) -> ExpectedReads {
             .expect("sections"),
         ..ExpectedReads::default()
     };
-    if skip.offset < probe_start {
-        reads
-            .probe
-            .push(GetRange::Range(skip.offset, skip.offset + skip.len));
-    }
     let skip_raw =
         ravel_rspan::read_section(bytes, &skip, DEFAULT_MAX_SECTION_UNCOMP).expect("SKIP_IDX");
     let reader = RspanRangeReader::from_sections(&footer, &skip_raw).expect("range reader");
@@ -334,6 +334,11 @@ fn expected_reads(bytes: &Bytes, trace: &[u8; 16]) -> ExpectedReads {
         TraceKeyProbe::Absent => {}
         TraceKeyProbe::Present(_) => {
             reads.present = true;
+            if skip.offset < probe_start {
+                reads
+                    .skip
+                    .push(GetRange::Range(skip.offset, skip.offset + skip.len));
+            }
             let run = reader
                 .trace_block_span(trace)
                 .expect("block span")
@@ -527,7 +532,7 @@ fn bracket(trace: &[u8; 16]) -> Vec<([u8; 16], &'static str)> {
 /// the trace is absent, so they read no block, and only the holder reads the
 /// trace's run.
 ///
-/// FLIP: `blocks.is_none() && !candidate_idx.is_empty()` to `false` in
+/// FLIP: `if blocks.is_none()` to `if false` before the tier-1 probe in
 /// `ranged_trace_scan` (no probe) issues no KEY_IDX read and reads a block
 /// run from every object.
 #[tokio::test]
@@ -578,7 +583,7 @@ async fn trace_lookup_on_a_folded_tenant_reads_index_buckets_and_the_trace_block
         assert_eq!(
             got,
             want.all(),
-            "{}: the tail probe, SKIP_IDX, the KEY_IDX reads, and the trace's run only",
+            "{}: the footer suffix, the KEY_IDX reads, and SKIP_IDX and the trace's run only where present",
             object.key
         );
         if !want.present {
@@ -621,7 +626,10 @@ async fn trace_lookup_on_a_folded_tenant_reads_index_buckets_and_the_trace_block
         len(&scan[0]),
         "{value}"
     );
-    let probe: Vec<GetRange> = want.iter().flat_map(|r| r.probe.clone()).collect();
+    let probe: Vec<GetRange> = want
+        .iter()
+        .flat_map(|r| r.probe.iter().chain(&r.skip).copied())
+        .collect();
     assert_eq!(
         phase(&value, "probe", "s3GetRequests"),
         probe.len() as u64,
