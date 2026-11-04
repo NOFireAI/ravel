@@ -3253,6 +3253,37 @@ class Box(Workdir):
         self.assertIn("run.sh: FAILED step=load-base: load base/logs exit 3 (log out/logs/load-base-logs.out)", text)
         self.assertNotIn("STEP state:", text)
 
+    def fold_advance_failed_dry_run(self, script=None):
+        p = subprocess.run([BASH, script or os.path.join(BOX, "run.sh"), "--dry-run", "--lane", "s3", "--run-toml",
+                            os.path.join(BOX, "run.example.toml"), "--out", self.path("out")],
+                           capture_output=True, text=True,
+                           env=dict(os.environ, INV_DRY_RUN_FAIL="fold-fold_advance-spans"))
+        return p.returncode, p.stdout + p.stderr
+
+    def test_failed_fold_advance_is_recorded_against_fold_advance(self):
+        # The fold that seals the mixed state's tail hour is fold_advance's,
+        # the derived state, as its deadline check records it. Recorded
+        # against mixed it would discard mixed's measured figures and every
+        # row that requires mixed live (row 13 among them), although mixed
+        # ran fine; recorded against fold_advance it loses only the figures
+        # that depend on the fold. The run still goes on with the next state.
+        code, text = self.fold_advance_failed_dry_run()
+        self.assertEqual(code, 0, text)
+        self.assertIn("STATE-FAILED fold_advance: fold fold_advance/spans exit 3 "
+                      "(log out/logs/fold-fold_advance-spans.out); the run goes on", text)
+        self.assertNotIn("STATE-FAILED mixed", text)
+        steps = self.steps(text)
+        self.assertIn("state:compaction_in_flight", steps[steps.index("state:mixed"):])
+        self.assertEqual(steps[-2:], ["evaluate", "finish"])
+        flipped, line = self.flipped_box(
+            "  fold fold_advance --key-index-leaves || { STATE=fold_advance; return 1; }\n",
+            "  fold fold_advance --key-index-leaves || return 1\n")
+        code, text = self.fold_advance_failed_dry_run(flipped)
+        self.assertEqual(code, 0, text)
+        self.assertIn("STATE-FAILED mixed: fold fold_advance/spans exit 3", text)
+        print(f"flip 'a failed fold_advance is recorded against mixed' at box/run.sh:{line + 1} fails "
+              f"test_failed_fold_advance_is_recorded_against_fold_advance", file=sys.stderr)
+
     def sourced_states(self, script=None):
         """run.sh sourced, outside a dry run, with a ravel-cli stub that
         prints its arguments and exits 7: the folded_no_leaves and

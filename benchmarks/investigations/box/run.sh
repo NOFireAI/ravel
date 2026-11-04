@@ -775,7 +775,7 @@ census() {
     run "$PY" "$LIB" s3 census "${tenants[@]}" --out "$f" || fail "census $state"
   else
     run aws s3api list-objects-v2 --region "$REGION" --bucket "$STORE_BUCKET" --output json \
-      >"$WORK/listing-$state.json" || fail "list store_bucket for census $state"
+      >"$WORK/listing-$state.json" || fail_log "list store_bucket for census $state" "$WORK/listing-$state.json"
     run "$PY" "$LIB" census-listing --listing "$WORK/listing-$state.json" --bucket "$STORE_BUCKET" \
       "${tenants[@]}" --out "$f" || fail "census $state"
   fi
@@ -1078,7 +1078,11 @@ state_mixed() {
   census mixed
   statements mixed
   fits fold_advance fold "$(estimate_s mixed)" || return 0
-  fold fold_advance --key-index-leaves || return 1
+  # A failed fold here is fold_advance's, the derived state (as the deadline
+  # check above records it), not mixed's: mixed already measured, and a
+  # failure recorded against it would discard its figures and every row
+  # that requires mixed live.
+  fold fold_advance --key-index-leaves || { STATE=fold_advance; return 1; }
   transition fold_advance "the fold that seals the mixed state's tail hour"
   census fold_advance
   return 0

@@ -105,10 +105,24 @@ while :; do
   [ "$(date +%s)" -lt "$deadline" ] || break
   sleep "$INTERVAL"
 done
+# Names the failed states and the failed commands' logs the download holds,
+# for a complete prefix and a --partial one alike.
+print_failures() {
+  if [ -s "$DEST/stamps/failed_states.jsonl" ]; then
+    echo "fetch: failed states (stamps/failed_states.jsonl):" >&2
+    cat "$DEST/stamps/failed_states.jsonl" >&2
+  fi
+  if [ -d "$DEST/logs" ]; then
+    echo "fetch: failed commands' logs under $DEST/logs/:" >&2
+    ls "$DEST/logs" >&2
+  fi
+}
+
 if [ -z "$marker" ] && [ "$PARTIAL" = 1 ]; then
   mkdir -p "$DEST"
   aws_call s3 cp --only-show-errors --recursive "$URI/" "$DEST/" || { echo "fetch: download of $URI failed" >&2; exit 1; }
   echo "fetch: PARTIAL: no DONE or FAILED under $URI; downloaded what is there to $DEST" >&2
+  print_failures
   exit 3
 fi
 if [ -z "$marker" ]; then
@@ -118,14 +132,7 @@ fi
 
 mkdir -p "$DEST"
 aws_call s3 cp --only-show-errors --recursive "$URI/" "$DEST/" || { echo "fetch: download of $URI failed" >&2; exit 1; }
-if [ -s "$DEST/stamps/failed_states.jsonl" ]; then
-  echo "fetch: failed states (stamps/failed_states.jsonl):" >&2
-  cat "$DEST/stamps/failed_states.jsonl" >&2
-fi
-if [ -d "$DEST/logs" ]; then
-  echo "fetch: failed commands' logs under $DEST/logs/:" >&2
-  ls "$DEST/logs" >&2
-fi
+print_failures
 if [ "$marker" = FAILED ]; then
   cat "$DEST/FAILED" >&2
   exit 1
