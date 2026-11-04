@@ -28,7 +28,7 @@ cores (#3819).
 of its inputs before the next one starts. For each stream it opens a new
 `StreamCursor` on every input that carries that stream. The cursor GETs the
 stream's location (`rlog.rs:2549`), and a location names the whole row group
-(`crates/ravel-logseg/src/ranged.rs:85-95`, ADR-0699 decision 2), so every
+(`crates/ravel-logseg/src/ranged.rs:85-95`, ADR-0699 decision 1), so every
 stream's cursor downloads the same bytes. Nothing keeps them between streams.
 The writer cuts blocks on a record count or a byte estimate, never at a stream
 boundary (`crates/ravel-logseg/src/writer.rs:1646-1666`), so each block holds
@@ -104,13 +104,24 @@ merge is a hard abort today (`MergeCursorBudgetExceeded`,
 block is fetched, from the PAGE_DIR sizes the catalog phase already holds,
 and the merge logs which path it took and the sum it compared.
 
-The resident ceiling is `merge_cursor_budget_bytes` divided by
-`--maintain-unit-concurrency`. The budget is per merge, and ravel-server
-passes it once for all of its concurrent merges
-(`crates/ravel-maintain/src/config.rs:659-664`), so without the division
-four merges could each hold their inputs resident. This bounds the resident
-term per process. It is not a cross-merge admission scheme: a shared budget
-that merges wait on is #3825.
+The resident ceiling is a new resolved input on `CompactorConfig`,
+`merge_resident_ceiling_bytes`. The merge reads it and computes nothing
+about concurrency itself. Each entry point resolves it from what it already
+knows, the way ravel-server resolves the part memory target
+(`services/ravel-server/src/config.rs:8605-8620`):
+
+| entry point | concurrent merges | `merge_resident_ceiling_bytes` |
+|---|---|---|
+| `ravel-server --mode maintain` | `--maintain-unit-concurrency` (default 4) | `merge_cursor_budget_bytes` / that concurrency: 5 GiB at the defaults |
+| `ravel-cli maintain compact-tenant` | `--bucket-concurrency` | the per-bucket `merge_cursor_budget_bytes` it already sets (`services/ravel-cli/src/maintain.rs:823`), with no second division |
+| `ravel-cli maintain compact-bucket` | 1 | `merge_cursor_budget_bytes` |
+| library default | 1 | `merge_cursor_budget_bytes` |
+
+The budget is per merge, and ravel-server passes it once for all of its
+concurrent merges (`crates/ravel-maintain/src/config.rs:659-664`). Without
+the division, four merges could each hold their inputs resident. This
+bounds the resident term per process. It is not a cross-merge admission
+scheme: a shared budget that merges wait on is #3825.
 
 ### D2. Emit in stream-range passes, decoding each block once per pass
 
@@ -145,6 +156,14 @@ bytes when D1 holds them, and fetches as today otherwise. This keeps
 ADR-0065 decision 4's bound for one hot stream, the 45.7 GB case #711 fixed:
 no path gathers a whole stream's rows.
 
+ADR-0065 decision 4 states that bound on the `MergeMemoryTracker`. Its
+transient term is at most one decoded block, plus the raw bytes of the row
+groups being decoded, per input. D1's resident bytes are not counted under
+that term. They are a separate `resident` term, at most
+`merge_resident_ceiling_bytes`, which the tracker records on its own. The
+transient term's bound and its independence from stream size stay exactly
+as ADR-0065 decision 4 states them.
+
 ### Commitments and their tests
 
 <!-- band-sources-allow: these are acceptance commitments of this ADR, predicted until the implementation measures them -->
@@ -152,9 +171,9 @@ no path gathers a whole stream's rows.
 |---|---|---|
 | L1 parts are byte-identical to today's | same keys and bytes on three fixtures: many-stream (N ≥ 50 inputs, S ≥ 200 streams per input, unkeyed); one hot stream; and clustered inputs at W above 1 with one stream whose per-bucket reservation sum exceeds the budget, so that ADR-2135 batching runs | a golden comparison against the current merge |
 | block fetches per input row group | exactly 1 with D1 and exactly P with the per-pass fallback, counted per (object, row-group range) | a counting `MemoryStore`. It must fail against a per-cursor cache (still N × S) and against a small LRU of row groups (thrashes, because every group spans the whole stream range) |
-| hot-stream memory | unchanged | `peak_memory_on_rlog_input_bucket` (`crates/ravel-maintain/tests/memory.rs:129`), plus the same hot stream inside a many-stream bucket |
-| resident path choice | the merge takes fetch-per-pass whenever raw bytes plus one pass plus the worst-case D3 charge exceed `merge_cursor_budget_bytes` / `--maintain-unit-concurrency`, and never aborts with `MergeCursorBudgetExceeded` where today's merge completes | a fixture sized just over and just under the ceiling, with a D3 range present |
-| this fixture, hours 08 and 09 | GETs per merge at most 1.1 × (N × catalog GETs + N); wall time within 10 × the fetch time at `k` in flight | measured on run 2's bucket, which is kept (predicted) |
+| hot-stream memory | the tracker's transient term stays under ADR-0065 decision 4's bound and does not grow with the stream; the separate `resident` term stays at most `merge_resident_ceiling_bytes` | `merge_peak_memory_is_bounded_independently_of_stream_size` (`crates/ravel-maintain/src/rlog.rs:7426`), extended to assert the resident term, plus the same hot stream inside a many-stream bucket |
+| resident path choice | the merge takes fetch-per-pass whenever raw bytes plus one pass plus the worst-case D3 charge exceed `merge_resident_ceiling_bytes`, and never aborts with `MergeCursorBudgetExceeded` where today's merge completes | a fixture sized just over and just under the ceiling, with a D3 range present; plus one test per entry point that it passes the ceiling the D1 table states |
+| this fixture, hours 08 and 09 | the band follows the path each run's logged decision line names. Resident: GETs per merge at most 1.1 × (N × catalog GETs + N row groups). Fetch-per-pass: at most 1.1 × (N × catalog GETs + P × N row groups), with P logged. Either way, wall time within 10 × that run's own fetch time at `k` in flight. Run once with `ravel-cli maintain compact-bucket` (a 20 GiB ceiling) and once with ravel-server at its defaults (a 5 GiB ceiling). | measured on run 2's bucket, which is kept (predicted) |
 | a mixed fleet | a 0.30.x compactor and a new one converge on the same parts through `CreateIfAbsent` | follows from byte-identical parts; the golden test above pins it |
 
 ## Rejected alternatives
@@ -190,9 +209,12 @@ no path gathers a whole stream's rows.
   decode CPU replaces GET latency as the limit, which is the trigger for the
   shuffle alternative.
 - Resident memory per merge grows by the inputs' raw bytes, about 5 to 7 GB
-  per shard-hour on this fixture. It is bounded by D1's resident ceiling,
-  `merge_cursor_budget_bytes` divided by `--maintain-unit-concurrency`. When
-  it does not fit, the merge falls back to one fetch per row group per pass.
+  per shard-hour on this fixture. It is bounded by D1's
+  `merge_resident_ceiling_bytes`, which ravel-server sets to 5 GiB at its
+  defaults. That is below this fixture's raw bytes per shard-hour, so on
+  this fixture ravel-server at its defaults takes the fetch-per-pass path.
+  When the bytes do not fit, the merge falls back to one fetch per row
+  group per pass.
 - ADR-0065 decision 4 and the ADR-0032 memory text gain an amendment that
   states the new peak: catalog metadata, plus resident raw bytes (D1), plus
   one pass's retained rows, plus the in-progress part. The `rlog.rs` module
