@@ -1376,10 +1376,12 @@ This amendment makes six decisions.
 
 **Memory.** The memo shares the entry's buffers. Its own cost is the array
 struct and the `Buffer` and `Bytes` headers, about 200 to 500 B per entry
-(inference), or 3 to 7 MB for a column of 13,141 blocks. Measured: 392 B
-for a plain column and for a text dictionary, 520 B for a mixed one
+(inference), or 3 to 7 MB for a column of 13,141 blocks. Measured through
+ravel-sql's own build: 432 B for a plain column and for a text dictionary,
+568 B for a text dictionary with its keys buffer built, 560 B for a mixed
+one, whose keys buffer is never built
 (`values_memo_charge_covers_the_measured_memo_and_no_more`); the charge is
-528 B. The inference's upper end was low. `offer` adds that
+576 B. The inference's upper end was low. `offer` adds that
 constant to the column's `heap_bytes` when it takes the reservation, since
 the memo is filled after `offer` fixes the charge. `heap_bytes` and
 `decoded_heap_bytes` stay unchanged for their other callers
@@ -1506,6 +1508,16 @@ launches.
 
 The investigation also predicts the 43-statement CPU geomean 0.012 lower
 than A (predicted, `predict.out`).
+
+The second pull request's paired run also carried a decoded-cache hits and
+misses row, within 1% of A per statement, on the basis that a keys buffer
+left out of the charge moves no admission. That basis was incomplete, and
+the row missed: q34 read 283 misses per call in A and 788 in B, and all
+misses read 1.019 of A, in both directions across statements, while no
+speed row moved (measured 2026-11-04, #3326 comment 6624033130). The key
+path also changes eviction: a batch that holds an entry's keys makes the
+entry held, so a pressure pass evicts a different one. That is the likely
+cause; it was not measured.
 
 **Out of scope.**
 - **A view memo for GROUP BY.** The dictionary-to-view cast costs 1.07 s

@@ -437,6 +437,8 @@ use plan::*;
 use scan::*;
 use threshold::*;
 
+#[doc(hidden)]
+pub use batch::values_memo_build;
 pub(crate) use threshold::ConfirmTopKThreshold;
 
 /// Rows accumulated into one output batch before it is emitted.
