@@ -60,10 +60,10 @@ pub const LOOKBACK_NS: i64 = 5 * 60 * 1_000_000_000;
 
 pub use super::promql_range::MAX_RANGE_POINTS;
 
-/// Room left below the fit cap for the presentation counters `fit` and this
-/// body set after the series are measured: four `u64` counters, zero when
-/// measured and at most 20 digits each, and two flags one byte longer when
-/// set.
+/// Room left below the fit cap for what `fit` and this body write after the
+/// series are measured: four `u64` counters, zero when measured and at most
+/// 20 digits each, and the 8 B a status grows by from `ok` to `ok_bounded`.
+/// A flag costs nothing here: `true` is shorter than `false`.
 const COUNTER_SLACK: usize = 128;
 
 /// The column names of the port's per-sample rows, in order.
@@ -234,12 +234,11 @@ fn finish(mut envelope: Envelope, plan: &Plan, ctx: &ToolContext<'_>) -> Result<
     } else {
         SeriesCut::default()
     };
-    let mut fitted = envelope.fit(ctx.budgets.max_response_bytes);
-    fitted.presentation.rows_omitted += row_cap_omitted + cut.rows_omitted;
+    envelope.data.row_count = produced as u64;
+    let mut fitted = envelope.fit_row_capped(ctx.budgets.max_response_bytes, row_cap_omitted);
+    fitted.presentation.rows_omitted += cut.rows_omitted;
     fitted.presentation.cells_truncated += cut.samples_cut;
     fitted.presentation.bytes_cap_hit |= cut.rows_omitted > 0 || cut.samples_cut > 0;
-    fitted.presentation.row_cap_hit |= row_cap_omitted > 0;
-    fitted.data.row_count = produced as u64;
     Ok(fitted.finish(false))
 }
 
@@ -570,7 +569,8 @@ mod tests {
 
     use super::*;
     use crate::cursor::{CURSOR_KEY_LEN, CursorKey};
-    use crate::envelope::Status;
+    use crate::envelope::row_cap_sweep::assert_finished_inside_cap;
+    use crate::envelope::{MAX_RESPONSE_BYTES_FLOOR, Status};
     use crate::tools::tests::{Stub, block_on, test_context};
 
     /// 1000 s and 1060 s after the epoch, in nanoseconds.
@@ -944,6 +944,46 @@ mod tests {
             };
             assert_eq!(samples["value"], json!([0.0, 1.0, 2.0, 3.0]));
         }
+    }
+
+    /// An answer that is not sample rows (a scalar or string result) skips
+    /// the series fit and goes to `fit` whole. Thirteen such rows cut to one
+    /// by `max_rows`, the kept one `len` bytes wide, packed right up to the
+    /// byte cap: the response stays inside the cap once the 12 omitted rows,
+    /// `row_cap_hit` and the `ok_bounded` status they make are written.
+    ///
+    /// Fitting with `fit` and folding the row cap in afterwards puts these
+    /// over the cap: `rows_omitted` goes from `0` to `12` and the status from
+    /// `ok` to `ok_bounded` after the fit measured them.
+    #[test]
+    fn a_row_capped_answer_at_its_byte_cap_finishes_inside_it() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_rows = 1;
+        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
+        let run_with = |len: usize| {
+            let mut answer = Envelope::default();
+            answer.data.columns = vec![Column {
+                name: "value".to_string(),
+                r#type: "string".to_string(),
+            }];
+            answer.data.rows = (0..13)
+                .map(|n| {
+                    vec![Cell::Str(if n == 0 {
+                        "x".repeat(len)
+                    } else {
+                        n.to_string()
+                    })]
+                })
+                .collect();
+            answer.data.row_count = 13;
+            answer.coverage.complete = true;
+            answer.visibility.resolved_no_segments = true;
+            let stub = answering(vec![Ok(answer)]);
+            let instant = json!({"query": "m", "evaluation_time": START_NS.to_string()});
+            block_on(run(instant, &ctx, &stub))
+        };
+        assert_finished_inside_cap(MAX_RESPONSE_BYTES_FLOOR, 12, run_with);
     }
 
     /// A range one step over [`MAX_RANGE_POINTS`] is `invalid_argument`
