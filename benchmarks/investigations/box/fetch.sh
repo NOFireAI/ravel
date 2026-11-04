@@ -10,7 +10,9 @@
 # FAILED marker. run.sh puts the marker only after the rest of out/ uploaded,
 # so a prefix with no marker holds an incomplete run: fetch.sh refuses to
 # download it unless --partial is given, which checks for a marker once and,
-# with none, downloads what is there and exits 3.
+# with none, downloads what is there and exits 3. It then names the failed
+# commands' logs run.sh kept under out/logs/, and the states run.sh recorded
+# failed (stamps/failed_states.jsonl).
 #
 # --dry-run prints the aws commands one poll would run, and exits 0.
 #
@@ -116,6 +118,14 @@ fi
 
 mkdir -p "$DEST"
 aws_call s3 cp --only-show-errors --recursive "$URI/" "$DEST/" || { echo "fetch: download of $URI failed" >&2; exit 1; }
+if [ -s "$DEST/stamps/failed_states.jsonl" ]; then
+  echo "fetch: failed states (stamps/failed_states.jsonl):" >&2
+  cat "$DEST/stamps/failed_states.jsonl" >&2
+fi
+if [ -d "$DEST/logs" ]; then
+  echo "fetch: failed commands' logs under $DEST/logs/:" >&2
+  ls "$DEST/logs" >&2
+fi
 if [ "$marker" = FAILED ]; then
   cat "$DEST/FAILED" >&2
   exit 1

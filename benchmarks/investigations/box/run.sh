@@ -22,6 +22,12 @@
 #
 # Steps: bootstrap, store, host, corpus, declare, load-base, then one step per
 # run.toml state (fold transitions inside them), then evaluate and finish.
+# A failure before the states (or of run.sh's own bookkeeping) ends the run
+# with out/FAILED. A load, fold, leaf rebuild, compaction or erasure command
+# that exits non-zero inside a state records that state in
+# stamps/failed_states.jsonl and the run goes on with the next state. Either
+# way the failed command's log is copied to out/logs/, which the upload
+# carries, and the FAILED or failed_states line names it.
 # out/ holds run.toml, truth.json, calls.jsonl, stamps/ and evaluate.py's
 # results.<lane>.json and summary.<lane>.txt; out/work/ holds logs, plans,
 # the store's data and the run's secrets and is never uploaded.
@@ -93,6 +99,12 @@ STATEMENTS="$INV_DIR/statements.toml"
 AUTH_DIR="$WORK/auth"
 TOKEN_FILE="$WORK/auth/tokens"
 CURRENT_STEP=""
+# The state run_state is in, and what the failed command of it was
+# (failed_at sets them; state_failed and fail_logged read them).
+STATE=""
+FAIL_STEP=""
+FAIL_CODE=0
+FAIL_LOG=""
 FINISHED=0
 SERVER_PID=""
 SERVER_N=0
@@ -117,6 +129,11 @@ run() {
       printf ' %q' "$@"
       printf '\n'
     } >&3
+    # INV_DRY_RUN_FAIL (the cases' hook): a dry-run command whose words
+    # contain it exits 3, so the failure paths run with no binary or store.
+    if [ -n "${INV_DRY_RUN_FAIL:-}" ] && [[ " $* " == *"$INV_DRY_RUN_FAIL"* ]]; then
+      return 3
+    fi
     return 0
   fi
   "$@"
@@ -203,6 +220,49 @@ fail() {
     terminate_self
   fi
   exit 1
+}
+
+# keep_log LOG: copy a failed command's log from work/ (never uploaded) to
+# out/logs/ (uploaded) and print the copy's path.
+keep_log() {
+  local kept
+  kept="out/logs/$(basename "$1")"
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'DRY-RUN: copy %s to %s\n' "$1" "$kept" >&3
+  elif ! { mkdir -p "$OUT/logs" && cp "$1" "$OUT/logs/"; } 2>/dev/null; then
+    kept="none ($1 could not be copied)"
+  fi
+  printf '%s\n' "$kept"
+}
+
+# failed_at STEP CODE [LOG]: name the command that exited CODE, for
+# state_failed or fail_logged; returns 1.
+failed_at() {
+  FAIL_STEP="$1"
+  FAIL_CODE="$2"
+  FAIL_LOG="${3:-}"
+  return 1
+}
+
+# fail_logged: fail on the command failed_at named, its log kept.
+fail_logged() {
+  local kept=none
+  [ -z "$FAIL_LOG" ] || kept="$(keep_log "$FAIL_LOG")"
+  fail "$FAIL_STEP exit $FAIL_CODE (log $kept)"
+}
+
+# state_failed: the command failed_at named stopped the current state. The
+# state is recorded failed with that step, its exit code and its log kept
+# under out/logs/; run_state returns and the run goes on with the next state.
+state_failed() {
+  local kept=none
+  [ -z "$FAIL_LOG" ] || kept="$(keep_log "$FAIL_LOG")"
+  printf 'STATE-FAILED %s: %s exit %s (log %s); the run goes on\n' "$STATE" "$FAIL_STEP" "$FAIL_CODE" "$kept"
+  say "state $STATE failed at $FAIL_STEP (exit $FAIL_CODE), log $kept; the run goes on with the next state"
+  [ "$DRY_RUN" = 1 ] || printf '%s STATE-FAILED %s at %s exit %s\n' "$(utc_now)" "$STATE" "$FAIL_STEP" \
+    "$FAIL_CODE" >>"$PROGRESS"
+  stop_server
+  stamp failed_states.jsonl state="$STATE" step="$FAIL_STEP" exit:="$FAIL_CODE" log="$kept" at="$(utc_now)"
 }
 
 on_exit() {
@@ -520,9 +580,18 @@ step_host() {
   fi
   [ "$DRY_RUN" = 1 ] || drop_page_cache || fail "page cache drop (the s3 lane needs root)"
   stamp host.json lane="$LANE" arch="$(uname -m)" nproc:="$(nproc)" kernel="$(uname -r)" \
-    mem_total_kb:="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" instance_type="$itype" \
+    mem_total_kb:="$(mem_total_kb)" instance_type="$itype" \
     page_cache_drop="${CACHE_DROP:-dry-run}" disk="$(df -h "$OUT" 2>/dev/null | tail -n 1)" \
     rq_stats="$RQ_STATS" at="$(utc_now)"
+}
+
+# mem_total_kb: /proc/meminfo's MemTotal; on a local lane without /proc
+# (macOS), hw.memsize in KiB; null when neither answers.
+mem_total_kb() {
+  local kb
+  kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)"
+  [ -n "$kb" ] || kb="$(sysctl -n hw.memsize 2>/dev/null | awk '{print int($1 / 1024)}')"
+  printf '%s\n' "${kb:-null}"
 }
 
 step_corpus() {
@@ -544,13 +613,18 @@ step_corpus() {
   subs+=(--sub "tail=$WORK/corpus-tail/truth.json")
   # Each many_parts_N tenant's corpus: N event hours ending four hours before
   # this one, so its strided ingest hours (one later than the event hours)
-  # all end below the hour the state runs in.
+  # all end below the hour the state runs in. --even-hours puts exactly
+  # traces_per_hour traces in every hour, so batch k of the strided load (a
+  # fixed --batch-rows of rows / N) holds event hour k and nothing else: with
+  # a random hour per trace the batches drift off their hours and the loader
+  # refuses the first batch whose events pass its ingest hour's end plus
+  # max_ingest_lag (README "many_parts_N").
   for n in $MP_SIZES; do
-    run "$PY" "$INV_DIR/gen_corpus.py" --traces $((n * MP_TPH)) --hours "$n" --seed $((SEED + n)) \
+    run "$PY" "$INV_DIR/gen_corpus.py" --traces $((n * MP_TPH)) --hours "$n" --seed $((SEED + n)) --even-hours \
       --spans-per-trace "$SPANS_PER" --logs-per-trace "$LOGS_PER" --start-hour $((h0 - n - 4)) \
       --format parquet --out "$WORK/corpus-mp$n" >"$WORK/corpus-mp$n.out" 2>&1 || fail "gen_corpus many_parts_$n"
     subs+=(--sub "many_parts_$n=$WORK/corpus-mp$n/truth.json")
-    mp="$("$HOST_PY" -c 'import json, sys; d = json.loads(sys.argv[1]); d[sys.argv[2]] = {"traces": int(sys.argv[3]), "hours": int(sys.argv[2]), "seed": int(sys.argv[4]), "start_hour": int(sys.argv[5]), "ingest_hour_start": int(sys.argv[5]) + 1}; print(json.dumps(d))' \
+    mp="$("$HOST_PY" -c 'import json, sys; d = json.loads(sys.argv[1]); d[sys.argv[2]] = {"traces": int(sys.argv[3]), "hours": int(sys.argv[2]), "seed": int(sys.argv[4]), "start_hour": int(sys.argv[5]), "ingest_hour_start": int(sys.argv[5]) + 1, "even_hours": True}; print(json.dumps(d))' \
       "$mp" "$n" $((n * MP_TPH)) $((SEED + n)) $((h0 - n - 4)))" || fail "many_parts corpus record"
   done
   run "$PY" "$LIB" merge-truth --base "$WORK/corpus/truth.json" ${subs[@]+"${subs[@]}"} --out "$OUT/truth.json" \
@@ -592,7 +666,8 @@ step_declare() {
     hits_key_index="$([ "$HITS" = true ] && echo UserID)" hits_show="$hits_show"
 }
 
-# load_signal LABEL SIGNAL CORPUS_DIR TENANT [LOAD_FLAG...]
+# load_signal LABEL SIGNAL CORPUS_DIR TENANT [LOAD_FLAG...]: one measured
+# load, stamped in loads.jsonl; non-zero (failed_at set) when it failed.
 load_signal() {
   local label="$1" sig="$2" dir="$3" tenant="$4" log m code=0
   shift 4
@@ -603,7 +678,7 @@ load_signal() {
     "$@" || code=$?
   stamp loads.jsonl hour="$label" signal="$sig" tenant="$tenant" exit:="$code" ingest_hour:="$(now_hour)" \
     flags="$*" measure@="$m" report%="$log"
-  [ "$code" = 0 ] || fail "load $label/$sig exit $code"
+  [ "$code" = 0 ] || failed_at "load $label/$sig" "$code" "$log"
 }
 
 load_hits() {
@@ -620,7 +695,7 @@ load_hits() {
     || code=$?
   stamp loads.jsonl hour=base signal=hits tenant=hits exit:="$code" rows_expected:="$rows" \
     measure@="$m" report%="$WORK/load-hits.out"
-  [ "$code" = 0 ] || fail "load hits exit $code"
+  [ "$code" = 0 ] || { failed_at "load base/hits" "$code" "$WORK/load-hits.out"; fail_logged; }
 }
 
 step_load_base() {
@@ -633,13 +708,14 @@ step_load_base() {
       # the inputs compaction_in_flight's compaction needs.
       flags=(--batch-rows "$(batch_rows "$(corpus_rows "$WORK/corpus" "$sig")" 2)" --target-bytes 1)
     fi
-    load_signal base "$sig" "$WORK/corpus" "$TENANT" ${flags[@]+"${flags[@]}"}
+    load_signal base "$sig" "$WORK/corpus" "$TENANT" ${flags[@]+"${flags[@]}"} || fail_logged
   done
   [ "$HITS" != true ] || load_hits
 }
 
 # fold TRANSITION [FOLD_FLAG...]: one catalog fold per $TRIPLES entry,
 # sealing through the current hour (--writers-stopped: nothing else writes).
+# Non-zero (failed_at set) at the first fold that failed.
 fold() {
   local transition="$1" triple tenant sig label code log m
   shift
@@ -653,7 +729,7 @@ fold() {
       --shards "$SHARDS" --signal "$sig" --writers-stopped --json "$@" || code=$?
     stamp folds.jsonl transition="$transition" tenant="$tenant" signal="$label" kind="fold${1:+ $*}" \
       exit:="$code" hour:="$(now_hour)" measure@="$m" report%="$log"
-    [ "$code" = 0 ] || fail "fold $transition/$label exit $code"
+    [ "$code" = 0 ] || { failed_at "fold $transition/$label" "$code" "$log"; return 1; }
   done
   FOLD_HOUR="$(now_hour)"
 }
@@ -661,7 +737,7 @@ fold() {
 # rebuild_leaves TRANSITION: attach key-index leaves to the parts already in
 # HEAD, per $TRIPLES entry. A --key-index-leaves fold right after a plain one
 # has no hour left to seal, so it re-encodes nothing and writes no leaf (its
-# report says no_op).
+# report says no_op). Non-zero (failed_at set) at the first that failed.
 rebuild_leaves() {
   local transition="$1" triple tenant sig label code log m
   stop_server
@@ -674,7 +750,7 @@ rebuild_leaves() {
       --shards "$SHARDS" --signal "$sig" --rebuild-key-index --json || code=$?
     stamp folds.jsonl transition="$transition" tenant="$tenant" signal="$label" kind=rebuild-key-index \
       exit:="$code" hour:="$(now_hour)" measure@="$m" report%="$log"
-    [ "$code" = 0 ] || fail "rebuild-key-index $label exit $code"
+    [ "$code" = 0 ] || { failed_at "rebuild-key-index $transition/$label" "$code" "$log"; return 1; }
   done
 }
 
@@ -798,8 +874,10 @@ needle_blocks() {
 # signals, run in the background while the in-flight statements run. The two
 # signals compact at once, so each signal's calls can overlap its own
 # compaction whichever order the statements run in.
+# Each signal whose compaction exited non-zero is a "SIGNAL CODE" line of
+# work/compact-failed.txt.
 compact_child() {
-  local sig pid pids=() code=0
+  local sig pid pids=() code=0 c i=0 sigs=(spans logs)
   for sig in spans logs; do
     "$PY" "$LIB" measure --out "$WORK/compact-$sig.measure.json" --stdout "$WORK/compact-$sig.out" -- \
       "${CLI[@]}" maintain compact-tenant --tenant "$TENANT" --signal "$sig" --shards "$SHARDS" \
@@ -807,7 +885,13 @@ compact_child() {
     pids+=("$!")
   done
   for pid in "${pids[@]}"; do
-    wait "$pid" || code=$?
+    c=0
+    wait "$pid" || c=$?
+    if [ "$c" != 0 ]; then
+      code="$c"
+      printf '%s %s\n' "${sigs[$i]}" "$c" >>"$WORK/compact-failed.txt"
+    fi
+    i=$((i + 1))
   done
   return "$code"
 }
@@ -827,7 +911,7 @@ wait_sealed() {
 }
 
 state_compaction() {
-  local code=0 sig
+  local code=0 sig failed_sig=""
   # The sealed-hour wait and the compaction run back to back: both must fit.
   local compact_s
   compact_s="$(estimate_s compaction_in_flight)" || fail "run.toml step_estimate_minutes.compaction_in_flight"
@@ -841,25 +925,31 @@ state_compaction() {
     for sig in spans logs; do
       run "$PY" "$LIB" measure --out "$WORK/compact-$sig.measure.json" --stdout "$WORK/compact-$sig.out" -- \
         "${CLI[@]}" maintain compact-tenant --tenant "$TENANT" --signal "$sig" --shards "$SHARDS" \
-        --max-flush-lifetime 0s --no-claim
+        --max-flush-lifetime 0s --no-claim || { code=$?; failed_sig="${failed_sig:-$sig}"; }
     done
     printf 'DRY-RUN: the compactions above run as background children, both signals at once, while the in-flight calls run\n'
     statements compaction_in_flight --temp inflight
     printf 'DRY-RUN: wait for the compaction child before the next transition\n'
   else
+    rm -f "$WORK/compact-failed.txt"
     compact_child </dev/null &
     local child=$!
     statements compaction_in_flight --temp inflight
     wait "$child" || code=$?
+    [ ! -s "$WORK/compact-failed.txt" ] || read -r failed_sig code <"$WORK/compact-failed.txt"
   fi
   for sig in spans logs; do
     stamp compaction.jsonl signal="$sig" exit:="$code" measure@="$WORK/compact-$sig.measure.json" \
       report:="$(run "$PY" "$LIB" kv-report --log "$WORK/compact-$sig.out" || echo null)"
   done
-  [ "$code" = 0 ] || fail "maintain compact-tenant exit $code"
+  if [ "$code" != 0 ]; then
+    failed_at "maintain compact-tenant ${failed_sig:-spans}" "$code" "$WORK/compact-${failed_sig:-spans}.out"
+    return 1
+  fi
   transition compaction_done "maintain compact-tenant finished"
   census compaction_done
   statements compaction_done
+  return 0
 }
 
 state_erasure() {
@@ -873,12 +963,12 @@ state_erasure() {
   fi
   stop_server
   run "${CLI[@]}" erase status --tenant "$TENANT" --signal logs >"$WORK/erase-status-before.out" 2>&1 \
-    || fail "erase status before submit"
+    || { failed_at "erase status before submit" "$?" "$WORK/erase-status-before.out"; return 1; }
   run "${CLI[@]}" erase submit --tenant "$TENANT" --signal logs --matcher "request_id=$rid" \
     --reason "investigations erasure_in_flight" >"$out" 2>&1 || code=$?
-  [ "$code" = 0 ] || fail "erase submit exit $code"
+  [ "$code" = 0 ] || { failed_at "erase submit" "$code" "$out"; return 1; }
   run "${CLI[@]}" erase status --tenant "$TENANT" --signal logs >"$WORK/erase-status-after.out" 2>&1 \
-    || fail "erase status after submit"
+    || { failed_at "erase status after submit" "$?" "$WORK/erase-status-after.out"; return 1; }
   # ravel-cli erase status prints "<request id>: PENDING" for a request with
   # a .dreq and no .done (services/ravel-cli/src/erase.rs print_state).
   if [ "$DRY_RUN" = 0 ] && ! grep -q ': PENDING$' "$WORK/erase-status-after.out"; then
@@ -891,76 +981,114 @@ state_erasure() {
   transition erasure_in_flight "erase submit on the victim's request_id; erase status reads pending"
   census erasure_in_flight
   statements erasure_in_flight
+  return 0
 }
 
 # state_many_parts N: a fresh spans tenant mpN, one batch per strided ingest
 # hour, folded into parts of at most MP_MAX_ENTRIES entries.
 state_many_parts() {
   local n="$1" t="mp$1" dir="$WORK/corpus-mp$1" saved="$TRIPLES" start
-  local est
+  local est rows why code=0
   est="$(estimate_s "many_parts_$n")"
   start="$("$HOST_PY" -c 'import sys; print(int(sys.argv[1]) - int(sys.argv[2]) - 3)' "$CORPUS_H0" "$n")"
   fits "many_parts_$n" load "$est" || return 0
+  rows="$(batch_rows "$(corpus_rows "$dir" spans)" "$n")"
+  # The loader checks each batch's latest event time against its ingest
+  # hour's end plus max_ingest_lag before writing it, and a refusal leaves a
+  # partial tenant behind. The same check over the whole file first: a
+  # corpus it would refuse records the state not-run with that refusal.
+  why="$(run "$PY" "$LIB" stride-check --parquet "$dir/spans.parquet" --batch-rows "$rows" --batches "$n" \
+    --ingest-hour-start "$start")" || code=$?
+  case "$code" in
+    0) ;;
+    1) not_run "many_parts_$n" "$why"; return 0 ;;
+    *) failed_at "stride-check many_parts_$n" "$code"; return 1 ;;
+  esac
   stop_server
   load_signal "many_parts_$n" spans "$dir" "$t" --ingest-hour-stride 1 --ingest-hour-start "$start" \
-    --batch-rows "$(batch_rows "$(corpus_rows "$dir" spans)" "$n")" --target-bytes 1
+    --batch-rows "$rows" --target-bytes 1 || return 1
   TRIPLES="$t:spans:spans"
   fits "many_parts_$n" fold "$est" || { TRIPLES="$saved"; return 0; }
-  fold "many_parts_$n" --snapshot-part-max-entries "$MP_MAX_ENTRIES"
+  fold "many_parts_$n" --snapshot-part-max-entries "$MP_MAX_ENTRIES" || { TRIPLES="$saved"; return 1; }
   fits "many_parts_$n" "leaf rebuild" "$est" || { TRIPLES="$saved"; return 0; }
-  rebuild_leaves "many_parts_${n}_leaf_rebuild"
+  rebuild_leaves "many_parts_${n}_leaf_rebuild" || { TRIPLES="$saved"; return 1; }
   transition "many_parts_$n" "tenant $t: $n strided ingest hours from $start, parts of at most $MP_MAX_ENTRIES entries"
   census "many_parts_$n"
   statements "many_parts_$n" --tenant "$t" --sub "many_parts_$n"
   TRIPLES="$saved"
+  return 0
 }
 
+state_unfolded() {
+  transition unfolded "base hours loaded, no fold"
+  census unfolded
+  needle_blocks
+  statements unfolded
+  return 0
+}
+
+state_folded_no_leaves() {
+  fits folded_no_leaves fold "$(estimate_s folded_no_leaves)" || return 0
+  fold folded_no_leaves || return 1
+  transition folded_no_leaves "catalog fold --writers-stopped, no leaves"
+  census folded_no_leaves
+  statements folded_no_leaves
+  return 0
+}
+
+state_folded_leaves() {
+  fits folded_leaves fold "$(estimate_s folded_leaves)" || return 0
+  fold folded_leaves --key-index-leaves || return 1
+  fits folded_leaves "leaf rebuild" "$(estimate_s folded_leaves)" || return 0
+  rebuild_leaves leaf_rebuild || return 1
+  transition folded_leaves "catalog fold --writers-stopped --key-index-leaves, then catalog fold --rebuild-key-index"
+  census folded_leaves
+  statements folded_leaves
+  return 0
+}
+
+state_mixed() {
+  fits mixed "the wait for the next ingest hour" "$((MIXED_WAIT * 60))" || return 0
+  if [ -z "$FOLD_HOUR" ]; then
+    not_run mixed "no fold ran before the mixed state (its fold states were skipped or not listed), so the tail hour has no sealed hour to follow"
+    return 0
+  fi
+  wait_next_hour
+  fits mixed load "$(estimate_s mixed)" || return 0
+  stop_server
+  load_signal tail spans "$WORK/corpus-tail" "$TENANT" || return 1
+  load_signal tail logs "$WORK/corpus-tail" "$TENANT" || return 1
+  transition mixed "folded hours plus one unfolded tail hour"
+  census mixed
+  statements mixed
+  fits fold_advance fold "$(estimate_s mixed)" || return 0
+  fold fold_advance --key-index-leaves || return 1
+  transition fold_advance "the fold that seals the mixed state's tail hour"
+  census fold_advance
+  return 0
+}
+
+# run_state STATE: one state. A state function returns 0 when it ran or was
+# recorded not-run, and 1 after failed_at named the command that stopped it,
+# which state_failed records before the run goes on with the next state.
 run_state() {
-  local state="$1"
+  local state="$1" code=0
   step "state:$state"
+  STATE="$state"
+  FAIL_STEP=""
   case "$state" in
-    unfolded)
-      transition unfolded "base hours loaded, no fold"
-      census unfolded
-      needle_blocks
-      statements unfolded ;;
-    folded_no_leaves)
-      fits folded_no_leaves fold "$(estimate_s folded_no_leaves)" || return 0
-      fold folded_no_leaves
-      transition folded_no_leaves "catalog fold --writers-stopped, no leaves"
-      census folded_no_leaves
-      statements folded_no_leaves ;;
-    folded_leaves)
-      fits folded_leaves fold "$(estimate_s folded_leaves)" || return 0
-      fold folded_leaves --key-index-leaves
-      fits folded_leaves "leaf rebuild" "$(estimate_s folded_leaves)" || return 0
-      rebuild_leaves leaf_rebuild
-      transition folded_leaves "catalog fold --writers-stopped --key-index-leaves, then catalog fold --rebuild-key-index"
-      census folded_leaves
-      statements folded_leaves ;;
-    mixed)
-      fits mixed "the wait for the next ingest hour" "$((MIXED_WAIT * 60))" || return 0
-      if [ -z "$FOLD_HOUR" ]; then
-        not_run mixed "no fold ran before the mixed state (its fold states were skipped or not listed), so the tail hour has no sealed hour to follow"
-        return 0
-      fi
-      wait_next_hour
-      fits mixed load "$(estimate_s mixed)" || return 0
-      stop_server
-      load_signal tail spans "$WORK/corpus-tail" "$TENANT"
-      load_signal tail logs "$WORK/corpus-tail" "$TENANT"
-      transition mixed "folded hours plus one unfolded tail hour"
-      census mixed
-      statements mixed
-      fits fold_advance fold "$(estimate_s mixed)" || return 0
-      fold fold_advance --key-index-leaves
-      transition fold_advance "the fold that seals the mixed state's tail hour"
-      census fold_advance ;;
+    unfolded) state_unfolded ;;
+    folded_no_leaves) state_folded_no_leaves ;;
+    folded_leaves) state_folded_leaves ;;
+    mixed) state_mixed ;;
     compaction_in_flight) state_compaction ;;
     erasure_in_flight) state_erasure ;;
     many_parts_*) state_many_parts "${state#many_parts_}" ;;
     *) fail "unknown state $state" ;;
-  esac
+  esac || code=$?
+  [ "$code" = 0 ] && return 0
+  [ -n "$FAIL_STEP" ] || fail "state $state returned $code with no failed command named"
+  state_failed
 }
 
 step_evaluate() {
@@ -1004,15 +1132,9 @@ finish() {
   exit $?
 }
 
-main() {
-  load_config
-  [ "$DRY_RUN" = 1 ] || : >"$CALLS"
-  step_bootstrap
-  step_store
-  step_host
-  step_corpus
-  step_declare
-  step_load_base
+# run_states: every run.toml state in order; a failed one is recorded and
+# the next one runs.
+run_states() {
   local s elapsed
   for s in $STATES; do
     elapsed=$(($(date +%s) - RUN_START))
@@ -1022,8 +1144,24 @@ main() {
     fi
     run_state "$s"
   done
+}
+
+main() {
+  load_config
+  [ "$DRY_RUN" = 1 ] || : >"$CALLS"
+  step_bootstrap
+  step_store
+  step_host
+  step_corpus
+  step_declare
+  step_load_base
+  run_states
   step_evaluate
   finish
 }
 
-main
+# Sourced (the cases' harness for the real, non-dry-run state paths), run.sh
+# only defines its functions and parses the arguments given to `source`.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main
+fi

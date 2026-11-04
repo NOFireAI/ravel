@@ -28,9 +28,13 @@ defaults to 0. Each answer is judged here against truth.json, under the
 truth key statements.toml gives the call, or, in the states whose oracle is
 the unfolded run, against the unfolded call of the same statement and try;
 a call whose rows differ from its oracle, or that names another key, is
-`wrong_answer`. The verdict is `fail` on any problem; else `incomplete`
-when an asked state, a planned call or an ungated figure did not run; else
-`pass`. Exit 0 only on pass; 1 on fail or incomplete; 64 on usage.
+`wrong_answer`. A state run.sh recorded failed (stamps/failed_states.jsonl:
+a load, fold, leaf rebuild, compaction or erasure command of it exited
+non-zero) is not live: every figure of it, and of a state derived from it,
+is `not-run` with the reason "state failed at <step> (exit N)", and its
+entry in `states` reads `failed` with the step, exit code and log. The
+verdict is `fail` on any problem; else `incomplete` when an asked state, a
+planned call or an ungated figure did not run; else `pass`. Exit 0 only on pass; 1 on fail or incomplete; 64 on usage.
 """
 
 import argparse
@@ -190,6 +194,27 @@ def load_cfg(run_dir, problems):
         problems.add("missing", "run.toml cost.amortise_months (a whole number of months, at least 1)")
         cfg["cost"]["amortise_months"] = None
     return cfg
+
+
+def failed_states(run_dir, problems):
+    """{state: its first stamps/failed_states.jsonl line}. A line without a
+    state, a step or an integer exit is a missing figure of its own."""
+    path = os.path.join(run_dir, "stamps", "failed_states.jsonl")
+    out = {}
+    if not os.path.exists(path):
+        return out
+    for line in load_jsonl(path, problems, "stamps/failed_states.jsonl"):
+        code = line.get("exit")
+        if not line.get("state") or not line.get("step") or isinstance(code, bool) or not isinstance(code, int):
+            problems.add("missing", f"stamps/failed_states.jsonl line without a state, step or integer exit: "
+                                    f"{json.dumps(line, sort_keys=True)}")
+            continue
+        out.setdefault(line["state"], line)
+    return out
+
+
+def failed_reason(line):
+    return f"state failed at {line['step']} (exit {line['exit']})"
 
 
 def live_states(cfg, not_run, all_states):
@@ -890,7 +915,7 @@ def check_needle_blocks(doc, problems):
     return out
 
 
-def check_inflight(calls, statements, compaction, problems):
+def check_inflight(calls, statements, compaction, problems, live):
     """Every in-flight try must overlap the compaction of the signal its
     statement reads: [started_unix_s, started_unix_s + wall_s] against the
     compaction's measured [started_unix_s, ended_unix_s]. A compaction that
@@ -899,7 +924,7 @@ def check_inflight(calls, statements, compaction, problems):
     recorded not-run with that duration. Any other partial overlap is a
     not_in_flight problem."""
     for (statement, state, temp), tries in sorted(calls.groups.items()):
-        if state not in INFLIGHT_STATES or temp != "inflight":
+        if state not in INFLIGHT_STATES or temp != "inflight" or live.get(state) is not None:
             continue
         lines = [c for v in tries.values() for c in v if c.get("outcome") == "ok"]
         if not lines:
@@ -1555,13 +1580,16 @@ def main(argv):
     if os.path.exists(not_run_path):
         for line in load_jsonl(not_run_path, problems, "stamps/not_run.jsonl"):
             not_run.setdefault(line.get("state"), line.get("reason") or "no reason given")
+    failed = failed_states(args.run, problems)
+    for state, line in failed.items():
+        not_run[state] = failed_reason(line)
     query_states = sorted({s for st in statements.values() for s in st.get("states", [])})
     all_states = sorted(set(query_states) | set(DERIVED) | set(cfg["states"]))
     live = live_states(cfg, not_run, all_states)
 
     calls = Calls(calls_raw, problems, statements)
     docs, loads, folds, census, restarts, stamps, compaction = required_stamps(args.run, cfg, live, problems)
-    check_inflight(calls, statements, compaction, problems)
+    check_inflight(calls, statements, compaction, problems, live)
     calls.judge_all(answers, statements, cfg, problems)
     check_tries(calls, cfg, problems)
     coverage = check_coverage(calls, statements, cfg, live, problems)
@@ -1622,7 +1650,11 @@ def main(argv):
             d["mean_server_cpu_s"] = c["mean_server_cpu_s"]
     states = []
     for s in all_states:
-        if live[s] is not None:
+        if s in failed:
+            f = failed[s]
+            states.append({"state": s, "status": "failed", "reason": live[s], "step": f.get("step"),
+                           "exit": f.get("exit"), "log": f.get("log")})
+        elif live[s] is not None:
             states.append({"state": s, "status": "not-run", "reason": live[s]})
         else:
             states.append({"state": s, "status": coverage.get(s, "run")})
