@@ -344,7 +344,8 @@ docs/catalog-and-mvcc.md, with these choices fixed here:
   in (to intersect the key's block set with the window's blocks, as the
   fetcher does today at :1032), BLOOM only when the statement has
   predicates. An object the key is absent from costs three GETs (footer,
-  prefix, bucket; about 11 KB) and is dropped without reading SKIP_IDX;
+  prefix, bucket; about 11 KB) when its footer fits the 8 KiB suffix (the
+  #3702 amendment states the condition) and is dropped without reading SKIP_IDX;
   a holder costs those three plus SKIP_IDX and its block runs, and BLOOM
   with predicates. The cost of the reorder is on an object whose SKIP_IDX
   would have dropped it for free (no block in the window): it now pays
@@ -496,10 +497,12 @@ is a defect of the task that owns it.
   `leafGetRequests` (the `keyIndex` phase's requests that were leaf
   reads, so the phase's total minus it is the tier-1 share),
   `keysProbed` (the key set's size). Per signal, the same object appears
-  under `stats.signals[].keyIndex`.
+  under `stats.signals[].keyIndex`. As shipped the object carries ten
+  fields, not these seven (see the #3702 amendment).
 - Metrics: `ravel_query_key_index_parts_total{signal, outcome}` with
   `outcome` in `covered | uncovered | beyond_ceiling | rejected |
   reservation_refused`, and `ravel_query_key_index_leaf_gets_total{signal}`.
+  As shipped `outcome` has a sixth value (see the #3702 amendment).
 - The fold report and `/metrics` gain `key_index_sections_read`,
   `key_index_entries_carried`, `key_index_build_passes` and
   `key_index_leaf_gets` per fold, beside the existing
@@ -615,8 +618,8 @@ off-repo T12 scripts.
   starts the server against a `MemoryStore` tenant whose catalog is
   folded with leaves (the fold in process, `--fold-key-index-leaves`),
   issues `GET /api/traces/<id>` and the SQL lookup, and asserts from the
-  response's `stats` that `keyIndex.leafGetRequests` is 2, that the
-  `probe` and `keyIndex` phases issued no per-object GET for a pruned
+  response's `stats` that `keyIndex.leafGetRequests` is 2 (the one-part
+  figure; see the #3702 amendment), that the `probe` and `keyIndex` phases issued no per-object GET for a pruned
   object, that `segmentsPrunedByKeyIndex` equals the covered segments
   minus the holders, and that the rows equal the unfolded answer. The
   pattern is `spans_trace_key_index_routing.rs` and
@@ -727,6 +730,9 @@ S3, the build's SHA stamped, state verified and stamped before the first
 statement and after any step that changes it, 20 cold runs per selective
 statement. "Covering parts" is the stamped part count for the window.
 
+Row 3's three GETs hold for an object whose footer fits the 8 KiB suffix;
+the #3702 amendment states the condition and the in-process figures.
+
 | check | target | miss | source |
 |---|---|---|---|
 | 1. spans lookup, no time range, folded with leaves, one covering part (the T12 tenant: 828 objects) | leaf GETs = 2; GETs for objects the leaf proves absent = 0; data GETs at most 2 + holders x (footer + SKIP_IDX + block runs), 8 or fewer for a 10-span trace in one object; wire under 300 KB; 10 rows; `partsCovered` 1 | over 20 GETs, over 1 MB, any `probe` GET on a pruned object, or a row count other than the unfolded answer's | predicted from ADR-2707 decision 5 against T12's 2,429 GETs and 55.7 MB, #2763 comment 6276877460 |
@@ -776,3 +782,65 @@ T12. 5 is T7 with T13. 6 is T9 and T10 (the run, then the amendment).
 T14 and T15 dispatch only on their triggers, after wave 6. Each wave's
 checkpoint review runs before its pull requests open; every acceptance
 test above is named in its task's spec and re-run at the checkpoint.
+
+## Amendment (issue #3702): what T4 shipped, and the figures its tests pin
+
+<!-- amendment-applies: sections="3. Spans: the router runs before the per-object path, and the first read is the footer|7. What the statistics say, and what the harness asserts|9. Tests pin the claims; one of them drives a real entry point|Acceptance (pre-registered; a figure outside its band is a miss, investigated before the epic closes)" pointer="#3702 amendment" -->
+<!-- amendment-supersedes: phrase="`keyIndex.leafGetRequests` is 2" pointer="#3702 amendment" -->
+
+Task T4 wired the router into the spans `trace_id =` lookup. Its review
+found the decisions above describing a smaller surface than the one that
+shipped, and one figure stated without the fixture it holds for. What
+changes:
+
+- **Six outcomes, not five (decision 7).**
+  `ravel_query_key_index_parts_total{signal, outcome}` has `outcome` in
+  `covered | uncovered | beyond_ceiling | rejected | reservation_refused |
+  skipped_by_budget`. `skipped_by_budget` is a part whose key set's bridged
+  read would exceed the part's allowance (`entry_count x KEY_INDEX_T1_BYTES`),
+  declined by the leaf reader and left to tier 1. Both families render for
+  `signal` `spans` and `logs` and every outcome, zeros included, in every
+  mode; docs/guides/observability.md lists them with their HELP text.
+- **Ten statistics fields, not seven (decision 7).** `stats.keyIndex` and
+  the spans entry of `stats.signals[].keyIndex` carry, in render order,
+  `partsCovered`, `partsUncovered`, `partsBeyondCeiling`, `leavesRejected`,
+  `reservationsRefused`, `leafGetRequests`, `leafWireBytes`, `keysProbed`,
+  `skippedByBudget` and `skipIdxDropped`. `partsCovered` is a part the router
+  answered from its leaves, not one it probed: a probed part can end
+  rejected, refused or skipped by budget. `leavesRejected` counts a leaf that
+  failed validation, a failed leaf GET, and leaf refs whose slices do not
+  tile the key space. The object is present, zeros included, whenever a spans
+  scan carried a pushed `trace_id`, and absent otherwise.
+- **`leafGetRequests` is 2 per covering part (decision 9).** The 2 decision 9
+  quotes is the one-part figure. The reachability test's fixture folds two
+  parts, each covering, and reads 4: two leaf GETs per part.
+- **The absent-object figure is three requests (decision 3, Acceptance
+  row 3).** An uncovered object the trace is absent from costs the 8 KiB
+  footer suffix in `probe` and the KEY_IDX prefix and bucket in `keyIndex`:
+  three requests, the first at most 8,192 B, under 16 KiB in sum, and no
+  SKIP_IDX read. Over three is a miss. The three hold when the footer fits
+  the suffix; a footer longer than 8 KiB is chased once, a fourth request in
+  `probe`, and the count falls when the suffix already holds KEY_IDX or the
+  trace's bucket is empty. The two-request figure quoted against this row in
+  review is ADR-2707's #3118 prediction ("two once #3118 sizes the first
+  read"), which that ADR's tier-2 trace lookup amendment retired: sizing the
+  first read cut its bytes, not its request count.
+- **A refused parts charge degrades to tier 1.** The parts the router needs
+  are charged to the statement's catalog decode budget with the snapshot.
+  When the budget refuses that charge, the spans lane resolves again without
+  parts, paying that resolve's requests a second time, and every segment
+  takes the tier-1 probe; the statement answers exactly, `stats.keyIndex`
+  reads 0 in every field including `keysProbed`, and the process counters do
+  not move. docs/query-engine.md, "Tier-2 router", says so.
+
+The figures below are pinned in process against `MemoryStore` with an exact
+GET recorder.
+
+| check | band | miss | source |
+|---|---|---|---|
+| uncovered object without the trace, footer within the 8 KiB suffix | 3 requests, the first at most 8,192 B, under 16 KiB in sum, no SKIP_IDX read | over 3 requests, or any SKIP_IDX read | services/ravel-server/tests/trace_by_id_tier2.rs:948 |
+| two-part folded fixture, row path | `leafGetRequests` 4, 2 per covering part | other than 2 per covering part | services/ravel-server/tests/trace_by_id_tier2.rs:815 |
+| two-part folded fixture, cold columnar path | holders read the suffix, SKIP_IDX and the routed run only; `leafGetRequests` 4 | any KEY_IDX read on a holder a leaf names | services/ravel-server/tests/trace_by_id_tier2.rs:1261 |
+| refused parts charge | every `stats.keyIndex` field 0, `keysProbed` 0, rows exact | a failed statement, or a moved process counter | services/ravel-server/tests/trace_by_id_tier2.rs:1606 |
+
+Refs: #3702, #3692, #3118
