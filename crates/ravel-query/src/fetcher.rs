@@ -305,7 +305,10 @@ pub const DEFAULT_MAX_CONCURRENT_GETS: usize = 16;
 /// When the coalesced runs a query selects outnumber it, the smallest gaps
 /// between runs are bridged until this many remain, trading gap bytes for
 /// requests. It gives an unsealed flush's request cost a ceiling above the
-/// whole-object threshold ([`MAX_GETS_PER_L0_SEGMENT_FETCH`], ADR-1306). L1
+/// whole-object threshold ([`MAX_GETS_PER_L0_SEGMENT_FETCH`], ADR-1306). On
+/// the RSEG path a bridge that would build a run longer than
+/// `SegmentFetcher::max_run_len` is skipped, so the ceiling is guaranteed
+/// only for an object no longer than that per-GET share of the fetch budget. L1
 /// segments are left unbounded on both paths: they can be far larger than a
 /// flush, so bridging would move far more bytes.
 pub const MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT: usize = 4;
@@ -313,7 +316,9 @@ pub const MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT: usize = 4;
 /// footer tail, or suffix), at most one footer chase (a second `NeedRange` is
 /// `Truncated`), one catalog GET (the catalog sections are fetched as one
 /// run), and [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`] page-range GETs. Retries
-/// are not counted here. This is the RSEG shape only: an L0 RLOG read can
+/// are not counted here, and neither are the extra runs a byte cap leaves
+/// when an L0 object is longer than `SegmentFetcher::max_run_len` (see
+/// [`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`]). This is the RSEG shape only: an L0 RLOG read can
 /// exceed it, since it may add front-section and BLOOM/POSTINGS GETs.
 pub const MAX_GETS_PER_L0_SEGMENT_FETCH: u64 =
     1 + 1 + 1 + MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64;
@@ -938,15 +943,35 @@ struct SparseCatalogRanges {
 /// Merges (start, end) ranges into ordered, non-overlapping groups, joining
 /// consecutive ranges whose gap is at most `max_gap` into a single group
 /// (docs/query-engine.md "coalesce adjacent byte ranges").
-fn coalesce_ranges(mut ranges: Vec<(u64, u64)>, max_gap: u64) -> Vec<(u64, u64)> {
+#[cfg(test)]
+fn coalesce_ranges(ranges: Vec<(u64, u64)>, max_gap: u64) -> Vec<(u64, u64)> {
+    coalesce_ranges_capped(ranges, max_gap, u64::MAX)
+}
+
+/// Merges (start, end) ranges into ordered, non-overlapping groups, joining
+/// consecutive ranges whose gap is at most `max_gap`, but never joining two
+/// ranges across a gap, or across a touching boundary, when the group would
+/// grow past `max_run_len` bytes (docs/query-engine.md "coalesce adjacent byte
+/// ranges").
+/// Overlapping ranges are always joined, since one buffer must hold each needed
+/// range whole, so a single needed range longer than the cap (or an overlapping
+/// pair) stays one group and is fetched whole.
+fn coalesce_ranges_capped(
+    mut ranges: Vec<(u64, u64)>,
+    max_gap: u64,
+    max_run_len: u64,
+) -> Vec<(u64, u64)> {
     ranges.sort_by_key(|r| r.0);
     let mut out: Vec<(u64, u64)> = Vec::new();
     for (start, end) in ranges {
-        if let Some(last) = out.last_mut()
-            && start <= last.1.saturating_add(max_gap)
-        {
-            last.1 = last.1.max(end);
-            continue;
+        if let Some(last) = out.last_mut() {
+            let overlaps = start < last.1;
+            let joinable = start <= last.1.saturating_add(max_gap)
+                && last.1.max(end).saturating_sub(last.0) <= max_run_len;
+            if overlaps || joinable {
+                last.1 = last.1.max(end);
+                continue;
+            }
         }
         out.push((start, end));
     }
@@ -954,12 +979,25 @@ fn coalesce_ranges(mut ranges: Vec<(u64, u64)>, max_gap: u64) -> Vec<(u64, u64)>
 }
 
 /// Bridges the smallest gaps between `runs` (sorted, non-overlapping, as
-/// [`coalesce_ranges`] returns them) until at most `max_runs` remain. Ties
+/// [`coalesce_ranges_capped`] returns them) until at most `max_runs` remain. Ties
 /// bridge the earlier gap first. A `max_runs` of zero is read as one.
 ///
 /// `pub(crate)` so `log_fetcher.rs` can reuse it for the RLOG chunk-run cap
 /// (ADR-2066 decision 1) instead of a second copy of the same bridging rule.
 pub(crate) fn bound_runs(runs: Vec<(u64, u64)>, max_runs: usize) -> Vec<(u64, u64)> {
+    bound_runs_capped(runs, max_runs, u64::MAX)
+}
+
+/// [`bound_runs`] that skips any bridge whose joined run would be longer than
+/// `max_run_len` bytes. Gaps are still taken smallest first, earlier first on
+/// a tie, and a skipped gap is never retried, since the runs on either side
+/// only grow. With a cap of `u64::MAX` this is exactly [`bound_runs`].
+///
+/// When more than `max_runs` runs remain, every adjacent pair of them spans
+/// more than `max_run_len` bytes (otherwise their gap would have been bridged),
+/// so `k` runs over an object span `S` satisfy `floor(k / 2) * max_run_len <
+/// S`: at most `2 * S / max_run_len + 1` runs, and never more than `runs` had.
+fn bound_runs_capped(runs: Vec<(u64, u64)>, max_runs: usize, max_run_len: u64) -> Vec<(u64, u64)> {
     let max_runs = max_runs.max(1);
     if runs.len() <= max_runs {
         return runs;
@@ -970,11 +1008,27 @@ pub(crate) fn bound_runs(runs: Vec<(u64, u64)>, max_runs: usize) -> Vec<(u64, u6
         .map(|(i, pair)| (pair[1].0.saturating_sub(pair[0].1), i))
         .collect();
     gaps.sort_unstable();
+    // Groups of bridged runs are contiguous index intervals: `first_of[e]` is
+    // the first run of the group ending at run `e`, `last_of[s]` the last run
+    // of the group starting at run `s`. Only group endpoints are kept current.
+    let mut first_of: Vec<usize> = (0..runs.len()).collect();
+    let mut last_of: Vec<usize> = (0..runs.len()).collect();
     let mut bridged = vec![false; gaps.len()];
-    for (_, i) in gaps.into_iter().take(runs.len() - max_runs) {
+    let mut remaining = runs.len();
+    for (_, i) in gaps {
+        if remaining <= max_runs {
+            break;
+        }
+        let (first, last) = (first_of[i], last_of[i + 1]);
+        if runs[last].1.saturating_sub(runs[first].0) > max_run_len {
+            continue;
+        }
         bridged[i] = true;
+        first_of[last] = first;
+        last_of[first] = last;
+        remaining -= 1;
     }
-    let mut out: Vec<(u64, u64)> = Vec::with_capacity(max_runs);
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(remaining);
     let mut bridge_previous = false;
     for (run, bridge_next) in runs.into_iter().zip(bridged.into_iter().chain([false])) {
         match out.last_mut() {
@@ -1648,9 +1702,25 @@ impl SegmentFetcher {
         }
     }
 
+    /// Longest run, in bytes, that coalescing or bridging may build out of more
+    /// than one needed range: the fetch budget's limit divided by the GET
+    /// limiter's permit count. The limiter bounds how many GETs are in flight
+    /// at once, so this is each in-flight GET's even share of the budget, and
+    /// joining unwanted gap bytes never makes one GET reserve more than that.
+    /// At least one byte; on the default unlimited budget it is far above any
+    /// object size, so nothing changes there.
+    fn max_run_len(&self) -> u64 {
+        let permits = u64::try_from(self.get_limiter.permits().max(1)).unwrap_or(u64::MAX);
+        (self.memory_budget.limit() / permits).max(1)
+    }
+
     /// Fetches the parts of `needed` that `regions` does not already hold, in
     /// at most `max_runs` GETs: the ranges are coalesced within the coalesce
-    /// gap, then [`bound_runs`] bridges the smallest remaining gaps.
+    /// gap, then [`bound_runs_capped`] bridges the smallest remaining gaps.
+    /// Neither step joins non-overlapping needed ranges into a run longer than
+    /// [`Self::max_run_len`]; a needed range longer than that is fetched whole
+    /// in one GET. When the cap blocks a bridge the fetch can issue more than
+    /// `max_runs` GETs ([`bound_runs_capped`] states the worst case).
     #[allow(clippy::too_many_arguments)]
     async fn ensure_ranges(
         &self,
@@ -1687,7 +1757,12 @@ impl SegmentFetcher {
         // shared semaphore inside `guarded_get` bounds the actual in-flight
         // GETs; `join_all` preserves input order, so the resulting
         // `regions` insert order is identical to the old sequential loop.
-        let runs = bound_runs(coalesce_ranges(missing, self.coalesce_gap), max_runs);
+        let max_run_len = self.max_run_len();
+        let runs = bound_runs_capped(
+            coalesce_ranges_capped(missing, self.coalesce_gap, max_run_len),
+            max_runs,
+            max_run_len,
+        );
         // Reserve the memory the coalesced runs will materialize before the
         // `join_all` issues a single GET (ADR-1170 decision 2): a refusal
         // fails the whole fetch typed, with zero GETs issued, never a smaller
@@ -6550,6 +6625,207 @@ mod tests {
             vec![(0, 4), (6, 7)]
         );
         assert_eq!(bound_runs(Vec::new(), 4), Vec::<(u64, u64)>::new());
+    }
+
+    #[test]
+    fn bound_runs_capped_skips_bridges_past_the_cap() {
+        // Gaps 5, 80, 2 and 380, as above.
+        let runs = vec![(0, 10), (15, 20), (100, 110), (112, 120), (500, 510)];
+        // An unreachable cap is exactly `bound_runs`.
+        for max_runs in 0..6 {
+            assert_eq!(
+                bound_runs_capped(runs.clone(), max_runs, u64::MAX),
+                bound_runs(runs.clone(), max_runs)
+            );
+        }
+        // Cap 20: gaps 2 and 5 bridge, the 80 gap would build (0, 120) and is
+        // skipped, so three runs remain although one was asked for.
+        assert_eq!(
+            bound_runs_capped(runs.clone(), 1, 20),
+            vec![(0, 20), (100, 120), (500, 510)]
+        );
+        // Every adjacent pair left above `max_runs` spans more than the cap.
+        for cap in [1, 10, 20, 50, 120, 400] {
+            let out = bound_runs_capped(runs.clone(), 1, cap);
+            if out.len() > 1 {
+                for pair in out.windows(2) {
+                    assert!(pair[1].1 - pair[0].0 > cap, "{out:?} under cap {cap}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coalesce_ranges_capped_joins_up_to_the_cap_and_keeps_overlaps_whole() {
+        // Gap 2 joins (0,10)+(12,20); (22,30) would make 30 > 25, so it stays
+        // apart, and a touching range past the cap stays apart too.
+        assert_eq!(
+            coalesce_ranges_capped(vec![(0, 10), (12, 20), (22, 30), (30, 40)], 5, 25),
+            vec![(0, 20), (22, 40)]
+        );
+        // Overlapping ranges join whatever the cap, and a range longer than the
+        // cap is one group.
+        assert_eq!(
+            coalesce_ranges_capped(vec![(0, 40), (30, 60), (70, 200)], 5, 25),
+            vec![(0, 60), (70, 200)]
+        );
+        // An unreachable cap is exactly `coalesce_ranges`.
+        let ranges = vec![(1000, 1010), (0, 10), (12, 20), (20, 30)];
+        assert_eq!(
+            coalesce_ranges_capped(ranges.clone(), 5, u64::MAX),
+            coalesce_ranges(ranges, 5)
+        );
+    }
+
+    /// Budget limit and GET permits for the capped-run fetches below: a
+    /// `max_run_len` of 400 / 4 = 100 bytes.
+    const CAPPED_LIMIT: u64 = 400;
+    const CAPPED_PERMITS: usize = 4;
+    const CAPPED_RUN_LEN: u64 = CAPPED_LIMIT / CAPPED_PERMITS as u64;
+
+    /// What one capped `ensure_ranges` call did: each GET's `(start, len)` in
+    /// offset order, the bytes reserved while the regions are held, and the
+    /// call's GET requests and wire bytes as recorded on its phase handle.
+    #[derive(Debug)]
+    struct CappedFetch {
+        gets: Vec<(u64, u64)>,
+        reserved: u64,
+        requests: u64,
+        wire_bytes: u64,
+    }
+
+    /// Runs `ensure_ranges` for `needed` on the many-run segment under a
+    /// [`CAPPED_LIMIT`]-byte budget and [`CAPPED_PERMITS`] GET permits, with
+    /// the given coalesce gap and `max_runs`.
+    async fn capped_ensure_ranges(
+        needed: &[(u64, u64)],
+        coalesce_gap: u64,
+        max_runs: usize,
+    ) -> Result<CappedFetch, FetchError> {
+        let (bytes, tenant_hash, seg_ref, _) = many_run_segment();
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(&seg_ref.data_object_key, bytes, PutOptions::default())
+            .await
+            .expect("put segment object");
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(CAPPED_LIMIT));
+        let fetcher = SegmentFetcher::new(backend)
+            .with_whole_object_threshold(0)
+            .with_suffix_len(16)
+            .with_coalesce_gap(coalesce_gap)
+            .with_max_concurrent_gets(CAPPED_PERMITS)
+            .with_memory_budget(budget.clone());
+        assert_eq!(fetcher.max_run_len(), CAPPED_RUN_LEN);
+        let (_footer, _total, suffix_etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &QueryAccounting::new())
+            .await
+            .expect("open segment");
+        let end = needed.iter().map(|r| r.1).max().unwrap_or(0);
+        assert!(
+            needed.iter().all(|r| !regions.covers(r.0, r.1)) && end < seg_ref.object_size,
+            "every needed range lies in the {}-byte object and is missing after the open",
+            seg_ref.object_size
+        );
+        let opened = regions.buffers.len();
+        let accounting = QueryAccounting::new();
+        let cost = fetcher
+            .ensure_ranges(
+                &seg_ref,
+                tenant_hash,
+                &suffix_etag,
+                needed,
+                max_runs,
+                &mut regions,
+                &accounting,
+            )
+            .await?;
+        let mut gets: Vec<(u64, u64)> = regions.buffers[opened..]
+            .iter()
+            .map(|(start, b)| (*start, b.len() as u64))
+            .collect();
+        gets.sort_unstable();
+        let snapshot = accounting.snapshot();
+        assert_eq!(cost.requests, snapshot.s3_requests(AccountedOp::Get));
+        assert_eq!(cost.bytes, snapshot.s3_bytes(AccountedOp::Get));
+        Ok(CappedFetch {
+            gets,
+            reserved: budget.reserved(),
+            requests: snapshot.s3_requests(AccountedOp::Get),
+            wire_bytes: snapshot.s3_bytes(AccountedOp::Get),
+        })
+    }
+
+    /// Eight 16-byte needed ranges, 64 bytes apart: 128 needed bytes over a
+    /// 464-byte span.
+    fn sparse_needed() -> Vec<(u64, u64)> {
+        (0..8).map(|i| (64 * i, 64 * i + 16)).collect()
+    }
+
+    /// Issue #3818: coalescing under a 64-byte gap chains all eight ranges into
+    /// one 464-byte run, more than the 400-byte budget, although the 128 needed
+    /// bytes fit it. With the cap no run passes 100 bytes, so the fetch issues
+    /// four 80-byte GETs and reserves and moves exactly their 320 bytes.
+    ///
+    /// FLIP: drop the cap from `coalesce_ranges_capped` (today's
+    /// `coalesce_ranges`) and the `expect` fails with `FetchMemoryExhausted {
+    /// requested: 464, .. }`.
+    #[tokio::test]
+    async fn coalescing_never_builds_a_run_past_the_fetch_share() {
+        let fetched = capped_ensure_ranges(&sparse_needed(), 64, usize::MAX)
+            .await
+            .expect("needed bytes that fit the budget are fetched");
+        assert_eq!(fetched.gets, vec![(0, 80), (128, 80), (256, 80), (384, 80)]);
+        let largest = fetched.gets.iter().map(|g| g.1).max();
+        assert_eq!(largest, Some(80));
+        assert!(largest <= Some(CAPPED_RUN_LEN));
+        assert_eq!(fetched.reserved, 320);
+        assert_eq!(fetched.requests, 4);
+        assert_eq!(fetched.wire_bytes, 320);
+    }
+
+    /// The bridging half of issue #3818: with no coalesce gap the eight ranges
+    /// are eight runs, and bridging down to two would build a 400-byte run plus
+    /// a 16-byte one (416 bytes, over the budget). The capped bridge stops at
+    /// 80-byte runs, so four GETs go out, more than `max_runs`, within the
+    /// `2 * S / max_run_len + 1` worst case `bound_runs_capped` states.
+    ///
+    /// FLIP: keep the cap in coalescing only and bridge with plain
+    /// `bound_runs`, and the `expect` fails with `FetchMemoryExhausted {
+    /// requested: 416, .. }`; today's code fails the same way.
+    #[tokio::test]
+    async fn bridging_never_builds_a_run_past_the_fetch_share() {
+        let fetched = capped_ensure_ranges(&sparse_needed(), 0, 2)
+            .await
+            .expect("needed bytes that fit the budget are fetched");
+        assert_eq!(fetched.gets, vec![(0, 80), (128, 80), (256, 80), (384, 80)]);
+        assert!(fetched.gets.iter().all(|g| g.1 <= CAPPED_RUN_LEN));
+        let span = 464;
+        assert!(fetched.requests <= 2 * span / CAPPED_RUN_LEN + 1);
+        assert_eq!(fetched.reserved, 320);
+        assert_eq!(fetched.wire_bytes, 320);
+    }
+
+    /// The cap never splits a needed range: a 200-byte needed range, twice the
+    /// cap, is one 200-byte GET, and two overlapping ranges spanning 120 bytes
+    /// are one GET. The touching 16-byte range after the long one is its own
+    /// GET, since joining it would only grow a run already past the cap.
+    ///
+    /// FLIP: chopping each run into cap-sized pieces instead fetches (0,200)
+    /// as (0,100) and (100,100), and today's uncapped coalescing joins the
+    /// touching range into one 216-byte GET; either fails the `gets` assertion.
+    #[tokio::test]
+    async fn the_cap_never_splits_a_needed_range() {
+        let needed = [(0, 200), (200, 216), (300, 310), (400, 450), (420, 520)];
+        let fetched = capped_ensure_ranges(&needed, 64, usize::MAX)
+            .await
+            .expect("needed bytes that fit the budget are fetched");
+        assert_eq!(
+            fetched.gets,
+            vec![(0, 200), (200, 16), (300, 10), (400, 120)]
+        );
+        assert_eq!(fetched.reserved, 346);
+        assert_eq!(fetched.wire_bytes, 346);
     }
 
     /// An L0 segment of 16 scalar series `s00`..`s15` and 16 histogram series
