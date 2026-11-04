@@ -110,7 +110,7 @@ deploy/metricsbench/aws/launch.sh "$H" "<image@digest>" "$H" 1793595495000 f1
 The arguments, in order:
 1. the harness commit;
 2. the Ravel image;
-3. the Ravel source commit, which is the harness commit for a `manual-<sha>` image;
+3. the Ravel source commit, which is the harness commit for a `manual-<sha>` image. A commit this checkout has is resolved to its full id; anything else must already be a full 40-character id, or `launch.sh` refuses it with exit 64 before uploading anything;
 4. the anchor, in milliseconds;
 5. a label;
 6. the bucket prefix, real S3 only.
