@@ -1084,22 +1084,23 @@ catalog-probe path, whole.
 An L1 segment keeps unbounded page runs, since a compacted segment can be far
 larger than one flush and bridging its gaps would move far more.
 
-Both steps are capped in bytes (issue #3818). Neither coalescing nor bridging
-joins two non-overlapping needed ranges into a run longer than
+Both steps are capped in bytes. Neither coalescing nor bridging joins two
+non-overlapping needed ranges into a run longer than
 `SegmentFetcher::max_run_len`, the fetch memory budget's limit divided by the
 GET limiter's permit count (each in-flight GET's even share of the budget),
 never less than `MIN_MAX_RUN_LEN` (8 MiB, ingest's flush `target_bytes`). For
 an object of at most 8 MiB the cap never binds, so its runs, its request law
-and a refusal's requested figure do not depend on the budget's limit. Under `--memory-budget-bytes 6442450944` and `--fetch-concurrency 32` that is
+and a refusal's requested figure do not depend on the budget's limit. Under
+`--memory-budget-bytes 6442450944` and `--fetch-concurrency 32` that is
 4,380,866,643 / 32 = 136,902,082 bytes. Without the cap, 64 KiB gaps between
-small pages of a large L1 part chain into one run spanning most of the part,
-and its gap bytes are reserved against the budget with the pages. The cap
-never splits a needed range: a range longer than the cap, or overlapping
-ranges, are fetched whole in one GET. A bridge the cap refuses stays open, so
-an L0 fetch can issue more than 4 page GETs when its object is longer than the
-cap (so never for an object of at most 8 MiB); when more than the bound remain, every two adjacent runs span more than
-the cap, so a fetch over an object span `S` issues at most `2 * S /
-max_run_len + 1` page GETs. On the default unlimited budget the cap exceeds
+small pages of a large L1 segment chain into one run spanning most of the
+segment, and its gap bytes are reserved against the budget with the pages.
+The cap never splits a needed range: a range longer than the cap, or
+overlapping ranges, are fetched whole in one GET. A bridge the cap refuses
+stays open, so an L0 fetch can issue more than 4 page GETs when its object is
+longer than the cap (so never for an object of at most 8 MiB); when more than
+the bound remain, every two adjacent runs span more than the cap, so a fetch
+over an object span `S` issues at most `2 * S / max_run_len + 1` page GETs. On the default unlimited budget the cap exceeds
 any object and nothing changes.
 
 ## Fetch-layer memory reservations
