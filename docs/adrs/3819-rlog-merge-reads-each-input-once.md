@@ -94,7 +94,7 @@ stay resident for the whole merge and are charged at fetch time to
 reservations use today (`crates/ravel-maintain/src/rlog.rs:2942, 2978`).
 
 The merge takes the resident path only when one sum fits a resident ceiling:
-the inputs' raw bytes, plus one pass's retained rows (D2), plus the worst-case
+the inputs' raw bytes, plus the pass budget's floor (D2), plus the worst-case
 cursor charge of any range that will use D3. The worst case is the largest
 D3 range's cursor reservations, with their raw term counted once, since those
 cursors read the resident bytes. Otherwise the merge fetches per pass (D2), so
@@ -126,7 +126,7 @@ scheme: a shared budget that merges wait on is #3825.
 ### D2. Emit in stream-range passes, decoding each block once per pass
 
 The merge splits its sorted stream ids into contiguous ranges, each sized so
-that its retained rows fit a pass budget. For each range, it decodes every
+that its retained rows fit the pass budget (defined below). For each range, it decodes every
 input's blocks once, from the resident bytes or from one fetch, and keeps the
 rows of the range's streams in columnar form (`StreamBlockRows`, ADR-0979).
 It then emits those streams with today's k-way merge, in today's order:
@@ -148,9 +148,31 @@ reads, multiplied by a decoded-bytes-per-record estimate. Measuring that
 estimate on this fixture is the first task. The row-heap ratio of 55 to 67 is
 an upper bound for the columnar form, not its value.
 
+**The pass budget.** Each merge derives it from `merge_resident_ceiling_bytes`
+and the catalog sizes it already holds. It is not a separate config input,
+so each entry point sets it only through the ceiling in D1's table:
+
+| path | `pass_budget` |
+|---|---|
+| resident | ceiling − inputs' raw bytes − worst-case D3 charge |
+| fetch-per-pass | ceiling − worst-case D3 charge − the raw bytes of the row groups being decoded at once (at most `input_read_concurrency` groups) |
+
+- **Floor.** The budget is never below a floor of `l1_part_memory_target_bytes`,
+  the derived part memory target (256 MiB at the least). D1 takes the
+  resident path only when the resident row's value is at or above the floor.
+  When even the fetch-per-pass value is below the floor, the merge emits
+  every stream through D3, which is today's merge, unchanged.
+- **Charge.** A pass's retained rows are charged to `merge_cursor_budget_bytes`
+  at decode time, through the same running charge as everything else. When
+  the charge would pass `pass_budget` before the range is complete, because
+  the estimate was low, the merge halves the range and decodes it again. It
+  does not abort. The output is unchanged, since a range's boundaries move
+  only memory and passes, never the emitted sequence.
+- **D3.** A stream whose estimate alone exceeds `pass_budget` is D3's stream.
+
 ### D3. A stream larger than one pass keeps today's streaming cursors
 
-A single stream whose estimate exceeds the pass budget is a range of its own,
+A single stream whose estimate exceeds `pass_budget` is a range of its own,
 emitted with today's per-input `StreamCursor`s. It reads from the resident
 bytes when D1 holds them, and fetches as today otherwise. This keeps
 ADR-0065 decision 4's bound for one hot stream, the 45.7 GB case #711 fixed:
