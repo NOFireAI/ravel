@@ -698,11 +698,9 @@ fn part_layout(snapshot: &Snapshot, parts: &SnapshotParts) -> Vec<(BTreeSet<Stri
 /// second run is served from the read cache with the same routing counts.
 ///
 /// FLIP: routing `SegmentRoute::Uncovered` as `Pruned` in the spans provider
-/// still covers both parts here, but the unfolded lookup in
-/// `unfolded_absent_object_costs_three_gets_under_sixteen_kib_and_no_skip_idx_read`
-/// returns no rows. Passing `None` for a `Blocks` survivor's set in
-/// `spans_scan` reads each holder's KEY_IDX, which the per-object read list
-/// here rejects.
+/// empties the unfolded baseline, which must hold three rows. Pushing `None`
+/// for a `Blocks` survivor's set in the spans provider reads each holder's
+/// KEY_IDX, which the holder's read list here rejects.
 #[tokio::test]
 async fn folded_lookup_reads_two_leaf_gets_and_no_pruned_object() {
     let _serial = SERIAL.lock().await;
@@ -846,7 +844,8 @@ async fn folded_lookup_reads_two_leaf_gets_and_no_pruned_object() {
 /// with no block read.
 ///
 /// FLIP: an `Uncovered` segment routed as `Pruned` in the spans provider
-/// returns no rows here.
+/// returns no rows here, and `build_stats_json` rendering `keyIndex` only
+/// once a part or leaf figure moved leaves `stats.keyIndex` absent here.
 #[tokio::test]
 async fn unfolded_absent_object_costs_three_gets_under_sixteen_kib_and_no_skip_idx_read() {
     let _serial = SERIAL.lock().await;
