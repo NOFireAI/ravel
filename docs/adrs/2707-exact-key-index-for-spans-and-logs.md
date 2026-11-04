@@ -1467,11 +1467,11 @@ GET recorder; the real-S3 figure stays predicted until a lane measures it.
 
 | check | band | figure | source |
 |---|---|---|---|
-| first read per object | at most 8,192 B | the 8 KiB suffix, or the whole object when shorter | services/ravel-server/tests/trace_by_id_tier2.rs:892; crates/ravel-query/src/span_fetcher.rs:4843 |
-| uncovered object without the trace | 3 requests, under 16 KiB, no SKIP_IDX or block read | 3 requests, under 16 KiB, no SKIP_IDX read | services/ravel-server/tests/trace_by_id_tier2.rs:891 |
-| covering part | 2 leaf GETs | 2 per part, `leafGetRequests` 4 over 2 parts | services/ravel-server/tests/trace_by_id_tier2.rs:764 |
-| object a covering part's leaves prune | 0 GETs | 0 | services/ravel-server/tests/trace_by_id_tier2.rs:759 |
-| part past the ceiling | tier-1 probe, never a scan | the suffix and KEY_IDX reads, no block of a non-holder | services/ravel-server/tests/trace_by_id_tier2.rs:995 |
+| first read per object | at most 8,192 B | the 8 KiB suffix, or the whole object when shorter | services/ravel-server/tests/trace_by_id_tier2.rs:932; crates/ravel-query/src/span_fetcher.rs:4843 |
+| uncovered object without the trace | 3 requests, under 16 KiB, no SKIP_IDX or block read | 3 requests, under 16 KiB, no SKIP_IDX read | services/ravel-server/tests/trace_by_id_tier2.rs:931 |
+| covering part | 2 leaf GETs | 2 per part, `leafGetRequests` 4 over 2 parts | services/ravel-server/tests/trace_by_id_tier2.rs:786 |
+| object a covering part's leaves prune | 0 GETs | 0 | services/ravel-server/tests/trace_by_id_tier2.rs:777 |
+| part past the ceiling | tier-1 probe, never a scan | the suffix and KEY_IDX reads, no block of a non-holder | services/ravel-server/tests/trace_by_id_tier2.rs:1055 |
 | spans 1 h lookup, cold, folded, real S3: bytes | 2 leaf GETs per covering part plus the holders' reads | not measured | predicted |
 
 Refs: #3702, #3692, #3118
