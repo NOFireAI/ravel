@@ -147,7 +147,7 @@ use ravel_rspan::{
 use crate::bucket::Bucket;
 use crate::build::{BuiltPart, put_part_with_ledger};
 use crate::codec::SegmentCodec;
-use crate::config::{CompactorConfig, MergeMemoryTracker};
+use crate::config::{CompactorConfig, MergeCharges, MergeMemoryTracker};
 use crate::error::{MaintainError, Result};
 use crate::read::InputRecord;
 use crate::read_gate::MaintainReadGate;
@@ -896,9 +896,9 @@ impl<'a> BlockCursor<'a> {
             note_get(ledger, RequestPhase::BlockRead, &got);
             let got = got?;
             let raw_len = got.data.len() as u64;
-            if let Some(t) = tracker {
-                t.block_fetched(raw_len);
-            }
+            // Releases the raw charge if the decode below fails.
+            let mut charge = MergeCharges::new(tracker);
+            charge.fetched(raw_len);
             // The decode runs on the read gate (ADR-1702), sized by the
             // block's raw bytes. The job owns them and drops them when it
             // returns, so they stay resident until the decoded block exists,
@@ -912,12 +912,10 @@ impl<'a> BlockCursor<'a> {
                 })
                 .await??;
             let decoded_bytes: u64 = recs.iter().map(estimate_record).sum();
-            if let Some(t) = tracker {
-                // Records both raw and decoded resident at the high-water
-                // instant; the raw buffer is already gone with the job.
-                t.block_decoded(raw_len, decoded_bytes);
-            }
-            self.block_bytes = decoded_bytes;
+            // Records both raw and decoded resident at the high-water
+            // instant; the raw buffer is already gone with the job.
+            charge.decoded(raw_len, decoded_bytes);
+            self.block_bytes = charge.hand_off_decoded();
             self.block = recs.into_iter();
             if let Some(rec) = self.block.next() {
                 self.head = Some(rec);
