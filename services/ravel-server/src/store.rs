@@ -782,8 +782,8 @@ mod tests {
     #[test]
     fn maintain_mode_requires_multipart_and_fails_without_it() {
         // A backend meeting every always-mandatory flag but not multipart
-        // (exactly what MemoryStore and S3Store report today) must fail startup
-        // in maintain mode, naming multipart as the offending flag.
+        // must fail startup in maintain mode, naming multipart as the
+        // offending flag.
         let backend = StubBackend {
             caps: Capabilities::mandatory(),
         };
@@ -807,6 +807,38 @@ mod tests {
         let backend = StubBackend { caps };
         check_capabilities(&backend, Mode::Maintain)
             .expect("maintain mode must start on a multipart-capable backend");
+    }
+
+    /// `--mode maintain --store gcs` passes the capability gate: `GcsStore`
+    /// declares multipart (#3802), so startup no longer refuses with
+    /// "unsupported: multipart".
+    #[tokio::test]
+    async fn maintain_mode_accepts_the_gcs_backend() {
+        use clap::Parser;
+        use ravel_object_store::gcs::fake::FakeGcs;
+
+        let fake = FakeGcs::start("ravel-maintain").await.expect("fake GCS");
+        let gcs = GcsStore::new(fake.config()).expect("GcsStore");
+        check_capabilities(&gcs, Mode::Maintain)
+            .expect("GcsStore's declared capabilities satisfy maintain mode");
+
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--mode",
+            "maintain",
+            "--store",
+            "gcs",
+            "--gcs-bucket",
+            fake.bucket(),
+            "--gcs-endpoint",
+            fake.endpoint(),
+        ])
+        .expect("a maintain-mode GCS command line parses");
+        assert_eq!(cli.mode, Mode::Maintain);
+        assert_eq!(cli.store, StoreKind::Gcs);
+        if let Err(err) = build_store(&cli, crate::config::DEFAULT_CACHE_MAX_BYTES) {
+            panic!("maintain mode must start on GCS, got: {err:#}");
+        }
     }
 
     #[test]

@@ -1977,9 +1977,16 @@ fn outcome_of(key: &str, result: object_store::PutResult) -> Result<PutOutcome, 
 /// or `complete` returns a non-retryable [`multipart_poisoned`] error telling
 /// the caller to abort and restart. A part-sequence violation poisons the same
 /// way. `abort` stays callable on a poisoned handle.
+///
+/// `GcsStore` drives the same handle over `object_store`'s GCS XML multipart
+/// client, whose part index and `complete` check behave the same way; only the
+/// `PutResult -> PutOutcome` conversion differs, which is why it is a field.
 pub struct S3MultipartUpload {
     key: String,
     upload: Box<dyn OsMultipartUpload>,
+    /// Builds the outcome `complete` returns: [`outcome_of`] for S3 (Version
+    /// is the ETag), the generation for GCS.
+    outcome: OutcomeOf,
     sequence: PartSequence,
     /// Set by `complete`/`abort`; every later call on this handle fails
     /// instead of issuing a second request against a dead upload id.
@@ -1990,6 +1997,24 @@ pub struct S3MultipartUpload {
     /// while `abort` stays callable. A checksum mismatch deliberately does not
     /// set this (it leaves the upload open for a re-send).
     poison: Option<String>,
+}
+
+/// The `PutResult -> PutOutcome` conversion a multipart handle applies on
+/// `complete`.
+pub(crate) type OutcomeOf = fn(&str, object_store::PutResult) -> Result<PutOutcome, StoreError>;
+
+impl S3MultipartUpload {
+    /// Wraps an already-initiated `object_store` upload for `key`.
+    pub(crate) fn new(key: &str, upload: Box<dyn OsMultipartUpload>, outcome: OutcomeOf) -> Self {
+        Self {
+            key: key.to_string(),
+            upload,
+            outcome,
+            sequence: PartSequence::default(),
+            finished: false,
+            poison: None,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -2040,7 +2065,7 @@ impl MultipartUpload for S3MultipartUpload {
         self.sequence.finish(&self.key)?;
         let result = self.upload.complete().await.map_err(map_error_common)?;
         self.finished = true;
-        outcome_of(&self.key, result)
+        (self.outcome)(&self.key, result)
     }
 
     async fn abort(&mut self) -> Result<(), StoreError> {
@@ -2725,13 +2750,7 @@ impl ObjectStoreBackend for S3Store {
             .put_multipart(&path_of(key)?)
             .await
             .map_err(map_error_common)?;
-        Ok(Box::new(S3MultipartUpload {
-            key: key.to_string(),
-            upload,
-            sequence: PartSequence::default(),
-            finished: false,
-            poison: None,
-        }))
+        Ok(Box::new(S3MultipartUpload::new(key, upload, outcome_of)))
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
@@ -3048,15 +3067,13 @@ mod tests {
     #[tokio::test]
     async fn backend_put_part_failure_poisons_handle() {
         let aborts = Arc::new(AtomicUsize::new(0));
-        let mut handle = S3MultipartUpload {
-            key: "poison".to_string(),
-            upload: Box::new(FailingPartUpload {
+        let mut handle = S3MultipartUpload::new(
+            "poison",
+            Box::new(FailingPartUpload {
                 aborts: Arc::clone(&aborts),
             }),
-            sequence: PartSequence::default(),
-            finished: false,
-            poison: None,
-        };
+            outcome_of,
+        );
 
         let part = Bytes::from(vec![0u8; crate::MULTIPART_MIN_PART_SIZE]);
         // First failure: the classified backend error (Transient here), which

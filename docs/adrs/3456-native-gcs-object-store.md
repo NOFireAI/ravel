@@ -117,7 +117,9 @@ type from `ExternalStore`, which stays read-only.
   a fixed wire maximum instead; see the XML listing correction at the end of
   this ADR.)
 - **Multipart.** `multipart: false`. A single GCS upload takes objects far
-  larger than any Ravel object, so no caller needs it.
+  larger than any Ravel object, so no caller needs it. (Replaced: maintain
+  mode requires multipart; see the multipart amendment at the end of this
+  ADR.)
 - **Upload checksum.** `upload_checksum: false` in this ADR. CRC32C through
   `x-goog-hash` is follow-up work. The capability is not mandatory, and full
   reads are counted on `ravel_store_get_unverified_total`, as they are for S3
@@ -324,7 +326,8 @@ The JSON listing also reports a different ETag from the XML API. Its `etag`
 field is not the ETag a HEAD returns. `GcsStore` therefore reports each
 listed object's ETag as the quoted hex of its `md5Hash`, which equals the
 HEAD ETag for an object written in a single upload. Every object Ravel writes
-is a single upload. A composite object has no `md5Hash`. Measured the same
+is a single upload (no longer so; see the multipart amendment below). A
+composite object has no `md5Hash`. Measured the same
 day, its HEAD ETag is a dash followed by its JSON `etag` (JSON
 `COTqrI7f35cDEAE=`, HEAD `"-COTqrI7f35cDEAE="`), so a listed composite is
 reported that way. A listed object with neither field fails the listing call
@@ -338,3 +341,87 @@ exactly as the S3 lister does for the same case. The contract suite's
 delimited probes therefore finish in one response. The multi-response
 delimited drain is covered by the listing client's own unit tests, not by
 the cross-page probes.
+
+## Amendment (2026-11-04): multipart for maintain (#3802)
+
+<!-- amendment-applies: sections="D1. A `GcsStore` backend in ravel-object-store" pointer="multipart amendment" -->
+<!-- amendment-supersedes: phrase="so no caller needs it" pointer="multipart amendment" -->
+<!-- amendment-supersedes: phrase="Every object Ravel writes is a single upload" pointer="multipart amendment" -->
+
+D1's "Multipart" bullet is replaced. `GcsStore` reports `multipart: true` and
+implements `put_multipart` with the trait's semantics.
+
+**Why.** `--mode maintain` requires multipart: `required_capabilities(Mode::Maintain)`
+adds it to the mandatory set (`services/ravel-server/src/store.rs`), and
+startup refuses a backend that lacks it. D1 judged multipart only as a way to
+write objects too large for one upload, found none, and concluded no caller
+needed it. It did not check the mode-conditional capability gate, which reads
+the declared flag and not whether a caller uploads parts. Today no compactor
+calls `put_multipart` (ravel-maintain writes its outputs with single
+`CreateIfAbsent` puts); the gate is there for the large L1/L2 outputs
+compaction is meant to stream (docs/object-store-contract.md,
+"Mode-conditional capabilities"). So with `multipart: false` a GCS
+deployment had no maintain process, and with none, nothing compacts and
+nothing is garbage-collected.
+
+**Reproduction.** v0.30.0 with `ravel-server --mode maintain --store gcs`
+exits at startup with:
+
+```text
+object store backend does not satisfy mandatory capabilities (unsupported: multipart); refusing to start.
+```
+
+A 3 h logs benchmark on a GCS bucket with no maintain process left 99.9% of
+the bucket's objects as L0 flush objects, median size 0.18 MiB.
+
+**What changed.**
+
+- `put_multipart` uses the GCS XML API's S3-shaped multipart protocol through
+  `object_store`'s GCS client: `POST <key>?uploads` (the response names the
+  `UploadId`), `PUT <key>?partNumber=N&uploadId=X` per part (the part's
+  `ETag` comes back in the response header), `POST <key>?uploadId=X` with a
+  `CompleteMultipartUpload` body listing each part's number and ETag, and
+  `DELETE <key>?uploadId=X` to abort.
+- The handle is `S3Store`'s (`S3MultipartUpload`), shared rather than copied:
+  the checksum pre-flight on each part, the part-sequence rules, poisoning,
+  and abort are the same code on both backends. The one difference is the
+  completed outcome: S3 keeps its ETag as the version, and `GcsStore` takes
+  the version from the complete response's `x-goog-generation` header and
+  the ETag from its `CompleteMultipartUploadResult` body. `S3Store`'s
+  behaviour is unchanged.
+- The in-process fake serves the four requests, assigns a completed upload a
+  generation exactly as it does a PUT, and refuses a short non-final part at
+  completion with `EntityTooSmall`. The contract suite's multipart cases run
+  against `GcsStore` on the fake in every CI run.
+- As on S3, the multipart requests are not counted into `StoreMetrics`, and
+  there is no multipart `CreateIfAbsent` or `CasVersion`.
+
+**Qualification.** Nothing to re-run. The conformance suite
+(`crates/ravel-object-store/src/conformance.rs`, `CONFORMANCE_SUITE_VERSION`
+3) neither probes multipart nor records it in `sys/qualification`; its only
+multipart concern is the informational, non-blocking
+`AbortIncompleteMultipartUpload` lifecycle line, which `GcsStore` cannot
+answer because it has no bucket-protection probes (D6). The maintain gate reads the backend's
+declared capabilities at startup. A bucket qualified under v0.30.0 stays
+qualified, the suite version is not bumped, and an operator upgrades the
+image and starts the maintain process. Two things remain for the operator:
+
+- Configure an `AbortIncompleteMultipartUpload` lifecycle rule of 7 days or
+  less on the bucket, as docs/object-store-contract.md requires of any bucket
+  Ravel writes multipart uploads to. Nothing in Ravel checks it on GCS.
+- To check multipart against real GCS rather than the fake, run the
+  contract lane with `RAVEL_GCS_TEST_BUCKET` set (`cargo test -p
+  ravel-object-store --test contract gcs_contract`).
+
+**Open: listing a multipart object.** Google documents no MD5 for an object
+completed through XML multipart, and its ETag is the S3-style
+`"<digest>-<part count>"` form. `GcsStore`'s listing gives each item the
+ETag HEAD reports from `md5Hash` or `componentCount`, and fails the call on
+an item with neither (see the XML listing correction above). Whether GCS
+lists such an object with a `componentCount` is unmeasured. The fake lists it
+with neither, and `gcs::tests::listing_over_a_multipart_object_fails_the_call`
+pins that the listing then fails. The real-bucket contract lane's cleanup
+lists the multipart object its suite leaves behind, so its first run answers
+the question. Until then, an object this path writes may fail a listing over
+its prefix on real GCS. No production writer uses `put_multipart` today
+(above), so no Ravel-written object reaches that listing yet.

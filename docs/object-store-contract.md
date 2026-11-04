@@ -590,10 +590,10 @@ permit like any other op
 part carries a server-verified checksum, not only the first, under
 `upload_integrity`. The maintain-mode requirement stands so that compaction
 can stream large L1/L2 segments as multipart uploads once it is written to
-use them; `MemoryStore` and `S3Store` both report `multipart: true` and
-implement the sequence, so `--mode maintain` starts against the memory
-oracle and against any S3-compatible endpoint regardless of whether a
-caller exercises the path. (`S3Store::put` does take an internal multipart
+use them; `MemoryStore`, `S3Store` and `GcsStore` all report `multipart: true`
+and implement the sequence, so `--mode maintain` starts against the memory
+oracle, against any S3-compatible endpoint and against a GCS bucket
+regardless of whether a caller exercises the path. (`S3Store::put` does take an internal multipart
 path above its threshold, but that is a size-driven implementation detail of
 `put`, not a caller reaching for `put_multipart`; see "When `put()` uses it"
 below.)
@@ -1052,24 +1052,43 @@ sends through the same connector and takes its bearer token from the
 data-plane client's credential provider. Requests the client makes to fetch
 credentials are neither counted nor dated.
 
-`GcsStore` does not do three things S3 does: **no multipart upload**
-(`multipart: false`, and `put_multipart` refuses, so it does not satisfy
-`required_capabilities(Mode::Maintain)`; see "Mode-conditional
-capabilities"), **no upload checksums** (`upload_checksum:
-false`; a caller's CRC32C is still checked against the buffer before the
-request, and is not sent), and **no bucket-protection probes** (the
-"Required bucket configuration" checks below are S3 control-plane reads with
-no GCS counterpart here). Every full-object read is counted by
-`GcsStore::get_unverified` and on the shared `StoreMetrics`
-(`ravel_store_get_unverified_total`), since no stored checksum is checked on
-read.
+`GcsStore` reports `multipart: true`, so it satisfies
+`required_capabilities(Mode::Maintain)` (see "Mode-conditional
+capabilities"; ADR-3456, multipart amendment). `put_multipart` speaks the XML
+API's S3-shaped multipart protocol: `POST <key>?uploads` opens the upload,
+`PUT <key>?partNumber=N&uploadId=X` sends each part, `POST <key>?uploadId=X`
+with a `CompleteMultipartUpload` body publishes it, and `DELETE
+<key>?uploadId=X` aborts it. The handle is `S3Store`'s, so the part-sequence
+rules, the checksum pre-flight and poisoning under "Multipart upload" hold
+unchanged; the one difference is the outcome, whose version is the
+generation the complete response's `x-goog-generation` header names. As on
+S3, the multipart requests are not counted into `StoreMetrics`. An
+object completed this way has no `md5Hash`, so a listing that reaches one
+fails, as for any listed item with neither `md5Hash` nor `componentCount`
+(above), until the real-bucket lane shows what GCS lists for it. The
+"Visibility and abort" rule that the bucket configure
+`AbortIncompleteMultipartUpload` applies to a GCS bucket too (GCS lifecycle
+rules carry that action), and nothing in Ravel checks it there.
+
+`GcsStore` does not do two things S3 does: **no upload checksums**
+(`upload_checksum: false`; a caller's CRC32C is still checked against the
+buffer before the request, on a part as on a `put`, and is not sent), and
+**no bucket-protection probes** (the "Required bucket configuration" checks
+below are S3 control-plane reads with no GCS counterpart here). Every
+full-object read is counted by `GcsStore::get_unverified` and on the shared
+`StoreMetrics` (`ravel_store_get_unverified_total`), since no stored checksum
+is checked on read.
 
 `crates/ravel-object-store/tests/contract.rs` runs the contract suite against
 `GcsStore` on the in-process fake GCS endpoint (`gcs::fake`, behind the
 `test-support` feature) in every run, and against a real bucket when
 `RAVEL_GCS_TEST_BUCKET` names one, with Application Default Credentials; it
-prints a skip line when the variable is unset. No production caller builds a
-`GcsStore` yet: ravel-server and ravel-cli do not accept `--store gcs`.
+prints a skip line when the variable is unset. The fake run includes the
+suite's multipart cases and asserts that the fake served the upload's
+initiation and holds the completed object. ravel-server builds a `GcsStore`
+for `--store gcs` (`services/ravel-server/src/store.rs`), and
+`maintain_mode_accepts_the_gcs_backend` there pins that maintain mode's
+capability check passes on it.
 
 ### Credentials
 
@@ -1799,9 +1818,10 @@ ADR-0042 decision 3.
    (`maxResults` is the page size for `list` and `list_after` and 1000 for
    `list_delimited`), returning a page one name short
    rather than sending a second request when the dropped inclusive start
-   name is the only shortfall (see "Backend support notes"). No
-   multipart, no upload checksums, no bucket-protection probes (see "Backend
-   support notes").
+   name is the only shortfall (see "Backend support notes"). Multipart
+   through the XML API on `S3Store`'s handle, with the generation as the
+   completed version; no upload checksums, no bucket-protection probes (see
+   "Backend support notes").
 
 ### Instrumentation decorator
 

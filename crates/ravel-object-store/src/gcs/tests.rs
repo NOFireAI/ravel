@@ -5,7 +5,7 @@ use object_store::client::{HttpConnector, HttpRequestBody};
 use object_store::gcp::GcpCredential;
 use object_store::{ClientOptions, StaticCredentialProvider};
 
-use super::fake::{FakeGcs, RecordedRequest};
+use super::fake::{FakeGcs, RecordedRequest, hex as fake_hex, md5 as fake_md5};
 use super::{GcsConfig, GcsStore, is_generation, list_client, store_authority};
 use crate::conformance::{Property, run_conformance_suite_with_seeder};
 use crate::s3::connector::{self, ObservedStoreTime, S3HttpConnector};
@@ -276,6 +276,29 @@ async fn attempts_and_observed_store_time_are_recorded() {
     assert_eq!(attempts(StoreOp::ListDelimited), 1);
     assert_eq!(attempts(StoreOp::Delete), 1);
     assert_eq!(fake.requests().len(), 7, "every attempt counted, no more");
+}
+
+#[tokio::test]
+async fn multipart_requests_are_not_counted() {
+    let fake = fake().await;
+    let metrics = Arc::new(StoreMetrics::default());
+    let store = InstrumentedStore::with_metrics(
+        GcsStore::with_metrics(fake.config(), Arc::clone(&metrics)).expect("store"),
+        Arc::clone(&metrics),
+    );
+    let mut upload = store.put_multipart("m/mp").await.expect("open");
+    upload
+        .put_part(Bytes::from_static(b"part"), None)
+        .await
+        .expect("part");
+    upload.complete().await.expect("complete");
+    assert_eq!(fake.requests().len(), 3, "initiate, one part, complete");
+
+    let snapshot = metrics.snapshot();
+    for op in StoreOp::ALL {
+        assert_eq!(snapshot.op(op).attempts, 0, "{op:?}");
+        assert_eq!(snapshot.op(op).calls, 0, "{op:?}");
+    }
 }
 
 #[tokio::test]
@@ -612,17 +635,409 @@ async fn listing_pages_carry_generations_and_report_unaddressable_keys() {
 }
 
 #[tokio::test]
-async fn multipart_is_refused_and_capabilities_say_so() {
+async fn capabilities_declare_multipart_and_no_upload_checksum() {
     let fake = fake().await;
     let store = store(&fake);
     let caps = store.capabilities();
-    assert!(!caps.multipart);
+    assert!(caps.multipart);
     assert!(!caps.upload_checksum);
     assert!(caps.consistent_read && caps.consistent_list);
     assert!(caps.create_if_absent && caps.cas_version);
     assert!(caps.suffix_range && caps.prefix_list);
-    assert!(store.put_multipart("mp/k").await.is_err());
     assert!(fake.requests().is_empty(), "{:?}", fake.requests());
+}
+
+fn filled(len: usize, seed: u8) -> Bytes {
+    Bytes::from(
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect::<Vec<u8>>(),
+    )
+}
+
+/// The requests a multipart upload sent for `key`, as `METHOD query`, with
+/// the upload id replaced by `X` so the sequence can be compared whole.
+fn multipart_requests(fake: &FakeGcs, key: &str) -> Vec<String> {
+    fake.requests()
+        .into_iter()
+        .filter(|r| r.is_object(BUCKET, key) && r.method != "GET" && r.method != "HEAD")
+        .map(|r| {
+            let query: Vec<String> = r
+                .query
+                .iter()
+                .map(|(name, value)| match name.as_str() {
+                    "uploadId" => "uploadId=X".to_string(),
+                    _ if value.is_empty() => name.clone(),
+                    _ => format!("{name}={value}"),
+                })
+                .collect();
+            format!("{} ?{}", r.method, query.join("&"))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn multipart_three_parts_complete_to_the_concatenated_bytes() {
+    let fake = fake().await;
+    let store = store(&fake);
+    let parts = [
+        filled(crate::MULTIPART_MIN_PART_SIZE, 1),
+        filled(crate::MULTIPART_MIN_PART_SIZE, 2),
+        filled(1000, 3),
+    ];
+
+    let mut upload = store
+        .put_multipart("mp/three")
+        .await
+        .expect("a backend declaring multipart opens an upload");
+    for part in &parts {
+        upload.put_part(part.clone(), None).await.expect("part");
+    }
+    assert_eq!(
+        fake.data_of("mp/three"),
+        None,
+        "nothing visible before complete"
+    );
+    let outcome = upload.complete().await.expect("complete");
+
+    let expected: Vec<u8> = parts.iter().flat_map(|p| p.iter().copied()).collect();
+    let got = store.get("mp/three", GetRange::Full).await.expect("get");
+    assert_eq!(got.data.len(), expected.len());
+    assert!(
+        got.data[..] == expected[..],
+        "the parts, concatenated in order"
+    );
+    let head = store.head("mp/three").await.expect("head");
+    assert_eq!(head.version, outcome.version);
+    assert_eq!(
+        Some(outcome.version.0.as_str()),
+        fake.generation_of("mp/three")
+            .map(|g| g.to_string())
+            .as_deref(),
+        "the version is the generation the completion assigned"
+    );
+    assert_eq!(
+        multipart_requests(&fake, "mp/three"),
+        [
+            "POST ?uploads",
+            "PUT ?partNumber=1&uploadId=X",
+            "PUT ?partNumber=2&uploadId=X",
+            "PUT ?partNumber=3&uploadId=X",
+            "POST ?uploadId=X",
+        ]
+    );
+    assert_eq!(fake.open_uploads(), 0);
+}
+
+#[tokio::test]
+async fn multipart_abort_after_two_parts_leaves_no_object() {
+    let fake = fake().await;
+    let store = store(&fake);
+
+    let mut upload = store.put_multipart("mp/aborted").await.expect("open");
+    for seed in [1, 2] {
+        upload
+            .put_part(filled(crate::MULTIPART_MIN_PART_SIZE, seed), None)
+            .await
+            .expect("part");
+    }
+    upload.abort().await.expect("abort");
+
+    assert!(
+        matches!(store.head("mp/aborted").await, Err(StoreError::NotFound)),
+        "an aborted upload publishes nothing"
+    );
+    assert_eq!(fake.open_uploads(), 0, "the abort reached the fake");
+    assert_eq!(
+        multipart_requests(&fake, "mp/aborted")
+            .last()
+            .map(String::as_str),
+        Some("DELETE ?uploadId=X")
+    );
+}
+
+#[tokio::test]
+async fn multipart_short_non_final_part_fails_complete_and_publishes_nothing() {
+    let fake = fake().await;
+    let store = store(&fake);
+
+    let mut upload = store.put_multipart("mp/short").await.expect("open");
+    upload
+        .put_part(filled(1024, 1), None)
+        .await
+        .expect("a short part is legal while it may be the last");
+    let next = upload
+        .put_part(filled(crate::MULTIPART_MIN_PART_SIZE, 2), None)
+        .await;
+    assert!(
+        matches!(next, Err(StoreError::Permanent(_))),
+        "a part after a short one makes it non-final: {next:?}"
+    );
+    let completed = upload.complete().await;
+    assert!(
+        matches!(completed, Err(StoreError::Permanent(_))),
+        "{completed:?}"
+    );
+    upload.abort().await.expect("abort stays callable");
+
+    assert!(matches!(
+        store.head("mp/short").await,
+        Err(StoreError::NotFound)
+    ));
+    assert_eq!(
+        multipart_requests(&fake, "mp/short"),
+        [
+            "POST ?uploads",
+            "PUT ?partNumber=1&uploadId=X",
+            "DELETE ?uploadId=X",
+        ],
+        "neither the refused part nor a completion reached the store"
+    );
+}
+
+/// The fake refuses a completion whose non-final part is below the minimum,
+/// as GCS does, when a client skips the local sequence check.
+#[tokio::test]
+async fn fake_refuses_a_short_non_final_part_at_completion() {
+    let fake = fake().await;
+    let store = store(&fake);
+    use object_store::ObjectStoreExt as _;
+    let path = object_store::path::Path::from("mp/raw-short");
+
+    let mut upload = store.store.put_multipart(&path).await.expect("open");
+    upload
+        .put_part(filled(1024, 1).into())
+        .await
+        .expect("part 1");
+    upload
+        .put_part(filled(1024, 2).into())
+        .await
+        .expect("part 2");
+    let completed = upload.complete().await;
+
+    let error = format!("{:?}", completed.expect_err("a short non-final part"));
+    assert!(error.contains("EntityTooSmall"), "{error}");
+    assert_eq!(fake.data_of("mp/raw-short"), None);
+    assert_eq!(
+        fake.open_uploads(),
+        1,
+        "a refused completion leaves the upload open"
+    );
+}
+
+/// The fake's XML multipart answers on the wire, each refusal publishing
+/// nothing, and the completed object's headers, body and JSON resource.
+#[tokio::test]
+async fn fake_multipart_answers_on_the_wire() {
+    let fake = fake().await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/{BUCKET}/mp/wire", fake.endpoint());
+    let code_of = |body: &str| {
+        body.split_once("<Code>")
+            .and_then(|(_, rest)| rest.split_once("</Code>"))
+            .map(|(code, _)| code.to_string())
+    };
+
+    let initiated = client
+        .post(format!("{url}?uploads"))
+        .send()
+        .await
+        .expect("initiate")
+        .text()
+        .await
+        .expect("body");
+    let id = initiated
+        .split_once("<UploadId>")
+        .and_then(|(_, rest)| rest.split_once("</UploadId>"))
+        .map(|(id, _)| id.to_string())
+        .expect("an UploadId");
+
+    let refused = client
+        .put(format!("{url}?partNumber=0&uploadId={id}"))
+        .body("x")
+        .send()
+        .await
+        .expect("part 0");
+    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        code_of(&refused.text().await.expect("body")).as_deref(),
+        Some("InvalidArgument")
+    );
+    let unknown = client
+        .put(format!("{url}?partNumber=1&uploadId=other"))
+        .body("x")
+        .send()
+        .await
+        .expect("unknown upload");
+    assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        code_of(&unknown.text().await.expect("body")).as_deref(),
+        Some("NoSuchUpload")
+    );
+
+    let other_method = client
+        .get(format!("{url}?uploadId={id}"))
+        .send()
+        .await
+        .expect("get with an upload id");
+    assert_eq!(other_method.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    let replaced = client
+        .put(format!("{url}?partNumber=2&uploadId={id}"))
+        .body("replaced below")
+        .send()
+        .await
+        .expect("part 2");
+    assert_eq!(replaced.status(), reqwest::StatusCode::OK);
+
+    let mut etags = Vec::new();
+    for (number, data) in [(1, "first"), (2, "second")] {
+        let part = client
+            .put(format!("{url}?partNumber={number}&uploadId={id}"))
+            .body(data)
+            .send()
+            .await
+            .expect("part");
+        assert_eq!(part.status(), reqwest::StatusCode::OK);
+        let etag = part.headers()["etag"].to_str().expect("ascii").to_string();
+        assert_eq!(
+            etag,
+            format!("\"{}\"", fake_hex(&fake_md5(data.as_bytes())))
+        );
+        etags.push(etag);
+    }
+    let body = |parts: &[(u32, &str)]| {
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for (number, etag) in parts {
+            let etag = etag.replace('"', "&quot;");
+            xml.push_str(&format!(
+                "<Part><ETag>{etag}</ETag><PartNumber>{number}</PartNumber></Part>"
+            ));
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        xml
+    };
+    let complete = |xml: String| client.post(format!("{url}?uploadId={id}")).body(xml).send();
+    for (xml, status, code) in [
+        ("<NotIt/>".to_string(), 400, "MalformedXML"),
+        (body(&[]), 400, "InvalidPartOrder"),
+        (
+            body(&[(2, &etags[1]), (1, &etags[0])]),
+            400,
+            "InvalidPartOrder",
+        ),
+        (body(&[(1, &etags[1])]), 400, "NoSuchPart"),
+        (body(&[(3, &etags[0])]), 400, "NoSuchPart"),
+        (
+            body(&[(1, &etags[0]), (2, &etags[1])]),
+            400,
+            "EntityTooSmall",
+        ),
+    ] {
+        let response = complete(xml).await.expect("complete");
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(
+            code_of(&response.text().await.expect("body")).as_deref(),
+            Some(code)
+        );
+        assert_eq!(fake.data_of("mp/wire"), None, "{code} publishes nothing");
+        assert_eq!(fake.open_uploads(), 1, "{code} leaves the upload open");
+    }
+
+    let done = complete(body(&[(2, &etags[1])])).await.expect("complete");
+    assert_eq!(done.status(), reqwest::StatusCode::OK);
+    let headers = done.headers().clone();
+    let generation = fake.generation_of("mp/wire").expect("published");
+    assert_eq!(
+        headers["x-goog-generation"],
+        generation.to_string().as_str()
+    );
+    assert_eq!(headers["x-goog-metageneration"], "1");
+    assert_eq!(headers["x-goog-stored-content-length"], "6");
+    assert!(headers.get("etag").is_none(), "{headers:?}");
+    assert!(
+        headers["x-goog-hash"]
+            .to_str()
+            .expect("ascii")
+            .starts_with("crc32c="),
+        "{headers:?}"
+    );
+    let etag = fake.etag_of("mp/wire").expect("etag");
+    let digest = fake_hex(&fake_md5(&fake_md5(b"second")));
+    assert_eq!(etag, format!("\"{digest}-1\""));
+    let text = done.text().await.expect("body");
+    assert!(
+        text.contains(&format!("<ETag>{}</ETag>", etag.replace('"', "&quot;"))),
+        "{text}"
+    );
+    assert_eq!(fake.data_of("mp/wire").as_deref(), Some(&b"second"[..]));
+    assert_eq!(fake.open_uploads(), 0);
+
+    let listed: serde_json::Value = client
+        .get(format!(
+            "{}/storage/v1/b/{BUCKET}/o?prefix=mp/",
+            fake.endpoint()
+        ))
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("json");
+    let item = &listed["items"][0];
+    assert_eq!(item["name"], "mp/wire");
+    assert!(item.get("md5Hash").is_none(), "{item}");
+    assert!(item.get("componentCount").is_none(), "{item}");
+
+    let reopened = client
+        .post(format!("{url}?uploads"))
+        .send()
+        .await
+        .expect("initiate")
+        .text()
+        .await
+        .expect("body");
+    let id = reopened
+        .split_once("<UploadId>")
+        .and_then(|(_, rest)| rest.split_once("</UploadId>"))
+        .map(|(id, _)| id.to_string())
+        .expect("an UploadId");
+    let aborted = client
+        .delete(format!("{url}?uploadId={id}"))
+        .send()
+        .await
+        .expect("abort");
+    assert_eq!(aborted.status(), reqwest::StatusCode::NO_CONTENT);
+    let again = client
+        .delete(format!("{url}?uploadId={id}"))
+        .send()
+        .await
+        .expect("abort again");
+    assert_eq!(again.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(fake.data_of("mp/wire").as_deref(), Some(&b"second"[..]));
+}
+
+/// A listing over an object an XML multipart upload completed fails, since
+/// its item carries neither `md5Hash` nor `componentCount` and the listing
+/// cannot know the ETag `head` reports. This pins the open gap the module
+/// doc names, against the fake's model of GCS.
+#[tokio::test]
+async fn listing_over_a_multipart_object_fails_the_call() {
+    let fake = fake().await;
+    let store = store(&fake);
+    let mut upload = store.put_multipart("mp/listed").await.expect("open");
+    upload
+        .put_part(Bytes::from_static(b"only part"), None)
+        .await
+        .expect("part");
+    upload.complete().await.expect("complete");
+
+    let listed = store.list("mp/", None).await;
+    match listed {
+        Err(StoreError::Permanent(message)) => {
+            assert!(message.contains("componentCount"), "{message}");
+        }
+        other => panic!("expected the listing to refuse the item, got {other:?}"),
+    }
 }
 
 #[test]
