@@ -1223,6 +1223,22 @@ class Evaluate(Workdir):
         self.assertTrue(any(p.startswith("wrong_answer logs_request_id_present/folded_leaves/cold try 0: call names truth key")
                             for p in res["problems"]), res["problems"])
 
+    def test_server_died_call_is_missing_with_its_reason(self):
+        reason = "server died during spans_in_1/folded_leaves try 0, signal 9"
+        for c in self.select("spans_in_1"):
+            if c["try"] == 0:
+                c["outcome"] = "server_died"
+                c["reason"] = reason
+                for k in ("rows", "columns", "values", "values_sha256"):
+                    c.pop(k, None)
+        self.save_calls()
+        code, res, _ = self.go()
+        self.assertEqual(code, 1)
+        f = figure(res, "row_t1.spans_1_rows_exact")
+        self.assertEqual((f["status"], f["verdict"], f["reason"]), ("missing", "missing", reason))
+        self.assertEqual(res["verdict"], "fail")
+        self.assertIn(f"missing row_t1.spans_1_rows_exact: {reason}", res["problems"])
+
     def test_empty_stamps_directory(self):
         stamps = os.path.join(self.run_dir, "stamps")
         shutil.rmtree(stamps)
@@ -3484,6 +3500,63 @@ FINISHED=1
         # the state with the stderr log.
         self.assertIn('    1) not_run "many_parts_$n" "$why"; return 0 ;;\n'
                       '    *) failed_at "stride-check many_parts_$n" "$code" "$stride_log"; return 1 ;;\n', run_sh)
+
+    def local_smoke_toml_with(self, extra_lines, suffix="run"):
+        """A copy of run.local-smoke.toml with EXTRA_LINES appended to its
+        [server] section."""
+        with open(os.path.join(BOX, "run.local-smoke.toml")) as f:
+            text = f.read()
+        self.assertEqual(text.count("[server]\n"), 1)
+        text = text.replace("[server]\n", "[server]\n" + extra_lines)
+        p = self.path(f"{suffix}.toml")
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    def sourced_load_config(self, toml):
+        """Sources run.sh under --dry-run, then calls load_config for real
+        (DRY_RUN=0) with no server or store, and prints what it built."""
+        out = self.path(f"out-{os.path.basename(toml)}")
+        driver = self.path(f"driver-{os.path.basename(toml)}.sh")
+        with open(driver, "w") as f:
+            f.write(f"""set -u
+source {os.path.join(BOX, "run.sh")} --dry-run --lane local --run-toml {toml} --out {out}
+DRY_RUN=0
+load_config
+printf 'SERVER_FLAGS=%s\\n' "$SERVER_FLAGS"
+printf 'SERVER_EXTRA=%s\\n' "${{SERVER_EXTRA[*]+${{SERVER_EXTRA[*]}}}}"
+FINISHED=1
+""")
+        p = subprocess.run([BASH, driver], capture_output=True, text=True, timeout=60)
+        return p.returncode, p.stdout + p.stderr
+
+    def test_extra_flags_appear_on_server_command_line_and_stamp(self):
+        toml = self.local_smoke_toml_with(
+            'extra_flags = ["--sql-max-query-bytes=1048576", "--audit-log-sample-rate=1"]\n')
+        code, text = self.sourced_load_config(toml)
+        self.assertEqual(code, 0, text)
+        self.assertIn("SERVER_EXTRA=--memory-budget-bytes 1000000000 --sql-max-query-bytes=1048576 "
+                      "--audit-log-sample-rate=1", text)
+        # SERVER_FLAGS is what start_server passes on the command line and
+        # the only site (run.sh "server_flags=\"$SERVER_FLAGS\"") that stamps
+        # it into <state>.server.json, so this one string proves both.
+        self.assertIn(
+            "SERVER_FLAGS=--mode query --store s3 --shards 2 --tenant-hash-unkeyed --audit-mode off "
+            "--memory-budget-bytes 1000000000 --sql-max-query-bytes=1048576 --audit-log-sample-rate=1", text)
+
+    def test_extra_flags_bad_element_refused_before_anything_runs(self):
+        toml = self.local_smoke_toml_with('extra_flags = ["sql-max-query-bytes=1048576"]\n')
+        code, text = run_sh("local", toml, self.path("out"))
+        self.assertNotEqual(code, 0, text)
+        self.assertNotIn("STEP ", text)
+        self.assertIn("run.toml server.extra_flags", text)
+        self.assertIn("'sql-max-query-bytes=1048576' is not a single --flag token", text)
+
+        toml2 = self.local_smoke_toml_with('extra_flags = ["--has space"]\n', suffix="run2")
+        code2, text2 = run_sh("local", toml2, self.path("out2"))
+        self.assertNotEqual(code2, 0, text2)
+        self.assertNotIn("STEP ", text2)
+        self.assertIn("'--has space' is not a single --flag token", text2)
 
 
 def refresh_local_smoke():
