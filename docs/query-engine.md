@@ -3850,7 +3850,9 @@ order (`ravel_sql::key_index_json`):
 - `leafGetRequests`: leaf GETs issued to the store; a leaf range served from
   the read cache is not counted.
 - `leafWireBytes`: the bytes those GETs returned, as transferred.
-- `keysProbed`: keys in the probed set, 1 for a `trace_id =` lookup.
+- `keysProbed`: keys in the probed set, 1 for a `trace_id =` lookup the
+  router ran for, 0 when the lookup fell back to tier 1 before routing (a
+  refused parts charge, below).
 - `skippedByBudget`: parts the bridged-read allowance left uncovered.
 - `skipIdxDropped`: objects the fetcher read the key present in and then
   dropped because SKIP_IDX kept none of the key's blocks inside the
@@ -4993,9 +4995,12 @@ with the routes; `stats.keyIndex` above renders them under their exact
 names.
 
 The spans `trace_id =` lookup calls it (ADR-3692 decision 3; the logs scan
-does not yet, task T5). `SpansTableProvider` resolves the window with
-`resolve_pruned_with_parts`, the snapshot it already pins, builds the key set
-from the trace id's `key8`, and routes with `SpanLeafRangeReader`, which reads
+does not yet, task T5). The SQL executor resolves the window with
+`resolve_pruned_with_parts` (`crates/ravel-sql/src/executor.rs`, the spans
+lane's resolve; without parts when the charge is refused, below) and hands
+the parts to `SpansTableProvider` with the snapshot it pins; the provider
+builds the key set from the trace id's `key8` and routes with
+`SpanLeafRangeReader`, which reads
 each leaf range through the span fetcher's read path, so leaf bytes share
 the read cache (keyed by the leaf's blake3) and the `keyIndex` phase with
 the KEY_IDX reads. A `Pruned` segment is dropped before any of its bytes are
@@ -5032,9 +5037,12 @@ settled with `outcome` one of `covered`, `uncovered`, `beyond_ceiling`,
 `ravel_query_key_index_leaf_gets_total{signal}`, the leaf GETs it issued.
 The Flight SQL pinned path and `EXPLAIN` do not route: they probe at tier 1.
 
-The parts are charged to the statement's catalog decode budget with the
-snapshot (`Catalog::resolve_pruned_with_parts` reserves their handles' heap
-bytes). A refused charge costs the spans lane its router, not the statement:
+The parts are charged to the catalog's memory budget with the snapshot
+(`Catalog::resolve_pruned_with_parts` reserves their handles' heap bytes).
+That budget is the process-wide one `--memory-budget-bytes` sizes, shared by
+every statement and the decoded cache, so the charge is refused under
+process-wide memory pressure, not by a per-statement limit. A refused
+charge costs the spans lane its router, not the statement:
 the lane resolves the window again with `resolve_pruned_with_admission`,
 without parts, paying that resolve's requests a second time, and every
 segment takes the tier-1 KEY_IDX probe. The fallback is visible: a

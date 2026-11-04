@@ -826,7 +826,9 @@ changes:
   read"), which that ADR's tier-2 trace lookup amendment retired: sizing the
   first read cut its bytes, not its request count.
 - **A refused parts charge degrades to tier 1.** The parts the router needs
-  are charged to the statement's catalog decode budget with the snapshot.
+  are charged to the catalog's memory budget with the snapshot; that budget
+  is the process-wide one (`--memory-budget-bytes`), so the refusal comes
+  under process-wide memory pressure, not from a per-statement limit.
   When the budget refuses that charge, the spans lane resolves again without
   parts, paying that resolve's requests a second time, and every segment
   takes the tier-1 probe; the statement answers exactly, `stats.keyIndex`
