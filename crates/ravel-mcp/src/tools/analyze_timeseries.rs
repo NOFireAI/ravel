@@ -806,9 +806,9 @@ mod tests {
     /// inside the cap once the 12 omitted series, `row_cap_hit` and the
     /// `ok_bounded` status they make are written.
     ///
-    /// FLIP: fitting with `fit` and folding the row cap in afterwards puts
-    /// the widest of these 8 B over the cap: `rows_omitted` goes from `0` to
-    /// `12` and the status from `ok` to `ok_bounded`.
+    /// Fitting with `fit` and folding the row cap in afterwards puts these
+    /// over the cap: `rows_omitted` goes from `0` to `12` and the status from
+    /// `ok` to `ok_bounded` after the fit measured them.
     #[test]
     fn a_row_capped_result_at_its_byte_cap_finishes_inside_it() {
         let key = key();

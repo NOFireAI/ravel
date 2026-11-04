@@ -953,8 +953,8 @@ mod tests {
     /// field reported: the page stays inside the cap with its
     /// `add_an_order_by` step, the 12 omitted rows and `ok_bounded` written.
     ///
-    /// FLIP: pushing the step after `finish_page` puts the widest of these
-    /// over the cap by the step's own serialized size less one byte.
+    /// Pushing the step after `finish_page` puts these over the cap, since
+    /// the fit never measured it.
     #[test]
     fn a_row_capped_unpaged_page_at_its_byte_cap_finishes_inside_it() {
         let key = key();

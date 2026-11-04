@@ -1075,8 +1075,7 @@ mod tests {
 
     /// An `ok` events page packed to its byte cap still carries its resume
     /// step and stays inside the cap: the step is in what the fit measured.
-    /// Pushing it after `finish`, as the tool used to, puts the page over the
-    /// cap at the widest payload the cap leaves alone.
+    /// Pushing it after `finish` puts the widest of these pages over the cap.
     #[test]
     fn an_ok_events_page_at_its_byte_cap_keeps_its_resume_step_inside_it() {
         let cap = MAX_RESPONSE_BYTES_FLOOR as usize;

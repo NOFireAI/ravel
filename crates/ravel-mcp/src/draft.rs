@@ -789,9 +789,9 @@ mod tests {
     /// packed right up to the byte cap with no identity field reported: the
     /// page stays inside the cap once the 10,000 omitted rows are counted.
     ///
-    /// FLIP: fitting with `fit` and adding the row cap's count afterwards
-    /// puts the widest of these 3 B over the cap: `rows_omitted` goes from
-    /// `0` to `10000` against one byte of slack in the identity allowance.
+    /// Fitting with `fit` and adding the row cap's count afterwards puts
+    /// these over the cap: `rows_omitted` goes from `0` to `10000` after the
+    /// fit measured it, against one byte of slack in the identity allowance.
     #[test]
     fn a_row_capped_page_at_its_byte_cap_finishes_inside_it() {
         let run_with = |len: usize| {
