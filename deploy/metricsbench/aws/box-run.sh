@@ -38,7 +38,11 @@ docker pull "$RAVEL_IMAGE" || finish 18
 store_args=()
 ci_args=()
 if [ -n "$REAL_S3_PREFIX" ]; then
-  region=${AWS_DEFAULT_REGION:?/mb/env names no region}
+  region=${AWS_DEFAULT_REGION:-}
+  # An unset region ends the run through finish, which uploads the log and
+  # schedules the shutdown; a bare ${var:?} would exit here and leave the box
+  # idle until the launch-time cap.
+  [ -n "$region" ] || { echo "/mb/env names no region"; finish 19 2; }
   store_args=(--real-s3-bucket-prefix "$REAL_S3_PREFIX" --real-s3-region "$region")
   ci_args=(--real-s3-bucket-prefix "${REAL_S3_PREFIX}-ci" --real-s3-region "$region")
 fi
