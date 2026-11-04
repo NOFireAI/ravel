@@ -83,12 +83,6 @@ pub async fn run<B: QueryBackend>(args: Value, ctx: &ToolContext<'_>, backend: &
 }
 
 fn plan(args: Value, ctx: &ToolContext<'_>) -> Result<Plan, Refusal> {
-    if args.get("evidence_ref").is_some() {
-        return Err(refusal(
-            FailureClass::InvalidArgument,
-            "evidence_ref is not an argument of ravel_find_labels".to_string(),
-        ));
-    }
     if args.get("time_range").is_none_or(Value::is_null) {
         return Err(refusal(
             FailureClass::MissingArgument,
@@ -312,16 +306,13 @@ mod tests {
         }
     }
 
-    /// An empty filter is `invalid_argument`, not a match of everything, and
-    /// `evidence_ref` is refused rather than accepted and ignored.
+    /// An empty filter is `invalid_argument`, not a match of everything.
     ///
-    /// FLIP: treating `""` as no filter, or ignoring `evidence_ref`, reaches
-    /// the stub, which panics.
+    /// FLIP: treating `""` as no filter reaches the stub, which panics.
     #[test]
-    fn an_empty_filter_and_an_evidence_ref_are_invalid() {
+    fn an_empty_filter_is_invalid() {
         for args in [
             json!({"label_name": "__name__", "filter": ""}),
-            json!({"label_name": "__name__", "evidence_ref": "ev1"}),
             json!({"label_name": ""}),
         ] {
             let stub = Stub::default();
@@ -332,6 +323,41 @@ mod tests {
                 "{args}"
             );
         }
+    }
+
+    /// A null `evidence_ref` is no value: the call answers as the same call
+    /// without it does, through the dispatcher, whose refusal of a string
+    /// value covers this tool too.
+    ///
+    /// FLIP: restoring the tool's own `args.get("evidence_ref").is_some()`
+    /// refusal answers the null call `invalid_argument`.
+    #[test]
+    fn a_null_evidence_ref_answers_as_a_call_without_it() {
+        let key = CursorKey::from_process_secret([31u8; CURSOR_KEY_LEN]);
+        let ctx = test_context(&key);
+        let answer = |args: Value| {
+            let stub = Stub {
+                listed: Some(listed(&["api", "db"])),
+                ..Stub::default()
+            };
+            block_on(super::super::dispatch(
+                "ravel_find_labels",
+                with_window(args),
+                &ctx,
+                &stub,
+            ))
+            .expect("ravel_find_labels routes")
+        };
+        let with_null = answer(json!({"label_name": "service", "evidence_ref": null}));
+        let without = answer(json!({"label_name": "service"}));
+
+        assert_eq!(with_null.status, Status::Ok, "{:?}", with_null.failure);
+        assert_eq!(with_null.status, without.status);
+        assert_eq!(strings(&with_null), ["api", "db"]);
+        assert_eq!(strings(&with_null), strings(&without));
+
+        let refused = answer(json!({"label_name": "service", "evidence_ref": "ev1"}));
+        assert_eq!(failure_of(&refused).class, FailureClass::InvalidArgument);
     }
 
     /// The filter is a case-sensitive substring match, reported in

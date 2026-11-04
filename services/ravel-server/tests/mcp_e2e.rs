@@ -1011,6 +1011,7 @@ mod with_mcp {
         fewer_rows: "shorten time_range or add WHERE predicates",
         smaller_rows_action: "narrow_the_projection",
         smaller_rows: "select fewer or narrower columns",
+        read_cell: Some("select fewer or narrower columns to give the cut cells more room"),
     };
 
     fn sql_request(sql: &str) -> ravel_sql::SqlRequest {
@@ -2813,10 +2814,10 @@ mod with_mcp {
             cut["next_steps"],
             serde_json::json!([{
                 "action": "read_full_cells",
-                "detail": "the result is complete but the byte cap shortened cells; widen step \
-                           or narrow time_range for fewer samples per series, or narrow the \
-                           query for fewer series, or raise max_response_bytes (up to 4 MiB), \
-                           to read them in full",
+                "detail": "the result is complete but the byte cap shortened cells; raise \
+                           max_response_bytes (up to 4 MiB) to read them in full, or narrow \
+                           time_range to a window after the last sample returned to read the \
+                           samples the cut omitted",
             }])
         );
 
