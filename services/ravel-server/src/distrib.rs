@@ -1647,6 +1647,10 @@ impl AttemptSpend {
     /// decode-cap refusal never manages. The `FetchStats` page counters do not
     /// survive the `Err` arm: the coordinator returns no stats for a query that
     /// fails, so they would have no reader.
+    ///
+    /// An `Ok`-arm fold also sets the response's `carried_abandoned_spend`, so
+    /// the coordinator knows this slice's accounting is more than one fetch of
+    /// its segments and the query's estimate does not bound it (issue #3789).
     fn fold_into(
         &self,
         result: Result<SliceResponse, DistribError>,
@@ -1671,6 +1675,7 @@ impl AttemptSpend {
                     .stats
                     .histogram_series_skipped
                     .saturating_add(self.stats.histogram_series_skipped);
+                response.carried_abandoned_spend = true;
                 response
             })
     }
@@ -1692,6 +1697,7 @@ fn expired_capability_timeout(spend: AttemptSpend) -> SliceResponse {
         samples_returned: 0,
         status: pb::status::Code::Timeout,
         status_message: "fragment slice refused: its capability expired".to_string(),
+        carried_abandoned_spend: false,
     }
 }
 
@@ -6780,6 +6786,10 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             response.accounting.total_s3_requests(),
             local_only.accounting.total_s3_requests()
         );
+        assert!(
+            !response.carried_abandoned_spend,
+            "a retry that carried nothing does not mark the slice's spend"
+        );
     }
 
     /// The other fold in `dispatch`: the re-dispatch target answers, so the
@@ -8106,6 +8116,166 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     /// A deadline on the coordinator's monotonic clock a year away.
     fn far_deadline() -> tokio::time::Instant {
         tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600)
+    }
+
+    /// A [`SliceFetcher`] that forwards to a routing coordinator and records
+    /// each answering response's `carried_abandoned_spend`, so a query-level
+    /// test can also see what the slice it folded said.
+    struct CarriedRecorder {
+        inner: RoutingSliceFetcher,
+        carried: Mutex<Vec<bool>>,
+    }
+
+    impl CarriedRecorder {
+        fn record(
+            &self,
+            result: Result<SliceResponse, DistribError>,
+        ) -> Result<SliceResponse, DistribError> {
+            if let Ok(response) = &result {
+                self.carried.lock().push(response.carried_abandoned_spend);
+            }
+            result
+        }
+    }
+
+    #[async_trait]
+    impl SliceFetcher for CarriedRecorder {
+        async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+            let result = self.inner.fetch(request).await;
+            self.record(result)
+        }
+
+        async fn fetch_within(
+            &self,
+            request: pb::FetchRequest,
+            deadline: tokio::time::Instant,
+        ) -> Result<SliceResponse, DistribError> {
+            let result = self.inner.fetch_within(request, deadline).await;
+            self.record(result)
+        }
+    }
+
+    /// Runs one instant query for metric `m` of `tenant` through a routing
+    /// coordinator over `endpoints`, and returns the query's stats with every
+    /// answering slice's `carried_abandoned_spend`.
+    async fn routed_instant(
+        store: Arc<dyn ObjectStoreBackend>,
+        tenant: &ravel_types::TenantId,
+        now: i64,
+        endpoints: &[&str],
+    ) -> (ravel_query::QueryStats, Vec<bool>) {
+        let recorder = Arc::new(CarriedRecorder {
+            inner: coordinator_with_live(store.clone(), now, endpoints),
+            carried: Mutex::new(Vec::new()),
+        });
+        let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+            recorder.clone(),
+            ravel_query::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        ));
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        let engine =
+            ravel_query::QueryEngine::new(catalog, store, ravel_query::EngineConfig::default())
+                .with_distributed(distributed);
+        let t_ms = (HOUR_NS + 30_000_000_000) / 1_000_000;
+        let (value, stats) = engine
+            .instant_with_stats(tenant.hash(), "m", t_ms, &[], now, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|err| panic!("the query answers: {err:?}"));
+        assert!(
+            matches!(&value, ravel_promql::Value::Vector(_)),
+            "an instant vector: {value:?}"
+        );
+        let carried = recorder.carried.lock().clone();
+        (stats, carried)
+    }
+
+    /// Issue #3789: a distributed slice that answers after one abandoned
+    /// attempt carries that attempt's spend (issue #1723), says so on its
+    /// response, and the query reports its estimate as excluding spend. A
+    /// slice that answers on its first attempt does neither.
+    ///
+    /// The retried query's live set holds one worker, which answers
+    /// `Unavailable` after spending `LOST`, so the slice is dispatched once and
+    /// then read coordinator-local. The baseline routes the same slice local
+    /// with no hop, so the retried query's accounting is the baseline's plus
+    /// `LOST`, exactly.
+    ///
+    /// Mutation proof: not setting `carried_abandoned_spend` in
+    /// `AttemptSpend::fold_into` fails the flag assertion; ignoring it in the
+    /// engine's distributed fetch fails the `estimate_excludes_spend` one.
+    #[tokio::test]
+    async fn a_retried_slice_marks_its_spend_as_outside_the_estimate() {
+        const LOST: Spend = Spend {
+            get_requests: 3,
+            get_bytes: 4_096,
+            raw_f64_pages: 2,
+            raw_f64_bytes: 16_384,
+        };
+        const ANSWERED: Spend = Spend {
+            get_requests: 5,
+            get_bytes: 8_192,
+            raw_f64_pages: 7,
+            raw_f64_bytes: 57_344,
+        };
+        let memory = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("retried-slice-estimate".to_string());
+        publish_metric(memory.as_ref(), &tenant, HOUR_NS).await;
+        let now = 4 * HOUR_NS;
+        let store: Arc<dyn ObjectStoreBackend> = memory;
+
+        let (baseline, baseline_carried) = routed_instant(store.clone(), &tenant, now, &[]).await;
+        assert_eq!(baseline_carried, vec![false], "one local slice, no retry");
+        assert!(!baseline.estimate_excludes_spend);
+
+        let (lost, lost_tries, _keep_lost) =
+            spawn_scripted(LOST, pb::status::Code::Unavailable, Ending::Summary).await;
+        let (retried, retried_carried) =
+            routed_instant(store.clone(), &tenant, now, &[&lost]).await;
+        assert_eq!(lost_tries.load(Ordering::Relaxed), 1, "dispatched once");
+        assert_eq!(
+            retried_carried,
+            vec![true],
+            "the answering response carries the abandoned attempt's spend"
+        );
+        assert_eq!(
+            retried.accounting.total_s3_requests(),
+            baseline.accounting.total_s3_requests() + LOST.get_requests,
+            "requests: baseline {} + abandoned {}",
+            baseline.accounting.total_s3_requests(),
+            LOST.get_requests
+        );
+        assert_eq!(
+            retried.accounting.total_s3_bytes(),
+            baseline.accounting.total_s3_bytes() + LOST.get_bytes,
+            "bytes: baseline {} + abandoned {}",
+            baseline.accounting.total_s3_bytes(),
+            LOST.get_bytes
+        );
+        assert_eq!(
+            retried.page_stats.raw_f64_bytes,
+            baseline.page_stats.raw_f64_bytes + LOST.raw_f64_bytes
+        );
+        assert!(
+            retried.estimate_excludes_spend,
+            "a slice carrying an abandoned attempt's spend is outside the estimate"
+        );
+
+        let (answered, answered_tries, _keep_answered) =
+            spawn_scripted(ANSWERED, pb::status::Code::Ok, Ending::Summary).await;
+        let (first, first_carried) =
+            routed_instant(store.clone(), &tenant, now, &[&answered]).await;
+        assert_eq!(answered_tries.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            first_carried,
+            vec![false],
+            "a slice answered on its first attempt carries nothing else"
+        );
+        assert!(!first.estimate_excludes_spend);
     }
 
     /// Issue #2385: once the coordinator's own deadline has passed, a

@@ -58,6 +58,7 @@ impl SliceFetcher for FixedCostFetcher {
             samples_returned: 0,
             status: pb::status::Code::Ok,
             status_message: String::new(),
+            carried_abandoned_spend: false,
         })
     }
 }

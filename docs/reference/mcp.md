@@ -498,8 +498,10 @@ lane, and a federated query also spends through each remote that answered;
 neither is in the estimate, so such a query reports every estimate component
 unbounded and `estimate_is_upper_envelope` false. A distributed query whose
 worker fan-out fell back to fetching locally spends twice on the same
-segments and reports the same. Any other PromQL or analytics call has an
-empty list.
+segments and reports the same, and so does one with a slice that answered
+after a retry or a reroute and carries the spend its abandoned attempts
+reported.
+Any other PromQL or analytics call has an empty list.
 
 ### Running a statement
 

@@ -1277,6 +1277,7 @@ impl SliceFetcher for LyingBudgetWorker {
             samples_returned: 0,
             status: pb::status::Code::Ok,
             status_message: String::new(),
+            carried_abandoned_spend: false,
         })
     }
 }
@@ -1545,6 +1546,7 @@ impl SliceFetcher for RecordingBudgetWorker {
             samples_returned: 0,
             status: pb::status::Code::Ok,
             status_message: String::new(),
+            carried_abandoned_spend: false,
         })
     }
 }
@@ -1804,6 +1806,7 @@ impl SliceFetcher for FaithfulBudgetWorker {
             samples_returned: 0,
             status,
             status_message,
+            carried_abandoned_spend: false,
         })
     }
 }
@@ -2106,6 +2109,7 @@ impl SliceFetcher for RemoteCapRefusalFetcher {
             samples_returned: 0,
             status: pb::status::Code::BudgetExceeded,
             status_message: self.message.clone(),
+            carried_abandoned_spend: false,
         })
     }
 }
@@ -2365,6 +2369,7 @@ impl SliceFetcher for AlwaysInvalidated {
             samples_returned: 0,
             status: pb::status::Code::SnapshotInvalidated,
             status_message: "segment vanished".to_string(),
+            carried_abandoned_spend: false,
         })
     }
 }
@@ -2710,6 +2715,7 @@ impl SliceFetcher for OverflowingLyingWorker {
             samples_returned: 0,
             status: pb::status::Code::Ok,
             status_message: String::new(),
+            carried_abandoned_spend: false,
         })
     }
 }
@@ -4368,6 +4374,7 @@ impl SliceFetcher for DuplicatePartialWorker {
             samples_returned: 0,
             status: pb::status::Code::Ok,
             status_message: String::new(),
+            carried_abandoned_spend: false,
         })
     }
 }
@@ -4876,6 +4883,7 @@ impl SliceFetcher for UnavailableWorker {
             samples_returned: 0,
             status: pb::status::Code::Unavailable,
             status_message: "every attempt was unavailable".to_string(),
+            carried_abandoned_spend: false,
         })
     }
 }
@@ -4991,6 +4999,7 @@ impl SliceFetcher for StatusSpendWorker {
             samples_returned: 0,
             status: self.status,
             status_message: "scripted".to_string(),
+            carried_abandoned_spend: false,
         })
     }
 
