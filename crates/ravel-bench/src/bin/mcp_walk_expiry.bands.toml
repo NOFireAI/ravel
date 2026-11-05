@@ -1,0 +1,196 @@
+# Pre-registration for the pinned-walk expiry probe (issue #3779 item 1, design
+# section C), read by `mcp_walk_expiry` through `ravel_bench::walk_expiry`.
+# Every key is required and an unknown key is refused, so the bin enforces
+# exactly what this file says.
+#
+# Section C's original timeline needed 26 h of load before the first walk. The
+# box now self-terminates after 10 h, so the window ages shrink (option b in the
+# T4 task) and the whole run, warmup included, fits in 7.5 h of wall time:
+#
+#   Wp [t0-1h, t0)      ends at the mint                       (unchanged)
+#   Wf [t0-1h, t0+1h)   still open during the walk             (unchanged)
+#   Wr [t0-3h, t0-2h)   a few hours old, possibly compacting   (unchanged)
+#   Wo [t0-5h, t0-4h)   old and sealed                         (was t0-26h)
+#
+# Wo's newest ingest hour ends at most at t0-3h plus the commit lag. At the
+# shipped defaults a fold seals an hour 80 min after it ends
+# (max_flush_lifetime 60 min + clock_skew_allowance 5 min + fold_safety_margin
+# 15 min) on its next 5 min fold pass, and compaction may take it 65 min after
+# it ends on its next 5 min maintenance pass, so every Wo hour is compacted and
+# sealed about 1.5 h before any Wo walk starts. The `wo_sealed` stamp checks this for each Wo walk rather
+# than trusting the arithmetic.
+#
+# The walks run in three phases, each starting once its windows hold data:
+# Wp and Wf from 1 h 05 min after load start, Wr from 3 h 05 min, Wo from
+# 5 h 05 min. Inside a phase the cells' walks are interleaved, so each cell's
+# starts spread over the whole phase (at least 1 h, every phase of the hour),
+# where section C asked for 3 h.
+
+version = 1
+
+[production.grid]
+walks_per_cell = 60
+max_concurrent_walks = 6
+# Page one plus three redemptions. A walk "finishes" when all three
+# redemptions see page one's segment set; the predictions below use
+# k = pages_per_walk - 1 = 3 inter-page delays.
+pages_per_walk = 4
+deltas_ms = [1000, 10000, 60000]
+# The cross-check: S1 walks over Wp and over Wo through the real MCP
+# ravel_query_sql at this delay, compared with the probe's S1 cell at the same
+# delay. Section C names no delay; 10 s is the middle one.
+mcp_crosscheck_walks = 20
+mcp_crosscheck_delta_ms = 10000
+
+# Seconds relative to page one's t0, [start, end).
+[production.windows]
+wp = [-3600, 0]
+wf = [-3600, 3600]
+wr = [-10800, -7200]
+wo = [-18000, -14400]
+
+[production.load]
+# MetricsBench workload families and label dimensions (benchmarks/metrics/
+# workload.json), at this many active series, one scrape every interval.
+active_series = 10000
+scrape_interval_ms = 15000
+series_per_body = 1000
+# S2's family: metricsbench_requests_total, 30% of the active series (3000).
+s2_family = "metricsbench_requests_total"
+# S1 has six names in the samples table: the gauge's 4000 series, the
+# counter's 3000, the classic histogram's _bucket, _sum and _count split from
+# its 1500, and build_info's 500 (the native histogram is not in the table).
+# The four largest counts differ, so one row a page gives four pages even
+# though the adapter pages S1 by groups of equal count. S2 has 3000 series, so
+# 600 rows a page gives five.
+s1_max_rows = 1
+s2_max_rows = 600
+
+[production.schedule]
+phase_a_after_s = 3900
+phase_b_after_s = 11100
+phase_c_after_s = 18300
+# Hard stop for the walk phase, from load start. A cell still unfinished then
+# is missing its figures, and the run fails on them.
+max_run_s = 27000
+
+[production.stamps]
+# Every rate window of the walk phase within this fraction of the nominal
+# rate (active_series per scrape interval).
+ingest_rate_tolerance = 0.10
+rate_window_s = 600
+# c and L are read from a listing of the commits of the last listing_window_s,
+# taken every listing_every_s. The shards flush together, so commits created
+# within commit_round_ms of a round's first commit are one round, and c is the
+# median gap between rounds: a walk cannot land between the commits of one
+# round.
+listing_window_s = 600
+listing_every_s = 600
+commit_round_ms = 500
+min_commit_rounds_per_listing = 10
+# The sampler that records hour-end-to-first-L1 latency and fold seal times.
+sample_interval_ms = 60000
+min_retention_days = 3
+require_sha_path = true
+# Every Wo walk's newest ingest hour sealed (fold watermark at or past it) at
+# its t0.
+require_wo_sealed = true
+# Every ingest hour a Wr or Wo walk read has a recorded fold seal time by the
+# end of the run.
+require_seal_recorded = true
+# At least one hour-end-to-first-L1 latency observed during the run.
+require_l1_observed = true
+
+# Each band: lo and hi (inclusive), or a model and a tolerance. Every figure is
+# emitted exactly once and must fall inside its band, or the bin exits
+# non-zero. All are predictions; there is no prior measurement.
+[production.bands]
+# finish_share.{s1,s2}.wp.d{1s,10s,60s}
+finish_wp = { model = "exp_min_lag", tolerance = 0.15, prediction = "exp(-min(3*delta, L)/c)", miss_means = "the overlap model of ADR-1374 item 5 is wrong" }
+# finish_share.{s1,s2}.wf.d{1s,10s,60s}
+finish_wf = { model = "exp_walk", tolerance = 0.15, prediction = "exp(-3*delta/c)", miss_means = "the overlap model of ADR-1374 item 5 is wrong" }
+# commit_cause_share.wp_wf: Wp and Wf expiries carrying the commit label
+commit_cause_share_live = { lo = 0.95, hi = 1.0, prediction = ">= 95%", miss_means = "something besides ingest moves a live window" }
+# finish_share.{s1,s2}.wr.d60s (the grid's longest delta)
+finish_wr_longest_delta = { lo = 0.70, hi = 1.0, prediction = "90%", miss_means = "compaction or fold expiries matter" }
+# finish_share.{s1,s2}.wo.d{1s,10s,60s}
+finish_wo = { lo = 0.98, hi = 1.0, prediction = "100%", miss_means = "an unexplained set change" }
+# commit_expiries.wr_wo
+commit_expiries_old = { lo = 0.0, hi = 0.0, prediction = "0", miss_means = "a bug (a non-overlapping commit kept), not a rate" }
+# fold_expiries.wo.s2
+fold_expiries_wo_s2 = { lo = 0.0, hi = 0.0, prediction = "0", miss_means = "an old hour sealed again" }
+# short_walks: walks with fewer than pages_per_walk pages
+short_walks = { lo = 0.0, hi = 0.0, prediction = "0", miss_means = "a vacuous cell, void it" }
+# failed_walks: walks that ended on a query error rather than a page
+failed_walks = { lo = 0.0, hi = 0.0, prediction = "0", miss_means = "the probe measured errors, not expiries" }
+# unresolved_hour_keys: an l0 key page one read whose ingest hour the probe could not look up
+unresolved_hour_keys = { lo = 0.0, hi = 0.0, prediction = "0", miss_means = "the compaction label could not be decided for some expiry" }
+# decision.wr_compaction_fold_share.d60s: Wr walks at the longest delta that
+# expired with a compaction or fold label, over all of them. Not a pass/fail
+# band: above 0.10, open the L0-identity digest ticket; otherwise close the
+# checkbox with the figure.
+decision_wr_compaction_fold_share = { lo = 0.0, hi = 1.0, prediction = "decision input, threshold 0.10", miss_means = "not a share" }
+# mcp_crosscheck.abs_diff.s1.{wp,wo}.d10s: |MCP finish share - probe finish share|
+mcp_crosscheck_abs_diff = { lo = 0.0, hi = 0.10, prediction = "within 10 pp", miss_means = "the probe does not reproduce what ravel_query_sql does" }
+
+# The --profile smoke run: an in-memory store, a minute of load, windows of
+# seconds rather than hours, so the bin runs end to end and emits every figure
+# in a test. Its bands are wide on purpose and prove nothing about expiry
+# rates; they are not the pre-registration.
+[smoke.grid]
+walks_per_cell = 2
+max_concurrent_walks = 6
+pages_per_walk = 4
+deltas_ms = [100, 200, 400]
+mcp_crosscheck_walks = 2
+mcp_crosscheck_delta_ms = 200
+
+# Wider than the commit lag (several seconds at the default flush cadence), so
+# page one sees enough committed rows for four pages.
+[smoke.windows]
+wp = [-20, 0]
+wf = [-20, 20]
+wr = [-35, -25]
+wo = [-50, -40]
+
+[smoke.load]
+active_series = 200
+scrape_interval_ms = 1000
+series_per_body = 1000
+s2_family = "metricsbench_requests_total"
+s1_max_rows = 1
+s2_max_rows = 5
+
+[smoke.schedule]
+phase_a_after_s = 25
+phase_b_after_s = 40
+phase_c_after_s = 55
+max_run_s = 240
+
+[smoke.stamps]
+ingest_rate_tolerance = 1.0
+rate_window_s = 10
+listing_window_s = 20
+listing_every_s = 10
+commit_round_ms = 500
+min_commit_rounds_per_listing = 1
+sample_interval_ms = 1000
+min_retention_days = 3
+require_sha_path = false
+require_wo_sealed = false
+require_seal_recorded = false
+require_l1_observed = false
+
+[smoke.bands]
+finish_wp = { model = "exp_min_lag", tolerance = 1.0, prediction = "smoke", miss_means = "smoke" }
+finish_wf = { model = "exp_walk", tolerance = 1.0, prediction = "smoke", miss_means = "smoke" }
+commit_cause_share_live = { lo = 0.0, hi = 1.0, prediction = "smoke", miss_means = "smoke" }
+finish_wr_longest_delta = { lo = 0.0, hi = 1.0, prediction = "smoke", miss_means = "smoke" }
+finish_wo = { lo = 0.0, hi = 1.0, prediction = "smoke", miss_means = "smoke" }
+commit_expiries_old = { lo = 0.0, hi = 1e9, prediction = "smoke", miss_means = "smoke" }
+fold_expiries_wo_s2 = { lo = 0.0, hi = 1e9, prediction = "smoke", miss_means = "smoke" }
+short_walks = { lo = 0.0, hi = 0.0, prediction = "0", miss_means = "the smoke fixture is too small for four pages" }
+failed_walks = { lo = 0.0, hi = 0.0, prediction = "0", miss_means = "the smoke run hit query errors" }
+unresolved_hour_keys = { lo = 0.0, hi = 1e9, prediction = "smoke", miss_means = "smoke" }
+decision_wr_compaction_fold_share = { lo = 0.0, hi = 1.0, prediction = "smoke", miss_means = "smoke" }
+mcp_crosscheck_abs_diff = { lo = 0.0, hi = 1.0, prediction = "smoke", miss_means = "smoke" }

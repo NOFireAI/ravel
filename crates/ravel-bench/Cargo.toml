@@ -174,6 +174,9 @@ pprof = { version = "0.15", optional = true, features = ["flamegraph"] }
 ravel-server = { path = "../../services/ravel-server", version = "0.30.1", optional = true, features = ["sql"] }
 ravel-cpu-gate = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
+# Gated behind `walk-expiry`: the MCP budget clamp and segment-set digest.
+# Workspace path crate, a new dependency edge only.
+ravel-mcp = { workspace = true, optional = true }
 # The pending-ack shed cost lane (`pending_ack_shed`) reads the process CPU
 # clock through `rustix::time::clock_gettime(ClockId::ProcessCPUTime)`, a safe
 # wrapper with nanosecond reporting on Linux and macOS, where `/proc/self/stat`
@@ -243,6 +246,21 @@ flight-lane = ["sql-latency", "dep:arrow-flight", "dep:futures"]
 # `heartbeat_under_query_load`, issue #2670). Off by default: they link
 # ravel-server and its SQL surface. Advisory lanes, run by hand.
 saturation = ["dep:ravel-server", "dep:ravel-cpu-gate", "dep:ravel-memory", "dep:anyhow", "dep:tikv-jemallocator"]
+# The pinned-walk expiry probe (`mcp_walk_expiry`, issue #3779 item 1). Off by
+# default: it links ravel-server with its `mcp` feature (which implies `sql`),
+# so the probe calls the query service the MCP adapter calls and the
+# cross-check drives the real `POST /mcp`. `ravel-sql` is the existing
+# optional entry above (with its `flight-sql` feature, the only spelling one
+# entry allows). `ravel-mcp` supplies the budget clamp and the segment-set
+# digest the adapter uses. No new external crate.
+walk-expiry = [
+    "dep:ravel-server",
+    "ravel-server?/mcp",
+    "dep:ravel-sql",
+    "dep:ravel-mcp",
+    "dep:anyhow",
+    "dep:tikv-jemallocator",
+]
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -482,6 +500,20 @@ bench = false
 name = "ingest_query_latency_trial"
 path = "src/bin/ingest_query_latency_trial.rs"
 required-features = ["saturation"]
+bench = false
+
+# Issue #3779 item 1: how often a pinned ravel_query_sql walk expires, and why.
+[[bin]]
+name = "mcp_walk_expiry"
+path = "src/bin/mcp_walk_expiry.rs"
+required-features = ["walk-expiry"]
+bench = false
+
+# The bin end to end in its smoke profile: every figure emitted and checked.
+[[test]]
+name = "walk_expiry_smoke"
+path = "tests/walk_expiry_smoke.rs"
+required-features = ["walk-expiry"]
 bench = false
 
 # ADR-2793 decision 4: the server CPU one post-decode pending-ack refusal costs
