@@ -42,6 +42,18 @@ pub(super) struct PlanCounts {
     /// The decoded-set verdict for a scan with a `Contains` arm and a decoded
     /// cache ([`deferred_verdict`]); `None` otherwise.
     deferred: Option<DeferredVerdict>,
+    /// The tier-2 router's figures (ADR-3692 decision 4), published once by
+    /// partition 0; `None` for a scan that did not route.
+    pub(super) route_figures: Option<RoutedFigures>,
+}
+
+/// What a routed logs scan reports in `stats.keyIndex`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct RoutedFigures {
+    pub(super) route: RouteFigures,
+    /// Planned segments whose skip index dropped every block KEY_IDX or the
+    /// leaves named for the key.
+    pub(super) skip_idx_dropped: u64,
 }
 
 /// Whether a scan's Contains-deferred columns are served from the decoded
@@ -472,15 +484,22 @@ type PlanSegmentResult = Option<(
 /// partitions the unplanned route would leave partitions idle that the planned
 /// route stripes blocks over when a read cache is wired (ADR-0102). Those
 /// scans keep planning every segment.
+///
+/// A segment the tier-2 router pruned is never opened, and one it answered
+/// with a block set above the whole-object bound is planned, so neither
+/// counts.
 fn skips_sub_bound_plans(
     ctx: &PartitionCtx,
     segments: &[SegmentRef],
+    routes: &[Option<SegmentRoute>],
     target_partitions: usize,
 ) -> bool {
     let sub_bound = segments
         .iter()
-        .filter(|seg| {
-            may_skip_plan(ctx, seg)
+        .zip(routes)
+        .filter(|(seg, route)| {
+            !routed_past_the_plan_skip(ctx, seg, route.as_ref())
+                && may_skip_plan(ctx, seg)
                 && LogSegmentFetcher::ts_range_relevant(
                     seg,
                     ctx.query.ts_min_ns,
@@ -489,6 +508,93 @@ fn skips_sub_bound_plans(
         })
         .count();
     sub_bound >= target_partitions.max(1)
+}
+
+/// Whether the tier-2 router's answer for `seg` takes it off the unplanned
+/// route: pruned, or a block set over an object above
+/// [`LogSegmentFetcher::plan_whole_object_bound`], which is planned
+/// restricted to the set.
+fn routed_past_the_plan_skip(
+    ctx: &PartitionCtx,
+    seg: &SegmentRef,
+    route: Option<&SegmentRoute>,
+) -> bool {
+    match route {
+        Some(SegmentRoute::Pruned) => true,
+        Some(SegmentRoute::Blocks(_)) => seg.object_size > ctx.fetcher.plan_whole_object_bound(),
+        Some(SegmentRoute::Uncovered) | None => false,
+    }
+}
+
+/// What the tier-2 router answered for one scan: per segment, in scan order,
+/// its route (`None` for a ts-irrelevant segment, and for every segment of a
+/// scan that does not route), and the figures for `stats.keyIndex`.
+struct ScanRoutes {
+    routes: Vec<Option<SegmentRoute>>,
+    figures: Option<RouteFigures>,
+}
+
+/// Run the tier-2 router once over the ts-relevant segments, before the plan
+/// pass's per-segment loop (ADR-3692 decision 4). A scan with no
+/// declared-key equality, or one resolved without parts, routes nothing and
+/// reports no figures.
+async fn route_segments(ctx: &PartitionCtx, segments: &[SegmentRef]) -> DFResult<ScanRoutes> {
+    let mut routed = ScanRoutes {
+        routes: vec![None; segments.len()],
+        figures: None,
+    };
+    let (Some((route_ctx, pool)), Some(arm)) = (&ctx.key_index_route, ctx.query.key_equals.first())
+    else {
+        return Ok(routed);
+    };
+    if route_ctx.parts.origin.len() != segments.len() {
+        return Err(DataFusionError::Internal(format!(
+            "logs key-index route: {} part origins for {} segments",
+            route_ctx.parts.origin.len(),
+            segments.len()
+        )));
+    }
+    let (ts_min, ts_max) = (ctx.query.ts_min_ns, ctx.query.ts_max_ns);
+    let mut positions = Vec::new();
+    let mut kept = Vec::new();
+    let mut origin = Vec::new();
+    for (idx, (seg, o)) in segments.iter().zip(&route_ctx.parts.origin).enumerate() {
+        if LogSegmentFetcher::ts_range_relevant(seg, ts_min, ts_max) {
+            positions.push(idx);
+            kept.push(seg.clone());
+            origin.push(*o);
+        }
+    }
+    let snapshot = Snapshot {
+        segments: kept,
+        ..Snapshot::default()
+    };
+    let parts = SnapshotParts::new(route_ctx.parts.parts.clone(), origin);
+    let key_set = log_key_set(arm).map_err(|e| DataFusionError::External(e.into()))?;
+    let reader = LogLeafRangeReader::new(&ctx.fetcher, ctx.tenant_hash);
+    let budget = PoolLeafBudget(Arc::clone(pool));
+    let input = RouteInput {
+        catalog: &route_ctx.catalog,
+        snapshot: &snapshot,
+        parts: &parts,
+        signal: ravel_types::Signal::Logs,
+        tenant_hash: ctx.tenant_hash,
+        key_set: &key_set,
+        accounting: &ctx.phase_accounting,
+        reader: &reader,
+        budget: &budget,
+        limits: KeyIndexLeafLimits::default(),
+    };
+    let (routes, figures) = match route_ctx.max_probed_parts {
+        Some(max_parts) => route_with_max_parts(input, max_parts).await,
+        None => route(input).await,
+    }
+    .map_err(|e| DataFusionError::External(e.into()))?;
+    for (idx, segment_route) in positions.into_iter().zip(routes) {
+        routed.routes[idx] = Some(segment_route);
+    }
+    routed.figures = Some(figures);
+    Ok(routed)
 }
 
 /// Whether `seg` is one [`skips_sub_bound_plans`] may open unplanned: at or
@@ -556,10 +662,12 @@ async fn compute_plan_counts(
     // Built with a loop rather than a `map` closure: a closure returning a
     // future that borrows its argument cannot satisfy the higher-ranked bound
     // this `Send` boxed future needs.
+    let ScanRoutes { routes, figures } = route_segments(ctx, segments).await?;
     let mut prunes = Vec::with_capacity(segments.len());
     let mut unplanned = vec![false; segments.len()];
     let mut probed = vec![false; segments.len()];
-    let skip_sub_bound = skips_sub_bound_plans(ctx, segments, plan_concurrency);
+    let mut key_index = KeyIndexPruning::default();
+    let skip_sub_bound = skips_sub_bound_plans(ctx, segments, &routes, plan_concurrency);
     for (idx, seg) in segments.iter().enumerate() {
         // Refuse an unreadable version BEFORE the plan probe, not after. This
         // is a second entry point into the fetch layer alongside the three
@@ -567,13 +675,33 @@ async fn compute_plan_counts(
         // before the open phase can reject the version -- so without this the
         // ordering guarantee holds on the scan path and quietly fails here.
         refuse_unreadable_version(seg)?;
+        // ADR-3692 decision 4: a segment the leaves prune is never opened,
+        // whatever its size, and one they answer with a block set needs no
+        // KEY_IDX read. Only an uncovered segment, and every segment of a
+        // scan built without parts (Flight SQL's pinned path, a worker slice,
+        // EXPLAIN, a refused parts charge), takes the tier-1 routes below.
+        let blocks = match &routes[idx] {
+            Some(SegmentRoute::Pruned) => {
+                key_index.segments_pruned += 1;
+                continue;
+            }
+            Some(SegmentRoute::Blocks(set)) => Some(set.as_slice()),
+            Some(SegmentRoute::Uncovered) | None => None,
+        };
+        if blocks.is_some()
+            && skip_sub_bound
+            && !routed_past_the_plan_skip(ctx, seg, routes[idx].as_ref())
+        {
+            unplanned[idx] = true;
+            continue;
+        }
         // ADR-2677 decision 2: at or under the bound the plan would read the
         // object whole only to count its survivors, so the scan reads it once
         // instead, when the scan has enough such segments to fill its
         // partitions (see `skips_sub_bound_plans`).
         // ADR-2707 decision 5: a keyed one above the block-range threshold is
         // probed here instead, and left unplanned unless a key is absent.
-        let probe_only = skip_sub_bound && may_skip_plan(ctx, seg);
+        let probe_only = blocks.is_none() && skip_sub_bound && may_skip_plan(ctx, seg);
         if probe_only {
             if !LogSegmentFetcher::ts_range_relevant(seg, ctx.query.ts_min_ns, ctx.query.ts_max_ns)
             {
@@ -596,6 +724,11 @@ async fn compute_plan_counts(
                     .probe_segment_keyed(seg, ctx.tenant_hash, &ctx.query, plan, key_index)
                     .await
                     .map(PlanPassRead::Probed)
+            } else if let Some(blocks) = blocks {
+                ctx.fetcher
+                    .plan_segment_routed(seg, ctx.tenant_hash, &ctx.query, blocks, plan, key_index)
+                    .await
+                    .map(|plan| PlanPassRead::Planned(Box::new(plan)))
             } else {
                 ctx.fetcher
                     .plan_segment_keyed(seg, ctx.tenant_hash, &ctx.query, plan, key_index)
@@ -618,7 +751,7 @@ async fn compute_plan_counts(
     // `None` before `PlannedUnit` is built below.
     let mut carried_bytes = 0u64;
     let mut carried_seen = 0usize;
-    let mut key_index = KeyIndexPruning::default();
+    let mut skip_idx_dropped = 0u64;
     let deferred_cap = deferred_cap(ctx);
     let mut deferred_estimate = 0u64;
     while let Some((idx, entry)) = stream.next().await {
@@ -635,6 +768,9 @@ async fn compute_plan_counts(
         };
         key_index.segments_pruned += keyed.key_index.segments_pruned;
         key_index.blocks_pruned += keyed.key_index.blocks_pruned;
+        if keyed.key_blocks.as_ref().is_some_and(Vec::is_empty) {
+            skip_idx_dropped += 1;
+        }
         let entry: PlanSegmentResult = keyed.plan;
         if let Some((indices, dirs, stats, footer, whole_object)) = entry {
             // The blocks some partition reads: the KEY_IDX probe's subset of
@@ -730,6 +866,10 @@ async fn compute_plan_counts(
     );
     counts.deferred = deferred;
     counts.probed = probed;
+    counts.route_figures = figures.map(|route| RoutedFigures {
+        route,
+        skip_idx_dropped,
+    });
     Ok(Arc::new(counts))
 }
 
@@ -777,6 +917,7 @@ impl PlanCounts {
             global,
             key_index,
             deferred: None,
+            route_figures: None,
         }
     }
 
@@ -3226,6 +3367,7 @@ mod carried_directory_reservation_tests {
             phase_accounting: PhaseAccounting::new(),
             budget: ScanBudget::unlimited(&PhaseAccounting::new()),
             serve_deferred: Default::default(),
+            key_index_route: None,
         };
         assert!(
             segments.iter().all(|seg| !ctx().fetcher.plans_segment(seg)),
@@ -3354,6 +3496,7 @@ mod carried_directory_reservation_tests {
             phase_accounting: PhaseAccounting::new(),
             budget: ScanBudget::unlimited(&PhaseAccounting::new()),
             serve_deferred: Default::default(),
+            key_index_route: None,
         };
         assert_eq!(budget.reserved(), 0);
         let counts = compute_plan_counts(&ctx, &segments, 4, true, false)
@@ -3417,6 +3560,7 @@ mod carried_directory_reservation_tests {
             phase_accounting: PhaseAccounting::new(),
             budget: ScanBudget::unlimited(&PhaseAccounting::new()),
             serve_deferred: Default::default(),
+            key_index_route: None,
         };
         let exact = compute_plan_counts(&with_limit(total), &segments, 1, true, false).await;
         assert!(
@@ -3486,6 +3630,7 @@ mod carried_directory_reservation_tests {
             phase_accounting: PhaseAccounting::new(),
             budget: ScanBudget::unlimited(&PhaseAccounting::new()),
             serve_deferred: Default::default(),
+            key_index_route: None,
         };
         let counts = compute_plan_counts(&ctx, &segments, 2, true, false)
             .await
@@ -3597,6 +3742,7 @@ mod carried_directory_reservation_tests {
             full_reads: 1,
             global: None,
             key_index: KeyIndexPruning::default(),
+            route_figures: None,
             deferred: None,
         };
         assert!(exec.counts.set(Arc::new(counts)).is_ok());

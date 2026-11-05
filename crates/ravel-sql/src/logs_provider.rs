@@ -23,6 +23,7 @@
 //! the merged column, so the channel changes which blocks the fetch reads and
 //! never which rows the query returns.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -30,7 +31,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::DFSchema;
-use datafusion::error::Result as DFResult;
+use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::expr_rewriter::unnormalize_col;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 #[cfg(feature = "flight-sql")]
@@ -38,7 +39,7 @@ use datafusion::physical_expr::expressions::col;
 use datafusion::physical_plan::ExecutionPlan;
 #[cfg(feature = "flight-sql")]
 use datafusion::physical_plan::projection::ProjectionExec;
-use ravel_catalog::{LoadedColumnStats, SegmentRef, Snapshot};
+use ravel_catalog::{Catalog, LoadedColumnStats, SegmentRef, Snapshot, SnapshotParts};
 use ravel_query::LogSegmentFetcher;
 use ravel_query::PhaseAccounting;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
@@ -58,7 +59,7 @@ use crate::flight_ticket::SlicePushdown;
 use crate::logs_pushdown::{
     LogsPushdown, extract_logs_keyed, filter_has_row_filter, filter_is_exact,
 };
-use crate::logs_scan::{LogsScanExec, RowFilters, ScanExecutions};
+use crate::logs_scan::{LogsKeyIndexRoute, LogsScanExec, RowFilters, ScanExecutions};
 use crate::logs_schema::{logs_schema, logs_schema_with_declared};
 use crate::logs_stats_prune::prune_segments_by_stats;
 use crate::scan_budget::ScanBudget;
@@ -128,6 +129,10 @@ pub struct LogsTableProvider {
     /// passed to the distributed fan-out. Unlimited over this provider's own
     /// accounting by default, installed with [`Self::with_scan_budget`].
     scan_budget: ScanBudget,
+    /// The tier-2 router's inputs over this provider's whole snapshot, `None`
+    /// for a snapshot resolved without its parts, which leaves every segment
+    /// to its object's KEY_IDX.
+    key_index_route: Option<LogsKeyIndexRoute>,
 }
 
 impl LogsTableProvider {
@@ -161,7 +166,31 @@ impl LogsTableProvider {
             row_filter_pushdown: true,
             scan_executions: None,
             scan_budget,
+            key_index_route: None,
         }
+    }
+
+    /// Route declared-key lookups through the parts' key-index leaves once
+    /// per scan (ADR-3692 decision 4). `parts` must come from the resolve that
+    /// produced this provider's snapshot; a mismatch fails the lookup.
+    #[must_use]
+    pub fn with_key_index_route(mut self, catalog: Arc<Catalog>, parts: SnapshotParts) -> Self {
+        self.key_index_route = Some(LogsKeyIndexRoute {
+            catalog,
+            parts,
+            max_probed_parts: None,
+        });
+        self
+    }
+
+    /// Lower the router's part ceiling to `max_parts` (never above the ADR's
+    /// `P_max`). A no-op without [`Self::with_key_index_route`].
+    #[must_use]
+    pub fn with_key_index_max_probed_parts(mut self, max_parts: Option<usize>) -> Self {
+        if let Some(ctx) = &mut self.key_index_route {
+            ctx.max_probed_parts = max_parts;
+        }
+        self
     }
 
     /// Install a coordinator-side distributed scan context (ADR-0071; #326). With
@@ -411,8 +440,47 @@ impl LogsTableProvider {
             .with_segments_pruned_by_stats(pruned_by_stats)
             .with_key_equals(Arc::new(pushdown.key_equals.clone()))
             .with_scan_executions(self.scan_executions.clone())
-            .with_scan_budget(self.scan_budget.clone());
+            .with_scan_budget(self.scan_budget.clone())
+            .with_key_index_route(self.scan_key_index_route(&segments, pushdown)?);
         Ok(Arc::new(scan))
+    }
+
+    /// The router's inputs re-aligned to `segments`, the scan's subset of the
+    /// snapshot. `None` without a declared-key equality or without parts.
+    fn scan_key_index_route(
+        &self,
+        segments: &[SegmentRef],
+        pushdown: &LogsPushdown,
+    ) -> DFResult<Option<Arc<LogsKeyIndexRoute>>> {
+        let Some(ctx) = &self.key_index_route else {
+            return Ok(None);
+        };
+        if pushdown.key_equals.is_empty() {
+            return Ok(None);
+        }
+        let segment_count = self.snapshot.segments.len();
+        if ctx.parts.origin.len() != segment_count {
+            return Err(DataFusionError::Internal(format!(
+                "logs key-index route: {} part origins for {segment_count} segments",
+                ctx.parts.origin.len()
+            )));
+        }
+        let by_key: HashMap<&str, _> = self
+            .snapshot
+            .segments
+            .iter()
+            .zip(&ctx.parts.origin)
+            .map(|(s, o)| (s.data_object_key.as_str(), *o))
+            .collect();
+        let origin = segments
+            .iter()
+            .map(|s| by_key.get(s.data_object_key.as_str()).copied().flatten())
+            .collect();
+        Ok(Some(Arc::new(LogsKeyIndexRoute {
+            catalog: Arc::clone(&ctx.catalog),
+            parts: SnapshotParts::new(ctx.parts.parts.clone(), origin),
+            max_probed_parts: ctx.max_probed_parts,
+        })))
     }
 
     /// Segments whose event-time span overlaps the extracted ts bounds.
