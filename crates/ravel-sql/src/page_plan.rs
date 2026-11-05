@@ -5504,9 +5504,7 @@ mod tests {
         }
 
         let sql = "SELECT name, avg(duration_ns) AS m FROM spans GROUP BY name ORDER BY m";
-        let resumed = |value: ResumeValue| {
-            plan_page(sql, Some(&ResumePosition::new(vec![value])))
-        };
+        let resumed = |value: ResumeValue| plan_page(sql, Some(&ResumePosition::new(vec![value])));
         let page = |predicate: &str| {
             format!(
                 "SELECT * FROM (SELECT name, avg(duration_ns) AS m FROM spans GROUP BY name) \
@@ -5514,7 +5512,9 @@ mod tests {
             )
         };
         assert_eq!(
-            resumed(ResumeValue::Float(-2.5)).expect("planned").statement,
+            resumed(ResumeValue::Float(-2.5))
+                .expect("planned")
+                .statement,
             page("(\"m\" > -2.5)"),
         );
         assert_eq!(

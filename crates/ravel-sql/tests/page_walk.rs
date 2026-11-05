@@ -2041,8 +2041,7 @@ fn avg_fixture() -> Vec<(&'static str, ArrayRef)> {
         (
             "name",
             Arc::new(StringArray::from(vec![
-                "a", "f", "e", "g", "d", "b", "a", "c", "e", "h", "f", "d", "g", "b", "a", "e",
-                "c",
+                "a", "f", "e", "g", "d", "b", "a", "c", "e", "h", "f", "d", "g", "b", "a", "e", "c",
             ])),
         ),
         (
@@ -2140,7 +2139,10 @@ async fn an_integer_avg_of_zero_is_positive_zero() {
         let ctx = checked_sum_context(
             SPANS_TABLE,
             vec![
-                ("name", Arc::new(StringArray::from(vec!["d", "a", "d", "a"]))),
+                (
+                    "name",
+                    Arc::new(StringArray::from(vec!["d", "a", "d", "a"])),
+                ),
                 (
                     "duration_ns",
                     Arc::new(Int64Array::from(vec![-3, i64::MAX, 3, -i64::MAX])),
