@@ -48,6 +48,13 @@
 #                    line is the only record of its flags, and it is
 #                    unavailable when docker is not reachable. Settings in the
 #                    mounted limits file are not read; ravel.yml names it.
+#   prometheus, victoriametrics, mimir (the Go comparators)
+#                    go_runtime: GOMEMLIMIT from the container's .Config.Env
+#                    via `docker inspect`, as {"source": "docker inspect
+#                    .Config.Env", "GOMEMLIMIT": "<value>"}, with the value
+#                    "unset" when the variable is absent. It is unavailable
+#                    when docker is not reachable or the inspect fails, and
+#                    does not count toward exit 1.
 #   every one        the container's image ID, .Config.Image, RepoDigests,
 #                    Architecture and Os, via `docker compose ps` and
 #                    `docker inspect`, when docker is reachable; otherwise the
@@ -419,6 +426,32 @@ def ravel_runtime_flags(containers, service):
     return {"source": source, "cmd": cmd}
 
 
+GO_RUNTIME_SOURCE = "docker inspect .Config.Env"
+
+
+def go_runtime(containers, service):
+    """GOMEMLIMIT out of the container's environment, "unset" when absent."""
+    if not isinstance(containers, dict):
+        return unavailable(f"{GO_RUNTIME_SOURCE} of compose service {service}: {containers}")
+    cid = containers.get(service)
+    if not cid:
+        return unavailable(f"no running container for compose service {service}")
+    stdout, err = run_docker("inspect", cid)
+    if err:
+        return unavailable(err)
+    try:
+        env = json.loads(stdout)[0].get("Config", {}).get("Env") or []
+        if not isinstance(env, list):
+            raise TypeError(f".Config.Env is {type(env).__name__}, not a list")
+    except Exception as e:
+        return unavailable(f"docker inspect {cid}: {type(e).__name__}: {e}")
+    value = "unset"
+    for entry in env:
+        if isinstance(entry, str) and entry.startswith("GOMEMLIMIT="):
+            value = entry[len("GOMEMLIMIT="):]
+    return {"source": GO_RUNTIME_SOURCE, "GOMEMLIMIT": value}
+
+
 containers = compose_containers()
 
 urls = {
@@ -455,6 +488,7 @@ doc["comparators"]["prometheus"] = {
     "revision": revision,
     "runtime_flags": flags_json(urls["prometheus"]["runtime_flags"]),
     "config_settings": prom_config_settings(urls["prometheus"]["config_settings"]),
+    "go_runtime": go_runtime(containers, "prometheus"),
     "image": image_of(containers, "prometheus"),
 }
 
@@ -463,6 +497,7 @@ doc["comparators"]["victoriametrics"] = {
     "version": version,
     "revision": revision,
     "runtime_flags": vm_flags(urls["victoriametrics"]["runtime_flags"]),
+    "go_runtime": go_runtime(containers, "victoriametrics"),
     "image": image_of(containers, "victoriametrics"),
 }
 
@@ -483,6 +518,7 @@ doc["comparators"]["mimir"] = {
     "runtime_flags": runtime_flags,
     "querier_query_engine": engine,
     "query_engine_default_for_version": mimir_default_engine(version),
+    "go_runtime": go_runtime(containers, "mimir"),
     "image": image_of(containers, "mimir"),
 }
 
