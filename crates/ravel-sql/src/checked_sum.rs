@@ -959,3 +959,580 @@ impl Accumulator for CheckedSlidingDistinctSumAccumulator {
             + self.counts.capacity() * (std::mem::size_of::<(i128, u64)>() + 1)
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch, UInt64Array};
+    use datafusion::arrow::datatypes::Schema;
+    use datafusion::datasource::MemTable;
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{SessionConfig, SessionContext};
+
+    use super::*;
+
+    const I64_MAX: i128 = i64::MAX as i128;
+    const U64_MAX: i128 = u64::MAX as i128;
+
+    /// One row of `t`: its order key `o`, its group key `g` and its value `v`.
+    type Row = (i64, i64, Option<i128>);
+
+    /// `rows` in value order `0..n`, each its own order key, all in group 1.
+    fn ungrouped(values: &[Option<i128>]) -> Vec<Row> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(o, &v)| (o as i64, 1, v))
+            .collect()
+    }
+
+    /// `t(o Int64, g Int64, v <value_type>)` with row `i` in partition
+    /// `i % partitions`; a partition that gets no row holds an empty batch.
+    fn table(value_type: &DataType, rows: &[Row], partitions: usize) -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("o", DataType::Int64, false),
+            Field::new("g", DataType::Int64, false),
+            Field::new("v", value_type.clone(), true),
+        ]));
+        let batches = (0..partitions)
+            .map(|p| {
+                let part: Vec<&Row> = rows.iter().skip(p).step_by(partitions).collect();
+                let o = Int64Array::from_iter_values(part.iter().map(|r| r.0));
+                let g = Int64Array::from_iter_values(part.iter().map(|r| r.1));
+                let v: ArrayRef = match value_type {
+                    DataType::Int64 => Arc::new(Int64Array::from_iter(
+                        part.iter().map(|r| r.2.map(|v| i64::try_from(v).expect("i64"))),
+                    )),
+                    DataType::UInt64 => Arc::new(UInt64Array::from_iter(
+                        part.iter().map(|r| r.2.map(|v| u64::try_from(v).expect("u64"))),
+                    )),
+                    DataType::Float64 => Arc::new(Float64Array::from_iter(
+                        part.iter().map(|r| r.2.map(|v| v as f64)),
+                    )),
+                    other => panic!("no fixture for {other}"),
+                };
+                let batch =
+                    RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(o), Arc::new(g), v])
+                        .expect("batch");
+                vec![batch]
+            })
+            .collect();
+        MemTable::try_new(schema, batches).expect("memtable")
+    }
+
+    fn context(value_type: &DataType, rows: &[Row], partitions: usize) -> SessionContext {
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new().with_target_partitions(partitions),
+        );
+        // Displace the built-in `sum`, exactly as `build_session` does.
+        ctx.register_udaf(checked_sum_udaf());
+        ctx.register_table("t", Arc::new(table(value_type, rows, partitions)))
+            .expect("register");
+        ctx
+    }
+
+    /// The first column of `sql`'s result over `t`, row by row.
+    async fn query(
+        sql: &str,
+        value_type: &DataType,
+        rows: &[Row],
+        partitions: usize,
+    ) -> DFResult<Vec<ScalarValue>> {
+        let batches = context(value_type, rows, partitions)
+            .sql(sql)
+            .await?
+            .collect()
+            .await?;
+        let mut out = Vec::new();
+        for batch in batches {
+            for row in 0..batch.num_rows() {
+                out.push(ScalarValue::try_from_array(batch.column(0), row)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The physical plan of `sql`, indented.
+    async fn plan(sql: &str, value_type: &DataType, rows: &[Row], partitions: usize) -> String {
+        let plan = context(value_type, rows, partitions)
+            .sql(sql)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        displayable(plan.as_ref()).indent(true).to_string()
+    }
+
+    fn sql_error(err: &DataFusionError) -> Option<&SqlError> {
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
+        while let Some(current) = cause {
+            if let Some(sql) = current.downcast_ref::<SqlError>() {
+                return Some(sql);
+            }
+            cause = current.source();
+        }
+        None
+    }
+
+    /// `result` failed with the typed overflow error for `aggregate` and
+    /// `result_type`, and returned no value.
+    fn assert_overflow(result: DFResult<Vec<ScalarValue>>, aggregate: &str, result_type: &str) {
+        let err = match result {
+            Ok(values) => panic!("expected an integer sum overflow, got {values:?}"),
+            Err(err) => err,
+        };
+        match sql_error(&err) {
+            Some(SqlError::IntegerSumOverflow {
+                aggregate: got_aggregate,
+                result_type: got_type,
+            }) => {
+                assert_eq!(got_aggregate, aggregate, "{err}");
+                assert_eq!(got_type, result_type, "{err}");
+            }
+            other => panic!("expected SqlError::IntegerSumOverflow, got {other:?} from {err}"),
+        }
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!(
+                "integer sum overflow in {aggregate}: the sum overflowed its result type \
+                 {result_type}"
+            )),
+            "{text}"
+        );
+    }
+
+    const UNGROUPED: &str = "SELECT sum(v) FROM t";
+    const GROUPED: &str = "SELECT sum(v) FROM t GROUP BY g ORDER BY g";
+    const SUM_V: &str = "sum(t.v)";
+
+    fn i64s(values: &[i64]) -> Vec<Option<i128>> {
+        values.iter().map(|&v| Some(i128::from(v))).collect()
+    }
+
+    /// Two groups: group 1 holds `values`, group 2 holds a single 7, so the
+    /// grouped accumulator carries a group that does not overflow beside one
+    /// that does.
+    fn grouped(values: &[Option<i128>]) -> Vec<Row> {
+        let mut rows: Vec<Row> = values
+            .iter()
+            .enumerate()
+            .map(|(o, &v)| (o as i64, 1, v))
+            .collect();
+        rows.push((values.len() as i64, 2, Some(7)));
+        rows
+    }
+
+    #[tokio::test]
+    async fn signed_max_plus_one_fails_ungrouped_and_grouped_at_1_and_8_partitions() {
+        let values = i64s(&[i64::MAX, 1]);
+        for partitions in [1, 8] {
+            let result = query(UNGROUPED, &DataType::Int64, &ungrouped(&values), partitions).await;
+            assert_overflow(result, SUM_V, "Int64");
+            let result = query(GROUPED, &DataType::Int64, &grouped(&values), partitions).await;
+            assert_overflow(result, SUM_V, "Int64");
+        }
+    }
+
+    #[tokio::test]
+    async fn unsigned_max_plus_one_fails_ungrouped_and_grouped_at_1_and_8_partitions() {
+        let values = vec![Some(U64_MAX), Some(1)];
+        for partitions in [1, 8] {
+            let result = query(UNGROUPED, &DataType::UInt64, &ungrouped(&values), partitions).await;
+            assert_overflow(result, SUM_V, "UInt64");
+            let result = query(GROUPED, &DataType::UInt64, &grouped(&values), partitions).await;
+            assert_overflow(result, SUM_V, "UInt64");
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_min_minus_one_fails_ungrouped_and_grouped_at_1_and_8_partitions() {
+        let values = i64s(&[i64::MIN, -1]);
+        for partitions in [1, 8] {
+            let result = query(UNGROUPED, &DataType::Int64, &ungrouped(&values), partitions).await;
+            assert_overflow(result, SUM_V, "Int64");
+            let result = query(GROUPED, &DataType::Int64, &grouped(&values), partitions).await;
+            assert_overflow(result, SUM_V, "Int64");
+        }
+    }
+
+    /// The 8-partition fixture runs a partial aggregation per partition and a
+    /// final one that merges their states, so the overflow tests above cover
+    /// `merge_batch`; at 1 partition the aggregate runs in one phase.
+    #[tokio::test]
+    async fn eight_partitions_merge_partial_states_and_one_does_not() {
+        let rows = grouped(&i64s(&[i64::MAX, 1]));
+        for sql in [UNGROUPED, GROUPED] {
+            let eight = plan(sql, &DataType::Int64, &rows, 8).await;
+            assert!(eight.contains("mode=Partial"), "{eight}");
+            let one = plan(sql, &DataType::Int64, &rows, 1).await;
+            assert!(!one.contains("mode=Partial"), "{one}");
+        }
+    }
+
+    async fn assert_sum(sql: &str, value_type: &DataType, rows: &[Row], expected: &[ScalarValue]) {
+        for partitions in [1, 8] {
+            let got = query(sql, value_type, rows, partitions)
+                .await
+                .unwrap_or_else(|err| panic!("{sql} at {partitions} partitions: {err}"));
+            assert_eq!(got, expected, "{sql} at {partitions} partitions");
+        }
+    }
+
+    fn int64(value: Option<i64>) -> ScalarValue {
+        ScalarValue::Int64(value)
+    }
+
+    #[tokio::test]
+    async fn sums_that_fit_are_unchanged() {
+        // The maximum alone.
+        let rows = ungrouped(&i64s(&[i64::MAX]));
+        assert_sum(UNGROUPED, &DataType::Int64, &rows, &[int64(Some(i64::MAX))]).await;
+        // Orders whose every running total stays in range.
+        for values in [
+            [i64::MAX, -1, 1],
+            [-1, i64::MAX, 1],
+            [-1, 1, i64::MAX],
+        ] {
+            let rows = ungrouped(&i64s(&values));
+            assert_sum(UNGROUPED, &DataType::Int64, &rows, &[int64(Some(i64::MAX))]).await;
+            let rows = grouped(&i64s(&values));
+            let expected = [int64(Some(i64::MAX)), int64(Some(7))];
+            assert_sum(GROUPED, &DataType::Int64, &rows, &expected).await;
+        }
+        let rows = ungrouped(&[Some(U64_MAX)]);
+        assert_sum(
+            UNGROUPED,
+            &DataType::UInt64,
+            &rows,
+            &[ScalarValue::UInt64(Some(u64::MAX))],
+        )
+        .await;
+        let rows = ungrouped(&i64s(&[i64::MIN]));
+        assert_sum(UNGROUPED, &DataType::Int64, &rows, &[int64(Some(i64::MIN))]).await;
+    }
+
+    /// `i64::MAX, 1, -1` in row order: the running total after the second row
+    /// is `i64::MAX + 1`, outside `Int64`, but the total is `i64::MAX`. The sum
+    /// is exact in `i128` and only the total is range-checked, so the query
+    /// returns `i64::MAX` at every partition count, whichever rows meet in
+    /// which partial.
+    #[tokio::test]
+    async fn an_intermediate_total_outside_the_range_with_a_total_inside_it_returns_the_total() {
+        for values in [[i64::MAX, 1, -1], [1, i64::MAX, -1], [i64::MIN, -1, 1]] {
+            let expected = values.iter().map(|&v| i128::from(v)).sum::<i128>();
+            let expected = i64::try_from(expected).expect("total fits");
+            let rows = ungrouped(&i64s(&values));
+            assert_sum(UNGROUPED, &DataType::Int64, &rows, &[int64(Some(expected))]).await;
+            let rows = grouped(&i64s(&values));
+            let expected = [int64(Some(expected)), int64(Some(7))];
+            assert_sum(GROUPED, &DataType::Int64, &rows, &expected).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn nulls_are_skipped_and_an_all_null_or_empty_group_is_null() {
+        let rows = ungrouped(&[None, Some(I64_MAX), None]);
+        assert_sum(UNGROUPED, &DataType::Int64, &rows, &[int64(Some(i64::MAX))]).await;
+        let rows = ungrouped(&[None, None]);
+        assert_sum(UNGROUPED, &DataType::Int64, &rows, &[int64(None)]).await;
+        assert_sum(UNGROUPED, &DataType::Int64, &[], &[int64(None)]).await;
+        assert_sum(
+            UNGROUPED,
+            &DataType::UInt64,
+            &[],
+            &[ScalarValue::UInt64(None)],
+        )
+        .await;
+        // Group 1 is all NULL, group 2 holds 7.
+        let rows = grouped(&[None, None]);
+        assert_sum(GROUPED, &DataType::Int64, &rows, &[int64(None), int64(Some(7))]).await;
+        // A NULL beside an overflow is still an overflow.
+        let rows = grouped(&[Some(I64_MAX), None, Some(1)]);
+        assert_overflow(query(GROUPED, &DataType::Int64, &rows, 8).await, SUM_V, "Int64");
+    }
+
+    #[tokio::test]
+    async fn distinct_sum_is_checked() {
+        let sql = "SELECT sum(DISTINCT v) FROM t";
+        let grouped_sql = "SELECT sum(DISTINCT v) FROM t GROUP BY g ORDER BY g";
+        // Duplicates of the maximum count once.
+        let values = i64s(&[i64::MAX, i64::MAX, 0]);
+        assert_sum(sql, &DataType::Int64, &ungrouped(&values), &[int64(Some(i64::MAX))]).await;
+        assert_sum(
+            grouped_sql,
+            &DataType::Int64,
+            &grouped(&values),
+            &[int64(Some(i64::MAX)), int64(Some(7))],
+        )
+        .await;
+        // A lone DISTINCT aggregate is rewritten by DataFusion's
+        // `SingleDistinctToGroupBy` into a plain sum over a GROUP BY of the
+        // value, aliased `alias1`, so the checked plain sum raises the error
+        // under that name.
+        let values = i64s(&[i64::MAX, i64::MAX, 1]);
+        for partitions in [1, 8] {
+            let result = query(sql, &DataType::Int64, &ungrouped(&values), partitions).await;
+            assert_overflow(result, "sum(alias1)", "Int64");
+            let result = query(grouped_sql, &DataType::Int64, &grouped(&values), partitions).await;
+            assert_overflow(result, "sum(alias1)", "Int64");
+        }
+    }
+
+    /// Two DISTINCT aggregates keep DataFusion from rewriting the distinct sum
+    /// into a GROUP BY, so the distinct accumulator itself runs.
+    #[tokio::test]
+    async fn distinct_sum_beside_another_distinct_aggregate_is_checked() {
+        let sql = "SELECT sum(DISTINCT v), count(DISTINCT o) FROM t";
+        let values = [Some(U64_MAX), Some(U64_MAX), Some(1)];
+        for partitions in [1, 8] {
+            let result = query(sql, &DataType::UInt64, &ungrouped(&values), partitions).await;
+            assert_overflow(result, "sum(DISTINCT t.v)", "UInt64");
+        }
+        let values = [Some(U64_MAX), Some(U64_MAX), Some(0), None];
+        assert_sum(
+            sql,
+            &DataType::UInt64,
+            &ungrouped(&values),
+            &[ScalarValue::UInt64(Some(u64::MAX))],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn filter_is_applied_before_the_check() {
+        let values = i64s(&[i64::MAX, 1, -5]);
+        let kept = "SELECT sum(v) FILTER (WHERE v <> 1) FROM t";
+        let kept_grouped = "SELECT sum(v) FILTER (WHERE v <> 1) FROM t GROUP BY g ORDER BY g";
+        assert_sum(kept, &DataType::Int64, &ungrouped(&values), &[int64(Some(i64::MAX - 5))])
+            .await;
+        assert_sum(
+            kept_grouped,
+            &DataType::Int64,
+            &grouped(&values),
+            &[int64(Some(i64::MAX - 5)), int64(Some(7))],
+        )
+        .await;
+        // A filter that selects no row of a group leaves it NULL.
+        let none = "SELECT sum(v) FILTER (WHERE v > 100) FROM t GROUP BY g ORDER BY g";
+        let rows = grouped(&i64s(&[1, 2]));
+        assert_sum(none, &DataType::Int64, &rows, &[int64(None), int64(None)]).await;
+        let overflow = "SELECT sum(v) FILTER (WHERE v > 0) FROM t";
+        let overflow_grouped = "SELECT sum(v) FILTER (WHERE v > 0) FROM t GROUP BY g ORDER BY g";
+        let aggregate = "sum(t.v) FILTER (WHERE t.v > Int64(0))";
+        for partitions in [1, 8] {
+            let result = query(overflow, &DataType::Int64, &ungrouped(&values), partitions).await;
+            assert_overflow(result, aggregate, "Int64");
+            let result =
+                query(overflow_grouped, &DataType::Int64, &grouped(&values), partitions).await;
+            assert_overflow(result, aggregate, "Int64");
+        }
+    }
+
+    #[tokio::test]
+    async fn window_sums_are_checked() {
+        let values = i64s(&[1, i64::MAX, -1, 1]);
+        let rows = ungrouped(&values);
+        // UNBOUNDED PRECEDING: the running total after row 1 overflows.
+        let running = "SELECT sum(v) OVER (ORDER BY o) FROM t ORDER BY o";
+        // A moving frame: rows 0-1 total i64::MAX + 1.
+        let moving =
+            "SELECT sum(v) OVER (ORDER BY o ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t \
+             ORDER BY o";
+        let moving_distinct = "SELECT sum(DISTINCT v) OVER (ORDER BY o ROWS BETWEEN 1 PRECEDING \
+                               AND CURRENT ROW) FROM t ORDER BY o";
+        for sql in [running, moving, moving_distinct] {
+            let err = query(sql, &DataType::Int64, &rows, 1)
+                .await
+                .expect_err("overflowing frame must fail");
+            assert!(
+                matches!(sql_error(&err), Some(SqlError::IntegerSumOverflow { .. })),
+                "{sql}: {err}"
+            );
+        }
+        // Frames that fit, including one reached by retracting a value that
+        // put an earlier frame at the limit.
+        let rows = ungrouped(&i64s(&[i64::MAX, -1, 1, 1]));
+        assert_sum(
+            moving,
+            &DataType::Int64,
+            &rows,
+            &[
+                int64(Some(i64::MAX)),
+                int64(Some(i64::MAX - 1)),
+                int64(Some(0)),
+                int64(Some(2)),
+            ],
+        )
+        .await;
+        assert_sum(
+            moving_distinct,
+            &DataType::Int64,
+            &rows,
+            &[
+                int64(Some(i64::MAX)),
+                int64(Some(i64::MAX - 1)),
+                int64(Some(0)),
+                int64(Some(1)),
+            ],
+        )
+        .await;
+        let rows = ungrouped(&[Some(U64_MAX), Some(1)]);
+        let err = query(moving, &DataType::UInt64, &rows, 1)
+            .await
+            .expect_err("overflowing unsigned frame must fail");
+        assert!(
+            matches!(sql_error(&err), Some(SqlError::IntegerSumOverflow { .. })),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn float_sum_delegates_to_the_built_in() {
+        let rows = ungrouped(&[Some(1), Some(2), None]);
+        for sql in [UNGROUPED, GROUPED] {
+            assert_sum(sql, &DataType::Float64, &rows, &[ScalarValue::Float64(Some(3.0))]).await;
+        }
+        let float_state = signed_state_fields(DataType::Float64);
+        assert_eq!(float_state, vec![DataType::Float64]);
+    }
+
+    /// The state field types `sum` declares for an argument of `arg_type`.
+    fn signed_state_fields(arg_type: DataType) -> Vec<DataType> {
+        let udaf = checked_sum_udaf();
+        let return_type = udaf.return_type(&[arg_type.clone()]).expect("type");
+        let input = [Arc::new(Field::new("v", arg_type, true))];
+        let fields = udaf
+            .state_fields(StateFieldsArgs {
+                name: "sum(t.v)",
+                input_fields: &input,
+                return_field: Arc::new(Field::new("sum(t.v)", return_type, true)),
+                ordering_fields: &[],
+                is_distinct: false,
+            })
+            .expect("state fields");
+        fields.iter().map(|f| f.data_type().clone()).collect()
+    }
+
+    /// Every integer width coerces to one of the two owned result types, so
+    /// every integer sum is checked.
+    #[tokio::test]
+    async fn every_integer_width_sums_into_an_owned_result_type() {
+        let rows = ungrouped(&i64s(&[1, 2]));
+        for (cast, result_type) in [
+            ("TINYINT", "Int64"),
+            ("SMALLINT", "Int64"),
+            ("INT", "Int64"),
+            ("BIGINT", "Int64"),
+            ("TINYINT UNSIGNED", "UInt64"),
+            ("SMALLINT UNSIGNED", "UInt64"),
+            ("INT UNSIGNED", "UInt64"),
+            ("BIGINT UNSIGNED", "UInt64"),
+        ] {
+            let sql = format!("SELECT arrow_typeof(sum(CAST(v AS {cast}))) FROM t");
+            let got = query(&sql, &DataType::Int64, &rows, 1).await.expect("query");
+            assert_eq!(got, vec![ScalarValue::Utf8(Some(result_type.to_string()))], "{cast}");
+        }
+        assert_eq!(signed_state_fields(DataType::Int64), vec![DataType::Decimal128(38, 0)]);
+        assert_eq!(signed_state_fields(DataType::UInt64), vec![DataType::Decimal128(38, 0)]);
+    }
+
+    fn signed_groups() -> CheckedSumGroupsAccumulator {
+        CheckedSumGroupsAccumulator::new(SumTarget::new(IntKind::Signed, SUM_V))
+    }
+
+    fn evaluated(acc: &mut CheckedSumGroupsAccumulator, emit_to: EmitTo) -> Vec<Option<i64>> {
+        let out = acc.evaluate(emit_to).expect("evaluate");
+        out.as_primitive::<Int64Type>().iter().collect()
+    }
+
+    /// `convert_to_state` (the skip-partial-aggregation path) produces states
+    /// `merge_batch` folds to the same sums, NULL and filtered rows included,
+    /// and an overflowing merge fails.
+    #[test]
+    fn converted_states_merge_to_the_same_sums() {
+        let acc = signed_groups();
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(i64::MAX),
+            None,
+            Some(-3),
+            Some(5),
+        ]));
+        let filter = BooleanArray::from(vec![Some(true), Some(true), None, Some(true)]);
+        let state = acc
+            .convert_to_state(std::slice::from_ref(&values), Some(&filter))
+            .expect("state");
+        let mut merged = signed_groups();
+        merged
+            .merge_batch(&state, &[0, 1, 2, 3], 4)
+            .expect("merge");
+        assert_eq!(
+            evaluated(&mut merged, EmitTo::All),
+            vec![Some(i64::MAX), None, None, Some(5)]
+        );
+        let mut overflow = signed_groups();
+        overflow
+            .merge_batch(&state, &[0, 0, 0, 0], 1)
+            .expect("i128 merge does not overflow");
+        let err = overflow.evaluate(EmitTo::All).expect_err("total overflows");
+        assert!(
+            matches!(sql_error(&err), Some(SqlError::IntegerSumOverflow { .. })),
+            "{err}"
+        );
+    }
+
+    /// `EmitTo::First` hands out the first groups and keeps the rest, sums and
+    /// presence bits aligned, on both the untracked and the tracked path.
+    #[test]
+    fn emit_first_keeps_the_remaining_groups_aligned() {
+        let mut acc = signed_groups();
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
+        acc.update_batch(std::slice::from_ref(&values), &[0, 1, 2], None, 3)
+            .expect("update");
+        assert_eq!(evaluated(&mut acc, EmitTo::First(1)), vec![Some(1)]);
+        let nulls: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(10)]));
+        acc.update_batch(std::slice::from_ref(&nulls), &[2, 3], None, 4)
+            .expect("update with nulls");
+        assert_eq!(evaluated(&mut acc, EmitTo::First(2)), vec![Some(2), Some(3)]);
+        // Group 2 saw only a NULL.
+        assert_eq!(evaluated(&mut acc, EmitTo::All), vec![None, Some(10)]);
+        let empty: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>]));
+        acc.update_batch(std::slice::from_ref(&empty), &[0], None, 1)
+            .expect("update all-null");
+        assert_eq!(evaluated(&mut acc, EmitTo::All), vec![None]);
+    }
+
+    /// A partial state beyond `Decimal128(38, 0)` cannot be produced from
+    /// fewer than about 10^19 rows; packing one fails with the overflow error
+    /// rather than writing a value the decimal type cannot hold.
+    #[test]
+    fn a_partial_beyond_decimal128_fails_to_pack() {
+        let mut acc = signed_groups();
+        acc.sums = vec![DECIMAL128_MAX_UNSCALED + 1];
+        let err = acc.state(EmitTo::All).expect_err("state out of range");
+        assert!(
+            matches!(sql_error(&err), Some(SqlError::IntegerSumOverflow { .. })),
+            "{err}"
+        );
+        let mut plain = CheckedSumAccumulator::new(SumTarget::new(IntKind::Signed, SUM_V));
+        plain.sum = Some(-DECIMAL128_MAX_UNSCALED - 1);
+        assert!(plain.state().is_err());
+    }
+
+    #[test]
+    fn an_i128_overflow_is_an_error_not_a_wrap() {
+        let mut acc = signed_groups();
+        acc.sums = vec![i128::MAX];
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let err = acc
+            .update_batch(std::slice::from_ref(&values), &[0], None, 1)
+            .expect_err("i128 overflow");
+        assert!(
+            matches!(sql_error(&err), Some(SqlError::IntegerSumOverflow { .. })),
+            "{err}"
+        );
+        let mut plain = CheckedSumAccumulator::new(SumTarget::new(IntKind::Signed, SUM_V));
+        plain.sum = Some(i128::MIN);
+        assert!(plain.update_batch(&[Arc::new(Int64Array::from(vec![-1])) as ArrayRef]).is_err());
+    }
+}
