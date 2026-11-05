@@ -9,14 +9,18 @@
 //! the reason, with two exceptions, which run unpaged so that a capped result
 //! is `ok_bounded` with no cursor: a statement with no `ORDER BY` over a table
 //! with no row identity, and a statement whose `ORDER BY` uses a value
-//! computed from other rows that the planner does not prove non-null (`avg`,
-//! a `sum` over a float column, a `min`, `max` or `sum` it cannot prove, a
-//! window function other than `count`, a subquery).
+//! computed from other rows that the planner does not prove non-null (a `sum`
+//! or `avg` over a float column, an `avg` over a `UInt64` column, a `min`,
+//! `max`, `sum` or `avg` it cannot prove, a window function other than
+//! `count`, a subquery).
 //!
 //! An order on `count(...)` pages, and so does an order on `min(col)` or
 //! `max(col)` under a plain `GROUP BY` when `col` is a NOT NULL integer,
-//! string or nanosecond timestamp column of the target table, and an order on
-//! `sum(col)` under the same conditions when `col` is a NOT NULL integer column
+//! string or nanosecond timestamp column of the target table, an order on
+//! `sum(col)` under the same conditions when `col` is a NOT NULL integer
+//! column, and an order on `avg(col)` under the same conditions when `col` is
+//! a NOT NULL `Int8` to `Int64` or `UInt8` to `UInt32` column, whose finite
+//! `Float64` mean the cursor carries bit for bit
 //! (`PagePlan::order_from_other_rows`). A row committed after a cursor was
 //! minted can change such a value for a row already served and move that row
 //! after the cursor, so such a walk pins the segment
@@ -154,12 +158,12 @@ impl Unpaged {
             Unpaged::OrderFromOtherRows => step(
                 "order_by_the_rows_own_columns",
                 "the ORDER BY uses a value computed from other rows that the statement does \
-                 not prove non-null (avg, a sum over a float column, a window function other \
-                 than count, a subquery, or a min, max or sum that is not over a NOT NULL \
-                 column of a supported type under a plain GROUP BY), so the rest of the \
-                 result has no cursor; order by count(...), by min(col), max(col) or an \
-                 integer sum(col) under GROUP BY, or by the row's own non-null columns to \
-                 page, or narrow time_range",
+                 not prove non-null (a float sum or avg, a UInt64 avg, a window function \
+                 other than count, a subquery, or a min, max, sum or avg not over a NOT NULL \
+                 column of a supported type), so the rest of the result has no cursor; \
+                 order by count(...), by min(col), max(col), an integer sum(col) or \
+                 avg(col) under GROUP BY, or by the row's own non-null columns to page, \
+                 or narrow time_range",
             ),
         }
     }
@@ -1079,6 +1083,7 @@ mod tests {
     fn a_statement_ordered_by_an_aggregate_runs_unpaged() {
         let queries = [
             "SELECT series_id, sum(value) AS s FROM samples GROUP BY series_id ORDER BY s",
+            "SELECT series_id, avg(value) AS a FROM samples GROUP BY series_id ORDER BY a",
             "SELECT ts, min(series_id) AS m FROM samples GROUP BY ts ORDER BY m, ts",
             "SELECT ts, series_id, row_number() OVER () AS r FROM samples ORDER BY r, ts, series_id",
             "SELECT ts, count(*) FROM samples GROUP BY ts ORDER BY count(*), ts",
@@ -1110,10 +1115,11 @@ mod tests {
                     assert!(
                         detail.contains("computed from other rows")
                             && detail.contains(
-                                "order by count(...), by min(col), max(col) or an \
-                                 integer sum(col) under GROUP BY, or by the row's own \
-                                 non-null columns to page"
-                            ),
+                                "order by count(...), by min(col), max(col), an integer \
+                                 sum(col) or avg(col) under GROUP BY, or by the row's \
+                                 own non-null columns to page"
+                            )
+                            && detail.ends_with("or narrow time_range"),
                         "{query}: {detail}"
                     );
                 } else {
