@@ -9191,15 +9191,18 @@ mod tests {
         let inputs = admission_mixed_fixture();
         // A small memory split target so the bucket splits into several parts
         // and the equality pin covers part boundaries and `part_index`, not one
-        // object; identical for both modes.
+        // object; identical for both modes. A zero resident ceiling puts every
+        // stream on the cursor merge, the only path admission gates.
         let overlap = CompactorConfig {
             merge_admission: AdmissionMode::Overlap,
             l1_part_memory_target_bytes: 1024,
+            merge_resident_ceiling_bytes: Some(0),
             ..CompactorConfig::default()
         };
         let eager = CompactorConfig {
             merge_admission: AdmissionMode::EagerAll,
             l1_part_memory_target_bytes: 1024,
+            merge_resident_ceiling_bytes: Some(0),
             ..CompactorConfig::default()
         };
         let on = compact_part_hashes(&inputs, &overlap).await;
@@ -9402,12 +9405,18 @@ mod tests {
             (Uuid::from_u128(2), 2, open_first),
         ];
 
+        // A zero resident ceiling puts the stream on the cursor merge, the only
+        // path admission gates.
+        let cursor = CompactorConfig {
+            merge_resident_ceiling_bytes: Some(0),
+            ..CompactorConfig::default()
+        };
         let store = MemoryStore::new();
         for (writer_id, seq, recs) in &inputs {
             seed(&store, *writer_id, *seq, recs).await;
         }
         let clock = FixedClock::new(sealed_now_ns());
-        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+        compact_bucket(&store, &clock, &cursor, &bucket())
             .await
             .expect("compact");
         let (_rec, parts) = read_output(&store).await;
@@ -9423,12 +9432,12 @@ mod tests {
         // and eager all-open admission, pinned as literals.
         const EXPECTED_HASHES: [&str; 1] =
             ["b843545604c87e9e9056effe52aca428af66fbff3ebed4f9c365a6fb57800cc3"];
-        let overlap = compact_part_hashes(&inputs, &CompactorConfig::default()).await;
+        let overlap = compact_part_hashes(&inputs, &cursor).await;
         let eager = compact_part_hashes(
             &inputs,
             &CompactorConfig {
                 merge_admission: AdmissionMode::EagerAll,
-                ..CompactorConfig::default()
+                ..cursor.clone()
             },
         )
         .await;

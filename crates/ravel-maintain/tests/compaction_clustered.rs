@@ -503,7 +503,13 @@ const ORDER_PART_HASH: &str = "01ddf5fa99bb1b4c047f77d03611ad1129e8515f83561d780
 /// input bucket, in both admission modes, and the part equals the reference
 /// written through one writer. Pushing heads by raw ts, or by the narrowest
 /// bucket (six hours), pushes input 1's `(c, 01:00)` before input 0's tie,
-/// whose day-bucket stored order starts at 13:00.
+/// whose day-bucket stored order starts at 13:00. A zero resident ceiling
+/// puts every stream on the cursor merge, the only path admission gates.
+///
+/// Demonstrated red by keying the cursor merge's heads by raw ts: in
+/// `merge_cursor_batch`, `let key = (ts.div_euclid(width_ns),
+/// cursor.input_index)` changed to `let key = (ts, cursor.input_index)` fails
+/// the reference assertion in both modes.
 #[tokio::test]
 async fn merge_order_is_bucket_then_input_index() {
     let inputs = order_inputs();
@@ -511,6 +517,7 @@ async fn merge_order_is_bucket_then_input_index() {
     for mode in [AdmissionMode::Overlap, AdmissionMode::EagerAll] {
         let config = CompactorConfig {
             merge_admission: mode,
+            merge_resident_ceiling_bytes: Some(0),
             ..CompactorConfig::default()
         };
         let (objects, mut parts) = compact(&inputs, &config).await.expect("compact");
