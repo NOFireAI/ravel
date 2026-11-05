@@ -32,7 +32,7 @@ use crate::fold::{
     read_entry_key_index,
 };
 use crate::snapshot_format::{
-    self, KEY_INDEX_LEAF_FORMAT_VERSION_1, KeyIndexLeafLimits, key_index_leaf_format_version,
+    self, KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN, KeyIndexLeafLimits, key_index_leaf_format_version,
     key_index_leaf_prefix_range, key_index_leaf_version_accepted,
 };
 use crate::tenant_config::TenantConfigError;
@@ -476,7 +476,10 @@ impl Catalog {
         report: &mut KeyIndexRebuildReport,
     ) -> Result<HashSet<String>, StoreError> {
         let mut refused = HashSet::new();
-        if key_index_leaf_version_accepted(signal, KEY_INDEX_LEAF_FORMAT_VERSION_1) {
+        if KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN
+            .iter()
+            .all(|&version| key_index_leaf_version_accepted(signal, version))
+        {
             return Ok(refused);
         }
         for leaf in part
@@ -2325,5 +2328,112 @@ mod tests {
             read_signal_head(store.as_ref(), Signal::Spans).await,
             before
         );
+    }
+
+    /// A logs field whose refs name one version-2 leaf and one version-1
+    /// leaf: the rebuild reads both prefixes, hands every ref of the field
+    /// over, and HEAD ends with exactly one `user_id` ref, the version-2
+    /// leaf a from-scratch build writes.
+    ///
+    /// A rebuild that replaced only the refused ref keeps the version-2 ref
+    /// beside the rebuilt one, two `user_id` refs.
+    #[tokio::test]
+    async fn a_field_with_one_version_one_slice_hands_every_slice_over() {
+        let store = recording_store();
+        let (catalog, _) = two_entry_parts(&store, 1).await;
+        rebuild(&catalog, Signal::Logs).await;
+        let (original, v1_ref) = swap_in_a_version_one_leaf(&store, Signal::Logs).await;
+        let mut head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        head.parts[0].key_index = vec![original.clone(), v1_ref.clone()];
+        let current = store
+            .get(&head_key(Signal::Logs), GetRange::Full)
+            .await
+            .expect("head");
+        store
+            .put(
+                &head_key(Signal::Logs),
+                Bytes::from(snapshot_format::encode_head(&head).expect("encode")),
+                PutOptions {
+                    mode: PutMode::CasVersion(current.version),
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("name both slices");
+
+        store.clear();
+        let report = rebuild(&catalog, Signal::Logs).await;
+        assert_eq!(
+            (
+                report.parts_with_refused_leaves,
+                report.leaf_prefix_gets,
+                report.parts_rebuilt,
+                report.leaves_written,
+            ),
+            (1, 2, 1, 1),
+            "{report:?}"
+        );
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let refs: Vec<&SnapshotKeyIndexLeafRef> = head.parts[0]
+            .key_index
+            .iter()
+            .filter(|r| r.field == USER_ID)
+            .collect();
+        assert_eq!(refs, vec![&original], "{head:?}");
+    }
+
+    /// A logs part whose leaf prefix GET fails with a store error is
+    /// deferred: the report counts the GET it issued and the part in
+    /// `parts_deferred`, nothing is rebuilt, and HEAD still names the
+    /// version-1 ref. A rerun with the fault cleared replaces it.
+    ///
+    /// A rebuild that skipped a ref whose prefix it could not read reports
+    /// nothing deferred and leaves the part looking repaired; one that
+    /// propagated the error interrupts the run.
+    #[tokio::test]
+    async fn a_failed_leaf_prefix_get_defers_the_part_and_a_rerun_replaces_it() {
+        let inner = recording_store();
+        let (_, _) = two_entry_parts(&inner, 1).await;
+        let catalog = off_catalog(inner.clone(), 2);
+        rebuild(&catalog, Signal::Logs).await;
+        let (original, v1_ref) = swap_in_a_version_one_leaf(&inner, Signal::Logs).await;
+        let faulty = Arc::new(FaultStore::new(
+            Arc::clone(&inner),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::Timeout).with_key_contains(v1_ref.key.clone()),
+            ),
+        ));
+        let catalog = off_catalog(faulty.clone(), 2);
+        inner.clear();
+        let report = rebuild(&catalog, Signal::Logs).await;
+        assert_eq!(faulty.fault_count(Op::Get, FaultKind::Timeout), 1);
+        assert_eq!(
+            (
+                report.leaf_prefix_gets,
+                report.leaf_prefix_bytes_read,
+                report.parts_deferred,
+                report.parts_with_refused_leaves,
+                report.parts_rebuilt,
+                report.leaves_written,
+            ),
+            (1, 0, 1, 0, 0, 0),
+            "{report:?}"
+        );
+        let head = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        assert_eq!(head.parts[0].key_index, vec![v1_ref.clone()]);
+
+        let catalog = off_catalog(inner.clone(), 2);
+        let rerun = rebuild(&catalog, Signal::Logs).await;
+        assert_eq!(
+            (
+                rerun.parts_deferred,
+                rerun.parts_with_refused_leaves,
+                rerun.parts_rebuilt
+            ),
+            (0, 1, 1),
+            "{rerun:?}"
+        );
+        let head = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        assert_eq!(head.parts[0].key_index, vec![original]);
     }
 }
