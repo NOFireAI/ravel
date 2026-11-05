@@ -1265,9 +1265,16 @@ part included, keeps its refs and costs no GET at all
 `crates/ravel-catalog/src/config.rs`) bounds the (entry, key8) pairs the
 build holds for one part, the pairs read from sections and the pairs
 carried from the previous tail together. Every field the build indexes gets
-a fixed share for the whole build, `max(1, floor(budget / F))` for `F`
-such fields, the ones the tenant declares and the ones a section names,
-whether or not a field is still building. A field holds every pair in its
+a share, `max(1, floor(budget / F))` for `F` such fields, the ones the
+tenant declares and the ones a section names, whether or not a field is
+still building. The share is fixed once the first pass has read every
+section. During that first pass a section naming a field the tenant did
+not declare adds a field and lowers the share; a field that already held
+pairs under the larger share keeps them, so on that first pass a field can
+hold above its final share, and the part's total can pass
+`F x (max(share, R) + 1)` by about the number of fields declared before
+the new one. R, the longest run of one key8, is at most the part's entry
+count, since an entry contributes at most one pair per key8. A field holds every pair in its
 pass's range as it is read or decoded; when its held pairs pass the share,
 it gives up its highest key8 run, and that key8 becomes the exclusive end
 of the pass's range. So a pass holds, for each field, the longest run of
@@ -1293,9 +1300,16 @@ that budget (test
 budgets 1, 2, 3, 5, 6, 7, 15 and `u64::MAX`). They equal a one-pass build only
 when every field's pairs fit its share; the `--rebuild-key-index` repair
 builds in one pass, so its leaves match a fold's byte for byte only then.
-Lookups do not depend on where the slices fall: the router reads the leaf
+Lookups stay correct wherever the slices fall: the router reads the leaf
 whose `[key8_lo, key8_hi]` holds the key8, and ADR-2707's slice rule needs
-only that the slices tile the key space.
+only that the slices tile the key space. Their cost does depend on it. A
+single-key lookup reads one slice whatever the count, but the router
+charges `1 + min(k, 2^bits, B_run)` GETs for every slice a key set touches
+(`crates/ravel-query/src/key_index_route.rs`), so a part built in more
+passes has more slices, a multi-key probe of it pays more GETs and reaches
+`KEY_INDEX_LEAF_GET_CEILING` sooner, and more parts fall back to tier 1;
+and the HEAD bytes per (part, field) grow with the slice count. Neither is
+measured yet (T9's Stage 1 run).
 
 The pass rule, for a part with one key-index field: the passes are the
 greedy partition of the field's key8 runs, in ascending order, into groups

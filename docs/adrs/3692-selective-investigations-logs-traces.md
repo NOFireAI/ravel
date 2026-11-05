@@ -918,7 +918,12 @@ incremental tail build amendment records the mechanism. What changes:
   - the KEY_IDX sections in flight, up to `fold_bucket_concurrency`
     (default 8) entries' decoded sections;
   - the encoded leaves of one pass until their PUTs, at most the leaf
-    bytes of that pass's pairs;
+    bytes of that pass's pairs, and while a slice is encoded its
+    uncompressed per-bucket buffers (kidx.rs `encode_prepared`), up to the
+    leaf body ceiling per slice, alongside that slice's decoded pairs;
+  - on the first pass only, when a section names a field the tenant did
+    not declare, the pairs a field already held under the share before
+    that field lowered it (about one pair per field declared earlier);
   - per-entry bookkeeping (ordinal maps, coverage flags), linear in the
     part's entries, not its pairs;
   - a single key8 over its share, held whole, as decision 5 already says;
@@ -963,15 +968,23 @@ changes:
 - **The leaves depend on the budget.** A field built in passes writes a
   slice end at every pass end, so its leaves equal a build from scratch at
   the same budget, carried or read, and after a restart; they equal a
-  one-pass build only when the field fits its share. Lookups are
-  unchanged: the router and ADR-2707's slice rule need only that the
-  slices tile the key space.
+  one-pass build only when the field fits its share. Lookups stay
+  correct: the router and ADR-2707's slice rule need only that the slices
+  tile the key space. Their cost does not stay the same: the router
+  charges `1 + min(k, 2^bits, B_run)` GETs per slice a key set touches,
+  so more slices cost a multi-key probe more GETs, reach the leaf GET
+  ceiling sooner and send more parts to tier 1, and row 8's HEAD bytes per
+  (part, field) grow with the slice count; both are predicted, not
+  measured, until T9.
 - **Row 7, passes.** The target "`key_index_build_passes` 1" becomes the
   greedy pass count `G` of the #3704 amendment, computed over the tail's
   carried and read pairs together: for each field, the number of groups
   of whole ascending key8 runs, each group at most the field's share
   `max(1, floor(budget / F))` or one run over it, and the part's count is
-  its slowest field's. A tail within the budget still takes 1. The miss
+  its slowest field's. A tail takes 1 pass only when every field fits its
+  share, which is the budget divided by the fields the build indexes, not
+  the whole budget: two fields of 16 and 8 pairs at a budget of 24 take 2.
+  The miss
   is the #3704 amendment's: other than `G` without a rebuild, over `2G`
   with one.
 - **Row 7, section GETs.** The target gains the pass factor:
@@ -990,7 +1003,7 @@ changes:
 
 | check | target | miss | source |
 |---|---|---|---|
-| what a pass holds, open slice included | at most `max(share, R) + 1` per field, open slice 0 | any pass over it; it failed on the #3704 amendment's first build with a held peak of 4 and an open slice of 3 at share 1 | crates/ravel-catalog/src/fold.rs:14517 |
+| what a pass holds, open slice included | at most `max(share, R) + 1` per field (above it on the first pass only when a section names an undeclared field), and no pair kept past its pass | any pass over it; it failed on the #3704 amendment's first build with a held peak of 4 and an open slice of 3 at share 1; the no-carry-over half rests on a slice end at every pass end and on the leaves equal to a from-scratch build at the same budget | crates/ravel-catalog/src/fold.rs:14517; crates/ravel-catalog/src/fold.rs:14575 |
 | advancing fold at budget 5, 9 carried and 6 read pairs | 3 passes, 6 section reads, 12 ranged GETs, 1 previous leaf GET, 3 leaves | any other figure | crates/ravel-catalog/src/fold.rs:14437 |
 | advancing fold at budget 1 | 11 passes, one per key8 run | any other count | crates/ravel-catalog/src/fold.rs:14517 |
 | leaves at the same budget | equal to from-scratch, carried and after a restart | a budget whose leaves differ | crates/ravel-catalog/src/fold.rs:14575 |

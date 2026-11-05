@@ -2623,8 +2623,8 @@ enum CatalogCommand {
         /// With `--key-index-leaves`, the most (entry, key8) pairs, read and
         /// carried from the previous tail's leaves, the leaf build holds for
         /// one part at a time (ADR-3692 decision 5). Each field the build
-        /// indexes gets a fixed share, max(1, N / fields). A part over it is
-        /// built in passes over disjoint key8 ranges, each pass holding the
+        /// indexes gets a share, max(1, N / fields). A field over its share
+        /// is built in passes over disjoint key8 ranges, each pass holding the
         /// whole key8s that fit, re-reading the sections it needs and closing
         /// its leaf slices before the next; one key8 is never split, so one
         /// over the share is held whole. A pass holds at most max(share,
