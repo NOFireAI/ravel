@@ -451,6 +451,7 @@ fn server_config(cli: &Cli, mode: Mode, tenant: &TenantId) -> anyhow::Result<Ser
             enabled: !cli.disable_fold,
             fold_interval: Duration::from_secs(cli.fold_interval_secs),
             build_key_index_leaves: cli.fold_key_index_leaves,
+            key_index_build_max_pairs: cli.fold_key_index_build_max_pairs,
         },
         maintain: MaintenanceTaskConfig {
             enabled: matches!(mode, Mode::Maintain),
