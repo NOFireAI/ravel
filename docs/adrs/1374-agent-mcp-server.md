@@ -2142,7 +2142,8 @@ amendment adds the proof.
    declared column, which the static schema does not hold; a column type
    off the allowlist; and every relation item 1 excludes, a Parquet table
    among them. `sum`, `avg`, a window function other than a count, and a
-   subquery are unchanged (an integer `sum` pages since #3849; item 13).
+   subquery are unchanged (an integer `sum` pages since #3849; item 13; an
+   `avg` over an exact integer column pages too; item 17).
 5. The pin. A proven `min` or `max` sets `PagePlan::order_from_other_rows`
    like a count, so its walk requires page one's segment set
    (`SegmentSetPin::Required`): a later page over a moved set is
@@ -2159,7 +2160,10 @@ amendment adds the proof.
    They do not for a float `sum` or an `avg`: the order in which float
    values are added across partitions is not fixed, so the same segments
    can give a different last bit. Neither of those pages, so no cursor
-   rested on the stronger claim.
+   rested on the stronger claim. Item 17 narrows this: an `avg` over an
+   exact integer column adds in `i128` and divides once, so equal digests
+   mean identical values for it too, and it pages; an `avg` over a float
+   or a `UInt64` column still does not.
 8. The ClickBench corpus, with each trailing row limit set aside, still
    plans 22 of its 43 statements as pages, and the 6 that answer
    `OrderTermFromOtherRows` still do. None of the 6 orders by a `min` or
@@ -2227,4 +2231,48 @@ amendment adds the proof.
     order partial sums merge in. An `avg` is not taken by the proof at all
     (`aggregate_proof` reads only `min`, `max` and `sum`): over an integer
     or a float column its result is `Float64` (ADR-0825), and a float is off
-    item 3's allowlist, since no cursor carries its NaN.
+    item 3's allowlist, since no cursor carries its NaN. Item 17 retires
+    this for an `avg` over an exact integer column.
+17. An `avg` over an exact integer column pages. The session's `avg`
+    (`crates/ravel-sql/src/avg.rs`, registered in place of DataFusion's
+    built-in) takes `Int8`, `Int16`, `Int32`, `Int64`, `UInt8`, `UInt16`
+    and `UInt32` (and dictionaries of them) down an exact path: it adds
+    the group's values in `i128` with checked addition, counts them in
+    `i64`, merges partial states as that integer pair, and divides once,
+    `sum as f64 / count as f64`. The `Float64` it returns depends only on
+    the group's values, never on how partitions split them, so
+    `aggregate_proof` admits `avg(col)` and `avg(DISTINCT col)` under item
+    1's links over exactly those widths, with a new plan kind,
+    `ResumeKind::FiniteFloat`, which a resume position matches only with a
+    finite `ResumeValue::Float`. The walk is pinned as item 5 says
+    (`avg_over_an_integer_column_plans_as_a_finite_float` in
+    `crates/ravel-sql/src/page_plan.rs`).
+18. The cursor encoding does not change. A `FiniteFloat` position is a
+    `ResumeValue::Float`, encoded under the existing float tag (4) as its
+    `f64` bit pattern, which already refuses NaN and the infinities, so
+    `CURSOR_VERSION` stays 7
+    (`an_integer_avg_resume_tuple_round_trips_bit_for_bit` in
+    `crates/ravel-mcp/src/resume_tuple.rs`).
+19. An `avg` over `UInt64` and over a float column stays unpaged, each
+    with its own reason. `UInt64` is outside the exact path: the session
+    coerces it to `Float64`, and a `Float64` argument takes a sequential
+    `f64` fold whose partial sums merge in the order the engine's
+    partitions finish, item 10's finding for a float `sum`. `mean`, the
+    same function under another name, is not admitted by the proof and
+    runs unpaged.
+20. An integer `avg` is never `-0.0`, never NaN and never infinite. The
+    count is at least one and the sum an integer within `i128`, so the
+    quotient is finite; a zero sum converts to `+0.0`, and `+0.0` over a
+    positive count is `+0.0`; a nonzero sum has magnitude at least 1 and
+    the count at most `i64::MAX`, so the quotient is far from the
+    subnormal range and never rounds to a signed zero. A cursor minted at
+    a zero mean therefore resumes strictly above zero, and the
+    `atan2`-based zero comparison is reached only by a caller's own
+    `-0.0` (`an_integer_avg_of_zero_is_positive_zero` in
+    `crates/ravel-sql/tests/page_walk.rs`).
+21. The integer mean is the same at any partition count: a four-page walk
+    whose boundaries fall at the mean -7/3, at a zero mean and inside a
+    tie at 1.5, with one group reaching its sum through `i64::MAX` and
+    `-i64::MAX`, returns the same rows at one and at eight partitions and
+    matches the unpaged statement
+    (`integer_avg_walk_is_identical_at_one_and_eight_partitions`).
