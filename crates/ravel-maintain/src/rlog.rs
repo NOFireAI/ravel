@@ -13066,8 +13066,10 @@ mod tests {
                 assert_eq!(run.report.merge_resident_bytes, held);
             }
             // The figures ADR-3819's table quotes: 8 resident passes over 12
-            // block GETs, 9 fetch-per-pass passes over 108, 60 catalog GETs.
-            assert_eq!(catalog_gets, [60, 60]);
+            // block GETs, 9 fetch-per-pass passes over 108. Its 60 catalog GETs
+            // (5 per input) are 12 since the catalog load slices every section
+            // its footer probe covers (#3855): the probe alone, per input.
+            assert_eq!(catalog_gets, [12, 12]);
             assert_eq!(block_gets, [(8, 12), (9, 108)]);
 
             // The cursor merge on the same inputs fetches each group once per

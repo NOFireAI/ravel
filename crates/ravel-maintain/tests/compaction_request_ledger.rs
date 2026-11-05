@@ -96,11 +96,12 @@ async fn bytes_under(store: &dyn ObjectStoreBackend, prefix: &str) -> u64 {
 ///   under `MemoryStore`'s default page size) to plan from, and one more for
 ///   the pre-publish re-list (ADR-1029, the 2026-10-03 amendment).
 /// - `record_read` 2: one whole-object GET per input commit record.
-/// - `catalog_read` 10: per input, the footer suffix probe plus the four
-///   whole-read directory sections the RLOG merge needs (STREAM_DIR, FIELD_DIR,
-///   SKIP_IDX, PAGE_DIR). No tail range (a 64 KiB probe covers these small
-///   objects' footers) and no POSTINGS GET (the fixture indexes no fields, so
-///   the section is absent).
+/// - `catalog_read` 2: per input, the footer suffix probe alone. These small
+///   objects fit the 128 KiB probe whole, so the four whole-read directory
+///   sections the RLOG merge needs (STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR)
+///   are sliced from it rather than fetched (issue #3855), and there is no tail
+///   range. No POSTINGS read (the fixture indexes no fields, so the section is
+///   absent).
 /// - `block_read` 2: one ranged GET per (input, row group), each input's single
 ///   row group fetched once and held resident (ADR-3819 D1). The fixture's
 ///   streams are stream 0 in both inputs, stream 1 in the first and stream 2
@@ -151,8 +152,8 @@ async fn per_phase_counts_match_the_instrumented_oracle_exactly() {
     );
     assert_eq!(report.record_read.requests, 2, "one GET per commit record");
     assert_eq!(
-        report.catalog_read.requests, 10,
-        "probe + STREAM_DIR + FIELD_DIR + SKIP_IDX + PAGE_DIR, per input"
+        report.catalog_read.requests, 2,
+        "the footer probe per input, every section sliced from it"
     );
     assert_eq!(
         report.block_read.requests, 2,
@@ -160,7 +161,7 @@ async fn per_phase_counts_match_the_instrumented_oracle_exactly() {
     );
     assert_eq!(report.part_put.requests, 1, "one L1 part PUT");
     assert_eq!(report.publish.requests, 1, "the compaction record PUT");
-    assert_eq!(report.total_requests(), 18);
+    assert_eq!(report.total_requests(), 10);
 
     assert_reconciles(&report, &before, &after);
 
@@ -221,12 +222,13 @@ async fn seed_rlog_two_inputs_with_strings(store: &dyn ObjectStoreBackend) -> Bu
 }
 
 /// Per input, in canonical input order: the object's size, the summed lengths
-/// of the four directory sections the merge reads whole, and its BLOOM section
-/// with the number of `Str` FIELD_DIR entries.
+/// of the four directory sections the merge reads whole, its BLOOM section
+/// with the number of `Str` FIELD_DIR entries, and the length of its footer
+/// plus the 16-byte trailer.
 async fn rlog_input_layout(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
-) -> Vec<(u64, u64, ravel_logseg::footer::SectionDesc, u64)> {
+) -> Vec<(u64, u64, ravel_logseg::footer::SectionDesc, u64, u64)> {
     use ravel_logseg::field_dir::FieldDir;
     use ravel_logseg::footer::{self, kind};
     let listing = read::list_bucket(store, bucket).await.expect("list");
@@ -264,92 +266,112 @@ async fn rlog_input_layout(
             .filter(|e| matches!(e.ty, ravel_logseg::FieldType::Str))
             .count() as u64;
         let bloom = *ftr.section(kind::BLOOM).expect("BLOOM");
-        out.push((object.len() as u64, directories, bloom, strings));
+        let trailer = &object[object.len() - 16..];
+        let footer_len = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+        let tail = u64::from(footer_len) + 16;
+        out.push((object.len() as u64, directories, bloom, strings, tail));
     }
     out
 }
 
-/// The bloom-scope read (ADR-2135 decision 5) is one `catalog_read` GET of
-/// the chosen input's BLOOM covered-column prefix, `8 + 5 x (10 + n)` bytes
-/// for its `n` string columns, and nothing else. Both inputs carry generation
-/// 0, so the chosen input is input 0, whose `n` is 2 (the `I64` column does
-/// not count): 68 bytes, against a BLOOM section longer than that, so the
-/// figure is the prefix rather than the section.
+/// The bloom-scope read (ADR-2135 decision 5) reads the chosen input's BLOOM
+/// covered-column prefix, `8 + 5 x (10 + n)` bytes for its `n` string columns,
+/// and nothing else. Both inputs carry generation 0, so the chosen input is
+/// input 0, whose `n` is 2 (the `I64` column does not count): 68 bytes,
+/// against a BLOOM section longer than that, so the figure is the prefix
+/// rather than the section.
 ///
-/// Every other phase matches the headline fixture's counts, and the catalog
-/// figure is pinned exactly: per input the whole object (the footer probe
-/// covers it) plus the four directory sections, plus the prefix.
+/// Two runs over the same fixture, every other phase at the headline's
+/// counts. At the default probe, which covers each whole small input, the
+/// prefix is sliced from the chosen input's probe like every catalog section
+/// (issue #3855): one `catalog_read` GET per input, and the phase's bytes are
+/// the two objects. Under a trailer-only probe that covers no section, the
+/// prefix is one more `catalog_read` GET of exactly those 68 bytes, after
+/// each input's 16-byte probe, footer chase, and four directory sections.
 ///
-/// Flip proofs, each run against this test, with the figure that failed:
-/// charging the read to `BlockRead` (catalog requests 10); fetching the whole
-/// BLOOM section (catalog bytes 1887 against 1859); dropping its `note_get`
-/// (catalog requests 10); leaving `FIRST_DYNAMIC_COL` out of the bound (an
-/// 18-byte range, catalog bytes 1809); and the pre-change merge that reads no
-/// scope at all (catalog requests 10).
+/// Flip proofs, each run against this test, with the trailer-only figure that
+/// failed: charging the prefix GET to `BlockRead` (block requests 3 against
+/// 2); fetching the whole BLOOM section (catalog bytes 1093 against 1065); and
+/// dropping its `note_get` (the oracle's 21 requests against the ledger's 20).
 #[tokio::test]
-async fn the_bloom_scope_read_is_one_catalog_get_of_the_list_prefix() {
-    let store = InstrumentedStore::new(MemoryStore::new());
-    let bucket = seed_rlog_two_inputs_with_strings(&store).await;
-    let layout = rlog_input_layout(&store, &bucket).await;
-    assert_eq!(layout.len(), 2);
-    assert_eq!(
-        layout.iter().map(|l| l.3).collect::<Vec<_>>(),
-        [2, 1],
-        "string columns per input"
-    );
-    let (_, _, bloom, strings) = layout[0];
-    let prefix = 8 + 5 * (10 + strings);
-    assert_eq!(prefix, 68);
-    assert_eq!(bloom.comp, ravel_logseg::footer::COMP_NONE);
-    assert!(
-        bloom.len > prefix,
-        "the BLOOM section ({} bytes) must outrun the prefix",
-        bloom.len
-    );
+async fn the_bloom_scope_read_is_the_list_prefix_sliced_or_one_get() {
+    // The probe's 16 bytes are the trailer alone, so it covers no section.
+    const TRAILER_ONLY_PROBE: u64 = 16;
+    for probe in [CompactorConfig::default().footer_probe_bytes, TRAILER_ONLY_PROBE] {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let bucket = seed_rlog_two_inputs_with_strings(&store).await;
+        let layout = rlog_input_layout(&store, &bucket).await;
+        assert_eq!(layout.len(), 2);
+        assert_eq!(
+            layout.iter().map(|l| l.3).collect::<Vec<_>>(),
+            [2, 1],
+            "string columns per input"
+        );
+        let (_, _, bloom, strings, _) = layout[0];
+        let prefix = 8 + 5 * (10 + strings);
+        assert_eq!(prefix, 68);
+        assert_eq!(bloom.comp, ravel_logseg::footer::COMP_NONE);
+        assert!(
+            bloom.len > prefix,
+            "the BLOOM section ({} bytes) must outrun the prefix",
+            bloom.len
+        );
 
-    let metrics = store.metrics();
-    let before = metrics.snapshot();
-    let ledger = RequestLedger::new();
-    let clock = FixedClock::new(sealed_now_ns());
-    let outcome = compact_bucket(&store, &clock, &config_with(&ledger), &bucket)
-        .await
-        .expect("compact");
-    assert_eq!(
-        outcome,
-        CompactionOutcome::Compacted {
-            parts: 1,
-            publish: PublishOutcome::Published,
+        let metrics = store.metrics();
+        let before = metrics.snapshot();
+        let ledger = RequestLedger::new();
+        let config = CompactorConfig {
+            footer_probe_bytes: probe,
+            ..config_with(&ledger)
+        };
+        let clock = FixedClock::new(sealed_now_ns());
+        let outcome = compact_bucket(&store, &clock, &config, &bucket)
+            .await
+            .expect("compact");
+        assert_eq!(
+            outcome,
+            CompactionOutcome::Compacted {
+                parts: 1,
+                publish: PublishOutcome::Published,
+            }
+        );
+        let after = metrics.snapshot();
+        let report = ledger.report();
+
+        assert_eq!(report.list.requests, 2);
+        assert_eq!(report.record_read.requests, 2);
+        assert_eq!(report.block_read.requests, 2);
+        assert_eq!(report.part_put.requests, 1);
+        assert_eq!(report.publish.requests, 1);
+        assert_reconciles(&report, &before, &after);
+
+        if probe == TRAILER_ONLY_PROBE {
+            assert_eq!(
+                report.catalog_read.requests, 13,
+                "per input probe, footer chase and four directories, plus the prefix"
+            );
+            let catalog: u64 = layout
+                .iter()
+                .map(|(_, directories, _, _, tail)| TRAILER_ONLY_PROBE + tail + directories)
+                .sum();
+            assert_eq!(
+                report.catalog_read.wire_bytes_received,
+                catalog + prefix,
+                "probes, footers and directories ({catalog}) plus the {prefix}-byte list prefix"
+            );
+        } else {
+            assert!(
+                layout.iter().all(|(size, ..)| *size <= probe),
+                "the footer probe covers each whole input object"
+            );
+            assert_eq!(
+                report.catalog_read.requests, 2,
+                "one probe per input, the prefix sliced from input 0's"
+            );
+            let objects: u64 = layout.iter().map(|(size, ..)| size).sum();
+            assert_eq!(report.catalog_read.wire_bytes_received, objects);
         }
-    );
-    let after = metrics.snapshot();
-    let report = ledger.report();
-
-    assert_eq!(report.list.requests, 2);
-    assert_eq!(report.record_read.requests, 2);
-    assert_eq!(
-        report.catalog_read.requests, 11,
-        "the headline's 10 plus one bloom-scope GET"
-    );
-    assert_eq!(report.block_read.requests, 2);
-    assert_eq!(report.part_put.requests, 1);
-    assert_eq!(report.publish.requests, 1);
-    assert_eq!(report.total_requests(), 19);
-    assert_reconciles(&report, &before, &after);
-
-    let probe = CompactorConfig::default().footer_probe_bytes;
-    assert!(
-        layout.iter().all(|(size, ..)| *size <= probe),
-        "the footer probe covers each whole input object"
-    );
-    let catalog: u64 = layout
-        .iter()
-        .map(|(size, directories, _, _)| size + directories)
-        .sum();
-    assert_eq!(
-        report.catalog_read.wire_bytes_received,
-        catalog + prefix,
-        "probes and directories ({catalog}) plus the {prefix}-byte list prefix"
-    );
+    }
 }
 
 /// Wire bytes are proportional to the fixture's ACTUAL object sizes, per
@@ -485,7 +507,7 @@ async fn list_counts_every_page_of_a_paginated_drain() {
         "per listing, two single-key pages plus the terminating page"
     );
     assert_eq!(report.record_read.requests, 2);
-    assert_eq!(report.catalog_read.requests, 10);
+    assert_eq!(report.catalog_read.requests, 2);
     assert_eq!(report.block_read.requests, 2);
     assert_reconciles(&report, &before, &after);
 }
@@ -612,7 +634,7 @@ async fn a_conservation_abort_reports_zero_publish_requests() {
     // The phases that did run are reported in full, including the part PUTs the
     // aborted run already spent.
     assert_eq!(report.record_read.requests, 2);
-    assert_eq!(report.catalog_read.requests, 10);
+    assert_eq!(report.catalog_read.requests, 2);
     assert_eq!(report.block_read.requests, 2);
     assert_eq!(report.part_put.requests, 1);
     assert_reconciles(&report, &before, &after);
@@ -620,7 +642,7 @@ async fn a_conservation_abort_reports_zero_publish_requests() {
 
 /// Run scoping: a second run reports only its own figures. The rerun here is
 /// gated `AlreadyCompacted` after its LIST, so its report is exactly one
-/// listing request and nothing else -- none of the first run's 18 requests
+/// listing request and nothing else -- none of the first run's 10 requests
 /// survive into it.
 ///
 /// Flip proofs, both run against this test before the pre-publish re-list
@@ -648,7 +670,7 @@ async fn a_second_run_reports_only_its_own_figures() {
         first.list.requests, 2,
         "the driver's LIST survives the rewrite, beside the pre-publish re-list"
     );
-    assert_eq!(first.total_requests(), 18);
+    assert_eq!(first.total_requests(), 10);
 
     let outcome = compact_bucket(&store, &clock, &config, &bucket)
         .await
@@ -868,15 +890,16 @@ async fn a_bad_rlog_zstd_level_is_refused_before_any_store_request() {
 
 /// The control for the refusal test: at the default level each entry point
 /// issues requests over the same fixture. Figures are the oracle's, pinned as
-/// measured on this fixture: compaction's 18 is the headline test's figure,
-/// and the bare rewrite's 16 is that less the two LISTs a compaction issues
+/// measured on this fixture: compaction's 10 is the headline test's figure,
+/// and the bare rewrite's 8 is that less the two LISTs a compaction issues
 /// around it (the listing it plans from and the pre-publish re-list). The
-/// migration's 20 is the bare rewrite's 16 plus its planning LIST, its two
+/// migration's 12 is the bare rewrite's 8 plus its planning LIST, its two
 /// eligibility reads of the commit records, and its pre-publish re-list. The
-/// erasure rewrite's 18 includes its own pre-publish re-list.
+/// erasure rewrite's 10 includes its own pre-publish re-list. Each input's
+/// catalog is one GET, its sections sliced from the footer probe.
 #[tokio::test]
 async fn the_default_level_runs_each_rlog_entry_point_against_the_store() {
-    for (entry, expected) in RLOG_ENTRIES.into_iter().zip([18, 20, 16, 18]) {
+    for (entry, expected) in RLOG_ENTRIES.into_iter().zip([10, 12, 8, 10]) {
         let (result, oracle, _) = run_rlog_entry_at(entry, 9).await;
         assert!(result.is_ok(), "{entry:?}: {result:?}");
         assert_eq!(oracle, expected, "{entry:?}: store requests");
