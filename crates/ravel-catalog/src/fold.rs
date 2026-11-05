@@ -1931,6 +1931,9 @@ struct FieldBuild {
     held: BinaryHeap<HeldPair>,
     /// The lowest key8 in `held`: when the top equals it, `held` is one key8.
     held_min: Option<[u8; 8]>,
+    /// The most pairs `held` had at once this pass, a placed pair before its
+    /// cut included.
+    held_peak: usize,
     lo: u64,
     /// Exclusive end of this pass's key8 range, once the budget cut it.
     end: Option<u64>,
@@ -1951,6 +1954,7 @@ impl FieldBuild {
             uncovered,
             held: BinaryHeap::new(),
             held_min: None,
+            held_peak: 0,
             lo: 0,
             end: None,
             slice: OpenSlice::new(),
@@ -1974,6 +1978,7 @@ impl FieldBuild {
         }
         self.held_min = Some(self.held_min.map_or(pair.key8, |min| min.min(pair.key8)));
         self.held.push(HeldPair(pair));
+        self.held_peak = self.held_peak.max(self.held.len());
         self.cut(share);
     }
 
@@ -2073,6 +2078,8 @@ pub(crate) struct KeyIndexPassRecord {
     pub(crate) end: Option<u64>,
     pub(crate) share: u64,
     pub(crate) held: u64,
+    /// The most pairs held at once during the pass.
+    pub(crate) held_peak: u64,
     /// Whether every held pair has one key8.
     pub(crate) one_key8: bool,
     /// Capacity of the held heap's buffer at the end of the pass.
@@ -2107,6 +2114,7 @@ fn record_key_index_pass(name: &str, field: &FieldBuild, share: u64) {
         end: field.end,
         share,
         held: field.held.len() as u64,
+        held_peak: field.held_peak as u64,
         one_key8,
         held_capacity: field.held.capacity() as u64,
         blocks_exact: field
@@ -2489,6 +2497,7 @@ fn end_key_index_pass(
         .map(|pair| pair.0)
         .collect();
     field.held_min = None;
+    field.held_peak = 0;
     held.sort_unstable_by_key(|e| (e.key8, e.entry_ordinal));
     let end = field.end.take();
     for run in held.chunk_by(|a, b| a.key8 == b.key8) {
@@ -12803,6 +12812,36 @@ pub(crate) mod tests {
         body_bytes: usize,
         with_key_idx: bool,
     ) -> (CommitRecord, Bytes) {
+        let key_fields: &[(&str, KeyType)] = if with_key_idx {
+            &[(USER_ID, KeyType::I64)]
+        } else {
+            &[]
+        };
+        publish_keyed_logs(
+            store,
+            writer_seq,
+            hour,
+            user_ids,
+            rows_per_block,
+            body_bytes,
+            key_fields,
+        )
+        .await
+    }
+
+    /// [`publish_user_id_logs`] with the KEY_IDX section indexing
+    /// `key_fields`: row `i` carries each of them as an attribute, an I64
+    /// field as `user_ids[i]` and a Str field as `"u{user_ids[i]}"`, and
+    /// `user_id = user_ids[i]` as I64 when `key_fields` does not name it.
+    pub(crate) async fn publish_keyed_logs(
+        store: &dyn ObjectStoreBackend,
+        writer_seq: u64,
+        hour: u32,
+        user_ids: &[i64],
+        rows_per_block: usize,
+        body_bytes: usize,
+        key_fields: &[(&str, KeyType)],
+    ) -> (CommitRecord, Bytes) {
         use ravel_logseg::writer::ObjectIdentity;
         use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
         use ravel_types::logstream::{AttrValue, log_stream_id};
@@ -12825,9 +12864,31 @@ pub(crate) mod tests {
                 writer_seq,
             },
         );
-        if with_key_idx {
-            w = w.with_key_index_fields(vec![(USER_ID.to_string(), KeyType::I64)]);
+        if !key_fields.is_empty() {
+            w = w.with_key_index_fields(
+                key_fields
+                    .iter()
+                    .map(|(name, key_type)| (name.to_string(), *key_type))
+                    .collect(),
+            );
         }
+        let attrs_of = |user_id: i64| {
+            let mut attrs: Vec<(String, AttrValue)> = key_fields
+                .iter()
+                .map(|(name, key_type)| {
+                    let value = match key_type {
+                        KeyType::Str => AttrValue::Str(format!("u{user_id}")),
+                        _ => AttrValue::I64(user_id),
+                    };
+                    (name.to_string(), value)
+                })
+                .collect();
+            if !key_fields.iter().any(|(name, _)| *name == USER_ID) {
+                attrs.push((USER_ID.to_string(), AttrValue::I64(user_id)));
+            }
+            attrs.sort_by(|a, b| a.0.cmp(&b.0));
+            attrs
+        };
         let base_ts = i64::from(hour) * NS_PER_HOUR + 60_000_000_000;
         for (i, user_id) in user_ids.iter().enumerate() {
             let mut body = format!("row {i} ");
@@ -12852,7 +12913,7 @@ pub(crate) mod tests {
                 trace_id: None,
                 span_id: None,
                 flags: 0,
-                attrs: vec![(USER_ID.to_string(), AttrValue::I64(*user_id))],
+                attrs: attrs_of(*user_id),
             })
             .expect("push");
         }
@@ -13345,8 +13406,9 @@ pub(crate) mod tests {
     }
 
     /// A part carried forward by reference keeps its `key_index` refs
-    /// unchanged across a second fold, and the second fold reads sections only
-    /// for the re-encoded tail's entries. With a 2-entry part ceiling the
+    /// unchanged across a second fold, and the second fold reads a section
+    /// only for the re-encoded tail's new entry: the tail's other entry is
+    /// carried from the previous tail's leaf. With a 2-entry part ceiling the
     /// first hour's two entries seal into a part the second fold reproduces
     /// byte-for-byte.
     #[tokio::test]
@@ -13777,6 +13839,16 @@ pub(crate) mod tests {
         store: &dyn ObjectStoreBackend,
         part: &SnapshotPartRef,
     ) -> Vec<Vec<u8>> {
+        from_scratch_leaves_declaring(store, part, &[(USER_ID.to_string(), KeyType::I64)]).await
+    }
+
+    /// [`from_scratch_leaves`] for a tenant declaring `declared`, the fields
+    /// the sections name besides included, as the fold builds them.
+    async fn from_scratch_leaves_declaring(
+        store: &dyn ObjectStoreBackend,
+        part: &SnapshotPartRef,
+        declared: &[(String, KeyType)],
+    ) -> Vec<Vec<u8>> {
         let got = store
             .get(&part.key, GetRange::Full)
             .await
@@ -13799,7 +13871,7 @@ pub(crate) mod tests {
             &tenant(),
             Signal::Logs,
             part_blake3,
-            &[(USER_ID.to_string(), KeyType::I64)],
+            declared,
             true,
             &reads.iter().collect::<Vec<_>>(),
             &key_index_leaf_limits(),
@@ -14032,17 +14104,453 @@ pub(crate) mod tests {
         )
         .expect("catalog");
         set_key_index_leaf_body_ceiling_for_test(Some(40));
+        take_key_index_pass_log_for_test();
         let report = fold_through(&catalog, Signal::Logs, KIDX_HOUR).await;
         let head = read_signal_head(store.as_ref(), Signal::Logs).await;
         (store, report, head)
     }
 
-    /// The basis of the carried-pair bound `CatalogConfig::key_index_build_max_pairs`
-    /// states: each carried (entry, key8) is one `KeyIndexLeafEntry` held for
-    /// the whole build, 40 B inline plus a `u32` per block on the heap.
+    /// A held (entry, key8) pair is one 40-byte `KeyIndexLeafEntry` in its
+    /// field's heap buffer, the per-pair struct term of the bound
+    /// `CatalogConfig::key_index_build_max_pairs` states. The buffer and
+    /// blocks terms are asserted on every pass by [`pass_ranges`].
     #[test]
-    fn a_carried_pair_is_forty_bytes_plus_four_per_block() {
+    fn a_held_pair_is_forty_bytes_in_the_heap_buffer() {
+        assert_eq!(std::mem::size_of::<HeldPair>(), 40);
         assert_eq!(std::mem::size_of::<KeyIndexLeafEntry>(), 40);
+    }
+
+    /// The `(attempt, lo, end)` of each of `field`'s passes in `log`, after
+    /// asserting the claims the pair budget rests on, pass by pass: the held
+    /// pairs, read and carried, are at most the pass's share unless they are
+    /// one key8, and at any moment at most the larger of the share and
+    /// `max_run` (the fixture's largest key8 run) plus the one pair placed
+    /// before its cut; the heap buffer is at most twice the most pairs it
+    /// held (4 at least); every held pair's blocks `Vec` has capacity equal
+    /// to its length. Within each attempt the ranges tile the key space: the
+    /// first starts at 0, each starts where the last ended and the last runs
+    /// to `u64::MAX`.
+    fn pass_ranges(
+        log: &[KeyIndexPassRecord],
+        field: &str,
+        max_run: u64,
+    ) -> Vec<(u32, u64, Option<u64>)> {
+        let records: Vec<&KeyIndexPassRecord> = log.iter().filter(|r| r.field == field).collect();
+        assert!(!records.is_empty(), "no pass of {field}: {log:?}");
+        for record in &records {
+            assert!(
+                record.held <= record.share || record.one_key8,
+                "a pass held more than its share over several key8s: {record:?}"
+            );
+            assert!(
+                record.held_peak <= record.share.max(max_run).saturating_add(1),
+                "{record:?}"
+            );
+            assert!(
+                record.held_capacity <= (2 * record.held_peak).max(4),
+                "{record:?}"
+            );
+            assert!(record.blocks_exact, "{record:?}");
+        }
+        let mut attempts: BTreeMap<u32, Vec<&KeyIndexPassRecord>> = BTreeMap::new();
+        for record in &records {
+            attempts.entry(record.attempt).or_default().push(record);
+        }
+        for (attempt, passes) in &attempts {
+            assert_eq!(passes[0].lo, 0, "attempt {attempt}: {passes:?}");
+            for pair in passes.windows(2) {
+                assert_eq!(
+                    pair[0].end,
+                    Some(pair[1].lo),
+                    "attempt {attempt}: {passes:?}"
+                );
+            }
+            assert_eq!(
+                passes.last().and_then(|p| p.end),
+                None,
+                "attempt {attempt}: {passes:?}"
+            );
+        }
+        records.iter().map(|r| (r.attempt, r.lo, r.end)).collect()
+    }
+
+    /// The pass rule for one field: greedy over its key8 runs in ascending
+    /// order, a pass taking whole runs while their pairs fit `budget`, and a
+    /// run over `budget` a pass of its own.
+    fn greedy_passes(run_pairs: &[u64], budget: u64) -> u64 {
+        let mut passes = 0u64;
+        let mut held = 0u64;
+        for &pairs in run_pairs {
+            if held > 0 && held + pairs > budget {
+                passes += 1;
+                held = 0;
+            }
+            held += pairs;
+        }
+        passes + u64::from(held > 0)
+    }
+
+    /// The shared-key8 fixture: six logs objects in [`KIDX_HOUR`] whose
+    /// `user_id` sets share key8s 7 (four entries) and 20 (four entries),
+    /// 17 pairs over 11 key8 runs.
+    const SHARED_KEY8_USER_IDS: [&[i64]; 6] = [
+        &[1, 7, 20],
+        &[2, 7, 20],
+        &[3, 7, 20],
+        &[4, 7, 21],
+        &[5, 20, 22],
+        &[6, 30],
+    ];
+    /// Pairs per key8 run of [`SHARED_KEY8_USER_IDS`], ascending: 1 to 6,
+    /// 7, 20, 21, 22, 30.
+    const SHARED_KEY8_RUN_PAIRS: [u64; 11] = [1, 1, 1, 1, 1, 1, 4, 4, 1, 1, 1];
+
+    /// Folds [`SHARED_KEY8_USER_IDS`] under `max_pairs` and the body ceiling
+    /// `ceiling` (the default when `None`), returning the store, the report,
+    /// HEAD and the pass log.
+    async fn shared_key8_fold(
+        max_pairs: u64,
+        ceiling: Option<u64>,
+    ) -> (
+        Arc<RangeRecordingStore>,
+        FoldReport,
+        SnapshotHead,
+        Vec<KeyIndexPassRecord>,
+    ) {
+        let store = recording_store();
+        declare_user_id_key_index(store.as_ref()).await;
+        for (seq, user_ids) in (1u64..).zip(SHARED_KEY8_USER_IDS) {
+            publish_user_id_logs(store.as_ref(), seq, KIDX_HOUR, user_ids, 2, 0, true).await;
+        }
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                key_index_build_max_pairs: max_pairs,
+                ..kidx_config()
+            },
+        )
+        .expect("catalog");
+        set_key_index_leaf_body_ceiling_for_test(ceiling);
+        take_key_index_pass_log_for_test();
+        let report = fold_through(&catalog, Signal::Logs, KIDX_HOUR).await;
+        let log = take_key_index_pass_log_for_test();
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        (store, report, head, log)
+    }
+
+    /// Byte identity in every budget (ADR-3692 decision 5): under a 40-byte
+    /// body ceiling key8 7 and key8 20 each carry four entries, 44 bytes, so
+    /// both are over the ceiling and uncover entries 0 to 4. A small budget
+    /// meets them in different passes, after pairs already reached a slice;
+    /// the build scans every remaining range before its one restart, so for
+    /// every budget from 1 to 20 and `u64::MAX` it stores the from-scratch
+    /// build's one leaf, five entries uncovered. A restart on the first
+    /// finding meets key8 20 again in the rebuild and writes no leaf for
+    /// budgets 1 to 7.
+    #[tokio::test]
+    async fn a_restart_sees_every_uncovered_entry_at_every_budget() {
+        for max_pairs in (1..=20).chain([u64::MAX]) {
+            let (store, report, head, log) = shared_key8_fold(max_pairs, Some(40)).await;
+            let part = &head.parts[0];
+            assert_eq!(part.key_index.len(), 1, "budget {max_pairs}: {report:?}");
+            assert_eq!(part.key_index[0].uncovered_count, 5, "budget {max_pairs}");
+            assert_eq!(report.key_index_uncovered_entries, 5, "budget {max_pairs}");
+            assert_eq!(
+                stored_leaves(store.as_ref(), part).await,
+                from_scratch_leaves(store.as_ref(), part).await,
+                "budget {max_pairs}"
+            );
+            pass_ranges(&log, USER_ID, 4);
+        }
+        set_key_index_leaf_body_ceiling_for_test(None);
+    }
+
+    /// The pass rule (ADR-3692 decision 5, the #3704 amendment): a field's
+    /// passes are the greedy partition of its key8 runs under the budget, not
+    /// ceil(pairs / budget) once a key8 is shared across entries. 17 pairs
+    /// at budget 6 take 4 passes, [1, 7), [7, 20), [20, 30) and [30, MAX],
+    /// where ceil(17 / 6) is 3; every budget from 1 to 20 matches the greedy
+    /// count. A restart doubles it: under a 40-byte ceiling the first
+    /// attempt's 4 passes find the uncovered entries and the rebuild's 4
+    /// write the leaf, 8 in all.
+    #[tokio::test]
+    async fn the_pass_count_is_the_greedy_key8_partition() {
+        let k = |v: i64| u64::from_be_bytes(key8_i64(v));
+        let (_, report, _, log) = shared_key8_fold(6, None).await;
+        assert_eq!(report.key_index_build_passes, 4, "{report:?}");
+        assert_eq!(17u64.div_ceil(6), 3);
+        assert_eq!(
+            pass_ranges(&log, USER_ID, 4),
+            vec![
+                (0, 0, Some(k(7))),
+                (0, k(7), Some(k(20))),
+                (0, k(20), Some(k(30))),
+                (0, k(30), None),
+            ]
+        );
+        assert_eq!(report.key_index_sections_read, 6 * 4, "{report:?}");
+        for max_pairs in 1..=20u64 {
+            let (_, report, _, log) = shared_key8_fold(max_pairs, None).await;
+            assert_eq!(
+                report.key_index_build_passes,
+                greedy_passes(&SHARED_KEY8_RUN_PAIRS, max_pairs),
+                "budget {max_pairs}"
+            );
+            pass_ranges(&log, USER_ID, 4);
+        }
+
+        let (_, restarted, _, log) = shared_key8_fold(6, Some(40)).await;
+        assert_eq!(restarted.key_index_build_passes, 8, "{restarted:?}");
+        let ranges = pass_ranges(&log, USER_ID, 4);
+        assert_eq!(ranges.iter().filter(|r| r.0 == 0).count(), 4);
+        assert_eq!(ranges.iter().filter(|r| r.0 == 1).count(), 4);
+        set_key_index_leaf_body_ceiling_for_test(None);
+    }
+
+    /// `key_index_leaves_written` and `key_index_leaf_bytes_written` are the
+    /// published leaf set: at budget 1 under a 40-byte ceiling the first
+    /// attempt PUTs slices it then abandons (the restart), and the store holds
+    /// more `.kidx` objects than HEAD names, but the report counts exactly
+    /// the leaf HEAD names and its bytes.
+    #[tokio::test]
+    async fn the_leaves_written_are_the_published_set() {
+        let (store, report, head, _) = shared_key8_fold(1, Some(40)).await;
+        set_key_index_leaf_body_ceiling_for_test(None);
+        let part = &head.parts[0];
+        let stored = kidx_objects(store.as_ref(), Signal::Logs).await;
+        assert!(
+            stored.len() > part.key_index.len(),
+            "the first attempt PUT leaves it abandoned: {stored:?}"
+        );
+        assert_eq!(
+            report.key_index_leaves_written,
+            part.key_index.len() as u64,
+            "{report:?}"
+        );
+        assert_eq!(
+            report.key_index_leaf_bytes_written,
+            part.key_index.iter().map(|leaf| leaf.size).sum::<u64>(),
+            "{report:?}"
+        );
+    }
+
+    /// Carried pairs count against the budget (ADR-3692 decision 5): the
+    /// advancing fixture's tail holds 15 pairs, 9 carried and 6 read, key8 7
+    /// in all five entries. Budget 5 takes 3 passes, [7], [10 to 20] and
+    /// [21 to 36], each holding exactly 5 pairs, so no pass holds more than
+    /// the budget of read and carried pairs together; each pass decodes the
+    /// one previous leaf again and reads the two new sections, and the leaf
+    /// equals the from-scratch build. Counting only read pairs, the 6 read
+    /// pairs fit 2 passes.
+    #[tokio::test]
+    async fn carried_pairs_count_against_the_pair_budget() {
+        let inner = recording_store();
+        advancing_fixture(&inner).await;
+        let catalog = Catalog::new(
+            inner.clone(),
+            CatalogConfig {
+                key_index_build_max_pairs: 5,
+                ..kidx_config()
+            },
+        )
+        .expect("catalog");
+        take_key_index_pass_log_for_test();
+        let report = advancing_fold(&catalog).await;
+        let log = take_key_index_pass_log_for_test();
+        let k = |v: i64| u64::from_be_bytes(key8_i64(v));
+        assert_eq!(
+            pass_ranges(&log, USER_ID, 5),
+            vec![
+                (0, 0, Some(k(10))),
+                (0, k(10), Some(k(21))),
+                (0, k(21), None),
+            ]
+        );
+        assert!(log.iter().all(|r| r.held == 5), "{log:?}");
+        assert_eq!(report.key_index_build_passes, 3, "{report:?}");
+        assert_eq!(report.key_index_entries_carried, 3, "{report:?}");
+        assert_eq!(report.key_index_leaf_gets, 1, "{report:?}");
+        assert_eq!(report.key_index_sections_read, 2 * 3, "{report:?}");
+        let second = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        assert_eq!(
+            stored_leaves(inner.as_ref(), &second.parts[0]).await,
+            from_scratch_leaves(inner.as_ref(), &second.parts[0]).await
+        );
+    }
+
+    /// Declares `columns` as typed columns carrying `key_index`, written at
+    /// `now_ns` so a later call replaces an earlier one.
+    async fn declare_key_index_columns(
+        store: &dyn ObjectStoreBackend,
+        columns: &[(&str, crate::tenant_config::DeclaredColumnType)],
+        now_ns: i64,
+    ) {
+        use crate::tenant_config::{StorageLayoutWrite, TenantConfig, TenantLifecycleState};
+        let mut cfg = TenantConfig {
+            typed_attr_columns: Some(
+                columns
+                    .iter()
+                    .map(|(key, ty)| DeclaredTypedColumn {
+                        key: key.to_string(),
+                        ty: *ty,
+                    })
+                    .collect(),
+            ),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+        cfg.set_key_index_columns(
+            columns.iter().map(|(key, _)| key.to_string()).collect(),
+            StorageLayoutWrite::ReadersRolledOut,
+        )
+        .expect("declare the key index");
+        crate::tenant_config::set_tenant_config(store, &tenant(), &cfg, now_ns)
+            .await
+            .expect("write tenant config");
+    }
+
+    const SESSION: &str = "session";
+
+    /// The first half of the carry-guard fixtures: `user_id` declared I64,
+    /// writers 10, 20 and 30 folded and sealed into one part with one leaf,
+    /// then the late writers 15 and 35 published with `late_fields` indexed,
+    /// so the next fold's tail is 10, 15, 20, 30, 35 (see
+    /// [`advancing_fixture`]).
+    async fn carry_guard_fixture(inner: &Arc<RangeRecordingStore>, late_fields: &[(&str, KeyType)]) {
+        use crate::tenant_config::DeclaredColumnType;
+        declare_key_index_columns(inner.as_ref(), &[(USER_ID, DeclaredColumnType::I64)], 1).await;
+        for seq in [10u64, 20, 30] {
+            let own = seq as i64;
+            publish_user_id_logs(inner.as_ref(), seq, KIDX_HOUR, &[7, own], 2, 0, true).await;
+        }
+        let catalog = Catalog::new(inner.clone(), kidx_config()).expect("catalog");
+        fold_logs_sealing(&catalog, now_inside(KIDX_HOUR), Some(KIDX_HOUR)).await;
+        let first = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        assert_eq!(first.parts[0].key_index.len(), 1);
+        for seq in [15u64, 35] {
+            let own = seq as i64;
+            publish_keyed_logs(inner.as_ref(), seq, KIDX_HOUR, &[7, own], 2, 0, late_fields).await;
+        }
+        inner.gets.lock().expect("lock").clear();
+    }
+
+    /// A key-index field declared between two folds has no previous leaf, so
+    /// the advancing fold carries nothing: it GETs no previous leaf, reads
+    /// all five entries' sections, and stores the from-scratch leaves of both
+    /// fields byte for byte, the three old entries uncovered for `session`.
+    /// Without the no-previous-leaf guard the fold GETs the previous leaf
+    /// (still carrying nothing, since `carried_all` runs over the declared
+    /// fields); without that guard and with `carried_all` over the carried
+    /// fields, the old entries go unread and the `session` leaf claims them
+    /// covered.
+    #[tokio::test]
+    async fn a_key_index_field_declared_between_folds_reads_every_entry() {
+        use crate::tenant_config::DeclaredColumnType;
+        let inner = recording_store();
+        carry_guard_fixture(&inner, &[(USER_ID, KeyType::I64), (SESSION, KeyType::I64)]).await;
+        declare_key_index_columns(
+            inner.as_ref(),
+            &[
+                (USER_ID, DeclaredColumnType::I64),
+                (SESSION, DeclaredColumnType::I64),
+            ],
+            2,
+        )
+        .await;
+        let catalog = Catalog::new(inner.clone(), kidx_config()).expect("catalog");
+        let report = advancing_fold(&catalog).await;
+        assert_eq!(report.key_index_leaf_gets, 0, "{report:?}");
+        assert_eq!(report.key_index_entries_carried, 0, "{report:?}");
+        assert_eq!(report.key_index_sections_read, 5, "{report:?}");
+        assert_eq!(data_object_ranged_gets(&inner).len(), 5 * 2);
+        let second = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        let part = &second.parts[0];
+        let session: Vec<_> = part.key_index.iter().filter(|l| l.field == SESSION).collect();
+        assert_eq!(session.len(), 1, "{part:?}");
+        assert_eq!(session[0].uncovered_count, 3, "{part:?}");
+        assert_eq!(
+            stored_leaves(inner.as_ref(), part).await,
+            from_scratch_leaves_declaring(
+                inner.as_ref(),
+                part,
+                &[
+                    (SESSION.to_string(), KeyType::I64),
+                    (USER_ID.to_string(), KeyType::I64)
+                ]
+            )
+            .await
+        );
+    }
+
+    /// A field retyped between two folds (`user_id` I64, then Str) does not
+    /// carry an old-type pair: the previous leaf's key type is not the
+    /// declared one, so the fold GETs no previous leaf, reads every section,
+    /// and stores the from-scratch Str leaf, the three I64-indexed entries
+    /// uncovered. Without the key-type guard the old I64 pairs are carried
+    /// into the Str leaf.
+    #[tokio::test]
+    async fn a_key_index_field_retyped_between_folds_carries_no_old_type_pair() {
+        use crate::tenant_config::DeclaredColumnType;
+        let inner = recording_store();
+        carry_guard_fixture(&inner, &[(USER_ID, KeyType::Str)]).await;
+        declare_key_index_columns(inner.as_ref(), &[(USER_ID, DeclaredColumnType::Str)], 2).await;
+        let catalog = Catalog::new(inner.clone(), kidx_config()).expect("catalog");
+        let report = advancing_fold(&catalog).await;
+        assert_eq!(report.key_index_leaf_gets, 0, "{report:?}");
+        assert_eq!(report.key_index_entries_carried, 0, "{report:?}");
+        assert_eq!(report.key_index_sections_read, 5, "{report:?}");
+        let second = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        let part = &second.parts[0];
+        assert_eq!(part.key_index.len(), 1, "{part:?}");
+        assert_eq!(
+            part.key_index[0].key_type,
+            u32::from(KeyType::Str.as_u8()),
+            "{part:?}"
+        );
+        assert_eq!(part.key_index[0].uncovered_count, 3, "{part:?}");
+        assert_eq!(
+            stored_leaves(inner.as_ref(), part).await,
+            from_scratch_leaves_declaring(
+                inner.as_ref(),
+                part,
+                &[(USER_ID.to_string(), KeyType::Str)]
+            )
+            .await
+        );
+    }
+
+    /// A new entry whose section names a field the tenant does not declare,
+    /// read while the carry is active, drops the carry: the build restarts
+    /// with every entry read and stores what the from-scratch build stores,
+    /// a `session` leaf for the section-named field beside the `user_id`
+    /// one, every entry but the two late ones uncovered for `session`.
+    /// Writer 15 is read first (ordinal 1) and stops the carried attempt
+    /// after one section, so 1 + 5 sections and 2 passes. Without the guard
+    /// the carried entries 20 and 30 are never read for `session` and its
+    /// leaf claims them covered.
+    #[tokio::test]
+    async fn a_section_naming_an_undeclared_field_drops_the_carry() {
+        let inner = recording_store();
+        carry_guard_fixture(&inner, &[(USER_ID, KeyType::I64), (SESSION, KeyType::I64)]).await;
+        let catalog = Catalog::new(inner.clone(), kidx_config()).expect("catalog");
+        let report = advancing_fold(&catalog).await;
+        assert_eq!(report.key_index_leaf_gets, 1, "{report:?}");
+        assert_eq!(report.key_index_entries_carried, 0, "{report:?}");
+        assert_eq!(report.key_index_sections_read, 1 + 5, "{report:?}");
+        assert_eq!(report.key_index_build_passes, 2, "{report:?}");
+        let second = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        let part = &second.parts[0];
+        let session: Vec<_> = part.key_index.iter().filter(|l| l.field == SESSION).collect();
+        assert_eq!(session.len(), 1, "{part:?}");
+        assert_eq!(session[0].uncovered_count, 3, "{part:?}");
+        assert_eq!(
+            stored_leaves(inner.as_ref(), part).await,
+            from_scratch_leaves_declaring(
+                inner.as_ref(),
+                part,
+                &[(USER_ID.to_string(), KeyType::I64)]
+            )
+            .await
+        );
     }
 
     /// ADR-3692 decision 5: a (part, field) over the pair budget is built in
@@ -14055,6 +14563,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn pair_budget_builds_in_passes_with_identical_leaves() {
         let (store, report, head) = budget_fixture_fold(5).await;
+        let k = |v: i64| u64::from_be_bytes(key8_i64(v));
+        assert_eq!(
+            pass_ranges(&take_key_index_pass_log_for_test(), USER_ID, 1),
+            vec![(0, 0, Some(k(6))), (0, k(6), Some(k(11))), (0, k(11), None)],
+            "passes of five, five and two pairs"
+        );
         let part = &head.parts[0];
         let mut tiles: Vec<(u64, u64)> = part
             .key_index
