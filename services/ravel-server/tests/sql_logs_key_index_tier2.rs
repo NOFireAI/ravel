@@ -919,6 +919,49 @@ async fn version_one_sections_are_uncovered_in_a_rebuilt_leaf() {
     assert_eq!(fx.uncovered_for_target().await, Some(want));
 }
 
+/// Objects 1 to 4 carry version 1 sections the leaf lists uncovered, and
+/// object 5 holds `TARGET`. All five are at or under the whole-object bound,
+/// so with four partitions the scan opens its sub-bound segments unplanned,
+/// and the leaf's block set for object 5 sends the holder there too instead
+/// of through a restricted plan: it is read whole, once, and its row is
+/// returned. The other 19 objects are pruned.
+///
+/// FLIP: dropping `unplanned[idx] = true` for a sub-bound block set in
+/// `compute_plan_counts` leaves object 5 neither planned nor unplanned: the
+/// rows assertion fails with no rows.
+#[tokio::test]
+async fn a_sub_bound_block_set_opens_the_holder_unplanned() {
+    let _serial = SERIAL.lock().await;
+    let fx = Fixture::publish(&[5], &[1, 2, 3, 4]).await;
+    let unfolded = sql(&serve(Arc::clone(&fx.base), &Serve::default())).await;
+    assert_eq!(rows(&unfolded), ["o5r050"]);
+
+    fx.fold().await;
+    let (leaf, ordinals) = fx.layout().await;
+    let mut want: Vec<u64> = (1..=4).map(|n| ordinals[n]).collect();
+    want.sort_unstable();
+    assert_eq!(fx.uncovered_for_target().await, Some(want));
+
+    let recorder = RecordingStore::new(Arc::clone(&fx.base));
+    let v = sql(&serve(recorder.clone(), &Serve::default())).await;
+    assert_eq!(rows(&v), rows(&unfolded), "rows equal the unfolded answer");
+    let opened: Vec<usize> = (0..OBJECTS)
+        .filter(|&n| !recorder.of(&fx.objects[n].key).is_empty())
+        .collect();
+    assert_eq!(opened, [1, 2, 3, 4, 5]);
+    for n in 1..=5 {
+        assert_eq!(
+            recorder.of(&fx.objects[n].key),
+            [GetRange::Full],
+            "object {n}: a sub-bound segment opened unplanned is read whole"
+        );
+    }
+    assert_eq!(recorder.of(&leaf).len(), 2, "two leaf GETs");
+    assert_eq!(key_index(&v, "partsCovered"), 1, "{v}");
+    assert_eq!(pruning(&v, "segmentsPrunedByKeyIndex"), 19, "{v}");
+    assert_signal_key_index_matches(&v);
+}
+
 /// A logs leaf at format_version 1 is the earlier fold's: it may claim a
 /// version 1 entry covered with `TARGET` missing. The router rejects it on
 /// its prefix (`leavesRejected`, one leaf GET), the part's segments take tier
