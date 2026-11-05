@@ -1350,8 +1350,9 @@ once).
 The bound: on every pass, for each field, the pairs the heap holds at its
 peak plus the pairs of any slice left open across the pass end are at most
 `max(share, R) + 1`, `R` the field's largest key8 run, the `+ 1` the pair
-placed before a cut; the open slice is always 0, since every pass closes
-its slices. Summed over the `F` fields, a pass holds at most
+placed before a cut; the open slice, the pairs the field still holds once
+its pass has ended, is 0, since every pass closes its slices and frees its
+heap. Summed over the `F` fields, a pass holds at most
 `F x (max(share, R_max) + 1)` pairs, which is at most `budget + F` when no
 key8 run exceeds a share. Test
 `every_pass_holds_at_most_its_share_open_slice_included` pins the per-field

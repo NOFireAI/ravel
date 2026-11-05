@@ -459,8 +459,8 @@ target_if = "v == 1"
 key = "row_07"
 adr_row = 7
 check = "fold with the switch on, advancing fold over an unchanged tail plus one new hour"
-target = "section GETs = 2 x new entries (plus one per entry whose footer exceeds 8 KiB) plus one GET per previous leaf; `key_index_build_passes` 1; peak fold RSS under 1.5 GB at the T12 spans corpus (20 M distinct keys, budget 8 M pairs, so 3 passes on the from-scratch build of the sealed part and the report says 3)"
-miss = "section GETs over 2 x tail entries (a from-scratch rebuild), passes other than `ceil(pairs / budget)`, RSS over 2 GB"
+target = "section GETs = 2 x new entries (plus one per entry whose footer exceeds 8 KiB) plus one GET per previous leaf; `key_index_build_passes` 1 (`G` and a pass factor on the section GETs: the pass-end slice amendment); peak fold RSS under 1.5 GB at the T12 spans corpus (20 M distinct keys, budget 8 M pairs, so 3 passes on the from-scratch build of the sealed part and the report says 3)"
+miss = "section GETs over 2 x tail entries (a from-scratch rebuild), passes other than `ceil(pairs / budget)` (the #3704 amendment replaces this miss and the section GETs target), RSS over 2 GB"
 source = "predicted; the from-scratch cost is the leaf build switch amendment's `2T`, measured by T12 as 1,656 = 2 x 828 on spans and 796 = 2 x 398 on logs, #2763 comment 6276877460"
 requires_tenant = "inv"
 # fold_advance is the fold the mixed state runs after its statements. New
