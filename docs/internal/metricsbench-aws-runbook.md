@@ -21,6 +21,10 @@ The scripts are under
 | `user-data.tpl` | the box, at boot | schedules the shutdown, installs the AWS CLI, fetches `box-run.sh` and checks its checksum |
 | `box-run.sh` | the box | builds the harness at the pinned commit, runs `ci`, runs the profile, and uploads the outputs |
 
+The same self-terminating box pattern runs the pinned-walk expiry
+measurement for issue #3779:
+[walk-expiry-aws-runbook.md](walk-expiry-aws-runbook.md).
+
 ## 1. Choose the instance
 
 All four engines run at once, each capped at 8 GiB and 2 CPUs. That fairness
