@@ -767,7 +767,8 @@ Decision: `querier.max_samples` is removed from the list of Mimir limits
 that bound a query. The Mimir bounds that do fire are
 `limits.max_fetched_chunks_per_query`,
 `limits.max_estimated_memory_consumption_per_query` (frozen at 2 GiB,
-2,147,483,648 bytes, since #3305; `deploy/metricsbench/README.md:89`),
+2,147,483,648 bytes, since #3305; 4 GiB per the 2026-11-05 amendment;
+`deploy/metricsbench/README.md:89`),
 `limits.max_total_query_length` and `querier.timeout`
 (`deploy/metricsbench/README.md:87-91`). The status mapper's budget table
 carries a signature for each of the four
@@ -1291,3 +1292,56 @@ Consequences.
   their cost is reported as run totals only.
 - A run before this amendment carries no `regime` key and no per-query cost.
   It is not compared with one after it on either.
+
+## Amendment (2026-11-05): the Go comparators run with GOMEMLIMIT inside their envelope
+
+<!-- amendment-applies: sections="Amendment (2026-10-27): warnings never set `partial`, Mimir's query bounds, band 6 per payload class, and what a Ravel Remote Write 2xx acknowledges" pointer="2026-11-05 amendment" -->
+<!-- amendment-supersedes: phrase="frozen at 2 GiB" pointer="2026-11-05 amendment" -->
+
+Context. Mimir was OOM-killed at its 8g limit in two of the three
+cardinality runs since every engine moved to 8 GiB: F4 at 7.97 GiB, and R5
+(#940, comment 6647977894) at a peak of 8.55 GB during timed pass 3, after it
+had answered every statement in passes 1 and 2. R4 peaked at 7.99 GiB and
+survived. Prometheus, VictoriaMetrics and Mimir are Go programs, and none of
+them was given GOMEMLIMIT. Without it the Go runtime starts a collection when
+the heap has grown GOGC percent (default 100) over the live heap after the
+previous one, with no knowledge of the container's limit, so a process with a
+large live heap can reach the cgroup limit before a collection runs. Ravel is
+told its envelope through its explicit memory flags (a 2 GiB reserve and a
+6 GiB budget).
+
+Decision: Prometheus, VictoriaMetrics and Mimir each run with
+GOMEMLIMIT=7GiB (7,516,192,768 bytes, 87.5 % of the 8 GiB envelope), set in
+docker-compose.yml and recorded in each run's effective configuration as
+go_runtime. The envelope is unchanged: 8g and 2 CPUs per engine. GOGC is
+unchanged, and VictoriaMetrics' own -memory.allowedPercent stays at its
+default.
+- The limit bounds heap overshoot, not the live set. A live heap above it
+  still cannot fit; the runtime then caps garbage collection at about half
+  the CPU, so the process slows before it is killed.
+- The limit counts all memory the Go runtime maps and has not released,
+  goroutine stacks and other non-heap runtime memory included. The 1 GiB
+  left outside it covers memory the cgroup charges but the runtime does not
+  manage: page cache charged to the container, files mapped with mmap,
+  kernel memory held for the process, and the binary itself.
+
+Correction. Section C says limits.max_estimated_memory_consumption_per_query
+is frozen at 2 GiB. Since every engine moved to 8 GiB on 2026-11-02 it has
+been 4 GiB, 4,294,967,296 bytes, half the envelope
+(deploy/metricsbench/config/mimir.yaml; the README's frozen-limits table).
+This amendment records that value; the limit itself is unchanged here.
+
+Rejected:
+- Raising Mimir's memory alone, because every engine runs one envelope.
+- Lowering Mimir's per-query estimate limit to 2 GiB, because R5's kill came
+  after two clean passes, which points at heap growth across passes rather
+  than one oversized query.
+- Rerunning unchanged, because a run that passes by chance measures nothing
+  new.
+
+Consequences.
+- Runs before this amendment ran the Go comparators without GOMEMLIMIT.
+  Their memory figures are not compared with runs after it, and their
+  latency figures are compared only with that stated.
+- The next cardinality run pre-registers Mimir completing all five timed
+  passes, and records each Go comparator's peak against the 7 GiB limit.
