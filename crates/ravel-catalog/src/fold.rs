@@ -45,7 +45,8 @@ use crate::snapshot_format::{
     self, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION, KeyIndexLeafEncodeError, KeyIndexLeafEntry,
     KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafSummary, NamePostings, PartLimits,
     SnapshotFormatError, check_key_index_leaf_set, column_stats_segments_concat,
-    encode_key_index_leaf, encoded_entry_len, split_key_index_entries, verify_key_index_leaf,
+    encode_key_index_leaf, encoded_entry_len, split_key_index_entries,
+    verify_key_index_leaf_frames,
 };
 use crate::tenant_config::DeclaredTypedColumn;
 
@@ -1720,8 +1721,8 @@ struct CarriedKeyIndex {
 /// stand in for the sections: a leaf field not in `fields` under its key
 /// type, a field of `fields` with no leaf, a failed GET, a leaf that does not
 /// verify, match its ref or bind `tail`, or a field whose slices do not form
-/// one set. The decoded entries are dropped once a leaf verifies; each pass
-/// decodes the leaves its range needs from the kept bytes.
+/// one set. No decoded entry is kept: each pass decodes the leaves its range
+/// overlaps from the kept bytes, one frame at a time.
 #[allow(clippy::too_many_arguments)]
 async fn load_carried_key_index(
     store: &dyn ObjectStoreBackend,
@@ -1762,7 +1763,7 @@ async fn load_carried_key_index(
             .get(&leaf.key, GetRange::Full)
             .await
             .map_err(|e| format!("leaf {} GET: {e}", leaf.key))?;
-        let mut summary = verify_key_index_leaf(&got.data, limits)
+        let summary = verify_key_index_leaf_frames(&got.data, limits, drop)
             .map_err(|e| format!("leaf {}: {e}", leaf.key))?;
         let expected = SnapshotKeyIndexLeafRef {
             key: String::new(),
@@ -1782,7 +1783,6 @@ async fn load_carried_key_index(
                 leaf.key
             ));
         }
-        summary.entries = Vec::new();
         by_field
             .entry(leaf.field.as_str())
             .or_default()
@@ -1798,8 +1798,7 @@ async fn load_carried_key_index(
         .collect();
     let mut carried = BTreeMap::new();
     for (field, leaves) in by_field {
-        let (summaries, bytes): (Vec<KeyIndexLeafSummary>, Vec<Bytes>) =
-            leaves.into_iter().unzip();
+        let (summaries, bytes): (Vec<KeyIndexLeafSummary>, Vec<Bytes>) = leaves.into_iter().unzip();
         check_key_index_leaf_set(&summaries).map_err(|e| format!("field {field:?}: {e}"))?;
         let uncovered: HashSet<u64> = summaries[0]
             .header
@@ -2027,9 +2026,9 @@ fn key_index_field_share(max_pairs: u64, fields: &BTreeMap<String, FieldBuild>) 
 }
 
 /// Feeds a field's carried pairs in its pass range into `held`, decoding
-/// the previous leaves that overlap it in key8 order and stopping at the
-/// first one past the range the budget has cut so far. `Err` when a leaf
-/// that verified at load no longer decodes.
+/// the previous leaves that overlap it in key8 order, one frame at a time,
+/// and stopping at the first leaf past the range the budget has cut so far.
+/// `Err` when a leaf that verified at load no longer decodes.
 fn feed_carried_key_index(
     field: &mut FieldBuild,
     carried: &CarriedField,
@@ -2045,25 +2044,27 @@ fn feed_carried_key_index(
         if field.end.is_some_and(|end| leaf.key8_lo >= end) {
             break;
         }
-        let summary = verify_key_index_leaf(&leaf.bytes, limits).map_err(|e| e.to_string())?;
-        for entry in summary.entries {
-            let Some(new) = usize::try_from(entry.entry_ordinal)
-                .ok()
-                .and_then(|previous| onto.get(previous).copied().flatten())
-            else {
-                continue;
-            };
-            if !carried_all.get(new as usize).copied().unwrap_or(false) {
-                continue;
+        verify_key_index_leaf_frames(&leaf.bytes, limits, |frame| {
+            for entry in frame {
+                let Some(new) = usize::try_from(entry.entry_ordinal)
+                    .ok()
+                    .and_then(|previous| onto.get(previous).copied().flatten())
+                else {
+                    continue;
+                };
+                if !carried_all.get(new as usize).copied().unwrap_or(false) {
+                    continue;
+                }
+                field.hold(
+                    KeyIndexLeafEntry {
+                        entry_ordinal: new,
+                        ..entry
+                    },
+                    share,
+                );
             }
-            field.hold(
-                KeyIndexLeafEntry {
-                    entry_ordinal: new,
-                    ..entry
-                },
-                share,
-            );
-        }
+        })
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -2101,12 +2102,9 @@ pub(crate) fn take_key_index_pass_log_for_test() -> Vec<KeyIndexPassRecord> {
 
 #[cfg(test)]
 fn record_key_index_pass(name: &str, field: &FieldBuild, share: u64) {
-    let one_key8 = field.held_min.is_some_and(|min| {
-        field
-            .held
-            .peek()
-            .is_some_and(|top| top.0.key8 == min)
-    });
+    let one_key8 = field
+        .held_min
+        .is_some_and(|min| field.held.peek().is_some_and(|top| top.0.key8 == min));
     let record = KeyIndexPassRecord {
         field: name.to_string(),
         attempt: field.attempt,
@@ -14415,7 +14413,10 @@ pub(crate) mod tests {
     /// then the late writers 15 and 35 published with `late_fields` indexed,
     /// so the next fold's tail is 10, 15, 20, 30, 35 (see
     /// [`advancing_fixture`]).
-    async fn carry_guard_fixture(inner: &Arc<RangeRecordingStore>, late_fields: &[(&str, KeyType)]) {
+    async fn carry_guard_fixture(
+        inner: &Arc<RangeRecordingStore>,
+        late_fields: &[(&str, KeyType)],
+    ) {
         use crate::tenant_config::DeclaredColumnType;
         declare_key_index_columns(inner.as_ref(), &[(USER_ID, DeclaredColumnType::I64)], 1).await;
         for seq in [10u64, 20, 30] {
@@ -14464,7 +14465,11 @@ pub(crate) mod tests {
         assert_eq!(data_object_ranged_gets(&inner).len(), 5 * 2);
         let second = read_signal_head(inner.as_ref(), Signal::Logs).await;
         let part = &second.parts[0];
-        let session: Vec<_> = part.key_index.iter().filter(|l| l.field == SESSION).collect();
+        let session: Vec<_> = part
+            .key_index
+            .iter()
+            .filter(|l| l.field == SESSION)
+            .collect();
         assert_eq!(session.len(), 1, "{part:?}");
         assert_eq!(session[0].uncovered_count, 3, "{part:?}");
         assert_eq!(
@@ -14539,7 +14544,11 @@ pub(crate) mod tests {
         assert_eq!(report.key_index_build_passes, 2, "{report:?}");
         let second = read_signal_head(inner.as_ref(), Signal::Logs).await;
         let part = &second.parts[0];
-        let session: Vec<_> = part.key_index.iter().filter(|l| l.field == SESSION).collect();
+        let session: Vec<_> = part
+            .key_index
+            .iter()
+            .filter(|l| l.field == SESSION)
+            .collect();
         assert_eq!(session.len(), 1, "{part:?}");
         assert_eq!(session[0].uncovered_count, 3, "{part:?}");
         assert_eq!(

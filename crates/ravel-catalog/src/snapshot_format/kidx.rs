@@ -1663,6 +1663,21 @@ pub fn verify_key_index_leaf(
     bytes: &[u8],
     limits: &KeyIndexLeafLimits,
 ) -> Result<KeyIndexLeafSummary, KeyIndexLeafRejection> {
+    let mut entries = Vec::new();
+    let mut summary = verify_key_index_leaf_frames(bytes, limits, |frame| entries.extend(frame))?;
+    summary.entries = entries;
+    Ok(summary)
+}
+
+/// [`verify_key_index_leaf`] that hands each frame's entries to `each`, in
+/// bucket order, instead of collecting them: the summary it returns has no
+/// `entries`, and at most one frame is decoded at a time. Every check is the
+/// same, so `each` may have seen frames of a leaf that is then rejected.
+pub fn verify_key_index_leaf_frames(
+    bytes: &[u8],
+    limits: &KeyIndexLeafLimits,
+    mut each: impl FnMut(Vec<KeyIndexLeafEntry>),
+) -> Result<KeyIndexLeafSummary, KeyIndexLeafRejection> {
     let prefix = validate_prefix(decode_envelope(bytes)?, bytes)?;
     let expected_size = prefix.prefix_len.saturating_add(prefix.header.body_len);
     if bytes.len() as u64 != expected_size {
@@ -1672,7 +1687,7 @@ pub fn verify_key_index_leaf(
         )));
     }
     let mut bucket_entry_counts = Vec::with_capacity(prefix.ends.len());
-    let mut entries = Vec::new();
+    let mut entry_count = 0u64;
     let mut body_uncompressed_len = 0u64;
     for bucket in 0..prefix.ends.len() {
         let body = prefix.bucket_body_range(bucket);
@@ -1685,12 +1700,12 @@ pub fn verify_key_index_leaf(
         let decoded = prefix.decode_frame(bucket as u32, frame, limits)?;
         bucket_entry_counts.push(decoded.entries.len() as u32);
         body_uncompressed_len += u64::from(decoded.uncompressed_len);
-        entries.extend(decoded.entries);
+        entry_count += decoded.entries.len() as u64;
+        each(decoded.entries);
     }
-    if entries.len() as u64 != prefix.header.entry_count {
+    if entry_count != prefix.header.entry_count {
         return Err(corrupted(format_args!(
-            "frames hold {} entries, header entry_count is {}",
-            entries.len(),
+            "frames hold {entry_count} entries, header entry_count is {}",
             prefix.header.entry_count
         )));
     }
@@ -1707,7 +1722,7 @@ pub fn verify_key_index_leaf(
         blake3: *blake3::hash(bytes).as_bytes(),
         bucket_entry_counts,
         body_uncompressed_len,
-        entries,
+        entries: Vec::new(),
         header: prefix.header,
     })
 }
