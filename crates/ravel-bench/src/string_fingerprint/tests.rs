@@ -484,12 +484,18 @@ fn overall_needs_every_subject_once_go_and_without_problems() {
             line: String::new(),
         },
         problems,
+        misses: 0,
     };
     let names = vec!["a".to_string(), "b".to_string()];
-    assert!(overall(&names, &[saved("a", true, 0), saved("b", true, 0)]).go);
+    let all_go = [saved("a", true, 0), saved("b", true, 0)];
+    assert!(overall(&names, &all_go).go);
+    assert!(complete(&names, &all_go));
+    // A NO-GO subject makes a complete NO-GO decision.
+    let no_go = [saved("a", true, 0), saved("b", false, 0)];
+    assert!(!overall(&names, &no_go).go);
+    assert!(complete(&names, &no_go));
     for set in [
         vec![saved("a", true, 0)],
-        vec![saved("a", true, 0), saved("b", false, 0)],
         vec![saved("a", true, 0), saved("b", true, 1)],
         vec![
             saved("a", true, 0),
@@ -503,8 +509,10 @@ fn overall_needs_every_subject_once_go_and_without_problems() {
         ],
     ] {
         assert!(!overall(&names, &set).go);
+        assert!(!complete(&names, &set));
     }
     assert!(!overall(&[], &[]).go);
+    assert!(!complete(&[], &[]));
 }
 
 #[test]
@@ -523,4 +531,5 @@ fn saved_decision_reads_back_a_written_report() {
     let back = saved_decision(&json).expect("read back");
     assert_eq!(back.decision, r.decision);
     assert_eq!(back.problems, 0);
+    assert_eq!(back.misses, 0);
 }

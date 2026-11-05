@@ -273,14 +273,19 @@ pub fn file_digest(path: &Path) -> Result<(String, u64), String> {
     Ok((hex, bytes))
 }
 
-pub fn stamp(corpus: &Path, zstd_level: i32) -> Result<Stamp, String> {
-    let (corpus_sha256, corpus_bytes) = file_digest(corpus)?;
+/// `git rev-parse HEAD`, with `-dirty` when a tracked file is modified.
+pub fn git_head() -> String {
     let mut git = command_out("git", &["rev-parse", "HEAD"]);
     if !command_out("git", &["status", "--porcelain", "--untracked-files=no"]).is_empty() {
         git.push_str("-dirty");
     }
+    git
+}
+
+pub fn stamp(corpus: &Path, zstd_level: i32) -> Result<Stamp, String> {
+    let (corpus_sha256, corpus_bytes) = file_digest(corpus)?;
     Ok(Stamp {
-        git,
+        git: git_head(),
         arch: command_out("uname", &["-m"]),
         nproc: string_fingerprint::threads(),
         mem_total_kib: mem_total_kib(),
