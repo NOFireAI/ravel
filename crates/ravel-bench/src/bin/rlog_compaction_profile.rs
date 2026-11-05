@@ -955,6 +955,7 @@ mod prof {
     use serde_json::{Value, json};
 
     pub const HZ: i32 = 997;
+    pub const SAMPLE_LIBC_ENV: &str = "RLOG_COMPACTION_PROFILE_SAMPLE_LIBC";
 
     pub struct Sampler {
         guard: pprof::ProfilerGuard<'static>,
@@ -975,12 +976,24 @@ mod prof {
             eprintln!("profiling: {e}");
             std::process::exit(1);
         }
+        // A sample whose interrupted PC sits in a blocklisted library is
+        // dropped, not attributed, so the default blocklist hides CPU spent in
+        // libc (memcpy, malloc). SAMPLE_LIBC_ENV=1 samples libc too, at the
+        // signal-safety risk `ravel_bench::profiling` describes.
+        let blocklist: &[&str] = if std::env::var(SAMPLE_LIBC_ENV).is_ok_and(|v| v == "1") {
+            &["libgcc", "pthread", "vdso"]
+        } else {
+            &["libc", "libgcc", "pthread", "vdso"]
+        };
         let guard = pprof::ProfilerGuardBuilder::default()
             .frequency(HZ)
-            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+            .blocklist(blocklist)
             .build()
             .expect("start sampler");
-        eprintln!("profiling: sampling at {HZ} Hz into {}", path.display());
+        eprintln!(
+            "profiling: sampling at {HZ} Hz into {}, blocklist {blocklist:?}",
+            path.display()
+        );
         Some(Sampler { guard, path })
     }
 
@@ -1163,6 +1176,48 @@ mod prof {
         out
     }
 
+    /// Top inclusive frames under `max_pct`, folding a frame whose sample
+    /// count equals the previous listed one into it: frames on one call chain
+    /// with no other callees carry identical counts and say the same thing.
+    fn distinct_chain_top(
+        m: &HashMap<String, u64>,
+        n: usize,
+        max_pct: f64,
+        total: u64,
+    ) -> Vec<Value> {
+        let pct = |c: u64| {
+            if total == 0 {
+                0.0
+            } else {
+                c as f64 * 100.0 / total as f64
+            }
+        };
+        let mut v: Vec<(&String, u64)> = m
+            .iter()
+            .map(|(k, c)| (k, *c))
+            .filter(|(_, c)| pct(*c) < max_pct)
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let mut out: Vec<(String, u64, Vec<String>)> = Vec::new();
+        for (name, c) in v {
+            let last_count = out.last().map(|l| l.1);
+            if last_count == Some(c) {
+                if let Some(last) = out.last_mut() {
+                    last.2.push(name.clone());
+                }
+            } else if out.len() == n {
+                break;
+            } else {
+                out.push((name.clone(), c, Vec::new()));
+            }
+        }
+        out.into_iter()
+            .map(|(name, c, folded)| {
+                json!({"function": name, "samples": c, "share_pct": pct(c), "folded_same_count": folded})
+            })
+            .collect()
+    }
+
     pub fn finish(sampler: Sampler) -> Value {
         let report = match sampler.guard.report().build() {
             Ok(r) => r,
@@ -1286,6 +1341,7 @@ mod prof {
         json!({
             "svg": sampler.path.display().to_string(),
             "frequency_hz": HZ,
+            "libc_sampled": std::env::var(SAMPLE_LIBC_ENV).is_ok_and(|v| v == "1"),
             "samples": total,
             "cpu_s_est": total as f64 / f64::from(HZ),
             "unattributed_share_pct": share * 100.0,
@@ -1294,7 +1350,8 @@ mod prof {
             "unattributed_by_thread_depth_caller": top(&unattributed_by, 10, f64::INFINITY),
             "leaf_exclusive_top15": top(&leaf, 15, f64::INFINITY),
             "inclusive_top10_below_95pct": top(&inclusive, 10, 95.0),
-            "inclusive_top40": top(&inclusive, 40, f64::INFINITY),
+            "inclusive_top10_distinct_below_95pct": distinct_chain_top(&inclusive, 10, 95.0, total),
+            "inclusive_top100": top(&inclusive, 100, f64::INFINITY),
             "phases": phase_rows,
             "zstd_decompress_samples_in_block_decode": zstd_decompress,
             "samples_by_thread": thread_rows.iter().take(12).map(|(t, c)| json!({"thread": t, "samples": c, "share_pct": pct(*c)})).collect::<Vec<_>>(),
@@ -1790,9 +1847,9 @@ fn print_table(doc: &Value) {
         }
         let _ = writeln!(
             out,
-            "top functions (inclusive, frames under 95% of samples):"
+            "top functions (inclusive, frames under 95% of samples, equal-count chains folded):"
         );
-        for row in p["inclusive_top10_below_95pct"]
+        for row in p["inclusive_top10_distinct_below_95pct"]
             .as_array()
             .into_iter()
             .flatten()
@@ -1843,8 +1900,15 @@ fn main() {
     drop(objects);
 
     let page_choice_ab = if args.page_choice_ab {
-        let ex = reencode(&compacted, PageChoice::Exhaustive);
-        let es = reencode(&compacted, PageChoice::Estimated);
+        // One thread per choice; each reports its own thread CPU clock.
+        let (ex, es) = std::thread::scope(|scope| {
+            let ex = scope.spawn(|| reencode(&compacted, PageChoice::Exhaustive));
+            let es = scope.spawn(|| reencode(&compacted, PageChoice::Estimated));
+            (
+                ex.join().expect("exhaustive re-encode"),
+                es.join().expect("estimated re-encode"),
+            )
+        });
         let l0 = compacted.report["l0_bytes"].as_u64().unwrap_or(1).max(1);
         let ratio = |v: &Value| v["bytes"].as_u64().unwrap_or(0) as f64 / l0 as f64;
         let (rex, res) = (ratio(&ex), ratio(&es));
