@@ -1,0 +1,41 @@
+string_fingerprint stamp git=283cad0203d621306ae1a58e167c61d58655260e arch=x86_64 nproc=16 mem_total_kib=32132612 corpus_file=BGL.log corpus_sha256=666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2 corpus_bytes=743185031 zstd_level=3 cpu_clock=CLOCK_THREAD_CPUTIME_ID
+string_fingerprint params column=value gram_len=3 budget_share=0.01 fallback_min_bits=256 zstd_level=3 block_records=8192 object_records=262144 max_lines=4747963 seed=3710 literals_per_kind=40 eq_max_len=1024 like_min_len=5 like_max_len=12
+string_fingerprint workload training present equals=20 like=20 absent equals=20 like=20; evaluation present equals=20 like=20 absent equals=20 like=20
+string_fingerprint figure bgl_body/lines = 4747963 predict 4747963 band [4747963, 4747963] ok
+string_fingerprint figure bgl_body/blocks = 580 predict 580 band [580, 580] ok
+string_fingerprint figure bgl_body/column_bytes = 738437068 predict 738437068 band [738437068, 738437068] ok
+string_fingerprint figure bgl_body/compressed_bytes = 68585093 predict 68585093 band [48000000, 89200000] ok
+string_fingerprint figure bgl_body/zstd_cpu_s = 1.24863934 predict 1.5 band [0.5, 4.5] ok
+string_fingerprint figure bgl_body/build_cpu_over_zstd = 9.498377451410429 predict 2.5 band [1, 6] MISS
+string_fingerprint figure bgl_body/candidate_grams = 1901 predict 1500 band [400, 4000] ok
+string_fingerprint figure bgl_body/learned_bits = 1259 predict 600 band [50, 2500] ok
+string_fingerprint figure bgl_body/fallback_bits = 8141 predict 8800 band [4000, 12300] ok
+string_fingerprint figure bgl_body/bits_per_block = 9400 predict 9400 band [6600, 12300] ok
+string_fingerprint figure bgl_body/summary_bytes_share = 0.009991631855044652 predict 0.0099 band [0.0095, 0.01] ok
+string_fingerprint figure bgl_body/fallback_density = 0.22201500281673428 predict 0.75 band [0.4, 0.97] MISS
+string_fingerprint figure bgl_body/eval_equals_bloom_testable = 0 predict 0 band [0, 0] ok
+string_fingerprint figure bgl_body/seen/equals/false_positive_share = 0.003364969801553063 predict 0.5 band [0.1, 0.95] MISS
+string_fingerprint figure bgl_body/seen/like/false_positive_share = 0.33121052910895293 predict 0.5 band [0.1, 0.95] ok
+string_fingerprint figure bgl_body/unseen/equals/false_positive_share = 0.0033218291630716136 predict 0.85 band [0.5, 1] MISS
+string_fingerprint figure bgl_body/unseen/like/false_positive_share = 0.20157822853963275 predict 0.85 band [0.5, 1] MISS
+string_fingerprint figure bgl_body/unseen/equals_absent/false_positive_share = 0.001379310344827586 predict 0.9 band [0.5, 1] MISS
+string_fingerprint figure bgl_body/unseen/like_absent/false_positive_share = 0.10724137931034483 predict 0.9 band [0.5, 1] MISS
+string_fingerprint figure bgl_body/production/equals/false_positive_share = 1 predict 1 band [0.95, 1] ok
+string_fingerprint figure bgl_body/contains/like/cells_tested_per_row = 1 predict 1 band [0.8, 1.2] ok
+string_fingerprint figure bgl_body/summary/like/cells_tested_share = 0.3194903688171117 predict 0.9 band [0.5, 1] MISS
+string_fingerprint figure bgl_body/saturation/long_values = 0 predict 0 band [0, 0] ok
+string_fingerprint figure bgl_body/bloom/equals/false_positive_share absent as pre-registered (no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0))
+string_fingerprint figure bgl_body/saturation/blocks absent as pre-registered (no value over 1024 bytes (describe over_1024_bytes=0))
+string_fingerprint figure bgl_body/saturation/fallback_density absent as pre-registered (no value over 1024 bytes (describe over_1024_bytes=0))
+string_fingerprint figure bgl_body/saturation/unseen/like/false_positive_share absent as pre-registered (no value over 1024 bytes (describe over_1024_bytes=0))
+string_fingerprint figure bgl_body/summary/equals_bloom_testable/false_positive_share absent as pre-registered (no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0))
+string_fingerprint decision bgl_body: NO-GO; unseen_equals_fp=0.0033 unseen_like_fp=0.2016 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=9.4984 (bar 2); fails: unseen_like, cpu; saturation untested (no value over 1024 bytes) (saturation_fp=missing, bar 0.3)
+string_fingerprint objects=19 object_bytes=77332359
+string_fingerprint miss bgl_body/build_cpu_over_zstd: 9.498377451410429 outside band [1.0, 6.0]
+string_fingerprint miss bgl_body/fallback_density: 0.22201500281673428 outside band [0.4, 0.97]
+string_fingerprint miss bgl_body/seen/equals/false_positive_share: 0.003364969801553063 outside band [0.1, 0.95]
+string_fingerprint miss bgl_body/summary/like/cells_tested_share: 0.3194903688171117 outside band [0.5, 1.0]
+string_fingerprint miss bgl_body/unseen/equals/false_positive_share: 0.0033218291630716136 outside band [0.5, 1.0]
+string_fingerprint miss bgl_body/unseen/equals_absent/false_positive_share: 0.001379310344827586 outside band [0.5, 1.0]
+string_fingerprint miss bgl_body/unseen/like/false_positive_share: 0.20157822853963275 outside band [0.5, 1.0]
+string_fingerprint miss bgl_body/unseen/like_absent/false_positive_share: 0.10724137931034483 outside band [0.5, 1.0]

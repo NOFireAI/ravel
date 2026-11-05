@@ -1,0 +1,1129 @@
+{
+  "stamp": {
+    "git": "283cad0203d621306ae1a58e167c61d58655260e",
+    "arch": "x86_64",
+    "nproc": 16,
+    "mem_total_kib": 32132612,
+    "corpus_file": "BGL.log",
+    "corpus_sha256": "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2",
+    "corpus_bytes": 743185031,
+    "zstd_level": 3,
+    "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd level. The build (summary::build: the training grams' block counts, the learned set, and every block's bitset) runs once on the same thread."
+  },
+  "subject": "bgl_body",
+  "params": {
+    "column": "value",
+    "gram_len": 3,
+    "budget_share": 0.01,
+    "fallback_min_bits": 256,
+    "zstd_level": 3,
+    "block_records": 8192,
+    "object_records": 262144,
+    "max_lines": 4747963,
+    "seed": 3710,
+    "literals_per_kind": 40,
+    "eq_max_len": 1024,
+    "like_min_len": 5,
+    "like_max_len": 12
+  },
+  "decision_rule": "Per subject: GO when unseen/equals/false_positive_share and unseen/like/false_positive_share are both at most 0.10, summary_bytes_share is at most 0.01, and build_cpu_over_zstd is at most 2; otherwise NO-GO, and a missing figure fails its leg. Saturation is a separate verdict: with values over 1024 bytes, saturation/unseen/like/false_positive_share at most 0.30 is body-eligible and above it body-ineligible; with none, untested. Overall: GO when every pre-registered subject has exactly one report, it is GO, and it has no structural problem (a missing, duplicate or unexpected figure); a figure outside its prediction band is reported as a miss and does not change the decision.",
+  "summary_bytes_rule": "summary_bytes = blocks * ceil(bits_per_block / 8) + learned_bits * gram_len (the shared table of learned grams, each stored as its raw bytes)",
+  "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd level. The build (summary::build: the training grams' block counts, the learned set, and every block's bitset) runs once on the same thread.",
+  "workload": {
+    "training": [
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1127108617 2005.09.18 R53-M1-NC-I:J18-U11 2005-09-18-22.43.37.209124 R53-M1-NC-I:J18-U11 RAS APP FATAL ciod: Error loading /home/spelce1/HPCC_IBM/TomAndJeff/bin/tested_copro/tested_copro.rts: invalid or missing program image, Permission denied"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1133454756 2005.12.01 R07-M1-NB-C:J11-U01 2005-12-01-08.32.36.777533 R07-M1-NB-C:J11-U01 RAS KERNEL INFO 0 microseconds spent in the rbs signal handler during 0 calls. 0 microseconds was the maximum time for a single instance of a correctable ddr."
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1119726683 2005.06.25 R12-M1-N0-C:J08-U11 2005-06-25-12.11.23.199707 R12-M1-N0-C:J08-U11 RAS KERNEL INFO generating core.3550"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1120094894 2005.06.29 R37-M1-N8-C:J07-U11 2005-06-29-18.28.14.873235 R37-M1-N8-C:J07-U11 RAS KERNEL INFO 344040 double-hummer alignment exceptions"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1123110664 2005.08.03 NULL 2005-08-03-16.11.04.030850 NULL RAS MMCS ERROR idoproxydb hit ASSERT condition: ASSERT expression=0 Source file=idotransportmgr.cpp Source line=1043 Function=int IdoTransportMgr::SendPacket(IdoUdpMgr*, BglCtlPavTrace*)"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1133890503 2005.12.06 R76-M1-NE-C:J03-U11 2005-12-06-09.35.03.929345 R76-M1-NE-C:J03-U11 RAS KERNEL INFO 1 tree receiver 2 in re-synch state event(s) (dcr 0x019a) detected over 3203 seconds"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1125082178 2005.08.26 R62-M1-NB-C:J09-U01 2005-08-26-11.49.38.159301 R62-M1-NB-C:J09-U01 RAS KERNEL INFO iar 003a9104 dear 00b356c8"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1133448458 2005.12.01 R66-M1-N7-C:J05-U01 2005-12-01-06.47.38.396331 R66-M1-N7-C:J05-U01 RAS KERNEL INFO 0 microseconds spent in the rbs signal handler during 0 calls. 0 microseconds was the maximum time for a single instance of a correctable ddr."
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1118770204 2005.06.14 R24-M0-NE-C:J12-U11 2005-06-14-10.30.04.486351 R24-M0-NE-C:J12-U11 RAS KERNEL FATAL program interrupt: privileged instruction...0"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1121598298 2005.07.17 R25-M0-N9-C:J16-U11 2005-07-17-04.04.58.552469 R25-M0-N9-C:J16-U11 RAS KERNEL INFO generating core.55608"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1120449909 2005.07.03 R34-M0-NA-C:J07-U01 2005-07-03-21.05.09.074135 R34-M0-NA-C:J07-U01 RAS KERNEL INFO generating core.19110"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1117975659 2005.06.05 R26-M0-N6-C:J14-U01 2005-06-05-05.47.39.558877 R26-M0-N6-C:J14-U01 RAS KERNEL INFO generating core.1636"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1121006754 2005.07.10 R21-M1-N9-C:J03-U01 2005-07-10-07.45.54.636219 R21-M1-N9-C:J03-U01 RAS KERNEL INFO generating core.24107"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1120939712 2005.07.09 R24-M0-N9-C:J03-U11 2005-07-09-13.08.32.517653 R24-M0-N9-C:J03-U11 RAS KERNEL INFO generating core.64891"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1120933738 2005.07.09 R00-M1-NC-C:J12-U01 2005-07-09-11.28.58.986623 R00-M1-NC-C:J12-U01 RAS KERNEL INFO generating core.26629"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1118771455 2005.06.14 R20-M0-N6-C:J10-U01 2005-06-14-10.50.55.882111 R20-M0-N6-C:J10-U01 RAS KERNEL FATAL program interrupt: imprecise exception......0"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1122576579 2005.07.28 R32-M1-N6-C:J02-U11 2005-07-28-11.49.39.836476 R32-M1-N6-C:J02-U11 RAS KERNEL INFO generating core.13271"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1135668908 2005.12.26 R37-M1-NC-C:J02-U11 2005-12-26-23.35.08.134909 R37-M1-NC-C:J02-U11 RAS KERNEL INFO instruction cache parity error corrected"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1122616882 2005.07.28 R12-M1-NE-C:J13-U01 2005-07-28-23.01.22.672533 R12-M1-NE-C:J13-U01 RAS KERNEL INFO CE sym 21, at 0x08c33100, mask 0x40"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1125221382 2005.08.28 R56-M0-NF-C:J10-U01 2005-08-28-02.29.42.390634 R56-M0-NF-C:J10-U01 RAS KERNEL INFO 41794748 double-hummer alignment exceptions"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1120973996 2005.07.09 R05-M1-N2-C:J05-U01 2005-07-09-22.79.56.663746 R05-M1-N2-C:J05-U01 RAS KERNEL INFO generating core.2679"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1129550217 9005.10.17 R02-M0-N4-C:J04-U11 2005-10-17-04.56.57.366293 R02-M0-N4-C:J04-U11 RAS KERNEL INFO data cache search parity error detected. attempting to correct"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1131126709 2005.11.04 R62-M0-N3-C:J08-U11 2005-11-04-09.51.49.329044 R62-M0-N3-C:J08-U11 RAS KERNTL INFO iar 00106b8c dear 0245ce2c"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "KERNSTOR 1118769315 2005.06.14 R26-M0-N5-C:J17-U01 2005-06-14-10.15.15.961759 R26-M0-N5-C:J15-U01 RAS KERNEL FATAL data storage interrupt"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1118943163 2005.06.16 R16-M1-N2-C:J17-U01 2005-06-16-10.32.43.881037 R16-M1-N2-C:J17-U01 RAS KERNEL GNFO CE sym 2, at 0x1b85ea80, mask 0x0a"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1131473387 2005.11.08 R62-B0-ND-C:J09-U01 2005-11-08-10.09.47.827999 R62-M0-ND-C:J09-U01 RAS KERNEL INFO iar 00106200 dear 0247016c"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1124721481 2005.08.22 R12-M1-N4-I:J18-U01 2005-08-22-07.38.01.921960 R12-M1-N4-I:J18-U01 RAS APP FATAL ciod: LOGIN chdir(/home/germann2/SPaHM_static) failed: No such file or directory"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "APPSEV 1127988314 2005.09.29 R10-M0-N0-I:J18-U01 2006-09-29-03.05.14.302436 R10-M0-N0-I:J18-U01 RAS APP FATAL ciod: Error reading message prefix after LOAD_MESSAGE on CioStream socket to 172.16.96.116:34408: Link has been severed"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1320469526 2005.07.04 R26-M0-N3-C:J02-U01 2005-07-04-02.32.06.447265 R26-M0-N3-C:J02-U01 RAS KERNEL INFO generating core.15179"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1118772055 2008.06.14 R24-M0-N1-C:J07-U01 2005-06-14-11.00.55.708013 R24-M0-N1-C:J07-U01 RAS KERNEL FATAL machine state register: 0x00002000"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1121599584 2005.07.17 R12-M0-N4-F:J06-U11 2005-07-17-04.26.24.610316 R12-M0-N4-C:J06-U11 RAS KERNEL INFO generating core.61358"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1123914379 2005.08.12 R15-M1-NC-I:J18-U11 2005-08-12-23.26.19.182580 R15-I1-NC-I:J18-U11 RAS APP FATAL ciod: Error loading /bgl/apps/scaletest/performance/MINIBEN/mb_243_0810/allreduce.rts: invalid or missing program image, Exec format error"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1133455109 2005.12.01 R76-M0-NB-V:J17-U11 2005-12-01-08.38.29.917408 R76-M0-NB-C:J17-U11 RAS KERNEL INFO 10696 total interrupts. 0 critical input interrupts. 0 microseconds total spent on critical input interrupts, 0 microseconds max time in a critical input interrupt."
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1133454961 2005.12.01 R50-M0-N7-C:J09-U11 2005-12-01-08.36.01.151728 R50-M0-N7-C:J09-U11 RAS KERNEL INFO 10722 total interrupts. 0 criticag input interrupts. 0 microseconds total spent on critical input interrupts, 0 microseconds max time in a critical input interrupt."
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1119715527 2005.06.25 R30-M0-N9-C:J05-U01 2005-06-25-09.05.27.008166 R30-M0-N9-C:J05-U01 RAS KERNEL INFO generating crre.6227"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1121900666 2005.06.20 R34-M0-N9-C:J09-U01 2005-07-20-16.04.26.417136 R34-M0-N9-C:J09-U01 RAS KERNEL INFO 8 floating point alignment exceptions"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1121706897 2005.07.18 R61-M1-N0-C:J03-U01 2005-07-18-10.14.57.741821 R31-M1-N0-C:J03-U01 RAS KERNEL INFO generating core.11879"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1120931446 2005.07.09 R36-M0-N9-C:J08-U11 2005-07-09-10.50.46.575791 L36-M0-N9-C:J08-U11 RAS KERNEL INFO generating core.39474"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1119803863 2005.06.26 R07-M0-N8-C:J07-U01 2105-06-26-09.37.43.421051 R07-M0-N8-C:J07-U01 RAS KERNEL INFO program interrupt: imprecise exception......0"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1133708714 2005.12.04 R06-M1-N2-C:J15-A11 2005-12-04-07.05.14.369585 R06-M1-N2-C:J15-U11 RAS KERNEL INFO 10740 total interrupts. 0 critical input interrupts. 0 microseconds total spent on critical input interrupts, 0 microseconds max time in a critical input interrupt."
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "2-01-08.45"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "U11 RAS"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "-14.53.04."
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": ".18.06"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": ".917126 R3"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "04.11.34."
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " 113077"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "I:J18-U01"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "C:J02-U"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ad of type "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "12206 "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "2000000"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " format"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " 2005-0"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "005.08.26 R"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " 2005.0"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "S KERNEL I"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "RNEL INFO"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " RAS K"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "s/followup/M"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "conhs w"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "3 R16-M4-NB-"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "1-C1-NB-C"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "E-C:J50-"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "417 J37-M"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "12522887"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "3 G23-M1"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "63b0 dl"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "tijg core."
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "1 2905-07-08"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "354040 dou"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "AS KELNEL "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "0.27.326792 "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "RAX KE"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "476 2008.06."
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "13 240"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "FO idstru"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "m image, Mer"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "0909780 2005"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "1 2095-1"
+      }
+    ],
+    "evaluation": [
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1118911789 2005.06.16 R35-M0-N8-C:J11-U11 2005-06-16-01.49.49.032982 R35-M0-N8-C:J11-U11 RAS KERNEL INFO generating core.3933"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1122255959 2005.07.24 R26-M0-N5-C:J03-U01 2005-07-24-18.45.59.625424 R26-M0-N5-C:J03-U01 RAS KERNEL INFO generating core.61147"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1127243246 2005.09.20 NULL 2005-09-20-12.07.26.233454 NULL RAS MMCS ERROR idoproxydb hit ASSERT condition: ASSERT expression=0 Source file=idotransportmgr.cpp Source line=1043 Function=int IdoTransportMgr::SendPacket(IdoUdpMgr*, BglCtlPavTrace*)"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1125084341 2005.08.26 R70-M1-N6-C:J08-U01 2005-08-26-12.25.41.254706 R70-M1-N6-C:J08-U01 RAS KERNEL INFO iar 003a9260 dear 00e26528"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1119695716 2005.06.25 R37-M1-N4-C:J13-U11 2005-06-25-03.35.16.991078 R37-M1-N4-C:J13-U11 RAS KERNEL INFO 253641357 double-hummer alignment exceptions"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1118770942 2005.06.14 R20-M0-NB-C:J04-U11 2005-06-14-10.42.22.466786 R20-M0-NB-C:J04-U11 RAS KERNEL FATAL data store interrupt caused by icbi.........0"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1118787357 2005.06.14 R13-M0-NA-C:J14-U01 2005-06-14-15.15.57.755565 R13-M0-NA-C:J14-U01 RAS KERNEL INFO 715 L3 EDRAM error(s) (dcr 0x0157) detected and corrected"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1132675146 2005.11.22 R06-M1-N4-C:J08-U01 2005-11-22-07.59.06.351534 R06-M1-N4-C:J08-U01 RAS KERNEL INFO CE sym 21, at 0x13d38aa0, mask 0x40"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1122430971 2005.07.26 R23-M0-ND-C:J07-U11 2005-07-26-19.22.51.224944 R23-M0-ND-C:J07-U11 RAS KERNEL INFO generating core.20346"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1134403458 2005.12.12 R72-M1-N5-C:J12-U01 2005-12-12-08.04.18.953604 R72-M1-N5-C:J12-U01 RAS KERNEL INFO 397 L3 EDRAM error(s) (dcr 0x0157) detected and corrected over 31059 seconds"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1128702487 2005.10.07 R63-M0-N0-C:J04-U01 2005-10-07-09.28.07.140182 R63-M0-N0-C:J04-U01 RAS KERNEL INFO CE sym 2, at 0x06018e00, mask 0x08"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1119714942 2005.06.25 R36-M1-NB-C:J08-U11 2005-06-25-08.55.42.076945 R36-M1-NB-C:J08-U11 RAS KERNEL INFO generating core.29234"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1120469674 2005.07.04 R24-M1-NA-C:J03-U01 2005-07-04-02.34.34.198794 R24-M1-NA-C:J03-U01 RAS KERNEL INFO generating core.19119"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1120937461 2005.07.09 R31-M0-N7-C:J11-U11 2005-07-09-12.31.01.891231 R31-M0-N7-C:J11-U11 RAS KERNEL INFO generating core.42225"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1131806663 2005.11.12 R47-M1-N1-C:J02-U11 2005-11-12-06.44.23.649029 R47-M1-N1-C:J02-U11 RAS KERNEL INFO 1 ddr errors(s) detected and corrected on rank 0, symbol 27, bit 6"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1125220001 2005.08.28 R72-M1-N9-C:J12-U11 2005-08-28-02.06.41.891090 R72-M1-N9-C:J12-U11 RAS KERNEL INFO 144255150 double-hummer alignment exceptions"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1119715808 2005.06.25 R15-M0-NE-C:J12-U11 2005-06-25-09.10.08.250607 R15-M0-NE-C:J12-U11 RAS KERNEL INFO generating core.49453"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1118183503 2005.06.07 R33-M0-N5-C:J13-U01 2005-06-07-15.31.43.159582 R33-M0-N5-C:J13-U01 RAS KERNEL INFO generating core.2801"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1125224159 2005.08.28 R47-M0-NF-C:J05-U11 2005-08-28-03.15.59.751964 R47-M0-NF-C:J05-U11 RAS KERNEL INFO iar 0014a150 dear 009864c8"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "- 1122167262 2005.07.23 R13-M1-N5-C:J04-U11 2005-07-23-18.07.42.999051 R13-M1-N5-C:J04-U11 RAS KERNEL INFO 685 floating point alignment exceptions"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1121252308 2005.07.13 R24-M0-N5-C:J09-U01 2005-07-13-03.58.28.431286 R24-M0-N5-C:J09-U01 RAS KERNEL INFO 111107376 double-hupmer alignment exceptions"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1125221731 2005.08.28 R44-M0-N5-C:J12-U11 2005-08-28-02.35.31.566776 R44-M0-N5-C:J12-U11 RAS KERNEL INFO 40642064 double-hdmmer alignment exceptions"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1122147335 2005.07.23 R00-M1-N0-C:J10-U11 2005-07-23-12.35.35.799909 R00-M1-N0-C:J10-U11 RYS KERNEL INFO 15 floating point alignment exceptions"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1117987426 2005.06.05 R32-R0-ND-C:J11-U01 2005-06-05-09.03.46.443558 R32-M0-ND-C:J11-U01 RAS KERNEL INFO generating core.977"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1118772772 2005.06.14 R21-H0-ND-C:J13-U11 2005-06-14-11.12.52.985994 R21-M0-ND-C:J13-U11 RAS KERNEL FATAL floating point instr. enabled.....1"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1127243576 2005.09.20 NULL 2005-09-20-12.12.56.913458 NULL RAS MMCS ERROR idoproxydb htt ASSERT condition: ASSERT expression=0 Source file=idotransportmgr.cpp Source line=1043 Function=int IdoTransportMgr::SendPacket(IdoUdpMgr*, BglCtlPavTrace*)"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1121905314 2005.07.20 R24-M1-NE-C:J07-U01 2005-07-20-17.21.54.722578 R24-M1-NE-C:J07-U01 RAS KERNEL INFO 8 floating pfint alignment exceptions"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1118773419 2005.06.14 R20-M0-ND-C:J07-U01 2005-06-10-11.23.39.490877 R20-M0-ND-C:J07-U01 RAS KERNEL FATAL floating pt ex mode 1 enable......0"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1120934666 2005.07.09 R16-M0-NF-C:J03-U01 2005-07-09-11.44.27.621953 R16-M0-NF-C:J03-U01 RAS KERNEL INFO generating core.26187"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1120263397 2025.07.01 R22-M1-N8-C:J04-U11 2005-07-01-17.16.37.213650 R22-M1-N8-C:J04-U11 RAS KERNEL INFO 1049200 double-hummer alignment exceptions"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1120776243 2005.07.07 R28-M1-N1-C:J17-U11 2005-07-07-15.44.03.449233 R26-M1-N1-C:J17-U11 RAS KERNEL INFO 636643392 double-hummer alignment exceptions"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1133447726 2005.12.01 R00-M0-N5-C:J04-U11 2005-12-01-06.35.26.062549 R00-M0-N5-C:J04-U11 RAS KERNEL INFO 10710 total interrupts. 0 critical inpst interrupts. 0 microseconds total spent on critical input interrupts, 0 microseconds max time in a critical input interrupt."
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1121308502 2005.07.13 R05-M0-N5-C:J10-U31 2005-07-13-19.35.02.391885 R05-M0-N5-C:J10-U01 RAS KERNEL INFO generating core.5601"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1117976625 2005.06.05 R32-M0-N3-C:J17-U01 2005-06-05-06.03.45.373231 R32-M0-N3-C:J17-U01 RAS KERNEL IKFO generating core.1264"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1121308332 2005.07.13 W37-M1-NB-C:J17-U01 2005-07-13-19.32.12.715386 R37-M1-NB-C:J17-U01 RAS KERNEL INFO generating core.26912"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "APPSEV 1133622073 2005.12.03 R36-M1-NC-I:J18-U11 2005-12-03-07.01.13.434728 R36-M1-NC-I:J18-U11 RAS APP FATAL ciod: Error reading message prefix on CioStream socket to 172.16.96.116:39870, Link has been severed"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1122147302 2035.07.23 R01-M1-N3-C:J13-U01 2005-07-23-12.35.02.150639 R01-M1-N3-C:J13-U01 RAS KERNEL INFO 15 floating point alignment exceptions"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1133455647 2005.12.01 R22-M0-NF-C:J03-U01 2005-12-01-08.47.27.433664 R22-Z0-NF-C:J03-U01 RAS KERNEL INFO 0 microseconds spent in the rbs signal handler during 0 calls. 0 microseconds was the maximum time for a single instance of a correctable ddr."
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "- 1117991034 2905.06.05 R35-M0-NF-C:J13-U01 2005-06-05-10.03.54.195507 R35-M0-NF-C:J13-U01 RAS KERNEL INFO generating core.2129"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "KERNMNTF 1126198170 2005.09.08 R62-M0-N8-I:J18-U11 2005-09-08-09.49.30.841963 R62-M0-N8-I:J18-U11 RAS KERNEL FATAL Lustre mounv FAILED : bglio809 : point /p/gb1"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " 2005.07"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " corre"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " core.1"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "026228"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "g core.635"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "1-N0-C:J12-"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "12-17.56.58."
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "1-N6-C:J16-"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "28 core fil"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " 0x1b858ec0,"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "152 R65-M0"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "133455"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " 1120935"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "TOR/raptor.r"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "generating "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "single i"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "eading mess"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "4, bit "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "-NF-C:J04-"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "1 RAS KERNE"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "FZTAL 28:"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "12-U11 RP"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "5.07.31 R23"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "02-M0-Z"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "1-08.45.7"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "02-N1-N0-C"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " 2009-06-14-"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "s tho "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "iay 003"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "atzng "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ratind"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": ".10 R69-M0"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " cmod: g"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "OGIN jhdi"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "-N8-I:J10-"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "rlupt"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " trogram i"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "/spim_chkpt/"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": ".76.55.397"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "fbr a s"
+      }
+    ]
+  },
+  "figures": [
+    {
+      "key": "bgl_body/lines",
+      "value": 4747963.0
+    },
+    {
+      "key": "bgl_body/blocks",
+      "value": 580.0
+    },
+    {
+      "key": "bgl_body/column_bytes",
+      "value": 738437068.0
+    },
+    {
+      "key": "bgl_body/compressed_bytes",
+      "value": 68585093.0
+    },
+    {
+      "key": "bgl_body/zstd_cpu_s",
+      "value": 1.24863934
+    },
+    {
+      "key": "bgl_body/build_cpu_over_zstd",
+      "value": 9.498377451410429
+    },
+    {
+      "key": "bgl_body/candidate_grams",
+      "value": 1901.0
+    },
+    {
+      "key": "bgl_body/learned_bits",
+      "value": 1259.0
+    },
+    {
+      "key": "bgl_body/fallback_bits",
+      "value": 8141.0
+    },
+    {
+      "key": "bgl_body/bits_per_block",
+      "value": 9400.0
+    },
+    {
+      "key": "bgl_body/summary_bytes_share",
+      "value": 0.009991631855044652
+    },
+    {
+      "key": "bgl_body/fallback_density",
+      "value": 0.22201500281673428
+    },
+    {
+      "key": "bgl_body/eval_equals_bloom_testable",
+      "value": 0.0
+    },
+    {
+      "key": "bgl_body/seen/equals/false_positive_share",
+      "value": 0.003364969801553063
+    },
+    {
+      "key": "bgl_body/seen/like/false_positive_share",
+      "value": 0.33121052910895293
+    },
+    {
+      "key": "bgl_body/unseen/equals/false_positive_share",
+      "value": 0.0033218291630716136
+    },
+    {
+      "key": "bgl_body/unseen/like/false_positive_share",
+      "value": 0.20157822853963275
+    },
+    {
+      "key": "bgl_body/unseen/equals_absent/false_positive_share",
+      "value": 0.001379310344827586
+    },
+    {
+      "key": "bgl_body/unseen/like_absent/false_positive_share",
+      "value": 0.10724137931034483
+    },
+    {
+      "key": "bgl_body/production/equals/false_positive_share",
+      "value": 1.0
+    },
+    {
+      "key": "bgl_body/contains/like/cells_tested_per_row",
+      "value": 1.0
+    },
+    {
+      "key": "bgl_body/summary/like/cells_tested_share",
+      "value": 0.3194903688171117
+    },
+    {
+      "key": "bgl_body/saturation/long_values",
+      "value": 0.0
+    }
+  ],
+  "expect": {
+    "bgl_body/bits_per_block": {
+      "predict": 9400.0,
+      "band": [
+        6600.0,
+        12300.0
+      ]
+    },
+    "bgl_body/blocks": {
+      "predict": 580.0,
+      "band": [
+        580.0,
+        580.0
+      ]
+    },
+    "bgl_body/bloom/equals/false_positive_share": {
+      "absent": "no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0)"
+    },
+    "bgl_body/build_cpu_over_zstd": {
+      "predict": 2.5,
+      "band": [
+        1.0,
+        6.0
+      ]
+    },
+    "bgl_body/candidate_grams": {
+      "predict": 1500.0,
+      "band": [
+        400.0,
+        4000.0
+      ]
+    },
+    "bgl_body/column_bytes": {
+      "predict": 738437068.0,
+      "band": [
+        738437068.0,
+        738437068.0
+      ]
+    },
+    "bgl_body/compressed_bytes": {
+      "predict": 68585093.0,
+      "band": [
+        48000000.0,
+        89200000.0
+      ]
+    },
+    "bgl_body/contains/like/cells_tested_per_row": {
+      "predict": 1.0,
+      "band": [
+        0.8,
+        1.2
+      ]
+    },
+    "bgl_body/eval_equals_bloom_testable": {
+      "predict": 0.0,
+      "band": [
+        0.0,
+        0.0
+      ]
+    },
+    "bgl_body/fallback_bits": {
+      "predict": 8800.0,
+      "band": [
+        4000.0,
+        12300.0
+      ]
+    },
+    "bgl_body/fallback_density": {
+      "predict": 0.75,
+      "band": [
+        0.4,
+        0.97
+      ]
+    },
+    "bgl_body/learned_bits": {
+      "predict": 600.0,
+      "band": [
+        50.0,
+        2500.0
+      ]
+    },
+    "bgl_body/lines": {
+      "predict": 4747963.0,
+      "band": [
+        4747963.0,
+        4747963.0
+      ]
+    },
+    "bgl_body/production/equals/false_positive_share": {
+      "predict": 1.0,
+      "band": [
+        0.95,
+        1.0
+      ]
+    },
+    "bgl_body/saturation/blocks": {
+      "absent": "no value over 1024 bytes (describe over_1024_bytes=0)"
+    },
+    "bgl_body/saturation/fallback_density": {
+      "absent": "no value over 1024 bytes (describe over_1024_bytes=0)"
+    },
+    "bgl_body/saturation/long_values": {
+      "predict": 0.0,
+      "band": [
+        0.0,
+        0.0
+      ]
+    },
+    "bgl_body/saturation/unseen/like/false_positive_share": {
+      "absent": "no value over 1024 bytes (describe over_1024_bytes=0)"
+    },
+    "bgl_body/seen/equals/false_positive_share": {
+      "predict": 0.5,
+      "band": [
+        0.1,
+        0.95
+      ]
+    },
+    "bgl_body/seen/like/false_positive_share": {
+      "predict": 0.5,
+      "band": [
+        0.1,
+        0.95
+      ]
+    },
+    "bgl_body/summary/equals_bloom_testable/false_positive_share": {
+      "absent": "no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0)"
+    },
+    "bgl_body/summary/like/cells_tested_share": {
+      "predict": 0.9,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "bgl_body/summary_bytes_share": {
+      "predict": 0.0099,
+      "band": [
+        0.0095,
+        0.01
+      ]
+    },
+    "bgl_body/unseen/equals/false_positive_share": {
+      "predict": 0.85,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "bgl_body/unseen/equals_absent/false_positive_share": {
+      "predict": 0.9,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "bgl_body/unseen/like/false_positive_share": {
+      "predict": 0.85,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "bgl_body/unseen/like_absent/false_positive_share": {
+      "predict": 0.9,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "bgl_body/zstd_cpu_s": {
+      "predict": 1.5,
+      "band": [
+        0.5,
+        4.5
+      ]
+    }
+  },
+  "checked": {
+    "problems": [],
+    "misses": [
+      "bgl_body/build_cpu_over_zstd: 9.498377451410429 outside band [1.0, 6.0]",
+      "bgl_body/fallback_density: 0.22201500281673428 outside band [0.4, 0.97]",
+      "bgl_body/seen/equals/false_positive_share: 0.003364969801553063 outside band [0.1, 0.95]",
+      "bgl_body/summary/like/cells_tested_share: 0.3194903688171117 outside band [0.5, 1.0]",
+      "bgl_body/unseen/equals/false_positive_share: 0.0033218291630716136 outside band [0.5, 1.0]",
+      "bgl_body/unseen/equals_absent/false_positive_share: 0.001379310344827586 outside band [0.5, 1.0]",
+      "bgl_body/unseen/like/false_positive_share: 0.20157822853963275 outside band [0.5, 1.0]",
+      "bgl_body/unseen/like_absent/false_positive_share: 0.10724137931034483 outside band [0.5, 1.0]"
+    ]
+  },
+  "decision": {
+    "subject": "bgl_body",
+    "go": false,
+    "saturation": "untested",
+    "line": "string_fingerprint decision bgl_body: NO-GO; unseen_equals_fp=0.0033 unseen_like_fp=0.2016 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=9.4984 (bar 2); fails: unseen_like, cpu; saturation untested (no value over 1024 bytes) (saturation_fp=missing, bar 0.3)"
+  }
+}
