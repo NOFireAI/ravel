@@ -27,7 +27,7 @@ use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use ravel_catalog::{
     Catalog, CatalogConfig, CatalogError, DeclaredColumnType, DeclaredTypedColumn,
-    KeyIndexLeafLimits, KeyIndexLeafRequest, Snapshot, SnapshotParts, StorageLayoutWrite,
+    KeyIndexLeafLimits, KeyIndexLeafRequest, KeyIndexRebuildOptions, Snapshot, SnapshotParts, StorageLayoutWrite,
     TenantConfig, TenantLifecycleState, set_tenant_config,
 };
 use ravel_commit::publish::RetryPolicy;
@@ -336,6 +336,12 @@ impl Fixture {
     /// Declares `user_id` an I64 key-index column, which is what makes the
     /// fold build a leaf for it, then folds.
     async fn fold(&self) {
+        self.fold_with(leaf_catalog(Arc::clone(&self.base))).await;
+    }
+
+    /// Declares `user_id` as the tenant's logs key-index field and folds every
+    /// object into one part through `catalog`.
+    async fn fold_with(&self, catalog: Catalog) {
         let mut config = TenantConfig {
             typed_attr_columns: Some(vec![DeclaredTypedColumn {
                 key: "user_id".to_string(),
@@ -352,7 +358,7 @@ impl Fixture {
         set_tenant_config(self.base.as_ref(), &tenant().hash(), &config, 1)
             .await
             .expect("write tenant config");
-        let report = leaf_catalog(Arc::clone(&self.base))
+        let report = catalog
             .fold(
                 &tenant().hash(),
                 Signal::Logs,
@@ -409,6 +415,30 @@ impl Fixture {
             .map(|o| by_key[o.key.as_str()])
             .collect();
         (leaves[0].key.clone(), ordinals)
+    }
+
+    /// The entry ordinals the part's leaf lists as uncovered, read by probing
+    /// it for `TARGET`.
+    async fn uncovered_for_target(&self) -> Option<Vec<u64>> {
+        let (_, parts) = self.resolve().await;
+        let part = &parts.parts[0];
+        let probe = leaf_catalog(Arc::clone(&self.base))
+            .probe_key_index_leaf(
+                &part.key_index[0],
+                &KeyIndexLeafRequest {
+                    tenant_hash: tenant().hash(),
+                    signal: Signal::Logs,
+                    part_blake3: &part.blake3,
+                    part_entry_count: part.entry_count,
+                    field: "user_id",
+                    key_type: KeyType::I64,
+                },
+                &key8_i64(TARGET),
+                &KeyIndexLeafLimits::default(),
+            )
+            .await
+            .expect("probe the leaf");
+        probe.uncovered_entry_ordinals().map(<[u64]>::to_vec)
     }
 }
 
@@ -717,32 +747,9 @@ async fn version_one_sections_are_uncovered_in_the_leaf() {
 
     fx.fold().await;
     let (leaf, ordinals) = fx.layout().await;
-    let catalog = leaf_catalog(Arc::clone(&fx.base));
-    let (_, parts) = fx.resolve().await;
-    let part = &parts.parts[0];
-    let probe = catalog
-        .probe_key_index_leaf(
-            &part.key_index[0],
-            &KeyIndexLeafRequest {
-                tenant_hash: tenant().hash(),
-                signal: Signal::Logs,
-                part_blake3: &part.blake3,
-                part_entry_count: part.entry_count,
-                field: "user_id",
-                key_type: KeyType::I64,
-            },
-            &key8_i64(TARGET),
-            &KeyIndexLeafLimits::default(),
-        )
-        .await
-        .expect("probe the leaf");
     let mut want = vec![ordinals[17], ordinals[20]];
     want.sort_unstable();
-    assert_eq!(
-        probe.uncovered_entry_ordinals(),
-        Some(want.as_slice()),
-        "{probe:?}"
-    );
+    assert_eq!(fx.uncovered_for_target().await, Some(want));
 
     let recorder = RecordingStore::new(Arc::clone(&fx.base));
     let v = sql(&serve(recorder.clone(), &Serve::default())).await;
@@ -768,6 +775,39 @@ async fn version_one_sections_are_uncovered_in_the_leaf() {
     assert_eq!(pruning(&v, "segmentsPrunedByKeyIndex"), 21, "{v}");
     // The leaf GETs plus the two declining prefix reads.
     assert_eq!(phase(&v, "keyIndex", "s3GetRequests"), 2 + 2, "{v}");
+}
+
+/// `--rebuild-key-index` builds a leaf through the same section read as the
+/// fold, so on a part folded without leaves it lists the two version 1
+/// entries as uncovered too.
+///
+/// FLIP: reverting the `section_resolves_like_the_reader` check in
+/// `read_entry_key_index_counted` makes the rebuild's `uncovered_entries` 0
+/// and the leaf's uncovered list empty: the report assertion fails.
+#[tokio::test]
+async fn version_one_sections_are_uncovered_in_a_rebuilt_leaf() {
+    let _serial = SERIAL.lock().await;
+    let fx = Fixture::publish(&[0, 20], &[17, 20]).await;
+    fx.fold_with(Catalog::new(Arc::clone(&fx.base), CatalogConfig::default()).expect("catalog"))
+        .await;
+    let (_, parts) = fx.resolve().await;
+    assert_eq!(parts.parts.len(), 1);
+    assert!(parts.parts[0].key_index.is_empty(), "folded without leaves");
+
+    let report = leaf_catalog(Arc::clone(&fx.base))
+        .rebuild_key_index(
+            &tenant().hash(),
+            Signal::Logs,
+            &KeyIndexRebuildOptions::default(),
+        )
+        .await
+        .expect("rebuild");
+    assert_eq!(report.parts_rebuilt, 1, "{report:?}");
+    assert_eq!(report.uncovered_entries, 2, "{report:?}");
+    let (_, ordinals) = fx.layout().await;
+    let mut want = vec![ordinals[17], ordinals[20]];
+    want.sort_unstable();
+    assert_eq!(fx.uncovered_for_target().await, Some(want));
 }
 
 /// The tier-1 answer every leaf-path failure must fall back to: the 16 small
