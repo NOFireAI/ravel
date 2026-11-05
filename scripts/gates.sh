@@ -429,10 +429,12 @@ run_feature_lanes() {
   # caught locally. stage-timing is a separate lane CI checks and runs, kept at
   # parity. saturation builds the ADR-1702 task 11 bins, which carry
   # `required-features = ["saturation"]`, and runs their band tests; no other
-  # local gate compiles them.
+  # local gate compiles them. walk-expiry does the same for the issue #3779
+  # probe (`required-features = ["walk-expiry"]`).
   if [[ ${want_bench} -eq 1 ]]; then
     run_feature_lane sql-latency,profiling,flight-lane -p ravel-bench
     run_feature_lane saturation -p ravel-bench
+    run_feature_lane walk-expiry -p ravel-bench
     run cargo check --locked -p ravel-bench --features stage-timing --all-targets
     run cargo test --locked -p ravel-bench --features stage-timing
   fi

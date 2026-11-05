@@ -320,9 +320,11 @@ check_eq "gates --dry-run: mcp lane agents clippy" "1" "$(count "${out}" "${mcp_
 check_eq "gates --dry-run: mcp lane agents binary" "1" "$(count "${out}" "${mcp_agents_test}")"
 check_eq "gates --dry-run: SDK gate" "1" "$(count_matching "${out}" "${sdk_gate_re}")"
 check_eq "gates --dry-run: no SDK skip line without the variable" "0" "$(count "${out}" "${sdk_skip}")"
-check_eq "gates --dry-run: feature lane clippy runs" "10" \
+check_eq "gates --dry-run: walk-expiry lane" "1" \
+  "$(count "${out}" '==> cargo clippy --locked -p ravel-bench --features walk-expiry --all-targets -- -D warnings')"
+check_eq "gates --dry-run: feature lane clippy runs" "11" \
   "$(count_matching "${out}" '^==> cargo clippy --locked .*--features ')"
-check_eq "gates --dry-run: feature lane nextest runs" "12" \
+check_eq "gates --dry-run: feature lane nextest runs" "13" \
   "$(count_matching "${out}" '^==> cargo nextest run --locked .*--features ')"
 
 # RAVEL_GATES_SKIP_SDK=1: the SDK step becomes one skip line, and nothing else

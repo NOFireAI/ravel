@@ -292,6 +292,8 @@ jobs:
         run: bash deploy/metricsbench/tests/capture-effective-config.test.sh
       - name: MetricsBench end-to-end driver cases (issue #940)
         run: bash deploy/metricsbench/tests/run.test.sh
+      - name: Walk-expiry launcher dry-run cases (issue #3779)
+        run: bash deploy/walk-expiry/aws/launch.test.sh
       - name: MCP agent evaluation runner cases (issue #1385)
         run: bash benchmarks/mcp-eval/run.test.sh
       - name: MCP agent evaluation corpus check (issue #1385)
@@ -1214,6 +1216,9 @@ jobs:
   #   - ravel-bench --features saturation       (ravel-server/jemalloc; the
   #                                              ADR-1702 task 11 bins. Clippy
   #                                              and RUNS the band tests)
+  #   - ravel-bench --features walk-expiry      (ravel-server/mcp; the issue
+  #                                              #3779 probe. Clippy and RUNS
+  #                                              its figure and smoke tests)
   #   - ravel-cli --features sql-explain        (the `sql explain`
   #                                              subcommand, issue #2881.
   #                                              Clippy and RUNS its tests)
@@ -1247,7 +1252,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [parquet-baseline, sql-latency, sql-latency-wide, stage-timing, saturation, cli-sql-explain]
+        lane: [parquet-baseline, sql-latency, sql-latency-wide, stage-timing, saturation, walk-expiry, cli-sql-explain]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -1285,7 +1290,7 @@ jobs:
           LANE: ${{ matrix.lane }}
         run: |
           case "$LANE" in
-            parquet-baseline|sql-latency|sql-latency-wide|stage-timing|saturation|cli-sql-explain)
+            parquet-baseline|sql-latency|sql-latency-wide|stage-timing|saturation|walk-expiry|cli-sql-explain)
               echo "lane: $LANE" ;;
             *)
               echo "::error::unknown features lane '$LANE'; no step would run for it"
@@ -1389,6 +1394,18 @@ jobs:
       - name: Doctests ravel-bench --features saturation
         if: matrix.lane == 'saturation'
         run: cargo test --locked --doc --profile ci -p ravel-bench --features saturation
+      # The issue #3779 walk-expiry probe carries
+      # `required-features = ["walk-expiry"]`; its figure, labeller and smoke
+      # tests run only with the feature on.
+      - name: Clippy ravel-bench --features walk-expiry
+        if: matrix.lane == 'walk-expiry'
+        run: cargo clippy --locked --profile ci -p ravel-bench --features walk-expiry --all-targets -- -D warnings
+      - name: Test ravel-bench --features walk-expiry
+        if: matrix.lane == 'walk-expiry'
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-bench --features walk-expiry
+      - name: Doctests ravel-bench --features walk-expiry
+        if: matrix.lane == 'walk-expiry'
+        run: cargo test --locked --doc --profile ci -p ravel-bench --features walk-expiry
       # `sql explain` and its tests compile only under this feature, which no
       # other lane selects for ravel-cli on its own.
       - name: Clippy ravel-cli --features sql-explain
