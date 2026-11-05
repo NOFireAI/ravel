@@ -273,14 +273,19 @@ pub fn file_digest(path: &Path) -> Result<(String, u64), String> {
     Ok((hex, bytes))
 }
 
-pub fn stamp(corpus: &Path, zstd_level: i32) -> Result<Stamp, String> {
-    let (corpus_sha256, corpus_bytes) = file_digest(corpus)?;
+/// `git rev-parse HEAD`, with `-dirty` when a tracked file is modified.
+pub fn git_head() -> String {
     let mut git = command_out("git", &["rev-parse", "HEAD"]);
     if !command_out("git", &["status", "--porcelain", "--untracked-files=no"]).is_empty() {
         git.push_str("-dirty");
     }
+    git
+}
+
+pub fn stamp(corpus: &Path, zstd_level: i32) -> Result<Stamp, String> {
+    let (corpus_sha256, corpus_bytes) = file_digest(corpus)?;
     Ok(Stamp {
-        git,
+        git: git_head(),
         arch: command_out("uname", &["-m"]),
         nproc: string_fingerprint::threads(),
         mem_total_kib: mem_total_kib(),
@@ -556,6 +561,15 @@ fn load_subject(path: &Path, name: &str) -> Result<SubjectSpec, String> {
 pub fn run(cfg: &Config) -> Result<RunReport, String> {
     let subject = load_subject(&cfg.spec_path, &cfg.subject)?;
     refuse_param_drift(&subject, &cfg.overrides)?;
+    #[cfg(feature = "parquet-baseline")]
+    if let Corpus::ParquetColumn { column, .. } = &cfg.corpus
+        && *column != subject.column
+    {
+        return Err(format!(
+            "subject {}: refusing --corpus-column {column:?}: the pre-registered column is {:?}",
+            subject.name, subject.column
+        ));
+    }
     let stamp = stamp(cfg.corpus.path(), subject.zstd_level)?;
 
     let values = read_values(&cfg.corpus, subject.max_lines)?;
@@ -678,9 +692,16 @@ mod tests {
         assert_eq!(run.rows, want);
 
         let keep: Vec<bool> = want.iter().map(|&n| n > 0).collect();
+        assert!(keep.contains(&false), "the summary must drop a block");
         let sub = objects.contains("needle", Some(&keep)).expect("subset");
         assert_eq!(sub.rows, want);
-        assert!(sub.cells_tested > 0 && sub.cells_tested <= run.cells_tested);
+        assert!(sub.cells_tested > 0);
+        assert!(
+            sub.cells_tested < run.cells_tested,
+            "dropping a block must test fewer cells: {} of {}",
+            sub.cells_tested,
+            run.cells_tested
+        );
     }
 
     #[test]
@@ -743,6 +764,90 @@ mod tests {
         assert!(by["test_subject/contains/like/cells_tested_per_row"] > 0.0);
         assert!(by["test_subject/eval_equals_bloom_testable"] > 0.0);
         assert!(by.contains_key("test_subject/bloom/equals/false_positive_share"));
+    }
+
+    #[cfg(feature = "parquet-baseline")]
+    #[test]
+    fn reads_binary_and_utf8_parquet_columns_with_nulls() {
+        use std::sync::Arc;
+
+        use arrow::array::{ArrayRef, BinaryArray, Int64Array, StringArray};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hits.parquet");
+        let binary: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(&b"http://a/x"[..]),
+            None,
+            Some(&b""[..]),
+            Some(&b"\xffnot utf8"[..]),
+        ]));
+        let utf8: ArrayRef = Arc::new(StringArray::from(vec![
+            None,
+            Some("title one"),
+            Some("t2"),
+            None,
+        ]));
+        let int: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4]));
+        let batch = RecordBatch::try_from_iter([("URL", binary), ("Title", utf8), ("Id", int)])
+            .expect("batch");
+        let file = File::create(&path).expect("create");
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let read = |column: &str, cap: u64| {
+            read_values(
+                &Corpus::ParquetColumn {
+                    path: path.clone(),
+                    column: column.to_string(),
+                },
+                cap,
+            )
+        };
+        assert_eq!(
+            read("URL", u64::MAX).expect("URL"),
+            vec![
+                b"http://a/x".to_vec(),
+                Vec::new(),
+                Vec::new(),
+                b"\xffnot utf8".to_vec()
+            ]
+        );
+        assert_eq!(
+            read("Title", u64::MAX).expect("Title"),
+            vec![
+                Vec::new(),
+                b"title one".to_vec(),
+                b"t2".to_vec(),
+                Vec::new()
+            ]
+        );
+        assert_eq!(read("URL", 2).expect("cap").len(), 2);
+        let err = read("Id", u64::MAX).expect_err("Int64 column");
+        assert!(err.contains("neither Utf8 nor Binary"), "{err}");
+        let err = read("Missing", u64::MAX).expect_err("no column");
+        assert!(err.contains("no column \"Missing\""), "{err}");
+    }
+
+    #[cfg(feature = "parquet-baseline")]
+    #[test]
+    fn refuses_a_parquet_column_other_than_the_registered_one() {
+        let parquet = |column: &str| {
+            let mut c = cfg("test_subject", Overrides::default());
+            c.corpus = Corpus::ParquetColumn {
+                path: fixture("no-such-corpus.parquet"),
+                column: column.to_string(),
+            };
+            run(&c).expect_err("no corpus")
+        };
+        let err = parquet("URL");
+        assert!(err.contains("refusing --corpus-column \"URL\""), "{err}");
+        assert!(!err.contains("no-such-corpus"), "{err}");
+        // The registered column passes the check and fails on the missing file.
+        let err = parquet("value");
+        assert!(err.contains("no-such-corpus"), "{err}");
     }
 
     #[test]

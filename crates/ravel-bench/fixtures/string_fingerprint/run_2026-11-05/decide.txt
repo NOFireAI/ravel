@@ -1,10 +1,19 @@
+string_fingerprint decide stamp git=b89114043e9f81f10182712abbfec9c20a79db44 reports=apache_body.json:bdd8b6bbf9f77fd78ffd157c10c635f88539543d3a1d6d8a27619eaca8beff05,openssh_body.json:82cabc18527f3679d41a7baf5e7c228746c244d75e1a08637085b50625fd6a9c,bgl_body.json:1c7119805679cb976e3019dab69452704394dced09556a0767489c8d8fc4cf7b,hdfs_body.json:f5bac56db4385255f4c32eb2bcdff9eff96c5650bdb937f450012817a9e915f3,clickbench_url.json:50808b3e2c3313213f821f083d9a0e9bd86720078adc8fd8ff52f18559f7d550,clickbench_title.json:6f5864e413506010e643c832e41e3ae4d1c81015bcbc78c2a3fc5e0a7766d6e9,clickbench_searchphrase.json:77492fc0b8e4dea7d8eca1e25df07563870c87441356d781ea27e68fc9a1920b,clickbench_referer.json:d4ec3f48d38cc4cba6500f544a35cf18ac3a30deea73006284cd7f2358240e49
 string_fingerprint decision apache_body: NO-GO; unseen_equals_fp=0.1423 unseen_like_fp=0.5692 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=7.5225 (bar 2); fails: unseen_equals, unseen_like, cpu; saturation untested (no value over 1024 bytes) (saturation_fp=missing, bar 0.3)
+string_fingerprint decide subject=apache_body misses=5 problems=0
 string_fingerprint decision openssh_body: NO-GO; unseen_equals_fp=0.0069 unseen_like_fp=0.2862 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=11.0115 (bar 2); fails: unseen_like, cpu; saturation untested (no value over 1024 bytes) (saturation_fp=missing, bar 0.3)
+string_fingerprint decide subject=openssh_body misses=7 problems=0
 string_fingerprint decision bgl_body: NO-GO; unseen_equals_fp=0.0033 unseen_like_fp=0.2016 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=9.4984 (bar 2); fails: unseen_like, cpu; saturation untested (no value over 1024 bytes) (saturation_fp=missing, bar 0.3)
+string_fingerprint decide subject=bgl_body misses=8 problems=0
 string_fingerprint decision hdfs_body: NO-GO; unseen_equals_fp=0.0578 unseen_like_fp=0.2588 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=9.2151 (bar 2); fails: unseen_like, cpu; saturation untested (no value over 1024 bytes) (saturation_fp=missing, bar 0.3)
+string_fingerprint decide subject=hdfs_body misses=7 problems=0
 string_fingerprint decision clickbench_url: NO-GO; unseen_equals_fp=0.7136 unseen_like_fp=0.8481 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=3.8763 (bar 2); fails: unseen_equals, unseen_like, cpu; saturation body-ineligible (saturation_fp=0.3636, bar 0.3)
+string_fingerprint decide subject=clickbench_url misses=0 problems=0
 string_fingerprint decision clickbench_title: NO-GO; unseen_equals_fp=0.4847 unseen_like_fp=0.4532 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=7.9867 (bar 2); fails: unseen_equals, unseen_like, cpu; saturation body-eligible (saturation_fp=0.0263, bar 0.3)
+string_fingerprint decide subject=clickbench_title misses=7 problems=0
 string_fingerprint decision clickbench_searchphrase: NO-GO; unseen_equals_fp=0.6385 unseen_like_fp=0.6979 (bar 0.1); summary_bytes_share=0.0099 (bar 0.01); build_cpu_over_zstd=3.0172 (bar 2); fails: unseen_equals, unseen_like, cpu; saturation body-ineligible (saturation_fp=0.5882, bar 0.3)
+string_fingerprint decide subject=clickbench_searchphrase misses=7 problems=0
 string_fingerprint decision clickbench_referer: NO-GO; unseen_equals_fp=0.7381 unseen_like_fp=0.8396 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=3.9412 (bar 2); fails: unseen_equals, unseen_like, cpu; saturation body-ineligible (saturation_fp=0.5556, bar 0.3)
+string_fingerprint decide subject=clickbench_referer misses=0 problems=0
 string_fingerprint decision overall: NO-GO; apache_body=NO-GO, openssh_body=NO-GO, bgl_body=NO-GO, hdfs_body=NO-GO, clickbench_url=NO-GO, clickbench_title=NO-GO, clickbench_searchphrase=NO-GO, clickbench_referer=NO-GO
-EXIT=1
+EXIT=3

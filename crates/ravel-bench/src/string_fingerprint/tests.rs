@@ -153,6 +153,147 @@ fn measure_reports_each_figure_once_and_prunes_unseen_literals() {
     assert_eq!(r.decision.saturation, Saturation::Untested);
 }
 
+/// The truth, except that equality keeps one block beyond the holders.
+struct OneExtraEquals<'a>(Truth<'a>);
+
+impl Production for OneExtraEquals<'_> {
+    fn equals_blocks_kept(&self, literal: &str) -> Result<u64, String> {
+        Ok(self.0.equals_blocks_kept(literal)? + 1)
+    }
+
+    fn contains(&self, literal: &str, keep: Option<&[bool]>) -> Result<ContainsRun, String> {
+        self.0.contains(literal, keep)
+    }
+}
+
+fn lit(kind: Kind, present: bool, text: &str) -> Literal {
+    Literal {
+        kind,
+        present,
+        text: text.into(),
+    }
+}
+
+#[test]
+fn measure_reports_hand_computed_shares() {
+    // 3-grams per block:
+    //   b0 alp lph pha ome meg ega
+    //   b1 alp lph pha hab abe bet hom ome meg egs
+    //   b2 ome meg ega
+    //   b3 del elt lta ome meg ega
+    // The training grams are alp lph pha hab abe bet ome meg ega. ome and meg
+    // are in every block, so they are not learned and never prune; the other
+    // seven are learned. Every literal below uses only training grams, so a
+    // block keeps it exactly when the block holds all of its grams.
+    let b: Vec<BlockValues> = [
+        &["alpha", "omega"][..],
+        &["alphabet", "home", "megs"],
+        &["omega"],
+        &["delta", "omeg", "mega"],
+    ]
+    .iter()
+    .map(|vs| vs.iter().map(|v| v.as_bytes().to_vec()).collect())
+    .collect();
+    let t = block_texts(&b).expect("texts");
+    let w = Workload {
+        training: vec![
+            // Holder b1; kept b1; non-holders b0 b2 b3 dropped: 0 of 3.
+            lit(Kind::Equals, true, "alphabet"),
+            // Holder b0; kept b0 b1; non-holders b1 kept, b2 b3 dropped: 1 of 3.
+            lit(Kind::Equals, true, "alpha"),
+            // Holders b0 b2; kept b0 b2 b3; non-holders b1 dropped, b3 kept: 1 of 2.
+            lit(Kind::Like, true, "omega"),
+        ],
+        evaluation: vec![
+            // Holder b3; kept b0 b2 b3; non-holders b0 b2 kept, b1 dropped: 2 of 3.
+            lit(Kind::Equals, true, "mega"),
+            // No holder; kept b1: 1 of 4.
+            lit(Kind::Equals, false, "lphabe"),
+            // Holders b0 b2 b3; kept all; non-holder b1 kept: 1 of 1.
+            lit(Kind::Like, true, "omeg"),
+            // Holder b1; kept b1; non-holders b0 b2 b3 dropped: 0 of 3.
+            lit(Kind::Like, true, "phab"),
+        ],
+    };
+    let spec = subject(unpredicted());
+    let production = OneExtraEquals(Truth {
+        blocks: &b,
+        equals_short_by_one: false,
+        contains_drops_a_row: false,
+    });
+    let r = measure(&spec, &input(&b, &t, &w), &production).expect("measure");
+    assert!(r.checked.problems.is_empty(), "{:?}", r.checked);
+    let f = by_key(&r);
+    assert_eq!(f["learned_bits"], 7.0);
+    // Over non-holder pairs only: a holder pair is never in the denominator.
+    assert_eq!(f["seen/equals/false_positive_share"], 1.0 / 6.0);
+    assert_eq!(f["seen/like/false_positive_share"], 1.0 / 2.0);
+    assert_eq!(f["unseen/equals/false_positive_share"], 3.0 / 7.0);
+    assert_eq!(f["unseen/like/false_positive_share"], 1.0 / 4.0);
+    assert_eq!(f["unseen/equals_absent/false_positive_share"], 1.0 / 4.0);
+    assert_eq!(
+        f["summary/equals_bloom_testable/false_positive_share"],
+        3.0 / 7.0
+    );
+    // Production keeps one non-holder per equality literal: "mega" has 3
+    // non-holders, "lphabe" 4, so 2 of 7 (not 2 of the 8 literal-block pairs).
+    assert_eq!(f["production/equals/false_positive_share"], 2.0 / 7.0);
+    assert_eq!(f["bloom/equals/false_positive_share"], 2.0 / 7.0);
+    assert_eq!(f["eval_equals_bloom_testable"], 2.0);
+    // Cells: 9 values. "omeg" scans all 9 under both; "phab" 9 in full and
+    // b1's 3 under the summary.
+    assert_eq!(f["summary/like/cells_tested_share"], 12.0 / 18.0);
+    assert_eq!(f["contains/like/cells_tested_per_row"], 1.0);
+}
+
+#[test]
+fn measure_learns_grams_only_from_the_training_literals() {
+    let b = blocks(8);
+    let t = block_texts(&b).expect("texts");
+    let spec = subject(unpredicted());
+    let w = workload::draw(&b, &t, &spec.workload_params()).expect("draw");
+    let truth = Truth {
+        blocks: &b,
+        equals_short_by_one: false,
+        contains_drops_a_row: false,
+    };
+    let grams_of = |set: &[Literal]| {
+        let mut out = std::collections::BTreeSet::new();
+        for l in set {
+            summary::for_each_gram(l.text.as_bytes(), spec.gram_len, |k| {
+                out.insert(k);
+            });
+        }
+        out
+    };
+    let training = grams_of(&w.training);
+    let evaluation_only: Vec<u64> = grams_of(&w.evaluation)
+        .difference(&training)
+        .copied()
+        .collect();
+    // An evaluation-only gram absent from some block would be learned if the
+    // evaluation literals fed the build.
+    assert!(
+        evaluation_only.iter().any(|&k| b.iter().any(|block| {
+            let mut has = false;
+            for v in block {
+                summary::for_each_gram(v, spec.gram_len, |g| has |= g == k);
+            }
+            !has
+        })),
+        "the fixture cannot tell training from evaluation grams"
+    );
+    let r = measure(&spec, &input(&b, &t, &w), &truth).expect("measure");
+    assert!(!r.layout.learned.is_empty());
+    for k in &r.layout.learned {
+        assert!(
+            training.contains(k),
+            "learned gram {k:#x} is not a training gram"
+        );
+    }
+    assert_eq!(by_key(&r)["candidate_grams"], training.len() as f64);
+}
+
 #[test]
 fn measure_refuses_a_contains_baseline_that_disagrees_with_the_truth() {
     let b = blocks(8);
@@ -343,12 +484,18 @@ fn overall_needs_every_subject_once_go_and_without_problems() {
             line: String::new(),
         },
         problems,
+        misses: 0,
     };
     let names = vec!["a".to_string(), "b".to_string()];
-    assert!(overall(&names, &[saved("a", true, 0), saved("b", true, 0)]).go);
+    let all_go = [saved("a", true, 0), saved("b", true, 0)];
+    assert!(overall(&names, &all_go).go);
+    assert!(complete(&names, &all_go));
+    // A NO-GO subject makes a complete NO-GO decision.
+    let no_go = [saved("a", true, 0), saved("b", false, 0)];
+    assert!(!overall(&names, &no_go).go);
+    assert!(complete(&names, &no_go));
     for set in [
         vec![saved("a", true, 0)],
-        vec![saved("a", true, 0), saved("b", false, 0)],
         vec![saved("a", true, 0), saved("b", true, 1)],
         vec![
             saved("a", true, 0),
@@ -362,8 +509,10 @@ fn overall_needs_every_subject_once_go_and_without_problems() {
         ],
     ] {
         assert!(!overall(&names, &set).go);
+        assert!(!complete(&names, &set));
     }
     assert!(!overall(&[], &[]).go);
+    assert!(!complete(&[], &[]));
 }
 
 #[test]
@@ -382,4 +531,5 @@ fn saved_decision_reads_back_a_written_report() {
     let back = saved_decision(&json).expect("read back");
     assert_eq!(back.decision, r.decision);
     assert_eq!(back.problems, 0);
+    assert_eq!(back.misses, 0);
 }
