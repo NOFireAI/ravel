@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::DFSchema;
-use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::expr_rewriter::unnormalize_col;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 #[cfg(feature = "flight-sql")]
@@ -441,29 +441,32 @@ impl LogsTableProvider {
             .with_key_equals(Arc::new(pushdown.key_equals.clone()))
             .with_scan_executions(self.scan_executions.clone())
             .with_scan_budget(self.scan_budget.clone())
-            .with_key_index_route(self.scan_key_index_route(&segments, pushdown)?);
+            .with_key_index_route(self.scan_key_index_route(&segments, pushdown));
         Ok(Arc::new(scan))
     }
 
     /// The router's inputs re-aligned to `segments`, the scan's subset of the
-    /// snapshot. `None` without a declared-key equality or without parts.
+    /// snapshot. `None` without a declared-key equality, without parts, or
+    /// with parts that do not line up with the snapshot, which leaves every
+    /// segment to tier 1.
     fn scan_key_index_route(
         &self,
         segments: &[SegmentRef],
         pushdown: &LogsPushdown,
-    ) -> DFResult<Option<Arc<LogsKeyIndexRoute>>> {
-        let Some(ctx) = &self.key_index_route else {
-            return Ok(None);
-        };
+    ) -> Option<Arc<LogsKeyIndexRoute>> {
+        let ctx = self.key_index_route.as_ref()?;
         if pushdown.key_equals.is_empty() {
-            return Ok(None);
+            return None;
         }
         let segment_count = self.snapshot.segments.len();
         if ctx.parts.origin.len() != segment_count {
-            return Err(DataFusionError::Internal(format!(
-                "logs key-index route: {} part origins for {segment_count} segments",
-                ctx.parts.origin.len()
-            )));
+            tracing::warn!(
+                origins = ctx.parts.origin.len(),
+                segments = segment_count,
+                "logs key-index route: part origins do not match the snapshot's segments; \
+                 the scan is left to tier 1"
+            );
+            return None;
         }
         let by_key: HashMap<&str, _> = self
             .snapshot
@@ -476,11 +479,11 @@ impl LogsTableProvider {
             .iter()
             .map(|s| by_key.get(s.data_object_key.as_str()).copied().flatten())
             .collect();
-        Ok(Some(Arc::new(LogsKeyIndexRoute {
+        Some(Arc::new(LogsKeyIndexRoute {
             catalog: Arc::clone(&ctx.catalog),
             parts: SnapshotParts::new(ctx.parts.parts.clone(), origin),
             max_probed_parts: ctx.max_probed_parts,
-        })))
+        }))
     }
 
     /// Segments whose event-time span overlaps the extracted ts bounds.

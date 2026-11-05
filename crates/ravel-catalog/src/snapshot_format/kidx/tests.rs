@@ -436,7 +436,8 @@ fn a_failed_get_rejects_the_leaf_as_a_read_failure() {
 #[test]
 fn format_constants_and_bucket_bits_balance_are_pinned() {
     assert_eq!(&KEY_INDEX_LEAF_MAGIC, b"RKI1");
-    assert_eq!(KEY_INDEX_LEAF_FORMAT_VERSION, 1);
+    assert_eq!(KEY_INDEX_LEAF_FORMAT_VERSION, 2);
+    assert_eq!(KEY_INDEX_LEAF_FORMAT_VERSION_1, 1);
     assert_eq!(KEY_INDEX_LEAF_MIN_BUCKET_BITS, 1);
     assert_eq!(KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS, 13);
     assert_eq!(KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS, 16);
@@ -445,6 +446,55 @@ fn format_constants_and_bucket_bits_balance_are_pinned() {
     assert_eq!(choose_key_index_bucket_bits(1_200_000), 9);
     assert_eq!(choose_key_index_bucket_bits(256 << 20), 13);
     assert_eq!(choose_key_index_bucket_bits(u64::MAX), 13);
+}
+
+#[test]
+fn version_one_is_refused_for_logs_and_answers_for_spans() {
+    assert!(key_index_leaf_version_accepted(Signal::Logs, 2));
+    assert!(key_index_leaf_version_accepted(Signal::Spans, 2));
+    assert!(key_index_leaf_version_accepted(Signal::Spans, 1));
+    assert!(!key_index_leaf_version_accepted(Signal::Logs, 1));
+    assert!(!key_index_leaf_version_accepted(Signal::Spans, 3));
+    assert!(!key_index_leaf_version_accepted(Signal::Spans, 0));
+
+    let f = fixture();
+    let expected = KeyIndexLeafProbe::Matches {
+        matches: matches(&[(1, &[0, 3, 7]), (4, &[2, 5])]),
+        uncovered_entry_ordinals: UNCOVERED.to_vec(),
+    };
+    for signal in [Signal::Logs, Signal::Spans] {
+        let leaf = encode_key_index_leaf_with_bucket_bits(
+            &KeyIndexLeafInput {
+                signal,
+                ..input(f.part, &f.entries, &UNCOVERED)
+            },
+            FIXTURE_BUCKET_BITS,
+            &KeyIndexLeafLimits::default(),
+        )
+        .expect("encode");
+        let req = KeyIndexLeafRequest {
+            signal,
+            ..request(&f.part)
+        };
+        let v1 = restamp_key_index_leaf_version(&leaf.bytes, 1).expect("restamp");
+        let summary = verify_key_index_leaf(&v1.bytes, &KeyIndexLeafLimits::default())
+            .expect("a version-1 leaf is well formed for every signal");
+        assert_eq!(summary.header.format_version, 1);
+        assert_eq!(summary.leaf_ref(), v1.leaf_ref);
+
+        let (v2_probe, _) = probe(&leaf.bytes, &leaf.leaf_ref, &req, &f.alpha);
+        assert_eq!(v2_probe, expected, "{signal:?} version 2");
+        let (v1_probe, reads) = probe(&v1.bytes, &v1.leaf_ref, &req, &f.alpha);
+        if signal == Signal::Logs {
+            assert_eq!(
+                v1_probe,
+                KeyIndexLeafProbe::Rejected(KeyIndexLeafRejection::UnsupportedVersion(1))
+            );
+            assert_eq!(reads.len(), 1, "refused on the prefix GET");
+        } else {
+            assert_eq!(v1_probe, expected, "{signal:?} version 1");
+        }
+    }
 }
 
 #[test]
@@ -1059,15 +1109,15 @@ fn every_prefix_corruption_is_a_typed_rejection() {
 
     let part = part_hash(b"hand");
     let (result, _) = probe_with(
-        &with(&|h| h.format_version = 2).0,
-        &with(&|h| h.format_version = 2).1,
+        &with(&|h| h.format_version = 3).0,
+        &with(&|h| h.format_version = 3).1,
         &request(&part),
         &k,
         &limits,
     );
     assert_eq!(
         result.expect("no breach"),
-        KeyIndexLeafProbe::Rejected(KeyIndexLeafRejection::UnsupportedVersion(2))
+        KeyIndexLeafProbe::Rejected(KeyIndexLeafRejection::UnsupportedVersion(3))
     );
     expect_rejected(
         &with(&|h| h.bucket_bits = 17),

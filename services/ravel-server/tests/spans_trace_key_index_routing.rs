@@ -7,7 +7,9 @@
 //! folded into a catalog part before the lookup. The expected reads of each
 //! object are computed from its bytes with `ravel_rspan`'s ranged reader,
 //! independently of the fetcher under test, and compared with what the store
-//! actually served.
+//! actually served. One case also builds `trace_id` leaves for the part and
+//! restamps them to format_version 1, which spans still accept (ADR-3692,
+//! amendment for issue #3703).
 
 #![cfg(feature = "sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -20,7 +22,10 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use clap::Parser;
-use ravel_catalog::{AbsentPolicy, append_generation, validate_or_adopt};
+use ravel_catalog::{
+    AbsentPolicy, Catalog, CatalogConfig, KEY_INDEX_LEAF_FORMAT_VERSION_1, KeyIndexRebuildOptions,
+    append_generation, decode_head, encode_head, restamp_key_index_leaf_version, validate_or_adopt,
+};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
@@ -28,8 +33,9 @@ use ravel_ingest::shard_for_span;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
-    PageToken, PutOptions, PutOutcome, StoreError,
+    PageToken, PutMode, PutOptions, PutOutcome, StoreError,
 };
+use ravel_proto::catalog::v1::SnapshotKeyIndexLeafRef;
 use ravel_query::http::StaticBearerTokenResolver;
 use ravel_rspan::footer::{DEFAULT_MAX_SECTION_UNCOMP, kind};
 use ravel_rspan::{RspanRangeReader, SpanSegError, TraceKeyProbe};
@@ -835,4 +841,142 @@ async fn trace_lookup_key_index_phase_counts_the_probe_decoded_bytes() {
         decoded.iter().sum::<u64>() < key_reads.iter().map(len).sum::<u64>(),
         "{decoded:?}"
     );
+}
+
+/// Builds `trace_id` leaves for the folded parts with the rebuild, then
+/// repoints every part's refs at the same leaves restamped to format_version
+/// 1, each PUT at its own content-addressed key. Returns those keys.
+async fn swap_in_version_one_leaves(store: &Arc<dyn ObjectStoreBackend>) -> Vec<String> {
+    let tenant = TenantId::new(TENANT).hash();
+    let report = Catalog::new(
+        Arc::clone(store),
+        CatalogConfig {
+            shard_count: 2,
+            byte_cache_max_bytes: 0,
+            build_key_index_leaves: true,
+            ..ravel_server::query::server_catalog_config_base()
+        },
+    )
+    .expect("catalog")
+    .rebuild_key_index(&tenant, Signal::Spans, &KeyIndexRebuildOptions::default())
+    .await
+    .expect("rebuild");
+    assert!(report.leaves_written > 0, "{report:?}");
+    let head_key = format!(
+        "t/{}/catalog/{}/HEAD",
+        tenant.to_hex(),
+        Signal::Spans.key_prefix()
+    );
+    let current = store.get(&head_key, GetRange::Full).await.expect("HEAD");
+    let mut head = decode_head(&current.data).expect("decode HEAD");
+    let mut keys = Vec::new();
+    for part in &mut head.parts {
+        assert!(!part.key_index.is_empty(), "every part has a leaf");
+        let mut refs = Vec::new();
+        for leaf in &part.key_index {
+            let bytes = store
+                .get(&leaf.key, GetRange::Full)
+                .await
+                .expect("leaf")
+                .data;
+            let v1 = restamp_key_index_leaf_version(&bytes, KEY_INDEX_LEAF_FORMAT_VERSION_1)
+                .expect("restamp");
+            let (dir, name) = leaf.key.rsplit_once('/').expect("leaf key directory");
+            let (hour, _) = name.split_once('.').expect("leaf key hour");
+            let key = format!("{dir}/{hour}.{}.kidx", hex(&v1.leaf_ref.blake3[..8]));
+            assert_ne!(key, leaf.key);
+            store
+                .put(&key, Bytes::from(v1.bytes), PutOptions::create_if_absent())
+                .await
+                .expect("put the version 1 leaf");
+            keys.push(key.clone());
+            refs.push(SnapshotKeyIndexLeafRef { key, ..v1.leaf_ref });
+        }
+        part.key_index = refs;
+    }
+    store
+        .put(
+            &head_key,
+            Bytes::from(encode_head(&head).expect("encode HEAD")),
+            PutOptions {
+                mode: PutMode::CasVersion(current.version),
+                checksum: None,
+            },
+        )
+        .await
+        .expect("swap the refs");
+    keys
+}
+
+/// Spans leaves at format_version 1 still route: the spans KEY_IDX writer
+/// resolved every key like its reader from version 1 on, so the leaf the
+/// fold built over it never had the logs hidden-scalar gap. The three
+/// objects the version 1 leaf proves absent are never read, and the holder
+/// is read with no KEY_IDX read.
+///
+/// FLIP: rejecting version 1 for spans in `key_index_leaf_version_accepted`
+/// leaves the part uncovered: every object probes its own KEY_IDX and the
+/// "a pruned object is never read" assertion fails.
+#[tokio::test]
+async fn a_spans_version_one_leaf_still_prunes_and_opens_only_the_holder() {
+    let trace = trace_routed(1, 0);
+    let specs = [
+        ObjectSpec {
+            shard: 0,
+            hour: 0,
+            spans: bracket(&trace),
+        },
+        ObjectSpec {
+            shard: 1,
+            hour: 0,
+            spans: vec![(trace, "t-0"), (trace, "t-1"), (trace, "t-2")],
+        },
+        ObjectSpec {
+            shard: 0,
+            hour: 1,
+            spans: bracket(&trace),
+        },
+        ObjectSpec {
+            shard: 1,
+            hour: 1,
+            spans: bracket(&trace),
+        },
+    ];
+    let (recorder, app, objects) = serve(RESHARD_2_TO_3, NOW_NS, &specs).await;
+    let want: Vec<ExpectedReads> = objects
+        .iter()
+        .map(|o| expected_reads(&o.bytes, &trace))
+        .collect();
+    let store: Arc<dyn ObjectStoreBackend> = recorder.clone();
+    let leaves = swap_in_version_one_leaves(&store).await;
+    recorder.clear();
+
+    let value = lookup(&app, NOW_NS, &trace).await;
+    assert_eq!(
+        value["data"]["rows"],
+        serde_json::json!([["t-0"], ["t-1"], ["t-2"]]),
+        "{value}"
+    );
+    for (object, want) in objects.iter().zip(&want) {
+        let got = recorder.take(&object.key);
+        if want.present {
+            assert!(!got.is_empty(), "{}: the holder is read", object.key);
+            assert!(
+                !got.iter().any(|r| want.key_index.contains(r)),
+                "{}: the holder's KEY_IDX is never read: {got:?}",
+                object.key
+            );
+        } else {
+            assert!(
+                got.is_empty(),
+                "{}: a pruned object is never read: {got:?}",
+                object.key
+            );
+        }
+    }
+    for leaf in &leaves {
+        assert!(!recorder.take(leaf).is_empty(), "{leaf} was probed");
+    }
+    assert_eq!(pruning(&value, "segmentsPrunedByKeyIndex"), 3, "{value}");
+    assert_eq!(value["stats"]["keyIndex"]["leavesRejected"], 0, "{value}");
 }

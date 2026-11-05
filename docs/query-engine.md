@@ -5118,9 +5118,43 @@ segment routes:
   a statement pool too small for a leaf's decoded bound is too small for the
   tier-1 scan too.
 
-Flight SQL (the pinned path, and the distributed and worker scans) and
-`EXPLAIN` do not route logs: their logs scans carry no parts and take the
-tier-1 routes above.
+A logs leaf at `format_version` 1 is rejected (`leavesRejected` 1, the
+`rejected` outcome) and its part reads uncovered: a version 1 leaf may
+predate the fold's version 1 section check and prove absent a key its
+part holds. Spans still accept version 1 (ADR-3692, the leaf format version 2
+amendment; docs/catalog-and-mvcc.md, "Per-part
+key-index leaves"; `a_logs_version_one_leaf_is_rejected_and_the_part_reads_uncovered`,
+`a_spans_version_one_leaf_still_prunes_and_opens_only_the_holder`). A
+leaf range the log fetcher's memory budget refuses before its GET is a
+refused reservation (`reservationsRefused`), not a rejected leaf
+(`a_refused_log_leaf_fetch_counts_as_a_refused_reservation`). The scan
+routes once per statement: a plan pass DataFusion retries reuses the
+first pass's routes and figures (`a_retried_plan_pass_routes_once`). Part
+origins that do not match the pinned snapshot's segments, which the
+executor never produces, degrade the scan to tier 1 with a warning rather
+than failing the statement. A `Blocks` segment at or under the
+whole-object bound is opened whole and unplanned, so its rows are still
+returned when the plan pass skips it
+(`a_sub_bound_block_set_opens_the_holder_unplanned`).
+
+The logs lane routes on exactly the surfaces whose executor entry passes
+the resolve's parts on (`SqlExecutor::run` in
+`crates/ravel-sql/src/executor.rs`, which takes them from the lane):
+
+- SQL over HTTP, `POST /api/v1/sql` (`QueryService::sql_execute` in
+  `services/ravel-server/src/service/mod.rs`, through
+  `execute_accounted_at`).
+- ES|QL, `POST /api/v1/esql` (`execute_statement_accounted`, called from
+  `crates/ravel-sql/src/esql/run.rs`).
+- MCP tools that run SQL, `search_logs` among them (`sql_execute` in
+  `services/ravel-server/src/mcp/service_impl.rs`, which calls
+  `QueryService::sql_execute_at`; `search_logs` in
+  `crates/ravel-mcp/src/tools/search_logs.rs` calls it).
+
+Flight SQL, the pinned path and the distributed and worker scans alike
+(`plan_checked_lanes` in `crates/ravel-sql/src/executor.rs`), and
+`EXPLAIN` (`explain_inner`, same file) pass no parts: their logs scans
+take the tier-1 routes above.
 
 The parts are charged to the catalog's memory budget with the snapshot
 (`Catalog::resolve_pruned_with_parts` reserves their handles' heap bytes).

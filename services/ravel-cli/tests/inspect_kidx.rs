@@ -85,7 +85,7 @@ fn scratch() -> tempfile::TempDir {
 // body_uncompressed_len is the five entries' encoded sizes: 13 + 11 + 12 +
 // 11 + 11. Four distinct keys over eight buckets leave four empty.
 const GOLDEN_HEADER: &str = "\
-format_version: 1
+format_version: 2
 tenant_hash: 11111111111111111111111111111111
 signal: 2 (Logs)
 part_blake3: 2222222222222222222222222222222222222222222222222222222222222222
@@ -100,7 +100,7 @@ uncovered_entry_ordinals: [3, 6]
 body_len: 142
 prefix_len: 148
 size: 290
-blake3: ca7633f6e4c56394f4df4ae4c5da96ea53f20df604185ae6fc653d1805b244b4
+blake3: 3d096b13169ec1b41dc3466d290440ac628f957c58f49487e363fda3569a279d
 body_uncompressed_len: 58
 buckets: 8 min=0 median=0 max=2 empty=4
 ";
@@ -219,7 +219,7 @@ fn one_partial_slice_inspects_alone_but_not_beside_a_gap() {
     let output = run_inspect(&slice, true);
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).expect("utf-8");
-    assert!(stdout.starts_with("format_version: 1\n"), "{stdout}");
+    assert!(stdout.starts_with("format_version: 2\n"), "{stdout}");
     assert!(
         stdout.contains("key8_lo: 0x0000000000000000\nkey8_hi: 0x0000000000000063\n"),
         "{stdout}"
