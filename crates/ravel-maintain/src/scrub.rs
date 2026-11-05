@@ -58,9 +58,11 @@ use crate::clock::Clock;
 use crate::read_gate::MaintainReadGate;
 use ravel_cpu_gate::ReadSite;
 
-/// Suffix size probed to locate a footer in the structural tier. Matches
-/// [`crate::config::DEFAULT_FOOTER_PROBE_BYTES`]; a footer larger than this
-/// costs one extra ranged GET, exactly as the compactor's own footer read does.
+/// Suffix size probed to locate a footer in the structural tier. Set apart from
+/// [`crate::config::DEFAULT_FOOTER_PROBE_BYTES`]: this tier reads only the
+/// footer, while the compactor's probe is sized to carry its catalog sections
+/// too. A footer larger than this costs one extra ranged GET, exactly as the
+/// compactor's own footer read does.
 const FOOTER_PROBE_BYTES: u64 = 64 * 1024;
 
 /// The covering name-postings object for the postings tier, plus the minimal
