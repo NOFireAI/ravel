@@ -825,6 +825,18 @@ fn accumulator_widths(expr: &AggregateFunctionExpr) -> Option<Vec<usize>> {
     match expr.fun().name() {
         // `CountGroupsAccumulator`: one `i64` per group.
         "count" => Some(vec![8]),
+        // Ravel's checked integer `SUM`: one exact `i128` per group (its
+        // presence bitmap is an eighth of a byte per group, inside the step
+        // tolerance).
+        "sum"
+            if expr.state_fields().ok()?.iter().any(|field| {
+                field
+                    .name()
+                    .ends_with(crate::checked_sum::CHECKED_SUM_STATE_SUFFIX)
+            }) =>
+        {
+            Some(vec![16])
+        }
         // `PrimitiveGroupsAccumulator` over the return type.
         "sum" | "min" | "max" => Some(vec![return_type.primitive_width()?]),
         "avg" => {

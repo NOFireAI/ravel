@@ -147,6 +147,7 @@ use crate::audit_provider::AuditTableProvider;
 use crate::avg::sequential_avg_udaf;
 use crate::bounded_topk::BoundedTopKAggregate;
 use crate::bucketed_final_aggregate::BucketedFinalAggregateRule;
+use crate::checked_sum::checked_sum_udaf;
 use crate::compact_slices::CompactSlices;
 use crate::config::SqlConfig;
 use crate::group_keys::DictionaryGroupKeysAsViews;
@@ -1013,8 +1014,16 @@ pub fn build_session_with_tables(
     // in deterministic order rather than arrow's lane-parallel batch sum. avg
     // stays in `ADMITTED_AGGREGATES` so the loop above keeps the built-in until
     // this line replaces it. This is independent of the public `sum` UDAF,
-    // which is untouched (ADR-0024).
+    // whose float reduction is ADR-0024's subject.
     ctx.register_udaf(sequential_avg_udaf());
+    // Replace the built-in sum with the checked integer sum (ADR-0022,
+    // integer-sum amendment; issue #3838): the built-in adds integers with
+    // wrapping arithmetic, so an overflowing total came back as a wrong value.
+    // Integer results are summed exactly and fail with
+    // `SqlError::IntegerSumOverflow` when the total leaves the result type;
+    // float, decimal and every other argument type delegates to the wrapped
+    // built-in unchanged.
+    ctx.register_udaf(checked_sum_udaf());
     // Replace the built-in regexp_replace with one that compiles a constant
     // pattern once per session instead of once per batch (epic #3231); every
     // other argument shape runs the built-in. It stays in `ADMITTED_SCALARS`,
