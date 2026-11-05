@@ -77,17 +77,20 @@ measurement and is decided conditionally (decision 6).
 ### What exists on main, and what does not
 
 - **The resolve narrows by time only, plus `__name__` postings when
-  every plan shares one name.** A `SegmentRef` carries time bounds,
+  every plan shares one name key.** A `SegmentRef` carries time bounds,
   counts and identity, no label or series summary
-  (`crates/ravel-catalog/src/snapshot.rs:40-104`); `include_l0_if_overlaps`
-  filters on time (`crates/ravel-catalog/src/catalog.rs:4079`); the RNP1
+  (`crates/ravel-catalog/src/snapshot.rs:43-104`); `include_l0_if_overlaps`
+  filters on time (`crates/ravel-catalog/src/catalog.rs:4179`); the RNP1
   postings map `__name__` to entry ordinals and nothing else
   (`crates/ravel-catalog/src/snapshot_format/postings.rs:1-21`); the
-  engine applies them only as a shared equality name
-  (`crates/ravel-query/src/engine.rs:3849`). `CompactionPart` carries
+  engine applies them when every selector shares one pruning key, an
+  exact `__name__` value or a literal-prefix-anchored regex such as
+  `^foo.*$` (ADR-0061 decision 3; `name_pruning_key`,
+  `equality_name_filter` and `shared_equality_name_filter` at
+  `crates/ravel-query/src/engine.rs:3881-3921`). `CompactionPart` carries
   `first_series_id` and `last_series_id` (`proto/ravel/commit.proto:99-100`)
   and neither the L1 `SegmentRef` nor the snapshot entry keeps them
-  (`catalog.rs:4805-4858`, `crates/ravel-catalog/src/fold.rs:582`).
+  (`catalog.rs:4905`, `crates/ravel-catalog/src/fold.rs:582`).
   Segments above the fold watermark (`Recent`) are never pruned by
   postings (`snapshot.rs:131-137`); in the F3 and R6 unfolded read-backs
   every segment was `Recent`.
@@ -104,9 +107,9 @@ measurement and is decided conditionally (decision 6).
   is a flat string dictionary of every label name and value in the object
   (`docs/segment-format.md:224-235`).
 - **Metrics have no key index.** ADR-2707 scopes metrics out
-  (`docs/adrs/2707-exact-key-index-for-spans-and-logs.md:697-705`);
+  (`docs/adrs/2707-exact-key-index-for-spans-and-logs.md:707`);
   `declared_key_index_fields` is `None` for metrics
-  (`fold.rs:1166-1183`). ADR-0020 rejected a label index because "build
+  (`fold.rs:1225-1242`). ADR-0020 rejected a label index because "build
   cost is a full catalog decode of every segment, size is unbounded"
   (`docs/adrs/0020-metric-index.md:50-55`). The first premise no longer
   holds: the fold already GETs every newly sealed object whole to derive
@@ -114,7 +117,7 @@ measurement and is decided conditionally (decision 6).
   `build_postings` at `fold.rs:4685`).
 - **The L1 read reserves a whole call at once.** `ensure_ranges` sums every
   coalesced run of a call and reserves the total before any GET
-  (`fetcher.rs:1655`, the 161,598,421-byte request of #3818); ADR-1170
+  (`fetcher.rs:1697-1701`, the 161,598,421-byte request of #3818); ADR-1170
   requires a refusal before the fetch rather than a smaller fetch or a
   partial result, and releases a reservation when its buffer drops, never
   earlier. Two fix rounds on #3818 did not land: one capped runs that were
@@ -135,7 +138,8 @@ measurement and is decided conditionally (decision 6).
 - **Exact pushdown is narrow by decision.** ADR-0103 pushes
   `count_over_time` only; `min_over_time` and `max_over_time` were excluded
   because `total_cmp` differs from PromQL's NaN and signed-zero handling
-  (`docs/adrs/0103-aggregation-pushdown.md:355-410`). ADR-0913's `.magg`
+  (`docs/adrs/0103-order-insensitive-aggregation-pushdown.md:393-410`).
+  ADR-0913's `.magg`
   states bind to the exact blake3 of the snapshot part they cover and are
   logs-only and unimplemented. Any answer from precomputed state is refused
   while an erasure is pending (ADR-0850 lemma, ADR-0913 section 2d).
@@ -149,15 +153,23 @@ measurement and is decided conditionally (decision 6).
   new encodings under a version bump. `codec_bakeoff` already carries the
   adoption rule: at most 75 % of current bytes and decode no slower
   (`crates/ravel-bench/src/bin/codec_bakeoff.rs:33-39`).
-- **The accounting is per phase already.** `data.stats.phases` splits
-  requests, wire bytes, cache hits and decompressed bytes into resolve,
-  plan, probe, scan and keyIndex
-  (`crates/ravel-query/src/phase_accounting.rs:16-31`); `segmentsFetched`
+- **The accounting is per phase already, on the statement's own stats.**
+  `data.stats.phases` splits requests, wire bytes, cache hits and
+  decompressed bytes into resolve, plan, probe, scan and keyIndex
+  (`crates/ravel-query/src/phase_accounting.rs:16-31`), and the resolve's
+  commit-record GETs are charged to the statement's resolve handle on the
+  unfolded path too (`engine.rs:2437` passes `first_accounting.resolve()`
+  into `resolve_bounded`; every record GET goes through the accounted
+  funnel at `crates/ravel-catalog/src/catalog.rs:1349`). `segmentsFetched`
   is the post-prune snapshot size and `unfoldedSegmentsResolved` the
-  `Recent` count (`engine.rs:71-73`, `crates/ravel-query/src/io_shape.rs:139-152`).
-  What it lacks is a count of segments each prune source removed on
-  metrics, and the resolve's own commit-record GETs are not attributed to
-  the statement on the unfolded path.
+  `Recent` count (`engine.rs:77`, `crates/ravel-query/src/io_shape.rs:139-152`).
+  What is missing is a count of segments each prune source removed on
+  metrics, and a harness that reads the statement's stats: the #2821
+  read-back readout (comment 6583379446) inferred the query's GETs from
+  process-wide store counters around the read-back window, which cannot
+  separate the query from a concurrent fold, because the kit records
+  `data.stats` for corpus statements (`ravel_cost`) and not for its own
+  read-back queries.
 
 ### What the 90-minute evidence cannot say
 
@@ -239,10 +251,17 @@ ADR-2707 and ADR-3692 already impose on logs and spans leaves.
   (decision 1) and the exact decode still run on survivors.
 - **Object.** The leaf is the ADR-2707 leaf object under
   `catalog/m/idx/`, referenced from `SnapshotPartRef.key_index` (field 8),
-  with `block_set` empty for every entry: a metrics leaf names entries,
-  not blocks. `declared_key_index_fields` returns the one field for
-  metrics instead of `None`. No proto field is added; the key layout gains
-  no prefix.
+  at `KEY_INDEX_LEAF_FORMAT_VERSION` 1 as it is. Every entry carries the
+  one-block set `{0}`: the encoder refuses an empty block set
+  (`crates/ravel-catalog/src/snapshot_format/kidx.rs:321-326`) and
+  docs/catalog-and-mvcc.md lists one as leaf corruption, so a metrics leaf
+  is legal to every existing reader and writer, and block ordinal 0 is
+  defined, for a signal whose objects have no block structure the leaf
+  addresses, as "the object". T3 writes that sentence into
+  docs/catalog-and-mvcc.md "Per-part key-index leaves" beside the metrics
+  field. `declared_key_index_fields` returns the one field for metrics
+  instead of `None`. No proto field is added, the leaf format version does
+  not move, and the key layout gains no prefix.
 - **Build.** Only when `metrics_label_index` (new fold setting, default
   off until the Stage 1 amendment, the same rule as ADR-3692 decision 5)
   is on, and under ADR-3692's pair budget and pass accounting. A part whose
@@ -269,9 +288,16 @@ with a `KeySet` of the statement's positive equality values, field
 `label_value`, over the pinned snapshot's covering parts and their field 8
 refs (ADR-3692 decision 1's `SnapshotParts`). Per part the router's
 answer maps to: every entry of the part dropped (`Pruned`), or the part's
-entries kept (`Blocks` with an empty set, or `Uncovered`). The router's
-`L_max`, `P_max`, `B_run` and admission order apply unchanged; a metrics
-statement never asks for more than one key per matcher.
+entries kept (`Blocks` or `Uncovered`). The metrics consumer never pushes
+a `Blocks` list as a read list: to the spans and logs consumers `Blocks`
+means "read these blocks instead of the SKIP_IDX candidates"
+(`crates/ravel-query/src/key_index_route.rs:107-115`,
+`crates/ravel-sql/src/spans_provider.rs:413-416`), and a metrics object
+has no blocks to read, so for metrics `Blocks` (always `{0}` by decision 2)
+and `Uncovered` are the same answer, keep the entry and let decision 1
+decide. The router's `L_max`, `P_max`, `B_run` and admission order apply
+unchanged; a metrics statement never asks for more than one key per
+matcher.
 
 - A compound query with several selectors routes each selector once over
   the padded union window the prefetch already resolves, and takes the
@@ -291,7 +317,13 @@ statement never asks for more than one key per matcher.
 `ensure_ranges` stops reserving the sum of a call's runs. The call is cut
 into batches of at most `fetch_batch_bytes = memory_budget.limit() /
 (2 x get permits)` (predicted; a floor of 8 MiB keeps a single large run
-whole, never split), each batch reserved, fetched, decoded into the
+whole, never split, so a call's reservation is bounded by the larger of
+the batch and its largest run; a run is one timestamp page and one value
+page, each under the 64 MiB reader page cap at
+`crates/ravel-segment/src/format.rs:364`, so that bound is at most 128 MiB
+against the frozen 6.4 GB budget, and #3818's runs were about 5 MB:
+161,598,421 bytes over about 32 runs), each batch reserved, fetched,
+decoded into the
 sample fold, whose own ledger charges what it retains (#3768's
 `RunFold::reserve_retained`), and only then dropped, which releases it.
 The next batch reserves after the drop. A call holds at most one batch's
@@ -312,12 +344,15 @@ next reserve rather than release before drop.
   run decode of an L1 part for a sub-hour window is measured in the same
   row and not changed here; decision 6 inherits it as a constraint.
 
-### 5. Cost is attributed per phase on every path, and the fold state is stamped
+### 5. Cost is read from the statement, and the fold state is stamped
 
-- The unfolded resolve's commit-record GETs count under `resolve` for the
-  statement that issued them, as the folded resolve's part GETs do. A
-  per-statement figure that pooled them with a background fold was the
-  inference gap in #2821 comment 6583379446.
+- The MetricsBench read-back records each of its sample queries'
+  `data.stats` (phases, `segmentsFetched`, `unfoldedSegmentsResolved`)
+  the way `ravel_cost` already records them for corpus statements, so a
+  read-back figure is the statement's own and never an inference from
+  process-wide store counters (the gap behind #2821 comment 6583379446).
+  The engine's attribution itself is unchanged: resolve GETs already land
+  on the statement's resolve handle.
 - `segmentsPrunedByDictionary` and `segmentsPrunedByLabelIndex` join
   `segmentsPruned`; each phase keeps `decompressedOutputBytes`.
 - Every MetricsBench report row carries the catalog state the harness
@@ -458,11 +493,11 @@ objects that contain the statement's series.
 
 | task | decision | crates | depends on | risk |
 |---|---|---|---|---|
-| T1 `history` lane for Ravel in `deploy/metricsbench`: event-hour-shaped ingest (stride by event hour, stamped), cold regime per statement, the wave 0 pre-registration on #3694, then the run on one box | Stage 0, 5, 6 | deploy/metricsbench (shell), ravel-bench (report fields) | none | low |
+| T1 `history` lane figures in `deploy/metricsbench`: the object event-time spread file, a Ravel-only diagnostic cold pass for the long-range statements, the read-back queries' `data.stats` recorded, then the wave 0 pre-registration on #3694 and the run on one box | Stage 0, 5, 6 | deploy/metricsbench (shell), ravel-bench (report fields) | none | low |
 | T2 two-step probe: LABEL_DICT range alone, dictionary decode, drop on a miss, `segmentsPrunedByDictionary`; dictionary bytes measured and recorded | 1, 5 | ravel-segment (a dictionary-only decode entry), ravel-query (fetcher, stats) | none | medium |
 | T3 metrics leaf in the fold: `declared_key_index_fields` for metrics, `label_value` field, LABEL_DICT read, `metrics_label_index` setting, leaf byte cap, erasure gating in the fold, docs/catalog-and-mvcc.md | 2 | ravel-catalog (fold, snapshot_format, config), docs | ADR-3692 T3 and T6 landed on main (shared fold and router files; the dispatch guard refuses while their pull requests are open) | high |
 | T4 batched fetch reservation: `ensure_ranges` batches, decode-then-drop order, `open_segment` charged, the #3818 reproducer as a test, docs/query-engine.md | 4 | ravel-query (fetcher, engine/sample_fold) | T2 landed (same crate) | high |
-| T5 router on metrics: `KeySet` from the selector, `prefetch_metric_plans` wiring, `segmentsPrunedByLabelIndex`, resolve-phase attribution of commit-record GETs, the reachability test on `/api/v1/query_range` | 3, 5 | ravel-query (engine, key_index_route), ravel-server (tests) | T3, T4 landed | medium |
+| T5 router on metrics: `KeySet` from the selector, `prefetch_metric_plans` wiring, `segmentsPrunedByLabelIndex`, the reachability test on `/api/v1/query_range` | 3, 5 | ravel-query (engine, key_index_route), ravel-server (tests) | T3, T4 landed | medium |
 | T6 codec bakeoff: timestamp candidates first, DeXOR and vectorised ALP, stale-marker proptest rows, the report | 7 | ravel-bench (bakeoff binaries, codecs.rs), ravel-segment (proptest rows only) | none; not with T2 (ravel-segment) | low |
 | T7 operator matrix and differential oracle | 8 | ravel-promql (tests), docs | none | medium |
 | T8 Stage 1 run on real S3: rows 2 to 9 and 12, 13; acceptance amendment; `metrics_label_index` default on | all | docs, ravel-catalog (one default) | T2, T4, T5 | low |
