@@ -299,7 +299,12 @@ fn widen(leg: &mut LogsLeg, offered: usize) -> Before {
 /// keeps the whole envelope under the fit cap, then write the leg's real cap
 /// figures, which can only shorten what was measured. A leg left uncapped
 /// drops its step.
-fn place_logs(envelope: &mut Envelope, mut rows: Vec<Row>, before: Before, max_response_bytes: u64) {
+fn place_logs(
+    envelope: &mut Envelope,
+    mut rows: Vec<Row>,
+    before: Before,
+    max_response_bytes: u64,
+) {
     let offered = rows.len();
     let Before {
         omitted: omitted_before,

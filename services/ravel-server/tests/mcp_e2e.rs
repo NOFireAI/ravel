@@ -4358,7 +4358,11 @@ mod with_mcp {
             };
             let spans = read(&logs["span_lookup_budget"]["actual"][figure]);
             let leg = read(&logs["budget"]["actual"][figure]);
-            assert_eq!(read(&found["budget"]["actual"][figure]), spans + leg, "{figure}");
+            assert_eq!(
+                read(&found["budget"]["actual"][figure]),
+                spans + leg,
+                "{figure}"
+            );
         }
         assert!(
             logs["budget"]["actual"]["store_requests"]
