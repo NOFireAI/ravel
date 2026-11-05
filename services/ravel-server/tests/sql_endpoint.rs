@@ -2446,6 +2446,46 @@ async fn a_select_returns_json_rows() {
     assert_eq!(rows[1][1], serde_json::json!(2.5));
 }
 
+/// Issue #3838: an integer `sum` whose exact total does not fit `Int64` is a
+/// 422 naming the aggregate and its result type, not a 200 carrying a wrapped
+/// total. Two samples of `2^62` sum to `2^63`, one past `i64::MAX`; halving
+/// each sample shows the same data still sums when the total fits.
+#[tokio::test]
+async fn an_overflowing_integer_sum_is_a_422_not_a_wrapped_total() {
+    const TWO_POW_62: f64 = 4_611_686_018_427_387_904.0;
+    let app = one_tenant_app("m", &[(100, TWO_POW_62), (200, TWO_POW_62)]).await;
+
+    for sql in [
+        "SELECT sum(CAST(value AS BIGINT)) FROM samples",
+        "SELECT series_id, sum(CAST(value AS BIGINT)) FROM samples GROUP BY series_id",
+    ] {
+        let (status, value) = post_json(&app, "acme-token", sql).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{sql}: {value}");
+        assert_eq!(value["status"], "error", "{value}");
+        assert_eq!(value["errorType"], "execution", "{value}");
+        assert_eq!(
+            value["error"],
+            "aggregate sum overflowed its Int64 result type: the exact integer total is out \
+             of range, and no wrapped value is returned; cast the argument to DOUBLE for an \
+             approximate sum",
+            "{sql}: {value}"
+        );
+    }
+
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT sum(CAST(value AS BIGINT) / 2) FROM samples",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(
+        value["data"]["rows"][0][0],
+        serde_json::json!(4_611_686_018_427_387_904_i64),
+        "{value}"
+    );
+}
+
 /// `/api/v1/sql`'s JSON response is the one shipping surface for the
 /// per-phase accounting and I/O shape issue #1367 adds
 /// (`ravel_sql::stats_json::phase_costs_json`/`io_shape_json`, wired in by

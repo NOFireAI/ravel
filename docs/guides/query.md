@@ -719,6 +719,23 @@ Parquet rows whole. Beside a Parquet table, a `samples` filter on `__name__`
 does not prune segments by metric name: the `samples` scan reads every
 segment in the window.
 
+### Integer `sum` overflow
+
+`sum` over an integer column returns a `BIGINT` (`BIGINT UNSIGNED` for
+unsigned input) and is exact: it never returns a wrapped total. When the
+total does not fit the result type, the query fails with an HTTP 422,
+`errorType` `execution`, and the error `aggregate sum overflowed its Int64
+result type: the exact integer total is out of range, and no wrapped value
+is returned; cast the argument to DOUBLE for an approximate sum` (`UInt64`
+for unsigned input). Flight SQL returns the same text with
+`FAILED_PRECONDITION`. Only the final total is checked, so a total that fits
+is returned even if a running total passed the limit on the way. The check
+applies to `sum(DISTINCT ...)`, to a `FILTER` clause, and to a window
+`sum`, where each frame's total is checked. Arithmetic inside the argument
+is not checked: `sum(v * 2)` wraps in `v * 2` before the sum sees it. A
+`sum` over a `DOUBLE` or `DECIMAL` is unchanged. ES|QL's `STATS SUM` over a
+long reads null on overflow instead (see [ES|QL queries](#esql-queries)).
+
 ### `DISTINCT ON`
 
 `SELECT DISTINCT ON (...)` is supported only when its `ORDER BY` fully

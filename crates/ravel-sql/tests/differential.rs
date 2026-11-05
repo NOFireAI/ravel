@@ -113,8 +113,13 @@ mod util;
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use proptest::prelude::*;
+use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::memory::MemoryStore;
+use ravel_query::EngineConfig;
+use ravel_sql::{SqlConfig, SqlError};
 use ravel_types::TenantId;
 use util::gate::{
     Cell, Pred, Query, Row, Shape, ValuePool, actual_rows, arb_dataset, arb_pred,
@@ -375,6 +380,222 @@ proptest! {
                 "grouped and ungrouped min/max must agree bit for bit"
             );
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Checked integer sum (issue #3838, ADR-0022's integer sum amendment)
+// ---------------------------------------------------------------------------
+
+/// `2^62`: two of them sum to `2^63`, one past `i64::MAX`.
+const TWO_POW_62: f64 = 4_611_686_018_427_387_904.0;
+/// `2^63 - 1024`, the largest `f64` below `2^63`, so it casts to an `i64`.
+const NEAR_I64_MAX: f64 = 9_223_372_036_854_774_784.0;
+/// `-2^63`, which casts to `i64::MIN` exactly.
+const I64_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
+
+/// Integer-valued `f64`s that cast to `BIGINT` exactly, weighted towards the
+/// limits so that sums which overflow, sums which only pass the limit part
+/// way through, and sums which land exactly on it all occur.
+fn near_limit_integer_value() -> BoxedStrategy<f64> {
+    prop_oneof![
+        Just(NEAR_I64_MAX),
+        Just(-NEAR_I64_MAX),
+        Just(TWO_POW_62),
+        Just(-TWO_POW_62),
+        Just(I64_MIN_F64),
+        Just(1024.0f64),
+        Just(-1024.0f64),
+        (-3i64..4).prop_map(|n| n as f64),
+    ]
+    .boxed()
+}
+
+/// The oracle for `sum(CAST(value AS BIGINT))`: the exact total of one group,
+/// `None` for a group with no rows (SQL NULL).
+fn exact_integer_sum(values: &[f64]) -> Option<i128> {
+    let mut total: Option<i128> = None;
+    for value in values {
+        let as_int = *value as i64;
+        assert_eq!(as_int as f64, *value, "pool values cast exactly");
+        total = Some(total.unwrap_or(0) + i128::from(as_int));
+    }
+    total
+}
+
+/// What the engine must answer for the oracle's per-group totals: the rows,
+/// or `None` when any total is out of `Int64`, where the whole query fails.
+fn expected_integer_rows(totals: Vec<(Option<Vec<u8>>, Option<i128>)>) -> Option<Vec<Row>> {
+    totals
+        .into_iter()
+        .map(|(key, total)| {
+            let cell = match total {
+                None => Cell::Null,
+                Some(total) => Cell::Int(i64::try_from(total).ok()?),
+            };
+            Some(match key {
+                Some(key) => vec![Cell::Bytes(key), cell],
+                None => vec![cell],
+            })
+        })
+        .collect()
+}
+
+/// A fixture whose scan runs at `fetch_concurrency` partitions with the
+/// ADR-0094 parallel final aggregation on, so at more than one partition the
+/// checked sum's partial states are merged across partitions.
+async fn partitioned_fixture(
+    tenant: &TenantId,
+    specs: &[SegSpec],
+    fetch_concurrency: usize,
+) -> Fixture {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let config = SqlConfig {
+        engine: EngineConfig {
+            fetch_concurrency,
+            ..EngineConfig::default()
+        },
+        parallel_final_aggregation: true,
+        ..SqlConfig::default()
+    };
+    Fixture::build(store, &[(tenant, specs)], config, 1 << 30).await
+}
+
+/// Run `sql` and compare against `want`: the exact rows, or (for `None`) the
+/// typed overflow error.
+async fn assert_integer_sum(
+    fixture: &Fixture,
+    tenant: &TenantId,
+    sql: &str,
+    want: Option<Vec<Row>>,
+) {
+    let outcome = fixture.executor.execute(tenant.hash(), &request(sql)).await;
+    match (outcome, want) {
+        (Ok(outcome), Some(want)) => {
+            assert_eq!(actual_rows(&outcome.output), want, "for: {sql}");
+        }
+        (Err(SqlError::IntegerSumOverflow { result_type }), None) => {
+            assert_eq!(result_type, "Int64", "for: {sql}");
+        }
+        (Ok(outcome), None) => panic!(
+            "an overflowing integer sum returned {:?} for: {sql}",
+            actual_rows(&outcome.output)
+        ),
+        (Err(err), want) => panic!("for: {sql}\nwant {want:?}\ngot error {err:?}"),
+    }
+}
+
+/// Check one dataset and predicate at one partition count, ungrouped and
+/// grouped, against the exact-or-overflow oracle.
+async fn assert_checked_integer_sums(specs: &[SegSpec], pred: &Pred, fetch_concurrency: usize) {
+    let tenant = tenant_id("checked-sum");
+    let fixture = partitioned_fixture(&tenant, specs, fetch_concurrency).await;
+    let snapshot = fixture.snapshot(&tenant).await;
+    let reference = util::reference_rows(&fixture.fetcher, tenant.hash(), &snapshot).await;
+    let kept: Vec<&util::RefRow> = reference.iter().filter(|r| pred.eval(r)).collect();
+    let where_clause = pred.sql();
+
+    let values: Vec<f64> = kept.iter().map(|r| r.value).collect();
+    assert_integer_sum(
+        &fixture,
+        &tenant,
+        &format!("SELECT sum(CAST(value AS BIGINT)) FROM samples WHERE {where_clause}"),
+        expected_integer_rows(vec![(None, exact_integer_sum(&values))]),
+    )
+    .await;
+
+    let grouped = group_by_series(&kept)
+        .into_iter()
+        .map(|(sid, values)| (Some(sid.to_vec()), exact_integer_sum(&values)))
+        .collect();
+    assert_integer_sum(
+        &fixture,
+        &tenant,
+        &format!(
+            "SELECT series_id, sum(CAST(value AS BIGINT)) FROM samples WHERE {where_clause} \
+             GROUP BY series_id ORDER BY series_id"
+        ),
+        expected_integer_rows(grouped),
+    )
+    .await;
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// An integer `sum` returns the exact total when it fits `Int64` and
+    /// otherwise fails with the typed overflow error, never a wrapped value,
+    /// at one scan partition and at eight (where partial states merge), over
+    /// values at and near the `Int64` limits. A total that fits is returned
+    /// even when a running total in some order would not (ADR-0022's
+    /// integer sum amendment), which the oracle encodes by summing in `i128`.
+    #[test]
+    fn integer_sum_is_exact_or_fails_with_the_overflow_error(
+        specs in arb_dataset(near_limit_integer_value as ValuePool),
+        pred in arb_pred(),
+    ) {
+        block_on(async move {
+            for fetch_concurrency in [1, 8] {
+                assert_checked_integer_sums(&specs, &pred, fetch_concurrency).await;
+            }
+        });
+    }
+}
+
+/// Fixed cases for the integer sum, each at one and eight partitions: a total
+/// past `i64::MAX` and one past `i64::MIN` fail, and totals that sit exactly
+/// on the limits (one of them only reachable through an out-of-range running
+/// total in series order) are returned.
+#[tokio::test]
+async fn golden_integer_sum_at_the_limits() {
+    let specs = vec![
+        SegSpec::new(
+            1,
+            1,
+            1,
+            vec![
+                SeriesSpec::new("over", vec![(1, TWO_POW_62), (2, TWO_POW_62)]),
+                SeriesSpec::new("under", vec![(1, I64_MIN_F64), (2, -1.0)]),
+                SeriesSpec::new("min", vec![(1, I64_MIN_F64)]),
+                SeriesSpec::new("back", vec![(1, NEAR_I64_MAX), (2, 2048.0)]),
+            ],
+        ),
+        SegSpec::new(2, 1, 2, vec![SeriesSpec::new("back", vec![(3, -2048.0)])]),
+    ];
+    for fetch_concurrency in [1, 8] {
+        for name in ["over", "under", "min", "back"] {
+            assert_checked_integer_sums(&specs, &Pred::LabelMatch(name), fetch_concurrency).await;
+        }
+        let tenant = tenant_id("checked-sum");
+        let fixture = partitioned_fixture(&tenant, &specs, fetch_concurrency).await;
+        assert_integer_sum(
+            &fixture,
+            &tenant,
+            "SELECT sum(CAST(value AS BIGINT)) FROM samples WHERE label(labels, '__name__') = 'back'",
+            Some(vec![vec![Cell::Int(9_223_372_036_854_774_784)]]),
+        )
+        .await;
+        assert_integer_sum(
+            &fixture,
+            &tenant,
+            "SELECT sum(CAST(value AS BIGINT)) FROM samples WHERE label(labels, '__name__') = 'over'",
+            None,
+        )
+        .await;
+        assert_integer_sum(
+            &fixture,
+            &tenant,
+            "SELECT sum(CAST(value AS BIGINT)) FROM samples WHERE label(labels, '__name__') = 'under'",
+            None,
+        )
+        .await;
+        assert_integer_sum(
+            &fixture,
+            &tenant,
+            "SELECT sum(CAST(value AS BIGINT)) FROM samples WHERE label(labels, '__name__') = 'min'",
+            Some(vec![vec![Cell::Int(i64::MIN)]]),
+        )
+        .await;
     }
 }
 

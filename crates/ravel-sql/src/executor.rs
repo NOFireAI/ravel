@@ -10353,7 +10353,8 @@ pub(crate) mod tests {
     /// grouped aggregate.
     ///
     /// A declared `I64` is `Int64`, so q33's `ClientIP` key is 8 bytes and its
-    /// `W` is 8 + 8 (keys) + 8 (COUNT) + 8 (SUM) + 24 (Ravel's exact AVG) = 56.
+    /// `W` is 8 + 8 (keys) + 8 (COUNT) + 17 (Ravel's checked integer SUM, an
+    /// `i128` and a seen flag) + 24 (Ravel's exact AVG) = 65.
     /// The optimizer drops q35's constant key, leaving the single view key
     /// q34 has. `date_part` is `Int32`, so q19's `W` is 8 + 4 + 16 + 8 = 36.
     /// q14's `COUNT(DISTINCT)` is rewritten into two plain group-bys, the
@@ -10392,7 +10393,7 @@ pub(crate) mod tests {
                 "SELECT \"WatchID\", \"ClientIP\", COUNT(*) AS c, SUM(\"IsRefresh\"), \
                  AVG(\"ResolutionWidth\") FROM logs GROUP BY \"WatchID\", \"ClientIP\" \
                  ORDER BY c DESC LIMIT 10",
-                layout(16, 56, 16, true),
+                layout(16, 65, 16, true),
             ),
             (
                 "SELECT \"URL\", COUNT(*) AS c FROM logs GROUP BY \"URL\" \

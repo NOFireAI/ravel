@@ -164,6 +164,7 @@ use crate::parquet::ParquetSession;
 use crate::provider::RavelTableProvider;
 use crate::regexp_replace_udf::regexp_replace_udf;
 use crate::spans_provider::SpansTableProvider;
+use crate::sum::checked_sum_udaf;
 use crate::trace_id_planner::trace_id_hex_literal_planner;
 use crate::udf::{label_match_udf, label_udf};
 
@@ -1012,9 +1013,15 @@ pub fn build_session_with_tables(
     // displacing both built-in entries so avg's numerator is a naive f64 fold
     // in deterministic order rather than arrow's lane-parallel batch sum. avg
     // stays in `ADMITTED_AGGREGATES` so the loop above keeps the built-in until
-    // this line replaces it. This is independent of the public `sum` UDAF,
-    // which is untouched (ADR-0024).
+    // this line replaces it. This is independent of the public `sum` UDAF
+    // below; avg sums its own operands.
     ctx.register_udaf(sequential_avg_udaf());
+    // Replace the built-in sum with the checked UDAF (issue #3838, ADR-0022's
+    // integer sum amendment): an integer sum whose exact total does not fit
+    // Int64/UInt64 fails the query instead of wrapping. Float, decimal and
+    // every other type delegate to the built-in, whose float bits ADR-0024
+    // owns.
+    ctx.register_udaf(checked_sum_udaf());
     // Replace the built-in regexp_replace with one that compiles a constant
     // pattern once per session instead of once per batch (epic #3231); every
     // other argument shape runs the built-in. It stays in `ADMITTED_SCALARS`,
