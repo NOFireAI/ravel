@@ -275,7 +275,7 @@
 //! `sum(part.series_count)`, which counts a straddling stream once per part it
 //! appears in; it is reported, never used as a gate.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1195,27 +1195,18 @@ pub(crate) async fn merge_catalogs(
         compared_bytes = plan.compared_bytes,
         ceiling_bytes = plan.ceiling_bytes,
         pass_budget_bytes = plan.pass_budget,
+        largest_stream_pass_bytes = plan.estimates.iter().copied().max().unwrap_or(0),
         hot_streams = plan.hot.iter().filter(|h| **h).count(),
         mode = plan.mode.name(),
-        "rlog merge read mode (compared = raw + pass floor + largest cursor-range charge)"
+        "rlog merge read mode (compared = the held raw bytes + pass floor + largest hot-stream cursor charge that decided the mode)"
     );
-    let ledger = config.request_ledger.as_ref();
     let mut resident_charges = MergeCharges::new(tracker);
     let resident = match plan.mode {
-        MergeReadMode::Resident => Some(
-            fetch_resident_groups(
-                store,
-                catalogs,
-                &plan.groups,
-                config.input_read_concurrency.max(1),
-                &mut resident_charges,
-                ledger,
-            )
-            .await?,
-        ),
+        MergeReadMode::Resident => {
+            Some(fetch_resident_groups(store, config, catalogs, &plan, &mut resident_charges).await?)
+        }
         MergeReadMode::FetchPerPass | MergeReadMode::Cursor => None,
     };
-    let mut scale = PassScale::default();
     let mut next = 0usize;
     while next < stream_ids.len() {
         if plan.mode == MergeReadMode::Cursor || plan.hot.get(next).copied().unwrap_or(true) {
@@ -1234,47 +1225,20 @@ pub(crate) async fn merge_catalogs(
             next += 1;
             continue;
         }
-        let mut len = scale.cut(&plan, next);
-        loop {
-            let range = &stream_ids[next..next + len];
-            let outcome = run_stream_pass(
-                store,
-                catalogs,
-                range,
-                width_ns,
-                &plan,
-                resident.as_deref(),
-                &merged,
-                &mut sink,
-                keep,
-                &mut counts,
-            )
-            .await?;
-            match outcome {
-                PassOutcome::Emitted { retained } => {
-                    scale.observe(retained, &plan.estimates[next..next + len]);
-                    next += len;
-                    break;
-                }
-                PassOutcome::Overflow if len > 1 => len /= 2,
-                PassOutcome::Overflow => {
-                    cursor_merge_one_stream(
-                        store,
-                        catalogs,
-                        &stream_ids[next],
-                        width_ns,
-                        &mut sink,
-                        tracker,
-                        keep,
-                        &mut counts,
-                        resident.as_deref(),
-                    )
-                    .await?;
-                    next += 1;
-                    break;
-                }
-            }
-        }
+        let len = plan.cut(next);
+        run_stream_pass(
+            store,
+            catalogs,
+            &stream_ids[next..next + len],
+            width_ns,
+            &plan,
+            resident.as_deref(),
+            &mut sink,
+            keep,
+            &mut counts,
+        )
+        .await?;
+        next += len;
     }
     // The resident groups are spent: release them before the last part's
     // encode rather than holding both.
@@ -1315,25 +1279,130 @@ impl MergeReadMode {
 /// BLOCKS byte is fetched.
 struct MergePlan {
     mode: MergeReadMode,
-    /// The retained-row budget of one stream-range pass. Zero in
+    /// What one stream-range pass may hold in decoded blocks: the
+    /// [`pass_block_cost`] of every block it decodes, summed. Zero in
     /// [`MergeReadMode::Cursor`].
     pass_budget: u64,
     /// Per stream, in merged stream-id order: whether it goes through the
     /// cursor merge (D3) rather than a pass.
     hot: Vec<bool>,
-    /// Per stream, in merged stream-id order: the pre-fetch estimate of its
-    /// retained rows across every input ([`plan_merge`] states the estimator).
+    /// Per stream, in merged stream-id order: what a pass of that stream alone
+    /// holds, the [`pass_block_cost`] of each of its candidate blocks on every
+    /// input carrying it, summed.
     estimates: Vec<u64>,
+    /// Per stream, in merged stream-id order: its candidate blocks on each
+    /// input carrying it, `(input_index, ascending block indices)`.
+    stream_blocks: Vec<Vec<(usize, Vec<usize>)>>,
+    /// Per input, per block of the input: [`pass_block_cost`].
+    block_costs: Vec<Vec<u64>>,
     /// Stored bytes of every distinct row group any stream's candidate blocks
     /// fall in, over every input.
     raw_bytes: u64,
-    /// `raw_bytes` + pass floor + the largest cursor-range charge under
-    /// resident reads: what the resident mode compares to the ceiling.
+    /// The sum that decided `mode`, compared to `ceiling_bytes`: `raw_bytes`
+    /// + pass floor + the largest hot stream's resident cursor charge for
+    /// [`MergeReadMode::Resident`]; the in-flight groups + pass floor + the
+    /// largest hot stream's cursor charge for [`MergeReadMode::FetchPerPass`],
+    /// and for [`MergeReadMode::Cursor`], which is taken when that sum is over
+    /// the ceiling.
     compared_bytes: u64,
     ceiling_bytes: u64,
     /// Per input, the `(start, end)` extents of those row groups, ascending.
     /// Filled only for [`MergeReadMode::Resident`].
     groups: Vec<Vec<(u64, u64)>>,
+    /// Row groups that land between two claim checkpoints while the merge
+    /// fetches resident groups or a pass's groups ([`lease_renewal_spacing`]).
+    renew_every_fetches: usize,
+    /// Blocks a pass decodes between two claim checkpoints.
+    renew_every_blocks: usize,
+}
+
+impl MergePlan {
+    /// How many streams from `start` the next pass covers: at least one, never
+    /// a hot stream, and as many more as keep the [`pass_block_cost`] of the
+    /// pass's distinct blocks within the pass budget. A block two streams of
+    /// the pass share is decoded and held once, so it is counted once.
+    fn cut(&self, start: usize) -> usize {
+        let mut held: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); self.block_costs.len()];
+        let mut sum = 0u64;
+        let mut len = 0usize;
+        for (j, hot) in self.hot.iter().enumerate().skip(start) {
+            if *hot {
+                break;
+            }
+            let carriers = self.stream_blocks.get(j).map(Vec::as_slice).unwrap_or(&[]);
+            let mut added = 0u64;
+            for (input, blocks) in carriers {
+                let costs = self.block_costs.get(*input).map(Vec::as_slice).unwrap_or(&[]);
+                let seen = held.get(*input);
+                for b in blocks {
+                    if !seen.is_some_and(|s| s.contains(b)) {
+                        added = added.saturating_add(costs.get(*b).copied().unwrap_or(0));
+                    }
+                }
+            }
+            if len > 0 && sum.saturating_add(added) > self.pass_budget {
+                break;
+            }
+            sum = sum.saturating_add(added);
+            for (input, blocks) in carriers {
+                if let Some(s) = held.get_mut(*input) {
+                    s.extend(blocks.iter().copied());
+                }
+            }
+            len += 1;
+        }
+        len.max(1)
+    }
+}
+
+/// Heap bytes a pass's block view holds per retained row on top of the decoded
+/// block: its row index (`u32`), timestamp (`i64`) and stream ref (`u32`),
+/// each vector allocated at exactly the retained row count
+/// ([`RlogRangeReader::block_rows_for_refs`]).
+const PASS_ROW_INDEX_BYTES: u64 = 16;
+
+/// What one block slot of a pass's per-input container costs, whether or not
+/// it still holds a view.
+const PASS_SLOT_BYTES: u64 = std::mem::size_of::<Option<HeldView<'static>>>() as u64;
+
+/// What a stream-range pass holds for one decoded block of `pricing`'s input:
+/// the block's ADR-0979 decoded ceiling ([`block_decode_ceiling_bytes`]), the
+/// view's row vectors at the block's full row count, and its container slot.
+/// [`run_stream_pass`] charges this before the decode and lowers the charge to
+/// the view's [`StreamBlockRows::heap_estimate`] once the view exists.
+fn pass_block_cost(pricing: &InputCursorPricing, block: usize) -> Result<u64> {
+    let rows = u64::from(pricing.block_rows.get(block).copied().unwrap_or(0));
+    Ok(block_decode_ceiling_bytes(pricing, block)?
+        .saturating_add(PASS_ROW_INDEX_BYTES.saturating_mul(rows))
+        .saturating_add(PASS_SLOT_BYTES))
+}
+
+/// How often the merge's read loops reach the claim checkpoint (ADR-1029):
+/// every `fetches` landed row groups and every `blocks` decoded blocks.
+///
+/// Both are sized from [`crate::config::claim_lease_max_part_bytes`], the bytes
+/// the conservative 10 MiB/s rate moves in half the lease. Between two
+/// checkpoints at most `fetches` groups land after the ones already in flight,
+/// `input_read_concurrency - 1` of them, so `fetches + concurrency - 1` of the
+/// largest group stay within that size; `blocks` of the largest block cost do
+/// too. A checkpoint renews once a third of the lease has passed since the last
+/// claim write, so at that rate the claim is never older than a third plus a
+/// half of the lease at any checkpoint.
+fn lease_renewal_spacing(
+    config: &CompactorConfig,
+    largest_group: u64,
+    largest_block: u64,
+) -> (usize, usize) {
+    let part = crate::config::claim_lease_max_part_bytes(config.claim_lease_duration);
+    let concurrency = config.input_read_concurrency.max(1) as u64;
+    let fetches = (part / largest_group.max(1))
+        .saturating_sub(concurrency - 1)
+        .max(1);
+    let blocks = (part / largest_block.max(1)).max(1);
+    (
+        usize::try_from(fetches).unwrap_or(usize::MAX),
+        usize::try_from(blocks).unwrap_or(usize::MAX),
+    )
 }
 
 /// Decide how [`merge_catalogs`] reads its inputs (ADR-3819), from resident
@@ -1350,14 +1419,13 @@ struct MergePlan {
 /// cursor merge. The pass budget is what is left after `raw` (or the in-flight
 /// groups) and `c`.
 ///
-/// The per-stream estimate, which sizes passes and picks the D3 streams, is the
-/// stream's share of each candidate block's decoded ceiling: for every input
-/// and every candidate block `b` of the stream there, the block's
-/// [`block_decode_ceiling_bytes`] divided by the number of the input's streams
-/// that have `b` as a candidate. That is the block's per-row ceiling times
-/// `rows_b / n_b` rows, since a block's per-stream row counts are not in the
-/// catalog. A pass that retains more than the budget anyway is halved, never
-/// aborted ([`run_stream_pass`]).
+/// A stream's estimate, which picks the D3 streams, is what a pass of that
+/// stream alone holds: the [`pass_block_cost`] of each of its candidate blocks
+/// on every input carrying it, the whole block's decoded ceiling whatever share
+/// of its rows the stream owns, since a pass holds a decoded block whole until
+/// its last wanted row is emitted. [`MergePlan::cut`] sizes passes by the same
+/// costs over the union of a range's blocks, so a pass never holds more than
+/// the pass budget, and no pass is retried.
 ///
 /// A stream's worst-case cursor charge is the largest reservation-batch sum
 /// [`merge_stream_into_parts`] would admit for it, capped at
@@ -1376,61 +1444,50 @@ fn plan_merge(
     let concurrency = config.input_read_concurrency.max(1);
     let streams = stream_ids.len();
 
-    // Per input: its candidate row groups, and per block how many of its
-    // streams have that block as a candidate.
+    // Per input: its candidate row groups, and every block's pass cost.
     let mut groups: Vec<Vec<(u64, u64)>> = Vec::with_capacity(catalogs.len());
-    let mut sharers: Vec<Vec<u32>> = Vec::with_capacity(catalogs.len());
+    let mut block_costs: Vec<Vec<u64>> = Vec::with_capacity(catalogs.len());
     for catalog in catalogs {
-        let mut counts = vec![0u32; catalog.pricing.block_rows.len()];
         let mut extents: BTreeSet<(u64, u64)> = BTreeSet::new();
         for entry in catalog.reader.stream_dir().entries() {
             let Some(locs) = catalog.reader.stream_blocks(&entry.stream_id)? else {
                 continue;
             };
-            for loc in &locs {
-                extents.insert((loc.start(), loc.end()));
-                for &block in loc.block_indices() {
-                    let slot = counts.get_mut(block).ok_or_else(|| {
-                        MaintainError::Invariant(
-                            "stream candidate block index past the input's SKIP_IDX block count"
-                                .to_string(),
-                        )
-                    })?;
-                    *slot = slot.saturating_add(1);
-                }
-            }
+            extents.extend(locs.iter().map(|loc| (loc.start(), loc.end())));
         }
         groups.push(extents.into_iter().collect());
-        sharers.push(counts);
+        let costs = (0..catalog.pricing.block_rows.len())
+            .map(|b| pass_block_cost(&catalog.pricing, b))
+            .collect::<Result<Vec<u64>>>()?;
+        block_costs.push(costs);
     }
     let raw_bytes = groups
         .iter()
         .flatten()
         .fold(0u64, |a, (s, e)| a.saturating_add(e.saturating_sub(*s)));
-
-    let cursor_plan = |compared_bytes: u64| MergePlan {
-        mode: MergeReadMode::Cursor,
-        pass_budget: 0,
-        hot: vec![true; streams],
-        estimates: vec![0; streams],
-        raw_bytes,
-        compared_bytes,
-        ceiling_bytes: ceiling,
-        groups: Vec::new(),
-    };
-    // No pass budget can reach the floor under a ceiling below it.
-    if ceiling == 0 || ceiling < floor {
-        return Ok(cursor_plan(raw_bytes.saturating_add(floor)));
-    }
+    let mut lens: Vec<u64> = groups
+        .iter()
+        .flatten()
+        .map(|(s, e)| e.saturating_sub(*s))
+        .collect();
+    lens.sort_unstable_by(|a, b| b.cmp(a));
+    let in_flight = lens
+        .iter()
+        .take(concurrency)
+        .fold(0u64, |a, l| a.saturating_add(*l));
+    let largest_group = lens.first().copied().unwrap_or(0);
 
     let budget = config.merge_cursor_budget_bytes;
     let mut estimates = Vec::with_capacity(streams);
+    let mut stream_blocks = Vec::with_capacity(streams);
     let mut d3_resident = Vec::with_capacity(streams);
     let mut d3_fetched = Vec::with_capacity(streams);
     let mut two_g = vec![0u64; catalogs.len()];
+    let mut largest_block = 0u64;
     for stream_id in stream_ids {
         let mut estimate = 0u64;
         let mut carriers: Vec<PendingCursor> = Vec::new();
+        let mut blocks_of: Vec<(usize, Vec<usize>)> = Vec::new();
         for (input_index, catalog) in catalogs.iter().enumerate() {
             let Some((lower_bound, upper_bound)) = catalog.reader.stream_ts_bounds(stream_id)
             else {
@@ -1452,14 +1509,24 @@ fn plan_merge(
                 upper_bound,
                 reservation: reservation.total(),
             });
-            let shared = sharers.get(input_index).map(Vec::as_slice).unwrap_or(&[]);
-            for loc in &locs {
-                for &block in loc.block_indices() {
-                    let n = u64::from(shared.get(block).copied().unwrap_or(1).max(1));
-                    let ceiling_b = block_decode_ceiling_bytes(&catalog.pricing, block)?;
-                    estimate = estimate.saturating_add(ceiling_b / n);
-                }
+            let mut blocks: Vec<usize> = locs
+                .iter()
+                .flat_map(|loc| loc.block_indices().iter().copied())
+                .collect();
+            blocks.sort_unstable();
+            blocks.dedup();
+            let costs = block_costs.get(input_index).map(Vec::as_slice).unwrap_or(&[]);
+            for &b in &blocks {
+                let cost = costs.get(b).copied().ok_or_else(|| {
+                    MaintainError::Invariant(
+                        "stream candidate block index past the input's SKIP_IDX block count"
+                            .to_string(),
+                    )
+                })?;
+                largest_block = largest_block.max(cost);
+                estimate = estimate.saturating_add(cost);
             }
+            blocks_of.push((input_index, blocks));
         }
         let mut worst_held = 0u64;
         let mut worst_fetched = 0u64;
@@ -1475,8 +1542,32 @@ fn plan_merge(
             worst_held = worst_held.max(held);
         }
         estimates.push(estimate);
+        stream_blocks.push(blocks_of);
         d3_resident.push(worst_held.min(budget));
         d3_fetched.push(worst_fetched.min(budget));
+    }
+    let (renew_every_fetches, renew_every_blocks) =
+        lease_renewal_spacing(config, largest_group, largest_block);
+
+    let cursor_plan = |compared_bytes: u64, estimates: Vec<u64>| MergePlan {
+        mode: MergeReadMode::Cursor,
+        pass_budget: 0,
+        hot: vec![true; streams],
+        estimates,
+        stream_blocks: Vec::new(),
+        block_costs: Vec::new(),
+        raw_bytes,
+        compared_bytes,
+        ceiling_bytes: ceiling,
+        groups: Vec::new(),
+        renew_every_fetches,
+        renew_every_blocks,
+    };
+    // No pass budget can reach the floor under a ceiling below it; the sum
+    // logged is the fetch-per-pass one with no hot stream, the smallest any
+    // mode could have compared.
+    if ceiling == 0 || ceiling < floor {
+        return Ok(cursor_plan(in_flight.saturating_add(floor), estimates));
     }
 
     let mut order: Vec<usize> = (0..streams).collect();
@@ -1484,29 +1575,26 @@ fn plan_merge(
 
     let resident_base = ceiling.saturating_sub(raw_bytes);
     let (resident_hot, resident_c) = hot_split(&order, &estimates, &d3_resident, resident_base);
-    let compared_bytes = raw_bytes.saturating_add(floor).saturating_add(resident_c);
+    let resident_compared = raw_bytes.saturating_add(floor).saturating_add(resident_c);
     let resident_budget = resident_base.saturating_sub(resident_c);
-    let chosen = if compared_bytes <= ceiling && resident_budget > 0 {
-        Some((MergeReadMode::Resident, resident_hot, resident_budget))
+    let (chosen, compared_bytes) = if resident_compared <= ceiling && resident_budget > 0 {
+        (
+            Some((MergeReadMode::Resident, resident_hot, resident_budget)),
+            resident_compared,
+        )
     } else {
-        let mut lens: Vec<u64> = groups
-            .iter()
-            .flatten()
-            .map(|(s, e)| e.saturating_sub(*s))
-            .collect();
-        lens.sort_unstable_by(|a, b| b.cmp(a));
-        let in_flight = lens
-            .iter()
-            .take(concurrency)
-            .fold(0u64, |a, l| a.saturating_add(*l));
         let base = ceiling.saturating_sub(in_flight);
         let (hot, c) = hot_split(&order, &estimates, &d3_fetched, base);
         let pass_budget = base.saturating_sub(c);
-        let fits = in_flight.saturating_add(c).saturating_add(floor) <= ceiling;
-        (fits && pass_budget > 0).then_some((MergeReadMode::FetchPerPass, hot, pass_budget))
+        let compared = in_flight.saturating_add(c).saturating_add(floor);
+        let fits = compared <= ceiling && pass_budget > 0;
+        (
+            fits.then_some((MergeReadMode::FetchPerPass, hot, pass_budget)),
+            compared,
+        )
     };
     let Some((mode, hot_count, pass_budget)) = chosen else {
-        return Ok(cursor_plan(compared_bytes));
+        return Ok(cursor_plan(compared_bytes, estimates));
     };
     let mut hot = vec![false; streams];
     for &j in order.iter().take(hot_count) {
@@ -1517,6 +1605,8 @@ fn plan_merge(
         pass_budget,
         hot,
         estimates,
+        stream_blocks,
+        block_costs,
         raw_bytes,
         compared_bytes,
         ceiling_bytes: ceiling,
@@ -1525,6 +1615,8 @@ fn plan_merge(
         } else {
             Vec::new()
         },
+        renew_every_fetches,
+        renew_every_blocks,
     })
 }
 
@@ -1545,24 +1637,51 @@ fn hot_split(order: &[usize], estimates: &[u64], d3: &[u64], base: u64) -> (usiz
     (order.len(), c)
 }
 
+/// Counts landed fetches or decoded blocks and reaches the claim checkpoint
+/// every `every` of them ([`lease_renewal_spacing`]).
+struct RenewalSpacing {
+    every: usize,
+    since: usize,
+}
+
+impl RenewalSpacing {
+    fn new(every: usize) -> Self {
+        RenewalSpacing {
+            every: every.max(1),
+            since: 0,
+        }
+    }
+
+    async fn tick(&mut self, config: &CompactorConfig, store: &dyn ObjectStoreBackend) -> Result<()> {
+        self.since += 1;
+        if self.since >= self.every {
+            self.since = 0;
+            crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::MergeLoop)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 /// Fetch every input's planned row groups once, `concurrency` GETs in flight,
 /// and hold them for the rest of the merge (ADR-3819 D1). Each group is charged
-/// to the tracker's resident term as it lands, through `charges`.
+/// to the tracker's resident term as it lands, through `charges`, and the
+/// claim checkpoint is reached every `plan.renew_every_fetches` landed groups.
 async fn fetch_resident_groups(
     store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
     catalogs: &[RlogInputCatalog],
-    groups: &[Vec<(u64, u64)>],
-    concurrency: usize,
+    plan: &MergePlan,
     charges: &mut MergeCharges<'_>,
-    ledger: Option<&RequestLedger>,
 ) -> Result<Vec<ResidentInputGroups>> {
     type GroupFetch<'f> =
         Pin<Box<dyn Future<Output = Result<(usize, (u64, u64), bytes::Bytes)>> + Send + 'f>>;
+    let ledger = config.request_ledger.as_ref();
     let mut out: Vec<ResidentInputGroups> = catalogs.iter().map(|_| HashMap::new()).collect();
     // Collected rather than chained lazily: a closure-built iterator held
     // across the awaits below is not `Send` for every lifetime.
     let mut fetches: Vec<GroupFetch<'_>> = Vec::new();
-    for (input_index, (catalog, extents)) in catalogs.iter().zip(groups).enumerate() {
+    for (input_index, (catalog, extents)) in catalogs.iter().zip(&plan.groups).enumerate() {
         for &extent in extents {
             fetches.push(Box::pin(fetch_input_range(
                 store,
@@ -1573,7 +1692,8 @@ async fn fetch_resident_groups(
             )));
         }
     }
-    let mut landed = stream_iter(fetches).buffered(concurrency);
+    let mut renewal = RenewalSpacing::new(plan.renew_every_fetches);
+    let mut landed = stream_iter(fetches).buffered(config.input_read_concurrency.max(1));
     while let Some((input_index, extent, data)) = landed.try_next().await? {
         let len = data.len() as u64;
         charges.add_resident_raw(len);
@@ -1583,6 +1703,7 @@ async fn fetch_resident_groups(
         if let Some(slot) = out.get_mut(input_index) {
             slot.insert(extent, data);
         }
+        renewal.tick(config, store).await?;
     }
     Ok(out)
 }
@@ -1597,65 +1718,6 @@ async fn fetch_input_range(
 ) -> Result<(usize, (u64, u64), bytes::Bytes)> {
     let data = fetch_range(store, object_key, extent, ledger).await?;
     Ok((input_index, extent, data))
-}
-
-/// Range sizing across passes. A range is cut by the streams' planned
-/// estimates, scaled up by how far the passes so far retained more than they
-/// were estimated to, so an estimator that runs low halves at most the first
-/// pass rather than every pass. It only moves where ranges are cut, never what
-/// is emitted.
-#[derive(Default)]
-struct PassScale {
-    retained: u128,
-    estimated: u128,
-}
-
-impl PassScale {
-    fn apply(&self, estimate: u64) -> u128 {
-        if self.estimated > 0 && self.retained > self.estimated {
-            u128::from(estimate).saturating_mul(self.retained) / self.estimated
-        } else {
-            u128::from(estimate)
-        }
-    }
-
-    /// How many streams from `start` the next pass covers: at least one, never
-    /// a D3 stream, and as many more as fit the pass budget.
-    fn cut(&self, plan: &MergePlan, start: usize) -> usize {
-        let budget = u128::from(plan.pass_budget);
-        let mut sum = 0u128;
-        let mut len = 0usize;
-        for (j, hot) in plan.hot.iter().enumerate().skip(start) {
-            if *hot {
-                break;
-            }
-            let e = self.apply(plan.estimates.get(j).copied().unwrap_or(0));
-            if len > 0 && sum.saturating_add(e) > budget {
-                break;
-            }
-            sum = sum.saturating_add(e);
-            len += 1;
-        }
-        len.max(1)
-    }
-
-    fn observe(&mut self, retained: u64, estimates: &[u64]) {
-        self.retained = self.retained.saturating_add(u128::from(retained));
-        let estimated = estimates
-            .iter()
-            .fold(0u128, |a, e| a.saturating_add(u128::from(*e)));
-        self.estimated = self.estimated.saturating_add(estimated);
-    }
-}
-
-/// What one stream-range pass did.
-enum PassOutcome {
-    /// Every stream of the range was emitted; `retained` is what its rows were
-    /// charged in total.
-    Emitted { retained: u64 },
-    /// The range's rows outgrew the pass budget while decoding; nothing was
-    /// emitted and every charge is released.
-    Overflow,
 }
 
 /// One stream through the cursor merge (D3, and every stream in
@@ -1687,33 +1749,94 @@ async fn cursor_merge_one_stream(
     .await
 }
 
-/// One input's share of a stream-range pass: which of its stream refs the
-/// range wants (each mapped to the range stream and that stream's row slot),
+/// One input's share of a stream-range pass: the stream refs the range wants,
 /// and the union of the range's candidate blocks per row group, ascending.
 struct InputPassWork<'c> {
     input_index: usize,
     catalog: &'c RlogInputCatalog,
-    slots: HashMap<u32, (usize, usize)>,
+    wanted: BTreeSet<u32>,
     groups: Vec<(StreamBlockLoc, Vec<usize>)>,
 }
 
-/// Merge the contiguous stream range `range` in one pass (ADR-3819 D2): decode
-/// each input's row groups once for all of the range's streams, retain the
-/// range's rows, then emit stream by stream exactly as the cursor merge would.
+/// One decoded block a pass holds, with what it is charged.
+struct HeldView<'r> {
+    rows: StreamBlockRows<'r>,
+    charged: u64,
+}
+
+/// One input's decoded blocks in a pass, in block order, which is the order of
+/// their rows in the object: `stream_ref`-major
+/// (docs/log-segment-format.md, the sort descriptor). `views` is allocated at
+/// exactly the input's block count for the pass and charged at its capacity.
+struct HeldBlocks<'r> {
+    views: Vec<Option<HeldView<'r>>>,
+    front: usize,
+}
+
+impl<'r> HeldBlocks<'r> {
+    /// The next row's timestamp when it belongs to `sref`. `None` when the
+    /// input's next row belongs to a later stream or the input is drained. A
+    /// next row of an earlier stream means that stream's rows were not all
+    /// emitted, which the pass treats as an invariant breach.
+    fn peek(&self, sref: u32) -> Result<Option<i64>> {
+        let Some(Some(view)) = self.views.get(self.front) else {
+            return Ok(None);
+        };
+        match view.rows.peek_stream_ref() {
+            Some(next) if next == sref => Ok(view.rows.peek_ts()),
+            Some(next) if next < sref => Err(MaintainError::Invariant(
+                "stream pass left rows of an earlier stream unemitted".to_string(),
+            )),
+            _ => Ok(None),
+        }
+    }
+
+    /// Materialize the next row, dropping the front block and releasing its
+    /// charge once its last row is out.
+    fn pop(&mut self, charges: &mut MergeCharges<'_>) -> Result<LogRecord> {
+        let Some(Some(view)) = self.views.get_mut(self.front) else {
+            return Err(MaintainError::Invariant(
+                "stream pass popped a drained input".to_string(),
+            ));
+        };
+        let rec = view.rows.next().ok_or_else(|| {
+            MaintainError::Invariant("stream pass popped an exhausted block".to_string())
+        })??;
+        if view.rows.is_exhausted() {
+            if let Some(done) = self.views.get_mut(self.front).and_then(Option::take) {
+                charges.release_pass_rows(done.charged);
+            }
+            self.front += 1;
+        }
+        Ok(rec)
+    }
+
+    fn is_drained(&self) -> bool {
+        self.views.get(self.front).is_none()
+    }
+}
+
+/// Merge the contiguous stream range `range` in one pass (ADR-3819 D2): decode each input's candidate blocks of the
+/// range once for all of its streams and hold them in columnar form, then emit
+/// stream by stream exactly as the cursor merge would, materializing one record
+/// at a time.
 ///
-/// Each input's rows of a stream are collected in ascending block order and row
-/// order within a block, which is the order a cursor over that stream yields
-/// them, since a block holding a row of the stream is always among its
-/// candidates. Emission then repeats [`merge_stream_into_parts`]: the stream's
-/// [`reservation_batches`] in order, each a head-by-head merge on
-/// `(ts.div_euclid(W), input_index)`, every record offered to `keep` and the
-/// kept ones pushed into `sink`. So the sink sees the cursor merge's sequence.
+/// An input's rows are stored `stream_ref`-major and its blocks are decoded in
+/// block order, so its held blocks present the range's streams one after the
+/// other, each in the order a cursor over that stream yields them (a block
+/// holding a row of the stream is always among its candidates). Emission
+/// repeats [`merge_stream_into_parts`]: the stream's [`reservation_batches`] in
+/// order, each a head-by-head merge on `(ts.div_euclid(W), input_index)`,
+/// every record offered to `keep` and the kept ones pushed into `sink`. So the
+/// sink sees the cursor merge's sequence.
 ///
-/// Retained rows are charged at decode, without their stream blob, which is
-/// restored from the merged STREAM_DIR at emit (equal across inputs, or the
-/// merge has already refused). A range whose charge exceeds the pass budget
-/// returns [`PassOutcome::Overflow`] before anything is emitted, with every
-/// charge released.
+/// Each block is charged its [`pass_block_cost`] before it is decoded, then
+/// the charge is set to its view's [`StreamBlockRows::heap_estimate`] and
+/// released when its last row is out. [`MergePlan::cut`] keeps the costs'
+/// sum within the pass budget. The claim checkpoint is reached every
+/// `plan.renew_every_fetches` landed groups and every
+/// `plan.renew_every_blocks` decoded blocks, and before each stream's
+/// emission.
 #[allow(clippy::too_many_arguments)]
 async fn run_stream_pass(
     store: &dyn ObjectStoreBackend,
@@ -1722,11 +1845,10 @@ async fn run_stream_pass(
     width_ns: i64,
     plan: &MergePlan,
     resident: Option<&[ResidentInputGroups]>,
-    blobs: &BTreeMap<LogStreamId, Vec<u8>>,
     sink: &mut PartSink<'_>,
     keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
     counts: &mut RecordCounts,
-) -> Result<PassOutcome> {
+) -> Result<()> {
     let config = sink.config;
     let ledger = config.request_ledger.as_ref();
     if let Some(l) = ledger {
@@ -1734,12 +1856,13 @@ async fn run_stream_pass(
     }
     let mut charges = MergeCharges::new(sink.tracker);
 
+    // Per stream of the range: its carriers, and each carrier's stream ref on
+    // its input, both in input order.
     let mut carriers: Vec<Vec<PendingCursor>> = vec![Vec::new(); range.len()];
-    let mut rows: Vec<Vec<(usize, VecDeque<LogRecord>)>> =
-        (0..range.len()).map(|_| Vec::new()).collect();
+    let mut refs: Vec<Vec<(usize, u32)>> = vec![Vec::new(); range.len()];
     let mut work: Vec<InputPassWork<'_>> = Vec::new();
     for (input_index, catalog) in catalogs.iter().enumerate() {
-        let mut slots: HashMap<u32, (usize, usize)> = HashMap::new();
+        let mut wanted: BTreeSet<u32> = BTreeSet::new();
         let mut groups: BTreeMap<u64, (StreamBlockLoc, BTreeSet<usize>)> = BTreeMap::new();
         for (s, stream_id) in range.iter().enumerate() {
             let Some((lower_bound, upper_bound)) = catalog.reader.stream_ts_bounds(stream_id)
@@ -1756,15 +1879,15 @@ async fn run_stream_pass(
                 continue;
             };
             let reservation = reservation_of_locs(&catalog.pricing, &locs)?.total();
-            if let (Some(c), Some(r)) = (carriers.get_mut(s), rows.get_mut(s)) {
+            if let (Some(c), Some(r)) = (carriers.get_mut(s), refs.get_mut(s)) {
                 c.push(PendingCursor {
                     input_index,
                     lower_bound,
                     upper_bound,
                     reservation,
                 });
-                slots.insert(sref, (s, r.len()));
-                r.push((input_index, VecDeque::new()));
+                r.push((input_index, sref));
+                wanted.insert(sref);
             }
             for loc in locs {
                 let (_, blocks) = groups
@@ -1773,17 +1896,25 @@ async fn run_stream_pass(
                 blocks.extend(loc.block_indices().iter().copied());
             }
         }
-        if !slots.is_empty() {
+        if !wanted.is_empty() {
             work.push(InputPassWork {
                 input_index,
                 catalog,
-                slots,
+                wanted,
                 groups: groups
                     .into_values()
                     .map(|(loc, blocks)| (loc, blocks.into_iter().collect()))
                     .collect(),
             });
         }
+    }
+
+    let mut held: Vec<HeldBlocks<'_>> = Vec::with_capacity(work.len());
+    for iw in &work {
+        let blocks: usize = iw.groups.iter().map(|(_, b)| b.len()).sum();
+        let views: Vec<Option<HeldView<'_>>> = Vec::with_capacity(blocks);
+        charges.add_pass_rows((views.capacity() as u64).saturating_mul(PASS_SLOT_BYTES));
+        held.push(HeldBlocks { views, front: 0 });
     }
 
     // Decode in (input, group start) order. Under resident reads the bytes are
@@ -1801,9 +1932,10 @@ async fn run_stream_pass(
             });
         }
     }
+    let mut fetch_renewal = RenewalSpacing::new(plan.renew_every_fetches);
+    let mut block_renewal = RenewalSpacing::new(plan.renew_every_blocks);
     let mut landed = stream_iter(fetches).buffered(config.input_read_concurrency.max(1));
     let mut job_order = jobs.iter();
-    let mut retained = 0u64;
     while let Some(data) = landed.try_next().await? {
         let Some(&(w, g)) = job_order.next() else {
             return Err(MaintainError::Invariant(
@@ -1818,75 +1950,89 @@ async fn run_stream_pass(
             data.len() as u64
         };
         charges.fetched(raw);
+        let costs = plan
+            .block_costs
+            .get(iw.input_index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         for &block in blocks {
-            let (decoded, heap) =
-                iw.catalog
-                    .reader
-                    .block_rows_for_refs(loc, block, data.as_ref(), |sref| {
-                        iw.slots.contains_key(&sref)
-                    })?;
-            charges.decoded(0, heap);
-            for (sref, mut rec) in decoded {
-                rec.stream_attrs = Vec::new();
-                let est = estimate_record(&rec);
-                retained = retained.saturating_add(est);
-                if retained > plan.pass_budget {
-                    return Ok(PassOutcome::Overflow);
-                }
-                charges.add_pass_rows(est);
-                let slot = iw
-                    .slots
-                    .get(&sref)
-                    .and_then(|&(s, k)| rows.get_mut(s).and_then(|r| r.get_mut(k)));
-                let Some((_, queue)) = slot else {
-                    return Err(MaintainError::Invariant(
-                        "stream pass decoded a row for a stream it did not ask for".to_string(),
-                    ));
-                };
-                queue.push_back(rec);
+            let cost = match costs.get(block) {
+                Some(cost) => *cost,
+                None => pass_block_cost(&iw.catalog.pricing, block)?,
+            };
+            charges.add_pass_rows(cost);
+            let rows = iw
+                .catalog
+                .reader
+                .block_rows_for_refs(loc, block, data.as_ref(), |sref| {
+                    iw.wanted.contains(&sref)
+                })?;
+            let heap = rows.heap_estimate();
+            if heap > cost {
+                charges.add_pass_rows(heap - cost);
+            } else {
+                charges.release_pass_rows(cost - heap);
             }
-            charges.release_decoded(heap);
+            if rows.is_exhausted() {
+                charges.release_pass_rows(heap);
+            } else if let Some(h) = held.get_mut(w) {
+                h.views.push(Some(HeldView {
+                    rows,
+                    charged: heap,
+                }));
+            }
+            block_renewal.tick(config, store).await?;
         }
         drop(data);
         charges.release_fetched(raw);
+        fetch_renewal.tick(config, store).await?;
     }
     drop(landed);
 
+    let input_work: BTreeMap<usize, usize> = work
+        .iter()
+        .enumerate()
+        .map(|(w, iw)| (iw.input_index, w))
+        .collect();
     let budget = config.merge_cursor_budget_bytes;
-    for (s, stream_id) in range.iter().enumerate() {
+    for s in 0..range.len() {
         crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::MergeLoop)
             .await?;
-        let blob = blobs.get(stream_id).ok_or_else(|| {
-            MaintainError::Invariant("stream pass emitted a stream with no blob".to_string())
-        })?;
-        let mut stream_rows = rows.get_mut(s).map(std::mem::take).unwrap_or_default();
         let stream_carriers = carriers.get(s).map(Vec::as_slice).unwrap_or(&[]);
+        let stream_refs = refs.get(s).map(Vec::as_slice).unwrap_or(&[]);
         for batch in reservation_batches(stream_carriers, width_ns, budget) {
-            let mut heads: Vec<(usize, VecDeque<LogRecord>)> = Vec::with_capacity(batch.len());
+            let mut heads: Vec<(usize, u32, usize)> = Vec::with_capacity(batch.len());
             for p in &batch {
-                if let Ok(k) = stream_rows.binary_search_by_key(&p.input_index, |(i, _)| *i) {
-                    heads.push((p.input_index, std::mem::take(&mut stream_rows[k].1)));
+                let w = input_work.get(&p.input_index).copied();
+                let sref = stream_refs
+                    .binary_search_by_key(&p.input_index, |(i, _)| *i)
+                    .ok()
+                    .and_then(|k| stream_refs.get(k))
+                    .map(|(_, r)| *r);
+                if let (Some(w), Some(sref)) = (w, sref) {
+                    heads.push((w, sref, p.input_index));
                 }
             }
             loop {
                 let mut best: Option<(usize, i64, usize)> = None;
-                for (h, (input_index, queue)) in heads.iter().enumerate() {
-                    if let Some(rec) = queue.front() {
-                        let key = (rec.ts_ns.div_euclid(width_ns), *input_index);
-                        match best {
-                            Some((_, bbucket, bidx)) if (bbucket, bidx) <= key => {}
-                            _ => best = Some((h, key.0, key.1)),
-                        }
+                for (h, &(w, sref, input_index)) in heads.iter().enumerate() {
+                    let Some(ts) = held.get(w).map(|b| b.peek(sref)).transpose()?.flatten()
+                    else {
+                        continue;
+                    };
+                    let key = (ts.div_euclid(width_ns), input_index);
+                    match best {
+                        Some((_, bbucket, bidx)) if (bbucket, bidx) <= key => {}
+                        _ => best = Some((h, key.0, key.1)),
                     }
                 }
                 let Some((h, _, _)) = best else {
                     break;
                 };
-                let Some(mut rec) = heads[h].1.pop_front() else {
+                let Some(input) = heads.get(h).and_then(|&(w, _, _)| held.get_mut(w)) else {
                     break;
                 };
-                charges.release_pass_rows(estimate_record(&rec));
-                rec.stream_attrs = blob.clone();
+                let rec = input.pop(&mut charges)?;
                 counts.add_input()?;
                 if keep(&rec)? {
                     counts.add_output()?;
@@ -1895,8 +2041,14 @@ async fn run_stream_pass(
             }
         }
     }
+    if !held.iter().all(HeldBlocks::is_drained) {
+        return Err(MaintainError::Invariant(
+            "stream pass ended with decoded rows it never emitted".to_string(),
+        ));
+    }
+    drop(held);
     charges.release_all_pass_rows();
-    Ok(PassOutcome::Emitted { retained })
+    Ok(())
 }
 
 /// The merge's running record tallies. Checked addition throughout: an

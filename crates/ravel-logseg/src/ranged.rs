@@ -535,24 +535,31 @@ impl RlogRangeReader {
         StreamBlockRows::new(self, decoded, loc.stream_ref)
     }
 
-    /// Decodes `block` out of a fetched row group once and rebuilds every row
-    /// whose `stream_ref` satisfies `wanted`, in ascending row order, each
-    /// paired with its `stream_ref`. Also returns the decoded columnar block's
-    /// heap bytes, which the caller drops with this call's return.
+    /// Decode `block` out of a fetched row group once and keep it in columnar
+    /// form, as one view over every row whose `stream_ref` satisfies `wanted`,
+    /// in ascending row order. [`StreamBlockRows::peek_stream_ref`] names the
+    /// next row's stream, so a merge over many streams of one group decodes
+    /// each block once instead of once per stream and still materializes one
+    /// [`LogRecord`] at a time.
     ///
     /// `group_bytes` must be the object's `[loc.start, loc.end)` range, and
     /// `block` must lie in that row group; `loc` may be any stream's loc over
-    /// the group. For one stream this yields the same records, in the same
-    /// order, as draining [`Self::block_rows_in_group`] for that stream's loc,
-    /// so a merge over many streams of one group decodes each block once
-    /// instead of once per stream.
-    pub fn block_rows_for_refs(
-        &self,
+    /// the group. The rows of one stream come back in the order, and as the
+    /// records, that draining [`Self::block_rows_in_group`] for that stream's
+    /// loc yields. A block whose `stream_ref` column descends is refused as
+    /// corrupt: rows are stored `stream_ref`-major, and a caller splitting the
+    /// view by stream relies on it.
+    ///
+    /// The view's row vectors are allocated at exactly the wanted row count,
+    /// so its [`StreamBlockRows::heap_estimate`] is the decoded block plus 16
+    /// bytes per wanted row.
+    pub fn block_rows_for_refs<'r>(
+        &'r self,
         loc: &StreamBlockLoc,
         block: usize,
         group_bytes: &[u8],
         wanted: impl Fn(u32) -> bool,
-    ) -> Result<(Vec<(u32, LogRecord)>, u64), LogSegError> {
+    ) -> Result<StreamBlockRows<'r>, LogSegError> {
         let plans = self.check_loc_bytes(loc, group_bytes)?;
         if self.extent_of(&[block])? != (loc.start, loc.end) {
             return Err(LogSegError::Corrupted(
@@ -566,18 +573,46 @@ impl RlogRangeReader {
             &plans,
             &mut DictCache::default(),
         )?;
-        let mut out = Vec::new();
+        let stream_ref_at = |row: usize| -> Result<u32, LogSegError> {
+            u32::try_from(i64_at(&decoded, COL_STREAM_REF, row)?)
+                .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))
+        };
+        // Count first so the row vectors are allocated once at their exact
+        // size: the caller charges the view's heap before it holds it.
+        let mut previous = 0u32;
+        let mut kept = 0usize;
         for row in 0..decoded.record_count() {
-            let sref = u32::try_from(i64_at(&decoded, COL_STREAM_REF, row)?)
-                .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
-            if wanted(sref) {
-                out.push((
-                    sref,
-                    rebuild_record(&self.stream_dir, &self.field_dir, &decoded, row)?,
+            let sref = stream_ref_at(row)?;
+            if sref < previous {
+                return Err(LogSegError::Corrupted(
+                    "block stream_ref column descends".into(),
                 ));
             }
+            previous = sref;
+            kept += usize::from(wanted(sref));
         }
-        Ok((out, decoded.decoded_heap_bytes() as u64))
+        let mut rows = Vec::with_capacity(kept);
+        let mut row_ts = Vec::with_capacity(kept);
+        let mut row_refs = Vec::with_capacity(kept);
+        for row in 0..decoded.record_count() {
+            let sref = stream_ref_at(row)?;
+            if !wanted(sref) {
+                continue;
+            }
+            rows.push(
+                u32::try_from(row).map_err(|_| LogSegError::Corrupted("block row index".into()))?,
+            );
+            row_ts.push(i64_at(&decoded, COL_TS, row)?);
+            row_refs.push(sref);
+        }
+        Ok(StreamBlockRows {
+            reader: self,
+            block: decoded,
+            rows,
+            row_ts,
+            refs: RowRefs::PerRow(row_refs),
+            pos: 0,
+        })
     }
 
     /// Check that `bytes` is exactly `loc`'s fetched range and return the column
@@ -668,8 +703,18 @@ pub struct StreamBlockRows<'r> {
     /// row's timestamp to validate the column, so keeping the value removes a
     /// per-peek column resolution.
     row_ts: Vec<i64>,
+    /// Which stream each retained row belongs to.
+    refs: RowRefs,
     /// Index into `rows` of the next row to yield.
     pos: usize,
+}
+
+/// The stream of each row a [`StreamBlockRows`] retains: one stream for a view
+/// built for a stream, or a per-row vector, parallel to `rows`, for a view
+/// built by [`RlogRangeReader::block_rows_for_refs`] over several.
+enum RowRefs {
+    One(u32),
+    PerRow(Vec<u32>),
 }
 
 impl<'r> StreamBlockRows<'r> {
@@ -714,8 +759,20 @@ impl<'r> StreamBlockRows<'r> {
             block: decoded,
             rows,
             row_ts,
+            refs: RowRefs::One(stream_ref),
             pos: 0,
         })
+    }
+
+    /// The next row's `stream_ref`, or `None` once the view is exhausted.
+    pub fn peek_stream_ref(&self) -> Option<u32> {
+        if self.is_exhausted() {
+            return None;
+        }
+        match &self.refs {
+            RowRefs::One(stream_ref) => Some(*stream_ref),
+            RowRefs::PerRow(refs) => refs.get(self.pos).copied(),
+        }
     }
 
     /// The next row's `ts_ns`, read straight out of the decoded timestamp
@@ -748,7 +805,8 @@ impl<'r> StreamBlockRows<'r> {
     /// vector's allocation at capacity, plus each present string or
     /// fixed-width cell's own buffer, with a dictionary column's distinct
     /// values counted once rather than once per row), and this view's own
-    /// row-index vector at capacity.
+    /// row-index, timestamp and (for a several-stream view) stream-ref
+    /// vectors at capacity.
     ///
     /// It does NOT count the stored (still compressed) block or row-group bytes
     /// the block was decoded from: those are the caller's buffer, charged
@@ -762,7 +820,14 @@ impl<'r> StreamBlockRows<'r> {
         let columnar = self.block.decoded_heap_bytes() as u64;
         let row_index = (self.rows.capacity() * std::mem::size_of::<u32>()) as u64;
         let ts_index = (self.row_ts.capacity() * std::mem::size_of::<i64>()) as u64;
-        columnar.saturating_add(row_index).saturating_add(ts_index)
+        let ref_index = match &self.refs {
+            RowRefs::One(_) => 0,
+            RowRefs::PerRow(refs) => (refs.capacity() * std::mem::size_of::<u32>()) as u64,
+        };
+        columnar
+            .saturating_add(row_index)
+            .saturating_add(ts_index)
+            .saturating_add(ref_index)
     }
 }
 
@@ -1196,15 +1261,28 @@ mod tests {
                 .find(|g| reader.extent_of(&[b]).expect("extent") == (g.start(), g.end()))
                 .expect("block's group");
             let bytes = slice(&object, group.start(), group.end());
-            let (rows, heap) = reader
+            let mut view = reader
                 .block_rows_for_refs(group, b, &bytes, |r| refs.contains(&r))
                 .expect("rows for refs");
             decodes += 1;
-            assert!(heap > 0, "a decoded block holds heap");
-            for (sref, rec) in rows {
+            let wanted = view.remaining();
+            assert!(view.heap_estimate() > 0, "a decoded block holds heap");
+            assert_eq!(
+                view.heap_estimate(),
+                view.block.decoded_heap_bytes() as u64 + 16 * wanted as u64,
+                "row vectors are sized exactly: 4 + 8 + 4 bytes per wanted row"
+            );
+            let mut last_ref = 0u32;
+            while let Some(sref) = view.peek_stream_ref() {
+                assert!(sref >= last_ref, "refs come out ascending");
+                last_ref = sref;
+                let ts = view.peek_ts().expect("peek with a ref");
+                let rec = view.next().expect("row").expect("rebuild");
+                assert_eq!(rec.ts_ns, ts, "peek_ts is the popped row's");
                 let s = refs.iter().position(|r| *r == sref).expect("wanted ref");
                 split[s].push(rec);
             }
+            assert!(view.is_exhausted() && view.peek_ts().is_none());
         }
         assert_eq!(decodes, blocks.len(), "one decode per block");
         for s in 0..2u8 {
