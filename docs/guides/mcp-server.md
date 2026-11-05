@@ -196,10 +196,18 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   (`__ravel_parent`: `root`, `present`, `missing`, `not_returned` or
   `cycle`). A capped result never calls a parent `missing`: it says
   `not_returned`, because the parent may be among the dropped rows. The
-  [reference](../reference/mcp.md#span-tree) gives the exact rules. The
-  optional logs pass is not built yet, and a call asking for it is refused
-  as unsupported; `ravel_search_logs` with the trace id and a time range
-  returns the trace's logs.
+  [reference](../reference/mcp.md#span-tree) gives the exact rules. An
+  all-zero parent id counts as no parent. With `include_logs: true` and a
+  time range, the call also returns the log records carrying the trace id
+  in that window, in a separate `logs` block ordered by timestamp. That
+  pass is an unindexed scan of the window's logs, and the call warns so:
+  keep the window tight. Its cost is reported apart from the span lookup's,
+  and a call with it claims no upper-bound estimate. If the pass runs out
+  of time or budget, or fails, you still get the spans, with the pass
+  marked `skipped` or `failed`. It has no cursor: when the records were
+  capped, the next step points at `ravel_search_logs` with the same trace
+  id and window. The [reference](../reference/mcp.md#logs-leg) gives the
+  exact rules.
 - `ravel_analyze_timeseries`: change-point detection or a summary statistic
   over each series of a PromQL range result, one row per series. The result
   names the method as a heuristic (`accuracy.exact` is `false`), and each
@@ -393,7 +401,8 @@ Five tools take a required time input: `ravel_query_sql`,
 input, the call fails with `missing_argument`, except on
 `ravel_query_promql`, whose modes are below. `ravel_get_trace` is the
 exception: its time range is optional, and a lookup without one reads
-every span the tenant retains.
+every span the tenant retains. It is required only with `include_logs:
+true`.
 
 `ravel_capabilities` and `ravel_describe_data` take no time input.
 `ravel_describe_data` reports the coverage window and the freshness
@@ -557,6 +566,8 @@ Paging order differs per tool:
   cap comes back bounded (`row_cap_hit`) rather than paged. Raise `max_rows`
   (up to 5,000) or narrow the time range to read more of it; a trace the
   byte cap cut needs smaller rows or a larger `max_response_bytes` instead.
+  Its logs pass has no cursor either; page a capped one with
+  `ravel_search_logs`.
 - `ravel_query_promql` mints no cursor: a PromQL result has no order a
   cursor could resume. Its row cap counts series, and a result with more
   series than `max_rows` comes back `ok_bounded`.
