@@ -165,16 +165,25 @@ learned table leaves is spent on whole bytes of bitset per block, so
 `summary_bytes_share` is at most `budget_share` by construction and the
 question the run answers is what false-positive rate that budget buys.
 
-Relation to arXiv:2507.10391 ("Instance-Optimized String Fingerprints"): the
-paper keeps a fixed-width fingerprint per row, partitions single characters
-into bins (one bit per bin) and picks the partition by mixed-integer
-optimization over a seen workload; an unseen pattern is tested against the
-same partition and the subset test keeps it sound. This summary keeps the
-subset test and the partition of every possible gram into bits (each learned
-gram is a bin of one, the hash partitions the rest), and departs in three
-ways: one bitset per RLOG block rather than per row, `gram_len`-byte grams
-rather than characters, and a greedy rank rather than a solver
-(`summary.rs:21-31`).
+Relation to arXiv:2507.10391 ("Instance-Optimized String Fingerprints",
+Stoian, Thürauf, Zimmerer, van Renen, Kipf). What was checked, on 2026-11-05:
+the abstract and the arXiv HTML body. The abstract says only that
+fingerprints are a lightweight secondary index approximating `LIKE`
+predicates, optimized for a workload by mixed-integer optimization and
+generalizing to unseen predicates. The rest of this paragraph comes from the
+body: the evaluation attaches a fingerprint column, one fixed-width
+fingerprint per row (section 1, "Applications"; a per-partition use is
+named there and block-level "string zonemaps" are left to section 4,
+Future Work); each character is assigned to exactly one bin, one bit per
+bin (section 2, constraint 1b of section 2.1), over single characters, with
+larger n-grams also left to section 4; the partition is chosen by a
+mixed-integer program solved with Gurobi over a seen workload (sections 2.1
+and 3); and a pattern is tested with the subset test, which cannot produce
+a false negative (sections 1, 2 and 3.1). This summary keeps the subset test
+and the partition of every possible gram into bits (each learned gram is a
+bin of one, the hash partitions the rest), and departs in three ways: one
+bitset per RLOG block rather than per row, `gram_len`-byte grams rather than
+characters, and a greedy rank rather than a solver (`summary.rs:21-31`).
 
 ### Workload
 
@@ -226,7 +235,8 @@ cut into blocks the production way and summarized alone, are tested with the
 evaluation `LIKE` literals; at most 0.30 false positives is body-eligible,
 above it body-ineligible, and a subject with no such value is untested.
 Overall GO needs every pre-registered subject GO. A figure outside its
-pre-registered band prints `MISS` and does not change the decision. Build and
+pre-registered band prints `MISS` and does not change the decision; it does
+change the exit code (below). Build and
 zstd CPU are the report thread's `CLOCK_THREAD_CPUTIME_ID`, both on one
 thread.
 
@@ -237,12 +247,42 @@ subject, every run parameter (gram length, budget share, fallback bits, zstd
 level, block and object records, line count, seed, workload lengths) and a
 prediction with a miss band, an expected-absent reason, or an unpredicted
 reason for every figure; its header states the basis of each prediction. It
-was committed alone (93ab7d8) before the first run of this design, and no
-band was edited after it. The report prints the parameters on its `params`
-line and refuses a parameter flag that differs from the file before it reads
-the corpus (`refuse_param_drift`, `string_fingerprint_report.rs:171`). Each
-run prints a stamp line: git HEAD, `uname -m`, nproc, memory, the corpus
-file's name, sha256 and bytes, zstd level and CPU clock.
+was committed alone before the first run of this design, and no band was
+edited after it. The report prints the parameters on its `params` line and
+refuses a parameter flag that differs from the file before it reads the
+corpus (`refuse_param_drift`, `string_fingerprint_report.rs:171`), and
+likewise a `--corpus-column` other than the subject's registered `column`.
+Each run prints a stamp line: git HEAD, `uname -m`, nproc, memory, the
+corpus file's name, sha256 and bytes, zstd level and CPU clock. `--decide`
+prints a stamp line too: git HEAD and the name and sha256 of every report
+file it read.
+
+Where the commits live. The landing rewrites every commit's authorship and
+folds the `wip:` commits, so no SHA of the run sequence exists on `main`.
+The sequence is kept on origin at
+`refs/heads/task/0626efcb-c224-4018-a9bf-558480a98866/result`, and every SHA
+below is a commit on that branch: round 0 is 2eee496, the pre-registration
+commit is 93ab7d8, and each run was recorded in its own commit after it
+(529f286 Apache through 4064e8d Referer, then 048dc32 for `decide.txt`).
+A run file's stamp names the commit on that branch the run was made from,
+which is the commit before the one that records it: `apache_body.txt` says
+93ab7d8, `openssh_body.txt` 529f286, and so on. The stamp in the current
+`decide.txt` was written by a later fix round, which regenerated that file
+from the committed reports to add the stamp; it names that round's commit,
+on that round's task branch, not on the branch above.
+
+Exit codes, also in `--help`:
+
+| Code | Measure mode | `--decide` |
+|---|---|---|
+| 0 | report written, no structural problem, every figure in its band | overall GO |
+| 1 | an error, or a structural problem (a missing, duplicate, unexpected or not-pre-registered figure; the report is still written) | a report could not be read, or the reports are not a decision: a subject missing or reported twice, a report with a problem, or a subject not pre-registered |
+| 2 | report written, no structural problem, at least one `MISS` | not used |
+| 3 | not used | every subject reported once without a problem, overall NO-GO |
+
+`--decide` also prints each subject's miss and problem counts, one
+`string_fingerprint decide subject=... misses=N problems=N` line after the
+subject's decision line.
 
 ```sh
 cargo build --release -p ravel-bench --features parquet-baseline --bin string_fingerprint_report
@@ -258,10 +298,30 @@ Subjects: the four LogHub bodies (Apache, OpenSSH, BGL, HDFS from
 [Zenodo record 8196385](https://zenodo.org/record/8196385), every line), and
 the URL, Title, SearchPhrase and Referer columns ClickBench q21 to q24 filter,
 from `hits_compatible/athena_partitioned/hits_0.parquet` (all 1,000,000
-rows). Round 0 used a 10,000,000-row prefix of `hits.parquet`; this run uses
-the first partition whole, a smaller and different sample. Neither corpus is
-checked in; the sha256 of every file is in `subjects.toml` and in each run's
-stamp line.
+rows). Neither corpus is checked in; the sha256 of every file is in
+`subjects.toml` and in each run's stamp line.
+
+The ClickBench corpus changed between rounds. Round 0 read a
+10,000,000-row prefix of the 14.8 GB `hits.parquet`, a scope reduction its
+own pre-registration header records: a full column scan ran about an hour
+at the throughput it measured. This round reads `hits_0.parquet`, the first
+of the 100 partitions of the same dataset, whole. No commit or
+pre-registration of this round states the reason for the switch; what the
+record does show is that it trades a row prefix of a file for a whole,
+separately published file whose sha256 pins every row read, at a tenth of
+the rows. The consequences:
+
+- 123 blocks per ClickBench subject instead of round 0's 1,221, so every
+  ClickBench false-positive share is over 123 blocks per literal.
+- Every ClickBench saturation arm rests on one block, because every value
+  over 1024 bytes fits in one: URL has 36 such values, SearchPhrase 4,
+  Referer 99 and Title 2 (`saturation/long_values`; `saturation/blocks` is 1
+  on all four).
+- Round 0's ClickBench figures are not comparable with these: a different
+  file, a tenth of the rows and a tenth of the blocks, besides the redesign
+  of the summary itself. The pre-registration took a tenth of round 0's
+  compressed bytes as the basis of its byte and bit-count predictions, and
+  on Title and SearchPhrase those missed low.
 
 ### 2026-11-05 run
 
@@ -289,37 +349,81 @@ Against the baselines on the same evaluation literals:
 - Equality on the ClickBench columns and Apache, where all 40 evaluation
   literals are bloom-testable: the production bloom keeps 0.011 to 0.017 of
   non-holding blocks, the summary 0.142 (Apache) to 0.738 (Referer). The
-  bloom is better by one to two orders of magnitude at these sizes; equal
-  false-positive rate was never reached, so no cost-at-equal-rate comparison
-  could be made.
-- Equality on OpenSSH, BGL and HDFS, where no line is 64 bytes or fewer:
-  production keeps every block (false-positive share 1.0) and the summary
-  0.003 to 0.058. These literals are whole log lines of over 100 bytes, so
-  most blocks lack at least one of their grams; this is the one place the
-  summary beats production, and it fails the CPU bar there (9.2 to 11.0).
+  summary's share over the bloom's, per subject: Apache 12x, Title 29x,
+  Referer 45x, URL 49x, SearchPhrase 56x. Equal false-positive rate was
+  never reached, so no cost-at-equal-rate comparison could be made. The
+  report does not measure the bloom's bytes, so `summary_bytes_share` is a
+  size figure for the summary alone, not a size comparison with the bloom.
+- Equality on OpenSSH, BGL and HDFS: the 64-byte cap on equality literals
+  (`eq_max_len = 64`, the bloom's own limit) has one pre-registered
+  exception. These three corpora have no line of 64 bytes or fewer
+  (`describe` `at_most_64_bytes=0`), so they take `eq_max_len = 1024` and
+  their equality literals are whole lines, from corpora in which almost
+  every line is distinct (`distinct` equals `values` on OpenSSH; 4
+  duplicates in 4,747,963 lines on BGL; 2,118 in 11,175,629 on HDFS). The
+  evaluation equality literals are 78 to 149 bytes on OpenSSH, 126 to 271
+  on BGL and 118 to 174 on HDFS. The bloom cannot test any of them, so
+  production keeps every block (false-positive share 1.0), while the summary
+  keeps 0.003 to 0.058: a long, near-unique line has grams most blocks lack.
+  The summary fails the CPU bar on all three (9.2 to 11.0).
 - `LIKE`: scanning only the summary's kept blocks tests 0.32 (BGL) to 0.94
-  (Referer) of the cells the full `Contains` scan tests.
+  (Referer) of the cells the full `Contains` scan tests. The share is below
+  1.0 on every subject, so the summary saves `Contains` work everywhere, not
+  only on the LogHub equality literals above.
 
-Saturation: on URL, SearchPhrase and Referer the long-value block keeps 0.36
-to 0.59 of non-holder pairs, so the summary is body-ineligible there. Title's
-0.026 comes from one block holding two values and is too small a sample to
-call the summary body-eligible in general. The LogHub corpora have no value
-over 1024 bytes, so the run cannot answer the saturation question for log
-bodies.
+Saturation: every ClickBench saturation verdict rests on one block. The
+values over 1024 bytes number 36 on URL, 4 on SearchPhrase, 99 on Referer
+and 2 on Title, and each subject's fit in a single block. On URL,
+SearchPhrase and Referer that block keeps 0.36 to 0.59 of non-holder pairs,
+so the summary reads body-ineligible there; Title's 0.026 reads
+body-eligible. One block per verdict is too small a sample to call the
+summary body-eligible or body-ineligible in general. The LogHub corpora have
+no value over 1024 bytes, so the run cannot answer the saturation question
+for log bodies.
 
-Prediction misses (each printed as `MISS` in the run files; no band moved
-after the pre-registration commit): `build_cpu_over_zstd` was predicted 2.5
-and read 3.0 to 11.0, over its band [1, 6] on Apache, OpenSSH, BGL, HDFS and
-Title. On OpenSSH, BGL and HDFS the fallback region was sparser than
-predicted (0.44, 0.22, 0.20 against 0.8, 0.75, 0.5), and every unseen
-false-positive share came in under its band, the equality ones by two orders
-of magnitude on OpenSSH and BGL; on Apache only the equality shares missed
-low. On ClickBench, Title and SearchPhrase compressed to 0.64 and 0.28 of a
-tenth of round 0's 10,000,000-row figure, the basis of their byte and
-bit-count predictions, which missed low; SearchPhrase's unseen shares (0.53
-to 0.70) came in under bands starting at 0.7.
+Prediction misses: 41, every one printed as `MISS` in the subject's run
+file and listed under `checked.misses` in its JSON; no band moved after the
+pre-registration commit. Each is the figure, its value and its band:
 
-Corrections to round 0 (2eee496), whose figures this run replaces. Its commit
+- apache_body (5): `build_cpu_over_zstd` 7.5 [1, 6]; `seen/equals` 0.035
+  [0.1, 0.9]; `summary/equals_bloom_testable` 0.142 [0.3, 1]; `unseen/equals`
+  0.142 [0.3, 1]; `unseen/equals_absent` 0.200 [0.4, 1].
+- openssh_body (7): `build_cpu_over_zstd` 11.0 [1, 6]; `fallback_density`
+  0.438 [0.5, 0.97]; `seen/equals` 0.0079 [0.1, 0.95]; `unseen/equals`
+  0.0069 [0.6, 1]; `unseen/equals_absent` 0.0050 [0.6, 1]; `unseen/like`
+  0.286 [0.5, 1]; `unseen/like_absent` 0.279 [0.5, 1].
+- bgl_body (8): `build_cpu_over_zstd` 9.5 [1, 6]; `fallback_density` 0.222
+  [0.4, 0.97]; `seen/equals` 0.0034 [0.1, 0.95];
+  `summary/like/cells_tested_share` 0.319 [0.5, 1]; `unseen/equals` 0.0033
+  [0.5, 1]; `unseen/equals_absent` 0.0014 [0.5, 1]; `unseen/like` 0.202
+  [0.5, 1]; `unseen/like_absent` 0.107 [0.5, 1].
+- hdfs_body (7): `build_cpu_over_zstd` 9.2 [1, 6]; `fallback_density` 0.195
+  [0.2, 0.85]; `summary/like/cells_tested_share` 0.468 [0.6, 1];
+  `unseen/equals` 0.058 [0.7, 1]; `unseen/equals_absent` 0.036 [0.7, 1];
+  `unseen/like` 0.259 [0.5, 1]; `unseen/like_absent` 0.133 [0.5, 1].
+- clickbench_url: none.
+- clickbench_title (7): `bits_per_block` 6,616 [7,300, 13,600];
+  `build_cpu_over_zstd` 8.0 [1, 6]; `compressed_bytes` 10,301,520
+  [11,300,000, 21,000,000]; `summary/like/cells_tested_share` 0.754 [0.8, 1];
+  `unseen/equals_absent` 0.297 [0.4, 1]; `unseen/like` 0.453 [0.5, 1];
+  `unseen/like_absent` 0.437 [0.5, 1].
+- clickbench_searchphrase (7): `bits_per_block` 408 [900, 2,100];
+  `compressed_bytes` 677,428 [1,600,000, 3,100,000];
+  `summary/equals_bloom_testable` 0.639 [0.7, 1]; `unseen/equals` 0.639
+  [0.7, 1]; `unseen/equals_absent` 0.530 [0.7, 1]; `unseen/like` 0.698
+  [0.7, 1]; `unseen/like_absent` 0.623 [0.7, 1].
+- clickbench_referer: none.
+
+Every miss is low except `build_cpu_over_zstd`, which was predicted 2.5 and
+read 7.5 to 11.0 where it missed. On OpenSSH, BGL and HDFS the fallback
+region was sparser than predicted and the false-positive shares came in
+under their bands, `unseen/equals` at 1/87 of its band's floor on OpenSSH
+and 1/150 on BGL. Title and SearchPhrase compressed to 0.64 and 0.28 of a tenth of
+round 0's 10,000,000-row figure, the basis of their byte and bit-count
+predictions.
+
+Corrections to round 0 (2eee496 on the task branch named above), whose
+figures this run replaces. Its commit
 message described a summary built from "the column's frequent 3-grams"; its
 vocabulary was drawn from the seen literals (`summary.rs:1-3` at 2eee496).
 Its writeup said a production "exact-residual scan" gave the true holders;
@@ -327,8 +431,10 @@ its `Contains` baseline selected no column and drained no block, so it tested
 no cell. This run computes the holders in-module and requires the production
 scan to return the same rows. And it said the unseen measure "tests
 generalization directly"; its unseen equality literals always survived by
-construction and its unseen `LIKE` literals were byte-disjoint from the
-corpus, so its unseen shares of 1.0 were fixed by design, not measured.
+construction, and its unseen `LIKE` literals were synthetic tokens (such as
+`sfp_unseen_like_hdfs_zzqqxyz`), absent from the corpus as substrings, that
+shared no 3-gram with the vocabulary, so the summary could not prune them.
+Its unseen shares of 1.0 were fixed by design, not measured.
 
 A small corpus and subject spec for the module's own tests live in
 `crates/ravel-bench/fixtures/string_fingerprint/` (`corpus.txt`,
