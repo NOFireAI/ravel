@@ -23,11 +23,11 @@ After 72 minutes, two merges (hour 07, shards 0 and 1) had issued 461,608 GETs
 for 48.8 GB and written four L1 parts of 16 MiB in total, at 0.17 to 0.36
 cores (#3819).
 
-**Why.** `merge_catalogs` walks `for stream_id in merged.keys()`
-(`crates/ravel-maintain/src/rlog.rs:1136`) and finishes each stream across all
+**Why.** `merge_catalogs` walks the streams of `merged.keys()` in order
+(`crates/ravel-maintain/src/rlog.rs:1185`) and finishes each stream across all
 of its inputs before the next one starts. For each stream it opens a new
 `StreamCursor` on every input that carries that stream. The cursor GETs the
-stream's location (`rlog.rs:2549`), and a location names the whole row group
+stream's location (`rlog.rs:3395`), and a location names the whole row group
 (`crates/ravel-logseg/src/ranged.rs:85-95`, ADR-0699 decision 1), so every
 stream's cursor downloads the same bytes. Nothing keeps them between streams.
 The writer cuts blocks on a record count or a byte estimate, never at a stream
@@ -45,7 +45,7 @@ rows from many streams.
 A shard-hour of N inputs carrying S streams each costs about N × S row-group
 GETs where N would do. With no sort descriptor (`sort_descriptor: none` on
 every object above), the frontier admits about one cursor at a time, and
-the emit loop refills one `.await` at a time (`rlog.rs:3159`), so each merge
+the emit loop refills one `.await` at a time (`rlog.rs:4152-4154`), so each merge
 has about one GET in flight.
 
 **Why no test caught it.** Every compaction test fixture and the ClickBench
@@ -123,7 +123,7 @@ The resident ceiling is a new resolved input on `CompactorConfig`,
 `merge_resident_ceiling_bytes`. The merge reads it and computes nothing
 about concurrency itself. Each entry point resolves it from what it already
 knows, the way ravel-server resolves the part memory target
-(`services/ravel-server/src/config.rs:8605-8620`):
+(`services/ravel-server/src/config.rs:8629`):
 
 | entry point | concurrent merges | `merge_resident_ceiling_bytes` |
 |---|---|---|
@@ -133,7 +133,7 @@ knows, the way ravel-server resolves the part memory target
 | library default | 1 | `merge_cursor_budget_bytes` |
 
 The budget is per merge, and ravel-server passes it once for all of its
-concurrent merges (`services/ravel-server/src/config.rs:8679`). Without
+concurrent merges (`services/ravel-server/src/config.rs:8706-8716`). Without
 the division, four merges could each hold their inputs resident. This
 bounds the resident term per process. It is not a cross-merge admission
 scheme: a shared budget that merges wait on is #3825.
@@ -152,8 +152,8 @@ sequence unchanged.
 On clustered inputs (W above 1), today's merge splits a stream whose
 per-bucket reservation sum exceeds `merge_cursor_budget_bytes` into several
 batches in input order (ADR-2135 decision 2, `reservation_batches`,
-`crates/ravel-maintain/src/rlog.rs:2594-2644`), and batching changes which
-records share a part (`rlog.rs:2904-2913`). D2 reproduces those batches
+`crates/ravel-maintain/src/rlog.rs:3561-3611`), and batching changes which
+records share a part (`rlog.rs:2135-2138`). D2 reproduces those batches
 exactly: it computes them per stream from the same reservation inputs, and
 against the same `merge_cursor_budget_bytes` value as today, never against
 the budget less the resident term. The batches then run in today's order.
