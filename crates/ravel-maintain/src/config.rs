@@ -62,6 +62,8 @@ use crate::request_ledger::RequestLedger;
 ///   decode-side buffers. This is the quantity these merges bound: at most
 ///   one raw block plus one decoded block per input, so it is
 ///   `O(input_count * block_size)` and does NOT scale with stream/trace size.
+///   An RLOG stream-range pass (ADR-3819 D2) holds less: one decoded block,
+///   plus at most `input_read_concurrency` raw row groups when it fetches.
 /// - [`Self::peak_total_bytes`]: `fetched + decoded + writer + probe`, adding
 ///   the in-progress part's writer buffer and the in-flight exact-encode probe.
 ///   The writer term tracks the memory split
@@ -225,9 +227,28 @@ struct MergeMemoryInner {
     plan_index: AtomicU64,
     /// High-water of `plan_index`.
     peak_plan_index: AtomicU64,
+    /// RLOG only: raw row-group bytes the merge fetched once and holds for its
+    /// whole run (ADR-3819 D1). Stored kind. Not part of the transient term:
+    /// it is sized against the resident ceiling before any of it is fetched.
+    resident_raw: AtomicU64,
+    /// High-water of `resident_raw`.
+    peak_resident_raw: AtomicU64,
+    /// RLOG only: the decoded blocks one stream-range pass holds in columnar
+    /// form until each of their rows is handed to the part writer (ADR-3819
+    /// D2), charged per block at its pre-decode ceiling and then reconciled
+    /// to the block view's `heap_estimate()`, plus the pass's block-slot
+    /// containers at capacity. Decoded heap bytes.
+    pass_rows: AtomicU64,
+    /// High-water of `pass_rows`.
+    peak_pass_rows: AtomicU64,
+    /// High-water of the read side alone: `fetched + decoded + resident_raw +
+    /// pass_rows`, the terms the RLOG merge sizes against its resident ceiling
+    /// (ADR-3819). Mixed byte kinds; the writer and probe terms are outside it.
+    peak_read_side: AtomicU64,
     /// High-water of every live term at once:
     /// `fetched + decoded + writer + probe + catalog_plan + catalog_labels +
-    /// plan_index`. Mixed byte kinds, like `peak_total`.
+    /// plan_index + resident_raw + pass_rows`. Mixed byte kinds, like
+    /// `peak_total`.
     peak_resident: AtomicU64,
 }
 
@@ -285,6 +306,13 @@ pub struct MergePhasePeaks {
     /// High-water of the decoded merge state alone (decoded heap): one
     /// series' decoded samples on the RSEG path.
     pub decoded_heap_bytes: u64,
+    /// RLOG: high-water of the raw row-group bytes held for the whole merge
+    /// (ADR-3819 D1). Stored/compressed kind. Zero when the merge fetched per
+    /// pass or per cursor.
+    pub resident_raw_bytes: u64,
+    /// RLOG: high-water of one stream-range pass's held decoded blocks
+    /// (ADR-3819 D2), as their columnar heap. Decoded heap bytes.
+    pub pass_rows_heap_bytes: u64,
 }
 
 impl MergeMemoryTracker {
@@ -405,10 +433,49 @@ impl MergeMemoryTracker {
         self.inner.peak_fetched.load(Ordering::Relaxed)
     }
 
+    /// Account `bytes` of raw row-group bytes held for the rest of the merge.
+    pub fn add_resident_raw_bytes(&self, bytes: u64) {
+        self.inner.resident_raw.fetch_add(bytes, Ordering::Relaxed);
+        self.note();
+    }
+
+    /// Release `bytes` of the resident raw term.
+    pub fn release_resident_raw_bytes(&self, bytes: u64) {
+        saturating_release(&self.inner.resident_raw, bytes);
+    }
+
+    /// Account `bytes` of one pass's retained rows.
+    pub fn add_pass_row_bytes(&self, bytes: u64) {
+        self.inner.pass_rows.fetch_add(bytes, Ordering::Relaxed);
+        self.note();
+    }
+
+    /// Release `bytes` of the pass-rows term.
+    pub fn release_pass_row_bytes(&self, bytes: u64) {
+        saturating_release(&self.inner.pass_rows, bytes);
+    }
+
+    /// High-water of the resident raw term alone.
+    pub fn peak_resident_raw_bytes(&self) -> u64 {
+        self.inner.peak_resident_raw.load(Ordering::Relaxed)
+    }
+
+    /// High-water of the pass-rows term alone.
+    pub fn peak_pass_row_bytes(&self) -> u64 {
+        self.inner.peak_pass_rows.load(Ordering::Relaxed)
+    }
+
     /// High-water of every live term summed at one instant (see the field
     /// doc); mixed byte kinds.
     pub fn peak_resident_bytes(&self) -> u64 {
         self.inner.peak_resident.load(Ordering::Relaxed)
+    }
+
+    /// High-water of `fetched + decoded + resident_raw + pass_rows` summed at
+    /// one instant: what the RLOG merge's resident ceiling bounds. Mixed byte
+    /// kinds.
+    pub fn peak_read_side_bytes(&self) -> u64 {
+        self.inner.peak_read_side.load(Ordering::Relaxed)
     }
 
     /// Recompute the high-water marks from the live counters.
@@ -420,15 +487,31 @@ impl MergeMemoryTracker {
         let catalog_plan = self.inner.catalog_plan.load(Ordering::Relaxed);
         let catalog_labels = self.inner.catalog_labels.load(Ordering::Relaxed);
         let plan_index = self.inner.plan_index.load(Ordering::Relaxed);
+        let resident_raw = self.inner.resident_raw.load(Ordering::Relaxed);
+        let pass_rows = self.inner.pass_rows.load(Ordering::Relaxed);
         let transient = fetched.saturating_add(decoded);
+        let read_side = transient
+            .saturating_add(resident_raw)
+            .saturating_add(pass_rows);
         let total = transient.saturating_add(writer).saturating_add(probe);
         let resident = total
             .saturating_add(catalog_plan)
             .saturating_add(catalog_labels)
-            .saturating_add(plan_index);
+            .saturating_add(plan_index)
+            .saturating_add(resident_raw)
+            .saturating_add(pass_rows);
         self.inner
             .peak_resident
             .fetch_max(resident, Ordering::Relaxed);
+        self.inner
+            .peak_read_side
+            .fetch_max(read_side, Ordering::Relaxed);
+        self.inner
+            .peak_resident_raw
+            .fetch_max(resident_raw, Ordering::Relaxed);
+        self.inner
+            .peak_pass_rows
+            .fetch_max(pass_rows, Ordering::Relaxed);
         self.inner
             .peak_fetched
             .fetch_max(fetched, Ordering::Relaxed);
@@ -597,6 +680,11 @@ impl MergeMemoryTracker {
             &self.inner.peak_catalog_labels,
             &self.inner.plan_index,
             &self.inner.peak_plan_index,
+            &self.inner.resident_raw,
+            &self.inner.peak_resident_raw,
+            &self.inner.pass_rows,
+            &self.inner.peak_pass_rows,
+            &self.inner.peak_read_side,
             &self.inner.peak_resident,
         ] {
             field.store(0, Ordering::Relaxed);
@@ -618,6 +706,8 @@ impl MergeMemoryTracker {
             plan_index_heap_bytes: self.peak_plan_index_bytes(),
             fetched_raw_bytes: self.peak_fetched_bytes(),
             decoded_heap_bytes: self.peak_cursor_decoded_bytes(),
+            resident_raw_bytes: self.peak_resident_raw_bytes(),
+            pass_rows_heap_bytes: self.peak_pass_row_bytes(),
         }
     }
 
@@ -672,6 +762,8 @@ impl MergeMemoryTracker {
             catalog_plan: load(&self.inner.catalog_plan),
             catalog_labels: load(&self.inner.catalog_labels),
             plan_index: load(&self.inner.plan_index),
+            resident_raw: load(&self.inner.resident_raw),
+            pass_rows: load(&self.inner.pass_rows),
         }
     }
 }
@@ -694,6 +786,10 @@ pub struct MergeLiveBytes {
     pub catalog_labels: u64,
     /// RSEG group-by index.
     pub plan_index: u64,
+    /// RLOG raw row-group bytes held for the whole merge.
+    pub resident_raw: u64,
+    /// RLOG retained rows of the current stream-range pass.
+    pub pass_rows: u64,
 }
 
 /// Subtract `bytes` from a live term, stopping at zero rather than wrapping.
@@ -717,6 +813,8 @@ pub(crate) struct MergeCharges<'t> {
     fetched: u64,
     decoded: u64,
     writer: u64,
+    resident_raw: u64,
+    pass_rows: u64,
 }
 
 impl<'t> MergeCharges<'t> {
@@ -729,7 +827,39 @@ impl<'t> MergeCharges<'t> {
             fetched: 0,
             decoded: 0,
             writer: 0,
+            resident_raw: 0,
+            pass_rows: 0,
         }
+    }
+
+    /// [`MergeMemoryTracker::add_resident_raw_bytes`], held until drop.
+    pub(crate) fn add_resident_raw(&mut self, bytes: u64) {
+        if let Some(t) = self.tracker {
+            t.add_resident_raw_bytes(bytes);
+            self.resident_raw = self.resident_raw.saturating_add(bytes);
+        }
+    }
+
+    /// [`MergeMemoryTracker::add_pass_row_bytes`], held until released.
+    pub(crate) fn add_pass_rows(&mut self, bytes: u64) {
+        if let Some(t) = self.tracker {
+            t.add_pass_row_bytes(bytes);
+            self.pass_rows = self.pass_rows.saturating_add(bytes);
+        }
+    }
+
+    /// Release up to `bytes` of this guard's pass-rows charge.
+    pub(crate) fn release_pass_rows(&mut self, bytes: u64) {
+        let bytes = bytes.min(self.pass_rows);
+        if let Some(t) = self.tracker {
+            t.release_pass_row_bytes(bytes);
+        }
+        self.pass_rows -= bytes;
+    }
+
+    /// Release this guard's whole pass-rows charge.
+    pub(crate) fn release_all_pass_rows(&mut self) {
+        self.release_pass_rows(self.pass_rows);
     }
 
     /// Whether a tracker is installed (so an estimate is worth computing).
@@ -825,6 +955,8 @@ impl Drop for MergeCharges<'_> {
         t.release_plan_index_bytes(self.plan_index);
         t.fetch_released(self.fetched);
         t.block_released(self.decoded);
+        t.release_resident_raw_bytes(self.resident_raw);
+        t.release_pass_row_bytes(self.pass_rows);
         if self.writer > 0 {
             t.set_writer_bytes(0);
         }
@@ -1970,6 +2102,18 @@ pub struct CompactorConfig {
     /// even one stream's minimum admissible cursor set does not fit refuses that
     /// stream's merge.
     pub merge_cursor_budget_bytes: u64,
+    /// The memory one RLOG merge may hold in raw row-group bytes kept for its
+    /// whole run plus one stream-range pass's retained rows (ADR-3819).
+    /// `None` reads as [`Self::merge_cursor_budget_bytes`]; see
+    /// [`Self::merge_resident_ceiling`]. The merge holds every input's row
+    /// groups resident only when their raw bytes, the part memory target and
+    /// the worst-case cursor charge of its largest hot stream fit under it;
+    /// otherwise it fetches per pass, and below that per stream exactly as
+    /// before. `Some(0)` therefore selects the per-stream cursor merge for
+    /// every stream. ravel-server sets it to the cursor budget over
+    /// `--maintain-unit-concurrency`; `ravel-cli maintain compact-tenant` to
+    /// its per-bucket cursor budget.
+    pub merge_resident_ceiling_bytes: Option<u64>,
     /// How the RLOG merge admits a stream's cursors (ADR-0979 decision 2).
     /// Default [`AdmissionMode::Overlap`] (the bounded path). Only the
     /// differential part-hash test sets [`AdmissionMode::EagerAll`]; output
@@ -2215,6 +2359,7 @@ impl Default for CompactorConfig {
             footer_probe_bytes: DEFAULT_FOOTER_PROBE_BYTES,
             input_read_concurrency: DEFAULT_INPUT_READ_CONCURRENCY,
             merge_cursor_budget_bytes: DEFAULT_MERGE_CURSOR_BUDGET_BYTES,
+            merge_resident_ceiling_bytes: None,
             merge_admission: AdmissionMode::Overlap,
             rlog_zstd_level: DEFAULT_RLOG_ZSTD_LEVEL,
             compactor_writer_id: Uuid::nil(),
@@ -2246,6 +2391,26 @@ impl Default for CompactorConfig {
 }
 
 impl CompactorConfig {
+    /// [`Self::merge_resident_ceiling_bytes`], or
+    /// [`Self::merge_cursor_budget_bytes`] when it is unset. A ceiling above
+    /// the cursor budget is clamped to it with a warning: the budget is the
+    /// memory the merge is allowed to hold beside the writer, and the ceiling
+    /// only divides it between resident groups and passes.
+    pub fn merge_resident_ceiling(&self) -> u64 {
+        match self.merge_resident_ceiling_bytes {
+            None => self.merge_cursor_budget_bytes,
+            Some(ceiling) if ceiling > self.merge_cursor_budget_bytes => {
+                tracing::warn!(
+                    merge_resident_ceiling_bytes = ceiling,
+                    merge_cursor_budget_bytes = self.merge_cursor_budget_bytes,
+                    "merge_resident_ceiling_bytes exceeds merge_cursor_budget_bytes; clamped to the budget"
+                );
+                self.merge_cursor_budget_bytes
+            }
+            Some(ceiling) => ceiling,
+        }
+    }
+
     /// The memory split target the RLOG merge closes a part at:
     /// [`Self::rlog_l1_part_memory_target_bytes`] when set, else
     /// [`Self::l1_part_memory_target_bytes`].
@@ -3107,6 +3272,8 @@ mod tests {
         charges.fetched(400);
         charges.decoded(100, 500);
         charges.set_writer(600);
+        charges.add_resident_raw(700);
+        charges.add_pass_rows(800);
     }
 
     /// A panic while a merge holds charges still releases them as it unwinds.
@@ -3122,6 +3289,40 @@ mod tests {
         assert!(unwound.is_err());
         assert_eq!(tracker.live_bytes(), MergeLiveBytes::default());
         assert_eq!(tracker.phase_peaks().catalog_plan_heap_bytes, 1_000);
+    }
+
+    /// The read-side high-water sums fetched, decoded, resident raw and pass
+    /// rows at one instant, and leaves the writer and probe terms out.
+    #[test]
+    fn the_read_side_peak_sums_the_ceiling_terms_only() {
+        let tracker = MergeMemoryTracker::new();
+        let mut charges = MergeCharges::new(Some(&tracker));
+        charge_every_term(&mut charges);
+        // 400 fetched, of which `decoded` released 100, + 500 decoded + 700
+        // resident raw + 800 pass rows. The 600 writer bytes are not in it.
+        assert_eq!(tracker.peak_read_side_bytes(), 300 + 500 + 700 + 800);
+        charges.release_all_pass_rows();
+        assert_eq!(tracker.peak_read_side_bytes(), 300 + 500 + 700 + 800);
+        drop(charges);
+        tracker.reset_for_run();
+        assert_eq!(tracker.peak_read_side_bytes(), 0);
+    }
+
+    /// A resident ceiling above the cursor budget resolves to the budget; one
+    /// at or below it, or unset, resolves as given.
+    #[test]
+    fn a_resident_ceiling_above_the_cursor_budget_is_clamped_to_it() {
+        let mut config = CompactorConfig {
+            merge_cursor_budget_bytes: 1_000,
+            ..CompactorConfig::default()
+        };
+        assert_eq!(config.merge_resident_ceiling(), 1_000);
+        for (set, resolved) in [(0, 0), (999, 999), (1_000, 1_000), (1_001, 1_000)] {
+            config.merge_resident_ceiling_bytes = Some(set);
+            assert_eq!(config.merge_resident_ceiling(), resolved, "set {set}");
+        }
+        config.merge_resident_ceiling_bytes = Some(u64::MAX);
+        assert_eq!(config.merge_resident_ceiling(), 1_000);
     }
 
     /// A release larger than the guard's own charge takes only that charge,

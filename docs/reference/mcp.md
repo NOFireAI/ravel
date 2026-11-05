@@ -517,7 +517,7 @@ it reads anything:
 | no `ORDER BY`, and no projected row identity to order by (only `samples` has one: `ts` and `series_id`) | runs as written, unpaged |
 | an `ORDER BY` term that is a `count(...)`, such as `count(*)`, `count(DISTINCT x)`, a count with `FILTER`, `-count(*)` or `count(*) OVER ()`, through an alias or written as the expression a projected column is defined as | runs, paged over page one's segment set |
 | an `ORDER BY` term that is a `min(col)` or `max(col)` under a plain `GROUP BY`, where `col` is a NOT NULL column of the table of a signed or unsigned integer, string or nanosecond timestamp type with no time zone, such as `max(ts)` on `samples` or `max(severity_num)` on `logs`, through an alias or written as the expression a projected column is defined as | runs, paged over page one's segment set |
-| any other `ORDER BY` term computed from rows other than its own: an aggregate such as `sum(value)`, `avg(value)`, `min(value)` or `min(series_id)`, a `min` or `max` with `FILTER` or `OVER`, or under `ROLLUP`, `CUBE`, `GROUPING SETS` or no `GROUP BY`, a window function such as `row_number() OVER (...)`, a count over a `ROWS` frame or a named window, or a subquery, whether ordered by directly or through an alias | runs as written, unpaged |
+| any other `ORDER BY` term computed from rows other than its own: an aggregate such as `sum(value)`, `sum(duration_ns)` (a `sum` over any column), `avg(value)`, `min(value)` or `min(series_id)`, a `min` or `max` with `FILTER` or `OVER`, or under `ROLLUP`, `CUBE`, `GROUPING SETS` or no `GROUP BY`, a window function such as `row_number() OVER (...)`, a count over a `ROWS` frame or a named window, or a subquery, whether ordered by directly or through an alias | runs as written, unpaged |
 | any other `SELECT` over one table | runs, paged |
 
 A float `ORDER BY` term is refused because a NaN or infinite value has no
@@ -543,7 +543,13 @@ NULL column is a value of that column, of the column's type. The argument
 is read from the table, never from the projection, so `max(ts)` beside
 `value AS ts` is the maximum of the table's `ts`. Float, Boolean and binary
 columns are not on the list, and neither is `samples`' `series_id`, so
-`min(series_id)` runs unpaged. Any other such term is not proven non-null,
+`min(series_id)` runs unpaged. A `sum` never pages, though a `sum` of a
+NOT NULL column under a plain `GROUP BY` is not NULL either. Over a float
+column the engine adds partial sums in the order its partitions finish, so
+two runs over the same segments can differ in the last bits. Over an
+integer column the sum is `Int64` for a signed argument and `UInt64` for an
+unsigned one, and it wraps past that range with no error, so the order of
+the sums is not the order of the totals. Any other such term is not proven non-null,
 so the statement runs once, in its own order, and a capped result ends
 `ok_bounded` with no cursor. To page it, order by a `count(...)`, by a
 `min(col)` or `max(col)` the planner proves, or by the row's own non-null
@@ -1222,7 +1228,8 @@ after page one can change its value for a row already served. A
 plain `GROUP BY` over a NOT NULL integer, string or nanosecond timestamp
 column. Every page of such a walk is computed over page one's segment set
 or is refused with `cursor_expired`, so within the walk a row is not
-served twice and not skipped. Any other such term carries no cursor.
+served twice and not skipped. Any other such term carries no cursor, a
+`sum` among them.
 
 `ravel_search_logs` orders by `(ts, observed_ts)`. That pair is not
 unique, because `logs` rows carry no row identity and ingest is
@@ -1230,7 +1237,10 @@ at-least-once. If a group of rows equal on the pair does not fit on the
 page whole, the tool drops the whole group from the page, and the cursor
 resumes after the last complete group. To request the second page, pass the
 cursor from `presentation.cursor` back as `cursor`, with the same
-arguments.
+arguments. As `ravel_query_sql` does, the tool checks the last row's
+`(ts, observed_ts)` against the plan before it mints: a row whose values
+the plan would refuse as a resume position ends the page `ok_bounded` with
+no cursor and a `narrow_time_range` next step.
 
 `ravel_get_trace` mints no cursor: it returns the trace's spans in one
 page ordered by `(start_ts, span_id)`, and a trace larger than the row cap

@@ -660,6 +660,15 @@ fn finish(
                 "the cursor after the last row is {len} bytes, over the {CURSOR_BOUND}-byte bound"
             )));
         }
+        // A tuple the redemption would refuse is refused here instead, so the
+        // page is ok_bounded rather than carrying a cursor that only fails.
+        if !plan.admits_resume(tuple) {
+            return Err(unmintable(
+                "the last row's (ts, observed_ts) are not of the types the order was planned \
+                 with, so a cursor after it could not be redeemed"
+                    .to_string(),
+            ));
+        }
         Ok(token)
     })
 }
@@ -1602,13 +1611,48 @@ mod tests {
     }
 
     /// A cursor whose tuple does not have the order terms' types is
-    /// `cursor_invalid` before the backend. Page one mints it from `Int`
-    /// values where `ts` and `observed_ts` take `TimestampNanos`.
+    /// `cursor_invalid` before the backend. Page one's cursor is re-signed
+    /// with `Int` values where `ts` and `observed_ts` take `TimestampNanos`.
     ///
     /// FLIP: dropping `ResumeValueTypeMismatch` from `resume_plan`'s cursor
     /// arm sends it to `plan_refusal`, which answers `invalid_argument`.
     #[test]
     fn a_cursor_whose_tuple_has_another_type_is_invalid() {
+        let key = key();
+        let stub = Stub::default();
+        stub.sql
+            .borrow_mut()
+            .push_back(plain(&[("a", 1, 1), ("b", 2, 2), ("c", 3, 3)]));
+        let one = block_on(run(args(json!({})), &context(&key), &stub));
+        let token = one
+            .presentation
+            .cursor
+            .as_deref()
+            .expect("page one's cursor");
+        let mut forged = Cursor::decode(token, &key).expect("decodes");
+        let CursorPosition::Keyset { tuple, .. } = &mut forged.position else {
+            panic!("a keyset position: {:?}", forged.position);
+        };
+        *tuple = encode_resume_tuple(&[ResumeValue::Int(2), ResumeValue::Int(2)]).expect("encodes");
+        let cursor = forged.encode(&key).expect("re-signs");
+
+        let mut resumed = args(json!({}));
+        resumed["cursor"] = json!(cursor);
+        let two = block_on(run(resumed, &later(&key), &stub));
+        assert_eq!(failure_class(&two), FailureClass::CursorInvalid);
+        assert_eq!(stub.executed.borrow().len(), 1);
+    }
+
+    /// A last row whose `(ts, observed_ts)` the plan's kinds refuse mints no
+    /// cursor: page one is `ok_bounded` with no cursor and the
+    /// `narrow_time_range` step, rather than handing out a cursor every
+    /// redemption of which is `cursor_invalid`. The last kept row carries
+    /// `Int` values where the order takes `TimestampNanos`.
+    ///
+    /// FLIP: removing the mint-time check in `finish` (leaving the check at
+    /// redemption only) mints a cursor.
+    #[test]
+    fn a_last_row_of_the_wrong_kind_mints_no_cursor() {
         let key = key();
         let stub = Stub::default();
         let ints = |i: i64| Some(vec![ResumeValue::Int(i), ResumeValue::Int(i)]);
@@ -1619,13 +1663,20 @@ mod tests {
                 ints(3),
             ]),
         );
-        let one = block_on(run(args(json!({})), &context(&key), &stub));
-        let cursor = one.presentation.cursor.clone().expect("page one's cursor");
 
-        let mut resumed = args(json!({}));
-        resumed["cursor"] = json!(cursor);
-        let two = block_on(run(resumed, &later(&key), &stub));
-        assert_eq!(failure_class(&two), FailureClass::CursorInvalid);
+        let page = block_on(run(args(json!({})), &context(&key), &stub));
+
+        assert_eq!(page.status, Status::OkBounded, "{page:?}");
+        assert_eq!(page.presentation.cursor, None);
+        assert_eq!(ids(&page), ["a", "b"]);
+        assert_eq!(actions(&page), ["narrow_time_range"]);
+        assert_eq!(
+            page.warnings,
+            [
+                "no cursor: the last row's (ts, observed_ts) are not of the types the order \
+                 was planned with, so a cursor after it could not be redeemed"
+            ]
+        );
         assert_eq!(stub.executed.borrow().len(), 1);
     }
 

@@ -1702,16 +1702,32 @@ L0 write, the compactor performs them by decoding each input back to
 records and feeding the merged records through the same writer via
 `finish_compacted`; the L0 and L1 encoders are one implementation.
 
-No input is decoded whole. The merge is a k-way streaming merge with one
-cursor per input over the stream it is merging, and its read-side working
-set is one row group's stored bytes plus one decoded block per input: the
-row group is what one ranged GET brings (under version 4 a block's pages
-are spread across the group's column chunks, so no smaller contiguous
-range holds a whole block), and the group's blocks are decoded one at a
-time out of those bytes, each released before the next. The one term that
-scales with the data is the in-progress output segment's own buffer, bounded
-by the segment size cap, because a segment's content-addressed key does not
-exist until the whole output segment is encoded.
+No input is decoded whole. The unit of reading is the row group: it is what
+one ranged GET brings (under version 4 a block's pages are spread across the
+group's column chunks, so no smaller contiguous range holds a whole block).
+The merge emits streams in sorted stream-id order, each a k-way merge over
+the inputs carrying it, and reads the row groups in one of three modes it
+picks from catalog metadata before the first block GET (ADR-3819):
+
+- **resident**: every input's candidate row groups are fetched once and
+  held for the whole merge, when their raw bytes fit the resident ceiling
+  with a pass of at least the RLOG part memory target beside them;
+- **fetch-per-pass**: each pass over a contiguous range of streams fetches
+  the row groups its streams fall in, once per pass;
+- **cursor**: when neither fits, one cursor per input over the stream it is
+  merging, holding one row group's stored bytes plus one decoded block,
+  each block released before the next.
+
+A pass decodes each of its blocks once and holds the range's rows in
+columnar form until they are emitted; its blocks' decoded costs are held
+within the pass budget the resident ceiling leaves. A stream too large for
+a pass stays on cursors in every mode, reading the held groups when the
+merge is resident. The mode changes only how bytes are read: every mode
+emits the same record sequence, so an output segment's bytes and key do not
+depend on it. The one term that scales with the data is the in-progress
+output segment's own buffer, bounded by the segment size cap, because a
+segment's content-addressed key is known only once the whole output segment
+is encoded.
 
 ## Tokenizer
 

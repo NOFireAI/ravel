@@ -154,8 +154,10 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   groups already served: a later page whose segments changed is
   `cursor_expired` with a `rerun_page_one` next step. A statement with no
   `ORDER BY` over a table with no row identity runs unpaged, and so does
-  one ordered by another aggregate (`sum`, `avg`, a `min` or `max` over a
-  float column or `series_id`), a window function or a subquery
+  one ordered by another aggregate (`sum` over any column, since a float
+  sum can differ in its last bits between runs and an integer sum wraps
+  past the 64-bit range; `avg`; a `min` or `max` over a float column or
+  `series_id`), a window function or a subquery
   (`ORDER BY sum(value)`): a full page of
   either is `ok_bounded` with no cursor and a next step saying how to order
   it to page. An
