@@ -4260,4 +4260,118 @@ mod with_mcp {
         client.cancel().await.expect("client stops");
         running.shutdown().await.expect("server stops");
     }
+
+    /// `ravel_get_trace` with `include_logs: true` through `POST /mcp`, over
+    /// published spans of trace [`TRACE_T`] and log lines of which two carry
+    /// it inside the window: the spans come back as without the leg, the
+    /// `logs` block holds exactly those two lines in `ts` order, the scan
+    /// warning is present, the leg's spend is reported apart from the span
+    /// lookup's, and `budget.actual` is their sum.
+    ///
+    /// FLIP: a body that ignores `include_logs` has no `logs` block.
+    #[tokio::test]
+    async fn get_trace_include_logs_returns_the_trace_log_lines() {
+        let (store, metrics) = instrumented_memory();
+        let (root, child) = ([0x01; 8], [0x02; 8]);
+        publish_trace(
+            store.as_ref(),
+            &[
+                (root, None, 10 * NS_PER_SEC),
+                (child, Some(root), 20 * NS_PER_SEC),
+            ],
+        )
+        .await;
+        let log = |ts_s: i64, body, trace_id| TestLog {
+            ts_ns: ts_s * NS_PER_SEC,
+            severity_num: 9,
+            body,
+            trace_id,
+            attrs: vec![("region", "eu")],
+        };
+        publish_logs(
+            store.as_ref(),
+            &[
+                log(12, "trace start", Some(TRACE_T)),
+                log(15, "other trace", Some([0xcd; 16])),
+                log(18, "no trace", None),
+                log(25, "trace end", Some(TRACE_T)),
+                log(70, "trace late", Some(TRACE_T)),
+            ],
+        )
+        .await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+        let arguments = |include_logs: bool| {
+            serde_json::json!({
+                "trace_id": "7e".repeat(16),
+                "time_range": {"start_ns": "0", "end_ns": (60 * NS_PER_SEC).to_string()},
+                "include_logs": include_logs,
+            })
+        };
+
+        let (is_error, plain) = call(&client, "ravel_get_trace", arguments(false)).await;
+        assert_eq!(is_error, Some(false), "{plain}");
+        assert!(plain.get("logs").is_none(), "{plain}");
+
+        let (is_error, found) = call(&client, "ravel_get_trace", arguments(true)).await;
+        assert_eq!(is_error, Some(false), "{found}");
+        assert_eq!(found["status"], serde_json::json!("ok"), "{found}");
+        assert_eq!(found["data"], plain["data"]);
+        assert_eq!(
+            span_tree(&found),
+            [
+                serde_json::json!(["0101010101010101", "0", "root"]),
+                serde_json::json!(["0202020202020202", "1", "present"]),
+            ]
+        );
+        let logs = &found["logs"];
+        assert_eq!(logs["status"], serde_json::json!("ok"), "{found}");
+        assert_eq!(
+            bodies(&serde_json::json!({"data": logs})),
+            ["trace start", "trace end"],
+            "{found}"
+        );
+        assert_eq!(logs["rows_omitted"], serde_json::json!(0));
+        assert!(
+            found["warnings"]
+                .as_array()
+                .expect("warnings")
+                .contains(&serde_json::json!(
+                    ravel_mcp::tools::get_trace::LOGS_SCAN_WARNING
+                )),
+            "{found}"
+        );
+        assert_eq!(found["budget"]["estimate_is_upper_envelope"], false);
+        for figure in [
+            "bytes_scanned",
+            "store_requests",
+            "segments_read",
+            "decompressed_bytes",
+        ] {
+            let read = |value: &serde_json::Value| {
+                value
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("{figure} is a count in {found}"))
+            };
+            let spans = read(&logs["span_lookup_budget"]["actual"][figure]);
+            let leg = read(&logs["budget"]["actual"][figure]);
+            assert_eq!(
+                read(&found["budget"]["actual"][figure]),
+                spans + leg,
+                "{figure}"
+            );
+        }
+        assert!(
+            logs["budget"]["actual"]["store_requests"]
+                .as_u64()
+                .is_some_and(|requests| requests > 0),
+            "the leg read the log object: {found}"
+        );
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
 }
