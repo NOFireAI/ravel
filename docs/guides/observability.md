@@ -2442,8 +2442,10 @@ over SQL on `POST /api/v1/sql`, ES|QL on `POST /api/v1/esql`, and the MCP
 tools that run SQL, `search_logs` among them. Flight SQL, pinned and
 distributed alike, and `EXPLAIN` do not route logs: their scans take the
 per-object probe and leave the logs samples unmoved. A logs
-leaf at `format_version` 1 counts under `outcome="rejected"`; a leaf range
-the fetch memory budget refuses counts under `outcome="reservation_refused"`.
+leaf at `format_version` 1 counts under `outcome="rejected"`. A logs leaf
+range the fetch memory budget refuses counts under
+`outcome="reservation_refused"`; a spans leaf range it refuses counts under
+`outcome="rejected"`.
 
 | Metric | Labels | HELP text |
 |---|---|---|
