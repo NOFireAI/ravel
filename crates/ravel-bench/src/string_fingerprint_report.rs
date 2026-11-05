@@ -556,6 +556,15 @@ fn load_subject(path: &Path, name: &str) -> Result<SubjectSpec, String> {
 pub fn run(cfg: &Config) -> Result<RunReport, String> {
     let subject = load_subject(&cfg.spec_path, &cfg.subject)?;
     refuse_param_drift(&subject, &cfg.overrides)?;
+    #[cfg(feature = "parquet-baseline")]
+    if let Corpus::ParquetColumn { column, .. } = &cfg.corpus
+        && *column != subject.column
+    {
+        return Err(format!(
+            "subject {}: refusing --corpus-column {column:?}: the pre-registered column is {:?}",
+            subject.name, subject.column
+        ));
+    }
     let stamp = stamp(cfg.corpus.path(), subject.zstd_level)?;
 
     let values = read_values(&cfg.corpus, subject.max_lines)?;
@@ -815,6 +824,25 @@ mod tests {
         assert!(err.contains("neither Utf8 nor Binary"), "{err}");
         let err = read("Missing", u64::MAX).expect_err("no column");
         assert!(err.contains("no column \"Missing\""), "{err}");
+    }
+
+    #[cfg(feature = "parquet-baseline")]
+    #[test]
+    fn refuses_a_parquet_column_other_than_the_registered_one() {
+        let parquet = |column: &str| {
+            let mut c = cfg("test_subject", Overrides::default());
+            c.corpus = Corpus::ParquetColumn {
+                path: fixture("no-such-corpus.parquet"),
+                column: column.to_string(),
+            };
+            run(&c).expect_err("no corpus")
+        };
+        let err = parquet("URL");
+        assert!(err.contains("refusing --corpus-column \"URL\""), "{err}");
+        assert!(!err.contains("no-such-corpus"), "{err}");
+        // The registered column passes the check and fails on the missing file.
+        let err = parquet("value");
+        assert!(err.contains("no-such-corpus"), "{err}");
     }
 
     #[test]

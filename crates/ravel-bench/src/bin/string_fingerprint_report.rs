@@ -52,7 +52,9 @@ struct Args {
     #[cfg(feature = "parquet-baseline")]
     #[arg(long, requires = "corpus_column", conflicts_with_all = ["corpus_lines", "decide"])]
     corpus_parquet: Option<PathBuf>,
-    /// The Parquet column `--corpus-parquet` reads.
+    /// The Parquet column `--corpus-parquet` reads. Must equal the subject's
+    /// pre-registered `column`; any other value is refused before the corpus
+    /// is read.
     #[cfg(feature = "parquet-baseline")]
     #[arg(long, requires = "corpus_parquet")]
     corpus_column: Option<String>,
