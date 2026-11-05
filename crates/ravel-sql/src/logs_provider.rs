@@ -29,7 +29,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::DFSchema;
 use datafusion::error::Result as DFResult;
+use datafusion::logical_expr::expr_rewriter::unnormalize_col;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 #[cfg(feature = "flight-sql")]
 use datafusion::physical_expr::expressions::col;
@@ -54,7 +56,7 @@ use crate::distributed_rlog::{
 #[cfg(feature = "flight-sql")]
 use crate::flight_ticket::SlicePushdown;
 use crate::logs_pushdown::{LogsPushdown, extract_logs_keyed, filter_is_exact};
-use crate::logs_scan::{LogsScanExec, ScanExecutions};
+use crate::logs_scan::{LogsScanExec, RowFilters, ScanExecutions};
 use crate::logs_schema::{logs_schema, logs_schema_with_declared};
 use crate::logs_stats_prune::prune_segments_by_stats;
 use crate::scan_budget::ScanBudget;
@@ -110,6 +112,11 @@ pub struct LogsTableProvider {
     /// Always `true` outside tests, which turn it off to compare against the
     /// unpushed scan.
     contains_pushdown: bool,
+    /// Whether [`TableProvider::scan`] hands the scan the
+    /// [`LogsPushdown::row_filters`] conjuncts to evaluate on each batch it
+    /// builds (ADR-0093, exact not-equal amendment). Always `true` outside
+    /// tests, which turn it off for the reference the residual alone answers.
+    row_filter_pushdown: bool,
     /// The executor's record of scan executions (issue #3192), handed to
     /// every `LogsScanExec` this provider builds. `None` by default, installed
     /// with [`Self::with_scan_executions`].
@@ -149,6 +156,7 @@ impl LogsTableProvider {
             segment_timing: false,
             stats_pruning: true,
             contains_pushdown: true,
+            row_filter_pushdown: true,
             scan_executions: None,
             scan_budget,
         }
@@ -202,7 +210,7 @@ impl LogsTableProvider {
             .and_then(SlicePushdown::as_logs)
             .cloned()
             .unwrap_or_default();
-        let scan = self.build_scan(target_partitions, &pushdown, None)?;
+        let scan = self.build_scan(target_partitions, &pushdown, None, RowFilters::default())?;
         sort_slice_fragment(scan, &self.schema, LOGS_ORDER_COLS)
     }
 
@@ -310,15 +318,31 @@ impl LogsTableProvider {
         self
     }
 
+    /// Turn the scan's row filter off, so the residual `FilterExec` above the
+    /// scan is the only evaluator of a declared `Str` column's `<>`. For tests
+    /// that compare answers and counters against the scan with it on.
+    #[doc(hidden)]
+    pub fn with_row_filter_pushdown(mut self, row_filter_pushdown: bool) -> Self {
+        self.row_filter_pushdown = row_filter_pushdown;
+        self
+    }
+
     /// Build the scan over every segment in the snapshot with no pushdown and
     /// no projection (every column). Exposed (like the metrics provider's
     /// `plan`) so tests can execute the scan without a SQL front-end.
     pub fn plan(&self, target_partitions: usize) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.build_scan(target_partitions, &LogsPushdown::default(), None)
+        self.build_scan(
+            target_partitions,
+            &LogsPushdown::default(),
+            None,
+            RowFilters::default(),
+        )
     }
 
     /// Build the scan for a set of filters, extracting the pushdown from them.
     /// Exposed so tests exercise the whole `extract_logs` -> prune -> scan path.
+    /// With no session to build physical expressions, the scan gets no row
+    /// filter; the caller's residual evaluates those conjuncts.
     pub fn plan_filters(
         &self,
         target_partitions: usize,
@@ -328,6 +352,7 @@ impl LogsTableProvider {
             target_partitions,
             &extract_logs_keyed(filters, self.declared.as_ref(), &self.key_index),
             None,
+            RowFilters::default(),
         )
     }
 
@@ -345,6 +370,7 @@ impl LogsTableProvider {
         target_partitions: usize,
         pushdown: &LogsPushdown,
         projection: Option<&Vec<usize>>,
+        row_filters: RowFilters,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let segments = self.pruned_segments(pushdown);
         let (segments, pruned_by_stats) = if self.stats_pruning {
@@ -371,13 +397,19 @@ impl LogsTableProvider {
             self.phase_accounting.clone(),
             Arc::clone(&self.schema),
             Arc::clone(&self.declared),
-        )?
-        .with_column_stats(self.column_stats.clone())
-        .with_segment_timing(self.segment_timing)
-        .with_segments_pruned_by_stats(pruned_by_stats)
-        .with_key_equals(Arc::new(pushdown.key_equals.clone()))
-        .with_scan_executions(self.scan_executions.clone())
-        .with_scan_budget(self.scan_budget.clone());
+        )?;
+        let scan = if row_filters.is_empty() {
+            scan
+        } else {
+            scan.with_row_filters(row_filters)?
+        };
+        let scan = scan
+            .with_column_stats(self.column_stats.clone())
+            .with_segment_timing(self.segment_timing)
+            .with_segments_pruned_by_stats(pruned_by_stats)
+            .with_key_equals(Arc::new(pushdown.key_equals.clone()))
+            .with_scan_executions(self.scan_executions.clone())
+            .with_scan_budget(self.scan_budget.clone());
         Ok(Arc::new(scan))
     }
 
@@ -522,7 +554,24 @@ impl TableProvider for LogsTableProvider {
         // adds the columns its own pushed content predicates and pending erasure
         // predicates need (`logs_scan::resolve_columns`); those are not visible
         // in the projection at all.
-        self.build_scan(target_partitions, &pushdown, projection)
+        //
+        // The row filter conjuncts are built by this session against the full
+        // `logs` schema, unqualified as the physical planner hands filters to
+        // a provider, the expression a `FilterExec` above would run; the
+        // scan rebinds their columns to its build schema and builds a column
+        // the projection leaves out (`logs_scan::row_filter`).
+        if !self.row_filter_pushdown {
+            pushdown.row_filters.clear();
+        }
+        let full = DFSchema::try_from(self.schema.as_ref().clone())?;
+        let row_filters = RowFilters::new(
+            pushdown
+                .row_filters
+                .iter()
+                .map(|e| state.create_physical_expr(unnormalize_col(e.clone()), &full))
+                .collect::<DFResult<Vec<_>>>()?,
+        );
+        self.build_scan(target_partitions, &pushdown, projection, row_filters)
     }
 }
 

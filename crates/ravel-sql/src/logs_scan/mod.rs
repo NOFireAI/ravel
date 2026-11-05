@@ -429,12 +429,15 @@ use ravel_logseg::record::canonical_value_bytes;
 mod batch;
 mod limit_hint;
 mod plan;
+mod row_filter;
 mod scan;
 mod threshold;
 
 use batch::*;
 pub(crate) use plan::ScanExecutions;
 use plan::*;
+pub(crate) use row_filter::RowFilters;
+use row_filter::{BoundRowFilters, filter_batches};
 use scan::*;
 use threshold::*;
 
@@ -1182,8 +1185,23 @@ pub struct LogsScanExec {
     /// Indices into the resolved full schema this scan emits, in output order.
     /// Always concrete: a `None` projection from DataFusion becomes every index.
     projection: Arc<Vec<usize>>,
+    /// The conjuncts the scan evaluates on each batch it builds (ADR-0093,
+    /// exact not-equal amendment), bound to the resolved full schema. Empty
+    /// unless the provider extracted one.
+    row_filters: RowFilters,
+    /// `projection` followed by every column `row_filters` reads that it does
+    /// not name, in full-schema order: what each batch is built with before
+    /// the row filter runs. Equal to `projection` with no row filter.
+    build_projection: Arc<Vec<usize>>,
+    /// The schema batches are built in: `build_projection`'s fields, then the
+    /// row-ref column when `row_refs` is set. Equal to [`Self::schema`] with no
+    /// row filter column outside the projection.
+    build_schema: SchemaRef,
+    /// `row_filters` bound to `build_schema`, with the build columns that form
+    /// the output; `None` with no row filter.
+    bound_row_filters: Option<Arc<BoundRowFilters>>,
     /// The block columns the reader must decode, resolved once from
-    /// `projection`, `content`, `erasure`, and `declared` (see
+    /// `build_projection`, `content`, `erasure`, and `declared` (see
     /// [`resolve_columns`]).
     columns: ColumnSelection,
     /// The share of an object's bytes `columns` is expected to read
@@ -1435,6 +1453,11 @@ struct BlockMetrics {
     /// Cells this partition's pushed `Contains` arms tested for their needle
     /// ([`ScanStats::contains_cells_tested`], ADR-2773 contains-arm amendment).
     contains_cells_tested: Count,
+    /// Rows this partition built and then removed with its row filter
+    /// ([`LogsScanExec::row_filters`], ADR-0093 exact not-equal amendment), on
+    /// either path, before any of them was emitted or charged
+    /// (`answers_match_the_residual_on_every_value_shape`).
+    rows_dropped_by_row_filter: Count,
     /// String cells this partition UTF-8 validated: the reader's dictionary
     /// entries on either path (undeclared columns included when `attrs` is
     /// projected) and the cells of the all-UTF-8 plain `Str` pages its
@@ -1612,6 +1635,8 @@ impl BlockMetrics {
                 .counter("rows_predicate_evaluated", partition),
             contains_cells_tested: MetricBuilder::new(metrics)
                 .counter("contains_cells_tested", partition),
+            rows_dropped_by_row_filter: MetricBuilder::new(metrics)
+                .counter("rows_dropped_by_row_filter", partition),
             str_cells_validated: MetricBuilder::new(metrics)
                 .counter("str_cells_validated", partition),
             str_dict_values_built: MetricBuilder::new(metrics)
@@ -1774,6 +1799,7 @@ impl LogsScanExec {
             declared,
             Vec::new(),
             false,
+            RowFilters::default(),
         )
     }
 
@@ -1807,6 +1833,7 @@ impl LogsScanExec {
             Arc::clone(&self.declared),
             self.attr_keys.as_ref().clone(),
             row_refs,
+            self.row_filters.clone(),
         )
         .map(|scan| {
             scan.with_column_stats(self.column_stats.clone())
@@ -1854,6 +1881,43 @@ impl LogsScanExec {
             Arc::clone(&self.declared),
             attr_keys,
             false,
+            self.row_filters.clone(),
+        )
+        .map(|scan| {
+            scan.with_column_stats(self.column_stats.clone())
+                .with_segment_timing(self.segment_timing)
+                .with_segments_pruned_by_stats(self.segments_pruned_by_stats)
+                .with_key_equals(Arc::clone(&self.key_equals))
+                .with_fetch_pushed(self.fetch)
+                .with_limit_hint(self.limit_hint)
+                .with_topk(self.topk.clone())
+                .with_scan_executions(self.scan_executions.clone())
+                .with_scan_budget(self.budget.clone())
+        })
+    }
+
+    /// This scan evaluating `row_filters` on every batch it builds (ADR-0093,
+    /// exact not-equal amendment), rebuilt through [`Self::build`] so the build
+    /// projection, the decoded columns and the bound expressions follow from
+    /// it. Everything else is carried over as [`Self::reproject`] carries it.
+    pub(crate) fn with_row_filters(&self, row_filters: RowFilters) -> DFResult<Self> {
+        Self::build(
+            self.tenant_hash,
+            self.fetcher.clone(),
+            &self.segments,
+            self.target_partitions,
+            self.ts_min,
+            self.ts_max,
+            Arc::clone(&self.content),
+            Arc::clone(&self.prune),
+            Arc::clone(&self.erasure),
+            Some(self.projection.as_ref().clone()),
+            self.phase_accounting.clone(),
+            Arc::clone(&self.full_schema),
+            Arc::clone(&self.declared),
+            self.attr_keys.as_ref().clone(),
+            self.row_refs,
+            row_filters,
         )
         .map(|scan| {
             scan.with_column_stats(self.column_stats.clone())
@@ -2035,6 +2099,10 @@ impl LogsScanExec {
             key_equals: Arc::clone(&self.key_equals),
             erasure: Arc::clone(&self.erasure),
             projection: Arc::clone(&self.projection),
+            row_filters: self.row_filters.clone(),
+            build_projection: Arc::clone(&self.build_projection),
+            build_schema: Arc::clone(&self.build_schema),
+            bound_row_filters: self.bound_row_filters.clone(),
             columns: self.columns.clone(),
             projected_fraction: self.projected_fraction,
             declared: Arc::clone(&self.declared),
@@ -2077,6 +2145,7 @@ impl LogsScanExec {
         declared: Arc<Vec<DeclaredColumn>>,
         attr_keys: Vec<String>,
         row_refs: bool,
+        row_filters: RowFilters,
     ) -> DFResult<Self> {
         // Blocks, not segments, are what get striped (ADR-0102), but the
         // per-segment block counts are not known until a prune runs, which is
@@ -2148,8 +2217,20 @@ impl LogsScanExec {
                 )));
             }
         }
+        // A row filter column the projection does not name is built too, and
+        // dropped once the filter has run.
+        let mut build_projection = projection.clone();
+        let mut filter_only: Vec<usize> = Vec::new();
+        for name in row_filters.column_names() {
+            let i = effective.index_of(&name)?;
+            if !build_projection.contains(&i) && !filter_only.contains(&i) {
+                filter_only.push(i);
+            }
+        }
+        filter_only.sort_unstable();
+        build_projection.extend(filter_only);
         let resolved = resolve_columns(
-            &projection,
+            &build_projection,
             &content,
             &erasure,
             &declared,
@@ -2158,19 +2239,32 @@ impl LogsScanExec {
         );
         let projected_fraction = resolved.fraction_of(declared.len());
         let columns = resolved.selection;
-        let projected = effective.project(&projection)?;
         // The row-ref column is synthesized per row from the scan's own cursor
         // position, not decoded, so it contributes nothing to `columns` and
         // sits last, past every projected column, where a remapped column index
         // cannot collide with it.
-        let schema: SchemaRef = if row_refs {
-            let mut fields = projected.fields().to_vec();
-            fields.push(Arc::new(row_ref_field()));
-            Arc::new(Schema::new(fields))
-        } else {
-            Arc::new(projected)
+        let with_row_ref = |projected: Schema| -> SchemaRef {
+            if row_refs {
+                let mut fields = projected.fields().to_vec();
+                fields.push(Arc::new(row_ref_field()));
+                Arc::new(Schema::new(fields))
+            } else {
+                Arc::new(projected)
+            }
         };
-        let columnar_eligible = columnar_static_eligible(&projection, &erasure);
+        let schema = with_row_ref(effective.project(&projection)?);
+        let build_schema = if build_projection.len() == projection.len() {
+            Arc::clone(&schema)
+        } else {
+            with_row_ref(effective.project(&build_projection)?)
+        };
+        let keep = (build_projection.len() != projection.len()).then(|| {
+            (0..projection.len())
+                .chain(row_refs.then_some(build_projection.len()))
+                .collect()
+        });
+        let bound_row_filters = row_filters.bind(&build_schema, keep, Arc::clone(&schema))?;
+        let columnar_eligible = columnar_static_eligible(&build_projection, &erasure);
         let properties = Arc::new(Self::compute_properties(&schema, declared_partitions));
         Ok(LogsScanExec {
             tenant_hash,
@@ -2187,6 +2281,10 @@ impl LogsScanExec {
             key_equals: Arc::new(Vec::new()),
             erasure,
             projection: Arc::new(projection),
+            row_filters,
+            build_projection: Arc::new(build_projection),
+            build_schema,
+            bound_row_filters,
             columns,
             projected_fraction,
             declared,
@@ -2246,14 +2344,18 @@ impl LogsScanExec {
     /// - no exact-key equality (`LogsPushdown::key_equals`): the KEY_IDX probe
     ///   drops whole blocks and objects, so the scan emits fewer rows than the
     ///   committed counts hold;
+    /// - no row filter (`LogsPushdown::row_filters`): the scan drops every row
+    ///   a conjunct does not hold for, so it emits fewer rows than the
+    ///   committed counts hold (ADR-0093, exact not-equal amendment;
+    ///   `a_pushed_fetch_counts_rows_after_the_row_filter`);
     /// - no pending selective erasure (ADR-0064 decision 2): a pending erasure
     ///   predicate removes rows the committed counts still include, so the sum
     ///   overstates the answer. Fail closed.
     ///
     /// The projection is irrelevant to the count, so it is not consulted.
-    /// `LogsPushdown` has exactly these five fields (`ts_lo`, `ts_hi`,
-    /// `content`, `prune`, `key_equals`); each is covered here, and `erasure` comes from the
-    /// resolved snapshot rather than the pushdown.
+    /// `LogsPushdown` has exactly these six fields (`ts_lo`, `ts_hi`,
+    /// `content`, `prune`, `key_equals`, `row_filters`); each is covered here,
+    /// and `erasure` comes from the resolved snapshot rather than the pushdown.
     fn stats_are_exact(&self) -> bool {
         self.prune.is_empty() && self.metadata_rewrite_stats_are_exact()
     }
@@ -2268,6 +2370,7 @@ impl LogsScanExec {
         self.content.is_empty()
             && prune_is_rewrite_neutral(&self.prune)
             && self.key_equals.is_empty()
+            && self.row_filters.is_empty()
             && self.erasure.is_empty()
             && self
                 .segments
@@ -2287,7 +2390,14 @@ impl LogsScanExec {
     /// a subset whose min/max/NULL count the catalog figures only bound, so
     /// every column statistic drops to `Inexact` too. An unknown total proves
     /// nothing either way and is treated the same.
+    ///
+    /// A scan with a row filter counts `fetch` in rows after the filter, so no
+    /// count of committed rows says how many it emits: `num_rows` drops to
+    /// `Inexact` (`a_pushed_fetch_counts_rows_after_the_row_filter`).
     fn apply_fetch_to_statistics(&self, stats: &mut Statistics, fetch: usize) {
+        if !self.row_filters.is_empty() {
+            stats.num_rows = std::mem::take(&mut stats.num_rows).to_inexact();
+        }
         if let Precision::Exact(total) = stats.num_rows {
             if total <= fetch {
                 return;
@@ -2964,6 +3074,9 @@ impl DisplayAs for LogsScanExec {
                 .collect::<Vec<_>>()
                 .join(", ")
         )?;
+        if !self.row_filters.is_empty() {
+            write!(f, ", row_filters=[{}]", self.row_filters)?;
+        }
         if self.active_topk().is_some() {
             write!(f, ", topk_threshold=ts")?;
         }
@@ -3318,7 +3431,9 @@ impl ExecutionPlan for LogsScanExec {
 
         Ok(Box::pin(LogScanStream {
             schema: Arc::clone(&self.schema),
-            projection: Arc::clone(&self.projection),
+            build_schema: Arc::clone(&self.build_schema),
+            build_projection: Arc::clone(&self.build_projection),
+            row_filters: self.bound_row_filters.clone(),
             declared: Arc::clone(&self.declared),
             attr_keys: Arc::clone(&self.attr_keys),
             full_len: self.full_schema.fields().len(),
@@ -3392,9 +3507,16 @@ impl ExecutionPlan for LogsScanExec {
 /// The reservations live on the stream (not on the state) so they are the same
 /// ones for the partition's lifetime, and each frees exactly once on drop.
 struct LogScanStream {
+    /// The output schema every emitted batch carries.
     schema: SchemaRef,
-    /// Indices into the resolved full schema to emit, in output order.
-    projection: Arc<Vec<usize>>,
+    /// The schema batches are built in ([`LogsScanExec::build_schema`]).
+    build_schema: SchemaRef,
+    /// Indices into the resolved full schema each batch is built with
+    /// ([`LogsScanExec::build_projection`]).
+    build_projection: Arc<Vec<usize>>,
+    /// The row filter run on each built batch before it is emitted or
+    /// charged, which also drops the build-only columns.
+    row_filters: Option<Arc<BoundRowFilters>>,
     /// The tenant's declared typed attribute columns (ADR-0090), consulted by
     /// [`build_batch`] and [`build_columnar_batches`] for a projected declared
     /// index.

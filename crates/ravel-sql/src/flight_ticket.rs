@@ -1406,7 +1406,7 @@ impl SlicePushdown {
     /// The logs subset of `pushdown`: `ts_lo`, `ts_hi`, the prune
     /// predicates the layout can carry, and the exact-key equalities. A prune
     /// predicate outside the layout is dropped, which only widens what the
-    /// worker reads; the content channel is not carried.
+    /// worker reads; the content and row filter channels are not carried.
     pub fn logs(pushdown: &LogsPushdown) -> Self {
         SlicePushdown(SlicePushdownKind::Logs(LogsPushdown {
             ts_lo: pushdown.ts_lo,
@@ -1419,6 +1419,7 @@ impl SlicePushdown {
                 .cloned()
                 .collect(),
             key_equals: pushdown.key_equals.clone(),
+            row_filters: Vec::new(),
         }))
     }
 
@@ -2036,6 +2037,7 @@ fn read_pushdown(cur: &mut Cursor<'_>, version: u8) -> Result<SlicePushdown, Fli
                 content: Vec::new(),
                 prune,
                 key_equals,
+                row_filters: Vec::new(),
             })))
         }
         other => Err(FlightTicketError::InvalidPushdownTag(other)),
@@ -3475,6 +3477,7 @@ mod tests {
                 },
             ],
             key_equals: Vec::new(),
+            row_filters: Vec::new(),
         })
     }
 
@@ -3687,6 +3690,7 @@ mod tests {
                 },
             ],
             key_equals: sample_key_equals(),
+            row_filters: Vec::new(),
         });
         let carried = logs.as_logs().expect("logs block");
         assert!(carried.content.is_empty());
@@ -3866,6 +3870,7 @@ mod tests {
                 value: AttrValue::I64(4),
             }],
             key_equals: Vec::new(),
+            row_filters: Vec::new(),
         }));
         assert!(matches!(
             sample_ticket().encode_with_pushdown(&test_key(), Some(&pushdown)),
@@ -4606,6 +4611,7 @@ mod tests {
                     content: Vec::new(),
                     prune,
                     key_equals,
+                    row_filters: Vec::new(),
                 })
             };
             let key = test_key();
