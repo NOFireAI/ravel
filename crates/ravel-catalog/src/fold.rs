@@ -14527,6 +14527,250 @@ pub(crate) mod tests {
         }
     }
 
+    /// The pairs a pass ends with are sorted and encoded in the heap's own
+    /// buffer, not copied into a second one: the sorted `Vec` starts at the
+    /// heap's buffer address.
+    #[test]
+    fn a_pass_sorts_its_pairs_in_the_heap_buffer() {
+        let mut heap = BinaryHeap::with_capacity(8);
+        for (key8, ordinal) in [(3u8, 0u64), (1, 1), (2, 0), (1, 0)] {
+            heap.push(HeldPair(KeyIndexLeafEntry {
+                key8: [key8; 8],
+                entry_ordinal: ordinal,
+                blocks: vec![0],
+            }));
+        }
+        let buffer = heap.as_slice().as_ptr().cast::<u8>();
+        let sorted = key_index_sorted_pairs(heap);
+        assert_eq!(sorted.as_ptr().cast::<u8>(), buffer, "the same allocation");
+        assert_eq!(
+            sorted
+                .iter()
+                .map(|e| (e.key8[0], e.entry_ordinal))
+                .collect::<Vec<_>>(),
+            vec![(1, 0), (1, 1), (2, 0), (3, 0)]
+        );
+    }
+
+    /// The leaves depend on the budget and the pairs read, not on how the
+    /// build got them (ADR-3692 decision 5, the #3704 open-slice amendment).
+    /// The advancing fixture's tail is built three ways at each budget:
+    /// carrying the previous leaf; from scratch, the previous leaf's GET
+    /// refused so every section is read; and through a forced restart,
+    /// writer 35's section GET refused in the second pass after the first
+    /// pass held pairs. The first two store the leaves the one-call build
+    /// writes at the same budget. The restart stores the leaves the
+    /// one-call build writes with writer 35's read failed, the same leaves
+    /// as a fold whose first-pass read of writer 35 failed and needed no
+    /// restart.
+    #[tokio::test]
+    async fn the_leaves_are_the_same_carried_from_scratch_and_after_a_restart() {
+        let writer_35 = {
+            let scratch = MemoryStore::new();
+            let (commit, _) =
+                publish_user_id_logs(&scratch, 35, KIDX_HOUR, &[7, 35, 36], 2, 0, true).await;
+            keys::reconstruct_data_key(&commit).expect("data key")
+        };
+        // Writer 35 sorts last in the tail of 10, 15, 20, 30 and 35.
+        let writer_35_ordinal = 4u64;
+        let all_pairs: [u64; 11] = [5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+        for max_pairs in [1, 2, 3, 5, 6, 7, 15, u64::MAX] {
+            let (carried_store, carried, _) = advancing_budget_fold(max_pairs).await;
+            assert_eq!(carried.key_index_leaf_gets, 1, "budget {max_pairs}");
+            assert_eq!(carried.key_index_entries_carried, 3, "budget {max_pairs}");
+            assert_eq!(
+                carried.key_index_build_passes,
+                greedy_passes(&all_pairs, max_pairs),
+                "budget {max_pairs}: {carried:?}"
+            );
+            let part = read_signal_head(carried_store.as_ref(), Signal::Logs)
+                .await
+                .parts
+                .remove(0);
+            let carried_leaves = stored_leaves(carried_store.as_ref(), &part).await;
+            assert_eq!(
+                carried_leaves,
+                user_id_leaves_at(carried_store.as_ref(), &part, max_pairs).await,
+                "budget {max_pairs}: carried"
+            );
+
+            let fault_fold = |rule: Rule| async move {
+                let inner = recording_store();
+                advancing_fixture(&inner).await;
+                let store = Arc::new(FaultStore::new(
+                    Arc::clone(&inner),
+                    FaultPlan::empty().with_rule(rule),
+                ));
+                let catalog = Catalog::new(
+                    store.clone(),
+                    CatalogConfig {
+                        key_index_build_max_pairs: max_pairs,
+                        ..kidx_config()
+                    },
+                )
+                .expect("catalog");
+                take_key_index_pass_log_for_test();
+                let report = advancing_fold(&catalog).await;
+                let log = take_key_index_pass_log_for_test();
+                assert_eq!(
+                    store.fault_count(Op::Get, FaultKind::Permanent),
+                    1,
+                    "budget {max_pairs}: the fault fired"
+                );
+                let part = read_signal_head(inner.as_ref(), Signal::Logs)
+                    .await
+                    .parts
+                    .remove(0);
+                let leaves = stored_leaves(inner.as_ref(), &part).await;
+                (inner, part, report, log, leaves)
+            };
+
+            let (_, _, scratch, _, scratch_leaves) = fault_fold(
+                Rule::new(Op::Get, ScriptedFault::Permanent("leaf GET refused".into()))
+                    .with_key_contains(".kidx")
+                    .with_occurrence(Occurrence::Nth(1)),
+            )
+            .await;
+            assert_eq!(scratch.key_index_entries_carried, 0, "budget {max_pairs}");
+            assert_eq!(
+                scratch_leaves, carried_leaves,
+                "budget {max_pairs}: from scratch"
+            );
+
+            // Writer 35's object: the column-stats GET, then a footer suffix
+            // GET and a section GET per pass, so the 3rd GET is its first
+            // pass's section and the 5th its second pass's.
+            let section_get = |nth: u64| {
+                Rule::new(
+                    Op::Get,
+                    ScriptedFault::Permanent("section GET refused".into()),
+                )
+                .with_key_contains(writer_35.as_str())
+                .with_occurrence(Occurrence::Nth(nth))
+            };
+            let (first_store, first_part, _, first_log, first_leaves) =
+                fault_fold(section_get(3)).await;
+            assert!(
+                first_log.iter().all(|r| r.attempt == 0),
+                "budget {max_pairs}: a first-pass failure needs no restart"
+            );
+            assert_eq!(
+                first_leaves,
+                reference_leaves(
+                    first_store.as_ref(),
+                    &first_part,
+                    &[(USER_ID.to_string(), KeyType::I64)],
+                    max_pairs,
+                    &[writer_35_ordinal],
+                )
+                .await,
+                "budget {max_pairs}: writer 35 failed in the first pass"
+            );
+            if greedy_passes(&all_pairs, max_pairs) < 2 {
+                continue;
+            }
+            let (_, _, restarted, restart_log, restart_leaves) = fault_fold(section_get(5)).await;
+            assert!(
+                restart_log.iter().any(|r| r.attempt == 1),
+                "budget {max_pairs}: the build restarted: {restarted:?}"
+            );
+            assert_pass_bound(&restart_log, 5, &format!("restart, budget {max_pairs}"));
+            assert_eq!(
+                restart_leaves, first_leaves,
+                "budget {max_pairs}: after a restart"
+            );
+        }
+    }
+
+    /// The share is fixed for the build (ADR-3692 decision 5): with two
+    /// fields every pass gives each `max(1, budget / 2)` pairs, whether or
+    /// not the other field has finished, so the part takes as many passes as
+    /// its slowest field under that share. Eight writers index `user_id`,
+    /// the first four `session` too, two values each: `user_id` holds 16
+    /// pairs and `session` 8, one entry per key8. At budget 4 each field's
+    /// share is 2 and the build takes 8 passes, `user_id`'s count; a share
+    /// that grew to 4 once `session` finished after 4 passes would take 6.
+    /// Every budget matches the slowest field's greedy count, and the leaves
+    /// equal the one-call build's at the same budget.
+    #[tokio::test]
+    async fn a_two_field_build_takes_as_many_passes_as_its_slowest_field() {
+        use crate::tenant_config::DeclaredColumnType;
+        for max_pairs in [1, 2, 3, 4, 5, 8, 16, u64::MAX] {
+            let store = recording_store();
+            declare_key_index_columns(
+                store.as_ref(),
+                &[
+                    (USER_ID, DeclaredColumnType::I64),
+                    (SESSION, DeclaredColumnType::I64),
+                ],
+                1,
+            )
+            .await;
+            for seq in 1..=8u64 {
+                let own = seq as i64;
+                let fields: &[(&str, KeyType)] = if seq <= 4 {
+                    &[(USER_ID, KeyType::I64), (SESSION, KeyType::I64)]
+                } else {
+                    &[(USER_ID, KeyType::I64)]
+                };
+                publish_keyed_logs(store.as_ref(), seq, KIDX_HOUR, &[own, own + 10], 2, 0, fields)
+                    .await;
+            }
+            let catalog = Catalog::new(
+                store.clone(),
+                CatalogConfig {
+                    key_index_build_max_pairs: max_pairs,
+                    ..kidx_config()
+                },
+            )
+            .expect("catalog");
+            take_key_index_pass_log_for_test();
+            let report = fold_through(&catalog, Signal::Logs, KIDX_HOUR).await;
+            let log = take_key_index_pass_log_for_test();
+            let share = (max_pairs / 2).max(1);
+            assert!(log.iter().all(|r| r.share == share), "{log:?}");
+            let user_id_passes = greedy_passes(&[1; 16], share);
+            let session_passes = greedy_passes(&[1; 8], share);
+            assert_eq!(
+                pass_ranges(&log, USER_ID, 1).len() as u64,
+                user_id_passes,
+                "budget {max_pairs}"
+            );
+            assert_eq!(
+                pass_ranges(&log, SESSION, 1).len() as u64,
+                session_passes,
+                "budget {max_pairs}"
+            );
+            assert_eq!(
+                report.key_index_build_passes,
+                user_id_passes.max(session_passes),
+                "budget {max_pairs}: {report:?}"
+            );
+            if max_pairs == 4 {
+                assert_eq!(report.key_index_build_passes, 8, "{report:?}");
+            }
+            let part = read_signal_head(store.as_ref(), Signal::Logs)
+                .await
+                .parts
+                .remove(0);
+            assert_eq!(
+                stored_leaves(store.as_ref(), &part).await,
+                reference_leaves(
+                    store.as_ref(),
+                    &part,
+                    &[
+                        (SESSION.to_string(), KeyType::I64),
+                        (USER_ID.to_string(), KeyType::I64)
+                    ],
+                    max_pairs,
+                    &[],
+                )
+                .await,
+                "budget {max_pairs}"
+            );
+        }
+    }
+
     /// Declares `columns` as typed columns carrying `key_index`, written at
     /// `now_ns` so a later call replaces an earlier one.
     async fn declare_key_index_columns(
