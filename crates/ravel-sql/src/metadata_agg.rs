@@ -22,7 +22,11 @@
 //!   ungrouped, filter-free aggregate directly over a [`LogsScanExec`].
 //!   Answered by [`LogsScanExec::declared_column_sum`] as `sum + k *
 //!   non_null_count` (#861); `k = 0` covers the plain `SUM(col)`. `SUM` over
-//!   zero non-null rows is `NULL`, matching the scan.
+//!   zero non-null rows is `NULL`, matching the scan. The two differ at the
+//!   `i64` edge: this answer is the exact total, while the scan adds `k` per
+//!   row with DataFusion's wrapping `+`, so a row whose `col + k` leaves `i64`
+//!   reaches the sum wrapped, and where the exact total fits `i64` the scanned
+//!   query fails with the integer sum overflow.
 //! - **q30**: `AVG(<declared integer column>) FROM logs`, likewise ungrouped
 //!   and filter-free. Answered as `sum / non_null_count` in `f64`, `NULL` when
 //!   there are no non-null rows.
