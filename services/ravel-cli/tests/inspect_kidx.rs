@@ -100,7 +100,7 @@ uncovered_entry_ordinals: [3, 6]
 body_len: 142
 prefix_len: 148
 size: 290
-blake3: ca7633f6e4c56394f4df4ae4c5da96ea53f20df604185ae6fc653d1805b244b4
+blake3: 3d096b13169ec1b41dc3466d290440ac628f957c58f49487e363fda3569a279d
 body_uncompressed_len: 58
 buckets: 8 min=0 median=0 max=2 empty=4
 ";
