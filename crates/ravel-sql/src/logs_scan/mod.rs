@@ -4207,3 +4207,35 @@ mod projection_width_tests {
         assert_eq!(r.fraction_of(0), 2.0 / 10.0);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod pool_leaf_budget_tests {
+    //! The logs router's frame reservations come out of the statement's pool:
+    //! a bound the pool cannot hold is refused (the router then leaves the
+    //! part uncovered; `key_index_route`'s
+    //! `a_refused_reservation_leaves_the_part_uncovered` pins that half), and
+    //! a granted one is held until its guard drops.
+
+    use super::*;
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+    #[test]
+    fn a_bound_over_the_pool_is_refused_and_a_granted_one_is_held() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(100));
+        let budget = PoolLeafBudget(Arc::clone(&pool));
+        assert_eq!(
+            budget.try_reserve(101).err(),
+            Some(BudgetRefused { bytes: 101 })
+        );
+        assert_eq!(pool.reserved(), 0);
+        let guard = budget.try_reserve(64).expect("fits the pool");
+        assert_eq!(pool.reserved(), 64);
+        assert_eq!(
+            budget.try_reserve(37).err(),
+            Some(BudgetRefused { bytes: 37 })
+        );
+        drop(guard);
+        assert_eq!(pool.reserved(), 0);
+    }
+}
