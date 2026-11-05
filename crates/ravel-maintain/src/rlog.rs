@@ -8565,6 +8565,19 @@ mod tests {
                  pass_rows={pass_rows}B ceiling={ceiling}B"
             );
             assert!(resident_raw > 0, "the merge held its row groups resident");
+            // The figures ADR-3819's table quotes, per (scale, ceiling):
+            // transient, total, resident and pass-row peaks.
+            let pinned: (u64, u64, u64, u64) = match (records_per_input, resident_ceiling) {
+                (3_000, None) => (0, 2_178_000, 312, 844_675),
+                (3_000, Some(_)) => (161_703, 227_285, 312, 0),
+                (30_000, None) => (0, 21_780_000, 3_219, 5_535_304),
+                _ => (161_703, 227_285, 3_219, 0),
+            };
+            assert_eq!(
+                (transient, total, resident_raw, pass_rows),
+                pinned,
+                "records/input={records_per_input} ceiling={resident_ceiling:?}"
+            );
             assert!(
                 resident_raw + pass_rows <= ceiling,
                 "resident {resident_raw} + pass rows {pass_rows} exceeded the ceiling {ceiling}"
@@ -12552,7 +12565,6 @@ mod tests {
                         "resident={resident}: {extent:?} over {passes} passes"
                     );
                 }
-                assert!(passes >= 3, "{passes} passes");
                 assert_eq!(run.report.block_read.requests, per_group * 12);
                 let block: u64 = extents.iter().map(|e| store.ranged_gets(e)).sum();
                 let on_inputs: u64 = keys.iter().map(|k| store.gets_on(k)).sum();
@@ -12562,12 +12574,10 @@ mod tests {
                 let held = if resident { raw } else { 0 };
                 assert_eq!(run.report.merge_resident_bytes, held);
             }
-            assert_eq!(catalog_gets[0], catalog_gets[1]);
-            assert!(
-                block_gets[1].0 < 60,
-                "fetch-per-pass passes {:?}",
-                block_gets[1]
-            );
+            // The figures ADR-3819's table quotes: 8 resident passes over 12
+            // block GETs, 9 fetch-per-pass passes over 108, 60 catalog GETs.
+            assert_eq!(catalog_gets, [60, 60]);
+            assert_eq!(block_gets, [(8, 12), (9, 108)]);
 
             // The cursor merge on the same inputs fetches each group once per
             // stream it carries: 60 streams, so 60 times.
@@ -12675,6 +12685,78 @@ mod tests {
             }
         }
 
+        /// ADR-3819 D2 holds a pass's rows columnar: a block decoded once for
+        /// every wanted stream is charged its view's `heap_estimate()`, which on
+        /// a log-shaped block of 40 streams (a 40 to 50 byte body and three
+        /// attributes per record) is under a quarter of the [`estimate_record`]
+        /// sum of the same records, the row form a pass would otherwise hold
+        /// (108 against 555 bytes per record when written).
+        #[tokio::test]
+        async fn pass_rows_hold_a_block_columnar_below_its_row_form() {
+            let records: Vec<LogRecord> = (0..40u32)
+                .flat_map(|s| {
+                    (0..50i64).map(move |k| {
+                        record(
+                            s,
+                            1_000 + k,
+                            &format!("GET /api/v1/items/{} 200 {}ms", k * 7919 % 10_007, k % 97),
+                            vec![
+                                ("http.method".to_string(), AttrValue::Str("GET".into())),
+                                ("http.status".to_string(), AttrValue::I64(200)),
+                                ("latency_ms".to_string(), AttrValue::I64(k % 97)),
+                            ],
+                        )
+                    })
+                })
+                .collect();
+            let inputs = vec![L0Input {
+                records,
+                cfg: RlogConfig::default(),
+                clustering: None,
+            }];
+            let store = ProbeStore::new();
+            let keys = seed_inputs(&store, &inputs).await;
+            let extents = group_extents(&store, &keys).await;
+            assert_eq!(extents.len(), 1, "one row group");
+            let catalogs = catalogs_of(&store, &keys).await;
+            let catalog = &catalogs[0];
+            let loc = catalog
+                .reader
+                .stream_blocks(&stream_ident(0).0)
+                .expect("stream blocks")
+                .expect("stream 0")
+                .remove(0);
+            assert_eq!(loc.block_indices(), &[0], "one block");
+            let (key, start, end) = extents[0].clone();
+            let group = store
+                .get(&key, GetRange::Range(start, end))
+                .await
+                .expect("group")
+                .data;
+            let mut rows = catalog
+                .reader
+                .block_rows_for_refs(&loc, 0, group.as_ref(), |_| true)
+                .expect("rows");
+            let columnar = rows.heap_estimate();
+            let mut row_form = 0u64;
+            let mut n = 0u64;
+            for rec in rows.by_ref() {
+                row_form += estimate_record(&rec.expect("record"));
+                n += 1;
+            }
+            assert_eq!(n, 2_000);
+            println!(
+                "[mem:rlog #3819] block of {n} records, 40 streams: columnar={columnar}B \
+                 ({}B/record) row_form={row_form}B ({}B/record)",
+                columnar / n,
+                row_form / n
+            );
+            assert!(
+                columnar * 4 < row_form,
+                "columnar {columnar} is not under a quarter of the row form {row_form}"
+            );
+        }
+
         /// ADR-3819 test (c), the hot stream inside a many-stream bucket: at the
         /// resident threshold the resident term is every group's raw bytes, the
         /// pass term stays within the pass budget, the two together within the
@@ -12703,6 +12785,17 @@ mod tests {
                 t.peak_resident_raw_bytes(),
                 t.peak_pass_row_bytes(),
                 t.peak_transient_bytes()
+            );
+            // The figures ADR-3819's table quotes.
+            assert_eq!(
+                (
+                    plan.raw_bytes,
+                    plan.pass_budget,
+                    threshold,
+                    t.peak_pass_row_bytes(),
+                    t.peak_transient_bytes()
+                ),
+                (24_548, 262_144, 652_143, 75_948, 53_901)
             );
             assert_eq!(t.peak_resident_raw_bytes(), plan.raw_bytes);
             assert!(t.peak_pass_row_bytes() > 0);
