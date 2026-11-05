@@ -725,49 +725,77 @@ async fn pending_erasure_declines_and_keeps_the_scan() {
     }
 }
 
-/// A `Str`-typed declared column is not answerable from the dictionary here
-/// (its Arrow projection is a dictionary array the reader does not decode into
-/// a `ScalarValue` for this path), so q02 over a `Str` column declines. The
-/// literal is a string so the plan is well-typed; the rule still refuses.
+/// q02 over a `Str`-typed declared column never reaches the metadata
+/// rewrite's answer, and the scan returns the true count, 2 (`'eu'` twice; the
+/// row with no `region` is NULL and `<>` drops it).
+///
+/// With the scan's row filter on (the production provider), `region <> 'us'`
+/// is reported `Exact` (ADR-0093, exact not-equal amendment), so no
+/// `FilterExec` is left and `rewrite` declines at its missing-filter check
+/// before it reaches the `Str` gate. With the row filter off, the provider
+/// reports it `Inexact`, the `FilterExec` stays above a scan with no row
+/// filter, and the rewrite reaches `declared_not_equal_count`, whose
+/// `DeclaredType::Str` gate (reinforced by `declared_scalar` having no `Str`
+/// arm) is then the only refusal: that case pins the gate directly. The
+/// stats carry a real present `region` dictionary in both cases, so a
+/// missing-column decline cannot mask either reason.
 #[tokio::test]
 async fn str_typed_column_declines_and_keeps_the_scan() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
-    let (a, b) = two_status_segments();
-    // The stats DO carry a `region` entry with a real present dictionary, so a
-    // missing-column decline cannot mask the reason under test: the sole cause
-    // is that `region` is declared `Str`, which `declared_not_equal_count`
-    // refuses (logs_scan.rs, the `matches!(declared.ty, DeclaredType::Str)`
-    // gate, reinforced by `declared_scalar` having no `Str` arm).
-    let stats = loaded_stats(vec![
-        (
-            &a,
-            stats_segment(&a, vec![str_stat("region", &[("us", 3), ("eu", 2)])]),
-        ),
-        (
-            &b,
-            stats_segment(&b, vec![str_stat("region", &[("us", 4), ("eu", 2)])]),
-        ),
-    ]);
-    let snapshot = snapshot_of(vec![a, b], Vec::new());
+    let regions = [Some("us"), Some("eu"), Some("us"), Some("eu"), None];
+    let records: Vec<LogRecord> = regions
+        .iter()
+        .enumerate()
+        .map(|(i, region)| {
+            let mut r = eq_record(i as i64, None);
+            if let Some(region) = region {
+                r.attrs
+                    .push(("region".to_string(), AttrValue::Str(region.to_string())));
+            }
+            r
+        })
+        .collect();
+    let seg = write_real_records(&store, "logs/region.rlog", 1, &records).await;
+    let stats = loaded_stats(vec![(
+        &seg,
+        stats_segment(&seg, vec![str_stat("region", &[("us", 2), ("eu", 2)])]),
+    )]);
     let declared = vec![DeclaredColumn::new("region", DeclaredType::Str)];
-    let ctx = logs_session(provider(&store, snapshot, declared, Some(stats))).expect("session");
-
-    let plan = ctx
-        .sql("SELECT COUNT(*) FROM logs WHERE region <> 'us'")
-        .await
-        .expect("plan")
-        .create_physical_plan()
-        .await
-        .expect("physical plan");
-    let shown = plan_str(&plan);
-    assert!(
-        !shown.contains("MetadataOnlyExec"),
-        "a Str-typed column must decline the rewrite; plan was:\n{shown}"
-    );
-    assert!(
-        shown.contains("LogsScanExec"),
-        "a Str-typed column must fall back to a scan; plan was:\n{shown}"
-    );
+    for (row_filter, filter_execs) in [(true, 0), (false, 1)] {
+        let snapshot = snapshot_of(vec![seg.clone()], Vec::new());
+        let ctx = logs_session(
+            provider(&store, snapshot, declared.clone(), Some(Arc::clone(&stats)))
+                .with_row_filter_pushdown(row_filter),
+        )
+        .expect("session");
+        let plan = ctx
+            .sql("SELECT COUNT(*) FROM logs WHERE region <> 'us'")
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let shown = plan_str(&plan);
+        assert!(
+            !shown.contains("MetadataOnlyExec"),
+            "row filter {row_filter}: a Str-typed column must decline the rewrite; plan was:\n{shown}"
+        );
+        assert!(
+            shown.contains("LogsScanExec"),
+            "row filter {row_filter}: a Str-typed column must fall back to a scan; plan was:\n{shown}"
+        );
+        assert_eq!(
+            shown.matches("FilterExec").count(),
+            filter_execs,
+            "row filter {row_filter}: plan was:\n{shown}"
+        );
+        let batches = collect(plan, ctx.task_ctx()).await.expect("collect");
+        assert_eq!(
+            count_scalar(&batches),
+            2,
+            "row filter {row_filter}: the scanned count"
+        );
+    }
 }
 
 /// A predicate over a non-declared column (`body`, a fixed column below
@@ -1102,6 +1130,53 @@ async fn write_real_segment(
         declared_column_stats: Default::default(),
     };
     stamped_like(seg, &stat_from_rows(rows))
+}
+
+/// Write `records` as one real RLOG object under `key` and return the
+/// unstamped `SegmentRef` describing it.
+async fn write_real_records(
+    store: &Arc<CountingStore>,
+    key: &str,
+    seq: u64,
+    records: &[LogRecord],
+) -> SegmentRef {
+    let mut w = RlogWriter::new(
+        RlogConfig::default(),
+        ObjectIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: seq,
+        },
+    );
+    for r in records {
+        w.push(r.clone()).expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+    let object_size = bytes.len() as u64;
+    store
+        .put(key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put");
+    SegmentRef {
+        data_object_key: key.to_string(),
+        object_size,
+        min_event_ts_ns: records.iter().map(|r| r.ts_ns).min().expect("nonempty"),
+        max_event_ts_ns: records.iter().map(|r| r.ts_ns).max().expect("nonempty"),
+        ingest_hour_bucket: 0,
+        sample_count: records.len() as u64,
+        series_count: 0,
+        shard: 0,
+        content_hash: [0u8; 32],
+        writer_id: writer(),
+        writer_epoch: 1,
+        writer_seq: seq,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
+    }
 }
 
 /// The exact `status` statistics for `rows`: what a correct fold over that
@@ -2236,5 +2311,107 @@ async fn sum_plus_literal_answers_from_stats_where_the_scan_overflows() {
         err.to_string()
             .contains("aggregate sum overflowed its Int64 result type"),
         "{err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0093, exact not-equal amendment, T4: a scan with a row filter claims no
+// exact statistics and refuses the metadata rewrite.
+// ---------------------------------------------------------------------------
+
+/// `(ts, s, status)` of the T4 object. The extreme `status` values, -5 and
+/// 900, sit on `''` rows, and the row with no `s` is NULL, so `s <> ''` keeps
+/// rows 2, 3 and 4: `status` 200, 404, 200.
+const T4_ROWS: [(i64, Option<&str>, i64); 6] = [
+    (0, Some(""), 900),
+    (1, Some(""), -5),
+    (2, Some("a"), 200),
+    (3, Some("b"), 404),
+    (4, Some("a"), 200),
+    (5, None, 500),
+];
+
+/// T4: `COUNT(*)`, `MIN`, `MAX`, `SUM` and a `GROUP BY status` count, each
+/// filtered by `s <> ''`, over one real object whose `status` statistics are
+/// loaded and stamped. The conjunct is `Exact`, so no `FilterExec` is left to
+/// intercept a statistic: each answer is the filtered one only because the
+/// scan claims no exact statistics and refuses the metadata rewrite. Each
+/// plan keeps `LogsScanExec` and holds no `MetadataOnlyExec`.
+///
+/// Flipped: with the row filter gate added to neither statistics method,
+/// `AggregateStatistics` replaces the `COUNT(*)` plan with the constant 6
+/// (`sample_count`), which fails "the plan keeps the scan" on the first
+/// statement; with the gate in `stats_are_exact` only, `COUNT`, `MIN` and
+/// `MAX` keep their scans and the `SUM` plan becomes `MetadataOnlyExec`,
+/// which fails the same assertion on the `SUM` statement.
+#[tokio::test]
+async fn a_row_filter_scan_claims_no_exact_statistics_and_refuses_the_rewrite() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let records: Vec<LogRecord> = T4_ROWS
+        .iter()
+        .map(|(ts, s, status)| {
+            let mut r = eq_record(*ts, Some(*status));
+            if let Some(s) = s {
+                r.attrs
+                    .push(("s".to_string(), AttrValue::Str(s.to_string())));
+            }
+            r
+        })
+        .collect();
+    let seg = write_real_records(&store, "logs/t4.rlog", 1, &records).await;
+    let stat = stat_from_rows(
+        &T4_ROWS
+            .iter()
+            .map(|(ts, _, status)| (*ts, Some(*status)))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(stat.sum, Some(2199), "the stored sum covers every row");
+    let seg = stamped_like(seg, &stat);
+    let stats = loaded_stats(vec![(&seg, stats_segment(&seg, vec![stat]))]);
+    let declared = vec![
+        DeclaredColumn::new("status", DeclaredType::I64),
+        DeclaredColumn::new("s", DeclaredType::Str),
+    ];
+
+    let run = |sql: &'static str| {
+        let ctx = logs_session(provider(
+            &store,
+            snapshot_of(vec![seg.clone()], Vec::new()),
+            declared.clone(),
+            Some(Arc::clone(&stats)),
+        ))
+        .expect("session");
+        async move {
+            let plan = ctx
+                .sql(sql)
+                .await
+                .expect("plan")
+                .create_physical_plan()
+                .await
+                .expect("physical plan");
+            let shown = plan_str(&plan);
+            assert!(
+                shown.contains("LogsScanExec") && !shown.contains("MetadataOnlyExec"),
+                "{sql}: the plan keeps the scan; plan was:\n{shown}"
+            );
+            assert!(
+                !shown.contains("FilterExec"),
+                "{sql}: the conjunct is Exact; plan was:\n{shown}"
+            );
+            collect(plan, ctx.task_ctx()).await.expect("collect")
+        }
+    };
+
+    let count = run("SELECT COUNT(*) FROM logs WHERE s <> ''").await;
+    assert_eq!(count_scalar(&count), 3, "COUNT(*)");
+    let min_max = run("SELECT MIN(status), MAX(status) FROM logs WHERE s <> ''").await;
+    assert_eq!(min_max_i64(&min_max), (Some(200), Some(404)), "MIN and MAX");
+    let sum = run("SELECT SUM(status) FROM logs WHERE s <> ''").await;
+    assert_eq!(single_i64(&sum), Some(804), "SUM");
+    let groups = run("SELECT status, COUNT(*) FROM logs WHERE s <> '' GROUP BY status").await;
+    assert_eq!(
+        group_counts(&groups),
+        HashMap::from([(Some(200), 2), (Some(404), 1)]),
+        "GROUP BY status"
     );
 }
