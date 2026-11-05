@@ -6,7 +6,9 @@
 //! read. A segment no leaf covers keeps the tier-1 routes: a version 1 RLOG
 //! KEY_IDX section is listed uncovered by the fold, and a leaf that cannot be
 //! read, fails its checksum, or is refused its decode reservation leaves its
-//! part's segments uncovered, never pruned.
+//! part's segments uncovered, never pruned. A logs leaf at format_version 1,
+//! written before the fold listed those sections uncovered, is rejected the
+//! same way, and an advancing fold does not carry it.
 //!
 //! The fixture is 24 RLOG objects of eight 16-record blocks, every record
 //! carrying a distinct `user_id`; record 50 of each holder holds the target.
@@ -27,8 +29,11 @@ use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use ravel_catalog::{
     Catalog, CatalogConfig, CatalogError, DeclaredColumnType, DeclaredTypedColumn,
-    KeyIndexLeafLimits, KeyIndexLeafRequest, KeyIndexRebuildOptions, Snapshot, SnapshotParts,
-    StorageLayoutWrite, TenantConfig, TenantLifecycleState, set_tenant_config,
+    KEY_INDEX_LEAF_FORMAT_VERSION, KEY_INDEX_LEAF_FORMAT_VERSION_1, KeyIndexLeafInput,
+    KeyIndexLeafLimits, KeyIndexLeafRequest, KeyIndexRebuildOptions, RefoldRequest, Snapshot,
+    SnapshotParts, StorageLayoutWrite, TenantConfig, TenantLifecycleState, decode_head,
+    encode_head, encode_key_index_leaf, restamp_key_index_leaf_version, set_tenant_config,
+    verify_key_index_leaf,
 };
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -44,8 +49,9 @@ use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, Scri
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
-    PageToken, PutOptions, PutOutcome, StoreError,
+    PageToken, PutMode, PutOptions, PutOutcome, StoreError,
 };
+use ravel_proto::catalog::v1::SnapshotKeyIndexLeafRef;
 use ravel_query::http::StaticBearerTokenResolver;
 use ravel_query::key_index_route::{
     KeyIndexPartOutcome, key_index_leaf_gets_total, key_index_parts_total,
@@ -263,72 +269,7 @@ impl Fixture {
     /// the earlier writer's rule keyed less than the reader resolves.
     async fn publish(holders: &[usize], version_one: &[usize]) -> Self {
         let base: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let tenant_hash = tenant().hash();
-        let mut objects = Vec::new();
-        for seq in 0..OBJECTS {
-            let writer_id = Uuid::from_u128(3_703_000 + seq as u128);
-            let mut writer = RlogWriter::new(
-                RlogConfig {
-                    block_target_records: RECORDS_PER_BLOCK,
-                    ..RlogConfig::default()
-                },
-                ObjectIdentity {
-                    tenant_hash: tenant_hash.0,
-                    shard: 0,
-                    writer_id: writer_id.into_bytes(),
-                    writer_epoch: 1,
-                    writer_seq: seq as u64 + 1,
-                },
-            )
-            .with_key_index_fields(vec![("user_id".to_string(), KeyType::I64)]);
-            let records: Vec<LogRecord> = (0..RECORDS)
-                .map(|i| record_of(seq, i, pad_of(seq), holders.contains(&seq)))
-                .collect();
-            let min = records.iter().map(|r| r.ts_ns).min().expect("records");
-            let max = records.iter().map(|r| r.ts_ns).max().expect("records");
-            for r in records {
-                writer.push(r).expect("push");
-            }
-            let mut bytes = writer.finish().expect("finish");
-            if version_one.contains(&seq) {
-                bytes = rewrite_key_index(&bytes, KEY_IDX_VERSION_1, |_, _, entries| {
-                    entries
-                        .into_iter()
-                        .filter(|(key, _)| *key != key8_i64(TARGET))
-                        .collect()
-                })
-                .expect("rewrite as version 1");
-            }
-            let bytes = Bytes::from(bytes);
-            let rec = record::build(NewCommitRecord {
-                tenant_hash,
-                signal: Signal::Logs,
-                shard: 0,
-                writer_id,
-                writer_epoch: 1,
-                writer_seq: seq as u64 + 1,
-                object_size: bytes.len() as u64,
-                content_hash: *blake3::hash(&bytes).as_bytes(),
-                sample_count: RECORDS as u64,
-                series_count: 1,
-                min_event_ts_ns: min,
-                max_event_ts_ns: max,
-                min_ingest_ts_ns: min,
-                max_ingest_ts_ns: max,
-                segment_format_version: u32::from(ravel_ingest::LOG_SEGMENT_FORMAT_VERSION),
-                created_unix_ns: 10 + seq as i64,
-                ingest_hour_bucket: 0,
-            })
-            .expect("record");
-            let key = keys::reconstruct_data_key(&rec).expect("key");
-            base.put(&key, bytes.clone(), PutOptions::default())
-                .await
-                .expect("put");
-            publish::publish(base.as_ref(), &rec, &RetryPolicy::default())
-                .await
-                .expect("publish");
-            objects.push(Published { key, bytes });
-        }
+        let objects = publish_objects(&base, holders, version_one, 0..OBJECTS).await;
         for (n, object) in objects.iter().enumerate() {
             assert_eq!(object.size() <= BOUND, (1..=16).contains(&n), "object {n}");
         }
@@ -344,6 +285,23 @@ impl Fixture {
     /// Declares `user_id` as the tenant's logs key-index field and folds every
     /// object into one part through `catalog`.
     async fn fold_with(&self, catalog: Catalog) {
+        self.declare().await;
+        let report = catalog
+            .fold(
+                &tenant().hash(),
+                Signal::Logs,
+                Uuid::from_u128(1),
+                NOW_NS,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert_eq!(report.entry_count, OBJECTS as u64, "{report:?}");
+    }
+
+    /// Declares `user_id` as the tenant's logs key-index field.
+    async fn declare(&self) {
         let mut config = TenantConfig {
             typed_attr_columns: Some(vec![DeclaredTypedColumn {
                 key: "user_id".to_string(),
@@ -360,18 +318,89 @@ impl Fixture {
         set_tenant_config(self.base.as_ref(), &tenant().hash(), &config, 1)
             .await
             .expect("write tenant config");
-        let report = catalog
-            .fold(
-                &tenant().hash(),
-                Signal::Logs,
-                Uuid::from_u128(1),
-                NOW_NS,
-                &[],
-                None,
+    }
+
+    /// Repoints the part's `user_id` ref at a format_version 1 leaf as the
+    /// fold wrote it before the version 1 KEY_IDX check: the current leaf's
+    /// entries with no entry uncovered, so a version 1 entry missing
+    /// `TARGET` reads as proving it absent. Returns the leaf's key.
+    async fn swap_in_a_pre_fix_leaf(&self) -> String {
+        let head_key = format!(
+            "t/{}/catalog/{}/HEAD",
+            tenant().hash().to_hex(),
+            Signal::Logs.key_prefix()
+        );
+        let current = self
+            .base
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("HEAD");
+        let mut head = decode_head(&current.data).expect("decode HEAD");
+        assert_eq!(head.parts.len(), 1, "one part");
+        let part = &mut head.parts[0];
+        assert_eq!(part.key_index.len(), 1, "one user_id leaf");
+        let leaf = &part.key_index[0];
+        let bytes = self
+            .base
+            .get(&leaf.key, GetRange::Full)
+            .await
+            .expect("leaf")
+            .data;
+        let summary =
+            verify_key_index_leaf(&bytes, &KeyIndexLeafLimits::default()).expect("verify");
+        assert_eq!(summary.header.format_version, KEY_INDEX_LEAF_FORMAT_VERSION);
+        assert!(
+            !summary.header.uncovered_entry_ordinals.is_empty(),
+            "the current leaf lists the version 1 entries"
+        );
+        let pre_fix = encode_key_index_leaf(
+            &KeyIndexLeafInput {
+                tenant_hash: tenant().hash(),
+                signal: Signal::Logs,
+                part_blake3: part.blake3.as_slice().try_into().expect("32-byte hash"),
+                part_entry_count: part.entry_count,
+                field: "user_id",
+                key_type: KeyType::I64,
+                key8_lo: summary.header.key8_lo,
+                key8_hi: summary.header.key8_hi,
+                uncovered_entry_ordinals: &[],
+                entries: &summary.entries,
+            },
+            &KeyIndexLeafLimits::default(),
+        )
+        .expect("encode");
+        let v1 = restamp_key_index_leaf_version(&pre_fix.bytes, KEY_INDEX_LEAF_FORMAT_VERSION_1)
+            .expect("restamp");
+        let hash16: String = v1.leaf_ref.blake3[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let (dir, _) = leaf.key.rsplit_once('/').expect("leaf key directory");
+        let (hour, _) = leaf.key[dir.len() + 1..]
+            .split_once('.')
+            .expect("leaf key hour");
+        let key = format!("{dir}/{hour}.{hash16}.kidx");
+        assert_ne!(key, leaf.key);
+        self.base
+            .put(&key, Bytes::from(v1.bytes), PutOptions::create_if_absent())
+            .await
+            .expect("put the version 1 leaf");
+        part.key_index = vec![SnapshotKeyIndexLeafRef {
+            key: key.clone(),
+            ..v1.leaf_ref
+        }];
+        self.base
+            .put(
+                &head_key,
+                Bytes::from(encode_head(&head).expect("encode HEAD")),
+                PutOptions {
+                    mode: PutMode::CasVersion(current.version),
+                    checksum: None,
+                },
             )
             .await
-            .expect("fold");
-        assert_eq!(report.entry_count, OBJECTS as u64, "{report:?}");
+            .expect("swap the ref");
+        key
     }
 
     /// The catalog's own resolve with its parts.
@@ -442,6 +471,82 @@ impl Fixture {
             .expect("probe the leaf");
         probe.uncovered_entry_ordinals().map(<[u64]>::to_vec)
     }
+}
+
+/// Publishes objects `seqs` of the fixture to `base`; see [`Fixture::publish`].
+async fn publish_objects(
+    base: &Arc<dyn ObjectStoreBackend>,
+    holders: &[usize],
+    version_one: &[usize],
+    seqs: Range<usize>,
+) -> Vec<Published> {
+    let tenant_hash = tenant().hash();
+    let mut objects = Vec::new();
+    for seq in seqs {
+        let writer_id = Uuid::from_u128(3_703_000 + seq as u128);
+        let mut writer = RlogWriter::new(
+            RlogConfig {
+                block_target_records: RECORDS_PER_BLOCK,
+                ..RlogConfig::default()
+            },
+            ObjectIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.into_bytes(),
+                writer_epoch: 1,
+                writer_seq: seq as u64 + 1,
+            },
+        )
+        .with_key_index_fields(vec![("user_id".to_string(), KeyType::I64)]);
+        let records: Vec<LogRecord> = (0..RECORDS)
+            .map(|i| record_of(seq, i, pad_of(seq), holders.contains(&seq)))
+            .collect();
+        let min = records.iter().map(|r| r.ts_ns).min().expect("records");
+        let max = records.iter().map(|r| r.ts_ns).max().expect("records");
+        for r in records {
+            writer.push(r).expect("push");
+        }
+        let mut bytes = writer.finish().expect("finish");
+        if version_one.contains(&seq) {
+            bytes = rewrite_key_index(&bytes, KEY_IDX_VERSION_1, |_, _, entries| {
+                entries
+                    .into_iter()
+                    .filter(|(key, _)| *key != key8_i64(TARGET))
+                    .collect()
+            })
+            .expect("rewrite as version 1");
+        }
+        let bytes = Bytes::from(bytes);
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seq as u64 + 1,
+            object_size: bytes.len() as u64,
+            content_hash: *blake3::hash(&bytes).as_bytes(),
+            sample_count: RECORDS as u64,
+            series_count: 1,
+            min_event_ts_ns: min,
+            max_event_ts_ns: max,
+            min_ingest_ts_ns: min,
+            max_ingest_ts_ns: max,
+            segment_format_version: u32::from(ravel_ingest::LOG_SEGMENT_FORMAT_VERSION),
+            created_unix_ns: 10 + seq as i64,
+            ingest_hour_bucket: 0,
+        })
+        .expect("record");
+        let key = keys::reconstruct_data_key(&rec).expect("key");
+        base.put(&key, bytes.clone(), PutOptions::default())
+            .await
+            .expect("put");
+        publish::publish(base.as_ref(), &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        objects.push(Published { key, bytes });
+    }
+    objects
 }
 
 /// A catalog whose fold builds key-index leaves.
@@ -812,6 +917,124 @@ async fn version_one_sections_are_uncovered_in_a_rebuilt_leaf() {
     let mut want = vec![ordinals[17], ordinals[20]];
     want.sort_unstable();
     assert_eq!(fx.uncovered_for_target().await, Some(want));
+}
+
+/// A logs leaf at format_version 1 is the earlier fold's: it may claim a
+/// version 1 entry covered with `TARGET` missing. The router rejects it on
+/// its prefix (`leavesRejected`, one leaf GET), the part's segments take tier
+/// 1, and the rows equal the unfolded answer.
+///
+/// FLIP: accepting version 1 for logs in `key_index_leaf_version_accepted`
+/// lets the leaf prove `TARGET` absent from object 20: the rows assertion
+/// fails with only `o0r050`.
+#[tokio::test]
+async fn a_logs_version_one_leaf_is_rejected_and_the_part_reads_uncovered() {
+    let _serial = SERIAL.lock().await;
+    let fx = Fixture::publish(&[0, 20], &[17, 20]).await;
+    let unfolded = sql(&serve(Arc::clone(&fx.base), &Serve::default())).await;
+    assert_eq!(rows(&unfolded), ["o0r050", "o20r05"]);
+    fx.fold().await;
+    let leaf = fx.swap_in_a_pre_fix_leaf().await;
+
+    let recorder = RecordingStore::new(Arc::clone(&fx.base));
+    let before = totals();
+    let v = sql(&serve(recorder.clone(), &Serve::default())).await;
+    let moved = delta(before, totals());
+    assert_eq!(rows(&v), rows(&unfolded), "rows equal the unfolded answer");
+    assert_eq!(recorder.of(&leaf).len(), 1, "the prefix GET, then nothing");
+    assert_eq!(key_index(&v, "keysProbed"), 1, "{v}");
+    assert_eq!(key_index(&v, "leavesRejected"), 1, "{v}");
+    assert_eq!(key_index(&v, "partsCovered"), 0, "{v}");
+    assert_eq!(key_index(&v, "partsUncovered"), 0, "{v}");
+    assert_eq!(key_index(&v, "leafGetRequests"), 1, "{v}");
+    assert_signal_key_index_matches(&v);
+    assert_eq!(moved, Totals::only(KeyIndexPartOutcome::Rejected, 1, 1));
+    for n in 1..=16 {
+        assert_eq!(
+            recorder.of(&fx.objects[n].key),
+            [GetRange::Full],
+            "object {n}: tier 1 reads a small object whole"
+        );
+    }
+}
+
+/// An advancing fold whose previous tail leaf is a logs format_version 1
+/// leaf does not carry it: holder 10 carries a version 1 KEY_IDX section
+/// without `TARGET`, and the first fold's leaf is replaced by a pre-fix one
+/// claiming entry 10 covered. The fold that adds objects 12 to 23 to the
+/// tail GETs that leaf, carries no entry, reads all 24 sections, and lists
+/// entry 10 uncovered in the new version 2 leaf. The rows equal the unfolded
+/// answer.
+///
+/// FLIP: dropping the version check in `load_carried_key_index` carries
+/// entry 10 as covered: the `uncovered_for_target` assertion fails with
+/// `Some([])`, and the statement returns only `o0r050`.
+#[tokio::test]
+async fn an_advancing_fold_does_not_carry_a_logs_version_one_leaf() {
+    let _serial = SERIAL.lock().await;
+    let base: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let mut fx = Fixture {
+        objects: publish_objects(&base, &[0, 10], &[10], 0..12).await,
+        base,
+    };
+    fx.declare().await;
+    // Ten minutes into ingest hour 0, operator-sealed through it, then five
+    // minutes later inside its margin, which re-lists the held-open hour.
+    let catalog = leaf_catalog(Arc::clone(&fx.base));
+    let at = |minutes: i64| minutes * 60 * 1_000_000_000;
+    let first = catalog
+        .fold_with_seal_through(
+            &tenant().hash(),
+            Signal::Logs,
+            Uuid::from_u128(1),
+            at(10),
+            &[],
+            None,
+            &RefoldRequest::new(),
+            Some(0),
+        )
+        .await
+        .expect("first fold");
+    assert_eq!(first.entry_count, 12, "{first:?}");
+    fx.swap_in_a_pre_fix_leaf().await;
+    let late = publish_objects(&fx.base, &[0, 10], &[10], 12..OBJECTS).await;
+    fx.objects.extend(late);
+    let unfolded_holders = ["o0r050", "o10r05"];
+
+    let report = catalog
+        .fold_with_seal_through(
+            &tenant().hash(),
+            Signal::Logs,
+            Uuid::from_u128(1),
+            at(15),
+            &[],
+            None,
+            &RefoldRequest::new(),
+            None,
+        )
+        .await
+        .expect("advancing fold");
+    assert_eq!(report.entry_count, OBJECTS as u64, "{report:?}");
+    let (leaf, ordinals) = fx.layout().await;
+    assert_eq!(fx.uncovered_for_target().await, Some(vec![ordinals[10]]));
+    let bytes = fx.base.get(&leaf, GetRange::Full).await.expect("leaf").data;
+    let summary = verify_key_index_leaf(&bytes, &KeyIndexLeafLimits::default()).expect("verify");
+    assert_eq!(summary.header.format_version, KEY_INDEX_LEAF_FORMAT_VERSION);
+
+    let unfolded = {
+        let unfolded = Fixture::publish(&[0, 10], &[10]).await;
+        sql(&serve(Arc::clone(&unfolded.base), &Serve::default())).await
+    };
+    assert_eq!(rows(&unfolded), unfolded_holders);
+    let v = sql(&serve(Arc::clone(&fx.base), &Serve::default())).await;
+    assert_eq!(rows(&v), rows(&unfolded), "rows equal the unfolded answer");
+    assert_eq!(key_index(&v, "partsCovered"), 1, "{v}");
+    assert_eq!(
+        report.key_index_leaf_gets, 1,
+        "the previous leaf: {report:?}"
+    );
+    assert_eq!(report.key_index_entries_carried, 0, "{report:?}");
+    assert_eq!(report.key_index_sections_read, OBJECTS as u64, "{report:?}");
 }
 
 /// The tier-1 answer every leaf-path failure must fall back to: the 16 small
