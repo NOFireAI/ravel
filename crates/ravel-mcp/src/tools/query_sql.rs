@@ -10,11 +10,15 @@
 //! is `ok_bounded` with no cursor: a statement with no `ORDER BY` over a table
 //! with no row identity, and a statement whose `ORDER BY` uses a value
 //! computed from other rows that the planner does not prove non-null (`sum`,
-//! `min`, `max`, `avg`, a window function other than `count`, a subquery).
+//! `avg`, a `min` or `max` it cannot prove, a window function other than
+//! `count`, a subquery).
 //!
-//! An order on `count(...)` pages (`PagePlan::order_from_other_rows`). A row
-//! committed after a cursor was minted can change a count for a row already
-//! served and move that row after the cursor, so such a walk pins the segment
+//! An order on `count(...)` pages, and so does an order on `min(col)` or
+//! `max(col)` under a plain `GROUP BY` when `col` is a NOT NULL integer,
+//! string or nanosecond timestamp column of the target table
+//! (`PagePlan::order_from_other_rows`). A row committed after a cursor was
+//! minted can change such a value for a row already served and move that row
+//! after the cursor, so such a walk pins the segment
 //! set page one read ([`SegmentSetPin::Required`]): a later page is served
 //! only over the same segments, and is otherwise `cursor_expired` with the
 //! single next step `rerun_page_one`. A walk ordered by the row's own columns
@@ -39,8 +43,8 @@
 //! [`crate::resume_tuple`], together with the effective `ORDER BY`. A later
 //! page resolves at page one's instant, audits at its own clock, and is
 //! refused as `cursor_expired` when a newer erasure or a changed declared
-//! column set moved what page one's pin describes, or, for a `count` order,
-//! when its segment set moved.
+//! column set moved what page one's pin describes, or, for a `count`, `min`
+//! or `max` order, when its segment set moved.
 //!
 //! Three boundaries have no cursor position, and each ends the page
 //! `ok_bounded` with no cursor and a `next_steps` entry rather than a
@@ -149,9 +153,11 @@ impl Unpaged {
             Unpaged::OrderFromOtherRows => step(
                 "order_by_the_rows_own_columns",
                 "the ORDER BY uses a value computed from other rows that the statement does \
-                 not prove non-null (sum, min, max, avg, a window function other than count, \
-                 a subquery), so the rest of the result has no cursor; order by count(...) or \
-                 by the row's own non-null columns to page, or narrow time_range",
+                 not prove non-null (sum, avg, a window function other than count, a \
+                 subquery, or a min or max that is not over a NOT NULL integer, string or \
+                 timestamp column under a plain GROUP BY), so the rest of the result has no \
+                 cursor; order by count(...), by min(col) or max(col) under GROUP BY, or by \
+                 the row's own non-null columns to page, or narrow time_range",
             ),
         }
     }
@@ -454,6 +460,15 @@ fn finish(
             return Err(unmintable(format!(
                 "the cursor after the last row is {len} bytes, over the {CURSOR_BOUND}-byte bound"
             )));
+        }
+        // A tuple the redemption would refuse is refused here instead, so the
+        // page is ok_bounded rather than carrying a cursor that only fails.
+        if !plan.admits_resume(tuple) {
+            return Err(unmintable(
+                "the last row's ORDER BY values are not of the types the order was planned \
+                 with, so a cursor after it could not be redeemed"
+                    .to_string(),
+            ));
         }
         Ok(token)
     })
@@ -1092,8 +1107,10 @@ mod tests {
                     let detail = &page.next_steps[0].detail;
                     assert!(
                         detail.contains("computed from other rows")
-                            && detail.contains("order by count(...)")
-                            && detail.contains("the row's own non-null columns"),
+                            && detail.contains(
+                                "order by count(...), by min(col) or max(col) under GROUP BY, \
+                                 or by the row's own non-null columns to page"
+                            ),
                         "{query}: {detail}"
                     );
                 } else {
@@ -1202,6 +1219,59 @@ mod tests {
                     backend reported no segment set to pin"),
             "{:?}",
             page.warnings
+        );
+    }
+
+    /// An order on a proven `max(...)` pages under the same required pin as a
+    /// `count` order: its cursor carries page one's digest, a later page over
+    /// a moved segment set is `cursor_expired` with `rerun_page_one` and no
+    /// rows, and the same page over page one's set is served, pinned, resumed
+    /// after page one's last kept group.
+    ///
+    /// FLIP: passing `SegmentSetPin::Advisory` for a `max` order serves the
+    /// moved page.
+    #[test]
+    fn a_max_order_expires_when_the_segment_set_moves() {
+        const MAX_ORDER: &str = "SELECT series_id, max(ts) AS m FROM samples \
+                                 GROUP BY series_id ORDER BY m DESC, series_id";
+        let plan = ravel_sql::plan_page(MAX_ORDER, None).expect("a max order plans");
+        assert!(plan.order_from_other_rows);
+        assert_eq!(order_columns(&plan), ["m", "series_id"]);
+
+        let key = key();
+        let stub = Stub::default();
+        let max_page = |digest: [u8; 32]| {
+            let mut draft = draft_of(
+                Signal::Metrics,
+                vec![Some(sample(5)), Some(sample(4)), Some(sample(3))],
+                Vec::new(),
+                END_NS,
+            );
+            draft.segment_set_digest = Some(digest);
+            draft
+        };
+        stub.sql
+            .borrow_mut()
+            .extend([max_page(SEGMENTS), max_page(MOVED), max_page(SEGMENTS)]);
+
+        let one = block_on(run(args(MAX_ORDER, None), &context(&key), &stub));
+        assert_eq!(one.status, Status::OkPage, "{one:?}");
+        assert_eq!(one.data.rows.len(), 2);
+        assert_eq!(decoded(&one, &key).segment_set_digest, Some(SEGMENTS));
+        let cursor = one.presentation.cursor.clone().expect("page one's cursor");
+
+        let moved = block_on(run(args(MAX_ORDER, Some(&cursor)), &later(&key), &stub));
+        assert_eq!(failure_class(&moved), FailureClass::CursorExpired);
+        assert_eq!(actions(&moved), ["rerun_page_one"]);
+        assert!(moved.data.rows.is_empty());
+
+        let same = block_on(run(args(MAX_ORDER, Some(&cursor)), &later(&key), &stub));
+        assert_eq!(same.status, Status::OkPage, "{same:?}");
+        assert!(same.visibility.pinned);
+        assert_eq!(decoded(&same, &key).segment_set_digest, Some(SEGMENTS));
+        assert_eq!(
+            stub.executed.borrow()[2].request.sql,
+            statement(MAX_ORDER, Some(sample(4)))
         );
     }
 
@@ -1441,10 +1511,21 @@ mod tests {
         assert_eq!(stub.executed.borrow().len(), 1);
     }
 
+    /// `samples` order tuple `i` with a `series_id` eight bytes wide where
+    /// the column is sixteen.
+    fn narrow(i: u8) -> Vec<ResumeValue> {
+        vec![
+            ResumeValue::TimestampNanos(START_NS + i64::from(i) * 1_000),
+            ResumeValue::FixedSizeBinary(vec![i; 8]),
+        ]
+    }
+
     /// A cursor whose tuple does not have the order terms' types is
     /// `cursor_invalid`, the class of a cursor bound to other inputs, before
-    /// the backend. Page one mints it from a `series_id` eight bytes wide
-    /// where the column is sixteen.
+    /// the backend. Page one mints no such cursor (see
+    /// `a_last_row_of_the_wrong_kind_mints_no_cursor`), so the test re-signs
+    /// page one's cursor around a `series_id` eight bytes wide where the
+    /// column is sixteen.
     ///
     /// FLIP: dropping `ResumeValueTypeMismatch` from `resume_plan`'s cursor
     /// arm sends it to `plan_refusal`, which answers `invalid_argument`.
@@ -1452,23 +1533,53 @@ mod tests {
     fn a_cursor_whose_tuple_has_another_type_is_invalid() {
         let key = key();
         let stub = Stub::default();
-        let narrow = |i: u8| {
-            Some(vec![
-                ResumeValue::TimestampNanos(START_NS + i64::from(i) * 1_000),
-                ResumeValue::FixedSizeBinary(vec![i; 8]),
-            ])
-        };
-        stub.sql.borrow_mut().push_back(draft_of(
-            Signal::Metrics,
-            vec![narrow(1), narrow(2), narrow(3)],
-            Vec::new(),
-            END_NS,
-        ));
+        stub.sql.borrow_mut().push_back(samples(&[1, 2, 3]));
         let one = block_on(run(args(TOTAL, None), &context(&key), &stub));
-        let cursor = one.presentation.cursor.expect("page one's cursor");
+        let mut forged = decoded(&one, &key);
+        let CursorPosition::Keyset { tuple, .. } = &mut forged.position else {
+            panic!("a keyset position: {:?}", forged.position);
+        };
+        *tuple = encode_resume_tuple(&narrow(2)).expect("encodes");
+        let cursor = forged.encode(&key).expect("re-signs");
 
         let two = block_on(run(args(TOTAL, Some(&cursor)), &later(&key), &stub));
         assert_eq!(failure_class(&two), FailureClass::CursorInvalid);
+        assert_eq!(stub.executed.borrow().len(), 1);
+    }
+
+    /// A last row whose order values the plan's proven kinds refuse mints no
+    /// cursor: page one is `ok_bounded` with no cursor and the
+    /// `narrow_time_range` step, rather than handing out a cursor every
+    /// redemption of which is `cursor_invalid`. The last kept row has the
+    /// right arity and a `series_id` of the wrong width.
+    ///
+    /// FLIP: an `admits_resume` that checks only the arity mints a cursor.
+    /// FLIP: removing the mint-time check (leaving the check at redemption
+    /// only) mints a cursor.
+    #[test]
+    fn a_last_row_of_the_wrong_kind_mints_no_cursor() {
+        let key = key();
+        let stub = Stub::default();
+        stub.sql.borrow_mut().push_back(draft_of(
+            Signal::Metrics,
+            vec![Some(sample(1)), Some(narrow(2)), Some(sample(3))],
+            Vec::new(),
+            END_NS,
+        ));
+
+        let page = block_on(run(args(TOTAL, None), &context(&key), &stub));
+
+        assert_eq!(page.status, Status::OkBounded, "{page:?}");
+        assert_eq!(page.presentation.cursor, None);
+        assert_eq!(page.data.rows.len(), 2);
+        assert_eq!(actions(&page), ["narrow_time_range"]);
+        assert_eq!(
+            page.warnings,
+            [
+                "no cursor: the last row's ORDER BY values are not of the types the order was \
+              planned with, so a cursor after it could not be redeemed"
+            ]
+        );
         assert_eq!(stub.executed.borrow().len(), 1);
     }
 }
