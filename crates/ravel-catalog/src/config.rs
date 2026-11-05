@@ -398,9 +398,9 @@ pub const DEFAULT_SNAPSHOT_PART_MAX_ENTRIES: usize = 250_000;
 /// mirroring the resolve path's in-flight bound). 8 matches the resolve
 /// path's fan-out order without saturating a small backend.
 pub const DEFAULT_FOLD_BUCKET_CONCURRENCY: usize = 8;
-/// Default `key_index_build_max_pairs`: 8,000,000 (entry, key8) pairs, at
-/// most about 704 MB at 88 B a one-block pair (see
-/// [`CatalogConfig::key_index_build_max_pairs`]; ADR-3692 decision 5).
+/// Default `key_index_build_max_pairs`: 8,000,000 (entry, key8) pairs (see
+/// [`CatalogConfig::key_index_build_max_pairs`] for the bound a pass holds
+/// under it; ADR-3692 decision 5).
 pub const DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS: u64 = 8_000_000;
 /// Default `fold_reconcile_window_hours`: how far back of the previous fold's
 /// watermark the post-fold reconcile pass re-lists commit buckets to catch a
@@ -674,31 +674,44 @@ pub struct CatalogConfig {
     pub build_key_index_leaves: bool,
     /// Most (entry, key8) pairs the leaf build holds at once for one part,
     /// read from KEY_IDX sections and carried from the previous tail's leaves
-    /// together (ADR-3692 decision 5, the #3704 amendment). Each pass gives
-    /// every field still building an equal share, `max_pairs / fields` (at
-    /// least 1), and holds for each field, from where its last pass ended,
-    /// the longest run of whole key8s whose pairs fit the share, or that one
-    /// key8 whole when its own pairs exceed it; each later pass reads the
-    /// sections again and decodes the carried leaves its range overlaps. For
-    /// one field the pass count is the greedy partition of its ascending
-    /// key8 runs into groups of at most the budget, `ceil(P / budget)` only
-    /// when no key8 is shared between entries; a field rebuilt after a later
-    /// pass found a new uncovered entry passes again. The leaves are
-    /// identical to a one-pass build.
+    /// together (ADR-3692 decision 5, the #3704 amendments). Every field the
+    /// build indexes gets a fixed share for the whole build, `max(1,
+    /// max_pairs / F)` with `F` the number of those fields, whether or not
+    /// it is still building. Each pass holds for each field, from where its
+    /// last pass ended, the longest run of whole key8s whose pairs fit the
+    /// share, or that one key8 whole when its own pairs exceed it, and closes
+    /// every leaf slice it opened before the next pass starts; each later
+    /// pass reads the sections again and decodes the carried leaves its range
+    /// overlaps. A field's pass count is the greedy partition of its
+    /// ascending key8 runs into groups of at most its share, `ceil(P /
+    /// share)` only when no key8 is shared between entries, and the build
+    /// takes as many passes as its slowest field; a field rebuilt after a
+    /// later pass found a new uncovered entry passes again.
     ///
-    /// A held pair costs at most 80 B plus its block list: one 40-byte
-    /// `KeyIndexLeafEntry` in its field's heap buffer, which grows to at most
-    /// twice the most pairs it held, and a `Vec<u32>` of exactly its blocks,
-    /// 4 B each requested, which jemalloc (the binaries' allocator) rounds
-    /// up to its 8 B smallest class for one or two blocks: 88 B for a
-    /// one-block pair. A pass holds at most its share plus the one pair
-    /// placed before each cut, or one key8's pairs plus one when that key8
-    /// exceeds the share. Outside the budget: the previous tail's leaf bytes
-    /// as stored, kept for the whole build; one decoded frame of one previous
-    /// leaf at a time; the KEY_IDX sections in flight, up to
-    /// `fold_bucket_concurrency`; the pass's encoded leaves until their PUTs;
-    /// and per-entry bookkeeping. Default
-    /// [`DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`]; 0 is read as 1.
+    /// Bound: on every pass, for each field, the heap pairs at their peak
+    /// plus the pairs of a slice left open across the pass end are at most
+    /// `max(share, R) + 1`, `R` the field's largest key8 run, and the open
+    /// slice is always 0. `fold::tests::
+    /// every_pass_holds_at_most_its_share_open_slice_included` pins it. The
+    /// leaves depend on the budget: they equal a build from scratch at the
+    /// same budget, and a one-pass build only when every field fits its
+    /// share.
+    ///
+    /// Per held pair, an upper-bound estimate of 88 B for a one-block pair:
+    /// the 40-byte `KeyIndexLeafEntry` (pinned by
+    /// `a_held_pair_is_forty_bytes_in_the_heap_buffer`), counted twice
+    /// because the heap buffer grows to at most twice the most pairs it held
+    /// (pinned per pass), plus a `Vec<u32>` whose capacity is exactly its
+    /// blocks (pinned per pass), 4 B a block requested. The 8 B the binaries'
+    /// allocator, jemalloc, charges a one- or two-block `Vec` is its smallest
+    /// size class and is not pinned here. The pass sorts its pairs in the
+    /// heap buffer, copying none (pinned by
+    /// `a_pass_sorts_its_pairs_in_the_heap_buffer`). Outside the budget: the
+    /// previous tail's leaf bytes as stored, read once per fold and kept for
+    /// the whole build; one decoded frame of one previous leaf at a time; the
+    /// KEY_IDX sections in flight, up to `fold_bucket_concurrency`; the
+    /// pass's encoded leaves until their PUTs; and per-entry bookkeeping.
+    /// Default [`DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`]; 0 is read as 1.
     pub key_index_build_max_pairs: u64,
     /// How far back of the previous fold's watermark the post-fold reconcile
     /// pass re-lists commit buckets, in hours (ADR-0063 section 4). Each fold

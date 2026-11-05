@@ -182,15 +182,16 @@ async fn fold_spans_with_budget(max_pairs: u64) -> (ravel_catalog::FoldReport, S
 
 /// `--key-index-build-max-pairs` (ADR-3692 decision 5) reaches the fold: the
 /// one entry's three trace ids are three (entry, key8) pairs, so a budget of
-/// 1 builds the leaf in ceil(3 / 1) = 3 passes, each reading the entry's
-/// section, where the default budget builds it in one. The text report
-/// prints each of the four build figures.
+/// 1 builds the field in ceil(3 / 1) = 3 passes, each reading the entry's
+/// section and closing its own leaf, where the default budget builds one
+/// leaf in one pass. The text report prints each of the four build figures.
 #[tokio::test]
 async fn the_pair_budget_reaches_the_fold_and_the_report_prints_the_build_figures() {
     let (one_pass, one_pass_printed) =
         fold_spans_with_budget(ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS).await;
     assert_eq!(one_pass.key_index_build_passes, 1, "default: one pass");
     assert_eq!(one_pass.key_index_sections_read, 1, "default: one read");
+    assert_eq!(one_pass.key_index_leaves_written, 1, "default: one leaf");
 
     let (budgeted, printed) = fold_spans_with_budget(1).await;
     assert_eq!(budgeted.key_index_build_passes, 3, "budget 1: three passes");
@@ -200,7 +201,7 @@ async fn the_pair_budget_reaches_the_fold_and_the_report_prints_the_build_figure
         "a first fold carries none"
     );
     assert_eq!(budgeted.key_index_leaf_gets, 0, "no previous tail leaf");
-    assert_eq!(budgeted.key_index_leaves_written, 1, "still one leaf");
+    assert_eq!(budgeted.key_index_leaves_written, 3, "one leaf per pass");
 
     for line in [
         "key_index_sections_read: 3\n",
@@ -224,8 +225,9 @@ async fn the_pair_budget_reaches_the_fold_and_the_report_prints_the_build_figure
 /// tail part with one leaf; two later objects of two trace ids each are then
 /// folded now under a budget of 5 pairs. That fold re-encodes the tail, GETs
 /// its one previous leaf, carries the three old entries, and holds 10 pairs
-/// in two passes of 5, reading the two new sections in each: 4 sections, 3
-/// entries carried, 2 passes and 1 leaf GET, each printed once.
+/// in two passes of 5, reading the two new sections in each and closing one
+/// leaf each: 4 sections, 3 entries carried, 2 passes and 1 leaf GET, each
+/// printed once, and 2 leaves.
 #[tokio::test]
 async fn an_advancing_fold_reports_four_different_build_figures() {
     let now = ravel_cli::now_ns().expect("system clock readable");
@@ -266,7 +268,7 @@ async fn an_advancing_fold_reports_four_different_build_figures() {
     assert_eq!(second.key_index_entries_carried, 3, "{second:?}");
     assert_eq!(second.key_index_build_passes, 2, "{second:?}");
     assert_eq!(second.key_index_leaf_gets, 1, "{second:?}");
-    assert_eq!(second.key_index_leaves_written, 1, "{second:?}");
+    assert_eq!(second.key_index_leaves_written, 2, "{second:?}");
     for line in [
         "key_index_sections_read: 4\n",
         "key_index_entries_carried: 3\n",

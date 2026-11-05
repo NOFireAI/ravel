@@ -2196,18 +2196,20 @@ pub(crate) struct BuiltPartKeyIndex {
 /// the carry and every entry is read; so does a section naming a field the
 /// tenant does not declare, since a carried entry might name it too.
 ///
-/// Passes: each pass gives every field still building an equal share of
-/// `limits.max_pairs` (at least 1) and holds, per field, the pairs read and
-/// carried in its key8 range. When a field's held pairs pass its share, it
-/// gives up its highest key8 run, which becomes the exclusive end of the
-/// range, so a pass holds the longest run of whole key8s from where the
-/// field's last pass ended that fits the share, or that one key8 whole when
-/// its own pairs exceed it. Each later pass reads the sections again and
-/// decodes the carried leaves its range overlaps. A field whose later pass
-/// finds an entry uncovered after pairs already reached its slices keeps
-/// passing to the end of the key space, collecting every uncovered entry,
-/// and is then rebuilt once from the first range with the complete list; a
-/// further finding in the rebuild leaves it with no leaf.
+/// Passes: every field the build indexes gets a fixed share of
+/// `limits.max_pairs`, `max(1, max_pairs / fields)`, for the whole build,
+/// and each pass holds, per field, the pairs read and carried in its key8
+/// range. When a field's held pairs pass its share, it gives up its highest
+/// key8 run, which becomes the exclusive end of the range, so a pass holds
+/// the longest run of whole key8s from where the field's last pass ended
+/// that fits the share, or that one key8 whole when its own pairs exceed
+/// it. A pass encodes and closes every slice its pairs open before the next
+/// pass starts, so no pair outlives its pass. Each later pass reads the
+/// sections again and decodes the carried leaves its range overlaps. A field
+/// whose later pass finds an entry uncovered after an earlier pass ended
+/// holding pairs keeps passing to the end of the key space, collecting every
+/// uncovered entry, and is then rebuilt once from the first range with the
+/// complete list; a further finding in the rebuild leaves it with no leaf.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_part_key_index(
     store: &dyn ObjectStoreBackend,
@@ -14448,6 +14450,10 @@ pub(crate) mod tests {
         assert_eq!(report.key_index_entries_carried, 3, "{report:?}");
         assert_eq!(report.key_index_leaf_gets, 1, "{report:?}");
         assert_eq!(report.key_index_sections_read, 2 * 3, "{report:?}");
+        // Two ranged GETs per section read, the objects being shorter than
+        // the footer suffix: 2 entries x 2 GETs x 3 passes.
+        assert_eq!(report.key_index_ranged_gets, 2 * 2 * 3, "{report:?}");
+        assert_eq!(data_object_ranged_gets(&inner).len(), 2 * 2 * 3);
         assert_eq!(report.key_index_leaves_written, 3, "{report:?}");
         let second = read_signal_head(inner.as_ref(), Signal::Logs).await;
         assert_eq!(
@@ -14501,10 +14507,9 @@ pub(crate) mod tests {
     /// 17-pair shared-key8 fixture (largest run 4) and the 12-pair budget
     /// fixture under its 40-byte ceiling (largest run 1, so ceiling cuts fall
     /// inside passes), and on the advancing fixture's 9 carried and 6 read
-    /// pairs (largest run 5), at budgets 1, 2, 3, 5, 6 and `u64::MAX`. A
-    /// slice cut only by the ceiling keeps every earlier pass's pairs: at
-    /// budget 5 the advancing fold's third pass held 5 in the heap and 10 in
-    /// the slice.
+    /// pairs (largest run 5), at budgets 1, 2, 3, 5, 6 and `u64::MAX`. It
+    /// fails when a slice outlives the pass that held its pairs, since the
+    /// open slice then holds every earlier pass's pairs past the ceiling.
     #[tokio::test]
     async fn every_pass_holds_at_most_its_share_open_slice_included() {
         for max_pairs in [1, 2, 3, 5, 6, u64::MAX] {

@@ -4,8 +4,12 @@
 //! "Rollout").
 //!
 //! The leaves are built by the fold's own leaf build from the same ranged
-//! KEY_IDX reads, so for a declared field a rebuilt leaf is byte-identical to
-//! the one a fold with `build_key_index_leaves` on writes for the same part.
+//! KEY_IDX reads, in one pass with no pair budget. A fold closes a leaf at
+//! every pass end, so for a declared field a rebuilt leaf is byte-identical
+//! to the one a fold with `build_key_index_leaves` on writes for the same
+//! part only when that fold built the field in one pass, its pairs within
+//! its share of `key_index_build_max_pairs`; otherwise both tile the key
+//! space and answer every lookup the same, at different leaf boundaries.
 //! The fold also indexes fields a KEY_IDX section names that the tenant does
 //! not declare; the rebuild does not.
 
