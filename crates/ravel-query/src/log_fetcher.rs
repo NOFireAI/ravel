@@ -57,10 +57,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::config::EngineConfigError;
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::{MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, ReadCache, bound_runs, gate_not_run};
+use crate::key_index_route::{KeySet, KeySetError, LeafRangeReader};
 use crate::phase_accounting::{PhaseAccounting, PhaseWireByteCounter, QueryPhase};
 use crate::reserved_bytes::attach_reservation;
 use crate::span_fetcher::{KeyIndexPruning, key_idx_frame_decompressed_len};
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use ravel_cache::{CacheKey, ReadOutcome, SingleFlightError};
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
@@ -82,6 +84,7 @@ use ravel_logseg::{
 };
 use ravel_object_store::get_latency::InGetPhase;
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError};
+use ravel_proto::catalog::v1::SnapshotKeyIndexLeafRef;
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccessIntent, AccountedOp, QueryAccounting};
 use ravel_types::logstream::canonical_attr_bytes;
@@ -1322,6 +1325,9 @@ impl LogSegmentFetcher {
                             "GetLimiter semaphore closed unexpectedly".to_string(),
                         ))
                     })?;
+                    // Counted once issued, so a GET whose future is dropped
+                    // mid-flight is still charged; bytes count on arrival.
+                    accounting.record_s3_request(AccountedOp::Get);
                     self.store
                         .get(key, GetRange::Range(start, end))
                         .in_get_phase(phase.into())
@@ -1329,7 +1335,6 @@ impl LogSegmentFetcher {
                         .map_err(store_error)?
                 };
                 let len = got.data.len() as u64;
-                accounting.record_s3_request(AccountedOp::Get);
                 accounting.add_s3_bytes(AccountedOp::Get, len);
                 self.wire_bytes.record(phase, len);
                 Ok::<_, LogFetchError>((got, reservation))
@@ -1788,6 +1793,8 @@ impl LogSegmentFetcher {
                                 "GetLimiter semaphore closed unexpectedly".to_string(),
                             ),
                         })?;
+                // Counted once issued; bytes count on arrival.
+                accounting.record_s3_request(AccountedOp::Get);
                 self.store
                     .get(key, GetRange::Full)
                     .in_get_phase(ReadPhases::SCAN.blocks.into())
@@ -1800,7 +1807,6 @@ impl LogSegmentFetcher {
             .instrument(fetch_span.clone())
             .await?;
             let bytes = attach_reservation(got.data, reservation);
-            accounting.record_s3_request(AccountedOp::Get);
             accounting.add_s3_bytes(AccountedOp::Get, bytes.len() as u64);
             // #913: a data read, so the whole object's wire bytes are the
             // scan phase's (`ReadPhases::SCAN.blocks`).
@@ -2525,6 +2531,55 @@ impl LogSegmentFetcher {
         plan_accounting: &QueryAccounting,
         key_index_accounting: &QueryAccounting,
     ) -> Result<KeyedSegmentPlan, LogFetchError> {
+        self.plan_segment_keyed_with(
+            seg_ref,
+            tenant_hash,
+            query,
+            None,
+            plan_accounting,
+            key_index_accounting,
+        )
+        .await
+    }
+
+    /// [`plan_segment_keyed`](Self::plan_segment_keyed) for a segment the
+    /// tier-2 router answered `Blocks(blocks)` for (ADR-3692 decision 4):
+    /// the block set is already known, so no KEY_IDX prefix or bucket is
+    /// read. Above [`plan_whole_object_bound`](Self::plan_whole_object_bound)
+    /// the plan is restricted to `blocks` as a present probe restricts it
+    /// (`key_blocks`, `key_index.blocks_pruned`); at or under it, and on a
+    /// span outside the query window, the object is planned by
+    /// [`plan_segment`](Self::plan_segment) over the query without its arms,
+    /// with nothing restricted. `blocks` is ascending and distinct.
+    pub async fn plan_segment_routed(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        blocks: &[u32],
+        plan_accounting: &QueryAccounting,
+        key_index_accounting: &QueryAccounting,
+    ) -> Result<KeyedSegmentPlan, LogFetchError> {
+        self.plan_segment_keyed_with(
+            seg_ref,
+            tenant_hash,
+            query,
+            Some(blocks),
+            plan_accounting,
+            key_index_accounting,
+        )
+        .await
+    }
+
+    async fn plan_segment_keyed_with(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        known: Option<&[u32]>,
+        plan_accounting: &QueryAccounting,
+        key_index_accounting: &QueryAccounting,
+    ) -> Result<KeyedSegmentPlan, LogFetchError> {
         let unkeyed = |primed: Option<PrimedProbe>| async move {
             let mut bare = query.clone();
             bare.key_equals.clear();
@@ -2543,8 +2598,12 @@ impl LogSegmentFetcher {
                 key_index: KeyIndexPruning::default(),
             })
         };
-        if query.key_equals.is_empty()
-            || seg_ref.object_size <= self.block_range_threshold
+        let size_gate = match known {
+            Some(_) => self.plan_whole_object_bound(),
+            None => self.block_range_threshold,
+        };
+        if (known.is_none() && query.key_equals.is_empty())
+            || seg_ref.object_size <= size_gate
             || seg_ref.min_event_ts_ns > seg_ref.max_event_ts_ns
             || !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
         {
@@ -2567,6 +2626,7 @@ impl LogSegmentFetcher {
                 tenant_hash,
                 query,
                 seg_ref.object_size > self.plan_whole_object_bound(),
+                known,
                 accounting,
                 phase.key_index(),
             )
@@ -3536,6 +3596,8 @@ impl LogSegmentFetcher {
                                 "GetLimiter semaphore closed unexpectedly".to_string(),
                             ),
                         })?;
+                // Counted once issued; bytes count on arrival.
+                accounting.record_s3_request(AccountedOp::Get);
                 self.store
                     .get(key, GetRange::Full)
                     .in_get_phase(phase.into())
@@ -3547,7 +3609,6 @@ impl LogSegmentFetcher {
             }
             .instrument(fetch_span.clone())
             .await?;
-            accounting.record_s3_request(AccountedOp::Get);
             accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
             self.wire_bytes.record(phase, got.data.len() as u64);
             fetch_span.record("s3_requests", 1u64);
@@ -3569,12 +3630,13 @@ impl LogSegmentFetcher {
                             "GetLimiter semaphore closed unexpectedly".to_string(),
                         )
                     })?;
+                    // Counted once issued; bytes count on arrival.
+                    accounting.record_s3_request(AccountedOp::Get);
                     let got = self
                         .store
                         .get(key, GetRange::Full)
                         .in_get_phase(phase.into())
                         .await?;
-                    accounting.record_s3_request(AccountedOp::Get);
                     accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
                     self.wire_bytes.record(phase, got.data.len() as u64);
                     Ok(got.data)
@@ -4720,6 +4782,155 @@ pub type SegmentPlan = Option<(
     Option<CarriedWholeObject>,
 )>;
 
+/// The tier-2 router's key set for one logs [`KeyEquals`] arm: the arm's
+/// field, key type and `key8`, which are what the fold copies from a
+/// version 2 RLOG KEY_IDX section into a leaf.
+pub fn log_key_set(arm: &KeyEquals) -> Result<KeySet, KeySetError> {
+    KeySet::new(arm.field.clone(), arm.key_type, vec![arm.key8])
+}
+
+/// The tier-2 router's [`LeafRangeReader`] for logs: each leaf range goes
+/// through [`LogSegmentFetcher::read_leaf_range`], so it shares the read
+/// cache (keyed by the leaf's `blake3`), the GET limiter and the fetch
+/// reservation with the data reads, and a GET that reaches the store is
+/// timed under [`QueryPhase::KeyIndex`] and charged to the router's
+/// accounting handle when it is issued.
+pub struct LogLeafRangeReader<'a> {
+    fetcher: &'a LogSegmentFetcher,
+    tenant_hash: TenantHash,
+}
+
+impl<'a> LogLeafRangeReader<'a> {
+    pub fn new(fetcher: &'a LogSegmentFetcher, tenant_hash: TenantHash) -> Self {
+        LogLeafRangeReader {
+            fetcher,
+            tenant_hash,
+        }
+    }
+}
+
+impl LeafRangeReader for LogLeafRangeReader<'_> {
+    fn read_range<'b>(
+        &'b self,
+        leaf: &'b SnapshotKeyIndexLeafRef,
+        range: std::ops::Range<u64>,
+        accounting: &'b QueryAccounting,
+    ) -> BoxFuture<'b, Result<Bytes, String>> {
+        Box::pin(async move {
+            let content_hash: [u8; 32] = leaf
+                .blake3
+                .as_slice()
+                .try_into()
+                .map_err(|_| format!("leaf {}: blake3 is not 32 bytes", leaf.key))?;
+            let len = range.end.saturating_sub(range.start);
+            if len == 0 || range.end > leaf.size {
+                return Err(format!(
+                    "leaf {}: range {range:?} outside {} bytes",
+                    leaf.key, leaf.size
+                ));
+            }
+            self.fetcher
+                .read_leaf_range(
+                    &leaf.key,
+                    content_hash,
+                    self.tenant_hash,
+                    range.start,
+                    len,
+                    accounting,
+                )
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
+impl LogSegmentFetcher {
+    /// One exact range of an immutable key-index leaf, through the read
+    /// cache when one is set, under the fetch reservation and the GET
+    /// limiter. The GET is timed under [`QueryPhase::KeyIndex`] and counted
+    /// on `accounting` once issued; bytes count on arrival. A short read is
+    /// refused, inside the cache fetch so the cache never admits it.
+    pub async fn read_leaf_range(
+        &self,
+        key: &str,
+        content_hash: [u8; 32],
+        tenant_hash: TenantHash,
+        start: u64,
+        len: u64,
+        accounting: &QueryAccounting,
+    ) -> Result<Bytes, LogFetchError> {
+        let phase = QueryPhase::KeyIndex;
+        let range = GetRange::Range(start, start.saturating_add(len));
+        let reservation = self.reserve_fetch(len)?;
+        let Some(cache) = &self.cache else {
+            let _permit = self
+                .get_limiter
+                .acquire()
+                .await
+                .map_err(|_| LogFetchError::Store {
+                    key: key.to_string(),
+                    source: StoreError::Transient(
+                        "GetLimiter semaphore closed unexpectedly".to_string(),
+                    ),
+                })?;
+            accounting.record_s3_request(AccountedOp::Get);
+            let got = self
+                .store
+                .get(key, range)
+                .in_get_phase(phase.into())
+                .await
+                .map_err(|source| LogFetchError::Store {
+                    key: key.to_string(),
+                    source,
+                })?;
+            accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+            self.wire_bytes.record(phase, got.data.len() as u64);
+            check_extent_len(key, got.data.len(), len)?;
+            return Ok(attach_reservation(got.data, reservation));
+        };
+        let cache_key = CacheKey::new(tenant_hash.0, content_hash, start, len);
+        let (bytes, outcome) = cache
+            .get_or_fetch(cache_key, accounting.access_intent(), || async move {
+                let _permit = self.get_limiter.acquire().await.map_err(|_| {
+                    StoreError::Transient("GetLimiter semaphore closed unexpectedly".to_string())
+                })?;
+                accounting.record_s3_request(AccountedOp::Get);
+                let got = self
+                    .store
+                    .get(key, range)
+                    .in_get_phase(phase.into())
+                    .await?;
+                accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
+                self.wire_bytes.record(phase, got.data.len() as u64);
+                if got.data.len() as u64 != len {
+                    return Err(crate::fetcher::CacheFetchError::Corrupt {
+                        key: key.to_string(),
+                        message: format!("short read: got {} bytes of {len}", got.data.len()),
+                    });
+                }
+                Ok(got.data)
+            })
+            .await
+            .map_err(|err| from_cache_error(key, err))?;
+        let mut reservation = reservation;
+        match outcome {
+            ReadOutcome::Hit => {
+                accounting.record_cache_hit();
+                accounting.add_cache_bytes(bytes.len() as u64);
+            }
+            ReadOutcome::LateServe => {
+                accounting.record_cache_miss();
+                accounting.add_late_served_bytes(bytes.len() as u64);
+            }
+            ReadOutcome::Fetched => accounting.record_cache_miss(),
+        }
+        // The returned bytes share the cache entry's allocation, which the
+        // cache's own ledger covers too (ADR-1170 decision 2).
+        reservation.mark_handed_off();
+        Ok(attach_reservation(bytes, reservation))
+    }
+}
+
 /// [`LogSegmentFetcher::plan_segment_keyed`]'s result: the plan
 /// [`LogSegmentFetcher::plan_segment`] would return, narrowed by the tier-1
 /// KEY_IDX probe (ADR-2707 decision 5).
@@ -5677,6 +5888,10 @@ impl BlockRangeFetcher {
                     "GetLimiter semaphore closed unexpectedly".to_string(),
                 ),
             })?;
+        // The request is counted once issued, so a GET whose future is
+        // dropped mid-flight, or that fails, is still charged; bytes count on
+        // arrival.
+        accounting.record_s3_request(AccountedOp::Get);
         let got = self
             .store
             .get(key, range)
@@ -5686,7 +5901,6 @@ impl BlockRangeFetcher {
                 key: key.to_string(),
                 source,
             })?;
-        accounting.record_s3_request(AccountedOp::Get);
         accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
         self.wire_bytes.record(phase, got.data.len() as u64);
         Ok(got)
@@ -6380,7 +6594,9 @@ impl BlockRangeFetcher {
     /// [`KeyedPlanRead::Absent`] before any directory past the footer is read;
     /// a probe that prunes nothing, and a present set when `plan_present` is
     /// false, returns [`KeyedPlanRead::Unkeyed`] with the footer probe's
-    /// extents, before any directory past the footer is read.
+    /// extents, before any directory past the footer is read. A `known` set
+    /// (a tier-2 `Blocks` answer) stands in for the probe: no KEY_IDX byte is
+    /// read and the set is treated as a present probe's.
     ///
     /// The survivors are the ones the reader's prune names over the same
     /// directories, so a subset open dealt any of them sees the same list:
@@ -6393,29 +6609,54 @@ impl BlockRangeFetcher {
     /// job (ADR-1702 decision 4), as the scan open of the unkeyed route does,
     /// and inline when the fetcher has no gate. The skip-decidable prune reads
     /// only the decoded directories, decompresses nothing, and runs inline.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn fetch_keyed_plan(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         query: &LogQuery,
         plan_present: bool,
+        known: Option<&[u32]>,
         accounting: &QueryAccounting,
         key_accounting: &QueryAccounting,
     ) -> Result<KeyedPlanRead, LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
         let mut stats = BlockRangeStats::default();
         let pin = EtagPin::default();
-        let (footer, extents, resident, probe) = self
-            .probe_footer_and_keys(
-                seg_ref,
-                tenant_hash,
-                &query.key_equals,
-                &pin,
-                accounting,
-                key_accounting,
-                &mut stats,
-            )
-            .await?;
+        let (footer, extents, resident, probe) = match known {
+            Some(blocks) => {
+                let (footer, extents) = self
+                    .probe_footer_extents(
+                        seg_ref,
+                        tenant_hash,
+                        ReadPhases::PLAN.metadata,
+                        &pin,
+                        accounting,
+                        &mut stats,
+                    )
+                    .await?;
+                let resident: Vec<(u64, Bytes)> =
+                    extents.iter().map(|e| (e.start, e.bytes.clone())).collect();
+                (
+                    footer,
+                    extents,
+                    resident,
+                    Some(KeyProbe::Present(blocks.to_vec())),
+                )
+            }
+            None => {
+                self.probe_footer_and_keys(
+                    seg_ref,
+                    tenant_hash,
+                    &query.key_equals,
+                    &pin,
+                    accounting,
+                    key_accounting,
+                    &mut stats,
+                )
+                .await?
+            }
+        };
         let key_blocks = match probe {
             Some(KeyProbe::Absent) => return Ok(KeyedPlanRead::Absent { fetch: stats }),
             Some(KeyProbe::Present(blocks)) if plan_present => blocks,

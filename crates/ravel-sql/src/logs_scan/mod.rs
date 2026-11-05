@@ -362,7 +362,7 @@ use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::expressions::{
     BinaryExpr, Column, DynamicFilterPhysicalExpr, Literal,
@@ -385,8 +385,8 @@ use datafusion::physical_plan::{
 use datafusion::scalar::ScalarValue;
 use futures::{Stream, StreamExt};
 use ravel_catalog::{
-    DeclaredColumnStats, LoadedColumnStats, SegmentRef, unique_column_stat,
-    validate_min_max_presence,
+    Catalog, DeclaredColumnStats, KeyIndexLeafLimits, LoadedColumnStats, SegmentRef, Snapshot,
+    SnapshotParts, unique_column_stat, validate_min_max_presence,
 };
 use ravel_commit::declared_stats::{StatCarrier, observe_declared_stat_drops};
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
@@ -401,9 +401,13 @@ use ravel_object_store::StoreError;
 use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
 use ravel_query::erasure::ErasurePredicate;
+use ravel_query::key_index_route::{
+    BudgetRefused, LeafDecodeBudget, LeafDecodeGuard, RouteFigures, RouteInput, SegmentRoute,
+    route, route_with_max_parts,
+};
 use ravel_query::{
-    CarriedWholeObject, ColumnarBlockOutcome, KeyEquals, KeyIndexPruning, LogFetchError, LogQuery,
-    LogSegmentFetcher, LogSegmentScan, PhaseAccounting,
+    CarriedWholeObject, ColumnarBlockOutcome, KeyEquals, KeyIndexPruning, LogFetchError,
+    LogLeafRangeReader, LogQuery, LogSegmentFetcher, LogSegmentScan, PhaseAccounting, log_key_set,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -1324,6 +1328,36 @@ pub struct LogsScanExec {
     /// The statement's byte and request budgets, checked after every plan,
     /// open and row-fetch read completes, before its blocks are decoded.
     budget: ScanBudget,
+    /// The tier-2 router's inputs aligned to [`Self::segments`] (ADR-3692
+    /// decision 4), set by [`Self::with_key_index_route`]. `None` leaves every
+    /// segment to its object's KEY_IDX.
+    key_index_route: Option<Arc<LogsKeyIndexRoute>>,
+}
+
+/// What the tier-2 router needs beyond a logs scan's segments (ADR-3692
+/// decision 4).
+pub(crate) struct LogsKeyIndexRoute {
+    pub(crate) catalog: Arc<Catalog>,
+    /// From the same resolve as the segments; `origin` is parallel to the
+    /// segments of the scan holding it.
+    pub(crate) parts: SnapshotParts,
+    /// A lowered part ceiling; `None` is the ADR's.
+    pub(crate) max_probed_parts: Option<usize>,
+}
+
+/// A frame decode reservation drawn from the statement's memory pool, so a
+/// leaf's decoded bound is counted against the same limit as the scan.
+struct PoolLeafBudget(Arc<dyn MemoryPool>);
+
+impl LeafDecodeBudget for PoolLeafBudget {
+    fn try_reserve(&self, bytes: u64) -> Result<LeafDecodeGuard, BudgetRefused> {
+        let reservation = MemoryConsumer::new("logs key-index leaf").register(&self.0);
+        let size = usize::try_from(bytes).map_err(|_| BudgetRefused { bytes })?;
+        reservation
+            .try_grow(size)
+            .map_err(|_| BudgetRefused { bytes })?;
+        Ok(LeafDecodeGuard::new(reservation))
+    }
 }
 
 /// [`LogQuery::is_block_predicate_free`] for route selection, reading a prune
@@ -1482,6 +1516,12 @@ struct BlockMetrics {
     /// no entry for (ADR-2707 decision 5). Published once by partition 0.
     segments_pruned_by_key_index: Count,
     blocks_pruned_by_key_index: Count,
+    /// The tier-2 router's figures and the plan's SKIP_IDX drops (ADR-3692
+    /// decision 4), one global counter each under
+    /// [`crate::spans_scan::METRIC_KEY_INDEX_FIGURES`], registered only for a
+    /// scan carrying a declared-key equality so their presence is what tells
+    /// the stats renderer one was pushed down. Published once by partition 0.
+    key_index_figures: Option<[Count; 10]>,
     /// Whole-segment fast-path segments this partition opened with one
     /// whole-object GET, and the ones it opened by column chunk instead (issue
     /// #862). Which way the request-cost model routed a statement is otherwise
@@ -1568,8 +1608,39 @@ struct BlockMetrics {
 }
 
 impl BlockMetrics {
-    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+    /// Add the router's figures to [`Self::key_index_figures`], in
+    /// [`crate::spans_scan::METRIC_KEY_INDEX_FIGURES`] order. A keyed scan
+    /// that did not route publishes zeros.
+    fn record_key_index_figures(&self, figures: Option<RoutedFigures>) {
+        let (Some(counts), Some(f)) = (&self.key_index_figures, figures) else {
+            return;
+        };
+        let r = f.route;
+        let values = [
+            r.parts_covered,
+            r.parts_uncovered,
+            r.parts_beyond_ceiling,
+            r.leaves_rejected,
+            r.reservations_refused,
+            r.leaf_get_requests,
+            r.leaf_wire_bytes,
+            r.keys_probed,
+            r.skipped_by_budget,
+            f.skip_idx_dropped,
+        ];
+        for (count, v) in counts.iter().zip(values) {
+            count.add(usize::try_from(v).unwrap_or(usize::MAX));
+        }
+    }
+
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize, keyed: bool) -> Self {
         BlockMetrics {
+            key_index_figures: keyed.then(|| {
+                std::array::from_fn(|i| {
+                    MetricBuilder::new(metrics)
+                        .global_counter(crate::spans_scan::METRIC_KEY_INDEX_FIGURES[i])
+                })
+            }),
             open_elapsed: MetricBuilder::new(metrics).subset_time("open_elapsed", partition),
             open_pending_polls: MetricBuilder::new(metrics)
                 .counter("open_pending_polls", partition),
@@ -1818,6 +1889,7 @@ impl LogsScanExec {
                 .with_topk(self.topk.clone())
                 .with_scan_executions(self.scan_executions.clone())
                 .with_scan_budget(self.budget.clone())
+                .with_key_index_route(self.key_index_route.clone())
         })
     }
 
@@ -1865,6 +1937,7 @@ impl LogsScanExec {
                 .with_topk(self.topk.clone())
                 .with_scan_executions(self.scan_executions.clone())
                 .with_scan_budget(self.budget.clone())
+                .with_key_index_route(self.key_index_route.clone())
         })
     }
 
@@ -1929,6 +2002,14 @@ impl LogsScanExec {
     /// unlimited budget [`Self::new`] starts with.
     pub(crate) fn with_scan_budget(mut self, budget: ScanBudget) -> Self {
         self.budget = budget;
+        self
+    }
+
+    /// Route this scan's declared-key equality through the parts' key-index
+    /// leaves once, before the plan pass's per-segment loop. `route`'s origins
+    /// must be parallel to this scan's segments.
+    pub(crate) fn with_key_index_route(mut self, route: Option<Arc<LogsKeyIndexRoute>>) -> Self {
+        self.key_index_route = route;
         self
     }
 
@@ -2057,6 +2138,7 @@ impl LogsScanExec {
             scan_executions: self.scan_executions.clone(),
             reversed: Arc::clone(&self.reversed),
             budget: self.budget.clone(),
+            key_index_route: self.key_index_route.clone(),
         }
     }
 
@@ -2209,6 +2291,7 @@ impl LogsScanExec {
             created_at: Instant::now(),
             scan_executions: None,
             reversed: Arc::new(std::sync::OnceLock::new()),
+            key_index_route: None,
         })
     }
 
@@ -3217,6 +3300,10 @@ impl ExecutionPlan for LogsScanExec {
             phase_accounting: self.phase_accounting.clone(),
             budget: self.budget.clone(),
             serve_deferred: std::sync::atomic::AtomicBool::new(false),
+            key_index_route: self
+                .key_index_route
+                .clone()
+                .map(|route| (route, Arc::clone(context.memory_pool()))),
         });
 
         // #693 part 3 deliverable 1, amended by #739: a predicate-free query
@@ -3227,7 +3314,7 @@ impl ExecutionPlan for LogsScanExec {
         // whole-object GET (no plan probe, no scan-side probe). Any other shape
         // falls to the plan-then-stripe path below, byte for byte, and records
         // which conjunct sent it there.
-        let blocks = BlockMetrics::new(&self.metrics, partition);
+        let blocks = BlockMetrics::new(&self.metrics, partition, !self.key_equals.is_empty());
         let (work, round, alternation, fast_whole_segment, state) =
             match self.whole_segment_fast_path(&ctx.query) {
                 Ok(relevant) => {
@@ -4118,5 +4205,37 @@ mod projection_width_tests {
         let r = resolve_columns(&[LOG_COL_TS], &[], &[], &[], &[], FIRST_DECLARED_COL);
         assert_eq!(r.width, Some(2));
         assert_eq!(r.fraction_of(0), 2.0 / 10.0);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod pool_leaf_budget_tests {
+    //! The logs router's frame reservations come out of the statement's pool:
+    //! a bound the pool cannot hold is refused (the router then leaves the
+    //! part uncovered; `key_index_route`'s
+    //! `a_refused_reservation_leaves_the_part_uncovered` pins that half), and
+    //! a granted one is held until its guard drops.
+
+    use super::*;
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
+
+    #[test]
+    fn a_bound_over_the_pool_is_refused_and_a_granted_one_is_held() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(100));
+        let budget = PoolLeafBudget(Arc::clone(&pool));
+        assert_eq!(
+            budget.try_reserve(101).err(),
+            Some(BudgetRefused { bytes: 101 })
+        );
+        assert_eq!(pool.reserved(), 0);
+        let guard = budget.try_reserve(64).expect("fits the pool");
+        assert_eq!(pool.reserved(), 64);
+        assert_eq!(
+            budget.try_reserve(37).err(),
+            Some(BudgetRefused { bytes: 37 })
+        );
+        drop(guard);
+        assert_eq!(pool.reserved(), 0);
     }
 }

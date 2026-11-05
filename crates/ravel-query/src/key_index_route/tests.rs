@@ -1146,6 +1146,62 @@ async fn a_dropped_span_leaf_read_still_charges_the_get_it_issued() {
     }
 }
 
+/// The logs reader charges a leaf GET when it is issued, the same as the
+/// spans reader above: a route dropped while its bucket GET is held still
+/// counts both GETs in `keyIndex`, on the uncached and the cached path.
+/// FLIP: moving either `record_s3_request` in
+/// `LogSegmentFetcher::read_leaf_range` after its `store.get` await leaves
+/// the held GET uncounted on that path (1 instead of 2).
+#[tokio::test]
+async fn a_dropped_log_leaf_read_still_charges_the_get_it_issued() {
+    use crate::log_fetcher::{LogLeafRangeReader, LogSegmentFetcher};
+    use ravel_cache::{Cache, CacheLimits};
+
+    for cached in [false, true] {
+        let fx = fixture(
+            &[PartSpec::simple(vec![rows(&[(1, &[0])])])],
+            &[],
+            KeyType::Str,
+        )
+        .await;
+        let leaf_key = fx.parts.parts[0].key_index[0].key.clone();
+        let faults = Arc::new(FaultStore::new(fx.store.clone(), FaultPlan::empty()));
+        let gate = faults.hold(Op::Get, Some(leaf_key), Occurrence::Nth(2));
+        let mut fetcher = LogSegmentFetcher::new(faults.clone());
+        if cached {
+            let cache: Arc<Cache<crate::fetcher::CacheFetchError>> =
+                Arc::new(Cache::new(CacheLimits::new(1 << 20, 100, 1 << 20)));
+            fetcher = fetcher.with_cache(cache);
+        }
+        let reader = LogLeafRangeReader::new(&fetcher, TENANT);
+        let keys = key_set(KeyType::Str, &BTreeSet::from([1u16]));
+        let accounting = PhaseAccounting::new();
+        let budget = ThresholdBudget::new(u64::MAX);
+        let totals = RouteTotals::new();
+        let mut future = Box::pin(route_under(
+            input(&fx, &keys, &accounting, &reader, &budget),
+            ADR_CEILING,
+            &totals,
+        ));
+        tokio::select! {
+            _ = &mut future => panic!("the route finished past a held GET (cached {cached})"),
+            _ = gate.wait_until_held(1) => {}
+        }
+        drop(future);
+        let key_index = accounting.key_index().snapshot();
+        assert_eq!(
+            key_index.s3_requests(AccountedOp::Get),
+            2,
+            "prefix and the held bucket GET (cached {cached})"
+        );
+        assert!(
+            key_index.s3_bytes(AccountedOp::Get) > 0,
+            "the prefix's bytes (cached {cached})"
+        );
+        assert_eq!(totals.leaf_gets(SIGNAL), 2, "cached {cached}");
+    }
+}
+
 /// Admission walks the parts largest first and stops at the first whose
 /// worst case does not fit; it does not skip it for a smaller part that
 /// would (ADR-3692 decision 3, "until admitting the next part's worst case

@@ -3167,7 +3167,8 @@ doc's own vocabulary:
   (`SegmentFetcher::fetch_scalar_pages`/`fetch_histogram_pages`,
   `LogSegmentFetcher::scan_accounted_with_tenant`).
 - **keyIndex** -- the key-index leaf reads of the tier-2 router on a spans
-  `trace_id =` lookup (ADR-3692 decision 3, "Tier-2 router" below), the
+  `trace_id =` lookup or a logs declared-key equality (ADR-3692 decisions 3
+  and 4, "Tier-2 router" below), the
   KEY_IDX prefix and bucket reads of such a lookup (`SpanSegmentFetcher`'s
   ranged trace path, ADR-2707 decision 5) and of a logs exact-key equality
   (`LogSegmentFetcher::plan_segment_keyed`, see "Exact-key probe" under
@@ -3759,10 +3760,11 @@ and block-level reported independently:
 - `segmentsPrunedByKeyIndex`: segments a spans `trace_id =` lookup or a logs
   exact-key equality read no blocks of because their KEY_IDX section proved
   the key absent, or, for several logs keys joined by `AND`, named no block
-  every key shares (ADR-2707 decision 5). On spans it also counts the
-  segments the tier-2 router dropped before the scan because their part's
-  leaves prove the trace absent (ADR-3692 decision 3); a segment is counted
-  by one tier only, since a tier-2 prune is never opened.
+  every key shares (ADR-2707 decision 5). It also counts the segments the
+  tier-2 router dropped before the scan because their part's leaves prove
+  the trace (spans) or the first declared-key equality's key (logs) absent
+  (ADR-3692 decisions 3 and 4); a segment is counted by one tier only, since
+  a tier-2 prune is never opened.
 - `blocksPrunedByKeyIndex`: blocks the skip index kept, in the segments that
   lookup did read, that KEY_IDX named no entry for. On spans it is 0 when the
   skip index already narrows the object to the trace's blocks, which it does
@@ -3834,13 +3836,18 @@ two key-index counts the same way, and
 `services/ravel-server/tests/sql_like_contains_e2e.rs` the two `LIKE`
 counts.
 
-`stats.keyIndex` and `stats.signals[].keyIndex` (the spans entry) carry the
-tier-2 router's figures and the fetcher's SKIP_IDX drops for a spans
-`trace_id =` lookup, summed over every spans scan in the plan. Both are
-present, zeros included, exactly when a spans scan carried a pushed
-`trace_id`, and absent for every other statement
-(`key_index_stats_are_absent_without_a_trace_key`). The keys, in render
-order (`ravel_sql::key_index_json`):
+`stats.keyIndex` and `stats.signals[].keyIndex` (the spans or logs entry)
+carry the tier-2 router's figures and the fetcher's SKIP_IDX drops for a
+spans `trace_id =` lookup, summed over every spans scan in the plan, and the
+router's figures for a logs declared-key equality, summed over every logs
+scan. On spans both are present, zeros included, exactly when a spans scan
+carried a pushed `trace_id`, and absent for every other spans statement
+(`key_index_stats_are_absent_without_a_trace_key`). On logs both are
+present, zeros included, when a logs scan carried a declared-key equality,
+the logs entry holding the same ten fields as `stats.keyIndex`
+(`folded_equality_opens_only_the_holder`, and the zeros of
+`a_refused_parts_charge_degrades_to_tier_one`). The keys, in render order
+(`ravel_sql::key_index_json`):
 
 - `partsCovered`: parts the router answered from their leaves.
 - `partsUncovered`: parts with no leaf for `trace_id`, whose segments go to
@@ -5000,8 +5007,9 @@ moves `ravel_catalog_isolation_breach_total`. Leaf reads are charged to the
 with the routes; `stats.keyIndex` above renders them under their exact
 names.
 
-The spans `trace_id =` lookup calls it (ADR-3692 decision 3; the logs scan
-does not yet, task T5). The SQL executor resolves the window with
+The spans `trace_id =` lookup calls it (ADR-3692 decision 3), and so does a
+logs scan carrying a declared-key equality (decision 4, below). The SQL
+executor resolves the window with
 `resolve_pruned_with_parts` (`crates/ravel-sql/src/executor.rs`, the spans
 lane's resolve; without parts when the charge is refused, below) and hands
 the parts to `SpansTableProvider` with the snapshot it pins; the provider
@@ -5043,19 +5051,71 @@ settled with `outcome` one of `covered`, `uncovered`, `beyond_ceiling`,
 `ravel_query_key_index_leaf_gets_total{signal}`, the leaf GETs it issued.
 The Flight SQL pinned path and `EXPLAIN` do not route: they probe at tier 1.
 
+The logs scan routes once per scan, in the plan pass before its per-segment
+loop (ADR-3692 decision 4; `route_segments` in
+`crates/ravel-sql/src/logs_scan/plan.rs`). The SQL executor resolves the
+logs lane with `resolve_pruned_with_parts` as it does the spans lane, and
+`LogsTableProvider` hands the parts to the scan. The key set is the first
+declared-key equality the statement pushed (`log_key_set`), and only the
+segments whose time range meets the statement's window are routed; the leaf
+ranges are read by `LogLeafRangeReader` through the log fetcher's read path,
+so leaf bytes share the read cache and the `keyIndex` phase with the KEY_IDX
+reads, and each leaf GET is charged to that phase when it is issued, a GET
+that then fails included
+(`a_dropped_log_leaf_read_still_charges_the_get_it_issued`). The decoded-bound
+reservation is taken from the statement's DataFusion memory pool. The
+segment routes:
+
+- `Pruned`: never opened, whatever its size. The block-range threshold and
+  the whole-object bound that otherwise let a small object be read whole
+  unprobed do not apply to it. On a folded tenant of 24 objects, 16 of them
+  at or under the bound, an equality held by one object costs the part's two
+  leaf GETs and the holder's reads, with no byte of the other 23 read and
+  `segmentsPrunedByKeyIndex` 23 (`folded_equality_opens_only_the_holder`).
+- `Blocks`: planned by `LogSegmentFetcher::plan_segment_routed`, which reads
+  no KEY_IDX prefix or bucket. Above `plan_whole_object_bound` the plan is
+  restricted to the leaf's block set; at or under it the object is read whole
+  as an unrouted one is (`folded_equality_opens_only_the_holder` asserts no
+  KEY_IDX read of the holder).
+- `Uncovered`: tier 1, unchanged. Objects at or under the bound are read
+  whole unprobed and larger ones are probed by their own KEY_IDX. An entry
+  whose RLOG KEY_IDX section is at a version the reader does not resolve
+  (version 1) is listed in the leaf's `uncovered_entry_ordinals` by both the
+  fold and `--rebuild-key-index`, so it is uncovered and its row is still
+  returned (`version_one_sections_are_uncovered_in_the_leaf`,
+  `version_one_sections_are_uncovered_in_a_rebuilt_leaf`). A leaf GET that
+  fails or a leaf failing its checksum rejects the leaf (`leavesRejected` 1),
+  and every segment of its part takes tier 1 with the same answer and reads
+  as a scan with no leaf
+  (`a_failed_leaf_get_leaves_the_part_uncovered`,
+  `a_leaf_failing_its_checksum_leaves_the_part_uncovered`). A refused
+  reservation leaves the part uncovered the same way
+  (`a_refused_reservation_leaves_the_part_uncovered` in the router), and
+  `a_bound_over_the_pool_is_refused_and_a_granted_one_is_held` pins that the
+  reservation is the statement pool's. There is no end-to-end case, because
+  a statement pool too small for a leaf's decoded bound is too small for the
+  tier-1 scan too.
+
+Flight SQL (the pinned path, and the distributed and worker scans) and
+`EXPLAIN` do not route logs: their logs scans carry no parts and take the
+tier-1 routes above.
+
 The parts are charged to the catalog's memory budget with the snapshot
 (`Catalog::resolve_pruned_with_parts` reserves their handles' heap bytes).
 That budget is the process-wide one `--memory-budget-bytes` sizes, shared by
 every statement and the decoded cache, so the charge is refused under
 process-wide memory pressure, not by a per-statement limit. A refused
-charge costs the spans lane its router, not the statement:
+charge costs the spans or logs lane its router, not the statement:
 the lane resolves the window again with `resolve_pruned_with_admission`,
 without parts, paying that resolve's requests a second time, and every
 segment takes the tier-1 KEY_IDX probe. The fallback is visible: a
 `trace_id =` lookup still renders `stats.keyIndex`, with every figure 0 and
 `keysProbed` 0, since the router never ran, and
 `ravel_query_key_index_parts_total` does not move
-(`a_trace_lookup_degrades_to_tier_one_on_a_refused_parts_charge`). A spans
+(`a_trace_lookup_degrades_to_tier_one_on_a_refused_parts_charge`). A logs
+declared-key equality degrades the same way, with the tier-1 answer and
+every `stats.keyIndex` figure 0
+(`a_refused_parts_charge_degrades_to_tier_one`). A spans
 statement without a trace key resolves the same way and answers
 (`a_spans_statement_without_a_trace_key_survives_a_refused_parts_charge`).
 Any other resolve error still fails the statement.
