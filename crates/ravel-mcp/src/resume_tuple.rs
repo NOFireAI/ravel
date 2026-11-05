@@ -361,6 +361,27 @@ mod tests {
         assert!(matches!(decoded.as_slice(), [ResumeValue::Float(v)] if v.is_sign_positive()));
     }
 
+    /// The resume tuples of an integer `avg` walk (issue #3779) are a `Float`
+    /// and the name tiebreak, and each round-trips bit for bit through tag 4:
+    /// the means -7/3, `+0.0` and 10/3, whose last bits are the position.
+    ///
+    /// FLIP: writing the float as `(v as f32 as f64).to_bits()` drops the low
+    /// bits of -7/3 and fails here.
+    #[test]
+    fn an_integer_avg_resume_tuple_round_trips_bit_for_bit() {
+        for (mean, name) in [(-7.0_f64 / 3.0, "e"), (0.0, "d"), (10.0_f64 / 3.0, "a")] {
+            let tuple = [ResumeValue::Float(mean), ResumeValue::Str(name.to_string())];
+            let bytes = encoded(&tuple);
+            let mut expected = vec![2, 0, 0, 0, 4];
+            expected.extend_from_slice(&mean.to_bits().to_le_bytes());
+            expected.extend_from_slice(&[5, 1, 0, 0, 0]);
+            expected.extend_from_slice(name.as_bytes());
+            assert_eq!(bytes, expected, "bytes of {mean:?}");
+            let decoded = decode_resume_tuple(&bytes).expect("decodes");
+            assert!(same(&decoded, &tuple), "{decoded:?} against {tuple:?}");
+        }
+    }
+
     /// The empty tuple is four zero bytes and decodes back to empty.
     ///
     /// FLIP: omitting the count when the tuple is empty writes no bytes and

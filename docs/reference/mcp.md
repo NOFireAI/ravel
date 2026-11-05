@@ -518,12 +518,14 @@ it reads anything:
 | an `ORDER BY` term that is a `count(...)`, such as `count(*)`, `count(DISTINCT x)`, a count with `FILTER`, `-count(*)` or `count(*) OVER ()`, through an alias or written as the expression a projected column is defined as | runs, paged over page one's segment set |
 | an `ORDER BY` term that is a `min(col)` or `max(col)` under a plain `GROUP BY`, where `col` is a NOT NULL column of the table of a signed or unsigned integer, string or nanosecond timestamp type with no time zone, such as `max(ts)` on `samples` or `max(severity_num)` on `logs`, through an alias or written as the expression a projected column is defined as | runs, paged over page one's segment set |
 | an `ORDER BY` term that is a `sum(col)` or `sum(DISTINCT col)` under a plain `GROUP BY`, where `col` is a NOT NULL column of the table of a signed or unsigned integer type, such as `sum(duration_ns)` on `spans` or `sum(severity_num)` on `logs`, through an alias or written as the expression a projected column is defined as | runs, paged over page one's segment set; a page whose sum overflows `Int64` (signed column) or `UInt64` (unsigned) fails the call with the overflow error |
-| any other `ORDER BY` term computed from rows other than its own: an aggregate such as `sum(value)` (a `sum` over a float column), a `sum` with `FILTER`, `avg(value)`, `min(value)` or `min(series_id)`, a `min` or `max` with `FILTER` or `OVER`, or under `ROLLUP`, `CUBE`, `GROUPING SETS` or no `GROUP BY`, a window function such as `row_number() OVER (...)`, a count over a `ROWS` frame or a named window, or a subquery, whether ordered by directly or through an alias | runs as written, unpaged |
+| an `ORDER BY` term that is an `avg(col)` or `avg(DISTINCT col)` under a plain `GROUP BY`, where `col` is a NOT NULL column of the table of type `Int8`, `Int16`, `Int32`, `Int64`, `UInt8`, `UInt16` or `UInt32`, such as `avg(duration_ns)` on `spans` or `avg(severity_num)` on `logs`, through an alias or written as the expression a projected column is defined as | runs, paged over page one's segment set |
+| any other `ORDER BY` term computed from rows other than its own: an aggregate such as `sum(value)` (a `sum` over a float column), a `sum` with `FILTER`, `avg(value)` (an `avg` over a float column), `avg(writer_seq)` on `alerts` (an `avg` over a `UInt64` column), `mean(...)`, `min(value)` or `min(series_id)`, a `min` or `max` with `FILTER` or `OVER`, or under `ROLLUP`, `CUBE`, `GROUPING SETS` or no `GROUP BY`, a window function such as `row_number() OVER (...)`, a count over a `ROWS` frame or a named window, or a subquery, whether ordered by directly or through an alias | runs as written, unpaged |
 | any other `SELECT` over one table | runs, paged |
 
 A float `ORDER BY` term is refused because a NaN or infinite value has no
 cursor position: the rows after it could not be reached. Order by another
-column to page the same rows.
+column to page the same rows. The one float term that pages is an integer
+`avg`, below, which is never NaN or infinite.
 
 An `ORDER BY` term computed from other rows is a cursor position only over
 the rows it was computed from. A row committed into one of page one's
@@ -551,12 +553,19 @@ partition count. A sum past that range is an error, not a value: the page
 that computes it fails the call, and no page is served in a wrapped order.
 A float `sum` runs unpaged, because the engine adds partial sums in the
 order its partitions finish, so two runs over the same segments can differ
-in the last bits. An `avg` is a float for an integer or a float column and
-runs unpaged too. Any other such term is not proven non-null,
+in the last bits. An `avg` term pages under the same proof when its column
+is `Int8` to `Int64` or `UInt8` to `UInt32`: the group's values are added
+exactly and the sum is divided by the count once, so the `Float64` mean is
+the same at any partition count. It is never NaN or infinite, and never
+`-0.0`: a zero sum is `+0.0`. The cursor carries it bit for bit. An `avg`
+over a `UInt64` or a float column runs unpaged, because it is a running
+`f64` sum whose partial sums merge in the order the partitions finish, like
+a float `sum`. The planner admits `avg` by that name only; `mean`, its
+alias, runs unpaged. Any other such term is not proven non-null,
 so the statement runs once, in its own order, and a capped result ends
 `ok_bounded` with no cursor. To page it, order by a `count(...)`, by a
-`min(col)`, `max(col)` or integer `sum(col)` the planner proves, or by the
-row's own non-null columns, such as a grouping column.
+`min(col)`, `max(col)`, integer `sum(col)` or integer `avg(col)` the planner
+proves, or by the row's own non-null columns, such as a grouping column.
 
 Before it mints a cursor, the tool checks the page's last order values
 against the plan the page ran under, the same check a later page's resume

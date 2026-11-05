@@ -151,15 +151,20 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   `GROUP BY` over a NOT NULL integer, string or nanosecond timestamp
   column (`ORDER BY m` over `max(ts) AS m`), or by a `sum(col)` under a
   plain `GROUP BY` over a NOT NULL integer column (`ORDER BY s` over
-  `sum(duration_ns) AS s`), pages only over the segments
+  `sum(duration_ns) AS s`), or by an `avg(col)` under a plain `GROUP BY`
+  over a NOT NULL `Int8` to `Int64` or `UInt8` to `UInt32` column
+  (`ORDER BY a` over `avg(duration_ns) AS a`), pages only over the segments
   page one read, since a row committed later can change the value for
   groups already served: a later page whose segments changed is
   `cursor_expired` with a `rerun_page_one` next step. An integer sum is
   exact: a sum past the `Int64` or `UInt64` range fails the call with an
-  overflow error rather than paging a wrapped order. A statement with no
+  overflow error rather than paging a wrapped order. An integer avg is
+  an exact sum divided once, a finite `Float64` the cursor carries bit for
+  bit. A statement with no
   `ORDER BY` over a table with no row identity runs unpaged, and so does
-  one ordered by another aggregate (a float `sum`, since it can differ in
-  its last bits between runs; `avg`; a `min` or `max` over a float column
+  one ordered by another aggregate (a float `sum` or `avg`, or an `avg`
+  over a `UInt64` column, since each can differ in its last bits between
+  runs; a `min` or `max` over a float column
   or `series_id`), a window function or a subquery
   (`ORDER BY sum(value)`): a full page of
   either is `ok_bounded` with no cursor and a next step saying how to order
@@ -562,15 +567,15 @@ Paging order differs per tool:
   or infinite order value, or a cursor over its 4 KiB bound) ends
   `ok_bounded` with no cursor and a `narrow_time_range` next step. The
   cursor pins a digest of the segments page one read. Under an `ORDER BY`
-  on a `count(...)`, or on a `min(col)`, `max(col)` or integer `sum(col)`
-  the planner proves non-null, a later page is served only over those same segments,
+  on a `count(...)`, or on a `min(col)`, `max(col)`, integer `sum(col)` or
+  integer `avg(col)` the planner proves non-null, a later page is served only over those same segments,
   else it is `cursor_expired` with a `rerun_page_one` next step; a
   `time_range` that ends before the most recent ingest keeps them stable.
   Under an order on the row's own columns, a later page over changed
   segments is served with a warning that a row committed since may appear
   or be omitted. An `ORDER BY` on any other aggregate or window value mints
-  no cursor at all; order by a count, a proven `min` or `max`, or the
-  row's own columns to page such a result.
+  no cursor at all; order by a count, a proven `min`, `max`, `sum` or
+  `avg`, or the row's own columns to page such a result.
 - `ravel_search_logs` orders by `(ts, observed_ts)`, which is not always
   unique, because `logs` rows carry no row identity. The equal-group rule
   applies. A later page over segments that changed since page one carries
