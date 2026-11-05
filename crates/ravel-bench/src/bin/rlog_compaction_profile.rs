@@ -949,7 +949,7 @@ const TICKS_PER_S: f64 = 100.0;
 
 #[cfg(feature = "profiling")]
 mod prof {
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::path::PathBuf;
 
     use serde_json::{Value, json};
@@ -1084,6 +1084,12 @@ mod prof {
     fn classify(names: &[String]) -> &'static str {
         let in_compaction = any(names, &["ravel_maintain::"]);
         if !in_compaction {
+            // The assembly Huffman decode loop breaks the frame-pointer chain,
+            // so its samples carry no callers; zstd decompression in a
+            // compaction is block (and catalog section) decode.
+            if names.len() == 1 && zstd(names, true) {
+                return PHASES[5];
+            }
             return PHASES[9];
         }
         if any(names, CATALOG) {
@@ -1107,6 +1113,56 @@ mod prof {
         }
     }
 
+    fn leaf_addr(frames: &pprof::Frames) -> Option<usize> {
+        frames
+            .frames
+            .first()
+            .and_then(|f| f.first())
+            .and_then(|s| s.addr)
+            .map(|a| a as usize)
+    }
+
+    /// Names unsymbolized leaf addresses with `addr2line` over this binary.
+    /// The unwinder leaves a leaf unnamed when it sits in a hand-written
+    /// assembly routine linked into the binary (zstd's Huffman decode loop),
+    /// whose local symbol it does not resolve.
+    fn resolve_with_addr2line(addrs: &BTreeSet<usize>) -> HashMap<usize, String> {
+        let mut out = HashMap::new();
+        if addrs.is_empty() {
+            return out;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return out;
+        };
+        let list: Vec<usize> = addrs.iter().copied().collect();
+        let result = std::process::Command::new("addr2line")
+            .arg("-f")
+            .arg("-e")
+            .arg(&exe)
+            .args(list.iter().map(|a| format!("{a:#x}")))
+            .output();
+        let Ok(result) = result else {
+            eprintln!("profiling: addr2line unavailable; unnamed leaves stay unknown");
+            return out;
+        };
+        let text = String::from_utf8_lossy(&result.stdout);
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, addr) in list.iter().enumerate() {
+            let func = lines.get(i * 2).copied().unwrap_or("??");
+            let place = lines.get(i * 2 + 1).copied().unwrap_or("??:0");
+            let file = place.rsplit('/').next().unwrap_or(place);
+            // Assembly carries line info but no function entry, so addr2line
+            // names the nearest preceding C symbol; the source line is the
+            // truthful name there.
+            if file.contains(".S:") || file.contains(".s:") {
+                out.insert(*addr, format!("asm {file} [addr2line]"));
+            } else if func != "??" && !func.is_empty() {
+                out.insert(*addr, format!("{func} [addr2line]"));
+            }
+        }
+        out
+    }
+
     pub fn finish(sampler: Sampler) -> Value {
         let report = match sampler.guard.report().build() {
             Ok(r) => r,
@@ -1122,19 +1178,52 @@ mod prof {
         let mut phases: BTreeMap<&'static str, u64> = BTreeMap::new();
         let mut threads: HashMap<String, u64> = HashMap::new();
         let mut zstd_decompress: u64 = 0;
+        let mut unattributed_by: HashMap<String, u64> = HashMap::new();
+        let mut resolved_leaf_samples: u64 = 0;
+        let unnamed: BTreeSet<usize> = report
+            .data
+            .keys()
+            .filter(|frames| {
+                let leaf = frames
+                    .frames
+                    .first()
+                    .and_then(|f| f.first())
+                    .map(|s| s.name())
+                    .unwrap_or_default();
+                !ravel_bench::profiling::frame_is_attributed(&leaf)
+            })
+            .filter_map(leaf_addr)
+            .collect();
+        let resolved = resolve_with_addr2line(&unnamed);
         for (frames, count) in &report.data {
             let count = u64::try_from(*count).unwrap_or(0);
             total += count;
             // frames[0] is the innermost frame; within a frame, symbol 0 is the
             // innermost inlined function.
-            let names: Vec<String> = frames
+            let mut names: Vec<String> = frames
                 .frames
                 .iter()
                 .flat_map(|f| f.iter().map(|s| clean(&s.name())))
                 .collect();
-            let leaf_name = names.first().cloned().unwrap_or_default();
+            let mut leaf_name = names.first().cloned().unwrap_or_default();
+            if !ravel_bench::profiling::frame_is_attributed(&leaf_name)
+                && let Some(name) = leaf_addr(frames).and_then(|a| resolved.get(&a))
+            {
+                leaf_name = name.clone();
+                if let Some(first) = names.first_mut() {
+                    *first = name.clone();
+                }
+                resolved_leaf_samples += count;
+            }
             if !ravel_bench::profiling::frame_is_attributed(&leaf_name) {
                 unattributed += count;
+                let key = format!(
+                    "{} | depth {} | addr {:#x}",
+                    frames.thread_name_or_id(),
+                    names.len(),
+                    leaf_addr(frames).unwrap_or(0)
+                );
+                *unattributed_by.entry(key).or_default() += count;
             }
             *leaf.entry(leaf_name).or_default() += count;
             let unique: HashSet<&String> = names.iter().collect();
@@ -1147,13 +1236,17 @@ mod prof {
             }
             *threads.entry(frames.thread_name_or_id()).or_default() += count;
         }
-        let share = match ravel_bench::profiling::check_attribution(unattributed, total) {
-            Ok(share) => share,
-            Err(msg) => {
-                eprintln!("profiling: {msg}");
-                std::process::exit(1);
-            }
-        };
+        // A failed attribution check still reports, so the unattributed
+        // stacks can be read, but marks the profile and fails the run.
+        let (share, attribution_error) =
+            match ravel_bench::profiling::check_attribution(unattributed, total) {
+                Ok(share) => (share, None),
+                Err(msg) => {
+                    eprintln!("profiling: {msg}");
+                    let share = ravel_bench::profiling::unattributed_share(unattributed, total);
+                    (share, Some(msg))
+                }
+            };
         match std::fs::File::create(&sampler.path) {
             Ok(file) => {
                 if let Err(e) = report.flamegraph(file) {
@@ -1196,6 +1289,9 @@ mod prof {
             "samples": total,
             "cpu_s_est": total as f64 / f64::from(HZ),
             "unattributed_share_pct": share * 100.0,
+            "attribution_error": attribution_error,
+            "leaf_samples_named_by_addr2line": resolved_leaf_samples,
+            "unattributed_by_thread_depth_caller": top(&unattributed_by, 10, f64::INFINITY),
             "leaf_exclusive_top15": top(&leaf, 15, f64::INFINITY),
             "inclusive_top10_below_95pct": top(&inclusive, 10, 95.0),
             "inclusive_top40": top(&inclusive, 40, f64::INFINITY),
@@ -1770,4 +1866,7 @@ fn main() {
     });
     print_table(&doc);
     println!("{}", serde_json::to_string_pretty(&doc).expect("json"));
+    if !doc["run"]["profile"]["attribution_error"].is_null() {
+        std::process::exit(1);
+    }
 }
