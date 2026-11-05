@@ -2029,6 +2029,158 @@ async fn integer_sum_walk_is_identical_at_one_and_eight_partitions() {
     assert_eq!(walks[0], walks[1], "the walks at one and eight partitions");
 }
 
+/// The walked integer `avg` order and its fixture: eight groups whose means
+/// are -3.5, -7/3, -0.5, 0, 1, 1.5 twice and 10/3. Group `d` sums to zero
+/// through -3 and 3, and group `a` reaches 10 through `i64::MAX` and
+/// `-i64::MAX`, which an `f64` running sum would round to a mean of 0.
+const AVG_ORDER_STATEMENT: &str = "SELECT name, avg(duration_ns) AS a FROM spans \
+     GROUP BY name ORDER BY a, name";
+
+fn avg_fixture() -> Vec<(&'static str, ArrayRef)> {
+    vec![
+        (
+            "name",
+            Arc::new(StringArray::from(vec![
+                "a", "f", "e", "g", "d", "b", "a", "c", "e", "h", "f", "d", "g", "b", "a", "e",
+                "c",
+            ])),
+        ),
+        (
+            "duration_ns",
+            Arc::new(Int64Array::from(vec![
+                i64::MAX,
+                -5,
+                -1,
+                -1,
+                -3,
+                1,
+                10,
+                3,
+                -2,
+                1,
+                -2,
+                3,
+                0,
+                2,
+                -i64::MAX,
+                -4,
+                0,
+            ])),
+        ),
+    ]
+}
+
+/// An `ORDER BY` over an integer `avg` pages over the exact mean: eight
+/// groups walk as four pages of two and an empty fifth. Page one ends at
+/// the negative non-integer mean -7/3, page two at the zero mean, and page
+/// three at `b`, tied at 1.5 with `c` on page four. The walk at one
+/// partition and at eight is the same sequence, equal to the unpaged result,
+/// each group once, and every resume tuple is one the plan admits.
+///
+/// FLIP: re-registering DataFusion's built-in `avg` in the session (an
+/// `f64` running sum) moves group `a` to a mean of 0, tied with `d`, and
+/// fails the unpaged ordering.
+#[tokio::test]
+async fn integer_avg_walk_is_identical_at_one_and_eight_partitions() {
+    let plan = plan_page(AVG_ORDER_STATEMENT, None).expect("planned");
+    assert!(plan.order_from_other_rows, "an avg order reads other rows");
+    assert_eq!(
+        plan.order_by
+            .iter()
+            .map(|term| term.column.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "name"],
+    );
+
+    let row = |name: &str, a: &str| vec![name.to_string(), a.to_string()];
+    let expected = vec![
+        vec![row("f", "-3.5"), row("e", "-2.3333333333333335")],
+        vec![row("g", "-0.5"), row("d", "0.0")],
+        vec![row("h", "1.0"), row("b", "1.5")],
+        vec![row("c", "1.5"), row("a", "3.3333333333333335")],
+    ];
+
+    let mut walks = Vec::new();
+    for partitions in [1, 8] {
+        let ctx = checked_sum_context(SPANS_TABLE, avg_fixture(), partitions);
+        let unpaged = rows_of(&execute(&ctx, AVG_ORDER_STATEMENT).await);
+        assert_eq!(
+            unpaged,
+            expected.concat(),
+            "the unpaged ordering at {partitions} partitions"
+        );
+        let pages = grouped_walk(&ctx, AVG_ORDER_STATEMENT, GROUPED_PAGE_CAP).await;
+        assert_eq!(
+            pages, expected,
+            "the walked pages at {partitions} partitions"
+        );
+        let walked: Vec<Vec<String>> = pages.concat();
+        assert_eq!(walked, unpaged, "the walk against the unpaged result");
+        assert!(
+            multiset(&walked).values().all(|&count| count == 1),
+            "a group was delivered twice at {partitions} partitions: {walked:?}",
+        );
+        walks.push(pages);
+    }
+    assert_eq!(walks[0], walks[1], "the walks at one and eight partitions");
+}
+
+/// An integer `avg` whose sum is zero is `+0.0`, never `-0.0`, at one
+/// partition and at eight, whatever the signs of the values that cancel:
+/// `d` is -3 and 3, and `a` is `i64::MAX` and `-i64::MAX`, each value in
+/// its own partition. So a cursor minted at a zero mean carries `+0.0`, and
+/// the page resumed from it starts strictly above zero.
+///
+/// FLIP: resuming at `Float(-0.0)` instead serves `a` and `d` again, since
+/// `+0.0` sorts after `-0.0`, and fails the empty-page assertion.
+#[tokio::test]
+async fn an_integer_avg_of_zero_is_positive_zero() {
+    let sql = "SELECT name, avg(duration_ns) AS a FROM spans GROUP BY name ORDER BY a, name";
+    for partitions in [1, 8] {
+        let ctx = checked_sum_context(
+            SPANS_TABLE,
+            vec![
+                ("name", Arc::new(StringArray::from(vec!["d", "a", "d", "a"]))),
+                (
+                    "duration_ns",
+                    Arc::new(Int64Array::from(vec![-3, i64::MAX, 3, -i64::MAX])),
+                ),
+            ],
+            partitions,
+        );
+        let batches = execute(&ctx, sql).await;
+        let mut bits = Vec::new();
+        for batch in &batches {
+            let column = batch.column_by_name("a").expect("the avg column");
+            for offset in 0..batch.num_rows() {
+                match resume_value(column.as_ref(), offset) {
+                    Some(ResumeValue::Float(v)) => bits.push(v.to_bits()),
+                    other => panic!("an avg resumed as {other:?}"),
+                }
+            }
+        }
+        assert_eq!(
+            bits,
+            [0.0_f64.to_bits(), 0.0_f64.to_bits()],
+            "the zero means at {partitions} partitions"
+        );
+
+        let resumed = plan_page(
+            sql,
+            Some(&ResumePosition::new(vec![
+                ResumeValue::Float(0.0),
+                ResumeValue::Str("d".to_string()),
+            ])),
+        )
+        .expect("resumed plan");
+        assert_eq!(
+            rows_of(&execute(&ctx, &resumed.statement).await),
+            Vec::<Vec<String>>::new(),
+            "the page after the last zero mean at {partitions} partitions"
+        );
+    }
+}
+
 /// A table, a statement over it, its columns, the sum's result type and a
 /// resume value of the order's kind.
 type OverflowCase<'a> = (
