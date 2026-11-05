@@ -334,12 +334,16 @@ pub struct FoldReport {
     /// transferred; a failed GET adds nothing). The total this fold read,
     /// like `key_index_ranged_gets`.
     pub key_index_bytes_read: u64,
-    /// `.kidx` leaves this fold PUT, every HEAD CAS attempt included (an
-    /// `AlreadyExists` included: the content-addressed object is there either
-    /// way), one per (part, field, key slice) of the re-encoded parts. A part
-    /// carried forward by reference keeps its `key_index` refs and adds none.
-    /// A leaf a later pass made stale (see `key_index_build_passes`) counts
-    /// too: it was PUT, and the catalog sweep removes it.
+    /// `.kidx` leaves the published HEAD names for the parts the publishing
+    /// attempt re-encoded, one per (part, field, key slice): the published
+    /// leaf set. Each was PUT by this fold (an `AlreadyExists` included: the
+    /// content-addressed object is there either way), by the publishing
+    /// attempt or by an attempt lost to a HEAD CAS that built the same part.
+    /// A part carried forward by reference keeps its `key_index` refs and
+    /// adds none. A leaf a build PUT and then abandoned, because a later pass
+    /// found a new uncovered entry (see `key_index_build_passes`), is not
+    /// named by HEAD and is not counted; `put_requests` counts its PUT and
+    /// the catalog sweep removes it. Zero on a no-op fold.
     pub key_index_leaves_written: u64,
     /// Total bytes of those leaves.
     pub key_index_leaf_bytes_written: u64,
@@ -385,8 +389,6 @@ pub(crate) struct RequestCounters {
     key_index_entries_carried: u64,
     key_index_build_passes: u64,
     key_index_leaf_gets: u64,
-    key_index_leaves_written: u64,
-    key_index_leaf_bytes_written: u64,
 }
 
 /// HEAD as read at the top of one fold attempt.
@@ -1623,9 +1625,11 @@ static FOLD_KEY_INDEX_LEAF_GETS: std::sync::atomic::AtomicU64 =
 
 /// The leaf build's [`FoldReport`] figures `key_index_sections_read`,
 /// `key_index_entries_carried`, `key_index_build_passes` and
-/// `key_index_leaf_gets`, summed over every fold that committed its HEAD in
-/// this process since it started. Monotonic and process-local: a scrape
-/// takes the delta between samples.
+/// `key_index_leaf_gets`, summed over every fold that returned a report in
+/// this process since it started, a no-op included (an attempt lost to a
+/// HEAD CAS can build leaves before the next attempt finds nothing to do).
+/// A fold that returns an error adds nothing. Monotonic and process-local: a
+/// scrape takes the delta between samples.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FoldKeyIndexTotals {
     pub sections_read: u64,
@@ -1645,8 +1649,8 @@ pub fn fold_key_index_totals() -> FoldKeyIndexTotals {
     }
 }
 
-/// Adds one committed fold's leaf-build figures to the process-global
-/// totals, from the same counters its [`FoldReport`] reads.
+/// Adds one fold's leaf-build figures to the process-global totals, from
+/// the same counters its [`FoldReport`] reads.
 fn observe_fold_key_index(counters: &RequestCounters) {
     use std::sync::atomic::Ordering::Relaxed;
     FOLD_KEY_INDEX_SECTIONS_READ.fetch_add(counters.key_index_sections_read, Relaxed);
@@ -1688,13 +1692,27 @@ impl PreviousTail {
     }
 }
 
-/// One field's pairs carried from the previous tail's leaves onto a new
-/// part's ordinals.
+/// One previous leaf the carry takes pairs from: its bytes, verified when
+/// the carry is loaded and decoded again by each pass whose key8 range it
+/// overlaps, so a carried pair is held only by the pass that emits it.
+struct CarriedLeaf {
+    key8_lo: u64,
+    key8_hi: u64,
+    bytes: Bytes,
+}
+
+/// One field's previous leaves, in key8 order.
 struct CarriedField {
-    /// Sorted by `(key8, entry_ordinal)`, ordinals the new part's.
-    entries: Vec<KeyIndexLeafEntry>,
+    leaves: Vec<CarriedLeaf>,
     /// Per new ordinal: whether the previous leaves covered its object.
     covered: Vec<bool>,
+}
+
+/// The previous tail's leaves, mapped onto a new part by data object key.
+struct CarriedKeyIndex {
+    fields: BTreeMap<String, CarriedField>,
+    /// Per previous ordinal: the new ordinal of the same data object.
+    onto: Vec<Option<u64>>,
 }
 
 /// Reads and verifies every leaf of `tail` and maps its covered entries onto
@@ -1702,7 +1720,8 @@ struct CarriedField {
 /// stand in for the sections: a leaf field not in `fields` under its key
 /// type, a field of `fields` with no leaf, a failed GET, a leaf that does not
 /// verify, match its ref or bind `tail`, or a field whose slices do not form
-/// one set.
+/// one set. The decoded entries are dropped once a leaf verifies; each pass
+/// decodes the leaves its range needs from the kept bytes.
 #[allow(clippy::too_many_arguments)]
 async fn load_carried_key_index(
     store: &dyn ObjectStoreBackend,
@@ -1714,7 +1733,7 @@ async fn load_carried_key_index(
     part_entry_count: usize,
     limits: &KeyIndexLeafLimits,
     counters: &mut RequestCounters,
-) -> Result<BTreeMap<String, CarriedField>, String> {
+) -> Result<CarriedKeyIndex, String> {
     let refs = &tail.part.key_index;
     if let Some(leaf) = refs.iter().find(|leaf| {
         fields
@@ -1735,7 +1754,7 @@ async fn load_carried_key_index(
     if tail.object_keys.len() as u64 != tail.part.entry_count {
         return Err("previous tail entry list does not match its ref".to_string());
     }
-    let mut by_field: BTreeMap<&str, Vec<KeyIndexLeafSummary>> = BTreeMap::new();
+    let mut by_field: BTreeMap<&str, Vec<(KeyIndexLeafSummary, Bytes)>> = BTreeMap::new();
     for leaf in refs {
         counters.get_requests += 1;
         counters.key_index_leaf_gets += 1;
@@ -1743,7 +1762,7 @@ async fn load_carried_key_index(
             .get(&leaf.key, GetRange::Full)
             .await
             .map_err(|e| format!("leaf {} GET: {e}", leaf.key))?;
-        let summary = verify_key_index_leaf(&got.data, limits)
+        let mut summary = verify_key_index_leaf(&got.data, limits)
             .map_err(|e| format!("leaf {}: {e}", leaf.key))?;
         let expected = SnapshotKeyIndexLeafRef {
             key: String::new(),
@@ -1763,10 +1782,11 @@ async fn load_carried_key_index(
                 leaf.key
             ));
         }
+        summary.entries = Vec::new();
         by_field
             .entry(leaf.field.as_str())
             .or_default()
-            .push(summary);
+            .push((summary, got.data));
     }
     let onto: Vec<Option<u64>> = tail
         .object_keys
@@ -1778,8 +1798,10 @@ async fn load_carried_key_index(
         .collect();
     let mut carried = BTreeMap::new();
     for (field, leaves) in by_field {
-        check_key_index_leaf_set(&leaves).map_err(|e| format!("field {field:?}: {e}"))?;
-        let uncovered: HashSet<u64> = leaves[0]
+        let (summaries, bytes): (Vec<KeyIndexLeafSummary>, Vec<Bytes>) =
+            leaves.into_iter().unzip();
+        check_key_index_leaf_set(&summaries).map_err(|e| format!("field {field:?}: {e}"))?;
+        let uncovered: HashSet<u64> = summaries[0]
             .header
             .uncovered_entry_ordinals
             .iter()
@@ -1794,28 +1816,22 @@ async fn load_carried_key_index(
                 *slot = true;
             }
         }
-        let mut entries = Vec::new();
-        for leaf in leaves {
-            for entry in leaf.entries {
-                if uncovered.contains(&entry.entry_ordinal) {
-                    continue;
-                }
-                let Some(new) = usize::try_from(entry.entry_ordinal)
-                    .ok()
-                    .and_then(|previous| onto.get(previous).copied().flatten())
-                else {
-                    continue;
-                };
-                entries.push(KeyIndexLeafEntry {
-                    entry_ordinal: new,
-                    ..entry
-                });
-            }
-        }
-        entries.sort_by_key(|e| (e.key8, e.entry_ordinal));
-        carried.insert(field.to_string(), CarriedField { entries, covered });
+        let mut leaves: Vec<CarriedLeaf> = summaries
+            .iter()
+            .zip(bytes)
+            .map(|(summary, bytes)| CarriedLeaf {
+                key8_lo: summary.header.key8_lo,
+                key8_hi: summary.header.key8_hi,
+                bytes,
+            })
+            .collect();
+        leaves.sort_by_key(|leaf| leaf.key8_lo);
+        carried.insert(field.to_string(), CarriedField { leaves, covered });
     }
-    Ok(carried)
+    Ok(CarriedKeyIndex {
+        fields: carried,
+        onto,
+    })
 }
 
 /// The open slice of one field's leaf build, cut by the rule
@@ -1877,16 +1893,44 @@ enum FieldBuildState {
     Uncovered,
 }
 
+/// A held (entry, key8) pair, ordered by `(key8, entry_ordinal)` so the top
+/// of a field's heap is its highest key8.
+struct HeldPair(KeyIndexLeafEntry);
+
+impl HeldPair {
+    fn order_key(&self) -> ([u8; 8], u64) {
+        (self.0.key8, self.0.entry_ordinal)
+    }
+}
+
+impl PartialEq for HeldPair {
+    fn eq(&self, other: &Self) -> bool {
+        self.order_key() == other.order_key()
+    }
+}
+
+impl Eq for HeldPair {}
+
+impl PartialOrd for HeldPair {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeldPair {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order_key().cmp(&other.order_key())
+    }
+}
+
 /// One field of one part's leaf build.
 struct FieldBuild {
     key_type: KeyType,
-    /// Pairs carried from the previous tail for entries this build does not
-    /// read, sorted by `(key8, entry_ordinal)`.
-    carried: Vec<KeyIndexLeafEntry>,
     uncovered: BTreeSet<u64>,
-    /// Pairs read this pass, by key8, inside `[lo, end)`.
-    held: BTreeMap<[u8; 8], Vec<KeyIndexLeafEntry>>,
-    held_pairs: u64,
+    /// Pairs held this pass, read and carried, inside `[lo, end)`.
+    held: BinaryHeap<HeldPair>,
+    /// The lowest key8 in `held`: when the top equals it, `held` is one key8.
+    held_min: Option<[u8; 8]>,
     lo: u64,
     /// Exclusive end of this pass's key8 range, once the budget cut it.
     end: Option<u64>,
@@ -1901,13 +1945,12 @@ struct FieldBuild {
 }
 
 impl FieldBuild {
-    fn new(key_type: KeyType, carried: Vec<KeyIndexLeafEntry>, uncovered: BTreeSet<u64>) -> Self {
+    fn new(key_type: KeyType, uncovered: BTreeSet<u64>) -> Self {
         Self {
             key_type,
-            carried,
             uncovered,
-            held: BTreeMap::new(),
-            held_pairs: 0,
+            held: BinaryHeap::new(),
+            held_min: None,
             lo: 0,
             end: None,
             slice: OpenSlice::new(),
@@ -1916,6 +1959,40 @@ impl FieldBuild {
             attempt: 0,
             state: FieldBuildState::Building,
             refs: Vec::new(),
+        }
+    }
+
+    fn in_range(&self, key8: [u8; 8]) -> bool {
+        let key8 = u64::from_be_bytes(key8);
+        key8 >= self.lo && self.end.is_none_or(|end| key8 < end)
+    }
+
+    /// Holds one pair if it falls in this pass's range, then cuts to `share`.
+    fn hold(&mut self, pair: KeyIndexLeafEntry, share: u64) {
+        if !self.in_range(pair.key8) {
+            return;
+        }
+        self.held_min = Some(self.held_min.map_or(pair.key8, |min| min.min(pair.key8)));
+        self.held.push(HeldPair(pair));
+        self.cut(share);
+    }
+
+    /// While the field holds more than `share` pairs over more than one key8,
+    /// gives up its highest key8 run, which becomes the exclusive end of the
+    /// pass's range. A single key8 is never split, so one whose own pairs
+    /// exceed `share` is held whole.
+    fn cut(&mut self, share: u64) {
+        while self.held.len() as u64 > share {
+            let Some(top) = self.held.peek().map(|pair| pair.0.key8) else {
+                break;
+            };
+            if self.held_min == Some(top) {
+                break;
+            }
+            while self.held.peek().is_some_and(|pair| pair.0.key8 == top) {
+                self.held.pop();
+            }
+            self.end = Some(u64::from_be_bytes(top));
         }
     }
 
@@ -1929,8 +2006,115 @@ impl FieldBuild {
         self.state = FieldBuildState::Uncovered;
         self.refs.clear();
         self.held.clear();
-        self.held_pairs = 0;
+        self.held_min = None;
     }
+}
+
+/// Each building field's share of the pair budget: `max_pairs` split evenly
+/// over the fields still building, at least 1.
+fn key_index_field_share(max_pairs: u64, fields: &BTreeMap<String, FieldBuild>) -> u64 {
+    let building = fields
+        .values()
+        .filter(|field| field.state == FieldBuildState::Building)
+        .count()
+        .max(1) as u64;
+    (max_pairs / building).max(1)
+}
+
+/// Feeds a field's carried pairs in its pass range into `held`, decoding
+/// the previous leaves that overlap it in key8 order and stopping at the
+/// first one past the range the budget has cut so far. `Err` when a leaf
+/// that verified at load no longer decodes.
+fn feed_carried_key_index(
+    field: &mut FieldBuild,
+    carried: &CarriedField,
+    onto: &[Option<u64>],
+    carried_all: &[bool],
+    limits: &KeyIndexLeafLimits,
+    share: u64,
+) -> Result<(), String> {
+    for leaf in &carried.leaves {
+        if leaf.key8_hi < field.lo {
+            continue;
+        }
+        if field.end.is_some_and(|end| leaf.key8_lo >= end) {
+            break;
+        }
+        let summary = verify_key_index_leaf(&leaf.bytes, limits).map_err(|e| e.to_string())?;
+        for entry in summary.entries {
+            let Some(new) = usize::try_from(entry.entry_ordinal)
+                .ok()
+                .and_then(|previous| onto.get(previous).copied().flatten())
+            else {
+                continue;
+            };
+            if !carried_all.get(new as usize).copied().unwrap_or(false) {
+                continue;
+            }
+            field.hold(
+                KeyIndexLeafEntry {
+                    entry_ordinal: new,
+                    ..entry
+                },
+                share,
+            );
+        }
+    }
+    Ok(())
+}
+
+// Test-only: every pass's range and held pairs, per field, in build order.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyIndexPassRecord {
+    pub(crate) field: String,
+    pub(crate) attempt: u32,
+    pub(crate) lo: u64,
+    pub(crate) end: Option<u64>,
+    pub(crate) share: u64,
+    pub(crate) held: u64,
+    /// Whether every held pair has one key8.
+    pub(crate) one_key8: bool,
+    /// Capacity of the held heap's buffer at the end of the pass.
+    pub(crate) held_capacity: u64,
+    /// Whether every held pair's blocks `Vec` has capacity equal to its length.
+    pub(crate) blocks_exact: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static KEY_INDEX_PASS_LOG: std::cell::RefCell<Vec<KeyIndexPassRecord>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_key_index_pass_log_for_test() -> Vec<KeyIndexPassRecord> {
+    KEY_INDEX_PASS_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
+}
+
+#[cfg(test)]
+fn record_key_index_pass(name: &str, field: &FieldBuild, share: u64) {
+    let one_key8 = field.held_min.is_some_and(|min| {
+        field
+            .held
+            .peek()
+            .is_some_and(|top| top.0.key8 == min)
+    });
+    let record = KeyIndexPassRecord {
+        field: name.to_string(),
+        attempt: field.attempt,
+        lo: field.lo,
+        end: field.end,
+        share,
+        held: field.held.len() as u64,
+        one_key8,
+        held_capacity: field.held.capacity() as u64,
+        blocks_exact: field
+            .held
+            .iter()
+            .all(|pair| pair.0.blocks.capacity() == pair.0.blocks.len()),
+    };
+    KEY_INDEX_PASS_LOG.with(|log| log.borrow_mut().push(record));
 }
 
 /// What the leaf build needs beyond the part: the body ceiling, the pair
@@ -1956,22 +2140,25 @@ pub(crate) struct BuiltPartKeyIndex {
 /// for byte.
 ///
 /// Carry: when `previous_tail` shares a data object with this part, its
-/// leaves are read (one GET each) and verified, and each entry they cover is
-/// taken from them, matched by data object key, without reading its section.
-/// Entries they list as uncovered and entries new to the part are read. A
-/// leaf that cannot be read or verified drops the carry and every entry is
-/// read; so does a section naming a field the tenant does not declare, since
-/// a carried entry might name it too.
+/// leaves are read (one GET each) and verified, and each entry they cover
+/// for every declared field is taken from them, matched by data object key,
+/// without reading its section. Entries they list as uncovered and entries
+/// new to the part are read. A leaf that cannot be read or verified drops
+/// the carry and every entry is read; so does a section naming a field the
+/// tenant does not declare, since a carried entry might name it too.
 ///
-/// Passes: the first pass counts pairs as it reads and spills nothing. Once
-/// the pairs held across the part's fields pass `limits.max_pairs`, the
-/// field holding most gives up its highest key8 run until the rest fit, and
-/// that key8 becomes the exclusive end of its range for the pass; each later
-/// pass re-reads the sections and keeps the next range. One key8 run is never
-/// split. The carried pairs are held outside the budget. A field whose later
-/// pass finds an entry uncovered after pairs already reached its slices is
-/// rebuilt once from the first range with the complete uncovered list; a
-/// second such finding leaves it with no leaf.
+/// Passes: each pass gives every field still building an equal share of
+/// `limits.max_pairs` (at least 1) and holds, per field, the pairs read and
+/// carried in its key8 range. When a field's held pairs pass its share, it
+/// gives up its highest key8 run, which becomes the exclusive end of the
+/// range, so a pass holds the longest run of whole key8s from where the
+/// field's last pass ended that fits the share, or that one key8 whole when
+/// its own pairs exceed it. Each later pass reads the sections again and
+/// decodes the carried leaves its range overlaps. A field whose later pass
+/// finds an entry uncovered after pairs already reached its slices keeps
+/// passing to the end of the key space, collecting every uncovered entry,
+/// and is then rebuilt once from the first range with the complete list; a
+/// further finding in the rebuild leaves it with no leaf.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_part_key_index(
     store: &dyn ObjectStoreBackend,
@@ -2045,35 +2232,32 @@ pub(crate) async fn build_part_key_index(
     };
 
     'build: loop {
-        let mut carried_by_field = carry.take();
-        let carry_active = carried_by_field.is_some();
+        let carried = carry.take();
+        let carry_active = carried.is_some();
+        // An entry goes unread only when the previous leaves covered it for
+        // every declared field; an entry read for one field is indexed from
+        // its section for all of them.
         let carried_all: Vec<bool> = (0..n)
             .map(|o| {
-                carried_by_field
-                    .as_ref()
-                    .is_some_and(|fields| fields.values().all(|field| field.covered[o]))
+                carried.as_ref().is_some_and(|carried| {
+                    declared_types.keys().all(|name| {
+                        carried
+                            .fields
+                            .get(*name)
+                            .is_some_and(|field| field.covered[o])
+                    })
+                })
             })
             .collect();
-        let mut fields: BTreeMap<String, FieldBuild> = BTreeMap::new();
-        for (&name, &key_type) in &declared_types {
-            // Only entries carried for every field go unread; an entry read
-            // for one field is indexed from its section for all of them.
-            let carried = carried_by_field
-                .as_mut()
-                .and_then(|fields| fields.remove(name))
-                .map(|field| {
-                    field
-                        .entries
-                        .into_iter()
-                        .filter(|e| carried_all[e.entry_ordinal as usize])
-                        .collect()
-                })
-                .unwrap_or_default();
-            fields.insert(
-                name.to_string(),
-                FieldBuild::new(key_type, carried, key_errors.clone()),
-            );
-        }
+        let mut fields: BTreeMap<String, FieldBuild> = declared_types
+            .iter()
+            .map(|(&name, &key_type)| {
+                (
+                    name.to_string(),
+                    FieldBuild::new(key_type, key_errors.clone()),
+                )
+            })
+            .collect();
         let mut to_read: Vec<u64> = (0..part_entry_count)
             .filter(|&o| data_keys[o as usize].is_ok() && !carried_all[o as usize])
             .collect();
@@ -2081,6 +2265,32 @@ pub(crate) async fn build_part_key_index(
 
         loop {
             counters.key_index_build_passes += 1;
+            let mut share = key_index_field_share(max_pairs, &fields);
+            if let Some(carried) = &carried {
+                for (name, field) in fields.iter_mut() {
+                    if field.state != FieldBuildState::Building {
+                        continue;
+                    }
+                    let Some(carried_field) = carried.fields.get(name) else {
+                        continue;
+                    };
+                    if let Err(reason) = feed_carried_key_index(
+                        field,
+                        carried_field,
+                        &carried.onto,
+                        &carried_all,
+                        &limits.leaf,
+                        share,
+                    ) {
+                        tracing::warn!(
+                            tenant = %tenant.to_hex(),
+                            reason = %reason,
+                            "a previous tail leaf no longer decodes; the leaf build drops the carry and reads every entry's section"
+                        );
+                        continue 'build;
+                    }
+                }
+            }
             let targets: Vec<(u64, String, u64)> = to_read
                 .iter()
                 .filter_map(|&o| {
@@ -2089,7 +2299,6 @@ pub(crate) async fn build_part_key_index(
                 })
                 .collect();
             let mut failed: HashSet<u64> = HashSet::new();
-            let mut total_held: u64 = 0;
             let mut carry_conflict = false;
             {
                 let targets_ref = &targets;
@@ -2131,6 +2340,7 @@ pub(crate) async fn build_part_key_index(
                             continue;
                         }
                     };
+                    let mut added = false;
                     for section in sections {
                         if fields.contains_key(&section.name) {
                             continue;
@@ -2145,12 +2355,19 @@ pub(crate) async fn build_part_key_index(
                             uncovered.extend(0..ordinal);
                             fields.insert(
                                 section.name.clone(),
-                                FieldBuild::new(section.key_type, Vec::new(), uncovered),
+                                FieldBuild::new(section.key_type, uncovered),
                             );
+                            added = true;
                         }
                     }
                     if carry_conflict {
                         break;
+                    }
+                    if added {
+                        share = key_index_field_share(max_pairs, &fields);
+                        for field in fields.values_mut() {
+                            field.cut(share);
+                        }
                     }
                     for (name, field) in fields.iter_mut() {
                         if field.state != FieldBuildState::Building {
@@ -2168,37 +2385,15 @@ pub(crate) async fn build_part_key_index(
                         pairs.sort_unstable();
                         pairs.dedup();
                         for run in pairs.chunk_by(|a, b| a.0 == b.0) {
-                            let key8 = u64::from_be_bytes(run[0].0);
-                            if key8 < field.lo || field.end.is_some_and(|end| key8 >= end) {
-                                continue;
-                            }
-                            field
-                                .held
-                                .entry(run[0].0)
-                                .or_default()
-                                .push(KeyIndexLeafEntry {
+                            field.hold(
+                                KeyIndexLeafEntry {
                                     key8: run[0].0,
                                     entry_ordinal: ordinal,
                                     blocks: run.iter().map(|&(_, block)| block).collect(),
-                                });
-                            field.held_pairs += 1;
-                            total_held += 1;
+                                },
+                                share,
+                            );
                         }
-                    }
-                    while total_held > max_pairs {
-                        let Some(field) = fields
-                            .values_mut()
-                            .filter(|f| f.held.len() > 1)
-                            .max_by_key(|f| f.held_pairs)
-                        else {
-                            break;
-                        };
-                        let Some((key8, run)) = field.held.pop_last() else {
-                            break;
-                        };
-                        field.held_pairs -= run.len() as u64;
-                        total_held -= run.len() as u64;
-                        field.end = Some(u64::from_be_bytes(key8));
                     }
                 }
             }
@@ -2215,6 +2410,8 @@ pub(crate) async fn build_part_key_index(
             let mut pending: Vec<(String, u32, EncodedKeyIndexLeaf)> = Vec::new();
             for (name, field) in fields.iter_mut() {
                 if field.state == FieldBuildState::Building {
+                    #[cfg(test)]
+                    record_key_index_pass(name, field, share);
                     end_key_index_pass(
                         tenant,
                         signal,
@@ -2233,8 +2430,6 @@ pub(crate) async fn build_part_key_index(
                 // Request-issued, like every PUT counter here (#1598).
                 counters.put_requests += 1;
                 let leaf_ref = put_result?;
-                counters.key_index_leaves_written += 1;
-                counters.key_index_leaf_bytes_written += leaf_ref.size;
                 if let Some(field) = fields.get_mut(&name)
                     && field.attempt == attempt
                     && field.state != FieldBuildState::Uncovered
@@ -2271,11 +2466,12 @@ pub(crate) async fn build_part_key_index(
     }
 }
 
-/// Closes one pass of one field: merges the pass's read pairs with the
-/// carried pairs in its range, uncovers the entries of every key8 whose own
-/// entries exceed the body ceiling, feeds the rest to the open slice and
-/// queues each slice it closes (the last one when the range reaches
-/// `u64::MAX`) on `pending`.
+/// Closes one pass of one field: sorts the pass's held pairs, read and
+/// carried, by `(key8, entry_ordinal)`, uncovers the entries of every key8
+/// whose own entries exceed the body ceiling, feeds the rest to the open
+/// slice (unless the attempt is stale) and queues each slice it closes (the
+/// last one when the range reaches `u64::MAX`) on `pending`. The held pairs
+/// move into the slices; nothing is copied.
 #[allow(clippy::too_many_arguments)]
 fn end_key_index_pass(
     tenant: &TenantHash,
@@ -2287,38 +2483,15 @@ fn end_key_index_pass(
     limits: &KeyIndexLeafLimits,
     pending: &mut Vec<(String, u32, EncodedKeyIndexLeaf)>,
 ) {
-    let held = std::mem::take(&mut field.held);
-    field.held_pairs = 0;
-    let lo = field.lo;
+    let mut held: Vec<KeyIndexLeafEntry> = std::mem::take(&mut field.held)
+        .into_vec()
+        .into_iter()
+        .map(|pair| pair.0)
+        .collect();
+    field.held_min = None;
+    held.sort_unstable_by_key(|e| (e.key8, e.entry_ordinal));
     let end = field.end.take();
-    let key_of = |e: &KeyIndexLeafEntry| u64::from_be_bytes(e.key8);
-    let carried_start = field.carried.partition_point(|e| key_of(e) < lo);
-    let carried_end = end.map_or(field.carried.len(), |end| {
-        field.carried.partition_point(|e| key_of(e) < end)
-    });
-    let mut carried = field.carried[carried_start..carried_end]
-        .chunk_by(|a, b| a.key8 == b.key8)
-        .peekable();
-    let mut held = held.into_iter().peekable();
-    let mut runs: Vec<Vec<KeyIndexLeafEntry>> = Vec::new();
-    loop {
-        let next_carried = carried.peek().map(|run| run[0].key8);
-        let next_held = held.peek().map(|(key8, _)| *key8);
-        let mut run = match (next_carried, next_held) {
-            (None, None) => break,
-            (Some(c), Some(h)) if c == h => {
-                let mut run = carried.next().map(<[_]>::to_vec).unwrap_or_default();
-                run.extend(held.next().map(|(_, run)| run).unwrap_or_default());
-                run
-            }
-            (Some(c), Some(h)) if c < h => carried.next().map(<[_]>::to_vec).unwrap_or_default(),
-            (Some(_), None) => carried.next().map(<[_]>::to_vec).unwrap_or_default(),
-            _ => held.next().map(|(_, run)| run).unwrap_or_default(),
-        };
-        run.sort_by_key(|e| e.entry_ordinal);
-        runs.push(run);
-    }
-    for run in &runs {
+    for run in held.chunk_by(|a, b| a.key8 == b.key8) {
         let body = run
             .iter()
             .map(encoded_entry_len)
@@ -2377,11 +2550,14 @@ fn end_key_index_pass(
             }
         };
     if !field.stale {
-        for run in runs {
-            let run: Vec<KeyIndexLeafEntry> = run
-                .into_iter()
-                .filter(|e| !field.uncovered.contains(&e.entry_ordinal))
-                .collect();
+        let mut rest = held.into_iter().peekable();
+        while let Some(first) = rest.next() {
+            let key8 = first.key8;
+            let mut run = vec![first];
+            while let Some(entry) = rest.next_if(|e| e.key8 == key8) {
+                run.push(entry);
+            }
+            run.retain(|e| !field.uncovered.contains(&e.entry_ordinal));
             if run.is_empty() {
                 continue;
             }
@@ -2394,7 +2570,10 @@ fn end_key_index_pass(
         }
     }
     match end {
-        _ if field.stale && field.attempt == 0 => {
+        // A stale attempt keeps passing to the end of the key space so the
+        // rebuild starts with every uncovered entry a pass can find.
+        Some(end) => field.lo = end,
+        None if field.stale && field.attempt == 0 => {
             tracing::warn!(
                 tenant = %tenant.to_hex(),
                 field = name,
@@ -2407,7 +2586,7 @@ fn end_key_index_pass(
             field.slice = OpenSlice::new();
             field.refs.clear();
         }
-        _ if field.stale => {
+        None if field.stale => {
             tracing::warn!(
                 tenant = %tenant.to_hex(),
                 field = name,
@@ -2415,7 +2594,6 @@ fn end_key_index_pass(
             );
             field.give_up();
         }
-        Some(end) => field.lo = end,
         None => {
             let last = field.slice.finish();
             if emit(field, last) {
@@ -3460,6 +3638,8 @@ impl Catalog {
             let mut column_stats_part_objects_built: u64 = 0;
             let mut column_stats_dictionaries_dropped: u64 = 0;
             let mut key_index_uncovered_entries: u64 = 0;
+            let mut key_index_leaves_written: u64 = 0;
+            let mut key_index_leaf_bytes_written: u64 = 0;
             for (span, encoding) in spans.iter().zip(span_encodings) {
                 // Single-part fold keeps exact v1 semantics: min_hour 0 (the
                 // epoch floor) and the fold watermark, byte-identical to the
@@ -3766,6 +3946,9 @@ impl Catalog {
                         }
                     };
                     key_index_uncovered_entries += built.uncovered_entries;
+                    key_index_leaves_written += built.refs.len() as u64;
+                    key_index_leaf_bytes_written +=
+                        built.refs.iter().map(|leaf| leaf.size).sum::<u64>();
                     key_index = built.refs;
                 }
 
@@ -4012,8 +4195,8 @@ impl Catalog {
                         seal_through_hour: applied_seal_through,
                         key_index_ranged_gets: counters.key_index_ranged_gets,
                         key_index_bytes_read: counters.key_index_bytes_read,
-                        key_index_leaves_written: counters.key_index_leaves_written,
-                        key_index_leaf_bytes_written: counters.key_index_leaf_bytes_written,
+                        key_index_leaves_written,
+                        key_index_leaf_bytes_written,
                         key_index_uncovered_entries,
                         key_index_sections_read: counters.key_index_sections_read,
                         key_index_entries_carried: counters.key_index_entries_carried,
@@ -5086,6 +5269,9 @@ fn no_op_report(
     counters: RequestCounters,
     refold_hours_reconciled: u64,
 ) -> FoldReport {
+    // The work an attempt lost to a HEAD CAS did is real work even when the
+    // fold ends in a no-op, so it reaches `/metrics` too.
+    observe_fold_key_index(&counters);
     FoldReport {
         watermark_hour,
         previous_watermark_hour: watermark_hour,
@@ -5117,12 +5303,13 @@ fn no_op_report(
         stamped_records: 0,
         stamped_entries: 0,
         seal_through_hour,
-        // Nonzero only when an earlier attempt of this fold lost its HEAD CAS
-        // after building leaves; a no-op attempt itself writes none.
+        // The read and build figures are nonzero only when an earlier attempt
+        // of this fold lost its HEAD CAS after building leaves; a no-op
+        // publishes no leaf.
         key_index_ranged_gets: counters.key_index_ranged_gets,
         key_index_bytes_read: counters.key_index_bytes_read,
-        key_index_leaves_written: counters.key_index_leaves_written,
-        key_index_leaf_bytes_written: counters.key_index_leaf_bytes_written,
+        key_index_leaves_written: 0,
+        key_index_leaf_bytes_written: 0,
         key_index_uncovered_entries: 0,
         key_index_sections_read: counters.key_index_sections_read,
         key_index_entries_carried: counters.key_index_entries_carried,
