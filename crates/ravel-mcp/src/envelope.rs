@@ -794,6 +794,50 @@ pub struct Failure {
     pub counter: Option<String>,
 }
 
+/// How `ravel_get_trace`'s logs leg ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LegStatus {
+    /// Every matching record is in `rows`.
+    Ok,
+    /// A cap cut the records; `rows_omitted` counts what is missing.
+    OkBounded,
+    /// The leg did not run; `skipped_reason` says why.
+    Skipped,
+    /// The leg ran and failed; `failure` names the class.
+    Failed,
+}
+
+/// One part of a call's spend, reported on its own.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+pub struct LegSpend {
+    pub actual: AnyJson,
+    pub estimate: AnyJson,
+    pub estimate_is_upper_envelope: bool,
+}
+
+/// The log records `ravel_get_trace` read for its trace id, beside the spans
+/// in `data`. Its rows have their own row cap and share the call's byte cap
+/// with the spans, and its spend is reported apart from the span lookup's.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct LogsLeg {
+    pub status: LegStatus,
+    pub failure: Option<Failure>,
+    pub skipped_reason: Option<String>,
+    pub columns: Vec<Column>,
+    pub rows: Vec<Row>,
+    /// Records the leg's statement produced, before either cap.
+    pub row_count: u64,
+    pub row_cap_hit: bool,
+    pub bytes_cap_hit: bool,
+    pub rows_omitted: u64,
+    /// The leg's own spend. Its estimate is never an upper envelope.
+    pub budget: LegSpend,
+    /// The span lookup's own spend. `budget` at the top level is the sum of
+    /// the two.
+    pub span_lookup_budget: LegSpend,
+}
+
 /// A projection wider than [`MAX_PROJECTION_COLUMNS`] is an
 /// `invalid_argument` failure whose `next_steps` says to name the columns
 /// (D4).
@@ -831,6 +875,11 @@ pub struct Envelope {
     pub evidence: Vec<EvidenceEntry>,
     pub warnings: Vec<String>,
     pub next_steps: Vec<NextStep>,
+    /// `ravel_get_trace`'s logs leg, present only when the call asked for it
+    /// with `include_logs`. Absent from every other envelope, so their bytes
+    /// are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<LogsLeg>,
     /// `presentation.cursor` is the source's own next-page cursor, not one
     /// minted because a cap cut the page: [`finish`](Self::finish) keeps it
     /// under a total order whatever the caps took. Never serialized.

@@ -324,6 +324,11 @@ mod tests {
         pub(crate) executed: std::cell::RefCell<Vec<SqlCall>>,
         pub(crate) trace: std::cell::RefCell<std::collections::VecDeque<Result<Envelope, Failure>>>,
         pub(crate) traced: std::cell::RefCell<Vec<crate::service::TraceLookupRequest>>,
+        /// When set, the next `sql_execute` records its request and answers
+        /// this failure instead of popping `sql`.
+        pub(crate) sql_failure: std::cell::RefCell<Option<Failure>>,
+        /// What `time_left` answers.
+        pub(crate) time_left: Option<std::time::Duration>,
     }
 
     impl Stub {
@@ -420,15 +425,24 @@ mod tests {
             resolve_at_ns: i64,
             order_columns: &[String],
         ) -> Result<crate::draft::Draft, Failure> {
-            let Some(draft) = self.sql.borrow_mut().pop_front() else {
-                panic!("sql_execute must not be reached");
-            };
-            self.executed.borrow_mut().push(SqlCall {
+            let call = SqlCall {
                 request: request.clone(),
                 resolve_at_ns,
                 order_columns: order_columns.to_vec(),
-            });
+            };
+            if let Some(failure) = self.sql_failure.borrow_mut().take() {
+                self.executed.borrow_mut().push(call);
+                return Err(failure);
+            }
+            let Some(draft) = self.sql.borrow_mut().pop_front() else {
+                panic!("sql_execute must not be reached");
+            };
+            self.executed.borrow_mut().push(call);
             Ok(draft)
+        }
+
+        fn time_left(&self) -> Option<std::time::Duration> {
+            self.time_left
         }
 
         async fn trace_lookup(

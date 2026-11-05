@@ -13,8 +13,8 @@
 //! One data row per span. The first two columns are added by this tool and
 //! describe the span tree over the rows returned:
 //!
-//! - `__ravel_parent`: `root` when the span has no parent id; `present` when
-//!   a returned span has that id; `cycle` when following parents from the
+//! - `__ravel_parent`: `root` when the span has no parent id, or one of
+//!   zeros only; `present` when a returned span has that id; `cycle` when following parents from the
 //!   span leads back to it; otherwise `missing` when the result is complete
 //!   and `not_returned` when it is not. Complete means no row cap and no byte
 //!   cap fired, no row was omitted, and coverage is complete, so an absent
@@ -30,15 +30,39 @@
 //! survive them. The byte fit runs with both columns already present and
 //! holding the widest value each can take, so writing the real values
 //! afterwards can only shorten the envelope the fit measured.
+//!
+//! # The logs leg
+//!
+//! With `include_logs: true` (it needs `time_range`) the call also reads the
+//! log records carrying the trace id in the same window, through
+//! `ravel_search_logs` with a `trace_id` argument, so the statement is that
+//! tool's synthesis, ordered by `(ts, observed_ts)`. The records go in the
+//! envelope's `logs` block, never in `data`, and with `include_logs` false or
+//! absent that block is not serialized at all.
+//!
+//! - It runs after the span lookup under what is left of the call's one
+//!   deadline, and is skipped with a stated reason when nothing is left.
+//! - Its records have their own `max_rows` and share `max_response_bytes`
+//!   with the spans, spans first: the leg's columns are in the envelope the
+//!   span fit measures, and its records are then added as a prefix while the
+//!   whole envelope stays under the same cap. No cursor: a capped leg reports
+//!   its omitted records and a step naming `ravel_search_logs`.
+//! - Its spend is `logs.budget` and the span lookup's is
+//!   `logs.span_lookup_budget`; `budget.actual` is their sum. The leg's
+//!   estimate is not an upper envelope, so a call with the leg never claims
+//!   one.
+//! - A leg that fails leaves the spans as they are and reports itself
+//!   `failed` with its failure class.
 
 use std::collections::HashMap;
 
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 
 use crate::catalog::GetTraceInput;
 use crate::envelope::{
-    CapAdvice, CapCut, Cell, Column, Envelope, Failure, FailureClass, NextStep, Row,
+    AnyJson, Budget, CapAdvice, CapCut, Cell, Column, Envelope, Failure, FailureClass, LegSpend,
+    LegStatus, LogsLeg, NextStep, Row, Status, fit_cap, serialized_len,
 };
 use crate::service::{QueryBackend, TraceLookupRequest};
 
@@ -48,6 +72,21 @@ use super::capabilities::refused;
 const DEPTH_COLUMN: &str = "__ravel_depth";
 const PARENT_COLUMN: &str = "__ravel_parent";
 const WIDEN_STEP: &str = "widen_time_range";
+const LOGS_STEP: &str = "ravel_search_logs";
+
+/// What every call whose logs leg started carries.
+pub const LOGS_SCAN_WARNING: &str = "include_logs ran an unindexed scan: no trace index covers \
+     logs, so the leg reads the logs in time_range and keeps the records carrying trace_id \
+     (a logs key index on trace_id, where the tenant declares one, can skip objects); its \
+     spend is logs.budget, apart from the span lookup's logs.span_lookup_budget";
+
+/// Why a leg did not start.
+pub const LOGS_SKIPPED_NO_TIME: &str =
+    "no time was left of the call's deadline after the span lookup";
+
+/// A leg failure's message is cut to this many bytes, on a character
+/// boundary.
+const LEG_FAILURE_MESSAGE_BOUND: usize = 512;
 
 /// The lead of the cap step a trace with a `not_returned` parent carries.
 const NOT_RETURNED: &str = "a parent was not returned";
@@ -64,17 +103,236 @@ const ADVICE: CapAdvice<'static> = CapAdvice {
 /// Run the tool. An argument the body cannot use is an `invalid_argument`
 /// envelope and reaches no store.
 pub async fn run<B: QueryBackend>(args: Value, ctx: &ToolContext<'_>, backend: &B) -> Envelope {
-    let request = match request(args) {
-        Ok(request) => request,
+    let call = match request(args) {
+        Ok(call) => call,
         Err(failure) => return refused(failure, ctx),
     };
-    let finished = match backend.trace_lookup(ctx.tenant_hash, &request).await {
-        Ok(envelope) => finish(envelope, &request, ctx),
-        Err(failure) => Err(failure),
+    let spans = match backend.trace_lookup(ctx.tenant_hash, &call.lookup).await {
+        Ok(envelope) => envelope,
+        Err(failure) => return refused(failure, ctx),
     };
-    match finished {
+    let leg = match &call.logs {
+        Some(logs) => Some(logs_leg(logs, ctx, backend).await),
+        None => None,
+    };
+    match finish(spans, &call, leg, ctx) {
         Ok(envelope) => envelope,
         Err(failure) => refused(failure, ctx),
+    }
+}
+
+/// One validated call: the span lookup, and the logs leg when asked for.
+#[derive(Debug)]
+struct Call {
+    lookup: TraceLookupRequest,
+    logs: Option<LogsCall>,
+}
+
+/// The logs leg's `ravel_search_logs` arguments, and the step a capped leg
+/// carries.
+#[derive(Debug)]
+struct LogsCall {
+    args: Value,
+    step: NextStep,
+}
+
+/// What the logs leg came back with.
+enum Leg {
+    /// It did not start, for the reason given.
+    Skipped(&'static str),
+    /// `ravel_search_logs`'s envelope: an error envelope when it failed.
+    Ran(Envelope),
+}
+
+async fn logs_leg<B: QueryBackend>(logs: &LogsCall, ctx: &ToolContext<'_>, backend: &B) -> Leg {
+    if backend.time_left().is_some_and(|left| left.is_zero()) {
+        return Leg::Skipped(LOGS_SKIPPED_NO_TIME);
+    }
+    Leg::Ran(super::search_logs::run(logs.args.clone(), ctx, backend).await)
+}
+
+/// The `logs` block for `leg`, and the records it read, held out of the
+/// block until the spans are fitted.
+fn leg_block(leg: Leg, span_lookup: &Budget) -> (LogsLeg, Vec<Row>) {
+    let span_lookup_budget = LegSpend {
+        actual: span_lookup.actual.clone(),
+        estimate: span_lookup.estimate.clone(),
+        estimate_is_upper_envelope: span_lookup.estimate_is_upper_envelope,
+    };
+    let mut block = LogsLeg {
+        status: LegStatus::Skipped,
+        failure: None,
+        skipped_reason: None,
+        columns: Vec::new(),
+        rows: Vec::new(),
+        row_count: 0,
+        row_cap_hit: false,
+        bytes_cap_hit: false,
+        rows_omitted: 0,
+        budget: LegSpend::default(),
+        span_lookup_budget,
+    };
+    let envelope = match leg {
+        Leg::Skipped(reason) => {
+            block.skipped_reason = Some(reason.to_string());
+            return (block, Vec::new());
+        }
+        Leg::Ran(envelope) => envelope,
+    };
+    block.budget = LegSpend {
+        actual: envelope.budget.actual,
+        estimate: envelope.budget.estimate,
+        estimate_is_upper_envelope: false,
+    };
+    if let Some(mut failure) = envelope.failure {
+        failure.message = bounded(failure.message, LEG_FAILURE_MESSAGE_BOUND);
+        block.status = LegStatus::Failed;
+        block.failure = Some(failure);
+        return (block, Vec::new());
+    }
+    let shown = &envelope.presentation;
+    let capped = shown.row_cap_hit
+        || shown.bytes_cap_hit
+        || shown.rows_omitted > 0
+        || envelope.status != Status::Ok;
+    block.status = if capped {
+        LegStatus::OkBounded
+    } else {
+        LegStatus::Ok
+    };
+    block.row_cap_hit = shown.row_cap_hit;
+    block.bytes_cap_hit = shown.bytes_cap_hit;
+    block.rows_omitted = shown.rows_omitted;
+    block.row_count = envelope.data.row_count;
+    block.columns = envelope.data.columns;
+    (block, envelope.data.rows)
+}
+
+/// `message` cut to at most `bound` bytes on a character boundary.
+fn bounded(mut message: String, bound: usize) -> String {
+    if message.len() > bound {
+        let mut at = bound;
+        while !message.is_char_boundary(at) {
+            at -= 1;
+        }
+        message.truncate(at);
+    }
+    message
+}
+
+/// The whole call's budget: the span lookup's ceilings, the two parts'
+/// spend summed, and no upper-envelope claim.
+fn whole_call(span_lookup: &Budget, leg: &LegSpend) -> Budget {
+    Budget {
+        effective: span_lookup.effective.clone(),
+        actual: AnyJson(sum_figures(&span_lookup.actual.0, &leg.actual.0)),
+        estimate: AnyJson(sum_figures(&span_lookup.estimate.0, &leg.estimate.0)),
+        estimate_is_upper_envelope: false,
+    }
+}
+
+/// Two spend objects added key by key. Numbers add; a null on either side
+/// stays null (a figure nobody could bound); string lists (`unbounded`) are
+/// merged; a key only one side has keeps that side's value. A side that is
+/// not an object contributes nothing.
+fn sum_figures(a: &Value, b: &Value) -> Value {
+    let (Value::Object(a), Value::Object(b)) = (a, b) else {
+        return match a {
+            Value::Object(_) => a.clone(),
+            _ => b.clone(),
+        };
+    };
+    let mut sum = Map::new();
+    for (key, left) in a {
+        let value = match (left, b.get(key)) {
+            (left, None) => left.clone(),
+            (Value::Number(x), Some(Value::Number(y))) => match (x.as_u64(), y.as_u64()) {
+                (Some(x), Some(y)) => json!(x.saturating_add(y)),
+                _ => Value::Null,
+            },
+            (Value::Array(x), Some(Value::Array(y))) => {
+                let mut merged = x.clone();
+                for item in y {
+                    if !merged.contains(item) {
+                        merged.push(item.clone());
+                    }
+                }
+                Value::Array(merged)
+            }
+            _ => Value::Null,
+        };
+        sum.insert(key.clone(), value);
+    }
+    for (key, right) in b {
+        if !a.contains_key(key) {
+            sum.insert(key.clone(), right.clone());
+        }
+    }
+    Value::Object(sum)
+}
+
+/// The leg's cap figures before its records are placed.
+#[derive(Debug, Clone, Copy)]
+struct Before {
+    omitted: u64,
+    bytes_cut: bool,
+    capped: bool,
+}
+
+/// Set every leg field that placing `offered` records can change to its
+/// widest value, so the span fit and the placement measure an envelope the
+/// final values can only shorten, and return what they were.
+fn widen(leg: &mut LogsLeg, offered: usize) -> Before {
+    let before = Before {
+        omitted: leg.rows_omitted,
+        bytes_cut: leg.bytes_cap_hit,
+        capped: leg.status == LegStatus::OkBounded,
+    };
+    leg.rows_omitted = leg.rows_omitted.saturating_add(offered as u64);
+    // `false` serializes one byte longer than `true`.
+    leg.bytes_cap_hit = false;
+    leg.status = LegStatus::OkBounded;
+    before
+}
+
+/// Add the leg's records to the fitted envelope as the longest prefix that
+/// keeps the whole envelope under the fit cap, then write the leg's real cap
+/// figures, which can only shorten what was measured. A leg left uncapped
+/// drops its step.
+fn place_logs(envelope: &mut Envelope, mut rows: Vec<Row>, before: Before, max_response_bytes: u64) {
+    let offered = rows.len();
+    let Before {
+        omitted: omitted_before,
+        bytes_cut: cut_before,
+        capped: capped_before,
+    } = before;
+    let cap = fit_cap(max_response_bytes);
+    let mut used = serialized_len(envelope);
+    let mut kept = 0;
+    for row in &rows {
+        let len = serde_json::to_vec(row).map_or(usize::MAX, |bytes| bytes.len());
+        let add = len.saturating_add(usize::from(kept > 0));
+        if used.saturating_add(add) > cap {
+            break;
+        }
+        used += add;
+        kept += 1;
+    }
+    rows.truncate(kept);
+    let Some(leg) = envelope.logs.as_mut() else {
+        return;
+    };
+    let cut = kept < offered;
+    leg.rows = rows;
+    leg.rows_omitted = omitted_before.saturating_add((offered - kept) as u64);
+    leg.bytes_cap_hit = cut_before || cut;
+    leg.status = if capped_before || cut {
+        LegStatus::OkBounded
+    } else {
+        LegStatus::Ok
+    };
+    if leg.status == LegStatus::Ok {
+        envelope.next_steps.retain(|next| next.action != LOGS_STEP);
     }
 }
 
@@ -121,7 +379,7 @@ enum Link {
 /// The span tree over `rows`: one placement per row, in row order.
 ///
 /// `span_at` and `parent_at` are the positions of `span_id` and
-/// `parent_span_id`. A null parent id is a root. A parent id resolves to the
+/// `parent_span_id`. A null or all-zero parent id is a root. A parent id resolves to the
 /// first row carrying it as `span_id`. An unresolved parent id is `missing`
 /// when `complete` and `not_returned` otherwise. The walk visits each row at
 /// most once on its way up, so it ends on any input, cycles included.
@@ -142,6 +400,7 @@ fn span_tree(
         .map(|row| {
             Ok(match id_at(row, parent_at, "parent_span_id")? {
                 None => Link::Root,
+                Some(id) if is_zero_id(id) => Link::Root,
                 Some(id) => first.get(id).map_or(Link::Absent, |&at| Link::To(at)),
             })
         })
@@ -204,6 +463,11 @@ fn span_tree(
         .collect()
 }
 
+/// An id of zeros only: OTLP's spelling of "no parent".
+fn is_zero_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|byte| byte == b'0')
+}
+
 /// The id a cell holds: `None` for null, the text for a string or hex id.
 fn id_at<'a>(row: &'a Row, at: usize, name: &str) -> Result<Option<&'a str>, Failure> {
     match row.get(at) {
@@ -219,9 +483,11 @@ fn id_at<'a>(row: &'a Row, at: usize, name: &str) -> Result<Option<&'a str>, Fai
 /// receives, so a parent the byte cap dropped reads as `not_returned`.
 fn finish(
     mut envelope: Envelope,
-    request: &TraceLookupRequest,
+    call: &Call,
+    leg: Option<Leg>,
     ctx: &ToolContext<'_>,
 ) -> Result<Envelope, Failure> {
+    let request = &call.lookup;
     let span_at = column_at(&envelope, "span_id")?;
     let parent_at = column_at(&envelope, "parent_span_id")?;
 
@@ -253,6 +519,21 @@ fn finish(
             },
         ],
     );
+    let mut log_rows = Vec::new();
+    let mut before = None;
+    if let (Some(leg), Some(logs)) = (leg, &call.logs) {
+        let (mut block, rows) = leg_block(leg, &envelope.budget);
+        if block.status != LegStatus::Skipped {
+            envelope.warnings.push(LOGS_SCAN_WARNING.to_string());
+        }
+        if matches!(block.status, LegStatus::Ok | LegStatus::OkBounded) {
+            envelope.next_steps.push(logs.step.clone());
+            before = Some(widen(&mut block, rows.len()));
+        }
+        envelope.budget = whole_call(&envelope.budget, &block.budget);
+        envelope.logs = Some(block);
+        log_rows = rows;
+    }
     envelope.next_steps.push(step(
         WIDEN_STEP,
         "a parent is missing and may start outside time_range; widen time_range or drop it",
@@ -262,7 +543,22 @@ fn finish(
         .push(ADVICE.widest(NOT_RETURNED, &ctx.budgets));
     let cap_step_at = envelope.next_steps.len() - 1;
 
-    let mut fitted = envelope.fit_row_capped(ctx.budgets.max_response_bytes, row_cap_omitted);
+    let cap = ctx.budgets.max_response_bytes;
+    let mut fitted = envelope.clone().fit_row_capped(cap, row_cap_omitted);
+    if serialized_len(&fitted) > fit_cap(cap)
+        && let Some(leg) = envelope.logs.as_mut()
+    {
+        // The leg's columns alone leave no room: none of its records can be
+        // returned, and the spans keep the room.
+        leg.columns.clear();
+        before = before.map(|before| Before {
+            omitted: before.omitted.saturating_add(log_rows.len() as u64),
+            bytes_cut: true,
+            capped: true,
+        });
+        log_rows.clear();
+        fitted = envelope.fit_row_capped(cap, row_cap_omitted);
+    }
     fitted.data.row_count = produced;
     let cut = CapCut::of(&fitted.presentation, fitted.data.rows.len(), &ctx.budgets);
 
@@ -290,6 +586,9 @@ fn finish(
     if !widen {
         fitted.next_steps.retain(|next| next.action != WIDEN_STEP);
     }
+    if let Some(before) = before {
+        place_logs(&mut fitted, log_rows, before, cap);
+    }
     Ok(fitted.finish(false))
 }
 
@@ -309,18 +608,9 @@ fn step(action: &str, detail: &str) -> NextStep {
     }
 }
 
-fn request(args: Value) -> Result<TraceLookupRequest, Failure> {
+fn request(args: Value) -> Result<Call, Failure> {
     let input = GetTraceInput::deserialize(args)
         .map_err(|err| invalid(format!("ravel_get_trace arguments: {err}")))?;
-    if input.include_logs == Some(true) {
-        return Err(Failure {
-            class: FailureClass::Unsupported,
-            message: "include_logs is not served by this build; for the trace's logs, call \
-                      ravel_search_logs with a trace_id predicate and a time_range"
-                .to_string(),
-            counter: None,
-        });
-    }
     if input.evidence_ref.is_some() {
         return Err(Failure {
             class: FailureClass::Unsupported,
@@ -334,7 +624,45 @@ fn request(args: Value) -> Result<TraceLookupRequest, Failure> {
         .as_ref()
         .map(crate::time::window)
         .transpose()?;
-    Ok(TraceLookupRequest { trace_id, window })
+    let logs = match (input.include_logs, window) {
+        (Some(true), None) => {
+            return Err(Failure {
+                class: FailureClass::MissingArgument,
+                message: "include_logs requires time_range: the logs leg reads the logs in \
+                          that window"
+                    .to_string(),
+                counter: None,
+            });
+        }
+        (Some(true), Some(window)) => Some(logs_call(&trace_id, window)),
+        _ => None,
+    };
+    Ok(Call {
+        lookup: TraceLookupRequest { trace_id, window },
+        logs,
+    })
+}
+
+/// The leg's `ravel_search_logs` arguments: the trace id and the window,
+/// nothing else, so the statement is that tool's `trace_id` synthesis.
+fn logs_call(trace_id: &[u8; 16], window: ravel_types::TimeRange) -> LogsCall {
+    let hex: String = trace_id.iter().map(|byte| format!("{byte:02x}")).collect();
+    let (start_ns, end_ns) = (window.start_ns.to_string(), window.end_ns.to_string());
+    let step = step(
+        LOGS_STEP,
+        &format!(
+            "the trace's log records were capped and this leg has no cursor; page through \
+             them with ravel_search_logs, trace_id {hex}, time_range start_ns {start_ns} \
+             end_ns {end_ns}"
+        ),
+    );
+    LogsCall {
+        args: json!({
+            "trace_id": hex,
+            "time_range": {"start_ns": start_ns, "end_ns": end_ns},
+        }),
+        step,
+    }
 }
 
 fn parse_trace_id(raw: &str) -> Result<[u8; 16], Failure> {
@@ -897,33 +1225,433 @@ mod tests {
         }
     }
 
-    /// The refusal names the route that does serve a trace's logs.
+    /// The leg reads the logs in a window, so asking for it without one is
+    /// refused before any store is reached.
     #[test]
-    fn include_logs_names_search_logs() {
+    fn include_logs_needs_a_time_range() {
         let failure =
             request(json!({"trace_id": TRACE, "include_logs": true})).expect_err("refused");
-        assert_eq!(failure.class, FailureClass::Unsupported);
-        assert!(
-            failure.message.contains("ravel_search_logs"),
-            "{}",
-            failure.message
+        assert_eq!(failure.class, FailureClass::MissingArgument);
+        assert_eq!(
+            failure.message,
+            "include_logs requires time_range: the logs leg reads the logs in that window"
         );
-        assert!(failure.message.contains("trace_id"), "{}", failure.message);
-        assert!(
-            failure.message.contains("time_range"),
-            "{}",
-            failure.message
+    }
+
+    /// The span lookup's spend in the fixtures below.
+    fn span_spend() -> (Value, Value) {
+        (
+            json!({"bytes_scanned": 100, "store_requests": 1, "segments_read": 1,
+                   "decompressed_bytes": 200}),
+            json!({"bytes_scanned": 150, "store_requests": 2, "segments_read": 1,
+                   "decompressed_bytes": 300, "unbounded": []}),
+        )
+    }
+
+    /// The leg's spend in the fixtures below.
+    fn leg_spend() -> (Value, Value) {
+        (
+            json!({"bytes_scanned": 5000, "store_requests": 7, "segments_read": 3,
+                   "decompressed_bytes": 9000}),
+            json!({"bytes_scanned": 6000, "store_requests": 9, "segments_read": 3,
+                   "decompressed_bytes": null, "unbounded": ["decompressed_bytes"]}),
+        )
+    }
+
+    /// Three spans, complete, with [`span_spend`] and an upper-envelope
+    /// estimate.
+    fn costed_spans() -> Envelope {
+        let mut port = spans(&[
+            ("r", None, "root"),
+            ("c", Some("r"), "child"),
+            ("g", Some("c"), "grandchild"),
+        ]);
+        let (actual, estimate) = span_spend();
+        port.budget = Budget {
+            effective: AnyJson(json!({"max_rows": 200})),
+            actual: AnyJson(actual),
+            estimate: AnyJson(estimate),
+            estimate_is_upper_envelope: true,
+        };
+        port
+    }
+
+    /// What the executor answers for the leg: one record per `(id, ts)`, in
+    /// the order given, each `body` `body_len` bytes long, with
+    /// [`leg_spend`].
+    fn records(rows: &[(&str, u8)], body_len: usize) -> crate::draft::Draft {
+        use ravel_sql::ResumeValue;
+        let mut envelope = Envelope::default();
+        envelope.ids.query_id = "q".to_owned();
+        envelope.ids.audit_ref = "a".to_owned();
+        envelope.data.columns = ["id", "trace_id", "ts", "observed_ts", "body", "attrs"]
+            .iter()
+            .map(|name| Column {
+                name: (*name).to_owned(),
+                r#type: "test".to_owned(),
+            })
+            .collect();
+        envelope.data.rows = rows
+            .iter()
+            .map(|(id, ts)| {
+                vec![
+                    Cell::Str((*id).to_owned()),
+                    Cell::Str(TRACE.to_owned()),
+                    Cell::Int(i128::from(*ts)),
+                    Cell::Int(i128::from(*ts)),
+                    Cell::Str("b".repeat(body_len)),
+                    Cell::Map(serde_json::Map::new()),
+                ]
+            })
+            .collect();
+        envelope.data.row_count = rows.len() as u64;
+        envelope.coverage.complete = true;
+        let (actual, estimate) = leg_spend();
+        envelope.budget = Budget {
+            effective: AnyJson(json!({"max_rows": 200})),
+            actual: AnyJson(actual),
+            estimate: AnyJson(estimate),
+            estimate_is_upper_envelope: false,
+        };
+        let tuples = rows
+            .iter()
+            .map(|(_, ts)| {
+                Some(vec![
+                    ResumeValue::TimestampNanos(i64::from(*ts)),
+                    ResumeValue::TimestampNanos(i64::from(*ts)),
+                ])
+            })
+            .collect();
+        crate::draft::Draft::new(
+            envelope,
+            Ok(ravel_types::Signal::Logs),
+            Vec::new(),
+            Vec::new(),
+            Some(2),
+            None,
+            9,
+        )
+        .with_order_tuples(tuples)
+    }
+
+    fn with_logs() -> Value {
+        json!({
+            "trace_id": TRACE,
+            "time_range": {"start_ns": "7", "end_ns": "9"},
+            "include_logs": true,
+        })
+    }
+
+    /// Run the tool against `stub`, its trace queue holding `port`.
+    fn call_with(stub: &Stub, port: Envelope, args: Value, ctx: &ToolContext<'_>) -> Envelope {
+        stub.trace.borrow_mut().push_back(Ok(port));
+        block_on(run(args, ctx, stub))
+    }
+
+    fn leg(envelope: &Envelope) -> &LogsLeg {
+        envelope.logs.as_ref().expect("a logs block")
+    }
+
+    /// The `id` of each record the leg returned, in order.
+    fn record_ids(envelope: &Envelope) -> Vec<String> {
+        let leg = leg(envelope);
+        let at = leg
+            .columns
+            .iter()
+            .position(|column| column.name == "id")
+            .expect("an id column");
+        leg.rows
+            .iter()
+            .map(|row| match &row[at] {
+                Cell::Str(id) => id.clone(),
+                other => panic!("id cell {other:?}"),
+            })
+            .collect()
+    }
+
+    fn json_of<T: serde::Serialize>(value: &T) -> Value {
+        serde_json::to_value(value).expect("serializes")
+    }
+
+    /// The leg runs `ravel_search_logs`'s `trace_id` statement over the
+    /// call's window, returns the records the executor matched in their
+    /// order, warns that it is an unindexed scan, and reports its own spend
+    /// apart from the span lookup's, with `budget.actual` their sum.
+    ///
+    /// FLIP: reporting the summed figures as the span lookup's own fails the
+    /// `span_lookup_budget` assertion.
+    #[test]
+    fn logs_leg_reports_unindexed_scan_cost() {
+        let key = key();
+        let ctx = test_context(&key);
+        let stub = Stub::default();
+        stub.sql
+            .borrow_mut()
+            .push_back(records(&[("l1", 7), ("l2", 8), ("l3", 8)], 4));
+        let envelope = call_with(&stub, costed_spans(), with_logs(), &ctx);
+
+        assert_eq!(envelope.status, Status::Ok, "{envelope:?}");
+        assert_eq!(tree(&envelope).len(), 3);
+        let executed = stub.executed.borrow();
+        assert_eq!(executed.len(), 1);
+        assert_eq!(
+            executed[0].request.sql,
+            "SELECT * FROM (SELECT * FROM logs WHERE \"trace_id\" = \
+             X'00112233445566778899aabbccddeeff') AS ravel_page \
+             ORDER BY \"ts\" ASC, \"observed_ts\" ASC"
         );
+        assert_eq!(
+            executed[0].request.window,
+            ravel_types::TimeRange {
+                start_ns: 7,
+                end_ns: 9
+            }
+        );
+        assert!(executed[0].request.row_window);
+        assert_eq!(record_ids(&envelope), ["l1", "l2", "l3"]);
+
+        let leg = leg(&envelope);
+        assert_eq!(leg.status, LegStatus::Ok);
+        assert_eq!(leg.row_count, 3);
+        assert_eq!(leg.rows_omitted, 0);
+        assert!(!leg.row_cap_hit && !leg.bytes_cap_hit);
+        assert!(envelope.warnings.contains(&LOGS_SCAN_WARNING.to_string()));
+        assert!(!actions(&envelope).contains(&LOGS_STEP));
+
+        let (span_actual, span_estimate) = span_spend();
+        let (leg_actual, leg_estimate) = leg_spend();
+        assert_eq!(leg.budget.actual.0, leg_actual);
+        assert_eq!(leg.budget.estimate.0, leg_estimate);
+        assert!(!leg.budget.estimate_is_upper_envelope);
+        assert_eq!(leg.span_lookup_budget.actual.0, span_actual);
+        assert_eq!(leg.span_lookup_budget.estimate.0, span_estimate);
+        assert!(leg.span_lookup_budget.estimate_is_upper_envelope);
+        assert_eq!(
+            envelope.budget.actual.0,
+            json!({"bytes_scanned": 5100, "store_requests": 8, "segments_read": 4,
+                   "decompressed_bytes": 9200})
+        );
+        assert_eq!(
+            envelope.budget.estimate.0,
+            json!({"bytes_scanned": 6150, "store_requests": 11, "segments_read": 4,
+                   "decompressed_bytes": null, "unbounded": ["decompressed_bytes"]})
+        );
+        assert_eq!(envelope.budget.effective.0, json!({"max_rows": 200}));
+    }
+
+    /// `include_logs: false` serializes to exactly the bytes of a call
+    /// without the argument: no `logs` key, no warning, no leg statement.
+    ///
+    /// FLIP: running the leg whatever `include_logs` says reaches the stub's
+    /// empty `sql` queue, which panics.
+    #[test]
+    fn include_logs_false_leaves_the_envelope_unchanged() {
+        let key = key();
+        let ctx = test_context(&key);
+        let without = call_with(&Stub::default(), costed_spans(), windowed(), &ctx);
+        let stub = Stub::default();
+        let mut args = windowed();
+        args["include_logs"] = json!(false);
+        let with_false = call_with(&stub, costed_spans(), args, &ctx);
+        let bytes = |envelope: &Envelope| serde_json::to_vec(envelope).expect("serializes");
+        assert_eq!(bytes(&with_false), bytes(&without));
+        assert!(stub.executed.borrow().is_empty());
+        assert!(with_false.logs.is_none());
+        assert!(json_of(&with_false).get("logs").is_none());
+        assert!(with_false.budget.estimate_is_upper_envelope);
+        let (span_actual, _) = span_spend();
+        assert_eq!(with_false.budget.actual.0, span_actual);
+    }
+
+    /// A call with the leg claims no upper envelope, and neither does the
+    /// leg; the span lookup's own claim is kept beside them. The same spans
+    /// without the leg keep the claim.
+    #[test]
+    fn a_call_with_the_leg_claims_no_upper_envelope() {
+        let key = key();
+        let ctx = test_context(&key);
+        let stub = Stub::default();
+        stub.sql.borrow_mut().push_back(records(&[("l1", 7)], 4));
+        let with = call_with(&stub, costed_spans(), with_logs(), &ctx);
+        assert!(!with.budget.estimate_is_upper_envelope);
+        assert!(!leg(&with).budget.estimate_is_upper_envelope);
+        assert!(leg(&with).span_lookup_budget.estimate_is_upper_envelope);
+        let without = call_with(&Stub::default(), costed_spans(), windowed(), &ctx);
+        assert!(without.budget.estimate_is_upper_envelope);
+    }
+
+    /// With nothing left of the call's deadline the leg does not start: it
+    /// is `skipped` with its reason, the spans are returned as usual, and
+    /// the call's spend is the span lookup's.
+    #[test]
+    fn a_leg_with_no_time_left_is_skipped() {
+        let key = key();
+        let ctx = test_context(&key);
+        let stub = Stub {
+            time_left: Some(std::time::Duration::ZERO),
+            ..Stub::default()
+        };
+        let envelope = call_with(&stub, costed_spans(), with_logs(), &ctx);
+        assert_eq!(envelope.status, Status::Ok, "{envelope:?}");
+        assert_eq!(tree(&envelope).len(), 3);
+        assert!(stub.executed.borrow().is_empty());
+        let leg = leg(&envelope);
+        assert_eq!(leg.status, LegStatus::Skipped);
+        assert_eq!(leg.skipped_reason.as_deref(), Some(LOGS_SKIPPED_NO_TIME));
+        assert!(leg.failure.is_none());
+        assert!(leg.rows.is_empty() && leg.columns.is_empty());
+        assert!(!envelope.warnings.contains(&LOGS_SCAN_WARNING.to_string()));
+        assert!(!actions(&envelope).contains(&LOGS_STEP));
+        let (span_actual, _) = span_spend();
+        assert_eq!(envelope.budget.actual.0, span_actual);
+    }
+
+    /// A leg the backend fails leaves the spans as they are: the call is
+    /// `ok`, and the leg is `failed` and names its failure class.
+    ///
+    /// FLIP: refusing the call on a leg failure makes it `error`.
+    #[test]
+    fn a_failed_leg_still_returns_the_spans() {
+        let key = key();
+        let ctx = test_context(&key);
+        let stub = Stub::default();
+        *stub.sql_failure.borrow_mut() = Some(Failure {
+            class: FailureClass::BudgetExceeded,
+            message: "query exceeded max_bytes_scanned".to_string(),
+            counter: None,
+        });
+        let envelope = call_with(&stub, costed_spans(), with_logs(), &ctx);
+        assert_eq!(envelope.status, Status::Ok, "{envelope:?}");
+        assert!(envelope.failure.is_none());
+        assert_eq!(
+            tree(&envelope),
+            [
+                ("r".to_string(), json!("0"), "root".to_string()),
+                ("c".to_string(), json!("1"), "present".to_string()),
+                ("g".to_string(), json!("2"), "present".to_string()),
+            ]
+        );
+        assert_eq!(stub.executed.borrow().len(), 1);
+        let leg = leg(&envelope);
+        assert_eq!(leg.status, LegStatus::Failed);
+        let failure = leg.failure.as_ref().expect("a failure");
+        assert_eq!(failure.class, FailureClass::BudgetExceeded);
+        assert_eq!(failure.message, "query exceeded max_bytes_scanned");
+        assert_eq!(
+            json_of(leg)["failure"]["class"],
+            json!("budget_exceeded"),
+            "the class is named in the serialized block"
+        );
+        assert!(leg.rows.is_empty());
+        assert!(envelope.warnings.contains(&LOGS_SCAN_WARNING.to_string()));
+        assert!(!actions(&envelope).contains(&LOGS_STEP));
+    }
+
+    /// A leg over `max_rows` returns the first records, counts the rest in
+    /// `rows_omitted`, mints no cursor, and points at `ravel_search_logs`
+    /// with the trace id and the window.
+    #[test]
+    fn a_row_capped_leg_points_at_search_logs() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_rows = 3;
+        let stub = Stub::default();
+        stub.sql.borrow_mut().push_back(records(
+            &[("l1", 7), ("l2", 8), ("l3", 9), ("l4", 10), ("l5", 11)],
+            4,
+        ));
+        let envelope = call_with(&stub, costed_spans(), with_logs(), &ctx);
+        assert_eq!(envelope.status, Status::Ok, "{envelope:?}");
+        assert_eq!(tree(&envelope).len(), 3);
+        assert!(envelope.presentation.cursor.is_none());
+        let leg = leg(&envelope);
+        assert_eq!(leg.status, LegStatus::OkBounded);
+        assert_eq!(record_ids(&envelope), ["l1", "l2", "l3"]);
+        assert!(leg.row_cap_hit);
+        assert_eq!(leg.rows_omitted, 2);
+        assert_eq!(leg.row_count, 5);
+        assert!(json_of(leg).get("cursor").is_none());
+        assert_eq!(
+            steps(&envelope),
+            [(
+                LOGS_STEP,
+                "the trace's log records were capped and this leg has no cursor; page \
+                 through them with ravel_search_logs, trace_id \
+                 00112233445566778899aabbccddeeff, time_range start_ns 7 end_ns 9"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// Records that do not fit beside the spans are dropped from the end:
+    /// every span is kept, the leg reports the records it lost, and the
+    /// final envelope is inside `max_response_bytes`.
+    #[test]
+    fn a_byte_capped_leg_keeps_the_envelope_inside_the_cap() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
+        let stub = Stub::default();
+        let ids: Vec<String> = (0..20).map(|i| format!("l{i:02}")).collect();
+        let rows: Vec<(&str, u8)> = ids.iter().map(|id| (id.as_str(), 8)).collect();
+        stub.sql.borrow_mut().push_back(records(&rows, 10_000));
+        let mut port = costed_spans();
+        for row in &mut port.data.rows {
+            row[3] = Cell::Str("n".repeat(40_000));
+        }
+        let envelope = call_with(&stub, port, with_logs(), &ctx);
+
+        let len = serialized_len(&envelope);
+        assert!(len <= MAX_RESPONSE_BYTES_FLOOR as usize, "{len}");
+        assert_eq!(envelope.status, Status::Ok, "{envelope:?}");
+        assert_eq!(tree(&envelope).len(), 3, "every span is kept");
+        assert!(!envelope.presentation.bytes_cap_hit);
+        let leg = leg(&envelope);
+        let kept = leg.rows.len();
+        assert_eq!(kept, 13, "the records that fit beside the spans");
+        let expected: Vec<String> = ids[..kept].to_vec();
+        assert_eq!(record_ids(&envelope), expected);
+        assert_eq!(leg.status, LegStatus::OkBounded);
+        assert!(leg.bytes_cap_hit);
+        assert_eq!(leg.rows_omitted, (20 - kept) as u64);
+        assert_eq!(actions(&envelope), [LOGS_STEP]);
+    }
+
+    /// An all-zero `parent_span_id`, OTLP's spelling of no parent, is a root
+    /// like a null one.
+    ///
+    /// FLIP: resolving it as a real id leaves `a` with an absent parent,
+    /// `missing` in this complete result.
+    #[test]
+    fn an_all_zero_parent_is_a_root() {
+        let key = key();
+        let ctx = test_context(&key);
+        let port = spans(&[
+            ("a", Some("0000000000000000"), "root"),
+            ("b", Some("a"), "child"),
+        ]);
+        let envelope = call(port, untimed(), &ctx);
+        assert_eq!(
+            tree(&envelope),
+            [
+                ("a".to_string(), json!("0"), "root".to_string()),
+                ("b".to_string(), json!("1"), "present".to_string()),
+            ]
+        );
+        assert!(!is_zero_id(""));
+        assert!(!is_zero_id("0000000000000001"));
+        assert!(is_zero_id("00000000000000000000000000000000"));
     }
 
     #[test]
     fn an_omitted_time_range_is_the_no_window_lookup() {
         let request = request(json!({"trace_id": "00112233445566778899AABBCCDDEEFF"}))
             .expect("valid arguments");
-        assert_eq!(request.window, None);
-        assert_eq!(request.trace_id[0], 0x00);
-        assert_eq!(request.trace_id[10], 0xaa);
-        assert_eq!(request.trace_id[15], 0xff);
+        assert_eq!(request.lookup.window, None);
+        assert_eq!(request.lookup.trace_id[0], 0x00);
+        assert_eq!(request.lookup.trace_id[10], 0xaa);
+        assert_eq!(request.lookup.trace_id[15], 0xff);
+        assert!(request.logs.is_none());
     }
 
     #[test]
@@ -934,7 +1662,7 @@ mod tests {
         }))
         .expect("valid arguments");
         assert_eq!(
-            request.window,
+            request.lookup.window,
             Some(ravel_types::TimeRange {
                 start_ns: 7,
                 end_ns: 9
@@ -955,7 +1683,7 @@ mod tests {
         }))
         .expect("valid arguments");
         assert_eq!(
-            request.window,
+            request.lookup.window,
             Some(ravel_types::TimeRange {
                 start_ns: 1_789_207_200_000_000_000,
                 end_ns: 1_789_207_200_500_000_000,
@@ -995,7 +1723,7 @@ mod tests {
                     "trace_id": "00112233445566778899aabbccddeeff",
                     "include_logs": true,
                 }),
-                FailureClass::Unsupported,
+                FailureClass::MissingArgument,
             ),
             (
                 json!({
