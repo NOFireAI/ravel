@@ -677,7 +677,9 @@ async fn compute_plan_counts(
         refuse_unreadable_version(seg)?;
         // ADR-3692 decision 4: a segment the leaves prune is never opened,
         // whatever its size, and one they answer with a block set needs no
-        // KEY_IDX read. Only an uncovered segment takes the tier-1 routes.
+        // KEY_IDX read. Only an uncovered segment, and every segment of a
+        // scan built without parts (Flight SQL's pinned path, a worker slice,
+        // EXPLAIN, a refused parts charge), takes the tier-1 routes below.
         let blocks = match &routes[idx] {
             Some(SegmentRoute::Pruned) => {
                 key_index.segments_pruned += 1;
