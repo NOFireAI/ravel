@@ -107,11 +107,12 @@
 //! ([`expression_is_non_null`]), with no schema involved: a literal is NON
 //! NULL wherever it is selected from, and so is `count(...)`, which is 0
 //! over no rows. `count` is the one function that proof admits, and an
-//! aggregate reaches it only through the next section. A `min`, `max` or
-//! `sum` is answered by [`aggregate_proof`] instead: under a plain `GROUP BY`
-//! every group holds at least one row, so the extreme or the sum of a NOT
-//! NULL column of the target table is never NULL. An extreme's type is the
-//! column's; an integer sum's is `Int64` or `UInt64`.
+//! aggregate reaches it only through the next section. A `min`, `max`, `sum`
+//! or `avg` is answered by [`aggregate_proof`] instead: under a plain `GROUP
+//! BY` every group holds at least one row, so the extreme, the sum or the mean
+//! of a NOT NULL column of the target table is never NULL. An extreme's type
+//! is the column's; an integer sum's is `Int64` or `UInt64`; an integer
+//! avg's is `Float64`.
 //!
 //! # A term computed from other rows has a position only over fixed segments
 //!
@@ -129,7 +130,7 @@
 //! proven: by [`expression_is_non_null`], which for an aggregate means
 //! `count(...)`, and only when no window inside it counts over a `ROWS`
 //! frame or a named window ([`calls_a_positional_window`]); or, for a `min`,
-//! `max` or `sum` call, by [`aggregate_proof`]. That proof needs a plain `GROUP
+//! `max`, `sum` or `avg` call, by [`aggregate_proof`]. That proof needs a plain `GROUP
 //! BY` with at least one key (no `ROLLUP`, `CUBE`, `GROUPING SETS`, `WITH
 //! TOTALS` or `GROUP BY ALL`, and not an ungrouped aggregate, any of which
 //! can produce a group over no rows), no `FILTER`, `OVER`, `WITHIN GROUP`,
@@ -140,7 +141,7 @@
 //! NOT NULL column, and a column type on the allowlist: for `min` and `max`
 //! the signed and unsigned integers, `Utf8`, `LargeUtf8` and nanosecond
 //! `Timestamp` with no zone; for `sum` the signed and unsigned integers
-//! only. Its plan sets
+//! only; for `avg` `Int8` to `Int64` and `UInt8` to `UInt32`. Its plan sets
 //! [`PagePlan::order_from_other_rows`], and the paging tool then serves a
 //! later page only over the segment set page one resolved, which it pins in
 //! the cursor (ADR-1374, pinned segment set amendment): over the same
@@ -153,13 +154,19 @@
 //! overflows is an error, not a value: the page that computes it fails, and
 //! no page is served in a wrapped order. A float `sum` is refused at the
 //! argument's type, because the engine merges partial sums in the order its
-//! partitions finish, so its last bits are not a fixed position. Every other
-//! such term (a float `sum`, `avg`, a `min`, `max` or `sum` the proof does
-//! not reach, any other window function, a subquery) is
+//! partitions finish, so its last bits are not a fixed position. An integer
+//! `avg` is the session's `crate::avg`: over `Int8` to `Int64` and `UInt8` to
+//! `UInt32` it adds the group in `i128` and divides once, so its `Float64` is
+//! the same at any partition count, finite, and never `-0.0`, and it plans
+//! with [`ResumeKind::FiniteFloat`]. An `avg` over `UInt64` or a float column
+//! is a sequential `f64` fold whose partial sums merge in partition finish
+//! order, and is refused at the argument's type. Every other such term (a
+//! float `sum` or `avg`, a `UInt64` `avg`, a `min`, `max`, `sum` or `avg` the
+//! proof does not reach, any other window function, a subquery) is
 //! [`PagePlanError::OrderTermFromOtherRows`], which the paging
 //! tool answers by running the statement as written, with no cursor, the way
-//! it answers [`PagePlanError::NoOrdering`]. A `count`, `min`, `max` or `sum`
-//! written in the `ORDER BY` rather than named there plans as the one output
+//! it answers [`PagePlanError::NoOrdering`]. A `count`, `min`, `max`, `sum` or
+//! `avg` written in the `ORDER BY` rather than named there plans as the one output
 //! column the projection defines as that same expression, and is that
 //! refusal when there is none.
 //!
@@ -186,7 +193,9 @@
 //! DESC` it dies on the first, and every row it had not reached appears on no
 //! page. Carrying NaN in a cursor instead of refusing the term needs a literal
 //! DataFusion parses back to the same bit pattern; until that exists, every
-//! float term is refused, and `samples.value` is the one reachable case.
+//! float column is refused, and `samples.value` is the one reachable case.
+//! The one float term that plans is an integer `avg`, which is never NaN or
+//! infinite (above).
 //!
 //! Comparison is a problem too, at the zeros. DataFusion SORTS floats by a
 //! total order, `-0.0` before `0.0`, but its comparison operators normalise a
@@ -198,12 +207,13 @@
 //! `atan2(c, -1.0)`, which is π for `0.0` and -π for `-0.0`. NaN is not
 //! normalised: `NaN = NaN` is TRUE, and a negative NaN sorts first and
 //! compares below zero while a positive one sorts last and compares above it;
-//! a NaN boundary is refused, as above. Because float terms are refused, no
-//! cursor minted from a page's own rows carries a float, and [`plan_page`]
-//! refuses a float in a caller's resume tuple
-//! ([`PagePlanError::ResumeValueTypeMismatch`]): every position of the tuple
-//! is checked against the kind its term's type was proven to take, before
-//! the predicate is written. The zero handling stays in [`keyset_predicate`],
+//! a NaN boundary is refused, as above. Only an integer `avg` term mints a
+//! float cursor, and that float is never `-0.0`. [`plan_page`] refuses a float
+//! in a caller's resume tuple at any other term, and a non-finite one at an
+//! `avg` term ([`PagePlanError::ResumeValueTypeMismatch`]): every position of
+//! the tuple is checked against the kind its term's type was proven to take,
+//! before the predicate is written. A caller's `-0.0` at an `avg` term is
+//! admitted and compared through the zero handling in [`keyset_predicate`],
 //! which writes whatever tuple it is given.
 //!
 //! # Every clause of the body is read, or discarded by name
@@ -600,8 +610,8 @@ pub enum PagePlanError {
     /// An `ORDER BY` term whose value is computed from rows other than its
     /// own (an aggregate, a window function, or a subquery, anywhere in the
     /// expression the term names or is) and that is not proven NON NULL:
-    /// anything but `count(...)` and a `min`, `max` or integer `sum` that
-    /// `aggregate_proof` proves, and a `count` over a `ROWS` frame or a
+    /// anything but `count(...)` and a `min`, `max`, integer `sum` or integer
+    /// `avg` that `aggregate_proof` proves, and a `count` over a `ROWS` frame or a
     /// named window.
     ///
     /// Not a refusal of the statement, and the paging tool does not answer it
@@ -746,8 +756,9 @@ impl ResumeValue {
 /// The [`ResumeValue`] variant that carries every value of a proven order
 /// term, as [`cursor_support`] and [`expression_cursor_support`] prove it.
 ///
-/// There is no float kind: no float term is proven, so a
-/// [`ResumeValue::Float`] matches no term.
+/// No column type plans as a float kind: a float column admits NaN and the
+/// infinities. [`ResumeKind::FiniteFloat`] is reached only through
+/// [`aggregate_proof`], for an `avg` over an exact integer column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResumeKind {
     Int,
@@ -758,6 +769,9 @@ pub(crate) enum ResumeKind {
     Binary,
     /// With the column's byte width, which the value's length must equal.
     FixedSizeBinary(i32),
+    /// A finite [`ResumeValue::Float`]: the `Float64` of an `avg` over an
+    /// exact integer column, which is never NaN or infinite.
+    FiniteFloat,
 }
 
 impl ResumeKind {
@@ -773,12 +787,14 @@ impl ResumeKind {
             (ResumeKind::FixedSizeBinary(width), ResumeValue::FixedSizeBinary(bytes)) => {
                 i32::try_from(bytes.len()).is_ok_and(|len| len == width)
             }
+            (ResumeKind::FiniteFloat, ResumeValue::Float(v)) => v.is_finite(),
             _ => false,
         }
     }
 
     /// This kind as [`PagePlanError::ResumeValueTypeMismatch`] names it, in
-    /// the same spelling as [`ResumeValue::variant_label`].
+    /// the same spelling as [`ResumeValue::variant_label`], except
+    /// `FiniteFloat`, which only a finite `Float` matches.
     fn label(self) -> String {
         match self {
             ResumeKind::Int => "Int".to_string(),
@@ -788,6 +804,7 @@ impl ResumeKind {
             ResumeKind::TimestampNanos => "TimestampNanos".to_string(),
             ResumeKind::Binary => "Binary".to_string(),
             ResumeKind::FixedSizeBinary(width) => format!("FixedSizeBinary({width})"),
+            ResumeKind::FiniteFloat => "FiniteFloat".to_string(),
         }
     }
 }
@@ -849,7 +866,8 @@ pub struct PagePlan {
     /// Why [`Self::order_by`] is not a total order, or `None` when it is.
     pub not_total: Option<NotTotalOrder>,
     /// Whether one of the statement's own order terms is computed from other
-    /// rows (a `count`, `min` or `max`, the such terms that plan): its value
+    /// rows (a `count`, `min`, `max`, integer `sum` or integer `avg`, the such
+    /// terms that plan): its value
     /// moves when a row lands in the segments the walk reads, so a later page
     /// is exact only over the segment set page one resolved (ADR-1374, pinned
     /// segment set amendment). A tiebreak column never sets it.
@@ -1824,6 +1842,10 @@ mod unproven {
          partitions finish, so two runs over the same segments can differ in the last bits";
     pub(super) const AGGREGATE_SUM_ARGUMENT_TYPE: &str =
         "the aggregate's argument is not an integer or float column";
+    pub(super) const AGGREGATE_AVG_FLOAT: &str = "an avg over a float column merges partial sums in the order the engine's \
+         partitions finish, so two runs over the same segments can differ in the last bits";
+    pub(super) const AGGREGATE_AVG_UINT64: &str = "an avg over a UInt64 column is a Float64 fold, not an exact integer sum, so \
+         two runs over the same segments can differ in the last bits";
 }
 
 /// Whether the `GROUP BY` can emit a row where a grouping column is NULL even
@@ -2065,10 +2087,11 @@ fn negated_number_cursor_support(text: &str) -> CursorSupport {
 /// consulted and no basis required: a literal is NON NULL whatever relation it
 /// is selected from, including under an outer join or a `ROLLUP`, because it
 /// is not a grouping column that a super-aggregate row can null, and the same
-/// holds for `count`. A `min`, `max` or `sum` call is the exception that
-/// needs both, and is answered by [`aggregate_proof`] instead. An expression
-/// computed from other rows arrives here only when [`statement_order_terms`]
-/// admitted it, which is a `count`, a `min`, a `max` or an integer `sum`.
+/// holds for `count`. A `min`, `max`, `sum` or `avg` call is the exception
+/// that needs both, and is answered by [`aggregate_proof`] instead. An
+/// expression computed from other rows arrives here only when
+/// [`statement_order_terms`] admitted it, which is a `count`, a `min`, a
+/// `max`, an integer `sum` or an integer `avg`.
 fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
     let (table, source) = match names.resolve(column) {
         Provenance::BaseColumn { table, column } => (table, column),
@@ -2130,10 +2153,12 @@ enum ProvenAggregate {
     Extreme,
     /// `sum`.
     Sum,
+    /// `avg`.
+    Avg,
 }
 
-/// The call and which aggregate it is, when `expr` is a call of `min`, `max`
-/// or `sum` under a one-part name in any case. Parentheses and other
+/// The call and which aggregate it is, when `expr` is a call of `min`, `max`,
+/// `sum` or `avg` under a one-part name in any case. Parentheses and other
 /// wrappers are not looked through.
 fn proven_aggregate_call(expr: &SqlExpr) -> Option<(ProvenAggregate, &Function)> {
     let SqlExpr::Function(function) = expr else {
@@ -2148,12 +2173,14 @@ fn proven_aggregate_call(expr: &SqlExpr) -> Option<(ProvenAggregate, &Function)>
         Some((ProvenAggregate::Extreme, function))
     } else if name.eq_ignore_ascii_case("sum") {
         Some((ProvenAggregate::Sum, function))
+    } else if name.eq_ignore_ascii_case("avg") {
+        Some((ProvenAggregate::Avg, function))
     } else {
         None
     }
 }
 
-/// The resume kind of a `min`, `max` or `sum` order term, when the text
+/// The resume kind of a `min`, `max`, `sum` or `avg` order term, when the text
 /// proves it NON NULL and of a type a resume value carries exactly, or the
 /// reason it is not proven.
 ///
@@ -2177,6 +2204,18 @@ fn proven_aggregate_call(expr: &SqlExpr) -> Option<(ProvenAggregate, &Function)>
 /// and an unsigned one [`ResumeKind::UInt`]. Over a float column the engine
 /// merges partial sums in the order its partitions finish, so the value is
 /// not a fixed position, and the term is refused.
+///
+/// An `avg` passes the same NON NULL proof too. Over `Int8` to `Int64` and
+/// `UInt8` to `UInt32` the session's `avg` (`crate::avg`) adds the group's
+/// values exactly in `i128`, counts them, and divides once, converting the sum
+/// to `f64` and dividing it by the count: the value depends only on the
+/// group's values, so it is the same at any partition count. It is finite (the
+/// count is at least one and the sum is an integer), and never `-0.0`: a zero
+/// sum converts to `+0.0`, and a sum of magnitude at least 1 over a count of
+/// at most `i64::MAX` is nowhere near the subnormal range. It plans with
+/// [`ResumeKind::FiniteFloat`]. Over `UInt64` and over a float column the
+/// session's `avg` is a sequential `f64` fold whose partial sums merge in the
+/// order the engine's partitions finish, so the term is refused.
 fn aggregate_proof(
     aggregate: ProvenAggregate,
     function: &Function,
@@ -2207,6 +2246,20 @@ fn aggregate_proof(
             }
             _ => Err(unproven::AGGREGATE_SUM_ARGUMENT_TYPE),
         },
+        ProvenAggregate::Avg => match field.data_type() {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32 => Ok(ResumeKind::FiniteFloat),
+            DataType::UInt64 => Err(unproven::AGGREGATE_AVG_UINT64),
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                Err(unproven::AGGREGATE_AVG_FLOAT)
+            }
+            _ => Err(unproven::AGGREGATE_SUM_ARGUMENT_TYPE),
+        },
     }
 }
 
@@ -2226,7 +2279,7 @@ fn aggregate_proof(
 ///
 /// `count` is the one function admitted here. Every other aggregate is NULL
 /// over an empty input, and no other function's nullability is read here; a
-/// `min`, `max` or `sum` is answered by [`aggregate_proof`] instead, which
+/// `min`, `max`, `sum` or `avg` is answered by [`aggregate_proof`] instead, which
 /// reads the grouping and the schema this function does not.
 ///
 /// Anything else answers `false`, which is a refusal rather than a plan. A
@@ -2317,8 +2370,8 @@ fn calls_a_positional_window(expr: &SqlExpr) -> bool {
 /// qualified or quoted spelling is caught too. Reading too wide here is safe:
 /// a term this answers true for runs once with no cursor unless it is proven,
 /// and only two proofs admit one, each paging under the Required segment-set
-/// pin: a `count`, by [`expression_is_non_null`], and a `min`, `max` or
-/// integer `sum`, by [`aggregate_proof`]. Each of those is an
+/// pin: a `count`, by [`expression_is_non_null`], and a `min`, `max`,
+/// integer `sum` or integer `avg`, by [`aggregate_proof`]. Each of those is an
 /// aggregate whichever way its name is read.
 fn depends_on_other_rows(expr: &SqlExpr) -> bool {
     struct OtherRows;
@@ -2510,7 +2563,7 @@ fn shape_of<'a>(query: &'a Query) -> Option<SelectShape<'a>> {
 /// A term computed from other rows is looked for across every term before any
 /// other term is read, whether it is written in the `ORDER BY` or names an
 /// output column defined by one. One that is not proven (by
-/// [`aggregate_proof`] for a `min`, `max` or `sum` call, by
+/// [`aggregate_proof`] for a `min`, `max`, `sum` or `avg` call, by
 /// [`expression_is_non_null`] otherwise), or that calls a window function
 /// over a `ROWS` frame or a named window ([`calls_a_positional_window`]), is
 /// [`PagePlanError::OrderTermFromOtherRows`]: such a statement runs as written
@@ -3484,8 +3537,8 @@ mod tests {
             fixed.statement
         );
 
-        // No float term is proven, so `plan_page` refuses a NaN by its type
-        // before rendering it; rendering one is refused on its own.
+        // `severity_text` is not a float term, so `plan_page` refuses a NaN by
+        // its type before rendering it; rendering one is refused on its own.
         let nan = ResumePosition::new(vec![
             ResumeValue::Float(f64::NAN),
             ResumeValue::TimestampNanos(1),
@@ -3518,10 +3571,9 @@ mod tests {
     /// `Bool` and `Binary` describe declared attribute columns, and `UInt`
     /// beyond `alerts.writer_seq` likewise: a declared column is nullable, so
     /// [`PagePlanError::OrderTermNullable`] refuses an ordering on one and no
-    /// page statement can carry the literal. `Float` is now in the same
-    /// position for a different reason:
-    /// [`PagePlanError::OrderTermNotRepresentable`] refuses every float
-    /// order term, so no page statement renders one either. The literal is
+    /// page statement can carry the literal. `Float` reaches a page statement
+    /// only at an integer `avg` term, which is never `-0.0`, so the negative
+    /// zero is pinned here too. The literal is
     /// still this module's contract with whatever mints a cursor and with
     /// [`render_statement`], which writes whatever tuple it is given, so it is
     /// pinned here rather than left unasserted.
@@ -5394,6 +5446,133 @@ mod tests {
             plan_page(sql, None),
             Err(PagePlanError::OrderTermFromOtherRows {
                 term: "sum(value)".to_string()
+            }),
+        );
+    }
+
+    /// An `avg` over an exact integer column pages under the same proof as
+    /// `sum`, with the `FiniteFloat` kind: `duration_ns` (`Int64`),
+    /// `status_code` and `severity_num` (`UInt8`) and `flags` (`UInt32`) plan,
+    /// as does `DISTINCT` and the call written in the ORDER BY. An `avg` over
+    /// a float column (`value`) and over a `UInt64` column (`writer_seq`)
+    /// stays unpaged, each with its own reason, and a non-numeric argument
+    /// keeps the argument-type reason.
+    ///
+    /// A resume position at an `avg` term must carry a finite `Float`: a zero
+    /// is admitted and compared as `0.0`, while NaN, an infinity and an `Int`
+    /// are refused before any statement is written.
+    ///
+    /// FLIP: the `Avg` arm admitting `Float64` as `FiniteFloat` plans
+    /// `avg(value)` and fails the float refusal.
+    /// FLIP: the `Avg` arm admitting `UInt64` as `FiniteFloat` plans
+    /// `avg(writer_seq)` and fails the `UInt64` refusal.
+    #[test]
+    fn avg_over_an_integer_column_plans_as_a_finite_float() {
+        let admitted = [
+            "SELECT name, avg(duration_ns) AS m FROM spans GROUP BY name ORDER BY m DESC",
+            "SELECT name, avg(status_code) AS m FROM spans GROUP BY name ORDER BY m",
+            "SELECT severity_text, avg(severity_num) AS m FROM logs GROUP BY severity_text \
+             ORDER BY m",
+            "SELECT severity_text, avg(flags) AS m FROM logs GROUP BY severity_text ORDER BY m",
+            "SELECT name, AVG(DISTINCT duration_ns) AS m FROM spans GROUP BY name ORDER BY m",
+            // Written in the ORDER BY rather than named there, the term is
+            // the one output column defined as the call.
+            "SELECT name, avg(duration_ns) AS m FROM spans GROUP BY name \
+             ORDER BY avg(duration_ns)",
+        ];
+        for sql in admitted {
+            let plan = plan_page(sql, None).unwrap_or_else(|e| panic!("{sql:?}: {e}"));
+            assert!(plan.order_from_other_rows, "flag for {sql:?}");
+            assert_eq!(
+                plan.order_by
+                    .iter()
+                    .map(|term| term.column.as_str())
+                    .collect::<Vec<_>>(),
+                ["m"],
+                "order for {sql:?}"
+            );
+            assert_eq!(
+                plan.resume_kinds,
+                [ResumeKind::FiniteFloat],
+                "kinds for {sql:?}"
+            );
+            assert_eq!(
+                min_or_max_proof(sql, "m"),
+                Ok(ResumeKind::FiniteFloat),
+                "proof for {sql:?}"
+            );
+        }
+
+        let sql = "SELECT name, avg(duration_ns) AS m FROM spans GROUP BY name ORDER BY m";
+        let resumed = |value: ResumeValue| plan_page(sql, Some(&ResumePosition::new(vec![value])));
+        let page = |predicate: &str| {
+            format!(
+                "SELECT * FROM (SELECT name, avg(duration_ns) AS m FROM spans GROUP BY name) \
+                 AS ravel_page WHERE ({predicate}) ORDER BY \"m\" ASC"
+            )
+        };
+        assert_eq!(
+            resumed(ResumeValue::Float(-2.5))
+                .expect("planned")
+                .statement,
+            page("(\"m\" > -2.5)"),
+        );
+        assert_eq!(
+            resumed(ResumeValue::Float(0.0)).expect("planned").statement,
+            page("(\"m\" > 0.0)"),
+        );
+        for (value, found) in [
+            (ResumeValue::Float(f64::NAN), "Float"),
+            (ResumeValue::Float(f64::INFINITY), "Float"),
+            (ResumeValue::Float(f64::NEG_INFINITY), "Float"),
+            (ResumeValue::Int(-2), "Int"),
+        ] {
+            assert_eq!(
+                resumed(value),
+                Err(PagePlanError::ResumeValueTypeMismatch {
+                    position: 1,
+                    column: "m".to_string(),
+                    expected: "FiniteFloat".to_string(),
+                    found: found.to_string(),
+                }),
+            );
+        }
+
+        let refused: Vec<(&str, &'static str)> = vec![
+            (
+                "SELECT series_id, avg(value) AS m FROM samples GROUP BY series_id ORDER BY m",
+                unproven::AGGREGATE_AVG_FLOAT,
+            ),
+            (
+                "SELECT writer_id, avg(writer_seq) AS m FROM alerts GROUP BY writer_id ORDER BY m",
+                unproven::AGGREGATE_AVG_UINT64,
+            ),
+            (
+                "SELECT series_id, avg(ts) AS m FROM samples GROUP BY series_id ORDER BY m",
+                unproven::AGGREGATE_SUM_ARGUMENT_TYPE,
+            ),
+            (
+                "SELECT avg(duration_ns) AS m FROM spans ORDER BY m",
+                unproven::AGGREGATE_UNGROUPED,
+            ),
+        ];
+        for (sql, reason) in refused {
+            assert_eq!(min_or_max_proof(sql, "m"), Err(reason), "proof for {sql:?}");
+            assert_eq!(
+                plan_page(sql, None),
+                Err(PagePlanError::OrderTermFromOtherRows {
+                    term: "m".to_string()
+                }),
+                "plan for {sql:?}"
+            );
+        }
+
+        // `mean` is the same UDAF under another name, and is not admitted.
+        let sql = "SELECT name, mean(duration_ns) AS m FROM spans GROUP BY name ORDER BY m";
+        assert_eq!(
+            plan_page(sql, None),
+            Err(PagePlanError::OrderTermFromOtherRows {
+                term: "m".to_string()
             }),
         );
     }
