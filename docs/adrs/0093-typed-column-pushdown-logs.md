@@ -533,9 +533,16 @@ every row when all of these hold:
 4. **Nothing downstream assumes the scan is unfiltered.** The statistics gates (decision 4), the
    metadata rewrite gate, and the fetch count all see the channel.
    - `logs_scan_residual` drops every conjunct that `filter_is_exact` accepts
-     (`crates/ravel-sql/src/metadata_agg.rs:474-484`).
-   - So the SUM/AVG and q08 shapes are admitted logically with an empty residual, and only the
-     physical gate refuses them.
+     (`crates/ravel-sql/src/metadata_agg.rs:474-484`). It keeps the Str `<>` conjunct in its
+     output even though the provider reports it `Exact`, because the logical check exists to
+     predict what the metadata rewrite answers, and the rewrite refuses a scan with
+     `row_filters`.
+   - So `logical_aggregate_answerable` still sees the conjunct, the q31 shape (a `GROUP BY`
+     with `WHERE "SearchPhrase" <> ''`) and `SUM(n) WHERE s <> ''` still skip
+     `load_column_stats` as they do today, and the physical gate (decision 4) stays the
+     backstop rather than the first refusal. Without this, those shapes would pay a column
+     statistics load, plus the group key's dictionary, that the rewrite then refuses
+     (`crates/ravel-sql/src/executor.rs:4928-4960`, `:7083-7098`).
 5. **DataFusion deletes only what was reported `Exact`.** A compound conjunct that is recognized
    only in part stays `Inexact`, as today (`partially_recognized_compound_filters_are_inexact`,
    `logs_provider.rs:2629`).
@@ -602,11 +609,14 @@ lanes.
      between the two pull requests reads the conjunct's per-row cost twice and is not a
      regression signal.
 2. **The provider reports the conjunct `Exact`, and DataFusion deletes the filter.**
-   - `leaf_is_exact` recognizes the decision 1 shape.
+   - `leaf_is_exact` recognizes the decision 1 shape, and `logs_scan_residual` keeps that shape
+     in its output (exactness argument, point 4), so the logical admission check still refuses
+     what the rewrite refuses.
    - The same commit updates the prose that states the old rule:
      - docs/query-engine.md:164-186 and :4874-4884;
      - the `supports_filters_pushdown` doc (`logs_provider.rs:418-443`);
-     - the `logs_pushdown` module doc (`:1-8`);
+     - the `logs_pushdown` module doc (`:1-8`) and the `filter_is_exact` doc
+       (`logs_pushdown.rs:296-310`), which says only the reader-verified shapes qualify;
      - the scan's correctness doc (`logs_scan/mod.rs:318-323`).
    - Tests T1, T3 (SQL), T4, T5 (SQL), T6 and T9.
    - `str_typed_column_declines_and_keeps_the_scan`
@@ -691,6 +701,12 @@ before the pull request merges.
       sum;
     - (b) the gate added to `stats_are_exact` only, leaving the metadata rewrite exact, so the
       SUM is answered from the stored sum while COUNT, MIN and MAX are right.
+  - Through the ordinary executor path (no statistics forced), the q31 shape and
+    `SUM(n) WHERE s <> ''` load no column statistics: the statistics object's GET count and
+    the group key's dictionary loads are both 0.
+  - Wrong implementation (c): `logs_scan_residual` drops the Str `<>` conjunct with the other
+    `Exact` ones, so `logical_aggregate_answerable` admits both shapes and each pays the
+    statistics load before the physical gate refuses it.
 - **T5, fetch.**
   - Run `SELECT s FROM logs WHERE s <> '' LIMIT 5` on one partition whose first block starts
     with ten `''` rows. It must return exactly five non-empty rows.
