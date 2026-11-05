@@ -612,7 +612,7 @@ lanes.
    - `str_typed_column_declines_and_keeps_the_scan`
      (`crates/ravel-sql/tests/logs_metadata_agg.rs:733`) keeps passing for another reason once the
      conjunct is `Exact`: with no `FilterExec`, `rewrite` declines at its missing-filter check
-     (`crates/ravel-sql/src/metadata_agg.rs:679-681`) before it reaches the `DeclaredType::Str`
+     (`crates/ravel-sql/src/metadata_agg.rs:675-677`) before it reaches the `DeclaredType::Str`
      gate (`logs_scan/mod.rs:2454`). This PR rewrites its comment, adds an answer assertion, and
      keeps a direct pin of the Str gate: a case whose filter is not the exact shape, or a
      unit-level call.
@@ -744,7 +744,7 @@ is a miss. The rows come from two runs:
 
 | Figure | Band | Miss | Basis |
 |---|---|---|---|
-| Dictionary merge removed: `merge_dictionary_values` plus `concat_dictionaries` inclusive, hot-wall weighted, A minus B, over q11-q15 and q25-q29 | at least 0.301 s (50% of 0.602 s; the reachable ceiling is 0.596 s, since q23 and q40 keep their FilterExec) | below 0.301 s | predicted; #3231 comment 6655737907 |
+| Dictionary merge removed: `merge_dictionary_values` plus `concat_dictionaries` inclusive, hot-wall weighted, A minus B, over q11-q15 and q25-q29 | 0.301 to 0.602 s (50 to 100% of 0.602 s; the reachable ceiling is 0.596 s, since q23 and q40 keep their FilterExec) | outside 0.301 to 0.602 s | predicted; #3231 comment 6655737907 |
 | Hot-sum saving, A minus B | 0.18 to 0.36 s | outside 0.18 to 0.36 s | predicted; #3231 comment 6655737907 |
 | 43-statement hot geomean ratio | 0.984 to 0.992 | outside 0.984 to 0.992 | predicted; #3231 comment 6655737907 |
 | `FilterExec` in B's plan | absent on q11-q15, q25-q29, q31, q32; present on q22, q23, q37-q43 | any other placement | predicted; research.md item 4 table, from `queries.sql` at 637aaa80a |
