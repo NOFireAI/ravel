@@ -64,6 +64,8 @@ mod flight_erasure;
 mod flight_tenancy;
 #[path = "group_by_null_dictionary_entry.rs"]
 mod group_by_null_dictionary_entry;
+#[path = "integer_sum_overflow.rs"]
+mod integer_sum_overflow;
 #[path = "io_shape_accounting.rs"]
 mod io_shape_accounting;
 #[path = "labels_dict_compaction.rs"]
