@@ -106,6 +106,16 @@
 //! used only where exact-bit comparison is not portably possible: ungrouped
 //! `sum` over values that are not exactly representable, and the bits of a
 //! NaN result of `avg` and of grouped `sum`.
+//!
+//! # Integer sum
+//!
+//! An integer `sum` is exact or it fails (issue #3838): its oracle is the
+//! exact `i128` total of the multiset, which is the result when it fits the
+//! result type (`Int64` or `UInt64`) and `SqlError::IntegerSumOverflow` when
+//! it does not, at any partition count and in any row order. The `samples`
+//! table has no integer value column, so this gate registers an in-memory
+//! table beside it on the session `build_session` returns, which is the
+//! session whose `sum` the SQL path runs.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -113,8 +123,21 @@ mod util;
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use datafusion::arrow::array::{Array, ArrayRef, Int64Array, UInt64Array};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::datasource::MemTable;
+use datafusion::error::DataFusionError;
+use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+use datafusion::prelude::SessionContext;
 use proptest::prelude::*;
+use ravel_query::{EngineConfig, PhaseAccounting, SegmentFetcher};
+use ravel_sql::{
+    RavelTableProvider, SessionPrincipal, SessionTable, SpillDecision, SqlConfig, SqlError,
+    build_session,
+};
 use ravel_types::TenantId;
 use util::gate::{
     Cell, Pred, Query, Row, Shape, ValuePool, actual_rows, arb_dataset, arb_pred,
@@ -927,4 +950,299 @@ async fn golden_multi_segment_overlap_and_duplicate_ts() {
         },
     ];
     assert_all(&fixture, &tenant, &queries).await;
+}
+
+// ---------------------------------------------------------------------------
+// Integer sum: exact or the overflow error
+// ---------------------------------------------------------------------------
+
+/// One `ints` row: a group key and one value per integer result type.
+type IntRow = (i64, Option<i64>, Option<u64>);
+
+/// Values at and near both limits of `Int64`, beside small ones, so a draw
+/// regularly overflows, regularly cancels back into range, and regularly
+/// passes a partial outside the range on the way to a total inside it.
+fn limit_i64() -> BoxedStrategy<i64> {
+    prop_oneof![
+        Just(i64::MAX),
+        Just(i64::MAX - 1),
+        Just(i64::MIN),
+        Just(i64::MIN + 1),
+        Just(i64::MAX / 2 + 1),
+        Just(i64::MIN / 2),
+        -3i64..=3,
+    ]
+    .boxed()
+}
+
+/// The `UInt64` analogue of [`limit_i64`].
+fn limit_u64() -> BoxedStrategy<u64> {
+    prop_oneof![
+        Just(u64::MAX),
+        Just(u64::MAX - 1),
+        Just(u64::MAX / 2 + 1),
+        Just(i64::MAX as u64 + 1),
+        0u64..=3,
+    ]
+    .boxed()
+}
+
+fn arb_int_rows() -> impl Strategy<Value = Vec<IntRow>> {
+    prop::collection::vec(
+        (
+            0i64..3,
+            prop::option::weighted(0.85, limit_i64()),
+            prop::option::weighted(0.85, limit_u64()),
+        ),
+        0..12,
+    )
+}
+
+/// What the SQL path must return: one exact total per output row, or the
+/// typed overflow error.
+#[derive(Debug, PartialEq)]
+enum IntSum {
+    Totals(Vec<Option<i128>>),
+    Overflow,
+}
+
+/// The exact total of every non-NULL value, or `None` when there is none.
+fn exact_total(values: impl Iterator<Item = Option<i128>>) -> Option<i128> {
+    values.flatten().fold(None, |acc, v| Some(acc.unwrap_or(0) + v))
+}
+
+/// The oracle: `totals` in output order, failing as a whole when any one of
+/// them is outside `[min, max]`, which is what a grouped query that emits the
+/// overflowing group in the same batch as the others does.
+fn int_oracle(totals: Vec<Option<i128>>, min: i128, max: i128) -> IntSum {
+    if totals.iter().flatten().any(|t| *t < min || *t > max) {
+        IntSum::Overflow
+    } else {
+        IntSum::Totals(totals)
+    }
+}
+
+fn grouped_totals(
+    rows: &[IntRow],
+    value: impl Fn(&IntRow) -> Option<i128>,
+) -> Vec<Option<i128>> {
+    let mut groups: BTreeMap<i64, Vec<Option<i128>>> = BTreeMap::new();
+    for row in rows {
+        groups.entry(row.0).or_default().push(value(row));
+    }
+    groups
+        .into_values()
+        .map(|values| exact_total(values.into_iter()))
+        .collect()
+}
+
+/// A real SQL session with `ints(g, v, u)` registered beside `samples`,
+/// spread round-robin over `partitions` partitions.
+async fn int_session(rows: &[IntRow], partitions: usize) -> SessionContext {
+    let tenant = tenant_id("issue-3838");
+    let specs = vec![SegSpec::new(
+        10,
+        1,
+        1,
+        vec![SeriesSpec::new("m", vec![(1, 1.0)])],
+    )];
+    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+    let config = SqlConfig {
+        engine: EngineConfig {
+            fetch_concurrency: partitions,
+            ..EngineConfig::default()
+        },
+        ..SqlConfig::default()
+    };
+    let provider = Arc::new(RavelTableProvider::new(
+        fixture.snapshot(&tenant).await,
+        tenant.hash(),
+        SegmentFetcher::new(Arc::clone(&fixture.store)),
+        config.clone(),
+        PhaseAccounting::new(),
+    ));
+    let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+    let ctx = build_session(
+        &config,
+        pool,
+        SessionTable::Metrics(provider),
+        true,
+        SpillDecision::Disabled,
+        &SessionPrincipal::without_capabilities(tenant.hash()),
+    )
+    .expect("session");
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("g", DataType::Int64, false),
+        Field::new("v", DataType::Int64, true),
+        Field::new("u", DataType::UInt64, true),
+    ]));
+    let mut parts = Vec::new();
+    for part in 0..partitions {
+        let mine: Vec<&IntRow> = rows.iter().skip(part).step_by(partitions).collect();
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from_iter_values(mine.iter().map(|r| r.0))),
+            Arc::new(Int64Array::from_iter(mine.iter().map(|r| r.1))),
+            Arc::new(UInt64Array::from_iter(mine.iter().map(|r| r.2))),
+        ];
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch");
+        parts.push(vec![batch]);
+    }
+    let table = MemTable::try_new(schema, parts).expect("mem table");
+    ctx.register_table("ints", Arc::new(table))
+        .expect("register ints");
+    ctx
+}
+
+/// The first `SqlError` in `err`'s source chain.
+fn sql_error(err: &DataFusionError) -> Option<&SqlError> {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(current) = cause {
+        if let Some(sql) = current.downcast_ref::<SqlError>() {
+            return Some(sql);
+        }
+        cause = current.source();
+    }
+    None
+}
+
+/// Run `sql` and read its last column as exact totals, or recognise the typed
+/// overflow error for `aggregate` over `result_type`. Any other error fails.
+async fn run_int_sum(
+    ctx: &SessionContext,
+    sql: &str,
+    aggregate: &str,
+    result_type: &str,
+) -> IntSum {
+    let result = match ctx.sql(sql).await {
+        Ok(frame) => frame.collect().await,
+        Err(err) => Err(err),
+    };
+    let batches = match result {
+        Ok(batches) => batches,
+        Err(err) => match sql_error(&err) {
+            Some(SqlError::IntegerSumOverflow {
+                aggregate: got_aggregate,
+                result_type: got_type,
+            }) if got_aggregate == aggregate && got_type == result_type => {
+                return IntSum::Overflow;
+            }
+            other => panic!("{sql}: unexpected error {other:?} from {err}"),
+        },
+    };
+    let mut totals = Vec::new();
+    for batch in &batches {
+        let column = batch.column(batch.num_columns() - 1);
+        if let Some(values) = column.as_any().downcast_ref::<Int64Array>() {
+            totals.extend(values.iter().map(|v| v.map(i128::from)));
+        } else if let Some(values) = column.as_any().downcast_ref::<UInt64Array>() {
+            totals.extend(values.iter().map(|v| v.map(i128::from)));
+        } else {
+            panic!("{sql}: sum column is {}", column.data_type());
+        }
+    }
+    IntSum::Totals(totals)
+}
+
+async fn assert_int_sums(rows: Vec<IntRow>, partitions: usize) {
+    let ctx = int_session(&rows, partitions).await;
+    let signed = |row: &IntRow| row.1.map(i128::from);
+    let unsigned = |row: &IntRow| row.2.map(i128::from);
+    let (i64_min, i64_max) = (i128::from(i64::MIN), i128::from(i64::MAX));
+    let (u64_min, u64_max) = (0, i128::from(u64::MAX));
+    let cases = [
+        (
+            "SELECT sum(v) FROM ints",
+            "sum(ints.v)",
+            "Int64",
+            int_oracle(vec![exact_total(rows.iter().map(signed))], i64_min, i64_max),
+        ),
+        (
+            "SELECT g, sum(v) FROM ints GROUP BY g ORDER BY g",
+            "sum(ints.v)",
+            "Int64",
+            int_oracle(grouped_totals(&rows, signed), i64_min, i64_max),
+        ),
+        (
+            "SELECT sum(u) FROM ints",
+            "sum(ints.u)",
+            "UInt64",
+            int_oracle(vec![exact_total(rows.iter().map(unsigned))], u64_min, u64_max),
+        ),
+        (
+            "SELECT g, sum(u) FROM ints GROUP BY g ORDER BY g",
+            "sum(ints.u)",
+            "UInt64",
+            int_oracle(grouped_totals(&rows, unsigned), u64_min, u64_max),
+        ),
+    ];
+    for (sql, aggregate, result_type, want) in cases {
+        let got = run_int_sum(&ctx, sql, aggregate, result_type).await;
+        assert_eq!(
+            got, want,
+            "{sql} at {partitions} partitions over {rows:?}"
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// Integer `sum`, grouped and ungrouped, signed and unsigned, at one to
+    /// eight partitions, against the exact total or the overflow error.
+    #[test]
+    fn integer_sum_is_the_exact_total_or_the_overflow_error(
+        rows in arb_int_rows(),
+        partitions in 1usize..=8,
+    ) {
+        block_on(assert_int_sums(rows, partitions));
+    }
+}
+
+/// The pool's three shapes, pinned so a strategy change cannot drop one: an
+/// overflow, a cancellation back into range through a partial outside it, and
+/// a total exactly at the limit.
+#[tokio::test]
+async fn golden_integer_sums_at_the_limits() {
+    for partitions in [1, 8] {
+        let ctx = int_session(
+            &[
+                (0, Some(i64::MAX), Some(u64::MAX)),
+                (0, Some(1), Some(1)),
+                (1, Some(i64::MAX), Some(u64::MAX)),
+                (1, Some(1), None),
+                (1, Some(-1), None),
+            ],
+            partitions,
+        )
+        .await;
+        assert_eq!(
+            run_int_sum(&ctx, "SELECT sum(v) FROM ints", "sum(ints.v)", "Int64").await,
+            IntSum::Overflow,
+        );
+        assert_eq!(
+            run_int_sum(
+                &ctx,
+                "SELECT sum(v) FROM ints WHERE g = 1",
+                "sum(ints.v)",
+                "Int64"
+            )
+            .await,
+            IntSum::Totals(vec![Some(i128::from(i64::MAX))]),
+        );
+        assert_eq!(
+            run_int_sum(&ctx, "SELECT sum(u) FROM ints", "sum(ints.u)", "UInt64").await,
+            IntSum::Overflow,
+        );
+        assert_eq!(
+            run_int_sum(
+                &ctx,
+                "SELECT g, sum(u) FROM ints WHERE g = 1 GROUP BY g",
+                "sum(ints.u)",
+                "UInt64"
+            )
+            .await,
+            IntSum::Totals(vec![Some(i128::from(u64::MAX))]),
+        );
+    }
 }
