@@ -624,7 +624,8 @@ pub enum PagePlanError {
     #[error(
         "the ORDER BY term `{term}` is computed from rows other than its own \
          (an aggregate, a window function or a subquery) and is not proven \
-         non-null, so no cursor is minted on it; only count(...) is"
+         non-null, so no cursor is minted on it; count(...) is, and so are min, max, \
+         and an integer sum or avg over a NOT NULL column under a plain GROUP BY"
     )]
     OrderTermFromOtherRows { term: String },
 
