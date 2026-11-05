@@ -4335,6 +4335,22 @@ mod with_mcp {
             "{found}"
         );
         assert_eq!(logs["rows_omitted"], serde_json::json!(0));
+        // The leg's own resolve and read: its log object's ingest hour and
+        // its complete coverage, beside the span lookup's top-level blocks.
+        assert_eq!(found["visibility"], plain["visibility"], "{found}");
+        assert!(
+            logs["visibility"]["snapshot_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "{found}"
+        );
+        assert!(
+            logs["visibility"]["ingest_watermark_hour"]
+                .as_str()
+                .is_some_and(|hour| !hour.is_empty()),
+            "{found}"
+        );
+        assert_eq!(logs["coverage"]["complete"], serde_json::json!(true));
         assert!(
             found["warnings"]
                 .as_array()

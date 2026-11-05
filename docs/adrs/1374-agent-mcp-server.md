@@ -2009,9 +2009,15 @@ deferred it. This logs-leg amendment ships it and records each choice.
    schema lists the blocks without forbidding others, so `tools/list` does
    not change. The block carries `status` (`ok`, `ok_bounded`, `skipped`,
    `failed`), `failure`, `skipped_reason`, `columns`, `rows`, `row_count`,
-   `row_cap_hit`, `bytes_cap_hit`, `rows_omitted`, `budget` and
-   `span_lookup_budget`. The call's top-level `status` and `failure`
-   describe the spans only.
+   `row_cap_hit`, `bytes_cap_hit`, `rows_omitted`, `visibility`,
+   `coverage`, `budget` and `span_lookup_budget`. The call's top-level
+   `status` and `failure` describe the spans only. The span lookup and the
+   leg resolve segments in two operations, each with its own snapshot and
+   ingest watermark, so each keeps its own blocks: the top-level
+   `visibility` and `coverage` are the span lookup's, and `logs.visibility`
+   and `logs.coverage`, in the same shapes, are the leg's (null on a
+   `skipped` or `failed` leg). One watermark for both would let a caller
+   judge the log records' completeness from a figure about the spans.
 4. Cost. A leg that started adds a warning that it ran an unindexed scan:
    no trace index covers logs, so it reads the window's logs and keeps the
    matching records. A logs key index on `trace_id`, where a tenant
@@ -2058,7 +2064,9 @@ deferred it. This logs-leg amendment ships it and records each choice.
    with the leg's columns, warning and next step already in the envelope
    and its fields at their widest values, so the fit measures everything
    but the records; if even that does not fit, the leg's columns are
-   dropped too. Both that check and the records' placement measure the
+   dropped too, and if it still does not fit, `logs.visibility` and
+   `logs.coverage` are set to null, leaving the block its status, counts
+   and spend. Both that check and the records' placement measure the
    envelope under the status it will finish with (`ok_bounded` once a cap
    cut the spans), not the one the fit left, so the status change cannot
    push it over. As with the deadline and the scan budgets of item 6, the
