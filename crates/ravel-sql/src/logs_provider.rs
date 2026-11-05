@@ -55,7 +55,9 @@ use crate::distributed_rlog::{
 };
 #[cfg(feature = "flight-sql")]
 use crate::flight_ticket::SlicePushdown;
-use crate::logs_pushdown::{LogsPushdown, extract_logs_keyed, filter_is_exact};
+use crate::logs_pushdown::{
+    LogsPushdown, extract_logs_keyed, filter_has_row_filter, filter_is_exact,
+};
 use crate::logs_scan::{LogsScanExec, RowFilters, ScanExecutions};
 use crate::logs_schema::{logs_schema, logs_schema_with_declared};
 use crate::logs_stats_prune::prune_segments_by_stats;
@@ -447,8 +449,9 @@ impl TableProvider for LogsTableProvider {
         TableType::Base
     }
 
-    /// `Exact` for a filter that resolves purely to a `ts` bound and/or a
-    /// `has_word` content predicate; `Inexact` for everything else (issue #733).
+    /// `Exact` for a filter that resolves purely to `ts` bounds, `has_word`
+    /// content predicates and declared `Str` `<>` row filters; `Inexact` for
+    /// everything else (issue #733).
     ///
     /// The split follows which reader channel the extracted predicate lands in
     /// ([`crate::logs_pushdown`]):
@@ -464,6 +467,15 @@ impl TableProvider for LogsTableProvider {
     ///   `LogsScanExec`'s exact leaf statistics reach DataFusion's
     ///   `AggregateStatistics` rule: a `FilterExec` above the scan would report
     ///   its own non-exact statistics instead of passing the leaf's through.
+    /// - A declared `Str` column's `<>` against a non-NULL string literal goes
+    ///   to [`LogsPushdown::row_filters`]. [`TableProvider::scan`] builds the
+    ///   session's own physical expression for it, and the scan applies it to
+    ///   every batch it builds, on both emission paths and on every rebuilt
+    ///   scan (ADR-0093, exact not-equal amendment), so the `FilterExec` above
+    ///   would drop nothing and the filter is deleted
+    ///   (`exact_not_equal_conjunct_is_exact_and_leaves_no_filter`). With the
+    ///   row filter turned off ([`Self::with_row_filter_pushdown`]) the scan
+    ///   receives none, and the filter stays `Inexact`.
     /// - Everything else -- an `attrs['k'] = 'v'` equality, every declared typed
     ///   column predicate (ADR-0093) -- goes to the prune-only
     ///   [`LogsPushdown::prune`] channel. `open_scan` passes that channel
@@ -489,7 +501,10 @@ impl TableProvider for LogsTableProvider {
         Ok(filters
             .iter()
             .map(|f| {
-                if filter_is_exact(f, self.declared.as_ref()) {
+                let declared = self.declared.as_ref();
+                if filter_is_exact(f, declared)
+                    && (self.row_filter_pushdown || !filter_has_row_filter(f, declared))
+                {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Inexact
@@ -2747,6 +2762,127 @@ mod tests {
                 "an unrecognized filter must stay Inexact: {filter:?}"
             );
         }
+    }
+
+    /// ADR-0093, exact not-equal amendment, T1 at the provider: a declared
+    /// `Str` column's `<>` against a string literal is `Exact`, alone and
+    /// AND-ed with a `ts` bound in one `Expr`; AND-ed with a `LIKE` in one
+    /// `Expr` it is recognized only in part and stays `Inexact`; and a
+    /// provider with its row filter off reports it `Inexact`, because its scan
+    /// then receives no row filter and the `FilterExec` must stay.
+    ///
+    /// Flipped: dropping the `row_filter_pushdown` check in
+    /// `supports_filters_pushdown` fails "Inexact with the row filter off".
+    #[test]
+    fn str_not_equal_filters_are_exact_only_when_the_scan_filters() {
+        use datafusion::prelude::{col, lit};
+
+        let declared = vec![
+            DeclaredColumn::new("s", DeclaredType::Str),
+            DeclaredColumn::new("n", DeclaredType::I64),
+        ];
+        let p = pushdown_provider(declared.clone());
+        let off = pushdown_provider(declared).with_row_filter_pushdown(false);
+        let like = Expr::Like(datafusion::logical_expr::Like {
+            negated: false,
+            expr: Box::new(col("s")),
+            pattern: Box::new(lit("%y%")),
+            escape_char: None,
+            case_insensitive: false,
+        });
+        for filter in [
+            col("s").not_eq(lit("")),
+            lit("x").not_eq(col("s")),
+            col("ts").gt_eq(ts_lit(100)).and(col("s").not_eq(lit(""))),
+        ] {
+            assert_eq!(
+                pushdown_for(&p, &filter),
+                TableProviderFilterPushDown::Exact,
+                "Exact: {filter}"
+            );
+            assert_eq!(
+                pushdown_for(&off, &filter),
+                TableProviderFilterPushDown::Inexact,
+                "Inexact with the row filter off: {filter}"
+            );
+        }
+        for filter in [
+            col("s").not_eq(lit("")).and(like),
+            col("n").not_eq(lit(5i64)),
+            col("s").not_eq(lit("")).and(col("n").not_eq(lit(5i64))),
+        ] {
+            assert_eq!(
+                pushdown_for(&p, &filter),
+                TableProviderFilterPushDown::Inexact,
+                "recognized only in part, or prune-only: {filter}"
+            );
+        }
+        let ts = col("ts").gt_eq(ts_lit(100));
+        assert_eq!(
+            pushdown_for(&off, &ts),
+            TableProviderFilterPushDown::Exact,
+            "the row filter switch leaves a ts bound Exact"
+        );
+    }
+
+    /// ADR-0093, exact not-equal amendment, T6: a provider acting as a
+    /// distributed coordinator reports every filter `Inexact`, the declared
+    /// `Str` `<>` and a pure `ts` bound included, and the slice pushdown it
+    /// hands workers carries no row filter.
+    ///
+    /// Flipped: classifying before the `distributed` check reports the `<>`
+    /// `Exact` and fails "every filter Inexact on the coordinator"; a slice
+    /// pushdown that carries `row_filters` to workers fails "workers receive
+    /// no row filter".
+    #[cfg(feature = "flight-sql")]
+    #[test]
+    fn a_distributed_coordinator_reports_the_str_not_equal_inexact() {
+        use datafusion::prelude::{col, lit};
+
+        #[derive(Debug)]
+        struct NoWorker;
+        impl WorkerSliceClient for NoWorker {
+            fn fetch_slice(
+                &self,
+                _location: &str,
+                _ticket: &crate::flight_ticket::FlightTicket,
+                _limit: Option<usize>,
+                _context: &Arc<datafusion::execution::TaskContext>,
+            ) -> DFResult<datafusion::execution::SendableRecordBatchStream> {
+                Err(datafusion::error::DataFusionError::Internal(
+                    "no worker in this test".into(),
+                ))
+            }
+        }
+
+        let declared = vec![DeclaredColumn::new("s", DeclaredType::Str)];
+        let local = pushdown_provider(declared.clone());
+        let coordinator = pushdown_provider(declared.clone())
+            .with_distributed_scan(Vec::new(), Arc::new(NoWorker));
+        let filters = [
+            col("s").not_eq(lit("")),
+            col("ts").gt_eq(ts_lit(100)),
+            col("ts").gt_eq(ts_lit(100)).and(col("s").not_eq(lit(""))),
+        ];
+        for filter in &filters {
+            assert_eq!(
+                pushdown_for(&local, filter),
+                TableProviderFilterPushDown::Exact,
+                "Exact on a local scan: {filter}"
+            );
+            assert_eq!(
+                pushdown_for(&coordinator, filter),
+                TableProviderFilterPushDown::Inexact,
+                "every filter Inexact on the coordinator: {filter}"
+            );
+        }
+        let pushdown = extract_logs_keyed(&filters, &declared, &KeyIndexDeclaration::default());
+        assert_eq!(pushdown.row_filters.len(), 2);
+        let sliced = SlicePushdown::logs(&pushdown);
+        assert!(
+            sliced.as_logs().expect("logs").row_filters.is_empty(),
+            "workers receive no row filter"
+        );
     }
 
     /// The verdicts line up with the filters positionally, so a mixed set is

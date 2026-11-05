@@ -1228,3 +1228,29 @@ async fn avg_declared_beside_a_timestamp_bound_loads_and_answers() {
         .expect("one avg row");
     assert_eq!(avg.to_bits(), (1408.0_f64 / 5.0).to_bits(), "1408 / 5");
 }
+
+/// ADR-0093, exact not-equal amendment, T4, exact ZERO. A `Str` column's `<>`
+/// against a string literal is reported `Exact` and leaves no `FilterExec`,
+/// but the scan evaluates it as a row filter, which the metadata rewrite
+/// refuses. So the q31 shape (a `GROUP BY` filtered by it) and a `SUM`
+/// filtered by it load no column statistics: no HEAD GET, no `.cstat` GET,
+/// and so no dictionary for the group key.
+///
+/// The gate judges the analyzed plan, where type coercion still wraps the
+/// literal in a cast, so the conjunct reads as a `<>` there whatever
+/// `logs_scan_residual` does with the optimizer's form; the unit test
+/// `str_not_equal_conjunct_stays_residual_for_the_rewrite_check` pins that
+/// rule on the form the scan receives.
+#[tokio::test]
+async fn str_not_equal_shapes_load_no_column_statistics() {
+    for sql in [
+        "SELECT status, COUNT(*) FROM logs WHERE url <> '' GROUP BY status",
+        "SELECT SUM(status) FROM logs WHERE url <> ''",
+    ] {
+        assert_eq!(
+            gets_to_plan_with_url(sql).await,
+            0,
+            "{sql}: the rewrite refuses a row filter scan, so the load must not fire"
+        );
+    }
+}

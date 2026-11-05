@@ -88,7 +88,7 @@ use datafusion::scalar::ScalarValue;
 use ravel_catalog::ColumnStatsRequest;
 
 use crate::declared::{DeclaredColumn, DeclaredType};
-use crate::logs_pushdown::filter_is_exact;
+use crate::logs_pushdown::{filter_has_row_filter, filter_is_exact};
 use crate::logs_scan::{DeclaredColumnSum, DeclaredGroupCounts, LogsScanExec};
 use crate::session::LOGS_TABLE;
 
@@ -370,7 +370,13 @@ fn not_equal_literal(predicate: &Arc<dyn PhysicalExpr>) -> Option<(usize, Scalar
 /// them from the `SegmentRef` stamps through [`LogsScanExec`]'s exact
 /// statistics, and the column statistics play no part in that answer.
 ///
-/// A residual conjunct is one [`filter_is_exact`] does not report. The plan
+/// A residual conjunct is one [`filter_is_exact`] does not report, or a
+/// declared `Str` column's `<>` against a string literal, which it does
+/// report: the provider reports that conjunct `Exact` and the scan evaluates
+/// it as a row filter, and [`rewrite`] refuses a scan with a row filter
+/// (`metadata_rewrite_stats_are_exact` in `crate::logs_scan`), so it is kept here
+/// to refuse what the rewrite would refuse
+/// (`str_not_equal_conjunct_stays_residual_for_the_rewrite_check`). The plan
 /// judged here is the analyzed one, before the optimizer folds casts and
 /// constant expressions, so a conjunct the scan later receives as a pure `ts`
 /// bound or as `<declared> <> <literal>` can still read here as something
@@ -470,7 +476,9 @@ fn non_str_declared_named<'a>(
 }
 
 /// The residual filter conjuncts between an aggregate's input and the `logs`
-/// scan under it, or `None` when the input is not a `logs` scan reached
+/// scan under it, plus every declared `Str` `<>` row filter conjunct (see
+/// [`logical_aggregate_answerable`]), or `None` when the input is not a `logs`
+/// scan reached
 /// through `Filter`, `SubqueryAlias`, and `Projection`s of plain columns only.
 /// [`rewrite`]'s scan chain admits a filter and partition shuffles and nothing
 /// that computes (a computed projection survives as a `ProjectionExec`), and
@@ -481,7 +489,10 @@ fn logs_scan_residual(mut plan: &LogicalPlan, declared: &[DeclaredColumn]) -> Op
         residual.extend(
             split_conjunction(predicate)
                 .into_iter()
-                .filter(|conjunct| !filter_is_exact(conjunct, declared))
+                .filter(|conjunct| {
+                    !filter_is_exact(conjunct, declared)
+                        || filter_has_row_filter(conjunct, declared)
+                })
                 .cloned(),
         );
     };
@@ -976,5 +987,86 @@ impl ExecutionPlan for MetadataOnlyExec {
                 None,
             ),
         ))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use datafusion::functions_aggregate::expr_fn::{count, sum};
+    use datafusion::logical_expr::LogicalPlanBuilder;
+    use datafusion::logical_expr::logical_plan::builder::table_scan_with_filters;
+    use datafusion::prelude::{col, lit};
+
+    use super::*;
+    use crate::logs_schema::logs_schema_with_declared;
+
+    /// ADR-0093, exact not-equal amendment, T4 (c): the optimizer's form of a
+    /// declared `Str` column's `<>`, `url <> Dictionary(Int32, Utf8(""))`,
+    /// which [`filter_is_exact`] accepts, stays in the residual. So the q31
+    /// shape (a `GROUP BY` under it) and a `SUM` under it are refused before
+    /// any column statistics load, whether the conjunct sits in a `Filter` or
+    /// in the scan's own filters. The same aggregates with no filter are
+    /// admitted, so the refusal is the conjunct's.
+    ///
+    /// The executor judges the analyzed plan, where type coercion leaves the
+    /// literal cast-wrapped and [`filter_is_exact`] does not accept it, so
+    /// `str_not_equal_shapes_load_no_column_statistics`
+    /// (`tests/logs_stats_load.rs`) passes with or without this rule; this
+    /// test pins the rule on the form the scan receives.
+    ///
+    /// Flipped: a `logs_scan_residual` that drops the conjunct with the other
+    /// `Exact` ones admits every filtered case and fails "refused".
+    #[test]
+    fn str_not_equal_conjunct_stays_residual_for_the_rewrite_check() {
+        let declared = vec![
+            DeclaredColumn::new("status", DeclaredType::I64),
+            DeclaredColumn::new("url", DeclaredType::Str),
+        ];
+        let schema = logs_schema_with_declared(&declared);
+        let conjunct = col("url").not_eq(lit(ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::Utf8(Some(String::new()))),
+        )));
+        assert!(filter_is_exact(&conjunct, &declared));
+        let shapes: [(&str, Vec<Expr>, Vec<Expr>); 2] = [
+            ("q31", vec![col("status")], vec![count(lit(1i64))]),
+            ("SUM", Vec::new(), vec![sum(col("status"))]),
+        ];
+        let aggregate_over = |input: LogicalPlanBuilder, group: &[Expr], aggr: &[Expr]| {
+            let plan = input
+                .aggregate(group.to_vec(), aggr.to_vec())
+                .expect("aggregate")
+                .build()
+                .expect("plan");
+            match plan {
+                LogicalPlan::Aggregate(aggregate) => aggregate,
+                other => panic!("not an aggregate: {other}"),
+            }
+        };
+        for (name, group, aggr) in &shapes {
+            let bare =
+                table_scan_with_filters(Some(LOGS_TABLE), &schema, None, Vec::new()).expect("scan");
+            let aggregate = aggregate_over(bare, group, aggr);
+            assert!(
+                logical_aggregate_answerable(&aggregate, &declared).is_some(),
+                "{name}: admitted with no filter"
+            );
+
+            let filtered = table_scan_with_filters(Some(LOGS_TABLE), &schema, None, Vec::new())
+                .expect("scan")
+                .filter(conjunct.clone())
+                .expect("filter");
+            let pushed =
+                table_scan_with_filters(Some(LOGS_TABLE), &schema, None, vec![conjunct.clone()])
+                    .expect("scan");
+            for (place, input) in [("Filter", filtered), ("scan filters", pushed)] {
+                let aggregate = aggregate_over(input, group, aggr);
+                assert!(
+                    logical_aggregate_answerable(&aggregate, &declared).is_none(),
+                    "{name}, conjunct in {place}: refused"
+                );
+            }
+        }
     }
 }

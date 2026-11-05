@@ -100,13 +100,16 @@ impl RowFilters {
     }
 }
 
+/// The conjuncts with their columns by name only: the indices they are bound
+/// to here are full-schema ones, which match neither the scan's output
+/// projection nor its build schema.
 impl fmt::Display for RowFilters {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for (i, e) in self.exprs.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{e}")?;
+            e.fmt_sql(f)?;
         }
         Ok(())
     }

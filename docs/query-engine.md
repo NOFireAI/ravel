@@ -162,10 +162,10 @@ This exact leaf statistic only reaches DataFusion's `AggregateStatistics`
 rule end to end when no `FilterExec` survives above the scan to intercept
 it, because a `FilterExec` reports its own (non-exact) statistics rather
 than passing the leaf's `Exact` count through. So
-`LogsTableProvider::supports_filters_pushdown` (crates/ravel-sql/src/
-logs_provider.rs) reports `Exact` for a filter that resolves purely to a
-`ts` bound and/or a `has_word` content predicate, which
-deletes it from the plan: both land in the channel the RLOG reader
+`LogsTableProvider::supports_filters_pushdown` reports `Exact` for a filter
+that resolves purely to `ts` bounds, `has_word` content predicates and
+declared `str` `<>` comparisons (below), which deletes it from the plan. A
+`ts` bound and a `has_word` call land in the channel the RLOG reader
 re-verifies exactly against each decoded block (`ravel_logseg`'s
 `block_survivors`, over its `Predicate::TsRange` and `Predicate::HasWord`
 arms), so no residual is needed. The reader evaluates that channel a block at
@@ -174,6 +174,23 @@ bounds hold for the whole block is dropped for that block, and the remaining
 arms run over the decoded column buffers, with only an attribute arm that has
 no FIELD_DIR column of its type falling back to a per-row `attrs_raw` lookup. A `COUNT(*)` over a contained `ts` bound therefore takes the same
 zero-GET path the genuinely predicate-free query does.
+
+A declared `str` column compared with `<>` against a non-NULL string literal
+(`"SearchPhrase" <> ''`, either operand order) is evaluated inside the scan
+instead (ADR-0093, exact not-equal amendment). The scan builds DataFusion's
+own expression for the comparison and applies it to every batch it builds,
+after the column build, on both of its emission paths and on every scan the
+optimizer rebuilds from it, so it reads the same merged value a filter above
+the scan would read, resource or scope fallback included, and a NULL value
+drops the row. The comparison is reported `Exact` and no `FilterExec` is
+left for it. The scan builds the compared column even when the statement
+does not select it, counts the rows it drops in `rows_dropped_by_row_filter`,
+and shows the comparisons on its EXPLAIN line as `row_filters=[...]`, by
+column name. A scan carrying such a comparison claims no exact row count or
+extrema, and the column-statistics rewrite below refuses it, so `COUNT(*)`,
+`MIN`, `MAX` and `SUM` under it are computed from the rows the scan emits.
+The same comparison AND-ed with a shape the scan does not evaluate, in one
+unsplit expression, stays `Inexact`.
 
 Every other filter stays `Inexact`. An `attrs['k'] = 'v'` equality and
 every declared typed column predicate (ADR-0093) go to the prune-only
@@ -4876,13 +4893,17 @@ Predicates on a typed attribute column are pushed down as prune-only arms
 (ADR-0093):
 an `i64`/`bool` comparison or `BETWEEN` and an `i64` `IN` drive the skip index,
 and a `str`/`bytes` equality drives POSTINGS, exactly as the "Supported
-predicates" list above describes. The pushdown is always `Inexact`, so the typed
+predicates" list above describes. That pushdown is always `Inexact`, so the typed
 comparison is still re-evaluated exactly as a residual filter above the scan; the
-prune only changes which blocks the fetch decodes. A typed attribute column
+prune only changes which blocks the fetch decodes. The one exception is a
+`str` column's `<>` against a string literal, which no prune arm carries: the
+scan itself evaluates it and it leaves no residual filter (see "Logs
+`COUNT(*)` from catalog row counts" above). A typed attribute column
 referenced by the query's projection -- which DataFusion also folds
 residual-filter columns
-into -- is decoded by the scan's column selection, so `WHERE` on a declared
-column decodes only the pages it needs. Moving an equality predicate from
+into -- is decoded by the scan's column selection, and so is the column of a
+`<>` the scan evaluates, so `WHERE` on a typed attribute column decodes only the
+pages it needs. Moving an equality predicate from
 `attrs['k'] = 'v'` to a declared `k = 'v'` now prunes through the same POSTINGS
 index (subject to the section-version caveat above). Declare for typed
 comparisons and aggregates, which the map cannot express at all.

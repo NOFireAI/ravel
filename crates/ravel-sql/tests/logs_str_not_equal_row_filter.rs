@@ -1,27 +1,32 @@
-//! ADR-0093, exact not-equal amendment, pull request 1: the logs scan
-//! evaluates a pushed declared-`Str` `<>` conjunct on each batch it builds,
-//! while the provider still reports the conjunct `Inexact`, so a `FilterExec`
-//! stays above the scan and re-evaluates every row it emits.
+//! ADR-0093, exact not-equal amendment: the logs scan evaluates a pushed
+//! declared-`Str` `<>` conjunct on each batch it builds (pull request 1), and
+//! the provider reports the conjunct `Exact`, so DataFusion keeps no
+//! `FilterExec` for it (pull request 2).
 //!
 //! Every statement runs through the production session (`build_session`) over
 //! real RLOG objects in a `MemoryStore`. The reference for an answer is the
 //! same statement on a provider with the row filter off
-//! (`LogsTableProvider::with_row_filter_pushdown(false)`), where DataFusion's
-//! `FilterExec` is the only evaluator.
+//! (`LogsTableProvider::with_row_filter_pushdown(false)`), which reports the
+//! conjunct `Inexact`, so DataFusion's `FilterExec` is the only evaluator.
 //!
 //! - `answers_match_the_residual_on_every_value_shape` (T2, T7): the fixture
 //!   spreads every value shape the amendment lists over a plain-page block, a
 //!   dictionary-page block, a block with an `attrs_raw` page, and a block with
 //!   a non-UTF-8 cell. Each statement returns the reference answer, the scan
 //!   drops exactly the 12 `''` and NULL rows (`rows_dropped_by_row_filter`),
-//!   and the `FilterExec` above it passes all 14 rows it receives.
-//! - `a_filter_column_outside_the_projection_is_built_and_dropped` and
+//!   and no `FilterExec` is left above it.
+//! - `exact_not_equal_conjunct_is_exact_and_leaves_no_filter` (T1): the
+//!   optimized plans of the accepted shapes hold no `FilterExec`, the rejected
+//!   ones keep one, and the scan's EXPLAIN line names the filter's column.
+//! - `a_filter_column_outside_the_projection_is_built_and_dropped`,
+//!   `the_q31_and_count_shapes_filter_a_column_they_do_not_select` and
 //!   `the_filter_reads_its_own_column_when_the_projection_is_widened` (T3 a,
 //!   c): a scan whose projection leaves the filter column out.
 //! - `the_late_materialized_phase_one_scan_filters_and_keeps_its_row_refs`
 //!   (T3 b, d) and `the_attrs_per_key_scan_keeps_the_row_filter` (T3 b2): the
 //!   two rebuilt scans.
 //! - `a_pushed_fetch_counts_rows_after_the_row_filter` (T5).
+//! - `clickbench_shapes_plan_without_a_filter_over_the_scan` (T9).
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -264,6 +269,16 @@ fn filter_rows(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize) {
         .expect("a selectivity metric")
 }
 
+/// `plan` holds no `FilterExec`: every conjunct of `sql` was reported
+/// `Exact`.
+fn assert_no_filter(plan: &Arc<dyn ExecutionPlan>, sql: &str) {
+    assert!(
+        nodes(plan, "FilterExec").is_empty(),
+        "{sql}: no FilterExec: {}",
+        displayable(plan.as_ref()).indent(true)
+    );
+}
+
 fn pretty(batches: &[RecordBatch]) -> String {
     pretty_format_batches(batches).expect("pretty").to_string()
 }
@@ -437,16 +452,14 @@ async fn shapes_fixture() -> (Arc<MemoryStore>, Vec<SegmentRef>) {
 
 /// T2 and T7. Each statement, with `attrs` projected and without, returns the
 /// answer the `FilterExec` alone gives, which is pinned to [`SHAPE_KEPT`]; the
-/// scan drops exactly [`SHAPE_DROPPED`] rows, and the `FilterExec` above it
-/// outputs every row the scan emits (`SHAPE_ROWS - SHAPE_DROPPED`).
+/// scan drops exactly [`SHAPE_DROPPED`] rows and emits the other
+/// `SHAPE_ROWS - SHAPE_DROPPED`, and no `FilterExec` is left above it.
 ///
-/// Flipped, each wrong implementation the amendment names fails here:
-/// a kernel reading raw dictionary keys keeps the plain block's NULL row
-/// (key 0 is `'p1'`) and fails "the FilterExec drops nothing"; a
-/// record-cell-only reader test drops the `'r'` rows and fails the reference
-/// answer; a filter on the columnar path only leaks the `attrs_raw` block's
-/// `''` rows and fails "the FilterExec drops nothing"; a keep-when-undecided
-/// rule keeps the I64-winner rows and fails the same.
+/// Flipped: a filter on the columnar path only leaks the `attrs_raw` block's
+/// `''` rows, which no `FilterExec` removes, and fails "the reference
+/// answer". The amendment's other wrong implementations for this test (a
+/// kernel reading raw dictionary keys, a record-cell-only reader test, a
+/// keep-when-undecided rule) change the rows the scan emits in the same way.
 #[tokio::test]
 async fn answers_match_the_residual_on_every_value_shape() {
     let (store, segments) = shapes_fixture().await;
@@ -475,20 +488,21 @@ async fn answers_match_the_residual_on_every_value_shape() {
             0,
             "{sql}: the reference scan filters nothing"
         );
-        let (input, output) = filter_rows(&plan);
-        assert_eq!(
-            output, input,
-            "{sql}: the FilterExec drops nothing the scan emits"
-        );
-        assert_eq!(
-            input,
-            SHAPE_ROWS - SHAPE_DROPPED,
-            "{sql}: the scan emits the kept rows"
-        );
+        assert_no_filter(&plan, sql);
+        let scans = nodes(&plan, "LogsScanExec");
+        assert_eq!(scans.len(), 1, "{sql}");
         assert_eq!(
             scan_metric(&plan, "rows_dropped_by_row_filter"),
             SHAPE_DROPPED,
             "{sql}: the scan drops every '' and NULL row"
+        );
+        // Run again alone, after the counter is read: the second run adds to
+        // the same node's metrics.
+        let emitted = execute_alone(&on, scans[0]).await;
+        assert_eq!(
+            emitted.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            SHAPE_ROWS - SHAPE_DROPPED,
+            "{sql}: the scan emits the kept rows"
         );
         assert_eq!(
             filter_rows(&reference_plan),
@@ -503,8 +517,8 @@ async fn answers_match_the_residual_on_every_value_shape() {
         );
         let shown = format!("{}", displayable(plan.as_ref()).indent(true));
         assert!(
-            shown.contains("row_filters=[s@"),
-            "{sql}: EXPLAIN shows the conjunct: {shown}"
+            shown.contains("row_filters=[s != ]"),
+            "{sql}: EXPLAIN shows the conjunct by column name: {shown}"
         );
     }
 
@@ -688,10 +702,15 @@ async fn the_filter_reads_its_own_column_when_the_projection_is_widened() {
 /// that row: rows 2, 4 and 6, with the `''` rows 3 and 5 between them in the
 /// same block.
 ///
+/// The conjunct is `Exact`, so no `FilterExec` reads `s` and phase 1
+/// projects only `ts` and the row ref: it builds `s` for the filter and drops
+/// it.
+///
 /// Flipped: a `reproject` that drops `row_filters` leaves phase 1 emitting
-/// the `''` rows and fails "phase 1 emits no '' row"; row refs recomputed after
-/// the filter shift every position past row 0 and fail "each s is its own
-/// row's".
+/// the `''` rows, so the statement returns rows 0, 1 and 2 and fails "the
+/// three earliest kept rows"; row refs recomputed after the filter as
+/// consecutive positions from the batch's first row point phase 2 at rows 0,
+/// 1 and 2, and fail the same assertion.
 #[tokio::test]
 async fn the_late_materialized_phase_one_scan_filters_and_keeps_its_row_refs() {
     let (store, segments) = t3_fixture().await;
@@ -706,6 +725,7 @@ async fn the_late_materialized_phase_one_scan_filters_and_keeps_its_row_refs() {
         shown.contains("LogsRowFetchExec"),
         "late materialized: {shown}"
     );
+    assert_no_filter(&plan, sql);
     let (_, reference) = run(&off, sql).await;
     assert_eq!(timestamps(&got), [2, 4, 6], "the three earliest kept rows");
     let want: Vec<Option<String>> = [2, 4, 6].iter().map(|&ts| Some(t3_s(ts))).collect();
@@ -720,17 +740,21 @@ async fn the_late_materialized_phase_one_scan_filters_and_keeps_its_row_refs() {
     let scans = nodes(&plan, "LogsScanExec");
     assert_eq!(scans.len(), 1, "{shown}");
     let phase_one = scans[0];
-    assert!(
-        phase_one.schema().index_of("__ravel_row_ref").is_ok(),
+    let fields: Vec<String> = phase_one
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(
+        fields,
+        ["ts", "__ravel_row_ref"],
         "the phase-1 scan: {shown}"
     );
     let emitted = execute_alone(&on, phase_one).await;
-    let values = column_texts(&emitted, "s");
-    assert!(
-        values.iter().all(|v| v.as_deref() != Some("")),
-        "phase 1 emits no '' row: {values:?}"
-    );
-    assert_eq!(values.len(), kept_by_s().len());
+    let mut emitted = timestamps(&emitted);
+    emitted.sort_unstable();
+    assert_eq!(emitted, kept_by_s(), "phase 1 emits only the kept rows");
 }
 
 /// T3 (b2): `SELECT attrs['k'] FROM logs WHERE s <> ''` plans through
@@ -738,7 +762,7 @@ async fn the_late_materialized_phase_one_scan_filters_and_keeps_its_row_refs() {
 /// `reproject_attr_keys`. That scan filters too.
 ///
 /// Flipped: a `reproject_attr_keys` that drops `row_filters` emits the `''`
-/// rows and fails "the per-key scan emits no '' row".
+/// rows, which no `FilterExec` removes, and fails "the reference answer".
 #[tokio::test]
 async fn the_attrs_per_key_scan_keeps_the_row_filter() {
     let (store, segments) = t3_fixture().await;
@@ -748,6 +772,7 @@ async fn the_attrs_per_key_scan_keeps_the_row_filter() {
     let sql = "SELECT ts, attrs['k'] AS k FROM logs WHERE s <> '' ORDER BY ts";
 
     let (plan, got) = run(&on, sql).await;
+    assert_no_filter(&plan, sql);
     let (_, reference) = run(&off, sql).await;
     assert_eq!(pretty(&got), pretty(&reference), "the reference answer");
     assert_eq!(timestamps(&got), kept_by_s());
@@ -762,12 +787,13 @@ async fn the_attrs_per_key_scan_keeps_the_row_filter() {
     let shown = format!("{}", displayable(scans[0].as_ref()).one_line());
     assert!(shown.contains("attrs[k]") || shown.contains("k"), "{shown}");
     let emitted = execute_alone(&on, scans[0]).await;
-    let values = column_texts(&emitted, "s");
-    assert!(
-        values.iter().all(|v| v.as_deref() != Some("")),
-        "the per-key scan emits no '' row: {values:?}"
+    let mut emitted = timestamps(&emitted);
+    emitted.sort_unstable();
+    assert_eq!(
+        emitted,
+        kept_by_s(),
+        "the per-key scan emits only the kept rows"
     );
-    assert_eq!(values.len(), kept_by_s().len());
 }
 
 // --- T5: fetch ----------------------------------------------------------------
@@ -776,9 +802,16 @@ async fn the_attrs_per_key_scan_keeps_the_row_filter() {
 /// non-empty ones. With a pushed fetch of 5, the scan alone returns exactly
 /// five rows, all non-empty, and its statistics claim no exact row count.
 ///
+/// The conjunct is `Exact`, so `LimitPushdown` puts the fetch on the scan
+/// itself: the statement's plan holds no `FilterExec` and its scan carries
+/// `fetch = 5`.
+///
 /// Flipped: counting the fetch on built rows returns no row at all and fails
-/// "exactly five rows"; leaving `apply_fetch_to_statistics` on its exact
-/// branch reports `Exact(5)` and fails "no exact row count".
+/// "exactly five rows". Leaving `apply_fetch_to_statistics` on its exact
+/// branch is caught only beside a statistics gate that also ignores the row
+/// filter: `stats_are_exact` already refuses this scan, so no exact count
+/// reaches that branch. With both gates removed the scan reports `Exact(5)`
+/// and fails "no exact row count".
 #[tokio::test]
 async fn a_pushed_fetch_counts_rows_after_the_row_filter() {
     let store = Arc::new(MemoryStore::new());
@@ -799,10 +832,13 @@ async fn a_pushed_fetch_counts_rows_after_the_row_filter() {
 
     let sql = "SELECT s FROM logs WHERE s <> '' LIMIT 5";
     let (plan, got) = run(&ctx, sql).await;
-    assert_eq!(got.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
+    assert_no_filter(&plan, sql);
+    let want: Vec<Option<String>> = (10..15).map(|ts| Some(format!("x{ts}"))).collect();
+    assert_eq!(column_texts(&got, "s"), want, "exactly five rows");
     let scans = nodes(&plan, "LogsScanExec");
     assert_eq!(scans.len(), 1);
     assert_eq!(scans[0].properties().partitioning.partition_count(), 1);
+    assert_eq!(scans[0].fetch(), Some(5), "the fetch is on the scan");
 
     let fetched = scans[0]
         .with_fetch(Some(5))
@@ -810,7 +846,6 @@ async fn a_pushed_fetch_counts_rows_after_the_row_filter() {
     let batches = execute_alone(&ctx, &fetched).await;
     let values = column_texts(&batches, "s");
     assert_eq!(values.len(), 5, "exactly five rows");
-    let want: Vec<Option<String>> = (10..15).map(|ts| Some(format!("x{ts}"))).collect();
     assert_eq!(values, want);
 
     for plan in [&fetched, scans[0]] {
@@ -851,4 +886,303 @@ async fn the_counter_is_published_beside_the_scans_row_counters() {
         .expect("explain runs");
     let text = pretty(&analyzed);
     assert!(text.contains("rows_dropped_by_row_filter=6"), "{text}");
+}
+
+// --- T1 and T3 through SQL -----------------------------------------------------
+
+/// The text of the one `LogsScanExec` line in `plan`.
+fn scan_line(plan: &Arc<dyn ExecutionPlan>) -> String {
+    let scans = nodes(plan, "LogsScanExec");
+    assert_eq!(
+        scans.len(),
+        1,
+        "{}",
+        displayable(plan.as_ref()).indent(true)
+    );
+    displayable(scans[0].as_ref()).one_line().to_string()
+}
+
+/// T1 through SQL: the planned and optimized plans of `s <> ''` and
+/// `'' <> s`, alone and beside a `ts` bound, hold no `FilterExec`, and the
+/// scan's EXPLAIN line names the conjunct's column (`row_filters=[s != ]`)
+/// rather than printing a full-schema index that does not match its
+/// `projection=[...]`. The shapes near it keep a `FilterExec`, and the
+/// conjunct beside a `LIKE` leaves a `FilterExec` holding the `LIKE` only.
+///
+/// Flipped: a `leaf_is_exact` that does not recognize the shape leaves a
+/// `FilterExec` and fails "no FilterExec"; printing the bound expression
+/// (`s@4 != `) fails "by column name".
+#[tokio::test]
+async fn exact_not_equal_conjunct_is_exact_and_leaves_no_filter() {
+    let (store, segments) = t3_fixture().await;
+    let declared = wide_declared();
+    let ctx = session(provider(&store, segments, &declared));
+    for sql in [
+        "SELECT ts FROM logs WHERE s <> ''",
+        "SELECT ts FROM logs WHERE '' <> s",
+        "SELECT ts FROM logs WHERE s <> '' AND ts >= TIMESTAMP '1970-01-01 00:00:00'",
+    ] {
+        let (plan, got) = run(&ctx, sql).await;
+        assert_no_filter(&plan, sql);
+        let line = scan_line(&plan);
+        assert!(
+            line.contains("projection=[ts], row_filters=[s != ]"),
+            "{sql}: by column name: {line}"
+        );
+        assert!(!line.contains('@'), "{sql}: no column index: {line}");
+        let mut got = timestamps(&got);
+        got.sort_unstable();
+        assert_eq!(got, kept_by_s(), "{sql}");
+    }
+
+    for sql in [
+        "SELECT ts FROM logs WHERE body <> 'x'",
+        "SELECT ts FROM logs WHERE attrs['k'] <> 'k1'",
+        "SELECT ts FROM logs WHERE n <> 1",
+        "SELECT ts FROM logs WHERE lower(s) <> 'v2'",
+        "SELECT ts FROM logs WHERE s <> t",
+        "SELECT ts FROM logs WHERE s <> 'v2' OR t <> 'u2'",
+    ] {
+        let (plan, _) = run(&ctx, sql).await;
+        assert_eq!(
+            nodes(&plan, "FilterExec").len(),
+            1,
+            "{sql}: a FilterExec stays: {}",
+            displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    let sql = "SELECT ts FROM logs WHERE s <> '' AND s LIKE '%v1%'";
+    let (plan, got) = run(&ctx, sql).await;
+    let filters = nodes(&plan, "FilterExec");
+    assert_eq!(filters.len(), 1, "{sql}");
+    let predicate = filters[0]
+        .downcast_ref::<FilterExec>()
+        .expect("FilterExec")
+        .predicate()
+        .to_string();
+    assert!(
+        predicate.to_lowercase().contains("like") && !predicate.contains("!="),
+        "{sql}: the FilterExec holds the LIKE only: {predicate}"
+    );
+    assert!(scan_line(&plan).contains("row_filters=[s != ]"), "{sql}");
+    let mut got = timestamps(&got);
+    got.sort_unstable();
+    assert_eq!(got, [10, 11], "{sql}");
+}
+
+/// T3 (a, c) through SQL: the q31 shape and `COUNT(*)` do not select `s`,
+/// so once the conjunct is `Exact` the scan's projection does not name it.
+/// The scan still builds `s`, filters on it and drops it, and each statement
+/// returns the reference answer. `t` is a second declared `Str` column the
+/// grouped statement selects.
+///
+/// Flipped: evaluating only when the column is in the output projection
+/// counts every row and fails "the reference answer"; binding the filter to
+/// the wrong build column reads `t` and fails the same.
+#[tokio::test]
+async fn the_q31_and_count_shapes_filter_a_column_they_do_not_select() {
+    let (store, segments) = t3_fixture().await;
+    let declared = wide_declared();
+    let on = session(provider(&store, segments.clone(), &declared));
+    let off = session(provider(&store, segments, &declared).with_row_filter_pushdown(false));
+    for (sql, rows) in [
+        (
+            "SELECT n, COUNT(*) AS c FROM logs WHERE s <> '' GROUP BY n ORDER BY n",
+            "+---+---+\n| n | c |\n+---+---+\n| 0 | 1 |\n| 1 | 3 |\n| 2 | 2 |\n+---+---+",
+        ),
+        (
+            "SELECT COUNT(*) AS c FROM logs WHERE s <> ''",
+            "+---+\n| c |\n+---+\n| 6 |\n+---+",
+        ),
+        (
+            "SELECT t, COUNT(*) AS c FROM logs WHERE s <> '' GROUP BY t ORDER BY t",
+            "+-----+---+\n| t   | c |\n+-----+---+\n|     | 2 |\n| u10 | 1 |\n| u2  | 1 |\n\
+             | u4  | 1 |\n| u6  | 1 |\n+-----+---+",
+        ),
+    ] {
+        let (plan, got) = run(&on, sql).await;
+        let (_, reference) = run(&off, sql).await;
+        assert_eq!(
+            pretty(&got),
+            pretty(&reference),
+            "{sql}: the reference answer"
+        );
+        assert_eq!(pretty(&got), rows, "{sql}");
+        assert_no_filter(&plan, sql);
+        let line = scan_line(&plan);
+        assert!(
+            !line.contains("projection=[s") && !line.contains(", s,"),
+            "{sql}: {line}"
+        );
+        assert_eq!(scan_metric(&plan, "rows_dropped_by_row_filter"), 6, "{sql}");
+    }
+}
+
+// --- T9: plan shape over ClickBench's declared types ---------------------------
+
+/// The ClickBench columns the q13, q22 and q31 shapes read, with the types
+/// `hits.mapping.toml` declares for them.
+fn clickbench_declared() -> Vec<DeclaredColumn> {
+    vec![
+        DeclaredColumn::new("SearchPhrase", DeclaredType::Str),
+        DeclaredColumn::new("URL", DeclaredType::Str),
+        DeclaredColumn::new("SearchEngineID", DeclaredType::I64),
+        DeclaredColumn::new("ClientIP", DeclaredType::I64),
+        DeclaredColumn::new("IsRefresh", DeclaredType::I64),
+        DeclaredColumn::new("ResolutionWidth", DeclaredType::I64),
+        DeclaredColumn::new("UserID", DeclaredType::I64),
+    ]
+}
+
+/// The T9 session's `target_partitions`, and the fixture's object count: an
+/// uncached scan plans one partition per object up to `target_partitions`.
+const T9_PARTITIONS: usize = 4;
+
+/// [`T9_PARTITIONS`] objects of 16 rows; `SearchPhrase` is `''` on every
+/// third row and `URL` holds `google` on every other row.
+async fn clickbench_fixture() -> (Arc<MemoryStore>, Vec<SegmentRef>) {
+    let store = Arc::new(MemoryStore::new());
+    let mut segments = Vec::new();
+    for object in 0..T9_PARTITIONS as i64 {
+        let records: Vec<LogRecord> = (0..16)
+            .map(|i| {
+                let ts = object * 100 + i;
+                let phrase = if i % 3 == 0 {
+                    String::new()
+                } else {
+                    format!("phrase {}", i % 4)
+                };
+                let url = if i % 2 == 0 {
+                    format!("https://google.com/{i}")
+                } else {
+                    format!("https://example.com/{i}")
+                };
+                record(
+                    ts,
+                    Stream::Bare,
+                    &[
+                        ("SearchPhrase", s(&phrase)),
+                        ("URL", s(&url)),
+                        ("SearchEngineID", AttrValue::I64(i % 2)),
+                        ("ClientIP", AttrValue::I64(i % 5)),
+                        ("IsRefresh", AttrValue::I64(i % 2)),
+                        ("ResolutionWidth", AttrValue::I64(1000 + i)),
+                        ("UserID", AttrValue::I64(i % 7)),
+                    ],
+                )
+            })
+            .collect();
+        let bytes = encode(&records, RlogConfig::default());
+        let key = format!("logs/clickbench-{object}.rlog");
+        segments.push(put(&store, &key, bytes, &records).await);
+    }
+    (store, segments)
+}
+
+fn partitioned_session(provider: LogsTableProvider, partitions: usize) -> SessionContext {
+    let mut config = SqlConfig::default();
+    config.engine.sql_partition_count = Some(partitions);
+    let pool = Arc::new(TenantDelegatingPool::new(
+        1 << 30,
+        TenantMemoryAccountant::new(1 << 30),
+        CeilingBreach::new(),
+        QueryAccounting::new(),
+    ));
+    build_session(
+        &config,
+        pool,
+        SessionTable::Logs(Arc::new(provider)),
+        false,
+        SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(TenantHash([0u8; 16])),
+    )
+    .expect("session")
+}
+
+/// The name of the node directly above each `LogsScanExec` in `plan`.
+fn scan_parents(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<String>) {
+    for child in plan.children() {
+        if child.name() == "LogsScanExec" {
+            out.push(plan.name().to_string());
+        }
+        scan_parents(child, out);
+    }
+}
+
+/// T9: over a tenant with ClickBench's declared types, the q13 and q31
+/// shapes hold no `FilterExec`, their scans report `target_partitions`
+/// partitions, and no `RepartitionExec` sits directly above the scan. The
+/// q22 shape keeps a `FilterExec` holding only its `LIKE`; its `<>` moves
+/// into the scan. Each answer equals the reference answer.
+///
+/// Flipped: a scan reporting fewer partitions than `target_partitions`, the
+/// condition under which DataFusion puts a round-robin `RepartitionExec` over
+/// it, fails "the scan reports target_partitions partitions"; partial credit
+/// for a compound
+/// conjunct is not reachable through SQL, because the optimizer offers the
+/// provider each top-level conjunct on its own, so that wrong implementation
+/// is caught by `str_not_equal_is_exact_and_nothing_near_it_is` and
+/// `str_not_equal_filters_are_exact_only_when_the_scan_filters` instead.
+#[tokio::test]
+async fn clickbench_shapes_plan_without_a_filter_over_the_scan() {
+    let (store, segments) = clickbench_fixture().await;
+    let declared = clickbench_declared();
+    let on = partitioned_session(provider(&store, segments.clone(), &declared), T9_PARTITIONS);
+    let off = partitioned_session(
+        provider(&store, segments, &declared).with_row_filter_pushdown(false),
+        T9_PARTITIONS,
+    );
+    let q13 = "SELECT \"SearchPhrase\", COUNT(*) AS c FROM logs WHERE \"SearchPhrase\" <> '' \
+               GROUP BY \"SearchPhrase\" ORDER BY c DESC, \"SearchPhrase\" LIMIT 10";
+    let q31 = "SELECT \"SearchEngineID\", \"ClientIP\", COUNT(*) AS c, SUM(\"IsRefresh\"), \
+               AVG(\"ResolutionWidth\") FROM logs WHERE \"SearchPhrase\" <> '' \
+               GROUP BY \"SearchEngineID\", \"ClientIP\" \
+               ORDER BY c DESC, \"SearchEngineID\", \"ClientIP\" LIMIT 10";
+    let q22 = "SELECT \"SearchPhrase\", MIN(\"URL\"), COUNT(*) AS c FROM logs \
+               WHERE \"URL\" LIKE '%google%' AND \"SearchPhrase\" <> '' \
+               GROUP BY \"SearchPhrase\" ORDER BY c DESC, \"SearchPhrase\" LIMIT 10";
+    for sql in [q13, q31, q22] {
+        let (plan, got) = run(&on, sql).await;
+        let (_, reference) = run(&off, sql).await;
+        assert_eq!(
+            pretty(&got),
+            pretty(&reference),
+            "{sql}: the reference answer"
+        );
+        let shown = displayable(plan.as_ref()).indent(true).to_string();
+        let scans = nodes(&plan, "LogsScanExec");
+        assert_eq!(scans.len(), 1, "{shown}");
+        assert_eq!(
+            scans[0].properties().partitioning.partition_count(),
+            T9_PARTITIONS,
+            "{sql}: the scan reports target_partitions partitions: {shown}"
+        );
+        assert!(
+            scan_line(&plan).contains("row_filters=[SearchPhrase != ]"),
+            "{sql}: the <> is in the scan: {shown}"
+        );
+        let filters = nodes(&plan, "FilterExec");
+        let mut parents = Vec::new();
+        scan_parents(&plan, &mut parents);
+        if sql == q22 {
+            assert_eq!(filters.len(), 1, "q22 keeps a FilterExec: {shown}");
+            let predicate = filters[0]
+                .downcast_ref::<FilterExec>()
+                .expect("FilterExec")
+                .predicate()
+                .to_string();
+            assert!(
+                predicate.contains("URL") && !predicate.contains("SearchPhrase"),
+                "q22's FilterExec holds only the LIKE: {predicate}"
+            );
+            assert_eq!(parents, ["FilterExec"], "{shown}");
+        } else {
+            assert!(filters.is_empty(), "{sql}: no FilterExec: {shown}");
+            assert!(
+                parents.iter().all(|p| p != "RepartitionExec"),
+                "{sql}: no RepartitionExec directly above the scan: {shown}"
+            );
+        }
+    }
 }
