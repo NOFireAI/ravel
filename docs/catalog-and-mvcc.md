@@ -919,8 +919,9 @@ switch amendment describes. Every process that runs a fold for a tenant
 (a maintain-mode process, and a query-mode process serving on-demand
 folds) should agree on the switch: a fold without it writes the re-encoded tail
 without refs; `ravel-cli catalog fold --rebuild-key-index` (under
-"Rollout") attaches them afterwards. The query path ("Reader") probes the leaves for a spans `trace_id`
-lookup; the logs lookup does not probe them yet.
+"Rollout") attaches them afterwards. The query path ("Reader") probes the
+leaves for a spans `trace_id` lookup and for a logs scan's declared-key
+equality, once per scan (docs/query-engine.md, "Tier-2 router").
 
 The codec is `ravel_catalog::snapshot_format::kidx`, re-exported at the
 crate root: `encode_key_index_leaf` (choosing `bucket_bits` with
@@ -1210,7 +1211,14 @@ every key of the field, so its other keys leave the leaf too) and the leaf
 holds the rest. A per-entry
 failure (no KEY_IDX section, a section that does not name the field or
 names it under another key type, a failed GET, a corrupt section) lands the
-entry in `uncovered_entry_ordinals` and never aborts the leaf. A field with
+entry in `uncovered_entry_ordinals` and never aborts the leaf. So does an
+RLOG KEY_IDX section at a version the logs reader does not resolve
+(`ravel_logseg::key_index::section_resolves_like_the_reader`; version 1,
+whose own probe declines): a leaf built from it could prove a key absent
+that the object holds. The check is in `read_entry_key_index_counted`, the
+section read the fold's leaf build and `--rebuild-key-index` share, so both
+list such an entry (`version_one_sections_are_uncovered_in_the_leaf`,
+`version_one_sections_are_uncovered_in_a_rebuilt_leaf`). A field with
 no covered entry in the part writes no leaf (absence is uncovered). The
 fold report counts `key_index_ranged_gets` and `key_index_bytes_read` (the
 footer and section GETs and the bytes they returned, also counted in
@@ -1512,7 +1520,17 @@ it was in publishes nothing. A rebuilt
 ref is carried forward by every later fold that carries the part by
 reference, and a fold that re-encodes the part while
 `build_key_index_leaves` is off drops it, so the rebuild must be rerun
-after such a re-encode. Like the plain CLI fold it holds no claim and
+after such a re-encode. A logs leaf written before the leaf build listed a
+version 1 RLOG KEY_IDX section as uncovered (see "Per-part key-index
+leaves") can prove absent a key such an entry holds. The rebuild does not
+repair it: it reads only parts lacking a ref for the field, so a part that
+already holds the stale leaf costs no GET and keeps it. Only a re-encode of
+the part by a fold with `build_key_index_leaves` on replaces it, and a
+sealed part is never re-encoded. ADR-3692 decision 4 says such a deployment
+repairs with `--rebuild-key-index`; with the rebuild as it is, that holds
+only for parts whose refs a fold with the switch off has already dropped.
+The leaf switch is off by default, so a deployment that kept the default
+holds no such leaf. Like the plain CLI fold it holds no claim and
 keeps no cursor (HEAD is the cursor). It accepts `--writers-stopped` as
 the same assertion the plain fold takes, but seals no hour and reads no
 commit record, so the flag changes nothing it does. Detection: the sweep's

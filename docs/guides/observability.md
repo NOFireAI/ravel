@@ -2433,11 +2433,12 @@ query incurred up to that point, not zeros:
 ### Key-index routing (`ravel_query_key_index_*`)
 
 Two counters cover the tier-2 key-index router, which answers an exact-key
-lookup (a spans `trace_id =` today) from the per-part key-index leaves. Every mode renders both on every scrape, for both
+lookup (a spans `trace_id =`, or a logs scan's declared-key equality) from
+the per-part key-index leaves. Every mode renders both on every scrape, for both
 `signal="spans"` and `signal="logs"` and every `outcome`, zeros included, so a
 rate over `outcome="covered"` exists before the first lookup. Neither carries
-`tenant_hash` or `workload_class`. The `logs` samples stay 0 until the logs
-scan routes its lookups.
+`tenant_hash` or `workload_class`. The logs samples move only for a SQL
+statement over the HTTP API: Flight SQL and `EXPLAIN` do not route logs.
 
 | Metric | Labels | HELP text |
 |---|---|---|
