@@ -181,11 +181,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, DictionaryArray, FixedSizeBinaryArray, Float64Array, Int32Array, MapArray,
-    MapBuilder, RecordBatch, StringArray, StringBuilder, TimestampNanosecondArray, UInt8Array,
-    UInt32Array,
+    Array, ArrayRef, DictionaryArray, FixedSizeBinaryArray, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, MapArray, MapBuilder, RecordBatch, StringArray, StringBuilder,
+    TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use datafusion::arrow::datatypes::Int32Type;
+use datafusion::arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
@@ -1733,4 +1733,120 @@ async fn an_aggregate_argument_named_like_an_alias_reads_the_from_column() {
             "1970-01-01T00:00:00.000000150",
         ],
     );
+}
+
+/// A context with table `t`: a Utf8 key `k` beside the integer `columns`,
+/// every row in its own partition, executed on `target_partitions`
+/// partitions. One row per partition makes a grouped sum over more than one
+/// row merge partial sums whenever the engine runs more than one partition.
+///
+/// The built-in `sum` this context registers is the one Ravel's SQL session
+/// serves: it replaces `min`, `max` and `avg` with its own UDAFs and leaves
+/// `sum` as DataFusion's (ADR-0024, which would replace it, is Proposed).
+fn integer_table_context(
+    keys: &[&str],
+    columns: Vec<(&str, ArrayRef)>,
+    target_partitions: usize,
+) -> SessionContext {
+    let mut fields = vec![Field::new("k", DataType::Utf8, false)];
+    let mut arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(keys.to_vec()))];
+    for (name, array) in columns {
+        fields.push(Field::new(name, array.data_type().clone(), false));
+        arrays.push(array);
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), arrays).expect("integer batch");
+    let partitions = (0..batch.num_rows())
+        .map(|row| vec![batch.slice(row, 1)])
+        .collect();
+    let ctx = SessionContext::new_with_config(
+        SessionConfig::new().with_target_partitions(target_partitions),
+    );
+    let table = MemTable::try_new(schema, partitions).expect("integer mem table");
+    ctx.register_table("t", Arc::new(table))
+        .expect("registered t");
+    ctx
+}
+
+/// DataFusion's `sum` over a signed integer argument of any width is
+/// `Int64`, and over an unsigned one `UInt64`: each column holds its type's
+/// maximum and 1 in one group, and every narrower sum is exact past its
+/// argument's own range.
+#[tokio::test]
+async fn an_integer_sum_is_int64_for_a_signed_and_uint64_for_an_unsigned_argument() {
+    let ctx = integer_table_context(
+        &["a", "a"],
+        vec![
+            ("i8", Arc::new(Int8Array::from(vec![i8::MAX, 1]))),
+            ("i16", Arc::new(Int16Array::from(vec![i16::MAX, 1]))),
+            ("i32", Arc::new(Int32Array::from(vec![i32::MAX, 1]))),
+            ("i64", Arc::new(Int64Array::from(vec![i64::MAX - 1, 1]))),
+            ("u8", Arc::new(UInt8Array::from(vec![u8::MAX, 1]))),
+            ("u16", Arc::new(UInt16Array::from(vec![u16::MAX, 1]))),
+            ("u32", Arc::new(UInt32Array::from(vec![u32::MAX, 1]))),
+            ("u64", Arc::new(UInt64Array::from(vec![u64::MAX - 1, 1]))),
+        ],
+        1,
+    );
+    let sql = "SELECT sum(i8) AS i8, sum(i16) AS i16, sum(i32) AS i32, sum(i64) AS i64, \
+               sum(u8) AS u8, sum(u16) AS u16, sum(u32) AS u32, sum(u64) AS u64 \
+               FROM t GROUP BY k";
+    let batches = execute(&ctx, sql).await;
+    let schema = batches.first().expect("one batch").schema();
+    let types: Vec<(&str, &DataType)> = schema
+        .fields()
+        .iter()
+        .map(|field| (field.name().as_str(), field.data_type()))
+        .collect();
+    assert_eq!(
+        types,
+        [
+            ("i8", &DataType::Int64),
+            ("i16", &DataType::Int64),
+            ("i32", &DataType::Int64),
+            ("i64", &DataType::Int64),
+            ("u8", &DataType::UInt64),
+            ("u16", &DataType::UInt64),
+            ("u32", &DataType::UInt64),
+            ("u64", &DataType::UInt64),
+        ],
+    );
+    assert_eq!(
+        rows_of(&batches),
+        [[
+            "128",
+            "32768",
+            "2147483648",
+            "9223372036854775807",
+            "256",
+            "65536",
+            "4294967296",
+            "18446744073709551615",
+        ]],
+    );
+}
+
+/// An integer `sum` that overflows its 64-bit result wraps rather than
+/// failing, at one partition and at eight alike: `i64::MAX + 1` is
+/// `i64::MIN` and `u64::MAX + 1` is 0. Ordered by the sum, the group whose
+/// true total is the largest sorts below a group summing to 5, so the order
+/// is not the order of the totals.
+#[tokio::test]
+async fn an_integer_sum_wraps_on_overflow_at_one_and_eight_partitions() {
+    let sql = "SELECT k, sum(s) AS s, sum(u) AS u FROM t GROUP BY k ORDER BY s DESC";
+    for partitions in [1, 8] {
+        let ctx = integer_table_context(
+            &["a", "b", "a"],
+            vec![
+                ("s", Arc::new(Int64Array::from(vec![i64::MAX, 5, 1]))),
+                ("u", Arc::new(UInt64Array::from(vec![u64::MAX, 5, 1]))),
+            ],
+            partitions,
+        );
+        assert_eq!(
+            rows_of(&execute(&ctx, sql).await),
+            [["b", "5", "5"], ["a", "-9223372036854775808", "0"]],
+            "at {partitions} partitions",
+        );
+    }
 }
