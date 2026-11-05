@@ -2089,6 +2089,9 @@ pub(crate) struct KeyIndexPassRecord {
     pub(crate) held_capacity: u64,
     /// Whether every held pair's blocks `Vec` has capacity equal to its length.
     pub(crate) blocks_exact: bool,
+    /// Pairs the field's open slice held, from earlier passes, while this
+    /// pass filled its heap.
+    pub(crate) open_slice: u64,
 }
 
 #[cfg(test)]
@@ -2121,6 +2124,7 @@ fn record_key_index_pass(name: &str, field: &FieldBuild, share: u64) {
             .held
             .iter()
             .all(|pair| pair.0.blocks.capacity() == pair.0.blocks.len()),
+        open_slice: field.slice.entries.len() as u64,
     };
     KEY_INDEX_PASS_LOG.with(|log| log.borrow_mut().push(record));
 }
@@ -14344,19 +14348,7 @@ pub(crate) mod tests {
     /// pairs fit 2 passes.
     #[tokio::test]
     async fn carried_pairs_count_against_the_pair_budget() {
-        let inner = recording_store();
-        advancing_fixture(&inner).await;
-        let catalog = Catalog::new(
-            inner.clone(),
-            CatalogConfig {
-                key_index_build_max_pairs: 5,
-                ..kidx_config()
-            },
-        )
-        .expect("catalog");
-        take_key_index_pass_log_for_test();
-        let report = advancing_fold(&catalog).await;
-        let log = take_key_index_pass_log_for_test();
+        let (inner, report, log) = advancing_budget_fold(5).await;
         let k = |v: i64| u64::from_be_bytes(key8_i64(v));
         assert_eq!(
             pass_ranges(&log, USER_ID, 5),
@@ -14376,6 +14368,76 @@ pub(crate) mod tests {
             stored_leaves(inner.as_ref(), &second.parts[0]).await,
             from_scratch_leaves(inner.as_ref(), &second.parts[0]).await
         );
+    }
+
+    /// The advancing fold of [`advancing_fixture`] under `max_pairs`,
+    /// returning the store, the report and the pass log.
+    async fn advancing_budget_fold(
+        max_pairs: u64,
+    ) -> (Arc<RangeRecordingStore>, FoldReport, Vec<KeyIndexPassRecord>) {
+        let inner = recording_store();
+        advancing_fixture(&inner).await;
+        let catalog = Catalog::new(
+            inner.clone(),
+            CatalogConfig {
+                key_index_build_max_pairs: max_pairs,
+                ..kidx_config()
+            },
+        )
+        .expect("catalog");
+        take_key_index_pass_log_for_test();
+        let report = advancing_fold(&catalog).await;
+        let log = take_key_index_pass_log_for_test();
+        (inner, report, log)
+    }
+
+    /// Asserts the pair budget's bound on every pass in `log`: the pairs the
+    /// field's heap held at its peak plus the pairs its open slice held from
+    /// earlier passes are at most the larger of the pass's share and
+    /// `max_run`, the fixture's largest key8 run, plus the one pair placed
+    /// before a cut. Returns the number of passes checked.
+    fn assert_pass_bound(log: &[KeyIndexPassRecord], max_run: u64, what: &str) -> usize {
+        assert!(!log.is_empty(), "{what}: no pass recorded");
+        for record in log {
+            assert!(
+                record.held_peak + record.open_slice <= record.share.max(max_run) + 1,
+                "{what}: a pass held more than its share, open slice included: {record:?}"
+            );
+        }
+        log.len()
+    }
+
+    /// The pair budget bounds everything a pass holds, the open slice
+    /// included (ADR-3692 decision 5, the #3704 open-slice amendment): on
+    /// every pass, heap pairs at their peak plus open-slice pairs are at most
+    /// `max(share, largest key8 run) + 1`. Checked from scratch on the
+    /// 17-pair shared-key8 fixture (largest run 4) and the 12-pair budget
+    /// fixture under its 40-byte ceiling (largest run 1, so ceiling cuts fall
+    /// inside passes), and on the advancing fixture's 9 carried and 6 read
+    /// pairs (largest run 5), at budgets 1, 2, 3, 5, 6 and `u64::MAX`. A
+    /// slice cut only by the ceiling keeps every earlier pass's pairs: at
+    /// budget 5 the advancing fold's third pass held 5 in the heap and 10 in
+    /// the slice.
+    #[tokio::test]
+    async fn every_pass_holds_at_most_its_share_open_slice_included() {
+        for max_pairs in [1, 2, 3, 5, 6, u64::MAX] {
+            let (_, report, _, log) = shared_key8_fold(max_pairs, None).await;
+            let passes = assert_pass_bound(&log, 4, &format!("shared key8, budget {max_pairs}"));
+            assert_eq!(passes as u64, report.key_index_build_passes, "{report:?}");
+
+            let (_, report, _) = budget_fixture_fold(max_pairs).await;
+            let log = take_key_index_pass_log_for_test();
+            set_key_index_leaf_body_ceiling_for_test(None);
+            let passes = assert_pass_bound(&log, 1, &format!("budget fixture, budget {max_pairs}"));
+            assert_eq!(passes as u64, report.key_index_build_passes, "{report:?}");
+
+            let (_, report, log) = advancing_budget_fold(max_pairs).await;
+            let passes = assert_pass_bound(&log, 5, &format!("advancing, budget {max_pairs}"));
+            assert_eq!(passes as u64, report.key_index_build_passes, "{report:?}");
+            if max_pairs == 1 {
+                assert_eq!(passes, 11, "one pass per key8 run of the advancing tail");
+            }
+        }
     }
 
     /// Declares `columns` as typed columns carrying `key_index`, written at
