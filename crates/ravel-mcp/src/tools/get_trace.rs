@@ -54,6 +54,13 @@
 //!   `logs.span_lookup_budget`; `budget.actual` is their sum. The leg's
 //!   estimate is not an upper envelope, so a call with the leg never claims
 //!   one.
+//! - The span lookup and the leg resolve segments in two operations. The
+//!   top-level `visibility` and `coverage` are the span lookup's; the leg's
+//!   own are `logs.visibility` and `logs.coverage`, null on a leg that was
+//!   skipped or failed.
+//! - A leg block that does not fit beside zero spans loses its columns and
+//!   so every record; one still over the cap then loses `logs.visibility`
+//!   and `logs.coverage` too, keeping its status, counts and spend.
 //! - A leg that fails leaves the spans as they are and reports itself
 //!   `failed` with its failure class.
 
@@ -236,6 +243,8 @@ fn leg_block(leg: Leg, span_lookup: &Budget) -> (LogsLeg, Vec<Row>, bool) {
         row_cap_hit: false,
         bytes_cap_hit: false,
         rows_omitted: 0,
+        visibility: None,
+        coverage: None,
         budget: LegSpend::default(),
         span_lookup_budget,
     };
@@ -271,6 +280,8 @@ fn leg_block(leg: Leg, span_lookup: &Budget) -> (LogsLeg, Vec<Row>, bool) {
     block.bytes_cap_hit = shown.bytes_cap_hit;
     block.rows_omitted = shown.rows_omitted;
     block.row_count = envelope.data.row_count;
+    block.visibility = Some(envelope.visibility);
+    block.coverage = Some(envelope.coverage);
     block.columns = envelope.data.columns;
     (block, envelope.data.rows, false)
 }
@@ -634,7 +645,15 @@ fn finish(
             capped: true,
         });
         log_rows.clear();
-        fitted = envelope.fit_row_capped(cap, row_cap_omitted);
+        fitted = envelope.clone().fit_row_capped(cap, row_cap_omitted);
+        if finished_len(&mut fitted) > fit_cap(cap)
+            && let Some(leg) = envelope.logs.as_mut()
+        {
+            // Still no room: the block keeps its status, counts and spend.
+            leg.visibility = None;
+            leg.coverage = None;
+            fitted = envelope.fit_row_capped(cap, row_cap_omitted);
+        }
     }
     if message_cut && let Some(failure) = fitted.logs.as_mut().and_then(|leg| leg.failure.as_mut())
     {
@@ -1882,6 +1901,172 @@ mod tests {
         assert_eq!(leg.rows_omitted, 3);
         assert!(leg.bytes_cap_hit);
         assert_eq!(leg.status, LegStatus::OkBounded);
+        assert!(leg.visibility.is_some() && leg.coverage.is_some());
+        assert_eq!(actions(&envelope), [LOGS_STEP]);
+    }
+
+    /// The span lookup and the leg resolve segments in two operations, and
+    /// each one's snapshot and ingest watermark is reported in its own place:
+    /// the top-level `visibility` is the span lookup's, `logs.visibility` the
+    /// leg's.
+    ///
+    /// FLIP: leaving the leg's visibility out of the block (null) fails the
+    /// `logs.visibility` assertions.
+    #[test]
+    fn the_leg_reports_its_own_visibility_apart_from_the_span_lookup() {
+        let key = key();
+        let ctx = test_context(&key);
+        let stub = Stub::default();
+        // `records` resolves ingest hour 2 under a snapshot derived from its
+        // pins.
+        stub.sql.borrow_mut().push_back(records(&[("l1", 7)], 4));
+        let mut port = costed_spans();
+        port.visibility.snapshot_id = "span-snapshot".to_string();
+        port.visibility.ingest_watermark_hour = "1".to_string();
+        let envelope = call_with(&stub, port, with_logs(), &ctx);
+
+        assert_eq!(envelope.status, Status::Ok, "{envelope:?}");
+        assert_eq!(envelope.visibility.snapshot_id, "span-snapshot");
+        assert_eq!(envelope.visibility.ingest_watermark_hour, "1");
+        let wire = json_of(&envelope);
+        let visibility = &wire["logs"]["visibility"];
+        assert_eq!(visibility["ingest_watermark_hour"], json!("2"), "{wire}");
+        let snapshot = visibility["snapshot_id"]
+            .as_str()
+            .expect("the leg's snapshot id is a string");
+        assert!(
+            !snapshot.is_empty() && snapshot != "span-snapshot",
+            "{snapshot}"
+        );
+    }
+
+    /// A leg whose read was incomplete says so in `logs.coverage`, while the
+    /// top-level `coverage` stays the span lookup's complete one.
+    #[test]
+    fn an_incomplete_leg_says_so_in_its_own_coverage() {
+        let key = key();
+        let ctx = test_context(&key);
+        let stub = Stub::default();
+        let mut ran = records(&[("l1", 7)], 4);
+        ran.envelope.coverage = crate::envelope::Coverage {
+            complete: false,
+            partial: true,
+            fragments: vec!["shard 3".to_string()],
+            unindexed_predicates: Vec::new(),
+        };
+        stub.sql.borrow_mut().push_back(ran);
+        let envelope = call_with(&stub, costed_spans(), with_logs(), &ctx);
+
+        assert!(envelope.coverage.complete, "{:?}", envelope.coverage);
+        assert!(!envelope.coverage.partial);
+        assert!(envelope.coverage.fragments.is_empty());
+        let coverage = leg(&envelope)
+            .coverage
+            .as_ref()
+            .expect("the leg's coverage");
+        assert!(!coverage.complete);
+        assert!(coverage.partial);
+        assert_eq!(coverage.fragments, ["shard 3"]);
+    }
+
+    /// A leg that returned no records (zero columns, zero rows): the
+    /// smallest block a started leg can have.
+    fn empty_leg() -> Leg {
+        let mut envelope = Envelope::default();
+        envelope.coverage.complete = true;
+        let (actual, estimate) = leg_spend();
+        envelope.budget.actual = AnyJson(actual);
+        envelope.budget.estimate = AnyJson(estimate);
+        Leg::Ran(Box::new(envelope))
+    }
+
+    /// The boundary of the byte fit's leg recovery: spans that fill the fit
+    /// cap exactly beside an empty leg block, then one byte more. The byte
+    /// over is taken from the spans (the last one is dropped), never from the
+    /// leg, so the branch that cuts the leg's block is not reached from the
+    /// span side: the block always fits beside zero spans unless the block
+    /// itself is over the cap.
+    #[test]
+    fn spans_one_byte_over_beside_an_empty_leg_give_way_to_it() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
+        let call = request(with_logs()).expect("valid arguments");
+        let run_with = |len: usize| {
+            let mut port = costed_spans();
+            if let Some(last) = port.data.rows.last_mut() {
+                last[3] = Cell::Str("n".repeat(len));
+            }
+            finish(port, &call, Some(empty_leg()), &ctx).expect("finished")
+        };
+        let dropped = |envelope: &Envelope| tree(envelope).len() < 3;
+        let fit = fit_cap(MAX_RESPONSE_BYTES_FLOOR);
+        let (mut lo, mut hi) = (0usize, fit);
+        assert!(!dropped(&run_with(lo)));
+        assert!(dropped(&run_with(hi)));
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if dropped(&run_with(mid)) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+
+        let full = run_with(lo);
+        let size = serialized_len(&full);
+        assert!(size <= fit, "{size} B, over the {fit} B fit cap");
+        // The fit measured the cap filled; the steps and widest values it
+        // held room for and `finish` then removed account for the rest.
+        assert!(
+            size + 512 >= fit,
+            "{size} B does not fill the {fit} B fit cap"
+        );
+        assert!(!full.presentation.bytes_cap_hit);
+
+        let over = run_with(hi);
+        let size = serialized_len(&over);
+        assert!(size <= fit, "{size} B, over the {fit} B fit cap");
+        assert!(over.presentation.bytes_cap_hit);
+        assert_eq!(over.presentation.rows_omitted, 1);
+        let leg = leg(&over);
+        assert_eq!(leg.status, LegStatus::Ok);
+        assert!(!leg.bytes_cap_hit);
+        assert!(leg.visibility.is_some() && leg.coverage.is_some());
+    }
+
+    /// A leg block over the cap even once its columns and records are gone
+    /// (here an unbounded commit token list, which `ravel_search_logs`'s own
+    /// fit would have capped) is cut to its smallest form: status, counts and
+    /// spend, with `visibility` and `coverage` null. Every span is kept and
+    /// the final envelope is inside the cap.
+    ///
+    /// FLIP: without that last cut the envelope is over the cap.
+    #[test]
+    fn a_leg_block_over_the_cap_without_records_keeps_status_and_counts() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
+        let mut ran = records(&[("l1", 7), ("l2", 8), ("l3", 8)], 4).envelope;
+        ran.visibility.min_commit_tokens_applied =
+            vec!["t".repeat(MAX_RESPONSE_BYTES_FLOOR as usize)];
+        let call = request(with_logs()).expect("valid arguments");
+        let envelope =
+            finish(costed_spans(), &call, Some(Leg::Ran(Box::new(ran))), &ctx).expect("finished");
+
+        let len = serialized_len(&envelope);
+        assert!(len <= MAX_RESPONSE_BYTES_FLOOR as usize, "{len}");
+        assert_eq!(envelope.status, Status::Ok, "{envelope:?}");
+        assert_eq!(tree(&envelope).len(), 3, "every span is kept");
+        let leg = leg(&envelope);
+        assert_eq!(leg.status, LegStatus::OkBounded);
+        assert!(leg.bytes_cap_hit);
+        assert_eq!(leg.row_count, 3);
+        assert_eq!(leg.rows_omitted, 3);
+        assert!(leg.columns.is_empty() && leg.rows.is_empty());
+        assert!(leg.visibility.is_none() && leg.coverage.is_none());
+        let (leg_actual, _) = leg_spend();
+        assert_eq!(leg.budget.actual.0, leg_actual);
         assert_eq!(actions(&envelope), [LOGS_STEP]);
     }
 

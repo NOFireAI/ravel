@@ -227,8 +227,18 @@ ordered by `ts` then `observed_ts`. Its records come back in a top-level
 | `skipped_reason` | on `skipped`: why the leg did not start |
 | `columns`, `rows`, `row_count` | the records returned, and how many the executor answered |
 | `row_cap_hit`, `bytes_cap_hit`, `rows_omitted` | whether `max_rows` or `max_response_bytes` cut the records, and how many were left out |
+| `visibility` | the leg's own snapshot and ingest watermark, the shape of the top-level `visibility`; null on `skipped` and `failed` |
+| `coverage` | whether the leg's own read was complete, the shape of the top-level `coverage`; null on `skipped` and `failed` |
 | `budget` | the leg's own `actual` and `estimate`, with `estimate_is_upper_envelope` always false |
 | `span_lookup_budget` | the span lookup's own `actual`, `estimate` and `estimate_is_upper_envelope` |
+
+Two operations. The span lookup and the leg each resolve segments, so they
+can see different snapshots and ingest watermarks. The top-level
+`visibility` and `coverage` describe the span lookup only, and
+`logs.visibility` and `logs.coverage` the leg only: judge whether the log
+records are complete from `logs.coverage` and `logs.visibility`, never from
+the top-level blocks. The top-level `budget` is the sum of the two (see
+Cost below).
 
 Cost. No trace index covers logs: the leg reads the logs in `time_range`
 and keeps the records carrying the trace id, so its cost follows the
@@ -255,7 +265,10 @@ A failure message over 512 serialized bytes is cut there, ends with the
 `presentation.scalars_truncated`. `max_rows` applies to spans and to log
 records separately. `max_response_bytes` is shared, spans first: the
 records that fit beside the spans are kept, in order, and the rest are
-counted in `logs.rows_omitted`; the limit holds for the final envelope.
+counted in `logs.rows_omitted`; the limit holds for the final envelope. A
+`logs` block that does not fit beside zero spans loses its columns and so
+every record, and one still over the cap then has `logs.visibility` and
+`logs.coverage` null as well, keeping its status, counts and spend.
 The leg mints no cursor. A leg cut by either cap adds a `ravel_search_logs`
 next step naming the `trace_id` and the window, the route that pages
 through the rest.
