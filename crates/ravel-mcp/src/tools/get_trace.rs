@@ -141,14 +141,16 @@ enum Leg {
     /// It did not start, for the reason given.
     Skipped(&'static str),
     /// `ravel_search_logs`'s envelope: an error envelope when it failed.
-    Ran(Envelope),
+    Ran(Box<Envelope>),
 }
 
 async fn logs_leg<B: QueryBackend>(logs: &LogsCall, ctx: &ToolContext<'_>, backend: &B) -> Leg {
     if backend.time_left().is_some_and(|left| left.is_zero()) {
         return Leg::Skipped(LOGS_SKIPPED_NO_TIME);
     }
-    Leg::Ran(super::search_logs::run(logs.args.clone(), ctx, backend).await)
+    Leg::Ran(Box::new(
+        super::search_logs::run(logs.args.clone(), ctx, backend).await,
+    ))
 }
 
 /// The `logs` block for `leg`, and the records it read, held out of the
@@ -177,7 +179,7 @@ fn leg_block(leg: Leg, span_lookup: &Budget) -> (LogsLeg, Vec<Row>) {
             block.skipped_reason = Some(reason.to_string());
             return (block, Vec::new());
         }
-        Leg::Ran(envelope) => envelope,
+        Leg::Ran(envelope) => *envelope,
     };
     block.budget = LegSpend {
         actual: envelope.budget.actual,
