@@ -1,0 +1,450 @@
+# Pre-registration for the string fingerprint experiment (issue #3710,
+# ADR-3692 work package 4, Plan row T12). Written before any real
+# measurement was run, per the project's measurement discipline: every
+# figure below is a prediction, not a fit, with one exception. After the
+# first run, the `lines` bands of `openssh_body` and `apache_body` moved up
+# by one (655,146 to 655,147 and 56,481 to 56,482): the predictions were
+# `wc -l` counts, and the report counts records, which is one more when a
+# file's last line has no trailing newline. No decision bar moved.
+#
+# Every subject writes its corpus as a declared `Str` attribute column named
+# "value" (never the record body), with `block_records = 8192` (the
+# production `RlogConfig::default().block_target_records`) so block counts
+# and the bloom/contains baselines are measured at a realistic block size,
+# not the tiny fixture size `test_subjects.toml` uses for its own plumbing
+# test. `block_max_bytes` defaults to 8 MiB, i.e. about 1024 bytes/record at
+# this block size; every subject's lines are well under that, so block
+# counts below are predicted as `ceil(lines / 8192)` and not expected to be
+# perturbed by the byte cap.
+#
+# `gram_len = 3`, `df_threshold = 0.5`, `budget_share = 0.01` uniformly: the
+# budget share is set to the GO_BYTES_BAR itself (0.01), so the learned
+# vocabulary is built to target the same 1% bar `decide()` checks it against.
+#
+# Corpora (4 LogHub body subjects):
+#   Source: Zenodo record 8196385 (Loghub, CC-BY-4.0), confirmed live via the
+#   Zenodo API at measurement time.
+#     HDFS_v1.zip  186,645,559 bytes, sha256 04f919f2185821f23f045dca611a7586429bdabc601bd7b43f30005f8e289b01 -> HDFS.log    (11,175,629 lines, 1,577,982,906 bytes)
+#     BGL.zip       57,489,019 bytes, sha256 d67fd82a711aea0157a9b83175892c6ee60e384a2ddf5bc51f39118453816da8 -> BGL.log     (4,747,963 lines, 743,185,031 bytes)
+#     SSH.tar.gz     4,596,666 bytes, sha256 296610a35773f58b7c295e5407fc5ccdf48beb3c544fc14a6309addf904a2712 -> SSH.log     (655,147 lines (wc -l reports 655,146: the file has no trailing newline), 73,417,506 bytes)
+#     Apache.tar.gz    262,905 bytes, sha256 f2cb5014453c8a0f71596838e1639a2131ff6d360839ad280409f621a6cac452 -> Apache.log  (56,482 lines (wc -l reports 56,481: the file has no trailing newline), 5,135,876 bytes)
+#   Every archive's sha256 above is over the downloaded archive itself, not
+#   its extracted contents.
+#   Every LogHub subject below runs its FULL corpus (no --max-lines cap):
+#   all four are tractable well within a single bounded run.
+#
+# Corpus (4 ClickBench subjects):
+#   Source: https://datasets.clickhouse.com/hits_compatible/hits.parquet,
+#   the public "hits_compatible" file the ClickBench benchmark
+#   (https://github.com/ClickHouse/ClickBench) documents. This repository
+#   carries no pinned URL/sha256/row-count for this file anywhere
+#   (crates/ravel-bench/src/clickbench_parquet/ only ever builds a synthetic
+#   fixture for its own tests); this is the well-known public source, and
+#   the sha256/size below are what was actually observed on download, not a
+#   pre-existing pinned value. FLAGGED in the task's final report as a gap
+#   in the inherited task context.
+#     hits.parquet  14,779,976,446 bytes, sha256 a390f6cb782f6aaef278c72fc1dd86c4f30bc843ebab3c159e9bd4d45ddb079f
+#   SCOPE REDUCTION, also flagged in the final report: the full file is
+#   ~100M rows; at the measured real throughput (~34s per 1,000,000 rows of
+#   one column, written at realistic block_records=8192), one column's full
+#   scan is on the order of an hour, which does not fit this session's
+#   per-command execution budget (a background shell command here is not
+#   guaranteed to survive much past 10 minutes) without a multi-hour,
+#   multi-invocation chase. Every ClickBench subject below instead measures
+#   a --max-lines 10000000 PREFIX of the column (the first 10,000,000 rows
+#   of the file, about 10% of the real corpus) -- a real, not fabricated,
+#   sample of real production-shaped data, clearly short of the full-corpus
+#   run the original task likely intended.
+schema = 1
+
+[[subject]]
+name = "hdfs_body"
+corpus = "LogHub HDFS_v1, full corpus"
+source = "https://zenodo.org/record/8196385/files/HDFS_v1.zip (sha256 04f919f2185821f23f045dca611a7586429bdabc601bd7b43f30005f8e289b01) -> HDFS.log"
+column = "value"
+block_records = 8192
+gram_len = 3
+df_threshold = 0.5
+budget_share = 0.01
+
+[subject.bands]
+lines = [11175629, 11175629]
+blocks = [1228, 1502]
+compressed_bytes = [0, 1420184615]
+zstd_cpu_s = [0, 120]
+build_cpu_over_zstd = [0, 50]
+summary_bytes_share = [0, 1]
+seen_equals_false_positive_share = [0, 1]
+seen_like_false_positive_share = [0, 1]
+unseen_equals_false_positive_share = [0, 1]
+unseen_like_false_positive_share = [0, 1]
+bloom_equals_blocks_kept_share = [0, 1]
+contains_like_cells_tested_share = [0, 1]
+saturation_false_positive_share = [0, 1]
+
+[[subject.seen]]
+id = "hdfs_eq_seen"
+kind = "equals"
+literal = "081109 203518 143 INFO dfs.DataNode$DataXceiver: Receiving block blk_-1608999687919862906 src: /10.250.19.102:54106 dest: /10.250.19.102:50010"
+reason = "verbatim first line of HDFS.log, confirmed present (grep -Fxc = 1)"
+
+[[subject.seen]]
+id = "hdfs_like_seen"
+kind = "like"
+literal = "blk_-1608999687919862906"
+reason = "block id token, confirmed present as a substring 269 times in HDFS.log"
+
+[[subject.unseen]]
+id = "hdfs_eq_unseen"
+kind = "equals"
+literal = "string_fingerprint_unseen_equals_hdfs_probe_line_does_not_occur_anywhere"
+reason = "synthetic probe line, confirmed absent (grep -Fxc = 0)"
+
+[[subject.unseen]]
+id = "hdfs_like_unseen"
+kind = "like"
+literal = "sfp_unseen_like_hdfs_zzqqxyz"
+reason = "synthetic probe token, confirmed absent as a substring (grep -Fc = 0)"
+
+[[subject]]
+name = "bgl_body"
+corpus = "LogHub BGL, full corpus"
+source = "https://zenodo.org/record/8196385/files/BGL.zip (sha256 d67fd82a711aea0157a9b83175892c6ee60e384a2ddf5bc51f39118453816da8) -> BGL.log"
+column = "value"
+block_records = 8192
+gram_len = 3
+df_threshold = 0.5
+budget_share = 0.01
+
+[subject.bands]
+lines = [4747963, 4747963]
+blocks = [522, 638]
+compressed_bytes = [0, 668866528]
+zstd_cpu_s = [0, 60]
+build_cpu_over_zstd = [0, 50]
+summary_bytes_share = [0, 1]
+seen_equals_false_positive_share = [0, 1]
+seen_like_false_positive_share = [0, 1]
+unseen_equals_false_positive_share = [0, 1]
+unseen_like_false_positive_share = [0, 1]
+bloom_equals_blocks_kept_share = [0, 1]
+contains_like_cells_tested_share = [0, 1]
+saturation_false_positive_share = [0, 1]
+
+[[subject.seen]]
+id = "bgl_eq_seen"
+kind = "equals"
+literal = "- 1117838570 2005.06.03 R02-M1-N0-C:J12-U11 2005-06-03-15.42.50.363779 R02-M1-N0-C:J12-U11 RAS KERNEL INFO instruction cache parity error corrected"
+reason = "verbatim first line of BGL.log, confirmed present (grep -Fxc = 1)"
+
+[[subject.seen]]
+id = "bgl_like_seen"
+kind = "like"
+literal = "RAS KERNEL INFO"
+reason = "common log-level token, confirmed present as a substring 3,698,211 times in BGL.log"
+
+[[subject.unseen]]
+id = "bgl_eq_unseen"
+kind = "equals"
+literal = "string_fingerprint_unseen_equals_bgl_probe_line_does_not_occur_anywhere"
+reason = "synthetic probe line, confirmed absent (grep -Fxc = 0)"
+
+[[subject.unseen]]
+id = "bgl_like_unseen"
+kind = "like"
+literal = "sfp_unseen_like_bgl_zzqqxyz"
+reason = "synthetic probe token, confirmed absent as a substring (grep -Fc = 0)"
+
+[[subject]]
+name = "openssh_body"
+corpus = "LogHub SSH (OpenSSH), full corpus"
+source = "https://zenodo.org/record/8196385/files/SSH.tar.gz (sha256 296610a35773f58b7c295e5407fc5ccdf48beb3c544fc14a6309addf904a2712) -> SSH.log"
+column = "value"
+block_records = 8192
+gram_len = 3
+df_threshold = 0.5
+budget_share = 0.01
+
+[subject.bands]
+lines = [655147, 655147]
+blocks = [72, 89]
+compressed_bytes = [0, 66075755]
+zstd_cpu_s = [0, 20]
+build_cpu_over_zstd = [0, 50]
+summary_bytes_share = [0, 1]
+seen_equals_false_positive_share = [0, 1]
+seen_like_false_positive_share = [0, 1]
+unseen_equals_false_positive_share = [0, 1]
+unseen_like_false_positive_share = [0, 1]
+bloom_equals_blocks_kept_share = [0, 1]
+contains_like_cells_tested_share = [0, 1]
+saturation_false_positive_share = [0, 1]
+
+[[subject.seen]]
+id = "ssh_eq_seen"
+kind = "equals"
+literal = "Dec 10 06:55:46 LabSZ sshd[24200]: Invalid user webmaster from 173.234.31.186"
+reason = "verbatim line of SSH.log, confirmed present (grep -Fxc = 1)"
+
+[[subject.seen]]
+id = "ssh_like_seen"
+kind = "like"
+literal = "POSSIBLE BREAK-IN ATTEMPT"
+reason = "recurring alert phrase, confirmed present as a substring 19,406 times in SSH.log"
+
+[[subject.unseen]]
+id = "ssh_eq_unseen"
+kind = "equals"
+literal = "string_fingerprint_unseen_equals_ssh_probe_line_does_not_occur_anywhere"
+reason = "synthetic probe line, confirmed absent (grep -Fxc = 0)"
+
+[[subject.unseen]]
+id = "ssh_like_unseen"
+kind = "like"
+literal = "sfp_unseen_like_ssh_zzqqxyz"
+reason = "synthetic probe token, confirmed absent as a substring (grep -Fc = 0)"
+
+[[subject]]
+name = "apache_body"
+corpus = "LogHub Apache, full corpus"
+source = "https://zenodo.org/record/8196385/files/Apache.tar.gz (sha256 f2cb5014453c8a0f71596838e1639a2131ff6d360839ad280409f621a6cac452) -> Apache.log"
+column = "value"
+block_records = 8192
+gram_len = 3
+df_threshold = 0.5
+budget_share = 0.01
+
+[subject.bands]
+lines = [56482, 56482]
+blocks = [7, 10]
+compressed_bytes = [0, 4622288]
+zstd_cpu_s = [0, 10]
+build_cpu_over_zstd = [0, 50]
+summary_bytes_share = [0, 1]
+seen_equals_false_positive_share = [0, 1]
+seen_like_false_positive_share = [0, 1]
+unseen_equals_false_positive_share = [0, 1]
+unseen_like_false_positive_share = [0, 1]
+bloom_equals_blocks_kept_share = [0, 1]
+contains_like_cells_tested_share = [0, 1]
+saturation_false_positive_share = [0, 1]
+
+[[subject.seen]]
+id = "apache_eq_seen"
+kind = "equals"
+literal = "[Thu Jun 09 06:07:04 2005] [notice] LDAP: Built with OpenLDAP LDAP SDK"
+reason = "verbatim first line of Apache.log, confirmed present (grep -Fxc = 1)"
+
+[[subject.seen]]
+id = "apache_like_seen"
+kind = "like"
+literal = "LDAP"
+reason = "common module token, confirmed present as a substring 106 times in Apache.log"
+
+[[subject.unseen]]
+id = "apache_eq_unseen"
+kind = "equals"
+literal = "string_fingerprint_unseen_equals_apache_probe_line_does_not_occur_anywhere"
+reason = "synthetic probe line, confirmed absent (grep -Fxc = 0)"
+
+[[subject.unseen]]
+id = "apache_like_unseen"
+kind = "like"
+literal = "sfp_unseen_like_apache_zzqqxyz"
+reason = "synthetic probe token, confirmed absent as a substring (grep -Fc = 0)"
+
+[[subject]]
+name = "clickbench_url"
+corpus = "ClickBench hits_compatible, URL column, first 10,000,000 rows"
+source = "https://datasets.clickhouse.com/hits_compatible/hits.parquet, sha256 a390f6cb782f6aaef278c72fc1dd86c4f30bc843ebab3c159e9bd4d45ddb079f, column URL, --max-lines 10000000 (see file header: scope reduction from the full ~100,000,000-row file)"
+column = "value"
+block_records = 8192
+gram_len = 3
+df_threshold = 0.5
+budget_share = 0.01
+
+[subject.bands]
+lines = [10000000, 10000000]
+blocks = [1098, 1343]
+compressed_bytes = [0, 2000000000]
+zstd_cpu_s = [0, 120]
+build_cpu_over_zstd = [0, 50]
+summary_bytes_share = [0, 1]
+seen_equals_false_positive_share = [0, 1]
+seen_like_false_positive_share = [0, 1]
+unseen_equals_false_positive_share = [0, 1]
+unseen_like_false_positive_share = [0, 1]
+bloom_equals_blocks_kept_share = [0, 1]
+contains_like_cells_tested_share = [0, 1]
+saturation_false_positive_share = [0, 1]
+
+[[subject.seen]]
+id = "clickbench_url_eq_seen"
+kind = "equals"
+literal = "http://holodilnik.ru/russia/05jul2013&model=0"
+reason = "verbatim URL value observed near the start of the column (dump_column scratch tool), present within the first 10,000,000 rows"
+
+[[subject.seen]]
+id = "clickbench_url_like_seen"
+kind = "like"
+literal = "bonprix.ru"
+reason = "recurring domain fragment observed in multiple sampled URL values"
+
+[[subject.unseen]]
+id = "clickbench_url_eq_unseen"
+kind = "equals"
+literal = "string_fingerprint_unseen_equals_clickbench_url_probe_value_does_not_occur_anywhere"
+reason = "synthetic probe value, cannot occur in the corpus"
+
+[[subject.unseen]]
+id = "clickbench_url_like_unseen"
+kind = "like"
+literal = "sfp_unseen_like_clickbench_url_zzqqxyz"
+reason = "synthetic probe token, cannot occur in the corpus"
+
+[[subject]]
+name = "clickbench_title"
+corpus = "ClickBench hits_compatible, Title column, first 10,000,000 rows"
+source = "https://datasets.clickhouse.com/hits_compatible/hits.parquet, sha256 a390f6cb782f6aaef278c72fc1dd86c4f30bc843ebab3c159e9bd4d45ddb079f, column Title, --max-lines 10000000 (see file header: scope reduction from the full ~100,000,000-row file)"
+column = "value"
+block_records = 8192
+gram_len = 3
+df_threshold = 0.5
+budget_share = 0.01
+
+[subject.bands]
+lines = [10000000, 10000000]
+blocks = [1098, 1343]
+compressed_bytes = [0, 2000000000]
+zstd_cpu_s = [0, 120]
+build_cpu_over_zstd = [0, 50]
+summary_bytes_share = [0, 1]
+seen_equals_false_positive_share = [0, 1]
+seen_like_false_positive_share = [0, 1]
+unseen_equals_false_positive_share = [0, 1]
+unseen_like_false_positive_share = [0, 1]
+bloom_equals_blocks_kept_share = [0, 1]
+contains_like_cells_tested_share = [0, 1]
+saturation_false_positive_share = [0, 1]
+
+[[subject.seen]]
+id = "clickbench_title_eq_seen"
+kind = "equals"
+literal = "@дневники, работа и женщин поступивая ул, попохорошем качество дал"
+reason = "verbatim Title value observed near the start of the column (dump_column scratch tool), present within the first 10,000,000 rows"
+
+[[subject.seen]]
+id = "clickbench_title_like_seen"
+kind = "like"
+literal = "bonprix.ru"
+reason = "recurring domain fragment observed in multiple sampled Title values"
+
+[[subject.unseen]]
+id = "clickbench_title_eq_unseen"
+kind = "equals"
+literal = "string_fingerprint_unseen_equals_clickbench_title_probe_value_does_not_occur_anywhere"
+reason = "synthetic probe value, cannot occur in the corpus"
+
+[[subject.unseen]]
+id = "clickbench_title_like_unseen"
+kind = "like"
+literal = "sfp_unseen_like_clickbench_title_zzqqxyz"
+reason = "synthetic probe token, cannot occur in the corpus"
+
+[[subject]]
+name = "clickbench_searchphrase"
+corpus = "ClickBench hits_compatible, SearchPhrase column, first 10,000,000 rows"
+source = "https://datasets.clickhouse.com/hits_compatible/hits.parquet, sha256 a390f6cb782f6aaef278c72fc1dd86c4f30bc843ebab3c159e9bd4d45ddb079f, column SearchPhrase, --max-lines 10000000 (see file header: scope reduction from the full ~100,000,000-row file)"
+column = "value"
+block_records = 8192
+gram_len = 3
+df_threshold = 0.5
+budget_share = 0.01
+
+[subject.bands]
+lines = [10000000, 10000000]
+blocks = [1098, 1343]
+compressed_bytes = [0, 1000000000]
+zstd_cpu_s = [0, 120]
+build_cpu_over_zstd = [0, 50]
+summary_bytes_share = [0, 1]
+seen_equals_false_positive_share = [0, 1]
+seen_like_false_positive_share = [0, 1]
+unseen_equals_false_positive_share = [0, 1]
+unseen_like_false_positive_share = [0, 1]
+bloom_equals_blocks_kept_share = [0, 1]
+contains_like_cells_tested_share = [0, 1]
+saturation_false_positive_share = [0, 1]
+
+[[subject.seen]]
+id = "clickbench_searchphrase_eq_seen"
+kind = "equals"
+literal = "авомосква веб каменисный"
+reason = "verbatim SearchPhrase value observed near the start of the column (dump_column scratch tool), present within the first 10,000,000 rows"
+
+[[subject.seen]]
+id = "clickbench_searchphrase_like_seen"
+kind = "like"
+literal = "волна"
+reason = "recurring word fragment observed in a sampled SearchPhrase value"
+
+[[subject.unseen]]
+id = "clickbench_searchphrase_eq_unseen"
+kind = "equals"
+literal = "string_fingerprint_unseen_equals_clickbench_searchphrase_probe_value_does_not_occur_anywhere"
+reason = "synthetic probe value, cannot occur in the corpus"
+
+[[subject.unseen]]
+id = "clickbench_searchphrase_like_unseen"
+kind = "like"
+literal = "sfp_unseen_like_clickbench_searchphrase_zzqqxyz"
+reason = "synthetic probe token, cannot occur in the corpus"
+
+[[subject]]
+name = "clickbench_referer"
+corpus = "ClickBench hits_compatible, Referer column, first 10,000,000 rows"
+source = "https://datasets.clickhouse.com/hits_compatible/hits.parquet, sha256 a390f6cb782f6aaef278c72fc1dd86c4f30bc843ebab3c159e9bd4d45ddb079f, column Referer, --max-lines 10000000 (see file header: scope reduction from the full ~100,000,000-row file)"
+column = "value"
+block_records = 8192
+gram_len = 3
+df_threshold = 0.5
+budget_share = 0.01
+
+[subject.bands]
+lines = [10000000, 10000000]
+blocks = [1098, 1343]
+compressed_bytes = [0, 2000000000]
+zstd_cpu_s = [0, 120]
+build_cpu_over_zstd = [0, 50]
+summary_bytes_share = [0, 1]
+seen_equals_false_positive_share = [0, 1]
+seen_like_false_positive_share = [0, 1]
+unseen_equals_false_positive_share = [0, 1]
+unseen_like_false_positive_share = [0, 1]
+bloom_equals_blocks_kept_share = [0, 1]
+contains_like_cells_tested_share = [0, 1]
+saturation_false_positive_share = [0, 1]
+
+[[subject.seen]]
+id = "clickbench_referer_eq_seen"
+kind = "equals"
+literal = "https://go.mail/folder-1/online/ru-en/#lingvo/#1О 50000&price_ashka/rav4/page=/check.xml"
+reason = "verbatim Referer value observed near the start of the column (dump_column scratch tool), present within the first 10,000,000 rows"
+
+[[subject.seen]]
+id = "clickbench_referer_like_seen"
+kind = "like"
+literal = "yandex.ru"
+reason = "recurring domain fragment observed in a sampled Referer value"
+
+[[subject.unseen]]
+id = "clickbench_referer_eq_unseen"
+kind = "equals"
+literal = "string_fingerprint_unseen_equals_clickbench_referer_probe_value_does_not_occur_anywhere"
+reason = "synthetic probe value, cannot occur in the corpus"
+
+[[subject.unseen]]
+id = "clickbench_referer_like_unseen"
+kind = "like"
+literal = "sfp_unseen_like_clickbench_referer_zzqqxyz"
+reason = "synthetic probe token, cannot occur in the corpus"

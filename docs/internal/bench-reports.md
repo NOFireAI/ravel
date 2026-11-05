@@ -128,6 +128,96 @@ has exactly one report, that report is GO, and it has no band miss; it exits
 0 only on GO. The 2026-11-04 run's output is committed as
 `crates/ravel-bench/fixtures/logbody/rei_run_2026-11-04.txt`.
 
+## string_fingerprint_report
+
+Issue #3710 (ADR-3692 Plan row T12), the sibling experiment to the REI arm
+above (T11): a report-only measurement of a learned, conservative per-block
+string summary for equality and `LIKE '%literal%'` predicates on a declared
+`Str` column, against the production bloom and `Contains` baselines, with a
+pre-registered go/no-go. Nothing outside the report reads or writes the
+summary; no production format changes. The hypothesis under test
+(arXiv:2507.10391, "Instance-Optimized String Fingerprints") is that a
+lightweight, per-workload secondary index can approximate equality and
+substring predicates soundly (never a false negative) and generalize past the
+workload it was built from.
+
+The summary (`string_fingerprint::summary`) is a shared vocabulary of
+features selected from a *seen* predicate workload (equality literals
+verbatim; `LIKE` literals decomposed into fixed-length byte grams), with each
+block storing only its own bitset over that vocabulary -- a different shape
+than the REI arm's shared postings list, and conservative for any vocabulary
+by construction (a block is never pruned unless `BlockSummary::build` found
+the feature truly absent). An equality literal outside the vocabulary always
+survives unconditionally: an equality fingerprint has no way to generalize to
+a value it was never told about, so `unseen/equals/false_positive_share`
+measures that ceiling directly, not a defect in one run's literal selection.
+A `LIKE` literal can still be pruned when its grams happen to already be
+vocabulary entries built from other, seen literals, which is the
+generalization the hypothesis predicts and `unseen/like/false_positive_share`
+tests directly.
+
+Every subject (a corpus and a column) is written as a declared `Str`
+attribute under one fixed column name, `value`, with `RlogConfig` defaults,
+so the production bloom baseline (`ScanStats::blocks_after_bloom`) and
+`Contains` baseline (`ScanStats::contains_cells_tested`) both apply
+unmodified -- including for the LogHub body subjects, which would otherwise
+have no production `Contains` baseline to compare against if written as the
+record body instead. GO per subject requires
+`unseen/equals/false_positive_share` and `unseen/like/false_positive_share`
+both at most 0.10, `summary_bytes_share` at most 0.01, `build_cpu_over_zstd`
+at most 2, and `saturation/false_positive_share` (the unseen `LIKE` measure
+restricted to blocks holding a value over 1024 bytes) at most 0.30, or the
+subject is body-ineligible (no block that long, reported as a vacuous pass);
+overall GO requires every pre-registered subject to be GO. A production
+exact-residual scan over the same blocks gives the true holders; the summary
+keeping fewer blocks than that scan holds (a false negative) is a hard
+error, never a softly reported figure.
+
+```sh
+cargo run --release -p ravel-bench --bin string_fingerprint_report -- \
+  --subject hdfs_body --corpus-lines HDFS.log --out hdfs_body.json
+cargo run --release -p ravel-bench --bin string_fingerprint_report --features parquet-baseline -- \
+  --subject clickbench_url --corpus-parquet hits.parquet --corpus-column URL \
+  --max-lines 10000000 --out clickbench_url.json
+cargo run --release -p ravel-bench --bin string_fingerprint_report -- \
+  --decide hdfs_body.json bgl_body.json openssh_body.json apache_body.json \
+           clickbench_url.json clickbench_title.json clickbench_searchphrase.json clickbench_referer.json
+```
+
+The eight subjects, their corpora, parameters, and seen/unseen literal sets
+(each with a stated reason) are pre-registered in
+`crates/ravel-bench/fixtures/string_fingerprint/subjects.toml`: four LogHub
+body subjects (HDFS, BGL, OpenSSH, Apache from
+[Zenodo record 8196385](https://zenodo.org/record/8196385), full corpus) and
+four ClickBench `hits_compatible` columns (URL, Title, SearchPhrase, Referer;
+`https://datasets.clickhouse.com/hits_compatible/hits.parquet`, a
+10,000,000-row prefix -- about 10% of the full ~100,000,000-row file, a
+documented scope reduction from a full-corpus run given this tool's
+per-command execution budget). Neither corpus is checked in.
+
+The 2026-11-05 run's output (every figure, band, and decision line) is
+committed as
+`crates/ravel-bench/fixtures/string_fingerprint/string_fingerprint_run_2026-11-05.txt`.
+Result: **NO-GO overall**, and NO-GO on every one of the eight subjects.
+`unseen/equals/false_positive_share` was 1.0 on every subject, which the
+module doc identifies as a structural ceiling of an equality fingerprint
+rather than an implementation defect: no vocabulary built only from seen
+literals can prune a block for an equality literal it has never seen.
+`unseen/like/false_positive_share` was also 1.0 on every subject (the
+pre-registered unseen `LIKE` literals were chosen to be byte-disjoint from
+the corpus, so none of their grams could already be vocabulary entries from
+other seen literals). The four ClickBench subjects additionally failed the
+saturation leg at 1.0 against a 0.30 bar; the four LogHub subjects reported
+it as a vacuous pass (no value in those corpora exceeds 1024 bytes).
+`openssh_body` additionally failed the CPU bar (`build_cpu_over_zstd` =
+11.91, bar 2). No subject came close on the bytes bar (`summary_bytes_share`
+was at most 0.0003 against a 0.01 bar) or the seen-equals false-positive
+share (0 on every subject).
+
+A small corpus and subject spec for the module's own orchestration test live
+in `crates/ravel-bench/fixtures/string_fingerprint/` (`corpus.txt`,
+`test_subjects.toml`).
+
 ## Selective investigations (benchmarks/investigations)
 
 Issue #3699 (ADR-3692 decision 8, T1). Not a `ravel-bench` report: a box

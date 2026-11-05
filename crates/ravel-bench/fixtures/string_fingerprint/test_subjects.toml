@@ -1,0 +1,53 @@
+# A tiny fixture spec for string_fingerprint_report's own orchestration
+# test (corpus.txt, 4 lines). Not the real pre-registration file: see
+# subjects.toml for the eight real subjects this issue measures.
+schema = 1
+
+[[subject]]
+name = "test_subject"
+corpus = "test fixture"
+source = "crates/ravel-bench/fixtures/string_fingerprint/corpus.txt"
+column = "value"
+block_records = 2
+gram_len = 3
+df_threshold = 0.5
+budget_share = 0.5
+
+[subject.bands]
+lines = [0, 1000]
+blocks = [0, 100]
+compressed_bytes = [0, 100000]
+zstd_cpu_s = [0, 10]
+build_cpu_over_zstd = [0, 1000]
+summary_bytes_share = [0, 10]
+seen_equals_false_positive_share = [0, 1]
+seen_like_false_positive_share = [0, 1]
+unseen_equals_false_positive_share = [0, 1]
+unseen_like_false_positive_share = [0, 1]
+bloom_equals_blocks_kept_share = [0, 1]
+contains_like_cells_tested_share = [0, 1]
+saturation_false_positive_share = [0, 1]
+
+[[subject.seen]]
+id = "e1"
+kind = "equals"
+literal = "gamma"
+reason = "test: present verbatim in the corpus"
+
+[[subject.seen]]
+id = "l1"
+kind = "like"
+literal = "needle"
+reason = "test: present as a substring in the corpus"
+
+[[subject.unseen]]
+id = "e2"
+kind = "equals"
+literal = "other"
+reason = "test: holds in no corpus value"
+
+[[subject.unseen]]
+id = "l2"
+kind = "like"
+literal = "trace"
+reason = "test: present as a substring, never used to build the vocabulary"
