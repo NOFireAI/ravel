@@ -451,10 +451,15 @@ Why the merge happens:
      `ts` and the row ref for q25 and q27.
    - **Every emission path.** It applies the filter on the columnar path
      (`build_columnar_batches`, then `hold_batches`) and on the row path (`emit_next_row_batch`),
-     and on every sibling `LogsScanExec::reproject` and `sibling` build.
+     and on every rebuilt scan: `LogsScanExec::reproject`, `reproject_attr_keys` (which the
+     `AttrsPerKeyProjection` rule calls, `crates/ravel-sql/src/logs_scan/mod.rs:1836-1869`) and
+     `sibling`. `sibling` is an exhaustive struct literal, so the compiler catches a missing field
+     there; `reproject` and `reproject_attr_keys` rebuild through `Self::build` and a builder
+     chain, so the channel is threaded through `Self::build`'s signature, which makes the compiler
+     catch both of them as well.
    - **Row refs.** In phase 1 of late materialization, the row-ref column is built with the batch
      and filtered with it, so each kept row keeps its own reference.
-     - Phase 2 (`fetch_block`, `crates/ravel-sql/src/logs_scan/mod.rs:2838-2870`) resolves rows
+     - Phase 2 (`fetch_block`, `crates/ravel-sql/src/logs_scan/mod.rs:2859-2870`) resolves rows
        by position in the reader's surviving-row list. That list is rebuilt from `content` and
        `prune` only (`query()`, `:2838-2847`).
      - So phase 2 does not apply `row_filters`, and nothing may recompute a reference after the
@@ -523,8 +528,8 @@ every row when all of these hold:
      (`mod.rs:742-744`, `scan.rs:721`).
    - It does not change any other column's values, because each declared column is built from
      its own cursor.
-3. **Every row passes through it.** Both emission paths and every sibling scan apply the filter.
-   No path emits a batch without it.
+3. **Every row passes through it.** Both emission paths and every rebuilt scan (`reproject`,
+   `reproject_attr_keys`, `sibling`) apply the filter. No path emits a batch without it.
 4. **Nothing downstream assumes the scan is unfiltered.** The statistics gates (decision 4), the
    metadata rewrite gate, and the fetch count all see the channel.
    - `logs_scan_residual` drops every conjunct that `filter_is_exact` accepts
@@ -585,15 +590,17 @@ lanes.
 1. **The scan narrows its own output by a pushed Str `<>` conjunct.**
    - Adds the `row_filters` channel and its extraction, the physical-expression build in
      `LogsTableProvider::scan`, the filter column in the build projection, the filter on both
-     emission paths and in `reproject`/`sibling`, the post-filter fetch count, the two statistics
-     gates, the counter and the EXPLAIN field.
+     emission paths and in `reproject`, `reproject_attr_keys` and `sibling`, the post-filter
+     fetch count, the two statistics gates, the counter and the EXPLAIN field.
    - The provider still reports the conjunct `Inexact`, so the `FilterExec` stays above the scan.
      It cannot put back a row the scan wrongly drops. So answers change in this PR only if the
      scan drops a row the `FilterExec` would keep. T2 pins that, against a reference with no
      in-scan filter.
    - Tests T2, T3 (exec level), T5 (exec level), T7 and T8.
    - Observable change: `rows_dropped_by_row_filter` is non-zero, and the `FilterExec` above drops
-     zero rows.
+     zero rows. Both evaluators run on the affected statements until PR 2 lands, so a timing run
+     between the two pull requests reads the conjunct's per-row cost twice and is not a
+     regression signal.
 2. **The provider reports the conjunct `Exact`, and DataFusion deletes the filter.**
    - `leaf_is_exact` recognizes the decision 1 shape.
    - The same commit updates the prose that states the old rule:
@@ -601,9 +608,15 @@ lanes.
      - the `supports_filters_pushdown` doc (`logs_provider.rs:418-443`);
      - the `logs_pushdown` module doc (`:1-8`);
      - the scan's correctness doc (`logs_scan/mod.rs:318-323`).
-   - Tests T1, T3 (SQL), T4, T5 (SQL), T6 and T9. `str_typed_column_declines_and_keeps_the_scan`
-     (`crates/ravel-sql/tests/logs_metadata_agg.rs:733`) gains an answer assertion.
-   - Before this PR, read `plan_aggregate_profile` (`crates/ravel-sql/src/memory.rs:671`). It is
+   - Tests T1, T3 (SQL), T4, T5 (SQL), T6 and T9.
+   - `str_typed_column_declines_and_keeps_the_scan`
+     (`crates/ravel-sql/tests/logs_metadata_agg.rs:733`) keeps passing for another reason once the
+     conjunct is `Exact`: with no `FilterExec`, `rewrite` declines at its missing-filter check
+     (`crates/ravel-sql/src/metadata_agg.rs:679-681`) before it reaches the `DeclaredType::Str`
+     gate (`logs_scan/mod.rs:2454`). This PR rewrites its comment, adds an answer assertion, and
+     keeps a direct pin of the Str gate: a case whose filter is not the exact shape, or a
+     unit-level call.
+   - Before this PR, read `plan_aggregate_profile` (`crates/ravel-sql/src/memory.rs:726`). It is
      behind the layout pinned for the q14 statement at `crates/ravel-sql/src/executor.rs:10419-10423`,
      and it is not established whether it reads through the FilterExec.
 3. **The paired run.** No code. Pre-register the bands below on #3231 before the run. Run one
@@ -649,11 +662,14 @@ before the pull request merges.
   - Run `SELECT "SearchEngineID", COUNT(*) ... WHERE "SearchPhrase" <> '' GROUP BY 1` (the q31
     shape), `SELECT COUNT(*) ... WHERE s <> ''`, and the late-materialized
     `SELECT s FROM logs WHERE s <> '' ORDER BY ts LIMIT 3`, where the `''` rows have the earliest
-    timestamps.
+    timestamps, and the attrs-per-key shape `SELECT attrs['k'] FROM logs WHERE s <> ''`, which
+    plans through `AttrsPerKeyProjection` and `reproject_attr_keys`.
   - Wrong implementations:
     - (a) evaluating only when the column is in the output projection, which counts every row;
     - (b) a `reproject` sibling that drops `row_filters`, so phase 1 picks the `''` rows and the
       statement returns empty strings;
+    - (b2) a `reproject_attr_keys` rebuild that drops `row_filters`, so the attrs-per-key
+      statement returns the `''` rows;
     - (c) a column-index mapping that is off after the projection is widened, caught with two
       declared Str columns in the fixture;
     - (d) for the late-materialized case with `''` rows placed between referenced rows of the
@@ -667,10 +683,14 @@ before the pull request merges.
   - Each must return the filtered answer. The plan must keep `LogsScanExec` and must not hold
     `MetadataOnlyExec`.
   - Wrong implementations:
-    - (a) `row_filters` missing from `stats_are_exact`, so `AggregateStatistics` answers the
-      count from `sample_count` and MIN/MAX from the segment stamps;
-    - (b) `row_filters` missing from `metadata_rewrite_stats_are_exact` only, so the SUM is
-      answered from the stored sum.
+    `stats_are_exact` is `self.prune.is_empty() && self.metadata_rewrite_stats_are_exact()`
+    (`crates/ravel-sql/src/logs_scan/mod.rs:2257-2259`), so a gate in the inner method covers
+    both. The two wrong implementations the code can express are:
+    - (a) the gate added to neither method, so `AggregateStatistics` answers the count from
+      `sample_count` and MIN/MAX from the segment stamps, and the SUM is answered from the stored
+      sum;
+    - (b) the gate added to `stats_are_exact` only, leaving the metadata rewrite exact, so the
+      SUM is answered from the stored sum while COUNT, MIN and MAX are right.
 - **T5, fetch.**
   - Run `SELECT s FROM logs WHERE s <> '' LIMIT 5` on one partition whose first block starts
     with ten `''` rows. It must return exactly five non-empty rows.
@@ -712,7 +732,8 @@ before the pull request merges.
 ### Bands
 
 These are the figures for PR 3. Every ratio is B / A. Each figure must be present exactly once and
-inside its band. The rows come from two runs:
+inside its band. On every row the band and the miss are complementary: a figure outside its band
+is a miss. The rows come from two runs:
 
 - **Paired `cpuab` timing run.** This produces the hot-sum, geomean, per-statement ratio,
   counter and answer rows. A and B are interleaved on one box, with an 8 GB decoded cache and
@@ -723,11 +744,11 @@ inside its band. The rows come from two runs:
 
 | Figure | Band | Miss | Basis |
 |---|---|---|---|
-| Dictionary merge removed: `merge_dictionary_values` plus `concat_dictionaries` inclusive, hot-wall weighted, A minus B, over q11-q15 and q25-q29 | 0.301 to 0.602 s (50 to 100% of 0.602 s; the reachable ceiling is 0.596 s, since q23 and q40 keep their FilterExec) | below 0.301 s | predicted; #3231 comment 6655737907 |
+| Dictionary merge removed: `merge_dictionary_values` plus `concat_dictionaries` inclusive, hot-wall weighted, A minus B, over q11-q15 and q25-q29 | at least 0.301 s (50% of 0.602 s; the reachable ceiling is 0.596 s, since q23 and q40 keep their FilterExec) | below 0.301 s | predicted; #3231 comment 6655737907 |
 | Hot-sum saving, A minus B | 0.18 to 0.36 s | outside 0.18 to 0.36 s | predicted; #3231 comment 6655737907 |
 | 43-statement hot geomean ratio | 0.984 to 0.992 | outside 0.984 to 0.992 | predicted; #3231 comment 6655737907 |
 | `FilterExec` in B's plan | absent on q11-q15, q25-q29, q31, q32; present on q22, q23, q37-q43 | any other placement | predicted; research.md item 4 table, from `queries.sql` at 637aaa80a |
-| q31, q32 hot wall ratio (FilterExec goes, no dictionary to merge) | at most 1.00 | above 1.02 | predicted; #3231 comment 6655737907 (no merge listed for them) |
+| q31, q32 hot wall ratio (FilterExec goes, no dictionary to merge) | at most 1.02 | above 1.02 | predicted; #3231 comment 6655737907 (no merge listed for them) |
 | q22, q23, q37, q38 hot wall ratio (the conjunct moves into the scan, FilterExec stays) | 0.98 to 1.02 | outside 0.98 to 1.02 | predicted; width from docs/adrs/3326-decoded-column-block-cache.md:800 |
 | Every other statement's hot wall ratio | 0.98 to 1.02, unchanged | outside 0.98 to 1.02 | predicted; #3231 comment 6655737907; width from docs/adrs/3326-decoded-column-block-cache.md:800 |
 | Rows the scan drops (`rows_dropped_by_row_filter`), per statement whose FilterExec goes | equal to A's FilterExec input rows minus output rows for the same statement | any difference | predicted |
