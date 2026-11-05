@@ -228,6 +228,10 @@ pub(crate) fn emit_request_report(config: &CompactorConfig, bucket: &Bucket, ok:
             total_requests = r.total_requests(),
             total_wire_bytes_received = r.total_wire_bytes_received(),
             total_wire_bytes_sent = r.total_wire_bytes_sent(),
+            // ADR-3819: the RLOG merge's stream-range passes and the raw
+            // row-group bytes it held resident (stored bytes, not wire bytes).
+            merge_passes = r.merge_passes,
+            merge_resident_bytes = r.merge_resident_bytes,
             "compaction store requests by phase (received and sent bytes are different kinds; do not sum them together)"
         );
     }

@@ -535,6 +535,86 @@ impl RlogRangeReader {
         StreamBlockRows::new(self, decoded, loc.stream_ref)
     }
 
+    /// Decode `block` out of a fetched row group once and keep it in columnar
+    /// form, as one view over every row whose `stream_ref` satisfies `wanted`,
+    /// in ascending row order. [`StreamBlockRows::peek_stream_ref`] names the
+    /// next row's stream, so a merge over many streams of one group decodes
+    /// each block once instead of once per stream and still materializes one
+    /// [`LogRecord`] at a time.
+    ///
+    /// `group_bytes` must be the object's `[loc.start, loc.end)` range, and
+    /// `block` must lie in that row group; `loc` may be any stream's loc over
+    /// the group. The rows of one stream come back in the order, and as the
+    /// records, that draining [`Self::block_rows_in_group`] for that stream's
+    /// loc yields. A block whose `stream_ref` column descends is refused as
+    /// corrupt: rows are stored `stream_ref`-major, and a caller splitting the
+    /// view by stream relies on it.
+    ///
+    /// The view's row vectors are allocated at exactly the wanted row count,
+    /// so its [`StreamBlockRows::heap_estimate`] is the decoded block plus 16
+    /// bytes per wanted row.
+    pub fn block_rows_for_refs<'r>(
+        &'r self,
+        loc: &StreamBlockLoc,
+        block: usize,
+        group_bytes: &[u8],
+        wanted: impl Fn(u32) -> bool,
+    ) -> Result<StreamBlockRows<'r>, LogSegError> {
+        let plans = self.check_loc_bytes(loc, group_bytes)?;
+        if self.extent_of(&[block])? != (loc.start, loc.end) {
+            return Err(LogSegError::Corrupted(
+                "block is not in this loc's row group".into(),
+            ));
+        }
+        let decoded = self.decode_one_block(
+            block,
+            loc.start,
+            group_bytes,
+            &plans,
+            &mut DictCache::default(),
+        )?;
+        let stream_ref_at = |row: usize| -> Result<u32, LogSegError> {
+            u32::try_from(i64_at(&decoded, COL_STREAM_REF, row)?)
+                .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))
+        };
+        // Count first so the row vectors are allocated once at their exact
+        // size: the caller charges the view's heap before it holds it.
+        let mut previous = 0u32;
+        let mut kept = 0usize;
+        for row in 0..decoded.record_count() {
+            let sref = stream_ref_at(row)?;
+            if sref < previous {
+                return Err(LogSegError::Corrupted(
+                    "block stream_ref column descends".into(),
+                ));
+            }
+            previous = sref;
+            kept += usize::from(wanted(sref));
+        }
+        let mut rows = Vec::with_capacity(kept);
+        let mut row_ts = Vec::with_capacity(kept);
+        let mut row_refs = Vec::with_capacity(kept);
+        for row in 0..decoded.record_count() {
+            let sref = stream_ref_at(row)?;
+            if !wanted(sref) {
+                continue;
+            }
+            rows.push(
+                u32::try_from(row).map_err(|_| LogSegError::Corrupted("block row index".into()))?,
+            );
+            row_ts.push(i64_at(&decoded, COL_TS, row)?);
+            row_refs.push(sref);
+        }
+        Ok(StreamBlockRows {
+            reader: self,
+            block: decoded,
+            rows,
+            row_ts,
+            refs: RowRefs::PerRow(row_refs),
+            pos: 0,
+        })
+    }
+
     /// Check that `bytes` is exactly `loc`'s fetched range and return the column
     /// plans a decode of it needs.
     fn check_loc_bytes(
@@ -623,8 +703,18 @@ pub struct StreamBlockRows<'r> {
     /// row's timestamp to validate the column, so keeping the value removes a
     /// per-peek column resolution.
     row_ts: Vec<i64>,
+    /// Which stream each retained row belongs to.
+    refs: RowRefs,
     /// Index into `rows` of the next row to yield.
     pos: usize,
+}
+
+/// The stream of each row a [`StreamBlockRows`] retains: one stream for a view
+/// built for a stream, or a per-row vector, parallel to `rows`, for a view
+/// built by [`RlogRangeReader::block_rows_for_refs`] over several.
+enum RowRefs {
+    One(u32),
+    PerRow(Vec<u32>),
 }
 
 impl<'r> StreamBlockRows<'r> {
@@ -669,8 +759,20 @@ impl<'r> StreamBlockRows<'r> {
             block: decoded,
             rows,
             row_ts,
+            refs: RowRefs::One(stream_ref),
             pos: 0,
         })
+    }
+
+    /// The next row's `stream_ref`, or `None` once the view is exhausted.
+    pub fn peek_stream_ref(&self) -> Option<u32> {
+        if self.is_exhausted() {
+            return None;
+        }
+        match &self.refs {
+            RowRefs::One(stream_ref) => Some(*stream_ref),
+            RowRefs::PerRow(refs) => refs.get(self.pos).copied(),
+        }
     }
 
     /// The next row's `ts_ns`, read straight out of the decoded timestamp
@@ -703,7 +805,8 @@ impl<'r> StreamBlockRows<'r> {
     /// vector's allocation at capacity, plus each present string or
     /// fixed-width cell's own buffer, with a dictionary column's distinct
     /// values counted once rather than once per row), and this view's own
-    /// row-index vector at capacity.
+    /// row-index, timestamp and (for a several-stream view) stream-ref
+    /// vectors at capacity.
     ///
     /// It does NOT count the stored (still compressed) block or row-group bytes
     /// the block was decoded from: those are the caller's buffer, charged
@@ -717,7 +820,14 @@ impl<'r> StreamBlockRows<'r> {
         let columnar = self.block.decoded_heap_bytes() as u64;
         let row_index = (self.rows.capacity() * std::mem::size_of::<u32>()) as u64;
         let ts_index = (self.row_ts.capacity() * std::mem::size_of::<i64>()) as u64;
-        columnar.saturating_add(row_index).saturating_add(ts_index)
+        let ref_index = match &self.refs {
+            RowRefs::One(_) => 0,
+            RowRefs::PerRow(refs) => (refs.capacity() * std::mem::size_of::<u32>()) as u64,
+        };
+        columnar
+            .saturating_add(row_index)
+            .saturating_add(ts_index)
+            .saturating_add(ref_index)
     }
 }
 
@@ -1109,6 +1219,91 @@ mod tests {
             assert_eq!(lazy, whole, "lazy drain == eager whole-stream decode");
             assert_eq!(lazy, expected, "and all three equal the written records");
         }
+    }
+
+    /// One decode per block serves every stream: decoding each candidate block
+    /// of the union of both streams' row groups once, with both refs wanted,
+    /// and splitting the rows by `stream_ref` gives each stream exactly the
+    /// records, in the same order, that draining its own `StreamBlockRows`
+    /// gives. A block of another row group is refused rather than decoded at
+    /// the wrong base.
+    #[test]
+    fn block_rows_for_refs_splits_into_each_streams_drain() {
+        let object = write_object();
+        let reader = reader_of(&object);
+        let refs: Vec<u32> = (0..2u8)
+            .map(|s| reader.stream_dir().stream_ref(&sid(s)).expect("ref"))
+            .collect();
+        let mut groups: Vec<StreamBlockLoc> = Vec::new();
+        let mut blocks: Vec<usize> = Vec::new();
+        for s in 0..2u8 {
+            for loc in reader
+                .stream_blocks(&sid(s))
+                .expect("stream_blocks")
+                .expect("stream present")
+            {
+                blocks.extend(loc.block_indices().iter().copied());
+                if !groups.iter().any(|g| g.start() == loc.start()) {
+                    groups.push(loc);
+                }
+            }
+        }
+        blocks.sort_unstable();
+        blocks.dedup();
+        groups.sort_by_key(|g| g.start());
+        assert!(groups.len() > 1, "the fixture must span row groups");
+
+        let mut split: Vec<Vec<LogRecord>> = vec![Vec::new(), Vec::new()];
+        let mut decodes = 0usize;
+        for &b in &blocks {
+            let group = groups
+                .iter()
+                .find(|g| reader.extent_of(&[b]).expect("extent") == (g.start(), g.end()))
+                .expect("block's group");
+            let bytes = slice(&object, group.start(), group.end());
+            let mut view = reader
+                .block_rows_for_refs(group, b, &bytes, |r| refs.contains(&r))
+                .expect("rows for refs");
+            decodes += 1;
+            let wanted = view.remaining();
+            assert!(view.heap_estimate() > 0, "a decoded block holds heap");
+            assert_eq!(
+                view.heap_estimate(),
+                view.block.decoded_heap_bytes() as u64 + 16 * wanted as u64,
+                "row vectors are sized exactly: 4 + 8 + 4 bytes per wanted row"
+            );
+            let mut last_ref = 0u32;
+            while let Some(sref) = view.peek_stream_ref() {
+                assert!(sref >= last_ref, "refs come out ascending");
+                last_ref = sref;
+                let ts = view.peek_ts().expect("peek with a ref");
+                let rec = view.next().expect("row").expect("rebuild");
+                assert_eq!(rec.ts_ns, ts, "peek_ts is the popped row's");
+                let s = refs.iter().position(|r| *r == sref).expect("wanted ref");
+                split[s].push(rec);
+            }
+            assert!(view.is_exhausted() && view.peek_ts().is_none());
+        }
+        assert_eq!(decodes, blocks.len(), "one decode per block");
+        for s in 0..2u8 {
+            let lazy = drain_lazy(&reader, &object, &sid(s));
+            assert_eq!(lazy.len() as i64, PER_STREAM, "exact record count");
+            assert_eq!(split[usize::from(s)], lazy, "stream {s}: split == drain");
+        }
+
+        let first = &groups[0];
+        let other = blocks
+            .iter()
+            .copied()
+            .find(|&b| reader.extent_of(&[b]).expect("extent") != (first.start(), first.end()))
+            .expect("a block of another group");
+        let bytes = slice(&object, first.start(), first.end());
+        assert!(
+            reader
+                .block_rows_for_refs(first, other, &bytes, |_| true)
+                .is_err(),
+            "a block outside the loc's row group is refused"
+        );
     }
 
     /// `peek_ts` reads the next row's timestamp out of the decoded ts column and

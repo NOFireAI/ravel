@@ -305,7 +305,8 @@ writer's one in-progress part (bounded by `max_l1_part_bytes`, needed anyway
 because the L1 key is content-addressed, so the object must be complete
 before its key exists). The bound is independent of stream size and record
 count; the surviving input-count term is directory metadata only, and is
-stated, not hidden.
+stated, not hidden. (ADR-3819 adds a resident term and a pass term to this
+peak; see the ADR-3819 read-plan amendment below.)
 
 **Acceptance test.** A `MergeMemoryTracker` seam (test-injectable, default
 no-op) accounts fetched block bytes, decoded-block residency, and the
@@ -456,3 +457,49 @@ and logs a warning, not repeated while the body is unchanged; it deletes
 nothing, so an older, smaller snapshot of the same process stays until the
 staleness bound excludes it. A skipped or refused snapshot costs its units
 the cold rescan decision 3 already falls back to, never correctness.
+
+## Amendment (2026-11-04): the RLOG merge reads each input once (ADR-3819)
+
+<!-- amendment-applies: sections="4. RLOG compaction: a real memory bound" pointer="ADR-3819 read-plan amendment" -->
+
+Decision 4's merge opened one cursor per input for every stream, and a
+cursor fetches the whole row group its stream's blocks sit in. A row group
+carries rows of many streams, so a merge fetched each input once per stream
+it carries (issue #3819). ADR-3819 replaces that read path without changing
+the emitted record sequence, so every L1 part keeps its bytes and key.
+
+The merge now picks one of three read modes from catalog metadata before it
+fetches any block, and logs the mode and the sum it compared:
+
+- **resident**: every input's row groups are fetched once and held for the
+  whole merge, when their raw bytes plus the pass floor plus the largest
+  cursor charge of a hot stream fit `merge_resident_ceiling_bytes`;
+- **fetch-per-pass**: each stream-range pass fetches the row groups its
+  streams fall in, when that fits instead;
+- **cursor**: decision 4's merge, unchanged, when neither fits.
+
+Under the first two, the sorted streams are emitted in contiguous ranges. A
+pass decodes each of its row groups' blocks once and retains the range's
+rows until they are emitted. A stream whose estimate alone exceeds the pass
+budget keeps decision 4's per-input cursors, which read the held row groups
+in resident mode.
+
+The peak this decision states becomes: per-input catalog metadata, plus the
+resident raw row groups (resident mode only; at most the resident ceiling
+less the pass floor), plus one pass's retained rows (at most the pass
+budget), plus the in-progress part. While a hot stream is on cursors, the
+cursors' transient term stands in for the pass rows.
+
+The `MergeMemoryTracker` keeps decision 4's transient term (fetched plus
+decoded) and records the resident raw bytes and the pass rows as two terms
+of their own. The transient term's bound is the one decision 4 states, and
+it stays independent of stream size. The acceptance test
+`merge_peak_memory_is_bounded_independently_of_stream_size` now runs the
+hot stream at the default ceiling and on cursors under a small ceiling. It
+asserts that bound together with `resident + pass rows <= ceiling`.
+
+One property of decision 4 is narrower now. The pass-rows term is bounded
+by the pass budget, not by block size, so under a large ceiling one pass
+may hold every row of a stream whose estimate fits that budget. "No path
+gathers a whole stream" holds for every stream too large for a pass, which
+is the hot-stream case decision 4 exists for.
