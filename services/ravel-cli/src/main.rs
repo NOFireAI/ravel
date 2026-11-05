@@ -2695,8 +2695,29 @@ enum CatalogCommand {
     },
 }
 
+/// The log filter when `RUST_LOG` is unset: warnings from every crate, plus
+/// `ravel_maintain`'s info lines (the RLOG merge's read mode, among others),
+/// which are the operator's view into a compaction run.
+const DEFAULT_LOG_FILTER: &str = "warn,ravel_maintain=info";
+
+/// Install the process's tracing subscriber. It writes to stderr only: stdout
+/// carries the reports and JSON documents callers parse. `RUST_LOG`, when set,
+/// replaces [`DEFAULT_LOG_FILTER`] entirely.
+fn init_tracing() {
+    use std::io::IsTerminal as _;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER));
+    // A second subscriber cannot be installed; the first one stays in force.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .try_init();
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_tracing();
     run(parse_cli(std::env::args_os()).unwrap_or_else(|err| err.exit())).await
 }
 
