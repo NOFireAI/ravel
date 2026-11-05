@@ -1,0 +1,484 @@
+# Pre-registration for the string fingerprint experiment (issue #3710,
+# ADR-3692 work package 4, Plan row T12), fix round 1. Committed alone,
+# before the first corpus run of this design. A later band edit is a new
+# commit saying what moved and why, and the report lists it.
+#
+# Every run parameter of a subject is fixed here. string_fingerprint_report
+# refuses a command-line value that differs, before it reads the corpus.
+#
+# Shared parameters and why:
+#   block_records = 8192     RlogConfig::default().block_target_records.
+#   object_records = 262144  32 blocks, one row group at the default
+#                            group_target_blocks = 32.
+#   zstd_level = 3           RlogConfig::default().zstd_level (writer.rs:102).
+#   gram_len = 3
+#   budget_share = 0.01      the GO bytes bar itself: the summary is sized to
+#                            the bar, so the question is what false-positive
+#                            rate 1 % of the compressed column buys.
+#   fallback_min_bits = 256
+#   seed = 3710
+#   literals_per_kind = 40   per kind (= and LIKE) and per set (training and
+#                            evaluation), half present, half absent.
+#   like_min_len = 5, like_max_len = 12
+#                            ClickBench q21-q24 needles are 6-9 bytes
+#                            ('%google%', '%.google.%').
+#   eq_max_len = 64          EXACT_BLOOM_MAX (ravel-logseg writer.rs:238), so
+#                            every evaluation equality literal is one the
+#                            production bloom can test; except the three
+#                            LogHub subjects with no line of 64 bytes or fewer
+#                            (describe at_most_64_bytes=0), which take
+#                            eq_max_len = 1024 (every line) and report no bloom
+#                            figure: the bloom cannot test any of their
+#                            equality literals.
+#
+# Corpora (describe lines from string_fingerprint_report --describe):
+#   LogHub, Zenodo record 8196385 (CC-BY-4.0). Archive sha256 as downloaded;
+#   the extracted file's sha256 is also in each run's stamp line.
+#     Apache.tar.gz f2cb5014453c8a0f71596838e1639a2131ff6d360839ad280409f621a6cac452
+#       Apache.log 23e616a1ed529bab9b20b9bc345d37035061eee971d246102bcc4937e51a039b
+#       values=56482 bytes=5079395 mean_len=89.9 distinct=28326 at_most_64_bytes=7118 over_1024_bytes=0
+#     SSH.tar.gz 296610a35773f58b7c295e5407fc5ccdf48beb3c544fc14a6309addf904a2712
+#       SSH.log 89eee9e36c182722f9fadc6e5617a4818ffc66109e7e222b8f9e8b78fc3aa2f3
+#       values=655147 bytes=72107214 mean_len=110.1 distinct=655147 at_most_64_bytes=0 over_1024_bytes=0
+#     BGL.zip d67fd82a711aea0157a9b83175892c6ee60e384a2ddf5bc51f39118453816da8
+#       BGL.log 666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2
+#       values=4747963 bytes=738437068 mean_len=155.5 distinct=4747959 at_most_64_bytes=0 over_1024_bytes=0
+#     HDFS_v1.zip 04f919f2185821f23f045dca611a7586429bdabc601bd7b43f30005f8e289b01
+#       HDFS.log 0783096174d7832c618337f9609e06e04abd86ddd7089b3c12b407e63bfebc52
+#       values=11175629 bytes=1555631648 mean_len=139.2 distinct=11173511 at_most_64_bytes=0 over_1024_bytes=0
+#   ClickBench, https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet,
+#   the first of the 100 partitions of hits_compatible (1,000,000 rows; the
+#   string columns are Binary, read as bytes, every value valid UTF-8).
+#   Round 0 measured a 10,000,000-row prefix of hits.parquet; this round
+#   measures hits_0 whole, a tenth of that and a different file.
+#     hits_0.parquet fa134fe101e68324e0de851146fda69624f5cbb707d387141d1c2a88a219a16d
+#       URL          values=1000000 bytes=88562192  empty=265    distinct=275494 at_most_64_bytes=428632 over_1024_bytes=36
+#       Title        values=1000000 bytes=138409995 empty=64282  distinct=73970  at_most_64_bytes=392427 over_1024_bytes=2
+#       SearchPhrase values=1000000 bytes=3528017   empty=930646 distinct=18316  at_most_64_bytes=983655 over_1024_bytes=4
+#       Referer      values=1000000 bytes=79583339  empty=78775  distinct=227319 at_most_64_bytes=509413 over_1024_bytes=99
+#
+# How the predictions were made (every figure of every subject is listed):
+#   lines, column_bytes, eval_equals_bloom_testable, saturation/long_values:
+#     exact, from describe and the parameters above.
+#   blocks, saturation/blocks: exact, ceil(rows / 8192); 262144 is a whole
+#     number of blocks and no corpus comes near block_max_bytes (8 MiB).
+#   compressed_bytes, zstd_cpu_s: round 0's figure for the same file and
+#     level (a tenth of it for the ClickBench columns), band +-30 % for bytes
+#     and x0.3..x3 for CPU.
+#   bits_per_block: 8 * floor((0.01 * compressed - 3 * learned) / blocks),
+#     from the predicted compressed bytes; the band follows the
+#     compressed_bytes band.
+#   summary_bytes_share: at most 0.01 by construction; the per-block floor
+#     leaves it just under.
+#   build_cpu_over_zstd: the build reads every byte twice (gram document
+#     frequency, then the bitsets), at an estimated 2 ns a byte a pass, against
+#     zstd level 3 at about 1.5 ns a byte.
+#   candidate_grams, learned_bits, fallback_bits: estimated from the literal
+#     lengths; a gram held by every block has no benefit and is never learned,
+#     which is most template text in the LogHub bodies.
+#   fallback_density: 1 - exp(-D / F), D an estimate of distinct 3-grams per
+#     8192-row block, F the predicted fallback bits.
+#   false-positive shares: a non-holder block survives when every gram of the
+#     literal is in the block or collides into a set fallback bit. A perturbed
+#     absent literal differs from a real value by one character, so it has
+#     at most 3 grams the corpus may lack, and those land on set fallback bits
+#     at about the fallback density. Every share is predicted to miss the
+#     0.10 bar; the bands run to 1.0 and miss on the low side.
+#   production/equals, bloom/equals: the bloom only tests a literal of 64
+#     bytes or fewer, so the LogHub subjects without such lines keep every
+#     block (round 0 kept share 1.0); the others are at the bloom's own
+#     false-positive rate.
+#   contains/like/cells_tested_per_row: about 1 where every line is distinct
+#     (plain pages, one test per cell); lower where a row group dictionary is
+#     tested once per entry. The encoding choice is the writer's, so these
+#     bands are wide.
+#   summary/like/cells_tested_share: the summary only saves cells where it
+#     drops a block whose cells are tested per row; a dictionary shared by a
+#     row group is tested once for the kept blocks too.
+#   saturation/*: only the ClickBench columns hold a value over 1024 bytes;
+#     every LogHub subject pre-registers those figures absent.
+schema = 2
+
+[[subject]]
+name = "apache_body"
+corpus = "LogHub Apache, full corpus"
+source = "https://zenodo.org/record/8196385/files/Apache.tar.gz -> Apache.log"
+column = "value"
+block_records = 8192
+object_records = 262144
+max_lines = 56482
+zstd_level = 3
+gram_len = 3
+budget_share = 0.01
+fallback_min_bits = 256
+seed = 3710
+literals_per_kind = 40
+eq_max_len = 64
+like_min_len = 5
+like_max_len = 12
+
+[subject.figures]
+"lines" = { predict = 56482, band = [56482, 56482] }
+"blocks" = { predict = 7, band = [7, 7] }
+"column_bytes" = { predict = 5079395, band = [5079395, 5079395] }
+"compressed_bytes" = { predict = 270382, band = [190000, 352000] }
+"zstd_cpu_s" = { predict = 0.006, band = [0.002, 0.02] }
+"build_cpu_over_zstd" = { predict = 2.5, band = [1.0, 6.0] }
+"candidate_grams" = { predict = 400, band = [100, 1500] }
+"learned_bits" = { predict = 150, band = [20, 1000] }
+"fallback_bits" = { predict = 2450, band = [500, 3800] }
+"bits_per_block" = { predict = 2600, band = [1500, 4000] }
+"summary_bytes_share" = { predict = 0.0099, band = [0.0095, 0.01] }
+"fallback_density" = { predict = 0.8, band = [0.5, 0.97] }
+"eval_equals_bloom_testable" = { predict = 40, band = [40, 40] }
+"seen/equals/false_positive_share" = { predict = 0.4, band = [0.1, 0.9] }
+"seen/like/false_positive_share" = { predict = 0.4, band = [0.1, 0.9] }
+"unseen/equals/false_positive_share" = { predict = 0.7, band = [0.3, 1.0] }
+"unseen/like/false_positive_share" = { predict = 0.8, band = [0.4, 1.0] }
+"unseen/equals_absent/false_positive_share" = { predict = 0.8, band = [0.4, 1.0] }
+"unseen/like_absent/false_positive_share" = { predict = 0.85, band = [0.4, 1.0] }
+"production/equals/false_positive_share" = { predict = 0.02, band = [0.0, 0.1] }
+"bloom/equals/false_positive_share" = { predict = 0.02, band = [0.0, 0.1] }
+"summary/equals_bloom_testable/false_positive_share" = { predict = 0.7, band = [0.3, 1.0] }
+"contains/like/cells_tested_per_row" = { predict = 0.6, band = [0.2, 1.2] }
+"summary/like/cells_tested_share" = { predict = 0.95, band = [0.6, 1.0] }
+"saturation/long_values" = { predict = 0, band = [0, 0] }
+"saturation/blocks" = { absent = "no value over 1024 bytes (describe over_1024_bytes=0)" }
+"saturation/fallback_density" = { absent = "no value over 1024 bytes (describe over_1024_bytes=0)" }
+"saturation/unseen/like/false_positive_share" = { absent = "no value over 1024 bytes (describe over_1024_bytes=0)" }
+
+[[subject]]
+name = "openssh_body"
+corpus = "LogHub SSH (OpenSSH), full corpus"
+source = "https://zenodo.org/record/8196385/files/SSH.tar.gz -> SSH.log"
+column = "value"
+block_records = 8192
+object_records = 262144
+max_lines = 655147
+zstd_level = 3
+gram_len = 3
+budget_share = 0.01
+fallback_min_bits = 256
+seed = 3710
+literals_per_kind = 40
+eq_max_len = 1024
+like_min_len = 5
+like_max_len = 12
+
+[subject.figures]
+"lines" = { predict = 655147, band = [655147, 655147] }
+"blocks" = { predict = 80, band = [80, 80] }
+"column_bytes" = { predict = 72107214, band = [72107214, 72107214] }
+"compressed_bytes" = { predict = 4904644, band = [3430000, 6380000] }
+"zstd_cpu_s" = { predict = 0.1, band = [0.03, 0.3] }
+"build_cpu_over_zstd" = { predict = 2.5, band = [1.0, 6.0] }
+"candidate_grams" = { predict = 1300, band = [400, 3000] }
+"learned_bits" = { predict = 500, band = [50, 2000] }
+"fallback_bits" = { predict = 4250, band = [1500, 6500] }
+"bits_per_block" = { predict = 4750, band = [3300, 6500] }
+"summary_bytes_share" = { predict = 0.0099, band = [0.0095, 0.01] }
+"fallback_density" = { predict = 0.8, band = [0.5, 0.97] }
+"eval_equals_bloom_testable" = { predict = 0, band = [0, 0] }
+"seen/equals/false_positive_share" = { predict = 0.5, band = [0.1, 0.95] }
+"seen/like/false_positive_share" = { predict = 0.5, band = [0.1, 0.95] }
+"unseen/equals/false_positive_share" = { predict = 0.9, band = [0.6, 1.0] }
+"unseen/like/false_positive_share" = { predict = 0.85, band = [0.5, 1.0] }
+"unseen/equals_absent/false_positive_share" = { predict = 0.9, band = [0.6, 1.0] }
+"unseen/like_absent/false_positive_share" = { predict = 0.9, band = [0.5, 1.0] }
+"production/equals/false_positive_share" = { predict = 1.0, band = [0.95, 1.0] }
+"bloom/equals/false_positive_share" = { absent = "no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0)" }
+"summary/equals_bloom_testable/false_positive_share" = { absent = "no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0)" }
+"contains/like/cells_tested_per_row" = { predict = 1.0, band = [0.8, 1.2] }
+"summary/like/cells_tested_share" = { predict = 0.9, band = [0.5, 1.0] }
+"saturation/long_values" = { predict = 0, band = [0, 0] }
+"saturation/blocks" = { absent = "no value over 1024 bytes (describe over_1024_bytes=0)" }
+"saturation/fallback_density" = { absent = "no value over 1024 bytes (describe over_1024_bytes=0)" }
+"saturation/unseen/like/false_positive_share" = { absent = "no value over 1024 bytes (describe over_1024_bytes=0)" }
+
+[[subject]]
+name = "bgl_body"
+corpus = "LogHub BGL, full corpus"
+source = "https://zenodo.org/record/8196385/files/BGL.zip -> BGL.log"
+column = "value"
+block_records = 8192
+object_records = 262144
+max_lines = 4747963
+zstd_level = 3
+gram_len = 3
+budget_share = 0.01
+fallback_min_bits = 256
+seed = 3710
+literals_per_kind = 40
+eq_max_len = 1024
+like_min_len = 5
+like_max_len = 12
+
+[subject.figures]
+"lines" = { predict = 4747963, band = [4747963, 4747963] }
+"blocks" = { predict = 580, band = [580, 580] }
+"column_bytes" = { predict = 738437068, band = [738437068, 738437068] }
+"compressed_bytes" = { predict = 68585093, band = [48000000, 89200000] }
+"zstd_cpu_s" = { predict = 1.5, band = [0.5, 4.5] }
+"build_cpu_over_zstd" = { predict = 2.5, band = [1.0, 6.0] }
+"candidate_grams" = { predict = 1500, band = [400, 4000] }
+"learned_bits" = { predict = 600, band = [50, 2500] }
+"fallback_bits" = { predict = 8800, band = [4000, 12300] }
+"bits_per_block" = { predict = 9400, band = [6600, 12300] }
+"summary_bytes_share" = { predict = 0.0099, band = [0.0095, 0.01] }
+"fallback_density" = { predict = 0.75, band = [0.4, 0.97] }
+"eval_equals_bloom_testable" = { predict = 0, band = [0, 0] }
+"seen/equals/false_positive_share" = { predict = 0.5, band = [0.1, 0.95] }
+"seen/like/false_positive_share" = { predict = 0.5, band = [0.1, 0.95] }
+"unseen/equals/false_positive_share" = { predict = 0.85, band = [0.5, 1.0] }
+"unseen/like/false_positive_share" = { predict = 0.85, band = [0.5, 1.0] }
+"unseen/equals_absent/false_positive_share" = { predict = 0.9, band = [0.5, 1.0] }
+"unseen/like_absent/false_positive_share" = { predict = 0.9, band = [0.5, 1.0] }
+"production/equals/false_positive_share" = { predict = 1.0, band = [0.95, 1.0] }
+"bloom/equals/false_positive_share" = { absent = "no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0)" }
+"summary/equals_bloom_testable/false_positive_share" = { absent = "no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0)" }
+"contains/like/cells_tested_per_row" = { predict = 1.0, band = [0.8, 1.2] }
+"summary/like/cells_tested_share" = { predict = 0.9, band = [0.5, 1.0] }
+"saturation/long_values" = { predict = 0, band = [0, 0] }
+"saturation/blocks" = { absent = "no value over 1024 bytes (describe over_1024_bytes=0)" }
+"saturation/fallback_density" = { absent = "no value over 1024 bytes (describe over_1024_bytes=0)" }
+"saturation/unseen/like/false_positive_share" = { absent = "no value over 1024 bytes (describe over_1024_bytes=0)" }
+
+[[subject]]
+name = "hdfs_body"
+corpus = "LogHub HDFS_v1, full corpus"
+source = "https://zenodo.org/record/8196385/files/HDFS_v1.zip -> HDFS.log"
+column = "value"
+block_records = 8192
+object_records = 262144
+max_lines = 11175629
+zstd_level = 3
+gram_len = 3
+budget_share = 0.01
+fallback_min_bits = 256
+seed = 3710
+literals_per_kind = 40
+eq_max_len = 1024
+like_min_len = 5
+like_max_len = 12
+
+[subject.figures]
+"lines" = { predict = 11175629, band = [11175629, 11175629] }
+"blocks" = { predict = 1365, band = [1365, 1365] }
+"column_bytes" = { predict = 1555631648, band = [1555631648, 1555631648] }
+"compressed_bytes" = { predict = 155256427, band = [108700000, 201800000] }
+"zstd_cpu_s" = { predict = 3.1, band = [1.0, 9.5] }
+"build_cpu_over_zstd" = { predict = 2.5, band = [1.0, 6.0] }
+"candidate_grams" = { predict = 1200, band = [300, 3500] }
+"learned_bits" = { predict = 300, band = [20, 2000] }
+"fallback_bits" = { predict = 8800, band = [4000, 11900] }
+"bits_per_block" = { predict = 9100, band = [6300, 11900] }
+"summary_bytes_share" = { predict = 0.0099, band = [0.0095, 0.01] }
+"fallback_density" = { predict = 0.5, band = [0.2, 0.85] }
+"eval_equals_bloom_testable" = { predict = 0, band = [0, 0] }
+"seen/equals/false_positive_share" = { predict = 0.6, band = [0.1, 0.95] }
+"seen/like/false_positive_share" = { predict = 0.6, band = [0.1, 0.95] }
+"unseen/equals/false_positive_share" = { predict = 0.95, band = [0.7, 1.0] }
+"unseen/like/false_positive_share" = { predict = 0.9, band = [0.5, 1.0] }
+"unseen/equals_absent/false_positive_share" = { predict = 0.95, band = [0.7, 1.0] }
+"unseen/like_absent/false_positive_share" = { predict = 0.9, band = [0.5, 1.0] }
+"production/equals/false_positive_share" = { predict = 1.0, band = [0.95, 1.0] }
+"bloom/equals/false_positive_share" = { absent = "no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0)" }
+"summary/equals_bloom_testable/false_positive_share" = { absent = "no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0)" }
+"contains/like/cells_tested_per_row" = { predict = 1.0, band = [0.8, 1.2] }
+"summary/like/cells_tested_share" = { predict = 0.95, band = [0.6, 1.0] }
+"saturation/long_values" = { predict = 0, band = [0, 0] }
+"saturation/blocks" = { absent = "no value over 1024 bytes (describe over_1024_bytes=0)" }
+"saturation/fallback_density" = { absent = "no value over 1024 bytes (describe over_1024_bytes=0)" }
+"saturation/unseen/like/false_positive_share" = { absent = "no value over 1024 bytes (describe over_1024_bytes=0)" }
+
+[[subject]]
+name = "clickbench_url"
+corpus = "ClickBench hits_0.parquet URL, whole file"
+source = "https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet column URL"
+column = "URL"
+block_records = 8192
+object_records = 262144
+max_lines = 1000000
+zstd_level = 3
+gram_len = 3
+budget_share = 0.01
+fallback_min_bits = 256
+seed = 3710
+literals_per_kind = 40
+eq_max_len = 64
+like_min_len = 5
+like_max_len = 12
+
+[subject.figures]
+"lines" = { predict = 1000000, band = [1000000, 1000000] }
+"blocks" = { predict = 123, band = [123, 123] }
+"column_bytes" = { predict = 88562192, band = [88562192, 88562192] }
+"compressed_bytes" = { predict = 13000000, band = [9100000, 16900000] }
+"zstd_cpu_s" = { predict = 0.24, band = [0.08, 0.72] }
+"build_cpu_over_zstd" = { predict = 2.5, band = [1.0, 6.0] }
+"candidate_grams" = { predict = 700, band = [200, 2000] }
+"learned_bits" = { predict = 400, band = [50, 1800] }
+"fallback_bits" = { predict = 8000, band = [4000, 11000] }
+"bits_per_block" = { predict = 8400, band = [5800, 11000] }
+"summary_bytes_share" = { predict = 0.0099, band = [0.0095, 0.01] }
+"fallback_density" = { predict = 0.85, band = [0.6, 0.99] }
+"eval_equals_bloom_testable" = { predict = 40, band = [40, 40] }
+"seen/equals/false_positive_share" = { predict = 0.5, band = [0.1, 0.95] }
+"seen/like/false_positive_share" = { predict = 0.5, band = [0.1, 0.95] }
+"unseen/equals/false_positive_share" = { predict = 0.8, band = [0.4, 1.0] }
+"unseen/like/false_positive_share" = { predict = 0.85, band = [0.5, 1.0] }
+"unseen/equals_absent/false_positive_share" = { predict = 0.85, band = [0.4, 1.0] }
+"unseen/like_absent/false_positive_share" = { predict = 0.9, band = [0.5, 1.0] }
+"production/equals/false_positive_share" = { predict = 0.03, band = [0.0, 0.15] }
+"bloom/equals/false_positive_share" = { predict = 0.03, band = [0.0, 0.15] }
+"summary/equals_bloom_testable/false_positive_share" = { predict = 0.8, band = [0.4, 1.0] }
+"contains/like/cells_tested_per_row" = { predict = 0.3, band = [0.05, 1.2] }
+"summary/like/cells_tested_share" = { predict = 1.0, band = [0.8, 1.0] }
+"saturation/long_values" = { predict = 36, band = [36, 36] }
+"saturation/blocks" = { predict = 1, band = [1, 1] }
+"saturation/fallback_density" = { predict = 0.3, band = [0.05, 0.8] }
+"saturation/unseen/like/false_positive_share" = { predict = 0.5, band = [0.05, 1.0] }
+
+[[subject]]
+name = "clickbench_title"
+corpus = "ClickBench hits_0.parquet Title, whole file"
+source = "https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet column Title"
+column = "Title"
+block_records = 8192
+object_records = 262144
+max_lines = 1000000
+zstd_level = 3
+gram_len = 3
+budget_share = 0.01
+fallback_min_bits = 256
+seed = 3710
+literals_per_kind = 40
+eq_max_len = 64
+like_min_len = 5
+like_max_len = 12
+
+[subject.figures]
+"lines" = { predict = 1000000, band = [1000000, 1000000] }
+"blocks" = { predict = 123, band = [123, 123] }
+"column_bytes" = { predict = 138409995, band = [138409995, 138409995] }
+"compressed_bytes" = { predict = 16100000, band = [11300000, 21000000] }
+"zstd_cpu_s" = { predict = 0.34, band = [0.11, 1.0] }
+"build_cpu_over_zstd" = { predict = 2.5, band = [1.0, 6.0] }
+"candidate_grams" = { predict = 700, band = [200, 2000] }
+"learned_bits" = { predict = 400, band = [50, 1800] }
+"fallback_bits" = { predict = 10000, band = [5000, 13600] }
+"bits_per_block" = { predict = 10400, band = [7300, 13600] }
+"summary_bytes_share" = { predict = 0.0099, band = [0.0095, 0.01] }
+"fallback_density" = { predict = 0.75, band = [0.4, 0.98] }
+"eval_equals_bloom_testable" = { predict = 40, band = [40, 40] }
+"seen/equals/false_positive_share" = { predict = 0.5, band = [0.1, 0.95] }
+"seen/like/false_positive_share" = { predict = 0.5, band = [0.1, 0.95] }
+"unseen/equals/false_positive_share" = { predict = 0.8, band = [0.4, 1.0] }
+"unseen/like/false_positive_share" = { predict = 0.85, band = [0.5, 1.0] }
+"unseen/equals_absent/false_positive_share" = { predict = 0.85, band = [0.4, 1.0] }
+"unseen/like_absent/false_positive_share" = { predict = 0.9, band = [0.5, 1.0] }
+"production/equals/false_positive_share" = { predict = 0.03, band = [0.0, 0.15] }
+"bloom/equals/false_positive_share" = { predict = 0.03, band = [0.0, 0.15] }
+"summary/equals_bloom_testable/false_positive_share" = { predict = 0.8, band = [0.4, 1.0] }
+"contains/like/cells_tested_per_row" = { predict = 0.1, band = [0.01, 1.2] }
+"summary/like/cells_tested_share" = { predict = 1.0, band = [0.8, 1.0] }
+"saturation/long_values" = { predict = 2, band = [2, 2] }
+"saturation/blocks" = { predict = 1, band = [1, 1] }
+"saturation/fallback_density" = { predict = 0.05, band = [0.005, 0.3] }
+"saturation/unseen/like/false_positive_share" = { predict = 0.1, band = [0.0, 0.5] }
+
+[[subject]]
+name = "clickbench_searchphrase"
+corpus = "ClickBench hits_0.parquet SearchPhrase, whole file"
+source = "https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet column SearchPhrase"
+column = "SearchPhrase"
+block_records = 8192
+object_records = 262144
+max_lines = 1000000
+zstd_level = 3
+gram_len = 3
+budget_share = 0.01
+fallback_min_bits = 256
+seed = 3710
+literals_per_kind = 40
+eq_max_len = 64
+like_min_len = 5
+like_max_len = 12
+
+[subject.figures]
+"lines" = { predict = 1000000, band = [1000000, 1000000] }
+"blocks" = { predict = 123, band = [123, 123] }
+"column_bytes" = { predict = 3528017, band = [3528017, 3528017] }
+"compressed_bytes" = { predict = 2380000, band = [1600000, 3100000] }
+"zstd_cpu_s" = { predict = 0.05, band = [0.015, 0.15] }
+"build_cpu_over_zstd" = { predict = 3.0, band = [1.0, 10.0] }
+"candidate_grams" = { predict = 500, band = [100, 1500] }
+"learned_bits" = { predict = 300, band = [30, 1300] }
+"fallback_bits" = { predict = 1200, band = [256, 2100] }
+"bits_per_block" = { predict = 1500, band = [900, 2100] }
+"summary_bytes_share" = { predict = 0.0099, band = [0.0095, 0.01] }
+"fallback_density" = { predict = 0.95, band = [0.7, 1.0] }
+"eval_equals_bloom_testable" = { predict = 40, band = [40, 40] }
+"seen/equals/false_positive_share" = { predict = 0.6, band = [0.1, 0.95] }
+"seen/like/false_positive_share" = { predict = 0.6, band = [0.1, 0.95] }
+"unseen/equals/false_positive_share" = { predict = 0.95, band = [0.7, 1.0] }
+"unseen/like/false_positive_share" = { predict = 0.95, band = [0.7, 1.0] }
+"unseen/equals_absent/false_positive_share" = { predict = 0.95, band = [0.7, 1.0] }
+"unseen/like_absent/false_positive_share" = { predict = 0.95, band = [0.7, 1.0] }
+"production/equals/false_positive_share" = { predict = 0.03, band = [0.0, 0.15] }
+"bloom/equals/false_positive_share" = { predict = 0.03, band = [0.0, 0.15] }
+"summary/equals_bloom_testable/false_positive_share" = { predict = 0.95, band = [0.7, 1.0] }
+"contains/like/cells_tested_per_row" = { predict = 0.05, band = [0.002, 1.2] }
+"summary/like/cells_tested_share" = { predict = 1.0, band = [0.8, 1.0] }
+"saturation/long_values" = { predict = 4, band = [4, 4] }
+"saturation/blocks" = { predict = 1, band = [1, 1] }
+"saturation/fallback_density" = { predict = 0.9, band = [0.5, 1.0] }
+"saturation/unseen/like/false_positive_share" = { predict = 0.8, band = [0.3, 1.0] }
+
+[[subject]]
+name = "clickbench_referer"
+corpus = "ClickBench hits_0.parquet Referer, whole file"
+source = "https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet column Referer"
+column = "Referer"
+block_records = 8192
+object_records = 262144
+max_lines = 1000000
+zstd_level = 3
+gram_len = 3
+budget_share = 0.01
+fallback_min_bits = 256
+seed = 3710
+literals_per_kind = 40
+eq_max_len = 64
+like_min_len = 5
+like_max_len = 12
+
+[subject.figures]
+"lines" = { predict = 1000000, band = [1000000, 1000000] }
+"blocks" = { predict = 123, band = [123, 123] }
+"column_bytes" = { predict = 79583339, band = [79583339, 79583339] }
+"compressed_bytes" = { predict = 16400000, band = [11500000, 21300000] }
+"zstd_cpu_s" = { predict = 0.31, band = [0.1, 0.93] }
+"build_cpu_over_zstd" = { predict = 2.5, band = [1.0, 6.0] }
+"candidate_grams" = { predict = 700, band = [200, 2000] }
+"learned_bits" = { predict = 400, band = [50, 1800] }
+"fallback_bits" = { predict = 10000, band = [5000, 13800] }
+"bits_per_block" = { predict = 10400, band = [7400, 13800] }
+"summary_bytes_share" = { predict = 0.0099, band = [0.0095, 0.01] }
+"fallback_density" = { predict = 0.85, band = [0.6, 0.99] }
+"eval_equals_bloom_testable" = { predict = 40, band = [40, 40] }
+"seen/equals/false_positive_share" = { predict = 0.5, band = [0.1, 0.95] }
+"seen/like/false_positive_share" = { predict = 0.5, band = [0.1, 0.95] }
+"unseen/equals/false_positive_share" = { predict = 0.8, band = [0.4, 1.0] }
+"unseen/like/false_positive_share" = { predict = 0.85, band = [0.5, 1.0] }
+"unseen/equals_absent/false_positive_share" = { predict = 0.85, band = [0.4, 1.0] }
+"unseen/like_absent/false_positive_share" = { predict = 0.9, band = [0.5, 1.0] }
+"production/equals/false_positive_share" = { predict = 0.03, band = [0.0, 0.15] }
+"bloom/equals/false_positive_share" = { predict = 0.03, band = [0.0, 0.15] }
+"summary/equals_bloom_testable/false_positive_share" = { predict = 0.8, band = [0.4, 1.0] }
+"contains/like/cells_tested_per_row" = { predict = 0.3, band = [0.05, 1.2] }
+"summary/like/cells_tested_share" = { predict = 1.0, band = [0.8, 1.0] }
+"saturation/long_values" = { predict = 99, band = [99, 99] }
+"saturation/blocks" = { predict = 1, band = [1, 1] }
+"saturation/fallback_density" = { predict = 0.55, band = [0.2, 0.9] }
+"saturation/unseen/like/false_positive_share" = { predict = 0.6, band = [0.1, 1.0] }

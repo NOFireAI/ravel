@@ -1,0 +1,1160 @@
+{
+  "stamp": {
+    "git": "971c43712df718af013a9e9ab34b62f9ab81e00b",
+    "arch": "x86_64",
+    "nproc": 16,
+    "mem_total_kib": 32132612,
+    "corpus_file": "hits_0.parquet",
+    "corpus_sha256": "fa134fe101e68324e0de851146fda69624f5cbb707d387141d1c2a88a219a16d",
+    "corpus_bytes": 122446530,
+    "zstd_level": 3,
+    "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd level. The build (summary::build: the training grams' block counts, the learned set, and every block's bitset) runs once on the same thread."
+  },
+  "subject": "clickbench_referer",
+  "params": {
+    "column": "Referer",
+    "gram_len": 3,
+    "budget_share": 0.01,
+    "fallback_min_bits": 256,
+    "zstd_level": 3,
+    "block_records": 8192,
+    "object_records": 262144,
+    "max_lines": 1000000,
+    "seed": 3710,
+    "literals_per_kind": 40,
+    "eq_max_len": 64,
+    "like_min_len": 5,
+    "like_max_len": 12
+  },
+  "decision_rule": "Per subject: GO when unseen/equals/false_positive_share and unseen/like/false_positive_share are both at most 0.10, summary_bytes_share is at most 0.01, and build_cpu_over_zstd is at most 2; otherwise NO-GO, and a missing figure fails its leg. Saturation is a separate verdict: with values over 1024 bytes, saturation/unseen/like/false_positive_share at most 0.30 is body-eligible and above it body-ineligible; with none, untested. Overall: GO when every pre-registered subject has exactly one report, it is GO, and it has no structural problem (a missing, duplicate or unexpected figure); a figure outside its prediction band is reported as a miss and does not change the decision.",
+  "summary_bytes_rule": "summary_bytes = blocks * ceil(bits_per_block / 8) + learned_bits * gram_len (the shared table of learned grams, each stored as its raw bytes)",
+  "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd level. The build (summary::build: the training grams' block counts, the learned set, and every block's bitset) runs once on the same thread.",
+  "workload": {
+    "training": [
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://state=19945206/foto-4/login-2491724/?bundlers/search?text"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://google.com/fee=меньше"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://kinopoisk.ru/yandex.ru/real-estation/vacancing"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://state=19945206/foto-4/login-yamz/"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://kinopoisk.ru/?state"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://povarenok.ru/rost-za-search?clid=9403&lr=1099.html&ei"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/a-shoppiccollection=9016341703][from"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/pnews/all/marka=88&model=0&where"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://video.yandsearch"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://mysw.info/node/215455&text=контровать"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/registered/main.aspx?clstered/main.aspx"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/yandex.ru/ru/mymail.ru/yandex.ru/air/novjob"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/registrict=2660628&cbv=r2013/blagovestate"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/yandex.ru/member"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://main.EE06Cro1pMXZiaTgs"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/inworld"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.info/catalog/3184715/?Search"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/yandex.ru/yandex.ru/yandex"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://state=19945206/foto-4/login-2006/makum"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://state=199450984062"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://taqbov.irr.ru/recipes/tv-auto.ru/showalbums"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://state=19945206/foto-4/logil-2491724/?bundlers/search?text"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.iyr.ru/yandex.ru/radiorecord.ru"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://state=19945206/foto-4/qogin-2491724/?bundlers/search?text"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://googoe.com/fee=меньше"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.irr.irr.ru/yandex.ru/elena483/pagm2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "kttp://tambov.irr.ru/index.ua/auto_renaul.avtogsm"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "htsp://state=19945206/foto-4/login-2491724/?bundlers/search?text"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.ikr.ua/yandsearch?clid=1&sqi=2&ved=0CEwQFjAA"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://auto_ru.php?gr=18&manhfactual&bn=5&target=blank&sort"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "htti://tambov.irr"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.irr.ru/search?lr=257222227_ru_23988868.2.28.0.htm"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.irr.ru/kategory_id=1&bodyshyle=0&drive"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.irr.ru/yandex.rm/search?query=\t Полозовые"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://taobov.irr.ru/yandex.ru/cgi-bin/afisha.mail.ru/yandsearch"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.frr.ru/index.ru/GameMain.aspx"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://khnopoisk.ru/?state"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://gfogle.com/fee=меньше"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://joogle.com/fee=меньше"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://google.com/vee=меньше"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "tp://tambov."
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "avgorod55"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "bmit="
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "oHgBJT"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "-techn"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/search"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "o-4/log"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "s://g"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "rs/sear"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": ".xml?fb_acti"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/login-"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/kinopo"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "724/?b"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/state"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/kategory_"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/login-2006/"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "//tambov.irr"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "bov.irr.ru/g"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ezona-"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "istem=120"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "902310970354"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ettps:/"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "em_no%3J"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "6/roto-4/log"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ru/reil-e"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "atonstru"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "u/yardse"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "rodp=days&c"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "-7/on"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "206/foko-4"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "rowhoowb"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "aia-toda-"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "if-2006/mak"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "//kinopoiv"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "0&Zelect"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "&sule"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ke/344166."
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "rr.ru/yaade"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ge_hen80/p"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "mbov.mrr"
+      }
+    ],
+    "evaluation": [
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/registemy.ru/produkty/body_type&tt=web"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/kategory_id=1942053501&uuid"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/kategory_id=19420554/detail.aspx"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/?favorite"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/real-estate/aparthenom-autodoc.ru"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/pnz/event=ms-opera&aV=5.0 (Windows NT 5"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/registerday/page="
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://state=19945206/foto-4/login-lososcannet.ru/Web/Pagesize"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/registered/mail.ru/kategory/conquest"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/kategory"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/registrict=2660628&cbv"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "httpdom.ru/real-estate=0&currency=RUR/rooms=1/feed?z=photo"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/search?lr=213&text=приканка"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ua/yandex.ru/kardighany/?page=5"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/a-search?clid=3321"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.irr.ru/yandsearch/index.ru/yandsearch"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "https://gotovka/hotels.turizm"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "http://tambov.irr.ru/yandex.ru/galle/290622&bL=ru&lr=1095&option"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.irr.ua/yandex.rn/saledParams=fh"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://goojle.com/fee=меньше"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.irr.ru/register.aspx?group_cod_1s=16&rstreetozt"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.irr.irr.ru/yandsearch&group=auto.ria.ua%2Fsmsarhpv"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://google.com/fef=меньше"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.irr.ru/katexory"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://state=19945206/foto-4/login-2491724/?butdlers/search?text"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://state=19945206/foto-4/login-2491724/?buddlers/search?text"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "rttp://новострашная"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://state=19945206/foto-4/hogin-ange_raion%3Dru_1_ru_202"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://state=19945206/fotk-4/login.php?page4/?adtype=&page2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://auto_volkswag74D4BQ&usg=AFQjCNElLaAB1jeSs&where"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://googce.com/fee=меньше"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.irr.ru/yandex.ru/yandseakchAuto=oldAuto=oldAuto"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://state=19945206/foto-4/login-2491744/?bundlers/search?text"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "https://google.com/fej=меньше"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.irr.ru/ynndex.ru/u-mebelny.irr"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.irr.ru/insex.ua/yandsearch?text=кардой"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.irr.ru/registered/maiv.aspx?clstered/main.aspx"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "http://tambov.irr.ru/dandex.ru/cinema.perm/"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/list."
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "728x90.html"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "06/foto-"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ttp:/"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "u-en/"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/tambov.irr"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "rch?text"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ogle.com/f"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/state=19945"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "tp://tambo"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "%3D213767449"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/foto-4/logi"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "5206/"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "[3]=Y&is_"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "o-4/login"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "tels/mode=2"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "p://bibika."
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/24/wom"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "000054"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ndex.ru/yand"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "mpov.irr."
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "araa&res"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "nwers/El"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": ".tu/kategor"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": ".ju/ca"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "http://stmte"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "://seate="
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "5206/qot"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "3291071"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "/tambov.iru"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": ".ru/kyt"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "htfp://ta"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "to-4/wogin.1"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "a_gie"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "p://tamdov.i"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ity_id=79"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "//taebov.irr"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ligin/?R"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "8E634"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ttmbov."
+      }
+    ]
+  },
+  "figures": [
+    {
+      "key": "clickbench_referer/lines",
+      "value": 1000000.0
+    },
+    {
+      "key": "clickbench_referer/blocks",
+      "value": 123.0
+    },
+    {
+      "key": "clickbench_referer/column_bytes",
+      "value": 79583339.0
+    },
+    {
+      "key": "clickbench_referer/compressed_bytes",
+      "value": 12616251.0
+    },
+    {
+      "key": "clickbench_referer/zstd_cpu_s",
+      "value": 0.19512925199999998
+    },
+    {
+      "key": "clickbench_referer/build_cpu_over_zstd",
+      "value": 3.9411965254702053
+    },
+    {
+      "key": "clickbench_referer/candidate_grams",
+      "value": 843.0
+    },
+    {
+      "key": "clickbench_referer/learned_bits",
+      "value": 445.0
+    },
+    {
+      "key": "clickbench_referer/fallback_bits",
+      "value": 7667.0
+    },
+    {
+      "key": "clickbench_referer/bits_per_block",
+      "value": 8112.0
+    },
+    {
+      "key": "clickbench_referer/summary_bytes_share",
+      "value": 0.009991636976784941
+    },
+    {
+      "key": "clickbench_referer/fallback_density",
+      "value": 0.9313805020142274
+    },
+    {
+      "key": "clickbench_referer/eval_equals_bloom_testable",
+      "value": 40.0
+    },
+    {
+      "key": "clickbench_referer/seen/equals/false_positive_share",
+      "value": 0.26765799256505574
+    },
+    {
+      "key": "clickbench_referer/seen/like/false_positive_share",
+      "value": 0.4301898346601347
+    },
+    {
+      "key": "clickbench_referer/unseen/equals/false_positive_share",
+      "value": 0.7381233750886316
+    },
+    {
+      "key": "clickbench_referer/unseen/like/false_positive_share",
+      "value": 0.839572192513369
+    },
+    {
+      "key": "clickbench_referer/unseen/equals_absent/false_positive_share",
+      "value": 0.7109756097560975
+    },
+    {
+      "key": "clickbench_referer/unseen/like_absent/false_positive_share",
+      "value": 0.8512195121951219
+    },
+    {
+      "key": "clickbench_referer/production/equals/false_positive_share",
+      "value": 0.016544552115339162
+    },
+    {
+      "key": "clickbench_referer/bloom/equals/false_positive_share",
+      "value": 0.016544552115339162
+    },
+    {
+      "key": "clickbench_referer/summary/equals_bloom_testable/false_positive_share",
+      "value": 0.7381233750886316
+    },
+    {
+      "key": "clickbench_referer/contains/like/cells_tested_per_row",
+      "value": 0.244687
+    },
+    {
+      "key": "clickbench_referer/summary/like/cells_tested_share",
+      "value": 0.9410339535815143
+    },
+    {
+      "key": "clickbench_referer/saturation/long_values",
+      "value": 99.0
+    },
+    {
+      "key": "clickbench_referer/saturation/blocks",
+      "value": 1.0
+    },
+    {
+      "key": "clickbench_referer/saturation/fallback_density",
+      "value": 0.863440719968697
+    },
+    {
+      "key": "clickbench_referer/saturation/unseen/like/false_positive_share",
+      "value": 0.5555555555555556
+    }
+  ],
+  "expect": {
+    "clickbench_referer/bits_per_block": {
+      "predict": 10400.0,
+      "band": [
+        7400.0,
+        13800.0
+      ]
+    },
+    "clickbench_referer/blocks": {
+      "predict": 123.0,
+      "band": [
+        123.0,
+        123.0
+      ]
+    },
+    "clickbench_referer/bloom/equals/false_positive_share": {
+      "predict": 0.03,
+      "band": [
+        0.0,
+        0.15
+      ]
+    },
+    "clickbench_referer/build_cpu_over_zstd": {
+      "predict": 2.5,
+      "band": [
+        1.0,
+        6.0
+      ]
+    },
+    "clickbench_referer/candidate_grams": {
+      "predict": 700.0,
+      "band": [
+        200.0,
+        2000.0
+      ]
+    },
+    "clickbench_referer/column_bytes": {
+      "predict": 79583339.0,
+      "band": [
+        79583339.0,
+        79583339.0
+      ]
+    },
+    "clickbench_referer/compressed_bytes": {
+      "predict": 16400000.0,
+      "band": [
+        11500000.0,
+        21300000.0
+      ]
+    },
+    "clickbench_referer/contains/like/cells_tested_per_row": {
+      "predict": 0.3,
+      "band": [
+        0.05,
+        1.2
+      ]
+    },
+    "clickbench_referer/eval_equals_bloom_testable": {
+      "predict": 40.0,
+      "band": [
+        40.0,
+        40.0
+      ]
+    },
+    "clickbench_referer/fallback_bits": {
+      "predict": 10000.0,
+      "band": [
+        5000.0,
+        13800.0
+      ]
+    },
+    "clickbench_referer/fallback_density": {
+      "predict": 0.85,
+      "band": [
+        0.6,
+        0.99
+      ]
+    },
+    "clickbench_referer/learned_bits": {
+      "predict": 400.0,
+      "band": [
+        50.0,
+        1800.0
+      ]
+    },
+    "clickbench_referer/lines": {
+      "predict": 1000000.0,
+      "band": [
+        1000000.0,
+        1000000.0
+      ]
+    },
+    "clickbench_referer/production/equals/false_positive_share": {
+      "predict": 0.03,
+      "band": [
+        0.0,
+        0.15
+      ]
+    },
+    "clickbench_referer/saturation/blocks": {
+      "predict": 1.0,
+      "band": [
+        1.0,
+        1.0
+      ]
+    },
+    "clickbench_referer/saturation/fallback_density": {
+      "predict": 0.55,
+      "band": [
+        0.2,
+        0.9
+      ]
+    },
+    "clickbench_referer/saturation/long_values": {
+      "predict": 99.0,
+      "band": [
+        99.0,
+        99.0
+      ]
+    },
+    "clickbench_referer/saturation/unseen/like/false_positive_share": {
+      "predict": 0.6,
+      "band": [
+        0.1,
+        1.0
+      ]
+    },
+    "clickbench_referer/seen/equals/false_positive_share": {
+      "predict": 0.5,
+      "band": [
+        0.1,
+        0.95
+      ]
+    },
+    "clickbench_referer/seen/like/false_positive_share": {
+      "predict": 0.5,
+      "band": [
+        0.1,
+        0.95
+      ]
+    },
+    "clickbench_referer/summary/equals_bloom_testable/false_positive_share": {
+      "predict": 0.8,
+      "band": [
+        0.4,
+        1.0
+      ]
+    },
+    "clickbench_referer/summary/like/cells_tested_share": {
+      "predict": 1.0,
+      "band": [
+        0.8,
+        1.0
+      ]
+    },
+    "clickbench_referer/summary_bytes_share": {
+      "predict": 0.0099,
+      "band": [
+        0.0095,
+        0.01
+      ]
+    },
+    "clickbench_referer/unseen/equals/false_positive_share": {
+      "predict": 0.8,
+      "band": [
+        0.4,
+        1.0
+      ]
+    },
+    "clickbench_referer/unseen/equals_absent/false_positive_share": {
+      "predict": 0.85,
+      "band": [
+        0.4,
+        1.0
+      ]
+    },
+    "clickbench_referer/unseen/like/false_positive_share": {
+      "predict": 0.85,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "clickbench_referer/unseen/like_absent/false_positive_share": {
+      "predict": 0.9,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "clickbench_referer/zstd_cpu_s": {
+      "predict": 0.31,
+      "band": [
+        0.1,
+        0.93
+      ]
+    }
+  },
+  "checked": {
+    "problems": [],
+    "misses": []
+  },
+  "decision": {
+    "subject": "clickbench_referer",
+    "go": false,
+    "saturation": "body-ineligible",
+    "line": "string_fingerprint decision clickbench_referer: NO-GO; unseen_equals_fp=0.7381 unseen_like_fp=0.8396 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=3.9412 (bar 2); fails: unseen_equals, unseen_like, cpu; saturation body-ineligible (saturation_fp=0.5556, bar 0.3)"
+  }
+}

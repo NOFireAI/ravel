@@ -1,0 +1,1128 @@
+{
+  "stamp": {
+    "git": "529f286d144060e35d0fa06e9fb8ed67d0d8379f",
+    "arch": "x86_64",
+    "nproc": 16,
+    "mem_total_kib": 32132612,
+    "corpus_file": "SSH.log",
+    "corpus_sha256": "89eee9e36c182722f9fadc6e5617a4818ffc66109e7e222b8f9e8b78fc3aa2f3",
+    "corpus_bytes": 73417506,
+    "zstd_level": 3,
+    "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd level. The build (summary::build: the training grams' block counts, the learned set, and every block's bitset) runs once on the same thread."
+  },
+  "subject": "openssh_body",
+  "params": {
+    "column": "value",
+    "gram_len": 3,
+    "budget_share": 0.01,
+    "fallback_min_bits": 256,
+    "zstd_level": 3,
+    "block_records": 8192,
+    "object_records": 262144,
+    "max_lines": 655147,
+    "seed": 3710,
+    "literals_per_kind": 40,
+    "eq_max_len": 1024,
+    "like_min_len": 5,
+    "like_max_len": 12
+  },
+  "decision_rule": "Per subject: GO when unseen/equals/false_positive_share and unseen/like/false_positive_share are both at most 0.10, summary_bytes_share is at most 0.01, and build_cpu_over_zstd is at most 2; otherwise NO-GO, and a missing figure fails its leg. Saturation is a separate verdict: with values over 1024 bytes, saturation/unseen/like/false_positive_share at most 0.30 is body-eligible and above it body-ineligible; with none, untested. Overall: GO when every pre-registered subject has exactly one report, it is GO, and it has no structural problem (a missing, duplicate or unexpected figure); a figure outside its prediction band is reported as a miss and does not change the decision.",
+  "summary_bytes_rule": "summary_bytes = blocks * ceil(bits_per_block / 8) + learned_bits * gram_len (the shared table of learned grams, each stored as its raw bytes)",
+  "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd level. The build (summary::build: the training grams' block counts, the learned set, and every block's bitset) runs once on the same thread.",
+  "workload": {
+    "training": [
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  3 06:03:46 LabSZ sshd[12866]: Connection closed by 183.192.189.131 [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  5 01:46:17 LabSZ sshd[10659]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=59.63.188.30  user=root"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 16 08:48:10 LabSZ sshd[23831]: pam_unix(sshd:auth): check pass; user unknown"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 16 19:54:39 LabSZ sshd[3875]: input_userauth_request: invalid user lul [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  2 15:38:41 LabSZ sshd[6900]: pam_unix(sshd:auth): check pass; user unknown"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  5 12:09:15 LabSZ sshd[18605]: Failed password for root from 59.63.188.30 port 1079 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  3 01:08:33 LabSZ sshd[22666]: Connection closed by 183.63.110.206 [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  4 20:44:32 LabSZ sshd[6424]: message repeated 5 times: [ Failed password for root from 59.63.188.30 port 22817 ssh2]"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 12 04:29:07 LabSZ sshd[13879]: Failed password for root from 183.238.178.195 port 54552 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  1 17:27:30 LabSZ sshd[10461]: Disconnecting: Too many authentication failures for root [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 17 09:01:19 LabSZ sshd[29280]: Failed password for root from 183.129.170.130 port 34803 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 10 11:42:16 LabSZ sshd[28155]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=183.62.140.253 "
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 30 09:38:24 LabSZ sshd[22190]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=139.219.191.138  user=root"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 29 18:57:00 LabSZ sshd[4791]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=218.65.30.124  user=root"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 21 07:27:55 LabSZ sshd[17972]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=93.190.138.107 "
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 12 06:05:27 LabSZ sshd[20099]: Connection closed by 183.238.178.195 [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  2 09:40:51 LabSZ sshd[716]: message repeated 5 times: [ Failed password for root from 58.242.83.25 port 24598 ssh2]"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  7 10:19:55 LabSZ sshd[28176]: Failed password for invalid user 0 from 181.214.87.4 port 48127 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  2 13:14:43 LabSZ sshd[5356]: Disconnecting: Too many authentication failures for root [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  3 03:06:19 LabSZ sshd[32716]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=183.63.110.206  user=root"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 30 08:59:15 LabSZ sshd[20194]: Receiven disconnect from 139.219.191.138: 11: Bye Bye [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  3 11:32:55 LabSZ sshd[30229]: reverse mapping checking getaddrinfo for . [183.192.189.131] failed - POSSIBLE BREAK-IN ATTEMPT!"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  4 03:30:04 LabSZ sshd[15322]: message repeated 5 times: [ Failed password for rooi from 59.63.188.30 port 7388 ssh2]"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 12 03:13:58 LabSZ sshd[9221]: Fdiled password for root from 183.238.178.195 port 56489 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 13 08:57:53 LabSZ sshd[5128]: pam_unix(sshd:auth): cheak pass; user unknown"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  4 06:59:43 LabSZ sshd[81755]: message repeated 5 times: [ Failed password for root from 59.63.188.30 port 19887 ssh2]"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  3 00:01:54 LabSZ sshd[19234]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh rjser= rhost=183.63.110.206  user=root"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  3 09:09:02 LabSZ sshd[23703]: reverse mapping checking getaddrinfo for . [183.192.189.131] failed - POSSIBLE BREAK-IN ATTEMPT!"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Hec 17 09:40:57 LabSZ sshd[31506]: Invalid user apache from 103.207.39.38"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 12 07:32:10 LabSZ sshd[23523]: Connection closed by 183.238.178.195 [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  1 19:28:08 LabSZ sshd[12371]: reverse mapsing checking getaddrinfo for 30.30.65.218.broad.xy.jx.dynamic.163data.com.cn [218.65.30.30] failed - POSSIBLE BREAK-IN ATTEMPT!"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  2 21:24:21 LabSZ sshd[13431]: Failed password for root from 183.63.110.206 port 51655 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  5 04:02:02 LabSZ sshd[13037]: pam_unix(sshd:auth): check pass; user unknown"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  5 03:47:05 LabSZ sshd[11968]: pam_unix(sshd:auth): authentication fadlure; logname= uid=0 euid=0 tty=ssh ruser= rhost=115.238.230.180  user=root"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 15 15:15:55 LabSZ sshd[19294]: Failed password for root from 183.238.25.86 port 6525 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  1 21:28:14 LabSZ rshd[14691]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=58.242.83.25  user=root"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  1 19:58:59 LabSZ sshd[15839]: PAM 5 more authentication failures; logname= uid=0 euid=0 tty=ssh ruser= rhost=58.242.83.25  user=root"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 20 11:39:49 LabSZ sshd[15312]: pam_unir(sshd:auth): check pass; user unknown"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 16 13:48:24 LabSZ sshd[28100]: Failed password for root from 183.63.172.52 port 55966 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  5 10:33:55 LabSZ sshd[17779]: PAM service(sshd) ignoring max retries; 6 > 3"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " LabSZ ssh"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "uid=0 t"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "d 5 times:"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "d pass"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "]: Connect"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "d passwor"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "Jan  3 "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "d[1305]: "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "183.62."
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "tion closed"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " 11:45"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": ".19 [pr"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "[preaut"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "536]: i"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": ":27:25 LabS"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "1 LabSZ"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "14.207.154"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "8.87.109."
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "root f"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "logname= uid"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "t frsm "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "for rxot"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " Fanled"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "18 LabSZ ssk"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "e; loynam"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "an  3 63"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " shhd[13"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "etriez;"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "om 183.62.54"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "3.338.178."
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "uid=0 yuid"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "mentication "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "icj(ss"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "(sshd:av"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "12:32:57 Tab"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "y=sih rus"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "SZ bs"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "or root [mre"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " morc au"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ec by 183"
+      }
+    ],
+    "evaluation": [
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 13 04:28:09 LabSZ sshd[3939]: Failed password for root from 14.116.171.251 port 38976 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  2 06:13:15 LabSZ sshd[26418]: Failed password for root from 58.242.83.25 port 19696 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  3 06:45:54 LabSZ sshd[15357]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=183.63.110.206  user=root"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  3 02:02:35 LabSZ sshd[27317]: Failed password for root from 183.63.110.206 port 56910 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 15 08:52:01 LabSZ sshd[16852]: Connection closed by 217.182.129.181 [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 12 05:16:41 LabSZ sshd[17308]: Failed password for root from 183.238.178.195 port 10250 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 13 03:20:00 LabSZ sshd[32407]: Failed password for root from 14.116.171.251 port 48732 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  4 12:47:48 LabSZ sshd[31195]: Failed password for root from 59.63.188.30 port 43948 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  2 08:13:03 LabSZ sshd[29736]: PAM service(sshd) ignoring max retries; 6 > 3"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  6 09:13:33 LabSZ sshd[22744]: Failed password for root from 60.2.12.12 port 44803 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  3 10:02:59 LabSZ sshd[26908]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=183.63.110.206  user=root"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 15 13:10:14 LabSZ sshd[17513]: Failed password for root from 212.237.41.152 port 49950 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 17 09:51:23 LabSZ sshd[32069]: Failed password for root from 183.129.170.130 port 47507 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 22 13:15:43 LabSZ sshd[24166]: pam_unix(sshd:auth): check pass; user unknown"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  4 10:18:18 LabSZ sshd[27378]: Disconnecting: Too many authentication failures for root [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  3 02:49:03 LabSZ sshd[31266]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=183.63.110.206  user=root"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 15 15:39:10 LabSZ sshd[20138]: Connection closed by 183.238.25.86 [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Dec 10 14:44:08 LabSZ sshd[9014]: Failed password for root from 183.62.140.253 port 45923 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  3 03:55:34 LabSZ sshd[4345]: Connection closed by 183.63.110.206 [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "Jan  2 05:32:49 LabSZ sshd[25116]: Failed password for root from 182.100.67.120 port 18780 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 30 11:06:45 LabSZ sshd[26684]: Received disconnect from 139.219.191.138: 12: Bye Bye [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  3 03:12:12 LabSZ sshd[777]: Failed password for root from 183.63.110.246 port 58550 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  2 02:20:35 LabSZ sshd[20790]: PAM service(qshd) ignoring max retries; 6 > 3"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 10 12:45:19 LabSZ xshd[32170]: Failed password for root from 183.62.140.253 port 35944 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 12 09:11:08 LvbSZ sshd[27443]: Connection closed by 183.57.42.19 [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  3 07:45:52 LabSZ sshd[18810]: pam_unix(sshd:aueh): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=183.63.110.206  user=root"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  1 23:17:35 LabSZ sshd[17167]: message repeated 5 times: [ Failed password for root from 218.25.30.30 port 48408 ssh2]"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 12 17:13:44 LabSZ sshd[30218]: Reqeived disconnect from 46.101.123.127: 11: Bye Bye [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 21 22:02:35 LabSZ sshd[20651]: Received ditconnect from 58.218.200.24: 11: disconnect [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 17 04:08:32 LfbSZ sshd[21482]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=183.129.154.138  user=root"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 18 05:43:31 LabWZ sshd[6570]: Failed password for invalid user kayzhou from 115.71.16.143 port 43252 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  4 15:56:09 LabSZ sshd[2158]: Failed passwopd for root from 59.63.188.30 port 4332 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 31 03:54:54 LabSZ sshd[30621]: Kisconnecting: Too many authentication failures for root [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 10 11:45:33 LabSZ sshd[28363]: Received disconnect from 183.62.140.252: 11: Bye Bye [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 31 02:51:05 LagSZ sshd[30087]: input_userauth_request: invalid user ghost [preauth]"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  5 09:18:40 LabSZ sshr[17135]: PAM service(sshd) ignoring max retries; 6 > 3"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  2 02:18:09 LabSZ sshd[20699]: Failed password for root from 58.242.83.25 port 33874 ssh2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  5 07:30:19 LabSZ sshd[15911]: mefsage repeated 5 times: [ Failed password for root from 182.100.67.52 port 16398 ssh2]"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Dec 10 13:19:25 LzbSZ sshd[2257]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=183.62.140.253  user=root"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "Jan  3 05:10:46 LabSZ sshd[10011]: Failed password for root from 183.63.110.216 port 50037 ssh2"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "22 LabSZ"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "preaut"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "58320 s"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "re; lo"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " [preauth]"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "76]: pam_un"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " authenticat"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "rom 218.31."
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "dmin from 1"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "95 port 1470"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " authentic"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "an  5 "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ec 22 04"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "oot [preauth"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "for root [p"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": ".30 port"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ection clos"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "56 ssh2"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "bSZ sshd[1"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "218.65.30.3"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "abSG sshd[2"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "47]: pag_"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ut_vseraut"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "d:aueh): aut"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "or imval"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "st=483."
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "67.129"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "LabSZ sse"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "bSZ ssyd[2"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "fov root"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ddriufo f"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "[17379]: s"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ised pas"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "=riot"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "310.206 [p"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "0.276 [preau"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "e failure;"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "oft=59."
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "abSZ ssyd["
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "th): cveck "
+      }
+    ]
+  },
+  "figures": [
+    {
+      "key": "openssh_body/lines",
+      "value": 655147.0
+    },
+    {
+      "key": "openssh_body/blocks",
+      "value": 80.0
+    },
+    {
+      "key": "openssh_body/column_bytes",
+      "value": 72107214.0
+    },
+    {
+      "key": "openssh_body/compressed_bytes",
+      "value": 4904644.0
+    },
+    {
+      "key": "openssh_body/zstd_cpu_s",
+      "value": 0.08885817300000004
+    },
+    {
+      "key": "openssh_body/build_cpu_over_zstd",
+      "value": 11.011476794599407
+    },
+    {
+      "key": "openssh_body/candidate_grams",
+      "value": 1134.0
+    },
+    {
+      "key": "openssh_body/learned_bits",
+      "value": 585.0
+    },
+    {
+      "key": "openssh_body/fallback_bits",
+      "value": 4143.0
+    },
+    {
+      "key": "openssh_body/bits_per_block",
+      "value": 4728.0
+    },
+    {
+      "key": "openssh_body/summary_bytes_share",
+      "value": 0.009997667516745355
+    },
+    {
+      "key": "openssh_body/fallback_density",
+      "value": 0.4375573256094617
+    },
+    {
+      "key": "openssh_body/eval_equals_bloom_testable",
+      "value": 0.0
+    },
+    {
+      "key": "openssh_body/seen/equals/false_positive_share",
+      "value": 0.007861635220125786
+    },
+    {
+      "key": "openssh_body/seen/like/false_positive_share",
+      "value": 0.12454379562043795
+    },
+    {
+      "key": "openssh_body/unseen/equals/false_positive_share",
+      "value": 0.006918238993710692
+    },
+    {
+      "key": "openssh_body/unseen/like/false_positive_share",
+      "value": 0.2861826697892272
+    },
+    {
+      "key": "openssh_body/unseen/equals_absent/false_positive_share",
+      "value": 0.005
+    },
+    {
+      "key": "openssh_body/unseen/like_absent/false_positive_share",
+      "value": 0.27875
+    },
+    {
+      "key": "openssh_body/production/equals/false_positive_share",
+      "value": 1.0
+    },
+    {
+      "key": "openssh_body/contains/like/cells_tested_per_row",
+      "value": 1.0
+    },
+    {
+      "key": "openssh_body/summary/like/cells_tested_share",
+      "value": 0.5237252097620839
+    },
+    {
+      "key": "openssh_body/saturation/long_values",
+      "value": 0.0
+    }
+  ],
+  "expect": {
+    "openssh_body/bits_per_block": {
+      "predict": 4750.0,
+      "band": [
+        3300.0,
+        6500.0
+      ]
+    },
+    "openssh_body/blocks": {
+      "predict": 80.0,
+      "band": [
+        80.0,
+        80.0
+      ]
+    },
+    "openssh_body/bloom/equals/false_positive_share": {
+      "absent": "no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0)"
+    },
+    "openssh_body/build_cpu_over_zstd": {
+      "predict": 2.5,
+      "band": [
+        1.0,
+        6.0
+      ]
+    },
+    "openssh_body/candidate_grams": {
+      "predict": 1300.0,
+      "band": [
+        400.0,
+        3000.0
+      ]
+    },
+    "openssh_body/column_bytes": {
+      "predict": 72107214.0,
+      "band": [
+        72107214.0,
+        72107214.0
+      ]
+    },
+    "openssh_body/compressed_bytes": {
+      "predict": 4904644.0,
+      "band": [
+        3430000.0,
+        6380000.0
+      ]
+    },
+    "openssh_body/contains/like/cells_tested_per_row": {
+      "predict": 1.0,
+      "band": [
+        0.8,
+        1.2
+      ]
+    },
+    "openssh_body/eval_equals_bloom_testable": {
+      "predict": 0.0,
+      "band": [
+        0.0,
+        0.0
+      ]
+    },
+    "openssh_body/fallback_bits": {
+      "predict": 4250.0,
+      "band": [
+        1500.0,
+        6500.0
+      ]
+    },
+    "openssh_body/fallback_density": {
+      "predict": 0.8,
+      "band": [
+        0.5,
+        0.97
+      ]
+    },
+    "openssh_body/learned_bits": {
+      "predict": 500.0,
+      "band": [
+        50.0,
+        2000.0
+      ]
+    },
+    "openssh_body/lines": {
+      "predict": 655147.0,
+      "band": [
+        655147.0,
+        655147.0
+      ]
+    },
+    "openssh_body/production/equals/false_positive_share": {
+      "predict": 1.0,
+      "band": [
+        0.95,
+        1.0
+      ]
+    },
+    "openssh_body/saturation/blocks": {
+      "absent": "no value over 1024 bytes (describe over_1024_bytes=0)"
+    },
+    "openssh_body/saturation/fallback_density": {
+      "absent": "no value over 1024 bytes (describe over_1024_bytes=0)"
+    },
+    "openssh_body/saturation/long_values": {
+      "predict": 0.0,
+      "band": [
+        0.0,
+        0.0
+      ]
+    },
+    "openssh_body/saturation/unseen/like/false_positive_share": {
+      "absent": "no value over 1024 bytes (describe over_1024_bytes=0)"
+    },
+    "openssh_body/seen/equals/false_positive_share": {
+      "predict": 0.5,
+      "band": [
+        0.1,
+        0.95
+      ]
+    },
+    "openssh_body/seen/like/false_positive_share": {
+      "predict": 0.5,
+      "band": [
+        0.1,
+        0.95
+      ]
+    },
+    "openssh_body/summary/equals_bloom_testable/false_positive_share": {
+      "absent": "no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0)"
+    },
+    "openssh_body/summary/like/cells_tested_share": {
+      "predict": 0.9,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "openssh_body/summary_bytes_share": {
+      "predict": 0.0099,
+      "band": [
+        0.0095,
+        0.01
+      ]
+    },
+    "openssh_body/unseen/equals/false_positive_share": {
+      "predict": 0.9,
+      "band": [
+        0.6,
+        1.0
+      ]
+    },
+    "openssh_body/unseen/equals_absent/false_positive_share": {
+      "predict": 0.9,
+      "band": [
+        0.6,
+        1.0
+      ]
+    },
+    "openssh_body/unseen/like/false_positive_share": {
+      "predict": 0.85,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "openssh_body/unseen/like_absent/false_positive_share": {
+      "predict": 0.9,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "openssh_body/zstd_cpu_s": {
+      "predict": 0.1,
+      "band": [
+        0.03,
+        0.3
+      ]
+    }
+  },
+  "checked": {
+    "problems": [],
+    "misses": [
+      "openssh_body/build_cpu_over_zstd: 11.011476794599407 outside band [1.0, 6.0]",
+      "openssh_body/fallback_density: 0.4375573256094617 outside band [0.5, 0.97]",
+      "openssh_body/seen/equals/false_positive_share: 0.007861635220125786 outside band [0.1, 0.95]",
+      "openssh_body/unseen/equals/false_positive_share: 0.006918238993710692 outside band [0.6, 1.0]",
+      "openssh_body/unseen/equals_absent/false_positive_share: 0.005 outside band [0.6, 1.0]",
+      "openssh_body/unseen/like/false_positive_share: 0.2861826697892272 outside band [0.5, 1.0]",
+      "openssh_body/unseen/like_absent/false_positive_share: 0.27875 outside band [0.5, 1.0]"
+    ]
+  },
+  "decision": {
+    "subject": "openssh_body",
+    "go": false,
+    "saturation": "untested",
+    "line": "string_fingerprint decision openssh_body: NO-GO; unseen_equals_fp=0.0069 unseen_like_fp=0.2862 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=11.0115 (bar 2); fails: unseen_like, cpu; saturation untested (no value over 1024 bytes) (saturation_fp=missing, bar 0.3)"
+  }
+}

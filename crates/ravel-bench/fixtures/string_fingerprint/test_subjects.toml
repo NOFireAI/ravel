@@ -1,0 +1,52 @@
+# A tiny spec for string_fingerprint_report's own tests over corpus.txt
+# (18 lines, one over 1024 bytes). Not the pre-registration file: see
+# subjects.toml for the real subjects.
+schema = 2
+
+[[subject]]
+name = "test_subject"
+corpus = "test fixture"
+source = "crates/ravel-bench/fixtures/string_fingerprint/corpus.txt"
+column = "value"
+block_records = 4
+object_records = 8
+max_lines = 18
+zstd_level = 3
+gram_len = 3
+budget_share = 0.5
+fallback_min_bits = 64
+seed = 11
+literals_per_kind = 4
+eq_max_len = 64
+like_min_len = 4
+like_max_len = 9
+
+[subject.figures]
+"lines" = { predict = 18, band = [18, 18] }
+"blocks" = { predict = 5, band = [5, 5] }
+"column_bytes" = { unpredicted = "test" }
+"compressed_bytes" = { unpredicted = "test" }
+"zstd_cpu_s" = { unpredicted = "test" }
+"build_cpu_over_zstd" = { unpredicted = "test" }
+"candidate_grams" = { unpredicted = "test" }
+"learned_bits" = { unpredicted = "test" }
+"fallback_bits" = { unpredicted = "test" }
+"bits_per_block" = { unpredicted = "test" }
+"summary_bytes_share" = { unpredicted = "test" }
+"fallback_density" = { unpredicted = "test" }
+"eval_equals_bloom_testable" = { predict = 4, band = [4, 4] }
+"seen/equals/false_positive_share" = { unpredicted = "test" }
+"seen/like/false_positive_share" = { unpredicted = "test" }
+"unseen/equals/false_positive_share" = { unpredicted = "test" }
+"unseen/like/false_positive_share" = { unpredicted = "test" }
+"unseen/equals_absent/false_positive_share" = { unpredicted = "test" }
+"unseen/like_absent/false_positive_share" = { unpredicted = "test" }
+"production/equals/false_positive_share" = { unpredicted = "test" }
+"bloom/equals/false_positive_share" = { unpredicted = "test" }
+"summary/equals_bloom_testable/false_positive_share" = { unpredicted = "test" }
+"contains/like/cells_tested_per_row" = { unpredicted = "test" }
+"summary/like/cells_tested_share" = { unpredicted = "test" }
+"saturation/long_values" = { predict = 1, band = [1, 1] }
+"saturation/blocks" = { predict = 1, band = [1, 1] }
+"saturation/fallback_density" = { unpredicted = "test" }
+"saturation/unseen/like/false_positive_share" = { unpredicted = "test" }

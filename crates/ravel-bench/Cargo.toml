@@ -425,6 +425,11 @@ path = "src/bin/compaction_bench.rs"
 bench = false
 
 [[bin]]
+name = "string_fingerprint_report"
+path = "src/bin/string_fingerprint_report.rs"
+bench = false
+
+[[bin]]
 name = "parquet_baseline"
 path = "src/bin/parquet_baseline.rs"
 required-features = ["parquet-baseline"]
