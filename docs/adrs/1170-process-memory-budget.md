@@ -1617,6 +1617,8 @@ two is the share bound, and a building stream's envelope from 8 MiB is
 `5 x J_max` fallback for an Unknown profile, and the ladder bound for a
 layout not reported by capacity are unchanged. `S` is the asked size, not
 the charged `1.25 x S`. For q33 the share bound is `1.125 x (S + 192)`.
+These q33 figures are for a `W` of 56; the q33 width amendment restates
+them for the 65 that #3838 made it.
 
 The `Vec` term takes the `Vec` that moves to hold at most `A_v / W` groups,
 which holds while one batch adds fewer than `S x s / ((2W + s)(W + s))`
@@ -1843,3 +1845,48 @@ in `services/ravel-server/src/fold.rs` pins the fold tick.
 `a_refused_covering_decode_skips_the_postings_tier_until_a_tick_with_room`
 and `a_refused_seal_divergence_decode_skips_the_tier_until_a_tick_with_room`
 in `services/ravel-server/src/scrub.rs` pin the scrub's skip and retry.
+
+## Amendment (2026-11-05, #3838): q33's aggregate width is 65
+
+<!-- amendment-applies: sections="Amendment (2026-10-24, #3181): the aggregate envelope is bounded by its capacity share" pointer="q33 width amendment" -->
+
+The capacity share amendment derived q33's figures with `W` 56. #3838 made
+an integer `SUM` keep a checked state of 17 bytes per group where the
+built-in kept 8, so q33's `W` is `8 + 8 + 8 + 17 + 24 = 65`; `w_max` stays
+16 and the entry size `s` stays 16. The 56 derivation stands as the history
+of q33 before #3838 and as a synthetic layout whose ladders coincide.
+
+With `W` 65 the two ladders no longer coincide. A `Vec` step `65 x 2^j`
+sits 16% above the table step `56 x 2^j` and 42% below `112 x 2^j`, and a
+table step `56 x 2^m` sits 13.8% below the `Vec` step `65 x 2^m`, all
+outside the 3% step tolerance, so no grow counts for both and `J_t` and
+`J_v` move apart. The ladder bound reads
+`max(5 x J_t, 2.1 x J_v x 81 / 65)`, a `Vec` factor of 2.6169. The share
+bound's `Vec` term is `(S + 192) x 2 x 81 / 146 = 81/73 x (S + 192)`, about
+`1.1096 x (S + 192)`, and its table term
+`16/7 x 17 x (2S / 97 + 12) + 16`, about `0.8012 x S + 482`, is the smaller
+of the two from `S` about 872 bytes, so q33's share bound is
+`81/73 x (S + 192)`. `1.125 x (S + 192)` is no longer q33's share bound; it
+still bounds q33's envelope from above, since 81/73 is under 1.125. The
+`Vec` term holds while one batch adds fewer than
+`S x 16 / (146 x 81) = S / 739.125` groups, 11,349 at 8 MiB, where the
+56-wide figures were `S / 576` and 14,563.
+
+Neither bound binds for every stream. A stream whose steps start at the
+8 MiB table step, `14 x 2^19, 65 x 2^19, ..., 14 x 2^21, 65 x 2^21`, asks
+289,931,264 bytes with `J_t` 29,360,128 and `J_v` 136,314,880; its
+envelopes read 17,836,278, 45,958,007, 62,246,845, 137,873,593,
+170,451,270 and 321,704,767, the last the share bound, under the ladder
+bound 356,725,556 and the size bound 704,532,972. A stream grown from a
+224-byte table step through `14 x 2^k` and `65 x 2^k` for `k` 4 to 21 takes
+the ladder bound at each of its 11 steps from 8 MiB: the first at
+10,353,424 bytes asked, an envelope of 11,147,674 against a share bound of
+11,488,259, and the last at 331,348,752 asked, 356,725,556 against
+367,661,158.
+
+`the_q33_layout_keeps_its_ladders_apart_and_takes_the_smaller_bound` in
+`crates/ravel-sql/src/memory.rs` pins these figures for the 65-wide layout,
+and `the_q33_layout_with_coinciding_ladders_takes_the_capacity_share_bound`
+keeps the 56-wide case under its old name as the synthetic coinciding
+layout. `the_aggregate_profile_of_the_six_measured_statements` in
+`crates/ravel-sql/src/executor.rs` pins q33's layout at 16, 65, 16.

@@ -87,9 +87,12 @@
 //! `16/7 x (s + 1) x (2S / (W + 2s) + 12) + 16` and the next `Vec` transient
 //! at most `(S + 12s) x 2(W + w_max) / (2W + s)`, `s` the entry size. The
 //! envelope is the smallest of the size bound, the next step and that share
-//! bound. When the two ladders coincide (q33's `14 x 2^k` and `56 x 2^j`),
-//! every grow counts for both and the next step reads `5 x J_max`; the share
-//! bound reads `1.125 x (S + 192)`.
+//! bound. When the two ladders coincide (16-byte entries and a `W` of 56:
+//! `14 x 2^k` and `56 x 2^j`), every grow counts for both and the next step
+//! reads `5 x J_max`; the share bound reads `1.125 x (S + 192)`. q33's `W` is
+//! 65, whose ladders stay apart: its next step is
+//! `max(5 x J_t, 2.1 x J_v x 81 / 65)` and its share bound
+//! `81/73 x (S + 192)`.
 //!
 //! [`AggregateReserveAhead::DEFAULT`] charges the factor and carries the
 //! envelope; [`AggregateReserveAhead::OFF`] restores one-to-one charging and
@@ -2611,7 +2614,7 @@ mod tests {
     }
 
     /// The table and accumulator `Vec` steps of one partial aggregate
-    /// building 3.1M groups of q33's shape (layout `(16, 52, 16)`), as
+    /// building 3.1M groups of a q33-like shape (layout `(16, 52, 16)`), as
     /// DataFusion 55.2 asks for them: the table steps
     /// `7/8 x 2^k x 16` for k = 19, 20, 21 (7,340,032, 14,680,064 and
     /// 29,360,128 bytes), each followed by the `Vec` step `2^k x 52` that
@@ -2635,11 +2638,30 @@ mod tests {
         capacity_accounted: false,
     };
 
-    /// A q33-like layout with every `Vec` reported by capacity: per group 56
-    /// bytes of `Vec`s.
-    const Q33_ACCOUNTED_LAYOUT: AggregateLayout = AggregateLayout {
+    /// A synthetic capacity-accounted layout whose two ladders coincide:
+    /// 16-byte entries and per group 56 bytes of `Vec`s, `56 x 2^j = 14 x
+    /// 2^(j + 2)`. It is q33's width before its `SUM` became the 17-byte
+    /// checked sum; q33 itself is [`Q33_ACCOUNTED_LAYOUT`].
+    const W56_ACCOUNTED_LAYOUT: AggregateLayout = AggregateLayout {
         entry_size: 16,
         vec_width_total: 56,
+        vec_width_max: 16,
+        capacity_accounted: true,
+    };
+
+    /// q33's layout, as `the_aggregate_profile_of_the_six_measured_statements`
+    /// in `executor.rs` derives it from the plan: per group 8 + 8 (keys), 8
+    /// (`COUNT`), the checked integer `SUM`'s 16 + 1 and the exact `AVG`'s
+    /// 16 + 8, so `W` is 65.
+    const Q33_ACCOUNTED_LAYOUT: AggregateLayout = AggregateLayout {
+        entry_size: 16,
+        vec_width_total: 8
+            + 8
+            + 8
+            + crate::sum::EXACT_SUM_GROUP_WIDTHS[0]
+            + crate::sum::EXACT_SUM_GROUP_WIDTHS[1]
+            + 16
+            + 8,
         vec_width_max: 16,
         capacity_accounted: true,
     };
@@ -2802,9 +2824,11 @@ mod tests {
         drop(res);
     }
 
-    /// q33's table ladder `14 x 2^k` and `Vec` ladder `56 x 2^j` are one set,
-    /// so every step is both chains' step and the ladder bound is
-    /// `5 x J_max`. The capacity share of the asked size bounds it instead.
+    /// The synthetic 56-wide case ([`W56_ACCOUNTED_LAYOUT`], q33's width until
+    /// #3838; q33 itself is the next test): its table ladder `14 x 2^k` and
+    /// `Vec` ladder `56 x 2^j` are one set, so every step is both chains'
+    /// step and the ladder bound is `5 x J_max`. The capacity share of the
+    /// asked size bounds it instead.
     /// FLIP: the PR head's `min(2.43 x S, ladder)` reads 587,202,560 at the
     /// end; taking the share over the charged bytes reads 361,267,416.
     #[test]
@@ -2817,7 +2841,7 @@ mod tests {
             AggregateReserveAhead::DEFAULT,
             QueryAccounting::new(),
         );
-        pool.set_aggregate_profile(AggregateProfile::Layout(Q33_ACCOUNTED_LAYOUT));
+        pool.set_aggregate_profile(AggregateProfile::Layout(W56_ACCOUNTED_LAYOUT));
         let res = register_on(&pool, PARTIAL);
         // Table, `Vec`, table, `Vec`, table, `Vec`: 14 x 2^19, 56 x 2^19,
         // 14 x 2^20, 56 x 2^20, 14 x 2^21, 56 x 2^21.
@@ -2850,6 +2874,116 @@ mod tests {
             last >= vec_bytes * (56 + 16) / 56,
             "the next Vec step, with its widest Vec moving last: {last}"
         );
+        drop(res);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// q33's `W` of 65 is no `14 x 2^m`: its `Vec` steps `65 x 2^j` sit 16%
+    /// off the nearest table steps `14 x 2^k`, so no grow counts for both, and
+    /// its next step is `max(5 x J_t, 2.1 x J_v x 81 / 65)`. Its share bound
+    /// is `(S + 192) x 2 x 81 / 146 = 81/73 x (S + 192)`, under the 56-wide
+    /// `1.125 x (S + 192)`. Neither bound always binds: a stream whose first
+    /// step is the table step at 8 MiB takes the share bound, and one grown
+    /// from a 224-byte table step takes the ladder bound at every step from
+    /// 8 MiB. One batch keeps the share bound's `Vec` term while it adds under
+    /// `S x 16 / (146 x 81) = S / 739.125` groups, 11,349 at 8 MiB.
+    /// FLIP: dropping the share bound from the envelope reads 356,725,556 at
+    /// the end of the first stream; dropping the ladder bound reads
+    /// 11,488,259 against 11,147,674 at the second stream's first step over
+    /// 8 MiB.
+    #[test]
+    fn the_q33_layout_keeps_its_ladders_apart_and_takes_the_smaller_bound() {
+        let _serial = envelope_tests();
+        let layout = Q33_ACCOUNTED_LAYOUT;
+        assert_eq!(layout.vec_width_total, 65);
+        let (s, w, w_max) = (16, 65, 16);
+        assert_eq!(
+            (8usize << 20) * s / ((2 * w + s) * (w + s)),
+            11_349,
+            "groups one batch may add at 8 MiB"
+        );
+        let vec_factor: f64 = 2.1 * 81.0 / 65.0;
+        assert_eq!(
+            vec_factor.to_bits(),
+            (2.1 * (w + w_max) as f64 / w as f64).to_bits()
+        );
+
+        // Starting at the 8 MiB table step: 14 x 2^19, 65 x 2^19, ...,
+        // 14 x 2^21, 65 x 2^21.
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (_tenant, pool) = ahead_pool(
+            &budget,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        pool.set_aggregate_profile(AggregateProfile::Layout(layout));
+        let res = register_on(&pool, PARTIAL);
+        let steps = [
+            7_340_032,
+            34_078_720,
+            14_680_064,
+            68_157_440,
+            29_360_128,
+            136_314_880,
+        ];
+        let envelopes = envelopes_after(&budget, &pool, &res, &steps);
+        assert_eq!(chain_steps(&pool, &res), (29_360_128, 136_314_880));
+        assert_eq!(
+            envelopes,
+            [
+                17_836_278,
+                45_958_007,
+                62_246_845,
+                137_873_593,
+                170_451_270,
+                321_704_767
+            ]
+        );
+        let asked: usize = steps.iter().sum();
+        assert_eq!(asked, 289_931_264);
+        // 81/73 x (289,931,264 + 192), under the ladder bound
+        // 2.1 x 136,314,880 x 81 / 65 = 356,725,556.
+        assert_eq!(Some(envelopes[5] as usize), layout.share_bound(asked));
+        assert_eq!(scale(136_314_880, vec_factor), 356_725_556);
+        assert!(envelopes[5] <= (1.125 * (asked + 192) as f64) as u64);
+        drop(res);
+        assert_eq!(budget.reserved(), 0);
+
+        // Grown from 224 bytes: 14 x 2^k then 65 x 2^k for k = 4 to 21.
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (_tenant, pool) = ahead_pool(
+            &budget,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        pool.set_aggregate_profile(AggregateProfile::Layout(layout));
+        let res = register_on(&pool, PARTIAL);
+        let steps: Vec<usize> = (4..=21).flat_map(|k| [14 << k, 65 << k]).collect();
+        let envelopes = envelopes_after(&budget, &pool, &res, &steps);
+        assert_eq!(chain_steps(&pool, &res), (29_360_128, 136_314_880));
+        let (mut asked, mut j_t, mut j_v, mut ladder_bound) = (0, 0, 0, 0);
+        for (index, step) in steps.iter().enumerate() {
+            asked += step;
+            if index % 2 == 0 {
+                j_t = *step;
+            } else {
+                j_v = *step;
+            }
+            if asked < ENVELOPE_STEP_BOUND_FROM {
+                continue;
+            }
+            let ladder = scale(j_t, 5.0).max(scale(j_v, vec_factor));
+            let share = layout.share_bound(asked).expect("capacity accounted");
+            assert!(ladder < share, "step {index}: {ladder} against {share}");
+            assert_eq!(envelopes[index], ladder as u64, "step {index}");
+            ladder_bound += 1;
+        }
+        assert_eq!(ladder_bound, 11, "steps 25 to 35 are at or over 8 MiB");
+        assert_eq!(asked, 331_348_752);
+        assert_eq!(envelopes[34..], [178_362_778, 356_725_556]);
+        assert_eq!(layout.share_bound(asked), Some(367_661_158));
         drop(res);
         assert_eq!(budget.reserved(), 0);
     }
@@ -2902,7 +3036,7 @@ mod tests {
             AggregateReserveAhead::DEFAULT,
             QueryAccounting::new(),
         );
-        pool.set_aggregate_profile(AggregateProfile::Layout(Q33_ACCOUNTED_LAYOUT));
+        pool.set_aggregate_profile(AggregateProfile::Layout(W56_ACCOUNTED_LAYOUT));
         let res = register_on(&pool, PARTIAL);
         let envelopes = envelopes_after(&budget, &pool, &res, &[7_340_032, 29_360_128]);
         let asked = 7_340_032 + 29_360_128;
@@ -2911,10 +3045,10 @@ mod tests {
         assert_eq!(envelopes[1], 41_287_896);
         assert_eq!(
             Some(envelopes[1] as usize),
-            Q33_ACCOUNTED_LAYOUT.share_bound(asked)
+            W56_ACCOUNTED_LAYOUT.share_bound(asked)
         );
         assert_ne!(
-            Q33_ACCOUNTED_LAYOUT.share_bound(pool.reserved()),
+            W56_ACCOUNTED_LAYOUT.share_bound(pool.reserved()),
             Some(envelopes[1] as usize)
         );
         drop(res);
