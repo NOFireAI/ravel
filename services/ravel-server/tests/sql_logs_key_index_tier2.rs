@@ -653,10 +653,11 @@ fn delta(before: Totals, after: Totals) -> Totals {
 ///
 /// FLIP (b): letting the block-range threshold gate a pruned segment
 /// (`compute_plan_counts` treating `Pruned` like `Uncovered` for objects at
-/// or under it) reads the small objects whole: the "a pruned object is never
-/// read" assertion fails on object 1. FLIP (c): planning a `Blocks(set)`
-/// segment with `plan_segment_keyed` instead of `plan_segment_routed` reads
-/// the holder's KEY_IDX: the holder's KEY_IDX assertion fails.
+/// or under it) reads the 16 small objects whole: the "only the holder is
+/// opened" assertion fails with objects 0 to 16. FLIP (c): ignoring the block
+/// set (`Blocks(_)` treated like `Uncovered`, so the holder takes
+/// `plan_segment_keyed`) reads the holder's KEY_IDX: the "the holder's
+/// KEY_IDX is never read" assertion fails.
 #[tokio::test]
 async fn folded_equality_opens_only_the_holder() {
     let _serial = SERIAL.lock().await;
@@ -729,7 +730,8 @@ async fn folded_equality_opens_only_the_holder() {
 /// and object 20's row is returned. The rows equal the unfolded answer.
 ///
 /// FLIP (a): routing `SegmentRoute::Uncovered` as `Pruned` in
-/// `compute_plan_counts` drops object 20's row: the rows assertion fails.
+/// `compute_plan_counts` returns no rows: the unfolded rows assertion fails
+/// first, since a scan with no part routes every segment `Uncovered`.
 /// Reverting the fold's `section_resolves_like_the_reader` check makes both
 /// entries covered and the leaf proves `TARGET` absent from object 20: the
 /// `uncovered_entry_ordinals` assertion fails.
