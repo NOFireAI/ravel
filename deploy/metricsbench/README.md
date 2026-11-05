@@ -123,6 +123,11 @@ server's derivation from the container, and the server logs each value with
 | Budget left for query working set | 4,380,866,643 | budget minus the three caches (2,061,584,301) |
 | `--max-ingest-buffer-bytes` | 536,870,912 | the 512 MiB default, stated; held in the reserve |
 
+The three Go comparators are told their envelope through `GOMEMLIMIT=7GiB`
+(ADR-0927 amendment 2026-11-05), set in `docker-compose.yml` on
+`prometheus`, `victoriametrics` and `mimir`; its row is under "Frozen limits"
+below.
+
 **Disclosed settings** (each commented next to its flag in `ravel.yml`):
 
 - `--max-ingest-lag 45d` replaces the 2h default, so the 30 d history profile
@@ -290,6 +295,7 @@ scrape grid.
 | Ravel | `--max-samples` | `500000000` | `10000000` | Raised (#3306) to Prometheus' and Mimir's value. Ravel counts total materialized samples after dedup, where Prometheus counts peak resident samples, so the equal numbers are not equal semantics; the comparator counting the same quantity is VictoriaMetrics' `-search.maxSamplesPerQuery`, at twice this value. No corpus entry comes near either: the largest read is 96,000,000. The bytes behind them are bounded by `--memory-budget-bytes`, which refuses an oversized materialization `memory exhausted` first. The flag also sizes the range selector-cache cap (2 x max_samples x 16 bytes): 16,000,000,000 bytes here, against 320,000,000 at the default, so that cap is inert and the memory budget alone bounds a range query's cached selector copies. At the default, 5 history entries would be refused, the largest `mb_long_range_7d_avg` at about 40.3M | `--max-samples <N>  Cap on the total samples (summed across series, after cross-segment dedup) a single PromQL query may materialize ... Default when unset: ravel_query::DEFAULT_MAX_SAMPLES (10,000,000)` |
 | Ravel | points per range series | `11000` | `11000` (unchanged, no flag) | Kept, same as Prometheus and Mimir: history's grid is 289 points | `crates/ravel-promql/src/eval.rs`, `DEFAULT_MAX_RANGE_POINTS: usize = 11_000` |
 | Ravel | total evaluation points per query | `1000000` | `1000000` (unchanged, no flag) | Kept: `mb_long_range_subquery_max` (`[1d:5m]`, 289 points) over the 289-point grid is 83,521 | `crates/ravel-promql/src/eval.rs`, `DEFAULT_MAX_TOTAL_EVAL_POINTS: u64 = 1_000_000` |
+| Prometheus, VictoriaMetrics, Mimir | `GOMEMLIMIT` (docker-compose.yml `environment`) | `7GiB` (7,516,192,768 bytes, 87.5% of the 8g envelope) | unset | The Go runtime's soft memory limit (ADR-0927 amendment 2026-11-05). Unset, the runtime collects only when the heap has grown GOGC percent (default 100, left unset here) over the last live heap, with no knowledge of the cgroup limit; with it, the runtime collects before the cgroup limit instead of overshooting it. It bounds heap overshoot, not the live set. The limit counts all memory the Go runtime maps and has not released, goroutine stacks and other non-heap runtime memory included; the 1 GiB left covers what the cgroup charges outside the runtime: page cache charged to the container, files mapped with `mmap`, kernel memory held for the process, and the binary itself. The envelope (8g, 2 CPUs) is unchanged. `capture-effective-config.sh` records it per run as `go_runtime` | Go `runtime/debug.SetMemoryLimit` documentation: "The initial setting is math.MaxInt64 unless the GOMEMLIMIT environment variable is set"; the limit "includes all memory mapped, managed, and not released by the Go runtime" and excludes "OS kernel memory held on behalf of the process, memory allocated by C code, and memory mapped by syscall.Mmap" |
 | All five: Prometheus, VictoriaMetrics, Mimir, Ravel, s3s-fs | `ulimits.nofile` (docker-compose.yml, ravel.yml) | `524288` soft and hard | Docker's container default: soft `1024`, hard `524288` | Equal descriptors for every long-running service, at Docker's hard default. The Go engines (Prometheus, VictoriaMetrics, Mimir) raise their soft limit to the hard limit themselves, so for them this changes nothing; ravel-server does not (#3412), and the s3s-fs release binary imports neither `setrlimit` nor `prlimit` (`nm -D`), so without it they run at 1,024 descriptors | Default as recorded on #2821; each service's block is pinned by `tests/run.test.sh` case o |
 
 Limits the corpus does not reach, left at their defaults: VictoriaMetrics
@@ -438,6 +444,12 @@ The sources are:
   out of `/config`; `query_engine_default_for_version` is the documented
   default for the reported version: `prometheus` for 2.14 to 2.16, `mimir`
   (the Mimir Query Engine) from 2.17.
+- Prometheus, VictoriaMetrics and Mimir, the Go comparators: `go_runtime` is
+  `GOMEMLIMIT` read from the container's `.Config.Env` through `docker
+  inspect`, as `{"source": "docker inspect .Config.Env", "GOMEMLIMIT":
+  "7GiB"}`. The value is `"unset"` when the container's environment has no
+  `GOMEMLIMIT`, and the field is `{"unavailable": "<reason>"}` when docker is
+  not reachable or the inspect fails. Neither counts toward exit 1.
 - Ravel: `/api/v1/status/buildinfo` (no bearer needed) for version and
   revision. Ravel serves no flags endpoint, so `runtime_flags` is the
   `ravel-server` container's command line, `.Config.Cmd` from `docker
@@ -478,14 +490,15 @@ The document's shape, abbreviated:
     }
   },
   "comparators": {
-    "prometheus": {"version": "3.13.1", "revision": "...", "runtime_flags": {"...": "..."}, "config_settings": {"storage.tsdb.out_of_order_time_window": "1h"}, "image": {"...": "..."}},
-    "victoriametrics": {"version": "v1.115.0", "revision": "victoria-metrics-...-tags-v1.115.0-0-g...", "runtime_flags": {"...": "..."}, "image": {"...": "..."}},
+    "prometheus": {"version": "3.13.1", "revision": "...", "runtime_flags": {"...": "..."}, "config_settings": {"storage.tsdb.out_of_order_time_window": "1h"}, "go_runtime": {"source": "docker inspect .Config.Env", "GOMEMLIMIT": "7GiB"}, "image": {"...": "..."}},
+    "victoriametrics": {"version": "v1.115.0", "revision": "victoria-metrics-...-tags-v1.115.0-0-g...", "runtime_flags": {"...": "..."}, "go_runtime": {"...": "..."}, "image": {"...": "..."}},
     "mimir": {
       "version": "3.2.3",
       "revision": "...",
       "runtime_flags": {"format": "yaml", "effective_config": "..."},
       "querier_query_engine": "mimir",
       "query_engine_default_for_version": "mimir",
+      "go_runtime": {"source": "docker inspect .Config.Env", "GOMEMLIMIT": "7GiB"},
       "image": {
         "container": "...",
         "image_id": "sha256:...",
