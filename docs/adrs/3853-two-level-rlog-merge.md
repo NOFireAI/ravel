@@ -59,14 +59,22 @@ pass budget, and the plan is cursor (`rlog.rs:1587-1605`).
 The charge is not a planning artefact. A pass holds, per input, the whole
 decoded block its streams fall in: `block_rows_for_refs`
 (`ranged.rs:556-600`) decodes the entire block and the view owns it
-(`StreamBlockRows.block`, `ranged.rs:683-700`), and `run_stream_pass` keeps
-the view until the pass pops its last wanted row (`rlog.rs:2003-2008`,
-`2040-2072`). So the memory floor of a stream-major pass on this geometry is
-`N x h`, `h` the decoded heap of one block. `h` is not measured on a real
-block; the ADR-3819 fixture figure of 108 bytes per record gives 0.9 MB,
-and the dense-slot shape term of `block_decode_ceiling_bytes`
-(`rlog.rs:820-845`) gives about 10 MB on this schema. At N = 19,177 the floor
-is between 17 GB and 190 GB. No ceiling admits it, no admission rule lowers
+(`StreamBlockRows.block`, `ranged.rs:683-700`), and `run_stream_pass`
+pushes an unexhausted view into `held` with its heap charge
+(`rlog.rs:1989-1996`) and keeps it until the pass pops its last wanted row
+(the drained assertion at `rlog.rs:2058-2065`). So the memory floor of a
+stream-major pass on this geometry is `N x h`, `h` the decoded heap of one
+block. `h` is not measured on a real block. The ADR-3819 fixture figure of
+108 bytes per record gives 0.9 MB. The ceiling `block_decode_ceiling_bytes`
+(`rlog.rs:820-845`) prices a block by its two per-row terms, `16 B x rows x
+total_cols` (`DECODED_CELL_BYTES`, `rlog.rs:704`, `831-833`) and `40 B x rows
+x string_cols` (`DECODED_STRING_SLOT_BYTES`, `rlog.rs:711`, `834-836`), plus
+the string pages' `uncomp_len` and a slot-spine term that does not scale with
+rows (`48 B x total_cols x 5 x 2`, `rlog.rs:838-842`, 32.6 KB at 68 column
+ids). On this schema (8,192 rows, 68 column ids, 35 string columns, about
+2 MB of strings) the ceiling is `8.9 MB + 11.5 MB + 2 MB`, about 22 MB, and
+`h` lies between the two figures. At N = 19,177 the floor is between 17 GB
+and 422 GB. No ceiling admits it, no admission rule lowers
 it, and a per-stream row count in the format (which the format does not
 carry: STREAM_DIR has `first_blk` and `last_blk`,
 `docs/log-segment-format.md:264-265`) would not lower it either.
@@ -118,32 +126,40 @@ After this ADR's merge ships, the same plan routes instead: a plan that is
 resident over all inputs runs the single-level merge as today; any other
 plan (fetch-per-pass or cursor over all inputs) runs the two-level merge.
 The refusal remains for a two-level plan that cannot run: a group size
-under 2, or scratch headroom below the unit's need (D2).
+under 2, a level-2 plan that is neither resident nor fetch-per-pass at one
+level-1 worker (D4's constraint (b) fails at `W1 = 1`), or scratch headroom
+below the unit's need (D2). The error names which of the three.
 
 ### D1. Group merges
 
 Inputs in canonical order are cut into contiguous groups of `G`. `G` is the
 largest value for which the shipped planner takes the resident path with one
-pass for the group: `G x (raw per input + ceiling(one block)) + floor <= C`,
-where `C` is the per-worker ceiling (D4) and `ceiling(one block)` is the
-largest `pass_block_cost` over the group's blocks. Each group is merged by
+pass for the group, constraint (a):
+
+```
+G x (raw per input + price(the input's blocks)) + run target <= C
+```
+
+where `C = U / W1` is the per-worker ceiling, `U` the unit's
+`merge_resident_ceiling_bytes` (the 20 GiB `merge_cursor_budget_bytes`
+default, `crates/ravel-maintain/src/config.rs:1573`, divided by
+`--maintain-unit-concurrency` in ravel-server,
+`services/ravel-server/src/config.rs:8715-8716`: 5 GiB at the default
+concurrency 4, 20 GiB at 1 and for `compact-bucket`), `W1` the number of
+level-1 workers (D4), the run target the fixed 256 MiB of D4, and `price` the
+sum of `pass_block_cost` over the input's blocks, since one pass over the
+whole group holds every block of every input. Each group is merged by
 `merge_catalogs` exactly as a bucket is merged today, into a run (D2), with
 `input_set_hash` of the whole bucket and the group index in the run's name.
 The group's record sequence is today's sequence restricted to the group,
 since the planner and the passes are the same code.
 
-Predicted sizing on hour 498273 (block ceiling about 22 MB from the shape
-term at 68 column ids and 35 string columns, plus about 2 MB of strings):
-
-| per-worker ceiling | G | runs R = N / G | actual pass memory at h = 10 MB | at h = 0.9 MB | source |
-|---|---|---|---|---|---|
-| 2.5 GiB (ravel-server, one unit, 8 workers) | 96 | 200 | 1.0 GB | 0.17 GB | predicted |
-| 5 GiB (compact-bucket, 4 workers) | 200 | 96 | 2.1 GB | 0.36 GB | predicted |
-
-The profile must report `decoded_heap_bytes` of a real 8,192-row block. If
-it is near the 0.9 MB end, the plan gains a measured-ratio term beside the
-ceiling so `G` is not held 10x below what memory allows; if it is near 10
-MB, the table above stands.
+`price` is the ADR-0979 ceiling today: about 29 MB per hour-498273 input
+(22 MB for its 8,192-row block and 7 MB for its 2,696-row block, Context).
+When the profile reports `decoded_heap_bytes` of a real block, the plan
+gains a measured-ratio term and prices a block at that figure, `h`, instead.
+The sizing table is in D4, because `G`, the run count `R = N / G` and `W1`
+constrain each other through level 2 (D3).
 
 ### D2. Scratch runs
 
@@ -185,12 +201,22 @@ alternatives.
 ### D3. Level 2 over runs
 
 Level 2 loads the run parts' catalogs from the scratch store and merges them
-with the same planner and passes. A run of 1.2M records has about 148
-blocks and about 17 streams per block, so a stream's estimate over 200 runs
-is about 4.4 GB and fits a 5 GiB ceiling in fetch-per-pass; a pass covers
-about 17 streams, decodes each run block once, and reads about 1.6 times
-the run bytes from local disk across the unit (block-aligned groups,
-boundary blocks twice). All predicted.
+with the same planner and passes under the unit ceiling `U`. Every run
+carries every stream, so a stream's level-2 estimate is `R x price(one run
+block)`, and level 2 plans fetch-per-pass only under constraint (b):
+
+```
+R x price(one run block) + reads in flight + final part target <= U
+```
+
+At ceiling pricing a run block of 8,192 rows costs the same 22 MB as an L0
+block, so (b) bounds `R` at about 113 under a 5 GiB `U` and about 770 under
+20 GiB; at `h` pricing the bound is `h / 22 MB` times looser. A run of
+1.2M records has about 148 blocks and about 17 streams per block, so a pass
+covers about 17 streams, decodes each run block once, and reads about 1.6
+times the run bytes from local disk across the unit (block-aligned groups,
+boundary blocks twice). A level-2 plan that fails (b) is refused (D0), never
+run as a cursor merge over the runs. All predicted.
 
 The emitted sequence is today's. Groups are contiguous in canonical input
 order, a run stores equal-key ties in push order, and the level-2 tie-break
@@ -201,8 +227,12 @@ One exception is stated rather than hidden: a keyed bucket whose per-bucket
 reservation sum exceeds `merge_cursor_budget_bytes` is emitted batch-major
 today (ADR-2135 decision 2, `reservation_batches`,
 `rlog.rs:3561-3611`), and the batches over runs differ from the batches over
-inputs. At G up to 256 and R up to 200 the sum stays under 10 GB at 37 MB per
-cursor, so the exception needs a budget set far below the default to arise.
+inputs. An unkeyed bucket never batches (`rlog.rs:3566-3568`, one batch at
+`width_ns <= 1`), and the logs benchmark is unkeyed. A keyed bucket with
+`R` near 770 runs at 37 MB per cursor reaches 28 GB per stream, above the
+20 GiB budget, so the exception is live for a keyed many-input bucket at
+ceiling pricing; the phase A fixture includes one such bucket and pins its
+output as the two-level sequence, not today's.
 
 Part encodes stop blocking the merge. Today a closed part's encode runs on
 the read gate (`MaintainReadGate::run`,
@@ -217,9 +247,13 @@ the cuts and the bytes do not change.
 
 ### D4. Parallel groups
 
-Level-1 groups run `W1` at a time as tokio tasks; `W1` defaults to the
+Level-1 groups run `W1` at a time as tokio tasks. `W1` is at most the
 unit's core share (the usable cores divided by `--maintain-unit-concurrency`
-in ravel-server, all usable cores for `compact-bucket`). The per-merge
+in ravel-server, all usable cores for `compact-bucket`: 8 at the server
+defaults on the 32-core reference box, 32 at concurrency 1), and the plan
+takes the largest `W1` at or under that share for which D1's constraint (a)
+and D3's constraint (b) both hold, since a larger `W1` lowers `C`, which
+lowers `G`, which raises `R` until level 2 no longer fits. The per-merge
 budgets are divided per worker: `merge_cursor_budget_bytes` and
 `merge_resident_ceiling_bytes` over `W1`, and the run memory target is a
 fixed 256 MiB per builder, not derived from host memory, so the number of
@@ -228,6 +262,27 @@ is unchanged and still derived as ADR-2135's 2026-10-02 amendment states.
 `MergeCursorBudgetExceeded` stays fail-closed per worker. The
 `MergeMemoryTracker` becomes one instance per worker, and the unit's report
 sums their high-water marks.
+
+Predicted sizing on hour 498273 (N = 19,177, 0.9 MB raw per input, 2
+blocks per input, run blocks of 8,192 rows), by unit ceiling and by block
+pricing:
+
+| unit ceiling U, cores per unit | pricing | W1 | C = U / W1 | G | R | level-2 estimate R x price | source |
+|---|---|---|---|---|---|---|---|
+| 5 GiB, 8 (server defaults) | ceiling, 29 MB per input, 22 MB per run block | 1 | 5 GiB | 170 | 113 | 2.5 GB | predicted |
+| 5 GiB, 8 | h = 10 MB (21 MB per input) | 4 | 1.25 GiB | 49 | 392 | 3.9 GB | predicted |
+| 5 GiB, 8 | h = 3 MB (6.9 MB per input) | 8 | 640 MiB | 55 | 349 | 1.0 GB | predicted |
+| 5 GiB, 8 | h = 0.9 MB (2.7 MB per input) | 8 | 640 MiB | 142 | 135 | 0.1 GB | predicted |
+| 20 GiB, 32 (concurrency 1, compact-bucket) | ceiling | 20 | 1 GiB | 25 | 767 | 16.9 GB | predicted |
+| 20 GiB, 32 | h = 10 MB | 32 | 640 MiB | 18 | 1,066 | 10.7 GB | predicted |
+| 20 GiB, 32 | h = 3 MB | 32 | 640 MiB | 55 | 349 | 1.0 GB | predicted |
+
+At ceiling pricing and the server defaults, level 1 runs on one core per
+unit, and parallelism comes from the four units the server merges at once.
+The measured-ratio term is what buys level-1 parallelism inside a unit, and
+the profile's `h` decides which row applies. Every row keeps the actual
+pass memory per worker under `C` by construction; the actual figure is
+`G x (raw per input + 2h)` and is reported, not planned.
 
 Every worker ticks the claim checkpoints at the merge loop head and at each
 part boundary (`rlog.rs:1773-1791`, `2312-2320`). The `ClaimGuard` is
@@ -258,9 +313,21 @@ format caps `part_index` at 9,999 (`crates/ravel-commit/src/keys.rs:108-112`),
 so a unit of more than 625 ranges fails the same way; hour 498273 at today's
 part size needs about 100 ranges. Whether anything reads part indexes as
 contiguous (the record, the fold, the sweep) is checked in the phase B
-ticket before the rule is fixed. The final part memory target is divided by
-`W2`, which the phase B amendment records as a change to the part-split
-settings of ADR-0979's 2026-10-02 amendment.
+ticket before the rule is fixed.
+
+The final part memory target does not depend on `W2`: it is a part-close
+trigger (`rlog_memory_target_bytes`, `rlog.rs:2201`), so dividing it by a
+worker count would cut parts at different records on nodes with different
+core counts. `W2` is bounded by memory instead: the largest value such that
+`W2 x final part target` is at most half of `merge_memory_budget_bytes`
+(`crates/ravel-maintain/src/config.rs:1115`), and at most the unit's cores.
+On the 30 GB reference box at concurrency 1 the derived target is 1 GiB and
+the budget 8 GiB, so `W2 = 4`, which merges no faster than phase A's
+pipelined level 2 at `f = 0.75`; phase B pays when the operator sets the
+target to 256 MiB (`W2 = 16`, parts four times smaller). Both the target and
+`W2`'s bound are part-split settings in the sense of ADR-0979's 2026-10-02
+amendment, and the phase B amendment records the bound; the target's
+derivation is untouched.
 
 Range-aligned cuts change part boundaries, so phase B re-pins the golden
 content-hash vectors. Convergence does not depend on them: a racing
@@ -293,16 +360,18 @@ bucket replace the predictions.
 | `level2_block_decodes` | the run parts' block count, within 10% (boundary blocks twice) | above 1.3x | predicted |
 | `scratch_write_bytes` | 1.0 to 1.3 x raw | outside | predicted |
 | `scratch_read_bytes` | 1.2 to 2.0 x `scratch_write_bytes` | outside | predicted |
-| peak working set, one unit, 8 level-1 workers | 8 x (G x (raw per input + h) + 256 MiB) plus the unexplained 6 GiB | above ceiling plus 8 GiB | predicted |
-| phase A wall, one unit, 32 cores | 45 to 90 min | above 2 h | predicted |
-| phase B wall, one unit, 32 cores | 10 to 12 min | above 20 min | predicted |
-| throughput, 32 cores, units in parallel | at or above 134k records/s | below 134k | predicted |
+| peak working set, one unit, W1 level-1 workers | W1 x (G x (raw per input + 2h) + 256 MiB) plus the unexplained 6 GiB | above U plus 8 GiB | predicted |
+| phase A wall, one unit on 32 cores (concurrency 1) | 47 to 95 min | above 2 h | predicted |
+| phase B wall, one unit on 32 cores, 256 MiB part target | 14 to 17 min | above 25 min | predicted |
+| throughput, server defaults (4 units in flight on 32 cores) | at or above 134k records/s | below 134k | predicted |
 
 The wall figures come from this arithmetic. Today's single-level cost is
 43.5 us per record (measured 2026-11-05, hour 498274). Let `f` be the share
 of that in page trials and zstd, which the profile measures. Level 1 encodes
 runs at zstd 1 and `Estimated`, taken as a quarter of today's encode
-(predicted). Level 2 encodes final parts at today's settings.
+(predicted). Level 2 encodes final parts at today's settings. The worker
+counts are D4's 20 GiB rows: `W1` between 20 (ceiling pricing) and 32, `W2`
+from D5.
 
 | | f = 0.75 | f = 0.5 | source |
 |---|---|---|---|
@@ -310,23 +379,31 @@ runs at zstd 1 and `Estimated`, taken as a quarter of today's encode
 | level 2 per record | 43.5 us | 43.5 us | predicted |
 | core-seconds for 242M records | 15,100 | 17,100 | predicted |
 | I/O floor, 16.7 GiB at 64 in flight at 108 MB/s | 166 s, overlapped with level 1 | 166 s | predicted |
-| level 1 wall at 24 workers | 192 s | 272 s | predicted |
-| level 2 wall, serial merge with pipelined encode | 242M x 10.9 us = 44 min | 88 min | predicted |
-| level 2 wall at 24 range workers | 440 s | 440 s | predicted |
+| level 1 wall at W1 = 32 (W1 = 20) | 166 s, I/O bound (230 s) | 204 s (327 s) | predicted |
+| level 2 wall, serial merge with pipelined encode (phase A) | 242M x 10.9 us = 44 min | 88 min | predicted |
+| level 2 wall at W2 = 4 (derived 1 GiB target) | 44 min | 44 min | predicted |
+| level 2 wall at W2 = 16 (256 MiB target) | 11 min | 11 min | predicted |
 | cores to sustain 134k records/s | 8.4 | 9.4 | predicted |
 
 The unit-level figures are what fails the five-minute target: at 62.5 to
 70.5 us per record the merge needs 15,100 to 17,100 core-seconds per
-240M-record unit, which 32 cores deliver in 7.9 to 8.9 minutes with no
-I/O wait and perfect scaling. The throughput objective holds with room:
-about nine cores sustain the benchmark's ingest, and the five-hour backlog
-clears in about 1.3 h on 32 cores.
+240M-record unit, which 32 cores deliver in 7.9 to 8.9 minutes only with
+no I/O wait, no memory bound on `W2`, and perfect scaling; with `W2`
+bounded as D5 states, one unit takes 14 to 17 minutes at a 256 MiB part
+target and 47 to 95 minutes at the derived target. The throughput objective
+holds at the server defaults because units overlap: four units in flight
+each run a level-2 merge thread at `1 / (decode + merge)` records/s, 92k at
+`f = 0.75` and 46k at `f = 0.5`, so 368k or 184k records/s for the node, with
+level-1 work (7 or 5 cores) and part encodes (12 or 4 cores) on the other
+cores; about nine cores sustain the benchmark's ingest. A five-hour backlog
+of 2.4G records drains at the node's rate net of the 134k records/s that
+keep arriving: about 2.9 h at 368k, about 13 h at 184k.
 
 What the profile must show for each part of the decision to stand:
 
 | profile figure | decides | source |
 |---|---|---|
-| `decoded_heap_bytes` of a real 8,192-row block | G (D1) and whether the plan gains a measured-ratio term | predicted 0.9 to 10 MB |
+| `decoded_heap_bytes` of a real 8,192-row block | which D4 row applies: G, R and W1, and whether the plan gains a measured-ratio term | predicted 0.9 to 22 MB |
 | decode, merge, page-trial and zstd shares of 43.5 us | whether phase A alone meets the objective (it delivers `1 / (decode + merge)` records/s at level 2) or D5 ships | predicted |
 | zstd 9 against 3 and 1, `Exhaustive` against `Estimated`, per record | whether level-1 runs cost a quarter of today's encode, and the deferred phase C decision on final-part settings | predicted |
 | catalog decode CPU per input | #3855's expected catalog phase | predicted |
@@ -340,7 +417,7 @@ at most 10% larger at ingest, and the zstd level ADR-2135 decision 4 sets to
 
 - **Adaptive admission inside the shipped modes.** The floor of a stream-major
   pass is `N x h` whatever the estimate says; a runtime measure would find
-  it after allocating it. Lost on arithmetic: 17 to 190 GB at N = 19,177.
+  it after allocating it. Lost on arithmetic: 17 to 422 GB at N = 19,177.
 - **A tighter per-block estimate alone.** Even at the optimistic 0.9 MB per
   block the pass needs 17 GB for one unit. Lost on the same arithmetic.
 - **Per-stream row counts in the format.** An ADR and a trailer version bump
@@ -348,9 +425,9 @@ at most 10% larger at ingest, and the zstd level ADR-2135 decision 4 sets to
   input. Lost because it does not move the number.
 - **Stream-range workers over all N inputs, no fan-in.** Every worker
   decodes every input's block for its range, so decode work is `W x` and
-  memory is `W x N x h`. At 24 workers and 10.9 us decode plus merge per
-  record the wall is about 55 min, slower than two levels. Lost on decode
-  multiplicity.
+  memory is `W x N x h`. At 32 workers and 10.9 us decode plus merge per
+  record every worker spends 44 min decoding, so the wall is about 48 min
+  whatever `W` is, slower than two levels. Lost on decode multiplicity.
 - **Runs as transient objects in the bucket.** About 2,000 PUTs and GETs per
   unit, cheap, but a new object class under the frozen key layout
   (`docs/catalog-and-mvcc.md`), an orphan sweep rule and a lifecycle entry in
@@ -410,10 +487,11 @@ at most 10% larger at ingest, and the zstd level ADR-2135 decision 4 sets to
   than run as cursor merges.
 - The merge's memory terms change: per-worker catalogs (G of them, not N),
   per-worker resident raw and pass rows under a per-worker ceiling, `E`
-  encoding builders at level 2. ADR-0065 decision 4 and ADR-3819 gain an
-  amendment naming the `N x h` floor and the per-worker division; ADR-3819's
-  amendment is in this branch and the ADR-0065 one lands with phase A's
-  tracker changes.
+  encoding builders at level 2. ADR-3819's amendment, in this branch, names
+  the `N x h` floor and the measured cursor plan. ADR-0065 decision 4 gains
+  an amendment with phase A's tracker changes that names the floor and the
+  per-worker division of the budgets; that division is documented nowhere
+  until then.
 - The 6 GiB working set is unexplained and stays in the report as a term of
   its own until the profile names it.
 - The ADR-3819 commitments row for hours 08 and 09 is a measured miss; its
