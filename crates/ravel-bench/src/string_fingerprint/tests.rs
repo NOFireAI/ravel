@@ -554,9 +554,48 @@ proptest! {
 }
 
 #[test]
-fn string_fingerprint_fixture_is_a_valid_pre_registration() {
-    // The checked-in pre-registration, once it exists, must parse and
-    // validate the same way this test's own inline SPEC does.
+fn string_fingerprint_inline_spec_is_a_valid_pre_registration() {
     let s = spec::parse(SPEC).expect("SPEC");
     assert_eq!(s.columns(), ["syn/col".to_string()]);
+}
+
+#[test]
+fn needles_fixture_is_a_valid_pre_registration() {
+    let text = include_str!("../../fixtures/string_fingerprint/needles.toml");
+    let s = spec::parse(text).expect("needles.toml");
+    let names: Vec<&str> = s.corpus.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["hdfs", "bgl", "ssh", "apache", "clickbench"]);
+    assert_eq!(
+        s.columns(),
+        [
+            "hdfs/body",
+            "bgl/body",
+            "ssh/body",
+            "apache/body",
+            "clickbench/URL",
+            "clickbench/Title",
+            "clickbench/SearchPhrase",
+            "clickbench/Referer",
+        ]
+    );
+    for c in &s.corpus {
+        // LogHub corpora exercise 2 seen + 2 unseen (one single-token
+        // bloom-applicable, one multi-word bloom-inapplicable, per split);
+        // ClickBench's columns exercise 1 seen + 1 unseen each.
+        let want = if c.name == "clickbench" { 1 } else { 2 };
+        for col in &c.column {
+            let seen = col
+                .predicate
+                .iter()
+                .filter(|p| p.set == spec::Split::Seen)
+                .count();
+            let unseen = col
+                .predicate
+                .iter()
+                .filter(|p| p.set == spec::Split::Unseen)
+                .count();
+            assert_eq!(seen, want, "{}/{} seen predicates", c.name, col.name);
+            assert_eq!(unseen, want, "{}/{} unseen predicates", c.name, col.name);
+        }
+    }
 }

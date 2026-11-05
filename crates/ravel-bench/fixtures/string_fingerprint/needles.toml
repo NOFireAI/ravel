@@ -1,0 +1,827 @@
+# Pre-registration for string_fingerprint_report (issue #3710, ADR-3692 Plan
+# row T12). Written before any corpus run. Read by
+# `string_fingerprint_report` and checked by
+# `ravel_bench::string_fingerprint::spec`.
+#
+# Interpretation decisions (good-faith readings of ambiguous task language;
+# see also the three documented in string_fingerprint/mod.rs's module doc):
+# - LogHub body columns carry Contains (LIKE) predicates only. A whole-row
+#   Equals predicate against a raw log line is not groundable without the
+#   corpus text: every real line embeds a timestamp or other per-row value,
+#   so no literal line is known to recur. ClickBench's four Str columns
+#   carry a mix: URL and Title keep Contains (the only Set L predicates
+#   that exist against them, see below), SearchPhrase and Referer carry
+#   Equals (an exact value match is a realistic predicate shape for them,
+#   and the task names all four columns while only two have a documented
+#   LIKE predicate).
+# - ADR-2773 (docs/adrs/2773-hot-path-materialization.md) names "Set L" as
+#   {q21, q22, q23, q24}, the LIKE declared-string scans. Its only real
+#   literal predicates are `URL LIKE '%google%'` (q21/q22/q24) and
+#   `Title LIKE '%Google%'` (q23). SearchPhrase and Referer appear in Set L
+#   only in GROUP BY / ORDER BY / COUNT DISTINCT / REGEXP_REPLACE contexts,
+#   never in a LIKE or equality filter; there is no grounded real literal
+#   for either column anywhere in this repo. Their predicates below are
+#   explicitly marked illustrative/unverified, not drawn from Set L.
+#
+# Network access was unavailable to this session: none of the four LogHub
+# corpora (Zenodo record 8196385) or the ClickBench `hits.parquet` file
+# could be downloaded, so no run has produced real figures against this
+# file. See the final report for the NOT RUN (blocked) status.
+#
+# Band basis (predicted, 2026-11-05, before the first run):
+# - LogHub lines/blocks/compressed_bytes/zstd_cpu_s bands, block_records,
+#   and the fingerprint_* analogues of the "selected" arm's bands are
+#   copied from crates/ravel-bench/fixtures/logbody/rei_needles.toml
+#   (issue #3709 / T11), which operates on these same four corpus files
+#   through the same BlockText/Pattern types: a corpus fact true there is
+#   true here. `lines` there becomes this file's exact `contains.cells_total`
+#   bound for a predicate whose bloom arm is inapplicable (the code sets
+#   cells_tested = cells_total in that case, so both are exact), and the
+#   loose bound otherwise (cells_tested <= cells_total when bloom narrows
+#   the scan, a structural fact independent of corpus content).
+# - Every LogHub predicate pattern below is either a verbatim needle from
+#   rei_needles.toml (already checked by T11 to occur in its corpus) or a
+#   literal substring of one. A Pattern match requires each of its literal
+#   runs to appear verbatim in the matching line, so a substring of a
+#   verified-occurring needle is itself verified to occur at least once:
+#   true_holders bands use a floor of 1 on that basis, open above it (an
+#   exact count needs the corpus, which this session could not fetch).
+# - ClickBench `blocks` assumes block_records = 8192 against the ~100M-row,
+#   8,424-object reference tenant in docs/query-engine.md; a column's text
+#   export may not match that row count exactly, so the band is wide.
+#   compressed_bytes, zstd_cpu_s, and the fingerprint_* bands for ClickBench
+#   are fully open: this tool reads pre-exported row text, and exporting
+#   the real `hits.parquet` columns was both out of scope (Parquet decoding
+#   is not part of this task) and blocked (no network this session), so no
+#   per-column size or CPU fact is grounded yet.
+# - true_holders for ClickBench URL/Title "google"/"Google" predicates use a
+#   floor of 1: ADR-2773 documents these as real Set L predicates that
+#   return rows against the reference tenant. All other ClickBench
+#   predicates (the unseen URL/Title substrings, and every SearchPhrase and
+#   Referer predicate) are illustrative placeholders with no grounded
+#   occurrence; their true_holders bands are fully open starting at 0, and
+#   a human must replace the literal content with values observed in the
+#   real corpus before the real run.
+# - saturation_blocks_long / saturation_false_positive_share: fully open for
+#   every column. No prior exists for long-row distribution in any of
+#   these corpora without fetching them.
+
+schema = 1
+
+# =============================================================================
+# LogHub: one declared Str column ("body", the raw log line) per corpus.
+# =============================================================================
+
+[[corpus]]
+name = "hdfs"
+source = "https://zenodo.org/records/8196385/files/HDFS_v1.zip (HDFS.log; same file as crates/ravel-bench/fixtures/logbody/rei_needles.toml)"
+block_records = 8192
+
+[[corpus.column]]
+name = "body"
+max_gram = 6
+df_threshold = 0.10
+budget_share = 0.05
+sample_size = 2
+long_value_bytes = 256
+
+[corpus.column.bands]
+blocks = [1365, 1365]
+compressed_bytes = [50e6, 600e6]
+zstd_cpu_s = [0.5, 60]
+fingerprint_index_bytes = [2, 3e6]
+fingerprint_index_bytes_share = [0, 0.01]
+fingerprint_build_cpu_s = [0.05, 120]
+fingerprint_build_cpu_over_zstd = [0.05, 5]
+fingerprint_grams_selected = [0, 2000]
+saturation_blocks_long = [0, 1365]
+saturation_false_positive_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "pending-replication-monitor"
+kind = "contains"
+set = "seen"
+pattern = "PendingReplicationMonitor"
+reason = "grounded: literal prefix of rei_needles.toml's verified-occurring needle 'PendingReplicationMonitor timed out block' (template E29, rare); single alpha token, bloom-applicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 1365]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 1365]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.bloom]
+blocks_surviving = [0, 1365]
+survival_share = [0, 1]
+blocks_missed = [0, 1365]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [0, 11175629]
+cells_total = [11175629, 11175629]
+cells_tested_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "verification-succeeded"
+kind = "contains"
+set = "seen"
+pattern = "Verification succeeded for"
+reason = "grounded: verbatim needle in rei_needles.toml (template E2, common); multi-word, bloom-inapplicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 1365]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 1365]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [11175629, 11175629]
+cells_total = [11175629, 11175629]
+cells_tested_share = [1, 1]
+
+[[corpus.column.predicate]]
+id = "exception"
+kind = "contains"
+set = "unseen"
+pattern = "exception"
+reason = "grounded: substring of rei_needles.toml's verified-occurring needle 'Got exception while serving' (template E4, open); single alpha token, bloom-applicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 1365]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 1365]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.bloom]
+blocks_surviving = [0, 1365]
+survival_share = [0, 1]
+blocks_missed = [0, 1365]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [0, 11175629]
+cells_total = [11175629, 11175629]
+cells_tested_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "not-in-any-file"
+kind = "contains"
+set = "unseen"
+pattern = "does not belong to any file"
+reason = "grounded: verbatim needle in rei_needles.toml (templates E24/E28, rare); multi-word, bloom-inapplicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 1365]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 1365]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [11175629, 11175629]
+cells_total = [11175629, 11175629]
+cells_tested_share = [1, 1]
+
+# -----------------------------------------------------------------------------
+
+[[corpus]]
+name = "bgl"
+source = "https://zenodo.org/records/8196385/files/BGL.zip (BGL.log; same file as rei_needles.toml)"
+block_records = 8192
+
+[[corpus.column]]
+name = "body"
+max_gram = 6
+df_threshold = 0.10
+budget_share = 0.05
+sample_size = 2
+long_value_bytes = 256
+
+[corpus.column.bands]
+blocks = [580, 580]
+compressed_bytes = [25e6, 300e6]
+zstd_cpu_s = [0.2, 30]
+fingerprint_index_bytes = [2, 1.5e6]
+fingerprint_index_bytes_share = [0, 0.01]
+fingerprint_build_cpu_s = [0.02, 60]
+fingerprint_build_cpu_over_zstd = [0.05, 5]
+fingerprint_grams_selected = [0, 2000]
+saturation_blocks_long = [0, 580]
+saturation_false_positive_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "hummer"
+kind = "contains"
+set = "seen"
+pattern = "hummer"
+reason = "grounded: substring of rei_needles.toml's verified-occurring needle 'double-hummer alignment exceptions' (open); single alpha token, bloom-applicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 580]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 580]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.bloom]
+blocks_surviving = [0, 580]
+survival_share = [0, 1]
+blocks_missed = [0, 580]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [0, 4747963]
+cells_total = [4747963, 4747963]
+cells_tested_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "data-tlb"
+kind = "contains"
+set = "seen"
+pattern = "data TLB error interrupt"
+reason = "grounded: verbatim needle in rei_needles.toml (rare); multi-word, bloom-inapplicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 580]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 580]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [4747963, 4747963]
+cells_total = [4747963, 4747963]
+cells_tested_share = [1, 1]
+
+[[corpus.column.predicate]]
+id = "ciod"
+kind = "contains"
+set = "unseen"
+pattern = "ciod"
+reason = "grounded: substring of rei_needles.toml's verified-occurring needle 'ciod: failed to read message prefix on control stream' (rare); single alpha token, bloom-applicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 580]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 580]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.bloom]
+blocks_surviving = [0, 580]
+survival_share = [0, 1]
+blocks_missed = [0, 580]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [0, 4747963]
+cells_total = [4747963, 4747963]
+cells_tested_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "illegal-instruction"
+kind = "contains"
+set = "unseen"
+pattern = "program interrupt: illegal instruction"
+reason = "grounded: verbatim needle in rei_needles.toml (rare); multi-word, bloom-inapplicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 580]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 580]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [4747963, 4747963]
+cells_total = [4747963, 4747963]
+cells_tested_share = [1, 1]
+
+# -----------------------------------------------------------------------------
+
+[[corpus]]
+name = "ssh"
+source = "https://zenodo.org/records/8196385/files/SSH.tar.gz (SSH.log; same file as rei_needles.toml)"
+block_records = 8192
+
+[[corpus.column]]
+name = "body"
+max_gram = 6
+df_threshold = 0.10
+budget_share = 0.05
+sample_size = 2
+long_value_bytes = 256
+
+[corpus.column.bands]
+blocks = [80, 80]
+compressed_bytes = [2e6, 30e6]
+zstd_cpu_s = [0.02, 5]
+fingerprint_index_bytes = [2, 3e5]
+fingerprint_index_bytes_share = [0, 0.01]
+fingerprint_build_cpu_s = [0.002, 10]
+fingerprint_build_cpu_over_zstd = [0.05, 5]
+fingerprint_grams_selected = [0, 2000]
+saturation_blocks_long = [0, 80]
+saturation_false_positive_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "authentication"
+kind = "contains"
+set = "seen"
+pattern = "authentication"
+reason = "grounded: substring of rei_needles.toml's verified-occurring needle 'No more user authentication methods available' (open); single alpha token, bloom-applicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 80]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 80]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.bloom]
+blocks_surviving = [0, 80]
+survival_share = [0, 1]
+blocks_missed = [0, 80]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [0, 655147]
+cells_total = [655147, 655147]
+cells_tested_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "break-in"
+kind = "contains"
+set = "seen"
+pattern = "POSSIBLE BREAK-IN ATTEMPT"
+reason = "grounded: verbatim needle in rei_needles.toml (common); multi-word (and hyphenated), bloom-inapplicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 80]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 80]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [655147, 655147]
+cells_total = [655147, 655147]
+cells_tested_share = [1, 1]
+
+[[corpus.column.predicate]]
+id = "identification"
+kind = "contains"
+set = "unseen"
+pattern = "identification"
+reason = "grounded: substring of rei_needles.toml's verified-occurring needle 'Did not receive identification string from' (open); single alpha token, bloom-applicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 80]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 80]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.bloom]
+blocks_surviving = [0, 80]
+survival_share = [0, 1]
+blocks_missed = [0, 80]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [0, 655147]
+cells_total = [655147, 655147]
+cells_tested_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "too-many-admin"
+kind = "contains"
+set = "unseen"
+pattern = "Too many authentication failures for admin"
+reason = "grounded: verbatim needle in rei_needles.toml (open); multi-word, bloom-inapplicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 80]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 80]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [655147, 655147]
+cells_total = [655147, 655147]
+cells_tested_share = [1, 1]
+
+# -----------------------------------------------------------------------------
+
+# 1024 records per block, matching rei_needles.toml: at the production 8192
+# this corpus is 7 blocks, too few for the 10% survival bar to mean anything.
+[[corpus]]
+name = "apache"
+source = "https://zenodo.org/records/8196385/files/Apache.tar.gz (Apache.log; same file as rei_needles.toml)"
+block_records = 1024
+
+[[corpus.column]]
+name = "body"
+max_gram = 6
+df_threshold = 0.10
+budget_share = 0.05
+sample_size = 2
+long_value_bytes = 512
+
+[corpus.column.bands]
+blocks = [56, 56]
+compressed_bytes = [0.15e6, 2.5e6]
+zstd_cpu_s = [0.001, 1]
+fingerprint_index_bytes = [2, 1.25e5]
+fingerprint_index_bytes_share = [0, 0.05]
+fingerprint_build_cpu_s = [0.0001, 2]
+fingerprint_build_cpu_over_zstd = [0.05, 5]
+fingerprint_grams_selected = [0, 2000]
+saturation_blocks_long = [0, 56]
+saturation_false_positive_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "scoreboard"
+kind = "contains"
+set = "seen"
+pattern = "scoreboard"
+reason = "grounded: substring of the literal run ' in scoreboard' in rei_needles.toml's verified-occurring gap needle 'jk2_init() Can't find child .* in scoreboard' (common); a Pattern match requires each literal run to appear verbatim, so 'scoreboard' occurs at least once. Single alpha token, bloom-applicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 56]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 56]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.bloom]
+blocks_surviving = [0, 56]
+survival_share = [0, 1]
+blocks_missed = [0, 56]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [0, 56482]
+cells_total = [56482, 56482]
+cells_tested_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "workerenv-error"
+kind = "contains"
+set = "seen"
+pattern = "mod_jk child workerEnv in error state"
+reason = "grounded: verbatim needle in rei_needles.toml (common); multi-word, bloom-inapplicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 56]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 56]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [56482, 56482]
+cells_total = [56482, 56482]
+cells_tested_share = [1, 1]
+
+[[corpus.column.predicate]]
+id = "workerenv"
+kind = "contains"
+set = "unseen"
+pattern = "workerEnv"
+reason = "grounded: substring of rei_needles.toml's verified-occurring needle 'mod_jk child workerEnv in error state' (common); single alpha token, bloom-applicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 56]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 56]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.bloom]
+blocks_surviving = [0, 56]
+survival_share = [0, 1]
+blocks_missed = [0, 56]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [0, 56482]
+cells_total = [56482, 56482]
+cells_tested_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "index-forbidden"
+kind = "contains"
+set = "unseen"
+pattern = "Directory index forbidden by rule"
+reason = "grounded: verbatim needle in rei_needles.toml (open); multi-word, bloom-inapplicable."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 56]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 56]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [56482, 56482]
+cells_total = [56482, 56482]
+cells_tested_share = [1, 1]
+
+# =============================================================================
+# ClickBench: one corpus, four declared Str columns (Set L's URL and Title,
+# plus SearchPhrase and Referer per the task's column list).
+# =============================================================================
+
+[[corpus]]
+name = "clickbench"
+source = "ClickBench hits table (https://github.com/ClickHouse/ClickBench, hits.parquet), 100M-row / 8,424-object reference tenant per docs/query-engine.md. URL/Title/SearchPhrase/Referer must be exported to one text value per line before this tool can read them; Parquet decoding is out of scope for this task and the export was not performed this session (no network access to fetch hits.parquet)."
+block_records = 8192
+
+[[corpus.column]]
+name = "URL"
+max_gram = 6
+df_threshold = 0.10
+budget_share = 0.05
+sample_size = 2
+long_value_bytes = 2048
+
+[corpus.column.bands]
+blocks = [8000, 20000]
+compressed_bytes = [1e6, 5e10]
+zstd_cpu_s = [0.01, 3600]
+fingerprint_index_bytes = [2, 2.5e9]
+fingerprint_index_bytes_share = [0, 0.01]
+fingerprint_build_cpu_s = [0.001, 3600]
+fingerprint_build_cpu_over_zstd = [0.05, 10]
+fingerprint_grams_selected = [0, 10000]
+saturation_blocks_long = [0, 20000]
+saturation_false_positive_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "google"
+kind = "contains"
+set = "seen"
+pattern = "google"
+reason = "grounded: docs/adrs/2773-hot-path-materialization.md documents 'URL LIKE %google%' as a real Set L predicate (q21/q22/q24) that returns rows against the reference tenant; single alpha token, bloom-applicable. Exact occurrence count not corpus-verified this session (network blocked)."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 20000]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 20000]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.bloom]
+blocks_surviving = [0, 20000]
+survival_share = [0, 1]
+blocks_missed = [0, 20000]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [0, 1.7e8]
+cells_total = [6e7, 1.7e8]
+cells_tested_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "wikipedia"
+kind = "contains"
+set = "unseen"
+pattern = "wikipedia"
+reason = "illustrative/unverified: not drawn from a documented Set L predicate; plausible URL substring but occurrence not confirmed this session (network blocked). Single alpha token, bloom-applicable. true_holders left fully open from 0."
+
+[corpus.column.predicate.bands]
+true_holders = [0, 20000]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 20000]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.bloom]
+blocks_surviving = [0, 20000]
+survival_share = [0, 1]
+blocks_missed = [0, 20000]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [0, 1.7e8]
+cells_total = [6e7, 1.7e8]
+cells_tested_share = [0, 1]
+
+[[corpus.column]]
+name = "Title"
+max_gram = 6
+df_threshold = 0.10
+budget_share = 0.05
+sample_size = 2
+long_value_bytes = 512
+
+[corpus.column.bands]
+blocks = [8000, 20000]
+compressed_bytes = [1e6, 5e10]
+zstd_cpu_s = [0.01, 3600]
+fingerprint_index_bytes = [2, 2.5e9]
+fingerprint_index_bytes_share = [0, 0.01]
+fingerprint_build_cpu_s = [0.001, 3600]
+fingerprint_build_cpu_over_zstd = [0.05, 10]
+fingerprint_grams_selected = [0, 10000]
+saturation_blocks_long = [0, 20000]
+saturation_false_positive_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "google-title"
+kind = "contains"
+set = "seen"
+pattern = "Google"
+reason = "grounded: docs/adrs/2773-hot-path-materialization.md documents 'Title LIKE %Google%' as a real Set L predicate (q23) that returns rows against the reference tenant; single alpha token (case preserved per the ADR), bloom-applicable. Exact occurrence count not corpus-verified this session (network blocked)."
+
+[corpus.column.predicate.bands]
+true_holders = [1, 20000]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 20000]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.bloom]
+blocks_surviving = [0, 20000]
+survival_share = [0, 1]
+blocks_missed = [0, 20000]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [0, 1.7e8]
+cells_total = [6e7, 1.7e8]
+cells_tested_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "news-title"
+kind = "contains"
+set = "unseen"
+pattern = "news"
+reason = "illustrative/unverified: not drawn from a documented Set L predicate; plausible Title substring but occurrence not confirmed this session (network blocked). Single alpha token, bloom-applicable. true_holders left fully open from 0."
+
+[corpus.column.predicate.bands]
+true_holders = [0, 20000]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 20000]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.bloom]
+blocks_surviving = [0, 20000]
+survival_share = [0, 1]
+blocks_missed = [0, 20000]
+false_positive_share = [0, 1]
+
+[corpus.column.predicate.bands.contains]
+cells_tested = [0, 1.7e8]
+cells_total = [6e7, 1.7e8]
+cells_tested_share = [0, 1]
+
+[[corpus.column]]
+name = "SearchPhrase"
+max_gram = 6
+df_threshold = 0.10
+budget_share = 0.05
+sample_size = 2
+long_value_bytes = 256
+
+[corpus.column.bands]
+blocks = [8000, 20000]
+compressed_bytes = [1e6, 5e10]
+zstd_cpu_s = [0.01, 3600]
+fingerprint_index_bytes = [2, 2.5e9]
+fingerprint_index_bytes_share = [0, 0.01]
+fingerprint_build_cpu_s = [0.001, 3600]
+fingerprint_build_cpu_over_zstd = [0.05, 10]
+fingerprint_grams_selected = [0, 10000]
+saturation_blocks_long = [0, 20000]
+saturation_false_positive_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "searchphrase-example"
+kind = "equals"
+set = "seen"
+pattern = "example query"
+reason = "illustrative/unverified: ADR-2773's Set L documents no LIKE or equality predicate against SearchPhrase (it appears only in GROUP BY/ORDER BY/COUNT DISTINCT contexts, e.g. q6/q13/q22/q25-27); this literal is a placeholder, not drawn from or confirmed against real corpus data (network blocked this session). A human must replace it with a genuine observed SearchPhrase value before the real run. Multi-word, bloom-inapplicable."
+
+[corpus.column.predicate.bands]
+true_holders = [0, 20000]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 20000]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "searchphrase-another"
+kind = "equals"
+set = "unseen"
+pattern = "another phrase"
+reason = "illustrative/unverified: same basis as searchphrase-example. Multi-word, bloom-inapplicable."
+
+[corpus.column.predicate.bands]
+true_holders = [0, 20000]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 20000]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[[corpus.column]]
+name = "Referer"
+max_gram = 6
+df_threshold = 0.10
+budget_share = 0.05
+sample_size = 2
+long_value_bytes = 2048
+
+[corpus.column.bands]
+blocks = [8000, 20000]
+compressed_bytes = [1e6, 5e10]
+zstd_cpu_s = [0.01, 3600]
+fingerprint_index_bytes = [2, 2.5e9]
+fingerprint_index_bytes_share = [0, 0.01]
+fingerprint_build_cpu_s = [0.001, 3600]
+fingerprint_build_cpu_over_zstd = [0.05, 10]
+fingerprint_grams_selected = [0, 10000]
+saturation_blocks_long = [0, 20000]
+saturation_false_positive_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "referer-unknown"
+kind = "equals"
+set = "seen"
+pattern = "unknown referer"
+reason = "illustrative/unverified: ADR-2773's Set L documents no LIKE or equality predicate against Referer (it appears only inside REGEXP_REPLACE(Referer) in q29); this literal is a placeholder, not drawn from or confirmed against real corpus data (network blocked this session). A human must replace it with a genuine observed Referer value before the real run. Multi-word, bloom-inapplicable."
+
+[corpus.column.predicate.bands]
+true_holders = [0, 20000]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 20000]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]
+
+[[corpus.column.predicate]]
+id = "referer-direct"
+kind = "equals"
+set = "unseen"
+pattern = "direct traffic"
+reason = "illustrative/unverified: same basis as referer-unknown. Multi-word, bloom-inapplicable."
+
+[corpus.column.predicate.bands]
+true_holders = [0, 20000]
+
+[corpus.column.predicate.bands.fingerprint]
+blocks_surviving = [0, 20000]
+survival_share = [0, 1]
+blocks_missed = [0, 0]
+false_positive_share = [0, 1]

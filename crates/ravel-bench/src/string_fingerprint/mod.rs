@@ -64,11 +64,21 @@
 //!
 //! The decision ([`decide`], [`DECISION_RULE`]) is per corpus/column, and
 //! overall ([`overall`]) across every corpus/column the pre-registration
-//! file names. Two interpretation choices the task text leaves open, made
+//! file names. Interpretation choices the task text leaves open, made
 //! explicit here: the unseen false-positive bar is a mean across every
 //! unseen predicate (the task gives no per-predicate or N-of-M rule, unlike
 //! T11's "3 of 5"), and `sample_size` above the number of `seen` predicates
-//! clamps rather than refuses.
+//! clamps rather than refuses. The pre-registration file
+//! (`fixtures/string_fingerprint/needles.toml`) also fixes a column/kind
+//! split the task names four ClickBench columns without fully grounding:
+//! URL and Title carry `Contains` predicates (ADR-2773's Set L documents a
+//! real `LIKE '%google%'`/`LIKE '%Google%'` predicate against each), while
+//! SearchPhrase and Referer carry `Equals` predicates with illustrative,
+//! corpus-unverified literals, since Set L names neither column in a `LIKE`
+//! or equality filter at all. The four LogHub body columns carry `Contains`
+//! predicates only: a whole-row `Equals` against a raw log line is not
+//! groundable without the corpus text, since every real line embeds a
+//! per-row value such as a timestamp.
 
 pub mod spec;
 
