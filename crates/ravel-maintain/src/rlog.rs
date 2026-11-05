@@ -154,16 +154,16 @@
 //! - **cursor**: every stream on its own cursors, as above, when neither fits.
 //!
 //! In the first two, the sorted stream ids are cut into contiguous ranges
-//! sized by a per-stream estimate against the pass budget (the ceiling less
-//! the raw term and the D3 charge). A pass decodes each of its groups' blocks
-//! once, keeps the range's rows (charged as the resident pass-rows term), and
-//! emits them stream by stream with the cursor merge's order and reservation
-//! batches, so every mode pushes the same record sequence into the sink and
-//! every part keeps its bytes. A pass whose rows outgrow the budget emits
-//! nothing, releases its charges and is retried at half the range; a single
-//! stream that still overflows goes through cursors. A stream whose estimate
-//! alone exceeds the pass budget is D3's: it stays on cursors, which read the
-//! held groups in resident mode, so no path gathers a whole hot stream.
+//! ([`MergePlan::cut`]) whose distinct candidate blocks' [`pass_block_cost`]
+//! sum fits the pass budget (the ceiling less the raw term and the D3
+//! charge). A pass decodes each of its groups' blocks once, keeps the range's
+//! rows columnar (charged as the tracker's pass-rows term), and emits them
+//! stream by stream with the cursor merge's order and reservation batches, so
+//! every mode pushes the same record sequence into the sink and every part
+//! keeps its bytes. No pass is retried: the cut already priced every block it
+//! holds. A stream whose estimate alone exceeds the pass budget is D3's: it
+//! stays on cursors, which read the held groups in resident mode, so no path
+//! gathers a whole hot stream.
 //!
 //! Peak resident memory is then: per-input catalog metadata (KBs per input,
 //! unchanged by the k-way merge), plus the resident raw row groups (resident
@@ -11664,9 +11664,9 @@ mod tests {
         /// The rlog memory target (pass floor) of the unkeyed fixtures. A pass
         /// of one stream of a [`wide_inputs`] fixture costs one two-row block per
         /// input, about 6.4 KiB each ([`pass_block_cost`], most of it the
-        /// decoder's per-column slot spines), so this floor lets a fetch-per-pass
-        /// ceiling one byte under the resident one keep every stream off
-        /// cursors on up to 50 inputs ([`tight_ceilings`] asserts it).
+        /// decoder's per-column slot spines). [`tight_ceilings`] asserts, per
+        /// fixture that calls it, that this floor keeps every stream off
+        /// cursors at both of its ceilings.
         const FLOOR: u64 = 64 * 1024;
 
         type Extent = (String, u64, u64);
@@ -13200,6 +13200,8 @@ mod tests {
                 columnar / n,
                 row_form / n
             );
+            // The figures ADR-3819's table quotes.
+            assert_eq!((columnar / n, row_form / n), (108, 555));
             assert!(
                 columnar * 4 < row_form,
                 "columnar {columnar} is not under a quarter of the row form {row_form}"

@@ -197,8 +197,7 @@ pub struct RunRequestReport {
     pub coordinate: PhaseRequests,
     /// The format-floor read ([`RequestPhase::FloorRead`]).
     pub floor_read: PhaseRequests,
-    /// RLOG merge stream-range passes run (ADR-3819 D2), a halved range's
-    /// abandoned attempt included. Not a request count.
+    /// RLOG merge stream-range passes run (ADR-3819 D2). Not a request count.
     pub merge_passes: u64,
     /// RLOG raw row-group bytes the merge held resident for its whole run
     /// (ADR-3819 D1), as fetched; zero when it fetched per pass or per

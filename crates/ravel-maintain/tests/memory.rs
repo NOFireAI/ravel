@@ -119,12 +119,12 @@ async fn peak_memory_on_3600_input_bucket() {
     }
 }
 
-/// The RLOG analogue: the ranged reader means the merge holds only
-/// per-input directories plus one stream's blocks at a time, so the compactor's
-/// incremental peak stays bounded as the input count grows rather than scaling
-/// with the whole bucket's raw bytes (the pre-#275 merge held every input
-/// object whole and resident at once). Same method and loose ceiling as the
-/// RSEG test above.
+/// The RLOG analogue: the ranged reader means the merge holds per-input
+/// directories plus, under ADR-3819, the inputs' candidate row groups only when
+/// they fit the resident ceiling, one pass's decoded blocks, and at most two
+/// row groups per cursor of a stream too large for a pass. It never holds an
+/// input object whole (the pre-#275 merge held every one resident at once).
+/// Same method and loose ceiling as the RSEG test above.
 #[tokio::test]
 async fn peak_memory_on_rlog_input_bucket() {
     const INPUTS: usize = 3_600;
