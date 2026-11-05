@@ -4946,7 +4946,15 @@ impl SqlExecutor {
     ///
     /// Anything else (several aggregates beside a `SUM` or `AVG`, a distinct
     /// count, a `GROUP BY` with a `<>` filter or with two keys, a raw select)
-    /// skips the load. Inside an admitted shape, a residual conjunct the
+    /// skips the load. A declared `Str` column's `<>` against a string literal
+    /// counts as a residual `<>` conjunct here although the provider reports
+    /// it `Exact` and no `FilterExec` holds it: the scan evaluates it as a row
+    /// filter, which the rewrite's gate refuses, so the q31 shape (`GROUP BY`
+    /// with `WHERE "SearchPhrase" <> ''`) and `SUM(n) WHERE s <> ''` still
+    /// skip the load (`str_not_equal_shapes_load_no_column_statistics`;
+    /// `str_not_equal_conjunct_stays_residual_for_the_rewrite_check` pins
+    /// the conjunct in the form the optimizer hands the scan).
+    /// Inside an admitted shape, a residual conjunct the
     /// analyzed plan does not show as either a pure `ts` or `has_word`
     /// conjunct or a `declared <> literal` keeps the load, except on the q02
     /// shape when no residual conjunct names a non-`Str` declared column (no

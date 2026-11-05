@@ -2,10 +2,12 @@
 //! invariant the metrics pushdown obeys (crate::pushdown): pruning may only
 //! ever *widen* the read set relative to the query's true need, never narrow
 //! it. `LogsTableProvider::supports_filters_pushdown` returns `Inexact` for
-//! every filter except one it can prove the reader re-verifies per row
-//! ([`filter_is_exact`]: a pure `ts` bound and/or `has_word` call), so
-//! DataFusion re-applies every other original above the scan; exactness comes
-//! from that residual plus the scan re-applying nothing destructive.
+//! every filter except one it can prove the scan evaluates per row
+//! ([`filter_is_exact`]: a pure `ts` bound and/or `has_word` call, which the
+//! reader re-verifies, and a declared `Str` column's `<>` against a string
+//! literal, which the scan's row filter evaluates), so DataFusion re-applies
+//! every other original above the scan; exactness comes from that residual
+//! plus the scan re-applying nothing destructive.
 //!
 //! Recognized shapes (everything else contributes nothing and widens):
 //!
@@ -150,13 +152,14 @@
 //! no key comes from it. The scan builds DataFusion's own physical expression
 //! for it and applies it to each batch after the column build, so it sees the
 //! value SQL sees, resource or scope fallback included
-//! (`crate::logs_scan::row_filter`). The filter stays `Inexact`
-//! ([`filter_is_exact`] does not recognize the shape), so the residual
-//! `FilterExec` above the scan still evaluates every row the scan emits.
+//! (`crate::logs_scan::row_filter`). [`filter_is_exact`] answers `true` for
+//! the shape, so the provider reports it `Exact` and DataFusion keeps no
+//! `FilterExec` for it; a filter that holds it beside an unrecognized
+//! sub-expression in one unsplit `Expr` stays `Inexact`.
 //! `str_not_equal_goes_to_row_filters_only` pins what is accepted and what is
 //! not; `answers_match_the_residual_on_every_value_shape`
 //! (`tests/logs_str_not_equal_row_filter.rs`) pins that the scan drops exactly
-//! the rows the `FilterExec` would drop.
+//! the rows the `FilterExec` of a provider with the row filter off drops.
 //!
 //! # Exact-key equalities (tier-1 KEY_IDX probe, ADR-2707 decision 5)
 //!
@@ -327,12 +330,20 @@ pub fn extract_logs_keyed(
 /// every conjunct of `filter` must be a shape whose pushed predicate is
 /// *equivalent* to it, not merely implied by it.
 ///
-/// Two shapes qualify, and only because the reader re-verifies both per row
+/// Three shapes qualify. Two because the reader re-verifies them per row
 /// (`ravel_logseg::reader`'s `eval`, its `Predicate::TsRange` and
 /// `Predicate::HasWord` arms both read the row's own value): a `ts` bound and a
-/// `has_word(col, 'literal')` call. Everything routed to the prune-only
-/// [`LogsPushdown::prune`] channel, and everything not recognized at all,
-/// answers `false`.
+/// `has_word(col, 'literal')` call. The third is a declared `Str` column's
+/// `<>` against a non-NULL string literal ([`LogsPushdown::row_filters`]),
+/// because the scan evaluates DataFusion's own expression for it on every
+/// batch it builds (ADR-0093, exact not-equal amendment). Everything routed to
+/// the prune-only [`LogsPushdown::prune`] channel or to
+/// [`LogsPushdown::key_equals`], and everything not recognized at all, answers
+/// `false` (`str_not_equal_is_exact_and_nothing_near_it_is`).
+///
+/// A caller that does not hand the scan its row filters (a provider with
+/// them off, the distributed coordinator) must not report the third shape
+/// `Exact`; [`filter_has_row_filter`] tells it apart.
 pub fn filter_is_exact(filter: &Expr, declared: &[DeclaredColumn]) -> bool {
     if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = filter
         && *op == Operator::And
@@ -340,6 +351,15 @@ pub fn filter_is_exact(filter: &Expr, declared: &[DeclaredColumn]) -> bool {
         return filter_is_exact(left, declared) && filter_is_exact(right, declared);
     }
     leaf_is_exact(filter, declared)
+}
+
+/// Whether some conjunct of `filter` goes to [`LogsPushdown::row_filters`]:
+/// the part of [`filter_is_exact`]'s answer that holds only when the scan
+/// receives and evaluates its row filters.
+pub fn filter_has_row_filter(filter: &Expr, declared: &[DeclaredColumn]) -> bool {
+    !extract_logs(std::slice::from_ref(filter), declared)
+        .row_filters
+        .is_empty()
 }
 
 /// [`filter_is_exact`] for one non-`AND` conjunct. The extraction is
@@ -364,7 +384,9 @@ fn leaf_is_exact(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
             Some((Operator::Eq, _)) => out.ts_lo.is_some() && out.ts_hi.is_some(),
             Some((Operator::Gt | Operator::GtEq, _)) => out.ts_lo.is_some(),
             Some((Operator::Lt | Operator::LtEq, _)) => out.ts_hi.is_some(),
-            _ => false,
+            Some(_) => false,
+            // The scan evaluates the whole leaf as its row filter.
+            None => is_str_not_equal(be, declared) && out.row_filters.len() == 1,
         },
         Expr::Between(bt) if !bt.negated && is_ts_col(&bt.expr) => {
             out.ts_lo.is_some() && out.ts_hi.is_some()
@@ -1513,8 +1535,8 @@ mod tests {
     /// A declared `Str` column's `<>` against a non-NULL string literal, in
     /// either operand order and with the literal as `Utf8`, `Utf8View` or the
     /// `Dictionary(Int32, Utf8)` scalar, lands in `row_filters` as the
-    /// expression itself and nowhere else, and stays `Inexact`. Every other
-    /// shape leaves `row_filters` empty.
+    /// expression itself and nowhere else. Every other shape leaves
+    /// `row_filters` empty.
     #[test]
     fn str_not_equal_goes_to_row_filters_only() {
         let d = vec![
@@ -1542,7 +1564,6 @@ mod tests {
             assert_eq!(p.row_filters, vec![e.clone()], "{e} is a row filter");
             assert!(p.prune.is_empty() && p.content.is_empty(), "{e}");
             assert!(p.key_equals.is_empty() && p.ts_lo.is_none(), "{e}");
-            assert!(!filter_is_exact(&e, &d), "{e} stays Inexact in this step");
         }
 
         let bounded = extract_logs(
@@ -1579,6 +1600,100 @@ mod tests {
             let p = extract_logs(std::slice::from_ref(&e), &d);
             assert!(p.row_filters.is_empty(), "{e} is not a row filter");
         }
+    }
+
+    /// ADR-0093, exact not-equal amendment, T1: [`filter_is_exact`] accepts a
+    /// declared `Str` column's `<>` against a non-NULL string literal, in
+    /// either operand order, with the literal as `Utf8`, `Utf8View` or the
+    /// `Dictionary(Int32, Utf8)` scalar, alone and AND-ed with a `ts` bound,
+    /// and [`filter_has_row_filter`] says each holds a row filter. It rejects
+    /// every shape near it. `body` is declared `Str` too, so a name resolved
+    /// without the fixed-column guard reads it as declared.
+    ///
+    /// Flipped, each fails "these stay Inexact" and names what it accepted:
+    /// matching any `NotEq` with a column on one side accepts `body` and
+    /// `attrs['k']`; resolving the name without the fixed-column guard accepts
+    /// `body`; testing a looser not-equal shape before the `prune`/`key_equals`
+    /// early return accepts the I64 `NumNotEq` (`n <> 5`); crediting either
+    /// side of an `AND` accepts `s <> 'x' AND s LIKE '%y%'`.
+    #[test]
+    fn str_not_equal_is_exact_and_nothing_near_it_is() {
+        let d = vec![
+            DeclaredColumn::new("s", DeclaredType::Str),
+            DeclaredColumn::new("t", DeclaredType::Str),
+            DeclaredColumn::new("body", DeclaredType::Str),
+            DeclaredColumn::new("blob", DeclaredType::Bytes),
+            DeclaredColumn::new("n", DeclaredType::I64),
+        ];
+        let dict = |v: &str| {
+            lit(ScalarValue::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(ScalarValue::Utf8(Some(v.to_string()))),
+            ))
+        };
+        let view = |v: &str| lit(ScalarValue::Utf8View(Some(v.into())));
+        let bound = || col("ts").gt_eq(ts_lit(5));
+        let mut accepted = Vec::new();
+        for value in [lit("x"), view("x"), dict("x")] {
+            for e in [
+                col("s").not_eq(value.clone()),
+                value.clone().not_eq(col("s")),
+            ] {
+                accepted.push(e.clone().and(bound()));
+                accepted.push(bound().and(e.clone()));
+                accepted.push(e);
+            }
+        }
+        for e in &accepted {
+            assert!(filter_is_exact(e, &d), "{e} is Exact");
+            assert!(filter_has_row_filter(e, &d), "{e} holds a row filter");
+        }
+
+        let rejected = [
+            ("body <> 'x'", col("body").not_eq(lit("x"))),
+            (
+                "attrs['k'] <> 'v'",
+                get_field(col("attrs"), "k").not_eq(lit("v")),
+            ),
+            ("undeclared", col("other").not_eq(lit("x"))),
+            ("Bytes", col("blob").not_eq(lit(vec![1u8]))),
+            ("n <> 5", col("n").not_eq(lit(5i64))),
+            ("NOT (s = 'x')", Expr::Not(Box::new(col("s").eq(lit("x"))))),
+            ("s <> NULL", col("s").not_eq(lit(ScalarValue::Utf8(None)))),
+            (
+                "CAST(s) <> 'x'",
+                Expr::Cast(datafusion::logical_expr::Cast::new(
+                    Box::new(col("s")),
+                    DataType::Utf8,
+                ))
+                .not_eq(lit("x")),
+            ),
+            (
+                "lower(s) <> 'x'",
+                datafusion::functions::string::expr_fn::lower(col("s")).not_eq(lit("x")),
+            ),
+            ("s <> t", col("s").not_eq(col("t"))),
+            (
+                "OR",
+                or(col("s").not_eq(lit("x")), col("t").not_eq(lit("y"))),
+            ),
+            (
+                "s <> 'x' AND s LIKE '%y%'",
+                col("s")
+                    .not_eq(lit("x"))
+                    .and(like(col("s"), "%y%", false, None, false)),
+            ),
+            ("s = 'x'", col("s").eq(lit("x"))),
+        ];
+        let accepted_wrongly: Vec<&str> = rejected
+            .iter()
+            .filter(|(_, e)| filter_is_exact(e, &d))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            accepted_wrongly.is_empty(),
+            "these stay Inexact: {accepted_wrongly:?}"
+        );
     }
 
     /// TEST 7: a comparison against a type-mismatched literal (a float against a

@@ -320,8 +320,12 @@
 //! Correctness comes solely from the merged `attrs` column plus the residual.
 //! An attribute predicate's pushdown is always `Inexact`
 //! ([`crate::logs_pushdown::filter_is_exact`] answers `true` for the ts and
-//! `has_word` shapes only), so DataFusion re-applies the *original* predicate
-//! against the emitted batch. [`build_batch`] populates the `attrs`
+//! `has_word` shapes and for a declared `Str` column's `<>` against a string
+//! literal only), so DataFusion re-applies the *original* predicate against
+//! the emitted batch. The declared `Str` `<>` has no residual: this scan
+//! evaluates DataFusion's own expression for it on every batch it builds, on
+//! the merged value the column holds (`row_filter`;
+//! `answers_match_the_residual_on_every_value_shape`). [`build_batch`] populates the `attrs`
 //! column from the fully merged view (ADR-0033 amendment), so the
 //! residual evaluates `attrs['k'] = 'v'` against exactly the data a row's SQL
 //! semantics demand: a resource-only match survives (the residual sees it in the
