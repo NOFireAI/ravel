@@ -432,6 +432,7 @@ use ravel_logseg::record::canonical_value_bytes;
 
 mod batch;
 mod limit_hint;
+mod partition_topk;
 mod plan;
 mod row_filter;
 mod scan;
@@ -448,6 +449,7 @@ use threshold::*;
 #[doc(hidden)]
 pub use batch::values_memo_build;
 pub(crate) use limit_hint::LogsLimitHint;
+pub(crate) use partition_topk::LogsPartitionTopK;
 pub(crate) use threshold::ConfirmTopKThreshold;
 
 /// Rows accumulated into one output batch before it is emitted.

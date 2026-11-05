@@ -192,6 +192,11 @@ extrema, and the column-statistics rewrite below refuses it, so `COUNT(*)`,
 The same comparison AND-ed with a shape the scan does not evaluate, in one
 unsplit expression, stays `Inexact`.
 
+A scan carrying such a comparison under an `ORDER BY ... LIMIT k` whose
+global sort reads it through a partition merge and projections only gets a
+per-partition top-`k` sort below the global one, so the global sort reads
+`k` rows per partition instead of every batch the scan emits.
+
 Every other filter stays `Inexact`. An `attrs['k'] = 'v'` equality and
 every declared typed column predicate (ADR-0093) go to the prune-only
 channel, which the reader uses for block pruning ONLY and never evaluates

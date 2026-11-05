@@ -98,6 +98,8 @@ mod logs_limit_hint;
 mod logs_metadata_agg;
 #[path = "logs_not_equal_route.rs"]
 mod logs_not_equal_route;
+#[path = "logs_partition_topk.rs"]
+mod logs_partition_topk;
 #[path = "logs_plan_concurrency.rs"]
 mod logs_plan_concurrency;
 #[path = "logs_provider.rs"]

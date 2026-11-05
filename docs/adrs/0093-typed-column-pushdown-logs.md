@@ -487,6 +487,16 @@ Why the merge happens:
    integer conjuncts. In those four, the `<>` conjunct moves into the scan, and the FilterExec
    still coalesces and merges.
 
+   Measured (2026-11-05, #3231 comment 6669915906): q26 (`ORDER BY "SearchPhrase" LIMIT 10`) ran
+   1.61 times slower. With the `FilterExec` gone, its single global TopK evaluated its threshold
+   over each narrowed batch's full dictionary values, work the filter's coalescer had done per
+   partition. So a scan that carries a row filter, under a global `SortExec` with a fetch above a
+   fetch-less `CoalescePartitionsExec` through pass-through nodes only, gets a per-partition
+   `SortExec` with the same sort keys and fetch between them
+   (`a_row_filtered_scan_under_a_global_topk_gets_a_partition_topk`). The answer is unchanged,
+   because the top k of the union is the top k of the partitions' top k. A scan whose TopK is
+   already confirmed for late materialization (`ORDER BY ts`) is left as it is.
+
 ### Why the evaluator sits after the build, not in the reader
 
 A reader arm in `block_survivors` would have to agree with `FilterExec` on every row, and it does

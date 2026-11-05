@@ -78,13 +78,13 @@ fn identity() -> ObjectIdentity {
     }
 }
 
-fn s(v: &str) -> AttrValue {
+pub(crate) fn s(v: &str) -> AttrValue {
     AttrValue::Str(v.to_string())
 }
 
 /// The stream a record is on, by what its resource says about `s`.
 #[derive(Clone, Copy)]
-enum Stream {
+pub(crate) enum Stream {
     /// No `s` at resource level: a row with no record value reads NULL.
     Bare,
     /// Resource `s = 'r'`.
@@ -106,7 +106,7 @@ fn resource(stream: Stream) -> Vec<(String, AttrValue)> {
     out
 }
 
-fn record(ts: i64, stream: Stream, attrs: &[(&str, AttrValue)]) -> LogRecord {
+pub(crate) fn record(ts: i64, stream: Stream, attrs: &[(&str, AttrValue)]) -> LogRecord {
     let resource = resource(stream);
     LogRecord {
         stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
@@ -126,7 +126,7 @@ fn record(ts: i64, stream: Stream, attrs: &[(&str, AttrValue)]) -> LogRecord {
     }
 }
 
-fn encode(records: &[LogRecord], cfg: RlogConfig) -> Vec<u8> {
+pub(crate) fn encode(records: &[LogRecord], cfg: RlogConfig) -> Vec<u8> {
     let mut w = RlogWriter::new(cfg, identity());
     for r in records {
         w.push(r.clone()).expect("push");
@@ -134,7 +134,12 @@ fn encode(records: &[LogRecord], cfg: RlogConfig) -> Vec<u8> {
     w.finish().expect("finish")
 }
 
-async fn put(store: &MemoryStore, key: &str, bytes: Vec<u8>, records: &[LogRecord]) -> SegmentRef {
+pub(crate) async fn put(
+    store: &MemoryStore,
+    key: &str,
+    bytes: Vec<u8>,
+    records: &[LogRecord],
+) -> SegmentRef {
     let size = bytes.len() as u64;
     store
         .put(key, bytes::Bytes::from(bytes), PutOptions::default())
@@ -160,7 +165,7 @@ async fn put(store: &MemoryStore, key: &str, bytes: Vec<u8>, records: &[LogRecor
     }
 }
 
-fn provider(
+pub(crate) fn provider(
     store: &Arc<MemoryStore>,
     segments: Vec<SegmentRef>,
     declared: &[DeclaredColumn],
@@ -198,7 +203,10 @@ fn session(provider: LogsTableProvider) -> SessionContext {
 }
 
 /// The physical plan of `sql`, executed, with its batches.
-async fn run(ctx: &SessionContext, sql: &str) -> (Arc<dyn ExecutionPlan>, Vec<RecordBatch>) {
+pub(crate) async fn run(
+    ctx: &SessionContext,
+    sql: &str,
+) -> (Arc<dyn ExecutionPlan>, Vec<RecordBatch>) {
     let plan = ctx
         .sql(sql)
         .await
@@ -225,7 +233,10 @@ fn find<'a>(
     }
 }
 
-fn nodes<'a>(plan: &'a Arc<dyn ExecutionPlan>, name: &str) -> Vec<&'a Arc<dyn ExecutionPlan>> {
+pub(crate) fn nodes<'a>(
+    plan: &'a Arc<dyn ExecutionPlan>,
+    name: &str,
+) -> Vec<&'a Arc<dyn ExecutionPlan>> {
     let mut out = Vec::new();
     find(plan, name, &mut out);
     out
@@ -279,7 +290,7 @@ fn assert_no_filter(plan: &Arc<dyn ExecutionPlan>, sql: &str) {
     );
 }
 
-fn pretty(batches: &[RecordBatch]) -> String {
+pub(crate) fn pretty(batches: &[RecordBatch]) -> String {
     pretty_format_batches(batches).expect("pretty").to_string()
 }
 
@@ -303,7 +314,7 @@ fn texts(column: &dyn Array) -> Vec<Option<String>> {
         .collect()
 }
 
-fn column_texts(batches: &[RecordBatch], name: &str) -> Vec<Option<String>> {
+pub(crate) fn column_texts(batches: &[RecordBatch], name: &str) -> Vec<Option<String>> {
     batches
         .iter()
         .flat_map(|b| texts(b.column(b.schema().index_of(name).expect(name)).as_ref()))
@@ -1080,7 +1091,10 @@ async fn clickbench_fixture() -> (Arc<MemoryStore>, Vec<SegmentRef>) {
     (store, segments)
 }
 
-fn partitioned_session(provider: LogsTableProvider, partitions: usize) -> SessionContext {
+pub(crate) fn partitioned_session(
+    provider: LogsTableProvider,
+    partitions: usize,
+) -> SessionContext {
     let mut config = SqlConfig::default();
     config.engine.sql_partition_count = Some(partitions);
     let pool = Arc::new(TenantDelegatingPool::new(
