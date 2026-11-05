@@ -420,14 +420,16 @@ section: `2T` ranged GETs per fold for a tail of `T` entries, up to
   the part in memory (about 68 bytes each, the leaf build switch
   amendment's figure): 20 M distinct trace ids in one spans part is about
   1.4 GB. `CatalogConfig::key_index_build_max_pairs` (default 8,000,000,
-  about 550 MB) bounds it. A (part, field) whose pair count would exceed
+  about 550 MB; the pass-end slice amendment replaces this figure with the
+  bound a pass holds) bounds it. A (part, field) whose pair count would exceed
   it is built in `ceil(pairs / budget)` passes over disjoint `key8`
   ranges (the #3704 amendment states the exact pass rule, the per-pair
   cost and what the budget does not bound), each pass reading the sections again (a pass costs `2T` GETs and
   about the section bytes, 2 to 6 % of the part) and emitting the slices
   of its range; the slices tile exactly as `split_key_index_entries`
-  produces them today. The report names the pass count. A sealed part
-  pays it once.
+  produces them today (per pass, under the pass-end slice amendment).
+  The report names the pass count. A sealed part pays it once (as does
+  each advancing fold, see the pass-end slice amendment).
 - **Default.** `build_key_index_leaves` defaults to on for both signals
   once the Stage 1 amendment records the per-fold figures inside their
   bands (Acceptance, rows 7 and 8) and the production reader of decisions
@@ -744,7 +746,7 @@ the #3702 amendment states the condition and the in-process figures.
 | 4. spans lookup, warm (second run), folded with leaves | 0 data GETs, 0 leaf GETs, 1 resolve GET | any data or leaf GET | predicted; T12 measured 0 data GETs, #2763 comment 6276877460 |
 | 5. q20, cold, folded with leaves (398 `hits` objects) | leaf GETs = 2 x covering parts; objects opened = holders (1); total GETs under 40; wire under 20 MB; under 1 s; 4 rows | over 100 GETs or over 100 MB | predicted; ADR-2707's band, unreachable until the leaf is read; T12 measured 1,013 GETs and 907 MB, #2763 comment 6276877460 |
 | 6. q20, cold, unfolded, post-#3117 | every object above 512 KiB probed: `keyIndex` GETs = prefix + bucket per probed object (2 x 398 minus empty buckets); objects read past the probe = holders (1); scan wire under 20 MB; 4 rows | any object above 512 KiB read whole for an absent key; over 100 GETs beyond the probe; over 100 MB | predicted from the #3117 amendment, docs/adrs/2707-exact-key-index-for-spans-and-logs.md:1229; T12 measured 81 survivors and 823 MB before the fix, #2763 comment 6276877460 |
-| 7. fold with the switch on, advancing fold over an unchanged tail plus one new hour | section GETs = 2 x new entries (plus one per entry whose footer exceeds 8 KiB) plus one GET per previous leaf; `key_index_build_passes` 1; peak fold RSS under 1.5 GB at the T12 spans corpus (20 M distinct keys, budget 8 M pairs, so 3 passes on the from-scratch build of the sealed part and the report says 3) | section GETs over 2 x tail entries (a from-scratch rebuild), passes other than `ceil(pairs / budget)` (the #3704 amendment replaces this miss and the section GETs target), RSS over 2 GB | predicted; the from-scratch cost is the leaf build switch amendment's `2T`, measured by T12 as 1,656 = 2 x 828 on spans and 796 = 2 x 398 on logs, #2763 comment 6276877460 |
+| 7. fold with the switch on, advancing fold over an unchanged tail plus one new hour | section GETs = 2 x new entries (plus one per entry whose footer exceeds 8 KiB) plus one GET per previous leaf; `key_index_build_passes` 1 (`G` and a pass factor on the section GETs: the pass-end slice amendment); peak fold RSS under 1.5 GB at the T12 spans corpus (20 M distinct keys, budget 8 M pairs, so 3 passes on the from-scratch build of the sealed part and the report says 3) | section GETs over 2 x tail entries (a from-scratch rebuild), passes other than `ceil(pairs / budget)` (the #3704 amendment replaces this miss and the section GETs target), RSS over 2 GB | predicted; the from-scratch cost is the leaf build switch amendment's `2T`, measured by T12 as 1,656 = 2 x 828 on spans and 796 = 2 x 398 on logs, #2763 comment 6276877460 |
 | 8. leaf bytes | spans at most 6 % and logs at most 2.5 % of part bytes (the logs target sits above the one measurement, 2.06 %), slices x 194 B of HEAD per (part, field) | over 2x either | predicted; T12 measured 4.40 % and 2.06 %, 194 B and 192 B, #2763 comment 6276877460 |
 | 9. month-scale lane: spans lookup without a range over 744 hour-ranged parts (`--ingest-hour-stride 1`, a month) | resolve: 1 part GET per covering part; leaf GETs = 2 x 744 = 1,488; 0 tier-1 GETs on covered objects; `partsBeyondCeiling` 0; `keyIndex` decompressed bytes per part at most `8 x sqrt(body)` as ADR-2707's row states; rows exact | more than 2 leaf GETs per part, any leaf GET outside `keyIndex`, any tier-1 GET on a covered object | predicted; the ADR-2707 month-scale row, docs/adrs/2707-exact-key-index-for-spans-and-logs.md:877, unmeasured there |
 | 10. past `P_max` lane: 2,160 hour-ranged parts | leaf GETs = 2 x 1,024 = 2,048 exactly; `partsBeyondCeiling` 1,136, the 1,136 smallest parts by entry count; those parts' objects probed at tier 1 (3 GETs, under 16 KB each, in `probe` and `keyIndex`), 0 leaf GETs for them; rows exact | any leaf GET for a part beyond the ceiling, more than 2,048 leaf GETs, a beyond-ceiling object read whole for an absent key | predicted; restates the ADR-2707 `P_max` row (scan remainder) per decision 2's amendment, docs/adrs/2707-exact-key-index-for-spans-and-logs.md:878 |
@@ -868,33 +870,46 @@ incremental tail build amendment records the mechanism. What changes:
   read again by each fold that re-encodes the tail, for as long as it stays
   uncovered, not once. The advancing fold's section GETs are
   2 x (new entries + entries still uncovered), plus one per such entry
-  whose footer exceeds 8 KiB, plus one GET per previous leaf. Row 7's
+  whose footer exceeds 8 KiB, on each build pass, plus one GET per
+  previous leaf per fold. Row 7's
   target reads that way; its miss, over 2 x tail entries, stands.
 - **The pass count is a greedy partition, not `ceil(pairs / budget)`.**
-  Each pass gives every field still building an equal share of the
-  budget and holds, per field, the longest run of whole key8s from where
-  its last pass ended whose pairs fit the share, or that one key8 when its
-  own pairs exceed it. For one field the passes are the greedy partition
-  `G` of its ascending key8 runs into groups of at most the budget, which
-  is `ceil(pairs / budget)` only when no key8 is shared between entries:
-  17 pairs over two key8s shared by four entries each take 4 passes at
-  budget 6, where the ceiling is 3. A field that a later pass finds a new
-  uncovered entry for, after its pairs reached a slice, finishes its
-  passes to collect every such entry and is rebuilt once, adding `G` again.
-  Row 7's passes miss becomes: passes other than `G` on a build with no
-  rebuild, or over `2G` on one with a rebuild. On the T12 spans corpus,
-  where a trace id rarely spans two objects, `G` is about the 3 that row 7
+  Every field the build indexes gets a fixed share of the budget for the
+  whole build, `max(1, budget / F)` for `F` fields, and each pass holds,
+  per field, the longest run of whole key8s from where its last pass
+  ended whose pairs fit the share, or that one key8 when its own pairs
+  exceed it. A field's passes are the greedy partition `G` of its
+  ascending key8 runs into groups of at most its share, which is
+  `ceil(pairs / share)` only when no key8 is shared between entries: 17
+  pairs over two key8s shared by four entries each take 4 passes at
+  budget 6, where the ceiling is 3. A part takes as many passes as its
+  slowest field. A field that a later pass finds a new uncovered entry
+  for, after an earlier pass ended holding pairs, finishes its passes to
+  collect every such entry and is rebuilt once, adding `G` again. Row 7's
+  passes miss becomes: passes other than `G` on a build with no rebuild,
+  or over `2G` on one with a rebuild. On the T12 spans corpus, where a
+  trace id rarely spans two objects, `G` is about the 3 that row 7
   predicts.
-- **What the budget bounds.** A pass holds at most its share of pairs,
-  read and carried together, plus the one pair placed before each cut, or
-  one key8's pairs plus one when that key8 alone exceeds the share. A held
-  pair costs at most 88 B for one block (a 40-byte entry in a buffer that
-  grows to at most twice the pairs it held, and an 8 B block list under
-  jemalloc), so the default budget holds at most about 704 MB of pairs.
-  The budget does not bound these, which add to it:
-  - the previous tail's leaf bytes as stored, kept for the whole build so
-    each pass can decode the leaves its range overlaps without a second
-    GET (the previous fold's leaf bytes for that part);
+- **What the budget bounds.** Every pass encodes its pairs and closes
+  every slice it opened before the next pass starts, so nothing a pass
+  read outlives it. On every pass, for each field, the heap's pairs at
+  their peak plus the pairs of a slice left open across the pass end are
+  at most `max(share, R) + 1`, `R` the field's largest key8 run and the
+  `+ 1` the pair placed before a cut, and the open slice is 0; summed over
+  the fields, at most `F x (max(share, R_max) + 1)` pairs, which is at
+  most `budget + F` when no key8 run exceeds a share. The catalog test
+  `every_pass_holds_at_most_its_share_open_slice_included` pins it. A held
+  one-block pair costs about 88 B as an upper-bound estimate: a 40-byte
+  entry counted twice, since its buffer grows to at most twice the pairs
+  it held, and a block list of exactly its blocks, 8 B under jemalloc's
+  smallest size class; the entry size, the buffer factor and the exact
+  block list are pinned by tests, the size class is not. The open slice
+  is not among what the budget leaves out. The budget does not bound
+  these, which add to it:
+  - the previous tail's leaf bytes as stored, read by one GET per leaf
+    per fold and kept for the whole build so each pass can decode the
+    leaves its range overlaps without a second GET (the previous fold's
+    leaf bytes for that part);
   - one decoded frame of one previous leaf at a time: a frame is one
     bucket, near `4 x 2^bucket_bits` bytes decompressed for keys whose
     key8 spreads evenly (trace ids, strings, bytes), and up to the whole
@@ -915,10 +930,70 @@ and RSS figures stay predicted until the harness measures them.
 
 | check | target | miss | source |
 |---|---|---|---|
-| row 7, section GETs on an advancing fold | 2 x (new entries + entries still uncovered), plus one per previous leaf | over 2 x tail entries | crates/ravel-catalog/src/fold.rs:13973 |
-| row 7, passes | `G`, the greedy partition per field; up to `2G` with a rebuild | other than `G` without a rebuild, over `2G` with one | crates/ravel-catalog/src/fold.rs:14277 |
-| pairs one pass holds | at most the share, or one key8 whole | a pass over its share across several key8s | crates/ravel-catalog/src/fold.rs:14346 |
-| one rebuild sees every uncovered entry | the from-scratch leaves at every budget | a budget whose leaves differ | crates/ravel-catalog/src/fold.rs:14251 |
-| build memory at the default budget, T12 spans corpus | held pairs at most about 704 MB; peak fold RSS under 1.5 GB as row 7 | RSS over 2 GB | predicted |
+| row 7, section GETs on an advancing fold | 2 x (new entries + entries still uncovered) per pass, plus one per previous leaf per fold | over 2 x tail entries per pass | crates/ravel-catalog/src/fold.rs:14056 |
+| row 7, passes | `G`, the greedy partition per field under its share; up to `2G` with a rebuild | other than `G` without a rebuild, over `2G` with one | crates/ravel-catalog/src/fold.rs:14367; crates/ravel-catalog/src/fold.rs:14701 |
+| pairs one pass holds, open slice included | at most `max(share, R) + 1` per field, open slice 0 | any pass over it | crates/ravel-catalog/src/fold.rs:14514 |
+| one rebuild sees every uncovered entry | every leaf lists every uncovered entry; leaves equal to from-scratch at the same budget | a budget whose leaves differ | crates/ravel-catalog/src/fold.rs:14335; crates/ravel-catalog/src/fold.rs:14572 |
+| build memory at the default budget, T12 spans corpus | held pairs at most `F x (max(share, R_max) + 1)`; peak fold RSS under 1.5 GB as row 7 | RSS over 2 GB | predicted |
+
+Refs: #3704, #3692
+
+## Amendment (issue #3704, fix round 2): every pass closes its slices, and row 7 counts the passes
+
+<!-- amendment-applies: sections="5. The tail part's leaves are built incrementally, under a pair budget; the switch defaults on after Stage 1|Acceptance (pre-registered; a figure outside its band is a miss, investigated before the epic closes)" pointer="pass-end slice amendment" -->
+<!-- amendment-supersedes: phrase="about 550 MB" pointer="pass-end slice amendment" -->
+<!-- amendment-supersedes: phrase="pays it once" pointer="pass-end slice amendment" -->
+<!-- amendment-supersedes: phrase="`key_index_build_passes` 1" pointer="pass-end slice amendment" -->
+<!-- amendment-supersedes: phrase="the slices tile exactly as `split_key_index_entries`" pointer="pass-end slice amendment" -->
+
+This amendment changes a pre-registered band, row 7, after a measurement.
+Box B of this epic, on real S3 with 20 M traces, measured the logs fold at
+9.06 GB peak RSS and the spans fold at 2.30 GB (#3692 comment 6646584150),
+so the pair budget has to bound everything a pass holds, and the #3704
+amendment's first build did not: a leaf slice stayed open across pass ends
+until the body ceiling cut it, holding every earlier pass's pairs decoded.
+The build now closes every slice at the end of the pass that opened it
+(docs/catalog-and-mvcc.md, "Pair budget"; ADR-2707's incremental tail
+build amendment, "Slice rule"). The leaf layout needs a slice's whole
+body before it is written, since the bucket count is chosen from the
+final body size and the frames are laid out per hash bucket, not in key8
+order, so a slice cannot be streamed out as its pairs arrive. What
+changes:
+
+- **The leaves depend on the budget.** A field built in passes writes a
+  slice end at every pass end, so its leaves equal a build from scratch at
+  the same budget, carried or read, and after a restart; they equal a
+  one-pass build only when the field fits its share. Lookups are
+  unchanged: the router and ADR-2707's slice rule need only that the
+  slices tile the key space.
+- **Row 7, passes.** The target "`key_index_build_passes` 1" becomes the
+  greedy pass count `G` of the #3704 amendment, computed over the tail's
+  carried and read pairs together: for each field, the number of groups
+  of whole ascending key8 runs, each group at most the field's share
+  `max(1, floor(budget / F))` or one run over it, and the part's count is
+  its slowest field's. A tail within the budget still takes 1. The miss
+  is the #3704 amendment's: other than `G` without a rebuild, over `2G`
+  with one.
+- **Row 7, section GETs.** The target gains the pass factor:
+  2 x (new entries + entries still uncovered) x `G` ranged GETs, plus one
+  per such entry and pass whose footer exceeds 8 KiB, plus one GET per
+  previous leaf, issued once per fold whatever `G` is, since the build
+  keeps the leaf bytes and decodes them again in each pass. The miss is
+  over 2 x tail entries x `G`.
+- **Decision 5's cost.** "A sealed part pays it once" holds for the
+  sealed part's own build; the tail pays the passes on every advancing
+  fold while its pairs exceed the budget, carried pairs included, so a
+  tail over the budget re-reads its new and uncovered entries' sections
+  `G` times per fold. "About 550 MB" is replaced by the bound the #3704
+  amendment states, at most `F x (max(share, R_max) + 1)` held pairs per
+  pass, about 88 B each as an upper-bound estimate.
+
+| check | target | miss | source |
+|---|---|---|---|
+| what a pass holds, open slice included | at most `max(share, R) + 1` per field, open slice 0 | any pass over it; it failed on the #3704 amendment's first build with a held peak of 4 and an open slice of 3 at share 1 | crates/ravel-catalog/src/fold.rs:14514 |
+| advancing fold at budget 5, 9 carried and 6 read pairs | 3 passes, 6 section reads, 12 ranged GETs, 1 previous leaf GET, 3 leaves | any other figure | crates/ravel-catalog/src/fold.rs:14437 |
+| advancing fold at budget 1 | 11 passes, one per key8 run | any other count | crates/ravel-catalog/src/fold.rs:14514 |
+| leaves at the same budget | equal to from-scratch, carried and after a restart | a budget whose leaves differ | crates/ravel-catalog/src/fold.rs:14572 |
+| row 7 at the T12 spans corpus, real S3 | `G` passes, 2 x (new + still uncovered) x `G` section GETs plus one per previous leaf | as row 7 above | predicted |
 
 Refs: #3704, #3692

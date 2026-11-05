@@ -1198,7 +1198,10 @@ over the whole object by `inspect kidx`; it is not a bound on `body_len`
 (the stored bytes, which are smaller).
 A (part, field) whose decompressed body would exceed it is split by key
 range into several leaves under the ceiling, each with its own ref and
-slice, so a lookup opens exactly one leaf per (part, field). A slice cuts
+slice, so a lookup opens exactly one leaf per (part, field). A build that
+runs in passes under the pair budget (below) also ends a slice at every
+pass end, so it can write several leaves for a body under the ceiling; the
+reader needs only that the slices tile the key space. A slice cuts
 only between distinct `key8` values, so a single `key8` whose own entries'
 encodings exceed the ceiling cannot be sliced: every entry carrying that
 `key8` is listed in `uncovered_entry_ordinals` for the field (it stays a
@@ -1261,19 +1264,38 @@ part included, keeps its refs and costs no GET at all
 (default 8,000,000; `DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS`,
 `crates/ravel-catalog/src/config.rs`) bounds the (entry, key8) pairs the
 build holds for one part, the pairs read from sections and the pairs
-carried from the previous tail together. Each pass gives every field still
-building an equal share, `floor(budget / F)` for `F` such fields and at
-least 1. A field holds every pair in its pass's range as it is read or
-decoded; when its held pairs pass the share, it gives up its highest key8
-run, and that key8 becomes the exclusive end of the pass's range. So a pass
-holds, for each field, the longest run of whole key8s from where its last
-pass ended whose pairs fit the share, or that one key8 alone when its own
-pairs exceed it, which is held whole. Each later pass reads the sections it
-needs again, decodes the carried leaves its range overlaps, and keeps the
-next range; the slices tile the key space with no gap and no overlap, the
-slices and bytes of a one-pass build (`build_part_key_index`; test
-`pair_budget_builds_in_passes_with_identical_leaves`: 12 pairs under a
-budget of 5 build in passes of 5, 5 and 2).
+carried from the previous tail together. Every field the build indexes gets
+a fixed share for the whole build, `max(1, floor(budget / F))` for `F`
+such fields, the ones the tenant declares and the ones a section names,
+whether or not a field is still building. A field holds every pair in its
+pass's range as it is read or decoded; when its held pairs pass the share,
+it gives up its highest key8 run, and that key8 becomes the exclusive end
+of the pass's range. So a pass holds, for each field, the longest run of
+whole key8s from where its last pass ended whose pairs fit the share, or
+that one key8 alone when its own pairs exceed it, which is held whole. A
+pass then sorts its pairs in their heap buffer, encodes them into slices
+under the leaf body ceiling and closes every slice before the next pass
+starts: the first slice starts where the field's last slice ended, the last
+ends at the pass's end, and no pair outlives its pass. Each later pass
+reads the sections it needs again, decodes the carried leaves its range
+overlaps, and keeps the next range; the slices tile the key space with no
+gap and no overlap, and every pass end is a slice end
+(`build_part_key_index`; test
+`pair_budget_builds_in_passes_and_closes_a_slice_at_each_pass_end`: 12
+pairs under a budget of 5 build in passes of 5, 5 and 2, which a 40-byte
+ceiling cuts into 5 slices where one pass writes 4).
+
+The leaves therefore depend on the budget. At a given budget they are the
+same whether the pairs were carried or read, and the same after a restart:
+they equal the leaves the one-call build over the final read set writes at
+that budget (test
+`the_leaves_are_the_same_carried_from_scratch_and_after_a_restart`, at
+budgets 1, 2, 3, 5, 6, 7, 15 and `u64::MAX`). They equal a one-pass build only
+when every field's pairs fit its share; the `--rebuild-key-index` repair
+builds in one pass, so its leaves match a fold's byte for byte only then.
+Lookups do not depend on where the slices fall: the router reads the leaf
+whose `[key8_lo, key8_hi]` holds the key8, and ADR-2707's slice rule needs
+only that the slices tile the key space.
 
 The pass rule, for a part with one key-index field: the passes are the
 greedy partition of the field's key8 runs, in ascending order, into groups
@@ -1282,50 +1304,63 @@ of at most `budget` pairs, a run over `budget` a group of its own. That is
 entries; 17 pairs over 11 runs, two of them shared by four entries each,
 take 4 passes at budget 6 where `ceil(17 / 6)` is 3, and every budget from
 1 to 20 matches the greedy count (test
-`the_pass_count_is_the_greedy_key8_partition`). With several fields the
-part takes as many passes as its slowest field under the shares, which
-grow as fields finish. A field that a pass finds a new uncovered entry for
-after its pairs already reached a slice (a key8 over the body ceiling in a
-later range, or a section read that failed in a later pass) keeps passing
-to the end of the key space, collecting every uncovered entry the passes
-find, and is then rebuilt once from the first range with the complete
-list, so a rebuild adds that field's greedy count once more, at most twice
-the count in all (8 passes for the same 17 pairs under a 40-byte ceiling);
-a further finding in the rebuild, which only a section read failing then
-for the first time can cause, leaves the field with no leaf. When each
-entry's section reads the same in every pass, the leaves are the same at
-every budget (test `a_restart_sees_every_uncovered_entry_at_every_budget`:
-two over-ceiling key8s in different ranges, the from-scratch build's one
-leaf and five uncovered entries at every budget from 1 to 20 and
-`u64::MAX`). One case still differs: a section read that fails in some
-passes and not others. Its entry is uncovered for the part where a one-pass
-build whose one read succeeded covers it, and a failure that first appears
-in a rebuild leaves the field with no leaf. Either way the stored leaves
-stay exact, only less complete, and a tail entry is read again by the
-next advancing fold. Carried
-pairs count against the budget like read ones
+`the_pass_count_is_the_greedy_key8_partition`). With several fields each
+field's passes are the greedy partition under its share, and the part
+takes as many passes as its slowest field (test
+`a_two_field_build_takes_as_many_passes_as_its_slowest_field`: two fields
+of 16 and 8 pairs under a budget of 4, shares of 2, take 8 passes). A
+field that a pass finds a new uncovered entry for after an earlier pass
+ended holding pairs (a key8 over the body ceiling in a later range, or a
+section read that failed in a later pass) keeps passing to the end of the
+key space, collecting every uncovered entry the passes find, and is then
+rebuilt once from the first range with the complete list, so a rebuild
+adds that field's greedy count once more, at most twice the count in all
+(8 passes for the same 17 pairs under a 40-byte ceiling); a further
+finding in the rebuild, which only a section read failing then for the
+first time can cause, leaves the field with no leaf. When each entry's
+section reads the same in every pass, every leaf lists the same uncovered
+entries at every budget (test
+`a_restart_sees_every_uncovered_entry_at_every_budget`: two over-ceiling
+key8s in different ranges, five uncovered entries on every leaf at every
+budget from 1 to 20 and `u64::MAX`). One case still differs: a section
+read that fails in some passes and not others. Its entry is uncovered for
+the part where a one-pass build whose one read succeeded covers it, and a
+failure that first appears in a rebuild leaves the field with no leaf.
+Either way the stored leaves stay exact, only less complete, and a tail
+entry is read again by the next advancing fold. Carried pairs count
+against the budget like read ones
 (`carried_pairs_count_against_the_pair_budget`: 9 carried and 6 read pairs
-take 3 passes of 5).
+take 3 passes of 5 and write 3 leaves, with the previous leaf fetched
+once).
 
-What one pass holds costs at most 80 B per pair plus its block list: one
-40-byte `KeyIndexLeafEntry` in the field's heap buffer, which grows to at
-most twice the most pairs it held, and a block list allocated at exactly
-its length, 4 B a block requested, which jemalloc (the binaries'
-allocator) rounds up to its 8 B smallest class for one or two blocks; a
-one-block pair costs at most 88 B, so the default budget holds at most
-about 704 MB (the pass log `pass_ranges` asserts the buffer and block-list
-terms on every pass of the tests above, and
-`a_held_pair_is_forty_bytes_in_the_heap_buffer` the struct). At any
-moment a pass holds at most its share plus the one pair placed before its
-cut, or one key8's pairs plus one when that key8 exceeds the share. The
-budget does not bound: the previous tail's leaf bytes as stored, kept for
-the whole build; one decoded frame of one previous leaf at a time (a frame
-is one bucket, near `4 x 2^bucket_bits` bytes for keys whose key8 spreads
-evenly, trace ids, strings and bytes, and up to the whole leaf body for
-I64 keys that share their high bits); the KEY_IDX sections in flight, up
-to `fold_bucket_concurrency`; the encoded leaves of one pass until their
-PUTs; and per-entry bookkeeping. ADR-3692's amendment to decision 5
-lists these.
+The bound: on every pass, for each field, the pairs the heap holds at its
+peak plus the pairs of any slice left open across the pass end are at most
+`max(share, R) + 1`, `R` the field's largest key8 run, the `+ 1` the pair
+placed before a cut; the open slice is always 0, since every pass closes
+its slices. Summed over the `F` fields, a pass holds at most
+`F x (max(share, R_max) + 1)` pairs, which is at most `budget + F` when no
+key8 run exceeds a share. Test
+`every_pass_holds_at_most_its_share_open_slice_included` pins the per-field
+bound on every pass of three fixtures at budgets 1, 2, 3, 5, 6 and
+`u64::MAX`.
+
+A held pair costs, as an upper-bound estimate, 88 B for one block: one
+40-byte `KeyIndexLeafEntry` (test
+`a_held_pair_is_forty_bytes_in_the_heap_buffer`), counted twice because
+the field's heap buffer grows to at most twice the most pairs it held, and
+a block list allocated at exactly its length, 4 B a block requested (the
+pass log `pass_ranges` asserts both on every pass of the tests above). The
+8 B a one- or two-block list costs is jemalloc's smallest size class, the
+binaries' allocator, and no test pins it. The sort reuses the heap buffer
+and copies no pair (test `a_pass_sorts_its_pairs_in_the_heap_buffer`). The
+budget does not bound: the previous tail's leaf bytes as stored, read once
+per fold and kept for the whole build; one decoded frame of one previous
+leaf at a time (a frame is one bucket, near `4 x 2^bucket_bits` bytes for
+keys whose key8 spreads evenly, trace ids, strings and bytes, and up to the
+whole leaf body for I64 keys that share their high bits); the KEY_IDX
+sections in flight, up to `fold_bucket_concurrency`; the encoded leaves of
+one pass until their PUTs; and per-entry bookkeeping. ADR-3692's
+amendments to decision 5 list these.
 The server sets the budget with `--fold-key-index-build-max-pairs` and
 `ravel-cli catalog fold` with `--key-index-build-max-pairs`, each refused
 without the leaf build flag and at 0; the `--rebuild-key-index` repair
@@ -1343,7 +1378,7 @@ summed over every fold that returned a report, a no-op included
   is not read. It is 2 for the two late entries of
   `advancing_fold_reads_sections_for_new_entries_only` and 9 for three
   entries over three passes in
-  `pair_budget_builds_in_passes_with_identical_leaves`.
+  `pair_budget_builds_in_passes_and_closes_a_slice_at_each_pass_end`.
 - `key_index_entries_carried` (`ravel_catalog_fold_key_index_entries_carried_total`):
   entries whose pairs came from the previous tail's leaves instead of a
   section read. It is 3 in `advancing_fold_reads_sections_for_new_entries_only`
@@ -1352,7 +1387,8 @@ summed over every fold that returned a report, a no-op included
 - `key_index_build_passes` (`ravel_catalog_fold_key_index_build_passes_total`):
   build passes summed over the re-encoded parts, by the pass rule above,
   a rebuild's passes included. It is 3 under a budget of 5 and 1 under
-  `u64::MAX` in `pair_budget_builds_in_passes_with_identical_leaves`.
+  `u64::MAX` in
+  `pair_budget_builds_in_passes_and_closes_a_slice_at_each_pass_end`.
 - `key_index_leaf_gets` (`ravel_catalog_fold_key_index_leaf_gets_total`):
   whole-object GETs of the previous tail's leaves, one per (field, slice),
   also counted in `get_requests`; a pass decodes them again from the bytes
@@ -1367,7 +1403,7 @@ prints each (tests
 `the_pair_budget_reaches_the_fold_and_the_report_prints_the_build_figures`
 and `an_advancing_fold_reports_four_different_build_figures`, the second
 an advancing fold reading 4 sections, carrying 3 entries, in 2 passes with
-1 leaf GET; both in `services/ravel-cli/tests/catalog_fold_key_index_leaves.rs`).
+1 leaf GET, writing 2 leaves; both in `services/ravel-cli/tests/catalog_fold_key_index_leaves.rs`).
 
 When a compaction or erasure rewrite record lands, the fold re-encodes the
 part and rebuilds its leaves from the new entry set. An erasure rewrite

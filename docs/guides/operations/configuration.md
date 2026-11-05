@@ -1973,20 +1973,24 @@ uncovered.
 `--fold-key-index-build-max-pairs N` (ravel-server) and
 `--key-index-build-max-pairs N` (`ravel-cli catalog fold`) bound the
 (entry, key8) pairs the build holds for one part at once, the pairs read
-and the pairs carried from the previous tail together, shared evenly by
-the fields still building. Each is refused without its leaf build flag
-(`--fold-key-index-leaves`, `--key-index-leaves`) and at 0. The default is
-8,000,000, which holds at most about 704 MB: a pair costs at most 88 B for
-one block. A part over the budget is built in passes over disjoint key8
-ranges, each pass reading the sections it needs again, so a smaller budget
-trades memory for section reads. One key8's pairs are never split, so a
-key8 over the budget is held whole, and a key8 shared by several entries
-counts once per entry: the passes are the greedy packing of the part's
-key8 runs into groups of at most the budget, more than
-`ceil(pairs / budget)` when keys repeat across entries. The leaves are the
-same at every budget when every section reads the same in every pass
-(test `a_restart_sees_every_uncovered_entry_at_every_budget`); a section
-read that fails in some passes only leaves its entry uncovered. The budget
+and the pairs carried from the previous tail together. Every field the
+build indexes gets a fixed share, `max(1, N / fields)`. Each flag is
+refused without its leaf build flag (`--fold-key-index-leaves`,
+`--key-index-leaves`) and at 0; the default is 8,000,000. A part over the
+budget is built in passes over disjoint key8 ranges, each pass reading the
+sections it needs again and closing its leaf slices before the next, so a
+smaller budget trades memory for section reads and leaves. One key8's
+pairs are never split, so a key8 over the share is held whole, and a key8
+shared by several entries counts once per entry: a field's passes are the
+greedy packing of its key8 runs into groups of at most its share, more
+than `ceil(pairs / share)` when keys repeat across entries, and the part
+takes as many passes as its slowest field. A pass holds at most
+`max(share, largest key8 run) + 1` pairs per field (catalog test
+`every_pass_holds_at_most_its_share_open_slice_included`); about 88 B a
+one-block pair is an upper-bound estimate, not a measured figure. The
+leaves depend on the budget: they equal a build from scratch at the same
+budget, and lookups read them the same at any budget. A section read that
+fails in some passes only leaves its entry uncovered. The budget
 does not cover the previous tail's stored leaf bytes, the one frame of a
 previous leaf being decoded, the sections in flight or one pass's encoded
 leaves; the
