@@ -25,9 +25,25 @@ use crate::{Catalog, CatalogError};
 /// First 4 bytes of every key-index leaf.
 pub const KEY_INDEX_LEAF_MAGIC: [u8; 4] = *b"RKI1";
 
-/// The header `format_version` this module writes and reads. Any other
-/// value rejects the leaf, and the part reads as uncovered.
-pub const KEY_INDEX_LEAF_FORMAT_VERSION: u32 = 1;
+/// The header `format_version` this module writes, for every signal, and
+/// reads for every signal (ADR-3692 amendment "Leaf format version 2").
+pub const KEY_INDEX_LEAF_FORMAT_VERSION: u32 = 2;
+
+/// The header `format_version` written before
+/// [`KEY_INDEX_LEAF_FORMAT_VERSION`]. A logs leaf at this version was built
+/// from version-1 RLOG KEY_IDX sections without marking them uncovered, so
+/// it can miss a key, and the reader rejects it; a spans leaf at this
+/// version is still accepted. See [`key_index_leaf_version_accepted`].
+pub const KEY_INDEX_LEAF_FORMAT_VERSION_1: u32 = 1;
+
+/// Whether a leaf of `signal` at header `format_version` may answer a
+/// lookup or be carried into a new leaf: [`KEY_INDEX_LEAF_FORMAT_VERSION`]
+/// for every signal, [`KEY_INDEX_LEAF_FORMAT_VERSION_1`] for every signal
+/// except logs. A refused leaf leaves its part uncovered for the field.
+pub fn key_index_leaf_version_accepted(signal: Signal, format_version: u32) -> bool {
+    format_version == KEY_INDEX_LEAF_FORMAT_VERSION
+        || (format_version == KEY_INDEX_LEAF_FORMAT_VERSION_1 && signal != Signal::Logs)
+}
 
 /// Smallest `bucket_bits` either side accepts.
 pub const KEY_INDEX_LEAF_MIN_BUCKET_BITS: u8 = 1;
@@ -632,6 +648,12 @@ pub fn key_index_leaf_prefix_range(
     Ok(0..prefix_len)
 }
 
+/// The header `format_version` of a leaf from its first bytes (GET 1's
+/// range is enough), after the magic and header crc check and nothing else.
+pub fn key_index_leaf_format_version(bytes: &[u8]) -> Result<u32, KeyIndexLeafRejection> {
+    Ok(decode_envelope(bytes)?.header.format_version)
+}
+
 fn le_u32(bytes: &[u8], at: usize) -> Result<u32, KeyIndexLeafRejection> {
     bytes
         .get(at..at + 4)
@@ -710,7 +732,9 @@ fn validate_prefix(
         header_len,
         prefix_len,
     } = envelope;
-    if header.format_version != KEY_INDEX_LEAF_FORMAT_VERSION {
+    if header.format_version != KEY_INDEX_LEAF_FORMAT_VERSION
+        && header.format_version != KEY_INDEX_LEAF_FORMAT_VERSION_1
+    {
         return Err(KeyIndexLeafRejection::UnsupportedVersion(
             header.format_version,
         ));
@@ -809,7 +833,8 @@ fn check_ref_copy<T: PartialEq + std::fmt::Debug>(
 impl KeyIndexLeafPrefix {
     /// Verifies GET 1's bytes against the ref and the request, in the order
     /// the reader procedure gives: magic and header crc; then the tenant
-    /// and signal binding ([`KeyIndexLeafError::Breach`]); then version,
+    /// and signal binding ([`KeyIndexLeafError::Breach`]); then version
+    /// ([`key_index_leaf_version_accepted`] for the request's signal),
     /// `bucket_bits`, the `prefix_len` arithmetic, the directory crc and
     /// ends; then every ref copy, the part binding, and the request's
     /// field, key type and `part_entry_count`.
@@ -820,6 +845,8 @@ impl KeyIndexLeafPrefix {
     ) -> Result<Self, KeyIndexLeafError> {
         let envelope = decode_envelope(bytes)?;
         let header = &envelope.header;
+        let version_accepted =
+            key_index_leaf_version_accepted(request.signal, header.format_version);
         if header.tenant_hash.as_slice() != request.tenant_hash.0.as_slice() {
             return Err(KeyIndexLeafError::Breach(KeyIndexLeafBreach {
                 field: "tenant_hash",
@@ -834,6 +861,9 @@ impl KeyIndexLeafPrefix {
                 expected: signal.to_string(),
                 actual: header.signal.to_string(),
             }));
+        }
+        if !version_accepted {
+            return Err(KeyIndexLeafRejection::UnsupportedVersion(header.format_version).into());
         }
         let prefix = validate_prefix(envelope, bytes)?;
         let header = &prefix.header;
@@ -1725,6 +1755,56 @@ pub fn verify_key_index_leaf_frames(
         entries: Vec::new(),
         header: prefix.header,
     })
+}
+
+/// Rewrites a verified leaf's header `format_version` to `format_version`,
+/// recomputing the header crc, the length fields and the ref; the directory
+/// and frames are kept byte for byte. It is for tests that need a leaf as an
+/// earlier writer left it: nothing in the fold or the rebuild calls it.
+pub fn restamp_key_index_leaf_version(
+    bytes: &[u8],
+    format_version: u32,
+) -> Result<EncodedKeyIndexLeaf, KeyIndexLeafRejection> {
+    let summary = verify_key_index_leaf(bytes, &KeyIndexLeafLimits::default())?;
+    let rest = &bytes[12 + header_len_of(bytes)? + 4..];
+    let mut header = summary.header;
+    header.format_version = format_version;
+    let header_bytes = header.encode_to_vec();
+    let header_len = u32::try_from(header_bytes.len())
+        .map_err(|_| corrupted("restamped header length does not fit u32"))?;
+    let dir_and_crc = &rest[..rest.len() - header.body_len as usize];
+    let prefix_len = u32::try_from(12 + header_bytes.len() + 4 + dir_and_crc.len())
+        .map_err(|_| corrupted("restamped prefix length does not fit u32"))?;
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(&KEY_INDEX_LEAF_MAGIC);
+    out.extend_from_slice(&header_len.to_le_bytes());
+    out.extend_from_slice(&prefix_len.to_le_bytes());
+    out.extend_from_slice(&header_bytes);
+    let header_crc = crc32c::crc32c(&out);
+    out.extend_from_slice(&header_crc.to_le_bytes());
+    out.extend_from_slice(rest);
+    let leaf_ref = SnapshotKeyIndexLeafRef {
+        key: String::new(),
+        blake3: blake3::hash(&out).as_bytes().to_vec(),
+        size: out.len() as u64,
+        field: header.field.clone(),
+        key_type: header.key_type,
+        key8_lo: header.key8_lo,
+        key8_hi: header.key8_hi,
+        prefix_len,
+        bucket_bits: header.bucket_bits,
+        entry_count: header.entry_count,
+        uncovered_count: header.uncovered_entry_ordinals.len() as u64,
+        part_blake3: header.part_blake3.clone(),
+    };
+    Ok(EncodedKeyIndexLeaf {
+        bytes: out,
+        leaf_ref,
+    })
+}
+
+fn header_len_of(bytes: &[u8]) -> Result<usize, KeyIndexLeafRejection> {
+    Ok(le_u32(bytes, 4)? as usize)
 }
 
 /// Checks verified leaves that claim one (part, field) against each other:

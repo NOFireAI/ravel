@@ -299,7 +299,7 @@ message SnapshotKeyIndexLeafRef {
 // header crc32c. Layout and validation: docs/catalog-and-mvcc.md,
 // "Per-part key-index leaves".
 message KeyIndexLeafHeader {
-  uint32 format_version = 1;  // 1
+  uint32 format_version = 1;  // 2 (logs readers reject 1, spans accept 1 and 2)
   bytes tenant_hash = 2;      // 16
   uint32 signal = 3;
   bytes part_blake3 = 4;      // 32, binds the leaf to one exact part

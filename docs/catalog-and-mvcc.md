@@ -973,7 +973,7 @@ slice of the pair) and `part_blake3` (32, the one covered part).
                                    cannot change header_len; the ref's copy
                                    sizes GET 1, this one is authoritative)
   header      KeyIndexLeafHeader protobuf (ravel.catalog.v1): format_version
-              (1), tenant_hash (16), signal, part_blake3 (32), field,
+              (2; 1 before the leaf format version 2 amendment), tenant_hash (16), signal, part_blake3 (32), field,
               key_type, key8_lo, key8_hi, bucket_bits,
               entry_count (index entries in this leaf's body),
               part_entry_count (the covered part's SnapshotEntry count;
@@ -1019,7 +1019,15 @@ a degraded one),
 counted in `ravel_catalog_isolation_breach_total`, with no fallback: the
 lookup fails. A leaf whose header `part_blake3` differs from the part's hash
 in the HEAD it resolved, or whose `format_version` it does not support, is
-rejected and the reader treats the part as uncovered for that field. `uncovered_entry_ordinals` lists the entries the fold could not
+rejected and the reader treats the part as uncovered for that field. The
+writer writes version 2 (`KEY_INDEX_LEAF_FORMAT_VERSION`); the reader
+accepts 2 for every signal and 1 for every signal except logs
+(`key_index_leaf_version_accepted`,
+`crates/ravel-catalog/src/snapshot_format/kidx.rs`). A logs leaf at
+version 1 was built before the leaf build listed a version 1 RLOG KEY_IDX
+section as uncovered, so it can prove absent a key such an entry holds; a
+spans leaf at version 1 has no such gap, since RSPAN keys the fixed
+`trace_id` column (ADR-3692, the leaf format version 2 amendment). `uncovered_entry_ordinals` lists the entries the fold could not
 index for this field: a segment with no KEY_IDX section, a section whose
 header does not name the field (declared after the flush opened, or
 de-declared), a failed or refused GET, a corrupt section. An uncovered entry
@@ -1252,6 +1260,8 @@ fold, not once; the leaves are byte-identical to a build that read every
 section (test `advancing_fold_reads_sections_for_new_entries_only`: three
 carried entries, two late ones read, and the leaf equal to a from-scratch
 build). The carry is refused, and every entry's section read, when a
+previous leaf is a logs leaf at format version 1, which the reader rejects
+(`an_advancing_fold_does_not_carry_a_logs_version_one_leaf`), when a
 previous leaf cannot be read or does not verify
 (`a_failed_previous_leaf_get_falls_back_to_section_reads`,
 `a_corrupt_previous_leaf_falls_back_to_section_reads`), when a declared
@@ -1520,17 +1530,30 @@ it was in publishes nothing. A rebuilt
 ref is carried forward by every later fold that carries the part by
 reference, and a fold that re-encodes the part while
 `build_key_index_leaves` is off drops it, so the rebuild must be rerun
-after such a re-encode. A logs leaf written before the leaf build listed a
-version 1 RLOG KEY_IDX section as uncovered (see "Per-part key-index
-leaves") can prove absent a key such an entry holds. The rebuild does not
-repair it: it reads only parts lacking a ref for the field, so a part that
-already holds the stale leaf costs no GET and keeps it. Only a re-encode of
-the part by a fold with `build_key_index_leaves` on replaces it, and a
-sealed part is never re-encoded. ADR-3692 decision 4 says such a deployment
-repairs with `--rebuild-key-index`; with the rebuild as it is, that holds
-only for parts whose refs a fold with the switch off has already dropped.
-The leaf switch is off by default, so a deployment that kept the default
-holds no such leaf. Like the plain CLI fold it holds no claim and
+after such a re-encode. A logs leaf at format version 1 (see "Per-part
+key-index leaves") can prove absent a key its part holds, and the reader
+rejects it, so the rebuild also replaces it. Before any batch, on logs only,
+it reads each ref of a requested field with one ranged GET of the leaf's
+`[0, prefix_len)` to learn its `format_version` (`leaf_prefix_gets` and
+`leaf_prefix_bytes_read` in the report, counted when issued). That cost is
+paid on every run, by a tenant with no version 1 leaf too: one GET per
+held logs ref of each requested field. A part holding a version 1 ref for a
+field is counted under `parts_unindexed` and `parts_with_refused_leaves`, its
+sections are read, and the field's leaves are built again; the publish
+removes every ref of that field from the part and attaches the new ones. A
+version 2 leaf is written at a key derived from its own bytes, so it never
+lands on the version 1 leaf's key. The old leaf is neither overwritten nor
+deleted by the rebuild: once HEAD no longer names it, the catalog sweep
+deletes it past the protection horizon like any unreferenced leaf
+(`deleted_kidx`). A prefix GET that fails with a store error defers the
+part, which keeps its refs this run; a prefix that does not decode leaves
+the ref alone, since the reader already reads it uncovered
+(`a_logs_version_one_ref_is_replaced_and_its_leaf_is_kept`). A spans ref is
+never read: spans accept version 1. The leaf build switch does not limit
+any of this: the rebuild writes leaves whether or not
+`build_key_index_leaves` is on, so a deployment that kept the switch off
+but ran the rebuild before this version holds version 1 logs leaves, and a
+rebuild run under this version replaces them. Like the plain CLI fold it holds no claim and
 keeps no cursor (HEAD is the cursor). It accepts `--writers-stopped` as
 the same assertion the plain fold takes, but seals no hour and reads no
 commit record, so the flag changes nothing it does. Detection: the sweep's
