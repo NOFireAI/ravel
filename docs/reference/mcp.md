@@ -240,12 +240,19 @@ figure null on either side is null in the sum, a key only one side reports
 keeps that side's value, and the `unbounded` lists are merged. The leg's estimate is not an upper envelope, so a call with
 `include_logs: true` reports `estimate_is_upper_envelope: false`.
 
-Bounds. The leg runs under what is left of the call's one deadline. When
-nothing is left after the span lookup, it does not start: `status` is
-`skipped` and `skipped_reason` says so. A leg that fails (a budget, the
-deadline, an engine error) is `failed` with its failure class, and the
-spans are returned as they would be without it; the call's `status` and
-`failure` describe the spans only. `max_rows` applies to spans and to log
+Bounds. The call's scan budgets are shared across the call like its
+deadline: the leg runs under what is left of the one deadline and of each
+of `max_bytes_scanned`, `max_store_requests` and `max_segments`, that is
+the effective budget less the span lookup's `budget.actual` figure for it
+(`bytes_scanned`, `store_requests`, `segments_read`). When nothing is left
+of the deadline or of any one of those budgets after the span lookup, the
+leg does not start: `status` is `skipped` and `skipped_reason` names what
+ran out. A leg that fails (a budget, the deadline, an engine error) is
+`failed` with its failure class, and the spans are returned as they would
+be without it; the call's `status` and `failure` describe the spans only.
+A failure message over 512 serialized bytes is cut there, ends with the
+`...[truncated]` marker, and is counted in
+`presentation.scalars_truncated`. `max_rows` applies to spans and to log
 records separately. `max_response_bytes` is shared, spans first: the
 records that fit beside the spans are kept, in order, and the rest are
 counted in `logs.rows_omitted`; the limit holds for the final envelope.
