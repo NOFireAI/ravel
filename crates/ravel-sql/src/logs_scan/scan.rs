@@ -21,6 +21,9 @@ pub(super) struct PartitionCtx {
     /// whole-segment fast path the verdict comes from
     /// [`fast_path_verdict_future`], awaited in the same `Planning` state.
     pub(super) serve_deferred: std::sync::atomic::AtomicBool,
+    /// The tier-2 router's inputs and the statement's memory pool its leaf
+    /// decode reservations draw from; `None` leaves every segment to tier 1.
+    pub(super) key_index_route: Option<(Arc<LogsKeyIndexRoute>, Arc<dyn MemoryPool>)>,
 }
 
 impl PartitionCtx {
@@ -1576,6 +1579,7 @@ impl LogScanStream {
                             this.blocks
                                 .blocks_pruned_by_key_index
                                 .add(counts.key_index.blocks_pruned as usize);
+                            this.blocks.record_key_index_figures(counts.route_figures);
                         }
                         this.queue = this.round.as_ref().map(|round| {
                             round.queue(|| {

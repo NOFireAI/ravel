@@ -4895,7 +4895,11 @@ impl LogSegmentFetcher {
                     StoreError::Transient("GetLimiter semaphore closed unexpectedly".to_string())
                 })?;
                 accounting.record_s3_request(AccountedOp::Get);
-                let got = self.store.get(key, range).in_get_phase(phase.into()).await?;
+                let got = self
+                    .store
+                    .get(key, range)
+                    .in_get_phase(phase.into())
+                    .await?;
                 accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
                 self.wire_bytes.record(phase, got.data.len() as u64);
                 if got.data.len() as u64 != len {
