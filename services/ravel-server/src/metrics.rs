@@ -3639,7 +3639,8 @@ fn render_declared_stats_family(
 }
 
 /// The fold's key-index leaf build figures (ADR-3692 decisions 5 and 7),
-/// summed over every fold that committed its HEAD in this process. `None`
+/// summed over every fold in this process that returned a report, a no-op
+/// included. `None`
 /// under the same `can_fold` gate as the stamp-coverage families, for the
 /// same reason: absent where no fold can run, never pinned at zero.
 const FOLD_KEY_INDEX_FAMILIES: [(&str, &str); 4] = [
@@ -3653,7 +3654,7 @@ const FOLD_KEY_INDEX_FAMILIES: [(&str, &str); 4] = [
     ),
     (
         "ravel_catalog_fold_key_index_build_passes_total",
-        "Passes of the fold's key-index leaf build over disjoint key8 ranges: one per re-encoded part whose pairs fit the pair budget, one per key8 range above it.",
+        "Passes of the fold's key-index leaf build over disjoint key8 ranges: one per re-encoded part whose pairs fit the pair budget, one per key8 range above it, and the ranges of a field rebuilt after a pass found a new uncovered entry.",
     ),
     (
         "ravel_catalog_fold_key_index_leaf_gets_total",

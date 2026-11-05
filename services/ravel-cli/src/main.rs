@@ -2608,23 +2608,27 @@ enum CatalogCommand {
         #[arg(long)]
         writers_stopped: bool,
         /// Build per-part key-index leaves (ADR-2707 decision 4) in this
-        /// fold. Off by default pending measurement, and no query reads the
-        /// leaves yet. When on, every part the fold re-encodes has each new
+        /// fold. Off by default pending measurement (ADR-3692 decision 5);
+        /// the spans `trace_id` lookup reads the leaves where they exist
+        /// (tier 2). When on, every part the fold re-encodes has each new
         /// entry's KEY_IDX section read by ranged GET, up to three GETs per
         /// entry; the tail part, re-encoded on every fold that advances the
         /// watermark, carries the entries its previous leaves cover by one
-        /// GET per leaf instead. Applies to `--signal spans` and to a logs tenant that
+        /// GET per leaf instead, and reads again each entry those leaves left
+        /// uncovered. Applies to `--signal spans` and to a logs tenant that
         /// declares a key-index column or turns on trace-id indexing; other
         /// signals ignore it.
         #[arg(long)]
         key_index_leaves: bool,
-        /// With `--key-index-leaves`, the most (entry, key8) pairs the leaf
-        /// build holds for one part at a time, across its fields (ADR-3692
-        /// decision 5). A part over it is built in about ceil(pairs / budget)
-        /// passes over
-        /// disjoint key8 ranges, each re-reading the sections it needs, with
-        /// leaves identical to a one-pass build. The default of 8,000,000 is
-        /// about 550 MB at 68 B a pair. At least 1.
+        /// With `--key-index-leaves`, the most (entry, key8) pairs, read and
+        /// carried from the previous tail's leaves, the leaf build holds for
+        /// one part at a time, shared evenly by the fields still building
+        /// (ADR-3692 decision 5). A part over it is built in passes over
+        /// disjoint key8 ranges, each pass holding the whole key8s that fit
+        /// and re-reading the sections it needs, with leaves identical to a
+        /// one-pass build; one key8 is never split, so one over the budget is
+        /// held whole. The default of 8,000,000 holds at most about 704 MB at
+        /// 88 B a one-block pair. At least 1.
         #[arg(long, value_name = "N", requires = "key_index_leaves",
               default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_BUILD_MAX_PAIRS,
               value_parser = clap::value_parser!(u64).range(1..))]

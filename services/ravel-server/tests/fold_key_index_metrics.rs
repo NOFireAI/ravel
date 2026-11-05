@@ -32,10 +32,21 @@ const TOKEN: &str = "operator-token";
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const USER_ID: &str = "user_id";
 
-/// Sealed well past the default `max_flush_lifetime (1h) +
-/// clock_skew_allowance (5m) + fold_safety_margin (15m)`, so the one fold this
-/// test triggers finds the seeded hour eligible.
-const SEALED_AGE_HOURS: i64 = 3;
+/// The first fold runs this long before now, directly through the catalog,
+/// and seals every hour ending at least the default `max_flush_lifetime (1h)
+/// + clock_skew_allowance (5m) + fold_safety_margin (15m)` before it.
+const FIRST_FOLD_AGE_HOURS: i64 = 2;
+/// The first batch's age: its hour ends at least 5 h before now, so the first
+/// fold seals it.
+const FIRST_BATCH_AGE_HOURS: i64 = 6;
+/// The second batch's age: its hour starts after every hour the first fold
+/// sealed and ends at least 2 h before now, so only the second fold, through
+/// the on-demand route, folds it, re-encoding the first fold's tail part.
+const SECOND_BATCH_AGE_HOURS: i64 = 3;
+
+fn hour_aged(now: i64, age_hours: i64) -> u32 {
+    u32::try_from((now - age_hours * NS_PER_HOUR) / NS_PER_HOUR).expect("hour fits u32")
+}
 
 fn now_ns() -> i64 {
     SystemTime::now()
@@ -212,11 +223,16 @@ fn leaf_building_config(
     }
 }
 
-/// Three commits with a KEY_IDX section each, folded once by the on-demand
-/// route with the leaf build on: a first fold has no previous tail, so it
-/// reads all three sections in one pass, carries nothing and GETs no leaf.
-/// `/metrics` must render each of the four families exactly once with its
-/// HELP and counter TYPE and those values.
+/// Three commits with a KEY_IDX section each, folded with the leaf build on
+/// two hours ago directly through the catalog: a first fold has no previous
+/// tail, so it reads all three sections in one pass, carries nothing and GETs
+/// no leaf. Two later commits are then folded by the on-demand route, which
+/// re-encodes that tail: it GETs the previous tail's one leaf, carries its
+/// three entries and reads the two new sections in one pass. The totals are
+/// process-wide, so `/metrics` must render each of the four families exactly
+/// once with its HELP and counter TYPE and the two folds' sums: 3 + 2 = 5
+/// sections, 0 + 3 = 3 entries carried, 1 + 1 = 2 passes and 0 + 1 = 1 leaf
+/// GET, four different values so a family rendering another's value fails.
 #[tokio::test]
 async fn a_leaf_building_fold_renders_the_key_index_build_families() {
     let tenant = TenantId::new("acme");
@@ -226,10 +242,40 @@ async fn a_leaf_building_fold_renders_the_key_index_build_families() {
     let store = Arc::new(MemoryStore::new());
 
     declare_user_id_key_index(store.as_ref(), &tenant).await;
-    let sealed_hour = u32::try_from((now_ns() - SEALED_AGE_HOURS * NS_PER_HOUR) / NS_PER_HOUR)
-        .expect("hour fits u32");
+    let now = now_ns();
+    let first_hour = hour_aged(now, FIRST_BATCH_AGE_HOURS);
     for (seq, user_ids) in [(0u64, [1i64, 2]), (1, [2, 3]), (2, [3, 4])] {
-        seed_sealed_log_commit(store.as_ref(), &tenant, sealed_hour, seq, &user_ids).await;
+        seed_sealed_log_commit(store.as_ref(), &tenant, first_hour, seq, &user_ids).await;
+    }
+    let catalog = ravel_catalog::Catalog::new(
+        store.clone(),
+        ravel_catalog::CatalogConfig {
+            shard_count: 1,
+            build_key_index_leaves: true,
+            ..ravel_catalog::CatalogConfig::default()
+        },
+    )
+    .expect("catalog");
+    let first = catalog
+        .fold(
+            &tenant.hash(),
+            Signal::Logs,
+            Uuid::from_u128(7),
+            now - FIRST_FOLD_AGE_HOURS * NS_PER_HOUR,
+            &[],
+            None,
+        )
+        .await
+        .expect("first fold");
+    assert_eq!(first.entry_count, 3, "{first:?}");
+    assert_eq!(first.key_index_leaves_written, 1, "{first:?}");
+    let second_hour = hour_aged(now, SECOND_BATCH_AGE_HOURS);
+    assert!(
+        first.watermark_hour.is_some_and(|w| w < second_hour),
+        "{first:?}"
+    );
+    for (seq, user_ids) in [(3u64, [5i64, 6]), (4, [6, 7])] {
+        seed_sealed_log_commit(store.as_ref(), &tenant, second_hour, seq, &user_ids).await;
     }
 
     let running = ravel_server::start(
@@ -255,7 +301,7 @@ async fn a_leaf_building_fold_renders_the_key_index_build_families() {
         .await
         .expect("fold response is JSON");
     assert_eq!(fold["status"], "published", "{fold}");
-    assert_eq!(fold["entry_count"], 3, "{fold}");
+    assert_eq!(fold["entry_count"], 5, "{fold}");
 
     let body = client
         .get(format!("{base}/metrics"))
@@ -270,22 +316,22 @@ async fn a_leaf_building_fold_renders_the_key_index_build_families() {
         (
             "ravel_catalog_fold_key_index_sections_read_total",
             "KEY_IDX sections the fold's key-index leaf build read, one per entry per build pass. An entry carried from the previous tail's leaf reads none.",
-            3,
+            5,
         ),
         (
             "ravel_catalog_fold_key_index_entries_carried_total",
             "Entries whose key-index pairs the fold carried from the previous tail's leaves, matched by data object key, instead of reading their sections.",
-            0,
+            3,
         ),
         (
             "ravel_catalog_fold_key_index_build_passes_total",
-            "Passes of the fold's key-index leaf build over disjoint key8 ranges: one per re-encoded part whose pairs fit the pair budget, one per key8 range above it.",
-            1,
+            "Passes of the fold's key-index leaf build over disjoint key8 ranges: one per re-encoded part whose pairs fit the pair budget, one per key8 range above it, and the ranges of a field rebuilt after a pass found a new uncovered entry.",
+            2,
         ),
         (
             "ravel_catalog_fold_key_index_leaf_gets_total",
             "GETs of the previous tail's key-index leaves the fold issued to carry their pairs forward, one per leaf.",
-            0,
+            1,
         ),
     ] {
         assert_eq!(
