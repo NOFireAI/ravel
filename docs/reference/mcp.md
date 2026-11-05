@@ -150,7 +150,7 @@ No arguments.
 | `trace_id` | string | yes | 32 hex characters, either case. |
 | `deadline_ms` | integer | no |  |
 | `evidence_ref` | string | no | Not served by this build: any value is refused as `unsupported`. |
-| `include_logs` | boolean | no | Not served by this build: `true` is refused as `unsupported`; for logs, use ravel_search_logs. |
+| `include_logs` | boolean | no | With `true`, the log records that carry trace_id in time_range (required) come back in `logs`. |
 | `max_bytes_scanned` | integer | no |  |
 | `max_response_bytes` | integer | no | Bounds the whole serialized envelope; default 512 KiB, floored at 256 KiB. |
 | `max_rows` | integer | no | Spans returned; default 200, ceiling 5,000. |
@@ -191,7 +191,7 @@ bounds and failure classes.
 | `ravel_query_sql` | The `SELECT` is read-only, its rows are filtered to `time_range`, and it is paged by a keyset cursor. See [Running a statement](#running-a-statement) | `data`, `scope` (`order_by` is the effective order, tiebreak included), `visibility`, `presentation`, `budget` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
 | `ravel_query_promql` | Exactly one mode: `time_range` with `step`, or `evaluation_time`. One row per series. See [Evaluating PromQL](#evaluating-promql) | `data` (`series`, `samples`), `scope` (the instant or range, the step alignment, the lookback), `coverage`, `accuracy`, `budget` | `max_rows` 200 series, ceiling 5,000; past it the result is `ok_bounded` with no cursor; a range of at most 11,000 steps; `max_response_bytes` 512 KiB default, 256 KiB floor, a series over it cut to a prefix of its samples | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
 | `ravel_search_logs` | Compiled to one SQL `SELECT` over `logs`. The shared attributes of a group are listed once per group. See [Searching logs](#searching-logs) | `data` (`__ravel_group`, `__ravel_group_attrs`, then the `logs` columns), `scope` (`predicates_applied`, `order_by`), `visibility`, `presentation`, `budget` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_get_trace` | Rows of the `spans` table, each with its depth in the span tree and whether its parent was returned. With `time_range`, only spans that start inside it are returned. See [Span tree](#span-tree) | `data` (`__ravel_depth`, `__ravel_parent`, then the `spans` columns), `scope`, `presentation`, `budget` | `max_rows` 200, ceiling 5,000; past it the result is cut, with status `ok_bounded`, `presentation.row_cap_hit` set and no cursor; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
+| `ravel_get_trace` | Rows of the `spans` table, each with its depth in the span tree and whether its parent was returned. With `time_range`, only spans that start inside it are returned. See [Span tree](#span-tree). With `include_logs`, the trace's log records too; see [Logs leg](#logs-leg) | `data` (`__ravel_depth`, `__ravel_parent`, then the `spans` columns), `scope`, `presentation`, `budget`, and with `include_logs` `logs` | `max_rows` 200, ceiling 5,000; past it the result is cut, with status `ok_bounded`, `presentation.row_cap_hit` set and no cursor; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
 | `ravel_analyze_timeseries` | One row per series, reported as a heuristic. `max_bytes_scanned`, `max_segments` and `max_store_requests` are refused with `unsupported`. See [Analyzing a series](#analyzing-a-series) | `data`, `scope` (the range, the step alignment, the lookback), `coverage`, `accuracy` (`exact: false`, naming the heuristic), `presentation`, `budget` | `max_rows` 200 series, ceiling 5,000; past it the result is `ok_bounded` with no cursor; at most 1,000 matched series; a range of at most 11,000 steps; `max_response_bytes` 512 KiB default, 256 KiB floor; every row reports the method's minimum point count | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
 
 `ravel_capabilities` and `ravel_describe_data` return metadata only. No tool
@@ -205,9 +205,53 @@ tool does with one.
 reads every folded part and the unsealed tail the tenant still retains, so its
 cost grows with retention. With it, the bounds are kept exactly. Unlike the
 HTTP route, where `start` and `end` only choose which objects are read, the
-tool also drops every span that starts outside `time_range`. `include_logs:
-true` is refused with `unsupported`; for a trace's logs, call
-`ravel_search_logs` with a `trace_id` and a `time_range`.
+tool also drops every span that starts outside `time_range`.
+`include_logs: true` adds the trace's log records; see [Logs leg](#logs-leg).
+
+#### Logs leg
+
+`include_logs` defaults to false. False or omitted, the envelope is exactly
+the one the call returns without the argument: no `logs` key, no added
+warning, no added store read. With `true`, `time_range` is required (its
+absence is refused as `missing_argument` before anything is read), and
+after the span lookup the tool runs `ravel_search_logs`'s own statement for
+that `trace_id` and window, `SELECT * FROM logs WHERE "trace_id" = X'...'`
+ordered by `ts` then `observed_ts`. Its records come back in a top-level
+`logs` block, in that order, with the columns `ravel_search_logs` returns
+(its `__ravel_group` and `__ravel_group_attrs` columns first).
+
+| `logs` field | Value |
+| --- | --- |
+| `status` | `ok`; `ok_bounded` when a cap cut the records; `skipped`; `failed` |
+| `failure` | on `failed`: `class` and `message`, the class one of the failure classes above (`budget_exceeded`, `deadline`, `unavailable`, ...) |
+| `skipped_reason` | on `skipped`: why the leg did not start |
+| `columns`, `rows`, `row_count` | the records returned, and how many the executor answered |
+| `row_cap_hit`, `bytes_cap_hit`, `rows_omitted` | whether `max_rows` or `max_response_bytes` cut the records, and how many were left out |
+| `budget` | the leg's own `actual` and `estimate`, with `estimate_is_upper_envelope` always false |
+| `span_lookup_budget` | the span lookup's own `actual`, `estimate` and `estimate_is_upper_envelope` |
+
+Cost. No trace index covers logs: the leg reads the logs in `time_range`
+and keeps the records carrying the trace id, so its cost follows the
+window's log volume, not the trace's size. A logs key index on `trace_id`,
+where the tenant declares one, can skip objects. A leg that started adds a
+warning saying so. The top-level `budget.actual` and `budget.estimate` are
+the whole call's: the span lookup's figures plus the leg's, per key. A
+figure null on either side is null in the sum, a key only one side reports
+keeps that side's value, and the `unbounded` lists are merged. The leg's estimate is not an upper envelope, so a call with
+`include_logs: true` reports `estimate_is_upper_envelope: false`.
+
+Bounds. The leg runs under what is left of the call's one deadline. When
+nothing is left after the span lookup, it does not start: `status` is
+`skipped` and `skipped_reason` says so. A leg that fails (a budget, the
+deadline, an engine error) is `failed` with its failure class, and the
+spans are returned as they would be without it; the call's `status` and
+`failure` describe the spans only. `max_rows` applies to spans and to log
+records separately. `max_response_bytes` is shared, spans first: the
+records that fit beside the spans are kept, in order, and the rest are
+counted in `logs.rows_omitted`; the limit holds for the final envelope.
+The leg mints no cursor. A leg cut by either cap adds a `ravel_search_logs`
+next step naming the `trace_id` and the window, the route that pages
+through the rest.
 
 #### Span tree
 
@@ -216,7 +260,7 @@ the tree over the rows returned; the row order stays `(start_ts, span_id)`.
 
 | Column | Value |
 | --- | --- |
-| `__ravel_parent` | `root`: the span has no parent id. `present`: a returned span has the parent's id. `missing`: no returned span has it, and the result is complete. `not_returned`: no returned span has it, and the result is not complete. `cycle`: following parents from this span leads back to it |
+| `__ravel_parent` | `root`: the span has no parent id, or one of zeros only. `present`: a returned span has the parent's id. `missing`: no returned span has it, and the result is complete. `not_returned`: no returned span has it, and the result is not complete. `cycle`: following parents from this span leads back to it |
 | `__ravel_depth` | how many returned ancestors the span has: 0 for a `root`, and 0 for a span whose parent is `missing` or `not_returned`. Null for a `cycle` span, and for a span whose ancestors lead into a cycle |
 
 A result is complete when `presentation.row_cap_hit` and
@@ -1155,7 +1199,8 @@ arguments.
 page ordered by `(start_ts, span_id)`, and a trace larger than the row cap
 comes back with status `ok_bounded` and `row_cap_hit` rather than paged.
 Raise `max_rows` (up to 5,000) or narrow `time_range` to read more of it;
-at the ceiling, only narrowing `time_range` reads more.
+at the ceiling, only narrowing `time_range` reads more. Its logs leg mints
+no cursor either; a cut leg points at `ravel_search_logs`, which pages.
 
 When no complete group fits in the row cap, the server returns the
 rows it has, up to the row cap, with status `ok_bounded` and no cursor.

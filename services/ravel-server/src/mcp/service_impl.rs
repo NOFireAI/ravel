@@ -769,6 +769,11 @@ impl QueryBackend for ServiceBackend {
         Ok(envelope)
     }
 
+    fn time_left(&self) -> Option<Duration> {
+        self.call_deadline
+            .map(|at| at.saturating_duration_since(tokio::time::Instant::now()))
+    }
+
     async fn sql_explain(
         &self,
         tenant_hash: TenantHash,

@@ -173,8 +173,8 @@ pub struct GetTraceInput {
     pub trace_id: String,
     /// Optional. Omitted, the lookup reads every span the tenant retains.
     pub time_range: Option<TimeRange>,
-    /// Not served by this build: `true` is refused as `unsupported`; for
-    /// logs, use ravel_search_logs.
+    /// With `true`, the log records that carry trace_id in time_range
+    /// (required) come back in `logs`.
     pub include_logs: Option<bool>,
     /// Spans returned; default 200, ceiling 5,000.
     pub max_rows: Option<u32>,
