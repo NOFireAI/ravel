@@ -109,8 +109,10 @@ pub struct QueryStats {
     /// metrics snapshot and the fetches of that snapshot's segments; this is
     /// set when the query also spent through the log lane (a selector naming a
     /// log metric, ADR-1103), through a federated remote that answered
-    /// (ADR-0071), or through distributed workers whose fetch then fell back to
-    /// a local re-fetch of the same segments.
+    /// (ADR-0071), through distributed workers whose fetch then fell back to
+    /// a local re-fetch of the same segments, or through a distributed slice
+    /// that answered after a retry or reroute and carries the abandoned
+    /// attempts' spend (issue #3789).
     pub estimate_excludes_spend: bool,
     /// True when the query's coverage is partial: at least one federated
     /// remote cluster was skipped because it was unavailable and its
@@ -2110,7 +2112,7 @@ impl QueryEngine {
                         // merge has already paid for every byte.
                         let mut histogram_fold =
                             HistogramFold::new(Arc::clone(&self.memory_budget), max_series);
-                        let (page_stats, pushdown_partials, fell_back) = self
+                        let (page_stats, pushdown_partials, excludes_spend) = self
                             .fetch_samples_and_histograms_maybe_distributed(
                                 tenant_hash,
                                 snapshot,
@@ -2129,7 +2131,7 @@ impl QueryEngine {
                             histograms,
                             page_stats,
                             pushdown_partials,
-                            fell_back,
+                            excludes_spend,
                         ))
                     }
                 })
@@ -2166,12 +2168,13 @@ impl QueryEngine {
             // partials; every other yields `None`. Collect the one that did.
             let mut collected_pushdown: Option<Vec<crate::distrib::codec::PartialAggregate>> = None;
             // Whether `accounting` now holds spend the snapshot's estimate does
-            // not cover: a distributed fetch that fell back to a local re-fetch,
-            // or a federated remote that answered (below).
+            // not cover: a distributed fetch that fell back to a local re-fetch
+            // or folded a retried slice, or a federated remote that answered
+            // (below).
             let mut excludes_spend = false;
             for r in results {
-                let (histograms, per_plan_stats, pushdown_partials, fell_back) = r?;
-                excludes_spend |= fell_back;
+                let (histograms, per_plan_stats, pushdown_partials, plan_excludes_spend) = r?;
+                excludes_spend |= plan_excludes_spend;
                 for series in histograms {
                     insert_or_union_histogram_series(&mut combined_histograms, series);
                 }
@@ -2825,8 +2828,10 @@ impl QueryEngine {
             // result and must use the raw samples it also returned.
             Option<Vec<crate::distrib::codec::PartialAggregate>>,
             // True when a distributed fetch folded worker spend and then fell
-            // back to the local path, which fetches the same segments again:
-            // the snapshot's estimate counts each segment fetch once.
+            // back to the local path, which fetches the same segments again,
+            // or when a slice that answered carried the spend of its retried
+            // or rerouted attempts: the snapshot's estimate counts each
+            // segment fetch once.
             bool,
         ),
         QueryError,
@@ -2850,8 +2855,8 @@ impl QueryEngine {
                 // of this ticket's scope. Charged to `scan` rather than left
                 // unaccounted (issue #796 finding, same treatment as
                 // federation above).
-                if let Some((triple, partials)) = distributed
-                    .fetch(
+                if let Some((triple, partials, carried_abandoned_spend)) = distributed
+                    .fetch_reporting_carried_spend(
                         tenant_hash,
                         Signal::Metrics,
                         snapshot,
@@ -2903,7 +2908,7 @@ impl QueryEngine {
                     // in `scalar`, `partials` empty): only the former yields a
                     // pushdown result the caller may stash.
                     let pushdown = want_pushdown.then_some(partials);
-                    return Ok((stats, pushdown, false));
+                    return Ok((stats, pushdown, carried_abandoned_spend));
                 }
                 // `None`: a worker asked for local fallback (version skew, a
                 // histogram-bearing slice). Fall through to the local path.
@@ -7692,6 +7697,7 @@ mod prefetch_tests {
                 samples_returned: 0,
                 status: ravel_proto::queryfrag::v1::status::Code::SnapshotInvalidated,
                 status_message: "vanished".to_string(),
+                carried_abandoned_spend: false,
             })
         }
     }
@@ -7723,6 +7729,7 @@ mod prefetch_tests {
                 samples_returned: 0,
                 status: ravel_proto::queryfrag::v1::status::Code::Ok,
                 status_message: String::new(),
+                carried_abandoned_spend: false,
             })
         }
     }
@@ -8678,6 +8685,7 @@ mod prefetch_tests {
                 samples_returned: 0,
                 status: ravel_proto::queryfrag::v1::status::Code::Timeout,
                 status_message: "stopped at the deadline".to_string(),
+                carried_abandoned_spend: false,
             })
         }
     }
@@ -8856,6 +8864,7 @@ mod prefetch_tests {
                 samples_returned: 0,
                 status: self.0,
                 status_message: String::new(),
+                carried_abandoned_spend: false,
             })
         }
     }
@@ -8905,6 +8914,77 @@ mod prefetch_tests {
                 .await
                 .expect("instant");
             assert_eq!(stats.estimate_excludes_spend, fell_back, "{code:?}");
+        }
+    }
+
+    /// A worker that answers every slice `Ok`, with no data, and a fixed
+    /// `carried_abandoned_spend`.
+    struct CarriedSpend(bool);
+
+    #[async_trait::async_trait]
+    impl crate::distrib::client::SliceFetcher for CarriedSpend {
+        async fn fetch(
+            &self,
+            _request: ravel_proto::queryfrag::v1::FetchRequest,
+        ) -> Result<crate::distrib::client::SliceResponse, crate::distrib::client::DistribError>
+        {
+            Ok(crate::distrib::client::SliceResponse {
+                scalar: Vec::new(),
+                histogram: Vec::new(),
+                partials: Vec::new(),
+                accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+                stats: crate::fetcher::FetchStats::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: ravel_proto::queryfrag::v1::status::Code::Ok,
+                status_message: String::new(),
+                carried_abandoned_spend: self.0,
+            })
+        }
+    }
+
+    /// Issue #3789: an `Ok` slice whose accounting carries the spend of
+    /// abandoned attempts makes the estimate exclude spend; one that answered
+    /// on its first attempt does not.
+    ///
+    /// FLIP: returning `false` in place of `carried_abandoned_spend` from the
+    /// distributed arm of `fetch_samples_and_histograms_maybe_distributed`
+    /// fails the carried case.
+    #[tokio::test]
+    async fn estimate_excludes_spend_when_an_ok_slice_carried_abandoned_spend() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+        for carried in [false, true] {
+            let distributed = Arc::new(crate::distrib::Distributed::new(
+                Arc::new(CarriedSpend(carried)),
+                crate::distrib::partition::DistribThresholds {
+                    min_store_bytes: 0,
+                    min_segments: 0,
+                    max_parallel_slices: 1,
+                },
+            ));
+            let eng = engine(Arc::clone(&store)).with_distributed(distributed);
+            let (_value, stats) = eng
+                .instant_with_stats(
+                    tenant_hash,
+                    "metric_a",
+                    BASE_MS,
+                    &[],
+                    BASE_NS,
+                    Duration::from_secs(30),
+                )
+                .await
+                .expect("instant");
+            assert_eq!(stats.estimate_excludes_spend, carried, "carried={carried}");
         }
     }
 
@@ -9242,6 +9322,7 @@ mod prefetch_tests {
                 samples_returned: 0,
                 status: ravel_proto::queryfrag::v1::status::Code::Ok,
                 status_message: String::new(),
+                carried_abandoned_spend: false,
             })
         }
     }
@@ -11460,6 +11541,7 @@ mod coverage_wrapper_tests {
                 samples_returned: 0,
                 status: pb::status::Code::Ok,
                 status_message: String::new(),
+                carried_abandoned_spend: false,
             })
         }
     }

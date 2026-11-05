@@ -916,7 +916,9 @@ const EXCLUDED_SPEND_UNBOUNDED_COMPONENTS: [EstimateComponent; 3] = [
 /// estimate covers the coordinator's own resolve of the metrics snapshot; a
 /// query naming a log metric also spends through the log lane, and a
 /// federated query also spends through each remote that answered (as does a
-/// distributed fetch that fell back to fetching locally). None of that is in
+/// distributed fetch that fell back to fetching locally, or whose slice
+/// answered after a retry or reroute and carries the abandoned attempts'
+/// spend). None of that is in
 /// the estimate, so such a query names every component, and any other query
 /// names none.
 fn stats_unbounded_components(stats: &QueryStats) -> &'static [EstimateComponent] {

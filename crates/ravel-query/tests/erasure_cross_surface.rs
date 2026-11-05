@@ -898,6 +898,7 @@ fn ok_response(scalar: Vec<FetchedSeriesSoa>) -> SliceResponse {
         samples_returned,
         status: pb::status::Code::Ok,
         status_message: String::new(),
+        carried_abandoned_spend: false,
     }
 }
 
