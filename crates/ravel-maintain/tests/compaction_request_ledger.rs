@@ -101,9 +101,10 @@ async fn bytes_under(store: &dyn ObjectStoreBackend, prefix: &str) -> u64 {
 ///   SKIP_IDX, PAGE_DIR). No tail range (a 64 KiB probe covers these small
 ///   objects' footers) and no POSTINGS GET (the fixture indexes no fields, so
 ///   the section is absent).
-/// - `block_read` 4: one ranged block GET per (stream, input) cursor. The
-///   fixture's streams are stream 0 in both inputs, stream 1 in the first and
-///   stream 2 in the second, i.e. four cursors, each over a single block.
+/// - `block_read` 2: one ranged GET per (input, row group), each input's single
+///   row group fetched once and held resident (ADR-3819 D1). The fixture's
+///   streams are stream 0 in both inputs, stream 1 in the first and stream 2
+///   in the second, so a GET per (stream, input) cursor would read 4.
 /// - `part_put` 1: the single L1 part's `CreateIfAbsent` PUT.
 /// - `publish` 1: the compaction record's PUT. No post-publish HEAD: no part
 ///   answered `AlreadyExists` on a first run.
@@ -111,7 +112,7 @@ async fn bytes_under(store: &dyn ObjectStoreBackend, prefix: &str) -> u64 {
 /// Flip proofs, each run against this test:
 ///
 /// - dropping the `note_get` at `rlog.rs`'s `fetch_block`: `block_read` reads
-///   0 against the expected 4.
+///   0 against the expected 2.
 /// - attributing the commit-record GET to `CatalogRead` instead of
 ///   `RecordRead` in `read.rs`'s `load_one_input`: `record_read` reads 0
 ///   against the expected 2, so the pinned split, not just the total, is what
@@ -154,12 +155,12 @@ async fn per_phase_counts_match_the_instrumented_oracle_exactly() {
         "probe + STREAM_DIR + FIELD_DIR + SKIP_IDX + PAGE_DIR, per input"
     );
     assert_eq!(
-        report.block_read.requests, 4,
-        "one block GET per (stream, input) cursor"
+        report.block_read.requests, 2,
+        "one block GET per (input, row group), not per (stream, input)"
     );
     assert_eq!(report.part_put.requests, 1, "one L1 part PUT");
     assert_eq!(report.publish.requests, 1, "the compaction record PUT");
-    assert_eq!(report.total_requests(), 20);
+    assert_eq!(report.total_requests(), 18);
 
     assert_reconciles(&report, &before, &after);
 
@@ -329,10 +330,10 @@ async fn the_bloom_scope_read_is_one_catalog_get_of_the_list_prefix() {
         report.catalog_read.requests, 11,
         "the headline's 10 plus one bloom-scope GET"
     );
-    assert_eq!(report.block_read.requests, 4);
+    assert_eq!(report.block_read.requests, 2);
     assert_eq!(report.part_put.requests, 1);
     assert_eq!(report.publish.requests, 1);
-    assert_eq!(report.total_requests(), 21);
+    assert_eq!(report.total_requests(), 19);
     assert_reconciles(&report, &before, &after);
 
     let probe = CompactorConfig::default().footer_probe_bytes;
@@ -485,7 +486,7 @@ async fn list_counts_every_page_of_a_paginated_drain() {
     );
     assert_eq!(report.record_read.requests, 2);
     assert_eq!(report.catalog_read.requests, 10);
-    assert_eq!(report.block_read.requests, 4);
+    assert_eq!(report.block_read.requests, 2);
     assert_reconciles(&report, &before, &after);
 }
 
@@ -612,14 +613,14 @@ async fn a_conservation_abort_reports_zero_publish_requests() {
     // aborted run already spent.
     assert_eq!(report.record_read.requests, 2);
     assert_eq!(report.catalog_read.requests, 10);
-    assert_eq!(report.block_read.requests, 4);
+    assert_eq!(report.block_read.requests, 2);
     assert_eq!(report.part_put.requests, 1);
     assert_reconciles(&report, &before, &after);
 }
 
 /// Run scoping: a second run reports only its own figures. The rerun here is
 /// gated `AlreadyCompacted` after its LIST, so its report is exactly one
-/// listing request and nothing else -- none of the first run's 20 requests
+/// listing request and nothing else -- none of the first run's 18 requests
 /// survive into it.
 ///
 /// Flip proofs, both run against this test before the pre-publish re-list
@@ -647,7 +648,7 @@ async fn a_second_run_reports_only_its_own_figures() {
         first.list.requests, 2,
         "the driver's LIST survives the rewrite, beside the pre-publish re-list"
     );
-    assert_eq!(first.total_requests(), 20);
+    assert_eq!(first.total_requests(), 18);
 
     let outcome = compact_bucket(&store, &clock, &config, &bucket)
         .await
@@ -867,15 +868,15 @@ async fn a_bad_rlog_zstd_level_is_refused_before_any_store_request() {
 
 /// The control for the refusal test: at the default level each entry point
 /// issues requests over the same fixture. Figures are the oracle's, pinned as
-/// measured on this fixture: compaction's 20 is the headline test's figure,
-/// and the bare rewrite's 18 is that less the two LISTs a compaction issues
+/// measured on this fixture: compaction's 18 is the headline test's figure,
+/// and the bare rewrite's 16 is that less the two LISTs a compaction issues
 /// around it (the listing it plans from and the pre-publish re-list). The
-/// migration's 22 is the bare rewrite's 18 plus its planning LIST, its two
+/// migration's 20 is the bare rewrite's 16 plus its planning LIST, its two
 /// eligibility reads of the commit records, and its pre-publish re-list. The
-/// erasure rewrite's 20 includes its own pre-publish re-list.
+/// erasure rewrite's 18 includes its own pre-publish re-list.
 #[tokio::test]
 async fn the_default_level_runs_each_rlog_entry_point_against_the_store() {
-    for (entry, expected) in RLOG_ENTRIES.into_iter().zip([20, 22, 18, 20]) {
+    for (entry, expected) in RLOG_ENTRIES.into_iter().zip([18, 20, 16, 18]) {
         let (result, oracle, _) = run_rlog_entry_at(entry, 9).await;
         assert!(result.is_ok(), "{entry:?}: {result:?}");
         assert_eq!(oracle, expected, "{entry:?}: store requests");

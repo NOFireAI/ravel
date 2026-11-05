@@ -1554,8 +1554,11 @@ fn first_dropping_log_request(
 /// `CompactorConfig` it hands this function, so the derived target reaches this
 /// rewrite through the shared config, not through `l1_part_memory_target_bytes`.
 /// On this path the check runs after every record, so the part exceeds the
-/// target by at most one record. Resident memory is therefore one part plus one
-/// decoded block per input, never the bucket.
+/// target by at most one record. It also shares the merge's ADR-3819 read plan,
+/// so its inputs' row groups are read once (or once per stream-range pass)
+/// rather than once per stream they carry, apart from what a hot stream's
+/// cursors fetch outside resident mode, and resident memory is the sum the `rlog`
+/// module docs state under the resident ceiling.
 ///
 /// It did NOT always work this way: this function used to GET every input whole
 /// and push every survivor into ONE unbounded [`RlogWriter`], so a bucket

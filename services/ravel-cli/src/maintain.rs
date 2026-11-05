@@ -1154,7 +1154,9 @@ pub async fn compact_tenant_to(
 /// bucket undivided; dividing it would also make
 /// `MergeCursorBudgetExceeded`'s raise-to-`required_bytes` remediation wrong
 /// at N > 1. N=1 is the full budget either way. A `concurrency` of zero is
-/// clamped to one (callers refuse it upstream with a typed error). Every
+/// clamped to one (callers refuse it upstream with a typed error). The
+/// bucket's RLOG resident ceiling (ADR-3819 D1) is that per-bucket budget,
+/// with no second division: the budget already is this bucket's share. Every
 /// other config field is `base`, copied verbatim.
 pub fn per_bucket_config(base: &CompactorConfig, concurrency: usize) -> CompactorConfig {
     let mut config = base.clone();
@@ -1163,6 +1165,7 @@ pub fn per_bucket_config(base: &CompactorConfig, concurrency: usize) -> Compacto
         config.merge_cursor_budget_bytes =
             base.merge_cursor_budget_bytes / (concurrency.max(1) as u64);
     }
+    config.merge_resident_ceiling_bytes = Some(config.merge_cursor_budget_bytes);
     config
 }
 
@@ -3388,6 +3391,35 @@ mod tests {
     /// These fixtures build their own `MemoryStore`, which is the explicit
     /// `--store memory` case (issue #1024): an empty result stays a success.
     const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
+
+    /// `compact-bucket` runs one merge, so its RLOG resident ceiling (ADR-3819
+    /// D1) is the whole merge cursor budget: the config `compact_to` builds
+    /// leaves the field unset and the library default resolves it to the
+    /// budget. Setting it to the budget over any divisor fails the equality.
+    #[test]
+    fn compact_bucket_resident_ceiling_is_the_merge_cursor_budget() {
+        let (config, _) = build_compactor_config(
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(32 * 1024 * 1024 * 1024),
+            1,
+            Duration::from_secs(300),
+        )
+        .expect("build");
+        assert_eq!(config.merge_resident_ceiling_bytes, None);
+        assert_eq!(
+            config.merge_resident_ceiling(),
+            ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES
+        );
+        assert_eq!(
+            config.merge_resident_ceiling(),
+            config.merge_cursor_budget_bytes
+        );
+    }
 
     /// Both CLI consumers of the supported-version window derive from the one
     /// crate source (ADR-0066 decision 1): `audit-versions`' anomaly predicate

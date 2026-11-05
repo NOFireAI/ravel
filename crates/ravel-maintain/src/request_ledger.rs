@@ -197,6 +197,12 @@ pub struct RunRequestReport {
     pub coordinate: PhaseRequests,
     /// The format-floor read ([`RequestPhase::FloorRead`]).
     pub floor_read: PhaseRequests,
+    /// RLOG merge stream-range passes run (ADR-3819 D2). Not a request count.
+    pub merge_passes: u64,
+    /// RLOG raw row-group bytes the merge held resident for its whole run
+    /// (ADR-3819 D1), as fetched; zero when it fetched per pass or per
+    /// cursor. Stored bytes, a residency figure, not a request figure.
+    pub merge_resident_bytes: u64,
 }
 
 impl RunRequestReport {
@@ -250,6 +256,8 @@ struct PhaseCounters {
 #[derive(Debug, Default)]
 struct RequestLedgerInner {
     phases: [PhaseCounters; RequestPhase::ALL.len()],
+    merge_passes: AtomicU64,
+    merge_resident_bytes: AtomicU64,
     /// Whether a run's scope is currently open. Read only by
     /// [`RequestLedger::reset_for_run_unless_open`] to decide whether an
     /// enclosing driver already opened one; it never reaches any store or
@@ -317,12 +325,30 @@ impl RequestLedger {
     /// combined figures, and that contract is the installer's to keep, exactly
     /// as for [`crate::config::MergeMemoryTracker::reset_for_run`].
     pub fn reset_for_run(&self) {
+        self.clear_counters();
+        self.inner.run_open.store(true, Ordering::Relaxed);
+    }
+
+    fn clear_counters(&self) {
         for counters in &self.inner.phases {
             counters.requests.store(0, Ordering::Relaxed);
             counters.wire_bytes_received.store(0, Ordering::Relaxed);
             counters.wire_bytes_sent.store(0, Ordering::Relaxed);
         }
-        self.inner.run_open.store(true, Ordering::Relaxed);
+        self.inner.merge_passes.store(0, Ordering::Relaxed);
+        self.inner.merge_resident_bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// Account one RLOG merge stream-range pass.
+    pub fn record_merge_pass(&self) {
+        self.inner.merge_passes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Account `bytes` of raw row-group bytes the RLOG merge holds resident.
+    pub fn record_merge_resident_bytes(&self, bytes: u64) {
+        self.inner
+            .merge_resident_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Open a run's scope only if no enclosing driver already opened one. This
@@ -344,11 +370,7 @@ impl RequestLedger {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            for counters in &self.inner.phases {
-                counters.requests.store(0, Ordering::Relaxed);
-                counters.wire_bytes_received.store(0, Ordering::Relaxed);
-                counters.wire_bytes_sent.store(0, Ordering::Relaxed);
-            }
+            self.clear_counters();
             return true;
         }
         false
@@ -398,6 +420,8 @@ impl RequestLedger {
             publish: read(RequestPhase::Publish),
             coordinate: read(RequestPhase::Coordinate),
             floor_read: read(RequestPhase::FloorRead),
+            merge_passes: self.inner.merge_passes.load(Ordering::Relaxed),
+            merge_resident_bytes: self.inner.merge_resident_bytes.load(Ordering::Relaxed),
         }
     }
 }
