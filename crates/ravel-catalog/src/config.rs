@@ -675,9 +675,15 @@ pub struct CatalogConfig {
     /// Most (entry, key8) pairs the leaf build holds at once for one part,
     /// read from KEY_IDX sections and carried from the previous tail's leaves
     /// together (ADR-3692 decision 5, the #3704 amendments). Every field the
-    /// build indexes gets a fixed share for the whole build, `max(1,
-    /// max_pairs / F)` with `F` the number of those fields, whether or not
-    /// it is still building. Each pass holds for each field, from where its
+    /// build indexes gets a share, `max(1, max_pairs / F)` with `F` the
+    /// number of those fields, whether or not it is still building. The
+    /// share is fixed once the first pass has read every section; during
+    /// that first pass a section that names a field the tenant did not
+    /// declare adds a field and lowers the share, and a field that already
+    /// held pairs under the larger share keeps what it held, so on that
+    /// first pass a field can hold above its final share and the part's
+    /// total can pass `F x (max(share, R) + 1)` by about the number of
+    /// fields declared before it. Each pass holds for each field, from where its
     /// last pass ended, the longest run of whole key8s whose pairs fit the
     /// share, or that one key8 whole when its own pairs exceed it, and closes
     /// every leaf slice it opened before the next pass starts; each later
