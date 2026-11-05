@@ -378,7 +378,7 @@ docs/catalog-and-mvcc.md, with these choices fixed here:
   today's tier-1 routes unchanged (log_fetcher.rs:2485, :2589).
 - The fold's leaf build skips a version 1 RLOG KEY_IDX section and lists
   the entry uncovered (fold.rs:1398 and
-  crates/ravel-catalog/src/key_index_rebuild.rs:492 both go through
+  crates/ravel-catalog/src/key_index_rebuild.rs:597 both go through
   `read_entry_key_index_counted`, which gains the
   `section_resolves_like_the_reader` check the tier-1 probe applies).
   The leaf header has no field that could carry the section version, so
@@ -1065,8 +1065,10 @@ make.
   replaces every ref of that field on the part. The new leaf is
   content-addressed, so it lands at a new key. The old leaf is neither
   overwritten nor deleted by the rebuild; once HEAD no longer names it,
-  the catalog sweep deletes it past `protection_horizon_ns` like any
-  unreferenced leaf (`deleted_kidx`). A prefix GET that fails with a store
+  the catalog sweep deletes it like any unreferenced leaf
+  (`deleted_kidx`), measuring `protection_horizon_ns` from the leaf's own
+  `last_modified`. A query pinned to an earlier HEAD can therefore find
+  it gone; it counts the leaf as rejected and reads the part from tier 1. A prefix GET that fails with a store
   error defers the part, which keeps its refs this run. A spans ref costs
   no GET.
 - **Migration class.** The leaf stays a Class B derived catalog object
@@ -1083,8 +1085,8 @@ make.
 | accept rule | logs accept 2 only; spans accept 1 and 2 | any other pair | crates/ravel-catalog/src/snapshot_format/kidx/tests.rs:452 |
 | logs query over a version 1 leaf | rows equal the unfolded answer; 1 leaf GET (the prefix), `leavesRejected` 1, `partsCovered` 0 | a missing row, or a covered part | services/ravel-server/tests/sql_logs_key_index_tier2.rs:974 |
 | advancing fold over a version 1 logs tail leaf | 1 previous leaf GET, 0 entries carried, every section read (24 of 24), the version 1 section's entry uncovered in a version 2 leaf, rows equal the unfolded answer | a carried entry, or a missing row | services/ravel-server/tests/sql_logs_key_index_tier2.rs:1016 |
-| rebuild over one logs part holding a version 1 ref | 1 part refused, 1 prefix GET of `prefix_len` bytes, 1 part rebuilt, 1 leaf written at a new key, the old leaf kept byte-equal | any other figure, or an overwritten or deleted leaf | crates/ravel-catalog/src/key_index_rebuild.rs:2248; crates/ravel-catalog/src/key_index_rebuild.rs:2297 |
-| rebuild over a spans part holding a version 1 ref | 0 parts, 0 prefix GETs, HEAD unchanged | any GET of a leaf | crates/ravel-catalog/src/key_index_rebuild.rs:2306 |
+| rebuild over one logs part holding a version 1 ref | 1 part refused, 1 prefix GET of `prefix_len` bytes, 1 part rebuilt, 1 leaf written at a new key, the old leaf kept byte-equal | any other figure, or an overwritten or deleted leaf | crates/ravel-catalog/src/key_index_rebuild.rs:2251; crates/ravel-catalog/src/key_index_rebuild.rs:2300 |
+| rebuild over a spans part holding a version 1 ref | 0 parts, 0 prefix GETs, HEAD unchanged | any GET of a leaf | crates/ravel-catalog/src/key_index_rebuild.rs:2312 |
 | spans lookup over a version 1 leaf | prunes and opens only the holder | a rejected leaf | services/ravel-server/tests/spans_trace_key_index_routing.rs:921 |
 
 Refs: #3703, #3692
