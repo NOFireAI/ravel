@@ -314,16 +314,19 @@ matcher.
 
 ### 4. One fetch call reserves one batch, and a batch is released after its decode
 
-`ensure_ranges` stops reserving the sum of a call's runs. The call is cut
-into batches of at most `fetch_batch_bytes = memory_budget.limit() /
-(2 x get permits)` (predicted; a floor of 8 MiB keeps a single large run
-whole, never split, so a call's reservation is bounded by the larger of
-the batch and its largest run; a run is one timestamp page and one value
-page, each under the 64 MiB reader page cap at
-`crates/ravel-segment/src/format.rs:364`, so that bound is at most 128 MiB
-against the frozen 6.4 GB budget, and #3818's runs were about 5 MB:
-161,598,421 bytes over about 32 runs), each batch reserved, fetched,
-decoded into the
+`ensure_ranges` stops reserving the sum of a call's runs. The cut is made
+on the call's needed page ranges, before `coalesce_ranges` and
+`bound_runs` turn them into runs (`fetcher.rs:1690-1701`): page ranges
+are taken in object order into batches of at most `fetch_batch_bytes =
+memory_budget.limit() / (2 x get permits)` (predicted), and coalescing
+and bridging never cross a batch boundary. A batch therefore holds at
+most `fetch_batch_bytes`, or one page range when a single page exceeds
+it, and a page is under the 64 MiB reader cap
+(`crates/ravel-segment/src/format.rs:364`), so a call's reservation is
+bounded by the larger of the batch and 64 MiB against the frozen 6.4 GB
+budget; #3818's 161,598,421-byte call was about 32 coalesced runs of
+about 5 MB, every one of which this cut divides. Each batch is reserved,
+fetched, decoded into the
 sample fold, whose own ledger charges what it retains (#3768's
 `RunFold::reserve_retained`), and only then dropped, which releases it.
 The next batch reserves after the drop. A call holds at most one batch's
@@ -333,7 +336,10 @@ difference from #3818's round two is the order, decode and drop before the
 next reserve rather than release before drop.
 
 - A reservation that does not fit still refuses before the GET, with the
-  batch size in the message; it never shrinks a needed range.
+  batch size in the message; it never shrinks a needed page range.
+  Cutting before coalescing can add a GET where a 64 KiB gap used to be
+  bridged across the cut; the acceptance row 6 counts GETs against the
+  unbatched call and tolerates one extra per batch.
 - `open_segment`'s first GET (the footer tail or the whole small object)
   reserves its bytes like every other fetch.
 - Runs are decoded in the order the batches arrive, which is the order
@@ -418,8 +424,9 @@ raw whatever the matrix says.
 - **A new index object kind for metrics instead of the `.kidx` leaf.** A
   second leaf format forks the router, the fold's pair budget, the
   binding check and the sweep for the same shape of answer; the logs leaf
-  already holds `Str` keys by hash prefix and an empty block set is a
-  legal payload.
+  already holds `Str` keys by hash prefix and a one-block set is a legal
+  payload, which is what makes decision 2's `{0}` convention reuse the
+  leaf without a format change.
 - **Keying the index on `(name, value)` pairs.** LABEL_DICT has no pair
   structure, so pairs need the SERIES_META decode ADR-0020 rejected; the
   value-only key proves the same absence and reads one frame.
@@ -480,7 +487,7 @@ objects that contain the statement's series.
 | 3. R6 `mb_single_counter_rate`, folded with leaves | leaf GETs at most 2 x covering parts; objects opened = holders (about 360 of 2,899); probe wire under 200 MB; `segmentsPrunedByLabelIndex` = 2,899 minus holders; result hash equal to the unrouted run | over 600 objects opened or over 500 MB | predicted; R6 measured 2,899 opened and 1,031 MB, release metricsbench-r6-20261105 |
 | 4. R6 `mb_fanout_total_rate` and the two `full_range` instant statements, folded with leaves | objects opened and bytes within 2 % of the unrouted run (every object holds the name); no statement over 5 % slower; result hashes equal | over 5 % slower or any extra GET | predicted; R6 figures in the Stage 0 table |
 | 5. `series` listing of 1,000,000 series, cold, real S3, folded | within 10 % of R6's 81.0 s and `catalog_get_delta` within 125 plus leaf GETs | over 100 s | measured 2026-11-05, #940 comment 6664968984 |
-| 6. the #3818 arm: the same tenant compacted to its L1 parts, frozen query flags, all 8 statements | every statement answers; no `fetch memory exhausted`; peak container memory under 8 GiB; result hashes equal to the L0 arm; decompressed bytes per statement recorded against the L0 arm as decision 6's run-span input | any refusal, kill, or hash difference | predicted; #3818 measured three failures |
+| 6. the #3818 arm: the same tenant compacted to its L1 parts, frozen query flags, all 8 statements | every statement answers; no `fetch memory exhausted`; peak container memory under 8 GiB; result hashes equal to the L0 arm; scan GETs at most the unbatched call's plus one per batch and wire bytes equal; decompressed bytes per statement recorded against the L0 arm as decision 6's run-span input | any refusal, kill, or hash difference, or scan GETs above that bound | predicted; #3818 measured three failures |
 | 7. leaf bytes and build cost | leaf bytes at most 1 % of part data bytes on the cardinality tenant; fold wall with the switch on within 10 % of off on an unchanged tail plus one new hour; uncovered parts 0 | over 2 % or over 20 % | predicted |
 | 8. erasure in flight | with a pending `del/` request on the tenant, `segmentsPrunedByLabelIndex` = 0 on every statement and results equal to the unrouted run; after the rewrite and fold, the stale leaf is unreferenced and swept | any prune while pending | predicted; the rule is ADR-2707 decision 6 |
 | 9. correctness matrix | exact agreement with the Prometheus oracle status of R6 on every statement (15 ok, 4 incorrect for the known last-bit and tie reasons, 0 new incorrect), folded and unfolded, routed and unrouted; the two R6 timeouts recorded as answered or still timing out | any new `incorrect` | measured 2026-11-05, release metricsbench-r6-20261105 |
