@@ -1565,17 +1565,17 @@ GET recorder; the real-S3 figures stay predicted until a lane measures them.
 |---|---|---|---|
 | advancing fold, 3 carried and 2 new entries: section GETs | 2 per new entry, none for a carried one | 4 ranged GETs, `key_index_sections_read` 2, `key_index_entries_carried` 3 | crates/ravel-catalog/src/fold.rs:14056 |
 | advancing fold: previous leaf GETs | 1 per (field, slice) of the previous tail, once per fold whatever the pass count | 1 | crates/ravel-catalog/src/fold.rs:14063 |
-| carried build against a from-scratch build | byte-identical leaves at the same budget | identical at budgets 1, 2, 3, 5, 6, 7, 15 and `u64::MAX`, after a restart too | crates/ravel-catalog/src/fold.rs:14075; crates/ravel-catalog/src/fold.rs:14572 |
+| carried build against a from-scratch build | byte-identical leaves at the same budget | identical at budgets 1, 2, 3, 5, 6, 7, 15 and `u64::MAX`, after a restart too | crates/ravel-catalog/src/fold.rs:14075; crates/ravel-catalog/src/fold.rs:14575 |
 | failed or corrupt previous leaf | every entry read, nothing carried | 5 sections, 10 GETs, 0 carried | crates/ravel-catalog/src/fold.rs:14096; crates/ravel-catalog/src/fold.rs:14127 |
-| field declared, or retyped, between folds | no previous leaf GET, every entry read, leaves equal to from-scratch | 0 leaf GETs, 5 sections | crates/ravel-catalog/src/fold.rs:14847; crates/ravel-catalog/src/fold.rs:14896 |
-| section naming an undeclared field, carry active | carry dropped, leaves equal to from-scratch | 0 carried, 1 + 5 sections, 2 passes | crates/ravel-catalog/src/fold.rs:14936 |
-| 12 pairs under a budget of 5 | 3 passes, slices tiling the key space, a slice end at every pass end | passes of 5, 5 and 2, 9 section reads, 5 slices where one pass writes 4 | crates/ravel-catalog/src/fold.rs:14975 |
+| field declared, or retyped, between folds | no previous leaf GET, every entry read, leaves equal to from-scratch | 0 leaf GETs, 5 sections | crates/ravel-catalog/src/fold.rs:14858; crates/ravel-catalog/src/fold.rs:14907 |
+| section naming an undeclared field, carry active | carry dropped, leaves equal to from-scratch | 0 carried, 1 + 5 sections, 2 passes | crates/ravel-catalog/src/fold.rs:14947 |
+| 12 pairs under a budget of 5 | 3 passes, slices tiling the key space, a slice end at every pass end | passes of 5, 5 and 2, 9 section reads, 5 slices where one pass writes 4 | crates/ravel-catalog/src/fold.rs:14986 |
 | 17 pairs over shared key8s, budgets 1 to 20 | the greedy partition count | 4 passes at budget 6; a rebuild 8 | crates/ravel-catalog/src/fold.rs:14367 |
-| two fields of 16 and 8 pairs, fixed shares | the slowest field's greedy count under its share | 8 passes at budget 4 | crates/ravel-catalog/src/fold.rs:14701 |
+| two fields of 16 and 8 pairs, fixed shares | the slowest field's greedy count under its share | 8 passes at budget 4 | crates/ravel-catalog/src/fold.rs:14704 |
 | two over-ceiling key8s in different ranges, budgets 1 to 20 and `u64::MAX` | every leaf lists every uncovered entry, leaves equal to from-scratch at the same budget | 5 uncovered on every leaf; 1 leaf at `u64::MAX` | crates/ravel-catalog/src/fold.rs:14335 |
 | carried pairs against the budget | read plus carried at most the share per pass | 9 carried and 6 read pairs, 3 passes of 5, 3 leaves | crates/ravel-catalog/src/fold.rs:14437 |
-| what one pass holds, open slice included | at most `max(share, R) + 1` per field | open slice 0 on every pass, three fixtures at budgets 1, 2, 3, 5, 6 and `u64::MAX` | crates/ravel-catalog/src/fold.rs:14514 |
-| sealed part carried by reference | 0 GETs | 0 | crates/ravel-catalog/src/fold.rs:15049 |
+| what one pass holds, open slice included | at most `max(share, R) + 1` per field | open slice 0 on every pass, three fixtures at budgets 1, 2, 3, 5, 6 and `u64::MAX` | crates/ravel-catalog/src/fold.rs:14517 |
+| sealed part carried by reference | 0 GETs | 0 | crates/ravel-catalog/src/fold.rs:15060 |
 | held pair, in memory | upper-bound estimate of 88 B for one block: a 40 B entry counted twice and an 8 B block list | 40 B entry, buffer at most twice its peak, block list exact; jemalloc's 8 B class not pinned | crates/ravel-catalog/src/fold.rs:14201 |
 | advancing fold on a 250,000-entry tail, real S3 | about 2 x (new + still uncovered) x passes section GETs plus one leaf GET per slice | not measured | predicted |
 | build memory at the default budget | at most `F x (max(share, R_max) + 1)` held pairs at about 88 B each, plus what ADR-3692's #3704 amendment lists | not measured | predicted |

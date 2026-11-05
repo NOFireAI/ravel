@@ -43,8 +43,8 @@ use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{
     self, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION, KeyIndexLeafEncodeError, KeyIndexLeafEntry,
-    KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafSummary, KeyIndexSlice, NamePostings, PartLimits,
-    SnapshotFormatError, check_key_index_leaf_set, column_stats_segments_concat,
+    KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafSummary, KeyIndexSlice, NamePostings,
+    PartLimits, SnapshotFormatError, check_key_index_leaf_set, column_stats_segments_concat,
     encode_key_index_leaf, encoded_entry_len, split_key_index_entries,
     verify_key_index_leaf_frames,
 };
@@ -14466,7 +14466,11 @@ pub(crate) mod tests {
     /// returning the store, the report and the pass log.
     async fn advancing_budget_fold(
         max_pairs: u64,
-    ) -> (Arc<RangeRecordingStore>, FoldReport, Vec<KeyIndexPassRecord>) {
+    ) -> (
+        Arc<RangeRecordingStore>,
+        FoldReport,
+        Vec<KeyIndexPassRecord>,
+    ) {
         let inner = recording_store();
         advancing_fixture(&inner).await;
         let catalog = Catalog::new(
@@ -14492,8 +14496,7 @@ pub(crate) mod tests {
         assert!(!log.is_empty(), "{what}: no pass recorded");
         for record in log {
             assert!(
-                record.held_peak + record.open_slice
-                    <= record.share.max(max_run).saturating_add(1),
+                record.held_peak + record.open_slice <= record.share.max(max_run).saturating_add(1),
                 "{what}: a pass held more than its share, open slice included: {record:?}"
             );
         }
@@ -14718,8 +14721,16 @@ pub(crate) mod tests {
                 } else {
                     &[(USER_ID, KeyType::I64)]
                 };
-                publish_keyed_logs(store.as_ref(), seq, KIDX_HOUR, &[own, own + 10], 2, 0, fields)
-                    .await;
+                publish_keyed_logs(
+                    store.as_ref(),
+                    seq,
+                    KIDX_HOUR,
+                    &[own, own + 10],
+                    2,
+                    0,
+                    fields,
+                )
+                .await;
             }
             let catalog = Catalog::new(
                 store.clone(),

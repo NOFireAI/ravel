@@ -931,9 +931,9 @@ and RSS figures stay predicted until the harness measures them.
 | check | target | miss | source |
 |---|---|---|---|
 | row 7, section GETs on an advancing fold | 2 x (new entries + entries still uncovered) per pass, plus one per previous leaf per fold | over 2 x tail entries per pass | crates/ravel-catalog/src/fold.rs:14056 |
-| row 7, passes | `G`, the greedy partition per field under its share; up to `2G` with a rebuild | other than `G` without a rebuild, over `2G` with one | crates/ravel-catalog/src/fold.rs:14367; crates/ravel-catalog/src/fold.rs:14701 |
-| pairs one pass holds, open slice included | at most `max(share, R) + 1` per field, open slice 0 | any pass over it | crates/ravel-catalog/src/fold.rs:14514 |
-| one rebuild sees every uncovered entry | every leaf lists every uncovered entry; leaves equal to from-scratch at the same budget | a budget whose leaves differ | crates/ravel-catalog/src/fold.rs:14335; crates/ravel-catalog/src/fold.rs:14572 |
+| row 7, passes | `G`, the greedy partition per field under its share; up to `2G` with a rebuild | other than `G` without a rebuild, over `2G` with one | crates/ravel-catalog/src/fold.rs:14367; crates/ravel-catalog/src/fold.rs:14704 |
+| pairs one pass holds, open slice included | at most `max(share, R) + 1` per field, open slice 0 | any pass over it | crates/ravel-catalog/src/fold.rs:14517 |
+| one rebuild sees every uncovered entry | every leaf lists every uncovered entry; leaves equal to from-scratch at the same budget | a budget whose leaves differ | crates/ravel-catalog/src/fold.rs:14335; crates/ravel-catalog/src/fold.rs:14575 |
 | build memory at the default budget, T12 spans corpus | held pairs at most `F x (max(share, R_max) + 1)`; peak fold RSS under 1.5 GB as row 7 | RSS over 2 GB | predicted |
 
 Refs: #3704, #3692
@@ -990,10 +990,10 @@ changes:
 
 | check | target | miss | source |
 |---|---|---|---|
-| what a pass holds, open slice included | at most `max(share, R) + 1` per field, open slice 0 | any pass over it; it failed on the #3704 amendment's first build with a held peak of 4 and an open slice of 3 at share 1 | crates/ravel-catalog/src/fold.rs:14514 |
+| what a pass holds, open slice included | at most `max(share, R) + 1` per field, open slice 0 | any pass over it; it failed on the #3704 amendment's first build with a held peak of 4 and an open slice of 3 at share 1 | crates/ravel-catalog/src/fold.rs:14517 |
 | advancing fold at budget 5, 9 carried and 6 read pairs | 3 passes, 6 section reads, 12 ranged GETs, 1 previous leaf GET, 3 leaves | any other figure | crates/ravel-catalog/src/fold.rs:14437 |
-| advancing fold at budget 1 | 11 passes, one per key8 run | any other count | crates/ravel-catalog/src/fold.rs:14514 |
-| leaves at the same budget | equal to from-scratch, carried and after a restart | a budget whose leaves differ | crates/ravel-catalog/src/fold.rs:14572 |
+| advancing fold at budget 1 | 11 passes, one per key8 run | any other count | crates/ravel-catalog/src/fold.rs:14517 |
+| leaves at the same budget | equal to from-scratch, carried and after a restart | a budget whose leaves differ | crates/ravel-catalog/src/fold.rs:14575 |
 | row 7 at the T12 spans corpus, real S3 | `G` passes, 2 x (new + still uncovered) x `G` section GETs plus one per previous leaf | as row 7 above | predicted |
 
 Refs: #3704, #3692
