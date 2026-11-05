@@ -2168,3 +2168,33 @@ amendment adds the proof.
    resume on, and two by an `AVG`. All 43 read `logs`, and a `min` or
    `max` among them is over a declared column, which item 4 leaves unpaged
    (`the_clickbench_corpus_page_plan_outcomes_are_pinned`).
+9. `sum` was considered under the same proof and is refused at its last
+   link, the argument's type, each refusal with its own reason in
+   `aggregate_proof`. Under item 1's other links a `sum` of a NOT NULL
+   column is not NULL, and its result type is fixed: `Int8` to `Int64`
+   sum to `Int64`, `UInt8` to `UInt64` to `UInt64`
+   (`an_integer_sum_is_int64_for_a_signed_and_uint64_for_an_unsigned_argument`
+   in `crates/ravel-sql/tests/page_walk.rs`). It is not a position the
+   order of the totals agrees with, for two reasons.
+10. A float `sum` is refused because the engine adds partial sums in the
+    order its partitions finish, so two runs over the same segments can
+    differ in the last bits, and a cursor would compare a value page one
+    saw against one a later page recomputed. Item 7 is the same finding
+    from the pin's side.
+11. An integer `sum` is refused because Ravel serves DataFusion's built-in
+    `sum` (the session replaces `min`, `max` and `avg`; ADR-0024, which
+    would replace `sum`, is still Proposed), which adds
+    with wrapping arithmetic and raises no error past the 64-bit range. The
+    wrapped value is the same at one and at eight partitions, but it is
+    not the total: a group whose total exceeds `i64::MAX` sorts below one
+    whose total is 5
+    (`an_integer_sum_wraps_on_overflow_at_one_and_eight_partitions`). A
+    checked sum, which fails the statement instead of wrapping, would make
+    the order of the sums the order of the totals; until one replaces the
+    built-in, every `sum` order term runs unpaged, as item 4 says.
+12. `ravel_search_logs` applies item 6's mint-time check too. A last row
+    whose `(ts, observed_ts)` are not the kinds the plan resumes on ends
+    the page `ok_bounded` with no cursor and the `narrow_time_range` next
+    step, as `ravel_query_sql` does
+    (`a_last_row_of_the_wrong_kind_mints_no_cursor` in
+    `crates/ravel-mcp/src/tools/search_logs.rs`).
