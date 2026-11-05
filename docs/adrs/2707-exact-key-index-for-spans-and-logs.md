@@ -1497,48 +1497,67 @@ rules are in docs/catalog-and-mvcc.md, "Per-part key-index leaves", under
   re-encodes shares a data object with the previous HEAD's tail part, the
   build GETs each of that tail's leaves once and verifies it against its
   ref and the tail's tenant, signal, `part_blake3` and entry count, then
-  takes every entry those leaves cover for every field from them. Entries
-  are matched by data object key, never by ordinal, because a late entry
-  sorting into the middle of the part shifts every ordinal after it. Only
-  new entries and entries the previous leaves list as uncovered have their
-  sections read. The leaves are byte-identical to a build that reads every
-  section. A leaf that cannot be read or verified drops the carry for
-  that part, and every entry is read, as before this amendment. A sealed
-  part carried forward by reference keeps its refs and costs nothing.
-  The advancing fold's section reads fall from `2T` ranged GETs, `T` the
-  tail's entry count, to `2N` for `N` new entries, plus one leaf GET per
-  (field, slice) of the previous tail.
+  takes every entry those leaves cover for every declared field from them.
+  Entries are matched by data object key, never by ordinal, because a late
+  entry sorting into the middle of the part shifts every ordinal after it.
+  Only new entries and entries the previous leaves list as uncovered have
+  their sections read, and an entry that stays uncovered is read again on
+  every advancing fold, not once. The leaves are byte-identical to a build
+  that reads every section. A leaf that cannot be read or verified, a
+  declared field with no previous leaf, a previous leaf under another key
+  type, and a section naming a field the tenant does not declare each drop
+  the carry for that part, and every entry is read, as before this
+  amendment. A sealed part carried forward by reference keeps its refs and
+  costs nothing. The advancing fold's section reads fall from `2T` ranged
+  GETs, `T` the tail's entry count, to 2 x (new entries + entries still
+  uncovered), plus one leaf GET per (field, slice) of the previous tail.
 - **The build runs under a pair budget.** `key_index_build_max_pairs`
-  (default 8,000,000, about 550 MB at the 68 B a pair the leaf build switch
-  amendment estimated) bounds the (entry, key8) pairs held for one part
-  across its fields. The first pass counts pairs as it reads and spills
-  nothing. Past the budget it keeps the lowest key8 range that fits, and
-  each later pass re-reads the sections and keeps the next range, so a
-  part of `P` pairs over distinct key8 values takes `ceil(P / budget)`
-  passes over disjoint ranges, with leaves identical to one pass. One
-  key8's pairs are never split, so a single key8 over the budget is held
-  whole. The carried pairs are outside the budget: they are held for the
-  whole build at 40 B plus 4 B per block each, so the carry adds at most
-  the previous tail's pair count at that size. The `--rebuild-key-index`
+  (default 8,000,000) bounds the (entry, key8) pairs one pass holds for a
+  part, read and carried together, shared evenly by the fields still
+  building. A field gives up its highest key8 run whenever its pairs pass
+  its share, so a pass holds the longest run of whole key8s from where the
+  field's last pass ended that fits, and each later pass re-reads the
+  sections and decodes the carried leaves its range overlaps. The pass
+  count of a one-field part is the greedy partition of its ascending key8
+  runs into groups of at most the budget: `ceil(P / budget)` for `P` pairs
+  only when no key8 is shared between entries (17 pairs at budget 6 over
+  two shared key8s take 4 passes, not 3). One key8's pairs are never
+  split, so a single key8 over its share is held whole. A field a later
+  pass finds a new uncovered entry for after its pairs reached a slice
+  keeps passing to the end of the key space and is then rebuilt once with
+  every uncovered entry the passes found, so one rebuild sees them all; a
+  rebuild adds that field's greedy count once more. A held pair costs at
+  most 88 B for one block (a 40-byte entry in a buffer that grows to at
+  most twice the pairs it held, and an 8 B block list under jemalloc), so
+  the default holds at most about 704 MB; what the budget does not bound
+  is listed in ADR-3692's #3704 amendment. The `--rebuild-key-index`
   repair is unchanged: one pass, no budget, no carry.
 - **Reporting.** `FoldReport` gains `key_index_sections_read`,
   `key_index_entries_carried`, `key_index_build_passes` and
   `key_index_leaf_gets`, printed by `ravel-cli catalog fold` and exported
-  as `ravel_catalog_fold_key_index_*_total` counters on `/metrics`.
+  as `ravel_catalog_fold_key_index_*_total` counters on `/metrics`, summed
+  over every fold that returned a report, a no-op included.
+  `key_index_leaves_written` and `key_index_leaf_bytes_written` count the
+  published leaf set, not the leaves an abandoned pass PUT.
 
 The bands below are pinned in process against `MemoryStore` with an exact
 GET recorder; the real-S3 figures stay predicted until a lane measures them.
 
 | check | band | figure | source |
 |---|---|---|---|
-| advancing fold, 3 carried and 2 new entries: section GETs | 2 per new entry, none for a carried one | 4 ranged GETs, `key_index_sections_read` 2, `key_index_entries_carried` 3 | crates/ravel-catalog/src/fold.rs:13713 |
-| advancing fold: previous leaf GETs | 1 per (field, slice) of the previous tail | 1 | crates/ravel-catalog/src/fold.rs:13721 |
-| carried build against a from-scratch build | byte-identical leaves | identical | crates/ravel-catalog/src/fold.rs:13730 |
-| failed or corrupt previous leaf | every entry read, nothing carried | 5 sections, 10 GETs, 0 carried | crates/ravel-catalog/src/fold.rs:13771; crates/ravel-catalog/src/fold.rs:13806 |
-| 12 pairs under a budget of 5 | `ceil(12 / 5)` = 3 passes, slices tiling the key space | 3 passes, 9 section reads, same refs and bytes as one pass | crates/ravel-catalog/src/fold.rs:13901; crates/ravel-catalog/src/fold.rs:13908 |
-| sealed part carried by reference | 0 GETs | 0 | crates/ravel-catalog/src/fold.rs:13959 |
-| carried pair, in memory | 40 B plus 4 B per block | 40 B `KeyIndexLeafEntry` | crates/ravel-catalog/src/fold.rs:13858 |
-| advancing fold on a 250,000-entry tail, real S3 | about `2N` section GETs plus one leaf GET per slice | not measured | predicted |
-| build memory at the default budget | about 550 MB plus the carried pairs | not measured | predicted |
+| advancing fold, 3 carried and 2 new entries: section GETs | 2 per new entry, none for a carried one | 4 ranged GETs, `key_index_sections_read` 2, `key_index_entries_carried` 3 | crates/ravel-catalog/src/fold.rs:13973 |
+| advancing fold: previous leaf GETs | 1 per (field, slice) of the previous tail | 1 | crates/ravel-catalog/src/fold.rs:13980 |
+| carried build against a from-scratch build | byte-identical leaves | identical | crates/ravel-catalog/src/fold.rs:13992 |
+| failed or corrupt previous leaf | every entry read, nothing carried | 5 sections, 10 GETs, 0 carried | crates/ravel-catalog/src/fold.rs:14013; crates/ravel-catalog/src/fold.rs:14044 |
+| field declared, or retyped, between folds | no previous leaf GET, every entry read, leaves equal to from-scratch | 0 leaf GETs, 5 sections | crates/ravel-catalog/src/fold.rs:14449; crates/ravel-catalog/src/fold.rs:14498 |
+| section naming an undeclared field, carry active | carry dropped, leaves equal to from-scratch | 0 carried, 1 + 5 sections, 2 passes | crates/ravel-catalog/src/fold.rs:14538 |
+| 12 pairs under a budget of 5 | 3 passes, slices tiling the key space | passes of 5, 5 and 2, 9 section reads, same refs and bytes as one pass | crates/ravel-catalog/src/fold.rs:14575 |
+| 17 pairs over shared key8s, budgets 1 to 20 | the greedy partition count | 4 passes at budget 6; a rebuild 8 | crates/ravel-catalog/src/fold.rs:14277 |
+| two over-ceiling key8s in different ranges, budgets 1 to 20 and `u64::MAX` | from-scratch leaves at every budget | 1 leaf, 5 uncovered | crates/ravel-catalog/src/fold.rs:14251 |
+| carried pairs against the budget | read plus carried at most the budget per pass | 9 carried and 6 read pairs, 3 passes of 5 | crates/ravel-catalog/src/fold.rs:14346 |
+| sealed part carried by reference | 0 GETs | 0 | crates/ravel-catalog/src/fold.rs:14639 |
+| held pair, in memory | at most 80 B plus the block list, 88 B for one block under jemalloc | 40 B entry, buffer at most twice its peak, block list exact | crates/ravel-catalog/src/fold.rs:14118 |
+| advancing fold on a 250,000-entry tail, real S3 | about 2 x (new + still uncovered) section GETs plus one leaf GET per slice | not measured | predicted |
+| build memory at the default budget | at most about 704 MB of held pairs plus what ADR-3692's #3704 amendment lists | not measured | predicted |
 
 Refs: #3704, #3692

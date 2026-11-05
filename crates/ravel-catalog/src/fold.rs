@@ -367,11 +367,13 @@ pub struct FoldReport {
     /// Build passes over the re-encoded parts, summed. A part whose held
     /// pairs fit
     /// [`CatalogConfig::key_index_build_max_pairs`](crate::CatalogConfig::key_index_build_max_pairs)
-    /// takes one; a part over it takes one pass per key8 range, and each pass
-    /// reads every section the build needs again. A field a later pass finds
-    /// a new uncovered entry for (a transient read failure, or a key8 over the
-    /// body ceiling) is rebuilt once from its first range with the complete
-    /// uncovered list, which adds its passes here.
+    /// takes one; a part over it takes one pass per key8 range the pass rule
+    /// that field documents cuts, and each pass reads every section the
+    /// build needs again. A field a later pass finds a new uncovered entry
+    /// for (a transient read failure, or a key8 over the body ceiling) keeps
+    /// passing to the end of the key space and is then rebuilt once from its
+    /// first range with the complete uncovered list, which adds its passes
+    /// here.
     pub key_index_build_passes: u64,
     /// GETs of the previous tail part's leaves, whole objects, one per
     /// (field, slice), issued when a re-encoded part shares a data object
