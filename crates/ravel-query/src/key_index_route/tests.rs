@@ -271,7 +271,7 @@ impl LeafRangeReader for CountingReader {
         leaf: &'a SnapshotKeyIndexLeafRef,
         range: Range<u64>,
         accounting: &'a QueryAccounting,
-    ) -> BoxFuture<'a, Result<Bytes, String>> {
+    ) -> BoxFuture<'a, Result<Bytes, LeafReadError>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::Relaxed);
             let bytes = self.inner.read_range(leaf, range, accounting).await?;
@@ -975,7 +975,10 @@ async fn the_bridged_byte_budget_is_the_parts_not_each_slices() {
                     &request,
                     &slice_keys,
                     &KeyIndexLeafLimits::default(),
-                    |range| reader.read_range(leaf_ref, range, &accounting),
+                    |range| {
+                        let read = reader.read_range(leaf_ref, range, &accounting);
+                        async move { read.await.map_err(|e| e.to_string()) }
+                    },
                     &permissive,
                     |bytes| budget.try_reserve(bytes).ok(),
                 )
@@ -1200,6 +1203,55 @@ async fn a_dropped_log_leaf_read_still_charges_the_get_it_issued() {
         );
         assert_eq!(totals.leaf_gets(SIGNAL), 2, "cached {cached}");
     }
+}
+
+/// A logs leaf range the fetcher's memory budget refuses is a refused
+/// reservation, not a rejected leaf: the part reads uncovered, no GET is
+/// issued, and the pass counts it under `reservationsRefused`.
+/// FLIP: mapping `FetchMemoryExhausted` to `LeafReadError::Failed` in
+/// `LogLeafRangeReader::read_range` counts it under `leavesRejected`.
+#[tokio::test]
+async fn a_refused_log_leaf_fetch_counts_as_a_refused_reservation() {
+    use crate::log_fetcher::{LogLeafRangeReader, LogSegmentFetcher};
+
+    let fx = fixture(
+        &[PartSpec::simple(vec![rows(&[(1, &[0])])])],
+        &[],
+        KeyType::Str,
+    )
+    .await;
+    let fetcher = LogSegmentFetcher::new(fx.store.clone())
+        .with_memory_budget(Arc::new(ravel_memory::MemoryBudget::new(1)));
+    let reader = LogLeafRangeReader::new(&fetcher, TENANT);
+    let keys = key_set(KeyType::Str, &BTreeSet::from([1u16]));
+    let accounting = PhaseAccounting::new();
+    let budget = ThresholdBudget::new(u64::MAX);
+    let totals = RouteTotals::new();
+    let (routes, figures) = route_under(
+        input(&fx, &keys, &accounting, &reader, &budget),
+        ADR_CEILING,
+        &totals,
+    )
+    .await
+    .expect("route");
+
+    assert_eq!(routes, vec![SegmentRoute::Uncovered]);
+    assert_eq!(figures.reservations_refused, 1);
+    assert_eq!(figures.leaves_rejected, 0);
+    assert_eq!(figures.parts_covered, 0);
+    assert_eq!(
+        totals.parts(SIGNAL, KeyIndexPartOutcome::ReservationRefused),
+        1
+    );
+    assert_eq!(totals.parts(SIGNAL, KeyIndexPartOutcome::Rejected), 0);
+    assert_eq!(
+        accounting
+            .key_index()
+            .snapshot()
+            .s3_requests(AccountedOp::Get),
+        0,
+        "the refusal comes before the GET"
+    );
 }
 
 /// Admission walks the parts largest first and stops at the first whose
