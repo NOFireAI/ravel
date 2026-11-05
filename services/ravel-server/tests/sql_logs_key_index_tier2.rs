@@ -27,15 +27,17 @@ use axum::http::{Request, StatusCode, header};
 use bytes::Bytes;
 use ravel_catalog::{
     Catalog, CatalogConfig, CatalogError, DeclaredColumnType, DeclaredTypedColumn,
-    KeyIndexLeafLimits, KeyIndexLeafRequest, KeyIndexRebuildOptions, Snapshot, SnapshotParts, StorageLayoutWrite,
-    TenantConfig, TenantLifecycleState, set_tenant_config,
+    KeyIndexLeafLimits, KeyIndexLeafRequest, KeyIndexRebuildOptions, Snapshot, SnapshotParts,
+    StorageLayoutWrite, TenantConfig, TenantLifecycleState, set_tenant_config,
 };
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_ingest::Clock;
 use ravel_logseg::footer::kind;
-use ravel_logseg::key_index::{KEY_IDX_VERSION_1, KeyType, key8_i64, probe_ranged, rewrite_key_index};
+use ravel_logseg::key_index::{
+    KEY_IDX_VERSION_1, KeyType, key8_i64, probe_ranged, rewrite_key_index,
+};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, LogSegError, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
@@ -913,7 +915,13 @@ async fn a_refused_parts_charge_degrades_to_tier_one() {
 /// `rule` on the leaf's key.
 async fn with_leaf_fault(
     fault: ScriptedFault,
-) -> (Fixture, Arc<RecordingStore>, Arc<FaultStore<Arc<dyn ObjectStoreBackend>>>, Value, Totals) {
+) -> (
+    Fixture,
+    Arc<RecordingStore>,
+    Arc<FaultStore<Arc<dyn ObjectStoreBackend>>>,
+    Value,
+    Totals,
+) {
     let fx = Fixture::publish(&[0], &[]).await;
     fx.fold().await;
     let (leaf, _) = fx.layout().await;
@@ -961,7 +969,10 @@ async fn a_leaf_failing_its_checksum_leaves_the_part_uncovered() {
     assert_eq!(key_index(&v, "keysProbed"), 1, "{v}");
     assert_eq!(key_index(&v, "leavesRejected"), 1, "{v}");
     assert_eq!(key_index(&v, "partsUncovered"), 0, "{v}");
-    assert_eq!(moved.parts, Totals::only(KeyIndexPartOutcome::Rejected, 1, 0).parts);
+    assert_eq!(
+        moved.parts,
+        Totals::only(KeyIndexPartOutcome::Rejected, 1, 0).parts
+    );
     assert_tier_one(&fx, &recorder, &v);
 }
 
