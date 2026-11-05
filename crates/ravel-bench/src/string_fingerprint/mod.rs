@@ -436,6 +436,9 @@ pub struct SubjectReport {
     pub expect: BTreeMap<String, Expect>,
     pub checked: Checked,
     pub decision: Decision,
+    /// The layout the summary was built with; not part of the written report.
+    #[serde(skip)]
+    pub layout: summary::Layout,
 }
 
 fn fmt_expect(e: &Expect, v: f64) -> String {
@@ -725,6 +728,7 @@ pub fn measure(
         expect,
         checked,
         decision,
+        layout: built.layout,
     })
 }
 
@@ -845,11 +849,12 @@ pub fn decide(d: &DecisionInput) -> Decision {
 }
 
 /// A subject decision read back from a written report, with its structural
-/// problem count.
+/// problem count and its count of figures outside their band.
 #[derive(Clone, Debug)]
 pub struct SavedDecision {
     pub decision: Decision,
     pub problems: usize,
+    pub misses: usize,
 }
 
 pub fn saved_decision(json: &str) -> Result<SavedDecision, String> {
@@ -862,7 +867,21 @@ pub fn saved_decision(json: &str) -> Result<SavedDecision, String> {
     Ok(SavedDecision {
         decision: saved.decision,
         problems: saved.checked.problems.len(),
+        misses: saved.checked.misses.len(),
     })
+}
+
+/// Whether `saved` is a decision at all: every subject of `subjects` reported
+/// exactly once and without a figure problem, and no other subject. An
+/// incomplete set is NO-GO under [`overall`] but is not a result.
+pub fn complete(subjects: &[String], saved: &[SavedDecision]) -> bool {
+    !subjects.is_empty()
+        && subjects.iter().all(|s| {
+            let mine: Vec<&SavedDecision> =
+                saved.iter().filter(|d| &d.decision.subject == s).collect();
+            matches!(mine.as_slice(), [d] if d.problems == 0)
+        })
+        && saved.iter().all(|d| subjects.contains(&d.decision.subject))
 }
 
 /// The overall rule of [`DECISION_RULE`] over `subjects`, the names the
