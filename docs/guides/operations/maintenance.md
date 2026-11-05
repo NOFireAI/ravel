@@ -282,6 +282,11 @@ ravel-cli maintain compact-tenant --tenant <t> --signal <metrics|logs|spans> \
   [--dry-run] [--no-claim]
 ```
 
+Reports go to stdout and log lines go to stderr. With `RUST_LOG` unset,
+`ravel-cli` logs warnings from every crate plus the compactor's info lines,
+such as the RLOG merge's `rlog merge read mode` line. A set `RUST_LOG`
+replaces that default entirely, and `RUST_LOG=off` silences it.
+
 Under per-role storage credentials, run both with the Maintain credential, not
 Admin. They take compaction claims and write L1 segments and compaction
 records, which only the Maintain policy grants (see
