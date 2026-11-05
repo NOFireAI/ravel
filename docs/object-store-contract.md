@@ -1824,6 +1824,20 @@ ADR-0042 decision 3.
    through the XML API on `S3Store`'s handle, with the generation as the
    completed version; no upload checksums, no bucket-protection probes (see
    "Backend support notes").
+5. `ScratchStore`: process-local, non-durable backend over a local
+   directory, the transient run store of ADR-3853 D2. It is a cache and
+   nothing else: `open` removes everything the directory held and `wipe`
+   empties it, nothing in it is published or read by another process, and
+   no durability or recovery path may depend on it. It must never back a
+   tenant's data. Each `/`-separated key segment maps to one escaped file
+   name (ASCII letters, digits, `-` and `_` kept, every other byte written
+   as `%XX`), so no key names a path outside the directory, and a segment
+   whose escaped name exceeds 255 bytes is refused as `Permanent`. A put
+   writes a temporary file and renames it into place; conditional puts and
+   deletes are decided under one lock, so their outcomes match
+   `MemoryStore`'s. It declares the same `Capabilities` as `MemoryStore`
+   and gives up none of them, and runs the contract suite at the default
+   page size and at 2.
 
 ### Instrumentation decorator
 

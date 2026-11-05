@@ -41,7 +41,8 @@
 //! - A multipart upload streams its parts into one temporary file and is
 //!   published by the same rename at `complete`.
 //!
-//! Every operation runs its filesystem calls on tokio's blocking pool.
+//! Every [`ObjectStoreBackend`] operation runs its filesystem calls on
+//! tokio's blocking pool; `open` and `wipe` block the calling thread.
 //! Filesystem errors are [`StoreError::Permanent`].
 
 use std::fs::{self, File, OpenOptions};
@@ -260,9 +261,7 @@ fn clear_dir(dir: &Path) -> Result<(), StoreError> {
     for entry in entries {
         let entry = entry.map_err(|e| io_error("read", dir, e))?;
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|e| io_error("stat", &path, e))?;
+        let file_type = entry.file_type().map_err(|e| io_error("stat", &path, e))?;
         if file_type.is_dir() {
             fs::remove_dir_all(&path).map_err(|e| io_error("remove", &path, e))?;
         } else {
@@ -580,7 +579,12 @@ impl Inner {
 
     /// One page of keys under `prefix` starting at `start`, strictly after it
     /// when `exclusive`, with the oracle's page and token rules.
-    fn list_page(&self, prefix: &str, start: &str, exclusive: bool) -> Result<ListPage, StoreError> {
+    fn list_page(
+        &self,
+        prefix: &str,
+        start: &str,
+        exclusive: bool,
+    ) -> Result<ListPage, StoreError> {
         let _guard = self.commit.lock();
         let mut out = Vec::with_capacity(self.page_size.min(64));
         for key in self.keys_under(prefix)? {
@@ -1026,7 +1030,11 @@ mod tests {
         ];
         for (i, key) in keys.iter().enumerate() {
             store
-                .put(key, Bytes::from(format!("object {i}")), PutOptions::default())
+                .put(
+                    key,
+                    Bytes::from(format!("object {i}")),
+                    PutOptions::default(),
+                )
                 .await
                 .expect("put");
         }
@@ -1045,7 +1053,10 @@ mod tests {
             .collect();
         let mut sorted: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
         sorted.sort();
-        assert_eq!(listed, sorted, "every key lists back verbatim, in key order");
+        assert_eq!(
+            listed, sorted,
+            "every key lists back verbatim, in key order"
+        );
     }
 
     /// Non-ASCII keys are unaddressable (ADR-2637), so the store refuses them
@@ -1062,8 +1073,12 @@ mod tests {
         let store = open_in(dir.path());
         let oracle = crate::memory::MemoryStore::new();
         for result in [
-            store.put(key, Bytes::from_static(b"x"), PutOptions::default()).await,
-            oracle.put(key, Bytes::from_static(b"x"), PutOptions::default()).await,
+            store
+                .put(key, Bytes::from_static(b"x"), PutOptions::default())
+                .await,
+            oracle
+                .put(key, Bytes::from_static(b"x"), PutOptions::default())
+                .await,
         ] {
             assert!(matches!(result, Err(StoreError::UnaddressableKey { .. })));
         }
@@ -1101,7 +1116,13 @@ mod tests {
 
         // The mapping alone, without the addressability check in front of it,
         // keeps every such key inside the directory.
-        for key in ["..", "../escape", "a/../../escape", "/absolute/path", "a\0b"] {
+        for key in [
+            "..",
+            "../escape",
+            "a/../../escape",
+            "/absolute/path",
+            "a\0b",
+        ] {
             let path = store.inner.object_path(key).expect("mappable");
             let relative = path.strip_prefix(&dir).expect("inside the directory");
             assert!(
@@ -1140,7 +1161,10 @@ mod tests {
         let result = store
             .put(&key, Bytes::from_static(b"x"), PutOptions::default())
             .await;
-        assert!(matches!(result, Err(StoreError::Permanent(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(StoreError::Permanent(_))),
+            "{result:?}"
+        );
         assert!(tree(dir.path()).is_empty());
         let fits = format!("runs/{}", "x".repeat(MAX_NAME_BYTES - 1));
         store
@@ -1176,7 +1200,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = open_in(dir.path());
         store
-            .put("k", Bytes::from_static(b"0123456789"), PutOptions::default())
+            .put(
+                "k",
+                Bytes::from_static(b"0123456789"),
+                PutOptions::default(),
+            )
             .await
             .expect("put");
         let path = store.inner.object_path("k").expect("path");
@@ -1273,9 +1301,17 @@ mod tests {
         assert_eq!(winners.len(), 1, "exactly one create succeeds");
         let (winner, outcome) = &winners[0];
         let got = store.get("contended", GetRange::Full).await.expect("get");
-        assert_eq!(got.data, Bytes::from(vec![*winner; 4096]), "the winner's bytes");
+        assert_eq!(
+            got.data,
+            Bytes::from(vec![*winner; 4096]),
+            "the winner's bytes"
+        );
         assert_eq!(got.version, outcome.version);
-        assert_eq!(tree(dir.path()).len(), 1, "no losing temporary file is left");
+        assert_eq!(
+            tree(dir.path()).len(),
+            1,
+            "no losing temporary file is left"
+        );
     }
 
     #[tokio::test]
@@ -1295,15 +1331,31 @@ mod tests {
         let names = |page: &ListPage| -> Vec<String> {
             page.objects.iter().map(|m| m.key.clone()).collect()
         };
-        for (prefix, after) in [("a/", None), ("a", Some("a/2")), ("", Some("a/4")), ("a/", Some("0"))] {
+        for (prefix, after) in [
+            ("a/", None),
+            ("a", Some("a/2")),
+            ("", Some("a/4")),
+            ("a/", Some("0")),
+        ] {
             let mut ours = store.list_after(prefix, after, None).await.expect("ours");
-            let mut theirs = oracle.list_after(prefix, after, None).await.expect("oracle");
+            let mut theirs = oracle
+                .list_after(prefix, after, None)
+                .await
+                .expect("oracle");
             loop {
                 assert_eq!(names(&ours), names(&theirs), "{prefix:?} after {after:?}");
                 assert_eq!(ours.next, theirs.next);
-                let Some(token) = ours.next.clone() else { break };
-                ours = store.list_after(prefix, after, Some(token.clone())).await.expect("ours");
-                theirs = oracle.list_after(prefix, after, Some(token)).await.expect("oracle");
+                let Some(token) = ours.next.clone() else {
+                    break;
+                };
+                ours = store
+                    .list_after(prefix, after, Some(token.clone()))
+                    .await
+                    .expect("ours");
+                theirs = oracle
+                    .list_after(prefix, after, Some(token))
+                    .await
+                    .expect("oracle");
             }
         }
         let ours = store.list_delimited("a/").await.expect("delimited");
@@ -1316,10 +1368,7 @@ mod tests {
     }
 
     fn key_strategy() -> impl Strategy<Value = String> {
-        prop_oneof![
-            any::<String>(),
-            "[ab/. %~\\\\\u{0}\u{7f}é日-]{0,24}",
-        ]
+        prop_oneof![any::<String>(), "[ab/. %~\\\\\u{0}\u{7f}é日-]{0,24}",]
     }
 
     proptest! {

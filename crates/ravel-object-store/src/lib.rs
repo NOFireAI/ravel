@@ -14,8 +14,8 @@ pub mod instrument;
 pub mod kms_routing;
 pub mod memory;
 pub mod s3;
-pub mod scratch;
 pub mod scheduling;
+pub mod scratch;
 
 use std::sync::Arc;
 
