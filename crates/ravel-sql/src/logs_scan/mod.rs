@@ -4051,6 +4051,42 @@ mod cstat_reconcile_tests {
         (answered, delta)
     }
 
+    /// The key-index route set on a logs scan survives every rebuild the
+    /// optimizer applies: `reproject`, `reproject_attr_keys` and the sibling
+    /// a pushed fetch or TopK builds. A rebuild that drops it sends the scan
+    /// back to the tier-1 probe for every segment.
+    #[test]
+    fn the_key_index_route_survives_every_rebuild() {
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let route = Arc::new(LogsKeyIndexRoute {
+            catalog: Arc::new(
+                ravel_catalog::Catalog::new(backend, ravel_catalog::CatalogConfig::default())
+                    .expect("catalog"),
+            ),
+            parts: SnapshotParts::new(Vec::new(), Vec::new()),
+            max_probed_parts: None,
+        });
+        let scan = scan_with(10, Vec::new()).with_key_index_route(Some(Arc::clone(&route)));
+        let declared = [DeclaredColumn::new(COL, DeclaredType::I64)];
+        let full_len = crate::logs_schema::logs_schema_with_declared(&declared)
+            .fields()
+            .len();
+
+        let carried = |s: &LogsScanExec| {
+            s.key_index_route
+                .as_ref()
+                .is_some_and(|r| Arc::ptr_eq(r, &route))
+        };
+        assert!(carried(&scan));
+        assert!(carried(&scan.reproject(vec![0], false).expect("reproject")));
+        assert!(carried(
+            &scan
+                .reproject_attr_keys(vec![0, full_len], vec!["k".to_string()])
+                .expect("reproject_attr_keys")
+        ));
+        assert!(carried(&scan.sibling(Some(5), None)));
+    }
+
     fn not_equal_404(scan: &LogsScanExec) -> Option<u64> {
         scan.declared_not_equal_count(0, &ScalarValue::Int64(Some(404)))
     }
