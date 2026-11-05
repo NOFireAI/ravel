@@ -135,7 +135,9 @@ DataFusion re-applies the *original* predicate against the emitted batch.
 exactly the data a row's SQL semantics demand... The merged column and the
 residual are the whole correctness story." Both new extraction shapes stay
 `Inexact` for the same reason: pruning underneath the residual, never a
-substitute for it.
+substitute for it. This precedent covers the prune arms this ADR builds; a
+declared Str column's `<>` against a literal is now evaluated exactly in
+the scan and reported `Exact` (see the exact not-equal amendment below).
 
 ## Decision
 
@@ -203,7 +205,10 @@ separately-sound prune primitives.
      `Cast`-wrapped operand DataFusion's own type coercion may have
      already inserted, e.g. rewriting `i64_col > 3.14` to compare against
      a cast column) — is **not extracted**. Never coerce a mismatched
-     literal to fit; decline instead.
+     literal to fit; decline instead. `<>` on a declared `Str` column
+     against a string literal still produces no prune arm, but is
+     evaluated exactly in the scan (see the exact not-equal amendment
+     below).
 3. **Wire the produced predicate into the existing `prune: Vec<Predicate>`
    field** on whatever pushdown-result struct `logs_pushdown.rs` already
    builds (no struct change: it is already typed to hold arbitrary
@@ -287,7 +292,9 @@ flowchart LR
    non-matching row inside a block that merely wasn't pruned (the
    ordinary, expected case for a coarse block-level bound) would stream
    to the client unfiltered — wrong query results, not a hygiene
-   trade-off.
+   trade-off. The reason holds for the prune arms; it does not cover an
+   evaluator that runs per row on the built column, which the exact
+   not-equal amendment below adds for a declared Str `<>`.
 3. **Blocking this ADR on ADR-0101's F64 code landing**, to ship numeric
    pushdown for all three numeric-capable declared types at once.
    Rejected: I64 and Bool cover real, already-declarable tenant columns
@@ -358,3 +365,406 @@ flowchart LR
   soundness argument, or POSTINGS' write path: this ADR is the first real
   caller of primitives #331 and #333 already proved correct in isolation,
   and inherits their proofs rather than re-deriving them.
+- Since the exact not-equal amendment, a declared Str `<>` against a
+  literal has no `FilterExec` above the scan; every other shape here is
+  unchanged.
+
+## Amendment (2026-11-05): a declared Str column's `<>` against a literal is evaluated exactly in the scan
+
+<!-- amendment-applies: sections="Precedent: pushdown stays Inexact, DataFusion's residual is the correctness backstop|Decision|Rejected alternatives|Consequences" pointer="exact not-equal amendment" -->
+
+Status: Accepted (2026-11-05). Not yet implemented; the pull requests below
+carry it.
+
+### Evidence
+
+The evidence is the fresh profile on `main` 5a71c86b3, run `profvm-20261105T0851Z`, with an 8 GB
+decoded cache, entry 637aaa80a. It is #3231 comment 6655737907.
+
+- Hot sum: 32.29 s. In it, `merge_dictionary_values` and `concat_dictionaries`, inclusive and
+  weighted by hot wall, take 0.602 s.
+- That time is inside the batch coalescer of the `FilterExec` that sits above `LogsScanExec`
+  (`finish_buffered_batch`, 0.643 s). On q13 to q15 it is almost all of that FilterExec's cost:
+  0.085 s of 0.095 s, 0.085 s of 0.113 s and 0.093 s of 0.124 s.
+- Statement numbers are 1-based, as in `ravel/queries.sql` and the profile.
+
+Why the merge happens:
+
+1. **The conjunct is not pushed.** `"SearchPhrase" <> ''` and the other `<> ''` conjuncts are not
+   pushed at all. This ADR's decision 2 does not extract `!=`, and `str_eq_value` returns `None`
+   for any operator but `=` (`crates/ravel-sql/src/logs_pushdown.rs:735-738`). So the provider
+   reports the filter `Inexact` as an unrecognized shape
+   (`crates/ravel-sql/src/logs_provider.rs:445-466`), and DataFusion keeps a `FilterExec` above
+   the scan.
+2. **The FilterExec always coalesces.** In DataFusion 55.2, `FilterExec` wraps its output in a
+   `LimitedBatchCoalescer` (datafusion-physical-plan 55.2.0 `filter.rs:615-619`). The coalescer
+   concatenates the filtered batches.
+3. **The concat merges dictionaries.** arrow-select 59.3.0 merges the dictionaries of a concat
+   when their values arrays differ and the total values reach the output length
+   (`dictionary.rs:214-219`, called from `concat.rs:110-114` with no mask).
+4. **The memo values make that always true.** A block served from the decoded cache emits its
+   declared Str column as identity keys over the entry's memo array (ADR-3326, zero-copy values
+   amendment, decision 2). A plain-page memo array holds one value per row of its block. Any two
+   filtered blocks therefore have more values than surviving rows, and every concat interns
+   every value of every block it joins.
+
+### What changes
+
+1. **Scope.** A top-level conjunct `c <> v` (either operand order) is evaluated exactly inside the
+   logs scan, and the provider reports it `Exact`, when all of these hold:
+   - `c` is a bare `Expr::Column` that resolves to a declared column of type `Str` (this ADR's
+     decision 1, fixed names excluded);
+   - `v` is a non-NULL string literal: `Utf8`, `Utf8View`, or the `Dictionary(Int32, Utf8)`
+     scalar that type coercion produces;
+   - the provider is not acting as a distributed coordinator. That path stays blanket `Inexact`
+     (`logs_provider.rs:451-456`).
+
+   The literal is any string, not only `''`. The exactness argument below does not depend on its
+   value, and narrowing it to `''` would add a special case with no gain in safety. This holds on
+   every storage shape of the column (plain pages, dictionary pages, dictionary values of the
+   `Text`, `Mixed` or `Raw` regions, served or decoded, record cell or resource/scope fallback),
+   because the scan evaluates the column it has already built, not the stored pages.
+
+2. **Where the scan evaluates it.** The scan evaluates the conjunct on the Arrow batch it has built
+   for a block, after the column build and before it emits or charges the batch. It does not
+   evaluate it in the reader.
+   - The evaluator is DataFusion's own physical expression for the conjunct, created by the
+     session against the scan's build schema.
+   - It is applied with `filter_record_batch`, the call `FilterExec` makes, which treats a NULL
+     verdict as false.
+   - The reader's surviving-row list, its arms, and its counters do not change.
+
+3. **A channel of its own.** The conjunct goes to a new `LogsPushdown` field, here called
+   `row_filters`. It does not go to `prune`, `content` or `key_equals`.
+   - `content` is the reader's per-row channel, and the reader cannot see the merged value (see
+     the exactness argument).
+   - `prune` and `key_equals` are block-only.
+   - The shape still produces no prune arm and no key, as today
+     (`not_equal_on_declared_i64_is_the_only_negation_prune_arm`,
+     `logs_pushdown.rs:1428-1430`).
+
+4. **What the scan must do once the filter is deleted.**
+   - **Build the filter column.** The scan builds the conjunct's column even when the output
+     projection does not name it, and drops it before emission. DataFusion no longer folds
+     filter-only columns into the scan projection once the filter is `Exact`. q31 and q32 use
+     `SearchPhrase` only in `WHERE`. Phase 1 of TopK late materialization (ADR-0774) projects only
+     `ts` and the row ref for q25 and q27.
+   - **Every emission path.** It applies the filter on the columnar path
+     (`build_columnar_batches`, then `hold_batches`) and on the row path (`emit_next_row_batch`),
+     and on every sibling `LogsScanExec::reproject` and `sibling` build.
+   - **Row refs.** In phase 1 of late materialization, the row-ref column is built with the batch
+     and filtered with it, so each kept row keeps its own reference.
+     - Phase 2 (`fetch_block`, `crates/ravel-sql/src/logs_scan/mod.rs:2838-2870`) resolves rows
+       by position in the reader's surviving-row list. That list is rebuilt from `content` and
+       `prune` only (`query()`, `:2838-2847`).
+     - So phase 2 does not apply `row_filters`, and nothing may recompute a reference after the
+       filter.
+   - **Fetch.** It counts a pushed `fetch` in rows after the filter. An `Exact` conjunct lets
+     `LimitPushdown` put a fetch on the scan for `WHERE ... LIMIT n` with no `ORDER BY`, which
+     cannot happen today.
+   - **Exact statistics.** `stats_are_exact` and `metadata_rewrite_stats_are_exact`
+     (`crates/ravel-sql/src/logs_scan/mod.rs:2257-2276`) return false whenever `row_filters` is
+     non-empty. Their doc's list of `LogsPushdown` fields gains the sixth.
+     - `stats_are_exact` also gates the exact row count, the `ts` extrema, and the declared
+       columns' exact min/max (`mod.rs:3112`).
+     - So one check covers `COUNT(*)`, `MIN` and `MAX` through `AggregateStatistics`.
+   - **Counter and EXPLAIN.** It reports the rows it dropped in a new partition counter,
+     `rows_dropped_by_row_filter`, and shows the conjuncts in the scan's EXPLAIN line.
+
+5. **Which statements change plan.** Only those whose every conjunct is now `Exact` lose the
+   `FilterExec`:
+   - q11 and q12 (`MobilePhoneModel <> ''`);
+   - q13 to q15 and q25 to q27 (`SearchPhrase <> ''`);
+   - q28 (`URL <> ''`) and q29 (`Referer <> ''`);
+   - q31 and q32 (`SearchPhrase <> ''`, with no Str column in the output).
+
+   q22 and q23 keep a `FilterExec` for their `LIKE` conjuncts. q37 and q38 keep one for their
+   integer conjuncts. In those four, the `<>` conjunct moves into the scan, and the FilterExec
+   still coalesces and merges.
+
+### Why the evaluator sits after the build, not in the reader
+
+A reader arm in `block_survivors` would have to agree with `FilterExec` on every row, and it does
+not see the value `FilterExec` sees. For a declared Str column the SQL value of a row is:
+
+- the record's `Str` cell when it is present, UTF-8 and the winning occurrence;
+- NULL when the winning occurrence has another type (ADR-0090 decision 7);
+- otherwise the stream's resource or scope `Str` value;
+- otherwise NULL.
+
+A block with an `attrs_raw` page resolves through the row path
+(`crates/ravel-sql/src/logs_scan/batch.rs:1731-1758`; `scan.rs:721`). The reader's `Equals` reads
+the record column only (`logs_pushdown.rs:65-79`). `Contains` keeps every row it cannot decide
+(`crates/ravel-logseg/src/record.rs:530-533`), and that is why LIKE is `Inexact`. An exact reader
+arm would reimplement the resolver that `build_str_block` already is.
+
+A reader arm also narrows the block. Both zero-copy paths require `surviving == record_count`
+(`batch.rs:353`, `:381`), so a narrowed plain block would copy its survivors into new values
+(`block_values`, `batch.rs:907-925`). That is the copy ADR-3326's zero-copy values amendment
+removed from these statements.
+
+### The exactness argument
+
+Today `FilterExec` computes `filter_record_batch(B, E(B))`, where:
+
+- `B` is the batch `LogsScanExec` emits;
+- `E` is DataFusion's physical expression for the conjunct.
+
+After this amendment the scan computes the same thing, on a batch `B+` that holds every column
+`B` holds plus the conjunct's column. It then projects to the output schema. The two agree on
+every row when all of these hold:
+
+1. **Same expression.** `E` is built by the same session planner from the same logical `Expr`.
+   The scan does not re-derive comparison or NULL semantics.
+2. **Same values.** The conjunct's column in `B+` is the column `FilterExec` reads today, built by
+   the same code (`build_str_block` on the columnar path, `build_batch` on the row path).
+   - Adding a declared column to the build projection does not change which path a block takes:
+     only `attrs` in the projection, a pending erasure, or an `attrs_raw` page decide that
+     (`mod.rs:742-744`, `scan.rs:721`).
+   - It does not change any other column's values, because each declared column is built from
+     its own cursor.
+3. **Every row passes through it.** Both emission paths and every sibling scan apply the filter.
+   No path emits a batch without it.
+4. **Nothing downstream assumes the scan is unfiltered.** The statistics gates (decision 4), the
+   metadata rewrite gate, and the fetch count all see the channel.
+   - `logs_scan_residual` drops every conjunct that `filter_is_exact` accepts
+     (`crates/ravel-sql/src/metadata_agg.rs:474-484`).
+   - So the SUM/AVG and q08 shapes are admitted logically with an empty residual, and only the
+     physical gate refuses them.
+5. **DataFusion deletes only what was reported `Exact`.** A compound conjunct that is recognized
+   only in part stays `Inexact`, as today (`partially_recognized_compound_filters_are_inexact`,
+   `logs_provider.rs:2629`).
+
+SQL three-valued logic follows from point 1. `NULL <> v` is NULL and is dropped. That covers:
+
+- an absent attribute with no fallback;
+- a winner of another type;
+- a non-UTF-8 cell with no fallback.
+
+A row with no record cell whose fallback differs from `v` is kept.
+
+### What changes for the decoded cache and the memo
+
+Nothing in ADR-3326 changes:
+
+- **Reader and admission.** The reader does not narrow the block. So no column is deferred,
+  served-column and admission rules are unchanged, and the serve-if-fits verdict applies only to
+  `Contains` scans as before.
+- **Memo fast paths.** `plain_memo` and `dict_memo_keys` still fire, because the reader's
+  `surviving == record_count` still holds.
+- **Values sharing.** Arrow's `filter` on a `DictionaryArray` filters the keys and keeps the
+  values `ArrayRef`. So the emitted column shares the memo array as an unfiltered batch does,
+  and `StrValuesCache`'s `ptr_eq` and `held` checks see one array per scan (zero-copy values
+  amendment, decision 1, "One `ArrayRef` per scan"). This is inference until test T8 pins it.
+- **Lifetime.** A narrowed batch keeps its whole block's memo values referenced for as long as a
+  downstream operator holds it. That is the same as an unfiltered batch: the pressure pass sees
+  `held_outside` true for that time. TopK holds at most the batches its k rows point into.
+
+### What stays Inexact, and why
+
+- **`=` on a declared Str or Bytes column.** It already emits a prune `Equals` and a KEY_IDX key,
+  and `leaf_is_exact` returns false whenever either is present (`logs_pushdown.rs:332-334`).
+  The same evaluator would make it exact, but no profiled statement has the shape. A follow-up
+  amendment can take it with its own evidence.
+- **`<>` on a declared Bytes column.** Same reason: no profiled statement has it.
+- **I64 and Bool comparisons** (`"CounterID" = 62` and the rest of q37 to q43). They stay on the
+  prune channel as decision 2 of this ADR describes. `prune_channel_filters_stay_inexact` pins
+  them (`logs_provider.rs:2600-2617`). The profile's shares for q37 to q40 rest on 11, 2, 0 and
+  50 samples, which is noise. The mechanism extends to them, but that needs a measured reason.
+- **`LIKE` and `NOT LIKE`** (ADR-2773, contains-arm amendment). Unchanged.
+- **`attrs['k'] <> 'v'`, `NOT (c = v)`, `c <> NULL`, a `Cast`-wrapped column, a column inside an
+  expression, `c <> other_column`, and any `OR`.** They are not the shape in decision 1.
+- **A distributed coordinator.** Its workers receive no filter.
+
+### Pull requests
+
+One behaviour change per pull request. All of them are in `crates/ravel-sql`. The gate is
+`scripts/gates.sh -p ravel-sql`, which also runs the `sql`, `flight-sql`, `esql` and ravel-bench
+lanes.
+
+1. **The scan narrows its own output by a pushed Str `<>` conjunct.**
+   - Adds the `row_filters` channel and its extraction, the physical-expression build in
+     `LogsTableProvider::scan`, the filter column in the build projection, the filter on both
+     emission paths and in `reproject`/`sibling`, the post-filter fetch count, the two statistics
+     gates, the counter and the EXPLAIN field.
+   - The provider still reports the conjunct `Inexact`, so the `FilterExec` stays above the scan.
+     It cannot put back a row the scan wrongly drops. So answers change in this PR only if the
+     scan drops a row the `FilterExec` would keep. T2 pins that, against a reference with no
+     in-scan filter.
+   - Tests T2, T3 (exec level), T5 (exec level), T7 and T8.
+   - Observable change: `rows_dropped_by_row_filter` is non-zero, and the `FilterExec` above drops
+     zero rows.
+2. **The provider reports the conjunct `Exact`, and DataFusion deletes the filter.**
+   - `leaf_is_exact` recognizes the decision 1 shape.
+   - The same commit updates the prose that states the old rule:
+     - docs/query-engine.md:164-186 and :4874-4884;
+     - the `supports_filters_pushdown` doc (`logs_provider.rs:418-443`);
+     - the `logs_pushdown` module doc (`:1-8`);
+     - the scan's correctness doc (`logs_scan/mod.rs:318-323`).
+   - Tests T1, T3 (SQL), T4, T5 (SQL), T6 and T9. `str_typed_column_declines_and_keeps_the_scan`
+     (`crates/ravel-sql/tests/logs_metadata_agg.rs:733`) gains an answer assertion.
+   - Before this PR, read `plan_aggregate_profile` (`crates/ravel-sql/src/memory.rs:671`). It is
+     behind the layout pinned for the q14 statement at `crates/ravel-sql/src/executor.rs:10419-10423`,
+     and it is not established whether it reads through the FilterExec.
+3. **The paired run.** No code. Pre-register the bands below on #3231 before the run. Run one
+   paired `cpuab` run: A is `main` at PR 2's merge base, B is PR 2's merge commit, with an 8 GB
+   decoded cache, entry 637aaa80a, and the same box. Record the result as an amendment of its
+   own.
+
+### Tests and the wrong implementations each must catch
+
+Every test in this list must be shown failing against each wrong implementation named under it
+before the pull request merges.
+
+- **T1, classification** (`logs_pushdown` and `logs_provider` units, plus a planned and optimized
+  SQL statement, per this ADR's decision 4 rule on optimized plans).
+  - Accepts `s <> 'x'` and `'x' <> s` with the literal as `Utf8`, `Utf8View` and the
+    `Dictionary(Int32, Utf8)` scalar, alone and AND-ed with a `ts` bound.
+  - Rejects `body <> 'x'`, `attrs['k'] <> 'v'`, an undeclared name, a declared Bytes or I64
+    column, `NOT (s = 'x')`, `s <> NULL`, `CAST(s AS ...) <> 'x'`, `lower(s) <> 'x'`, `s <> t`,
+    an `OR`, and `s <> 'x' AND s LIKE '%y%'` as one unsplit expression.
+  - Wrong implementations:
+    - (a) matching any `NotEq` with a column on one side, which accepts `body` and `attrs['k']`;
+    - (b) resolving the name without the fixed-column guard, which accepts `body` for a tenant
+      that also declares `body`;
+    - (c) testing the shape before the `prune`/`key_equals` early return, which accepts the I64
+      `NumNotEq` shape.
+- **T2, answers across value shapes** (`ravel-sql` integration test, real RLOG objects).
+  - The fixture has rows with: `''`; a non-empty value; no attribute and no fallback; no
+    attribute with resource value `'r'`; no attribute with resource value `''`; an I64 cell
+    for the key; a non-UTF-8 cell with fallback `'f'`; duplicate occurrences of the key.
+  - The rows are spread over a plain-page block, a dictionary-page block, and a block with an
+    `attrs_raw` page. They run once with `attrs` projected and once without.
+  - The answer must equal the reference answer. The reference is the same statement on a scan
+    with `row_filters` empty, so DataFusion's `FilterExec` is the only evaluator. That holds in
+    PR 1 and PR 2, and PR 1's plan, with both evaluators, would not serve as a reference.
+  - Wrong implementations:
+    - (a) a kernel that reads raw key values and ignores the null buffer. `push_key` writes key 0
+      under a NULL (`batch.rs:1888-1891`), so a NULL row reads entry 0's verdict and is kept;
+    - (b) a record-cell-only test in the reader, shaped like `column_eq_arm`, which drops the
+      `'r'` fallback row;
+    - (c) a filter on the columnar path only, which leaks the `''` row of the `attrs_raw` block;
+    - (d) a `Contains`-style keep-when-undecided rule, which keeps the I64-winner row.
+- **T3, the filter column is not projected.**
+  - Run `SELECT "SearchEngineID", COUNT(*) ... WHERE "SearchPhrase" <> '' GROUP BY 1` (the q31
+    shape), `SELECT COUNT(*) ... WHERE s <> ''`, and the late-materialized
+    `SELECT s FROM logs WHERE s <> '' ORDER BY ts LIMIT 3`, where the `''` rows have the earliest
+    timestamps.
+  - Wrong implementations:
+    - (a) evaluating only when the column is in the output projection, which counts every row;
+    - (b) a `reproject` sibling that drops `row_filters`, so phase 1 picks the `''` rows and the
+      statement returns empty strings;
+    - (c) a column-index mapping that is off after the projection is widened, caught with two
+      declared Str columns in the fixture;
+    - (d) for the late-materialized case with `''` rows placed between referenced rows of the
+      same block: row refs recomputed after the filter, or phase 2 filtering the block before it
+      takes positions. Either shifts every position after a dropped row, so phase 2 returns other
+      rows' values. The test asserts each returned `s` against its own `ts`.
+- **T4, statistics and the metadata rewrite.**
+  - Run `COUNT(*) WHERE s <> ''`, `MIN(n) WHERE s <> ''` and `MAX(n) WHERE s <> ''` (the
+    fixture's extreme `n` sits on a `''` row), `SUM(n) WHERE s <> ''` with column statistics
+    loaded, and `SELECT n, COUNT(*) ... WHERE s <> '' GROUP BY n`.
+  - Each must return the filtered answer. The plan must keep `LogsScanExec` and must not hold
+    `MetadataOnlyExec`.
+  - Wrong implementations:
+    - (a) `row_filters` missing from `stats_are_exact`, so `AggregateStatistics` answers the
+      count from `sample_count` and MIN/MAX from the segment stamps;
+    - (b) `row_filters` missing from `metadata_rewrite_stats_are_exact` only, so the SUM is
+      answered from the stored sum.
+- **T5, fetch.**
+  - Run `SELECT s FROM logs WHERE s <> '' LIMIT 5` on one partition whose first block starts
+    with ten `''` rows. It must return exactly five non-empty rows.
+  - The scan's statistics under that fetch must not report an `Exact` row count.
+  - Wrong implementations:
+    - (a) the fetch counted on built rows before the filter, which returns fewer than five rows;
+    - (b) `apply_fetch_to_statistics` left on the exact branch while `row_filters` is
+      non-empty.
+- **T6, distributed coordinator** (`flight-sql` lane). Every filter, the Str `<>` included, is
+  still reported `Inexact`.
+  - Wrong implementations:
+    - (a) the classification computed before the `distributed` check;
+    - (b) the coordinator's `scan` passing `row_filters` to workers that ignore it, while
+      reporting `Exact`.
+- **T7, the counter.**
+  - In PR 1, for the q13 shape, the `FilterExec` above the scan reports output rows equal to
+    input rows, and `rows_dropped_by_row_filter` equals the fixture's count of `''` and NULL
+    rows.
+  - Wrong implementations:
+    - (a) counting evaluated rows instead of dropped ones;
+    - (b) a row path that drops rows but does not count them.
+- **T8, the memo is not copied.**
+  - On a served plain block, the emitted column's values `ArrayRef` is `ptr_eq` to the scan's
+    shared memo array for that block. `PLAIN_MEMO_FAST_PATHS` counts the block. The batch's
+    charge counts the shared values once.
+  - Wrong implementations:
+    - (a) narrowing in the reader, which leaves the fast-path counter at 0;
+    - (b) filtering through `take` plus a values compaction or a cast, which gives a new values
+      array per batch, so the merge cost moves into a copy instead of going away.
+- **T9, plan shape** (explain over a fixture tenant with ClickBench's declared types).
+  - The q13 and q31 shapes hold no `FilterExec`, and no `RepartitionExec` sits directly above
+    `LogsScanExec`.
+  - The q22 shape keeps a `FilterExec` holding only the `LIKE` conjunct.
+  - Wrong implementations:
+    - (a) partial credit for a compound conjunct, which deletes the `LIKE` with it;
+    - (b) a scan reporting fewer partitions than `target_partitions`, which brings back a
+      round-robin coalescer over the scan.
+
+### Bands
+
+These are the figures for PR 3. Every ratio is B / A. Each figure must be present exactly once and
+inside its band. The rows come from two runs:
+
+- **Paired `cpuab` timing run.** This produces the hot-sum, geomean, per-statement ratio,
+  counter and answer rows. A and B are interleaved on one box, with an 8 GB decoded cache and
+  entry 637aaa80a. The hot figure is `min(try2, try3)`, as in the profile.
+- **Profiled run of both arms.** This produces the merge row, which a timing run cannot emit. It
+  uses the protocol of `profvm-20261105T0851Z`: `perf -F 99 -g`, one profiled call per statement
+  after one warm call. The `FilterExec` placement row is read from either run's EXPLAIN capture.
+
+| Figure | Band | Miss | Basis |
+|---|---|---|---|
+| Dictionary merge removed: `merge_dictionary_values` plus `concat_dictionaries` inclusive, hot-wall weighted, A minus B, over q11-q15 and q25-q29 | 0.301 to 0.602 s (50 to 100% of 0.602 s; the reachable ceiling is 0.596 s, since q23 and q40 keep their FilterExec) | below 0.301 s | predicted; #3231 comment 6655737907 |
+| Hot-sum saving, A minus B | 0.18 to 0.36 s | outside 0.18 to 0.36 s | predicted; #3231 comment 6655737907 |
+| 43-statement hot geomean ratio | 0.984 to 0.992 | outside 0.984 to 0.992 | predicted; #3231 comment 6655737907 |
+| `FilterExec` in B's plan | absent on q11-q15, q25-q29, q31, q32; present on q22, q23, q37-q43 | any other placement | predicted; research.md item 4 table, from `queries.sql` at 637aaa80a |
+| q31, q32 hot wall ratio (FilterExec goes, no dictionary to merge) | at most 1.00 | above 1.02 | predicted; #3231 comment 6655737907 (no merge listed for them) |
+| q22, q23, q37, q38 hot wall ratio (the conjunct moves into the scan, FilterExec stays) | 0.98 to 1.02 | outside 0.98 to 1.02 | predicted; width from docs/adrs/3326-decoded-column-block-cache.md:800 |
+| Every other statement's hot wall ratio | 0.98 to 1.02, unchanged | outside 0.98 to 1.02 | predicted; #3231 comment 6655737907; width from docs/adrs/3326-decoded-column-block-cache.md:800 |
+| Rows the scan drops (`rows_dropped_by_row_filter`), per statement whose FilterExec goes | equal to A's FilterExec input rows minus output rows for the same statement | any difference | predicted |
+| Every statement's answer | equal to A's | any difference | predicted |
+
+The first three rows are lever M of #3231 comment 6655737907:
+
+- The saving band takes the coalescer-finish base of 0.364 s times a retained fraction of 0.5 to
+  1.0.
+- The geomean band subtracts that saving from each affected statement's hot wall.
+- The merge row's ceiling is the sum of the per-statement merge figures for the ten statements
+  whose FilterExec goes: q11 0.023, q12 0.005, q13 0.085, q14 0.085, q15 0.093, q25 0.079,
+  q26 0.126, q27 0.080, q28 0.015, q29 0.005.
+
+**The merge row and the saving row rest on different bases.**
+
+- The merge row takes the fresh profile's per-statement merge figures at face value. That
+  includes q25, q26 and q27, which rest on 2, 81 and 2 samples.
+- The saving row's 0.364 s base replaces those noisy shares with prof028's shares times the
+  fresh hot wall (#3231 comment 6655737907, lever M).
+- So a merge cut near 0.5 s with a saving above 0.36 s is consistent. It still misses the saving
+  band and is recorded as a miss to explain.
+- The saving and geomean rows decide whether the change is kept. The merge and plan rows say
+  whether the mechanism did what this amendment claims.
+
+None of these bands has had a miss check, and the q11, q12, q25, q26 and q27 shares rest on
+fewer than 100 samples each. A merge figure below 0.301 s with the plan rows inside their bands
+would mean a coalescer still runs between the scan and its consumer. The first place to look is
+TopK compaction on q25 to q27 (`interleave_record_batch` merges dictionaries too).
+
+### Not established
+
+- No physical plan of an affected statement was captured. The plan rows above are predictions,
+  and T9 pins them on a fixture.
+- How much TopK compaction merges on q25 to q27 once batches arrive narrowed rather than coalesced
+  to 8,192 rows.
+- Whether the partial aggregate pays a per-batch cost on narrowed batches that eats part of the
+  saving. This is the retained fraction in the saving band.
+- The page shapes (plain or dictionary) of MobilePhoneModel, URL, Referer and Title in the
+  ClickBench tenant.
