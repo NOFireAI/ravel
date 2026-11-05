@@ -899,7 +899,6 @@ async fn a_refused_parts_charge_degrades_to_tier_one() {
         recorder.clone(),
         &Serve {
             catalog_budget: Some(budget),
-            ..Serve::default()
         },
     );
     let before = totals();
