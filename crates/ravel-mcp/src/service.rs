@@ -261,4 +261,12 @@ pub trait QueryBackend {
         tenant_hash: TenantHash,
         request: &DescribeRequest,
     ) -> Result<DescribeOutcome, Failure>;
+
+    /// What remains of the one deadline that bounds every call this backend
+    /// makes for a tool call, or `None` when each call gets the whole
+    /// deadline from its own start. A tool reads it before an optional
+    /// second call, to skip that call rather than start it with nothing left.
+    fn time_left(&self) -> Option<std::time::Duration> {
+        None
+    }
 }

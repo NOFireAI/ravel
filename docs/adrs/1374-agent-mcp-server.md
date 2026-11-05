@@ -171,7 +171,7 @@ amendment below.
 | `ravel_query_sql` | One `SELECT` over one table, with a required `time_range` applied as a row filter, `max_rows`, budgets that can only be lowered, and a keyset cursor | D3 |
 | `ravel_query_promql` | Instant or range evaluation, partial-coverage consent, step alignment, the two log pseudo-metrics | `QueryEngine` through the service layer |
 | `ravel_search_logs` | Typed log search compiled to SQL. Uses indexed and declared predicates, `has_word`, severity, and trace id. Orders by `ts`. Groups rows by attribute set and hoists shared attributes once | D3 |
-| `ravel_get_trace` | Spans of one trace id inside a required window, the span tree, the missing parents, and the orphans. An optional logs leg, reported as an unindexed scan with its own cost (the span-tree amendment below records the tree's columns and defers the logs leg) | `spans_pushdown` fast path |
+| `ravel_get_trace` | Spans of one trace id inside a required window, the span tree, the missing parents, and the orphans. An optional logs leg, reported as an unindexed scan with its own cost (the span-tree amendment below records the tree's columns; the logs-leg amendment below records the leg, its separate cost and its bounds) | `spans_pushdown` fast path |
 | `ravel_analyze_timeseries` | `change_point` or `summary` over a PromQL range result. The output says "heuristic", the minimum point count, and if it was downsampled | `analytics.rs::run` through the service layer, which adds admission |
 
 Phase 2 tools: `ravel_compare_windows` and `ravel_correlate_signals`
@@ -1499,7 +1499,8 @@ the choices D2's row leaves open.
 
 D2's row gives `ravel_get_trace` the span tree, the missing parents and the
 orphans, plus a logs leg. This span-tree amendment records how the tree is
-reported, why the tool mints no cursor, and that the logs leg is deferred.
+reported, why the tool mints no cursor, and that the logs leg is deferred
+(superseded: it ships; see the logs-leg amendment below).
 
 A. Where the tree is computed. The tool body
    (`crates/ravel-mcp/src/tools/get_trace.rs`) computes it over the rows the
@@ -1510,7 +1511,8 @@ A. Where the tree is computed. The tool body
    executor's own row cap in `presentation.row_cap_hit`, so the tool can
    apply the caps first and label the rows that survive them.
 B. Output. Two columns come first in every row. `__ravel_parent` is `root`
-   when the span's `parent_span_id` is null, `present` when a returned span
+   when the span's `parent_span_id` is null (or all zeros, per the logs-leg
+   amendment below), `present` when a returned span
    has that id, `cycle` when following parents from the span leads back to
    it, and otherwise `missing` when the result is complete and
    `not_returned` when it is not. Complete means no row cap and no byte cap
@@ -1544,9 +1546,11 @@ D. Next steps. A `missing` parent under a `time_range` adds
    `not_returned` parent adds `raise_max_rows` (up to 5,000, or narrow
    `time_range`). Any other result carries neither, including a `missing`
    parent with no `time_range`, where widening has nothing to widen.
-E. The logs leg is deferred and still owed under #1382; D2's row keeps it.
+E. The logs leg is deferred and still owed under #1382; D2's row keeps it
+   (superseded: the leg ships; see the logs-leg amendment below).
    Its acceptance test is `logs_leg_reports_unindexed_scan_cost`: the leg
    reports its scan as unindexed, with its own cost. Until it ships,
+   (superseded by the logs-leg amendment below, which serves it)
    `include_logs: true` is refused as `unsupported`, and the message names
    `ravel_search_logs` with a `trace_id` predicate and a `time_range` as
    the call that serves a trace's logs today.
@@ -1975,3 +1979,88 @@ settled here.
    `ravel_agent_events` is the tool this applies to; its events page
    carries the route's `next_cursor` when its only cut is a shortened
    payload.
+
+## Amendment (2026-11-04, #1382): the logs-leg amendment, `ravel_get_trace` returns the trace's log records on request
+
+<!-- amendment-applies: sections="D2. Nine tools, three resources, two prompts|Amendment (2026-11-03, #1382): the span-tree amendment, `ravel_get_trace` reports each span's depth and parent" pointer="logs-leg amendment" -->
+<!-- amendment-supersedes: phrase="logs leg is deferred" pointer="logs-leg amendment" -->
+<!-- amendment-supersedes: phrase="`include_logs: true` is refused as `unsupported`" pointer="logs-leg amendment" -->
+
+D2's row promises `ravel_get_trace` an optional logs leg, reported as an
+unindexed scan with its own cost, and item E of the span-tree amendment
+deferred it. This logs-leg amendment ships it and records each choice.
+
+1. Opt-in, and invisible when off. `include_logs` defaults to false. False
+   or omitted, the call runs no second statement and its envelope is byte
+   for byte the one without the argument: the leg's block is an optional
+   envelope field left out when absent. With `true`, `time_range` is
+   required and its absence is refused as `missing_argument` before any
+   read, because the leg's cost is the window's log volume and a
+   whole-retention scan is not a sensible default.
+2. Selection. The leg calls `ravel_search_logs`'s own body with only the
+   trace id and the call's window, so it is that tool's SQL synthesis and
+   nothing else: `"trace_id" = X'...'`, the window as a half-open row
+   filter, ordered by `ts` then `observed_ts`. Its rows keep that tool's
+   shape, including the `__ravel_group` and `__ravel_group_attrs` columns.
+   The page's cursor and the tool's own warnings and next steps are
+   dropped; the leg reports its own.
+3. Placement. The records go in a new top-level `logs` block, not in
+   `data`: `data` stays the span table the tree labels, and the D4 output
+   schema lists the blocks without forbidding others, so `tools/list` does
+   not change. The block carries `status` (`ok`, `ok_bounded`, `skipped`,
+   `failed`), `failure`, `skipped_reason`, `columns`, `rows`, `row_count`,
+   `row_cap_hit`, `bytes_cap_hit`, `rows_omitted`, `budget` and
+   `span_lookup_budget`. The call's top-level `status` and `failure`
+   describe the spans only.
+4. Cost. A leg that started adds a warning that it ran an unindexed scan:
+   no trace index covers logs, so it reads the window's logs and keeps the
+   matching records. A logs key index on `trace_id`, where a tenant
+   declares one, can skip objects, and the warning says so rather than
+   claiming the scan is always full. `logs.budget` is the leg's own
+   `actual` and `estimate`; `logs.span_lookup_budget` is the span lookup's.
+   The top-level `budget.actual` and `budget.estimate` stay the whole
+   call's, the two summed per key (null on either side stays null, a key
+   one side lacks keeps the other's value, `unbounded` lists merged).
+5. No upper envelope. The leg's estimate is a scan estimate, not a bound
+   on what one trace's records cost, so `logs.budget` never claims one,
+   and a call with `include_logs: true` reports
+   `estimate_is_upper_envelope: false` even when the span lookup's own
+   claim, kept in `logs.span_lookup_budget`, is true. A call without the
+   leg is unchanged.
+6. Deadline. The leg runs on the same `ServiceBackend` as the span lookup,
+   so it is bounded by what is left of the call's one deadline
+   (`with_call_start`, the call-deadline amendment). A new
+   `QueryBackend::time_left` reports that remainder; when it is zero after
+   the span lookup the leg does not start and is `skipped` with the reason
+   "no time was left of the call's deadline after the span lookup". A leg
+   that starts and runs out is `failed` with class `deadline`.
+7. Failure isolation. A leg that fails for any reason (a budget, the
+   deadline, an engine error) is `failed` with its failure class and a
+   message bounded to 512 bytes, and the spans are returned as they would
+   be without it. Its spend is whatever its failure reported, which for a
+   refusal is empty, so the summed `budget.actual` can under-count a leg
+   that read data before it failed.
+8. Rows. `max_rows` applies to spans and to log records separately: each
+   gets the call's `max_rows`, so a leg cannot crowd the spans out of the
+   row cap. The leg's own cut is reported in `logs.row_cap_hit` and
+   `logs.rows_omitted`, never in `presentation`, which stays the spans'.
+9. Bytes. `max_response_bytes` is shared, spans first. The span fit runs
+   with the leg's columns, warning and next step already in the envelope
+   and its fields at their widest values, so the fit measures everything
+   but the records; if even that does not fit, the leg's columns are
+   dropped too. The records are then added as the longest prefix that
+   keeps the serialized envelope inside the fit, the rest counted in
+   `logs.rows_omitted` with `logs.bytes_cap_hit` set, and the widest
+   values are rewritten with the real ones, which only shorten it. The
+   limit therefore holds for the final envelope.
+10. No cursor. The leg mints none, for the same reason the span tree has
+    none. A leg cut by either cap is `ok_bounded` and adds a
+    `ravel_search_logs` next step naming the trace id and the window, the
+    route that pages through the rest; an uncut leg carries no step.
+11. Root parents. An all-zero `parent_span_id`, OTLP's encoding of no
+    parent, is a `root`, like a null one. Item B of the span-tree
+    amendment named only null.
+12. Rendering. The compact text block renders `data` only, so the leg's
+    records are in `structuredContent` alone.
+13. `tools/list`. The `include_logs` input doc is rewritten to the same
+    length, so the pinned sizes of item F (16,177 and 24,066 bytes) hold.
