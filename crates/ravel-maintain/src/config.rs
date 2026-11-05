@@ -1511,11 +1511,12 @@ pub fn claim_lease_below_warn_threshold(
     let threshold_ms = u64::try_from(encode_ms.saturating_mul(2)).unwrap_or(u64::MAX);
     claim_lease_duration < Duration::from_millis(threshold_ms)
 }
-/// Default footer suffix-probe size: 128 KiB. It covers the footer and the
-/// four directory sections an RLOG input's tail carries (SKIP_IDX, PAGE_DIR,
-/// STREAM_DIR, FIELD_DIR), so the RLOG catalog load slices them from this one
-/// GET instead of fetching each by range (docs/log-segment-format.md reader
-/// protocol).
+/// Default footer suffix-probe size: 128 KiB, for RSEG, RSPAN and RLOG inputs
+/// alike. It is sized for the footer and the four directory sections at the
+/// end of an RLOG input's tail (SKIP_IDX, PAGE_DIR, STREAM_DIR, FIELD_DIR):
+/// the RLOG catalog load slices each section that lies wholly inside the probe
+/// from this one GET and fetches the rest by range (docs/log-segment-format.md
+/// reader protocol).
 pub const DEFAULT_FOOTER_PROBE_BYTES: u64 = 128 * 1024;
 /// Default `input_read_concurrency`: 8 input reads in flight at once.
 pub const DEFAULT_INPUT_READ_CONCURRENCY: usize = 8;

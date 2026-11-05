@@ -153,7 +153,11 @@ Identical in shape to RSEG v1:
    pays for it with step 3's extra ranged GET. `ravel-query`'s log fetcher
    probes 256 KiB, sized so that one probe carries the footer, SKIP_IDX and
    PAGE_DIR past the BLOOM section that sits between them (ADR-0699
-   decision 5).
+   decision 5). `ravel-maintain`'s compaction catalog load probes
+   `footer_probe_bytes` (default 128 KiB) and slices every section it reads
+   whose whole stored range lies inside the probe, footer included, from
+   that one GET; only a section the probe misses or covers in part costs a
+   ranged GET of its own.
 3. Require `footer_len > 0` and `16 + footer_len <= total_size`;
    otherwise `Corrupted`. If the suffix did not cover the footer, issue
    one more ranged GET.
@@ -1671,14 +1675,16 @@ The merge is defined entirely in terms of this format:
   the catalog does so a scope-only change reaches compacted
   data only through this tie rule: it reaches the output when an input
   written under the new scope is the first input at the highest
-  generation. Reading that input's covered list costs one ranged GET per merge
-  of at most `8 + 5 * (10 + string columns)` bytes (the whole section when
-  its BLOOM is compressed), and none when that input holds no string column,
-  in which case the output covers every string column.
+  generation. Reading that input's covered list reads at most
+  `8 + 5 * (10 + string columns)` bytes (the whole section when its BLOOM is
+  compressed), and none when that input holds no string column, in which
+  case the output covers every string column. An uncompressed list prefix
+  that lies wholly inside the input's footer probe is sliced from it at
+  catalog load; otherwise the read is one ranged GET per merge.
 - **KEY_IDX.** The output names the union of the inputs' KEY_IDX fields,
-  read from each input's section header by one ranged GET of
-  `[0, prefix_len)`, and its entries are rebuilt from the merged blocks; an
-  input's entries are never reused, since the block ordinals differ. A field
+  read from each input's section header, `[0, prefix_len)`, sliced from the
+  footer probe when it lies wholly inside it and one ranged GET otherwise,
+  and its entries are rebuilt from the merged blocks; an input's entries are never reused, since the block ordinals differ. A field
   no output row carries is still named, with `entry_count = 0`. A field two
   inputs name under different key types is left out of the output's header
   and logged at warn level, and the merge goes ahead with every other
