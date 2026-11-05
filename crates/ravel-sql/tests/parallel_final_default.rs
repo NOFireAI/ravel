@@ -517,9 +517,10 @@ async fn avg_over_int_column_carries_a_decimal128_partial_sum_state() {
         partial.contains("[avg_count]:Int64"),
         "avg's partial count state must be an integer count; got:\n{partial}"
     );
-    // The other exact-typed aggregate over the same column, for contrast:
-    // sum(k) carries a plain Int64 partial state (unchanged by ADR-0825,
-    // which explicitly does not touch the public `sum` aggregate).
+    // The other exact-typed aggregate over the same column: sum(k) runs the
+    // checked integer sum (ADR-0022's integer sum amendment), whose partial
+    // state is the exact i128 sum as Decimal128(38, 0), range-checked against
+    // Int64 only at the final evaluation.
     let sum_plan = fixture
         .physical_plan_text_with_schema("SELECT sum(k) AS s FROM logs")
         .await;
@@ -528,8 +529,9 @@ async fn avg_over_int_column_carries_a_decimal128_partial_sum_state() {
         .find(|line| line.contains("AggregateExec: mode=Partial"))
         .unwrap_or_else(|| panic!("expected a Partial AggregateExec; got:\n{sum_plan}"));
     assert!(
-        sum_partial.contains("sum(logs.k)[sum]:Int64"),
-        "sum over an Int64 column must carry an Int64 partial state; got:\n{sum_partial}"
+        sum_partial.contains("sum(logs.k)[sum_exact]:Decimal128(38, 0)"),
+        "sum over an Int64 column must carry the exact Decimal128(38, 0) partial \
+         state; got:\n{sum_partial}"
     );
 }
 

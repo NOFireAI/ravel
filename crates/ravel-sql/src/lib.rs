@@ -120,6 +120,7 @@ pub mod spill;
 mod statement;
 mod statement_accounting;
 pub mod stats_json;
+mod sum;
 mod trace_id_planner;
 mod udf;
 mod validate;

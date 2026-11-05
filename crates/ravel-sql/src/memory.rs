@@ -825,6 +825,17 @@ fn accumulator_widths(expr: &AggregateFunctionExpr) -> Option<Vec<usize>> {
     match expr.fun().name() {
         // `CountGroupsAccumulator`: one `i64` per group.
         "count" => Some(vec![8]),
+        // Ravel's checked integer `SUM`: an `i128` sum and a `bool` seen
+        // flag per group.
+        "sum"
+            if expr
+                .state_fields()
+                .ok()?
+                .iter()
+                .any(|field| field.name().ends_with(crate::sum::EXACT_SUM_STATE_SUFFIX)) =>
+        {
+            Some(crate::sum::EXACT_SUM_GROUP_WIDTHS.to_vec())
+        }
         // `PrimitiveGroupsAccumulator` over the return type.
         "sum" | "min" | "max" => Some(vec![return_type.primitive_width()?]),
         "avg" => {
@@ -2624,8 +2635,8 @@ mod tests {
         capacity_accounted: false,
     };
 
-    /// q33's layout as `plan_aggregate_profile` reads it: per group 56 bytes
-    /// of `Vec`s, all of them reported by capacity.
+    /// A q33-like layout with every `Vec` reported by capacity: per group 56
+    /// bytes of `Vec`s.
     const Q33_ACCOUNTED_LAYOUT: AggregateLayout = AggregateLayout {
         entry_size: 16,
         vec_width_total: 56,
