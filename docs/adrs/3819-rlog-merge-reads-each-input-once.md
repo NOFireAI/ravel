@@ -62,6 +62,11 @@ is N.
 | GET rate per merge, this run | about 53 GETs/s, catalog GETs included | 461,608 GETs / 4,320 s / 2 merges, #3819 |
 | merge wall time per shard-hour at that rate | about 180 h (model) | 34 million / 53 |
 | decoded (row heap estimate) over stored, L1 output | 55 to 67 | two L1 parts closed on the 269,565,184-byte memory target at 4,933,909 and 4,024,942 bytes |
+| block GETs, counting store, N = 12 inputs of S = 60 streams, one row group each | cursor merge 720 (60 per group); resident 12 (1 per group, 7 passes); fetch-per-pass 108 (9 per group, P = 9); catalog GETs 60 in every mode | measured 2026-11-04, `crates/ravel-maintain/src/rlog.rs:12273` |
+| hot stream, records per input 3,000 then 30,000, default ceiling | transient term 41,613 bytes at both sizes; resident term 312 then 3,219 bytes; pass rows 1,773,000 then 17,730,000 bytes, one pass holding the whole stream | measured 2026-11-04, `crates/ravel-maintain/src/rlog.rs:8279` |
+| the same hot stream under a 2 MiB ceiling, so on cursors (D3) | transient term 161,703 bytes at both sizes; pass rows 0; `peak_total_bytes` (transient plus writer and probe) 227,285 bytes at both sizes | measured 2026-11-04, `crates/ravel-maintain/src/rlog.rs:8279` |
+| hot stream inside a 41-stream bucket of 21 inputs | resident 6,329 bytes, pass rows 24,786, transient 53,901, under a 437,316-byte ceiling and a 65,536-byte pass budget | measured 2026-11-04, `crates/ravel-maintain/src/rlog.rs:12437` |
+| process RSS, 3,600 RLOG inputs, 10 hot streams | VmHWM 95,956 KiB, 77,092 KiB above the seeded baseline | measured 2026-11-04, `crates/ravel-maintain/tests/memory.rs:129` |
 
 ## Decision
 

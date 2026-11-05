@@ -535,6 +535,51 @@ impl RlogRangeReader {
         StreamBlockRows::new(self, decoded, loc.stream_ref)
     }
 
+    /// Decodes `block` out of a fetched row group once and rebuilds every row
+    /// whose `stream_ref` satisfies `wanted`, in ascending row order, each
+    /// paired with its `stream_ref`. Also returns the decoded columnar block's
+    /// heap bytes, which the caller drops with this call's return.
+    ///
+    /// `group_bytes` must be the object's `[loc.start, loc.end)` range, and
+    /// `block` must lie in that row group; `loc` may be any stream's loc over
+    /// the group. For one stream this yields the same records, in the same
+    /// order, as draining [`Self::block_rows_in_group`] for that stream's loc,
+    /// so a merge over many streams of one group decodes each block once
+    /// instead of once per stream.
+    pub fn block_rows_for_refs(
+        &self,
+        loc: &StreamBlockLoc,
+        block: usize,
+        group_bytes: &[u8],
+        wanted: impl Fn(u32) -> bool,
+    ) -> Result<(Vec<(u32, LogRecord)>, u64), LogSegError> {
+        let plans = self.check_loc_bytes(loc, group_bytes)?;
+        if self.extent_of(&[block])? != (loc.start, loc.end) {
+            return Err(LogSegError::Corrupted(
+                "block is not in this loc's row group".into(),
+            ));
+        }
+        let decoded = self.decode_one_block(
+            block,
+            loc.start,
+            group_bytes,
+            &plans,
+            &mut DictCache::default(),
+        )?;
+        let mut out = Vec::new();
+        for row in 0..decoded.record_count() {
+            let sref = u32::try_from(i64_at(&decoded, COL_STREAM_REF, row)?)
+                .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+            if wanted(sref) {
+                out.push((
+                    sref,
+                    rebuild_record(&self.stream_dir, &self.field_dir, &decoded, row)?,
+                ));
+            }
+        }
+        Ok((out, decoded.decoded_heap_bytes() as u64))
+    }
+
     /// Check that `bytes` is exactly `loc`'s fetched range and return the column
     /// plans a decode of it needs.
     fn check_loc_bytes(
@@ -1109,6 +1154,78 @@ mod tests {
             assert_eq!(lazy, whole, "lazy drain == eager whole-stream decode");
             assert_eq!(lazy, expected, "and all three equal the written records");
         }
+    }
+
+    /// One decode per block serves every stream: decoding each candidate block
+    /// of the union of both streams' row groups once, with both refs wanted,
+    /// and splitting the rows by `stream_ref` gives each stream exactly the
+    /// records, in the same order, that draining its own `StreamBlockRows`
+    /// gives. A block of another row group is refused rather than decoded at
+    /// the wrong base.
+    #[test]
+    fn block_rows_for_refs_splits_into_each_streams_drain() {
+        let object = write_object();
+        let reader = reader_of(&object);
+        let refs: Vec<u32> = (0..2u8)
+            .map(|s| reader.stream_dir().stream_ref(&sid(s)).expect("ref"))
+            .collect();
+        let mut groups: Vec<StreamBlockLoc> = Vec::new();
+        let mut blocks: Vec<usize> = Vec::new();
+        for s in 0..2u8 {
+            for loc in reader
+                .stream_blocks(&sid(s))
+                .expect("stream_blocks")
+                .expect("stream present")
+            {
+                blocks.extend(loc.block_indices().iter().copied());
+                if !groups.iter().any(|g| g.start() == loc.start()) {
+                    groups.push(loc);
+                }
+            }
+        }
+        blocks.sort_unstable();
+        blocks.dedup();
+        groups.sort_by_key(|g| g.start());
+        assert!(groups.len() > 1, "the fixture must span row groups");
+
+        let mut split: Vec<Vec<LogRecord>> = vec![Vec::new(), Vec::new()];
+        let mut decodes = 0usize;
+        for &b in &blocks {
+            let group = groups
+                .iter()
+                .find(|g| reader.extent_of(&[b]).expect("extent") == (g.start(), g.end()))
+                .expect("block's group");
+            let bytes = slice(&object, group.start(), group.end());
+            let (rows, heap) = reader
+                .block_rows_for_refs(group, b, &bytes, |r| refs.contains(&r))
+                .expect("rows for refs");
+            decodes += 1;
+            assert!(heap > 0, "a decoded block holds heap");
+            for (sref, rec) in rows {
+                let s = refs.iter().position(|r| *r == sref).expect("wanted ref");
+                split[s].push(rec);
+            }
+        }
+        assert_eq!(decodes, blocks.len(), "one decode per block");
+        for s in 0..2u8 {
+            let lazy = drain_lazy(&reader, &object, &sid(s));
+            assert_eq!(lazy.len() as i64, PER_STREAM, "exact record count");
+            assert_eq!(split[usize::from(s)], lazy, "stream {s}: split == drain");
+        }
+
+        let first = &groups[0];
+        let other = blocks
+            .iter()
+            .copied()
+            .find(|&b| reader.extent_of(&[b]).expect("extent") != (first.start(), first.end()))
+            .expect("a block of another group");
+        let bytes = slice(&object, first.start(), first.end());
+        assert!(
+            reader
+                .block_rows_for_refs(first, other, &bytes, |_| true)
+                .is_err(),
+            "a block outside the loc's row group is refused"
+        );
     }
 
     /// `peek_ts` reads the next row's timestamp out of the decoded ts column and

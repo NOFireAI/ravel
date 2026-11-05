@@ -308,6 +308,7 @@ sequential awaits: one commit-record GET per input, then one catalog load
 per input, then one block GET per cursor advance. A new
 `CompactorConfig::input_read_concurrency` (default 8) bounds how many of
 those are in flight, and each stream cursor prefetches one block ahead.
+(Block reads changed again under the ADR-3819 read-plan amendment below.)
 This is a latency change only. Output bytes cannot depend on it: inputs
 are re-sorted into canonical `(writer_id, writer_epoch, writer_seq)`
 order after loading, catalogs stay aligned to that order, and the merge
@@ -326,7 +327,8 @@ That follow-up landed. `build_rewrite_logs` now runs the same k-way
 block-streaming merge, with the erasure predicate as a per-record filter
 and `input_read_concurrency` bounding its catalog loads, so it inherits
 every bound described above: one decoded block per input plus one
-in-progress part, never the bucket. A logs erasure rewrite therefore
+in-progress part, never the bucket (the peak gained two terms under the
+ADR-3819 read-plan amendment below). A logs erasure rewrite therefore
 emits N parts, exactly as a compaction does, and for the same reason.
 Nothing downstream assumed one part: ADR-0064's conservation gate is
 already stated over `sum(output sample_count)`, the parts are already
@@ -404,3 +406,35 @@ past the target by the last item that crossed it, and neither models the
 compressor. What the rule forbids is a term missing from the sum
 altogether, because that error accumulates without limit while an
 overshoot by one item does not.
+
+## Amendment 2026-11-04: the merge reads each input once (ADR-3819)
+
+<!-- amendment-applies: sections="Amendment 2026-08-26: a part splits on a size target; a stream may span parts" pointer="ADR-3819 read-plan amendment" -->
+
+Status: accepted. Issue #3819. The record sequence the merge emits, and so
+every part's bytes and key, is unchanged; only how inputs are read moves.
+
+A stream cursor fetches the row group its stream's blocks sit in, and a row
+group carries many streams, so a merge that opened cursors for every stream
+fetched each input once per stream it carries. `merge_catalogs` now plans
+its reads from catalog metadata before any block GET, and logs the mode:
+every input's row groups fetched once and held (resident), fetched once per
+stream-range pass (fetch-per-pass), or today's cursors (cursor) when the
+resident ceiling admits no pass of at least the floor. A stream too large
+for one pass stays on cursors in every mode, reading the held groups when
+the merge is resident. The resident ceiling is the new resolved
+`CompactorConfig::merge_resident_ceiling_bytes`. ravel-server sets it to
+`merge_cursor_budget_bytes` divided by `--maintain-unit-concurrency`.
+`ravel-cli maintain compact-tenant` sets it to the per-bucket
+`merge_cursor_budget_bytes` it already derives, with no second division,
+and `compact-bucket` and the library default use the whole
+`merge_cursor_budget_bytes`. `input_read_concurrency` now also bounds the
+row-group fetches in flight, in both the resident fetch and a pass.
+
+The memory text above becomes: per-input catalog metadata, plus the
+resident raw row groups (resident mode only), plus one pass's retained
+rows, plus the in-progress part. A stream on cursors has decision 4's
+transient term (ADR-0065) in place of the pass rows. The erasure rewriter
+runs the same merge, so all of this applies to it too. ADR-0065's amendment
+of the same date states the bound on each term.
+

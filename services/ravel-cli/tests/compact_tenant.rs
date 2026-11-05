@@ -1374,6 +1374,35 @@ fn per_bucket_merge_budget_is_the_default_divided_by_n() {
     );
 }
 
+/// The RLOG resident ceiling (ADR-3819 D1) each concurrent bucket runs with is
+/// that bucket's cursor budget, divided once: the default's share at N > 1, an
+/// explicit budget undivided.
+///
+/// Prove-the-test: dropping the assignment in `per_bucket_config` fails the
+/// N=1 row's `merge_resident_ceiling_bytes` equality (`None` against
+/// `Some(21474836480)`); dividing it by N a second time fails the N=4 row.
+#[test]
+fn per_bucket_resident_ceiling_is_the_per_bucket_cursor_budget() {
+    let base = CompactorConfig::default();
+    for (n, expected) in [
+        (1, DEFAULT_MERGE_CURSOR_BUDGET_BYTES),
+        (4, DEFAULT_MERGE_CURSOR_BUDGET_BYTES / 4),
+    ] {
+        let config = per_bucket_config(&base, n);
+        assert_eq!(config.merge_resident_ceiling_bytes, Some(expected), "N={n}");
+        assert_eq!(config.merge_resident_ceiling(), expected, "N={n}");
+    }
+    let explicit = CompactorConfig {
+        merge_cursor_budget_bytes: 7 * 1024 * 1024 * 1024,
+        ..CompactorConfig::default()
+    };
+    assert_eq!(
+        per_bucket_config(&explicit, 4).merge_resident_ceiling(),
+        7 * 1024 * 1024 * 1024,
+        "an operator-configured budget is the ceiling undivided"
+    );
+}
+
 // ---- Advisory compaction claims (ADR-1029 decision 5, issue #1034) ----
 
 /// The walk's shard/hour of the bucket a foreign process claims in the claim

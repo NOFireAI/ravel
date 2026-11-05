@@ -8673,6 +8673,11 @@ impl Cli {
             config.merge_cursor_budget_bytes,
         )?;
         memory_target.apply_to(&mut config);
+        // Up to `--maintain-unit-concurrency` merges run at once in this
+        // process, so each one's resident row groups get that share of the
+        // cursor budget (ADR-3819 D1).
+        config.merge_resident_ceiling_bytes =
+            Some(config.merge_cursor_budget_bytes / self.maintain_unit_concurrency.max(1) as u64);
         tracing::info!(
             setting = "rlog_l1_part_memory_target_bytes",
             value = memory_target.bytes,
@@ -17103,6 +17108,35 @@ mod tests {
         let cli = cli(args);
         let gc_runtime = cli.resolve_gc_runtime(Duration::from_secs(30))?;
         cli.resolve_compactor_config(&gc_runtime, &resolved_from(&cli))
+    }
+
+    /// The RLOG merge's resident ceiling (ADR-3819 D1) is the merge cursor
+    /// budget over `--maintain-unit-concurrency`, since that many merges can
+    /// hold resident row groups in this process at once: 20 GiB / 4 (the
+    /// default) = 5368709120, / 1 = 21474836480, / 3 = 7158278826, and a 0
+    /// clamps to 1.
+    ///
+    /// Non-vacuity: leaving the field at the library default fails the first
+    /// row's `merge_resident_ceiling_bytes` equality (`None` against
+    /// `Some(5368709120)`); dividing without the clamp panics on the 0 row.
+    #[test]
+    fn merge_resident_ceiling_is_the_cursor_budget_over_unit_concurrency() {
+        let budget = ravel_maintain::CompactorConfig::default().merge_cursor_budget_bytes;
+        assert_eq!(budget, 21_474_836_480, "the 20 GiB cursor budget");
+        for (args, expected) in [
+            (&[][..], 5_368_709_120u64),
+            (&["--maintain-unit-concurrency", "1"][..], 21_474_836_480),
+            (&["--maintain-unit-concurrency", "3"][..], 7_158_278_826),
+            (&["--maintain-unit-concurrency", "0"][..], 21_474_836_480),
+        ] {
+            let config = compactor(args).expect("resolve");
+            assert_eq!(
+                config.merge_resident_ceiling_bytes,
+                Some(expected),
+                "{args:?}"
+            );
+            assert_eq!(config.merge_resident_ceiling(), expected, "{args:?}");
+        }
     }
 
     /// The compactor's memory split target with the flag unset is derived
