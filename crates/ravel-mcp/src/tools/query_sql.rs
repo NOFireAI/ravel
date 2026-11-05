@@ -9,13 +9,14 @@
 //! the reason, with two exceptions, which run unpaged so that a capped result
 //! is `ok_bounded` with no cursor: a statement with no `ORDER BY` over a table
 //! with no row identity, and a statement whose `ORDER BY` uses a value
-//! computed from other rows that the planner does not prove non-null (`sum`,
-//! `avg`, a `min` or `max` it cannot prove, a window function other than
-//! `count`, a subquery).
+//! computed from other rows that the planner does not prove non-null (`avg`,
+//! a `sum` over a float column, a `min`, `max` or `sum` it cannot prove, a
+//! window function other than `count`, a subquery).
 //!
 //! An order on `count(...)` pages, and so does an order on `min(col)` or
 //! `max(col)` under a plain `GROUP BY` when `col` is a NOT NULL integer,
-//! string or nanosecond timestamp column of the target table
+//! string or nanosecond timestamp column of the target table, and an order on
+//! `sum(col)` under the same conditions when `col` is a NOT NULL integer column
 //! (`PagePlan::order_from_other_rows`). A row committed after a cursor was
 //! minted can change such a value for a row already served and move that row
 //! after the cursor, so such a walk pins the segment
@@ -153,11 +154,12 @@ impl Unpaged {
             Unpaged::OrderFromOtherRows => step(
                 "order_by_the_rows_own_columns",
                 "the ORDER BY uses a value computed from other rows that the statement does \
-                 not prove non-null (sum, avg, a window function other than count, a \
-                 subquery, or a min or max that is not over a NOT NULL integer, string or \
-                 timestamp column under a plain GROUP BY), so the rest of the result has no \
-                 cursor; order by count(...), by min(col) or max(col) under GROUP BY, or by \
-                 the row's own non-null columns to page, or narrow time_range",
+                 not prove non-null (avg, a sum over a float column, a window function other \
+                 than count, a subquery, or a min, max or sum that is not over a NOT NULL \
+                 column of a supported type under a plain GROUP BY), so the rest of the \
+                 result has no cursor; order by count(...), by min(col), max(col) or an \
+                 integer sum(col) under GROUP BY, or by the row's own non-null columns to \
+                 page, or narrow time_range",
             ),
         }
     }
@@ -1108,8 +1110,9 @@ mod tests {
                     assert!(
                         detail.contains("computed from other rows")
                             && detail.contains(
-                                "order by count(...), by min(col) or max(col) under GROUP BY, \
-                                 or by the row's own non-null columns to page"
+                                "order by count(...), by min(col), max(col) or an \
+                                 integer sum(col) under GROUP BY, or by the row's own \
+                                 non-null columns to page"
                             ),
                         "{query}: {detail}"
                     );

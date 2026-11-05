@@ -2142,7 +2142,7 @@ amendment adds the proof.
    declared column, which the static schema does not hold; a column type
    off the allowlist; and every relation item 1 excludes, a Parquet table
    among them. `sum`, `avg`, a window function other than a count, and a
-   subquery are unchanged (an integer `sum` pages since #3844; item 13).
+   subquery are unchanged (an integer `sum` pages since #3849; item 13).
 5. The pin. A proven `min` or `max` sets `PagePlan::order_from_other_rows`
    like a count, so its walk requires page one's segment set
    (`SegmentSetPin::Required`): a later page over a moved set is
@@ -2200,8 +2200,8 @@ amendment adds the proof.
     step, as `ravel_query_sql` does
     (`a_last_row_of_the_wrong_kind_mints_no_cursor` in
     `crates/ravel-mcp/src/tools/search_logs.rs`).
-13. An integer `sum` order pages since #3844. That change made the
-    session's `sum` a checked UDAF (`crates/ravel-sql/src/sum.rs`,
+13. An integer `sum` order pages since #3849, which #3844 made possible.
+    #3844 made the session's `sum` a checked UDAF (`crates/ravel-sql/src/sum.rs`,
     registered in place of DataFusion's built-in): it adds in `i128`,
     returns `Int64` for a signed argument and `UInt64` for an unsigned
     one, and fails with `IntegerSumOverflow` when the total does not fit,
