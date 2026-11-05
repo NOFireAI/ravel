@@ -895,3 +895,452 @@ impl ObjectStoreBackend for ScratchStore {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::list_all;
+
+    fn open_in(dir: &Path) -> ScratchStore {
+        ScratchStore::open(dir.to_path_buf(), 1000).expect("open scratch store")
+    }
+
+    /// Every path under `dir`, relative to it, files and directories alike.
+    fn tree(dir: &Path) -> BTreeSet<PathBuf> {
+        fn visit(base: &Path, dir: &Path, out: &mut BTreeSet<PathBuf>) {
+            for entry in fs::read_dir(dir).expect("read dir") {
+                let path = entry.expect("dir entry").path();
+                out.insert(path.strip_prefix(base).expect("under base").to_path_buf());
+                if path.is_dir() {
+                    visit(base, &path, out);
+                }
+            }
+        }
+        let mut out = BTreeSet::new();
+        visit(dir, dir, &mut out);
+        out
+    }
+
+    #[tokio::test]
+    async fn open_wipes_whatever_the_directory_held() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let dir = parent.path().join("scratch");
+        fs::create_dir_all(dir.join("nested/deeper")).expect("nested dirs");
+        fs::write(dir.join("left-over.bin"), b"previous process").expect("file");
+        fs::write(dir.join("nested/deeper/run-0.rlog"), b"old run").expect("nested file");
+        fs::write(dir.join("fstale"), b"looks like an object").expect("object-shaped file");
+        fs::write(dir.join("t7"), b"looks like a temp file").expect("temp-shaped file");
+        assert_eq!(tree(&dir).len(), 6, "the fixture is in place");
+
+        let store = open_in(&dir);
+
+        assert!(dir.is_dir(), "the directory itself is kept");
+        assert!(tree(&dir).is_empty(), "left: {:?}", tree(&dir));
+        assert!(list_all(&store, "").await.expect("list").is_empty());
+        assert!(matches!(
+            store.get("stale", GetRange::Full).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn open_creates_a_missing_directory() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let dir = parent.path().join("a/b/scratch");
+        let store = ScratchStore::open(dir.clone(), 2).expect("open");
+        assert!(dir.is_dir());
+        assert_eq!(store.root(), dir.as_path());
+    }
+
+    #[tokio::test]
+    async fn wipe_empties_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = open_in(dir.path());
+        let mut last_before_wipe = None;
+        for key in ["runs/0/part-0", "runs/0/part-1", "runs/1/part-0", "top"] {
+            last_before_wipe = Some(
+                store
+                    .put(key, Bytes::from_static(b"run bytes"), PutOptions::default())
+                    .await
+                    .expect("put"),
+            );
+        }
+        let last_before_wipe = last_before_wipe.expect("four puts");
+        let mut upload = store.put_multipart("runs/2/part-0").await.expect("start");
+        upload
+            .put_part(Bytes::from_static(b"in flight"), None)
+            .await
+            .expect("part");
+        assert_eq!(list_all(&store, "").await.expect("list").len(), 4);
+
+        store.wipe().expect("wipe");
+
+        assert!(tree(dir.path()).is_empty(), "left: {:?}", tree(dir.path()));
+        assert!(list_all(&store, "").await.expect("list").is_empty());
+        assert!(matches!(
+            store.head("runs/0/part-0").await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(
+            upload.complete().await.is_err(),
+            "an upload whose temporary file was wiped cannot publish"
+        );
+        assert!(matches!(
+            store.head("runs/2/part-0").await,
+            Err(StoreError::NotFound)
+        ));
+
+        let first = store
+            .put("top", Bytes::from_static(b"x"), PutOptions::default())
+            .await
+            .expect("put after wipe");
+        let id = |v: &Version| -> u64 {
+            v.0.strip_prefix("scratch-v-")
+                .and_then(|n| n.parse().ok())
+                .expect("scratch version")
+        };
+        assert!(
+            id(&first.version) > id(&last_before_wipe.version),
+            "versions keep counting across a wipe: {:?} after {:?}",
+            first.version,
+            last_before_wipe.version
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_with_slashes_and_dots_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = open_in(dir.path());
+        store.set_clock_ms(1_234);
+        let keys = [
+            "t/acme/runs/hour=08/run.0001.rlog",
+            "a..b/...c/x.y",
+            "with space/plus+sign/.hidden",
+            "a",
+            "a/b",
+        ];
+        for (i, key) in keys.iter().enumerate() {
+            store
+                .put(key, Bytes::from(format!("object {i}")), PutOptions::default())
+                .await
+                .expect("put");
+        }
+        for (i, key) in keys.iter().enumerate() {
+            let got = store.get(key, GetRange::Full).await.expect("get");
+            assert_eq!(got.data, Bytes::from(format!("object {i}")), "{key}");
+            let meta = store.head(key).await.expect("head");
+            assert_eq!(meta.key, *key);
+            assert_eq!(meta.last_modified_unix_ms, 1_234);
+        }
+        let listed: Vec<String> = list_all(&store, "")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        let mut sorted: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+        sorted.sort();
+        assert_eq!(listed, sorted, "every key lists back verbatim, in key order");
+    }
+
+    /// Non-ASCII keys are unaddressable (ADR-2637), so the store refuses them
+    /// as every backend does; the file name mapping itself still round-trips
+    /// them.
+    #[tokio::test]
+    async fn a_unicode_key_round_trips_through_the_mapping_and_is_refused_as_unaddressable() {
+        let key = "résumé/日本/ключ.bin";
+        let components = key_components(key);
+        assert_eq!(key_from_components(&components).as_deref(), Some(key));
+        assert!(components.iter().all(|c| c.is_ascii()));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = open_in(dir.path());
+        let oracle = crate::memory::MemoryStore::new();
+        for result in [
+            store.put(key, Bytes::from_static(b"x"), PutOptions::default()).await,
+            oracle.put(key, Bytes::from_static(b"x"), PutOptions::default()).await,
+        ] {
+            assert!(matches!(result, Err(StoreError::UnaddressableKey { .. })));
+        }
+        assert!(tree(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn traversal_keys_are_refused_and_never_write_outside_the_directory() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        fs::write(parent.path().join("sentinel"), b"untouched").expect("sentinel");
+        let dir = parent.path().join("scratch");
+        let store = open_in(&dir);
+        let before = tree(parent.path());
+
+        for key in [
+            "..",
+            "../escape",
+            "a/../../escape",
+            "a/./b",
+            "/absolute/path",
+            "/",
+            "a\0b",
+            "../../../../../../../../tmp/ravel-scratch-escape",
+        ] {
+            let result = store
+                .put(key, Bytes::from_static(b"x"), PutOptions::default())
+                .await;
+            assert!(
+                matches!(result, Err(StoreError::UnaddressableKey { .. })),
+                "{key:?}: {result:?}"
+            );
+            assert!(store.put_multipart(key).await.is_err(), "{key:?}");
+        }
+        assert_eq!(tree(parent.path()), before, "nothing was written anywhere");
+
+        // The mapping alone, without the addressability check in front of it,
+        // keeps every such key inside the directory.
+        for key in ["..", "../escape", "a/../../escape", "/absolute/path", "a\0b"] {
+            let path = store.inner.object_path(key).expect("mappable");
+            let relative = path.strip_prefix(&dir).expect("inside the directory");
+            assert!(
+                relative
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_))),
+                "{key:?} maps to {relative:?}"
+            );
+        }
+
+        // Dots inside a segment are ordinary bytes.
+        store
+            .put("..a/b..", Bytes::from_static(b"in"), PutOptions::default())
+            .await
+            .expect("dotted key");
+        let after: BTreeSet<PathBuf> = tree(parent.path())
+            .into_iter()
+            .filter(|p| !before.contains(p))
+            .collect();
+        assert!(!after.is_empty());
+        assert!(
+            after.iter().all(|p| p.starts_with("scratch")),
+            "new paths: {after:?}"
+        );
+        assert_eq!(
+            fs::read(parent.path().join("sentinel")).expect("sentinel"),
+            b"untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_segment_too_long_for_a_file_name_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = open_in(dir.path());
+        let key = format!("runs/{}", "x".repeat(MAX_NAME_BYTES));
+        let result = store
+            .put(&key, Bytes::from_static(b"x"), PutOptions::default())
+            .await;
+        assert!(matches!(result, Err(StoreError::Permanent(_))), "{result:?}");
+        assert!(tree(dir.path()).is_empty());
+        let fits = format!("runs/{}", "x".repeat(MAX_NAME_BYTES - 1));
+        store
+            .put(&fits, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+            .expect("a 255-byte file name fits");
+    }
+
+    #[tokio::test]
+    async fn an_open_multipart_upload_is_neither_listed_nor_readable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = open_in(dir.path());
+        let mut upload = store.put_multipart("m/object").await.expect("start");
+        upload
+            .put_part(Bytes::from_static(b"part"), None)
+            .await
+            .expect("part");
+        assert_eq!(tree(dir.path()).len(), 1, "one temporary file");
+        assert!(list_all(&store, "").await.expect("list").is_empty());
+        assert!(matches!(
+            store.head("m/object").await,
+            Err(StoreError::NotFound)
+        ));
+        drop(upload);
+        assert!(
+            tree(dir.path()).is_empty(),
+            "a dropped upload removes its temporary file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_get_refuses_bytes_that_changed_at_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = open_in(dir.path());
+        store
+            .put("k", Bytes::from_static(b"0123456789"), PutOptions::default())
+            .await
+            .expect("put");
+        let path = store.inner.object_path("k").expect("path");
+        let mut bytes = fs::read(&path).expect("read");
+        bytes[HEADER_LEN] ^= 1;
+        fs::write(&path, bytes).expect("corrupt");
+        assert!(matches!(
+            store.get("k", GetRange::Full).await,
+            Err(StoreError::Corrupted(_))
+        ));
+        let ranged = store.get("k", GetRange::Range(5, 10)).await.expect("range");
+        assert_eq!(&ranged.data[..], b"56789", "a ranged get is not checked");
+    }
+
+    /// A writer overwrites one key with large objects of distinct fill bytes
+    /// while a reader polls it: every read is absent or one whole object.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_get_never_observes_a_partially_written_object() {
+        const SIZE: usize = 8 * 1024 * 1024;
+        const WRITES: u8 = 6;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(open_in(dir.path()));
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let reader = {
+            let store = Arc::clone(&store);
+            let done = Arc::clone(&done);
+            tokio::spawn(async move {
+                let (mut absent, mut complete) = (0u32, 0u32);
+                loop {
+                    let finished = done.load(Ordering::SeqCst);
+                    match store.get("big", GetRange::Full).await {
+                        Err(StoreError::NotFound) => absent += 1,
+                        Ok(got) => {
+                            assert_eq!(got.data.len(), SIZE, "a partial object was read");
+                            let fill = got.data[0];
+                            assert!((1..=WRITES).contains(&fill));
+                            assert!(
+                                got.data.iter().all(|&b| b == fill),
+                                "a read mixed two writes"
+                            );
+                            complete += 1;
+                        }
+                        Err(e) => panic!("unexpected get error: {e:?}"),
+                    }
+                    if finished {
+                        return (absent, complete);
+                    }
+                }
+            })
+        };
+        for fill in 1..=WRITES {
+            store
+                .put("big", Bytes::from(vec![fill; SIZE]), PutOptions::default())
+                .await
+                .expect("put");
+        }
+        done.store(true, Ordering::SeqCst);
+        let (absent, complete) = reader.await.expect("reader");
+        assert!(complete >= 1, "the reader saw the final object");
+        assert!(absent + complete >= 2, "the reader polled while writes ran");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn create_if_absent_from_8_concurrent_tasks_has_exactly_one_winner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(open_in(dir.path()));
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = Vec::new();
+        for writer in 0u8..8 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let result = store
+                    .put(
+                        "contended",
+                        Bytes::from(vec![writer; 4096]),
+                        PutOptions::create_if_absent(),
+                    )
+                    .await;
+                (writer, result)
+            }));
+        }
+        let mut winners = Vec::new();
+        for task in tasks {
+            let (writer, result) = task.await.expect("task");
+            match result {
+                Ok(outcome) => winners.push((writer, outcome)),
+                Err(StoreError::AlreadyExists) => {}
+                Err(e) => panic!("writer {writer}: {e:?}"),
+            }
+        }
+        assert_eq!(winners.len(), 1, "exactly one create succeeds");
+        let (winner, outcome) = &winners[0];
+        let got = store.get("contended", GetRange::Full).await.expect("get");
+        assert_eq!(got.data, Bytes::from(vec![*winner; 4096]), "the winner's bytes");
+        assert_eq!(got.version, outcome.version);
+        assert_eq!(tree(dir.path()).len(), 1, "no losing temporary file is left");
+    }
+
+    #[tokio::test]
+    async fn paged_listing_and_start_after_match_the_oracle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ScratchStore::open(dir.path().to_path_buf(), 2).expect("open");
+        let oracle = crate::memory::MemoryStore::with_page_size(2);
+        let keys = ["a/1", "a/2", "a/3", "a/4/x", "a/5", "ab", "b/1"];
+        for key in keys {
+            for subject in [&store as &dyn ObjectStoreBackend, &oracle] {
+                subject
+                    .put(key, Bytes::from_static(b"x"), PutOptions::default())
+                    .await
+                    .expect("put");
+            }
+        }
+        let names = |page: &ListPage| -> Vec<String> {
+            page.objects.iter().map(|m| m.key.clone()).collect()
+        };
+        for (prefix, after) in [("a/", None), ("a", Some("a/2")), ("", Some("a/4")), ("a/", Some("0"))] {
+            let mut ours = store.list_after(prefix, after, None).await.expect("ours");
+            let mut theirs = oracle.list_after(prefix, after, None).await.expect("oracle");
+            loop {
+                assert_eq!(names(&ours), names(&theirs), "{prefix:?} after {after:?}");
+                assert_eq!(ours.next, theirs.next);
+                let Some(token) = ours.next.clone() else { break };
+                ours = store.list_after(prefix, after, Some(token.clone())).await.expect("ours");
+                theirs = oracle.list_after(prefix, after, Some(token)).await.expect("oracle");
+            }
+        }
+        let ours = store.list_delimited("a/").await.expect("delimited");
+        let theirs = oracle.list_delimited("a/").await.expect("delimited");
+        assert_eq!(ours.common_prefixes, theirs.common_prefixes);
+        let direct = |l: &DelimitedList| -> Vec<String> {
+            l.objects.iter().map(|m| m.key.clone()).collect()
+        };
+        assert_eq!(direct(&ours), direct(&theirs));
+    }
+
+    fn key_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            any::<String>(),
+            "[ab/. %~\\\\\u{0}\u{7f}é日-]{0,24}",
+        ]
+    }
+
+    proptest! {
+        /// Escaping is reversible for every key, and each name it produces is
+        /// one plain path component: a mark, then only letters, digits, `-`,
+        /// `_` and `%`.
+        #[test]
+        fn escaping_round_trips_and_names_hold_no_separator(key in key_strategy()) {
+            let components = key_components(&key);
+            prop_assert_eq!(components.len(), key.split('/').count());
+            let last = components.len() - 1;
+            for (i, name) in components.iter().enumerate() {
+                let mark = if i == last { OBJECT_MARK } else { DIR_MARK };
+                prop_assert!(name.starts_with(mark), "{:?}", name);
+                prop_assert!(
+                    name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'%'),
+                    "{:?}", name
+                );
+                prop_assert!(name != "." && name != "..");
+            }
+            prop_assert_eq!(key_from_components(&components), Some(key.clone()));
+        }
+    }
+}
