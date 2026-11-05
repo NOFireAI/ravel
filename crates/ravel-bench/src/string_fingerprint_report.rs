@@ -32,7 +32,7 @@ use crate::string_fingerprint::{
 pub enum Corpus {
     /// One value per line of a (possibly gzip-compressed) text file.
     Lines(PathBuf),
-    /// One value per row of a named `Utf8` column of a Parquet file (a null
+    /// One value per row of a named `Utf8` or `Binary` column of a Parquet file (a null
     /// reads as the empty string). Behind the `parquet-baseline` feature,
     /// which links the Parquet reader.
     #[cfg(feature = "parquet-baseline")]
@@ -119,7 +119,7 @@ pub fn read_values(corpus: &Corpus, cap: u64) -> Result<Vec<Vec<u8>>, String> {
 
 #[cfg(feature = "parquet-baseline")]
 fn read_parquet_column(path: &Path, column: &str, cap: u64) -> Result<Vec<Vec<u8>>, String> {
-    use arrow::array::{Array, StringArray};
+    use arrow::array::{Array, BinaryArray, StringArray};
     use parquet::arrow::ProjectionMask;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -146,19 +146,21 @@ fn read_parquet_column(path: &Path, column: &str, cap: u64) -> Result<Vec<Vec<u8
         let col = batch
             .column_by_name(column)
             .ok_or_else(|| format!("parquet file has no column {column:?}"))?;
-        let strings = col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| format!("column {column:?} is not Utf8"))?;
-        for i in 0..strings.len() {
+        let strings = col.as_any().downcast_ref::<StringArray>();
+        let binary = col.as_any().downcast_ref::<BinaryArray>();
+        for i in 0..col.len() {
             if out.len() as u64 >= cap {
                 break;
             }
-            out.push(if strings.is_null(i) {
-                Vec::new()
-            } else {
-                strings.value(i).as_bytes().to_vec()
-            });
+            let value: &[u8] = match (strings, binary) {
+                _ if col.is_null(i) => &[],
+                (Some(s), _) => s.value(i).as_bytes(),
+                (None, Some(b)) => b.value(i),
+                (None, None) => {
+                    return Err(format!("column {column:?} is neither Utf8 nor Binary"));
+                }
+            };
+            out.push(value.to_vec());
         }
     }
     Ok(out)
@@ -599,6 +601,10 @@ pub fn describe(corpus: &Corpus, cap: u64) -> Result<String, String> {
         .count();
     let long = values.iter().filter(|v| v.len() > SATURATION_BYTES).count();
     let empty = values.iter().filter(|v| v.is_empty()).count();
+    let non_utf8 = values
+        .iter()
+        .filter(|v| std::str::from_utf8(v).is_err())
+        .count();
     let bytes: u64 = values.iter().map(|v| v.len() as u64).sum();
     let distinct = values
         .iter()
@@ -606,7 +612,7 @@ pub fn describe(corpus: &Corpus, cap: u64) -> Result<String, String> {
         .len();
     Ok(format!(
         "string_fingerprint describe values={n} bytes={bytes} mean_len={:.1} empty={empty} \
-         distinct={distinct} at_most_{}_bytes={short} over_{SATURATION_BYTES}_bytes={long}",
+         non_utf8={non_utf8} distinct={distinct} at_most_{}_bytes={short} over_{SATURATION_BYTES}_bytes={long}",
         if n == 0 { 0.0 } else { bytes as f64 / n as f64 },
         string_fingerprint::BLOOM_EXACT_MAX,
     ))
@@ -743,6 +749,7 @@ mod tests {
     fn describe_counts_short_and_long_values() {
         let line = describe(&Corpus::Lines(fixture("corpus.txt")), u64::MAX).expect("describe");
         assert!(line.contains("values=18 "), "{line}");
+        assert!(line.contains("non_utf8=0 "), "{line}");
         assert!(line.contains("over_1024_bytes=1"), "{line}");
     }
 }

@@ -48,7 +48,7 @@ struct Args {
     /// One value per line of this (possibly gzip-compressed) text file.
     #[arg(long, conflicts_with = "decide")]
     corpus_lines: Option<PathBuf>,
-    /// One value per row of this Parquet file's named `Utf8` column.
+    /// One value per row of this Parquet file's named `Utf8` or `Binary` column.
     #[cfg(feature = "parquet-baseline")]
     #[arg(long, requires = "corpus_column", conflicts_with_all = ["corpus_lines", "decide"])]
     corpus_parquet: Option<PathBuf>,
