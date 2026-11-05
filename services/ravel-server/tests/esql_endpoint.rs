@@ -630,6 +630,41 @@ mod with_esql {
         fx.running.shutdown().await.expect("graceful shutdown");
     }
 
+    /// Issue #3838 changed SQL `sum`, not ES|QL's: a `SUM` over a `long` sums
+    /// exactly as a decimal and a total outside the long range reads null
+    /// (docs/esql-conformance.md, `overflow-null`), never a wrapped value. The
+    /// `x = 1` control sums exactly.
+    #[tokio::test]
+    async fn a_long_sum_that_overflows_is_null_not_wrapped() {
+        let fx = Fixture::start(false).await;
+        fx.ingest().await;
+
+        let (status, body) = fx
+            .esql(
+                "FROM logs | WHERE @timestamp >= NOW() - 1 hour \
+                 | EVAL x = 5000000000000000000 | STATS s = SUM(x)",
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body["data"]["columns"],
+            json!([{ "name": "s", "type": "long" }])
+        );
+        assert_eq!(body["data"]["rows"], json!([[null]]), "{body}");
+        assert!(body.get("warnings").is_none(), "{body}");
+
+        let (status, body) = fx
+            .esql(
+                "FROM logs | WHERE @timestamp >= NOW() - 1 hour \
+                 | EVAL x = 1 | STATS s = SUM(x)",
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["data"]["rows"], json!([[ROWS]]));
+
+        fx.running.shutdown().await.expect("graceful shutdown");
+    }
+
     #[tokio::test]
     async fn params_are_refused() {
         let fx = Fixture::start(false).await;
