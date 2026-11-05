@@ -1202,9 +1202,9 @@ pub(crate) async fn merge_catalogs(
     );
     let mut resident_charges = MergeCharges::new(tracker);
     let resident = match plan.mode {
-        MergeReadMode::Resident => {
-            Some(fetch_resident_groups(store, config, catalogs, &plan, &mut resident_charges).await?)
-        }
+        MergeReadMode::Resident => Some(
+            fetch_resident_groups(store, config, catalogs, &plan, &mut resident_charges).await?,
+        ),
         MergeReadMode::FetchPerPass | MergeReadMode::Cursor => None,
     };
     let mut next = 0usize;
@@ -1332,7 +1332,11 @@ impl MergePlan {
             let carriers = self.stream_blocks.get(j).map(Vec::as_slice).unwrap_or(&[]);
             let mut added = 0u64;
             for (input, blocks) in carriers {
-                let costs = self.block_costs.get(*input).map(Vec::as_slice).unwrap_or(&[]);
+                let costs = self
+                    .block_costs
+                    .get(*input)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
                 let seen = held.get(*input);
                 for b in blocks {
                     if !seen.is_some_and(|s| s.contains(b)) {
@@ -1515,7 +1519,10 @@ fn plan_merge(
                 .collect();
             blocks.sort_unstable();
             blocks.dedup();
-            let costs = block_costs.get(input_index).map(Vec::as_slice).unwrap_or(&[]);
+            let costs = block_costs
+                .get(input_index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             for &b in &blocks {
                 let cost = costs.get(b).copied().ok_or_else(|| {
                     MaintainError::Invariant(
@@ -1652,12 +1659,20 @@ impl RenewalSpacing {
         }
     }
 
-    async fn tick(&mut self, config: &CompactorConfig, store: &dyn ObjectStoreBackend) -> Result<()> {
+    async fn tick(
+        &mut self,
+        config: &CompactorConfig,
+        store: &dyn ObjectStoreBackend,
+    ) -> Result<()> {
         self.since += 1;
         if self.since >= self.every {
             self.since = 0;
-            crate::claim_guard::checkpoint(config, store, crate::claim_guard::Checkpoint::MergeLoop)
-                .await?;
+            crate::claim_guard::checkpoint(
+                config,
+                store,
+                crate::claim_guard::Checkpoint::MergeLoop,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1961,12 +1976,12 @@ async fn run_stream_pass(
                 None => pass_block_cost(&iw.catalog.pricing, block)?,
             };
             charges.add_pass_rows(cost);
-            let rows = iw
-                .catalog
-                .reader
-                .block_rows_for_refs(loc, block, data.as_ref(), |sref| {
-                    iw.wanted.contains(&sref)
-                })?;
+            let rows =
+                iw.catalog
+                    .reader
+                    .block_rows_for_refs(loc, block, data.as_ref(), |sref| {
+                        iw.wanted.contains(&sref)
+                    })?;
             let heap = rows.heap_estimate();
             if heap > cost {
                 charges.add_pass_rows(heap - cost);
@@ -2016,8 +2031,7 @@ async fn run_stream_pass(
             loop {
                 let mut best: Option<(usize, i64, usize)> = None;
                 for (h, &(w, sref, input_index)) in heads.iter().enumerate() {
-                    let Some(ts) = held.get(w).map(|b| b.peek(sref)).transpose()?.flatten()
-                    else {
+                    let Some(ts) = held.get(w).map(|b| b.peek(sref)).transpose()?.flatten() else {
                         continue;
                     };
                     let key = (ts.div_euclid(width_ns), input_index);
@@ -11802,7 +11816,9 @@ mod tests {
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
                 if let (Some(clock), Ok(got)) = (&self.lease_clock, &out) {
                     let ns = got.data.len() as u128 * 1_000_000_000
-                        / u128::from(crate::config::CLAIM_LEASE_WARN_CONSERVATIVE_ENCODE_BYTES_PER_SEC);
+                        / u128::from(
+                            crate::config::CLAIM_LEASE_WARN_CONSERVATIVE_ENCODE_BYTES_PER_SEC,
+                        );
                     clock.set(clock.now_ns() + i64::try_from(ns).expect("ns"));
                     self.mark(Moment::Group);
                 }
@@ -12139,7 +12155,10 @@ mod tests {
             );
             for ceiling in [ceilings.0, ceilings.1] {
                 let (tight, _) = plan_for(store, keys, &with_ceiling(base, Some(ceiling))).await;
-                assert!(tight.hot.iter().all(|h| !h), "ceiling {ceiling}: a hot stream");
+                assert!(
+                    tight.hot.iter().all(|h| !h),
+                    "ceiling {ceiling}: a hot stream"
+                );
             }
             ceilings
         }
@@ -12193,6 +12212,135 @@ mod tests {
                     output == oracle,
                     "{name}: parts differ from the cursor merge"
                 );
+            }
+        }
+
+        /// Three inputs of four streams, four-record blocks, two blocks a row
+        /// group. Input 0 carries 30 records per stream and inputs 1 and 2
+        /// carry 10, so input 0's streams each span several blocks and row
+        /// groups, and block boundaries fall inside streams. Keyed inputs
+        /// cluster on `k` at a one-hour width and their records span ten
+        /// hours, so the merge orders by `(hour, input_index)`. Bodies carry
+        /// 1 500 incompressible bytes so the output cuts into several parts:
+        /// the writer sorts within a part, so the merge order shows in the
+        /// bytes only through where a cut falls.
+        fn spread_inputs(keyed: bool) -> Vec<L0Input> {
+            let cfg = RlogConfig {
+                block_target_records: 4,
+                group_target_blocks: 2,
+                ..RlogConfig::default()
+            };
+            let clustering = keyed.then(|| (keyed_on_k(footer::SortBucketWidth::OneHour), 1));
+            (0..3u32)
+                .map(|i| {
+                    let per_stream: i64 = if i == 0 { 30 } else { 10 };
+                    let records = (0..4u32)
+                        .flat_map(|s| {
+                            (0..per_stream).map(move |k| {
+                                let step = 20 * 60 * 1_000_000_000 * 30 / per_stream;
+                                record(
+                                    s,
+                                    DAY0 + k * step + i64::from(i),
+                                    &format!(
+                                        "in{i} s{s} k{k} {}",
+                                        noise(u64::from(i * 1_000 + s * 100) + k as u64, 1_500)
+                                    ),
+                                    vec![(
+                                        "k".to_string(),
+                                        AttrValue::Str(["a", "b", "c"][(k % 3) as usize].into()),
+                                    )],
+                                )
+                            })
+                        })
+                        .collect();
+                    L0Input {
+                        records,
+                        cfg,
+                        clustering: clustering.clone(),
+                    }
+                })
+                .collect()
+        }
+
+        /// ADR-3819 test (a) on a stream that spans several blocks and row
+        /// groups of one input, unkeyed and keyed: resident reads in one pass,
+        /// resident reads in several passes and fetch-per-pass reads each
+        /// write the bytes of the cursor merge (`Some(0)`), with every stream
+        /// on a pass.
+        ///
+        /// Demonstrated red against:
+        /// - a pass that reads only each stream's first row group (`for loc
+        ///   in locs` in [`run_stream_pass`] changed to `for loc in
+        ///   locs.into_iter().take(1)`): the run aborts with
+        ///   `ConservationViolation` (200 input samples, 72 written);
+        /// - a pass that merges by raw ts (`let key = (ts.div_euclid(width_ns),
+        ///   input_index)` in [`run_stream_pass`] changed to `let key = (ts,
+        ///   input_index)`): the keyed one-pass parts differ from the cursor
+        ///   merge's.
+        #[tokio::test]
+        async fn every_read_mode_writes_the_cursor_merges_bytes_across_blocks_and_groups() {
+            for keyed in [false, true] {
+                let inputs = spread_inputs(keyed);
+                let base = CompactorConfig {
+                    rlog_l1_part_memory_target_bytes: Some(128 * 1024),
+                    input_read_concurrency: 2,
+                    ..CompactorConfig::default()
+                };
+                let store = ProbeStore::new();
+                let keys = seed_inputs(&store, &inputs).await;
+                let catalogs = catalogs_of(&store, &keys).await;
+                let width = OutputClustering::from_inputs(&catalogs).merge_width_ns;
+                assert_eq!(width, if keyed { NS_PER_HOUR } else { 1 }, "keyed={keyed}");
+                let (stream0, _) = stream_ident(0);
+                let locs = catalogs[0]
+                    .reader
+                    .stream_blocks(&stream0)
+                    .expect("stream blocks")
+                    .expect("input 0 carries stream 0");
+                let blocks: usize = locs.iter().map(|l| l.block_indices().len()).sum();
+                assert!(locs.len() >= 3, "keyed={keyed}: {} groups", locs.len());
+                assert!(blocks >= 6, "keyed={keyed}: {blocks} blocks");
+
+                let (resident_tight, fetch_tight) = tight_ceilings(&store, &keys, &base).await;
+                let oracle = cursor_oracle(&inputs, &base).await;
+                assert!(
+                    oracle.parts.len() >= 3,
+                    "keyed={keyed}: {} parts",
+                    oracle.parts.len()
+                );
+                for (name, ceiling, mode, passes) in [
+                    ("one pass", None, MergeReadMode::Resident, 1..=1),
+                    (
+                        "resident, several passes",
+                        Some(resident_tight),
+                        MergeReadMode::Resident,
+                        2..=u64::MAX,
+                    ),
+                    (
+                        "fetch per pass",
+                        Some(fetch_tight),
+                        MergeReadMode::FetchPerPass,
+                        2..=u64::MAX,
+                    ),
+                ] {
+                    let config = with_ceiling(&base, ceiling);
+                    let (plan, _) = plan_for(&store, &keys, &config).await;
+                    assert_eq!(plan.mode, mode, "keyed={keyed} {name}");
+                    assert!(
+                        plan.hot.iter().all(|h| !h),
+                        "keyed={keyed} {name}: a hot stream"
+                    );
+                    let (output, run, _, _) = compact_fresh(&inputs, &config).await;
+                    assert!(
+                        passes.contains(&run.report.merge_passes),
+                        "keyed={keyed} {name}: {} passes",
+                        run.report.merge_passes
+                    );
+                    assert!(
+                        output == oracle,
+                        "keyed={keyed} {name}: parts differ from the cursor merge"
+                    );
+                }
             }
         }
 
@@ -12457,7 +12605,14 @@ mod tests {
                     .collect::<Vec<LogRecord>>()
             };
             let ballast = (3..13u32).map(|n| L0Input {
-                records: incompressible(u64::from(n), 12, 800, DAY0 + i64::from(n), NS_PER_HOUR, 60 + n),
+                records: incompressible(
+                    u64::from(n),
+                    12,
+                    800,
+                    DAY0 + i64::from(n),
+                    NS_PER_HOUR,
+                    60 + n,
+                ),
                 cfg,
                 clustering: Some((d.clone(), 1)),
             });
@@ -12567,7 +12722,10 @@ mod tests {
                 plan.raw_bytes,
                 carriers.iter().map(|c| c.reservation).collect::<Vec<_>>()
             );
-            assert!(resident <= budget, "a resident ceiling fits under the clamp");
+            assert!(
+                resident <= budget,
+                "a resident ceiling fits under the clamp"
+            );
             assert!(
                 fetch < plan.raw_bytes + floor,
                 "the ballast outweighs a pass"
