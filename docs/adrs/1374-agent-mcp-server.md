@@ -2142,7 +2142,7 @@ amendment adds the proof.
    declared column, which the static schema does not hold; a column type
    off the allowlist; and every relation item 1 excludes, a Parquet table
    among them. `sum`, `avg`, a window function other than a count, and a
-   subquery are unchanged.
+   subquery are unchanged (an integer `sum` pages since #3844; item 13).
 5. The pin. A proven `min` or `max` sets `PagePlan::order_from_other_rows`
    like a count, so its walk requires page one's segment set
    (`SegmentSetPin::Required`): a later page over a moved set is
@@ -2175,7 +2175,8 @@ amendment adds the proof.
    sum to `Int64`, `UInt8` to `UInt64` to `UInt64`
    (`an_integer_sum_is_int64_for_a_signed_and_uint64_for_an_unsigned_argument`
    in `crates/ravel-sql/tests/page_walk.rs`). It is not a position the
-   order of the totals agrees with, for two reasons.
+   order of the totals agrees with, for two reasons. Item 13 retires the
+   integer one.
 10. A float `sum` is refused because the engine adds partial sums in the
     order its partitions finish, so two runs over the same segments can
     differ in the last bits, and a cursor would compare a value page one
@@ -2191,10 +2192,39 @@ amendment adds the proof.
     (`an_integer_sum_wraps_on_overflow_at_one_and_eight_partitions`). A
     checked sum, which fails the statement instead of wrapping, would make
     the order of the sums the order of the totals; until one replaces the
-    built-in, every `sum` order term runs unpaged, as item 4 says.
+    built-in, every `sum` order term runs unpaged, as item 4 says. #3844
+    replaced it, and item 13 retires this item.
 12. `ravel_search_logs` applies item 6's mint-time check too. A last row
     whose `(ts, observed_ts)` are not the kinds the plan resumes on ends
     the page `ok_bounded` with no cursor and the `narrow_time_range` next
     step, as `ravel_query_sql` does
     (`a_last_row_of_the_wrong_kind_mints_no_cursor` in
     `crates/ravel-mcp/src/tools/search_logs.rs`).
+13. An integer `sum` order pages since #3844. That change made the
+    session's `sum` a checked UDAF (`crates/ravel-sql/src/sum.rs`,
+    registered in place of DataFusion's built-in): it adds in `i128`,
+    returns `Int64` for a signed argument and `UInt64` for an unsigned
+    one, and fails with `IntegerSumOverflow` when the total does not fit,
+    with no wrapped value. Item 11's reason is therefore gone, and a
+    `sum(col)` order term now plans under exactly item 1's links and item
+    5's pin: a column of `Int8` to `Int64` with resume kind `Int`, of
+    `UInt8` to `UInt64` with `UInt`. `sum(DISTINCT col)` plans like
+    `min(DISTINCT col)`; a `FILTER` and every other clause item 1 excludes
+    stay refused (`an_integer_sum_order_plans_and_a_float_sum_does_not` in
+    `crates/ravel-sql/src/page_plan.rs`).
+14. An overflow is an error, never an order. A walk whose page computes a
+    total past the result type fails that call with the overflow error,
+    on page one and on a resumed page alike, and no page is served in a
+    wrapped order
+    (`an_overflowing_integer_sum_order_fails_rather_than_pages` in
+    `crates/ravel-sql/tests/page_walk.rs`).
+15. The integer total is exact, so it is the same at any partition count:
+    a three-page walk with a tie across a page boundary returns the same
+    rows at one and at eight partitions, and matches the unpaged
+    statement (`integer_sum_walk_is_identical_at_one_and_eight_partitions`).
+16. A float `sum` and an `avg` still run unpaged, as
+    `OrderTermFromOtherRows`. A float `sum` keeps item 10's reason, the
+    order partial sums merge in. An `avg` is not taken by the proof at all
+    (`aggregate_proof` reads only `min`, `max` and `sum`): over an integer
+    or a float column its result is `Float64` (ADR-0825), and a float is off
+    item 3's allowlist, since no cursor carries its NaN.

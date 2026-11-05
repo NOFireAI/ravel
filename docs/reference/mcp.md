@@ -517,7 +517,8 @@ it reads anything:
 | no `ORDER BY`, and no projected row identity to order by (only `samples` has one: `ts` and `series_id`) | runs as written, unpaged |
 | an `ORDER BY` term that is a `count(...)`, such as `count(*)`, `count(DISTINCT x)`, a count with `FILTER`, `-count(*)` or `count(*) OVER ()`, through an alias or written as the expression a projected column is defined as | runs, paged over page one's segment set |
 | an `ORDER BY` term that is a `min(col)` or `max(col)` under a plain `GROUP BY`, where `col` is a NOT NULL column of the table of a signed or unsigned integer, string or nanosecond timestamp type with no time zone, such as `max(ts)` on `samples` or `max(severity_num)` on `logs`, through an alias or written as the expression a projected column is defined as | runs, paged over page one's segment set |
-| any other `ORDER BY` term computed from rows other than its own: an aggregate such as `sum(value)`, `sum(duration_ns)` (a `sum` over any column), `avg(value)`, `min(value)` or `min(series_id)`, a `min` or `max` with `FILTER` or `OVER`, or under `ROLLUP`, `CUBE`, `GROUPING SETS` or no `GROUP BY`, a window function such as `row_number() OVER (...)`, a count over a `ROWS` frame or a named window, or a subquery, whether ordered by directly or through an alias | runs as written, unpaged |
+| an `ORDER BY` term that is a `sum(col)` or `sum(DISTINCT col)` under a plain `GROUP BY`, where `col` is a NOT NULL column of the table of a signed or unsigned integer type, such as `sum(duration_ns)` on `spans` or `sum(severity_num)` on `logs`, through an alias or written as the expression a projected column is defined as | runs, paged over page one's segment set; a page whose sum overflows `Int64` (signed column) or `UInt64` (unsigned) fails the call with the overflow error |
+| any other `ORDER BY` term computed from rows other than its own: an aggregate such as `sum(value)` (a `sum` over a float column), a `sum` with `FILTER`, `avg(value)`, `min(value)` or `min(series_id)`, a `min` or `max` with `FILTER` or `OVER`, or under `ROLLUP`, `CUBE`, `GROUPING SETS` or no `GROUP BY`, a window function such as `row_number() OVER (...)`, a count over a `ROWS` frame or a named window, or a subquery, whether ordered by directly or through an alias | runs as written, unpaged |
 | any other `SELECT` over one table | runs, paged |
 
 A float `ORDER BY` term is refused because a NaN or infinite value has no
@@ -543,17 +544,19 @@ NULL column is a value of that column, of the column's type. The argument
 is read from the table, never from the projection, so `max(ts)` beside
 `value AS ts` is the maximum of the table's `ts`. Float, Boolean and binary
 columns are not on the list, and neither is `samples`' `series_id`, so
-`min(series_id)` runs unpaged. A `sum` never pages, though a `sum` of a
-NOT NULL column under a plain `GROUP BY` is not NULL either. Over a float
-column the engine adds partial sums in the order its partitions finish, so
-two runs over the same segments can differ in the last bits. Over an
-integer column the sum is `Int64` for a signed argument and `UInt64` for an
-unsigned one, and it wraps past that range with no error, so the order of
-the sums is not the order of the totals. Any other such term is not proven non-null,
+`min(series_id)` runs unpaged. A `sum` term pages under the same proof
+when its column is an integer: the sum is `Int64` for a signed argument and
+`UInt64` for an unsigned one, computed exactly, so it is the same at any
+partition count. A sum past that range is an error, not a value: the page
+that computes it fails the call, and no page is served in a wrapped order.
+A float `sum` runs unpaged, because the engine adds partial sums in the
+order its partitions finish, so two runs over the same segments can differ
+in the last bits. An `avg` is a float for an integer or a float column and
+runs unpaged too. Any other such term is not proven non-null,
 so the statement runs once, in its own order, and a capped result ends
 `ok_bounded` with no cursor. To page it, order by a `count(...)`, by a
-`min(col)` or `max(col)` the planner proves, or by the row's own non-null
-columns, such as a grouping column.
+`min(col)`, `max(col)` or integer `sum(col)` the planner proves, or by the
+row's own non-null columns, such as a grouping column.
 
 Before it mints a cursor, the tool checks the page's last order values
 against the plan the page ran under, the same check a later page's resume
