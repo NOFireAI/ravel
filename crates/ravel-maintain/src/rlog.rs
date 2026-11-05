@@ -1298,12 +1298,12 @@ struct MergePlan {
     /// Stored bytes of every distinct row group any stream's candidate blocks
     /// fall in, over every input.
     raw_bytes: u64,
-    /// The sum that decided `mode`, compared to `ceiling_bytes`: `raw_bytes`
-    /// + pass floor + the largest hot stream's resident cursor charge for
-    /// [`MergeReadMode::Resident`]; the in-flight groups + pass floor + the
-    /// largest hot stream's cursor charge for [`MergeReadMode::FetchPerPass`],
-    /// and for [`MergeReadMode::Cursor`], which is taken when that sum is over
-    /// the ceiling.
+    /// The sum that decided `mode`, compared to `ceiling_bytes`. Resident:
+    /// `raw_bytes` plus the pass floor plus the largest hot stream's resident
+    /// cursor charge. [`MergeReadMode::FetchPerPass`]: the in-flight groups
+    /// plus the pass floor plus the largest hot stream's cursor charge, and
+    /// the same for [`MergeReadMode::Cursor`], taken when that sum is over the
+    /// ceiling.
     compared_bytes: u64,
     ceiling_bytes: u64,
     /// Per input, the `(start, end)` extents of those row groups, ascending.
@@ -8604,29 +8604,25 @@ mod tests {
             peaks.push((resident_ceiling, transient));
         }
 
-        for resident_ceiling in [Some(D3_CEILING)] {
-            let at: Vec<u64> = peaks
-                .iter()
-                .filter(|(c, _)| *c == resident_ceiling)
-                .map(|(_, t)| *t)
-                .collect();
-            // The stream grew 10x; the decode-side peak did not (the same one
-            // decoded block per input stays resident regardless of stream size).
-            let (base, ten_x) = (at[0], at[1]);
-            assert!(
-                ten_x <= base * 2,
-                "{resident_ceiling:?}: decode-side peak scaled with the stream: \
-                 base={base} 10x={ten_x}"
-            );
-            // And concretely, at 10x the peak is a small fraction of the stream.
-            let stream_bytes_10x =
-                (scales[1] * i64::from(INPUTS)) as u64 * PER_RECORD_APPROX as u64;
-            assert!(
-                ten_x < stream_bytes_10x / 5,
-                "{resident_ceiling:?}: 10x peak {ten_x} is not far below the stream size \
-                 {stream_bytes_10x}"
-            );
-        }
+        // The transient bound applies to the cursor runs, under D3_CEILING.
+        let at: Vec<u64> = peaks
+            .iter()
+            .filter(|(c, _)| *c == Some(D3_CEILING))
+            .map(|(_, t)| *t)
+            .collect();
+        // The stream grew 10x; the decode-side peak did not (the same one
+        // decoded block per input stays resident regardless of stream size).
+        let (base, ten_x) = (at[0], at[1]);
+        assert!(
+            ten_x <= base * 2,
+            "decode-side peak scaled with the stream: base={base} 10x={ten_x}"
+        );
+        // And concretely, at 10x the peak is a small fraction of the stream.
+        let stream_bytes_10x = (scales[1] * i64::from(INPUTS)) as u64 * PER_RECORD_APPROX as u64;
+        assert!(
+            ten_x < stream_bytes_10x / 5,
+            "10x peak {ten_x} is not far below the stream size {stream_bytes_10x}"
+        );
     }
 
     /// Byte-identical-output test: the new k-way streaming merge
@@ -12353,7 +12349,7 @@ mod tests {
         fn skewed_inputs() -> (Vec<L0Input>, Vec<u32>, Vec<u32>) {
             let mut order: Vec<u32> = (0..16).collect();
             order.sort_by_key(|&s| stream_ident(s).0);
-            let (big, small): (Vec<(usize, u32)>, Vec<(usize, u32)>) = order
+            let (big, small): (Vec<_>, Vec<_>) = order
                 .iter()
                 .copied()
                 .enumerate()
