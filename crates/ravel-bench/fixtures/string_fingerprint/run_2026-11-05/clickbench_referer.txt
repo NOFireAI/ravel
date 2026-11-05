@@ -1,0 +1,33 @@
+string_fingerprint stamp git=971c43712df718af013a9e9ab34b62f9ab81e00b arch=x86_64 nproc=16 mem_total_kib=32132612 corpus_file=hits_0.parquet corpus_sha256=fa134fe101e68324e0de851146fda69624f5cbb707d387141d1c2a88a219a16d corpus_bytes=122446530 zstd_level=3 cpu_clock=CLOCK_THREAD_CPUTIME_ID
+string_fingerprint params column=Referer gram_len=3 budget_share=0.01 fallback_min_bits=256 zstd_level=3 block_records=8192 object_records=262144 max_lines=1000000 seed=3710 literals_per_kind=40 eq_max_len=64 like_min_len=5 like_max_len=12
+string_fingerprint workload training present equals=20 like=20 absent equals=20 like=20; evaluation present equals=20 like=20 absent equals=20 like=20
+string_fingerprint figure clickbench_referer/lines = 1000000 predict 1000000 band [1000000, 1000000] ok
+string_fingerprint figure clickbench_referer/blocks = 123 predict 123 band [123, 123] ok
+string_fingerprint figure clickbench_referer/column_bytes = 79583339 predict 79583339 band [79583339, 79583339] ok
+string_fingerprint figure clickbench_referer/compressed_bytes = 12616251 predict 16400000 band [11500000, 21300000] ok
+string_fingerprint figure clickbench_referer/zstd_cpu_s = 0.19512925199999998 predict 0.31 band [0.1, 0.93] ok
+string_fingerprint figure clickbench_referer/build_cpu_over_zstd = 3.9411965254702053 predict 2.5 band [1, 6] ok
+string_fingerprint figure clickbench_referer/candidate_grams = 843 predict 700 band [200, 2000] ok
+string_fingerprint figure clickbench_referer/learned_bits = 445 predict 400 band [50, 1800] ok
+string_fingerprint figure clickbench_referer/fallback_bits = 7667 predict 10000 band [5000, 13800] ok
+string_fingerprint figure clickbench_referer/bits_per_block = 8112 predict 10400 band [7400, 13800] ok
+string_fingerprint figure clickbench_referer/summary_bytes_share = 0.009991636976784941 predict 0.0099 band [0.0095, 0.01] ok
+string_fingerprint figure clickbench_referer/fallback_density = 0.9313805020142274 predict 0.85 band [0.6, 0.99] ok
+string_fingerprint figure clickbench_referer/eval_equals_bloom_testable = 40 predict 40 band [40, 40] ok
+string_fingerprint figure clickbench_referer/seen/equals/false_positive_share = 0.26765799256505574 predict 0.5 band [0.1, 0.95] ok
+string_fingerprint figure clickbench_referer/seen/like/false_positive_share = 0.4301898346601347 predict 0.5 band [0.1, 0.95] ok
+string_fingerprint figure clickbench_referer/unseen/equals/false_positive_share = 0.7381233750886316 predict 0.8 band [0.4, 1] ok
+string_fingerprint figure clickbench_referer/unseen/like/false_positive_share = 0.839572192513369 predict 0.85 band [0.5, 1] ok
+string_fingerprint figure clickbench_referer/unseen/equals_absent/false_positive_share = 0.7109756097560975 predict 0.85 band [0.4, 1] ok
+string_fingerprint figure clickbench_referer/unseen/like_absent/false_positive_share = 0.8512195121951219 predict 0.9 band [0.5, 1] ok
+string_fingerprint figure clickbench_referer/production/equals/false_positive_share = 0.016544552115339162 predict 0.03 band [0, 0.15] ok
+string_fingerprint figure clickbench_referer/bloom/equals/false_positive_share = 0.016544552115339162 predict 0.03 band [0, 0.15] ok
+string_fingerprint figure clickbench_referer/summary/equals_bloom_testable/false_positive_share = 0.7381233750886316 predict 0.8 band [0.4, 1] ok
+string_fingerprint figure clickbench_referer/contains/like/cells_tested_per_row = 0.244687 predict 0.3 band [0.05, 1.2] ok
+string_fingerprint figure clickbench_referer/summary/like/cells_tested_share = 0.9410339535815143 predict 1 band [0.8, 1] ok
+string_fingerprint figure clickbench_referer/saturation/long_values = 99 predict 99 band [99, 99] ok
+string_fingerprint figure clickbench_referer/saturation/blocks = 1 predict 1 band [1, 1] ok
+string_fingerprint figure clickbench_referer/saturation/fallback_density = 0.863440719968697 predict 0.55 band [0.2, 0.9] ok
+string_fingerprint figure clickbench_referer/saturation/unseen/like/false_positive_share = 0.5555555555555556 predict 0.6 band [0.1, 1] ok
+string_fingerprint decision clickbench_referer: NO-GO; unseen_equals_fp=0.7381 unseen_like_fp=0.8396 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=3.9412 (bar 2); fails: unseen_equals, unseen_like, cpu; saturation body-ineligible (saturation_fp=0.5556, bar 0.3)
+string_fingerprint objects=4 object_bytes=11723497

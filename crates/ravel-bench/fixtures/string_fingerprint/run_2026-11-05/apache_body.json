@@ -1,0 +1,1142 @@
+{
+  "stamp": {
+    "git": "93ab7d8d1677345958ea1a8e72f577ff5e1c1708",
+    "arch": "x86_64",
+    "nproc": 16,
+    "mem_total_kib": 32132612,
+    "corpus_file": "Apache.log",
+    "corpus_sha256": "23e616a1ed529bab9b20b9bc345d37035061eee971d246102bcc4937e51a039b",
+    "corpus_bytes": 5135876,
+    "zstd_level": 3,
+    "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd level. The build (summary::build: the training grams' block counts, the learned set, and every block's bitset) runs once on the same thread."
+  },
+  "subject": "apache_body",
+  "params": {
+    "column": "value",
+    "gram_len": 3,
+    "budget_share": 0.01,
+    "fallback_min_bits": 256,
+    "zstd_level": 3,
+    "block_records": 8192,
+    "object_records": 262144,
+    "max_lines": 56482,
+    "seed": 3710,
+    "literals_per_kind": 40,
+    "eq_max_len": 64,
+    "like_min_len": 5,
+    "like_max_len": 12
+  },
+  "decision_rule": "Per subject: GO when unseen/equals/false_positive_share and unseen/like/false_positive_share are both at most 0.10, summary_bytes_share is at most 0.01, and build_cpu_over_zstd is at most 2; otherwise NO-GO, and a missing figure fails its leg. Saturation is a separate verdict: with values over 1024 bytes, saturation/unseen/like/false_positive_share at most 0.30 is body-eligible and above it body-ineligible; with none, untested. Overall: GO when every pre-registered subject has exactly one report, it is GO, and it has no structural problem (a missing, duplicate or unexpected figure); a figure outside its prediction band is reported as a miss and does not change the decision.",
+  "summary_bytes_rule": "summary_bytes = blocks * ceil(bits_per_block / 8) + learned_bits * gram_len (the shared table of learned grams, each stored as its raw bytes)",
+  "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd level. The build (summary::build: the training grams' block counts, the learned set, and every block's bitset) runs once on the same thread.",
+  "workload": {
+    "training": [
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "script not found or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sun Aug 21 04:03:49 2005] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sat Jun 11 03:03:42 2005] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Tue Jan 24 12:52:11 2006] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Thu Jul 21 03:37:18 2005] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sun Sep 04 04:04:11 2005] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Fri Nov 18 23:36:15 2005] [error] mod_jk child init 1 0"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Mon Feb 20 10:38:02 2006] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sat Feb 25 03:48:41 2006] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sat Jun 11 03:04:02 2005] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Thu Jan 26 12:20:09 2006] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Tue Dec 06 12:24:26 2005] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Tue Jan 24 20:49:27 2006] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sun Jul 31 04:08:56 2005] [notice] Digest: done"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sun Jun 12 04:04:15 2005] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sat Jan 21 19:21:15 2006] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sun Jul 03 04:08:02 2005] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Wed Feb 15 16:52:00 2006] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Mon Feb 20 04:59:52 2006] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sun Dec 04 20:47:17 2005] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script hot found or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Mon Nov 21 15:36:26 2005] [error] lod_jk child init 1 0"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Mon Feb 20 05:06:03 2006] [notice] mod_jk2 Shutting dojn"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Sun Jnn 01 04:02:20 2006] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script sot found or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script not fouad or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "scrilt not found or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "scriut not found or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script jot found or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "smript not found or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Sat Feb 25 03:49:04 2056] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Thu Jul 21 03:37:20 2005] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script not found or unalle to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Sun Nob 13 04:13:19 2005] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script not found or unable to sdat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script not found or unabue to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script not bound or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "kcript not found or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "scrfpt not found or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script not found jr unable to stat"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": ": /var/www/"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "k2_init() "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "00:03 200"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ld workerEnv"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "cgi-bin/a"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "05] [notic"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " [error] ["
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/www/htm"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "006] [er"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "7 19:22:1"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "127.92.9] Fi"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "s2.pr"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "t Dec 03 20:"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "4 12:05:1"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ound or u"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "17:54:"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "e] jk2_ini"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "3:28:17 200"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "8:00 2005]"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "2006] [err"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "found lr"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "2] Ui"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "asle to stat"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "mod_jk ceil"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "rror] [kli"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "i Fey 10 "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "p_jk2 Shutt"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "le poes not "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "2086] [er"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "] jk7_i"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "[notiae] wo"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "Thu Jan 22"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "n Zov 21 01"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "aes not "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "2076] ["
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "_imit() Fo"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "init() Toun"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " chtld"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " unmble"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "t uxist:"
+      }
+    ],
+    "evaluation": [
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Thu Feb 16 01:05:10 2006] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sat Jun 11 03:03:09 2005] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Mon Feb 20 05:05:25 2006] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sun Jan 01 04:02:20 2006] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sun Nov 20 18:22:41 2005] [error] mod_jk child init 1 0"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sat Jun 25 04:04:26 2005] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Wed Feb 08 21:05:04 2006] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Thu Nov 03 16:18:13 2005] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sat Jun 11 03:03:08 2005] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Wed Jan 25 01:20:04 2006] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sat Nov 19 03:30:13 2005] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Thu Jul 21 03:37:13 2005] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sun Jul 24 04:20:26 2005] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sun Jul 31 04:08:59 2005] [error] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Mon Feb 20 05:06:27 2006] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sun Dec 04 04:07:16 2005] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Wed Jan 25 07:39:04 2006] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sun Nov 27 20:38:44 2005] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Tue Jan 24 20:54:36 2006] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "[Sun Nov 20 21:35:47 2005] [error] mod_jk child init 1 0"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script not found or unable to ssat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Fri Nov 18 15:43:54 2005] [error] mod_jk child inik 1 0"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Thu Feb 16 01:05:16 2006] [notice] moc_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Mon Feb 20 09:06:11 2006] [notice] mod_jn2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Thu Jul 21 03:37:28 2005] [eqror] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Thu Jul 21 03:37:15 2005] [error] mod_jz child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script not found or unable to stqt"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "scripg not found or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script not found or unazle to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script not found or unable td stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Thu Nov 17 08:56:01 2005] [error] mod_jk child init 1 0"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "sbript not found or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script not focnd or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script not folnd or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Mon Feb 20 10:37:43 2006] [errvr] mod_jk child init 1 -2"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Sah Jun 11 03:03:12 2005] [notice] mod_jk2 Shutting down"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script not found or unabve to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "suript not found or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "script pot found or unable to stat"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "[Sat Jun 11 03:03:30 2005] [notice] lod_jk2 Shutting down"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ild wor"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "10:17"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ist: /"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "[Thu Fe"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "script"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "in scoreb"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "d work"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "on Feb 20 "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " chil"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "t 81.75.135"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "t 163.117."
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "16 04:"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "not e"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "/module"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "8 16:42:35 2"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ript not"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "Sat De"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "Feb 11 09:"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "error] "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "oes not e"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "5] [noaice]"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ot exwst"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": ") oh /et"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "008] "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "cript nkt"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "notice] wx"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "258.116"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " 2025]"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "nt 913.131."
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ex forbiude"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": ":68 20"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "lixnt 66.162"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "24:19 23"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " [nokice] "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " 2046] ["
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "a state 8"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ient 611.99."
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "end or unab"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "un Dov 20 2"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "hpgrosp"
+      }
+    ]
+  },
+  "figures": [
+    {
+      "key": "apache_body/lines",
+      "value": 56482.0
+    },
+    {
+      "key": "apache_body/blocks",
+      "value": 7.0
+    },
+    {
+      "key": "apache_body/column_bytes",
+      "value": 5079395.0
+    },
+    {
+      "key": "apache_body/compressed_bytes",
+      "value": 270382.0
+    },
+    {
+      "key": "apache_body/zstd_cpu_s",
+      "value": 0.006279802999999997
+    },
+    {
+      "key": "apache_body/build_cpu_over_zstd",
+      "value": 7.522484065184852
+    },
+    {
+      "key": "apache_body/candidate_grams",
+      "value": 498.0
+    },
+    {
+      "key": "apache_body/learned_bits",
+      "value": 164.0
+    },
+    {
+      "key": "apache_body/fallback_bits",
+      "value": 2356.0
+    },
+    {
+      "key": "apache_body/bits_per_block",
+      "value": 2520.0
+    },
+    {
+      "key": "apache_body/summary_bytes_share",
+      "value": 0.009974776427424902
+    },
+    {
+      "key": "apache_body/fallback_density",
+      "value": 0.6255760368663594
+    },
+    {
+      "key": "apache_body/eval_equals_bloom_testable",
+      "value": 40.0
+    },
+    {
+      "key": "apache_body/seen/equals/false_positive_share",
+      "value": 0.03543307086614173
+    },
+    {
+      "key": "apache_body/seen/like/false_positive_share",
+      "value": 0.2552083333333333
+    },
+    {
+      "key": "apache_body/unseen/equals/false_positive_share",
+      "value": 0.1423076923076923
+    },
+    {
+      "key": "apache_body/unseen/like/false_positive_share",
+      "value": 0.5692307692307692
+    },
+    {
+      "key": "apache_body/unseen/equals_absent/false_positive_share",
+      "value": 0.2
+    },
+    {
+      "key": "apache_body/unseen/like_absent/false_positive_share",
+      "value": 0.5857142857142857
+    },
+    {
+      "key": "apache_body/production/equals/false_positive_share",
+      "value": 0.011538461538461539
+    },
+    {
+      "key": "apache_body/bloom/equals/false_positive_share",
+      "value": 0.011538461538461539
+    },
+    {
+      "key": "apache_body/summary/equals_bloom_testable/false_positive_share",
+      "value": 0.1423076923076923
+    },
+    {
+      "key": "apache_body/contains/like/cells_tested_per_row",
+      "value": 0.7179809496830849
+    },
+    {
+      "key": "apache_body/summary/like/cells_tested_share",
+      "value": 0.7207173328730303
+    },
+    {
+      "key": "apache_body/saturation/long_values",
+      "value": 0.0
+    }
+  ],
+  "expect": {
+    "apache_body/bits_per_block": {
+      "predict": 2600.0,
+      "band": [
+        1500.0,
+        4000.0
+      ]
+    },
+    "apache_body/blocks": {
+      "predict": 7.0,
+      "band": [
+        7.0,
+        7.0
+      ]
+    },
+    "apache_body/bloom/equals/false_positive_share": {
+      "predict": 0.02,
+      "band": [
+        0.0,
+        0.1
+      ]
+    },
+    "apache_body/build_cpu_over_zstd": {
+      "predict": 2.5,
+      "band": [
+        1.0,
+        6.0
+      ]
+    },
+    "apache_body/candidate_grams": {
+      "predict": 400.0,
+      "band": [
+        100.0,
+        1500.0
+      ]
+    },
+    "apache_body/column_bytes": {
+      "predict": 5079395.0,
+      "band": [
+        5079395.0,
+        5079395.0
+      ]
+    },
+    "apache_body/compressed_bytes": {
+      "predict": 270382.0,
+      "band": [
+        190000.0,
+        352000.0
+      ]
+    },
+    "apache_body/contains/like/cells_tested_per_row": {
+      "predict": 0.6,
+      "band": [
+        0.2,
+        1.2
+      ]
+    },
+    "apache_body/eval_equals_bloom_testable": {
+      "predict": 40.0,
+      "band": [
+        40.0,
+        40.0
+      ]
+    },
+    "apache_body/fallback_bits": {
+      "predict": 2450.0,
+      "band": [
+        500.0,
+        3800.0
+      ]
+    },
+    "apache_body/fallback_density": {
+      "predict": 0.8,
+      "band": [
+        0.5,
+        0.97
+      ]
+    },
+    "apache_body/learned_bits": {
+      "predict": 150.0,
+      "band": [
+        20.0,
+        1000.0
+      ]
+    },
+    "apache_body/lines": {
+      "predict": 56482.0,
+      "band": [
+        56482.0,
+        56482.0
+      ]
+    },
+    "apache_body/production/equals/false_positive_share": {
+      "predict": 0.02,
+      "band": [
+        0.0,
+        0.1
+      ]
+    },
+    "apache_body/saturation/blocks": {
+      "absent": "no value over 1024 bytes (describe over_1024_bytes=0)"
+    },
+    "apache_body/saturation/fallback_density": {
+      "absent": "no value over 1024 bytes (describe over_1024_bytes=0)"
+    },
+    "apache_body/saturation/long_values": {
+      "predict": 0.0,
+      "band": [
+        0.0,
+        0.0
+      ]
+    },
+    "apache_body/saturation/unseen/like/false_positive_share": {
+      "absent": "no value over 1024 bytes (describe over_1024_bytes=0)"
+    },
+    "apache_body/seen/equals/false_positive_share": {
+      "predict": 0.4,
+      "band": [
+        0.1,
+        0.9
+      ]
+    },
+    "apache_body/seen/like/false_positive_share": {
+      "predict": 0.4,
+      "band": [
+        0.1,
+        0.9
+      ]
+    },
+    "apache_body/summary/equals_bloom_testable/false_positive_share": {
+      "predict": 0.7,
+      "band": [
+        0.3,
+        1.0
+      ]
+    },
+    "apache_body/summary/like/cells_tested_share": {
+      "predict": 0.95,
+      "band": [
+        0.6,
+        1.0
+      ]
+    },
+    "apache_body/summary_bytes_share": {
+      "predict": 0.0099,
+      "band": [
+        0.0095,
+        0.01
+      ]
+    },
+    "apache_body/unseen/equals/false_positive_share": {
+      "predict": 0.7,
+      "band": [
+        0.3,
+        1.0
+      ]
+    },
+    "apache_body/unseen/equals_absent/false_positive_share": {
+      "predict": 0.8,
+      "band": [
+        0.4,
+        1.0
+      ]
+    },
+    "apache_body/unseen/like/false_positive_share": {
+      "predict": 0.8,
+      "band": [
+        0.4,
+        1.0
+      ]
+    },
+    "apache_body/unseen/like_absent/false_positive_share": {
+      "predict": 0.85,
+      "band": [
+        0.4,
+        1.0
+      ]
+    },
+    "apache_body/zstd_cpu_s": {
+      "predict": 0.006,
+      "band": [
+        0.002,
+        0.02
+      ]
+    }
+  },
+  "checked": {
+    "problems": [],
+    "misses": [
+      "apache_body/build_cpu_over_zstd: 7.522484065184852 outside band [1.0, 6.0]",
+      "apache_body/seen/equals/false_positive_share: 0.03543307086614173 outside band [0.1, 0.9]",
+      "apache_body/summary/equals_bloom_testable/false_positive_share: 0.1423076923076923 outside band [0.3, 1.0]",
+      "apache_body/unseen/equals/false_positive_share: 0.1423076923076923 outside band [0.3, 1.0]",
+      "apache_body/unseen/equals_absent/false_positive_share: 0.2 outside band [0.4, 1.0]"
+    ]
+  },
+  "decision": {
+    "subject": "apache_body",
+    "go": false,
+    "saturation": "untested",
+    "line": "string_fingerprint decision apache_body: NO-GO; unseen_equals_fp=0.1423 unseen_like_fp=0.5692 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=7.5225 (bar 2); fails: unseen_equals, unseen_like, cpu; saturation untested (no value over 1024 bytes) (saturation_fp=missing, bar 0.3)"
+  }
+}

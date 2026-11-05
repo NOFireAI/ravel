@@ -1,0 +1,1128 @@
+{
+  "stamp": {
+    "git": "a2a8c50678f5b61cfe395605f000826152067e5e",
+    "arch": "x86_64",
+    "nproc": 16,
+    "mem_total_kib": 32132612,
+    "corpus_file": "HDFS.log",
+    "corpus_sha256": "0783096174d7832c618337f9609e06e04abd86ddd7089b3c12b407e63bfebc52",
+    "corpus_bytes": 1577982906,
+    "zstd_level": 3,
+    "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd level. The build (summary::build: the training grams' block counts, the learned set, and every block's bitset) runs once on the same thread."
+  },
+  "subject": "hdfs_body",
+  "params": {
+    "column": "value",
+    "gram_len": 3,
+    "budget_share": 0.01,
+    "fallback_min_bits": 256,
+    "zstd_level": 3,
+    "block_records": 8192,
+    "object_records": 262144,
+    "max_lines": 11175629,
+    "seed": 3710,
+    "literals_per_kind": 40,
+    "eq_max_len": 1024,
+    "like_min_len": 5,
+    "like_max_len": 12
+  },
+  "decision_rule": "Per subject: GO when unseen/equals/false_positive_share and unseen/like/false_positive_share are both at most 0.10, summary_bytes_share is at most 0.01, and build_cpu_over_zstd is at most 2; otherwise NO-GO, and a missing figure fails its leg. Saturation is a separate verdict: with values over 1024 bytes, saturation/unseen/like/false_positive_share at most 0.30 is body-eligible and above it body-ineligible; with none, untested. Overall: GO when every pre-registered subject has exactly one report, it is GO, and it has no structural problem (a missing, duplicate or unexpected figure); a figure outside its prediction band is reported as a miss and does not change the decision.",
+  "summary_bytes_rule": "summary_bytes = blocks * ceil(bits_per_block / 8) + learned_bits * gram_len (the shared table of learned grams, each stored as its raw bytes)",
+  "cpu_clock": "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd level. The build (summary::build: the training grams' block counts, the learned set, and every block's bitset) runs once on the same thread.",
+  "workload": {
+    "training": [
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 055229 31 INFO dfs.FSNamesystem: BLOCK* NameSystem.allocateBlock: /user/root/randtxt5/_temporary/_task_200811101024_0012_m_000191_0/part-00191. blk_-2798827605342006180"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 101020 28 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.75.228:50010 is added to blk_-4665002721681762292 size 67108864"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 103604 19 INFO dfs.FSDataset: Deleting block blk_5782621825137787312 file /mnt/hadoop/dfs/data/current/subdir0/blk_5782621825137787312"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 105739 9484 INFO dfs.DataNode$PacketResponder: PacketResponder 2 for block blk_-4812404149917089451 terminating"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 042545 19944 INFO dfs.DataNode$DataXceiver: Receiving block blk_-9011738877401709475 src: /10.251.38.197:43856 dest: /10.251.38.197:50010"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 105251 26714 INFO dfs.DataNode$PacketResponder: Received block blk_777748003912431965 of size 67108864 from /10.251.198.196"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 044657 19 INFO dfs.FSDataset: Deleting block blk_797804053159120527 file /mnt/hadoop/dfs/data/current/subdir37/blk_797804053159120527"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 094759 26090 INFO dfs.DataNode$DataXceiver: Receiving block blk_-2352111322265128032 src: /10.251.67.113:35488 dest: /10.251.67.113:50010"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 014117 5741 INFO dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_2366125074746837904 terminating"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 223118 34 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.30.101:50010 is added to blk_-1907491758330123555 size 67108864"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 122200 10796 INFO dfs.DataNode$PacketResponder: PacketResponder 0 for block blk_-1220221555133950121 terminating"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081109 205012 30 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.42.84:50010 is added to blk_7185370990719197021 size 67108864"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 210953 14754 INFO dfs.DataNode$DataXceiver: Receiving block blk_-1429451264166858153 src: /10.251.122.38:47123 dest: /10.251.122.38:50010"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 201644 14267 INFO dfs.DataNode$DataXceiver: 10.251.107.227:50010 Served block blk_-1853532908793403857 to /10.251.107.227"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 150404 12955 INFO dfs.DataNode$PacketResponder: PacketResponder 0 for block blk_3259824948529013142 terminating"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 020416 26 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.125.193:50010 is added to blk_-40081643776915806 size 67108864"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 034836 31 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.75.228:50010 is added to blk_-1094298755579025554 size 67108864"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 110553 19 INFO dfs.FSDataset: Deleting block blk_-8261598549541352237 file /mnt/hadoop/dfs/data/current/subdir33/blk_-8261598549541352237"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 041553 19817 INFO dfs.DataNode$DataXceiver: Receiving block blk_-355362023215106223 src: /10.251.27.63:52700 dest: /10.251.27.63:50010"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 050608 20953 INFO dfs.DataNode$PacketResponder: Received block blk_-2398352042898043299 of size 67108864 from /10.251.74.134"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 210623 19 INFO dfs.FSDataset: Deleting block blk_7893869444896275182 file /mnt/hadoop/dfs/data/current/subdir4/blk_7893869044896275182"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 062222 26 INFO dfs.FSNamesystem: BLOCK* NameSystem.delete: blk_131501474895224810 is added to invalidSet of 10.250.11.85:50010"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 075852 19 INFO dfs.FSDataset: Deleting block blk_1350636495654640851 file /mnt/hadoop/dfs/data/cugrent/subdir59/blk_1350636495654640851"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 012456 5491 INFO dfs.DataNode$PacnetResponder: PacketResponder 2 for block blk_7944629892520686135 terminating"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 103027 34 INFO dfs.FSNamesystem: BLOCK* NameSystem.delete: blk_4607575369745693095 is addcd to invalidSet of 10.251.198.196:50010"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 083201 24600 INFO dfh.DataNode$PacketResponder: Received block blk_4313239079779123510 of size 67108864 from /10.251.126.255"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 044358 19940 INFO dfs.DataNode$DataXceiver: Receiving block blk_-150965812868783965 src: /10.251.814.67:51670 dest: /10.251.214.67:50010"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 063322 35 INFO dfs.FSNamesystfm: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.126.5:50010 is added to blk_-6513639190039130861 size 67108864"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "001110 122932 10130 INFO dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_-3607888214691261853 terminating"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 042117 6047 WARN dfs.DataNode$DataXceiver: 10.251.65.237:50010:Got exception while serving blk_7512425296684115479 to /10.251.202.134:"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 224430 16425 INFO dfs.DataNrde$DataXceiver: Receiving block blk_4043122005810494741 src: /10.251.106.37:36592 dest: /10.251.106.37:50010"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 044318 35 INFO dfs.FSNamesystei: BLOCK* NameSystem.delete: blk_-3341250753068275993 is added to invalidSet of 10.251.71.97:50010"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 102224 30 INYO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.125.193:50010 is added to blk_3807722119285770698 size 67108864"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 101705 31 INFO dfs.FSNamesystem: BLOCK* NameSystem.allocateBlock: /user/root/raidtxt9/_temporary/_task_200811101024_0016_m_000797_0/part-00797. blk_932339456562729543"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 103440 19 INFO dfs.FSDataset: Deleting block blk_-6905953577161479303 file /mnt/hadoop/dfs/data/current/subdir3/blk_-6905953577261479303"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 230051 16457 INFO dfs.DataNode$PacketResponder: PacketResponder 1 for block blk_-14371116158491189 terminating"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 224753 16544 INFO kfs.DataNode$PacketResponder: Received block blk_-4316109555387787286 of size 67108864 from /10.251.111.80"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 145648 12807 INFO dfs.DataNode$PacketResponder: PacketRysponder 0 for block blk_-398370365994817678 terminating"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 103710 19 INFO dfs.FSDataset: Deletkng block blk_5755628467609368166 file /mnt/hadoop/dfs/data/current/subdir52/blk_5755628467609368166"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 104812 27311 INFO dfs.DataNode$PacketResponder: Received block blk_-7988755858672901897 of size 67108864 from /10.250.19.227"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": ".DataNode$"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " added "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "dBlock: bl"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "r: Pac"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ock: block"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ock blk_-"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "81111 0"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "FSDataset"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "4244148"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "lk_13033890"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "20640 "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "3 to /1"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": ".188:50"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": ": Recei"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "9 INFO dfs."
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " INFO d"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "74093429 o"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "to invali"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "_task_"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "066178580165"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "1.196.1"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "O dfs.DatgNo"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " dvs.Data"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "onier: "
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "457 8889 INI"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " filw /mn"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "O sfs.FS"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "903143 3"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "0167673319"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "67 src: /50."
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "ackbtRespond"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "k_-4186259"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " bloce blk"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "xponder: Pac"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "d: 30."
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "eletic"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "BLOCK* O"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " 29 INFO lfs"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "6 37 I"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "a/cuhrent"
+      }
+    ],
+    "evaluation": [
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 093849 8776 WARN dfs.DataNode$DataXceiver: 10.250.7.244:50010:Got exception while serving blk_4522485651416885266 to /10.250.7.244:"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 030842 32 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.66.192:50010 is added to blk_9076188805956839938 size 67108864"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 060115 28 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.250.15.67:50010 is added to blk_4504815666835195533 size 28489293"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 044853 18 INFO dfs.FSDataset: Deleting block blk_6784982734061504109 file /mnt/hadoop/dfs/data/current/subdir18/blk_6784982734061504109"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 103149 30 INFO dfs.FSNamesystem: BLOCK* NameSystem.delete: blk_-8482503273962412451 is added to invalidSet of 10.251.90.64:50010"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 015449 27 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.25.237:50010 is added to blk_987594530064167067 size 67108864"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 081707 8190 INFO dfs.DataNode$DataXceiver: 10.251.39.192:50010 Served block blk_-292744933071256312 to /10.251.39.192"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 090408 24969 INFO dfs.DataNode$PacketResponder: PacketResponder 0 for block blk_-7263281003374795294 terminating"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 032859 18791 INFO dfs.DataNode$PacketResponder: Received block blk_4594252898631639665 of size 67108864 from /10.251.73.220"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 110434 26 INFO dfs.FSNamesystem: BLOCK* NameSystem.delete: blk_113009073558539640 is added to invalidSet of 10.250.13.240:50010"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 064525 29 INFO dfs.FSNamesystem: BLOCK* NameSystem.allocateBlock: /user/root/randtxt5/_temporary/_task_200811101024_0012_m_001912_0/part-01912. blk_4540122595428656577"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 103235 29 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.74.134:50010 is added to blk_-7868773145680462243 size 67108864"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 123132 11191 INFO dfs.DataNode$PacketResponder: Received block blk_7934423504675594768 of size 67108864 from /10.251.111.80"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 161405 11867 INFO dfs.DataNode$PacketResponder: PacketResponder 2 for block blk_-7990159845707051959 terminating"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 085920 27 INFO dfs.FSNamesystem: BLOCK* NameSystem.delete: blk_7068252590255605096 is added to invalidSet of 10.251.42.191:50010"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 050107 26 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.66.63:50010 is added to blk_-1651143620446102998 size 67108864"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081110 103504 18 INFO dfs.FSDataset: Deleting block blk_-7585256437923912301 file /mnt/hadoop/dfs/data/current/subdir37/blk_-7585256437923912301"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081109 213014 2251 INFO dfs.DataNode$DataXceiver: Receiving block blk_5711802967589285809 src: /10.251.75.143:57164 dest: /10.251.75.143:50010"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 052016 28 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.250.10.213:50010 is added to blk_-4159161211108688490 size 67108864"
+      },
+      {
+        "kind": "equals",
+        "present": true,
+        "text": "081111 025832 18102 INFO dfs.DataNode$PacketResponder: Received block blk_-2554866684801058119 of size 67108864 from /10.251.26.131"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 212407 14292 INFO dfs.DataNode$DataXceiver: Receiving block blk_-1466968680069128807 src: /10.251.106.10:36387 dest: /10.251.106.10:50010"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 050748 20412 INFO dfs.DataNode$DataXceiver: Receiving block blk_-6924021375671652455 src: /10.251.197.161:43975 dest: /10.251.197.161:50010"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 023239 19 INFO dfs.FSDataset: Deleting block blk_-3572969081313706761 file /mnt/fadoop/dfs/data/current/subdir6/blk_-3572969081313706761"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081109 210227 1165 INFO dfs.DayaNode$DataXceiver: Receiving block blk_-4381885958961390476 src: /10.251.31.160:39324 dest: /10.251.31.160:50010"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 070549 7454 WARN dfs.YataNode$DataXceiver: 10.251.67.113:50010:Got exception while serving blk_2369342352176492646 to /10.251.39.242:"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 061453 21699 INFO dfs.DataNode$PacvetResponder: PacketResponder 1 for block blk_4078641140346213254 terminating"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 010120 17327 INFO dfs.DataNode$DataXceiver: 10.251.31.85:50010 Served block blk_1569620096471881784 to /10.251.65.203"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 072527 7589 INFO dfs.DataNode$DataXcewver: 10.251.203.179:50010 Served block blk_-112235336458008803 to /10.250.17.177"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 151238 9997 INFO dfs.DataNode$PacketResponder: Recejved block blk_5946583872382258400 of size 67108864 from /10.251.43.210"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 115623 10508 INFO dfs.DataNode$PacketResponder: Received block blk_7877325199765587861 of size 67108864 from /10.251.126.5"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 135936 12061 WAVN dfs.DataNode$DataXceiver: 10.251.107.227:50010:Got exception while serving blk_-3122284420172833394 to /10.251.123.1:"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 092257 25420 INFO dfs.DataNode$PacketResponder: PacketPesponder 1 for block blk_-3953227133090292438 terminating"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 214445 15314 INFO dfs.DataNode$DataEceiver: Receiving block blk_-4969537496108849166 src: /10.251.74.192:55605 dest: /10.251.74.192:50010"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081109 205057 30 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.111.228:50010 is added to blk_4956276028193818154 size 67108864"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081110 214103 29 INFO dfs.FSNaresystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.29.239:50010 is added to blk_-2696878620809016915 size 3549717"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 104438 26715 INFO dfs.DataNode$PocketResponder: PacketResponder 2 for block blk_7197291290049532326 terminating"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 023234 12 INFO dfs.FSDataset: Deleting block blk_3936210645238808502 file /mnt/hadoop/dfs/data/current/subdir42/blk_3936210645238808502"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 103911 26853 INFO dfs.DataNode$QataXceiver: Receiving block blk_-471436687761220552 src: /10.250.10.213:52907 dest: /10.250.10.213:50010"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081109 210955 0415 INFO dfs.DataNode$PacketResponder: Received block blk_-3990960005926544378 of size 67108864 from /10.251.214.18"
+      },
+      {
+        "kind": "equals",
+        "present": false,
+        "text": "081111 054116 34 INFO dfs.FSNamesystem: BLOCK* NameSystem.addStoredBlock: blockMap updated: 10.251.111.37:50010 is added to blk_263598024442941029 size 3553246"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": " INFO df"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "196:50"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ize 671"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "892205"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "0391093792"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "system: BLO"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "meSystem.del"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "r 2 for blo"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "03 is added"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "lk_904590802"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "ver: Recei"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "81111 "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "81110 15"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "0.10.176:500"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "64 from /10"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "t: /10.2"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "tResponder "
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "1.31.18"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "system: BL"
+      },
+      {
+        "kind": "like",
+        "present": true,
+        "text": "blk_-295068"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "aNome"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": " from /19.25"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "0 902603 144"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "NameQyst"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": ": /19.251"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "der 2 fog"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "O dfs.R"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "DataNody$"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "Maq update"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "Systpm.addSt"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "d to l"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "0.951."
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "s.DataNoa"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "O dfs.FJNa"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "dev 1 fo"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "cketRlspo"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "lgck blk_-2"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "s.FSNamesb"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "Bsock: b"
+      },
+      {
+        "kind": "like",
+        "present": false,
+        "text": "j 10.251.1"
+      }
+    ]
+  },
+  "figures": [
+    {
+      "key": "hdfs_body/lines",
+      "value": 11175629.0
+    },
+    {
+      "key": "hdfs_body/blocks",
+      "value": 1365.0
+    },
+    {
+      "key": "hdfs_body/column_bytes",
+      "value": 1555631648.0
+    },
+    {
+      "key": "hdfs_body/compressed_bytes",
+      "value": 155256427.0
+    },
+    {
+      "key": "hdfs_body/zstd_cpu_s",
+      "value": 2.7121428219999997
+    },
+    {
+      "key": "hdfs_body/build_cpu_over_zstd",
+      "value": 9.215074646979636
+    },
+    {
+      "key": "hdfs_body/candidate_grams",
+      "value": 1425.0
+    },
+    {
+      "key": "hdfs_body/learned_bits",
+      "value": 677.0
+    },
+    {
+      "key": "hdfs_body/fallback_bits",
+      "value": 8403.0
+    },
+    {
+      "key": "hdfs_body/bits_per_block",
+      "value": 9080.0
+    },
+    {
+      "key": "hdfs_body/summary_bytes_share",
+      "value": 0.00999189553679475
+    },
+    {
+      "key": "hdfs_body/fallback_density",
+      "value": 0.1951075383420973
+    },
+    {
+      "key": "hdfs_body/eval_equals_bloom_testable",
+      "value": 0.0
+    },
+    {
+      "key": "hdfs_body/seen/equals/false_positive_share",
+      "value": 0.10692561377794063
+    },
+    {
+      "key": "hdfs_body/seen/like/false_positive_share",
+      "value": 0.29276050080775445
+    },
+    {
+      "key": "hdfs_body/unseen/equals/false_positive_share",
+      "value": 0.05776841333821913
+    },
+    {
+      "key": "hdfs_body/unseen/like/false_positive_share",
+      "value": 0.25878390446786254
+    },
+    {
+      "key": "hdfs_body/unseen/equals_absent/false_positive_share",
+      "value": 0.03600732600732601
+    },
+    {
+      "key": "hdfs_body/unseen/like_absent/false_positive_share",
+      "value": 0.133003663003663
+    },
+    {
+      "key": "hdfs_body/production/equals/false_positive_share",
+      "value": 1.0
+    },
+    {
+      "key": "hdfs_body/contains/like/cells_tested_per_row",
+      "value": 1.0
+    },
+    {
+      "key": "hdfs_body/summary/like/cells_tested_share",
+      "value": 0.46815057568571755
+    },
+    {
+      "key": "hdfs_body/saturation/long_values",
+      "value": 0.0
+    }
+  ],
+  "expect": {
+    "hdfs_body/bits_per_block": {
+      "predict": 9100.0,
+      "band": [
+        6300.0,
+        11900.0
+      ]
+    },
+    "hdfs_body/blocks": {
+      "predict": 1365.0,
+      "band": [
+        1365.0,
+        1365.0
+      ]
+    },
+    "hdfs_body/bloom/equals/false_positive_share": {
+      "absent": "no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0)"
+    },
+    "hdfs_body/build_cpu_over_zstd": {
+      "predict": 2.5,
+      "band": [
+        1.0,
+        6.0
+      ]
+    },
+    "hdfs_body/candidate_grams": {
+      "predict": 1200.0,
+      "band": [
+        300.0,
+        3500.0
+      ]
+    },
+    "hdfs_body/column_bytes": {
+      "predict": 1555631648.0,
+      "band": [
+        1555631648.0,
+        1555631648.0
+      ]
+    },
+    "hdfs_body/compressed_bytes": {
+      "predict": 155256427.0,
+      "band": [
+        108700000.0,
+        201800000.0
+      ]
+    },
+    "hdfs_body/contains/like/cells_tested_per_row": {
+      "predict": 1.0,
+      "band": [
+        0.8,
+        1.2
+      ]
+    },
+    "hdfs_body/eval_equals_bloom_testable": {
+      "predict": 0.0,
+      "band": [
+        0.0,
+        0.0
+      ]
+    },
+    "hdfs_body/fallback_bits": {
+      "predict": 8800.0,
+      "band": [
+        4000.0,
+        11900.0
+      ]
+    },
+    "hdfs_body/fallback_density": {
+      "predict": 0.5,
+      "band": [
+        0.2,
+        0.85
+      ]
+    },
+    "hdfs_body/learned_bits": {
+      "predict": 300.0,
+      "band": [
+        20.0,
+        2000.0
+      ]
+    },
+    "hdfs_body/lines": {
+      "predict": 11175629.0,
+      "band": [
+        11175629.0,
+        11175629.0
+      ]
+    },
+    "hdfs_body/production/equals/false_positive_share": {
+      "predict": 1.0,
+      "band": [
+        0.95,
+        1.0
+      ]
+    },
+    "hdfs_body/saturation/blocks": {
+      "absent": "no value over 1024 bytes (describe over_1024_bytes=0)"
+    },
+    "hdfs_body/saturation/fallback_density": {
+      "absent": "no value over 1024 bytes (describe over_1024_bytes=0)"
+    },
+    "hdfs_body/saturation/long_values": {
+      "predict": 0.0,
+      "band": [
+        0.0,
+        0.0
+      ]
+    },
+    "hdfs_body/saturation/unseen/like/false_positive_share": {
+      "absent": "no value over 1024 bytes (describe over_1024_bytes=0)"
+    },
+    "hdfs_body/seen/equals/false_positive_share": {
+      "predict": 0.6,
+      "band": [
+        0.1,
+        0.95
+      ]
+    },
+    "hdfs_body/seen/like/false_positive_share": {
+      "predict": 0.6,
+      "band": [
+        0.1,
+        0.95
+      ]
+    },
+    "hdfs_body/summary/equals_bloom_testable/false_positive_share": {
+      "absent": "no evaluation equality literal is 64 bytes or fewer (describe at_most_64_bytes=0)"
+    },
+    "hdfs_body/summary/like/cells_tested_share": {
+      "predict": 0.95,
+      "band": [
+        0.6,
+        1.0
+      ]
+    },
+    "hdfs_body/summary_bytes_share": {
+      "predict": 0.0099,
+      "band": [
+        0.0095,
+        0.01
+      ]
+    },
+    "hdfs_body/unseen/equals/false_positive_share": {
+      "predict": 0.95,
+      "band": [
+        0.7,
+        1.0
+      ]
+    },
+    "hdfs_body/unseen/equals_absent/false_positive_share": {
+      "predict": 0.95,
+      "band": [
+        0.7,
+        1.0
+      ]
+    },
+    "hdfs_body/unseen/like/false_positive_share": {
+      "predict": 0.9,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "hdfs_body/unseen/like_absent/false_positive_share": {
+      "predict": 0.9,
+      "band": [
+        0.5,
+        1.0
+      ]
+    },
+    "hdfs_body/zstd_cpu_s": {
+      "predict": 3.1,
+      "band": [
+        1.0,
+        9.5
+      ]
+    }
+  },
+  "checked": {
+    "problems": [],
+    "misses": [
+      "hdfs_body/build_cpu_over_zstd: 9.215074646979636 outside band [1.0, 6.0]",
+      "hdfs_body/fallback_density: 0.1951075383420973 outside band [0.2, 0.85]",
+      "hdfs_body/summary/like/cells_tested_share: 0.46815057568571755 outside band [0.6, 1.0]",
+      "hdfs_body/unseen/equals/false_positive_share: 0.05776841333821913 outside band [0.7, 1.0]",
+      "hdfs_body/unseen/equals_absent/false_positive_share: 0.03600732600732601 outside band [0.7, 1.0]",
+      "hdfs_body/unseen/like/false_positive_share: 0.25878390446786254 outside band [0.5, 1.0]",
+      "hdfs_body/unseen/like_absent/false_positive_share: 0.133003663003663 outside band [0.5, 1.0]"
+    ]
+  },
+  "decision": {
+    "subject": "hdfs_body",
+    "go": false,
+    "saturation": "untested",
+    "line": "string_fingerprint decision hdfs_body: NO-GO; unseen_equals_fp=0.0578 unseen_like_fp=0.2588 (bar 0.1); summary_bytes_share=0.0100 (bar 0.01); build_cpu_over_zstd=9.2151 (bar 2); fails: unseen_like, cpu; saturation untested (no value over 1024 bytes) (saturation_fp=missing, bar 0.3)"
+  }
+}
