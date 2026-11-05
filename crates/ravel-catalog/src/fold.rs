@@ -2125,9 +2125,10 @@ pub(crate) struct KeyIndexPassRecord {
     pub(crate) held_capacity: u64,
     /// Whether every held pair's blocks `Vec` has capacity equal to its length.
     pub(crate) blocks_exact: bool,
-    /// Pairs the field held outside its heap, from earlier passes, while
-    /// this pass filled it. Every pass closes its slices
-    /// ([`key_index_pass_slices`]), so the build keeps no such pair.
+    /// Pairs the field still held once this pass had ended, measured after
+    /// `end_key_index_pass` returned: pairs that would sit in the next pass
+    /// beside its own. Every pass closes its slices
+    /// ([`key_index_pass_slices`]) and drops its heap, so this is 0.
     pub(crate) open_slice: u64,
 }
 
@@ -2164,6 +2165,17 @@ fn record_key_index_pass(name: &str, field: &FieldBuild, share: u64) {
         open_slice: 0,
     };
     KEY_INDEX_PASS_LOG.with(|log| log.borrow_mut().push(record));
+}
+
+/// Completes the record [`record_key_index_pass`] just wrote for `name`:
+/// the pairs the field still holds now that its pass has ended.
+#[cfg(test)]
+fn record_key_index_pass_end(name: &str, field: &FieldBuild) {
+    KEY_INDEX_PASS_LOG.with(|log| {
+        if let Some(record) = log.borrow_mut().iter_mut().rev().find(|r| r.field == name) {
+            record.open_slice = field.held.len() as u64;
+        }
+    });
 }
 
 /// What the leaf build needs beyond the part: the body ceiling, the pair
@@ -2473,6 +2485,8 @@ pub(crate) async fn build_part_key_index(
                         &limits.leaf,
                         &mut pending,
                     );
+                    #[cfg(test)]
+                    record_key_index_pass_end(name, field);
                 }
             }
             for (name, attempt, leaf) in pending {
@@ -14488,16 +14502,21 @@ pub(crate) mod tests {
     }
 
     /// Asserts the pair budget's bound on every pass in `log`: the pairs the
-    /// field's heap held at its peak plus the pairs its open slice held from
-    /// earlier passes are at most the larger of the pass's share and
-    /// `max_run`, the fixture's largest key8 run, plus the one pair placed
-    /// before a cut. Returns the number of passes checked.
+    /// field's heap held at its peak plus the pairs the field still held once
+    /// the pass ended, measured, are at most the larger of the pass's share
+    /// and `max_run`, the fixture's largest key8 run, plus the one pair
+    /// placed before a cut; and the pairs still held are 0, since every pass
+    /// closes its slices. Returns the number of passes checked.
     fn assert_pass_bound(log: &[KeyIndexPassRecord], max_run: u64, what: &str) -> usize {
         assert!(!log.is_empty(), "{what}: no pass recorded");
         for record in log {
             assert!(
                 record.held_peak + record.open_slice <= record.share.max(max_run).saturating_add(1),
                 "{what}: a pass held more than its share, open slice included: {record:?}"
+            );
+            assert_eq!(
+                record.open_slice, 0,
+                "{what}: a pass ended still holding pairs: {record:?}"
             );
         }
         log.len()
@@ -14510,9 +14529,9 @@ pub(crate) mod tests {
     /// 17-pair shared-key8 fixture (largest run 4) and the 12-pair budget
     /// fixture under its 40-byte ceiling (largest run 1, so ceiling cuts fall
     /// inside passes), and on the advancing fixture's 9 carried and 6 read
-    /// pairs (largest run 5), at budgets 1, 2, 3, 5, 6 and `u64::MAX`. It
-    /// fails when a slice outlives the pass that held its pairs, since the
-    /// open slice then holds every earlier pass's pairs past the ceiling.
+    /// pairs (largest run 5), at budgets 1, 2, 3, 5, 6 and `u64::MAX`. The
+    /// open slice is measured after each pass ends, as the pairs the field
+    /// still holds, so the test fails when a pass's pairs outlive it.
     #[tokio::test]
     async fn every_pass_holds_at_most_its_share_open_slice_included() {
         for max_pairs in [1, 2, 3, 5, 6, u64::MAX] {
