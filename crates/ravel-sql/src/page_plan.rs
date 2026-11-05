@@ -746,8 +746,9 @@ impl ResumeValue {
 /// The [`ResumeValue`] variant that carries every value of a proven order
 /// term, as [`cursor_support`] and [`expression_cursor_support`] prove it.
 ///
-/// There is no float kind: no float term is proven, so a
-/// [`ResumeValue::Float`] matches no term.
+/// No column type plans as a float kind: a float column admits NaN and the
+/// infinities. [`ResumeKind::FiniteFloat`] is reached only through
+/// [`aggregate_proof`], for an `avg` over an exact integer column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResumeKind {
     Int,
@@ -758,6 +759,9 @@ pub(crate) enum ResumeKind {
     Binary,
     /// With the column's byte width, which the value's length must equal.
     FixedSizeBinary(i32),
+    /// A finite [`ResumeValue::Float`]: the `Float64` of an `avg` over an
+    /// exact integer column, which is never NaN or infinite.
+    FiniteFloat,
 }
 
 impl ResumeKind {
@@ -773,12 +777,14 @@ impl ResumeKind {
             (ResumeKind::FixedSizeBinary(width), ResumeValue::FixedSizeBinary(bytes)) => {
                 i32::try_from(bytes.len()).is_ok_and(|len| len == width)
             }
+            (ResumeKind::FiniteFloat, ResumeValue::Float(v)) => v.is_finite(),
             _ => false,
         }
     }
 
     /// This kind as [`PagePlanError::ResumeValueTypeMismatch`] names it, in
-    /// the same spelling as [`ResumeValue::variant_label`].
+    /// the same spelling as [`ResumeValue::variant_label`], except
+    /// `FiniteFloat`, which only a finite `Float` matches.
     fn label(self) -> String {
         match self {
             ResumeKind::Int => "Int".to_string(),
@@ -788,6 +794,7 @@ impl ResumeKind {
             ResumeKind::TimestampNanos => "TimestampNanos".to_string(),
             ResumeKind::Binary => "Binary".to_string(),
             ResumeKind::FixedSizeBinary(width) => format!("FixedSizeBinary({width})"),
+            ResumeKind::FiniteFloat => "FiniteFloat".to_string(),
         }
     }
 }
@@ -1824,6 +1831,10 @@ mod unproven {
          partitions finish, so two runs over the same segments can differ in the last bits";
     pub(super) const AGGREGATE_SUM_ARGUMENT_TYPE: &str =
         "the aggregate's argument is not an integer or float column";
+    pub(super) const AGGREGATE_AVG_FLOAT: &str = "an avg over a float column merges partial sums in the order the engine's \
+         partitions finish, so two runs over the same segments can differ in the last bits";
+    pub(super) const AGGREGATE_AVG_UINT64: &str = "an avg over a UInt64 column is a Float64 fold, not an exact integer sum, so \
+         two runs over the same segments can differ in the last bits";
 }
 
 /// Whether the `GROUP BY` can emit a row where a grouping column is NULL even
@@ -2130,10 +2141,12 @@ enum ProvenAggregate {
     Extreme,
     /// `sum`.
     Sum,
+    /// `avg`.
+    Avg,
 }
 
-/// The call and which aggregate it is, when `expr` is a call of `min`, `max`
-/// or `sum` under a one-part name in any case. Parentheses and other
+/// The call and which aggregate it is, when `expr` is a call of `min`, `max`,
+/// `sum` or `avg` under a one-part name in any case. Parentheses and other
 /// wrappers are not looked through.
 fn proven_aggregate_call(expr: &SqlExpr) -> Option<(ProvenAggregate, &Function)> {
     let SqlExpr::Function(function) = expr else {
@@ -2148,12 +2161,14 @@ fn proven_aggregate_call(expr: &SqlExpr) -> Option<(ProvenAggregate, &Function)>
         Some((ProvenAggregate::Extreme, function))
     } else if name.eq_ignore_ascii_case("sum") {
         Some((ProvenAggregate::Sum, function))
+    } else if name.eq_ignore_ascii_case("avg") {
+        Some((ProvenAggregate::Avg, function))
     } else {
         None
     }
 }
 
-/// The resume kind of a `min`, `max` or `sum` order term, when the text
+/// The resume kind of a `min`, `max`, `sum` or `avg` order term, when the text
 /// proves it NON NULL and of a type a resume value carries exactly, or the
 /// reason it is not proven.
 ///
@@ -2177,6 +2192,18 @@ fn proven_aggregate_call(expr: &SqlExpr) -> Option<(ProvenAggregate, &Function)>
 /// and an unsigned one [`ResumeKind::UInt`]. Over a float column the engine
 /// merges partial sums in the order its partitions finish, so the value is
 /// not a fixed position, and the term is refused.
+///
+/// An `avg` passes the same NON NULL proof too. Over `Int8` to `Int64` and
+/// `UInt8` to `UInt32` the session's `avg` (`crate::avg`) adds the group's
+/// values exactly in `i128`, counts them, and divides once, converting the sum
+/// to `f64` and dividing it by the count: the value depends only on the
+/// group's values, so it is the same at any partition count. It is finite (the
+/// count is at least one and the sum is an integer), and never `-0.0`: a zero
+/// sum converts to `+0.0`, and a sum of magnitude at least 1 over a count of
+/// at most `i64::MAX` is nowhere near the subnormal range. It plans with
+/// [`ResumeKind::FiniteFloat`]. Over `UInt64` and over a float column the
+/// session's `avg` is a sequential `f64` fold whose partial sums merge in the
+/// order the engine's partitions finish, so the term is refused.
 fn aggregate_proof(
     aggregate: ProvenAggregate,
     function: &Function,
@@ -2204,6 +2231,20 @@ fn aggregate_proof(
             }
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                 Err(unproven::AGGREGATE_SUM_FLOAT)
+            }
+            _ => Err(unproven::AGGREGATE_SUM_ARGUMENT_TYPE),
+        },
+        ProvenAggregate::Avg => match field.data_type() {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32 => Ok(ResumeKind::FiniteFloat),
+            DataType::UInt64 => Err(unproven::AGGREGATE_AVG_UINT64),
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                Err(unproven::AGGREGATE_AVG_FLOAT)
             }
             _ => Err(unproven::AGGREGATE_SUM_ARGUMENT_TYPE),
         },
