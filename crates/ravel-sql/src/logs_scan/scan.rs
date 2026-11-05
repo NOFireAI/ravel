@@ -672,8 +672,13 @@ pub(super) enum ColumnarStep {
 /// Everything one columnar block's decode and build read besides the scan,
 /// owned so the two can run together as one read-gate job.
 struct ColumnarBlockJob {
+    /// The build schema and projection ([`LogsScanExec::build_schema`]).
     schema: SchemaRef,
     projection: Arc<Vec<usize>>,
+    /// The scan's row filter, run on each built batch inside the job, and
+    /// [`BlockMetrics::rows_dropped_by_row_filter`], which it adds to.
+    row_filters: Option<Arc<BoundRowFilters>>,
+    rows_dropped_by_row_filter: Count,
     declared: Arc<Vec<DeclaredColumn>>,
     attr_keys: Arc<Vec<String>>,
     full_len: usize,
@@ -738,7 +743,13 @@ impl ColumnarBlockJob {
                         &self.str_cells_validated,
                     )
                 });
-                match built {
+                let filtered = built.and_then(|batches| match &self.row_filters {
+                    Some(filters) => {
+                        filter_batches(filters, batches, &self.rows_dropped_by_row_filter)
+                    }
+                    None => Ok(batches),
+                });
+                match filtered {
                     Ok(batches) => ColumnarStep::Held { batches },
                     Err(e) => ColumnarStep::Failed(e),
                 }
@@ -1214,7 +1225,11 @@ impl LogScanStream {
     /// Emit the next row-path batch out of `pending`, moving the reservation
     /// with it: the previous batch's charge is released (it is downstream's
     /// now), the new batch's charge is taken before it is handed over.
-    fn emit_next_row_batch(&mut self) -> DFResult<RecordBatch> {
+    ///
+    /// With a row filter, each chunk is filtered as soon as it is built, and a
+    /// chunk the filter empties is skipped; `None` means the block's remaining
+    /// rows all failed the filter and nothing was charged.
+    fn emit_next_row_batch(&mut self) -> DFResult<Option<RecordBatch>> {
         self.reservation.shrink(std::mem::take(&mut self.emitted));
         let pending_range = self.pending_range;
         let Pending::Rows { records, pos } = &mut self.pending else {
@@ -1222,25 +1237,37 @@ impl LogScanStream {
                 "emit_next_row_batch called without a row block held".into(),
             ));
         };
-        let end = (*pos + BATCH_ROWS).min(records.len());
-        let batch = build_batch(
-            &records[*pos..end],
-            Arc::clone(&self.schema),
-            &self.projection,
-            &self.declared,
-            &self.attr_keys,
-            self.full_len,
-            pending_range.map(|r| RowRefRange {
-                first_row: r.first_row + *pos,
-                ..r
-            }),
-        )?;
-        *pos = end;
+        let batch = loop {
+            if *pos >= records.len() {
+                return Ok(None);
+            }
+            let end = (*pos + BATCH_ROWS).min(records.len());
+            let built = build_batch(
+                &records[*pos..end],
+                Arc::clone(&self.build_schema),
+                &self.build_projection,
+                &self.declared,
+                &self.attr_keys,
+                self.full_len,
+                pending_range.map(|r| RowRefRange {
+                    first_row: r.first_row + *pos,
+                    ..r
+                }),
+            )?;
+            *pos = end;
+            let Some(filters) = &self.row_filters else {
+                break built;
+            };
+            let batch = filters.apply(built, &self.blocks.rows_dropped_by_row_filter)?;
+            if batch.num_rows() > 0 {
+                break batch;
+            }
+        };
         let bytes = batch.get_array_memory_size();
         self.reservation.try_grow(bytes)?;
         self.emitted = bytes;
         self.blocks.rowpath_batches.add(1);
-        Ok(batch)
+        Ok(Some(batch))
     }
 
     /// Emit the next columnar-path batch: pop the front pre-built batch, relabel
@@ -1523,12 +1550,14 @@ impl LogScanStream {
                 let emit_started = Instant::now();
                 let emitted = match &this.pending {
                     Pending::Rows { .. } => this.emit_next_row_batch(),
-                    Pending::Batches(_) => this.emit_next_columnar_batch(),
+                    Pending::Batches(_) => this.emit_next_columnar_batch().map(Some),
                     Pending::None => unreachable!("has_pending() ruled this out"),
                 };
                 this.blocks.emit_elapsed.add_elapsed(emit_started);
                 return match emitted {
-                    Ok(batch) => {
+                    // The row filter dropped the rest of the block.
+                    Ok(None) => continue,
+                    Ok(Some(batch)) => {
                         // DataFusion drops the limit above a scan that
                         // accepted `with_fetch`, so the cap is exact here.
                         let batch = match this.fetch {
@@ -1895,8 +1924,13 @@ impl LogScanStream {
                                 None => Ok(None),
                             };
                             let job = ColumnarBlockJob {
-                                schema: Arc::clone(&this.schema),
-                                projection: Arc::clone(&this.projection),
+                                schema: Arc::clone(&this.build_schema),
+                                projection: Arc::clone(&this.build_projection),
+                                row_filters: this.row_filters.clone(),
+                                rows_dropped_by_row_filter: this
+                                    .blocks
+                                    .rows_dropped_by_row_filter
+                                    .clone(),
                                 declared: Arc::clone(&this.declared),
                                 attr_keys: Arc::clone(&this.attr_keys),
                                 full_len: this.full_len,

@@ -123,7 +123,10 @@
 //!   [`Predicate::NumNotEq`], prune-only like `NumRange`: a block whose stat
 //!   has `min == max == value` holds no row the comparison keeps (ADR-0095,
 //!   prune-only not-equal amendment). The filter stays `Inexact`.
-//! - Anything else -- `!=` on a non-`I64` column, `NOT`, a negated `BETWEEN`, `IS [NOT] NULL`, a
+//! - `Str` + `<>` (either operand order), against a non-NULL `Utf8`,
+//!   `Utf8View` or `Dictionary(Int32, Utf8)` literal -> the expression itself,
+//!   in [`LogsPushdown::row_filters`]; see the next section.
+//! - Anything else -- `!=` on a `Bool` or `Bytes` column, `NOT`, a negated `BETWEEN`, `IS [NOT] NULL`, a
 //!   general `OR` (anything but the same-column I64 equality union above), a
 //!   range operator on a `Str`/`Bytes` column, or a literal whose type does not
 //!   match the declared type (including a `Cast`-wrapped operand DataFusion's own
@@ -139,6 +142,21 @@
 //! ADR-0095's single-version RLOG regime every stat is merged-view-correct, and
 //! an absent stat is "no information", never "no match" (ADR-0013), so an object
 //! predating the column's declaration falls through and is scanned, not pruned.
+//!
+//! # A declared `Str` column's `<>` (ADR-0093, exact not-equal amendment)
+//!
+//! `c <> v`, with `c` a bare declared `Str` column and `v` a non-NULL string
+//! literal, goes to [`LogsPushdown::row_filters`] unchanged. No prune arm and
+//! no key comes from it. The scan builds DataFusion's own physical expression
+//! for it and applies it to each batch after the column build, so it sees the
+//! value SQL sees, resource or scope fallback included
+//! (`crate::logs_scan::row_filter`). The filter stays `Inexact`
+//! ([`filter_is_exact`] does not recognize the shape), so the residual
+//! `FilterExec` above the scan still evaluates every row the scan emits.
+//! `str_not_equal_goes_to_row_filters_only` pins what is accepted and what is
+//! not; `answers_match_the_residual_on_every_value_shape`
+//! (`tests/logs_str_not_equal_row_filter.rs`) pins that the scan drops exactly
+//! the rows the `FilterExec` would drop.
 //!
 //! # Exact-key equalities (tier-1 KEY_IDX probe, ADR-2707 decision 5)
 //!
@@ -176,6 +194,7 @@
 //! applies this arm's bounds. The I64/Bool code here honors none of this,
 //! because neither case is reachable for an integer or boolean literal.
 
+use datafusion::arrow::datatypes::DataType;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
@@ -216,6 +235,12 @@ pub struct LogsPushdown {
     /// its type, and `trace_id` `=` a 16-byte literal. Like `prune`, they only
     /// narrow which blocks are read; see the module doc.
     pub key_equals: Vec<KeyEquals>,
+    /// Top-level conjuncts `c <> v` (either operand order) with `c` a bare
+    /// declared `Str` column and `v` a non-NULL string literal, kept as the
+    /// logical expression DataFusion handed the provider. The scan evaluates
+    /// them on each batch it builds, after the column build (ADR-0093, exact
+    /// not-equal amendment); the reader never sees them. See the module doc.
+    pub row_filters: Vec<Expr>,
 }
 
 impl LogsPushdown {
@@ -431,6 +456,12 @@ fn handle_binary(be: &BinaryExpr, out: &mut LogsPushdown, declared: &[DeclaredCo
     // and drop resource/scope-only matches (see the module doc).
     if let Some(p) = attr_equality_predicate(be) {
         out.prune.push(p);
+        return;
+    }
+    // A declared Str column's `<>` against a string literal goes to the
+    // scan's own row filter channel, not to the reader.
+    if is_str_not_equal(be, declared) {
+        out.row_filters.push(Expr::BinaryExpr(be.clone()));
         return;
     }
     // A comparison against a declared typed column (ADR-0093). Resolved only for
@@ -740,6 +771,38 @@ fn str_eq_value(op: Operator, lit: &Expr) -> Option<AttrValue> {
         return None;
     };
     Some(AttrValue::Str(scalar_utf8(sv)?))
+}
+
+/// Whether `be` is `c <> v` or `v <> c` with `c` a bare column resolving to a
+/// declared `Str` column (fixed names excluded, [`resolve_declared`]) and `v` a
+/// non-NULL `Utf8`, `Utf8View` or `Dictionary(Int32, Utf8)` literal, the shape
+/// [`LogsPushdown::row_filters`] carries (ADR-0093, exact not-equal
+/// amendment).
+fn is_str_not_equal(be: &BinaryExpr, declared: &[DeclaredColumn]) -> bool {
+    if be.op != Operator::NotEq {
+        return false;
+    }
+    let (column, value) = match resolve_declared(&be.left, declared) {
+        Some(dc) => (dc, be.right.as_ref()),
+        None => match resolve_declared(&be.right, declared) {
+            Some(dc) => (dc, be.left.as_ref()),
+            None => return false,
+        },
+    };
+    column.ty == DeclaredType::Str && matches!(value, Expr::Literal(sv, _) if is_str_literal(sv))
+}
+
+/// A non-NULL `Utf8` or `Utf8View` scalar, bare or inside the
+/// `Dictionary(Int32, Utf8)` scalar a declared `Str` column's coercion wraps a
+/// literal in.
+fn is_str_literal(sv: &ScalarValue) -> bool {
+    match sv {
+        ScalarValue::Utf8(Some(_)) | ScalarValue::Utf8View(Some(_)) => true,
+        ScalarValue::Dictionary(key, inner) => {
+            **key == DataType::Int32 && matches!(**inner, ScalarValue::Utf8(Some(_)))
+        }
+        _ => false,
+    }
 }
 
 /// The UTF-8 string a scalar carries, unwrapping a `Dictionary` scalar to its
@@ -1445,6 +1508,77 @@ mod tests {
         let bd = vec![DeclaredColumn::new("is_active", DeclaredType::Bool)];
         let bne = extract_logs(&[col("is_active").not_eq(lit(true))], &bd);
         assert!(bne.prune.is_empty(), "bool != must produce no prune arm");
+    }
+
+    /// A declared `Str` column's `<>` against a non-NULL string literal, in
+    /// either operand order and with the literal as `Utf8`, `Utf8View` or the
+    /// `Dictionary(Int32, Utf8)` scalar, lands in `row_filters` as the
+    /// expression itself and nowhere else, and stays `Inexact`. Every other
+    /// shape leaves `row_filters` empty.
+    #[test]
+    fn str_not_equal_goes_to_row_filters_only() {
+        let d = vec![
+            DeclaredColumn::new("s", DeclaredType::Str),
+            DeclaredColumn::new("t", DeclaredType::Str),
+            DeclaredColumn::new("body", DeclaredType::Str),
+            DeclaredColumn::new("blob", DeclaredType::Bytes),
+            DeclaredColumn::new("n", DeclaredType::I64),
+        ];
+        let dict = |v: &str| {
+            lit(ScalarValue::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(ScalarValue::Utf8(Some(v.to_string()))),
+            ))
+        };
+        let accepted = [
+            col("s").not_eq(lit("x")),
+            lit("x").not_eq(col("s")),
+            col("s").not_eq(lit(ScalarValue::Utf8View(Some("x".into())))),
+            col("s").not_eq(dict("")),
+            dict("x").not_eq(col("s")),
+        ];
+        for e in accepted {
+            let p = extract_logs(std::slice::from_ref(&e), &d);
+            assert_eq!(p.row_filters, vec![e.clone()], "{e} is a row filter");
+            assert!(p.prune.is_empty() && p.content.is_empty(), "{e}");
+            assert!(p.key_equals.is_empty() && p.ts_lo.is_none(), "{e}");
+            assert!(!filter_is_exact(&e, &d), "{e} stays Inexact in this step");
+        }
+
+        let bounded = extract_logs(
+            &[col("s").not_eq(lit("")).and(col("ts").gt_eq(ts_lit(5)))],
+            &d,
+        );
+        assert_eq!(bounded.row_filters, vec![col("s").not_eq(lit(""))]);
+        assert_eq!(bounded.ts_lo, Some(5));
+
+        let rejected = [
+            col("body").not_eq(lit("x")),
+            get_field(col("attrs"), "k").not_eq(lit("v")),
+            col("other").not_eq(lit("x")),
+            col("blob").not_eq(lit(vec![1u8])),
+            col("n").not_eq(lit(5i64)),
+            Expr::Not(Box::new(col("s").eq(lit("x")))),
+            col("s").not_eq(lit(ScalarValue::Utf8(None))),
+            col("s").not_eq(lit(ScalarValue::LargeUtf8(Some("x".into())))),
+            col("s").not_eq(lit(ScalarValue::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(ScalarValue::Utf8(Some("x".into()))),
+            ))),
+            Expr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(col("s")),
+                DataType::Utf8,
+            ))
+            .not_eq(lit("x")),
+            datafusion::functions::string::expr_fn::lower(col("s")).not_eq(lit("x")),
+            col("s").not_eq(col("t")),
+            or(col("s").not_eq(lit("x")), col("t").not_eq(lit("y"))),
+            col("s").eq(lit("x")),
+        ];
+        for e in rejected {
+            let p = extract_logs(std::slice::from_ref(&e), &d);
+            assert!(p.row_filters.is_empty(), "{e} is not a row filter");
+        }
     }
 
     /// TEST 7: a comparison against a type-mismatched literal (a float against a
