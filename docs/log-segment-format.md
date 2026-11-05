@@ -1726,8 +1726,8 @@ merge is resident. The mode changes only how bytes are read: every mode
 emits the same record sequence, so an output segment's bytes and key do not
 depend on it. The one term that scales with the data is the in-progress
 output segment's own buffer, bounded by the segment size cap, because a
-segment's content-addressed key does not exist until the whole output
-segment is encoded.
+segment's content-addressed key is known only once the whole output segment
+is encoded.
 
 ## Tokenizer
 
