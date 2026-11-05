@@ -382,6 +382,11 @@ path = "src/bin/logbody_report.rs"
 bench = false
 
 [[bin]]
+name = "string_fingerprint_report"
+path = "src/bin/string_fingerprint_report.rs"
+bench = false
+
+[[bin]]
 name = "codec_bakeoff"
 path = "src/bin/codec_bakeoff.rs"
 bench = false

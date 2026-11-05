@@ -69,4 +69,5 @@ pub mod spans_scan;
 pub mod sql_corpus;
 #[cfg(feature = "sql-latency")]
 pub mod sql_latency;
+pub mod string_fingerprint;
 pub mod value_shapes;
