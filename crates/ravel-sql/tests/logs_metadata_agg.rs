@@ -2183,3 +2183,58 @@ async fn sum_and_avg_over_all_null_is_null_byte_identical() {
         }
     }
 }
+
+/// One statement over one object, two answers. `SUM(status + 1)` over
+/// `i64::MAX` and `-i64::MAX` answers 2 from statistics, the exact total
+/// `0 + 1 x 2`, while the scan adds 1 per row with DataFusion's wrapping `+`:
+/// `i64::MAX + 1` reads `i64::MIN`, the checked sum of the two wrapped rows
+/// is `-2^64 + 2`, and the query fails with the integer sum overflow. Which
+/// one a caller gets depends only on whether statistics loaded.
+#[tokio::test]
+async fn sum_plus_literal_answers_from_stats_where_the_scan_overflows() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let rows = [(100, Some(i64::MAX)), (200, Some(-i64::MAX))];
+    let seg = write_real_segment(&store, "logs/wrap.rlog", 1, &rows).await;
+    let stats = loaded_stats(vec![(
+        &seg,
+        stats_segment(&seg, vec![stat_from_rows(&rows)]),
+    )]);
+    let sql = "SELECT SUM(status + 1) FROM logs";
+
+    let mut answers = Vec::new();
+    for stats in [Some(stats), None] {
+        let snapshot = snapshot_of(vec![seg.clone()], Vec::new());
+        let ctx = logs_session(provider(&store, snapshot, status_col(), stats)).expect("session");
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let shown = plan_str(&plan);
+        answers.push((shown, collect(plan, ctx.task_ctx()).await));
+    }
+
+    let (stats_plan, stats_answer) = &answers[0];
+    assert!(
+        stats_plan.contains("MetadataOnlyExec") && !stats_plan.contains("LogsScanExec"),
+        "with statistics the sum must be answered from them; plan was:\n{stats_plan}"
+    );
+    let stats_answer = stats_answer.as_ref().expect("the statistics answer");
+    assert_eq!(single_i64(stats_answer), Some(2));
+
+    let (scan_plan, scan_answer) = &answers[1];
+    assert!(
+        scan_plan.contains("LogsScanExec"),
+        "without statistics the statement must scan; plan was:\n{scan_plan}"
+    );
+    let err = scan_answer
+        .as_ref()
+        .expect_err("the scan's wrapped rows must overflow the checked sum");
+    assert!(
+        err.to_string()
+            .contains("aggregate sum overflowed its Int64 result type"),
+        "{err}"
+    );
+}

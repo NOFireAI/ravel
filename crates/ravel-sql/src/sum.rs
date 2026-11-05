@@ -112,22 +112,23 @@ impl std::hash::Hash for CheckedSum {
     fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {}
 }
 
-/// Which accumulator a call gets, from its resolved result type.
+/// Which checked accumulator an integer call gets, from its resolved result
+/// type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SumKind {
     /// Signed integer input, coerced to `Int64`; returns `Int64`.
     Signed,
     /// Unsigned integer input, coerced to `UInt64`; returns `UInt64`.
     Unsigned,
-    /// Anything else: the built-in, unchanged.
-    Delegate,
 }
 
-fn sum_kind(return_type: &DataType) -> SumKind {
+/// The checked kind of a call returning `return_type`; `None` for every other
+/// result type, which the built-in runs unchanged.
+fn sum_kind(return_type: &DataType) -> Option<SumKind> {
     match return_type {
-        DataType::Int64 => SumKind::Signed,
-        DataType::UInt64 => SumKind::Unsigned,
-        _ => SumKind::Delegate,
+        DataType::Int64 => Some(SumKind::Signed),
+        DataType::UInt64 => Some(SumKind::Unsigned),
+        _ => None,
     }
 }
 
@@ -135,14 +136,14 @@ impl SumKind {
     fn result_type(self) -> DataType {
         match self {
             SumKind::Unsigned => DataType::UInt64,
-            SumKind::Signed | SumKind::Delegate => DataType::Int64,
+            SumKind::Signed => DataType::Int64,
         }
     }
 
     fn result_type_name(self) -> &'static str {
         match self {
             SumKind::Unsigned => "UInt64",
-            SumKind::Signed | SumKind::Delegate => "Int64",
+            SumKind::Signed => "Int64",
         }
     }
 
@@ -163,7 +164,7 @@ impl SumKind {
                     .map(|total| u64::try_from(total).map_err(|_| self.overflow()))
                     .transpose()?,
             ),
-            SumKind::Signed | SumKind::Delegate => ScalarValue::Int64(
+            SumKind::Signed => ScalarValue::Int64(
                 total
                     .map(|total| i64::try_from(total).map_err(|_| self.overflow()))
                     .transpose()?,
@@ -201,7 +202,7 @@ impl SumKind {
                     }
                 }
             }
-            SumKind::Signed | SumKind::Delegate => {
+            SumKind::Signed => {
                 let values = as_primitive::<Int64Type>(array)?;
                 for (row, value) in values.iter().enumerate() {
                     if let Some(value) = value {
@@ -219,7 +220,7 @@ impl SumKind {
             // conversions cannot fail; a failure would be a typed NULL, not a
             // wrapped value.
             SumKind::Unsigned => ScalarValue::UInt64(u64::try_from(value).ok()),
-            SumKind::Signed | SumKind::Delegate => ScalarValue::Int64(i64::try_from(value).ok()),
+            SumKind::Signed => ScalarValue::Int64(i64::try_from(value).ok()),
         }
     }
 }
@@ -288,40 +289,44 @@ impl AggregateUDFImpl for CheckedSum {
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> DFResult<Vec<FieldRef>> {
-        let kind = sum_kind(args.return_type());
-        match kind {
-            SumKind::Delegate => self.inner.state_fields(args),
+        let Some(kind) = sum_kind(args.return_type()) else {
+            return self.inner.state_fields(args);
+        };
+        if args.is_distinct {
             // Matches [`DistinctSumAccumulator`]'s `state`/`merge_batch`.
-            _ if args.is_distinct => Ok(vec![Arc::new(Field::new_list(
+            Ok(vec![Arc::new(Field::new_list(
                 format!("{}[sum_distinct]", args.name),
                 Field::new_list_field(kind.result_type(), true),
                 false,
-            ))]),
+            ))])
+        } else {
             // Matches [`CheckedSumAccumulator`]/[`CheckedSumGroupsAccumulator`]'s
             // `state`/`merge_batch`.
-            _ => Ok(vec![Arc::new(Field::new(
+            Ok(vec![Arc::new(Field::new(
                 format!("{}{EXACT_SUM_STATE_SUFFIX}", args.name),
                 DataType::Decimal128(38, 0),
                 true,
-            ))]),
+            ))])
         }
     }
 
     fn accumulator(&self, acc_args: AccumulatorArgs) -> DFResult<Box<dyn Accumulator>> {
-        let kind = sum_kind(acc_args.return_field.data_type());
-        match kind {
-            SumKind::Delegate => self.inner.accumulator(acc_args),
-            _ if acc_args.is_distinct => Ok(Box::new(DistinctSumAccumulator::new(kind))),
-            _ => Ok(Box::new(CheckedSumAccumulator::new(kind))),
+        let Some(kind) = sum_kind(acc_args.return_field.data_type()) else {
+            return self.inner.accumulator(acc_args);
+        };
+        if acc_args.is_distinct {
+            Ok(Box::new(DistinctSumAccumulator::new(kind)))
+        } else {
+            Ok(Box::new(CheckedSumAccumulator::new(kind)))
         }
     }
 
     fn groups_accumulator_supported(&self, args: AccumulatorArgs) -> bool {
         match sum_kind(args.return_field.data_type()) {
-            SumKind::Delegate => self.inner.groups_accumulator_supported(args),
+            None => self.inner.groups_accumulator_supported(args),
             // DataFusion runs one `DistinctSumAccumulator` per group behind
             // its adapter, as it does for the built-in's distinct call.
-            _ => !args.is_distinct,
+            Some(_) => !args.is_distinct,
         }
     }
 
@@ -329,24 +334,28 @@ impl AggregateUDFImpl for CheckedSum {
         &self,
         args: AccumulatorArgs,
     ) -> DFResult<Box<dyn GroupsAccumulator>> {
-        let kind = sum_kind(args.return_field.data_type());
-        match kind {
-            SumKind::Delegate => self.inner.create_groups_accumulator(args),
-            _ if args.is_distinct => Err(DataFusionError::Internal(
+        let Some(kind) = sum_kind(args.return_field.data_type()) else {
+            return self.inner.create_groups_accumulator(args);
+        };
+        if args.is_distinct {
+            Err(DataFusionError::Internal(
                 "checked sum: no GroupsAccumulator exists for a DISTINCT integer call; \
                  groups_accumulator_supported returns false for it"
                     .to_string(),
-            )),
-            _ => Ok(Box::new(CheckedSumGroupsAccumulator::new(kind))),
+            ))
+        } else {
+            Ok(Box::new(CheckedSumGroupsAccumulator::new(kind)))
         }
     }
 
     fn create_sliding_accumulator(&self, args: AccumulatorArgs) -> DFResult<Box<dyn Accumulator>> {
-        let kind = sum_kind(args.return_field.data_type());
-        match kind {
-            SumKind::Delegate => self.inner.create_sliding_accumulator(args),
-            _ if args.is_distinct => Ok(Box::new(DistinctSumAccumulator::new(kind))),
-            _ => Ok(Box::new(CheckedSumAccumulator::new(kind))),
+        let Some(kind) = sum_kind(args.return_field.data_type()) else {
+            return self.inner.create_sliding_accumulator(args);
+        };
+        if args.is_distinct {
+            Ok(Box::new(DistinctSumAccumulator::new(kind)))
+        } else {
+            Ok(Box::new(CheckedSumAccumulator::new(kind)))
         }
     }
 
@@ -379,8 +388,8 @@ impl AggregateUDFImpl for CheckedSum {
         // A statistics sum was not computed by this accumulator and carries
         // no overflow check, so an integer call always reads its rows.
         match sum_kind(statistics_args.return_type) {
-            SumKind::Delegate => self.inner.value_from_stats(statistics_args),
-            _ => None,
+            None => self.inner.value_from_stats(statistics_args),
+            Some(_) => None,
         }
     }
 
@@ -549,7 +558,7 @@ impl GroupsAccumulator for CheckedSumGroupsAccumulator {
                 let values = as_primitive::<UInt64Type>(&values[0])?;
                 self.update_primitive(&values, group_indices, opt_filter)
             }
-            SumKind::Signed | SumKind::Delegate => {
+            SumKind::Signed => {
                 let values = as_primitive::<Int64Type>(&values[0])?;
                 self.update_primitive(&values, group_indices, opt_filter)
             }
@@ -588,7 +597,7 @@ impl GroupsAccumulator for CheckedSumGroupsAccumulator {
                     .collect::<DFResult<Vec<u64>>>()?;
                 Arc::new(UInt64Array::new(ScalarBuffer::from(values), Some(nulls)))
             }
-            SumKind::Signed | SumKind::Delegate => {
+            SumKind::Signed => {
                 let values = sums
                     .into_iter()
                     .map(|sum| i64::try_from(sum).map_err(|_| kind.overflow()))
@@ -633,6 +642,8 @@ impl GroupsAccumulator for CheckedSumGroupsAccumulator {
     }
 
     fn size(&self) -> usize {
+        // The `EXACT_SUM_GROUP_WIDTHS` bytes per group the memory layout reads, by
+        // capacity; like the built-in's, the fixed struct is not counted anywhere.
         self.sums.capacity() * std::mem::size_of::<i128>()
             + self.seen.capacity() * std::mem::size_of::<bool>()
     }
