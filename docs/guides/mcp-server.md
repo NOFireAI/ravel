@@ -202,9 +202,10 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   in that window, in a separate `logs` block ordered by timestamp. That
   pass is an unindexed scan of the window's logs, and the call warns so:
   keep the window tight. Its cost is reported apart from the span lookup's,
-  and a call with it claims no upper-bound estimate. If the pass runs out
-  of time or budget, or fails, you still get the spans, with the pass
-  marked `skipped` or `failed`. It has no cursor: when the records were
+  and a call with it claims no upper-bound estimate. The call's time and
+  scan budgets are shared: the pass gets only what the span lookup left of
+  them. If the pass runs out of time or budget, or fails, you still get
+  the spans, with the pass marked `skipped` or `failed`. It has no cursor: when the records were
   capped, the next step points at `ravel_search_logs` with the same trace
   id and window. The [reference](../reference/mcp.md#logs-leg) gives the
   exact rules.

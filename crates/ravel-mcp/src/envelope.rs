@@ -1008,7 +1008,7 @@ fn bound_evidence(entries: &mut [EvidenceEntry]) -> u64 {
 }
 
 /// Cuts one scalar to its own sub-bound, and reports whether it was cut.
-fn bound_scalar(field: &mut String, bound: usize) -> bool {
+pub(crate) fn bound_scalar(field: &mut String, bound: usize) -> bool {
     if serialized_str_len(field) <= bound {
         return false;
     }
@@ -1736,7 +1736,7 @@ impl Envelope {
     /// `finish` reports `error` for any envelope carrying a failure, and
     /// otherwise `ok_page` or `ok_bounded` once a cap took something;
     /// `ok_bounded` is the wider of those two.
-    fn finished_status_bound(&self, bytes_cap_took_something: bool) -> Status {
+    pub(crate) fn finished_status_bound(&self, bytes_cap_took_something: bool) -> Status {
         if self.status == Status::Error || self.failure.is_some() {
             Status::Error
         } else if self.presentation.row_cap_hit || bytes_cap_took_something {

@@ -41,7 +41,10 @@
 //! absent that block is not serialized at all.
 //!
 //! - It runs after the span lookup under what is left of the call's one
-//!   deadline, and is skipped with a stated reason when nothing is left.
+//!   deadline and of each of its scan budgets (`max_bytes_scanned`,
+//!   `max_store_requests`, `max_segments`, less the span lookup's
+//!   `budget.actual` figure for each), and is skipped with a stated reason
+//!   when nothing is left of any of them.
 //! - Its records have their own `max_rows` and share `max_response_bytes`
 //!   with the spans, spans first: the leg's columns are in the envelope the
 //!   span fit measures, and its records are then added as a prefix while the
@@ -56,13 +59,14 @@
 
 use std::collections::HashMap;
 
+use ravel_query::{ByteLimit, EffectiveBudgets, RequestLimit};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::catalog::GetTraceInput;
 use crate::envelope::{
     AnyJson, Budget, CapAdvice, CapCut, Cell, Column, Envelope, Failure, FailureClass, LegSpend,
-    LegStatus, LogsLeg, NextStep, Row, Status, fit_cap, serialized_len,
+    LegStatus, LogsLeg, NextStep, Row, Status, bound_scalar, fit_cap, serialized_len,
 };
 use crate::service::{QueryBackend, TraceLookupRequest};
 
@@ -84,8 +88,20 @@ pub const LOGS_SCAN_WARNING: &str = "include_logs ran an unindexed scan: no trac
 pub const LOGS_SKIPPED_NO_TIME: &str =
     "no time was left of the call's deadline after the span lookup";
 
-/// A leg failure's message is cut to this many bytes, on a character
-/// boundary.
+/// Why a leg did not start: the span lookup spent all of `max_bytes_scanned`.
+pub const LOGS_SKIPPED_NO_BYTES: &str =
+    "nothing was left of the call's max_bytes_scanned after the span lookup";
+
+/// Why a leg did not start: the span lookup spent all of `max_store_requests`.
+pub const LOGS_SKIPPED_NO_REQUESTS: &str =
+    "nothing was left of the call's max_store_requests after the span lookup";
+
+/// Why a leg did not start: the span lookup spent all of `max_segments`.
+pub const LOGS_SKIPPED_NO_SEGMENTS: &str =
+    "nothing was left of the call's max_segments after the span lookup";
+
+/// A leg failure's message is cut to this many serialized bytes, the
+/// truncation marker included.
 const LEG_FAILURE_MESSAGE_BOUND: usize = 512;
 
 /// The lead of the cap step a trace with a `not_returned` parent carries.
@@ -112,7 +128,7 @@ pub async fn run<B: QueryBackend>(args: Value, ctx: &ToolContext<'_>, backend: &
         Err(failure) => return refused(failure, ctx),
     };
     let leg = match &call.logs {
-        Some(logs) => Some(logs_leg(logs, ctx, backend).await),
+        Some(logs) => Some(logs_leg(logs, &spans.budget.actual.0, ctx, backend).await),
         None => None,
     };
     match finish(spans, &call, leg, ctx) {
@@ -144,18 +160,67 @@ enum Leg {
     Ran(Box<Envelope>),
 }
 
-async fn logs_leg<B: QueryBackend>(logs: &LogsCall, ctx: &ToolContext<'_>, backend: &B) -> Leg {
+/// Run the leg under what is left of the call's deadline and scan budgets
+/// once the span lookup spent `span_spend` (its `budget.actual`).
+async fn logs_leg<B: QueryBackend>(
+    logs: &LogsCall,
+    span_spend: &Value,
+    ctx: &ToolContext<'_>,
+    backend: &B,
+) -> Leg {
     if backend.time_left().is_some_and(|left| left.is_zero()) {
         return Leg::Skipped(LOGS_SKIPPED_NO_TIME);
     }
+    let query = match leg_budgets(&ctx.budgets.query, span_spend) {
+        Ok(query) => query,
+        Err(reason) => return Leg::Skipped(reason),
+    };
+    let mut leg_ctx = *ctx;
+    leg_ctx.budgets.query = query;
     Leg::Ran(Box::new(
-        super::search_logs::run(logs.args.clone(), ctx, backend).await,
+        super::search_logs::run(logs.args.clone(), &leg_ctx, backend).await,
     ))
 }
 
-/// The `logs` block for `leg`, and the records it read, held out of the
-/// block until the spans are fitted.
-fn leg_block(leg: Leg, span_lookup: &Budget) -> (LogsLeg, Vec<Row>) {
+/// Each scan budget less the span lookup's `budget.actual` figure for it:
+/// `bytes_scanned`, `store_requests` and `segments_read`. A figure the span
+/// lookup did not report as a number counts as nothing spent. An unlimited
+/// budget stays unlimited; a bounded one with nothing left is the reason
+/// the leg does not start.
+fn leg_budgets(
+    call: &EffectiveBudgets,
+    span_spend: &Value,
+) -> Result<EffectiveBudgets, &'static str> {
+    let spent = |key: &str| span_spend.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let max_bytes_scanned = match call.max_bytes_scanned {
+        ByteLimit::Bounded(max) => match max.saturating_sub(spent("bytes_scanned")) {
+            0 => return Err(LOGS_SKIPPED_NO_BYTES),
+            left => ByteLimit::Bounded(left),
+        },
+        ByteLimit::Unlimited => ByteLimit::Unlimited,
+    };
+    let max_store_requests = match call.max_store_requests {
+        RequestLimit::Bounded(max) => match max.saturating_sub(spent("store_requests")) {
+            0 => return Err(LOGS_SKIPPED_NO_REQUESTS),
+            left => RequestLimit::Bounded(left),
+        },
+        RequestLimit::Unlimited => RequestLimit::Unlimited,
+    };
+    let segments_read = usize::try_from(spent("segments_read")).unwrap_or(usize::MAX);
+    let max_segments = match call.max_segments.saturating_sub(segments_read) {
+        0 => return Err(LOGS_SKIPPED_NO_SEGMENTS),
+        left => left,
+    };
+    Ok(EffectiveBudgets {
+        max_bytes_scanned,
+        max_store_requests,
+        max_segments,
+    })
+}
+
+/// The `logs` block for `leg`, the records it read, held out of the block
+/// until the spans are fitted, and whether its failure message was cut.
+fn leg_block(leg: Leg, span_lookup: &Budget) -> (LogsLeg, Vec<Row>, bool) {
     let span_lookup_budget = LegSpend {
         actual: span_lookup.actual.clone(),
         estimate: span_lookup.estimate.clone(),
@@ -177,7 +242,7 @@ fn leg_block(leg: Leg, span_lookup: &Budget) -> (LogsLeg, Vec<Row>) {
     let envelope = match leg {
         Leg::Skipped(reason) => {
             block.skipped_reason = Some(reason.to_string());
-            return (block, Vec::new());
+            return (block, Vec::new(), false);
         }
         Leg::Ran(envelope) => *envelope,
     };
@@ -187,10 +252,10 @@ fn leg_block(leg: Leg, span_lookup: &Budget) -> (LogsLeg, Vec<Row>) {
         estimate_is_upper_envelope: false,
     };
     if let Some(mut failure) = envelope.failure {
-        failure.message = bounded(failure.message, LEG_FAILURE_MESSAGE_BOUND);
+        let cut = bound_scalar(&mut failure.message, LEG_FAILURE_MESSAGE_BOUND);
         block.status = LegStatus::Failed;
         block.failure = Some(failure);
-        return (block, Vec::new());
+        return (block, Vec::new(), cut);
     }
     let shown = &envelope.presentation;
     let capped = shown.row_cap_hit
@@ -207,19 +272,17 @@ fn leg_block(leg: Leg, span_lookup: &Budget) -> (LogsLeg, Vec<Row>) {
     block.rows_omitted = shown.rows_omitted;
     block.row_count = envelope.data.row_count;
     block.columns = envelope.data.columns;
-    (block, envelope.data.rows)
+    (block, envelope.data.rows, false)
 }
 
-/// `message` cut to at most `bound` bytes on a character boundary.
-fn bounded(mut message: String, bound: usize) -> String {
-    if message.len() > bound {
-        let mut at = bound;
-        while !message.is_char_boundary(at) {
-            at -= 1;
-        }
-        message.truncate(at);
-    }
-    message
+/// `envelope`'s serialized size under the widest status `finish` can give
+/// it, the status the span fit measured under.
+fn finished_len(envelope: &mut Envelope) -> usize {
+    let status = envelope.status;
+    envelope.status = envelope.finished_status_bound(envelope.presentation.bytes_cap_hit);
+    let len = serialized_len(envelope);
+    envelope.status = status;
+    len
 }
 
 /// The whole call's budget: the span lookup's ceilings, the two parts'
@@ -314,7 +377,7 @@ fn place_logs(
         capped: capped_before,
     } = before;
     let cap = fit_cap(max_response_bytes);
-    let mut used = serialized_len(envelope);
+    let mut used = finished_len(envelope);
     let mut kept = 0;
     for row in &rows {
         let len = serde_json::to_vec(row).map_or(usize::MAX, |bytes| bytes.len());
@@ -528,8 +591,15 @@ fn finish(
     );
     let mut log_rows = Vec::new();
     let mut before = None;
+    let mut message_cut = false;
     if let (Some(leg), Some(logs)) = (leg, &call.logs) {
-        let (mut block, rows) = leg_block(leg, &envelope.budget);
+        let (mut block, rows, cut) = leg_block(leg, &envelope.budget);
+        if cut && let Some(failure) = block.failure.as_mut() {
+            // Room for the digit `scalars_truncated` can gain when the cut is
+            // counted after the fit, which resets the count.
+            failure.message.push(' ');
+            message_cut = true;
+        }
         if block.status != LegStatus::Skipped {
             envelope.warnings.push(LOGS_SCAN_WARNING.to_string());
         }
@@ -552,7 +622,7 @@ fn finish(
 
     let cap = ctx.budgets.max_response_bytes;
     let mut fitted = envelope.clone().fit_row_capped(cap, row_cap_omitted);
-    if serialized_len(&fitted) > fit_cap(cap)
+    if finished_len(&mut fitted) > fit_cap(cap)
         && let Some(leg) = envelope.logs.as_mut()
     {
         // The leg's columns alone leave no room: none of its records can be
@@ -565,6 +635,11 @@ fn finish(
         });
         log_rows.clear();
         fitted = envelope.fit_row_capped(cap, row_cap_omitted);
+    }
+    if message_cut && let Some(failure) = fitted.logs.as_mut().and_then(|leg| leg.failure.as_mut())
+    {
+        failure.message.pop();
+        fitted.presentation.scalars_truncated += 1;
     }
     fitted.data.row_count = produced;
     let cut = CapCut::of(&fitted.presentation, fitted.data.rows.len(), &ctx.budgets);
@@ -1621,6 +1696,192 @@ mod tests {
         assert_eq!(leg.status, LegStatus::OkBounded);
         assert!(leg.bytes_cap_hit);
         assert_eq!(leg.rows_omitted, (20 - kept) as u64);
+        assert_eq!(actions(&envelope), [LOGS_STEP]);
+    }
+
+    /// Bounded scan budgets of `bytes`, `requests` and `segments`.
+    fn scan_budgets(bytes: u64, requests: u64, segments: usize) -> EffectiveBudgets {
+        EffectiveBudgets {
+            max_bytes_scanned: ByteLimit::Bounded(bytes),
+            max_store_requests: RequestLimit::Bounded(requests),
+            max_segments: segments,
+        }
+    }
+
+    /// The leg's statement runs under what the span lookup left of each scan
+    /// budget: the call's budget less the span lookup's `budget.actual`
+    /// figure for it (100 bytes, 1 request, 1 segment in [`span_spend`]).
+    ///
+    /// FLIP: handing the leg the call's full budgets sends 1,000 bytes, 10
+    /// requests and 20 segments.
+    #[test]
+    fn the_leg_runs_under_what_the_span_lookup_left() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets.query = scan_budgets(1_000, 10, 20);
+        let stub = Stub::default();
+        stub.sql.borrow_mut().push_back(records(&[("l1", 7)], 4));
+        let envelope = call_with(&stub, costed_spans(), with_logs(), &ctx);
+        assert_eq!(leg(&envelope).status, LegStatus::Ok, "{envelope:?}");
+        let executed = stub.executed.borrow();
+        assert_eq!(executed.len(), 1);
+        assert_eq!(
+            executed[0].request.budgets,
+            Some(ravel_query::RequestBudgets {
+                max_bytes_scanned: Some(ByteLimit::Bounded(900)),
+                max_store_requests: Some(RequestLimit::Bounded(9)),
+                max_segments: Some(19),
+            })
+        );
+    }
+
+    /// A scan budget the span lookup spent whole leaves the leg nothing: it
+    /// does not start, its reason names that budget, and the spans are
+    /// returned as usual.
+    #[test]
+    fn a_leg_with_a_spent_scan_budget_is_skipped() {
+        let key = key();
+        for (query, reason) in [
+            (scan_budgets(1_000, 1, 20), LOGS_SKIPPED_NO_REQUESTS),
+            (scan_budgets(100, 10, 20), LOGS_SKIPPED_NO_BYTES),
+            (scan_budgets(1_000, 10, 1), LOGS_SKIPPED_NO_SEGMENTS),
+        ] {
+            let mut ctx = test_context(&key);
+            ctx.budgets.query = query;
+            let stub = Stub::default();
+            let envelope = call_with(&stub, costed_spans(), with_logs(), &ctx);
+            assert_eq!(envelope.status, Status::Ok, "{reason}: {envelope:?}");
+            assert_eq!(tree(&envelope).len(), 3, "{reason}");
+            assert!(stub.executed.borrow().is_empty(), "{reason}");
+            let leg = leg(&envelope);
+            assert_eq!(leg.status, LegStatus::Skipped, "{reason}");
+            assert_eq!(leg.skipped_reason.as_deref(), Some(reason));
+            assert!(!envelope.warnings.contains(&LOGS_SCAN_WARNING.to_string()));
+            let (span_actual, _) = span_spend();
+            assert_eq!(envelope.budget.actual.0, span_actual, "{reason}");
+        }
+    }
+
+    /// A row-capped trace whose leg record fills the room left beside the
+    /// spans stays inside the fit cap, and so the byte cap, once `finish`
+    /// writes `ok_bounded`.
+    /// The span grows with the sweep, and the sweep is the widest span that
+    /// keeps the record, the 16 below it, and the narrowest that drops it.
+    ///
+    /// FLIP: placing the records under the status the fitted envelope
+    /// carries (`ok`) lets them take some of the 8 bytes `ok_bounded`
+    /// needs, and the first span width where they do fails.
+    #[test]
+    fn a_row_capped_trace_with_a_full_leg_finishes_inside_the_cap() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
+        ctx.budgets.max_rows = 1;
+        let run_with = |len: usize| {
+            let stub = Stub::default();
+            stub.sql
+                .borrow_mut()
+                .push_back(records(&[("l1", 7)], 1_000));
+            let mut port = costed_spans();
+            for row in &mut port.data.rows {
+                row[3] = Cell::Str("n".repeat(len));
+            }
+            call_with(&stub, port, with_logs(), &ctx)
+        };
+        let dropped = |envelope: &Envelope| leg(envelope).rows.is_empty();
+        let cap = MAX_RESPONSE_BYTES_FLOOR as usize;
+        // `fit_cap` is the cap less the room kept for the identity warnings
+        // `Envelope::finish` can still add, so it is the bound to fill.
+        let fit = fit_cap(MAX_RESPONSE_BYTES_FLOOR);
+        let narrowest = run_with(0);
+        assert!(!dropped(&narrowest));
+        // One byte past what the narrowest envelope leaves: the record no
+        // longer fits, while the span alone still does uncut.
+        let (mut lo, mut hi) = (0usize, cap + 1 - serialized_len(&narrowest));
+        assert!(dropped(&run_with(hi)));
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if dropped(&run_with(mid)) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let mut widest = 0;
+        for len in lo - 16..=hi {
+            let envelope = run_with(len);
+            assert_eq!(envelope.status, Status::OkBounded, "{len}");
+            assert!(envelope.presentation.row_cap_hit, "{len}");
+            assert_eq!(envelope.presentation.rows_omitted, 2, "{len}");
+            let size = serialized_len(&envelope);
+            assert!(size <= fit, "len {len}: {size} B, over the {fit} B fit cap");
+            widest = widest.max(size);
+        }
+        assert!(widest + 16 >= fit, "the sweep peaked at {widest} B");
+    }
+
+    /// A leg failure message over 512 serialized bytes is cut with the
+    /// truncation marker and counted in `presentation.scalars_truncated`.
+    #[test]
+    fn a_long_leg_failure_message_is_marked_and_counted() {
+        let key = key();
+        let ctx = test_context(&key);
+        let stub = Stub::default();
+        *stub.sql_failure.borrow_mut() = Some(Failure {
+            class: FailureClass::Unavailable,
+            message: "m".repeat(2_000),
+            counter: None,
+        });
+        let envelope = call_with(&stub, costed_spans(), with_logs(), &ctx);
+        assert_eq!(envelope.status, Status::Ok, "{envelope:?}");
+        let failure = leg(&envelope).failure.as_ref().expect("a failure");
+        assert!(
+            failure.message.ends_with("m...[truncated]"),
+            "{}",
+            failure.message
+        );
+        assert_eq!(
+            crate::envelope::serialized_str_len(&failure.message),
+            LEG_FAILURE_MESSAGE_BOUND
+        );
+        assert_eq!(envelope.presentation.scalars_truncated, 1);
+    }
+
+    /// A leg whose columns alone do not fit beside the spans loses its
+    /// columns too: every record is counted in its omitted rows, its
+    /// `bytes_cap_hit` is set, every span is kept, and the envelope is
+    /// inside the cap. `ravel_search_logs`'s own fit bounds the columns it
+    /// returns far below the 256 KiB floor, so the leg's envelope is built
+    /// here and handed to `finish`.
+    #[test]
+    fn a_leg_whose_columns_do_not_fit_drops_them() {
+        let key = key();
+        let mut ctx = test_context(&key);
+        ctx.budgets.max_response_bytes = MAX_RESPONSE_BYTES_FLOOR;
+        let mut ran = records(&[("l1", 7), ("l2", 8), ("l3", 8)], 4).envelope;
+        ran.data.columns.push(Column {
+            name: "c".repeat(MAX_RESPONSE_BYTES_FLOOR as usize),
+            r#type: "Utf8".to_string(),
+        });
+        for row in &mut ran.data.rows {
+            row.push(Cell::Null);
+        }
+        let call = request(with_logs()).expect("valid arguments");
+        let envelope =
+            finish(costed_spans(), &call, Some(Leg::Ran(Box::new(ran))), &ctx).expect("finished");
+
+        let len = serialized_len(&envelope);
+        assert!(len <= MAX_RESPONSE_BYTES_FLOOR as usize, "{len}");
+        assert_eq!(envelope.status, Status::Ok, "{envelope:?}");
+        assert!(!envelope.presentation.bytes_cap_hit);
+        assert_eq!(tree(&envelope).len(), 3, "every span is kept");
+        let leg = leg(&envelope);
+        assert!(leg.columns.is_empty());
+        assert!(leg.rows.is_empty());
+        assert_eq!(leg.row_count, 3);
+        assert_eq!(leg.rows_omitted, 3);
+        assert!(leg.bytes_cap_hit);
+        assert_eq!(leg.status, LegStatus::OkBounded);
         assert_eq!(actions(&envelope), [LOGS_STEP]);
     }
 
