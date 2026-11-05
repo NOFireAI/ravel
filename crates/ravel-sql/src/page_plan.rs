@@ -107,7 +107,10 @@
 //! ([`expression_is_non_null`]), with no schema involved: a literal is NON
 //! NULL wherever it is selected from, and so is `count(...)`, which is 0
 //! over no rows. `count` is the one function that proof admits, and an
-//! aggregate reaches it only through the next section.
+//! aggregate reaches it only through the next section. A `min` or `max` is
+//! answered by [`aggregate_proof`] instead: under a plain `GROUP BY` every
+//! group holds at least one row, so the extreme of a NOT NULL column of the
+//! target table is never NULL, and its type is the column's.
 //!
 //! # A term computed from other rows has a position only over fixed segments
 //!
@@ -121,21 +124,32 @@
 //! again, and ADR-1374's 2026-09-12 amendment, item 4, says a row is never
 //! repeated.
 //!
-//! So a term that names or is such an expression plans only when
-//! [`expression_is_non_null`] proves it, which for an aggregate means
+//! So a term that names or is such an expression plans only when it is
+//! proven: by [`expression_is_non_null`], which for an aggregate means
 //! `count(...)`, and only when no window inside it counts over a `ROWS`
-//! frame or a named window ([`calls_a_positional_window`]). Its plan sets
+//! frame or a named window ([`calls_a_positional_window`]); or, for a `min`
+//! or `max` call, by [`aggregate_proof`]. That proof needs a plain `GROUP
+//! BY` with at least one key (no `ROLLUP`, `CUBE`, `GROUPING SETS`, `WITH
+//! TOTALS` or `GROUP BY ALL`, and not an ungrouped aggregate, any of which
+//! can produce a group over no rows), no `FILTER`, `OVER`, `WITHIN GROUP`,
+//! null treatment or argument clause on the call (`DISTINCT` is allowed: it
+//! does not change an extreme), one argument that is a bare column
+//! name read from the target table's schema (never through the projection,
+//! so an alias of the same name does not stand in for it), a NOT NULL
+//! column, and a column type on the allowlist: signed and unsigned integers,
+//! `Utf8`, `LargeUtf8` and nanosecond `Timestamp` with no zone. Its plan sets
 //! [`PagePlan::order_from_other_rows`], and the paging tool then serves a
 //! later page only over the segment set page one resolved, which it pins in
 //! the cursor (ADR-1374, pinned segment set amendment): over the same
 //! segments the value is the same, and a walk whose segments changed ends
-//! rather than repeating a row. Every other such term (`sum`, `min`, `max`,
-//! `avg`, any other window function, a subquery) is
-//! [`PagePlanError::OrderTermFromOtherRows`], which the paging tool answers
-//! by running the statement as written, with no cursor, the way it answers
-//! [`PagePlanError::NoOrdering`]. A `count` written in the `ORDER BY` rather
-//! than named there plans as the one output column the projection defines as
-//! that same expression, and is that refusal when there is none.
+//! rather than repeating a row. Every other such term (`sum`, `avg`, a `min`
+//! or `max` the proof does not reach, any other window function, a
+//! subquery) is [`PagePlanError::OrderTermFromOtherRows`], which the paging
+//! tool answers by running the statement as written, with no cursor, the way
+//! it answers [`PagePlanError::NoOrdering`]. A `count`, `min` or `max`
+//! written in the `ORDER BY` rather than named there plans as the one output
+//! column the projection defines as that same expression, and is that
+//! refusal when there is none.
 //!
 //! The other clauses of the rule are read off the term's TYPE, from the same
 //! two routes: the public schema's field type for a base column
@@ -296,7 +310,7 @@
 
 use std::ops::ControlFlow;
 
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::sql::parser::Statement as DFStatement;
 use datafusion::sql::sqlparser::ast::{
     Distinct, Expr as SqlExpr, Function, FunctionArguments, GroupByExpr, Ident, ObjectName,
@@ -822,11 +836,13 @@ pub struct PagePlan {
     /// Why [`Self::order_by`] is not a total order, or `None` when it is.
     pub not_total: Option<NotTotalOrder>,
     /// Whether one of the statement's own order terms is computed from other
-    /// rows (a `count`, the one such term that plans): its value moves when a
-    /// row lands in the segments the walk reads, so a later page is exact
-    /// only over the segment set page one resolved (ADR-1374, pinned segment
-    /// set amendment). A tiebreak column never sets it.
+    /// rows (a `count`, `min` or `max`, the such terms that plan): its value
+    /// moves when a row lands in the segments the walk reads, so a later page
+    /// is exact only over the segment set page one resolved (ADR-1374, pinned
+    /// segment set amendment). A tiebreak column never sets it.
     pub order_from_other_rows: bool,
+    /// The proven kind of each [`Self::order_by`] term, in term order.
+    resume_kinds: Vec<ResumeKind>,
 }
 
 impl PagePlan {
@@ -835,6 +851,19 @@ impl PagePlan {
     /// may be minted.
     pub fn total_order(&self) -> bool {
         self.not_total.is_none()
+    }
+
+    /// Whether `tuple` would be accepted as a [`ResumePosition`] for this
+    /// plan: one value per [`Self::order_by`] term, each the variant that
+    /// term's proven kind takes. The same check [`plan_page`] applies to a
+    /// resume position, answered before a cursor carrying `tuple` is minted.
+    pub fn admits_resume(&self, tuple: &[ResumeValue]) -> bool {
+        tuple.len() == self.resume_kinds.len()
+            && self
+                .resume_kinds
+                .iter()
+                .zip(tuple)
+                .all(|(kind, value)| kind.admits(value))
     }
 }
 
@@ -918,6 +947,7 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
         tiebreak_appended,
         not_total,
         order_from_other_rows,
+        resume_kinds: kinds,
     })
 }
 
@@ -1158,13 +1188,15 @@ fn page_target(sql: &str) -> Result<PageTarget, PagePlanError> {
 mod resolution {
     use std::collections::{BTreeMap, BTreeSet};
 
+    use datafusion::arrow::datatypes::Field;
     use datafusion::sql::sqlparser::ast::{
-        Expr as SqlExpr, Query, SelectItem, SetExpr, WildcardAdditionalOptions,
+        Expr as SqlExpr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+        FunctionArguments, GroupByExpr, Query, SelectItem, SetExpr, WildcardAdditionalOptions,
     };
 
     use super::{
         PageTarget, Relation, bare_name, column_of, grouping_can_null_a_grouping_column,
-        ident_name, relation_of, unproven,
+        ident_name, relation_of, table_schema, unproven,
     };
 
     /// What the statement's text proves one of its output names is built
@@ -1253,6 +1285,10 @@ mod resolution {
     pub(super) struct OutputResolution {
         projection: Projection,
         basis: Basis,
+        /// Whether every output row is one group of a plain `GROUP BY`, so
+        /// that each row's aggregates are computed over at least one input
+        /// row ([`groups_of`]).
+        groups: bool,
     }
 
     impl OutputResolution {
@@ -1261,7 +1297,78 @@ mod resolution {
             OutputResolution {
                 projection: projection_of(query),
                 basis: basis_of(query, target),
+                groups: groups_of(query),
             }
+        }
+
+        /// The schema field of the column a grouped aggregate call reads, when
+        /// the text proves the call sees at least one value of it in every
+        /// group: the `FROM` relation is the target table under its own
+        /// column names, the statement groups by a plain `GROUP BY`, the call
+        /// carries no clause that drops rows or values from its input, and
+        /// its one argument is a bare column the static schema declares NOT
+        /// NULL. `DISTINCT` removes duplicates and never the last value, so
+        /// it is allowed.
+        ///
+        /// The argument is looked up in the schema directly, never through
+        /// the projection: an aggregate's argument names a column of the
+        /// `FROM` relation even where an output alias shares its name.
+        ///
+        /// Every refusal names the link of the proof that is missing.
+        pub(super) fn aggregate_argument(
+            &self,
+            function: &Function,
+        ) -> Result<Field, &'static str> {
+            let table = match self.basis {
+                Basis::Table(table) => table,
+                Basis::Unresolvable(reason) => return Err(reason),
+            };
+            if !self.groups {
+                return Err(unproven::AGGREGATE_UNGROUPED);
+            }
+            let Function {
+                // The caller has already matched the name.
+                name: _,
+                uses_odbc_syntax: _,
+                parameters,
+                args,
+                filter,
+                null_treatment,
+                over,
+                within_group,
+            } = function;
+            if filter.is_some()
+                || over.is_some()
+                || null_treatment.is_some()
+                || !within_group.is_empty()
+                || !matches!(parameters, FunctionArguments::None)
+            {
+                return Err(unproven::AGGREGATE_FILTERED);
+            }
+            let FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: _,
+                args,
+                clauses,
+            }) = args
+            else {
+                return Err(unproven::AGGREGATE_ARGUMENT_NOT_A_COLUMN);
+            };
+            if !clauses.is_empty() {
+                return Err(unproven::AGGREGATE_FILTERED);
+            }
+            let [FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Identifier(ident)))] =
+                args.as_slice()
+            else {
+                return Err(unproven::AGGREGATE_ARGUMENT_NOT_A_COLUMN);
+            };
+            let schema = table_schema(table).ok_or(unproven::NO_PUBLIC_SCHEMA)?;
+            let field = schema
+                .field_with_name(&ident_name(ident))
+                .map_err(|_| unproven::NOT_A_SCHEMA_COLUMN)?;
+            if field.is_nullable() {
+                return Err(unproven::AGGREGATE_ARGUMENT_NULLABLE);
+            }
+            Ok(field.clone())
         }
 
         /// What the text proves the output name `name` is built from.
@@ -1559,6 +1666,31 @@ mod resolution {
         }
         Basis::Table(table)
     }
+
+    /// Whether the statement groups by a plain `GROUP BY` over at least one
+    /// expression, so that it emits a row only for a group with at least one
+    /// input row in it.
+    ///
+    /// An ungrouped aggregate emits one row over an empty input, and so does
+    /// the empty grouping set `()`. `GROUP BY ALL` groups by whatever the
+    /// projection leaves unaggregated, which can be nothing, and a grouping
+    /// modifier (`WITH ROLLUP`, `WITH TOTALS`) adds a super-aggregate row, so
+    /// neither is a plain `GROUP BY` here.
+    fn groups_of(query: &Query) -> bool {
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return false;
+        };
+        match &select.group_by {
+            GroupByExpr::All(_) => false,
+            GroupByExpr::Expressions(exprs, modifiers) => {
+                modifiers.is_empty()
+                    && !exprs.is_empty()
+                    && !exprs
+                        .iter()
+                        .any(|expr| matches!(expr, SqlExpr::Tuple(items) if items.is_empty()))
+            }
+        }
+    }
 }
 
 use resolution::{OutputResolution, Provenance};
@@ -1665,6 +1797,16 @@ mod unproven {
          the expanded columns by a rule this planner does not model";
     pub(super) const MULTI_ALIAS: &str = "the projection item that names it carries a multi-alias list, whose expansion \
          this planner does not model";
+    pub(super) const AGGREGATE_FILTERED: &str = "the aggregate carries a FILTER, OVER, WITHIN GROUP, null-treatment or other \
+         clause that can leave it no value to read in a group";
+    pub(super) const AGGREGATE_UNGROUPED: &str = "the statement has no plain GROUP BY, so an aggregate can be computed over no \
+         rows at all";
+    pub(super) const AGGREGATE_ARGUMENT_NOT_A_COLUMN: &str =
+        "the aggregate's argument is not one bare column of the FROM relation";
+    pub(super) const AGGREGATE_ARGUMENT_NULLABLE: &str = "the target table's public schema declares the aggregate's argument \
+         nullable, so a group can hold no value of it";
+    pub(super) const AGGREGATE_ARGUMENT_TYPE: &str = "the aggregate's argument is not of a type min and max are proven to return \
+         unchanged and a resume value carries exactly";
 }
 
 /// Whether the `GROUP BY` can emit a row where a grouping column is NULL even
@@ -1906,12 +2048,20 @@ fn negated_number_cursor_support(text: &str) -> CursorSupport {
 /// consulted and no basis required: a literal is NON NULL whatever relation it
 /// is selected from, including under an outer join or a `ROLLUP`, because it
 /// is not a grouping column that a super-aggregate row can null, and the same
-/// holds for `count`. An expression computed from other rows arrives here
-/// only when [`statement_order_terms`] admitted it, which is a `count`.
+/// holds for `count`. A `min` or `max` call is the exception that needs both,
+/// and is answered by [`aggregate_proof`] instead. An expression computed from
+/// other rows arrives here only when [`statement_order_terms`] admitted it,
+/// which is a `count`, a `min` or a `max`.
 fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
     let (table, source) = match names.resolve(column) {
         Provenance::BaseColumn { table, column } => (table, column),
         Provenance::Expression(expr) => {
+            if let Some(function) = min_or_max_call(expr) {
+                return match aggregate_proof(function, names) {
+                    Ok(kind) => TermProof::Admissible(kind),
+                    Err(reason) => TermProof::Unproven(reason),
+                };
+            }
             if !expression_is_non_null(expr) {
                 return TermProof::Unproven(unproven::EXPRESSION_NOT_PROVABLE);
             }
@@ -1928,13 +2078,8 @@ fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
         // above instead of a panic on a production path.
         Provenance::NotProjected => return TermProof::Unproven(unproven::NOT_A_BARE_COLUMN),
     };
-    let schema = match table {
-        SAMPLES_TABLE => public_schema(),
-        LOGS_TABLE => logs_schema(),
-        SPANS_TABLE => spans_schema(),
-        ALERTS_TABLE => alerts_schema(),
-        AUDIT_TABLE => audit_schema(),
-        _ => return TermProof::Unproven(unproven::NO_PUBLIC_SCHEMA),
+    let Some(schema) = table_schema(table) else {
+        return TermProof::Unproven(unproven::NO_PUBLIC_SCHEMA);
     };
     let Ok(field) = schema.field_with_name(source) else {
         return TermProof::Unproven(unproven::NOT_A_SCHEMA_COLUMN);
@@ -1945,6 +2090,62 @@ fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
     match cursor_support(field.data_type()) {
         CursorSupport::Exact(kind) => TermProof::Admissible(kind),
         CursorSupport::Unrepresentable(kind) => TermProof::NotRepresentable(kind),
+    }
+}
+
+/// The static public schema of a target table, or `None` for a table this
+/// planner has none for.
+fn table_schema(table: &str) -> Option<SchemaRef> {
+    match table {
+        SAMPLES_TABLE => Some(public_schema()),
+        LOGS_TABLE => Some(logs_schema()),
+        SPANS_TABLE => Some(spans_schema()),
+        ALERTS_TABLE => Some(alerts_schema()),
+        AUDIT_TABLE => Some(audit_schema()),
+        _ => None,
+    }
+}
+
+/// The call, when `expr` is a call of `min` or `max` under a one-part name in
+/// any case. Parentheses and other wrappers are not looked through.
+fn min_or_max_call(expr: &SqlExpr) -> Option<&Function> {
+    let SqlExpr::Function(function) = expr else {
+        return None;
+    };
+    let [part] = function.name.0.as_slice() else {
+        return None;
+    };
+    let ident = part.as_ident()?;
+    (ident.value.eq_ignore_ascii_case("min") || ident.value.eq_ignore_ascii_case("max"))
+        .then_some(function)
+}
+
+/// The resume kind of a `min` or `max` order term, when the text proves it
+/// NON NULL and of a type a resume value carries exactly.
+///
+/// NON NULL comes from [`OutputResolution::aggregate_argument`]: a group of a
+/// plain `GROUP BY` holds at least one row, the call reads every row of its
+/// group, and its argument is a column the schema declares NOT NULL, so the
+/// call sees at least one value. The type comes from an allowlist of argument
+/// types for which `min` and `max` return the input type unchanged and
+/// [`cursor_support`] is exact: the signed and unsigned integers, `Utf8` and
+/// `LargeUtf8`, and nanosecond timestamps with no timezone. A float argument
+/// is refused (NaN and the infinities have no resume value), and so are
+/// `Boolean`, `Binary` and `FixedSizeBinary`, whose `min` and `max` return
+/// types no test here has executed.
+fn aggregate_proof(
+    function: &Function,
+    names: &OutputResolution,
+) -> Result<ResumeKind, &'static str> {
+    let field = names.aggregate_argument(function)?;
+    match field.data_type() {
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Ok(ResumeKind::Int),
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            Ok(ResumeKind::UInt)
+        }
+        DataType::Utf8 | DataType::LargeUtf8 => Ok(ResumeKind::Str),
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(ResumeKind::TimestampNanos),
+        _ => Err(unproven::AGGREGATE_ARGUMENT_TYPE),
     }
 }
 
@@ -1962,8 +2163,10 @@ fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
 ///   arguments, `FILTER`, `DISTINCT` or `OVER`: it counts rows or non-null
 ///   values, so an empty input is 0 rather than NULL.
 ///
-/// `count` is the one function admitted. Every other aggregate is NULL over
-/// an empty input, and no other function's nullability is read here.
+/// `count` is the one function admitted here. Every other aggregate is NULL
+/// over an empty input, and no other function's nullability is read here; a
+/// `min` or `max` is proven by [`aggregate_proof`] instead, which reads the
+/// grouping and the schema this function does not.
 ///
 /// Anything else answers `false`, which is a refusal rather than a plan. A
 /// case added here has to hold for every input, not merely for the inputs a
@@ -2276,8 +2479,9 @@ fn statement_order_terms(
         OrderByKind::All(_) => return Err(PagePlanError::OrderByAll),
         OrderByKind::Expressions(exprs) => exprs,
     };
-    let proven = |defining: &SqlExpr| {
-        expression_is_non_null(defining) && !calls_a_positional_window(defining)
+    let proven = |defining: &SqlExpr| match min_or_max_call(defining) {
+        Some(function) => aggregate_proof(function, names).is_ok(),
+        None => expression_is_non_null(defining) && !calls_a_positional_window(defining),
     };
     let mut order_from_other_rows = false;
     // The output column each written term orders by, where it is not a column
@@ -4425,13 +4629,15 @@ mod tests {
     /// An order term computed from other rows that is not proven NON NULL
     /// carries no cursor, whether it is an aggregate, a window function or a
     /// subquery, written in ORDER BY or reached through an alias, bare or
-    /// inside another expression. Only `count(...)` is proven, and only where
-    /// no window inside it counts positions.
+    /// inside another expression. Only `count(...)`, where no window inside
+    /// it counts positions, and a grouped `min` or `max` over a NOT NULL
+    /// column (`an_unproven_min_or_max_stays_unpaged` covers the refusals)
+    /// are proven.
     ///
     /// FLIP C: with `expression_is_non_null` and `expression_cursor_support`
     /// admitting every `SqlExpr::Function` rather than `count` alone, the
-    /// `sum`, `min`, `max`, `avg`, `row_number` and `rank` cases plan
-    /// (the `sum` direct case fails first).
+    /// `sum`, `avg`, `row_number` and `rank` cases plan (the `sum` direct
+    /// case fails first).
     #[test]
     fn an_order_term_from_other_rows_carries_no_cursor() {
         let cases: Vec<(&str, &str)> = vec![
@@ -4442,14 +4648,6 @@ mod tests {
             ),
             (
                 "SELECT series_id, SUM(value) AS s FROM samples GROUP BY series_id ORDER BY s",
-                "s",
-            ),
-            (
-                "SELECT series_id, min(ts) AS s FROM samples GROUP BY series_id ORDER BY s",
-                "s",
-            ),
-            (
-                "SELECT series_id, max(ts) AS s FROM samples GROUP BY series_id ORDER BY s",
                 "s",
             ),
             (
@@ -4683,6 +4881,330 @@ mod tests {
                 ),
                 expected,
                 "{text}"
+            );
+        }
+    }
+
+    /// `PagePlan::admits_resume` answers exactly what `plan_page` answers for
+    /// the same tuple as a resume position, and both answers are pinned: a
+    /// `series_id` of the wrong width, a `Binary` where the column is fixed
+    /// width, a `Float` or a `UInt` where a count is `Int`, and a tuple one
+    /// value short are each refused; the planned kinds are admitted.
+    ///
+    /// FLIP: an `admits` that matches `FixedSizeBinary` without comparing the
+    /// width admits the eight-byte `series_id`.
+    /// FLIP: an `admits` that also takes a `Float` for an `Int` term admits
+    /// the float count.
+    #[test]
+    fn admits_resume_matches_check_resume_types() {
+        let total = "SELECT * FROM samples ORDER BY ts";
+        let counted = "SELECT ts, count(*) AS c FROM samples GROUP BY ts ORDER BY c, ts";
+        let cases: Vec<(&str, Vec<ResumeValue>, bool)> = vec![
+            (
+                total,
+                vec![
+                    ResumeValue::TimestampNanos(1),
+                    ResumeValue::FixedSizeBinary(vec![1; 16]),
+                ],
+                true,
+            ),
+            (
+                total,
+                vec![
+                    ResumeValue::TimestampNanos(1),
+                    ResumeValue::FixedSizeBinary(vec![1; 8]),
+                ],
+                false,
+            ),
+            (
+                total,
+                vec![
+                    ResumeValue::TimestampNanos(1),
+                    ResumeValue::Binary(vec![1; 16]),
+                ],
+                false,
+            ),
+            (total, vec![ResumeValue::TimestampNanos(1)], false),
+            (
+                counted,
+                vec![ResumeValue::Int(3), ResumeValue::TimestampNanos(1)],
+                true,
+            ),
+            (
+                counted,
+                vec![ResumeValue::Float(3.0), ResumeValue::TimestampNanos(1)],
+                false,
+            ),
+            (
+                counted,
+                vec![ResumeValue::UInt(3), ResumeValue::TimestampNanos(1)],
+                false,
+            ),
+        ];
+        for (sql, tuple, expected) in cases {
+            let plan = plan_page(sql, None).expect("planned");
+            assert_eq!(plan.admits_resume(&tuple), expected, "{sql:?} {tuple:?}");
+            let resumed = plan_page(sql, Some(&ResumePosition::new(tuple.clone())));
+            assert_eq!(resumed.is_ok(), expected, "{sql:?} {tuple:?}: {resumed:?}");
+        }
+    }
+
+    /// The proof `aggregate_proof` gives the `min` or `max` call the output
+    /// name `term` is defined as.
+    fn min_or_max_proof(sql: &str, term: &str) -> Result<ResumeKind, &'static str> {
+        let query = parse_query(sql).expect("parsed");
+        let target = page_target(sql).expect("a target");
+        let names = OutputResolution::of(&query, target);
+        let Provenance::Expression(expr) = names.resolve(term) else {
+            panic!("{term} is not an expression in {sql:?}");
+        };
+        let function = min_or_max_call(expr).expect("a min or max call");
+        aggregate_proof(function, &names)
+    }
+
+    /// A `min` or `max` over a NOT NULL column of the target table, under a
+    /// plain `GROUP BY`, plans with the resume kind of its column's type and
+    /// marks the order as computed from other rows: `Timestamp` is
+    /// `TimestampNanos`, `UInt8` is `UInt`, `Int64` is `Int`, `Utf8` is
+    /// `Str`. So it does written in the ORDER BY, under `DISTINCT`, and with
+    /// an argument named like an output alias, which names the `FROM`
+    /// column (`max(ts) AS ts` reads `samples.ts`; `value AS ts, max(ts)`
+    /// still reads `samples.ts`, not `value`).
+    ///
+    /// FLIP: an allowlist arm mapping `Timestamp(ns)` to `Int` fails the
+    /// first row.
+    /// FLIP: an allowlist arm mapping the unsigned integers to `Int` fails
+    /// the `max(severity_num)` row.
+    /// FLIP: `order_from_other_rows` left `false` for a proven `min` or
+    /// `max` fails the flag assertion of the first row.
+    #[test]
+    fn a_grouped_max_over_a_not_null_column_plans_with_its_column_kind() {
+        let cases: Vec<(&str, &str, ResumeKind)> = vec![
+            (
+                "SELECT series_id, max(ts) AS m FROM samples GROUP BY series_id ORDER BY m DESC",
+                "m",
+                ResumeKind::TimestampNanos,
+            ),
+            (
+                "SELECT severity_text, max(severity_num) AS m FROM logs \
+                 GROUP BY severity_text ORDER BY m",
+                "m",
+                ResumeKind::UInt,
+            ),
+            (
+                "SELECT name, MIN(duration_ns) AS d FROM spans GROUP BY name ORDER BY d",
+                "d",
+                ResumeKind::Int,
+            ),
+            (
+                "SELECT severity_num, min(body) AS b FROM logs GROUP BY severity_num ORDER BY b",
+                "b",
+                ResumeKind::Str,
+            ),
+            (
+                "SELECT series_id, max(ts) AS m FROM samples GROUP BY series_id ORDER BY max(ts)",
+                "m",
+                ResumeKind::TimestampNanos,
+            ),
+            (
+                "SELECT series_id, max(DISTINCT ts) AS m FROM samples GROUP BY series_id \
+                 ORDER BY m",
+                "m",
+                ResumeKind::TimestampNanos,
+            ),
+            (
+                "SELECT series_id, max(ts) AS ts FROM samples GROUP BY series_id ORDER BY ts",
+                "ts",
+                ResumeKind::TimestampNanos,
+            ),
+            (
+                "SELECT value AS ts, max(ts) AS m FROM samples GROUP BY value ORDER BY m",
+                "m",
+                ResumeKind::TimestampNanos,
+            ),
+        ];
+        for (sql, term, kind) in cases {
+            let plan = plan_page(sql, None).unwrap_or_else(|e| panic!("{sql:?}: {e}"));
+            assert!(plan.order_from_other_rows, "flag for {sql:?}");
+            assert_eq!(
+                plan.order_by
+                    .iter()
+                    .map(|term| term.column.as_str())
+                    .collect::<Vec<_>>(),
+                [term],
+                "order for {sql:?}"
+            );
+            assert_eq!(plan.resume_kinds, [kind], "kinds for {sql:?}");
+            assert_eq!(min_or_max_proof(sql, term), Ok(kind), "proof for {sql:?}");
+        }
+
+        // The planned kind is the one a resume position must carry.
+        let sql = "SELECT series_id, max(ts) AS m FROM samples GROUP BY series_id ORDER BY m DESC";
+        let resumed = plan_page(
+            sql,
+            Some(&ResumePosition::new(vec![ResumeValue::TimestampNanos(7)])),
+        )
+        .expect("a TimestampNanos resumes");
+        assert!(
+            resumed
+                .statement
+                .contains("\"m\" < arrow_cast(7, 'Timestamp(Nanosecond, None)')"),
+            "{}",
+            resumed.statement
+        );
+        assert_eq!(
+            plan_page(sql, Some(&ResumePosition::new(vec![ResumeValue::Int(7)]))),
+            Err(PagePlanError::ResumeValueTypeMismatch {
+                position: 1,
+                column: "m".to_string(),
+                expected: "TimestampNanos".to_string(),
+                found: "Int".to_string(),
+            }),
+        );
+    }
+
+    /// Every `min` or `max` the proof does not cover runs unpaged, and each
+    /// row is refused for its own one reason: the statement is otherwise
+    /// one that pages (grouped, a NOT NULL argument of an allowed type, the
+    /// target table under its own names) except for the one thing the row
+    /// changes.
+    #[test]
+    fn an_unproven_min_or_max_stays_unpaged() {
+        let cases: Vec<(&str, &'static str)> = vec![
+            // A float argument: NaN and the infinities have no resume value.
+            (
+                "SELECT series_id, max(value) AS m FROM samples GROUP BY series_id ORDER BY m",
+                unproven::AGGREGATE_ARGUMENT_TYPE,
+            ),
+            // Nullable arguments.
+            (
+                "SELECT severity_text, max(trace_id) AS m FROM logs GROUP BY severity_text \
+                 ORDER BY m",
+                unproven::AGGREGATE_ARGUMENT_NULLABLE,
+            ),
+            (
+                "SELECT severity_text, min(span_id) AS m FROM logs GROUP BY severity_text \
+                 ORDER BY m",
+                unproven::AGGREGATE_ARGUMENT_NULLABLE,
+            ),
+            (
+                "SELECT name, max(service_name) AS m FROM spans GROUP BY name ORDER BY m",
+                unproven::AGGREGATE_ARGUMENT_NULLABLE,
+            ),
+            (
+                "SELECT name, min(status_message) AS m FROM spans GROUP BY name ORDER BY m",
+                unproven::AGGREGATE_ARGUMENT_NULLABLE,
+            ),
+            (
+                "SELECT writer_id, max(generation) AS m FROM alerts GROUP BY writer_id \
+                 ORDER BY m",
+                unproven::AGGREGATE_ARGUMENT_NULLABLE,
+            ),
+            // A declared column: not in the static schema.
+            (
+                "SELECT severity_text, max(http_status) AS m FROM logs GROUP BY severity_text \
+                 ORDER BY m",
+                unproven::NOT_A_SCHEMA_COLUMN,
+            ),
+            // Clauses that can leave a group with no value to read.
+            (
+                "SELECT series_id, max(ts) FILTER (WHERE value > 0) AS m FROM samples \
+                 GROUP BY series_id ORDER BY m",
+                unproven::AGGREGATE_FILTERED,
+            ),
+            (
+                "SELECT series_id, max(ts) OVER () AS m FROM samples GROUP BY series_id, ts \
+                 ORDER BY m",
+                unproven::AGGREGATE_FILTERED,
+            ),
+            // No plain GROUP BY.
+            (
+                "SELECT max(ts) AS m FROM samples ORDER BY m",
+                unproven::AGGREGATE_UNGROUPED,
+            ),
+            (
+                "SELECT series_id, max(ts) AS m FROM samples GROUP BY ALL ORDER BY m",
+                unproven::AGGREGATE_UNGROUPED,
+            ),
+            (
+                "SELECT max(ts) AS m FROM samples GROUP BY () ORDER BY m",
+                unproven::AGGREGATE_UNGROUPED,
+            ),
+            // Groupings that add a super-aggregate row.
+            (
+                "SELECT max(ts) AS m FROM samples GROUP BY ROLLUP(series_id) ORDER BY m",
+                unproven::GROUPING_NULLS,
+            ),
+            (
+                "SELECT max(ts) AS m FROM samples GROUP BY CUBE(series_id) ORDER BY m",
+                unproven::GROUPING_NULLS,
+            ),
+            (
+                "SELECT max(ts) AS m FROM samples GROUP BY GROUPING SETS ((series_id)) \
+                 ORDER BY m",
+                unproven::GROUPING_NULLS,
+            ),
+            (
+                "SELECT series_id, max(ts) AS m FROM samples GROUP BY series_id WITH TOTALS \
+                 ORDER BY m",
+                unproven::GROUPING_NULLS,
+            ),
+            // A FROM relation that is not the target table under its own names.
+            (
+                "SELECT series_id, max(ts) AS m FROM (SELECT * FROM samples) x \
+                 GROUP BY series_id ORDER BY m",
+                unproven::DERIVED_RELATION,
+            ),
+            (
+                "WITH x AS (SELECT * FROM samples) SELECT series_id, max(ts) AS m FROM samples \
+                 GROUP BY series_id ORDER BY m",
+                unproven::WITH_CLAUSE,
+            ),
+            (
+                "SELECT a.series_id, max(ts) AS m FROM samples a JOIN samples b \
+                 ON a.series_id = b.series_id GROUP BY a.series_id ORDER BY m",
+                unproven::JOINED,
+            ),
+            (
+                "SELECT series_id, max(ts) AS m FROM samples AS x (value, ts, series_id, labels) \
+                 GROUP BY series_id ORDER BY m",
+                unproven::RENAMED_COLUMNS,
+            ),
+            (
+                "SELECT series_id, max(ts) AS m FROM samples TABLESAMPLE SYSTEM (10) \
+                 GROUP BY series_id ORDER BY m",
+                unproven::SAMPLED_RELATION,
+            ),
+            // Arguments that are not one bare column.
+            (
+                "SELECT series_id, max(value + value) AS m FROM samples GROUP BY series_id \
+                 ORDER BY m",
+                unproven::AGGREGATE_ARGUMENT_NOT_A_COLUMN,
+            ),
+            (
+                "SELECT series_id, max(CAST(ts AS BIGINT)) AS m FROM samples GROUP BY series_id \
+                 ORDER BY m",
+                unproven::AGGREGATE_ARGUMENT_NOT_A_COLUMN,
+            ),
+            (
+                "SELECT severity_text, max(logs.ts) AS m FROM logs GROUP BY severity_text \
+                 ORDER BY m",
+                unproven::AGGREGATE_ARGUMENT_NOT_A_COLUMN,
+            ),
+            // A Parquet table has no page target.
+            (
+                "SELECT id, max(ts) AS m FROM hits GROUP BY id ORDER BY m",
+                unproven::NO_BASE_TABLE,
+            ),
+        ];
+        for (sql, reason) in cases {
+            assert_eq!(min_or_max_proof(sql, "m"), Err(reason), "proof for {sql:?}");
+            assert_eq!(
+                plan_page(sql, None),
+                Err(PagePlanError::OrderTermFromOtherRows {
+                    term: "m".to_string()
+                }),
+                "plan for {sql:?}"
             );
         }
     }

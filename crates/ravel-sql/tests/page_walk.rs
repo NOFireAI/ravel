@@ -1535,3 +1535,202 @@ fn the_no_row_identity_target_is_never_claimed_as_a_total_order() {
         Some(NotTotalOrder::ShapeNotIdentityPreserving { shape: "GROUP BY" }),
     );
 }
+
+/// The `samples` fixture the `max` order walks: six series whose latest `ts`
+/// values are 300, 300, 300, 250, 400 and 150, so three groups tie on the
+/// aggregate and the tie crosses the first page boundary at a cap of two. Each
+/// series carries its own `value`, so grouping by `value` groups by series too.
+const MAX_FIXTURE: &[FixtureRow] = &[
+    FixtureRow {
+        ts: 100,
+        value: 1.0,
+        series_id: [1u8; 16],
+    },
+    FixtureRow {
+        ts: 300,
+        value: 1.0,
+        series_id: [1u8; 16],
+    },
+    FixtureRow {
+        ts: 300,
+        value: 2.0,
+        series_id: [2u8; 16],
+    },
+    FixtureRow {
+        ts: 200,
+        value: 3.0,
+        series_id: [3u8; 16],
+    },
+    FixtureRow {
+        ts: 300,
+        value: 3.0,
+        series_id: [3u8; 16],
+    },
+    FixtureRow {
+        ts: 250,
+        value: 4.0,
+        series_id: [4u8; 16],
+    },
+    FixtureRow {
+        ts: 400,
+        value: 5.0,
+        series_id: [5u8; 16],
+    },
+    FixtureRow {
+        ts: 50,
+        value: 6.0,
+        series_id: [6u8; 16],
+    },
+    FixtureRow {
+        ts: 150,
+        value: 6.0,
+        series_id: [6u8; 16],
+    },
+];
+
+/// The walked `max` order. `series_id` follows the aggregate so the three
+/// groups tied at 300 have a fixed order inside the tie.
+const MAX_ORDER_STATEMENT: &str = "SELECT series_id, max(ts) AS m FROM samples \
+     GROUP BY series_id ORDER BY m DESC, series_id";
+
+/// The row cap of a grouped walk, as the tool's `max_rows`.
+const GROUPED_PAGE_CAP: usize = 2;
+
+/// Page `sql` the way `ravel_query_sql` pages an order that is not total: run
+/// the page statement, keep `cap + 1` rows, hold back the trailing group of
+/// rows equal under the order when the extra row continues it, and resume
+/// after the last kept row. Each resume tuple is checked against the plan the
+/// page ran under, as the tool's cursor mint checks it, so a tuple the next
+/// page would refuse fails on the page that produced it.
+async fn grouped_walk(ctx: &SessionContext, sql: &str, cap: usize) -> Vec<Vec<Vec<String>>> {
+    let mut pages: Vec<Vec<Vec<String>>> = Vec::new();
+    let mut resume: Option<ResumePosition> = None;
+    loop {
+        assert!(
+            pages.len() < MAX_PAGES,
+            "grouped walk of {sql:?} did not terminate within {MAX_PAGES} pages",
+        );
+        let plan = plan_page(sql, resume.as_ref())
+            .unwrap_or_else(|e| panic!("page {} of {sql:?} would not plan: {e}", pages.len() + 1));
+        let batches = execute(ctx, &plan.statement).await;
+        let rendered = rows_of(&batches);
+        if rendered.is_empty() {
+            return pages;
+        }
+        let tuple_at = |index: usize| -> Vec<ResumeValue> {
+            let (batch, offset) = row_at(&batches, index);
+            plan.order_by
+                .iter()
+                .map(|term| {
+                    let column = batch.column_by_name(&term.column).unwrap_or_else(|| {
+                        panic!("page of {sql:?} does not carry {:?}", term.column)
+                    });
+                    assert!(
+                        !column.is_null(offset),
+                        "a NULL {:?} in {sql:?}",
+                        term.column
+                    );
+                    resume_value(column.as_ref(), offset).unwrap_or_else(|| {
+                        panic!(
+                            "no resume value for {:?} of type {}",
+                            term.column,
+                            column.data_type()
+                        )
+                    })
+                })
+                .collect()
+        };
+        let mut kept = rendered.len().min(cap);
+        if rendered.len() > cap {
+            let boundary = tuple_at(cap);
+            while kept > 0 && tuple_at(kept - 1) == boundary {
+                kept -= 1;
+            }
+            assert!(
+                kept > 0,
+                "no complete group of {sql:?} fits a page of {cap}"
+            );
+        }
+        let tuple = tuple_at(kept - 1);
+        assert!(
+            plan.admits_resume(&tuple),
+            "the last row of page {} of {sql:?} is {tuple:?}, which the plan it ran under \
+             would refuse as a resume position",
+            pages.len() + 1,
+        );
+        pages.push(rendered.into_iter().take(kept).collect());
+        resume = Some(ResumePosition::new(tuple));
+    }
+}
+
+/// A grouped `max` order walks three full pages and an empty one, with the
+/// three groups tied at 300 split across the first boundary, and delivers
+/// exactly the unpaged result in its order, each group once.
+#[tokio::test]
+async fn max_order_walks_three_pages_exactly() {
+    let ctx = context_of(MAX_FIXTURE);
+    let plan = plan_page(MAX_ORDER_STATEMENT, None).expect("planned");
+    assert_eq!(
+        plan.not_total,
+        Some(NotTotalOrder::ShapeNotIdentityPreserving { shape: "GROUP BY" }),
+    );
+    assert!(plan.order_from_other_rows, "a max order reads other rows");
+
+    let series = |n: u8| format!("{n:02x}").repeat(16);
+    let row = |n: u8, m: &str| vec![series(n), format!("1970-01-01T00:00:00.{m}")];
+    let expected = vec![
+        vec![row(5, "000000400"), row(1, "000000300")],
+        vec![row(2, "000000300"), row(3, "000000300")],
+        vec![row(4, "000000250"), row(6, "000000150")],
+    ];
+
+    let unpaged = rows_of(&execute(&ctx, MAX_ORDER_STATEMENT).await);
+    assert_eq!(unpaged, expected.concat(), "the unpaged ordering");
+
+    let pages = grouped_walk(&ctx, MAX_ORDER_STATEMENT, GROUPED_PAGE_CAP).await;
+    assert_eq!(pages, expected, "the walked pages");
+    let walked: Vec<Vec<String>> = pages.concat();
+    assert_eq!(
+        walked, unpaged,
+        "the walk's union against the unpaged result"
+    );
+    assert!(
+        multiset(&walked).values().all(|&count| count == 1),
+        "a group was delivered twice: {walked:?}",
+    );
+}
+
+/// An aggregate argument that shares its name with an output alias reads the
+/// FROM column, not the alias: `max(ts)` beside `value AS ts` is the latest
+/// sample time per value, a timestamp, never a float. The planner proves the
+/// argument off the schema on that reading, so the executed answer has to
+/// agree with it.
+#[tokio::test]
+async fn an_aggregate_argument_named_like_an_alias_reads_the_from_column() {
+    let ctx = context_of(MAX_FIXTURE);
+    let sql = "SELECT value AS ts, max(ts) AS m FROM samples GROUP BY value ORDER BY m DESC";
+    let batches = execute(&ctx, sql).await;
+    let schema = batches.first().expect("one batch").schema();
+    assert_eq!(
+        schema.field_with_name("m").expect("m").data_type(),
+        &datafusion::arrow::datatypes::DataType::Timestamp(
+            datafusion::arrow::datatypes::TimeUnit::Nanosecond,
+            None,
+        ),
+    );
+    let m: Vec<String> = rows_of(&batches)
+        .into_iter()
+        .map(|row| row[1].clone())
+        .collect();
+    assert_eq!(
+        m,
+        [
+            "1970-01-01T00:00:00.000000400",
+            "1970-01-01T00:00:00.000000300",
+            "1970-01-01T00:00:00.000000300",
+            "1970-01-01T00:00:00.000000300",
+            "1970-01-01T00:00:00.000000250",
+            "1970-01-01T00:00:00.000000150",
+        ],
+    );
+}

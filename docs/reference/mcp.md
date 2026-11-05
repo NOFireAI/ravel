@@ -516,7 +516,8 @@ it reads anything:
 | cannot be paged: for example its own `LIMIT`, `OFFSET`, `FETCH` or `TOP`, an `ORDER BY` term that is not a projected column or may be NULL, or a float `ORDER BY` term | `invalid_argument` naming the planner's reason, with a `rewrite_the_statement` next step |
 | no `ORDER BY`, and no projected row identity to order by (only `samples` has one: `ts` and `series_id`) | runs as written, unpaged |
 | an `ORDER BY` term that is a `count(...)`, such as `count(*)`, `count(DISTINCT x)`, a count with `FILTER`, `-count(*)` or `count(*) OVER ()`, through an alias or written as the expression a projected column is defined as | runs, paged over page one's segment set |
-| any other `ORDER BY` term computed from rows other than its own: an aggregate such as `sum(value)` or `avg(value)`, a window function such as `row_number() OVER (...)`, a count over a `ROWS` frame or a named window, or a subquery, whether ordered by directly or through an alias | runs as written, unpaged |
+| an `ORDER BY` term that is a `min(col)` or `max(col)` under a plain `GROUP BY`, where `col` is a NOT NULL column of the table of a signed or unsigned integer, string or nanosecond timestamp type with no time zone, such as `max(ts)` on `samples` or `max(severity_num)` on `logs`, through an alias or written as the expression a projected column is defined as | runs, paged over page one's segment set |
+| any other `ORDER BY` term computed from rows other than its own: an aggregate such as `sum(value)`, `avg(value)`, `min(value)` or `min(series_id)`, a `min` or `max` with `FILTER` or `OVER`, or under `ROLLUP`, `CUBE`, `GROUPING SETS` or no `GROUP BY`, a window function such as `row_number() OVER (...)`, a count over a `ROWS` frame or a named window, or a subquery, whether ordered by directly or through an alias | runs as written, unpaged |
 | any other `SELECT` over one table | runs, paged |
 
 A float `ORDER BY` term is refused because a NaN or infinite value has no
@@ -535,11 +536,24 @@ erasure rewrite that changes the segments the window reads ends the walk.
 A commit whose rows fall outside `time_range` does not, so a `time_range`
 that ends before the most recent ingest pages stably.
 
-A `count(...)` term pages this way because a count is not NULL. Any other
-such term is not proven non-null, so the statement runs once, in its own
-order, and a capped result ends `ok_bounded` with no cursor. To page it,
-order by a `count(...)` or by the row's own non-null columns, such as a
-grouping column.
+A `count(...)` term pages this way because a count is not NULL. A `min` or
+`max` term pages this way when the planner proves it is not NULL: under a
+plain `GROUP BY` every group has at least one row, so the extreme of a NOT
+NULL column is a value of that column, of the column's type. The argument
+is read from the table, never from the projection, so `max(ts)` beside
+`value AS ts` is the maximum of the table's `ts`. Float, Boolean and binary
+columns are not on the list, and neither is `samples`' `series_id`, so
+`min(series_id)` runs unpaged. Any other such term is not proven non-null,
+so the statement runs once, in its own order, and a capped result ends
+`ok_bounded` with no cursor. To page it, order by a `count(...)`, by a
+`min(col)` or `max(col)` the planner proves, or by the row's own non-null
+columns, such as a grouping column.
+
+Before it mints a cursor, the tool checks the page's last order values
+against the plan the page ran under, the same check a later page's resume
+position must pass. A last row whose values the plan would refuse ends the
+page `ok_bounded` with a `narrow_time_range` next step instead of minting a
+cursor that cannot be redeemed.
 
 `time_range` filters rows, not only segments: a row whose timestamp is
 outside the half-open window is not returned, even when its segment
@@ -1204,10 +1218,11 @@ The cursor points at the last complete group. Cursor paging continues.
 An `ORDER BY` term computed from other rows (an aggregate, a window
 function or a subquery) is a position only over fixed rows: a row committed
 after page one can change its value for a row already served. A
-`count(...)` term pages, and every page of its walk is computed over page
-one's segment set or is refused with `cursor_expired`, so within the walk
-a row is not served twice and not skipped. Any other such term carries no
-cursor.
+`count(...)` term pages, and so does a `min(col)` or `max(col)` under a
+plain `GROUP BY` over a NOT NULL integer, string or nanosecond timestamp
+column. Every page of such a walk is computed over page one's segment set
+or is refused with `cursor_expired`, so within the walk a row is not
+served twice and not skipped. Any other such term carries no cursor.
 
 `ravel_search_logs` orders by `(ts, observed_ts)`. That pair is not
 unique, because `logs` rows carry no row identity and ingest is
