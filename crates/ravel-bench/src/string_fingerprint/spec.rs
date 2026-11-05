@@ -1,15 +1,16 @@
-//! The pre-registration file
-//! (`fixtures/string_fingerprint/subjects.toml`): per subject (a corpus and
-//! column), its block geometry, the summary's own parameters, its seen and
-//! unseen predicates with the reason each was chosen, and a band for every
-//! figure the report prints. Mirrors `crate::logbody::spec`'s shape and
-//! validation style.
+//! The pre-registration file (`fixtures/string_fingerprint/subjects.toml`):
+//! per subject (a corpus and column), every run parameter, the workload's
+//! parameters and seed, and for every figure the report can print either a
+//! prediction with its miss band, the reason it is expected absent, or the
+//! reason it cannot be predicted.
 
 use std::collections::{BTreeMap, HashSet};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use super::summary::MIN_GRAM;
+use super::FIGURES;
+use super::summary::{MAX_GRAM, MIN_GRAM};
+use super::workload::WorkloadParams;
 
 /// An inclusive `[low, high]` band.
 pub type Band = [f64; 2];
@@ -21,76 +22,116 @@ pub struct FingerprintSpec {
     pub subject: Vec<SubjectSpec>,
 }
 
+/// What the pre-registration says about one figure.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawExpect", into = "RawExpect")]
+pub enum Expect {
+    /// Reported exactly once, and a miss when outside `band`.
+    Predicted { predict: f64, band: Band },
+    /// Not reported; the string says why.
+    Absent(String),
+    /// Reported exactly once with no band; the string says why no prediction
+    /// could be made.
+    Unpredicted(String),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExpect {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predict: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    band: Option<Band>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    absent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unpredicted: Option<String>,
+}
+
+impl From<Expect> for RawExpect {
+    fn from(e: Expect) -> RawExpect {
+        let mut r = RawExpect {
+            predict: None,
+            band: None,
+            absent: None,
+            unpredicted: None,
+        };
+        match e {
+            Expect::Predicted { predict, band } => {
+                r.predict = Some(predict);
+                r.band = Some(band);
+            }
+            Expect::Absent(why) => r.absent = Some(why),
+            Expect::Unpredicted(why) => r.unpredicted = Some(why),
+        }
+        r
+    }
+}
+
+impl TryFrom<RawExpect> for Expect {
+    type Error = String;
+
+    fn try_from(r: RawExpect) -> Result<Expect, String> {
+        let reason = |s: String, what: &str| {
+            if s.trim().is_empty() {
+                Err(format!("{what} needs a reason"))
+            } else {
+                Ok(s)
+            }
+        };
+        match (r.predict, r.band, r.absent, r.unpredicted) {
+            (Some(predict), Some(band), None, None) => {
+                if !(band[0].is_finite() && band[1].is_finite() && band[0] <= band[1]) {
+                    return Err(format!("band {band:?} is not a finite low <= high"));
+                }
+                if !(band[0] <= predict && predict <= band[1]) {
+                    return Err(format!("prediction {predict} is outside its band {band:?}"));
+                }
+                Ok(Expect::Predicted { predict, band })
+            }
+            (None, None, Some(a), None) => Ok(Expect::Absent(reason(a, "absent")?)),
+            (None, None, None, Some(u)) => Ok(Expect::Unpredicted(reason(u, "unpredicted")?)),
+            _ => {
+                Err("a figure takes exactly one of {predict, band}, {absent}, {unpredicted}".into())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubjectSpec {
     pub name: String,
-    /// Display name of the source corpus (e.g. "HDFS", "ClickBench hits").
+    /// Display name of the source corpus (e.g. "LogHub HDFS").
     pub corpus: String,
-    /// Where the corpus comes from (URL or recipe reference).
+    /// Where the corpus comes from (URL and file).
     pub source: String,
-    /// The attribute column every subject's values are written and read
-    /// back under. Every subject, log body included, is written as a
-    /// declared `Str` attribute (never the record body) so the production
-    /// `Equals` and `Contains` baselines, which both resolve through a
-    /// named `FIELD_DIR` column, apply uniformly across every subject (see
-    /// the module doc for why `Predicate::Contains` cannot target the
-    /// body field directly).
+    /// The `Str` attribute every value is written and read back under.
     pub column: String,
-    /// `--block-records` the run must use.
     pub block_records: usize,
-    /// The summary's own `gram_len` the run must use.
+    pub object_records: usize,
+    /// Values read from the corpus; the corpus must hold at least this many.
+    pub max_lines: u64,
+    pub zstd_level: i32,
     pub gram_len: usize,
-    /// The summary's own `df_threshold` the run must use.
-    pub df_threshold: f64,
-    /// The summary's own `budget_share` the run must use.
     pub budget_share: f64,
-    pub bands: SubjectBands,
-    pub seen: Vec<PredicateSpec>,
-    pub unseen: Vec<PredicateSpec>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Kind {
-    Equals,
-    Like,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PredicateSpec {
-    pub id: String,
-    pub kind: Kind,
-    pub literal: String,
-    pub reason: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubjectBands {
-    pub lines: Band,
-    pub blocks: Band,
-    pub compressed_bytes: Band,
-    pub zstd_cpu_s: Band,
-    pub build_cpu_over_zstd: Band,
-    pub summary_bytes_share: Band,
-    pub seen_equals_false_positive_share: Band,
-    pub seen_like_false_positive_share: Band,
-    pub unseen_equals_false_positive_share: Band,
-    pub unseen_like_false_positive_share: Band,
-    pub bloom_equals_blocks_kept_share: Band,
-    pub contains_like_cells_tested_share: Band,
-    pub saturation_false_positive_share: Band,
+    pub fallback_min_bits: usize,
+    pub seed: u64,
+    pub literals_per_kind: usize,
+    pub eq_max_len: usize,
+    pub like_min_len: usize,
+    pub like_max_len: usize,
+    /// Keyed by figure suffix (the key without `name/`).
+    pub figures: BTreeMap<String, Expect>,
 }
 
 /// Parses and validates a pre-registration file.
 pub fn parse(text: &str) -> Result<FingerprintSpec, String> {
     let spec: FingerprintSpec =
         toml::from_str(text).map_err(|e| format!("string fingerprint subjects: {e}"))?;
-    if spec.schema != 1 {
+    if spec.schema != 2 {
         return Err(format!(
-            "string fingerprint subjects: schema {} is not 1",
+            "string fingerprint subjects: schema {} is not 2",
             spec.schema
         ));
     }
@@ -116,16 +157,15 @@ impl FingerprintSpec {
 impl SubjectSpec {
     fn validate(&self) -> Result<(), String> {
         let at = |m: String| format!("string fingerprint subjects: subject {}: {m}", self.name);
-        if self.block_records == 0 {
-            return Err(at("block_records is 0".into()));
+        if self.block_records == 0 || self.object_records == 0 || self.max_lines == 0 {
+            return Err(at(
+                "block_records, object_records and max_lines must be nonzero".into(),
+            ));
         }
-        if !(MIN_GRAM..=32).contains(&self.gram_len) {
-            return Err(at(format!("gram_len {} is not in 3..=32", self.gram_len)));
-        }
-        if !(self.df_threshold > 0.0 && self.df_threshold <= 1.0) {
+        if !(MIN_GRAM..=MAX_GRAM).contains(&self.gram_len) {
             return Err(at(format!(
-                "df_threshold {} is not in (0, 1]",
-                self.df_threshold
+                "gram_len {} is not in {MIN_GRAM}..={MAX_GRAM}",
+                self.gram_len
             )));
         }
         if !(self.budget_share > 0.0 && self.budget_share <= 1.0) {
@@ -134,116 +174,72 @@ impl SubjectSpec {
                 self.budget_share
             )));
         }
+        if self.fallback_min_bits == 0 {
+            return Err(at("fallback_min_bits is 0".into()));
+        }
+        if self.literals_per_kind == 0 || !self.literals_per_kind.is_multiple_of(2) {
+            return Err(at(format!(
+                "literals_per_kind {} is not a positive even number",
+                self.literals_per_kind
+            )));
+        }
+        if !(self.gram_len <= self.like_min_len && self.like_min_len <= self.like_max_len)
+            || self.eq_max_len < self.gram_len
+        {
+            return Err(at(
+                "need gram_len <= like_min_len <= like_max_len and gram_len <= eq_max_len".into(),
+            ));
+        }
         if self.column.trim().is_empty() {
             return Err(at("column is empty".into()));
         }
-        for (group, preds) in [("seen", &self.seen), ("unseen", &self.unseen)] {
-            let mut ids = HashSet::new();
-            for p in preds {
-                if !ids.insert(p.id.as_str()) {
-                    return Err(at(format!("{group} predicate id {:?} is repeated", p.id)));
-                }
-                if p.reason.trim().is_empty() {
-                    return Err(at(format!("{group} predicate {} has no reason", p.id)));
-                }
-                if p.literal.is_empty() {
-                    return Err(at(format!(
-                        "{group} predicate {} has an empty literal",
-                        p.id
-                    )));
-                }
-            }
-            for kind in [Kind::Equals, Kind::Like] {
-                if !preds.iter().any(|p| p.kind == kind) {
-                    return Err(at(format!("no {group} predicate of kind {kind:?}")));
-                }
-            }
-        }
-        // Seen and unseen must be disjoint, within a kind: an unseen literal
-        // that is also a seen one (of the same kind) is not actually unseen,
-        // and the figures it feeds would silently stop measuring
-        // generalization.
-        for kind in [Kind::Equals, Kind::Like] {
-            let seen_literals: HashSet<&str> = self
-                .seen
-                .iter()
-                .filter(|p| p.kind == kind)
-                .map(|p| p.literal.as_str())
-                .collect();
-            for p in self.unseen.iter().filter(|p| p.kind == kind) {
-                if seen_literals.contains(p.literal.as_str()) {
-                    return Err(at(format!(
-                        "unseen predicate {} ({:?}) repeats a seen literal",
-                        p.id, kind
-                    )));
-                }
-            }
-        }
-        for (key, b) in self.bands() {
-            if !(b[0].is_finite() && b[1].is_finite() && b[0] <= b[1]) {
-                return Err(at(format!(
-                    "band {key} = {b:?} is not a finite low <= high"
-                )));
-            }
+        let want: HashSet<&str> = FIGURES.iter().copied().collect();
+        let have: HashSet<&str> = self.figures.keys().map(String::as_str).collect();
+        let mut missing: Vec<&str> = want.difference(&have).copied().collect();
+        let mut unknown: Vec<&str> = have.difference(&want).copied().collect();
+        if !missing.is_empty() || !unknown.is_empty() {
+            missing.sort_unstable();
+            unknown.sort_unstable();
+            return Err(at(format!(
+                "figures must name every reported figure exactly: missing {missing:?}, unknown {unknown:?}"
+            )));
         }
         Ok(())
     }
 
-    /// Every band of this subject, keyed like the figures.
-    pub fn bands(&self) -> BTreeMap<String, Band> {
-        let s = &self.name;
-        let b = &self.bands;
-        let mut out = BTreeMap::new();
-        for (k, v) in [
-            ("lines", b.lines),
-            ("blocks", b.blocks),
-            ("compressed_bytes", b.compressed_bytes),
-            ("zstd_cpu_s", b.zstd_cpu_s),
-            ("build_cpu_over_zstd", b.build_cpu_over_zstd),
-            ("summary_bytes_share", b.summary_bytes_share),
-            (
-                "seen/equals/false_positive_share",
-                b.seen_equals_false_positive_share,
-            ),
-            (
-                "seen/like/false_positive_share",
-                b.seen_like_false_positive_share,
-            ),
-            (
-                "unseen/equals/false_positive_share",
-                b.unseen_equals_false_positive_share,
-            ),
-            (
-                "unseen/like/false_positive_share",
-                b.unseen_like_false_positive_share,
-            ),
-            (
-                "bloom/equals/blocks_kept_share",
-                b.bloom_equals_blocks_kept_share,
-            ),
-            (
-                "contains/like/cells_tested_share",
-                b.contains_like_cells_tested_share,
-            ),
-            (
-                "saturation/false_positive_share",
-                b.saturation_false_positive_share,
-            ),
-        ] {
-            out.insert(format!("{s}/{k}"), v);
+    /// Every figure's expectation, keyed like the reported figures.
+    pub fn expectations(&self) -> BTreeMap<String, Expect> {
+        self.figures
+            .iter()
+            .map(|(k, v)| (format!("{}/{k}", self.name), v.clone()))
+            .collect()
+    }
+
+    pub fn workload_params(&self) -> WorkloadParams {
+        WorkloadParams {
+            seed: self.seed,
+            literals_per_kind: self.literals_per_kind,
+            gram_len: self.gram_len,
+            eq_max_len: self.eq_max_len,
+            like_min_len: self.like_min_len,
+            like_max_len: self.like_max_len,
         }
-        out
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 
     fn minimal_toml() -> String {
-        r#"
-schema = 1
+        let mut figures = String::new();
+        for f in FIGURES {
+            figures.push_str(&format!("\"{f}\" = {{ unpredicted = \"test\" }}\n"));
+        }
+        format!(
+            r#"
+schema = 2
 
 [[subject]]
 name = "s1"
@@ -251,117 +247,86 @@ corpus = "test"
 source = "inline"
 column = "value"
 block_records = 4
+object_records = 8
+max_lines = 16
+zstd_level = 3
 gram_len = 3
-df_threshold = 0.5
 budget_share = 0.5
+fallback_min_bits = 64
+seed = 1
+literals_per_kind = 4
+eq_max_len = 64
+like_min_len = 4
+like_max_len = 10
 
-[subject.bands]
-lines = [0, 1000]
-blocks = [0, 100]
-compressed_bytes = [0, 100000]
-zstd_cpu_s = [0, 1]
-build_cpu_over_zstd = [0, 10]
-summary_bytes_share = [0, 0.01]
-seen_equals_false_positive_share = [0, 0.1]
-seen_like_false_positive_share = [0, 0.1]
-unseen_equals_false_positive_share = [0, 1]
-unseen_like_false_positive_share = [0, 0.1]
-bloom_equals_blocks_kept_share = [0, 1]
-contains_like_cells_tested_share = [0, 1]
-saturation_false_positive_share = [0, 0.3]
-
-[[subject.seen]]
-id = "e1"
-kind = "equals"
-literal = "needle"
-reason = "test"
-
-[[subject.seen]]
-id = "l1"
-kind = "like"
-literal = "stack"
-reason = "test"
-
-[[subject.unseen]]
-id = "e2"
-kind = "equals"
-literal = "other"
-reason = "test"
-
-[[subject.unseen]]
-id = "l2"
-kind = "like"
-literal = "trace"
-reason = "test"
-"#
-        .to_string()
+[subject.figures]
+{figures}"#
+        )
     }
 
     #[test]
     fn parses_a_minimal_valid_spec() {
         let spec = parse(&minimal_toml()).expect("valid");
         assert_eq!(spec.subject.len(), 1);
-        assert!(spec.subject("s1").is_some());
+        let s = spec.subject("s1").expect("s1");
+        assert_eq!(s.expectations().len(), FIGURES.len());
     }
 
     #[test]
     fn refuses_wrong_schema() {
-        let bad = minimal_toml().replace("schema = 1", "schema = 2");
+        let bad = minimal_toml().replace("schema = 2", "schema = 1");
         assert!(parse(&bad).is_err());
     }
 
     #[test]
     fn refuses_duplicate_subject_names() {
         let one = minimal_toml();
-        let (_, second_subject) = one.split_once("[[subject]]").expect("one subject block");
-        let doubled = format!("{one}\n[[subject]]{second_subject}");
-        let err = parse(&doubled).unwrap_err();
+        let (_, second) = one.split_once("[[subject]]").expect("one subject");
+        let err = parse(&format!("{one}\n[[subject]]{second}")).unwrap_err();
         assert!(err.contains("twice"), "{err}");
     }
 
     #[test]
-    fn refuses_unseen_literal_repeating_a_seen_one() {
-        let bad = minimal_toml().replace("literal = \"other\"", "literal = \"needle\"");
-        let err = parse(&bad).unwrap_err();
-        assert!(err.contains("repeats a seen literal"), "{err}");
+    fn refuses_a_missing_or_unknown_figure() {
+        let missing = minimal_toml().replace("\"lines\" = { unpredicted = \"test\" }\n", "");
+        let err = parse(&missing).unwrap_err();
+        assert!(err.contains("missing [\"lines\"]"), "{err}");
+        let unknown = format!("{}\"nope\" = {{ unpredicted = \"x\" }}\n", minimal_toml());
+        let err = parse(&unknown).unwrap_err();
+        assert!(err.contains("unknown [\"nope\"]"), "{err}");
     }
 
     #[test]
-    fn refuses_missing_predicate_kind() {
+    fn refuses_a_prediction_outside_its_band() {
         let bad = minimal_toml().replace(
-            r#"[[subject.unseen]]
-id = "l2"
-kind = "like"
-literal = "trace"
-reason = "test"
-"#,
-            "",
+            "\"lines\" = { unpredicted = \"test\" }",
+            "\"lines\" = { predict = 20, band = [0, 16] }",
         );
         let err = parse(&bad).unwrap_err();
-        assert!(err.contains("no unseen predicate of kind Like"), "{err}");
+        assert!(err.contains("outside its band"), "{err}");
     }
 
     #[test]
-    fn refuses_empty_reason() {
-        let bad = minimal_toml().replacen(
-            "id = \"e1\"\nkind = \"equals\"\nliteral = \"needle\"\nreason = \"test\"",
-            "id = \"e1\"\nkind = \"equals\"\nliteral = \"needle\"\nreason = \"   \"",
-            1,
+    fn refuses_a_figure_with_two_forms_or_no_reason() {
+        let two = minimal_toml().replace(
+            "\"lines\" = { unpredicted = \"test\" }",
+            "\"lines\" = { predict = 1, band = [0, 2], absent = \"x\" }",
         );
-        let err = parse(&bad).unwrap_err();
-        assert!(err.contains("has no reason"), "{err}");
+        assert!(parse(&two).unwrap_err().contains("exactly one"));
+        let empty = minimal_toml().replace(
+            "\"lines\" = { unpredicted = \"test\" }",
+            "\"lines\" = { absent = \" \" }",
+        );
+        assert!(parse(&empty).unwrap_err().contains("needs a reason"));
     }
 
     #[test]
-    fn refuses_out_of_range_band() {
-        let bad = minimal_toml().replace("zstd_cpu_s = [0, 1]", "zstd_cpu_s = [1, 0]");
-        let err = parse(&bad).unwrap_err();
-        assert!(err.contains("is not a finite low <= high"), "{err}");
-    }
-
-    #[test]
-    fn refuses_bad_gram_len() {
-        let bad = minimal_toml().replace("gram_len = 3", "gram_len = 1");
-        assert!(parse(&bad).is_err());
+    fn refuses_bad_workload_parameters() {
+        let odd = minimal_toml().replace("literals_per_kind = 4", "literals_per_kind = 3");
+        assert!(parse(&odd).is_err());
+        let short = minimal_toml().replace("like_min_len = 4", "like_min_len = 2");
+        assert!(parse(&short).is_err());
+        let gram = minimal_toml().replace("gram_len = 3", "gram_len = 2");
+        assert!(parse(&gram).is_err());
     }
 }

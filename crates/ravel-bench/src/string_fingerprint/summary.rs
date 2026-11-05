@@ -1,463 +1,575 @@
-//! The per-block learned string summary (issue #3710, ADR-3692 Plan row T12):
-//! a shared vocabulary of features selected from a *seen* predicate workload,
-//! with each block storing its own fixed-size bitset over that vocabulary.
+//! The per-block string summary (issue #3710, ADR-3692 Plan row T12).
 //!
-//! This is a different shape than the REI arm's
-//! [`crate::logbody::grams::GramIndex`] (issue #3709): `GramIndex` is one
-//! shared postings list, gram to the blocks holding it, built once over a
-//! corpus. Here every block's summary is a bitset over the shared vocabulary
-//! and nothing else; a query is answered from one block's bits alone, with no
-//! cross-block structure to consult. That is the "genuinely per-block
-//! self-contained" shape issue #3710 asks for, as opposed to a shared index
-//! wearing a per-block label.
+//! Every value of a block is cut into byte grams of a fixed length
+//! (`gram_len`), and every possible gram maps to exactly one bit of a block's
+//! bitset:
 //!
-//! Two kinds of query, two kinds of feature:
+//! - a **learned** gram, one chosen from the training workload, owns a bit of
+//!   its own (bits `0..learned`);
+//! - every other gram hashes into a shared **fallback** region (bits
+//!   `learned..learned + fallback`).
 //!
-//! - **Equality** (`col = 'literal'`): the feature is the whole literal
-//!   value. A block's bit is set iff the block holds a value byte-equal to
-//!   it. The vocabulary only ever contains literals drawn from the seen
-//!   workload (an equality fingerprint has no way to generalize to a value it
-//!   has never been told about): a query literal outside the vocabulary
-//!   always survives, unconditionally.
-//! - **`LIKE '%literal%'`**: the literal is decomposed into fixed-length
-//!   byte grams ([`decompose`]); the feature is one gram. A block's bit is
-//!   set iff some value in the block contains that gram as a byte substring.
-//!   A query literal survives unless every one of its grams is both in the
-//!   vocabulary and set in the block's bits; a query whose grams happen to
-//!   all appear in vocabulary entries built from *other*, seen literals can
-//!   still be pruned, which is the generalization the hypothesis (and this
-//!   whole report) is testing.
+//! A block's summary sets the bit of every gram of every value it holds. A
+//! literal is pruned on a block when ANY of its grams maps to a bit that is
+//! clear in that block's summary ([`survives`]). A block holding a value
+//! equal to, or containing, the literal holds every gram of the literal, so
+//! every one of those bits is set: no false negative, for any learned set and
+//! any fallback size. Equality uses the same test, since a value equal to a
+//! literal contains it. A literal shorter than `gram_len` has no gram and is
+//! never pruned.
 //!
-//! Conservativeness does not depend on which features made it into the
-//! vocabulary: [`BlockSummary::build`] only ever sets a bit when it finds the
-//! feature truly present in that block's own values, and every query falls
-//! back to "survives" the moment it meets a feature the vocabulary does not
-//! have. So for *any* vocabulary (not just the one [`Vocabulary::build`]
-//! would have chosen), a block that truly holds a matching value is never
-//! pruned. [`tests::conservative_for_any_vocabulary`] states that property
-//! directly over randomized blocks, vocabularies and literals.
+//! Relation to arXiv:2507.10391 ("Instance-Optimized String Fingerprints"):
+//! the paper keeps one fixed-width fingerprint per row, partitions the
+//! alphabet of single characters into bins (one bit per bin), and picks the
+//! partition by mixed-integer optimization over a seen workload; an unseen
+//! pattern is tested against the same partition, and the subset test makes
+//! that sound. This summary keeps the subset test and the
+//! partition-of-the-universe shape (each learned gram is a bin of one, the
+//! hash partitions every other gram into `fallback` bins), and departs from
+//! the paper in three ways: one bitset per RLOG block instead of per row,
+//! grams of `gram_len` bytes instead of single characters, and a greedy
+//! benefit rank ([`build`]) instead of a solver.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashMap};
 
-/// The shortest gram a `LIKE` feature is built from. Below this a substring
-/// index has no selectivity worth the bit it costs (mirrors
-/// [`crate::logbody::grams::MIN_GRAM`]).
+/// The shortest gram this summary is built from.
 pub const MIN_GRAM: usize = 3;
+/// The longest gram: a gram is packed into a `u64` key.
+pub const MAX_GRAM: usize = 8;
 
-/// One vocabulary entry: an equality literal or a `LIKE` gram. Order is the
-/// bit index into every [`BlockSummary`] built against the enclosing
-/// [`Vocabulary`].
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Feature {
-    Equals(Vec<u8>),
-    Gram(Vec<u8>),
-}
+/// How [`Built::summary_bytes`] counts.
+pub const LAYOUT_BYTES: &str = "summary_bytes = blocks * ceil(bits_per_block / 8) + \
+learned_bits * gram_len (the shared table of learned grams, each stored as its raw bytes)";
 
-/// The summary's own parameters: pre-registered per subject, never inferred
-/// at run time.
+/// The summary's own parameters, pre-registered per subject.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
-    /// The fixed gram length `LIKE` literals are decomposed into.
     pub gram_len: usize,
-    /// A candidate gram is dropped when more than this share of blocks
-    /// contain it: a near-universal gram buys no pruning and only spends
-    /// budget.
-    pub df_threshold: f64,
-    /// The vocabulary's serialized byte cap, as a share of the column's
-    /// compressed bytes. Candidates are dropped rarest-kept-first, i.e. the
-    /// highest-document-frequency survivors are dropped first, until the
-    /// vocabulary fits.
+    /// The byte budget as a share of the column's compressed bytes: every
+    /// block's bitset plus the shared learned-gram table.
     pub budget_share: f64,
+    /// The fewest fallback bits a block's bitset may have. Grams are learned
+    /// only while this many fallback bits still fit the budget; every bit the
+    /// budget leaves over goes to the fallback region.
+    pub fallback_min_bits: usize,
 }
 
-/// Splits `literal` into the grams a `LIKE` query or a vocabulary build tests:
-/// non-overlapping information is not required, so this is the plain sliding
-/// window of `gram_len` bytes; a literal shorter than `gram_len` is its own
-/// single (short) gram, exactly like [`crate::logbody::grams::Pattern`]'s
-/// literal runs are tested whole when they do not reach a gram length.
-pub fn decompose(literal: &[u8], gram_len: usize) -> Vec<Vec<u8>> {
-    if literal.is_empty() {
-        return Vec::new();
+fn gram_mask(gram_len: usize) -> u64 {
+    if gram_len >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (8 * gram_len)) - 1
     }
-    if literal.len() <= gram_len {
-        return vec![literal.to_vec()];
+}
+
+/// Calls `f` with the packed key of every `gram_len`-byte window of `bytes`.
+pub fn for_each_gram(bytes: &[u8], gram_len: usize, mut f: impl FnMut(u64)) {
+    if gram_len == 0 || bytes.len() < gram_len {
+        return;
     }
-    literal.windows(gram_len).map(|w| w.to_vec()).collect()
-}
-
-fn contains(value: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    value.windows(needle.len()).any(|w| w == needle)
-}
-
-/// The shared feature set, built once per subject from the seen workload and
-/// the corpus's real per-block values.
-#[derive(Clone, Debug, Default)]
-pub struct Vocabulary {
-    /// Bit order. Sorted so two builds over the same inputs agree byte for
-    /// byte, which [`tests::vocabulary_build_is_deterministic`] pins.
-    features: Vec<Feature>,
-}
-
-/// What a candidate gram cost to evaluate, for the budget cut.
-struct Candidate {
-    feature: Feature,
-    df_blocks: usize,
-}
-
-impl Vocabulary {
-    /// Builds the vocabulary from the seen equality literals and seen `LIKE`
-    /// literals only: an unseen literal and every one of its grams are never
-    /// candidates, by construction, which is what makes the unseen-predicate
-    /// figures an honest test of generalization rather than a vocabulary
-    /// that was quietly handed the answer.
-    ///
-    /// `blocks` are the corpus's real per-block column values, read back
-    /// through the production block cuts (never a naive re-chunking): a
-    /// candidate's document frequency and a block's bits must agree on what
-    /// "the same block" means.
-    pub fn build(
-        seen_equals: &[Vec<u8>],
-        seen_like: &[Vec<u8>],
-        blocks: &[Vec<Vec<u8>>],
-        params: &Params,
-        compressed_bytes: u64,
-    ) -> Vocabulary {
-        let n_blocks = blocks.len().max(1);
-        let mut equals: BTreeSet<Vec<u8>> = BTreeSet::new();
-        for lit in seen_equals {
-            equals.insert(lit.clone());
+    let mask = gram_mask(gram_len);
+    let mut key = 0u64;
+    for (i, &b) in bytes.iter().enumerate() {
+        key = ((key << 8) | u64::from(b)) & mask;
+        if i + 1 >= gram_len {
+            f(key);
         }
+    }
+}
 
-        let mut grams: BTreeSet<Vec<u8>> = BTreeSet::new();
-        for lit in seen_like {
-            for g in decompose(lit, params.gram_len) {
-                grams.insert(g);
+/// The fallback bit, as an offset into the fallback region, a gram hashes to.
+pub fn fallback_slot(key: u64, fallback_bits: usize) -> usize {
+    let h = (key ^ 0x517c_c1b7_2722_0a95).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (((h >> 32) * fallback_bits as u64) >> 32) as usize
+}
+
+/// Which bit every gram maps to: the learned grams, sorted (bit `i` belongs
+/// to `learned[i]`), then `fallback_bits` hashed bits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub gram_len: usize,
+    pub learned: Vec<u64>,
+    pub fallback_bits: usize,
+}
+
+impl Layout {
+    pub fn bits_per_block(&self) -> usize {
+        self.learned.len() + self.fallback_bits
+    }
+
+    pub fn bit_of(&self, key: u64) -> usize {
+        match self.learned.binary_search(&key) {
+            Ok(i) => i,
+            Err(_) => self.learned.len() + fallback_slot(key, self.fallback_bits),
+        }
+    }
+
+    /// The bits `literal`'s grams map to; empty when it is shorter than a gram.
+    pub fn literal_bits(&self, literal: &[u8]) -> Vec<usize> {
+        let mut out = Vec::new();
+        for_each_gram(literal, self.gram_len, |k| out.push(self.bit_of(k)));
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Bytes shared by every block: the learned grams, `gram_len` bytes each.
+    pub fn shared_bytes(&self) -> u64 {
+        (self.learned.len() * self.gram_len) as u64
+    }
+
+    /// Bytes one block's bitset takes.
+    pub fn block_bytes(&self) -> u64 {
+        self.bits_per_block().div_ceil(8) as u64
+    }
+}
+
+/// Membership and index lookup over a set of gram keys. 3-byte grams test a
+/// dense 2^24-bit table first, so a gram outside the set costs one bit read.
+struct KeySet {
+    dense: Option<Vec<u64>>,
+    index: HashMap<u64, u32>,
+}
+
+impl KeySet {
+    fn new(keys: &[u64], gram_len: usize) -> KeySet {
+        let dense = (gram_len == 3).then(|| {
+            let mut bits = vec![0u64; (1 << 24) / 64];
+            for &k in keys {
+                if let Some(w) = bits.get_mut((k >> 6) as usize) {
+                    *w |= 1 << (k & 63);
+                }
             }
-        }
-
-        // Document frequency rule: drop a gram held by more than
-        // `df_threshold` of blocks. Equality literals keep no such rule --
-        // the workload named them explicitly and there are never enough of
-        // them to need a cut on frequency alone.
-        let mut candidates: Vec<Candidate> = Vec::new();
-        for lit in &equals {
-            candidates.push(Candidate {
-                feature: Feature::Equals(lit.clone()),
-                df_blocks: blocks.iter().filter(|b| b.iter().any(|v| v == lit)).count(),
-            });
-        }
-        for g in &grams {
-            let df = blocks
-                .iter()
-                .filter(|b| b.iter().any(|v| contains(v, g)))
-                .count();
-            if (df as f64) / (n_blocks as f64) <= params.df_threshold {
-                candidates.push(Candidate {
-                    feature: Feature::Gram(g.clone()),
-                    df_blocks: df,
-                });
-            }
-        }
-
-        // Budget cut: rarest first (lowest document frequency buys the most
-        // selectivity per bit); a feature whose own bytes alone would push
-        // the vocabulary over the cap is dropped and the next cheaper one is
-        // tried, mirroring GramIndex's rarest-first-under-budget rule
-        // (crate::logbody::grams).
-        candidates.sort_by(|a, b| {
-            a.df_blocks
-                .cmp(&b.df_blocks)
-                .then_with(|| a.feature.cmp(&b.feature))
+            bits
         });
-        let cap_bytes = (params.budget_share * compressed_bytes as f64)
-            .floor()
-            .max(0.0) as u64;
-        let mut features = Vec::new();
-        let mut bytes_used: u64 = 0;
-        for c in candidates {
-            let cost = feature_bytes(&c.feature);
-            if bytes_used + cost > cap_bytes {
-                continue;
-            }
-            bytes_used += cost;
-            features.push(c.feature);
-        }
-        features.sort();
-        Vocabulary { features }
-    }
-
-    pub fn feature_index(&self, f: &Feature) -> Option<usize> {
-        self.features.binary_search(f).ok()
-    }
-
-    pub fn len(&self) -> usize {
-        self.features.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.features.is_empty()
-    }
-
-    /// The vocabulary's own encoded size: a length-prefixed byte string per
-    /// feature plus a one-byte kind tag, the layout [`FEATURE_LAYOUT`]
-    /// states. This is reported alongside, never instead of, the per-block
-    /// bitset bytes that [`BlockSummary::bytes`] sums: both make up
-    /// `summary_bytes` in the report.
-    pub fn bytes(&self) -> usize {
-        self.features
+        let index = keys
             .iter()
-            .map(|f| {
-                let lit = match f {
-                    Feature::Equals(l) | Feature::Gram(l) => l,
-                };
-                1 + 4 + lit.len()
-            })
-            .sum()
+            .enumerate()
+            .map(|(i, &k)| (k, i as u32))
+            .collect();
+        KeySet { dense, index }
+    }
+
+    fn get(&self, key: u64) -> Option<usize> {
+        if let Some(d) = &self.dense
+            && d.get((key >> 6) as usize)
+                .is_none_or(|w| w & (1 << (key & 63)) == 0)
+        {
+            return None;
+        }
+        self.index.get(&key).map(|&i| i as usize)
     }
 }
 
-fn feature_bytes(f: &Feature) -> u64 {
-    let lit = match f {
-        Feature::Equals(l) | Feature::Gram(l) => l,
-    };
-    (1 + 4 + lit.len()) as u64
-}
-
-pub const FEATURE_LAYOUT: &str = "per vocabulary feature, a one-byte kind tag (0 = equals literal, \
-1 = like gram), a little-endian u32 byte length, then the literal bytes; summary_bytes is this plus, \
-per block, ceil(vocabulary_len / 8) bitset bytes.";
-
-/// One block's bitset over a [`Vocabulary`]: bit `i` is set iff this block's
-/// own real values truly contain feature `i` (equals: byte-equal; gram: byte
-/// substring). This is the only place a bit is ever set, which is what makes
-/// the summary sound regardless of how the vocabulary was chosen.
-#[derive(Clone, Debug)]
+/// One block's bitset over a [`Layout`].
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockSummary {
-    bits: Vec<u8>,
+    words: Vec<u64>,
 }
 
 impl BlockSummary {
-    pub fn build(values: &[Vec<u8>], vocab: &Vocabulary) -> BlockSummary {
-        let mut bits = vec![0u8; vocab.len().div_ceil(8)];
-        for (i, f) in vocab.features.iter().enumerate() {
-            let hit = match f {
-                Feature::Equals(lit) => values.iter().any(|v| v == lit),
-                Feature::Gram(g) => values.iter().any(|v| contains(v, g)),
-            };
-            if hit {
-                bits[i / 8] |= 1 << (i % 8);
-            }
+    fn empty(bits: usize) -> BlockSummary {
+        BlockSummary {
+            words: vec![0u64; bits.div_ceil(64)],
         }
-        BlockSummary { bits }
     }
 
-    fn bit(&self, i: usize) -> bool {
-        self.bits
-            .get(i / 8)
-            .is_some_and(|byte| byte & (1 << (i % 8)) != 0)
+    fn set(&mut self, i: usize) {
+        if let Some(w) = self.words.get_mut(i / 64) {
+            *w |= 1 << (i % 64);
+        }
     }
 
-    pub fn bytes(&self) -> usize {
-        self.bits.len()
+    pub fn bit(&self, i: usize) -> bool {
+        self.words
+            .get(i / 64)
+            .is_some_and(|w| w & (1 << (i % 64)) != 0)
+    }
+
+    /// Builds one block's bitset against an existing layout. [`build`] uses
+    /// the same code for every block it learns from.
+    pub fn build(values: &[Vec<u8>], layout: &Layout) -> BlockSummary {
+        Builder::new(layout).block(values)
+    }
+
+    /// The share of the fallback region's bits that are set.
+    pub fn fallback_density(&self, layout: &Layout) -> f64 {
+        if layout.fallback_bits == 0 {
+            return 0.0;
+        }
+        let k = layout.learned.len();
+        let set = (k..k + layout.fallback_bits)
+            .filter(|&i| self.bit(i))
+            .count();
+        set as f64 / layout.fallback_bits as f64
     }
 }
 
-/// Whether `block` (its summary, over `vocab`) may hold a value exactly equal
-/// to `literal`: `false` only when `literal` is in the vocabulary and the
-/// block's bit for it is clear, which [`BlockSummary::build`] only ever does
-/// when the block's own values truly never equal it.
-pub fn survives_equals(summary: &BlockSummary, vocab: &Vocabulary, literal: &[u8]) -> bool {
-    match vocab.feature_index(&Feature::Equals(literal.to_vec())) {
-        Some(i) => summary.bit(i),
-        None => true,
+/// Whether a block may hold the literal whose bits are `bits`
+/// ([`Layout::literal_bits`]): `false` as soon as any bit is clear.
+pub fn survives(summary: &BlockSummary, bits: &[usize]) -> bool {
+    bits.iter().all(|&b| summary.bit(b))
+}
+
+/// Builds block bitsets against one layout, sharing the learned-gram lookup.
+pub struct Builder<'a> {
+    layout: &'a Layout,
+    learned: KeySet,
+}
+
+impl<'a> Builder<'a> {
+    pub fn new(layout: &'a Layout) -> Builder<'a> {
+        Builder {
+            layout,
+            learned: KeySet::new(&layout.learned, layout.gram_len),
+        }
+    }
+
+    pub fn block(&self, values: &[Vec<u8>]) -> BlockSummary {
+        let l = self.layout;
+        let k = l.learned.len();
+        let mut s = BlockSummary::empty(l.bits_per_block());
+        for v in values {
+            for_each_gram(v, l.gram_len, |key| match self.learned.get(key) {
+                Some(i) => s.set(i),
+                None => s.set(k + fallback_slot(key, l.fallback_bits)),
+            });
+        }
+        s
     }
 }
 
-/// Whether `block` (its summary, over `vocab`) may hold a value containing
-/// `literal` as a substring (`LIKE '%literal%'`). Decomposes `literal` into
-/// grams ([`decompose`], at `gram_len`); survives unless every gram is both
-/// in the vocabulary and clear in this block's bits. A gram the vocabulary
-/// never saw always survives, which includes every gram of a literal whose
-/// length is under `gram_len` and was never a seen `LIKE` literal itself.
-pub fn survives_like(
-    summary: &BlockSummary,
-    vocab: &Vocabulary,
-    literal: &[u8],
-    gram_len: usize,
-) -> bool {
-    let grams = decompose(literal, gram_len);
-    if grams.is_empty() {
-        return true;
+/// A built summary over a set of blocks.
+#[derive(Clone, Debug)]
+pub struct Built {
+    pub layout: Layout,
+    pub summaries: Vec<BlockSummary>,
+    /// Distinct grams of the training literals.
+    pub candidates: usize,
+    /// The byte budget the layout was sized to.
+    pub budget_bytes: u64,
+}
+
+impl Built {
+    pub fn summary_bytes(&self) -> u64 {
+        self.summaries.len() as u64 * self.layout.block_bytes() + self.layout.shared_bytes()
     }
-    for g in &grams {
-        match vocab.feature_index(&Feature::Gram(g.clone())) {
-            Some(i) => {
-                if !summary.bit(i) {
-                    return false;
+
+    /// The mean, over blocks, of [`BlockSummary::fallback_density`].
+    pub fn fallback_density(&self) -> f64 {
+        mean_density(&self.summaries, &self.layout)
+    }
+}
+
+/// The mean, over `summaries`, of [`BlockSummary::fallback_density`].
+pub fn mean_density(summaries: &[BlockSummary], layout: &Layout) -> f64 {
+    if summaries.is_empty() {
+        return 0.0;
+    }
+    summaries
+        .iter()
+        .map(|s| s.fallback_density(layout))
+        .sum::<f64>()
+        / summaries.len() as f64
+}
+
+fn cost(blocks: u64, bits: u64, learned: u64, gram_len: u64) -> u64 {
+    blocks * bits.div_ceil(8) + learned * gram_len
+}
+
+/// Learns the layout from `training` (the training literals, both kinds) and
+/// builds every block's bitset: one pass to count, per training gram, the
+/// blocks holding it, then one pass to set the bits.
+///
+/// The candidates are the training literals' distinct grams. A candidate's
+/// benefit is the number of training literals holding it times the number of
+/// blocks lacking it: a learned gram's bit is exact, so it prunes every such
+/// (literal, block) pair, where a hashed bit can be set by a collision.
+/// Candidates with a positive benefit are learned in rank order (ties by key)
+/// while `fallback_min_bits` fallback bits still fit the budget. What the
+/// learned table leaves of the budget is spent on whole bytes of bitset per
+/// block, and every bit past the learned ones is fallback.
+pub fn build(
+    training: &[Vec<u8>],
+    blocks: &[Vec<Vec<u8>>],
+    params: &Params,
+    compressed_bytes: u64,
+) -> Result<Built, String> {
+    let g = params.gram_len;
+    if !(MIN_GRAM..=MAX_GRAM).contains(&g) {
+        return Err(format!("gram_len {g} is not in {MIN_GRAM}..={MAX_GRAM}"));
+    }
+    if params.fallback_min_bits == 0 {
+        return Err("fallback_min_bits is 0".into());
+    }
+    if blocks.is_empty() {
+        return Err("no blocks to summarize".into());
+    }
+    let n = blocks.len() as u64;
+    let budget_bytes = (params.budget_share * compressed_bytes as f64).floor() as u64;
+    let fmin = params.fallback_min_bits;
+    let fits = |k: usize| cost(n, (k + fmin) as u64, k as u64, g as u64) <= budget_bytes;
+    if !fits(0) {
+        return Err(format!(
+            "a budget of {budget_bytes} bytes cannot hold {fmin} fallback bits for {n} blocks"
+        ));
+    }
+
+    let mut literal_count: BTreeMap<u64, u64> = BTreeMap::new();
+    for lit in training {
+        let mut grams = Vec::new();
+        for_each_gram(lit, g, |k| grams.push(k));
+        grams.sort_unstable();
+        grams.dedup();
+        for k in grams {
+            *literal_count.entry(k).or_default() += 1;
+        }
+    }
+    let keys: Vec<u64> = literal_count.keys().copied().collect();
+    let candidates = KeySet::new(&keys, g);
+
+    let mut df = vec![0u64; keys.len()];
+    let mut in_block = vec![false; keys.len()];
+    let mut touched = Vec::new();
+    for values in blocks {
+        for v in values {
+            for_each_gram(v, g, |key| {
+                if let Some(i) = candidates.get(key)
+                    && let Some(seen) = in_block.get_mut(i)
+                    && !*seen
+                {
+                    *seen = true;
+                    touched.push(i);
                 }
+            });
+        }
+        for i in touched.drain(..) {
+            if let (Some(d), Some(seen)) = (df.get_mut(i), in_block.get_mut(i)) {
+                *d += 1;
+                *seen = false;
             }
-            None => return true,
         }
     }
-    true
+
+    let mut ranked: Vec<(u64, u64)> = literal_count
+        .iter()
+        .zip(&df)
+        .filter_map(|((&key, &count), &d)| {
+            let benefit = count * (n - d);
+            (benefit > 0).then_some((benefit, key))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+    // `fits` is monotone in k: find the largest k that fits.
+    let (mut lo, mut hi) = (0usize, ranked.len());
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let k = lo;
+    let per_block_bytes = (budget_bytes - (k * g) as u64) / n;
+    let total_bits = (per_block_bytes * 8) as usize;
+    let mut learned: Vec<u64> = ranked.iter().take(k).map(|&(_, key)| key).collect();
+    learned.sort_unstable();
+    let layout = Layout {
+        gram_len: g,
+        learned,
+        fallback_bits: total_bits - k,
+    };
+
+    let builder = Builder::new(&layout);
+    let summaries = blocks.iter().map(|b| builder.block(b)).collect();
+    Ok(Built {
+        layout,
+        summaries,
+        candidates: keys.len(),
+        budget_bytes,
+    })
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use std::collections::HashSet;
+
     use proptest::prelude::*;
 
     use super::*;
 
-    fn arb_value() -> impl Strategy<Value = Vec<u8>> {
-        prop::collection::vec(prop::sample::select(vec![b'a', b'b', b'c', b'd']), 0..12)
+    fn grams(s: &str) -> Vec<u64> {
+        let mut out = Vec::new();
+        for_each_gram(s.as_bytes(), 3, |k| out.push(k));
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
-    fn arb_block() -> impl Strategy<Value = Vec<Vec<u8>>> {
-        prop::collection::vec(arb_value(), 0..6)
+    fn values(vs: &[&str]) -> Vec<Vec<u8>> {
+        vs.iter().map(|v| v.as_bytes().to_vec()).collect()
     }
 
-    fn arb_feature() -> impl Strategy<Value = Feature> {
-        prop_oneof![
-            arb_value().prop_map(Feature::Equals),
-            arb_value().prop_map(Feature::Gram),
-        ]
+    fn pruned(layout: &Layout, block: &[&str], literal: &str) -> bool {
+        let s = BlockSummary::build(&values(block), layout);
+        !survives(&s, &layout.literal_bits(literal.as_bytes()))
     }
 
-    fn arb_vocab() -> impl Strategy<Value = Vocabulary> {
-        prop::collection::vec(arb_feature(), 0..10).prop_map(|mut features| {
-            features.sort();
-            features.dedup();
-            Vocabulary { features }
-        })
+    #[test]
+    fn absent_literal_with_every_gram_clear_is_pruned() {
+        let layout = Layout {
+            gram_len: 3,
+            learned: grams("needle"),
+            fallback_bits: 64,
+        };
+        assert!(pruned(&layout, &["other words"], "needle"));
+        assert!(!pruned(&layout, &["a needle here"], "needle"));
     }
 
-    proptest! {
-        /// However the vocabulary was chosen (not just the one `build` would
-        /// pick): a block whose real values truly hold a value equal to, or
-        /// containing, a literal is never pruned by that block's own
-        /// summary. This is the conservativeness guarantee issue #3710
-        /// requires, stated over an adversarial vocabulary so it cannot pass
-        /// by accident of `build`'s own selection rule.
-        #[test]
-        fn conservative_for_any_vocabulary(
-            block in arb_block(),
-            vocab in arb_vocab(),
-            literal in arb_value(),
-            gram_len in 1usize..6,
-        ) {
-            let summary = BlockSummary::build(&block, &vocab);
-            if block.iter().any(|v| v == &literal) {
-                prop_assert!(survives_equals(&summary, &vocab, &literal));
-            }
-            if block.iter().any(|v| contains(v, &literal)) {
-                prop_assert!(survives_like(&summary, &vocab, &literal, gram_len));
-            }
+    #[test]
+    fn pruned_when_any_gram_is_clear_in_either_order() {
+        // Only the grams of "needle" are learned: "zzn"/"zne" and "lez"/"ezz"
+        // fall back to hashed bits, all of them clear in a block whose only
+        // value is "needle", whose grams set only their own learned bits.
+        let layout = Layout {
+            gram_len: 3,
+            learned: grams("needle"),
+            fallback_bits: 64,
+        };
+        assert!(pruned(&layout, &["needle"], "zzneedle"));
+        assert!(pruned(&layout, &["needle"], "needlezz"));
+    }
+
+    #[test]
+    fn unseen_literal_is_pruned_through_the_fallback_region() {
+        let built = build(
+            &values(&["alpha"]),
+            &[values(&["alpha beta"]), values(&["gamma delta"])],
+            &Params {
+                gram_len: 3,
+                budget_share: 1.0,
+                fallback_min_bits: 256,
+            },
+            1024,
+        )
+        .expect("build");
+        for g in grams("omega") {
+            assert!(!built.layout.learned.contains(&g), "omega is unseen");
+        }
+        let bits = built.layout.literal_bits(b"omega");
+        assert!(!survives(&built.summaries[0], &bits));
+        assert!(!survives(&built.summaries[1], &bits));
+        assert!(survives(
+            &built.summaries[1],
+            &built.layout.literal_bits(b"delta")
+        ));
+    }
+
+    #[test]
+    fn short_literal_is_never_pruned() {
+        let layout = Layout {
+            gram_len: 3,
+            learned: Vec::new(),
+            fallback_bits: 64,
+        };
+        assert!(layout.literal_bits(b"ab").is_empty());
+        assert!(!pruned(&layout, &["zzzz"], "ab"));
+    }
+
+    #[test]
+    fn build_learns_only_training_grams_within_budget() {
+        let blocks: Vec<Vec<Vec<u8>>> = (0..8)
+            .map(|i| values(&[&format!("row {i} payload"), "common text"]))
+            .collect();
+        let training = values(&["row 3 payload", "zzzz"]);
+        let built = build(
+            &training,
+            &blocks,
+            &Params {
+                gram_len: 3,
+                budget_share: 0.5,
+                fallback_min_bits: 16,
+            },
+            1000,
+        )
+        .expect("build");
+        let allowed: HashSet<u64> = grams("row 3 payload")
+            .into_iter()
+            .chain(grams("zzzz"))
+            .collect();
+        assert!(!built.layout.learned.is_empty());
+        for g in &built.layout.learned {
+            assert!(allowed.contains(g));
+        }
+        // "row" is in every block: no benefit, never learned.
+        assert!(!built.layout.learned.contains(&grams("row")[0]));
+        assert!(built.summary_bytes() <= built.budget_bytes);
+        assert!(built.layout.fallback_bits >= 16);
+        for (b, s) in blocks.iter().zip(&built.summaries) {
+            assert_eq!(s, &BlockSummary::build(b, &built.layout));
         }
     }
 
     #[test]
-    fn vocabulary_build_is_deterministic() {
-        let blocks = vec![
-            vec![b"needle".to_vec(), b"other".to_vec()],
-            vec![b"haystack".to_vec()],
-        ];
-        let params = Params {
-            gram_len: 3,
-            df_threshold: 1.0,
-            budget_share: 1.0,
-        };
-        let a = Vocabulary::build(
-            &[b"needle".to_vec()],
-            &[b"stack".to_vec()],
-            &blocks,
-            &params,
-            10_000,
-        );
-        let b = Vocabulary::build(
-            &[b"needle".to_vec()],
-            &[b"stack".to_vec()],
-            &blocks,
-            &params,
-            10_000,
-        );
-        assert_eq!(a.features, b.features);
-        assert!(
-            a.feature_index(&Feature::Equals(b"needle".to_vec()))
-                .is_some()
-        );
+    fn build_refuses_a_budget_below_the_fallback_floor() {
+        let err = build(
+            &values(&["abc"]),
+            &[values(&["abc"]), values(&["abc"]), values(&["abc"])],
+            &Params {
+                gram_len: 3,
+                budget_share: 0.01,
+                fallback_min_bits: 64,
+            },
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot hold"), "{err}");
     }
 
-    #[test]
-    fn equals_vocabulary_never_grows_from_corpus_values() {
-        // A value that is common in the corpus but was never a seen equality
-        // literal must never become an equality feature: equality has no
-        // unsupervised signal to train on, only the named workload.
-        let blocks = vec![vec![b"common".to_vec(); 20]];
-        let params = Params {
-            gram_len: 3,
-            df_threshold: 1.0,
-            budget_share: 1.0,
-        };
-        let vocab = Vocabulary::build(&[], &[], &blocks, &params, 10_000);
-        assert!(vocab.is_empty());
+    fn byte_string() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(prop::sample::select(b"abcde xy".to_vec()), 0..24)
     }
 
-    #[test]
-    fn df_threshold_drops_a_near_universal_gram() {
-        // "aaa" occurs in every block (df share 1.0) and must be dropped as
-        // non-discriminating even though it is a substring of the seen LIKE
-        // literal; "XXX" occurs in only one of the two blocks (df share
-        // 0.5) and clears the same bar.
-        let blocks = vec![vec![b"aaaXXX".to_vec()], vec![b"aaaYYY".to_vec()]];
-        let params = Params {
-            gram_len: 3,
-            df_threshold: 0.6,
-            budget_share: 1.0,
-        };
-        let vocab = Vocabulary::build(&[], &[b"aaaXXX".to_vec()], &blocks, &params, 10_000);
-        assert!(
-            vocab
-                .feature_index(&Feature::Gram(b"aaa".to_vec()))
-                .is_none()
-        );
-        assert!(
-            vocab
-                .feature_index(&Feature::Gram(b"XXX".to_vec()))
-                .is_some()
-        );
-    }
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
 
-    #[test]
-    fn budget_share_caps_vocabulary_bytes() {
-        let blocks = vec![vec![b"abcdefghij".to_vec()]];
-        let seen_like = vec![b"abcdefghij".to_vec()];
-        let params = Params {
-            gram_len: 3,
-            df_threshold: 1.0,
-            budget_share: 1.0,
-        };
-        let unlimited = Vocabulary::build(&[], &seen_like, &blocks, &params, 1_000_000);
-        assert!(unlimited.len() > 1);
-        let starved = Vocabulary::build(&[], &seen_like, &blocks, &params, 0);
-        assert_eq!(starved.len(), 0);
-    }
+        /// The pruning rule is exactly "some gram's bit is clear", with the
+        /// block's bits computed independently of `BlockSummary::build`, and
+        /// a block holding the literal is never pruned.
+        #[test]
+        fn survives_is_exactly_the_subset_test(
+            block in prop::collection::vec(byte_string(), 0..6),
+            literal in byte_string(),
+            learn_from in prop::collection::vec(byte_string(), 0..4),
+            fallback_bits in 1usize..48,
+        ) {
+            let mut learned: Vec<u64> = Vec::new();
+            for l in &learn_from {
+                for_each_gram(l, 3, |k| learned.push(k));
+            }
+            learned.sort_unstable();
+            learned.dedup();
+            let layout = Layout { gram_len: 3, learned, fallback_bits };
+            let summary = BlockSummary::build(&block, &layout);
 
-    #[test]
-    fn unseen_literal_outside_vocabulary_always_survives() {
-        let blocks = vec![vec![b"abcdef".to_vec()]];
-        let params = Params {
-            gram_len: 3,
-            df_threshold: 1.0,
-            budget_share: 1.0,
-        };
-        let vocab = Vocabulary::build(&[b"abcdef".to_vec()], &[], &blocks, &params, 10_000);
-        let summary = BlockSummary::build(&blocks[0], &vocab);
-        // "zzz" never occurs anywhere and was never seen: not in vocabulary,
-        // so it must survive unconditionally (honest 100% FP, not a crash or
-        // a false "pruned").
-        assert!(survives_equals(&summary, &vocab, b"zzzzzz"));
+            let mut set = HashSet::new();
+            for v in &block {
+                for_each_gram(v, 3, |k| { set.insert(layout.bit_of(k)); });
+            }
+            let mut every_bit_set = true;
+            for_each_gram(&literal, 3, |k| every_bit_set &= set.contains(&layout.bit_of(k)));
+
+            let kept = survives(&summary, &layout.literal_bits(&literal));
+            prop_assert_eq!(kept, every_bit_set);
+            let held = block.iter().any(|v| {
+                literal.is_empty() || v.windows(literal.len()).any(|w| w == literal.as_slice())
+            });
+            if held {
+                prop_assert!(kept, "false negative");
+            }
+        }
     }
 }

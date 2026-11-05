@@ -1,112 +1,124 @@
 //! `string_fingerprint_report` (issue #3710, ADR-3692 Plan row T12): a
 //! report-only experiment measuring a learned, conservative per-block string
-//! summary for equality and `LIKE '%literal%'` predicates on a declared
-//! `Str` column, against the production bloom and `Contains` baselines, with
-//! a pre-registered go/no-go. Nothing outside the report reads or writes the
+//! summary for equality and `LIKE '%literal%'` predicates on a declared `Str`
+//! column, against the production bloom and `Contains` baselines, with a
+//! pre-registered go/no-go. Nothing outside the report reads or writes the
 //! summary; no production format changes.
 //!
-//! Hypothesis (arXiv:2507.10391, "Instance-Optimized String Fingerprints"): a
-//! lightweight, per-workload secondary index can approximate equality and
-//! substring predicates soundly (never a false negative) and generalize past
-//! the workload it was built from.
+//! Hypothesis (arXiv:2507.10391): a learned, conservative per-block string
+//! summary is cheaper than bloom and postings at equal false-positive rate,
+//! including on predicates unseen at build time, and saturates on long
+//! bodies.
 //!
-//! The summary itself ([`summary`]) is a shared vocabulary of features
-//! selected from a *seen* predicate workload (equality literals verbatim;
-//! `LIKE` literals decomposed into fixed-length grams), with each block
-//! storing only its own bitset over that vocabulary -- see `summary`'s
-//! module doc for why that is a different shape than the REI arm's shared
-//! postings list ([`crate::logbody::grams::GramIndex`], issue #3709), and for
-//! the conservativeness argument that holds regardless of the vocabulary.
+//! The summary ([`summary`]) learns from a TRAINING workload and is judged on
+//! a disjoint EVALUATION workload ([`workload`]), both drawn from the
+//! subject's values by a pre-registered seed before the build. `seen/*`
+//! figures evaluate the training literals (in-sample), `unseen/*` the
+//! evaluation literals; the two are never pooled.
 //!
-//! Every subject (a corpus and a column) is written as a declared `Str`
-//! attribute under one fixed column name, `value`, with `RlogConfig`
-//! defaults (`BloomScope::All` covers it, so the production bloom baseline
-//! applies with no extra schema step). This holds for the four LogHub body
-//! subjects too: `Predicate::Contains` resolves its `key` through a named
-//! `FIELD_DIR` column (`crates/ravel-logseg/src/reader.rs`, the `Contains`
-//! arm build), never through `FieldSel::Body`, so a body-text subject that
-//! was written as the record body would have no production `Contains`
-//! baseline to compare against at all. Writing every subject's values as the
-//! same kind of attribute column keeps the two baselines, and the summary
-//! itself, identical in mechanism across all eight subjects.
+//! A `*_false_positive_share` is the standard filter rate over (literal,
+//! block) pairs: pairs whose block does not hold the literal and that the
+//! summary (or production code) keeps, over all pairs whose block does not
+//! hold it, pooled over the literals of the group. A block holding the
+//! literal is never counted; the summary dropping one is an error, never a
+//! figure.
 //!
-//! Baselines are real production code, run over the same blocks:
-//! - **bloom**: `RlogReader::scan_blocks` with `Predicate::Equals{field:
-//!   Attr(column), value}`, reading `ScanStats::blocks_after_bloom` (checked
-//!   against `bloom_degraded == false`).
-//! - **contains**: `RlogReader::scan_blocks` with `Predicate::Contains{key:
-//!   column, needle, negated: false}`, fully drained, reading
-//!   `ScanStats::contains_cells_tested`
-//!   (`crates/ravel-sql/src/stats_json.rs` names this the production
-//!   `containsCellsTested` figure).
+//! Baselines are production code over the same RLOG objects ([`Production`]):
+//! - **equality**: `RlogReader::scan_blocks` with `Predicate::Equals` on the
+//!   column, reading `ScanStats::blocks_after_bloom`, which is after the skip
+//!   index, POSTINGS and the bloom. The bloom holds a value's exact bytes only
+//!   when it is at most [`BLOOM_EXACT_MAX`] bytes, so `bloom/*` covers the
+//!   evaluation literals of that length and `production/*` covers all of them.
+//! - **contains**: `Predicate::Contains` on the column, scanning with that
+//!   column selected and every block drained, reading
+//!   `ScanStats::contains_cells_tested` (the `containsCellsTested` figure)
+//!   and each block's surviving rows, which must agree with the in-module
+//!   truth block for block. The same scan restricted to the blocks the
+//!   summary keeps gives the cells production would test with the summary
+//!   in front of it.
 //!
-//! Figures are keyed `subject/figure`. Every one must be present exactly
-//! once and inside its band from the pre-registration file ([`spec`]), and
-//! every figure must have a band; [`check_figures`] lists each breach.
-//! `*_false_positive_share` is false-positive blocks over surviving blocks
-//! (0 when none survive), matching `crate::logbody`'s convention: a block
-//! the production exact-residual scan (recomputed here directly over the
-//! real per-block values the report already read back, so no second
-//! production code path is needed to get a true-holder oracle) says holds
-//! the predicate and the summary does not keep is a hard error, never a
-//! softly-reported figure -- the summary must never produce a false
-//! negative.
-//!
-//! `seen/*` figures are in-sample: the vocabulary was built from exactly
-//! those literals. `unseen/*` figures are the out-of-sample test the
-//! hypothesis lives or dies on. An equality literal outside the vocabulary
-//! always survives unconditionally (summary module doc): since the
-//! vocabulary's equality features are drawn only from seen literals, the
-//! `unseen/equals/false_positive_share` figure measures exactly that
-//! ceiling, not a defect in one run's selection. A `LIKE` literal can still
-//! be pruned when its grams happen to already be vocabulary entries built
-//! from other, seen literals, which is the generalization the hypothesis
-//! predicts and `unseen/like/false_positive_share` tests directly.
-//!
-//! `saturation/false_positive_share` restricts the unseen `LIKE` measurement
-//! to blocks holding a value over 1024 bytes. A subject with no such block
-//! reports `0.0` (vacuously conservative: there is nothing to falsely keep)
-//! and is noted "body-ineligible" in the decision line rather than silently
-//! passing a bar nothing was measured against.
+//! The saturation arm rebuilds blocks from the values over
+//! [`SATURATION_BYTES`] alone, with the production block cut, summarizes them
+//! with the learned layout, and evaluates the `LIKE` evaluation literals on
+//! them. It is a separate verdict ([`Saturation`]) and not a go/no-go leg.
 //!
 //! CPU is the calling thread's CPU clock ([`CPU_CLOCK`]).
-//!
-//! The decision ([`decide`], [`DECISION_RULE`]) is per subject, and overall
-//! ([`overall`]) across every subject the pre-registration file names.
 
 pub mod spec;
 pub mod summary;
+pub mod workload;
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use self::spec::{Band, Kind, SubjectSpec};
-use self::summary::{BlockSummary, Params, Vocabulary, survives_equals, survives_like};
+use self::spec::{Expect, SubjectSpec};
+use self::summary::{BlockSummary, Builder, Params, survives};
+use self::workload::{Kind, Literal, Workload};
 
 /// A block's real column values, read back through the production block
-/// cuts (never a naive re-chunking of the corpus).
+/// cuts.
 pub type BlockValues = Vec<Vec<u8>>;
 
-/// A byte threshold a block is "long" at, for the saturation arm.
+/// A value longer than this is a long body, for the saturation arm.
 pub const SATURATION_BYTES: usize = 1024;
+/// The longest value the RLOG writer puts into the bloom as exact bytes
+/// (`EXACT_BLOOM_MAX`, crates/ravel-logseg/src/writer.rs:238).
+pub const BLOOM_EXACT_MAX: usize = 64;
+/// The production block's byte cut (`RlogConfig::block_max_bytes` default).
+pub const BLOCK_MAX_BYTES: usize = 8 << 20;
 
 pub const GO_FALSE_POSITIVE_BAR: f64 = 0.10;
 pub const GO_BYTES_BAR: f64 = 0.01;
 pub const GO_CPU_BAR: f64 = 2.0;
-pub const GO_SATURATION_BAR: f64 = 0.30;
+pub const SATURATION_BAR: f64 = 0.30;
 
 pub const DECISION_RULE: &str = "Per subject: GO when unseen/equals/false_positive_share and \
-unseen/like/false_positive_share are both at most 0.10, summary_bytes_share is at most 0.01, \
-build_cpu_over_zstd is at most 2, and saturation/false_positive_share is at most 0.30 (or the \
-subject is body-ineligible: zero blocks over 1024 bytes); otherwise NO-GO, and a missing figure \
-fails its leg. Overall: GO when every subject the pre-registration names has exactly one report, \
-that report is GO, and it has no problems; otherwise NO-GO.";
+unseen/like/false_positive_share are both at most 0.10, summary_bytes_share is at most 0.01, and \
+build_cpu_over_zstd is at most 2; otherwise NO-GO, and a missing figure fails its leg. \
+Saturation is a separate verdict: with values over 1024 bytes, \
+saturation/unseen/like/false_positive_share at most 0.30 is body-eligible and above it \
+body-ineligible; with none, untested. Overall: GO when every pre-registered subject has exactly \
+one report, it is GO, and it has no structural problem (a missing, duplicate or unexpected \
+figure); a figure outside its prediction band is reported as a miss and does not change the \
+decision.";
 
-pub const CPU_CLOCK: &str = "CLOCK_THREAD_CPUTIME_ID of the report thread, one run per figure. \
-zstd_cpu_s compresses every block's values joined with a 0x00 byte at the writer's zstd level. \
-build_cpu_s (folded into build_cpu_over_zstd) builds the vocabulary from the seen workload and \
-every block's bitset over it, once, on the same thread.";
+pub const CPU_CLOCK: &str = "CLOCK_THREAD_CPUTIME_ID of the report thread, one run each. \
+zstd_cpu_s compresses every block's values joined with a 0x00 byte at the pre-registered zstd \
+level. The build (summary::build: the training grams' block counts, the learned set, and every \
+block's bitset) runs once on the same thread.";
+
+/// The suffix of every figure the report can print, in print order.
+pub const FIGURES: &[&str] = &[
+    "lines",
+    "blocks",
+    "column_bytes",
+    "compressed_bytes",
+    "zstd_cpu_s",
+    "build_cpu_over_zstd",
+    "candidate_grams",
+    "learned_bits",
+    "fallback_bits",
+    "bits_per_block",
+    "summary_bytes_share",
+    "fallback_density",
+    "eval_equals_bloom_testable",
+    "seen/equals/false_positive_share",
+    "seen/like/false_positive_share",
+    "unseen/equals/false_positive_share",
+    "unseen/like/false_positive_share",
+    "unseen/equals_absent/false_positive_share",
+    "unseen/like_absent/false_positive_share",
+    "production/equals/false_positive_share",
+    "bloom/equals/false_positive_share",
+    "summary/equals_bloom_testable/false_positive_share",
+    "contains/like/cells_tested_per_row",
+    "summary/like/cells_tested_share",
+    "saturation/long_values",
+    "saturation/blocks",
+    "saturation/fallback_density",
+    "saturation/unseen/like/false_positive_share",
+];
 
 /// One reported figure.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -115,16 +127,45 @@ pub struct Figure {
     pub value: f64,
 }
 
-fn fig(out: &mut Vec<Figure>, key: String, value: f64) {
-    out.push(Figure { key, value });
+pub(crate) fn threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
 }
 
-fn share(a: u64, b: u64) -> f64 {
-    if b == 0 {
-        f64::INFINITY
-    } else {
-        a as f64 / b as f64
-    }
+/// `f` over `items` on every core, in order.
+pub(crate) fn par_map<T: Sync, R: Send>(
+    items: &[T],
+    f: impl Fn(&T) -> R + Sync,
+) -> Result<Vec<R>, String> {
+    let chunk = items.len().div_ceil(threads()).max(1);
+    std::thread::scope(|s| {
+        let f = &f;
+        let handles: Vec<_> = items
+            .chunks(chunk)
+            .map(|c| s.spawn(move || c.iter().map(f).collect::<Vec<R>>()))
+            .collect();
+        let mut out = Vec::with_capacity(items.len());
+        for h in handles {
+            out.extend(h.join().map_err(|_| "worker thread panicked".to_string())?);
+        }
+        Ok(out)
+    })
+}
+
+/// Whether `f` holds for any of `items`, on every core. A panicked worker
+/// counts as a match, so a caller treating `false` as proof of absence
+/// cannot be misled by it.
+pub(crate) fn par_any<T: Sync>(items: &[T], f: impl Fn(&T) -> bool + Sync) -> bool {
+    par_map(items, |t| f(t)).map_or(true, |v| v.into_iter().any(|b| b))
+}
+
+/// Each block's values joined by a 0x00 byte, as text. Literals hold no 0x00,
+/// so a literal occurs in a block's text exactly when some value contains it.
+pub fn block_texts(blocks: &[BlockValues]) -> Result<Vec<String>, String> {
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| String::from_utf8(b.join(&0u8)).map_err(|e| format!("block {i}: {e}")))
+        .collect()
 }
 
 fn thread_cpu_s() -> f64 {
@@ -138,359 +179,551 @@ fn cpu_time<T>(f: impl FnOnce() -> T) -> (T, f64) {
     (out, thread_cpu_s() - t)
 }
 
-/// Every breach of the pre-registration: a band whose figure is missing or
-/// present more than once, a figure outside its band, a figure with no band.
-/// A missing figure is always a breach, never defaulted to a passing value:
-/// [`tests::a_missing_figure_is_never_silently_in_band`] pins this.
-pub fn check_figures(figures: &[Figure], bands: &BTreeMap<String, Band>) -> Vec<String> {
+/// What [`check_figures`] found: `problems` make a report not a result (a
+/// figure missing, present twice, present though pre-registered absent, or
+/// not pre-registered at all); `misses` are figures outside their band.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Checked {
+    pub problems: Vec<String>,
+    pub misses: Vec<String>,
+}
+
+pub fn check_figures(figures: &[Figure], expect: &BTreeMap<String, Expect>) -> Checked {
     let mut seen: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
     for f in figures {
         seen.entry(f.key.as_str()).or_default().push(f.value);
     }
-    let mut out = Vec::new();
-    for (key, band) in bands {
-        match seen.get(key.as_str()).map(Vec::as_slice) {
-            None => out.push(format!("{key}: missing (band {band:?})")),
-            Some([v]) => {
-                if !(band[0] <= *v && *v <= band[1]) {
-                    out.push(format!("{key}: {v} outside band {band:?}"));
-                }
+    let mut out = Checked::default();
+    for (key, e) in expect {
+        let got = seen.get(key.as_str()).map(Vec::as_slice);
+        match (e, got) {
+            (Expect::Absent(_), None) => {}
+            (Expect::Absent(why), Some(_)) => out
+                .problems
+                .push(format!("{key}: reported, pre-registered absent ({why})")),
+            (_, None) => out.problems.push(format!("{key}: missing")),
+            (_, Some(vs)) if vs.len() > 1 => out
+                .problems
+                .push(format!("{key}: present {} times", vs.len())),
+            (Expect::Predicted { band, .. }, Some([v])) if !(band[0] <= *v && *v <= band[1]) => {
+                out.misses.push(format!("{key}: {v} outside band {band:?}"));
             }
-            Some(vs) => out.push(format!("{key}: present {} times", vs.len())),
+            _ => {}
         }
     }
     for key in seen.keys() {
-        if !bands.contains_key(*key) {
-            out.push(format!("{key}: no band"));
+        if !expect.contains_key(*key) {
+            out.problems.push(format!("{key}: not pre-registered"));
         }
     }
     out
 }
 
-/// One predicate the report evaluates, with the real baseline the
-/// orchestration module (`string_fingerprint_report`) already measured
-/// against production code over the same blocks.
-#[derive(Clone, Debug)]
-pub struct PredicateInput {
-    pub id: String,
-    pub kind: Kind,
-    pub literal: Vec<u8>,
-    /// `ScanStats::blocks_after_bloom` for an `Equals` predicate on this
-    /// literal; `None` for a `Like` predicate.
-    pub bloom_blocks_kept: Option<u64>,
-    /// `ScanStats::contains_cells_tested` for a `Like` predicate on this
-    /// literal; `None` for an `Equals` predicate.
-    pub contains_cells_tested: Option<u64>,
+/// Production's answer for one `Contains` literal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContainsRun {
+    /// `ScanStats::contains_cells_tested`, summed over objects.
+    pub cells_tested: u64,
+    /// Surviving rows per block, over every block of the subject in order
+    /// (zero for a block the scan did not read).
+    pub rows: Vec<u64>,
+}
+
+/// The production baselines, run over the subject's real RLOG objects.
+pub trait Production: Sync {
+    /// Blocks `Predicate::Equals` keeps after skip, POSTINGS and bloom.
+    fn equals_blocks_kept(&self, literal: &str) -> Result<u64, String>;
+    /// A drained `Predicate::Contains` scan, over every block or only the
+    /// blocks `keep` marks.
+    fn contains(&self, literal: &str, keep: Option<&[bool]>) -> Result<ContainsRun, String>;
 }
 
 /// What the report hands the measurement for one subject.
 pub struct SubjectInput<'a> {
     pub lines: u64,
     pub blocks: &'a [BlockValues],
-    pub zstd_level: i32,
-    pub seen: &'a [PredicateInput],
-    pub unseen: &'a [PredicateInput],
+    pub texts: &'a [String],
+    pub workload: &'a Workload,
 }
 
+/// Which blocks hold `literal`.
+fn holders(lit: &Literal, blocks: &[BlockValues], texts: &[String]) -> Result<Vec<bool>, String> {
+    match lit.kind {
+        Kind::Equals => par_map(blocks, |b| {
+            b.iter().any(|v| v.as_slice() == lit.text.as_bytes())
+        }),
+        Kind::Like => par_map(texts, |t| t.contains(lit.text.as_str())),
+    }
+}
+
+/// False-positive pairs over non-holder pairs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Tally {
+    false_positive: u64,
+    non_holder: u64,
+}
+
+impl Tally {
+    fn add(&mut self, held: &[bool], kept: &[bool]) {
+        for (&h, &k) in held.iter().zip(kept) {
+            if !h {
+                self.non_holder += 1;
+                if k {
+                    self.false_positive += 1;
+                }
+            }
+        }
+    }
+
+    fn rate(self) -> f64 {
+        if self.non_holder == 0 {
+            f64::NAN
+        } else {
+            self.false_positive as f64 / self.non_holder as f64
+        }
+    }
+}
+
+/// The summary's verdict on every block for `lit`; an error when it drops a
+/// block that holds the literal.
+fn summary_verdicts(
+    lit: &Literal,
+    held: &[bool],
+    summaries: &[BlockSummary],
+    layout: &summary::Layout,
+) -> Result<Vec<bool>, String> {
+    let bits = layout.literal_bits(lit.text.as_bytes());
+    let kept: Vec<bool> = summaries.iter().map(|s| survives(s, &bits)).collect();
+    if let Some(i) = held.iter().zip(&kept).position(|(&h, &k)| h && !k) {
+        return Err(format!(
+            "false negative: the summary drops block {i}, which holds {:?} literal {:?}",
+            lit.kind.name(),
+            lit.text
+        ));
+    }
+    Ok(kept)
+}
+
+/// The values over [`SATURATION_BYTES`], in order, cut into blocks the way
+/// the writer cuts them: `block_records` values or [`BLOCK_MAX_BYTES`].
+pub fn long_value_blocks(blocks: &[BlockValues], block_records: usize) -> Vec<BlockValues> {
+    let mut out = Vec::new();
+    let mut cur: BlockValues = Vec::new();
+    let mut bytes = 0usize;
+    for v in blocks
+        .iter()
+        .flatten()
+        .filter(|v| v.len() > SATURATION_BYTES)
+    {
+        if !cur.is_empty() && (cur.len() >= block_records || bytes + v.len() > BLOCK_MAX_BYTES) {
+            out.push(std::mem::take(&mut cur));
+            bytes = 0;
+        }
+        bytes += v.len();
+        cur.push(v.clone());
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParamsOut {
+    pub column: String,
+    pub gram_len: usize,
+    pub budget_share: f64,
+    pub fallback_min_bits: usize,
+    pub zstd_level: i32,
+    pub block_records: usize,
+    pub object_records: usize,
+    pub max_lines: u64,
+    pub seed: u64,
+    pub literals_per_kind: usize,
+    pub eq_max_len: usize,
+    pub like_min_len: usize,
+    pub like_max_len: usize,
+}
+
+impl ParamsOut {
+    pub fn of(spec: &SubjectSpec) -> ParamsOut {
+        ParamsOut {
+            column: spec.column.clone(),
+            gram_len: spec.gram_len,
+            budget_share: spec.budget_share,
+            fallback_min_bits: spec.fallback_min_bits,
+            zstd_level: spec.zstd_level,
+            block_records: spec.block_records,
+            object_records: spec.object_records,
+            max_lines: spec.max_lines,
+            seed: spec.seed,
+            literals_per_kind: spec.literals_per_kind,
+            eq_max_len: spec.eq_max_len,
+            like_min_len: spec.like_min_len,
+            like_max_len: spec.like_max_len,
+        }
+    }
+
+    pub fn line(&self) -> String {
+        format!(
+            "string_fingerprint params column={} gram_len={} budget_share={} fallback_min_bits={} \
+             zstd_level={} block_records={} object_records={} max_lines={} seed={} \
+             literals_per_kind={} eq_max_len={} like_min_len={} like_max_len={}",
+            self.column,
+            self.gram_len,
+            self.budget_share,
+            self.fallback_min_bits,
+            self.zstd_level,
+            self.block_records,
+            self.object_records,
+            self.max_lines,
+            self.seed,
+            self.literals_per_kind,
+            self.eq_max_len,
+            self.like_min_len,
+            self.like_max_len
+        )
+    }
+}
+
+/// Provenance printed first and kept in the report.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Stamp {
+    /// `git rev-parse HEAD`, with `-dirty` when tracked files differ from it.
+    pub git: String,
+    /// `uname -m`.
+    pub arch: String,
+    pub nproc: usize,
+    pub mem_total_kib: u64,
+    /// The corpus file's name (no directory).
+    pub corpus_file: String,
+    pub corpus_sha256: String,
+    pub corpus_bytes: u64,
+    pub zstd_level: i32,
+    pub cpu_clock: String,
+}
+
+impl Stamp {
+    pub fn line(&self) -> String {
+        format!(
+            "string_fingerprint stamp git={} arch={} nproc={} mem_total_kib={} corpus_file={} \
+             corpus_sha256={} corpus_bytes={} zstd_level={} cpu_clock=CLOCK_THREAD_CPUTIME_ID",
+            self.git,
+            self.arch,
+            self.nproc,
+            self.mem_total_kib,
+            self.corpus_file,
+            self.corpus_sha256,
+            self.corpus_bytes,
+            self.zstd_level
+        )
+    }
+}
+
+/// Serialized only: a NaN figure (a rate with no non-holder) is written as
+/// JSON `null`. [`saved_decision`] reads a written report back.
 #[derive(Debug, Serialize)]
 pub struct SubjectReport {
+    /// Set by the report bin; `None` for a measurement with no corpus file.
+    pub stamp: Option<Stamp>,
     pub subject: String,
     pub params: ParamsOut,
-    pub decision_rule: &'static str,
-    pub feature_layout: &'static str,
-    pub cpu_clock: &'static str,
+    pub decision_rule: String,
+    pub summary_bytes_rule: String,
+    pub cpu_clock: String,
+    pub workload: Workload,
     pub figures: Vec<Figure>,
-    pub bands: BTreeMap<String, Band>,
-    pub problems: Vec<String>,
+    pub expect: BTreeMap<String, Expect>,
+    pub checked: Checked,
     pub decision: Decision,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct ParamsOut {
-    pub block_records: usize,
-    pub gram_len: usize,
-    pub df_threshold: f64,
-    pub budget_share: f64,
+fn fmt_expect(e: &Expect, v: f64) -> String {
+    match e {
+        Expect::Predicted { predict, band } => {
+            let ok = if band[0] <= v && v <= band[1] {
+                "ok"
+            } else {
+                "MISS"
+            };
+            format!("predict {predict} band [{}, {}] {ok}", band[0], band[1])
+        }
+        Expect::Unpredicted(why) => format!("unpredicted ({why})"),
+        Expect::Absent(why) => format!("pre-registered absent ({why}) PROBLEM"),
+    }
 }
 
 impl SubjectReport {
-    /// The parameters the run used, then one line per figure, then the
-    /// decision line.
+    /// The params line, one line per figure (and per pre-registered absent
+    /// figure), then the decision line.
     pub fn lines(&self) -> Vec<String> {
-        let mut out = vec![format!(
-            "string_fingerprint params block_records={} gram_len={} df_threshold={} budget_share={}",
-            self.params.block_records,
-            self.params.gram_len,
-            self.params.df_threshold,
-            self.params.budget_share
-        )];
-        out.extend(self.figures.iter().map(|f| match self.bands.get(&f.key) {
-            Some(b) => {
-                let ok = if b[0] <= f.value && f.value <= b[1] {
-                    "ok"
-                } else {
-                    "MISS"
-                };
-                format!(
-                    "string_fingerprint figure {} = {} band [{}, {}] {ok}",
-                    f.key, f.value, b[0], b[1]
-                )
-            }
-            None => format!(
-                "string_fingerprint figure {} = {} band none MISS",
+        let mut out: Vec<String> = self.stamp.iter().map(Stamp::line).collect();
+        out.push(self.params.line());
+        let by_kind = |present: bool, set: &[Literal]| {
+            [Kind::Equals, Kind::Like]
+                .iter()
+                .map(|&k| {
+                    let n = set
+                        .iter()
+                        .filter(|l| l.kind == k && l.present == present)
+                        .count();
+                    format!("{}={n}", k.name())
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        out.push(format!(
+            "string_fingerprint workload training present {} absent {}; evaluation present {} absent {}",
+            by_kind(true, &self.workload.training),
+            by_kind(false, &self.workload.training),
+            by_kind(true, &self.workload.evaluation),
+            by_kind(false, &self.workload.evaluation),
+        ));
+        for f in &self.figures {
+            let tail = match self.expect.get(&f.key) {
+                Some(e) => fmt_expect(e, f.value),
+                None => "not pre-registered PROBLEM".to_string(),
+            };
+            out.push(format!(
+                "string_fingerprint figure {} = {} {tail}",
                 f.key, f.value
-            ),
-        }));
+            ));
+        }
+        for (key, e) in &self.expect {
+            if let Expect::Absent(why) = e
+                && !self.figures.iter().any(|f| &f.key == key)
+            {
+                out.push(format!(
+                    "string_fingerprint figure {key} absent as pre-registered ({why})"
+                ));
+            }
+        }
         out.push(self.decision.line.clone());
         out
     }
 }
 
-/// The built summary a subject's predicates are evaluated against.
-struct Model<'a> {
-    vocab: &'a Vocabulary,
-    summaries: &'a [BlockSummary],
-    gram_len: usize,
-}
+/// Builds the summary from the training literals, evaluates both sets
+/// against it and against `production`, and decides. A summary dropping a
+/// block that holds a literal, or production disagreeing with the in-module
+/// truth, is an error rather than a figure.
+pub fn measure(
+    spec: &SubjectSpec,
+    input: &SubjectInput<'_>,
+    production: &dyn Production,
+) -> Result<SubjectReport, String> {
+    let blocks = input.blocks;
+    let n = blocks.len();
+    if input.texts.len() != n {
+        return Err("texts and blocks differ in length".into());
+    }
+    let (sizes, zstd_cpu) = cpu_time(|| {
+        blocks
+            .iter()
+            .map(|b| zstd::bulk::compress(&b.join(&0u8), spec.zstd_level).map(|c| c.len() as u64))
+            .collect::<Result<Vec<u64>, _>>()
+    });
+    let compressed_bytes: u64 = sizes.map_err(|e| format!("zstd: {e}"))?.iter().sum();
+    let column_bytes: u64 = blocks.iter().flatten().map(|v| v.len() as u64).sum();
 
-/// True holders and the summary's survivors, per block, for one predicate
-/// restricted to `which` block indices. Errors if the summary ever drops a
-/// true holder.
-fn evaluate(
-    model: &Model<'_>,
-    kind: Kind,
-    literal: &[u8],
-    blocks: &[BlockValues],
-    which: &[usize],
-    id: &str,
-) -> Result<(u64, u64), String> {
-    let mut surviving = 0u64;
-    let mut held = 0u64;
-    for &i in which {
-        let holds = match kind {
-            Kind::Equals => blocks[i].iter().any(|v| v.as_slice() == literal),
-            Kind::Like => blocks[i].iter().any(|v| {
-                v.windows(literal.len().max(1)).any(|w| w == literal) || literal.is_empty()
-            }),
-        };
-        let survives = match kind {
-            Kind::Equals => survives_equals(&model.summaries[i], model.vocab, literal),
-            Kind::Like => survives_like(&model.summaries[i], model.vocab, literal, model.gram_len),
-        };
-        if holds {
-            held += 1;
-            if !survives {
+    let training: Vec<Vec<u8>> = input
+        .workload
+        .training
+        .iter()
+        .map(|l| l.text.as_bytes().to_vec())
+        .collect();
+    let params = Params {
+        gram_len: spec.gram_len,
+        budget_share: spec.budget_share,
+        fallback_min_bits: spec.fallback_min_bits,
+    };
+    let (built, build_cpu) =
+        cpu_time(|| summary::build(&training, blocks, &params, compressed_bytes));
+    let built = built?;
+    let layout = &built.layout;
+
+    let mut seen = [Tally::default(); 2];
+    let mut unseen = [Tally::default(); 2];
+    let mut unseen_absent = [Tally::default(); 2];
+    let slot = |k: Kind| usize::from(k == Kind::Like);
+    for lit in &input.workload.training {
+        let held = holders(lit, blocks, input.texts)?;
+        let kept = summary_verdicts(lit, &held, &built.summaries, layout)?;
+        seen[slot(lit.kind)].add(&held, &kept);
+    }
+
+    let mut production_eq = Tally::default();
+    let mut bloom_eq = Tally::default();
+    let mut summary_bloom_eq = Tally::default();
+    let mut bloom_testable = 0u64;
+    let mut eval_like: Vec<(&Literal, Vec<bool>, Vec<bool>)> = Vec::new();
+    for lit in &input.workload.evaluation {
+        let held = holders(lit, blocks, input.texts)?;
+        if held.iter().any(|&h| h) != lit.present {
+            return Err(format!(
+                "workload literal {:?} is marked present={} but holds in {} blocks",
+                lit.text,
+                lit.present,
+                held.iter().filter(|&&h| h).count()
+            ));
+        }
+        let kept = summary_verdicts(lit, &held, &built.summaries, layout)?;
+        unseen[slot(lit.kind)].add(&held, &kept);
+        if !lit.present {
+            unseen_absent[slot(lit.kind)].add(&held, &kept);
+        }
+        match lit.kind {
+            Kind::Equals => {
+                let holding = held.iter().filter(|&&h| h).count() as u64;
+                let prod = production.equals_blocks_kept(&lit.text)?;
+                if prod < holding {
+                    return Err(format!(
+                        "production equality keeps {prod} blocks for {:?}, fewer than the {holding} holding it",
+                        lit.text
+                    ));
+                }
+                let pair = Tally {
+                    false_positive: prod - holding,
+                    non_holder: n as u64 - holding,
+                };
+                production_eq.false_positive += pair.false_positive;
+                production_eq.non_holder += pair.non_holder;
+                if lit.text.len() <= BLOOM_EXACT_MAX {
+                    bloom_testable += 1;
+                    bloom_eq.false_positive += pair.false_positive;
+                    bloom_eq.non_holder += pair.non_holder;
+                    summary_bloom_eq.add(&held, &kept);
+                }
+            }
+            Kind::Like => eval_like.push((lit, held, kept)),
+        }
+    }
+
+    let contains = par_map(&eval_like, |(lit, held, kept)| {
+        let full = production.contains(&lit.text, None)?;
+        let sub = production.contains(&lit.text, Some(kept))?;
+        for (run, what) in [(&full, "full"), (&sub, "summary-kept")] {
+            let prod_held: Vec<bool> = run.rows.iter().map(|&r| r > 0).collect();
+            if &prod_held != held {
                 return Err(format!(
-                    "predicate {id} dropped block {i}, which truly holds it"
+                    "production Contains ({what} scan) disagrees with the in-module truth for {:?}",
+                    lit.text
                 ));
             }
         }
-        if survives {
-            surviving += 1;
-        }
-    }
-    Ok((surviving, held))
-}
+        Ok::<(u64, u64), String>((full.cells_tested, sub.cells_tested))
+    })?
+    .into_iter()
+    .collect::<Result<Vec<(u64, u64)>, String>>()?;
+    let cells_full: u64 = contains.iter().map(|c| c.0).sum();
+    let cells_sub: u64 = contains.iter().map(|c| c.1).sum();
 
-fn pooled_false_positive_share(
-    model: &Model<'_>,
-    preds: &[&PredicateInput],
-    blocks: &[BlockValues],
-    which: &[usize],
-) -> Result<f64, String> {
-    let mut surviving_total = 0u64;
-    let mut fp_total = 0u64;
-    for p in preds {
-        let (surviving, held) = evaluate(model, p.kind, &p.literal, blocks, which, &p.id)?;
-        surviving_total += surviving;
-        fp_total += surviving - held;
-    }
-    Ok(if surviving_total == 0 {
-        0.0
-    } else {
-        fp_total as f64 / surviving_total as f64
-    })
-}
+    let long_blocks = long_value_blocks(blocks, spec.block_records);
+    let long_values: usize = long_blocks.iter().map(Vec::len).sum();
 
-/// Builds the summary over `input.blocks` from `spec`'s seen workload,
-/// answers every seen and unseen predicate, checks the figures against
-/// their bands, and returns the decision. A predicate the summary drops a
-/// true holder of is an error, not a figure.
-pub fn measure(spec: &SubjectSpec, input: &SubjectInput<'_>) -> Result<SubjectReport, String> {
-    let params = Params {
-        gram_len: spec.gram_len,
-        df_threshold: spec.df_threshold,
-        budget_share: spec.budget_share,
-    };
-    let blocks = input.blocks;
-    let n_blocks = blocks.len() as u64;
-    let all_blocks: Vec<usize> = (0..blocks.len()).collect();
-
-    let (zstd_sizes, zstd_cpu) = cpu_time(|| {
-        blocks
-            .iter()
-            .map(|b| zstd::bulk::compress(&b.join(&0u8), input.zstd_level).map(|c| c.len()))
-            .collect::<Result<Vec<usize>, _>>()
-    });
-    let zstd_sizes = zstd_sizes.map_err(|e| format!("zstd: {e}"))?;
-    let compressed_bytes: u64 = zstd_sizes.iter().map(|&n| n as u64).sum();
-
-    let seen_equals: Vec<Vec<u8>> = input
-        .seen
-        .iter()
-        .filter(|p| p.kind == Kind::Equals)
-        .map(|p| p.literal.clone())
-        .collect();
-    let seen_like: Vec<Vec<u8>> = input
-        .seen
-        .iter()
-        .filter(|p| p.kind == Kind::Like)
-        .map(|p| p.literal.clone())
-        .collect();
-
-    let ((vocab, summaries), build_cpu) = cpu_time(|| {
-        let vocab = Vocabulary::build(&seen_equals, &seen_like, blocks, &params, compressed_bytes);
-        let summaries: Vec<BlockSummary> = blocks
-            .iter()
-            .map(|b| BlockSummary::build(b, &vocab))
-            .collect();
-        (vocab, summaries)
-    });
-
-    let summary_bytes: u64 =
-        vocab.bytes() as u64 + summaries.iter().map(|s| s.bytes() as u64).sum::<u64>();
-
-    let model = Model {
-        vocab: &vocab,
-        summaries: &summaries,
-        gram_len: spec.gram_len,
-    };
     let s = &spec.name;
     let mut figures = Vec::new();
-    fig(&mut figures, format!("{s}/lines"), input.lines as f64);
-    fig(&mut figures, format!("{s}/blocks"), n_blocks as f64);
+    let mut fig = |k: &str, v: f64| {
+        figures.push(Figure {
+            key: format!("{s}/{k}"),
+            value: v,
+        })
+    };
+    fig("lines", input.lines as f64);
+    fig("blocks", n as f64);
+    fig("column_bytes", column_bytes as f64);
+    fig("compressed_bytes", compressed_bytes as f64);
+    fig("zstd_cpu_s", zstd_cpu);
     fig(
-        &mut figures,
-        format!("{s}/compressed_bytes"),
-        compressed_bytes as f64,
-    );
-    fig(&mut figures, format!("{s}/zstd_cpu_s"), zstd_cpu);
-    fig(
-        &mut figures,
-        format!("{s}/build_cpu_over_zstd"),
+        "build_cpu_over_zstd",
         if zstd_cpu > 0.0 {
             build_cpu / zstd_cpu
         } else {
             f64::INFINITY
         },
     );
+    fig("candidate_grams", built.candidates as f64);
+    fig("learned_bits", layout.learned.len() as f64);
+    fig("fallback_bits", layout.fallback_bits as f64);
+    fig("bits_per_block", layout.bits_per_block() as f64);
     fig(
-        &mut figures,
-        format!("{s}/summary_bytes_share"),
-        share(summary_bytes, compressed_bytes),
+        "summary_bytes_share",
+        built.summary_bytes() as f64 / compressed_bytes.max(1) as f64,
     );
-
-    for (group_name, preds) in [("seen", input.seen), ("unseen", input.unseen)] {
+    fig("fallback_density", built.fallback_density());
+    fig("eval_equals_bloom_testable", bloom_testable as f64);
+    for (group, tallies) in [
+        ("seen", &seen),
+        ("unseen", &unseen),
+        ("unseen_absent", &unseen_absent),
+    ] {
         for kind in [Kind::Equals, Kind::Like] {
-            let kind_name = if kind == Kind::Equals {
-                "equals"
-            } else {
-                "like"
+            let key = match group {
+                "unseen_absent" => format!("unseen/{}_absent/false_positive_share", kind.name()),
+                g => format!("{g}/{}/false_positive_share", kind.name()),
             };
-            let subset: Vec<&PredicateInput> = preds.iter().filter(|p| p.kind == kind).collect();
-            let value = pooled_false_positive_share(&model, &subset, blocks, &all_blocks)?;
-            fig(
-                &mut figures,
-                format!("{s}/{group_name}/{kind_name}/false_positive_share"),
-                value,
-            );
+            fig(&key, tallies[slot(kind)].rate());
         }
     }
-
-    let equals_preds: Vec<&PredicateInput> = input
-        .seen
-        .iter()
-        .chain(input.unseen)
-        .filter(|p| p.kind == Kind::Equals)
-        .collect();
-    let bloom_share = {
-        let shares: Vec<f64> = equals_preds
-            .iter()
-            .filter_map(|p| p.bloom_blocks_kept.map(|k| share(k, n_blocks)))
-            .collect();
-        if shares.is_empty() {
-            return Err(format!("{s}: no equals predicate carries a bloom baseline"));
-        }
-        shares.iter().sum::<f64>() / shares.len() as f64
-    };
     fig(
-        &mut figures,
-        format!("{s}/bloom/equals/blocks_kept_share"),
-        bloom_share,
+        "production/equals/false_positive_share",
+        production_eq.rate(),
     );
-
-    let like_preds: Vec<&PredicateInput> = input
-        .seen
-        .iter()
-        .chain(input.unseen)
-        .filter(|p| p.kind == Kind::Like)
-        .collect();
-    let total_cells: u64 = blocks.iter().map(|b| b.len() as u64).sum();
-    let contains_share = {
-        let shares: Vec<f64> = like_preds
-            .iter()
-            .filter_map(|p| p.contains_cells_tested.map(|c| share(c, total_cells)))
-            .collect();
-        if shares.is_empty() {
-            return Err(format!(
-                "{s}: no like predicate carries a contains baseline"
-            ));
-        }
-        shares.iter().sum::<f64>() / shares.len() as f64
-    };
+    if bloom_testable > 0 {
+        fig("bloom/equals/false_positive_share", bloom_eq.rate());
+        fig(
+            "summary/equals_bloom_testable/false_positive_share",
+            summary_bloom_eq.rate(),
+        );
+    }
+    let rows_total: u64 = blocks.iter().map(|b| b.len() as u64).sum();
     fig(
-        &mut figures,
-        format!("{s}/contains/like/cells_tested_share"),
-        contains_share,
+        "contains/like/cells_tested_per_row",
+        cells_full as f64 / (rows_total * eval_like.len() as u64).max(1) as f64,
     );
-
-    let long_blocks: Vec<usize> = (0..blocks.len())
-        .filter(|&i| blocks[i].iter().any(|v| v.len() > SATURATION_BYTES))
-        .collect();
-    let saturation_eligible = !long_blocks.is_empty();
-    let saturation_value = if saturation_eligible {
-        let unseen_like: Vec<&PredicateInput> = input
-            .unseen
-            .iter()
-            .filter(|p| p.kind == Kind::Like)
-            .collect();
-        pooled_false_positive_share(&model, &unseen_like, blocks, &long_blocks)?
-    } else {
-        0.0
-    };
     fig(
-        &mut figures,
-        format!("{s}/saturation/false_positive_share"),
-        saturation_value,
-    );
-
-    let bands = spec.bands();
-    let problems = check_figures(&figures, &bands);
-    let decision = decide(&decision_input(spec, &figures), saturation_eligible);
-    Ok(SubjectReport {
-        subject: spec.name.clone(),
-        params: ParamsOut {
-            block_records: spec.block_records,
-            gram_len: spec.gram_len,
-            df_threshold: spec.df_threshold,
-            budget_share: spec.budget_share,
+        "summary/like/cells_tested_share",
+        if cells_full == 0 {
+            f64::NAN
+        } else {
+            cells_sub as f64 / cells_full as f64
         },
-        decision_rule: DECISION_RULE,
-        feature_layout: summary::FEATURE_LAYOUT,
-        cpu_clock: CPU_CLOCK,
+    );
+    fig("saturation/long_values", long_values as f64);
+    let mut saturation_rate = None;
+    if long_values > 0 {
+        let builder = Builder::new(layout);
+        let sums: Vec<BlockSummary> = long_blocks.iter().map(|b| builder.block(b)).collect();
+        let texts = block_texts(&long_blocks)?;
+        let mut tally = Tally::default();
+        for (lit, _, _) in &eval_like {
+            let held = holders(lit, &long_blocks, &texts)?;
+            let kept = summary_verdicts(lit, &held, &sums, layout)?;
+            tally.add(&held, &kept);
+        }
+        fig("saturation/blocks", long_blocks.len() as f64);
+        fig(
+            "saturation/fallback_density",
+            summary::mean_density(&sums, layout),
+        );
+        fig("saturation/unseen/like/false_positive_share", tally.rate());
+        saturation_rate = Some(tally.rate());
+    }
+
+    let expect = spec.expectations();
+    let checked = check_figures(&figures, &expect);
+    let decision = decide(&decision_input(s, &figures, saturation_rate));
+    Ok(SubjectReport {
+        stamp: None,
+        subject: s.clone(),
+        params: ParamsOut::of(spec),
+        decision_rule: DECISION_RULE.to_string(),
+        summary_bytes_rule: summary::LAYOUT_BYTES.to_string(),
+        cpu_clock: CPU_CLOCK.to_string(),
+        workload: input.workload.clone(),
         figures,
-        bands,
-        problems,
+        expect,
+        checked,
         decision,
     })
 }
@@ -504,36 +737,52 @@ pub struct DecisionInput {
     pub unseen_like_fp: Option<f64>,
     pub summary_bytes_share: Option<f64>,
     pub build_cpu_over_zstd: Option<f64>,
+    /// `None` when the subject has no value over [`SATURATION_BYTES`].
     pub saturation_fp: Option<f64>,
 }
 
-/// Reads the decision's figures for `spec` out of `figures`.
-pub fn decision_input(spec: &SubjectSpec, figures: &[Figure]) -> DecisionInput {
-    use std::collections::HashMap;
-    let mut by_key: HashMap<&str, Vec<f64>> = HashMap::new();
-    for f in figures {
-        by_key.entry(f.key.as_str()).or_default().push(f.value);
-    }
-    let one = |key: String| match by_key.get(key.as_str()).map(Vec::as_slice) {
-        Some([v]) => Some(*v),
-        _ => None,
+pub fn decision_input(
+    subject: &str,
+    figures: &[Figure],
+    saturation_fp: Option<f64>,
+) -> DecisionInput {
+    let one = |suffix: &str| {
+        let key = format!("{subject}/{suffix}");
+        let vs: Vec<f64> = figures
+            .iter()
+            .filter(|f| f.key == key)
+            .map(|f| f.value)
+            .collect();
+        match vs.as_slice() {
+            [v] => Some(*v),
+            _ => None,
+        }
     };
-    let s = &spec.name;
     DecisionInput {
-        subject: s.clone(),
-        unseen_equals_fp: one(format!("{s}/unseen/equals/false_positive_share")),
-        unseen_like_fp: one(format!("{s}/unseen/like/false_positive_share")),
-        summary_bytes_share: one(format!("{s}/summary_bytes_share")),
-        build_cpu_over_zstd: one(format!("{s}/build_cpu_over_zstd")),
-        saturation_fp: one(format!("{s}/saturation/false_positive_share")),
+        subject: subject.to_string(),
+        unseen_equals_fp: one("unseen/equals/false_positive_share"),
+        unseen_like_fp: one("unseen/like/false_positive_share"),
+        summary_bytes_share: one("summary_bytes_share"),
+        build_cpu_over_zstd: one("build_cpu_over_zstd"),
+        saturation_fp,
     }
 }
 
-/// A go/no-go and the one line that states it.
+/// The saturation arm's verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Saturation {
+    Untested,
+    BodyEligible,
+    BodyIneligible,
+}
+
+/// A go/no-go, the saturation verdict, and the line that states both.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Decision {
     pub subject: String,
     pub go: bool,
+    pub saturation: Saturation,
     pub line: String,
 }
 
@@ -541,26 +790,25 @@ fn shown(v: Option<f64>) -> String {
     v.map_or_else(|| "missing".to_string(), |v| format!("{v:.4}"))
 }
 
-/// The per-subject rule of [`DECISION_RULE`]. `saturation_eligible` is
-/// `false` when the subject had no block over [`SATURATION_BYTES`]; the
-/// saturation leg then always passes (there was nothing to test) and the
-/// line says so.
-pub fn decide(d: &DecisionInput, saturation_eligible: bool) -> Decision {
+/// The per-subject rule of [`DECISION_RULE`].
+pub fn decide(d: &DecisionInput) -> Decision {
     let equals_ok = d
         .unseen_equals_fp
         .is_some_and(|v| v <= GO_FALSE_POSITIVE_BAR);
     let like_ok = d.unseen_like_fp.is_some_and(|v| v <= GO_FALSE_POSITIVE_BAR);
     let bytes_ok = d.summary_bytes_share.is_some_and(|v| v <= GO_BYTES_BAR);
     let cpu_ok = d.build_cpu_over_zstd.is_some_and(|v| v <= GO_CPU_BAR);
-    let saturation_ok =
-        !saturation_eligible || d.saturation_fp.is_some_and(|v| v <= GO_SATURATION_BAR);
-    let go = equals_ok && like_ok && bytes_ok && cpu_ok && saturation_ok;
+    let go = equals_ok && like_ok && bytes_ok && cpu_ok;
+    let saturation = match d.saturation_fp {
+        None => Saturation::Untested,
+        Some(v) if v <= SATURATION_BAR => Saturation::BodyEligible,
+        Some(_) => Saturation::BodyIneligible,
+    };
     let fails: Vec<&str> = [
         (equals_ok, "unseen_equals"),
         (like_ok, "unseen_like"),
         (bytes_ok, "bytes"),
         (cpu_ok, "cpu"),
-        (saturation_ok, "saturation"),
     ]
     .iter()
     .filter(|(ok, _)| !ok)
@@ -569,52 +817,51 @@ pub fn decide(d: &DecisionInput, saturation_eligible: bool) -> Decision {
     let line = format!(
         "string_fingerprint decision {}: {}; unseen_equals_fp={} unseen_like_fp={} (bar {GO_FALSE_POSITIVE_BAR}); \
          summary_bytes_share={} (bar {GO_BYTES_BAR}); build_cpu_over_zstd={} (bar {GO_CPU_BAR}); \
-         saturation_fp={} (bar {GO_SATURATION_BAR}{}); fails: {}",
+         fails: {}; saturation {} (saturation_fp={}, bar {SATURATION_BAR})",
         d.subject,
         if go { "GO" } else { "NO-GO" },
         shown(d.unseen_equals_fp),
         shown(d.unseen_like_fp),
         shown(d.summary_bytes_share),
         shown(d.build_cpu_over_zstd),
-        shown(d.saturation_fp),
-        if saturation_eligible {
-            ""
-        } else {
-            ", body-ineligible: vacuous pass"
-        },
         if fails.is_empty() {
             "none".to_string()
         } else {
             fails.join(", ")
         },
+        match saturation {
+            Saturation::Untested => "untested (no value over 1024 bytes)",
+            Saturation::BodyEligible => "body-eligible",
+            Saturation::BodyIneligible => "body-ineligible",
+        },
+        shown(d.saturation_fp),
     );
     Decision {
         subject: d.subject.clone(),
         go,
+        saturation,
         line,
     }
 }
 
-/// A subject decision read back from a written report, with its problem
-/// count.
+/// A subject decision read back from a written report, with its structural
+/// problem count.
 #[derive(Clone, Debug)]
 pub struct SavedDecision {
     pub decision: Decision,
     pub problems: usize,
 }
 
-/// The `string_fingerprint` section's decision from a report the binary
-/// wrote.
 pub fn saved_decision(json: &str) -> Result<SavedDecision, String> {
     #[derive(Deserialize)]
     struct Saved {
         decision: Decision,
-        problems: Vec<String>,
+        checked: Checked,
     }
     let saved: Saved = serde_json::from_str(json).map_err(|e| format!("report: {e}"))?;
     Ok(SavedDecision {
         decision: saved.decision,
-        problems: saved.problems.len(),
+        problems: saved.checked.problems.len(),
     })
 }
 
@@ -647,6 +894,7 @@ pub fn overall(subjects: &[String], saved: &[SavedDecision]) -> Decision {
     Decision {
         subject: "overall".to_string(),
         go,
+        saturation: Saturation::Untested,
         line: format!(
             "string_fingerprint decision overall: {}; {}",
             if go { "GO" } else { "NO-GO" },
