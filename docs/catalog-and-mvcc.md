@@ -1544,10 +1544,17 @@ removes every ref of that field from the part and attaches the new ones. A
 version 2 leaf is written at a key derived from its own bytes, so it never
 lands on the version 1 leaf's key. The old leaf is neither overwritten nor
 deleted by the rebuild: once HEAD no longer names it, the catalog sweep
-deletes it past the protection horizon like any unreferenced leaf
-(`deleted_kidx`). A prefix GET that fails with a store error defers the
-part, which keeps its refs this run; a prefix that does not decode leaves
-the ref alone, since the reader already reads it uncovered
+deletes it like any unreferenced leaf (`deleted_kidx`). The sweep measures
+the protection horizon from the leaf's own `last_modified`, not from when
+HEAD stopped naming it, so a query pinned to an earlier HEAD can find the
+old leaf gone; that read counts the leaf as rejected and answers the part
+from tier 1, exactly. Every slice of a field is replaced together
+(`a_field_with_one_version_one_slice_hands_every_slice_over`). A prefix GET
+that fails with a store error defers the part, which keeps its refs this
+run, and a rerun replaces them
+(`a_failed_leaf_prefix_get_defers_the_part_and_a_rerun_replaces_it`); a
+prefix that does not decode leaves the ref alone, since the reader already
+reads it uncovered
 (`a_logs_version_one_ref_is_replaced_and_its_leaf_is_kept`). A spans ref is
 never read: spans accept version 1. The leaf build switch does not limit
 any of this: the rebuild writes leaves whether or not

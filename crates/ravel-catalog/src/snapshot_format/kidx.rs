@@ -36,6 +36,13 @@ pub const KEY_INDEX_LEAF_FORMAT_VERSION: u32 = 2;
 /// version is still accepted. See [`key_index_leaf_version_accepted`].
 pub const KEY_INDEX_LEAF_FORMAT_VERSION_1: u32 = 1;
 
+/// Every header `format_version` the decoder parses. Whether a parsed leaf
+/// may answer for its signal is [`key_index_leaf_version_accepted`].
+pub const KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN: [u32; 2] = [
+    KEY_INDEX_LEAF_FORMAT_VERSION_1,
+    KEY_INDEX_LEAF_FORMAT_VERSION,
+];
+
 /// Whether a leaf of `signal` at header `format_version` may answer a
 /// lookup or be carried into a new leaf: [`KEY_INDEX_LEAF_FORMAT_VERSION`]
 /// for every signal, [`KEY_INDEX_LEAF_FORMAT_VERSION_1`] for every signal
@@ -732,9 +739,7 @@ fn validate_prefix(
         header_len,
         prefix_len,
     } = envelope;
-    if header.format_version != KEY_INDEX_LEAF_FORMAT_VERSION
-        && header.format_version != KEY_INDEX_LEAF_FORMAT_VERSION_1
-    {
+    if !KEY_INDEX_LEAF_FORMAT_VERSIONS_KNOWN.contains(&header.format_version) {
         return Err(KeyIndexLeafRejection::UnsupportedVersion(
             header.format_version,
         ));
