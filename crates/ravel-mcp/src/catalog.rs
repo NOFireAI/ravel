@@ -550,6 +550,73 @@ mod tests {
         assert_eq!(actual.len(), 14, "D4 defines exactly 14 envelope blocks");
         assert_eq!(required, actual);
         assert_eq!(advertised, actual);
+
+        // `ravel_get_trace`'s optional `logs` block: the shallow schema
+        // leaves it out of `required` and does not forbid it, and the derived
+        // envelope schema declares it, with its own `visibility` and
+        // `coverage`, as an optional property.
+        let with_logs = Envelope {
+            logs: Some(crate::envelope::LogsLeg {
+                status: crate::envelope::LegStatus::Ok,
+                failure: None,
+                skipped_reason: None,
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                row_cap_hit: false,
+                bytes_cap_hit: false,
+                rows_omitted: 0,
+                visibility: Some(crate::envelope::Visibility::default()),
+                coverage: Some(crate::envelope::Coverage::default()),
+                budget: crate::envelope::LegSpend::default(),
+                span_lookup_budget: crate::envelope::LegSpend::default(),
+            }),
+            ..Envelope::default()
+        };
+        let with_logs = serde_json::to_value(with_logs).expect("envelope serializes");
+        let mut extra: Vec<&str> = with_logs
+            .as_object()
+            .expect("an envelope is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !actual.contains(key))
+            .collect();
+        extra.sort_unstable();
+        assert_eq!(extra, ["logs"]);
+        assert!(!required.contains(&"logs"));
+        assert_ne!(
+            schema.get("additionalProperties"),
+            Some(&Value::Bool(false)),
+            "the shallow schema must not forbid the logs block"
+        );
+
+        let derived = serde_json::to_value(schemars::schema_for!(Envelope))
+            .expect("the derived schema serializes");
+        let derived_required = derived["required"]
+            .as_array()
+            .expect("the derived schema has a required list");
+        assert!(derived["properties"].get("logs").is_some(), "{derived}");
+        assert!(
+            !derived_required.contains(&Value::String("logs".to_string())),
+            "{derived}"
+        );
+        let leg = &derived["$defs"]["LogsLeg"];
+        let mut leg_keys: Vec<&str> = leg["properties"]
+            .as_object()
+            .expect("LogsLeg has properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut serialized: Vec<&str> = with_logs["logs"]
+            .as_object()
+            .expect("the logs block is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        serialized.sort_unstable();
+        leg_keys.sort_unstable();
+        assert_eq!(leg_keys, serialized);
+        assert!(serialized.contains(&"visibility") && serialized.contains(&"coverage"));
     }
 
     /// The `status` property enumerates the four D4 values, in the wire

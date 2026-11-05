@@ -831,6 +831,14 @@ pub struct LogsLeg {
     pub row_cap_hit: bool,
     pub bytes_cap_hit: bool,
     pub rows_omitted: u64,
+    /// The snapshot and ingest watermark the leg's own statement resolved;
+    /// the top-level `visibility` is the span lookup's. Null when the leg is
+    /// `skipped` or `failed`, and when the byte cap cut the block to its
+    /// smallest form.
+    pub visibility: Option<Visibility>,
+    /// Whether the leg's own read was complete; the top-level `coverage` is
+    /// the span lookup's. Null in the same cases as `visibility`.
+    pub coverage: Option<Coverage>,
     /// The leg's own spend. Its estimate is never an upper envelope.
     pub budget: LegSpend,
     /// The span lookup's own spend. `budget` at the top level is the sum of
