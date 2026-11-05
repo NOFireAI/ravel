@@ -149,6 +149,10 @@ stream id, then `ts.div_euclid(W)`, then canonical input order. Part cuts
 (`PartSink`, the memory split target and the stored-size target) run on that
 sequence unchanged.
 
+This sizing assumes a block belongs to one or a few streams. On an L0 whose
+blocks each carry hundreds of streams, every range needs one block per
+input and no pass fits; see the #3853 amendment below.
+
 On clustered inputs (W above 1), today's merge splits a stream whose
 per-bucket reservation sum exceeds `merge_cursor_budget_bytes` into several
 batches in input order (ADR-2135 decision 2, `reservation_batches`,
@@ -228,6 +232,10 @@ stream size stay exactly as ADR-0065 decision 4 states them.
 | this fixture, hours 08 and 09 | the band follows the path each run's logged decision line names. Resident: GETs per merge at most 1.1 × (N × catalog GETs + N row groups). Fetch-per-pass: at most 1.1 × (N × catalog GETs + P × N row groups), with P logged. Either way, wall time within 10 × that run's own fetch time at `k` in flight. Run once with `ravel-cli maintain compact-bucket` (a 20 GiB ceiling) and once with ravel-server at its defaults (a 5 GiB ceiling). | measured on run 2's bucket, which is kept (predicted) |
 | a mixed fleet | a 0.30.x compactor and a new one converge on the same parts through `CreateIfAbsent` | follows from byte-identical parts; the golden test above pins it |
 
+The "this fixture, hours 08 and 09" row is a measured miss: on that bucket
+the merge plans cursor mode and finishes neither hour. The #3853 amendment
+below records the measurement, and ADR-3853 carries the replacement bands.
+
 ## Rejected alternatives
 
 - **A per-cursor cache.** Each `StreamCursor` would keep its own fetched
@@ -264,7 +272,8 @@ stream size stay exactly as ADR-0065 decision 4 states them.
   per shard-hour on this fixture. It is bounded by D1's
   `merge_resident_ceiling_bytes`, which ravel-server sets to 5 GiB at its
   defaults. That is below this fixture's raw bytes per shard-hour, so on
-  this fixture ravel-server at its defaults takes the fetch-per-pass path.
+  this fixture ravel-server at its defaults takes the fetch-per-pass path
+  (this did not hold: it takes cursor mode, see the #3853 amendment below).
   When the bytes do not fit, the merge falls back to one fetch per row
   group per pass.
 - ADR-0065 decision 4 and the ADR-0032 memory text gain an amendment that
@@ -284,3 +293,46 @@ stream size stay exactly as ADR-0065 decision 4 states them.
   on this workload, so a shard-hour yields hundreds of small L1 objects.
 - The fold's postings build fails with "bad magic bytes" on this bucket
   (#2861).
+
+## Amendment (2026-11-05): the motivating bucket plans cursor mode (issue #3853)
+
+<!-- amendment-applies: sections="D2. Emit in stream-range passes, decoding each block once per pass|Commitments and their tests|Consequences" pointer="#3853 amendment" -->
+<!-- amendment-supersedes: phrase="ravel-server at its defaults takes the fetch-per-pass path" pointer="#3853 amendment" -->
+
+Measured 2026-11-05 on the bucket this ADR was written for (image
+`manual-ad0ab23`, ravel-server `--mode maintain --maintain-unit-concurrency
+1`, so a 20 GiB ceiling), hour 498271, shard 0, the merge logged:
+
+```
+inputs=17066 streams=2477 raw_bytes=3890845094 compared_bytes=23053674799
+ceiling_bytes=21474836480 pass_budget_bytes=0
+largest_stream_pass_bytes=171164619526 hot_streams=2477 mode="cursor"
+```
+
+Hour 498273, shard 0 (19,177 inputs, 16.7 GiB) planned cursor too and was
+stopped unfinished after 64 minutes at 8 reads in flight and after 34
+minutes at 64 (#3819 comment 6660371946). So on this bucket the merge
+takes neither D1 nor D2, and the Consequences bullet that said ravel-server
+at its defaults takes the fetch-per-pass path is withdrawn: it takes
+cursor mode, the merge before this ADR.
+
+Why: every L0 block on this bucket carries about 1,800 of the 2,477
+streams, so each stream's candidate set is one block per input and its
+estimate under D2's sizing is `N x pass_block_cost(one block)`, 171 GB
+against 3.9 GB raw. `hot_split` marks every stream hot and the hot cursor
+charge leaves no pass budget. The charge is not an overstatement of D2's
+mechanism: a pass holds a decoded block whole until its last wanted row is
+emitted, as D2 says, so the memory floor of any stream-range pass on such a
+bucket is one decoded block per input, `N x h`, which no ceiling holds at
+N near 19,000. D2 therefore applies when `N x pass_block_cost(one block)`
+fits the pass budget, a few hundred inputs on this schema, and not beyond.
+The fixtures named under "Why no test caught it" gave each stream its own
+blocks, so no test planned a merge where one block carries many streams.
+
+The commitments row "this fixture, hours 08 and 09" is a measured miss. The
+rejected "shuffle through transient objects" alternative named decode CPU
+under a large pass count as its trigger; the trigger fired in a stronger
+form, no pass fits at all. ADR-3853 is the decision that follows: the merge
+of a many-input bucket runs in two levels, groups of a few hundred inputs
+each merged by this ADR's resident path into transient runs, then one merge
+over the runs in today's order. Its band table replaces the missed row.
