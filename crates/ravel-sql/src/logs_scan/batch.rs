@@ -5946,6 +5946,160 @@ mod tests {
             }
         }
 
+        /// ADR-0093, exact not-equal amendment, T8: the scan's row filter
+        /// keeps a served plain block's memo values. The block is built on
+        /// the plain memo fast path (`PLAIN_MEMO_FAST_PATHS` counts it), the
+        /// filter drops the block's three `''` rows, and the filtered column's
+        /// values are the very `ArrayRef` the scan's [`StrValuesCache`] holds
+        /// for the block, over the memo's buffer. Charging the filtered batch
+        /// grows the stream by the batch's own arrays only: the cache charged
+        /// the shared values once.
+        ///
+        /// Flipped: narrowing in the reader leaves the fast-path count at 0
+        /// and fails "the plain memo fast path ran"; filtering through `take`
+        /// and a values compaction or cast gives a new values array and fails
+        /// "the cache's own values array".
+        #[test]
+        fn a_row_filter_keeps_the_served_plain_blocks_memo_values() {
+            use datafusion::common::DFSchema;
+            use datafusion::physical_expr::create_physical_expr;
+            use datafusion::physical_expr::execution_props::ExecutionProps;
+            use datafusion::prelude::{col, lit};
+
+            let rows = 12;
+            let value = |r: usize| {
+                if r % 4 == 1 {
+                    String::new()
+                } else {
+                    format!("value-{r}")
+                }
+            };
+            let block = fixed_block(
+                &[FieldType::Str],
+                (0..rows)
+                    .map(|r| vec![str_value(value(r).as_bytes())])
+                    .collect(),
+                0,
+                rows - 1,
+            );
+            let cfg = cfg();
+            let obj = encode(&block, &cfg);
+            let declared = [DeclaredColumn::new(KEY, DeclaredType::Str)];
+            let full = crate::logs_schema::logs_schema_with_declared(&declared);
+            let projection = vec![FIRST_DECLARED_COL];
+            let schema: SchemaRef = Arc::new(full.project(&projection).expect("project"));
+            let literal = ScalarValue::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(ScalarValue::Utf8(Some(String::new()))),
+            );
+            let expr = create_physical_expr(
+                &col(KEY).not_eq(lit(literal)),
+                &DFSchema::try_from(full.as_ref().clone()).expect("df schema"),
+                &ExecutionProps::new(),
+                &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
+            )
+            .expect("physical expression");
+            let filters = RowFilters::new(vec![expr])
+                .bind(&schema, None, Arc::clone(&schema))
+                .expect("bind")
+                .expect("a filter");
+
+            let cache = Arc::new(DecodedColumnCache::new(1 << 30, None));
+            let reader = RlogReader::new(&obj, &cfg).expect("open");
+            for pass in ["admitting", "served"] {
+                let mut scan = reader
+                    .scan_blocks(&window(&block), &[], &ColumnSelection::all())
+                    .expect("scan");
+                scan.attach_decoded_cache(attach(&cache));
+                let view = scan
+                    .next_block_columnar(&obj)
+                    .expect("columnar exit")
+                    .expect("one block");
+                let cid = str_column_id(&view).expect("a Str column");
+                assert!(view.str_dict(cid).is_none(), "{pass}: a plain page");
+                let pool = unbounded_pool();
+                let shared = test_str_values(&pool);
+                let before = fast_paths();
+                let built = build_columnar_batches(
+                    &view,
+                    &schema,
+                    &projection,
+                    &declared,
+                    &[],
+                    full.fields().len(),
+                    None,
+                    &shared,
+                    &Count::new(),
+                )
+                .expect("batches");
+                assert_eq!(
+                    fast_paths() - before,
+                    1,
+                    "{pass}: the plain memo fast path ran"
+                );
+                let dropped = Count::new();
+                let filtered = filter_batches(&filters, built, &dropped).expect("filter");
+                assert_eq!(dropped.value(), 3, "{pass}: the '' rows");
+                assert_eq!(filtered.len(), 1);
+                let column = filtered[0].column(0).as_dictionary::<Int32Type>();
+                let kept: Vec<&str> = (0..column.len())
+                    .map(|i| {
+                        column
+                            .values()
+                            .as_string::<i32>()
+                            .value(column.keys().value(i) as usize)
+                    })
+                    .collect();
+                let want: Vec<String> = (0..rows).map(value).filter(|v| !v.is_empty()).collect();
+                assert_eq!(kept, want, "{pass}");
+
+                let memo = view
+                    .str_values_memo(cid)
+                    .and_then(|m| m.get())
+                    .and_then(|m| m.as_any().downcast_ref::<StrMemo>())
+                    .and_then(|m| m.array.clone())
+                    .expect("a memo array");
+                let held = lock_str_values(&shared)
+                    .plain
+                    .first()
+                    .map(|v| Arc::clone(&v.array))
+                    .expect("the cache holds the block's values");
+                assert!(
+                    Arc::ptr_eq(column.values(), &held),
+                    "{pass}: the cache's own values array"
+                );
+                assert_eq!(
+                    column.values().as_string::<i32>().values().as_ptr(),
+                    memo.values().as_ptr(),
+                    "{pass}: over the memo's buffer"
+                );
+
+                let own: usize = filtered
+                    .iter()
+                    .flat_map(|b| b.columns())
+                    .map(|c| {
+                        let values = c
+                            .as_any_dictionary_opt()
+                            .map_or(0, |d| d.values().get_array_memory_size());
+                        c.get_array_memory_size() - values
+                    })
+                    .sum();
+                let cached = lock_str_values(&shared).reserved();
+                let stream = MemoryConsumer::new("stream").register(&pool);
+                let (_, bytes) =
+                    charge_columnar_batches(filtered, &shared, &stream).expect("charged");
+                assert_eq!(
+                    bytes, own,
+                    "{pass}: the stream charges the batch's own arrays"
+                );
+                assert_eq!(
+                    lock_str_values(&shared).reserved(),
+                    cached,
+                    "{pass}: the shared values stay charged once, by the cache"
+                );
+            }
+        }
+
         /// A clock a test advances by hand.
         #[derive(Default)]
         struct TestClock(AtomicU64);

@@ -112,6 +112,8 @@ mod logs_selective_scan_amplification;
 mod logs_stats_load;
 #[path = "logs_str_dict_charge.rs"]
 mod logs_str_dict_charge;
+#[path = "logs_str_not_equal_row_filter.rs"]
+mod logs_str_not_equal_row_filter;
 #[path = "logs_striped_directory_accounting.rs"]
 mod logs_striped_directory_accounting;
 #[path = "logs_topk_global_block_order.rs"]
