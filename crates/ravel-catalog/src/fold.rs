@@ -1455,6 +1455,17 @@ async fn read_entry_key_index_counted(
         return Err("KEY_IDX section crc mismatch".to_string().into());
     }
     let fields = decode_key_idx(&section.data, prefix_len).map_err(|e| e.to_string())?;
+    // A leaf answers a logs probe, so it may only carry keys the reader's
+    // resolution rule produced; a version 1 RLOG section's entry is uncovered.
+    if signal == Signal::Logs {
+        let version = section.data.first().copied().unwrap_or_default();
+        if !ravel_logseg::key_index::section_resolves_like_the_reader(version) {
+            return Err(format!(
+                "RLOG KEY_IDX section at version {version} does not resolve like the reader"
+            )
+            .into());
+        }
+    }
     for field in &fields {
         if let Some((_, block)) = field
             .entries
