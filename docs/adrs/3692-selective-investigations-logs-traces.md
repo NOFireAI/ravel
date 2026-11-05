@@ -384,7 +384,11 @@ docs/catalog-and-mvcc.md, with these choices fixed here:
   The leaf header has no field that could carry the section version, so
   the reader cannot make this distinction; the writer must. The leaf
   switch has been off by default since it shipped, so no leaf in a
-  deployment that kept the default holds a version 1 entry; a deployment
+  deployment that kept the default holds a version 1 entry (retired by the
+  leaf format version 2 amendment: the rebuild writes leaves whatever the
+  switch, so a default deployment can hold such a leaf; the leaf header
+  now carries format version 2, logs reject version 1, and the rebuild
+  replaces those refs); a deployment
   that turned it on before this change repairs with `catalog fold
   --rebuild-key-index`, and the Rollout paragraph of
   docs/catalog-and-mvcc.md says so.
@@ -1011,3 +1015,76 @@ changes:
 | row 7 at the T12 spans corpus, real S3 | `G` passes, 2 x (new + still uncovered) x `G` section GETs plus one per previous leaf | as row 7 above | predicted |
 
 Refs: #3704, #3692
+
+## Amendment (issue #3703): leaf format version 2
+
+<!-- amendment-applies: sections="4. Logs: the router runs once per scan, before the per-segment loop" pointer="leaf format version 2 amendment" -->
+<!-- amendment-supersedes: phrase="no leaf in a deployment that kept the default holds a version 1 entry" pointer="leaf format version 2 amendment" -->
+
+Decision 4 made the writer list a version 1 RLOG KEY_IDX section as
+uncovered and left the reader unable to tell a leaf built before that
+change from one built after, on the ground that a deployment that kept
+the leaf switch at its default holds no such leaf. That ground is false:
+`catalog fold --rebuild-key-index` writes leaves whatever
+`build_key_index_leaves` says, so any deployment that ran the repair holds
+logs leaves that can prove absent a key a version 1 entry holds, and the
+rebuild, which reads only parts lacking a ref, never replaced them. This
+amendment gives the reader the distinction decision 4 said it could not
+make.
+
+- **Version.** The writer writes `KeyIndexLeafHeader.format_version` 2
+  (`KEY_INDEX_LEAF_FORMAT_VERSION`,
+  crates/ravel-catalog/src/snapshot_format/kidx.rs:30). The decoder
+  accepts 1 and 2; the accept rule is per signal
+  (`key_index_leaf_version_accepted`, kidx.rs:43): version 2 for every
+  signal, version 1 for every signal except logs. A refused leaf is
+  `KeyIndexLeafRejection::UnsupportedVersion`, counted under
+  `leavesRejected`, and its part reads uncovered for the field
+  (kidx.rs:865).
+- **Why logs only.** The gap is RLOG's: RLOG KEY_IDX version 1 left hidden
+  scalars unindexed, and RLOG writes version 2 sections since #3039
+  (crates/ravel-logseg/src/key_index.rs:37-53). RSPAN still writes
+  section version 1 and keys the fixed 16-byte `trace_id` column
+  (crates/ravel-rspan/src/writer.rs:220-227 through `key8_id16`,
+  crates/ravel-rspan/src/key_index.rs:65); the reader probes the same key
+  (crates/ravel-query/src/span_fetcher.rs:1261 and :2199). `trace_id` is
+  not a merged-attribute view, so no resource or scope entry can claim
+  it, and a spans leaf at version 1 has no gap. A bump refused on every
+  signal would leave every sealed spans part uncovered until someone ran
+  the rebuild, a regression with no correctness gain.
+- **Carry.** The incremental tail build treats a previous logs leaf at
+  version 1 like one that does not verify: the carry is refused and every
+  entry's section is read (crates/ravel-catalog/src/fold.rs:1886). A
+  version 1 leaf is therefore never copied into a version 2 one.
+- **Rebuild.** On logs, before any batch, the rebuild reads each ref of a
+  requested field with one ranged GET of `[0, prefix_len)`, counted when
+  issued (`leaf_prefix_gets`, `leaf_prefix_bytes_read`;
+  crates/ravel-catalog/src/key_index_rebuild.rs:479). That GET is paid on
+  every run, by a tenant with no version 1 leaf too. A field one of whose
+  refs is version 1 is built again from the sections, and the publish
+  replaces every ref of that field on the part. The new leaf is
+  content-addressed, so it lands at a new key. The old leaf is neither
+  overwritten nor deleted by the rebuild; once HEAD no longer names it,
+  the catalog sweep deletes it past `protection_horizon_ns` like any
+  unreferenced leaf (`deleted_kidx`). A prefix GET that fails with a store
+  error defers the part, which keeps its refs this run. A spans ref costs
+  no GET.
+- **Migration class.** The leaf stays a Class B derived catalog object
+  (ADR-2707 decision 4, ADR-0066 decision 4): no data object, commit
+  record or HEAD field changes, and every leaf can be rebuilt from the
+  sections. Readers: spans read 1 and 2, logs read 2.
+- **Rollback.** A binary older than this one accepts only version 1. It
+  rejects a version 2 leaf and reads that part uncovered, which costs the
+  tier-1 route but stays exact, and its carry falls back to section reads.
+  Its rebuild sees the ref present and leaves it alone.
+
+| amendment check | target | miss | source |
+|---|---|---|---|
+| accept rule | logs accept 2 only; spans accept 1 and 2 | any other pair | crates/ravel-catalog/src/snapshot_format/kidx/tests.rs:452 |
+| logs query over a version 1 leaf | rows equal the unfolded answer; 1 leaf GET (the prefix), `leavesRejected` 1, `partsCovered` 0 | a missing row, or a covered part | services/ravel-server/tests/sql_logs_key_index_tier2.rs:974 |
+| advancing fold over a version 1 logs tail leaf | 1 previous leaf GET, 0 entries carried, every section read (24 of 24), the version 1 section's entry uncovered in a version 2 leaf, rows equal the unfolded answer | a carried entry, or a missing row | services/ravel-server/tests/sql_logs_key_index_tier2.rs:1016 |
+| rebuild over one logs part holding a version 1 ref | 1 part refused, 1 prefix GET of `prefix_len` bytes, 1 part rebuilt, 1 leaf written at a new key, the old leaf kept byte-equal | any other figure, or an overwritten or deleted leaf | crates/ravel-catalog/src/key_index_rebuild.rs:2248; crates/ravel-catalog/src/key_index_rebuild.rs:2297 |
+| rebuild over a spans part holding a version 1 ref | 0 parts, 0 prefix GETs, HEAD unchanged | any GET of a leaf | crates/ravel-catalog/src/key_index_rebuild.rs:2306 |
+| spans lookup over a version 1 leaf | prunes and opens only the holder | a rejected leaf | services/ravel-server/tests/spans_trace_key_index_routing.rs:921 |
+
+Refs: #3703, #3692

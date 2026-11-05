@@ -22,7 +22,7 @@ use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -181,6 +181,24 @@ impl LeafDecodeBudget for Arc<ravel_memory::MemoryBudget> {
     }
 }
 
+/// Why a [`LeafRangeReader`] returned no bytes.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LeafReadError {
+    /// The reader's fetch reservation refused the range before any GET; the
+    /// part counts as [`KeyIndexPartOutcome::ReservationRefused`].
+    #[error("{0}")]
+    ReservationRefused(String),
+    /// The part counts as [`KeyIndexPartOutcome::Rejected`].
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for LeafReadError {
+    fn from(message: String) -> Self {
+        LeafReadError::Failed(message)
+    }
+}
+
 /// The ranged byte source for leaf objects: the fetcher's cached ranged
 /// read in production. A read that reaches the store charges its GET and
 /// wire bytes to `accounting`; a cache hit charges none.
@@ -190,7 +208,7 @@ pub trait LeafRangeReader: Sync {
         leaf: &'a SnapshotKeyIndexLeafRef,
         range: Range<u64>,
         accounting: &'a QueryAccounting,
-    ) -> BoxFuture<'a, Result<Bytes, String>>;
+    ) -> BoxFuture<'a, Result<Bytes, LeafReadError>>;
 }
 
 /// An uncached [`LeafRangeReader`]: one ranged store GET per read.
@@ -210,14 +228,14 @@ impl LeafRangeReader for StoreLeafReader {
         leaf: &'a SnapshotKeyIndexLeafRef,
         range: Range<u64>,
         accounting: &'a QueryAccounting,
-    ) -> BoxFuture<'a, Result<Bytes, String>> {
+    ) -> BoxFuture<'a, Result<Bytes, LeafReadError>> {
         Box::pin(async move {
             accounting.record_s3_request(AccountedOp::Get);
             let got = self
                 .store
                 .get(&leaf.key, GetRange::Range(range.start, range.end))
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| LeafReadError::Failed(e.to_string()))?;
             accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
             Ok(got.data)
         })
@@ -670,6 +688,7 @@ async fn probe_part(
             b_run: part_policy.b_run,
             max_bridged_bytes: bridged_left,
         };
+        let read_refused = AtomicBool::new(false);
         let probe = input
             .catalog
             .probe_key_index_leaf_set_with(
@@ -677,7 +696,18 @@ async fn probe_part(
                 &request,
                 keys,
                 &input.limits,
-                |range| input.reader.read_range(leaf_ref, range, leaf_accounting),
+                |range| {
+                    let read = input.reader.read_range(leaf_ref, range, leaf_accounting);
+                    let read_refused = &read_refused;
+                    async move {
+                        read.await.map_err(|err| {
+                            if matches!(err, LeafReadError::ReservationRefused(_)) {
+                                read_refused.store(true, Ordering::Relaxed);
+                            }
+                            err.to_string()
+                        })
+                    }
+                },
                 &policy,
                 |bytes| input.budget.try_reserve(bytes).ok(),
             )
@@ -706,6 +736,11 @@ async fn probe_part(
                         }
                     }
                 }
+            }
+            KeyIndexSetAnswer::Rejected(KeyIndexLeafRejection::Read(_))
+                if read_refused.load(Ordering::Relaxed) =>
+            {
+                return Ok((gets, PartOutcome::ReservationRefused));
             }
             KeyIndexSetAnswer::Rejected(rejection) => {
                 tracing::warn!(

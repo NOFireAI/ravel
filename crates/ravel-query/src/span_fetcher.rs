@@ -43,7 +43,7 @@
 use std::sync::Arc;
 
 use crate::fetcher::{ReadCache, gate_not_run};
-use crate::key_index_route::{KeySet, KeySetError, LeafRangeReader};
+use crate::key_index_route::{KeySet, KeySetError, LeafRangeReader, LeafReadError};
 use crate::phase_accounting::{PhaseAccounting, QueryPhase};
 use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
@@ -2224,7 +2224,7 @@ impl LeafRangeReader for SpanLeafRangeReader<'_> {
         leaf: &'b SnapshotKeyIndexLeafRef,
         range: std::ops::Range<u64>,
         accounting: &'b QueryAccounting,
-    ) -> BoxFuture<'b, Result<Bytes, String>> {
+    ) -> BoxFuture<'b, Result<Bytes, LeafReadError>> {
         Box::pin(async move {
             let content_hash: [u8; 32] = leaf
                 .blake3
@@ -2236,7 +2236,8 @@ impl LeafRangeReader for SpanLeafRangeReader<'_> {
                 return Err(format!(
                     "leaf {}: range {range:?} outside {} bytes",
                     leaf.key, leaf.size
-                ));
+                )
+                .into());
             }
             let bytes = self
                 .fetcher
@@ -2257,7 +2258,8 @@ impl LeafRangeReader for SpanLeafRangeReader<'_> {
                     "leaf {}: short read, {} bytes of {len}",
                     leaf.key,
                     bytes.len()
-                ));
+                )
+                .into());
             }
             Ok(bytes)
         })

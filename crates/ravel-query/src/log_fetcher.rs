@@ -57,7 +57,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::config::EngineConfigError;
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::{MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, ReadCache, bound_runs, gate_not_run};
-use crate::key_index_route::{KeySet, KeySetError, LeafRangeReader};
+use crate::key_index_route::{KeySet, KeySetError, LeafRangeReader, LeafReadError};
 use crate::phase_accounting::{PhaseAccounting, PhaseWireByteCounter, QueryPhase};
 use crate::reserved_bytes::attach_reservation;
 use crate::span_fetcher::{KeyIndexPruning, key_idx_frame_decompressed_len};
@@ -1325,9 +1325,6 @@ impl LogSegmentFetcher {
                             "GetLimiter semaphore closed unexpectedly".to_string(),
                         ))
                     })?;
-                    // Counted once issued, so a GET whose future is dropped
-                    // mid-flight is still charged; bytes count on arrival.
-                    accounting.record_s3_request(AccountedOp::Get);
                     self.store
                         .get(key, GetRange::Range(start, end))
                         .in_get_phase(phase.into())
@@ -1335,6 +1332,7 @@ impl LogSegmentFetcher {
                         .map_err(store_error)?
                 };
                 let len = got.data.len() as u64;
+                accounting.record_s3_request(AccountedOp::Get);
                 accounting.add_s3_bytes(AccountedOp::Get, len);
                 self.wire_bytes.record(phase, len);
                 Ok::<_, LogFetchError>((got, reservation))
@@ -1793,8 +1791,6 @@ impl LogSegmentFetcher {
                                 "GetLimiter semaphore closed unexpectedly".to_string(),
                             ),
                         })?;
-                // Counted once issued; bytes count on arrival.
-                accounting.record_s3_request(AccountedOp::Get);
                 self.store
                     .get(key, GetRange::Full)
                     .in_get_phase(ReadPhases::SCAN.blocks.into())
@@ -1807,6 +1803,7 @@ impl LogSegmentFetcher {
             .instrument(fetch_span.clone())
             .await?;
             let bytes = attach_reservation(got.data, reservation);
+            accounting.record_s3_request(AccountedOp::Get);
             accounting.add_s3_bytes(AccountedOp::Get, bytes.len() as u64);
             // #913: a data read, so the whole object's wire bytes are the
             // scan phase's (`ReadPhases::SCAN.blocks`).
@@ -3596,8 +3593,6 @@ impl LogSegmentFetcher {
                                 "GetLimiter semaphore closed unexpectedly".to_string(),
                             ),
                         })?;
-                // Counted once issued; bytes count on arrival.
-                accounting.record_s3_request(AccountedOp::Get);
                 self.store
                     .get(key, GetRange::Full)
                     .in_get_phase(phase.into())
@@ -3609,6 +3604,7 @@ impl LogSegmentFetcher {
             }
             .instrument(fetch_span.clone())
             .await?;
+            accounting.record_s3_request(AccountedOp::Get);
             accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
             self.wire_bytes.record(phase, got.data.len() as u64);
             fetch_span.record("s3_requests", 1u64);
@@ -3630,13 +3626,12 @@ impl LogSegmentFetcher {
                             "GetLimiter semaphore closed unexpectedly".to_string(),
                         )
                     })?;
-                    // Counted once issued; bytes count on arrival.
-                    accounting.record_s3_request(AccountedOp::Get);
                     let got = self
                         .store
                         .get(key, GetRange::Full)
                         .in_get_phase(phase.into())
                         .await?;
+                    accounting.record_s3_request(AccountedOp::Get);
                     accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
                     self.wire_bytes.record(phase, got.data.len() as u64);
                     Ok(got.data)
@@ -4815,7 +4810,7 @@ impl LeafRangeReader for LogLeafRangeReader<'_> {
         leaf: &'b SnapshotKeyIndexLeafRef,
         range: std::ops::Range<u64>,
         accounting: &'b QueryAccounting,
-    ) -> BoxFuture<'b, Result<Bytes, String>> {
+    ) -> BoxFuture<'b, Result<Bytes, LeafReadError>> {
         Box::pin(async move {
             let content_hash: [u8; 32] = leaf
                 .blake3
@@ -4827,7 +4822,8 @@ impl LeafRangeReader for LogLeafRangeReader<'_> {
                 return Err(format!(
                     "leaf {}: range {range:?} outside {} bytes",
                     leaf.key, leaf.size
-                ));
+                )
+                .into());
             }
             self.fetcher
                 .read_leaf_range(
@@ -4839,7 +4835,12 @@ impl LeafRangeReader for LogLeafRangeReader<'_> {
                     accounting,
                 )
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| match e {
+                    LogFetchError::FetchMemoryExhausted { .. } => {
+                        LeafReadError::ReservationRefused(e.to_string())
+                    }
+                    e => LeafReadError::Failed(e.to_string()),
+                })
         })
     }
 }
@@ -5888,10 +5889,6 @@ impl BlockRangeFetcher {
                     "GetLimiter semaphore closed unexpectedly".to_string(),
                 ),
             })?;
-        // The request is counted once issued, so a GET whose future is
-        // dropped mid-flight, or that fails, is still charged; bytes count on
-        // arrival.
-        accounting.record_s3_request(AccountedOp::Get);
         let got = self
             .store
             .get(key, range)
@@ -5901,6 +5898,7 @@ impl BlockRangeFetcher {
                 key: key.to_string(),
                 source,
             })?;
+        accounting.record_s3_request(AccountedOp::Get);
         accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
         self.wire_bytes.record(phase, got.data.len() as u64);
         Ok(got)
