@@ -2796,6 +2796,69 @@ async fn a_result_json_cannot_encode_is_422_naming_the_column_and_arrow_ipc_read
     assert_eq!(values, vec![MILLIS]);
 }
 
+/// Issue #3838: an integer `sum` whose total leaves `Int64` fails the query
+/// with 422 `execution` and a message naming the aggregate and the result
+/// type, in JSON and in Arrow IPC alike, instead of returning a wrapped value.
+/// A total that fits comes back exactly.
+#[tokio::test]
+async fn an_integer_sum_that_overflows_is_422_naming_the_aggregate() {
+    use arrow::array::{Array, Int64Array};
+    use arrow::ipc::reader::StreamReader;
+
+    // 5e18 and 4e18 are exact in f64 and in Int64; two of the first leave
+    // Int64, two of the second do not.
+    let app = one_tenant_app("m", &[(100, 5e18), (200, 5e18)]).await;
+    let query = "SELECT sum(CAST(value AS BIGINT)) AS s FROM samples";
+    let expected = "integer sum overflow in sum(samples.value): the sum overflowed its result \
+                    type Int64";
+
+    let (status, value) = post_json(&app, "acme-token", query).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+    assert_eq!(value["errorType"], "execution", "{value}");
+    assert_eq!(value["error"].as_str(), Some(expected), "{value}");
+
+    let (status, bytes) = post(
+        &app,
+        Some("acme-token"),
+        Some(ARROW_STREAM_MEDIA_TYPE),
+        body(query),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(
+        String::from_utf8_lossy(&bytes).contains(expected),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    let app = one_tenant_app("m", &[(100, 4e18), (200, 4e18)]).await;
+    let (status, bytes) = post(
+        &app,
+        Some("acme-token"),
+        Some(ARROW_STREAM_MEDIA_TYPE),
+        body(query),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    let reader = StreamReader::try_new(bytes.as_slice(), None).expect("ipc reader");
+    let mut sums = Vec::new();
+    for batch in reader {
+        let batch = batch.expect("batch");
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 column");
+        sums.extend((0..col.len()).map(|i| col.is_valid(i).then(|| col.value(i))));
+    }
+    assert_eq!(sums, vec![Some(8_000_000_000_000_000_000)]);
+}
+
 #[tokio::test]
 async fn an_unauthenticated_request_is_rejected() {
     let app = one_tenant_app("m", &[(1, 1.0)]).await;
