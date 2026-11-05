@@ -1613,7 +1613,8 @@ finding of review #1388). This other-rows order amendment closes that.
    names a projected alias that defines it. `count(...)` was the only
    function an order term could carry before this; it no longer can, and
    no function is admitted. (Superseded for count(...): see the pinned
-   segment set amendment below.)
+   segment set amendment below. Superseded for a proven `min` or `max`:
+   see the min/max proof amendment below.)
 2. The statement is not refused. `ravel_query_sql` treats this outcome as
    the query-sql amendment, item 1, treats `NoOrdering`: it runs the
    statement as written, unpaged, and returns the rows up to `max_rows`; a
@@ -1796,7 +1797,10 @@ matters and gives the count order its cursor back.
    ravel-mcp digests them (`ravel_mcp::cursor::segment_set_digest`). A
    key embeds the object's content hash (ADR-0010 section 7), so equal
    digests mean byte-identical segments and so identical values for every
-   expression over them. `CURSOR_VERSION` goes from 6 to 7, and a version
+   expression over them. (Corrected by the min/max proof amendment below:
+   identical values for `count`, `min`, `max` and an integer `sum`, not for
+   a float `sum` or an `avg`, whose order of float additions across
+   partitions is not fixed.) `CURSOR_VERSION` goes from 6 to 7, and a version
    6 token decodes as `cursor_invalid`, as versions 3, 4 and 5 do. The
    digest is 33 bytes in the token with its presence byte (1 when no
    digest is pinned) and does not grow with the segment count, which the
@@ -1823,7 +1827,8 @@ matters and gives the count order its cursor back.
    (`count(*)`, `count(x)`, `count(DISTINCT x)`, a `FILTER` clause,
    `count(*) OVER (PARTITION BY ..)`, a negated count), written in the
    `ORDER BY` or through an alias: a count is not NULL and is an `Int64`.
-   It is the one function admitted; the other-rows order amendment's item
+   It is the one function admitted (until the min/max proof amendment
+   below); the other-rows order amendment's item
    1 said that no function is admitted, and that now holds for every
    function but count. Two count forms stay unpaged: a count over a
    `ROWS` frame or a named window, which counts positions that ties under
@@ -2087,3 +2092,79 @@ deferred it. This logs-leg amendment ships it and records each choice.
     records are in `structuredContent` alone.
 13. `tools/list`. The `include_logs` input doc is rewritten to the same
     length, so the pinned sizes of item F (16,177 and 24,066 bytes) hold.
+
+## Amendment (2026-11-05, #3779): the min/max proof amendment, a grouped `min` or `max` over a NOT NULL column pages
+
+<!-- amendment-applies: sections="Amendment (2026-11-03, #3774): the pinned segment set amendment, a cursor pins a digest of the segment set and a count order pages again|Amendment (2026-11-03, #3749): the other-rows order amendment, an aggregate or window order term carries no cursor" pointer="min/max proof amendment" -->
+<!-- amendment-supersedes: phrase="It is the one function admitted" pointer="min/max proof amendment" -->
+
+The pinned segment set amendment, item 4, gave `count(...)` its cursor
+back and left `min` and `max` unpaged, because the text alone does not
+prove them non-null: over no rows each is NULL, and NULL is not a resume
+value. Under page one's segment set a `min` or `max` is as fixed as a
+count, so what it lacked was the proof, not the pin. This min/max proof
+amendment adds the proof.
+
+1. The proof. A `min(col)` or `max(col)` order term, written in the
+   `ORDER BY` or through an alias, plans when every link holds: the
+   statement's relation is the target table under its own column names (no
+   derived table, CTE, join, positional rename list or sampled relation);
+   it has a plain `GROUP BY` with at least one key, so every group holds
+   at least one row; the call carries no `FILTER`, `OVER`, `WITHIN GROUP`,
+   null treatment, parameters or argument-list clause, any of which can
+   leave a group's input empty or change the value (`DISTINCT` is allowed,
+   since it never removes a group's last value); its one argument is a
+   bare column name; and that column is NOT NULL in the table's static
+   schema. A group then holds a non-null value of the column, so the
+   extreme is not NULL, and its type is the column's
+   (`crates/ravel-sql/src/page_plan.rs`, `aggregate_proof`).
+2. The argument is read from the schema, never through the projection. In
+   `SELECT value AS ts, max(ts) AS m FROM samples GROUP BY value`, `max(ts)`
+   is proven off `samples.ts`, and DataFusion resolves it the same way: an
+   executed check returns a nanosecond timestamp per group, the latest
+   `ts`, never the float `value`
+   (`an_aggregate_argument_named_like_an_alias_reads_the_from_column` in
+   `crates/ravel-sql/tests/page_walk.rs`).
+3. The allowlist, by column type, with the resume kind each plans with:
+   `Int8` to `Int64` as `Int`, `UInt8` to `UInt64` as `UInt`, `Utf8` and
+   `LargeUtf8` as `Str`, and `Timestamp(Nanosecond)` with no zone as
+   `TimestampNanos`. Off it: every float, whose NaN no cursor carries;
+   `Boolean`, `Binary` and `FixedSizeBinary`, which a cursor could carry
+   but which no executed walk covers yet, so `min(series_id)` stays
+   unpaged; and every other type.
+4. What stays unpaged, each as `OrderTermFromOtherRows`, run as written:
+   an ungrouped aggregate, `GROUP BY ALL` and `GROUP BY ()`; `ROLLUP`,
+   `CUBE`, `GROUPING SETS` and `WITH TOTALS`, whose subtotal rows can
+   group over no rows; a call with any clause item 1 excludes; an argument
+   that is not a bare column (`max(value + value)`, `max(CAST(ts AS
+   BIGINT))`, a qualified `max(logs.ts)`); a nullable column (`trace_id`,
+   `span_id`, `service_name`, `status_message`, `generation`) or a
+   declared column, which the static schema does not hold; a column type
+   off the allowlist; and every relation item 1 excludes, a Parquet table
+   among them. `sum`, `avg`, a window function other than a count, and a
+   subquery are unchanged.
+5. The pin. A proven `min` or `max` sets `PagePlan::order_from_other_rows`
+   like a count, so its walk requires page one's segment set
+   (`SegmentSetPin::Required`): a later page over a moved set is
+   `cursor_expired` with `rerun_page_one`. The cursor format does not
+   change; `CURSOR_VERSION` stays 7.
+6. The mint-time check. A cursor is minted only when the page's last kept
+   row's order values are of the kinds the plan resumes on
+   (`PagePlan::admits_resume`, the same check `plan_page` applies to a
+   resume position). A row that fails it ends the page `ok_bounded` with
+   no cursor and a `narrow_time_range` next step, where before the page
+   carried a cursor that its own redemption refused as `cursor_invalid`.
+7. A correction to the pinned segment set amendment, item 1. Equal digests
+   mean identical values for `count`, `min`, `max` and an integer `sum`.
+   They do not for a float `sum` or an `avg`: the order in which float
+   values are added across partitions is not fixed, so the same segments
+   can give a different last bit. Neither of those pages, so no cursor
+   rested on the stronger claim.
+8. The ClickBench corpus, with each trailing row limit set aside, still
+   plans 22 of its 43 statements as pages, and the 6 that answer
+   `OrderTermFromOtherRows` still do. None of the 6 orders by a `min` or
+   `max`: four order by a `COUNT(*)` written in the `ORDER BY` and
+   projected without an alias, so no output name is defined as it to
+   resume on, and two by an `AVG`. All 43 read `logs`, and a `min` or
+   `max` among them is over a declared column, which item 4 leaves unpaged
+   (`the_clickbench_corpus_page_plan_outcomes_are_pinned`).
