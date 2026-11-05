@@ -738,6 +738,7 @@ mod tests {
                 samples_returned: 0,
                 status: pb::status::Code::Unsupported,
                 status_message: self.0.clone(),
+                carried_abandoned_spend: false,
             })
         }
     }
@@ -1408,6 +1409,7 @@ mod tests {
                 samples_returned: 0,
                 status: pb::status::Code::Timeout,
                 status_message: "stopped at the deadline".to_string(),
+                carried_abandoned_spend: false,
             })
         }
     }
@@ -1505,6 +1507,7 @@ mod tests {
                 samples_returned: 0,
                 status: self.0,
                 status_message: "refused: the query's deadline has passed".to_string(),
+                carried_abandoned_spend: false,
             })
         }
     }

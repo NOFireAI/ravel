@@ -3278,7 +3278,13 @@ also spends through each remote that answered; neither is in the estimate,
 so such a query reports every estimate component unbounded and
 `estimate_is_upper_envelope` false. A distributed fetch that falls back to
 fetching locally after a worker answered `UNSUPPORTED` spends on the same
-segments twice, which the estimate does not count either. That spend lands
+segments twice, which the estimate does not count either, and so does a
+distributed slice that answered after a retry or a reroute: the slice's
+response carries the spend the attempts abandoned before it reported
+(ADR-0071), so its accounting can count some of its segments more than
+once. A retry whose abandoned attempt reported nothing (a transport loss
+before any summary) carries no spend and is not one of these. That spend
+lands
 in `QueryStats::accounting`, and `QueryStats::estimate_excludes_spend` is
 true for each of these queries; the MCP envelope reads it. A federation
 whose remotes were all skipped unanswered folds no remote spend and leaves

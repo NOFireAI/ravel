@@ -8929,6 +8929,7 @@ mod tick_tests {
                 samples_returned: 0,
                 status: ravel_proto::queryfrag::v1::status::Code::Ok,
                 status_message: String::new(),
+                carried_abandoned_spend: false,
             })
         }
     }

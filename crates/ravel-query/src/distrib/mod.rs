@@ -144,33 +144,9 @@ impl Distributed {
         &self.thresholds
     }
 
-    /// Partitions the snapshot, dispatches one request per slice, and folds the
-    /// results incrementally as each slice completes (so a budget trip or a
-    /// hard error short-circuits without draining the rest).
-    ///
-    /// `partial_aggregate` (ADR-0103) is `Some` only for an eligible instant
-    /// `count_over_time` query: the coordinator asks every slice for a
-    /// per-series precomputed partial over the request's reduction window
-    /// instead of raw runs, and the returned `Vec<codec::PartialAggregate>` is
-    /// the collected result (empty when the field is `None`, today's every real
-    /// query). `None` is byte-identical to the pre-ADR-0103 behavior.
-    ///
-    /// Returns:
-    /// - `Ok(Some((triple, partials)))` when every slice succeeded: the
-    ///   coordinator merges `triple` exactly as the local path merges its own
-    ///   fetch, and `partials` carries any collected worker partials.
-    /// - `Ok(None)` when the query must fall back to fully local execution: a
-    ///   worker reported [`pb::status::Code::Unsupported`] (version skew or a
-    ///   resolve-scope slice). ADR-0071's silent fallback, never an error to the
-    ///   user. As of `PROTOCOL_VERSION` 3 a native-histogram or run-merged scalar
-    ///   slice is served over the wire, not refused (ADR-0096 decision 3 step 4).
-    /// - `Err(QueryError::Fetch(Store { NotFound }))` when a slice reported
-    ///   [`pb::status::Code::SnapshotInvalidated`]: mapped to the exact error
-    ///   the local path raises for a vanished segment, so the engine's existing
-    ///   `resolve_snapshot_with_retry` re-resolves the snapshot and re-dispatches
-    ///   the whole query once (not once per slice).
-    /// - `Err(..)` for a terminal slice failure (corrupt segment, transport,
-    ///   framing) or a budget overrun the coordinator re-enforces.
+    /// [`fetch_reporting_carried_spend`](Self::fetch_reporting_carried_spend)
+    /// for a caller that does not report whether a slice's accounting carried
+    /// abandoned attempts' spend.
     #[allow(clippy::too_many_arguments)]
     pub async fn fetch(
         &self,
@@ -184,6 +160,65 @@ impl Distributed {
         deadline: WallDeadline,
         partial_aggregate: Option<pb::PartialAggregateRequest>,
     ) -> Result<Option<(FetchedTriple, Vec<codec::PartialAggregate>)>, QueryError> {
+        Ok(self
+            .fetch_reporting_carried_spend(
+                tenant_hash,
+                signal,
+                snapshot,
+                matchers,
+                erasure,
+                accounting,
+                config,
+                deadline,
+                partial_aggregate,
+            )
+            .await?
+            .map(|(triple, partials, _carried)| (triple, partials)))
+    }
+
+    /// Partitions the snapshot, dispatches one request per slice, and folds the
+    /// results incrementally as each slice completes (so a budget trip or a
+    /// hard error short-circuits without draining the rest).
+    ///
+    /// `partial_aggregate` (ADR-0103) is `Some` only for an eligible instant
+    /// `count_over_time` query: the coordinator asks every slice for a
+    /// per-series precomputed partial over the request's reduction window
+    /// instead of raw runs, and the returned `Vec<codec::PartialAggregate>` is
+    /// the collected result (empty when the field is `None`, today's every real
+    /// query). `None` is byte-identical to the pre-ADR-0103 behavior.
+    ///
+    /// Returns:
+    /// - `Ok(Some((triple, partials, carried)))` when every slice succeeded:
+    ///   the coordinator merges `triple` exactly as the local path merges its
+    ///   own fetch, and `partials` carries any collected worker partials.
+    ///   `carried` is true when any folded slice set
+    ///   [`SliceResponse::carried_abandoned_spend`]: `accounting` then holds
+    ///   more than one fetch of that slice's segments (issue #3789).
+    /// - `Ok(None)` when the query must fall back to fully local execution: a
+    ///   worker reported [`pb::status::Code::Unsupported`] (version skew or a
+    ///   resolve-scope slice). ADR-0071's silent fallback, never an error to the
+    ///   user. As of `PROTOCOL_VERSION` 3 a native-histogram or run-merged scalar
+    ///   slice is served over the wire, not refused (ADR-0096 decision 3 step 4).
+    /// - `Err(QueryError::Fetch(Store { NotFound }))` when a slice reported
+    ///   [`pb::status::Code::SnapshotInvalidated`]: mapped to the exact error
+    ///   the local path raises for a vanished segment, so the engine's existing
+    ///   `resolve_snapshot_with_retry` re-resolves the snapshot and re-dispatches
+    ///   the whole query once (not once per slice).
+    /// - `Err(..)` for a terminal slice failure (corrupt segment, transport,
+    ///   framing) or a budget overrun the coordinator re-enforces.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_reporting_carried_spend(
+        &self,
+        tenant_hash: TenantHash,
+        signal: Signal,
+        snapshot: &Snapshot,
+        matchers: &[LabelMatcher],
+        erasure: &[ErasurePredicate],
+        accounting: &QueryAccounting,
+        config: &EngineConfig,
+        deadline: WallDeadline,
+        partial_aggregate: Option<pb::PartialAggregateRequest>,
+    ) -> Result<Option<(FetchedTriple, Vec<codec::PartialAggregate>, bool)>, QueryError> {
         let slices = partition_snapshot(snapshot, self.thresholds.max_parallel_slices);
         if slices.is_empty() {
             // Nothing to fetch: an empty snapshot merges to an empty result
@@ -191,6 +226,7 @@ impl Distributed {
             return Ok(Some((
                 (Vec::new(), FetchStats::default(), Vec::new()),
                 Vec::new(),
+                false,
             )));
         }
 
@@ -304,6 +340,7 @@ impl Distributed {
         let mut stats = FetchStats::default();
         let mut invalidated = false;
         let mut unsupported = false;
+        let mut carried_abandoned_spend = false;
 
         while let Some(result) = stream.next().await {
             // A slice whose FINAL attempt failed carries every attempt's
@@ -317,6 +354,7 @@ impl Distributed {
             match response.status {
                 pb::status::Code::Ok => {
                     fold_slice(accounting, &mut running, &mut stats, &response);
+                    carried_abandoned_spend |= response.carried_abandoned_spend;
                     // Series cap re-enforcement: a lying worker cannot overrun
                     // the query's distinct-series cap. The sample cap is
                     // enforced downstream by the k-way merge, after
@@ -484,6 +522,7 @@ impl Distributed {
         Ok(Some((
             (per_slice, stats, per_slice_hist),
             collected_partials,
+            carried_abandoned_spend,
         )))
     }
 
@@ -1617,6 +1656,7 @@ impl SliceStreamDecoder {
             samples_returned: summary.samples_returned,
             status: code,
             status_message: status.message,
+            carried_abandoned_spend: false,
         })
     }
 }

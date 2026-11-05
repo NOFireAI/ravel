@@ -180,6 +180,13 @@ pub struct SliceResponse {
     pub status: pb::status::Code,
     /// The status' human-readable detail (empty for `Ok`).
     pub status_message: String,
+    /// True when `accounting` and `stats` also carry the spend of attempts at
+    /// this slice that were abandoned before another attempt answered (a
+    /// retry or reroute, issue #1723). The cost estimate counts each slice's
+    /// segments fetched once, so a coordinator folding such a response can no
+    /// longer call that estimate an upper envelope (issue #3789). False for
+    /// a response decoded off the wire: only a re-dispatching fetcher sets it.
+    pub carried_abandoned_spend: bool,
 }
 
 /// One RLOG-family slice's fully-decoded response (Logs, Alerts, Audit). The
@@ -527,6 +534,7 @@ pub fn decode_slice_frames(frames: Vec<pb::FetchResponse>) -> Result<SliceRespon
         samples_returned: summary.samples_returned,
         status: code,
         status_message: status.message,
+        carried_abandoned_spend: false,
     })
 }
 
