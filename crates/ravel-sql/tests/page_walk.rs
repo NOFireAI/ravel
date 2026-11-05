@@ -194,10 +194,19 @@ use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
     Expr as SqlExpr, Ident, OrderBy, OrderByExpr, OrderByKind, OrderByOptions, Statement,
 };
+use ravel_catalog::Snapshot;
+use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::memory::MemoryStore;
+use ravel_query::LogSegmentFetcher;
 use ravel_sql::{
-    LOGS_TABLE, NotTotalOrder, PagePlan, PagePlanError, ResumePosition, ResumeValue, SAMPLES_TABLE,
-    logs_schema, plan_page, public_schema, resume_value,
+    ALERTS_TABLE, AlertsTableProvider, CeilingBreach, LOGS_TABLE, NotTotalOrder, PagePlan,
+    PagePlanError, ResumePosition, ResumeValue, SAMPLES_TABLE, SPANS_TABLE, SessionPrincipal,
+    SessionTable, SpillDecision, SqlConfig, SqlError, TenantDelegatingPool, TenantMemoryAccountant,
+    alerts_schema, build_session, logs_schema, plan_page, public_schema, resume_value,
+    spans_schema,
 };
+use ravel_types::TenantHash;
+use ravel_types::accounting::QueryAccounting;
 
 /// The `ts` the two tied rows share.
 const TIED_TS: i64 = 1_000;
@@ -1740,9 +1749,10 @@ async fn an_aggregate_argument_named_like_an_alias_reads_the_from_column() {
 /// partitions. One row per partition makes a grouped sum over more than one
 /// row merge partial sums whenever the engine runs more than one partition.
 ///
-/// The built-in `sum` this context registers is the one Ravel's SQL session
-/// serves: it replaces `min`, `max` and `avg` with its own UDAFs and leaves
-/// `sum` as DataFusion's (ADR-0024, which would replace it, is Proposed).
+/// The `sum` this context registers is DataFusion's built-in, which wraps.
+/// Ravel's SQL session replaces it with the checked UDAF (issue #3838), so a
+/// test of what a session pages builds its context with
+/// [`checked_sum_context`] instead.
 fn integer_table_context(
     keys: &[&str],
     columns: Vec<(&str, ArrayRef)>,
@@ -1826,7 +1836,8 @@ async fn an_integer_sum_is_int64_for_a_signed_and_uint64_for_an_unsigned_argumen
     );
 }
 
-/// An integer `sum` that overflows its 64-bit result wraps rather than
+/// DataFusion's built-in integer `sum`, which the session's checked UDAF
+/// replaces, wraps when it overflows its 64-bit result rather than
 /// failing, at one partition and at eight alike: `i64::MAX + 1` is
 /// `i64::MIN` and `u64::MAX + 1` is 0. Ordered by the sum, the group whose
 /// true total is the largest sorts below a group summing to 5, so the order
@@ -1848,5 +1859,259 @@ async fn an_integer_sum_wraps_on_overflow_at_one_and_eight_partitions() {
             [["b", "5", "5"], ["a", "-9223372036854775808", "0"]],
             "at {partitions} partitions",
         );
+    }
+}
+
+/// A session built by `build_session` as the executor builds one, so `sum`
+/// is the checked UDAF it registers, with `table` replaced by an in-memory
+/// table of `columns`, each typed as `table`'s public schema types it, and
+/// every row in its own partition. The partition count is the config's
+/// `engine.sql_partition_count`, which `session_config` sets as the
+/// session's `target_partitions`, and the session repartitions its final
+/// aggregation, as the executor does for an exact-typed statement.
+fn checked_sum_context(
+    table: &str,
+    columns: Vec<(&str, ArrayRef)>,
+    target_partitions: usize,
+) -> SessionContext {
+    let mut config = SqlConfig::default();
+    config.engine.sql_partition_count = Some(target_partitions);
+    let pool = Arc::new(TenantDelegatingPool::new(
+        1 << 30,
+        TenantMemoryAccountant::new(1 << 30),
+        CeilingBreach::new(),
+        QueryAccounting::new(),
+    ));
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let alerts = AlertsTableProvider::new(
+        Snapshot {
+            segments: Vec::new(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        },
+        TenantHash([7u8; 16]),
+        LogSegmentFetcher::new(store),
+        QueryAccounting::new(),
+    );
+    let ctx = build_session(
+        &config,
+        pool,
+        SessionTable::Alerts(Arc::new(alerts)),
+        true,
+        SpillDecision::Disabled,
+        &SessionPrincipal::without_capabilities(TenantHash([0u8; 16])),
+    )
+    .expect("session builds");
+    assert_eq!(
+        ctx.state().config().target_partitions(),
+        target_partitions,
+        "the session's partition count",
+    );
+
+    let public = match table {
+        SPANS_TABLE => spans_schema(),
+        ALERTS_TABLE => alerts_schema(),
+        other => panic!("no public schema for {other}"),
+    };
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut arrays = Vec::with_capacity(columns.len());
+    for (name, array) in columns {
+        let field = public
+            .field_with_name(name)
+            .expect("a public column")
+            .clone();
+        assert_eq!(field.data_type(), array.data_type(), "type of {name}");
+        fields.push(field);
+        arrays.push(array);
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), arrays).expect("checked sum batch");
+    let partitions = (0..batch.num_rows())
+        .map(|row| vec![batch.slice(row, 1)])
+        .collect();
+    let mem = MemTable::try_new(schema, partitions).expect("checked sum mem table");
+    ctx.deregister_table(table).expect("deregistered");
+    ctx.register_table(table, Arc::new(mem))
+        .expect("registered");
+    ctx
+}
+
+/// `sql` run to completion, or the error its planning or execution returned,
+/// rendered.
+async fn try_execute(ctx: &SessionContext, sql: &str) -> Result<Vec<RecordBatch>, String> {
+    ctx.sql(sql)
+        .await
+        .map_err(|e| e.to_string())?
+        .collect()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// An `ORDER BY` over an integer `sum` pages over the checked sum: six
+/// groups walk as three pages of two and an empty fourth, with the two
+/// groups tied at 70 split across the first boundary, and the walk at one
+/// partition and at eight is the same sequence, equal to the unpaged result,
+/// each group once. Group `d` passes through `i64::MAX` on its way to 50.
+///
+/// FLIP: the planner's `Sum` arm mapping a signed argument to `UInt` fails
+/// the walk's resume check on page one's last row, `[Int(70), Str("b")]`.
+#[tokio::test]
+async fn integer_sum_walk_is_identical_at_one_and_eight_partitions() {
+    let sql = "SELECT name, sum(duration_ns) AS s FROM spans GROUP BY name \
+               ORDER BY s DESC, name";
+    let plan = plan_page(sql, None).expect("planned");
+    assert!(plan.order_from_other_rows, "a sum order reads other rows");
+    assert_eq!(
+        plan.order_by
+            .iter()
+            .map(|term| term.column.as_str())
+            .collect::<Vec<_>>(),
+        ["s", "name"],
+    );
+
+    let row = |name: &str, s: &str| vec![name.to_string(), s.to_string()];
+    let expected = vec![
+        vec![row("a", "100"), row("b", "70")],
+        vec![row("c", "70"), row("d", "50")],
+        vec![row("e", "-5"), row("f", "-20")],
+    ];
+
+    let mut walks = Vec::new();
+    for partitions in [1, 8] {
+        let ctx = checked_sum_context(
+            SPANS_TABLE,
+            vec![
+                (
+                    "name",
+                    Arc::new(StringArray::from(vec![
+                        "d", "b", "f", "a", "c", "d", "e", "b", "f", "a", "d", "b",
+                    ])),
+                ),
+                (
+                    "duration_ns",
+                    Arc::new(Int64Array::from(vec![
+                        i64::MAX,
+                        30,
+                        -30,
+                        60,
+                        70,
+                        -i64::MAX,
+                        -5,
+                        25,
+                        10,
+                        40,
+                        50,
+                        15,
+                    ])),
+                ),
+            ],
+            partitions,
+        );
+        let unpaged = rows_of(&execute(&ctx, sql).await);
+        assert_eq!(
+            unpaged,
+            expected.concat(),
+            "the unpaged ordering at {partitions} partitions"
+        );
+        let pages = grouped_walk(&ctx, sql, GROUPED_PAGE_CAP).await;
+        assert_eq!(
+            pages, expected,
+            "the walked pages at {partitions} partitions"
+        );
+        let walked: Vec<Vec<String>> = pages.concat();
+        assert_eq!(walked, unpaged, "the walk against the unpaged result");
+        assert!(
+            multiset(&walked).values().all(|&count| count == 1),
+            "a group was delivered twice at {partitions} partitions: {walked:?}",
+        );
+        walks.push(pages);
+    }
+    assert_eq!(walks[0], walks[1], "the walks at one and eight partitions");
+}
+
+/// A table, a statement over it, its columns, the sum's result type and a
+/// resume value of the order's kind.
+type OverflowCase<'a> = (
+    &'a str,
+    &'a str,
+    Vec<(&'a str, ArrayRef)>,
+    &'static str,
+    ResumeValue,
+);
+
+/// A group whose integer sum overflows fails the paged statement with the
+/// checked sum's overflow error, signed and unsigned, at one partition and at
+/// eight: the first page computes every group's sum and fails, a page resumed
+/// from a cursor past the other groups fails the same way, and no page
+/// carries a wrapped total.
+///
+/// FLIP: re-registering DataFusion's built-in `sum` in
+/// [`checked_sum_context`] makes page one return rows, a wrapped total
+/// among them, instead of failing.
+#[tokio::test]
+async fn an_overflowing_integer_sum_order_fails_rather_than_pages() {
+    let cases: Vec<OverflowCase<'_>> = vec![
+        (
+            SPANS_TABLE,
+            "SELECT name, sum(duration_ns) AS s FROM spans GROUP BY name ORDER BY s DESC, name",
+            vec![
+                (
+                    "name",
+                    Arc::new(StringArray::from(vec!["a", "b", "a", "c"])),
+                ),
+                (
+                    "duration_ns",
+                    Arc::new(Int64Array::from(vec![i64::MAX, 5, 1, 3])),
+                ),
+            ],
+            "Int64",
+            ResumeValue::Int(3),
+        ),
+        (
+            ALERTS_TABLE,
+            "SELECT writer_id, sum(writer_seq) AS s FROM alerts GROUP BY writer_id \
+             ORDER BY s, writer_id",
+            vec![
+                (
+                    "writer_id",
+                    Arc::new(StringArray::from(vec!["a", "b", "a", "c"])),
+                ),
+                (
+                    "writer_seq",
+                    Arc::new(UInt64Array::from(vec![u64::MAX, 5, 1, 3])),
+                ),
+            ],
+            "UInt64",
+            ResumeValue::UInt(5),
+        ),
+    ];
+    for (table, sql, columns, result_type, resume) in cases {
+        let overflow = SqlError::IntegerSumOverflow { result_type }.to_string();
+        for partitions in [1, 8] {
+            let ctx = checked_sum_context(table, columns.clone(), partitions);
+            let first = plan_page(sql, None).expect("planned");
+            let failed = try_execute(&ctx, &first.statement)
+                .await
+                .expect_err("the first page computes the overflowing sum");
+            assert!(
+                failed.contains(&overflow),
+                "page one of {sql:?} at {partitions} partitions failed with {failed:?}",
+            );
+            let resumed = plan_page(
+                sql,
+                Some(&ResumePosition::new(vec![
+                    resume.clone(),
+                    ResumeValue::Str("c".to_string()),
+                ])),
+            )
+            .expect("resumed plan");
+            let failed = try_execute(&ctx, &resumed.statement)
+                .await
+                .expect_err("a resumed page computes the overflowing sum too");
+            assert!(
+                failed.contains(&overflow),
+                "a resumed page of {sql:?} at {partitions} partitions failed with {failed:?}",
+            );
+        }
     }
 }
