@@ -52,7 +52,11 @@ designed in parallel, not merged at the time of this ADR).
    segment, size is unbounded on high-cardinality tenants, and no
    measurement yet shows the labels endpoints are the bottleneck.
    Rejected now; a narrow metric-name postings index is planned but
-   gated on Phase 2 load-test measurements.
+   gated on Phase 2 load-test measurements. Amended by ADR-3694 decision
+   2 (2026-11-05): the fold now reads every newly sealed object to build
+   the name postings, so the build-cost premise no longer holds, and a
+   label-value leaf keyed on each object's dictionary strings, size-capped
+   per part, is built in the existing `.kidx` object.
 6. External index service or database: forbidden (object storage is the
    only durable backend; a catalog service must be an optimization,
    never a durability dependency, ADR-0003).
