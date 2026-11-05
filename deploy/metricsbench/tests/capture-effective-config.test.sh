@@ -28,6 +28,11 @@
 #   k  Ravel down / --no-ravel           -> exit 1 when Ravel is queried and
 #                                           down; --no-ravel skips it, exit 0,
 #                                           and still exits 1 for Mimir down
+#   l  GOMEMLIMIT of the Go comparators  -> go_runtime 7GiB from .Config.Env
+#                                           (host GOMEMLIMIT differs), "unset"
+#                                           when absent, unavailable when
+#                                           inspect fails or docker is down;
+#                                           exit 0 throughout
 #
 # Every field is asserted by parsing the JSON with python3 -I, not by grep.
 #
@@ -476,6 +481,93 @@ METRICSBENCH_DOCKER="${TMP}/bin/docker-down" "${SCRIPT}" --out "${TMP}/no-such-d
   2>"${TMP}/h.err" || code=$?
 expect_exit "h unwritable out" 70 "${code}"
 if [[ -e "${TMP}/no-such-dir/h.json" ]]; then fail "h no document"; else pass "h no document"; fi
+
+# --- l: GOMEMLIMIT of the Go comparators, from the container's .Config.Env -----
+# The stub sets 7GiB in each Go comparator's environment and nothing in
+# Ravel's. The host's own GOMEMLIMIT is set to a different value on every run
+# below, so a capture that read the host environment would record 1GiB.
+# shellcheck disable=SC2016 # the stub body expands when the stub runs
+write "${TMP}/bin/docker-gomemlimit" '#!/usr/bin/env bash
+case "$1 $2" in
+  "info --format") echo 27.0.0 ;;
+  "compose -f")
+    echo "{\"ID\":\"c-prom\",\"Service\":\"prometheus\"}"
+    echo "{\"ID\":\"c-vm\",\"Service\":\"victoriametrics\"}"
+    echo "{\"ID\":\"c-mimir\",\"Service\":\"mimir\"}"
+    echo "{\"ID\":\"c-ravel\",\"Service\":\"ravel-server\"}" ;;
+  "inspect c-ravel")
+    echo "[{\"Image\":\"sha256:img-ravel\",\"Config\":{\"Image\":\"ref-ravel\",\"Env\":[\"PATH=/usr/bin\"],\"Cmd\":[\"--mode\",\"all\"]}}]" ;;
+  "inspect "*)
+    echo "[{\"Image\":\"sha256:img-$2\",\"Config\":{\"Image\":\"ref-$2\",\"Env\":[\"PATH=/bin\",\"GOMEMLIMIT=7GiB\"]}}]" ;;
+  "image inspect")
+    echo "[{\"RepoDigests\":[\"repo@sha256:digest-$3\"],\"Architecture\":\"arm64\",\"Os\":\"linux\"}]" ;;
+  *) exit 1 ;;
+esac
+'
+# Daemon and compose answer, every container inspect fails.
+# shellcheck disable=SC2016 # the stub body expands when the stub runs
+write "${TMP}/bin/docker-inspect-fails" '#!/usr/bin/env bash
+case "$1 $2" in
+  "info --format") echo 27.0.0 ;;
+  "compose -f")
+    echo "{\"ID\":\"c-prom\",\"Service\":\"prometheus\"}"
+    echo "{\"ID\":\"c-vm\",\"Service\":\"victoriametrics\"}"
+    echo "{\"ID\":\"c-mimir\",\"Service\":\"mimir\"}"
+    echo "{\"ID\":\"c-ravel\",\"Service\":\"ravel-server\"}" ;;
+  "inspect "*) echo "Error: No such object: $2" >&2; exit 1 ;;
+  *) exit 1 ;;
+esac
+'
+chmod +x "${TMP}/bin/docker-gomemlimit" "${TMP}/bin/docker-inspect-fails"
+
+out_l="${TMP}/l.json"
+code=0
+GOMEMLIMIT=1GiB METRICSBENCH_DOCKER="${TMP}/bin/docker-gomemlimit" "${SCRIPT}" --out "${out_l}" \
+  --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir3_url}" \
+  --ravel "${ravel_url}" \
+  2>"${TMP}/l.err" || code=$?
+expect_exit "l GOMEMLIMIT set in .Config.Env" 0 "${code}"
+check "l go_runtime 7GiB" "${out_l}" <<EOF
+d["comparators"]["prometheus"]["go_runtime"] == {"source": "docker inspect .Config.Env", "GOMEMLIMIT": "7GiB"}
+d["comparators"]["victoriametrics"]["go_runtime"] == {"source": "docker inspect .Config.Env", "GOMEMLIMIT": "7GiB"}
+d["comparators"]["mimir"]["go_runtime"] == {"source": "docker inspect .Config.Env", "GOMEMLIMIT": "7GiB"}
+("go_runtime" in d["comparators"]["ravel"]) == False
+EOF
+
+# docker-up's inspect answers carry no Env at all.
+out_l2="${TMP}/l2.json"
+code=0
+GOMEMLIMIT=1GiB METRICSBENCH_DOCKER="${TMP}/bin/docker-up" "${SCRIPT}" --out "${out_l2}" \
+  --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir3_url}" \
+  --ravel "${ravel_url}" \
+  2>"${TMP}/l2.err" || code=$?
+expect_exit "l GOMEMLIMIT absent" 0 "${code}"
+check "l go_runtime unset" "${out_l2}" <<EOF
+d["comparators"]["prometheus"]["go_runtime"] == {"source": "docker inspect .Config.Env", "GOMEMLIMIT": "unset"}
+d["comparators"]["victoriametrics"]["go_runtime"] == {"source": "docker inspect .Config.Env", "GOMEMLIMIT": "unset"}
+d["comparators"]["mimir"]["go_runtime"] == {"source": "docker inspect .Config.Env", "GOMEMLIMIT": "unset"}
+EOF
+
+out_l3="${TMP}/l3.json"
+code=0
+GOMEMLIMIT=1GiB METRICSBENCH_DOCKER="${TMP}/bin/docker-inspect-fails" "${SCRIPT}" --out "${out_l3}" \
+  --prometheus "${prom_url}" --victoriametrics "${vm_url}" --mimir "${mimir3_url}" \
+  --ravel "${ravel_url}" \
+  2>"${TMP}/l3.err" || code=$?
+expect_exit "l inspect fails, exit unchanged" 0 "${code}"
+check "l go_runtime unavailable" "${out_l3}" <<EOF
+sorted(d["comparators"]["prometheus"]["go_runtime"]) == ["unavailable"]
+d["comparators"]["prometheus"]["go_runtime"]["unavailable"].startswith("docker inspect exited 1: Error: No such object: c-prom") == True
+d["comparators"]["victoriametrics"]["go_runtime"]["unavailable"].startswith("docker inspect exited 1: Error: No such object: c-vm") == True
+d["comparators"]["mimir"]["go_runtime"]["unavailable"].startswith("docker inspect exited 1: Error: No such object: c-mimir") == True
+EOF
+
+# docker not reachable: case a's capture, made with docker-down.
+check "l go_runtime without docker" "${out_a}" <<EOF
+d["comparators"]["prometheus"]["go_runtime"] == {"unavailable": "docker inspect .Config.Env of compose service prometheus: unavailable: docker not reachable"}
+d["comparators"]["victoriametrics"]["go_runtime"] == {"unavailable": "docker inspect .Config.Env of compose service victoriametrics: unavailable: docker not reachable"}
+d["comparators"]["mimir"]["go_runtime"] == {"unavailable": "docker inspect .Config.Env of compose service mimir: unavailable: docker not reachable"}
+EOF
 
 if [[ -n "${CAPTURE_TEST_KEEP_CASE_A:-}" ]]; then
   cp "${out_a}" "${CAPTURE_TEST_KEEP_CASE_A}"
