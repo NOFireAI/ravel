@@ -1207,6 +1207,41 @@ PY
   fi
 done
 
+# --- o2: the Go comparators' memory limit (ADR-0927 amendment 2026-11-05) -----
+# Same block rule as o: the service's environment mapping must carry
+# GOMEMLIMIT: 7GiB, and nowhere in the block may GOGC be set.
+for svc in prometheus victoriametrics mimir; do
+  if python3 -I - "${HERE}/../docker-compose.yml" "${svc}" <<'PY'; then
+import re, sys
+path, svc = sys.argv[1], sys.argv[2]
+lines = open(path).read().splitlines()
+start = next((i for i, l in enumerate(lines) if l == "  " + svc + ":"), None)
+if start is None:
+    sys.exit(1)
+block = []
+for l in lines[start + 1:]:
+    if re.match(r"^ {0,2}[A-Za-z0-9_.-]+:", l):
+        break
+    block.append(l)
+env = next((i for i, l in enumerate(block) if l == "    environment:"), None)
+if env is None:
+    sys.exit(1)
+entries = []
+for l in block[env + 1:]:
+    if not l.startswith("      ") or l.strip().startswith("#"):
+        if l.strip().startswith("#"):
+            continue
+        break
+    entries.append(l.strip())
+ok = "GOMEMLIMIT: 7GiB" in entries and not any(e.startswith("GOGC") for e in entries)
+sys.exit(0 if ok else 1)
+PY
+    pass "o2: ${svc} in docker-compose.yml carries GOMEMLIMIT 7GiB and no GOGC"
+  else
+    fail "o2: ${svc} in docker-compose.yml lacks environment GOMEMLIMIT: 7GiB, or sets GOGC"
+  fi
+done
+
 # --- s: the real-S3 lane --------------------------------------------------------
 mapfile -t args < <(full_args "${TMP}/s/out")
 run_case s "${args[@]}" --real-s3-bucket-prefix mb-run1 --real-s3-region us-east-1
