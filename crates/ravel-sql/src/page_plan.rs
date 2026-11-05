@@ -107,10 +107,11 @@
 //! ([`expression_is_non_null`]), with no schema involved: a literal is NON
 //! NULL wherever it is selected from, and so is `count(...)`, which is 0
 //! over no rows. `count` is the one function that proof admits, and an
-//! aggregate reaches it only through the next section. A `min` or `max` is
-//! answered by [`aggregate_proof`] instead: under a plain `GROUP BY` every
-//! group holds at least one row, so the extreme of a NOT NULL column of the
-//! target table is never NULL, and its type is the column's.
+//! aggregate reaches it only through the next section. A `min`, `max` or
+//! `sum` is answered by [`aggregate_proof`] instead: under a plain `GROUP BY`
+//! every group holds at least one row, so the extreme or the sum of a NOT
+//! NULL column of the target table is never NULL. An extreme's type is the
+//! column's; an integer sum's is `Int64` or `UInt64`.
 //!
 //! # A term computed from other rows has a position only over fixed segments
 //!
@@ -127,31 +128,37 @@
 //! So a term that names or is such an expression plans only when it is
 //! proven: by [`expression_is_non_null`], which for an aggregate means
 //! `count(...)`, and only when no window inside it counts over a `ROWS`
-//! frame or a named window ([`calls_a_positional_window`]); or, for a `min`
-//! or `max` call, by [`aggregate_proof`]. That proof needs a plain `GROUP
+//! frame or a named window ([`calls_a_positional_window`]); or, for a `min`,
+//! `max` or `sum` call, by [`aggregate_proof`]. That proof needs a plain `GROUP
 //! BY` with at least one key (no `ROLLUP`, `CUBE`, `GROUPING SETS`, `WITH
 //! TOTALS` or `GROUP BY ALL`, and not an ungrouped aggregate, any of which
 //! can produce a group over no rows), no `FILTER`, `OVER`, `WITHIN GROUP`,
 //! null treatment or argument clause on the call (`DISTINCT` is allowed: it
-//! does not change an extreme), one argument that is a bare column
-//! name read from the target table's schema (never through the projection,
-//! so an alias of the same name does not stand in for it), a NOT NULL
-//! column, and a column type on the allowlist: signed and unsigned integers,
-//! `Utf8`, `LargeUtf8` and nanosecond `Timestamp` with no zone. Its plan sets
+//! removes duplicates and never a group's last value), one argument that is
+//! a bare column name read from the target table's schema (never through
+//! the projection, so an alias of the same name does not stand in for it), a
+//! NOT NULL column, and a column type on the allowlist: for `min` and `max`
+//! the signed and unsigned integers, `Utf8`, `LargeUtf8` and nanosecond
+//! `Timestamp` with no zone; for `sum` the signed and unsigned integers
+//! only. Its plan sets
 //! [`PagePlan::order_from_other_rows`], and the paging tool then serves a
 //! later page only over the segment set page one resolved, which it pins in
 //! the cursor (ADR-1374, pinned segment set amendment): over the same
 //! segments the value is the same, and a walk whose segments changed ends
-//! rather than repeating a row. A `sum` call goes through the same proof and
-//! is refused at its last link, the argument's type: over a float column the
-//! engine merges partial sums in the order its partitions finish, and over an
-//! integer column DataFusion's `sum` wraps past the 64-bit range with no
-//! error, so neither value is a position the order of the totals agrees
-//! with. Every other such term (`sum`, `avg`, a `min` or `max` the proof
-//! does not reach, any other window function, a subquery) is
+//! rather than repeating a row. An integer `sum` is the session's checked
+//! UDAF (`crate::sum`, issue #3838): it adds in `i128` and fails the query
+//! when the total does not fit `Int64` (signed argument) or `UInt64`
+//! (unsigned), so its value is exact and the same at any partition count, and
+//! it plans with [`ResumeKind::Int`] or [`ResumeKind::UInt`]. A total that
+//! overflows is an error, not a value: the page that computes it fails, and
+//! no page is served in a wrapped order. A float `sum` is refused at the
+//! argument's type, because the engine merges partial sums in the order its
+//! partitions finish, so its last bits are not a fixed position. Every other
+//! such term (a float `sum`, `avg`, a `min`, `max` or `sum` the proof does
+//! not reach, any other window function, a subquery) is
 //! [`PagePlanError::OrderTermFromOtherRows`], which the paging
 //! tool answers by running the statement as written, with no cursor, the way
-//! it answers [`PagePlanError::NoOrdering`]. A `count`, `min` or `max`
+//! it answers [`PagePlanError::NoOrdering`]. A `count`, `min`, `max` or `sum`
 //! written in the `ORDER BY` rather than named there plans as the one output
 //! column the projection defines as that same expression, and is that
 //! refusal when there is none.
@@ -593,7 +600,8 @@ pub enum PagePlanError {
     /// An `ORDER BY` term whose value is computed from rows other than its
     /// own (an aggregate, a window function, or a subquery, anywhere in the
     /// expression the term names or is) and that is not proven NON NULL:
-    /// anything but `count(...)`, and a `count` over a `ROWS` frame or a
+    /// anything but `count(...)` and a `min`, `max` or integer `sum` that
+    /// `aggregate_proof` proves, and a `count` over a `ROWS` frame or a
     /// named window.
     ///
     /// Not a refusal of the statement, and the paging tool does not answer it
@@ -1814,8 +1822,6 @@ mod unproven {
          unchanged and a resume value carries exactly";
     pub(super) const AGGREGATE_SUM_FLOAT: &str = "a sum over a float column merges partial sums in the order the engine's \
          partitions finish, so two runs over the same segments can differ in the last bits";
-    pub(super) const AGGREGATE_SUM_WRAPS: &str = "an integer sum wraps past the 64-bit range without an error, so the order of \
-         the sums is not the order of the totals";
     pub(super) const AGGREGATE_SUM_ARGUMENT_TYPE: &str =
         "the aggregate's argument is not an integer or float column";
 }
@@ -2062,7 +2068,7 @@ fn negated_number_cursor_support(text: &str) -> CursorSupport {
 /// holds for `count`. A `min`, `max` or `sum` call is the exception that
 /// needs both, and is answered by [`aggregate_proof`] instead. An expression
 /// computed from other rows arrives here only when [`statement_order_terms`]
-/// admitted it, which is a `count`, a `min` or a `max`.
+/// admitted it, which is a `count`, a `min`, a `max` or an integer `sum`.
 fn term_admissibility(names: &OutputResolution, column: &str) -> TermProof {
     let (table, source) = match names.resolve(column) {
         Provenance::BaseColumn { table, column } => (table, column),
@@ -2147,9 +2153,9 @@ fn proven_aggregate_call(expr: &SqlExpr) -> Option<(ProvenAggregate, &Function)>
     }
 }
 
-/// The resume kind of a `min` or `max` order term, when the text proves it
-/// NON NULL and of a type a resume value carries exactly, and for a `sum`
-/// the reason it is not proven.
+/// The resume kind of a `min`, `max` or `sum` order term, when the text
+/// proves it NON NULL and of a type a resume value carries exactly, or the
+/// reason it is not proven.
 ///
 /// NON NULL comes from [`OutputResolution::aggregate_argument`]: a group of a
 /// plain `GROUP BY` holds at least one row, the call reads every row of its
@@ -2162,13 +2168,15 @@ fn proven_aggregate_call(expr: &SqlExpr) -> Option<(ProvenAggregate, &Function)>
 /// `Boolean`, `Binary` and `FixedSizeBinary`, whose `min` and `max` return
 /// types no test here has executed.
 ///
-/// A `sum` passes the same NON NULL proof and is still refused, for a reason
-/// that depends on its argument's type. Over a float column the engine
+/// A `sum` passes the same NON NULL proof, and its argument's type decides
+/// the rest. Over an integer column the session's `sum` is the checked UDAF
+/// of `crate::sum`: it returns `Int64` for a signed argument and `UInt64` for
+/// an unsigned one, adds in `i128`, and fails the query on a total out of
+/// that range, so the value is exact, the same at any partition count, or an
+/// error, never a wrapped total. A signed argument takes [`ResumeKind::Int`]
+/// and an unsigned one [`ResumeKind::UInt`]. Over a float column the engine
 /// merges partial sums in the order its partitions finish, so the value is
-/// not a fixed position. Over an integer column it is `Int64` (signed) or
-/// `UInt64` (unsigned) and is exact up to that range, but DataFusion's `sum`
-/// wraps past it with no error, so a group whose total overflows sorts by
-/// the wrapped value.
+/// not a fixed position, and the term is refused.
 fn aggregate_proof(
     aggregate: ProvenAggregate,
     function: &Function,
@@ -2187,20 +2195,18 @@ fn aggregate_proof(
             DataType::Timestamp(TimeUnit::Nanosecond, None) => Ok(ResumeKind::TimestampNanos),
             _ => Err(unproven::AGGREGATE_ARGUMENT_TYPE),
         },
-        ProvenAggregate::Sum => Err(match field.data_type() {
-            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                unproven::AGGREGATE_SUM_FLOAT
+        ProvenAggregate::Sum => match field.data_type() {
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                Ok(ResumeKind::Int)
             }
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64 => unproven::AGGREGATE_SUM_WRAPS,
-            _ => unproven::AGGREGATE_SUM_ARGUMENT_TYPE,
-        }),
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                Ok(ResumeKind::UInt)
+            }
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                Err(unproven::AGGREGATE_SUM_FLOAT)
+            }
+            _ => Err(unproven::AGGREGATE_SUM_ARGUMENT_TYPE),
+        },
     }
 }
 
@@ -2311,8 +2317,8 @@ fn calls_a_positional_window(expr: &SqlExpr) -> bool {
 /// qualified or quoted spelling is caught too. Reading too wide here is safe:
 /// a term this answers true for runs once with no cursor unless it is proven,
 /// and only two proofs admit one, each paging under the Required segment-set
-/// pin: a `count`, by [`expression_is_non_null`], and a `min` or `max`, by
-/// [`aggregate_proof`], which refuses every `sum`. Each of those is an
+/// pin: a `count`, by [`expression_is_non_null`], and a `min`, `max` or
+/// integer `sum`, by [`aggregate_proof`]. Each of those is an
 /// aggregate whichever way its name is read.
 fn depends_on_other_rows(expr: &SqlExpr) -> bool {
     struct OtherRows;
@@ -5267,47 +5273,89 @@ mod tests {
         }
     }
 
-    /// A `sum` order runs unpaged even where the `min` and `max` proof holds
-    /// for its argument, for a reason named by the argument's type: a float
-    /// sum's last bits follow the partition merge order, and an integer sum,
-    /// signed or unsigned and at every width, wraps on overflow. An argument
-    /// that is not a bare column, a clause, a missing `GROUP BY` and a
-    /// non-numeric column keep the reasons `min` and `max` give them.
+    /// An integer `sum` order pages under the same proof as `min` and `max`,
+    /// now that the session's `sum` is checked (issue #3838): a signed
+    /// argument (`duration_ns`, `Int64`) plans with `Int`, an unsigned one
+    /// (`severity_num`, `UInt8`; `flags`, `UInt32`; `writer_seq`, `UInt64`)
+    /// with `UInt`, and `DISTINCT` plans as it does for `min` and `max`. A
+    /// float `sum` stays unpaged with the float reason, and an argument that
+    /// is not a bare column, a clause, a missing `GROUP BY` and a non-numeric
+    /// column keep the reasons `min` and `max` give them.
     ///
-    /// FLIP: a `Sum` arm admitting the signed integers as `Int` and the
-    /// unsigned ones as `UInt` plans the `sum(duration_ns)` row.
-    /// FLIP: a `Sum` arm answering the wrap reason for a float fails the
-    /// `sum(value)` row.
-    /// FLIP: an `aggregate_argument` that looks through a `CAST` answers the
-    /// float reason for `sum(CAST(value AS BIGINT))`.
+    /// FLIP: the `Sum` arm mapping the unsigned integers to `Int` fails the
+    /// `sum(severity_num)` row's kind.
+    /// FLIP: the `Sum` arm admitting `Float64` as `Int` plans `sum(value)`
+    /// and fails the float refusal.
     #[test]
-    fn an_integer_or_float_sum_order_stays_unpaged_for_its_own_reason() {
-        let cases: Vec<(&str, &'static str)> = vec![
-            (
-                "SELECT series_id, sum(value) AS m FROM samples GROUP BY series_id ORDER BY m",
-                unproven::AGGREGATE_SUM_FLOAT,
-            ),
+    fn an_integer_sum_order_plans_and_a_float_sum_does_not() {
+        let admitted: Vec<(&str, &str, ResumeKind)> = vec![
             (
                 "SELECT name, sum(duration_ns) AS m FROM spans GROUP BY name ORDER BY m DESC",
-                unproven::AGGREGATE_SUM_WRAPS,
+                "m",
+                ResumeKind::Int,
             ),
             (
                 "SELECT name, SUM(DISTINCT duration_ns) AS m FROM spans GROUP BY name ORDER BY m",
-                unproven::AGGREGATE_SUM_WRAPS,
+                "m",
+                ResumeKind::Int,
             ),
             (
                 "SELECT severity_text, sum(severity_num) AS m FROM logs GROUP BY severity_text \
                  ORDER BY m",
-                unproven::AGGREGATE_SUM_WRAPS,
+                "m",
+                ResumeKind::UInt,
             ),
             (
                 "SELECT severity_text, sum(flags) AS m FROM logs GROUP BY severity_text \
                  ORDER BY m",
-                unproven::AGGREGATE_SUM_WRAPS,
+                "m",
+                ResumeKind::UInt,
             ),
             (
                 "SELECT writer_id, sum(writer_seq) AS m FROM alerts GROUP BY writer_id ORDER BY m",
-                unproven::AGGREGATE_SUM_WRAPS,
+                "m",
+                ResumeKind::UInt,
+            ),
+            // Written in the ORDER BY rather than named there, the term is
+            // the one output column defined as the call.
+            (
+                "SELECT name, sum(duration_ns) AS m FROM spans GROUP BY name \
+                 ORDER BY sum(duration_ns)",
+                "m",
+                ResumeKind::Int,
+            ),
+        ];
+        for (sql, term, kind) in admitted {
+            let plan = plan_page(sql, None).unwrap_or_else(|e| panic!("{sql:?}: {e}"));
+            assert!(plan.order_from_other_rows, "flag for {sql:?}");
+            assert_eq!(
+                plan.order_by
+                    .iter()
+                    .map(|term| term.column.as_str())
+                    .collect::<Vec<_>>(),
+                [term],
+                "order for {sql:?}"
+            );
+            assert_eq!(plan.resume_kinds, [kind], "kinds for {sql:?}");
+            assert_eq!(min_or_max_proof(sql, term), Ok(kind), "proof for {sql:?}");
+        }
+
+        // The planned kind is the one a resume position must carry.
+        let sql = "SELECT name, sum(duration_ns) AS m FROM spans GROUP BY name ORDER BY m DESC";
+        assert_eq!(
+            plan_page(sql, Some(&ResumePosition::new(vec![ResumeValue::UInt(7)]))),
+            Err(PagePlanError::ResumeValueTypeMismatch {
+                position: 1,
+                column: "m".to_string(),
+                expected: "Int".to_string(),
+                found: "UInt".to_string(),
+            }),
+        );
+
+        let refused: Vec<(&str, &'static str)> = vec![
+            (
+                "SELECT series_id, sum(value) AS m FROM samples GROUP BY series_id ORDER BY m",
+                unproven::AGGREGATE_SUM_FLOAT,
             ),
             (
                 "SELECT series_id, sum(CAST(value AS BIGINT)) AS m FROM samples \
@@ -5328,7 +5376,7 @@ mod tests {
                 unproven::AGGREGATE_SUM_ARGUMENT_TYPE,
             ),
         ];
-        for (sql, reason) in cases {
+        for (sql, reason) in refused {
             assert_eq!(min_or_max_proof(sql, "m"), Err(reason), "proof for {sql:?}");
             assert_eq!(
                 plan_page(sql, None),
@@ -5339,14 +5387,13 @@ mod tests {
             );
         }
 
-        // Written in the ORDER BY rather than named there, the term is the
-        // call itself.
-        let sql = "SELECT name, sum(duration_ns) AS m FROM spans GROUP BY name \
-                   ORDER BY sum(duration_ns)";
+        // A float sum written in the ORDER BY with no output column defined
+        // as it is refused as the call itself.
+        let sql = "SELECT series_id FROM samples GROUP BY series_id ORDER BY sum(value)";
         assert_eq!(
             plan_page(sql, None),
             Err(PagePlanError::OrderTermFromOtherRows {
-                term: "sum(duration_ns)".to_string()
+                term: "sum(value)".to_string()
             }),
         );
     }

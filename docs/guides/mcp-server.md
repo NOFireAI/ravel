@@ -149,15 +149,18 @@ server offers over MCP, `ravel_agent_send`, belongs to the
   A statement ordered by a `count(...)` (`ORDER BY c` over
   `count(*) AS c`), or by a `min(col)` or `max(col)` under a plain
   `GROUP BY` over a NOT NULL integer, string or nanosecond timestamp
-  column (`ORDER BY m` over `max(ts) AS m`), pages only over the segments
+  column (`ORDER BY m` over `max(ts) AS m`), or by a `sum(col)` under a
+  plain `GROUP BY` over a NOT NULL integer column (`ORDER BY s` over
+  `sum(duration_ns) AS s`), pages only over the segments
   page one read, since a row committed later can change the value for
   groups already served: a later page whose segments changed is
-  `cursor_expired` with a `rerun_page_one` next step. A statement with no
+  `cursor_expired` with a `rerun_page_one` next step. An integer sum is
+  exact: a sum past the `Int64` or `UInt64` range fails the call with an
+  overflow error rather than paging a wrapped order. A statement with no
   `ORDER BY` over a table with no row identity runs unpaged, and so does
-  one ordered by another aggregate (`sum` over any column, since a float
-  sum can differ in its last bits between runs and an integer sum wraps
-  past the 64-bit range; `avg`; a `min` or `max` over a float column or
-  `series_id`), a window function or a subquery
+  one ordered by another aggregate (a float `sum`, since it can differ in
+  its last bits between runs; `avg`; a `min` or `max` over a float column
+  or `series_id`), a window function or a subquery
   (`ORDER BY sum(value)`): a full page of
   either is `ok_bounded` with no cursor and a next step saying how to order
   it to page. An
@@ -559,8 +562,8 @@ Paging order differs per tool:
   or infinite order value, or a cursor over its 4 KiB bound) ends
   `ok_bounded` with no cursor and a `narrow_time_range` next step. The
   cursor pins a digest of the segments page one read. Under an `ORDER BY`
-  on a `count(...)`, or on a `min(col)` or `max(col)` the planner proves
-  non-null, a later page is served only over those same segments,
+  on a `count(...)`, or on a `min(col)`, `max(col)` or integer `sum(col)`
+  the planner proves non-null, a later page is served only over those same segments,
   else it is `cursor_expired` with a `rerun_page_one` next step; a
   `time_range` that ends before the most recent ingest keeps them stable.
   Under an order on the row's own columns, a later page over changed
