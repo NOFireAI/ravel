@@ -131,6 +131,52 @@ async fn esql_plans_pass_admission_through_the_executor() {
     }
 }
 
+/// A long `STATS SUM` sums in `Decimal128(38, 0)` and reads a total outside
+/// the long range as null, ES|QL's overflow semantics, so the SQL surface's
+/// checked integer `sum` (issue #3838) never sees a long argument and its
+/// overflow error does not apply here. Every scaled `dur` fits a long (the
+/// largest, 20, scales to 6e18); the total, 43 scaled, does not, and neither
+/// does the `api` group's 35 scaled. The smaller scale fits and is exact.
+#[tokio::test]
+async fn an_overflowing_long_stats_sum_reads_null() {
+    let fixture = fixture().await;
+    let outcome = run(
+        &fixture,
+        "FROM logs | EVAL big = dur * 300000000000000000 | STATS s = SUM(big)",
+    )
+    .await
+    .expect("runs");
+    assert_eq!(rows(&outcome), vec![vec!["null".to_string()]]);
+
+    let outcome = run(
+        &fixture,
+        "FROM logs | EVAL big = dur * 300000000000000000 | STATS s = SUM(big) BY service",
+    )
+    .await
+    .expect("runs");
+    let mut grouped = rows(&outcome);
+    grouped.sort();
+    assert_eq!(
+        grouped,
+        vec![
+            vec!["2100000000000000000".to_string(), "web".to_string()],
+            vec!["300000000000000000".to_string(), "null".to_string()],
+            vec!["null".to_string(), "api".to_string()],
+        ]
+    );
+
+    let outcome = run(
+        &fixture,
+        "FROM logs | EVAL big = dur * 100000000000000000 | STATS s = SUM(big)",
+    )
+    .await
+    .expect("a fitting sum");
+    assert_eq!(
+        rows(&outcome),
+        vec![vec!["4300000000000000000".to_string()]]
+    );
+}
+
 /// A sort on a key a sort below it also sorts on plans and runs, ordered by
 /// the last sort.
 #[tokio::test]

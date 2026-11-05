@@ -13,9 +13,10 @@ from the admission policy ADR-0022 sets.
 ## Context
 
 `sum` is already in the v1 SQL subset, gated by the two-layer
-differential gate (crates/ravel-sql/tests/differential.rs). Today it uses
-DataFusion's
-built-in `sum` accumulator directly. That accumulator computes a batch's
+differential gate (crates/ravel-sql/tests/differential.rs). Today, for
+float input, it uses DataFusion's built-in `sum` accumulator directly
+(integer input runs the checked UDAF of ADR-0022's integer sum
+amendment, which does not change float results). That accumulator computes a batch's
 partial sum with arrow's `compute::sum` kernel, which reduces internal
 lanes in parallel; the lane count and reduction order are
 architecture-dependent, so the bit pattern of a sum over values whose

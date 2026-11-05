@@ -6,7 +6,9 @@ sequential-order GroupsAccumulator with identical bits, and integer input
 moves to exact i128 accumulation instead of the f64 fold. Amended by the
 DISTINCT ON amendment below: `first_value` stays registered for the
 optimizer's `DISTINCT ON` rewrite while statements that name it are still
-refused.
+refused. Amended by the integer sum amendment below: `sum` over integer
+input is a checked UDAF that fails the query on overflow instead of
+returning a wrapped total.
 
 Companion to ADR-0013; amends the v1 aggregate subset it defines. Grouped
 min/max total-order semantics are a sibling gap decided separately in
@@ -138,7 +140,8 @@ What the pinned datafusion 54.1.0 accumulators actually do
    `reject_grouped_min_max` remains a separate check owned by ADR-0023.
 3. **Summation semantics inside `avg`'s own UDAF** (this does not touch
    the public `sum` aggregate, which stays DataFusion's built-in,
-   unchanged; see ADR-0024): `avg`'s internal numerator is the left fold
+   unchanged, for float input; the integer sum amendment below replaces
+   it for integer input; see ADR-0024): `avg`'s internal numerator is the left fold
    of plain IEEE f64 addition over its own non-null input values in the
    deterministic (series_id, ts) order, initialized with the first value
    rather than a zero seed. Empty input yields NULL; a group of all -0.0
@@ -200,7 +203,8 @@ What the pinned datafusion 54.1.0 accumulators actually do
   planned statement instead of at registration. The audit acceptance test
   (`stddev_and_variance_family_must_be_handled_like_avg`) passes without
   a per-function reject list to maintain.
-- The public `sum` aggregate is untouched by this ADR: its bits, and its
+- The public `sum` aggregate is untouched by this ADR for float input (the
+  integer sum amendment below changes it for integer input): its bits, and its
   documented restricted-pool gate deviation (crates/ravel-sql/tests/
   differential.rs), stay exactly as they are today. `avg(x)` computed by
   the new UDAF is therefore not guaranteed bit-identical to
@@ -331,3 +335,83 @@ value FROM samples ORDER BY series_id, ts DESC` is refused although `ts` is
 unique within a series; adding `value` as a trailing term admits it.
 `first_value` itself is not admitted: readmitting it under its own name is a
 decision 1 admission, not a consequence of this amendment.
+
+## Amendment: integer sum overflow fails the query
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="integer sum amendment" -->
+<!-- amendment-supersedes: phrase="aggregate is untouched by this ADR" pointer="integer sum amendment" -->
+
+Dated 2026-11-05. Tracked in issue #3838.
+
+Decision 3 and the Consequences left the public `sum` as DataFusion's
+built-in. For integer input that built-in adds with wrapping arithmetic in
+its grouped, ungrouped and sliding-window accumulators, so
+`SELECT sum(v)` over two rows of `2^62` returned `-2^63` with no error. A
+wrong number with no signal breaks the exactness invariant more plainly
+than any floating-point question this ADR settles.
+
+What changes:
+
+1. **`sum` is a Ravel UDAF** (crates/ravel-sql/src/sum.rs), registered
+   under `sum` in `build_session` and displacing the built-in. A call whose
+   result type is `Int64` (any signed integer input) or `UInt64` (any
+   unsigned integer input) accumulates in `i128` and converts the total to
+   the result type once, when the aggregate is evaluated. A total out of
+   range fails the query with `SqlError::IntegerSumOverflow`:
+   `aggregate sum overflowed its Int64 result type: the exact integer total
+   is out of range, and no wrapped value is returned; cast the argument to
+   DOUBLE for an approximate sum` (`UInt64` for unsigned input). It is an
+   execution error, HTTP 422, and its text names no value.
+2. **Every other result type delegates to the built-in**, with its
+   accumulators, state and bits unchanged: float `sum` stays the question
+   ADR-0024 tracks, and decimal, duration and interval sums are not
+   affected. NULL semantics are unchanged: null rows are skipped, and a
+   group with no non-null row sums to NULL.
+3. **Only the final total is range-checked; partial sums are not.** A total
+   that fits is returned even when a running or partial sum passed the
+   result type's range on the way: `i64::MAX` and `1` in one partition and
+   `-1` in another return `i64::MAX`. A check on every partial would make
+   the outcome depend on how rows are split: those three rows would fail
+   when `i64::MAX` and `1` share a partition and succeed when `-1` joins
+   them. ADR-0094 lets an aggregate over non-float input repartition
+   its final aggregation because its result does not depend on the
+   partitioning. Its Context gave wrapping as the reason this held for
+   integer `sum`. The checked sum keeps the property for a different
+   reason: `i128` addition is exact and associative, so the total, or the
+   error, depends only on the input rows. The partial state is a
+   `Decimal128(38, 0)`; a partial sum outside it would need about `10^19`
+   input rows, and fails with the same error.
+4. **DISTINCT, FILTER and window frames are checked the same way.**
+   `sum(DISTINCT x)` sums the distinct set in `i128`. A `FILTER` clause
+   drops rows before they are added. A window `sum` runs the same checked
+   accumulator, with retraction for a moving frame, so an overflowing frame
+   fails the query rather than returning a wrapped frame total.
+5. **The `SUM(x + c)` rewrite is not applied for an integer literal `c`.**
+   The built-in rewrites it to `SUM(x) + c * COUNT(x)`, whose `+` and `*`
+   are DataFusion scalar arithmetic and wrap. The checked sum declines the
+   rewrite, so `sum(x + 1)` is checked like `sum(x)`.
+
+What this does not change:
+
+- DataFusion scalar arithmetic still wraps: `v * 2` overflows before any
+  aggregate sees it. This amendment is about the aggregate only.
+- ES|QL's `STATS SUM` over a long reads null on overflow, as ES|QL
+  specifies. Its lowering sums a `Decimal128(38, 0)` cast of the argument
+  and casts the total back with `try_cast`, so the checked integer path
+  never sees a long argument there (crates/ravel-sql/src/esql/binder.rs).
+  `an_overflowing_long_stats_sum_reads_null` pins this behaviour.
+
+Evidence: the unit tests in crates/ravel-sql/src/sum.rs check
+`i64::MAX + 1`, `u64::MAX + 1` and `i64::MIN + (-1)` grouped and ungrouped
+at 1 and 8 partitions, asserting the plan stages. They also cover an
+overflow that only the final merge sees, totals exactly at the limits, the
+partial-overflow case of item 3, DISTINCT, FILTER, growing and moving
+window frames, and the delegated types. `tests/differential.rs` compares
+every integer sum against an `i128` oracle over values near `±2^63`. It
+runs at fetch concurrency 1 and 8 with the final aggregation fanned out,
+and an out-of-range oracle total must come back as the overflow error.
+ravel-server's `sql_endpoint.rs` asserts the 422 and its text over HTTP.
+
+Grouped execution runs a vectorized `GroupsAccumulator`: one `i128` and one
+seen flag per group, 17 bytes, against the built-in's 8. The aggregate
+memory estimate in crates/ravel-sql/src/memory.rs reads that layout.

@@ -496,6 +496,19 @@ pub enum SqlError {
         reason: &'static str,
     },
 
+    /// An integer `sum` whose exact total does not fit its result type
+    /// (`Int64` for signed input, `UInt64` for unsigned), raised by the
+    /// checked `sum` UDAF (crate::sum) instead of returning a wrapped value.
+    /// The query was valid; its data is out of the result type's range. The
+    /// text names only the aggregate and the result type, never a value, so
+    /// it is safe to return to the client; 422.
+    #[error(
+        "aggregate sum overflowed its {result_type} result type: the exact integer total \
+         is out of range, and no wrapped value is returned; cast the argument to DOUBLE \
+         for an approximate sum"
+    )]
+    IntegerSumOverflow { result_type: &'static str },
+
     /// A DataFusion operator panicked while the query's stream was being
     /// polled, and [`crate::PinnedStream`] unwound it into an error rather
     /// than letting it escape (issue #737).
@@ -687,6 +700,7 @@ impl SqlError {
             | SqlError::SpillUnavailable(_)
             | SqlError::Plan(_)
             | SqlError::UnencodableResult { .. }
+            | SqlError::IntegerSumOverflow { .. }
             | SqlError::Execution(_)
             | SqlError::Internal(_)
             | SqlError::OperatorPanic(_) => ErrorClass::Unsupported,
@@ -844,6 +858,8 @@ impl SqlError {
             // A result column name, an Arrow type and a fixed reason; the
             // variant never carries the value.
             SqlError::UnencodableResult { .. } => self.to_string(),
+            // The aggregate name and the result type; never a value.
+            SqlError::IntegerSumOverflow { .. } => self.to_string(),
             SqlError::Execution(_) => MSG_EXECUTION.to_string(),
             SqlError::Internal(_) | SqlError::OperatorPanic(_) | SqlError::PlanNotAdmitted(_) => {
                 MSG_INTERNAL.to_string()

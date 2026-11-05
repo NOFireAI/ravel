@@ -3,7 +3,11 @@
 Status: Accepted. Amended by ADR-0825: once `avg`'s accumulator is
 integer-exact for resolved integer input (i128 sum, associative merge),
 decision 1's classification admits `avg`/`mean` over resolved integer
-input; `avg` over float input remains never eligible.
+input; `avg` over float input remains never eligible. Amended by
+ADR-0022's integer sum amendment: integer `sum` no longer wraps on
+overflow; it sums exactly in `i128` and fails the query when the final
+total is out of range, which keeps the partition independence the Context
+section attributes to wrapping.
 
 ## Context
 
