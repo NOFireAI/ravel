@@ -297,7 +297,10 @@ async fn rlog_input_layout(
 async fn the_bloom_scope_read_is_the_list_prefix_sliced_or_one_get() {
     // The probe's 16 bytes are the trailer alone, so it covers no section.
     const TRAILER_ONLY_PROBE: u64 = 16;
-    for probe in [CompactorConfig::default().footer_probe_bytes, TRAILER_ONLY_PROBE] {
+    for probe in [
+        CompactorConfig::default().footer_probe_bytes,
+        TRAILER_ONLY_PROBE,
+    ] {
         let store = InstrumentedStore::new(MemoryStore::new());
         let bucket = seed_rlog_two_inputs_with_strings(&store).await;
         let layout = rlog_input_layout(&store, &bucket).await;
