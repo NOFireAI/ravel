@@ -8409,7 +8409,12 @@ mod tests {
     /// [`MergeMemoryTracker`]'s recorded *transient* high-water -- the merge's
     /// own decode-side buffers, at most one decoded block plus the raw bytes of
     /// the row groups it is decoding from, per input -- must stay under a fixed
-    /// bound and must NOT grow with the stream. The defect was that the old
+    /// bound and must NOT grow with the stream, on the runs where the stream
+    /// goes through cursors (ADR-3819 D3, the `D3_CEILING` runs). At the
+    /// default ceiling the stream fits one stream-range pass instead, which
+    /// holds its decoded blocks under the pass-rows term, so there the bound
+    /// is the pass budget (resident plus pass rows within the ceiling), not a
+    /// block per input. The defect was that the old
     /// merge decoded a whole stream's
     /// records from every input into one `Vec`, plus a second copy in the part
     /// accumulator, so peak scaled with stream size; a regression to that shape
@@ -8527,11 +8532,14 @@ mod tests {
                 config.l1_part_memory_target_bytes
             );
 
-            // The decode-side peak is under the fixed bound.
-            assert!(
-                transient > 0,
-                "the tracker must record real decode residency"
-            );
+            // The decode-side peak is under the fixed bound. A pass charges
+            // its decoded blocks to the pass-rows term, checked below.
+            if resident_ceiling.is_some() {
+                assert!(
+                    transient > 0,
+                    "the tracker must record real decode residency"
+                );
+            }
             assert!(
                 transient < TRANSIENT_BOUND,
                 "transient peak {transient} exceeded the fixed bound {TRANSIENT_BOUND} \
@@ -8569,7 +8577,7 @@ mod tests {
             peaks.push((resident_ceiling, transient));
         }
 
-        for resident_ceiling in [None, Some(D3_CEILING)] {
+        for resident_ceiling in [Some(D3_CEILING)] {
             let at: Vec<u64> = peaks
                 .iter()
                 .filter(|(c, _)| *c == resident_ceiling)
