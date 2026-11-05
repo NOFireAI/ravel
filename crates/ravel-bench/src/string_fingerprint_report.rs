@@ -752,6 +752,71 @@ mod tests {
         assert!(by.contains_key("test_subject/bloom/equals/false_positive_share"));
     }
 
+    #[cfg(feature = "parquet-baseline")]
+    #[test]
+    fn reads_binary_and_utf8_parquet_columns_with_nulls() {
+        use std::sync::Arc;
+
+        use arrow::array::{ArrayRef, BinaryArray, Int64Array, StringArray};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("hits.parquet");
+        let binary: ArrayRef = Arc::new(BinaryArray::from(vec![
+            Some(&b"http://a/x"[..]),
+            None,
+            Some(&b""[..]),
+            Some(&b"\xffnot utf8"[..]),
+        ]));
+        let utf8: ArrayRef = Arc::new(StringArray::from(vec![
+            None,
+            Some("title one"),
+            Some("t2"),
+            None,
+        ]));
+        let int: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4]));
+        let batch = RecordBatch::try_from_iter([("URL", binary), ("Title", utf8), ("Id", int)])
+            .expect("batch");
+        let file = File::create(&path).expect("create");
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let read = |column: &str, cap: u64| {
+            read_values(
+                &Corpus::ParquetColumn {
+                    path: path.clone(),
+                    column: column.to_string(),
+                },
+                cap,
+            )
+        };
+        assert_eq!(
+            read("URL", u64::MAX).expect("URL"),
+            vec![
+                b"http://a/x".to_vec(),
+                Vec::new(),
+                Vec::new(),
+                b"\xffnot utf8".to_vec()
+            ]
+        );
+        assert_eq!(
+            read("Title", u64::MAX).expect("Title"),
+            vec![
+                Vec::new(),
+                b"title one".to_vec(),
+                b"t2".to_vec(),
+                Vec::new()
+            ]
+        );
+        assert_eq!(read("URL", 2).expect("cap").len(), 2);
+        let err = read("Id", u64::MAX).expect_err("Int64 column");
+        assert!(err.contains("neither Utf8 nor Binary"), "{err}");
+        let err = read("Missing", u64::MAX).expect_err("no column");
+        assert!(err.contains("no column \"Missing\""), "{err}");
+    }
+
     #[test]
     fn describe_counts_short_and_long_values() {
         let line = describe(&Corpus::Lines(fixture("corpus.txt")), u64::MAX).expect("describe");
