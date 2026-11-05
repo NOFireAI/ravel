@@ -158,12 +158,12 @@ impl Unpaged {
             Unpaged::OrderFromOtherRows => step(
                 "order_by_the_rows_own_columns",
                 "the ORDER BY uses a value computed from other rows that the statement does \
-                 not prove non-null (a sum or avg over a float column, an avg over a UInt64 \
-                 column, a window function other than count, a subquery, or a min, max, sum \
-                 or avg that is not over a NOT NULL column of a supported type under a plain \
-                 GROUP BY), so the rest of the result has no cursor; order by count(...), by \
-                 min(col), max(col), an integer sum(col) or an integer avg(col) under GROUP \
-                 BY, or by the row's own non-null columns to page, or narrow time_range",
+                 not prove non-null (a float sum or avg, a UInt64 avg, a window function \
+                 other than count, a subquery, or a min, max, sum or avg not over a NOT NULL \
+                 column of a supported type), so the rest of the result has no cursor; \
+                 order by count(...), by min(col), max(col), an integer sum(col) or \
+                 avg(col) under GROUP BY, or by the row's own non-null columns to page, \
+                 or narrow time_range",
             ),
         }
     }
@@ -1116,9 +1116,10 @@ mod tests {
                         detail.contains("computed from other rows")
                             && detail.contains(
                                 "order by count(...), by min(col), max(col), an integer \
-                                 sum(col) or an integer avg(col) under GROUP BY, or by \
-                                 the row's own non-null columns to page"
-                            ),
+                                 sum(col) or avg(col) under GROUP BY, or by the row's \
+                                 own non-null columns to page"
+                            )
+                            && detail.ends_with("or narrow time_range"),
                         "{query}: {detail}"
                     );
                 } else {
