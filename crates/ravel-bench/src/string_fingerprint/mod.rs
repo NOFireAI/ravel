@@ -436,6 +436,9 @@ pub struct SubjectReport {
     pub expect: BTreeMap<String, Expect>,
     pub checked: Checked,
     pub decision: Decision,
+    /// The layout the summary was built with; not part of the written report.
+    #[serde(skip)]
+    pub layout: summary::Layout,
 }
 
 fn fmt_expect(e: &Expect, v: f64) -> String {
@@ -725,6 +728,7 @@ pub fn measure(
         expect,
         checked,
         decision,
+        layout: built.layout,
     })
 }
 

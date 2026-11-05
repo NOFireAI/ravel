@@ -678,9 +678,16 @@ mod tests {
         assert_eq!(run.rows, want);
 
         let keep: Vec<bool> = want.iter().map(|&n| n > 0).collect();
+        assert!(keep.contains(&false), "the summary must drop a block");
         let sub = objects.contains("needle", Some(&keep)).expect("subset");
         assert_eq!(sub.rows, want);
-        assert!(sub.cells_tested > 0 && sub.cells_tested <= run.cells_tested);
+        assert!(sub.cells_tested > 0);
+        assert!(
+            sub.cells_tested < run.cells_tested,
+            "dropping a block must test fewer cells: {} of {}",
+            sub.cells_tested,
+            run.cells_tested
+        );
     }
 
     #[test]
