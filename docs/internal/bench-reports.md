@@ -141,81 +141,197 @@ lightweight, per-workload secondary index can approximate equality and
 substring predicates soundly (never a false negative) and generalize past the
 workload it was built from.
 
-The summary (`string_fingerprint::summary`) is a shared vocabulary of
-features selected from a *seen* predicate workload (equality literals
-verbatim; `LIKE` literals decomposed into fixed-length byte grams), with each
-block storing only its own bitset over that vocabulary -- a different shape
-than the REI arm's shared postings list, and conservative for any vocabulary
-by construction (a block is never pruned unless `BlockSummary::build` found
-the feature truly absent). An equality literal outside the vocabulary always
-survives unconditionally: an equality fingerprint has no way to generalize to
-a value it was never told about, so `unseen/equals/false_positive_share`
-measures that ceiling directly, not a defect in one run's literal selection.
-A `LIKE` literal can still be pruned when its grams happen to already be
-vocabulary entries built from other, seen literals, which is the
-generalization the hypothesis predicts and `unseen/like/false_positive_share`
-tests directly.
+### The summary
 
-Every subject (a corpus and a column) is written as a declared `Str`
-attribute under one fixed column name, `value`, with `RlogConfig` defaults,
-so the production bloom baseline (`ScanStats::blocks_after_bloom`) and
-`Contains` baseline (`ScanStats::contains_cells_tested`) both apply
-unmodified -- including for the LogHub body subjects, which would otherwise
-have no production `Contains` baseline to compare against if written as the
-record body instead. GO per subject requires
-`unseen/equals/false_positive_share` and `unseen/like/false_positive_share`
-both at most 0.10, `summary_bytes_share` at most 0.01, `build_cpu_over_zstd`
-at most 2, and `saturation/false_positive_share` (the unseen `LIKE` measure
-restricted to blocks holding a value over 1024 bytes) at most 0.30, or the
-subject is body-ineligible (no block that long, reported as a vacuous pass);
-overall GO requires every pre-registered subject to be GO. A production
-exact-residual scan over the same blocks gives the true holders; the summary
-keeping fewer blocks than that scan holds (a false negative) is a hard
-error, never a softly reported figure.
+`string_fingerprint::summary` cuts every value of a block into byte grams of
+`gram_len` bytes and maps every possible gram to one bit of a per-block
+bitset. A gram learned from the training workload owns a bit; every other
+gram hashes into a shared fallback region (`Layout::bit_of`,
+`summary.rs:100`). A block sets the bit of every gram it holds, and a literal
+is pruned on a block when any of its grams maps to a clear bit (`survives`,
+`summary.rs:210`). A block holding a value equal to or containing the literal
+holds every one of its grams, so the test has no false negative for any
+learned set and fallback size (`summary.rs:12-19`); the proptest
+`survives_is_exactly_the_subset_test` (`summary.rs:543`) pins that, and
+`measure` refuses a summary or baseline that keeps fewer blocks than hold the
+literal.
+
+The learned set is chosen greedily: each distinct gram of the training
+literals is ranked by the number of training literals holding it times the
+number of blocks lacking it (`summary.rs:356-360`), and grams are learned in
+that order while `fallback_min_bits` fallback bits still fit the byte budget.
+The budget is `budget_share` of the column's zstd-compressed bytes; what the
+learned table leaves is spent on whole bytes of bitset per block, so
+`summary_bytes_share` is at most `budget_share` by construction and the
+question the run answers is what false-positive rate that budget buys.
+
+Relation to arXiv:2507.10391 ("Instance-Optimized String Fingerprints"): the
+paper keeps a fixed-width fingerprint per row, partitions single characters
+into bins (one bit per bin) and picks the partition by mixed-integer
+optimization over a seen workload; an unseen pattern is tested against the
+same partition and the subset test keeps it sound. This summary keeps the
+subset test and the partition of every possible gram into bits (each learned
+gram is a bin of one, the hash partitions the rest), and departs in three
+ways: one bitset per RLOG block rather than per row, `gram_len`-byte grams
+rather than characters, and a greedy rank rather than a solver
+(`summary.rs:21-31`).
+
+### Workload
+
+Per subject, `string_fingerprint::workload::draw` draws, from the subject's
+own values with the pre-registered seed and before the summary is built, a
+training set and a disjoint evaluation set: per kind, `literals_per_kind`
+literals in each set, half present and half absent
+(`workload.rs:254-265`). Present equality literals are values of
+`gram_len..=eq_max_len` bytes; absent ones are such a value with one ASCII
+letter or digit replaced, kept only when no value equals it. Present `LIKE`
+literals are substrings of `like_min_len..=like_max_len` bytes; absent ones
+are perturbed the same way, kept only when no block contains them. Every
+literal of a kind is distinct, so no evaluation literal was a training
+literal; evaluation literals do share grams with training literals, which is
+the generalization being tested. They come from the same column, so "unseen"
+means a literal not used at build time, not a different distribution.
+
+`seen/*` figures are over the training literals and `unseen/*` over the
+evaluation literals, never pooled. Each false-positive share is the pooled
+count of (literal, block) pairs where a block that does not hold the literal
+is kept, over all such pairs.
+
+### Baselines
+
+Each subject is written as a declared `Str` attribute with `RlogConfig`
+defaults (block 8192 records, zstd level 3) and read back through
+`ravel_logseg`'s reader:
+
+- Equality: `ScanStats::blocks_after_bloom` per evaluation equality literal
+  (`string_fingerprint_report.rs:485`). The writer builds no postings for a
+  declared attribute, so equality pruning is skip index plus bloom, and the
+  bloom only tests a literal of at most 64 bytes (`BLOOM_EXACT_MAX`,
+  `mod.rs:67`). `production/equals/*` covers every evaluation equality
+  literal; `bloom/equals/*` and `summary/equals_bloom_testable/*` cover the
+  ones the bloom can test, counted in `eval_equals_bloom_testable`.
+- `LIKE`: `ScanStats::contains_cells_tested` from a full scan that selects the
+  column (`ColumnSelection::fixed_only().with_attr`) and drains every block
+  (`string_fingerprint_report.rs:496-518`), and again over only the blocks
+  the summary keeps; the rows each scan returns must match the in-module
+  truth. `summary/like/cells_tested_share` is the second over the first.
+
+### Decision and saturation
+
+GO per subject requires `unseen/equals/false_positive_share` and
+`unseen/like/false_positive_share` both at most 0.10, `summary_bytes_share` at
+most 0.01 and `build_cpu_over_zstd` at most 2 (`DECISION_RULE`, `mod.rs:76`).
+Saturation is a separate verdict, not a NO-GO leg: the values over 1024 bytes,
+cut into blocks the production way and summarized alone, are tested with the
+evaluation `LIKE` literals; at most 0.30 false positives is body-eligible,
+above it body-ineligible, and a subject with no such value is untested.
+Overall GO needs every pre-registered subject GO. A figure outside its
+pre-registered band prints `MISS` and does not change the decision. Build and
+zstd CPU are the report thread's `CLOCK_THREAD_CPUTIME_ID`, both on one
+thread.
+
+### Pre-registration and running it
+
+`crates/ravel-bench/fixtures/string_fingerprint/subjects.toml` fixes, per
+subject, every run parameter (gram length, budget share, fallback bits, zstd
+level, block and object records, line count, seed, workload lengths) and a
+prediction with a miss band, an expected-absent reason, or an unpredicted
+reason for every figure; its header states the basis of each prediction. It
+was committed alone (93ab7d8) before the first run of this design, and no
+band was edited after it. The report prints the parameters on its `params`
+line and refuses a parameter flag that differs from the file before it reads
+the corpus (`refuse_param_drift`, `string_fingerprint_report.rs:171`). Each
+run prints a stamp line: git HEAD, `uname -m`, nproc, memory, the corpus
+file's name, sha256 and bytes, zstd level and CPU clock.
 
 ```sh
-cargo run --release -p ravel-bench --bin string_fingerprint_report -- \
-  --subject hdfs_body --corpus-lines HDFS.log --out hdfs_body.json
-cargo run --release -p ravel-bench --bin string_fingerprint_report --features parquet-baseline -- \
-  --subject clickbench_url --corpus-parquet hits.parquet --corpus-column URL \
-  --max-lines 10000000 --out clickbench_url.json
-cargo run --release -p ravel-bench --bin string_fingerprint_report -- \
-  --decide hdfs_body.json bgl_body.json openssh_body.json apache_body.json \
-           clickbench_url.json clickbench_title.json clickbench_searchphrase.json clickbench_referer.json
+cargo build --release -p ravel-bench --features parquet-baseline --bin string_fingerprint_report
+string_fingerprint_report --describe --corpus-lines HDFS.log
+string_fingerprint_report --subject hdfs_body --corpus-lines HDFS.log --out hdfs_body.json
+string_fingerprint_report --subject clickbench_url --corpus-parquet hits_0.parquet \
+  --corpus-column URL --out clickbench_url.json
+string_fingerprint_report --decide apache_body.json openssh_body.json bgl_body.json hdfs_body.json \
+  clickbench_url.json clickbench_title.json clickbench_searchphrase.json clickbench_referer.json
 ```
 
-The eight subjects, their corpora, parameters, and seen/unseen literal sets
-(each with a stated reason) are pre-registered in
-`crates/ravel-bench/fixtures/string_fingerprint/subjects.toml`: four LogHub
-body subjects (HDFS, BGL, OpenSSH, Apache from
-[Zenodo record 8196385](https://zenodo.org/record/8196385), full corpus) and
-four ClickBench `hits_compatible` columns (URL, Title, SearchPhrase, Referer;
-`https://datasets.clickhouse.com/hits_compatible/hits.parquet`, a
-10,000,000-row prefix -- about 10% of the full ~100,000,000-row file, a
-documented scope reduction from a full-corpus run given this tool's
-per-command execution budget). Neither corpus is checked in.
+Subjects: the four LogHub bodies (Apache, OpenSSH, BGL, HDFS from
+[Zenodo record 8196385](https://zenodo.org/record/8196385), every line), and
+the URL, Title, SearchPhrase and Referer columns ClickBench q21 to q24 filter,
+from `hits_compatible/athena_partitioned/hits_0.parquet` (all 1,000,000
+rows). Round 0 used a 10,000,000-row prefix of `hits.parquet`; this run uses
+the first partition whole, a smaller and different sample. Neither corpus is
+checked in; the sha256 of every file is in `subjects.toml` and in each run's
+stamp line.
 
-The 2026-11-05 run's output (every figure, band, and decision line) is
-committed as
-`crates/ravel-bench/fixtures/string_fingerprint/string_fingerprint_run_2026-11-05.txt`.
-Result: **NO-GO overall**, and NO-GO on every one of the eight subjects.
-`unseen/equals/false_positive_share` was 1.0 on every subject, which the
-module doc identifies as a structural ceiling of an equality fingerprint
-rather than an implementation defect: no vocabulary built only from seen
-literals can prune a block for an equality literal it has never seen.
-`unseen/like/false_positive_share` was also 1.0 on every subject (the
-pre-registered unseen `LIKE` literals were chosen to be byte-disjoint from
-the corpus, so none of their grams could already be vocabulary entries from
-other seen literals). The four ClickBench subjects additionally failed the
-saturation leg at 1.0 against a 0.30 bar; the four LogHub subjects reported
-it as a vacuous pass (no value in those corpora exceeds 1024 bytes).
-`openssh_body` additionally failed the CPU bar (`build_cpu_over_zstd` =
-11.91, bar 2). No subject came close on the bytes bar (`summary_bytes_share`
-was at most 0.0003 against a 0.01 bar) or the seen-equals false-positive
-share (0 on every subject).
+### 2026-11-05 run
 
-A small corpus and subject spec for the module's own orchestration test live
-in `crates/ravel-bench/fixtures/string_fingerprint/` (`corpus.txt`,
+Every run's output and JSON report are in
+`crates/ravel-bench/fixtures/string_fingerprint/run_2026-11-05/`, one
+`<subject>.txt` and `<subject>.json` each, with the `--decide` output in
+`decide.txt`. Host: x86_64, 16 CPUs, 32 GB.
+
+Result: **NO-GO overall, NO-GO on all eight subjects.** Every subject fails
+the unseen `LIKE` bar and the CPU bar; the bytes bar holds by construction.
+
+| Subject | unseen `=` FP | unseen `LIKE` FP | build CPU / zstd | bytes share | saturation |
+|---|---|---|---|---|---|
+| apache_body | 0.142 | 0.569 | 7.5 | 0.0100 | untested |
+| openssh_body | 0.007 | 0.286 | 11.0 | 0.0100 | untested |
+| bgl_body | 0.003 | 0.202 | 9.5 | 0.0100 | untested |
+| hdfs_body | 0.058 | 0.259 | 9.2 | 0.0100 | untested |
+| clickbench_url | 0.714 | 0.848 | 3.9 | 0.0100 | ineligible (0.364) |
+| clickbench_title | 0.485 | 0.453 | 8.0 | 0.0100 | eligible (0.026) |
+| clickbench_searchphrase | 0.639 | 0.698 | 3.0 | 0.0099 | ineligible (0.588) |
+| clickbench_referer | 0.738 | 0.840 | 3.9 | 0.0100 | ineligible (0.556) |
+
+Against the baselines on the same evaluation literals:
+
+- Equality on the ClickBench columns and Apache, where all 40 evaluation
+  literals are bloom-testable: the production bloom keeps 0.011 to 0.017 of
+  non-holding blocks, the summary 0.142 (Apache) to 0.738 (Referer). The
+  bloom is better by one to two orders of magnitude at these sizes; equal
+  false-positive rate was never reached, so no cost-at-equal-rate comparison
+  could be made.
+- Equality on OpenSSH, BGL and HDFS, where no line is 64 bytes or fewer:
+  production keeps every block (false-positive share 1.0) and the summary
+  0.003 to 0.058. These literals are whole log lines of over 100 bytes, so
+  most blocks lack at least one of their grams; this is the one place the
+  summary beats production, and it fails the CPU bar there (9.2 to 11.0).
+- `LIKE`: scanning only the summary's kept blocks tests 0.32 (BGL) to 0.94
+  (Referer) of the cells the full `Contains` scan tests.
+
+Saturation: on URL, SearchPhrase and Referer the long-value block keeps 0.36
+to 0.59 of non-holder pairs, so the summary is body-ineligible there. Title's
+0.026 comes from one block holding two values and is too small a sample to
+call the summary body-eligible in general. The LogHub corpora have no value
+over 1024 bytes, so the run cannot answer the saturation question for log
+bodies.
+
+Prediction misses (each printed as `MISS` in the run files; no band moved
+after the pre-registration commit): `build_cpu_over_zstd` was predicted 2.5
+and read 3.0 to 11.0, over its band [1, 6] on Apache, OpenSSH, BGL, HDFS and
+Title. On OpenSSH, BGL and HDFS the fallback region was sparser than
+predicted (0.44, 0.22, 0.20 against 0.8, 0.75, 0.5), and every unseen
+false-positive share came in under its band, the equality ones by two orders
+of magnitude on OpenSSH and BGL; on Apache only the equality shares missed
+low. On ClickBench, Title and SearchPhrase compressed to 0.64 and 0.28 of a
+tenth of round 0's 10,000,000-row figure, the basis of their byte and
+bit-count predictions, which missed low; SearchPhrase's unseen shares (0.53
+to 0.70) came in under bands starting at 0.7.
+
+Corrections to round 0 (2eee496), whose figures this run replaces. Its commit
+message described a summary built from "the column's frequent 3-grams"; its
+vocabulary was drawn from the seen literals (`summary.rs:1-3` at 2eee496).
+Its writeup said a production "exact-residual scan" gave the true holders;
+its `Contains` baseline selected no column and drained no block, so it tested
+no cell. This run computes the holders in-module and requires the production
+scan to return the same rows. And it said the unseen measure "tests
+generalization directly"; its unseen equality literals always survived by
+construction and its unseen `LIKE` literals were byte-disjoint from the
+corpus, so its unseen shares of 1.0 were fixed by design, not measured.
+
+A small corpus and subject spec for the module's own tests live in
+`crates/ravel-bench/fixtures/string_fingerprint/` (`corpus.txt`,
 `test_subjects.toml`).
 
 ## Selective investigations (benchmarks/investigations)
