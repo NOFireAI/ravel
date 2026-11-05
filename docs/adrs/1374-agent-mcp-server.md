@@ -2027,29 +2027,44 @@ deferred it. This logs-leg amendment ships it and records each choice.
    `estimate_is_upper_envelope: false` even when the span lookup's own
    claim, kept in `logs.span_lookup_budget`, is true. A call without the
    leg is unchanged.
-6. Deadline. The leg runs on the same `ServiceBackend` as the span lookup,
-   so it is bounded by what is left of the call's one deadline
-   (`with_call_start`, the call-deadline amendment). A new
-   `QueryBackend::time_left` reports that remainder; when it is zero after
-   the span lookup the leg does not start and is `skipped` with the reason
-   "no time was left of the call's deadline after the span lookup". A leg
-   that starts and runs out is `failed` with class `deadline`.
+6. Deadline and scan budgets. The call's budgets are shared across the
+   call, the scan budgets like the deadline. The leg runs on the same
+   `ServiceBackend` as the span lookup, so it is bounded by what is left
+   of the call's one deadline (`with_call_start`, the call-deadline
+   amendment). A new `QueryBackend::time_left` reports that remainder;
+   when it is zero after the span lookup the leg does not start and is
+   `skipped` with the reason "no time was left of the call's deadline
+   after the span lookup". A leg that starts and runs out is `failed` with
+   class `deadline`. The leg's `max_bytes_scanned`, `max_store_requests`
+   and `max_segments` are the call's effective figure less the span
+   lookup's `budget.actual` spend for it (`bytes_scanned`,
+   `store_requests`, `segments_read`), an unlimited budget staying
+   unlimited, so the whole call scans no more than one call may. When any
+   of the three has nothing left the leg does not start and is `skipped`
+   with a reason naming that budget.
 7. Failure isolation. A leg that fails for any reason (a budget, the
    deadline, an engine error) is `failed` with its failure class and a
-   message bounded to 512 bytes, and the spans are returned as they would
-   be without it. Its spend is whatever its failure reported, which for a
+   message bounded to 512 serialized bytes: a longer one is cut with the
+   truncation marker and counted in `presentation.scalars_truncated`. The
+   spans are returned as they would be without it. Its spend is whatever its failure reported, which for a
    refusal is empty, so the summed `budget.actual` can under-count a leg
    that read data before it failed.
 8. Rows. `max_rows` applies to spans and to log records separately: each
    gets the call's `max_rows`, so a leg cannot crowd the spans out of the
-   row cap. The leg's own cut is reported in `logs.row_cap_hit` and
+   row cap. Unlike the scan budgets of item 6 it is not shared, since it
+   bounds what is returned, not what is read. The leg's own cut is reported in `logs.row_cap_hit` and
    `logs.rows_omitted`, never in `presentation`, which stays the spans'.
 9. Bytes. `max_response_bytes` is shared, spans first. The span fit runs
    with the leg's columns, warning and next step already in the envelope
    and its fields at their widest values, so the fit measures everything
    but the records; if even that does not fit, the leg's columns are
-   dropped too. The records are then added as the longest prefix that
-   keeps the serialized envelope inside the fit, the rest counted in
+   dropped too. Both that check and the records' placement measure the
+   envelope under the status it will finish with (`ok_bounded` once a cap
+   cut the spans), not the one the fit left, so the status change cannot
+   push it over. As with the deadline and the scan budgets of item 6, the
+   leg gets only what the span lookup left. The records are then added as
+   the longest prefix that keeps the serialized envelope inside the fit,
+   the rest counted in
    `logs.rows_omitted` with `logs.bytes_cap_hit` set, and the widest
    values are rewritten with the real ones, which only shorten it. The
    limit therefore holds for the final envelope.
