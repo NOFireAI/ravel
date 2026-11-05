@@ -11635,7 +11635,8 @@ mod tests {
         };
 
         use super::*;
-        use crate::{MergeLiveBytes, RequestLedger, RunRequestReport};
+        use crate::clock::Clock;
+        use crate::{ClaimParticipant, MergeLiveBytes, RequestLedger, RunRequestReport};
 
         /// The rlog memory target (pass floor) of the unkeyed fixtures. A pass
         /// of one stream of a [`wide_inputs`] fixture costs one two-row block per
@@ -11659,6 +11660,17 @@ mod tests {
             watched: Mutex<BTreeSet<Extent>>,
             in_flight: AtomicU64,
             max_in_flight: AtomicU64,
+            /// A claim clock each watched GET moves forward by its bytes at
+            /// the 10 MiB/s rate the lease is sized by, and every watched GET
+            /// and claim PUT in order, at that clock's time once it is done.
+            lease_clock: Option<FixedClock>,
+            timeline: Mutex<Vec<(Moment, i64)>>,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Moment {
+            Group,
+            ClaimWrite,
         }
 
         impl ProbeStore {
@@ -11670,6 +11682,28 @@ mod tests {
                     watched: Mutex::new(BTreeSet::new()),
                     in_flight: AtomicU64::new(0),
                     max_in_flight: AtomicU64::new(0),
+                    lease_clock: None,
+                    timeline: Mutex::new(Vec::new()),
+                }
+            }
+
+            fn with_lease_clock(clock: FixedClock) -> Self {
+                ProbeStore {
+                    lease_clock: Some(clock),
+                    ..ProbeStore::new()
+                }
+            }
+
+            fn timeline(&self) -> Vec<(Moment, i64)> {
+                self.timeline.lock().expect("lock").clone()
+            }
+
+            fn mark(&self, moment: Moment) {
+                if let Some(clock) = &self.lease_clock {
+                    self.timeline
+                        .lock()
+                        .expect("lock")
+                        .push((moment, clock.now_ns()));
                 }
             }
 
@@ -11718,7 +11752,11 @@ mod tests {
                 data: Bytes,
                 opts: PutOptions,
             ) -> std::result::Result<PutOutcome, StoreError> {
-                self.inner.put(key, data, opts).await
+                let out = self.inner.put(key, data, opts).await;
+                if out.is_ok() && key.starts_with(ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX) {
+                    self.mark(Moment::ClaimWrite);
+                }
+                out
             }
 
             async fn get(
@@ -11753,6 +11791,12 @@ mod tests {
                 }
                 let out = self.inner.get(key, range).await;
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                if let (Some(clock), Ok(got)) = (&self.lease_clock, &out) {
+                    let ns = got.data.len() as u128 * 1_000_000_000
+                        / u128::from(crate::config::CLAIM_LEASE_WARN_CONSERVATIVE_ENCODE_BYTES_PER_SEC);
+                    clock.set(clock.now_ns() + i64::try_from(ns).expect("ns"));
+                    self.mark(Moment::Group);
+                }
                 out
             }
 
@@ -11967,6 +12011,16 @@ mod tests {
             store: &dyn ObjectStoreBackend,
             config: &CompactorConfig,
         ) -> (Result<CompactionOutcome>, Run) {
+            compact_logged_as(store, config, false).await
+        }
+
+        /// [`compact_logged`], through [`crate::compact_bucket_claimed`] when
+        /// `claimed`, which must run rather than skip.
+        async fn compact_logged_as(
+            store: &dyn ObjectStoreBackend,
+            config: &CompactorConfig,
+            claimed: bool,
+        ) -> (Result<CompactionOutcome>, Run) {
             let tracker = MergeMemoryTracker::new();
             let ledger = RequestLedger::new();
             let config = CompactorConfig {
@@ -11983,7 +12037,15 @@ mod tests {
                 .finish();
             let guard = tracing::subscriber::set_default(subscriber);
             let clock = FixedClock::new(sealed_now_ns());
-            let outcome = compact_bucket(store, &clock, &config, &bucket()).await;
+            let outcome = if claimed {
+                match crate::compact_bucket_claimed(store, &clock, &config, &bucket()).await {
+                    Ok(crate::ClaimedCompaction::Ran(outcome)) => Ok(outcome),
+                    Ok(other) => panic!("the claimed run did not run: {other:?}"),
+                    Err(e) => Err(e),
+                }
+            } else {
+                compact_bucket(store, &clock, &config, &bucket()).await
+            };
             drop(guard);
             let log = String::from_utf8_lossy(&log.0.lock().expect("log lock")).into_owned();
             let run = Run {
@@ -12622,6 +12684,99 @@ mod tests {
                     (2..=3).contains(&max),
                     "{mode:?}: {max} group GETs in flight"
                 );
+            }
+        }
+
+        /// The claim lease outlives a group fetch phase longer than itself
+        /// ([`lease_renewal_spacing`]). Under a 1 ms lease, with every group GET
+        /// taking its bytes' time at 10 MiB/s on the claim's clock, one pass's
+        /// groups take over two leases to land, under resident reads and
+        /// fetch-per-pass reads alike. The claim is renewed between group GETs,
+        /// so no group lands on a claim older than the lease.
+        ///
+        /// Demonstrated red against the merge without its renewal calls:
+        /// removing `renewal.tick(config, store).await?` from
+        /// [`fetch_resident_groups`] fails the resident case (group 17 of 40
+        /// lands on a claim 1,009,169 ns old), and removing both
+        /// `fetch_renewal.tick` and `block_renewal.tick` from
+        /// [`run_stream_pass`] fails the fetch-per-pass case the same way.
+        /// Removing only one of those two leaves the other renewing: at this
+        /// lease the block spacing is one block.
+        #[tokio::test]
+        async fn a_long_group_fetch_renews_the_claim_between_groups() {
+            const LEASE: std::time::Duration = std::time::Duration::from_millis(1);
+            let lease_ns = i64::try_from(LEASE.as_nanos()).expect("lease");
+            let inputs = blocked(wide_inputs(40, 20, 2), 2);
+            // A floor over one stream's 40 two-row blocks, about 256 KiB.
+            let base = CompactorConfig {
+                claim_lease_duration: LEASE,
+                rlog_l1_part_memory_target_bytes: Some(512 * 1024),
+                ..unkeyed_base(2)
+            };
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &inputs).await;
+            let extents = group_extents(&probe, &keys).await;
+            assert_eq!(extents.len(), 40, "one group per input");
+            let raw: u64 = extents.iter().map(|(_, s, e)| e - s).sum();
+            let part = crate::config::claim_lease_max_part_bytes(LEASE);
+            assert!(raw > 4 * part, "the groups take {raw} / {part} half-leases");
+            let (_, fetch_tight) = tight_ceilings(&probe, &keys, &base).await;
+            for (ceiling, mode) in [
+                (None, MergeReadMode::Resident),
+                (Some(fetch_tight), MergeReadMode::FetchPerPass),
+            ] {
+                let config = with_ceiling(&base, ceiling);
+                assert_eq!(plan_for(&probe, &keys, &config).await.0.mode, mode);
+                let clock = FixedClock::new(sealed_now_ns());
+                let store = ProbeStore::with_lease_clock(clock.clone());
+                seed_inputs(&store, &inputs).await;
+                store.watch(&extents);
+                let config = CompactorConfig {
+                    claim_participant: Some(ClaimParticipant::new(
+                        Uuid::from_u128(99),
+                        Arc::new(clock) as Arc<dyn Clock>,
+                    )),
+                    ..config
+                };
+                let (outcome, run) = compact_logged_as(&store, &config, true).await;
+                outcome.expect("compact");
+                if mode == MergeReadMode::FetchPerPass {
+                    assert!(run.report.merge_passes >= 2);
+                }
+
+                let timeline = store.timeline();
+                let groups = timeline.iter().filter(|(m, _)| *m == Moment::Group).count();
+                assert_eq!(groups as u64, run.report.block_read.requests, "{mode:?}");
+                let mut written: Option<i64> = None;
+                let mut renewals_among_groups = 0usize;
+                let mut seen = 0usize;
+                for &(moment, at) in &timeline {
+                    match moment {
+                        Moment::ClaimWrite => {
+                            if seen > 0 && seen < groups {
+                                renewals_among_groups += 1;
+                            }
+                            written = Some(at);
+                        }
+                        Moment::Group => {
+                            seen += 1;
+                            let at_write = written.expect("the claim is taken before any GET");
+                            assert!(
+                                at - at_write < lease_ns,
+                                "{mode:?}: group {seen} of {groups} landed on a claim {} ns old, \
+                                 lease {lease_ns} ns",
+                                at - at_write
+                            );
+                        }
+                    }
+                }
+                println!(
+                    "[lease:rlog #3819] {mode:?}: {groups} group GETs over {} ns, \
+                     {renewals_among_groups} renewals among them",
+                    timeline.last().map(|(_, t)| *t).unwrap_or(0)
+                        - timeline.first().map(|(_, t)| *t).unwrap_or(0)
+                );
+                assert!(renewals_among_groups >= 2, "{mode:?}");
             }
         }
 
