@@ -4725,6 +4725,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
+ "tracing-subscriber",
  "uuid",
  "zstd",
 ]

@@ -100,6 +100,9 @@ thiserror = { workspace = true }
 # Already a workspace pin (ravel-server uses it); adds no new external crate.
 humantime = { workspace = true }
 tokio = { workspace = true }
+# Library tracing (the RLOG merge's read-mode line, among others) to stderr
+# (issue #3854). Workspace pin, already a dependency of ravel-server.
+tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
