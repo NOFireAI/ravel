@@ -43,7 +43,7 @@ use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{
     self, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION, KeyIndexLeafEncodeError, KeyIndexLeafEntry,
-    KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafSummary, NamePostings, PartLimits,
+    KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafSummary, KeyIndexSlice, NamePostings, PartLimits,
     SnapshotFormatError, check_key_index_leaf_set, column_stats_segments_concat,
     encode_key_index_leaf, encoded_entry_len, split_key_index_entries,
     verify_key_index_leaf_frames,
@@ -1497,6 +1497,14 @@ pub(crate) struct PartKeyIndexLeaves {
 /// the field under that key type. Every entry carrying a `key8` whose own
 /// entries exceed the body ceiling is uncovered for the field too, since no
 /// slice can hold that `key8`. A field with no covered entry writes no leaf.
+///
+/// `max_pairs` is the pair budget [`build_part_key_index`] builds under: each
+/// field's pairs are cut into the passes [`key_index_pass_ends`] gives under
+/// its share [`key_index_field_share`], and each pass's pairs into slices by
+/// [`key_index_pass_slices`], so for the same reads this returns the leaves
+/// the incremental build writes, byte for byte. `u64::MAX` is one pass per
+/// field.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_part_key_index_leaves(
     tenant: &TenantHash,
     signal: Signal,
@@ -1505,6 +1513,7 @@ pub(crate) fn build_part_key_index_leaves(
     section_named_fields: bool,
     reads: &[&EntryKeyIndex],
     limits: &KeyIndexLeafLimits,
+    max_pairs: u64,
 ) -> PartKeyIndexLeaves {
     let part_entry_count = reads.len() as u64;
     let mut field_types: BTreeMap<&str, KeyType> = BTreeMap::new();
@@ -1520,6 +1529,7 @@ pub(crate) fn build_part_key_index_leaves(
             }
         }
     }
+    let share = key_index_field_share(max_pairs, field_types.len());
     let mut built = PartKeyIndexLeaves {
         leaves: Vec::new(),
         uncovered_entries: 0,
@@ -1550,6 +1560,9 @@ pub(crate) fn build_part_key_index_leaves(
             }
         }
         entries.sort_by_key(|e| (e.key8, e.entry_ordinal));
+        // The passes count every pair the incremental build holds, those of
+        // entries the ceiling then uncovers included.
+        let pass_ends = key_index_pass_ends(&entries, share);
         let mut oversized: BTreeSet<u64> = BTreeSet::new();
         for run in entries.chunk_by(|a, b| a.key8 == b.key8) {
             let body = run
@@ -1576,34 +1589,61 @@ pub(crate) fn build_part_key_index_leaves(
             built.uncovered_entries += part_entry_count;
             continue;
         }
-        let leaves = split_key_index_entries(&entries, limits.max_body_bytes).and_then(|slices| {
-            slices
-                .into_iter()
-                .map(|slice| {
-                    encode_part_key_index_leaf(
-                        &KeyIndexLeafInput {
-                            tenant_hash: *tenant,
-                            signal,
-                            part_blake3,
-                            part_entry_count,
-                            field,
-                            key_type,
-                            key8_lo: slice.key8_lo,
-                            key8_hi: slice.key8_hi,
-                            uncovered_entry_ordinals: &uncovered,
-                            entries: &entries[slice.entries],
-                        },
-                        limits,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()
-        });
-        match leaves {
-            Ok(leaves) => {
+        let mut leaves: Vec<EncodedKeyIndexLeaf> = Vec::new();
+        let mut refused = None;
+        let mut slice_lo = 0u64;
+        let mut start = 0usize;
+        for end in pass_ends.iter().copied().map(Some).chain([None]) {
+            let stop = end.map_or(entries.len(), |end| {
+                start + entries[start..].partition_point(|e| u64::from_be_bytes(e.key8) < end)
+            });
+            let pass = &entries[start..stop];
+            start = stop;
+            let slices = match key_index_pass_slices(pass, slice_lo, end, limits.max_body_bytes) {
+                Ok(slices) => slices,
+                Err(err) => {
+                    refused = Some(err);
+                    break;
+                }
+            };
+            if let Some(end) = end
+                && !slices.is_empty()
+            {
+                slice_lo = end;
+            }
+            for slice in slices {
+                match encode_part_key_index_leaf(
+                    &KeyIndexLeafInput {
+                        tenant_hash: *tenant,
+                        signal,
+                        part_blake3,
+                        part_entry_count,
+                        field,
+                        key_type,
+                        key8_lo: slice.key8_lo,
+                        key8_hi: slice.key8_hi,
+                        uncovered_entry_ordinals: &uncovered,
+                        entries: &pass[slice.entries],
+                    },
+                    limits,
+                ) {
+                    Ok(leaf) => leaves.push(leaf),
+                    Err(err) => {
+                        refused = Some(err);
+                        break;
+                    }
+                }
+            }
+            if refused.is_some() {
+                break;
+            }
+        }
+        match refused {
+            None => {
                 built.uncovered_entries += uncovered.len() as u64;
                 built.leaves.extend(leaves);
             }
-            Err(err) => {
+            Some(err) => {
                 tracing::error!(
                     tenant = %tenant.to_hex(),
                     field,
@@ -1615,6 +1655,52 @@ pub(crate) fn build_part_key_index_leaves(
         }
     }
     built
+}
+
+/// The exclusive key8 ends of a field's passes over `entries`, sorted by
+/// `(key8, entry_ordinal)`, under `share`: greedy over the key8 runs in
+/// ascending order, a pass taking whole runs while their pairs fit `share`,
+/// and a run over `share` a pass of its own. The budget cut of
+/// [`FieldBuild::cut`] converges to these ends whatever order the pairs
+/// arrive in.
+fn key_index_pass_ends(entries: &[KeyIndexLeafEntry], share: u64) -> Vec<u64> {
+    let mut ends = Vec::new();
+    let mut held = 0u64;
+    for run in entries.chunk_by(|a, b| a.key8 == b.key8) {
+        let pairs = run.len() as u64;
+        if held > 0 && held.saturating_add(pairs) > share {
+            ends.push(u64::from_be_bytes(run[0].key8));
+            held = 0;
+        }
+        held = held.saturating_add(pairs);
+    }
+    ends
+}
+
+/// The slices of one pass: `entries`, the pass's covered pairs sorted by
+/// `(key8, entry_ordinal)`, split by [`split_key_index_entries`], the first
+/// slice starting at `slice_lo` (where the field's last slice ended) and the
+/// last ending at `end - 1`, or `u64::MAX` for the field's last pass. A pass
+/// that ends before `u64::MAX` with no covered pair has no slice, and the
+/// next pass's first slice starts at `slice_lo`. Every pass closes its
+/// slices, so no pair outlives its pass.
+fn key_index_pass_slices(
+    entries: &[KeyIndexLeafEntry],
+    slice_lo: u64,
+    end: Option<u64>,
+    max_body_bytes: u64,
+) -> Result<Vec<KeyIndexSlice>, KeyIndexLeafEncodeError> {
+    if entries.is_empty() && end.is_some() {
+        return Ok(Vec::new());
+    }
+    let mut slices = split_key_index_entries(entries, max_body_bytes)?;
+    if let Some(first) = slices.first_mut() {
+        first.key8_lo = slice_lo;
+    }
+    if let (Some(last), Some(end)) = (slices.last_mut(), end) {
+        last.key8_hi = end - 1;
+    }
+    Ok(slices)
 }
 
 static FOLD_KEY_INDEX_SECTIONS_READ: std::sync::atomic::AtomicU64 =
@@ -1835,56 +1921,6 @@ async fn load_carried_key_index(
     })
 }
 
-/// The open slice of one field's leaf build, cut by the rule
-/// [`split_key_index_entries`] applies to a whole sorted list: a slice takes
-/// key8 runs while its body stays at or below the ceiling, and the run that
-/// would cross it opens the next slice at its own key8. Runs arrive in
-/// ascending key8 order across every pass, so the slices of all passes are
-/// the slices of one pass.
-struct OpenSlice {
-    key8_lo: u64,
-    entries: Vec<KeyIndexLeafEntry>,
-    body: u64,
-}
-
-impl OpenSlice {
-    fn new() -> Self {
-        Self {
-            key8_lo: 0,
-            entries: Vec::new(),
-            body: 0,
-        }
-    }
-
-    /// Adds one key8 run (non-empty, sorted by ordinal, body at or below
-    /// `max_body_bytes`) and returns the slice it closed, if any.
-    fn push_run(
-        &mut self,
-        run: Vec<KeyIndexLeafEntry>,
-        max_body_bytes: u64,
-    ) -> Option<(u64, u64, Vec<KeyIndexLeafEntry>)> {
-        let key8 = u64::from_be_bytes(run.first()?.key8);
-        let run_body = run
-            .iter()
-            .map(encoded_entry_len)
-            .fold(0u64, u64::saturating_add);
-        let mut closed = None;
-        if !self.entries.is_empty() && self.body.saturating_add(run_body) > max_body_bytes {
-            closed = Some((self.key8_lo, key8 - 1, std::mem::take(&mut self.entries)));
-            self.key8_lo = key8;
-            self.body = 0;
-        }
-        self.body = self.body.saturating_add(run_body);
-        self.entries.extend(run);
-        closed
-    }
-
-    /// The last slice, which ends at `u64::MAX`.
-    fn finish(&mut self) -> (u64, u64, Vec<KeyIndexLeafEntry>) {
-        (self.key8_lo, u64::MAX, std::mem::take(&mut self.entries))
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FieldBuildState {
     Building,
@@ -1938,9 +1974,12 @@ struct FieldBuild {
     lo: u64,
     /// Exclusive end of this pass's key8 range, once the budget cut it.
     end: Option<u64>,
-    slice: OpenSlice,
-    /// Whether any pair reached `slice` this attempt: a new uncovered entry
-    /// after that makes the attempt stale.
+    /// Where the field's next slice starts: the end of the last pass that
+    /// wrote one.
+    slice_lo: u64,
+    /// Whether a pass this attempt ended holding a pair: a new uncovered
+    /// entry after that makes the attempt stale, since that pass's leaves
+    /// and pass range were made without it.
     fed: bool,
     stale: bool,
     attempt: u32,
@@ -1958,7 +1997,7 @@ impl FieldBuild {
             held_peak: 0,
             lo: 0,
             end: None,
-            slice: OpenSlice::new(),
+            slice_lo: 0,
             fed: false,
             stale: false,
             attempt: 0,
@@ -2016,15 +2055,12 @@ impl FieldBuild {
     }
 }
 
-/// Each building field's share of the pair budget: `max_pairs` split evenly
-/// over the fields still building, at least 1.
-fn key_index_field_share(max_pairs: u64, fields: &BTreeMap<String, FieldBuild>) -> u64 {
-    let building = fields
-        .values()
-        .filter(|field| field.state == FieldBuildState::Building)
-        .count()
-        .max(1) as u64;
-    (max_pairs / building).max(1)
+/// Each field's share of the pair budget: `max_pairs` split evenly over the
+/// `fields` the build indexes, at least 1. Fixed for the build, a finished
+/// or uncovered field included, so a field's passes depend on its own pairs
+/// and the field count alone, not on when other fields finish.
+fn key_index_field_share(max_pairs: u64, fields: usize) -> u64 {
+    (max_pairs / fields.max(1) as u64).max(1)
 }
 
 /// Feeds a field's carried pairs in its pass range into `held`, decoding
@@ -2089,8 +2125,9 @@ pub(crate) struct KeyIndexPassRecord {
     pub(crate) held_capacity: u64,
     /// Whether every held pair's blocks `Vec` has capacity equal to its length.
     pub(crate) blocks_exact: bool,
-    /// Pairs the field's open slice held, from earlier passes, while this
-    /// pass filled its heap.
+    /// Pairs the field held outside its heap, from earlier passes, while
+    /// this pass filled it. Every pass closes its slices
+    /// ([`key_index_pass_slices`]), so the build keeps no such pair.
     pub(crate) open_slice: u64,
 }
 
@@ -2124,7 +2161,7 @@ fn record_key_index_pass(name: &str, field: &FieldBuild, share: u64) {
             .held
             .iter()
             .all(|pair| pair.0.blocks.capacity() == pair.0.blocks.len()),
-        open_slice: field.slice.entries.len() as u64,
+        open_slice: 0,
     };
     KEY_INDEX_PASS_LOG.with(|log| log.borrow_mut().push(record));
 }
@@ -2277,7 +2314,7 @@ pub(crate) async fn build_part_key_index(
 
         loop {
             counters.key_index_build_passes += 1;
-            let mut share = key_index_field_share(max_pairs, &fields);
+            let mut share = key_index_field_share(max_pairs, fields.len());
             if let Some(carried) = &carried {
                 for (name, field) in fields.iter_mut() {
                     if field.state != FieldBuildState::Building {
@@ -2376,7 +2413,7 @@ pub(crate) async fn build_part_key_index(
                         break;
                     }
                     if added {
-                        share = key_index_field_share(max_pairs, &fields);
+                        share = key_index_field_share(max_pairs, fields.len());
                         for field in fields.values_mut() {
                             field.cut(share);
                         }
@@ -2479,11 +2516,12 @@ pub(crate) async fn build_part_key_index(
 }
 
 /// Closes one pass of one field: sorts the pass's held pairs, read and
-/// carried, by `(key8, entry_ordinal)`, uncovers the entries of every key8
-/// whose own entries exceed the body ceiling, feeds the rest to the open
-/// slice (unless the attempt is stale) and queues each slice it closes (the
-/// last one when the range reaches `u64::MAX`) on `pending`. The held pairs
-/// move into the slices; nothing is copied.
+/// carried, by `(key8, entry_ordinal)` in the heap's own buffer, uncovers the
+/// entries of every key8 whose own entries exceed the body ceiling, drops
+/// the uncovered entries' pairs in place and, unless the attempt is stale,
+/// queues the pass's slices ([`key_index_pass_slices`]) on `pending`,
+/// encoded from that buffer. The buffer is freed when the pass ends, so the
+/// pairs a field holds at any moment are the pairs of one pass.
 #[allow(clippy::too_many_arguments)]
 fn end_key_index_pass(
     tenant: &TenantHash,
@@ -2495,14 +2533,9 @@ fn end_key_index_pass(
     limits: &KeyIndexLeafLimits,
     pending: &mut Vec<(String, u32, EncodedKeyIndexLeaf)>,
 ) {
-    let mut held: Vec<KeyIndexLeafEntry> = std::mem::take(&mut field.held)
-        .into_vec()
-        .into_iter()
-        .map(|pair| pair.0)
-        .collect();
+    let mut held = key_index_sorted_pairs(std::mem::take(&mut field.held));
     field.held_min = None;
     field.held_peak = 0;
-    held.sort_unstable_by_key(|e| (e.key8, e.entry_ordinal));
     let end = field.end.take();
     for run in held.chunk_by(|a, b| a.key8 == b.key8) {
         let body = run
@@ -2526,58 +2559,55 @@ fn end_key_index_pass(
         field.give_up();
         return;
     }
-    let uncovered: Vec<u64> = field.uncovered.iter().copied().collect();
-    let mut emit =
-        |field: &mut FieldBuild,
-         (key8_lo, key8_hi, entries): (u64, u64, Vec<KeyIndexLeafEntry>)| {
-            let encoded = encode_part_key_index_leaf(
-                &KeyIndexLeafInput {
-                    tenant_hash: *tenant,
-                    signal,
-                    part_blake3,
-                    part_entry_count,
-                    field: name,
-                    key_type: field.key_type,
-                    key8_lo,
-                    key8_hi,
-                    uncovered_entry_ordinals: &uncovered,
-                    entries: &entries,
-                },
-                limits,
-            );
-            match encoded {
-                Ok(leaf) => {
-                    pending.push((name.to_string(), field.attempt, leaf));
-                    true
-                }
-                Err(err) => {
-                    tracing::error!(
-                        tenant = %tenant.to_hex(),
-                        field = name,
-                        error = %err,
-                        "key-index leaf encode refused; the part is uncovered for the field"
-                    );
-                    field.give_up();
-                    false
-                }
-            }
-        };
     if !field.stale {
-        let mut rest = held.into_iter().peekable();
-        while let Some(first) = rest.next() {
-            let key8 = first.key8;
-            let mut run = vec![first];
-            while let Some(entry) = rest.next_if(|e| e.key8 == key8) {
-                run.push(entry);
+        field.fed |= !held.is_empty();
+        held.retain(|e| !field.uncovered.contains(&e.entry_ordinal));
+        let uncovered: Vec<u64> = field.uncovered.iter().copied().collect();
+        let encoded = key_index_pass_slices(&held, field.slice_lo, end, limits.max_body_bytes)
+            .and_then(|slices| {
+                slices
+                    .into_iter()
+                    .map(|slice| {
+                        encode_part_key_index_leaf(
+                            &KeyIndexLeafInput {
+                                tenant_hash: *tenant,
+                                signal,
+                                part_blake3,
+                                part_entry_count,
+                                field: name,
+                                key_type: field.key_type,
+                                key8_lo: slice.key8_lo,
+                                key8_hi: slice.key8_hi,
+                                uncovered_entry_ordinals: &uncovered,
+                                entries: &held[slice.entries],
+                            },
+                            limits,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            });
+        drop(held);
+        match encoded {
+            Ok(leaves) => {
+                if let Some(end) = end
+                    && !leaves.is_empty()
+                {
+                    field.slice_lo = end;
+                }
+                pending.extend(
+                    leaves
+                        .into_iter()
+                        .map(|leaf| (name.to_string(), field.attempt, leaf)),
+                );
             }
-            run.retain(|e| !field.uncovered.contains(&e.entry_ordinal));
-            if run.is_empty() {
-                continue;
-            }
-            field.fed = true;
-            if let Some(closed) = field.slice.push_run(run, limits.max_body_bytes)
-                && !emit(field, closed)
-            {
+            Err(err) => {
+                tracing::error!(
+                    tenant = %tenant.to_hex(),
+                    field = name,
+                    error = %err,
+                    "key-index leaf encode refused; the part is uncovered for the field"
+                );
+                field.give_up();
                 return;
             }
         }
@@ -2596,7 +2626,7 @@ fn end_key_index_pass(
             field.stale = false;
             field.fed = false;
             field.lo = 0;
-            field.slice = OpenSlice::new();
+            field.slice_lo = 0;
             field.refs.clear();
         }
         None if field.stale => {
@@ -2607,13 +2637,18 @@ fn end_key_index_pass(
             );
             field.give_up();
         }
-        None => {
-            let last = field.slice.finish();
-            if emit(field, last) {
-                field.state = FieldBuildState::Done;
-            }
-        }
+        None => field.state = FieldBuildState::Done,
     }
+}
+
+/// `held`'s pairs sorted by `(key8, entry_ordinal)`, in the heap's own
+/// buffer: `HeldPair` wraps one `KeyIndexLeafEntry`, so the collect reuses
+/// the allocation rather than copying the pairs into a second one.
+fn key_index_sorted_pairs(held: BinaryHeap<HeldPair>) -> Vec<KeyIndexLeafEntry> {
+    held.into_sorted_vec()
+        .into_iter()
+        .map(|pair| pair.0)
+        .collect()
 }
 
 impl Catalog {
@@ -13846,12 +13881,49 @@ pub(crate) mod tests {
         from_scratch_leaves_declaring(store, part, &[(USER_ID.to_string(), KeyType::I64)]).await
     }
 
+    /// `part`'s `user_id` leaves as the one-call build writes them under the
+    /// pair budget `max_pairs`.
+    async fn user_id_leaves_at(
+        store: &dyn ObjectStoreBackend,
+        part: &SnapshotPartRef,
+        max_pairs: u64,
+    ) -> Vec<Vec<u8>> {
+        reference_leaves(
+            store,
+            part,
+            &[(USER_ID.to_string(), KeyType::I64)],
+            max_pairs,
+            &[],
+        )
+        .await
+    }
+
     /// [`from_scratch_leaves`] for a tenant declaring `declared`, the fields
     /// the sections name besides included, as the fold builds them.
     async fn from_scratch_leaves_declaring(
         store: &dyn ObjectStoreBackend,
         part: &SnapshotPartRef,
         declared: &[(String, KeyType)],
+    ) -> Vec<Vec<u8>> {
+        reference_leaves(
+            store,
+            part,
+            declared,
+            kidx_config().key_index_build_max_pairs,
+            &[],
+        )
+        .await
+    }
+
+    /// `part`'s leaves as [`build_part_key_index_leaves`] builds them in one
+    /// call under the pair budget `max_pairs`, for a tenant declaring
+    /// `declared`, with the read of every entry in `failed` failed.
+    async fn reference_leaves(
+        store: &dyn ObjectStoreBackend,
+        part: &SnapshotPartRef,
+        declared: &[(String, KeyType)],
+        max_pairs: u64,
+        failed: &[u64],
     ) -> Vec<Vec<u8>> {
         let got = store
             .get(&part.key, GetRange::Full)
@@ -13861,7 +13933,11 @@ pub(crate) mod tests {
             .expect("part decodes")
             .entries;
         let mut reads = Vec::new();
-        for entry in &entries {
+        for (ordinal, entry) in (0u64..).zip(&entries) {
+            if failed.contains(&ordinal) {
+                reads.push(Err("failed".to_string()));
+                continue;
+            }
             let key = column_stats_build::segment_data_key(&tenant(), Signal::Logs, entry)
                 .expect("data key");
             reads.push(
@@ -13879,6 +13955,7 @@ pub(crate) mod tests {
             true,
             &reads.iter().collect::<Vec<_>>(),
             &key_index_leaf_limits(),
+            max_pairs,
         )
         .leaves
         .into_iter()
@@ -14247,23 +14324,30 @@ pub(crate) mod tests {
     /// both are over the ceiling and uncover entries 0 to 4. A small budget
     /// meets them in different passes, after pairs already reached a slice;
     /// the build scans every remaining range before its one restart, so for
-    /// every budget from 1 to 20 and `u64::MAX` it stores the from-scratch
-    /// build's one leaf, five entries uncovered. A restart on the first
-    /// finding meets key8 20 again in the rebuild and writes no leaf for
-    /// budgets 1 to 7.
+    /// every budget from 1 to 20 and `u64::MAX` it stores the leaves the
+    /// one-call build writes at the same budget, every one listing the five
+    /// uncovered entries, and at `u64::MAX` that is one leaf. A restart on
+    /// the first finding meets key8 20 again in the rebuild and writes no
+    /// leaf for budgets 1 to 7.
     #[tokio::test]
     async fn a_restart_sees_every_uncovered_entry_at_every_budget() {
         for max_pairs in (1..=20).chain([u64::MAX]) {
             let (store, report, head, log) = shared_key8_fold(max_pairs, Some(40)).await;
             let part = &head.parts[0];
-            assert_eq!(part.key_index.len(), 1, "budget {max_pairs}: {report:?}");
-            assert_eq!(part.key_index[0].uncovered_count, 5, "budget {max_pairs}");
+            assert!(!part.key_index.is_empty(), "budget {max_pairs}: {report:?}");
+            assert!(
+                part.key_index.iter().all(|leaf| leaf.uncovered_count == 5),
+                "budget {max_pairs}: {part:?}"
+            );
             assert_eq!(report.key_index_uncovered_entries, 5, "budget {max_pairs}");
             assert_eq!(
                 stored_leaves(store.as_ref(), part).await,
-                from_scratch_leaves(store.as_ref(), part).await,
+                user_id_leaves_at(store.as_ref(), part, max_pairs).await,
                 "budget {max_pairs}"
             );
+            if max_pairs == u64::MAX {
+                assert_eq!(part.key_index.len(), 1, "{report:?}");
+            }
             pass_ranges(&log, USER_ID, 4);
         }
         set_key_index_leaf_body_ceiling_for_test(None);
@@ -14342,10 +14426,11 @@ pub(crate) mod tests {
     /// advancing fixture's tail holds 15 pairs, 9 carried and 6 read, key8 7
     /// in all five entries. Budget 5 takes 3 passes, [7], [10 to 20] and
     /// [21 to 36], each holding exactly 5 pairs, so no pass holds more than
-    /// the budget of read and carried pairs together; each pass decodes the
-    /// one previous leaf again and reads the two new sections, and the leaf
-    /// equals the from-scratch build. Counting only read pairs, the 6 read
-    /// pairs fit 2 passes.
+    /// the budget of read and carried pairs together. The fold GETs the one
+    /// previous leaf once and decodes it from memory in each pass, reads the
+    /// two new sections in each pass, and writes one leaf per pass, the
+    /// leaves the one-call build writes at budget 5. Counting only read
+    /// pairs, the 6 read pairs fit 2 passes.
     #[tokio::test]
     async fn carried_pairs_count_against_the_pair_budget() {
         let (inner, report, log) = advancing_budget_fold(5).await;
@@ -14363,10 +14448,11 @@ pub(crate) mod tests {
         assert_eq!(report.key_index_entries_carried, 3, "{report:?}");
         assert_eq!(report.key_index_leaf_gets, 1, "{report:?}");
         assert_eq!(report.key_index_sections_read, 2 * 3, "{report:?}");
+        assert_eq!(report.key_index_leaves_written, 3, "{report:?}");
         let second = read_signal_head(inner.as_ref(), Signal::Logs).await;
         assert_eq!(
             stored_leaves(inner.as_ref(), &second.parts[0]).await,
-            from_scratch_leaves(inner.as_ref(), &second.parts[0]).await
+            user_id_leaves_at(inner.as_ref(), &second.parts[0], 5).await
         );
     }
 
@@ -14400,7 +14486,8 @@ pub(crate) mod tests {
         assert!(!log.is_empty(), "{what}: no pass recorded");
         for record in log {
             assert!(
-                record.held_peak + record.open_slice <= record.share.max(max_run) + 1,
+                record.held_peak + record.open_slice
+                    <= record.share.max(max_run).saturating_add(1),
                 "{what}: a pass held more than its share, open slice included: {record:?}"
             );
         }
@@ -14627,14 +14714,16 @@ pub(crate) mod tests {
     }
 
     /// ADR-3692 decision 5: a (part, field) over the pair budget is built in
-    /// ceil(pairs / budget) passes over disjoint key8 ranges, each pass
-    /// re-reading the sections, and the slices tile `[0, u64::MAX]` with no
-    /// gap and no overlap, exactly the slices and bytes of a one-pass build.
-    /// Twelve pairs under a budget of five: passes of five, five and two,
-    /// while the 40-byte ceiling cuts slices of three, so pass boundaries
-    /// fall inside slices.
+    /// passes over disjoint key8 ranges, each pass re-reading the sections,
+    /// and each pass closes its slices, so the slices tile `[0, u64::MAX]`
+    /// with no gap and no overlap and a pass end is a slice end. Twelve pairs
+    /// of one entry per key8 under a budget of five: passes of five, five and
+    /// two, which the 40-byte ceiling (three entries) cuts into slices of
+    /// three and two, three and two, and two: 5 leaves, the leaves the
+    /// one-call build writes at budget 5, where one pass writes 4 slices of
+    /// three.
     #[tokio::test]
-    async fn pair_budget_builds_in_passes_with_identical_leaves() {
+    async fn pair_budget_builds_in_passes_and_closes_a_slice_at_each_pass_end() {
         let (store, report, head) = budget_fixture_fold(5).await;
         let k = |v: i64| u64::from_be_bytes(key8_i64(v));
         assert_eq!(
@@ -14666,10 +14755,20 @@ pub(crate) mod tests {
         check_key_index_leaf_set(&summaries).expect("the slices form one set");
         let pairs: u64 = part.key_index.iter().map(|leaf| leaf.entry_count).sum();
         assert_eq!(pairs, 12);
-        assert_eq!(part.key_index.len(), 4, "slices of three under the ceiling");
+        assert_eq!(
+            tiles,
+            vec![
+                (0, k(4) - 1),
+                (k(4), k(6) - 1),
+                (k(6), k(9) - 1),
+                (k(9), k(11) - 1),
+                (k(11), u64::MAX),
+            ],
+            "slices of three and two closed at each pass end"
+        );
         assert_eq!(
             report.key_index_build_passes,
-            pairs.div_ceil(5),
+            greedy_passes(&[1; 12], 5),
             "{report:?}"
         );
         assert_eq!(report.key_index_build_passes, 3);
@@ -14679,14 +14778,14 @@ pub(crate) mod tests {
         let (one_pass_store, one_pass, one_pass_head) = budget_fixture_fold(u64::MAX).await;
         assert_eq!(one_pass.key_index_build_passes, 1, "{one_pass:?}");
         assert_eq!(one_pass.key_index_sections_read, 3, "{one_pass:?}");
-        assert_eq!(one_pass_head.parts[0].key_index, part.key_index);
+        assert_eq!(one_pass_head.parts[0].key_index.len(), 4, "slices of three");
         assert_eq!(
             stored_leaves(store.as_ref(), part).await,
-            stored_leaves(one_pass_store.as_ref(), &one_pass_head.parts[0]).await
+            user_id_leaves_at(store.as_ref(), part, 5).await
         );
         assert_eq!(
-            stored_leaves(store.as_ref(), part).await,
-            from_scratch_leaves(store.as_ref(), part).await
+            stored_leaves(one_pass_store.as_ref(), &one_pass_head.parts[0]).await,
+            user_id_leaves_at(one_pass_store.as_ref(), &one_pass_head.parts[0], u64::MAX).await
         );
         set_key_index_leaf_body_ceiling_for_test(None);
     }
@@ -14825,6 +14924,7 @@ pub(crate) mod tests {
             true,
             &reads.iter().collect::<Vec<_>>(),
             &limits,
+            u64::MAX,
         );
         assert_eq!(built.leaves.len(), 1, "user_id only; order_id has no leaf");
         assert_eq!(

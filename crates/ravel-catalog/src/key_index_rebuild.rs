@@ -503,6 +503,7 @@ impl Catalog {
                 false,
                 &entry_fields,
                 &KeyIndexLeafLimits::default(),
+                u64::MAX,
             );
             report.uncovered_entries += leaves.uncovered_entries;
             let mut refs = Vec::with_capacity(leaves.leaves.len());
