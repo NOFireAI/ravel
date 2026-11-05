@@ -270,11 +270,16 @@ pub(super) type CountsFuture = Pin<Box<dyn Future<Output = DFResult<Arc<PlanCoun
 /// A future resolving the shared [`PlanCounts`] through `cell`: the first
 /// partition to poll computes it (pruning every segment once), the rest await
 /// that one computation. Errors are not cached, so a transient fetch failure
-/// can be retried by a later poll. `by_min_ts` is whether the scan feeds a
-/// confirmed ascending `ts` TopK ([`LogsScanExec::active_topk`]); with
-/// `stripe_blocks` it selects [`global_order`].
+/// can be retried by a later poll. The tier-2 router's answer is resolved
+/// through `routes` and kept whatever it was, so a retried plan pass does not
+/// route again and the statement's routing figures and process totals move
+/// once. `by_min_ts` is whether the scan feeds a confirmed ascending `ts`
+/// TopK ([`LogsScanExec::active_topk`]); with `stripe_blocks` it selects
+/// [`global_order`].
+#[allow(clippy::too_many_arguments)]
 pub(super) fn plan_counts_future(
     cell: Arc<OnceCell<Arc<PlanCounts>>>,
+    routes: Arc<RoutesCell>,
     ctx: Arc<PartitionCtx>,
     segments: Arc<Vec<SegmentRef>>,
     plan_concurrency: usize,
@@ -290,6 +295,7 @@ pub(super) fn plan_counts_future(
                 let started = Instant::now();
                 let counts = compute_plan_counts(
                     &ctx,
+                    &routes,
                     &segments,
                     plan_concurrency,
                     stripe_blocks,
@@ -529,9 +535,31 @@ fn routed_past_the_plan_skip(
 /// What the tier-2 router answered for one scan: per segment, in scan order,
 /// its route (`None` for a ts-irrelevant segment, and for every segment of a
 /// scan that does not route), and the figures for `stats.keyIndex`.
-struct ScanRoutes {
+pub(super) struct ScanRoutes {
     routes: Vec<Option<SegmentRoute>>,
     figures: Option<RouteFigures>,
+}
+
+/// The router's answer for one scan, or its error, resolved once by the first
+/// plan pass and reused by every retry ([`plan_counts_future`]).
+pub(super) type RoutesCell = OnceCell<Result<Arc<ScanRoutes>, Arc<DataFusionError>>>;
+
+/// [`route_segments`] through `cell`: the first call routes, every later one
+/// reads its answer or its error.
+async fn routes_once(
+    ctx: &PartitionCtx,
+    cell: &RoutesCell,
+    segments: &[SegmentRef],
+) -> DFResult<Arc<ScanRoutes>> {
+    cell.get_or_init(|| async {
+        route_segments(ctx, segments)
+            .await
+            .map(Arc::new)
+            .map_err(Arc::new)
+    })
+    .await
+    .clone()
+    .map_err(DataFusionError::Shared)
 }
 
 /// Run the tier-2 router once over the ts-relevant segments, before the plan
@@ -548,11 +576,13 @@ async fn route_segments(ctx: &PartitionCtx, segments: &[SegmentRef]) -> DFResult
         return Ok(routed);
     };
     if route_ctx.parts.origin.len() != segments.len() {
-        return Err(DataFusionError::Internal(format!(
-            "logs key-index route: {} part origins for {} segments",
-            route_ctx.parts.origin.len(),
-            segments.len()
-        )));
+        tracing::warn!(
+            origins = route_ctx.parts.origin.len(),
+            segments = segments.len(),
+            "logs key-index route: part origins do not match the scan's segments; \
+             every segment is left to tier 1"
+        );
+        return Ok(routed);
     }
     let (ts_min, ts_max) = (ctx.query.ts_min_ns, ctx.query.ts_max_ns);
     let mut positions = Vec::new();
@@ -651,6 +681,7 @@ enum PlanPassRead {
 // skips this whole pass; see `owned_whole_segments` and `plan_segment_fast`.
 async fn compute_plan_counts(
     ctx: &PartitionCtx,
+    routes: &RoutesCell,
     segments: &[SegmentRef],
     plan_concurrency: usize,
     stripe_blocks: bool,
@@ -662,12 +693,13 @@ async fn compute_plan_counts(
     // Built with a loop rather than a `map` closure: a closure returning a
     // future that borrows its argument cannot satisfy the higher-ranked bound
     // this `Send` boxed future needs.
-    let ScanRoutes { routes, figures } = route_segments(ctx, segments).await?;
+    let routed = routes_once(ctx, routes, segments).await?;
+    let (routes, figures) = (&routed.routes, routed.figures);
     let mut prunes = Vec::with_capacity(segments.len());
     let mut unplanned = vec![false; segments.len()];
     let mut probed = vec![false; segments.len()];
     let mut key_index = KeyIndexPruning::default();
-    let skip_sub_bound = skips_sub_bound_plans(ctx, segments, &routes, plan_concurrency);
+    let skip_sub_bound = skips_sub_bound_plans(ctx, segments, routes, plan_concurrency);
     for (idx, seg) in segments.iter().enumerate() {
         // Refuse an unreadable version BEFORE the plan probe, not after. This
         // is a second entry point into the fetch layer alongside the three
@@ -3375,7 +3407,7 @@ mod carried_directory_reservation_tests {
         );
 
         let skipping = ctx();
-        let counts = compute_plan_counts(&skipping, &segments, 2, true, false)
+        let counts = compute_plan_counts(&skipping, &RoutesCell::new(), &segments, 2, true, false)
             .await
             .expect("plan counts");
         assert!(counts.is_unplanned(0) && counts.is_unplanned(1));
@@ -3394,7 +3426,7 @@ mod carried_directory_reservation_tests {
         );
 
         let planning = ctx();
-        let counts = compute_plan_counts(&planning, &segments, 3, true, false)
+        let counts = compute_plan_counts(&planning, &RoutesCell::new(), &segments, 3, true, false)
             .await
             .expect("plan counts");
         let mut expected = 0u64;
@@ -3429,6 +3461,202 @@ mod carried_directory_reservation_tests {
             (s.deferred_set_estimate_bytes, s.deferred_served),
             (Some(expected), true)
         );
+    }
+
+    /// A [`RoutesCell`] already holding `routes` and no figures, so the plan
+    /// pass reads them without routing.
+    fn routed(routes: Vec<Option<SegmentRoute>>) -> RoutesCell {
+        RoutesCell::new_with(Some(Ok(Arc::new(ScanRoutes {
+            routes,
+            figures: None,
+        }))))
+    }
+
+    /// The whole-object block indices `counts` publishes for `seg`.
+    fn published_blocks(counts: &PlanCounts, seg: usize) -> Vec<usize> {
+        counts
+            .planned(seg)
+            .expect("planned with survivors")
+            .groups
+            .iter()
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    /// One route of each kind over three segments. Segment 0 is `Pruned` and
+    /// is not in the store, so any read of it fails the pass. Above the
+    /// whole-object bound, segment 1's `Blocks([2, 5])` plans it restricted
+    /// to those two blocks and segment 2, `Uncovered`, is planned whole. At or
+    /// under the bound, with as many such segments as partitions, both are
+    /// left unplanned for their owners to read whole.
+    ///
+    /// FLIP: treating `Pruned` as `Uncovered` reads segment 0 and the pass
+    /// fails `NotFound`; treating `Blocks` as `Uncovered` publishes all 12 of
+    /// segment 1's blocks; dropping the sub-bound `unplanned[idx] = true`
+    /// leaves segment 1 neither planned nor unplanned.
+    #[tokio::test]
+    async fn each_route_kind_takes_its_plan_route() {
+        let store = Arc::new(MemoryStore::new());
+        let mut segments = vec![seg_ref("t/pruned.rlog", &object(10, 1), 1, 10)];
+        for seq in [11u64, 12] {
+            let obj = object(seq, 1);
+            let key = format!("t/routed{seq}.rlog");
+            store
+                .put(&key, bytes::Bytes::from(obj.clone()), PutOptions::default())
+                .await
+                .expect("put");
+            segments.push(seg_ref(&key, &obj, 1, seq));
+        }
+        let routes = || {
+            vec![
+                Some(SegmentRoute::Pruned),
+                Some(SegmentRoute::Blocks(vec![2, 5])),
+                Some(SegmentRoute::Uncovered),
+            ]
+        };
+        let ctx = |fetcher: LogSegmentFetcher| PartitionCtx {
+            fetcher,
+            tenant_hash: TENANT,
+            query: LogQuery::new(0, 100),
+            columns: ColumnSelection::all(),
+            projected_fraction: 1.0,
+            phase_accounting: PhaseAccounting::new(),
+            budget: ScanBudget::unlimited(&PhaseAccounting::new()),
+            serve_deferred: Default::default(),
+            key_index_route: None,
+        };
+
+        let above = ctx(LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(1)
+            .with_projection_break_even_bytes(Some(1)));
+        assert_eq!(above.fetcher.plan_whole_object_bound(), 1);
+        let counts = compute_plan_counts(&above, &routed(routes()), &segments, 2, true, false)
+            .await
+            .expect("plan counts");
+        assert!(counts.segs[0].is_none() && !counts.is_unplanned(0));
+        assert_eq!(counts.key_index.segments_pruned, 1);
+        assert_eq!(published_blocks(&counts, 1), [2, 5]);
+        assert_eq!(
+            published_blocks(&counts, 2),
+            (0..BLOCKS).collect::<Vec<_>>()
+        );
+        assert!(!counts.is_unplanned(1) && !counts.is_unplanned(2));
+
+        let sub_bound = ctx(LogSegmentFetcher::new(store.clone()));
+        assert!(segments.iter().all(|s| !sub_bound.fetcher.plans_segment(s)));
+        let counts = compute_plan_counts(&sub_bound, &routed(routes()), &segments, 2, true, false)
+            .await
+            .expect("plan counts");
+        assert!(counts.segs[0].is_none() && !counts.is_unplanned(0));
+        assert_eq!(counts.key_index.segments_pruned, 1);
+        assert!(counts.is_unplanned(1) && counts.is_unplanned(2));
+        assert!(counts.segs[1].is_none() && counts.segs[2].is_none());
+    }
+
+    /// A plan pass that fails after routing, then succeeds on the retry a
+    /// later partition's poll makes, routes once: the part's rejected leaf
+    /// ref moves `ravel_query_key_index_parts_total{signal="logs",
+    /// outcome="rejected"}` by exactly 1 for the statement, and both passes
+    /// see the same figures. The first pass fails because segment 1 is not in
+    /// the store yet.
+    ///
+    /// FLIP: routing on every plan pass (`routes_once` calling
+    /// `route_segments` without the cell) moves the total by 2.
+    #[tokio::test]
+    async fn a_retried_plan_pass_routes_once() {
+        use datafusion::execution::memory_pool::UnboundedMemoryPool;
+        use ravel_catalog::{Catalog, CatalogConfig, SegmentPartOrigin, SnapshotPartHandle};
+        use ravel_logseg::key_index::{KeyType, key8_i64};
+        use ravel_proto::catalog::v1::SnapshotKeyIndexLeafRef;
+        use ravel_query::key_index_route::{KeyIndexPartOutcome, key_index_parts_total};
+
+        let store = Arc::new(MemoryStore::new());
+        let objects = [object(21, 1), object(22, 1)];
+        let mut segments = Vec::new();
+        for (i, obj) in objects.iter().enumerate() {
+            segments.push(seg_ref(&format!("t/retry{i}.rlog"), obj, 1, 21 + i as u64));
+        }
+        store
+            .put(
+                &segments[0].data_object_key,
+                bytes::Bytes::from(objects[0].clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put");
+        // One slice that does not tile the key space: the router rejects the
+        // part's refs without a GET.
+        let handle = SnapshotPartHandle {
+            blake3: vec![9u8; 32],
+            entry_count: 2,
+            watermark_hour: 0,
+            key_index: vec![SnapshotKeyIndexLeafRef {
+                field: "user_id".to_string(),
+                key8_lo: 1,
+                key8_hi: 0,
+                ..SnapshotKeyIndexLeafRef::default()
+            }],
+        };
+        let origin = (0..2)
+            .map(|ordinal| Some(SegmentPartOrigin { part: 0, ordinal }))
+            .collect();
+        let route = LogsKeyIndexRoute {
+            catalog: Arc::new(
+                Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"),
+            ),
+            parts: SnapshotParts::new(vec![handle], origin),
+            max_probed_parts: None,
+        };
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let ctx = Arc::new(PartitionCtx {
+            fetcher: LogSegmentFetcher::new(store.clone()),
+            tenant_hash: TENANT,
+            query: LogQuery::new(0, 100).with_key_equals(KeyEquals::new(
+                "user_id",
+                KeyType::I64,
+                key8_i64(7),
+            )),
+            columns: ColumnSelection::all(),
+            projected_fraction: 1.0,
+            phase_accounting: PhaseAccounting::new(),
+            budget: ScanBudget::unlimited(&PhaseAccounting::new()),
+            serve_deferred: Default::default(),
+            key_index_route: Some((Arc::new(route), pool)),
+        });
+        let (cell, routes) = (Arc::new(OnceCell::new()), Arc::new(RoutesCell::new()));
+        let pass = || {
+            plan_counts_future(
+                Arc::clone(&cell),
+                Arc::clone(&routes),
+                Arc::clone(&ctx),
+                Arc::new(segments.clone()),
+                4,
+                true,
+                false,
+                Time::new(),
+            )
+        };
+
+        let before =
+            key_index_parts_total(ravel_types::Signal::Logs, KeyIndexPartOutcome::Rejected);
+        assert!(pass().await.is_err(), "segment 1 is missing");
+        store
+            .put(
+                &segments[1].data_object_key,
+                bytes::Bytes::from(objects[1].clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put");
+        let counts = pass().await.expect("the retry plans");
+        let moved = key_index_parts_total(ravel_types::Signal::Logs, KeyIndexPartOutcome::Rejected)
+            - before;
+        assert_eq!(moved, 1, "one routing pass for the statement");
+        let figures = counts.route_figures.expect("routed").route;
+        assert_eq!(figures.leaves_rejected, 1);
+        assert_eq!(figures.parts_covered, 0);
+        assert_eq!(published_blocks(&counts, 1).len(), BLOCKS);
     }
 
     /// Two segments with a surviving block and one that overlaps the query
@@ -3499,7 +3727,7 @@ mod carried_directory_reservation_tests {
             key_index_route: None,
         };
         assert_eq!(budget.reserved(), 0);
-        let counts = compute_plan_counts(&ctx, &segments, 4, true, false)
+        let counts = compute_plan_counts(&ctx, &RoutesCell::new(), &segments, 4, true, false)
             .await
             .expect("plan counts");
         assert_eq!(
@@ -3562,17 +3790,32 @@ mod carried_directory_reservation_tests {
             serve_deferred: Default::default(),
             key_index_route: None,
         };
-        let exact = compute_plan_counts(&with_limit(total), &segments, 1, true, false).await;
+        let exact = compute_plan_counts(
+            &with_limit(total),
+            &RoutesCell::new(),
+            &segments,
+            1,
+            true,
+            false,
+        )
+        .await;
         assert!(
             exact.is_ok(),
             "the directories fit a budget of exactly their size: {:?}",
             exact.as_ref().err()
         );
         drop(exact);
-        let err = compute_plan_counts(&with_limit(total - 1), &segments, 1, true, false)
-            .await
-            .err()
-            .expect("a budget one byte short of the directories refuses");
+        let err = compute_plan_counts(
+            &with_limit(total - 1),
+            &RoutesCell::new(),
+            &segments,
+            1,
+            true,
+            false,
+        )
+        .await
+        .err()
+        .expect("a budget one byte short of the directories refuses");
         let typed = match &err {
             DataFusionError::External(e) => e.downcast_ref::<SqlError>(),
             _ => None,
@@ -3632,7 +3875,7 @@ mod carried_directory_reservation_tests {
             serve_deferred: Default::default(),
             key_index_route: None,
         };
-        let counts = compute_plan_counts(&ctx, &segments, 2, true, false)
+        let counts = compute_plan_counts(&ctx, &RoutesCell::new(), &segments, 2, true, false)
             .await
             .expect("plan counts");
         let planned = counts.planned(0).expect("planned");

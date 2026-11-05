@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use ravel_codec::key_idx::KeyType;
-use ravel_object_store::{PutMode, PutOptions, StoreError, UploadChecksum, Version};
+use ravel_object_store::{GetRange, PutMode, PutOptions, StoreError, UploadChecksum, Version};
 use ravel_proto::catalog::v1::{SnapshotHead, SnapshotKeyIndexLeafRef, SnapshotPartRef};
 use ravel_types::{Signal, TenantHash};
 
@@ -31,7 +31,10 @@ use crate::fold::{
     build_part_key_index_leaves, declared_key_index_fields, head_object_key, put_key_index_leaf,
     read_entry_key_index,
 };
-use crate::snapshot_format::{self, KeyIndexLeafLimits};
+use crate::snapshot_format::{
+    self, KEY_INDEX_LEAF_FORMAT_VERSION_1, KeyIndexLeafLimits, key_index_leaf_format_version,
+    key_index_leaf_prefix_range, key_index_leaf_version_accepted,
+};
 use crate::tenant_config::TenantConfigError;
 
 /// Default `--batch-entries`: the entry total one rebuild batch stays at or
@@ -83,12 +86,23 @@ pub struct KeyIndexRebuildReport {
     pub largest_unindexed_part_entries: u64,
     /// The fields the run rebuilds.
     pub fields: Vec<String>,
-    /// Non-empty parts in HEAD lacking a ref for at least one of `fields`.
+    /// Non-empty parts in HEAD lacking a ref for at least one of `fields`,
+    /// or holding one whose leaf `format_version` the signal's reader
+    /// refuses (a logs version-1 leaf, which the rebuild replaces).
     pub parts_unindexed: u64,
+    /// Of `parts_unindexed`, the parts counted for a refused leaf version.
+    pub parts_with_refused_leaves: u64,
+    /// Ranged GETs of an existing leaf's `[0, prefix_len)`, one per ref of a
+    /// requested field on a signal whose reader refuses version 1 (logs),
+    /// issued before any batch to read each leaf's `format_version`.
+    pub leaf_prefix_gets: u64,
+    /// Bytes those prefix GETs returned, as transferred.
+    pub leaf_prefix_bytes_read: u64,
     /// Parts a published HEAD attached at least one ref to.
     pub parts_rebuilt: u64,
     /// Parts given no ref this run because a ranged GET for one of their
-    /// entries failed with a store error; a rerun reads them again.
+    /// entries, or for one of their leaves' prefixes, failed with a store
+    /// error; a rerun reads them again.
     pub parts_deferred: u64,
     /// Leaves PUT, including any a lost CAS left unreferenced.
     pub leaves_written: u64,
@@ -171,10 +185,15 @@ impl KeyIndexRebuildError {
     }
 }
 
-/// A part HEAD names without a ref for some requested field, and those fields.
+/// A part HEAD names without a usable ref for some requested field, and those
+/// fields.
 struct Target {
     part: SnapshotPartRef,
+    /// Fields with no ref, then fields whose refs `replaces` names.
     missing: Vec<(String, KeyType)>,
+    /// Keys of the refs whose leaf version the signal's reader refuses: the
+    /// rebuild swaps them out of HEAD for the new refs of the same field.
+    replaces: HashSet<String>,
 }
 
 fn missing_fields(
@@ -186,6 +205,22 @@ fn missing_fields(
         .filter(|(field, _)| !part.key_index.iter().any(|r| &r.field == field))
         .cloned()
         .collect()
+}
+
+/// Whether `part` still needs `field` built: it holds no ref for it, or every
+/// ref it holds for it is one the run found refused.
+fn still_needed(part: &SnapshotPartRef, field: &str, replaces: &HashSet<String>) -> bool {
+    part.key_index
+        .iter()
+        .filter(|r| r.field == field)
+        .all(|r| replaces.contains(&r.key))
+}
+
+/// One part's built refs, and the refused refs they stand in for.
+struct BuiltPart {
+    part_blake3: Vec<u8>,
+    refs: Vec<SnapshotKeyIndexLeafRef>,
+    replaces: HashSet<String>,
 }
 
 /// Splits `targets` into runs whose entry total stays at or below
@@ -211,26 +246,38 @@ fn batches(targets: Vec<Target>, batch_entries: u64) -> Vec<Vec<Target>> {
 
 /// Copies `head` with each built ref attached to the part whose `blake3` it
 /// was built for, when that part is still named and still lacks the ref's
-/// field. Returns the copy and how many parts gained a ref.
-fn attach(
-    head: &SnapshotHead,
-    built: &[(Vec<u8>, Vec<SnapshotKeyIndexLeafRef>)],
-) -> (SnapshotHead, u64) {
+/// field or holds for it only refs the build replaces, which are removed.
+/// Returns the copy and how many parts gained a ref.
+fn attach(head: &SnapshotHead, built: &[BuiltPart]) -> (SnapshotHead, u64) {
     let mut next = head.clone();
     let mut attached = 0u64;
-    for (part_blake3, refs) in built {
-        let Some(part) = next.parts.iter_mut().find(|p| &p.blake3 == part_blake3) else {
+    for built in built {
+        let Some(part) = next
+            .parts
+            .iter_mut()
+            .find(|p| p.blake3 == built.part_blake3)
+        else {
             continue;
         };
-        let new: Vec<SnapshotKeyIndexLeafRef> = refs
+        let fields: HashSet<&str> = built
+            .refs
             .iter()
-            .filter(|r| !part.key_index.iter().any(|have| have.field == r.field))
-            .cloned()
+            .map(|r| r.field.as_str())
+            .filter(|field| still_needed(part, field, &built.replaces))
             .collect();
-        if !new.is_empty() {
-            part.key_index.extend(new);
-            attached += 1;
+        if fields.is_empty() {
+            continue;
         }
+        part.key_index
+            .retain(|have| !fields.contains(have.field.as_str()));
+        part.key_index.extend(
+            built
+                .refs
+                .iter()
+                .filter(|r| fields.contains(r.field.as_str()))
+                .cloned(),
+        );
+        attached += 1;
     }
     (next, attached)
 }
@@ -257,6 +304,16 @@ impl Catalog {
     /// keeps them and gains the rest. A part one of whose entries' ranged
     /// GETs failed with a store error is deferred: it gains no ref this run,
     /// so a rerun reads it again.
+    ///
+    /// On logs, whose reader refuses a version-1 leaf (ADR-3692 amendment
+    /// "Leaf format version 2"), every ref of a requested field also costs
+    /// one ranged GET of its `[0, prefix_len)` before any batch, counted in
+    /// [`KeyIndexRebuildReport::leaf_prefix_gets`] when issued. A field one of
+    /// whose leaves is version 1 is built again, the new leaves are PUT at
+    /// their own keys, and the publish replaces that field's refs on the part
+    /// rather than adding to them. The old leaf object is neither overwritten
+    /// nor deleted. A failed prefix GET defers the part. Spans accept version
+    /// 1 and cost no prefix GET.
     pub async fn rebuild_key_index(
         &self,
         tenant: &TenantHash,
@@ -315,18 +372,46 @@ impl Catalog {
         };
 
         // An empty part has no entry to index.
-        let targets: Vec<Target> = head
-            .parts
-            .iter()
-            .filter(|part| part.entry_count > 0)
-            .filter_map(|part| {
-                let missing = missing_fields(part, &requested);
-                (!missing.is_empty()).then(|| Target {
+        let mut targets: Vec<Target> = Vec::new();
+        for part in head.parts.iter().filter(|part| part.entry_count > 0) {
+            let mut missing = missing_fields(part, &requested);
+            let replaces = match self
+                .refused_leaf_refs(signal, part, &requested, &mut report)
+                .await
+            {
+                Ok(replaces) => replaces,
+                Err(e) => {
+                    report.parts_deferred += 1;
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        part_key = %part.key,
+                        error = %e,
+                        "a key-index leaf prefix GET failed; the part keeps its refs this run and a rerun reads it again"
+                    );
+                    continue;
+                }
+            };
+            if !replaces.is_empty() {
+                report.parts_with_refused_leaves += 1;
+                missing.extend(
+                    requested
+                        .iter()
+                        .filter(|(field, _)| {
+                            part.key_index
+                                .iter()
+                                .any(|r| &r.field == field && replaces.contains(&r.key))
+                        })
+                        .cloned(),
+                );
+            }
+            if !missing.is_empty() {
+                targets.push(Target {
                     part: part.clone(),
                     missing,
-                })
-            })
-            .collect();
+                    replaces,
+                });
+            }
+        }
         report.parts_unindexed = targets.len() as u64;
         report.largest_unindexed_part_entries = targets
             .iter()
@@ -377,6 +462,59 @@ impl Catalog {
         Ok(report)
     }
 
+    /// The keys of `part`'s refs for `requested` fields whose leaf is at a
+    /// `format_version` the signal's reader refuses, read with one ranged GET
+    /// of `[0, prefix_len)` per ref, each counted when issued. Empty, with no
+    /// GET, for a signal that accepts every version the writer has produced
+    /// (spans). A ref whose prefix does not decode is left alone: the reader
+    /// already treats it as uncovered, and replacing it is not this repair.
+    async fn refused_leaf_refs(
+        &self,
+        signal: Signal,
+        part: &SnapshotPartRef,
+        requested: &[(String, KeyType)],
+        report: &mut KeyIndexRebuildReport,
+    ) -> Result<HashSet<String>, StoreError> {
+        let mut refused = HashSet::new();
+        if key_index_leaf_version_accepted(signal, KEY_INDEX_LEAF_FORMAT_VERSION_1) {
+            return Ok(refused);
+        }
+        for leaf in part
+            .key_index
+            .iter()
+            .filter(|r| requested.iter().any(|(field, _)| *field == r.field))
+        {
+            let Ok(range) = key_index_leaf_prefix_range(leaf) else {
+                continue;
+            };
+            report.leaf_prefix_gets += 1;
+            let got = self
+                .store()
+                .get(&leaf.key, GetRange::Range(range.start, range.end))
+                .await?;
+            report.leaf_prefix_bytes_read += got.data.len() as u64;
+            if let Ok(version) = key_index_leaf_format_version(&got.data)
+                && !key_index_leaf_version_accepted(signal, version)
+            {
+                refused.insert(leaf.key.clone());
+            }
+        }
+        // Every slice of a field is replaced together, so a field with one
+        // refused slice hands all of its refs over.
+        let fields: HashSet<&str> = part
+            .key_index
+            .iter()
+            .filter(|r| refused.contains(&r.key))
+            .map(|r| r.field.as_str())
+            .collect();
+        Ok(part
+            .key_index
+            .iter()
+            .filter(|r| fields.contains(r.field.as_str()))
+            .map(|r| r.key.clone())
+            .collect())
+    }
+
     /// Builds one batch's leaves and publishes them. `head`/`version` are the
     /// HEAD this run last read or wrote, updated on every re-read and publish.
     #[allow(clippy::too_many_arguments)]
@@ -394,7 +532,7 @@ impl Catalog {
         let mut counters = RequestCounters::default();
         let mut reads: HashMap<String, EntryKeyIndex> = HashMap::new();
         let mut failed_gets: HashSet<String> = HashSet::new();
-        let mut built: Vec<(Vec<u8>, Vec<SnapshotKeyIndexLeafRef>)> = Vec::new();
+        let mut built: Vec<BuiltPart> = Vec::new();
         for target in batch {
             // A part an earlier batch's CAS loss showed replaced, or already
             // given the refs by someone else, costs nothing.
@@ -404,7 +542,7 @@ impl Catalog {
             let missing: Vec<(String, KeyType)> = target
                 .missing
                 .into_iter()
-                .filter(|(field, _)| !current.key_index.iter().any(|r| &r.field == field))
+                .filter(|(field, _)| still_needed(current, field, &target.replaces))
                 .collect();
             if missing.is_empty() {
                 continue;
@@ -445,8 +583,9 @@ impl Catalog {
                 }
             }
             // Every section is read: the parts the rebuild visits have no leaf
-            // for these fields, so there is no previous leaf to carry from, and
-            // the fold's incremental build does not apply.
+            // for these fields, or only a refused one, so there is no previous
+            // leaf to carry from, and the fold's incremental build does not
+            // apply.
             let store = self.store();
             let unread_ref = &unread;
             let fresh: Vec<EntryKeyIndexRead> = stream::iter(0..unread.len())
@@ -522,7 +661,11 @@ impl Catalog {
                 refs.push(leaf_ref);
             }
             if !refs.is_empty() {
-                built.push((part.blake3, refs));
+                built.push(BuiltPart {
+                    part_blake3: part.blake3,
+                    refs,
+                    replaces: target.replaces,
+                });
             }
         }
         if attempt.parts == 0 {
@@ -539,7 +682,7 @@ impl Catalog {
     async fn publish_batch(
         &self,
         head_key: &str,
-        built: &[(Vec<u8>, Vec<SnapshotKeyIndexLeafRef>)],
+        built: &[BuiltPart],
         head: &mut SnapshotHead,
         version: &mut Version,
         report: &mut KeyIndexRebuildReport,
@@ -833,6 +976,9 @@ mod tests {
                 largest_unindexed_part_entries: 3,
                 fields: vec![USER_ID.to_string()],
                 parts_unindexed: 1,
+                parts_with_refused_leaves: 0,
+                leaf_prefix_gets: 0,
+                leaf_prefix_bytes_read: 0,
                 parts_rebuilt: 1,
                 parts_deferred: 0,
                 leaves_written: 1,
@@ -994,7 +1140,9 @@ mod tests {
     /// GETs per batch, twelve in all, by the report and by the store's own
     /// record, however many CAS tries batch 3 spends. A rerun reads no section
     /// and no part object of parts 1 and 2, issues exactly the config GET, the
-    /// HEAD GET, part 3's GET and its four ranged GETs, and completes part 3.
+    /// HEAD GET, one prefix GET for each of the leaves parts 1 and 2 hold (a
+    /// logs leaf's version is read before it is trusted), part 3's GET and
+    /// its four ranged GETs, and completes part 3.
     ///
     /// A rebuild that published every batch in one CAS at the end leaves no
     /// ref on HEAD here; one that re-read sections on a CAS retry issues more
@@ -1093,7 +1241,21 @@ mod tests {
                 head.parts[2].key.clone(),
             ]
         );
-        assert_eq!(gets.len(), 3 + 4, "{gets:?}");
+        let prefixes: Vec<String> = gets
+            .iter()
+            .filter(|(key, range, _)| key.ends_with(".kidx") && !matches!(range, GetRange::Full))
+            .map(|(key, _, _)| key.clone())
+            .collect();
+        assert_eq!(
+            prefixes,
+            vec![
+                head.parts[0].key_index[0].key.clone(),
+                head.parts[1].key_index[0].key.clone(),
+            ],
+            "one prefix GET per leaf parts 1 and 2 already hold"
+        );
+        assert_eq!(report.leaf_prefix_gets, 2, "{report:?}");
+        assert_eq!(gets.len(), 3 + 4 + 2, "{gets:?}");
         let head = read_signal_head(inner.as_ref(), Signal::Logs).await;
         let refs: Vec<usize> = head.parts.iter().map(|p| p.key_index.len()).collect();
         assert_eq!(refs, vec![1, 1, 1]);
@@ -1199,6 +1361,9 @@ mod tests {
                 largest_unindexed_part_entries: 2,
                 fields: vec![USER_ID.to_string()],
                 parts_unindexed: 3,
+                parts_with_refused_leaves: 0,
+                leaf_prefix_gets: 0,
+                leaf_prefix_bytes_read: 0,
                 parts_rebuilt: 1,
                 parts_deferred: 0,
                 leaves_written: 2,
@@ -1357,6 +1522,9 @@ mod tests {
                     largest_unindexed_part_entries: 2,
                     fields: vec![USER_ID.to_string()],
                     parts_unindexed: 1,
+                    parts_with_refused_leaves: 0,
+                    leaf_prefix_gets: 0,
+                    leaf_prefix_bytes_read: 0,
                     parts_rebuilt: 0,
                     parts_deferred: 0,
                     leaves_written: 0,
@@ -1649,6 +1817,9 @@ mod tests {
                 largest_unindexed_part_entries: 2,
                 fields: vec![USER_ID.to_string()],
                 parts_unindexed: 2,
+                parts_with_refused_leaves: 0,
+                leaf_prefix_gets: 0,
+                leaf_prefix_bytes_read: 0,
                 parts_rebuilt: 1,
                 parts_deferred: 1,
                 leaves_written: 1,
@@ -1813,7 +1984,8 @@ mod tests {
     /// An undeclared `--field` is refused, naming it and the declared set,
     /// before HEAD is read: the tenant config GET is the only request. A
     /// rerun on a HEAD whose every part is indexed issues the config and HEAD
-    /// GETs only: no part or data object GET, no PUT, no CAS.
+    /// GETs and, on logs, one prefix GET per leaf: no part or data object
+    /// GET, no PUT, no CAS.
     #[tokio::test]
     async fn undeclared_field_is_refused_and_an_indexed_head_costs_no_get() {
         let store = recording_store();
@@ -1884,14 +2056,24 @@ mod tests {
         let indexed = read_signal_head(store.as_ref(), Signal::Logs).await;
         store.clear();
         let rerun = rebuild(&catalog, Signal::Logs).await;
+        let leaves: Vec<&SnapshotKeyIndexLeafRef> =
+            indexed.parts.iter().flat_map(|p| &p.key_index).collect();
+        assert_eq!(leaves.len(), 2);
         assert_eq!(
             rerun,
             KeyIndexRebuildReport {
                 fields: vec![USER_ID.to_string()],
+                leaf_prefix_gets: 2,
+                leaf_prefix_bytes_read: leaves.iter().map(|l| u64::from(l.prefix_len)).sum(),
                 ..KeyIndexRebuildReport::default()
             }
         );
-        let whole: Vec<String> = store.gets().into_iter().map(|(key, _, _)| key).collect();
+        let gets = store.gets();
+        let whole: Vec<String> = gets
+            .iter()
+            .filter(|(_, range, _)| matches!(range, GetRange::Full))
+            .map(|(key, _, _)| key.clone())
+            .collect();
         assert_eq!(
             whole,
             vec![
@@ -1899,6 +2081,17 @@ mod tests {
                 head_key(Signal::Logs)
             ]
         );
+        // A logs rerun reads each version-2 leaf's prefix and nothing else.
+        let ranged: Vec<(String, GetRange)> = gets
+            .into_iter()
+            .filter(|(_, range, _)| !matches!(range, GetRange::Full))
+            .map(|(key, range, _)| (key, range))
+            .collect();
+        let want: Vec<(String, GetRange)> = leaves
+            .iter()
+            .map(|l| (l.key.clone(), GetRange::Range(0, u64::from(l.prefix_len))))
+            .collect();
+        assert_eq!(ranged, want);
         assert!(store.puts().is_empty(), "{:?}", store.puts());
         assert_eq!(
             read_signal_head(store.as_ref(), Signal::Logs).await,
@@ -1985,5 +2178,152 @@ mod tests {
         );
         let head = read_signal_head(store.as_ref(), Signal::Logs).await;
         assert_eq!(head.parts[0].key_index, vec![trace_ref, user_id_ref]);
+    }
+
+    /// Restamps part 0's only leaf to format_version 1, PUTs it at its own
+    /// content-addressed key, and CASes HEAD to name it instead of the
+    /// original. Returns the original ref and the version-1 ref.
+    async fn swap_in_a_version_one_leaf(
+        store: &RecordingStore,
+        signal: Signal,
+    ) -> (SnapshotKeyIndexLeafRef, SnapshotKeyIndexLeafRef) {
+        let head = read_signal_head(store, signal).await;
+        assert_eq!(head.parts[0].key_index.len(), 1);
+        let original = head.parts[0].key_index[0].clone();
+        let bytes = store
+            .get(&original.key, GetRange::Full)
+            .await
+            .expect("leaf")
+            .data;
+        let v1 = snapshot_format::restamp_key_index_leaf_version(&bytes, 1).expect("restamp");
+        let v1_ref = put_key_index_leaf(store, &tenant(), signal, head.parts[0].watermark_hour, v1)
+            .await
+            .expect("put the version-1 leaf");
+        assert_ne!(v1_ref.key, original.key);
+        let mut swapped = head.clone();
+        swapped.parts[0].key_index = vec![v1_ref.clone()];
+        let current = store
+            .get(&head_key(signal), GetRange::Full)
+            .await
+            .expect("head");
+        store
+            .put(
+                &head_key(signal),
+                Bytes::from(snapshot_format::encode_head(&swapped).expect("encode")),
+                PutOptions {
+                    mode: PutMode::CasVersion(current.version),
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("swap refs");
+        (original, v1_ref)
+    }
+
+    /// A logs part whose `user_id` ref names a format_version 1 leaf: the
+    /// rebuild reads that leaf's prefix with one ranged GET (counted in
+    /// `leaf_prefix_gets` and `leaf_prefix_bytes_read`), builds the field
+    /// again, and the published HEAD holds exactly one `user_id` ref, a
+    /// version-2 leaf at a key other than the version-1 leaf's. The
+    /// version-1 object is still stored, byte for byte. A spans part holding
+    /// a version-1 leaf is left alone and costs no prefix GET.
+    ///
+    /// A rebuild that skips parts holding a ref for the field leaves the
+    /// version-1 ref in HEAD; one that attaches instead of replacing leaves
+    /// two `user_id` refs.
+    #[tokio::test]
+    async fn a_logs_version_one_ref_is_replaced_and_its_leaf_is_kept() {
+        let store = recording_store();
+        let (catalog, _) = two_entry_parts(&store, 1).await;
+        rebuild(&catalog, Signal::Logs).await;
+        let (original, v1_ref) = swap_in_a_version_one_leaf(&store, Signal::Logs).await;
+        let v1_bytes = store
+            .get(&v1_ref.key, GetRange::Full)
+            .await
+            .expect("v1 leaf")
+            .data;
+
+        store.clear();
+        let report = rebuild(&catalog, Signal::Logs).await;
+        assert_eq!(
+            (
+                report.parts_unindexed,
+                report.parts_with_refused_leaves,
+                report.leaf_prefix_gets,
+                report.leaf_prefix_bytes_read,
+                report.parts_rebuilt,
+                report.leaves_written,
+            ),
+            (1, 1, 1, u64::from(v1_ref.prefix_len), 1, 1),
+            "{report:?}"
+        );
+        let prefix_gets: Vec<(String, GetRange, u64)> = store
+            .gets()
+            .into_iter()
+            .filter(|(key, _, _)| key.ends_with(".kidx"))
+            .collect();
+        assert_eq!(
+            prefix_gets,
+            vec![(
+                v1_ref.key.clone(),
+                GetRange::Range(0, u64::from(v1_ref.prefix_len)),
+                u64::from(v1_ref.prefix_len)
+            )]
+        );
+
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let refs: Vec<&SnapshotKeyIndexLeafRef> = head.parts[0]
+            .key_index
+            .iter()
+            .filter(|r| r.field == USER_ID)
+            .collect();
+        assert_eq!(refs.len(), 1, "{head:?}");
+        let rebuilt = refs[0];
+        assert_ne!(rebuilt.key, v1_ref.key);
+        assert_eq!(rebuilt, &original, "the rebuilt leaf is the version-2 leaf");
+        let rebuilt_bytes = store
+            .get(&rebuilt.key, GetRange::Full)
+            .await
+            .expect("v2 leaf")
+            .data;
+        let summary =
+            verify_key_index_leaf(&rebuilt_bytes, &KeyIndexLeafLimits::default()).expect("verify");
+        assert_eq!(summary.header.format_version, 2);
+        let kept = store
+            .get(&v1_ref.key, GetRange::Full)
+            .await
+            .expect("the version-1 leaf is not deleted")
+            .data;
+        assert_eq!(kept, v1_bytes, "nor overwritten");
+
+        // Spans accept version 1: nothing to replace, no prefix GET.
+        let store = recording_store();
+        publish_trace_spans(store.as_ref(), 1, &[[0x11u8; 16], [0x22u8; 16]]).await;
+        let catalog = off_catalog(store.clone(), DEFAULT_SNAPSHOT_PART_MAX_ENTRIES);
+        fold_through(&catalog, Signal::Spans, KIDX_HOUR).await;
+        rebuild(&catalog, Signal::Spans).await;
+        swap_in_a_version_one_leaf(&store, Signal::Spans).await;
+        let before = read_signal_head(store.as_ref(), Signal::Spans).await;
+        store.clear();
+        let report = rebuild(&catalog, Signal::Spans).await;
+        assert_eq!(
+            (
+                report.parts_unindexed,
+                report.leaf_prefix_gets,
+                report.attempt_count
+            ),
+            (0, 0, 0),
+            "{report:?}"
+        );
+        assert!(
+            store
+                .gets()
+                .iter()
+                .all(|(key, _, _)| !key.ends_with(".kidx"))
+        );
+        assert_eq!(
+            read_signal_head(store.as_ref(), Signal::Spans).await,
+            before
+        );
     }
 }

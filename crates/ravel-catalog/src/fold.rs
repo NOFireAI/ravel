@@ -45,8 +45,8 @@ use crate::snapshot_format::{
     self, EncodedKeyIndexLeaf, HEAD_FORMAT_VERSION, KeyIndexLeafEncodeError, KeyIndexLeafEntry,
     KeyIndexLeafInput, KeyIndexLeafLimits, KeyIndexLeafSummary, KeyIndexSlice, NamePostings,
     PartLimits, SnapshotFormatError, check_key_index_leaf_set, column_stats_segments_concat,
-    encode_key_index_leaf, encoded_entry_len, split_key_index_entries,
-    verify_key_index_leaf_frames,
+    encode_key_index_leaf, encoded_entry_len, key_index_leaf_version_accepted,
+    split_key_index_entries, verify_key_index_leaf_frames,
 };
 use crate::tenant_config::DeclaredTypedColumn;
 
@@ -1819,8 +1819,9 @@ struct CarriedKeyIndex {
 /// the new part by data object key. `Err` (the reason) when the leaves cannot
 /// stand in for the sections: a leaf field not in `fields` under its key
 /// type, a field of `fields` with no leaf, a failed GET, a leaf that does not
-/// verify, match its ref or bind `tail`, or a field whose slices do not form
-/// one set. No decoded entry is kept: each pass decodes the leaves its range
+/// verify, match its ref or bind `tail`, a leaf whose `format_version` the
+/// signal does not accept (a logs version-1 leaf), or a field whose slices do
+/// not form one set. No decoded entry is kept: each pass decodes the leaves its range
 /// overlaps from the kept bytes, one frame at a time.
 #[allow(clippy::too_many_arguments)]
 async fn load_carried_key_index(
@@ -1880,6 +1881,12 @@ async fn load_carried_key_index(
             return Err(format!(
                 "leaf {} binds another tenant, signal or part",
                 leaf.key
+            ));
+        }
+        if !key_index_leaf_version_accepted(signal, header.format_version) {
+            return Err(format!(
+                "leaf {} is format_version {}, which a {signal:?} carry does not take",
+                leaf.key, header.format_version
             ));
         }
         by_field

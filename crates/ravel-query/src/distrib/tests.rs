@@ -5569,9 +5569,9 @@ fn signal_request(segments: &[SegmentRef], signal: Signal) -> pb::FetchRequest {
 /// the metric path does.
 ///
 /// The oracle is what fetching that first segment alone costs through the same
-/// `LogSegmentFetcher` over a clean store. The GET the fault answered adds one
-/// request and no byte: the fetcher counts a request once issued and its bytes
-/// on arrival, so a refused GET is charged for the request alone.
+/// `LogSegmentFetcher` over a clean store. The GET the fault answered adds
+/// nothing to either counter: the fetcher records a request and its bytes once
+/// the store has served them, so a refused GET is charged for neither.
 ///
 /// Mutation proof: RED against the reverted line. Dropping
 /// `.with_spend(&accounting, &stats)` from the fetch-error site in
@@ -5648,9 +5648,9 @@ fn failed_log_slice_reports_the_segments_it_already_paid_for() {
         );
         assert_eq!(
             response.accounting.total_s3_requests(),
-            oracle.total_s3_requests() + 1,
-            "and the requests that served them plus the refused GET, which the \
-             log fetcher counts once issued"
+            oracle.total_s3_requests(),
+            "and the requests that served them; the refused GET is charged for \
+             neither bytes nor a request on this path"
         );
     });
 }

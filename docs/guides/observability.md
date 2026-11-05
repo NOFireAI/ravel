@@ -2437,8 +2437,13 @@ lookup (a spans `trace_id =`, or a logs scan's declared-key equality) from
 the per-part key-index leaves. Every mode renders both on every scrape, for both
 `signal="spans"` and `signal="logs"` and every `outcome`, zeros included, so a
 rate over `outcome="covered"` exists before the first lookup. Neither carries
-`tenant_hash` or `workload_class`. The logs samples move only for a SQL
-statement over the HTTP API: Flight SQL and `EXPLAIN` do not route logs.
+`tenant_hash` or `workload_class`. The logs samples move for a statement
+over SQL on `POST /api/v1/sql`, ES|QL on `POST /api/v1/esql`, and the MCP
+tools that run SQL, `search_logs` among them. Flight SQL, pinned and
+distributed alike, and `EXPLAIN` do not route logs: their scans take the
+per-object probe and leave the logs samples unmoved. A logs
+leaf at `format_version` 1 counts under `outcome="rejected"`; a leaf range
+the fetch memory budget refuses counts under `outcome="reservation_refused"`.
 
 | Metric | Labels | HELP text |
 |---|---|---|

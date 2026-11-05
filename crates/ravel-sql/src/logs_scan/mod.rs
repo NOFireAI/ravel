@@ -1159,6 +1159,9 @@ pub struct LogsScanExec {
     /// poll and reused by the rest (ADR-0102). `None` entries are ts-irrelevant
     /// segments that issue no GET.
     counts: Arc<OnceCell<Arc<PlanCounts>>>,
+    /// The tier-2 router's answer for this scan, resolved once beside
+    /// [`Self::counts`] and kept across a retried plan pass.
+    routes: Arc<RoutesCell>,
     /// The queues the planned route's partitions take units from, one per
     /// execution round ([`UnitRounds`]).
     units: Arc<UnitRounds>,
@@ -2176,6 +2179,7 @@ impl LogsScanExec {
             segments: Arc::clone(&self.segments),
             target_partitions: self.target_partitions,
             counts: Arc::clone(&self.counts),
+            routes: Arc::clone(&self.routes),
             units: Arc::clone(&self.units),
             prefetch_pool: Arc::clone(&self.prefetch_pool),
             ts_min: self.ts_min,
@@ -2359,6 +2363,7 @@ impl LogsScanExec {
             segments: Arc::new(segments.to_vec()),
             target_partitions: declared_partitions,
             counts: Arc::new(OnceCell::new()),
+            routes: Arc::new(RoutesCell::new()),
             units: Arc::new(UnitRounds::new(declared_partitions)),
             prefetch_pool: Arc::new(PrefetchPool::new(declared_partitions)),
             ts_min,
@@ -3474,6 +3479,7 @@ impl ExecutionPlan for LogsScanExec {
                     // requires.
                     let counts_fut = plan_counts_future(
                         Arc::clone(&self.counts),
+                        Arc::clone(&self.routes),
                         Arc::clone(&ctx),
                         Arc::clone(&self.segments),
                         self.target_partitions,
