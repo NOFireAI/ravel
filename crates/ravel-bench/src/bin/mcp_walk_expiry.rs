@@ -52,16 +52,15 @@ use ravel_bench::walk_expiry::{
     self as we, BANDS_TOML, Causes, Cell, CellTally, CommitListing, KeyKind, L0Commit,
     ProfileConfig, Rates, Stamps, Statement, Transport, WalkEnd, WindowRole,
 };
+use ravel_bench::walk_probe::{PinnedWalk, WalkSpec};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_mcp::budget::{McpBudgetConfig, McpEffectiveBudgets, McpRequestBudgets};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::S3Store;
 use ravel_object_store::{ObjectStoreBackend, StoreMetrics};
-use ravel_query::RequestBudgets;
 use ravel_server::config::{CpuGatePermits, McpConfig};
 use ravel_server::service::QueryService;
 use ravel_server::{Cli, FoldTaskConfig, MaintenanceTaskConfig, Mode, QueryBudgets, ServerConfig};
-use ravel_sql::{ResumePosition, SqlRequest};
 use ravel_types::{Signal, TenantHash, TenantId, TimeRange};
 use serde_json::{Value, json};
 
@@ -770,48 +769,6 @@ fn window_for(ctx: &Ctx, cell: Cell, t0_ns: i64) -> TimeRange {
     TimeRange { start_ns, end_ns }
 }
 
-/// `Call::request` for one page: the window as listing bound and row filter,
-/// the row cap and the clamped MCP budgets.
-fn page_request(
-    budgets: &McpEffectiveBudgets,
-    sql: String,
-    window: TimeRange,
-    now_ns: i64,
-) -> SqlRequest {
-    let query = &budgets.query;
-    SqlRequest {
-        sql,
-        window,
-        min_tokens: Vec::new(),
-        now_ns,
-        deadline: budgets.deadline,
-        row_window: true,
-        max_rows: Some(budgets.max_rows as usize),
-        budgets: Some(RequestBudgets {
-            max_bytes_scanned: Some(query.max_bytes_scanned),
-            max_store_requests: Some(query.max_store_requests),
-            max_segments: Some(query.max_segments),
-        }),
-    }
-}
-
-/// Each resolved segment's ingest hour, from a resolve at `at_ns`.
-async fn hour_lookup(
-    ctx: &Ctx,
-    window: TimeRange,
-    at_ns: i64,
-    into: &mut HashMap<String, u32>,
-) -> anyhow::Result<()> {
-    let snapshot = ctx
-        .catalog
-        .resolve(&ctx.tenant_hash, Signal::Metrics, window, &[], at_ns)
-        .await?;
-    for segment in snapshot.segments {
-        into.insert(segment.data_object_key, segment.ingest_hour_bucket);
-    }
-    Ok(())
-}
-
 async fn probe_walk(ctx: &Ctx, cell: Cell) -> WalkEnd {
     match probe_walk_inner(ctx, cell).await {
         Ok(end) => end,
@@ -828,13 +785,19 @@ async fn probe_walk_inner(ctx: &Ctx, cell: Cell) -> Result<WalkEnd, (u32, anyhow
     let Some(budgets) = ctx.budgets.get(&cell.statement) else {
         return Err((1, anyhow::anyhow!("no budgets for {:?}", cell.statement)));
     };
-    let max_rows = budgets.max_rows as usize;
     let t0_ns = wall_now_ns();
     let window = window_for(ctx, cell, t0_ns);
-    let mut hours = HashMap::new();
-    hour_lookup(ctx, window, t0_ns, &mut hours)
-        .await
-        .map_err(|e| (1, e))?;
+    let mut walk = PinnedWalk::start(WalkSpec {
+        service: &ctx.service,
+        catalog: &ctx.catalog,
+        tenant_hash: ctx.tenant_hash,
+        budgets,
+        sql,
+        window,
+        t0_ns,
+        pages,
+    })
+    .await?;
     let watermark = if cell.window == WindowRole::Wo {
         ctx.catalog
             .head_watermark_hour(&ctx.tenant_hash, Signal::Metrics)
@@ -843,39 +806,28 @@ async fn probe_walk_inner(ctx: &Ctx, cell: Cell) -> Result<WalkEnd, (u32, anyhow
     } else {
         None
     };
-    let mut k0: BTreeSet<String> = BTreeSet::new();
-    let mut k0_digest = [0u8; 32];
-    let mut resume: Option<ResumePosition> = None;
-    for page in 1..=pages {
-        if page > 1 {
+    loop {
+        let now_ns = if walk.pages_run() == 0 {
+            t0_ns
+        } else {
             tokio::time::sleep(Duration::from_millis(cell.delta_ms)).await;
-        }
-        let plan = ravel_sql::plan_page(&sql, resume.as_ref()).map_err(|e| (page, e.into()))?;
-        let order_columns: Vec<String> = plan.order_by.iter().map(|t| t.column.clone()).collect();
-        let now_ns = if page == 1 { t0_ns } else { wall_now_ns() };
-        let request = page_request(budgets, plan.statement.clone(), window, now_ns);
-        let outcome = ctx
-            .service
-            .sql_execute_at(ctx.tenant_hash, &request, t0_ns)
-            .await
-            .map_err(|e| (page, anyhow::anyhow!("{e:?}")))?;
+            wall_now_ns()
+        };
+        let report = walk.step(now_ns).await?;
         ctx.pages.fetch_add(1, Ordering::SeqCst);
-        if !outcome.pending_erasure.is_empty() {
+        if report.pending_erasure {
             ctx.pages_with_pending_erasure
                 .fetch_add(1, Ordering::SeqCst);
         }
-        let digest =
-            ravel_mcp::cursor::segment_set_digest(outcome.segment_set.iter().map(String::as_str));
-        let kn: BTreeSet<String> = outcome.segment_set.iter().cloned().collect();
-        if page == 1 {
-            hour_lookup(ctx, window, t0_ns, &mut hours)
-                .await
-                .map_err(|e| (page, e))?;
-            let read_hours: BTreeSet<u32> = kn
+        ctx.unresolved_hour_keys
+            .fetch_add(report.unresolved_hours, Ordering::SeqCst);
+        if report.page == 1 {
+            let read_hours: BTreeSet<u32> = walk
+                .k0()
                 .iter()
                 .filter_map(|key| match we::key_kind(key) {
                     KeyKind::L1 { hour } => Some(hour),
-                    _ => hours.get(key).copied(),
+                    _ => walk.hour_of(key),
                 })
                 .collect();
             if matches!(cell.window, WindowRole::Wr | WindowRole::Wo)
@@ -890,36 +842,11 @@ async fn probe_walk_inner(ctx: &Ctx, cell: Cell) -> Result<WalkEnd, (u32, anyhow
                     ctx.wo_unsealed.fetch_add(1, Ordering::SeqCst);
                 }
             }
-            k0 = kn;
-            k0_digest = digest;
-        } else if digest != k0_digest {
-            let labelled = we::label_expiry(&k0, &kn, |key| hours.get(key).copied());
-            ctx.unresolved_hour_keys
-                .fetch_add(labelled.unresolved_hours, Ordering::SeqCst);
-            return Ok(WalkEnd::Expired {
-                page,
-                causes: labelled.causes,
-            });
         }
-        if page < pages {
-            if !outcome.stats.row_cap_hit {
-                return Ok(WalkEnd::Short { pages: page });
-            }
-            let tuples = outcome.output.resume_tuples(&order_columns);
-            let kept = we::page_break(&tuples, max_rows, plan.total_order());
-            let Some(tuple) = kept
-                .checked_sub(1)
-                .and_then(|last| tuples.into_iter().nth(last))
-                .flatten()
-            else {
-                // No complete group fits a page, so the adapter mints no
-                // cursor: the walk ends here.
-                return Ok(WalkEnd::Short { pages: page });
-            };
-            resume = Some(ResumePosition::new(tuple));
+        if let Some(end) = report.end {
+            return Ok(end);
         }
     }
-    Ok(WalkEnd::Finished)
 }
 
 async fn mcp_walk(ctx: &Ctx, cell: Cell) -> WalkEnd {

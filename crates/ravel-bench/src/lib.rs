@@ -72,3 +72,5 @@ pub mod sql_latency;
 pub mod value_shapes;
 #[cfg(feature = "walk-expiry")]
 pub mod walk_expiry;
+#[cfg(feature = "walk-expiry")]
+pub mod walk_probe;
