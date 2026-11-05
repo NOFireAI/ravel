@@ -12344,6 +12344,133 @@ mod tests {
             }
         }
 
+        /// Four inputs of sixteen streams in ten-record blocks, two blocks a
+        /// row group. Taken in stream-id order, which is the order an input
+        /// stores them in, the streams alternate nine records and one, so
+        /// every block holds one stream's nine records and the next stream's
+        /// one: a stream owns 90% of every block, and the one-record streams
+        /// need a whole block for a tenth of its rows.
+        fn skewed_inputs() -> (Vec<L0Input>, Vec<u32>, Vec<u32>) {
+            let mut order: Vec<u32> = (0..16).collect();
+            order.sort_by_key(|&s| stream_ident(s).0);
+            let (big, small): (Vec<(usize, u32)>, Vec<(usize, u32)>) = order
+                .iter()
+                .copied()
+                .enumerate()
+                .partition(|(p, _)| p % 2 == 0);
+            let big: Vec<u32> = big.into_iter().map(|(_, s)| s).collect();
+            let small: Vec<u32> = small.into_iter().map(|(_, s)| s).collect();
+            let cfg = RlogConfig {
+                block_target_records: 10,
+                group_target_blocks: 2,
+                ..RlogConfig::default()
+            };
+            let inputs = (0..4u32)
+                .map(|i| {
+                    let records = order
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(p, &s)| {
+                            let n: i64 = if p % 2 == 0 { 9 } else { 1 };
+                            (0..n).map(move |k| {
+                                record(
+                                    s,
+                                    1_000 + k * 10 + i64::from(i),
+                                    &format!(
+                                        "in{i} s{s} k{k} {}",
+                                        noise(u64::from(i * 1_000 + s * 50) + k as u64, 300)
+                                    ),
+                                    Vec::new(),
+                                )
+                            })
+                        })
+                        .collect();
+                    L0Input {
+                        records,
+                        cfg,
+                        clustering: None,
+                    }
+                })
+                .collect();
+            (inputs, big, small)
+        }
+
+        /// The skew shape: on [`skewed_inputs`], where one stream owns 90% of
+        /// every block, resident reads in one pass, resident reads in several
+        /// passes and fetch-per-pass reads each write the cursor merge's bytes
+        /// and keep `peak_read_side_bytes` within the resident ceiling. A pass
+        /// of a one-record stream holds its block whole, so it is planned at
+        /// the whole block's [`pass_block_cost`], not at the stream's share of
+        /// the rows.
+        ///
+        /// Demonstrated red by planning each block at a tenth of its cost,
+        /// a one-record stream's share (`pass_block_cost(&catalog.pricing, b)`
+        /// in [`plan_merge`]'s `block_costs` changed to
+        /// `pass_block_cost(&catalog.pricing, b).map(|c| c / 10)`): the
+        /// several-pass resident run then plans one pass and peaks at 224 340
+        /// bytes over its 129 262-byte ceiling.
+        #[tokio::test]
+        async fn a_stream_owning_most_of_every_block_keeps_passes_under_the_ceiling() {
+            let (inputs, big, small) = skewed_inputs();
+            let base = unkeyed_base(2);
+            let store = ProbeStore::new();
+            let keys = seed_inputs(&store, &inputs).await;
+            let catalogs = catalogs_of(&store, &keys).await;
+            for (i, catalog) in catalogs.iter().enumerate() {
+                assert_eq!(catalog.pricing.block_rows, vec![10; 8], "input {i}");
+                for &s in big.iter().chain(&small) {
+                    let locs = catalog
+                        .reader
+                        .stream_blocks(&stream_ident(s).0)
+                        .expect("stream blocks")
+                        .expect("every input carries every stream");
+                    let blocks: Vec<usize> = locs
+                        .iter()
+                        .flat_map(|l| l.block_indices().iter().copied())
+                        .collect();
+                    assert_eq!(blocks.len(), 1, "input {i} stream {s}: {blocks:?}");
+                }
+            }
+
+            let (resident_tight, fetch_tight) = tight_ceilings(&store, &keys, &base).await;
+            let oracle = cursor_oracle(&inputs, &base).await;
+            for (name, ceiling, mode, passes) in [
+                ("one pass", None, MergeReadMode::Resident, 1..=1),
+                (
+                    "resident, several passes",
+                    Some(resident_tight),
+                    MergeReadMode::Resident,
+                    2..=u64::MAX,
+                ),
+                (
+                    "fetch per pass",
+                    Some(fetch_tight),
+                    MergeReadMode::FetchPerPass,
+                    2..=u64::MAX,
+                ),
+            ] {
+                let config = with_ceiling(&base, ceiling);
+                let (plan, _) = plan_for(&store, &keys, &config).await;
+                assert_eq!(plan.mode, mode, "{name}");
+                let (output, run, _, _) = compact_fresh(&inputs, &config).await;
+                let peak = run.tracker.peak_read_side_bytes();
+                let limit = config.merge_resident_ceiling();
+                assert!(
+                    peak <= limit,
+                    "{name}: peak {peak} over the ceiling {limit}"
+                );
+                assert!(
+                    output == oracle,
+                    "{name}: parts differ from the cursor merge"
+                );
+                assert!(
+                    passes.contains(&run.report.merge_passes),
+                    "{name}: {} passes",
+                    run.report.merge_passes
+                );
+            }
+        }
+
         /// Input 0 carries only stream 0, 20 000 records over ten row groups;
         /// inputs 1 to 20 carry streams 1 to 40, two records each, one block
         /// per stream and one group per input.
