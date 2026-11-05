@@ -280,6 +280,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::keys;
 use ravel_logseg::field_dir::FieldDir;
@@ -378,6 +379,10 @@ pub struct RlogInputCatalog {
     /// is taken from has its covered-column list read, once per merge
     /// ([`read_bloom_scope`]); no other BLOOM byte is fetched.
     pub bloom_section: Option<footer::SectionDesc>,
+    /// The bytes [`read_bloom_scope`] reads from an uncompressed BLOOM, copied
+    /// from the catalog load's footer probe when it held them; `None` when it
+    /// did not, and the read is then a ranged GET.
+    pub bloom_scope_bytes: Option<Vec<u8>>,
     /// This input's FIELD_DIR string (`FieldType::Str`) entries, the columns a
     /// BLOOM covered list names, so the coverage maps to column names without
     /// refetching FIELD_DIR.
@@ -560,7 +565,11 @@ pub(crate) async fn load_catalog_from_object(
     note_get(ledger, RequestPhase::CatalogRead, &probe);
     let probe = probe?;
     let total = probe.total_size;
-    let ftr = match footer::open_from_suffix(&probe.data, total)? {
+    let probe = CatalogProbe {
+        start: total.saturating_sub(probe.data.len() as u64),
+        bytes: probe.data,
+    };
+    let ftr = match footer::open_from_suffix(&probe.bytes, total)? {
         SuffixOutcome::Ready(f) => f,
         SuffixOutcome::NeedRange { offset, len } => {
             let tail = store
@@ -579,29 +588,63 @@ pub(crate) async fn load_catalog_from_object(
         }
     };
 
-    // Fetch and decode the three whole-read directory sections by range.
-    // BLOCKS and BLOOM are never fetched here; the merge streams blocks by
-    // range one stream at a time. FIELD_DIR is decoded (and validated) even
-    // though the merge rebuilds it, so a corrupt input fails loud here.
-    let stream_dir_raw =
-        fetch_section(store, &object_key, &ftr, kind::STREAM_DIR, &cfg, ledger).await?;
-    let field_dir_raw =
-        fetch_section(store, &object_key, &ftr, kind::FIELD_DIR, &cfg, ledger).await?;
-    let skip_idx_raw =
-        fetch_section(store, &object_key, &ftr, kind::SKIP_IDX, &cfg, ledger).await?;
+    // Decode the three whole-read directory sections, each sliced from the
+    // probe when it lies inside it and fetched by range otherwise. BLOCKS and
+    // BLOOM are never fetched here; the merge streams blocks by range one
+    // stream at a time. FIELD_DIR is decoded (and validated) even though the
+    // merge rebuilds it, so a corrupt input fails loud here.
+    let stream_dir_raw = fetch_section(
+        store,
+        &object_key,
+        &probe,
+        &ftr,
+        kind::STREAM_DIR,
+        &cfg,
+        ledger,
+    )
+    .await?;
+    let field_dir_raw = fetch_section(
+        store,
+        &object_key,
+        &probe,
+        &ftr,
+        kind::FIELD_DIR,
+        &cfg,
+        ledger,
+    )
+    .await?;
+    let skip_idx_raw = fetch_section(
+        store,
+        &object_key,
+        &probe,
+        &ftr,
+        kind::SKIP_IDX,
+        &cfg,
+        ledger,
+    )
+    .await?;
 
     // Which fields this input had indexed. Recovered here, while the
     // object's footer and FIELD_DIR bytes are already at hand, and reduced
     // immediately to a name list: the POSTINGS bytes themselves are dropped
     // before this function returns and never take part in the merge.
     let indexed_fields = if recover_indexed_fields {
-        input_indexed_fields(store, &object_key, &ftr, &field_dir_raw, &cfg, ledger).await?
+        input_indexed_fields(
+            store,
+            &object_key,
+            &probe,
+            &ftr,
+            &field_dir_raw,
+            &cfg,
+            ledger,
+        )
+        .await?
     } else {
         Vec::new()
     };
     // Recovered on both routes: the erasure rewrite rebuilds KEY_IDX from the
     // surviving records, so its parts keep the inputs' field set.
-    let key_index_fields = input_key_index_fields(store, &object_key, &ftr, ledger).await?;
+    let key_index_fields = input_key_index_fields(store, &object_key, &probe, &ftr, ledger).await?;
 
     // PAGE_DIR is present exactly on a version-4 input (ADR-0699 decision 2),
     // and the bounded merge cannot admission-price a cursor over an input
@@ -615,8 +658,16 @@ pub(crate) async fn load_catalog_from_object(
             format_version: OUTPUT_FORMAT_VERSION,
         });
     };
-    let page_dir_raw =
-        fetch_section(store, &object_key, &ftr, kind::PAGE_DIR, &cfg, ledger).await?;
+    let page_dir_raw = fetch_section(
+        store,
+        &object_key,
+        &probe,
+        &ftr,
+        kind::PAGE_DIR,
+        &cfg,
+        ledger,
+    )
+    .await?;
     // The per-block shape and string-payload figures the bounded merge reserves
     // a cursor's decode against (ADR-0979 decision 4). Decoded here, once, from
     // directory bytes already fetched: these are the same decodes the range
@@ -638,6 +689,18 @@ pub(crate) async fn load_catalog_from_object(
         .iter()
         .map(|e| (e.name.len() + std::mem::size_of::<ravel_logseg::field_dir::FieldEntry>()) as u64)
         .sum();
+    // `read_bloom_scope` runs after every input has loaded and the probe is
+    // gone, so keep a copy of the bytes it reads when the probe holds them.
+    // Only an uncompressed BLOOM is kept: its read is the covered-list prefix,
+    // a few bytes per string column, never the section.
+    let bloom_section = ftr.section(kind::BLOOM).copied();
+    let bloom_scope_bytes = bloom_section
+        .filter(|desc| desc.comp == COMP_NONE && !string_fields.is_empty())
+        .and_then(|desc| {
+            let (start, end) = bloom_scope_range(&desc, string_fields.len());
+            probe.slice(start, end)
+        })
+        .map(|bytes| bytes.to_vec());
     // Input read / catalog load phase (issue #977): the reader below retains a
     // decoded form of these directory sections for the whole merge. Charge the
     // decoded section payload lengths (what `fetch_section` returns after
@@ -655,14 +718,15 @@ pub(crate) async fn load_catalog_from_object(
                 .saturating_mul(std::mem::size_of::<u32>() as u64)
             + (pricing.block_string_uncomp_lens.len() as u64)
                 .saturating_mul(std::mem::size_of::<u64>() as u64)
-            // The string FIELD_DIR entries kept for the output bloom scope.
-            + string_field_bytes;
+            // The string FIELD_DIR entries and BLOOM list prefix kept for the
+            // output bloom scope.
+            + string_field_bytes
+            + bloom_scope_bytes.as_ref().map_or(0, |b| b.len() as u64);
         t.add_catalog_directory_bytes(dir_bytes);
     }
     let record_count = ftr.record_count;
     let sort_descriptor = ftr.sort_descriptor.clone();
     let clustering_generation = ftr.clustering_generation;
-    let bloom_section = ftr.section(kind::BLOOM).copied();
     let reader = RlogRangeReader::from_sections_with_page_dir(
         &ftr,
         &stream_dir_raw,
@@ -679,9 +743,45 @@ pub(crate) async fn load_catalog_from_object(
         sort_descriptor,
         clustering_generation,
         bloom_section,
+        bloom_scope_bytes,
         string_fields,
         key_index_fields,
     })
+}
+
+/// The suffix probe of one catalog load: the object's tail and the offset it
+/// starts at. Lives for that load only; the built catalog keeps none of it.
+struct CatalogProbe {
+    start: u64,
+    bytes: Bytes,
+}
+
+impl CatalogProbe {
+    /// The object's bytes `[start, end)` when the probe holds all of them.
+    fn slice(&self, start: u64, end: u64) -> Option<Bytes> {
+        let from = usize::try_from(start.checked_sub(self.start)?).ok()?;
+        let to = usize::try_from(end.checked_sub(self.start)?).ok()?;
+        (from <= to && to <= self.bytes.len()).then(|| self.bytes.slice(from..to))
+    }
+}
+
+/// The object's bytes `[start, end)` for a catalog load: sliced from `probe`
+/// when it holds the whole range, otherwise one ranged GET under
+/// [`RequestPhase::CatalogRead`].
+async fn read_catalog_range(
+    store: &dyn ObjectStoreBackend,
+    object_key: &str,
+    probe: &CatalogProbe,
+    start: u64,
+    end: u64,
+    ledger: Option<&RequestLedger>,
+) -> Result<Bytes> {
+    if let Some(bytes) = probe.slice(start, end) {
+        return Ok(bytes);
+    }
+    let got = store.get(object_key, GetRange::Range(start, end)).await;
+    note_get(ledger, RequestPhase::CatalogRead, &got);
+    Ok(got?.data)
 }
 
 /// The fixed column ids whose cells decode to owned per-row byte buffers:
@@ -937,6 +1037,21 @@ const BLOOM_LIST_FRAME_BYTES: u64 = 8;
 /// The longest uvarint a `u32` column id encodes to.
 const MAX_U32_UVARINT_BYTES: u64 = 5;
 
+/// The object range [`read_bloom_scope`] reads from a BLOOM section `desc`
+/// whose FIELD_DIR holds `strings` string columns: the covered-list prefix of
+/// an uncompressed section, the whole of a compressed one.
+fn bloom_scope_range(desc: &footer::SectionDesc, strings: usize) -> (u64, u64) {
+    let len = if desc.comp == COMP_NONE {
+        let known = u64::from(FIRST_DYNAMIC_COL) + strings as u64;
+        let max_list =
+            BLOOM_LIST_FRAME_BYTES.saturating_add(known.saturating_mul(MAX_U32_UVARINT_BYTES));
+        desc.len.min(max_list)
+    } else {
+        desc.len
+    };
+    (desc.offset, desc.offset + len)
+}
+
 /// The bloom scope an input was written under, recovered from its BLOOM
 /// covered-column list (ADR-2135 decision 5) mapped to names through its
 /// FIELD_DIR string entries:
@@ -947,10 +1062,11 @@ const MAX_U32_UVARINT_BYTES: u64 = 5;
 /// - otherwise `Undeclared` with the uncovered string columns as `declared`.
 ///
 /// An input with no string attribute column cannot tell `Text` from `All`; it
-/// resolves to `All`, the default scope, and costs no request. Otherwise this
-/// is one ranged GET of the list's prefix, at most
-/// `8 + 5 x (FIRST_DYNAMIC_COL + string columns)` bytes, since the writer
-/// stores BLOOM uncompressed; a compressed BLOOM is fetched whole.
+/// resolves to `All`, the default scope, and costs no request. Otherwise it
+/// reads the list's prefix, at most `8 + 5 x (FIRST_DYNAMIC_COL + string
+/// columns)` bytes, since the writer stores BLOOM uncompressed: no request when
+/// the catalog load's footer probe held them ([`RlogInputCatalog::bloom_scope_bytes`]),
+/// one ranged GET otherwise. A compressed BLOOM is fetched whole.
 async fn read_bloom_scope(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
@@ -967,28 +1083,23 @@ async fn read_bloom_scope(
         ))
     })?;
     let ledger = config.request_ledger.as_ref();
+    let fetched;
+    let stored: &[u8] = match catalog.bloom_scope_bytes.as_deref() {
+        Some(bytes) => bytes,
+        None => {
+            let (start, end) = bloom_scope_range(&desc, strings.len());
+            let got = store
+                .get(&catalog.object_key, GetRange::Range(start, end))
+                .await;
+            note_get(ledger, RequestPhase::CatalogRead, &got);
+            fetched = got?.data;
+            &fetched
+        }
+    };
     let section = if desc.comp == COMP_NONE {
-        let known = u64::from(FIRST_DYNAMIC_COL) + strings.len() as u64;
-        let max_list =
-            BLOOM_LIST_FRAME_BYTES.saturating_add(known.saturating_mul(MAX_U32_UVARINT_BYTES));
-        let len = desc.len.min(max_list);
-        let got = store
-            .get(
-                &catalog.object_key,
-                GetRange::Range(desc.offset, desc.offset + len),
-            )
-            .await;
-        note_get(ledger, RequestPhase::CatalogRead, &got);
-        got?.data.to_vec()
+        stored.to_vec()
     } else {
-        let got = store
-            .get(
-                &catalog.object_key,
-                GetRange::Range(desc.offset, desc.offset + desc.len),
-            )
-            .await;
-        note_get(ledger, RequestPhase::CatalogRead, &got);
-        decode_section(got?.data.as_ref(), &desc, &RlogConfig::default())?
+        decode_section(stored, &desc, &RlogConfig::default())?
     };
     // Cut the section after its covered list and give it an empty entry table,
     // so the section parser verifies the list crc, its order, and that every id
@@ -4636,6 +4747,7 @@ fn attr_value_stored_estimate(v: &AttrValue) -> u64 {
 async fn input_indexed_fields(
     store: &dyn ObjectStoreBackend,
     object_key: &str,
+    probe: &CatalogProbe,
     ftr: &footer::LogFooter,
     field_dir_raw: &[u8],
     cfg: &RlogConfig,
@@ -4646,14 +4758,16 @@ async fn input_indexed_fields(
     let Some(desc) = ftr.section(kind::POSTINGS) else {
         return Ok(Vec::new());
     };
-    let got = store
-        .get(
-            object_key,
-            GetRange::Range(desc.offset, desc.offset + desc.len),
-        )
-        .await;
-    note_get(ledger, RequestPhase::CatalogRead, &got);
-    let raw = decode_section(got?.data.as_ref(), desc, cfg)?;
+    let stored = read_catalog_range(
+        store,
+        object_key,
+        probe,
+        desc.offset,
+        desc.offset + desc.len,
+        ledger,
+    )
+    .await?;
+    let raw = decode_section(&stored, desc, cfg)?;
     let section = PostingsSection::parse(&raw)?;
     let field_dir = FieldDir::decode(field_dir_raw, MAX_FIELD_DIR_ENTRIES)?;
     let mut names: BTreeSet<String> = BTreeSet::new();
@@ -4684,13 +4798,14 @@ fn merged_indexed_fields(catalogs: &[RlogInputCatalog]) -> Vec<String> {
     names.into_iter().map(str::to_string).collect()
 }
 
-/// The fields and key types `object_key`'s KEY_IDX header names, read with one
-/// ranged GET of the section's `[0, prefix_len)` (the header and field
-/// directory, crcs verified), never its buckets. Empty, with no request, when
-/// the object has no KEY_IDX.
+/// The fields and key types `object_key`'s KEY_IDX header names, read from the
+/// section's `[0, prefix_len)` (the header and field directory, crcs verified),
+/// never its buckets: sliced from `probe` when it holds that range, one ranged
+/// GET otherwise. Empty, with no request, when the object has no KEY_IDX.
 async fn input_key_index_fields(
     store: &dyn ObjectStoreBackend,
     object_key: &str,
+    probe: &CatalogProbe,
     ftr: &footer::LogFooter,
     ledger: Option<&RequestLedger>,
 ) -> Result<Vec<(String, KeyType)>> {
@@ -4699,9 +4814,7 @@ async fn input_key_index_fields(
     };
     let start = desc.offset;
     let end = desc.offset.saturating_add(u64::from(desc.prefix_len));
-    let got = store.get(object_key, GetRange::Range(start, end)).await;
-    note_get(ledger, RequestPhase::CatalogRead, &got);
-    let prefix = got?.data;
+    let prefix = read_catalog_range(store, object_key, probe, start, end, ledger).await?;
     let fields = key_index::key_index_fields(ftr, |range| {
         if range == (start..end) {
             Ok(prefix.clone())
@@ -4815,12 +4928,14 @@ fn key_index_field_cap(mut fields: Vec<(String, KeyType)>) -> Vec<(String, KeyTy
     fields
 }
 
-/// Fetch one required whole-read section by range and return its decompressed,
-/// crc-verified bytes. Fetches exactly `[offset, offset + len)` (the section's
-/// stored bytes), never the whole object.
+/// Read one required whole-read section and return its decompressed,
+/// crc-verified bytes. Reads exactly `[offset, offset + len)` (the section's
+/// stored bytes), sliced from `probe` when it holds the whole range and
+/// fetched by range otherwise, never the whole object.
 async fn fetch_section(
     store: &dyn ObjectStoreBackend,
     object_key: &str,
+    probe: &CatalogProbe,
     ftr: &footer::LogFooter,
     k: u32,
     cfg: &RlogConfig,
@@ -4829,14 +4944,16 @@ async fn fetch_section(
     let desc = ftr.section(k).ok_or_else(|| {
         MaintainError::Invariant(format!("input .rlog object missing section kind {k}"))
     })?;
-    let got = store
-        .get(
-            object_key,
-            GetRange::Range(desc.offset, desc.offset + desc.len),
-        )
-        .await;
-    note_get(ledger, RequestPhase::CatalogRead, &got);
-    Ok(decode_section(got?.data.as_ref(), desc, cfg)?)
+    let stored = read_catalog_range(
+        store,
+        object_key,
+        probe,
+        desc.offset,
+        desc.offset + desc.len,
+        ledger,
+    )
+    .await?;
+    Ok(decode_section(&stored, desc, cfg)?)
 }
 
 /// KEY_IDX readers and a ground-truth oracle over a whole RLOG object, shared
@@ -11511,6 +11628,203 @@ mod tests {
         }
     }
 
+    /// Issue #3855: a catalog load slices every section its footer probe holds
+    /// from the probe and fetches by range only the ones it does not.
+    mod catalog_probe {
+        use super::*;
+        use crate::config::DEFAULT_FOOTER_PROBE_BYTES;
+
+        const KEY: &str = "l0/catalog-probe";
+
+        /// One L0 object over six streams. With `indexes`, it carries POSTINGS
+        /// (`user`) and KEY_IDX (`user_id`) too, so a catalog load reads six
+        /// sections; without, the four directories only.
+        fn input(indexes: bool) -> Vec<u8> {
+            let identity = ObjectIdentity {
+                tenant_hash: tenant_hash().0,
+                shard: SHARD,
+                writer_id: Uuid::from_u128(1).into_bytes(),
+                writer_epoch: EPOCH,
+                writer_seq: 1,
+            };
+            let mut w = RlogWriter::new(RlogConfig::default(), identity);
+            if indexes {
+                w = w
+                    .with_indexed_fields(vec!["user".to_string()])
+                    .with_key_index_fields(vec![("user_id".to_string(), KeyType::I64)]);
+            }
+            for i in 0..24u32 {
+                let attrs = vec![
+                    ("user".to_string(), AttrValue::Str(format!("u{}", i % 5))),
+                    ("user_id".to_string(), AttrValue::I64(i64::from(i % 7))),
+                ];
+                w.push(record(i % 6, i64::from(i), "line", attrs))
+                    .expect("push");
+            }
+            w.finish().expect("finish")
+        }
+
+        async fn put(store: &MemoryStore, bytes: &[u8]) {
+            store
+                .put(KEY, Bytes::copy_from_slice(bytes), PutOptions::default())
+                .await
+                .expect("put");
+        }
+
+        fn ledgered(footer_probe_bytes: u64) -> (CompactorConfig, RequestLedger) {
+            let ledger = RequestLedger::new();
+            let config = CompactorConfig {
+                footer_probe_bytes,
+                request_ledger: Some(ledger.clone()),
+                ..CompactorConfig::default()
+            };
+            (config, ledger)
+        }
+
+        async fn load(store: &MemoryStore, config: &CompactorConfig) -> RlogInputCatalog {
+            load_catalog_from_object(store, config, KEY.to_string(), true)
+                .await
+                .expect("load catalog")
+        }
+
+        /// A probe holding the footer and trailer and no section byte, so a
+        /// load fetches every section it reads by range.
+        fn footer_only_probe(bytes: &[u8]) -> u64 {
+            let ftr = footer::open(bytes).expect("open");
+            let sections_end = ftr
+                .sections
+                .iter()
+                .map(|s| s.offset + s.len)
+                .max()
+                .expect("sections");
+            bytes.len() as u64 - sections_end
+        }
+
+        #[test]
+        fn the_default_footer_probe_is_128_kib() {
+            assert_eq!(DEFAULT_FOOTER_PROBE_BYTES, 131_072);
+            assert_eq!(CompactorConfig::default().footer_probe_bytes, 131_072);
+        }
+
+        /// Every section the load reads (STREAM_DIR, FIELD_DIR, SKIP_IDX,
+        /// PAGE_DIR, POSTINGS, the KEY_IDX prefix) and the bloom scope's
+        /// BLOOM list sit inside the default probe: the probe is the only GET,
+        /// and the bloom scope read issues none. With every section outside
+        /// the probe, the same object costs the probe plus one GET per section
+        /// and decodes to the same catalog.
+        #[tokio::test]
+        async fn a_catalog_the_probe_holds_is_one_get() {
+            let store = MemoryStore::new();
+            let bytes = input(true);
+            put(&store, &bytes).await;
+            let ftr = footer::open(&bytes).expect("open");
+            assert!(ftr.section(kind::POSTINGS).is_some(), "POSTINGS present");
+            assert!(ftr.section(kind::KEY_IDX).is_some(), "KEY_IDX present");
+            assert!((bytes.len() as u64) < DEFAULT_FOOTER_PROBE_BYTES);
+
+            let (config, ledger) = ledgered(DEFAULT_FOOTER_PROBE_BYTES);
+            let catalog = load(&store, &config).await;
+            let report = ledger.report();
+            assert_eq!(
+                report.catalog_read.requests, 1,
+                "the probe and no other GET"
+            );
+            assert_eq!(report.catalog_read.wire_bytes_received, bytes.len() as u64);
+            assert_eq!(catalog.indexed_fields, ["user"]);
+            assert_eq!(
+                catalog.key_index_fields,
+                [("user_id".to_string(), KeyType::I64)]
+            );
+
+            let bloom = catalog.bloom_section.expect("BLOOM");
+            let (start, end) = bloom_scope_range(&bloom, catalog.string_fields.len());
+            assert_eq!(
+                catalog.bloom_scope_bytes.as_deref(),
+                Some(&bytes[start as usize..end as usize]),
+                "the catalog keeps the BLOOM list bytes the probe held"
+            );
+            let scope = read_bloom_scope(&store, &config, &catalog)
+                .await
+                .expect("bloom scope");
+            assert_eq!(
+                ledger.report().catalog_read.requests,
+                1,
+                "the bloom scope read issued no GET"
+            );
+            let unheld = RlogInputCatalog {
+                bloom_scope_bytes: None,
+                ..catalog.clone()
+            };
+            assert_eq!(
+                read_bloom_scope(&store, &config, &unheld)
+                    .await
+                    .expect("bloom scope by range"),
+                scope
+            );
+            assert_eq!(ledger.report().catalog_read.requests, 2);
+
+            let (by_range_config, by_range_ledger) = ledgered(footer_only_probe(&bytes));
+            let by_range = load(&store, &by_range_config).await;
+            assert_eq!(
+                by_range_ledger.report().catalog_read.requests,
+                1 + 6,
+                "the probe, four directories, POSTINGS and the KEY_IDX prefix"
+            );
+            assert!(by_range.bloom_scope_bytes.is_none());
+            assert_eq!(format!("{unheld:?}"), format!("{by_range:?}"));
+        }
+
+        /// A probe that starts one byte into STREAM_DIR holds FIELD_DIR and
+        /// the footer whole and STREAM_DIR only in part. The load slices
+        /// FIELD_DIR and fetches STREAM_DIR, PAGE_DIR and SKIP_IDX by range,
+        /// each exactly once, and decodes to the same catalog as a load that
+        /// fetches every section.
+        #[tokio::test]
+        async fn sections_the_probe_misses_or_partly_holds_are_fetched_by_range() {
+            let store = MemoryStore::new();
+            let bytes = input(false);
+            put(&store, &bytes).await;
+            let total = bytes.len() as u64;
+            let ftr = footer::open(&bytes).expect("open");
+            let section = |k| *ftr.section(k).expect("section");
+            let (skip, page, stream, field) = (
+                section(kind::SKIP_IDX),
+                section(kind::PAGE_DIR),
+                section(kind::STREAM_DIR),
+                section(kind::FIELD_DIR),
+            );
+            assert!(ftr.section(kind::POSTINGS).is_none());
+            assert!(ftr.section(kind::KEY_IDX).is_none());
+            assert!(
+                skip.offset < page.offset
+                    && page.offset < stream.offset
+                    && stream.offset < field.offset,
+                "the writer's tail order"
+            );
+            assert!(stream.len > 1, "STREAM_DIR spans the probe's start");
+
+            let probe = total - (stream.offset + 1);
+            let (config, ledger) = ledgered(probe);
+            let catalog = load(&store, &config).await;
+            let report = ledger.report();
+            assert_eq!(
+                report.catalog_read.requests,
+                1 + 3,
+                "the probe, then SKIP_IDX, PAGE_DIR and STREAM_DIR"
+            );
+            assert_eq!(
+                report.catalog_read.wire_bytes_received,
+                probe + skip.len + page.len + stream.len,
+                "STREAM_DIR is fetched whole, FIELD_DIR not at all"
+            );
+
+            let (by_range_config, by_range_ledger) = ledgered(footer_only_probe(&bytes));
+            let by_range = load(&store, &by_range_config).await;
+            assert_eq!(by_range_ledger.report().catalog_read.requests, 1 + 4);
+            assert_eq!(format!("{catalog:?}"), format!("{by_range:?}"));
+        }
+    }
+
     // --- keystone differential property test ---------------------------------
 
     #[derive(Debug, Clone)]
@@ -12926,9 +13240,10 @@ mod tests {
                 let held = if resident { raw } else { 0 };
                 assert_eq!(run.report.merge_resident_bytes, held);
             }
-            // The figures ADR-3819's table quotes: 8 resident passes over 12
-            // block GETs, 9 fetch-per-pass passes over 108, 60 catalog GETs.
-            assert_eq!(catalog_gets, [60, 60]);
+            // The block figures ADR-3819's table quotes: 8 resident passes over
+            // 12 block GETs, 9 fetch-per-pass passes over 108. One catalog GET
+            // per input: each footer probe holds its input's directories.
+            assert_eq!(catalog_gets, [12, 12]);
             assert_eq!(block_gets, [(8, 12), (9, 108)]);
 
             // The cursor merge on the same inputs fetches each group once per
