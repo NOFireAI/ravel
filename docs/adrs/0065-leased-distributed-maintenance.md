@@ -527,12 +527,17 @@ into contiguous groups of `G`, the largest size with
 `G x (raw per input + price of its blocks) + run target <= C`, and merges
 each group with the same planner and passes into a run: an RLOG in a local
 scratch directory, cut into parts at the run memory target. Level 2 merges
-the `R` runs into the published parts with the same planner and passes,
-once `max(R x price(one run block), largest stream estimate) + reads in
-flight + final part target <= U` holds and the plan over the runs is not
-cursor. The stream estimate term is there because a run's part cut can
-split one stream across two of that run's blocks. Group size under 2, short
-scratch headroom and a level 2 that does not fit are each refused by name.
+the runs' `R` parts into the published parts with the same planner and
+passes, once `max(R x price(one run block), largest stream estimate) +
+reads in flight + final part target <= U` holds and the plan over the runs
+is not cursor. `R` counts run parts, not groups: every part of every run is
+a level-2 input, so a run target that cuts each group into several parts
+multiplies the term. The stream estimate term is there because a run's part
+cut can split one stream across two of that run's blocks. Group size under
+2, short scratch headroom and a level 2 that does not fit are each refused
+by name, as a terminal outcome the scan memo does not retry in this process.
+Only a bucket the D0 check refuses takes this route; a fetch-per-pass or
+resident plan stays single-level with `scratch_dir` set.
 The emitted sequence, and so
 every L1 part's bytes and key, is the single-level one, except for a keyed
 bucket that `merge_cursor_budget_bytes` splits into reservation batches
@@ -541,11 +546,15 @@ bucket that `merge_cursor_budget_bytes` splits into reservation batches
 The peak this decision states then holds per level. Every input's catalog
 stays loaded across both levels. Level 1 holds one group's resident row
 groups, one pass over them and an in-progress run part bounded by the run
-memory target; level 2 holds the runs' row groups, one pass over at most
-`R` run blocks per stream, and the in-progress part. Level 1 runs one group
+memory target; level 2 holds the run parts' row groups, one pass over at
+most `R` run blocks per stream, and the in-progress part. Level 1 runs one group
 at a time (`W1 = 1`), so the per-worker ceiling `C` is the unit ceiling `U`;
 dividing the budgets across parallel workers is ADR-3853 D4's. The runs are
 a cache: the merge refuses before its first block GET when the scratch
 volume holds less than 1.3 times the inputs' object sizes, removes the
 unit's runs however it ends, and no durability or recovery path reads them.
+A process takes an exclusive lock on a file in `scratch_dir` at its first
+two-level merge and holds it for its lifetime; with the lock held it removes
+every unit directory it did not create, which reclaims what a killed process
+left behind, and a directory another process holds is refused by name.
 With no `scratch_dir`, the merge and the D0 refusal are unchanged.

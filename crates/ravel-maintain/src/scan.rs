@@ -51,9 +51,11 @@ pub struct ScanReport {
     /// hours still compact; the cursor stops before the first held hour.
     pub held_out_of_window: usize,
     /// Buckets compaction refused for their merge geometry
-    /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0). Later hours
-    /// still compact; the cursor stops before the first refused hour, so a
-    /// build that can merge it revisits it.
+    /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), including a
+    /// two-level merge's refusal ([`CompactionOutcome::TwoLevelUnsupported`],
+    /// [`CompactionOutcome::ScratchHeadroom`]). Later hours still compact; the
+    /// cursor stops before the first refused hour, so a build that can merge
+    /// it revisits it.
     pub geometry_unsupported: usize,
     /// The hour the cursor was advanced to, if it moved.
     pub cursor_advanced_to: Option<u32>,
@@ -104,7 +106,9 @@ pub async fn scan_and_compact(
                 report.held_out_of_window += 1;
                 first_held.get_or_insert(hour);
             }
-            CompactionOutcome::GeometryUnsupported { .. } => {
+            CompactionOutcome::GeometryUnsupported { .. }
+            | CompactionOutcome::TwoLevelUnsupported { .. }
+            | CompactionOutcome::ScratchHeadroom { .. } => {
                 report.geometry_unsupported += 1;
                 first_held.get_or_insert(hour);
             }
@@ -157,8 +161,10 @@ pub struct MaintainReport {
     /// continues to later hours.
     pub held_out_of_window: usize,
     /// Buckets whose compaction this pass refused for their merge geometry
-    /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0). Not counted
-    /// for a bucket the [`MaintainMemo`] already holds as refused.
+    /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), including a
+    /// two-level merge's refusal ([`CompactionOutcome::TwoLevelUnsupported`],
+    /// [`CompactionOutcome::ScratchHeadroom`]). Not counted for a bucket the
+    /// [`MaintainMemo`] already holds as refused.
     pub geometry_unsupported: usize,
     /// Expired buckets whose physical sweep was blocked because the live
     /// catalog HEAD snapshot still names an object inside the bucket
@@ -755,7 +761,9 @@ pub enum TerminalState {
     /// shard listing, so its entry is pruned on the next pass.)
     SweptEmpty,
     /// Compaction refused the bucket for its merge geometry
-    /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0). Terminal
+    /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), or refused
+    /// its two-level merge ([`CompactionOutcome::TwoLevelUnsupported`],
+    /// [`CompactionOutcome::ScratchHeadroom`]). Terminal
     /// for this process's binary only, so it is held in memory and never
     /// written to the durable snapshot: a restart, or a sibling seeded from a
     /// snapshot, evaluates the bucket again.
@@ -1873,10 +1881,14 @@ fn classify_terminal(
                 Some(CompactionOutcome::HeldOutOfWindow { .. }) => None,
                 // Refused for its merge geometry (ADR-3853 D0): this binary
                 // would refuse it again, so it is not retried while the memo
-                // holds it, and the memo never persists it.
-                Some(CompactionOutcome::GeometryUnsupported { .. }) => {
-                    Some(TerminalState::GeometryUnsupported)
-                }
+                // holds it, and the memo never persists it. A two-level merge's
+                // refusal is the same: the same build would refuse it again,
+                // after paying for level 1 when the refusal came after it.
+                Some(
+                    CompactionOutcome::GeometryUnsupported { .. }
+                    | CompactionOutcome::TwoLevelUnsupported { .. }
+                    | CompactionOutcome::ScratchHeadroom { .. },
+                ) => Some(TerminalState::GeometryUnsupported),
             }
         }
     }
@@ -2104,9 +2116,11 @@ pub async fn scan_and_maintain_with_memo(
                 Some(ClaimedCompaction::Ran(CompactionOutcome::HeldOutOfWindow { .. })) => {
                     report.held_out_of_window += 1
                 }
-                Some(ClaimedCompaction::Ran(CompactionOutcome::GeometryUnsupported { .. })) => {
-                    report.geometry_unsupported += 1
-                }
+                Some(ClaimedCompaction::Ran(
+                    CompactionOutcome::GeometryUnsupported { .. }
+                    | CompactionOutcome::TwoLevelUnsupported { .. }
+                    | CompactionOutcome::ScratchHeadroom { .. },
+                )) => report.geometry_unsupported += 1,
                 Some(ClaimedCompaction::Ran(CompactionOutcome::BelowMinInputs { count })) => {
                     report.already_done += 1;
                     report.l0_records_pending += count;
