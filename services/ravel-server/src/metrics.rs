@@ -11101,8 +11101,8 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            49,
-            "exactly 49 label variants every build has, 27 distinct keys (sql adds DdlKind, \
+            50,
+            "exactly 50 label variants every build has, 27 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
