@@ -211,21 +211,33 @@
 #                                       snapshot parts, the stamp naming the
 #                                       inspector commands; x0: a second count;
 #                                       x1: no snapshot HEAD, x2: a failed
-#                                       inspector and x3: no fold are stamped
-#                                       failures, no file; f: not applicable
+#                                       catalog list, x3: no fold, x4: a failed
+#                                       catalog inspect and x6: a non-JSON
+#                                       listing line are stamped failures, no
+#                                       file; x5: L1 lines are read; x7: no
+#                                       ravel-objects.json is null, not false;
+#                                       b, u1, u2b, u3: an earlier end is
+#                                       stamped not taken; f: not applicable
 #   y  Ravel-only cold pass         -> y: --profile history on a corpus with
 #                                       ids the real one lacks; the selection is
 #                                       exactly its long_range class plus
 #                                       mb_full_range_avg_over_time for the
 #                                       profile, five repetitions each, a
-#                                       restart per run, the regime
+#                                       restart before every cold query, the
+#                                       order validate, memory, cold pass,
+#                                       stop, the regime
 #                                       cold-ravel-diagnostic marked non-
 #                                       comparable, the five phases per record,
 #                                       report.json's timed rows unchanged and
 #                                       only the standard run writing it; y1:
 #                                       failing cold runs are recorded, exit 0;
 #                                       y2: a failed ingest runs none; y3: the
-#                                       real corpus's four history entries
+#                                       real corpus's four history entries; y4:
+#                                       a failed restart and y5: a failed
+#                                       readiness wait are recorded runs; y6: a
+#                                       missing record is a named failed run;
+#                                       y7: an unloadable corpus is a stamped
+#                                       failure; b: not taken
 #
 # Every JSON field is asserted by parsing it with python3 -I, not by grep.
 #
@@ -310,6 +322,7 @@ case "$1" in
       esac
       [ "${STUB_START_EXIT:-0}" -eq 0 ] || exit "${STUB_START_EXIT}"
       echo running >"${STUB_STATE}.ravel"
+      rm -f "${STUB_STATE}.notready"
       exit 0
     fi
     case "$sub" in
@@ -370,6 +383,13 @@ JSON
       start)
         [ "${STUB_START_EXIT:-0}" -eq 0 ] || exit "${STUB_START_EXIT}"
         ;;
+      # restart (the cold pass): exit STUB_RESTART_EXIT; with
+      # STUB_RESTART_NOT_READY, ravel's buildinfo answers 503 until the
+      # folded steps start the stopped container again.
+      restart)
+        [ "${STUB_RESTART_EXIT:-0}" -eq 0 ] || exit "${STUB_RESTART_EXIT}"
+        [ -z "${STUB_RESTART_NOT_READY:-}" ] || : >"${STUB_STATE}.notready"
+        ;;
       run)
         case " $* " in
           *" list-objects-v2 "*)
@@ -384,16 +404,20 @@ JSON
             fi
             ;;
           # ravel-cli catalog list --json and catalog inspect (the spans
-          # capture): STUB_LIST_DATA segments (default 300) cycling through
-          # spans of 0.5, 1.5, 3, 12 and 30 hours over two ingest hours, 100
-          # bytes each, after the store header line the CLI prints; exit
-          # STUB_SPANS_LIST_EXIT / STUB_SPANS_INSPECT_EXIT; STUB_INSPECT_HEAD_ABSENT
-          # prints the line the CLI prints for a tenant with no snapshot HEAD.
+          # capture): STUB_LIST_DATA segments (default 300), one JSON
+          # document per line, cycling through spans of 0.5, 1.5, 3, 12 and
+          # 30 hours over two ingest hours, 100 bytes each, the store header
+          # line on stderr as the CLI prints it under --json (on stdout with
+          # STUB_SPANS_HEADER_STDOUT); STUB_SPANS_L1 makes every third
+          # segment an L1 part; exit STUB_SPANS_LIST_EXIT /
+          # STUB_SPANS_INSPECT_EXIT; STUB_INSPECT_HEAD_ABSENT prints the line
+          # the CLI prints for a tenant with no snapshot HEAD.
           *" catalog list "*)
             printf 'docker-state catalog-list ravel-server=%s\n' "$(cat "${STUB_STATE}.ravel" 2>/dev/null || echo running)" >>"${STUB_LOG}"
             [ "${STUB_SPANS_LIST_EXIT:-0}" -eq 0 ] || exit "${STUB_SPANS_LIST_EXIT}"
-            echo 'store: s3'
-            python3 -I -c 'import json,sys; n=int(sys.argv[1]); H=3600*10**9; spans=[H//2,3*H//2,3*H,12*H,30*H]; print(json.dumps({"segment_count":n,"segments":[{"key":f"t/h1/m/l0/{i:06d}.rseg","level":"L0","shard":i%4,"ingest_hour_bucket":490000+i%2,"object_size":100,"min_event_ts_ns":10**18,"max_event_ts_ns":10**18+spans[i%5]} for i in range(n)]}))' "${STUB_LIST_DATA:-300}"
+            [ -z "${STUB_SPANS_OBJECTS_GONE:-}" ] || rm -f "${STUB_SPANS_OBJECTS_GONE}"
+            if [ -n "${STUB_SPANS_HEADER_STDOUT:-}" ]; then echo 'store: s3'; else echo 'store: s3' >&2; fi
+            python3 -I -c 'import json,sys; n=int(sys.argv[1]); l1=sys.argv[2]=="1"; H=3600*10**9; spans=[H//2,3*H//2,3*H,12*H,30*H]; print("\n".join(json.dumps({"key":f"t/h1/m/l0/{i:06d}.rseg","level":"L1" if l1 and i%3==0 else "L0","shard":i%4,"ingest_hour_bucket":490000+i%2,"object_size":100,"min_event_ts_ns":10**18,"max_event_ts_ns":10**18+spans[i%5]}) for i in range(n)))' "${STUB_LIST_DATA:-300}" "${STUB_SPANS_L1:-0}"
             ;;
           *" catalog inspect "*)
             [ "${STUB_SPANS_INSPECT_EXIT:-0}" -eq 0 ] || exit "${STUB_SPANS_INSPECT_EXIT}"
@@ -539,6 +563,9 @@ case "$url" in
     printf '{"status":"error","errorType":"execution","error":"query processing would load too many samples into memory in query execution"}' >"$out"
     printf 422
     ;;
+  *:4318/api/v1/status/buildinfo)
+    if [ -e "${STUB_STATE}.notready" ]; then printf 503; else printf 200; fi
+    ;;
   *) printf 200 ;;
 esac
 STUB
@@ -668,6 +695,18 @@ for ((i = 0; i < ${#args[@]}; i++)); do
   esac
 done
 case "$out" in */cold-ravel-diagnostic/*) [ "${STUB_COLD_QUERY_EXIT:-0}" -eq 0 ] || exit "${STUB_COLD_QUERY_EXIT}" ;; esac
+# STUB_COLD_DROP_RECORD=ID.R: the cold run of entry ID, repetition R, blocks
+# the runs file's temporary path so the record after it cannot be written;
+# the next cold run clears it, so exactly that one record goes missing.
+case "$out" in
+  */cold-ravel-diagnostic/*)
+    if [ -n "${STUB_COLD_DROP_RECORD:-}" ] && [ "${out##*/}" = "${STUB_COLD_DROP_RECORD}.report.json" ]; then
+      mkdir -p "${out%/*}/runs.json.tmp"
+    else
+      rmdir "${out%/*}/runs.json.tmp" 2>/dev/null
+    fi
+    ;;
+esac
 python3 -I - "$corpus" "$diag" "$out" "$verdict" <<'PY'
 import json, sys
 corpus, diag, out, verdict = sys.argv[1:]
@@ -682,6 +721,12 @@ if out:
         report["run_verdict"] = "failed"
     json.dump(report, open(out, "w"))
 PY
+# STUB_CORPUS_CLOBBER: the standard run leaves its corpus file unreadable for
+# the cold pass after it.
+case "$out" in
+  */cold-ravel-diagnostic/*) ;;
+  *) [ -z "${STUB_CORPUS_CLOBBER:-}" ] || printf 'not json\n' >"$corpus" ;;
+esac
 exit 0
 STUB
 
@@ -1825,7 +1870,7 @@ else
   fail "x: the entries are not read after the fold"
 fi
 expect_log "x: the entries listing asks for JSON" "catalog list --tenant metricsbench --shards 4 --hours"
-check "x: a ci run selects no cold entry, stamped" 'j("stamps.json")["cold_ravel_diagnostic"].startswith("not applicable: no corpus entry of class long_range")'
+check "x: a ci run selects no cold entry, stamped with the corpus path" 'j("stamps.json")["cold_ravel_diagnostic"] == "not applicable: no entry of class long_range or mb_full_range_avg_over_time in the corpus " + j("stamps.json")["corpus"] + " is declared for profile ci" and j("stamps.json")["corpus"].endswith("benchmarks/metrics/metrics.corpus.json")'
 expect_no_file x cold-ravel-diagnostic.json
 expect_no_log "x: a ci run restarts nothing for a cold pass" " restart ravel-server"
 
@@ -1850,6 +1895,29 @@ mapfile -t args < <(full_args "${TMP}/x3/out")
 STUB_INGEST_ROW_FAILURE=ravel run_case x3 "${args[@]}"
 expect_no_file x3 ravel-object-spans.json
 check "x3: no fold ran, so the capture is stamped failed with the reason" 'j("stamps.json")["object_spans"].startswith("failed: no fold ran: ")'
+
+mapfile -t args < <(full_args "${TMP}/x4/out")
+STUB_SPANS_INSPECT_EXIT=2 run_case x4 "${args[@]}"
+expect_rc x4 0
+expect_no_file x4 ravel-object-spans.json
+check "x4: a failed catalog inspect is stamped with its command, the run passes" 'j("stamps.json")["object_spans"] == "failed: ravel-cli catalog inspect --tenant metricsbench --signal metrics exited 2" and j("stamps.json")["status"] == "passed"'
+
+mapfile -t args < <(full_args "${TMP}/x5/out")
+STUB_SPANS_L1=1 run_case x5 "${args[@]}"
+expect_rc x5 0
+if [ "$(grep -c '"level": "L1"' "${OUT}/ravel-object-spans.list.txt")" -eq 100 ]; then pass "x5: the listing carries 100 L1 lines"; else fail "x5: the listing does not carry 100 L1 lines"; fi
+check "x5: L1 records are read, the capture succeeds over all 300" 'j("stamps.json")["object_spans"]["status"] == "ok" and j("ravel-object-spans.json")["object_count"] == 300 and sum(b["objects"] for b in j("ravel-object-spans.json")["histogram"]) == 300'
+
+mapfile -t args < <(full_args "${TMP}/x6/out")
+STUB_SPANS_HEADER_STDOUT=1 run_case x6 "${args[@]}"
+expect_rc x6 0
+expect_no_file x6 ravel-object-spans.json
+check "x6: a non-JSON line on the listing stdout is a stamped failure" 'j("stamps.json")["object_spans"] == "failed: line 1 of the catalog listing is not a JSON document" and j("stamps.json")["status"] == "passed"'
+
+mapfile -t args < <(full_args "${TMP}/x7/out")
+STUB_SPANS_OBJECTS_GONE="${TMP}/x7/out/ravel-objects.json" run_case x7 "${args[@]}"
+expect_rc x7 0
+check "x7: no ravel-objects.json to compare against is null, not false" 'j("ravel-object-spans.json")["ravel_objects_data_count"] is None and j("ravel-object-spans.json")["matches_ravel_objects"] is None and j("stamps.json")["object_spans"]["matches_ravel_objects"] is None'
 
 OUT="${TMP}/f/out"
 check "f: the diagnostic mode stamps both captures not applicable" 'j("stamps.json")["object_spans"] == "not applicable: diagnostic run starts no Ravel" and j("stamps.json")["cold_ravel_diagnostic"] == "not applicable: diagnostic run starts no Ravel"'
@@ -1913,14 +1981,34 @@ lines = open(sys.argv[1]).read().splitlines()
 validate = next(i for i, l in enumerate(lines) if l.startswith("metricsbench_report validate "))
 restart = next(i for i, l in enumerate(lines) if l.endswith(" restart ravel-server"))
 stop = next(i for i, l in enumerate(lines) if l.endswith(" stop ravel-server"))
-sys.exit(0 if validate < restart < stop else 1)
+# The memory step's docker inspect of the stack's containers, after validate.
+memory = [i for i, l in enumerate(lines) if l.startswith("docker inspect id-") and i > validate]
+# The sampler's last docker stats, which memory_summary takes as it stops it.
+stats = [i for i, l in enumerate(lines) if l.startswith("docker stats ")]
+sys.exit(0 if memory and validate < memory[0] < restart < stop and stats and stats[-1] < restart else 1)
 PY
-  pass "y: the pass runs after the standard query step and validate, before the fold's stop"
+  pass "y: validate, memory (sampler stopped, containers inspected), then the cold pass, then the fold's stop"
 else
-  fail "y: the pass is not between validate and stop"
+  fail "y: the step order is not validate, memory, cold pass, stop"
+fi
+if python3 -I - "${LOG}" "${OUT}" <<'PY'; then
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+cold = "--out " + sys.argv[2] + "/cold-ravel-diagnostic/"
+seq = [("restart" if l.endswith(" restart ravel-server") else "query")
+       for l in lines
+       if l.endswith(" restart ravel-server") or (l.startswith("metricsbench_query --ingest-report") and cold in l)]
+sys.exit(0 if seq == ["restart", "query"] * 15 else 1)
+PY
+  pass "y: every cold query is preceded by its own restart"
+else
+  fail "y: the restarts and cold queries do not alternate restart, query, 15 times"
 fi
 expect_log "y: the cold provenance is built over the single-entry corpus" "--corpus ${OUT}/cold-ravel-diagnostic/corpus-zz_long_any.json"
 check "y: the standard steps are unchanged" 'j("stamps.json")["steps_completed"] == ["fetch-s3s-fs","up","qualify","image","ready","sampler","ingest","mimir-readiness","objects","capture","provenance","fold-state","query","validate","memory","stop","fold","start","readback-folded"]'
+
+check "y: the corpus path used is stamped, and named in the file and the stamp" 'j("stamps.json")["corpus"] == "'"${TMP}"'/corpus.json" == j("cold-ravel-diagnostic.json")["corpus"] == j("stamps.json")["cold_ravel_diagnostic"]["corpus"] and j("stamps.json")["cold_ravel_diagnostic"]["missing_runs"] == []'
+check "y: the note says each repetition also queries the Prometheus oracle" '"Prometheus oracle" in j("cold-ravel-diagnostic.json")["note"]'
 
 METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_COLD_QUERY_EXIT=1 run_cold y1
 expect_rc y1 0
@@ -1937,6 +2025,36 @@ expect_rc y3 0
 check "y3: the real corpus selects the four history entries it declares, in corpus order" 'j("cold-ravel-diagnostic.json")["entries"] == ["mb_full_range_avg_over_time","mb_long_range_7d_avg","mb_long_range_subquery_max","mb_long_range_predict_linear"]'
 OUT="${TMP}/y3/out"
 check "y3: the selection matches a fresh read of the real corpus file" 'j("cold-ravel-diagnostic.json")["entries"] == [e["id"] for e in json.load(open("'"${HERE}"'/../../../benchmarks/metrics/metrics.corpus.json"))["entries"] if (e["class"] == "long_range" or e["id"] == "mb_full_range_avg_over_time") and "history" in e.get("profiles", ["history"])]'
+
+METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_RESTART_EXIT=1 run_cold y4
+expect_rc y4 0
+check "y4: every failed restart is a recorded run, stamped, the run passes" 'j("stamps.json")["status"] == "passed" and j("stamps.json")["cold_ravel_diagnostic"]["failed_runs"] == 15 and all(r["status"] == "failed: docker compose restart ravel-server failed" for r in j("cold-ravel-diagnostic.json")["runs"])'
+expect_no_log "y4: no cold query after a failed restart" "--out ${OUT}/cold-ravel-diagnostic/"
+
+METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_RESTART_NOT_READY=1 run_cold y5
+expect_rc y5 0
+check "y5: a failed readiness wait is a recorded run, stamped, the run passes" 'j("stamps.json")["status"] == "passed" and j("stamps.json")["cold_ravel_diagnostic"]["failed_runs"] == 15 and all(r["status"] == "failed: ravel did not answer 200 after the restart" for r in j("cold-ravel-diagnostic.json")["runs"]) and "readback-folded" in j("stamps.json")["steps_completed"]'
+expect_no_log "y5: no cold query after a failed readiness wait" "--out ${OUT}/cold-ravel-diagnostic/"
+
+METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_COLD_DROP_RECORD=zz_long_any.3 run_cold y6
+expect_rc y6 0
+expect_err "y6: the lost record is reported" "could not record zz_long_any repetition 3"
+check "y6: a missing record is a failed run naming its entry and repetition, the count still 3 x 5" 'len(j("cold-ravel-diagnostic.json")["runs"]) == 15 and [(r["entry"], r["repetition"]) for r in j("cold-ravel-diagnostic.json")["runs"] if r["ravel_cost"] is None] == [("zz_long_any", 3)] and [r["status"] for r in j("cold-ravel-diagnostic.json")["runs"] if r["ravel_cost"] is None] == ["failed: no record was written for this run"] and j("stamps.json")["cold_ravel_diagnostic"]["failed_runs"] == 1 and j("stamps.json")["cold_ravel_diagnostic"]["missing_runs"] == [{"entry": "zz_long_any", "repetition": 3}] and j("stamps.json")["status"] == "passed"'
+
+cp "${TMP}/corpus.json" "${TMP}/corpus-y7.json"
+METRICSBENCH_CORPUS="${TMP}/corpus-y7.json" STUB_CORPUS_CLOBBER=1 run_cold y7
+expect_rc y7 0
+expect_no_file y7 cold-ravel-diagnostic.json
+check "y7: a corpus that cannot be loaded is a stamped failure, not not applicable" 'j("stamps.json")["cold_ravel_diagnostic"] == "failed: the corpus '"${TMP}"'/corpus-y7.json could not be loaded (JSONDecodeError)" and j("stamps.json")["status"] == "passed"'
+expect_no_log "y7: nothing restarted for it" " restart ravel-server"
+
+# The captures a run ends before are stamped not taken, never null.
+OUT="${TMP}/b/out"
+check "b: an ingest failure leaves both captures stamped not taken" 'j("stamps.json")["object_spans"] == "not taken: the run ended before the object spans step" and j("stamps.json")["cold_ravel_diagnostic"] == "not taken: the run ended before the cold pass"'
+for c in u1 u2b u3; do
+  OUT="${TMP}/${c}/out"
+  check "${c}: a failed folded step leaves object_spans stamped not taken" 'j("stamps.json")["object_spans"] == "not taken: the run ended before the object spans step" and j("stamps.json")["cold_ravel_diagnostic"].startswith("not applicable: no entry of class long_range")'
+done
 
 echo
 echo "${passes} passed, ${fails} failed"

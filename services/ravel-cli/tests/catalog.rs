@@ -534,3 +534,25 @@ async fn inspect_prints_absent_marker_for_unset_column_stats_ref() {
         "per-part field 7 must print an explicit ABSENT marker: {out}"
     );
 }
+
+/// `catalog list --json` keeps stdout to JSON lines: the `store:` header goes
+/// to stderr, so a reader parsing every stdout line never meets it. A
+/// subprocess gets its own empty `MemoryStore`, so the listing has no line.
+#[test]
+fn catalog_list_json_prints_the_store_header_on_stderr() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ravel-cli"))
+        .args([
+            "--store", "memory", "catalog", "list", "--tenant", "t", "--json",
+        ])
+        .output()
+        .expect("run ravel-cli");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("store: memory"), "stderr: {stderr}");
+    assert!(!stdout.contains("store:"), "stdout: {stdout}");
+    for line in stdout.lines() {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|e| panic!("stdout line is not JSON ({e}): {line}"));
+    }
+}

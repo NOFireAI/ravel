@@ -199,7 +199,9 @@
 # bound per engine is tries x (interval + 5) s),
 # METRICSBENCH_IMDS (default http://169.254.169.254),
 # METRICSBENCH_S3S_FS_CACHE (default ${XDG_CACHE_HOME:-~/.cache}/ravel-metricsbench,
-# where fetch-s3s-fs keeps the verified binary between runs).
+# where fetch-s3s-fs keeps the verified binary between runs),
+# METRICSBENCH_CORPUS (default benchmarks/metrics/metrics.corpus.json; the
+# path used is stamped as corpus).
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -776,19 +778,33 @@ elif op == "falsification":
         doc["result_series_count"] = len(result)
     dump(out_path, doc)
 elif op == "object-spans":
-    # `catalog list --json` output (its store header line first), `catalog
-    # inspect` text, ravel-objects.json, the output path, the tenant, then
-    # the two commands as run. Exit 0 and the stamp as JSON on stdout, or 4
-    # and why not on stdout, writing nothing.
+    # `catalog list --json` stdout (one JSON document per line and per
+    # segment; the store header goes to stderr), `catalog inspect` text,
+    # ravel-objects.json, the output path, the tenant, then the two commands
+    # as run. Exit 0 and the stamp as JSON on stdout, or 4 and why not on
+    # stdout, writing nothing. SPANS_SEGMENT_FIELDS is the key list ravel-cli's
+    # catalog_list_json_line test pins.
+    SPANS_SEGMENT_FIELDS = ("level", "object_size", "ingest_hour_bucket", "min_event_ts_ns", "max_event_ts_ns")
     list_path, inspect_path, objects_path, out_path, tenant, list_cmd, inspect_cmd = args
     try:
         with open(list_path) as f:
-            lines = [l for l in f.read().splitlines() if l.strip().startswith("{")]
-        listing = json.loads(lines[-1])
-        segments = listing["segments"]
-        assert isinstance(segments, list) and listing["segment_count"] == len(segments)
-    except (OSError, ValueError, KeyError, IndexError, AssertionError, TypeError) as e:
-        print(f"the catalog listing is not the --json document ({type(e).__name__})")
+            lines = [l for l in f.read().splitlines() if l.strip()]
+    except OSError as e:
+        print(f"the catalog listing could not be read ({type(e).__name__})")
+        sys.exit(4)
+    segments = []
+    for n, l in enumerate(lines, 1):
+        try:
+            seg = json.loads(l)
+        except ValueError:
+            print(f"line {n} of the catalog listing is not a JSON document")
+            sys.exit(4)
+        if not isinstance(seg, dict) or any(k not in seg for k in SPANS_SEGMENT_FIELDS):
+            print(f"line {n} of the catalog listing lacks one of {', '.join(SPANS_SEGMENT_FIELDS)}")
+            sys.exit(4)
+        segments.append(seg)
+    if not segments:
+        print("the catalog listing printed no segment line")
         sys.exit(4)
     try:
         with open(inspect_path) as f:
@@ -836,24 +852,37 @@ elif op == "object-spans":
     except (OSError, ValueError, KeyError, TypeError):
         data_count = None
     doc["ravel_objects_data_count"] = data_count
-    doc["matches_ravel_objects"] = data_count == len(segments)
+    # null, not false, when there is no count to compare against.
+    doc["matches_ravel_objects"] = None if data_count is None else data_count == len(segments)
     dump(out_path, doc)
     print(json.dumps({"status": "ok", "file": "ravel-object-spans.json", "inspector": doc["inspector"],
                       "object_count": len(segments), "matches_ravel_objects": doc["matches_ravel_objects"]}))
 elif op == "cold-select":
     # The corpus, the profile, a directory: one single-entry corpus file per
     # selected entry (class long_range, plus the named full-range entry,
-    # declared for the profile), the ids one per line. Exit 3 when none.
+    # declared for the profile), the ids one per line. Exit 3 when none is
+    # selected; exit 4 and why on stdout when the corpus cannot be read or a
+    # file cannot be written.
     corpus_path, prof, dest, extra_id = args
-    corpus = load(corpus_path)
+    try:
+        corpus = load(corpus_path)
+        entries = corpus["entries"]
+        assert isinstance(entries, list)
+    except (OSError, ValueError, KeyError, TypeError, AssertionError) as e:
+        print(f"the corpus {corpus_path} could not be loaded ({type(e).__name__})")
+        sys.exit(4)
     ids = []
-    for e in corpus.get("entries", []):
-        if e.get("class") != "long_range" and e.get("id") != extra_id:
-            continue
-        if "profiles" in e and prof not in e["profiles"]:
-            continue
-        dump(os.path.join(dest, f"corpus-{e['id']}.json"), {**corpus, "entries": [e]})
-        ids.append(e["id"])
+    try:
+        for e in entries:
+            if e.get("class") != "long_range" and e.get("id") != extra_id:
+                continue
+            if "profiles" in e and prof not in e["profiles"]:
+                continue
+            dump(os.path.join(dest, f"corpus-{e['id']}.json"), {**corpus, "entries": [e]})
+            ids.append(e["id"])
+    except (OSError, KeyError, TypeError, AttributeError) as e:
+        print(f"the single-entry corpus files could not be written from {corpus_path} ({type(e).__name__})")
+        sys.exit(4)
     if not ids:
         sys.exit(3)
     print("\n".join(ids))
@@ -885,16 +914,38 @@ elif op == "cold-record":
     runs.append(rec)
     dump(runs_path, runs)
 elif op == "cold-final":
-    runs_path, out_path, prof, regime, reps, *ids = args
-    runs = load(runs_path) if os.path.exists(runs_path) else []
+    # Every (entry, repetition) has exactly one record: a run whose
+    # cold-record never landed gets a failed one here, naming it. Exit 4 and
+    # why on stdout for a duplicate or unexpected record, writing nothing.
+    runs_path, out_path, prof, regime, reps, corpus_path, *ids = args
+    reps = int(reps)
+    try:
+        recorded = load(runs_path) if os.path.exists(runs_path) else []
+        assert isinstance(recorded, list)
+    except (OSError, ValueError, AssertionError):
+        recorded = []
+    want = [(i, r) for i in ids for r in range(1, reps + 1)]
+    by_run = {}
+    for rec in recorded:
+        k = (rec.get("entry"), rec.get("repetition")) if isinstance(rec, dict) else None
+        if k not in want or k in by_run:
+            print(f"runs.json holds a duplicate or unexpected record: {rec!r}")
+            sys.exit(4)
+        by_run[k] = rec
+    missing = [{"entry": i, "repetition": r} for i, r in want if (i, r) not in by_run]
+    runs = [by_run.get((i, r)) or {"entry": i, "repetition": r, "status": "failed: no record was written for this run",
+                                   "latency_ms": None, "ravel_cost": None} for i, r in want]
+    if len(runs) != len(ids) * reps:
+        print(f"{len(runs)} run records, want {len(ids)} entries x {reps} repetitions")
+        sys.exit(4)
     doc = {"regime": regime, "comparable": False,
-           "note": "diagnostic, not comparable: Ravel only, one restart per repetition, never in report.json's timed denominators; the cross-engine cold and warm procedure is issue #3794 (M9)",
-           "profile": prof, "repetitions_per_entry": int(reps), "entries": ids, "runs": runs}
+           "note": "diagnostic, not comparable: Ravel only, one restart per repetition, never in report.json's timed denominators; each repetition also queries the Prometheus oracle that metricsbench_query requires, and only Ravel's cost is recorded here; the cross-engine cold and warm procedure is issue #3794 (M9)",
+           "profile": prof, "corpus": corpus_path, "repetitions_per_entry": reps, "entries": ids, "runs": runs}
     dump(out_path, doc)
     bad = [r for r in runs if r["ravel_cost"] is None]
     print(json.dumps({"regime": regime, "comparable": False, "file": "cold-ravel-diagnostic.json",
-                      "entries": ids, "repetitions_per_entry": int(reps), "runs": len(runs),
-                      "failed_runs": len(bad)}))
+                      "corpus": corpus_path, "entries": ids, "repetitions_per_entry": reps, "runs": len(runs),
+                      "failed_runs": len(bad), "missing_runs": missing}))
 else:
     print(f"unknown op {op}", file=sys.stderr)
     sys.exit(2)
@@ -1216,6 +1267,7 @@ stamp_str schema "metricsbench-run-stamps/1"
 stamp_str status running
 stamp_set diagnostic "$([ "$diagnostic" -eq 1 ] && echo true || echo false)"
 stamp_str profile "$profile"
+stamp_str corpus "$CORPUS"
 stamp_set anchor_ms "$anchor_ms"
 stamp_str anchor_source "$anchor_source"
 stamp_str started_at "$(utc_now)"
@@ -1800,7 +1852,7 @@ COLD_REPS=5
 # id comes from the corpus.
 COLD_EXTRA_ENTRY="mb_full_range_avg_over_time"
 
-# cold_ravel_diagnostic: after the standard query step, the corpus entries of
+# cold_ravel_diagnostic: after the memory step, the corpus entries of
 # class long_range plus COLD_EXTRA_ENTRY declared for the profile, each run
 # COLD_REPS times through metricsbench_query, ravel-server restarted before
 # every run. Reports go under <out>/cold-ravel-diagnostic/, never to
@@ -1813,9 +1865,13 @@ cold_ravel_diagnostic() {
   mkdir -p "$dir" || { stamp_str cold_ravel_diagnostic "failed: cannot create $dir"; return 0; }
   code=0
   ids="$(py cold-select "$CORPUS" "$profile" "$dir" "$COLD_EXTRA_ENTRY")" || code=$?
-  if [ "$code" -ne 0 ]; then
-    stamp_str cold_ravel_diagnostic "not applicable: no corpus entry of class long_range or ${COLD_EXTRA_ENTRY} is declared for profile ${profile}"
+  if [ "$code" -eq 3 ]; then
+    stamp_str cold_ravel_diagnostic "not applicable: no entry of class long_range or ${COLD_EXTRA_ENTRY} in the corpus ${CORPUS} is declared for profile ${profile}"
     say "cold ravel diagnostic: no entry selected for profile ${profile}"
+    return 0
+  elif [ "$code" -ne 0 ]; then
+    stamp_str cold_ravel_diagnostic "failed: ${ids:-cold-select exited ${code} on the corpus ${CORPUS}}"
+    say "cold ravel diagnostic: ${ids:-cold-select exited ${code}}"
     return 0
   fi
   for id in $ids; do
@@ -1853,10 +1909,12 @@ cold_ravel_diagnostic() {
   done
   code=0
   # shellcheck disable=SC2086
-  line="$(py cold-final "$runs" "${out_dir}/cold-ravel-diagnostic.json" "$profile" "$COLD_REGIME" "$COLD_REPS" $ids)" ||
-    code=$?
+  line="$(py cold-final "$runs" "${out_dir}/cold-ravel-diagnostic.json" "$profile" "$COLD_REGIME" "$COLD_REPS" \
+    "$CORPUS" $ids)" || code=$?
   if [ "$code" -ne 0 ]; then
-    stamp_str cold_ravel_diagnostic "failed: cold-ravel-diagnostic.json could not be written"
+    rm -f "${out_dir}/cold-ravel-diagnostic.json"
+    stamp_str cold_ravel_diagnostic "failed: cold-ravel-diagnostic.json not written: ${line:-cold-final exited ${code}}"
+    say "cold ravel diagnostic: ${line:-cold-final exited ${code}}"
     return 0
   fi
   stamp_set cold_ravel_diagnostic "$line"
@@ -1927,6 +1985,10 @@ run_diagnostic() {
 
 run_full() {
   local code=0 resolved line fold
+  # Replaced when each capture runs, so a run that ends before one carries
+  # why it is missing, never null.
+  stamp_str object_spans "not taken: the run ended before the object spans step"
+  stamp_str cold_ravel_diagnostic "not taken: the run ended before the cold pass"
   if [ "$real_s3" -eq 1 ]; then
     stamp_set object_store "$(python3 -I -c 'import json,sys; print(json.dumps({"implementation":"s3","region":sys.argv[1],"credentials":"instance-role","buckets":[sys.argv[2]+"-"+b for b in ("ravel","mimir-blocks","mimir-ruler","mimir-alertmanager")]}))' \
       "$real_s3_region" "$real_s3_prefix")"
@@ -2110,13 +2172,14 @@ run_full() {
   fi
   step_done validate
 
+  # The memory verdict is written before the cold pass restarts anything, so
+  # its restarts and queries never enter the rss bands or final_bytes.
+  memory_step --defer
   if [ "$INGEST_FAILED" -eq 1 ]; then
     stamp_str cold_ravel_diagnostic "not applicable: the ingest verification failed, so the run is a diagnostic already"
   else
     cold_ravel_diagnostic
   fi
-
-  memory_step --defer
   folded_readback
   end_deferred_memory
   [ "$INGEST_FAILED" -eq 0 ] || fail_after_ingest
