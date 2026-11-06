@@ -1071,8 +1071,24 @@ fn increase_rejects_corrections_summed_once() {
         Stale::Drop,
         Combine::CorrectionsOnce,
     );
-    // Before extrapolation: (7.7 - 30.0) + 30.0 + 9.1 is 0x4030cccccccccccc,
-    // (7.7 - 30.0) + (30.0 + 9.1) is 0x4030cccccccccccd.
+    // Before extrapolation: the evaluator adds 30.0 then 9.1 to last minus
+    // first; the mutant adds their sum once.
+    let hours: Vec<FloatHour> = float_segments(
+        &fixture("reset_at_window_start").samples,
+        window("(0m,180m]"),
+        Stale::Drop,
+    )
+    .iter()
+    .map(|seg| FloatHour::of(seg))
+    .collect();
+    assert_eq!(
+        ((7.7_f64 - 30.0) + 30.0 + 9.1).to_bits(),
+        0x4030_cccc_cccc_cccc
+    );
+    assert_eq!(
+        corrections_once(&hours, true).to_bits(),
+        0x4030_cccc_cccc_cccd
+    );
     assert_eq!(expected, Some(0x4033_9999_9999_9999));
     assert_eq!(wrong, Some(0x4033_9999_9999_999a));
 }

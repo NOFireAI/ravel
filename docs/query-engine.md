@@ -4514,10 +4514,17 @@ each window `(eval - range, eval]` into hour segments `(kH, (k+1)H]`, which
 are left-open like the matrix window itself. It computes the row's statistic
 for each segment inside the test, combines the segments, and compares the
 result with `Evaluator::instant` over the same window by `f64::to_bits`. No
-library code computes a statistic. Staleness markers are dropped before
+library code computes a float statistic. The histogram rows' per-hour
+correction (`HistHour::of` in the test) uses the library's
+`FloatHistogram::detect_reset` and `FloatHistogram::add_assign`, so a defect
+in either would affect both sides equally. Staleness markers are dropped before
 segmenting, as the matrix selection drops them by the `STALE_NAN_BITS` bit
 pattern (in `Evaluator::eval_matrix_selector` for instant queries and in
-`Evaluator::eval_range_matrix_reduction` for range queries). Five of the eight windows are not aligned to hours:
+`Evaluator::eval_range_matrix_reduction` for range queries). The order of
+that drop relative to the cross-segment dedup (ADR-0103's amendment requires
+the marker to be filtered after `merge_soa_runs` picks the winner at a
+timestamp) is not exercised: no fixture in the test file has two samples at
+one timestamp. Five of the eight windows are not aligned to hours:
 `(34m,167m]`, `(25m,50m]`, `(35m,95m]`, `(85m,95m]` and `(70m,130m]`. Their
 partial edge hours are summarised from the window's raw samples with the
 same statistic, so an accelerated read of such a window still reads its edge
@@ -4531,6 +4538,8 @@ hours raw. The float fixtures are:
   the 120m boundary.
 - `rounding`: values whose sum depends on how it is associated.
 - `two_resets_one_hour`: two counter resets inside `(0m,60m]`.
+- `reset_at_window_start`: a reset across the 60m boundary as the first pair
+  of `(0m,180m]`, and a second reset inside `(60m,120m]`.
 
 The native-histogram fixtures are:
 
@@ -4539,6 +4548,14 @@ The native-histogram fixtures are:
   NaN sums with two payloads.
 - `hist_two_resets_one_hour` and `hist_two_resets_one_hour_offset`: two
   bucket resets inside `(0m,60m]`.
+
+All three use exponential schemas, and the histogram rows are classified for
+exponential schemas only. `histogram_rate` (`histogram.rs`) returns no value
+for a window that mixes custom-bucket and exponential schemas or holds custom
+bounds that differ, and the test's combination checks neither. A window
+holding a custom-bucket histogram beside exponential ones is RAW ONLY for
+these rows: the evaluator returns no value there, and the combination is not
+compared (`histogram_rows_raw_only_with_custom_buckets_beside_exponential`).
 
 Each verdict means one thing:
 
@@ -4566,9 +4583,9 @@ Each verdict means one thing:
 | `delta` | EXACT | first and last sample with timestamps, and the sample count; the combination ports `extrapolated_rate` (`functions/rate.rs`) | none | `delta_exact_from_hour_endpoints` |
 | `increase` | EXACT UNDER CONDITION | first and last sample with timestamps, the sample count, and the earlier value of each in-hour reset pair summed in time order; boundary resets and hour sums are added in time order, then extrapolated as `extrapolated_rate` does | at most one counter reset inside each hour segment (a reset across an hour boundary counts toward neither hour); fails on `two_resets_one_hour` over `(0m,120m]`, evaluator `0x402401dca01dca00`, combined `0x402401dca01dca01` | `increase_exact_with_one_reset_per_hour`, `increase_condition_fails_on_two_resets_in_one_hour` |
 | `rate` | EXACT UNDER CONDITION | as `increase` | as `increase`; fails on `two_resets_one_hour` over `(0m,120m]`, evaluator `0x3f56c38a61fb357a`, combined `0x3f56c38a61fb357b` | `rate_exact_with_one_reset_per_hour`, `rate_condition_fails_on_two_resets_in_one_hour` |
-| `histogram_count(increase(h[w]))` | EXACT UNDER CONDITION | first and last histogram with timestamps, the sample count, the hour's minimum scale, and the earlier histogram of each in-hour reset pair (`FloatHistogram::detect_reset`) summed in time order; the combination ports `histogram_rate` (`histogram.rs`) and its extrapolation with the library's `copy_to_scale`, `sub_assign`, `add_assign` and `mul` | at most one histogram reset inside each hour segment; fails on `hist_two_resets_one_hour` over `(0m,120m]`, evaluator `0x403401dca01dca00`, combined `0x403401dca01dca01` | `histogram_count_exact_with_one_reset_per_hour`, `histogram_rows_condition_fails_on_two_resets_in_one_hour` |
-| `histogram_sum(rate(h[w]))` | EXACT UNDER CONDITION | as `histogram_count` | as `histogram_count`; fails on both two-reset fixtures over `(0m,120m]`, evaluator `0x3f56c38a61fb357b`, combined `0x3f56c38a61fb357c` | `histogram_sum_exact_with_one_reset_per_hour`, `histogram_rows_condition_fails_on_two_resets_in_one_hour` |
-| `histogram_quantile(0.9, rate(h[w]))` | EXACT UNDER CONDITION | as `histogram_count`, then `histogram::histogram_quantile` | as `histogram_count`; fails on `hist_two_resets_one_hour_offset` over `(0m,120m]`, evaluator `0x400feaf9372573ad`, combined `0x400feaf9372573ab` | `histogram_quantile_exact_with_one_reset_per_hour`, `histogram_rows_condition_fails_on_two_resets_in_one_hour` |
+| `histogram_count(increase(h[w]))` | EXACT UNDER CONDITION | first and last histogram with timestamps, the sample count, the hour's minimum scale, and the earlier histogram of each in-hour reset pair (`FloatHistogram::detect_reset`) summed in time order; the combination ports `histogram_rate` (`histogram.rs`) and its extrapolation with the library's `copy_to_scale`, `sub_assign`, `add_assign` and `mul` | exponential schemas only; custom-bucket histograms are not classified. At most one histogram reset inside each hour segment; fails on `hist_two_resets_one_hour` over `(0m,120m]`, evaluator `0x403401dca01dca00`, combined `0x403401dca01dca01` | `histogram_count_exact_with_one_reset_per_hour`, `histogram_rows_condition_fails_on_two_resets_in_one_hour`, `histogram_rows_raw_only_with_custom_buckets_beside_exponential` |
+| `histogram_sum(rate(h[w]))` | EXACT UNDER CONDITION | as `histogram_count` | exponential schemas only; custom-bucket histograms are not classified. Otherwise as `histogram_count`; fails on both two-reset fixtures over `(0m,120m]`, evaluator `0x3f56c38a61fb357b`, combined `0x3f56c38a61fb357c` | `histogram_sum_exact_with_one_reset_per_hour`, `histogram_rows_condition_fails_on_two_resets_in_one_hour`, `histogram_rows_raw_only_with_custom_buckets_beside_exponential` |
+| `histogram_quantile(0.9, rate(h[w]))` | EXACT UNDER CONDITION | as `histogram_count`, then `histogram::histogram_quantile` | exponential schemas only; custom-bucket histograms are not classified. Otherwise as `histogram_count`; fails on `hist_two_resets_one_hour_offset` over `(0m,120m]`, evaluator `0x400feaf9372573ad`, combined `0x400feaf9372573ab` | `histogram_quantile_exact_with_one_reset_per_hour`, `histogram_rows_condition_fails_on_two_resets_in_one_hour`, `histogram_rows_raw_only_with_custom_buckets_beside_exponential` |
 | `sum_over_time` | RAW ONLY | per-hour compensated sum (`kahan_sum_inc`), combined by the same compensated sum over the hours | differs on `rounding` over `(0m,180m]`, evaluator `0x405c5147ae147ae2`, combined `0x405c5147ae147ae1` | `sum_over_time_raw_only_compensated_hour_sums_differ` |
 | `avg_over_time` | RAW ONLY | per-hour incremental mean times the hour count, compensated sum over the hours, divided by the total count | differs on `rounding` over `(0m,180m]`, evaluator `0x4022e0da740da742`, combined `0x4022e0da740da741` | `avg_over_time_raw_only_weighted_hour_means_differ` |
 | `stdvar_over_time` | RAW ONLY | per-hour compensated Welford `(count, mean, M2)`, merged by Chan's pairwise formula | differs on `rounding` over `(0m,180m]`, evaluator `0x4087624c8ae66094`, combined `0x4087624c8ae66095` | `stdvar_over_time_raw_only_merged_hour_moments_differ` |
@@ -4584,12 +4601,22 @@ that each one disagrees with the evaluator on a named fixture and window:
   `hour_segments`): every EXACT row has a test named
   `<function>_rejects_counted_staleness_marker`, and `rate`/`increase` share
   `rate_rejects_counted_staleness_marker`. Native histograms carry no
-  staleness marker (the doc comment on `pick_histogram` in `eval.rs`), so (b) does not apply to the
-  histogram rows.
-- (a), reassociating a floating-point sum across hours: `delta`, `rate` and
-  `increase` are tested against the telescoped sum of per-hour deltas and
-  boundary gaps (`delta_rejects_telescoped_hour_sum`,
+  staleness marker: `Evaluator::eval_histogram_matrix_selector` in `eval.rs`
+  filters the window by timestamp only, with no stale drop, so (b) does not
+  apply to the histogram rows.
+- (a), reassociating a floating-point sum across hours, in two forms. The
+  telescoped hour sum adds each hour's own delta and the gap from the
+  previous hour (`delta_rejects_telescoped_hour_sum`,
   `rate_rejects_telescoped_hour_sum`, `increase_rejects_telescoped_hour_sum`).
+  Corrections summed once adds every reset correction, boundary and in-hour,
+  into one total first, then adds that total once to last minus first
+  (`increase_rejects_corrections_summed_once`,
+  `rate_rejects_corrections_summed_once`). On `reset_at_window_start` over
+  `(0m,180m]` the increase before extrapolation is `0x4030cccccccccccc` in
+  time order and `0x4030cccccccccccd` summed once, and after it the evaluator
+  gives `0x4033999999999999` and the mutant `0x403399999999999a`. `delta` adds no reset correction, so for
+  `delta` the second form is the documented combination
+  (`delta_corrections_summed_once_is_the_documented_combination`).
   For `count_over_time`, summing the hour counts as `f64` agrees on every
   fixture, because the counts are small integers
   (`count_over_time_reassociated_f64_sum_is_harmless`). The other EXACT rows
@@ -4601,6 +4628,19 @@ that each one disagrees with the evaluator on a named fixture and window:
   `irate` and `idelta` read from the final hour only
   (`*_rejects_final_hour_only`). `last_over_time`, `present_over_time` and
   `absent_over_time` have no (a) test.
+  The three histogram rows are run against both forms
+  (`histogram_rows_reassociations_differ_only_through_the_nan_sum`), and
+  rounding rejects neither form on any of them. `hist` builds
+  `hist_schema_change`'s bucket counts as integers and its finite sums as
+  short binary fractions, so every grouping of the same additions gives the
+  same bits. The two-reset fixtures' counts are not integers, but both forms agree
+  with the evaluator on every window of theirs where the condition holds. The
+  telescoped form is rejected for `histogram_sum` only, and through a NaN, not
+  rounding: it reads the NaN sum of the 120m histogram, which the evaluator
+  never reads (`histogram_sum_rejects_telescoped_hour_sum`, on
+  `hist_schema_change` over `(34m,167m]`, evaluator `0x3f7624fe38ca86e2`,
+  telescoped `0x7ff8000000000001`). `histogram_count` and
+  `histogram_quantile` have no failing (a) test.
 
 The following range-vector functions and argument forms have no row:
 
