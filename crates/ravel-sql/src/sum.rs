@@ -51,12 +51,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, ArrowPrimitiveType, BooleanArray, Decimal128Array, Int64Array, ListArray,
-    PrimitiveArray, UInt64Array,
+    Array, ArrayRef, ArrowPrimitiveType, BooleanArray, Decimal128Array, ListArray, PrimitiveArray,
 };
+use datafusion::arrow::array::builder::BooleanBufferBuilder;
 use datafusion::arrow::buffer::{NullBuffer, ScalarBuffer};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Int64Type, UInt64Type};
+use datafusion::arrow::datatypes::{
+    ArrowNativeType, DataType, Field, FieldRef, Int64Type, UInt64Type,
+};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::functions_aggregate::sum::sum_udaf;
 use datafusion::logical_expr::expr::AggregateFunction;
@@ -81,9 +83,11 @@ pub fn checked_sum_udaf() -> AggregateUDF {
 /// built-in's.
 pub(crate) const EXACT_SUM_STATE_SUFFIX: &str = "[sum_exact]";
 
-/// Per-group bytes of [`CheckedSumGroupsAccumulator`]: an `i128` sum and a
-/// `bool` seen flag.
-pub(crate) const EXACT_SUM_GROUP_WIDTHS: [usize; 2] = [16, 1];
+/// Per-group `Vec` bytes of [`CheckedSumGroupsAccumulator`]: an `i64` or
+/// `u64` sum. Its validity bitmap (one bit per group) and the carry table of
+/// the groups whose sum left 64 bits are not `Vec`s of group width, as the
+/// built-in's bitmap is not.
+pub(crate) const EXACT_SUM_GROUP_WIDTHS: [usize; 1] = [8];
 
 #[derive(Debug)]
 struct CheckedSum {
@@ -346,7 +350,12 @@ impl AggregateUDFImpl for CheckedSum {
                     .to_string(),
             ))
         } else {
-            Ok(Box::new(CheckedSumGroupsAccumulator::new(kind)))
+            Ok(match kind {
+                SumKind::Signed => Box::new(CheckedSumGroupsAccumulator::<Int64Type>::new(kind)),
+                SumKind::Unsigned => {
+                    Box::new(CheckedSumGroupsAccumulator::<UInt64Type>::new(kind))
+                }
+            })
         }
     }
 
@@ -483,70 +492,190 @@ impl Accumulator for CheckedSumAccumulator {
     }
 }
 
-/// The flat per-group accumulator for an integer call. `sums[g]` is group
-/// `g`'s exact running sum and `seen[g]` whether any non-null value reached
-/// it; an unseen group evaluates to NULL.
-#[derive(Debug)]
-struct CheckedSumGroupsAccumulator {
-    kind: SumKind,
-    sums: Vec<i128>,
-    seen: Vec<bool>,
+/// The native type of a checked kind's narrow per-group sum: `i64` for
+/// [`SumKind::Signed`], `u64` for [`SumKind::Unsigned`].
+pub(crate) trait NarrowSum: ArrowNativeType + Into<i128> + TryFrom<i128> {
+    fn add_checked(self, value: Self) -> Option<Self>;
 }
 
-impl CheckedSumGroupsAccumulator {
-    fn new(kind: SumKind) -> Self {
+impl NarrowSum for i64 {
+    #[inline]
+    fn add_checked(self, value: Self) -> Option<Self> {
+        self.checked_add(value)
+    }
+}
+
+impl NarrowSum for u64 {
+    #[inline]
+    fn add_checked(self, value: Self) -> Option<Self> {
+        self.checked_add(value)
+    }
+}
+
+/// Exact per-group sums held in the input's own 64-bit type. A group's exact
+/// sum is `narrow[g]` plus its entry in `carries`, which only a group whose
+/// running sum left the narrow type has: the add that would overflow moves
+/// the narrow sum into the `i128` carry and restarts the narrow sum at the
+/// value. Every value is counted exactly once, so the total is the same
+/// `i128` sum as a wide accumulator's, in any arrival order.
+#[derive(Debug)]
+pub(crate) struct NarrowSums<N> {
+    kind: SumKind,
+    narrow: Vec<N>,
+    carries: HashMap<usize, i128>,
+}
+
+impl<N: NarrowSum> NarrowSums<N> {
+    pub(crate) fn new(kind: SumKind) -> Self {
         Self {
             kind,
-            sums: Vec::new(),
-            seen: Vec::new(),
+            narrow: Vec::new(),
+            carries: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn resize(&mut self, total_num_groups: usize) {
+        self.narrow.resize(total_num_groups, N::default());
+    }
+
+    #[inline]
+    pub(crate) fn add(&mut self, group: usize, value: N) -> DFResult<()> {
+        let sum = &mut self.narrow[group];
+        match sum.add_checked(value) {
+            Some(total) => {
+                *sum = total;
+                Ok(())
+            }
+            None => {
+                let spilled = std::mem::replace(sum, value);
+                self.carry(group, spilled.into())
+            }
+        }
+    }
+
+    /// Add `value`, a partial sum that may be outside the narrow type.
+    pub(crate) fn add_wide(&mut self, group: usize, value: i128) -> DFResult<()> {
+        match N::try_from(value) {
+            Ok(value) => self.add(group, value),
+            Err(_) => self.carry(group, value),
+        }
+    }
+
+    fn carry(&mut self, group: usize, value: i128) -> DFResult<()> {
+        let carry = self.carries.entry(group).or_insert(0);
+        *carry = self.kind.checked_add(*carry, value)?;
+        Ok(())
+    }
+
+    /// Remove the carries of the groups `emit_to` names, renumbering the
+    /// rest as `EmitTo::take_needed` renumbers the narrow sums.
+    fn take_carries(&mut self, emit_to: EmitTo) -> Vec<(usize, i128)> {
+        if self.carries.is_empty() {
+            return Vec::new();
+        }
+        let carries = std::mem::take(&mut self.carries);
+        match emit_to {
+            EmitTo::All => carries.into_iter().collect(),
+            EmitTo::First(n) => {
+                let mut taken = Vec::new();
+                for (group, carry) in carries {
+                    if group < n {
+                        taken.push((group, carry));
+                    } else {
+                        self.carries.insert(group - n, carry);
+                    }
+                }
+                taken
+            }
+        }
+    }
+
+    /// Take the groups `emit_to` names as result-type totals, or the overflow
+    /// error when one does not fit.
+    pub(crate) fn take_narrow(&mut self, emit_to: EmitTo) -> DFResult<Vec<N>> {
+        let kind = self.kind;
+        let mut sums = emit_to.take_needed(&mut self.narrow);
+        for (group, carry) in self.take_carries(emit_to) {
+            let total = kind.checked_add(carry, sums[group].into())?;
+            sums[group] = N::try_from(total).map_err(|_| kind.overflow())?;
+        }
+        Ok(sums)
+    }
+
+    /// Take the groups `emit_to` names as exact `i128` totals.
+    pub(crate) fn take_wide(&mut self, emit_to: EmitTo) -> DFResult<Vec<i128>> {
+        let kind = self.kind;
+        let mut sums: Vec<i128> = emit_to
+            .take_needed(&mut self.narrow)
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        for (group, carry) in self.take_carries(emit_to) {
+            sums[group] = kind.checked_add(carry, sums[group])?;
+        }
+        Ok(sums)
+    }
+
+    /// The narrow `Vec` by capacity, and the carry table by capacity with
+    /// hashbrown's one control byte per slot.
+    pub(crate) fn size(&self) -> usize {
+        self.narrow.capacity() * std::mem::size_of::<N>()
+            + self.carries.capacity() * (std::mem::size_of::<(usize, i128)>() + 1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn carried_groups(&self) -> usize {
+        self.carries.len()
+    }
+}
+
+/// The flat per-group accumulator for an integer call, over `T`, the call's
+/// coerced input type (`Int64` or `UInt64`). `sums` holds group `g`'s exact
+/// running sum and `seen` whether any non-null value reached it; an unseen
+/// group evaluates to NULL.
+#[derive(Debug)]
+struct CheckedSumGroupsAccumulator<T: ArrowPrimitiveType> {
+    sums: NarrowSums<T::Native>,
+    seen: BooleanBufferBuilder,
+}
+
+impl<T> CheckedSumGroupsAccumulator<T>
+where
+    T: ArrowPrimitiveType,
+    T::Native: NarrowSum,
+{
+    fn new(kind: SumKind) -> Self {
+        Self {
+            sums: NarrowSums::new(kind),
+            seen: BooleanBufferBuilder::new(0),
         }
     }
 
     fn resize(&mut self, total_num_groups: usize) {
-        self.sums.resize(total_num_groups, 0);
-        self.seen.resize(total_num_groups, false);
+        self.sums.resize(total_num_groups);
+        if total_num_groups > self.seen.len() {
+            self.seen.append_n(total_num_groups - self.seen.len(), false);
+        }
     }
 
-    fn update_primitive<T>(
-        &mut self,
-        values: &PrimitiveArray<T>,
-        group_indices: &[usize],
-        opt_filter: Option<&BooleanArray>,
-    ) -> DFResult<()>
-    where
-        T: ArrowPrimitiveType,
-        T::Native: Into<i128>,
-    {
-        let kind = self.kind;
-        if values.null_count() == 0 && opt_filter.is_none() {
-            for (&group_index, &value) in group_indices.iter().zip(values.values().iter()) {
-                let sum = &mut self.sums[group_index];
-                *sum = kind.checked_add(*sum, value.into())?;
-                self.seen[group_index] = true;
+    /// Take the validity of the groups `emit_to` names.
+    fn take_seen(&mut self, emit_to: EmitTo) -> NullBuffer {
+        let seen = self.seen.finish();
+        match emit_to {
+            EmitTo::All => NullBuffer::new(seen),
+            EmitTo::First(n) => {
+                self.seen.append_buffer(&seen.slice(n, seen.len() - n));
+                NullBuffer::new(seen.slice(0, n))
             }
-            return Ok(());
         }
-        for (row, &group_index) in group_indices.iter().enumerate() {
-            if row_is_filtered(opt_filter, row) || values.is_null(row) {
-                continue;
-            }
-            let sum = &mut self.sums[group_index];
-            *sum = kind.checked_add(*sum, values.value(row).into())?;
-            self.seen[group_index] = true;
-        }
-        Ok(())
-    }
-
-    /// Take the groups `emit_to` names, as their sums and a validity buffer
-    /// that is false for each unseen group.
-    fn take(&mut self, emit_to: EmitTo) -> (Vec<i128>, NullBuffer) {
-        let sums = emit_to.take_needed(&mut self.sums);
-        let seen = emit_to.take_needed(&mut self.seen);
-        (sums, NullBuffer::from(seen))
     }
 }
 
-impl GroupsAccumulator for CheckedSumGroupsAccumulator {
+impl<T> GroupsAccumulator for CheckedSumGroupsAccumulator<T>
+where
+    T: ArrowPrimitiveType + Send,
+    T::Native: NarrowSum,
+{
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
@@ -555,16 +684,22 @@ impl GroupsAccumulator for CheckedSumGroupsAccumulator {
         total_num_groups: usize,
     ) -> DFResult<()> {
         self.resize(total_num_groups);
-        match self.kind {
-            SumKind::Unsigned => {
-                let values = as_primitive::<UInt64Type>(&values[0])?;
-                self.update_primitive(&values, group_indices, opt_filter)
+        let values = as_primitive::<T>(&values[0])?;
+        if values.null_count() == 0 && opt_filter.is_none() {
+            for (&group_index, &value) in group_indices.iter().zip(values.values().iter()) {
+                self.sums.add(group_index, value)?;
+                self.seen.set_bit(group_index, true);
             }
-            SumKind::Signed => {
-                let values = as_primitive::<Int64Type>(&values[0])?;
-                self.update_primitive(&values, group_indices, opt_filter)
-            }
+            return Ok(());
         }
+        for (row, &group_index) in group_indices.iter().enumerate() {
+            if row_is_filtered(opt_filter, row) || values.is_null(row) {
+                continue;
+            }
+            self.sums.add(group_index, values.value(row))?;
+            self.seen.set_bit(group_index, true);
+        }
+        Ok(())
     }
 
     fn merge_batch(
@@ -574,46 +709,30 @@ impl GroupsAccumulator for CheckedSumGroupsAccumulator {
         total_num_groups: usize,
     ) -> DFResult<()> {
         self.resize(total_num_groups);
-        let kind = self.kind;
         let partials = as_decimal128(&values[0])?;
         for (row, &group_index) in group_indices.iter().enumerate() {
             if partials.is_valid(row) {
-                let sum = &mut self.sums[group_index];
-                *sum = kind.checked_add(*sum, partials.value(row))?;
-                self.seen[group_index] = true;
+                self.sums.add_wide(group_index, partials.value(row))?;
+                self.seen.set_bit(group_index, true);
             }
         }
         Ok(())
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> DFResult<ArrayRef> {
-        let kind = self.kind;
-        let (sums, nulls) = self.take(emit_to);
-        // An unseen group's sum is zero, so it always converts; its slot is
-        // masked by `nulls`.
-        Ok(match kind {
-            SumKind::Unsigned => {
-                let values = sums
-                    .into_iter()
-                    .map(|sum| u64::try_from(sum).map_err(|_| kind.overflow()))
-                    .collect::<DFResult<Vec<u64>>>()?;
-                Arc::new(UInt64Array::new(ScalarBuffer::from(values), Some(nulls)))
-            }
-            SumKind::Signed => {
-                let values = sums
-                    .into_iter()
-                    .map(|sum| i64::try_from(sum).map_err(|_| kind.overflow()))
-                    .collect::<DFResult<Vec<i64>>>()?;
-                Arc::new(Int64Array::new(ScalarBuffer::from(values), Some(nulls)))
-            }
-        })
+        let sums = self.sums.take_narrow(emit_to)?;
+        let nulls = self.take_seen(emit_to);
+        Ok(Arc::new(PrimitiveArray::<T>::new(
+            ScalarBuffer::from(sums),
+            Some(nulls),
+        )))
     }
 
     fn state(&mut self, emit_to: EmitTo) -> DFResult<Vec<ArrayRef>> {
-        let kind = self.kind;
-        let (sums, nulls) = self.take(emit_to);
+        let sums = self.sums.take_wide(emit_to)?;
+        let nulls = self.take_seen(emit_to);
         for &sum in &sums {
-            kind.state_value(sum)?;
+            self.sums.kind.state_value(sum)?;
         }
         let state = Decimal128Array::new(ScalarBuffer::from(sums), Some(nulls))
             .with_precision_and_scale(38, 0)?;
@@ -631,7 +750,7 @@ impl GroupsAccumulator for CheckedSumGroupsAccumulator {
         let rows = values[0].len();
         let mut sums = vec![0i128; rows];
         let mut valid = vec![false; rows];
-        self.kind.for_each_value(&values[0], |row, value| {
+        self.sums.kind.for_each_value(&values[0], |row, value| {
             if !row_is_filtered(opt_filter, row) {
                 sums[row] = value;
                 valid[row] = true;
@@ -645,9 +764,9 @@ impl GroupsAccumulator for CheckedSumGroupsAccumulator {
 
     fn size(&self) -> usize {
         // The `EXACT_SUM_GROUP_WIDTHS` bytes per group the memory layout reads, by
-        // capacity; like the built-in's, the fixed struct is not counted anywhere.
-        self.sums.capacity() * std::mem::size_of::<i128>()
-            + self.seen.capacity() * std::mem::size_of::<bool>()
+        // capacity, plus the validity bitmap and the carry table, which it does
+        // not; like the built-in's, the fixed struct is not counted anywhere.
+        self.sums.size() + self.seen.capacity() / 8
     }
 }
 
@@ -754,7 +873,7 @@ impl Accumulator for DistinctSumAccumulator {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Float64Array, Int8Array, UInt8Array};
+    use datafusion::arrow::array::{Float64Array, Int8Array, Int64Array, UInt8Array, UInt64Array};
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
@@ -1226,7 +1345,7 @@ mod tests {
     /// rows and keeps the check at evaluation.
     #[test]
     fn convert_to_state_then_merge_is_checked() {
-        let mut accumulator = CheckedSumGroupsAccumulator::new(SumKind::Signed);
+        let mut accumulator = SignedGroups::new(SumKind::Signed);
         let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(MAX), None, Some(1), Some(7)]));
         let filter = BooleanArray::from(vec![Some(true), Some(true), Some(true), None]);
         let state = accumulator
@@ -1251,23 +1370,257 @@ mod tests {
         // The no-null, no-filter loop and the general loop agree.
         let values: ArrayRef = Arc::new(Int64Array::from(vec![5, -3, MAX, 2]));
         let groups = [0, 1, 0, 1];
-        let mut fast = CheckedSumGroupsAccumulator::new(SumKind::Signed);
+        let mut fast = SignedGroups::new(SumKind::Signed);
         fast.update_batch(&[Arc::clone(&values)], &groups, None, 3)
             .expect("fast");
-        let mut general = CheckedSumGroupsAccumulator::new(SumKind::Signed);
+        let mut general = SignedGroups::new(SumKind::Signed);
         let admit_all = BooleanArray::from(vec![true; 4]);
         general
             .update_batch(&[values], &groups, Some(&admit_all), 3)
             .expect("general");
-        assert_eq!(fast.sums, vec![i128::from(MAX) + 5, -1, 0]);
-        assert_eq!(fast.sums, general.sums);
-        assert_eq!(fast.seen, vec![true, true, false]);
-        assert_eq!(fast.seen, general.seen);
+        assert_eq!(fast.totals(), vec![i128::from(MAX) + 5, -1, 0]);
+        assert_eq!(fast.totals(), general.totals());
+        assert_eq!(fast.seen_flags(), vec![true, true, false]);
+        assert_eq!(fast.seen_flags(), general.seen_flags());
         let err = fast.evaluate(EmitTo::All).expect_err("group 0 overflows");
         assert!(matches!(
             crate::executor::take_sql_error(err),
             Ok(SqlError::IntegerSumOverflow { .. })
         ));
+    }
+
+    type SignedGroups = CheckedSumGroupsAccumulator<Int64Type>;
+
+    impl<T> CheckedSumGroupsAccumulator<T>
+    where
+        T: ArrowPrimitiveType,
+        T::Native: NarrowSum,
+    {
+        /// Each group's exact running sum, narrow sum plus carry.
+        fn totals(&self) -> Vec<i128> {
+            let mut totals: Vec<i128> = self.sums.narrow.iter().map(|&n| n.into()).collect();
+            for (&group, &carry) in &self.sums.carries {
+                totals[group] += carry;
+            }
+            totals
+        }
+
+        fn seen_flags(&self) -> Vec<bool> {
+            (0..self.seen.len()).map(|g| self.seen.get_bit(g)).collect()
+        }
+    }
+
+    /// `GROUPS` distinct groups, one row each, in 8192-row batches, as a
+    /// partial aggregation over all-distinct keys grows them.
+    const GROUPS: usize = 1 << 17;
+
+    fn grown_to_groups() -> SignedGroups {
+        let mut accumulator = SignedGroups::new(SumKind::Signed);
+        for start in (0..GROUPS).step_by(8192) {
+            let values: ArrayRef = Arc::new(Int64Array::from(vec![1i64; 8192]));
+            let groups: Vec<usize> = (start..start + 8192).collect();
+            accumulator
+                .update_batch(&[values], &groups, None, start + 8192)
+                .expect("update");
+        }
+        accumulator
+    }
+
+    /// The grouped state is an `i64` and a validity bit per group. Over
+    /// 131,072 groups grown batch by batch it reports 8 x 131,072 + 131,072 / 8
+    /// = 1,064,960 bytes, 8.125 per group, within 9 per group plus a 64-byte
+    /// allowance (arrow's bitmap allocation granule). The `i128` and `bool`
+    /// layout this replaced reported 17 x 131,072 = 2,228,224.
+    #[test]
+    fn grouped_state_is_at_most_nine_bytes_per_group() {
+        let accumulator = grown_to_groups();
+        let size = accumulator.size();
+        assert!(size <= 9 * GROUPS + 64, "{size} bytes for {GROUPS} groups");
+        assert_eq!(size, 1_064_960);
+        assert_eq!(accumulator.sums.carried_groups(), 0);
+    }
+
+    /// A promoted group's carry is reported: 1,000 groups pushed past
+    /// `i64::MAX` grow `size()` by at least their 1,000 carry entries.
+    #[test]
+    fn promoted_groups_are_counted_in_size() {
+        let mut accumulator = grown_to_groups();
+        let before = accumulator.size();
+        let groups: Vec<usize> = (0..1000).collect();
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![MAX; 1000]));
+        accumulator
+            .update_batch(&[values], &groups, None, GROUPS)
+            .expect("update");
+        assert_eq!(accumulator.sums.carried_groups(), 1000);
+        let after = accumulator.size();
+        let entry = std::mem::size_of::<(usize, i128)>() + 1;
+        assert!(
+            after >= before + 1000 * entry,
+            "{after} bytes after promoting 1,000 groups, {before} before"
+        );
+        assert_eq!(accumulator.totals()[0], i128::from(MAX) + 1);
+    }
+
+    /// A group whose running sum passes `i64::MAX` (or `i64::MIN`) and comes
+    /// back returns the exact total, beside groups that never leave `i64`,
+    /// grouped at one and eight partitions.
+    #[test]
+    fn a_group_that_leaves_int64_and_comes_back_returns_the_exact_total() {
+        let rows = vec![
+            (1, Some(MAX)),
+            (1, Some(1)),
+            (1, Some(-2)),
+            (2, Some(5)),
+            (2, Some(6)),
+            (3, Some(MAX)),
+            (3, Some(MAX)),
+            (3, Some(MIN)),
+            (3, Some(MIN)),
+            (3, Some(MAX)),
+            (4, Some(MIN)),
+            (4, Some(-1)),
+            (4, Some(1)),
+            (5, Some(-3)),
+        ];
+        let expected = vec![
+            Some(MAX - 1),
+            Some(11),
+            Some(MAX - 2),
+            Some(MIN),
+            Some(-3),
+        ];
+        let (plan, result) = run(signed(&[rows.clone()]), 1, GROUPED);
+        assert_stages(&plan, 1);
+        assert_eq!(i64_cells(&result.expect("one partition")), expected);
+        // Round-robin over eight partitions puts no two rows of one group in
+        // the same partition, so every partial fits and only the merge
+        // leaves `i64`.
+        let parts = spread(&rows, 8);
+        for part in &parts {
+            let mut keys: Vec<i64> = part.iter().map(|(k, _)| *k).collect();
+            keys.sort_unstable();
+            keys.dedup();
+            assert_eq!(keys.len(), part.len(), "{part:?}");
+        }
+        let (plan, result) = run(signed(&parts), 8, GROUPED);
+        assert_stages(&plan, 8);
+        assert_eq!(i64_cells(&result.expect("eight partitions")), expected);
+    }
+
+    /// A group that leaves the result type and stays out fails, at one and
+    /// eight partitions, signed and unsigned, while its neighbours fit.
+    #[test]
+    fn a_group_that_leaves_and_stays_out_fails() {
+        let rows = vec![(1, Some(MAX)), (1, Some(1)), (1, Some(1)), (2, Some(3))];
+        let wide = vec![(1, Some(u64::MAX)), (1, Some(5)), (2, Some(3))];
+        for partitions in [1, 8] {
+            let (_, result) = run(signed(&spread(&rows, partitions)), partitions, GROUPED);
+            assert_overflow(result, "Int64", &format!("signed at {partitions}"));
+            let (_, result) = run(unsigned(&spread(&wide, partitions)), partitions, GROUPED);
+            assert_overflow(result, "UInt64", &format!("unsigned at {partitions}"));
+        }
+    }
+
+    /// The merge promotes on overflow too, including a partial outside `i64`,
+    /// and `EmitTo::First` renumbers the carries of the groups it leaves.
+    #[test]
+    fn merge_promotes_and_emit_first_keeps_the_carries() {
+        let mut accumulator = SignedGroups::new(SumKind::Signed);
+        let max = i128::from(MAX);
+        let min = i128::from(MIN);
+        let partials = Decimal128Array::from(vec![
+            Some(max),
+            Some(max),
+            Some(min),
+            Some(-1),
+            Some(2 * max),
+            Some(min),
+            Some(min),
+            Some(5),
+            None,
+            Some(7),
+            Some(max),
+            Some(1),
+        ])
+        .with_precision_and_scale(38, 0)
+        .expect("decimal");
+        let state: ArrayRef = Arc::new(partials);
+        accumulator
+            .merge_batch(&[state], &[0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3], 5)
+            .expect("merge");
+        assert_eq!(
+            accumulator.totals(),
+            vec![max - 2, 3, 7, max + 1, 0],
+            "exact sums"
+        );
+        assert_eq!(accumulator.sums.carried_groups(), 3);
+
+        let first = accumulator.evaluate(EmitTo::First(3)).expect("first three");
+        let first = first.as_any().downcast_ref::<Int64Array>().expect("Int64");
+        assert_eq!(
+            first.iter().collect::<Vec<_>>(),
+            vec![Some(MAX - 2), Some(3), Some(7)]
+        );
+        assert_eq!(accumulator.sums.carried_groups(), 1);
+        assert_eq!(accumulator.totals(), vec![max + 1, 0]);
+        assert_eq!(accumulator.seen_flags(), vec![true, false]);
+        // Group 3, now group 0, still holds its carry and overflows.
+        let state = accumulator.state(EmitTo::All).expect("state");
+        let state = as_decimal128(&state[0]).expect("decimal");
+        assert_eq!(state.iter().collect::<Vec<_>>(), vec![Some(max + 1), None]);
+    }
+
+    #[test]
+    #[ignore = "scratch timing harness"]
+    fn zz_scratch_timing_grouped_sum() {
+        let rows = 10_000_000usize;
+        let groups = 1_000_000usize;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let mut partitions = vec![Vec::new(); 8];
+        let mut start = 0usize;
+        let mut batch_no = 0usize;
+        while start < rows {
+            let end = (start + 8192).min(rows);
+            let k: Vec<i64> = (start..end)
+                .map(|i| ((i.wrapping_mul(7919)) % groups) as i64)
+                .collect();
+            let v: Vec<i64> = (start..end).map(|i| (i % 1000) as i64).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(k)), Arc::new(Int64Array::from(v))],
+            )
+            .expect("batch");
+            partitions[batch_no % 8].push(batch);
+            batch_no += 1;
+            start = end;
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(8));
+            ctx.register_udaf(checked_sum_udaf());
+            let mem = MemTable::try_new(schema, partitions).expect("memtable");
+            ctx.register_table("t", Arc::new(mem)).expect("register");
+            for round in 0..2 {
+                let t0 = std::time::Instant::now();
+                let batches = ctx
+                    .sql("SELECT k, sum(v) FROM t GROUP BY k")
+                    .await
+                    .expect("plan")
+                    .collect()
+                    .await
+                    .expect("run");
+                let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+                assert_eq!(n, groups);
+                println!("TIMING round={round} ms={}", t0.elapsed().as_millis());
+            }
+        });
     }
 
     #[test]
