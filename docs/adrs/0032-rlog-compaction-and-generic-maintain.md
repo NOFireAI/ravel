@@ -306,7 +306,8 @@ parts changed. Concretely:
 The same issue covers the compaction read path, which was a chain of
 sequential awaits: one commit-record GET per input, then one catalog load
 per input, then one block GET per cursor advance. A new
-`CompactorConfig::input_read_concurrency` (default 8) bounds how many of
+`CompactorConfig::input_read_concurrency` (default 8; 32 since the
+2026-11-06 amendment below) bounds how many of
 those are in flight, and each stream cursor prefetches one block ahead.
 (Block reads changed again under the ADR-3819 read-plan amendment below.)
 This is a latency change only. Output bytes cannot depend on it: inputs
@@ -437,3 +438,26 @@ rows, plus the in-progress part. A stream on cursors has decision 4's
 transient term (ADR-0065) in place of the pass rows. The erasure rewriter
 runs the same merge, so all of this applies to it too. ADR-0065's amendment
 of the same date states the bound on each term.
+
+## Amendment 2026-11-06: input read concurrency defaults to 32 (issue #3856)
+
+<!-- amendment-applies: sections="Amendment 2026-08-26: a part splits on a size target; a stream may span parts" pointer="2026-11-06 amendment" -->
+
+Status: accepted. Issue #3856, following ADR-3853. The default of
+`CompactorConfig::input_read_concurrency` (`DEFAULT_INPUT_READ_CONCURRENCY`)
+is now 32 in flight, up from 8, and `ravel-cli maintain`'s
+`--input-read-concurrency` help states the same default. Output bytes are
+unchanged, for the reason the Input read concurrency section gives.
+
+The basis is the #3819 measurement from a GKE node (issue comment
+6660371946): GCS reads there are latency-bound, at 16, 72 and 108 MB/s with
+8, 32 and 64 reads in flight over 400 objects, and a compaction at 64 in
+flight ran its catalog phase about 4x faster than at 8 (600 against 140
+GETs/s). 32 is the default ADR-3853 names.
+
+The in-flight bytes scale with it. An RLOG fetch-per-pass merge reserves
+the `input_read_concurrency` largest row groups: at ~3.5 MB stored per
+group (the ClickBench tenant `DEFAULT_MERGE_CURSOR_BUDGET_BYTES` is sized
+against) that is 112,000,000 B (106.8 MiB) at 32, against 28,000,000 B
+(26.7 MiB) at 8. The catalog loads hold one 128 KiB footer probe each,
+4 MiB at 32.

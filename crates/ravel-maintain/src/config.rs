@@ -1519,8 +1519,18 @@ pub const DEFAULT_FOOTER_PROBE_BYTES: u64 = 64 * 1024;
 /// PAGE_DIR, STREAM_DIR, FIELD_DIR and the footer on the logs-benchmark
 /// objects (docs/log-segment-format.md reader protocol).
 pub const DEFAULT_RLOG_FOOTER_PROBE_BYTES: u64 = 128 * 1024;
-/// Default `input_read_concurrency`: 8 input reads in flight at once.
-pub const DEFAULT_INPUT_READ_CONCURRENCY: usize = 8;
+/// Default `input_read_concurrency`: 32 input reads in flight at once
+/// (ADR-3853). Object-store reads are latency-bound: on GCS, 400-object reads
+/// moved 16, 72 and 108 MB/s at 8, 32 and 64 in flight, and a compaction's
+/// catalog phase ran about 4x faster at 64 than at 8 (issue #3819).
+///
+/// The in-flight bytes grow with it. An RLOG fetch-per-pass merge reserves the
+/// 32 largest row groups: at the ~3.5 MB stored per group of the ClickBench
+/// tenant sized against in [`DEFAULT_MERGE_CURSOR_BUDGET_BYTES`], that is
+/// 32 x 3,500,000 B = 112,000,000 B (106.8 MiB), against 28,000,000 B
+/// (26.7 MiB) at 8. The catalog loads hold one footer probe each, 32 x 128 KiB
+/// = 4 MiB at [`DEFAULT_RLOG_FOOTER_PROBE_BYTES`].
+pub const DEFAULT_INPUT_READ_CONCURRENCY: usize = 32;
 /// Default `merge_cursor_budget_bytes`: 20 GiB (ADR-0979 decision 4), re-derived
 /// below from the arithmetic `crate::rlog` implements rather than from the ADR's
 /// summary figure.
@@ -2060,13 +2070,15 @@ pub struct CompactorConfig {
     /// inputs otherwise pays one full store round trip per input in sequence,
     /// which dominates the merge on any real object store.
     ///
-    /// This bounds request concurrency only, never resident bytes: a catalog
-    /// is directory metadata (KBs), and the merge itself still streams one
-    /// block at a time per cursor. Values below 1 are treated as 1. Output
-    /// bytes do not depend on it -- inputs are re-sorted into canonical order
-    /// after loading and the merge is a deterministic k-way merge over that
-    /// order -- so raising it can change timing but never content. Default
-    /// [`DEFAULT_INPUT_READ_CONCURRENCY`] (8).
+    /// A catalog is directory metadata (KBs), but each load in flight holds
+    /// its footer probe ([`Self::rlog_footer_probe_bytes`] for RLOG), and an
+    /// RLOG fetch-per-pass merge reserves this many of the largest row groups
+    /// in flight, so the in-flight bytes scale with it (figures at
+    /// [`DEFAULT_INPUT_READ_CONCURRENCY`]). Values below 1 are treated as 1.
+    /// Output bytes do not depend on it -- inputs are re-sorted into canonical
+    /// order after loading and the merge is a deterministic k-way merge over
+    /// that order -- so raising it can change timing but never content.
+    /// Default [`DEFAULT_INPUT_READ_CONCURRENCY`] (32).
     pub input_read_concurrency: usize,
     /// The RLOG merge's per-stream cursor-memory budget (ADR-0979 decision 4).
     /// Unlike the two part-split targets and `input_read_concurrency`, this one
@@ -2600,6 +2612,22 @@ mod tests {
     /// A lease long enough that its part cap (420 GiB) never binds, so a test of
     /// the share, floor and ceiling terms is not also a test of the lease term.
     const LONG_LEASE: Duration = Duration::from_secs(86_400);
+
+    /// Issue #3856: the default is 32 in flight, and the figures its doc
+    /// comment states follow from it.
+    #[test]
+    fn the_default_input_read_concurrency_is_32() {
+        assert_eq!(DEFAULT_INPUT_READ_CONCURRENCY, 32);
+        assert_eq!(CompactorConfig::default().input_read_concurrency, 32);
+        let groups = DEFAULT_INPUT_READ_CONCURRENCY as u64 * 3_500_000;
+        assert_eq!(groups, 112_000_000);
+        assert_eq!(groups * 10 / MIB, 1068, "106.8 MiB");
+        assert_eq!(8 * 3_500_000 * 10 / MIB, 267, "26.7 MiB at 8");
+        assert_eq!(
+            DEFAULT_INPUT_READ_CONCURRENCY as u64 * DEFAULT_RLOG_FOOTER_PROBE_BYTES,
+            4 * MIB
+        );
+    }
 
     /// The issue #2351 acceptance figures, pinned exactly. A derivation without
     /// the clamp gives 16 GiB for the 128 GiB row and 128 MiB for the 1 GiB

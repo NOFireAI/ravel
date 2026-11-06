@@ -12983,6 +12983,46 @@ mod tests {
             }
         }
 
+        /// Issue #3856: at the default `input_read_concurrency` (32) the
+        /// in-flight reservation [`plan_merge`] compares is the 32 largest row
+        /// groups. Forty single-group inputs of growing size, so the 32 largest
+        /// and the 8 largest differ; under a zero ceiling the plan is the
+        /// cursor one and compares the in-flight groups plus the floor.
+        ///
+        /// Demonstrated red against a reservation that still takes 8
+        /// (`.take(concurrency)` in [`plan_merge`] changed to `.take(8)`).
+        #[tokio::test]
+        async fn the_default_in_flight_reservation_is_the_32_largest_groups() {
+            let records = (0..40u32)
+                .map(|i| {
+                    (0..=i64::from(i))
+                        .map(|k| record(0, 1_000 + k, &format!("in{i} k{k}"), Vec::new()))
+                        .collect()
+                })
+                .collect();
+            let inputs = blocked(records, 64);
+            let config = with_ceiling(&CompactorConfig::default(), Some(0));
+            assert_eq!(config.input_read_concurrency, 32);
+            let store = ProbeStore::new();
+            let keys = seed_inputs(&store, &inputs).await;
+            let mut lens: Vec<u64> = group_extents(&store, &keys)
+                .await
+                .iter()
+                .map(|(_, s, e)| e - s)
+                .collect();
+            assert_eq!(lens.len(), 40, "one row group per input");
+            lens.sort_unstable_by(|a, b| b.cmp(a));
+            let largest = |n: usize| lens.iter().take(n).sum::<u64>();
+            assert!(largest(32) > largest(8), "{lens:?}");
+
+            let (plan, _) = plan_for(&store, &keys, &config).await;
+            assert_eq!(plan.mode, MergeReadMode::Cursor);
+            assert_eq!(
+                plan.compared_bytes,
+                largest(32) + config.rlog_memory_target_bytes()
+            );
+        }
+
         /// `r` moved to stream `s`, everything else kept.
         fn restream(r: LogRecord, s: u32) -> LogRecord {
             let (stream_id, stream_attrs) = stream_ident(s);
