@@ -18,12 +18,22 @@ use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 /// a non-empty row filter and no active TopK threshold, and puts a `SortExec`
 /// with the same sort expressions, the same fetch and `preserve_partitioning:
 /// true` directly under the coalesce. The global `SortExec` stays: the top `k`
-/// of the union is the top `k` of every partition's top `k`. Any other shape
-/// is returned unchanged. Pinned by
+/// of the union is the top `k` of every partition's top `k`. A fetch above
+/// `max_limit` is refused, since every partition holds its own `k`-row heap.
+/// Any other shape is returned unchanged. Pinned by
 /// `a_row_filtered_scan_under_a_global_topk_gets_a_partition_topk` and its
 /// neighbours in `tests/logs_partition_topk.rs`.
-#[derive(Debug, Default)]
-pub(crate) struct LogsPartitionTopK;
+#[derive(Debug)]
+pub(crate) struct LogsPartitionTopK {
+    /// [`crate::SqlConfig::partition_topk_max_limit`].
+    max_limit: usize,
+}
+
+impl LogsPartitionTopK {
+    pub(crate) fn new(max_limit: usize) -> Self {
+        Self { max_limit }
+    }
+}
 
 /// The name [`LogsPartitionTopK`] reports as a physical optimizer rule.
 const LOGS_PARTITION_TOPK_RULE: &str = "logs_partition_topk";
@@ -34,7 +44,7 @@ impl PhysicalOptimizerRule for LogsPartitionTopK {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        plan.transform_up(|node| match partition_topk(&node)? {
+        plan.transform_up(|node| match partition_topk(&node, self.max_limit)? {
             Some(rewritten) => Ok(Transformed::yes(rewritten)),
             None => Ok(Transformed::no(node)),
         })
@@ -51,15 +61,18 @@ impl PhysicalOptimizerRule for LogsPartitionTopK {
 }
 
 /// `node` with a partition TopK inserted under its coalesce, when `node` is
-/// the global TopK of a matching shape.
-fn partition_topk(node: &Arc<dyn ExecutionPlan>) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
+/// the global TopK of a matching shape with a fetch of at most `max_limit`.
+fn partition_topk(
+    node: &Arc<dyn ExecutionPlan>,
+    max_limit: usize,
+) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
     let Some(sort) = node.downcast_ref::<SortExec>() else {
         return Ok(None);
     };
     let Some(fetch) = sort.fetch() else {
         return Ok(None);
     };
-    if sort.preserve_partitioning() {
+    if fetch > max_limit || sort.preserve_partitioning() {
         return Ok(None);
     }
     let coalesce = sort.input();

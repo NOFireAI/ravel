@@ -63,6 +63,14 @@ pub const DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS: usize = 8;
 /// magnitude below it.
 pub const DEFAULT_BOUNDED_TOPK_MAX_LIMIT: usize = 1024;
 
+/// Default for [`SqlConfig::partition_topk_max_limit`].
+///
+/// The per-partition TopK holds a `k`-row heap in every scan partition on top
+/// of the global one, so its memory is `k` rows times the partition count plus
+/// one. The ceiling matches [`DEFAULT_BOUNDED_TOPK_MAX_LIMIT`]; the measured
+/// statement asks for `LIMIT 10`.
+pub const DEFAULT_PARTITION_TOPK_MAX_LIMIT: usize = 1024;
+
 /// Under-count of DataFusion 55's `GroupValues::size()` against the real
 /// hashbrown allocation of the group-key table (issue #740, finding 2).
 /// `size()` charges `capacity() * entry_size`, where `capacity()` is the
@@ -475,6 +483,16 @@ pub struct SqlConfig {
     /// `count` or `sum`, which cannot be pruned exactly at all; see the
     /// `crate::bounded_topk` module docs for the counterexample.
     pub bounded_topk_max_limit: Option<usize>,
+    /// `LIMIT` ceiling for the per-partition TopK under a row-filtered `logs`
+    /// scan (ADR-0093, exact not-equal amendment). `Some(k)` installs
+    /// `crate::logs_scan::LogsPartitionTopK` and lets it fire on a global
+    /// `ORDER BY ... LIMIT n` with `n` at most `k`; `None` does not install the
+    /// rule at all. Each partition holds its own `n`-row heap, which is why the
+    /// limit is bounded. Pinned by `tests/logs_partition_topk.rs`.
+    ///
+    /// Default [`DEFAULT_PARTITION_TOPK_MAX_LIMIT`]. Set once at server
+    /// startup, like every other field here.
+    pub partition_topk_max_limit: Option<usize>,
     /// Bucketed final aggregation (ADR-3565 decision 1, issue #3608).
     /// `Some` installs [`crate::BucketedFinalAggregateRule`], which replaces a
     /// `FinalPartitioned` aggregate over fixed-width integer or temporal keys
@@ -546,6 +564,7 @@ impl Default for SqlConfig {
             skip_partial_aggregation: true,
             late_materialization_extra_columns: Some(DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS),
             bounded_topk_max_limit: Some(DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
+            partition_topk_max_limit: Some(DEFAULT_PARTITION_TOPK_MAX_LIMIT),
             bucketed_final_aggregation: None,
             // Spill off. See the field doc: this is requirement 9 of #954 (a
             // no-spill deployment profile) and it is what makes enabling spill
@@ -716,6 +735,15 @@ mod tests {
     fn bounded_topk_defaults_to_a_limit_of_1024() {
         assert_eq!(SqlConfig::default().bounded_topk_max_limit, Some(1024));
         assert_eq!(DEFAULT_BOUNDED_TOPK_MAX_LIMIT, 1024);
+    }
+
+    /// The per-partition TopK ships installed, with a `LIMIT` ceiling. Both
+    /// halves are pinned, so neither the default nor the constant can drift
+    /// without this failing.
+    #[test]
+    fn partition_topk_defaults_to_a_limit_of_1024() {
+        assert_eq!(SqlConfig::default().partition_topk_max_limit, Some(1024));
+        assert_eq!(DEFAULT_PARTITION_TOPK_MAX_LIMIT, 1024);
     }
 
     fn cache_dir_spill(free_bytes: u64, memory_budget_bytes: u64) -> CacheDirSpill<'static> {
