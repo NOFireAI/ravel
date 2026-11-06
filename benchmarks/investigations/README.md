@@ -580,36 +580,40 @@ unchanged.
   that reason (the allowlist above). The many_parts leaf-GET figures are
   among them: main has no tier-2 reader.
 - The 1,000- and 1,001-key IN lists (`spans_in_1000`, `logs_trace_in_1000`,
-  `logs_request_in_1000` and their `_1001` controls) are sent, and the
-  server refuses them with HTTP 400 and `statement complexity 1001 exceeds
-  the maximum of 1000 tokens; simplify the statement`. These statements
-  carry `expect_refusal_on_main = true`, and evaluate.py records each such
-  refusal as `refused-by-guard` ("refused by the SQL complexity guard") with
-  that text, a class of its own: the summary's `refusal classes` line counts
-  its figures and calls apart from `unsupported-on-this-build`, and neither
-  is a problem. A refusal of any other statement
-  is the problem `refused` with its status and text. The SQL complexity
-  guard charges one unit per token start
-  (`crates/ravel-sql/src/complexity_guard.rs:640`): an identifier or number
-  run is one unit, an opening quote is one, and an `X'..'` literal is an X
-  run plus a quote (`:674-684`), so an element costs 3 units with its comma
-  in an X list and 2 in a quoted one. Against `MAX_STATEMENT_COMPLEXITY =
-  1_000` (`:257`, checked at `:380-381`) and the 8 units of the rest of the statement,
-  an X list (3n + 8) holds at most 330 keys and a quoted list (2n + 8) at
-  most 496. The guard stops counting once the count passes the cap
-  (`complexity_guard.rs:469-472`, `:640-643`), so for the IN lists the
-  harness sends, which add one unit at a time, it reports 1001 whatever the
-  list's length (a hint comment adds 2 or 3 units in one step, `:495-499`
-  and `:611`, so a refusal can also read 1002 or 1003): the figure in a
-  refusal is where the scan stopped, not the statement's count. Box A's s3
-  run (`investigations-20261104T001915Z-46224-17727`, main 3465163df)
-  refused its 1,000-key lists with exactly that text, which says nothing of
-  one unit per key or of a cap one key below 1,000. Measured 2026-11-04
-  against a release `ravel-server --features sql` built from main c322a283c
-  on the local lane: an X list of 330 keys is admitted and one of 331
-  refused, a quoted list of 496 admitted and one of 497 refused, and a
-  999-key list of either kind refused with the same `statement complexity
-  1001`.
+  `logs_request_in_1000` and their `_1001` controls) are sent. A build from
+  before ADR-3692's key set amendment refuses them with HTTP 400 and
+  `statement complexity 1001 exceeds the maximum of 1000 tokens; simplify the
+  statement`, and `fixtures/local-smoke` is a run of such a build. These
+  statements carry `expect_refusal_on_main = true`, and evaluate.py records
+  each such refusal as `refused-by-guard` ("refused by the SQL complexity
+  guard") with that text, a class of its own: the summary's `refusal classes`
+  line counts its figures and calls apart from `unsupported-on-this-build`,
+  and neither is a problem. A refusal of any other statement is the problem
+  `refused` with its status and text. The flag is read only when the server
+  refuses, so on a build that admits the lists it changes nothing.
+  Before the amendment the SQL complexity guard charged one unit per token
+  start: an identifier or number run is one unit, an opening quote is one,
+  and an `X'..'` literal is an X run plus a quote, so an element costs 3
+  units with its comma in an X list and 2 in a quoted one. Against
+  `MAX_STATEMENT_COMPLEXITY = 1_000` and the 8 units of the rest of the
+  statement, an X list (3n + 8) held at most 330 keys and a quoted list
+  (2n + 8) at most 496. The guard stops counting once the count passes the
+  cap (`scan` returns `stop_above + 1`), so for these lists, which add one
+  unit at a time, it reported 1001 whatever the list's length (a hint
+  comment adds 2 or 3 units in one step, so a refusal can also read 1002 or
+  1003): the figure in a refusal is where the scan stopped, not the
+  statement's count. Box A's s3 run
+  (`investigations-20261104T001915Z-46224-17727`, main 3465163df) refused
+  its 1,000-key lists with exactly that text, which says nothing of one unit
+  per key or of a cap one key below 1,000. Measured 2026-11-04 against a
+  release `ravel-server --features sql` built from main c322a283c on the
+  local lane: an X list of 330 keys is admitted and one of 331 refused, a
+  quoted list of 496 admitted and one of 497 refused, and a 999-key list of
+  either kind refused with the same `statement complexity 1001`. Since the
+  amendment a flat list of literals costs one unit plus one per 64 literals,
+  rounded up (`in_list_units` in `crates/ravel-sql/src/complexity_guard.rs`),
+  up to 4,096 literals, so each of these statements costs 24 units at 1,000
+  keys and at 1,001 and is admitted.
 - Row 13's negative controls: decision 9's mutants are not built here, so
   the figure is `not-run` ("mutant controls not implemented") and the
   verdict is at best `incomplete`.

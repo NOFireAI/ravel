@@ -431,6 +431,19 @@ impl KeyProbeBucket {
     /// the bucket naming a block at or past the object's level-0 block count,
     /// whichever key it belongs to, is [`LogSegError::Corrupted`].
     pub fn finish(&self, frame: &[u8]) -> Result<KeyProbe, LogSegError> {
+        let blocks = self.matching(&self.entries(frame)?);
+        Ok(if blocks.is_empty() {
+            KeyProbe::Absent
+        } else {
+            KeyProbe::Present(blocks)
+        })
+    }
+
+    /// The decode half of [`KeyProbeBucket::finish`], with its checks: every
+    /// `(key8, block)` entry of the bucket, whichever key it belongs to. A set
+    /// probe decodes each touched bucket once with this and answers every key
+    /// located in that bucket with [`KeyProbeBucket::matching`].
+    pub fn entries(&self, frame: &[u8]) -> Result<Vec<(Key8, u32)>, LogSegError> {
         let entries = self.bucket.entries(frame)?;
         if let Some(&(_, past)) = entries
             .iter()
@@ -442,12 +455,13 @@ impl KeyProbeBucket {
                 self.block_count
             )));
         }
-        let blocks = self.bucket.matching(&entries);
-        Ok(if blocks.is_empty() {
-            KeyProbe::Absent
-        } else {
-            KeyProbe::Present(blocks)
-        })
+        Ok(entries)
+    }
+
+    /// The blocks of `entries`, decoded from this key's bucket by
+    /// [`KeyProbeBucket::entries`], whose key is the probed one, ascending.
+    pub fn matching(&self, entries: &[(Key8, u32)]) -> Vec<u32> {
+        self.bucket.matching(entries)
     }
 }
 
