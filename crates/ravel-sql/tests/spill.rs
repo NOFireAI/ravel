@@ -30,7 +30,11 @@
 //! - an `ORDER BY ... LIMIT` over an eligible aggregate, with many groups tied
 //!   on the sort key, returns the same rows in the same order with spill
 //!   forced, in memory, and with spill off (issue #2416), including when a
-//!   select-list alias carries a group column's name.
+//!   select-list alias carries a group column's name;
+//! - a grouped `MIN` of a string, `MAX` of an integer and `AVG` of an
+//!   `Int32`, and the ClickBench row 29 shape with its `HAVING`, spill and
+//!   return the unlimited run's result, the average bit for bit (issue
+//!   #3899).
 //!
 //! # Where each test drives the spill from
 //!
@@ -1312,12 +1316,32 @@ fn q33_tenant() -> ravel_types::TenantHash {
 /// result order, and what the query reported about spill and memory.
 struct TopTen {
     rows: Vec<String>,
+    batches: Vec<RecordBatch>,
     spill_files: u64,
     spill_rows_written: u64,
     peak_pool_bytes: u64,
 }
 
 impl TopTen {
+    /// The bit pattern of every value of the `Float64` column `index`, in
+    /// result order, read from the result batches rather than their rendering.
+    fn column_f64_bits(&self, index: usize) -> Vec<u64> {
+        use datafusion::arrow::array::Float64Array;
+        self.batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("the column is Float64");
+                (0..column.len())
+                    .map(|row| column.value(row).to_bits())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Column `index` of every row, parsed as a number.
     fn column_f64(&self, index: usize) -> Vec<f64> {
         self.rows
@@ -1353,6 +1377,7 @@ async fn run_top_ten(executor: &ravel_sql::SqlExecutor, sql: &str) -> TopTen {
     }
     TopTen {
         rows,
+        batches: outcome.output.batches().to_vec(),
         spill_files: outcome.stats.spill.files,
         spill_rows_written: outcome.stats.spill.rows_written,
         peak_pool_bytes: outcome.accounting.peak_intermediate_bytes,
@@ -1529,4 +1554,100 @@ async fn a_statement_the_rewrite_cannot_apply_to_runs_with_spill_disabled() {
         spill_subdirs(scratch.path()).is_empty(),
         "a spill-disabled query never creates a scratch directory"
     );
+}
+
+/// The per-query pool the spilling run of [`spilled_and_unlimited`] gets, as
+/// a fraction of the unlimited run's measured peak: half, for the reason
+/// [`spilled_and_in_memory`] gives.
+const SPILL_BUDGET_DIVISOR: u64 = 2;
+
+/// Run `sql` over the q33 table under [`AMPLE_QUERY_BYTES`], a pool no run
+/// over this fixture approaches, and again under a pool of the first run's
+/// peak divided by [`SPILL_BUDGET_DIVISOR`]. Asserts that the first run did
+/// not spill and the second did (files and rows written both nonzero), and
+/// returns `(spilled, unlimited)`.
+async fn spilled_and_unlimited(sql: &str) -> (TopTen, TopTen) {
+    let file = q33_parquet();
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = |query_bytes| {
+        spill_config(
+            scratch.path().to_path_buf(),
+            AMPLE_SCRATCH_BYTES,
+            query_bytes,
+        )
+    };
+    let unlimited = run_top_ten(&*q33_executor(config(AMPLE_QUERY_BYTES), &file).await, sql).await;
+    let budget = usize::try_from(unlimited.peak_pool_bytes / SPILL_BUDGET_DIVISOR).expect("fits");
+    let spilled = run_top_ten(&*q33_executor(config(budget), &file).await, sql).await;
+    eprintln!(
+        "issue #3899: unlimited peak={} budget={budget} spill files={} rows_written={}",
+        unlimited.peak_pool_bytes, spilled.spill_files, spilled.spill_rows_written
+    );
+    assert_eq!(
+        (unlimited.spill_files, unlimited.spill_rows_written),
+        (0, 0),
+        "the unlimited run must not spill"
+    );
+    assert!(
+        spilled.spill_files > 0 && spilled.spill_rows_written > 0,
+        "under a pool of 1/{SPILL_BUDGET_DIVISOR} of its peak the statement must spill: \
+         files={} rows_written={}",
+        spilled.spill_files,
+        spilled.spill_rows_written
+    );
+    (spilled, unlimited)
+}
+
+/// Issue #3899: a grouped `MIN` of a string, `MAX` of an integer and `AVG`
+/// of an `Int32` spills, and DataFusion's grouped-hash spill path, merging
+/// the spilled partial states of Ravel's `min`/`max` and `avg`, returns the
+/// unlimited run's result value for value, and the average bit for bit. Each
+/// `k` group holds two rows (`y = 2k` and `2k + 1`, three times over for the
+/// [`Q33_TOP_GROUPS`] lowest groups), so `min(a)` picks between two
+/// different strings and `avg(w)` is `2k + 0.5`.
+///
+/// Prove-the-test: take `min` out of `aggregate_expr_is_spill_exact` and the
+/// spilling run is refused with the spill-disabled `ResourcesExhausted`; set
+/// [`SPILL_BUDGET_DIVISOR`] to 1 and it never spills, failing the counter
+/// assertion.
+#[tokio::test]
+async fn min_max_and_int32_avg_spill_with_the_unlimited_result() {
+    let sql = "SELECT y / 2 AS k, min(a) AS mn, max(y) AS mx, avg(w) AS aw, count(*) AS c \
+               FROM q33 GROUP BY y / 2 ORDER BY k";
+    let (spilled, unlimited) = spilled_and_unlimited(sql).await;
+    let groups = usize::try_from(Q33_GROUPS / 2).expect("fits");
+    assert_eq!(unlimited.rows.len(), groups);
+    assert_eq!(spilled.rows, unlimited.rows, "value for value, in order");
+    assert_eq!(
+        spilled.column_f64_bits(3),
+        unlimited.column_f64_bits(3),
+        "the average, bit for bit"
+    );
+    assert_eq!(spilled.rows[0], "0|a0000000|1|0.5|6");
+    assert_eq!(spilled.rows[groups - 1], "99999|a0199998|199999|199998.5|2");
+}
+
+/// Issue #3899: the ClickBench row 29 shape (a `regexp_replace` group key,
+/// `AVG(length(..))`, `COUNT(*)`, `MIN` of a string, `HAVING`, `ORDER BY` the
+/// average, `LIMIT`) spills and returns the unlimited run's rows. The key
+/// strips the leading `a`, so there is one group per `a` and the aggregate
+/// holds [`Q33_GROUPS`] groups; the `HAVING` keeps the [`Q33_TOP_GROUPS`]
+/// groups with three rows. Every `a` is eight characters, so the average
+/// ties across all of them and the 25 rows returned are decided by the
+/// tiebreak on the key alone.
+#[tokio::test]
+async fn the_clickbench_row_29_shape_spills_with_the_unlimited_result() {
+    let sql = "SELECT regexp_replace(a, '^a([0-9]+)$', '\\1') AS k, \
+               AVG(length(a)) AS l, COUNT(*) AS c, MIN(a) AS m FROM q33 WHERE a <> '' \
+               GROUP BY k HAVING COUNT(*) > 1 ORDER BY l DESC LIMIT 25";
+    let (spilled, unlimited) = spilled_and_unlimited(sql).await;
+    assert_eq!(unlimited.rows.len(), 25);
+    assert_eq!(spilled.rows, unlimited.rows, "value for value, in order");
+    assert_eq!(
+        spilled.column_f64_bits(1),
+        unlimited.column_f64_bits(1),
+        "the average, bit for bit"
+    );
+    assert_eq!(spilled.rows[0], "0000000|8.0|3|a0000000");
+    assert_eq!(spilled.rows[24], "0000024|8.0|3|a0000024");
 }
