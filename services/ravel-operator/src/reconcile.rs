@@ -185,6 +185,26 @@ pub enum RenderError {
     )]
     MaintainKeySecretRefMissing,
 
+    /// `spec.maintain.scratch.sizeGi` is above the `ephemeral-storage` limit
+    /// in `spec.maintain.resources.limits`. The scratch volume renders an
+    /// `ephemeral-storage` request of `sizeGi`, and Kubernetes refuses a
+    /// container whose request exceeds its limit. Captured as
+    /// [`MaintainTier::Refused`], so the live maintain Deployment is left
+    /// unchanged and the other tiers keep reconciling.
+    #[error(
+        "spec.maintain.scratch.sizeGi is {size_gi} ({size_gi}Gi) but \
+         spec.maintain.resources.limits.ephemeral-storage is {limit}, and the scratch volume's \
+         ephemeral-storage request of {size_gi}Gi cannot exceed that limit. Raise the limit to \
+         at least {size_gi}Gi or lower sizeGi. The existing maintain Deployment, if any, is \
+         left unchanged until then"
+    )]
+    MaintainScratchExceedsEphemeralLimit {
+        /// `spec.maintain.scratch.sizeGi`.
+        size_gi: u32,
+        /// The `ephemeral-storage` limit as the spec wrote it.
+        limit: String,
+    },
+
     /// `spec.query.memoryBudgetBytes` is set, and the query container has no
     /// memory limit (`limit` is `None`) or one below the budget plus `held`,
     /// what `--mode query` keeps outside its budget. Such a pod cannot hold
@@ -2132,6 +2152,7 @@ pub fn desired_maintain_deployment(
     }
     let key_secret =
         maintain_key_secret_name(spec).ok_or(RenderError::MaintainKeySecretRefMissing)?;
+    validate_maintain_scratch(spec)?;
     let mut args = vec![
         "--mode".to_string(),
         "maintain".to_string(),
@@ -2196,6 +2217,10 @@ pub fn desired_maintain_deployment(
     if let Some(scratch) = &spec.maintain.scratch {
         args.push("--maintain-scratch-dir".to_string());
         args.push(scratch.mount_path.clone());
+        // The server's headroom check reads filesystem free space, which for
+        // an emptyDir is the node's; this bounds it by the volume's sizeLimit.
+        args.push("--maintain-scratch-max-bytes".to_string());
+        args.push(scratch_bytes(scratch).to_string());
         volumes.push(maintain_scratch_volume(scratch));
     }
 
@@ -2261,10 +2286,41 @@ fn scratch_quantity(scratch: &MaintainScratchSpec) -> Quantity {
     Quantity(format!("{}Gi", scratch.size_gi))
 }
 
+fn scratch_bytes(scratch: &MaintainScratchSpec) -> u64 {
+    u64::from(scratch.size_gi) << 30
+}
+
+/// Refuse a `spec.maintain.scratch.sizeGi` above an explicit
+/// `ephemeral-storage` limit: the rendered request would exceed the limit.
+/// A limit that does not parse as a quantity is left for the apiserver to
+/// name.
+fn validate_maintain_scratch(spec: &RavelClusterSpec) -> Result<(), RenderError> {
+    let Some(scratch) = &spec.maintain.scratch else {
+        return Ok(());
+    };
+    let limit = spec
+        .maintain
+        .resources
+        .as_ref()
+        .and_then(|r| r.limits.as_ref())
+        .and_then(|l| l.get("ephemeral-storage"));
+    if let Some(limit) = limit {
+        if parse_memory_quantity(limit).is_ok_and(|bytes| bytes < scratch_bytes(scratch)) {
+            return Err(RenderError::MaintainScratchExceedsEphemeralLimit {
+                size_gi: scratch.size_gi,
+                limit: limit.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Add an `ephemeral-storage` request of `sizeGi` to the ravel-server
 /// container, so the scheduler places the pod on a node with room for the
 /// volume. It replaces any `ephemeral-storage` request in
-/// `spec.maintain.resources`; the other requests and limits are kept.
+/// `spec.maintain.resources`; the other requests and limits are kept
+/// ([`validate_maintain_scratch`] has refused a smaller `ephemeral-storage`
+/// limit).
 fn request_scratch_ephemeral_storage(deployment: &mut Deployment, scratch: &MaintainScratchSpec) {
     let containers = deployment
         .spec
@@ -4461,6 +4517,11 @@ pub enum MaintainTier {
     /// controller neither applies nor deletes, so a live maintain Deployment
     /// keeps running unchanged and none is created.
     Withheld,
+    /// The maintain tier is enabled but its spec cannot render for the
+    /// reason given (today only
+    /// [`RenderError::MaintainScratchExceedsEphemeralLimit`]). Handled like
+    /// [`Self::Withheld`]: neither applied nor deleted.
+    Refused(RenderError),
     /// Apply this Deployment.
     Apply(Box<Deployment>),
 }
@@ -4470,7 +4531,7 @@ impl MaintainTier {
     pub fn deployment(&self) -> Option<&Deployment> {
         match self {
             Self::Apply(deployment) => Some(deployment),
-            Self::Disabled | Self::Withheld => None,
+            Self::Disabled | Self::Withheld | Self::Refused(_) => None,
         }
     }
 
@@ -4478,7 +4539,7 @@ impl MaintainTier {
     pub fn into_deployment(self) -> Option<Deployment> {
         match self {
             Self::Apply(deployment) => Some(*deployment),
-            Self::Disabled | Self::Withheld => None,
+            Self::Disabled | Self::Withheld | Self::Refused(_) => None,
         }
     }
 }
@@ -4654,6 +4715,9 @@ pub fn desired_objects(
             Ok(Some(deployment)) => MaintainTier::Apply(Box::new(deployment)),
             Ok(None) => MaintainTier::Disabled,
             Err(RenderError::MaintainKeySecretRefMissing) => MaintainTier::Withheld,
+            Err(err @ RenderError::MaintainScratchExceedsEphemeralLimit { .. }) => {
+                MaintainTier::Refused(err)
+            }
             Err(err) => return Err(err),
         },
         pod_disruption_budgets: desired_pod_disruption_budgets(spec, instance),
