@@ -32,8 +32,8 @@ use crate::distrib::WallDeadline;
 use crate::erasure::ErasurePredicate;
 use crate::error::{FoldLag, QueryError};
 use crate::fetcher::{
-    FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa, ReadCache, SamplePriority,
-    SegmentFetcher,
+    DictionaryProbeStats, FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa,
+    ReadCache, SamplePriority, SegmentFetcher,
 };
 use crate::io_shape::{IoShapeCounts, PlanClass, QueryIoShape};
 use crate::limiter::GetLimiter;
@@ -77,6 +77,18 @@ pub struct QueryStats {
     pub segments_fetched: u64,
     /// Snapshot-sourced segments postings pruning excluded.
     pub segments_pruned: u64,
+    /// Fetched sparse objects the dictionary-first probe dropped because
+    /// their LABEL_DICT lacked a positive equality name or value (ADR-3694
+    /// decision 1, issue #3862). Counted within `segments_fetched`, which
+    /// counts the objects opened, not the objects that yielded series.
+    pub segments_pruned_by_dictionary: u64,
+    /// Fetched sparse objects whose probe read LABEL_DICT alone before the
+    /// rest of the catalog.
+    pub segments_probed_two_step: u64,
+    /// True when the statement's first two-step probes (as many as its PromQL
+    /// fetch fan-out) dropped fewer than half their objects, so its remaining
+    /// objects were probed in one step.
+    pub dictionary_probe_switched_off: bool,
     /// Page-fetch counters summed across every segment this query opened
     /// (`FetchStats`), no longer discarded at the
     /// `fetch_all_samples_and_histograms` call site (ADR-0044). Distinct
@@ -143,10 +155,14 @@ impl QueryStats {
         phase_accounting: PhaseAccountingSnapshot,
         estimate: CostEstimate,
         io_shape: QueryIoShape,
+        dictionary_probe: DictionaryProbeStats,
     ) -> Self {
         QueryStats {
             segments_fetched,
             segments_pruned,
+            segments_pruned_by_dictionary: dictionary_probe.segments_pruned_by_dictionary,
+            segments_probed_two_step: dictionary_probe.segments_probed_two_step,
+            dictionary_probe_switched_off: dictionary_probe.switched_off,
             page_stats,
             accounting: phase_accounting.pooled(),
             phase_accounting,
@@ -167,6 +183,9 @@ impl Default for QueryStats {
         QueryStats {
             segments_fetched: 0,
             segments_pruned: 0,
+            segments_pruned_by_dictionary: 0,
+            segments_probed_two_step: 0,
+            dictionary_probe_switched_off: false,
             page_stats: FetchStats::default(),
             accounting: QueryAccountingSnapshot::default(),
             phase_accounting: PhaseAccountingSnapshot::default(),
@@ -2037,6 +2056,14 @@ impl QueryEngine {
             // dedup `service_fetch_multiplier` below was sized from, so the
             // two never drift onto two different notions of "distinct".
             let distinct_plans = distinct_plans_by_matcher(plans);
+            // ADR-3694 decision 1 as amended for issue #3862: a statement
+            // whose only positive equalities are names the postings already
+            // applied cannot miss in any dictionary, so it never pays the
+            // two-step probe's extra GET.
+            accounting.dictionary_probe().arm(
+                concurrency,
+                only_name_equalities(&distinct_plans) && snapshot.segments_pruned > 0,
+            );
             // ADR-0103 eligibility gate, evaluated ONCE per query over the whole
             // resolved snapshot's segment set and the generation history THIS
             // resolve produced (never a per-matcher-set subset, never a
@@ -2532,6 +2559,7 @@ impl QueryEngine {
                             second_accounting.snapshot(),
                             second_estimate,
                             second_io_shape,
+                            second_accounting.dictionary_probe().stats(),
                         ),
                     )),
                     Err(other) => Err(other),
@@ -2546,6 +2574,7 @@ impl QueryEngine {
                     first_accounting.snapshot(),
                     first_estimate,
                     first_io_shape,
+                    first_accounting.dictionary_probe().stats(),
                 ),
             )),
             Err(other) => Err(other),
@@ -3929,6 +3958,17 @@ fn shared_equality_name_filter<'a>(plans: &'a [SelectorPlan]) -> Option<Cow<'a, 
         }
     }
     shared
+}
+
+/// Whether every non-empty positive equality across `plans` matches
+/// `__name__`, the statement shape whose dictionary-first probe prunes
+/// nothing once the name postings applied (issue #3862).
+fn only_name_equalities(plans: &[SelectorPlan]) -> bool {
+    plans
+        .iter()
+        .flat_map(|plan| &plan.matchers)
+        .filter(|m| m.op == MatchOp::Eq && !m.value.is_empty())
+        .all(|m| m.name == METRIC_NAME_LABEL)
 }
 
 /// Deduplicates `plans` by matcher equality, keeping the first plan seen for

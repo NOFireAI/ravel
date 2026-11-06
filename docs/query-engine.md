@@ -1058,8 +1058,9 @@ shape (docs/segment-format.md, ADR-0026):
   does. Each catalog section the decode reads has its crc32c re-verified on
   the fetched bytes, so a mis-ranged or corrupt fetch is a typed error, never
   wrong data. The matching decode reads only LABEL_DICT when an equality
-  name or value is absent from it; the other three sections are fetched but
-  neither verified nor decoded in that case.
+  name or value is absent from it; under the one-step probe the other three
+  sections are fetched but neither verified nor decoded in that case, and
+  under the dictionary-first probe below they are not fetched at all.
 - **Otherwise** (a sparse object that does not qualify) the fetcher keeps the
   unchanged whole-object GET and `decode_catalog_v5`.
 
@@ -1075,6 +1076,44 @@ is set
 conservatively (256 KiB: above the four fixed 64 KiB suffix/gap probes, far
 below any real compacted sparse L1 segment) rather than fit to a measured point.
 The within-segment GET/byte model is the `selective_read_accounting` bench.
+
+### The dictionary-first probe and its per-statement gate (ADR-3694 decision 1)
+
+On the catalog-probe path, a selector with at least one non-empty positive
+equality matcher (`__name__` included) can take a two-step probe. Step one
+GETs the LABEL_DICT range alone and checks it with
+`ravel_segment::label_dict_holds_all`, under one fetch-memory reservation for
+the inflated dictionary that is released as soon as the answer is known. When
+any matched name or value is absent, the object holds no matching series: it
+is dropped with no further GET and counted in `segmentsPrunedByDictionary`.
+Otherwise step two GETs the other three catalog sections as one coalesced
+request and the decode above runs unchanged; LABEL_DICT is not fetched again.
+A corrupt dictionary at step one is the same typed corrupt-segment error the
+one-step probe reports. `!=`, regex and empty-value matchers take no part in
+the check, and a selector without a positive equality runs the one-step
+probe. An object at or under the 512 KiB whole-object threshold already holds
+its whole catalog after the first GET and never takes step one.
+
+Step one pays one extra GET for every object whose dictionary holds the
+values, so the engine gates it per statement (`DictionaryProbeGate`, the
+ADR's probe gate amendment):
+
+- A statement whose only positive equality matchers are `__name__` values,
+  and whose snapshot the name postings already pruned (`segmentsPruned` above
+  zero), runs the one-step probe for every object.
+- Every other statement starts two-step. At most `K` two-step probes run
+  before the decision, `K` being the statement's PromQL fetch fan-out
+  (`promql_fetch_fanout`). Once `K` have completed, if fewer than half dropped
+  their object, the statement's remaining objects use the one-step probe.
+  Probes already in flight keep the mode they started with.
+- A statement's extra GETs over the one-step probe are therefore at most `K`
+  plus the probes in flight at the switch, at most twice the fan-out. Both
+  probes decode the same catalog, so results are bit-identical; only the
+  request count differs.
+
+The gate is armed by the PromQL metrics fetch (`prefetch_metric_plans`). The
+SQL, distributed and series-listing fetches leave it unarmed and run the
+one-step probe. A dropped object still counts in `segmentsFetched`.
 
 ### The L0 page-range bound (ADR-1306)
 
@@ -3502,6 +3541,12 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   fetched, and `segmentsPruned` is the rest of the resolved snapshot. The
   log lane's catalog resolve passes no name filter, so it prunes nothing
   of its own.
+- `stats.segmentsPrunedByDictionary`, `stats.segmentsProbedTwoStep`,
+  `stats.dictionaryProbeSwitchedOff`: the dictionary-first probe's figures
+  (see "The dictionary-first probe and its per-statement gate"). The first
+  counts objects dropped because their LABEL_DICT lacked a matched name or
+  value, the second counts objects that took the two-step probe, and the
+  third is whether the statement's gate switched to the one-step probe.
 - `stats.estimate`: the `CostEstimate`, carrying `estimatedRequests`,
   `estimatedStoreBytes`, `estimatedDecompressedBytes`, `segments`,
   `series`.

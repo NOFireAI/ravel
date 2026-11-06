@@ -49,8 +49,8 @@ pub use reader::{
 /// series' runs.
 pub use sparse::{
     ChunkLocation, IdWindow, SparseIdIndex, decode_catalog_v5, decode_catalog_v5_chunked,
-    decode_catalog_v5_chunked_matching, decode_chunk_runs, find_index_in_window, parse_series_idx,
-    verify_and_decompress_chunk_frame, verify_id_window,
+    decode_catalog_v5_chunked_matching, decode_chunk_runs, find_index_in_window,
+    label_dict_holds_all, parse_series_idx, verify_and_decompress_chunk_frame, verify_id_window,
 };
 pub use writer::{
     CompactionMetaV4, HistogramSample, IngestBounds, RunInputV4, RunInputV7, RunValuePageV4,

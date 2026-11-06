@@ -233,6 +233,8 @@ catalog is the size of a dictionary.
 - Reads stay inside ADR-1170: each step reserves its own bytes and holds
   them only while decoding.
 
+The probe gate amendment below gates this per statement.
+
 ### 2. The fold builds a label-value index for metrics parts, in the `.kidx` leaf
 
 ADR-0020's alternative 5 is amended, not reversed. Its "build cost is a
@@ -488,7 +490,8 @@ ravel-server at 2 CPUs and 8 GiB, the build's SHA and the catalog state
 stamped before the first statement and after any fold, five cold
 repetitions per statement (restart between), the MetricsBench harness and
 corpus at their frozen versions. "Holders" is the stamped number of
-objects that contain the statement's series.
+objects that contain the statement's series. Rows 4 and 12 are read with
+the probe gate amendment's extra-GET allowance.
 
 | check | target | miss | source |
 |---|---|---|---|
@@ -530,3 +533,32 @@ T8, then the final docs task. T9 dispatches only on its trigger. Each
 wave's checkpoint review runs before its pull requests open; every
 acceptance row above is named in its task's spec and re-run at the
 checkpoint.
+
+## Amendment (issue #3862): the dictionary-first probe is gated per statement
+
+<!-- amendment-applies: sections="1. The unfolded probe reads the dictionary first, and stops on a miss|Acceptance (pre-registered; a figure outside its band is a miss, investigated before the epic closes)" pointer="probe gate amendment" -->
+
+Decision 1 as written adds one GET for every object whose dictionary holds
+the matched values. On a selector that matches only a name the postings
+already applied, or a low-cardinality value every object holds (R6's
+`mb_fanout_total_rate`, the `full_range` statements,
+`mb_selective_job_rate_sum`), step one prunes nothing and the extra GET is
+pure cost: about 2,900 GETs on a statement that issues 5,786 today. The
+two-step probe is therefore gated per statement:
+
+- A statement whose only positive equality matchers are `__name__` values,
+  and whose snapshot the name postings already pruned, runs the one-step
+  probe.
+- Every other qualifying statement starts two-step. After its first `K`
+  two-step probes complete, `K` being the statement's PromQL fetch fan-out,
+  if fewer than half dropped their object, its remaining objects use the
+  one-step probe. Both probes decode the same catalog exactly; only the
+  request count differs.
+- `segmentsProbedTwoStep` and `dictionaryProbeSwitchedOff` are reported
+  beside `segmentsPrunedByDictionary`.
+- A statement's extra GETs over the one-step probe are bounded by `K` plus
+  the probes in flight when the switch fires, at most twice the fan-out.
+
+Acceptance rows 4 and 12 read "no GET increase" and "any extra GET" as
+more than twice the PromQL fetch fan-out extra GETs per statement the
+router does not prune.
