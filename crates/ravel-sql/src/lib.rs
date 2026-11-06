@@ -145,6 +145,7 @@ pub use bucketed_final_aggregate::{
     BUCKETED_FINAL_AGGREGATE_CONSUMER_PREFIX, BUCKETED_FINAL_AGGREGATE_MAX_BITS,
     BUCKETED_FINAL_AGGREGATE_RULE, BucketedFinalAggregateExec, BucketedFinalAggregateRule,
 };
+pub use checked_arithmetic::{CHECKED_INTEGER_ARITHMETIC_RULE, CheckedIntegerArithmetic};
 pub use compact_slices::{COMPACT_SLICES_RULE, CompactSlices, CompactSlicesExec, TopKPrefilter};
 pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex, structural_count};
 pub use config::{

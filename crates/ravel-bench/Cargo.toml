@@ -457,6 +457,12 @@ required-features = ["flight-egress"]
 bench = false
 
 [[bin]]
+name = "checked_arithmetic_bench"
+path = "src/bin/checked_arithmetic_bench.rs"
+required-features = ["sql-latency"]
+bench = false
+
+[[bin]]
 name = "groupby_scaling_bench"
 path = "src/bin/groupby_scaling_bench.rs"
 required-features = ["sql-latency"]
