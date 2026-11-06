@@ -24,7 +24,7 @@ use ravel_types::accounting::QueryAccounting;
 
 use crate::memory::{
     AggregateReserveAhead, CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant,
-    process_envelope_width,
+    process_envelope_width, spill_margin,
 };
 
 /// Default per-query RecordBatch byte budget: 256 MiB. This is the shipped
@@ -655,6 +655,34 @@ impl SqlConfig {
                 self.aggregate_reserve_ahead,
                 process_envelope_width(self.engine.sql_partition_count()),
             ),
+        );
+        (pool, breach)
+    }
+
+    /// [`Self::query_pool`] in spill mode: the same pool, with its
+    /// spill-capable consumers capped `H` bytes below `max_query_bytes` (`L`)
+    /// so the consumers that cannot spill keep that room
+    /// ([`TenantDelegatingPool::with_spill_margin`]). `H` is
+    /// [`spill_margin`]`(L)`, `max(64 MiB, 10% of L)`, a hypothesis to be
+    /// re-derived from the measured peak non-spillable bytes.
+    pub fn query_pool_spill_mode(
+        &self,
+        tenant: Arc<TenantMemoryAccountant>,
+        accounting: QueryAccounting,
+    ) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
+        let breach = CeilingBreach::new();
+        let pool = Arc::new(
+            TenantDelegatingPool::new(
+                self.max_query_bytes,
+                tenant,
+                Arc::clone(&breach),
+                accounting,
+            )
+            .with_aggregate_reserve_ahead(
+                self.aggregate_reserve_ahead,
+                process_envelope_width(self.engine.sql_partition_count()),
+            )
+            .with_spill_margin(spill_margin(self.max_query_bytes)),
         );
         (pool, breach)
     }

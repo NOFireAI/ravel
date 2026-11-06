@@ -101,7 +101,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use datafusion::arrow::datatypes::DataType;
@@ -1048,9 +1048,9 @@ fn clear_pool_envelopes(budget: &Arc<MemoryBudget>, pool_id: u64) {
     }
 }
 
-/// Envelope bytes currently on `budget`, for tests that share the process
-/// ledger with every other test in the binary.
-#[cfg(test)]
+/// Envelope bytes currently on `budget`: what a refusal names as the process
+/// aggregate envelope, and what tests that share the process ledger with
+/// every other test in the binary read.
 fn envelope_on_budget(budget: &Arc<MemoryBudget>) -> u64 {
     envelope_ledger()
         .get(&budget_key(budget))
@@ -1127,6 +1127,123 @@ pub(crate) fn take_profiles_set_on_this_thread() -> Vec<AggregateProfile> {
 /// the process ledger.
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(0);
 
+/// The floor of the spill-mode margin `H` ([`spill_margin`]): 64 MiB.
+///
+/// `H` is a hypothesis, not a measurement: the room the non-spillable
+/// consumers are assumed to need while the spill-capable ones are capped at
+/// `L - H`. Re-derive both halves of it from the measured peak non-spillable
+/// bytes ([`TenantDelegatingPool::peak_non_spillable_bytes`]) once a run has
+/// recorded them (issue #3899).
+pub const SPILL_MARGIN_FLOOR_BYTES: usize = 64 << 20;
+
+/// The fraction of the per-query limit `L`, in percent, that the spill-mode
+/// margin `H` is at least ([`spill_margin`]). The same hypothesis as
+/// [`SPILL_MARGIN_FLOOR_BYTES`], to be re-derived the same way.
+pub const SPILL_MARGIN_PERCENT_OF_LIMIT: usize = 10;
+
+/// The spill-mode margin `H` for a per-query limit of `query_limit` bytes:
+/// `max(SPILL_MARGIN_FLOOR_BYTES, SPILL_MARGIN_PERCENT_OF_LIMIT% of L)`.
+pub fn spill_margin(query_limit: usize) -> usize {
+    let share = (query_limit as u128 * SPILL_MARGIN_PERCENT_OF_LIMIT as u128 / 100) as usize;
+    SPILL_MARGIN_FLOOR_BYTES.max(share)
+}
+
+/// How many of the largest holders a refusal message names.
+const REFUSAL_HOLDERS: usize = 3;
+
+/// What one consumer has charged to a query pool, for refusal attribution.
+#[derive(Debug)]
+struct ConsumerCharge {
+    name: String,
+    can_spill: bool,
+    /// Bytes charged to the query ledger on this consumer's behalf, held
+    /// bytes included.
+    charged: usize,
+}
+
+/// Every consumer's charge on one query pool, and the spillable and
+/// non-spillable totals. Charged amounts are the query ledger's, after any
+/// reserve-ahead factor; a held shrink stays in them until it is released.
+#[derive(Debug, Default)]
+struct ConsumerLedger {
+    consumers: HashMap<usize, ConsumerCharge>,
+    spillable: usize,
+    non_spillable: usize,
+    peak_non_spillable: usize,
+}
+
+impl ConsumerLedger {
+    fn entry(&mut self, consumer: &MemoryConsumer) -> &mut ConsumerCharge {
+        self.consumers
+            .entry(consumer.id())
+            .or_insert_with(|| ConsumerCharge {
+                name: consumer.name().to_string(),
+                can_spill: consumer.can_spill(),
+                charged: 0,
+            })
+    }
+
+    fn add(&mut self, consumer: &MemoryConsumer, amount: usize) {
+        let entry = self.entry(consumer);
+        entry.charged = entry.charged.saturating_add(amount);
+        if entry.can_spill {
+            self.spillable = self.spillable.saturating_add(amount);
+        } else {
+            self.non_spillable = self.non_spillable.saturating_add(amount);
+            self.peak_non_spillable = self.peak_non_spillable.max(self.non_spillable);
+        }
+    }
+
+    fn remove(&mut self, id: usize, amount: usize) {
+        let Some(entry) = self.consumers.get_mut(&id) else {
+            return;
+        };
+        let amount = amount.min(entry.charged);
+        entry.charged -= amount;
+        if entry.can_spill {
+            self.spillable = self.spillable.saturating_sub(amount);
+        } else {
+            self.non_spillable = self.non_spillable.saturating_sub(amount);
+        }
+    }
+
+    /// Drop consumer `id`'s entry once it charges nothing.
+    fn forget(&mut self, id: usize) {
+        if self.consumers.get(&id).is_some_and(|entry| entry.charged == 0) {
+            self.consumers.remove(&id);
+        }
+    }
+
+    fn can_spill(&self, id: usize) -> bool {
+        self.consumers.get(&id).is_some_and(|entry| entry.can_spill)
+    }
+
+    /// The `n` consumers charging the most, largest first, ties by name.
+    fn top_holders(&self, n: usize) -> Vec<&ConsumerCharge> {
+        let mut holders: Vec<&ConsumerCharge> = self
+            .consumers
+            .values()
+            .filter(|entry| entry.charged > 0)
+            .collect();
+        holders.sort_by(|a, b| b.charged.cmp(&a.charged).then_with(|| a.name.cmp(&b.name)));
+        holders.truncate(n);
+        holders
+    }
+}
+
+/// The envelopes of the spill-capable aggregates in `aggregates`, leaving out
+/// consumer `except`.
+fn spillable_envelopes(
+    aggregates: &HashMap<usize, AggregateState>,
+    ledger: &ConsumerLedger,
+    except: Option<usize>,
+) -> usize {
+    aggregates
+        .iter()
+        .filter(|(id, _)| Some(**id) != except && ledger.can_spill(**id))
+        .fold(0usize, |sum, (_, state)| sum.saturating_add(state.envelope))
+}
+
 /// The query's DataFusion `MemoryPool`: enforces a per-query byte ceiling and
 /// forwards all accounting to a shared [`TenantMemoryAccountant`].
 ///
@@ -1175,6 +1292,17 @@ pub struct TenantDelegatingPool {
     asked_used: AtomicUsize,
     /// The high-water mark of `asked_used`.
     peak_asked_bytes: AtomicU64,
+    /// Each consumer's charge, keyed by `MemoryConsumer::id`. Locked after
+    /// `aggregates` and before `held` and the process envelope ledger.
+    consumers: Mutex<ConsumerLedger>,
+    /// Set by the first grow refused for memory: by the query, tenant or
+    /// process budget, or by the aggregate reserve-ahead.
+    refused: AtomicBool,
+    /// In spill mode, the bytes the spill-capable consumers' charges and
+    /// envelopes may reach: `query_limit - H`. `None` outside spill mode.
+    spill_cap: Option<usize>,
+    /// How many grows the spill cap turned into a spill trigger.
+    spill_cap_refusals: AtomicU64,
 }
 
 impl fmt::Debug for TenantDelegatingPool {
@@ -1234,7 +1362,116 @@ impl TenantDelegatingPool {
             aggregate_profile: Mutex::new(None),
             asked_used: AtomicUsize::new(0),
             peak_asked_bytes: AtomicU64::new(0),
+            consumers: Mutex::new(ConsumerLedger::default()),
+            refused: AtomicBool::new(false),
+            spill_cap: None,
+            spill_cap_refusals: AtomicU64::new(0),
         }
+    }
+
+    /// Spill mode: cap the spill-capable consumers `margin` bytes below the
+    /// per-query limit `L`, so the consumers that cannot spill keep that room.
+    ///
+    /// A `try_grow` of a consumer whose `can_spill` is set is refused with
+    /// `ResourcesExhausted`, the error DataFusion's spilling operators answer
+    /// by spilling, once the spill-capable consumers' charged bytes plus their
+    /// reserve-ahead envelopes would exceed `L - margin`. Every other rule is
+    /// unchanged: a consumer that cannot spill may still grow to `L`, and the
+    /// infallible `grow` is never refused. A spill-cap refusal does not set
+    /// [`Self::refused`]; [`Self::spill_cap_refusals`] counts it.
+    pub fn with_spill_margin(mut self, margin: usize) -> Self {
+        self.spill_cap = Some(self.query_limit.saturating_sub(margin));
+        self
+    }
+
+    /// The spill-mode cap `L - H`, or `None` outside spill mode.
+    pub fn spill_cap(&self) -> Option<usize> {
+        self.spill_cap
+    }
+
+    /// Whether any grow on this pool was refused for memory: by the query,
+    /// tenant or process budget, or by the aggregate reserve-ahead. A grow
+    /// through the infallible `grow`, which can overshoot but never refuses,
+    /// leaves it false, and so does a spill-cap refusal.
+    pub fn refused(&self) -> bool {
+        self.refused.load(Ordering::Acquire)
+    }
+
+    /// How many `try_grow` calls the spill-mode cap refused as a spill trigger.
+    pub fn spill_cap_refusals(&self) -> u64 {
+        self.spill_cap_refusals.load(Ordering::Acquire)
+    }
+
+    /// The high-water mark, over this pool's life, of the bytes charged to
+    /// consumers that cannot spill, held bytes included.
+    pub fn peak_non_spillable_bytes(&self) -> u64 {
+        self.consumers_ledger().peak_non_spillable as u64
+    }
+
+    fn consumers_ledger(&self) -> MutexGuard<'_, ConsumerLedger> {
+        self.consumers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The tail every memory refusal carries: who asked, the largest holders,
+    /// what the non-spillable consumers hold and the process aggregate
+    /// envelope. Consumer names are DataFusion operator names, so the text
+    /// carries no tenant data.
+    fn attribution(&self, ledger: &ConsumerLedger, consumer: &MemoryConsumer, asked: usize) -> String {
+        let holders = ledger.top_holders(REFUSAL_HOLDERS);
+        let holders = if holders.is_empty() {
+            "none".to_string()
+        } else {
+            holders
+                .iter()
+                .map(|entry| format!("{} {} bytes", entry.name, entry.charged))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "; asked by {} (can_spill={}) for {asked} bytes; top holders: {holders}; \
+             non-spillable consumers hold {} bytes; process aggregate envelope {} bytes",
+            consumer.name(),
+            consumer.can_spill(),
+            ledger.non_spillable,
+            envelope_on_budget(&self.tenant.budget)
+        )
+    }
+
+    /// In spill mode, refuse a spill-capable consumer's grow that would take
+    /// the spill-capable charges and envelopes past the cap. `charged` is the
+    /// grow's new charge and `envelopes` every spill-capable envelope the
+    /// grow would leave, its own included.
+    fn check_spill_cap(
+        &self,
+        ledger: &ConsumerLedger,
+        consumer: &MemoryConsumer,
+        asked: usize,
+        charged: usize,
+        envelopes: usize,
+    ) -> DFResult<()> {
+        let Some(cap) = self.spill_cap else {
+            return Ok(());
+        };
+        if !consumer.can_spill() {
+            return Ok(());
+        }
+        let would = ledger
+            .spillable
+            .saturating_add(charged)
+            .saturating_add(envelopes);
+        if would <= cap {
+            return Ok(());
+        }
+        self.spill_cap_refusals.fetch_add(1, Ordering::AcqRel);
+        Err(DataFusionError::ResourcesExhausted(format!(
+            "query memory spill cap reached: {charged} more bytes would bring the spill-capable \
+             consumers to {would} bytes with {envelopes} bytes of envelopes, over the spill cap \
+             {cap} of per-query limit {}{}",
+            self.query_limit,
+            self.attribution(ledger, consumer, asked)
+        )))
     }
 
     /// Charge the migrated hash aggregate streams ahead of what they ask for,
@@ -1418,28 +1655,36 @@ impl TenantDelegatingPool {
         let mut aggregates = self.aggregates_map();
         let state = aggregates.get(&id).copied().unwrap_or_default();
         let next = state.grown(additional, &self.reserve_ahead, self.aggregate_profile());
-        if next.envelope != state.envelope {
-            self.set_envelope(id, next.envelope, EnvelopeCheck::Checked)
-                .map_err(|refused| {
-                    DataFusionError::ResourcesExhausted(format!(
-                        "aggregate reserve-ahead refused: {additional} bytes asked by {} need \
-                         the process aggregate envelope to grow by {} bytes: {}",
-                        consumer.name(),
-                        refused.delta,
-                        refused.exhausted
-                    ))
-                })?;
-        }
         let charged = self
             .reserve_ahead
             .charge(next.asked)
             .saturating_sub(self.reserve_ahead.charge(state.asked));
-        if let Err(error) = self.try_grow_charged(consumer, charged) {
+        let mut ledger = self.consumers_ledger();
+        if self.spill_cap.is_some() {
+            let envelopes =
+                spillable_envelopes(&aggregates, &ledger, Some(id)).saturating_add(next.envelope);
+            self.check_spill_cap(&ledger, consumer, additional, charged, envelopes)?;
+        }
+        if next.envelope != state.envelope {
+            if let Err(refused) = self.set_envelope(id, next.envelope, EnvelopeCheck::Checked) {
+                self.refused.store(true, Ordering::Release);
+                return Err(DataFusionError::ResourcesExhausted(format!(
+                    "aggregate reserve-ahead refused: {additional} bytes asked by {} need \
+                     the process aggregate envelope to grow by {} bytes: {}{}",
+                    consumer.name(),
+                    refused.delta,
+                    refused.exhausted,
+                    self.attribution(&ledger, consumer, additional)
+                )));
+            }
+        }
+        if let Err(error) = self.try_grow_charged(&mut ledger, consumer, charged, additional) {
             if next.envelope != state.envelope {
                 self.set_envelope_unchecked(id, state.envelope);
             }
             return Err(error);
         }
+        drop(ledger);
         self.asked_grow(next.asked.saturating_sub(state.asked));
         aggregates.insert(id, next);
         Ok(())
@@ -1500,12 +1745,20 @@ impl TenantDelegatingPool {
         let excess = amount - from_held;
         if excess > 0 {
             self.charge(excess);
+            self.consumers_ledger().add(consumer, excess);
         }
     }
 
     /// Charge `amount` bytes for `consumer` on all three budgets or none,
-    /// serving what its hold covers from the hold.
-    fn try_grow_charged(&self, consumer: &MemoryConsumer, amount: usize) -> DFResult<()> {
+    /// serving what its hold covers from the hold. `asked` is what the
+    /// consumer asked for before any reserve-ahead factor, for the refusal.
+    fn try_grow_charged(
+        &self,
+        ledger: &mut ConsumerLedger,
+        consumer: &MemoryConsumer,
+        amount: usize,
+        asked: usize,
+    ) -> DFResult<()> {
         let from_held = if self.may_hold(consumer) {
             self.take_held(consumer.id(), amount)
         } else {
@@ -1515,13 +1768,24 @@ impl TenantDelegatingPool {
         if excess == 0 {
             return Ok(());
         }
-        let charged = self.try_charge(excess);
-        if charged.is_err() && from_held > 0 {
-            // A refused try_grow leaves the reservation's size unchanged, so
-            // the bytes taken from the hold go back to it.
-            self.hold(consumer.id(), from_held);
+        match self.try_charge(excess) {
+            Ok(()) => {
+                ledger.add(consumer, excess);
+                Ok(())
+            }
+            Err(refusal) => {
+                if from_held > 0 {
+                    // A refused try_grow leaves the reservation's size
+                    // unchanged, so the bytes taken from the hold go back to
+                    // it.
+                    self.hold(consumer.id(), from_held);
+                }
+                Err(DataFusionError::ResourcesExhausted(format!(
+                    "{refusal}{}",
+                    self.attribution(ledger, consumer, asked)
+                )))
+            }
         }
-        charged
     }
 
     /// Add `amount` to consumer `id`'s hold. The bytes stay charged.
@@ -1617,16 +1881,25 @@ impl TenantDelegatingPool {
     }
 
     /// The checked charge behind [`MemoryPool::try_grow`]: all three budgets
-    /// or none.
-    fn try_charge(&self, additional: usize) -> DFResult<()> {
+    /// or none. A refusal sets [`Self::refused`] and returns the message's
+    /// leading text, which the caller completes with the attribution.
+    fn try_charge(&self, additional: usize) -> Result<(), String> {
+        let refused = self.try_charge_unflagged(additional);
+        if refused.is_err() {
+            self.refused.store(true, Ordering::Release);
+        }
+        refused
+    }
+
+    fn try_charge_unflagged(&self, additional: usize) -> Result<(), String> {
         // Query budget first: a query must trip its own pool before it can
         // threaten the tenant budget.
         let query_total = self.query_try_grow(additional).map_err(|used| {
-            DataFusionError::ResourcesExhausted(format!(
+            format!(
                 "query memory pool exhausted: {additional} more bytes on top of {used} \
                  already reserved exceeds per-query limit {}",
                 self.query_limit
-            ))
+            )
         })?;
         if let Err(refused) = self.tenant.try_grow(additional) {
             // Roll the query reservation back so a tenant- or process-budget
@@ -1668,7 +1941,7 @@ impl TenantDelegatingPool {
                     ),
                 },
             };
-            return Err(DataFusionError::ResourcesExhausted(message));
+            return Err(message);
         }
         // Observed only once BOTH budgets have granted the growth. Recording it
         // before the tenant check leaves a peak for bytes that no successful
@@ -1751,6 +2024,11 @@ impl MemoryPool for TenantDelegatingPool {
         if released > 0 {
             self.release(released);
         }
+        {
+            let mut ledger = self.consumers_ledger();
+            ledger.remove(consumer.id(), released);
+            ledger.forget(consumer.id());
+        }
         let before = self.registered.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(
             before != 1 || self.held_bytes() == 0,
@@ -1785,6 +2063,7 @@ impl MemoryPool for TenantDelegatingPool {
             self.hold(consumer.id(), charged);
         } else {
             self.release(charged);
+            self.consumers_ledger().remove(consumer.id(), charged);
         }
     }
 
@@ -1793,7 +2072,18 @@ impl MemoryPool for TenantDelegatingPool {
         if self.reserves_ahead(consumer) {
             self.aggregate_try_grow(consumer, additional)
         } else {
-            self.try_grow_charged(consumer, additional)?;
+            // In spill mode a spill-capable grow reads the envelopes, so the
+            // aggregates are locked first, in the pool's lock order.
+            let aggregates =
+                (self.spill_cap.is_some() && consumer.can_spill()).then(|| self.aggregates_map());
+            let mut ledger = self.consumers_ledger();
+            if let Some(aggregates) = &aggregates {
+                let envelopes = spillable_envelopes(aggregates, &ledger, None);
+                self.check_spill_cap(&ledger, consumer, additional, additional, envelopes)?;
+            }
+            self.try_grow_charged(&mut ledger, consumer, additional, additional)?;
+            drop(ledger);
+            drop(aggregates);
             self.asked_grow(additional);
             Ok(())
         }
@@ -1830,6 +2120,19 @@ impl Drop for TenantDelegatingPool {
             HELD_BYTES.fetch_sub(total as u64, Ordering::AcqRel);
             self.release(total);
         }
+        let peak_non_spillable_bytes = self
+            .consumers
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .peak_non_spillable;
+        tracing::debug!(
+            refused = *self.refused.get_mut(),
+            peak_non_spillable_bytes,
+            spill_cap = ?self.spill_cap,
+            spill_cap_refusals = *self.spill_cap_refusals.get_mut(),
+            query_limit = self.query_limit,
+            "SQL query memory pool closed"
+        );
     }
 }
 
