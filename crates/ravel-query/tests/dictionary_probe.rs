@@ -10,10 +10,12 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::body::Body;
+use bytes::Bytes;
 use axum::http::{Request, StatusCode};
 use ravel_catalog::{
     Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
@@ -22,8 +24,11 @@ use ravel_catalog::{
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
-use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::Occurrence;
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
+    PageToken, PutOptions, PutOutcome, StoreError,
+};
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_promql::Value;
@@ -100,6 +105,19 @@ async fn publish_sparse(
     base_ts: i64,
     holds_target: bool,
 ) -> Published {
+    publish_sparse_named(store, tenant_id, object, hour, base_ts, holds_target, METRIC).await
+}
+
+/// [`publish_sparse`] with every series named `metric`.
+async fn publish_sparse_named(
+    store: &dyn ObjectStoreBackend,
+    tenant_id: &TenantId,
+    object: u64,
+    hour: u32,
+    base_ts: i64,
+    holds_target: bool,
+    metric: &str,
+) -> Published {
     let tenant_hash = tenant_id.hash();
     let writer_id = Uuid::from_u128(u128::from(object) + 1);
     let mut inputs = Vec::with_capacity(SERIES_PER_OBJECT);
@@ -112,7 +130,7 @@ async fn publish_sparse(
         let labels = LabelSet::new(vec![
             Label {
                 name: METRIC_NAME_LABEL.to_string(),
-                value: METRIC.to_string(),
+                value: metric.to_string(),
             },
             Label {
                 name: "instance".to_string(),
@@ -124,7 +142,7 @@ async fn publish_sparse(
             },
         ])
         .expect("valid labels");
-        let series_id = SeriesId::compute(tenant_id, METRIC, &labels).expect("series id");
+        let series_id = SeriesId::compute(tenant_id, metric, &labels).expect("series id");
         let samples = (0..SAMPLES_PER_SERIES)
             .map(|j| {
                 let bits = (object.wrapping_mul(0xD6E8_FEB8_6659_FD93))
@@ -439,61 +457,7 @@ async fn postings_applied_name_only_statement_runs_one_step() {
     let th = tid.hash();
     let hour = 7_020u32;
     let objects = publish_fixture(store.as_ref(), &tid, hour, N, 1).await;
-    // One more object holding only another metric, for the postings to prune.
-    let other = LabelSet::new(vec![Label {
-        name: METRIC_NAME_LABEL.to_string(),
-        value: "other_metric".to_string(),
-    }])
-    .expect("valid labels");
-    let written = SegmentWriter::write(
-        vec![SeriesInput {
-            series_id: SeriesId::compute(&tid, "other_metric", &other).expect("series id"),
-            labels: other,
-            samples: vec![Sample {
-                ts_ns: hour_start(hour) + 30 * 60 * NS_PER_SEC,
-                value: 1.0,
-            }],
-        }],
-        SegmentIdentity {
-            tenant_hash: th.0,
-            shard: 0,
-            writer_id: Uuid::from_u128(99).to_string(),
-            writer_epoch: 1,
-            writer_seq: 1,
-        },
-        IngestBounds {
-            min_ingest_ts_ns: 0,
-            max_ingest_ts_ns: 0,
-        },
-    )
-    .expect("write other segment");
-    let rec = record::build(NewCommitRecord {
-        tenant_hash: th,
-        signal: Signal::Metrics,
-        shard: 0,
-        writer_id: Uuid::from_u128(99),
-        writer_epoch: 1,
-        writer_seq: 1,
-        object_size: written.bytes.len() as u64,
-        content_hash: written.summary.blake3,
-        sample_count: written.summary.sample_count,
-        series_count: written.summary.series_count,
-        min_event_ts_ns: written.summary.min_event_ts_ns,
-        max_event_ts_ns: written.summary.max_event_ts_ns,
-        min_ingest_ts_ns: written.summary.min_event_ts_ns,
-        max_ingest_ts_ns: written.summary.max_event_ts_ns,
-        segment_format_version: u32::from(VERSION_V7),
-        created_unix_ns: 0,
-        ingest_hour_bucket: hour,
-    })
-    .expect("valid commit record");
-    let key = keys::reconstruct_data_key(&rec).expect("data key");
-    publish::put_data_object(store.as_ref(), &key, written.bytes)
-        .await
-        .expect("put data object");
-    publish::publish(store.as_ref(), &rec, &RetryPolicy::default())
-        .await
-        .expect("publish");
+    publish_other_metric(store.as_ref(), &tid, hour).await;
 
     let now = now_at_seal(hour);
     let catalog = Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog");
@@ -538,6 +502,224 @@ async fn postings_applied_name_only_statement_runs_one_step() {
         N as usize * SERIES_PER_OBJECT,
         "every series of every object"
     );
+}
+
+/// The name-only rule is per segment: in a partially folded snapshot the
+/// part segments the name postings filtered run the one-step probe, while
+/// the Recent segments the postings never saw go through the gate, and
+/// those whose dictionary lacks the name are dropped by it.
+#[tokio::test]
+async fn name_only_statement_gates_the_segments_the_postings_did_not_filter() {
+    // Sealed and folded: two objects of the metric and one of another, which
+    // the postings prune.
+    const SEALED: u64 = 2;
+    // Listed after the fold: two objects of the metric and two sparse objects
+    // of another metric only, whose dictionaries lack the name.
+    const RECENT_HOLD: u64 = 2;
+    const RECENT_MISS: u64 = 2;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tid = TenantId::new("acme".to_string());
+    let th = tid.hash();
+    let hour = 7_050u32;
+    let sealed = publish_fixture(store.as_ref(), &tid, hour, SEALED, 1).await;
+    publish_other_metric(store.as_ref(), &tid, hour).await;
+
+    let now = now_at_seal(hour);
+    let catalog = Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog");
+    let report = catalog
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
+        .await
+        .expect("fold");
+    assert!(report.postings_built, "postings must build");
+
+    // The same event times, one ingest hour later: unsealed at `now`, so
+    // the snapshot lists them past the folded parts.
+    let base_ts = hour_start(hour) + 30 * 60 * NS_PER_SEC;
+    let mut recent = Vec::new();
+    for object in SEALED..SEALED + RECENT_HOLD + RECENT_MISS {
+        let metric = if object < SEALED + RECENT_HOLD {
+            METRIC
+        } else {
+            "unrelated_metric"
+        };
+        recent.push(
+            publish_sparse_named(store.as_ref(), &tid, object, hour + 1, base_ts, false, metric)
+                .await,
+        );
+    }
+    let (hold, miss) = recent.split_at(RECENT_HOLD as usize);
+
+    let engine = QueryEngine::new(
+        Arc::new(catalog),
+        store,
+        EngineConfig {
+            promql_fetch_fanout: Some(8),
+            max_series: 1 << 20,
+            ..EngineConfig::default()
+        },
+    );
+    let (t_ms, _) = query_at(hour);
+    let (value, stats) = run(&engine, th, METRIC, t_ms, now).await;
+    assert_eq!(
+        stats.segments_pruned, 1,
+        "the postings prune the other_metric part segment"
+    );
+    assert_eq!(
+        stats.segments_fetched,
+        SEALED + RECENT_HOLD + RECENT_MISS,
+        "the Recent segments are not postings-filtered"
+    );
+    assert_eq!(
+        stats.segments_probed_two_step,
+        RECENT_HOLD + RECENT_MISS,
+        "every Recent segment, and no part segment, probes two-step"
+    );
+    assert_eq!(
+        stats.segments_pruned_by_dictionary, RECENT_MISS,
+        "the Recent segments lacking the name are dropped by the dictionary"
+    );
+    assert!(!stats.dictionary_probe_switched_off);
+    assert_eq!(
+        probe_gets(&stats),
+        SEALED + 2 * RECENT_HOLD + RECENT_MISS,
+        "one-step part segments, two GETs per Recent holder, one per Recent miss"
+    );
+    let expected_bytes = sealed.iter().map(|o| o.one_step_bytes).sum::<u64>()
+        + hold
+            .iter()
+            .map(|o| o.dict_bytes + o.rest_bytes)
+            .sum::<u64>()
+        + miss.iter().map(|o| o.dict_bytes).sum::<u64>();
+    assert_eq!(
+        probe_bytes(&stats),
+        expected_bytes,
+        "the part segments read all four sections in one GET"
+    );
+    assert_eq!(
+        vector_bits(&value).len(),
+        (SEALED + RECENT_HOLD) as usize * SERIES_PER_OBJECT,
+        "every series of every object holding the name"
+    );
+}
+
+/// Each selector plan keeps its own gate: in one statement a selective
+/// selector keeps the two-step probe and drops the objects that lack its
+/// value, while a selector every dictionary holds switches its own gate off
+/// after its first K probes, with at most `2K - 1` of them started.
+#[tokio::test]
+async fn each_selector_plan_switches_its_own_gate() {
+    const N: u64 = 8;
+    const H: u64 = 1;
+    const FAN_OUT: u64 = 2;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tid = TenantId::new("acme".to_string());
+    let th = tid.hash();
+    let hour = 7_060u32;
+    publish_fixture(store.as_ref(), &tid, hour, N, H).await;
+    let (t_ms, now) = query_at(hour);
+    let engine = engine(store, FAN_OUT as usize);
+
+    let (value, stats) = run(
+        &engine,
+        th,
+        "probe_metric{instance=\"target\"} or probe_metric{series=\"s1\"}",
+        t_ms,
+        now,
+    )
+    .await;
+    assert!(
+        stats.dictionary_probe_switched_off,
+        "the non-selective plan's gate switched off"
+    );
+    assert_eq!(
+        stats.segments_pruned_by_dictionary,
+        N - H,
+        "the selective plan's gate stayed on for every object"
+    );
+    let non_selective_two_step = stats.segments_probed_two_step - N;
+    assert!(
+        (FAN_OUT..2 * FAN_OUT).contains(&non_selective_two_step),
+        "the non-selective plan started between K and 2K - 1 two-step probes: \
+         {non_selective_two_step}"
+    );
+    assert_eq!(
+        probe_gets(&stats),
+        (N + H) + (N + non_selective_two_step),
+        "selective: N dictionary GETs plus H; non-selective: N plus one per two-step probe"
+    );
+
+    let (one_step_value, _) = run(
+        &engine,
+        th,
+        "{__name__=~\"probe_metric\",instance=~\"target\"} \
+         or {__name__=~\"probe_metric\",series=~\"s1\"}",
+        t_ms,
+        now,
+    )
+    .await;
+    let bits = vector_bits(&value);
+    assert_eq!(bits.len(), (N + H) as usize, "{bits:?}");
+    assert_eq!(bits, vector_bits(&one_step_value));
+}
+
+/// Publishes a one-series dense object holding only `other_metric` into
+/// ingest hour `hour`, for the name postings to prune.
+async fn publish_other_metric(store: &dyn ObjectStoreBackend, tid: &TenantId, hour: u32) {
+    let th = tid.hash();
+    let other = LabelSet::new(vec![Label {
+        name: METRIC_NAME_LABEL.to_string(),
+        value: "other_metric".to_string(),
+    }])
+    .expect("valid labels");
+    let written = SegmentWriter::write(
+        vec![SeriesInput {
+            series_id: SeriesId::compute(tid, "other_metric", &other).expect("series id"),
+            labels: other,
+            samples: vec![Sample {
+                ts_ns: hour_start(hour) + 30 * 60 * NS_PER_SEC,
+                value: 1.0,
+            }],
+        }],
+        SegmentIdentity {
+            tenant_hash: th.0,
+            shard: 0,
+            writer_id: Uuid::from_u128(99).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        },
+        IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        },
+    )
+    .expect("write other segment");
+    let rec = record::build(NewCommitRecord {
+        tenant_hash: th,
+        signal: Signal::Metrics,
+        shard: 0,
+        writer_id: Uuid::from_u128(99),
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: written.bytes.len() as u64,
+        content_hash: written.summary.blake3,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: written.summary.min_event_ts_ns,
+        max_ingest_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: u32::from(VERSION_V7),
+        created_unix_ns: 0,
+        ingest_hour_bucket: hour,
+    })
+    .expect("valid commit record");
+    let key = keys::reconstruct_data_key(&rec).expect("data key");
+    publish::put_data_object(store, &key, written.bytes)
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
 }
 
 /// A value no dictionary holds: every object is dropped at step one, with
@@ -587,7 +769,8 @@ async fn corrupt_dictionary_at_step_one_is_the_one_step_typed_error() {
 
     // The object's first GET is the footer tail; the second is the probe's
     // first catalog GET: LABEL_DICT alone under the two-step probe, all four
-    // sections under the one-step probe.
+    // sections under the one-step probe. Returns the error and the length of
+    // the faulted range.
     let faulted = |query: &'static str| {
         let memory = memory.clone();
         let key = key.clone();
@@ -596,11 +779,15 @@ async fn corrupt_dictionary_at_step_one_is_the_one_step_typed_error() {
                 memory,
                 FaultPlan::empty().with_rule(
                     Rule::new(Op::Get, ScriptedFault::CorruptRange)
-                        .with_key_contains(key)
+                        .with_key_contains(key.clone())
                         .with_occurrence(Occurrence::Nth(2)),
                 ),
             ));
-            let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+            let recording = Arc::new(RangeRecordingStore {
+                inner: store.clone(),
+                gets: Mutex::new(Vec::new()),
+            });
+            let backend: Arc<dyn ObjectStoreBackend> = recording.clone();
             let err = engine(backend, 2)
                 .instant_with_stats(th, query, t_ms, &[], now, Duration::from_secs(30))
                 .await
@@ -610,16 +797,89 @@ async fn corrupt_dictionary_at_step_one_is_the_one_step_typed_error() {
                 1,
                 "the fault must fire exactly once"
             );
-            err
+            let ranges: Vec<GetRange> = recording
+                .gets
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| k.contains(&key))
+                .map(|(_, range)| range.clone())
+                .collect();
+            let faulted_len = match ranges.get(1) {
+                Some(GetRange::Range(start, end)) => end - start,
+                other => panic!("the faulted GET must be a bounded range: {other:?}"),
+            };
+            (err, faulted_len)
         }
     };
-    let two_step = faulted("probe_metric{instance=\"target\"}").await;
-    let one_step = faulted("{__name__=~\"probe_metric\",instance=~\"target\"}").await;
+    let (two_step, two_step_len) = faulted("probe_metric{instance=\"target\"}").await;
+    let (one_step, one_step_len) =
+        faulted("{__name__=~\"probe_metric\",instance=~\"target\"}").await;
+    assert_eq!(
+        two_step_len, objects[0].dict_bytes,
+        "the two-step probe's faulted GET is LABEL_DICT's stored length"
+    );
+    assert_eq!(one_step_len, objects[0].one_step_bytes);
     assert!(
         matches!(two_step, QueryError::Fetch(_)),
         "a typed fetch error: {two_step:?}"
     );
     assert_eq!(format!("{two_step:?}"), format!("{one_step:?}"));
+}
+
+/// Records each GET's key and range, then forwards it.
+struct RangeRecordingStore {
+    inner: Arc<dyn ObjectStoreBackend>,
+    gets: Mutex<Vec<(String, GetRange)>>,
+}
+
+#[async_trait]
+impl ObjectStoreBackend for RangeRecordingStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.gets
+            .lock()
+            .unwrap()
+            .push((key.to_string(), range.clone()));
+        self.inner.get(key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.inner.list_after(prefix, start_after, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
 }
 
 /// The three figures reach `data.stats` on ravel-query's HTTP query path.
