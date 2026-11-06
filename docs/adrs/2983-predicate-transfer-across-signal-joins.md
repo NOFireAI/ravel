@@ -350,17 +350,18 @@ Stages:
 A figure outside its band is a miss, investigated before Stage 3 turns the
 switch on. A figure marked as set at Stage 0 or Stage 1 gets its number in
 that stage's pre-registration comment on the tracking issue, before the
-run. (Stage 0 amendment: the Stage 0 and Stage 1 figures below are now
-set.)
+run. (Stage 0 amendment: the four rows below deferred to Stage 0 or
+Stage 1 now have their numbers, per K, in the amendment's Stage 3
+figures table, which replaces those rows' bands and misses.)
 
 | Figure | Expected band | Miss | Basis |
 |---|---|---|---|
 | Rows returned, transfer on against off, every generated shape | identical multiset, 0 differing rows | any differing row | predicted: exact by construction (decision 2) |
 | Build-side scan requests and wire bytes, on against off | equal | any difference | predicted: transfer never touches the build side (decision 7) |
-| Receiving scan blocks opened, build side at or under k keys | strictly fewer with transfer on; the ratio is set at Stage 0 | not fewer | predicted; figure deferred to Stage 0 |
-| Receiving scan objects opened, build side at or under k keys | at most the transfer-off count; the ratio is set at Stage 0 | more than off | predicted; figure deferred to Stage 0 |
-| Receiving scan `keyIndex` requests (leaf and section probes) | set when Stage 1 fixes the key-set arm's probe shape | outside the Stage 1 band | predicted; figure deferred to Stage 1 |
-| Receiving scan wire bytes per phase, on against off | set at Stage 0 | outside the Stage 0 band | predicted; figure deferred to Stage 0 |
+| Receiving scan blocks opened, build side at or under k keys | strictly fewer with transfer on; the ratio is set at Stage 0 | not fewer | predicted; figure deferred to Stage 0, now set (Stage 0 amendment) |
+| Receiving scan objects opened, build side at or under k keys | at most the transfer-off count; the ratio is set at Stage 0 | more than off | predicted; figure deferred to Stage 0, now set (Stage 0 amendment) |
+| Receiving scan `keyIndex` requests (leaf and section probes) | set when Stage 1 fixes the key-set arm's probe shape | outside the Stage 1 band | predicted; figure deferred to Stage 1, now set (Stage 0 amendment) |
+| Receiving scan wire bytes per phase, on against off | set at Stage 0 | outside the Stage 0 band | predicted; figure deferred to Stage 0, now set (Stage 0 amendment) |
 | KEY_IDX requests caused by transfer, build side over k keys | 0 | any | predicted: no transfer above k (decision 5) |
 | Key-set reservation | at most k times 16 bytes plus the set's own overhead, reserved before use | any unreserved key set | predicted (decision 5) |
 
@@ -446,17 +447,23 @@ receiving scans a set arm:
 - **Hex ids:** `trace_id IN ('<32-hex>', ...)` now plans.
   `TraceIdHexInListRule` rewrites the list before type coercion
   (`crates/ravel-sql/src/trace_id_planner.rs:22-29`).
-- **Probe shape:** a set probe reads the KEY_IDX prefix, then each touched
-  bucket, or makes one ranged read over the touched span above 64 buckets.
-  An object every key is absent from is not opened. A scan with exactly
-  one key arm routes through the key-index leaves.
+- **Probe shape, tier 1:** on an object, a set probe reads the KEY_IDX
+  prefix, then each touched bucket, or makes one ranged read over the
+  touched span above 64 buckets. An object every key is absent from is not
+  opened.
+- **Probe shape, tier 2:** a scan with exactly one key arm routes through
+  the key-index leaves. Per covered part, the router reads the leaf prefix,
+  then up to `B_run` = 64 ranged GETs over the touched buckets, bridging
+  the smallest gaps. It leaves the part `Uncovered` when the bridged bytes
+  would exceed `entry_count x T1_BYTES`, and the scan then probes that
+  part's objects at tier 1 (ADR-3692 decision 2).
 
 That is Stage 1 for a set written in the statement. It is not yet the arm
 transfer needs. Decision 1's filter arrives as a hash-join dynamic filter
 through `handle_child_pushdown_result`, and the logs scan still answers
 `PushedDown::No` for every parent filter there
 (`crates/ravel-sql/src/logs_scan/mod.rs:3264`). Its doc comment, at
-`:3255-3263`, still names a join's filter as one it does nothing with.
+`:3253-3263`, still names a join's filter as one it does nothing with.
 Stage 2 routes a dynamic `IN`-list filter into `key_in` and `trace_ids`.
 The arm's 1,024-key cap equals k (decision 5), so it never binds before k
 does.
@@ -469,7 +476,7 @@ they read:
 | Context cites | Now |
 |---|---|
 | `logs_scan/mod.rs:2769` (`handle_child_pushdown_result`) | `:3264`, still `PushedDown::No` for every parent filter |
-| `logs_scan/mod.rs:2765-2768` (its doc comment) | `:3255-3263` |
+| `logs_scan/mod.rs:2765-2768` (its doc comment) | `:3253-3263` |
 | `trace_id_planner.rs:22-25` (`IN` lists never reach the planner) | `:22-29`, which names `TraceIdHexInListRule` as the path they take now |
 | `spans_pushdown.rs:61-66` (a `trace_id` disjunction refused) | `:61-75`: a disjunction of `=` is still refused; an `IN` list is carried |
 | `logs_pushdown.rs:334` (only `ts` extracts from the fixed columns) | `trace_id` now feeds `key_equals` (`key_equality`, `:716`) and `key_in` (`key_in_list`, `:451`) |
@@ -537,24 +544,34 @@ reads every object and every block whether the join keeps 1 trace or
 
 The receiving arm's own cost bounds what transfer can save. The same run
 measured it as literal `trace_id IN` lists on logs, folded with leaves.
-These are the "set at Stage 0" ratios, taken against the Journey C logs
-scan above (12,511 blocks, 3,806,990,963 B):
+These are the figures the Pre-registered figures table deferred to Stage 0
+and Stage 1. Off is the Journey C logs scan above: 548 objects, 12,511
+blocks, 0 `keyIndex` requests, and 3,806,990,963 B (resolve 33, scan
+3,806,990,930).
 
-| Receiving logs scan, transfer on against off | band | miss | source |
-|---|---|---|---|
-| blocks, K = 1 | at most 0.0013 of off (16 of 12,511, the 1-key list) | not fewer than off | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1`) |
-| wire bytes, K = 1 | at most 0.0013 of off (4,835,567 B) | over 0.01 of off | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1`) |
-| blocks, K = 102 | at most 0.20 of off (2,425 of 12,511 at 100 keys) | not fewer than off | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_100`) |
-| wire bytes, K = 102 | at most 0.28 of off (1,051,558,209 B at 100 keys) | over off | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_100`) |
-| blocks, K = 1,024 | at most 0.87 of off (10,780 of 12,511 at 1,000 keys) | not fewer than off | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1000`) |
-| wire bytes, K = 1,024 | at most 0.95 of off (3,607,235,510 B at 1,000 keys) | over off | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1000`) |
-| every figure, K = 10,240 | equal to off: above k, no transfer | any difference | predicted (decision 5) |
-| `keyIndex` requests, K at most k | at most the literal list of K keys, measured in the same Stage 3 run | over it | predicted; probe shape from `logs_trace_in_1` (2 leaf GETs), `_10` (11) and `_100` (1 leaf GET, part skipped by budget, then 1,041 tier-1 GETs) in calls.jsonl above |
+Each band is the literal list's own figure, and each miss is that figure
+times 1.1, capped at off. The factor covers the 2 to 2.4 % more keys at
+K = 102 and K = 1,024 than in the 100- and 1,000-key lists measured here.
+The counts did not vary across 20 cold calls, so it needs no allowance for
+noise. Stage 3 runs literal lists of exactly 102 and 1,024 keys beside the
+join and judges each figure against that twin by the same rule. The
+figures below stand in only where a twin is missing.
 
-K = 102 and K = 1,024 are compared with the 100- and 1,000-key lists, the
-nearest sizes this run measured. Stage 3 runs literal lists of exactly
-102 and 1,024 keys beside the join, and judges each band against its own
-twin.
+| Receiving logs scan, transfer on | K | band | miss | source |
+|---|---|---|---|---|
+| blocks | 1 | at most 16 (0.0013 of off's 12,511) | over 17 | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1`) |
+| blocks | 102 | at most 2,425 (0.19 of off), the 100-key list | over 2,667 | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_100`) |
+| blocks | 1,024 | at most 10,780 (0.86 of off), the 1,000-key list | over 11,858 | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1000`) |
+| objects opened, every phase | 1 | at most 1 of 548 | over 1 | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1`) |
+| objects opened, every phase | 102 | at most 548 (520 opened by the tier-1 probe, 28 scanned) | over 548 | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_100`) |
+| objects opened, every phase | 1,024 | at most 548 (520 by the tier-1 probe, 28 scanned) | over 548 | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1000`) |
+| `keyIndex` requests | 1 | at most 2 (leaf GETs) | over 2 | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1`) |
+| `keyIndex` requests | 102 | at most 1,041 (1 leaf GET, the part skipped by budget, then tier-1 GETs) | over 1,145 | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_100`) |
+| `keyIndex` requests | 1,024 | at most 1,041 | over 1,145 | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1000`) |
+| wire bytes per phase | 1 | plan 4,774,926, keyIndex 60,608, scan 0, resolve 33; total 4,835,567 (0.0013 of off) | any phase over 1.1 x its figure, or a total over 5,319,123 | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1`) |
+| wire bytes per phase | 102 | plan 108,947,000, keyIndex 212,487,009, scan 730,124,167, resolve 33; total 1,051,558,209 (0.28 of off) | any phase over 1.1 x its figure, or a total over 1,156,714,029 | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_100`) |
+| wire bytes per phase | 1,024 | plan 108,947,000, keyIndex 214,992,302, scan 3,283,296,175, resolve 33; total 3,607,235,510 (0.95 of off) | any phase over 1.1 x its figure, or a total not under off's 3,806,990,963 | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1000`) |
+| every figure | 10,240 | equal to off: above k, no transfer | any difference | predicted (decision 5) |
 
 One observation bears on k, and Stage 3 decides it. At 100 keys and above,
 the logs `trace_id` leaf, at 13 bits and 20,000,000 entries, is skipped by
