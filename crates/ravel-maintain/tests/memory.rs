@@ -23,6 +23,15 @@ use ravel_maintain::{
 use ravel_object_store::memory::MemoryStore;
 use uuid::Uuid;
 
+/// The default config at 8 input reads in flight: the printed peaks are cited
+/// at that setting, and the in-flight reads are part of what they measure.
+fn eight_in_flight() -> CompactorConfig {
+    CompactorConfig {
+        input_read_concurrency: 8,
+        ..CompactorConfig::default()
+    }
+}
+
 /// (VmRSS, VmHWM) in kibibytes from /proc/self/status, if available.
 fn mem_kib() -> Option<(u64, u64)> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -78,7 +87,7 @@ async fn peak_memory_on_3600_input_bucket() {
     let after_seed = mem_kib();
     let clock = FixedClock::new(sealed_now_ns());
     let bucket = bucket();
-    let outcome = compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket)
+    let outcome = compact_bucket(&store, &clock, &eight_in_flight(), &bucket)
         .await
         .expect("compact 3600-input bucket");
     let after_compact = mem_kib();
@@ -156,7 +165,7 @@ async fn peak_memory_on_rlog_input_bucket() {
     let after_seed = mem_kib();
     let clock = FixedClock::new(sealed_now_ns());
     let bucket = logs_bucket();
-    let outcome = compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket)
+    let outcome = compact_bucket(&store, &clock, &eight_in_flight(), &bucket)
         .await
         .expect("compact 3600-input rlog bucket");
     let after_compact = mem_kib();
