@@ -532,8 +532,7 @@ maintenance work runs twice until it completes.
 ### Maintain scratch volume
 
 The two-level RLOG merge writes intermediate runs to a local scratch
-directory ([ADR-3853](../adrs/3853-two-level-rlog-merge.md) D2).
-`spec.maintain.scratch` gives the maintain pods one:
+directory. `spec.maintain.scratch` gives the maintain pods one:
 
 ```yaml
 spec:
