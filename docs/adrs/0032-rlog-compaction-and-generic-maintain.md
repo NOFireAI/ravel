@@ -306,7 +306,8 @@ parts changed. Concretely:
 The same issue covers the compaction read path, which was a chain of
 sequential awaits: one commit-record GET per input, then one catalog load
 per input, then one block GET per cursor advance. A new
-`CompactorConfig::input_read_concurrency` (default 8) bounds how many of
+`CompactorConfig::input_read_concurrency` (default 8, 32 since the #3856
+default amendment below) bounds how many of
 those are in flight, and each stream cursor prefetches one block ahead.
 (Block reads changed again under the ADR-3819 read-plan amendment below.)
 This is a latency change only. Output bytes cannot depend on it: inputs
@@ -437,3 +438,26 @@ rows, plus the in-progress part. A stream on cursors has decision 4's
 transient term (ADR-0065) in place of the pass rows. The erasure rewriter
 runs the same merge, so all of this applies to it too. ADR-0065's amendment
 of the same date states the bound on each term.
+
+## Amendment 2026-11-06: 32 input reads in flight by default (#3856)
+
+<!-- amendment-applies: sections="Amendment 2026-08-26: a part splits on a size target; a stream may span parts" pointer="#3856 default amendment" -->
+<!-- amendment-supersedes: phrase="(default 8" pointer="#3856 default amendment" -->
+
+Status: accepted. Issue #3856, ADR-3853. `DEFAULT_INPUT_READ_CONCURRENCY`
+is 32, up from 8, so `CompactorConfig::default()` keeps 32 per-input reads
+in flight (`the_default_input_read_concurrency_is_32`). Output bytes still
+do not depend on it (`input_read_concurrency_changes_timing_not_bytes`).
+
+The basis, measured 2026-11-05 from a GKE node (#3819 comment 6660371946):
+GCS reads are latency-bound, at 16, 72 and 108 MB/s with 8, 32 and 64 reads
+in flight, and a compaction at 64 in flight ran its catalog phase about 4x
+faster than at 8 (600 against 140 GETs/s). 32 is the default ADR-3853
+sizes its reads in flight against.
+
+The cost is transient memory. A fetch-per-pass plan reserves the 32 largest
+input row groups against the resident ceiling
+(`the_default_in_flight_reservation_is_the_32_largest_groups`). On the #3819
+bucket (hour 498273: 16.7 GiB over 19,177 L0 inputs, each one row group,
+0.94 MB per input on average) that is about 30 MB, against 7.5 MB at 8. The
+catalog phase holds up to 32 RLOG footer probes of 128 KiB, 4 MiB.

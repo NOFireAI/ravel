@@ -12983,6 +12983,52 @@ mod tests {
             }
         }
 
+        /// Issue #3856: at the default `input_read_concurrency` (32) the plan
+        /// reserves the 32 largest row groups in flight. Forty inputs of one
+        /// row group each, input `i` holding `i` incompressible records, so
+        /// the 8, 32 and 40 largest groups sum to three different figures; at
+        /// a ceiling of 0 the plan compares exactly that reservation plus the
+        /// floor.
+        #[tokio::test]
+        async fn the_default_in_flight_reservation_is_the_32_largest_groups() {
+            let inputs: Vec<L0Input> = (1..=40u32)
+                .map(|i| L0Input {
+                    records: (0..i64::from(i))
+                        .map(|k| {
+                            let body = noise(u64::from(i) * 1_000 + k as u64, 512);
+                            record(1, 1_000 + k, &body, Vec::new())
+                        })
+                        .collect(),
+                    cfg: stream_blocked_cfg(64),
+                    clustering: None,
+                })
+                .collect();
+            let store = ProbeStore::new();
+            let keys = seed_inputs(&store, &inputs).await;
+            let mut lens: Vec<u64> = group_extents(&store, &keys)
+                .await
+                .iter()
+                .map(|(_, s, e)| e - s)
+                .collect();
+            assert_eq!(lens.len(), 40, "one row group per input");
+            lens.sort_unstable_by(|a, b| b.cmp(a));
+            let largest = |n: usize| -> u64 { lens.iter().take(n).sum() };
+            assert!(largest(8) < largest(32) && largest(32) < largest(40));
+
+            let config = CompactorConfig {
+                rlog_l1_part_memory_target_bytes: Some(FLOOR),
+                merge_resident_ceiling_bytes: Some(0),
+                ..CompactorConfig::default()
+            };
+            let (plan, _) = plan_for(&store, &keys, &config).await;
+            assert_eq!(plan.mode, MergeReadMode::Cursor);
+            assert_eq!(
+                plan.compared_bytes,
+                largest(32) + config.rlog_memory_target_bytes(),
+                "the in-flight reservation is the 32 largest groups"
+            );
+        }
+
         /// `r` moved to stream `s`, everything else kept.
         fn restream(r: LogRecord, s: u32) -> LogRecord {
             let (stream_id, stream_attrs) = stream_ident(s);
