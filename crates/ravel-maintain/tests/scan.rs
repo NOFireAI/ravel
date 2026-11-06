@@ -1643,8 +1643,14 @@ async fn a_geometry_refusal_is_memoized_in_memory_and_never_persisted() {
         let records: Vec<_> = (0..20)
             .map(|s| common::log_record(s, ts, &format!("in{input} s{s}")))
             .collect();
-        seed_rlog_input(&store, Uuid::from_u128(700 + u128::from(input)), 1, input + 1, &records)
-            .await;
+        seed_rlog_input(
+            &store,
+            Uuid::from_u128(700 + u128::from(input)),
+            1,
+            input + 1,
+            &records,
+        )
+        .await;
     }
     let clock = sealed_through(HOUR);
     let config = CompactorConfig {
@@ -1677,7 +1683,9 @@ async fn a_geometry_refusal_is_memoized_in_memory_and_never_persisted() {
 
     let mut warm = MaintainMemo::new(DEFAULT_MEMO_REVERIFY_INTERVAL_NS);
     let before = refused();
-    let first = logs_tick(&mut warm, &store, &clock, &config, &retention).await.expect("first tick");
+    let first = logs_tick(&mut warm, &store, &clock, &config, &retention)
+        .await
+        .expect("first tick");
     assert_eq!(first.geometry_unsupported, 1, "{first:?}");
     assert_eq!(first.compacted, 0, "{first:?}");
     assert_eq!(refused() - before, 1, "one refusal, one count");
@@ -1687,10 +1695,16 @@ async fn a_geometry_refusal_is_memoized_in_memory_and_never_persisted() {
     );
 
     let before = refused();
-    let second = logs_tick(&mut warm, &store, &clock, &config, &retention).await.expect("second tick");
+    let second = logs_tick(&mut warm, &store, &clock, &config, &retention)
+        .await
+        .expect("second tick");
     assert_eq!(second.geometry_unsupported, 0, "{second:?}");
     assert_eq!(second.compacted, 0, "{second:?}");
-    assert_eq!(refused(), before, "the memo kept the merge from being planned");
+    assert_eq!(
+        refused(),
+        before,
+        "the memo kept the merge from being planned"
+    );
     assert_eq!(
         warm.terminal_state(tenant_hash(), Signal::Logs, SHARD, HOUR),
         Some(TerminalState::GeometryUnsupported),
@@ -1698,7 +1712,11 @@ async fn a_geometry_refusal_is_memoized_in_memory_and_never_persisted() {
     );
     assert_eq!(compaction_record_count(&store, Format::Rlog, HOUR).await, 0);
 
-    assert_eq!(warm.snapshot_entry_count(), 0, "the snapshot skips the refusal");
+    assert_eq!(
+        warm.snapshot_entry_count(),
+        0,
+        "the snapshot skips the refusal"
+    );
     let now = clock.now_ns();
     let mut seeded = MaintainMemo::new(DEFAULT_MEMO_REVERIFY_INTERVAL_NS);
     let stats = seeded
@@ -1716,7 +1734,9 @@ async fn a_geometry_refusal_is_memoized_in_memory_and_never_persisted() {
         None
     );
     let before = refused();
-    let reseeded = logs_tick(&mut seeded, &store, &clock, &config, &retention).await.expect("seeded tick");
+    let reseeded = logs_tick(&mut seeded, &store, &clock, &config, &retention)
+        .await
+        .expect("seeded tick");
     assert_eq!(reseeded.geometry_unsupported, 1, "{reseeded:?}");
     assert_eq!(refused() - before, 1);
 }

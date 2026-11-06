@@ -13413,7 +13413,11 @@ mod tests {
                 matches!(outcome, CompactionOutcome::Compacted { .. }),
                 "{outcome:?}"
             );
-            assert!(run.mode_line().contains("mode=\"cursor\""), "{}", run.mode_line());
+            assert!(
+                run.mode_line().contains("mode=\"cursor\""),
+                "{}",
+                run.mode_line()
+            );
             assert!(run.report.block_read.requests > 0, "{:?}", run.report);
             assert_eq!(compaction_records(&store).await, 1, "one record published");
         }
@@ -13435,20 +13439,16 @@ mod tests {
                 ..cursor_forced()
             };
             for process in [7, 8] {
-                let outcome = crate::compact_bucket_claimed(
-                    &store,
-                    &clock,
-                    &as_process(process),
-                    &bucket(),
-                )
-                .await
-                .expect("compact");
+                let outcome =
+                    crate::compact_bucket_claimed(&store, &clock, &as_process(process), &bucket())
+                        .await
+                        .expect("compact");
                 assert!(
                     matches!(
                         outcome,
-                        crate::ClaimedCompaction::Ran(CompactionOutcome::GeometryUnsupported {
-                            ..
-                        })
+                        crate::ClaimedCompaction::Ran(
+                            CompactionOutcome::GeometryUnsupported { .. }
+                        )
                     ),
                     "process {process}: {outcome:?}"
                 );

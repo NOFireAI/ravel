@@ -7004,7 +7004,11 @@ mod tests {
             vec![(1, 1), (0, 0)],
             "refused once and counted once, then left alone by the memo"
         );
-        assert_eq!(ownership.units_stalled(), 0, "a refusal is not a failed scan");
+        assert_eq!(
+            ownership.units_stalled(),
+            0,
+            "a refusal is not a failed scan"
+        );
     }
 
     /// Submit a logs erasure request for [`TEST_ERASED_SUBJECT`] acknowledged

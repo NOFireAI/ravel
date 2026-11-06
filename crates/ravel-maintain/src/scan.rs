@@ -2013,34 +2013,33 @@ pub async fn scan_and_maintain_with_memo(
         } else {
             RewriteBound::Read(&mut bound_read)
         };
-        let (retention_outcome, observed_expiry, compaction, acquisition) = if claim_deferred
-            || geometry_refused
-        {
-            let (outcome, expiry) = retention_sweep_bucket_observed(
-                &mut reach,
-                store,
-                clock,
-                config,
-                retention_window_ns,
-                lease,
-                &bucket,
-                rewrite_bound,
-            )
-            .await?;
-            (outcome, expiry, None, None)
-        } else {
-            maintain_bucket_observed(
-                &mut reach,
-                store,
-                clock,
-                config,
-                retention_window_ns,
-                lease,
-                &bucket,
-                rewrite_bound,
-            )
-            .await?
-        };
+        let (retention_outcome, observed_expiry, compaction, acquisition) =
+            if claim_deferred || geometry_refused {
+                let (outcome, expiry) = retention_sweep_bucket_observed(
+                    &mut reach,
+                    store,
+                    clock,
+                    config,
+                    retention_window_ns,
+                    lease,
+                    &bucket,
+                    rewrite_bound,
+                )
+                .await?;
+                (outcome, expiry, None, None)
+            } else {
+                maintain_bucket_observed(
+                    &mut reach,
+                    store,
+                    clock,
+                    config,
+                    retention_window_ns,
+                    lease,
+                    &bucket,
+                    rewrite_bound,
+                )
+                .await?
+            };
         report.lag_bound_gets += bound_read.gets;
         if let Some(keeps) = bound_read.learned {
             memo.rewrites_keep_nominal_bound.insert(key, keeps);
