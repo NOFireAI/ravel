@@ -417,7 +417,9 @@ fn combine_float(f: Float, hours: &[FloatHour], w: Window, how: Combine) -> Opti
             hours.iter().map(|h| h.n).sum::<usize>() as f64
         }),
         Float::Min | Float::Max => {
-            let values = hours.iter().map(|h| if f == Float::Min { h.min } else { h.max });
+            let values = hours
+                .iter()
+                .map(|h| if f == Float::Min { h.min } else { h.max });
             if how == Combine::TotalOrder {
                 return if f == Float::Min {
                     values.min_by(f64::total_cmp)
@@ -442,7 +444,11 @@ fn combine_float(f: Float, hours: &[FloatHour], w: Window, how: Combine) -> Opti
         Float::Resets | Float::Changes => {
             let mut total = 0u64;
             for (k, h) in hours.iter().enumerate() {
-                total += if f == Float::Resets { h.resets } else { h.changes };
+                total += if f == Float::Resets {
+                    h.resets
+                } else {
+                    h.changes
+                };
                 if k == 0 || how == Combine::DropBoundaryPairs {
                     continue;
                 }
@@ -672,7 +678,13 @@ fn exact_everywhere(_: &Fixture, _: Window) -> bool {
 
 /// Asserts that a wrong combination disagrees with the evaluator on the named
 /// fixture and window while the documented combination agrees there.
-fn assert_rejects(f: Float, fx: &str, w: &str, stale: Stale, how: Combine) -> (Option<u64>, Option<u64>) {
+fn assert_rejects(
+    f: Float,
+    fx: &str,
+    w: &str,
+    stale: Stale,
+    how: Combine,
+) -> (Option<u64>, Option<u64>) {
     let fx = fixture(fx);
     let w = window(w);
     let expected = bits(eval_float(&fx.samples, &f.query(w), w));
@@ -712,7 +724,13 @@ fn count_over_time_reassociated_f64_sum_is_harmless() {
     for fx in float_fixtures() {
         for &w in WINDOWS {
             assert_eq!(
-                bits(combined(Float::Count, &fx, w, Stale::Drop, Combine::Reassociate)),
+                bits(combined(
+                    Float::Count,
+                    &fx,
+                    w,
+                    Stale::Drop,
+                    Combine::Reassociate
+                )),
                 bits(combined(Float::Count, &fx, w, Stale::Drop, Combine::Exact)),
             );
         }
@@ -728,8 +746,13 @@ fn min_over_time_exact_from_hour_fold() {
 fn min_over_time_rejects_total_order_combination() {
     // Hour minima 0.0, -0.0, -0.0: the fold keeps the first zero, total_cmp
     // picks -0.0.
-    let (expected, wrong) =
-        assert_rejects(Float::Min, "signed_zero", "(0m,180m]", Stale::Drop, Combine::TotalOrder);
+    let (expected, wrong) = assert_rejects(
+        Float::Min,
+        "signed_zero",
+        "(0m,180m]",
+        Stale::Drop,
+        Combine::TotalOrder,
+    );
     assert_eq!(expected, Some(0.0_f64.to_bits()));
     assert_eq!(wrong, Some((-0.0_f64).to_bits()));
 }
@@ -773,7 +796,10 @@ fn last_over_time_exact_from_hour_last_sample() {
 #[test]
 fn last_over_time_rejects_counted_staleness_marker() {
     let (expected, wrong) = rejects_counted_marker(Float::Last, "(35m,95m]");
-    assert_eq!((expected, wrong), (Some(5.0_f64.to_bits()), Some(STALE_BITS)));
+    assert_eq!(
+        (expected, wrong),
+        (Some(5.0_f64.to_bits()), Some(STALE_BITS))
+    );
 }
 
 #[test]
@@ -941,7 +967,13 @@ fn increase_condition_fails_on_two_resets_in_one_hour() {
     let w = window("(0m,120m]");
     assert!(!one_reset_per_hour(&fx, w));
     let expected = bits(eval_float(&fx.samples, &Float::Increase.query(w), w));
-    let got = bits(combined(Float::Increase, &fx, w, Stale::Drop, Combine::Exact));
+    let got = bits(combined(
+        Float::Increase,
+        &fx,
+        w,
+        Stale::Drop,
+        Combine::Exact,
+    ));
     assert_eq!(expected, Some(0x4024_01dc_a01d_ca00));
     assert_eq!(got, Some(0x4024_01dc_a01d_ca01));
 }
@@ -1101,7 +1133,10 @@ fn regression_from_hours(anchor_ns: i64) -> (f64, f64) {
 fn sum_over_time_raw_only_compensated_hour_sums_differ() {
     let per_hour: Vec<f64> = rounding_hours().iter().map(|h| kahan_sum(h)).collect();
     let combined = kahan_sum(&per_hour).to_bits();
-    assert_eq!(eval_rounding("sum_over_time(m[180m])"), 0x405c_5147_ae14_7ae2);
+    assert_eq!(
+        eval_rounding("sum_over_time(m[180m])"),
+        0x405c_5147_ae14_7ae2
+    );
     assert_eq!(combined, 0x405c_5147_ae14_7ae1);
 }
 
@@ -1114,7 +1149,10 @@ fn avg_over_time_raw_only_weighted_hour_means_differ() {
         .map(|h| incremental_mean(h) * h.len() as f64)
         .collect();
     let combined = (kahan_sum(&weighted) / n as f64).to_bits();
-    assert_eq!(eval_rounding("avg_over_time(m[180m])"), 0x4022_e0da_740d_a742);
+    assert_eq!(
+        eval_rounding("avg_over_time(m[180m])"),
+        0x4022_e0da_740d_a742
+    );
     assert_eq!(combined, 0x4022_e0da_740d_a741);
 }
 
@@ -1122,7 +1160,10 @@ fn avg_over_time_raw_only_weighted_hour_means_differ() {
 fn stdvar_over_time_raw_only_merged_hour_moments_differ() {
     let moments: Vec<(f64, f64, f64)> = rounding_hours().iter().map(|h| welford(h)).collect();
     let combined = chan_variance(&moments).to_bits();
-    assert_eq!(eval_rounding("stdvar_over_time(m[180m])"), 0x4087_624c_8ae6_6094);
+    assert_eq!(
+        eval_rounding("stdvar_over_time(m[180m])"),
+        0x4087_624c_8ae6_6094
+    );
     assert_eq!(combined, 0x4087_624c_8ae6_6095);
 }
 
@@ -1130,7 +1171,10 @@ fn stdvar_over_time_raw_only_merged_hour_moments_differ() {
 fn stddev_over_time_raw_only_merged_hour_moments_differ() {
     let moments: Vec<(f64, f64, f64)> = rounding_hours().iter().map(|h| welford(h)).collect();
     let combined = chan_variance(&moments).sqrt().to_bits();
-    assert_eq!(eval_rounding("stddev_over_time(m[180m])"), 0x403b_5ad6_eadf_df79);
+    assert_eq!(
+        eval_rounding("stddev_over_time(m[180m])"),
+        0x403b_5ad6_eadf_df79
+    );
     assert_eq!(combined, 0x403b_5ad6_eadf_df7a);
 }
 

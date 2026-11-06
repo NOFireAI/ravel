@@ -4502,6 +4502,132 @@ Surface: 132 constructs over 271 corpus entries in 10 corpus files.
 | subquery per-node point cap | accepted divergence | accepted divergence | ADR-0030, 2 corpus entries; Ravel's per-subquery-node 11,000-point budget has no Prometheus counterpart, so Ravel rejects by design where Prometheus accepts; the comparator asserts exactly that shape |
 <!-- END GENERATED PROMQL CONFORMANCE TABLE -->
 
+## Exact acceleration matrix
+
+This matrix documents what the evaluator does today, for each range-vector
+function: whether its value over a window can be rebuilt bit for bit from
+per-hour sufficient statistics. No rollup object exists, and requests with
+`min_commit_token` read raw whatever the matrix says (ADR-3694 decision 8).
+
+The test is `crates/ravel-promql/tests/exact_hour_statistics.rs`. It splits
+each window `(eval - range, eval]` into hour segments `(kH, (k+1)H]`, which
+are left-open like the matrix window itself. It computes the row's statistic
+for each segment inside the test, combines the segments, and compares the
+result with `Evaluator::instant` over the same window by `f64::to_bits`. No
+library code computes a statistic. Staleness markers are dropped before
+segmenting, as the matrix selection drops them by the `STALE_NAN_BITS` bit
+pattern (in `Evaluator::eval_matrix_selector` for instant queries and in
+`Evaluator::eval_range_matrix_reduction` for range queries). Five of the eight windows are not aligned to hours:
+`(34m,167m]`, `(25m,50m]`, `(35m,95m]`, `(85m,95m]` and `(70m,130m]`. Their
+partial edge hours are summarised from the window's raw samples with the
+same statistic, so an accelerated read of such a window still reads its edge
+hours raw. The float fixtures are:
+
+- `nan_payloads`: two NaN payloads, and one hour holding only NaN.
+- `signed_zero`: `0.0` and `-0.0` on both sides of every hour boundary.
+- `staleness`: markers between a reset pair and between two equal values,
+  plus a window, `(85m,95m]`, that holds a marker and nothing else.
+- `resets`: a reset inside an hour, one across the 60m boundary, and one on
+  the 120m boundary.
+- `rounding`: values whose sum depends on how it is associated.
+- `two_resets_one_hour`: two counter resets inside `(0m,60m]`.
+
+The native-histogram fixtures are:
+
+- `hist_schema_change`: a scale decrease inside an hour, a scale increase
+  across the 60m boundary (a reset), a bucket reset inside `(60m,120m]`, and
+  NaN sums with two payloads.
+- `hist_two_resets_one_hour` and `hist_two_resets_one_hour_offset`: two
+  bucket resets inside `(0m,60m]`.
+
+Each verdict means one thing:
+
+- EXACT: the combined value is bitwise equal to the evaluator's on every
+  fixture and window.
+- EXACT UNDER CONDITION: the values are equal wherever the condition holds.
+  The condition column names a fixture where it fails, with both bit
+  patterns.
+- RAW ONLY: combining the named statistic gives a different value, and the
+  test asserts both bit patterns. The verdict is about that statistic. It
+  does not prove that no per-hour statistic exists.
+
+| Function | Verdict | Sufficient statistic | Condition | Test |
+|---|---|---|---|---|
+| `count_over_time` | EXACT | hour sample count, summed as an integer | none | `count_over_time_exact_from_hour_counts` |
+| `min_over_time` | EXACT | the hour's own `min_over_time` fold (`min_over_time` in `functions/over_time.rs`), folded again over the hours in time order | none | `min_over_time_exact_from_hour_fold` |
+| `max_over_time` | EXACT | the hour's own `max_over_time` fold, folded again over the hours in time order | none | `max_over_time_exact_from_hour_fold` |
+| `last_over_time` | EXACT | the hour's last sample | none | `last_over_time_exact_from_hour_last_sample` |
+| `present_over_time` | EXACT | whether the hour holds a sample | none | `present_over_time_exact_from_hour_presence` |
+| `absent_over_time` | EXACT | whether the hour holds a sample | none | `absent_over_time_exact_from_hour_presence` |
+| `resets` | EXACT | in-hour count of adjacent pairs with `b < a`, plus the hour's first and last value so that each boundary pair is counted | none | `resets_exact_from_hour_pairs_and_edges` |
+| `changes` | EXACT | in-hour count of adjacent pairs with `b != a` (IEEE `!=`, with two NaNs counting as equal, `changes` in `functions/rate.rs`), plus the hour's first and last value | none | `changes_exact_from_hour_pairs_and_edges` |
+| `irate` | EXACT | the hour's last two samples, timestamps included | none | `irate_exact_from_hour_last_two_samples` |
+| `idelta` | EXACT | the hour's last two samples, timestamps included | none | `idelta_exact_from_hour_last_two_samples` |
+| `delta` | EXACT | first and last sample with timestamps, and the sample count; the combination ports `extrapolated_rate` (`functions/rate.rs`) | none | `delta_exact_from_hour_endpoints` |
+| `increase` | EXACT UNDER CONDITION | first and last sample with timestamps, the sample count, and the earlier value of each in-hour reset pair summed in time order; boundary resets and hour sums are added in time order, then extrapolated as `extrapolated_rate` does | at most one counter reset inside each hour segment (a reset across an hour boundary counts toward neither hour); fails on `two_resets_one_hour` over `(0m,120m]`, evaluator `0x402401dca01dca00`, combined `0x402401dca01dca01` | `increase_exact_with_one_reset_per_hour`, `increase_condition_fails_on_two_resets_in_one_hour` |
+| `rate` | EXACT UNDER CONDITION | as `increase` | as `increase`; fails on `two_resets_one_hour` over `(0m,120m]`, evaluator `0x3f56c38a61fb357a`, combined `0x3f56c38a61fb357b` | `rate_exact_with_one_reset_per_hour`, `rate_condition_fails_on_two_resets_in_one_hour` |
+| `histogram_count(increase(h[w]))` | EXACT UNDER CONDITION | first and last histogram with timestamps, the sample count, the hour's minimum scale, and the earlier histogram of each in-hour reset pair (`FloatHistogram::detect_reset`) summed in time order; the combination ports `histogram_rate` (`histogram.rs`) and its extrapolation with the library's `copy_to_scale`, `sub_assign`, `add_assign` and `mul` | at most one histogram reset inside each hour segment; fails on `hist_two_resets_one_hour` over `(0m,120m]`, evaluator `0x403401dca01dca00`, combined `0x403401dca01dca01` | `histogram_count_exact_with_one_reset_per_hour`, `histogram_rows_condition_fails_on_two_resets_in_one_hour` |
+| `histogram_sum(rate(h[w]))` | EXACT UNDER CONDITION | as `histogram_count` | as `histogram_count`; fails on both two-reset fixtures over `(0m,120m]`, evaluator `0x3f56c38a61fb357b`, combined `0x3f56c38a61fb357c` | `histogram_sum_exact_with_one_reset_per_hour`, `histogram_rows_condition_fails_on_two_resets_in_one_hour` |
+| `histogram_quantile(0.9, rate(h[w]))` | EXACT UNDER CONDITION | as `histogram_count`, then `histogram::histogram_quantile` | as `histogram_count`; fails on `hist_two_resets_one_hour_offset` over `(0m,120m]`, evaluator `0x400feaf9372573ad`, combined `0x400feaf9372573ab` | `histogram_quantile_exact_with_one_reset_per_hour`, `histogram_rows_condition_fails_on_two_resets_in_one_hour` |
+| `sum_over_time` | RAW ONLY | per-hour compensated sum (`kahan_sum_inc`), combined by the same compensated sum over the hours | differs on `rounding` over `(0m,180m]`, evaluator `0x405c5147ae147ae2`, combined `0x405c5147ae147ae1` | `sum_over_time_raw_only_compensated_hour_sums_differ` |
+| `avg_over_time` | RAW ONLY | per-hour incremental mean times the hour count, compensated sum over the hours, divided by the total count | differs on `rounding` over `(0m,180m]`, evaluator `0x4022e0da740da742`, combined `0x4022e0da740da741` | `avg_over_time_raw_only_weighted_hour_means_differ` |
+| `stdvar_over_time` | RAW ONLY | per-hour compensated Welford `(count, mean, M2)`, merged by Chan's pairwise formula | differs on `rounding` over `(0m,180m]`, evaluator `0x4087624c8ae66094`, combined `0x4087624c8ae66095` | `stdvar_over_time_raw_only_merged_hour_moments_differ` |
+| `stddev_over_time` | RAW ONLY | as `stdvar_over_time`, then the square root | differs on `rounding` over `(0m,180m]`, evaluator `0x403b5ad6eadfdf79`, combined `0x403b5ad6eadfdf7a` | `stddev_over_time_raw_only_merged_hour_moments_differ` |
+| `quantile_over_time` | RAW ONLY | per-hour quantile, combined by the same quantile over the hour results; only the window's full multiset of values reproduces the evaluator, and that is the raw data | differs on `rounding` over `(0m,180m]` at 0.5, evaluator `0x3fd3333333333333` (0.3), combined `0x3fe0000000000000` (0.5) | `quantile_over_time_raw_only_median_of_hour_medians_differs` |
+| `predict_linear` | RAW ONLY | per-hour regression sums `(n, Σx, Σy, Σxy, Σx²)`, `x` in seconds from the evaluation timestamp, added over the hours | differs on `rounding` over `(0m,180m]` at 600 s, evaluator `0x401303a9f975b340`, combined `0x401303a9f975b348` | `predict_linear_raw_only_summed_hour_moments_differ` |
+| `deriv` | RAW ONLY | as `predict_linear`, with `x` measured from the window's first sample | differs on `rounding` over `(0m,180m]`, evaluator `0xbf4baa157caa451d`, combined `0xbf4baa157caa4526` | `deriv_raw_only_summed_hour_moments_differ` |
+
+Every EXACT row is also run against wrong combinations, and the tests assert
+that each one disagrees with the evaluator on a named fixture and window:
+
+- (b), keeping the staleness marker as a sample (the `Stale::Keep` branch of
+  `hour_segments`): every EXACT row has a test named
+  `<function>_rejects_counted_staleness_marker`, and `rate`/`increase` share
+  `rate_rejects_counted_staleness_marker`. Native histograms carry no
+  staleness marker (the doc comment on `pick_histogram` in `eval.rs`), so (b) does not apply to the
+  histogram rows.
+- (a), reassociating a floating-point sum across hours: `delta`, `rate` and
+  `increase` are tested against the telescoped sum of per-hour deltas and
+  boundary gaps (`delta_rejects_telescoped_hour_sum`,
+  `rate_rejects_telescoped_hour_sum`, `increase_rejects_telescoped_hour_sum`).
+  For `count_over_time`, summing the hour counts as `f64` agrees on every
+  fixture, because the counts are small integers
+  (`count_over_time_reassociated_f64_sum_is_harmless`). The other EXACT rows
+  combine no floating-point sum. They are tested against the nearest wrong
+  combination instead: `min_over_time` and `max_over_time` under
+  `f64::total_cmp`, the ordering ADR-0103's amendment excluded
+  (`*_rejects_total_order_combination`); `resets` and `changes` without the
+  pair across each hour boundary (`*_rejects_dropped_boundary_pair`); and
+  `irate` and `idelta` read from the final hour only
+  (`*_rejects_final_hour_only`). `last_over_time`, `present_over_time` and
+  `absent_over_time` have no (a) test.
+
+The following range-vector functions and argument forms have no row:
+
+- Native-histogram windows of `delta`, `irate`, `idelta`, `resets`,
+  `changes`, `sum_over_time`, `avg_over_time`, `count_over_time`,
+  `last_over_time` and `present_over_time`. These are the `delta_hist`
+  branch in `functions/rate.rs` and `histogram_over_time` in
+  `functions/over_time.rs`. They are not classified because no fixture here
+  exercises them.
+- A subquery as the range argument (`f(expr[w:s])`). Its samples are
+  computed for each query and are not stored, so there are no stored hour
+  segments to summarise. The matrix covers matrix selectors only.
+- `histogram_count`, `histogram_sum` and `histogram_quantile` over anything
+  other than `increase` or `rate` of a native-histogram selector. All three
+  take an instant vector, not a range vector: `histogram_count` and
+  `histogram_sum` are `FunctionKind::VectorMap`
+  (`functions/histogram_native.rs`), and `histogram_quantile`
+  is `FunctionKind::HistogramQuantile` (`functions/mod.rs`).
+
+The remaining public functions take no range-vector argument, so they are
+outside the class: `histogram_avg`, `histogram_fraction`, classic
+`histogram_quantile` over `le` buckets, `label_replace`, `label_join`,
+`absent`, `vector`, `scalar`, `time`, `timestamp`, the date functions
+(`minute`, `hour`, `day_of_week`, `day_of_month`, `day_of_year`,
+`days_in_month`, `month`, `year`), the math functions, `round`, `clamp`,
+`clamp_min`, `clamp_max`, `sort` and `sort_desc`.
+
 ## SQL statement complexity gate
 
 `ravel_sql::validate` is the single gate every SQL surface reaches: the
