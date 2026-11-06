@@ -29,6 +29,8 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
+# statvfs for the two-level merge's scratch headroom check (ADR-3853 D2).
+rustix = { workspace = true }
 
 [dev-dependencies]
 ravel-segment = { workspace = true }
