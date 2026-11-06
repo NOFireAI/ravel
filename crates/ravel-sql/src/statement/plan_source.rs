@@ -525,7 +525,8 @@ where
     (granted, run.await.expect("the statement runs"))
 }
 
-/// With spill configured the executor builds a classification session, and
+/// On a spill retry (the only execute-path attempt that plans with spill
+/// allowed, issue #3899) the executor builds a classification session, and
 /// the programmatic statement is lowered for it as well as for the executed
 /// session. The spill grant read off that classification plan matches the SQL
 /// equivalent's.
@@ -535,12 +536,13 @@ async fn classification_plan_is_built_for_a_programmatic_statement() {
     let expected = owned(&[&["DEBUG", "1"], &["INFO", "3"], &["WARN", "2"]]);
 
     let sql_scratch = tempfile::tempdir().expect("scratch root");
-    let (sql_store, sql_fixture) = logs_fixture(
+    let (sql_store, mut sql_fixture) = logs_fixture(
         FaultPlan::empty(),
         &tenant,
         spill_enabled_config(sql_scratch.path()),
     )
     .await;
+    sql_fixture.executor.start_as_spill_retry = true;
     let sql_req = request(UNORDERED_GROUPED_SQL);
     let (sql_granted, sql) = spill_grant_while_scanning(
         &sql_store,
@@ -554,12 +556,13 @@ async fn classification_plan_is_built_for_a_programmatic_statement() {
     );
 
     let scratch = tempfile::tempdir().expect("scratch root");
-    let (store, fixture) = logs_fixture(
+    let (store, mut fixture) = logs_fixture(
         FaultPlan::empty(),
         &tenant,
         spill_enabled_config(scratch.path()),
     )
     .await;
+    fixture.executor.start_as_spill_retry = true;
     let statement = unordered_grouped_statement();
     let req = statement_request();
     let (granted, lowered) = spill_grant_while_scanning(

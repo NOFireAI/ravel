@@ -2040,6 +2040,10 @@ pub struct SqlExecutor {
     /// How many times [`Self::executed_plan`] built a plan to execute.
     #[cfg(test)]
     executed_plan_builds: std::sync::atomic::AtomicUsize,
+    /// Runs an executed statement's first pass as a spill retry, so a test
+    /// can reach the spill-enabled execute path without a memory refusal.
+    #[cfg(test)]
+    pub(crate) start_as_spill_retry: bool,
 }
 
 /// One tenant's memory accountant plus the last-touch stamp idle-tenant
@@ -2091,6 +2095,8 @@ impl SqlExecutor {
             spill_fallbacks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             executed_plan_builds: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            start_as_spill_retry: false,
         }
     }
 
@@ -2711,7 +2717,7 @@ impl SqlExecutor {
         let mut spill_retry: Option<FirstRefusal> = None;
         loop {
             let pass_started = Instant::now();
-            let spill_attempt = if spill_retry.is_some() {
+            let spill_attempt = if spill_retry.is_some() || self.starts_as_spill_retry() {
                 SpillAttempt::Retry
             } else {
                 SpillAttempt::First
@@ -5020,6 +5026,18 @@ impl SqlExecutor {
     #[cfg(test)]
     pub(crate) fn scan_execution_counts(&self) -> Vec<u64> {
         self.scan_executions.counts()
+    }
+
+    /// [`Self::start_as_spill_retry`]; outside tests a first pass is always
+    /// [`SpillAttempt::First`].
+    #[cfg(test)]
+    fn starts_as_spill_retry(&self) -> bool {
+        self.start_as_spill_retry
+    }
+
+    #[cfg(not(test))]
+    fn starts_as_spill_retry(&self) -> bool {
+        false
     }
 
     /// [`Self::analyzed_classification_plan`] for SQL text, with any error
@@ -10725,6 +10743,7 @@ pub(crate) mod tests {
             spill_enabled_config(root.path()),
         )
         .await;
+        fixture.executor.start_as_spill_retry = true;
         fixture.executor.executed_plan_tamper = Some(keep_the_first_sort_term);
         let statement = Programmatic::over_logs(
             DialectPolicy::new(Vec::<String>::new(), ["count"], Vec::<String>::new()),
@@ -10776,14 +10795,16 @@ pub(crate) mod tests {
         );
     }
 
-    /// [`executor_over`] with spill configured at `root`.
+    /// [`executor_over`] with spill configured at `root`, whose executed
+    /// statements start as a spill retry (issue #3899): only a retry plans
+    /// with spill allowed on the execute path.
     fn spill_executor_over(
         store: Arc<InstrumentedStore<FaultStore<MemoryStore>>>,
         root: &std::path::Path,
     ) -> SqlExecutor {
         let catalog =
             Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
-        SqlExecutor::new(
+        let mut executor = SqlExecutor::new(
             catalog,
             SegmentFetcher::new(store.clone()),
             LogSegmentFetcher::new(store.clone()),
@@ -10796,7 +10817,9 @@ pub(crate) mod tests {
                 ..SqlConfig::default()
             },
             1 << 30,
-        )
+        );
+        executor.start_as_spill_retry = true;
+        executor
     }
 
     /// An executor over an empty store with spill configured at `root` and a
