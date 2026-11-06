@@ -332,6 +332,52 @@ target_if = "v == 1"
 """
 
 
+class Reports(unittest.TestCase):
+    """inv.py extract_report over what `measure` writes: stdout and stderr in
+    one file, so a ravel-cli `--json` report shares it with tracing lines."""
+
+    TRACE = ("\x1b[2m2026-11-06T21:52:22.654860Z\x1b[0m \x1b[33m WARN\x1b[0m "
+             "\x1b[2mravel_catalog::fold\x1b[0m: shard 3 hour 498333 deferred\n")
+    # "frontier" last: its indented `"frontier": {}` line parses on its own.
+    REPORT = {"signal": "logs", "key_index_ranged_gets": 1140, "key_index_build_passes": 1,
+              "attempts": [{"parts": 1}], "nested": {"a": {"b": 2}}, "frontier": {}}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.inv = load_module(os.path.join(BOX, "lib", "inv.py"), "inv_reports")
+
+    def pretty(self):
+        return json.dumps(self.REPORT, indent=2) + "\n"
+
+    def test_whole_document(self):
+        self.assertEqual(self.inv.extract_report(self.pretty()), self.REPORT)
+
+    def test_pretty_report_beside_tracing_lines(self):
+        # Box C (#3918): every fold that did real work stamped report null,
+        # because a tracing line shared the file with the pretty-printed
+        # report and neither the whole-file nor the one-line parse took it.
+        for text in (self.TRACE + self.pretty(), self.pretty() + self.TRACE,
+                     self.TRACE + self.pretty() + self.TRACE + self.TRACE):
+            self.assertEqual(self.inv.extract_report(text), self.REPORT)
+
+    def test_nested_object_is_never_taken_for_the_report(self):
+        # A parser taking the last line whose `{...}` tail parses would
+        # return the indented `"frontier": {}` as the report.
+        doc = self.inv.extract_report(self.TRACE + self.pretty())
+        self.assertEqual(doc["key_index_ranged_gets"], 1140)
+
+    def test_last_document_wins(self):
+        first = json.dumps({"signal": "spans"}, indent=2) + "\n"
+        self.assertEqual(self.inv.extract_report(first + self.TRACE + self.pretty()), self.REPORT)
+
+    def test_load_report_line(self):
+        text = self.TRACE + "rows: 10\nload report json : " + json.dumps({"rows": 10}) + "\n"
+        self.assertEqual(self.inv.extract_report(text), {"rows": 10})
+
+    def test_no_report(self):
+        self.assertIsNone(self.inv.extract_report(self.TRACE + "compacted: 8\n"))
+
+
 class Workdir(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
