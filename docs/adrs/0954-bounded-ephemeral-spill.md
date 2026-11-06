@@ -759,12 +759,15 @@ by a `regexp_replace` of a string and computes `AVG(length(..))`,
 3. The tie-order rewrite of the cache-dir spill default amendment's
    requirement 4 accepts `min` and `max` among its aggregate functions,
    except for a `Sort` that restates the gate of the bounded aggregate of
-   issue #1402 on the logical plan: a `LIMIT` (the `Sort`'s own fetch or
-   that of a `Limit` above it), one sort term naming the output column of
-   an aggregate whose only aggregate expression is one `min` or `max`
-   with no `FILTER` clause, descending for `max` and ascending for `min`,
-   a single GROUP BY key, and nothing but an optional `Projection`
-   between the `Sort` and the aggregate (no `HAVING` filter). That gate
+   issue #1402 on the logical plan: the rule installed (a
+   `bounded_topk_max_limit` is set), a `LIMIT` (the `Sort`'s own fetch, or
+   that of a `Limit` above it plus its `OFFSET`) no larger than that
+   ceiling, one sort term naming the output column of an aggregate whose
+   only aggregate expression is one `min` or `max` with no `FILTER`
+   clause, whose one argument is a column of the aggregate's input that is
+   not nullable, descending for `max` and ascending for `min`, a single
+   GROUP BY key, and nothing but an optional `Projection` between the
+   `Sort` and the aggregate (no `HAVING` filter). That gate
    requires exactly one sort term, so a trailing tiebreak would take the
    top-k away from it. Such a `Sort` is left as written and stays
    spill-ineligible, as it was before this amendment; any other `Sort`
