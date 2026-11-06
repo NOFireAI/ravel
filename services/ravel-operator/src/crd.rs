@@ -1008,8 +1008,10 @@ pub struct MaintainSpec {
     /// Local scratch space for the two-level RLOG merge (ADR-3853 D2). When
     /// set, the maintain pods get an `emptyDir` volume named `scratch` with a
     /// `sizeLimit` of `sizeGi` GiB mounted at `mountPath`, an
-    /// `ephemeral-storage` request of the same size, and
-    /// `--maintain-scratch-dir <mountPath>`. Omit to render none of these.
+    /// `ephemeral-storage` request of the same size,
+    /// `--maintain-scratch-dir <mountPath>`, and `--maintain-scratch-max-bytes`
+    /// of `sizeGi` GiB in bytes. Omit to render none of these. Requires a
+    /// ravel-server release that includes the two-level merge flags.
     /// The directory is a cache only: ravel-server wipes it at start and
     /// publishes nothing from it, so losing the volume loses no data. Size it
     /// to about 1.3 times the largest merge unit's input bytes.
@@ -1033,7 +1035,8 @@ pub struct MaintainScratchSpec {
     pub size_gi: u32,
 
     /// Where the volume is mounted in the maintain container, and the value
-    /// of `--maintain-scratch-dir`. Defaults to `/var/lib/ravel/scratch`.
+    /// of `--maintain-scratch-dir`. An absolute path; defaults to
+    /// `/var/lib/ravel/scratch`.
     #[serde(default = "default_maintain_scratch_mount_path")]
     pub mount_path: String,
 }
@@ -1496,13 +1499,18 @@ fn inject_minimum_bounds(crd: &mut CustomResourceDefinition) {
             {
                 fold_interval.minimum = Some(1.0);
             }
-            // A zero-size emptyDir leaves the merge no scratch space at all.
-            if let Some(size) = maintain_props
+            if let Some(scratch_props) = maintain_props
                 .get_mut("scratch")
                 .and_then(|f| f.properties.as_mut())
-                .and_then(|p| p.get_mut("sizeGi"))
             {
-                size.minimum = Some(1.0);
+                // A zero-size emptyDir leaves the merge no scratch space at all.
+                if let Some(size) = scratch_props.get_mut("sizeGi") {
+                    size.minimum = Some(1.0);
+                }
+                // Kubernetes refuses a relative volumeMount path.
+                if let Some(mount_path) = scratch_props.get_mut("mountPath") {
+                    mount_path.pattern = Some("^/".to_string());
+                }
             }
         }
     }

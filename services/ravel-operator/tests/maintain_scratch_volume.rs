@@ -1,10 +1,11 @@
 //! ADR-3853 D2: the two-level RLOG merge needs local scratch space, and on
 //! Kubernetes that is an ephemeral volume on the maintain Deployment.
-//! `spec.maintain.scratch` renders four things together: an `emptyDir` named
+//! `spec.maintain.scratch` renders five things together: an `emptyDir` named
 //! `scratch` limited to `sizeGi`, its mount in the ravel-server container, the
-//! `--maintain-scratch-dir` flag pointing at that mount, and an
+//! `--maintain-scratch-dir` flag pointing at that mount,
+//! `--maintain-scratch-max-bytes` of `sizeGi` GiB in bytes, and an
 //! `ephemeral-storage` request of the same size. Without the field none of
-//! them render.
+//! them render. An `ephemeral-storage` limit below `sizeGi` is refused.
 //!
 //! One reconcile pass runs against a loopback fake apiserver that records the
 //! body of every server-side apply, so the assertions are on the maintain
@@ -230,6 +231,14 @@ async fn serve_fake(listener: TcpListener, fake: Arc<Fake>) {
 /// Run the operator against the fake until its first status write, then stop
 /// it. Returns the maintain Deployment it applied.
 async fn applied_maintain(spec: Value) -> Value {
+    let (maintain, _) = reconcile_once(spec).await;
+    maintain.unwrap_or_else(|| panic!("no maintain Deployment applied"))
+}
+
+/// Run the operator against the fake until its first status write, then stop
+/// it. Returns the maintain Deployment it applied, if any, and the status
+/// patch.
+async fn reconcile_once(spec: Value) -> (Option<Value>, Value) {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let fake = Arc::new(Fake {
@@ -262,11 +271,14 @@ async fn applied_maintain(spec: Value) -> Value {
     }
     operator.abort();
     let path = format!("/apis/apps/v1/namespaces/{NAMESPACE}/deployments/{INSTANCE}-maintain");
-    let applied = fake.applied.lock().expect("lock");
-    applied
-        .get(&path)
-        .cloned()
-        .unwrap_or_else(|| panic!("no maintain Deployment applied: {:?}", applied.keys()))
+    let maintain = fake.applied.lock().expect("lock").get(&path).cloned();
+    let status = fake
+        .status
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("the pass wrote its status");
+    (maintain, status)
 }
 
 fn pod_spec(deployment: &Value) -> &Value {
@@ -310,6 +322,21 @@ fn scratch_dir_flags(deployment: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Every value following `--maintain-scratch-max-bytes` in the container's
+/// args.
+fn scratch_max_bytes_flags(deployment: &Value) -> Vec<String> {
+    let args: Vec<&str> = server_container(deployment)["args"]
+        .as_array()
+        .expect("args")
+        .iter()
+        .map(|a| a.as_str().expect("string arg"))
+        .collect();
+    args.windows(2)
+        .filter(|w| w[0] == "--maintain-scratch-max-bytes")
+        .map(|w| w[1].to_string())
+        .collect()
+}
+
 /// All four scratch renders, together, for `size` GiB at `mount`.
 fn assert_scratch_rendered(deployment: &Value, size: &str, mount: &str) {
     let volumes = scratch_volumes(deployment);
@@ -347,6 +374,11 @@ fn assert_scratch_rendered(deployment: &Value, size: &str, mount: &str) {
 async fn a_scratch_size_renders_the_volume_mount_and_flag() {
     let maintain = applied_maintain(spec(Some(json!({ "sizeGi": 90 })))).await;
     assert_scratch_rendered(&maintain, "90Gi", DEFAULT_MOUNT);
+    // The server bounds its headroom check by the volume size: 90 * 2^30.
+    assert_eq!(
+        scratch_max_bytes_flags(&maintain),
+        vec!["96636764160".to_string()]
+    );
     // The default resource request is kept beside the added one.
     assert_eq!(
         server_container(&maintain)["resources"]["requests"],
@@ -382,8 +414,54 @@ async fn the_scratch_request_replaces_an_explicit_ephemeral_storage_request() {
     );
 }
 
+/// An `ephemeral-storage` limit below `sizeGi` would render a request above
+/// the limit, which Kubernetes refuses. No maintain Deployment is applied and
+/// the `Degraded` condition names both values.
+#[tokio::test]
+async fn a_scratch_size_above_an_explicit_ephemeral_limit_is_refused() {
+    let mut cluster = spec(Some(json!({ "sizeGi": 90 })));
+    cluster["maintain"]["resources"] = json!({
+        "limits": { "memory": "8Gi", "ephemeral-storage": "10Gi" },
+    });
+    let (maintain, status) = reconcile_once(cluster).await;
+    assert_eq!(maintain, None, "no maintain Deployment is applied");
+    let degraded = status["status"]["conditions"]
+        .as_array()
+        .expect("conditions")
+        .iter()
+        .find(|c| c["type"] == "Degraded")
+        .expect("a Degraded condition");
+    assert_eq!(degraded["status"], "True", "{degraded}");
+    assert_eq!(
+        degraded["reason"], "MaintainScratchExceedsEphemeralLimit",
+        "{degraded}"
+    );
+    let message = degraded["message"].as_str().expect("message");
+    for named in [
+        "spec.maintain.scratch.sizeGi is 90",
+        "spec.maintain.resources.limits.ephemeral-storage is 10Gi",
+    ] {
+        assert!(message.contains(named), "{named:?} not in {message}");
+    }
+}
+
+/// A limit equal to `sizeGi`, in another spelling, is not refused.
+#[tokio::test]
+async fn a_scratch_size_at_the_ephemeral_limit_renders() {
+    let mut cluster = spec(Some(json!({ "sizeGi": 90 })));
+    cluster["maintain"]["resources"] = json!({
+        "limits": { "ephemeral-storage": "92160Mi" },
+    });
+    let maintain = applied_maintain(cluster).await;
+    assert_scratch_rendered(&maintain, "90Gi", DEFAULT_MOUNT);
+    assert_eq!(
+        server_container(&maintain)["resources"]["limits"],
+        json!({ "ephemeral-storage": "92160Mi" })
+    );
+}
+
 /// Without the field the Deployment is the one rendered before it existed,
-/// and with it the four scratch renders are the only difference.
+/// and with it the scratch renders are the only difference.
 #[tokio::test]
 async fn without_scratch_the_maintain_deployment_is_unchanged() {
     let without = applied_maintain(spec(None)).await;
@@ -425,9 +503,14 @@ async fn without_scratch_the_maintain_deployment_is_unchanged() {
         .position(|a| a == "--maintain-scratch-dir")
         .expect("the scratch flag");
     args.drain(at..at + 2);
+    let at = args
+        .iter()
+        .position(|a| a == "--maintain-scratch-max-bytes")
+        .expect("the scratch max-bytes flag");
+    args.drain(at..at + 2);
     assert_eq!(
         with, without,
-        "removing the four scratch renders yields the Deployment without the field"
+        "removing the scratch renders yields the Deployment without the field"
     );
 }
 
@@ -452,6 +535,7 @@ fn the_crd_schema_carries_minimum_one_on_scratch_size() {
         scratch["properties"]["mountPath"]["default"],
         json!(DEFAULT_MOUNT)
     );
+    assert_eq!(scratch["properties"]["mountPath"]["pattern"], json!("^/"));
     let description = scratch["description"].as_str().expect("description");
     assert!(description.contains("cache only"), "{description}");
     assert!(description.contains("1.3 times"), "{description}");
