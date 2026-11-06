@@ -1618,7 +1618,8 @@ two is the share bound, and a building stream's envelope from 8 MiB is
 layout not reported by capacity are unchanged. `S` is the asked size, not
 the charged `1.25 x S`. For q33 the share bound is `1.125 x (S + 192)`.
 These q33 figures are for a `W` of 56; the q33 width amendment restates
-them for the 65 that #3838 made it.
+them for the 65 that #3838 made it, and the eight-byte sum amendment
+returns q33 to 56 and to these figures.
 
 The `Vec` term takes the `Vec` that moves to hold at most `A_v / W` groups,
 which holds while one batch adds fewer than `S x s / ((2W + s)(W + s))`
@@ -1889,4 +1890,38 @@ the ladder bound at each of its 11 steps from 8 MiB: the first at
 and `the_q33_layout_with_coinciding_ladders_takes_the_capacity_share_bound`
 keeps the 56-wide case under its old name as the synthetic coinciding
 layout. `the_aggregate_profile_of_the_six_measured_statements` in
-`crates/ravel-sql/src/executor.rs` pins q33's layout at 16, 65, 16.
+`crates/ravel-sql/src/executor.rs` pins q33's layout at 16, 65, 16. The
+eight-byte sum amendment below returns q33's `W` to 56; these 65-wide
+figures stand for a synthetic layout.
+
+## Amendment (2026-11-06, #3845): q33's aggregate width is 56 again
+
+<!-- amendment-applies: sections="Amendment (2026-10-24, #3181): the aggregate envelope is bounded by its capacity share|Amendment (2026-11-05, #3838): q33's aggregate width is 65" pointer="eight-byte sum amendment" -->
+
+ADR-0022's eight-byte checked sum amendment keeps the grouped checked
+integer `SUM` at one `i64` or `u64` per group and a validity bit, promoting
+a group that leaves that width to an `i128` in a side table that is not a
+`Vec` of a group width. The memory estimate reads the sum as 8, as it reads
+the built-in's, and leaves its bitmap and side table out of `W` as it
+leaves the built-in's bitmap out. q33's `W` is `8 + 8 + 8 + 8 + 24 = 56`;
+`w_max` stays 16 and `s` stays 16. The q33 width amendment's 65 was the
+#3844 layout, under which q33 failed the process memory budget (issue
+#3845).
+
+With `W` 56 the two ladders coincide again (`56 x 2^j = 14 x 2^(j + 2)`),
+and the capacity share amendment's figures are q33's, recomputed from the
+layout rather than carried over: the share bound's `Vec` term is
+`(S + 192) x 2 x (56 + 16) / (2 x 56 + 16) = 1.125 x (S + 192)`, and it
+holds while one batch adds fewer than
+`S x 16 / ((2 x 56 + 16)(56 + 16)) = S / 576` groups, 14,563 at 8 MiB
+(`8,388,608 x 16 / 9,216`, rounded down). The six-step stream of that
+amendment, `14 x 2^19, 56 x 2^19, ..., 14 x 2^21, 56 x 2^21`, asks
+256,901,120 bytes and ends at an envelope of 289,013,976, the share bound,
+under the ladder bound `5 x 117,440,512`.
+
+`the_q33_layout_with_coinciding_ladders_takes_the_capacity_share_bound` in
+`crates/ravel-sql/src/memory.rs` now runs on q33's layout and asserts its
+`W` of 56 and the 14,563 groups; the 65-wide figures moved to
+`a_65_wide_layout_keeps_its_ladders_apart_and_takes_the_smaller_bound` over
+a synthetic layout. `the_aggregate_profile_of_the_six_measured_statements`
+in `crates/ravel-sql/src/executor.rs` pins q33's layout at 16, 56, 16.

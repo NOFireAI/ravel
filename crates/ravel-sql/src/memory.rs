@@ -89,8 +89,8 @@
 //! envelope is the smallest of the size bound, the next step and that share
 //! bound. When the two ladders coincide (16-byte entries and a `W` of 56:
 //! `14 x 2^k` and `56 x 2^j`), every grow counts for both and the next step
-//! reads `5 x J_max`; the share bound reads `1.125 x (S + 192)`. q33's `W` is
-//! 65, whose ladders stay apart: its next step is
+//! reads `5 x J_max`; the share bound reads `1.125 x (S + 192)`. q33 is that
+//! case. A `W` of 65 keeps its ladders apart: its next step is
 //! `max(5 x J_t, 2.1 x J_v x 81 / 65)` and its share bound
 //! `81/73 x (S + 192)`.
 //!
@@ -828,8 +828,10 @@ fn accumulator_widths(expr: &AggregateFunctionExpr) -> Option<Vec<usize>> {
     match expr.fun().name() {
         // `CountGroupsAccumulator`: one `i64` per group.
         "count" => Some(vec![8]),
-        // Ravel's checked integer `SUM`: an `i128` sum and a `bool` seen
-        // flag per group.
+        // Ravel's checked integer `SUM`: an `i64` or `u64` sum per group.
+        // Its validity bitmap and its table of groups promoted past the
+        // result type are not `Vec`s of a group width, as the built-in's
+        // bitmap is not.
         "sum"
             if expr
                 .state_fields()
@@ -2643,30 +2645,23 @@ mod tests {
         capacity_accounted: false,
     };
 
-    /// A synthetic capacity-accounted layout whose two ladders coincide:
-    /// 16-byte entries and per group 56 bytes of `Vec`s, `56 x 2^j = 14 x
-    /// 2^(j + 2)`. It is q33's width before its `SUM` became the 17-byte
-    /// checked sum; q33 itself is [`Q33_ACCOUNTED_LAYOUT`].
-    const W56_ACCOUNTED_LAYOUT: AggregateLayout = AggregateLayout {
+    /// q33's layout, as `the_aggregate_profile_of_the_six_measured_statements`
+    /// in `executor.rs` derives it from the plan: per group 8 + 8 (keys), 8
+    /// (`COUNT`), the checked integer `SUM`'s 8 and the exact `AVG`'s 16 + 8,
+    /// so `W` is 56 and its two ladders coincide: `56 x 2^j = 14 x 2^(j + 2)`.
+    const Q33_ACCOUNTED_LAYOUT: AggregateLayout = AggregateLayout {
         entry_size: 16,
-        vec_width_total: 56,
+        vec_width_total: 8 + 8 + 8 + crate::sum::EXACT_SUM_GROUP_WIDTHS[0] + 16 + 8,
         vec_width_max: 16,
         capacity_accounted: true,
     };
 
-    /// q33's layout, as `the_aggregate_profile_of_the_six_measured_statements`
-    /// in `executor.rs` derives it from the plan: per group 8 + 8 (keys), 8
-    /// (`COUNT`), the checked integer `SUM`'s 16 + 1 and the exact `AVG`'s
-    /// 16 + 8, so `W` is 65.
-    const Q33_ACCOUNTED_LAYOUT: AggregateLayout = AggregateLayout {
+    /// A synthetic capacity-accounted layout whose two ladders stay apart:
+    /// q33's shape with a 17-byte `SUM` (an `i128` and a `bool` per group),
+    /// so `W` is 65.
+    const W65_ACCOUNTED_LAYOUT: AggregateLayout = AggregateLayout {
         entry_size: 16,
-        vec_width_total: 8
-            + 8
-            + 8
-            + crate::sum::EXACT_SUM_GROUP_WIDTHS[0]
-            + crate::sum::EXACT_SUM_GROUP_WIDTHS[1]
-            + 16
-            + 8,
+        vec_width_total: 65,
         vec_width_max: 16,
         capacity_accounted: true,
     };
@@ -2829,11 +2824,12 @@ mod tests {
         drop(res);
     }
 
-    /// The synthetic 56-wide case ([`W56_ACCOUNTED_LAYOUT`], q33's width until
-    /// #3838; q33 itself is the next test): its table ladder `14 x 2^k` and
-    /// `Vec` ladder `56 x 2^j` are one set, so every step is both chains'
+    /// q33 ([`Q33_ACCOUNTED_LAYOUT`], `W` 56): its table ladder `14 x 2^k`
+    /// and `Vec` ladder `56 x 2^j` are one set, so every step is both chains'
     /// step and the ladder bound is `5 x J_max`. The capacity share of the
-    /// asked size bounds it instead.
+    /// asked size bounds it instead. One batch keeps the share bound's `Vec`
+    /// term while it adds under `S x 16 / (128 x 72) = S / 576` groups,
+    /// 14,563 at 8 MiB.
     /// FLIP: the PR head's `min(2.43 x S, ladder)` reads 587,202,560 at the
     /// end; taking the share over the charged bytes reads 361,267,416.
     #[test]
@@ -2846,7 +2842,15 @@ mod tests {
             AggregateReserveAhead::DEFAULT,
             QueryAccounting::new(),
         );
-        pool.set_aggregate_profile(AggregateProfile::Layout(W56_ACCOUNTED_LAYOUT));
+        let layout = Q33_ACCOUNTED_LAYOUT;
+        assert_eq!(layout.vec_width_total, 56);
+        let (s, w) = (16, 56);
+        assert_eq!(
+            (8usize << 20) * s / ((2 * w + s) * (w + s)),
+            14_563,
+            "groups one batch may add at 8 MiB"
+        );
+        pool.set_aggregate_profile(AggregateProfile::Layout(layout));
         let res = register_on(&pool, PARTIAL);
         // Table, `Vec`, table, `Vec`, table, `Vec`: 14 x 2^19, 56 x 2^19,
         // 14 x 2^20, 56 x 2^20, 14 x 2^21, 56 x 2^21.
@@ -2883,7 +2887,7 @@ mod tests {
         assert_eq!(budget.reserved(), 0);
     }
 
-    /// q33's `W` of 65 is no `14 x 2^m`: its `Vec` steps `65 x 2^j` sit 16%
+    /// A `W` of 65 ([`W65_ACCOUNTED_LAYOUT`]) is no `14 x 2^m`: its `Vec` steps `65 x 2^j` sit 16%
     /// off the nearest table steps `14 x 2^k`, so no grow counts for both, and
     /// its next step is `max(5 x J_t, 2.1 x J_v x 81 / 65)`. Its share bound
     /// is `(S + 192) x 2 x 81 / 146 = 81/73 x (S + 192)`, under the 56-wide
@@ -2897,9 +2901,9 @@ mod tests {
     /// 11,488,259 against 11,147,674 at the second stream's first step over
     /// 8 MiB.
     #[test]
-    fn the_q33_layout_keeps_its_ladders_apart_and_takes_the_smaller_bound() {
+    fn a_65_wide_layout_keeps_its_ladders_apart_and_takes_the_smaller_bound() {
         let _serial = envelope_tests();
-        let layout = Q33_ACCOUNTED_LAYOUT;
+        let layout = W65_ACCOUNTED_LAYOUT;
         assert_eq!(layout.vec_width_total, 65);
         let (s, w, w_max) = (16, 65, 16);
         assert_eq!(
@@ -3041,7 +3045,7 @@ mod tests {
             AggregateReserveAhead::DEFAULT,
             QueryAccounting::new(),
         );
-        pool.set_aggregate_profile(AggregateProfile::Layout(W56_ACCOUNTED_LAYOUT));
+        pool.set_aggregate_profile(AggregateProfile::Layout(Q33_ACCOUNTED_LAYOUT));
         let res = register_on(&pool, PARTIAL);
         let envelopes = envelopes_after(&budget, &pool, &res, &[7_340_032, 29_360_128]);
         let asked = 7_340_032 + 29_360_128;
@@ -3050,10 +3054,10 @@ mod tests {
         assert_eq!(envelopes[1], 41_287_896);
         assert_eq!(
             Some(envelopes[1] as usize),
-            W56_ACCOUNTED_LAYOUT.share_bound(asked)
+            Q33_ACCOUNTED_LAYOUT.share_bound(asked)
         );
         assert_ne!(
-            W56_ACCOUNTED_LAYOUT.share_bound(pool.reserved()),
+            Q33_ACCOUNTED_LAYOUT.share_bound(pool.reserved()),
             Some(envelopes[1] as usize)
         );
         drop(res);
