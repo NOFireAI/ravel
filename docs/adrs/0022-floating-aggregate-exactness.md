@@ -415,8 +415,10 @@ and an out-of-range oracle total must come back as the overflow error.
 ravel-server's `sql_endpoint.rs` asserts the 422 and its text over HTTP.
 
 Grouped execution runs a vectorized `GroupsAccumulator`: one `i128` and one
-seen flag per group, 17 bytes, against the built-in's 8. The aggregate
-memory estimate in crates/ravel-sql/src/memory.rs reads that layout.
+seen flag per group, 17 bytes, against the built-in's 8 (8 bytes and a
+validity bit since the eight-byte checked sum amendment below). The
+aggregate memory estimate in crates/ravel-sql/src/memory.rs reads that
+layout.
 
 ## Amendment (2026-11-06): an exact SUM(x + c) for an integer column
 
@@ -442,7 +444,9 @@ What changes:
    literal `c`, the rule `exact_sum_plus_literal`
    (crates/ravel-sql/src/sum_plus.rs) replaces `sum(x + c)`, `sum(c + x)`
    and `sum(x - c)` with an `exact_sum_count(x)` aggregate, which keeps the
-   exact `i128` sum and the non-null count of `x`, and a projection that
+   exact `i128` sum and the non-null count of `x` (grouped, a 64-bit sum
+   that promotes, per the eight-byte checked sum amendment below), and a
+   projection that
    evaluates `sum + c * count` in `i128` and narrows it once to the call's
    result type. A total that does not fit fails with
    `SqlError::IntegerSumOverflow`, the same error and text as item 1 of the
@@ -471,3 +475,67 @@ input, the q30 shape at one aggregate expression (ninety with the rule
 off), FILTER, DISTINCT, window and an unchanged output schema.
 `tests/logs_metadata_agg.rs` pins 2 for the rows above on the statistics
 and the scan path.
+
+## Amendment (2026-11-06): the checked sum keeps eight bytes per group
+
+<!-- amendment-applies: sections="Amendment: integer sum overflow fails the query|Amendment (2026-11-06): an exact SUM(x + c) for an integer column" pointer="eight-byte checked sum amendment" -->
+
+Tracked in issue #3845; it narrows the grouped layout #3844 introduced.
+
+The grouped checked sum kept an `i128` and a `bool` per group, 17 bytes
+against the built-in's 8. ClickBench q33 (`GROUP BY "WatchID",
+"ClientIP"` with a `SUM`, over millions of distinct groups) then failed the
+process memory budget it had fit before: its per-group width `W` went from
+56 to 65 (ADR-1170, q33 width amendment), and the reserve-ahead envelope
+over that width crossed the budget. The answer did not need the wider
+state: almost every group's running sum fits the 64-bit result type.
+
+What changes:
+
+1. **The grouped state is the result type's own width.** The grouped
+   accumulator keeps one `i64` (signed input) or `u64` (unsigned input) per
+   group and a validity bitmap, and adds each value with a checked add.
+2. **A group that would leave that width is promoted, not failed.** The
+   add that would overflow moves the group's running sum into an `i128`
+   carry held in a side table keyed by group, and restarts the narrow sum
+   at the value. The group's exact sum is carry plus narrow sum, so every
+   value counts exactly once, and the hot path never reads the side table:
+   only a failed checked add touches it. At evaluation a total that fits
+   the result type is returned and one that does not fails with
+   `SqlError::IntegerSumOverflow`, so the answer and the error are those of
+   the `i128` design in any arrival or merge order: `i64::MAX`, `1`, `-2`
+   in one group gives `i64::MAX - 1`.
+3. **The merge takes the same path.** A partial sum that fits the narrow
+   type is a checked add with promotion; one outside it goes to the carry
+   directly.
+4. **The exchanged partial state is unchanged**: one nullable
+   `Decimal128(38, 0)` per group, 16 bytes and a validity bit. A partial
+   can be outside the result type while the total fits (item 3 of the
+   integer sum amendment), so a 64-bit state would have to fail it or
+   promote it on the wire too. Keeping the wide state keeps the exchanged
+   value exact, keeps the state field the memory estimate recognises the
+   checked sum by, and costs nothing at the accumulator, which is where a
+   group lives for the whole stream.
+5. **`exact_sum_count` narrows the same way.** Grouped, it keeps the same
+   promoting 64-bit sum and its `i64` count, 16 bytes per group instead of
+   24; its exchanged state stays a `Decimal128(38, 0)` sum and an `Int64`
+   count, 24 bytes a row.
+
+Per group, as `GroupsAccumulator::size` reports it: the checked sum 8 bytes
+and a bit (17 before), `exact_sum_count` 16 bytes (24 before). A promoted
+group adds its side-table entry, 32 bytes and a control byte at the table's
+capacity, and `size` counts it. The aggregate memory estimate reads the
+narrow widths: q33's `W` is 56 again (ADR-1170, q33 width amendment of this
+date).
+
+Evidence: crates/ravel-sql/src/sum.rs asserts 1,064,960 bytes, 8.125 a
+group, over 131,072 groups grown batch by batch (the `i128` layout read
+2,228,224), that promoting 1,000 groups grows `size` by at least their
+entries, and exact totals for groups that leave `i64` and come back beside
+groups that never leave it, at 1 partition and at 8 where only the merge
+leaves `i64`. It asserts the overflow error for a group that leaves and
+stays out, signed and unsigned, and the merge's promotion and an
+`EmitTo::First` that keeps the remaining groups' carries. sum_plus.rs
+asserts 2,097,152 bytes over 131,072 groups (the `i128` layout read
+3,145,728) and exact promoted `SUM(x + c)` totals at 1 and 8 partitions.
+The tests of the integer sum amendment pass unchanged.

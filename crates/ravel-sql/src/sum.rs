@@ -1579,59 +1579,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "scratch timing harness"]
-    fn zz_scratch_timing_grouped_sum() {
-        let rows = 10_000_000usize;
-        let groups = 1_000_000usize;
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("v", DataType::Int64, false),
-        ]));
-        let mut partitions = vec![Vec::new(); 8];
-        let mut start = 0usize;
-        let mut batch_no = 0usize;
-        while start < rows {
-            let end = (start + 8192).min(rows);
-            let k: Vec<i64> = (start..end)
-                .map(|i| ((i.wrapping_mul(7919)) % groups) as i64)
-                .collect();
-            let v: Vec<i64> = (start..end).map(|i| (i % 1000) as i64).collect();
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![Arc::new(Int64Array::from(k)), Arc::new(Int64Array::from(v))],
-            )
-            .expect("batch");
-            partitions[batch_no % 8].push(batch);
-            batch_no += 1;
-            start = end;
-        }
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(8)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        rt.block_on(async {
-            let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(8));
-            ctx.register_udaf(checked_sum_udaf());
-            let mem = MemTable::try_new(schema, partitions).expect("memtable");
-            ctx.register_table("t", Arc::new(mem)).expect("register");
-            for round in 0..2 {
-                let t0 = std::time::Instant::now();
-                let batches = ctx
-                    .sql("SELECT k, sum(v) FROM t GROUP BY k")
-                    .await
-                    .expect("plan")
-                    .collect()
-                    .await
-                    .expect("run");
-                let n: usize = batches.iter().map(|b| b.num_rows()).sum();
-                assert_eq!(n, groups);
-                println!("TIMING round={round} ms={}", t0.elapsed().as_millis());
-            }
-        });
-    }
-
-    #[test]
     fn overflow_error_text_names_the_aggregate_and_result_type() {
         let err = SqlError::IntegerSumOverflow {
             result_type: "Int64",
