@@ -1149,6 +1149,41 @@ pub(crate) fn spill_mode_headroom(query_limit: usize) -> usize {
     share.max(SPILL_MODE_HEADROOM_MIN_BYTES)
 }
 
+/// Which limit refused a checked grow on a [`TenantDelegatingPool`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MemoryRefusal {
+    /// The per-query limit.
+    Query,
+    /// The tenant budget.
+    Tenant,
+    /// The process budget's accounted bytes.
+    Process,
+    /// The host memory gate.
+    HostGate,
+    /// The process aggregate envelope of a reserve-ahead grow.
+    ReserveAhead,
+}
+
+impl MemoryRefusal {
+    /// The name the query logs use for this refusal.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            MemoryRefusal::Query => "query_pool",
+            MemoryRefusal::Tenant => "tenant_budget",
+            MemoryRefusal::Process => "process_budget",
+            MemoryRefusal::HostGate => "host_memory_gate",
+            MemoryRefusal::ReserveAhead => "aggregate_reserve_ahead",
+        }
+    }
+
+    fn of_cause(cause: &ExhaustionCause, accounted: MemoryRefusal) -> MemoryRefusal {
+        match cause {
+            ExhaustionCause::Accounted => accounted,
+            ExhaustionCause::HostMemory { .. } => MemoryRefusal::HostGate,
+        }
+    }
+}
+
 /// What a pool has charged on behalf of one consumer.
 #[derive(Debug)]
 struct ConsumerEntry {
@@ -1342,6 +1377,10 @@ pub struct TenantDelegatingPool {
     consumers: Mutex<ConsumerLedger>,
     /// Set once any `try_grow` on this pool was refused for memory.
     refused: AtomicBool,
+    /// The kind of this pool's first memory refusal.
+    first_refusal: OnceLock<MemoryRefusal>,
+    /// Set once any refusal on this pool was the host memory gate's.
+    host_gate_refused: AtomicBool,
     /// The spill-mode headroom `H`, when this pool is in spill mode.
     spill_headroom: Option<usize>,
     /// Serializes spill-capable consumers' checked grows in spill mode, so
@@ -1409,6 +1448,8 @@ impl TenantDelegatingPool {
             peak_asked_bytes: AtomicU64::new(0),
             consumers: Mutex::new(ConsumerLedger::default()),
             refused: AtomicBool::new(false),
+            first_refusal: OnceLock::new(),
+            host_gate_refused: AtomicBool::new(false),
             spill_headroom: None,
             spill_gate: Mutex::new(()),
         }
@@ -1420,7 +1461,9 @@ impl TenantDelegatingPool {
     /// reserve-ahead envelopes would exceed `query_limit - headroom`
     /// (saturating at zero). Consumers that cannot spill may still grow to
     /// the query limit. That refusal is a spill trigger, not a memory
-    /// refusal, so it leaves [`Self::refused`] unset.
+    /// refusal, so it leaves [`Self::refused`] unset. A spill-capable
+    /// aggregate whose reserve-ahead envelope the process budget refuses gets
+    /// the same spill trigger instead of a memory refusal.
     pub fn with_spill_headroom(mut self, headroom: usize) -> Self {
         self.spill_headroom = Some(headroom);
         self
@@ -1432,6 +1475,16 @@ impl TenantDelegatingPool {
     /// it, even one that overshoots a ceiling.
     pub fn refused(&self) -> bool {
         self.refused.load(Ordering::Acquire)
+    }
+
+    /// The kind of this pool's first memory refusal, if it had one.
+    pub(crate) fn first_refusal(&self) -> Option<MemoryRefusal> {
+        self.first_refusal.get().copied()
+    }
+
+    /// Whether any memory refusal on this pool was the host memory gate's.
+    pub(crate) fn host_gate_refused(&self) -> bool {
+        self.host_gate_refused.load(Ordering::Acquire)
     }
 
     /// The most bytes consumers that cannot spill held at once on this pool,
@@ -1446,9 +1499,14 @@ impl TenantDelegatingPool {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Record a refusal of `asked` bytes asked by `consumer` and return the
-    /// attribution to append to its message.
-    fn refuse(&self, consumer: &MemoryConsumer, asked: usize) -> String {
+    /// Record a refusal of kind `kind` of `asked` bytes asked by `consumer`
+    /// and return the attribution to append to its message.
+    fn refuse(&self, kind: MemoryRefusal, consumer: &MemoryConsumer, asked: usize) -> String {
+        // Only the first refusal's kind is kept; a later set is a no-op.
+        let _ = self.first_refusal.set(kind);
+        if kind == MemoryRefusal::HostGate {
+            self.host_gate_refused.store(true, Ordering::Release);
+        }
         self.refused.store(true, Ordering::Release);
         // The process envelope spans every tenant, so it goes to the operator
         // log and never into the client-visible message.
@@ -1698,12 +1756,31 @@ impl TenantDelegatingPool {
         if next.envelope != state.envelope
             && let Err(refused) = self.set_envelope(id, next.envelope, EnvelopeCheck::Checked)
         {
+            // In spill mode a consumer that can spill answers this by
+            // spilling, so it is a spill trigger and not a memory refusal.
+            if self.spill_headroom.is_some() && consumer.can_spill() {
+                tracing::debug!(
+                    consumer = consumer.name(),
+                    asked = additional,
+                    delta = refused.delta,
+                    "SQL aggregate reserve-ahead refused in spill mode; the aggregate spills"
+                );
+                return Err(DataFusionError::ResourcesExhausted(format!(
+                    "query memory pool spill threshold reached: the process aggregate \
+                     envelope needs to grow by {} bytes: {}{}",
+                    refused.delta,
+                    refused.exhausted,
+                    self.attribution(consumer, additional)
+                )));
+            }
+            let kind =
+                MemoryRefusal::of_cause(&refused.exhausted.cause, MemoryRefusal::ReserveAhead);
             return Err(DataFusionError::ResourcesExhausted(format!(
                 "aggregate reserve-ahead refused: the process aggregate envelope needs \
                  to grow by {} bytes: {}{}",
                 refused.delta,
                 refused.exhausted,
-                self.refuse(consumer, additional)
+                self.refuse(kind, consumer, additional)
             )));
         }
         if let Err(error) = self.try_grow_charged(consumer, charged, additional) {
@@ -1916,7 +1993,7 @@ impl TenantDelegatingPool {
                 "query memory pool exhausted: {additional} more bytes on top of {used} \
                  already reserved exceeds per-query limit {}{}",
                 self.query_limit,
-                self.refuse(consumer, asked)
+                self.refuse(MemoryRefusal::Query, consumer, asked)
             ))
         })?;
         if let Err(refused) = self.tenant.try_grow(additional) {
@@ -1925,6 +2002,12 @@ impl TenantDelegatingPool {
             // accountant has already rolled its own tenant charge back on a
             // process refusal, and the process reserved nothing to release.
             self.query_shrink(additional);
+            let kind = match &refused {
+                GrowRefused::Tenant { .. } => MemoryRefusal::Tenant,
+                GrowRefused::Process { exhausted, .. } => {
+                    MemoryRefusal::of_cause(&exhausted.cause, MemoryRefusal::Process)
+                }
+            };
             let message = match refused {
                 GrowRefused::Tenant { used } => format!(
                     "tenant memory budget exhausted: {additional} more bytes on top of {used} \
@@ -1960,7 +2043,7 @@ impl TenantDelegatingPool {
                 },
             };
             return Err(DataFusionError::ResourcesExhausted(
-                message + &self.refuse(consumer, asked),
+                message + &self.refuse(kind, consumer, asked),
             ));
         }
         // Observed only once BOTH budgets have granted the growth. Recording it

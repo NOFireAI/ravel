@@ -150,6 +150,13 @@ fn create_scratch_dir(dir: &Path) -> std::io::Result<()> {
 /// smaller. A query that cannot reserve this much runs with spill disabled.
 pub const MIN_SPILL_RESERVATION_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The ceiling bytes behind each spill share: a ceiling of `n` times this
+/// is split into `n` shares, within [`MAX_SPILL_SHARES`] (issue #3899).
+pub const SPILL_SHARE_UNIT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The most queries the process spill ceiling is split between.
+pub const MAX_SPILL_SHARES: u64 = 4;
+
 /// The process-wide spill ceiling and the bytes of it live queries hold
 /// (ADR-0954 requirement 2, issue #2416). Each query granted spill reserves
 /// its scratch cap here before its disk manager is built, and releases it when
@@ -173,6 +180,26 @@ impl SpillBudget {
     #[cfg(test)]
     fn reserved(&self) -> u64 {
         self.reserved.load(Ordering::Acquire)
+    }
+
+    /// How many shares the ceiling is split into:
+    /// `clamp(floor(ceiling / SPILL_SHARE_UNIT_BYTES), 1, MAX_SPILL_SHARES)`,
+    /// so a ceiling under twice [`SPILL_SHARE_UNIT_BYTES`] is one share.
+    pub(crate) fn slots(&self) -> u64 {
+        (self.ceiling / SPILL_SHARE_UNIT_BYTES).clamp(1, MAX_SPILL_SHARES)
+    }
+
+    /// The scratch cap one query asks for: the ceiling split into
+    /// [`Self::slots`] equal shares, rounded down.
+    pub(crate) fn share(&self) -> u64 {
+        self.ceiling / self.slots()
+    }
+
+    /// Reserve one query's share: `min(share, what remains of the ceiling)`,
+    /// or `None` when that is below [`MIN_SPILL_RESERVATION_BYTES`] and the
+    /// query runs without spill.
+    pub(crate) fn reserve_share(&self) -> Option<SpillReservation> {
+        self.reserve(self.share())
     }
 
     /// Reserve `min(want, what remains of the ceiling)` in one atomic step, or
@@ -1480,5 +1507,72 @@ mod tests {
             err.to_string().contains("inst-dead") && err.to_string().contains("twice"),
             "the error names the root and the cause: {err}"
         );
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+
+    /// Issue #3899: the ceiling is split into
+    /// `clamp(floor(ceiling / 8 GiB), 1, 4)` shares.
+    #[test]
+    fn the_spill_ceiling_splits_into_up_to_four_shares() {
+        let cases = [
+            (64 * GIB, 4, 16 * GIB),
+            (21_500_000_000, 2, 10_750_000_000),
+            (9 * GIB, 1, 9 * GIB),
+            (16 * GIB - 1, 1, 16 * GIB - 1),
+            (16 * GIB, 2, 8 * GIB),
+            (100 * GIB, 4, 25 * GIB),
+            (1 << 20, 1, 1 << 20),
+        ];
+        for (ceiling, slots, share) in cases {
+            let budget = SpillBudget::new(ceiling);
+            assert_eq!(
+                (budget.slots(), budget.share()),
+                (slots, share),
+                "ceiling {ceiling}"
+            );
+        }
+    }
+
+    /// Issue #3899: four concurrent queries under a 64 GiB ceiling each get
+    /// 16 GiB, and a fifth gets nothing; a fifth that finds some of the
+    /// ceiling left gets only that, and nothing when it is under 64 MiB.
+    #[test]
+    fn a_fifth_concurrent_share_gets_only_what_remains() {
+        let budget = SpillBudget::new(64 * GIB);
+        let shares: Vec<SpillReservation> = (0..4)
+            .map(|_| budget.reserve_share().expect("one of four shares"))
+            .collect();
+        assert_eq!(
+            shares.iter().map(SpillReservation::bytes).collect::<Vec<_>>(),
+            [16 * GIB; 4]
+        );
+        assert_eq!(budget.reserved(), 64 * GIB);
+        assert!(budget.reserve_share().is_none(), "nothing remains");
+
+        drop(shares);
+        assert_eq!(budget.reserved(), 0);
+        let held: Vec<SpillReservation> = (0..3)
+            .map(|_| budget.reserve_share().expect("one of four shares"))
+            .collect();
+        let partial = budget
+            .reserve(16 * GIB - 100 * MIB)
+            .expect("a smaller reservation fits");
+        let fifth = budget.reserve_share().expect("100 MiB remains");
+        assert_eq!(fifth.bytes(), 100 * MIB, "only what remains");
+        assert_eq!(budget.reserved(), 64 * GIB);
+        drop(fifth);
+
+        drop(partial);
+        let partial = budget
+            .reserve(16 * GIB - 50 * MIB)
+            .expect("a smaller reservation fits");
+        assert!(
+            budget.reserve_share().is_none(),
+            "50 MiB is under the 64 MiB floor"
+        );
+        drop((held, partial));
+        assert_eq!(budget.reserved(), 0);
     }
 }
