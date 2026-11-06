@@ -1196,6 +1196,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recreated_key_never_reuses_a_version_or_etag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = open_in(dir.path());
+        let first = store
+            .put("k", Bytes::from_static(b"same"), PutOptions::default())
+            .await
+            .expect("put");
+        store.delete("k").await.expect("delete");
+        let second = store
+            .put(
+                "k",
+                Bytes::from_static(b"same"),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("create after delete");
+        assert_ne!(second.version, first.version);
+        assert_ne!(second.etag, first.etag);
+        assert!(matches!(
+            store
+                .put(
+                    "k",
+                    Bytes::from_static(b"same"),
+                    PutOptions {
+                        mode: PutMode::CasVersion(first.version.clone()),
+                        ..PutOptions::default()
+                    }
+                )
+                .await,
+            Err(StoreError::PreconditionFailed)
+        ));
+    }
+
+    #[tokio::test]
     async fn a_full_get_refuses_bytes_that_changed_at_rest() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = open_in(dir.path());
