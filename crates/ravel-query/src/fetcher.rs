@@ -5596,6 +5596,15 @@ mod tests {
         n_series: usize,
         samples_per: usize,
     ) -> (Bytes, TenantHash, SegmentRef) {
+        write_sparse_labelled_segment(n_series, samples_per, &[]).await
+    }
+
+    /// [`write_sparse_test_segment`] with every series also carrying `extra`.
+    async fn write_sparse_labelled_segment(
+        n_series: usize,
+        samples_per: usize,
+        extra: &[(&str, &str)],
+    ) -> (Bytes, TenantHash, SegmentRef) {
         let tenant_hash = TenantHash([5u8; 16]);
         let writer_id = Uuid::from_u128(3);
         let identity = SegmentIdentity {
@@ -5631,7 +5640,26 @@ mod tests {
                     ((1_000 + j as i64) * NS, f64::from_bits(bits))
                 })
                 .collect();
-            inputs.push(series(&metric, &samples));
+            let mut input = series(&metric, &samples);
+            if !extra.is_empty() {
+                let mut all = vec![Label {
+                    name: "__name__".to_string(),
+                    value: metric.clone(),
+                }];
+                all.extend(extra.iter().map(|(name, value)| Label {
+                    name: (*name).to_string(),
+                    value: (*value).to_string(),
+                }));
+                let label_set = LabelSet::new(all).expect("valid labels");
+                input.series_id = ravel_types::SeriesId::compute(
+                    &TenantId::new("t".to_string()),
+                    &metric,
+                    &label_set,
+                )
+                .expect("series id");
+                input.labels = label_set;
+            }
+            inputs.push(input);
         }
         let written = SegmentWriter::write(inputs, identity, bounds).expect("write sparse segment");
 
@@ -5984,6 +6012,161 @@ mod tests {
         );
         drop(decoded);
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// The gate's decision rule, driven synchronously with `K = 2`: at most
+    /// `K` two-step probes in flight before the decision, at most `2K - 1`
+    /// started, the first `K` completions decide, exactly half dropped keeps
+    /// the gate on, and a ticket dropped without `finish` completes as a
+    /// probe that did not drop its object.
+    #[test]
+    fn dictionary_probe_gate_decides_on_the_first_k_probes() {
+        let gate = DictionaryProbeGate::new(2);
+        let first = gate.begin(true).expect("first probe");
+        let second = gate.begin(true).expect("second probe");
+        assert!(
+            gate.begin(true).is_none(),
+            "K probes in flight refuse a third"
+        );
+        first.finish(true);
+        let third = gate.begin(false).expect("one completion admits one more");
+        assert!(gate.begin(true).is_none(), "K in flight again");
+        second.finish(false);
+        assert_eq!(
+            gate.stats(),
+            DictionaryProbeStats {
+                segments_pruned_by_dictionary: 1,
+                segments_probed_two_step: 2,
+                switched_off: false,
+            },
+            "one of the first two dropped: exactly half keeps the gate on"
+        );
+        third.finish(true);
+        let later = gate.begin(true).expect("a decided gate that stayed on");
+        drop(later);
+        assert_eq!(
+            gate.stats(),
+            DictionaryProbeStats {
+                segments_pruned_by_dictionary: 2,
+                segments_probed_two_step: 3,
+                switched_off: false,
+            },
+            "the held-dictionary probe paid no GET and is not counted"
+        );
+
+        let gate = DictionaryProbeGate::new(2);
+        let kept = gate.begin(true).expect("first probe");
+        let abandoned = gate.begin(true).expect("second probe");
+        kept.finish(false);
+        drop(abandoned);
+        assert_eq!(
+            gate.stats(),
+            DictionaryProbeStats {
+                segments_pruned_by_dictionary: 0,
+                segments_probed_two_step: 2,
+                switched_off: true,
+            },
+            "the dropped ticket completed the first K as not-dropped"
+        );
+        assert!(gate.begin(true).is_none(), "a switched-off gate refuses");
+    }
+
+    /// A sparse L0 fetch that takes the two-step probe on the ranged path
+    /// spends the whole per-segment bound and no more: the footer tail, the
+    /// footer chase, LABEL_DICT alone, the other three catalog sections, and
+    /// `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` page-range GETs for a selection
+    /// of eight runs. A dictionary miss stops after the third GET.
+    #[tokio::test]
+    async fn sparse_l0_two_step_fetch_meets_the_per_segment_bound() {
+        let (bytes, tenant_hash, seg_ref) =
+            write_sparse_labelled_segment(4096, 32, &[("job", "api")]).await;
+        let name = LabelMatcher::regex(
+            "__name__",
+            "sparse_metric_(100|1000|2000|3000)".to_string(),
+        )
+        .expect("regex");
+        for (job, want_series, want_gets, want_pruned) in [
+            ("api", 4, MAX_GETS_PER_L0_SEGMENT_FETCH, 0),
+            ("absent", 0, 3, 1),
+        ] {
+            let matchers = [LabelMatcher::equal("job", job), name.clone()];
+            let (fetcher, metrics) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+            let fetcher = fetcher
+                .with_whole_object_threshold(0)
+                .with_suffix_len(16)
+                .with_coalesce_gap(0);
+            let accounting = PhaseAccounting::new();
+            accounting
+                .dictionary_probe()
+                .arm([&matchers[..]], 8, false);
+            let (soa, _stats) = fetcher
+                .fetch_soa_phase_accounted(tenant_hash, &seg_ref, &matchers, &accounting)
+                .await
+                .expect("fetch");
+            assert_eq!(soa.len(), want_series, "job={job}: series");
+            assert_eq!(
+                accounting.dictionary_probe().stats(),
+                DictionaryProbeStats {
+                    segments_pruned_by_dictionary: want_pruned,
+                    segments_probed_two_step: 1,
+                    switched_off: false,
+                },
+                "job={job}: the two-step probe ran"
+            );
+            let gets = metrics.snapshot().get.calls;
+            assert_eq!(gets, want_gets, "job={job}: GETs");
+            assert!(gets <= MAX_GETS_PER_L0_SEGMENT_FETCH, "job={job}");
+        }
+    }
+
+    /// A two-step probe on an object whose LABEL_DICT is already held reads
+    /// the dictionary with no GET, so a miss counts as pruned and not as
+    /// probed two-step.
+    #[tokio::test]
+    async fn a_held_dictionary_is_not_counted_as_probed_two_step() {
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        let (fetcher, metrics) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let fetcher = fetcher.with_whole_object_threshold(0);
+        let accounting = QueryAccounting::new();
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_absent")];
+        let (footer, total, etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+        let sparse = fetcher
+            .sparse_probe_qualifies(&footer, total, &matchers)
+            .expect("the fixture takes the sparse catalog-probe path");
+        let (dict_off, dict_len) = sparse.label_dict;
+        let dict_end = usize::try_from(dict_off + dict_len).expect("in memory");
+        let dict_off_usize = usize::try_from(dict_off).expect("in memory");
+        regions.insert(dict_off, bytes.slice(dict_off_usize..dict_end));
+        let gates = DictionaryProbeGates::default();
+        gates.arm([&matchers[..]], 8, false);
+        let gets_before = metrics.snapshot().get.calls;
+        let decoded = fetcher
+            .decode_sparse_catalog(
+                &seg_ref,
+                tenant_hash,
+                &footer,
+                &etag,
+                &mut regions,
+                &sparse,
+                &matchers,
+                &accounting,
+                &gates,
+            )
+            .await
+            .expect("decode sparse catalog");
+        assert!(decoded.entries.is_empty(), "the dictionary drops the object");
+        assert_eq!(metrics.snapshot().get.calls, gets_before, "no GET");
+        assert_eq!(
+            gates.stats(),
+            DictionaryProbeStats {
+                segments_pruned_by_dictionary: 1,
+                segments_probed_two_step: 0,
+                switched_off: false,
+            }
+        );
     }
 
     /// A SERIES_IDX whose bytes fail their section crc32c does not set the
