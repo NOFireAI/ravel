@@ -46,8 +46,8 @@ pub fn sample_series(
 ) -> Result<(u64, Vec<SeriesSample>), String> {
     let workload = load_workload(WORKLOAD_PATH).map_err(|e| e.to_string())?;
     let seed = workload.seed;
-    let mut generator = Generator::new(&workload, profile_name, 1_700_000_000_000)
-        .map_err(|e| e.to_string())?;
+    let mut generator =
+        Generator::new(&workload, profile_name, 1_700_000_000_000).map_err(|e| e.to_string())?;
     let (bytes, _report) = generator.generate_bytes(steps).map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&bytes);
 
@@ -81,10 +81,10 @@ pub fn sample_series(
             continue;
         };
         entry.ts_ms.push(ts_ms);
-        if let Some(hex) = payload.strip_prefix("f 0x") {
-            if let Ok(bits) = u64::from_str_radix(hex, 16) {
-                entry.values.push(f64::from_bits(bits));
-            }
+        if let Some(hex) = payload.strip_prefix("f 0x")
+            && let Ok(bits) = u64::from_str_radix(hex, 16)
+        {
+            entry.values.push(f64::from_bits(bits));
         }
     }
     let series = order
@@ -110,14 +110,22 @@ mod tests {
             series.len() <= 5,
             "max_series must bound the distinct series returned"
         );
-        assert!(!series.is_empty(), "the cardinality profile must emit at least one series");
+        assert!(
+            !series.is_empty(),
+            "the cardinality profile must emit at least one series"
+        );
         for s in &series {
             assert!(
                 s.ts_ms.windows(2).all(|w| w[1] >= w[0] - 2 * 15_000),
                 "series {} timestamps should be close to step order (a bounded out-of-order shift aside)",
                 s.series
             );
-            assert_eq!(s.ts_ms.len(), 8, "8 steps requested for series {}", s.series);
+            assert_eq!(
+                s.ts_ms.len(),
+                8,
+                "8 steps requested for series {}",
+                s.series
+            );
         }
     }
 
@@ -125,6 +133,9 @@ mod tests {
     fn history_profile_is_reachable_and_bounded() {
         let (_seed, series) = sample_series("history", 4, 3).expect("sample history");
         assert!(series.len() <= 3);
-        assert!(!series.is_empty(), "the history profile must emit at least one series");
+        assert!(
+            !series.is_empty(),
+            "the history profile must emit at least one series"
+        );
     }
 }

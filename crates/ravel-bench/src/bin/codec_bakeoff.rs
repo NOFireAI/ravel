@@ -42,7 +42,10 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use ravel_bench::bench_env::env_header;
-use ravel_bench::codecs::{Alp, ByteSplitZstd, Chimp128, GcdDeltaFor, RawF64, ValueCodec};
+use ravel_bench::codecs::{
+    Alp, AlpRd, AlpVectorized, ByteSplitZstd, Chimp128, GcdDeltaFor, RawF64, ValueCodec,
+};
+use ravel_bench::metrics_stream_sample::sample_series;
 use ravel_bench::segment_support::{decode_scalar_run, production_scalar_run, scalar_val_page};
 use ravel_bench::value_shapes::{ALL_SHAPES, ValueShape, value_stream};
 
@@ -71,6 +74,42 @@ fn dataset(shape: ValueShape, n: usize) -> Dataset {
         name: shape.label(),
         values: value_stream(shape, n, 0),
     }
+}
+
+/// A value dataset drawn from a real MetricsBench profile
+/// (`benchmarks/metrics/workload.json`), via `metrics_stream_sample`, for
+/// exactly `n` float samples (concatenating series in first-encountered
+/// order until `n` is reached). `None` if the profile cannot supply `n`
+/// float samples within the bounded series/step budget tried here.
+///
+/// Only `"history"` (10,000 active series) is used for value datasets, never
+/// `"cardinality"` (1,000,000 active series): measured on this box,
+/// `cardinality` costs about 13.5s *per scrape step* regardless of how many
+/// series are kept (every step still generates every active series before
+/// filtering), so reaching `n = 500` steps would cost roughly two hours.
+/// `cardinality`'s temporal behavior is already covered by the timestamp
+/// bake-off (`ts_bakeoff`), which bounds it to 8 steps; its *value*
+/// distributions are not separately sampled here.
+fn metrics_value_dataset(n: usize) -> Option<(u64, Dataset)> {
+    let (seed, series) = sample_series("history", n as u64, 8).ok()?;
+    let mut values: Vec<f64> = Vec::with_capacity(n);
+    for s in &series {
+        values.extend(s.values.iter().copied());
+        if values.len() >= n {
+            break;
+        }
+    }
+    if values.len() < n {
+        return None;
+    }
+    values.truncate(n);
+    Some((
+        seed,
+        Dataset {
+            name: "metricsbench_history",
+            values,
+        },
+    ))
 }
 
 fn bits_eq(a: &[f64], b: &[f64]) -> bool {
@@ -278,8 +317,25 @@ fn main() {
         out.push_str(&format!(
             "\n======================= {page} samples per page =======================\n"
         ));
-        for shape in ALL_SHAPES {
-            let ds = dataset(shape, page);
+        let mut datasets: Vec<Dataset> = ALL_SHAPES
+            .iter()
+            .map(|&shape| dataset(shape, page))
+            .collect();
+        match metrics_value_dataset(page) {
+            Some((seed, ds)) => {
+                out.push_str(&format!(
+                    "(metricsbench_history values: seed={seed}, n={page}, drawn via \
+                     metrics_stream_sample::sample_series, bounded to 8 series)\n"
+                ));
+                datasets.push(ds);
+            }
+            None => out.push_str(&format!(
+                "(metricsbench_history values: skipped, could not draw {page} float samples \
+                 within the bounded series/step budget)\n"
+            )),
+        }
+
+        for ds in datasets {
             let prod = measure_production(&ds.values);
             let challengers: Vec<Cell> = [
                 &Alp as &dyn ValueCodec,
@@ -287,6 +343,8 @@ fn main() {
                 &Chimp128,
                 &ByteSplitZstd,
                 &RawF64,
+                &AlpVectorized,
+                &AlpRd,
             ]
             .iter()
             .map(|c| measure_challenger(*c, &ds.values))
