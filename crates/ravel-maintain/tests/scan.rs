@@ -15,9 +15,9 @@ use ravel_maintain::scan::{
 };
 use ravel_maintain::worker_set::MaintainRecordKeys;
 use ravel_maintain::{
-    Bucket, CompactorConfig, FixedClock, MaintainError, MemoSnapshotLimits, NoLeases,
-    RetentionConfig, RetentionPolicy, VerifiedSnapshot, buckets_held_out_of_window_total,
-    scan_and_compact,
+    Bucket, Clock, CompactionRefusedReason, CompactorConfig, FixedClock, MaintainError,
+    MemoSnapshotLimits, NoLeases, RetentionConfig, RetentionPolicy, VerifiedSnapshot,
+    buckets_held_out_of_window_total, compaction_refused_total, scan_and_compact,
 };
 use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
 use ravel_object_store::memory::MemoryStore;
@@ -1487,6 +1487,7 @@ async fn an_out_of_window_input_is_held_and_later_hours_still_compact(format: Fo
             already_done: 0,
             not_sealed: 0,
             held_out_of_window: 1,
+            geometry_unsupported: 0,
             cursor_advanced_to: Some(HOUR - 1),
         },
         "{format:?}: both readable hours compact and the cursor stops before the held hour"
@@ -1532,6 +1533,7 @@ async fn a_held_bucket_is_retried_on_the_next_pass() {
             already_done: 0,
             not_sealed: 0,
             held_out_of_window: 1,
+            geometry_unsupported: 0,
             cursor_advanced_to: None,
         }
     );
@@ -1542,6 +1544,7 @@ async fn a_held_bucket_is_retried_on_the_next_pass() {
             already_done: 1,
             not_sealed: 0,
             held_out_of_window: 1,
+            geometry_unsupported: 0,
             cursor_advanced_to: None,
         },
         "the cursor did not pass the held hour, so the second pass revisits it"
@@ -1622,4 +1625,98 @@ async fn a_newer_metrics_record_over_a_readable_object_is_not_held() {
         matches!(err, MaintainError::Invariant(ref msg) if msg.contains("newer than the current output version")),
         "the newer-than-writable refusal: {err:?}"
     );
+}
+
+/// ADR-3853 D0 on the maintain tick. Two RLOG inputs of 20 streams, one
+/// record each, are one block each carrying every stream, so a cursor plan
+/// predicts 20 streams x 2 inputs x 20 rows = 800 decoded rows for 40
+/// records, over the limit of 16 x 40 = 640. The first tick refuses the
+/// bucket and the memo holds the refusal; the next tick on that memo does not
+/// plan the merge again. The refusal is never written to the durable
+/// snapshot, so a memo seeded from it refuses the bucket afresh.
+#[tokio::test]
+async fn a_geometry_refusal_is_memoized_in_memory_and_never_persisted() {
+    let store = InstrumentedStore::new(MemoryStore::new());
+    let hour_start = i64::from(HOUR) * NS_PER_HOUR;
+    for input in 0..2u64 {
+        let ts = hour_start + 1_000 + input as i64;
+        let records: Vec<_> = (0..20)
+            .map(|s| common::log_record(s, ts, &format!("in{input} s{s}")))
+            .collect();
+        seed_rlog_input(&store, Uuid::from_u128(700 + u128::from(input)), 1, input + 1, &records)
+            .await;
+    }
+    let clock = sealed_through(HOUR);
+    let config = CompactorConfig {
+        merge_resident_ceiling_bytes: Some(0),
+        ..CompactorConfig::default()
+    };
+    let retention = retention_window(30 * DAY_NS);
+    async fn logs_tick(
+        memo: &mut MaintainMemo,
+        store: &dyn ObjectStoreBackend,
+        clock: &FixedClock,
+        config: &CompactorConfig,
+        retention: &RetentionConfig,
+    ) -> ScanResult {
+        scan_and_maintain_with_memo(
+            memo,
+            store,
+            clock,
+            config,
+            retention,
+            &NoLeases,
+            tenant_hash(),
+            Signal::Logs,
+            SHARD,
+        )
+        .await
+    }
+    type ScanResult = ravel_maintain::Result<ravel_maintain::MaintainReport>;
+    let refused = || compaction_refused_total(CompactionRefusedReason::Geometry);
+
+    let mut warm = MaintainMemo::new(DEFAULT_MEMO_REVERIFY_INTERVAL_NS);
+    let before = refused();
+    let first = logs_tick(&mut warm, &store, &clock, &config, &retention).await.expect("first tick");
+    assert_eq!(first.geometry_unsupported, 1, "{first:?}");
+    assert_eq!(first.compacted, 0, "{first:?}");
+    assert_eq!(refused() - before, 1, "one refusal, one count");
+    assert_eq!(
+        warm.terminal_state(tenant_hash(), Signal::Logs, SHARD, HOUR),
+        Some(TerminalState::GeometryUnsupported)
+    );
+
+    let before = refused();
+    let second = logs_tick(&mut warm, &store, &clock, &config, &retention).await.expect("second tick");
+    assert_eq!(second.geometry_unsupported, 0, "{second:?}");
+    assert_eq!(second.compacted, 0, "{second:?}");
+    assert_eq!(refused(), before, "the memo kept the merge from being planned");
+    assert_eq!(
+        warm.terminal_state(tenant_hash(), Signal::Logs, SHARD, HOUR),
+        Some(TerminalState::GeometryUnsupported),
+        "the refusal is still held"
+    );
+    assert_eq!(compaction_record_count(&store, Format::Rlog, HOUR).await, 0);
+
+    assert_eq!(warm.snapshot_entry_count(), 0, "the snapshot skips the refusal");
+    let now = clock.now_ns();
+    let mut seeded = MaintainMemo::new(DEFAULT_MEMO_REVERIFY_INTERVAL_NS);
+    let stats = seeded
+        .seed_from_snapshot(
+            &verified_snapshot(&warm, now),
+            MemoSnapshotLimits::DEFAULT,
+            now,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("seed");
+    assert_eq!(stats.seeded_buckets, 0, "{stats:?}");
+    assert_eq!(
+        seeded.terminal_state(tenant_hash(), Signal::Logs, SHARD, HOUR),
+        None
+    );
+    let before = refused();
+    let reseeded = logs_tick(&mut seeded, &store, &clock, &config, &retention).await.expect("seeded tick");
+    assert_eq!(reseeded.geometry_unsupported, 1, "{reseeded:?}");
+    assert_eq!(refused() - before, 1);
 }

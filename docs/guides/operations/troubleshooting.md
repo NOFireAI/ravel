@@ -1019,6 +1019,36 @@ recomputes the same plan and writes nothing.
 **Action.** A bucket that retries every tick and never compacts needs an
 operator, not another retry.
 
+### Compaction refused for merge geometry
+
+**Symptom.** `increase(ravel_maintain_compaction_refused_total{reason="geometry"}[1h]) > 0`,
+and a warn line `compaction refused a bucket: its cursor merge would decode
+more than max_amplification rows per input record` naming the signal, shard
+and ingest hour.
+
+**Cause.** The bucket's merge plan chose cursor mode, and the rows that mode
+would decode exceed 16 times the bucket's input records (ADR-3853 D0). The
+prediction comes from catalog metadata alone: for every stream, the record
+counts of every block that may carry it, summed over every input. A bucket
+with many inputs whose blocks each carry many streams decodes each block once
+per stream, so the merge would run for hours. The refusal happens after the
+catalog reads and before the first block is fetched. Nothing is fetched or
+published, the claim is released, and the L0 inputs stay live, so queries
+still read the bucket. A cursor bucket under the ratio, with few streams per
+block, compacts as before.
+
+**Confirm.** The counter on `/metrics` and the warn line, which carries the
+inputs, streams, blocks, records and predicted decoded rows.
+`ravel-cli maintain compact-bucket --tenant <t> --signal <s> --shard <n> --hour <n> --dry-run`
+prints `outcome: GeometryUnsupported` with the same figures, and
+`maintain compact-tenant` lists the bucket as `outcome=GeometryUnsupported`.
+
+**Action.** No data is at risk. The server records the refusal in its
+in-memory maintain memo and does not plan the bucket again until the process
+restarts; retention still runs on it. Each restart refuses it once more and
+moves the counter by one. ADR-3853's two-level merge is the fix that compacts
+these buckets; until it ships, leave them uncompacted.
+
 ### Legal hold refresh fails
 
 **Symptom.**

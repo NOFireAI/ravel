@@ -331,6 +331,10 @@ pub enum Label {
     /// `unwritable_stream_attrs`. Shares the `reason` key with the other
     /// reason variants.
     CompactionInputSkipReason(ravel_maintain::CompactionInputSkipReason),
+    /// Why compaction refused a bucket before fetching any block (issue
+    /// #3870): `geometry`. Shares the `reason` key with the other reason
+    /// variants.
+    CompactionRefusedReason(ravel_maintain::CompactionRefusedReason),
     /// Why a flush handed its rows back instead of writing them:
     /// `retired_index` or `generation_mismatch`. A closed enum owned by
     /// `ravel_ingest`, which also owns the label spelling. Shares the `reason`
@@ -747,6 +751,7 @@ impl Label {
             Label::AlertRetentionSkipReason(_) => "reason",
             Label::SupersededHeldReason(_) => "reason",
             Label::CompactionInputSkipReason(_) => "reason",
+            Label::CompactionRefusedReason(_) => "reason",
             Label::HandBackReason(_) => "reason",
             Label::Cache(_) => "cache",
             Label::DecodedCache(_) => "cache",
@@ -817,6 +822,7 @@ impl Label {
             Label::AlertRetentionSkipReason(reason) => reason.name().to_string(),
             Label::SupersededHeldReason(reason) => reason.name().to_string(),
             Label::CompactionInputSkipReason(reason) => reason.name().to_string(),
+            Label::CompactionRefusedReason(reason) => reason.name().to_string(),
             Label::HandBackReason(reason) => reason.label().to_string(),
             Label::Cache(family) => family.name().to_string(),
             Label::DecodedCache(kind) => kind.name().to_string(),
@@ -5858,6 +5864,10 @@ pub struct MaintenanceSafetySnapshot {
     /// [`ravel_maintain::buckets_held_out_of_window_total`], read at scrape
     /// time. Not signal-scoped: ravel-maintain keeps one total.
     pub compaction_held_out_of_window_buckets: u64,
+    /// [`ravel_maintain::compaction_refused_total`] for
+    /// [`ravel_maintain::CompactionRefusedReason::Geometry`], read at scrape
+    /// time. Not signal-scoped: ravel-maintain keeps one total.
+    pub compaction_refused_geometry: u64,
     pub signals: Vec<MaintenanceSafetySignalSnapshot>,
 }
 
@@ -5901,6 +5911,9 @@ impl MaintenanceSafetySnapshot {
             retention_held_by_lease_buckets: ravel_maintain::retention::held_by_lease_buckets_total(
             ),
             compaction_held_out_of_window_buckets: ravel_maintain::buckets_held_out_of_window_total(
+            ),
+            compaction_refused_geometry: ravel_maintain::compaction_refused_total(
+                ravel_maintain::CompactionRefusedReason::Geometry,
             ),
             signals: crate::maintain::MAINTAINED_SIGNALS
                 .iter()
@@ -6057,6 +6070,28 @@ fn render_maintain_safety_family(
         "ravel_maintain_buckets_held_out_of_window_total",
         &[Label::Mode(mode)],
         snapshot.compaction_held_out_of_window_buckets,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_compaction_refused_total",
+        "Bucket compactions refused before the first block GET, by reason, summed over every \
+         signal since process start (ADR-3853 D0). reason=\"geometry\": a cursor-mode merge \
+         whose predicted decoded rows exceed 16 times the bucket's record count, which happens \
+         when many L0 inputs each carry blocks spanning many streams. Nothing is fetched or \
+         published, the claim is released and the L0 inputs stay live; the server's in-memory \
+         maintain memo stops retrying the bucket until restart. A warn log line names the \
+         bucket. The fix is ADR-3853's two-level merge.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_compaction_refused_total",
+        &[
+            Label::Mode(mode),
+            Label::CompactionRefusedReason(ravel_maintain::CompactionRefusedReason::Geometry),
+        ],
+        snapshot.compaction_refused_geometry,
     );
 
     write_header(
@@ -10831,6 +10866,7 @@ mod tests {
             Label::CompactionInputSkipReason(
                 ravel_maintain::CompactionInputSkipReason::UnwritableStreamAttrs,
             ),
+            Label::CompactionRefusedReason(ravel_maintain::CompactionRefusedReason::Geometry),
             Label::HandBackReason(HandBackReason::RetiredIndex),
             Label::Cache(CacheFamily::Fetch),
             Label::DecodedCache(DecodedCacheKind::Part),
@@ -10888,6 +10924,7 @@ mod tests {
                 Label::AlertRetentionSkipReason(_) => "reason",
                 Label::SupersededHeldReason(_) => "reason",
                 Label::CompactionInputSkipReason(_) => "reason",
+                Label::CompactionRefusedReason(_) => "reason",
                 Label::HandBackReason(_) => "reason",
                 Label::Cache(_) => "cache",
                 Label::DecodedCache(_) => "cache",
@@ -10976,6 +11013,9 @@ mod tests {
                 // SupersededHeldReason (issue #2221) reuses the `reason` key.
                 "reason",
                 // CompactionInputSkipReason (issue #2554) reuses the `reason`
+                // key.
+                "reason",
+                // CompactionRefusedReason (issue #3870) reuses the `reason`
                 // key.
                 "reason",
                 // HandBackReason (issue #2600) reuses the `reason` key.
@@ -15443,6 +15483,7 @@ mod tests {
             retention_held_out_of_window_objects: 15,
             retention_held_by_lease_buckets: 16,
             compaction_held_out_of_window_buckets: 31,
+            compaction_refused_geometry: 32,
             signals: vec![
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Metrics,
@@ -15552,6 +15593,13 @@ mod tests {
                 "ravel_maintain_buckets_held_out_of_window_total{mode=\"maintain\"} 31\n"
             ),
             "missing compaction_held_out_of_window_buckets sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_compaction_refused_total{mode=\"maintain\",reason=\"geometry\"} \
+                 32\n"
+            ),
+            "missing compaction_refused_geometry sample:\n{body}"
         );
         assert!(
             body.contains(
@@ -17132,6 +17180,7 @@ mod tests {
             retention_held_out_of_window_objects: 1,
             retention_held_by_lease_buckets: 1,
             compaction_held_out_of_window_buckets: 1,
+            compaction_refused_geometry: 1,
             signals: vec![MaintenanceSafetySignalSnapshot {
                 signal: Signal::Metrics,
                 conservation_aborts: 1,
