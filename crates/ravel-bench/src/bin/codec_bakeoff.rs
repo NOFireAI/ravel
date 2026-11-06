@@ -282,6 +282,113 @@ fn measure_production(values: &[f64]) -> Cell {
     }
 }
 
+/// Renders one page size's full report block (every dataset, production row,
+/// every challenger row) and returns the per-dataset summaries used by the
+/// adoption pass. Split out of `main` so a reduced page size can be driven
+/// from a test: see `report_has_no_duplicate_cells` below, which is the
+/// Deliverable-3 "report fields appear exactly once per (corpus, codec, page
+/// size) cell" guard.
+fn page_report(page: usize) -> (String, Vec<DatasetSummary>) {
+    let mut out = String::new();
+    let mut summary: Vec<DatasetSummary> = Vec::new();
+
+    out.push_str(&format!(
+        "\n======================= {page} samples per page =======================\n"
+    ));
+    let mut datasets: Vec<Dataset> = ALL_SHAPES
+        .iter()
+        .map(|&shape| dataset(shape, page))
+        .collect();
+    match metrics_value_dataset(page) {
+        Some((seed, ds)) => {
+            out.push_str(&format!(
+                "(metricsbench_history values: seed={seed}, n={page}, drawn via \
+                 metrics_stream_sample::sample_series, bounded to 8 series)\n"
+            ));
+            datasets.push(ds);
+        }
+        None => out.push_str(&format!(
+            "(metricsbench_history values: skipped, could not draw {page} float samples \
+             within the bounded series/step budget)\n"
+        )),
+    }
+
+    for ds in datasets {
+        let prod = measure_production(&ds.values);
+        let challengers: Vec<Cell> = [
+            &Alp as &dyn ValueCodec,
+            &GcdDeltaFor,
+            &Chimp128,
+            &ByteSplitZstd,
+            &RawF64,
+            &AlpVectorized,
+            &AlpRd,
+        ]
+        .iter()
+        .map(|c| measure_challenger(*c, &ds.values))
+        .collect();
+
+        let enc_tag = prod.prod_enc.map(enc_name).unwrap_or("?");
+        out.push_str(&format!(
+            "\n{}  (n={page}, production val enc={enc_tag})\n",
+            ds.name
+        ));
+        out.push_str(&format!(
+            "  {:<16} {:>10} {:>12} {:>12} {:>12} {:>12} {:>8}  {}\n",
+            "codec",
+            "B/sample",
+            "enc Mval/s",
+            "dec Mval/s",
+            "dec in MB/s",
+            "dec out MB/s",
+            "ratio",
+            "roundtrip"
+        ));
+        let prod_bytes = prod.bytes_per_sample;
+        out.push_str(&format!(
+            "  {:<16} {:>10.4} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>8}  {}\n",
+            prod.codec,
+            prod.bytes_per_sample,
+            prod.enc_mvps,
+            prod.dec_mvps,
+            prod.dec_in_mb_per_sec,
+            prod.dec_out_mb_per_sec,
+            "-",
+            "ok"
+        ));
+        let mut summary_cells = Vec::new();
+        for c in &challengers {
+            let ratio = c.bytes_per_sample / prod_bytes.max(f64::MIN_POSITIVE);
+            out.push_str(&format!(
+                "  {:<16} {:>10.4} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>8.3}  {}\n",
+                c.codec,
+                c.bytes_per_sample,
+                c.enc_mvps,
+                c.dec_mvps,
+                c.dec_in_mb_per_sec,
+                c.dec_out_mb_per_sec,
+                ratio,
+                if c.roundtrip_ok { "ok" } else { "FAIL" },
+            ));
+            summary_cells.push(ChallengerSummary {
+                codec: c.codec,
+                bytes_per_sample: c.bytes_per_sample,
+                dec_mvps: c.dec_mvps,
+                roundtrip_ok: c.roundtrip_ok,
+            });
+        }
+        summary.push(DatasetSummary {
+            page,
+            name: ds.name,
+            prod_bytes,
+            prod_dec: prod.dec_mvps,
+            challengers: summary_cells,
+        });
+    }
+
+    (out, summary)
+}
+
 fn main() {
     let mut out = String::new();
     out.push_str(&env_header(
@@ -314,99 +421,9 @@ fn main() {
     let mut summary: Vec<DatasetSummary> = Vec::new();
 
     for &page in &PAGE_SIZES {
-        out.push_str(&format!(
-            "\n======================= {page} samples per page =======================\n"
-        ));
-        let mut datasets: Vec<Dataset> = ALL_SHAPES
-            .iter()
-            .map(|&shape| dataset(shape, page))
-            .collect();
-        match metrics_value_dataset(page) {
-            Some((seed, ds)) => {
-                out.push_str(&format!(
-                    "(metricsbench_history values: seed={seed}, n={page}, drawn via \
-                     metrics_stream_sample::sample_series, bounded to 8 series)\n"
-                ));
-                datasets.push(ds);
-            }
-            None => out.push_str(&format!(
-                "(metricsbench_history values: skipped, could not draw {page} float samples \
-                 within the bounded series/step budget)\n"
-            )),
-        }
-
-        for ds in datasets {
-            let prod = measure_production(&ds.values);
-            let challengers: Vec<Cell> = [
-                &Alp as &dyn ValueCodec,
-                &GcdDeltaFor,
-                &Chimp128,
-                &ByteSplitZstd,
-                &RawF64,
-                &AlpVectorized,
-                &AlpRd,
-            ]
-            .iter()
-            .map(|c| measure_challenger(*c, &ds.values))
-            .collect();
-
-            let enc_tag = prod.prod_enc.map(enc_name).unwrap_or("?");
-            out.push_str(&format!(
-                "\n{}  (n={page}, production val enc={enc_tag})\n",
-                ds.name
-            ));
-            out.push_str(&format!(
-                "  {:<16} {:>10} {:>12} {:>12} {:>12} {:>12} {:>8}  {}\n",
-                "codec",
-                "B/sample",
-                "enc Mval/s",
-                "dec Mval/s",
-                "dec in MB/s",
-                "dec out MB/s",
-                "ratio",
-                "roundtrip"
-            ));
-            let prod_bytes = prod.bytes_per_sample;
-            out.push_str(&format!(
-                "  {:<16} {:>10.4} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>8}  {}\n",
-                prod.codec,
-                prod.bytes_per_sample,
-                prod.enc_mvps,
-                prod.dec_mvps,
-                prod.dec_in_mb_per_sec,
-                prod.dec_out_mb_per_sec,
-                "-",
-                "ok"
-            ));
-            let mut summary_cells = Vec::new();
-            for c in &challengers {
-                let ratio = c.bytes_per_sample / prod_bytes.max(f64::MIN_POSITIVE);
-                out.push_str(&format!(
-                    "  {:<16} {:>10.4} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>8.3}  {}\n",
-                    c.codec,
-                    c.bytes_per_sample,
-                    c.enc_mvps,
-                    c.dec_mvps,
-                    c.dec_in_mb_per_sec,
-                    c.dec_out_mb_per_sec,
-                    ratio,
-                    if c.roundtrip_ok { "ok" } else { "FAIL" },
-                ));
-                summary_cells.push(ChallengerSummary {
-                    codec: c.codec,
-                    bytes_per_sample: c.bytes_per_sample,
-                    dec_mvps: c.dec_mvps,
-                    roundtrip_ok: c.roundtrip_ok,
-                });
-            }
-            summary.push(DatasetSummary {
-                page,
-                name: ds.name,
-                prod_bytes,
-                prod_dec: prod.dec_mvps,
-                challengers: summary_cells,
-            });
-        }
+        let (page_out, page_summary) = page_report(page);
+        out.push_str(&page_out);
+        summary.extend(page_summary);
     }
 
     // Adoption summary per (page, dataset).
@@ -558,5 +575,61 @@ mod tests {
     #[test]
     fn dec_in_mb_per_sec_is_zero_for_empty() {
         assert_eq!(dec_in_mb_per_sec(100.0, 0, 0), 0.0);
+    }
+
+    /// Deliverable-3 guard: every report field appears exactly once per
+    /// (corpus, codec, page size) cell. Run on a reduced page size (4, not the
+    /// real `PAGE_SIZES`) so this stays cheap: `page_report` is the exact
+    /// function `main` drives, so a stray second push into `summary` (a
+    /// duplicated dataset, a codec measured twice) is caught here rather than
+    /// only visible by eyeballing the printed table.
+    #[test]
+    fn report_has_no_duplicate_cells() {
+        let (out, summary) = page_report(4);
+
+        // No dataset name appears twice for this page: one row of production
+        // numbers per corpus, not more.
+        let mut names: Vec<&str> = summary.iter().map(|d| d.name).collect();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            before,
+            "a dataset name was measured more than once for page=4"
+        );
+        assert!(!summary.is_empty(), "page_report(4) measured no datasets");
+
+        // Within each dataset, every challenger codec name appears exactly
+        // once: no codec measured twice, none silently dropped.
+        for ds in &summary {
+            let mut codecs: Vec<&str> = ds.challengers.iter().map(|c| c.codec).collect();
+            let expected = codecs.len();
+            codecs.sort_unstable();
+            codecs.dedup();
+            assert_eq!(
+                codecs.len(),
+                expected,
+                "dataset {} has a duplicated challenger codec row",
+                ds.name
+            );
+            assert_eq!(
+                expected, 7,
+                "dataset {} should report exactly the 7 wired challengers",
+                ds.name
+            );
+        }
+
+        // And in the rendered text itself: each dataset's own header line
+        // ("<name>  (n=4, ...)") appears exactly once in the page's output.
+        for ds in &summary {
+            let header = format!("\n{}  (n=4,", ds.name);
+            let occurrences = out.matches(&header).count();
+            assert_eq!(
+                occurrences, 1,
+                "dataset header for {} appears {occurrences} times, expected 1",
+                ds.name
+            );
+        }
     }
 }
