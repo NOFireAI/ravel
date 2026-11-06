@@ -8753,6 +8753,250 @@ pub(crate) mod tests {
         assert_eq!(retry_decision(true, 7, 1), RetryDecision::FailInvalidated);
     }
 
+    /// Issue #3899: the spill retry's trigger. A pool refusal or an accounted
+    /// fetch refusal with nothing emitted, spill configured, an eligible
+    /// statement and no spill retry yet retries; taking away any one of those
+    /// does not, and no other error retries whatever the pool recorded.
+    #[test]
+    fn the_spill_retry_fires_only_on_a_memory_refusal_with_every_condition() {
+        use ravel_memory::ExhaustionCause;
+
+        let refused = PoolReport {
+            refused: true,
+            first: Some(MemoryRefusal::Query),
+            ..PoolReport::default()
+        };
+        let pool_err = || SqlError::ResourcesExhausted("query memory pool exhausted".into());
+        let fetch_err = |cause| {
+            SqlError::Fetch(FetchError::FetchMemoryExhausted {
+                requested: 10,
+                reserved: 90,
+                limit: 100,
+                cause,
+            })
+        };
+        let decide = |err: &SqlError, pool, emitted, retried| {
+            spill_retry_decision(err, pool, emitted, true, true, retried)
+        };
+
+        assert_eq!(decide(&pool_err(), refused, 0, false), SpillRetry::Retry);
+        assert_eq!(
+            decide(
+                &fetch_err(ExhaustionCause::Accounted),
+                PoolReport::default(),
+                0,
+                false
+            ),
+            SpillRetry::Retry,
+            "an accounted fetch refusal retries though the pool refused nothing"
+        );
+
+        assert_eq!(
+            decide(&pool_err(), PoolReport::default(), 0, false),
+            SpillRetry::Propagate,
+            "a ResourcesExhausted the pool did not refuse is not a memory refusal"
+        );
+        assert_eq!(
+            decide(&pool_err(), refused, 1, false),
+            SpillRetry::Propagate,
+            "rows already emitted"
+        );
+        assert_eq!(
+            decide(&pool_err(), refused, 0, true),
+            SpillRetry::Propagate,
+            "a second refusal after the spill retry"
+        );
+        assert_eq!(
+            spill_retry_decision(&pool_err(), refused, 0, false, true, false),
+            SpillRetry::Propagate,
+            "spill not configured"
+        );
+        assert_eq!(
+            spill_retry_decision(&pool_err(), refused, 0, true, false, false),
+            SpillRetry::Propagate,
+            "statement not spill-eligible"
+        );
+
+        let gate = PoolReport {
+            refused: true,
+            host_gate: true,
+            first: Some(MemoryRefusal::HostGate),
+            ..PoolReport::default()
+        };
+        assert_eq!(
+            decide(&pool_err(), gate, 0, false),
+            SpillRetry::Propagate,
+            "a host-gate refusal"
+        );
+        assert_eq!(
+            decide(
+                &fetch_err(ExhaustionCause::HostMemory {
+                    available: 1,
+                    floor: 2
+                }),
+                refused,
+                0,
+                false
+            ),
+            SpillRetry::Propagate,
+            "a fetch refused by the host gate"
+        );
+        for err in [
+            SqlError::SpillBudgetExhausted("quota".into()),
+            SqlError::SpillUnavailable("no scratch".into()),
+            SqlError::DeadlineExceeded { millis: 5 },
+            SqlError::Internal("boom".into()),
+        ] {
+            assert_eq!(
+                decide(&err, refused, 0, false),
+                SpillRetry::Propagate,
+                "{err:?}"
+            );
+        }
+
+        // Counted independently: a snapshot retry already taken leaves the
+        // spill retry available, and a spill retry already taken leaves the
+        // snapshot retry available.
+        assert_eq!(retry_decision(true, 0, 1), RetryDecision::FailInvalidated);
+        assert_eq!(decide(&pool_err(), refused, 0, false), SpillRetry::Retry);
+        assert_eq!(decide(&pool_err(), refused, 0, true), SpillRetry::Propagate);
+        assert_eq!(retry_decision(true, 0, 0), RetryDecision::RetryOnce);
+    }
+
+    /// Issue #3899: the spill retry's pool is the spill-mode pool, so a
+    /// consumer that can spill is held to `L - H` and a consumer that cannot
+    /// spill still finds `H` free; the first attempt's pool, and a retry that
+    /// could not enable spill, let the spillable consumer take all of `L`.
+    #[test]
+    fn the_spill_retry_runs_in_the_spill_mode_pool() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        const MIB: usize = 1 << 20;
+        let config = SqlConfig {
+            max_query_bytes: 1000 * MIB,
+            ..SqlConfig::default()
+        };
+        // Whether a non-spillable consumer can take 100 MiB after a
+        // spillable one asked for 950 MiB of the 1000 MiB limit.
+        let join_fits = |spill, spill_enabled| {
+            let (pool, _breach) = attempt_pool(
+                &config,
+                spill,
+                spill_enabled,
+                TenantMemoryAccountant::new(usize::MAX),
+                QueryAccounting::new(),
+            );
+            let sorter = MemoryConsumer::new("ExternalSorter[0]")
+                .with_can_spill(true)
+                .register(&pool);
+            let _ = sorter.try_grow(950 * MIB);
+            let join = MemoryConsumer::new("HashJoinInput[0]").register(&pool);
+            join.try_grow(100 * MIB).is_ok()
+        };
+        assert_eq!(
+            [
+                join_fits(SpillAttempt::Retry, true),
+                join_fits(SpillAttempt::Retry, false),
+                join_fits(SpillAttempt::First, false),
+                join_fits(SpillAttempt::PlanTime, true),
+            ],
+            [true, false, false, false]
+        );
+    }
+
+    /// Issue #3899: the one INFO line a statement that took a spill retry
+    /// logs, field by field.
+    #[test]
+    fn the_spill_retry_logs_one_info_line_with_its_figures() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        type Fields = BTreeMap<String, String>;
+        #[derive(Clone, Default)]
+        struct Infos(Arc<Mutex<Vec<Fields>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Infos {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() != tracing::Level::INFO {
+                    return;
+                }
+                struct Visit(Fields);
+                impl tracing::field::Visit for Visit {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.insert(field.name().to_string(), format!("{value:?}"));
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        self.0.insert(field.name().to_string(), value.to_string());
+                    }
+                }
+                let mut visit = Visit(Fields::new());
+                event.record(&mut visit);
+                self.0.lock().expect("not poisoned").push(visit.0);
+            }
+        }
+        static KEEP_TWO_DISPATCHERS: std::sync::OnceLock<tracing::Dispatch> =
+            std::sync::OnceLock::new();
+        KEEP_TWO_DISPATCHERS
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
+        let report = FirstRefusal {
+            class: "query_pool",
+            after: Duration::from_millis(1234),
+        }
+        .report(
+            SpillCounts {
+                files: 3,
+                bytes_written: 4096,
+                rows_written: 10,
+                bytes_read: None,
+                duration: Duration::from_millis(7),
+            },
+            PoolReport {
+                peak_unspillable_bytes: 2_200_000,
+                ..PoolReport::default()
+            },
+            Some(16 << 30),
+        );
+        let infos = Infos::default();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(infos.clone()), || {
+            report.emit("00000000deadbeef", "answered");
+        });
+        let lines = infos.0.lock().expect("not poisoned").clone();
+        let expected: Fields = [
+            ("message", "SQL statement retried with spill after a memory refusal"),
+            ("statement_fingerprint", "00000000deadbeef"),
+            ("outcome", "answered"),
+            ("first_refusal", "query_pool"),
+            ("first_refusal_after_ms", "1234"),
+            ("spill_bytes_written", "4096"),
+            ("spill_bytes_read", "unmeasured"),
+            ("spill_files", "3"),
+            ("peak_unspillable_bytes", "2200000"),
+            ("share_bytes", "17179869184"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(lines, vec![expected]);
+    }
+
+    /// The fingerprint is a stable hash of the SQL text, and a lowered
+    /// statement, which has no text, says so.
+    #[test]
+    fn a_statement_fingerprint_is_sixteen_hex_digits_of_its_text() {
+        let a = statement_fingerprint(Statement::Sql("SELECT 1"));
+        assert_eq!(a.len(), 16);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "{a}");
+        assert_eq!(a, statement_fingerprint(Statement::Sql("SELECT 1")));
+        assert_ne!(a, statement_fingerprint(Statement::Sql("SELECT 2")));
+    }
+
     #[test]
     fn target_signal_maps_the_from_clause_to_a_signal() {
         // samples -> metrics; logs -> logs.

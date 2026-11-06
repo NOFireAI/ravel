@@ -1509,8 +1509,7 @@ mod tests {
         );
     }
 
-    const GIB: u64 = 1024 * 1024 * 1024;
-    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
 
     /// Issue #3899: the ceiling is split into
     /// `clamp(floor(ceiling / 8 GiB), 1, 4)` shares.

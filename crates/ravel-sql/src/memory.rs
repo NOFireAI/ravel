@@ -4409,6 +4409,127 @@ mod tests {
         assert_eq!(spill.reserved(), 900);
     }
 
+    /// Issue #3899: in a spill-mode pool a reserve-ahead refusal of an
+    /// aggregate that can spill is the spill trigger: a `ResourcesExhausted`
+    /// with the spill-threshold text DataFusion's aggregate answers by
+    /// spilling, which sets neither `refused` nor the first refusal. The
+    /// same refusal of an aggregate that cannot spill, and of any aggregate
+    /// in a pool out of spill mode, is the memory refusal it always was.
+    #[test]
+    fn a_spill_mode_reserve_ahead_refusal_of_a_spillable_aggregate_is_a_spill_trigger() {
+        let _serial = envelope_tests();
+        // The process budget leaves 50 bytes once the join holds 950, so a
+        // 60-byte envelope does not fit; the query limit and a zero headroom
+        // keep the spill-mode cap itself out of the way.
+        let setup = |headroom: Option<usize>, spillable: bool| {
+            let budget = Arc::new(MemoryBudget::new(1000));
+            let pool = attributed_pool(&budget, 1000, 1000, headroom);
+            let join = register_on(&pool, "HashJoinInput[0]");
+            join.try_grow(950).expect("within every ceiling");
+            let aggregate = if spillable {
+                register_spilling(&pool, PARTIAL)
+            } else {
+                register_on(&pool, PARTIAL)
+            };
+            let message = exhausted_message(
+                aggregate
+                    .try_grow(60)
+                    .expect_err("a 60-byte envelope does not fit the process's last 50"),
+            );
+            (pool, message, join, aggregate)
+        };
+
+        let (pool, message, _join, _aggregate) = setup(Some(0), true);
+        assert!(
+            message.starts_with(
+                "query memory pool spill threshold reached: the process aggregate envelope \
+                 needs to grow by 60 bytes: "
+            ),
+            "{message}"
+        );
+        assert!(!pool.refused(), "the spill trigger is not a memory refusal");
+        assert_eq!(pool.first_refusal(), None);
+        assert_eq!(pool.reserved(), 950, "the refused grow charged nothing");
+
+        let (pool, message, _join, _aggregate) = setup(Some(0), false);
+        assert!(
+            message.starts_with(
+                "aggregate reserve-ahead refused: the process aggregate envelope needs to grow \
+                 by 60 bytes: "
+            ),
+            "{message}"
+        );
+        assert!(pool.refused());
+        assert_eq!(pool.first_refusal(), Some(MemoryRefusal::ReserveAhead));
+
+        let (pool, message, _join, _aggregate) = setup(None, true);
+        assert!(
+            message.starts_with(
+                "aggregate reserve-ahead refused: the process aggregate envelope needs to grow \
+                 by 60 bytes: "
+            ),
+            "{message}"
+        );
+        assert!(pool.refused());
+        assert_eq!(pool.first_refusal(), Some(MemoryRefusal::ReserveAhead));
+    }
+
+    /// Issue #3899: the pool records which layer refused first, and whether
+    /// any refusal came from the host memory gate, which the spill retry does
+    /// not answer.
+    #[test]
+    fn the_pool_records_its_first_refusal_and_a_host_gate_refusal() {
+        let budget = Arc::new(MemoryBudget::new(1 << 20));
+        let query = attributed_pool(&budget, 100, 1 << 20, None);
+        let res = register_on(&query, "HashJoinInput[0]");
+        res.try_grow(101).expect_err("over the query limit");
+        let tenant = attributed_pool(&budget, 1000, 50, None);
+        let res = register_on(&tenant, "HashJoinInput[0]");
+        res.try_grow(60).expect_err("over the tenant limit");
+        let small = Arc::new(MemoryBudget::new(40));
+        let process = attributed_pool(&small, 1000, 1000, None);
+        let res = register_on(&process, "HashJoinInput[0]");
+        res.try_grow(60).expect_err("over the process limit");
+        let gated = Arc::new(MemoryBudget::new(1 << 20));
+        gated.set_host_memory_gate(false, 1_000, 4_000);
+        let gate = attributed_pool(&gated, 1000, 1000, None);
+        let res = register_on(&gate, "HashJoinInput[0]");
+        res.try_grow(60).expect_err("the host gate is closed");
+        res.try_grow(1).expect_err("the host gate is still closed");
+
+        assert_eq!(
+            [
+                (query.first_refusal(), query.host_gate_refused()),
+                (tenant.first_refusal(), tenant.host_gate_refused()),
+                (process.first_refusal(), process.host_gate_refused()),
+                (gate.first_refusal(), gate.host_gate_refused()),
+            ],
+            [
+                (Some(MemoryRefusal::Query), false),
+                (Some(MemoryRefusal::Tenant), false),
+                (Some(MemoryRefusal::Process), false),
+                (Some(MemoryRefusal::HostGate), true),
+            ]
+        );
+        assert_eq!(
+            [
+                MemoryRefusal::Query,
+                MemoryRefusal::Tenant,
+                MemoryRefusal::Process,
+                MemoryRefusal::HostGate,
+                MemoryRefusal::ReserveAhead,
+            ]
+            .map(MemoryRefusal::as_str),
+            [
+                "query_pool",
+                "tenant_budget",
+                "process_budget",
+                "host_memory_gate",
+                "aggregate_reserve_ahead",
+            ]
+        );
+    }
+
     /// `query_pool_spill_mode` builds the `query_pool` pool with the headroom
     /// `spill_mode_headroom` gives its limit; `query_pool` stays out of spill
     /// mode.
