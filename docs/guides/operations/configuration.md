@@ -898,7 +898,7 @@ them afterwards.
 The server takes the spill settings from the first of these sources that is
 configured:
 
-1. `--sql-spill off` disables spill, whatever the other two sources say. Use
+1. `--sql-spill off` disables spill, whatever the other sources say. Use
    it on a node with no safe local scratch storage. The other value, `auto`,
    is the default.
 2. `RAVEL_SQL_SPILL_DIR` and `RAVEL_SQL_SPILL_MAX_BYTES`, both set: spill
@@ -908,13 +908,51 @@ configured:
 3. `--cache-dir` set and `RAVEL_SQL_SPILL_DIR` unset: spill goes under
    `<cache-dir>/sql-spill/<instance-id>`, with a derived ceiling.
    `RAVEL_SQL_SPILL_MAX_BYTES` set alone replaces the derived ceiling.
-4. None of the above: spill is off, and a query that outgrows its pool fails.
+4. None of the above: spill is on by default under the working directory of
+   the process, in `<working-dir>/sql-spill/<instance-id>`, with a derived
+   ceiling. See [Working-directory default](#working-directory-default).
 
 Two combinations refuse startup with an error that names the missing
 variable:
 
 - `RAVEL_SQL_SPILL_DIR` without `RAVEL_SQL_SPILL_MAX_BYTES`
 - `RAVEL_SQL_SPILL_MAX_BYTES` alone with no `--cache-dir`
+
+### Working-directory default
+
+With no `--sql-spill off`, neither spill variable set and no `--cache-dir`,
+spill goes under the directory the server was started in:
+
+```text
+<working-dir>/sql-spill/<instance-id>/
+```
+
+It works as under `--cache-dir`, with the working directory in its place: the
+same [derived ceiling](#derived-ceiling), [directory layout and
+lock](#spill-directory) and [startup sweep](#startup-sweep). The ceiling
+subtracts nothing for a read cache, because without `--cache-dir` the read
+cache has no disk tier. Both startup lines read `source=cwd-default`.
+
+This default never refuses startup. Spill is off instead, and a WARN line
+names the source, in these cases:
+
+| Case | `source` |
+|---|---|
+| The working directory is on tmpfs or ramfs, so spill would write to memory | `cwd-tmpfs` |
+| The working directory cannot be read, `<working-dir>/sql-spill` cannot be created, its free space cannot be measured, or the lock of the process's own directory cannot be taken | `cwd-unavailable` |
+| Half of the free space on the volume is below 1 GiB | `cwd-insufficient-space` |
+
+On Linux the server reads the filesystem type with `statfs(2)`. On other
+systems it does not check the type, and spill proceeds.
+
+To turn the default off, pass `--sql-spill off`. To put spill somewhere
+else, pass `--cache-dir` or set both spill variables.
+
+**Containers.** In a container whose working directory is on the overlay
+filesystem of the image, spill files count against the ephemeral-storage
+limit of the pod, and a large spill can get the pod evicted. Set
+`--sql-spill off`, or set `--cache-dir` to a volume sized for spill, in such
+deployments.
 
 ### Derived ceiling
 
@@ -967,8 +1005,13 @@ same `setting=... value=... source=...` layout as `sql_max_query_bytes`:
 
 | `setting` | `value` | `source` |
 |---|---|---|
-| `sql_spill_dir` | the spill directory, or `none` | `env`, `cache-dir`, `cache-dir-insufficient-space`, `flag-off` or `unset` |
-| `sql_spill_max_bytes` | the process spill ceiling in bytes, or `none` | `env`, `env-override` (the variable alone over a `--cache-dir` root), `derived`, `cache-dir-insufficient-space`, `flag-off` or `unset` |
+| `sql_spill_dir` | the spill directory, or `none` | `env`, `cache-dir`, `cache-dir-insufficient-space`, `cwd-default`, `cwd-tmpfs`, `cwd-unavailable`, `cwd-insufficient-space` or `flag-off` |
+| `sql_spill_max_bytes` | the process spill ceiling in bytes, or `none` | `env`, `env-override` (the variable alone over a `--cache-dir` root), `derived`, `cache-dir-insufficient-space`, `cwd-default`, `cwd-tmpfs`, `cwd-unavailable`, `cwd-insufficient-space` or `flag-off` |
+
+Under `derived`, `cache-dir-insufficient-space`, `cwd-default` and
+`cwd-insufficient-space`, the `sql_spill_max_bytes` line also carries
+`free_bytes` and `read_cache_bytes`. Under the working-directory default,
+`read_cache_bytes` is always 0.
 
 ### Spill directory
 
@@ -992,6 +1035,8 @@ The spill directory is checked at startup, unlike the read cache. With
 `--cache-dir` set and spill resolving there, the server refuses to start if
 it cannot create `<cache-dir>/sql-spill`, measure its free space, or take the
 lock of its own directory. `--sql-spill off` starts without touching it.
+Under the [working-directory default](#working-directory-default) the same
+failures turn spill off with a WARN line instead.
 
 ### Startup sweep
 
@@ -1004,6 +1049,11 @@ all of these hold:
 
 A `maintain` or `gateway` process does not sweep. A process under
 `--sql-spill off` does not sweep.
+
+Under the working-directory default, the process sweeps
+`<working-dir>/sql-spill` the same way, when that directory exists and the
+working directory is not on tmpfs or ramfs. It does not sweep the working
+directory when `--sql-spill off`, a spill variable or `--cache-dir` is set.
 
 When the sweep runs:
 

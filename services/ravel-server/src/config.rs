@@ -359,7 +359,7 @@ impl StrictFlushPolicy {
 pub enum SqlSpillArg {
     /// Spill wherever a source configures it: the
     /// `RAVEL_SQL_SPILL_DIR`/`RAVEL_SQL_SPILL_MAX_BYTES` pair, else
-    /// `--cache-dir`.
+    /// `--cache-dir`, else the working directory.
     #[default]
     Auto,
     /// ADR-0954 requirement 9's no-spill profile: spill is disabled whatever
@@ -1957,11 +1957,17 @@ pub struct Cli {
     /// disk-tier bound is subtracted, capped at four times the memory budget
     /// and raised to 1 GiB when that cap is lower, with spill off when that
     /// half is below 1 GiB
-    /// (`RAVEL_SQL_SPILL_MAX_BYTES` alone replaces that ceiling); else no
-    /// spill. The ceiling bounds all of the
+    /// (`RAVEL_SQL_SPILL_MAX_BYTES` alone replaces that ceiling); else
+    /// `<working-dir>/sql-spill/<instance-id>` under the same derived ceiling,
+    /// with nothing subtracted for a read cache, and spill off with a warning
+    /// instead of a refusal when the working directory is on tmpfs or ramfs
+    /// (`cwd-tmpfs`), `<working-dir>/sql-spill` cannot be created or locked
+    /// (`cwd-unavailable`), or half its volume's free bytes is below 1 GiB
+    /// (`cwd-insufficient-space`). The ceiling bounds all of the
     /// process's queries together. `off` disables spill whatever the
     /// environment or `--cache-dir` says. The startup log's
-    /// `sql_spill_dir` and `sql_spill_max_bytes` lines report the outcome.
+    /// `sql_spill_dir` and `sql_spill_max_bytes` lines report the outcome
+    /// and its source.
     /// Meaningful only in a build with the `sql` feature and in a mode that
     /// serves queries; inert otherwise.
     #[arg(long = "sql-spill", value_enum, default_value = "auto")]
