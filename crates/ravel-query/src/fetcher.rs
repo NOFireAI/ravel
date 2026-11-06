@@ -2454,7 +2454,10 @@ impl SegmentFetcher {
             .sections
             .iter()
             .find(|s| s.kind == SECTION_LABEL_DICT)
-            .map_or(0, |s| s.uncompressed_len.min(self.limits.max_section_uncompressed_bytes));
+            .map_or(0, |s| {
+                s.uncompressed_len
+                    .min(self.limits.max_section_uncompressed_bytes)
+            });
         let reservation = self.reserve_fetch(inflated)?;
         let limits = self.limits;
         let holds = match &self.read_gate {
@@ -2467,8 +2470,10 @@ impl SegmentFetcher {
                     .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
                     .collect();
                 gate.run(ReadSite::SegmentSparseCatalog, size, move || {
-                    let equals: Vec<(&str, &str)> =
-                        equals.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+                    let equals: Vec<(&str, &str)> = equals
+                        .iter()
+                        .map(|(n, v)| (n.as_str(), v.as_str()))
+                        .collect();
                     label_dict_holds_all(&footer, &dict, &equals, limits)
                 })
                 .await

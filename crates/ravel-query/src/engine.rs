@@ -32,8 +32,8 @@ use crate::distrib::WallDeadline;
 use crate::erasure::ErasurePredicate;
 use crate::error::{FoldLag, QueryError};
 use crate::fetcher::{
-    DictionaryProbeStats, FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa, ReadCache, SamplePriority,
-    SegmentFetcher,
+    DictionaryProbeStats, FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa,
+    ReadCache, SamplePriority, SegmentFetcher,
 };
 use crate::io_shape::{IoShapeCounts, PlanClass, QueryIoShape};
 use crate::limiter::GetLimiter;
