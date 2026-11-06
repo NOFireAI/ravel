@@ -1872,7 +1872,8 @@ impl ScratchUnit {
             hex::encode(&input_set_hash[..8]),
             std::process::id()
         ));
-        let store = scratch_blocking(move || Ok(ScratchStore::open(dir, SCRATCH_LIST_PAGE)?)).await?;
+        let store =
+            scratch_blocking(move || Ok(ScratchStore::open(dir, SCRATCH_LIST_PAGE)?)).await?;
         Ok(ScratchUnit {
             store: Arc::new(store),
             closed: false,
@@ -2102,7 +2103,10 @@ async fn two_level_merge(
         need,
         free,
     };
-    let merged = merge_in_unit(target, catalogs, stream_ids, width_ns, output, &unit, &layout).await;
+    let merged = merge_in_unit(
+        target, catalogs, stream_ids, width_ns, output, &unit, &layout,
+    )
+    .await;
     unit.close().await;
     merged
 }
@@ -2384,8 +2388,7 @@ async fn merge_in_unit(
     if compared > ceiling || plan.mode == MergeReadMode::Cursor {
         return Err(MaintainError::MergeTwoLevelUnsupported { inputs, check: fit });
     }
-    let builders =
-        level2_encode_builders(layout.share, ceiling, resident, in_flight, part_target);
+    let builders = level2_encode_builders(layout.share, ceiling, resident, in_flight, part_target);
     if let Some(l) = &ledger {
         l.record_encode_builders(builders as u64);
     }

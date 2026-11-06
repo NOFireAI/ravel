@@ -404,9 +404,7 @@ impl RequestLedger {
 
     /// Record the level-1 worker count `W1` of a two-level RLOG merge.
     pub fn record_level1_workers(&self, workers: u64) {
-        self.inner
-            .level1_workers
-            .store(workers, Ordering::Relaxed);
+        self.inner.level1_workers.store(workers, Ordering::Relaxed);
     }
 
     /// Record the level-2 encode depth `E` of a two-level RLOG merge.
