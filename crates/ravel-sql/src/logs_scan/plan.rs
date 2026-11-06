@@ -1542,6 +1542,7 @@ impl ScanExecutions {
     /// does a scan whose tenant published another object since its last
     /// execution. Two scans whose keys collide share a count, which only
     /// moves a publication direction.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn key(
         tenant_hash: TenantHash,
         projection: &[usize],
