@@ -104,14 +104,15 @@ Other knobs: `--streams`, `--min-streams-per-object`,
   `distinct_streams_in_bucket`, and min/median/max/mean/sum spreads for
   `records_per_object`, `streams_per_object`, `blocks_per_object`,
   `row_groups_per_object`, `bytes_per_object` and `ts_span_ms_per_object`.
-  Also `first_object_fields`, with each field's type, null share and
+  Also `records_per_stream_per_object_x100`, `objects_consecutive_in_time`,
+  and `first_object_fields`, with each field's type, null share and
   distinct count.
 - `run`:
   - `config`: the resolved compactor settings, including
     `rlog_zstd_level` and `rlog_l1_part_memory_target_bytes`.
   - Counts and sizes: `records_in`, `records_out`, `l0_objects`,
     `l0_bytes`, `l1_bytes`, `l1_l0_ratio`, `l1_parts`, `l1_part_bytes`,
-    `merge_read_mode`.
+    `l1_parts_reported_by_outcome`, `publish_outcome`, `merge_read_mode`.
   - CPU and time: `wall_s`, `process_cpu_s`, `cores_busy (cpu/wall)`,
     `records_per_s_wall`, `records_per_s_per_core (records / process cpu)`,
     `busiest_thread_cpu_s`, `threads_cpu_s`.
@@ -141,6 +142,9 @@ The bin exits 1, after printing the document, when any of these is true:
   process CPU, records/s per core) must each appear exactly once in the
   serialized `run`, with a non-null value.
 - `records_in` differs from `records_out`.
+- `l1_parts` (from the compaction record) differs from
+  `l1_parts_reported_by_outcome` (from the compaction outcome).
+- `publish_outcome` is anything other than `Published`.
 - `shape.objects` differs from `--inputs`.
 - With `--page-choice-ab`: the rows are not Exhaustive then Estimated, or a
   row has no bytes, ratio or encode CPU.
