@@ -165,6 +165,7 @@ use crate::provider::RavelTableProvider;
 use crate::regexp_replace_udf::regexp_replace_udf;
 use crate::spans_provider::SpansTableProvider;
 use crate::sum::checked_sum_udaf;
+use crate::sum_plus;
 use crate::trace_id_planner::trace_id_hex_literal_planner;
 use crate::udf::{label_match_udf, label_udf};
 
@@ -830,6 +831,11 @@ pub fn build_session_with_tables(
         .with_config(session)
         .with_runtime_env(runtime)
         .with_default_features()
+        // Issue #3845: an exact `SUM(x + c)` for an integer `x` and literal
+        // `c`, with every such call over one `x` sharing one sum and count.
+        // The default rules, with that rewrite before common subexpression
+        // elimination; see `crate::sum_plus`.
+        .with_optimizer_rules(sum_plus::optimizer_rules())
         .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews))
         // ADR-0850 item 2: answer `COUNT(*) WHERE <declared column> <>
         // <literal>` and `GROUP BY <declared column>, COUNT(*)` from exact

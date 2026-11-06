@@ -731,7 +731,14 @@ for unsigned input). Flight SQL returns the same text with
 `FAILED_PRECONDITION`. Only the final total is checked, so a total that fits
 is returned even if a running total passed the limit on the way. The check
 applies to `sum(DISTINCT ...)`, to a `FILTER` clause, and to a window
-`sum`, where each frame's total is checked. Arithmetic inside the argument
+`sum`, where each frame's total is checked. `sum(v + 1)`, `sum(1 + v)` and
+`sum(v - 1)` with an integer literal are exact too: the result is the exact
+`sum(v) + 1 * count(v)`, so over rows `9223372036854775807` and
+`-9223372036854775807` `sum(v + 1)` returns 2 even though the first row's
+`v + 1` leaves `BIGINT`, and only a total that does not fit fails. Every such term
+over one column shares one sum and count, so ninety `sum(v + k)` columns
+cost about one. With `DISTINCT`, as `sum(1 - v)`, or as a window `sum` the
+argument is still computed per row. Other arithmetic inside the argument
 is not checked: `sum(v * 2)` wraps in `v * 2` before the sum sees it. A
 `sum` over a `DOUBLE` or `DECIMAL` is unchanged. ES|QL's `STATS SUM` over a
 long reads null on overflow instead (see [ES|QL queries](#esql-queries)).

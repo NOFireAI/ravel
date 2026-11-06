@@ -389,7 +389,9 @@ What changes:
 5. **The `SUM(x + c)` rewrite is not applied for an integer literal `c`.**
    The built-in rewrites it to `SUM(x) + c * COUNT(x)`, whose `+` and `*`
    are DataFusion scalar arithmetic and wrap. The checked sum declines the
-   rewrite, so `sum(x + 1)` is checked like `sum(x)`.
+   rewrite, so `sum(x + 1)` is checked like `sum(x)`. Item 5 is replaced by
+   the exact SUM(x + c) amendment below, which computes that form exactly
+   instead of summing the per-row `x + 1`.
 
 What this does not change:
 
@@ -415,3 +417,57 @@ ravel-server's `sql_endpoint.rs` asserts the 422 and its text over HTTP.
 Grouped execution runs a vectorized `GroupsAccumulator`: one `i128` and one
 seen flag per group, 17 bytes, against the built-in's 8. The aggregate
 memory estimate in crates/ravel-sql/src/memory.rs reads that layout.
+
+## Amendment (2026-11-06): an exact SUM(x + c) for an integer column
+
+<!-- amendment-applies: sections="Amendment: integer sum overflow fails the query" pointer="exact SUM(x + c) amendment" -->
+<!-- amendment-supersedes: phrase="The checked sum declines the rewrite" pointer="exact SUM(x + c) amendment" -->
+
+Tracked in issues #3845 and #3847.
+
+Item 5 of the integer sum amendment kept `sum(x + c)` correct by summing
+the per-row `x + c` with the checked sum. That cost two things. The per-row
+`x + c` is DataFusion's wrapping scalar arithmetic, so a row at `i64::MAX`
+plus 1 wrapped to `i64::MIN` before the checked sum saw it: over rows
+`i64::MAX` and `-i64::MAX` the scan summed `-2^64 + 2` and failed
+`sum(v + 1)` with the overflow error, while the statistics path in
+crates/ravel-sql/src/metadata_agg.rs answered 2. And ClickBench q30
+(ninety `SUM("ResolutionWidth" + k)` terms) ran ninety accumulators, one per
+term.
+
+What changes:
+
+1. **An optimizer rule rewrites the shape exactly.** For an integer `x`
+   (Int8 to Int64, UInt8 to UInt64, or a dictionary of one) and an integer
+   literal `c`, the rule `exact_sum_plus_literal`
+   (crates/ravel-sql/src/sum_plus.rs) replaces `sum(x + c)`, `sum(c + x)`
+   and `sum(x - c)` with an `exact_sum_count(x)` aggregate, which keeps the
+   exact `i128` sum and the non-null count of `x`, and a projection that
+   evaluates `sum + c * count` in `i128` and narrows it once to the call's
+   result type. A total that does not fit fails with
+   `SqlError::IntegerSumOverflow`, the same error and text as item 1 of the
+   integer sum amendment. A group with no non-null `x` is NULL. Neither
+   DataFusion's `+` nor its `*` touches the combination. Rows `i64::MAX`
+   and `-i64::MAX` now give `sum(v + 1)` = 2 on the scan and the
+   statistics path alike.
+2. **Every such call over one `x` and one `FILTER` shares one
+   `exact_sum_count`**, and a plain `sum(x)` beside them joins it with
+   `c = 0`. q30's ninety terms plan one aggregate expression. The rule runs
+   before DataFusion's common subexpression elimination, which would
+   otherwise extract a shared `x + c` into a column and hide the shape.
+3. **Which path the other forms take.** A `FILTER` clause stays on the
+   shared aggregate and takes the exact form. `sum(DISTINCT x + c)`,
+   `sum(c - x)` and a window `sum(x + c) OVER (...)` are not rewritten:
+   they keep item 5's checked sum over the per-row `x + c`, whose
+   per-row wrapping issue #3847 tracks along with `sum(x * c)`.
+4. **The statistics path answers the same form.** A lone `sum(col + k)`
+   whose rewritten aggregate is `exact_sum_count(col)` is answered from
+   column statistics as the same sum and count, so the two paths agree.
+
+Evidence: the tests in crates/ravel-sql/src/sum_plus.rs cover exact totals
+whose rows leave the column type, overflow grouped and ungrouped at 1 and 8
+partitions for Int64 and UInt64, NULL and empty groups, Int8 and dictionary
+input, the q30 shape at one aggregate expression (ninety with the rule
+off), FILTER, DISTINCT, window and an unchanged output schema.
+`tests/logs_metadata_agg.rs` pins 2 for the rows above on the statistics
+and the scan path.
