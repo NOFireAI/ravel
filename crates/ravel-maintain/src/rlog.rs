@@ -1390,10 +1390,10 @@ async fn merge_catalogs_with_geometry(
         predicted_decoded_rows = plan.predicted_decoded_rows,
         "rlog merge read mode (compared = the held raw bytes + pass floor + largest hot-stream cursor charge that decided the mode)"
     );
-    if geometry == GeometryCheck::Refuse {
-        if let Some(refusal) = geometry_refusal(&plan, catalogs.len(), stream_ids.len()) {
-            return Err(refusal);
-        }
+    if geometry == GeometryCheck::Refuse
+        && let Some(refusal) = geometry_refusal(&plan, catalogs.len(), stream_ids.len())
+    {
+        return Err(refusal);
     }
     let mut resident_charges = MergeCharges::new(tracker);
     let resident = match plan.mode {
