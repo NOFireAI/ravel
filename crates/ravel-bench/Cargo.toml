@@ -521,6 +521,13 @@ path = "tests/walk_expiry_smoke.rs"
 required-features = ["walk-expiry"]
 bench = false
 
+# Which maintenance events expire a pinned walk, and with which label.
+[[test]]
+name = "walk_expiry_maintenance"
+path = "tests/walk_expiry_maintenance.rs"
+required-features = ["walk-expiry"]
+bench = false
+
 # ADR-2793 decision 4: the server CPU one post-decode pending-ack refusal costs
 # over one head refusal (issue #2902).
 [[bin]]
