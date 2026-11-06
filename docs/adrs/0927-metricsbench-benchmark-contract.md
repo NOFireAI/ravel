@@ -1269,7 +1269,9 @@ Decision.
    `data.stats`. The harness records it in the `--diagnostics` sidecar,
    never in `report.json`.
    - It is recorded for every repetition of every timed pass, with its
-     entry, pass and repetition index. Figures are never summed or pooled
+     entry, pass and repetition index (narrowed by the 2026-11-06 amendment:
+     skipped repetitions are listed in `skipped_reps` instead).
+     Figures are never summed or pooled
      across repetitions, so a repetition's cost sits beside that
      repetition's own latency.
    - Like the sidecar's ULP gaps, these figures are descriptive and never a
@@ -1345,3 +1347,30 @@ Consequences.
   latency figures are compared only with that stated.
 - The next cardinality run pre-registers Mimir completing all five timed
   passes, and records each Go comparator's peak against the 7 GiB limit.
+
+## Amendment (2026-11-06): a timed pass stops repeating a statement once it times out
+
+<!-- amendment-applies: sections="Amendment (2026-11-04): the first reference run reports one regime, and per-query cost rides in the diagnostics sidecar" pointer="2026-11-06 amendment" -->
+<!-- amendment-supersedes: phrase="It is recorded for every repetition of every timed pass" pointer="2026-11-06 amendment" -->
+
+Context. A timed pass reports the status of its first non-`ok` repetition, and a row reports the status of its first non-`ok` pass. A row that is not `ok` carries no latency. Once a repetition times out, the pass's remaining repetitions cannot change the pass status, the row status or any figure in `report.json`, but each still waits the full deadline. R6 waited out 32 timed repetitions at 120 s each (#940, comment 6664968984), and R5 waited out 38.
+
+Decision.
+1. In a timed pass, once an engine's repetition of a statement times out, the harness sends that engine no more repetitions of that statement in that pass. The next pass starts again at repetition 1. The rule applies to every engine alike, the oracle included, and only to `timeout`. Other non-`ok` statuses still run every repetition, because they answer fast and feed the ULP gaps.
+2. The untimed warm-up pass is unchanged. It sends every repetition, because it sets the cache state the timed passes start from.
+3. The diagnostics sidecar records each skipped repetition in `skipped_reps`: engine, entry, pass, repetition, and the repetition that timed out.
+   - For every engine and entry, the repetitions sent plus those skipped equal passes times repetitions per pass. The harness refuses to write a report when this does not hold.
+   - `ravel_cost` and `ulp_gaps` cover only repetitions that were sent.
+4. `report.json` is unchanged in shape and content. Given the same outcomes, a run with the rule produces the same rows, statuses, `pass_statuses` and figures as one without it.
+
+Decision 4 of the 2026-11-04 amendment is narrowed accordingly. Per-query cost is recorded for every repetition that was sent, and a skipped repetition appears in `skipped_reps` instead.
+
+Rejected:
+- Writing every later pass as `timeout` after a statement times out. It saves more time (69.8 min on R6), but it records statuses nobody observed: on R5, `mb_fanout_total_rate` timed out in pass 1 and answered in passes 2 and 4.
+- Skipping warm-up repetitions after a warm-up timeout, because that changes the cache state timed pass 1 starts from.
+- Lowering the deadline, because that changes which statements time out.
+
+Consequences.
+- **Saving.** Replayed from the per-repetition records, the rule saves 42.0 min on R6 and 52.0 min on R5 (issue #3879).
+- **Leftover load.** If an engine keeps working on a query after the client gives up at the deadline, a skipped repetition also removes that leftover work, so the statements after it can run faster than they did before this amendment. Runs on either side of the amendment are compared only with this stated. The next run pre-registers Ravel's per-statement medians within 0.85 to 1.15 of R6's.
+- **`ravel_cost` count.** The record count drops below passes times repetitions times entries by the number of Ravel's skipped repetitions. R6's pre-registered count of 315 does not carry over.
