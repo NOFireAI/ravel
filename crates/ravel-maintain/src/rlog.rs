@@ -560,7 +560,10 @@ pub(crate) async fn load_catalog_from_object(
     // ranged GET, growing to a second only if the probe missed the footer
     // (the RLOG analogue of the RSEG read path).
     let probe = store
-        .get(&object_key, GetRange::Suffix(config.footer_probe_bytes))
+        .get(
+            &object_key,
+            GetRange::Suffix(config.rlog_footer_probe_bytes),
+        )
         .await;
     note_get(ledger, RequestPhase::CatalogRead, &probe);
     let probe = probe?;
@@ -11632,7 +11635,7 @@ mod tests {
     /// from the probe and fetches by range only the ones it does not.
     mod catalog_probe {
         use super::*;
-        use crate::config::DEFAULT_FOOTER_PROBE_BYTES;
+        use crate::config::{DEFAULT_FOOTER_PROBE_BYTES, DEFAULT_RLOG_FOOTER_PROBE_BYTES};
 
         const KEY: &str = "l0/catalog-probe";
 
@@ -11671,10 +11674,14 @@ mod tests {
                 .expect("put");
         }
 
-        fn ledgered(footer_probe_bytes: u64) -> (CompactorConfig, RequestLedger) {
+        /// A config whose RLOG probe is `rlog_footer_probe_bytes`. The shared
+        /// RSEG/RSPAN probe is set to the 16-byte trailer alone, so a load that
+        /// read it instead would cost a footer GET plus one per section.
+        fn ledgered(rlog_footer_probe_bytes: u64) -> (CompactorConfig, RequestLedger) {
             let ledger = RequestLedger::new();
             let config = CompactorConfig {
-                footer_probe_bytes,
+                rlog_footer_probe_bytes,
+                footer_probe_bytes: 16,
                 request_ledger: Some(ledger.clone()),
                 ..CompactorConfig::default()
             };
@@ -11701,9 +11708,15 @@ mod tests {
         }
 
         #[test]
-        fn the_default_footer_probe_is_128_kib() {
-            assert_eq!(DEFAULT_FOOTER_PROBE_BYTES, 131_072);
-            assert_eq!(CompactorConfig::default().footer_probe_bytes, 131_072);
+        fn the_default_rlog_footer_probe_is_128_kib() {
+            assert_eq!(DEFAULT_RLOG_FOOTER_PROBE_BYTES, 131_072);
+            assert_eq!(CompactorConfig::default().rlog_footer_probe_bytes, 131_072);
+        }
+
+        #[test]
+        fn the_shared_footer_probe_stays_64_kib() {
+            assert_eq!(DEFAULT_FOOTER_PROBE_BYTES, 65_536);
+            assert_eq!(CompactorConfig::default().footer_probe_bytes, 65_536);
         }
 
         /// Every section the load reads (STREAM_DIR, FIELD_DIR, SKIP_IDX,
@@ -11720,9 +11733,9 @@ mod tests {
             let ftr = footer::open(&bytes).expect("open");
             assert!(ftr.section(kind::POSTINGS).is_some(), "POSTINGS present");
             assert!(ftr.section(kind::KEY_IDX).is_some(), "KEY_IDX present");
-            assert!((bytes.len() as u64) < DEFAULT_FOOTER_PROBE_BYTES);
+            assert!((bytes.len() as u64) < DEFAULT_RLOG_FOOTER_PROBE_BYTES);
 
-            let (config, ledger) = ledgered(DEFAULT_FOOTER_PROBE_BYTES);
+            let (config, ledger) = ledgered(DEFAULT_RLOG_FOOTER_PROBE_BYTES);
             let catalog = load(&store, &config).await;
             let report = ledger.report();
             assert_eq!(

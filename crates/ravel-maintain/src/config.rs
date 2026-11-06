@@ -1511,11 +1511,14 @@ pub fn claim_lease_below_warn_threshold(
     let threshold_ms = u64::try_from(encode_ms.saturating_mul(2)).unwrap_or(u64::MAX);
     claim_lease_duration < Duration::from_millis(threshold_ms)
 }
-/// Default footer suffix-probe size, 128 KiB. On an RLOG input the four
-/// directory sections and the footer sit at the object's tail, and every one
-/// the probe holds is sliced from it rather than fetched again
-/// (docs/log-segment-format.md reader protocol).
-pub const DEFAULT_FOOTER_PROBE_BYTES: u64 = 128 * 1024;
+/// Default footer suffix-probe size for RSEG and RSPAN inputs, 64 KiB (RSEG
+/// reader protocol, docs/segment-format.md).
+pub const DEFAULT_FOOTER_PROBE_BYTES: u64 = 64 * 1024;
+/// Default footer suffix-probe size for RLOG inputs, 128 KiB. The RLOG catalog
+/// load slices its sections from this probe; it is sized to hold SKIP_IDX,
+/// PAGE_DIR, STREAM_DIR, FIELD_DIR and the footer on the logs-benchmark
+/// objects (docs/log-segment-format.md reader protocol).
+pub const DEFAULT_RLOG_FOOTER_PROBE_BYTES: u64 = 128 * 1024;
 /// Default `input_read_concurrency`: 8 input reads in flight at once.
 pub const DEFAULT_INPUT_READ_CONCURRENCY: usize = 8;
 /// Default `merge_cursor_budget_bytes`: 20 GiB (ADR-0979 decision 4), re-derived
@@ -2045,8 +2048,12 @@ pub struct CompactorConfig {
     /// Buckets with fewer L0 records than this are left uncompacted; set 1 for
     /// v1-retirement campaigns.
     pub min_compaction_inputs: usize,
-    /// Suffix-probe size for the first footer GET of each input.
+    /// Suffix-probe size for the first footer GET of each RSEG or RSPAN input.
     pub footer_probe_bytes: u64,
+    /// Suffix-probe size for the first footer GET of each RLOG input. The RLOG
+    /// catalog load slices every section the probe wholly holds from it, so
+    /// this is larger than [`Self::footer_probe_bytes`].
+    pub rlog_footer_probe_bytes: u64,
     /// How many per-input reads a compaction or rewrite keeps in flight at
     /// once: the commit-record GETs of [`crate::read::load_inputs`] and the
     /// per-input catalog loads that follow it. A bucket with hundreds of
@@ -2359,6 +2366,7 @@ impl Default for CompactorConfig {
             rlog_max_l1_part_bytes: None,
             min_compaction_inputs: DEFAULT_MIN_COMPACTION_INPUTS,
             footer_probe_bytes: DEFAULT_FOOTER_PROBE_BYTES,
+            rlog_footer_probe_bytes: DEFAULT_RLOG_FOOTER_PROBE_BYTES,
             input_read_concurrency: DEFAULT_INPUT_READ_CONCURRENCY,
             merge_cursor_budget_bytes: DEFAULT_MERGE_CURSOR_BUDGET_BYTES,
             merge_resident_ceiling_bytes: None,
