@@ -4727,7 +4727,10 @@ mod tests {
             );
             assert!(startup.inputs.cwd_default, "{label}");
             assert_eq!(
-                startup.owner.as_ref().map(|owner| owner.dir().to_path_buf()),
+                startup
+                    .owner
+                    .as_ref()
+                    .map(|owner| owner.dir().to_path_buf()),
                 Some(dir.clone()),
                 "{label}: this process holds its root's owner lock"
             );
@@ -4789,8 +4792,7 @@ mod tests {
         assert!(!cwd.path().join("sql-spill").exists());
         let lines = capture.0.lock().clone();
         assert!(
-            resolved_line(&lines, "sql_spill_dir")
-                .contains(" value=\"none\" source=\"cwd-tmpfs\"")
+            resolved_line(&lines, "sql_spill_dir").contains(" value=\"none\" source=\"cwd-tmpfs\"")
         );
         let warns = capture.1.lock().clone();
         assert_eq!(warns.len(), 1, "{warns:?}");
@@ -4851,12 +4853,20 @@ mod tests {
         let (capture, guard) = capture_info();
         check(
             "a file",
-            prepare_cwd(&file, settings(false, 2 * GIB), SpillFsKind::Other, 100 * GIB),
+            prepare_cwd(
+                &file,
+                settings(false, 2 * GIB),
+                SpillFsKind::Other,
+                100 * GIB,
+            ),
         );
         drop(guard);
         let warns = capture.1.lock().clone();
         assert_eq!(warns.len(), 1, "{warns:?}");
-        assert!(warns[0].contains(" source=\"cwd-unavailable\""), "{warns:?}");
+        assert!(
+            warns[0].contains(" source=\"cwd-unavailable\""),
+            "{warns:?}"
+        );
 
         check(
             "no working directory",
