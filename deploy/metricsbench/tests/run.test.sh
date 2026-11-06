@@ -1872,7 +1872,7 @@ fi
 expect_log "x: the entries listing asks for JSON" "catalog list --tenant metricsbench --shards 4 --hours"
 check "x: a ci run selects no cold entry, stamped with the corpus path" 'j("stamps.json")["cold_ravel_diagnostic"] == "not applicable: no entry of class long_range or mb_full_range_avg_over_time in the corpus " + j("stamps.json")["corpus"] + " is declared for profile ci" and j("stamps.json")["corpus"].endswith("benchmarks/metrics/metrics.corpus.json")'
 expect_no_file x cold-ravel-diagnostic.json
-expect_no_log "x: a ci run restarts nothing for a cold pass" " restart ravel-server"
+expect_no_log "x: a ci run restarts nothing for a cold pass" " restart --no-deps ravel-server"
 
 mapfile -t args < <(full_args "${TMP}/x0/out")
 STUB_LIST_DATA=7 run_case x0 "${args[@]}"
@@ -1960,7 +1960,7 @@ check "y: every run carries status, latency and the ravel_cost record with exact
 check "y: the file names the regime and marks it non-comparable" 'j("cold-ravel-diagnostic.json")["regime"] == "cold-ravel-diagnostic" and j("cold-ravel-diagnostic.json")["comparable"] is False and "not comparable" in j("cold-ravel-diagnostic.json")["note"] and "#3794" in j("cold-ravel-diagnostic.json")["note"]'
 check "y: the stamp names the regime, non-comparable, with no failed run" 'j("stamps.json")["cold_ravel_diagnostic"]["regime"] == "cold-ravel-diagnostic" and j("stamps.json")["cold_ravel_diagnostic"]["comparable"] is False and j("stamps.json")["cold_ravel_diagnostic"]["failed_runs"] == 0 and j("stamps.json")["cold_ravel_diagnostic"]["runs"] == 15 and j("stamps.json")["status"] == "passed"'
 check "y: report.json's timed rows are the standard run's (the whole corpus), not touched by the pass" 'j("report.json") == {"stub": "report", "timed_rows": 6}'
-if [ "$(grep -c ' restart ravel-server$' "${LOG}")" -eq 15 ]; then pass "y: ravel-server restarted once per run"; else fail "y: restarts $(grep -c ' restart ravel-server$' "${LOG}"), want 15"; fi
+if [ "$(grep -c ' restart --no-deps ravel-server$' "${LOG}")" -eq 15 ]; then pass "y: ravel-server restarted once per run"; else fail "y: restarts $(grep -c ' restart --no-deps ravel-server$' "${LOG}"), want 15"; fi
 if [ "$(grep -c '^metricsbench_query --ingest-report' "${LOG}")" -eq 16 ] &&
   [ "$(grep '^metricsbench_query --ingest-report' "${LOG}" | grep -c -- "--out ${OUT}/report.json")" -eq 1 ] &&
   [ "$(grep '^metricsbench_query --ingest-report' "${LOG}" | grep -c -- "--out ${OUT}/cold-ravel-diagnostic/")" -eq 15 ]; then
@@ -1979,7 +1979,7 @@ if python3 -I - "${LOG}" <<'PY'; then
 import sys
 lines = open(sys.argv[1]).read().splitlines()
 validate = next(i for i, l in enumerate(lines) if l.startswith("metricsbench_report validate "))
-restart = next(i for i, l in enumerate(lines) if l.endswith(" restart ravel-server"))
+restart = next(i for i, l in enumerate(lines) if l.endswith(" restart --no-deps ravel-server"))
 stop = next(i for i, l in enumerate(lines) if l.endswith(" stop ravel-server"))
 # The memory step's docker inspect of the stack's containers, after validate.
 memory = [i for i, l in enumerate(lines) if l.startswith("docker inspect id-") and i > validate]
@@ -1995,9 +1995,9 @@ if python3 -I - "${LOG}" "${OUT}" <<'PY'; then
 import sys
 lines = open(sys.argv[1]).read().splitlines()
 cold = "--out " + sys.argv[2] + "/cold-ravel-diagnostic/"
-seq = [("restart" if l.endswith(" restart ravel-server") else "query")
+seq = [("restart" if l.endswith(" restart --no-deps ravel-server") else "query")
        for l in lines
-       if l.endswith(" restart ravel-server") or (l.startswith("metricsbench_query --ingest-report") and cold in l)]
+       if l.endswith(" restart --no-deps ravel-server") or (l.startswith("metricsbench_query --ingest-report") and cold in l)]
 sys.exit(0 if seq == ["restart", "query"] * 15 else 1)
 PY
   pass "y: every cold query is preceded by its own restart"
@@ -2018,7 +2018,7 @@ STUB_INGEST_READBACK_FAIL=mimir METRICSBENCH_CORPUS="${TMP}/corpus.json" run_col
 expect_rc y2 70
 expect_no_file y2 cold-ravel-diagnostic.json
 check "y2: after a failed ingest the pass is stamped not applicable" 'j("stamps.json")["cold_ravel_diagnostic"].startswith("not applicable: the ingest verification failed")'
-expect_no_log "y2: nothing restarted for it" " restart ravel-server"
+expect_no_log "y2: nothing restarted for it" " restart --no-deps ravel-server"
 
 run_cold y3
 expect_rc y3 0
@@ -2028,7 +2028,7 @@ check "y3: the selection matches a fresh read of the real corpus file" 'j("cold-
 
 METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_RESTART_EXIT=1 run_cold y4
 expect_rc y4 0
-check "y4: every failed restart is a recorded run, stamped, the run passes" 'j("stamps.json")["status"] == "passed" and j("stamps.json")["cold_ravel_diagnostic"]["failed_runs"] == 15 and all(r["status"] == "failed: docker compose restart ravel-server failed" for r in j("cold-ravel-diagnostic.json")["runs"])'
+check "y4: every failed restart is a recorded run, stamped, the run passes" 'j("stamps.json")["status"] == "passed" and j("stamps.json")["cold_ravel_diagnostic"]["failed_runs"] == 15 and all(r["status"] == "failed: docker compose restart --no-deps ravel-server failed" for r in j("cold-ravel-diagnostic.json")["runs"])'
 expect_no_log "y4: no cold query after a failed restart" "--out ${OUT}/cold-ravel-diagnostic/"
 
 METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_RESTART_NOT_READY=1 run_cold y5
@@ -2046,7 +2046,7 @@ METRICSBENCH_CORPUS="${TMP}/corpus-y7.json" STUB_CORPUS_CLOBBER=1 run_cold y7
 expect_rc y7 0
 expect_no_file y7 cold-ravel-diagnostic.json
 check "y7: a corpus that cannot be loaded is a stamped failure, not not applicable" 'j("stamps.json")["cold_ravel_diagnostic"] == "failed: the corpus '"${TMP}"'/corpus-y7.json could not be loaded (JSONDecodeError)" and j("stamps.json")["status"] == "passed"'
-expect_no_log "y7: nothing restarted for it" " restart ravel-server"
+expect_no_log "y7: nothing restarted for it" " restart --no-deps ravel-server"
 
 # The captures a run ends before are stamped not taken, never null.
 OUT="${TMP}/b/out"
