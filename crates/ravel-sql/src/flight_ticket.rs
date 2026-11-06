@@ -74,7 +74,8 @@
 //! version       1   = 8; 9 for a ticket carrying the pushdown block; 10 for
 //!                   a ticket carrying segment groups (see below); 11 when
 //!                   the pushdown block is a logs block with exact-key
-//!                   equalities
+//!                   equalities; 12 when the pushdown block carries a key
+//!                   set (a logs `IN` set or a spans trace-id list)
 //! tenant       16   TenantHash bytes
 //! now_ns        8   i64
 //! deadline_ns   8   i64
@@ -82,7 +83,7 @@
 //! slice_count   4   u32   (number of slices; 1 for a whole-snapshot ticket)
 //! token_count   4   u32
 //!   per token:  4 + N   len-prefixed CommitToken::encode() (ASCII)
-//! [pins]            versions 8, 9 and 11: seg_count through erasure_count
+//! [pins]            versions 8, 9, 11 and 12: seg_count through erasure_count
 //!                   below, once. Version 10 instead:
 //!   group_count  4   u32   (>= 2, one per signal table the statement reads)
 //!   per group, in lane order samples, logs, spans, alerts, audit:
@@ -138,7 +139,7 @@
 //!         limit      8   u64
 //! stmt_len      4   u32   (<= MAX_STATEMENT_LEN)
 //! stmt          N   statement text (UTF-8)
-//! [pushdown]        versions 9 and 11 only: the slice pushdown block a
+//! [pushdown]        versions 9, 11 and 12 only: the slice pushdown block a
 //!                   coordinator attached (see below)
 //!   kind         1   1 = spans, 2 = logs
 //!   ts_lo        1 (+8)  flag 0 = absent, 1 = present, then i64
@@ -146,6 +147,9 @@
 //!   if spans:
 //!     trace_flag 1   0 = absent, 1 = the trace id follows
 //!       trace_id 16
+//!     version 12 only:
+//!     trace_id_count 4  u32 (1 to 1,024)
+//!       trace_id    16  per id, strictly ascending
 //!   if logs:
 //!     prune_count 4  u32
 //!       per prune predicate:
@@ -168,6 +172,14 @@
 //!         key_type  1  KEY_IDX key type byte: 1 = Id16, 2 = I64, 3 = Str,
 //!                      4 = Bytes
 //!         key8      8  the compared literal's key8
+//!     version 12 only: key_count and the equalities as version 11 lays
+//!     them out, key_count 0 allowed, then the key-set section
+//!     (ravel_query::KeyIn):
+//!       field_len  4  u32
+//!       field      N  field name (UTF-8)
+//!       key_type   1  KEY_IDX key type byte, as above
+//!       set_count  4  u32 (1 to 1,024)
+//!       key8       8  per key, strictly ascending
 //! mac          32   keyed BLAKE3-256 over every preceding byte
 //! ```
 //!
@@ -177,8 +189,10 @@
 //! [`SlicePushdown`]. A ticket without it is the no-pushdown query, and
 //! [`FlightTicket::encode`] never writes it. Only the slice surface carries
 //! it. It sits under the MAC like every other field. A ticket that carries
-//! the block is version 9, or 11 when it is a logs block with exact-key
-//! equalities; one without it is still version 8, byte for byte,
+//! the block is version 9; 11 when it is a logs block with exact-key
+//! equalities and no key set; 12 when it carries a key set, a logs exact-key
+//! `IN` set or a spans `trace_id IN` list. One without it is still version
+//! 8, byte for byte,
 //! so a metrics slice or a coordinator built before the block mints exactly
 //! what it always did. See "Version history" below for why the block needs
 //! the bump.
@@ -194,15 +208,17 @@
 //! signal table on version 8 or 9, byte for byte. A version 10 ticket is
 //! client-surface only: the distributed slice path splits one snapshot, so
 //! a slice ticket never carries groups and the slice surface refuses version
-//! 10. The slice surface's own newer version is 11, the pushdown block with
-//! a logs key section; the client surface refuses it in turn.
+//! 10. The slice surface's own newer versions are 11, the pushdown block
+//! with a logs key section, and 12, the pushdown block with a key set; the
+//! client surface refuses both in turn.
 //!
 //! Each surface's version set holds at mint as well as at decode:
 //! [`FlightTicket::encode_for_surface`], which [`SqlTicketKeys`] and the
 //! coordinator's slice client mint through, refuses a ticket whose version
-//! the surface does not decode, a version 10 ticket on the slice surface as
-//! [`FlightTicketError::SignalGroupsOnSlice`] and a version 11 ticket on the
-//! client surface as [`FlightTicketError::KeyEqualsOnClient`].
+//! the surface does not decode: a version 10 ticket on the slice surface as
+//! [`FlightTicketError::SignalGroupsOnSlice`], a version 11 ticket on the
+//! client surface as [`FlightTicketError::KeyEqualsOnClient`], and a version
+//! 12 ticket on the client surface as [`FlightTicketError::KeySetOnClient`].
 //! [`FlightTicket::encode_with_pushdown`] names no surface and checks none.
 //!
 //! # Integrity: a keyed MAC, not a checksum
@@ -369,8 +385,18 @@
 //!   Written only when the block carries at least one; every other slice
 //!   ticket keeps version 8 or 9. Version 11 is a slice-surface version: it
 //!   follows 9's layout, not 10's, so the slice surface decodes and mints 8,
-//!   9 and 11 and the client surface 8, 9 and 10. A version 9 worker refuses
-//!   a version 11 ticket on its version byte.
+//!   9 and 11 (and 12, below) and the client surface 8, 9 and 10. A version
+//!   9 worker refuses a version 11 ticket on its version byte.
+//! - 12: the pushdown block carries a key set (ADR-3692 decision 6): a logs
+//!   block ends with the version 11 key section (its count may be 0) and an
+//!   exact-key `IN` set, a spans block ends with the `trace_id IN` list after
+//!   the version 9 single trace id. Written only when the block carries a
+//!   set; every other slice ticket keeps 8, 9 or 11 byte for byte. A
+//!   slice-surface version, like 11. Workers decode a slice ticket with
+//!   [`SqlTicketKeys::decode`], which drops the pushdown block and re-plans
+//!   the fragment from the statement text, so the bump changes no rows: its
+//!   effect is that a worker on 11 refuses a version 12 ticket on its version
+//!   byte during a mixed-version rollout, an error rather than a read.
 //!
 //! Every layout change bumps the byte, even though a ticket is ephemeral,
 //! because the build that mints a ticket and the build that redeems it can
@@ -389,7 +415,7 @@ use ravel_logseg::{AttrValue, FieldSel, FieldType, Predicate};
 use ravel_pqtable::names::validate_table;
 use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
 use ravel_query::erasure::ErasurePredicate;
-use ravel_query::{ByteLimit, KeyEquals, RequestBudgets, RequestLimit};
+use ravel_query::{ByteLimit, KeyEquals, KeyIn, RequestBudgets, RequestLimit};
 use ravel_types::{CommitToken, TenantHash};
 use uuid::Uuid;
 
@@ -420,15 +446,28 @@ pub(crate) const VERSION_PUSHDOWN: u8 = 9;
 /// never this version.
 pub(crate) const VERSION_GROUPS: u8 = 10;
 /// Version of a ticket whose logs pushdown block carries exact-key
-/// equalities (ADR-2707 decision 5), and the newest the slice surface
-/// decodes. Its layout is version 9's plus the key section, so a client
-/// ticket is never this version.
+/// equalities and no key set (ADR-2707 decision 5). Its layout is version
+/// 9's plus the key section, so a client ticket is never this version.
 pub(crate) const VERSION_KEY_EQUALS: u8 = 11;
+/// Version of a slice ticket whose pushdown block carries a key set: a logs
+/// block with an exact-key `IN` set, or a spans block with a `trace_id IN`
+/// list (ADR-3692 decision 6). Its layout is version 11's plus that section,
+/// and it is the newest the slice surface decodes; a client ticket is never
+/// this version.
+pub(crate) const VERSION_KEY_SET: u8 = 12;
+/// The most keys a version 12 key set or trace-id list carries (ADR-2983
+/// decision 5's k).
+const MAX_KEY_SET_KEYS: usize = ravel_query::key_index_route::KEY_SET_MAX_KEYS;
 
 /// The versions the client surface decodes.
 const CLIENT_VERSIONS: &[u8] = &[VERSION, VERSION_PUSHDOWN, VERSION_GROUPS];
 /// The versions the slice surface decodes. Version 10 is a client ticket.
-const SLICE_VERSIONS: &[u8] = &[VERSION, VERSION_PUSHDOWN, VERSION_KEY_EQUALS];
+const SLICE_VERSIONS: &[u8] = &[
+    VERSION,
+    VERSION_PUSHDOWN,
+    VERSION_KEY_EQUALS,
+    VERSION_KEY_SET,
+];
 
 /// The versions `surface` decodes, and so the versions it mints.
 fn surface_versions(surface: TicketSurface) -> &'static [u8] {
@@ -444,6 +483,7 @@ const ALL_VERSIONS: &[u8] = &[
     VERSION_PUSHDOWN,
     VERSION_GROUPS,
     VERSION_KEY_EQUALS,
+    VERSION_KEY_SET,
 ];
 
 /// Wire tag of each signal table's group in a version 10 ticket. Parquet
@@ -687,8 +727,8 @@ impl SqlTicketKeys {
     /// surface's keys. [`FlightTicketError::MacMismatch`] when none verifies;
     /// any other error is the first key's structural refusal, which does not
     /// depend on the key. The client surface decodes versions 8, 9 and 10,
-    /// the slice surface 8, 9 and 11: a version 10 ticket on the slice
-    /// surface, or a version 11 ticket on the client surface, is
+    /// the slice surface 8, 9, 11 and 12: a version 10 ticket on the slice
+    /// surface, or a version 11 or 12 ticket on the client surface, is
     /// [`FlightTicketError::UnsupportedVersion`].
     pub fn decode(
         &self,
@@ -997,6 +1037,7 @@ impl FlightTicket {
     fn wire_version(&self, pushdown: Option<&SlicePushdown>) -> u8 {
         match pushdown {
             _ if !self.signal_groups.is_empty() => VERSION_GROUPS,
+            Some(p) if p.carries_key_set() => VERSION_KEY_SET,
             Some(p) if p.carries_key_equals() => VERSION_KEY_EQUALS,
             Some(_) => VERSION_PUSHDOWN,
             None => VERSION,
@@ -1009,7 +1050,9 @@ impl FlightTicket {
     /// groups (version 10) on the slice surface is
     /// [`FlightTicketError::SignalGroupsOnSlice`]; a pushdown with exact-key
     /// equalities (version 11) on the client surface is
-    /// [`FlightTicketError::KeyEqualsOnClient`].
+    /// [`FlightTicketError::KeyEqualsOnClient`]; a pushdown with a key set
+    /// (version 12) on the client surface is
+    /// [`FlightTicketError::KeySetOnClient`].
     pub fn encode_for_surface(
         &self,
         key: &TicketKey,
@@ -1021,6 +1064,7 @@ impl FlightTicket {
             return Err(match version {
                 VERSION_GROUPS => FlightTicketError::SignalGroupsOnSlice,
                 VERSION_KEY_EQUALS => FlightTicketError::KeyEqualsOnClient,
+                VERSION_KEY_SET => FlightTicketError::KeySetOnClient,
                 other => FlightTicketError::UnsupportedVersion(other),
             });
         }
@@ -1263,7 +1307,10 @@ impl FlightTicket {
             std::str::from_utf8(stmt_bytes).map_err(|_| FlightTicketError::InvalidUtf8)?;
 
         // Version 10 carries groups and no pushdown block.
-        let pushdown = if version == VERSION_PUSHDOWN || version == VERSION_KEY_EQUALS {
+        let pushdown = if matches!(
+            version,
+            VERSION_PUSHDOWN | VERSION_KEY_EQUALS | VERSION_KEY_SET
+        ) {
             Some(read_pushdown(&mut cur, version)?)
         } else {
             None
@@ -1393,12 +1440,14 @@ enum SlicePushdownKind {
 }
 
 impl SlicePushdown {
-    /// The spans subset of `pushdown`: `ts_lo`, `ts_hi` and `trace_id`.
+    /// The spans subset of `pushdown`: `ts_lo`, `ts_hi`, `trace_id` and the
+    /// `trace_id IN` list.
     pub fn spans(pushdown: &SpansPushdown) -> Self {
         SlicePushdown(SlicePushdownKind::Spans(SpansPushdown {
             ts_lo: pushdown.ts_lo,
             ts_hi: pushdown.ts_hi,
             trace_id: pushdown.trace_id,
+            trace_ids: pushdown.trace_ids.clone(),
             ..SpansPushdown::default()
         }))
     }
@@ -1419,8 +1468,19 @@ impl SlicePushdown {
                 .cloned()
                 .collect(),
             key_equals: pushdown.key_equals.clone(),
+            key_in: pushdown.key_in.clone(),
             row_filters: Vec::new(),
         }))
+    }
+
+    /// Whether this block carries a key set, a logs exact-key `IN` set or a
+    /// spans `trace_id IN` list, which only a version [`VERSION_KEY_SET`]
+    /// ticket can hold.
+    fn carries_key_set(&self) -> bool {
+        match &self.0 {
+            SlicePushdownKind::Logs(p) => p.key_in.is_some(),
+            SlicePushdownKind::Spans(p) => !p.trace_ids.is_empty(),
+        }
     }
 
     /// Whether this is a logs block carrying exact-key equalities, which only
@@ -1567,6 +1627,14 @@ pub enum FlightTicketError {
     /// 11) was minted for the client surface, which never decodes one.
     #[error("a client ticket cannot carry a pushdown with exact-key equalities")]
     KeyEqualsOnClient,
+    /// A ticket whose slice pushdown carries a key set (version 12) was
+    /// minted for the client surface, which never decodes one.
+    #[error("a client ticket cannot carry a pushdown with a key set")]
+    KeySetOnClient,
+    /// A version 12 key set or trace-id list was empty, held more than
+    /// [`MAX_KEY_SET_KEYS`] keys, or was not strictly ascending.
+    #[error("ticket carries a key set of {0} keys that is empty, over the cap, or unsorted")]
+    InvalidKeySet(usize),
     /// A version 10 ticket carried fewer than two signal groups.
     #[error("ticket carries {0} signal groups; a grouped ticket carries at least two")]
     TooFewSignalGroups(usize),
@@ -1886,6 +1954,7 @@ const PRUNE_NUM_RANGE: u8 = 2;
 /// The slice pushdown block. The bytes land in the payload before the MAC is
 /// computed, so a client cannot narrow or widen a worker's read.
 fn write_pushdown(buf: &mut Vec<u8>, pushdown: &SlicePushdown) -> Result<(), FlightTicketError> {
+    let key_set = pushdown.carries_key_set();
     match &pushdown.0 {
         SlicePushdownKind::Spans(p) => {
             buf.push(PUSHDOWN_SPANS);
@@ -1897,6 +1966,14 @@ fn write_pushdown(buf: &mut Vec<u8>, pushdown: &SlicePushdown) -> Result<(), Fli
                     buf.extend_from_slice(&tid);
                 }
                 None => buf.push(0),
+            }
+            // Version 12: the trace-id list.
+            if key_set {
+                check_key_set(&p.trace_ids)?;
+                write_u32(buf, u32_len(p.trace_ids.len())?);
+                for tid in &p.trace_ids {
+                    buf.extend_from_slice(tid);
+                }
             }
         }
         SlicePushdownKind::Logs(p) => {
@@ -1935,7 +2012,9 @@ fn write_pushdown(buf: &mut Vec<u8>, pushdown: &SlicePushdown) -> Result<(), Fli
                     _ => return Err(FlightTicketError::UncarriedPushdown),
                 }
             }
-            if !p.key_equals.is_empty() {
+            // Version 11 writes the equalities only when there is one;
+            // version 12 always writes their count, zero included.
+            if !p.key_equals.is_empty() || key_set {
                 write_u32(buf, u32_len(p.key_equals.len())?);
                 for k in &p.key_equals {
                     write_len_prefixed(buf, k.field.as_bytes())?;
@@ -1943,9 +2022,38 @@ fn write_pushdown(buf: &mut Vec<u8>, pushdown: &SlicePushdown) -> Result<(), Fli
                     buf.extend_from_slice(&k.key8);
                 }
             }
+            // Version 12: the key-set section.
+            if let Some(set) = &p.key_in {
+                check_key_set(set.keys())?;
+                write_len_prefixed(buf, set.field().as_bytes())?;
+                buf.push(set.key_type().as_u8());
+                write_u32(buf, u32_len(set.keys().len())?);
+                for key8 in set.keys() {
+                    buf.extend_from_slice(key8);
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// A key set or trace-id list a version 12 ticket can carry: 1 to
+/// [`MAX_KEY_SET_KEYS`] keys, strictly ascending, so a set has one encoding.
+fn check_key_set<T: Ord>(keys: &[T]) -> Result<(), FlightTicketError> {
+    if keys.is_empty() || keys.len() > MAX_KEY_SET_KEYS || keys.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(FlightTicketError::InvalidKeySet(keys.len()));
+    }
+    Ok(())
+}
+
+/// A version 12 key count, refused before anything is read past it when it
+/// is zero or over [`MAX_KEY_SET_KEYS`].
+fn read_key_set_count(cur: &mut Cursor<'_>) -> Result<usize, FlightTicketError> {
+    let count = cur.read_u32()? as usize;
+    if count == 0 || count > MAX_KEY_SET_KEYS {
+        return Err(FlightTicketError::InvalidKeySet(count));
+    }
+    Ok(count)
 }
 
 fn read_pushdown(cur: &mut Cursor<'_>, version: u8) -> Result<SlicePushdown, FlightTicketError> {
@@ -1963,10 +2071,18 @@ fn read_pushdown(cur: &mut Cursor<'_>, version: u8) -> Result<SlicePushdown, Fli
                 1 => Some(cur.read_array::<16>()?),
                 other => return Err(FlightTicketError::InvalidPushdownTag(other)),
             };
+            let mut trace_ids = Vec::new();
+            if version == VERSION_KEY_SET {
+                for _ in 0..read_key_set_count(cur)? {
+                    trace_ids.push(cur.read_array::<16>()?);
+                }
+                check_key_set(&trace_ids)?;
+            }
             Ok(SlicePushdown(SlicePushdownKind::Spans(SpansPushdown {
                 ts_lo,
                 ts_hi,
                 trace_id,
+                trace_ids,
                 ..SpansPushdown::default()
             })))
         }
@@ -2015,9 +2131,9 @@ fn read_pushdown(cur: &mut Cursor<'_>, version: u8) -> Result<SlicePushdown, Fli
                 prune.push(predicate);
             }
             let mut key_equals = Vec::new();
-            if version == VERSION_KEY_EQUALS {
+            if version == VERSION_KEY_EQUALS || version == VERSION_KEY_SET {
                 let count = cur.read_u32()?;
-                if count == 0 {
+                if count == 0 && version == VERSION_KEY_EQUALS {
                     return Err(FlightTicketError::InvalidPushdownTag(0));
                 }
                 for _ in 0..count {
@@ -2031,12 +2147,34 @@ fn read_pushdown(cur: &mut Cursor<'_>, version: u8) -> Result<SlicePushdown, Fli
                     key_equals.push(KeyEquals::new(field, key_type, cur.read_array::<8>()?));
                 }
             }
+            let key_in = if version == VERSION_KEY_SET {
+                let field = cur.read_len_prefixed()?;
+                let field = std::str::from_utf8(field)
+                    .map_err(|_| FlightTicketError::InvalidUtf8)?
+                    .to_owned();
+                let ty_byte = cur.read_u8()?;
+                let key_type = KeyType::from_u8(ty_byte)
+                    .map_err(|_| FlightTicketError::InvalidPushdownTag(ty_byte))?;
+                let mut keys = Vec::new();
+                for _ in 0..read_key_set_count(cur)? {
+                    keys.push(cur.read_array::<8>()?);
+                }
+                check_key_set(&keys)?;
+                let count = keys.len();
+                Some(
+                    KeyIn::new(field, key_type, keys)
+                        .map_err(|_| FlightTicketError::InvalidKeySet(count))?,
+                )
+            } else {
+                None
+            };
             Ok(SlicePushdown(SlicePushdownKind::Logs(LogsPushdown {
                 ts_lo,
                 ts_hi,
                 content: Vec::new(),
                 prune,
                 key_equals,
+                key_in,
                 row_filters: Vec::new(),
             })))
         }
@@ -2496,7 +2634,7 @@ mod tests {
         let key = test_key();
         let mut body = Vec::new();
         body.extend_from_slice(&MAGIC);
-        body.push(VERSION_KEY_EQUALS.wrapping_add(1));
+        body.push(VERSION_KEY_SET.wrapping_add(1));
         body.extend_from_slice(&[0u8; 16]);
         body.extend_from_slice(&0i64.to_le_bytes());
         body.extend_from_slice(&0i64.to_le_bytes());
@@ -2546,6 +2684,273 @@ mod tests {
         assert_eq!(to_hex(&v10), V10_GOLDEN_HEX);
     }
 
+    /// The spans block with a `trace_id IN` list of three ids.
+    fn sample_trace_ids() -> Vec<[u8; 16]> {
+        vec![[0x01u8; 16], [0x0au8; 16], [0xabu8; 16]]
+    }
+
+    fn sample_key_in() -> KeyIn {
+        KeyIn::new("user_id", KeyType::I64, (1..=5i64).map(key8_i64).collect()).expect("key set")
+    }
+
+    /// Versions 8 to 11 encode byte for byte as before version 12 existed
+    /// (the version 11 and spans version 9 literals were generated on the
+    /// tree before it), and version 12 carries the logs key set and the
+    /// spans trace-id list through the codec unchanged. A spans pushdown with
+    /// a trace-id list is never encoded as version 9, and the client surface
+    /// and a version 11 decoder refuse version 12.
+    ///
+    /// Flip to watch it fail: make `carries_key_set` answer `false` for a
+    /// spans block, so `wire_version` picks version 9 and `write_pushdown`
+    /// drops the list. The spans version assertion then reads 9, not 12.
+    #[test]
+    fn version_11_bytes_unchanged_and_version_12_carries_key_set() {
+        let key = test_key();
+        let ticket = sample_ticket();
+        let v8 = ticket.encode(&key).expect("v8");
+        let v9 = ticket
+            .encode_with_pushdown(&key, Some(&sample_logs_pushdown()))
+            .expect("v9");
+        let v9_spans = ticket
+            .encode_with_pushdown(&key, Some(&sample_spans_pushdown()))
+            .expect("v9 spans");
+        let mut logs = sample_logs_pushdown().as_logs().expect("logs").clone();
+        logs.key_equals = sample_key_equals();
+        let v11 = ticket
+            .encode_with_pushdown(&key, Some(&SlicePushdown::logs(&logs)))
+            .expect("v11");
+        assert_eq!(to_hex(&v8), V8_GOLDEN_HEX);
+        assert_eq!(to_hex(&v9), V9_GOLDEN_HEX);
+        assert_eq!(to_hex(&v9_spans), V9_SPANS_GOLDEN_HEX);
+        assert_eq!(to_hex(&v11), V11_GOLDEN_HEX);
+        assert_eq!(
+            to_hex(&grouped_ticket().encode(&key).expect("v10")),
+            V10_GOLDEN_HEX
+        );
+
+        // Logs: the key set beside the equalities, and alone.
+        for equalities in [sample_key_equals(), Vec::new()] {
+            let mut logs = sample_logs_pushdown().as_logs().expect("logs").clone();
+            logs.key_equals = equalities.clone();
+            logs.key_in = Some(sample_key_in());
+            let pushdown = SlicePushdown::logs(&logs);
+            let bytes = ticket
+                .encode_for_surface(&key, TicketSurface::Slice, Some(&pushdown))
+                .expect("v12 logs");
+            assert_eq!(bytes[4], VERSION_KEY_SET);
+            let (decoded, carried) =
+                FlightTicket::decode_with_pushdown(&bytes, &key).expect("decode");
+            assert_eq!(decoded, ticket);
+            let carried = carried.expect("pushdown");
+            assert_eq!(carried, pushdown);
+            let carried = carried.as_logs().expect("logs");
+            assert_eq!(carried.key_in, Some(sample_key_in()));
+            assert_eq!(carried.key_equals, equalities);
+            assert_eq!(
+                FlightTicket::decode_accepting(
+                    &bytes,
+                    &key,
+                    &[VERSION, VERSION_PUSHDOWN, VERSION_KEY_EQUALS]
+                ),
+                Err(FlightTicketError::UnsupportedVersion(VERSION_KEY_SET))
+            );
+        }
+
+        // Spans: the trace-id list beside the version 9 block's fields.
+        let spans = SlicePushdown::spans(&SpansPushdown {
+            ts_lo: Some(-5),
+            ts_hi: Some(1_700_000_000_000_000_000),
+            trace_ids: sample_trace_ids(),
+            ..SpansPushdown::default()
+        });
+        let bytes = ticket
+            .encode_for_surface(&key, TicketSurface::Slice, Some(&spans))
+            .expect("v12 spans");
+        assert_eq!(
+            bytes[4], VERSION_KEY_SET,
+            "a trace_id IN is never version 9"
+        );
+        let (_, carried) = FlightTicket::decode_with_pushdown(&bytes, &key).expect("decode");
+        let carried = carried.expect("pushdown");
+        assert_eq!(carried, spans);
+        assert_eq!(
+            carried.as_spans().map(|p| p.trace_ids.clone()),
+            Some(sample_trace_ids())
+        );
+        assert_eq!(
+            ticket.encode_for_surface(&key, TicketSurface::Client, Some(&spans)),
+            Err(FlightTicketError::KeySetOnClient)
+        );
+    }
+
+    /// A version 12 key section is refused when its count is zero or over
+    /// the cap, or when its keys are not strictly ascending, and an encoder
+    /// refuses a list over the cap.
+    #[test]
+    fn a_malformed_version_12_key_set_is_a_typed_error() {
+        let key = test_key();
+        let ticket = sample_ticket();
+        let resign = |mut body: Vec<u8>| {
+            let tag = mac(&key, &body);
+            body.extend_from_slice(&tag);
+            body
+        };
+        let v9_spans = ticket
+            .encode_with_pushdown(&key, Some(&sample_spans_pushdown()))
+            .expect("v9 spans");
+        let mut body = v9_spans[..v9_spans.len() - MAC_LEN].to_vec();
+        body[4] = VERSION_KEY_SET;
+        let mut empty = body.clone();
+        write_u32(&mut empty, 0);
+        assert_eq!(
+            FlightTicket::decode_with_pushdown(&resign(empty), &key),
+            Err(FlightTicketError::InvalidKeySet(0))
+        );
+        let mut over = body.clone();
+        write_u32(&mut over, 1_025);
+        assert_eq!(
+            FlightTicket::decode_with_pushdown(&resign(over), &key),
+            Err(FlightTicketError::InvalidKeySet(1_025))
+        );
+        let mut unsorted = body.clone();
+        write_u32(&mut unsorted, 2);
+        unsorted.extend_from_slice(&[2u8; 16]);
+        unsorted.extend_from_slice(&[1u8; 16]);
+        assert_eq!(
+            FlightTicket::decode_with_pushdown(&resign(unsorted), &key),
+            Err(FlightTicketError::InvalidKeySet(2))
+        );
+        let mut truncated = body;
+        write_u32(&mut truncated, 2);
+        truncated.extend_from_slice(&[1u8; 16]);
+        assert_eq!(
+            FlightTicket::decode_with_pushdown(&resign(truncated), &key),
+            Err(FlightTicketError::Truncated)
+        );
+        let too_many = SlicePushdown::spans(&SpansPushdown {
+            trace_ids: (0..1_025u32)
+                .map(|n| {
+                    let mut t = [0u8; 16];
+                    t[..4].copy_from_slice(&n.to_be_bytes());
+                    t
+                })
+                .collect(),
+            ..SpansPushdown::default()
+        });
+        assert_eq!(
+            ticket.encode_with_pushdown(&key, Some(&too_many)),
+            Err(FlightTicketError::InvalidKeySet(1_025))
+        );
+    }
+
+    /// The logs key-set section of a version 12 ticket is refused with a
+    /// typed error when its count is zero or over the cap, its keys are not
+    /// strictly ascending (unsorted or repeated), it ends inside any of its
+    /// fields, its key type byte is not a key type, or its field name is not
+    /// UTF-8.
+    ///
+    /// Flip to watch it fail: drop the `check_key_set(&keys)?` after the
+    /// logs key loop in `read_pushdown`. The repeated keys then decode
+    /// (`KeyIn::new` deduplicates them) and the unsorted ones decode sorted,
+    /// so both cases read `Ok`.
+    #[test]
+    fn a_malformed_version_12_logs_key_set_is_a_typed_error() {
+        let key = test_key();
+        let ticket = sample_ticket();
+        let resign = |mut body: Vec<u8>| {
+            let tag = mac(&key, &body);
+            body.extend_from_slice(&tag);
+            body
+        };
+        let section = |field: &[u8], ty: u8, count: u32, keys: &[[u8; 8]]| {
+            let mut out = Vec::new();
+            write_u32(&mut out, u32_len(field.len()).expect("field length"));
+            out.extend_from_slice(field);
+            out.push(ty);
+            write_u32(&mut out, count);
+            for key8 in keys {
+                out.extend_from_slice(key8);
+            }
+            out
+        };
+        let keys: Vec<[u8; 8]> = (1..=5i64).map(key8_i64).collect();
+        let mut logs = sample_logs_pushdown().as_logs().expect("logs").clone();
+        logs.key_in = Some(sample_key_in());
+        let v12 = ticket
+            .encode_with_pushdown(&key, Some(&SlicePushdown::logs(&logs)))
+            .expect("v12 logs");
+        assert_eq!(v12[4], VERSION_KEY_SET);
+        let payload = &v12[..v12.len() - MAC_LEN];
+        let valid = section(b"user_id", KeyType::I64.as_u8(), 5, &keys);
+        assert!(payload.ends_with(&valid), "the section ends the payload");
+        let head = payload[..payload.len() - valid.len()].to_vec();
+        let with = |section: Vec<u8>| {
+            let mut body = head.clone();
+            body.extend_from_slice(&section);
+            FlightTicket::decode_with_pushdown(&resign(body), &key)
+        };
+        assert!(with(valid.clone()).is_ok(), "the rebuilt section decodes");
+
+        let i64_ty = KeyType::I64.as_u8();
+        let cases: Vec<(&str, Vec<u8>, FlightTicketError)> = vec![
+            (
+                "count 0",
+                section(b"user_id", i64_ty, 0, &[]),
+                FlightTicketError::InvalidKeySet(0),
+            ),
+            (
+                "count over 1,024",
+                section(b"user_id", i64_ty, 1_025, &keys),
+                FlightTicketError::InvalidKeySet(1_025),
+            ),
+            (
+                "keys unsorted",
+                section(b"user_id", i64_ty, 2, &[keys[1], keys[0]]),
+                FlightTicketError::InvalidKeySet(2),
+            ),
+            (
+                "keys repeated",
+                section(b"user_id", i64_ty, 2, &[keys[0], keys[0]]),
+                FlightTicketError::InvalidKeySet(2),
+            ),
+            (
+                "key type 0",
+                section(b"user_id", 0, 5, &keys),
+                FlightTicketError::InvalidPushdownTag(0),
+            ),
+            (
+                "key type 5",
+                section(b"user_id", 5, 5, &keys),
+                FlightTicketError::InvalidPushdownTag(5),
+            ),
+            (
+                "key type 0xff",
+                section(b"user_id", 0xff, 5, &keys),
+                FlightTicketError::InvalidPushdownTag(0xff),
+            ),
+            (
+                "field not UTF-8",
+                section(&[0xff, 0xfe, b'x'], i64_ty, 5, &keys),
+                FlightTicketError::InvalidUtf8,
+            ),
+        ];
+        for (what, section, want) in cases {
+            assert_eq!(with(section), Err(want), "{what}");
+        }
+
+        // Ends inside the field-name length, the name, the key type, the
+        // count, or any key.
+        for cut in 0..valid.len() {
+            assert_eq!(
+                with(valid[..cut].to_vec()),
+                Err(FlightTicketError::Truncated),
+                "cut at section byte {cut}"
+            );
+        }
+    }
+
+    const V9_SPANS_GOLDEN_HEX: &str = "52465431090707070707070707070707070707070700002a36fe9c971700ac4d32059d97170000000001000000020000003f000000646a49364d546f774d4441774d4441774d4330774d4441774c5441774d4441744d4441774d4330774d4441774f57557a4e7a6335596a6b364d6a6f334f6a4540000000646a49364d6a6f774d4441774d4441774d4330774d4441774c5441774d4441744d4441774d4330774d4441784d324d325a57597a4e7a49364d7a6f784e446f7902000000c00b000000000000c10b000000000000c20b000000000000b90b000000000000ba0b000000000000bb0b000000000000bd0b000000000000be0b000000000000070000000a0000000303030303030303030303030303030303030303030303030303030303030303000000000000000000000000369d036b23000000742f61612f6d6574726963732f6c312f303030302f772e312e322e6162632e727365670103030303030303030303030303030303030303030303030303030303030303030e0000000f000000481f000000000000491f0000000000004a1f000000000000411f000000000000421f000000000000431f000000000000451f000000000000461f0000000000000c0000000f000000080808080808080808080808080808080808080808080808080808080808080800000000000000000000000091a2b3c823000000742f61612f6d6574726963732f6c302f303030312f772e342e352e6465662e7273656700140000000200000001000000080000005f5f6e616d655f5f0800000065726173655f6d65000000000000000000000000000000000100000006000000726567696f6e0700000075732d656173746400000000000000c8000000000000000400000010000000687474702e7374617475735f636f646502120000006b38732e6e616d6573706163652e6e616d6501020000006f6b03070000007061796c6f6164040200000004000000686974730700000000000000090000005f6f72646572735f32ffffffffffffffff0102000000400000000001020c000000000000002e00000053454c454354202a2046524f4d2073616d706c6573205748455245207473203e3d203120414e44207473203c20320101fbffffffffffffff0100002a36fe9c971701abababababababababababababababab4130ecf77c418f040d5282bc70e82782ecd4c661ccbd4df5fbc39faf6a86ef10";
+    const V11_GOLDEN_HEX: &str = "524654310b0707070707070707070707070707070700002a36fe9c971700ac4d32059d97170000000001000000020000003f000000646a49364d546f774d4441774d4441774d4330774d4441774c5441774d4441744d4441774d4330774d4441774f57557a4e7a6335596a6b364d6a6f334f6a4540000000646a49364d6a6f774d4441774d4441774d4330774d4441774c5441774d4441744d4441774d4330774d4441784d324d325a57597a4e7a49364d7a6f784e446f7902000000c00b000000000000c10b000000000000c20b000000000000b90b000000000000ba0b000000000000bb0b000000000000bd0b000000000000be0b000000000000070000000a0000000303030303030303030303030303030303030303030303030303030303030303000000000000000000000000369d036b23000000742f61612f6d6574726963732f6c312f303030302f772e312e322e6162632e727365670103030303030303030303030303030303030303030303030303030303030303030e0000000f000000481f000000000000491f0000000000004a1f000000000000411f000000000000421f000000000000431f000000000000451f000000000000461f0000000000000c0000000f000000080808080808080808080808080808080808080808080808080808080808080800000000000000000000000091a2b3c823000000742f61612f6d6574726963732f6c302f303030312f772e342e352e6465662e7273656700140000000200000001000000080000005f5f6e616d655f5f0800000065726173655f6d65000000000000000000000000000000000100000006000000726567696f6e0700000075732d656173746400000000000000c8000000000000000400000010000000687474702e7374617475735f636f646502120000006b38732e6e616d6573706163652e6e616d6501020000006f6b03070000007061796c6f6164040200000004000000686974730700000000000000090000005f6f72646572735f32ffffffffffffffff0102000000400000000001020c000000000000002e00000053454c454354202a2046524f4d2073616d706c6573205748455245207473203e3d203120414e44207473203c2032020001ffffffffffffff7f050000000107000000736572766963650108000000636865636b6f75740104000000626c6f6205030000000001ff020b0000007374617475735f636f64650201fdffffffffffffff00020700000073616d706c6564040101000000000000000101000000000000000205000000726174696f030001000000000000e03f040000000b0000007374617475735f636f6465027ffffffffffffffd070000007365727669636503fc04a00a978b4cf904000000626c6f620470ab40eda5eeffb10800000074726163655f696401abababababababab6f3851cf9312313deec245e20f6944831e718a0d5d1a3afea04a96370f8a5ba5";
     const V8_GOLDEN_HEX: &str = "52465431080707070707070707070707070707070700002a36fe9c971700ac4d32059d97170000000001000000020000003f000000646a49364d546f774d4441774d4441774d4330774d4441774c5441774d4441744d4441774d4330774d4441774f57557a4e7a6335596a6b364d6a6f334f6a4540000000646a49364d6a6f774d4441774d4441774d4330774d4441774c5441774d4441744d4441774d4330774d4441784d324d325a57597a4e7a49364d7a6f784e446f7902000000c00b000000000000c10b000000000000c20b000000000000b90b000000000000ba0b000000000000bb0b000000000000bd0b000000000000be0b000000000000070000000a0000000303030303030303030303030303030303030303030303030303030303030303000000000000000000000000369d036b23000000742f61612f6d6574726963732f6c312f303030302f772e312e322e6162632e727365670103030303030303030303030303030303030303030303030303030303030303030e0000000f000000481f000000000000491f0000000000004a1f000000000000411f000000000000421f000000000000431f000000000000451f000000000000461f0000000000000c0000000f000000080808080808080808080808080808080808080808080808080808080808080800000000000000000000000091a2b3c823000000742f61612f6d6574726963732f6c302f303030312f772e342e352e6465662e7273656700140000000200000001000000080000005f5f6e616d655f5f0800000065726173655f6d65000000000000000000000000000000000100000006000000726567696f6e0700000075732d656173746400000000000000c8000000000000000400000010000000687474702e7374617475735f636f646502120000006b38732e6e616d6573706163652e6e616d6501020000006f6b03070000007061796c6f6164040200000004000000686974730700000000000000090000005f6f72646572735f32ffffffffffffffff0102000000400000000001020c000000000000002e00000053454c454354202a2046524f4d2073616d706c6573205748455245207473203e3d203120414e44207473203c2032c98d62930dedceb80ed7eebb08d798b38446f1b2e88bae028f7620a50ae0557c";
     const V9_GOLDEN_HEX: &str = "52465431090707070707070707070707070707070700002a36fe9c971700ac4d32059d97170000000001000000020000003f000000646a49364d546f774d4441774d4441774d4330774d4441774c5441774d4441744d4441774d4330774d4441774f57557a4e7a6335596a6b364d6a6f334f6a4540000000646a49364d6a6f774d4441774d4441774d4330774d4441774c5441774d4441744d4441774d4330774d4441784d324d325a57597a4e7a49364d7a6f784e446f7902000000c00b000000000000c10b000000000000c20b000000000000b90b000000000000ba0b000000000000bb0b000000000000bd0b000000000000be0b000000000000070000000a0000000303030303030303030303030303030303030303030303030303030303030303000000000000000000000000369d036b23000000742f61612f6d6574726963732f6c312f303030302f772e312e322e6162632e727365670103030303030303030303030303030303030303030303030303030303030303030e0000000f000000481f000000000000491f0000000000004a1f000000000000411f000000000000421f000000000000431f000000000000451f000000000000461f0000000000000c0000000f000000080808080808080808080808080808080808080808080808080808080808080800000000000000000000000091a2b3c823000000742f61612f6d6574726963732f6c302f303030312f772e342e352e6465662e7273656700140000000200000001000000080000005f5f6e616d655f5f0800000065726173655f6d65000000000000000000000000000000000100000006000000726567696f6e0700000075732d656173746400000000000000c8000000000000000400000010000000687474702e7374617475735f636f646502120000006b38732e6e616d6573706163652e6e616d6501020000006f6b03070000007061796c6f6164040200000004000000686974730700000000000000090000005f6f72646572735f32ffffffffffffffff0102000000400000000001020c000000000000002e00000053454c454354202a2046524f4d2073616d706c6573205748455245207473203e3d203120414e44207473203c2032020001ffffffffffffff7f050000000107000000736572766963650108000000636865636b6f75740104000000626c6f6205030000000001ff020b0000007374617475735f636f64650201fdffffffffffffff00020700000073616d706c6564040101000000000000000101000000000000000205000000726174696f030001000000000000e03f895fac53726f191762670f3474908a66d704122b1993e82dbb260302de63501b";
     const V10_GOLDEN_HEX: &str = "524654310a0707070707070707070707070707070700002a36fe9c971700ac4d32059d97170000000001000000020000003f000000646a49364d546f774d4441774d4441774d4330774d4441774c5441774d4441744d4441774d4330774d4441774f57557a4e7a6335596a6b364d6a6f334f6a4540000000646a49364d6a6f774d4441774d4441774d4330774d4441774c5441774d4441744d4441774d4330774d4441784d324d325a57597a4e7a49364d7a6f784e446f79020000000102000000c00b000000000000c10b000000000000c20b000000000000b90b000000000000ba0b000000000000bb0b000000000000bd0b000000000000be0b000000000000070000000a0000000303030303030303030303030303030303030303030303030303030303030303000000000000000000000000369d036b23000000742f61612f6d6574726963732f6c312f303030302f772e312e322e6162632e727365670103030303030303030303030303030303030303030303030303030303030303030e0000000f000000481f000000000000491f0000000000004a1f000000000000411f000000000000421f000000000000431f000000000000451f000000000000461f0000000000000c0000000f000000080808080808080808080808080808080808080808080808080808080808080800000000000000000000000091a2b3c823000000742f61612f6d6574726963732f6c302f303030312f772e342e352e6465662e7273656700140000000100000001000000080000005f5f6e616d655f5f0800000065726173655f6d6500000000000000000000000000000000020100000090130000000000009113000000000000921300000000000089130000000000008a130000000000008b130000000000008d130000000000008e13000000000000090000000c00000005050505050505050505050505050505050505050505050505050505050505050000000000000000000000005b05b05d20000000742f61612f6c6f67732f6c312f303030322f772e362e372e6665642e726c6f67010505050505050505050505050505050505050505050505050505050505050505100000001100000001000000010000000c000000736572766963652e6e616d6508000000636865636b6f75746400000000000000c8000000000000000400000010000000687474702e7374617475735f636f646502120000006b38732e6e616d6573706163652e6e616d6501020000006f6b03070000007061796c6f6164040200000004000000686974730700000000000000090000005f6f72646572735f32ffffffffffffffff0102000000400000000001020c000000000000005200000053454c45435420732e74732046524f4d2073616d706c65732073204a4f494e206c6f6773206c204f4e20732e7473203d206c2e747320574845524520732e7473203e3d203120414e4420732e7473203c2032af2c7423fb4aaa9bd16a527cf71f4f6e960a4776650b3858340d7e86415845a4";
@@ -3477,6 +3882,7 @@ mod tests {
                 },
             ],
             key_equals: Vec::new(),
+            key_in: None,
             row_filters: Vec::new(),
         })
     }
@@ -3690,6 +4096,7 @@ mod tests {
                 },
             ],
             key_equals: sample_key_equals(),
+            key_in: None,
             row_filters: Vec::new(),
         });
         let carried = logs.as_logs().expect("logs block");
@@ -3870,6 +4277,7 @@ mod tests {
                 value: AttrValue::I64(4),
             }],
             key_equals: Vec::new(),
+            key_in: None,
             row_filters: Vec::new(),
         }));
         assert!(matches!(
@@ -4555,12 +4963,18 @@ mod tests {
             prop_assert!(FlightTicket::decode(&corrupt, &key).is_err());
         }
 
-        // decode(encode(x)) == x for arbitrary spans and logs pushdowns.
+        // decode(encode(x)) == x for arbitrary spans and logs pushdowns, each
+        // under the version it needs: a spans block with a trace-id list or
+        // a logs block with a key set is version 12, a logs block with
+        // equalities and no set version 11, any other block version 9.
         #[test]
         fn prop_pushdown_round_trip(
             ts_lo in proptest::option::of(any::<i64>()),
             ts_hi in proptest::option::of(any::<i64>()),
             trace_id in proptest::option::of(any::<[u8; 16]>()),
+            trace_ids in proptest::option::of(
+                prop::collection::btree_set(any::<[u8; 16]>(), 1..=MAX_KEY_SET_KEYS),
+            ),
             spans in any::<bool>(),
             prune in prop::collection::vec(
                 (
@@ -4573,14 +4987,23 @@ mod tests {
                 0..6,
             ),
             keys in prop::collection::vec(("[a-z_.]{0,12}", 1u8..=4, any::<[u8; 8]>()), 0..4),
+            key_in in proptest::option::of((
+                "[a-z_.]{0,12}",
+                1u8..=4,
+                prop::collection::btree_set(any::<[u8; 8]>(), 1..=MAX_KEY_SET_KEYS),
+            )),
         ) {
-            let pushdown = if spans {
-                SlicePushdown::spans(&SpansPushdown {
+            let (pushdown, version) = if spans {
+                let trace_ids: Vec<[u8; 16]> = trace_ids.into_iter().flatten().collect();
+                let version = if trace_ids.is_empty() { VERSION_PUSHDOWN } else { VERSION_KEY_SET };
+                let pushdown = SlicePushdown::spans(&SpansPushdown {
                     ts_lo,
                     ts_hi,
                     trace_id,
+                    trace_ids,
                     ..SpansPushdown::default()
-                })
+                });
+                (pushdown, version)
             } else {
                 let prune = prune
                     .into_iter()
@@ -4604,19 +5027,31 @@ mod tests {
                         let key_type = KeyType::from_u8(ty).expect("1..=4 is a key type");
                         KeyEquals::new(field, key_type, key8)
                     })
-                    .collect();
-                SlicePushdown::logs(&LogsPushdown {
+                    .collect::<Vec<_>>();
+                let key_in = key_in.map(|(field, ty, keys)| {
+                    let key_type = KeyType::from_u8(ty).expect("1..=4 is a key type");
+                    KeyIn::new(field, key_type, keys.into_iter().collect()).expect("1 to 1,024 keys")
+                });
+                let version = match (&key_in, key_equals.is_empty()) {
+                    (Some(_), _) => VERSION_KEY_SET,
+                    (None, false) => VERSION_KEY_EQUALS,
+                    (None, true) => VERSION_PUSHDOWN,
+                };
+                let pushdown = SlicePushdown::logs(&LogsPushdown {
                     ts_lo,
                     ts_hi,
                     content: Vec::new(),
                     prune,
                     key_equals,
+                    key_in,
                     row_filters: Vec::new(),
-                })
+                });
+                (pushdown, version)
             };
             let key = test_key();
             let ticket = sample_ticket();
             let bytes = ticket.encode_with_pushdown(&key, Some(&pushdown)).expect("encode");
+            prop_assert_eq!(bytes[4], version);
             let (decoded, carried) =
                 FlightTicket::decode_with_pushdown(&bytes, &key).expect("decode");
             prop_assert_eq!(decoded, ticket);

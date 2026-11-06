@@ -439,6 +439,7 @@ impl LogsTableProvider {
             .with_segment_timing(self.segment_timing)
             .with_segments_pruned_by_stats(pruned_by_stats)
             .with_key_equals(Arc::new(pushdown.key_equals.clone()))
+            .with_key_in(pushdown.key_in.clone().map(Arc::new))
             .with_scan_executions(self.scan_executions.clone())
             .with_scan_budget(self.scan_budget.clone())
             .with_key_index_route(self.scan_key_index_route(&segments, pushdown));
@@ -446,19 +447,20 @@ impl LogsTableProvider {
     }
 
     /// The router's inputs re-aligned to `segments`, the scan's subset of the
-    /// snapshot. `None` without a declared-key equality, without parts, or
-    /// with parts that do not line up with the snapshot, which leaves every
-    /// segment to tier 1.
+    /// snapshot. `None` unless the scan carries exactly one key arm, one
+    /// declared-key equality or one `IN` set (ADR-3692, key set amendment);
+    /// `None` too without parts, or with parts that do not line up with the
+    /// snapshot, which leaves every segment to tier 1.
     fn scan_key_index_route(
         &self,
         segments: &[SegmentRef],
         pushdown: &LogsPushdown,
     ) -> Option<Arc<LogsKeyIndexRoute>> {
         let ctx = self.key_index_route.as_ref()?;
-        // One equality only: a routed segment skips the tier-1 probe, which
-        // intersects every equality's block set and so prunes more when there
-        // are several.
-        if pushdown.key_equals.len() != 1 {
+        // One key arm only, an equality or an `IN` set: a routed segment
+        // skips the tier-1 probe, which intersects every arm's block set and
+        // so prunes more when there are several.
+        if pushdown.key_equals.len() + usize::from(pushdown.key_in.is_some()) != 1 {
             return None;
         }
         let segment_count = self.snapshot.segments.len();
@@ -5496,9 +5498,10 @@ mod tests {
         }
     }
 
-    /// The provider routes a logs scan only for exactly one declared-key
-    /// equality: with several, the tier-1 probe intersects their block sets,
-    /// which a route answered from one of them would skip.
+    /// The provider routes a logs scan only for exactly one key arm, one
+    /// declared-key equality or one `IN` set: with several, the tier-1 probe
+    /// intersects their block sets, which a route answered from one of them
+    /// would skip.
     #[test]
     fn route_needs_exactly_one_key_equality() {
         use ravel_catalog::CatalogConfig;
@@ -5540,6 +5543,29 @@ mod tests {
             provider
                 .scan_key_index_route(&[], &with(vec![key(7), key(8)]))
                 .is_none()
+        );
+        let set = ravel_query::KeyIn::new(
+            "user_id",
+            KeyType::I64,
+            vec![key8_i64(7), key8_i64(8), key8_i64(9)],
+        )
+        .expect("set");
+        let with_set = |keys: Vec<KeyEquals>| LogsPushdown {
+            key_equals: keys,
+            key_in: Some(set.clone()),
+            ..LogsPushdown::default()
+        };
+        assert!(
+            provider
+                .scan_key_index_route(&[], &with_set(Vec::new()))
+                .is_some(),
+            "one IN set routes"
+        );
+        assert!(
+            provider
+                .scan_key_index_route(&[], &with_set(vec![key(7)]))
+                .is_none(),
+            "an IN set and an equality stay on tier 1"
         );
     }
 }

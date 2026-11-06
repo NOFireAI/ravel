@@ -64,7 +64,7 @@ use crate::span_fetcher::{KeyIndexPruning, key_idx_frame_decompressed_len};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use ravel_cache::{CacheKey, ReadOutcome, SingleFlightError};
-use ravel_catalog::{SegmentLevel, SegmentRef};
+use ravel_catalog::{KEY_INDEX_SET_PROBE_MAX_RUNS, SegmentLevel, SegmentRef};
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_logseg::block::NumStat;
 use ravel_logseg::decoded_cache::{DecodedCacheAttach, DecodedColumnCache};
@@ -146,6 +146,52 @@ impl KeyEquals {
     }
 }
 
+/// An exact-key `IN` list on one KEY_IDX-indexed field (ADR-3692 decision
+/// 6): the field's name, its declared key type, and 1 to
+/// [`KEY_SET_MAX_KEYS`](crate::key_index_route::KEY_SET_MAX_KEYS) sorted,
+/// distinct `key8`s. The arm admits an object when any of its keys is present
+/// and names the union of their block sets. Like [`KeyEquals`] it is
+/// prune-only: the caller's own filter (in SQL, DataFusion's residual over the
+/// full values) stays the exact evaluator, so a `key8` collision only adds a
+/// block.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyIn {
+    field: String,
+    key_type: KeyType,
+    keys: Vec<Key8>,
+}
+
+impl KeyIn {
+    /// Sorts and deduplicates `keys`, then checks the count is 1 to
+    /// [`KEY_SET_MAX_KEYS`](crate::key_index_route::KEY_SET_MAX_KEYS).
+    pub fn new(
+        field: impl Into<String>,
+        key_type: KeyType,
+        keys: Vec<Key8>,
+    ) -> Result<Self, KeySetError> {
+        let set = KeySet::new(field, key_type, keys)?;
+        Ok(KeyIn {
+            field: set.field().to_owned(),
+            key_type: set.key_type(),
+            keys: set.keys().to_vec(),
+        })
+    }
+
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+
+    pub fn key_type(&self) -> KeyType {
+        self.key_type
+    }
+
+    /// Sorted ascending, distinct, 1 to
+    /// [`KEY_SET_MAX_KEYS`](crate::key_index_route::KEY_SET_MAX_KEYS).
+    pub fn keys(&self) -> &[Key8] {
+        &self.keys
+    }
+}
+
 /// One log query against a single segment: an inclusive ts range, zero or more
 /// stream-attribute equalities (ANDed, resolved against STREAM_DIR), zero or
 /// more content predicates (`HasWord`/`Equals`, ANDed, passed straight to the
@@ -209,6 +255,12 @@ pub struct LogQuery {
     /// answers. Every other entry point ignores them, so they never remove a
     /// record, only block reads.
     pub key_equals: Vec<KeyEquals>,
+    /// A prune-only KEY_IDX `IN` list, ANDed with every [`KeyEquals`] arm
+    /// (ADR-3692 decision 6). Read by the same two entry points as
+    /// `key_equals`: an object is dropped when every key of the set is
+    /// absent, and the set's blocks are the union of its keys' block sets,
+    /// intersected with every equality's.
+    pub key_in: Option<KeyIn>,
 }
 
 impl LogQuery {
@@ -223,7 +275,21 @@ impl LogQuery {
             prune: Vec::new(),
             erasure: Vec::new(),
             key_equals: Vec::new(),
+            key_in: None,
         }
+    }
+
+    /// Whether the query carries a KEY_IDX arm: an equality or an `IN` set.
+    #[must_use]
+    pub fn has_key_arms(&self) -> bool {
+        !self.key_equals.is_empty() || self.key_in.is_some()
+    }
+
+    /// Sets the KEY_IDX `IN` arm (see [`LogQuery::key_in`]).
+    #[must_use]
+    pub fn with_key_in(mut self, key_in: KeyIn) -> Self {
+        self.key_in = Some(key_in);
+        self
     }
 
     /// Adds one KEY_IDX equality (see [`LogQuery::key_equals`]).
@@ -289,12 +355,14 @@ impl LogQuery {
             prune,
             erasure,
             key_equals,
+            key_in,
         } = self;
         content.is_empty()
             && prune.is_empty()
             && stream_attrs.is_empty()
             && erasure.is_empty()
             && key_equals.is_empty()
+            && key_in.is_none()
     }
 }
 
@@ -2580,6 +2648,7 @@ impl LogSegmentFetcher {
         let unkeyed = |primed: Option<PrimedProbe>| async move {
             let mut bare = query.clone();
             bare.key_equals.clear();
+            bare.key_in = None;
             let plan = self
                 .plan_segment_primed(
                     seg_ref,
@@ -2599,7 +2668,7 @@ impl LogSegmentFetcher {
             Some(_) => self.plan_whole_object_bound(),
             None => self.block_range_threshold,
         };
-        if (known.is_none() && query.key_equals.is_empty())
+        if (known.is_none() && !query.has_key_arms())
             || seg_ref.object_size <= size_gate
             || seg_ref.min_event_ts_ns > seg_ref.max_event_ts_ns
             || !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
@@ -2695,7 +2764,7 @@ impl LogSegmentFetcher {
     /// decode), so that arm only guards a hand-built [`SegmentRef`].
     #[must_use]
     pub fn key_probe_reads(&self, seg_ref: &SegmentRef, query: &LogQuery) -> bool {
-        !query.key_equals.is_empty()
+        query.has_key_arms()
             && seg_ref.object_size > self.block_range_threshold
             && seg_ref.min_event_ts_ns <= seg_ref.max_event_ts_ns
             && Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
@@ -2738,13 +2807,7 @@ impl LogSegmentFetcher {
         );
         let result = self
             .block_range
-            .fetch_key_probe(
-                seg_ref,
-                tenant_hash,
-                &query.key_equals,
-                accounting,
-                phase.key_index(),
-            )
+            .fetch_key_probe(seg_ref, tenant_hash, query, accounting, phase.key_index())
             .instrument(fetch_span.clone())
             .await;
         let result = self
@@ -2817,6 +2880,7 @@ impl LogSegmentFetcher {
             // The KEY_IDX probe narrows the blocks read, never the survivor
             // list the reader names (`plan_segment_keyed`).
             key_equals: _,
+            key_in: _,
         } = query;
         content.is_empty()
             && stream_attrs.is_empty()
@@ -4713,6 +4777,7 @@ impl FilterSections {
             // Answered by the KEY_IDX probe before the scan, never by BLOOM
             // or POSTINGS.
             key_equals: _,
+            key_in: _,
         } = query;
         FilterSections(FilterSectionReads::for_scan(content, prune))
     }
@@ -4782,6 +4847,12 @@ pub type SegmentPlan = Option<(
 /// version 2 RLOG KEY_IDX section into a leaf.
 pub fn log_key_set(arm: &KeyEquals) -> Result<KeySet, KeySetError> {
     KeySet::new(arm.field.clone(), arm.key_type, vec![arm.key8])
+}
+
+/// The tier-2 router's key set for a logs [`KeyIn`] arm: every key of the
+/// list, so one route answers the whole set.
+pub fn log_key_in_set(arm: &KeyIn) -> Result<KeySet, KeySetError> {
+    KeySet::new(arm.field.clone(), arm.key_type, arm.keys.clone())
 }
 
 /// The tier-2 router's [`LeafRangeReader`] for logs: each leaf range goes
@@ -6646,7 +6717,7 @@ impl BlockRangeFetcher {
                 self.probe_footer_and_keys(
                     seg_ref,
                     tenant_hash,
-                    &query.key_equals,
+                    query,
                     &pin,
                     accounting,
                     key_accounting,
@@ -6739,7 +6810,7 @@ impl BlockRangeFetcher {
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
-        keys: &[KeyEquals],
+        query: &LogQuery,
         accounting: &QueryAccounting,
         key_accounting: &QueryAccounting,
     ) -> Result<(bool, BlockRangeStats), LogFetchError> {
@@ -6748,7 +6819,7 @@ impl BlockRangeFetcher {
             .probe_footer_and_keys(
                 seg_ref,
                 tenant_hash,
-                keys,
+                query,
                 &EtagPin::default(),
                 accounting,
                 key_accounting,
@@ -6759,7 +6830,7 @@ impl BlockRangeFetcher {
     }
 
     /// The footer probe, charged to `accounting` as a plan read, then
-    /// [`Self::probe_key_index`] over its extents for every arm in `keys`:
+    /// [`Self::probe_key_index`] over its extents for every key arm of `query`:
     /// the footer, the probe's extents, the same extents as resident bytes,
     /// and the probe's answer.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -6767,7 +6838,7 @@ impl BlockRangeFetcher {
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
-        keys: &[KeyEquals],
+        query: &LogQuery,
         pin: &EtagPin,
         accounting: &QueryAccounting,
         key_accounting: &QueryAccounting,
@@ -6799,7 +6870,7 @@ impl BlockRangeFetcher {
                 tenant_hash,
                 &footer,
                 &resident,
-                keys,
+                query,
                 pin,
                 key_accounting,
             )
@@ -6845,16 +6916,18 @@ impl BlockRangeFetcher {
         .map_err(|source| corrupt(key, source))
     }
 
-    /// The tier-1 KEY_IDX probe of one object for every arm in `keys`: the
-    /// section's prefix read once, then at most one bucket per arm. `None`
-    /// prunes nothing: the object has no KEY_IDX, no arm's field is indexed
-    /// under its key type, or a prefix or bucket is corrupt (logged with the
-    /// object key). `Some(Absent)` when any arm is absent (the arms are a
-    /// conjunction), else `Some(Present)` with the intersection of the
-    /// present arms' block sets. A failed read is a typed error, never a
-    /// fallback. Its decompressed bytes, charged to `accounting`, are the
-    /// prefix's length once it parses (stored as is) plus each decoded
-    /// bucket's declared length.
+    /// The tier-1 KEY_IDX probe of one object for every key arm of `query`:
+    /// the section's prefix read once, then at most one bucket per equality,
+    /// and for the `IN` set ([`LogQuery::key_in`]) the buckets its keys touch
+    /// ([`Self::probe_key_set`]). `None` prunes nothing: the object has no
+    /// KEY_IDX, no arm's field is indexed under its key type, or a prefix or
+    /// bucket is corrupt (logged with the object key). `Some(Absent)` when
+    /// any arm is absent (the arms are a conjunction; the set is absent when
+    /// every key is), else `Some(Present)` with the intersection of the
+    /// present arms' block sets, the set's being the union over its keys. A
+    /// failed read is a typed error, never a fallback. Its decompressed
+    /// bytes, charged to `accounting`, are the prefix's length once it parses
+    /// (stored as is) plus each decoded bucket's declared length.
     #[allow(clippy::too_many_arguments)]
     async fn probe_key_index(
         &self,
@@ -6862,7 +6935,7 @@ impl BlockRangeFetcher {
         tenant_hash: TenantHash,
         footer: &footer::LogFooter,
         resident: &[(u64, Bytes)],
-        keys: &[KeyEquals],
+        query: &LogQuery,
         pin: &EtagPin,
         accounting: &QueryAccounting,
     ) -> Result<Option<KeyProbe>, LogFetchError> {
@@ -6894,7 +6967,8 @@ impl BlockRangeFetcher {
             .await?;
         let mut present: Option<Vec<u32>> = None;
         let mut prefix_charged = false;
-        for arm in keys {
+        let mut answers = Vec::with_capacity(query.key_equals.len() + 1);
+        for arm in &query.key_equals {
             let step = match locate_key(footer, &arm.field, arm.key_type, &arm.key8, &prefix) {
                 Ok(step) => step,
                 Err(err) => {
@@ -6933,6 +7007,37 @@ impl BlockRangeFetcher {
                     }
                 }
             };
+            if answer == KeyProbe::Absent {
+                return Ok(Some(KeyProbe::Absent));
+            }
+            answers.push(answer);
+        }
+        if let Some(set) = &query.key_in {
+            if !prefix_charged {
+                accounting.add_decompressed_bytes(prefix.len() as u64);
+            }
+            let answer = match self
+                .probe_key_set(
+                    seg_ref,
+                    tenant_hash,
+                    footer,
+                    resident,
+                    set,
+                    &prefix,
+                    pin,
+                    accounting,
+                )
+                .await?
+            {
+                Ok(answer) => answer,
+                Err(err) => {
+                    fall_back(err);
+                    return Ok(None);
+                }
+            };
+            answers.push(answer);
+        }
+        for answer in answers {
             match answer {
                 KeyProbe::Absent => return Ok(Some(KeyProbe::Absent)),
                 KeyProbe::Declined => {}
@@ -6955,6 +7060,95 @@ impl BlockRangeFetcher {
             Some(blocks) => Some(KeyProbe::Present(blocks)),
             None => None,
         })
+    }
+
+    /// The tier-1 probe of one `IN` set over an already-read prefix (ADR-3692
+    /// decision 6): every key is located in the prefix's directory; a key
+    /// whose bucket is empty is absent with no read. When the keys touch at
+    /// most [`KEY_INDEX_SET_PROBE_MAX_RUNS`] distinct non-empty buckets each
+    /// is read once; above that, one ranged read spans the touched buckets,
+    /// from the first's start to the last's end, and every touched bucket is
+    /// decoded from it. `Absent` when every key is absent; `Present` names the
+    /// union of the present keys' blocks; `Declined` when the section does
+    /// not index the field under the set's key type. The inner `Err` is a
+    /// corrupt prefix or bucket, which the caller logs and falls back on.
+    #[allow(clippy::too_many_arguments)]
+    async fn probe_key_set(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        footer: &footer::LogFooter,
+        resident: &[(u64, Bytes)],
+        set: &KeyIn,
+        prefix: &[u8],
+        pin: &EtagPin,
+        accounting: &QueryAccounting,
+    ) -> Result<Result<KeyProbe, LogSegError>, LogFetchError> {
+        // Touched buckets by their range, each with the keys that mix to it.
+        let mut buckets: std::collections::BTreeMap<
+            (u64, u64),
+            Vec<ravel_logseg::key_index::KeyProbeBucket>,
+        > = std::collections::BTreeMap::new();
+        for key8 in &set.keys {
+            match locate_key(footer, &set.field, set.key_type, key8, prefix) {
+                Ok(KeyProbeStep::Done(KeyProbe::Declined)) => return Ok(Ok(KeyProbe::Declined)),
+                Ok(KeyProbeStep::Done(_)) => {}
+                Ok(KeyProbeStep::Bucket(bucket)) => {
+                    let range = bucket.range();
+                    buckets
+                        .entry((range.start, range.end))
+                        .or_default()
+                        .push(bucket);
+                }
+                Err(err) => return Ok(Err(err)),
+            }
+        }
+        let (Some(first), Some(last)) = (buckets.keys().next(), buckets.keys().next_back()) else {
+            return Ok(Ok(KeyProbe::Absent));
+        };
+        let area = (buckets.len() > KEY_INDEX_SET_PROBE_MAX_RUNS).then_some(first.0..last.1);
+        let area_bytes = match &area {
+            Some(range) => Some(
+                self.key_index_read(
+                    seg_ref,
+                    tenant_hash,
+                    resident,
+                    range.clone(),
+                    pin,
+                    accounting,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        let mut union: Vec<u32> = Vec::new();
+        for (&(start, end), keyed) in &buckets {
+            let frame = match (&area, &area_bytes) {
+                (Some(range), Some(bytes)) => {
+                    let at = (start - range.start) as usize;
+                    bytes.slice(at..at + (end - start) as usize)
+                }
+                _ => {
+                    self.key_index_read(seg_ref, tenant_hash, resident, start..end, pin, accounting)
+                        .await?
+                }
+            };
+            for bucket in keyed {
+                match bucket.finish(&frame) {
+                    Ok(KeyProbe::Present(blocks)) => union.extend(blocks),
+                    Ok(_) => {}
+                    Err(err) => return Ok(Err(err)),
+                }
+            }
+            accounting.add_decompressed_bytes(key_idx_frame_decompressed_len(&frame));
+        }
+        union.sort_unstable();
+        union.dedup();
+        Ok(Ok(if union.is_empty() {
+            KeyProbe::Absent
+        } else {
+            KeyProbe::Present(union)
+        }))
     }
 
     /// One KEY_IDX read of the absolute `range`: sliced from a resident probe
@@ -17553,5 +17747,326 @@ mod block_funnel_intent_tests {
                 .await;
             assert_admitted_under(&cache, intent, "admit_blocks_from_whole");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    //! The tier-1 `IN` set probe (ADR-3692 decision 6).
+
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_codec::key_idx::{KEY_IDX_WRITER_BUCKET_BITS, bucket_index};
+    use ravel_logseg::RlogWriter;
+    use ravel_logseg::key_index::key8_str;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+    const KEY: &str = "t/set.rlog";
+    /// Records, one distinct `request.id` each, eight to a block.
+    const RECORDS: i64 = 400;
+    const PER_BLOCK: i64 = 8;
+
+    fn record(ts: i64) -> LogRecord {
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: ravel_logseg::stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: format!("hello {ts}"),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![("request.id".to_string(), AttrValue::Str(format!("r{ts}")))],
+        }
+    }
+
+    /// An object whose KEY_IDX indexes `request.id`, and a fetcher over it
+    /// that probes every keyed query and holds only a 64-byte tail, so the
+    /// prefix and every bucket read is a GET of its own.
+    async fn fixture() -> (LogSegmentFetcher, SegmentRef) {
+        let cfg = RlogConfig {
+            block_target_records: PER_BLOCK as usize,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut writer = RlogWriter::new(cfg, identity)
+            .with_key_index_fields(vec![("request.id".to_string(), KeyType::Str)]);
+        for ts in 0..RECORDS {
+            writer.push(record(ts)).expect("push");
+        }
+        let bytes = writer.finish().expect("finish");
+        let seg_ref = SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: bytes.len() as u64,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: RECORDS - 1,
+            ingest_hour_bucket: 0,
+            sample_count: RECORDS as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: [9u8; 32],
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        };
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = LogSegmentFetcher::new(backend)
+            .with_block_range_threshold(0)
+            .with_suffix_len(64);
+        (fetcher, seg_ref)
+    }
+
+    fn key_in(values: impl IntoIterator<Item = i64>) -> KeyIn {
+        KeyIn::new(
+            "request.id",
+            KeyType::Str,
+            values
+                .into_iter()
+                .map(|v| key8_str(&format!("r{v}")))
+                .collect(),
+        )
+        .expect("key set")
+    }
+
+    fn distinct_buckets(values: &[i64]) -> usize {
+        values
+            .iter()
+            .map(|v| {
+                bucket_index(&key8_str(&format!("r{v}")), KEY_IDX_WRITER_BUCKET_BITS)
+                    .expect("bucket")
+            })
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    /// The probe's answer for `query`, and the KEY_IDX GETs it issued.
+    async fn probe(
+        fetcher: &LogSegmentFetcher,
+        seg_ref: &SegmentRef,
+        query: &LogQuery,
+    ) -> (Option<KeyProbe>, u64) {
+        let key_accounting = QueryAccounting::new();
+        let mut stats = BlockRangeStats::default();
+        let (_, _, _, answer) = fetcher
+            .block_range
+            .probe_footer_and_keys(
+                seg_ref,
+                TENANT,
+                query,
+                &EtagPin::default(),
+                &QueryAccounting::new(),
+                &key_accounting,
+                &mut stats,
+            )
+            .await
+            .expect("probe");
+        (
+            answer,
+            key_accounting.snapshot().s3_requests(AccountedOp::Get),
+        )
+    }
+
+    /// The blocks the records of `values` sit in.
+    fn blocks_of(values: &[i64]) -> Vec<u32> {
+        values
+            .iter()
+            .map(|v| (v / PER_BLOCK) as u32)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// A set touching more than `B_run` distinct buckets costs the prefix and
+    /// one ranged read of the bucket area it spans, and answers the union of
+    /// its keys' blocks; a set touching at most `B_run` reads each touched
+    /// bucket once; a set of absent keys is absent.
+    ///
+    /// Flip to watch it fail: in `probe_key_set`, set `area` to `None`
+    /// unconditionally, so every touched bucket is read on its own above
+    /// `B_run` too. The 300-key case then issues 1 + its distinct bucket
+    /// count GETs, not 2.
+    #[tokio::test]
+    async fn set_probe_reads_the_bucket_area_above_b_run() {
+        let (fetcher, seg_ref) = fixture().await;
+        let wide: Vec<i64> = (0..300).collect();
+        let wide_buckets = distinct_buckets(&wide);
+        assert!(
+            wide_buckets > KEY_INDEX_SET_PROBE_MAX_RUNS,
+            "the wide set must touch more than B_run buckets: {wide_buckets}"
+        );
+        let (answer, gets) = probe(
+            &fetcher,
+            &seg_ref,
+            &LogQuery::new(i64::MIN, i64::MAX).with_key_in(key_in(wide.clone())),
+        )
+        .await;
+        assert_eq!(answer, Some(KeyProbe::Present(blocks_of(&wide))));
+        assert_eq!(gets, 2, "the prefix and one read of the bucket area");
+
+        let narrow: Vec<i64> = vec![3, 17, 101, 250, 399];
+        let narrow_buckets = distinct_buckets(&narrow);
+        assert!(narrow_buckets <= KEY_INDEX_SET_PROBE_MAX_RUNS);
+        let (answer, gets) = probe(
+            &fetcher,
+            &seg_ref,
+            &LogQuery::new(i64::MIN, i64::MAX).with_key_in(key_in(narrow.clone())),
+        )
+        .await;
+        assert_eq!(answer, Some(KeyProbe::Present(blocks_of(&narrow))));
+        assert_eq!(
+            gets,
+            1 + narrow_buckets as u64,
+            "one read per touched bucket"
+        );
+
+        // The set's answer is the union of the per-key equality answers.
+        let mut union = BTreeSet::new();
+        for v in &narrow {
+            let (answer, _) = probe(
+                &fetcher,
+                &seg_ref,
+                &LogQuery::new(i64::MIN, i64::MAX).with_key_equals(KeyEquals::new(
+                    "request.id",
+                    KeyType::Str,
+                    key8_str(&format!("r{v}")),
+                )),
+            )
+            .await;
+            let Some(KeyProbe::Present(blocks)) = answer else {
+                panic!("r{v} is present: {answer:?}");
+            };
+            union.extend(blocks);
+        }
+        assert_eq!(union.into_iter().collect::<Vec<_>>(), blocks_of(&narrow));
+
+        let absent = (RECORDS..RECORDS + 300).collect::<Vec<_>>();
+        let (answer, _) = probe(
+            &fetcher,
+            &seg_ref,
+            &LogQuery::new(i64::MIN, i64::MAX).with_key_in(key_in(absent)),
+        )
+        .await;
+        assert_eq!(answer, Some(KeyProbe::Absent));
+
+        // ANDed with an equality: the intersection of the two arms.
+        let (answer, _) = probe(
+            &fetcher,
+            &seg_ref,
+            &LogQuery::new(i64::MIN, i64::MAX)
+                .with_key_in(key_in(wide.clone()))
+                .with_key_equals(KeyEquals::new("request.id", KeyType::Str, key8_str("r9"))),
+        )
+        .await;
+        assert_eq!(answer, Some(KeyProbe::Present(vec![1])));
+    }
+
+    /// A set mixing present and absent keys answers exactly the union of the
+    /// present keys' blocks, below and above `B_run`, whether an absent key's
+    /// bucket is empty (no read) or holds other keys (read, no match).
+    ///
+    /// Flip to watch it fail: in `probe_key_set`, return `KeyProbe::Absent`
+    /// at the first absent key, either where `locate_key` answers `Done` (an
+    /// empty bucket) or where a bucket's `finish` is not `Present`. The mixed
+    /// cases holding that kind of absent key then answer `Absent`.
+    #[tokio::test]
+    async fn set_probe_answers_the_union_of_a_mixed_set() {
+        let (fetcher, seg_ref) = fixture().await;
+        let bucket_of = |v: i64| {
+            bucket_index(&key8_str(&format!("r{v}")), KEY_IDX_WRITER_BUCKET_BITS).expect("bucket")
+        };
+        let occupied: BTreeSet<_> = (0..RECORDS).map(bucket_of).collect();
+        let absent = RECORDS..RECORDS + 10_000;
+        // Absent keys of both kinds: in a bucket the object's keys occupy,
+        // and in a bucket the object leaves empty.
+        let shares: Vec<i64> = absent
+            .clone()
+            .filter(|v| occupied.contains(&bucket_of(*v)))
+            .take(3)
+            .collect();
+        let alone: Vec<i64> = absent
+            .filter(|v| !occupied.contains(&bucket_of(*v)))
+            .take(3)
+            .collect();
+        assert_eq!((shares.len(), alone.len()), (3, 3), "fixture geometry");
+
+        let present: Vec<i64> = vec![3, 101, 250];
+        let cases: [(&str, Vec<i64>); 3] = [
+            ("absent in occupied buckets", shares.clone()),
+            ("absent in empty buckets", alone.clone()),
+            (
+                "absent of both kinds",
+                shares.iter().chain(&alone).copied().collect(),
+            ),
+        ];
+        for (what, absent) in cases {
+            let set: Vec<i64> = present.iter().chain(&absent).copied().collect();
+            assert!(distinct_buckets(&set) <= KEY_INDEX_SET_PROBE_MAX_RUNS);
+            let (answer, _) = probe(
+                &fetcher,
+                &seg_ref,
+                &LogQuery::new(i64::MIN, i64::MAX).with_key_in(key_in(set)),
+            )
+            .await;
+            assert_eq!(
+                answer,
+                Some(KeyProbe::Present(blocks_of(&present))),
+                "below B_run, {what}"
+            );
+        }
+
+        // Above B_run: 300 absent keys beside 100 present ones, plus the
+        // empty-bucket keys, read as the prefix and one bucket area.
+        let present: Vec<i64> = (0..100).collect();
+        let set: Vec<i64> = present
+            .iter()
+            .copied()
+            .chain(RECORDS..RECORDS + 300)
+            .chain(alone.iter().copied())
+            .collect();
+        let touched = set
+            .iter()
+            .map(|v| bucket_of(*v))
+            .filter(|b| occupied.contains(b))
+            .collect::<BTreeSet<_>>()
+            .len();
+        assert!(
+            touched > KEY_INDEX_SET_PROBE_MAX_RUNS,
+            "the set must touch more than B_run non-empty buckets: {touched}"
+        );
+        let (answer, gets) = probe(
+            &fetcher,
+            &seg_ref,
+            &LogQuery::new(i64::MIN, i64::MAX).with_key_in(key_in(set)),
+        )
+        .await;
+        assert_eq!(answer, Some(KeyProbe::Present(blocks_of(&present))));
+        assert_eq!(blocks_of(&present), (0..13).collect::<Vec<u32>>());
+        assert_eq!(gets, 2, "the prefix and one read of the bucket area");
     }
 }

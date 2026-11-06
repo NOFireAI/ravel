@@ -229,6 +229,12 @@ pub struct SpansScanExec {
     /// The shared query handed to every segment fetch: the ts window and, on
     /// the fast path, the trace_id key. One query covers the whole scan.
     query: SpanQuery,
+    /// The ids of a pushed `trace_id IN (...)` set (ADR-3692 decision 6),
+    /// empty otherwise. With a set, `query` carries no `trace_id`: every
+    /// segment takes the ranged read, probing KEY_IDX for the set when the
+    /// router named no block set, and rows are filtered by the ts window
+    /// alone, so the residual filter is the exact evaluator.
+    trace_set: Arc<[[u8; 16]]>,
     /// The `service_name = <literal>` equality pushed, if any: a `COL_SERVICE_NAME`
     /// bloom probe applied per block before decode (ADR-0054). One value covers
     /// the whole scan, like `query`.
@@ -390,6 +396,7 @@ impl SpansScanExec {
             fetcher,
             partitions,
             query,
+            trace_set: Arc::from(Vec::new()),
             service_name,
             name,
             duration_ns,
@@ -404,6 +411,21 @@ impl SpansScanExec {
             metrics,
             key_index_figures,
         })
+    }
+
+    /// Scan for a `trace_id IN (...)` set (ADR-3692 decision 6): `trace_ids`
+    /// are its distinct ids. Ignored when the scan's query pins one
+    /// `trace_id`, or when `trace_ids` is empty. Registers the
+    /// `stats.keyIndex` figures as a trace lookup does.
+    pub(crate) fn with_trace_set(mut self, trace_ids: Vec<[u8; 16]>) -> Self {
+        if self.query.trace_id.is_some() || trace_ids.is_empty() {
+            return self;
+        }
+        self.trace_set = Arc::from(trace_ids);
+        if self.key_index_figures.is_none() {
+            self.key_index_figures = Some(KeyIndexFigureCounters::register(&self.metrics));
+        }
+        self
     }
 
     /// Apply the tier-2 router's answer for a `trace_id` lookup (ADR-3692
@@ -582,6 +604,7 @@ impl ExecutionPlan for SpansScanExec {
             tenant_hash,
             segs,
             self.query,
+            Arc::clone(&self.trace_set),
             self.service_name.clone(),
             self.name.clone(),
             self.duration_ns,
@@ -754,6 +777,7 @@ async fn prepare_partition(
     tenant_hash: TenantHash,
     segs: Vec<ScanSegment>,
     query: SpanQuery,
+    trace_set: Arc<[[u8; 16]]>,
     service_name: Option<String>,
     name: Option<String>,
     duration_ns: Option<(i64, i64)>,
@@ -799,6 +823,7 @@ async fn prepare_partition(
             tenant_hash,
             &segs,
             &query,
+            &trace_set,
             duration_ns,
             status_mask,
             &predicates,
@@ -828,13 +853,14 @@ async fn prepare_partition(
     let mut out: Vec<SpanRow> = Vec::new();
     for seg in &segs {
         let fetched = fetcher
-            .fetch_accounted_in_blocks(
+            .fetch_accounted_in_trace_set(
                 &seg.seg,
                 tenant_hash,
                 &query,
                 duration_ns,
                 status_mask,
                 &predicates,
+                &trace_set,
                 seg.blocks.as_deref(),
                 &accounting,
             )
@@ -891,6 +917,7 @@ async fn prepare_columnar(
     tenant_hash: TenantHash,
     segs: &[ScanSegment],
     query: &SpanQuery,
+    trace_set: &[[u8; 16]],
     duration_ns: Option<(i64, i64)>,
     status_mask: Option<u8>,
     predicates: &[BloomPredicate<'_>],
@@ -911,7 +938,7 @@ async fn prepare_columnar(
     let mut pages_skipped = 0usize;
     for seg in segs {
         let fetched = fetcher
-            .fetch_accounted_columnar_in_blocks(
+            .fetch_accounted_columnar_in_trace_set(
                 &seg.seg,
                 tenant_hash,
                 query,
@@ -919,6 +946,7 @@ async fn prepare_columnar(
                 status_mask,
                 predicates,
                 &union,
+                trace_set,
                 seg.blocks.as_deref(),
                 accounting,
             )

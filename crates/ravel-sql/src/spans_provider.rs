@@ -40,11 +40,12 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use ravel_catalog::{Catalog, KeyIndexLeafLimits, SegmentRef, Snapshot, SnapshotParts};
 use ravel_query::PhaseAccounting;
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
+use ravel_query::key_index_route::KeySet;
 use ravel_query::key_index_route::{
     BudgetRefused, LeafDecodeBudget, LeafDecodeGuard, RouteFigures, RouteInput, SegmentRoute,
     route, route_with_max_parts,
 };
-use ravel_query::span_fetcher::{SpanLeafRangeReader, trace_key_set};
+use ravel_query::span_fetcher::{SpanLeafRangeReader, trace_ids_key_set, trace_key_set};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Signal, TenantHash};
 
@@ -348,6 +349,7 @@ impl SpansTableProvider {
         .map(|scan| {
             scan.with_phase_accounting(self.accounting.clone())
                 .with_scan_budget(self.scan_budget.clone())
+                .with_trace_set(pushdown.trace_ids.clone())
         })
     }
 
@@ -358,7 +360,7 @@ impl SpansTableProvider {
         ctx: &KeyIndexRouteContext,
         pool: Arc<dyn MemoryPool>,
         pushdown: &SpansPushdown,
-        trace_id: &[u8; 16],
+        key_set: &KeySet,
     ) -> DFResult<RoutedSegments> {
         let segment_count = self.snapshot.segments.len();
         if ctx.parts.origin.len() != segment_count {
@@ -381,7 +383,6 @@ impl SpansTableProvider {
             ..Snapshot::default()
         };
         let parts = SnapshotParts::new(ctx.parts.parts.clone(), origin);
-        let key_set = trace_key_set(trace_id).map_err(|e| DataFusionError::External(e.into()))?;
         let reader = SpanLeafRangeReader::new(&self.fetcher, self.tenant_hash);
         let budget = PoolLeafBudget(pool);
         let input = RouteInput {
@@ -390,7 +391,7 @@ impl SpansTableProvider {
             parts: &parts,
             signal: Signal::Spans,
             tenant_hash: self.tenant_hash,
-            key_set: &key_set,
+            key_set,
             accounting: &self.accounting,
             reader: &reader,
             budget: &budget,
@@ -513,13 +514,22 @@ impl TableProvider for SpansTableProvider {
         // the projected column indices, so a projection that excludes
         // `events`/`links` skips their decode there too, not only on the
         // columnar path. Either way, no wrapping `ProjectionExec` is needed.
-        if let (Some(ctx), Some(trace_id)) = (&self.key_index_route, pushdown.trace_id) {
+        // A `trace_id =` routes its one id; a `trace_id IN (...)` set routes
+        // as one key set (ADR-3692 decision 6).
+        let key_set = match (pushdown.trace_id, pushdown.trace_ids.as_slice()) {
+            (Some(trace_id), _) => Some(trace_key_set(&trace_id)),
+            (None, []) => None,
+            (None, ids) => Some(trace_ids_key_set(ids)),
+        }
+        .transpose()
+        .map_err(|e| DataFusionError::External(e.into()))?;
+        if let (Some(ctx), Some(key_set)) = (&self.key_index_route, key_set) {
             let routed = self
                 .route_trace(
                     ctx,
                     Arc::clone(&state.runtime_env().memory_pool),
                     &pushdown,
-                    &trace_id,
+                    &key_set,
                 )
                 .await?;
             let scan = self
