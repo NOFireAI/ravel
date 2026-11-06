@@ -16425,9 +16425,12 @@ mod tests {
             let dir = scratch_with_stray("cap-refuse", stray as usize);
             let (mut config, need) = two_level_scratch_config(&dir).await;
             config.scratch_max_bytes = Some(need - 1 + stray);
+            let headroom = crate::CompactionRefusedReason::ScratchHeadroom;
+            let refused = crate::compaction_refused_total(headroom);
             SCRATCH_FREE_OVERRIDE.with(|o| o.set(Some(Ok(u64::MAX / 2))));
             let (outcome, run, store, _) = compact_two_level(&config).await;
             SCRATCH_FREE_OVERRIDE.with(|o| o.set(None));
+            assert!(crate::compaction_refused_total(headroom) > refused);
             match outcome {
                 Ok(CompactionOutcome::ScratchHeadroom {
                     need: n,
