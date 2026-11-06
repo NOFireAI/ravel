@@ -1,0 +1,493 @@
+# T13 pre-registration (issue #3711, epic #3692, ADR-3692 WP4).
+#
+# Committed alone, before any LogHub run. Every run parameter is read from
+# here; `--param` on the command line is a check, refused on drift before the
+# corpus is read. A figure carries `predict` and a `band` that can miss, or
+# `unpredicted` with the reason no prediction is made. Later edits are new
+# commits that say what moved and why.
+#
+# Corpora: LogHub (Zenodo 8196385), HDFS.log and BGL.log, checked by sha256.
+#
+# Prediction basis. The figures were calibrated on a generated HDFS-shaped
+# corpus (3,000,000 lines, 144.8 B mean line, not LogHub; not checked in) at
+# commit 31c52bb's code, then scaled to the LogHub inputs:
+#   HDFS: 141.2 B mean line, about 15.6 B/row as a body+ts RLOG object
+#         (21.5 B/row with the structural arm's trace_id column);
+#   BGL:  156.5 B mean line, about 16.1 B/row (22 B/row with trace_id).
+# Calibration figures the predictions lean on: structural ratio/bytes 1.072,
+# ratio/gets 1, ratio/wall 0.474, structural uncomp 699,073 B of 12,455,785;
+# sidecar over_postings 3.94, cpu_ratio 1.5065 (noisy, 1.47..1.53 across
+# runs), bloom-guided miss 1,413,093 B and 3.058 GETs, sidecar miss
+# 66,725 B and 2 GETs, bloom false positives 107 blocks over 150 pairs.
+#
+# Structural arm parameters. object_min/max_bytes is the 10 MB object the
+# issue names (10..11 MiB). matched_rows 10 and latency_ms 30 are the issue's.
+# coalesce_gap 1,887,437 is the production fetcher's effective gap
+# (DEFAULT_LOG_REQUEST_COST_BYTES), so both plans coalesce under the same
+# rule; floor_gap/* reports the 64 KiB floor alongside. mini_block_bytes 8192
+# and 4 bytes of index per mini-block follow Lance's 8 KiB mini-block target.
+# runs 5, medians reported.
+#
+# Sidecar arm parameters. object_rows 524,288 (64 blocks of 8192) matches the
+# production writer's block size; HDFS takes 10 objects (5,242,880 lines) to
+# keep one run under the executor's 600 s command limit, BGL 9 objects (its
+# whole file holds 9 full ones). sidecar_stride 64 terms per block and a
+# 64 KiB suffix probe; a rare token is one on at most 3 rows, 30 sampled with
+# seed 13. scale_raw_bytes 1e11 is the issue's 100 GB.
+#
+# Expected decisions: structural NO-GO (bytes ratio about 1.07: at the
+# production gap the ten target blocks coalesce into one range spanning the
+# object, and Lance's saving needs a gap the request cost forbids); sidecar
+# NO-GO (over_postings well above 1.2 because the sidecar is row-granular
+# and postings are block-granular; cpu_ratio near the 1.5 bar either way).
+#
+# Object size against the plan whole-object bound (9,437,185 B): the sidecar
+# objects are predicted at about 8.2 MB, below it, so the production default
+# path and the crossover-off path are predicted at one whole-object GET per
+# (token, object) pair, and plan_route_bytes_per_object at the object size
+# with no suffix. An object above the bound misses those bands.
+#
+# Addendum 1 (fix round 1, structural arm only; committed alone, before any
+# run at the new gaps).
+#
+# What moved and why. Round 0 decided the structural arm on ratio/* at the
+# production gap (1,887,437 B). Ten targets about 1.1 MB apart sit inside
+# that gap, so both sides coalesce across the targets and the ratio is fixed
+# by construction; review blocked the NO-GO on that. A second reason the
+# production-gap figures cannot decide: on an L0 segment the fetcher bridges
+# a read to at most MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT = 4 runs before its
+# 0.75 coverage crossover, so today's side spans the targets whatever the
+# gap (round 0: HDFS 2 data GETs of 10,384,932 B, BGL the whole object).
+#   - Unprefixed figures stay: production gap, L0, as round 0. ratio/* there
+#     is reported as a layout and recompression ratio and decides nothing.
+#     today/data_over_object is new (today's data bytes over the object).
+#   - floor_gap/* is removed: it was planned only, no GET issued. The same
+#     plan is now measured as gap_64k/structural/*.
+#   - gap_64k/*, gap_256k/*, gap_1m/*: both sides at the named gap, measured
+#     with real GETs at 30 ms per GET, on an L1 segment (no run cap). Today's
+#     side is the production fetcher with BlockRangeFetcher::with_coalesce_gap
+#     and nothing else changed; the structural ranges coalesce at the same
+#     gap. THE DECISION IS gap_64k/ratio/{bytes <= 0.25, gets <= 1.5,
+#     wall <= 1.0}, on both subjects.
+#   - l0_64k/*: 64 KiB on an L0 segment, the structural ranges held to the
+#     same 4-run cap by the production bridging rule. Reported, not deciding.
+#   - The latency model has no bandwidth term: a GET costs 30 ms whatever
+#     its size, and at most max_concurrent_gets = 16 are in flight.
+#
+# Prediction basis. The objects are the round 0 objects (same corpus, params
+# and seed; RLOG writing is deterministic), so the round 0 figures carry
+# over: HDFS 11,101,600 B, 66 blocks, about 168 KB per block; BGL
+# 11,029,764 B, 70 blocks, about 158 KB per block; plan 1 GET of 262,144 B.
+# Round 0's planned floor_gap/* is the uncapped 64 KiB structural plan, so
+# gap_64k/structural is predicted at it: HDFS 22 ranges, 480,525 B; BGL 23
+# ranges, 437,519 B (plan and index included). Today at 64 KiB on L1 reads
+# the ten target blocks plus the dictionary pages of their groups: about
+# 10 blocks + 5%, in about 13 data GETs (a generated 32-block object gave
+# 13 GETs for 10 blocks). Wall: one 30 ms round for the plan, one per 16
+# data GETs, plus decode CPU; a ranged today decode of ten blocks is about
+# 28 ms (round 0 HDFS), the structural decode about 0.08x of it.
+#
+# Expected decision: NO-GO on both subjects, decided by gap_64k/ratio/gets
+# (predicted 1.64 HDFS, 1.71 BGL: 22-23 structural data ranges against
+# about 13 today) and gap_64k/ratio/wall near 1.0 (22-23 data GETs need two
+# 30 ms rounds at 16 in flight, today's 13 need one), while
+# gap_64k/ratio/bytes passes narrowly (predicted 0.24 HDFS, 0.23 BGL; the
+# 262,144 B plan probe both sides pay is over half of the structural bytes).
+# A today side with more data GETs than predicted (each column page its own
+# run) would flip gets and wall to pass; that is the miss these bands watch.
+#
+# Band notes. today/plan_bytes bands start at 262,144, the fixed probe size,
+# so they can only miss high. On the sidecar subjects (already run, bands
+# not edited after the fact): delete/residual_terms [0, 0] is a correctness
+# check fixed by construction, not a prediction; delete/erased_only_terms has
+# a band floor of 0, a count's own floor, so it cannot miss low.
+
+schema = 1
+
+[[subject]]
+name = "hdfs_structural"
+arm = "structural_fetch"
+corpus = "HDFS.log"
+source = "LogHub Zenodo 8196385"
+corpus_sha256 = "0783096174d7832c618337f9609e06e04abd86ddd7089b3c12b407e63bfebc52"
+
+[subject.params]
+max_lines = 2000000.0
+object_min_bytes = 10485760.0
+object_max_bytes = 11534336.0
+block_records = 8192.0
+group_blocks = 32.0
+zstd_level = 3.0
+trace_run_rows = 4.0
+matched_rows = 10.0
+latency_ms = 30.0
+max_concurrent_gets = 16.0
+mini_block_bytes = 8192.0
+mini_block_meta_bytes = 4.0
+coalesce_gap = 1887437.0
+runs = 5.0
+seed = 13.0
+
+[subject.figures]
+# 10 MiB at about 21.5 B/row, rounded to whole blocks of 8192.
+"rows" = { predict = 532480.0, band = [425984.0, 655360.0] }
+"blocks" = { predict = 65.0, band = [52.0, 80.0] }
+"object_bytes" = { unpredicted = "fixed by construction: the sizing search places it inside the registered object_min_bytes..object_max_bytes window" }
+"target_blocks" = { unpredicted = "fixed by construction: 10 evenly spaced rows land in 10 distinct blocks whenever the object has at least 10 blocks" }
+"today/plan_gets" = { predict = 1.0, band = [1.0, 2.0] }
+"today/plan_bytes" = { predict = 262144.0, band = [262144.0, 1048576.0] }
+"today/gets" = { predict = 2.0, band = [2.0, 3.0] }
+"today/bytes" = { predict = 11272192.0, band = [10747904.0, 12582912.0] }
+"today/uncomp_bytes" = { predict = 11960000.0, band = [10525000.0, 13395000.0] }
+"today/wall_ms" = { predict = 130.0, band = [90.0, 220.0] }
+"today/decode_cpu_ms" = { predict = 70.0, band = [30.0, 150.0] }
+"structural/layout_bytes" = { predict = 11900000.0, band = [10485760.0, 14417920.0] }
+"structural/raw_ranges" = { predict = 72.0, band = [60.0, 90.0] }
+"structural/data_ranges" = { predict = 1.0, band = [1.0, 2.0] }
+"structural/meta_bytes" = { predict = 5000.0, band = [2500.0, 9000.0] }
+"structural/gets" = { predict = 2.0, band = [2.0, 3.0] }
+"structural/bytes" = { predict = 12100000.0, band = [10700000.0, 14700000.0] }
+"structural/uncomp_bytes" = { predict = 900000.0, band = [450000.0, 1600000.0] }
+"structural/wall_ms" = { predict = 66.0, band = [60.0, 110.0] }
+"structural/decode_cpu_ms" = { predict = 5.0, band = [1.5, 15.0] }
+"ratio/bytes" = { predict = 1.07, band = [0.9, 1.2] }
+"ratio/gets" = { predict = 1.0, band = [0.66, 1.5] }
+"ratio/wall" = { predict = 0.5, band = [0.3, 0.8] }
+# Addendum 1. Round 0 read 10,384,932 data bytes of 11,101,600.
+"today/data_over_object" = { predict = 0.935, band = [0.9, 1.0] }
+# 64 KiB, L1: the decision.
+"gap_64k/today/plan_gets" = { predict = 1.0, band = [1.0, 2.0] }
+"gap_64k/today/plan_bytes" = { predict = 262144.0, band = [262144.0, 1048576.0] }
+"gap_64k/today/gets" = { predict = 14.0, band = [11.0, 24.0] }
+"gap_64k/today/bytes" = { predict = 2030000.0, band = [1600000.0, 2800000.0] }
+"gap_64k/today/data_over_object" = { predict = 0.16, band = [0.12, 0.25] }
+"gap_64k/today/wall_ms" = { predict = 95.0, band = [60.0, 190.0] }
+"gap_64k/today/decode_cpu_ms" = { predict = 28.0, band = [10.0, 80.0] }
+"gap_64k/structural/data_ranges" = { predict = 22.0, band = [21.0, 23.0] }
+"gap_64k/structural/gets" = { predict = 23.0, band = [22.0, 24.0] }
+"gap_64k/structural/bytes" = { predict = 480525.0, band = [475000.0, 486000.0] }
+"gap_64k/structural/wall_ms" = { predict = 95.0, band = [65.0, 150.0] }
+"gap_64k/structural/decode_cpu_ms" = { predict = 2.2, band = [0.8, 7.0] }
+"gap_64k/ratio/bytes" = { predict = 0.237, band = [0.17, 0.3] }
+"gap_64k/ratio/gets" = { predict = 1.64, band = [0.9, 2.2] }
+"gap_64k/ratio/wall" = { predict = 1.05, band = [0.6, 1.6] }
+# 256 KiB, L1: a target's mini-blocks merge, the targets do not.
+"gap_256k/today/plan_gets" = { predict = 1.0, band = [1.0, 2.0] }
+"gap_256k/today/plan_bytes" = { predict = 262144.0, band = [262144.0, 1048576.0] }
+"gap_256k/today/gets" = { predict = 13.0, band = [11.0, 24.0] }
+"gap_256k/today/bytes" = { predict = 2050000.0, band = [1600000.0, 2900000.0] }
+"gap_256k/today/data_over_object" = { predict = 0.16, band = [0.12, 0.26] }
+"gap_256k/today/wall_ms" = { predict = 95.0, band = [60.0, 190.0] }
+"gap_256k/today/decode_cpu_ms" = { predict = 28.0, band = [10.0, 80.0] }
+"gap_256k/structural/data_ranges" = { predict = 11.0, band = [8.0, 16.0] }
+"gap_256k/structural/gets" = { predict = 12.0, band = [9.0, 17.0] }
+"gap_256k/structural/bytes" = { predict = 1000000.0, band = [500000.0, 2000000.0] }
+"gap_256k/structural/wall_ms" = { predict = 64.0, band = [55.0, 110.0] }
+"gap_256k/structural/decode_cpu_ms" = { predict = 2.2, band = [0.8, 7.0] }
+"gap_256k/ratio/bytes" = { predict = 0.5, band = [0.25, 1.0] }
+"gap_256k/ratio/gets" = { predict = 0.92, band = [0.6, 1.6] }
+"gap_256k/ratio/wall" = { predict = 0.69, band = [0.4, 1.2] }
+# 1 MiB, L1: about 0.94 MB between target blocks, so today's runs bridge
+# into a span above the coverage crossover and it reads as round 0 did.
+"gap_1m/today/plan_gets" = { predict = 1.0, band = [1.0, 2.0] }
+"gap_1m/today/plan_bytes" = { predict = 262144.0, band = [262144.0, 1048576.0] }
+"gap_1m/today/gets" = { predict = 3.0, band = [2.0, 4.0] }
+"gap_1m/today/bytes" = { predict = 10647076.0, band = [10300000.0, 11400000.0] }
+"gap_1m/today/data_over_object" = { predict = 0.935, band = [0.9, 1.0] }
+"gap_1m/today/wall_ms" = { predict = 121.0, band = [80.0, 220.0] }
+"gap_1m/today/decode_cpu_ms" = { predict = 28.0, band = [10.0, 90.0] }
+"gap_1m/structural/data_ranges" = { predict = 5.0, band = [1.0, 12.0] }
+"gap_1m/structural/gets" = { predict = 6.0, band = [2.0, 13.0] }
+"gap_1m/structural/bytes" = { predict = 6000000.0, band = [600000.0, 11500000.0] }
+"gap_1m/structural/wall_ms" = { predict = 64.0, band = [55.0, 110.0] }
+"gap_1m/structural/decode_cpu_ms" = { predict = 2.2, band = [0.7, 7.0] }
+"gap_1m/ratio/bytes" = { predict = 0.55, band = [0.05, 1.1] }
+"gap_1m/ratio/gets" = { predict = 2.0, band = [0.5, 6.5] }
+"gap_1m/ratio/wall" = { predict = 0.53, band = [0.3, 0.9] }
+# 64 KiB, L0: today as round 0 (the 4-run cap), structural bridged to 4.
+"l0_64k/today/plan_gets" = { predict = 1.0, band = [1.0, 2.0] }
+"l0_64k/today/plan_bytes" = { predict = 262144.0, band = [262144.0, 1048576.0] }
+"l0_64k/today/gets" = { predict = 3.0, band = [2.0, 4.0] }
+"l0_64k/today/bytes" = { predict = 10647076.0, band = [10300000.0, 11400000.0] }
+"l0_64k/today/data_over_object" = { predict = 0.935, band = [0.9, 1.0] }
+"l0_64k/today/wall_ms" = { predict = 121.0, band = [80.0, 220.0] }
+"l0_64k/today/decode_cpu_ms" = { predict = 28.0, band = [10.0, 90.0] }
+"l0_64k/structural/data_ranges" = { predict = 4.0, band = [4.0, 4.0] }
+"l0_64k/structural/gets" = { predict = 5.0, band = [5.0, 5.0] }
+"l0_64k/structural/bytes" = { predict = 7300000.0, band = [4500000.0, 10000000.0] }
+"l0_64k/structural/wall_ms" = { predict = 64.0, band = [55.0, 110.0] }
+"l0_64k/structural/decode_cpu_ms" = { predict = 2.2, band = [0.7, 7.0] }
+"l0_64k/ratio/bytes" = { predict = 0.69, band = [0.4, 0.95] }
+"l0_64k/ratio/gets" = { predict = 1.67, band = [1.25, 2.5] }
+"l0_64k/ratio/wall" = { predict = 0.53, band = [0.3, 0.9] }
+
+[[subject]]
+name = "bgl_structural"
+arm = "structural_fetch"
+corpus = "BGL.log"
+source = "LogHub Zenodo 8196385"
+corpus_sha256 = "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2"
+
+[subject.params]
+max_lines = 2000000.0
+object_min_bytes = 10485760.0
+object_max_bytes = 11534336.0
+block_records = 8192.0
+group_blocks = 32.0
+zstd_level = 3.0
+trace_run_rows = 4.0
+matched_rows = 10.0
+latency_ms = 30.0
+max_concurrent_gets = 16.0
+mini_block_bytes = 8192.0
+mini_block_meta_bytes = 4.0
+coalesce_gap = 1887437.0
+runs = 5.0
+seed = 13.0
+
+[subject.figures]
+# 10 MiB at about 22 B/row, rounded to whole blocks of 8192.
+"rows" = { predict = 524288.0, band = [425984.0, 655360.0] }
+"blocks" = { predict = 64.0, band = [52.0, 80.0] }
+"object_bytes" = { unpredicted = "fixed by construction: the sizing search places it inside the registered object_min_bytes..object_max_bytes window" }
+"target_blocks" = { unpredicted = "fixed by construction: 10 evenly spaced rows land in 10 distinct blocks whenever the object has at least 10 blocks" }
+"today/plan_gets" = { predict = 1.0, band = [1.0, 2.0] }
+"today/plan_bytes" = { predict = 262144.0, band = [262144.0, 1048576.0] }
+"today/gets" = { predict = 2.0, band = [2.0, 3.0] }
+"today/bytes" = { predict = 11272192.0, band = [10747904.0, 12582912.0] }
+"today/uncomp_bytes" = { predict = 13300000.0, band = [11700000.0, 14900000.0] }
+"today/wall_ms" = { predict = 130.0, band = [90.0, 220.0] }
+"today/decode_cpu_ms" = { predict = 70.0, band = [30.0, 150.0] }
+"structural/layout_bytes" = { predict = 11900000.0, band = [10485760.0, 14417920.0] }
+"structural/raw_ranges" = { predict = 72.0, band = [60.0, 90.0] }
+"structural/data_ranges" = { predict = 1.0, band = [1.0, 2.0] }
+"structural/meta_bytes" = { predict = 5000.0, band = [2500.0, 9000.0] }
+"structural/gets" = { predict = 2.0, band = [2.0, 3.0] }
+"structural/bytes" = { predict = 12100000.0, band = [10700000.0, 14700000.0] }
+"structural/uncomp_bytes" = { predict = 900000.0, band = [450000.0, 1600000.0] }
+"structural/wall_ms" = { predict = 66.0, band = [60.0, 110.0] }
+"structural/decode_cpu_ms" = { predict = 5.0, band = [1.5, 15.0] }
+"ratio/bytes" = { predict = 1.07, band = [0.9, 1.2] }
+"ratio/gets" = { predict = 1.0, band = [0.66, 1.5] }
+"ratio/wall" = { predict = 0.5, band = [0.3, 0.8] }
+# Addendum 1. Round 0 read the whole object after the plan.
+"today/data_over_object" = { predict = 1.0, band = [0.95, 1.0] }
+# 64 KiB, L1: the decision.
+"gap_64k/today/plan_gets" = { predict = 1.0, band = [1.0, 2.0] }
+"gap_64k/today/plan_bytes" = { predict = 262144.0, band = [262144.0, 1048576.0] }
+"gap_64k/today/gets" = { predict = 14.0, band = [11.0, 24.0] }
+"gap_64k/today/bytes" = { predict = 1920000.0, band = [1500000.0, 2700000.0] }
+"gap_64k/today/data_over_object" = { predict = 0.15, band = [0.11, 0.24] }
+"gap_64k/today/wall_ms" = { predict = 95.0, band = [60.0, 190.0] }
+"gap_64k/today/decode_cpu_ms" = { predict = 25.0, band = [8.0, 80.0] }
+"gap_64k/structural/data_ranges" = { predict = 23.0, band = [22.0, 24.0] }
+"gap_64k/structural/gets" = { predict = 24.0, band = [23.0, 25.0] }
+"gap_64k/structural/bytes" = { predict = 437519.0, band = [432000.0, 443000.0] }
+"gap_64k/structural/wall_ms" = { predict = 95.0, band = [65.0, 150.0] }
+"gap_64k/structural/decode_cpu_ms" = { predict = 2.4, band = [0.8, 8.0] }
+"gap_64k/ratio/bytes" = { predict = 0.228, band = [0.16, 0.3] }
+"gap_64k/ratio/gets" = { predict = 1.71, band = [0.9, 2.3] }
+"gap_64k/ratio/wall" = { predict = 1.05, band = [0.6, 1.6] }
+# 256 KiB, L1: a target's mini-blocks merge, the targets do not.
+"gap_256k/today/plan_gets" = { predict = 1.0, band = [1.0, 2.0] }
+"gap_256k/today/plan_bytes" = { predict = 262144.0, band = [262144.0, 1048576.0] }
+"gap_256k/today/gets" = { predict = 13.0, band = [11.0, 24.0] }
+"gap_256k/today/bytes" = { predict = 1950000.0, band = [1500000.0, 2800000.0] }
+"gap_256k/today/data_over_object" = { predict = 0.15, band = [0.11, 0.25] }
+"gap_256k/today/wall_ms" = { predict = 95.0, band = [60.0, 190.0] }
+"gap_256k/today/decode_cpu_ms" = { predict = 25.0, band = [8.0, 80.0] }
+"gap_256k/structural/data_ranges" = { predict = 11.0, band = [8.0, 16.0] }
+"gap_256k/structural/gets" = { predict = 12.0, band = [9.0, 17.0] }
+"gap_256k/structural/bytes" = { predict = 950000.0, band = [480000.0, 1900000.0] }
+"gap_256k/structural/wall_ms" = { predict = 64.0, band = [55.0, 110.0] }
+"gap_256k/structural/decode_cpu_ms" = { predict = 2.4, band = [0.8, 8.0] }
+"gap_256k/ratio/bytes" = { predict = 0.49, band = [0.25, 1.0] }
+"gap_256k/ratio/gets" = { predict = 0.92, band = [0.6, 1.6] }
+"gap_256k/ratio/wall" = { predict = 0.69, band = [0.4, 1.2] }
+# 1 MiB, L1: about 0.95 MB between target blocks, so today's runs bridge
+# into a span above the coverage crossover and it reads as round 0 did.
+"gap_1m/today/plan_gets" = { predict = 1.0, band = [1.0, 2.0] }
+"gap_1m/today/plan_bytes" = { predict = 262144.0, band = [262144.0, 1048576.0] }
+"gap_1m/today/gets" = { predict = 2.0, band = [2.0, 3.0] }
+"gap_1m/today/bytes" = { predict = 11291908.0, band = [10900000.0, 11300000.0] }
+"gap_1m/today/data_over_object" = { predict = 1.0, band = [0.95, 1.0] }
+"gap_1m/today/wall_ms" = { predict = 138.0, band = [90.0, 260.0] }
+"gap_1m/today/decode_cpu_ms" = { predict = 76.0, band = [30.0, 200.0] }
+"gap_1m/structural/data_ranges" = { predict = 5.0, band = [1.0, 12.0] }
+"gap_1m/structural/gets" = { predict = 6.0, band = [2.0, 13.0] }
+"gap_1m/structural/bytes" = { predict = 5800000.0, band = [550000.0, 11000000.0] }
+"gap_1m/structural/wall_ms" = { predict = 70.0, band = [58.0, 120.0] }
+"gap_1m/structural/decode_cpu_ms" = { predict = 7.3, band = [2.5, 20.0] }
+"gap_1m/ratio/bytes" = { predict = 0.51, band = [0.05, 1.0] }
+"gap_1m/ratio/gets" = { predict = 3.0, band = [1.0, 6.5] }
+"gap_1m/ratio/wall" = { predict = 0.5, band = [0.3, 0.9] }
+# 64 KiB, L0: today as round 0 (the 4-run cap), structural bridged to 4.
+"l0_64k/today/plan_gets" = { predict = 1.0, band = [1.0, 2.0] }
+"l0_64k/today/plan_bytes" = { predict = 262144.0, band = [262144.0, 1048576.0] }
+"l0_64k/today/gets" = { predict = 2.0, band = [2.0, 3.0] }
+"l0_64k/today/bytes" = { predict = 11291908.0, band = [10900000.0, 11300000.0] }
+"l0_64k/today/data_over_object" = { predict = 1.0, band = [0.95, 1.0] }
+"l0_64k/today/wall_ms" = { predict = 138.0, band = [90.0, 260.0] }
+"l0_64k/today/decode_cpu_ms" = { predict = 76.0, band = [30.0, 200.0] }
+"l0_64k/structural/data_ranges" = { predict = 4.0, band = [4.0, 4.0] }
+"l0_64k/structural/gets" = { predict = 5.0, band = [5.0, 5.0] }
+"l0_64k/structural/bytes" = { predict = 7000000.0, band = [4300000.0, 9800000.0] }
+"l0_64k/structural/wall_ms" = { predict = 70.0, band = [58.0, 120.0] }
+"l0_64k/structural/decode_cpu_ms" = { predict = 7.3, band = [2.5, 20.0] }
+"l0_64k/ratio/bytes" = { predict = 0.62, band = [0.38, 0.9] }
+"l0_64k/ratio/gets" = { predict = 2.5, band = [1.67, 2.5] }
+"l0_64k/ratio/wall" = { predict = 0.5, band = [0.3, 0.9] }
+
+[[subject]]
+name = "hdfs_sidecar"
+arm = "fulltext_sidecar"
+corpus = "HDFS.log"
+source = "LogHub Zenodo 8196385"
+corpus_sha256 = "0783096174d7832c618337f9609e06e04abd86ddd7089b3c12b407e63bfebc52"
+
+[subject.params]
+max_lines = 5242880.0
+object_rows = 524288.0
+block_records = 8192.0
+group_blocks = 32.0
+zstd_level = 3.0
+sidecar_stride = 64.0
+sidecar_suffix_bytes = 65536.0
+rare_max_rows = 3.0
+rare_sample = 30.0
+scale_raw_bytes = 100000000000.0
+seed = 13.0
+
+[subject.figures]
+"lines" = { unpredicted = "fixed by construction: objects * object_rows" }
+"objects" = { unpredicted = "fixed by construction: max_lines / object_rows whole objects" }
+"blocks" = { unpredicted = "fixed by construction: objects * object_rows / block_records" }
+"rare/tokens" = { unpredicted = "fixed by construction: min(rare_sample, rare/candidates)" }
+# 5,242,880 lines at 141.2 B mean, +-5% for the head of the file.
+"raw_bytes" = { predict = 740300000.0, band = [703000000.0, 777000000.0] }
+# About 15.6 B/row.
+"object_bytes" = { predict = 81800000.0, band = [65000000.0, 105000000.0] }
+"bloom/section_bytes" = { predict = 6300000.0, band = [3100000.0, 12600000.0] }
+# HDFS repeats block ids, IPs and ports, so far fewer distinct body tokens
+# per object than the generated corpus's 278k.
+"postings/bytes" = { predict = 6500000.0, band = [2000000.0, 20000000.0] }
+"postings/terms" = { predict = 1000000.0, band = [300000.0, 3000000.0] }
+# Every object is over the production 10,000-distinct postings cap.
+"postings/capped_objects" = { predict = 10.0, band = [10.0, 10.0] }
+"postings/verdict_mismatches" = { predict = 0.0, band = [0.0, 0.0] }
+"sidecar/bytes" = { predict = 60000000.0, band = [30000000.0, 120000000.0] }
+"sidecar/terms" = { predict = 1000000.0, band = [300000.0, 3000000.0] }
+"sidecar/entries" = { predict = 100000000.0, band = [70000000.0, 130000000.0] }
+"sidecar/over_postings" = { predict = 6.0, band = [2.5, 15.0] }
+"sidecar/over_bloom_section" = { predict = 9.5, band = [3.0, 30.0] }
+"build/sidecar_cpu_ms" = { predict = 32000.0, band = [15000.0, 70000.0] }
+"build/compaction_cpu_ms" = { predict = 22000.0, band = [10000.0, 50000.0] }
+"build/cpu_ratio" = { predict = 1.45, band = [0.8, 2.5] }
+"build/rewrite_amplification" = { predict = 1.73, band = [1.3, 2.6] }
+"rare/candidates" = { predict = 300000.0, band = [50000.0, 1500000.0] }
+"rare/rows" = { predict = 36.0, band = [30.0, 50.0] }
+# 300 (token, object) pairs.
+"rare/bloom_gets" = { predict = 1020.0, band = [800.0, 1300.0] }
+# 300 misses of about 1.08 MB (256 KiB probe plus BLOOM and PAGE_DIR) and
+# about 247 kept blocks of about 128 KB.
+"rare/bloom_bytes" = { predict = 356000000.0, band = [160000000.0, 750000000.0] }
+"rare/bloom_blocks_kept" = { predict = 247.0, band = [100.0, 750.0] }
+"rare/false_positive_blocks" = { predict = 211.0, band = [60.0, 700.0] }
+# Below the whole-object bound: the plan reads the whole object.
+"rare/plan_route_bytes_per_object" = { predict = 8180000.0, band = [6500000.0, 9437185.0] }
+"rare/default_path_gets" = { predict = 300.0, band = [300.0, 300.0] }
+"rare/default_path_bytes" = { predict = 2450000000.0, band = [1950000000.0, 3150000000.0] }
+"rare/no_crossover_gets" = { predict = 300.0, band = [300.0, 300.0] }
+"rare/no_crossover_bytes" = { predict = 2450000000.0, band = [1950000000.0, 3150000000.0] }
+"rare/sidecar_gets" = { predict = 855.0, band = [600.0, 1200.0] }
+"rare/sidecar_bytes" = { predict = 47000000.0, band = [20000000.0, 110000000.0] }
+"rare/bytes_ratio_measured" = { predict = 0.13, band = [0.04, 0.4] }
+# 1e11 / (740.3e6 / 10), over the raw_bytes band.
+"rare/scale_objects" = { predict = 1351.0, band = [1287.0, 1422.0] }
+"rare/bloom_bytes_100gb" = { predict = 1460000000.0, band = [700000000.0, 3000000000.0] }
+"rare/sidecar_bytes_100gb" = { predict = 96000000.0, band = [60000000.0, 200000000.0] }
+"rare/bytes_ratio_100gb" = { predict = 0.066, band = [0.025, 0.2] }
+"rare/gets_ratio_100gb" = { predict = 0.654, band = [0.4, 1.05] }
+"rare/default_path_bytes_100gb" = { predict = 11050000000.0, band = [8500000000.0, 14500000000.0] }
+"rare/bytes_ratio_100gb_default_path" = { predict = 0.0087, band = [0.004, 0.02] }
+# HDFS row 0 holds a source port few other rows repeat.
+"delete/erased_only_terms" = { predict = 1.0, band = [0.0, 5.0] }
+"delete/residual_terms" = { predict = 0.0, band = [0.0, 0.0] }
+"delete/rebuild_cpu_ms" = { predict = 3300.0, band = [1500.0, 7000.0] }
+"delete/rebuild_cpu_over_compaction" = { predict = 1.48, band = [0.9, 2.5] }
+"delete/bytes_over_object" = { predict = 0.73, band = [0.3, 1.5] }
+
+[[subject]]
+name = "bgl_sidecar"
+arm = "fulltext_sidecar"
+corpus = "BGL.log"
+source = "LogHub Zenodo 8196385"
+corpus_sha256 = "666130b15ef44eb32fd02bd053e6c6e007c37696b5e7e8b9d8e45b729876a5d2"
+
+[subject.params]
+max_lines = 4718592.0
+object_rows = 524288.0
+block_records = 8192.0
+group_blocks = 32.0
+zstd_level = 3.0
+sidecar_stride = 64.0
+sidecar_suffix_bytes = 65536.0
+rare_max_rows = 3.0
+rare_sample = 30.0
+scale_raw_bytes = 100000000000.0
+seed = 13.0
+
+[subject.figures]
+"lines" = { unpredicted = "fixed by construction: objects * object_rows" }
+"objects" = { unpredicted = "fixed by construction: max_lines / object_rows whole objects" }
+"blocks" = { unpredicted = "fixed by construction: objects * object_rows / block_records" }
+"rare/tokens" = { unpredicted = "fixed by construction: min(rare_sample, rare/candidates)" }
+# 4,718,592 lines at 156.5 B mean, +-5%.
+"raw_bytes" = { predict = 738500000.0, band = [701000000.0, 776000000.0] }
+# About 16.1 B/row.
+"object_bytes" = { predict = 76000000.0, band = [61000000.0, 98000000.0] }
+"bloom/section_bytes" = { predict = 5700000.0, band = [2800000.0, 11300000.0] }
+# BGL bodies carry microsecond timestamps and node names, so many more
+# distinct tokens per object than HDFS.
+"postings/bytes" = { predict = 26000000.0, band = [8000000.0, 60000000.0] }
+"postings/terms" = { predict = 4000000.0, band = [1500000.0, 8000000.0] }
+"postings/capped_objects" = { predict = 9.0, band = [9.0, 9.0] }
+"postings/verdict_mismatches" = { predict = 0.0, band = [0.0, 0.0] }
+"sidecar/bytes" = { predict = 66000000.0, band = [30000000.0, 130000000.0] }
+"sidecar/terms" = { predict = 4000000.0, band = [1500000.0, 8000000.0] }
+"sidecar/entries" = { predict = 94000000.0, band = [60000000.0, 130000000.0] }
+"sidecar/over_postings" = { predict = 2.5, band = [1.0, 8.0] }
+"sidecar/over_bloom_section" = { predict = 11.6, band = [3.0, 40.0] }
+"build/sidecar_cpu_ms" = { predict = 29000.0, band = [13000.0, 65000.0] }
+"build/compaction_cpu_ms" = { predict = 20000.0, band = [9000.0, 45000.0] }
+"build/cpu_ratio" = { predict = 1.45, band = [0.8, 2.5] }
+"build/rewrite_amplification" = { predict = 1.87, band = [1.3, 2.8] }
+"rare/candidates" = { predict = 500000.0, band = [100000.0, 2000000.0] }
+"rare/rows" = { predict = 36.0, band = [30.0, 50.0] }
+# 270 (token, object) pairs.
+"rare/bloom_gets" = { predict = 918.0, band = [720.0, 1170.0] }
+"rare/bloom_bytes" = { predict = 323000000.0, band = [150000000.0, 700000000.0] }
+"rare/bloom_blocks_kept" = { predict = 226.0, band = [90.0, 700.0] }
+"rare/false_positive_blocks" = { predict = 190.0, band = [55.0, 650.0] }
+"rare/plan_route_bytes_per_object" = { predict = 8440000.0, band = [6800000.0, 9437185.0] }
+"rare/default_path_gets" = { predict = 270.0, band = [270.0, 270.0] }
+"rare/default_path_bytes" = { predict = 2280000000.0, band = [1800000000.0, 2950000000.0] }
+"rare/no_crossover_gets" = { predict = 270.0, band = [270.0, 270.0] }
+"rare/no_crossover_bytes" = { predict = 2280000000.0, band = [1800000000.0, 2950000000.0] }
+"rare/sidecar_gets" = { predict = 770.0, band = [540.0, 1080.0] }
+"rare/sidecar_bytes" = { predict = 47000000.0, band = [20000000.0, 110000000.0] }
+"rare/bytes_ratio_measured" = { predict = 0.145, band = [0.04, 0.45] }
+# 1e11 / (738.5e6 / 9), over the raw_bytes band.
+"rare/scale_objects" = { predict = 1218.6, band = [1160.0, 1284.0] }
+"rare/bloom_bytes_100gb" = { predict = 1320000000.0, band = [650000000.0, 2700000000.0] }
+"rare/sidecar_bytes_100gb" = { predict = 92000000.0, band = [55000000.0, 200000000.0] }
+"rare/bytes_ratio_100gb" = { predict = 0.07, band = [0.025, 0.2] }
+"rare/gets_ratio_100gb" = { predict = 0.654, band = [0.4, 1.05] }
+"rare/default_path_bytes_100gb" = { predict = 10300000000.0, band = [8000000000.0, 13500000000.0] }
+"rare/bytes_ratio_100gb_default_path" = { predict = 0.0089, band = [0.004, 0.02] }
+# BGL row 0 holds a microsecond timestamp fragment no other row repeats.
+"delete/erased_only_terms" = { predict = 2.0, band = [0.0, 6.0] }
+"delete/residual_terms" = { predict = 0.0, band = [0.0, 0.0] }
+"delete/rebuild_cpu_ms" = { predict = 3300.0, band = [1500.0, 7000.0] }
+"delete/rebuild_cpu_over_compaction" = { predict = 1.48, band = [0.9, 2.5] }
+"delete/bytes_over_object" = { predict = 0.87, band = [0.35, 1.8] }
