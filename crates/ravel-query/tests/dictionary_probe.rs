@@ -820,7 +820,7 @@ async fn corrupt_dictionary_at_step_one_is_the_one_step_typed_error() {
                 .unwrap()
                 .iter()
                 .filter(|(k, _)| k.contains(&key))
-                .map(|(_, range)| range.clone())
+                .map(|(_, range)| *range)
                 .collect();
             let faulted_len = match ranges.get(1) {
                 Some(GetRange::Range(start, end)) => end - start,
@@ -862,10 +862,7 @@ impl ObjectStoreBackend for RangeRecordingStore {
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
-        self.gets
-            .lock()
-            .unwrap()
-            .push((key.to_string(), range.clone()));
+        self.gets.lock().unwrap().push((key.to_string(), range));
         self.inner.get(key, range).await
     }
 
