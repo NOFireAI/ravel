@@ -6967,11 +6967,7 @@ fn aggregate_functions_are_spill_families(aggregate: &Aggregate) -> bool {
 ///   not nullable.
 /// - the term is descending for `max` and ascending for `min`, the direction
 ///   that function's extreme runs.
-fn is_bounded_topk_candidate(
-    sort: &Sort,
-    fetch: Option<usize>,
-    max_limit: Option<usize>,
-) -> bool {
+fn is_bounded_topk_candidate(sort: &Sort, fetch: Option<usize>, max_limit: Option<usize>) -> bool {
     let (Some(fetch), Some(max_limit)) = (fetch, max_limit) else {
         return false;
     };
@@ -7027,7 +7023,11 @@ fn is_bounded_topk_candidate(
     let [Expr::Column(argument)] = function.params.args.as_slice() else {
         return false;
     };
-    match aggregate.input.schema().qualified_field_from_column(argument) {
+    match aggregate
+        .input
+        .schema()
+        .qualified_field_from_column(argument)
+    {
         Ok((_, field)) if !field.is_nullable() => {}
         _ => return false,
     }
@@ -9040,7 +9040,8 @@ pub(crate) mod tests {
             "ORDER BY c alone must not be treated as total over (a, b) before the rewrite"
         );
 
-        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite never errors");
+        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX)
+            .expect("the rewrite never errors");
         assert!(
             plan_is_spill_eligible(&rewritten),
             "appending (a, b) as trailing tiebreak terms must make the Sort eligible"
@@ -9059,7 +9060,8 @@ pub(crate) mod tests {
             .sql_classification_plan(tenant, Q33_SQL, &[], Some(&schemas))
             .await
             .expect("the q33 shape plans");
-        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite never errors");
+        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX)
+            .expect("the rewrite never errors");
         let sort = find_sort(&rewritten).expect("the rewritten plan has a Sort node");
 
         assert_eq!(
@@ -9100,7 +9102,8 @@ pub(crate) mod tests {
             "a sort key already total over the group must already be eligible"
         );
 
-        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite never errors");
+        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX)
+            .expect("the rewrite never errors");
         let sort = find_sort(&rewritten).expect("the rewritten plan has a Sort node");
         assert_eq!(
             sort.expr.len(),
@@ -9126,7 +9129,8 @@ pub(crate) mod tests {
             .expect("the grouping-set shape plans");
         assert!(!plan_is_spill_eligible(&plan));
 
-        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite never errors");
+        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX)
+            .expect("the rewrite never errors");
         assert!(
             !plan_is_spill_eligible(&rewritten),
             "a grouping set's synthetic group columns must fail closed, not be guessed at"
@@ -9248,7 +9252,8 @@ pub(crate) mod tests {
         .await;
         assert!(!plan_is_spill_eligible(&plan));
 
-        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
         assert_eq!(
             sort_terms(&rewritten),
             vec![
@@ -9275,7 +9280,8 @@ pub(crate) mod tests {
         let schema = Arc::clone(plan.schema());
         assert!(!plan_is_spill_eligible(&plan));
 
-        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
         let tiebreak = format!("{TIEBREAK_COLUMN_PREFIX}0");
         assert_eq!(
             sort_terms(&rewritten),
@@ -9311,7 +9317,8 @@ pub(crate) mod tests {
         .await;
         assert!(!plan_is_spill_eligible(&plan));
 
-        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
         assert_eq!(
             sort_terms(&rewritten),
             vec![
@@ -9340,7 +9347,8 @@ pub(crate) mod tests {
         .await;
         assert!(!plan_is_spill_eligible(&plan));
         assert!(plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX));
-        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
         assert_eq!(
             sort_terms(&rewritten),
             vec![
@@ -9499,7 +9507,8 @@ pub(crate) mod tests {
         assert!(!plan_is_spill_eligible(&plan), "ORDER BY l alone ties");
         assert!(plan_is_spill_eligible_ignoring_sort_order(&plan));
         assert!(plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX));
-        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
         assert_eq!(
             sort_terms(&rewritten),
             vec![term(None, "l", false), term(None, "k", true)]
@@ -9525,7 +9534,8 @@ pub(crate) mod tests {
         for sql in BOUNDED_TOPK_SERVED {
             let plan = q33_plan(sql).await;
             assert!(!plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX), "{sql}");
-            let rewritten = rewrite_sort_group_key_tie_order(plan.clone(), DEFAULT_TOPK_MAX).expect("nothing to do");
+            let rewritten = rewrite_sort_group_key_tie_order(plan.clone(), DEFAULT_TOPK_MAX)
+                .expect("nothing to do");
             assert_eq!(rewritten, plan, "{sql}");
         }
 
@@ -9534,8 +9544,8 @@ pub(crate) mod tests {
         )
         .await;
         assert!(plan_has_tie_order_edit(&two_aggregates, DEFAULT_TOPK_MAX));
-        let rewritten =
-            rewrite_sort_group_key_tie_order(two_aggregates, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        let rewritten = rewrite_sort_group_key_tie_order(two_aggregates, DEFAULT_TOPK_MAX)
+            .expect("the rewrite applies");
         assert_eq!(
             sort_terms(&rewritten),
             vec![term(None, "m", false), term(Some("q33"), "a", true)]
@@ -9593,7 +9603,8 @@ pub(crate) mod tests {
             let plan = q33_plan(sql).await;
             assert!(!plan_is_spill_eligible(&plan), "{sql} ties as written");
             assert!(plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX), "{sql}");
-            let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+            let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX)
+                .expect("the rewrite applies");
             assert_eq!(sort_terms(&rewritten), terms, "{sql}");
             assert!(plan_is_spill_eligible(&rewritten), "{sql}");
         }
@@ -9601,8 +9612,7 @@ pub(crate) mod tests {
 
     /// A lone `min` over a nullable column, the shape of every declared logs
     /// column, under an ascending single-term top-k.
-    const NULLABLE_MIN_SQL: &str =
-        "SELECT a, min(s) AS m FROM q33 GROUP BY a ORDER BY m LIMIT 25";
+    const NULLABLE_MIN_SQL: &str = "SELECT a, min(s) AS m FROM q33 GROUP BY a ORDER BY m LIMIT 25";
 
     /// The bounded aggregate refuses a nullable `min` argument, so the sort
     /// gets the group key as a tiebreak and becomes spill-eligible rather than
@@ -9672,7 +9682,11 @@ pub(crate) mod tests {
         let cases = BOUNDED_TOPK_SERVED
             .iter()
             .map(|sql| (*sql, DEFAULT_TOPK_MAX, true))
-            .chain(refused.iter().map(|(sql, _)| (*sql, DEFAULT_TOPK_MAX, false)))
+            .chain(
+                refused
+                    .iter()
+                    .map(|(sql, _)| (*sql, DEFAULT_TOPK_MAX, false)),
+            )
             .chain([
                 (NULLABLE_MIN_SQL, DEFAULT_TOPK_MAX, false),
                 (
@@ -9743,7 +9757,8 @@ pub(crate) mod tests {
              ORDER BY c DESC LIMIT 10",
         )
         .await;
-        let rewritten = rewrite_sort_group_key_tie_order(plan.clone(), DEFAULT_TOPK_MAX).expect("nothing to do");
+        let rewritten = rewrite_sort_group_key_tie_order(plan.clone(), DEFAULT_TOPK_MAX)
+            .expect("nothing to do");
         assert_eq!(rewritten, plan);
         assert!(!plan_is_spill_eligible(&rewritten));
     }
@@ -9781,7 +9796,8 @@ pub(crate) mod tests {
             .expect("the statement plans");
         assert!(!plan_is_spill_eligible_ignoring_sort_order(&plan));
         assert!(!plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX));
-        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
         assert_eq!(sort_terms(&rewritten), vec![term(None, "c", false)]);
         assert!(!plan_is_spill_eligible(&rewritten));
     }
@@ -9809,7 +9825,8 @@ pub(crate) mod tests {
         .await;
         assert!(!plan_is_spill_eligible_ignoring_sort_order(&plan));
         assert!(plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX));
-        let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
+        let rewritten =
+            rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX).expect("the rewrite applies");
         assert_eq!(
             sort_terms(&rewritten),
             vec![
@@ -9822,7 +9839,8 @@ pub(crate) mod tests {
         let max =
             q33_plan("SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10").await;
         assert!(!plan_has_tie_order_edit(&max, DEFAULT_TOPK_MAX));
-        let rewritten = rewrite_sort_group_key_tie_order(max.clone(), DEFAULT_TOPK_MAX).expect("nothing to do");
+        let rewritten =
+            rewrite_sort_group_key_tie_order(max.clone(), DEFAULT_TOPK_MAX).expect("nothing to do");
         assert_eq!(rewritten, max);
 
         let already_total = q33_plan(
