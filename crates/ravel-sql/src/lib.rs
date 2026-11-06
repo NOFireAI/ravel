@@ -121,6 +121,7 @@ mod statement;
 mod statement_accounting;
 pub mod stats_json;
 mod sum;
+mod sum_plus;
 mod trace_id_planner;
 mod udf;
 mod validate;

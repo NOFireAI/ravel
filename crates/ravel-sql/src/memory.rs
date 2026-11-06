@@ -839,6 +839,11 @@ fn accumulator_widths(expr: &AggregateFunctionExpr) -> Option<Vec<usize>> {
         {
             Some(crate::sum::EXACT_SUM_GROUP_WIDTHS.to_vec())
         }
+        // The shared sum and count of an exact `SUM(x + c)`: an `i128` sum and
+        // an `i64` count per group.
+        crate::sum_plus::EXACT_SUM_COUNT => {
+            Some(crate::sum_plus::EXACT_SUM_COUNT_GROUP_WIDTHS.to_vec())
+        }
         // `PrimitiveGroupsAccumulator` over the return type.
         "sum" | "min" | "max" => Some(vec![return_type.primitive_width()?]),
         "avg" => {

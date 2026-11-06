@@ -43,7 +43,9 @@
 //! The built-in's `SUM(x + c)` to `SUM(x) + c * COUNT(x)` rewrite is not
 //! applied for an integer literal: the outer `+` and `*` are DataFusion
 //! scalar arithmetic, which wraps, so the rewritten form could return a
-//! wrapped total where the checked `sum` would have failed.
+//! wrapped total where the checked `sum` would have failed. `crate::sum_plus`
+//! rewrites that shape instead, into an exact sum and count of `x` and a
+//! checked `sum + c * count`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -114,8 +116,8 @@ impl std::hash::Hash for CheckedSum {
 
 /// Which checked accumulator an integer call gets, from its resolved result
 /// type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SumKind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SumKind {
     /// Signed integer input, coerced to `Int64`; returns `Int64`.
     Signed,
     /// Unsigned integer input, coerced to `UInt64`; returns `UInt64`.
@@ -124,7 +126,7 @@ enum SumKind {
 
 /// The checked kind of a call returning `return_type`; `None` for every other
 /// result type, which the built-in runs unchanged.
-fn sum_kind(return_type: &DataType) -> Option<SumKind> {
+pub(crate) fn sum_kind(return_type: &DataType) -> Option<SumKind> {
     match return_type {
         DataType::Int64 => Some(SumKind::Signed),
         DataType::UInt64 => Some(SumKind::Unsigned),
@@ -133,7 +135,7 @@ fn sum_kind(return_type: &DataType) -> Option<SumKind> {
 }
 
 impl SumKind {
-    fn result_type(self) -> DataType {
+    pub(crate) fn result_type(self) -> DataType {
         match self {
             SumKind::Unsigned => DataType::UInt64,
             SumKind::Signed => DataType::Int64,
@@ -149,7 +151,7 @@ impl SumKind {
 
     /// The overflow error for this kind, as the `DataFusionError` an
     /// accumulator returns. The executor recovers the `SqlError` from it.
-    fn overflow(self) -> DataFusionError {
+    pub(crate) fn overflow(self) -> DataFusionError {
         DataFusionError::External(Box::new(SqlError::IntegerSumOverflow {
             result_type: self.result_type_name(),
         }))
@@ -172,13 +174,13 @@ impl SumKind {
         })
     }
 
-    fn checked_add(self, acc: i128, value: i128) -> DFResult<i128> {
+    pub(crate) fn checked_add(self, acc: i128, value: i128) -> DFResult<i128> {
         acc.checked_add(value).ok_or_else(|| self.overflow())
     }
 
     /// `sum` as a `Decimal128(38, 0)` state value, or the overflow error when
     /// it is outside that type's range.
-    fn state_value(self, sum: i128) -> DFResult<i128> {
+    pub(crate) fn state_value(self, sum: i128) -> DFResult<i128> {
         if (-DECIMAL128_MAX_UNSCALED..=DECIMAL128_MAX_UNSCALED).contains(&sum) {
             Ok(sum)
         } else {
@@ -188,7 +190,7 @@ impl SumKind {
 
     /// Visit every non-null value of `array` (the call's coerced input) as an
     /// `i128`, with its row index.
-    fn for_each_value(
+    pub(crate) fn for_each_value(
         self,
         array: &ArrayRef,
         mut visit: impl FnMut(usize, i128) -> DFResult<()>,
@@ -229,7 +231,7 @@ impl SumKind {
 const DECIMAL128_MAX_UNSCALED: i128 = 99_999_999_999_999_999_999_999_999_999_999_999_999;
 
 /// `array` as a `PrimitiveArray<T>`, cast first when its type differs.
-fn as_primitive<T: ArrowPrimitiveType>(array: &ArrayRef) -> DFResult<PrimitiveArray<T>> {
+pub(crate) fn as_primitive<T: ArrowPrimitiveType>(array: &ArrayRef) -> DFResult<PrimitiveArray<T>> {
     let array = if array.data_type() == &T::DATA_TYPE {
         Arc::clone(array)
     } else {
@@ -247,7 +249,7 @@ fn as_primitive<T: ArrowPrimitiveType>(array: &ArrayRef) -> DFResult<PrimitiveAr
         })
 }
 
-fn as_decimal128(array: &ArrayRef) -> DFResult<&Decimal128Array> {
+pub(crate) fn as_decimal128(array: &ArrayRef) -> DFResult<&Decimal128Array> {
     array
         .as_any()
         .downcast_ref::<Decimal128Array>()
@@ -260,7 +262,7 @@ fn as_decimal128(array: &ArrayRef) -> DFResult<&Decimal128Array> {
 
 /// Whether `opt_filter[row]` excludes `row`. A null filter slot excludes the
 /// row, as DataFusion does.
-fn row_is_filtered(opt_filter: Option<&BooleanArray>, row: usize) -> bool {
+pub(crate) fn row_is_filtered(opt_filter: Option<&BooleanArray>, row: usize) -> bool {
     match opt_filter {
         None => false,
         Some(filter) => filter.is_null(row) || !filter.value(row),
