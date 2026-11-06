@@ -1856,8 +1856,8 @@ fn lock_scratch_dir(scratch_dir: &std::path::Path) -> Result<()> {
 
 /// One merge unit's scratch subdirectory. [`Self::close`] wipes and removes it
 /// on the blocking pool once the merge returns, success or error; dropping an
-/// unclosed unit, a merge future dropped mid-await, does the same, on the
-/// blocking pool when a runtime is current (ADR-3853 D2).
+/// unclosed unit, a merge future dropped mid-await, does the same inline
+/// (ADR-3853 D2).
 struct ScratchUnit {
     store: Arc<ScratchStore>,
     closed: bool,
@@ -1909,18 +1909,10 @@ fn remove_scratch_unit(store: &ScratchStore) {
 
 impl Drop for ScratchUnit {
     fn drop(&mut self) {
-        if self.closed {
-            return;
-        }
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => {
-                let store = Arc::clone(&self.store);
-                let dispatch = tracing::dispatcher::get_default(Clone::clone);
-                drop(runtime.spawn_blocking(move || {
-                    tracing::dispatcher::with_default(&dispatch, || remove_scratch_unit(&store))
-                }));
-            }
-            Err(_) => remove_scratch_unit(&self.store),
+        // A dropped merge cannot await the blocking pool, and its scratch must
+        // be gone when the drop returns.
+        if !self.closed {
+            remove_scratch_unit(&self.store);
         }
     }
 }
