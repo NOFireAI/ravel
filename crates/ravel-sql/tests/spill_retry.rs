@@ -245,9 +245,9 @@ fn aggregate_limits(plan: &Arc<dyn ExecutionPlan>) -> Vec<usize> {
 /// where the column-statistics load is charged; it returns the same rows; and
 /// it takes no spill retry and creates no scratch directory.
 ///
-/// Prove-the-test: make the first attempt's `wants_spill_gate` read
-/// `config.spill` and the column-statistics decision reads the tie-ordered
-/// plan, so the plan phase's requests differ.
+/// Prove-the-test: bind `SpillAttempt::First` to `config.spill.as_ref()` in
+/// `plan_pinned_with` and the first attempt plans the repartition-free
+/// spill-enabled aggregate, so the plan text differs from the control's.
 #[tokio::test]
 async fn a_statement_that_fits_runs_its_first_attempt_as_if_spill_were_off() {
     let scratch = tempfile::tempdir().expect("scratch root");

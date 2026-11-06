@@ -1730,10 +1730,16 @@ const RESERVE_AHEAD_QUERY_BYTES: usize = 256 * 1024 * 1024;
 /// run's rows. With spill off the same budget fails the statement with the
 /// reserve-ahead refusal.
 ///
-/// Prove-the-test: drop the `self.spill_headroom.is_some() &&
-/// consumer.can_spill()` early return from the reserve-ahead refusal in
-/// `memory.rs` and the spill-configured run fails with the reserve-ahead
-/// refusal on its retry as well.
+/// This test does not pin the spill-mode branch of the reserve-ahead refusal
+/// in `memory.rs`: DataFusion's aggregate spills on any `ResourcesExhausted`
+/// once a disk manager is configured, so the retry spills and answers with
+/// either message. The unit test
+/// `a_spill_mode_reserve_ahead_refusal_of_a_spillable_aggregate_is_a_spill_trigger`
+/// pins that branch.
+///
+/// Prove-the-test: make `spill_retry_decision` read no `ResourcesExhausted`
+/// as a memory refusal and the spill-configured run fails with the
+/// reserve-ahead refusal instead of retrying.
 #[tokio::test]
 async fn a_reserve_ahead_refusal_of_a_spillable_aggregate_spills_on_the_retry() {
     let sql = "SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b ORDER BY c DESC LIMIT 10";
