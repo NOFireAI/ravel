@@ -2660,7 +2660,8 @@ mod tests {
             message,
             "host memory gate refused the reservation: host available memory 1000 bytes \
              is below the 4000 byte floor (requested 500; tenant reserved 500 of tenant \
-             limit 600)"
+             limit 600); asked by tenant (can_spill=false) for 500 bytes; top holders: none; \
+             non-spillable consumers hold 0 bytes; process aggregate envelope 0 bytes"
         );
         assert!(
             !message.contains("exceeds process limit"),
@@ -2713,7 +2714,9 @@ mod tests {
         assert_eq!(
             message,
             "process memory budget exhausted: 50 more bytes on top of 60 already reserved \
-             exceeds process limit 100 (tenant reserved 50 of tenant limit 60)",
+             exceeds process limit 100 (tenant reserved 50 of tenant limit 60); asked by \
+             tenant-b (can_spill=false) for 50 bytes; top holders: none; non-spillable \
+             consumers hold 0 bytes; process aggregate envelope 0 bytes",
             "the tenant figure is read before the rollback, so it names what B held \
              when it was refused, not what it holds after the refused charge came back"
         );
@@ -3941,5 +3944,319 @@ mod tests {
         res.shrink(N - 1);
         assert_eq!(pool.asked_used.load(Ordering::Acquire), 0);
         assert_eq!(pool.peak_asked_bytes(), N as u64);
+    }
+
+    /// A reserve-ahead that charges one to one and gives every building
+    /// aggregate an envelope of its asked size, so envelope figures in the
+    /// attribution and spill-cap tests are the asked bytes themselves.
+    const ENVELOPE_AS_ASKED: AggregateReserveAhead = AggregateReserveAhead {
+        envelope_size_factor: 1.0,
+        ..AggregateReserveAhead::OFF
+    };
+
+    /// A pool capped at `query_limit` over a tenant and process budget of
+    /// `process_limit` bytes each.
+    fn attributed_pool(
+        query_limit: usize,
+        process_limit: u64,
+        reserve_ahead: AggregateReserveAhead,
+    ) -> (Arc<MemoryBudget>, Arc<TenantDelegatingPool>) {
+        let budget = Arc::new(MemoryBudget::new(process_limit));
+        let tenant = TenantMemoryAccountant::with_process_budget(1 << 30, Arc::clone(&budget));
+        let pool = TenantDelegatingPool::new(
+            query_limit,
+            tenant,
+            CeilingBreach::new(),
+            QueryAccounting::new(),
+        )
+        .with_aggregate_reserve_ahead(reserve_ahead, NonZeroUsize::MIN);
+        (budget, Arc::new(pool))
+    }
+
+    fn consumer_on(
+        pool: &Arc<TenantDelegatingPool>,
+        name: &str,
+        can_spill: bool,
+    ) -> MemoryReservation {
+        let pool: Arc<dyn MemoryPool> = Arc::clone(pool) as Arc<dyn MemoryPool>;
+        MemoryConsumer::new(name)
+            .with_can_spill(can_spill)
+            .register(&pool)
+    }
+
+    fn refusal_text(error: DataFusionError) -> String {
+        match error {
+            DataFusionError::ResourcesExhausted(message) => message,
+            other => panic!("a memory refusal must stay a ResourcesExhausted; got {other:?}"),
+        }
+    }
+
+    /// Issue #3899 (a): a query-pool refusal names the asker with its
+    /// can_spill flag and the bytes it asked, the three largest holders with
+    /// their bytes, the non-spillable total and the process aggregate
+    /// envelope, after the unchanged leading text.
+    ///
+    /// FLIP: `ledger.top_holders(0)` in `attribution` reads "top holders:
+    /// none" and the assertion fails.
+    #[test]
+    fn a_query_pool_refusal_names_the_asker_the_holders_and_the_envelope() {
+        let _serial = envelope_tests();
+        let (budget, pool) = attributed_pool(1000, 1 << 30, ENVELOPE_AS_ASKED);
+        let sorter = consumer_on(&pool, "ExternalSorter[0]", false);
+        let exchange = consumer_on(&pool, "RepartitionExec[1]", true);
+        let partial = consumer_on(&pool, "PartialHashAggregateStream[0]", true);
+        let merge = consumer_on(&pool, "SortPreservingMergeExec[0]", false);
+        sorter.try_grow(400).expect("within every ceiling");
+        exchange.try_grow(250).expect("within every ceiling");
+        partial.try_grow(150).expect("within every ceiling");
+        merge.try_grow(100).expect("within every ceiling");
+        assert_eq!(envelope_on_budget(&budget), 150);
+
+        let join = consumer_on(&pool, "HashJoinInput[0]", false);
+        let message = refusal_text(join.try_grow(101).expect_err("1001 exceeds the limit"));
+        assert_eq!(
+            message,
+            "query memory pool exhausted: 101 more bytes on top of 900 already reserved \
+             exceeds per-query limit 1000; asked by HashJoinInput[0] (can_spill=false) for 101 \
+             bytes; top holders: ExternalSorter[0] 400 bytes, RepartitionExec[1] 250 bytes, \
+             PartialHashAggregateStream[0] 150 bytes; non-spillable consumers hold 500 bytes; \
+             process aggregate envelope 150 bytes"
+        );
+        assert!(pool.refused());
+        assert_eq!(pool.peak_non_spillable_bytes(), 500);
+    }
+
+    /// The peak non-spillable figure is a high-water mark that counts held
+    /// bytes: a held shrink keeps them in it, a released one takes them out
+    /// of the live total but not the peak.
+    #[test]
+    fn the_peak_non_spillable_bytes_count_held_bytes_and_never_fall() {
+        let ledgers = Ledgers::holding();
+        let held = ledgers.register(AGGREGATE);
+        let spills = ledgers.register_consumer(MemoryConsumer::new("Spills").with_can_spill(true));
+        held.try_grow(1000).expect("within every ceiling");
+        spills.try_grow(5000).expect("within every ceiling");
+        held.shrink(800);
+        assert_eq!(ledgers.pool.held_bytes(), 800);
+        assert_eq!(ledgers.pool.consumers_ledger().non_spillable, 1000);
+        assert_eq!(ledgers.pool.consumers_ledger().spillable, 5000);
+        drop(held);
+        assert_eq!(ledgers.pool.consumers_ledger().non_spillable, 0);
+        assert_eq!(ledgers.pool.peak_non_spillable_bytes(), 1000);
+    }
+
+    /// Issue #3899 (b): `refused()` is set by each of the four refusal kinds,
+    /// every one of which carries the attribution, and stays false after
+    /// grows that were never refused, the overshooting infallible `grow`
+    /// included.
+    ///
+    /// FLIP: set the flag only in `try_charge_unflagged`'s query-pool
+    /// `map_err` (and not in `try_charge`); the process case fails.
+    #[test]
+    fn refused_is_set_by_each_refusal_kind_and_by_nothing_else() {
+        let _serial = envelope_tests();
+        let query = {
+            let (_, pool) = attributed_pool(100, 1 << 30, AggregateReserveAhead::OFF);
+            let res = consumer_on(&pool, "ExternalSorter[0]", false);
+            (pool, res.try_grow(101))
+        };
+        let tenant = {
+            let tenant = TenantMemoryAccountant::new(100);
+            let pool = Arc::new(TenantDelegatingPool::new(
+                1 << 30,
+                tenant,
+                CeilingBreach::new(),
+                QueryAccounting::new(),
+            ));
+            let res = consumer_on(&pool, "ExternalSorter[0]", false);
+            (pool, res.try_grow(101))
+        };
+        let process = {
+            let (_, pool) = attributed_pool(1 << 30, 100, AggregateReserveAhead::OFF);
+            let res = consumer_on(&pool, "ExternalSorter[0]", false);
+            (pool, res.try_grow(101))
+        };
+        let reserve_ahead = {
+            let doubling = AggregateReserveAhead {
+                envelope_size_factor: 2.0,
+                ..AggregateReserveAhead::OFF
+            };
+            let (_, pool) = attributed_pool(1 << 30, 1000, doubling);
+            let sorter = consumer_on(&pool, "ExternalSorter[0]", false);
+            sorter.try_grow(500).expect("within every ceiling");
+            let partial = consumer_on(&pool, "PartialHashAggregateStream[0]", true);
+            // An envelope of 600 does not fit the 500 the process has left.
+            let refused = partial.try_grow(300);
+            drop(sorter);
+            (pool, refused)
+        };
+        for (kind, (pool, outcome), leading) in [
+            ("query", query, "query memory pool exhausted: "),
+            ("tenant", tenant, "tenant memory budget exhausted: "),
+            ("process", process, "process memory budget exhausted: "),
+            (
+                "reserve-ahead",
+                reserve_ahead,
+                "aggregate reserve-ahead refused: ",
+            ),
+        ] {
+            let message = refusal_text(outcome.expect_err(kind));
+            assert!(message.starts_with(leading), "{kind}: {message}");
+            assert!(
+                message.contains("; asked by ") && message.contains("; top holders: "),
+                "{kind}: {message}"
+            );
+            assert!(pool.refused(), "{kind} refusal sets refused()");
+        }
+
+        let (_, pool) = attributed_pool(100, 1 << 30, AggregateReserveAhead::OFF);
+        let res = consumer_on(&pool, "ExternalSorter[0]", false);
+        res.try_grow(100).expect("within every ceiling");
+        res.grow(50);
+        assert_eq!(pool.reserved(), 150, "the infallible grow overshot the limit");
+        assert!(!pool.refused(), "no grow was refused");
+    }
+
+    /// Issue #3899 (c): with `L = 1000` and `H = 100`, a spill-capable
+    /// consumer is refused as a spill trigger at 901 bytes, while a consumer
+    /// that cannot spill still grows the query to 1000. A spill-cap refusal
+    /// is counted and does not set `refused()`. Without the margin, the same
+    /// spill-capable consumer reaches 1000.
+    #[test]
+    fn spill_mode_caps_spillable_consumers_a_margin_below_the_limit() {
+        let _serial = envelope_tests();
+        let (_, pool) = attributed_pool(1000, 1 << 30, AggregateReserveAhead::OFF);
+        let pool = Arc::new(
+            Arc::into_inner(pool)
+                .expect("one owner")
+                .with_spill_margin(100),
+        );
+        assert_eq!(pool.spill_cap(), Some(900));
+        let exchange = consumer_on(&pool, "RepartitionExec[0]", true);
+        exchange.try_grow(900).expect("900 is the spill cap");
+        let message = refusal_text(exchange.try_grow(1).expect_err("901 is over the cap"));
+        assert_eq!(
+            message,
+            "query memory spill cap reached: 1 more bytes would bring the spill-capable \
+             consumers to 901 bytes with 0 bytes of envelopes, over the spill cap 900 of \
+             per-query limit 1000; asked by RepartitionExec[0] (can_spill=true) for 1 bytes; \
+             top holders: RepartitionExec[0] 900 bytes; non-spillable consumers hold 0 bytes; \
+             process aggregate envelope 0 bytes"
+        );
+        assert_eq!(pool.spill_cap_refusals(), 1);
+        assert!(!pool.refused(), "a spill trigger is not a memory refusal");
+
+        let sorter = consumer_on(&pool, "ExternalSorter[0]", false);
+        sorter.try_grow(100).expect("a non-spillable consumer grows to L");
+        assert_eq!(pool.reserved(), 1000);
+
+        let (_, alone) = attributed_pool(1000, 1 << 30, AggregateReserveAhead::OFF);
+        let alone = Arc::new(
+            Arc::into_inner(alone)
+                .expect("one owner")
+                .with_spill_margin(100),
+        );
+        let sorter = consumer_on(&alone, "ExternalSorter[0]", false);
+        sorter
+            .try_grow(1000)
+            .expect("the margin does not cap a non-spillable consumer");
+        assert_eq!(alone.reserved(), 1000);
+
+        for can_spill in [true, false] {
+            let (_, default) = attributed_pool(1000, 1 << 30, AggregateReserveAhead::OFF);
+            assert_eq!(default.spill_cap(), None);
+            let res = consumer_on(&default, "RepartitionExec[0]", can_spill);
+            res.try_grow(1000)
+                .expect("the default pool caps nobody below L");
+            assert_eq!(default.reserved(), 1000, "can_spill={can_spill}");
+            assert_eq!(default.spill_cap_refusals(), 0);
+        }
+    }
+
+    /// Issue #3899 (c), the envelope half: a spill-capable aggregate's own
+    /// next envelope counts against `L - H`. At 450 asked its 450 charged and
+    /// 450 of envelope fill the cap of 900; one byte more is 451 + 451.
+    ///
+    /// FLIP: drop `.saturating_add(envelopes)` from `would` in
+    /// `check_spill_cap`; the second grow is accepted and this fails.
+    #[test]
+    fn a_spillable_aggregates_own_envelope_counts_inside_the_spill_cap() {
+        let _serial = envelope_tests();
+        let (_, pool) = attributed_pool(1000, 1 << 30, ENVELOPE_AS_ASKED);
+        let pool = Arc::new(
+            Arc::into_inner(pool)
+                .expect("one owner")
+                .with_spill_margin(100),
+        );
+        let partial = consumer_on(&pool, "PartialHashAggregateStream[0]", true);
+        partial.try_grow(450).expect("450 + 450 is the cap");
+        let message = refusal_text(partial.try_grow(1).expect_err("451 + 451 is over the cap"));
+        assert!(
+            message.starts_with(
+                "query memory spill cap reached: 1 more bytes would bring the spill-capable \
+                 consumers to 902 bytes with 451 bytes of envelopes, over the spill cap 900"
+            ),
+            "{message}"
+        );
+        assert_eq!(pool.reserved(), 450, "the refused grow charged nothing");
+        assert!(!pool.refused());
+    }
+
+    /// Issue #3899 (d): another spill-capable consumer's envelope counts
+    /// inside `L - H`, and a non-spillable aggregate's does not.
+    #[test]
+    fn a_spillable_envelope_counts_against_another_spillable_consumer() {
+        let _serial = envelope_tests();
+        let (_, pool) = attributed_pool(1000, 1 << 30, ENVELOPE_AS_ASKED);
+        let pool = Arc::new(
+            Arc::into_inner(pool)
+                .expect("one owner")
+                .with_spill_margin(100),
+        );
+        let partial = consumer_on(&pool, "PartialHashAggregateStream[0]", true);
+        partial.try_grow(300).expect("within the cap");
+        let last = consumer_on(&pool, "FinalHashAggregateStream[0]", false);
+        last.try_grow(50).expect("within every ceiling");
+        let exchange = consumer_on(&pool, "RepartitionExec[0]", true);
+        exchange
+            .try_grow(300)
+            .expect("300 charged + 300 enveloped + 300 is the cap");
+        let message = refusal_text(exchange.try_grow(1).expect_err("one byte over the cap"));
+        assert!(
+            message.starts_with(
+                "query memory spill cap reached: 1 more bytes would bring the spill-capable \
+                 consumers to 901 bytes with 300 bytes of envelopes, over the spill cap 900"
+            ),
+            "{message}"
+        );
+        assert_eq!(pool.reserved(), 650);
+    }
+
+    /// `SqlConfig::query_pool_spill_mode` caps the spill-capable consumers
+    /// `max(64 MiB, 10% of L)` below `L`; `query_pool` caps nothing.
+    #[test]
+    fn the_spill_mode_pool_takes_the_larger_of_the_floor_and_the_share() {
+        for (limit, cap) in [
+            (256 * MIB, 192 * MIB),
+            (1 << 30, (1 << 30) - 107_374_182),
+            (32 * MIB, 0),
+        ] {
+            let config = crate::config::SqlConfig {
+                max_query_bytes: limit,
+                ..crate::config::SqlConfig::default()
+            };
+            let tenant = TenantMemoryAccountant::new(1 << 40);
+            let (pool, _breach) =
+                config.query_pool_spill_mode(Arc::clone(&tenant), QueryAccounting::new());
+            let pool = pool
+                .downcast_ref::<TenantDelegatingPool>()
+                .expect("a TenantDelegatingPool");
+            assert_eq!(pool.spill_cap(), Some(cap), "L = {limit}");
+            let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
+            let pool = pool
+                .downcast_ref::<TenantDelegatingPool>()
+                .expect("a TenantDelegatingPool");
+            assert_eq!(pool.spill_cap(), None);
+        }
     }
 }
