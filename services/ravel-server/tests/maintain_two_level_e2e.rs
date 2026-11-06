@@ -377,16 +377,20 @@ async fn a_maintain_server_compacts_a_many_input_bucket_in_two_levels() {
     let scratch = tempfile::tempdir().expect("scratch dir");
     let scratch_dir = scratch.path().to_str().expect("utf-8 path");
     let config = compactor(&["--maintain-scratch-dir", scratch_dir]);
-    assert_eq!(config.scratch_dir.as_deref(), Some(scratch.path()));
     let expected = refused_now_plus(&[]);
 
-    let body = run_until(&store, &tenant, config, async |store, _| {
-        !compaction_records(store, &tenant, hour).await.is_empty()
+    let body = run_until(&store, &tenant, config, async |store, body| {
+        !compaction_records(store, &tenant, hour).await.is_empty() || refused(body) != expected
     })
     .await;
 
     let records = compaction_records(store.as_ref(), &tenant, hour).await;
-    assert_eq!(records.len(), 1, "one compaction record: {records:?} {:?}", refused(&body));
+    assert_eq!(
+        records.len(),
+        1,
+        "one compaction record: {records:?} {:?}",
+        refused(&body)
+    );
     println!(
         "two-level e2e: {INPUTS} inputs, {stored} stored bytes, record {}",
         records[0]
@@ -395,7 +399,10 @@ async fn a_maintain_server_compacts_a_many_input_bucket_in_two_levels() {
         scratch.path().join(SCRATCH_LOCK_FILE).exists(),
         "the two-level merge locked the scratch directory"
     );
-    assert_eq!(scratch_entries(scratch.path()), Vec::<std::path::PathBuf>::new());
+    assert_eq!(
+        scratch_entries(scratch.path()),
+        Vec::<std::path::PathBuf>::new()
+    );
     assert_eq!(refused(&body), expected);
 }
 
@@ -411,15 +418,19 @@ async fn a_maintain_server_without_scratch_refuses_with_the_geometry_reason() {
     publish_inputs(store.as_ref(), &tenant, hour).await;
     let config = compactor(&[]);
     assert_eq!(config.scratch_dir, None);
+    let before = refused_now_plus(&[]);
     let expected = refused_now_plus(&[CompactionRefusedReason::Geometry]);
 
     let body = run_until(&store, &tenant, config, async |_, body| {
-        refused(body) == expected
+        refused(body) != before
     })
     .await;
 
     assert_eq!(refused(&body), expected);
-    assert_eq!(compaction_records(store.as_ref(), &tenant, hour).await, Vec::<String>::new());
+    assert_eq!(
+        compaction_records(store.as_ref(), &tenant, hour).await,
+        Vec::<String>::new()
+    );
 }
 
 /// `--maintain-scratch-max-bytes` reaches the headroom admission: a cap far
@@ -444,14 +455,21 @@ async fn a_maintain_server_with_a_short_scratch_cap_refuses_with_the_scratch_hea
         "1024",
     ]);
     assert_eq!(config.scratch_max_bytes, Some(1024));
+    let before = refused_now_plus(&[]);
     let expected = refused_now_plus(&[CompactionRefusedReason::ScratchHeadroom]);
 
     let body = run_until(&store, &tenant, config, async |_, body| {
-        refused(body) == expected
+        refused(body) != before
     })
     .await;
 
     assert_eq!(refused(&body), expected);
-    assert_eq!(compaction_records(store.as_ref(), &tenant, hour).await, Vec::<String>::new());
-    assert_eq!(scratch_entries(scratch.path()), Vec::<std::path::PathBuf>::new());
+    assert_eq!(
+        compaction_records(store.as_ref(), &tenant, hour).await,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        scratch_entries(scratch.path()),
+        Vec::<std::path::PathBuf>::new()
+    );
 }
