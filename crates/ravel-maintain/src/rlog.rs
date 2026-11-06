@@ -15109,11 +15109,12 @@ mod tests {
         }
 
         /// ADR-3853 D4 and D3 at the production shape: 32 cores, 4 units of
-        /// 5 GiB at once, 256 MiB run and part targets, the 19,177-input
-        /// bucket. Measured pricing gives each unit 8 workers; ceiling
-        /// pricing leaves no worker count whose run parts fit constraint
-        /// (b), so it falls back to 1. `E` is the core share while final
-        /// parts fit beside level 2's resident side, and 2 when they do not.
+        /// 5 GiB at once or one of 20 GiB, 256 MiB run targets, the
+        /// 19,177-input bucket. Measured pricing gives each unit its whole
+        /// core share, 8 or 32 workers; ceiling pricing leaves no worker
+        /// count whose run parts fit constraint (b), so it falls back to 1.
+        /// `E` is the core share while final parts fit beside level 2's
+        /// resident side, and 2 when they do not.
         #[test]
         fn level1_workers_and_encode_builders_at_the_production_shape() {
             const GIB: u64 = 1 << 30;
@@ -15145,6 +15146,23 @@ mod tests {
             assert_eq!(level1_group_size(29_900_000, TARGET, ceiling, 19_177), 170);
             assert_eq!(priced.run_parts(170), 2_143);
             assert_eq!(derive_level1_workers(&priced, share), 1);
+
+            // One unit of 20 GiB with all 32 cores and 1 GiB final parts.
+            let whole = 20 * GIB;
+            assert_eq!(unit_core_share(32, whole, whole), 32);
+            let at_whole = |per_input: u64, run: u64, block: u64| Level1Shape {
+                ceiling: whole,
+                part_target: GIB,
+                ..shape(per_input, run, block)
+            };
+            let measured = at_whole(6_900_000, 6_000_000, 3_000_000);
+            assert_eq!(level1_group_size(6_900_000, TARGET, whole / 32, 19_177), 58);
+            assert_eq!(measured.run_parts(58), 661);
+            assert_eq!(derive_level1_workers(&measured, 32), 32);
+            let priced = at_whole(29_900_000, 29_000_000, 22_000_000);
+            assert_eq!(level1_group_size(29_900_000, TARGET, whole, 19_177), 709);
+            assert_eq!(priced.run_parts(709), 2_083, "27 runs of 77 parts, 1 of 4");
+            assert_eq!(derive_level1_workers(&priced, 32), 1);
 
             assert_eq!(
                 level2_encode_builders(share, ceiling, 661 * 3_000_000, 32_000_000, TARGET),
