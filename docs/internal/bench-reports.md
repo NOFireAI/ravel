@@ -440,6 +440,210 @@ A small corpus and subject spec for the module's own tests live in
 `crates/ravel-bench/fixtures/string_fingerprint/` (`corpus.txt`,
 `test_subjects.toml`).
 
+## structural_fetch_report and fulltext_sidecar_report
+
+Issue #3711 (ADR-3692 work package 4, Plan row T13): two report-only
+experiments with a pre-registered go/no-go each. Nothing outside
+`ravel-bench` changes; both use the public APIs of `ravel-logseg`,
+`ravel-query` and `ravel-object-store`, and no feature ships.
+
+### Arm 1: structural decode for a journey row fetch
+
+Lance (arXiv:2504.15247) stores small values in independently compressed
+mini-blocks of a few KiB with a per-page index of where each starts, so a
+point lookup reads one mini-block per column instead of a whole page. RLOG
+compresses one page per block per column (8192 rows). The question: for 10
+matched rows of a 10 MiB RLOG object whose block set is already known, does a
+structural read cut wire bytes to 0.25x or less, with GETs at most 1.5x and a
+wall clock no worse, at 30 ms per GET?
+
+Today's side is the production path, run for real: `RlogWriter` writes the
+object into a `MemoryStore` behind `InstrumentedStore` and a 30 ms per-GET
+delay, `plan_segment_routed` plans with the known block set, and
+`scan_accounted_with_tenant_subset_raw` scans every column.
+
+The structural side is a FAITHFUL SIMULATION, not a real decode: no
+structural reader exists. Every real page is decompressed, cut into
+`ceil(stored / mini_block_bytes)` slices, and each slice recompressed on its
+own at the writer's zstd level, so mini-block sizes are measured. A row is
+placed in mini-block `floor(row * chunks / rows)` (`mini_block_of`,
+`structural_fetch.rs:185`), exact for fixed-width columns and proportional
+otherwise; dictionary pages are read whole. The needed ranges are coalesced
+(`coalesce`, `structural_fetch.rs:197`: sort, then merge a range starting at
+most `gap` bytes past the previous end) and issued as real ranged GETs
+against the simulated layout in the same delayed store. The plan is the
+production plan plus 4 bytes of index per mini-block. Decode CPU is
+modelled as today's measured CPU times the structural decompressed bytes over
+today's; structural wall is measured GET time plus that CPU. Both plans
+coalesce at 1,887,437 bytes, the production fetcher's effective gap (its
+request cost); `floor_gap/*` plans the structural read at the 64 KiB floor
+too, planned only, no GETs issued.
+
+### Arm 2: compressed full-text sidecar
+
+LogCloud (PVLDB vol. 18, p. 2362) keeps a compressed full-text index (an
+FM-index) beside each cold log object so a rare-token search reads a small
+index and then only matching rows. This arm measures the simpler member of
+that family RLOG would carry: a row-granular inverted index over the
+production body tokenizer's tokens, in zstd blocks of 64 prefix-shared terms
+with delta-coded row ordinals, plus a block index, the row map (rows per RLOG
+block, `RowMap`, `fulltext_sidecar.rs:176`) and an 8-byte trailer. A probe is
+one 64 KiB suffix GET and one term-block GET; a hit then fetches its rows
+through the production `plan_segment_routed` for the named blocks. The build
+and probe are real, not simulated.
+
+The baselines are the production structures on the same objects: the BLOOM
+section `RlogWriter` wrote, with its verdict through
+`scan_accounted_with_tenant` and `HasWord(body)` over the full time window,
+and a POSTINGS section from the production `encode_postings_section` over body
+tokens to block indices (production builds no body postings; it is what a
+sidecar would replace or stand beside). Every returned row on every path is
+checked against the corpus. Production narrows by BLOOM only at decode, over
+a buffer that already holds every time-candidate block, so its scans move the
+whole object whatever the bloom says (findings c and d below). The decision
+baseline is therefore the bloom-guided route production does not take, a
+simulation of the route with real ranged GETs (`guided_rounds`,
+`fulltext_sidecar.rs:720`): the production suffix probe, then PAGE_DIR and
+BLOOM where the probe missed them, then the pages of the blocks the
+production bloom kept, each round coalesced at the request cost. The two
+production scans are reported beside it.
+
+The 100 GB scale is extrapolated (`extrapolate`, `fulltext_sidecar.rs:503`):
+`S = scale_raw_bytes / (raw_bytes / objects)`; per sampled token, cost =
+`sum(measured cost of each object it occurs in) + (S - those objects) *
+mean miss cost`; the ratio is the mean sidecar cost over the mean bloom cost
+across the 30 tokens. A rare token (at most 3 rows) is assumed to stay that
+rare at scale. Deletion: one row holding a term no other row holds is erased,
+the object rewritten by the production writer, and the sidecar rebuilt (an
+ordinal shift moves every later row, so it cannot be edited in place); the
+erased term must be gone and the next row found at its new place.
+
+### Pre-registration and running it
+
+`crates/ravel-bench/fixtures/t13/subjects.toml` fixes every parameter and a
+prediction with a band, or an unpredicted reason, for every figure of the
+four subjects (HDFS and BGL from LogHub, Zenodo 8196385, one per arm each);
+its header states the basis (a calibration on a generated HDFS-shaped corpus
+scaled to the LogHub line lengths). It was committed alone (8a4ee91 on the
+task branch) before any LogHub run, and no band was edited after it. Each
+binary refuses a `--param` that differs from the file before it reads the
+corpus, prints a stamp (git HEAD, `uname -m`, nproc, memory, corpus name,
+sha256 and bytes, CPU clock), exits 0 in band, 2 on a band miss, 1 on a
+problem, and `--decide` exits 0 for GO and 3 for NO-GO.
+
+```sh
+structural_fetch_report --subject hdfs_structural \
+    --corpus-lines HDFS.log --out hdfs_structural.json
+fulltext_sidecar_report --subject hdfs_sidecar \
+    --corpus-lines HDFS.log --out hdfs_sidecar.json
+structural_fetch_report --decide hdfs_structural.json bgl_structural.json
+fulltext_sidecar_report --decide hdfs_sidecar.json bgl_sidecar.json
+```
+
+### 2026-11-06 run
+
+Outputs, JSON reports and `--decide` output are in
+`crates/ravel-bench/fixtures/t13/run_2026-11-06/`. Host: x86_64, 16 CPUs,
+32 GB, release build.
+
+Structural arm: **NO-GO overall, NO-GO on both subjects.** At the production
+gap the ten target blocks coalesce into one range spanning nearly the whole
+layout, so the structural read moves about as many bytes as today's.
+
+| Figure | hdfs_structural | bgl_structural | Bar |
+|---|---|---|---|
+| object bytes, rows, blocks | 11,101,600, 540,672, 66 | 11,029,764, 573,440, 70 | |
+| today GETs, bytes | 3, 10,647,076 | 2, 11,291,908 | |
+| today decode CPU, wall (ms) | 27.9, 121.2 | 75.8, 138.0 | |
+| structural GETs, bytes | 2, 11,374,888 | 2, 10,025,669 | |
+| structural decompressed bytes | 928,318 of 12,039,421 | 1,129,981 of 11,755,333 | |
+| structural modelled CPU, wall (ms) | 2.15, 64.4 | 7.28, 69.6 | |
+| ratio/bytes | 1.068 FAIL | 0.888 FAIL | <= 0.25 |
+| ratio/gets | 0.667 ok | 1.0 ok | <= 1.5 |
+| ratio/wall | 0.532 ok | 0.504 ok | <= 1 |
+| floor_gap ranges, bytes | 22, 480,525 | 23, 437,519 | report |
+
+Band misses, kept as measured: hdfs `today/bytes` (10,647,076 under
+10,747,904: the routed plan took three GETs and skipped the edge blocks) and
+`today/decode_cpu_ms` (27.9 under 30); bgl `structural/layout_bytes`
+(9,756,688 under 10,485,760: BGL recompresses smaller in 8 KiB mini-blocks),
+and with it `structural/bytes` and `ratio/bytes` (0.888 under 0.9). The
+saving Lance relies on needs a small gap: at the 64 KiB floor the structural
+plan would move 0.045x (HDFS) and 0.039x (BGL) of today's bytes, but in 22
+to 23 data ranges, above the 1.5x GET bar against today's 2 to 3 GETs (planned
+only, so that GET ratio is not a measured figure).
+
+Sidecar arm: **NO-GO overall, NO-GO on both subjects.** The rare-token bytes
+bar holds against the bloom-guided route; the size bar fails on both, and the
+build CPU bar on BGL.
+
+| Figure | hdfs_sidecar | bgl_sidecar | Bar |
+|---|---|---|---|
+| objects, lines, raw bytes | 10, 5,242,880, 729,267,580 | 9, 4,718,592, 738,614,793 | |
+| object bytes, bloom section | 81,283,745, 3,742,284 | 76,898,472, 8,677,394 | |
+| postings bytes, terms | 9,816,814, 1,007,144 | 20,391,383, 4,632,997 | |
+| sidecar bytes, entries | 42,354,324, 98,096,683 | 44,624,476, 109,681,304 | |
+| sidecar/over_postings | 4.31 FAIL | 2.19 FAIL | <= 1.2 |
+| build sidecar, compaction CPU (ms) | 17,527, 14,854 | 32,748, 17,379 | |
+| build/cpu_ratio | 1.18 ok | 1.88 FAIL | <= 1.5 |
+| rewrite amplification | 1.52 | 1.58 | report |
+| rare tokens, rows, candidates | 30, 55, 14,918 | 30, 51, 712,956 | |
+| bloom kept, false positive blocks | 256, 226 | 269, 220 | |
+| measured bloom-guided GETs, bytes | 947, 385,008,908 | 900, 548,689,582 | |
+| measured sidecar GETs, bytes | 630, 283,205,558 | 685, 317,188,706 | |
+| production default GETs, bytes | 300, 2,438,512,350 | 300, 2,314,818,480 | |
+| crossover off GETs, bytes | 300, 2,438,512,350 | 330, 2,314,733,670 | |
+| rare/bytes_ratio_100gb (vs bloom-guided) | 0.0978 ok | 0.0459 ok | <= 0.1 |
+| vs production default path | 0.0140 | 0.0104 | report |
+| rare/gets_ratio_100gb | 0.658 | 0.699 | report |
+| delete rebuild CPU (ms), over compaction | 2,249, 1.50 | 3,075, 1.84 | costed |
+| delete sidecar bytes over object | 0.529 | 0.596 | costed |
+| delete residual terms | 0 ok | 0 ok | <= 0 |
+
+Extrapolation inputs (both measured): HDFS `S = 1e11 / (729,267,580 / 10) =
+1371.24`, mean miss bytes bloom-guided 1,162,157.9, sidecar 107,654.9,
+production default 8,097,652.9, mean miss GETs 3.041 and 2.000, giving
+1,594,808,053 bloom-guided and 155,984,207 sidecar bytes per token. BGL `S =
+1e11 / (738,614,793 / 9) = 1218.50`, miss bytes 1,922,461.3, 80,171.5 and
+8,513,742.2, miss GETs 3.120 and 2.178, giving 2,343,501,109 and 107,540,196.
+The HDFS ratio sits just under its bar. A sidecar hit fetches its rows
+through the production routed plan, which reads the whole object below the
+plan whole-object bound (about 8 MB per matching pair), while the bloom-guided
+route reads only kept pages, so the comparison is conservative against the
+sidecar; misses dominate at scale (at most `(1371.24 - 1) * 107,654.9`, about
+147.5 of 156.0 MB per HDFS token, since every sampled token matches at least
+one object).
+
+Band misses, kept as measured: hdfs `rare/candidates` (14,918: HDFS holds
+far fewer tokens on at most three rows than predicted), `rare/rows` (55),
+`rare/sidecar_bytes` (283,205,558, the whole-object hit fetch above) and
+`rare/bytes_ratio_measured` (0.736); bgl `rare/rows` (51),
+`rare/sidecar_bytes` and `rare/bytes_ratio_measured` (0.578) for the same
+reason, and `rare/default_path_gets` 300 and `rare/no_crossover_gets` 330
+against 270. Those are 270 + 30 and 270 + 2 * 30: one of the nine objects
+is above the plan whole-object bound, the case the registration names.
+
+### Findings outside the experiments
+
+These are production behaviours the measurement ran into; none is changed
+here.
+
+- (a) The production log fetcher's effective coalescing gap is its request
+  cost (`DEFAULT_LOG_REQUEST_COST_BYTES`, 1,887,437 bytes), not the 64 KiB
+  `DEFAULT_LOG_COALESCE_GAP` floor, so ranged plans coalesce across about
+  1.8 MiB holes.
+- (b) For a full-time-window `HasWord` query on an object above the plan
+  whole-object bound, `plan_segment` falls back to a whole-object read.
+- (c) `scan_accounted_with_tenant` with defaults reads the whole object for a
+  rare-token `HasWord`: the 0.75 coverage crossover
+  (`DEFAULT_LOG_COVERAGE_THRESHOLD`) fires on time-only candidates before the
+  bloom is consulted. On the calibration objects one miss cost 2 GETs and
+  12,449,003.6 bytes.
+- (d) With the crossover off (coverage threshold 2.0) the ranged read still
+  fetches every time-candidate block, because BLOOM and POSTINGS arms are
+  resolved only at decode over the fetched buffer; a miss cost 3 GETs and
+  12,446,190 bytes. The bloom saves decode CPU for `HasWord`, never bytes.
+
 ## Selective investigations (benchmarks/investigations)
 
 Issue #3699 (ADR-3692 decision 8, T1). Not a `ravel-bench` report: a box
