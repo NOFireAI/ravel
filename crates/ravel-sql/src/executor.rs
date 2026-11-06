@@ -2960,6 +2960,10 @@ impl SqlExecutor {
                                 }
                                 _ => false,
                             };
+                            eprintln!(
+                                "DEBUGSPILL candidate={candidate} eligible={spill_eligible} retried={spill_retried} refused={} host={} share={:?}",
+                                caps.pool.refused, caps.pool.host_gate, caps.spill_share
+                            );
                             if spill_retry_decision(
                                 &err,
                                 caps.pool,
@@ -5637,7 +5641,10 @@ fn spill_tie_ordered(plan: LogicalPlan, max_limit: Option<usize>) -> LogicalPlan
 /// The memory pool a plan's session gets. A spill retry whose spill is
 /// enabled gets the spill-mode pool, which refuses a spillable consumer
 /// early so it spills and leaves room for the consumers that cannot
-/// (issue #3899); every other plan gets the plain query pool.
+/// (issue #3899); every other plan gets the plain query pool. So does a
+/// retry whose per-query limit is no larger than the spill-mode headroom,
+/// where the spill-mode cap would be zero and no spillable consumer could
+/// hold even the batch it spills.
 fn attempt_pool(
     config: &SqlConfig,
     spill: SpillAttempt,
@@ -5645,8 +5652,13 @@ fn attempt_pool(
     tenant: Arc<TenantMemoryAccountant>,
     accounting: QueryAccounting,
 ) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
+    let spill_mode_cap = config
+        .max_query_bytes
+        .saturating_sub(crate::memory::spill_mode_headroom(config.max_query_bytes));
     match spill {
-        SpillAttempt::Retry if spill_enabled => config.query_pool_spill_mode(tenant, accounting),
+        SpillAttempt::Retry if spill_enabled && spill_mode_cap > 0 => {
+            config.query_pool_spill_mode(tenant, accounting)
+        }
         SpillAttempt::Retry | SpillAttempt::PlanTime | SpillAttempt::First => {
             config.query_pool(tenant, accounting)
         }

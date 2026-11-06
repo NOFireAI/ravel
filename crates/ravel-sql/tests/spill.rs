@@ -746,23 +746,33 @@ async fn an_eligible_aggregation_over_the_scratch_quota_is_spill_budget_exhauste
 
 /// ADR-0954 requirements 3 and 5: an eligible query with spill armed at a
 /// directory that does not exist fails the typed `SpillUnavailable`, raised
-/// before any operator runs, and creates nothing.
+/// before any operator of the spill retry runs, and creates nothing. The
+/// scratch area is created only for the spill retry (issue #3899), so the
+/// query has to be refused once first, and a query that fits never touches
+/// the directory.
 #[tokio::test]
 async fn an_eligible_query_with_a_missing_spill_directory_is_spill_unavailable() {
     let tenant = tenant_id("acme");
-    // Small: the failure is at scratch creation, before planning, so the data
-    // size is irrelevant and a large fixture would only slow the test.
-    let specs = overlapping_series_specs(100, 50);
+    let small = tenant_id("small");
+    let specs = overlapping_series_specs(LONG_ROWS, SHORT_ROWS);
+    let small_specs = overlapping_series_specs(100, 50);
     let root = tempfile::tempdir().expect("scratch root");
     let missing = root.path().join("does-not-exist");
 
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
-        &[(&tenant, &specs)],
+        &[(&tenant, &specs), (&small, &small_specs)],
         spill_config(missing.clone(), AMPLE_SCRATCH_BYTES, TIGHT_QUERY_BYTES),
         1 << 40,
     )
     .await;
+
+    let fits = fixture
+        .executor
+        .execute(small.hash(), &request(SPILLING_SQL))
+        .await
+        .expect("a query that fits runs without the scratch area");
+    assert_eq!(fits.stats.spill_retries, 0);
 
     let err = fixture
         .executor
@@ -1578,6 +1588,12 @@ async fn spilled_and_unlimited(sql: &str) -> (TopTen, TopTen) {
     };
     let unlimited = run_top_ten(&*q33_executor(config(AMPLE_QUERY_BYTES), &file).await, sql).await;
     let budget = usize::try_from(unlimited.peak_pool_bytes / SPILL_BUDGET_DIVISOR).expect("fits");
+    eprintln!("PROBE unlimited peak={}", unlimited.peak_pool_bytes);
+    for num in [50u64, 60, 70, 80, 90, 95] {
+        let b = usize::try_from(unlimited.peak_pool_bytes * num / 100).expect("fits");
+        let r = q33_executor(config(b), &file).await.execute(q33_tenant(), &request(sql)).await;
+        eprintln!("PROBE {num}% ok={} retries={:?} err={:?}", r.is_ok(), r.as_ref().map(|o| (o.stats.spill_retries, o.stats.spill.files)).ok(), r.as_ref().err().map(|e| e.to_string().chars().take(120).collect::<String>()));
+    }
     let spilled = run_top_ten(&*q33_executor(config(budget), &file).await, sql).await;
     eprintln!(
         "issue #3899: unlimited peak={} budget={budget} spill files={} rows_written={}",
