@@ -1863,6 +1863,9 @@ cold_ravel_diagnostic() {
   local dir="${out_dir}/cold-ravel-diagnostic" ids id r code why line
   local runs="${out_dir}/cold-ravel-diagnostic/runs.json"
   mkdir -p "$dir" || { stamp_str cold_ravel_diagnostic "failed: cannot create $dir"; return 0; }
+  # cold-record appends to runs.json; a reused out-dir would otherwise carry a
+  # previous pass's records into cold-final, which refuses duplicates.
+  rm -f "$runs"
   code=0
   ids="$(py cold-select "$CORPUS" "$profile" "$dir" "$COLD_EXTRA_ENTRY")" || code=$?
   if [ "$code" -eq 3 ]; then
@@ -1884,8 +1887,11 @@ cold_ravel_diagnostic() {
       why=""
       if [ "$code" -ne 0 ]; then
         why="metricsbench_report provenance exited ${code}"
-      elif ! compose restart ravel-server >>"${dir}/restart.log" 2>&1; then
-        why="docker compose restart ravel-server failed"
+      elif ! compose restart --no-deps ravel-server >>"${dir}/restart.log" 2>&1; then
+        # Without --no-deps, compose restart also bounces ravel-server's
+        # dependency chain (ravel-qualify, createbuckets, s3s), and the cold
+        # figure would include an object-store restart.
+        why="docker compose restart --no-deps ravel-server failed"
       elif ! ravel_ready_nonfatal; then
         why="ravel did not answer 200 after the restart"
       fi

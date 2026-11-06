@@ -765,7 +765,10 @@ verification (step 6), after which the run goes on as a diagnostic:
     `cold_ravel_diagnostic` `not applicable` with the corpus path and
     restarts nothing (cases x, y3); a corpus the pass cannot load is stamped
     `failed: ...` instead (case y7). For each entry, five times,
-    `docker compose restart ravel-server` runs, Ravel answers 200 on
+    `docker compose restart --no-deps ravel-server` runs (`--no-deps` keeps
+    the restart to ravel-server alone; without it compose also restarts
+    ravel-qualify, createbuckets and s3s, and the cold figure would include an
+    object-store restart), Ravel answers 200 on
     `/api/v1/status/buildinfo` again, and `metricsbench_query` runs once
     (`--warmup-passes 0 --passes 1 --reps-per-pass 1`) against a corpus file
     holding that entry alone, with Prometheus as the oracle it requires and
