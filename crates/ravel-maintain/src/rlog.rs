@@ -15024,6 +15024,144 @@ mod tests {
             assert!(writes[0].1 != writes[1].1, "{writes:?}");
         }
 
+        /// ADR-3853 D4: level 1 split over 4 workers, each with its own
+        /// tracker under `U / 4`, publishes the bytes, keys and content
+        /// hashes one worker does, and so the single-level ones. Each
+        /// worker's peak is its own: no higher than one worker merging the
+        /// same groups alone under `U / 4` peaks at, and the highest equal to
+        /// it. So each stays under its ceiling and their sum under `U`.
+        #[tokio::test]
+        async fn parallel_groups_emit_the_serial_two_level_bytes() {
+            let (oracle, _, per_input) = single_level_oracle().await;
+            let run_target = 5 * per_input;
+            let ceiling = group_ceiling(per_input, TWO_LEVEL_RUN_PER_INPUTS * per_input, 12);
+            let worker_ceiling = ceiling / 4;
+
+            // One worker under U / 4 merges the 8 groups the 4 workers share
+            // out, then level 2 does not fit that ceiling.
+            let dir = fresh_scratch("parallel-alone");
+            let config = CompactorConfig {
+                level1_workers: Some(1),
+                ..two_level_config(worker_ceiling, run_target, Some(dir.clone()))
+            };
+            let (outcome, alone, _, _) = compact_two_level(&config).await;
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(CompactionOutcome::TwoLevelUnsupported {
+                        check: crate::error::TwoLevelCheck::LevelTwoFit { .. },
+                        ..
+                    })
+                ),
+                "{outcome:?}"
+            );
+            assert_eq!(alone.report.level1_groups, 8, "{:?}", alone.report);
+            let alone_peaks = alone.tracker.level1_worker_peak_bytes();
+            assert_eq!(alone_peaks.len(), 1, "{alone_peaks:?}");
+            let alone_peak = alone_peaks[0];
+
+            let mut outputs = Vec::new();
+            for (workers, group_size, groups) in [(1usize, 47u64, 2u64), (4, 8, 8)] {
+                let dir = fresh_scratch(&format!("parallel-{workers}"));
+                let config = CompactorConfig {
+                    level1_workers: Some(workers),
+                    ..two_level_config(ceiling, run_target, Some(dir.clone()))
+                };
+                let (outcome, run, store, _) = compact_two_level(&config).await;
+                outcome.unwrap_or_else(|e| panic!("{workers} workers: {e}"));
+                let line = run.line("rlog two-level merge");
+                assert_eq!(log_field(&line, "level1_workers"), workers as u64, "{line}");
+                assert_eq!(log_field(&line, "group_size"), group_size, "{line}");
+                assert_eq!(run.report.level1_groups, groups, "{:?}", run.report);
+                assert_eq!(run.report.level1_workers, workers as u64);
+                let peaks = run.tracker.level1_worker_peak_bytes();
+                assert_eq!(peaks.len(), workers, "{peaks:?}");
+                assert!(peaks.iter().all(|p| *p > 0), "{peaks:?}");
+                if workers == 4 {
+                    assert_eq!(
+                        log_field(&line, "level1_ceiling_bytes"),
+                        worker_ceiling,
+                        "{line}"
+                    );
+                    assert!(
+                        peaks.iter().all(|p| *p <= alone_peak),
+                        "{peaks:?} against {alone_peak} alone"
+                    );
+                    assert_eq!(peaks.iter().max(), Some(&alone_peak), "{peaks:?}");
+                    assert!(
+                        peaks.iter().all(|p| *p < worker_ceiling),
+                        "{peaks:?} against {worker_ceiling}"
+                    );
+                    let summed: u64 = peaks.iter().sum();
+                    assert!(summed < 4 * worker_ceiling, "{summed} against {ceiling}");
+                }
+                assert!(scratch_entries(&dir).is_empty(), "{workers} workers");
+                outputs.push(published(&store).await);
+            }
+            assert_eq!(outputs[0].0, outputs[1].0, "part keys");
+            assert!(outputs[0].1.hashes == outputs[1].1.hashes, "content hashes");
+            assert!(outputs[0].1.parts == outputs[1].1.parts, "part bytes");
+            assert_eq!(outputs[1].0, oracle.0, "single-level part keys");
+            assert!(outputs[1].1 == oracle.1, "single-level parts");
+        }
+
+        /// ADR-3853 D4 and D3 at the production shape: 32 cores, 4 units of
+        /// 5 GiB at once, 256 MiB run and part targets, the 19,177-input
+        /// bucket. Measured pricing gives each unit 8 workers; ceiling
+        /// pricing leaves no worker count whose run parts fit constraint
+        /// (b), so it falls back to 1. `E` is the core share while final
+        /// parts fit beside level 2's resident side, and 2 when they do not.
+        #[test]
+        fn level1_workers_and_encode_builders_at_the_production_shape() {
+            const GIB: u64 = 1 << 30;
+            const TARGET: u64 = 256 << 20;
+            let ceiling = 5 * GIB;
+            let share = unit_core_share(32, 4 * ceiling, ceiling);
+            assert_eq!(share, 8);
+            assert_eq!(unit_core_share(32, 20 * GIB, 64 << 20), 1);
+            let shape = |per_input: u64, run: u64, block: u64| Level1Shape {
+                per_input,
+                run_bytes: vec![run; 19_177],
+                block_bytes: block,
+                in_flight: 32_000_000,
+                run_target: TARGET,
+                part_target: TARGET,
+                ceiling,
+            };
+
+            let measured = shape(6_900_000, 6_000_000, 3_000_000);
+            assert_eq!(
+                level1_group_size(6_900_000, TARGET, ceiling / 8, 19_177),
+                58
+            );
+            assert_eq!(measured.run_parts(58), 661, "330 runs of 2 parts, 1 of 1");
+            assert_eq!(derive_level1_workers(&measured, share), 8);
+            assert_eq!(derive_level1_workers(&measured, 1), 1);
+
+            let priced = shape(29_900_000, 29_000_000, 22_000_000);
+            assert_eq!(level1_group_size(29_900_000, TARGET, ceiling, 19_177), 170);
+            assert_eq!(priced.run_parts(170), 2_143);
+            assert_eq!(derive_level1_workers(&priced, share), 1);
+
+            assert_eq!(
+                level2_encode_builders(share, ceiling, 661 * 3_000_000, 32_000_000, TARGET),
+                8
+            );
+            assert_eq!(
+                level2_encode_builders(share, ceiling, 113 * 22_000_000, 32_000_000, TARGET),
+                8
+            );
+            assert_eq!(
+                level2_encode_builders(share, ceiling, 230 * 22_000_000, 32_000_000, TARGET),
+                2
+            );
+            assert_eq!(
+                level2_encode_builders(1, ceiling, 0, 0, TARGET),
+                2,
+                "never under 2"
+            );
+        }
+
         /// With no scratch directory the two-level route is closed and the
         /// D0 refusal stands, unchanged.
         #[tokio::test]
