@@ -41,3 +41,7 @@ graft/
 # the watchdog marker above: commit-on-death must not sweep them in.
 .gate-logs/
 .dd-tools/
+# SQL spill scratch. A ravel-server with no spill configuration spills under
+# <working directory>/sql-spill, so server tests run from a crate directory
+# leave per-instance directories there.
+sql-spill/
