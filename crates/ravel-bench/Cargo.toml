@@ -430,6 +430,16 @@ path = "src/bin/string_fingerprint_report.rs"
 bench = false
 
 [[bin]]
+name = "structural_fetch_report"
+path = "src/bin/structural_fetch_report.rs"
+bench = false
+
+[[bin]]
+name = "fulltext_sidecar_report"
+path = "src/bin/fulltext_sidecar_report.rs"
+bench = false
+
+[[bin]]
 name = "parquet_baseline"
 path = "src/bin/parquet_baseline.rs"
 required-features = ["parquet-baseline"]

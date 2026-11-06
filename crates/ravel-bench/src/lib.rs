@@ -30,6 +30,7 @@ pub mod cost_regression;
 pub mod cost_report_source;
 pub mod distrib_crossover;
 pub mod e2e;
+pub mod fulltext_sidecar;
 pub mod generator;
 pub mod get_latency;
 #[cfg(feature = "sql-latency")]
@@ -71,6 +72,8 @@ pub mod sql_corpus;
 pub mod sql_latency;
 pub mod string_fingerprint;
 pub mod string_fingerprint_report;
+pub mod structural_fetch;
+pub mod t13;
 pub mod value_shapes;
 #[cfg(feature = "walk-expiry")]
 pub mod walk_expiry;

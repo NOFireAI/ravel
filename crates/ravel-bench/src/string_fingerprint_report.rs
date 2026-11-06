@@ -225,7 +225,7 @@ pub fn refuse_param_drift(spec: &SubjectSpec, o: &Overrides) -> Result<(), Strin
     }
 }
 
-fn command_out(cmd: &str, args: &[&str]) -> String {
+pub(crate) fn command_out(cmd: &str, args: &[&str]) -> String {
     std::process::Command::new(cmd)
         .args(args)
         .output()
@@ -237,7 +237,7 @@ fn command_out(cmd: &str, args: &[&str]) -> String {
         )
 }
 
-fn mem_total_kib() -> u64 {
+pub(crate) fn mem_total_kib() -> u64 {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|m| {
