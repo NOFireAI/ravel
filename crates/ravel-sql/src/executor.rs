@@ -2960,10 +2960,6 @@ impl SqlExecutor {
                                 }
                                 _ => false,
                             };
-                            eprintln!(
-                                "DEBUGSPILL candidate={candidate} eligible={spill_eligible} retried={spill_retried} refused={} host={} share={:?}",
-                                caps.pool.refused, caps.pool.host_gate, caps.spill_share
-                            );
                             if spill_retry_decision(
                                 &err,
                                 caps.pool,

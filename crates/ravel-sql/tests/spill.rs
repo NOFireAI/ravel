@@ -1329,6 +1329,7 @@ struct TopTen {
     batches: Vec<RecordBatch>,
     spill_files: u64,
     spill_rows_written: u64,
+    spill_retries: u32,
     peak_pool_bytes: u64,
 }
 
@@ -1390,6 +1391,7 @@ async fn run_top_ten(executor: &ravel_sql::SqlExecutor, sql: &str) -> TopTen {
         batches: outcome.output.batches().to_vec(),
         spill_files: outcome.stats.spill.files,
         spill_rows_written: outcome.stats.spill.rows_written,
+        spill_retries: outcome.stats.spill_retries,
         peak_pool_bytes: outcome.accounting.peak_intermediate_bytes,
     }
 }
@@ -1566,16 +1568,20 @@ async fn a_statement_the_rewrite_cannot_apply_to_runs_with_spill_disabled() {
     );
 }
 
-/// The per-query pool the spilling run of [`spilled_and_unlimited`] gets, as
-/// a fraction of the unlimited run's measured peak: half, for the reason
-/// [`spilled_and_in_memory`] gives.
-const SPILL_BUDGET_DIVISOR: u64 = 2;
+/// The per-query pool the spilling run of [`spilled_and_unlimited`] gets, in
+/// percent of the unlimited run's measured peak. The unlimited run is a first
+/// attempt, planned without spill and with repartitioning, and peaks lower
+/// than the repartition-free retry plan the spilling run answers on
+/// (measured for the `min`/`max`/`avg` statement: 35,732,780 against
+/// 44,482,860 bytes). 60 percent of the first is about half of the second,
+/// the fraction [`spilled_and_in_memory`] explains.
+const SPILL_BUDGET_PERCENT: u64 = 60;
 
 /// Run `sql` over the q33 table under [`AMPLE_QUERY_BYTES`], a pool no run
-/// over this fixture approaches, and again under a pool of the first run's
-/// peak divided by [`SPILL_BUDGET_DIVISOR`]. Asserts that the first run did
-/// not spill and the second did (files and rows written both nonzero), and
-/// returns `(spilled, unlimited)`.
+/// over this fixture approaches, and again under a pool of
+/// [`SPILL_BUDGET_PERCENT`] of the first run's peak. Asserts that the first
+/// run did not spill and the second did (files and rows written both
+/// nonzero) on its one spill retry, and returns `(spilled, unlimited)`.
 async fn spilled_and_unlimited(sql: &str) -> (TopTen, TopTen) {
     let file = q33_parquet();
     let scratch = tempfile::tempdir().expect("scratch root");
@@ -1587,27 +1593,30 @@ async fn spilled_and_unlimited(sql: &str) -> (TopTen, TopTen) {
         )
     };
     let unlimited = run_top_ten(&*q33_executor(config(AMPLE_QUERY_BYTES), &file).await, sql).await;
-    let budget = usize::try_from(unlimited.peak_pool_bytes / SPILL_BUDGET_DIVISOR).expect("fits");
-    eprintln!("PROBE unlimited peak={}", unlimited.peak_pool_bytes);
-    for num in [50u64, 60, 70, 80, 90, 95] {
-        let b = usize::try_from(unlimited.peak_pool_bytes * num / 100).expect("fits");
-        let r = q33_executor(config(b), &file).await.execute(q33_tenant(), &request(sql)).await;
-        eprintln!("PROBE {num}% ok={} retries={:?} err={:?}", r.is_ok(), r.as_ref().map(|o| (o.stats.spill_retries, o.stats.spill.files)).ok(), r.as_ref().err().map(|e| e.to_string().chars().take(120).collect::<String>()));
-    }
+    let budget = usize::try_from(unlimited.peak_pool_bytes * SPILL_BUDGET_PERCENT / 100)
+        .expect("fits");
     let spilled = run_top_ten(&*q33_executor(config(budget), &file).await, sql).await;
     eprintln!(
         "issue #3899: unlimited peak={} budget={budget} spill files={} rows_written={}",
         unlimited.peak_pool_bytes, spilled.spill_files, spilled.spill_rows_written
     );
     assert_eq!(
-        (unlimited.spill_files, unlimited.spill_rows_written),
-        (0, 0),
+        (
+            unlimited.spill_files,
+            unlimited.spill_rows_written,
+            unlimited.spill_retries
+        ),
+        (0, 0, 0),
         "the unlimited run must not spill"
+    );
+    assert_eq!(
+        spilled.spill_retries, 1,
+        "the spilling run answers on its one spill retry"
     );
     assert!(
         spilled.spill_files > 0 && spilled.spill_rows_written > 0,
-        "under a pool of 1/{SPILL_BUDGET_DIVISOR} of its peak the statement must spill: \
-         files={} rows_written={}",
+        "under a pool of {SPILL_BUDGET_PERCENT} percent of its peak the statement must \
+         spill: files={} rows_written={}",
         spilled.spill_files,
         spilled.spill_rows_written
     );
@@ -1624,7 +1633,7 @@ async fn spilled_and_unlimited(sql: &str) -> (TopTen, TopTen) {
 ///
 /// Prove-the-test: take `min` out of `aggregate_expr_is_spill_exact` and the
 /// spilling run is refused with the spill-disabled `ResourcesExhausted`; set
-/// [`SPILL_BUDGET_DIVISOR`] to 1 and it never spills, failing the counter
+/// [`SPILL_BUDGET_PERCENT`] to 100 and it never spills, failing the retry
 /// assertion.
 #[tokio::test]
 async fn min_max_and_int32_avg_spill_with_the_unlimited_result() {
