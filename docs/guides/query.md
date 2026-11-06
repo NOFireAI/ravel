@@ -1081,6 +1081,52 @@ selects them. Inside an object, pruning works as follows:
 - `has_word` prunes through the token bloom filter.
 - Ravel applies any other attribute predicate to the decoded records.
 
+### Exact-key `IN` lists
+
+An `IN` list on a key-index column is a lookup of up to 1,024 keys at once.
+It works on a typed attribute column the tenant declared in its `key_index`
+list, on the logs `trace_id` when `index_trace_id` is on, and on the spans
+`trace_id`:
+
+```sh
+curl -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer devtoken" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT name, start_ts FROM spans WHERE trace_id IN ('\''00112233445566778899aabbccddeeff'\'', '\''ffeeddccbbaa99887766554433221100'\'', '\''0123456789abcdef0123456789abcdef'\'', '\''fedcba9876543210fedcba9876543210'\'')"}'
+```
+
+The rows are the union of what each key's `=` lookup returns. Ravel reads
+only the objects and blocks that hold one of the keys: it checks the key
+index of each folded part first, then the key index inside each object it
+still has to read. `stats.keyIndex.keysProbed` is the number of keys the
+lookup used.
+
+A trace id is a 32-character hex string or a 16-byte binary literal
+(`X'0011...'`). A typed column's values must be literals of exactly its
+type: integers for an `i64` column, strings for a `str` column, binary
+literals for a `bytes` column.
+
+These lists still return the right rows but use no key, so Ravel reads the
+time window's objects in full:
+
+- a list of more than 1,024 distinct values;
+- `NOT IN`, a list mixing types, or a list holding `NULL` or an expression;
+- a list inside an `OR`;
+- a list of two or three values, which the planner rewrites into `=`
+  comparisons joined by `OR` before Ravel sees it. One value becomes a plain
+  `=`, which does use the key.
+
+A list beside a second key comparison, such as
+`user_id IN (...) AND user_id = 7`, uses both keys inside each object but
+skips the part-level check.
+
+A list of literals costs much less of the statement complexity limit than
+other SQL: one unit for the list plus one per 64 values. A list of up to
+4,096 literals fits, so a lookup of 1,000 keys has room for the rest of the
+statement. A list of more than 4,096 literals is an HTTP 400 that names the
+list limit; split it into several statements. The 64 KiB request body limit
+still applies: 1,000 hex trace ids take about 37 KB.
+
 ### Matching pseudonymized addresses
 
 An attribute under an `--ipcrypt-config` rule stores the IPCrypt ciphertext of
