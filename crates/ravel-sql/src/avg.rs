@@ -167,7 +167,7 @@ impl std::hash::Hash for SequentialAvg {
 /// A `Dictionary(_, V)` is admitted exactly when `V` is: a scalar function
 /// over a dictionary-encoded column (`length` of a declared `Str` column) can
 /// return a dictionary of integers, and its values are what the average folds.
-fn is_admitted_integer(data_type: &DataType) -> bool {
+pub(crate) fn is_admitted_integer(data_type: &DataType) -> bool {
     let value_type = match data_type {
         DataType::Dictionary(_, value_type) => value_type.as_ref(),
         other => other,

@@ -119,8 +119,8 @@ use datafusion::execution::SessionState;
 use datafusion::execution::disk_manager::DiskManager;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, UnboundedMemoryPool};
 use datafusion::logical_expr::{
-    Aggregate, Distinct, DistinctOn, Expr, ExprSchemable, Filter, LogicalPlan, Projection, Sort,
-    SortExpr, WindowFunctionDefinition, lit,
+    Aggregate, Distinct, DistinctOn, Expr, ExprSchemable, FetchType, Filter, LogicalPlan,
+    Projection, Sort, SortExpr, WindowFunctionDefinition, lit,
 };
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::metrics::MetricsSet;
@@ -6927,23 +6927,81 @@ fn aggregate_functions_are_spill_families(aggregate: &Aggregate) -> bool {
     })
 }
 
-/// Whether `sort` over `aggregate` is a shape the bounded aggregate
-/// (`crate::bounded_topk`) can serve: a single sort term over an aggregate
-/// whose only aggregate expression, after duplicates are merged, is a `min` or
-/// a `max`. That rule requires exactly one sort term and exactly one aggregate,
-/// so a trailing tiebreak term would take the top-k away from it.
-fn is_bounded_topk_candidate(sort: &Sort, aggregate: &Aggregate) -> bool {
+/// Whether `sort`, with `fetch` as its row limit (its own, or that of the
+/// `Limit` above it, since this runs before limit pushdown), has the logical
+/// shape of a top-k the bounded aggregate (`crate::bounded_topk`) bounds. Each
+/// conjunct is one of that rule's refusals, restated on the logical plan
+/// because the rule reads the physical one:
+///
+/// - `fetch` is `Some`: no fetch is no top-k.
+/// - one sort term, and it is a column.
+/// - the `Sort`'s input is the aggregate, or a `Projection` directly over it
+///   in which that column is a plain column of the aggregate. A `HAVING`
+///   filter in between is refused, as the rule's pass-through allowlist
+///   refuses a `FilterExec`.
+/// - the aggregate groups by one plain key (no grouping set).
+/// - its only aggregate expression, after duplicates are merged, is a `min` or
+///   a `max` with no `FILTER` clause, and the sort column is its output.
+/// - the term is descending for `max` and ascending for `min`, the direction
+///   that function's extreme runs.
+///
+/// The rule's `LIMIT` ceiling and its non-nullable-input check are not
+/// restated: a statement they refuse keeps its single term here, which costs
+/// it spill eligibility and nothing else.
+fn is_bounded_topk_candidate(sort: &Sort, fetch: Option<usize>) -> bool {
+    if fetch.is_none() {
+        return false;
+    }
+    let [term] = sort.expr.as_slice() else {
+        return false;
+    };
+    let Expr::Column(sort_column) = &term.expr else {
+        return false;
+    };
+    let (aggregate_column, aggregate) = match sort.input.as_ref() {
+        LogicalPlan::Projection(projection) => {
+            let LogicalPlan::Aggregate(aggregate) = projection.input.as_ref() else {
+                return false;
+            };
+            let Ok(index) = projection.schema.index_of_column(sort_column) else {
+                return false;
+            };
+            let Some(Expr::Column(source)) = projection.expr.get(index).map(unaliased) else {
+                return false;
+            };
+            (source, aggregate)
+        }
+        LogicalPlan::Aggregate(aggregate) => (sort_column, aggregate),
+        _ => return false,
+    };
+    let [group_key] = aggregate.group_expr.as_slice() else {
+        return false;
+    };
+    if matches!(group_key, Expr::GroupingSet(_)) {
+        return false;
+    }
     let Some((first, rest)) = aggregate.aggr_expr.split_first() else {
         return false;
     };
     let first = unaliased(first);
-    sort.expr.len() == 1
-        && rest.iter().all(|expr| unaliased(expr) == first)
-        && matches!(
-            first,
-            Expr::AggregateFunction(function)
-                if matches!(function.func.name().to_ascii_lowercase().as_str(), "min" | "max")
-        )
+    if !rest.iter().all(|expr| unaliased(expr) == first) {
+        return false;
+    }
+    let Expr::AggregateFunction(function) = first else {
+        return false;
+    };
+    if function.params.filter.is_some() {
+        return false;
+    }
+    let descending = match function.func.name().to_ascii_lowercase().as_str() {
+        "max" => true,
+        "min" => false,
+        _ => return false,
+    };
+    let Ok(index) = aggregate.schema.index_of_column(aggregate_column) else {
+        return false;
+    };
+    index >= aggregate.group_expr.len() && term.asc != descending
 }
 
 /// [`tie_order_edit`] for a `Sort` whose aggregate has only non-float GROUP BY
@@ -6957,12 +7015,12 @@ fn is_bounded_topk_candidate(sort: &Sort, aggregate: &Aggregate) -> bool {
 /// spill-eligible, so it gains nothing from a total order. A bounded top-k
 /// candidate is left as written so the bounded aggregate can still bound its
 /// state; it stays spill-ineligible unless its single term already orders by
-/// every group key.
-fn total_tie_order_edit(sort: &Sort) -> Option<TieOrderEdit> {
+/// every group key. `fetch` is the `Sort`'s row limit ([`sort_fetch`]).
+fn total_tie_order_edit(sort: &Sort, fetch: Option<usize>) -> Option<TieOrderEdit> {
     let (_, aggregate) = sorted_aggregate(sort)?;
     if !group_keys_are_non_float(aggregate)
         || !aggregate_functions_are_spill_families(aggregate)
-        || is_bounded_topk_candidate(sort, aggregate)
+        || is_bounded_topk_candidate(sort, fetch)
     {
         return None;
     }
@@ -6975,16 +7033,45 @@ fn total_tie_order_edit(sort: &Sort) -> Option<TieOrderEdit> {
 /// function names only, never argument types: the plan this reads has not
 /// been through the analyzer that coerces them.
 fn plan_has_tie_order_edit(plan: &LogicalPlan) -> bool {
-    plan.exists(|node| {
-        Ok(matches!(
-            node,
-            LogicalPlan::Sort(sort) if matches!(
-                total_tie_order_edit(sort),
-                Some(TieOrderEdit::Extend(_) | TieOrderEdit::ProjectThrough { .. })
-            )
-        ))
-    })
-    .unwrap_or(false)
+    has_tie_order_edit_under(plan, None)
+}
+
+/// [`plan_has_tie_order_edit`] for `node`, which sits under the row limit
+/// `fetch` ([`fetch_for_inputs`] of its parent).
+fn has_tie_order_edit_under(node: &LogicalPlan, fetch: Option<usize>) -> bool {
+    if let LogicalPlan::Sort(sort) = node
+        && matches!(
+            total_tie_order_edit(sort, sort_fetch(sort, fetch)),
+            Some(TieOrderEdit::Extend(_) | TieOrderEdit::ProjectThrough { .. })
+        )
+    {
+        return true;
+    }
+    let fetch = fetch_for_inputs(node, fetch);
+    node.inputs()
+        .into_iter()
+        .any(|input| has_tie_order_edit_under(input, fetch))
+}
+
+/// The row limit `sort` is under: its own `fetch`, else `fetch`, the one its
+/// ancestors put on it. The tie-order rewrite runs before DataFusion's limit
+/// pushdown, so a `LIMIT` is still a `Limit` node above the `Sort` there.
+fn sort_fetch(sort: &Sort, fetch: Option<usize>) -> Option<usize> {
+    sort.fetch.or(fetch)
+}
+
+/// The row limit `node`'s inputs are under, given that `node` is under
+/// `fetch`: a `Limit`'s literal `fetch`, the same `fetch` through a
+/// `Projection` (which keeps every row), and none below anything else.
+fn fetch_for_inputs(node: &LogicalPlan, fetch: Option<usize>) -> Option<usize> {
+    match node {
+        LogicalPlan::Limit(limit) => match limit.get_fetch_type() {
+            Ok(FetchType::Literal(fetch)) => fetch,
+            _ => None,
+        },
+        LogicalPlan::Projection(_) => fetch,
+        _ => None,
+    }
 }
 
 /// Apply `edit` to `sort`, leaving `fetch` unchanged.
@@ -7037,15 +7124,30 @@ fn apply_tie_order_edit(
 /// spill-ineligible; the rewrite exists to admit spill and never fails a
 /// query.
 fn rewrite_sort_group_key_tie_order(plan: LogicalPlan) -> Result<LogicalPlan, DataFusionError> {
-    Ok(plan
-        .transform_down(|node| match node {
-            LogicalPlan::Sort(sort) => match total_tie_order_edit(&sort) {
-                Some(edit) => apply_tie_order_edit(sort, edit),
-                None => Ok(Transformed::no(LogicalPlan::Sort(sort))),
-            },
-            other => Ok(Transformed::no(other)),
-        })?
-        .data)
+    Ok(rewrite_tie_order_under(plan, None)?.data)
+}
+
+/// [`rewrite_sort_group_key_tie_order`] for `node`, which sits under the row
+/// limit `fetch` ([`fetch_for_inputs`] of its parent). Top-down: an edited
+/// `Sort`'s new inputs are visited too, as `transform_down` would.
+fn rewrite_tie_order_under(
+    node: LogicalPlan,
+    fetch: Option<usize>,
+) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+    let input_fetch = fetch_for_inputs(&node, fetch);
+    let node = match node {
+        LogicalPlan::Sort(sort) => {
+            let fetch = sort_fetch(&sort, fetch);
+            match total_tie_order_edit(&sort, fetch) {
+                Some(edit) => apply_tie_order_edit(sort, edit)?,
+                None => Transformed::no(LogicalPlan::Sort(sort)),
+            }
+        }
+        other => Transformed::no(other),
+    };
+    node.transform_children(|node| {
+        node.map_children(|input| rewrite_tie_order_under(input, input_fetch))
+    })
 }
 
 /// [`rewrite_sort_group_key_tie_order`], or `plan` as it was when the rewrite
@@ -7101,8 +7203,8 @@ fn group_keys_are_non_float(aggregate: &Aggregate) -> bool {
 /// - `sum` over a resolved integer input: eligible. Integer addition is
 ///   associative, so partial sums merged in any order give the same total.
 /// - `avg`/`mean` over a resolved integer input `crate::avg` computes exactly
-///   ([`is_exact_avg_integer`]: `Int8` to `Int64`, `UInt8` to `UInt32`, or a
-///   dictionary of one): eligible. That is `crate::avg`'s exact integer path,
+///   ([`crate::avg::is_admitted_integer`]: `Int8` to `Int64`, `UInt8` to
+///   `UInt32`, or a dictionary of one): eligible. That is `crate::avg`'s exact integer path,
 ///   an `i128` numerator with checked addition and an integer count (ADR-0825
 ///   decision 2), whose partial states merge by adding numerators and counts.
 ///   The analyzer coerces each of those widths to `Int64`, so an analyzed plan
@@ -7144,22 +7246,10 @@ fn aggregate_expr_is_spill_exact(expr: &Expr, schema: &DFSchema) -> bool {
     match aggregate_function.func.name().to_ascii_lowercase().as_str() {
         "count" => true,
         "sum" => arg_type(is_exact_integer),
-        "avg" | "mean" => arg_type(is_exact_avg_integer),
+        "avg" | "mean" => arg_type(crate::avg::is_admitted_integer),
         "min" | "max" => arg_type(is_exact_extreme_type),
         _ => false,
     }
-}
-
-/// The argument types `crate::avg` averages on its exact integer path:
-/// `Int8` to `Int64` and `UInt8` to `UInt32`, plain or as a dictionary's
-/// values. The same list as that module's coercion; `UInt64` is not on it.
-fn is_exact_avg_integer(ty: &datafusion::arrow::datatypes::DataType) -> bool {
-    use datafusion::arrow::datatypes::DataType;
-    let value_type = match ty {
-        DataType::Dictionary(_, value_type) => value_type.as_ref(),
-        other => other,
-    };
-    is_exact_integer(value_type) && !matches!(value_type, DataType::UInt64)
 }
 
 /// The argument types `min`/`max` merge exactly under spill: integers,
@@ -9313,14 +9403,20 @@ pub(crate) mod tests {
             DataType::UInt32,
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32)),
         ] {
-            assert!(is_exact_avg_integer(&admitted), "{admitted} is admitted");
+            assert!(
+                crate::avg::is_admitted_integer(&admitted),
+                "{admitted} is admitted"
+            );
         }
         for refused in [
             DataType::UInt64,
             DataType::Float64,
             DataType::Decimal128(18, 2),
         ] {
-            assert!(!is_exact_avg_integer(&refused), "{refused} is refused");
+            assert!(
+                !crate::avg::is_admitted_integer(&refused),
+                "{refused} is refused"
+            );
         }
     }
 
@@ -9371,11 +9467,7 @@ pub(crate) mod tests {
     /// `total_tie_order_edit` and the single-`max` rows read true.
     #[tokio::test]
     async fn a_min_or_max_top_k_keeps_its_single_sort_term() {
-        for sql in [
-            "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
-            "SELECT a, min(y) AS m FROM q33 GROUP BY a ORDER BY m LIMIT 10",
-            "SELECT a, max(x) AS m, max(x) AS m2 FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
-        ] {
+        for sql in BOUNDED_TOPK_SERVED {
             let plan = q33_plan(sql).await;
             assert!(!plan_has_tie_order_edit(&plan), "{sql}");
             let rewritten = rewrite_sort_group_key_tie_order(plan.clone()).expect("nothing to do");
@@ -9394,6 +9486,122 @@ pub(crate) mod tests {
             vec![term(None, "m", false), term(Some("q33"), "a", true)]
         );
         assert!(plan_is_spill_eligible(&rewritten));
+    }
+
+    /// One [`sort_terms`] entry: qualifier, name, ascending, nulls first.
+    type SortTerm = (Option<String>, String, bool, bool);
+
+    /// The single-`min`/`max` statements the bounded aggregate bounds.
+    const BOUNDED_TOPK_SERVED: [&str; 3] = [
+        "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
+        "SELECT a, min(y) AS m FROM q33 GROUP BY a ORDER BY m LIMIT 10",
+        "SELECT a, max(x) AS m, max(x) AS m2 FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
+    ];
+
+    /// Single-`min`/`max`, single-term sorts the bounded aggregate refuses,
+    /// each with the sort terms the tie-order rewrite gives it: no `LIMIT`,
+    /// the direction opposite to `max`'s extreme, a sort on a group key of a
+    /// two-key aggregate, and a `HAVING` filter between the sort and the
+    /// aggregate.
+    fn bounded_topk_refused() -> [(&'static str, Vec<SortTerm>); 4] {
+        [
+            (
+                "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC",
+                vec![term(None, "m", false), term(Some("q33"), "a", true)],
+            ),
+            (
+                "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m ASC LIMIT 10",
+                vec![term(None, "m", true), term(Some("q33"), "a", true)],
+            ),
+            (
+                "SELECT a, b, max(x) AS m FROM q33 GROUP BY a, b ORDER BY a LIMIT 10",
+                vec![term(Some("q33"), "a", true), term(Some("q33"), "b", true)],
+            ),
+            (
+                "SELECT a, max(x) AS m FROM q33 GROUP BY a HAVING max(x) > 1 \
+                 ORDER BY m DESC LIMIT 10",
+                vec![term(None, "m", false), term(Some("q33"), "a", true)],
+            ),
+        ]
+    }
+
+    /// Issue #3899: a single-term sort over a lone `min`/`max` that the bounded
+    /// aggregate cannot serve is not left as written. It gets the group keys
+    /// as tiebreaks and becomes spill-eligible.
+    ///
+    /// Prove-the-test: drop the `fetch` check from `is_bounded_topk_candidate`
+    /// and the no-`LIMIT` row fails; drop its direction check and the `ASC`
+    /// row fails.
+    #[tokio::test]
+    async fn a_min_or_max_sort_the_bounded_aggregate_refuses_gets_the_tiebreak() {
+        for (sql, terms) in bounded_topk_refused() {
+            let plan = q33_plan(sql).await;
+            assert!(!plan_is_spill_eligible(&plan), "{sql} ties as written");
+            assert!(plan_has_tie_order_edit(&plan), "{sql}");
+            let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite applies");
+            assert_eq!(sort_terms(&rewritten), terms, "{sql}");
+            assert!(plan_is_spill_eligible(&rewritten), "{sql}");
+        }
+    }
+
+    /// Whether the logical plan's first `Sort` is a bounded top-k candidate,
+    /// under the row limit the plan's `Limit` nodes give it.
+    fn first_sort_is_candidate(node: &LogicalPlan, fetch: Option<usize>) -> Option<bool> {
+        if let LogicalPlan::Sort(sort) = node {
+            return Some(is_bounded_topk_candidate(sort, sort_fetch(sort, fetch)));
+        }
+        let fetch = fetch_for_inputs(node, fetch);
+        node.inputs()
+            .into_iter()
+            .find_map(|input| first_sort_is_candidate(input, fetch))
+    }
+
+    /// Whether any `AggregateExec` in `plan` carries the limit
+    /// `crate::bounded_topk` sets when it bounds one.
+    fn has_bounded_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        plan.downcast_ref::<datafusion::physical_plan::aggregates::AggregateExec>()
+            .is_some_and(|aggregate| aggregate.limit_options().is_some())
+            || plan.children().into_iter().any(has_bounded_aggregate)
+    }
+
+    /// `is_bounded_topk_candidate` restates `crate::bounded_topk`'s gate on the
+    /// logical plan, since that rule reads the physical one. Every case of the
+    /// two tests above is planned through a session with the rule installed,
+    /// and the restatement must agree with whether the rule bounded the
+    /// aggregate.
+    #[tokio::test]
+    async fn the_bounded_topk_candidate_agrees_with_the_rule() {
+        let refused = bounded_topk_refused();
+        let cases = BOUNDED_TOPK_SERVED
+            .iter()
+            .map(|sql| (*sql, true))
+            .chain(refused.iter().map(|(sql, _)| (*sql, false)));
+        for (sql, served) in cases {
+            let plan = q33_plan(sql).await;
+            assert_eq!(first_sort_is_candidate(&plan, None), Some(served), "{sql}");
+            let q33: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(q33_schema()));
+            let tables = vec![SessionTable::Parquet(ParquetSession {
+                tables: vec![("q33".to_string(), q33)],
+                store: Arc::new(ravel_parquet::TenantParquetStore::new(TenantHash(
+                    [105u8; 16],
+                ))),
+            })];
+            let ctx = build_session_with_tables(
+                &SqlConfig::default(),
+                Arc::new(UnboundedMemoryPool::default()),
+                tables,
+                false,
+                SpillDecision::Disabled,
+                &SessionPrincipal::without_capabilities(TenantHash([105u8; 16])),
+            )
+            .expect("the session builds");
+            let physical = ctx
+                .state()
+                .create_physical_plan(&plan)
+                .await
+                .expect("the plan lowers");
+            assert_eq!(has_bounded_aggregate(&physical), served, "{sql}");
+        }
     }
 
     /// An `ORDER BY` over a subquery puts a second projection (and the
@@ -9453,8 +9661,9 @@ pub(crate) mod tests {
     /// The executed-plan gate reads the `Sort`'s shape, the group key types
     /// and the aggregate function names, never argument types: a `sum` over a
     /// float expression is not spill-exact, yet its `Sort` gets the group keys
-    /// as tiebreaks. A lone `max` under a single sort term is a bounded top-k
-    /// candidate and its `Sort` is left as written, which keeps it a
+    /// as tiebreaks. A lone `max` over one group key, under a single
+    /// descending sort term and a `LIMIT`, is a bounded top-k candidate and
+    /// its `Sort` is left as written, which keeps it a
     /// single-term top-k the bounded aggregate can serve. A `Sort` that
     /// already orders by every group key has nothing to edit.
     ///
@@ -9483,8 +9692,7 @@ pub(crate) mod tests {
         );
 
         let max =
-            q33_plan("SELECT a, b, max(x) AS m FROM q33 GROUP BY a, b ORDER BY m DESC LIMIT 10")
-                .await;
+            q33_plan("SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10").await;
         assert!(!plan_has_tie_order_edit(&max));
         let rewritten = rewrite_sort_group_key_tie_order(max.clone()).expect("nothing to do");
         assert_eq!(rewritten, max);
