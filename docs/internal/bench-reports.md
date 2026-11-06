@@ -586,7 +586,15 @@ were made afterwards on another host from the same commit (b515bb8e1, clean
 tree, run stamps in the files): arm64, 15 CPUs, macOS, release build; the
 stamp reads `mem_total_kib=0` because the stamp reads `/proc/meminfo`, which
 macOS lacks. Bytes and GETs follow from the object layout and do not depend
-on the host; wall depends only on the simulated 30 ms per GET. The outputs
+on the host. Wall does: today's wall is a measured elapsed time that
+includes its real decode, and the structural wall adds today's measured
+decode CPU scaled by the decompressed-byte ratio. It is dominated by the
+simulated 30 ms GET rounds, though: at `gap_64k` today's decode is 22.5 ms
+of 150.1 ms on HDFS and 20.4 ms of 149.2 ms on BGL, so with decode taken out
+of both sides the ratio is (97.3 − 1.7) / (150.1 − 22.5) = 0.749 on HDFS and
+(98.2 − 2.0) / (149.2 − 20.4) = 0.747 on BGL. A host with faster decode moves
+`gap_64k/ratio/wall` toward that bound, which is under the 1.0 bar, so the
+wall verdict does not depend on this host. The outputs
 are in `crates/ravel-bench/fixtures/t13/run_2026-11-06-gaps/`, beside round
 0's.
 
