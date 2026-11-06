@@ -49,7 +49,9 @@
 //!   evaluates inside its own scan.
 //! - Constant folding: the simplifier folds `9223372036854775807 + 1` with
 //!   the wrapping kernel before any physical rule runs.
-//! - Unary minus and `abs`, which are not `BinaryExpr`s.
+//! - Unary minus and `abs`, which are not `BinaryExpr`s: `-a` on `i64::MIN`
+//!   wraps to `i64::MIN`, and `abs(a)` fails with arrow's own overflow error,
+//!   reported as a generic execution error, with the option on or off.
 //!
 //! ES|QL statements keep null-on-overflow: the executor turns the option off
 //! for a lowered statement.

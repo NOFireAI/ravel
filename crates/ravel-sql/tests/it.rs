@@ -32,6 +32,8 @@ mod bounded_topk_aggregate;
 mod bucketed_final_aggregate;
 #[path = "ceiling_breach.rs"]
 mod ceiling_breach;
+#[path = "checked_arithmetic.rs"]
+mod checked_arithmetic;
 #[path = "compact_slices.rs"]
 mod compact_slices;
 #[path = "deadline.rs"]
