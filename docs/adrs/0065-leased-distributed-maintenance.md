@@ -306,7 +306,9 @@ because the L1 key is content-addressed, so the object must be complete
 before its key exists). The bound is independent of stream size and record
 count; the surviving input-count term is directory metadata only, and is
 stated, not hidden. (ADR-3819 adds a resident term and a pass term to this
-peak; see the ADR-3819 read-plan amendment below.)
+peak; see the ADR-3819 read-plan amendment below. The one decoded block
+per input is an `N x h` floor no ceiling lowers, and a many-input bucket
+now merges in two levels; see the two-level merge amendment below.)
 
 **Acceptance test.** A `MergeMemoryTracker` seam (test-injectable, default
 no-op) accounts fetched block bytes, decoded-block residency, and the
@@ -503,3 +505,61 @@ by the pass budget, not by block size, so under a large ceiling one pass
 may hold every row of a stream whose estimate fits that budget. "No path
 gathers a whole stream" holds for every stream too large for a pass, which
 is the hot-stream case decision 4 exists for.
+
+## Amendment (2026-11-06): many-input buckets merge in two levels (ADR-3853)
+
+<!-- amendment-applies: sections="4. RLOG compaction: a real memory bound" pointer="two-level merge amendment" -->
+
+Decision 4's peak keeps one decoded block per input, and ADR-3819's passes
+keep that term. A stream-major pass holds, per input carrying its streams,
+the whole decoded block those streams fall in until it emits the last row it
+wants from it, so the pass's memory floor is `N x h`, `N` the inputs and `h`
+the decoded heap of one block, whatever its budget. When every block carries
+many streams, as an L0 cut every 8,192 `(stream_ref, ts)`-sorted rows does,
+every stream's estimate is one block per input, no ceiling admits a pass,
+and the plan is cursor, which decodes each block once per stream it
+carries. ADR-3853 D0 refuses that cursor plan when it predicts more than 16
+decoded rows per record.
+
+When `scratch_dir` is configured, ADR-3853 merges such a bucket in two
+levels instead of refusing it. Level 1 cuts the inputs, in canonical order,
+into contiguous groups of `G`, the largest size with
+`G x (raw per input + price of its blocks) + run target <= C`, and merges
+each group with the same planner and passes into a run: an RLOG in a local
+scratch directory, cut into parts at the run memory target. Level 2 merges
+the runs' `R` parts into the published parts with the same planner and
+passes, once `max(R x price(one run block), largest stream estimate) +
+reads in flight + final part target <= U` holds and the plan over the runs
+is not cursor. `R` counts run parts, not groups: every part of every run is
+a level-2 input, so a run target that cuts each group into several parts
+multiplies the term. The stream estimate term is there because a run's part
+cut can split one stream across two of that run's blocks. Group size under
+2, short scratch headroom, a scratch directory another process holds and a
+level 2 that does not fit are each refused by name, as a terminal outcome
+the scan memo does not retry in this process; the pass goes on to the
+buckets that do not need two levels.
+Only a bucket the D0 check refuses takes this route; a fetch-per-pass or
+resident plan stays single-level with `scratch_dir` set.
+The emitted sequence, and so
+every L1 part's bytes and key, is the single-level one, except for a keyed
+bucket that `merge_cursor_budget_bytes` splits into reservation batches
+(ADR-3853 D3).
+
+The peak this decision states then holds per level. Every input's catalog
+stays loaded across both levels. Level 1 holds one group's resident row
+groups, one pass over them and an in-progress run part bounded by the run
+memory target; level 2 holds the run parts' row groups, one pass over at
+most `R` run blocks per stream, and the in-progress part. Level 1 runs one group
+at a time (`W1 = 1`), so the per-worker ceiling `C` is the unit ceiling `U`;
+dividing the budgets across parallel workers is ADR-3853 D4's. The runs are
+a cache: the merge refuses before its first block GET when the scratch
+volume's free bytes, less what the process's other running merges hold
+reserved in that directory, are under 1.3 times the inputs' object sizes,
+reserves that much until it ends, refuses the same way when a scratch write
+runs out of space, removes the unit's runs however it ends, and no
+durability or recovery path reads them.
+A process takes an exclusive lock on a file in `scratch_dir` at its first
+two-level merge and holds it for its lifetime; with the lock held it removes
+every unit directory it did not create, which reclaims what a killed process
+left behind, and a directory another process holds is refused by name.
+With no `scratch_dir`, the merge and the D0 refusal are unchanged.

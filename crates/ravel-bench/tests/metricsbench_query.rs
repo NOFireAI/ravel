@@ -231,7 +231,7 @@ async fn answer(
         other => other,
     };
     match scripted {
-        Answer::Correct | Answer::Sequence(_) =>axum::Json(json!({"status": "success", "data": series("1.5", kind, &params)})).into_response(),
+        Answer::Correct | Answer::Sequence(_) => axum::Json(json!({"status": "success", "data": series("1.5", kind, &params)})).into_response(),
         Answer::Diverge => axum::Json(json!({"status": "success", "data": series("99", kind, &params)})).into_response(),
         Answer::TwoUlps => axum::Json(json!({"status": "success", "data": series("1.5000000000000004", kind, &params)})).into_response(),
         Answer::RampUlps => {

@@ -2116,7 +2116,7 @@ mod catalog_cache_tests {
     /// `crate::query::server_seal_margin()`, which is exactly the revert to
     /// the reference derivation that changes no production number. The
     /// `resolved_at_longer` equality below then reports
-    /// `left: Bounded(343400)` against `right: Bounded(516200)`, the budget
+    /// `left: Bounded(385700)` against `right: Bounded(580100)`, the budget
     /// the hour-longer margin was required to produce.
     ///
     /// The `server_seal_margin() == running` assertion is the other direction:
@@ -2164,9 +2164,9 @@ mod catalog_cache_tests {
              catalog's own seal margin"
         );
         assert_eq!(
-            expected, 343_400,
+            expected, 385_700,
             "sanity: at 4 shards, the 2s cadence and the catalog's 4,800s seal margin the \
-             derivation is the figure ADR-1306's 2026-09-27 amendment states, and the figure \
+             derivation is the figure ADR-1306's dictionary GET amendment states, and the figure \
              the flag help text and docs/query-engine.md give an operator"
         );
 
@@ -2205,7 +2205,7 @@ mod catalog_cache_tests {
         // figure and not just to each other. A `fold_safety_margin` one hour
         // longer adds an hour to `healthy_tail_max` and an hour to
         // `lag_allowance`, so `covered_span` grows by 7,200s: 3,600 more
-        // flushes per shard at the 2s cadence, each budgeted at 8 requests,
+        // flushes per shard at the 2s cadence, each budgeted at 9 requests,
         // with the 3/2 headroom over 4 shards.
         assert_eq!(
             at_longer - expected,

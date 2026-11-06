@@ -203,6 +203,25 @@ pub struct RunRequestReport {
     /// (ADR-3819 D1), as fetched; zero when it fetched per pass or per
     /// cursor. Stored bytes, a residency figure, not a request figure.
     pub merge_resident_bytes: u64,
+    /// Level-1 groups the two-level RLOG merge (ADR-3853 D1) cut the inputs
+    /// into; zero for a single-level merge. Not a request count.
+    pub level1_groups: u64,
+    /// Stream-range passes run at level 1 of a two-level merge, summed over
+    /// its groups. Not a request count.
+    pub level1_passes: u64,
+    /// Stream-range passes run at level 2 of a two-level merge. Not a request
+    /// count.
+    pub level2_passes: u64,
+    /// Input blocks decoded at level 1 of a two-level merge, a decode count.
+    pub level1_block_decodes: u64,
+    /// Run blocks decoded at level 2 of a two-level merge, a decode count.
+    pub level2_block_decodes: u64,
+    /// Bytes of level-1 runs written to scratch, as stored (ADR-3853 D6).
+    /// Scratch traffic is not a store request and never lands in a phase.
+    pub scratch_write_bytes: u64,
+    /// Bytes of level-1 runs read back from scratch at level 2, as stored.
+    /// Scratch traffic is not a store request and never lands in a phase.
+    pub scratch_read_bytes: u64,
 }
 
 impl RunRequestReport {
@@ -258,6 +277,13 @@ struct RequestLedgerInner {
     phases: [PhaseCounters; RequestPhase::ALL.len()],
     merge_passes: AtomicU64,
     merge_resident_bytes: AtomicU64,
+    level1_groups: AtomicU64,
+    level1_passes: AtomicU64,
+    level2_passes: AtomicU64,
+    level1_block_decodes: AtomicU64,
+    level2_block_decodes: AtomicU64,
+    scratch_write_bytes: AtomicU64,
+    scratch_read_bytes: AtomicU64,
     /// Whether a run's scope is currently open. Read only by
     /// [`RequestLedger::reset_for_run_unless_open`] to decide whether an
     /// enclosing driver already opened one; it never reaches any store or
@@ -337,6 +363,13 @@ impl RequestLedger {
         }
         self.inner.merge_passes.store(0, Ordering::Relaxed);
         self.inner.merge_resident_bytes.store(0, Ordering::Relaxed);
+        self.inner.level1_groups.store(0, Ordering::Relaxed);
+        self.inner.level1_passes.store(0, Ordering::Relaxed);
+        self.inner.level2_passes.store(0, Ordering::Relaxed);
+        self.inner.level1_block_decodes.store(0, Ordering::Relaxed);
+        self.inner.level2_block_decodes.store(0, Ordering::Relaxed);
+        self.inner.scratch_write_bytes.store(0, Ordering::Relaxed);
+        self.inner.scratch_read_bytes.store(0, Ordering::Relaxed);
     }
 
     /// Account one RLOG merge stream-range pass.
@@ -348,6 +381,47 @@ impl RequestLedger {
     pub fn record_merge_resident_bytes(&self, bytes: u64) {
         self.inner
             .merge_resident_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Account the level-1 group count of a two-level RLOG merge.
+    pub fn record_level1_groups(&self, groups: u64) {
+        self.inner
+            .level1_groups
+            .fetch_add(groups, Ordering::Relaxed);
+    }
+
+    /// Account one stream-range pass at `level` (1 or 2) of a two-level merge.
+    pub fn record_level_pass(&self, level: u8) {
+        let counter = if level == 1 {
+            &self.inner.level1_passes
+        } else {
+            &self.inner.level2_passes
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Account `blocks` block decodes at `level` (1 or 2) of a two-level merge.
+    pub fn record_level_block_decodes(&self, level: u8, blocks: u64) {
+        let counter = if level == 1 {
+            &self.inner.level1_block_decodes
+        } else {
+            &self.inner.level2_block_decodes
+        };
+        counter.fetch_add(blocks, Ordering::Relaxed);
+    }
+
+    /// Account `bytes` of run bytes written to scratch, as stored.
+    pub fn record_scratch_write(&self, bytes: u64) {
+        self.inner
+            .scratch_write_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Account `bytes` of run bytes read back from scratch, as stored.
+    pub fn record_scratch_read(&self, bytes: u64) {
+        self.inner
+            .scratch_read_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
@@ -422,6 +496,13 @@ impl RequestLedger {
             floor_read: read(RequestPhase::FloorRead),
             merge_passes: self.inner.merge_passes.load(Ordering::Relaxed),
             merge_resident_bytes: self.inner.merge_resident_bytes.load(Ordering::Relaxed),
+            level1_groups: self.inner.level1_groups.load(Ordering::Relaxed),
+            level1_passes: self.inner.level1_passes.load(Ordering::Relaxed),
+            level2_passes: self.inner.level2_passes.load(Ordering::Relaxed),
+            level1_block_decodes: self.inner.level1_block_decodes.load(Ordering::Relaxed),
+            level2_block_decodes: self.inner.level2_block_decodes.load(Ordering::Relaxed),
+            scratch_write_bytes: self.inner.scratch_write_bytes.load(Ordering::Relaxed),
+            scratch_read_bytes: self.inner.scratch_read_bytes.load(Ordering::Relaxed),
         }
     }
 }

@@ -2476,6 +2476,11 @@ fn plan_render(
         (MaintainTier::Withheld, _) => Some(degraded_reason(&Error::Render(
             RenderError::MaintainKeySecretRefMissing,
         ))),
+        (MaintainTier::Refused(err), _) => {
+            let reason = degraded_reason(&Error::Render(err.clone()));
+            maintain = MaintainTier::Withheld;
+            Some(reason)
+        }
         (MaintainTier::Apply(_), MaintainKeyResolution::SecretMissing { name, reason }) => {
             maintain = MaintainTier::Withheld;
             Some(degraded_reason(&Error::SecretNotFound {
@@ -2564,7 +2569,10 @@ impl TierDeployments {
             query_withheld: query.is_none(),
             query,
             maintain_disabled: matches!(maintain, MaintainTier::Disabled),
-            maintain_withheld: matches!(maintain, MaintainTier::Withheld),
+            maintain_withheld: matches!(
+                maintain,
+                MaintainTier::Withheld | MaintainTier::Refused(_)
+            ),
             maintain: maintain.into_deployment(),
             applied: BTreeMap::new(),
         }
@@ -3251,6 +3259,10 @@ fn degraded_reason(err: &Error) -> (String, String) {
         Error::Render(RenderError::MaintainKeySecretRefMissing) => {
             ("MaintainKeySecretRefMissing".to_string(), err.to_string())
         }
+        Error::Render(RenderError::MaintainScratchExceedsEphemeralLimit { .. }) => (
+            "MaintainScratchExceedsEphemeralLimit".to_string(),
+            err.to_string(),
+        ),
         Error::Render(RenderError::QueryMemoryBudgetExceedsLimit { .. }) => (
             QUERY_MEMORY_BUDGET_EXCEEDS_LIMIT_REASON.to_string(),
             err.to_string(),

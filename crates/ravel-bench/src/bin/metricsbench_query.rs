@@ -18,37 +18,33 @@
 //! `validate` everywhere else. A failed row on the Prometheus oracle refuses
 //! the diagnostic too, since every engine is classified against it.
 //!
-//! Exit codes: 0 the report (and any sidecar) was written; 64 a usage error (an `--engine`
-//! value that does not parse); 65 the inputs cannot bind a run or the run is
-//! void (a digest mismatch, a band-6 or accounting failure on a portable
-//! ingest row, an engine with no URL or no ingest row, a classification
-//! error); 66 an input file is unreadable or malformed; 70 the assembled
-//! report fails validation, in which case nothing is written; 74 the report
-//! or the sidecar could not be written.
+//! Exit codes: 0 the report (and any sidecar) was written; 64 a usage error
+//! (an `--engine` value that does not parse); 65 the inputs cannot bind a run
+//! or the run is void (a digest mismatch, a band-6 or accounting failure on a
+//! portable ingest row, an engine with no URL or no ingest row, a
+//! classification error, or a repetition-accounting failure), and no report
+//! is written; on a repetition-accounting failure the sidecar is still
+//! written when `--diagnostics` is given; 66 an input file is unreadable or
+//! malformed; 70 the assembled report fails validation, in which case nothing
+//! is written; 74 the report or the sidecar could not be written.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
-use ravel_bench::metrics_correctness::Engine;
 use ravel_bench::metrics_ingest::MetricsIngestReport;
 use ravel_bench::metrics_query::{
-    BindError, Diagnostics, EngineSpec, RAVEL_COST_NOTE, REGIME_CONFIG_KEY, REGIME_STEADY_STATE,
-    RunOptions, bind, bind_diagnostic, endpoints, parse_engine_spec, run, system_name,
+    BindError, Binding, EX_DATAERR, EX_NOINPUT, EX_SOFTWARE, EX_USAGE, EngineSpec, Failure,
+    OutputPaths, REGIME_CONFIG_KEY, REGIME_STEADY_STATE, RunOptions, RunOutput, bind,
+    bind_diagnostic, endpoints, finish_run, parse_engine_spec, run,
 };
 use ravel_bench::metrics_workload::load_workload;
 use ravel_bench::promql_corpus::load_corpus;
 use ravel_bench::report_schema::{
-    ConfigEntry, INSUFFICIENT_PASSES, MIN_VARIANCE_PASSES, MetricsBenchReport, Provenance,
-    RunVerdict, SCHEMA_VERSION, VARIANCE_CONFIG_KEY, validate, validate_diagnostic,
+    ConfigEntry, FailedBand, INSUFFICIENT_PASSES, MIN_VARIANCE_PASSES, MetricsBenchReport,
+    Provenance, RunVerdict, SCHEMA_VERSION, VARIANCE_CONFIG_KEY, validate, validate_diagnostic,
 };
-
-const EX_USAGE: u8 = 64;
-const EX_DATAERR: u8 = 65;
-const EX_NOINPUT: u8 = 66;
-const EX_SOFTWARE: u8 = 70;
-const EX_IOERR: u8 = 74;
 
 #[derive(Parser, Debug)]
 #[command(about = "Run the MetricsBench PromQL corpus over HTTP against every engine (ADR-0927)")]
@@ -96,7 +92,8 @@ struct Args {
     out: PathBuf,
     /// Where to write the diagnostics sidecar (each non-oracle engine's
     /// largest ULP gap to the oracle per entry, and every oracle retry),
-    /// after the report. Not part of the report.
+    /// after the report, or with no report on a repetition-accounting
+    /// failure. Not part of the report.
     #[arg(long)]
     diagnostics: Option<PathBuf>,
     /// Query a run whose ingest verification failed, as a diagnostic: a
@@ -122,8 +119,6 @@ async fn main() -> ExitCode {
         }
     }
 }
-
-type Failure = (u8, String);
 
 fn read(path: &Path) -> Result<Vec<u8>, Failure> {
     std::fs::read(path).map_err(|e| (EX_NOINPUT, format!("{}: {e}", path.display())))
@@ -167,7 +162,7 @@ async fn run_main(args: Args) -> Result<(), Failure> {
     let corpus = load_corpus(&args.corpus)
         .map_err(|e| (EX_NOINPUT, format!("{}: {e}", args.corpus.display())))?;
     let provenance_bytes = read(&args.provenance)?;
-    let mut provenance: Provenance = serde_json::from_slice(&provenance_bytes).map_err(|e| {
+    let provenance: Provenance = serde_json::from_slice(&provenance_bytes).map_err(|e| {
         (
             EX_NOINPUT,
             format!("{}: not a provenance block: {e}", args.provenance.display()),
@@ -214,10 +209,27 @@ async fn run_main(args: Args) -> Result<(), Failure> {
         deadline: Duration::from_millis(args.query_timeout_ms),
         oracle_retries: args.oracle_retries,
     };
-    let mut output = run(&binding, &entries, &workload, options)
-        .await
-        .map_err(|e| (EX_DATAERR, e.to_string()))?;
+    let outcome = run(&binding, &entries, &workload, options).await;
+    let paths = OutputPaths {
+        out: &args.out,
+        diagnostics: args.diagnostics.as_deref(),
+        profile: &binding.run.profile,
+        corpus_digest: &corpus_digest,
+    };
+    finish_run(outcome, paths, |output| {
+        assemble_report(&args, &binding, provenance, failed_bands, output)
+    })
+}
 
+/// Stamps the run's settings on `provenance`, builds the report from
+/// `output`, and returns it serialized once it validates.
+fn assemble_report(
+    args: &Args,
+    binding: &Binding,
+    mut provenance: Provenance,
+    failed_bands: Vec<FailedBand>,
+    output: &mut RunOutput,
+) -> Result<Vec<u8>, Failure> {
     provenance.schema_version = SCHEMA_VERSION;
     let config = &mut provenance.config;
     set_config(config, "profile", binding.run.profile.clone());
@@ -254,7 +266,7 @@ async fn run_main(args: Args) -> Result<(), Failure> {
             retried.join(",")
         },
     );
-    for (system, url) in endpoints(&binding) {
+    for (system, url) in endpoints(binding) {
         set_config(config, &format!("query_url.{system}"), url);
     }
     if (args.passes as usize) < MIN_VARIANCE_PASSES {
@@ -284,28 +296,6 @@ async fn run_main(args: Args) -> Result<(), Failure> {
             format!("the assembled report fails validation, nothing written: {e}"),
         )
     })?;
-    let json = serde_json::to_vec_pretty(&report)
-        .map_err(|e| (EX_SOFTWARE, format!("cannot serialize the report: {e}")))?;
-    std::fs::write(&args.out, json)
-        .map_err(|e| (EX_IOERR, format!("{}: {e}", args.out.display())))?;
-    if let Some(path) = &args.diagnostics {
-        let diagnostics = Diagnostics {
-            profile: &binding.run.profile,
-            corpus_digest: &corpus_digest,
-            oracle: system_name(Engine::Prometheus),
-            ulp_gaps: &output.ulp_gaps,
-            oracle_retries: &output.oracle_retries,
-            ravel_cost: &output.ravel_cost,
-            skipped_reps: &output.skipped_reps,
-            ravel_cost_note: RAVEL_COST_NOTE,
-        };
-        let json = serde_json::to_vec_pretty(&diagnostics).map_err(|e| {
-            (
-                EX_SOFTWARE,
-                format!("cannot serialize the diagnostics: {e}"),
-            )
-        })?;
-        std::fs::write(path, json).map_err(|e| (EX_IOERR, format!("{}: {e}", path.display())))?;
-    }
-    Ok(())
+    serde_json::to_vec_pretty(&report)
+        .map_err(|e| (EX_SOFTWARE, format!("cannot serialize the report: {e}")))
 }

@@ -33,9 +33,9 @@ use ravel_object_store::{
 use ravel_promql::Value;
 use ravel_query::{
     BUDGETED_REQUESTS_PER_UNSEALED_FLUSH, DEFAULT_BUDGET_REFERENCE_SHARDS,
-    DEFAULT_WHOLE_OBJECT_THRESHOLD, EngineConfig, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT,
-    MAX_REQUESTS_PER_UNSEALED_FLUSH, QueryEngine, QueryPhase, QueryStats,
-    REQUEST_BUDGET_FIXED_OVERHEAD, REQUESTS_PER_UNSEALED_FLUSH,
+    DEFAULT_WHOLE_OBJECT_THRESHOLD, EngineConfig, MAX_GETS_PER_L0_SEGMENT_FETCH,
+    MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, MAX_REQUESTS_PER_UNSEALED_FLUSH, QueryEngine, QueryPhase,
+    QueryStats, REQUEST_BUDGET_FIXED_OVERHEAD, REQUESTS_PER_UNSEALED_FLUSH,
 };
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, VERSION_V7};
 use ravel_types::accounting::AccountedOp;
@@ -276,6 +276,16 @@ async fn large_fixture(
     sealed: u64,
     tail_per_shard: u64,
 ) -> (Arc<MemoryStore>, TenantHash, Vec<u64>) {
+    large_fixture_with(sealed, tail_per_shard, large_inputs).await
+}
+
+/// [`large_fixture`] with every unsealed flush built by `build` from the
+/// tenant, its first sample's timestamp and a seed.
+async fn large_fixture_with(
+    sealed: u64,
+    tail_per_shard: u64,
+    build: fn(&TenantId, i64, u64) -> Vec<SeriesInput>,
+) -> (Arc<MemoryStore>, TenantHash, Vec<u64>) {
     let store = Arc::new(MemoryStore::new());
     let tid = TenantId::new("acme".to_string());
     let th = tid.hash();
@@ -299,14 +309,14 @@ async fn large_fixture(
             seq += 1;
             let start =
                 i64::from(TAIL_HOUR) * NS_PER_HOUR + 10 * NS_PER_MIN + j as i64 * 2 * NS_PER_MIN;
-            let inputs = large_inputs(&tid, start + offset, seq);
+            let inputs = build(&tid, start + offset, seq);
             let size = publish_segment(store.as_ref(), th, shard, seq, TAIL_HOUR, inputs).await;
             sizes.push(size);
         }
         for _ in 0..RECENT_PER_SHARD {
             seq += 1;
             let start = NOW_NS - 2 * NS_PER_MIN;
-            let inputs = large_inputs(&tid, start + offset, seq);
+            let inputs = build(&tid, start + offset, seq);
             let size = publish_segment(store.as_ref(), th, shard, seq, RECENT_HOUR, inputs).await;
             sizes.push(size);
         }
@@ -337,6 +347,74 @@ fn alternate_series_keys(tenant_id: &TenantId) -> Vec<String> {
         .collect();
     by_id.sort();
     by_id.into_iter().step_by(2).map(|(_, k)| k).collect()
+}
+
+/// Series in one sparse flush: the writer's sparse (chunked catalog)
+/// threshold. Samples per series, raw f64 like [`large_inputs`], carry the
+/// object past the whole-object threshold with its catalog sections at the
+/// front, outside the footer tail.
+const SPARSE_SERIES: usize = 4_096;
+const SPARSE_SAMPLES: i64 = 32;
+
+/// The label value of series `i` of a sparse flush.
+fn sparse_key(i: usize) -> String {
+    format!("{i:04}")
+}
+
+fn sparse_labels(i: usize) -> LabelSet {
+    LabelSet::new(vec![
+        Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: METRIC.to_string(),
+        },
+        Label {
+            name: "k".to_string(),
+            value: sparse_key(i),
+        },
+    ])
+    .expect("valid labels")
+}
+
+/// `SPARSE_SERIES` series of `m`, told apart by label `k`, each with
+/// `SPARSE_SAMPLES` samples one second apart from `start_ns`.
+fn sparse_inputs(tenant_id: &TenantId, start_ns: i64, seed: u64) -> Vec<SeriesInput> {
+    let mut state = seed | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        f64::from_bits(state >> 2)
+    };
+    (0..SPARSE_SERIES)
+        .map(|i| {
+            let labels = sparse_labels(i);
+            let series_id = SeriesId::compute(tenant_id, METRIC, &labels).expect("series id");
+            let samples = (0..SPARSE_SAMPLES)
+                .map(|s| Sample {
+                    ts_ns: start_ns + s * NS_PER_SEC,
+                    value: next(),
+                })
+                .collect();
+            SeriesInput {
+                series_id,
+                labels,
+                samples,
+            }
+        })
+        .collect()
+}
+
+/// Six series of a sparse flush, 800 apart in the order the writer lays
+/// their pages out, so their VAL pages are six runs no coalescing joins.
+fn spread_sparse_keys(tenant_id: &TenantId) -> Vec<String> {
+    let mut by_id: Vec<([u8; 16], String)> = (0..SPARSE_SERIES)
+        .map(|i| {
+            let id = SeriesId::compute(tenant_id, METRIC, &sparse_labels(i)).expect("series id");
+            (id.0, sparse_key(i))
+        })
+        .collect();
+    by_id.sort();
+    by_id.into_iter().step_by(800).map(|(_, k)| k).collect()
 }
 
 /// Requests a query issued, by the kind of object they touched.
@@ -455,6 +533,8 @@ struct Cost {
     phases: [[u64; 3]; 4],
     objects: ByObject,
     samples: usize,
+    /// `QueryStats::segments_probed_two_step`.
+    two_step: u64,
 }
 
 impl Cost {
@@ -512,6 +592,7 @@ async fn cold(store: &Arc<MemoryStore>, th: TenantHash, query: &str) -> Cost {
         phases,
         objects,
         samples,
+        two_step: stats.segments_probed_two_step,
     }
 }
 
@@ -804,8 +885,69 @@ async fn cold_requests_per_unsealed_flush_above_whole_object_threshold() {
     for total in totals {
         assert!(total <= MAX_REQUESTS_PER_UNSEALED_FLUSH);
     }
-    // The worst measured flush leaves one request of the ceiling: the footer
-    // chase, which a footer inside the 64 KiB tail never needs.
-    assert_eq!(MAX_REQUESTS_PER_UNSEALED_FLUSH, 8);
-    assert_eq!(BUDGETED_REQUESTS_PER_UNSEALED_FLUSH, 8);
+    // The worst measured flush leaves two requests of the ceiling: the footer
+    // chase, which a footer inside the 64 KiB tail never needs, and the sparse
+    // probe's dictionary GET, which a dense catalog never issues
+    // (`cold_sparse_flush_two_step_probe_fits_the_per_flush_ceiling` spends it).
+    assert_eq!(MAX_REQUESTS_PER_UNSEALED_FLUSH, 9);
+    assert_eq!(BUDGETED_REQUESTS_PER_UNSEALED_FLUSH, 9);
+}
+
+/// Issue #3862: a sparse flush (a catalog of 4,096 series at the object's
+/// front) whose dictionary holds the selected values is read in two steps,
+/// the LABEL_DICT GET and then the rest of the catalog, so probe costs 2
+/// requests per flush instead of 1. With 6 page runs held at the page-range
+/// bound, a flush costs 8 requests, one under the ceiling: the footer chase,
+/// which only a footer outside the 64 KiB tail needs, is the one left unused.
+#[tokio::test]
+async fn cold_sparse_flush_two_step_probe_fits_the_per_flush_ceiling() {
+    const K: u64 = 2;
+    const N_LOW: u64 = 0;
+    const N_HIGH: u64 = 1;
+    let shards = u64::from(SHARDS);
+    let tid = TenantId::new("acme".to_string());
+    let spread = spread_sparse_keys(&tid);
+    assert_eq!(spread.len(), 6);
+    let query = format!("m{{k=~\"{}\"}}[140m]", spread.join("|"));
+
+    let (store, th, sizes_low) = large_fixture_with(K, N_LOW, sparse_inputs).await;
+    let low = cold(&store, th, &query).await;
+    let (store, th, sizes_high) = large_fixture_with(K, N_HIGH, sparse_inputs).await;
+    let high = cold(&store, th, &query).await;
+
+    assert_eq!(sizes_low.len(), 2);
+    assert_eq!(sizes_high.len(), 4);
+    for size in sizes_low.into_iter().chain(sizes_high) {
+        assert!(size > DEFAULT_WHOLE_OBJECT_THRESHOLD, "{size} bytes");
+    }
+
+    let samples = spread.len() * SPARSE_SAMPLES as usize;
+    assert_eq!(low.samples, 2 * samples);
+    assert_eq!(high.samples, 4 * samples);
+    // Every sparse flush in range is probed in two steps, and no flush count
+    // here reaches the gate's decision at the default fan-out of 8.
+    assert_eq!(low.two_step, 2);
+    assert_eq!(high.two_step, 4);
+
+    let added_flushes = shards * (N_HIGH - N_LOW);
+    let mut per_flush = [0u64; 4];
+    for (phase, slot) in per_flush.iter_mut().enumerate() {
+        let delta: u64 =
+            high.phases[phase].iter().sum::<u64>() - low.phases[phase].iter().sum::<u64>();
+        assert_eq!(delta % added_flushes, 0);
+        *slot = delta / added_flushes;
+    }
+    // [resolve, plan, probe, scan]: record; footer tail; LABEL_DICT and the
+    // rest of the catalog; six page runs in the bounded page-range GETs.
+    assert_eq!(
+        per_flush,
+        [1, 1, 2, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64],
+        "a two-step sparse probe costs one more probe request than a dense catalog read"
+    );
+    let data_gets = (high.objects.data_gets - low.objects.data_gets) / added_flushes;
+    assert_eq!(data_gets, 7);
+    assert_eq!(data_gets + 1, MAX_GETS_PER_L0_SEGMENT_FETCH);
+    let total: u64 = per_flush.iter().sum();
+    assert_eq!(total, 8);
+    assert_eq!(total + 1, MAX_REQUESTS_PER_UNSEALED_FLUSH);
 }

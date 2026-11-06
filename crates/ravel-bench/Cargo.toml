@@ -185,6 +185,11 @@ ravel-mcp = { workspace = true, optional = true }
 # regular dependency. Workspace pin with its `time` feature added; no new
 # external crate.
 rustix = { workspace = true, features = ["time"] }
+# The rlog compaction profile (issue #3819) times the compactor's phases from
+# its own tracing events, so it installs a capturing subscriber. Workspace
+# pins, no new external crate.
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 # The saturation bins install jemalloc as their global allocator the way
 # ravel-server's binary does, so the server they measure allocates as the
@@ -221,6 +226,9 @@ flight-egress = [
 # bench bins wrap their measured region in a sampler when
 # `RAVEL_BENCH_PROFILE_SVG` names an output path (see `src/profiling.rs`).
 profiling = ["dep:pprof"]
+# Lets `rlog_compaction_profile` (issue #3819) run under jemalloc, the global
+# allocator ravel-cli installs, for a side-by-side with the system allocator.
+compaction-jemalloc = ["dep:tikv-jemallocator"]
 # Per-stage ingest timing (ADR-0104 decision 2b). Off by default: the shipping
 # `ingest_bench` bin compiles and runs in BOTH modes and only emits the
 # stage-breakdown field with this on, so no default gate stops covering the bin
@@ -715,6 +723,12 @@ bench = false
 [[bin]]
 name = "int_page_decode"
 path = "src/bin/int_page_decode.rs"
+bench = false
+
+# Where the CPU of one RLOG L0 -> L1 compaction goes (issue #3819).
+[[bin]]
+name = "rlog_compaction_profile"
+path = "src/bin/rlog_compaction_profile.rs"
 bench = false
 
 [lints]

@@ -1058,8 +1058,9 @@ shape (docs/segment-format.md, ADR-0026):
   does. Each catalog section the decode reads has its crc32c re-verified on
   the fetched bytes, so a mis-ranged or corrupt fetch is a typed error, never
   wrong data. The matching decode reads only LABEL_DICT when an equality
-  name or value is absent from it; the other three sections are fetched but
-  neither verified nor decoded in that case.
+  name or value is absent from it; under the one-step probe the other three
+  sections are fetched but neither verified nor decoded in that case, and
+  under the dictionary-first probe below they are not fetched at all.
 - **Otherwise** (a sparse object that does not qualify) the fetcher keeps the
   unchanged whole-object GET and `decode_catalog_v5`.
 
@@ -1076,6 +1077,62 @@ conservatively (256 KiB: above the four fixed 64 KiB suffix/gap probes, far
 below any real compacted sparse L1 segment) rather than fit to a measured point.
 The within-segment GET/byte model is the `selective_read_accounting` bench.
 
+### The dictionary-first probe and its per-plan gates (ADR-3694 decision 1)
+
+On the catalog-probe path, a selector with at least one non-empty positive
+equality matcher (`__name__` included) can take a two-step probe. Step one
+GETs the LABEL_DICT range alone and checks it with
+`ravel_segment::label_dict_holds_all`, under one fetch-memory reservation for
+the inflated dictionary that is released as soon as the answer is known. When
+any matched name or value is absent, the object holds no matching series: it
+is dropped with no further GET and counted in `segmentsPrunedByDictionary`.
+Otherwise step two GETs the other three catalog sections as one coalesced
+request and the decode above runs unchanged; LABEL_DICT is not fetched again.
+A corrupt dictionary at step one is the same typed corrupt-segment error the
+one-step probe reports. `!=`, regex and empty-value matchers take no part in
+the check, and a selector without a positive equality runs the one-step
+probe. An object at or under the whole-object threshold
+(`DEFAULT_WHOLE_OBJECT_THRESHOLD`, 512 KiB by default, set per fetcher with
+`SegmentFetcher::with_whole_object_threshold`) already holds its whole catalog
+after the first GET and never takes step one. Neither does an object whose
+LABEL_DICT the footer tail already holds: it is checked with no GET.
+
+Step one pays one extra GET for every object whose dictionary holds the
+values, so the engine gates it within each statement, one
+`DictionaryProbeGate` per selector plan (a distinct matcher set), per the
+ADR's probe gate amendment:
+
+- The name-only rule is per segment. When a statement's only positive
+  equality matchers are `__name__` values, a segment the name postings
+  filtered (a sealed segment of a snapshot whose `segmentsPruned` is above
+  zero) runs the one-step probe, since its dictionary holds the name. Every
+  other segment of the statement, a recent unsealed one included, goes
+  through its plan's gate
+  (`name_only_statement_gates_the_segments_the_postings_did_not_filter`,
+  `crates/ravel-query/tests/dictionary_probe.rs`).
+- Every other segment starts two-step under its plan's gate, so a selective
+  plan and a non-selective one in the same statement decide apart
+  (`each_selector_plan_switches_its_own_gate`). A gate decides on the first
+  `K` of its plan's two-step probes to complete, `K` being the statement's
+  PromQL fetch fan-out (`promql_fetch_fanout`): if fewer than half dropped
+  their object, the plan's later objects use the one-step probe. Before the
+  decision the cap is on probes in flight, at most `K` at once, so up to
+  `2K - 1` can start (`K - 1` completed and `K` running when the `K`-th
+  completes); an object arriving while `K` are in flight takes the one-step
+  probe. Probes already in flight keep the mode they started with
+  (`dictionary_probe_gate_decides_on_the_first_k_probes` in `fetcher.rs`).
+- When a plan's gate switches off, its extra GETs over the one-step probe
+  are the two-step probes started before the decision, at most `2K - 1`,
+  under twice the fan-out. When at least half of its first `K` two-step
+  probes dropped, the gate stays on: every later holder pays one extra GET,
+  and the drops pay for them, each dropped object reading its LABEL_DICT
+  alone instead of its whole catalog. Both probes decode the same catalog,
+  so results are bit-identical; only the request count differs.
+
+The gate is armed by the PromQL metrics fetch (`prefetch_metric_plans`). The
+SQL, distributed and series-listing fetches leave it unarmed and run the
+one-step probe. A dropped object still counts in `segmentsFetched`.
+
 ### The L0 page-range bound (ADR-1306)
 
 An unsealed L0 flush is one ingest buffer. Ingest's 8 MiB `target_bytes` size
@@ -1091,10 +1148,15 @@ leaves 48 runs that coalescing cannot join, which would be 48 page GETs.
 left, on an L0 segment only.
 Scalar and histogram runs are planned and fetched in one batch, and the
 catalog sections go as one run (three on the dense path, four on the sparse
-catalog-probe path), so the bound holds per segment fetch whichever page
-kinds a query selects. One L0 fetch therefore costs at most
-`MAX_GETS_PER_L0_SEGMENT_FETCH` = 7 GETs: the first GET, one footer chase, one
-catalog GET and 4 page GETs. Bridging moves the bytes in a bridged gap that
+catalog-probe path) or, when the dictionary-first probe reads LABEL_DICT
+first, as two, so the bound holds per segment fetch whichever page kinds a
+query selects. One L0 fetch therefore costs at most
+`MAX_GETS_PER_L0_SEGMENT_FETCH` = 1 + 1 + 2 + 4 = 8 GETs: the first GET, one
+footer chase, two catalog GETs (the LABEL_DICT GET, then the rest of the
+catalog) and 4 page GETs
+(`sparse_l0_two_step_fetch_meets_the_per_segment_bound` in `fetcher.rs`; a
+dense catalog read leaves the dictionary GET unused). Bridging moves the
+bytes in a bridged gap that
 the query did not ask for, which is the trade the bound makes: a bounded,
 predictable request count per flush in exchange for bytes inside one segment.
 The bridged gap bytes are fetched like any other page bytes: they are reserved
@@ -2041,14 +2103,14 @@ Their cost is bounded instead by a per-query S3 request budget
 (`EngineConfig::max_s3_requests`, derived from the deployment's shard count,
 ingest flush cadence and catalog seal margin by `derive_max_s3_requests_for`
 rather than a flat constant -- ADR-0075 decisions 1-2, ADR-1306 decisions 1
-and 3; the derived default is 343,400 at the default 4 shards and the 2s
+and 3; the derived default is 385,700 at the default 4 shards and the 2s
 flush cadence ADR-0076 decision 4 sets), checked
 incrementally at the same points `max_bytes_scanned` already is, and reported
 as `RequestBudgetExceeded` (HTTP 422) when tripped. A running server does not
 use the `DEFAULT_BUDGET_REFERENCE_SHARDS` (4) and
 `DEFAULT_BUDGET_REFERENCE_FLUSH_DELAY` (500ms) reference pair that
 `EngineConfig::default` carries for context-free callers (tests, alerting,
-other non-server callers); that pair derives 1,358,600, which is not the
+other non-server callers); that pair derives 1,527,800, which is not the
 deployment default.
 
 The span the per-shard allowance is sized from is `covered_span` (ADR-1306
@@ -2076,7 +2138,7 @@ verbatim and follows no margin.
 the span it is measured against (ADR-1306 decision 5):
 
 ```text
-per-query S3 request budget resolved max_s3_requests=343400 source="derived" covered_span_secs=14100 seal_margin_secs=4800
+per-query S3 request budget resolved max_s3_requests=385700 source="derived" covered_span_secs=14100 seal_margin_secs=4800
 ```
 
 `source` is `derived` or `explicit --max-s3-requests`, and `covered_span_secs`
@@ -2108,16 +2170,20 @@ any stall.
 Each unsealed flush in that span is sized at
 `BUDGETED_REQUESTS_PER_UNSEALED_FLUSH`, the larger of
 `REQUESTS_PER_UNSEALED_FLUSH` (2, the measured cold cost of a flush at or under
-the whole-object threshold) and `MAX_REQUESTS_PER_UNSEALED_FLUSH` (8, its
+the whole-object threshold) and `MAX_REQUESTS_PER_UNSEALED_FLUSH` (9, its
 commit-record GET plus `MAX_GETS_PER_L0_SEGMENT_FETCH`), so the per-flush term
 is an upper bound per selector fetch at any flush size ingest can produce, not
 only under the threshold. At 4 shards and 2 s that is
-`ceil(14,100 / 2) x 8 x 3/2 x 4 + 5,000 = 343,400`. It is not an upper bound
-per query: `prefetch` fetches each segment once per selector (the
-`estimate_cost` comment in `engine.rs`), while the commit record is read once
-at resolve, so an N-selector query pays up to `1 + 7N` requests per unsealed
-flush against a budget sized at 8. The derived budget does not scale with the
-selector count (ADR-1306, "Amendment (2026-09-27)").
+`ceil(14,100 / 2) x 9 x 3/2 x 4 + 5,000 = 385,700`
+(`derived_budget_covers_healthy_tail_plus_stall_alert_window`). A cold sparse
+flush read with the two-step dictionary probe measures 8 of the 9
+(`cold_sparse_flush_two_step_probe_fits_the_per_flush_ceiling`). The per-flush
+term is not an upper bound per query: `prefetch` fetches each segment once per
+selector (the `estimate_cost` comment in `engine.rs`), while the commit record
+is read once at resolve, so an N-selector query pays up to `1 + 8N` requests
+per unsealed flush against a budget sized at 9. The derived budget does not
+scale with the selector count (ADR-1306, "Amendment (2026-09-27)" and the
+dictionary GET amendment).
 
 A refusal says when the unsealed tail, not the query, is what the budget was
 spent on (ADR-1306 decision 6): each resolve records the tail it listed live
@@ -2781,8 +2847,8 @@ alter it without the slice key (`crates/ravel-sql/src/flight_ticket.rs`,
 
 | Table | Carried | Not carried |
 |---|---|---|
-| `spans` | `ts_lo`, `ts_hi`, `trace_id` | `duration_ns` window, `status_code` mask, `service_name`, `name` |
-| `logs` | `ts_lo`, `ts_hi`, prune predicates: attribute or declared-column string/bytes equality, I64/F64/Bool range; exact-key equalities (field, key type, 8-byte key) for the KEY_IDX probe | the content channel (`has_word`, a pushed `LIKE '%literal%'`) |
+| `spans` | `ts_lo`, `ts_hi`, `trace_id`, the `trace_id IN` list (16-byte ids) | `duration_ns` window, `status_code` mask, `service_name`, `name` |
+| `logs` | `ts_lo`, `ts_hi`, prune predicates: attribute or declared-column string/bytes equality, I64/F64/Bool range; exact-key equalities (field, key type, 8-byte key) for the KEY_IDX probe; the exact-key `IN` set (field, key type, sorted 8-byte keys) | the content channel (`has_word`, a pushed `LIKE '%literal%'`) |
 
 The pushdown-aware fragment is built by the provider's
 `worker_fragment_with_pushdown`. No production `DoGet` calls it yet: the Flight
@@ -2819,14 +2885,30 @@ signed under a slice key as `wrong_surface`. Version 11 is the slice ticket
 whose logs block also carries the exact-key equalities the worker probes
 KEY_IDX with (see the exact-key probe below); it is version 9's layout plus
 that key section, so it is a slice-surface version and never a client one. A
-slice ticket whose block carries no key stays version 9. Each surface decodes
-its own set: the client surface versions 8, 9 and 10, the slice surface 8, 9
-and 11. A version 11 ticket on the client surface is refused as an
-unsupported version, as a version 10 ticket is on the slice surface. Each
-surface mints only its own set: `FlightTicket::encode_for_surface`, which
+slice ticket whose block carries no key stays version 9. Version 12 is the
+slice ticket whose block carries a key set (ADR-3692 decision 6): version
+11's layout plus, on a logs block, the equalities' count (0 allowed) and
+equalities followed by the key-set section (field, key type, a count of 1
+to 1,024, then that many 8-byte keys in strictly ascending order), and, on a
+spans block, a trace-id list (a count of 1 to 1,024, then that many 16-byte
+ids in strictly ascending order) after the version 9 block's single optional
+trace id. Workers decode a slice ticket with `SqlTicketKeys::decode`, which
+drops the pushdown block and re-plans the fragment from the statement text,
+so the block never changes a worker's rows; what version 12 changes is a
+mixed-version rollout, where a version 11 worker refuses these tickets on
+their version byte, an error rather than wrong rows. A count of 0 or over 1,024, or
+keys out of order, is `InvalidKeySet`. Versions 8 to 11 encode byte for byte
+as before version 12 existed, each pinned by a golden-bytes test
+(`version_11_bytes_unchanged_and_version_12_carries_key_set`). Each surface
+decodes its own set: the client surface versions 8, 9 and 10, the slice
+surface 8, 9, 11 and 12. A version 11 or 12 ticket on the client surface is
+refused as an unsupported version, as a version 10 ticket is on the slice
+surface. Each surface mints only its own set: `FlightTicket::encode_for_surface`, which
 `SqlTicketKeys` and the coordinator's slice client mint through, refuses a
-version 10 ticket for the slice surface as `SignalGroupsOnSlice` and a
-version 11 ticket for the client surface as `KeyEqualsOnClient`. The
+version 10 ticket for the slice surface as `SignalGroupsOnSlice`, a
+version 11 ticket for the client surface as `KeyEqualsOnClient`, and a
+version 12 one as `KeySetOnClient`. A worker on version 11 refuses a version
+12 ticket on its version byte. The
 version moves because
 the coordinator that mints a ticket and the worker that redeems it can run
 different builds during a rolling upgrade, and the worker has to be able to
@@ -3502,6 +3584,14 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   fetched, and `segmentsPruned` is the rest of the resolved snapshot. The
   log lane's catalog resolve passes no name filter, so it prunes nothing
   of its own.
+- `stats.segmentsPrunedByDictionary`, `stats.segmentsProbedTwoStep`,
+  `stats.dictionaryProbeSwitchedOff`: the dictionary-first probe's figures
+  (see "The dictionary-first probe and its per-plan gates"). The first
+  counts objects dropped because their LABEL_DICT lacked a matched name or
+  value; the second counts objects that paid the two-step probe's dictionary
+  GET, so an object whose LABEL_DICT the footer tail already held is not in
+  it; the third is whether any selector plan's gate switched to the one-step
+  probe.
 - `stats.estimate`: the `CostEstimate`, carrying `estimatedRequests`,
   `estimatedStoreBytes`, `estimatedDecompressedBytes`, `segments`,
   `series`.
@@ -3788,9 +3878,10 @@ and block-level reported independently:
   the key absent, or, for several logs keys joined by `AND`, named no block
   every key shares (ADR-2707 decision 5). It also counts the segments the
   tier-2 router dropped before the scan because their part's leaves prove
-  the trace (spans) or the one declared-key equality's key (logs) absent
-  (ADR-3692 decisions 3 and 4); a segment is counted by one tier only, since
-  a tier-2 prune is never opened.
+  the trace or every id of a `trace_id IN` list (spans), or the key of the
+  one declared-key arm, an equality or every key of an `IN` set (logs),
+  absent (ADR-3692 decisions 3, 4 and 6); a segment is counted by one tier
+  only, since a tier-2 prune is never opened.
 - `blocksPrunedByKeyIndex`: blocks the skip index kept, in the segments that
   lookup did read, that KEY_IDX named no entry for. On spans it is 0 when the
   skip index already narrows the object to the trace's blocks, which it does
@@ -4738,6 +4829,20 @@ Three numbers, one decision:
   statement at the complexity bound fits in it many times over, with room for
   whitespace, string literals, and `min_commit_token` values.
 
+One construct is priced on its own (ADR-3692, key set amendment): a flat
+`IN` list whose every element is a literal, a bare `'...'` string, an
+`X'...'` hex string or a number with an optional sign, costs one token for
+the list plus one per 64 literals, rounded up, so a 1,000-key lookup costs
+17 instead of about 2,000 and fits under the bound with room for the rest of
+the statement. It is sound because the parser holds the list as one `Vec` of
+leaves under one `InList` node: the list adds width, not depth. Anything else
+between the parentheses (an identifier, an operator, a nested parenthesis, a
+comment) declines the allowance and every token counts as before. A flat list
+of more than 4,096 literals (`MAX_IN_LIST_LITERALS`) is refused with the same
+typed error, whose message names the list cap. Every other token's cost and
+the 1,000-token bound are unchanged. The body cap still applies: 1,000 hex
+trace ids are about 37 KB of text.
+
 The check is not a call each parse site is expected to remember. It is part of
 the parse: `ravel_sql::complexity_guard::parse_guarded` runs the check and then
 builds the parser with the pinned recursion limit, and it is the only parse of
@@ -5108,9 +5213,9 @@ does not pin it: it only decides which equalities reach the probe, which
 narrows the blocks read, not the rows returned. An equality on a typed
 attribute column the declaration does not name issues no KEY_IDX read, even on
 an object whose section indexes it. A distributed logs slice does not resolve it again: the
-coordinator's kept keys travel in the slice ticket (version 11; version 10 is
-the grouped client ticket of ADR-2904), and a version 11 ticket carrying a
-spans block is refused.
+coordinator's kept keys travel in the slice ticket (version 11, or version 12
+when it carries an `IN` set; version 10 is the grouped client ticket of
+ADR-2904), and a version 11 ticket carrying a spans block is refused.
 
 Each object above the block-range threshold that the catalog keeps reads the
 section's prefix
@@ -5185,6 +5290,55 @@ The probe trades block reads for index reads: a selective equality reads
 fewer bytes, but every object probed pays the prefix GET and up to one bucket
 GET per key whether or not it holds the key.
 
+**Exact-key `IN` lists (ADR-3692 decision 6).** A top-level
+`column IN (v1, ..., vn)` carries one key set of 1 to 1,024 distinct keys.
+On logs it is `LogsPushdown::key_in` (`LogQuery::key_in`, a
+`ravel_query::KeyIn`): a declared key-index `i64`, `str` or `bytes` column
+against literals of exactly its type, or `trace_id` (with `index_trace_id`
+on) against 16-byte binary or 32-character hex literals. On spans it is
+`SpansPushdown::trace_ids`, for `trace_id IN` 16-byte binary or 32-character
+hex literals; a hex list plans because the `trace_id_hex_in_list` analyzer
+rule rewrites it into the column's native literals before type coercion
+(`crates/ravel-sql/src/trace_id_planner.rs`). A `NOT IN`, a mixed-type list, a
+list holding a NULL or an expression, a list of more than 1,024 distinct
+values, and a list under `OR` carry no key; a declared `i64` list keeps its
+envelope `NumRange` prune arm whatever happens to the key. The first such list
+of a conjunction is the set; a second carries nothing. DataFusion rewrites a
+list of at most three values into `=` disjuncts before the scan sees it (one
+value into a plain `=`, which is an equality arm), and a disjunction carries
+no key. The pushdown stays `Inexact`: the residual re-applies the list over
+the full values, so a `key8` collision only adds a block. On spans the reader
+filters a set's rows by the time window alone, and the residual is the `IN`
+list's exact evaluator.
+
+The set is ANDed with the equality arms: an object is dropped when every key
+of the set is absent or when an equality is absent, and the blocks read are
+the union of the set's keys' block sets intersected with every equality's.
+Tier 1 with a set reads the KEY_IDX prefix once and locates every key in its
+bucket directory; a key whose bucket is empty is absent with no read. When the
+set touches at most `B_run` = 64 distinct non-empty buckets
+(`KEY_INDEX_SET_PROBE_MAX_RUNS`), each is one read; above that, one ranged
+read spans the touched buckets from the first one's start to the last one's
+end, and every touched bucket is decoded from it
+(`set_probe_reads_the_bucket_area_above_b_run` on both fetchers). So an
+uncovered object costs the prefix and at most `min(buckets touched, B_run)`
+bucket reads, or the prefix and one read of at most the section's bucket area.
+On spans the set takes the ranged trace read: the probe's union names the
+blocks read, and an object whose KEY_IDX says nothing for the set reads every
+SKIP_IDX candidate of the window, each adjacent run in one GET.
+
+A scan routes through the tier-2 router below only when it carries exactly
+one key arm: one declared-key equality or one `IN` set. A scan with two or
+more arms, an `IN` set beside an equality included, stays on the tier-1
+probe, which intersects their block sets where the router would answer from
+one (`route_needs_exactly_one_key_equality`). On spans a `trace_id =`
+equality governs: a statement carrying both it and a `trace_id IN` list
+routes and reads the one id, since the equality alone already pins the rows.
+`stats.keyIndex.keysProbed` is the routed set's distinct `key8` count, so a
+routed `IN` list of `n` distinct keys reads `n`, and a scan that did not route
+reads 0 (`in_list_rows_equal_the_union_of_equalities` in
+`services/ravel-server/tests/sql_key_in.rs`).
+
 **Tier-2 router (ADR-3692 decisions 1 and 2).** `ravel_query::key_index_route`
 is the one per-part leaf router the spans and logs read paths share. Given a
 snapshot resolved with `Catalog::resolve_pruned_with_parts`, which returns
@@ -5203,16 +5357,18 @@ moves `ravel_catalog_isolation_breach_total`. Leaf reads are charged to the
 with the routes; `stats.keyIndex` above renders them under their exact
 names.
 
-The spans `trace_id =` lookup calls it (ADR-3692 decision 3), and so does a
-logs scan carrying exactly one declared-key equality (decision 4, below). A
-logs scan carrying several, joined by `AND`, stays on the tier-1 probe, which
-intersects their block sets where the router would answer from one
-(`route_needs_exactly_one_key_equality`). The SQL
+The spans `trace_id =` lookup and a spans `trace_id IN` list call it
+(ADR-3692 decisions 3 and 6), and so does a logs scan carrying exactly one
+key arm, one declared-key equality or one `IN` set (decisions 4 and 6,
+below). A logs scan carrying two or more arms, joined by `AND`, stays on the
+tier-1 probe, which intersects their block sets where the router would
+answer from one (`route_needs_exactly_one_key_equality`). The SQL
 executor resolves the window with
 `resolve_pruned_with_parts` (`crates/ravel-sql/src/executor.rs`, the spans
 lane's resolve; without parts when the charge is refused, below) and hands
 the parts to `SpansTableProvider` with the snapshot it pins; the provider
-builds the key set from the trace id's `key8` and routes with
+builds the key set from the trace id's `key8`, or from every id of a
+`trace_id IN` list (`trace_ids_key_set`), and routes with
 `SpanLeafRangeReader`, which reads
 each leaf range through the span fetcher's read path, so leaf bytes share
 the read cache (keyed by the leaf's blake3) and the `keyIndex` phase with
@@ -5254,8 +5410,9 @@ The logs scan routes once per scan, in the plan pass before its per-segment
 loop (ADR-3692 decision 4; `route_segments` in
 `crates/ravel-sql/src/logs_scan/plan.rs`). The SQL executor resolves the
 logs lane with `resolve_pruned_with_parts` as it does the spans lane, and
-`LogsTableProvider` hands the parts to the scan. The key set is the first
-declared-key equality the statement pushed (`log_key_set`), and only the
+`LogsTableProvider` hands the parts to the scan. The key set is the scan's
+one key arm: its declared-key equality (`log_key_set`) or its `IN` set
+(`log_key_in_set`), and only the
 segments whose time range meets the statement's window are routed; the leaf
 ranges are read by `LogLeafRangeReader` through the log fetcher's read path,
 so leaf bytes share the read cache and the `keyIndex` phase with the KEY_IDX

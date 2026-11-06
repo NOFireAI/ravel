@@ -1587,6 +1587,11 @@ pub const DEFAULT_INPUT_READ_CONCURRENCY: usize = 32;
 /// [`CompactorConfig::merge_cursor_budget_bytes`] for what the budget bounds.
 pub const DEFAULT_MERGE_CURSOR_BUDGET_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
+/// The memory split target of a level-1 run part (ADR-3853 D4): 256 MiB per
+/// builder, fixed so the number of level-1 builders never moves the final
+/// parts.
+pub const RLOG_RUN_MEMORY_TARGET_BYTES: u64 = 256 * 1024 * 1024;
+
 /// How the RLOG merge admits a stream's per-input cursors (ADR-0979 decision 2).
 /// A knob only because the differential test asserts the two modes produce
 /// byte-identical parts; production always uses [`Self::Overlap`], the bounded
@@ -2136,6 +2141,20 @@ pub struct CompactorConfig {
     /// `--maintain-unit-concurrency`; `ravel-cli maintain compact-tenant` to
     /// its per-bucket cursor budget.
     pub merge_resident_ceiling_bytes: Option<u64>,
+    /// The local directory the two-level RLOG merge writes its level-1 runs
+    /// under (ADR-3853 D2), one subdirectory per unit, wiped when the unit
+    /// ends. A cache only: nothing durable is ever read from it. The first
+    /// two-level merge locks `ravel-scratch.lock` in it for the life of the
+    /// process, so each process needs its own directory. `None` (the
+    /// default) leaves a bucket whose single-level plan is not resident on
+    /// the single-level merge, refused under ADR-3853 D0 when its cursor
+    /// decode is too amplified.
+    pub scratch_dir: Option<std::path::PathBuf>,
+    /// The memory split target a level-1 run part closes at (ADR-3853 D2 and
+    /// D4). Fixed rather than derived from host memory, and it never changes
+    /// the final parts' bytes, only how the runs between the levels are cut.
+    /// Default [`RLOG_RUN_MEMORY_TARGET_BYTES`].
+    pub rlog_run_memory_target_bytes: u64,
     /// How the RLOG merge admits a stream's cursors (ADR-0979 decision 2).
     /// Default [`AdmissionMode::Overlap`] (the bounded path). Only the
     /// differential part-hash test sets [`AdmissionMode::EagerAll`]; output
@@ -2383,6 +2402,8 @@ impl Default for CompactorConfig {
             input_read_concurrency: DEFAULT_INPUT_READ_CONCURRENCY,
             merge_cursor_budget_bytes: DEFAULT_MERGE_CURSOR_BUDGET_BYTES,
             merge_resident_ceiling_bytes: None,
+            scratch_dir: None,
+            rlog_run_memory_target_bytes: RLOG_RUN_MEMORY_TARGET_BYTES,
             merge_admission: AdmissionMode::Overlap,
             rlog_zstd_level: DEFAULT_RLOG_ZSTD_LEVEL,
             compactor_writer_id: Uuid::nil(),

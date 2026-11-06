@@ -174,17 +174,17 @@ services:
       # refused(budget).
       - "--max-segments"
       - "1000000"
-      # S3 requests per query: the derived default 1358600 (4 shards, the
+      # S3 requests per query: the derived default 1527800 (4 shards, the
       # 500ms flush cadence above, 4,800s seal margin), stated, not raised;
       # services/ravel-server/tests/metricsbench_request_budget.rs fails if
       # it stops equalling what this command derives. At one GET per object
       # and the 8 objects per second above, a read over the whole
-      # uncompacted replay needs 169,825 s (47.2 h) of ingest to reach it,
+      # uncompacted replay needs 190,975 s (53.0 h) of ingest to reach it,
       # and --max-segments refuses first, at 125,000 s. Range reads raise
-      # the requests per object: above about 1.36 (1,358,600 / 1,000,000)
+      # the requests per object: above about 1.53 (1,527,800 / 1,000,000)
       # this cap refuses first instead. A hit is refused(budget).
       - "--max-s3-requests"
-      - "1358600"
+      - "1527800"
       # Series per query: replaces the default 10000 (#3306). 1,000,000 is
       # the cardinality profile's active series and VictoriaMetrics'
       # -search.maxUniqueTimeseries; the widest corpus union is 700,000

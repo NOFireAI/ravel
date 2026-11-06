@@ -4622,6 +4622,8 @@ dependencies = [
  "toml",
  "tonic",
  "tower",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
  "zstd",
 ]
@@ -4958,6 +4960,7 @@ dependencies = [
  "ravel-rspan",
  "ravel-segment",
  "ravel-types",
+ "rustix",
  "stats_alloc",
  "thiserror",
  "tokio",

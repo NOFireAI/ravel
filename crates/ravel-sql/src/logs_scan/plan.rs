@@ -571,10 +571,17 @@ async fn route_segments(ctx: &PartitionCtx, segments: &[SegmentRef]) -> DFResult
         routes: vec![None; segments.len()],
         figures: None,
     };
-    let (Some((route_ctx, pool)), Some(arm)) = (&ctx.key_index_route, ctx.query.key_equals.first())
-    else {
+    let Some((route_ctx, pool)) = &ctx.key_index_route else {
         return Ok(routed);
     };
+    // One key arm, an equality or an `IN` set; the provider routes nothing
+    // else (`LogsTableProvider::scan_key_index_route`).
+    let key_set = match (ctx.query.key_equals.as_slice(), &ctx.query.key_in) {
+        ([arm], None) => log_key_set(arm),
+        ([], Some(set)) => log_key_in_set(set),
+        _ => return Ok(routed),
+    }
+    .map_err(|e| DataFusionError::External(e.into()))?;
     if route_ctx.parts.origin.len() != segments.len() {
         tracing::warn!(
             origins = route_ctx.parts.origin.len(),
@@ -600,7 +607,6 @@ async fn route_segments(ctx: &PartitionCtx, segments: &[SegmentRef]) -> DFResult
         ..Snapshot::default()
     };
     let parts = SnapshotParts::new(route_ctx.parts.parts.clone(), origin);
-    let key_set = log_key_set(arm).map_err(|e| DataFusionError::External(e.into()))?;
     let reader = LogLeafRangeReader::new(&ctx.fetcher, ctx.tenant_hash);
     let budget = PoolLeafBudget(Arc::clone(pool));
     let input = RouteInput {
@@ -1529,12 +1535,14 @@ impl ScanExecutions {
     }
 
     /// The record key of a scan: the tenant, the projection (with its
-    /// per-key attribute columns and row refs) and the pushed filters.
+    /// per-key attribute columns and row refs) and the pushed filters, the
+    /// key equalities and the `IN` key set included.
     /// Neither the time bounds nor the resolved segment set are in it, so a
     /// relative window re-sent with fresh bounds keeps its count, and so
     /// does a scan whose tenant published another object since its last
     /// execution. Two scans whose keys collide share a count, which only
     /// moves a publication direction.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn key(
         tenant_hash: TenantHash,
         projection: &[usize],
@@ -1543,6 +1551,7 @@ impl ScanExecutions {
         content: &[Predicate],
         prune: &[Predicate],
         key_equals: &[KeyEquals],
+        key_in: Option<&KeyIn>,
     ) -> u64 {
         let mut hasher = DefaultHasher::new();
         tenant_hash.0.hash(&mut hasher);
@@ -1558,6 +1567,12 @@ impl ScanExecutions {
             key.field.hash(&mut hasher);
             key.key_type.hash(&mut hasher);
             key.key8.hash(&mut hasher);
+        }
+        key_in.is_some().hash(&mut hasher);
+        if let Some(set) = key_in {
+            set.field().hash(&mut hasher);
+            set.key_type().hash(&mut hasher);
+            set.keys().hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -2699,6 +2714,7 @@ mod unit_queue_tests {
             content,
             &[],
             &[],
+            None,
         )
     }
 
@@ -2814,6 +2830,7 @@ mod unit_queue_tests {
                 &[],
                 &[],
                 key_equals,
+                None,
             )
         };
         let base = KeyEquals::new("service", KeyType::Str, key8_str("checkout"));
@@ -2826,6 +2843,44 @@ mod unit_queue_tests {
             key(&[base.clone(), base.clone()]),
             key(&[KeyEquals::new("service", KeyType::I64, key8_i64(-3))]),
         ];
+        let distinct: std::collections::HashSet<u64> = keys.iter().copied().collect();
+        assert_eq!(distinct.len(), keys.len(), "{keys:?}");
+    }
+
+    /// Scans differing only in their `IN` key set (none, another field, key
+    /// type, or set of keys) are different scans. A collision would only
+    /// move a publication order, never a row.
+    ///
+    /// Fails against a key that leaves the set, or any of its three fields,
+    /// out.
+    #[test]
+    fn a_scan_under_another_key_set_has_its_own_key() {
+        use ravel_logseg::key_index::{KeyType, key8_i64, key8_str};
+        let key = |key_in: Option<&KeyIn>| {
+            ScanExecutions::key(
+                TenantHash([7u8; 16]),
+                &[0, 1, 2],
+                &[],
+                false,
+                &[],
+                &[],
+                &[],
+                key_in,
+            )
+        };
+        let set = |field: &str, key_type: KeyType, keys: Vec<[u8; 8]>| {
+            KeyIn::new(field, key_type, keys).expect("key set")
+        };
+        let base = set("user_id", KeyType::I64, vec![key8_i64(1), key8_i64(2)]);
+        let sets = [
+            set("account", KeyType::I64, base.keys().to_vec()),
+            set("user_id", KeyType::Str, base.keys().to_vec()),
+            set("user_id", KeyType::I64, vec![key8_i64(1)]),
+            set("user_id", KeyType::I64, vec![key8_i64(1), key8_i64(3)]),
+            set("user_id", KeyType::Str, vec![key8_str("1")]),
+        ];
+        let mut keys = vec![key(None), key(Some(&base))];
+        keys.extend(sets.iter().map(|s| key(Some(s))));
         let distinct: std::collections::HashSet<u64> = keys.iter().copied().collect();
         assert_eq!(distinct.len(), keys.len(), "{keys:?}");
     }
@@ -2886,8 +2941,9 @@ mod unit_queue_tests {
     /// count rather than last.
     #[test]
     fn the_execution_record_drops_the_oldest_scan_past_its_bound() {
-        let key =
-            |i: usize| ScanExecutions::key(TenantHash([7u8; 16]), &[i], &[], false, &[], &[], &[]);
+        let key = |i: usize| {
+            ScanExecutions::key(TenantHash([7u8; 16]), &[i], &[], false, &[], &[], &[], None)
+        };
         let record = ScanExecutions::new();
         for i in 0..SCAN_EXECUTIONS_CAPACITY {
             assert_eq!(record.next(key(i)), 0);

@@ -81,17 +81,18 @@ pub use clock::{Clock, FixedClock};
 pub use codec::{RsegCodec, SegmentCodec};
 pub use compact::{
     COMPACTION_INPUT_SKIP_SIGNALS, ClaimAcquisition, ClaimedCompaction, CompactionInputSkipReason,
-    CompactionOutcome, buckets_held_out_of_window_total, compact_bucket, compact_bucket_claimed,
-    compaction_inputs_skipped_total, compactions_in_flight,
+    CompactionOutcome, CompactionRefusedReason, buckets_held_out_of_window_total, compact_bucket,
+    compact_bucket_claimed, compaction_inputs_skipped_total, compaction_refused_total,
+    compactions_in_flight,
 };
 pub use config::{
     AdmissionMode, AuditMode, AuditPipelineConfig, ClaimParticipant, CompactorConfig, Coordination,
     L1PartMemoryTargetBound, L1PartMemoryTargetSource, MEMORY_OVERHEAD_RESERVE_BYTES,
-    MergeLiveBytes, MergeMemoryTracker, MergePhasePeaks, ResolvedL1PartMemoryTarget,
-    RetentionConfig, RetentionConfigError, RetentionPolicy, RlogZstdLevelError,
-    claim_lease_max_part_bytes, derive_l1_part_memory_target, derive_l1_part_memory_target_bytes,
-    detect_host_memory_total_bytes, host_memory_budget_bytes, merge_memory_budget_bytes,
-    validate_rlog_zstd_level,
+    MergeLiveBytes, MergeMemoryTracker, MergePhasePeaks, RLOG_RUN_MEMORY_TARGET_BYTES,
+    ResolvedL1PartMemoryTarget, RetentionConfig, RetentionConfigError, RetentionPolicy,
+    RlogZstdLevelError, claim_lease_max_part_bytes, derive_l1_part_memory_target,
+    derive_l1_part_memory_target_bytes, detect_host_memory_total_bytes, host_memory_budget_bytes,
+    merge_memory_budget_bytes, validate_rlog_zstd_level,
 };
 pub use discover::discover_tenants;
 pub use erasure_rewrite::{
@@ -101,7 +102,7 @@ pub use erasure_rewrite::{
     build_rewrite, erasure_rewrite_bucket, erasure_unwritable_objects_total,
     pending_erasure_requests, publish_rewrite_record,
 };
-pub use error::{MaintainError, MergeCursorBudgetSite, Result};
+pub use error::{MaintainError, MergeCursorBudgetSite, Result, TwoLevelCheck};
 pub use gc_config::{
     GC_CONFIG_KEY, GC_FORMAT_VERSION, GC_FORMAT_VERSION_V1, GcAccessOp, GcConfigError,
     GcConfigProposal, GcConfigValues, SetOutcome, bootstrap_gc_config,

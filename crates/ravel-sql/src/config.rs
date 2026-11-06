@@ -658,6 +658,34 @@ impl SqlConfig {
         );
         (pool, breach)
     }
+
+    /// [`SqlConfig::query_pool`] in spill mode: the same pool, except that a
+    /// consumer that can spill is refused with `ResourcesExhausted`, so it
+    /// spills, once the spill-capable consumers' charged bytes plus their
+    /// reserve-ahead envelopes would exceed `max_query_bytes` less the
+    /// headroom [`crate::memory::spill_mode_headroom`] gives. Consumers that
+    /// cannot spill may still grow to `max_query_bytes`.
+    pub fn query_pool_spill_mode(
+        &self,
+        tenant: Arc<TenantMemoryAccountant>,
+        accounting: QueryAccounting,
+    ) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
+        let breach = CeilingBreach::new();
+        let pool = Arc::new(
+            TenantDelegatingPool::new(
+                self.max_query_bytes,
+                tenant,
+                Arc::clone(&breach),
+                accounting,
+            )
+            .with_aggregate_reserve_ahead(
+                self.aggregate_reserve_ahead,
+                process_envelope_width(self.engine.sql_partition_count()),
+            )
+            .with_spill_headroom(crate::memory::spill_mode_headroom(self.max_query_bytes)),
+        );
+        (pool, breach)
+    }
 }
 
 #[cfg(test)]

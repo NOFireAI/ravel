@@ -51,10 +51,11 @@
 #              No statement sets it today.
 #   expect_refusal_on_main  true: the statement is sent, and a refusal the
 #              server returns (the 1,000- and 1,001-key IN lists against the
-#              SQL complexity cap) is recorded as refused-by-guard with the
+#              SQL complexity cap of a build from before ADR-3692's key set
+#              amendment) is recorded as refused-by-guard with the
 #              response's status and text, counted apart from
 #              unsupported-on-this-build. A refusal of any other
-#              statement is the problem `refused`.
+#              statement is the problem `refused`. Read only on a refusal.
 
 [[statement]]
 id = "spans_lookup_norange"
@@ -151,14 +152,16 @@ truth_key = "in_trace_id.100.spans"
 states = ["unfolded", "folded_leaves"]
 cold_only = true
 
-# Sent as written. ravel-sql's complexity guard (complexity_guard.rs:640,
-# :674-684) counts one unit per token start: an X'..' literal is an X run
-# plus a quoted string, so an element with its comma costs 3, and a quoted
-# '..' element with its comma costs 2. Against MAX_STATEMENT_COMPLEXITY =
-# 1,000 (:257, checked at :380-381) and the 8 units of the rest of the
-# statement, an X list holds at most 330 keys (3n + 8) and a quoted list at
-# most 496 (2n + 8). The server's 400 and its text are recorded as
-# refused-by-guard; the 1,001-key list beside it is row 11's control.
+# Sent as written. Before ADR-3692's key set amendment ravel-sql's
+# complexity guard counted one unit per token start: an X'..' literal is an
+# X run plus a quoted string, so an element with its comma cost 3, and a
+# quoted '..' element with its comma cost 2. Against
+# MAX_STATEMENT_COMPLEXITY = 1,000 and the 8 units of the rest of the
+# statement, an X list held at most 330 keys (3n + 8) and a quoted list at
+# most 496 (2n + 8), and such a build's 400 and its text are recorded as
+# refused-by-guard. Since the amendment a flat literal list costs one unit
+# plus one per 64 literals (in_list_units), so the statement costs 24 units
+# and is admitted. The 1,001-key list beside it is row 11's control.
 [[statement]]
 id = "spans_in_1000"
 tenant = "inv"

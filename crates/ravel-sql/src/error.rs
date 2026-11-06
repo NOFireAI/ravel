@@ -428,7 +428,8 @@ pub enum SqlError {
     },
 
     /// The per-query or per-tenant byte budget was exhausted. The detail is
-    /// the pool's own message (byte counts and limits only).
+    /// the pool's own message: byte counts and limits, and the names of the
+    /// asking and holding memory consumers, which are operator names.
     #[error("query memory budget exhausted: {0}")]
     ResourcesExhausted(String),
 
@@ -846,6 +847,8 @@ impl SqlError {
             | SqlError::TooManySeries { .. }
             | SqlError::TooManyBytesScanned { .. }
             | SqlError::RequestBudgetExceeded { .. }
+            // Counts, limits and memory consumer names, which are operator
+            // names (`ExternalSorter[0]`), never tenant data.
             | SqlError::ResourcesExhausted(_)
             // Counts and a configured quota only, built by
             // `spill_budget_exhausted` from this query's own figures; no path,
@@ -2259,5 +2262,46 @@ mod tests {
         });
         assert!(!transient.is_segment_not_found());
         assert!(!SqlError::SnapshotInvalidated.is_segment_not_found());
+    }
+
+    /// Issue #3899: a pool refusal's attribution reaches the client whole,
+    /// as the 422 class, and names only operators and byte figures.
+    #[test]
+    fn an_attributed_pool_refusal_echoes_to_the_client_whole() {
+        use std::sync::Arc;
+
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+        use ravel_types::accounting::QueryAccounting;
+
+        use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            100,
+            TenantMemoryAccountant::new(1 << 20),
+            CeilingBreach::new(),
+            QueryAccounting::new(),
+        ));
+        let join = MemoryConsumer::new("HashJoinInput[0]").register(&pool);
+        join.try_grow(70).expect("within every ceiling");
+        let sorter = MemoryConsumer::new("ExternalSorter[0]")
+            .with_can_spill(true)
+            .register(&pool);
+        let refused = sorter
+            .try_grow(40)
+            .expect_err("70 + 40 exceeds the 100-byte query limit");
+        let DataFusionError::ResourcesExhausted(raw) = refused else {
+            panic!("a pool refusal is a ResourcesExhausted; got {refused:?}");
+        };
+
+        let err = SqlError::resources_exhausted_reattributed(&raw, 70, 100);
+        assert_eq!(err.class(), ErrorClass::Unsupported);
+        assert_eq!(
+            err.client_message(),
+            "query memory budget exhausted: query memory pool exhausted: 40 more bytes on top \
+             of 70 already reserved exceeds per-query limit 100; asked by ExternalSorter[0] \
+             (can_spill=true, 40 bytes asked); top holders: HashJoinInput[0] 70 bytes; \
+             non-spillable consumers hold 70 bytes; this query's aggregate envelope 0 bytes"
+        );
+        assert_redacted(&err.client_message());
     }
 }

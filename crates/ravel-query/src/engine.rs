@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
 use promql_parser::parser::{Expr, Offset};
-use ravel_catalog::{Catalog, SegmentRef, ShardGeneration, Snapshot};
+use ravel_catalog::{Catalog, SegmentOrigin, SegmentRef, ShardGeneration, Snapshot};
 use ravel_cpu_gate::{JobSize, ReadGate, ReadSite};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_promql::{
@@ -32,8 +32,8 @@ use crate::distrib::WallDeadline;
 use crate::erasure::ErasurePredicate;
 use crate::error::{FoldLag, QueryError};
 use crate::fetcher::{
-    FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa, ReadCache, SamplePriority,
-    SegmentFetcher,
+    DictionaryProbeStats, FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa,
+    ReadCache, SamplePriority, SegmentFetcher,
 };
 use crate::io_shape::{IoShapeCounts, PlanClass, QueryIoShape};
 use crate::limiter::GetLimiter;
@@ -77,6 +77,23 @@ pub struct QueryStats {
     pub segments_fetched: u64,
     /// Snapshot-sourced segments postings pruning excluded.
     pub segments_pruned: u64,
+    /// Fetched sparse objects the dictionary-first probe dropped because
+    /// their LABEL_DICT lacked a positive equality name or value (ADR-3694
+    /// decision 1, issue #3862). Counted within `segments_fetched`, which
+    /// counts the objects opened, not the objects that yielded series.
+    pub segments_pruned_by_dictionary: u64,
+    /// Fetched sparse objects whose probe read LABEL_DICT alone before the
+    /// rest of the catalog, paying one GET a one-step probe would not. An
+    /// object whose LABEL_DICT the footer tail already held is checked with
+    /// no GET and is not counted here, though a miss on it still counts in
+    /// `segments_pruned_by_dictionary` (`a_held_dictionary_is_not_counted_as_probed_two_step`).
+    pub segments_probed_two_step: u64,
+    /// True when at least one selector plan's gate switched off: the first
+    /// two-step probes of that plan to complete (as many as the PromQL fetch
+    /// fan-out) dropped fewer than half their objects, so that plan's later
+    /// objects were probed in one step. Each plan has its own gate
+    /// (`each_selector_plan_switches_its_own_gate`).
+    pub dictionary_probe_switched_off: bool,
     /// Page-fetch counters summed across every segment this query opened
     /// (`FetchStats`), no longer discarded at the
     /// `fetch_all_samples_and_histograms` call site (ADR-0044). Distinct
@@ -143,10 +160,14 @@ impl QueryStats {
         phase_accounting: PhaseAccountingSnapshot,
         estimate: CostEstimate,
         io_shape: QueryIoShape,
+        dictionary_probe: DictionaryProbeStats,
     ) -> Self {
         QueryStats {
             segments_fetched,
             segments_pruned,
+            segments_pruned_by_dictionary: dictionary_probe.segments_pruned_by_dictionary,
+            segments_probed_two_step: dictionary_probe.segments_probed_two_step,
+            dictionary_probe_switched_off: dictionary_probe.switched_off,
             page_stats,
             accounting: phase_accounting.pooled(),
             phase_accounting,
@@ -167,6 +188,9 @@ impl Default for QueryStats {
         QueryStats {
             segments_fetched: 0,
             segments_pruned: 0,
+            segments_pruned_by_dictionary: 0,
+            segments_probed_two_step: 0,
+            dictionary_probe_switched_off: false,
             page_stats: FetchStats::default(),
             accounting: QueryAccountingSnapshot::default(),
             phase_accounting: PhaseAccountingSnapshot::default(),
@@ -419,6 +443,13 @@ struct ResolvedBounded {
     /// decision 6), carried to every request-budget check downstream of it so
     /// a refusal caused by fold lag reads as one.
     fold_lag: FoldLag,
+    /// Data object keys of the snapshot-sourced segments the name postings
+    /// filtered, empty when the postings pruned nothing or the statement has
+    /// a positive equality that is not a name (issue #3862). The
+    /// dictionary-first probe skips these for a statement whose only positive
+    /// equalities are names; a recent or token-resolved segment never
+    /// passed through the postings and is not here.
+    postings_filtered: std::collections::HashSet<String>,
 }
 
 /// Resolves snapshots, fetches segments, merges cross-segment duplicates,
@@ -1367,6 +1398,7 @@ impl QueryEngine {
                 min_tokens,
                 now_ns,
                 name_filter.as_deref(),
+                false, // names_only: discovery runs no dictionary probe.
                 1,
                 1,
                 true, // metadata_only: discovery never fetches pages.
@@ -1455,6 +1487,7 @@ impl QueryEngine {
                 min_tokens,
                 now_ns,
                 None,
+                false, // names_only: log discovery runs no dictionary probe.
                 1,
                 1,
                 true, // metadata_only: log discovery never fetches pages.
@@ -1656,6 +1689,7 @@ impl QueryEngine {
                 min_tokens,
                 now_ns,
                 None,
+                false, // names_only: the log lane runs no dictionary probe.
                 log_accounting.resolve(),
             )
             .await?;
@@ -1972,6 +2006,10 @@ impl QueryEngine {
         }
 
         let name_filter = shared_equality_name_filter(plans);
+        // Only a statement whose positive equalities are all names reads the
+        // resolve's postings-filtered set (the dictionary probe's gate), so
+        // every other statement skips building it.
+        let names_only = only_name_equalities(plans);
         let max_series = self.config.max_series;
         let max_samples = self.config.max_samples;
         let max_bytes_scanned = self.config.max_bytes_scanned;
@@ -2037,6 +2075,17 @@ impl QueryEngine {
             // dedup `service_fetch_multiplier` below was sized from, so the
             // two never drift onto two different notions of "distinct".
             let distinct_plans = distinct_plans_by_matcher(plans);
+            // ADR-3694 decision 1 as amended for issue #3862: one gate per
+            // distinct matcher set. For a statement whose only positive
+            // equalities are names, the segments the name postings filtered
+            // cannot miss in any dictionary and take the one-step probe;
+            // every other segment, a recent one included, goes through its
+            // plan's gate.
+            accounting.dictionary_probe().arm(
+                distinct_plans.iter().map(|plan| plan.matchers.as_slice()),
+                concurrency,
+                only_name_equalities(&distinct_plans),
+            );
             // ADR-0103 eligibility gate, evaluated ONCE per query over the whole
             // resolved snapshot's segment set and the generation history THIS
             // resolve produced (never a per-matcher-set subset, never a
@@ -2317,6 +2366,7 @@ impl QueryEngine {
                 min_tokens,
                 now_ns,
                 name_filter.as_deref(),
+                names_only,
                 fetch_multiplier,
                 service_fetch_multiplier,
                 false, // metadata_only: this path fetches scalar/histogram pages.
@@ -2363,6 +2413,10 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         name_filter: Option<&str>,
+        // Whether every positive equality of the statement is a name
+        // (`only_name_equalities`): only then does the resolve build the
+        // postings-filtered set the dictionary probe's gate reads.
+        names_only: bool,
         // Upper-envelope selector fan-out factor for `estimate_cost`
         // (`plans.len()`, undeduplicated -- see the comment above its
         // assignment in `prefetch_metric_plans`): legitimately over-counts
@@ -2426,6 +2480,7 @@ impl QueryEngine {
             generations: first_generations,
             unfolded_segments_resolved: first_unfolded,
             fold_lag: first_fold_lag,
+            postings_filtered: first_postings_filtered,
         } = self
             .resolve_bounded(
                 tenant_hash,
@@ -2434,6 +2489,7 @@ impl QueryEngine {
                 min_tokens,
                 now_ns,
                 name_filter,
+                names_only,
                 first_accounting.resolve(),
             )
             .await?;
@@ -2462,6 +2518,9 @@ impl QueryEngine {
             &first_accounting,
             first_unfolded,
         );
+        first_accounting
+            .dictionary_probe()
+            .record_postings_filtered(first_postings_filtered);
         match attempt(
             first,
             first_generations,
@@ -2481,6 +2540,7 @@ impl QueryEngine {
                     generations: second_generations,
                     unfolded_segments_resolved: second_unfolded,
                     fold_lag: second_fold_lag,
+                    postings_filtered: second_postings_filtered,
                 } = self
                     .resolve_bounded(
                         tenant_hash,
@@ -2489,6 +2549,7 @@ impl QueryEngine {
                         min_tokens,
                         now_ns,
                         name_filter,
+                        names_only,
                         second_accounting.resolve(),
                     )
                     .await?;
@@ -2511,6 +2572,9 @@ impl QueryEngine {
                     &second_accounting,
                     second_unfolded,
                 );
+                second_accounting
+                    .dictionary_probe()
+                    .record_postings_filtered(second_postings_filtered);
                 match attempt(
                     second,
                     second_generations,
@@ -2532,6 +2596,7 @@ impl QueryEngine {
                             second_accounting.snapshot(),
                             second_estimate,
                             second_io_shape,
+                            second_accounting.dictionary_probe().stats(),
                         ),
                     )),
                     Err(other) => Err(other),
@@ -2546,6 +2611,7 @@ impl QueryEngine {
                     first_accounting.snapshot(),
                     first_estimate,
                     first_io_shape,
+                    first_accounting.dictionary_probe().stats(),
                 ),
             )),
             Err(other) => Err(other),
@@ -2567,6 +2633,7 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         name_filter: Option<&str>,
+        names_only: bool,
         accounting: &QueryAccounting,
     ) -> Result<ResolvedBounded, QueryError> {
         // `resolve_pruned_with_generations` returns the shard-generation history
@@ -2608,11 +2675,23 @@ impl QueryEngine {
             now_ns,
             self.config.fold_lag_threshold(),
         );
+        let postings_filtered = if names_only && snapshot.segments_pruned > 0 {
+            snapshot
+                .segments
+                .iter()
+                .zip(&origins.origins)
+                .filter(|(_, origin)| **origin == SegmentOrigin::SealedBelowWatermark)
+                .map(|(seg, _)| seg.data_object_key.clone())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         Ok(ResolvedBounded {
             snapshot,
             generations,
             unfolded_segments_resolved,
             fold_lag,
+            postings_filtered,
         })
     }
 
@@ -3929,6 +4008,17 @@ fn shared_equality_name_filter<'a>(plans: &'a [SelectorPlan]) -> Option<Cow<'a, 
         }
     }
     shared
+}
+
+/// Whether every non-empty positive equality across `plans` matches
+/// `__name__`, the statement shape whose dictionary-first probe prunes
+/// nothing once the name postings applied (issue #3862).
+fn only_name_equalities(plans: &[SelectorPlan]) -> bool {
+    plans
+        .iter()
+        .flat_map(|plan| &plan.matchers)
+        .filter(|m| m.op == MatchOp::Eq && !m.value.is_empty())
+        .all(|m| m.name == METRIC_NAME_LABEL)
 }
 
 /// Deduplicates `plans` by matcher equality, keeping the first plan seen for

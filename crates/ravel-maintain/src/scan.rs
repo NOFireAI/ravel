@@ -50,6 +50,14 @@ pub struct ScanReport {
     /// build's reader window ([`CompactionOutcome::HeldOutOfWindow`]). Later
     /// hours still compact; the cursor stops before the first held hour.
     pub held_out_of_window: usize,
+    /// Buckets compaction refused for their merge geometry
+    /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), including a
+    /// two-level merge's refusal ([`CompactionOutcome::TwoLevelUnsupported`],
+    /// [`CompactionOutcome::ScratchHeadroom`],
+    /// [`CompactionOutcome::ScratchLocked`]). Later hours still compact; the
+    /// cursor stops before the first refused hour, so a build that can merge
+    /// it revisits it.
+    pub geometry_unsupported: usize,
     /// The hour the cursor was advanced to, if it moved.
     pub cursor_advanced_to: Option<u32>,
 }
@@ -77,6 +85,7 @@ pub async fn scan_and_compact(
         already_done: 0,
         not_sealed: 0,
         held_out_of_window: 0,
+        geometry_unsupported: 0,
         cursor_advanced_to: None,
     };
     let mut highest_done: Option<u32> = None;
@@ -96,6 +105,13 @@ pub async fn scan_and_compact(
             }
             CompactionOutcome::HeldOutOfWindow { .. } => {
                 report.held_out_of_window += 1;
+                first_held.get_or_insert(hour);
+            }
+            CompactionOutcome::GeometryUnsupported { .. }
+            | CompactionOutcome::TwoLevelUnsupported { .. }
+            | CompactionOutcome::ScratchHeadroom { .. }
+            | CompactionOutcome::ScratchLocked { .. } => {
+                report.geometry_unsupported += 1;
                 first_held.get_or_insert(hour);
             }
             CompactionOutcome::Compacted { .. } => {
@@ -146,6 +162,13 @@ pub struct MaintainReport {
     /// ([`CompactionOutcome::HeldOutOfWindow`]). Retried every pass; the scan
     /// continues to later hours.
     pub held_out_of_window: usize,
+    /// Buckets whose compaction this pass refused for their merge geometry
+    /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), including a
+    /// two-level merge's refusal ([`CompactionOutcome::TwoLevelUnsupported`],
+    /// [`CompactionOutcome::ScratchHeadroom`],
+    /// [`CompactionOutcome::ScratchLocked`]). Not counted for a bucket the
+    /// [`MaintainMemo`] already holds as refused.
+    pub geometry_unsupported: usize,
     /// Expired buckets whose physical sweep was blocked because the live
     /// catalog HEAD snapshot still names an object inside the bucket
     /// (ADR-0020 delete-blocker, [`RetentionOutcome::BlockedBySnapshot`] with
@@ -717,9 +740,9 @@ type BucketKey = (TenantHash, Signal, u32, u32);
 /// the memo).
 type SnapshotUnitKey = (TenantHash, u8, u32);
 
-/// One unit's terminal buckets as `(hour, state, verified_at_ns)` before they
-/// are run-length encoded into a frontier plus exceptions.
-type SnapshotUnitEntries = Vec<(u32, TerminalState, i64)>;
+/// One unit's terminal buckets as `(hour, state code, verified_at_ns)` before
+/// they are run-length encoded into a frontier plus exceptions.
+type SnapshotUnitEntries = Vec<(u32, u8, i64)>;
 
 /// Why a bucket is terminal for the maintain loop: no retention or compaction
 /// action is due now, and none can become due until either a later retention
@@ -740,17 +763,28 @@ pub enum TerminalState {
     /// bucket holds nothing further to do. (It normally also vanishes from the
     /// shard listing, so its entry is pruned on the next pass.)
     SweptEmpty,
+    /// Compaction refused the bucket for its merge geometry
+    /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), or refused
+    /// its two-level merge ([`CompactionOutcome::TwoLevelUnsupported`],
+    /// [`CompactionOutcome::ScratchHeadroom`],
+    /// [`CompactionOutcome::ScratchLocked`]). Terminal
+    /// for this process's binary only, so it is held in memory and never
+    /// written to the durable snapshot: a restart, or a sibling seeded from a
+    /// snapshot, evaluates the bucket again.
+    GeometryUnsupported,
 }
 
 impl TerminalState {
     /// Stable one-byte discriminant for the durable memo snapshot payload
     /// (ADR-0065 decision 3). Fixed values: a persisted snapshot must decode
-    /// the same across versions, so these never change once shipped.
-    fn to_code(self) -> u8 {
+    /// the same across versions, so these never change once shipped. `None`
+    /// for a state the snapshot does not carry.
+    fn to_code(self) -> Option<u8> {
         match self {
-            TerminalState::Compacted => 0,
-            TerminalState::BelowThreshold => 1,
-            TerminalState::SweptEmpty => 2,
+            TerminalState::Compacted => Some(0),
+            TerminalState::BelowThreshold => Some(1),
+            TerminalState::SweptEmpty => Some(2),
+            TerminalState::GeometryUnsupported => None,
         }
     }
 
@@ -937,6 +971,15 @@ impl MaintainMemo {
             .get(key)
             .and_then(|entry| entry.l0_records_pending)
             .unwrap_or(0)
+    }
+
+    /// Whether the memo holds `key` as refused for its merge geometry
+    /// ([`TerminalState::GeometryUnsupported`]), fresh or not. Only this
+    /// process's own refusal puts it there: the snapshot never carries it.
+    fn geometry_refused(&self, key: &BucketKey) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|entry| entry.state == TerminalState::GeometryUnsupported)
     }
 
     /// Record `key` as terminal in `state`, verified at `now_ns`, with no known
@@ -1221,10 +1264,13 @@ impl MaintainMemo {
         let mut by_unit: std::collections::BTreeMap<SnapshotUnitKey, SnapshotUnitEntries> =
             std::collections::BTreeMap::new();
         for (&(t, s, sh, hour), entry) in &self.entries {
+            let Some(code) = entry.state.to_code() else {
+                continue;
+            };
             by_unit
                 .entry((t, signal_to_code(s), sh))
                 .or_default()
-                .push((hour, entry.state, entry.verified_at_ns));
+                .push((hour, code, entry.verified_at_ns));
         }
 
         let mut buf = Vec::new();
@@ -1254,7 +1300,7 @@ impl MaintainMemo {
                     buf.push(1); // frontier present
                     buf.extend_from_slice(&f.start_hour.to_le_bytes());
                     buf.extend_from_slice(&f.end_hour.to_le_bytes());
-                    buf.push(f.state.to_code());
+                    buf.push(f.code);
                     buf.extend_from_slice(&f.verified_ns.to_le_bytes());
 
                     let exceptions: Vec<&TerminalRun> = runs
@@ -1267,7 +1313,7 @@ impl MaintainMemo {
                     for run in exceptions {
                         buf.extend_from_slice(&run.start_hour.to_le_bytes());
                         buf.extend_from_slice(&run.len().to_le_bytes());
-                        buf.push(run.state.to_code());
+                        buf.push(run.code);
                         buf.extend_from_slice(&run.verified_ns.to_le_bytes());
                     }
                 }
@@ -1288,7 +1334,10 @@ impl MaintainMemo {
     /// passes it to [`MemoSnapshotLimits::admits_write`] so it never persists a
     /// snapshot the reader would reject.
     pub fn snapshot_entry_count(&self) -> usize {
-        self.entries.len()
+        self.entries
+            .values()
+            .filter(|entry| entry.state.to_code().is_some())
+            .count()
     }
 
     /// Frame a snapshot body ([`Self::snapshot_body`]) into the durable object
@@ -1460,7 +1509,8 @@ pub enum MemoSnapshotError {
 struct TerminalRun {
     start_hour: u32,
     end_hour: u32,
-    state: TerminalState,
+    /// The run's [`TerminalState::to_code`].
+    code: u8,
     /// Minimum `verified_at_ns` across the run (conservative for freshness).
     verified_ns: i64,
 }
@@ -1471,25 +1521,23 @@ impl TerminalRun {
     }
 }
 
-/// Partition sorted `(hour, state, verified_ns)` entries into maximal runs of
-/// consecutive hours sharing one [`TerminalState`]. A run breaks on a hour gap
-/// or a state change. Input must be sorted ascending by hour with unique hours
-/// (the memo keys one entry per bucket, so hours are unique by construction).
-fn terminal_runs(sorted: &[(u32, TerminalState, i64)]) -> Vec<TerminalRun> {
+/// Partition sorted `(hour, state code, verified_ns)` entries into maximal runs
+/// of consecutive hours sharing one [`TerminalState`]. A run breaks on a hour
+/// gap or a state change. Input must be sorted ascending by hour with unique
+/// hours (the memo keys one entry per bucket, so hours are unique by
+/// construction).
+fn terminal_runs(sorted: &[(u32, u8, i64)]) -> Vec<TerminalRun> {
     let mut runs: Vec<TerminalRun> = Vec::new();
-    for &(hour, state, verified_ns) in sorted {
+    for &(hour, code, verified_ns) in sorted {
         match runs.last_mut() {
-            Some(run)
-                if run.end_hour + 1 == hour
-                    && std::mem::discriminant(&run.state) == std::mem::discriminant(&state) =>
-            {
+            Some(run) if run.end_hour + 1 == hour && run.code == code => {
                 run.end_hour = hour;
                 run.verified_ns = run.verified_ns.min(verified_ns);
             }
             _ => runs.push(TerminalRun {
                 start_hour: hour,
                 end_hour: hour,
-                state,
+                code,
                 verified_ns,
             }),
         }
@@ -1835,6 +1883,17 @@ fn classify_terminal(
                 // Held for an out-of-window input: retried every tick, so the
                 // bucket compacts on the first tick after the upgrade finishes.
                 Some(CompactionOutcome::HeldOutOfWindow { .. }) => None,
+                // Refused for its merge geometry (ADR-3853 D0): this binary
+                // would refuse it again, so it is not retried while the memo
+                // holds it, and the memo never persists it. A two-level merge's
+                // refusal is the same: the same build would refuse it again,
+                // after paying for level 1 when the refusal came after it.
+                Some(
+                    CompactionOutcome::GeometryUnsupported { .. }
+                    | CompactionOutcome::TwoLevelUnsupported { .. }
+                    | CompactionOutcome::ScratchHeadroom { .. }
+                    | CompactionOutcome::ScratchLocked { .. },
+                ) => Some(TerminalState::GeometryUnsupported),
             }
         }
     }
@@ -1938,6 +1997,11 @@ pub async fn scan_and_maintain_with_memo(
         // and the zone split run as for any other bucket, so a held head or
         // tail hour still reaches `head_tail_hours`.
         let claim_deferred = memo.claim_deferred(&key, now);
+        // A bucket this process refused for its merge geometry (ADR-3853 D0)
+        // is not compacted again while the memo holds the refusal: the same
+        // binary would plan and refuse the same merge. Retention still runs
+        // whenever the bucket is evaluated.
+        let geometry_refused = memo.geometry_refused(&key);
 
         let zone = classify_zone(hour, now, config, retention_window_ns);
         if zone != Zone::Interior {
@@ -1966,32 +2030,33 @@ pub async fn scan_and_maintain_with_memo(
         } else {
             RewriteBound::Read(&mut bound_read)
         };
-        let (retention_outcome, observed_expiry, compaction, acquisition) = if claim_deferred {
-            let (outcome, expiry) = retention_sweep_bucket_observed(
-                &mut reach,
-                store,
-                clock,
-                config,
-                retention_window_ns,
-                lease,
-                &bucket,
-                rewrite_bound,
-            )
-            .await?;
-            (outcome, expiry, None, None)
-        } else {
-            maintain_bucket_observed(
-                &mut reach,
-                store,
-                clock,
-                config,
-                retention_window_ns,
-                lease,
-                &bucket,
-                rewrite_bound,
-            )
-            .await?
-        };
+        let (retention_outcome, observed_expiry, compaction, acquisition) =
+            if claim_deferred || geometry_refused {
+                let (outcome, expiry) = retention_sweep_bucket_observed(
+                    &mut reach,
+                    store,
+                    clock,
+                    config,
+                    retention_window_ns,
+                    lease,
+                    &bucket,
+                    rewrite_bound,
+                )
+                .await?;
+                (outcome, expiry, None, None)
+            } else {
+                maintain_bucket_observed(
+                    &mut reach,
+                    store,
+                    clock,
+                    config,
+                    retention_window_ns,
+                    lease,
+                    &bucket,
+                    rewrite_bound,
+                )
+                .await?
+            };
         report.lag_bound_gets += bound_read.gets;
         if let Some(keeps) = bound_read.learned {
             memo.rewrites_keep_nominal_bound.insert(key, keeps);
@@ -2056,6 +2121,12 @@ pub async fn scan_and_maintain_with_memo(
                 Some(ClaimedCompaction::Ran(CompactionOutcome::HeldOutOfWindow { .. })) => {
                     report.held_out_of_window += 1
                 }
+                Some(ClaimedCompaction::Ran(
+                    CompactionOutcome::GeometryUnsupported { .. }
+                    | CompactionOutcome::TwoLevelUnsupported { .. }
+                    | CompactionOutcome::ScratchHeadroom { .. }
+                    | CompactionOutcome::ScratchLocked { .. },
+                )) => report.geometry_unsupported += 1,
                 Some(ClaimedCompaction::Ran(CompactionOutcome::BelowMinInputs { count })) => {
                     report.already_done += 1;
                     report.l0_records_pending += count;
@@ -2083,6 +2154,10 @@ pub async fn scan_and_maintain_with_memo(
                 None => {}
             },
         }
+        let retention_left_live = matches!(
+            retention_outcome,
+            RetentionOutcome::NoPolicy | RetentionOutcome::NotSealed | RetentionOutcome::NotExpired
+        );
 
         // Update the memo from this fresh, authoritative evaluation: remember a
         // newly terminal bucket, and forget one that transitioned away from a
@@ -2095,7 +2170,15 @@ pub async fn scan_and_maintain_with_memo(
             .as_ref()
             .and_then(ClaimedCompaction::ran)
             .cloned();
-        match classify_terminal(&retention_outcome, &ran) {
+        let terminal = match classify_terminal(&retention_outcome, &ran) {
+            // A refusal the memo already held, on a bucket retention left live
+            // and compaction did not run on: still refused.
+            None if geometry_refused && ran.is_none() && retention_left_live => {
+                Some(TerminalState::GeometryUnsupported)
+            }
+            other => other,
+        };
+        match terminal {
             Some(state) => {
                 memo.mark_terminal(key, state, now);
                 // Carry this evaluation's below-threshold population on the
@@ -2640,7 +2723,7 @@ mod memo_snapshot_tests {
                     body.push(1);
                     body.extend_from_slice(&start.to_le_bytes());
                     body.extend_from_slice(&end.to_le_bytes());
-                    body.push(TerminalState::Compacted.to_code());
+                    body.push(compacted_code());
                     body.extend_from_slice(&7i64.to_le_bytes());
                 }
                 None => body.push(0),
@@ -2649,11 +2732,17 @@ mod memo_snapshot_tests {
             for &(start, run_len) in &unit.exceptions {
                 body.extend_from_slice(&start.to_le_bytes());
                 body.extend_from_slice(&run_len.to_le_bytes());
-                body.push(TerminalState::Compacted.to_code());
+                body.push(compacted_code());
                 body.extend_from_slice(&7i64.to_le_bytes());
             }
         }
         body
+    }
+
+    fn compacted_code() -> u8 {
+        TerminalState::Compacted
+            .to_code()
+            .expect("Compacted has a snapshot code")
     }
 
     fn frontier_unit(shard: u32, start: u32, end: u32) -> RawUnit {

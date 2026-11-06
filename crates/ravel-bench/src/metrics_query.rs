@@ -37,6 +37,7 @@
 //! report row has no message field.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 use ravel_promql_difftest::comparator::ulp_distance;
@@ -752,17 +753,29 @@ pub enum RunError {
     },
     #[error("passes and reps_per_pass must each be at least 1")]
     NoPasses,
-    #[error(
-        "repetition accounting does not close: corpus entry `{entry}` on engine `{engine}`: \
-         {sent} sent plus {skipped} skipped, expected {expected}"
-    )]
+    /// The run finished but its repetitions do not add up. It still carries
+    /// the run's output, so the diagnostics sidecar can be written; the
+    /// report must not be.
+    #[error("{mismatch}")]
     RepsUnaccounted {
-        entry: String,
-        engine: &'static str,
-        sent: u32,
-        skipped: u32,
-        expected: u32,
+        mismatch: RepsMismatch,
+        output: Box<RunOutput>,
     },
+}
+
+/// One (engine, entry) whose timed repetitions sent plus skipped differ from
+/// the passes times the repetitions per pass.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "repetition accounting does not close: corpus entry `{entry}` on engine `{engine}`: \
+     {sent} sent plus {skipped} skipped, expected {expected}"
+)]
+pub struct RepsMismatch {
+    pub entry: String,
+    pub engine: &'static str,
+    pub sent: u32,
+    pub skipped: u32,
+    pub expected: u32,
 }
 
 /// The rows and the per-engine figures a run produced.
@@ -803,6 +816,99 @@ pub struct Diagnostics<'a> {
     pub skipped_reps: &'a [SkippedRep],
     /// [`RAVEL_COST_NOTE`].
     pub ravel_cost_note: &'static str,
+}
+
+impl<'a> Diagnostics<'a> {
+    /// The sidecar of `output`, the one builder both of
+    /// [`finish_run`]'s sidecar writes use.
+    pub fn of(output: &'a RunOutput, profile: &'a str, corpus_digest: &'a str) -> Self {
+        Diagnostics {
+            profile,
+            corpus_digest,
+            oracle: system_name(Engine::Prometheus),
+            ulp_gaps: &output.ulp_gaps,
+            oracle_retries: &output.oracle_retries,
+            ravel_cost: &output.ravel_cost,
+            skipped_reps: &output.skipped_reps,
+            ravel_cost_note: RAVEL_COST_NOTE,
+        }
+    }
+}
+
+/// `metricsbench_query`'s exit codes (sysexits).
+pub const EX_USAGE: u8 = 64;
+pub const EX_DATAERR: u8 = 65;
+pub const EX_NOINPUT: u8 = 66;
+pub const EX_SOFTWARE: u8 = 70;
+pub const EX_IOERR: u8 = 74;
+
+/// An exit code and the message printed beside it.
+pub type Failure = (u8, String);
+
+/// Where [`finish_run`] writes, and what the sidecar is stamped with.
+#[derive(Clone, Copy, Debug)]
+pub struct OutputPaths<'a> {
+    pub out: &'a Path,
+    pub diagnostics: Option<&'a Path>,
+    pub profile: &'a str,
+    pub corpus_digest: &'a str,
+}
+
+/// `metricsbench_query`'s step after [`run`]: the report and sidecar writes
+/// and the exit-code decision.
+///
+/// On success `report` assembles, validates and serializes the report from
+/// the output; nothing is written when it fails. The report is then written
+/// to `paths.out` and, with `paths.diagnostics`, the sidecar after it.
+///
+/// On [`RunError::RepsUnaccounted`] the sidecar is still written when
+/// `paths.diagnostics` is set, `paths.out` is never touched, and the result
+/// is [`EX_DATAERR`] with the accounting message; a sidecar write that fails
+/// there is named in the same message. Every other [`RunError`] is
+/// [`EX_DATAERR`] with nothing written.
+pub fn finish_run(
+    outcome: Result<RunOutput, RunError>,
+    paths: OutputPaths<'_>,
+    report: impl FnOnce(&mut RunOutput) -> Result<Vec<u8>, Failure>,
+) -> Result<(), Failure> {
+    let mut output = match outcome {
+        Ok(output) => output,
+        Err(RunError::RepsUnaccounted { mismatch, output }) => {
+            let message = mismatch.to_string();
+            if let Some(path) = paths.diagnostics
+                && let Err((_, sidecar)) = write_diagnostics(path, &output, paths)
+            {
+                return Err((
+                    EX_DATAERR,
+                    format!("{message}; the diagnostics sidecar was not written either: {sidecar}"),
+                ));
+            }
+            return Err((EX_DATAERR, message));
+        }
+        Err(e) => return Err((EX_DATAERR, e.to_string())),
+    };
+    let json = report(&mut output)?;
+    std::fs::write(paths.out, json)
+        .map_err(|e| (EX_IOERR, format!("{}: {e}", paths.out.display())))?;
+    if let Some(path) = paths.diagnostics {
+        write_diagnostics(path, &output, paths)?;
+    }
+    Ok(())
+}
+
+fn write_diagnostics(
+    path: &Path,
+    output: &RunOutput,
+    paths: OutputPaths<'_>,
+) -> Result<(), Failure> {
+    let diagnostics = Diagnostics::of(output, paths.profile, paths.corpus_digest);
+    let json = serde_json::to_vec_pretty(&diagnostics).map_err(|e| {
+        (
+            EX_SOFTWARE,
+            format!("cannot serialize the diagnostics: {e}"),
+        )
+    })?;
+    std::fs::write(path, json).map_err(|e| (EX_IOERR, format!("{}: {e}", path.display())))
 }
 
 /// `ravel_cost`'s caveat (ADR-0927 decision 8): the figures are logical
@@ -1249,11 +1355,11 @@ pub async fn run(
                 .map(|(entry, n)| (system_name(engine.engine), entry.id.as_str(), *n))
         })
         .collect();
-    check_reps_accounted(
+    let accounted = check_reps_accounted(
         &sent_counts,
         &skipped_reps,
         options.passes.saturating_mul(options.reps_per_pass),
-    )?;
+    );
 
     let mut measurements = Vec::with_capacity(cases_expected.len());
     let mut denominators = Vec::with_capacity(binding.engines.len());
@@ -1291,7 +1397,7 @@ pub async fn run(
             coverage_success: d.coverage_success,
         });
     }
-    Ok(RunOutput {
+    let output = RunOutput {
         cases_expected,
         measurements,
         denominators,
@@ -1305,7 +1411,14 @@ pub async fn run(
             .collect(),
         ravel_cost,
         skipped_reps,
-    })
+    };
+    match accounted {
+        Ok(()) => Ok(output),
+        Err(mismatch) => Err(RunError::RepsUnaccounted {
+            mismatch,
+            output: Box::new(output),
+        }),
+    }
 }
 
 /// The [`SkippedRep`] records for the repetitions of one pass after
@@ -1352,7 +1465,7 @@ fn check_reps_accounted(
     sent: &[(&'static str, &str, u32)],
     skipped: &[SkippedRep],
     expected: u32,
-) -> Result<(), RunError> {
+) -> Result<(), RepsMismatch> {
     for &(engine, entry, sent) in sent {
         let skipped = skipped
             .iter()
@@ -1360,7 +1473,7 @@ fn check_reps_accounted(
             .count();
         let skipped = u32::try_from(skipped).unwrap_or(u32::MAX);
         if sent.checked_add(skipped) != Some(expected) {
-            return Err(RunError::RepsUnaccounted {
+            return Err(RepsMismatch {
                 entry: entry.to_string(),
                 engine,
                 sent,
@@ -1855,24 +1968,172 @@ mod tests {
             } else {
                 ("mimir", mimir_sent, 0)
             };
-            match err {
-                RunError::RepsUnaccounted {
-                    entry,
-                    engine,
-                    sent,
-                    skipped,
-                    expected: e,
-                } => {
-                    assert_eq!(
-                        (entry.as_str(), engine, sent, skipped, e),
-                        ("e", want_engine, want_sent, want_skipped, expected)
-                    );
-                }
-                other => panic!("{other}"),
-            }
+            let RepsMismatch {
+                entry,
+                engine,
+                sent,
+                skipped,
+                expected: e,
+            } = err;
+            assert_eq!(
+                (entry.as_str(), engine, sent, skipped, e),
+                ("e", want_engine, want_sent, want_skipped, expected)
+            );
         }
         // Skipped records not matched by a short sent count also refuse.
         assert!(check_reps_accounted(&[("ravel", "e", 6)], &skipped, expected).is_err());
+    }
+
+    fn sidecar_output() -> RunOutput {
+        RunOutput {
+            cases_expected: Vec::new(),
+            measurements: Vec::new(),
+            denominators: Vec::new(),
+            oracle_retries: Vec::new(),
+            ulp_gaps: Vec::new(),
+            ravel_cost: Vec::new(),
+            skipped_reps: vec![SkippedRep {
+                engine: "ravel",
+                entry: "e".to_string(),
+                pass: 1,
+                rep: 2,
+                timed_out_rep: 1,
+            }],
+        }
+    }
+
+    fn unaccounted() -> RunError {
+        RunError::RepsUnaccounted {
+            mismatch: RepsMismatch {
+                entry: "e".to_string(),
+                engine: "ravel",
+                sent: 1,
+                skipped: 1,
+                expected: 3,
+            },
+            output: Box::new(sidecar_output()),
+        }
+    }
+
+    /// ADR-0927's 2026-11-06 amendment, decision 3: an accounting failure
+    /// writes no report, yet the sidecar that explains it is still written.
+    #[test]
+    fn an_accounting_failure_keeps_the_sidecar_and_writes_no_report() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("report.json");
+        let sidecar = dir.path().join("diagnostics.json");
+        let paths = OutputPaths {
+            out: &out,
+            diagnostics: Some(&sidecar),
+            profile: "smoke",
+            corpus_digest: "blake3:c",
+        };
+        let mut report_called = false;
+        let (code, message) = finish_run(Err(unaccounted()), paths, |_| {
+            report_called = true;
+            Ok(b"{}".to_vec())
+        })
+        .expect_err("void run");
+        assert_eq!(code, EX_DATAERR);
+        assert!(
+            message.starts_with("repetition accounting does not close"),
+            "{message}"
+        );
+        assert!(!report_called, "the report is never assembled");
+        assert!(!out.exists(), "no report on an accounting failure");
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).expect("sidecar written"))
+                .expect("sidecar parses");
+        for key in ["skipped_reps", "ravel_cost", "ulp_gaps"] {
+            assert!(json.get(key).is_some(), "sidecar lacks `{key}`: {json}");
+        }
+        assert_eq!(json["skipped_reps"][0]["timed_out_rep"], 1);
+    }
+
+    /// A sidecar that cannot be written on the accounting-failure path still
+    /// exits 65, and the message names both failures.
+    #[test]
+    fn an_accounting_failure_with_an_unwritable_sidecar_names_both() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("report.json");
+        let sidecar = dir.path().join("missing").join("diagnostics.json");
+        let paths = OutputPaths {
+            out: &out,
+            diagnostics: Some(&sidecar),
+            profile: "smoke",
+            corpus_digest: "blake3:c",
+        };
+        let (code, message) =
+            finish_run(Err(unaccounted()), paths, |_| Ok(b"{}".to_vec())).expect_err("void");
+        assert_eq!(code, EX_DATAERR);
+        assert!(
+            message.starts_with("repetition accounting does not close"),
+            "{message}"
+        );
+        assert!(
+            message.contains("diagnostics sidecar was not written")
+                && message.contains(&sidecar.display().to_string()),
+            "{message}"
+        );
+        assert!(!out.exists());
+    }
+
+    /// Without `--diagnostics` an accounting failure writes nothing, and a
+    /// file already at the report path is left as it was.
+    #[test]
+    fn an_accounting_failure_leaves_an_existing_report_path_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("report.json");
+        std::fs::write(&out, b"earlier").expect("seed");
+        let paths = OutputPaths {
+            out: &out,
+            diagnostics: None,
+            profile: "smoke",
+            corpus_digest: "blake3:c",
+        };
+        let (code, _) =
+            finish_run(Err(unaccounted()), paths, |_| Ok(b"{}".to_vec())).expect_err("void");
+        assert_eq!(code, EX_DATAERR);
+        assert_eq!(std::fs::read(&out).expect("still there"), b"earlier");
+        assert_eq!(std::fs::read_dir(dir.path()).expect("dir").count(), 1);
+    }
+
+    /// Any other run error writes neither file.
+    #[test]
+    fn other_run_errors_write_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("report.json");
+        let sidecar = dir.path().join("diagnostics.json");
+        let paths = OutputPaths {
+            out: &out,
+            diagnostics: Some(&sidecar),
+            profile: "smoke",
+            corpus_digest: "blake3:c",
+        };
+        let (code, _) =
+            finish_run(Err(RunError::NoPasses), paths, |_| Ok(b"{}".to_vec())).expect_err("void");
+        assert_eq!(code, EX_DATAERR);
+        assert!(!out.exists() && !sidecar.exists());
+    }
+
+    /// On success the report and then the sidecar are written.
+    #[test]
+    fn a_clean_run_writes_the_report_and_the_sidecar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("report.json");
+        let sidecar = dir.path().join("diagnostics.json");
+        let paths = OutputPaths {
+            out: &out,
+            diagnostics: Some(&sidecar),
+            profile: "smoke",
+            corpus_digest: "blake3:c",
+        };
+        finish_run(Ok(sidecar_output()), paths, |_| Ok(b"{\"r\":1}".to_vec())).expect("written");
+        assert_eq!(std::fs::read(&out).expect("report"), b"{\"r\":1}");
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar).expect("sidecar")).expect("json");
+        assert_eq!(json["profile"], "smoke");
+        assert_eq!(json["skipped_reps"][0]["rep"], 2);
     }
 
     #[test]

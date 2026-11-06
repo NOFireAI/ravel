@@ -58,6 +58,45 @@ pub enum CompactionOutcome {
     /// as it is and retried on every pass; it is not done, so a cursored scan
     /// does not advance past it.
     HeldOutOfWindow { version: u16 },
+    /// The RLOG merge plan is cursor mode and would decode more than
+    /// [`crate::rlog::MAX_CURSOR_DECODE_AMPLIFICATION`] times the bucket's
+    /// record count, so compaction refused it after the catalog phase and
+    /// before the first block GET (ADR-3853 D0). Nothing was fetched or
+    /// published and the claim is released. Retrying cannot succeed under
+    /// this build, so the scan memoizes it as terminal for the bucket.
+    GeometryUnsupported {
+        inputs: usize,
+        streams: usize,
+        blocks: usize,
+        records: u64,
+        predicted_decoded_rows: u64,
+    },
+    /// The bucket's single-level plan is refused under ADR-3853 D0 and its
+    /// two-level merge failed `check` (ADR-3853 D1). Nothing was published
+    /// and the claim is released. Terminal for this build like
+    /// [`Self::GeometryUnsupported`], so a refusal after level 1 does not pay
+    /// for level 1 again on every pass.
+    TwoLevelUnsupported {
+        inputs: usize,
+        check: crate::error::TwoLevelCheck,
+    },
+    /// The bucket's single-level plan is refused under ADR-3853 D0 and the
+    /// scratch volume holds less than its two-level merge needs once the
+    /// other two-level merges of this process have their `reserved` share
+    /// set aside, or a scratch write ran out of space (ADR-3853 D2). Nothing
+    /// published; terminal like [`Self::GeometryUnsupported`].
+    ScratchHeadroom {
+        need: u64,
+        free: u64,
+        reserved: u64,
+        path: std::path::PathBuf,
+    },
+    /// The bucket's single-level plan is refused under ADR-3853 D0 and
+    /// another process holds the scratch directory's lock, at `path`
+    /// (ADR-3853 D2). Refused before the first block GET; terminal like
+    /// [`Self::GeometryUnsupported`], so buckets that do not need the
+    /// two-level merge keep compacting.
+    ScratchLocked { path: std::path::PathBuf },
     /// Built and published (or converged / abandoned): `parts` parts written,
     /// `publish` records how the record PUT resolved.
     Compacted {
@@ -184,6 +223,70 @@ pub fn buckets_held_out_of_window_total() -> u64 {
     BUCKETS_HELD_OUT_OF_WINDOW.load(Ordering::Relaxed)
 }
 
+/// Why compaction refused a bucket outright: the `reason` label of
+/// `ravel_maintain_compaction_refused_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompactionRefusedReason {
+    /// [`CompactionOutcome::GeometryUnsupported`] (ADR-3853 D0).
+    Geometry,
+}
+
+impl CompactionRefusedReason {
+    pub const ALL: [CompactionRefusedReason; 1] = [CompactionRefusedReason::Geometry];
+
+    /// The `reason` label value.
+    pub fn name(self) -> &'static str {
+        match self {
+            CompactionRefusedReason::Geometry => "geometry",
+        }
+    }
+}
+
+/// Counter seam for `ravel_maintain_compaction_refused_total{reason="geometry"}`:
+/// compactions that ended in [`CompactionOutcome::GeometryUnsupported`].
+/// Process-wide and monotonic.
+static COMPACTIONS_REFUSED_GEOMETRY: AtomicU64 = AtomicU64::new(0);
+
+/// Compactions this process has refused for `reason` since it started.
+pub fn compaction_refused_total(reason: CompactionRefusedReason) -> u64 {
+    match reason {
+        CompactionRefusedReason::Geometry => COMPACTIONS_REFUSED_GEOMETRY.load(Ordering::Relaxed),
+    }
+}
+
+/// Count and log a geometry refusal, returning its outcome.
+fn refuse_geometry(
+    bucket: &Bucket,
+    inputs: usize,
+    streams: usize,
+    blocks: usize,
+    records: u64,
+    predicted_decoded_rows: u64,
+) -> CompactionOutcome {
+    COMPACTIONS_REFUSED_GEOMETRY.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        signal = ?bucket.signal,
+        shard = bucket.shard,
+        ingest_hour_bucket = bucket.ingest_hour_bucket,
+        inputs,
+        streams,
+        blocks,
+        records,
+        predicted_decoded_rows,
+        max_amplification = crate::rlog::MAX_CURSOR_DECODE_AMPLIFICATION,
+        "compaction refused a bucket: its cursor merge would decode more than \
+         max_amplification rows per input record; nothing fetched or published, \
+         the L0 inputs stay live (ADR-3853 D0)"
+    );
+    CompactionOutcome::GeometryUnsupported {
+        inputs,
+        streams,
+        blocks,
+        records,
+        predicted_decoded_rows,
+    }
+}
+
 /// Gauge seam for `ravel_maintain_compactions_in_flight`: bucket merges this
 /// process has started and not yet finished. A merge starts once the bucket
 /// passed every gate and, for a run that takes a claim, its claim is held,
@@ -253,6 +356,12 @@ fn merge_end_outcome(
 ) -> &'static str {
     match result {
         Err(MaintainError::InputOutOfWindow { .. }) => "held",
+        Err(
+            MaintainError::MergeGeometryUnsupported { .. }
+            | MaintainError::MergeTwoLevelUnsupported { .. }
+            | MaintainError::ScratchHeadroom { .. }
+            | MaintainError::ScratchLocked { .. },
+        ) => "refused",
         Err(_) => "failed",
         Ok(_) if cancelled => "cancelled",
         Ok(CompactionOutcome::Compacted { publish, .. }) => match publish {
@@ -611,6 +720,69 @@ async fn compact_bucket_scoped(
                 *source,
             )
             .await?
+        }
+        Err(MaintainError::MergeGeometryUnsupported {
+            inputs,
+            streams,
+            blocks,
+            records,
+            predicted_decoded_rows,
+        }) => refuse_geometry(
+            bucket,
+            inputs,
+            streams,
+            blocks,
+            records,
+            predicted_decoded_rows,
+        ),
+        Err(MaintainError::MergeTwoLevelUnsupported { inputs, check }) => {
+            tracing::warn!(
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                inputs,
+                %check,
+                "compaction refused a bucket: its two-level merge does not fit; \
+                 nothing published, the L0 inputs stay live (ADR-3853)"
+            );
+            CompactionOutcome::TwoLevelUnsupported { inputs, check }
+        }
+        Err(MaintainError::ScratchHeadroom {
+            need,
+            free,
+            reserved,
+            path,
+        }) => {
+            tracing::warn!(
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                need,
+                free,
+                reserved,
+                path = %path.display(),
+                "compaction refused a bucket: its two-level merge needs more scratch \
+                 than the volume has free beyond what this process's other merges \
+                 reserved; nothing published (ADR-3853 D2)"
+            );
+            CompactionOutcome::ScratchHeadroom {
+                need,
+                free,
+                reserved,
+                path,
+            }
+        }
+        Err(MaintainError::ScratchLocked { path }) => {
+            tracing::warn!(
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                path = %path.display(),
+                "compaction refused a bucket: another process holds the scratch \
+                 directory lock its two-level merge needs; nothing fetched or \
+                 published (ADR-3853 D2)"
+            );
+            CompactionOutcome::ScratchLocked { path }
         }
         other => other?,
     };
