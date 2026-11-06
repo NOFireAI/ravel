@@ -30,7 +30,7 @@
 //! (`floor(row * chunks / rows)`): that is the one approximation, exact for
 //! fixed-width columns and proportional for variable-width ones. Dictionary
 //! pages are read whole. The ranges a fetch of the matched rows needs are
-//! coalesced with the production gap and issued as real ranged GETs against
+//! coalesced at the gap being measured and issued as real ranged GETs against
 //! the simulated layout, stored beside the object in the same delayed store;
 //! the plan is the production plan, run for real, plus the mini-block index
 //! (`mini_block_meta_bytes` per mini-block, assumed carried in the page
@@ -38,6 +38,24 @@
 //! measured decode CPU scaled by the decompressed bytes the structural read
 //! would decode over the ones today's read decodes. The structural wall is
 //! its measured plan and data GET time plus that modelled CPU.
+//!
+//! Both sides are measured at two kinds of coalescing gap. At the production
+//! default (`coalesce_gap`, which must equal
+//! `ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`) on an L0 segment, ten
+//! targets about a megabyte apart coalesce into ranges spanning them on both
+//! sides (or today's side reads the whole object through its coverage
+//! crossover), so `ratio/*` there is a layout and recompression ratio and
+//! decides nothing. The decision is taken at the [`SWEEP`] gaps on an L1
+//! segment, where today's side runs the same production fetcher with
+//! `BlockRangeFetcher::with_coalesce_gap` and the structural ranges are
+//! coalesced at the same gap: `gap_64k/ratio/*` decides, the wider gaps are
+//! reported beside it. L1, because the fetcher bridges an L0 read to at most
+//! `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` runs before its coverage crossover,
+//! so on L0 today's side spans the targets at any gap; [`L0_FLOOR`] measures
+//! that case, with the structural ranges held to the same run cap by
+//! [`bound_runs`], and is reported only. The delay is a fixed latency per GET
+//! with no bandwidth term, so a larger range costs no more wall time than a
+//! small one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -53,7 +71,7 @@ use ravel_logseg::{
     RlogWriter, footer, stream_attrs_bytes,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreMetrics};
-use ravel_query::{LogQuery, LogSegmentFetcher};
+use ravel_query::{BlockRangeFetcher, LogQuery, LogSegmentFetcher};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::log_stream_id;
@@ -87,6 +105,7 @@ pub const FIGURES: &[&str] = &[
     "today/plan_bytes",
     "today/gets",
     "today/bytes",
+    "today/data_over_object",
     "today/uncomp_bytes",
     "today/wall_ms",
     "today/decode_cpu_ms",
@@ -99,24 +118,98 @@ pub const FIGURES: &[&str] = &[
     "structural/uncomp_bytes",
     "structural/wall_ms",
     "structural/decode_cpu_ms",
-    "floor_gap/data_ranges",
-    "floor_gap/bytes",
     "ratio/bytes",
     "ratio/gets",
     "ratio/wall",
+    "gap_64k/today/plan_gets",
+    "gap_64k/today/plan_bytes",
+    "gap_64k/today/gets",
+    "gap_64k/today/bytes",
+    "gap_64k/today/data_over_object",
+    "gap_64k/today/wall_ms",
+    "gap_64k/today/decode_cpu_ms",
+    "gap_64k/structural/data_ranges",
+    "gap_64k/structural/gets",
+    "gap_64k/structural/bytes",
+    "gap_64k/structural/wall_ms",
+    "gap_64k/structural/decode_cpu_ms",
+    "gap_64k/ratio/bytes",
+    "gap_64k/ratio/gets",
+    "gap_64k/ratio/wall",
+    "gap_256k/today/plan_gets",
+    "gap_256k/today/plan_bytes",
+    "gap_256k/today/gets",
+    "gap_256k/today/bytes",
+    "gap_256k/today/data_over_object",
+    "gap_256k/today/wall_ms",
+    "gap_256k/today/decode_cpu_ms",
+    "gap_256k/structural/data_ranges",
+    "gap_256k/structural/gets",
+    "gap_256k/structural/bytes",
+    "gap_256k/structural/wall_ms",
+    "gap_256k/structural/decode_cpu_ms",
+    "gap_256k/ratio/bytes",
+    "gap_256k/ratio/gets",
+    "gap_256k/ratio/wall",
+    "gap_1m/today/plan_gets",
+    "gap_1m/today/plan_bytes",
+    "gap_1m/today/gets",
+    "gap_1m/today/bytes",
+    "gap_1m/today/data_over_object",
+    "gap_1m/today/wall_ms",
+    "gap_1m/today/decode_cpu_ms",
+    "gap_1m/structural/data_ranges",
+    "gap_1m/structural/gets",
+    "gap_1m/structural/bytes",
+    "gap_1m/structural/wall_ms",
+    "gap_1m/structural/decode_cpu_ms",
+    "gap_1m/ratio/bytes",
+    "gap_1m/ratio/gets",
+    "gap_1m/ratio/wall",
+    "l0_64k/today/plan_gets",
+    "l0_64k/today/plan_bytes",
+    "l0_64k/today/gets",
+    "l0_64k/today/bytes",
+    "l0_64k/today/data_over_object",
+    "l0_64k/today/wall_ms",
+    "l0_64k/today/decode_cpu_ms",
+    "l0_64k/structural/data_ranges",
+    "l0_64k/structural/gets",
+    "l0_64k/structural/bytes",
+    "l0_64k/structural/wall_ms",
+    "l0_64k/structural/decode_cpu_ms",
+    "l0_64k/ratio/bytes",
+    "l0_64k/ratio/gets",
+    "l0_64k/ratio/wall",
 ];
+
+/// The coalescing gaps both sides are measured at besides the production
+/// default, each with the prefix its figures carry, on an L1 segment. The
+/// first is the production floor and the one the decision is taken at.
+pub const SWEEP: &[(&str, u64)] = &[
+    ("gap_64k", 64 * 1024),
+    ("gap_256k", 256 * 1024),
+    ("gap_1m", 1024 * 1024),
+];
+
+/// The floor gap again on an L0 segment, where both sides are held to
+/// `ravel_query::MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` data GETs.
+pub const L0_FLOOR: (&str, u64) = ("l0_64k", 64 * 1024);
+
+const _: () = assert!(SWEEP[0].1 == ravel_query::DEFAULT_LOG_COALESCE_GAP);
+const _: () = assert!(L0_FLOOR.1 == ravel_query::DEFAULT_LOG_COALESCE_GAP);
 
 pub const RULES: &[Rule] = &[
     Rule {
-        key: "ratio/bytes",
+        key: "gap_64k/ratio/bytes",
         max: 0.25,
     },
     Rule {
-        key: "ratio/gets",
+        key: "gap_64k/ratio/gets",
         max: 1.5,
     },
     Rule {
-        key: "ratio/wall",
+        key: "gap_64k/ratio/wall",
         max: 1.0,
     },
 ];
@@ -206,13 +299,47 @@ pub fn coalesce(mut ranges: Vec<(u64, u64)>, gap: u64) -> Vec<(u64, u64)> {
     out
 }
 
+/// Bridges the smallest gaps between sorted, disjoint `runs` (ties to the
+/// earlier gap) until at most `max_runs` remain, `max_runs` 0 read as 1: the
+/// production rule (`ravel_query`'s `bound_runs`, crate-private there) that
+/// holds one read of an L0 object to
+/// `ravel_query::MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` GETs.
+pub fn bound_runs(runs: Vec<(u64, u64)>, max_runs: usize) -> Vec<(u64, u64)> {
+    let max_runs = max_runs.max(1);
+    if runs.len() <= max_runs {
+        return runs;
+    }
+    let mut gaps: Vec<(u64, usize)> = runs
+        .windows(2)
+        .enumerate()
+        .map(|(i, pair)| (pair[1].0.saturating_sub(pair[0].1), i))
+        .collect();
+    gaps.sort_unstable();
+    let mut bridged = vec![false; gaps.len()];
+    for (_, i) in gaps.into_iter().take(runs.len() - max_runs) {
+        bridged[i] = true;
+    }
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(max_runs);
+    let mut bridge_previous = false;
+    for (run, bridge_next) in runs.into_iter().zip(bridged.into_iter().chain([false])) {
+        match out.last_mut() {
+            Some(last) if bridge_previous => last.1 = last.1.max(run.1),
+            _ => out.push(run),
+        }
+        bridge_previous = bridge_next;
+    }
+    out
+}
+
 /// The ranges a structural read of `targets` needs over `layout`: per target,
 /// the one mini-block of each page of its block that holds the row, and the
-/// whole dictionary page of each column of the block's group that has one.
+/// whole dictionary page of each column of the block's group that has one;
+/// coalesced at `gap`, then bounded to `max_runs` GETs by [`bound_runs`].
 pub fn structural_plan(
     layout: &[SPage],
     targets: &[Target],
     gap: u64,
+    max_runs: usize,
     meta_per_chunk: u64,
 ) -> Result<StructuralPlan, String> {
     let mut offsets = Vec::with_capacity(layout.len());
@@ -260,7 +387,7 @@ pub fn structural_plan(
     }
     let raw_ranges = wanted.len();
     let uncomp = wanted.values().sum();
-    let ranges = coalesce(wanted.into_keys().collect(), gap);
+    let ranges = bound_runs(coalesce(wanted.into_keys().collect(), gap), max_runs);
     let bytes = ranges.iter().map(|(s, e)| e - s).sum();
     let meta_bytes = layout
         .iter()
@@ -548,6 +675,7 @@ fn today_uncomp(dir: &PageDir, blocks: &[u32]) -> Result<u64, String> {
     Ok(total)
 }
 
+#[derive(Clone)]
 struct Ctx<'a> {
     store: Arc<dyn ObjectStoreBackend>,
     metrics: Arc<StoreMetrics>,
@@ -568,10 +696,23 @@ struct Planned {
     elapsed: Duration,
 }
 
-async fn plan(ctx: &Ctx<'_>) -> Result<Planned, String> {
-    let fetcher = LogSegmentFetcher::new(ctx.store.clone())
-        .with_config(*ctx.cfg)
-        .with_max_concurrent_gets(ctx.max_gets);
+/// A fresh production fetcher: the production defaults throughout, or with
+/// its block-range coalescing gap set to `gap` and nothing else changed.
+fn fetcher(ctx: &Ctx<'_>, gap: Option<u64>) -> LogSegmentFetcher {
+    let f = LogSegmentFetcher::new(ctx.store.clone()).with_config(*ctx.cfg);
+    let f = match gap {
+        Some(g) => f.with_block_range(
+            BlockRangeFetcher::new(ctx.store.clone())
+                .with_config(*ctx.cfg)
+                .with_coalesce_gap(g),
+        ),
+        None => f,
+    };
+    f.with_max_concurrent_gets(ctx.max_gets)
+}
+
+async fn plan(ctx: &Ctx<'_>, gap: Option<u64>) -> Result<Planned, String> {
+    let fetcher = fetcher(ctx, gap);
     let query = LogQuery::new(ctx.seg.min_event_ts_ns, ctx.seg.max_event_ts_ns);
     let (g0, b0, _) = t13::store_counts(&ctx.metrics);
     let t0 = Instant::now();
@@ -618,10 +759,10 @@ struct TodayRun {
     cpu: f64,
 }
 
-async fn today_once(ctx: &Ctx<'_>, matched: usize) -> Result<TodayRun, String> {
+async fn today_once(ctx: &Ctx<'_>, matched: usize, gap: Option<u64>) -> Result<TodayRun, String> {
     let (g0, b0, h0) = t13::store_counts(&ctx.metrics);
     let t0 = Instant::now();
-    let p = plan(ctx).await?;
+    let p = plan(ctx, gap).await?;
     let (indices, dirs, _, footer, whole) = p.plan.ok_or("the plan dropped the object")?;
     if whole.is_some() {
         return Err("the plan carried the whole object".into());
@@ -679,8 +820,12 @@ struct StructuralRun {
     data_s: f64,
 }
 
-async fn structural_once(ctx: &Ctx<'_>, ranges: &[(u64, u64)]) -> Result<StructuralRun, String> {
-    let p = plan(ctx).await?;
+async fn structural_once(
+    ctx: &Ctx<'_>,
+    ranges: &[(u64, u64)],
+    gap: Option<u64>,
+) -> Result<StructuralRun, String> {
+    let p = plan(ctx, gap).await?;
     let (g0, b0, _) = t13::store_counts(&ctx.metrics);
     let t0 = Instant::now();
     let permits = Arc::new(tokio::sync::Semaphore::new(ctx.max_gets.max(1)));
@@ -727,6 +872,104 @@ fn same<T: PartialEq + Copy + std::fmt::Debug>(what: &str, vs: &[T]) -> Result<T
     Ok(first)
 }
 
+/// One measured configuration: the prefix its figures carry, the gap today's
+/// fetcher is given (`None`: the production default, unmodified), the gap
+/// the structural ranges are coalesced at, and the segment level, which sets
+/// the run cap on both sides.
+struct Variant {
+    prefix: &'static str,
+    today_gap: Option<u64>,
+    gap: u64,
+    l1: bool,
+}
+
+impl Variant {
+    fn label(&self) -> String {
+        let level = if self.l1 { "L1" } else { "L0" };
+        if self.prefix.is_empty() {
+            format!("production gap {} on {level}", self.gap)
+        } else {
+            format!("{} ({} bytes on {level})", self.prefix, self.gap)
+        }
+    }
+}
+
+/// One gap's two sides, reduced over the runs.
+struct Sided {
+    plan: (u64, u64),
+    today: (u64, u64),
+    today_wall: f64,
+    today_cpu: f64,
+    s_gets: u64,
+    s_bytes: u64,
+    s_wall: f64,
+    s_cpu: f64,
+}
+
+/// Every GET and byte count must be the same in each run, both sides must
+/// have planned alike, and the structural data GETs must be the ones
+/// `splan` says. Decode CPU of the structural side is today's at the same
+/// gap, scaled by the decompressed bytes each side decodes.
+fn reduce(
+    what: &str,
+    today: &[TodayRun],
+    structural: &[StructuralRun],
+    splan: &StructuralPlan,
+    today_uncomp: u64,
+) -> Result<Sided, String> {
+    let t_plan = same(
+        &format!("{what}: today plan GETs"),
+        &today
+            .iter()
+            .map(|r| (r.plan_gets, r.plan_bytes))
+            .collect::<Vec<_>>(),
+    )?;
+    let t_all = same(
+        &format!("{what}: today GETs"),
+        &today.iter().map(|r| (r.gets, r.bytes)).collect::<Vec<_>>(),
+    )?;
+    let s_plan = same(
+        &format!("{what}: structural plan GETs"),
+        &structural
+            .iter()
+            .map(|r| (r.plan_gets, r.plan_bytes))
+            .collect::<Vec<_>>(),
+    )?;
+    let s_data = same(
+        &format!("{what}: structural data GETs"),
+        &structural
+            .iter()
+            .map(|r| (r.data_gets, r.data_bytes))
+            .collect::<Vec<_>>(),
+    )?;
+    if s_plan != t_plan {
+        return Err(format!(
+            "{what}: the two sides planned differently: {t_plan:?} vs {s_plan:?}"
+        ));
+    }
+    if s_data != (splan.ranges.len() as u64, splan.bytes) {
+        return Err(format!(
+            "{what}: the structural GETs moved {s_data:?}, the plan said {:?}",
+            (splan.ranges.len(), splan.bytes)
+        ));
+    }
+    let med = |v: Vec<f64>| t13::median(&v).ok_or_else(|| format!("{what}: no run"));
+    let today_wall = med(today.iter().map(|r| r.wall).collect())?;
+    let today_cpu = med(today.iter().map(|r| r.cpu).collect())?;
+    let s_cpu = today_cpu * splan.uncomp as f64 / today_uncomp.max(1) as f64;
+    let s_wall = med(structural.iter().map(|r| r.plan_s + r.data_s).collect())? + s_cpu;
+    Ok(Sided {
+        plan: t_plan,
+        today: t_all,
+        today_wall,
+        today_cpu,
+        s_gets: s_plan.0 + s_data.0,
+        s_bytes: s_plan.1 + splan.meta_bytes + s_data.1,
+        s_wall,
+        s_cpu,
+    })
+}
+
 /// The arm's measurement, for [`t13::exec`].
 pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
     let max_lines = spec.param_usize("max_lines")?;
@@ -752,6 +995,14 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
     if matched == 0 || runs == 0 {
         return Err("matched_rows and runs must be positive".into());
     }
+    if gap != ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES {
+        return Err(format!(
+            "coalesce_gap {gap} is not the production default gap, \
+             DEFAULT_LOG_REQUEST_COST_BYTES = {}: the production-gap figures compare against \
+             the unmodified production fetcher",
+            ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES
+        ));
+    }
 
     let lines = t13::read_lines(corpus, max_lines)?;
     let (rows, object, attempts) = sized_object(&lines, &cfg, window, seed, trace_run, matched)?;
@@ -774,33 +1025,71 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
         .ok_or("no BLOCKS section")?
         .offset;
     let (layout, layout_bytes) = build_layout(&object, &dir, blocks_offset, mini, cfg.zstd_level)?;
-    let splan = structural_plan(&layout, &targets, gap, meta)?;
-    let floor = structural_plan(
-        &layout,
-        &targets,
-        ravel_query::DEFAULT_LOG_COALESCE_GAP,
-        meta,
-    )?;
+    let l0_cap = ravel_query::MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT;
+    // Index 0 is the production default gap on L0, as round 0 measured it;
+    // then the SWEEP gaps on L1, then the floor gap on L0.
+    let gaps: Vec<Variant> = std::iter::once(Variant {
+        prefix: "",
+        today_gap: None,
+        gap,
+        l1: false,
+    })
+    .chain(SWEEP.iter().map(|&(prefix, g)| Variant {
+        prefix,
+        today_gap: Some(g),
+        gap: g,
+        l1: true,
+    }))
+    .chain(std::iter::once(Variant {
+        prefix: L0_FLOOR.0,
+        today_gap: Some(L0_FLOOR.1),
+        gap: L0_FLOOR.1,
+        l1: false,
+    }))
+    .collect();
+    let splans = gaps
+        .iter()
+        .map(|v| {
+            let max_runs = if v.l1 { usize::MAX } else { l0_cap };
+            structural_plan(&layout, &targets, v.gap, max_runs, meta)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let today_uncomp = today_uncomp(&dir, &blocks)?;
 
-    let seg = t13::segment_ref(OBJECT_KEY, &object, rows as u64, (0, rows as i64 - 1));
+    let ts = (0, rows as i64 - 1);
+    let seg_l0 = t13::segment_ref(OBJECT_KEY, &object, rows as u64, ts);
+    let seg_l1 = t13::segment_ref_at(
+        OBJECT_KEY,
+        &object,
+        rows as u64,
+        ts,
+        ravel_catalog::SegmentLevel::L1 {
+            input_set_hash: [0x13; 32],
+            part_index: 0,
+        },
+    );
     let (store, metrics) = t13::remote_store(latency);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("runtime: {e}"))?;
-    let ctx = Ctx {
+    let ctx_l0 = Ctx {
         store: store.clone(),
         metrics,
         cfg: &cfg,
         max_gets,
-        seg: &seg,
+        seg: &seg_l0,
         blocks: &blocks,
     };
+    let ctx_l1 = Ctx {
+        seg: &seg_l1,
+        ..ctx_l0.clone()
+    };
+    let ctx_of = |v: &Variant| if v.l1 { &ctx_l1 } else { &ctx_l0 };
     let bound = LogSegmentFetcher::new(store.clone())
         .with_config(cfg)
         .plan_whole_object_bound();
-    let (today, structural) = rt.block_on(async {
+    let sides = rt.block_on(async {
         store
             .put(
                 OBJECT_KEY,
@@ -817,100 +1106,107 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
             )
             .await
             .map_err(|e| format!("put layout: {e}"))?;
-        let mut today = Vec::with_capacity(runs);
-        let mut structural = Vec::with_capacity(runs);
+        // Interleaved: every run measures every gap, each side once.
+        let mut out: Vec<(Vec<TodayRun>, Vec<StructuralRun>)> = gaps
+            .iter()
+            .map(|_| (Vec::with_capacity(runs), Vec::with_capacity(runs)))
+            .collect();
         for _ in 0..runs {
-            today.push(today_once(&ctx, matched).await?);
-            structural.push(structural_once(&ctx, &splan.ranges).await?);
+            for ((v, sp), (today, structural)) in gaps.iter().zip(&splans).zip(out.iter_mut()) {
+                let ctx = ctx_of(v);
+                today.push(today_once(ctx, matched, v.today_gap).await?);
+                structural.push(structural_once(ctx, &sp.ranges, v.today_gap).await?);
+            }
         }
-        Ok::<_, String>((today, structural))
+        Ok::<_, String>(out)
     })?;
-
-    let t_plan = same(
-        "today plan GETs",
-        &today
-            .iter()
-            .map(|r| (r.plan_gets, r.plan_bytes))
-            .collect::<Vec<_>>(),
-    )?;
-    let t_all = same(
-        "today GETs",
-        &today.iter().map(|r| (r.gets, r.bytes)).collect::<Vec<_>>(),
-    )?;
-    let s_plan = same(
-        "structural plan GETs",
-        &structural
-            .iter()
-            .map(|r| (r.plan_gets, r.plan_bytes))
-            .collect::<Vec<_>>(),
-    )?;
-    let s_data = same(
-        "structural data GETs",
-        &structural
-            .iter()
-            .map(|r| (r.data_gets, r.data_bytes))
-            .collect::<Vec<_>>(),
-    )?;
-    if s_plan != t_plan {
-        return Err(format!(
-            "the two sides planned differently: {t_plan:?} vs {s_plan:?}"
-        ));
-    }
-    if s_data != (splan.ranges.len() as u64, splan.bytes) {
-        return Err(format!(
-            "the structural GETs moved {s_data:?}, the plan said {:?}",
-            (splan.ranges.len(), splan.bytes)
-        ));
-    }
-    let med = |v: Vec<f64>| t13::median(&v).ok_or_else(|| "no run".to_string());
-    let today_wall = med(today.iter().map(|r| r.wall).collect())?;
-    let today_cpu = med(today.iter().map(|r| r.cpu).collect())?;
-    let s_cpu = today_cpu * splan.uncomp as f64 / today_uncomp.max(1) as f64;
-    let s_wall = med(structural.iter().map(|r| r.plan_s + r.data_s).collect())? + s_cpu;
-    let s_gets = s_plan.0 + s_data.0;
-    let s_bytes = s_plan.1 + splan.meta_bytes + s_data.1;
+    let reduced = gaps
+        .iter()
+        .zip(&splans)
+        .zip(&sides)
+        .map(|((v, sp), (today, structural))| {
+            reduce(&v.label(), today, structural, sp, today_uncomp)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let object_len = object.len() as u64;
+    // A covering read: after the plan, one GET that returned the object.
+    let whole = |s: &Sided| s.today.0 - s.plan.0 == 1 && s.today.1 - s.plan.1 == object_len;
 
     let fig = |key: &str, value: f64| Figure {
         key: key.to_string(),
         value,
     };
-    let figures = vec![
+    let splan = &splans[0];
+    let mut figures = vec![
         fig("rows", rows as f64),
         fig("blocks", per_block.len() as f64),
         fig("object_bytes", object.len() as f64),
         fig("target_blocks", blocks.len() as f64),
-        fig("today/plan_gets", t_plan.0 as f64),
-        fig("today/plan_bytes", t_plan.1 as f64),
-        fig("today/gets", t_all.0 as f64),
-        fig("today/bytes", t_all.1 as f64),
         fig("today/uncomp_bytes", today_uncomp as f64),
-        fig("today/wall_ms", today_wall * 1e3),
-        fig("today/decode_cpu_ms", today_cpu * 1e3),
         fig("structural/layout_bytes", layout_bytes.len() as f64),
         fig("structural/raw_ranges", splan.raw_ranges as f64),
-        fig("structural/data_ranges", splan.ranges.len() as f64),
         fig("structural/meta_bytes", splan.meta_bytes as f64),
-        fig("structural/gets", s_gets as f64),
-        fig("structural/bytes", s_bytes as f64),
         fig("structural/uncomp_bytes", splan.uncomp as f64),
-        fig("structural/wall_ms", s_wall * 1e3),
-        fig("structural/decode_cpu_ms", s_cpu * 1e3),
-        fig("floor_gap/data_ranges", floor.ranges.len() as f64),
-        fig(
-            "floor_gap/bytes",
-            (s_plan.1 + floor.meta_bytes + floor.bytes) as f64,
-        ),
-        fig("ratio/bytes", s_bytes as f64 / t_all.1 as f64),
-        fig("ratio/gets", s_gets as f64 / t_all.0 as f64),
-        fig("ratio/wall", s_wall / today_wall),
     ];
+    for ((v, sp), s) in gaps.iter().zip(&splans).zip(&reduced) {
+        let prefix = v.prefix;
+        let key = |k: &str| {
+            if prefix.is_empty() {
+                k.to_string()
+            } else {
+                format!("{prefix}/{k}")
+            }
+        };
+        figures.extend([
+            fig(&key("today/plan_gets"), s.plan.0 as f64),
+            fig(&key("today/plan_bytes"), s.plan.1 as f64),
+            fig(&key("today/gets"), s.today.0 as f64),
+            fig(&key("today/bytes"), s.today.1 as f64),
+            fig(
+                &key("today/data_over_object"),
+                (s.today.1 - s.plan.1) as f64 / object_len.max(1) as f64,
+            ),
+            fig(&key("today/wall_ms"), s.today_wall * 1e3),
+            fig(&key("today/decode_cpu_ms"), s.today_cpu * 1e3),
+            fig(&key("structural/data_ranges"), sp.ranges.len() as f64),
+            fig(&key("structural/gets"), s.s_gets as f64),
+            fig(&key("structural/bytes"), s.s_bytes as f64),
+            fig(&key("structural/wall_ms"), s.s_wall * 1e3),
+            fig(&key("structural/decode_cpu_ms"), s.s_cpu * 1e3),
+            fig(&key("ratio/bytes"), s.s_bytes as f64 / s.today.1 as f64),
+            fig(&key("ratio/gets"), s.s_gets as f64 / s.today.0 as f64),
+            fig(&key("ratio/wall"), s.s_wall / s.today_wall),
+        ]);
+    }
+    let today_reads: Vec<String> = gaps
+        .iter()
+        .zip(&reduced)
+        .map(|(v, s)| {
+            let at = v.label();
+            if whole(s) {
+                format!(
+                    "{at}: the whole object in one GET after the plan (coverage crossover), \
+                     the plan's {} bytes read again",
+                    s.plan.1
+                )
+            } else {
+                format!(
+                    "{at}: {} ranged GETs of {} bytes after the plan",
+                    s.today.0 - s.plan.0,
+                    s.today.1 - s.plan.1
+                )
+            }
+        })
+        .collect();
     let notes = vec![
         format!(
             "object: {rows} rows from the first lines of the corpus, {} blocks, {} bytes, sized in \
-             {attempts} writes; whole-object bound {bound} bytes, so the routed plan restricts reads \
-             to the known blocks",
+             {attempts} writes; whole-object bound {bound} bytes, so the plan is the ranged plan \
+             restricted to the known blocks. Whether today's scan then reads those blocks ranged \
+             or the whole object is the fetcher's coverage crossover, decided per gap: {}",
             per_block.len(),
-            object.len()
+            object.len(),
+            today_reads.join("; ")
         ),
         format!(
             "matched rows (block, row of block): {:?}",
@@ -923,20 +1219,41 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
         "structural: a faithful simulation, not a real decode. Byte and GET counts come from the \
          object's real pages, re-cut into independently compressed mini-blocks and fetched as real \
          ranged GETs; the plan is the production plan run for real plus the mini-block index; \
-         decode CPU is modelled as today's CPU times structural/uncomp_bytes over \
+         decode CPU is modelled as today's CPU at the same gap times structural/uncomp_bytes over \
          today/uncomp_bytes; wall is measured plan and data GET time plus that modelled CPU"
             .to_string(),
         format!(
-            "coalescing: the structural ranges are coalesced at coalesce_gap = {gap} bytes; the \
-             production fetcher's default effective gap is its request cost, {} bytes, so today's \
-             ranges coalesce at that gap too. floor_gap/* is the structural plan at the {}-byte \
-             floor instead, planned only (no GETs issued): its byte figure includes the plan and \
-             mini-block index bytes",
-            ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES,
-            ravel_query::DEFAULT_LOG_COALESCE_GAP
+            "coalescing: unprefixed figures are both sides at the production default gap, \
+             coalesce_gap = DEFAULT_LOG_REQUEST_COST_BYTES = {gap} bytes (checked), on an L0 \
+             segment, the configuration round 0 measured. Targets {} blocks apart sit closer \
+             than that, so both sides there tend to one range and ratio/* is a layout and \
+             recompression ratio; it is not counted toward the decision. {} are both sides at \
+             the named gap on an L1 segment, measured: today's side is the production fetcher \
+             with BlockRangeFetcher::with_coalesce_gap and nothing else changed, the structural \
+             ranges are coalesced at the same gap, and both sides' plans are made by that \
+             fetcher. The decision is taken at {} ({} bytes, DEFAULT_LOG_COALESCE_GAP). L1 \
+             because an L0 read is bridged to at most {l0_cap} \
+             (MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT) runs before the coverage crossover is \
+             checked, which spans the targets whatever the gap; {}/* is that L0 case at {} \
+             bytes, with the structural ranges bounded to the same {l0_cap} runs by the same \
+             rule, reported beside the decision and not counted",
+            (per_block.len() / matched.max(1)).max(1),
+            SWEEP
+                .iter()
+                .map(|(p, g)| format!("{p}/* ({g} bytes)"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            SWEEP[0].0,
+            SWEEP[0].1,
+            L0_FLOOR.0,
+            L0_FLOOR.1
         ),
+        "latency model: every GET waits latency_ms before it returns, whatever its size; there \
+         is no bandwidth term, so wall time counts round trips and decode CPU, not bytes moved"
+            .to_string(),
         format!(
-            "medians of {runs} interleaved runs; every GET and byte count was identical across runs"
+            "medians of {runs} interleaved runs (each run measures every gap, today then \
+             structural); every GET and byte count was identical across runs"
         ),
     ];
     Ok(Measured { figures, notes })
@@ -1021,7 +1338,7 @@ mod tests {
                 rows: 8,
             },
         ];
-        let plan = structural_plan(&layout, &targets, 0, 2).expect("plan");
+        let plan = structural_plan(&layout, &targets, 0, usize::MAX, 2).expect("plan");
         // Block 0 row 7 -> c5 chunk 3: 350..450; block 1 row 0 -> chunk 0:
         // 450..550. Plus the dictionary 0..30 and both column-0 pages.
         assert_eq!(plan.raw_ranges, 5);
@@ -1030,7 +1347,7 @@ mod tests {
         assert_eq!(plan.uncomp, (30 + 10 + 10 + 100 + 100) * 4);
         // 1 + 1 + 4 + 4 value-page chunks, 2 bytes each.
         assert_eq!(plan.meta_bytes, 20);
-        let gapped = structural_plan(&layout, &targets, 300, 2).expect("plan");
+        let gapped = structural_plan(&layout, &targets, 300, usize::MAX, 2).expect("plan");
         assert_eq!(gapped.ranges, vec![(0, 550)]);
         assert_eq!(gapped.bytes, 550);
         assert!(
@@ -1042,10 +1359,35 @@ mod tests {
                     rows: 1
                 }],
                 0,
+                usize::MAX,
                 2
             )
             .is_err()
         );
+        // An L0 cap of one run bridges the two coalesced ranges.
+        let capped = structural_plan(&layout, &targets, 0, 1, 2).expect("plan");
+        assert_eq!(capped.ranges, vec![(0, 550)]);
+        assert_eq!(capped.raw_ranges, 5);
+    }
+
+    #[test]
+    fn bound_runs_bridges_the_smallest_gaps_first() {
+        let runs = vec![(0, 10), (30, 40), (45, 50), (100, 110), (115, 120)];
+        // Gaps: 20, 5, 50, 5. Two bridges take the two 5s.
+        assert_eq!(
+            bound_runs(runs.clone(), 3),
+            vec![(0, 10), (30, 50), (100, 120)]
+        );
+        // A third takes the 20.
+        assert_eq!(bound_runs(runs.clone(), 2), vec![(0, 50), (100, 120)]);
+        // Ties go to the earlier gap: of the two 5s only the first bridges.
+        assert_eq!(
+            bound_runs(runs.clone(), 4),
+            vec![(0, 10), (30, 50), (100, 110), (115, 120)]
+        );
+        assert_eq!(bound_runs(runs.clone(), 0), vec![(0, 120)]);
+        assert_eq!(bound_runs(runs.clone(), 5), runs);
+        assert_eq!(bound_runs(runs.clone(), usize::MAX), runs);
     }
 
     #[test]

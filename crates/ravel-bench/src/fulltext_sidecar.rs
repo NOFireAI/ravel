@@ -6,8 +6,9 @@
 //! each cold log object, so a search for a rare token reads a small index and
 //! then only the rows that hold the token, instead of every object's bloom
 //! filter and every block the bloom cannot rule out. LogCloud's index is an
-//! FM-index over the text; this arm measures the simpler member of the same
-//! family that RLOG would actually carry: a row-granular inverted index of the
+//! FM-index over the text, which answers arbitrary substrings. This arm
+//! measures a different index, the one RLOG would actually carry, that
+//! answers whole-token queries only: a row-granular inverted index of the
 //! body's tokens (the production tokenizer, so the same words the bloom and
 //! `HasWord` see), zstd-compressed in blocks of `sidecar_stride` terms with
 //! prefix-shared terms and delta-coded row ordinals, plus a block index and
@@ -23,12 +24,17 @@
 //! over the body's tokens to block indices (production does not build body
 //! postings today; it is what the sidecar would replace or stand beside).
 //!
-//! Production narrows by BLOOM only at decode, over a buffer that already
-//! holds every block in the time window, so for a full-window `HasWord` its
-//! scan moves the whole object whatever the bloom says. The bloom path the
-//! decision is taken against is therefore the bloom-guided route production
-//! does not take: real ranged GETs of the suffix probe, PAGE_DIR and BLOOM,
-//! then only the pages of the blocks the production bloom keeps. The two
+//! For a pure `HasWord` query (no `KeyEquals` arm, no tier-2 routed block
+//! set) production narrows by BLOOM only at decode, over a buffer that
+//! already holds every block in the time window, so its scan moves the whole
+//! object whatever the bloom says. A query that carries a `KeyEquals` arm or
+//! a tier-2 routed set, on an object above the whole-object bound, does take
+//! a bloom-guided route: `LogSegmentFetcher::fetch_keyed_plan` places BLOOM
+//! and POSTINGS for its content arms and prunes blocks before any BLOCKS
+//! byte is read. The bloom path the decision is taken against is that route,
+//! applied to a pure `HasWord` query, which production does not route this
+//! way: real ranged GETs of the suffix probe, PAGE_DIR and BLOOM, then only
+//! the pages of the blocks the production bloom keeps. The two
 //! production scans (defaults, and the coverage crossover off) are measured
 //! beside it for context. Every path runs against a `MemoryStore` behind the
 //! production `InstrumentedStore`, which counts their GETs and bytes, and
@@ -744,9 +750,11 @@ fn guided_rounds(
     Ok(rounds)
 }
 
-/// The bloom-guided route on one object, which production does not take:
-/// production narrows by BLOOM only at decode, after fetching every block
-/// in the time window. Real ranged GETs of the production-placed bytes for
+/// The bloom-guided route on one object for a pure `HasWord` query, which
+/// production routes this way only when the query also carries a
+/// `KeyEquals` arm or a tier-2 routed set (`fetch_keyed_plan`); a pure
+/// `HasWord` scan narrows by BLOOM only at decode, after fetching every
+/// block in the time window. Real ranged GETs of the production-placed bytes for
 /// the production suffix probe, PAGE_DIR and BLOOM, and the pages of the
 /// blocks the production bloom kept, coalesced at the production request
 /// cost. The verdict (`kept`) is the production scan's.
@@ -1539,8 +1547,11 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
          whole object is read. rare/no_crossover_* is the same scan with the crossover off \
          (BlockRangeFetcher coverage threshold 2.0): the ranged read still fetches every time \
          candidate block, because production narrows by BLOOM only at decode over the fetched \
-         buffer. rare/bloom_* is the bloom-guided route production does not take, the \
-         baseline the decision is taken against: real ranged GETs of the production suffix \
+         buffer. rare/bloom_* is the bloom-guided route, the baseline the decision is taken \
+         against: production's keyed plan (fetch_keyed_plan) prunes by BLOOM and POSTINGS \
+         before reading BLOCKS when the query carries a KeyEquals arm or a tier-2 routed set \
+         above the whole-object bound, and does not for a pure HasWord query, which is the \
+         query measured here. Real ranged GETs of the production suffix \
          probe (DEFAULT_LOG_SUFFIX_LEN), PAGE_DIR and BLOOM where the probe missed them, and \
          the pages of the blocks the production bloom kept, each round coalesced at \
          DEFAULT_LOG_REQUEST_COST_BYTES; its block verdict is the production scan's. \

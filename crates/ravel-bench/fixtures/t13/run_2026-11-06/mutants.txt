@@ -48,7 +48,7 @@
    result: exit=101 FAILED: assertion failed: a.windows(2).all(|w| w[0] < w[1])
 17 tests::measures_a_generated_corpus_and_refuses_drift_before_reading
    wrong: measure: --param drift not checked before the corpus is read
-   result: exit=101 FAILED: open /var/lib/fleet/work/c8543a31-6111-4b2d-878e-e3f0f6b3f4c9/.gate-logs/t13/tmp/.tmpGt2UjE/none.txt: No such file or directory (os error 2)
+   result: exit=101 FAILED: open <test tempdir>/none.txt: No such file or directory (os error 2)
 18 tests::measures_a_generated_corpus_with_exact_counts
    wrong: build_sidecar: entries counts terms, not (term, row) pairs
    result: exit=101 FAILED: assertion `left == right` failed: Checked { problems: [], misses: ["sidecar/entries: 6066 outside band [30000.0, 30000.0]"] }   left: 2  right: 0

@@ -475,7 +475,9 @@ impl Report {
     }
 }
 
-/// The verdict and figure-check counts read back from a written report.
+/// A written report's verdict and figure-check counts, recomputed from its
+/// figures: the verdict under the arm's current rules, the counts against
+/// the current pre-registration.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SavedDecision {
     pub arm: Arm,
@@ -484,19 +486,39 @@ pub struct SavedDecision {
     pub misses: usize,
 }
 
-pub fn saved_decision(json: &str) -> Result<SavedDecision, String> {
+/// Reads a written report back and recomputes its verdict from its saved
+/// figures and its figure check against `spec`, so a hand-edited verdict or a
+/// band moved after the run cannot pass. A report whose saved verdict is not
+/// the recomputed one is refused. A subject `spec` does not register under the
+/// report's arm keeps its saved counts, and [`overall`] and [`complete`]
+/// reject it by name.
+pub fn saved_decision(json: &str, spec: &T13Spec) -> Result<SavedDecision, String> {
     #[derive(Deserialize)]
     struct Saved {
         arm: Arm,
+        subject: String,
+        figures: Vec<Figure>,
         decision: Decision,
         checked: Checked,
     }
     let saved: Saved = serde_json::from_str(json).map_err(|e| format!("report: {e}"))?;
+    let decision = decide(saved.arm, &saved.subject, &saved.figures);
+    if decision != saved.decision {
+        return Err(format!(
+            "report for {}: the saved decision {:?} is not the one its figures give under the \
+             current rules, {:?}",
+            saved.subject, saved.decision.line, decision.line
+        ));
+    }
+    let checked = match spec.subject(&saved.subject) {
+        Some(s) if s.arm == saved.arm => check_figures(&saved.figures, &s.figures),
+        _ => saved.checked,
+    };
     Ok(SavedDecision {
         arm: saved.arm,
-        decision: saved.decision,
-        problems: saved.checked.problems.len(),
-        misses: saved.checked.misses.len(),
+        decision,
+        problems: checked.problems.len(),
+        misses: checked.misses.len(),
     })
 }
 
@@ -564,7 +586,9 @@ pub fn report_code(checked: &Checked) -> u8 {
 
 /// The `--decide` output and its exit code: a stamp line naming the git
 /// commit and every report read with its sha256, each subject's decision line
-/// and its miss and problem counts, then the overall line.
+/// and its miss and problem counts, then the overall line. Every line is
+/// recomputed by [`saved_decision`] from the saved figures and the spec at
+/// `spec_path`.
 pub fn decide_overall(
     arm: Arm,
     spec_path: &Path,
@@ -581,7 +605,7 @@ pub fn decide_overall(
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         read.push(format!("{name}:{sha256}"));
-        saved.push(saved_decision(&json).map_err(|e| format!("{}: {e}", path.display()))?);
+        saved.push(saved_decision(&json, &spec).map_err(|e| format!("{}: {e}", path.display()))?);
     }
     let mut lines = vec![format!(
         "{} decide stamp git={} reports={}",
@@ -787,12 +811,26 @@ pub fn store_counts(metrics: &StoreMetrics) -> (u64, u64, u64) {
 }
 
 /// A `SegmentRef` for one bench object, built as the fetcher's own tests
-/// build one.
+/// build one: an L0 segment, as an ingest flush writes it.
 pub fn segment_ref(
     key: &str,
     bytes: &[u8],
     rows: u64,
     ts: (i64, i64),
+) -> ravel_catalog::SegmentRef {
+    segment_ref_at(key, bytes, rows, ts, ravel_catalog::SegmentLevel::L0)
+}
+
+/// [`segment_ref`] at `level`. The level changes the fetcher's request law:
+/// one ranged read of an L0 object issues at most
+/// `ravel_query::MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` page-range GETs, an L1
+/// object's are unbounded.
+pub fn segment_ref_at(
+    key: &str,
+    bytes: &[u8],
+    rows: u64,
+    ts: (i64, i64),
+    level: ravel_catalog::SegmentLevel,
 ) -> ravel_catalog::SegmentRef {
     ravel_catalog::SegmentRef {
         data_object_key: key.to_string(),
@@ -808,7 +846,7 @@ pub fn segment_ref(
         writer_epoch: 1,
         writer_seq: 1,
         created_unix_ns: 0,
-        level: ravel_catalog::SegmentLevel::L0,
+        level,
         segment_format_version: u32::from(ravel_logseg::footer::VERSION),
         declared_column_stats: Default::default(),
     }
@@ -832,16 +870,16 @@ mod tests {
     #[test]
     fn structural_decision_is_go_only_when_every_bar_holds() {
         let at_bars = vec![
-            fig("ratio/bytes", 0.25),
-            fig("ratio/gets", 1.5),
-            fig("ratio/wall", 1.0),
+            fig("gap_64k/ratio/bytes", 0.25),
+            fig("gap_64k/ratio/gets", 1.5),
+            fig("gap_64k/ratio/wall", 1.0),
         ];
         let d = decide(Arm::StructuralFetch, "s", &at_bars);
         assert!(d.go, "{}", d.line);
         assert_eq!(
             d.line,
-            "structural_fetch decision s: GO (ratio/bytes=0.2500<=0.25 ok, \
-             ratio/gets=1.5000<=1.5 ok, ratio/wall=1.0000<=1 ok)"
+            "structural_fetch decision s: GO (gap_64k/ratio/bytes=0.2500<=0.25 ok, \
+             gap_64k/ratio/gets=1.5000<=1.5 ok, gap_64k/ratio/wall=1.0000<=1 ok)"
         );
         for (i, over) in [0.2501, 1.5001, 1.0001].iter().enumerate() {
             let mut f = at_bars.clone();
@@ -850,10 +888,120 @@ mod tests {
         }
         // A figure reported twice is no verdict at all.
         let mut twice = at_bars.clone();
-        twice.push(fig("ratio/gets", 1.0));
+        twice.push(fig("gap_64k/ratio/gets", 1.0));
         let d = decide(Arm::StructuralFetch, "s", &twice);
         assert!(!d.go);
-        assert!(d.line.contains("ratio/gets=missing FAIL"), "{}", d.line);
+        assert!(
+            d.line.contains("gap_64k/ratio/gets=missing FAIL"),
+            "{}",
+            d.line
+        );
+        // The production-gap ratios are reported and decide nothing.
+        let mut prod = at_bars.clone();
+        prod.extend([
+            fig("ratio/bytes", 9.0),
+            fig("ratio/gets", 9.0),
+            fig("ratio/wall", 9.0),
+        ]);
+        assert!(decide(Arm::StructuralFetch, "s", &prod).go);
+    }
+
+    /// A one-subject structural spec whose figures are unpredicted except
+    /// `gap_64k/ratio/bytes`, banded [0, band_max], and the report the
+    /// structural arm would write for it with `bytes` as that figure.
+    fn decide_fixture(band_max: f64, bytes: f64) -> (T13Spec, String) {
+        let mut text = SPEC.to_string();
+        text.push_str("[subject.params]\n");
+        for p in crate::structural_fetch::PARAMS {
+            text.push_str(&format!("{p} = 1\n"));
+        }
+        text.push_str("[subject.figures]\n");
+        for f in crate::structural_fetch::FIGURES {
+            if *f == "gap_64k/ratio/bytes" {
+                text.push_str(&format!(
+                    "\"{f}\" = {{ predict = 0.1, band = [0, {band_max}] }}\n"
+                ));
+            } else {
+                text.push_str(&format!("\"{f}\" = {{ unpredicted = \"test\" }}\n"));
+            }
+        }
+        let spec = parse(&text).expect("spec");
+        let figures: Vec<Figure> = crate::structural_fetch::FIGURES
+            .iter()
+            .map(|f| {
+                fig(
+                    f,
+                    if *f == "gap_64k/ratio/bytes" {
+                        bytes
+                    } else {
+                        1.0
+                    },
+                )
+            })
+            .collect();
+        let stamp = Stamp {
+            git: "g".into(),
+            arch: "a".into(),
+            nproc: 1,
+            mem_total_kib: 1,
+            corpus_file: "c.log".into(),
+            corpus_sha256: "0".repeat(64),
+            corpus_bytes: 1,
+            profile: "test".into(),
+            cpu_clock: CPU_CLOCK.into(),
+        };
+        let report = Report::new(&spec.subject[0], stamp, figures, Vec::new());
+        (spec, serde_json::to_string(&report).expect("json"))
+    }
+
+    #[test]
+    fn decide_recomputes_the_verdict_and_the_check_from_the_saved_figures() {
+        let (spec, json) = decide_fixture(0.3, 0.2);
+        let s = saved_decision(&json, &spec).expect("read back");
+        assert!(s.decision.go, "{}", s.decision.line);
+        assert_eq!((s.problems, s.misses), (0, 0));
+
+        // A saved verdict edited to GO over figures that give NO-GO is
+        // refused, and so is the reverse.
+        let (_, no_go) = decide_fixture(0.3, 0.26);
+        let mut v: serde_json::Value = serde_json::from_str(&no_go).expect("json");
+        assert_eq!(v["decision"]["go"], serde_json::Value::Bool(false));
+        v["decision"]["go"] = serde_json::Value::Bool(true);
+        let e = saved_decision(&v.to_string(), &spec).expect_err("edited verdict");
+        assert!(e.contains("is not the one its figures give"), "{e}");
+        let mut v: serde_json::Value = serde_json::from_str(&json).expect("json");
+        v["decision"]["line"] = serde_json::Value::String("anything".into());
+        assert!(saved_decision(&v.to_string(), &spec).is_err());
+
+        // The miss count is the current pre-registration's: a report written
+        // in band misses once the band is narrowed, and a saved check with no
+        // miss does not hide it.
+        let (narrow, _) = decide_fixture(0.1, 0.2);
+        let s = saved_decision(&json, &narrow).expect("read back");
+        assert_eq!((s.problems, s.misses), (0, 1));
+        // A figure the current spec predicts and the report lacks is a
+        // problem, though the saved check counted none.
+        let mut v: serde_json::Value = serde_json::from_str(&json).expect("json");
+        let figures = v["figures"].as_array_mut().expect("figures");
+        figures.retain(|f| f["key"] != "rows");
+        let with_rows = {
+            let mut text = SPEC.to_string();
+            text.push_str("[subject.params]\n");
+            for p in crate::structural_fetch::PARAMS {
+                text.push_str(&format!("{p} = 1\n"));
+            }
+            text.push_str("[subject.figures]\n");
+            for f in crate::structural_fetch::FIGURES {
+                if *f == "rows" {
+                    text.push_str("\"rows\" = { predict = 1, band = [1, 1] }\n");
+                } else {
+                    text.push_str(&format!("\"{f}\" = {{ unpredicted = \"test\" }}\n"));
+                }
+            }
+            parse(&text).expect("spec")
+        };
+        let s = saved_decision(&v.to_string(), &with_rows).expect("read back");
+        assert_eq!(s.problems, 1);
     }
 
     #[test]

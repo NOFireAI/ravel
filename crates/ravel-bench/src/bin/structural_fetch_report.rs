@@ -83,7 +83,7 @@ mod tests {
             ("max_concurrent_gets", 16),
             ("mini_block_bytes", 8192),
             ("mini_block_meta_bytes", 4),
-            ("coalesce_gap", 65_536),
+            ("coalesce_gap", 1_887_437),
             ("runs", 1),
             ("seed", 5),
         ] {
@@ -110,6 +110,91 @@ mod tests {
         let mut argv = vec!["structural_fetch_report"];
         argv.extend_from_slice(extra);
         t13::Args::try_parse_from(argv).expect("args")
+    }
+
+    /// Every byte and GET figure of `run()` over a fixed generated object,
+    /// exactly. Fails if the structural bytes drop the mini-block index
+    /// (`+ splan.meta_bytes`), if today's side at a sweep gap is built
+    /// without that gap, or if the L0 structural ranges escape the run cap.
+    #[test]
+    fn pins_the_exact_figures_of_a_generated_object() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = write_corpus(dir.path(), 90_000);
+        let (sha, _) = file_digest(&corpus).expect("digest");
+        let spec = t13::read_spec(&write_spec(dir.path(), &sha)).expect("spec");
+        let subject = spec.subject("gen").expect("subject");
+        let m = ravel_bench::structural_fetch::run(subject, &corpus).expect("run");
+        let get = |k: &str| {
+            let v: Vec<f64> = m
+                .figures
+                .iter()
+                .filter(|f| f.key == k)
+                .map(|f| f.value)
+                .collect();
+            assert_eq!(v.len(), 1, "{k}");
+            v[0]
+        };
+        let exact = [
+            ("rows", 65_536.0),
+            ("blocks", 32.0),
+            ("object_bytes", 10_584_418.0),
+            ("target_blocks", 10.0),
+            ("today/uncomp_bytes", 4_384_239.0),
+            ("structural/layout_bytes", 10_457_903.0),
+            ("structural/raw_ranges", 71.0),
+            ("structural/meta_bytes", 6_016.0),
+            ("structural/uncomp_bytes", 183_529.0),
+            // Production gap on L0: today reads the whole object after the
+            // plan, the structural ranges coalesce to one.
+            ("today/plan_gets", 1.0),
+            ("today/plan_bytes", 262_144.0),
+            ("today/gets", 2.0),
+            ("today/bytes", 262_144.0 + 10_584_418.0),
+            ("today/data_over_object", 1.0),
+            ("structural/data_ranges", 1.0),
+            ("structural/gets", 2.0),
+            ("structural/bytes", 10_726_043.0),
+            // 64 KiB on L1: thirteen ranged GETs on today's side, twelve
+            // mini-block ranges on the structural side, whose bytes are the
+            // plan, the index and the data: 262,144 + 6,016 + 405,458.
+            ("gap_64k/today/plan_gets", 1.0),
+            ("gap_64k/today/plan_bytes", 262_144.0),
+            ("gap_64k/today/gets", 14.0),
+            ("gap_64k/today/bytes", 3_742_501.0),
+            ("gap_64k/structural/data_ranges", 12.0),
+            ("gap_64k/structural/gets", 13.0),
+            ("gap_64k/structural/bytes", 262_144.0 + 6_016.0 + 405_458.0),
+            ("gap_64k/ratio/bytes", 673_618.0 / 3_742_501.0),
+            ("gap_64k/ratio/gets", 13.0 / 14.0),
+            ("gap_256k/today/gets", 14.0),
+            ("gap_256k/today/bytes", 3_742_501.0),
+            ("gap_256k/structural/bytes", 673_618.0),
+            // 1 MiB bridges targets three blocks apart: whole object again.
+            ("gap_1m/today/gets", 2.0),
+            ("gap_1m/today/bytes", 10_846_562.0),
+            ("gap_1m/structural/data_ranges", 1.0),
+            ("gap_1m/structural/bytes", 10_726_043.0),
+            // 64 KiB on L0: the four-run cap spans the targets on both
+            // sides, so today reads the whole object.
+            ("l0_64k/today/gets", 2.0),
+            ("l0_64k/today/bytes", 10_846_562.0),
+            ("l0_64k/structural/data_ranges", 4.0),
+            ("l0_64k/structural/gets", 5.0),
+            ("l0_64k/structural/bytes", 7_706_827.0),
+        ];
+        for (k, want) in exact {
+            assert_eq!(get(k), want, "{k}");
+        }
+        // Modelled decode CPU is today's at the same gap scaled by the
+        // decompressed bytes each side decodes.
+        for p in ["", "gap_64k/", "gap_256k/", "gap_1m/", "l0_64k/"] {
+            let today = get(&format!("{p}today/decode_cpu_ms"));
+            let s = get(&format!("{p}structural/decode_cpu_ms"));
+            let want = today * 183_529.0 / 4_384_239.0;
+            assert!((s - want).abs() <= want * 1e-12, "{p}: {s} vs {want}");
+        }
+        let d = t13::decide(Arm::StructuralFetch, "gen", &m.figures);
+        assert!(d.go, "{}", d.line);
     }
 
     #[test]
