@@ -784,6 +784,18 @@ pub const SQL_SPILL_SOURCE_INSUFFICIENT_SPACE: &str = "cache-dir-insufficient-sp
 pub const SQL_SPILL_SOURCE_FLAG_OFF: &str = "flag-off";
 /// `source` of both spill lines when no source configures spill.
 pub const SQL_SPILL_SOURCE_UNSET: &str = "unset";
+/// `source` of both spill lines when spill resolved under the process working
+/// directory, `<cwd>/sql-spill/<instance-id>`, because neither the env pair
+/// nor `--cache-dir` configures it.
+pub const SQL_SPILL_SOURCE_CWD_DEFAULT: &str = "cwd-default";
+/// `source` of both spill lines when the working directory default is off
+/// because the working directory is on tmpfs or ramfs.
+pub const SQL_SPILL_SOURCE_CWD_TMPFS: &str = "cwd-tmpfs";
+/// `source` of both spill lines when the working directory default is off
+/// because the working directory could not be read, `<cwd>/sql-spill` could
+/// not be created, measured or locked, or its derived ceiling is below the
+/// 1 GiB floor.
+pub const SQL_SPILL_SOURCE_CWD_UNAVAILABLE: &str = "cwd-unavailable";
 
 /// The owned form of [`ravel_sql::CacheDirSpill`]: what a `--cache-dir`
 /// deployment resolves its SQL spill root and ceiling from (ADR-0954, amended
@@ -843,6 +855,8 @@ pub struct SqlSpillInputs {
     /// `Some` when `--cache-dir` is set, `--sql-spill` is `auto`, and
     /// `RAVEL_SQL_SPILL_DIR` is unset: the only case in which
     /// [`ravel_sql::SpillConfig::resolve`] reads a cache directory at all.
+    /// Also `Some`, rooted at the working directory with no read cache bytes,
+    /// when the working directory default resolved spill on.
     pub cache_dir: Option<CacheDirSpillInputs>,
 }
 
@@ -1047,6 +1061,11 @@ pub const SPILL_ROOT_LEFT_SWEPT_ASIDE: &str = "a sweep moved it aside for remova
 /// `<cache-dir>/sql-spill` cannot be created or its free space cannot be
 /// measured, or when this process cannot take its own root's lock; every
 /// message names the path involved.
+///
+/// When `--sql-spill` is not off and neither half of the env pair nor
+/// `--cache-dir` is set, spill defaults to the process working directory
+/// instead: see [`prepare_cwd_default_spill`]. That default never refuses
+/// startup; a working directory it cannot use resolves spill off with a WARN.
 #[cfg(feature = "sql")]
 pub fn prepare_sql_spill(
     cache_dir: Option<&std::path::Path>,
@@ -1055,14 +1074,55 @@ pub fn prepare_sql_spill(
 ) -> anyhow::Result<SqlSpillStartup> {
     let env_dir = std::env::var_os(ravel_sql::ENV_SPILL_DIR);
     let env_quota = std::env::var_os(ravel_sql::ENV_SPILL_MAX_BYTES);
+    let working_dir = std::env::current_dir();
     prepare_sql_spill_with(
         cache_dir,
         settings,
         instance_id,
         env_dir.as_deref(),
         env_quota.as_deref(),
+        CwdSpillProbe {
+            working_dir: working_dir.as_deref(),
+            memory_backed_filesystem,
+        },
         ravel_sql::measure_free_bytes,
     )
+}
+
+/// What the working directory default reads about the process working
+/// directory, injected so tests neither change directory nor mount anything.
+#[cfg(feature = "sql")]
+struct CwdSpillProbe<'a, F> {
+    /// `std::env::current_dir()`.
+    working_dir: Result<&'a std::path::Path, &'a std::io::Error>,
+    /// [`memory_backed_filesystem`] in production.
+    memory_backed_filesystem: F,
+}
+
+/// `Some("tmpfs")` or `Some("ramfs")` when `path` is on that memory-backed
+/// filesystem, read from `statfs`'s `f_type`; `None` for any other type, when
+/// `statfs` fails, and on every host other than Linux, where the type is
+/// treated as unknown.
+#[cfg(feature = "sql")]
+fn memory_backed_filesystem(path: &std::path::Path) -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        const TMPFS_MAGIC: i128 = 0x0102_1994;
+        const RAMFS_MAGIC: i128 = 0x8584_58f6;
+        // `f_type`'s integer type differs by target and backend; the low 32
+        // bits carry the magic whether it is signed or not.
+        let f_type = i128::from(rustix::fs::statfs(path).ok()?.f_type) & 0xffff_ffff;
+        match f_type {
+            TMPFS_MAGIC => Some("tmpfs"),
+            RAMFS_MAGIC => Some("ramfs"),
+            _ => None,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 #[cfg(feature = "sql")]
@@ -1072,10 +1132,20 @@ fn prepare_sql_spill_with(
     instance_id: &str,
     env_dir: Option<&std::ffi::OsStr>,
     env_quota: Option<&std::ffi::OsStr>,
+    cwd: CwdSpillProbe<'_, impl FnOnce(&std::path::Path) -> Option<&'static str>>,
     measure_free_bytes: impl FnOnce(&std::path::Path) -> std::io::Result<u64>,
 ) -> anyhow::Result<SqlSpillStartup> {
     use anyhow::Context as _;
     use ravel_sql::spill::SpillRootOwner;
+
+    if !settings.off && cache_dir.is_none() && env_dir.is_none() && env_quota.is_none() {
+        return Ok(prepare_cwd_default_spill(
+            settings,
+            instance_id,
+            cwd,
+            measure_free_bytes,
+        ));
+    }
 
     let left_in_place = match cache_dir {
         Some(cache_dir) if !settings.off => sweep_spill_roots(cache_dir),
@@ -1133,6 +1203,177 @@ fn prepare_sql_spill_with(
         owner,
         left_in_place,
     })
+}
+
+/// The working directory default: with `--sql-spill` not off and neither the
+/// env pair nor `--cache-dir` set, spill resolves to
+/// `<cwd>/sql-spill/<instance-id>` exactly as `--cache-dir` would with the
+/// working directory as the cache directory and no read cache disk tier: the
+/// same startup sweep, the same owner lock, and a ceiling of
+/// [`ravel_sql::derive_spill_max_bytes`] over the measured free bytes and the
+/// memory budget. Both startup lines then read `cwd-default`.
+///
+/// It never fails. A working directory on tmpfs or ramfs resolves spill off
+/// as `cwd-tmpfs` and touches nothing under it; one that cannot be read, a
+/// `<cwd>/sql-spill` that cannot be created, measured or locked, and a derived
+/// ceiling below the 1 GiB floor each resolve spill off as `cwd-unavailable`.
+/// Each of those logs a WARN naming the source and the reason.
+#[cfg(feature = "sql")]
+fn prepare_cwd_default_spill(
+    settings: crate::config::SqlSpillSettings,
+    instance_id: &str,
+    cwd: CwdSpillProbe<'_, impl FnOnce(&std::path::Path) -> Option<&'static str>>,
+    measure_free_bytes: impl FnOnce(&std::path::Path) -> std::io::Result<u64>,
+) -> SqlSpillStartup {
+    let working_dir = match cwd.working_dir {
+        Ok(dir) => dir,
+        Err(err) => {
+            return cwd_spill_off(
+                SQL_SPILL_SOURCE_CWD_UNAVAILABLE,
+                None,
+                None,
+                Vec::new(),
+                &format!("the working directory could not be read: {err}"),
+            );
+        }
+    };
+    if let Some(fs_type) = (cwd.memory_backed_filesystem)(working_dir) {
+        return cwd_spill_off(
+            SQL_SPILL_SOURCE_CWD_TMPFS,
+            Some(working_dir),
+            None,
+            Vec::new(),
+            &format!("the working directory is on {fs_type}, so spilled bytes would stay in memory"),
+        );
+    }
+    let left_in_place = sweep_spill_roots(working_dir);
+    let spill_root = working_dir.join(ravel_sql::SQL_SPILL_SUBDIR);
+    if let Err(err) = std::fs::create_dir_all(&spill_root) {
+        return cwd_spill_off(
+            SQL_SPILL_SOURCE_CWD_UNAVAILABLE,
+            Some(working_dir),
+            None,
+            left_in_place,
+            &format!("could not create {}: {err}", spill_root.display()),
+        );
+    }
+    let free_bytes = match measure_free_bytes(&spill_root) {
+        Ok(free_bytes) => free_bytes,
+        Err(err) => {
+            return cwd_spill_off(
+                SQL_SPILL_SOURCE_CWD_UNAVAILABLE,
+                Some(working_dir),
+                None,
+                left_in_place,
+                &format!(
+                    "could not measure the free space under {}: {err}",
+                    spill_root.display()
+                ),
+            );
+        }
+    };
+    let space = SpillSpace {
+        free_bytes,
+        read_cache_bytes: 0,
+    };
+    let inputs = SqlSpillInputs {
+        off: false,
+        cache_dir: Some(CacheDirSpillInputs {
+            cache_dir: working_dir.to_path_buf(),
+            instance_id: instance_id.to_string(),
+            free_bytes,
+            read_cache_bytes: 0,
+            memory_budget_bytes: settings.memory_budget_bytes,
+        }),
+    };
+    let config = match resolve_sql_spill(&inputs, None, None) {
+        Ok(ResolvedSqlSpill {
+            config: Some(config),
+            ..
+        }) => config,
+        Ok(_) => {
+            return cwd_spill_off(
+                SQL_SPILL_SOURCE_CWD_UNAVAILABLE,
+                Some(working_dir),
+                Some(space),
+                left_in_place,
+                "half the free space under the working directory is below the 1 GiB floor of a \
+                 derived spill ceiling",
+            );
+        }
+        Err(err) => {
+            return cwd_spill_off(
+                SQL_SPILL_SOURCE_CWD_UNAVAILABLE,
+                Some(working_dir),
+                Some(space),
+                left_in_place,
+                &format!("{err:#}"),
+            );
+        }
+    };
+    let owner = match ravel_sql::spill::SpillRootOwner::acquire(working_dir, instance_id) {
+        Ok(owner) => owner,
+        Err(err) => {
+            return cwd_spill_off(
+                SQL_SPILL_SOURCE_CWD_UNAVAILABLE,
+                Some(working_dir),
+                Some(space),
+                left_in_place,
+                &format!(
+                    "could not take ownership of {} (another live process holds its owner \
+                     lock, or the directory is not writable): {err}",
+                    config.dir.display()
+                ),
+            );
+        }
+    };
+    let resolved = ResolvedSqlSpill {
+        config: Some(config),
+        dir_source: SQL_SPILL_SOURCE_CWD_DEFAULT,
+        max_bytes_source: SQL_SPILL_SOURCE_CWD_DEFAULT,
+        space: Some(space),
+    };
+    resolved.emit();
+    SqlSpillStartup {
+        inputs,
+        resolved,
+        owner: Some(owner),
+        left_in_place,
+    }
+}
+
+/// The working directory default resolved off: log both startup lines with
+/// `source`, then a WARN naming `source` and `reason`. The returned inputs
+/// carry no directory, so the executor resolves spill off too.
+#[cfg(feature = "sql")]
+fn cwd_spill_off(
+    source: &'static str,
+    working_dir: Option<&std::path::Path>,
+    space: Option<SpillSpace>,
+    left_in_place: Vec<LeftSpillRoot>,
+    reason: &str,
+) -> SqlSpillStartup {
+    let resolved = ResolvedSqlSpill {
+        config: None,
+        dir_source: source,
+        max_bytes_source: source,
+        space,
+    };
+    resolved.emit();
+    tracing::warn!(
+        source,
+        working_dir = working_dir.map(|dir| dir.display().to_string()),
+        reason,
+        "SQL spill is off: the default spill directory under the working directory is \
+         unusable; set --cache-dir or the RAVEL_SQL_SPILL_DIR/RAVEL_SQL_SPILL_MAX_BYTES pair \
+         to spill elsewhere, or --sql-spill off to choose no spill"
+    );
+    SqlSpillStartup {
+        inputs: SqlSpillInputs::default(),
+        resolved,
+        owner: None,
+        left_in_place,
+    }
 }
 
 /// Sweep the roots under `<cache_dir>/sql-spill` whose owner is gone, then log
@@ -3296,7 +3537,8 @@ mod tests {
     }
 
     /// `prepare_sql_spill_with` with the env pair and the measured free bytes
-    /// injected, so no test reads this process's environment or volume.
+    /// injected, so no test reads this process's environment or volume. The
+    /// working directory reads as unreadable; [`prepare_in`] supplies one.
     fn prepare(
         cache_dir: Option<&std::path::Path>,
         spill: crate::config::SqlSpillSettings,
@@ -3304,9 +3546,42 @@ mod tests {
         env_quota: Option<&std::ffi::OsStr>,
         free_bytes: u64,
     ) -> anyhow::Result<SqlSpillStartup> {
-        prepare_sql_spill_with(cache_dir, spill, INSTANCE, env_dir, env_quota, |_| {
-            Ok(free_bytes)
-        })
+        prepare_sql_spill_with(
+            cache_dir,
+            spill,
+            INSTANCE,
+            env_dir,
+            env_quota,
+            CwdSpillProbe {
+                working_dir: Err(&std::io::Error::other("no working directory in this test")),
+                memory_backed_filesystem: |_: &std::path::Path| None,
+            },
+            |_| Ok(free_bytes),
+        )
+    }
+
+    /// [`prepare`] with `working_dir` as the working directory and
+    /// `fs_type` as what its filesystem type check reports.
+    fn prepare_in(
+        working_dir: &std::path::Path,
+        fs_type: Option<&'static str>,
+        cache_dir: Option<&std::path::Path>,
+        spill: crate::config::SqlSpillSettings,
+        env: (Option<&std::ffi::OsStr>, Option<&std::ffi::OsStr>),
+        free_bytes: u64,
+    ) -> anyhow::Result<SqlSpillStartup> {
+        prepare_sql_spill_with(
+            cache_dir,
+            spill,
+            INSTANCE,
+            env.0,
+            env.1,
+            CwdSpillProbe {
+                working_dir: Ok(working_dir),
+                memory_backed_filesystem: |_: &std::path::Path| fs_type,
+            },
+            |_| Ok(free_bytes),
+        )
     }
 
     /// A sibling spill root whose owner has exited: its lock file exists and
@@ -3330,7 +3605,8 @@ mod tests {
     }
 
     /// Every INFO event, as `message=... name=value...`, the shape
-    /// `config::tests::capture_events` records.
+    /// `config::tests::capture_events` records, and every WARN event in the
+    /// same shape prefixed with `WARN`.
     #[derive(Clone, Default)]
     struct InfoCapture(Arc<parking_lot::Mutex<Vec<String>>>);
 
@@ -3340,10 +3616,11 @@ mod tests {
             event: &tracing::Event<'_>,
             _ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            if *event.metadata().level() != tracing::Level::INFO {
-                return;
-            }
-            #[derive(Default)]
+            let prefix = match *event.metadata().level() {
+                tracing::Level::INFO => "",
+                tracing::Level::WARN => "WARN",
+                _ => return,
+            };
             struct Visitor(String);
             impl tracing::field::Visit for Visitor {
                 fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
@@ -3363,7 +3640,7 @@ mod tests {
                     let _ = write!(self.0, " {}={value:?}", field.name());
                 }
             }
-            let mut visitor = Visitor::default();
+            let mut visitor = Visitor(prefix.to_string());
             event.record(&mut visitor);
             self.0.lock().push(visitor.0);
         }
@@ -3635,8 +3912,9 @@ mod tests {
 
     /// The source precedence: the full env pair wins over `--cache-dir`;
     /// `RAVEL_SQL_SPILL_MAX_BYTES` alone keeps the cache-dir root under the
-    /// env ceiling; `--sql-spill off` wins over both; neither source disables
-    /// spill; a half-set pair that no cache dir completes is an error naming
+    /// env ceiling; `--sql-spill off` wins over both; neither source spills
+    /// under the working directory (100 GiB free, 2 GiB budget: the 8 GiB
+    /// memory cap binds); a half-set pair that no cache dir completes is an error naming
     /// the missing variable. What each row sweeps is pinned by
     /// `an_env_spill_dir_start_sweeps_the_cache_dir_roots` and
     /// `sql_spill_off_touches_nothing`.
@@ -3696,15 +3974,29 @@ mod tests {
             .expect("off ignores even an unparseable env half");
         assert_eq!(half_set_off.resolved.config, None);
 
-        let neither = prepare(None, settings(false, 2 * GIB), None, None, 100 * GIB)
-            .expect("no source resolves");
+        let working = tempfile::tempdir().expect("working dir");
+        let neither = prepare_in(
+            working.path(),
+            None,
+            None,
+            settings(false, 2 * GIB),
+            (None, None),
+            100 * GIB,
+        )
+        .expect("no source resolves");
         assert_eq!(
             neither.resolved,
             ResolvedSqlSpill {
-                config: None,
-                dir_source: SQL_SPILL_SOURCE_UNSET,
-                max_bytes_source: SQL_SPILL_SOURCE_UNSET,
-                space: None,
+                config: Some(ravel_sql::SpillConfig {
+                    dir: working.path().join("sql-spill").join(INSTANCE),
+                    max_bytes: 8 * GIB,
+                }),
+                dir_source: SQL_SPILL_SOURCE_CWD_DEFAULT,
+                max_bytes_source: SQL_SPILL_SOURCE_CWD_DEFAULT,
+                space: Some(SpillSpace {
+                    free_bytes: 100 * GIB,
+                    read_cache_bytes: 0,
+                }),
             }
         );
 
@@ -4157,6 +4449,10 @@ mod tests {
             INSTANCE,
             env_dir,
             env_quota,
+            CwdSpillProbe {
+                working_dir: Err(&std::io::Error::other("no working directory in this test")),
+                memory_backed_filesystem: |_: &std::path::Path| None,
+            },
             |_| {
                 let present = orphan.exists();
                 seen.push(present);
@@ -4413,5 +4709,385 @@ mod tests {
             1,
             "the swept-aside tree is logged once with its reason: {lines:?}"
         );
+    }
+
+    /// The WARN lines a capture recorded.
+    fn warn_lines(capture: &InfoCapture) -> Vec<String> {
+        capture
+            .0
+            .lock()
+            .iter()
+            .filter(|line| line.starts_with("WARN"))
+            .cloned()
+            .collect()
+    }
+
+    /// With no `--sql-spill off`, no env pair and no `--cache-dir`, spill
+    /// resolves to `<cwd>/sql-spill/<instance-id>` with both startup lines
+    /// reading `cwd-default`, a ceiling of `derive_spill_max_bytes` over the
+    /// injected free bytes and the memory budget (40 GiB free, 2 GiB budget:
+    /// 8 GiB), this process's owner lock on the root, an orphan root swept,
+    /// and the executor resolving the same directory and ceiling.
+    ///
+    /// FLIP: label the resolved lines `SQL_SPILL_SOURCE_CACHE_DIR` in
+    /// `prepare_cwd_default_spill` and the source assertions fail.
+    #[test]
+    fn no_source_spills_under_the_working_directory() {
+        assert_spill_env_unset();
+        let working = tempfile::tempdir().expect("working dir");
+        let orphan = dead_sibling(working.path(), "inst-dead");
+        let (capture, guard) = capture_info();
+        let startup = prepare_in(
+            working.path(),
+            None,
+            None,
+            settings(false, 2 * GIB),
+            (None, None),
+            40 * GIB,
+        );
+        drop(guard);
+        let startup = startup.expect("the working directory default never refuses startup");
+
+        let expected = ravel_sql::SpillConfig {
+            dir: working.path().join("sql-spill").join(INSTANCE),
+            max_bytes: 8 * GIB,
+        };
+        assert_eq!(
+            Some(8 * GIB),
+            ravel_sql::derive_spill_max_bytes(40 * GIB, 2 * GIB)
+        );
+        assert_eq!(
+            startup.resolved,
+            ResolvedSqlSpill {
+                config: Some(expected.clone()),
+                dir_source: SQL_SPILL_SOURCE_CWD_DEFAULT,
+                max_bytes_source: SQL_SPILL_SOURCE_CWD_DEFAULT,
+                space: Some(SpillSpace {
+                    free_bytes: 40 * GIB,
+                    read_cache_bytes: 0,
+                }),
+            }
+        );
+        assert_eq!(
+            startup.inputs,
+            SqlSpillInputs {
+                off: false,
+                cache_dir: Some(CacheDirSpillInputs {
+                    cache_dir: working.path().to_path_buf(),
+                    instance_id: INSTANCE.to_string(),
+                    free_bytes: 40 * GIB,
+                    read_cache_bytes: 0,
+                    memory_budget_bytes: 2 * GIB,
+                }),
+            }
+        );
+        assert_eq!(executor_spill(&startup.inputs), Some(expected.clone()));
+        let owner = startup.owner.as_ref().expect("this process owns its root");
+        assert_eq!(owner.dir(), expected.dir.as_path());
+        assert!(!orphan.exists(), "the startup sweep runs under the cwd");
+
+        let lines = capture.0.lock().clone();
+        let dir_line = resolved_line(&lines, "sql_spill_dir");
+        assert!(
+            dir_line.contains(&format!(
+                " value={:?} source=\"cwd-default\"",
+                expected.dir.display().to_string()
+            )),
+            "{dir_line}"
+        );
+        let max_line = resolved_line(&lines, "sql_spill_max_bytes");
+        assert!(
+            max_line.contains(&format!(
+                " value={} source=\"cwd-default\" free_bytes={} read_cache_bytes=0",
+                8 * GIB,
+                40 * GIB
+            )),
+            "{max_line}"
+        );
+        assert_eq!(warn_lines(&capture), Vec::<String>::new());
+    }
+
+    /// A working directory on tmpfs resolves spill off as `cwd-tmpfs`, with
+    /// a WARN naming that source and the filesystem, and startup succeeds
+    /// without creating `<cwd>/sql-spill`. ramfs reads the same way.
+    #[test]
+    fn a_tmpfs_working_directory_resolves_spill_off() {
+        assert_spill_env_unset();
+        for fs_type in ["tmpfs", "ramfs"] {
+            let working = tempfile::tempdir().expect("working dir");
+            let (capture, guard) = capture_info();
+            let startup = prepare_in(
+                working.path(),
+                Some(fs_type),
+                None,
+                settings(false, 2 * GIB),
+                (None, None),
+                100 * GIB,
+            );
+            drop(guard);
+            let startup = startup.expect("a tmpfs working directory does not refuse startup");
+
+            assert_eq!(
+                startup.resolved,
+                ResolvedSqlSpill {
+                    config: None,
+                    dir_source: SQL_SPILL_SOURCE_CWD_TMPFS,
+                    max_bytes_source: SQL_SPILL_SOURCE_CWD_TMPFS,
+                    space: None,
+                },
+                "{fs_type}"
+            );
+            assert_eq!(startup.inputs, SqlSpillInputs::default());
+            assert_eq!(executor_spill(&startup.inputs), None);
+            assert!(startup.owner.is_none());
+            assert!(
+                !working.path().join("sql-spill").exists(),
+                "a tmpfs working directory gains no spill root"
+            );
+            let lines = capture.0.lock().clone();
+            assert!(
+                resolved_line(&lines, "sql_spill_dir")
+                    .contains(" value=\"none\" source=\"cwd-tmpfs\""),
+                "{lines:?}"
+            );
+            let warns = warn_lines(&capture);
+            assert_eq!(warns.len(), 1, "{warns:?}");
+            assert!(
+                warns[0].contains(" source=\"cwd-tmpfs\"")
+                    && warns[0].contains(&format!("the working directory is on {fs_type}")),
+                "{warns:?}"
+            );
+        }
+    }
+
+    /// A working directory where `<cwd>/sql-spill` cannot be created, one
+    /// whose own root's lock another holder has, one that cannot be read, and
+    /// one whose derived ceiling is below the 1 GiB floor each resolve spill
+    /// off as `cwd-unavailable` with a WARN, and startup succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn an_unusable_working_directory_resolves_spill_off() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let check = |startup: anyhow::Result<SqlSpillStartup>,
+                     capture: &InfoCapture,
+                     space: Option<SpillSpace>,
+                     reason: &str| {
+            let startup = startup.expect("an unusable working directory does not refuse startup");
+            assert_eq!(
+                startup.resolved,
+                ResolvedSqlSpill {
+                    config: None,
+                    dir_source: SQL_SPILL_SOURCE_CWD_UNAVAILABLE,
+                    max_bytes_source: SQL_SPILL_SOURCE_CWD_UNAVAILABLE,
+                    space,
+                },
+                "{reason}"
+            );
+            assert_eq!(startup.inputs, SqlSpillInputs::default());
+            assert!(startup.owner.is_none());
+            let warns = warn_lines(capture);
+            assert_eq!(warns.len(), 1, "{warns:?}");
+            assert!(
+                warns[0].contains(" source=\"cwd-unavailable\"") && warns[0].contains(reason),
+                "{reason}: {warns:?}"
+            );
+        };
+
+        let sealed = tempfile::tempdir().expect("working dir");
+        std::fs::set_permissions(sealed.path(), std::fs::Permissions::from_mode(0o500))
+            .expect("make the working directory read-only");
+        let writable = std::fs::create_dir(sealed.path().join("probe")).is_ok();
+        let (capture, guard) = capture_info();
+        let startup = prepare_in(
+            sealed.path(),
+            None,
+            None,
+            settings(false, 2 * GIB),
+            (None, None),
+            100 * GIB,
+        );
+        drop(guard);
+        std::fs::set_permissions(sealed.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("unseal for cleanup");
+        if writable {
+            eprintln!("this process can write a read-only directory; read-only row skipped");
+        } else {
+            check(startup, &capture, None, "could not create");
+        }
+
+        let held = tempfile::tempdir().expect("working dir");
+        let _holder =
+            ravel_sql::spill::SpillRootOwner::acquire(held.path(), INSTANCE).expect("acquire");
+        let (capture, guard) = capture_info();
+        let startup = prepare_in(
+            held.path(),
+            None,
+            None,
+            settings(false, 2 * GIB),
+            (None, None),
+            100 * GIB,
+        );
+        drop(guard);
+        check(
+            startup,
+            &capture,
+            Some(SpillSpace {
+                free_bytes: 100 * GIB,
+                read_cache_bytes: 0,
+            }),
+            "could not take ownership",
+        );
+
+        let (capture, guard) = capture_info();
+        let startup = prepare(None, settings(false, 2 * GIB), None, None, 100 * GIB);
+        drop(guard);
+        check(
+            startup,
+            &capture,
+            None,
+            "the working directory could not be read",
+        );
+
+        let small = tempfile::tempdir().expect("working dir");
+        let (capture, guard) = capture_info();
+        let startup = prepare_in(
+            small.path(),
+            None,
+            None,
+            settings(false, 2 * GIB),
+            (None, None),
+            GIB,
+        );
+        drop(guard);
+        check(
+            startup,
+            &capture,
+            Some(SpillSpace {
+                free_bytes: GIB,
+                read_cache_bytes: 0,
+            }),
+            "below the 1 GiB floor",
+        );
+        assert!(
+            !small.path().join("sql-spill").join(INSTANCE).exists(),
+            "a ceiling below the floor takes no root"
+        );
+    }
+
+    /// `--sql-spill off`, the env pair and `--cache-dir` each win over the
+    /// working directory default, and none of them creates
+    /// `<cwd>/sql-spill`. A bare `RAVEL_SQL_SPILL_MAX_BYTES` with no
+    /// `--cache-dir` is still refused rather than rooted at the working
+    /// directory.
+    #[test]
+    fn explicit_sources_win_over_the_working_directory_default() {
+        let working = tempfile::tempdir().expect("working dir");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let explicit = cache.path().join("explicit");
+
+        let off = prepare_in(
+            working.path(),
+            None,
+            None,
+            settings(true, 2 * GIB),
+            (None, None),
+            100 * GIB,
+        )
+        .expect("off never errors");
+        assert_eq!(
+            off.resolved,
+            ResolvedSqlSpill {
+                config: None,
+                dir_source: SQL_SPILL_SOURCE_FLAG_OFF,
+                max_bytes_source: SQL_SPILL_SOURCE_FLAG_OFF,
+                space: None,
+            }
+        );
+
+        let env = prepare_in(
+            working.path(),
+            None,
+            None,
+            settings(false, 2 * GIB),
+            (
+                os(explicit.to_str().expect("utf-8 temp path")),
+                os("4096"),
+            ),
+            100 * GIB,
+        )
+        .expect("the env pair resolves");
+        assert_eq!(
+            env.resolved,
+            ResolvedSqlSpill {
+                config: Some(ravel_sql::SpillConfig {
+                    dir: explicit.clone(),
+                    max_bytes: 4096,
+                }),
+                dir_source: SQL_SPILL_SOURCE_ENV,
+                max_bytes_source: SQL_SPILL_SOURCE_ENV,
+                space: None,
+            }
+        );
+
+        let cached = prepare_in(
+            working.path(),
+            None,
+            Some(cache.path()),
+            settings(false, 2 * GIB),
+            (None, None),
+            100 * GIB,
+        )
+        .expect("--cache-dir resolves");
+        assert_eq!(
+            cached.resolved,
+            ResolvedSqlSpill {
+                config: Some(ravel_sql::SpillConfig {
+                    dir: cache.path().join("sql-spill").join(INSTANCE),
+                    max_bytes: 8 * GIB,
+                }),
+                dir_source: SQL_SPILL_SOURCE_CACHE_DIR,
+                max_bytes_source: SQL_SPILL_SOURCE_DERIVED,
+                space: Some(SpillSpace {
+                    free_bytes: 100 * GIB,
+                    read_cache_bytes: 0,
+                }),
+            }
+        );
+        drop(cached);
+
+        let err = prepare_in(
+            working.path(),
+            None,
+            None,
+            settings(false, 2 * GIB),
+            (None, os("777")),
+            100 * GIB,
+        )
+        .err()
+        .expect("a quota with no directory and no --cache-dir is refused");
+        assert!(
+            err.to_string()
+                .starts_with("RAVEL_SQL_SPILL_DIR is not set but RAVEL_SQL_SPILL_MAX_BYTES is"),
+            "{err}"
+        );
+        assert!(
+            !working.path().join("sql-spill").exists(),
+            "no explicit source touches the working directory"
+        );
+    }
+
+    /// The production filesystem type check reads `/proc`, which is procfs
+    /// on every Linux host, as not memory-backed, and `/dev/shm` as tmpfs
+    /// where the host mounts it that way (a host without it is reported and
+    /// skipped for that row).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_filesystem_check_recognises_tmpfs() {
+        assert_eq!(memory_backed_filesystem(std::path::Path::new("/proc")), None);
+        match memory_backed_filesystem(std::path::Path::new("/dev/shm")) {
+            Some(fs_type) => assert_eq!(fs_type, "tmpfs"),
+            None => eprintln!("/dev/shm is not tmpfs on this host; tmpfs row skipped"),
+        }
     }
 }

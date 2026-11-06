@@ -5360,6 +5360,7 @@ dependencies = [
  "reqwest 0.13.4",
  "ring",
  "rmcp",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "serde",

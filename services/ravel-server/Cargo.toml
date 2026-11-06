@@ -193,6 +193,10 @@ ravel-alerting = { path = "../../crates/ravel-alerting", version = "0.30.1" }
 # internal crate is pinned.
 ravel-sql = { path = "../../crates/ravel-sql", version = "0.30.1", optional = true }
 
+# `statfs`, for the `sql` feature: the cwd-default SQL spill root refuses a
+# tmpfs or ramfs working directory by its filesystem magic.
+rustix = { workspace = true, optional = true }
+
 # The ES|QL lexer and parser, for the `esql` feature: the handler's structural
 # guard and parse before admission, and the audit redactor's lexing.
 ravel-esql = { workspace = true, optional = true }
@@ -246,7 +250,7 @@ otap = ["dep:ravel-otap"]
 # `POST /api/v1/sql`. Off by default: enabling it links datafusion into the
 # server binary, and the SQL surface is opt-in per deployment
 # (ADR-0013 structural isolation).
-sql = ["dep:ravel-sql"]
+sql = ["dep:ravel-sql", "dep:rustix"]
 
 # Flight SQL on the gRPC listener. Implies `sql`: both surfaces execute through
 # ravel-sql, so there is no deployment that wants Flight without it
