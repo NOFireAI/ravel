@@ -13840,6 +13840,14 @@ mod tests {
                 .with_ansi(false)
                 .with_max_level(tracing::Level::INFO)
                 .finish();
+            // With one dispatcher registered, a callsite's interest is cached
+            // from whichever thread reaches it first; a second, process-wide
+            // one keeps interest computed across every live dispatcher instead.
+            static KEEP_TWO_DISPATCHERS: std::sync::OnceLock<tracing::Dispatch> =
+                std::sync::OnceLock::new();
+            KEEP_TWO_DISPATCHERS.get_or_init(|| {
+                tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
+            });
             let guard = tracing::subscriber::set_default(subscriber);
             let clock = FixedClock::new(sealed_now_ns());
             let outcome = if claimed {
