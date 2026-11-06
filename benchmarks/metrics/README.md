@@ -1088,7 +1088,10 @@ step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
   every entry, tolerance or not (`metrics_query::UlpGap`). `max_ulps` is the
   largest `comparator::ulp_distance` between a value of the oracle's answer
   for the pass and the paired value of the engine's answer, over every step,
-  repetition and timed pass; an exact entry shows 0. Only answers classified
+  repetition sent and timed pass; an exact entry shows 0. A repetition
+  skipped after a timeout (`skipped_reps` below) is not an answer and counts
+  nowhere here
+  (`metricsbench_query::a_timed_out_repetition_ends_its_pass_for_that_engine`). Only answers classified
   against the oracle are measured, so warmup passes and an entry unsupported
   on the engine by declaration are not. An answer is aligned when it is a
   2xx `success` envelope of the oracle's result type with the same label
@@ -1112,7 +1115,9 @@ step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
   `metrics_query::RavelCost`). It is recorded here and never in
   `report.json`. Each object carries `entry`, `pass`, `rep`, `status`,
   `latency_ms`, `accounting` and `phases`. There is one object per timed
-  repetition of every pass, never summed or pooled across repetitions
+  repetition sent, never summed or pooled across repetitions; a repetition
+  skipped after a timeout has none
+  (`ravel_cost_records_null_on_an_answer_with_no_stats`)
   (`ravel_cost_records_every_repetitions_accounting_and_phases`); `pass` and
   `rep` count from 1 and warm-up passes add nothing
   (`ravel_cost_skips_warmup_passes_and_counts_from_one`). `latency_ms` is
@@ -1134,6 +1139,29 @@ step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
   `accounting` and `phases` both `null`
   (`ravel_cost_records_null_on_an_answer_with_no_stats`). The figures are
   descriptive: no band or exit status reads them.
+- `skipped_reps`: every timed repetition not sent because an earlier
+  repetition of the same entry, on the same engine and in the same pass,
+  timed out (ADR-0927's 2026-11-06 amendment; `metrics_query::SkippedRep`).
+  Once a repetition classifies as `timeout`, that engine is sent no more
+  repetitions of that entry in that pass; the next pass starts again at
+  repetition 1, and the untimed warm-up passes send every repetition
+  (`a_timed_out_repetition_ends_its_pass_for_that_engine`,
+  `a_timeout_mid_pass_skips_the_rest_and_the_next_pass_restarts`). Every
+  engine is treated alike, the oracle included, and only `timeout` triggers
+  it: an `incorrect`, `error`, `partial` or `refused` repetition, and any
+  repetition of an entry unsupported by declaration, never does
+  (`an_incorrect_repetition_does_not_end_its_pass`). Each object carries
+  `engine` (the system name), `entry`, `pass`, `rep` (the repetition left
+  out, from 1) and `timed_out_rep` (the repetition that timed out). For
+  every engine and entry, the timed repetitions sent plus the records here
+  equal `passes` times `reps_per_pass`; when they do not, the run exits 65
+  and writes no report (`metrics_query::RunError::RepsUnaccounted`,
+  `unaccounted_repetitions_refuse_the_run`). `report.json` is unchanged by
+  the skip: a pass's status is its first non-`ok` repetition and a row
+  carries latency only when every pass is `ok`, so the repetitions after a
+  timeout could not change a row
+  (`a_pass_cut_after_its_timeout_writes_the_same_row`). `ravel_cost` and
+  `ulp_gaps` cover only the repetitions sent.
 - `ravel_cost_note`: a fixed string stating that the `ravel_cost` figures
   are logical object-store call counts as the query engine counted them,
   not billed provider requests (ADR-0927 decision 8).
@@ -1162,6 +1190,10 @@ step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
     {"entry": "mb_single_counter_rate", "pass": 1, "rep": 2, "status": "timeout",
      "latency_ms": 1000.9, "accounting": null, "phases": null}
   ],
-  "ravel_cost_note": "ravel_cost figures are logical object-store call counts as the query engine counted them, not billed provider requests (ADR-0927 decision 8), one record per timed repetition, never summed or pooled across repetitions"
+  "skipped_reps": [
+    {"engine": "ravel", "entry": "mb_single_counter_rate", "pass": 1, "rep": 3,
+     "timed_out_rep": 2}
+  ],
+  "ravel_cost_note": "ravel_cost figures are logical object-store call counts as the query engine counted them, not billed provider requests (ADR-0927 decision 8), one record per timed repetition sent, never summed or pooled across repetitions"
 }
 ```

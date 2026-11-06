@@ -120,6 +120,9 @@ enum Answer {
     /// request's 1-based number for this query, with `data.stats` carrying
     /// that request's 0-based number as `accounting.request`.
     Numbered { step_ms: u64 },
+    /// The `n`th answer (from 0) to the `n`th request for the query, the
+    /// last one repeated past the end. Warm-up requests count.
+    Sequence(Vec<Answer>),
 }
 
 #[derive(Clone, Debug)]
@@ -220,10 +223,15 @@ async fn answer(
     let scripted = match stub.script.get(&query).cloned().unwrap_or(Answer::Correct) {
         Answer::HangFirst(n) if earlier < n => Answer::Hang,
         Answer::HangFirst(_) => Answer::Correct,
+        Answer::Sequence(answers) => answers
+            .get(earlier)
+            .or(answers.last())
+            .cloned()
+            .unwrap_or(Answer::Correct),
         other => other,
     };
     match scripted {
-        Answer::Correct => axum::Json(json!({"status": "success", "data": series("1.5", kind, &params)})).into_response(),
+        Answer::Correct | Answer::Sequence(_) =>axum::Json(json!({"status": "success", "data": series("1.5", kind, &params)})).into_response(),
         Answer::Diverge => axum::Json(json!({"status": "success", "data": series("99", kind, &params)})).into_response(),
         Answer::TwoUlps => axum::Json(json!({"status": "success", "data": series("1.5000000000000004", kind, &params)})).into_response(),
         Answer::RampUlps => {
@@ -552,6 +560,28 @@ async fn run_bin_corpus(
     corpus: &Json,
     diagnostics: bool,
 ) -> Run {
+    run_bin_shape(
+        ingest,
+        urls,
+        warmup,
+        (PASSES, REPS),
+        extra,
+        corpus,
+        diagnostics,
+    )
+    .await
+}
+
+/// [`run_bin_corpus`] with `passes` timed passes of `reps` repetitions.
+async fn run_bin_shape(
+    ingest: MetricsIngestReport,
+    urls: &Urls,
+    warmup: u32,
+    (passes, reps): (u32, u32),
+    extra: &[&str],
+    corpus: &Json,
+    diagnostics: bool,
+) -> Run {
     let dir = tempfile::tempdir().expect("tempdir");
     let diagnostics_path = dir.path().join("diagnostics.json");
     let corpus_bytes = serde_json::to_vec_pretty(corpus).expect("corpus");
@@ -592,8 +622,8 @@ async fn run_bin_corpus(
         .arg("--engine")
         .arg(format!("name=mimir,url={}", urls.mimir))
         .args(["--warmup-passes", &warmup.to_string()])
-        .args(["--passes", &PASSES.to_string()])
-        .args(["--reps-per-pass", &REPS.to_string()])
+        .args(["--passes", &passes.to_string()])
+        .args(["--reps-per-pass", &reps.to_string()])
         .args(["--query-timeout-ms", "1000"])
         .args(extra)
         .arg("--out")
@@ -830,9 +860,17 @@ async fn a_range_entry_is_one_range_request_per_repetition() {
     // newest = anchor + 119 * 15 s; the ci profile's range_eval is
     // {start_offset 1485, end_offset 0, step 15}.
     let newest_s = (ANCHOR_MS + 119 * 15_000) / 1000;
+    // Mimir's counter-rate stub hangs, so each timed pass stops after its
+    // first repetition times out (ADR-0927's 2026-11-06 amendment).
+    let mimir_counter_rate = (WARMUP * REPS + PASSES) as usize;
     for stub in [&s.prometheus, &s.ravel, &s.victoriametrics, &s.mimir] {
         for promql in [COUNTER_RATE, JOB_RATE_SUM] {
-            assert_eq!(stub.count("/api/v1/query_range", promql), per_engine);
+            let expected = if std::ptr::eq(stub, &s.mimir) && promql == COUNTER_RATE {
+                mimir_counter_rate
+            } else {
+                per_engine
+            };
+            assert_eq!(stub.count("/api/v1/query_range", promql), expected);
             assert_eq!(stub.count("/api/v1/query", promql), 0);
         }
         for promql in [GAUGE, NATIVE_P95] {
@@ -1281,10 +1319,21 @@ async fn an_oracle_timeout_is_retried_and_prometheus_keeps_its_first_attempt() {
         ),
         "{err}"
     );
-    // One request per repetition, plus the one retry.
+    // One request per repetition, less pass 1's second (Prometheus' own
+    // first attempt timed out, so its pass stopped there), plus the one
+    // retry, which answers the oracle and is not a repetition.
     assert_eq!(
         s.prometheus.count("/api/v1/query", GAUGE),
-        (PASSES * REPS) as usize + 1
+        (PASSES * REPS) as usize - 1 + 1
+    );
+    assert_eq!(
+        diagnostics["skipped_reps"],
+        json!([{"engine": "prometheus", "entry": "mb_single_gauge_instant", "pass": 1, "rep": 2, "timed_out_rep": 1},
+               {"engine": "mimir", "entry": "mb_single_counter_rate", "pass": 1, "rep": 2, "timed_out_rep": 1},
+               {"engine": "mimir", "entry": "mb_single_counter_rate", "pass": 2, "rep": 2, "timed_out_rep": 1},
+               {"engine": "mimir", "entry": "mb_single_counter_rate", "pass": 3, "rep": 2, "timed_out_rep": 1},
+               {"engine": "mimir", "entry": "mb_single_counter_rate", "pass": 4, "rep": 2, "timed_out_rep": 1},
+               {"engine": "mimir", "entry": "mb_single_counter_rate", "pass": 5, "rep": 2, "timed_out_rep": 1}])
     );
 
     let p = row(&report, Engine::Prometheus, "mb_single_gauge_instant");
@@ -1433,9 +1482,11 @@ async fn the_diagnostics_sidecar_records_the_largest_ulp_gap() {
         0
     );
 
+    // Mimir's counter-rate timeout stops each pass after its first
+    // repetition, so only one answer per pass is sent and counted.
     for (entry, engine, unaligned) in [
         ("mb_selective_job_rate_sum", "mimir", answers),
-        ("mb_single_counter_rate", "mimir", answers),
+        ("mb_single_counter_rate", "mimir", u64::from(PASSES)),
         ("mb_histogram_native_p95", "victoriametrics", 0),
     ] {
         let gap = ulp_gap(&d, entry, engine);
@@ -1567,9 +1618,12 @@ async fn ravel_cost_records_null_on_an_answer_with_no_stats() {
     );
     let d: Json =
         serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    // One record per pass: each pass stops after its first repetition
+    // times out (ADR-0927's 2026-11-06 amendment).
     let entries = ravel_cost_entries(&d, "mb_single_counter_rate");
-    assert_eq!(entries.len(), (PASSES * REPS) as usize, "{entries:?}");
+    assert_eq!(entries.len(), PASSES as usize, "{entries:?}");
     for c in &entries {
+        assert_eq!(c["rep"], 1, "{c}");
         assert_eq!(c["status"], "timeout", "{c}");
         assert_eq!(c["accounting"], Json::Null, "{c}");
         assert_eq!(c["phases"], Json::Null, "{c}");
@@ -1756,6 +1810,199 @@ async fn ravel_cost_latency_is_the_repetitions_own() {
             ravel_row.pass_medians_ms
         );
     }
+}
+
+/// The `skipped_reps` records for (`engine`, `entry`), in the order written.
+fn skipped_reps<'a>(diagnostics: &'a Json, engine: &str, entry: &str) -> Vec<&'a Json> {
+    diagnostics["skipped_reps"]
+        .as_array()
+        .expect("skipped_reps")
+        .iter()
+        .filter(|s| s["engine"] == engine && s["entry"] == entry)
+        .collect()
+}
+
+/// The pass and repetition counts of the skip tests below.
+const SKIP_SHAPE: (u32, u32) = (2, 3);
+
+/// ADR-0927's 2026-11-06 amendment: once an engine's timed repetition of an
+/// entry times out, the rest of that pass is not sent and each repetition
+/// left out is a `skipped_reps` record. Mimir's counter-rate stub always
+/// hangs: with one warm-up pass, two timed passes and three repetitions, it
+/// receives all three warm-up requests and one timed request per pass, the
+/// sidecar lists repetitions 2 and 3 of both passes against timed-out
+/// repetition 1, and both passes are `timeout`. The oracle on the same entry
+/// gets every repetition.
+///
+/// TO SEE THIS FAIL: skip every later pass after a timeout, and the Mimir
+/// count drops to 4 and pass 2's records go; skip warm-up repetitions after
+/// a warm-up timeout, and it drops to 3; skip without recording, and the run
+/// fails its repetition accounting (no report, `success()` flips).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timed_out_repetition_ends_its_pass_for_that_engine() {
+    let s = stubs().await;
+    let (passes, reps) = SKIP_SHAPE;
+    let run = run_bin_shape(
+        ingest_report(&s.urls),
+        &s.urls,
+        1,
+        SKIP_SHAPE,
+        &[],
+        &corpus(),
+        true,
+    )
+    .await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    assert_eq!(
+        s.mimir.count("/api/v1/query_range", COUNTER_RATE),
+        (reps + passes) as usize
+    );
+    assert_eq!(
+        s.prometheus.count("/api/v1/query_range", COUNTER_RATE),
+        (reps + passes * reps) as usize
+    );
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    let expected: Vec<Json> = (1..=passes)
+        .flat_map(|pass| {
+            (2..=reps).map(move |rep| {
+                json!({"engine": "mimir", "entry": "mb_single_counter_rate",
+                       "pass": pass, "rep": rep, "timed_out_rep": 1})
+            })
+        })
+        .collect();
+    assert_eq!(d["skipped_reps"], Json::Array(expected));
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    let m = row(&report, Engine::Mimir, "mb_single_counter_rate");
+    assert_eq!(m.status, ResultStatus::Timeout);
+    assert_eq!(
+        m.pass_statuses,
+        vec![ResultStatus::Timeout; passes as usize]
+    );
+    assert_eq!(
+        ulp_gap(&d, "mb_single_counter_rate", "mimir")["unaligned_answers"],
+        passes
+    );
+}
+
+/// A pass that times out after an `ok` repetition is `timeout` (its first
+/// non-`ok` repetition), leaves out only the repetitions after the timeout,
+/// and the next pass starts again at repetition 1. Ravel answers the gauge
+/// correctly, then hangs, then answers correctly from then on.
+///
+/// TO SEE THIS FAIL: skip every later pass after a timeout, and Ravel
+/// receives 2 requests instead of 5 and pass 2's `ravel_cost` records go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timeout_mid_pass_skips_the_rest_and_the_next_pass_restarts() {
+    let mut s = stubs().await;
+    let (ravel, r) = spawn_stub(
+        &[(
+            GAUGE,
+            Answer::Sequence(vec![Answer::Correct, Answer::Hang, Answer::Correct]),
+        )],
+        Some(RAVEL_TOKEN),
+    )
+    .await;
+    s.ravel = ravel;
+    s.urls.ravel = r;
+    let run = run_bin_shape(
+        ingest_report(&s.urls),
+        &s.urls,
+        0,
+        SKIP_SHAPE,
+        &[],
+        &corpus(),
+        true,
+    )
+    .await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    assert_eq!(s.ravel.count("/api/v1/query", GAUGE), 5);
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    assert_eq!(
+        skipped_reps(&d, "ravel", "mb_single_gauge_instant"),
+        vec![
+            &json!({"engine": "ravel", "entry": "mb_single_gauge_instant",
+                     "pass": 1, "rep": 3, "timed_out_rep": 2})
+        ]
+    );
+    let mut sent: Vec<(u64, u64, String)> = ravel_cost_entries(&d, "mb_single_gauge_instant")
+        .iter()
+        .map(|c| {
+            (
+                c["pass"].as_u64().expect("pass"),
+                c["rep"].as_u64().expect("rep"),
+                c["status"].as_str().expect("status").to_string(),
+            )
+        })
+        .collect();
+    sent.sort();
+    let ok = || "ok".to_string();
+    assert_eq!(
+        sent,
+        vec![
+            (1, 1, ok()),
+            (1, 2, "timeout".to_string()),
+            (2, 1, ok()),
+            (2, 2, ok()),
+            (2, 3, ok()),
+        ]
+    );
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    let m = row(&report, Engine::Ravel, "mb_single_gauge_instant");
+    assert_eq!(
+        m.pass_statuses,
+        vec![ResultStatus::Timeout, ResultStatus::Ok]
+    );
+    assert_eq!(m.status, ResultStatus::Timeout);
+}
+
+/// Only `timeout` ends a pass early: VictoriaMetrics answers the gauge
+/// wrongly on every repetition and still receives every one, warm-up and
+/// timed, and nothing is skipped anywhere (Mimir's hang is replaced by a
+/// correct stub here).
+///
+/// TO SEE THIS FAIL: also skip after an `incorrect` repetition, and the
+/// VictoriaMetrics count drops from 9 to 5 and `skipped_reps` is not empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_incorrect_repetition_does_not_end_its_pass() {
+    let mut s = stubs().await;
+    let (mimir, m) = spawn_stub(&[(JOB_RATE_SUM, Answer::RefuseChunks)], None).await;
+    s.mimir = mimir;
+    s.urls.mimir = m;
+    let (passes, reps) = SKIP_SHAPE;
+    let run = run_bin_shape(
+        ingest_report(&s.urls),
+        &s.urls,
+        1,
+        SKIP_SHAPE,
+        &[],
+        &corpus(),
+        true,
+    )
+    .await;
+    let err = stderr(&run.output);
+    assert!(run.output.status.success(), "{err}");
+    let all = (reps + passes * reps) as usize;
+    assert_eq!(s.victoriametrics.count("/api/v1/query", GAUGE), all);
+    assert_eq!(s.mimir.count("/api/v1/query_range", JOB_RATE_SUM), all);
+    let d: Json =
+        serde_json::from_slice(&std::fs::read(&run.diagnostics).expect("sidecar")).expect("json");
+    assert_eq!(d["skipped_reps"], json!([]));
+    let report: MetricsBenchReport =
+        serde_json::from_str(&std::fs::read_to_string(&run.out).expect("report")).expect("parse");
+    assert_eq!(
+        row(&report, Engine::VictoriaMetrics, "mb_single_gauge_instant").status,
+        ResultStatus::Incorrect
+    );
+    assert_eq!(
+        row(&report, Engine::Mimir, "mb_selective_job_rate_sum").status,
+        ResultStatus::Refused
+    );
 }
 
 /// An ingest report whose row failed its read-back binds no query run: the

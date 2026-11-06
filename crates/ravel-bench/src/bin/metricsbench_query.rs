@@ -296,6 +296,7 @@ async fn run_main(args: Args) -> Result<(), Failure> {
             ulp_gaps: &output.ulp_gaps,
             oracle_retries: &output.oracle_retries,
             ravel_cost: &output.ravel_cost,
+            skipped_reps: &output.skipped_reps,
             ravel_cost_note: RAVEL_COST_NOTE,
         };
         let json = serde_json::to_vec_pretty(&diagnostics).map_err(|e| {

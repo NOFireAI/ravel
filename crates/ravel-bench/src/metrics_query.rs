@@ -24,6 +24,11 @@
 //! one `/api/v1/query_range` request per repetition over the profile's
 //! `range_eval` grid (amendment E).
 //!
+//! In a timed pass, once an engine's repetition of an entry classifies as
+//! `timeout`, the engine is sent no more repetitions of that entry in that
+//! pass; each one left out is a [`SkippedRep`] (ADR-0927's 2026-11-06
+//! amendment). The warm-up passes send every repetition.
+//!
 //! An entry that reads a native-histogram family, run on an engine whose
 //! ingest row lists `native_histogram` among its `unsupported_classes`, is
 //! `unsupported_construct` on that engine before any comparison. Its query
@@ -648,10 +653,29 @@ pub struct OracleRetry {
     pub attempt: u32,
 }
 
+/// One timed repetition the run did not send because an earlier repetition
+/// of the same entry, on the same engine and in the same pass, timed out
+/// (ADR-0927's 2026-11-06 amendment). Written to the `--diagnostics`
+/// sidecar's `skipped_reps`; `report.json` does not carry it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SkippedRep {
+    /// The engine's system name, as the other sidecar records spell it.
+    pub engine: &'static str,
+    pub entry: String,
+    /// The timed pass, from 1.
+    pub pass: u32,
+    /// The repetition left out, from 1.
+    pub rep: u32,
+    /// The repetition of the same pass that timed out.
+    pub timed_out_rep: u32,
+}
+
 /// One Ravel repetition's per-query object-store cost, for the
 /// `--diagnostics` sidecar (ADR-0927's 2026-11-04 amendment, decision 4).
-/// One record per timed repetition of every pass, never summed or pooled
-/// across repetitions, so each repetition's cost sits beside its own latency.
+/// One record per timed repetition sent, never summed or pooled across
+/// repetitions, so each repetition's cost sits beside its own latency; a
+/// repetition skipped after a timeout is a [`SkippedRep`] instead (ADR-0927's
+/// 2026-11-06 amendment).
 /// `accounting` and `phases` are `data.stats.accounting` and
 /// `data.stats.phases` copied from the answer body as returned; both are
 /// `None` when the answer carries no `data.stats`.
@@ -728,6 +752,17 @@ pub enum RunError {
     },
     #[error("passes and reps_per_pass must each be at least 1")]
     NoPasses,
+    #[error(
+        "repetition accounting does not close: corpus entry `{entry}` on engine `{engine}`: \
+         {sent} sent plus {skipped} skipped, expected {expected}"
+    )]
+    RepsUnaccounted {
+        entry: String,
+        engine: &'static str,
+        sent: u32,
+        skipped: u32,
+        expected: u32,
+    },
 }
 
 /// The rows and the per-engine figures a run produced.
@@ -742,8 +777,11 @@ pub struct RunOutput {
     /// binding's engine order.
     pub ulp_gaps: Vec<UlpGap>,
     /// Ravel's per-query object-store cost, one per (entry, timed pass,
-    /// repetition); empty when Ravel is not among `binding`'s engines.
+    /// repetition sent); empty when Ravel is not among `binding`'s engines.
     pub ravel_cost: Vec<RavelCost>,
+    /// Every timed repetition left out after a timeout, in the order the
+    /// run reached it (ADR-0927's 2026-11-06 amendment).
+    pub skipped_reps: Vec<SkippedRep>,
 }
 
 /// The `--diagnostics` sidecar: figures a pre-registered check needs that
@@ -757,8 +795,12 @@ pub struct Diagnostics<'a> {
     pub ulp_gaps: &'a [UlpGap],
     pub oracle_retries: &'a [OracleRetry],
     /// Ravel's own per-query object-store cost (ADR-0927's 2026-11-04
-    /// amendment, decision 4): one record per timed repetition, Ravel only.
+    /// amendment, decision 4): one record per timed repetition sent, Ravel
+    /// only.
     pub ravel_cost: &'a [RavelCost],
+    /// The timed repetitions not sent after a timeout (ADR-0927's 2026-11-06
+    /// amendment), every engine.
+    pub skipped_reps: &'a [SkippedRep],
     /// [`RAVEL_COST_NOTE`].
     pub ravel_cost_note: &'static str,
 }
@@ -768,7 +810,7 @@ pub struct Diagnostics<'a> {
 /// the provider.
 pub const RAVEL_COST_NOTE: &str = "ravel_cost figures are logical object-store call counts as \
      the query engine counted them, not billed provider requests (ADR-0927 decision 8), one \
-     record per timed repetition, never summed or pooled across repetitions";
+     record per timed repetition sent, never summed or pooled across repetitions";
 
 /// The largest ULP gap between one engine's answers to one entry and the
 /// oracle's, over every timed pass and repetition, for the diagnostics
@@ -1085,6 +1127,9 @@ pub async fn run(
         .collect();
     let mut oracle_retries: Vec<OracleRetry> = Vec::new();
     let mut ravel_cost: Vec<RavelCost> = Vec::new();
+    let mut skipped_reps: Vec<SkippedRep> = Vec::new();
+    // sent[engine][entry]: timed repetitions sent.
+    let mut sent: Vec<Vec<u32>> = vec![vec![0; entries.len()]; binding.engines.len()];
     for pass in 1..=options.passes {
         for (entry_index, entry) in entries.iter().enumerate() {
             let expectation = EntryExpectation {
@@ -1105,6 +1150,7 @@ pub async fn run(
                         options.deadline,
                     )
                     .await;
+                    sent[engine_index][entry_index] += 1;
                     let latency_ms = outcome.timing().elapsed.as_secs_f64() * 1000.0;
                     let void = |source| RunError::Classify {
                         entry: entry.id.clone(),
@@ -1172,22 +1218,42 @@ pub async fn run(
                             phases,
                         });
                     }
+                    let timed_out = classified.status == ResultStatus::Timeout;
                     reps.push((classified, latency_ms));
+                    if timed_out {
+                        skipped_reps.extend(skipped_after_timeout(
+                            system_name(engine.engine),
+                            &entry.id,
+                            pass,
+                            repetition,
+                            options.reps_per_pass,
+                        ));
+                        break;
+                    }
                 }
-                let latencies: Vec<f64> = reps.iter().map(|(_, ms)| *ms).collect();
-                let classified = reps
-                    .iter()
-                    .find(|(c, _)| c.status != ResultStatus::Ok)
-                    .or_else(|| reps.first())
-                    .map(|(c, _)| c.clone())
-                    .ok_or(RunError::NoPasses)?;
-                record.passes.push(PassResult {
-                    classified,
-                    median_ms: median(&latencies),
-                });
+                record
+                    .passes
+                    .push(pass_result(&reps).ok_or(RunError::NoPasses)?);
             }
         }
     }
+
+    let sent_counts: Vec<(&'static str, &str, u32)> = binding
+        .engines
+        .iter()
+        .zip(&sent)
+        .flat_map(|(engine, per_entry)| {
+            entries
+                .iter()
+                .zip(per_entry)
+                .map(|(entry, n)| (system_name(engine.engine), entry.id.as_str(), *n))
+        })
+        .collect();
+    check_reps_accounted(
+        &sent_counts,
+        &skipped_reps,
+        options.passes.saturating_mul(options.reps_per_pass),
+    )?;
 
     let mut measurements = Vec::with_capacity(cases_expected.len());
     let mut denominators = Vec::with_capacity(binding.engines.len());
@@ -1238,7 +1304,72 @@ pub async fn run(
             .flat_map(|(_, gaps)| gaps)
             .collect(),
         ravel_cost,
+        skipped_reps,
     })
+}
+
+/// The [`SkippedRep`] records for the repetitions of one pass after
+/// `timed_out_rep`, through `reps_per_pass`.
+fn skipped_after_timeout(
+    engine: &'static str,
+    entry: &str,
+    pass: u32,
+    timed_out_rep: u32,
+    reps_per_pass: u32,
+) -> Vec<SkippedRep> {
+    (timed_out_rep + 1..=reps_per_pass)
+        .map(|rep| SkippedRep {
+            engine,
+            entry: entry.to_string(),
+            pass,
+            rep,
+            timed_out_rep,
+        })
+        .collect()
+}
+
+/// What one pass of one case came to: the status of its first non-`ok`
+/// repetition (or of its first when all are `ok`) and the median of the
+/// latencies of the repetitions sent. `None` when no repetition was sent.
+fn pass_result(reps: &[(Classified, f64)]) -> Option<PassResult> {
+    let classified = reps
+        .iter()
+        .find(|(c, _)| c.status != ResultStatus::Ok)
+        .or_else(|| reps.first())
+        .map(|(c, _)| c.clone())?;
+    let latencies: Vec<f64> = reps.iter().map(|(_, ms)| *ms).collect();
+    Some(PassResult {
+        classified,
+        median_ms: median(&latencies),
+    })
+}
+
+/// Refuses a run in which some (engine, entry)'s timed repetitions sent plus
+/// those skipped differ from `expected`, its passes times its repetitions
+/// per pass (ADR-0927's 2026-11-06 amendment, decision 3). `sent` holds one
+/// (engine, entry, repetitions sent) per case.
+fn check_reps_accounted(
+    sent: &[(&'static str, &str, u32)],
+    skipped: &[SkippedRep],
+    expected: u32,
+) -> Result<(), RunError> {
+    for &(engine, entry, sent) in sent {
+        let skipped = skipped
+            .iter()
+            .filter(|s| s.engine == engine && s.entry == entry)
+            .count();
+        let skipped = u32::try_from(skipped).unwrap_or(u32::MAX);
+        if sent.checked_add(skipped) != Some(expected) {
+            return Err(RunError::RepsUnaccounted {
+                entry: entry.to_string(),
+                engine,
+                sent,
+                skipped,
+                expected,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The oracle's answer for one entry in one pass. `first` is the outcome of
@@ -1574,6 +1705,174 @@ mod tests {
         let gap = gap_of(&only, Some(&finite));
         assert_eq!((gap.max_ulps, gap.aligned_answers), (None, 1));
         assert_eq!(gap.non_finite_mismatches, 1);
+    }
+
+    fn classified(status: ResultStatus) -> Classified {
+        Classified {
+            status,
+            refusal_reason: None,
+            error_class: None,
+            incomplete: false,
+            annotations: Default::default(),
+            message: (status != ResultStatus::Ok).then(|| format!("{status:?}")),
+        }
+    }
+
+    /// The row `row_of` writes for one case whose passes saw `passes`, each
+    /// repetition a (status, latency) pair, with `truncate` cutting each pass
+    /// after its first `timeout` as `run` does.
+    fn row_for(passes: &[&[(ResultStatus, f64)]], truncate: bool) -> (Measurement, Classified) {
+        let engine = BoundEngine {
+            engine: Engine::Ravel,
+            query_url: "http://ravel/api/v1/query".to_string(),
+            bearer_token: None,
+            extra_params: Vec::new(),
+            unsupported: Vec::new(),
+        };
+        let entry: CorpusEntry = serde_json::from_value(serde_json::json!({
+            "id": "e",
+            "promql": "up",
+            "constructs": ["vector selector"],
+            "class": "single_series",
+        }))
+        .expect("entry");
+        let record = CaseRecord {
+            passes: passes
+                .iter()
+                .map(|reps| {
+                    let mut sent: Vec<(Classified, f64)> = Vec::new();
+                    for (status, ms) in reps.iter() {
+                        sent.push((classified(*status), *ms));
+                        if truncate && *status == ResultStatus::Timeout {
+                            break;
+                        }
+                    }
+                    pass_result(&sent).expect("a repetition")
+                })
+                .collect(),
+            unsupported_citation: None,
+            unsupported_answer: None,
+        };
+        row_of(&engine, &entry, &record, 3)
+    }
+
+    /// ADR-0927's 2026-11-06 amendment, decision 4: for the same repetition
+    /// outcomes, a pass cut after its first `timeout` yields the same report
+    /// row as one that sent every repetition. Each case has a timeout
+    /// followed by repetitions that would change a figure or the status if
+    /// they were read: another non-`ok` status, or a latency far from the
+    /// timed-out one.
+    #[test]
+    fn a_pass_cut_after_its_timeout_writes_the_same_row() {
+        use ResultStatus::{Error, Incorrect, Ok, Timeout};
+        let cases: [&[&[(ResultStatus, f64)]]; 4] = [
+            &[
+                &[(Ok, 5.0), (Timeout, 1000.0), (Ok, 7.0)],
+                &[(Ok, 5.0), (Ok, 6.0), (Ok, 7.0)],
+            ],
+            &[
+                &[(Timeout, 1000.0), (Incorrect, 3.0), (Error, 2.0)],
+                &[(Ok, 5.0), (Ok, 6.0), (Ok, 7.0)],
+            ],
+            &[
+                &[(Incorrect, 4.0), (Incorrect, 4.0), (Incorrect, 4.0)],
+                &[(Ok, 5.0), (Timeout, 1000.0), (Error, 1.0)],
+            ],
+            &[
+                &[(Ok, 5.0), (Ok, 6.0), (Ok, 7.0)],
+                &[(Ok, 5.0), (Ok, 6.0), (Ok, 7.0)],
+            ],
+        ];
+        for passes in cases {
+            let full = row_for(passes, false);
+            let cut = row_for(passes, true);
+            assert_eq!(full.0, cut.0, "{passes:?}");
+            assert_eq!(full.1, cut.1, "{passes:?}");
+        }
+        let all_ok = row_for(cases[3], true).0;
+        assert_eq!(all_ok.status, Ok);
+        assert_eq!(all_ok.pass_medians_ms, vec![6.0, 6.0]);
+        let timed_out = row_for(cases[0], true).0;
+        assert_eq!(timed_out.status, Timeout);
+        assert_eq!(timed_out.pass_statuses, vec![Timeout, Ok]);
+        assert!(timed_out.figures.is_empty());
+    }
+
+    #[test]
+    fn skipped_reps_follow_the_timed_out_repetition() {
+        assert_eq!(
+            skipped_after_timeout("mimir", "e", 2, 1, 3),
+            vec![
+                SkippedRep {
+                    engine: "mimir",
+                    entry: "e".to_string(),
+                    pass: 2,
+                    rep: 2,
+                    timed_out_rep: 1,
+                },
+                SkippedRep {
+                    engine: "mimir",
+                    entry: "e".to_string(),
+                    pass: 2,
+                    rep: 3,
+                    timed_out_rep: 1,
+                },
+            ]
+        );
+        assert!(skipped_after_timeout("mimir", "e", 1, 3, 3).is_empty());
+        assert_eq!(
+            serde_json::to_value(&skipped_after_timeout("ravel", "e", 1, 2, 3)[0]).expect("json"),
+            serde_json::json!({"engine": "ravel", "entry": "e", "pass": 1, "rep": 3, "timed_out_rep": 2})
+        );
+    }
+
+    /// The completeness check of ADR-0927's 2026-11-06 amendment, decision 3:
+    /// sent plus skipped must equal passes times repetitions for every case,
+    /// and a case off by one either way refuses the run naming it.
+    #[test]
+    fn unaccounted_repetitions_refuse_the_run() {
+        // Two passes of three: Ravel timed out at rep 1 of each pass.
+        let skipped: Vec<SkippedRep> = [1, 2]
+            .into_iter()
+            .flat_map(|pass| skipped_after_timeout("ravel", "e", pass, 1, 3))
+            .collect();
+        let expected = 2 * 3;
+        check_reps_accounted(
+            &[("ravel", "e", 2), ("ravel", "f", 6), ("mimir", "e", 6)],
+            &skipped,
+            expected,
+        )
+        .expect("accounted");
+        for (sent, mimir_sent) in [(3, 6), (1, 6), (2, 5), (2, 7)] {
+            let err = check_reps_accounted(
+                &[("ravel", "e", sent), ("mimir", "e", mimir_sent)],
+                &skipped,
+                expected,
+            )
+            .expect_err("unaccounted");
+            let (want_engine, want_sent, want_skipped) = if sent != 2 {
+                ("ravel", sent, 4)
+            } else {
+                ("mimir", mimir_sent, 0)
+            };
+            match err {
+                RunError::RepsUnaccounted {
+                    entry,
+                    engine,
+                    sent,
+                    skipped,
+                    expected: e,
+                } => {
+                    assert_eq!(
+                        (entry.as_str(), engine, sent, skipped, e),
+                        ("e", want_engine, want_sent, want_skipped, expected)
+                    );
+                }
+                other => panic!("{other}"),
+            }
+        }
+        // Skipped records not matched by a short sent count also refuse.
+        assert!(check_reps_accounted(&[("ravel", "e", 6)], &skipped, expected).is_err());
     }
 
     #[test]
