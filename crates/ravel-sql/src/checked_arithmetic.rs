@@ -471,3 +471,266 @@ fn checked_window_expr(
     }
     Ok(None)
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Float64Array, Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::common::tree_node::TreeNodeRecursion;
+    use datafusion::datasource::MemTable;
+    use datafusion::execution::session_state::SessionStateBuilder;
+    use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+    use datafusion::physical_plan::{collect, displayable};
+    use datafusion::prelude::SessionContext;
+
+    /// The rule's install modes: absent, installed and off, installed and on.
+    #[derive(Clone, Copy, Debug)]
+    enum Rule {
+        Absent,
+        Off,
+        On,
+    }
+
+    /// One statement per exec kind the rule rewrites, a nested expression,
+    /// a TopK, and a float expression the rule must leave alone.
+    const STATEMENTS: &[&str] = &[
+        "SELECT a + 1 FROM t",
+        "SELECT a FROM t WHERE a + 1 > b",
+        "SELECT SUM(a * 2) FROM t",
+        "SELECT a + 1, COUNT(*) FROM t GROUP BY a + 1",
+        "SELECT a FROM t ORDER BY a - b",
+        "SELECT a FROM t ORDER BY a - b LIMIT 2",
+        "SELECT SUM(a) OVER (ORDER BY a + 1) FROM t",
+        "SELECT SUM(a) OVER (PARTITION BY b * 2 ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        "SELECT b, SUM(a) FROM t GROUP BY b HAVING SUM(a) + 1 > 0",
+        "SELECT COUNT(*) FILTER (WHERE a + 1 > 0) FROM t",
+        "SELECT (a + 1) * 2 FROM t",
+        "SELECT f + 1.5 FROM t",
+    ];
+
+    fn table(a: Vec<i64>, b: Vec<i64>) -> MemTable {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+            Field::new("f", DataType::Float64, false),
+        ]));
+        let f = a.iter().map(|&v| v as f64).collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(a)),
+                Arc::new(Int64Array::from(b)),
+                Arc::new(Float64Array::from(f)),
+            ],
+        )
+        .expect("batch");
+        MemTable::try_new(schema, vec![vec![batch]]).expect("table")
+    }
+
+    fn context(rule: Rule, t: MemTable) -> SessionContext {
+        let mut builder = SessionStateBuilder::new().with_default_features();
+        let enabled = match rule {
+            Rule::Absent => None,
+            Rule::Off => Some(false),
+            Rule::On => Some(true),
+        };
+        if let Some(enabled) = enabled {
+            let rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
+                std::iter::once(Arc::new(CheckedIntegerArithmetic::new(enabled))
+                    as Arc<dyn PhysicalOptimizerRule + Send + Sync>)
+                .chain(PhysicalOptimizer::new().rules)
+                .collect();
+            builder = builder.with_physical_optimizer_rules(rules);
+        }
+        let ctx = SessionContext::new_with_state(builder.build());
+        ctx.register_table("t", Arc::new(t)).expect("register");
+        ctx
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    async fn plan(ctx: &SessionContext, sql: &str) -> Arc<dyn ExecutionPlan> {
+        ctx.sql(sql)
+            .await
+            .expect("logical plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan")
+    }
+
+    /// The expressions each exec kind the rule rewrites evaluates, with the
+    /// schema they are evaluated against.
+    fn node_exprs(plan: &dyn ExecutionPlan) -> Vec<(Arc<dyn PhysicalExpr>, Arc<Schema>)> {
+        let Some(input) = plan.children().first().map(|child| child.schema()) else {
+            return Vec::new();
+        };
+        let mut exprs: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+        if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+            exprs.extend(projection.expr().iter().map(|e| Arc::clone(&e.expr)));
+        } else if let Some(filter) = plan.downcast_ref::<FilterExec>() {
+            exprs.push(Arc::clone(filter.predicate()));
+        } else if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
+            exprs.extend(aggregate.group_expr().expr().iter().map(|(e, _)| Arc::clone(e)));
+            for aggr in aggregate.aggr_expr() {
+                exprs.extend(aggr.expressions());
+            }
+            exprs.extend(aggregate.filter_expr().iter().flatten().cloned());
+        } else if let Some(sort) = plan.downcast_ref::<SortExec>() {
+            exprs.extend(sort.expr().iter().map(|s| Arc::clone(&s.expr)));
+        } else {
+            let window_exprs = if let Some(w) = plan.downcast_ref::<BoundedWindowAggExec>() {
+                w.window_expr()
+            } else if let Some(w) = plan.downcast_ref::<WindowAggExec>() {
+                w.window_expr()
+            } else {
+                &[]
+            };
+            for w in window_exprs {
+                exprs.extend(w.expressions());
+                exprs.extend(w.partition_by().iter().cloned());
+                exprs.extend(w.order_by().iter().map(|s| Arc::clone(&s.expr)));
+            }
+        }
+        exprs.into_iter().map(|e| (e, Arc::clone(&input))).collect()
+    }
+
+    /// Integer `+`, `-`, `*` in the rewritten execs of `plan`, as (checked,
+    /// unchecked). `BinaryExpr` has no getter for its flag; its equality
+    /// includes it.
+    fn arithmetic(plan: &Arc<dyn ExecutionPlan>) -> (usize, usize) {
+        let mut counts = (0, 0);
+        plan.apply(|node| {
+            for (expr, schema) in node_exprs(node.as_ref()) {
+                expr.apply(|e| {
+                    if let Some(b) = e.downcast_ref::<BinaryExpr>()
+                        && matches!(b.op(), Operator::Plus | Operator::Minus | Operator::Multiply)
+                        && e.data_type(&schema)?.is_integer()
+                    {
+                        let flagged = BinaryExpr::new(Arc::clone(b.left()), *b.op(), Arc::clone(b.right()))
+                            .with_fail_on_overflow(true);
+                        if *b == flagged {
+                            counts.0 += 1;
+                        } else {
+                            counts.1 += 1;
+                        }
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })?;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("walk");
+        counts
+    }
+
+    fn shown(plan: &Arc<dyn ExecutionPlan>) -> String {
+        displayable(plan.as_ref()).indent(true).to_string()
+    }
+
+    /// `plan`'s `Debug` form without the dynamic filters' process-wide
+    /// expression ids, which differ between any two plannings.
+    fn debug_form(plan: &Arc<dyn ExecutionPlan>) -> String {
+        let text = format!("{plan:?}");
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find("expression_id: ") {
+            let (head, tail) = rest.split_at(at + "expression_id: ".len());
+            out.push_str(head);
+            rest = tail.trim_start_matches(|c: char| c.is_ascii_digit());
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// With the option off, the rule leaves every plan as DataFusion built it:
+    /// the displayed plan and the full `Debug` form are byte-identical to the
+    /// plan built without the rule installed, and no expression is checked.
+    #[test]
+    fn off_plans_are_byte_identical_to_plans_without_the_rule() {
+        runtime().block_on(async {
+            for sql in STATEMENTS {
+                let absent = plan(&context(Rule::Absent, table(vec![1], vec![2])), sql).await;
+                let off = plan(&context(Rule::Off, table(vec![1], vec![2])), sql).await;
+                assert_eq!(shown(&absent), shown(&off), "{sql}");
+                assert_eq!(debug_form(&absent), debug_form(&off), "{sql}");
+                assert_eq!(arithmetic(&off).0, 0, "{sql}");
+            }
+        });
+    }
+
+    /// With the option on, the displayed plan is unchanged, the `Debug` form
+    /// differs only in the flag, and every integer `+`, `-`, `*` in the
+    /// rewritten execs carries the flag; the float statement has none.
+    #[test]
+    fn on_checks_every_integer_operator_and_keeps_the_plan_shape() {
+        runtime().block_on(async {
+            for sql in STATEMENTS {
+                let off = plan(&context(Rule::Off, table(vec![1], vec![2])), sql).await;
+                let on = plan(&context(Rule::On, table(vec![1], vec![2])), sql).await;
+                assert_eq!(shown(&off), shown(&on), "{sql}");
+                assert_eq!(
+                    debug_form(&on).replace("fail_on_overflow: true", "fail_on_overflow: false"),
+                    debug_form(&off),
+                    "{sql}"
+                );
+                let (checked, unchecked) = arithmetic(&on);
+                assert_eq!(unchecked, 0, "{sql}");
+                let (_, before) = arithmetic(&off);
+                assert_eq!(checked, before, "{sql}");
+                if sql.contains("f + 1.5") {
+                    assert_eq!(checked, 0, "{sql}");
+                } else {
+                    assert!(checked > 0, "{sql}");
+                }
+            }
+        });
+    }
+
+    /// The rule is idempotent: a second pass over a checked plan changes
+    /// nothing.
+    #[test]
+    fn a_second_pass_is_a_no_op() {
+        runtime().block_on(async {
+            let ctx = context(Rule::On, table(vec![1], vec![2]));
+            for sql in STATEMENTS {
+                let once = plan(&ctx, sql).await;
+                let twice = CheckedIntegerArithmetic::new(true)
+                    .optimize(Arc::clone(&once), &ConfigOptions::default())
+                    .expect("second pass");
+                assert_eq!(format!("{once:?}"), format!("{twice:?}"), "{sql}");
+            }
+        });
+    }
+
+    /// Execution: on fails with an arithmetic overflow that
+    /// [`is_arithmetic_overflow`] recognises; off returns the wrapped value.
+    #[test]
+    fn on_fails_where_off_wraps() {
+        runtime().block_on(async {
+            let sql = "SELECT (a + 1) - b FROM t";
+            let off_ctx = context(Rule::Off, table(vec![i64::MAX], vec![-1]));
+            let batches = collect(plan(&off_ctx, sql).await, off_ctx.task_ctx())
+                .await
+                .expect("off wraps");
+            let column = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64");
+            assert_eq!(column.value(0), i64::MIN + 1);
+
+            let on_ctx = context(Rule::On, table(vec![i64::MAX], vec![-1]));
+            let err = collect(plan(&on_ctx, sql).await, on_ctx.task_ctx())
+                .await
+                .expect_err("on fails");
+            assert!(is_arithmetic_overflow(&err), "{err}");
+        });
+    }
+}

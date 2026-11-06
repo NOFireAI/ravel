@@ -2254,6 +2254,30 @@ mod tests {
         assert_eq!(last.name(), crate::memory::AGGREGATE_PROFILE_RULE);
     }
 
+    /// The checked integer arithmetic rule (issue #3847) is installed first,
+    /// ahead of DataFusion's own rules, whatever the option says, and every
+    /// default rule follows it in DataFusion's order.
+    #[test]
+    fn the_checked_arithmetic_rule_is_the_first_physical_optimizer_rule() {
+        let ctx = samples_and_logs();
+        let state = ctx.state();
+        let names: Vec<&str> = state.physical_optimizers().iter().map(|r| r.name()).collect();
+        assert_eq!(
+            names.first().copied(),
+            Some(crate::checked_arithmetic::CHECKED_INTEGER_ARITHMETIC_RULE)
+        );
+        let defaults: Vec<String> = PhysicalOptimizer::new()
+            .rules
+            .iter()
+            .map(|r| r.name().to_string())
+            .collect();
+        let after: Vec<String> = names[1..=defaults.len()]
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        assert_eq!(after, defaults);
+    }
+
     fn session_with(tables: Vec<SessionTable>) -> SessionContext {
         build_session_with_tables(
             &SqlConfig::default(),
