@@ -54,10 +54,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::arrow::array::builder::BooleanBufferBuilder;
 use datafusion::arrow::array::{
     Array, ArrayRef, ArrowPrimitiveType, BooleanArray, Decimal128Array, ListArray, PrimitiveArray,
 };
-use datafusion::arrow::array::builder::BooleanBufferBuilder;
 use datafusion::arrow::buffer::{NullBuffer, ScalarBuffer};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{
@@ -356,9 +356,7 @@ impl AggregateUDFImpl for CheckedSum {
         } else {
             Ok(match kind {
                 SumKind::Signed => Box::new(CheckedSumGroupsAccumulator::<Int64Type>::new(kind)),
-                SumKind::Unsigned => {
-                    Box::new(CheckedSumGroupsAccumulator::<UInt64Type>::new(kind))
-                }
+                SumKind::Unsigned => Box::new(CheckedSumGroupsAccumulator::<UInt64Type>::new(kind)),
             })
         }
     }
@@ -662,7 +660,8 @@ where
     fn resize(&mut self, total_num_groups: usize) {
         self.sums.resize(total_num_groups);
         if total_num_groups > self.seen.len() {
-            self.seen.append_n(total_num_groups - self.seen.len(), false);
+            self.seen
+                .append_n(total_num_groups - self.seen.len(), false);
         }
     }
 
@@ -1490,13 +1489,7 @@ mod tests {
             (4, Some(1)),
             (5, Some(-3)),
         ];
-        let expected = vec![
-            Some(MAX - 1),
-            Some(11),
-            Some(MAX - 2),
-            Some(MIN),
-            Some(-3),
-        ];
+        let expected = vec![Some(MAX - 1), Some(11), Some(MAX - 2), Some(MIN), Some(-3)];
         let (plan, result) = run(signed(std::slice::from_ref(&rows)), 1, GROUPED);
         assert_stages(&plan, 1);
         assert_eq!(i64_cells(&result.expect("one partition")), expected);
