@@ -108,7 +108,8 @@ across queries, or that folds sooner, is a separate decision record.
 token) is watched past the fold's seal horizon. The check confirms that logs
 compaction rewrites the ingest objects. D1's size bound holds only until
 compaction rewrites an object, so if compaction never runs there, that bound
-is permanent instead.
+is permanent instead. (Since the compaction page choice amendment, compaction
+also writes `Estimated`, so the bound is permanent either way.)
 
 ### D1. The ingest flush chooses page encodings by estimate
 
@@ -395,7 +396,9 @@ flowchart LR
   amended for the logs ingest flush only (D7).
 - `Estimated` ingest objects can be up to 10% larger, by the exit bound, until
   compaction rewrites them. D0 confirms that compaction runs on the benchmark
-  deployment.
+  deployment. (Since the compaction page choice amendment, compaction writes
+  `Estimated` too, so the exit bound applies to L1 parts as well and is
+  permanent, not transient.)
 - Strict-ack latency drops at small flush delays (D6) and with cheaper flushes
   (D1 to D5). The shipped 2 s default behaves as before.
 - The benchmark's strict row moves from 4 shards at 250 ms to 2 shards at
@@ -673,3 +676,11 @@ to 3; that half is ADR-2135's compaction level 3 amendment. D1's statement
 that objects are a function of their input and configuration holds for
 compaction output too, so merges retried or run in a different read mode
 still write the same bytes. Readers are unaffected.
+
+What this changes in D0 and the Consequences: D1's exit bound (an
+`Estimated` object up to 10% larger) was transient, because compaction
+rewrote ingest objects with `Exhaustive`. Compaction now writes `Estimated`
+as well, so the bound is permanent for every object, and D0's compaction
+check no longer limits how long the cost lasts. On the logs-benchmark
+hour the measured L1 cost is 0.6%; the 10% exit bound is the ceiling
+elsewhere.
