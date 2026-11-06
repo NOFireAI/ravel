@@ -841,7 +841,7 @@ async fn structural_once(
             let got = store
                 .get(LAYOUT_KEY, GetRange::Range(s, e))
                 .await
-                .map_err(|e| format!("get {s}..{e}: {e}"))?;
+                .map_err(|err| format!("get {s}..{e}: {err}"))?;
             if got.data.len() as u64 == e - s {
                 Ok(())
             } else {
