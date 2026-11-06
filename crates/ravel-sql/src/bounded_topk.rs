@@ -87,6 +87,7 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result as DFResult;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
@@ -171,7 +172,7 @@ impl BoundedTopKAggregate {
         let Some(limit) = sort.fetch() else {
             return Ok(Transformed::no(node));
         };
-        if limit > self.max_limit {
+        if !limit_within_ceiling(limit, self.max_limit) {
             return Ok(Transformed::no(node));
         }
         // A per-partition sort keeps `fetch` rows PER partition; the bound the
@@ -251,6 +252,26 @@ impl BoundedTopKAggregate {
             .with_preserve_partitioning(sort.preserve_partitioning());
         Ok(Transformed::yes(Arc::new(rewritten)))
     }
+}
+
+/// Whether the rule bounds an aggregate under a top-k sort of `limit` rows,
+/// given its ceiling `max_limit`.
+pub(crate) fn limit_within_ceiling(limit: usize, max_limit: usize) -> bool {
+    limit <= max_limit
+}
+
+/// Whether the rule bounds an aggregate grouped by one key of `key_type` whose
+/// ordering `min`/`max` outputs `value_type`: DataFusion's priority map must
+/// support both types ([`topk_types_supported`]), and the value must not be a
+/// float.
+///
+/// The priority map orders floats with `total_cmp` like ADR-0023's total
+/// order, but its worse-than pre-check compares with `PartialOrd`, so whether
+/// it treats `-0.0`/`0.0` and NaN payloads the way ADR-0023 mandates is not
+/// proven here. Refusing float input keeps the answer provably ravel's rather
+/// than assumed so.
+pub(crate) fn topk_types_admitted(key_type: &DataType, value_type: &DataType) -> bool {
+    !is_float(value_type) && topk_types_supported(key_type, value_type)
 }
 
 /// A node between the top-k sort and the aggregate that neither drops rows nor
@@ -354,16 +375,8 @@ fn bound_aggregate(
     } else {
         false
     };
-    // The priority map orders floats with `total_cmp` like ADR-0023's total
-    // order, but its worse-than pre-check compares with `PartialOrd`, so
-    // whether it treats `-0.0`/`0.0` and NaN payloads the way ADR-0023
-    // mandates is not proven here. Refusing float input keeps the answer
-    // provably ravel's rather than assumed so.
-    if is_float(field.data_type()) {
-        return None;
-    }
     let key_type = group_key.data_type(&aggregate.input().schema()).ok()?;
-    if !topk_types_supported(&key_type, field.data_type()) {
+    if !topk_types_admitted(&key_type, field.data_type()) {
         return None;
     }
     let rewritten = AggregateExec::with_new_limit_options(
