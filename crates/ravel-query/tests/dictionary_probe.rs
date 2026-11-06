@@ -325,6 +325,10 @@ async fn selective_statement_drops_objects_whose_dictionary_lacks_the_value() {
         stats.segments_pruned, 0,
         "an unfolded snapshot prunes nothing by postings"
     );
+    assert_eq!(
+        stats.segments_fetched, N,
+        "an object dropped by its dictionary still counts as fetched"
+    );
     assert_eq!(stats.segments_probed_two_step, N);
     assert_eq!(stats.segments_pruned_by_dictionary, N - H);
     assert!(!stats.dictionary_probe_switched_off);
