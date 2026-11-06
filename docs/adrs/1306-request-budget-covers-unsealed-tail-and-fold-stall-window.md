@@ -194,7 +194,9 @@ $0.0063 today.
 amendment below gives them at the measured 2: 26,150, 89,600, 174,200 and
 343,400, and $0.0358 for the 4-shard, 2 s query. The 2026-09-27 amendment
 below supersedes those with the figures at 8 requests per flush: 89,600,
-343,400, 681,800 and 1,358,600, and $0.1374 for the 4-shard, 2 s query.)
+343,400, 681,800 and 1,358,600, and $0.1374 for the 4-shard, 2 s query. The
+dictionary GET amendment below raises them to 9 requests per flush: 385,700
+at 4 shards and 2 s, and 1,527,800 at 4 shards and 500 ms.)
 
 What a query can now rely on, at the modelled per-flush cost:
 
@@ -316,7 +318,8 @@ refuses a cold wide query throughout the healthy hour, not from 10:30.)
   is still bounded.
   (At the measured cost the 2026-09-26 amendment below gives 89,600, about
   5.7x today's figure. The 2026-09-27 amendment below sizes each flush at 8
-  and gives 343,400, about 21.7x.)
+  and gives 343,400, about 21.7x. The dictionary GET amendment below sizes
+  each flush at 9 and gives 385,700.)
 - The budget and the alert are now coupled. Raising the alert's threshold or
   its `for:` without raising `lag_allowance` breaks the ordering. Follow-up
   task 4 makes that a failing test rather than a review comment. A
@@ -340,7 +343,8 @@ refuses a cold wide query throughout the healthy hour, not from 10:30.)
   (Task 1 did measure 2; the 2026-09-26 amendment below records it, and that
   the per-flush bound holds only under the whole-object threshold. The
   2026-09-27 amendment below keeps flush size uncapped and budgets 8 per
-  flush, 343,400 at 4 shards and 2 s, and names the per-selector gap.)
+  flush, 343,400 at 4 shards and 2 s, and names the per-selector gap. The
+  dictionary GET amendment below budgets 9, 385,700 at 4 shards and 2 s.)
 
 ### Follow-up tasks
 
@@ -625,6 +629,10 @@ The derived budget sizes each flush at `BUDGETED_REQUESTS_PER_UNSEALED_FLUSH`,
 the larger of the measured small-flush 2 and the ceiling 8, so 8. The formulas
 of decisions 1 and 2 stand, with 8 in place of `REQUESTS_PER_UNSEALED_FLUSH`.
 
+(The sparse probe's dictionary GET raises the catalog term to 2, the segment
+ceiling to 8 and the flush ceiling to 9: see the dictionary GET amendment
+below.)
+
 ### Recomputed figures at 8 per flush
 
 `covered_span` is still 14,100 s, so 7,050 flushes per shard at 2 s and 28,200
@@ -662,6 +670,8 @@ division scale with the per-flush term. On the gantt chart it is still 14:52,
 2 h 03 m after the alert fires and 1 h 58 m after the page. A query whose
 flushes cost less than the ceiling is refused later still.
 
+(The dictionary GET amendment below recomputes these at 9 per flush.)
+
 ### What the bound costs in bytes
 
 Bridging a gap fetches bytes the query did not select. They are fetched like
@@ -688,7 +698,8 @@ share at 338,400 / 108,000 = 3.13 h, about 3 h 08 m, before the 3 h 55 m page.
 Decision 2's guarantee holds for a query with one selector per signal lane.
 Closing the gap needs either a per-query budget scaled by selector count, which
 would repeat the "scale with the query" alternative's cost-predictability
-problem, or a fetch shared across selectors; neither is decided here.
+problem, or a fetch shared across selectors; neither is decided here. (The
+dictionary GET amendment below restates this gap at 8 GETs per fetch.)
 
 ### Acceptance figures for tasks 3 to 7
 
@@ -717,6 +728,9 @@ problem, or a fetch shared across selectors; neither is decided here.
   `EngineConfig::default` reference pair, in `docs/query-engine.md` and the
   `--max-s3-requests` help text. The observability guide names the
   multi-selector gap above as a third case the ordering does not cover.
+
+(The dictionary GET amendment below moves these pinned figures to 9 per
+flush.)
 
 ## Amendment (2026-09-27, #1306): the fold-lag refusal threshold adds the fold interval and the HEAD cache TTL
 
@@ -857,3 +871,79 @@ query pods, as does any
 later edit to those three fields that adds, removes or changes the flag. The
 query pods' `spec.image` must carry `--fold-lag-interval-secs` before or with
 that operator upgrade: an older server rejects the unknown flag at startup.
+
+## Amendment (issue #3862): the sparse probe's dictionary GET raises the per-segment catalog term to 2
+
+<!-- amendment-applies: sections="Decision|Consequences|Amendment (2026-09-27): unsealed flush size stays uncapped; the budget covers flushes above the whole-object threshold" pointer="dictionary GET amendment" -->
+
+ADR-3694 decision 1, as its probe gate amendment amends it, reads a sparse
+object's catalog in two steps: one GET of LABEL_DICT alone, then, only when
+the dictionary holds every positive equality value, one GET of the rest of
+the catalog. An L0 segment whose catalog is read that way spends two catalog
+GETs where the 2026-09-27 amendment counted one, so the ceilings move:
+
+- one L0 segment fetch issues at most `MAX_GETS_PER_L0_SEGMENT_FETCH` =
+  1 + 1 + 2 + 4 = 8 GETs: the first GET, at most one footer chase, the
+  dictionary GET and the rest-of-catalog GET, and 4 page-range GETs
+  (`crates/ravel-query/src/fetcher.rs`). L0 is not exempted from the
+  two-step probe; the ceiling covers it.
+- one unsealed flush costs at most `MAX_REQUESTS_PER_UNSEALED_FLUSH` =
+  1 + 8 = 9 requests per selector fetch, and
+  `BUDGETED_REQUESTS_PER_UNSEALED_FLUSH`, the larger of the measured
+  small-flush 2 and that ceiling, is 9 (`crates/ravel-query/src/config.rs`).
+
+`sparse_l0_two_step_fetch_meets_the_per_segment_bound`
+(`crates/ravel-query/src/fetcher.rs`) forces a footer chase on a 4,096-series
+sparse L0 object and measures exactly 8 GETs for a holder, and 3 (first GET,
+chase, dictionary) for a non-holder.
+`cold_sparse_flush_two_step_probe_fits_the_per_flush_ceiling`
+(`crates/ravel-query/tests/unsealed_flush_request_cost.rs`) measures a cold
+sparse flush end to end through `QueryEngine` at 1 + 1 + 2 + 4 = 8 requests,
+one under the ceiling: its footer fits the 64 KiB tail, so it needs no chase.
+The 48-run dense query of the 2026-09-27 amendment still measures 7, two
+under the ceiling.
+
+The derived budget therefore grows by one request per unsealed flush in its
+covered span, times the 3/2 headroom and the shard count. The formulas of
+decisions 1 and 2 stand, with 9 in place of 8. `covered_span` is still
+14,100 s, so 7,050 flushes per shard at 2 s and 28,200 at 500 ms:
+
+| Shards | `max_flush_delay` | Today | At 8 per flush | At 9 per flush |
+|---|---|---|---|---|
+| 1 | 2 s | 7,700 | 89,600 | 7,050 x 9 x 3/2 x 1 + 5,000 = 100,175 |
+| 4 | 2 s | 15,800 | 343,400 | 7,050 x 9 x 3/2 x 4 + 5,000 = 385,700 |
+| 8 | 2 s | 26,600 | 681,800 | 7,050 x 9 x 3/2 x 8 + 5,000 = 766,400 |
+| 4 | 500 ms | 48,200 | 1,358,600 | 28,200 x 9 x 3/2 x 4 + 5,000 = 1,527,800 |
+
+`derived_budget_covers_healthy_tail_plus_stall_alert_window`
+(`crates/ravel-query/src/segment_admission.rs`) pins the four budgets. At
+$0.40 per million GET-class requests the worst 4-shard, 2 s query costs
+385,700 x $0.40 / 1,000,000 = $0.1543, about 24.4x today's $0.0063
+(385,700 / 15,800).
+
+The same test pins the tail and runaway figures at 9:
+
+- the 2 h 20 m tail at 4 shards and 2 s costs 4,200 x 9 x 4 = 151,200
+  requests, or 156,200 with the fixed overhead; today's 15,800 refuses it
+  and 385,700 admits it;
+- the runaway at three times the covered-span cost, 3 x 7,050 x 9 x 4 =
+  761,400, is still refused by 385,700.
+
+The refusal point is unchanged, since both sides of the division scale with
+the per-flush term: (385,700 - 5,000) / (1,800 x 9 x 4) = 380,700 / 64,800 =
+5.875 h.
+
+The per-selector gap grows with the fetch ceiling. An N-selector query pays
+up to 1 + 8N requests per unsealed flush above the threshold and 1 + N at or
+under it, so the budgeted 9 covers one selector at any size and up to eight
+at or under the threshold. A two-selector query over large flushes at the
+ceiling spends 1 + 16 = 17 per flush, 1,800 x 17 x 4 = 122,400 per hour of
+tail at 4 shards and 2 s, and exhausts the tail share at 380,700 / 122,400 =
+3.11 h, about 3 h 07 m, still before the 3 h 55 m page. Decision 2's
+guarantee still holds for a query with one selector per signal lane.
+
+Task 3's fixture is unaffected: it builds its budget at the measured
+small-flush cost of 2. The shipped term at its scaled cadence would now give
+a bare allowance of 235 x 9 x 2 = 4,230, still above the 1,690 x 2 = 3,380
+requests its 1,690 resolved flushes cost, so the reason that test does not
+use the shipped term stands.

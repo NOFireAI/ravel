@@ -45,10 +45,12 @@ pub const REQUESTS_PER_UNSEALED_FLUSH: u64 = 2;
 
 /// Most cold requests one unsealed flush inside the query's range costs, per
 /// shard, at any object size: its commit-record GET plus the fetcher's
-/// [`MAX_GETS_PER_L0_SEGMENT_FETCH`] (first GET, footer chase, catalog GET and
-/// at most 4 page-range GETs), 8 in all. Retries are left to the headroom.
-/// `cold_requests_per_unsealed_flush_above_whole_object_threshold` measures
-/// flushes of several MiB against it.
+/// [`MAX_GETS_PER_L0_SEGMENT_FETCH`] (first GET, footer chase, at most two
+/// catalog GETs and at most 4 page-range GETs), 9 in all. Retries are left to
+/// the headroom. `cold_requests_per_unsealed_flush_above_whole_object_threshold`
+/// measures flushes of several MiB against it, and
+/// `cold_sparse_flush_two_step_probe_fits_the_per_flush_ceiling` a sparse
+/// flush taking the two-step dictionary probe.
 pub const MAX_REQUESTS_PER_UNSEALED_FLUSH: u64 = 1 + MAX_GETS_PER_L0_SEGMENT_FETCH;
 
 /// The per-flush term the derived budget sizes each unsealed flush at: the
@@ -271,7 +273,7 @@ pub fn derive_max_s3_requests_for(
 /// per-flush ceiling so a flush above the whole-object threshold fits too. The
 /// span is [`covered_span`], the longest tail a healthy catalog carries plus
 /// the time a stalled fold takes to page, so a query is not refused for fold
-/// lag before the fold-stall alert reaches an operator: 343,400 at 4 shards
+/// lag before the fold-stall alert reaches an operator: 385,700 at 4 shards
 /// and a 2 s cadence. Deriving from `max_flush_delay` means a deployment that raises the
 /// flush delay (a supported cost lever) gets a correct cap with no hand
 /// recomputation. A caller with a non-default seal margin uses

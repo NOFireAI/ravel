@@ -1247,9 +1247,12 @@ impl Envelope {
 
 /// This request's segment counters and cost accounting (ADR-0044 decision 1).
 /// Mirrors `ravel_query::http`'s private `json::QueryStatsJson` field for
-/// field, minus the two parts that do not exist on this path: `estimate`
+/// field, minus the parts that do not exist on this path: `estimate`
 /// (`estimate_cost` is private to `ravel-query`, and an estimate is only ever
-/// computed from a real resolved snapshot, never assumed) and three
+/// computed from a real resolved snapshot, never assumed), the three
+/// dictionary-first probe fields `segmentsPrunedByDictionary`,
+/// `segmentsProbedTwoStep` and `dictionaryProbeSwitchedOff` (this endpoint
+/// reads whole objects and never runs the sparse catalog probe), and three
 /// accounting counters this path can never move, each of which would be a
 /// permanently-zero field, which `ravel-query`'s own accounting JSON
 /// explicitly refuses to carry: the `rawF64Pages`/`rawF64Bytes` page

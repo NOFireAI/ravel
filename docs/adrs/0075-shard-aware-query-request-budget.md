@@ -150,7 +150,8 @@ verbatim. At 4 shards and a 2 s flush cadence the derived default goes from
 15,800 to 47,300 requests.
 (The ADR-1306 measured-cost amendment below sets the factor at 2, its measured
 value, which makes that default 89,600. The ADR-1306 flush-ceiling amendment
-below budgets 8 per flush instead, which makes it 343,400.)
+below budgets 8 per flush instead, which makes it 343,400. The ADR-1306
+dictionary GET amendment below raises that to 9, which makes it 385,700.)
 
 The first Consequences bullet held only for one hour of unsealed data. Under
 ADR-1306 the claim becomes: no query is refused for fold lag before the
@@ -180,7 +181,8 @@ or under the fetcher's 512 KiB whole-object threshold, not an upper bound
 above it. ADR-1306's "Amendment (2026-09-26)" carries the recomputed figures,
 the above-threshold cost and what follow-up task 2 must decide about it.
 (The ADR-1306 flush-ceiling amendment below records that decision: 89,600 is
-superseded by 343,400.)
+superseded by 343,400, and the ADR-1306 dictionary GET amendment below
+supersedes that with 385,700.)
 
 ## Amendment (ADR-1306 flush-ceiling amendment, 2026-09-27): each unsealed flush is budgeted at 8
 
@@ -198,3 +200,21 @@ selector per signal lane: an N-selector query can spend up to `1 + 7N` per
 flush, which the budget does not scale for. ADR-1306's
 "Amendment (2026-09-27)" carries the measurement, the recomputed figures, the
 byte cost of the page-range bound and that gap.
+(The ADR-1306 dictionary GET amendment below raises the fetch to 8 GETs, the
+factor to 9, the default to 385,700 and the N-selector spend to `1 + 8N`.)
+
+## Amendment (ADR-1306 dictionary GET amendment, issue #3862): each unsealed flush is budgeted at 9
+
+<!-- amendment-applies: sections="Amendment (ADR-1306, 2026-09-26): the budget covers the unsealed tail and the fold-stall alert window|Amendment (ADR-1306 measured-cost amendment, 2026-09-26): REQUESTS_PER_UNSEALED_FLUSH is 2|Amendment (ADR-1306 flush-ceiling amendment, 2026-09-27): each unsealed flush is budgeted at 8" pointer="ADR-1306 dictionary GET amendment" -->
+
+ADR-3694 decision 1 lets the fetcher read a sparse segment's `LABEL_DICT`
+first and its remaining catalog sections second, so an L0 segment fetch can
+read its catalog as two runs instead of one. The fetcher's per-fetch bound
+`MAX_GETS_PER_L0_SEGMENT_FETCH` becomes `1 + 1 + 2 + 4` = 8 GETs, and one
+unsealed flush costs at most `1 + 8` = 9 requests per selector fetch, its
+commit-record GET included. The factor is 9, and at 4 shards and a 2 s flush
+cadence the derived default is `ceil(14,100 / 2) x 9 x 3/2 x 4 + 5,000` =
+385,700 requests, not 343,400. The shape of decision 1 is still unchanged. An
+N-selector query can spend up to `1 + 8N` per flush, a gap of the same kind
+as before. ADR-1306's "Amendment (issue #3862)" carries the tests that pin
+both constants and the recomputed figures.

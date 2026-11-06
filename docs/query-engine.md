@@ -1058,8 +1058,9 @@ shape (docs/segment-format.md, ADR-0026):
   does. Each catalog section the decode reads has its crc32c re-verified on
   the fetched bytes, so a mis-ranged or corrupt fetch is a typed error, never
   wrong data. The matching decode reads only LABEL_DICT when an equality
-  name or value is absent from it; the other three sections are fetched but
-  neither verified nor decoded in that case.
+  name or value is absent from it; under the one-step probe the other three
+  sections are fetched but neither verified nor decoded in that case, and
+  under the dictionary-first probe below they are not fetched at all.
 - **Otherwise** (a sparse object that does not qualify) the fetcher keeps the
   unchanged whole-object GET and `decode_catalog_v5`.
 
@@ -1076,6 +1077,62 @@ conservatively (256 KiB: above the four fixed 64 KiB suffix/gap probes, far
 below any real compacted sparse L1 segment) rather than fit to a measured point.
 The within-segment GET/byte model is the `selective_read_accounting` bench.
 
+### The dictionary-first probe and its per-plan gates (ADR-3694 decision 1)
+
+On the catalog-probe path, a selector with at least one non-empty positive
+equality matcher (`__name__` included) can take a two-step probe. Step one
+GETs the LABEL_DICT range alone and checks it with
+`ravel_segment::label_dict_holds_all`, under one fetch-memory reservation for
+the inflated dictionary that is released as soon as the answer is known. When
+any matched name or value is absent, the object holds no matching series: it
+is dropped with no further GET and counted in `segmentsPrunedByDictionary`.
+Otherwise step two GETs the other three catalog sections as one coalesced
+request and the decode above runs unchanged; LABEL_DICT is not fetched again.
+A corrupt dictionary at step one is the same typed corrupt-segment error the
+one-step probe reports. `!=`, regex and empty-value matchers take no part in
+the check, and a selector without a positive equality runs the one-step
+probe. An object at or under the whole-object threshold
+(`DEFAULT_WHOLE_OBJECT_THRESHOLD`, 512 KiB by default, set per fetcher with
+`SegmentFetcher::with_whole_object_threshold`) already holds its whole catalog
+after the first GET and never takes step one. Neither does an object whose
+LABEL_DICT the footer tail already holds: it is checked with no GET.
+
+Step one pays one extra GET for every object whose dictionary holds the
+values, so the engine gates it within each statement, one
+`DictionaryProbeGate` per selector plan (a distinct matcher set), per the
+ADR's probe gate amendment:
+
+- The name-only rule is per segment. When a statement's only positive
+  equality matchers are `__name__` values, a segment the name postings
+  filtered (a sealed segment of a snapshot whose `segmentsPruned` is above
+  zero) runs the one-step probe, since its dictionary holds the name. Every
+  other segment of the statement, a recent unsealed one included, goes
+  through its plan's gate
+  (`name_only_statement_gates_the_segments_the_postings_did_not_filter`,
+  `crates/ravel-query/tests/dictionary_probe.rs`).
+- Every other segment starts two-step under its plan's gate, so a selective
+  plan and a non-selective one in the same statement decide apart
+  (`each_selector_plan_switches_its_own_gate`). A gate decides on the first
+  `K` of its plan's two-step probes to complete, `K` being the statement's
+  PromQL fetch fan-out (`promql_fetch_fanout`): if fewer than half dropped
+  their object, the plan's later objects use the one-step probe. Before the
+  decision the cap is on probes in flight, at most `K` at once, so up to
+  `2K - 1` can start (`K - 1` completed and `K` running when the `K`-th
+  completes); an object arriving while `K` are in flight takes the one-step
+  probe. Probes already in flight keep the mode they started with
+  (`dictionary_probe_gate_decides_on_the_first_k_probes` in `fetcher.rs`).
+- When a plan's gate switches off, its extra GETs over the one-step probe
+  are the two-step probes started before the decision, at most `2K - 1`,
+  under twice the fan-out. When at least half of its first `K` two-step
+  probes dropped, the gate stays on: every later holder pays one extra GET,
+  and the drops pay for them, each dropped object reading its LABEL_DICT
+  alone instead of its whole catalog. Both probes decode the same catalog,
+  so results are bit-identical; only the request count differs.
+
+The gate is armed by the PromQL metrics fetch (`prefetch_metric_plans`). The
+SQL, distributed and series-listing fetches leave it unarmed and run the
+one-step probe. A dropped object still counts in `segmentsFetched`.
+
 ### The L0 page-range bound (ADR-1306)
 
 An unsealed L0 flush is one ingest buffer. Ingest's 8 MiB `target_bytes` size
@@ -1091,10 +1148,15 @@ leaves 48 runs that coalescing cannot join, which would be 48 page GETs.
 left, on an L0 segment only.
 Scalar and histogram runs are planned and fetched in one batch, and the
 catalog sections go as one run (three on the dense path, four on the sparse
-catalog-probe path), so the bound holds per segment fetch whichever page
-kinds a query selects. One L0 fetch therefore costs at most
-`MAX_GETS_PER_L0_SEGMENT_FETCH` = 7 GETs: the first GET, one footer chase, one
-catalog GET and 4 page GETs. Bridging moves the bytes in a bridged gap that
+catalog-probe path) or, when the dictionary-first probe reads LABEL_DICT
+first, as two, so the bound holds per segment fetch whichever page kinds a
+query selects. One L0 fetch therefore costs at most
+`MAX_GETS_PER_L0_SEGMENT_FETCH` = 1 + 1 + 2 + 4 = 8 GETs: the first GET, one
+footer chase, two catalog GETs (the LABEL_DICT GET, then the rest of the
+catalog) and 4 page GETs
+(`sparse_l0_two_step_fetch_meets_the_per_segment_bound` in `fetcher.rs`; a
+dense catalog read leaves the dictionary GET unused). Bridging moves the
+bytes in a bridged gap that
 the query did not ask for, which is the trade the bound makes: a bounded,
 predictable request count per flush in exchange for bytes inside one segment.
 The bridged gap bytes are fetched like any other page bytes: they are reserved
@@ -2041,14 +2103,14 @@ Their cost is bounded instead by a per-query S3 request budget
 (`EngineConfig::max_s3_requests`, derived from the deployment's shard count,
 ingest flush cadence and catalog seal margin by `derive_max_s3_requests_for`
 rather than a flat constant -- ADR-0075 decisions 1-2, ADR-1306 decisions 1
-and 3; the derived default is 343,400 at the default 4 shards and the 2s
+and 3; the derived default is 385,700 at the default 4 shards and the 2s
 flush cadence ADR-0076 decision 4 sets), checked
 incrementally at the same points `max_bytes_scanned` already is, and reported
 as `RequestBudgetExceeded` (HTTP 422) when tripped. A running server does not
 use the `DEFAULT_BUDGET_REFERENCE_SHARDS` (4) and
 `DEFAULT_BUDGET_REFERENCE_FLUSH_DELAY` (500ms) reference pair that
 `EngineConfig::default` carries for context-free callers (tests, alerting,
-other non-server callers); that pair derives 1,358,600, which is not the
+other non-server callers); that pair derives 1,527,800, which is not the
 deployment default.
 
 The span the per-shard allowance is sized from is `covered_span` (ADR-1306
@@ -2076,7 +2138,7 @@ verbatim and follows no margin.
 the span it is measured against (ADR-1306 decision 5):
 
 ```text
-per-query S3 request budget resolved max_s3_requests=343400 source="derived" covered_span_secs=14100 seal_margin_secs=4800
+per-query S3 request budget resolved max_s3_requests=385700 source="derived" covered_span_secs=14100 seal_margin_secs=4800
 ```
 
 `source` is `derived` or `explicit --max-s3-requests`, and `covered_span_secs`
@@ -2108,16 +2170,20 @@ any stall.
 Each unsealed flush in that span is sized at
 `BUDGETED_REQUESTS_PER_UNSEALED_FLUSH`, the larger of
 `REQUESTS_PER_UNSEALED_FLUSH` (2, the measured cold cost of a flush at or under
-the whole-object threshold) and `MAX_REQUESTS_PER_UNSEALED_FLUSH` (8, its
+the whole-object threshold) and `MAX_REQUESTS_PER_UNSEALED_FLUSH` (9, its
 commit-record GET plus `MAX_GETS_PER_L0_SEGMENT_FETCH`), so the per-flush term
 is an upper bound per selector fetch at any flush size ingest can produce, not
 only under the threshold. At 4 shards and 2 s that is
-`ceil(14,100 / 2) x 8 x 3/2 x 4 + 5,000 = 343,400`. It is not an upper bound
-per query: `prefetch` fetches each segment once per selector (the
-`estimate_cost` comment in `engine.rs`), while the commit record is read once
-at resolve, so an N-selector query pays up to `1 + 7N` requests per unsealed
-flush against a budget sized at 8. The derived budget does not scale with the
-selector count (ADR-1306, "Amendment (2026-09-27)").
+`ceil(14,100 / 2) x 9 x 3/2 x 4 + 5,000 = 385,700`
+(`derived_budget_covers_healthy_tail_plus_stall_alert_window`). A cold sparse
+flush read with the two-step dictionary probe measures 8 of the 9
+(`cold_sparse_flush_two_step_probe_fits_the_per_flush_ceiling`). The per-flush
+term is not an upper bound per query: `prefetch` fetches each segment once per
+selector (the `estimate_cost` comment in `engine.rs`), while the commit record
+is read once at resolve, so an N-selector query pays up to `1 + 8N` requests
+per unsealed flush against a budget sized at 9. The derived budget does not
+scale with the selector count (ADR-1306, "Amendment (2026-09-27)" and the
+dictionary GET amendment).
 
 A refusal says when the unsealed tail, not the query, is what the budget was
 spent on (ADR-1306 decision 6): each resolve records the tail it listed live
@@ -3518,6 +3584,14 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   fetched, and `segmentsPruned` is the rest of the resolved snapshot. The
   log lane's catalog resolve passes no name filter, so it prunes nothing
   of its own.
+- `stats.segmentsPrunedByDictionary`, `stats.segmentsProbedTwoStep`,
+  `stats.dictionaryProbeSwitchedOff`: the dictionary-first probe's figures
+  (see "The dictionary-first probe and its per-plan gates"). The first
+  counts objects dropped because their LABEL_DICT lacked a matched name or
+  value; the second counts objects that paid the two-step probe's dictionary
+  GET, so an object whose LABEL_DICT the footer tail already held is not in
+  it; the third is whether any selector plan's gate switched to the one-step
+  probe.
 - `stats.estimate`: the `CostEstimate`, carrying `estimatedRequests`,
   `estimatedStoreBytes`, `estimatedDecompressedBytes`, `segments`,
   `series`.
