@@ -10,6 +10,7 @@ use ravel_types::accounting::QueryAccounting;
 use ravel_types::{CommitToken, TenantHash};
 
 use super::{EsqlColumn, EsqlError, PreparedEsql};
+use crate::config::SqlConfig;
 use crate::error::SqlError;
 use crate::executor::{LiveAccounting, SqlExecutor, SqlOutcome, StatementRequest, StatementTables};
 use crate::output::QueryOutput;
@@ -140,7 +141,11 @@ async fn run_row_inner(
     tenant: TenantHash,
     prepared: &PreparedEsql,
 ) -> Result<QueryOutput, SqlError> {
-    let config = executor.config();
+    // ES|QL arithmetic is null on overflow; the SQL checked mode never applies.
+    let config = &SqlConfig {
+        checked_integer_arithmetic: false,
+        ..executor.config().clone()
+    };
     let (pool, breach) = config.query_pool(executor.tenant_budget(tenant), QueryAccounting::new());
     let session = build_session(
         config,

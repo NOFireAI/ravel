@@ -257,7 +257,14 @@ fn logs_session_with(
     provider: LogsTableProvider,
     exact_typed_aggregates: bool,
 ) -> datafusion::error::Result<SessionContext> {
-    let config = SqlConfig::default();
+    logs_session_config(provider, exact_typed_aggregates, SqlConfig::default())
+}
+
+fn logs_session_config(
+    provider: LogsTableProvider,
+    exact_typed_aggregates: bool,
+    config: SqlConfig,
+) -> datafusion::error::Result<SessionContext> {
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
     build_session(
@@ -1959,6 +1966,58 @@ async fn q03_sum_plus_k_answered_from_stats_with_zero_gets() {
         "2708 + 1 * 10 non-null rows"
     );
     assert_eq!(store.gets(), 0, "the q03 answer must read no objects");
+}
+
+/// Issue #3847: with `checked_integer_arithmetic` on, q03's `SUM(col + k)`
+/// is still answered from stats with zero GETs, because the checked rule
+/// runs on the physical plan the metadata rule rewrites and changes no shape.
+#[tokio::test]
+async fn q03_sum_plus_k_answered_from_stats_with_checked_arithmetic_on() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let (a, b) = two_status_segments();
+    let stats = status_stats(&a, &b);
+    let snapshot = snapshot_of(vec![a, b], Vec::new());
+    let config = SqlConfig {
+        checked_integer_arithmetic: true,
+        ..SqlConfig::default()
+    };
+    let ctx = logs_session_config(
+        provider(&store, snapshot, status_col(), Some(stats)),
+        false,
+        config,
+    )
+    .expect("session");
+
+    let plan = ctx
+        .sql("SELECT SUM(status + 1) FROM logs")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
+    assert!(
+        !shown.contains("LogsScanExec"),
+        "checked mode must still answer SUM(col + k) from stats; plan was:\n{shown}"
+    );
+    assert!(
+        shown.contains("MetadataOnlyExec: metadata_only=true, rows=1"),
+        "checked mode must still report one sum row via the metadata marker; plan was:\n{shown}"
+    );
+
+    let batches = collect(Arc::clone(&plan), ctx.task_ctx())
+        .await
+        .expect("collect");
+    assert_eq!(
+        single_i64(&batches),
+        Some(2718),
+        "2708 + 1 * 10 non-null rows"
+    );
+    assert_eq!(
+        store.gets(),
+        0,
+        "the checked-mode answer must read no objects"
+    );
 }
 
 /// The plain `SUM(status)` (addend 0) is answered from stats with zero GETs:

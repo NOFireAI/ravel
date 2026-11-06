@@ -754,6 +754,10 @@ mod tests {
     use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
     use datafusion::prelude::{SessionConfig, SessionContext};
 
+    use datafusion::physical_optimizer::PhysicalOptimizerRule;
+    use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+
+    use crate::checked_arithmetic::CheckedIntegerArithmetic;
     use crate::error::SqlError;
     use crate::sum::checked_sum_udaf;
 
@@ -844,6 +848,18 @@ mod tests {
     /// `partitions` target partitions with repartitioned aggregation, with or
     /// without [`ExactSumPlusLiteral`].
     fn run_with(t: MemTable, partitions: usize, sql: &str, rewrite: bool) -> Run {
+        run_with_checked(t, partitions, sql, rewrite, false)
+    }
+
+    /// [`run_with`], with the checked integer arithmetic rule installed
+    /// first and enabled when `checked` is set, as `build_session` does.
+    fn run_with_checked(
+        t: MemTable,
+        partitions: usize,
+        sql: &str,
+        rewrite: bool,
+        checked: bool,
+    ) -> Run {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -855,6 +871,14 @@ mod tests {
             let mut builder = SessionStateBuilder::new()
                 .with_config(config)
                 .with_default_features();
+            if checked {
+                let rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
+                    std::iter::once(Arc::new(CheckedIntegerArithmetic::new(true))
+                        as Arc<dyn PhysicalOptimizerRule + Send + Sync>)
+                    .chain(PhysicalOptimizer::new().rules)
+                    .collect();
+                builder = builder.with_physical_optimizer_rules(rules);
+            }
             if rewrite {
                 builder = builder.with_optimizer_rules(optimizer_rules());
             }
@@ -1147,6 +1171,31 @@ mod tests {
                 widths.iter().all(|&width| width == 90),
                 "{case} before: {widths:?}"
             );
+        }
+    }
+
+    /// Issue #3847: with checked integer arithmetic on, the q30 shape still
+    /// plans as one shared aggregate and returns the same exact totals,
+    /// because the rewrite's `x + c` terms are UDF calls, not the integer
+    /// `BinaryExpr`s the checked rule rebuilds.
+    #[test]
+    fn q30_shape_runs_one_aggregate_with_checked_arithmetic_on() {
+        let values = signed(&(1..=100).map(Some).collect::<Vec<_>>());
+        for partitions in [1, 8] {
+            let case = format!("checked q30 at {partitions}");
+            let run = run_with_checked(
+                table(&ones(&values), Arc::clone(&values), partitions),
+                partitions,
+                &q30_sql(90),
+                true,
+                true,
+            );
+            assert_rewritten(&run, &case);
+            let widths = run.aggregate_widths();
+            assert!(!widths.is_empty(), "{case}");
+            assert!(widths.iter().all(|&width| width == 1), "{case}: {widths:?}");
+            let expected: Vec<Option<i128>> = (0..90).map(|k| Some(5050 + 100 * k)).collect();
+            assert_eq!(cells(&run.batches(&case)), vec![expected], "{case}");
         }
     }
 

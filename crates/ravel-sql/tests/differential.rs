@@ -600,6 +600,204 @@ async fn golden_integer_sum_at_the_limits() {
 }
 
 // ---------------------------------------------------------------------------
+// Checked integer arithmetic (issue #3847)
+// ---------------------------------------------------------------------------
+
+/// The other operand of an arithmetic case: the `Int64` limits themselves
+/// (which no `f64` value casts to exactly at the top end), the values next to
+/// zero, and a few that overflow only when combined with a large column value.
+fn arithmetic_constant() -> BoxedStrategy<i64> {
+    prop_oneof![
+        Just(i64::MAX),
+        Just(i64::MIN),
+        Just(i64::MAX - 1),
+        Just(i64::MIN + 1),
+        Just(1i64 << 32),
+        Just(-(1i64 << 32)),
+        (-3i64..4),
+    ]
+    .boxed()
+}
+
+/// One integer arithmetic expression over the column `x` (the row's value
+/// cast to `BIGINT`) and a constant `k`, with its exact `i128` meaning.
+#[derive(Clone, Copy, Debug)]
+enum Arith {
+    XPlusK,
+    XMinusK,
+    KMinusX,
+    XTimesK,
+    XPlusX,
+    XMinusX,
+    XTimesX,
+}
+
+const ARITHS: [Arith; 7] = [
+    Arith::XPlusK,
+    Arith::XMinusK,
+    Arith::KMinusX,
+    Arith::XTimesK,
+    Arith::XPlusX,
+    Arith::XMinusX,
+    Arith::XTimesX,
+];
+
+impl Arith {
+    fn sql(self, k: i64) -> String {
+        let x = "CAST(value AS BIGINT)";
+        let k = format!("CAST('{k}' AS BIGINT)");
+        match self {
+            Arith::XPlusK => format!("{x} + {k}"),
+            Arith::XMinusK => format!("{x} - {k}"),
+            Arith::KMinusX => format!("{k} - {x}"),
+            Arith::XTimesK => format!("{x} * {k}"),
+            Arith::XPlusX => format!("{x} + {x}"),
+            Arith::XMinusX => format!("{x} - {x}"),
+            Arith::XTimesX => format!("{x} * {x}"),
+        }
+    }
+
+    fn exact(self, x: i64, k: i64) -> i128 {
+        let (x, k) = (i128::from(x), i128::from(k));
+        match self {
+            Arith::XPlusK => x + k,
+            Arith::XMinusK => x - k,
+            Arith::KMinusX => k - x,
+            Arith::XTimesK => x * k,
+            Arith::XPlusX => x + x,
+            // `x - x` written out is clippy's eq_op; the exact answer is 0.
+            Arith::XMinusX => 0,
+            Arith::XTimesX => x * x,
+        }
+    }
+}
+
+/// A fixture with checked integer arithmetic on.
+async fn checked_arithmetic_fixture(tenant: &TenantId, specs: &[SegSpec]) -> Fixture {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let config = SqlConfig {
+        checked_integer_arithmetic: true,
+        ..SqlConfig::default()
+    };
+    Fixture::build(store, &[(tenant, specs)], config, 1 << 30).await
+}
+
+/// Run `sql` and compare against `want`: the exact rows, or (for `None`) the
+/// typed arithmetic overflow error.
+async fn assert_exact_or_overflow(
+    fixture: &Fixture,
+    tenant: &TenantId,
+    sql: &str,
+    want: Option<Vec<Row>>,
+) {
+    let outcome = fixture.executor.execute(tenant.hash(), &request(sql)).await;
+    match (outcome, want) {
+        (Ok(outcome), Some(want)) => {
+            assert_eq!(actual_rows(&outcome.output), want, "for: {sql}");
+        }
+        (Err(SqlError::IntegerArithmeticOverflow), None) => {}
+        (Ok(outcome), None) => panic!(
+            "an overflowing expression returned {:?} for: {sql}",
+            actual_rows(&outcome.output)
+        ),
+        (Err(err), want) => panic!("for: {sql}\nwant {want:?}\ngot error {err:?}"),
+    }
+}
+
+/// Check every [`Arith`] against one dataset, predicate and constant, in a
+/// projection and in a filter. The oracle computes each row's result in
+/// `i128`: the statement must return the narrowed values when every row
+/// evaluated fits `Int64`, and fail with the overflow error otherwise.
+async fn assert_checked_arithmetic(specs: &[SegSpec], pred: &Pred, k: i64) {
+    let tenant = tenant_id("checked-arith");
+    let fixture = checked_arithmetic_fixture(&tenant, specs).await;
+    let snapshot = fixture.snapshot(&tenant).await;
+    let reference = util::reference_rows(&fixture.fetcher, tenant.hash(), &snapshot).await;
+    let as_int = |r: &util::RefRow| {
+        let x = r.value as i64;
+        assert_eq!(x as f64, r.value, "pool values cast exactly");
+        x
+    };
+    let where_clause = pred.sql();
+    for arith in ARITHS {
+        let expr = arith.sql(k);
+
+        // Projection, over the rows the predicate keeps.
+        let kept = reference.iter().filter(|r| pred.eval(r));
+        let projected: Option<Vec<Row>> = kept
+            .map(|r| {
+                let v = i64::try_from(arith.exact(as_int(r), k)).ok()?;
+                Some(vec![Cell::Int(r.ts), Cell::Int(v)])
+            })
+            .collect();
+        assert_exact_or_overflow(
+            &fixture,
+            &tenant,
+            &format!("SELECT ts, {expr} FROM samples WHERE {where_clause} ORDER BY series_id, ts"),
+            projected,
+        )
+        .await;
+
+        // Filter, over every row: the comparison is evaluated on each one.
+        let filtered: Option<Vec<Row>> = reference
+            .iter()
+            .filter_map(|r| match i64::try_from(arith.exact(as_int(r), k)) {
+                Err(_) => Some(None),
+                Ok(v) if v > 0 => Some(Some(vec![Cell::Int(r.ts)])),
+                Ok(_) => None,
+            })
+            .collect();
+        assert_exact_or_overflow(
+            &fixture,
+            &tenant,
+            &format!("SELECT ts FROM samples WHERE {expr} > 0 ORDER BY series_id, ts"),
+            filtered,
+        )
+        .await;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// With checked integer arithmetic on, every integer `+`, `-` and `*`
+    /// over values at and near the `Int64` limits returns the exact `i128`
+    /// result narrowed to `Int64`, or the statement fails with
+    /// `SqlError::IntegerArithmeticOverflow`; never a wrapped value.
+    #[test]
+    fn integer_arithmetic_is_exact_or_fails_with_the_overflow_error(
+        specs in arb_dataset(near_limit_integer_value as ValuePool),
+        pred in arb_pred(),
+        k in arithmetic_constant(),
+    ) {
+        block_on(async move {
+            assert_checked_arithmetic(&specs, &pred, k).await;
+        });
+    }
+}
+
+/// Fixed cases at the limits: each constant in the pool against a row at
+/// `i64::MIN`, rows next to `i64::MAX`, and small rows.
+#[tokio::test]
+async fn golden_integer_arithmetic_at_the_limits() {
+    let specs = vec![SegSpec::new(
+        1,
+        1,
+        1,
+        vec![
+            SeriesSpec::new("min", vec![(1, I64_MIN_F64)]),
+            SeriesSpec::new("near_max", vec![(1, NEAR_I64_MAX), (2, -NEAR_I64_MAX)]),
+            SeriesSpec::new("small", vec![(1, 0.0), (2, -1.0), (3, 2.0)]),
+        ],
+    )];
+    for k in [i64::MAX, i64::MIN, i64::MAX - 1, i64::MIN + 1, -1, 0, 1, 2] {
+        for name in ["min", "near_max", "small"] {
+            assert_checked_arithmetic(&specs, &Pred::LabelMatch(name), k).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Adversarial pushdown cases
 // ---------------------------------------------------------------------------
 

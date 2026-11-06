@@ -3,6 +3,7 @@
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::LogicalPlan;
+use ravel_sql::SqlConfig;
 use ravel_sql::esql::{
     self, EsqlError, EsqlRun, MAX_BOUND_NODES, MAX_EXPRESSION_DEPTH, MAX_LIMIT, MAX_PLAN_STAGES,
     PrepareContext,
@@ -10,8 +11,8 @@ use ravel_sql::esql::{
 
 use crate::lowering::fetch;
 use crate::support::{
-    BASE, NOW, SECOND, WORKER_STACK, context, fixture, on_stack, optimized, prepare, request, rows,
-    run, run_with,
+    BASE, NOW, SECOND, WORKER_STACK, context, fixture, fixture_with_config, on_stack, optimized,
+    prepare, request, rows, run, run_with,
 };
 
 /// Every fetch in `plan`, outermost first.
@@ -159,6 +160,30 @@ async fn an_intermediate_overflow_reads_null_through_later_operations() {
         rows(&outcome),
         vec![vec!["null", "92233720368547758", "null", "1e-308"]]
     );
+}
+
+/// ES|QL keeps null-on-overflow on an executor with SQL's checked integer
+/// arithmetic on (#3847): the overflowing column expression reads null, not an
+/// error. This holds even without the executor turning the option off for a
+/// lowered statement, since the binder's `long_arithmetic` lowers ES|QL's long
+/// arithmetic to forms with no integer `BinaryExpr` for the rule to rewrite.
+#[tokio::test]
+async fn checked_integer_arithmetic_does_not_reach_esql() {
+    let fixture = fixture_with_config(SqlConfig {
+        checked_integer_arithmetic: true,
+        ..SqlConfig::default()
+    })
+    .await;
+    let outcome = run(
+        &fixture,
+        "FROM logs | WHERE message == \"a\" | EVAL o = dur * 922337203685477581, \
+         p = dur + 9223372036854775807, q = dur * 2 | KEEP o, p, q",
+    )
+    .await
+    .expect("runs");
+    let [row] = rows(&outcome).try_into().expect("one row");
+    assert_eq!(&row[..2], ["null", "null"]);
+    assert_ne!(row[2], "null");
 }
 
 /// Shared operands at the deepest admitted chains keep each stage's value,

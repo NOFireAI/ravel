@@ -154,6 +154,7 @@ use crate::access_intent::{
 };
 use crate::alerts_provider::AlertsTableProvider;
 use crate::audit_provider::AuditTableProvider;
+use crate::checked_arithmetic;
 use crate::clock::SystemClock;
 use crate::config::SqlConfig;
 use crate::cost::{estimate_logs_cost, estimate_metrics_cost, estimate_spans_cost};
@@ -3271,7 +3272,12 @@ impl SqlExecutor {
         // one binding, so a request's lowered budgets reach the memory pool,
         // the metrics provider's scan limits, and the session together. `None`
         // borrows the executor's own config and clones nothing.
-        let effective = self.effective_config(extras.budgets.as_ref());
+        let mut effective = self.effective_config(extras.budgets.as_ref());
+        // A lowered (ES|QL) statement keeps ES|QL's null-on-overflow
+        // arithmetic: checked integer arithmetic is a SQL option (#3847).
+        if statement.sql().is_none() && effective.checked_integer_arithmetic {
+            effective.to_mut().checked_integer_arithmetic = false;
+        }
         let config: &SqlConfig = &effective;
         let principal = self.session_principal(tenant_hash, extras.capabilities);
         // The memory pool's peak-reservation report is execution-time
@@ -5617,6 +5623,11 @@ pub struct PinnedStream {
     /// session's disk manager is disabled -- which is every query on the
     /// default configuration, so the default path pays nothing for this.
     spill: Option<SpillState>,
+    /// Whether `ctx` was built with
+    /// [`SqlConfig::checked_integer_arithmetic`] on, so an arithmetic overflow
+    /// maps to [`SqlError::IntegerArithmeticOverflow`]. Derived from `ctx` in
+    /// [`Self::start`], like `pool`.
+    checked_arithmetic: bool,
     /// [`SqlRequest::max_rows`]: stop after this many rows plus one. `None`
     /// drains the plan, which is every pre-ADR-1374 caller.
     row_cap: Option<usize>,
@@ -5698,6 +5709,7 @@ impl PinnedStream {
             active_since: None,
             elapsed: Duration::ZERO,
         });
+        let checked_arithmetic = checked_arithmetic::session_is_checked(&ctx.copied_config());
         let inner = execute_stream(Arc::clone(&plan), ctx.task_ctx()).map_err(plan_error)?;
         Ok(PinnedStream {
             _ctx: ctx,
@@ -5708,6 +5720,7 @@ impl PinnedStream {
             panicked: false,
             pool,
             spill,
+            checked_arithmetic,
             row_cap: None,
             rows_emitted: 0,
             row_cap_hit: false,
@@ -5838,6 +5851,9 @@ impl PinnedStream {
             && let Some(failure) = spill_failure_kind(&err)
         {
             return spill_error(failure, spill.disk_manager.used_disk_space(), spill.quota);
+        }
+        if self.checked_arithmetic && checked_arithmetic::is_arithmetic_overflow(&err) {
+            return SqlError::IntegerArithmeticOverflow;
         }
         execution_error(err, &self.pool)
     }

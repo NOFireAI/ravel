@@ -137,6 +137,8 @@ use datafusion::functions::datetime::planner::DatetimeFunctionPlanner;
 use datafusion::functions::unicode::planner::UnicodeFunctionPlanner;
 use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::object_store::ObjectStore;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ravel_parquet::SingleStoreRegistry;
 use url::Url;
@@ -147,6 +149,7 @@ use crate::audit_provider::AuditTableProvider;
 use crate::avg::sequential_avg_udaf;
 use crate::bounded_topk::BoundedTopKAggregate;
 use crate::bucketed_final_aggregate::BucketedFinalAggregateRule;
+use crate::checked_arithmetic::{self, CheckedIntegerArithmetic};
 use crate::compact_slices::CompactSlices;
 use crate::config::SqlConfig;
 use crate::group_keys::DictionaryGroupKeysAsViews;
@@ -817,6 +820,19 @@ pub fn build_session_with_tables(
     if parquet_store.is_some() {
         session = parquet_session_config(session, exact_typed_aggregates);
     }
+    if config.checked_integer_arithmetic {
+        session = checked_arithmetic::mark_checked(session);
+    }
+    // Issue #3847: checked integer `+`, `-` and `*`, inert unless the option
+    // is on. Ahead of DataFusion's own rules, so every operator they derive
+    // from these expressions carries the checked form; see
+    // `crate::checked_arithmetic`.
+    let physical_rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
+        std::iter::once(Arc::new(CheckedIntegerArithmetic::new(
+            config.checked_integer_arithmetic,
+        )) as Arc<dyn PhysicalOptimizerRule + Send + Sync>)
+        .chain(PhysicalOptimizer::new().rules)
+        .collect();
 
     // `SessionContext::new_with_config_rt` with one extra physical optimizer
     // rule. `DictionaryGroupKeysAsViews` keeps a `GROUP BY` over a declared
@@ -831,6 +847,7 @@ pub fn build_session_with_tables(
         .with_config(session)
         .with_runtime_env(runtime)
         .with_default_features()
+        .with_physical_optimizer_rules(physical_rules)
         // Issue #3845: an exact `SUM(x + c)` for an integer `x` and literal
         // `c`, with every such call over one `x` sharing one sum and count.
         // The default rules, with that rewrite before common subexpression
@@ -2234,6 +2251,34 @@ mod tests {
             .last()
             .expect("the session has physical optimizer rules");
         assert_eq!(last.name(), crate::memory::AGGREGATE_PROFILE_RULE);
+    }
+
+    /// The checked integer arithmetic rule (issue #3847) is installed first,
+    /// ahead of DataFusion's own rules, whatever the option says, and every
+    /// default rule follows it in DataFusion's order.
+    #[test]
+    fn the_checked_arithmetic_rule_is_the_first_physical_optimizer_rule() {
+        let ctx = samples_and_logs();
+        let state = ctx.state();
+        let names: Vec<&str> = state
+            .physical_optimizers()
+            .iter()
+            .map(|r| r.name())
+            .collect();
+        assert_eq!(
+            names.first().copied(),
+            Some(crate::checked_arithmetic::CHECKED_INTEGER_ARITHMETIC_RULE)
+        );
+        let defaults: Vec<String> = PhysicalOptimizer::new()
+            .rules
+            .iter()
+            .map(|r| r.name().to_string())
+            .collect();
+        let after: Vec<String> = names[1..=defaults.len()]
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        assert_eq!(after, defaults);
     }
 
     fn session_with(tables: Vec<SessionTable>) -> SessionContext {
