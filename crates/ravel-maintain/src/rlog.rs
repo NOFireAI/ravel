@@ -1744,12 +1744,14 @@ thread_local! {
 
 /// Run the blocking scratch filesystem call `job` on tokio's blocking pool, so
 /// a directory create, lock, `statvfs` or wipe never stalls an async worker.
+/// The job logs to the caller's tracing dispatcher.
 async fn scratch_blocking<R, F>(job: F) -> Result<R>
 where
     F: FnOnce() -> Result<R> + Send + 'static,
     R: Send + 'static,
 {
-    tokio::task::spawn_blocking(job)
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    tokio::task::spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, job))
         .await
         .map_err(|e| MaintainError::Invariant(format!("scratch filesystem task: {e}")))?
 }
@@ -1912,7 +1914,10 @@ impl Drop for ScratchUnit {
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
                 let store = Arc::clone(&self.store);
-                drop(runtime.spawn_blocking(move || remove_scratch_unit(&store)));
+                let dispatch = tracing::dispatcher::get_default(Clone::clone);
+                drop(runtime.spawn_blocking(move || {
+                    tracing::dispatcher::with_default(&dispatch, || remove_scratch_unit(&store))
+                }));
             }
             Err(_) => remove_scratch_unit(&self.store),
         }
