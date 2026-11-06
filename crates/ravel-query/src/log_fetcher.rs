@@ -17905,12 +17905,15 @@ mod tests {
     /// A set touching more than `B_run` distinct buckets costs the prefix and
     /// one ranged read of the bucket area it spans, and answers the union of
     /// its keys' blocks; a set touching at most `B_run` reads each touched
-    /// bucket once; a set of absent keys is absent.
+    /// bucket once; a set of absent keys is absent; a set mixing present and
+    /// absent keys, on either side of `B_run`, answers exactly the present
+    /// keys' blocks.
     ///
     /// Flip to watch it fail: in `probe_key_set`, set `area` to `None`
     /// unconditionally, so every touched bucket is read on its own above
     /// `B_run` too. The 300-key case then issues 1 + its distinct bucket
-    /// count GETs, not 2.
+    /// count GETs, not 2. Or answer `Absent` at the first absent key, in the
+    /// locate loop or the bucket loop: the mixed sets then read `Absent`.
     #[tokio::test]
     async fn set_probe_reads_the_bucket_area_above_b_run() {
         let (fetcher, seg_ref) = fixture().await;
@@ -17973,6 +17976,57 @@ mod tests {
         )
         .await;
         assert_eq!(answer, Some(KeyProbe::Absent));
+
+        // Sets mixing present and absent keys answer the present keys'
+        // blocks, above and below `B_run`. The narrow set holds an absent key
+        // whose bucket is empty (located absent with no read) and one whose
+        // bucket holds other keys (absent once the bucket is decoded).
+        let occupied: BTreeSet<u32> = (0..RECORDS)
+            .map(|v| {
+                bucket_index(&key8_str(&format!("r{v}")), KEY_IDX_WRITER_BUCKET_BITS)
+                    .expect("bucket")
+            })
+            .collect();
+        let absent_in = |occupied_bucket: bool| {
+            (RECORDS..RECORDS + 10_000)
+                .find(|v| {
+                    let bucket =
+                        bucket_index(&key8_str(&format!("r{v}")), KEY_IDX_WRITER_BUCKET_BITS)
+                            .expect("bucket");
+                    occupied.contains(&bucket) == occupied_bucket
+                })
+                .expect("an absent key of each kind")
+        };
+        let (beside, alone) = (absent_in(true), absent_in(false));
+        let mixed_narrow: Vec<i64> = vec![beside, 3, alone, 101, 250];
+        assert!(distinct_buckets(&mixed_narrow) <= KEY_INDEX_SET_PROBE_MAX_RUNS);
+        let (answer, _) = probe(
+            &fetcher,
+            &seg_ref,
+            &LogQuery::new(i64::MIN, i64::MAX).with_key_in(key_in(mixed_narrow)),
+        )
+        .await;
+        assert_eq!(answer, Some(KeyProbe::Present(blocks_of(&[3, 101, 250]))));
+
+        let mixed_wide: Vec<i64> = wide.iter().copied().chain(RECORDS..RECORDS + 300).collect();
+        assert!(distinct_buckets(&mixed_wide) > KEY_INDEX_SET_PROBE_MAX_RUNS);
+        let (answer, gets) = probe(
+            &fetcher,
+            &seg_ref,
+            &LogQuery::new(i64::MIN, i64::MAX).with_key_in(key_in(mixed_wide)),
+        )
+        .await;
+        assert_eq!(answer, Some(KeyProbe::Present(blocks_of(&wide))));
+        assert_eq!(gets, 2, "the prefix and one read of the bucket area");
+        for lone in [vec![beside], vec![alone]] {
+            let (answer, _) = probe(
+                &fetcher,
+                &seg_ref,
+                &LogQuery::new(i64::MIN, i64::MAX).with_key_in(key_in(lone.clone())),
+            )
+            .await;
+            assert_eq!(answer, Some(KeyProbe::Absent), "r{} is absent", lone[0]);
+        }
 
         // ANDed with an equality: the intersection of the two arms.
         let (answer, _) = probe(

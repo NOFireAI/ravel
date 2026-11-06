@@ -3736,11 +3736,14 @@ mod tests {
     /// set touching more than `B_run` buckets costs the KEY_IDX prefix and
     /// one ranged read of the bucket area it spans; one touching at most
     /// `B_run` reads each touched bucket once; a set of absent ids drops the
-    /// object. The rows hold every listed trace.
+    /// object. The rows hold every listed trace, and a set mixing present and
+    /// absent ids, on either side of `B_run`, reads exactly the present ids'
+    /// blocks.
     ///
     /// Flip to watch it fail: in `probe_key_index`, set `area` to `None`
     /// unconditionally. The 300-id case then issues 1 + its distinct bucket
-    /// count KEY_IDX GETs, not 2.
+    /// count KEY_IDX GETs, not 2. Or answer `Absent` at the first id a
+    /// decoded bucket does not hold: the mixed sets then drop the object.
     #[tokio::test]
     async fn set_probe_reads_the_bucket_area_above_b_run() {
         use ravel_codec::key_idx::bucket_index;
@@ -3824,6 +3827,31 @@ mod tests {
             "every id absent drops the object"
         );
         assert!(traces.is_empty());
+
+        // Sets mixing present and absent ids read exactly the present ids'
+        // blocks, above and below `B_run`: block `n / 2` holds ids `n & !1`
+        // and `n | 1`.
+        let blocks_of = |present: &[u32]| -> BTreeSet<[u8; 16]> {
+            present
+                .iter()
+                .flat_map(|&n| [id(n & !1), id(n | 1)])
+                .collect()
+        };
+        let mixed_narrow: Vec<[u8; 16]> = [1_003, 3, 1_017, 101, 1_250, 250]
+            .into_iter()
+            .map(id)
+            .collect();
+        assert!(distinct(&mixed_narrow) <= KEY_INDEX_SET_PROBE_MAX_RUNS);
+        let (pruning, _, traces) = run(mixed_narrow).await;
+        assert_eq!(pruning.segments_pruned, 0);
+        assert_eq!(traces, blocks_of(&[3, 101, 250]));
+
+        let mixed_wide: Vec<[u8; 16]> = (0..300).chain(1_000..1_300).map(id).collect();
+        assert!(distinct(&mixed_wide) > KEY_INDEX_SET_PROBE_MAX_RUNS);
+        let (pruning, gets, traces) = run(mixed_wide).await;
+        assert_eq!(pruning.segments_pruned, 0);
+        assert_eq!(gets, 2, "the prefix and one read of the bucket area");
+        assert_eq!(traces, blocks_of(&(0..300).collect::<Vec<_>>()));
     }
 
     async fn trace_fixture() -> TraceFixture {
