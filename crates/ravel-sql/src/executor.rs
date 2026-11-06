@@ -9461,11 +9461,7 @@ pub(crate) mod tests {
     /// `total_tie_order_edit` and the single-`max` rows read true.
     #[tokio::test]
     async fn a_min_or_max_top_k_keeps_its_single_sort_term() {
-        for sql in [
-            "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
-            "SELECT a, min(y) AS m FROM q33 GROUP BY a ORDER BY m LIMIT 10",
-            "SELECT a, max(x) AS m, max(x) AS m2 FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
-        ] {
+        for sql in BOUNDED_TOPK_SERVED {
             let plan = q33_plan(sql).await;
             assert!(!plan_has_tie_order_edit(&plan), "{sql}");
             let rewritten = rewrite_sort_group_key_tie_order(plan.clone()).expect("nothing to do");
@@ -9484,6 +9480,119 @@ pub(crate) mod tests {
             vec![term(None, "m", false), term(Some("q33"), "a", true)]
         );
         assert!(plan_is_spill_eligible(&rewritten));
+    }
+
+    /// The single-`min`/`max` statements the bounded aggregate bounds.
+    const BOUNDED_TOPK_SERVED: [&str; 3] = [
+        "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
+        "SELECT a, min(y) AS m FROM q33 GROUP BY a ORDER BY m LIMIT 10",
+        "SELECT a, max(x) AS m, max(x) AS m2 FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
+    ];
+
+    /// Single-`min`/`max`, single-term sorts the bounded aggregate refuses,
+    /// each with the sort terms the tie-order rewrite gives it: no `LIMIT`,
+    /// the direction opposite to `max`'s extreme, a sort on a group key of a
+    /// two-key aggregate, and a `HAVING` filter between the sort and the
+    /// aggregate.
+    fn bounded_topk_refused() -> [(&'static str, Vec<(Option<String>, String, bool, bool)>); 4] {
+        [
+            (
+                "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC",
+                vec![term(None, "m", false), term(Some("q33"), "a", true)],
+            ),
+            (
+                "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m ASC LIMIT 10",
+                vec![term(None, "m", true), term(Some("q33"), "a", true)],
+            ),
+            (
+                "SELECT a, b, max(x) AS m FROM q33 GROUP BY a, b ORDER BY a LIMIT 10",
+                vec![term(Some("q33"), "a", true), term(Some("q33"), "b", true)],
+            ),
+            (
+                "SELECT a, max(x) AS m FROM q33 GROUP BY a HAVING max(x) > 1 \
+                 ORDER BY m DESC LIMIT 10",
+                vec![term(None, "m", false), term(Some("q33"), "a", true)],
+            ),
+        ]
+    }
+
+    /// Issue #3899: a single-term sort over a lone `min`/`max` that the bounded
+    /// aggregate cannot serve is not left as written. It gets the group keys
+    /// as tiebreaks and becomes spill-eligible.
+    ///
+    /// Prove-the-test: drop the `fetch` check from `is_bounded_topk_candidate`
+    /// and the no-`LIMIT` row fails; drop its direction check and the `ASC`
+    /// row fails.
+    #[tokio::test]
+    async fn a_min_or_max_sort_the_bounded_aggregate_refuses_gets_the_tiebreak() {
+        for (sql, terms) in bounded_topk_refused() {
+            let plan = q33_plan(sql).await;
+            assert!(!plan_is_spill_eligible(&plan), "{sql} ties as written");
+            assert!(plan_has_tie_order_edit(&plan), "{sql}");
+            let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite applies");
+            assert_eq!(sort_terms(&rewritten), terms, "{sql}");
+            assert!(plan_is_spill_eligible(&rewritten), "{sql}");
+        }
+    }
+
+    /// Whether the logical plan's first `Sort` is a bounded top-k candidate,
+    /// under the row limit the plan's `Limit` nodes give it.
+    fn first_sort_is_candidate(node: &LogicalPlan, fetch: Option<usize>) -> Option<bool> {
+        if let LogicalPlan::Sort(sort) = node {
+            return Some(is_bounded_topk_candidate(sort, sort_fetch(sort, fetch)));
+        }
+        let fetch = fetch_for_inputs(node, fetch);
+        node.inputs()
+            .into_iter()
+            .find_map(|input| first_sort_is_candidate(input, fetch))
+    }
+
+    /// Whether any `AggregateExec` in `plan` carries the limit
+    /// `crate::bounded_topk` sets when it bounds one.
+    fn has_bounded_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        plan.downcast_ref::<datafusion::physical_plan::aggregates::AggregateExec>()
+            .is_some_and(|aggregate| aggregate.limit_options().is_some())
+            || plan.children().into_iter().any(has_bounded_aggregate)
+    }
+
+    /// `is_bounded_topk_candidate` restates `crate::bounded_topk`'s gate on the
+    /// logical plan, since that rule reads the physical one. Every case of the
+    /// two tests above is planned through a session with the rule installed,
+    /// and the restatement must agree with whether the rule bounded the
+    /// aggregate.
+    #[tokio::test]
+    async fn the_bounded_topk_candidate_agrees_with_the_rule() {
+        let refused = bounded_topk_refused();
+        let cases = BOUNDED_TOPK_SERVED
+            .iter()
+            .map(|sql| (*sql, true))
+            .chain(refused.iter().map(|(sql, _)| (*sql, false)));
+        for (sql, served) in cases {
+            let plan = q33_plan(sql).await;
+            assert_eq!(first_sort_is_candidate(&plan, None), Some(served), "{sql}");
+            let q33: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(q33_schema()));
+            let tables = vec![SessionTable::Parquet(ParquetSession {
+                tables: vec![("q33".to_string(), q33)],
+                store: Arc::new(ravel_parquet::TenantParquetStore::new(TenantHash(
+                    [105u8; 16],
+                ))),
+            })];
+            let ctx = build_session_with_tables(
+                &SqlConfig::default(),
+                Arc::new(UnboundedMemoryPool::default()),
+                tables,
+                false,
+                SpillDecision::Disabled,
+                &SessionPrincipal::without_capabilities(TenantHash([105u8; 16])),
+            )
+            .expect("the session builds");
+            let physical = ctx
+                .state()
+                .create_physical_plan(&plan)
+                .await
+                .expect("the plan lowers");
+            assert_eq!(has_bounded_aggregate(&physical), served, "{sql}");
+        }
     }
 
     /// An `ORDER BY` over a subquery puts a second projection (and the
@@ -9543,8 +9652,9 @@ pub(crate) mod tests {
     /// The executed-plan gate reads the `Sort`'s shape, the group key types
     /// and the aggregate function names, never argument types: a `sum` over a
     /// float expression is not spill-exact, yet its `Sort` gets the group keys
-    /// as tiebreaks. A lone `max` under a single sort term is a bounded top-k
-    /// candidate and its `Sort` is left as written, which keeps it a
+    /// as tiebreaks. A lone `max` over one group key, under a single
+    /// descending sort term and a `LIMIT`, is a bounded top-k candidate and
+    /// its `Sort` is left as written, which keeps it a
     /// single-term top-k the bounded aggregate can serve. A `Sort` that
     /// already orders by every group key has nothing to edit.
     ///
@@ -9572,9 +9682,8 @@ pub(crate) mod tests {
             ]
         );
 
-        let max =
-            q33_plan("SELECT a, b, max(x) AS m FROM q33 GROUP BY a, b ORDER BY m DESC LIMIT 10")
-                .await;
+        let max = q33_plan("SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10")
+            .await;
         assert!(!plan_has_tie_order_edit(&max));
         let rewritten = rewrite_sort_group_key_tie_order(max.clone()).expect("nothing to do");
         assert_eq!(rewritten, max);
