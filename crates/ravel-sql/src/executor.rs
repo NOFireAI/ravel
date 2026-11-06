@@ -9403,14 +9403,20 @@ pub(crate) mod tests {
             DataType::UInt32,
             DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32)),
         ] {
-            assert!(crate::avg::is_admitted_integer(&admitted), "{admitted} is admitted");
+            assert!(
+                crate::avg::is_admitted_integer(&admitted),
+                "{admitted} is admitted"
+            );
         }
         for refused in [
             DataType::UInt64,
             DataType::Float64,
             DataType::Decimal128(18, 2),
         ] {
-            assert!(!crate::avg::is_admitted_integer(&refused), "{refused} is refused");
+            assert!(
+                !crate::avg::is_admitted_integer(&refused),
+                "{refused} is refused"
+            );
         }
     }
 
@@ -9482,6 +9488,9 @@ pub(crate) mod tests {
         assert!(plan_is_spill_eligible(&rewritten));
     }
 
+    /// One [`sort_terms`] entry: qualifier, name, ascending, nulls first.
+    type SortTerm = (Option<String>, String, bool, bool);
+
     /// The single-`min`/`max` statements the bounded aggregate bounds.
     const BOUNDED_TOPK_SERVED: [&str; 3] = [
         "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
@@ -9494,7 +9503,7 @@ pub(crate) mod tests {
     /// the direction opposite to `max`'s extreme, a sort on a group key of a
     /// two-key aggregate, and a `HAVING` filter between the sort and the
     /// aggregate.
-    fn bounded_topk_refused() -> [(&'static str, Vec<(Option<String>, String, bool, bool)>); 4] {
+    fn bounded_topk_refused() -> [(&'static str, Vec<SortTerm>); 4] {
         [
             (
                 "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC",
@@ -9682,8 +9691,8 @@ pub(crate) mod tests {
             ]
         );
 
-        let max = q33_plan("SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10")
-            .await;
+        let max =
+            q33_plan("SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10").await;
         assert!(!plan_has_tie_order_edit(&max));
         let rewritten = rewrite_sort_group_key_tie_order(max.clone()).expect("nothing to do");
         assert_eq!(rewritten, max);
