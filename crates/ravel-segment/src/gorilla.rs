@@ -363,6 +363,8 @@ mod tests {
             -0.0,
             f64::NAN,
             -f64::NAN,
+            f64::from_bits(0x7ff8_0000_0000_0001), // a quiet NaN payload
+            f64::from_bits(0x7ff0_0000_0000_0002), // PromQL stale marker bit pattern
             f64::INFINITY,
             f64::NEG_INFINITY,
             f64::MIN_POSITIVE, // smallest normal
