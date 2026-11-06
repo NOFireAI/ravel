@@ -12648,9 +12648,9 @@ mod tests {
         /// Estimated page choice. The fixture is one where the two choices
         /// disagree on the `u` column (Exhaustive picks the row-group
         /// dictionary, Estimated plain pages), and the part's `u` pages carry
-        /// Estimated's encodings. Every compressed page of the part re-seals
-        /// to its stored bytes at level 3, and at least one would not at
-        /// level 9.
+        /// Estimated's encodings. Every compressed `u` page of the part
+        /// re-seals to its stored bytes at level 3, and at least one would not
+        /// at level 9. Other columns' pages are not re-sealed here.
         #[tokio::test]
         async fn l1_parts_use_estimated_page_choice_and_zstd_3() {
             use ravel_logseg::encoding::Enc;
