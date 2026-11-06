@@ -69,8 +69,9 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const SEAL_PADDING_NS: i64 = 3 * NS_PER_HOUR;
 const OBJECT_SPAN_NS: i64 = 700 * NS_PER_MS;
 
-/// The attribute fields every record may carry, in name order.
-const FIELDS: [&str; 57] = [
+/// The attribute fields every record may carry, in name order: the 58 named
+/// fields of the hour-498274 bucket the generator imitates.
+const FIELDS: [&str; 58] = [
     "app_version",
     "autoscaler",
     "backup_policy",
@@ -78,6 +79,7 @@ const FIELDS: [&str; 57] = [
     "bytes_sent",
     "cache_backend",
     "cache_status",
+    "cluster",
     "component",
     "compression",
     "content_type",
@@ -180,6 +182,9 @@ const BODY_WORDS: [&str; 48] = [
     "shard",
     "flushed",
 ];
+
+/// The fields carrying `AttrValue::I64`; every other field carries `Str`.
+const I64_FIELDS: [&str; 5] = ["bytes_sent", "duration_ms", "replicas", "retries", "status"];
 
 const METHODS: [&str; 6] = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"];
 const STATUSES: [i64; 12] = [200, 200, 200, 200, 201, 204, 301, 304, 400, 404, 500, 503];
@@ -395,30 +400,87 @@ struct L0Object {
     max_ts: i64,
 }
 
+/// How one object's records are laid out over streams, drawn before any
+/// record content so the shape can be checked without building records.
+struct ObjectPlan {
+    /// Indexes into the bucket's stream list.
+    chosen: Vec<usize>,
+    /// Records per chosen stream, parallel to `chosen`.
+    per_stream: Vec<usize>,
+    /// The generator state the record contents continue from.
+    rng: StdRng,
+}
+
+fn object_plan(args: &Args, index: usize, stream_count: usize) -> ObjectPlan {
+    let mut rng =
+        StdRng::seed_from_u64(args.seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let median = args.median_records as f64;
+    let n = ((median.ln() + args.records_sigma * normal(&mut rng)).exp() as usize)
+        .clamp(args.min_records, args.max_records);
+    let max_k = args.max_streams_per_object.min(stream_count);
+    let min_k = args.min_streams_per_object.min(max_k);
+    let k = rng.random_range(min_k..=max_k).min(n);
+    let mut order: Vec<usize> = (0..stream_count).collect();
+    for i in 0..k {
+        let j = rng.random_range(i..order.len());
+        order.swap(i, j);
+    }
+    let chosen = order[..k].to_vec();
+    let mut per_stream = vec![1usize; k];
+    for _ in k..n {
+        per_stream[rng.random_range(0..k)] += 1;
+    }
+    ObjectPlan {
+        chosen,
+        per_stream,
+        rng,
+    }
+}
+
+/// Distinct streams each L0 block of the planned object covers. Records are
+/// written in stream-id order and STREAM_DIR is sorted by stream id, so this
+/// is the block's `max_stream_ref - min_stream_ref + 1`.
+fn planned_block_stream_spans(plan: &ObjectPlan, all: &[Stream], block_records: usize) -> Vec<u64> {
+    let mut by_id: Vec<(ravel_types::logstream::LogStreamId, usize)> = plan
+        .chosen
+        .iter()
+        .zip(&plan.per_stream)
+        .map(|(&s, &c)| (all[s].id, c))
+        .collect();
+    by_id.sort_unstable();
+    let mut spans = Vec::new();
+    let (mut in_block, mut streams) = (0usize, 0u64);
+    for (_, mut count) in by_id {
+        streams += 1;
+        while count > 0 {
+            let take = count.min(block_records - in_block);
+            count -= take;
+            in_block += take;
+            if in_block == block_records {
+                spans.push(streams);
+                in_block = 0;
+                streams = u64::from(count > 0);
+            }
+        }
+    }
+    if in_block > 0 {
+        spans.push(streams);
+    }
+    spans
+}
+
 fn object_records(
     args: &Args,
     index: usize,
     specs: &[FieldSpec],
     all: &[Stream],
 ) -> Vec<LogRecord> {
-    let mut rng =
-        StdRng::seed_from_u64(args.seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    let median = args.median_records as f64;
-    let n = ((median.ln() + args.records_sigma * normal(&mut rng)).exp() as usize)
-        .clamp(args.min_records, args.max_records);
-    let max_k = args.max_streams_per_object.min(all.len());
-    let min_k = args.min_streams_per_object.min(max_k);
-    let k = rng.random_range(min_k..=max_k).min(n);
-    let mut order: Vec<usize> = (0..all.len()).collect();
-    for i in 0..k {
-        let j = rng.random_range(i..order.len());
-        order.swap(i, j);
-    }
-    let chosen = &order[..k];
-    let mut per_stream = vec![1usize; k];
-    for _ in k..n {
-        per_stream[rng.random_range(0..k)] += 1;
-    }
+    let ObjectPlan {
+        chosen,
+        per_stream,
+        mut rng,
+    } = object_plan(args, index, all.len());
+    let n: usize = per_stream.iter().sum();
     let window_start = i64::from(HOUR) * NS_PER_HOUR + index as i64 * OBJECT_SPAN_NS;
     let mut records = Vec::with_capacity(n);
     for (slot, &s) in chosen.iter().enumerate() {
@@ -598,6 +660,7 @@ fn verify_shape(objects: &[L0Object]) -> Value {
     let mut bytes = Vec::new();
     let mut span_ms = Vec::new();
     let mut per_stream = Vec::new();
+    let mut block_spans = Vec::new();
     let mut union = BTreeSet::new();
     let mut contiguous = true;
     let mut prev_max: Option<i64> = None;
@@ -607,6 +670,10 @@ fn verify_shape(objects: &[L0Object]) -> Value {
         let reader = RlogReader::new(&obj.bytes[..], &cfg).expect("open L0");
         let l0 = &dirs.skip_index().l0;
         let recs: u64 = l0.iter().map(|e| u64::from(e.record_count)).sum();
+        block_spans.extend(
+            l0.iter()
+                .map(|e| u64::from(e.max_stream_ref - e.min_stream_ref) + 1),
+        );
         let min_ts = l0.iter().map(|e| e.min_ts).min().unwrap_or(0);
         let max_ts = l0.iter().map(|e| e.max_ts).max().unwrap_or(0);
         if let Some(p) = prev_max
@@ -679,6 +746,7 @@ fn verify_shape(objects: &[L0Object]) -> Value {
         "streams_per_object": spread(&mut streams),
         "records_per_stream_per_object_x100": spread(&mut per_stream),
         "blocks_per_object": spread(&mut blocks),
+        "block_stream_ref_span": spread(&mut block_spans),
         "row_groups_per_object": spread(&mut row_groups),
         "bytes_per_object": spread(&mut bytes),
         "ts_span_ms_per_object": spread(&mut span_ms),
@@ -1726,6 +1794,131 @@ fn reencode(c: &Compacted, choice: PageChoice) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Bands and figure checks.
+
+/// The input count the realism band is pre-registered at.
+const REALISM_INPUTS: usize = 230;
+/// Records per second per core of process CPU a compaction of the default
+/// bucket must land inside, inclusive. Outside it the bucket or the build is
+/// not the one the profile claims to describe.
+const REALISM_BAND: (f64, f64) = (8_000.0, 70_000.0);
+
+/// `Err` names the miss; the caller exits non-zero on it.
+fn check_realism(records_per_s_per_core: f64) -> Result<(), String> {
+    let (lo, hi) = REALISM_BAND;
+    if records_per_s_per_core.is_finite()
+        && records_per_s_per_core >= lo
+        && records_per_s_per_core <= hi
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "realism band missed: {records_per_s_per_core:.0} records/s per core is outside [{lo:.0}, {hi:.0}]"
+        ))
+    }
+}
+
+/// The run figures every report carries, each a non-null value under a key
+/// that appears exactly once anywhere in the document.
+const RUN_FIGURES: [&str; 12] = [
+    "records_in",
+    "records_out",
+    "l0_bytes",
+    "l1_bytes",
+    "l1_l0_ratio",
+    "l1_parts",
+    "merge_read_mode",
+    "wall_s",
+    "process_cpu_s",
+    "records_per_s_per_core (records / process cpu)",
+    "catalog_load_plus_plan_s (merge-started to read-mode event)",
+    "read_mode_to_last_part_put_s",
+];
+
+fn collect_keys<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
+    match v {
+        Value::Object(map) => {
+            for (k, child) in map {
+                if k == key {
+                    out.push(child);
+                }
+                collect_keys(child, key, out);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_keys(child, key, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every figure the document is meant to carry, present exactly once and
+/// non-null. Returns one message per violation.
+fn check_figures(doc: &Value, page_choice_ab: bool, profiled: bool) -> Vec<String> {
+    let mut errors = Vec::new();
+    for key in RUN_FIGURES {
+        let mut found = Vec::new();
+        collect_keys(doc, key, &mut found);
+        match found.as_slice() {
+            [v] if !v.is_null() => {}
+            [_] => errors.push(format!("figure {key:?} is null")),
+            [] => errors.push(format!("figure {key:?} is absent")),
+            many => errors.push(format!("figure {key:?} is reported {} times", many.len())),
+        }
+    }
+    if page_choice_ab {
+        let rows = doc["page_choice_ab"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for choice in ["Exhaustive", "Estimated"] {
+            let matching: Vec<&Value> = rows
+                .iter()
+                .filter(|r| r["page_choice"].as_str() == Some(choice))
+                .collect();
+            match matching.as_slice() {
+                [row] => {
+                    for k in ["bytes", "l1_l0_ratio", "encode_thread_cpu_s"] {
+                        if row[k].is_null() {
+                            errors.push(format!("page choice {choice} figure {k:?} is absent"));
+                        }
+                    }
+                }
+                other => errors.push(format!(
+                    "page choice {choice} is reported {} times",
+                    other.len()
+                )),
+            }
+        }
+    }
+    if profiled {
+        let p = &doc["run"]["profile"];
+        let phases = p["phases"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        if phases.is_empty() {
+            errors.push("profile phase table is absent".to_string());
+        }
+        let mut names = BTreeSet::new();
+        for row in phases {
+            let name = row["phase"].as_str().unwrap_or_default();
+            if !names.insert(name) {
+                errors.push(format!("profile phase {name:?} is reported twice"));
+            }
+        }
+        for k in [
+            "leaf_exclusive_top15",
+            "inclusive_top10_distinct_below_95pct",
+        ] {
+            if p[k].as_array().is_none_or(Vec::is_empty) {
+                errors.push(format!("profile table {k:?} is absent or empty"));
+            }
+        }
+    }
+    errors
+}
+
 fn host_info() -> Value {
     let uname = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
     let mem_kb = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| {
@@ -1872,6 +2065,7 @@ fn print_table(doc: &Value) {
             f(&ab["parts_byte_identical_to_published"])
         );
     }
+    let _ = writeln!(out, "realism: {}", doc["realism"]);
     eprint!("{out}");
 }
 
@@ -1928,9 +2122,170 @@ fn main() {
         "run": compacted.report,
         "page_choice_ab": page_choice_ab,
     });
+    let mut doc = doc;
+    let realism = if args.inputs == REALISM_INPUTS {
+        let rate = doc["run"]["records_per_s_per_core (records / process cpu)"]
+            .as_f64()
+            .unwrap_or(f64::NAN);
+        match check_realism(rate) {
+            Ok(()) => {
+                json!({"applied": true, "band": [REALISM_BAND.0, REALISM_BAND.1], "pass": true})
+            }
+            Err(miss) => {
+                json!({"applied": true, "band": [REALISM_BAND.0, REALISM_BAND.1], "pass": false, "miss": miss})
+            }
+        }
+    } else {
+        json!({"applied": false, "band": [REALISM_BAND.0, REALISM_BAND.1],
+               "note": format!("band is pre-registered at --inputs {REALISM_INPUTS}")})
+    };
+    doc["realism"] = realism;
     print_table(&doc);
     println!("{}", serde_json::to_string_pretty(&doc).expect("json"));
-    if !doc["run"]["profile"]["attribution_error"].is_null() {
+    let profiled = doc["run"]["profile"].is_object();
+    let mut failures = check_figures(&doc, args.page_choice_ab, profiled);
+    if let Some(miss) = doc["realism"]["miss"].as_str() {
+        failures.push(miss.to_string());
+    }
+    if let Some(e) = doc["run"]["profile"]["attribution_error"].as_str() {
+        failures.push(format!("profile attribution: {e}"));
+    }
+    if !failures.is_empty() {
+        for f in &failures {
+            eprintln!("FAIL: {f}");
+        }
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn args(inputs: usize) -> Args {
+        Args::parse_from(["rlog_compaction_profile", "--inputs", &inputs.to_string()])
+    }
+
+    fn attr_type(v: &AttrValue) -> &'static str {
+        match v {
+            AttrValue::Str(_) => "str",
+            AttrValue::I64(_) => "i64",
+            _ => "other",
+        }
+    }
+
+    #[test]
+    fn synthetic_bucket_matches_the_hour_498274_shape() {
+        let small = args(8);
+        let all = streams(small.streams);
+        let ids: HashSet<_> = all.iter().map(|s| s.id).collect();
+        assert_eq!(ids.len(), 2_477, "2,477 distinct streams in the bucket");
+
+        // Streams and records per object, from the plan the generator writes.
+        for index in 0..small.inputs {
+            let plan = object_plan(&small, index, all.len());
+            let distinct: HashSet<usize> = plan.chosen.iter().copied().collect();
+            assert_eq!(distinct.len(), plan.chosen.len());
+            assert!(
+                (2_200..=2_477).contains(&distinct.len()),
+                "object {index}: {} streams, want 2,200..=2,477",
+                distinct.len()
+            );
+            assert!(plan.per_stream.iter().all(|&c| c >= 1));
+            let n: usize = plan.per_stream.iter().sum();
+            assert!((5_000..=29_000).contains(&n), "object {index}: {n} records");
+        }
+
+        // The generated records of one object carry exactly the 58 named
+        // fields, each with its documented type.
+        let specs = field_specs(small.seed);
+        let records = object_records(&small, 0, &specs, &all);
+        let mut seen: BTreeMap<String, &'static str> = BTreeMap::new();
+        for r in &records {
+            for (k, v) in &r.attrs {
+                let t = attr_type(v);
+                let prev = seen.insert(k.clone(), t);
+                assert!(prev.is_none_or(|p| p == t), "field {k} carries two types");
+            }
+        }
+        let names: Vec<&str> = seen.keys().map(String::as_str).collect();
+        assert_eq!(names.len(), 58);
+        assert_eq!(names, FIELDS.to_vec());
+        for (k, t) in &seen {
+            let want = if I64_FIELDS.contains(&k.as_str()) {
+                "i64"
+            } else {
+                "str"
+            };
+            assert_eq!(*t, want, "field {k}");
+        }
+
+        // The planned block spans are the ones the writer stamps.
+        let cfg = RlogConfig::default();
+        let plan = object_plan(&small, 0, all.len());
+        let planned = planned_block_stream_spans(&plan, &all, cfg.block_target_records);
+        let identity = ObjectIdentity {
+            tenant_hash: [0; 16],
+            shard: SHARD,
+            writer_id: [0; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut w = RlogWriter::new(cfg, identity);
+        for r in records {
+            w.push(r).expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let dirs = RlogReader::<[u8]>::decode_directories(&bytes[..], &cfg).expect("dirs");
+        let written: Vec<u64> = dirs
+            .skip_index()
+            .l0
+            .iter()
+            .map(|e| u64::from(e.max_stream_ref - e.min_stream_ref) + 1)
+            .collect();
+        assert_eq!(planned, written);
+
+        // At full scale, over the full blocks (block_target_records records;
+        // the writer cuts greedily, so only an object's last block is short):
+        // the median block spans at least 1,000 stream refs and none spans
+        // fewer than 600. Not every block reaches 1,000: an object near
+        // --max-records carries about 12 records per stream, so 8,192 records
+        // cover about 650 streams.
+        let full = args(REALISM_INPUTS);
+        let mut full_spans = Vec::new();
+        for index in 0..full.inputs {
+            let plan = object_plan(&full, index, all.len());
+            let spans = planned_block_stream_spans(&plan, &all, cfg.block_target_records);
+            let (_, full_blocks) = spans.split_last().expect("an object has a block");
+            for &span in full_blocks {
+                assert!(
+                    span >= 600,
+                    "object {index}: a full block spans {span} stream refs"
+                );
+                full_spans.push(span);
+            }
+        }
+        assert!(
+            full_spans.len() >= full.inputs / 2,
+            "{} full blocks",
+            full_spans.len()
+        );
+        full_spans.sort_unstable();
+        let median = full_spans[full_spans.len() / 2];
+        assert!(
+            median >= 1_000,
+            "median full block spans {median} stream refs"
+        );
+    }
+
+    #[test]
+    fn realism_band_refuses_outside_8k_to_70k() {
+        assert!(check_realism(7_999.0).is_err());
+        assert!(check_realism(70_001.0).is_err());
+        assert!(check_realism(f64::NAN).is_err());
+        for inside in [8_000.0, 20_000.0, 70_000.0] {
+            assert!(check_realism(inside).is_ok(), "{inside}");
+        }
     }
 }
