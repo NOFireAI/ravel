@@ -106,12 +106,18 @@ pub enum TwoLevelCheck {
         group_size: u64,
     },
     /// Constraint (b): one block per run, plus the reads in flight, plus the
-    /// final part target, does not fit the resident ceiling at level 2.
+    /// final part target, does not fit the resident ceiling at level 2. The
+    /// block term is the larger of `runs x run_block_bytes` and the largest
+    /// stream's level-2 estimate, which exceeds it when a run part cut splits
+    /// a stream across two blocks of one run.
     LevelTwoFit {
         /// Runs merged at level 2.
         runs: u64,
         /// The largest pass price of one run block.
         run_block_bytes: u64,
+        /// The largest level-2 stream estimate: the summed pass price of every
+        /// run block carrying the stream.
+        stream_estimate_bytes: u64,
         /// Bytes of the `input_read_concurrency` largest run row groups.
         in_flight_bytes: u64,
         /// The final parts' memory split target.
@@ -136,12 +142,13 @@ impl std::fmt::Display for TwoLevelCheck {
             Self::LevelTwoFit {
                 runs,
                 run_block_bytes,
+                stream_estimate_bytes,
                 in_flight_bytes,
                 part_target_bytes,
                 ceiling_bytes,
             } => write!(
                 f,
-                "level 2 over {runs} runs needs {runs} x {run_block_bytes} + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes (constraint b)"
+                "level 2 over {runs} runs needs the larger of {runs} x {run_block_bytes} and the largest stream estimate {stream_estimate_bytes}, + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes (constraint b)"
             ),
         }
     }

@@ -1877,8 +1877,10 @@ async fn two_level_merge(
         runs.push(load_catalog_noted(&meter, config, None, key, false).await?);
     }
     let mut run_block_bytes = 0u64;
+    let mut run_blocks = 0usize;
     let mut lens: Vec<u64> = Vec::new();
     for run in &runs {
+        run_blocks = run_blocks.saturating_add(run.pricing.block_rows.len());
         for block in 0..run.pricing.block_rows.len() {
             run_block_bytes = run_block_bytes.max(pass_block_cost(&run.pricing, block)?);
         }
@@ -1894,18 +1896,21 @@ async fn two_level_merge(
         .take(config.input_read_concurrency.max(1))
         .fold(0u64, |a, l| a.saturating_add(*l));
     let part_target = config.rlog_memory_target_bytes();
+    let plan = plan_merge(config, &runs, stream_ids, width_ns)?;
+    let stream_estimate = plan.estimates.iter().copied().max().unwrap_or(0);
     let fit = TwoLevelCheck::LevelTwoFit {
         runs: runs_count as u64,
         run_block_bytes,
+        stream_estimate_bytes: stream_estimate,
         in_flight_bytes: in_flight,
         part_target_bytes: part_target,
         ceiling_bytes: ceiling,
     };
     let compared = (runs_count as u64)
         .saturating_mul(run_block_bytes)
+        .max(stream_estimate)
         .saturating_add(in_flight)
         .saturating_add(part_target);
-    let plan = plan_merge(config, &runs, stream_ids, width_ns)?;
     if compared > ceiling || plan.mode == MergeReadMode::Cursor {
         return Err(MaintainError::MergeTwoLevelUnsupported { inputs, check: fit });
     }
@@ -1919,7 +1924,9 @@ async fn two_level_merge(
         run_target_bytes = run_target,
         runs = runs_count,
         run_parts = runs.len(),
+        run_blocks,
         run_block_bytes,
+        stream_estimate_bytes = stream_estimate,
         in_flight_bytes = in_flight,
         part_target_bytes = part_target,
         ceiling_bytes = ceiling,
@@ -14113,6 +14120,485 @@ mod tests {
                     "process {process}: {outcome:?}"
                 );
             }
+        }
+
+        /// The ADR-3853 two-level fixture: 60 inputs of 40 streams, one record
+        /// per stream, each input one block carrying all 40 streams. Inputs
+        /// `i` and `i + 3` share timestamps ([`wide_inputs`]), so a level-1
+        /// group out of canonical order shows in the bytes.
+        fn two_level_inputs() -> Vec<L0Input> {
+            blocked(wide_inputs(60, 40, 1), 40)
+        }
+
+        /// The final part memory target of every two-level comparison, the
+        /// same on both sides.
+        const TWO_LEVEL_PART: u64 = 4096;
+
+        /// The run memory target of the G = 12 fixture, in units of the
+        /// per-input level-1 cost `P`: at `40 P` each group's run is one part
+        /// of one 480-row block and constraint (b) holds with room to spare.
+        const TWO_LEVEL_RUN_PER_INPUTS: u64 = 40;
+
+        /// A scratch directory for test `name`, absent on return.
+        fn fresh_scratch(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "ravel-maintain-two-level-{}-{name}",
+                std::process::id()
+            ));
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => panic!("clear {}: {e}", dir.display()),
+            }
+            dir
+        }
+
+        /// Everything under `dir`, empty when it does not exist.
+        fn scratch_entries(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+            match std::fs::read_dir(dir) {
+                Ok(entries) => entries.map(|e| e.expect("entry").path()).collect(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(e) => panic!("read {}: {e}", dir.display()),
+            }
+        }
+
+        /// `P`, the largest per-input level-1 cost of constraint (a) over the
+        /// inputs, from their catalogs.
+        async fn level1_per_input(store: &dyn ObjectStoreBackend, keys: &[String]) -> u64 {
+            let catalogs = catalogs_of(store, keys).await;
+            catalogs
+                .iter()
+                .map(|c| level1_input_bytes(c).expect("level-1 cost"))
+                .max()
+                .expect("inputs")
+        }
+
+        /// The unit ceiling at which constraint (a) gives `groups` per group
+        /// for run target `run_target`: half a `P` above `groups` of them.
+        fn group_ceiling(per_input: u64, run_target: u64, groups: u64) -> u64 {
+            run_target + groups * per_input + per_input / 2
+        }
+
+        fn two_level_config(
+            ceiling: u64,
+            run_target: u64,
+            scratch_dir: Option<std::path::PathBuf>,
+        ) -> CompactorConfig {
+            CompactorConfig {
+                rlog_l1_part_memory_target_bytes: Some(TWO_LEVEL_PART),
+                merge_resident_ceiling_bytes: Some(ceiling),
+                rlog_run_memory_target_bytes: run_target,
+                scratch_dir,
+                ..CompactorConfig::default()
+            }
+        }
+
+        /// The published parts' keys, then their content hashes and bytes.
+        async fn published(store: &dyn ObjectStoreBackend) -> (Vec<String>, Output) {
+            let (rec, _) = read_output(store).await;
+            let part_keys = rec
+                .parts
+                .iter()
+                .map(|p| keys::reconstruct_l1_part_key(&rec, p).expect("part key"))
+                .collect();
+            (part_keys, output_of(store).await)
+        }
+
+        /// The integer `name=` field of a log line.
+        fn log_field(line: &str, name: &str) -> u64 {
+            let needle = format!(" {name}=");
+            let at = line.find(&needle).unwrap_or_else(|| panic!("{name} in {line}"));
+            line[at + needle.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or_else(|e| panic!("{name} in {line}: {e}"))
+        }
+
+        /// Seeds the two-level fixture on a fresh store and compacts it under
+        /// `config`.
+        async fn compact_two_level(
+            config: &CompactorConfig,
+        ) -> (Result<CompactionOutcome>, Run, ProbeStore, Vec<String>) {
+            let store = ProbeStore::new();
+            let keys = seed_inputs(&store, &two_level_inputs()).await;
+            let (outcome, run) = compact_logged(&store, config).await;
+            (outcome, run, store, keys)
+        }
+
+        /// The single-level merge of the two-level fixture under a 64 MiB
+        /// ceiling, which is resident, its run, and `P`.
+        async fn single_level_oracle() -> ((Vec<String>, Output), Run, u64) {
+            let config = two_level_config(64 << 20, crate::RLOG_RUN_MEMORY_TARGET_BYTES, None);
+            let (outcome, run, store, keys) = compact_two_level(&config).await;
+            outcome.expect("single-level compact");
+            assert!(run.mode_line().contains("mode=\"resident\""), "{}", run.mode_line());
+            assert_eq!(run.report.level1_groups, 0, "{:?}", run.report);
+            let per_input = level1_per_input(&store, &keys).await;
+            (published(&store).await, run, per_input)
+        }
+
+        /// ADR-3853 D3: the 60-input, 40-stream bucket whose single-level plan
+        /// at the unit ceiling is a cursor merge D0 refuses merges in two
+        /// levels of G = 12 instead, and every published part has the bytes,
+        /// key and content hash the resident single-level merge gives it.
+        /// Level 1 decodes each input block once; level 2 reads the runs
+        /// from scratch only and decodes each run block about once.
+        #[tokio::test]
+        async fn two_level_merge_matches_single_level_bytes_and_keys() {
+            let (oracle, single, per_input) = single_level_oracle().await;
+            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+            let ceiling = group_ceiling(per_input, run_target, 12);
+            let dir = fresh_scratch("matches");
+            let config = two_level_config(ceiling, run_target, Some(dir.clone()));
+
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &two_level_inputs()).await;
+            let (plan, _) = plan_for(&probe, &keys, &config).await;
+            assert_eq!(plan.mode, MergeReadMode::Cursor, "single level at U");
+            assert_eq!(plan.input_blocks, 60, "one block per input");
+            let input_groups = group_extents(&probe, &keys).await.len() as u64;
+            assert_eq!(input_groups, 60);
+
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            assert!(
+                matches!(outcome.expect("two-level compact"), CompactionOutcome::Compacted { .. })
+            );
+            let two_level = published(&store).await;
+            assert_eq!(two_level.0, oracle.0, "part keys");
+            assert!(two_level.1.hashes == oracle.1.hashes, "content hashes differ");
+            assert!(two_level.1.parts == oracle.1.parts, "part bytes differ");
+            assert!(!oracle.0.is_empty());
+
+            let line = run.line("rlog two-level merge");
+            assert_eq!(log_field(&line, "group_size"), 12, "{line}");
+            assert_eq!(log_field(&line, "runs"), 5, "{line}");
+            assert_eq!(log_field(&line, "per_input_bytes"), per_input, "{line}");
+            assert_eq!(log_field(&line, "ceiling_bytes"), ceiling, "{line}");
+            let run_blocks = log_field(&line, "run_blocks");
+            let r = &run.report;
+            assert_eq!(r.level1_groups, 5, "{r:?}");
+            assert_eq!(r.level1_passes, 5, "one pass per group: {r:?}");
+            assert_eq!(r.level1_block_decodes, 60, "each input block once: {r:?}");
+            assert_eq!(r.merge_passes, 0, "{r:?}");
+            assert_eq!(
+                r.block_read.requests, input_groups,
+                "every block GET is an input row group, none at level 2: {r:?}"
+            );
+            assert_eq!(r.block_read.requests, single.report.block_read.requests);
+            assert!(run_blocks > 0);
+            assert!(
+                r.level2_block_decodes >= run_blocks && r.level2_block_decodes * 10 <= run_blocks * 11,
+                "level-2 decodes {} against {run_blocks} run blocks",
+                r.level2_block_decodes
+            );
+            assert!(r.level2_passes >= 1, "{r:?}");
+            assert!(r.scratch_write_bytes > 0, "{r:?}");
+            assert!(r.scratch_read_bytes >= r.scratch_write_bytes, "{r:?}");
+            assert_eq!(scratch_entries(&dir), Vec::<std::path::PathBuf>::new());
+        }
+
+        /// Run settings never reach the published parts: a run target that
+        /// cuts every run into many parts and one that keeps each run whole
+        /// publish the single-level bytes and keys.
+        #[tokio::test]
+        async fn the_run_target_does_not_change_the_published_parts() {
+            let (oracle, _, per_input) = single_level_oracle().await;
+            let mut writes = Vec::new();
+            for (name, run_target) in [
+                ("small-runs", 1024),
+                ("whole-runs", TWO_LEVEL_RUN_PER_INPUTS * per_input),
+            ] {
+                let dir = fresh_scratch(name);
+                let ceiling = group_ceiling(per_input, run_target, 12);
+                let config = two_level_config(ceiling, run_target, Some(dir.clone()));
+                let (outcome, run, store, _) = compact_two_level(&config).await;
+                outcome.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(run.report.level1_groups, 5, "{name}");
+                let line = run.line("rlog two-level merge");
+                let got = published(&store).await;
+                assert_eq!(got.0, oracle.0, "{name}: part keys");
+                assert!(got.1 == oracle.1, "{name}: parts differ");
+                writes.push((log_field(&line, "run_parts"), run.report.scratch_write_bytes));
+                assert!(scratch_entries(&dir).is_empty(), "{name}");
+            }
+            assert_eq!(writes[1].0, 5, "one part per run at the large target");
+            assert!(writes[0].0 > writes[1].0, "the small target cuts more run parts: {writes:?}");
+            assert!(writes[0].1 != writes[1].1, "{writes:?}");
+        }
+
+        /// With no scratch directory the two-level route is closed and the
+        /// D0 refusal stands, unchanged.
+        #[tokio::test]
+        async fn with_no_scratch_dir_the_d0_refusal_stands() {
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &two_level_inputs()).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+            let config = two_level_config(group_ceiling(per_input, run_target, 12), run_target, None);
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            assert_eq!(
+                outcome.expect("a refusal is an outcome"),
+                CompactionOutcome::GeometryUnsupported {
+                    inputs: 60,
+                    streams: 40,
+                    blocks: 60,
+                    records: 2_400,
+                    predicted_decoded_rows: 96_000,
+                }
+            );
+            assert_eq!(run.report.level1_groups, 0, "{:?}", run.report);
+            assert_eq!(run.report.scratch_write_bytes, 0, "{:?}", run.report);
+            assert_eq!(run.report.block_read.requests, 0, "{:?}", run.report);
+            assert_eq!(compaction_records(&store).await, 0);
+        }
+
+        /// Each two-level check that fails is refused by name: constraint (a)
+        /// leaving G under 2 before any block GET, and constraint (b) after
+        /// level 1, with the figures it compared.
+        #[tokio::test]
+        async fn a_two_level_refusal_names_the_failed_check() {
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &two_level_inputs()).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+
+            let dir = fresh_scratch("refusal-a");
+            let ceiling = group_ceiling(per_input, run_target, 1);
+            let config = two_level_config(ceiling, run_target, Some(dir.clone()));
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            match outcome {
+                Err(MaintainError::MergeTwoLevelUnsupported { inputs, check }) => {
+                    assert_eq!(inputs, 60);
+                    assert_eq!(
+                        check,
+                        TwoLevelCheck::GroupSize {
+                            per_input_bytes: per_input,
+                            run_target_bytes: run_target,
+                            ceiling_bytes: ceiling,
+                            group_size: 1,
+                        }
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(run.report.block_read.requests, 0, "{:?}", run.report);
+            assert_eq!(compaction_records(&store).await, 0);
+
+            let dir = fresh_scratch("refusal-b");
+            let run_target = 2 * per_input;
+            let ceiling = group_ceiling(per_input, run_target, 12);
+            let config = two_level_config(ceiling, run_target, Some(dir.clone()));
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            match outcome {
+                Err(MaintainError::MergeTwoLevelUnsupported {
+                    inputs: 60,
+                    check:
+                        TwoLevelCheck::LevelTwoFit {
+                            runs,
+                            run_block_bytes,
+                            stream_estimate_bytes,
+                            in_flight_bytes,
+                            part_target_bytes,
+                            ceiling_bytes,
+                        },
+                }) => {
+                    assert_eq!(runs, 5);
+                    assert_eq!(part_target_bytes, TWO_LEVEL_PART);
+                    assert_eq!(ceiling_bytes, ceiling);
+                    assert!(stream_estimate_bytes >= run_block_bytes);
+                    assert!(
+                        (runs * run_block_bytes).max(stream_estimate_bytes)
+                            + in_flight_bytes
+                            + part_target_bytes
+                            > ceiling,
+                        "(b) failed: {runs} x {run_block_bytes}, {stream_estimate_bytes}, \
+                         {in_flight_bytes}, {part_target_bytes}, {ceiling}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(run.report.level1_groups, 5, "{:?}", run.report);
+            assert_eq!(run.report.level2_passes, 0, "{:?}", run.report);
+            assert_eq!(compaction_records(&store).await, 0);
+            assert!(scratch_entries(&dir).is_empty());
+        }
+
+        /// ADR-3853 D2: a scratch volume with one byte less than 1.3 times
+        /// the inputs' object sizes free is refused with the need, the free
+        /// bytes and the directory, before any block GET, and nothing is
+        /// published.
+        #[tokio::test]
+        async fn a_short_scratch_volume_is_refused_before_any_block_get() {
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &two_level_inputs()).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let mut stored = 0u64;
+            for key in &keys {
+                stored += probe.head(key).await.expect("head").size;
+            }
+            let need = (stored * 13).div_ceil(10);
+            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+            let dir = fresh_scratch("short");
+            let config = two_level_config(
+                group_ceiling(per_input, run_target, 12),
+                run_target,
+                Some(dir.clone()),
+            );
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(Some(need - 1)));
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(None));
+            match outcome {
+                Err(MaintainError::ScratchHeadroom { need: n, free, path }) => {
+                    assert_eq!((n, free, path), (need, need - 1, dir.clone()));
+                }
+                other => panic!("{other:?}"),
+            }
+            let r = &run.report;
+            assert!(r.catalog_read.requests > 0, "{r:?}");
+            assert_eq!(r.block_read.requests, 0, "{r:?}");
+            assert_eq!(r.part_put.requests, 0, "{r:?}");
+            assert_eq!(r.level1_groups, 0, "{r:?}");
+            assert_eq!(r.scratch_write_bytes, 0, "{r:?}");
+            assert_eq!(compaction_records(&store).await, 0);
+            assert!(scratch_entries(&dir).is_empty());
+        }
+
+        /// A [`MemoryStore`] whose first non-claim PUT once `armed` never
+        /// completes, after raising `stalled`.
+        struct StallStore {
+            inner: MemoryStore,
+            armed: std::sync::atomic::AtomicBool,
+            stalled: std::sync::atomic::AtomicBool,
+        }
+
+        #[async_trait]
+        impl ObjectStoreBackend for StallStore {
+            async fn put(
+                &self,
+                key: &str,
+                data: Bytes,
+                opts: PutOptions,
+            ) -> std::result::Result<PutOutcome, StoreError> {
+                if self.armed.load(Ordering::SeqCst)
+                    && !key.starts_with(ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX)
+                {
+                    self.stalled.store(true, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                }
+                self.inner.put(key, data, opts).await
+            }
+
+            async fn get(
+                &self,
+                key: &str,
+                range: GetRange,
+            ) -> std::result::Result<GetOutcome, StoreError> {
+                self.inner.get(key, range).await
+            }
+
+            async fn put_multipart<'a>(
+                &'a self,
+                key: &str,
+            ) -> std::result::Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+                self.inner.put_multipart(key).await
+            }
+
+            async fn head(&self, key: &str) -> std::result::Result<ObjectMeta, StoreError> {
+                self.inner.head(key).await
+            }
+
+            async fn list(
+                &self,
+                prefix: &str,
+                page: Option<PageToken>,
+            ) -> std::result::Result<ListPage, StoreError> {
+                self.inner.list(prefix, page).await
+            }
+
+            async fn list_delimited(
+                &self,
+                prefix: &str,
+            ) -> std::result::Result<DelimitedList, StoreError> {
+                self.inner.list_delimited(prefix).await
+            }
+
+            async fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+                self.inner.delete(key).await
+            }
+
+            fn capabilities(&self) -> Capabilities {
+                self.inner.capabilities()
+            }
+        }
+
+        /// ADR-3853 D2: the unit's scratch holds runs while the merge runs
+        /// and is empty once it ends, whether it published, returned an error
+        /// after level 1 wrote its runs, or was dropped at its first final
+        /// part PUT.
+        #[tokio::test]
+        async fn scratch_is_empty_after_success_error_and_cancel() {
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &two_level_inputs()).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+            let ceiling = group_ceiling(per_input, run_target, 12);
+
+            let dir = fresh_scratch("success");
+            let config = two_level_config(ceiling, run_target, Some(dir.clone()));
+            let (outcome, run, _, _) = compact_two_level(&config).await;
+            outcome.expect("success");
+            assert!(run.report.scratch_write_bytes > 0);
+            assert!(dir.is_dir(), "the scratch directory itself stays");
+            assert!(scratch_entries(&dir).is_empty(), "success");
+
+            let dir = fresh_scratch("error");
+            let small_run = 2 * per_input;
+            let config = two_level_config(
+                group_ceiling(per_input, small_run, 12),
+                small_run,
+                Some(dir.clone()),
+            );
+            let (outcome, run, _, _) = compact_two_level(&config).await;
+            assert!(
+                matches!(
+                    outcome,
+                    Err(MaintainError::MergeTwoLevelUnsupported {
+                        check: TwoLevelCheck::LevelTwoFit { .. },
+                        ..
+                    })
+                ),
+                "{outcome:?}"
+            );
+            assert!(run.report.scratch_write_bytes > 0, "runs were written");
+            assert!(scratch_entries(&dir).is_empty(), "error");
+
+            let dir = fresh_scratch("cancel");
+            let config = two_level_config(ceiling, run_target, Some(dir.clone()));
+            let store = StallStore {
+                inner: MemoryStore::new(),
+                armed: std::sync::atomic::AtomicBool::new(false),
+                stalled: std::sync::atomic::AtomicBool::new(false),
+            };
+            seed_inputs(&store, &two_level_inputs()).await;
+            store.armed.store(true, Ordering::SeqCst);
+            let clock = FixedClock::new(sealed_now_ns());
+            let target = bucket();
+            let mut merge = Box::pin(compact_bucket(&store, &clock, &config, &target));
+            tokio::select! {
+                out = &mut merge => panic!("the merge finished past a stalled PUT: {out:?}"),
+                () = async {
+                    while !store.stalled.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+            let held = scratch_entries(&dir);
+            assert_eq!(held.len(), 1, "one unit directory while the merge runs");
+            assert!(!scratch_entries(&held[0]).is_empty(), "runs present at level 2");
+            drop(merge);
+            assert!(scratch_entries(&dir).is_empty(), "cancel");
         }
 
         /// `r` moved to stream `s`, everything else kept.
