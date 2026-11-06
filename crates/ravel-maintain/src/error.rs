@@ -86,6 +86,74 @@ impl std::fmt::Display for MergeCursorBudgetSite {
     }
 }
 
+/// Which ADR-3853 check refused a two-level RLOG merge, with the figures it
+/// compared. Every check runs before the step it guards does any work, so a
+/// refusal publishes nothing and leaves the L0 inputs live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TwoLevelCheck {
+    /// Constraint (a) at one level-1 worker admits fewer than two inputs per
+    /// group: `G = floor((ceiling - run_target) / per_input)` is below 2, so
+    /// level 1 would not reduce the input count.
+    GroupSize {
+        /// The largest per-input term, raw candidate row-group bytes plus the
+        /// summed pass price of the input's blocks.
+        per_input_bytes: u64,
+        /// The memory split target a run part closes at.
+        run_target_bytes: u64,
+        /// The resident ceiling `C = U / W1`, with `W1 = 1`.
+        ceiling_bytes: u64,
+        /// The group size the figures admit.
+        group_size: u64,
+    },
+    /// Constraint (b): one block per run, plus the reads in flight, plus the
+    /// final part target, does not fit the resident ceiling at level 2. The
+    /// block term is the larger of `runs x run_block_bytes` and the largest
+    /// stream's level-2 estimate, which exceeds it when a run part cut splits
+    /// a stream across two blocks of one run.
+    LevelTwoFit {
+        /// Runs merged at level 2.
+        runs: u64,
+        /// The largest pass price of one run block.
+        run_block_bytes: u64,
+        /// The largest level-2 stream estimate: the summed pass price of every
+        /// run block carrying the stream.
+        stream_estimate_bytes: u64,
+        /// Bytes of the `input_read_concurrency` largest run row groups.
+        in_flight_bytes: u64,
+        /// The final parts' memory split target.
+        part_target_bytes: u64,
+        /// The resident ceiling `U`.
+        ceiling_bytes: u64,
+    },
+}
+
+impl std::fmt::Display for TwoLevelCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GroupSize {
+                per_input_bytes,
+                run_target_bytes,
+                ceiling_bytes,
+                group_size,
+            } => write!(
+                f,
+                "level-1 group size {group_size} is below 2: per input {per_input_bytes} bytes, run target {run_target_bytes} bytes, ceiling {ceiling_bytes} bytes (constraint a)"
+            ),
+            Self::LevelTwoFit {
+                runs,
+                run_block_bytes,
+                stream_estimate_bytes,
+                in_flight_bytes,
+                part_target_bytes,
+                ceiling_bytes,
+            } => write!(
+                f,
+                "level 2 over {runs} runs needs the larger of {runs} x {run_block_bytes} and the largest stream estimate {stream_estimate_bytes}, + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes (constraint b)"
+            ),
+        }
+    }
+}
+
 /// A compaction run's failure. Retryable store faults surface as
 /// [`MaintainError::Store`] carrying the underlying [`StoreError`]; the caller
 /// decides whether to re-run the whole bucket (the idempotent recovery path). The `*Divergence` and `*Mismatch` variants are invariant
@@ -286,6 +354,31 @@ pub enum MaintainError {
         /// Rows the cursor plan would decode: for every stream and every input
         /// carrying it, the `record_count` of each candidate block, summed.
         predicted_decoded_rows: u64,
+    },
+    /// A two-level RLOG merge (ADR-3853) failed one of its fit checks. Raised
+    /// before the step the check guards, so nothing was published.
+    #[error(
+        "RLOG compaction refused: two-level merge over {inputs} inputs cannot run: {check} (ADR-3853); nothing published, the L0 inputs stay live"
+    )]
+    MergeTwoLevelUnsupported {
+        /// Input catalogs in the bucket.
+        inputs: usize,
+        /// The check that refused, with its figures.
+        check: TwoLevelCheck,
+    },
+    /// The filesystem holding the scratch directory has less free space than
+    /// the two-level merge's runs need (ADR-3853 D2). Raised before the first
+    /// block GET.
+    #[error(
+        "RLOG compaction refused: two-level merge needs {need} bytes of scratch under {path:?} and that filesystem has {free} free (ADR-3853 D2); nothing fetched or published, the L0 inputs stay live"
+    )]
+    ScratchHeadroom {
+        /// 1.3 times the summed object sizes of the inputs.
+        need: u64,
+        /// Bytes available to an unprivileged writer on that filesystem.
+        free: u64,
+        /// The configured scratch directory.
+        path: std::path::PathBuf,
     },
     #[error("RLOG compaction refused before writing any part: {0}")]
     InvalidRlogZstdLevel(#[from] crate::config::RlogZstdLevelError),

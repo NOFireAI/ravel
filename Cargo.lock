@@ -4958,6 +4958,7 @@ dependencies = [
  "ravel-rspan",
  "ravel-segment",
  "ravel-types",
+ "rustix",
  "stats_alloc",
  "thiserror",
  "tokio",
