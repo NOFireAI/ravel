@@ -700,6 +700,7 @@ fn verify_shape(objects: &[L0Object]) -> Value {
 }
 
 /// The shape of one written L0 object, read back from its bytes.
+#[cfg(test)]
 struct ObjectShape {
     records: u64,
     streams: usize,
@@ -712,6 +713,7 @@ struct ObjectShape {
     blocks: Vec<(u32, u32)>,
 }
 
+#[cfg(test)]
 fn object_shape(bytes: &[u8]) -> ObjectShape {
     let cfg = RlogConfig::default();
     let dirs = RlogReader::<[u8]>::decode_directories(bytes, &cfg).expect("decode directories");
