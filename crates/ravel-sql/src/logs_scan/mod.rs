@@ -410,8 +410,9 @@ use ravel_query::key_index_route::{
     route, route_with_max_parts,
 };
 use ravel_query::{
-    CarriedWholeObject, ColumnarBlockOutcome, KeyEquals, KeyIndexPruning, LogFetchError,
-    LogLeafRangeReader, LogQuery, LogSegmentFetcher, LogSegmentScan, PhaseAccounting, log_key_set,
+    CarriedWholeObject, ColumnarBlockOutcome, KeyEquals, KeyIn, KeyIndexPruning, LogFetchError,
+    LogLeafRangeReader, LogQuery, LogSegmentFetcher, LogSegmentScan, PhaseAccounting,
+    log_key_in_set, log_key_set,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -1189,6 +1190,10 @@ pub struct LogsScanExec {
     /// they narrow which blocks are read and never which rows a read block
     /// returns. Set by [`Self::with_key_equals`].
     key_equals: Arc<Vec<KeyEquals>>,
+    /// The exact-key `IN` set handed to the fetch as `LogQuery::key_in`
+    /// (ADR-3692 decision 6), beside `key_equals` and like it prune-only. Set
+    /// by [`Self::with_key_in`].
+    key_in: Option<Arc<KeyIn>>,
     /// Pending selective-erasure predicates from the resolved snapshot
     /// (ADR-0064 decision 2). Fed to [`LogQuery::with_erasure`] so
     /// `LogSegmentFetcher::fetch`'s existing post-fetch, post-cache filter
@@ -1920,6 +1925,7 @@ impl LogsScanExec {
                 .with_segment_timing(self.segment_timing)
                 .with_segments_pruned_by_stats(self.segments_pruned_by_stats)
                 .with_key_equals(Arc::clone(&self.key_equals))
+                .with_key_in(self.key_in.clone())
                 .with_fetch_pushed(self.fetch)
                 .with_limit_hint(self.limit_hint)
                 .with_topk(self.topk.clone())
@@ -1969,6 +1975,7 @@ impl LogsScanExec {
                 .with_segment_timing(self.segment_timing)
                 .with_segments_pruned_by_stats(self.segments_pruned_by_stats)
                 .with_key_equals(Arc::clone(&self.key_equals))
+                .with_key_in(self.key_in.clone())
                 .with_fetch_pushed(self.fetch)
                 .with_limit_hint(self.limit_hint)
                 .with_topk(self.topk.clone())
@@ -2006,6 +2013,7 @@ impl LogsScanExec {
                 .with_segment_timing(self.segment_timing)
                 .with_segments_pruned_by_stats(self.segments_pruned_by_stats)
                 .with_key_equals(Arc::clone(&self.key_equals))
+                .with_key_in(self.key_in.clone())
                 .with_fetch_pushed(self.fetch)
                 .with_limit_hint(self.limit_hint)
                 .with_topk(self.topk.clone())
@@ -2060,6 +2068,14 @@ impl LogsScanExec {
         self
     }
 
+    /// Install the exact-key `IN` set the plan's KEY_IDX probe and the
+    /// tier-2 router answer (ADR-3692 decision 6), from
+    /// [`crate::logs_pushdown::LogsPushdown::key_in`].
+    pub(crate) fn with_key_in(mut self, key_in: Option<Arc<KeyIn>>) -> Self {
+        self.key_in = key_in;
+        self
+    }
+
     /// Hand this scan the executor's record of scan executions (issue
     /// #3192), so a repeated execution with a read cache, no confirmed TopK
     /// and no pushed fetch publishes its units in the opposite direction to
@@ -2090,7 +2106,7 @@ impl LogsScanExec {
     /// Whether this scan carries exact-key equalities, so its plan pass probes
     /// KEY_IDX ([`Self::with_key_equals`]).
     pub(crate) fn has_key_equals(&self) -> bool {
-        !self.key_equals.is_empty()
+        !self.key_equals.is_empty() || self.key_in.is_some()
     }
 
     /// Carry a pushed `fetch` (issue #362) across a rebuild that otherwise
@@ -2189,6 +2205,7 @@ impl LogsScanExec {
             content: Arc::clone(&self.content),
             prune: Arc::clone(&self.prune),
             key_equals: Arc::clone(&self.key_equals),
+            key_in: self.key_in.clone(),
             erasure: Arc::clone(&self.erasure),
             projection: Arc::clone(&self.projection),
             row_filters: self.row_filters.clone(),
@@ -2373,6 +2390,7 @@ impl LogsScanExec {
             content,
             prune,
             key_equals: Arc::new(Vec::new()),
+            key_in: None,
             erasure,
             projection: Arc::new(projection),
             row_filters,
@@ -2465,6 +2483,7 @@ impl LogsScanExec {
         self.content.is_empty()
             && prune_is_rewrite_neutral(&self.prune)
             && self.key_equals.is_empty()
+            && self.key_in.is_none()
             && self.row_filters.is_empty()
             && self.erasure.is_empty()
             && self
@@ -3412,6 +3431,9 @@ impl ExecutionPlan for LogsScanExec {
         for k in self.key_equals.iter() {
             query = query.with_key_equals(k.clone());
         }
+        if let Some(k) = &self.key_in {
+            query = query.with_key_in(k.as_ref().clone());
+        }
 
         let reservation = MemoryConsumer::new(format!("LogsScanExec[{partition}]"))
             .register(context.memory_pool());
@@ -3439,7 +3461,7 @@ impl ExecutionPlan for LogsScanExec {
         // whole-object GET (no plan probe, no scan-side probe). Any other shape
         // falls to the plan-then-stripe path below, byte for byte, and records
         // which conjunct sent it there.
-        let blocks = BlockMetrics::new(&self.metrics, partition, !self.key_equals.is_empty());
+        let blocks = BlockMetrics::new(&self.metrics, partition, self.has_key_equals());
         let (work, round, alternation, fast_whole_segment, state) =
             match self.whole_segment_fast_path(&ctx.query) {
                 Ok(relevant) => {

@@ -180,6 +180,21 @@
 //! key type declines for that key. `OR` is not handled: a disjunction of
 //! equalities contributes no key.
 //!
+//! # Exact-key `IN` lists (ADR-3692 decision 6)
+//!
+//! A top-level `column IN (v1, ..., vn)` feeds [`LogsPushdown::key_in`]: a
+//! declared key-index I64/Str/Bytes column against literals of exactly its
+//! type, read as the equality arm reads one, or `trace_id` against 16-byte
+//! binary or 32-character hex literals when `index_trace_id` is set. One
+//! field, 1 to 1,024 distinct values. A `NOT IN`, a mixed-type list, a list
+//! holding a NULL or an expression, more than 1,024 distinct values, and a
+//! list under `OR` carry no key; a declared I64 list keeps its envelope
+//! `NumRange` arm either way. The first such list of the conjunction is
+//! kept; a second contributes nothing. DataFusion rewrites a list of at most
+//! three values into `=` disjuncts before the scan sees it (one value into a
+//! plain `=`, which is an equality arm), and a disjunction carries no key.
+//! The arm is `Inexact`: the residual re-applies the list over full values.
+//!
 //! A row whose attribute is stored under another type than the declared one
 //! is never indexed for the field, and is never matched by the SQL comparison
 //! either: the declared column reads such a row as NULL, with no cast
@@ -203,11 +218,12 @@ use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
 use ravel_logseg::key_index::{KeyType, TRACE_ID_FIELD, key8_bytes, key8_i64, key8_id16, key8_str};
 use ravel_logseg::{AttrValue, FieldSel, FieldType, Predicate};
-use ravel_query::KeyEquals;
+use ravel_query::{KeyEquals, KeyIn};
 
 use crate::declared::{DeclaredColumn, DeclaredType, KeyIndexDeclaration};
 use crate::like_udf::pushable_contains;
 use crate::logs_udf::HAS_WORD_UDF;
+use crate::spans_pushdown::hex_trace_id_literal;
 
 /// The scalar UDF name an `attrs['k']` subscript lowers to
 /// ([`crate::map_field_planner`]).
@@ -238,6 +254,12 @@ pub struct LogsPushdown {
     /// its type, and `trace_id` `=` a 16-byte literal. Like `prune`, they only
     /// narrow which blocks are read; see the module doc.
     pub key_equals: Vec<KeyEquals>,
+    /// A prune-only exact-key `IN` list for the KEY_IDX probe and the tier-2
+    /// router (ADR-3692 decision 6): a declared I64/Str/Bytes key-index
+    /// column `IN` literals of exactly its type, or `trace_id IN` 16-byte or
+    /// 32-hex literals, 1 to 1,024 distinct values. The first such list of
+    /// the conjunction is kept; see the module doc.
+    pub key_in: Option<KeyIn>,
     /// Top-level conjuncts `c <> v` (either operand order) with `c` a bare
     /// declared `Str` column and `v` a non-NULL string literal, kept as the
     /// logical expression DataFusion handed the provider. The scan evaluates
@@ -310,6 +332,7 @@ pub fn extract_logs_keyed(
     let mut out = LogsPushdown::default();
     for f in filters {
         walk_conjunct(f, &mut out, declared);
+        collect_key_in(f, &mut out, declared, key_index);
     }
     out.key_equals.retain(|k| {
         if k.field == TRACE_ID_FIELD {
@@ -374,7 +397,7 @@ pub fn filter_has_row_filter(filter: &Expr, declared: &[DeclaredColumn]) -> bool
 fn leaf_is_exact(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
     let mut out = LogsPushdown::default();
     handle_leaf(expr, &mut out, declared);
-    if !out.prune.is_empty() || !out.key_equals.is_empty() {
+    if !out.prune.is_empty() || !out.key_equals.is_empty() || out.key_in.is_some() {
         return false;
     }
     match expr {
@@ -394,6 +417,95 @@ fn leaf_is_exact(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
         Expr::ScalarFunction(sf) if sf.func.name() == HAS_WORD_UDF => !out.content.is_empty(),
         _ => false,
     }
+}
+
+/// The first top-level `IN` conjunct of `expr` that [`key_in_list`] reads,
+/// into [`LogsPushdown::key_in`] when it is still empty.
+fn collect_key_in(
+    expr: &Expr,
+    out: &mut LogsPushdown,
+    declared: &[DeclaredColumn],
+    key_index: &KeyIndexDeclaration,
+) {
+    if out.key_in.is_some() {
+        return;
+    }
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::And => {
+            collect_key_in(left, out, declared, key_index);
+            collect_key_in(right, out, declared, key_index);
+        }
+        Expr::InList(il) => out.key_in = key_in_list(il, declared, key_index),
+        _ => {}
+    }
+}
+
+/// `column IN (literals)` as a KEY_IDX key set: a declared key-index column
+/// against literals of exactly its declared type, or `trace_id` (when the
+/// declaration indexes it) against 16-byte binary or 32-hex literals. `None`
+/// for a `NOT IN`, an empty list, a list with any other element (a mixed-type
+/// list, a NULL, an expression), a column the declaration does not index,
+/// and a list of more than 1,024 distinct values: such a list carries no key,
+/// and the numeric envelope [`declared_in_list_predicate`] builds still
+/// applies.
+fn key_in_list(
+    il: &InList,
+    declared: &[DeclaredColumn],
+    key_index: &KeyIndexDeclaration,
+) -> Option<KeyIn> {
+    if il.negated || il.list.is_empty() {
+        return None;
+    }
+    let Expr::Column(col) = il.expr.as_ref() else {
+        return None;
+    };
+    if col.name == TRACE_ID_FIELD {
+        if !key_index.trace_id {
+            return None;
+        }
+        let keys = il
+            .list
+            .iter()
+            .map(|e| {
+                lit_id16(e)
+                    .or_else(|| hex_trace_id_literal(e))
+                    .map(|id| key8_id16(&id))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return KeyIn::new(TRACE_ID_FIELD, KeyType::Id16, keys).ok();
+    }
+    let dc = resolve_declared(&il.expr, declared)?;
+    if !key_index.columns.contains(&dc.key) {
+        return None;
+    }
+    let (key_type, keys) = match dc.ty {
+        DeclaredType::I64 => (
+            KeyType::I64,
+            il.list
+                .iter()
+                .map(|e| lit_i64(e).map(key8_i64))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        DeclaredType::Str => (
+            KeyType::Str,
+            il.list
+                .iter()
+                .map(|e| match e {
+                    Expr::Literal(sv, _) => scalar_utf8(sv).map(|v| key8_str(&v)),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        DeclaredType::Bytes => (
+            KeyType::Bytes,
+            il.list
+                .iter()
+                .map(|e| lit_bytes(e).map(|b| key8_bytes(&b)))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        DeclaredType::Bool => return None,
+    };
+    KeyIn::new(dc.key.clone(), key_type, keys).ok()
 }
 
 fn walk_conjunct(expr: &Expr, out: &mut LogsPushdown, declared: &[DeclaredColumn]) {
@@ -1920,5 +2032,97 @@ mod tests {
         assert!(plain.key_equals.is_empty());
         assert_eq!(p.prune, plain.prune);
         assert_eq!(p.prune.len(), 2);
+    }
+
+    /// A declared key-index column `IN` literals of exactly its type, and
+    /// `trace_id IN` 16-byte or 32-hex literals, yield one key set of the
+    /// distinct values; the I64 list keeps its envelope prune arm.
+    #[test]
+    fn an_in_list_yields_one_key_set() {
+        let d = keyed_decl();
+        let p = keyed(
+            &[col("status_code").in_list(
+                vec![lit(500i64), lit(404i64), lit(500i64), lit(200i64)],
+                false,
+            )],
+            &d,
+        );
+        assert_eq!(
+            p.key_in,
+            Some(
+                KeyIn::new(
+                    "status_code",
+                    KeyType::I64,
+                    vec![key8_i64(200), key8_i64(404), key8_i64(500)]
+                )
+                .expect("set")
+            )
+        );
+        assert_eq!(p.prune.len(), 1, "the envelope stays");
+        let p = keyed(
+            &[col("region").in_list(vec![lit("eu"), lit("us"), lit("ap"), lit("sa")], false)],
+            &d,
+        );
+        assert_eq!(p.key_in.as_ref().map(|k| k.keys().len()), Some(4));
+        let hex = "00112233445566778899aabbccddeeff";
+        let bin = ScalarValue::FixedSizeBinary(16, Some(vec![7u8; 16]));
+        let p = keyed(
+            &[col(TRACE_ID_FIELD).in_list(vec![lit(hex), lit(bin.clone())], false)],
+            &d,
+        );
+        let k = p.key_in.expect("trace set");
+        assert_eq!(k.key_type(), KeyType::Id16);
+        assert_eq!(k.keys().len(), 2);
+        // Without the declaration's trace_id switch, no key.
+        let off = extract_logs_keyed(
+            &[col(TRACE_ID_FIELD).in_list(vec![lit(bin)], false)],
+            &d,
+            &KeyIndexDeclaration {
+                columns: Vec::new(),
+                trace_id: false,
+            },
+        );
+        assert!(off.key_in.is_none());
+    }
+
+    /// `NOT IN`, a mixed-type list, more than 1,024 distinct values, a list
+    /// under `OR`, and a column the declaration does not index carry no key.
+    #[test]
+    fn non_key_in_shapes_carry_no_key() {
+        let d = keyed_decl();
+        let shapes = vec![
+            col("status_code").in_list(vec![lit(1i64), lit(2i64), lit(3i64), lit(4i64)], true),
+            col("status_code").in_list(vec![lit(1i64), lit("2"), lit(3i64), lit(4i64)], false),
+            col("status_code").in_list((0..1_025i64).map(lit).collect(), false),
+            or(
+                col("status_code").in_list(vec![lit(1i64), lit(2i64), lit(3i64), lit(4i64)], false),
+                col("region").eq(lit("eu")),
+            ),
+            col("is_active").in_list(vec![lit(true), lit(false)], false),
+            col("undeclared").in_list(vec![lit(1i64), lit(2i64), lit(3i64), lit(4i64)], false),
+        ];
+        for e in shapes {
+            assert!(keyed(std::slice::from_ref(&e), &d).key_in.is_none(), "{e}");
+        }
+        let at_k = keyed(
+            &[col("status_code").in_list((0..1_024i64).map(lit).collect(), false)],
+            &d,
+        );
+        assert_eq!(at_k.key_in.map(|k| k.keys().len()), Some(1_024));
+    }
+
+    /// An `IN` list ANDed with an equality carries both arms.
+    #[test]
+    fn an_in_list_and_an_equality_carry_both_arms() {
+        let d = keyed_decl();
+        let p = keyed(
+            &[and(
+                col("status_code").in_list(vec![lit(1i64), lit(2i64), lit(3i64), lit(4i64)], false),
+                col("region").eq(lit("eu")),
+            )],
+            &d,
+        );
+        assert_eq!(p.key_equals.len(), 1);
+        assert_eq!(p.key_in.map(|k| k.keys().len()), Some(4));
     }
 }
