@@ -308,7 +308,9 @@ count; the surviving input-count term is directory metadata only, and is
 stated, not hidden. (ADR-3819 adds a resident term and a pass term to this
 peak; see the ADR-3819 read-plan amendment below. The one decoded block
 per input is an `N x h` floor no ceiling lowers, and a many-input bucket
-now merges in two levels; see the two-level merge amendment below.)
+now merges in two levels; see the two-level merge amendment below. Its
+level 1 divides this bound across parallel workers; see the per-worker
+budget amendment below.)
 
 **Acceptance test.** A `MergeMemoryTracker` seam (test-injectable, default
 no-op) accounts fetched block bytes, decoded-block residency, and the
@@ -548,7 +550,8 @@ stays loaded across both levels. Level 1 holds one group's resident row
 groups, one pass over them and an in-progress run part bounded by the run
 memory target; level 2 holds the run parts' row groups, one pass over at
 most `R` run blocks per stream, and the in-progress part. Level 1 runs one group
-at a time (`W1 = 1`), so the per-worker ceiling `C` is the unit ceiling `U`;
+at a time (`W1 = 1`; see the per-worker budget amendment below for `W1`
+parallel workers), so the per-worker ceiling `C` is the unit ceiling `U`;
 dividing the budgets across parallel workers is ADR-3853 D4's. The runs are
 a cache: the merge refuses before its first block GET when the scratch
 volume holds less than 1.3 times the inputs' object sizes, removes the
@@ -558,3 +561,29 @@ two-level merge and holds it for its lifetime; with the lock held it removes
 every unit directory it did not create, which reclaims what a killed process
 left behind, and a directory another process holds is refused by name.
 With no `scratch_dir`, the merge and the D0 refusal are unchanged.
+
+## Amendment (2026-11-06): the per-worker budget amendment (ADR-3853 D4, #3873)
+
+<!-- amendment-applies: sections="4. RLOG compaction: a real memory bound" pointer="per-worker budget amendment" -->
+<!-- amendment-supersedes: phrase="Level 1 runs one group" pointer="per-worker budget amendment" -->
+
+A two-level merge's level 1 now runs `W1` workers at once (ADR-3853 D4 and
+its #3873 amendment). `W1` is the largest count at or under the unit's core
+share whose groups and predicted run parts fit both of ADR-3853's
+constraints, or the `level1_workers` setting when one is given. Decision 4's
+bound then holds per worker: each merges its groups under its own copy of
+the unit's config, with `merge_cursor_budget_bytes / W1` as its cursor
+budget and `C = U / W1` as its resident ceiling, and charges its own
+`MergeMemoryTracker`. Each worker's peak stays under `C`, so the level-1
+peaks sum under `U`; the unit's tracker raises each of its high-water marks
+to at least that sum and keeps each worker's peak. The run memory target is
+not divided: every worker's in-progress run part is cut at the same fixed
+target, which `C`'s constraint (a) already reserves. Level 2 is one merge
+under `U` and the undivided budget, as before.
+
+The workers share the unit's claim guard and a stop token. A lost claim
+cancels every worker at its own next checkpoint, and the first error any
+worker returns stops the others before their next group or run-part PUT;
+the unit then ends as one merge would, `Cancelled` with its publish
+`Abandoned` for a lost claim, the error otherwise, and its scratch runs
+removed either way.
