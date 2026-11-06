@@ -2575,4 +2575,32 @@ mod tests {
             prop_assert!(parts > 1, "boundary corpus must produce more than one part, got {parts}");
         }
     }
+
+    /// The RSPAN catalog load slices no section from its footer probe, so it
+    /// keeps the shared 64 KiB probe rather than the larger RLOG one.
+    #[tokio::test]
+    async fn rspan_catalog_probe_uses_the_shared_64_kib_default() {
+        let identity = ObjectIdentity {
+            tenant_hash: tenant_hash().0,
+            shard: SHARD,
+            writer_id: Uuid::from_u128(1).into_bytes(),
+            writer_epoch: EPOCH,
+            writer_seq: 1,
+        };
+        let mut w = RspanWriter::new(RspanConfig::default(), identity);
+        w.push(span(0, 0, 10, 20));
+        w.push(span(1, 0, 5, 9));
+        let bytes = Bytes::from(w.finish().expect("finish"));
+        let store = crate::read::probe_recorder::SuffixRecordingStore::default();
+        store
+            .put("l0/rspan-probe", bytes, PutOptions::default())
+            .await
+            .expect("put");
+
+        let config = CompactorConfig::default();
+        load_catalog_from_object(&store, &config, "l0/rspan-probe".into())
+            .await
+            .expect("load catalog");
+        assert_eq!(store.suffix_lengths(), [65_536]);
+    }
 }

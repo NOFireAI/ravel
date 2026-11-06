@@ -153,9 +153,10 @@ Identical in shape to RSEG v1:
    pays for it with step 3's extra ranged GET. `ravel-query`'s log fetcher
    probes 256 KiB, sized so that one probe carries the footer, SKIP_IDX and
    PAGE_DIR past the BLOOM section that sits between them (ADR-0699
-   decision 5). The compactor probes `footer_probe_bytes`, 128 KiB by
-   default, and keeps the probe for the length of one input's catalog load:
-   every section that load reads (the four directories, POSTINGS, the
+   decision 5). The compactor probes `rlog_footer_probe_bytes`, 128 KiB
+   by default (RSEG and RSPAN inputs keep the 64 KiB `footer_probe_bytes`),
+   and keeps the probe for the length of one input's catalog load: every
+   section that load reads (the four directories, POSTINGS, the
    KEY_IDX prefix) is sliced from the probe when it lies wholly inside it and
    fetched by one ranged GET otherwise, so an input whose catalog the probe
    holds costs one GET. The covered-column list of an uncompressed BLOOM,
