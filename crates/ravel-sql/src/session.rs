@@ -899,8 +899,12 @@ pub fn build_session_with_tables(
     // reads `k` rows per partition instead of every narrowed batch. After
     // every rule that rebuilds a scan or inserts or confirms a TopK, since it
     // matches on the scan's confirmed threshold and the final sort shape. See
-    // `crate::logs_scan::LogsPartitionTopK`.
-    builder = builder.with_physical_optimizer_rule(Arc::new(LogsPartitionTopK));
+    // `crate::logs_scan::LogsPartitionTopK`. `None` does not install it at
+    // all; `Some(max)` refuses a fetch above `max`, since every partition
+    // holds its own `k`-row heap.
+    if let Some(max_limit) = config.partition_topk_max_limit {
+        builder = builder.with_physical_optimizer_rule(Arc::new(LogsPartitionTopK::new(max_limit)));
+    }
     // Issue #2720: give an aggregate's output slices buffers of their own
     // before a `RepartitionExec` or a sort charges each slice the whole
     // materialized output. Appended after every rule above because each of
