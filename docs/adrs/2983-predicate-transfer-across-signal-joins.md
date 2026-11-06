@@ -1,7 +1,7 @@
 # ADR-2983: Predicate transfer across signal joins
 
 Status: Accepted (2026-10-15). Not implemented: no code before the gates in
-Sequencing are met.
+Sequencing are met. Stage 0 measured 2026-11-06 (Stage 0 amendment).
 Date: 2026-10-14
 Issue: #2983.
 Builds on: ADR-2904 (cross-signal SQL statements), ADR-2707 (exact-key
@@ -48,7 +48,9 @@ receives `Post`-phase filters in `handle_child_pushdown_result`
 (`crates/ravel-sql/src/logs_scan/mod.rs:2769`), answers `PushedDown::No` for
 every one, and adopts only a TopK threshold; its doc comment
 (`crates/ravel-sql/src/logs_scan/mod.rs:2765-2768`) names a join's filter as
-one it does nothing with. The spans scan implements no such hook.
+one it does nothing with. The spans scan implements no such hook. (Stage 0
+amendment: both citations have moved, and the logs scan still answers
+`PushedDown::No` there.)
 
 DataFusion's own gate for which joins push a filter
 (`allow_join_dynamic_filter_pushdown` on the hash join) admits a probe side
@@ -77,6 +79,10 @@ The receiving scan needs an arm that takes a set of keys. None exists:
 - ADR-2707 decision 7 ("Read-path wiring and statistics") adds a `KeyEquals`
   arm on the logs side and the KEY_IDX probe on the spans side. Both are
   equality lookups. Neither takes a set.
+
+(Stage 0 amendment: ADR-3692 decision 6 has since given both scans a set
+arm for a literal `IN` list. A join's dynamic filter still reaches none of
+them.)
 
 ### What is not known
 
@@ -314,7 +320,8 @@ This ADR is gated. No code lands until:
 2. Epic #2904 is closed: multi-signal statements run, per-scan attribution
    (ADR-2904 decision 5) and `stats.signals` (decision 7) are in place.
 3. The receiving key-set arm of decision 8 exists for the signal that
-   receives.
+   receives. (Stage 0 amendment: it exists for literal lists on both
+   signals; routing a dynamic filter into it is Stage 2's work.)
 
 Joins are not spill-eligible (ADR-0954, "Relationship to ADR-0013 and
 ADR-0102"), so a join over the memory budget fails with the typed memory
@@ -343,7 +350,8 @@ Stages:
 A figure outside its band is a miss, investigated before Stage 3 turns the
 switch on. A figure marked as set at Stage 0 or Stage 1 gets its number in
 that stage's pre-registration comment on the tracking issue, before the
-run.
+run. (Stage 0 amendment: the Stage 0 and Stage 1 figures below are now
+set.)
 
 | Figure | Expected band | Miss | Basis |
 |---|---|---|---|
@@ -414,3 +422,143 @@ join's probe does.
   defaults. A transfer-off session is configured as today.
 - No persistent format changes: no RSEG, RLOG or RSPAN layout, no protobuf
   schema, no commit token, no object key.
+
+## Amendment (issue #3708): Stage 0 baseline, and the receiving arm ADR-3692 landed
+
+<!-- amendment-applies: sections="What DataFusion 55.2 already does|What the receiving scans accept today|Sequencing|Pre-registered figures" pointer="Stage 0 amendment" -->
+
+Since this ADR was accepted, two things have moved. Stage 0 was measured,
+and the read side gained a set arm for literal lists. Decisions 1 to 10
+are unchanged. Transfer is still not implemented, and no switch exists yet.
+
+### The receiving arm exists for literal lists
+
+ADR-3692 decision 6 and its key set amendment (PR #3906) gave both
+receiving scans a set arm:
+
+- **Logs:** a top-level `column IN (...)` becomes `LogsPushdown::key_in`.
+  The column is a declared key-index column, or `trace_id` when the
+  declaration indexes it. The list is 1 to 1,024 distinct literals of
+  exactly the column's type (`crates/ravel-sql/src/logs_pushdown.rs:183`,
+  `key_in_list` at `:451`).
+- **Spans:** a `trace_id IN (...)` of 2 to 1,024 distinct ids becomes
+  `SpansPushdown::trace_ids` (`crates/ravel-sql/src/spans_pushdown.rs:68-75`).
+- **Hex ids:** `trace_id IN ('<32-hex>', ...)` now plans.
+  `TraceIdHexInListRule` rewrites the list before type coercion
+  (`crates/ravel-sql/src/trace_id_planner.rs:22-29`).
+- **Probe shape:** a set probe reads the KEY_IDX prefix, then each touched
+  bucket, or makes one ranged read over the touched span above 64 buckets.
+  An object every key is absent from is not opened. A scan with exactly
+  one key arm routes through the key-index leaves.
+
+That is Stage 1 for a set written in the statement. It is not yet the arm
+transfer needs. Decision 1's filter arrives as a hash-join dynamic filter
+through `handle_child_pushdown_result`, and the logs scan still answers
+`PushedDown::No` for every parent filter there
+(`crates/ravel-sql/src/logs_scan/mod.rs:3264`). Its doc comment, at
+`:3255-3263`, still names a join's filter as one it does nothing with.
+Stage 2 routes a dynamic `IN`-list filter into `key_in` and `trace_ids`.
+The arm's 1,024-key cap equals k (decision 5), so it never binds before k
+does.
+
+### Corrected citations
+
+The line references in Context were taken on 2026-10-14. On main 87eff26db
+they read:
+
+| Context cites | Now |
+|---|---|
+| `logs_scan/mod.rs:2769` (`handle_child_pushdown_result`) | `:3264`, still `PushedDown::No` for every parent filter |
+| `logs_scan/mod.rs:2765-2768` (its doc comment) | `:3255-3263` |
+| `trace_id_planner.rs:22-25` (`IN` lists never reach the planner) | `:22-29`, which names `TraceIdHexInListRule` as the path they take now |
+| `spans_pushdown.rs:61-66` (a `trace_id` disjunction refused) | `:61-75`: a disjunction of `=` is still refused; an `IN` list is carried |
+| `logs_pushdown.rs:334` (only `ts` extracts from the fixed columns) | `trace_id` now feeds `key_equals` (`key_equality`, `:716`) and `key_in` (`key_in_list`, `:451`) |
+| `logs_pushdown.rs:62-64` (`attrs['k'] IN` not extracted) | `:82-84`, still true |
+| `logs_pushdown.rs:102-103` (a declared `Str` or `Bytes` `IN` not extracted) | `:122-123` for POSTINGS, still true; a key-index column's list feeds `key_in` |
+
+The module comment at `logs_pushdown.rs:623` still says only `ts` extracts
+anything from the fixed columns. That is stale, and it is outside this
+amendment.
+
+Two consequences for Stage 2:
+
+- DataFusion builds the `IN`-list form only up to
+  `hash_join_inlist_pushdown_max_distinct_values`, 150 by default. A
+  transfer-on session must raise it to k, among the four options this ADR
+  already says it pins.
+- DataFusion rewrites a literal list of two or three values into `=`
+  disjuncts before the scan sees it, and neither arm carries a disjunction
+  (issue #3913). A dynamic filter is not a literal list, so this does not
+  reach transfer, but Stage 3 must not compare transfer against a two- or
+  three-key literal list.
+
+### Stage 0: the join baseline
+
+Stage 0 was measured in the Stage 1 run of ADR-3692. The run was box C,
+`investigations-20261106T154511Z-47463-23195`: main b54ecc52a, 20,000,000
+traces over 24 hours, on real S3 in us-east-1. Its pre-registration is
+https://github.com/NOFireAI/ravel/issues/3692#issuecomment-6688876402 and
+its result is
+https://github.com/NOFireAI/ravel/issues/3692#issuecomment-6698223574.
+
+The verified state, from the folded_leaves stamps:
+
+- the catalog was folded through watermark hour 498331;
+- the spans head holds one part of 800 entries, with a `trace_id` leaf of
+  20,000,000 entries and 0 uncovered;
+- every spans object carries KEY_IDX, version 1;
+- each call was cold, after a server restart and a page-cache drop.
+
+The statement was Journey C: `logs JOIN spans ON trace_id`, the build side
+the first K root spans of the failing hour. Transfer was absent. Each
+figure is from 20 cold calls, and all 20 gave the same counts:
+
+| Build side K | Scan | Objects opened | Requests (resolve, scan; probe and keyIndex 0) | Wire bytes | p50 s |
+|---|---|---|---|---|---|
+| 1, 102, 1,024, 10,240 | logs (probe side) | 548 of 548 | 545 (1, 544) | 3,806,990,963 | |
+| 1, 102, 1,024, 10,240 | spans (build side) | 8 of 44 | 12 (4, 8) | 51,364,567 | |
+| 1 | statement | 556 | 557 | 3,858,355,530 | 10.00 |
+| 102 | statement | 556 | 557 | 3,858,355,530 | 9.93 |
+| 1,024 | statement | 556 | 557 | 3,858,355,530 | 9.94 |
+| 10,240 | statement | 556 | 557 | 3,858,355,530 | 10.05 |
+
+Blocks are reported per statement, not per scan: 12,511 of 12,511 at every
+K. That is the block count `journey_b`, a logs-only statement over the
+same hour, scans, so the figure counts logs blocks. Mixed state: 601 requests
+and 3,877,200,781 B. Unfolded: 1,356 requests, 803 of them spans resolve
+GETs. Source for every figure:
+`s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl`.
+
+The headline is that the build side's size changes nothing. The logs scan
+reads every object and every block whether the join keeps 1 trace or
+10,240.
+
+### Stage 3 figures
+
+The receiving arm's own cost bounds what transfer can save. The same run
+measured it as literal `trace_id IN` lists on logs, folded with leaves.
+These are the "set at Stage 0" ratios, taken against the Journey C logs
+scan above (12,511 blocks, 3,806,990,963 B):
+
+| Receiving logs scan, transfer on against off | band | miss | source |
+|---|---|---|---|
+| blocks, K = 1 | at most 0.0013 of off (16 of 12,511, the 1-key list) | not fewer than off | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1`) |
+| wire bytes, K = 1 | at most 0.0013 of off (4,835,567 B) | over 0.01 of off | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1`) |
+| blocks, K = 102 | at most 0.20 of off (2,425 of 12,511 at 100 keys) | not fewer than off | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_100`) |
+| wire bytes, K = 102 | at most 0.28 of off (1,051,558,209 B at 100 keys) | over off | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_100`) |
+| blocks, K = 1,024 | at most 0.87 of off (10,780 of 12,511 at 1,000 keys) | not fewer than off | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1000`) |
+| wire bytes, K = 1,024 | at most 0.95 of off (3,607,235,510 B at 1,000 keys) | over off | s3://ravel-inv-3692-d-runs/investigations/runs/investigations-20261106T154511Z-47463-23195/out/calls.jsonl (`logs_trace_in_1000`) |
+| every figure, K = 10,240 | equal to off: above k, no transfer | any difference | predicted (decision 5) |
+| `keyIndex` requests, K at most k | at most the literal list of K keys, measured in the same Stage 3 run | over it | predicted; probe shape from `logs_trace_in_1` (2 leaf GETs), `_10` (11) and `_100` (1 leaf GET, part skipped by budget, then 1,041 tier-1 GETs) in calls.jsonl above |
+
+K = 102 and K = 1,024 are compared with the 100- and 1,000-key lists, the
+nearest sizes this run measured. Stage 3 runs literal lists of exactly
+102 and 1,024 keys beside the join, and judges each band against its own
+twin.
+
+One observation bears on k, and Stage 3 decides it. At 100 keys and above,
+the logs `trace_id` leaf, at 13 bits and 20,000,000 entries, is skipped by
+budget (`skippedByBudget` 1). The tier-1 probe then reads every object's
+prefix. At 1,000 keys the arm saves 5 % of the wire bytes on this corpus.
+If Stage 3 confirms this, k = 1,024 admits transfers that cost a reservation
+and buy little.
