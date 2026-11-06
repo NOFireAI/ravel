@@ -732,9 +732,9 @@ typed tenant (Context) is given up, and the logs-benchmark shape stores
 about 1.8% more at L1 from the level. The page choice adds 0.6% on the
 logs-benchmark shape; on this ADR's wide typed tenant its cost is not
 measured. Context prices the exhaustive post-zstd choice there at -6.5%
-page bytes, and ADR-3492's exit bound caps an `Estimated` object at 10%
-larger, so that tenant's cost from the page choice lies somewhere up to that
-bound. Readers are unaffected: every
+page bytes, so the cost there may be of that order. ADR-3492's 10% is an
+exit criterion measured on its ingest benchmark corpus, not a bound on this
+tenant, so no measured figure bounds it. Readers are unaffected: every
 encoding `Estimated` picks is one decision 4 already lists, and a reader
 decodes any level the same way, so no format version changes and L1
 objects already written keep the level and encodings they were written

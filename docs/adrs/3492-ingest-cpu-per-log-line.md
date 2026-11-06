@@ -682,5 +682,6 @@ What this changes in D0 and the Consequences: D1's exit bound (an
 rewrote ingest objects with `Exhaustive`. Compaction now writes `Estimated`
 as well, so the bound is permanent for every object, and D0's compaction
 check no longer limits how long the cost lasts. On the logs-benchmark
-hour the measured L1 cost is 0.6%; the 10% exit bound is the ceiling
-elsewhere.
+hour the measured L1 cost is 0.6%. The 10% exit bound was measured on the
+ingest benchmark corpus, so it is not a ceiling on other tenants; their L1
+cost from `Estimated` is not measured.

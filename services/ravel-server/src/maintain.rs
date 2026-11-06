@@ -2120,6 +2120,7 @@ pub async fn run_discovery_cycle<C: Clock + Clone + 'static>(
         total.already_done += report.already_done;
         total.not_sealed += report.not_sealed;
         total.held_out_of_window += report.held_out_of_window;
+        total.geometry_unsupported += report.geometry_unsupported;
         total.skipped_terminal += report.skipped_terminal;
         total.claim_skipped += report.claim_skipped;
         total.claim_cancelled += report.claim_cancelled;
@@ -2765,6 +2766,9 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                         // Buckets held for an input outside this build's
                         // reader window (ADR-2708 D5b); retried every tick.
                         held_out_of_window = report.held_out_of_window,
+                        // Buckets refused for their cursor merge geometry
+                        // (ADR-3853 D0); the memo skips them until restart.
+                        geometry_unsupported = report.geometry_unsupported,
                         skipped_terminal = report.skipped_terminal,
                         // Buckets another attempt holds the claim on, and runs
                         // this process cancelled because its own claim was
@@ -2788,6 +2792,7 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                     total.already_done += report.already_done;
                     total.not_sealed += report.not_sealed;
                     total.held_out_of_window += report.held_out_of_window;
+                    total.geometry_unsupported += report.geometry_unsupported;
                     total.skipped_terminal += report.skipped_terminal;
                     total.claim_skipped += report.claim_skipped;
                     total.claim_cancelled += report.claim_cancelled;
@@ -3047,6 +3052,7 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
                 compacted = report.compacted,
                 already_done = report.already_done,
                 held_out_of_window = report.held_out_of_window,
+                geometry_unsupported = report.geometry_unsupported,
                 "maintenance: query-audit compaction pass complete"
             ),
             Err(err) => tracing::warn!(
@@ -6922,6 +6928,87 @@ mod tests {
         assert_eq!(report.compacted, 0, "the scan stops: {report:?}");
         assert_eq!(held_delta, 0, "nothing held on the rendered counter");
         assert_eq!(stalled, 1, "a failed scan stalls the unit");
+    }
+
+    /// The rendered `ravel_maintain_compaction_refused_total` geometry sample.
+    fn refused_geometry_sample(body: &str) -> u64 {
+        let prefix =
+            "ravel_maintain_compaction_refused_total{mode=\"maintain\",reason=\"geometry\"} ";
+        let samples: Vec<u64> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix(prefix))
+            .map(|value| value.parse().expect("integer sample"))
+            .collect();
+        assert_eq!(samples.len(), 1, "exactly one sample:\n{body}");
+        samples[0]
+    }
+
+    /// ADR-3853 D0 on the server tick: two RLOG inputs whose one block each
+    /// carries 20 streams, under a ceiling that forces cursor mode, predict
+    /// 800 decoded rows for 40 records. The tick refuses the bucket, the
+    /// rendered `reason="geometry"` counter moves by exactly one, the unit
+    /// does not stall, and the next tick on the same memo leaves it alone.
+    #[tokio::test]
+    async fn maintain_tick_refuses_a_many_stream_cursor_bucket_once() {
+        const GEOMETRY_HOUR: u32 = 1;
+        let store = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        for input in 0..2u32 {
+            let ts = i64::from(GEOMETRY_HOUR) * TEST_NS_PER_HOUR + 1_000 + i64::from(input);
+            let records: Vec<_> = (0..20)
+                .map(|stream| subject_log_record(stream, ts, "a"))
+                .collect();
+            publish_log_l0(
+                &store,
+                &tenant,
+                Uuid::from_u128(0x3870_0000 + u128::from(input)),
+                GEOMETRY_HOUR,
+                &records,
+                false,
+            )
+            .await;
+        }
+        let config = CompactorConfig {
+            merge_resident_ceiling_bytes: Some(0),
+            ..CompactorConfig::default()
+        };
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(1);
+        let worker = solo_worker();
+        let live_set = worker.solo_live_set();
+        let mut memo = MaintainMemo::with_default_interval();
+        let clock = FixedClock::new(i64::from(GEOMETRY_HOUR + 3) * TEST_NS_PER_HOUR);
+        let mut deltas = Vec::new();
+        for _ in 0..2 {
+            let before = refused_geometry_sample(&rendered_metrics(&safety));
+            let report = run_tick_with_clock(
+                &clock,
+                &store,
+                &tenant,
+                &config,
+                &RetentionConfig::default(),
+                1,
+                &mut memo,
+                &safety,
+                &ownership,
+                &worker,
+                &live_set,
+            )
+            .await;
+            let after = refused_geometry_sample(&rendered_metrics(&safety));
+            assert_eq!(report.compacted, 0, "{report:?}");
+            deltas.push((report.geometry_unsupported, after - before));
+        }
+        assert_eq!(
+            deltas,
+            vec![(1, 1), (0, 0)],
+            "refused once and counted once, then left alone by the memo"
+        );
+        assert_eq!(
+            ownership.units_stalled(),
+            0,
+            "a refusal is not a failed scan"
+        );
     }
 
     /// Submit a logs erasure request for [`TEST_ERASED_SUBJECT`] acknowledged
