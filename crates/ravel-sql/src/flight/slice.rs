@@ -274,12 +274,13 @@ mod tests {
             .encode(&slice_ticket(), TicketSurface::Slice)
             .expect("encode");
         let mut body = encoded[..encoded.len() - 32].to_vec();
-        body[4] = crate::flight_ticket::VERSION_KEY_EQUALS + 1;
+        let newer = crate::flight_ticket::VERSION_KEY_SET + 1;
+        body[4] = newer;
         let tag = blake3::keyed_hash(keys.mint_key(TicketSurface::Slice), &body);
         body.extend_from_slice(tag.as_bytes());
         assert_eq!(
             keys.decode(&body, TicketSurface::Slice),
-            Err(FlightTicketError::UnsupportedVersion(12))
+            Err(FlightTicketError::UnsupportedVersion(newer))
         );
         assert_eq!(
             verify_slice(&keys, &body, NOW_NS),
