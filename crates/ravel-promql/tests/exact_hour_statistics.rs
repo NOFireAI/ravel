@@ -531,12 +531,10 @@ fn telescoped(hours: &[FloatHour], is_counter: bool) -> f64 {
             } else {
                 h.first.1 - prev
             };
-            inc = gap + inc;
+            inc += gap;
         }
-        if is_counter {
-            if let Some(c) = h.correction {
-                inc += c;
-            }
+        if is_counter && let Some(c) = h.correction {
+            inc += c;
         }
         total += inc;
     }
@@ -1085,7 +1083,7 @@ fn chan_variance(hours: &[(f64, f64, f64)]) -> f64 {
     for &(nb, mb, m2b) in &hours[1..] {
         let total = n + nb;
         let d = mb - mean;
-        mean = mean + d * nb / total;
+        mean += d * nb / total;
         m2 = m2 + m2b + d * d * n * nb / total;
         n = total;
     }
