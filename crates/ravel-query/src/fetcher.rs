@@ -6080,11 +6080,9 @@ mod tests {
     async fn sparse_l0_two_step_fetch_meets_the_per_segment_bound() {
         let (bytes, tenant_hash, seg_ref) =
             write_sparse_labelled_segment(4096, 32, &[("job", "api")]).await;
-        let name = LabelMatcher::regex(
-            "__name__",
-            "sparse_metric_(100|1000|2000|3000)".to_string(),
-        )
-        .expect("regex");
+        let name =
+            LabelMatcher::regex("__name__", "sparse_metric_(100|1000|2000|3000)".to_string())
+                .expect("regex");
         for (job, want_series, want_gets, want_pruned) in [
             ("api", 4, MAX_GETS_PER_L0_SEGMENT_FETCH, 0),
             ("absent", 0, 3, 1),
@@ -6096,9 +6094,7 @@ mod tests {
                 .with_suffix_len(16)
                 .with_coalesce_gap(0);
             let accounting = PhaseAccounting::new();
-            accounting
-                .dictionary_probe()
-                .arm([&matchers[..]], 8, false);
+            accounting.dictionary_probe().arm([&matchers[..]], 8, false);
             let (soa, _stats) = fetcher
                 .fetch_soa_phase_accounted(tenant_hash, &seg_ref, &matchers, &accounting)
                 .await
@@ -6157,7 +6153,10 @@ mod tests {
             )
             .await
             .expect("decode sparse catalog");
-        assert!(decoded.entries.is_empty(), "the dictionary drops the object");
+        assert!(
+            decoded.entries.is_empty(),
+            "the dictionary drops the object"
+        );
         assert_eq!(metrics.snapshot().get.calls, gets_before, "no GET");
         assert_eq!(
             gates.stats(),

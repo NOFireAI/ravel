@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::body::Body;
-use bytes::Bytes;
 use axum::http::{Request, StatusCode};
+use bytes::Bytes;
 use ravel_catalog::{
     Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
     DEFAULT_MAX_FLUSH_LIFETIME_NS,
@@ -25,12 +25,12 @@ use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_object_store::fault::Occurrence;
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
-use ravel_object_store::memory::MemoryStore;
 use ravel_promql::Value;
 use ravel_query::http::{AppState, StaticBearerTokenResolver, router};
 use ravel_query::{EngineConfig, QueryEngine, QueryError, QueryStats};
@@ -105,7 +105,16 @@ async fn publish_sparse(
     base_ts: i64,
     holds_target: bool,
 ) -> Published {
-    publish_sparse_named(store, tenant_id, object, hour, base_ts, holds_target, METRIC).await
+    publish_sparse_named(
+        store,
+        tenant_id,
+        object,
+        hour,
+        base_ts,
+        holds_target,
+        METRIC,
+    )
+    .await
 }
 
 /// [`publish_sparse`] with every series named `metric`.
@@ -543,8 +552,16 @@ async fn name_only_statement_gates_the_segments_the_postings_did_not_filter() {
             "unrelated_metric"
         };
         recent.push(
-            publish_sparse_named(store.as_ref(), &tid, object, hour + 1, base_ts, false, metric)
-                .await,
+            publish_sparse_named(
+                store.as_ref(),
+                &tid,
+                object,
+                hour + 1,
+                base_ts,
+                false,
+                metric,
+            )
+            .await,
         );
     }
     let (hold, miss) = recent.split_at(RECENT_HOLD as usize);
