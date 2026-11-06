@@ -154,6 +154,7 @@ use crate::access_intent::{
 };
 use crate::alerts_provider::AlertsTableProvider;
 use crate::audit_provider::AuditTableProvider;
+use crate::bounded_topk;
 use crate::clock::SystemClock;
 use crate::config::SqlConfig;
 use crate::cost::{estimate_logs_cost, estimate_metrics_cost, estimate_spans_cost};
@@ -6947,14 +6948,26 @@ fn aggregate_functions_are_spill_families(aggregate: &Aggregate) -> bool {
 
 /// Whether `sort`, with `fetch` as its row limit (its own, or that of the
 /// `Limit` above it, since this runs before limit pushdown), has the logical
-/// shape of a top-k the bounded aggregate (`crate::bounded_topk`) bounds. Each
-/// conjunct is one of that rule's refusals, restated on the logical plan
-/// because the rule reads the physical one:
+/// shape of a top-k the bounded aggregate (`crate::bounded_topk`) bounds.
+///
+/// Two conjuncts call the rule's own helpers, so the two cannot disagree on
+/// them:
+///
+/// - the ceiling: [`bounded_topk::limit_within_ceiling`] on `fetch` and
+///   `max_limit`.
+/// - the types: [`bounded_topk::topk_types_admitted`] on the group key's type
+///   and the `min`/`max` output type, both resolved on the logical plan. The
+///   key type first goes through [`grouped_key_type`], a restatement of the
+///   dictionary-to-`Utf8View` cast the physical plan applies before the rule
+///   reads it.
+///
+/// The rest are the rule's structural refusals, restated on the logical plan
+/// because the rule reads the physical one. Agreement on them is what
+/// `the_bounded_topk_candidate_agrees_with_the_rule` checks, case by case:
 ///
 /// - `max_limit` ([`SqlConfig::bounded_topk_max_limit`]) is `Some`: with
 ///   `None` the rule is not installed.
-/// - `fetch` is `Some` and at most `max_limit`: no fetch is no top-k, and the
-///   rule refuses a fetch above its ceiling.
+/// - `fetch` is `Some`: no fetch is no top-k.
 /// - one sort term, and it is a column.
 /// - the `Sort`'s input is the aggregate, or a `Projection` directly over it
 ///   in which that column is a plain column of the aggregate. A `HAVING`
@@ -6971,7 +6984,7 @@ fn is_bounded_topk_candidate(sort: &Sort, fetch: Option<usize>, max_limit: Optio
     let (Some(fetch), Some(max_limit)) = (fetch, max_limit) else {
         return false;
     };
-    if fetch > max_limit {
+    if !bounded_topk::limit_within_ceiling(fetch, max_limit) {
         return false;
     }
     let [term] = sort.expr.as_slice() else {
@@ -7034,7 +7047,31 @@ fn is_bounded_topk_candidate(sort: &Sort, fetch: Option<usize>, max_limit: Optio
     let Ok(index) = aggregate.schema.index_of_column(aggregate_column) else {
         return false;
     };
-    index >= aggregate.group_expr.len() && term.asc != descending
+    if index < aggregate.group_expr.len() || term.asc == descending {
+        return false;
+    }
+    let Ok(key_type) = group_key.get_type(aggregate.input.schema()) else {
+        return false;
+    };
+    let value_type = aggregate.schema.field(index).data_type();
+    bounded_topk::topk_types_admitted(&grouped_key_type(key_type), value_type)
+}
+
+/// The type the bounded aggregate sees for a group key declared as
+/// `data_type`. `crate::group_keys::DictionaryGroupKeysAsViews` runs first and
+/// groups a dictionary-encoded string key as `Utf8View`.
+fn grouped_key_type(
+    data_type: datafusion::arrow::datatypes::DataType,
+) -> datafusion::arrow::datatypes::DataType {
+    use datafusion::arrow::datatypes::DataType;
+    match &data_type {
+        DataType::Dictionary(_, value)
+            if matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            DataType::Utf8View
+        }
+        _ => data_type,
+    }
 }
 
 /// [`tie_order_edit`] for a `Sort` whose aggregate has only non-float GROUP BY
@@ -7067,8 +7104,9 @@ fn total_tie_order_edit(
 
 /// Whether `plan` has a `Sort` [`rewrite_sort_group_key_tie_order`] edits:
 /// one [`total_tie_order_edit`] admits whose GROUP BY keys are not yet all
-/// sort terms. Shape, key types, function names and the nullability of a lone
-/// `min`/`max` argument column only, never argument types: the plan this
+/// sort terms. Shape, key types and function names only, plus, for a lone
+/// `min`/`max`, the nullability of its argument column and its result type
+/// ([`is_bounded_topk_candidate`]). No other argument type: the plan this
 /// reads has not been through the analyzer that coerces them.
 fn plan_has_tie_order_edit(plan: &LogicalPlan, max_limit: Option<usize>) -> bool {
     has_tie_order_edit_under(plan, None, max_limit)
@@ -9663,18 +9701,22 @@ pub(crate) mod tests {
             || plan.children().into_iter().any(has_bounded_aggregate)
     }
 
-    /// `is_bounded_topk_candidate` restates `crate::bounded_topk`'s gate on the
-    /// logical plan, since that rule reads the physical one. Every case of the
-    /// two tests above, and each case below, is planned through a session
-    /// built with that case's `bounded_topk_max_limit`, and the restatement
-    /// must agree with whether the rule bounded the aggregate: a nullable
-    /// `min` argument, a `LIMIT` above the ceiling (directly, or through an
-    /// `OFFSET` the pushdown adds to the `Sort`'s fetch), and a session with
-    /// no ceiling, where the rule is not installed, are each refused.
+    /// `is_bounded_topk_candidate` evaluates `crate::bounded_topk`'s gate on
+    /// the logical plan, since that rule reads the physical one. Every case of
+    /// the two tests above, and each case below, is planned through a session
+    /// built with that case's `bounded_topk_max_limit`, and the candidate
+    /// check must agree with whether the rule bounded the aggregate: a
+    /// nullable `min` argument, a `LIMIT` above the ceiling (directly, or
+    /// through an `OFFSET` the pushdown adds to the `Sort`'s fetch), and a
+    /// session with no ceiling, where the rule is not installed, are each
+    /// refused. Then every pairing of a [`TOPK_KEY_TYPES`] group key with a
+    /// [`TOPK_VALUE_TYPES`] argument, under `min ... ASC LIMIT 25` and
+    /// `max ... DESC LIMIT 25`, must agree too.
     ///
     /// Prove-the-test: drop the nullability check from
     /// `is_bounded_topk_candidate` and the nullable `min(s)` row fails; drop
-    /// its ceiling check and the `LIMIT 1025` row fails.
+    /// its ceiling check and the `LIMIT 1025` row fails; drop its
+    /// `topk_types_admitted` check and the dictionary-key rows fail.
     #[tokio::test]
     async fn the_bounded_topk_candidate_agrees_with_the_rule() {
         let refused = bounded_topk_refused();
@@ -9714,36 +9756,169 @@ pub(crate) mod tests {
                 Some(served),
                 "{sql} under {max_limit:?}"
             );
-            let q33: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(q33_schema()));
-            let tables = vec![SessionTable::Parquet(ParquetSession {
-                tables: vec![("q33".to_string(), q33)],
-                store: Arc::new(ravel_parquet::TenantParquetStore::new(TenantHash(
-                    [105u8; 16],
-                ))),
-            })];
-            let ctx = build_session_with_tables(
-                &SqlConfig {
-                    bounded_topk_max_limit: max_limit,
-                    ..SqlConfig::default()
-                },
-                Arc::new(UnboundedMemoryPool::default()),
-                tables,
-                false,
-                SpillDecision::Disabled,
-                &SessionPrincipal::without_capabilities(TenantHash([105u8; 16])),
-            )
-            .expect("the session builds");
-            let physical = ctx
-                .state()
-                .create_physical_plan(&plan)
-                .await
-                .expect("the plan lowers");
             assert_eq!(
-                has_bounded_aggregate(&physical),
+                rule_bounds("q33", q33_schema(), &plan, max_limit).await,
                 served,
                 "{sql} under {max_limit:?}"
             );
         }
+
+        let mut outcomes = [0usize; 2];
+        let mut disagreements = Vec::new();
+        for (key, _) in TOPK_KEY_TYPES {
+            for (value, _) in TOPK_VALUE_TYPES {
+                for (function, direction) in [("min", "ASC"), ("max", "DESC")] {
+                    let sql = format!(
+                        "SELECT k_{key}, {function}(v_{value}) AS m FROM typed \
+                         GROUP BY k_{key} ORDER BY m {direction} LIMIT 25"
+                    );
+                    let plan = typed_plan(&sql).await;
+                    let candidate = first_sort_is_candidate(&plan, None, DEFAULT_TOPK_MAX)
+                        .expect("the plan has a Sort");
+                    let bounded =
+                        rule_bounds("typed", typed_schema(), &plan, DEFAULT_TOPK_MAX).await;
+                    if candidate != bounded {
+                        disagreements.push(format!("{sql}: candidate {candidate}, rule {bounded}"));
+                    }
+                    outcomes[usize::from(bounded)] += 1;
+                }
+            }
+        }
+        assert!(disagreements.is_empty(), "{disagreements:#?}");
+        // Both answers occur, so the matrix cannot pass by never reaching
+        // the rule's type refusal, or by reaching nothing else.
+        assert!(outcomes[0] > 0 && outcomes[1] > 0, "{outcomes:?}");
+    }
+
+    /// Whether `crate::bounded_topk` bounds an aggregate in `plan`, lowered
+    /// through a session with `table` as an empty table of `schema` and
+    /// `max_limit` as its `bounded_topk_max_limit`.
+    async fn rule_bounds(
+        table: &str,
+        schema: Arc<datafusion::arrow::datatypes::Schema>,
+        plan: &LogicalPlan,
+        max_limit: Option<usize>,
+    ) -> bool {
+        let provider: Arc<dyn TableProvider> = Arc::new(EmptyTable::new(schema));
+        let tables = vec![SessionTable::Parquet(ParquetSession {
+            tables: vec![(table.to_string(), provider)],
+            store: Arc::new(ravel_parquet::TenantParquetStore::new(TenantHash(
+                [105u8; 16],
+            ))),
+        })];
+        let ctx = build_session_with_tables(
+            &SqlConfig {
+                bounded_topk_max_limit: max_limit,
+                ..SqlConfig::default()
+            },
+            Arc::new(UnboundedMemoryPool::default()),
+            tables,
+            false,
+            SpillDecision::Disabled,
+            &SessionPrincipal::without_capabilities(TenantHash([105u8; 16])),
+        )
+        .expect("the session builds");
+        let physical = ctx
+            .state()
+            .create_physical_plan(plan)
+            .await
+            .expect("the plan lowers");
+        has_bounded_aggregate(&physical)
+    }
+
+    /// Group-key types of the agreement matrix: the types a declared logs
+    /// column takes (`Str` is a `Dictionary(Int32, Utf8)`, `Bool` a
+    /// `Boolean`, `Bytes` a `Binary`), plus `Int64` and plain `Utf8`.
+    const TOPK_KEY_TYPES: [(&str, fn() -> datafusion::arrow::datatypes::DataType); 5] = {
+        use datafusion::arrow::datatypes::DataType;
+        [
+            ("int64", || DataType::Int64),
+            ("utf8", || DataType::Utf8),
+            ("dict", || {
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+            }),
+            ("bool", || DataType::Boolean),
+            ("bin", || DataType::Binary),
+        ]
+    };
+
+    /// `min`/`max` argument types of the agreement matrix: the key types plus
+    /// a timestamp.
+    const TOPK_VALUE_TYPES: [(&str, fn() -> datafusion::arrow::datatypes::DataType); 6] = {
+        use datafusion::arrow::datatypes::{DataType, TimeUnit};
+        [
+            ("int64", || DataType::Int64),
+            ("utf8", || DataType::Utf8),
+            ("dict", || {
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
+            }),
+            ("bool", || DataType::Boolean),
+            ("bin", || DataType::Binary),
+            ("ts", || DataType::Timestamp(TimeUnit::Nanosecond, None)),
+        ]
+    };
+
+    /// One non-nullable `k_<type>` column per [`TOPK_KEY_TYPES`] entry and
+    /// one `v_<type>` column per [`TOPK_VALUE_TYPES`] entry.
+    fn typed_schema() -> Arc<datafusion::arrow::datatypes::Schema> {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let keys = TOPK_KEY_TYPES
+            .iter()
+            .map(|(name, data_type)| Field::new(format!("k_{name}"), data_type(), false));
+        let values = TOPK_VALUE_TYPES
+            .iter()
+            .map(|(name, data_type)| Field::new(format!("v_{name}"), data_type(), false));
+        Arc::new(Schema::new(keys.chain(values).collect::<Vec<_>>()))
+    }
+
+    async fn typed_plan(sql: &str) -> LogicalPlan {
+        let schemas = vec![("typed".to_string(), typed_schema())];
+        eviction_test_executor()
+            .sql_classification_plan(TenantHash([105u8; 16]), sql, &[], Some(&schemas))
+            .await
+            .expect("the statement plans")
+    }
+
+    /// A lone `min` grouped by a dictionary-encoded key, the type of a
+    /// declared `Str` logs column, over a `Boolean` or `Binary` argument (a
+    /// declared `Bool` or `Bytes` column): the bounded aggregate refuses the
+    /// value type, so the single-term top-k gets the group key as a tiebreak
+    /// and becomes spill-eligible. The same key under a `min` of a plain
+    /// `Utf8` column is one the rule bounds, since the key reaches it as
+    /// `Utf8View`, and keeps its single sort term.
+    ///
+    /// Prove-the-test: drop the `topk_types_admitted` check from
+    /// `is_bounded_topk_candidate` and the `Boolean` and `Binary` plans read
+    /// no tie-order edit; drop the `grouped_key_type` mapping and the
+    /// `min(v_utf8)` plan reads one.
+    #[tokio::test]
+    async fn a_dictionary_key_min_top_k_gets_the_tiebreak() {
+        for value in ["v_bool", "v_bin"] {
+            let plan = typed_plan(&format!(
+                "SELECT k_dict, min({value}) AS m FROM typed GROUP BY k_dict ORDER BY m LIMIT 25"
+            ))
+            .await;
+            assert!(
+                !plan_is_spill_eligible(&plan),
+                "{value}: ORDER BY m alone ties"
+            );
+            assert!(plan_has_tie_order_edit(&plan, DEFAULT_TOPK_MAX), "{value}");
+            let rewritten = rewrite_sort_group_key_tie_order(plan, DEFAULT_TOPK_MAX)
+                .expect("the rewrite applies");
+            assert_eq!(
+                sort_terms(&rewritten),
+                vec![term(None, "m", true), term(Some("typed"), "k_dict", true)],
+                "{value}"
+            );
+            assert!(plan_is_spill_eligible(&rewritten), "{value}");
+        }
+
+        let served = typed_plan(
+            "SELECT k_dict, min(v_utf8) AS m FROM typed GROUP BY k_dict ORDER BY m LIMIT 25",
+        )
+        .await;
+        assert!(!plan_has_tie_order_edit(&served, DEFAULT_TOPK_MAX));
+        assert!(rule_bounds("typed", typed_schema(), &served, DEFAULT_TOPK_MAX).await);
     }
 
     /// An `ORDER BY` over a subquery puts a second projection (and the
