@@ -982,6 +982,14 @@ pub fn label_dict_holds_all(
 ) -> Result<bool, SegmentError> {
     let section = find_section(footer, section_kind::LABEL_DICT)
         .ok_or(SegmentError::MissingSection("LABEL_DICT"))?;
+    // The same section lookups `decode_chunked` makes before it reads the
+    // dictionary, so a footer missing one of them is the same typed error on
+    // both paths rather than a verdict here.
+    find_section(footer, section_kind::SERIES_IDS)
+        .ok_or(SegmentError::MissingSection("SERIES_IDS"))?;
+    find_section(footer, section_kind::SERIES_IDX).ok_or(SegmentError::SparseSectionsIncomplete)?;
+    find_section(footer, section_kind::SERIES_META_CHUNKS)
+        .ok_or(SegmentError::SparseSectionsIncomplete)?;
     let dict_bytes = decode_section_bytes(section, label_dict_stored, limits)?;
     let dict_index = index_label_dict(&dict_bytes)?;
     Ok(resolve_equals(&dict_bytes, &dict_index, equals).is_some())
