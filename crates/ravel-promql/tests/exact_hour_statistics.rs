@@ -13,7 +13,9 @@
 #![allow(clippy::expect_used)]
 
 use ravel_promql::Evaluator;
-use ravel_promql::histogram::{FloatHistogram, ResetHint, Span, histogram_quantile};
+use ravel_promql::histogram::{
+    CUSTOM_BUCKETS_SCALE, FloatHistogram, ResetHint, Span, histogram_quantile,
+};
 use ravel_promql::testsource::TestSource;
 
 const MIN_NS: i64 = 60_000_000_000;
@@ -201,6 +203,20 @@ fn float_fixtures() -> Vec<Fixture> {
             name: "two_resets_one_hour",
             samples: two_resets_samples(),
         },
+        Fixture {
+            // The window's first pair is a reset across the 60m boundary, with
+            // a second reset inside (60m,120m].
+            name: "reset_at_window_start",
+            samples: at(&[
+                (50, 30.0),
+                (65, 2.0),
+                (80, 5.5),
+                (100, 9.1),
+                (118, 0.3),
+                (125, 4.4),
+                (170, 7.7),
+            ]),
+        },
     ]
 }
 
@@ -385,6 +401,10 @@ enum Combine {
     /// summed (telescoped); for `count_over_time`, the hour counts summed as
     /// `f64`.
     Reassociate,
+    /// Mutant (a), second form, for `rate`/`increase`: every reset correction,
+    /// boundary and in-hour, summed first in time order, and that total added
+    /// once to last minus first.
+    CorrectionsOnce,
     /// `min`/`max` combined under `f64::total_cmp`, the ordering ADR-0103's
     /// amendment excluded from pushdown.
     TotalOrder,
@@ -494,6 +514,8 @@ fn combine_float(f: Float, hours: &[FloatHour], w: Window, how: Combine) -> Opti
             let n: usize = hours.iter().map(|h| h.n).sum();
             let result = if how == Combine::Reassociate {
                 telescoped(hours, is_counter)
+            } else if how == Combine::CorrectionsOnce {
+                corrections_once(hours, is_counter)
             } else {
                 let mut result = last.1 - first.1;
                 if is_counter {
@@ -539,6 +561,33 @@ fn telescoped(hours: &[FloatHour], is_counter: bool) -> f64 {
         total += inc;
     }
     total
+}
+
+/// Mutant (a), second form: last minus first, plus the total of every reset
+/// correction in the window.
+fn corrections_once(hours: &[FloatHour], is_counter: bool) -> f64 {
+    let first = hours[0].first.1;
+    let mut result = hours[hours.len() - 1].last.1 - first;
+    if !is_counter {
+        return result;
+    }
+    if first < 0.0 {
+        result += 0.0;
+    }
+    let mut total: Option<f64> = None;
+    for (k, h) in hours.iter().enumerate() {
+        if k > 0 && h.first.1 < hours[k - 1].last.1 {
+            let a = hours[k - 1].last.1;
+            total = Some(total.map_or(a, |t| t + a));
+        }
+        if let Some(c) = h.correction {
+            total = Some(total.map_or(c, |t| t + c));
+        }
+    }
+    if let Some(t) = total {
+        result += t;
+    }
+    result
 }
 
 /// The boundary extrapolation of `extrapolated_rate` (`functions/rate.rs`),
@@ -814,8 +863,9 @@ fn present_over_time_rejects_counted_staleness_marker() {
 #[test]
 fn absent_over_time_exact_from_hour_presence() {
     // Empty windows: the marker-only one on `staleness`, and the same
-    // interval on `signed_zero`, which has no sample there.
-    assert_eq!(assert_float_row_exact(Float::Absent, exact_everywhere), 2);
+    // interval on `signed_zero` and `reset_at_window_start`, which have no
+    // sample there.
+    assert_eq!(assert_float_row_exact(Float::Absent, exact_everywhere), 3);
 }
 
 #[test]
@@ -1010,6 +1060,54 @@ fn rate_rejects_telescoped_hour_sum() {
     );
     assert_eq!(expected, Some(0x3f82_f5a2_c8f3_c629));
     assert_eq!(wrong, Some(0x3f82_f5a2_c8f3_c628));
+}
+
+#[test]
+fn increase_rejects_corrections_summed_once() {
+    let (expected, wrong) = assert_rejects(
+        Float::Increase,
+        "reset_at_window_start",
+        "(0m,180m]",
+        Stale::Drop,
+        Combine::CorrectionsOnce,
+    );
+    // Before extrapolation: (7.7 - 30.0) + 30.0 + 9.1 is 0x4030cccccccccccc,
+    // (7.7 - 30.0) + (30.0 + 9.1) is 0x4030cccccccccccd.
+    assert_eq!(expected, Some(0x4033_9999_9999_9999));
+    assert_eq!(wrong, Some(0x4033_9999_9999_999a));
+}
+
+#[test]
+fn rate_rejects_corrections_summed_once() {
+    let (expected, wrong) = assert_rejects(
+        Float::Rate,
+        "reset_at_window_start",
+        "(0m,180m]",
+        Stale::Drop,
+        Combine::CorrectionsOnce,
+    );
+    assert_eq!(expected, Some(0x3f5d_bbe2_91c9_89d2));
+    assert_eq!(wrong, Some(0x3f5d_bbe2_91c9_89d3));
+}
+
+#[test]
+fn delta_corrections_summed_once_is_the_documented_combination() {
+    // `delta` adds no reset correction, so the second form of mutant (a) is
+    // the documented combination itself and has nothing to reject.
+    for fx in float_fixtures() {
+        for &w in WINDOWS {
+            assert_eq!(
+                bits(combined(
+                    Float::Delta,
+                    &fx,
+                    w,
+                    Stale::Drop,
+                    Combine::CorrectionsOnce
+                )),
+                bits(combined(Float::Delta, &fx, w, Stale::Drop, Combine::Exact)),
+            );
+        }
+    }
 }
 
 #[test]
@@ -1345,9 +1443,21 @@ fn hist_hours(fx: &HistFixture, w: Window) -> Vec<HistHour> {
         .collect()
 }
 
+fn add_to(total: Option<FloatHistogram>, h: FloatHistogram) -> FloatHistogram {
+    match total {
+        None => h,
+        Some(mut t) => {
+            t.add_assign(&h);
+            t
+        }
+    }
+}
+
 /// The windowed reduction of `histogram_rate` plus the extrapolation factor of
-/// `histogram_extrapolated_rate`, rebuilt from the hour statistics.
-fn combine_hist(f: Hist, hours: &[HistHour], w: Window) -> Option<f64> {
+/// `histogram_extrapolated_rate`, rebuilt from the hour statistics. `how` is
+/// `Exact`, or one of the two forms of mutant (a): `Reassociate` (telescoped)
+/// or `CorrectionsOnce`.
+fn combine_hist(f: Hist, hours: &[HistHour], w: Window, how: Combine) -> Option<f64> {
     let first = &hours.first()?.first;
     let last = &hours.last()?.last;
     let n: usize = hours.iter().map(|h| h.n).sum();
@@ -1355,22 +1465,57 @@ fn combine_hist(f: Hist, hours: &[HistHour], w: Window) -> Option<f64> {
         return None;
     }
     let scale = hours.iter().map(|h| h.min_scale).min()?;
-    let mut reduced = last.1.copy_to_scale(scale);
-    reduced.sub_assign(&first.1.copy_to_scale(scale));
-    for (k, h) in hours.iter().enumerate() {
-        if k > 0 {
-            let prev = &hours[k - 1].last.1;
-            if h.first.1.detect_reset(prev) {
-                reduced.add_assign(&prev.copy_to_scale(scale));
+    let mut reduced = if how == Combine::Reassociate {
+        telescoped_hist(hours, scale)?
+    } else {
+        let mut reduced = last.1.copy_to_scale(scale);
+        reduced.sub_assign(&first.1.copy_to_scale(scale));
+        let mut once: Option<FloatHistogram> = None;
+        for (k, h) in hours.iter().enumerate() {
+            let boundary = (k > 0 && h.first.1.detect_reset(&hours[k - 1].last.1))
+                .then(|| hours[k - 1].last.1.copy_to_scale(scale));
+            let in_hour = h.correction.as_ref().map(|c| c.copy_to_scale(scale));
+            for c in boundary.into_iter().chain(in_hour) {
+                if how == Combine::CorrectionsOnce {
+                    once = Some(add_to(once, c));
+                } else {
+                    reduced.add_assign(&c);
+                }
             }
         }
-        if let Some(c) = &h.correction {
-            reduced.add_assign(&c.copy_to_scale(scale));
+        if let Some(t) = once {
+            reduced.add_assign(&t);
         }
-    }
+        reduced
+    };
     reduced.counter_reset_hint = ResetHint::Gauge;
     reduced.mul(histogram_factor(first.0, last.0, n, w, f != Hist::Count));
     Some(f.read(&reduced))
+}
+
+/// Mutant (a) for the histogram rows: each hour's own increase plus the gap
+/// from the previous hour, summed across hours.
+fn telescoped_hist(hours: &[HistHour], scale: i32) -> Option<FloatHistogram> {
+    let mut total = None;
+    for (k, h) in hours.iter().enumerate() {
+        let mut inc = h.last.1.copy_to_scale(scale);
+        inc.sub_assign(&h.first.1.copy_to_scale(scale));
+        if k > 0 {
+            let prev = &hours[k - 1].last.1;
+            if h.first.1.detect_reset(prev) {
+                inc.add_assign(&h.first.1.copy_to_scale(scale));
+            } else {
+                let mut gap = h.first.1.copy_to_scale(scale);
+                gap.sub_assign(&prev.copy_to_scale(scale));
+                inc.add_assign(&gap);
+            }
+        }
+        if let Some(c) = &h.correction {
+            inc.add_assign(&c.copy_to_scale(scale));
+        }
+        total = Some(add_to(total, inc));
+    }
+    total
 }
 
 fn eval_hist(fx: &HistFixture, f: Hist, w: Window) -> Option<f64> {
@@ -1384,17 +1529,41 @@ fn eval_hist(fx: &HistFixture, f: Hist, w: Window) -> Option<f64> {
     result.first().map(|s| s.value)
 }
 
+/// The histogram rows' schema condition: every histogram in the window uses an
+/// exponential schema. `histogram_rate` returns `None` for a window mixing
+/// custom and exponential schemas or holding custom bounds that differ, and
+/// `combine_hist` checks neither, so custom-bucket windows are not classified.
+fn exponential_only(fx: &HistFixture, w: Window) -> bool {
+    hour_segments(&fx.samples, w, |_| false, Stale::Drop)
+        .iter()
+        .flatten()
+        .all(|(_, h)| !h.uses_custom_buckets())
+}
+
+/// The histogram rows' full condition: exponential schemas only, and at most
+/// one histogram reset inside each hour segment.
+fn hist_condition_holds(fx: &HistFixture, w: Window, hours: &[HistHour]) -> bool {
+    exponential_only(fx, w) && hours.iter().all(|h| h.resets <= 1)
+}
+
+fn hist_fixture(name: &str) -> HistFixture {
+    hist_fixtures()
+        .into_iter()
+        .find(|f| f.name == name)
+        .expect("known fixture")
+}
+
 fn assert_hist_row_exact(f: Hist) {
     let mut produced = 0;
     for fx in hist_fixtures() {
         let mut compared = 0;
         for &w in WINDOWS {
             let hours = hist_hours(&fx, w);
-            if hours.iter().any(|h| h.resets > 1) {
+            if !hist_condition_holds(&fx, w, &hours) {
                 continue;
             }
             let expected = bits(eval_hist(&fx, f, w));
-            let got = bits(combine_hist(f, &hours, w));
+            let got = bits(combine_hist(f, &hours, w, Combine::Exact));
             assert_eq!(
                 got, expected,
                 "{f:?} on {} over {}: combined {got:x?}, evaluator {expected:x?}",
@@ -1437,7 +1606,7 @@ fn histogram_rows_condition_fails_on_two_resets_in_one_hour() {
         assert_eq!(hours[0].resets, 2);
         for f in [Hist::Count, Hist::Sum, Hist::Quantile] {
             let expected = bits(eval_hist(&fx, f, w)).expect("evaluates");
-            let got = bits(combine_hist(f, &hours, w)).expect("combines");
+            let got = bits(combine_hist(f, &hours, w, Combine::Exact)).expect("combines");
             found.push((fx.name, f, expected, got));
         }
     }
@@ -1487,11 +1656,103 @@ fn histogram_rows_condition_fails_on_two_resets_in_one_hour() {
 }
 
 #[test]
+fn histogram_rows_raw_only_with_custom_buckets_beside_exponential() {
+    let custom = FloatHistogram {
+        scale: CUSTOM_BUCKETS_SCALE,
+        custom_values: vec![1.0, 2.0],
+        ..hist(0, 0, &[3.0, 3.0], 6.0)
+    };
+    let fx = HistFixture {
+        name: "hist_custom_beside_exponential",
+        samples: vec![
+            (10 * MIN_NS, hist(0, 1, &[1.0, 1.0], 2.0)),
+            (30 * MIN_NS, hist(0, 1, &[2.0, 2.0], 4.5)),
+            (50 * MIN_NS, custom),
+            (70 * MIN_NS, hist(0, 1, &[4.0, 4.0], 9.0)),
+            (90 * MIN_NS, hist(0, 1, &[5.0, 5.0], 11.5)),
+        ],
+    };
+    // The custom-bucket histogram at 50m sits beside exponential ones: the
+    // evaluator returns no value, and the combination is not compared.
+    let mixed = window("(0m,120m]");
+    assert!(!exponential_only(&fx, mixed));
+    for f in [Hist::Count, Hist::Sum, Hist::Quantile] {
+        assert_eq!(bits(eval_hist(&fx, f, mixed)), None, "{f:?}");
+    }
+    // Without it, the same series is classified and the combination agrees.
+    let exponential = window("(60m,120m]");
+    assert!(exponential_only(&fx, exponential));
+    for f in [Hist::Count, Hist::Sum, Hist::Quantile] {
+        let expected = bits(eval_hist(&fx, f, exponential));
+        assert!(expected.is_some(), "{f:?}");
+        assert_eq!(
+            bits(combine_hist(
+                f,
+                &hist_hours(&fx, exponential),
+                exponential,
+                Combine::Exact
+            )),
+            expected,
+            "{f:?}"
+        );
+    }
+}
+
+#[test]
+fn histogram_sum_rejects_telescoped_hour_sum() {
+    // Telescoping reads the NaN sum of the 120m histogram, the last of hour
+    // (60m,120m]; the evaluator reads only the endpoints and the reset pairs.
+    let fx = hist_fixture("hist_schema_change");
+    let w = window("(34m,167m]");
+    let hours = hist_hours(&fx, w);
+    let expected = bits(eval_hist(&fx, Hist::Sum, w));
+    assert_eq!(expected, Some(0x3f76_24fe_38ca_86e2));
+    assert_eq!(
+        bits(combine_hist(Hist::Sum, &hours, w, Combine::Exact)),
+        expected
+    );
+    assert_eq!(
+        bits(combine_hist(Hist::Sum, &hours, w, Combine::Reassociate)),
+        Some(NAN_A)
+    );
+}
+
+#[test]
+fn histogram_rows_reassociations_differ_only_through_the_nan_sum() {
+    // Every window where the rows' condition holds, both forms of mutant (a),
+    // all three rows: only the telescoped `histogram_sum` windows that read
+    // the 120m NaN sum disagree with the evaluator.
+    let mut disagree = Vec::new();
+    for fx in hist_fixtures() {
+        for &w in WINDOWS {
+            let hours = hist_hours(&fx, w);
+            if !hist_condition_holds(&fx, w, &hours) {
+                continue;
+            }
+            for f in [Hist::Count, Hist::Sum, Hist::Quantile] {
+                let expected = bits(eval_hist(&fx, f, w));
+                for how in [Combine::Reassociate, Combine::CorrectionsOnce] {
+                    if bits(combine_hist(f, &hours, w, how)) != expected {
+                        disagree.push((fx.name, w.label, f, how));
+                    }
+                }
+            }
+        }
+    }
+    let telescoped_sum = |w| ("hist_schema_change", w, Hist::Sum, Combine::Reassociate);
+    assert_eq!(
+        disagree,
+        vec![
+            telescoped_sum("(0m,180m]"),
+            telescoped_sum("(34m,167m]"),
+            telescoped_sum("(70m,130m]"),
+        ]
+    );
+}
+
+#[test]
 fn schema_change_fixture_exercises_both_scale_directions() {
-    let fx = hist_fixtures()
-        .into_iter()
-        .find(|f| f.name == "hist_schema_change")
-        .expect("fixture");
+    let fx = hist_fixture("hist_schema_change");
     let hours = hist_hours(&fx, window("(0m,180m]"));
     let scales: Vec<i32> = hours.iter().map(|h| h.min_scale).collect();
     assert_eq!(scales, vec![0, 1, 0]);
