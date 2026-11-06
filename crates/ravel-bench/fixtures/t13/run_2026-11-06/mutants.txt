@@ -1,0 +1,57 @@
+01 t13::tests::structural_decision_is_go_only_when_every_bar_holds
+   wrong: decide: a figure at its bar fails (< instead of <=)
+   result: exit=101 FAILED: structural_fetch decision s: NO-GO (ratio/bytes=0.2500<=0.25 FAIL, ratio/gets=1.5000<=1.5 FAIL, ratio/wall=1.0000<=1 FAIL)
+02 t13::tests::sidecar_decision_needs_the_deletion_path_costed
+   wrong: decide: a deletion-cost figure that is absent passes its bar
+   result: exit=101 FAILED: 3
+03 t13::tests::overall_and_complete_follow_the_arm
+   wrong: overall: a report from the other arm counts as this arm's
+   result: exit=101 FAILED: assertion failed: !overall(arm, &names, &wrong_arm).go
+04 t13::tests::the_spec_must_name_exactly_the_arms_params_and_figures
+   wrong: spec: an unknown figure key is accepted
+   result: exit=101 FAILED: unknown figure: T13Spec { schema: 1, subject: [SubjectSpec { name: "s", arm: StructuralFetch, corpus: "c.log", source: "test", corpus_sha256: "0000000000000000000000000000000000000000000000000000000000000000", params: {"block_records": 1.0, "coalesce_gap": 1.0, "group_blocks": 1.0, "latency_ms": 1.0
+05 t13::tests::a_drifted_or_unknown_param_is_refused
+   wrong: drift: a --param differing from the registered value is accepted
+   result: exit=101 FAILED: drift: ()
+06 t13::tests::each_arms_report_is_in_band_at_the_edges_and_misses_past_them
+   wrong: band check: a figure on a band edge is a miss (exclusive band)
+   result: exit=101 FAILED: assertion `left == right` failed: StructuralFetch 8 Checked { problems: [], misses: ["rows: 8 outside band [8.0, 12.0]"] }   left: 2  right: 0
+07 t13::tests::median_takes_the_lower_middle
+   wrong: median: takes the upper middle
+   result: exit=101 FAILED: assertion `left == right` failed   left: Some(3.0)  right: Some(2.0)
+08 structural_fetch::tests::coalesce_merges_within_the_gap_inclusive_and_sorts_first
+   wrong: coalesce: a range exactly gap bytes away is not merged (< instead of <=)
+   result: exit=101 FAILED: assertion `left == right` failed   left: [(0, 200), (250, 300), (400, 500)]  right: [(0, 300), (400, 500)]
+09 structural_fetch::tests::mini_block_mapping_is_proportional
+   wrong: mini_block_count: rounds down
+   result: exit=101 FAILED: assertion `left == right` failed   left: 1  right: 2
+10 structural_fetch::tests::structural_plan_reads_one_mini_block_per_page_and_the_dictionary
+   wrong: structural_plan: always reads a page's first mini-block
+   result: exit=101 FAILED: assertion `left == right` failed   left: [(0, 150), (450, 550)]  right: [(0, 50), (350, 550)]
+11 structural_fetch::tests::targets_are_spread_and_centred
+   wrong: target_rows: not centred in each stride
+   result: exit=101 FAILED: assertion `left == right` failed   left: [0, 10, 20, 30, 40, 50, 60, 70, 80, 90]  right: [5, 15, 25, 35, 45, 55, 65, 75, 85, 95]
+12 fulltext_sidecar::tests::row_map_round_trips_ordinals_and_places
+   wrong: RowMap::locate: a block's first ordinal maps to the previous block
+   result: exit=101 FAILED: assertion `left == right` failed   left: [(0, 0), (0, 1), (0, 2), (0, 3), (2, 1)]  right: [(0, 0), (0, 1), (0, 2), (2, 0), (2, 1)]
+13 fulltext_sidecar::tests::a_term_block_is_prefix_shared_and_delta_coded
+   wrong: encode_term_block: rows stored absolute, not delta-coded
+   result: exit=101 FAILED: assertion `left == right` failed   left: [3, 0, 3, 101, 114, 114, 2, 2, 5, 3, 2, 111, 114, 1, 9, 0, 4, 102, 97, 105, 108, 3, 0, 1, 172, 2]  right: [3, 0, 3, 101, 114, 114, 2, 2, 3, 3, 2, 111, 114, 1, 9, 0, 4, 102, 97, 105, 108, 3, 0, 1, 171, 2]
+14 fulltext_sidecar::tests::the_sidecar_maps_each_token_to_its_rows_across_blocks
+   wrong: block_for: a term equal to a block's first term looks in the previous block
+   result: exit=101 FAILED: assertion `left == right` failed   left: []  right: [(0, 0), (1, 0)]
+15 fulltext_sidecar::tests::extrapolation_charges_every_unmeasured_object_the_miss_cost
+   wrong: extrapolate: matching objects charged the miss cost too
+   result: exit=101 FAILED: assertion `left == right` failed   left: 10400.0  right: 10380.0
+16 fulltext_sidecar::tests::the_sample_is_seeded_distinct_and_sorted
+   wrong: sample: not sorted
+   result: exit=101 FAILED: assertion failed: a.windows(2).all(|w| w[0] < w[1])
+17 tests::measures_a_generated_corpus_and_refuses_drift_before_reading
+   wrong: measure: --param drift not checked before the corpus is read
+   result: exit=101 FAILED: open /var/lib/fleet/work/c8543a31-6111-4b2d-878e-e3f0f6b3f4c9/.gate-logs/t13/tmp/.tmpGt2UjE/none.txt: No such file or directory (os error 2)
+18 tests::measures_a_generated_corpus_with_exact_counts
+   wrong: build_sidecar: entries counts terms, not (term, row) pairs
+   result: exit=101 FAILED: assertion `left == right` failed: Checked { problems: [], misses: ["sidecar/entries: 6066 outside band [30000.0, 30000.0]"] }   left: 2  right: 0
+19 fulltext_sidecar::tests::the_guided_route_probes_then_reads_missed_metadata_then_kept_pages
+   wrong: guided_rounds: metadata the probe already brought is read again
+   result: exit=101 FAILED: assertion `left == right` failed   left: [[(900, 1000)], [(600, 950)], [(0, 40), (100, 200)]]  right: [[(900, 1000)], [(600, 900)], [(0, 40), (100, 200)]]

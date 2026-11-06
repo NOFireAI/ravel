@@ -543,7 +543,7 @@ fn write_object(
     )];
     let stream_id = log_stream_id(&resource, "t13_fulltext_sidecar", "1", &[]);
     let stream_attrs = stream_attrs_bytes(&resource, "t13_fulltext_sidecar", "1", &[]);
-    let mut writer = RlogWriter::new(cfg.clone(), identity(seq));
+    let mut writer = RlogWriter::new(*cfg, identity(seq));
     for (body, &t) in bodies.iter().zip(ts) {
         writer
             .push(LogRecord {
@@ -593,7 +593,7 @@ fn read_all(bytes: &[u8], cfg: &RlogConfig) -> Result<(Vec<LogRecord>, Vec<u64>)
 fn compact(bytes: &[u8], cfg: &RlogConfig, seq: u64) -> Result<(Vec<u8>, f64), String> {
     let cpu0 = t13::thread_cpu_s();
     let (recs, _) = read_all(bytes, cfg)?;
-    let mut writer = RlogWriter::new(cfg.clone(), identity(seq));
+    let mut writer = RlogWriter::new(*cfg, identity(seq));
     for r in recs {
         writer.push(r).map_err(|e| format!("push: {e}"))?;
     }
@@ -799,7 +799,7 @@ struct BloomVerdict {
 }
 
 fn fetcher(store: &Arc<dyn ObjectStoreBackend>, cfg: &RlogConfig) -> LogSegmentFetcher {
-    LogSegmentFetcher::new(store.clone()).with_config(cfg.clone())
+    LogSegmentFetcher::new(store.clone()).with_config(*cfg)
 }
 
 /// The production fetcher with the coverage crossover off, so a scan whose
@@ -807,7 +807,7 @@ fn fetcher(store: &Arc<dyn ObjectStoreBackend>, cfg: &RlogConfig) -> LogSegmentF
 fn fetcher_ranged(store: &Arc<dyn ObjectStoreBackend>, cfg: &RlogConfig) -> LogSegmentFetcher {
     fetcher(store, cfg).with_block_range(
         BlockRangeFetcher::new(store.clone())
-            .with_config(cfg.clone())
+            .with_config(*cfg)
             .with_coverage_threshold(2.0),
     )
 }
@@ -844,10 +844,7 @@ async fn scan_rows(
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    loop {
-        let Some(block) = scan.next_block_index() else {
-            break;
-        };
+    while let Some(block) = scan.next_block_index() {
         let Some(recs) = scan.next_block().map_err(|e| format!("scan block: {e}"))? else {
             break;
         };

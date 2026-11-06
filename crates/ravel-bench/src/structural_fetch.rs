@@ -405,7 +405,7 @@ fn write_object(
     let stream_id = log_stream_id(&resource, "t13_structural_fetch", "1", &[]);
     let stream_attrs = stream_attrs_bytes(&resource, "t13_structural_fetch", "1", &[]);
     let targets: BTreeSet<usize> = target_rows(rows, matched).into_iter().collect();
-    let mut writer = RlogWriter::new(cfg.clone(), identity);
+    let mut writer = RlogWriter::new(*cfg, identity);
     for (i, line) in lines.iter().take(rows).enumerate() {
         let trace = if targets.contains(&i) {
             JOURNEY
@@ -570,7 +570,7 @@ struct Planned {
 
 async fn plan(ctx: &Ctx<'_>) -> Result<Planned, String> {
     let fetcher = LogSegmentFetcher::new(ctx.store.clone())
-        .with_config(ctx.cfg.clone())
+        .with_config(*ctx.cfg)
         .with_max_concurrent_gets(ctx.max_gets);
     let query = LogQuery::new(ctx.seg.min_event_ts_ns, ctx.seg.max_event_ts_ns);
     let (g0, b0, _) = t13::store_counts(&ctx.metrics);
@@ -798,7 +798,7 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
         blocks: &blocks,
     };
     let bound = LogSegmentFetcher::new(store.clone())
-        .with_config(cfg.clone())
+        .with_config(cfg)
         .plan_whole_object_bound();
     let (today, structural) = rt.block_on(async {
         store
