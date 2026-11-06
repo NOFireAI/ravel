@@ -1696,11 +1696,7 @@ impl ObjectStoreBackend for ScratchMeter {
         Ok(outcome)
     }
 
-    async fn get(
-        &self,
-        key: &str,
-        range: GetRange,
-    ) -> std::result::Result<GetOutcome, StoreError> {
+    async fn get(&self, key: &str, range: GetRange) -> std::result::Result<GetOutcome, StoreError> {
         let outcome = self.scratch.get(key, range).await?;
         if let Some(l) = &self.ledger {
             l.record_scratch_read(outcome.data.len() as u64);
@@ -5103,6 +5099,7 @@ async fn open_cursor<'a>(
 
 /// [`open_cursor`] over `resident` row groups when the merge holds them
 /// (ADR-3819 D3 reading D1's bytes), or fetching by range when `None`.
+#[allow(clippy::too_many_arguments)]
 async fn open_cursor_in<'a>(
     store: &'a dyn ObjectStoreBackend,
     catalog: &'a RlogInputCatalog,
@@ -14207,7 +14204,9 @@ mod tests {
         /// The integer `name=` field of a log line.
         fn log_field(line: &str, name: &str) -> u64 {
             let needle = format!(" {name}=");
-            let at = line.find(&needle).unwrap_or_else(|| panic!("{name} in {line}"));
+            let at = line
+                .find(&needle)
+                .unwrap_or_else(|| panic!("{name} in {line}"));
             line[at + needle.len()..]
                 .chars()
                 .take_while(char::is_ascii_digit)
@@ -14233,7 +14232,11 @@ mod tests {
             let config = two_level_config(64 << 20, crate::RLOG_RUN_MEMORY_TARGET_BYTES, None);
             let (outcome, run, store, keys) = compact_two_level(&config).await;
             outcome.expect("single-level compact");
-            assert!(run.mode_line().contains("mode=\"resident\""), "{}", run.mode_line());
+            assert!(
+                run.mode_line().contains("mode=\"resident\""),
+                "{}",
+                run.mode_line()
+            );
             assert_eq!(run.report.level1_groups, 0, "{:?}", run.report);
             let per_input = level1_per_input(&store, &keys).await;
             (published(&store).await, run, per_input)
@@ -14262,12 +14265,16 @@ mod tests {
             assert_eq!(input_groups, 60);
 
             let (outcome, run, store, _) = compact_two_level(&config).await;
-            assert!(
-                matches!(outcome.expect("two-level compact"), CompactionOutcome::Compacted { .. })
-            );
+            assert!(matches!(
+                outcome.expect("two-level compact"),
+                CompactionOutcome::Compacted { .. }
+            ));
             let two_level = published(&store).await;
             assert_eq!(two_level.0, oracle.0, "part keys");
-            assert!(two_level.1.hashes == oracle.1.hashes, "content hashes differ");
+            assert!(
+                two_level.1.hashes == oracle.1.hashes,
+                "content hashes differ"
+            );
             assert!(two_level.1.parts == oracle.1.parts, "part bytes differ");
             assert!(!oracle.0.is_empty());
 
@@ -14289,7 +14296,8 @@ mod tests {
             assert_eq!(r.block_read.requests, single.report.block_read.requests);
             assert!(run_blocks > 0);
             assert!(
-                r.level2_block_decodes >= run_blocks && r.level2_block_decodes * 10 <= run_blocks * 11,
+                r.level2_block_decodes >= run_blocks
+                    && r.level2_block_decodes * 10 <= run_blocks * 11,
                 "level-2 decodes {} against {run_blocks} run blocks",
                 r.level2_block_decodes
             );
@@ -14320,11 +14328,17 @@ mod tests {
                 let got = published(&store).await;
                 assert_eq!(got.0, oracle.0, "{name}: part keys");
                 assert!(got.1 == oracle.1, "{name}: parts differ");
-                writes.push((log_field(&line, "run_parts"), run.report.scratch_write_bytes));
+                writes.push((
+                    log_field(&line, "run_parts"),
+                    run.report.scratch_write_bytes,
+                ));
                 assert!(scratch_entries(&dir).is_empty(), "{name}");
             }
             assert_eq!(writes[1].0, 5, "one part per run at the large target");
-            assert!(writes[0].0 > writes[1].0, "the small target cuts more run parts: {writes:?}");
+            assert!(
+                writes[0].0 > writes[1].0,
+                "the small target cuts more run parts: {writes:?}"
+            );
             assert!(writes[0].1 != writes[1].1, "{writes:?}");
         }
 
@@ -14336,7 +14350,8 @@ mod tests {
             let keys = seed_inputs(&probe, &two_level_inputs()).await;
             let per_input = level1_per_input(&probe, &keys).await;
             let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
-            let config = two_level_config(group_ceiling(per_input, run_target, 12), run_target, None);
+            let config =
+                two_level_config(group_ceiling(per_input, run_target, 12), run_target, None);
             let (outcome, run, store, _) = compact_two_level(&config).await;
             assert_eq!(
                 outcome.expect("a refusal is an outcome"),
@@ -14450,7 +14465,11 @@ mod tests {
             let (outcome, run, store, _) = compact_two_level(&config).await;
             SCRATCH_FREE_OVERRIDE.with(|o| o.set(None));
             match outcome {
-                Err(MaintainError::ScratchHeadroom { need: n, free, path }) => {
+                Err(MaintainError::ScratchHeadroom {
+                    need: n,
+                    free,
+                    path,
+                }) => {
                     assert_eq!((n, free, path), (need, need - 1, dir.clone()));
                 }
                 other => panic!("{other:?}"),
@@ -14596,7 +14615,10 @@ mod tests {
             }
             let held = scratch_entries(&dir);
             assert_eq!(held.len(), 1, "one unit directory while the merge runs");
-            assert!(!scratch_entries(&held[0]).is_empty(), "runs present at level 2");
+            assert!(
+                !scratch_entries(&held[0]).is_empty(),
+                "runs present at level 2"
+            );
             drop(merge);
             assert!(scratch_entries(&dir).is_empty(), "cancel");
         }

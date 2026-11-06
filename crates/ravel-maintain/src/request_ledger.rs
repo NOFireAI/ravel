@@ -386,7 +386,9 @@ impl RequestLedger {
 
     /// Account the level-1 group count of a two-level RLOG merge.
     pub fn record_level1_groups(&self, groups: u64) {
-        self.inner.level1_groups.fetch_add(groups, Ordering::Relaxed);
+        self.inner
+            .level1_groups
+            .fetch_add(groups, Ordering::Relaxed);
     }
 
     /// Account one stream-range pass at `level` (1 or 2) of a two-level merge.
