@@ -216,7 +216,8 @@ pub struct RunRequestReport {
     pub level1_block_decodes: u64,
     /// Run blocks decoded at level 2 of a two-level merge, a decode count.
     pub level2_block_decodes: u64,
-    /// Bytes of level-1 runs written to scratch, as stored (ADR-3853 D6).
+    /// Bytes of level-1 run-part writes issued to scratch, counted when
+    /// issued, so a write that then fails is already here (ADR-3853 D6).
     /// Scratch traffic is not a store request and never lands in a phase.
     pub scratch_write_bytes: u64,
     /// Run-part writes level 1 issued to scratch, counted when issued, so a
