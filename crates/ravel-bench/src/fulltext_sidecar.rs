@@ -18,11 +18,19 @@
 //! Every object is written by the production `RlogWriter` from LogHub lines,
 //! one line per row. The baselines are the production structures on the same
 //! objects: the BLOOM section the writer wrote (its size, and its verdict
-//! through the production `LogSegmentFetcher::plan_segment`), and a POSTINGS
-//! section built by the production `encode_postings_section` over the body's
-//! tokens to block indices (production does not build body postings today; it
-//! is what the sidecar would replace or stand beside). Both search paths run
-//! for real through the production fetcher against a `MemoryStore` behind the
+//! through the production `LogSegmentFetcher::scan_accounted_with_tenant`),
+//! and a POSTINGS section built by the production `encode_postings_section`
+//! over the body's tokens to block indices (production does not build body
+//! postings today; it is what the sidecar would replace or stand beside).
+//!
+//! Production narrows by BLOOM only at decode, over a buffer that already
+//! holds every block in the time window, so for a full-window `HasWord` its
+//! scan moves the whole object whatever the bloom says. The bloom path the
+//! decision is taken against is therefore the bloom-guided route production
+//! does not take: real ranged GETs of the suffix probe, PAGE_DIR and BLOOM,
+//! then only the pages of the blocks the production bloom keeps. The two
+//! production scans (defaults, and the coverage crossover off) are measured
+//! beside it for context. Every path runs against a `MemoryStore` behind the
 //! production `InstrumentedStore`, which counts their GETs and bytes, and
 //! every returned row is checked against the corpus.
 //!
@@ -43,6 +51,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ravel_catalog::SegmentRef;
+use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::postings::{FieldTerms, PostingsSection, encode_postings_section};
 use ravel_logseg::record::COL_BODY;
 use ravel_logseg::tokenizer::for_each_token;
@@ -52,7 +61,10 @@ use ravel_logseg::{
     RlogReader, RlogWriter, footer, stream_attrs_bytes,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreMetrics};
-use ravel_query::{LogQuery, LogSegmentFetcher};
+use ravel_query::{
+    BlockRangeFetcher, DEFAULT_LOG_REQUEST_COST_BYTES, DEFAULT_LOG_SUFFIX_LEN, LogQuery,
+    LogSegmentFetcher,
+};
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::log_stream_id;
@@ -100,6 +112,11 @@ pub const FIGURES: &[&str] = &[
     "rare/bloom_bytes",
     "rare/bloom_blocks_kept",
     "rare/false_positive_blocks",
+    "rare/plan_route_bytes_per_object",
+    "rare/default_path_gets",
+    "rare/default_path_bytes",
+    "rare/no_crossover_gets",
+    "rare/no_crossover_bytes",
     "rare/sidecar_gets",
     "rare/sidecar_bytes",
     "rare/bytes_ratio_measured",
@@ -108,6 +125,8 @@ pub const FIGURES: &[&str] = &[
     "rare/sidecar_bytes_100gb",
     "rare/bytes_ratio_100gb",
     "rare/gets_ratio_100gb",
+    "rare/default_path_bytes_100gb",
+    "rare/bytes_ratio_100gb_default_path",
     "delete/erased_only_terms",
     "delete/residual_terms",
     "delete/rebuild_cpu_ms",
@@ -614,9 +633,144 @@ struct Object {
     seg: SegmentRef,
     sidecar_len: u64,
     postings: Vec<u8>,
+    guide: Guide,
     /// The first ordinal of the object in the corpus.
     first_line: usize,
     rows: usize,
+}
+
+/// Where the bloom-guided route reads on one object, as absolute
+/// `[start, end)` byte ranges.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Guide {
+    size: u64,
+    /// PAGE_DIR and BLOOM: what the route needs beyond the footer.
+    meta: Vec<(u64, u64)>,
+    /// Per block, its pages in every column.
+    blocks: Vec<Vec<(u64, u64)>>,
+}
+
+fn guide(object: &[u8], cfg: &RlogConfig) -> Result<Guide, String> {
+    let foot = footer::open(object).map_err(|e| format!("footer: {e}"))?;
+    let dir_desc = foot
+        .section(footer::kind::PAGE_DIR)
+        .ok_or("no PAGE_DIR section")?;
+    let bloom = foot
+        .section(footer::kind::BLOOM)
+        .ok_or("no BLOOM section")?;
+    let blocks_desc = foot
+        .section(footer::kind::BLOCKS)
+        .ok_or("no BLOCKS section")?;
+    let base = blocks_desc.offset;
+    let mut placed = 0u64;
+    let dir_raw = ravel_logseg::reader::read_section(object, dir_desc, cfg)
+        .map_err(|e| format!("PAGE_DIR: {e}"))?;
+    let dir = PageDir::decode(&dir_raw).map_err(|e| format!("PAGE_DIR: {e}"))?;
+    let mut blocks: Vec<Vec<(u64, u64)>> = Vec::new();
+    for g in &dir.groups {
+        let first = g.first_block as usize;
+        let end = first + g.block_count as usize;
+        if blocks.len() < end {
+            blocks.resize(end, Vec::new());
+        }
+        for c in &g.chunks {
+            let offsets = c
+                .page_offsets()
+                .ok_or("page offsets overflow in PAGE_DIR")?;
+            for (p, rel) in c.pages.iter().zip(offsets) {
+                if p.len == 0 {
+                    continue;
+                }
+                let r = (base + rel, base + rel + p.len);
+                placed += p.len;
+                // A dictionary page serves every block of its group.
+                if c.dict_page().is_some_and(|d| std::ptr::eq(d, p)) {
+                    for b in &mut blocks[first..end] {
+                        b.push(r);
+                    }
+                } else {
+                    blocks
+                        .get_mut(first + p.block as usize)
+                        .ok_or("a page past its group's blocks")?
+                        .push(r);
+                }
+            }
+        }
+    }
+    if placed != blocks_desc.len {
+        return Err(format!(
+            "PAGE_DIR places {placed} bytes of a {}-byte BLOCKS section",
+            blocks_desc.len
+        ));
+    }
+    Ok(Guide {
+        size: object.len() as u64,
+        meta: vec![
+            (dir_desc.offset, dir_desc.offset + dir_desc.len),
+            (bloom.offset, bloom.offset + bloom.len),
+        ],
+        blocks,
+    })
+}
+
+/// The GET rounds of the bloom-guided route: the suffix probe of `probe`
+/// bytes, then the metadata the probe did not cover, then the pages of the
+/// `kept` blocks, each later round clipped to what the probe did not bring
+/// and coalesced at `gap`. An empty round is dropped.
+fn guided_rounds(
+    g: &Guide,
+    probe: u64,
+    kept: &[usize],
+    gap: u64,
+) -> Result<Vec<Vec<(u64, u64)>>, String> {
+    let tail = g.size.saturating_sub(probe);
+    let clip = |r: &[(u64, u64)]| -> Vec<(u64, u64)> {
+        r.iter()
+            .filter(|r| r.0 < tail)
+            .map(|&(s, e)| (s, e.min(tail)))
+            .collect()
+    };
+    let mut pages = Vec::new();
+    for &b in kept {
+        pages.extend(clip(g.blocks.get(b).ok_or("a kept block past the object")?));
+    }
+    let mut rounds = vec![vec![(tail, g.size)]];
+    for r in [clip(&g.meta), pages] {
+        let c = crate::structural_fetch::coalesce(r, gap);
+        if !c.is_empty() {
+            rounds.push(c);
+        }
+    }
+    Ok(rounds)
+}
+
+/// The bloom-guided route on one object, which production does not take:
+/// production narrows by BLOOM only at decode, after fetching every block
+/// in the time window. Real ranged GETs of the production-placed bytes for
+/// the production suffix probe, PAGE_DIR and BLOOM, and the pages of the
+/// blocks the production bloom kept, coalesced at the production request
+/// cost. The verdict (`kept`) is the production scan's.
+async fn bloom_guided_cost(
+    store: &Arc<dyn ObjectStoreBackend>,
+    metrics: &StoreMetrics,
+    obj: &Object,
+    kept: &[usize],
+) -> Result<Cost, String> {
+    let rounds = guided_rounds(
+        &obj.guide,
+        DEFAULT_LOG_SUFFIX_LEN,
+        kept,
+        DEFAULT_LOG_REQUEST_COST_BYTES,
+    )?;
+    let (g0, b0, _) = t13::store_counts(metrics);
+    for (s, e) in rounds.into_iter().flatten() {
+        get_range(store, &obj.key, s, e).await?;
+    }
+    let (g1, b1, _) = t13::store_counts(metrics);
+    Ok(Cost {
+        gets: g1 - g0,
+        bytes: b1 - b0,
+    })
 }
 
 /// One search path's cost on one object.
@@ -624,6 +778,16 @@ struct Object {
 struct Cost {
     gets: u64,
     bytes: u64,
+}
+
+/// One sampled token's measured costs on the objects that hold it.
+#[derive(Default)]
+struct Token {
+    bloom_bytes: Vec<f64>,
+    side_bytes: Vec<f64>,
+    bloom_gets: Vec<f64>,
+    side_gets: Vec<f64>,
+    default_bytes: Vec<f64>,
 }
 
 struct BloomVerdict {
@@ -636,6 +800,16 @@ struct BloomVerdict {
 
 fn fetcher(store: &Arc<dyn ObjectStoreBackend>, cfg: &RlogConfig) -> LogSegmentFetcher {
     LogSegmentFetcher::new(store.clone()).with_config(cfg.clone())
+}
+
+/// The production fetcher with the coverage crossover off, so a scan whose
+/// time window covers every block still reads only the blocks the bloom keeps.
+fn fetcher_ranged(store: &Arc<dyn ObjectStoreBackend>, cfg: &RlogConfig) -> LogSegmentFetcher {
+    fetcher(store, cfg).with_block_range(
+        BlockRangeFetcher::new(store.clone())
+            .with_config(cfg.clone())
+            .with_coverage_threshold(2.0),
+    )
 }
 
 /// Scans `indices` of a planned object and returns every row the scan
@@ -684,53 +858,59 @@ async fn scan_rows(
     Ok(out)
 }
 
-/// The bloom path for `token` on one object: the production plan with a
-/// `HasWord` arm on the body, then a scan of the blocks it keeps.
+fn has_word(obj: &Object, token: &str) -> LogQuery {
+    LogQuery::new(obj.seg.min_event_ts_ns, obj.seg.max_event_ts_ns).with_content(
+        Predicate::HasWord {
+            field: FieldSel::Body,
+            word: token.to_string(),
+        },
+    )
+}
+
+/// The bloom path for `token` on one object: the production scan funnel with
+/// a `HasWord` arm on the body. `ranged` turns the coverage crossover off;
+/// then, above the block-range threshold, it reads the footer probe, the
+/// BLOOM section, and the ranges of the blocks the bloom keeps. With the
+/// production defaults a full-window query covers every block and the scan
+/// reads the whole object instead.
 async fn bloom_path(
     store: &Arc<dyn ObjectStoreBackend>,
     metrics: &StoreMetrics,
     cfg: &RlogConfig,
     obj: &Object,
     token: &str,
+    ranged: bool,
 ) -> Result<BloomVerdict, String> {
-    let f = fetcher(store, cfg);
-    let query = LogQuery::new(obj.seg.min_event_ts_ns, obj.seg.max_event_ts_ns).with_content(
-        Predicate::HasWord {
-            field: FieldSel::Body,
-            word: token.to_string(),
-        },
-    );
+    let f = if ranged {
+        fetcher_ranged(store, cfg)
+    } else {
+        fetcher(store, cfg)
+    };
+    let query = has_word(obj, token);
     let (g0, b0, _) = t13::store_counts(metrics);
-    let plan = f
-        .plan_segment(
+    let mut kept = Vec::new();
+    let mut rows = Vec::new();
+    if let Some(mut scan) = f
+        .scan_accounted_with_tenant(
             &obj.seg,
             TenantHash(t13::TENANT),
             &query,
+            &ColumnSelection::all(),
             &QueryAccounting::new(),
         )
         .await
-        .map_err(|e| format!("bloom plan: {e}"))?;
-    let (kept, rows) = match plan {
-        None => (Vec::new(), Vec::new()),
-        Some((indices, dirs, _, foot, whole)) => {
-            let rows = if indices.is_empty() {
-                Vec::new()
-            } else {
-                scan_rows(
-                    &f,
-                    &obj.seg,
-                    &query,
-                    &indices,
-                    &indices,
-                    foot.as_ref(),
-                    whole,
-                    &dirs,
-                )
-                .await?
+        .map_err(|e| format!("bloom scan: {e}"))?
+    {
+        while let Some(block) = scan.next_block_index() {
+            let Some(recs) = scan.next_block().map_err(|e| format!("scan block: {e}"))? else {
+                break;
             };
-            (indices, rows)
+            kept.push(block);
+            for (i, r) in recs.into_iter().enumerate() {
+                rows.push((block as u32, i as u64, r.body));
+            }
         }
-    };
+    }
     let (g1, b1, _) = t13::store_counts(metrics);
     Ok(BloomVerdict {
         cost: Cost {
@@ -744,6 +924,33 @@ async fn bloom_path(
             rows.sort();
             rows
         },
+    })
+}
+
+/// The production plan for the same `HasWord` query on one object, without
+/// the scan: what a caller that plans each object first pays before reading
+/// a block.
+async fn plan_route_cost(
+    store: &Arc<dyn ObjectStoreBackend>,
+    metrics: &StoreMetrics,
+    cfg: &RlogConfig,
+    obj: &Object,
+    token: &str,
+) -> Result<Cost, String> {
+    let (g0, b0, _) = t13::store_counts(metrics);
+    fetcher(store, cfg)
+        .plan_segment(
+            &obj.seg,
+            TenantHash(t13::TENANT),
+            &has_word(obj, token),
+            &QueryAccounting::new(),
+        )
+        .await
+        .map_err(|e| format!("plan: {e}"))?;
+    let (g1, b1, _) = t13::store_counts(metrics);
+    Ok(Cost {
+        gets: g1 - g0,
+        bytes: b1 - b0,
     })
 }
 
@@ -968,6 +1175,7 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
         if pterms > cfg.postings_max_distinct as u64 {
             capped += 1;
         }
+        let guide = guide(&object, &cfg)?;
         let foot = footer::open(&object).map_err(|e| format!("footer: {e}"))?;
         bloom_bytes += foot
             .section(footer::kind::BLOOM)
@@ -1022,6 +1230,7 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
             seg,
             sidecar_len,
             postings: post,
+            guide,
             first_line,
             rows: chunk.len(),
         });
@@ -1069,13 +1278,24 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
     let mut side_miss = Vec::new();
     let mut bloom_miss_gets = Vec::new();
     let mut side_miss_gets = Vec::new();
-    // Per token: (bloom match costs, sidecar match costs, bloom gets, sidecar gets).
-    let mut per_token: Vec<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> = Vec::new();
+    let (mut d_gets, mut d_bytes, mut default_miss) = (0u64, 0u64, Vec::new());
+    let (mut x_gets, mut x_bytes) = (0u64, 0u64);
+    let mut per_token: Vec<Token> = Vec::new();
+    let first_word = picked
+        .first()
+        .and_then(|t| exact_word(t))
+        .ok_or("a picked token is not an exact word")?;
+    let mut plan_route_bytes = 0u64;
+    for obj in &objects {
+        plan_route_bytes += rt
+            .block_on(plan_route_cost(&store, &metrics, &cfg, obj, &first_word))?
+            .bytes;
+    }
     for token in &picked {
         let word = exact_word(token).ok_or("a picked token is not an exact word")?;
         let rows_of = &truth[token];
         rare_rows += rows_of.len() as u64;
-        let mut entry = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut entry = Token::default();
         for (k, obj) in objects.iter().enumerate() {
             let want: Vec<(u32, u64)> = rows_of
                 .iter()
@@ -1091,15 +1311,26 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
                 .map(|(&i, &(b, _))| (b, used[i].clone()))
                 .collect();
             want_bodies.sort();
-            let bloom = rt.block_on(bloom_path(&store, &metrics, &cfg, obj, &word))?;
+            let default = rt.block_on(bloom_path(&store, &metrics, &cfg, obj, &word, false))?;
+            let ranged = rt.block_on(bloom_path(&store, &metrics, &cfg, obj, &word, true))?;
             let (s_cost, s_rows) =
                 rt.block_on(sidecar_path(&store, &metrics, &cfg, obj, suffix, &word))?;
-            if bloom.rows != want_bodies || s_rows != want {
+            if default.rows != want_bodies
+                || ranged.rows != want_bodies
+                || ranged.kept != default.kept
+                || s_rows != want
+            {
                 return Err(format!(
-                    "{word:?} in object {k}: corpus {want:?}, bloom path {:?}, sidecar path {s_rows:?}",
-                    bloom.rows
+                    "{word:?} in object {k}: corpus {want:?}, default scan {:?} kept {:?}, \
+                     no-crossover scan {:?} kept {:?}, sidecar path {s_rows:?}",
+                    default.rows, default.kept, ranged.rows, ranged.kept
                 ));
             }
+            let guided = rt.block_on(bloom_guided_cost(&store, &metrics, obj, &default.kept))?;
+            d_gets += default.cost.gets;
+            d_bytes += default.cost.bytes;
+            x_gets += ranged.cost.gets;
+            x_bytes += ranged.cost.bytes;
             let post = PostingsSection::parse(&obj.postings)
                 .map_err(|e| format!("postings: {e}"))?
                 .probe(COL_BODY, token)
@@ -1108,26 +1339,28 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
             if post.into_iter().collect::<BTreeSet<u32>>() != want_blocks {
                 mismatches += 1;
             }
-            kept_blocks += bloom.kept.len() as u64;
-            fp_blocks += bloom
+            kept_blocks += default.kept.len() as u64;
+            fp_blocks += default
                 .kept
                 .iter()
                 .filter(|&&b| !want_blocks.contains(&(b as u32)))
                 .count() as u64;
-            b_gets += bloom.cost.gets;
-            b_bytes += bloom.cost.bytes;
+            b_gets += guided.gets;
+            b_bytes += guided.bytes;
             s_gets += s_cost.gets;
             s_bytes += s_cost.bytes;
             if want.is_empty() {
-                bloom_miss.push(bloom.cost.bytes as f64);
+                bloom_miss.push(guided.bytes as f64);
                 side_miss.push(s_cost.bytes as f64);
-                bloom_miss_gets.push(bloom.cost.gets as f64);
+                bloom_miss_gets.push(guided.gets as f64);
                 side_miss_gets.push(s_cost.gets as f64);
+                default_miss.push(default.cost.bytes as f64);
             } else {
-                entry.0.push(bloom.cost.bytes as f64);
-                entry.1.push(s_cost.bytes as f64);
-                entry.2.push(bloom.cost.gets as f64);
-                entry.3.push(s_cost.gets as f64);
+                entry.bloom_bytes.push(guided.bytes as f64);
+                entry.side_bytes.push(s_cost.bytes as f64);
+                entry.bloom_gets.push(guided.gets as f64);
+                entry.side_gets.push(s_cost.gets as f64);
+                entry.default_bytes.push(default.cost.bytes as f64);
             }
         }
         per_token.push(entry);
@@ -1140,20 +1373,20 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
         }
     };
     let scale_objects = scale_raw / (raw_bytes as f64 / n_objects as f64);
-    let (bm, sm, bmg, smg) = (
+    let (bm, sm, bmg, smg, dm) = (
         mean(&bloom_miss)?,
         mean(&side_miss)?,
         mean(&bloom_miss_gets)?,
         mean(&side_miss_gets)?,
+        mean(&default_miss)?,
     );
     let tokens = per_token.len() as f64;
-    let at_scale = |pick: &dyn Fn(&(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)) -> f64| {
-        per_token.iter().map(pick).sum::<f64>() / tokens
-    };
-    let bloom_100 = at_scale(&|t| extrapolate(&t.0, bm, scale_objects));
-    let side_100 = at_scale(&|t| extrapolate(&t.1, sm, scale_objects));
-    let bloom_g100 = at_scale(&|t| extrapolate(&t.2, bmg, scale_objects));
-    let side_g100 = at_scale(&|t| extrapolate(&t.3, smg, scale_objects));
+    let at_scale = |pick: &dyn Fn(&Token) -> f64| per_token.iter().map(pick).sum::<f64>() / tokens;
+    let bloom_100 = at_scale(&|t| extrapolate(&t.bloom_bytes, bm, scale_objects));
+    let side_100 = at_scale(&|t| extrapolate(&t.side_bytes, sm, scale_objects));
+    let bloom_g100 = at_scale(&|t| extrapolate(&t.bloom_gets, bmg, scale_objects));
+    let side_g100 = at_scale(&|t| extrapolate(&t.side_gets, smg, scale_objects));
+    let default_100 = at_scale(&|t| extrapolate(&t.default_bytes, dm, scale_objects));
 
     // Deletion: erase from object 0 a row holding a token no other row of
     // the corpus holds, rewrite the object without it, rebuild the sidecar.
@@ -1255,6 +1488,14 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
         fig("rare/bloom_bytes", b_bytes as f64),
         fig("rare/bloom_blocks_kept", kept_blocks as f64),
         fig("rare/false_positive_blocks", fp_blocks as f64),
+        fig(
+            "rare/plan_route_bytes_per_object",
+            plan_route_bytes as f64 / objects.len() as f64,
+        ),
+        fig("rare/default_path_gets", d_gets as f64),
+        fig("rare/default_path_bytes", d_bytes as f64),
+        fig("rare/no_crossover_gets", x_gets as f64),
+        fig("rare/no_crossover_bytes", x_bytes as f64),
         fig("rare/sidecar_gets", s_gets as f64),
         fig("rare/sidecar_bytes", s_bytes as f64),
         fig("rare/bytes_ratio_measured", s_bytes as f64 / b_bytes as f64),
@@ -1263,6 +1504,11 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
         fig("rare/sidecar_bytes_100gb", side_100),
         fig("rare/bytes_ratio_100gb", side_100 / bloom_100),
         fig("rare/gets_ratio_100gb", side_g100 / bloom_g100),
+        fig("rare/default_path_bytes_100gb", default_100),
+        fig(
+            "rare/bytes_ratio_100gb_default_path",
+            side_100 / default_100,
+        ),
         fig("delete/erased_only_terms", erased_only.len() as f64),
         fig("delete/residual_terms", residual as f64),
         fig("delete/rebuild_cpu_ms", rebuild_cpu * 1e3),
@@ -1289,7 +1535,21 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
          8-byte trailer. A real build and a real probe through ranged GETs, not a simulation"
             .to_string(),
         "baselines: the BLOOM section the production writer wrote, its verdict through the \
-         production plan_segment with HasWord(body); the POSTINGS section the production \
+         production scan funnel scan_accounted_with_tenant with HasWord(body) over the \
+         object's full time window, every returned row checked against the corpus. \
+         rare/default_path_* is that scan with the production defaults: every block is a time \
+         candidate, the 0.75 coverage crossover fires before the bloom is consulted, and the \
+         whole object is read. rare/no_crossover_* is the same scan with the crossover off \
+         (BlockRangeFetcher coverage threshold 2.0): the ranged read still fetches every time \
+         candidate block, because production narrows by BLOOM only at decode over the fetched \
+         buffer. rare/bloom_* is the bloom-guided route production does not take, the \
+         baseline the decision is taken against: real ranged GETs of the production suffix \
+         probe (DEFAULT_LOG_SUFFIX_LEN), PAGE_DIR and BLOOM where the probe missed them, and \
+         the pages of the blocks the production bloom kept, each round coalesced at \
+         DEFAULT_LOG_REQUEST_COST_BYTES; its block verdict is the production scan's. \
+         rare/plan_route_bytes_per_object is what the production plan_segment for the same \
+         query moves per object before any scan (the first sampled token, once per object); \
+         the POSTINGS section the production \
          encode_postings_section builds over body tokens to block indices (uncapped, so its \
          size is what it would cost; postings/capped_objects counts the objects where the \
          production distinct cap would have dropped it)"
@@ -1302,7 +1562,7 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
             "100 GB: scale_objects = scale_raw_bytes / (raw_bytes / objects) = {scale_raw} / \
              ({raw_bytes} / {n_objects}); per token cost = sum(measured costs of its matching \
              objects) + (scale_objects - matching objects) * mean miss cost; mean miss bytes \
-             bloom {bm:.1}, sidecar {sm:.1}; mean miss GETs bloom {bmg:.3}, sidecar {smg:.3}; \
+             bloom {bm:.1}, sidecar {sm:.1}, default path {dm:.1}; mean miss GETs bloom {bmg:.3}, sidecar {smg:.3}; \
              ratio = mean sidecar cost / mean bloom cost over {} tokens",
             per_token.len()
         ),
@@ -1328,6 +1588,41 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_guided_route_probes_then_reads_missed_metadata_then_kept_pages() {
+        let g = Guide {
+            size: 1000,
+            meta: vec![(600, 700), (700, 950)],
+            blocks: vec![
+                vec![(0, 10), (100, 120)],
+                vec![(10, 30), (120, 130)],
+                vec![(30, 40), (130, 200)],
+            ],
+        };
+        // The probe brings 900..1000, so BLOOM is read only up to 900; block
+        // 2's pages coalesce with block 0's at a gap of 20 (30 <= 10 + 20,
+        // 130 <= 120 + 20) but 100 > 40 + 20 starts a second range.
+        assert_eq!(
+            guided_rounds(&g, 100, &[2, 0], 20).expect("rounds"),
+            vec![
+                vec![(900, 1000)],
+                vec![(600, 900)],
+                vec![(0, 40), (100, 200)],
+            ]
+        );
+        // A miss reads no page.
+        assert_eq!(
+            guided_rounds(&g, 100, &[], 20).expect("rounds"),
+            vec![vec![(900, 1000)], vec![(600, 900)]]
+        );
+        // A probe as long as the object reads it in one GET.
+        assert_eq!(
+            guided_rounds(&g, 4096, &[1], 20).expect("rounds"),
+            vec![vec![(0, 1000)]]
+        );
+        assert!(guided_rounds(&g, 100, &[3], 20).is_err());
+    }
 
     #[test]
     fn row_map_round_trips_ordinals_and_places() {

@@ -175,6 +175,10 @@ mod tests {
             get("rare/sidecar_bytes_100gb") / get("rare/bloom_bytes_100gb")
         );
         assert_eq!(
+            get("rare/bytes_ratio_100gb_default_path"),
+            get("rare/sidecar_bytes_100gb") / get("rare/default_path_bytes_100gb")
+        );
+        assert_eq!(
             get("sidecar/over_postings"),
             get("sidecar/bytes") / get("postings/bytes")
         );
