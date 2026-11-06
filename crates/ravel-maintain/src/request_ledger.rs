@@ -219,6 +219,10 @@ pub struct RunRequestReport {
     /// Bytes of level-1 runs written to scratch, as stored (ADR-3853 D6).
     /// Scratch traffic is not a store request and never lands in a phase.
     pub scratch_write_bytes: u64,
+    /// Run-part writes level 1 issued to scratch, counted when issued, so a
+    /// write in flight when level 1 stops is already here. Not a store
+    /// request.
+    pub scratch_writes: u64,
     /// Bytes of level-1 runs read back from scratch at level 2, as stored.
     /// Scratch traffic is not a store request and never lands in a phase.
     pub scratch_read_bytes: u64,
@@ -290,6 +294,7 @@ struct RequestLedgerInner {
     level1_block_decodes: AtomicU64,
     level2_block_decodes: AtomicU64,
     scratch_write_bytes: AtomicU64,
+    scratch_writes: AtomicU64,
     scratch_read_bytes: AtomicU64,
     level1_workers: AtomicU64,
     encode_builders: AtomicU64,
@@ -378,6 +383,7 @@ impl RequestLedger {
         self.inner.level1_block_decodes.store(0, Ordering::Relaxed);
         self.inner.level2_block_decodes.store(0, Ordering::Relaxed);
         self.inner.scratch_write_bytes.store(0, Ordering::Relaxed);
+        self.inner.scratch_writes.store(0, Ordering::Relaxed);
         self.inner.scratch_read_bytes.store(0, Ordering::Relaxed);
         self.inner.level1_workers.store(0, Ordering::Relaxed);
         self.inner.encode_builders.store(0, Ordering::Relaxed);
@@ -434,11 +440,12 @@ impl RequestLedger {
         counter.fetch_add(blocks, Ordering::Relaxed);
     }
 
-    /// Account `bytes` of run bytes written to scratch, as stored.
+    /// Account one write of `bytes` run bytes to scratch, as stored.
     pub fn record_scratch_write(&self, bytes: u64) {
         self.inner
             .scratch_write_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+        self.inner.scratch_writes.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Account `bytes` of run bytes read back from scratch, as stored.
@@ -525,6 +532,7 @@ impl RequestLedger {
             level1_block_decodes: self.inner.level1_block_decodes.load(Ordering::Relaxed),
             level2_block_decodes: self.inner.level2_block_decodes.load(Ordering::Relaxed),
             scratch_write_bytes: self.inner.scratch_write_bytes.load(Ordering::Relaxed),
+            scratch_writes: self.inner.scratch_writes.load(Ordering::Relaxed),
             scratch_read_bytes: self.inner.scratch_read_bytes.load(Ordering::Relaxed),
             level1_workers: self.inner.level1_workers.load(Ordering::Relaxed),
             encode_builders: self.inner.encode_builders.load(Ordering::Relaxed),

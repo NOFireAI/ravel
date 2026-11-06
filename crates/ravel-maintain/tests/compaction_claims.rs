@@ -1424,13 +1424,40 @@ impl Clock for AfterFirstRunPart {
     }
 }
 
-/// A store that notes the ledger's scratch bytes written at the moment its
-/// one scripted fault, of kind `fault`, fires.
+/// A store that notes the ledger's scratch writes issued, and their bytes, at
+/// the moment its one scripted fault, of kind `fault`, fires.
 struct NoteScratchAtFault {
     inner: FaultStore<MemoryStore>,
     ledger: RequestLedger,
     fault: (Op, FaultKind),
-    at_fault: std::sync::Mutex<Option<u64>>,
+    at_fault: std::sync::Mutex<Option<ScratchAtFault>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScratchAtFault {
+    writes: u64,
+    bytes: u64,
+}
+
+/// Level-1 workers run as their own tasks, so between a worker's failing store
+/// call and the moment that worker stops the others, each other worker may
+/// already have issued the run-part write it was on. Past that, none writes
+/// another: at most `W1 - 1` writes follow the fault.
+fn assert_at_most_one_write_per_other_worker(
+    report: &ravel_maintain::RunRequestReport,
+    at_fault: ScratchAtFault,
+    what: &str,
+) {
+    let after = report.scratch_writes - at_fault.writes;
+    assert!(
+        after < report.level1_workers,
+        "{what}: {after} run-part writes followed the fault with {} workers: {report:?}",
+        report.level1_workers
+    );
+    assert!(
+        report.scratch_write_bytes >= at_fault.bytes,
+        "{report:?} {at_fault:?}"
+    );
 }
 
 impl NoteScratchAtFault {
@@ -1447,7 +1474,11 @@ impl NoteScratchAtFault {
         if self.inner.fault_count(self.fault.0, self.fault.1) > 0 {
             let mut at = self.at_fault.lock().unwrap();
             if at.is_none() {
-                *at = Some(self.ledger.report().scratch_write_bytes);
+                let report = self.ledger.report();
+                *at = Some(ScratchAtFault {
+                    writes: report.scratch_writes,
+                    bytes: report.scratch_write_bytes,
+                });
             }
         }
     }
@@ -1489,8 +1520,8 @@ impl ObjectStoreBackend for NoteScratchAtFault {
 
 /// ADR-3853 D4 with ADR-0065 claims: four level-1 workers share one claim
 /// guard, and a claim stolen at the first renewal, which falls due once the
-/// first run part is in scratch, stops every worker before it writes
-/// another run part. The unit abandons at that part boundary, level 2 never
+/// first run part is issued, stops every worker past the run part it was
+/// already writing. The unit abandons at that part boundary, level 2 never
 /// runs, nothing is PUT to the store, and the scratch unit is removed.
 ///
 /// `P` comes from a first run refused by constraint (a). The steal run's
@@ -1559,11 +1590,8 @@ async fn a_stolen_claim_cancels_every_level1_worker() {
     assert_eq!(report.level1_workers, 4, "{report:?}");
     assert_eq!(report.level1_groups, 20, "{report:?}");
     let at_steal = store.at_fault.lock().unwrap().expect("the steal fired");
-    assert!(at_steal > 0, "the steal followed a run part");
-    assert_eq!(
-        report.scratch_write_bytes, at_steal,
-        "no worker wrote a run part after the steal"
-    );
+    assert!(at_steal.writes > 0, "the steal followed a run part");
+    assert_at_most_one_write_per_other_worker(&report, at_steal, "steal");
     assert!(
         report.level1_passes < 20,
         "the workers stopped before merging every group: {report:?}"
@@ -1583,7 +1611,8 @@ async fn a_stolen_claim_cancels_every_level1_worker() {
 /// ADR-3853 D4: with no claim to lose, the shared stop token is the only
 /// thing that stops the other workers when one fails. A block GET of input 32
 /// fails for good partway through level 1, in group 10 of 20; every other
-/// worker stops before writing another run part, the unit returns that error,
+/// worker stops past the run part it was already writing, the unit returns
+/// that error,
 /// and the scratch unit is removed.
 #[tokio::test]
 async fn a_failed_level1_worker_stops_every_level1_worker() {
@@ -1631,11 +1660,11 @@ async fn a_failed_level1_worker_stops_every_level1_worker() {
     assert_eq!(report.level1_workers, 4, "{report:?}");
     assert_eq!(report.level1_groups, 20, "{report:?}");
     let at_fault = store.at_fault.lock().unwrap().expect("the GET failed");
-    assert!(at_fault > 0, "run parts were written before the failure");
-    assert_eq!(
-        report.scratch_write_bytes, at_fault,
-        "no worker wrote a run part after the failure"
+    assert!(
+        at_fault.writes > 0,
+        "run parts were written before the failure"
     );
+    assert_at_most_one_write_per_other_worker(&report, at_fault, "failed GET");
     assert_eq!(report.level2_passes, 0, "{report:?}");
     assert_eq!(report.part_put.requests, 0, "{report:?}");
     assert_eq!(report.publish.requests, 0, "{report:?}");

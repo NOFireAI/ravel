@@ -305,6 +305,7 @@ use ravel_object_store::{
 };
 use ravel_proto::commit::v1::CompactionPart;
 use ravel_types::declared_stats::{DeclaredColumnStat, DeclaredStatType, DeclaredStatValue};
+use tracing::instrument::WithSubscriber;
 
 use crate::bucket::Bucket;
 use crate::build::{BuiltPart, put_part_with_ledger};
@@ -512,6 +513,9 @@ impl SegmentCodec for RlogCodec {
         // `input_indexed_fields`). Every part of this compaction gets the same
         // list, so a field is indexed uniformly across the output.
         let indexed_fields = merged_indexed_fields(&catalogs);
+        // Moved, not cloned: a two-level merge's level-1 worker tasks each hold
+        // the set.
+        let catalogs: Arc<[RlogInputCatalog]> = catalogs.into();
         // The declared eligible columns to recompute per-part stamps for, learned
         // from the inputs' own stamps (ADR-0873 decision 3). Recomputed over
         // output rows in the merge, never copied from an input.
@@ -534,7 +538,7 @@ impl SegmentCodec for RlogCodec {
             // part is HEAD-verified after the record PUT instead of repaired from
             // RAM.
             false,
-            GeometryCheck::Refuse,
+            GeometryCheck::Refuse(&catalogs),
             &mut |_| Ok(true),
         )
         .await?;
@@ -1270,9 +1274,11 @@ pub(crate) async fn merge_catalogs(
 /// Whether [`merge_catalogs_with_geometry`] refuses a cursor plan whose
 /// predicted decode exceeds [`MAX_CURSOR_DECODE_AMPLIFICATION`] (ADR-3853 D0).
 /// Compaction refuses; the L1 and erasure rewrites keep merging as before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GeometryCheck {
-    Refuse,
+enum GeometryCheck<'a> {
+    /// Refuse, or merge in two levels. Carries the merge's inputs as one owned
+    /// set, the same catalogs as its `catalogs` slice, so each level-1 worker
+    /// task can hold them (ADR-3853 D4).
+    Refuse(&'a Arc<[RlogInputCatalog]>),
     Off,
 }
 
@@ -1312,7 +1318,7 @@ async fn merge_catalogs_with_geometry(
     declared: Vec<(String, DeclaredStatType)>,
     dry_run: bool,
     retain_bytes: bool,
-    geometry: GeometryCheck,
+    geometry: GeometryCheck<'_>,
     keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
 ) -> Result<MergeOutput> {
     // The entry points refuse a bad level before their first store request
@@ -1421,7 +1427,7 @@ async fn merge_catalogs_with_geometry(
     // when the process has scratch to hold the runs (ADR-3853 D0, D1); every
     // other plan runs single-level as before. Only compaction asks for the
     // refusal, and it keeps every record, so `keep` stops here.
-    if geometry == GeometryCheck::Refuse
+    if let GeometryCheck::Refuse(shared) = geometry
         && let Some(refusal) = geometry_refusal(&plan, catalogs.len(), stream_ids.len())
     {
         let Some(scratch_dir) = config.scratch_dir.as_deref() else {
@@ -1436,7 +1442,7 @@ async fn merge_catalogs_with_geometry(
             retain_bytes,
             scratch_dir,
         };
-        return two_level_merge(&target, catalogs, &stream_ids, width_ns, output).await;
+        return two_level_merge(&target, shared, &stream_ids, width_ns, output).await;
     }
     let mut sink = PartSink {
         store,
@@ -2055,11 +2061,12 @@ fn scratch_backend(store: &Arc<ScratchStore>) -> Arc<dyn ObjectStoreBackend> {
     Arc::clone(store) as Arc<dyn ObjectStoreBackend>
 }
 
-/// A unit's scratch store that adds every byte written to and read from it to
-/// the ledger's scratch counters (ADR-3853 D6), as stored: a run's encoded
-/// bytes, never a request phase. It records a write that failed for want of
-/// space in `full`. Its capabilities report no multipart upload: a multipart
-/// write would bypass both the write counter and that record.
+/// A unit's scratch store that adds every byte read from it to the ledger's
+/// scratch counters (ADR-3853 D6), as stored: a run's encoded bytes, never a
+/// request phase. Writes reach it only through the level-1 workers'
+/// [`StoreProxy`], which counts them when issued. It records a write that
+/// failed for want of space in `full`. Its capabilities report no multipart
+/// upload: a multipart write would bypass that record.
 struct ScratchMeter {
     scratch: Arc<dyn ObjectStoreBackend>,
     ledger: Option<RequestLedger>,
@@ -2074,11 +2081,8 @@ impl ObjectStoreBackend for ScratchMeter {
         data: Bytes,
         opts: PutOptions,
     ) -> std::result::Result<PutOutcome, StoreError> {
-        // Counted when the write is issued, so a write in flight when the
-        // merge stops is already in the ledger.
-        if let Some(l) = &self.ledger {
-            l.record_scratch_write(data.len() as u64);
-        }
+        // The write was counted where the level-1 worker issued it
+        // ([`StoreProxy::put`]).
         self.scratch.put(key, data, opts).await.inspect_err(|e| {
             if is_scratch_full(e) {
                 self.full.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2146,7 +2150,7 @@ impl ObjectStoreBackend for ScratchMeter {
 /// it keeps every record.
 async fn two_level_merge(
     target: &TwoLevelTarget<'_>,
-    catalogs: &[RlogInputCatalog],
+    catalogs: &Arc<[RlogInputCatalog]>,
     stream_ids: &[LogStreamId],
     width_ns: i64,
     output: OutputSpec,
@@ -2160,7 +2164,7 @@ async fn two_level_merge(
     let mut run_bytes = Vec::with_capacity(inputs);
     let mut block_bytes = 0u64;
     let mut extents: Vec<u64> = Vec::new();
-    for catalog in catalogs {
+    for catalog in catalogs.iter() {
         per_input = per_input.max(level1_input_bytes(catalog)?);
         let mut decoded = 0u64;
         for block in 0..catalog.pricing.block_rows.len() {
@@ -2303,22 +2307,391 @@ struct TwoLevelLayout {
     free: u64,
 }
 
-/// What every level-1 worker of one two-level merge shares (ADR-3853 D4):
-/// the groups, handed out in index order through `next`, and the stop token.
-struct Level1Groups<'a> {
-    target: &'a TwoLevelTarget<'a>,
-    catalogs: &'a [RlogInputCatalog],
+/// What every level-1 worker of one two-level merge shares (ADR-3853 D4),
+/// owned so each worker runs as its own task: the groups, handed out in index
+/// order through `next`, the stop token, and the input store and the unit's
+/// scratch, each reached through a [`StoreProxy`] the unit's task serves.
+struct Level1Groups {
+    store: StoreProxy,
+    scratch: StoreProxy,
+    bucket: Bucket,
+    input_set_hash: [u8; 32],
+    catalogs: Arc<[RlogInputCatalog]>,
     group_len: usize,
     width_ns: i64,
     identity: ObjectIdentity,
-    key_index_fields: &'a [(String, KeyType)],
-    run_declared: &'a Arc<DeclaredSchema>,
-    run_writer: &'a Arc<PartWriterSettings>,
-    scratch: &'a ScratchMeter,
+    key_index_fields: Vec<(String, KeyType)>,
+    run_declared: Arc<DeclaredSchema>,
+    run_writer: Arc<PartWriterSettings>,
     run_target: u64,
     ceiling: u64,
     next: std::sync::atomic::AtomicUsize,
-    stop: Level1Stop,
+    stop: Arc<Level1Stop>,
+    #[cfg(test)]
+    probe: Option<Arc<Level1Probe>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Handed to the level-1 workers of a merge unit started on this thread.
+    static LEVEL1_PROBE: std::cell::RefCell<Option<Arc<Level1Probe>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Where the first two level-1 groups of a unit meet before their merges, for
+/// a test that the groups run on distinct threads. The first holds its thread,
+/// up to a bound, until the second arrives while it is still there; each one
+/// that meets the other notes its thread.
+#[cfg(test)]
+#[derive(Default)]
+struct Level1Probe {
+    arrived: std::sync::atomic::AtomicUsize,
+    inside: std::sync::atomic::AtomicUsize,
+    met: std::sync::atomic::AtomicBool,
+    threads: std::sync::Mutex<Vec<std::thread::ThreadId>>,
+}
+
+#[cfg(test)]
+impl Level1Probe {
+    fn enter_group(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.arrived.fetch_add(1, SeqCst) >= 2 {
+            return;
+        }
+        let note = || {
+            self.threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(std::thread::current().id());
+        };
+        if self.inside.fetch_add(1, SeqCst) == 1 {
+            self.met.store(true, SeqCst);
+            note();
+        } else {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !self.met.load(SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if self.met.load(SeqCst) {
+                note();
+            }
+        }
+        self.inside.fetch_sub(1, SeqCst);
+    }
+}
+
+/// One call a level-1 worker task makes on a store the unit's task holds by
+/// reference, answered on `reply`.
+enum StoreCall {
+    Put {
+        key: String,
+        data: Bytes,
+        opts: PutOptions,
+        reply: StoreReply<PutOutcome>,
+    },
+    Get {
+        key: String,
+        range: GetRange,
+        reply: StoreReply<GetOutcome>,
+    },
+    GetPinned {
+        key: String,
+        range: GetRange,
+        pin: ravel_object_store::Pin,
+        reply: StoreReply<ravel_object_store::PinnedRead>,
+    },
+    GetWithPin {
+        key: String,
+        range: GetRange,
+        reply: StoreReply<ravel_object_store::PinnedRead>,
+    },
+    PinOf {
+        key: String,
+        reply: StoreReply<(ObjectMeta, ravel_object_store::Pin)>,
+    },
+    Head {
+        key: String,
+        reply: StoreReply<ObjectMeta>,
+    },
+    List {
+        prefix: String,
+        page: Option<PageToken>,
+        reply: StoreReply<ListPage>,
+    },
+    ListAfter {
+        prefix: String,
+        start_after: Option<String>,
+        page: Option<PageToken>,
+        reply: StoreReply<ListPage>,
+    },
+    ListDelimited {
+        prefix: String,
+        reply: StoreReply<DelimitedList>,
+    },
+    Delete {
+        key: String,
+        reply: StoreReply<()>,
+    },
+}
+
+type StoreReply<T> = tokio::sync::oneshot::Sender<std::result::Result<T, StoreError>>;
+
+/// A store a level-1 worker task reaches through the unit's task, which holds
+/// the real one by reference ([`serve_store_calls`]). Every call still runs on
+/// the unit's task, as it did when the workers were futures of that task;
+/// only the decode, merge and encode work moves to the workers' threads. Once
+/// the unit stops serving, a call fails rather than reaching the store, so no
+/// worker touches the input store or the scratch after the unit's merge
+/// returns or is dropped.
+struct StoreProxy {
+    calls: tokio::sync::mpsc::UnboundedSender<StoreCall>,
+    capabilities: Capabilities,
+    /// The ledger every PUT is counted on as a scratch write when the worker
+    /// issues it, so a write in flight when level 1 stops is already counted;
+    /// `None` on the input store's proxy.
+    scratch_writes: Option<RequestLedger>,
+}
+
+impl StoreProxy {
+    fn open(
+        store: &dyn ObjectStoreBackend,
+        scratch_writes: Option<RequestLedger>,
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<StoreCall>) {
+        let (calls, served) = tokio::sync::mpsc::unbounded_channel();
+        let proxy = StoreProxy {
+            calls,
+            scratch_writes,
+            // A multipart upload borrows the store for its lifetime, which a
+            // proxied call cannot; level 1 writes no multipart object.
+            capabilities: Capabilities {
+                multipart: false,
+                ..store.capabilities()
+            },
+        };
+        (proxy, served)
+    }
+
+    async fn call<T>(
+        &self,
+        call: impl FnOnce(StoreReply<T>) -> StoreCall,
+    ) -> std::result::Result<T, StoreError> {
+        let stopped = || {
+            StoreError::Permanent(
+                "two-level merge unit stopped serving its level-1 workers".to_string(),
+            )
+        };
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.calls.send(call(reply)).map_err(|_| stopped())?;
+        answer.await.map_err(|_| stopped())?
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for StoreProxy {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> std::result::Result<PutOutcome, StoreError> {
+        if let Some(l) = &self.scratch_writes {
+            l.record_scratch_write(data.len() as u64);
+        }
+        let key = key.to_string();
+        self.call(|reply| StoreCall::Put {
+            key,
+            data,
+            opts,
+            reply,
+        })
+        .await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> std::result::Result<GetOutcome, StoreError> {
+        let key = key.to_string();
+        self.call(|reply| StoreCall::Get { key, range, reply })
+            .await
+    }
+
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &ravel_object_store::Pin,
+    ) -> std::result::Result<ravel_object_store::PinnedRead, StoreError> {
+        let key = key.to_string();
+        let pin = pin.clone();
+        self.call(|reply| StoreCall::GetPinned {
+            key,
+            range,
+            pin,
+            reply,
+        })
+        .await
+    }
+
+    async fn get_with_pin(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> std::result::Result<ravel_object_store::PinnedRead, StoreError> {
+        let key = key.to_string();
+        self.call(|reply| StoreCall::GetWithPin { key, range, reply })
+            .await
+    }
+
+    async fn pin_of(
+        &self,
+        key: &str,
+    ) -> std::result::Result<(ObjectMeta, ravel_object_store::Pin), StoreError> {
+        let key = key.to_string();
+        self.call(|reply| StoreCall::PinOf { key, reply }).await
+    }
+
+    async fn head(&self, key: &str) -> std::result::Result<ObjectMeta, StoreError> {
+        let key = key.to_string();
+        self.call(|reply| StoreCall::Head { key, reply }).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        page: Option<PageToken>,
+    ) -> std::result::Result<ListPage, StoreError> {
+        let prefix = prefix.to_string();
+        self.call(|reply| StoreCall::List {
+            prefix,
+            page,
+            reply,
+        })
+        .await
+    }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> std::result::Result<ListPage, StoreError> {
+        let prefix = prefix.to_string();
+        let start_after = start_after.map(str::to_string);
+        self.call(|reply| StoreCall::ListAfter {
+            prefix,
+            start_after,
+            page,
+            reply,
+        })
+        .await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> std::result::Result<DelimitedList, StoreError> {
+        let prefix = prefix.to_string();
+        self.call(|reply| StoreCall::ListDelimited { prefix, reply })
+            .await
+    }
+
+    async fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+        let key = key.to_string();
+        self.call(|reply| StoreCall::Delete { key, reply }).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.capabilities
+    }
+}
+
+/// Answer `served` on `store`, every call concurrently, until each
+/// [`StoreProxy`] sending on it is gone.
+async fn serve_store_calls(
+    store: &dyn ObjectStoreBackend,
+    mut served: tokio::sync::mpsc::UnboundedReceiver<StoreCall>,
+) {
+    futures::stream::poll_fn(|cx| served.poll_recv(cx))
+        .for_each_concurrent(None, |call| serve_store_call(store, call))
+        .await;
+}
+
+/// Run one proxied call on `store`. A worker that stopped waiting dropped its
+/// receiver, so a reply that cannot be delivered is discarded.
+async fn serve_store_call(store: &dyn ObjectStoreBackend, call: StoreCall) {
+    fn answer<T>(reply: StoreReply<T>, result: std::result::Result<T, StoreError>) {
+        if reply.send(result).is_err() {
+            tracing::trace!("a level-1 worker stopped waiting for its store call");
+        }
+    }
+    match call {
+        StoreCall::Put {
+            key,
+            data,
+            opts,
+            reply,
+        } => answer(reply, store.put(&key, data, opts).await),
+        StoreCall::Get { key, range, reply } => answer(reply, store.get(&key, range).await),
+        StoreCall::GetPinned {
+            key,
+            range,
+            pin,
+            reply,
+        } => answer(reply, store.get_pinned(&key, range, &pin).await),
+        StoreCall::GetWithPin { key, range, reply } => {
+            answer(reply, store.get_with_pin(&key, range).await);
+        }
+        StoreCall::PinOf { key, reply } => answer(reply, store.pin_of(&key).await),
+        StoreCall::Head { key, reply } => answer(reply, store.head(&key).await),
+        StoreCall::List {
+            prefix,
+            page,
+            reply,
+        } => answer(reply, store.list(&prefix, page).await),
+        StoreCall::ListAfter {
+            prefix,
+            start_after,
+            page,
+            reply,
+        } => answer(
+            reply,
+            store
+                .list_after(&prefix, start_after.as_deref(), page)
+                .await,
+        ),
+        StoreCall::ListDelimited { prefix, reply } => {
+            answer(reply, store.list_delimited(&prefix).await);
+        }
+        StoreCall::Delete { key, reply } => answer(reply, store.delete(&key).await),
+    }
+}
+
+/// The unit's level-1 worker tasks, aborted if the unit's merge is dropped
+/// before they end.
+struct Level1Tasks(Vec<tokio::task::JoinHandle<Option<Level1Runs>>>);
+
+impl Level1Tasks {
+    /// Every worker's result. A worker task that panicked resumes the panic
+    /// here, on the unit's task, as it did when the workers were futures of
+    /// that task.
+    async fn join(&mut self, stop: &Level1Stop) -> Vec<Option<Level1Runs>> {
+        futures::future::join_all(self.0.iter_mut().map(|task| async move {
+            match task.await {
+                Ok(done) => done,
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(e) => {
+                    stop.fail(MaintainError::Invariant(format!(
+                        "level-1 worker task: {e}"
+                    )));
+                    None
+                }
+            }
+        }))
+        .await
+    }
+}
+
+impl Drop for Level1Tasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 /// What one level-1 worker merged: each group's index with its run's scratch
@@ -2329,10 +2702,11 @@ struct Level1Runs {
     counts: RecordCounts,
 }
 
-/// One level-1 worker under `config`, its per-worker share of the unit's. An
-/// error stops every worker through the shared token and yields `None`.
-async fn level1_worker(groups: &Level1Groups<'_>, config: &CompactorConfig) -> Option<Level1Runs> {
-    match level1_worker_groups(groups, config).await {
+/// One level-1 worker task under `config`, its per-worker share of the
+/// unit's. An error stops every worker through the shared token and yields
+/// `None`.
+async fn level1_worker(groups: Arc<Level1Groups>, config: CompactorConfig) -> Option<Level1Runs> {
+    match level1_worker_groups(&groups, &config).await {
         Ok(done) => Some(done),
         Err(e) => {
             groups.stop.fail(e);
@@ -2342,10 +2716,9 @@ async fn level1_worker(groups: &Level1Groups<'_>, config: &CompactorConfig) -> O
 }
 
 async fn level1_worker_groups(
-    groups: &Level1Groups<'_>,
+    groups: &Level1Groups,
     config: &CompactorConfig,
 ) -> Result<Level1Runs> {
-    let target = groups.target;
     let mut done = Level1Runs::default();
     let mut keep_all = |_: &LogRecord| -> Result<bool> { Ok(true) };
     loop {
@@ -2378,16 +2751,20 @@ async fn level1_worker_groups(
             groups.ceiling,
             groups.run_target,
         )?;
+        #[cfg(test)]
+        if let Some(probe) = &groups.probe {
+            probe.enter_group();
+        }
         let mut sink = PartSink {
-            store: target.store,
-            bucket: target.bucket,
+            store: &groups.store,
+            bucket: &groups.bucket,
             config,
-            input_set_hash: target.input_set_hash,
+            input_set_hash: &groups.input_set_hash,
             identity: groups.identity,
             indexed_fields: Vec::new(),
-            key_index_fields: groups.key_index_fields.to_vec(),
-            declared: Arc::clone(groups.run_declared),
-            writer: Arc::clone(groups.run_writer),
+            key_index_fields: groups.key_index_fields.clone(),
+            declared: Arc::clone(&groups.run_declared),
+            writer: Arc::clone(&groups.run_writer),
             tracker: config.merge_memory_tracker.as_ref(),
             dry_run: false,
             retain_bytes: false,
@@ -2400,7 +2777,7 @@ async fn level1_worker_groups(
                 level: 1,
             }),
             run: Some(RunTarget {
-                scratch: groups.scratch,
+                scratch: &groups.scratch,
                 index,
                 keys: Vec::new(),
                 stop: &groups.stop,
@@ -2410,7 +2787,7 @@ async fn level1_worker_groups(
             stored_target: u64::MAX,
         };
         merge_planned(
-            target.store,
+            &groups.store,
             group,
             &group_streams,
             groups.width_ns,
@@ -2428,7 +2805,7 @@ async fn level1_worker_groups(
 /// unit's scratch `meter`.
 async fn merge_in_unit(
     target: &TwoLevelTarget<'_>,
-    catalogs: &[RlogInputCatalog],
+    catalogs: &Arc<[RlogInputCatalog]>,
     stream_ids: &[LogStreamId],
     width_ns: i64,
     output: OutputSpec,
@@ -2470,31 +2847,54 @@ async fn merge_in_unit(
             ..config.clone()
         })
         .collect();
-    let groups = Level1Groups {
-        target,
-        catalogs,
+    // Each worker is its own task, so the groups' decode and merge run on as
+    // many runtime threads as there are workers. Every store and scratch call
+    // they make is served here, on the unit's task, which holds both by
+    // reference.
+    let stop = Arc::new(Level1Stop::default());
+    let (store, store_calls) = StoreProxy::open(target.store, None);
+    let (scratch, scratch_calls) = StoreProxy::open(meter, ledger.clone());
+    let groups = Arc::new(Level1Groups {
+        store,
+        scratch,
+        bucket: *target.bucket,
+        input_set_hash: *target.input_set_hash,
+        catalogs: Arc::clone(catalogs),
         group_len,
         width_ns,
         identity: output.identity,
-        key_index_fields: &output.key_index_fields,
-        run_declared: &run_declared,
-        run_writer: &run_writer,
-        scratch: meter,
+        key_index_fields: output.key_index_fields.clone(),
+        run_declared: Arc::clone(&run_declared),
+        run_writer: Arc::clone(&run_writer),
         run_target,
         ceiling: layout.worker_ceiling,
         next: std::sync::atomic::AtomicUsize::new(0),
-        stop: Level1Stop::default(),
-    };
-    let done = futures::future::join_all(
+        stop: Arc::clone(&stop),
+        #[cfg(test)]
+        probe: LEVEL1_PROBE.with(|p| p.borrow().clone()),
+    });
+    let mut workers = Level1Tasks(
         worker_configs
-            .iter()
-            .map(|worker_config| level1_worker(&groups, worker_config)),
-    )
-    .await;
+            .into_iter()
+            .map(|worker_config| {
+                tokio::spawn(
+                    level1_worker(Arc::clone(&groups), worker_config).with_current_subscriber(),
+                )
+            })
+            .collect(),
+    );
+    // The workers now hold the only proxies, so the serving below ends once
+    // the last worker does.
+    drop(groups);
+    let (done, (), ()) = tokio::join!(
+        workers.join(&stop),
+        serve_store_calls(target.store, store_calls),
+        serve_store_calls(meter, scratch_calls),
+    );
     if let Some(t) = tracker {
         t.absorb_workers(&worker_trackers);
     }
-    if let Some(e) = groups.stop.take() {
+    if let Some(e) = stop.take() {
         return Err(e);
     }
     let mut level1 = RecordCounts::default();
@@ -15291,6 +15691,46 @@ mod tests {
             assert!(outputs[0].1.parts == outputs[1].1.parts, "part bytes");
             assert_eq!(outputs[1].0, oracle.0, "single-level part keys");
             assert!(outputs[1].1 == oracle.1, "single-level parts");
+        }
+
+        /// ADR-3853 D4: each level-1 worker runs on its own task, so with four
+        /// workers on a multi-thread runtime two groups' merges are under way
+        /// at once on two threads. The probe holds the first group's thread,
+        /// without yielding it, until a second group arrives: workers that
+        /// were futures of the unit's one task could never meet there. The
+        /// published parts stay the single-level ones.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn level1_workers_run_on_distinct_threads() {
+            let (oracle, _, per_input) = single_level_oracle().await;
+            let run_target = 5 * per_input;
+            let ceiling = group_ceiling(per_input, TWO_LEVEL_RUN_PER_INPUTS * per_input, 12);
+            let dir = fresh_scratch("distinct-threads");
+            let config = CompactorConfig {
+                level1_workers: Some(4),
+                ..two_level_config(ceiling, run_target, Some(dir.clone()))
+            };
+            let probe = Arc::new(Level1Probe::default());
+            LEVEL1_PROBE.with(|p| *p.borrow_mut() = Some(Arc::clone(&probe)));
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            LEVEL1_PROBE.with(|p| *p.borrow_mut() = None);
+            outcome.expect("two-level compact");
+            assert_eq!(run.report.level1_workers, 4, "{:?}", run.report);
+            assert_eq!(run.report.level1_groups, 8, "{:?}", run.report);
+
+            let threads = probe
+                .threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let distinct: BTreeSet<String> = threads.iter().map(|t| format!("{t:?}")).collect();
+            assert!(
+                distinct.len() > 1,
+                "two level-1 group merges ran at once on distinct threads: {threads:?}"
+            );
+            assert!(scratch_entries(&dir).is_empty());
+            let two_level = published(&store).await;
+            assert_eq!(two_level.0, oracle.0, "single-level part keys");
+            assert!(two_level.1 == oracle.1, "single-level parts");
         }
 
         /// ADR-3853 D4 and D3 at the production shape: 32 cores, 4 units of
