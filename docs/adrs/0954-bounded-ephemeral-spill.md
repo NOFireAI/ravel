@@ -220,7 +220,9 @@ drops the reason drops the requirement.
    ceiling. An unset directory is a configuration error, not a fall-through
    to the OS default (amended: see the cache-dir spill default amendment
    below, which derives the directory and its ceiling from `--cache-dir` when
-   no spill environment names one, and keeps spill off when neither does).
+   no spill environment names one, and keeps spill off when neither does;
+   amended again by the refusal-retry spill amendment below, which turns
+   spill on under the working directory when nothing else configures it).
 
 4. **Exactness-aware eligibility, not an operator-name allowlist.**
    Eligibility is decided by whether spilling an operator yields the
@@ -579,7 +581,10 @@ source wins:
    more than half of what the read cache leaves free. With the host's
    memory unknown the budget is unbounded and only the half-of-free clause
    and the 1 GiB threshold apply.
-4. Otherwise spill is disabled.
+4. Otherwise spill is disabled. (The refusal-retry spill amendment below
+   replaces this item with the working directory as a fourth source, and
+   replaces the whole-ceiling reservation of requirement 2 with fixed
+   shares reserved only on a spill retry.)
 
 `RAVEL_SQL_SPILL_DIR` set without `RAVEL_SQL_SPILL_MAX_BYTES`, or
 `RAVEL_SQL_SPILL_MAX_BYTES` set alone with no `--cache-dir`, still refuses
@@ -727,7 +732,8 @@ from it, every query granted spill reserves its cap from that budget, and
 `ravel-server` builds one executor per process and shares it across its
 HTTP, mTLS and Flight SQL surfaces. The environment pair therefore sets the
 directory and the process-wide ceiling. Nothing else in the amendment
-changes.
+changes. The refusal-retry spill amendment below divides this ceiling into
+shares.
 
 ## Amendment (2026-11-06): exact min, max and integer avg spill (issue #3899)
 
@@ -792,3 +798,196 @@ Ravel's `min` over strings, `max` over integers and `avg` over `Int32`
 returns the in-memory result value for value, the average bit for bit, and
 so does the row 29 shape; `crates/ravel-sql/tests/spill.rs` pins both with
 nonzero spill counters.
+
+## Amendment (2026-11-07): spill only after a refusal, shared scratch, and spill on by default (issue #3899)
+
+<!-- amendment-applies: sections="Normative implementation requirements|Amendment (2026-10-03): spill under --cache-dir by default, and a tie-ordered Sort (issue #2416)|Correction (2026-10-14): the spill ceiling is per process" pointer="refusal-retry spill amendment" -->
+
+This is the refusal-retry spill amendment.
+
+### Refusal-retry context
+
+ClickBench was run through its own harness on c6a.large (2 vCPU, 4 GB),
+c6a.xlarge (8 GB) and c6a.2xlarge (16 GB) (issue #3899). On v0.30.1 with
+spill off, the stock configuration, the three machines refused 9, 4 and 1
+statements, every one a typed memory-budget refusal.
+
+With spill on through the environment pair, some refused statements
+answered, but three properties of the decision above cost the rest:
+
+1. **An eligible statement is planned without repartitioning whether or
+   not it spills.** The disk-manager permission is decided per statement
+   before execution, and `RepartitionExec`, which no logical-plan
+   classification sees, would hold it. On c6a.2xlarge the hot time of the
+   statements that answered both ways rose 1.73x. Rows 34 to 36, which
+   never needed spill, ran about 3.2x slower.
+2. **Each eligible statement reserves the whole process ceiling.**
+   Concurrent statements then ran without spill: the concurrent phase
+   logged 243 `SQL spill disabled for this statement` warnings.
+3. **The query pool is first come, first served.** A c6a.large measurement
+   with requirement 6's per-consumer attribution showed this in every
+   refusal of an eligible statement:
+   - the asker was a scan that cannot spill, asking for 82 KB to 1.34 MB;
+   - the top holder was one spill-capable final aggregate, holding 99.4%
+     to 99.9% of the per-query limit;
+   - consumers that cannot spill held 2.2 MB to 6.1 MB at their peak.
+
+   The aggregate filled the pool to the limit and never spilled. One more
+   refusal had the same cause from another side: an aggregate reserve-ahead
+   refusal of a spill-capable final aggregate on the process envelope
+   (853,958,589 bytes asked) failed the statement where a spill was
+   available.
+
+### Refusal-retry decision
+
+1. **Spill is a second attempt, not a plan property.** Every statement
+   first runs as if spill were not configured. That holds at every read of
+   the spill configuration, not only the scratch reservation: the plan, the
+   session, the column-statistics decision and the pool are those of a
+   server with spill unconfigured.
+
+   When that attempt fails with a memory-budget refusal, the statement
+   retries once with spill allowed, but only if all of these hold:
+   - the attempt's pool recorded the refusal as a typed signal, not a
+     message (a fetch-layer refusal of the process budget with an
+     accounted cause also counts);
+   - no batch was emitted;
+   - spill is configured;
+   - the statement's classification plan is spill-eligible under
+     requirement 4;
+   - the statement has not retried for spill before.
+
+   The retry re-resolves, is planned with spill allowed, and runs within
+   the same statement deadline. Its result or typed error is the
+   statement's; nothing is assembled across attempts. These are returned as
+   they are, with no retry:
+   - a refusal after emission;
+   - a second refusal;
+   - `spill_budget_exhausted` and `spill_unavailable`;
+   - a deadline;
+   - a host memory gate refusal.
+
+   Exactness is unchanged: the retry is the path this ADR already admits.
+   Flight SQL keeps the per-statement decision until it has the same retry.
+2. **A spill-enabled query pool keeps headroom for what cannot spill.** In
+   the retry's pool, a spill-capable consumer is refused, and so spills,
+   once the bytes charged to spill-capable consumers plus their aggregate
+   envelopes would exceed the query limit `L` less a headroom `H`.
+   Consumers that cannot spill may use that headroom. `H` is `max(64 MiB,
+   10% of L)`, more than twenty times the peak the c6a.large measurement
+   found. It is re-derived if a later measurement finds a peak above it.
+3. **In a spill-enabled pool, a reserve-ahead refusal of a spill-capable
+   consumer is a spill trigger, not a failure.** The same refusal of a
+   consumer that cannot spill is unchanged, and so is any refusal in a
+   pool whose query may not spill.
+4. **The process ceiling is shared in fixed shares.** `slots =
+   clamp(floor(ceiling / 8 GiB), 1, 4)`. A query granted spill reserves
+   `min(ceiling / slots, remaining)`, and runs without spill when that is
+   under 64 MiB. A ceiling under 16 GiB keeps one slot, which is the
+   earlier behaviour.
+5. **Spill is on by default.** With no `--sql-spill off`, no environment
+   pair and no `--cache-dir`, spill resolves as item 3 of the cache-dir
+   spill default amendment does, with two differences: the process's
+   working directory takes the place of the cache directory, and there is
+   no read cache to subtract. The root is
+   `<working directory>/sql-spill/<instance-id>`, with the same owner lock
+   and startup sweep. The ceiling is `derive_spill_max_bytes`, unchanged.
+
+   Spill resolves off, with a WARN, in three cases:
+
+   | condition | `source` |
+   |---|---|
+   | the directory sits on tmpfs or ramfs | `cwd-tmpfs` |
+   | it cannot be read, or the spill directory cannot be created, measured or locked | `cwd-unavailable` |
+   | half its free bytes is under 1 GiB | `cwd-insufficient-space` |
+
+   With spill on this way, both startup lines read `source="cwd-default"`,
+   and `unset` is no longer reported.
+
+   The precedence is `--sql-spill off`, then the environment pair, then
+   `--cache-dir`, then the working directory. This replaces requirement
+   3's sentence that an unset directory is a configuration error. Its
+   purpose stands: the directory is never the OS temp directory and never
+   memory-backed, and the ceiling is never DataFusion's 100 GB default.
+
+   On the repository's container image the working directory is `/` and
+   is not writable, so a container resolves `cwd-unavailable` unless it
+   mounts a volume and names it.
+
+The ordering matters: item 5 without item 1 would bring the repartition-free
+plan back to every eligible statement on every default deployment.
+
+### Refusal-retry rejected alternatives
+
+- **Keep the repartitioned plan and enable the disk manager on it.** An
+  enabled session is not the same session when nothing spills.
+  DataFusion 55.2's final aggregate reserves four more bytes per group for
+  spill sorting and registers as spill-capable, which ends the
+  last-release hold. A statement that fits today could be refused, or
+  spill. This remains the path to parallel spill, once the exchange spill
+  is classified and the bucketed final aggregate can spill.
+- **Grant spill per operator at run time.** This is exact, but DataFusion
+  reads the permission from the session's runtime environment per stream.
+  It needs a wrapper that hands classified operators a different task
+  context, so it is deferred on complexity. Item 1 already removes the
+  cost it would remove.
+- **Cap the consumers that cannot spill.** A non-spillable consumer
+  refused at its cap fails the query just as it does at the limit. The cap
+  moves the failure; it does not create room.
+- **Shrink the aggregate reserve-ahead envelope on small limits.** The
+  envelope stands for an allocation DataFusion makes before it reserves.
+  Shrinking it trades a typed refusal for memory no budget sees. Item 3
+  makes the envelope refusal a spill point instead.
+- **One share per expected concurrent query (`ceiling / Q`).** A
+  high-cardinality statement's spill is set by the data, not the host:
+  q33's is several gigabytes on every box. A sixteenth of the ceiling
+  would refuse it on the larger box.
+- **Default under the OS temp directory.** On several distributions it is
+  tmpfs, which is memory. Inside a cgroup it is charged to the memory limit
+  spill exists to protect.
+- **Leave spill off and set it in the benchmark entry.** A deployment on
+  defaults would keep refusing statements this ADR says must answer.
+
+The exact min, max and integer avg spill amendment above extends the
+tie-order rewrite through a `HAVING` filter. That change is separate, and
+it is measured on the statement it moves.
+
+### Refusal-retry consequences
+
+- A statement that answered before this amendment runs the same plan and
+  session whether or not spill is configured.
+- An eligible statement refused for memory runs twice: once to the
+  refusal, and once with spill. It returns the exact result or a typed
+  error. The refused attempt's time is part of its latency. One INFO line
+  names the refusal class, the time to refusal and the retry's spill bytes.
+- A spilling query's non-spillable consumers keep `H` of its limit.
+- Up to four queries spill at once on a ceiling of 32 GiB or more. A
+  ceiling under 16 GiB still admits one spilling query at a time.
+- A deployment with no spill configuration now writes to its working
+  directory when a statement needs to spill. `--sql-spill off` restores
+  requirement 9's no-spill profile.
+- A container whose working directory is on overlay storage counts spill
+  against the pod's ephemeral storage, so it should name a volume
+  explicitly. The operator does not yet render one (issue #3916).
+- Unchanged: object storage is the only durable store, spill is per-query
+  ephemeral state no other process reads, and no partial result is
+  returned.
+
+### Refusal-retry diagram
+
+```mermaid
+flowchart TB
+    S["SQL statement"] --> A1["Attempt 1: spill not configured<br/>(plan, session and pool as with no spill)"]
+    A1 -->|"answers"| R["Exact result"]
+    A1 -->|"typed memory refusal"| G{"Refusal recorded by the pool,<br/>no batch emitted, spill configured,<br/>statement spill-eligible, no earlier spill retry?"}
+    G -->|"no"| E1["Typed ResourcesExhausted<br/>(as before)"]
+    G -->|"yes"| SH{"Spill share available?<br/>min(ceiling / slots, remaining) >= 64 MiB"}
+    SH -->|"no"| E1
+    SH -->|"yes"| A2["Attempt 2: spill-enabled plan<br/>spill-capable consumers capped at L - H;<br/>their reserve-ahead refusal spills"]
+    A2 -->|"answers"| R
+    A2 -->|"scratch share exceeded"| E2["spill_budget_exhausted"]
+    A2 -->|"refusal of a consumer that cannot spill"| E1
+    R --> C["Scratch removed, share released;<br/>INFO line: refusal class, time to refusal, spill bytes"]
+    E1 --> C
+    E2 --> C
+```
