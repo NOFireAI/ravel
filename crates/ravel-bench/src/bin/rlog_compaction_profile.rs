@@ -453,12 +453,49 @@ fn object_records(
             });
         }
     }
-    records.sort_by(|a, b| (a.stream_id, a.ts_ns).cmp(&(b.stream_id, b.ts_ns)));
+    records.sort_by_key(|r| (r.stream_id, r.ts_ns));
     records
 }
 
+/// Builds L0 object `index` of the bucket on its own, so a caller (the shape
+/// test) can inspect full-scale objects without building all of them.
+fn build_object(
+    args: &Args,
+    index: usize,
+    specs: &[FieldSpec],
+    all: &[Stream],
+    writer_id: Uuid,
+    epoch: u64,
+) -> L0Object {
+    let records = object_records(args, index, specs, all);
+    let seq = index as u64 + 1;
+    let identity = ObjectIdentity {
+        tenant_hash: TenantId::new(TENANT).hash().0,
+        shard: SHARD,
+        writer_id: writer_id.into_bytes(),
+        writer_epoch: epoch,
+        writer_seq: seq,
+    };
+    let streams: HashSet<_> = records.iter().map(|r| r.stream_id).collect();
+    let min_ts = records.iter().map(|r| r.ts_ns).min().unwrap_or(0);
+    let max_ts = records.iter().map(|r| r.ts_ns).max().unwrap_or(0);
+    let count = records.len() as u64;
+    let mut w = RlogWriter::new(RlogConfig::default(), identity);
+    for r in records {
+        w.push(r).expect("push L0 record");
+    }
+    let bytes = Bytes::from(w.finish().expect("finish L0 object"));
+    L0Object {
+        seq,
+        bytes,
+        records: count,
+        streams: streams.len() as u64,
+        min_ts,
+        max_ts,
+    }
+}
+
 fn build_objects(args: &Args, writer_id: Uuid, epoch: u64) -> Vec<L0Object> {
-    let tenant_hash = TenantId::new(TENANT).hash();
     let specs = field_specs(args.seed);
     let all = streams(args.streams);
     let threads = std::thread::available_parallelism()
@@ -474,34 +511,9 @@ fn build_objects(args: &Args, writer_id: Uuid, epoch: u64) -> Vec<L0Object> {
                 scope.spawn(move || {
                     let mut built = Vec::new();
                     for index in (t..args.inputs).step_by(threads) {
-                        let records = object_records(args, index, specs, all);
-                        let seq = index as u64 + 1;
-                        let identity = ObjectIdentity {
-                            tenant_hash: tenant_hash.0,
-                            shard: SHARD,
-                            writer_id: writer_id.into_bytes(),
-                            writer_epoch: epoch,
-                            writer_seq: seq,
-                        };
-                        let streams: HashSet<_> = records.iter().map(|r| r.stream_id).collect();
-                        let min_ts = records.iter().map(|r| r.ts_ns).min().unwrap_or(0);
-                        let max_ts = records.iter().map(|r| r.ts_ns).max().unwrap_or(0);
-                        let count = records.len() as u64;
-                        let mut w = RlogWriter::new(RlogConfig::default(), identity);
-                        for r in records {
-                            w.push(r).expect("push L0 record");
-                        }
-                        let bytes = Bytes::from(w.finish().expect("finish L0 object"));
                         built.push((
                             index,
-                            L0Object {
-                                seq,
-                                bytes,
-                                records: count,
-                                streams: streams.len() as u64,
-                                min_ts,
-                                max_ts,
-                            },
+                            build_object(args, index, specs, all, writer_id, epoch),
                         ));
                     }
                     built
@@ -685,6 +697,53 @@ fn verify_shape(objects: &[L0Object]) -> Value {
         "objects_consecutive_in_time": contiguous,
         "first_object_fields": sample,
     })
+}
+
+/// The shape of one written L0 object, read back from its bytes.
+#[cfg(test)]
+struct ObjectShape {
+    records: u64,
+    streams: usize,
+    /// Every named field a record carries, with the value type it was seen
+    /// with: the attribute fields plus `body`. A field seen with two types is
+    /// recorded as "mixed".
+    fields: BTreeMap<String, &'static str>,
+    /// `(record_count, max_stream_ref - min_stream_ref + 1)` for each block,
+    /// in block order.
+    blocks: Vec<(u32, u32)>,
+}
+
+#[cfg(test)]
+fn object_shape(bytes: &[u8]) -> ObjectShape {
+    let cfg = RlogConfig::default();
+    let dirs = RlogReader::<[u8]>::decode_directories(bytes, &cfg).expect("decode directories");
+    let reader = RlogReader::new(bytes, &cfg).expect("open L0");
+    let (recs, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan L0");
+    let mut fields: BTreeMap<String, &'static str> = BTreeMap::new();
+    for r in &recs {
+        fields.insert("body".to_string(), "str");
+        for (k, v) in &r.attrs {
+            let kind = match v {
+                AttrValue::Str(_) => "str",
+                AttrValue::I64(_) => "i64",
+                _ => "other",
+            };
+            let slot = fields.entry(k.clone()).or_insert(kind);
+            if *slot != kind {
+                *slot = "mixed";
+            }
+        }
+    }
+    let l0 = &dirs.skip_index().l0;
+    ObjectShape {
+        records: recs.len() as u64,
+        streams: dirs.stream_dir().len(),
+        fields,
+        blocks: l0
+            .iter()
+            .map(|e| (e.record_count, e.max_stream_ref - e.min_stream_ref + 1))
+            .collect(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1337,7 +1396,7 @@ mod prof {
             })
             .collect();
         let mut thread_rows: Vec<(String, u64)> = threads.into_iter().collect();
-        thread_rows.sort_by(|a, b| b.1.cmp(&a.1));
+        thread_rows.sort_by_key(|r| std::cmp::Reverse(r.1));
         json!({
             "svg": sampler.path.display().to_string(),
             "frequency_hz": HZ,
@@ -1921,16 +1980,222 @@ fn main() {
         Value::Null
     };
 
-    let doc = json!({
+    let mut doc = json!({
         "host": host_info(),
         "generate_wall_s": gen_s,
         "shape": shape,
         "run": compacted.report,
         "page_choice_ab": page_choice_ab,
     });
+    let profiled = cfg!(feature = "profiling")
+        && std::env::var_os(ravel_bench::profiling::PROFILE_ENV).is_some_and(|p| !p.is_empty());
+    let mut failures = check_figures(&doc, args.inputs, args.page_choice_ab, profiled);
+    let rate = doc["run"][RATE_KEY].as_f64().unwrap_or(f64::NAN);
+    let realism = if args.inputs == REALISM_INPUTS {
+        match check_realism(rate) {
+            Ok(()) => "pass".to_string(),
+            Err(e) => {
+                failures.push(e.clone());
+                e
+            }
+        }
+    } else {
+        format!(
+            "not applied: the band is calibrated at --inputs {REALISM_INPUTS}, this run has {}",
+            args.inputs
+        )
+    };
+    if !doc["run"]["profile"]["attribution_error"].is_null() {
+        failures.push("profile attribution error".to_string());
+    }
+    doc["checks"] = json!({
+        "realism_band_records_per_s_per_core": [REALISM_BAND.0, REALISM_BAND.1],
+        "realism": realism,
+        "failures": failures,
+    });
     print_table(&doc);
     println!("{}", serde_json::to_string_pretty(&doc).expect("json"));
-    if !doc["run"]["profile"]["attribution_error"].is_null() {
+    if !failures.is_empty() {
+        for f in &failures {
+            eprintln!("check failed: {f}");
+        }
         std::process::exit(1);
+    }
+}
+
+/// Records per second per core (records over process CPU) the default
+/// 230-input bucket must compact at for the run to count as a profile of the
+/// production compactor rather than of a broken or starved one.
+const REALISM_BAND: (f64, f64) = (8_000.0, 70_000.0);
+const REALISM_INPUTS: usize = 230;
+const RATE_KEY: &str = "records_per_s_per_core (records / process cpu)";
+
+fn check_realism(records_per_s_per_core: f64) -> Result<(), String> {
+    let (lo, hi) = REALISM_BAND;
+    if (lo..=hi).contains(&records_per_s_per_core) {
+        Ok(())
+    } else {
+        Err(format!(
+            "realism band missed: {records_per_s_per_core:.0} records/s per core, band [{lo:.0}, {hi:.0}]"
+        ))
+    }
+}
+
+/// The figures every run reports under `run`, each exactly once.
+const RUN_FIGURES: [&str; 10] = [
+    "records_in",
+    "records_out",
+    "l0_bytes",
+    "l1_bytes",
+    "l1_l0_ratio",
+    "l1_parts",
+    "merge_read_mode",
+    "wall_s",
+    "process_cpu_s",
+    RATE_KEY,
+];
+
+/// Every figure the run is meant to report must be present exactly once and
+/// non-null. Presence is counted on the serialized output, so a key emitted
+/// at two places in `run` fails as surely as a missing one.
+fn check_figures(doc: &Value, inputs: usize, page_choice_ab: bool, profiled: bool) -> Vec<String> {
+    let mut failures = Vec::new();
+    let run = &doc["run"];
+    let text = serde_json::to_string(run).unwrap_or_default();
+    for key in RUN_FIGURES {
+        let quoted = serde_json::to_string(key).unwrap_or_default();
+        let count = text.matches(&format!("{quoted}:")).count();
+        if count != 1 || run[key].is_null() {
+            failures.push(format!(
+                "figure {key}: reported {count} times, value {}",
+                run[key]
+            ));
+        }
+    }
+    if run["records_in"] != run["records_out"] {
+        failures.push(format!(
+            "records_in {} != records_out {}",
+            run["records_in"], run["records_out"]
+        ));
+    }
+    if doc["shape"]["objects"].as_u64() != Some(inputs as u64) {
+        failures.push(format!(
+            "shape.objects {} != --inputs {inputs}",
+            doc["shape"]["objects"]
+        ));
+    }
+    if page_choice_ab {
+        let rows = doc["page_choice_ab"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let choices: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r["page_choice"].as_str())
+            .collect();
+        if choices != ["Exhaustive", "Estimated"] {
+            failures.push(format!(
+                "page_choice_ab rows {choices:?}, want Exhaustive then Estimated"
+            ));
+        }
+        for r in rows {
+            for key in ["bytes", "encode_thread_cpu_s", "l1_l0_ratio"] {
+                if r[key].is_null() {
+                    failures.push(format!("page_choice_ab {}: {key} absent", r["page_choice"]));
+                }
+            }
+        }
+    }
+    if profiled {
+        let p = &run["profile"];
+        if p["samples"].as_u64().unwrap_or(0) == 0 {
+            failures.push("profile: no samples".to_string());
+        }
+        for key in [
+            "phases",
+            "leaf_exclusive_top15",
+            "inclusive_top10_distinct_below_95pct",
+        ] {
+            if p[key].as_array().is_none_or(Vec::is_empty) {
+                failures.push(format!("profile: {key} absent or empty"));
+            }
+        }
+    }
+    failures
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// The attribute fields that carry `i64` values; every other one is a
+    /// string, and so is `body`.
+    const I64_FIELDS: [&str; 5] = ["bytes_sent", "duration_ms", "replicas", "retries", "status"];
+
+    /// Eight full-size objects, built one by one: the per-object shape does
+    /// not depend on how many inputs the bucket has.
+    #[test]
+    fn synthetic_bucket_matches_the_hour_498274_shape() {
+        let args = Args::parse_from(["rlog_compaction_profile", "--inputs", "8"]);
+        let specs = field_specs(args.seed);
+        let all = streams(args.streams);
+        let block_target = RlogConfig::default().block_target_records;
+
+        let mut want_fields: BTreeMap<String, &'static str> = FIELDS
+            .iter()
+            .map(|f| {
+                let kind = if I64_FIELDS.contains(f) { "i64" } else { "str" };
+                (f.to_string(), kind)
+            })
+            .collect();
+        want_fields.insert("body".to_string(), "str");
+        assert_eq!(want_fields.len(), 58, "57 attribute fields plus body");
+
+        let mut full_blocks = 0usize;
+        for index in 0..args.inputs {
+            let obj = build_object(&args, index, &specs, &all, Uuid::nil(), 1);
+            let shape = object_shape(&obj.bytes);
+            assert!(
+                (args.min_streams_per_object..=args.max_streams_per_object)
+                    .contains(&shape.streams),
+                "object {index}: {} streams, want {}..={}",
+                shape.streams,
+                args.min_streams_per_object,
+                args.max_streams_per_object
+            );
+            assert_eq!(shape.streams as u64, obj.streams, "object {index}");
+            assert_eq!(shape.records, obj.records, "object {index}");
+            assert_eq!(shape.fields, want_fields, "object {index} field set");
+            let block_records: u64 = shape.blocks.iter().map(|b| u64::from(b.0)).sum();
+            assert_eq!(block_records, shape.records, "object {index}");
+            // Only an object's last block may be short; every full block
+            // carries at least 1,000 streams.
+            let (last, full) = shape.blocks.split_last().expect("a block");
+            assert!(last.0 as usize <= block_target, "object {index}");
+            for (b, &(records, span)) in full.iter().enumerate() {
+                assert_eq!(records as usize, block_target, "object {index} block {b}");
+                assert!(
+                    span >= 1_000,
+                    "object {index} block {b}: spans {span} stream refs"
+                );
+                full_blocks += 1;
+            }
+            if last.0 as usize == block_target {
+                assert!(last.1 >= 1_000, "object {index} last block: {}", last.1);
+                full_blocks += 1;
+            }
+        }
+        assert!(full_blocks >= args.inputs, "only {full_blocks} full blocks");
+    }
+
+    #[test]
+    fn realism_band_refuses_outside_8k_to_70k() {
+        assert!(check_realism(7_999.0).is_err());
+        assert!(check_realism(70_001.0).is_err());
+        assert!(check_realism(f64::NAN).is_err());
+        for inside in [8_000.0, 30_000.0, 70_000.0] {
+            assert_eq!(check_realism(inside), Ok(()), "{inside}");
+        }
     }
 }
