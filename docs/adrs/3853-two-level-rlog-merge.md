@@ -159,7 +159,8 @@ since the planner and the passes are the same code.
 When the profile reports `decoded_heap_bytes` of a real block, the plan
 gains a measured-ratio term and prices a block at that figure, `h`, instead.
 The sizing table is in D4, because `G`, the run count `R = N / G` and `W1`
-constrain each other through level 2 (D3).
+constrain each other through level 2 (D3) (the #3873 amendment counts `R` in
+run parts, not groups).
 
 ### D2. Scratch runs
 
@@ -187,7 +188,9 @@ nothing else:
 - before the first block GET the merge computes the unit's scratch need as
   1.3 times the inputs' object sizes, which the catalog probes return, and
   refuses with a typed error naming the need and the free space when the
-  directory cannot hold it. It never falls back to cursor mode.
+  directory cannot hold it. It never falls back to cursor mode. (Which of
+  these refusals the scan retries, and the error for a free figure that
+  cannot be read, are in the #3873 amendment.)
 
 The scratch directory is a new config input: `--scratch-dir` on
 `ravel-cli maintain compact-bucket` and `compact-tenant`, and a field on
@@ -210,7 +213,8 @@ R x price(one run block) + reads in flight + final part target <= U
 ```
 
 Solved for the run count, (b) is `R <= (U - reads in flight - final part
-target) / price(one run block)`. Reads in flight at level 2 is
+target) / price(one run block)`. Level 2's inputs are the run parts, so `R`
+is their count (#3873 amendment). Reads in flight at level 2 is
 `input_read_concurrency` run row groups, and a run row group is one block
 of at most 1 MB stored at zstd 1, so 32 MB at the #3856 default of 32. A
 run block of 8,192 rows costs the same 22 MB as an L0 block at ceiling
@@ -244,14 +248,15 @@ the read gate (`MaintainReadGate::run`,
 ravel-server and inline in ravel-cli) and the merge awaits it
 (`rlog.rs:2289-2296`), so decode and encode never overlap. Level 2 hands a
 closed builder to the gate and continues merging into the next builder,
-with at most `E` builders in flight (`E` is 2 by default), each charged to
-the tracker's writer term, and awaits the oldest only when the next close
+with at most `E` builders in flight (`E` is 2 by default; derived per unit
+instead, see the #3873 amendment), each charged to the tracker's writer term, and awaits the oldest only when the next close
 would exceed `E`. Parts are still PUT in `part_index` order. The sequence,
 the cuts and the bytes do not change.
 
 ### D4. Parallel groups
 
-Level-1 groups run `W1` at a time as tokio tasks. `W1` is at most the
+Level-1 groups run `W1` at a time as tokio tasks (their store and scratch
+calls served on the unit's own task, see the #3873 amendment). `W1` is at most the
 unit's core share (the usable cores divided by `--maintain-unit-concurrency`
 in ravel-server, all usable cores for `compact-bucket`: 8 at the server
 defaults on the 32-core reference box, 32 at concurrency 1), and the plan
@@ -274,7 +279,8 @@ an input's blocks priced at 29 MB (22 + 7, Context) at ceiling pricing or
 `0.9 + 2h`; a run block priced at 22 MB or `h`; run target 268 MB (256
 MiB); final part target 268 MB at concurrency 4 and 1,074 MB (1 GiB) at
 concurrency 1; reads in flight 32 MB; `U` 5,369 MB (5 GiB) or 21,475 MB
-(20 GiB). `C = U / W1` and `G` round down, `R = N / G` rounds up, the bound
+(20 GiB). `C = U / W1` and `G` round down, `R = N / G` rounds up (the #3873
+amendment counts run parts and recomputes `R` and `W1`), the bound
 is (b) solved for `R` and rounded down, and `W1` is the largest value at or
 under the core share whose `R` is at or under the bound.
 
@@ -564,3 +570,114 @@ minutes per unit) assumed final parts at zstd 9 and `Exhaustive`, priced
 at the 43.5 us single-level figure measured under those settings. They are
 not re-derived here: they stay as predicted, and they overstate the level-2
 cost by the share of encode the two changes removed.
+
+## Amendment (2026-11-06): parallel level-1 workers and a derived encode depth (#3873)
+
+<!-- amendment-applies: sections="D1. Group merges|D2. Scratch runs|D3. Level 2 over runs|D4. Parallel groups" pointer="#3873 amendment" -->
+<!-- amendment-supersedes: phrase="`R = N / G`" pointer="#3873 amendment" -->
+<!-- amendment-supersedes: phrase="`E` is 2 by default" pointer="#3873 amendment" -->
+
+This records how D3 and D4 shipped, in issue #3873, corrects how D1,
+D3 and D4 count `R`, and states two cases of D2's headroom refusal.
+
+**`R` counts run parts.** D2 cuts each group's run into parts at the run
+memory target, and every run part is a level-2 input, so constraint (b)'s
+term is `R x price(one run block)` with `R` the number of run parts, not the
+number of groups `N / G`. A group of `G` inputs whose decoded bytes sum to
+`S` writes `ceil(S / run target)` parts, at least 1. Level 2 checks (b)
+against the run parts level 1 actually wrote, and D4's derivation predicts
+them from each input's decoded bytes (the sum of its blocks' prices) before
+level 1 reads a block. D4's table, recomputed with `R` in run parts, an
+input's decoded bytes at 29 MB at ceiling pricing or `2h` = 6 MB at
+measured-ratio pricing, and every other input and rounding rule as D4 states:
+
+| U, cores per unit | pricing | W1 | C | G | R (run parts) | (b) bound on R | source |
+|---|---|---|---|---|---|---|---|
+| 5,369 MB, 8 (server defaults) | ceiling | 1 | 5,369 | 170 | 2,143 | 230 | predicted |
+| 5,369 MB, 8 | h = 3 MB | 8 | 671 | 58 | 661 | 1,689 | predicted |
+| 21,475 MB, 32 (concurrency 1, compact-bucket) | ceiling | 1 | 21,475 | 709 | 2,083 | 925 | predicted |
+| 21,475 MB, 32 | h = 3 MB | 32 | 671 | 58 | 661 | 6,789 | predicted |
+
+At ceiling pricing no worker count at or under the share fits (b): a group
+of 170 inputs decodes to about 4.9 GB, 19 run parts, and a group of 709 to
+about 20.6 GB, 77 parts. The derivation finds no `W1`, and the unit is
+refused by (b) before level 1 reads a block (D0), so hour 498273 does not
+merge in two levels at ceiling pricing under either ceiling, and level 1 is
+not paid for first. The ceiling rows of D4's
+table (`W1` 1 with 113 runs, and `W1` 23 with 872) held only with `R`
+counting groups. The measured-ratio rows keep their `W1`, with 661 run
+parts (330 groups of 2 parts and one of 1) against bounds of 1,689 and
+6,789. The core share, `G`, `R` and `W1` of every row are pinned by the unit test
+`level1_workers_and_encode_builders_at_the_production_shape`.
+
+**Level-1 workers (D4).** `W1` is the largest count at or under the unit's
+core share for which constraint (a) at `C = U / W1` leaves a group of at
+least 2 and the predicted run parts keep (b)'s part term,
+`R x price(the inputs' largest block) + reads in flight + final part target`,
+at or under `U`. When no count does, the unit is refused before level 1
+reads a block, with the check `PredictedLevelTwoFit` and its figures at one
+worker, the count with the largest groups and so the fewest run parts.
+The core share is the usable cores
+divided by the units `merge_cursor_budget_bytes` runs at once
+(`budget / U`), at least 1. `CompactorConfig::level1_workers` names `W1`
+outright, wins over the derivation and skips that prediction. Either way
+level 2 checks (b) again against the run parts level 1 actually wrote,
+which the prediction prices from the inputs and can overstate. Each worker
+is its own tokio task, so the groups' decode and merge run on as many
+runtime threads as there are workers; each takes the next group index from
+a shared counter, and its run-part encodes still go through the read gate.
+The input store and the unit's scratch are held by reference on the unit's
+own task, so a worker reaches them through a channel that task serves: every
+store and scratch call still runs on the unit's task, and once the unit's
+merge returns or is dropped, which aborts the workers, no worker call
+reaches either. A worker's run-part writes are counted in the ledger when
+the worker issues them, as `scratch_write_bytes` and `scratch_writes`.
+Each worker merges under
+its own copy of the config with `merge_cursor_budget_bytes / W1` and `C`,
+with its own `MergeMemoryTracker`; the unit's tracker raises each of its
+high-water marks to at least the sum of the workers' and keeps each
+worker's peak. The run memory target
+is not divided. `W1` and the group size are on the `rlog two-level merge`
+log line and `level1_workers` in the request ledger.
+
+**Headroom refusals (D2).** Each running unit reserves its need in its
+scratch directory, and a unit is admitted when the free bytes less what the
+process's other units hold reserved cover its need. A refusal the free
+bytes alone would have admitted, `free >= need` with `free - reserved <
+need`, is caused only by those reservations, which end with their units, so
+the scan memo does not hold it and the next tick evaluates the bucket
+again. A refusal where `free < need`, and an out-of-space scratch write the
+figures do not explain, stay terminal for the process as before. A
+`statvfs` of the scratch directory that fails, at admission or when an
+out-of-space write is reported, is the error `ScratchFreeUnreadable` naming
+the directory and the failure, never a free figure of zero.
+
+**Claims and failures (D4).** The `ClaimGuard` is shared, and a lost claim
+is sticky in it: every worker's own next checkpoint, at the merge loop head
+or a part boundary, returns cancel. The workers also share a stop token.
+The first error any worker returns, a lost claim among them, sets it, and
+every other worker checks it when it starts a group and immediately before
+each run-part PUT, so none issues another run-part PUT once it is set.
+Workers run at once, so a run-part PUT another worker issued between the
+failing call and the moment the failing worker sets the token still
+completes. The unit returns that
+first error; a lost claim ends the unit `Cancelled` with its publish
+`Abandoned`, and the scratch unit is removed either way.
+
+**`E` is derived (D3).** D3 fixed `E` at 2. Writing parts is about 80% of
+merge CPU (the #3853 comment 6670968041 measurement the #3878 amendment
+cites), so two builders leave level 2 encoding on about one core. `E` is
+now computed once per unit, after (b) holds:
+
+```
+E = max(2, min(core share, (U - resident - reads in flight) / final part target))
+```
+
+where `resident` is the larger of `R x price(one run block)` and the largest
+level-2 stream estimate, the same term (b) compares. `E` is on the
+`rlog two-level merge` log line and is `encode_builders` in the request
+ledger. Parts are still PUT in `part_index` order, and the tracker's writer
+term carries every builder in flight, not only the open one. The floor of 2
+can take the writer term one final part target past the single one (b)
+reserves, when `U` leaves room for fewer than two parts beside the resident
+side; (b) itself is unchanged.

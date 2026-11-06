@@ -91,16 +91,17 @@ impl std::fmt::Display for MergeCursorBudgetSite {
 /// refusal publishes nothing and leaves the L0 inputs live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TwoLevelCheck {
-    /// Constraint (a) at one level-1 worker admits fewer than two inputs per
-    /// group: `G = floor((ceiling - run_target) / per_input)` is below 2, so
-    /// level 1 would not reduce the input count.
+    /// Constraint (a) at the unit's level-1 worker count admits fewer than two
+    /// inputs per group: `G = floor((ceiling - run_target) / per_input)` is
+    /// below 2, so level 1 would not reduce the input count.
     GroupSize {
         /// The largest per-input term, raw candidate row-group bytes plus the
         /// summed pass price of the input's blocks.
         per_input_bytes: u64,
         /// The memory split target a run part closes at.
         run_target_bytes: u64,
-        /// The resident ceiling `C = U / W1`, with `W1 = 1`.
+        /// The per-worker resident ceiling `C = U / W1`: `U` itself unless
+        /// `CompactorConfig::level1_workers` names more than one worker.
         ceiling_bytes: u64,
         /// The group size the figures admit.
         group_size: u64,
@@ -120,6 +121,24 @@ pub enum TwoLevelCheck {
         /// run block carrying the stream.
         stream_estimate_bytes: u64,
         /// Bytes of the `input_read_concurrency` largest run row groups.
+        in_flight_bytes: u64,
+        /// The final parts' memory split target.
+        part_target_bytes: u64,
+        /// The resident ceiling `U`.
+        ceiling_bytes: u64,
+    },
+    /// Constraint (b) priced before level 1 reads a block (ADR-3853 D4): at
+    /// no level-1 worker count up to the unit's core share do the run parts
+    /// level 1 is predicted to write fit level 2, so the unit is refused
+    /// without running level 1. Shown at one worker, the count with the
+    /// fewest run parts.
+    PredictedLevelTwoFit {
+        /// Run parts level 1 would write at one worker: per group, its
+        /// inputs' decoded bytes over the run target, rounded up.
+        run_parts: u64,
+        /// The price of one level-2 block, taken from the inputs' largest.
+        block_bytes: u64,
+        /// Bytes of the `input_read_concurrency` largest input row groups.
         in_flight_bytes: u64,
         /// The final parts' memory split target.
         part_target_bytes: u64,
@@ -150,6 +169,16 @@ impl std::fmt::Display for TwoLevelCheck {
             } => write!(
                 f,
                 "level 2 over {runs} run parts needs the larger of {runs} x {run_block_bytes} and the largest stream estimate {stream_estimate_bytes}, + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes (constraint b)"
+            ),
+            Self::PredictedLevelTwoFit {
+                run_parts,
+                block_bytes,
+                in_flight_bytes,
+                part_target_bytes,
+                ceiling_bytes,
+            } => write!(
+                f,
+                "level 2 over a predicted {run_parts} run parts needs {run_parts} x {block_bytes} + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes at every level-1 worker count (constraint b, refused before level 1)"
             ),
         }
     }
@@ -395,6 +424,18 @@ pub enum MaintainError {
     ScratchLocked {
         /// The lock file inside the configured scratch directory.
         path: std::path::PathBuf,
+    },
+    /// `statvfs` of the scratch directory failed, so its free bytes are
+    /// unknown (ADR-3853 D2). Never read as zero free: the unit fails with
+    /// this error and the next tick asks again.
+    #[error(
+        "RLOG compaction failed: could not read the free space of scratch directory {path:?}: statvfs: {error}"
+    )]
+    ScratchFreeUnreadable {
+        /// The configured scratch directory.
+        path: std::path::PathBuf,
+        /// The `statvfs` failure.
+        error: String,
     },
     #[error("RLOG compaction refused before writing any part: {0}")]
     InvalidRlogZstdLevel(#[from] crate::config::RlogZstdLevelError),
