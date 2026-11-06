@@ -200,9 +200,14 @@ pub struct Fixture {
 }
 
 pub async fn fixture() -> Fixture {
+    fixture_with_config(SqlConfig::default()).await
+}
+
+/// [`fixture`] with the executor built on `config`.
+pub async fn fixture_with_config(config: SqlConfig) -> Fixture {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     publish_logs(store.as_ref(), &tenant(), &records(), 1).await;
-    executor_over(store)
+    executor_over_with(store, config)
 }
 
 /// The value of the [`shadow_fixture`] record's `message` attribute.
@@ -365,6 +370,10 @@ pub fn segments(outcome: &EsqlOutcome) -> usize {
 }
 
 fn executor_over(store: Arc<dyn ObjectStoreBackend>) -> Fixture {
+    executor_over_with(store, SqlConfig::default())
+}
+
+fn executor_over_with(store: Arc<dyn ObjectStoreBackend>, config: SqlConfig) -> Fixture {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let executor = SqlExecutor::new(
@@ -372,7 +381,7 @@ fn executor_over(store: Arc<dyn ObjectStoreBackend>) -> Fixture {
         SegmentFetcher::new(Arc::clone(&store)),
         LogSegmentFetcher::new(Arc::clone(&store)),
         SpanSegmentFetcher::new(Arc::clone(&store)),
-        SqlConfig::default(),
+        config,
         1 << 30,
     )
     .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared())));

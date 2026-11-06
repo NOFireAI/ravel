@@ -28,8 +28,8 @@
 //! TopK's dynamic filter) carries the checked form.
 //!
 //! With the option off the rule returns its input unchanged, so the plan is
-//! the one built without it (`tests/checked_arithmetic.rs` compares the
-//! displayed plans). With it on, [`crate::PinnedStream`] maps an arithmetic
+//! the one built without it (this module's tests compare the displayed and
+//! `Debug` forms of the plans). With it on, [`crate::PinnedStream`] maps an arithmetic
 //! overflow to [`SqlError::IntegerArithmeticOverflow`]; with it off the
 //! mapping is not applied and every error keeps today's form.
 //!
