@@ -467,27 +467,43 @@ structural reader exists. Every real page is decompressed, cut into
 `ceil(stored / mini_block_bytes)` slices, and each slice recompressed on its
 own at the writer's zstd level, so mini-block sizes are measured. A row is
 placed in mini-block `floor(row * chunks / rows)` (`mini_block_of`,
-`structural_fetch.rs:185`), exact for fixed-width columns and proportional
+`structural_fetch.rs:278`), exact for fixed-width columns and proportional
 otherwise; dictionary pages are read whole. The needed ranges are coalesced
-(`coalesce`, `structural_fetch.rs:197`: sort, then merge a range starting at
+(`coalesce`, `structural_fetch.rs:290`: sort, then merge a range starting at
 most `gap` bytes past the previous end) and issued as real ranged GETs
 against the simulated layout in the same delayed store. The plan is the
 production plan plus 4 bytes of index per mini-block. Decode CPU is
 modelled as today's measured CPU times the structural decompressed bytes over
-today's; structural wall is measured GET time plus that CPU. Both plans
-coalesce at 1,887,437 bytes, the production fetcher's effective gap (its
-request cost); `floor_gap/*` plans the structural read at the 64 KiB floor
-too, planned only, no GETs issued.
+today's at the same gap; structural wall is measured GET time plus that CPU.
+The latency model has no bandwidth term: a GET costs 30 ms whatever its size,
+with at most 16 in flight.
+
+Both sides are measured at four configurations, each with real GETs. The
+unprefixed figures are the production default, both sides coalesced at
+1,887,437 bytes (`DEFAULT_LOG_REQUEST_COST_BYTES`, the fetcher's effective
+gap) on an L0 segment. Ten targets about 1.1 MB apart sit inside that gap,
+so both sides span the targets there and `ratio/*` is a layout and
+recompression ratio that decides nothing. `gap_64k/*`, `gap_256k/*` and
+`gap_1m/*` are both sides at that gap on an L1 segment: today's side is the
+production fetcher with `BlockRangeFetcher::with_coalesce_gap` and nothing
+else changed, and the structural ranges are coalesced at the same gap. L1
+because an L0 read is bridged to at most four runs
+(`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`) before the coverage crossover is
+checked, which spans the targets whatever the gap. `l0_64k/*` is that L0
+case at 64 KiB, with the structural ranges bridged to the same four runs by
+the same rule (`bound_runs`, a copy of the fetcher's crate-private rule),
+reported and not counted. The decision is `gap_64k/ratio/*`.
 
 ### Arm 2: compressed full-text sidecar
 
 LogCloud (PVLDB vol. 18, p. 2362) keeps a compressed full-text index (an
 FM-index) beside each cold log object so a rare-token search reads a small
-index and then only matching rows. This arm measures the simpler member of
-that family RLOG would carry: a row-granular inverted index over the
+index and then only matching rows. This arm measures a different index
+than LogCloud's FM-index, one that answers whole-token queries only where
+an FM-index also answers substrings: a row-granular inverted index over the
 production body tokenizer's tokens, in zstd blocks of 64 prefix-shared terms
 with delta-coded row ordinals, plus a block index, the row map (rows per RLOG
-block, `RowMap`, `fulltext_sidecar.rs:176`) and an 8-byte trailer. A probe is
+block, `RowMap`, `fulltext_sidecar.rs:182`) and an 8-byte trailer. A probe is
 one 64 KiB suffix GET and one term-block GET; a hit then fetches its rows
 through the production `plan_segment_routed` for the named blocks. The build
 and probe are real, not simulated.
@@ -498,17 +514,22 @@ section `RlogWriter` wrote, with its verdict through
 and a POSTINGS section from the production `encode_postings_section` over body
 tokens to block indices (production builds no body postings; it is what a
 sidecar would replace or stand beside). Every returned row on every path is
-checked against the corpus. Production narrows by BLOOM only at decode, over
-a buffer that already holds every time-candidate block, so its scans move the
-whole object whatever the bloom says (findings c and d below). The decision
-baseline is therefore the bloom-guided route production does not take, a
-simulation of the route with real ranged GETs (`guided_rounds`,
-`fulltext_sidecar.rs:720`): the production suffix probe, then PAGE_DIR and
+checked against the corpus. For a pure `HasWord` query (no `KeyEquals` arm,
+no tier-2 routed block set) production narrows by BLOOM only at decode, over
+a buffer that already holds every time-candidate block, so its scans move
+the whole object whatever the bloom says (findings c and d below). Production
+does have a bloom-guided route: on an object above the whole-object bound,
+`LogSegmentFetcher::fetch_keyed_plan` places BLOOM and POSTINGS for the
+content arms of a query that carries a `KeyEquals` arm or a tier-2 routed
+set, and prunes blocks before any BLOCKS byte is read. Only the pure
+`HasWord` query lacks it. The decision baseline is that route applied to the
+pure `HasWord` query, simulated with real ranged GETs (`guided_rounds`,
+`fulltext_sidecar.rs:726`): the production suffix probe, then PAGE_DIR and
 BLOOM where the probe missed them, then the pages of the blocks the
 production bloom kept, each round coalesced at the request cost. The two
 production scans are reported beside it.
 
-The 100 GB scale is extrapolated (`extrapolate`, `fulltext_sidecar.rs:503`):
+The 100 GB scale is extrapolated (`extrapolate`, `fulltext_sidecar.rs:509`):
 `S = scale_raw_bytes / (raw_bytes / objects)`; per sampled token, cost =
 `sum(measured cost of each object it occurs in) + (S - those objects) *
 mean miss cost`; the ratio is the mean sidecar cost over the mean bloom cost
@@ -525,11 +546,19 @@ prediction with a band, or an unpredicted reason, for every figure of the
 four subjects (HDFS and BGL from LogHub, Zenodo 8196385, one per arm each);
 its header states the basis (a calibration on a generated HDFS-shaped corpus
 scaled to the LogHub line lengths). It was committed alone (8a4ee91 on the
-task branch) before any LogHub run, and no band was edited after it. Each
-binary refuses a `--param` that differs from the file before it reads the
-corpus, prints a stamp (git HEAD, `uname -m`, nproc, memory, corpus name,
-sha256 and bytes, CPU clock), exits 0 in band, 2 on a band miss, 1 on a
-problem, and `--decide` exits 0 for GO and 3 for NO-GO.
+task branch) before any LogHub run, and no band was edited after it.
+Addendum 1 (committed alone, 6fc2c49 on the fix-round branch, before any run
+at the new gaps) moves the structural decision to `gap_64k/ratio/*`, adds the
+`gap_*`, `l0_64k` and `today/data_over_object` figures with their bands,
+and removes the planned-only `floor_gap/*`; its header says what moved and
+why. No sidecar band moved. Each binary refuses a `--param` that differs
+from the file before it reads the corpus, prints a stamp (git HEAD,
+`uname -m`, nproc, memory, corpus name, sha256 and bytes, CPU clock), exits
+0 in band, 2 on a band miss, 1 on a problem, and `--decide` exits 0 for GO
+and 3 for NO-GO. `--decide` recomputes each report's decision and band
+check from its saved figures and the current `subjects.toml`, and refuses a
+report whose saved decision or check disagrees, so a JSON edited by hand or
+written under an earlier registration cannot decide.
 
 ```sh
 structural_fetch_report --subject hdfs_structural \
@@ -546,32 +575,79 @@ Outputs, JSON reports and `--decide` output are in
 `crates/ravel-bench/fixtures/t13/run_2026-11-06/`. Host: x86_64, 16 CPUs,
 32 GB, release build.
 
-Structural arm: **NO-GO overall, NO-GO on both subjects.** At the production
-gap the ten target blocks coalesce into one range spanning nearly the whole
-layout, so the structural read moves about as many bytes as today's.
+Structural arm: **undecided; round 0's NO-GO is withdrawn.** Round 0 decided
+on `ratio/*` at the production gap, where ten targets about 1.1 MB apart sit
+inside the 1,887,437-byte gap and both sides span the targets by
+construction, so that ratio measures layout and recompression, not the
+structural read. Addendum 1 moves the decision to `gap_64k/ratio/*` on an L1
+segment. The LogHub runs at the new gaps were not made: the fix-round
+executor (aarch64, 4 CPUs, 8 GB) had no network route to Zenodo and no copy
+of either corpus, so no `gap_*` or `l0_64k` figure exists for HDFS or BGL
+and the arm has no decision. `structural_fetch_report --decide` over the
+round 0 reports now refuses them, since they carry no `gap_64k` figure. The
+pre-registered expectation is NO-GO on both subjects, decided by
+`gap_64k/ratio/gets` (predicted 1.64 HDFS, 1.71 BGL: 22 to 23 structural
+data ranges against about 13 today) and `gap_64k/ratio/wall` near 1.0, with
+`gap_64k/ratio/bytes` passing narrowly (0.24, 0.23).
+
+The round 0 figures below are the production gap on L0. The ratio rows are
+reported as a layout and recompression ratio and decide nothing. Every
+`today/plan_bytes` band starts at 262,144 bytes, the fixed suffix probe, so
+it can only miss high.
 
 | Figure | hdfs_structural | bgl_structural | Bar |
 |---|---|---|---|
 | object bytes, rows, blocks | 11,101,600, 540,672, 66 | 11,029,764, 573,440, 70 | |
 | today GETs, bytes | 3, 10,647,076 | 2, 11,291,908 | |
+| today after the 262,144-byte plan | 2 ranged GETs, 10,384,932 (0.935 of the object) | the whole object, 11,029,764, one GET | |
 | today decode CPU, wall (ms) | 27.9, 121.2 | 75.8, 138.0 | |
 | structural GETs, bytes | 2, 11,374,888 | 2, 10,025,669 | |
 | structural decompressed bytes | 928,318 of 12,039,421 | 1,129,981 of 11,755,333 | |
 | structural modelled CPU, wall (ms) | 2.15, 64.4 | 7.28, 69.6 | |
-| ratio/bytes | 1.068 FAIL | 0.888 FAIL | <= 0.25 |
-| ratio/gets | 0.667 ok | 1.0 ok | <= 1.5 |
-| ratio/wall | 0.532 ok | 0.504 ok | <= 1 |
-| floor_gap ranges, bytes | 22, 480,525 | 23, 437,519 | report |
+| ratio/bytes (layout ratio) | 1.068 | 0.888 | report |
+| ratio/gets | 0.667 | 1.0 | report |
+| ratio/wall | 0.532 | 0.504 | report |
+| floor_gap ranges, bytes (planned only, no GET issued) | 22, 480,525 | 23, 437,519 | report |
+
+Today's side restricted neither subject's read to the ten target blocks.
+The plan is the ranged plan for the known blocks (both objects are above the
+9,437,185-byte whole-object bound), but on L0 the fetcher bridges the block
+reads to at most four runs, which spans the targets. On HDFS the bridged
+read stayed ranged: two data GETs of 10,384,932 bytes. On BGL it crossed the
+0.75 coverage crossover and read the whole object, re-reading the plan's
+bytes. Why HDFS's bridged read, at 0.935 of the object, stayed under the
+crossover was not established here. Round 0's report said the routed plan
+"skipped the edge blocks"; it skipped about 7% of the object, not the
+untargeted blocks.
 
 Band misses, kept as measured: hdfs `today/bytes` (10,647,076 under
-10,747,904: the routed plan took three GETs and skipped the edge blocks) and
-`today/decode_cpu_ms` (27.9 under 30); bgl `structural/layout_bytes`
-(9,756,688 under 10,485,760: BGL recompresses smaller in 8 KiB mini-blocks),
-and with it `structural/bytes` and `ratio/bytes` (0.888 under 0.9). The
-saving Lance relies on needs a small gap: at the 64 KiB floor the structural
-plan would move 0.045x (HDFS) and 0.039x (BGL) of today's bytes, but in 22
-to 23 data ranges, above the 1.5x GET bar against today's 2 to 3 GETs (planned
-only, so that GET ratio is not a measured figure).
+10,747,904) and `today/decode_cpu_ms` (27.9 under 30); bgl
+`structural/layout_bytes` (9,756,688 under 10,485,760: BGL recompresses
+smaller in 8 KiB mini-blocks), and with it `structural/bytes` and
+`ratio/bytes` (0.888 under 0.9). The `floor_gap` figures are planned only,
+no GET issued: at 64 KiB the structural plan would move 0.045x (HDFS) and
+0.039x (BGL) of round 0's today bytes. They are superseded by the measured
+`gap_64k/structural/*` figures, and their GET ratio is not a measured
+figure.
+
+The one measured small-gap comparison is the generated 32-block object the
+exact-figure test pins (`pins_the_exact_figures_of_a_generated_object`, not
+a LogHub subject, deciding nothing). At `gap_64k` on L1 today read 14 GETs,
+3,742,501 bytes; the structural side 13 GETs, 673,618 bytes (262,144 plan,
+6,016 index, 405,458 data): ratio/bytes 0.180, ratio/gets 0.929, GO on that
+object. At the production gap it gives 0.989, the round 0 shape, and
+`l0_64k` reads the whole object on today's side (2 GETs, 10,846,562 bytes)
+against four bridged structural ranges (7,706,827 bytes).
+
+The structural CPU model scales today's measured decode CPU at the same gap.
+Where today reads the whole object (BGL above, and on the generated object
+the production gap, `gap_1m` and `l0_64k`), its decode CPU is far above a
+ranged read's (on the generated object, debug build, about 1,076 ms against
+118 ms), so the modelled structural CPU there is inflated too. That does
+not touch `gap_64k` on the generated object, where today's read is ranged,
+and today's LogHub read at `gap_64k` is predicted ranged
+(`gap_64k/today/data_over_object` band 0.11 to 0.25); a whole-object read
+there misses that band.
 
 Sidecar arm: **NO-GO overall, NO-GO on both subjects.** The rare-token bytes
 bar holds against the bloom-guided route; the size bar fails on both, and the
@@ -584,6 +660,8 @@ build CPU bar on BGL.
 | postings bytes, terms | 9,816,814, 1,007,144 | 20,391,383, 4,632,997 | |
 | sidecar bytes, entries | 42,354,324, 98,096,683 | 44,624,476, 109,681,304 | |
 | sidecar/over_postings | 4.31 FAIL | 2.19 FAIL | <= 1.2 |
+| sidecar over BLOOM section | 11.3 | 5.14 | report |
+| sidecar over POSTINGS plus BLOOM | 3.12 | 1.54 | report |
 | build sidecar, compaction CPU (ms) | 17,527, 14,854 | 32,748, 17,379 | |
 | build/cpu_ratio | 1.18 ok | 1.88 FAIL | <= 1.5 |
 | rewrite amplification | 1.52 | 1.58 | report |
@@ -598,7 +676,7 @@ build CPU bar on BGL.
 | rare/gets_ratio_100gb | 0.658 | 0.699 | report |
 | delete rebuild CPU (ms), over compaction | 2,249, 1.50 | 3,075, 1.84 | costed |
 | delete sidecar bytes over object | 0.529 | 0.596 | costed |
-| delete residual terms | 0 ok | 0 ok | <= 0 |
+| delete residual terms (correctness check) | 0 ok | 0 ok | <= 0 |
 
 Extrapolation inputs (both measured): HDFS `S = 1e11 / (729,267,580 / 10) =
 1371.24`, mean miss bytes bloom-guided 1,162,157.9, sidecar 107,654.9,
@@ -606,7 +684,14 @@ production default 8,097,652.9, mean miss GETs 3.041 and 2.000, giving
 1,594,808,053 bloom-guided and 155,984,207 sidecar bytes per token. BGL `S =
 1e11 / (738,614,793 / 9) = 1218.50`, miss bytes 1,922,461.3, 80,171.5 and
 8,513,742.2, miss GETs 3.120 and 2.178, giving 2,343,501,109 and 107,540,196.
-The HDFS ratio sits just under its bar. A sidecar hit fetches its rows
+The HDFS ratio sits just under its bar. Its bloom-guided miss cost,
+1,162,157.9 bytes, is the 262,144-byte suffix probe, plus the BLOOM section
+(374,228.4 bytes on the mean object, 3,742,284 over 10), plus 525,785.5
+bytes of PAGE_DIR and kept pages. About 1,369 of the 1,371.24 objects are
+misses per token, so the bar sits 34,965,983 bytes per token away: a
+bloom-guided miss cost about 25.5 KB (2.2%) lower, or a sidecar miss cost
+about 2.6 KB (2.4%) higher, flips the HDFS pass to a fail. BGL has more
+room (0.0459). A sidecar hit fetches its rows
 through the production routed plan, which reads the whole object below the
 plan whole-object bound (about 8 MB per matching pair), while the bloom-guided
 route reads only kept pages, so the comparison is conservative against the
@@ -620,29 +705,63 @@ far fewer tokens on at most three rows than predicted), `rare/rows` (55),
 `rare/bytes_ratio_measured` (0.736); bgl `rare/rows` (51),
 `rare/sidecar_bytes` and `rare/bytes_ratio_measured` (0.578) for the same
 reason, and `rare/default_path_gets` 300 and `rare/no_crossover_gets` 330
-against 270. Those are 270 + 30 and 270 + 2 * 30: one of the nine objects
-is above the plan whole-object bound, the case the registration names.
+against 270. Those are 270 + 30 and 270 + 2 * 30, which fits exactly one of
+the nine objects being above the plan whole-object bound, the case the
+registration names. The run did not record per-object sizes, so that count
+is inferred from the GET totals, not measured.
 
-### Findings outside the experiments
+The size ratio `sidecar/over_postings` divides by a POSTINGS section built
+for this experiment over every body token, with no cap. Production builds no
+body postings, and its writer caps a POSTINGS section at 10,000 distinct
+terms (`postings_max_distinct`), so no production section of that size
+exists to compare against. Against the BLOOM section production does write
+for the body, the sidecar is 11.3x (HDFS) and 5.14x (BGL); against that
+BLOOM section and the experiment's uncapped POSTINGS together, 3.12x and
+1.54x.
+
+`delete/residual_terms` (band [0, 0]) is a correctness check fixed by
+construction, not a prediction: the sidecar is rebuilt from the rewritten
+object, so a residual term means the build itself is wrong.
+`delete/erased_only_terms` has a band floor of 0, a count's own floor, so it
+can only miss high.
+
+### Production findings to file as issues
 
 These are production behaviours the measurement ran into; none is changed
-here.
+here, and each is stated as narrowly as the evidence supports. Round 0
+listed four "findings outside the experiments"; this list corrects them.
 
-- (a) The production log fetcher's effective coalescing gap is its request
-  cost (`DEFAULT_LOG_REQUEST_COST_BYTES`, 1,887,437 bytes), not the 64 KiB
-  `DEFAULT_LOG_COALESCE_GAP` floor, so ranged plans coalesce across about
-  1.8 MiB holes.
-- (b) For a full-time-window `HasWord` query on an object above the plan
-  whole-object bound, `plan_segment` falls back to a whole-object read.
-- (c) `scan_accounted_with_tenant` with defaults reads the whole object for a
-  rare-token `HasWord`: the 0.75 coverage crossover
-  (`DEFAULT_LOG_COVERAGE_THRESHOLD`) fires on time-only candidates before the
-  bloom is consulted. On the calibration objects one miss cost 2 GETs and
-  12,449,003.6 bytes.
-- (d) With the crossover off (coverage threshold 2.0) the ranged read still
-  fetches every time-candidate block, because BLOOM and POSTINGS arms are
-  resolved only at decode over the fetched buffer; a miss cost 3 GETs and
-  12,446,190 bytes. The bloom saves decode CPU for `HasWord`, never bytes.
+- (a) Calibration observation, not a defect. The log fetcher's coalescing
+  gap is `request_cost_bytes.max(DEFAULT_LOG_COALESCE_GAP)`
+  (`log_fetcher.rs:5798`), by design under ADR-0904: with the default
+  request cost that is 1,887,437 bytes, so ranged reads bridge holes up to
+  about 1.8 MiB and the 64 KiB `DEFAULT_LOG_COALESCE_GAP` is only a floor.
+  A point lookup of ten blocks about 1.1 MB apart therefore reads one
+  range spanning them. Whether 1,887,437 bytes is the right request cost
+  for row fetches at 30 ms per GET is the open calibration question.
+- (b) The plan's whole-object fallback is triggered by any content, stream
+  or POSTINGS arm, not by `HasWord` alone. Above the plan whole-object
+  bound such reads are ranged first and then go whole through the coverage
+  crossover; below the bound the object is read whole directly. LogHub
+  evidence: the HDFS sidecar objects (about 8.1 MB, below the bound) read
+  whole on both the default and the crossover-off path, 300 GETs and
+  2,438,512,350 bytes each, for 30 rare tokens over 10 objects.
+- (c) The 0.75 coverage crossover (`DEFAULT_LOG_COVERAGE_THRESHOLD`) is
+  decided after the numeric arms prune blocks and before BLOOM or POSTINGS
+  is consulted. On a version-4 object coverage counts the projected page
+  bytes, so "a rare-token `HasWord` reads the whole object" holds for an
+  all-column or wide projection only; a narrow projection can stay ranged.
+  LogHub evidence: the BGL structural object, all columns projected, was
+  read whole after the plan (11,029,764 bytes in one GET).
+- (d) "The bloom saves decode CPU, never bytes" holds only on the unkeyed
+  path (a pure `HasWord`, no `KeyEquals` arm, no tier-2 routed set), where
+  BLOOM and POSTINGS are resolved at decode over a buffer that already
+  holds every time-candidate block. `fetch_keyed_plan` places BLOOM and
+  POSTINGS before any BLOCKS byte and does save bytes. Separately, nothing
+  prunes a whole object by token before its suffix is read: there is no
+  object-level token pruning. LogHub evidence: on the BGL sidecar objects
+  the default path moved 2,314,818,480 bytes and the crossover-off path
+  2,314,733,670, 84,810 bytes less over 30 tokens and nine objects.
 
 ## Selective investigations (benchmarks/investigations)
 
