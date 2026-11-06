@@ -40,6 +40,7 @@
 //! Object-level relevance (does the segment's ts span overlap the window?) is
 //! still decided from the catalog summary before any GET.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::fetcher::{ReadCache, gate_not_run};
@@ -49,9 +50,9 @@ use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use ravel_cache::{CacheKey, ReadOutcome, SingleFlightError};
-use ravel_catalog::SegmentRef;
+use ravel_catalog::{KEY_INDEX_SET_PROBE_MAX_RUNS, SegmentRef};
 use ravel_codec::key_idx::{
-    KEY_IDX_ENTRY_LEN, KeyIdxPrefix, KeyType, key_idx_prefix_range, key8_id16,
+    KEY_IDX_ENTRY_LEN, KeyIdxBucket, KeyIdxPrefix, KeyType, key_idx_prefix_range, key8_id16,
 };
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_object_store::get_latency::InGetPhase;
@@ -533,6 +534,7 @@ impl SpanSegmentFetcher {
                     status_mask,
                     predicates,
                     None,
+                    &[],
                     BlockProjection::All,
                     &PhaseAccounting::new(),
                 )
@@ -728,6 +730,7 @@ impl SpanSegmentFetcher {
                 status_mask,
                 predicates,
                 blocks,
+                &[],
                 BlockProjection::All,
                 accounting,
             )
@@ -810,6 +813,81 @@ impl SpanSegmentFetcher {
             status_mask,
             predicates,
             blocks,
+            &[],
+            BlockProjection::columnar(projected_columns),
+            accounting,
+        )
+        .await
+    }
+
+    /// [`fetch_accounted_in_blocks`](Self::fetch_accounted_in_blocks) for a
+    /// `trace_id IN (...)` set (ADR-3692 decision 6): `query` carries the ts
+    /// window and no `trace_id`, and `trace_ids` the set's ids. The read is
+    /// the ranged trace read: with no `blocks`, the object's KEY_IDX is
+    /// probed for every id (`probe_key_index`), an object holding none is
+    /// dropped, and otherwise only the union of their blocks is read; with
+    /// `blocks` (a tier-2 answer), exactly those. The rows are filtered by
+    /// the ts window alone, so the caller's own filter on `trace_id` stays
+    /// the exact evaluator. An empty `trace_ids` reads as
+    /// [`fetch_accounted_in_blocks`](Self::fetch_accounted_in_blocks).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_accounted_in_trace_set(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &SpanQuery,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
+        predicates: &[BloomPredicate<'_>],
+        trace_ids: &[[u8; 16]],
+        blocks: Option<&[u32]>,
+        accounting: &PhaseAccounting,
+    ) -> Result<Option<SpanFetchOutput>, SpanFetchError> {
+        let scan = self
+            .open_accounted_scan(
+                seg_ref,
+                tenant_hash,
+                query,
+                duration_ns,
+                status_mask,
+                predicates,
+                blocks,
+                trace_ids,
+                BlockProjection::All,
+                accounting,
+            )
+            .await?;
+        match scan {
+            Some(scan) => Ok(Some(drain_rows(scan).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Columnar sibling of
+    /// [`fetch_accounted_in_trace_set`](Self::fetch_accounted_in_trace_set).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_accounted_columnar_in_trace_set(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &SpanQuery,
+        duration_ns: Option<(i64, i64)>,
+        status_mask: Option<u8>,
+        predicates: &[BloomPredicate<'_>],
+        projected_columns: &[u32],
+        trace_ids: &[[u8; 16]],
+        blocks: Option<&[u32]>,
+        accounting: &PhaseAccounting,
+    ) -> Result<Option<SpanColumnarScan>, SpanFetchError> {
+        self.open_accounted_scan(
+            seg_ref,
+            tenant_hash,
+            query,
+            duration_ns,
+            status_mask,
+            predicates,
+            blocks,
+            trace_ids,
             BlockProjection::columnar(projected_columns),
             accounting,
         )
@@ -829,11 +907,12 @@ impl SpanSegmentFetcher {
         status_mask: Option<u8>,
         predicates: &[BloomPredicate<'_>],
         blocks: Option<&[u32]>,
+        trace_set: &[[u8; 16]],
         projection: BlockProjection,
         accounting: &PhaseAccounting,
     ) -> Result<Option<SpanColumnarScan>, SpanFetchError> {
         let key = &seg_ref.data_object_key;
-        if blocks.is_some() && query.trace_id.is_none() {
+        if blocks.is_some() && query.trace_id.is_none() && trace_set.is_empty() {
             return Err(corrupt(
                 key,
                 SpanSegError::Corrupted("a block set needs a trace_id".into()),
@@ -842,7 +921,7 @@ impl SpanSegmentFetcher {
         if !Self::ts_range_relevant(seg_ref, query.ts_min, query.ts_max) {
             return Ok(None);
         }
-        if SpanReadPath::for_query(query) == SpanReadPath::RangedTrace {
+        if SpanReadPath::for_query(query) == SpanReadPath::RangedTrace || !trace_set.is_empty() {
             let scan = self
                 .ranged_trace_scan(
                     seg_ref,
@@ -852,6 +931,7 @@ impl SpanSegmentFetcher {
                     status_mask,
                     predicates,
                     blocks,
+                    trace_set,
                     projection,
                     accounting,
                 )
@@ -909,6 +989,7 @@ impl SpanSegmentFetcher {
         status_mask: Option<u8>,
         predicates: &[BloomPredicate<'_>],
         blocks: Option<&[u32]>,
+        trace_set: &[[u8; 16]],
         projection: BlockProjection,
         accounting: &PhaseAccounting,
     ) -> Result<SpanColumnarScan, SpanFetchError> {
@@ -919,11 +1000,17 @@ impl SpanSegmentFetcher {
         let metadata = accounting.probe();
         let scan = accounting.scan();
         let bad = |source: SpanSegError| corrupt(key, source);
-        let trace_id = query.trace_id.ok_or_else(|| {
-            bad(SpanSegError::Corrupted(
+        let trace_ids: Vec<[u8; 16]> = match query.trace_id {
+            Some(trace_id) => vec![trace_id],
+            None => trace_set.to_vec(),
+        };
+        // A run's stamp only: the reads and the row filter never consult it.
+        let Some(&stamp) = trace_ids.first() else {
+            return Err(bad(SpanSegError::Corrupted(
                 "ranged read needs a trace_id".into(),
-            ))
-        })?;
+            )));
+        };
+        let single = query.trace_id;
         let size = seg_ref.object_size;
 
         let probe_len = self.trace_probe_bytes.min(size);
@@ -1008,7 +1095,7 @@ impl SpanSegmentFetcher {
                     tenant_hash,
                     &probe,
                     &footer,
-                    &trace_id,
+                    &trace_ids,
                     accounting.key_index(),
                 )
                 .await?
@@ -1058,7 +1145,7 @@ impl SpanSegmentFetcher {
         }
 
         let window = skip.candidate_blocks(
-            Some(&trace_id),
+            single.as_ref(),
             query.ts_min,
             query.ts_max,
             duration_ns,
@@ -1088,7 +1175,7 @@ impl SpanSegmentFetcher {
                 .map_err(bad)?;
             let bloom = BloomSection::parse(&bloom_raw).map_err(|e| bad(SpanSegError::from(e)))?;
             skip.candidate_blocks_with_bloom(
-                Some(&trace_id),
+                single.as_ref(),
                 query.ts_min,
                 query.ts_max,
                 duration_ns,
@@ -1106,11 +1193,23 @@ impl SpanSegmentFetcher {
             Vec::new()
         } else {
             match (blocks, probed.as_deref()) {
-                (None, None) => reader
-                    .trace_block_span(&trace_id)
-                    .map_err(bad)?
-                    .into_iter()
-                    .collect(),
+                (None, None) => match &single {
+                    Some(trace_id) => reader
+                        .trace_block_span(trace_id)
+                        .map_err(bad)?
+                        .into_iter()
+                        .collect(),
+                    // A set with no index answer reads every candidate, each
+                    // adjacent run in one GET.
+                    None => {
+                        let wanted: Vec<u32> = candidate_idx.iter().map(|&b| b as u32).collect();
+                        contiguous_runs(&wanted)
+                            .iter()
+                            .map(|run| reader.block_run_span(&stamp, run))
+                            .collect::<Result<_, _>>()
+                            .map_err(bad)?
+                    }
+                },
                 // The run is split over the intersection of the caller's set
                 // with this object's candidates, so a non-candidate block
                 // between two candidates never widens a GET.
@@ -1122,7 +1221,7 @@ impl SpanSegmentFetcher {
                         .collect();
                     contiguous_runs(&wanted)
                         .iter()
-                        .map(|run| reader.block_run_span(&trace_id, run))
+                        .map(|run| reader.block_run_span(&stamp, run))
                         .collect::<Result<_, _>>()
                         .map_err(bad)?
                 }
@@ -1138,7 +1237,7 @@ impl SpanSegmentFetcher {
                         let last = run
                             .iter()
                             .rposition(|b| candidate_idx.binary_search(b).is_ok())?;
-                        Some(reader.block_run_span(&trace_id, &run[first..=last]))
+                        Some(reader.block_run_span(&stamp, &run[first..=last]))
                     })
                     .collect::<Result<_, _>>()
                     .map_err(bad)?,
@@ -1199,26 +1298,31 @@ impl SpanSegmentFetcher {
 
     /// The tier-1 KEY_IDX probe of one object (ADR-2707 decision 5), sized
     /// from the footer's section entry alone so it runs before SKIP_IDX is
-    /// read: the section's `[0, prefix_len)`, then the one bucket the trace
-    /// mixes to, skipped when the directory says that bucket is empty. Each
+    /// read: the section's `[0, prefix_len)`, then the buckets the trace ids
+    /// mix to, a bucket skipped when the directory says it is empty. Each
     /// read is sliced from the footer suffix when the suffix holds it,
-    /// otherwise one ranged GET on `accounting` (the key-index phase). Its
-    /// decompressed bytes, charged there too, are the prefix's length once it
-    /// parses (stored as is) plus the decoded bucket's declared length. Every
-    /// ordinal the bucket names, under any key, must be below the footer's
-    /// block count.
+    /// otherwise one ranged GET on `accounting` (the key-index phase). One id
+    /// is the `trace_id =` lookup; several are a `trace_id IN (...)` set
+    /// (ADR-3692 decision 6), whose touched buckets are each read once when
+    /// there are at most [`KEY_INDEX_SET_PROBE_MAX_RUNS`] of them and
+    /// otherwise by one ranged read spanning them, first start to last end.
+    /// Its decompressed bytes, charged there too, are the prefix's length
+    /// once it parses (stored as is) plus each decoded bucket's declared
+    /// length. Every ordinal a bucket names, under any key, must be below the
+    /// footer's block count.
     ///
-    /// `None` is a fallback to SKIP_IDX alone: the section is missing, or its
-    /// prefix or bucket is corrupt, which is logged with the object key and
-    /// prunes nothing. A failed GET is not a fallback; it is a typed
-    /// [`SpanFetchError::Store`].
+    /// `Absent` when every id is absent; `Present` names the union of the
+    /// present ids' blocks. `None` is a fallback to SKIP_IDX alone: the
+    /// section is missing, or its prefix or a bucket is corrupt, which is
+    /// logged with the object key and prunes nothing. A failed GET is not a
+    /// fallback; it is a typed [`SpanFetchError::Store`].
     async fn probe_key_index(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: Option<TenantHash>,
         probe: &Extent,
         footer: &SpanFooter,
-        trace_id: &[u8; 16],
+        trace_ids: &[[u8; 16]],
         accounting: &QueryAccounting,
     ) -> Result<Option<TraceKeyProbe>, SpanFetchError> {
         let key = &seg_ref.data_object_key;
@@ -1254,54 +1358,89 @@ impl SpanSegmentFetcher {
         let prefix_bytes = self
             .key_index_read(seg_ref, tenant_hash, probe, prefix_span, accounting)
             .await?;
+        // Touched buckets by their absolute range, each with the located
+        // bucket of every id that mixes to it.
+        let mut buckets: BTreeMap<(u64, u64), Vec<KeyIdxBucket>> = BTreeMap::new();
         let located = KeyIdxPrefix::parse(&prefix_bytes, desc.prefix_len, desc.len)
             .map_err(SpanSegError::from)
             .and_then(|prefix| {
                 check_trace_key_parameters(&prefix)?;
-                Ok(prefix.locate(TRACE_ID_FIELD, KeyType::Id16, &key8_id16(trace_id))?)
+                for trace_id in trace_ids {
+                    let Some(bucket) =
+                        prefix.locate(TRACE_ID_FIELD, KeyType::Id16, &key8_id16(trace_id))?
+                    else {
+                        return Ok(false);
+                    };
+                    if !bucket.is_empty() {
+                        let span = absolute(bucket.range())?;
+                        buckets
+                            .entry((span.start, span.end))
+                            .or_default()
+                            .push(bucket);
+                    }
+                }
+                Ok(true)
             });
-        let bucket = match located {
-            Ok(Some(bucket)) => bucket,
-            Ok(None) => return Ok(Some(TraceKeyProbe::Declined)),
+        match located {
+            Ok(true) => {}
+            Ok(false) => return Ok(Some(TraceKeyProbe::Declined)),
             Err(err) => {
                 fall_back(err);
                 return Ok(None);
             }
-        };
+        }
         accounting.add_decompressed_bytes(prefix_bytes.len() as u64);
-        if bucket.is_empty() {
+        let (Some(first), Some(last)) = (buckets.keys().next(), buckets.keys().next_back()) else {
             return Ok(Some(TraceKeyProbe::Absent));
-        }
-        let bucket_span = match absolute(bucket.range()) {
-            Ok(span) => span,
-            Err(err) => {
-                fall_back(err);
+        };
+        let area = (buckets.len() > KEY_INDEX_SET_PROBE_MAX_RUNS).then(|| first.0..last.1);
+        let area_bytes = match &area {
+            Some(range) => Some(
+                self.key_index_read(seg_ref, tenant_hash, probe, range.clone(), accounting)
+                    .await?,
+            ),
+            None => None,
+        };
+        let mut set = Vec::new();
+        for (&(start, end), located) in &buckets {
+            let frame = match (&area, &area_bytes) {
+                (Some(range), Some(bytes)) => {
+                    let at = (start - range.start) as usize;
+                    bytes.slice(at..at + (end - start) as usize)
+                }
+                _ => {
+                    self.key_index_read(seg_ref, tenant_hash, probe, start..end, accounting)
+                        .await?
+                }
+            };
+            let Some(bucket) = located.first() else {
+                continue;
+            };
+            let entries = match bucket.entries(&frame) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    fall_back(err.into());
+                    return Ok(None);
+                }
+            };
+            if let Some(&(_, block)) = entries
+                .iter()
+                .find(|(_, b)| u64::from(*b) >= footer.block_count)
+            {
+                fall_back(SpanSegError::Corrupted(format!(
+                    "KEY_IDX bucket {} names block {block}, object has {} blocks",
+                    bucket.bucket(),
+                    footer.block_count
+                )));
                 return Ok(None);
             }
-        };
-        let frame = self
-            .key_index_read(seg_ref, tenant_hash, probe, bucket_span, accounting)
-            .await?;
-        let entries = match bucket.entries(&frame) {
-            Ok(entries) => entries,
-            Err(err) => {
-                fall_back(err.into());
-                return Ok(None);
+            accounting.add_decompressed_bytes(key_idx_frame_decompressed_len(&frame));
+            for bucket in located {
+                set.extend(bucket.matching(&entries));
             }
-        };
-        if let Some(&(_, block)) = entries
-            .iter()
-            .find(|(_, b)| u64::from(*b) >= footer.block_count)
-        {
-            fall_back(SpanSegError::Corrupted(format!(
-                "KEY_IDX bucket {} names block {block}, object has {} blocks",
-                bucket.bucket(),
-                footer.block_count
-            )));
-            return Ok(None);
         }
-        accounting.add_decompressed_bytes(key_idx_frame_decompressed_len(&frame));
-        let set = bucket.matching(&entries);
+        set.sort_unstable();
+        set.dedup();
         Ok(Some(if set.is_empty() {
             TraceKeyProbe::Absent
         } else {
@@ -2197,6 +2336,16 @@ fn build_span_row(block: &DecodedBlock, row: usize) -> Result<SpanRow, SpanSegEr
 /// the same one the fold hashes into a spans leaf.
 pub fn trace_key_set(trace_id: &[u8; 16]) -> Result<KeySet, KeySetError> {
     KeySet::new(TRACE_ID_FIELD, KeyType::Id16, vec![key8_id16(trace_id)])
+}
+
+/// The tier-2 router's key set for a `trace_id IN (...)` lookup: every id's
+/// key8.
+pub fn trace_ids_key_set(trace_ids: &[[u8; 16]]) -> Result<KeySet, KeySetError> {
+    KeySet::new(
+        TRACE_ID_FIELD,
+        KeyType::Id16,
+        trace_ids.iter().map(key8_id16).collect(),
+    )
 }
 
 /// The tier-2 router's [`LeafRangeReader`] for spans: each leaf range goes
@@ -3580,6 +3729,101 @@ mod tests {
             .collect();
         let trace3 = skip.candidate_blocks(Some(&trace(3)), i64::MIN, i64::MAX, None, None);
         (blocks.offset + blocks.len, ranges, trace3)
+    }
+
+    /// The spans twin of the logs set probe test (ADR-3692 decision 6): one
+    /// object of 400 single-span traces, two to a block. A `trace_id IN`
+    /// set touching more than `B_run` buckets costs the KEY_IDX prefix and
+    /// one ranged read of the bucket area it spans; one touching at most
+    /// `B_run` reads each touched bucket once; a set of absent ids drops the
+    /// object. The rows hold every listed trace.
+    ///
+    /// Flip to watch it fail: in `probe_key_index`, set `area` to `None`
+    /// unconditionally. The 300-id case then issues 1 + its distinct bucket
+    /// count KEY_IDX GETs, not 2.
+    #[tokio::test]
+    async fn set_probe_reads_the_bucket_area_above_b_run() {
+        use ravel_codec::key_idx::bucket_index;
+        use ravel_rspan::TRACE_KEY_IDX_BUCKET_BITS;
+        use std::collections::BTreeSet;
+
+        let id = |n: u32| {
+            let mut t = [0u8; 16];
+            t[..4].copy_from_slice(&n.to_be_bytes());
+            t[15] = 1;
+            t
+        };
+        let memory = MemoryStore::new();
+        let records: Vec<SpanRecord> = (0..400u32)
+            .map(|n| bare_span(id(n), [1; 8], 100 + i64::from(n), 200 + i64::from(n)))
+            .collect();
+        let seg = write_object(&memory, 7, &records).await;
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(memory);
+        // A probe too short to hold KEY_IDX, so each of its reads is a GET.
+        let fetcher = SpanSegmentFetcher::new(backend).with_trace_probe_bytes(64);
+        let window = SpanQuery::ts_range(i64::MIN, i64::MAX);
+        let distinct = |ids: &[[u8; 16]]| {
+            ids.iter()
+                .map(|t| bucket_index(&key8_id16(t), TRACE_KEY_IDX_BUCKET_BITS).expect("bucket"))
+                .collect::<BTreeSet<_>>()
+                .len()
+        };
+        let run = |ids: Vec<[u8; 16]>| {
+            let fetcher = &fetcher;
+            let seg = &seg;
+            async move {
+                let phases = PhaseAccounting::new();
+                let out = fetcher
+                    .fetch_accounted_in_trace_set(
+                        seg,
+                        TENANT,
+                        &window,
+                        None,
+                        None,
+                        &[],
+                        &ids,
+                        None,
+                        &phases,
+                    )
+                    .await
+                    .expect("fetch")
+                    .expect("relevant");
+                let gets = phases.key_index().snapshot().s3_requests(AccountedOp::Get);
+                let traces: BTreeSet<[u8; 16]> =
+                    out.records.iter().map(|r| r.record.trace_id).collect();
+                (out.key_index, gets, traces)
+            }
+        };
+
+        let wide: Vec<[u8; 16]> = (0..300).map(id).collect();
+        assert!(distinct(&wide) > KEY_INDEX_SET_PROBE_MAX_RUNS);
+        let (pruning, gets, traces) = run(wide.clone()).await;
+        assert_eq!(pruning.segments_pruned, 0);
+        assert_eq!(gets, 2, "the prefix and one read of the bucket area");
+        assert!(
+            wide.iter().all(|t| traces.contains(t)),
+            "every listed trace"
+        );
+
+        let narrow: Vec<[u8; 16]> = [3, 17, 101, 250, 399].into_iter().map(id).collect();
+        assert!(distinct(&narrow) <= KEY_INDEX_SET_PROBE_MAX_RUNS);
+        let (pruning, gets, traces) = run(narrow.clone()).await;
+        assert_eq!(pruning.segments_pruned, 0);
+        assert_eq!(
+            gets,
+            1 + distinct(&narrow) as u64,
+            "one read per touched bucket"
+        );
+        assert!(narrow.iter().all(|t| traces.contains(t)));
+        // Only the listed traces' blocks are read: two spans to a block.
+        assert_eq!(traces.len(), 2 * narrow.len());
+
+        let (pruning, _, traces) = run((1_000..1_300).map(id).collect()).await;
+        assert_eq!(
+            pruning.segments_pruned, 1,
+            "every id absent drops the object"
+        );
+        assert!(traces.is_empty());
     }
 
     async fn trace_fixture() -> TraceFixture {
