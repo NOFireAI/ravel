@@ -416,6 +416,27 @@
                           }
                         },
                         "type": "object"
+                      },
+                      "scratch": {
+                        "description": "Local scratch space for the two-level RLOG merge (ADR-3853 D2). When\nset, the maintain pods get an `emptyDir` volume named `scratch` with a\n`sizeLimit` of `sizeGi` GiB mounted at `mountPath`, an\n`ephemeral-storage` request of the same size, and\n`--maintain-scratch-dir <mountPath>`. Omit to render none of these.\nThe directory is a cache only: ravel-server wipes it at start and\npublishes nothing from it, so losing the volume loses no data. Size it\nto about 1.3 times the largest merge unit's input bytes.",
+                        "nullable": true,
+                        "properties": {
+                          "mountPath": {
+                            "default": "/var/lib/ravel/scratch",
+                            "description": "Where the volume is mounted in the maintain container, and the value\nof `--maintain-scratch-dir`. Defaults to `/var/lib/ravel/scratch`.",
+                            "type": "string"
+                          },
+                          "sizeGi": {
+                            "description": "Volume size in GiB: the `emptyDir` `sizeLimit` and the container's\n`ephemeral-storage` request. About 1.3 times the largest merge unit's\ninput bytes. Minimum 1.",
+                            "format": "uint32",
+                            "minimum": 1.0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "sizeGi"
+                        ],
+                        "type": "object"
                       }
                     },
                     "type": "object"

@@ -39,7 +39,8 @@ use ravel_object_store::s3::{S3EndpointRefusal, resolve_s3_allow_http};
 use crate::crd::{
     AffinityBackend, AffinityKeySource, GATEWAY_DEFAULT_CPU_REQUEST,
     GATEWAY_DEFAULT_MEMORY_REQUEST, GatewayReference, IngestAffinitySpec, LocalSecretRef,
-    MAINTAIN_DEFAULT_CPU_REQUEST, MAINTAIN_DEFAULT_MEMORY_REQUEST, QUERY_DEFAULT_CPU_REQUEST,
+    MAINTAIN_DEFAULT_CPU_REQUEST, MAINTAIN_DEFAULT_MEMORY_REQUEST, MaintainScratchSpec,
+    QUERY_DEFAULT_CPU_REQUEST,
     QUERY_DEFAULT_MEMORY_REQUEST, RavelClusterSpec, ResourceRequirementsSpec, S3AuthSpec,
     S3UploadIntegrity,
 };
@@ -1212,6 +1213,9 @@ pub(crate) const SQL_TICKET_KEY_MOUNT_DIR: &str = "/etc/ravel/sql-ticket-key";
 /// Mount directory of `maintain.keySecretRef`.
 pub(crate) const MAINTAIN_KEY_MOUNT_DIR: &str = "/etc/ravel/maintain-key";
 
+/// Name of the maintain tier's scratch volume (`spec.maintain.scratch`).
+const MAINTAIN_SCRATCH_VOLUME_NAME: &str = "scratch";
+
 /// Secret key of the fragment certificate (the `kubernetes.io/tls` name).
 pub(crate) const FRAGMENT_TLS_CERT_KEY: &str = "tls.crt";
 /// Secret key of the fragment private key (the `kubernetes.io/tls` name).
@@ -2182,6 +2186,20 @@ pub fn desired_maintain_deployment(
         }
     }
 
+    let mut volumes = vec![secret_file_volume(
+        "maintain-key",
+        key_secret,
+        &[KEY_FILE_SECRET_KEY],
+        MAINTAIN_KEY_MOUNT_DIR,
+    )];
+    // Scratch for the two-level RLOG merge (ADR-3853 D2): a cache the server
+    // wipes at start, so an emptyDir is the whole contract.
+    if let Some(scratch) = &spec.maintain.scratch {
+        args.push("--maintain-scratch-dir".to_string());
+        args.push(scratch.mount_path.clone());
+        volumes.push(maintain_scratch_volume(scratch));
+    }
+
     let tier_override = spec.maintain.credentials_secret_ref.as_ref();
     let mut env = s3_credential_env(spec, tier_override);
     env.extend(tenant_token_env(spec, ctx));
@@ -2192,7 +2210,7 @@ pub fn desired_maintain_deployment(
         ..Default::default()
     }];
 
-    Ok(Some(deployment(
+    let mut maintain = deployment(
         spec,
         instance,
         "maintain",
@@ -2213,14 +2231,58 @@ pub fn desired_maintain_deployment(
             None,
             ctx.maintain_key_resource_version.as_slice(),
         ),
-        vec![secret_file_volume(
-            "maintain-key",
-            key_secret,
-            &[KEY_FILE_SECRET_KEY],
-            MAINTAIN_KEY_MOUNT_DIR,
-        )],
+        volumes,
         ctx.credentials_sidecar_image.as_deref(),
-    )))
+    );
+    if let Some(scratch) = &spec.maintain.scratch {
+        request_scratch_ephemeral_storage(&mut maintain, scratch);
+    }
+    Ok(Some(maintain))
+}
+
+/// The `scratch` emptyDir, limited to `sizeGi`, and its mount at `mountPath`.
+fn maintain_scratch_volume(scratch: &MaintainScratchSpec) -> (Volume, VolumeMount) {
+    let volume = Volume {
+        name: MAINTAIN_SCRATCH_VOLUME_NAME.to_string(),
+        empty_dir: Some(EmptyDirVolumeSource {
+            medium: None,
+            size_limit: Some(scratch_quantity(scratch)),
+        }),
+        ..Default::default()
+    };
+    let mount = VolumeMount {
+        name: MAINTAIN_SCRATCH_VOLUME_NAME.to_string(),
+        mount_path: scratch.mount_path.clone(),
+        ..Default::default()
+    };
+    (volume, mount)
+}
+
+fn scratch_quantity(scratch: &MaintainScratchSpec) -> Quantity {
+    Quantity(format!("{}Gi", scratch.size_gi))
+}
+
+/// Add an `ephemeral-storage` request of `sizeGi` to the ravel-server
+/// container, so the scheduler places the pod on a node with room for the
+/// volume. It replaces any `ephemeral-storage` request in
+/// `spec.maintain.resources`; the other requests and limits are kept.
+fn request_scratch_ephemeral_storage(deployment: &mut Deployment, scratch: &MaintainScratchSpec) {
+    let containers = deployment
+        .spec
+        .as_mut()
+        .and_then(|d| d.template.spec.as_mut())
+        .map(|p| p.containers.iter_mut());
+    for container in containers.into_iter().flatten() {
+        if container.name != "ravel-server" {
+            continue;
+        }
+        container
+            .resources
+            .get_or_insert_with(ResourceRequirements::default)
+            .requests
+            .get_or_insert_with(BTreeMap::new)
+            .insert("ephemeral-storage".to_string(), scratch_quantity(scratch));
+    }
 }
 
 /// Validate every set `spec.gc` field, whether or not the maintain tier
@@ -4670,6 +4732,7 @@ mod tests {
                 key_secret_ref: Some(LocalSecretRef {
                     name: "maintain-keys".to_string(),
                 }),
+                scratch: None,
             },
             // Explicit false: the pre-ADR-1702-task-12 default, kept as the
             // fixture every unrelated render test here builds on. The
