@@ -189,8 +189,10 @@
 //! [`SlicePushdown`]. A ticket without it is the no-pushdown query, and
 //! [`FlightTicket::encode`] never writes it. Only the slice surface carries
 //! it. It sits under the MAC like every other field. A ticket that carries
-//! the block is version 9, or 11 when it is a logs block with exact-key
-//! equalities; one without it is still version 8, byte for byte,
+//! the block is version 9; 11 when it is a logs block with exact-key
+//! equalities and no key set; 12 when it carries a key set, a logs exact-key
+//! `IN` set or a spans `trace_id IN` list. One without it is still version
+//! 8, byte for byte,
 //! so a metrics slice or a coordinator built before the block mints exactly
 //! what it always did. See "Version history" below for why the block needs
 //! the bump.
@@ -206,15 +208,17 @@
 //! signal table on version 8 or 9, byte for byte. A version 10 ticket is
 //! client-surface only: the distributed slice path splits one snapshot, so
 //! a slice ticket never carries groups and the slice surface refuses version
-//! 10. The slice surface's own newer version is 11, the pushdown block with
-//! a logs key section; the client surface refuses it in turn.
+//! 10. The slice surface's own newer versions are 11, the pushdown block
+//! with a logs key section, and 12, the pushdown block with a key set; the
+//! client surface refuses both in turn.
 //!
 //! Each surface's version set holds at mint as well as at decode:
 //! [`FlightTicket::encode_for_surface`], which [`SqlTicketKeys`] and the
 //! coordinator's slice client mint through, refuses a ticket whose version
-//! the surface does not decode, a version 10 ticket on the slice surface as
-//! [`FlightTicketError::SignalGroupsOnSlice`] and a version 11 ticket on the
-//! client surface as [`FlightTicketError::KeyEqualsOnClient`].
+//! the surface does not decode: a version 10 ticket on the slice surface as
+//! [`FlightTicketError::SignalGroupsOnSlice`], a version 11 ticket on the
+//! client surface as [`FlightTicketError::KeyEqualsOnClient`], and a version
+//! 12 ticket on the client surface as [`FlightTicketError::KeySetOnClient`].
 //! [`FlightTicket::encode_with_pushdown`] names no surface and checks none.
 //!
 //! # Integrity: a keyed MAC, not a checksum
@@ -381,16 +385,18 @@
 //!   Written only when the block carries at least one; every other slice
 //!   ticket keeps version 8 or 9. Version 11 is a slice-surface version: it
 //!   follows 9's layout, not 10's, so the slice surface decodes and mints 8,
-//!   9 and 11 and the client surface 8, 9 and 10. A version 9 worker refuses
-//!   a version 11 ticket on its version byte.
+//!   9 and 11 (and 12, below) and the client surface 8, 9 and 10. A version
+//!   9 worker refuses a version 11 ticket on its version byte.
 //! - 12: the pushdown block carries a key set (ADR-3692 decision 6): a logs
 //!   block ends with the version 11 key section (its count may be 0) and an
 //!   exact-key `IN` set, a spans block ends with the `trace_id IN` list after
 //!   the version 9 single trace id. Written only when the block carries a
-//!   set; every other slice ticket keeps 8, 9 or 11 byte for byte. Without
-//!   the spans list a Flight-served `trace_id IN` would have encoded as a
-//!   version 9 ticket carrying no id and read every block. A slice-surface
-//!   version, like 11; a worker on 11 refuses it on its version byte.
+//!   set; every other slice ticket keeps 8, 9 or 11 byte for byte. A
+//!   slice-surface version, like 11. Workers decode a slice ticket with
+//!   [`SqlTicketKeys::decode`], which drops the pushdown block and re-plans
+//!   the fragment from the statement text, so the bump changes no rows: its
+//!   effect is that a worker on 11 refuses a version 12 ticket on its version
+//!   byte during a mixed-version rollout, an error rather than a read.
 //!
 //! Every layout change bumps the byte, even though a ticket is ephemeral,
 //! because the build that mints a ticket and the build that redeems it can
@@ -440,9 +446,8 @@ pub(crate) const VERSION_PUSHDOWN: u8 = 9;
 /// never this version.
 pub(crate) const VERSION_GROUPS: u8 = 10;
 /// Version of a ticket whose logs pushdown block carries exact-key
-/// equalities (ADR-2707 decision 5), and the newest the slice surface
-/// decodes. Its layout is version 9's plus the key section, so a client
-/// ticket is never this version.
+/// equalities and no key set (ADR-2707 decision 5). Its layout is version
+/// 9's plus the key section, so a client ticket is never this version.
 pub(crate) const VERSION_KEY_EQUALS: u8 = 11;
 /// Version of a slice ticket whose pushdown block carries a key set: a logs
 /// block with an exact-key `IN` set, or a spans block with a `trace_id IN`
@@ -722,8 +727,8 @@ impl SqlTicketKeys {
     /// surface's keys. [`FlightTicketError::MacMismatch`] when none verifies;
     /// any other error is the first key's structural refusal, which does not
     /// depend on the key. The client surface decodes versions 8, 9 and 10,
-    /// the slice surface 8, 9 and 11: a version 10 ticket on the slice
-    /// surface, or a version 11 ticket on the client surface, is
+    /// the slice surface 8, 9, 11 and 12: a version 10 ticket on the slice
+    /// surface, or a version 11 or 12 ticket on the client surface, is
     /// [`FlightTicketError::UnsupportedVersion`].
     pub fn decode(
         &self,
@@ -1045,7 +1050,9 @@ impl FlightTicket {
     /// groups (version 10) on the slice surface is
     /// [`FlightTicketError::SignalGroupsOnSlice`]; a pushdown with exact-key
     /// equalities (version 11) on the client surface is
-    /// [`FlightTicketError::KeyEqualsOnClient`].
+    /// [`FlightTicketError::KeyEqualsOnClient`]; a pushdown with a key set
+    /// (version 12) on the client surface is
+    /// [`FlightTicketError::KeySetOnClient`].
     pub fn encode_for_surface(
         &self,
         key: &TicketKey,

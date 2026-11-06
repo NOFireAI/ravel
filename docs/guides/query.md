@@ -1098,8 +1098,8 @@ curl -X POST http://127.0.0.1:4318/api/v1/sql \
 The rows are the union of what each key's `=` lookup returns. Ravel reads
 only the objects and blocks that hold one of the keys: it checks the key
 index of each folded part first, then the key index inside each object it
-still has to read. `stats.keyIndex.keysProbed` is the number of keys the
-lookup used.
+still has to read. `stats.keyIndex.keysProbed` is the number of distinct
+keys the part-level check used, and 0 when the lookup skipped that check.
 
 A trace id is a 32-character hex string or a 16-byte binary literal
 (`X'0011...'`). A typed column's values must be literals of exactly its
@@ -1107,7 +1107,10 @@ type: integers for an `i64` column, strings for a `str` column, binary
 literals for a `bytes` column.
 
 These lists still return the right rows but use no key, so Ravel reads the
-time window's objects in full:
+time window's objects without the key index. An `IN` list (not `NOT IN`) on
+a declared `i64` column, outside an `OR`, still skips the blocks whose values
+all fall outside the list's smallest-to-largest range, as a range comparison
+does; the other lists read those objects in full:
 
 - a list of more than 1,024 distinct values;
 - `NOT IN`, a list mixing types, or a list holding `NULL` or an expression;
