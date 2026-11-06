@@ -534,8 +534,10 @@ is not cursor. `R` counts run parts, not groups: every part of every run is
 a level-2 input, so a run target that cuts each group into several parts
 multiplies the term. The stream estimate term is there because a run's part
 cut can split one stream across two of that run's blocks. Group size under
-2, short scratch headroom and a level 2 that does not fit are each refused
-by name, as a terminal outcome the scan memo does not retry in this process.
+2, short scratch headroom, a scratch directory another process holds and a
+level 2 that does not fit are each refused by name, as a terminal outcome
+the scan memo does not retry in this process; the pass goes on to the
+buckets that do not need two levels.
 Only a bucket the D0 check refuses takes this route; a fetch-per-pass or
 resident plan stays single-level with `scratch_dir` set.
 The emitted sequence, and so
@@ -551,8 +553,11 @@ most `R` run blocks per stream, and the in-progress part. Level 1 runs one group
 at a time (`W1 = 1`), so the per-worker ceiling `C` is the unit ceiling `U`;
 dividing the budgets across parallel workers is ADR-3853 D4's. The runs are
 a cache: the merge refuses before its first block GET when the scratch
-volume holds less than 1.3 times the inputs' object sizes, removes the
-unit's runs however it ends, and no durability or recovery path reads them.
+volume's free bytes, less what the process's other running merges hold
+reserved in that directory, are under 1.3 times the inputs' object sizes,
+reserves that much until it ends, refuses the same way when a scratch write
+runs out of space, removes the unit's runs however it ends, and no
+durability or recovery path reads them.
 A process takes an exclusive lock on a file in `scratch_dir` at its first
 two-level merge and holds it for its lifetime; with the lock held it removes
 every unit directory it did not create, which reclaims what a killed process
