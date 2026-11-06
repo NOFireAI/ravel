@@ -81,14 +81,22 @@ pub enum CompactionOutcome {
         check: crate::error::TwoLevelCheck,
     },
     /// The bucket's single-level plan is refused under ADR-3853 D0 and the
-    /// scratch volume holds less than its two-level merge needs (ADR-3853
-    /// D2). Refused before the first block GET; terminal like
-    /// [`Self::GeometryUnsupported`].
+    /// scratch volume holds less than its two-level merge needs once the
+    /// other two-level merges of this process have their `reserved` share
+    /// set aside, or a scratch write ran out of space (ADR-3853 D2). Nothing
+    /// published; terminal like [`Self::GeometryUnsupported`].
     ScratchHeadroom {
         need: u64,
         free: u64,
+        reserved: u64,
         path: std::path::PathBuf,
     },
+    /// The bucket's single-level plan is refused under ADR-3853 D0 and
+    /// another process holds the scratch directory's lock, at `path`
+    /// (ADR-3853 D2). Refused before the first block GET; terminal like
+    /// [`Self::GeometryUnsupported`], so buckets that do not need the
+    /// two-level merge keep compacting.
+    ScratchLocked { path: std::path::PathBuf },
     /// Built and published (or converged / abandoned): `parts` parts written,
     /// `publish` records how the record PUT resolved.
     Compacted {
@@ -739,18 +747,42 @@ async fn compact_bucket_scoped(
             );
             CompactionOutcome::TwoLevelUnsupported { inputs, check }
         }
-        Err(MaintainError::ScratchHeadroom { need, free, path }) => {
+        Err(MaintainError::ScratchHeadroom {
+            need,
+            free,
+            reserved,
+            path,
+        }) => {
             tracing::warn!(
                 signal = ?bucket.signal,
                 shard = bucket.shard,
                 ingest_hour_bucket = bucket.ingest_hour_bucket,
                 need,
                 free,
+                reserved,
                 path = %path.display(),
                 "compaction refused a bucket: its two-level merge needs more scratch \
-                 than the volume has free; nothing fetched or published (ADR-3853 D2)"
+                 than the volume has free beyond what this process's other merges \
+                 reserved; nothing published (ADR-3853 D2)"
             );
-            CompactionOutcome::ScratchHeadroom { need, free, path }
+            CompactionOutcome::ScratchHeadroom {
+                need,
+                free,
+                reserved,
+                path,
+            }
+        }
+        Err(MaintainError::ScratchLocked { path }) => {
+            tracing::warn!(
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                path = %path.display(),
+                "compaction refused a bucket: another process holds the scratch \
+                 directory lock its two-level merge needs; nothing fetched or \
+                 published (ADR-3853 D2)"
+            );
+            CompactionOutcome::ScratchLocked { path }
         }
         other => other?,
     };

@@ -615,11 +615,22 @@ pub async fn compact_to(
             "outcome: TwoLevelUnsupported (the two-level merge over {inputs} inputs \
              does not fit: {check}; nothing published)"
         )?,
-        CompactionOutcome::ScratchHeadroom { need, free, path } => writeln!(
+        CompactionOutcome::ScratchHeadroom {
+            need,
+            free,
+            reserved,
+            path,
+        } => writeln!(
             out,
             "outcome: ScratchHeadroom (the two-level merge needs {need} bytes of \
-             scratch under {} and that filesystem has {free} free; refused before \
-             any block was read, ADR-3853 D2)",
+             scratch under {} and that filesystem has {free} free with {reserved} \
+             reserved by other merges; nothing published, ADR-3853 D2)",
+            path.display()
+        )?,
+        CompactionOutcome::ScratchLocked { path } => writeln!(
+            out,
+            "outcome: ScratchLocked (another process holds the scratch lock {}; \
+             refused before any block was read, ADR-3853 D2)",
             path.display()
         )?,
         CompactionOutcome::Compacted { parts, publish } => {
@@ -1301,12 +1312,25 @@ fn emit_bucket_outcome(
                  check=\"{check}\""
             )?;
         }
-        Ok(CompactionOutcome::ScratchHeadroom { need, free, path }) => {
+        Ok(CompactionOutcome::ScratchHeadroom {
+            need,
+            free,
+            reserved,
+            path,
+        }) => {
             report.geometry_unsupported += 1;
             writeln!(
                 out,
                 "shard={shard} hour={hour} outcome=ScratchHeadroom need={need} free={free} \
-                 path={}",
+                 reserved={reserved} path={}",
+                path.display()
+            )?;
+        }
+        Ok(CompactionOutcome::ScratchLocked { path }) => {
+            report.geometry_unsupported += 1;
+            writeln!(
+                out,
+                "shard={shard} hour={hour} outcome=ScratchLocked path={}",
                 path.display()
             )?;
         }

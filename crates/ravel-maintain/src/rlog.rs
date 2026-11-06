@@ -1711,15 +1711,102 @@ fn lock_scratch_dir(scratch_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// One merge unit's scratch subdirectory. Dropping it wipes and removes the
-/// subdirectory, so the runs are gone after a success, an error return, and a
-/// merge future dropped mid-await (ADR-3853 D2).
+/// Scratch bytes the running two-level merges of this process hold reserved,
+/// per scratch directory. Units run concurrently, so each admission sets its
+/// need aside here before the next one reads the free figure.
+static SCRATCH_RESERVED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// What the units of this process running in `scratch_dir` hold reserved.
+fn scratch_reserved(scratch_dir: &std::path::Path) -> u64 {
+    SCRATCH_RESERVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(scratch_dir)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// One unit's share of its scratch directory's headroom, given back on drop.
+struct ScratchReservation {
+    dir: std::path::PathBuf,
+    bytes: u64,
+    /// The free figure the unit was admitted against.
+    free: u64,
+}
+
+impl ScratchReservation {
+    /// Admit a unit needing `need` bytes of `scratch_dir` (ADR-3853 D2) when
+    /// the filesystem's free bytes less what this process's running units
+    /// there hold reserved cover it; otherwise
+    /// [`MaintainError::ScratchHeadroom`]. The free figure is read under the
+    /// reservation lock, so two admissions never count the same bytes.
+    fn admit(scratch_dir: &std::path::Path, need: u64) -> Result<Self> {
+        let mut reserved = SCRATCH_RESERVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let free = scratch_free_bytes(scratch_dir)?;
+        let held = reserved.get(scratch_dir).copied().unwrap_or(0);
+        if free.saturating_sub(held) < need {
+            return Err(MaintainError::ScratchHeadroom {
+                need,
+                free,
+                reserved: held,
+                path: scratch_dir.to_path_buf(),
+            });
+        }
+        let total = reserved.entry(scratch_dir.to_path_buf()).or_insert(0);
+        *total = total.saturating_add(need);
+        Ok(ScratchReservation {
+            dir: scratch_dir.to_path_buf(),
+            bytes: need,
+            free,
+        })
+    }
+}
+
+impl Drop for ScratchReservation {
+    fn drop(&mut self) {
+        let mut reserved = SCRATCH_RESERVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(total) = reserved.get_mut(&self.dir) {
+            *total = total.saturating_sub(self.bytes);
+            if *total == 0 {
+                reserved.remove(&self.dir);
+            }
+        }
+    }
+}
+
+/// Whether a scratch write failed for want of space: the scratch store
+/// reports a filesystem error as [`StoreError::Permanent`] ending in the
+/// `io::Error`'s text, ENOSPC's or [`std::io::ErrorKind::StorageFull`]'s.
+fn is_scratch_full(err: &StoreError) -> bool {
+    let StoreError::Permanent(message) = err else {
+        return false;
+    };
+    let enospc = std::io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error());
+    let storage_full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+    message.ends_with(&enospc.to_string()) || message.ends_with(&storage_full.to_string())
+}
+
+/// One merge unit's scratch subdirectory and its headroom reservation.
+/// Dropping it wipes and removes the subdirectory, then gives the reservation
+/// back, so the runs are gone and the headroom is free again after a success,
+/// an error return, and a merge future dropped mid-await (ADR-3853 D2).
 struct ScratchUnit {
     store: Arc<ScratchStore>,
+    _reservation: ScratchReservation,
 }
 
 impl ScratchUnit {
-    fn open(scratch_dir: &std::path::Path, input_set_hash: &[u8; 32]) -> Result<Self> {
+    fn open(
+        scratch_dir: &std::path::Path,
+        input_set_hash: &[u8; 32],
+        reservation: ScratchReservation,
+    ) -> Result<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = scratch_dir.join(format!(
@@ -1729,11 +1816,14 @@ impl ScratchUnit {
         ));
         Ok(ScratchUnit {
             store: Arc::new(ScratchStore::open(dir, SCRATCH_LIST_PAGE)?),
+            _reservation: reservation,
         })
     }
 }
 
 impl Drop for ScratchUnit {
+    // The _reservation field drops after this body, so the headroom is given
+    // back only once the runs are gone.
     fn drop(&mut self) {
         let dir = self.store.root().to_path_buf();
         if let Err(e) = self.store.wipe() {
@@ -1747,12 +1837,36 @@ impl Drop for ScratchUnit {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Wraps a unit's scratch store before the merge writes to it, for a
+    /// test that injects scratch faults.
+    #[allow(clippy::type_complexity)]
+    static SCRATCH_STORE_WRAP: std::cell::RefCell<
+        Option<Box<dyn Fn(Arc<ScratchStore>) -> Arc<dyn ObjectStoreBackend>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// The backend a unit's runs are written through.
+fn scratch_backend(store: &Arc<ScratchStore>) -> Arc<dyn ObjectStoreBackend> {
+    #[cfg(test)]
+    if let Some(wrapped) =
+        SCRATCH_STORE_WRAP.with(|w| w.borrow().as_ref().map(|f| f(Arc::clone(store))))
+    {
+        return wrapped;
+    }
+    Arc::clone(store) as Arc<dyn ObjectStoreBackend>
+}
+
 /// A unit's scratch store that adds every byte written to and read from it to
 /// the ledger's scratch counters (ADR-3853 D6), as stored: a run's encoded
-/// bytes, never a request phase.
+/// bytes, never a request phase. It records a write that failed for want of
+/// space in `full`. Its capabilities report no multipart upload: a multipart
+/// write would bypass both the write counter and that record.
 struct ScratchMeter {
-    scratch: Arc<ScratchStore>,
+    scratch: Arc<dyn ObjectStoreBackend>,
     ledger: Option<RequestLedger>,
+    full: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -1764,7 +1878,11 @@ impl ObjectStoreBackend for ScratchMeter {
         opts: PutOptions,
     ) -> std::result::Result<PutOutcome, StoreError> {
         let len = data.len() as u64;
-        let outcome = self.scratch.put(key, data, opts).await?;
+        let outcome = self.scratch.put(key, data, opts).await.inspect_err(|e| {
+            if is_scratch_full(e) {
+                self.full.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })?;
         if let Some(l) = &self.ledger {
             l.record_scratch_write(len);
         }
@@ -1800,7 +1918,10 @@ impl ObjectStoreBackend for ScratchMeter {
     }
 
     fn capabilities(&self) -> Capabilities {
-        self.scratch.capabilities()
+        Capabilities {
+            multipart: false,
+            ..self.scratch.capabilities()
+        }
     }
 }
 
@@ -1859,21 +1980,87 @@ async fn two_level_merge(
         )))
     })?;
     lock_scratch_dir(target.scratch_dir)?;
-    let free = scratch_free_bytes(target.scratch_dir)?;
-    if need > free {
-        return Err(MaintainError::ScratchHeadroom {
-            need,
-            free,
-            path: target.scratch_dir.to_path_buf(),
-        });
-    }
+    let reservation = ScratchReservation::admit(target.scratch_dir, need)?;
+    let free = reservation.free;
 
-    let unit = ScratchUnit::open(target.scratch_dir, target.input_set_hash)?;
+    let unit = ScratchUnit::open(target.scratch_dir, target.input_set_hash, reservation)?;
     let ledger = config.request_ledger.clone();
     let meter = ScratchMeter {
-        scratch: Arc::clone(&unit.store),
+        scratch: scratch_backend(&unit.store),
         ledger: ledger.clone(),
+        full: std::sync::atomic::AtomicBool::new(false),
     };
+    let merged = two_level_levels(
+        target,
+        catalogs,
+        stream_ids,
+        width_ns,
+        output,
+        keep,
+        &meter,
+        TwoLevelSizing {
+            group_size,
+            per_input,
+            need,
+            free,
+        },
+    )
+    .await;
+    match merged {
+        Err(err) if meter.full.load(std::sync::atomic::Ordering::Relaxed) => {
+            let free = scratch_free_bytes(target.scratch_dir).unwrap_or(0);
+            let reserved = scratch_reserved(target.scratch_dir).saturating_sub(need);
+            tracing::warn!(
+                path = %target.scratch_dir.display(),
+                need,
+                free,
+                reserved,
+                error = %err,
+                "two-level merge scratch write ran out of space (ADR-3853 D2)"
+            );
+            Err(MaintainError::ScratchHeadroom {
+                need,
+                free,
+                reserved,
+                path: target.scratch_dir.to_path_buf(),
+            })
+        }
+        other => other,
+    }
+}
+
+/// The figures [`two_level_merge`] admitted its unit with.
+struct TwoLevelSizing {
+    group_size: u64,
+    per_input: u64,
+    need: u64,
+    free: u64,
+}
+
+/// Levels 1 and 2 of [`two_level_merge`], once its unit is admitted, with the
+/// runs written through `meter`.
+#[allow(clippy::too_many_arguments)]
+async fn two_level_levels(
+    target: &TwoLevelTarget<'_>,
+    catalogs: &[RlogInputCatalog],
+    stream_ids: &[LogStreamId],
+    width_ns: i64,
+    output: OutputSpec,
+    keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
+    meter: &ScratchMeter,
+    sizing: TwoLevelSizing,
+) -> Result<MergeOutput> {
+    let TwoLevelSizing {
+        group_size,
+        per_input,
+        need,
+        free,
+    } = sizing;
+    let config = target.config;
+    let inputs = catalogs.len();
+    let ceiling = config.merge_resident_ceiling();
+    let run_target = config.rlog_run_memory_target_bytes;
+    let ledger = config.request_ledger.clone();
     let tracker = config.merge_memory_tracker.as_ref();
     let run_writer = Arc::new(PartWriterSettings {
         zstd_level: RUN_ZSTD_LEVEL,
@@ -1923,7 +2110,7 @@ async fn two_level_merge(
                 level: 1,
             }),
             run: Some(RunTarget {
-                scratch: &meter,
+                scratch: meter,
                 index,
                 keys: Vec::new(),
             }),
@@ -1946,7 +2133,7 @@ async fn two_level_merge(
 
     let mut runs: Vec<RlogInputCatalog> = Vec::with_capacity(run_keys.len());
     for key in run_keys {
-        runs.push(load_catalog_noted(&meter, config, None, key, false).await?);
+        runs.push(load_catalog_noted(meter, config, None, key, false).await?);
     }
     let mut run_block_bytes = 0u64;
     let mut run_blocks = 0usize;
@@ -2039,7 +2226,7 @@ async fn two_level_merge(
     let mut level2 = RecordCounts::default();
     let mut keep_all = |_: &LogRecord| -> Result<bool> { Ok(true) };
     merge_planned(
-        &meter,
+        meter,
         &runs,
         stream_ids,
         width_ns,
@@ -6073,6 +6260,18 @@ mod tests {
         records: &[LogRecord],
         bytes: Bytes,
     ) -> Bytes {
+        seed_l0_object_at(store, writer_id, seq, records, bytes, HOUR).await
+    }
+
+    /// [`seed_l0_object`] into ingest hour `hour`.
+    async fn seed_l0_object_at(
+        store: &dyn ObjectStoreBackend,
+        writer_id: Uuid,
+        seq: u64,
+        records: &[LogRecord],
+        bytes: Bytes,
+        hour: u32,
+    ) -> Bytes {
         let th = tenant_hash();
         let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
         let data_key = keys::data_key(
@@ -6098,7 +6297,7 @@ mod tests {
             min_ts = min_ts.min(r.ts_ns);
             max_ts = max_ts.max(r.ts_ns);
         }
-        let created = i64::from(HOUR) * NS_PER_HOUR + (seq as i64) * 1_000_000;
+        let created = i64::from(hour) * NS_PER_HOUR + (seq as i64) * 1_000_000;
         let rec = record::build(NewCommitRecord {
             tenant_hash: th,
             signal: Signal::Logs,
@@ -6116,7 +6315,7 @@ mod tests {
             max_ingest_ts_ns: created,
             segment_format_version: OUTPUT_FORMAT_VERSION,
             created_unix_ns: created,
-            ingest_hour_bucket: HOUR,
+            ingest_hour_bucket: hour,
         })
         .expect("build commit record");
         let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
@@ -14062,14 +14261,13 @@ mod tests {
 
         /// Compaction records in the fixture bucket.
         async fn compaction_records(store: &dyn ObjectStoreBackend) -> usize {
-            let b = bucket();
-            let prefix = keys::commit_shard_hour_prefix(
-                &b.tenant_hash,
-                b.signal,
-                b.shard,
-                b.ingest_hour_bucket,
-            )
-            .expect("prefix");
+            compaction_records_at(store, HOUR).await
+        }
+
+        /// Compaction records in the fixture's shard at ingest hour `hour`.
+        async fn compaction_records_at(store: &dyn ObjectStoreBackend, hour: u32) -> usize {
+            let prefix = keys::commit_shard_hour_prefix(&tenant_hash(), Signal::Logs, SHARD, hour)
+                .expect("prefix");
             list_all(store, &prefix)
                 .await
                 .expect("list")
@@ -14621,12 +14819,25 @@ mod tests {
             Result<crate::MaintainReport>,
             crate::request_ledger::RunRequestReport,
         ) {
+            maintain_tick_at(memo, store, config, sealed_now_ns()).await
+        }
+
+        /// [`maintain_tick`] with the clock at `now_ns`.
+        async fn maintain_tick_at(
+            memo: &mut crate::MaintainMemo,
+            store: &dyn ObjectStoreBackend,
+            config: &CompactorConfig,
+            now_ns: i64,
+        ) -> (
+            Result<crate::MaintainReport>,
+            crate::request_ledger::RunRequestReport,
+        ) {
             let ledger = RequestLedger::new();
             let config = CompactorConfig {
                 request_ledger: Some(ledger.clone()),
                 ..config.clone()
             };
-            let clock = FixedClock::new(sealed_now_ns());
+            let clock = FixedClock::new(now_ns);
             let report = crate::scan::scan_and_maintain_with_memo(
                 memo,
                 store,
@@ -14780,7 +14991,7 @@ mod tests {
             );
             let (outcome, run, store, _) = compact_two_level(&config).await;
             match outcome {
-                Err(MaintainError::ScratchLocked { path }) => assert_eq!(path, lock_path),
+                Ok(CompactionOutcome::ScratchLocked { path }) => assert_eq!(path, lock_path),
                 other => panic!("{other:?}"),
             }
             let r = &run.report;
@@ -14819,9 +15030,11 @@ mod tests {
                 Ok(CompactionOutcome::ScratchHeadroom {
                     need: n,
                     free,
+                    reserved,
                     path,
                 }) => {
                     assert_eq!((n, free, path), (need, need - 1, dir.clone()));
+                    assert_eq!(reserved, 0);
                 }
                 other => panic!("{other:?}"),
             }
@@ -14972,6 +15185,255 @@ mod tests {
             );
             drop(merge);
             assert!(scratch_entries(&dir).is_empty(), "cancel");
+        }
+
+        /// The scratch need of the two-level fixture seeded at `keys`: 1.3
+        /// times its inputs' object sizes (ADR-3853 D2).
+        async fn scratch_need(store: &dyn ObjectStoreBackend, keys: &[String]) -> u64 {
+            let mut stored = 0u64;
+            for key in keys {
+                stored += store.head(key).await.expect("head").size;
+            }
+            (stored * 13).div_ceil(10)
+        }
+
+        /// The two-level fixture's config with `dir` as the scratch directory.
+        async fn two_level_scratch_config(dir: &std::path::Path) -> (CompactorConfig, u64) {
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &two_level_inputs()).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let run_target = TWO_LEVEL_RUN_PER_INPUTS * per_input;
+            let config = two_level_config(
+                group_ceiling(per_input, run_target, 12),
+                run_target,
+                Some(dir.to_path_buf()),
+            );
+            (config, scratch_need(&probe, &keys).await)
+        }
+
+        /// ADR-3853 D2: a scratch directory another process holds refuses
+        /// only the buckets that need the two-level merge. The pass goes on
+        /// and a resident bucket in the next hour publishes; the refused
+        /// bucket is held terminal in memory, and the next tick reads the
+        /// inputs of neither bucket again.
+        #[tokio::test]
+        async fn a_locked_scratch_dir_refuses_two_level_buckets_and_others_still_compact() {
+            let dir = fresh_scratch("locked-pass");
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let holder = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(dir.join(SCRATCH_LOCK_FILE))
+                .expect("lock file");
+            holder.try_lock().expect("the test holds the lock");
+            let (config, _) = two_level_scratch_config(&dir).await;
+
+            let store = ProbeStore::new();
+            seed_inputs(&store, &two_level_inputs()).await;
+            let next_hour = HOUR + 1;
+            for (i, input) in blocked(wide_inputs(4, 4, 1), 4).into_iter().enumerate() {
+                let writer_id = Uuid::from_u128(1_000 + i as u128);
+                let identity = ObjectIdentity {
+                    tenant_hash: tenant_hash().0,
+                    shard: SHARD,
+                    writer_id: writer_id.into_bytes(),
+                    writer_epoch: EPOCH,
+                    writer_seq: 1,
+                };
+                let mut w = RlogWriter::new(input.cfg, identity);
+                for r in &input.records {
+                    w.push(r.clone()).expect("push");
+                }
+                let bytes = Bytes::from(w.finish().expect("finish L0"));
+                seed_l0_object_at(&store, writer_id, 1, &input.records, bytes, next_hour).await;
+            }
+            let now_ns = sealed_now_ns() + NS_PER_HOUR;
+
+            let mut memo = crate::MaintainMemo::new(crate::scan::DEFAULT_MEMO_REVERIFY_INTERVAL_NS);
+            let (first, first_reads) = maintain_tick_at(&mut memo, &store, &config, now_ns).await;
+            let (second, second_reads) = maintain_tick_at(&mut memo, &store, &config, now_ns).await;
+            drop(holder);
+
+            let first = first.expect("a locked scratch directory does not abort the pass");
+            assert_eq!(
+                first.compacted, 1,
+                "the resident bucket compacted: {first:?}"
+            );
+            assert_eq!(first.geometry_unsupported, 1, "{first:?}");
+            assert_eq!(compaction_records_at(&store, next_hour).await, 1);
+            assert_eq!(compaction_records(&store).await, 0);
+            assert!(first_reads.block_read.requests > 0, "{first_reads:?}");
+            assert_eq!(first_reads.level1_groups, 0, "{first_reads:?}");
+            assert_eq!(first_reads.scratch_write_bytes, 0, "{first_reads:?}");
+            assert_eq!(
+                memo.terminal_state(tenant_hash(), Signal::Logs, SHARD, HOUR),
+                Some(crate::scan::TerminalState::GeometryUnsupported)
+            );
+            assert_eq!(
+                memo.terminal_state(tenant_hash(), Signal::Logs, SHARD, next_hour),
+                Some(crate::scan::TerminalState::Compacted)
+            );
+            assert_eq!(
+                memo.snapshot_entry_count(),
+                1,
+                "only the compacted bucket is persisted, never the refusal"
+            );
+
+            let second = second.expect("second tick");
+            assert_eq!(second.compacted, 0, "{second:?}");
+            assert_eq!(second.geometry_unsupported, 0, "{second:?}");
+            assert_eq!(second_reads.catalog_read.requests, 0, "{second_reads:?}");
+            assert_eq!(second_reads.block_read.requests, 0, "{second_reads:?}");
+            assert!(scratch_entries(&dir).is_empty());
+        }
+
+        /// ADR-3853 D2 across units: two two-level merges in one process
+        /// whose needs together exceed the scratch volume's free bytes. The
+        /// second is refused while the first runs, with the first's need as
+        /// `reserved`, and admitted once the first ends.
+        #[tokio::test]
+        async fn concurrent_units_reserve_scratch_headroom() {
+            let dir = fresh_scratch("reserve");
+            let (config, need) = two_level_scratch_config(&dir).await;
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(Some(2 * need - 1)));
+
+            let first_store = StallStore {
+                inner: MemoryStore::new(),
+                armed: std::sync::atomic::AtomicBool::new(false),
+                stalled: std::sync::atomic::AtomicBool::new(false),
+            };
+            seed_inputs(&first_store, &two_level_inputs()).await;
+            first_store.armed.store(true, Ordering::SeqCst);
+            let clock = FixedClock::new(sealed_now_ns());
+            let target = bucket();
+            let mut first = Box::pin(compact_bucket(&first_store, &clock, &config, &target));
+            tokio::select! {
+                out = &mut first => panic!("the first merge finished past a stalled PUT: {out:?}"),
+                () = async {
+                    while !first_store.stalled.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+            assert_eq!(
+                scratch_reserved(&dir),
+                need,
+                "the running unit holds its need"
+            );
+
+            let (second, run, store, _) = compact_two_level(&config).await;
+            match second {
+                Ok(CompactionOutcome::ScratchHeadroom {
+                    need: n,
+                    free,
+                    reserved,
+                    path,
+                }) => assert_eq!(
+                    (n, free, reserved, path),
+                    (need, 2 * need - 1, need, dir.clone())
+                ),
+                other => panic!("the second unit was admitted: {other:?}"),
+            }
+            assert_eq!(run.report.block_read.requests, 0, "{:?}", run.report);
+            assert_eq!(run.report.scratch_write_bytes, 0, "{:?}", run.report);
+            assert_eq!(compaction_records(&store).await, 0);
+
+            drop(first);
+            assert_eq!(
+                scratch_reserved(&dir),
+                0,
+                "the first unit's end gave its share back"
+            );
+            let (again, _, store, _) = compact_two_level(&config).await;
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(None));
+            assert!(
+                matches!(again, Ok(CompactionOutcome::Compacted { .. })),
+                "{again:?}"
+            );
+            assert_eq!(compaction_records(&store).await, 1);
+            assert_eq!(scratch_reserved(&dir), 0);
+            assert!(scratch_entries(&dir).is_empty());
+        }
+
+        /// ADR-3853 D2: a scratch write that runs out of space during level 1
+        /// is the headroom refusal, not an untyped store error, and the unit
+        /// still wipes its directory and gives its reservation back.
+        #[tokio::test]
+        async fn an_enospc_during_level_one_is_a_headroom_refusal() {
+            use ravel_object_store::fault::{
+                FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+            };
+            type Faulted = Arc<FaultStore<Arc<ScratchStore>>>;
+
+            let dir = fresh_scratch("enospc");
+            let (config, need) = two_level_scratch_config(&dir).await;
+            let slot: Arc<std::sync::Mutex<Option<Faulted>>> = Arc::default();
+            let wrapped = Arc::clone(&slot);
+            let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+            let message = format!("scratch store: write {}: {full}", dir.display());
+            SCRATCH_STORE_WRAP.with(|w| {
+                *w.borrow_mut() = Some(Box::new(move |inner| {
+                    let plan = FaultPlan::empty().with_rule(
+                        Rule::new(Op::Put, ScriptedFault::Permanent(message.clone()))
+                            .with_occurrence(Occurrence::Nth(2)),
+                    );
+                    let store: Faulted = Arc::new(FaultStore::new(inner, plan));
+                    *wrapped.lock().expect("slot") = Some(Arc::clone(&store));
+                    store as Arc<dyn ObjectStoreBackend>
+                }));
+            });
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            SCRATCH_STORE_WRAP.with(|w| *w.borrow_mut() = None);
+
+            let faulted = slot
+                .lock()
+                .expect("slot")
+                .take()
+                .expect("the unit's scratch store was wrapped");
+            assert_eq!(faulted.fault_count(Op::Put, FaultKind::Permanent), 1);
+            match outcome {
+                Ok(CompactionOutcome::ScratchHeadroom {
+                    need: n,
+                    reserved,
+                    path,
+                    ..
+                }) => assert_eq!((n, reserved, path), (need, 0, dir.clone())),
+                other => panic!("{other:?}"),
+            }
+            let r = &run.report;
+            assert!(
+                r.scratch_write_bytes > 0,
+                "the first run was written: {r:?}"
+            );
+            assert_eq!(r.part_put.requests, 0, "{r:?}");
+            assert!(run.log.contains("outcome=refused"), "{}", run.log);
+            assert_eq!(compaction_records(&store).await, 0);
+            drop(faulted);
+            assert!(
+                scratch_entries(&dir).is_empty(),
+                "the unit directory was wiped"
+            );
+            assert_eq!(scratch_reserved(&dir), 0, "the reservation was released");
+        }
+
+        /// A scratch write out of space reads as such whether the error
+        /// carries ENOSPC's errno or [`std::io::ErrorKind::StorageFull`], in
+        /// the text the scratch store reports a filesystem error with.
+        #[test]
+        fn a_scratch_write_out_of_space_is_recognised() {
+            let enospc = std::io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error());
+            let kind = std::io::Error::from(std::io::ErrorKind::StorageFull);
+            for err in [enospc, kind] {
+                let e = StoreError::Permanent(format!("scratch store: write /s/runs/r0: {err}"));
+                assert!(is_scratch_full(&e), "{e}");
+            }
+            let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+            assert!(!is_scratch_full(&StoreError::Permanent(format!(
+                "scratch store: write /s/runs/r0: {denied}"
+            ))));
+            let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+            assert!(!is_scratch_full(&StoreError::Transient(full.to_string())));
         }
 
         /// `r` moved to stream `s`, everything else kept.
