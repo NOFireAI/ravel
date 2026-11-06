@@ -444,7 +444,8 @@ struct ResolvedBounded {
     /// a refusal caused by fold lag reads as one.
     fold_lag: FoldLag,
     /// Data object keys of the snapshot-sourced segments the name postings
-    /// filtered, empty when the postings pruned nothing (issue #3862). The
+    /// filtered, empty when the postings pruned nothing or the statement has
+    /// a positive equality that is not a name (issue #3862). The
     /// dictionary-first probe skips these for a statement whose only positive
     /// equalities are names; a recent or token-resolved segment never
     /// passed through the postings and is not here.
@@ -1397,6 +1398,7 @@ impl QueryEngine {
                 min_tokens,
                 now_ns,
                 name_filter.as_deref(),
+                false, // names_only: discovery runs no dictionary probe.
                 1,
                 1,
                 true, // metadata_only: discovery never fetches pages.
@@ -1485,6 +1487,7 @@ impl QueryEngine {
                 min_tokens,
                 now_ns,
                 None,
+                false, // names_only: log discovery runs no dictionary probe.
                 1,
                 1,
                 true, // metadata_only: log discovery never fetches pages.
@@ -1686,6 +1689,7 @@ impl QueryEngine {
                 min_tokens,
                 now_ns,
                 None,
+                false, // names_only: the log lane runs no dictionary probe.
                 log_accounting.resolve(),
             )
             .await?;
@@ -2002,6 +2006,10 @@ impl QueryEngine {
         }
 
         let name_filter = shared_equality_name_filter(plans);
+        // Only a statement whose positive equalities are all names reads the
+        // resolve's postings-filtered set (the dictionary probe's gate), so
+        // every other statement skips building it.
+        let names_only = only_name_equalities(plans);
         let max_series = self.config.max_series;
         let max_samples = self.config.max_samples;
         let max_bytes_scanned = self.config.max_bytes_scanned;
@@ -2358,6 +2366,7 @@ impl QueryEngine {
                 min_tokens,
                 now_ns,
                 name_filter.as_deref(),
+                names_only,
                 fetch_multiplier,
                 service_fetch_multiplier,
                 false, // metadata_only: this path fetches scalar/histogram pages.
@@ -2404,6 +2413,10 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         name_filter: Option<&str>,
+        // Whether every positive equality of the statement is a name
+        // (`only_name_equalities`): only then does the resolve build the
+        // postings-filtered set the dictionary probe's gate reads.
+        names_only: bool,
         // Upper-envelope selector fan-out factor for `estimate_cost`
         // (`plans.len()`, undeduplicated -- see the comment above its
         // assignment in `prefetch_metric_plans`): legitimately over-counts
@@ -2476,6 +2489,7 @@ impl QueryEngine {
                 min_tokens,
                 now_ns,
                 name_filter,
+                names_only,
                 first_accounting.resolve(),
             )
             .await?;
@@ -2535,6 +2549,7 @@ impl QueryEngine {
                         min_tokens,
                         now_ns,
                         name_filter,
+                        names_only,
                         second_accounting.resolve(),
                     )
                     .await?;
@@ -2618,6 +2633,7 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         name_filter: Option<&str>,
+        names_only: bool,
         accounting: &QueryAccounting,
     ) -> Result<ResolvedBounded, QueryError> {
         // `resolve_pruned_with_generations` returns the shard-generation history
@@ -2659,7 +2675,7 @@ impl QueryEngine {
             now_ns,
             self.config.fold_lag_threshold(),
         );
-        let postings_filtered = if snapshot.segments_pruned > 0 {
+        let postings_filtered = if names_only && snapshot.segments_pruned > 0 {
             snapshot
                 .segments
                 .iter()
