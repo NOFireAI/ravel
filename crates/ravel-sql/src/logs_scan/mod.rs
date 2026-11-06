@@ -2103,8 +2103,9 @@ impl LogsScanExec {
         self
     }
 
-    /// Whether this scan carries exact-key equalities, so its plan pass probes
-    /// KEY_IDX ([`Self::with_key_equals`]).
+    /// Whether this scan carries any exact-key arm, so its plan pass probes
+    /// KEY_IDX: an equality ([`Self::with_key_equals`]) or an `IN` key set.
+    /// Despite the name, a scan whose only arm is a key set answers `true`.
     pub(crate) fn has_key_equals(&self) -> bool {
         !self.key_equals.is_empty() || self.key_in.is_some()
     }
@@ -3525,6 +3526,7 @@ impl ExecutionPlan for LogsScanExec {
                                 &self.content,
                                 &self.prune,
                                 &self.key_equals,
+                                self.key_in.as_deref(),
                             )
                         },
                         &self.reversed,

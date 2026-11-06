@@ -485,7 +485,9 @@ can measure it before anything is transferred.
   `trace_id` the version 9 block carries (flight_ticket.rs:1957). Versions
   8 to 11 are byte identical and pinned. Without the spans section a
   Flight-served `trace_id IN (...)` would encode as a version 9 ticket
-  whose block carries one id and silently lose the list. A multi-table
+  whose block carries one id and silently lose the list. (Workers re-plan
+  from the statement text, so a lost list costs no rows; see the key set
+  amendment below.) A multi-table
   statement never produces a slice ticket (ADR-2904 decisions 8 and 10),
   so only a single-table `IN` travels.
 - Transfer (ADR-2983 decisions 1 to 7, 10) is not part of this decision.
@@ -1106,7 +1108,8 @@ decision's text:
   (`LogsTableProvider::scan_key_index_route`). Two or more arms, an `IN` set
   beside an equality included, stay on the tier-1 probe, which intersects
   every arm's block set where a route answered from one arm would skip the
-  intersection. `keysProbed` is the routed set's size. On spans a
+  intersection. `keysProbed` is the routed set's distinct `key8` count,
+  and 0 for a scan that did not route. On spans a
   `trace_id =` equality governs a statement that also carries a
   `trace_id IN` list: the equality alone pins the rows, so the scan routes
   and reads that one id.
@@ -1136,8 +1139,10 @@ decision's text:
   the walks the guard protects recurse per tree level and the parser holds
   the list as one `Vec` of leaves under one `InList` node, so its length adds
   width, not depth; the guard's sound invariant (no more tree levels than
-  counted tokens) still holds, since the list contributes one level and is
-  charged at least one unit. Anything else between the parentheses declines
+  counted tokens) still holds: the list adds at most two levels, the
+  `InList` node and a unary minus over a signed literal, and is charged at
+  least two units, one for the list and one for its first 64 literals.
+  Anything else between the parentheses declines
   the allowance. A flat list of more than 4,096 literals is refused with the
   existing typed error, whose message names the list cap. Every other
   token's cost and the global bound are unchanged. k stays 1,024: a list of
@@ -1154,15 +1159,24 @@ decision's text:
   `KeySetOnClient`. The ticket is an ephemeral MAC'd wire format, not a
   persistent one: every byte is under the keyed MAC, a worker on version 11
   refuses a version 12 ticket on its version byte after the MAC verifies,
-  and no migration class applies.
+  and no migration class applies. Decision 6 says a spans list without the
+  bump would be lost and the read widened; it would not change rows either
+  way, because production workers decode a slice ticket with
+  `SqlTicketKeys::decode` (flight/service.rs:632, flight/slice.rs:150),
+  which drops the pushdown block and re-plans the fragment from the
+  statement text. What version 12 changes in practice is the mixed-version
+  rollout: a worker on version 11 refuses these tickets, an error rather
+  than wrong rows.
 
 | check | target | miss | source |
 |---|---|---|---|
-| `IN` rows, logs and spans, 1, 10, 100 and 1,000 keys | rows equal the union of the per-key equality answers; `keysProbed` equal to the list size | a missing or extra row, or another count | services/ravel-server/tests/sql_key_in.rs:548 |
+| `IN` rows, logs and spans, 1, 10, 100 and 1,000 keys | rows equal the union of the per-key equality answers; `keysProbed` equal to the list's distinct key count | a missing or extra row, or another count | services/ravel-server/tests/sql_key_in.rs:548 |
 | 1,000-key list on a 13-bit leaf | the part uncovered (`skippedByBudget` 1, `partsCovered` 0) after 1 leaf GET, rows exact | a second leaf GET, or a covered part | services/ravel-server/tests/sql_key_in.rs:548 |
-| 1,025-key list, and a list beside an equality | no key set (`keysProbed` 0, 0 leaf GETs), rows exact | a routed set, or a wrong row | services/ravel-server/tests/sql_key_in.rs:548 |
+| 1,025-key list, and a list beside an equality | no route (`keysProbed` 0, 0 leaf GETs), rows exact; the 1,025-key list carries no key set, the list beside an equality carries its set to tier 1 | a routed set, or a wrong row | services/ravel-server/tests/sql_key_in.rs:548 |
 | tier-1 set probe above `B_run`, logs and spans | the prefix and 1 ranged read, 2 KEY_IDX GETs | 1 + the distinct touched buckets | crates/ravel-query/src/log_fetcher.rs:17915; crates/ravel-query/src/span_fetcher.rs:3745 |
-| ticket versions | 8 to 11 byte identical; 12 round-trips both sections; a spans `IN` never encodes as 9 | any byte change, or a version 9 spans `IN` | crates/ravel-sql/src/flight_ticket.rs:2700 |
+| tier-1 set mixing present and absent keys, below and above `B_run`, logs and spans | exactly the union of the present keys' blocks, absent keys in empty and in occupied buckets | `Absent`, a dropped object, or another block set | crates/ravel-query/src/log_fetcher.rs:17998; crates/ravel-query/src/span_fetcher.rs:3745 |
+| ticket versions | 8 to 11 byte identical; 12 round-trips both sections; a spans `IN` never encodes as 9 | any byte change, or a version 9 spans `IN` | crates/ravel-sql/src/flight_ticket.rs:2707 |
+| version 12 decoder | a property round trip of 1 to 1,024 keys on both blocks at the version chosen; a malformed logs or spans set section a typed error | a lost section, another version, or an accepted malformed section | crates/ravel-sql/src/flight_ticket.rs:4971; crates/ravel-sql/src/flight_ticket.rs:2790; crates/ravel-sql/src/flight_ticket.rs:2857 |
 | complexity guard | a 1,000-literal list passes at 17 units, 4,097 literals refused naming the cap, a deep statement of the same token count refused | any other outcome | crates/ravel-sql/src/complexity_guard.rs:1627; crates/ravel-sql/src/complexity_guard.rs:1651; crates/ravel-sql/src/complexity_guard.rs:1677 |
 
 Refs: #3705, #3692

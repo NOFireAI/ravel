@@ -2826,8 +2826,11 @@ equalities followed by the key-set section (field, key type, a count of 1
 to 1,024, then that many 8-byte keys in strictly ascending order), and, on a
 spans block, a trace-id list (a count of 1 to 1,024, then that many 16-byte
 ids in strictly ascending order) after the version 9 block's single optional
-trace id. Without the spans list a Flight-served `trace_id IN (...)` would
-encode as a version 9 ticket carrying no id. A count of 0 or over 1,024, or
+trace id. Workers decode a slice ticket with `SqlTicketKeys::decode`, which
+drops the pushdown block and re-plans the fragment from the statement text,
+so the block never changes a worker's rows; what version 12 changes is a
+mixed-version rollout, where a version 11 worker refuses these tickets on
+their version byte, an error rather than wrong rows. A count of 0 or over 1,024, or
 keys out of order, is `InvalidKeySet`. Versions 8 to 11 encode byte for byte
 as before version 12 existed, each pinned by a golden-bytes test
 (`version_11_bytes_unchanged_and_version_12_carries_key_set`). Each surface
@@ -5257,8 +5260,9 @@ probe, which intersects their block sets where the router would answer from
 one (`route_needs_exactly_one_key_equality`). On spans a `trace_id =`
 equality governs: a statement carrying both it and a `trace_id IN` list
 routes and reads the one id, since the equality alone already pins the rows.
-`stats.keyIndex.keysProbed` is the routed set's size, so an `IN` list of
-`n` keys reads `n` (`in_list_rows_equal_the_union_of_equalities` in
+`stats.keyIndex.keysProbed` is the routed set's distinct `key8` count, so a
+routed `IN` list of `n` distinct keys reads `n`, and a scan that did not route
+reads 0 (`in_list_rows_equal_the_union_of_equalities` in
 `services/ravel-server/tests/sql_key_in.rs`).
 
 **Tier-2 router (ADR-3692 decisions 1 and 2).** `ravel_query::key_index_route`
