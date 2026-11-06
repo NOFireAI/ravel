@@ -1674,18 +1674,18 @@ impl TenantDelegatingPool {
                 spillable_envelopes(&aggregates, &ledger, Some(id)).saturating_add(next.envelope);
             self.check_spill_cap(&ledger, consumer, additional, charged, envelopes)?;
         }
-        if next.envelope != state.envelope {
-            if let Err(refused) = self.set_envelope(id, next.envelope, EnvelopeCheck::Checked) {
-                self.refused.store(true, Ordering::Release);
-                return Err(DataFusionError::ResourcesExhausted(format!(
-                    "aggregate reserve-ahead refused: {additional} bytes asked by {} need \
-                     the process aggregate envelope to grow by {} bytes: {}{}",
-                    consumer.name(),
-                    refused.delta,
-                    refused.exhausted,
-                    self.attribution(&ledger, consumer, additional)
-                )));
-            }
+        if next.envelope != state.envelope
+            && let Err(refused) = self.set_envelope(id, next.envelope, EnvelopeCheck::Checked)
+        {
+            self.refused.store(true, Ordering::Release);
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "aggregate reserve-ahead refused: {additional} bytes asked by {} need \
+                 the process aggregate envelope to grow by {} bytes: {}{}",
+                consumer.name(),
+                refused.delta,
+                refused.exhausted,
+                self.attribution(&ledger, consumer, additional)
+            )));
         }
         if let Err(error) = self.try_grow_charged(&mut ledger, consumer, charged, additional) {
             if next.envelope != state.envelope {
