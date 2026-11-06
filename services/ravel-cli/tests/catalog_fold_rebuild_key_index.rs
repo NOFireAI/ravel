@@ -222,10 +222,13 @@ async fn rebuild_attaches_a_leaf_and_prints_every_report_field() {
          parts_unindexed: 1\n\
          parts_rebuilt: 1\n\
          parts_deferred: 0\n\
+         parts_with_refused_leaves: 0\n\
          leaves_written: 1\n\
          leaf_bytes_written: {}\n\
          section_bytes_read: {}\n\
          ranged_gets: 2\n\
+         leaf_prefix_gets: 0\n\
+         leaf_prefix_bytes_read: 0\n\
          uncovered_entries: 0\n\
          attempt_count: 1\n\
          attempt 1: parts=1 part_gets=1 ranged_gets=2 leaf_puts=1 head_cas_tries=1 \

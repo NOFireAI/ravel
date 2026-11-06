@@ -2433,7 +2433,7 @@ query incurred up to that point, not zeros:
 ### Key-index routing (`ravel_query_key_index_*`)
 
 Two counters cover the tier-2 key-index router, which answers an exact-key
-lookup (a spans `trace_id =`, or a logs scan's declared-key equality) from
+lookup (a spans `trace_id =`, or a logs scan's one declared-key equality) from
 the per-part key-index leaves. Every mode renders both on every scrape, for both
 `signal="spans"` and `signal="logs"` and every `outcome`, zeros included, so a
 rate over `outcome="covered"` exists before the first lookup. Neither carries
