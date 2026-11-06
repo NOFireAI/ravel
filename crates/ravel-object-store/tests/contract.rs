@@ -2,7 +2,8 @@
 //! every `ObjectStoreBackend` implementation this crate ships: the memory
 //! oracle at its default page size and at a tiny one to force pagination,
 //! `FaultStore` wrapping the oracle with an empty plan (must be fully
-//! transparent), `GcsStore` against the in-process fake GCS endpoint, and --
+//! transparent), `ScratchStore` over a temporary directory at both page
+//! sizes, `GcsStore` against the in-process fake GCS endpoint, and --
 //! gated on `RAVEL_RUSTFS_URL` / `RAVEL_FLOCI_URL` / `RAVEL_GCS_TEST_BUCKET`
 //! -- `S3Store` against a real RustFS and against a real floci, and `GcsStore`
 //! against a real bucket.
@@ -30,7 +31,8 @@ use ravel_object_store::s3::{
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, InstrumentedStore, ListPage,
     MULTIPART_MIN_PART_SIZE, ObjectMeta, ObjectStoreBackend, PageToken, Pin, PutMode, PutOptions,
-    PutOutcome, StoreError, StoreMetrics, UploadChecksum, is_addressable_key, list_all,
+    PutOutcome, ScratchStore, StoreError, StoreMetrics, UploadChecksum, is_addressable_key,
+    list_all,
 };
 use std::sync::Arc;
 
@@ -1156,6 +1158,39 @@ async fn refusing_multipart_store_contract() {
 async fn memory_store_paged_contract() {
     let store = MemoryStore::with_page_size(2);
     run_contract_suite(&store, "memory-paged").await;
+}
+
+#[tokio::test]
+async fn scratch_store_passes_the_contract_suite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = ScratchStore::open(dir.path().join("scratch"), 1000).expect("open scratch store");
+    assert_eq!(
+        store.capabilities(),
+        MemoryStore::new().capabilities(),
+        "a local directory gives up none of the oracle's capabilities"
+    );
+    run_contract_suite(&store, "scratch").await;
+}
+
+#[tokio::test]
+async fn scratch_store_passes_the_contract_suite_at_page_size_2() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = ScratchStore::open(dir.path().join("scratch"), 2).expect("open scratch store");
+    run_contract_suite(&store, "scratch-paged").await;
+}
+
+#[tokio::test]
+async fn scratch_store_passes_the_conformance_probe() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = ScratchStore::open(dir.path().join("scratch"), 2).expect("open scratch store");
+    let report =
+        ravel_object_store::conformance::run_conformance_suite(&store, "sys/qualify/scratch/", 2)
+            .await;
+    assert!(
+        report.passed(),
+        "{:?}",
+        report.failures().collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
