@@ -3824,6 +3824,74 @@ mod tests {
             "every id absent drops the object"
         );
         assert!(traces.is_empty());
+
+        // Sets mixing present and absent ids read exactly the present ids'
+        // blocks, below and above B_run, whether an absent id's bucket is
+        // empty (skipped) or holds other ids (read, no match).
+        //
+        // Flip to watch it fail: in `probe_key_index`, answer `Absent` at the
+        // first absent id, either for an empty bucket or for a located bucket
+        // whose `matching` is empty. The mixed cases holding that kind of
+        // absent id then drop the object.
+        let bucket_of =
+            |n: u32| bucket_index(&key8_id16(&id(n)), TRACE_KEY_IDX_BUCKET_BITS).expect("bucket");
+        let occupied: BTreeSet<_> = (0..400).map(bucket_of).collect();
+        let shares: Vec<u32> = (1_000..11_000)
+            .filter(|n| occupied.contains(&bucket_of(*n)))
+            .take(3)
+            .collect();
+        let alone: Vec<u32> = (1_000..11_000)
+            .filter(|n| !occupied.contains(&bucket_of(*n)))
+            .take(3)
+            .collect();
+        assert_eq!((shares.len(), alone.len()), (3, 3), "fixture geometry");
+        // Two single-span traces to a block: trace n sits in block n / 2.
+        let blocks_of = |present: &[u32]| -> BTreeSet<[u8; 16]> {
+            present
+                .iter()
+                .flat_map(|n| [n / 2 * 2, n / 2 * 2 + 1])
+                .map(id)
+                .collect()
+        };
+        let present: Vec<u32> = vec![3, 101, 250];
+        let cases: [(&str, Vec<u32>); 3] = [
+            ("absent in occupied buckets", shares.clone()),
+            ("absent in empty buckets", alone.clone()),
+            (
+                "absent of both kinds",
+                shares.iter().chain(&alone).copied().collect(),
+            ),
+        ];
+        for (what, absent) in cases {
+            let set: Vec<[u8; 16]> = present.iter().chain(&absent).copied().map(id).collect();
+            assert!(distinct(&set) <= KEY_INDEX_SET_PROBE_MAX_RUNS);
+            let (pruning, _, traces) = run(set).await;
+            assert_eq!(pruning.segments_pruned, 0, "below B_run, {what}");
+            assert_eq!(traces, blocks_of(&present), "below B_run, {what}");
+        }
+
+        let present: Vec<u32> = (0..100).collect();
+        let set: Vec<u32> = present
+            .iter()
+            .copied()
+            .chain(1_000..1_300)
+            .chain(alone.iter().copied())
+            .collect();
+        let touched = set
+            .iter()
+            .map(|n| bucket_of(*n))
+            .filter(|b| occupied.contains(b))
+            .collect::<BTreeSet<_>>()
+            .len();
+        assert!(
+            touched > KEY_INDEX_SET_PROBE_MAX_RUNS,
+            "the set must touch more than B_run non-empty buckets: {touched}"
+        );
+        let (pruning, gets, traces) = run(set.into_iter().map(id).collect()).await;
+        assert_eq!(pruning.segments_pruned, 0);
+        assert_eq!(gets, 2, "the prefix and one read of the bucket area");
+        assert_eq!(traces, blocks_of(&present));
+        assert_eq!(traces.len(), 100);
     }
 
     async fn trace_fixture() -> TraceFixture {
