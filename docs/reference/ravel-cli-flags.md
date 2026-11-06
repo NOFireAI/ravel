@@ -131,6 +131,7 @@ _No flags._
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
 | `--hours` |  | `1` | How many hours back from now to list commit records for |
+| `--json` |  |  | Print one JSON document of the resolved metrics segments (key, level, shard, ingest hour bucket, object size and event bounds per segment) instead of the text lines |
 | `--shards` |  | `4` |  |
 | `--tenant` |  |  |  |
 
