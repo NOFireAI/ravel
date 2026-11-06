@@ -1013,14 +1013,31 @@ def cmd_measure(args):
 
 def extract_report(text):
     """The JSON report a ravel-cli run printed: the whole output when it is
-    one JSON document (`--json`), else the last line carrying a JSON object
-    (load's `load report json : {...}`)."""
+    one JSON document (`--json`), else the last JSON object that starts a
+    line (a pretty-printed `--json` document beside stderr lines, which
+    `measure` writes to the same file), else the last line carrying a JSON
+    object (load's `load report json : {...}`)."""
     try:
         doc = json.loads(text)
         if isinstance(doc, dict):
             return doc
     except ValueError:
         pass
+    decoder = json.JSONDecoder()
+    found = None
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        if line.startswith("{"):
+            try:
+                doc, end = decoder.raw_decode(text, offset)
+            except ValueError:
+                doc, end = None, offset
+            rest = text[end:].split("\n", 1)[0]
+            if isinstance(doc, dict) and not rest.strip():
+                found = doc
+        offset += len(line)
+    if found is not None:
+        return found
     for line in reversed(text.splitlines()):
         i = line.find("{")
         if i < 0:
