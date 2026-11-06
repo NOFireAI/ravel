@@ -1382,6 +1382,7 @@ fn build_sql_state_inner(
         // metric registrations.
         segment_timing: SqlConfig::default().segment_timing,
         aggregate_reserve_ahead: SqlConfig::default().aggregate_reserve_ahead,
+        checked_integer_arithmetic: false,
     }
     .with_spill_resolved(
         spill.off,

@@ -55,6 +55,7 @@ mod audit_schema;
 mod avg;
 mod bounded_topk;
 mod bucketed_final_aggregate;
+mod checked_arithmetic;
 mod clock;
 mod compact_slices;
 pub mod complexity_guard;

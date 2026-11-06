@@ -137,6 +137,8 @@ use datafusion::functions::datetime::planner::DatetimeFunctionPlanner;
 use datafusion::functions::unicode::planner::UnicodeFunctionPlanner;
 use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::object_store::ObjectStore;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ravel_parquet::SingleStoreRegistry;
 use url::Url;
@@ -147,6 +149,7 @@ use crate::audit_provider::AuditTableProvider;
 use crate::avg::sequential_avg_udaf;
 use crate::bounded_topk::BoundedTopKAggregate;
 use crate::bucketed_final_aggregate::BucketedFinalAggregateRule;
+use crate::checked_arithmetic::{self, CheckedIntegerArithmetic};
 use crate::compact_slices::CompactSlices;
 use crate::config::SqlConfig;
 use crate::group_keys::DictionaryGroupKeysAsViews;
@@ -817,6 +820,20 @@ pub fn build_session_with_tables(
     if parquet_store.is_some() {
         session = parquet_session_config(session, exact_typed_aggregates);
     }
+    if config.checked_integer_arithmetic {
+        session = checked_arithmetic::mark_checked(session);
+    }
+    // Issue #3847: checked integer `+`, `-` and `*`, inert unless the option
+    // is on. Ahead of DataFusion's own rules, so every operator they derive
+    // from these expressions carries the checked form; see
+    // `crate::checked_arithmetic`.
+    let physical_rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = std::iter::once(
+        Arc::new(CheckedIntegerArithmetic::new(
+            config.checked_integer_arithmetic,
+        )) as Arc<dyn PhysicalOptimizerRule + Send + Sync>,
+    )
+    .chain(PhysicalOptimizer::new().rules)
+    .collect();
 
     // `SessionContext::new_with_config_rt` with one extra physical optimizer
     // rule. `DictionaryGroupKeysAsViews` keeps a `GROUP BY` over a declared
@@ -831,6 +848,7 @@ pub fn build_session_with_tables(
         .with_config(session)
         .with_runtime_env(runtime)
         .with_default_features()
+        .with_physical_optimizer_rules(physical_rules)
         // Issue #3845: an exact `SUM(x + c)` for an integer `x` and literal
         // `c`, with every such call over one `x` sharing one sum and count.
         // The default rules, with that rewrite before common subexpression
