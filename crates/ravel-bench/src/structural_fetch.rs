@@ -99,6 +99,8 @@ pub const FIGURES: &[&str] = &[
     "structural/uncomp_bytes",
     "structural/wall_ms",
     "structural/decode_cpu_ms",
+    "floor_gap/data_ranges",
+    "floor_gap/bytes",
     "ratio/bytes",
     "ratio/gets",
     "ratio/wall",
@@ -190,7 +192,8 @@ pub fn mini_block_of(row: u64, rows: u64, chunks: u64) -> u64 {
 /// Sorts `ranges` and merges each into the previous one when it starts no
 /// more than `gap` bytes after the previous one ends: one GET then reads
 /// both and the bytes between. The production fetcher's rule for block
-/// ranges, with its default gap.
+/// ranges; its default gap is the request cost,
+/// `ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`.
 pub fn coalesce(mut ranges: Vec<(u64, u64)>, gap: u64) -> Vec<(u64, u64)> {
     ranges.sort_unstable();
     let mut out: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
@@ -772,6 +775,12 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
         .offset;
     let (layout, layout_bytes) = build_layout(&object, &dir, blocks_offset, mini, cfg.zstd_level)?;
     let splan = structural_plan(&layout, &targets, gap, meta)?;
+    let floor = structural_plan(
+        &layout,
+        &targets,
+        ravel_query::DEFAULT_LOG_COALESCE_GAP,
+        meta,
+    )?;
     let today_uncomp = today_uncomp(&dir, &blocks)?;
 
     let seg = t13::segment_ref(OBJECT_KEY, &object, rows as u64, (0, rows as i64 - 1));
@@ -886,6 +895,11 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
         fig("structural/uncomp_bytes", splan.uncomp as f64),
         fig("structural/wall_ms", s_wall * 1e3),
         fig("structural/decode_cpu_ms", s_cpu * 1e3),
+        fig("floor_gap/data_ranges", floor.ranges.len() as f64),
+        fig(
+            "floor_gap/bytes",
+            (s_plan.1 + floor.meta_bytes + floor.bytes) as f64,
+        ),
         fig("ratio/bytes", s_bytes as f64 / t_all.1 as f64),
         fig("ratio/gets", s_gets as f64 / t_all.0 as f64),
         fig("ratio/wall", s_wall / today_wall),
@@ -912,6 +926,15 @@ pub fn run(spec: &SubjectSpec, corpus: &Path) -> Result<Measured, String> {
          decode CPU is modelled as today's CPU times structural/uncomp_bytes over \
          today/uncomp_bytes; wall is measured plan and data GET time plus that modelled CPU"
             .to_string(),
+        format!(
+            "coalescing: the structural ranges are coalesced at coalesce_gap = {gap} bytes; the \
+             production fetcher's default effective gap is its request cost, {} bytes, so today's \
+             ranges coalesce at that gap too. floor_gap/* is the structural plan at the {}-byte \
+             floor instead, planned only (no GETs issued): its byte figure includes the plan and \
+             mini-block index bytes",
+            ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES,
+            ravel_query::DEFAULT_LOG_COALESCE_GAP
+        ),
         format!(
             "medians of {runs} interleaved runs; every GET and byte count was identical across runs"
         ),

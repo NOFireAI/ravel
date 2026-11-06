@@ -306,6 +306,9 @@ pub struct Stamp {
     pub corpus_sha256: String,
     pub corpus_bytes: u64,
     pub cpu_clock: String,
+    /// `release` or `debug`: CPU and wall figures from a debug build are not
+    /// comparable with anything.
+    pub profile: String,
 }
 
 pub fn stamp(corpus: &Path, corpus_sha256: String, corpus_bytes: u64) -> Stamp {
@@ -320,6 +323,12 @@ pub fn stamp(corpus: &Path, corpus_sha256: String, corpus_bytes: u64) -> Stamp {
         corpus_sha256,
         corpus_bytes,
         cpu_clock: CPU_CLOCK.to_string(),
+        profile: if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+        .to_string(),
     }
 }
 
@@ -409,8 +418,16 @@ impl Report {
         let p = self.arm.name();
         let s = &self.stamp;
         let mut out = vec![format!(
-            "{p} stamp git={} arch={} nproc={} mem_total_kib={} corpus={} sha256={} bytes={}",
-            s.git, s.arch, s.nproc, s.mem_total_kib, s.corpus_file, s.corpus_sha256, s.corpus_bytes
+            "{p} stamp git={} arch={} nproc={} mem_total_kib={} corpus={} sha256={} bytes={} \
+             profile={}",
+            s.git,
+            s.arch,
+            s.nproc,
+            s.mem_total_kib,
+            s.corpus_file,
+            s.corpus_sha256,
+            s.corpus_bytes,
+            s.profile
         )];
         out.push(format!("{p} cpu_clock {}", s.cpu_clock));
         let params: Vec<String> = self
