@@ -614,3 +614,30 @@ async fn in_list_rows_equal_the_union_of_equalities() {
         );
     }
 }
+
+/// `trace_id IN` 32-character hex strings plans against the native trace id
+/// column (the analyzer rule rewrites them before type coercion) and carries
+/// the same key set as the binary literals: the same rows, `keysProbed` the
+/// list's size.
+///
+/// Flip to watch it fail: drop `TraceIdHexInListRule` from
+/// `trace_id_planner::analyzer_rules`. The statement then fails to plan
+/// and `sql` panics on the error status.
+#[tokio::test]
+async fn a_hex_trace_id_list_plans_and_carries_the_key_set() {
+    let store = fixture().await;
+    let app = serve(store);
+    let values: Vec<String> = (0..100)
+        .map(|j| {
+            let (o, i) = key_record(j);
+            format!("'{}'", hex(&trace_id(o, i)))
+        })
+        .collect();
+    let v = sql(
+        &app,
+        &Lane::Spans.select(&format!("trace_id IN ({})", values.join(", "))),
+    )
+    .await;
+    assert_eq!(rows(&v), oracle(100), "{v}");
+    assert_eq!(key_index(&v, "keysProbed"), 100, "{v}");
+}
