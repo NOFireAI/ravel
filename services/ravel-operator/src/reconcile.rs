@@ -40,9 +40,8 @@ use crate::crd::{
     AffinityBackend, AffinityKeySource, GATEWAY_DEFAULT_CPU_REQUEST,
     GATEWAY_DEFAULT_MEMORY_REQUEST, GatewayReference, IngestAffinitySpec, LocalSecretRef,
     MAINTAIN_DEFAULT_CPU_REQUEST, MAINTAIN_DEFAULT_MEMORY_REQUEST, MaintainScratchSpec,
-    QUERY_DEFAULT_CPU_REQUEST,
-    QUERY_DEFAULT_MEMORY_REQUEST, RavelClusterSpec, ResourceRequirementsSpec, S3AuthSpec,
-    S3UploadIntegrity,
+    QUERY_DEFAULT_CPU_REQUEST, QUERY_DEFAULT_MEMORY_REQUEST, RavelClusterSpec,
+    ResourceRequirementsSpec, S3AuthSpec, S3UploadIntegrity,
 };
 
 /// A spec that cannot be rendered into a valid object set.

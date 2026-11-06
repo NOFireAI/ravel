@@ -357,6 +357,8 @@ A minimal example is in
 | `spec.maintain.fold.disabled` | boolean | `false` | `--disable-fold` on the maintain pods, the only Deployment the operator renders that runs the scheduled fold. Fold is a query-cost optimization only; disabling it never changes results. |
 | `spec.maintain.fold.intervalSecs` | integer | none | `--fold-interval-secs` on the maintain pods. While the maintain Deployment renders (`spec.maintain.enabled` true) and its fold runs (`spec.maintain.fold.disabled` false), the operator also passes it to the query pods as `--fold-lag-interval-secs`, so their request-budget refusals classify fold lag against the interval the maintain pods really fold on rather than the 300 s default; otherwise the query pods get no such flag. That flag requires a server image that has `--fold-lag-interval-secs`, and while that fold runs, editing this field rolls the query pods too. See "The fold-lag interval on the query pods" below. Minimum `1`: `0` is refused at admission, since the server refuses a zero interval at startup. |
 | `spec.maintain.resources` | object | `requests: {cpu: 100m, memory: 256Mi}`, no limits | An explicit block replaces the default entirely rather than merging with it. |
+| `spec.maintain.scratch.sizeGi` | integer | none | Size in GiB of the maintain pods' `scratch` `emptyDir` and of their `ephemeral-storage` request. Setting `spec.maintain.scratch` also mounts the volume and passes `--maintain-scratch-dir`. Minimum `1`. About 1.3 times the largest merge unit's input bytes. See "Maintain scratch volume" below. |
+| `spec.maintain.scratch.mountPath` | string | `/var/lib/ravel/scratch` | Where the volume is mounted, and the value of `--maintain-scratch-dir`. |
 | `spec.gc.protectionHorizon` | string | none | `--gc-protection-horizon` on the maintain pods, a duration such as `25h5m`. It must equal the protection horizon stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
 | `spec.gc.grace` | string | none | `--gc-grace` on the maintain pods, a duration such as `24h`. It must equal the grace stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
 | `spec.retention.default` | string | none | Duration string, e.g. `30d`. |
@@ -526,6 +528,42 @@ What happens to the rest of the cluster depends on whether it already runs:
 Maintain pods from an earlier release and pods on this one do not admit each
 other's heartbeat records, so during the roll onto the key file some
 maintenance work runs twice until it completes.
+
+### Maintain scratch volume
+
+The two-level RLOG merge writes intermediate runs to a local scratch
+directory ([ADR-3853](../adrs/3853-two-level-rlog-merge.md) D2).
+`spec.maintain.scratch` gives the maintain pods one:
+
+```yaml
+spec:
+  maintain:
+    keySecretRef:
+      name: ravel-maintain-keys
+    scratch:
+      sizeGi: 90
+      # mountPath: /var/lib/ravel/scratch   (the default)
+```
+
+With the block set, the operator renders four things on the maintain
+Deployment, and without it none of them:
+
+- an `emptyDir` volume named `scratch` with `sizeLimit` `<sizeGi>Gi`;
+- a mount of that volume at `mountPath` in the `ravel-server` container;
+- `--maintain-scratch-dir <mountPath>`;
+- an `ephemeral-storage` request of `<sizeGi>Gi` on the `ravel-server`
+  container, beside its other requests. It replaces any `ephemeral-storage`
+  request in `spec.maintain.resources`.
+
+`sizeGi` must be at least `1`; `0` is refused at admission.
+
+The directory is a cache only. The server wipes it at start and when each
+merge unit ends, never publishes a run from it, and a pod that loses it
+restarts the unit from object storage. An `emptyDir` on node disk is
+therefore the whole contract, and no PersistentVolumeClaim is needed. Size
+it to about 1.3 times the input bytes of the largest merge unit: before a
+merge reads its first block it computes that need and refuses the unit,
+naming the need and the free space, when the directory cannot hold it.
 
 ### Distributed query
 

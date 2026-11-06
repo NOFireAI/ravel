@@ -326,7 +326,11 @@ fn assert_scratch_rendered(deployment: &Value, size: &str, mount: &str) {
     assert_eq!(mount_path, mount);
 
     let flags = scratch_dir_flags(deployment);
-    assert_eq!(flags.len(), 1, "exactly one --maintain-scratch-dir: {flags:?}");
+    assert_eq!(
+        flags.len(),
+        1,
+        "exactly one --maintain-scratch-dir: {flags:?}"
+    );
     assert_eq!(
         flags[0], mount_path,
         "the flag names the directory the volume is mounted at"
@@ -357,6 +361,25 @@ async fn a_custom_mount_path_is_used_for_both_mount_and_flag() {
     )))
     .await;
     assert_scratch_rendered(&maintain, "12Gi", "/scratch/merge");
+}
+
+/// The scratch size replaces an `ephemeral-storage` request set in
+/// `spec.maintain.resources` and keeps every other request and limit.
+#[tokio::test]
+async fn the_scratch_request_replaces_an_explicit_ephemeral_storage_request() {
+    let mut cluster = spec(Some(json!({ "sizeGi": 90 })));
+    cluster["maintain"]["resources"] = json!({
+        "requests": { "cpu": "2", "ephemeral-storage": "5Gi" },
+        "limits": { "memory": "8Gi" },
+    });
+    let maintain = applied_maintain(cluster).await;
+    assert_eq!(
+        server_container(&maintain)["resources"],
+        json!({
+            "requests": { "cpu": "2", "ephemeral-storage": "90Gi" },
+            "limits": { "memory": "8Gi" },
+        })
+    );
 }
 
 /// Without the field the Deployment is the one rendered before it existed,
