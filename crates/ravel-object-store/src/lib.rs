@@ -15,6 +15,7 @@ pub mod kms_routing;
 pub mod memory;
 pub mod s3;
 pub mod scheduling;
+pub mod scratch;
 
 use std::sync::Arc;
 
@@ -38,6 +39,10 @@ pub use kms_routing::{KmsRoutingStore, routes_through_tenant_key};
 /// strict-priority-with-floor admission. Off by default via
 /// [`ClassedStore::passthrough`] (decision 2).
 pub use scheduling::{ClassedStore, RequestClass, RequestScheduler, SchedulerConfig};
+
+/// Process-local, non-durable scratch backend over a local directory, the
+/// transient run store of ADR-3853 D2. Never a tenant's store.
+pub use scratch::ScratchStore;
 
 /// Content identity: used only for equality assertions between reads of the
 /// same immutable object. Never used as a CAS precondition (that is
