@@ -707,5 +707,15 @@ name = "int_page_decode"
 path = "src/bin/int_page_decode.rs"
 bench = false
 
+[[bin]]
+name = "structural_read_report"
+path = "src/bin/structural_read_report.rs"
+bench = false
+
+[[bin]]
+name = "fulltext_sidecar_report"
+path = "src/bin/fulltext_sidecar_report.rs"
+bench = false
+
 [lints]
 workspace = true

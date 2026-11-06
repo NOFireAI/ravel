@@ -1,0 +1,54 @@
+# Test spec for the fulltext_sidecar_report bin's own tests: the 400-line
+# fixture corpus as two objects. Not a pre-registration and not a
+# measurement; only the line count is banded, so the tests can make it miss.
+schema = 1
+arm = "fulltext_sidecar"
+
+[[subject]]
+name = "smoke"
+corpus = "fixtures/logbody/corpus.log"
+source = "crates/ravel-bench/fixtures/logbody/corpus.log"
+corpus_sha256 = "65c77859d6073571c6a2c8e0696feb6c47bee3de4a13300dd8b972a963bae9c6"
+max_lines = 400
+objects = 2
+lines_per_object = 200
+block_records = 16
+zstd_level = 3
+stride = 128
+row_level_max_rows = 64
+rare_min_rows = 1
+rare_max_rows = 4
+queries_per_object = 5
+seed = 7
+reps = 1
+
+[subject.figures]
+"object/lines" = { predict = 400, band = [400, 400] }
+"object/count" = { unpredicted = "test spec" }
+"object/raw_bytes" = { unpredicted = "test spec" }
+"object/bytes" = { unpredicted = "test spec" }
+"object/blocks" = { unpredicted = "test spec" }
+"truth_blocks_mean" = { unpredicted = "test spec" }
+"bloom/survivors_mean" = { unpredicted = "test spec" }
+"bloom/fp_rate" = { unpredicted = "test spec" }
+"bytes/dirs" = { unpredicted = "test spec" }
+"bytes/bloom" = { unpredicted = "test spec" }
+"bytes/postings" = { unpredicted = "test spec" }
+"bytes/sidecar" = { unpredicted = "test spec" }
+"bytes/rowmap" = { unpredicted = "test spec" }
+"bytes/body_page_mean" = { unpredicted = "test spec" }
+"lookup/postings_mean" = { unpredicted = "test spec" }
+"lookup/sidecar_mean" = { unpredicted = "test spec" }
+"cpu/compaction_ms" = { unpredicted = "test spec" }
+"cpu/build_ms" = { unpredicted = "test spec" }
+"build_cpu_ratio" = { unpredicted = "test spec" }
+"index_ratio" = { unpredicted = "test spec" }
+"rewrite_amp" = { unpredicted = "test spec" }
+"extrap/objects" = { unpredicted = "test spec" }
+"extrap/bloom_bytes" = { unpredicted = "test spec" }
+"extrap/postings_bytes" = { unpredicted = "test spec" }
+"extrap/sidecar_bytes" = { unpredicted = "test spec" }
+"rare_bytes_ratio" = { unpredicted = "test spec" }
+"deletion/rebuild_cpu_ms" = { unpredicted = "test spec" }
+"deletion/rebuild_cpu_ratio" = { unpredicted = "test spec" }
+"deletion/residue_rows" = { unpredicted = "test spec" }

@@ -1,0 +1,68 @@
+# Test spec for the structural_read_report bin's own tests: a 400-line
+# fixture corpus, no injected latency. Not a pre-registration and not a
+# measurement; only the object's line count is banded, so the tests can
+# make it miss.
+schema = 1
+arm = "structural_read"
+
+[[subject]]
+name = "smoke"
+corpus = "fixtures/logbody/corpus.log"
+source = "crates/ravel-bench/fixtures/logbody/corpus.log"
+corpus_sha256 = "65c77859d6073571c6a2c8e0696feb6c47bee3de4a13300dd8b972a963bae9c6"
+max_lines = 400
+object_target_bytes = 20000
+object_tolerance = 0.9
+block_records = 16
+zstd_level = 3
+rows = 4
+seed = 7
+get_latency_ms = 0
+bandwidth_mib_s = 100.0
+structural_suffix_bytes = 4096
+coalesce_gap = 65536
+concurrency = 4
+reps = 1
+mini_max_rows = 4096
+mini_chunk_bytes = 8192
+mini_meta_bytes_per_chunk = 2
+
+[subject.figures]
+"object/lines" = { predict = 400, band = [400, 400] }
+"object/bytes" = { unpredicted = "test spec" }
+"object/blocks" = { unpredicted = "test spec" }
+"miniblock/meta_bytes" = { unpredicted = "test spec" }
+"scattered/blocks_touched" = { unpredicted = "test spec" }
+"scattered/today/gets" = { unpredicted = "test spec" }
+"scattered/today/bytes" = { unpredicted = "test spec" }
+"scattered/today/wall_ms" = { unpredicted = "test spec" }
+"scattered/today/decode_cpu_ms" = { unpredicted = "test spec" }
+"scattered/page_exact/gets" = { unpredicted = "test spec" }
+"scattered/page_exact/bytes" = { unpredicted = "test spec" }
+"scattered/page_exact/decode_cpu_ms" = { unpredicted = "test spec" }
+"scattered/page_exact/bytes_ratio" = { unpredicted = "test spec" }
+"scattered/page_exact/gets_ratio" = { unpredicted = "test spec" }
+"scattered/page_exact/wall_ratio" = { unpredicted = "test spec" }
+"scattered/miniblock/gets" = { unpredicted = "test spec" }
+"scattered/miniblock/bytes" = { unpredicted = "test spec" }
+"scattered/miniblock/decode_cpu_ms" = { unpredicted = "test spec" }
+"scattered/miniblock/bytes_ratio" = { unpredicted = "test spec" }
+"scattered/miniblock/gets_ratio" = { unpredicted = "test spec" }
+"scattered/miniblock/wall_ratio" = { unpredicted = "test spec" }
+"clustered/blocks_touched" = { unpredicted = "test spec" }
+"clustered/today/gets" = { unpredicted = "test spec" }
+"clustered/today/bytes" = { unpredicted = "test spec" }
+"clustered/today/wall_ms" = { unpredicted = "test spec" }
+"clustered/today/decode_cpu_ms" = { unpredicted = "test spec" }
+"clustered/page_exact/gets" = { unpredicted = "test spec" }
+"clustered/page_exact/bytes" = { unpredicted = "test spec" }
+"clustered/page_exact/decode_cpu_ms" = { unpredicted = "test spec" }
+"clustered/page_exact/bytes_ratio" = { unpredicted = "test spec" }
+"clustered/page_exact/gets_ratio" = { unpredicted = "test spec" }
+"clustered/page_exact/wall_ratio" = { unpredicted = "test spec" }
+"clustered/miniblock/gets" = { unpredicted = "test spec" }
+"clustered/miniblock/bytes" = { unpredicted = "test spec" }
+"clustered/miniblock/decode_cpu_ms" = { unpredicted = "test spec" }
+"clustered/miniblock/bytes_ratio" = { unpredicted = "test spec" }
+"clustered/miniblock/gets_ratio" = { unpredicted = "test spec" }
+"clustered/miniblock/wall_ratio" = { unpredicted = "test spec" }

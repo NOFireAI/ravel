@@ -4,7 +4,7 @@
 //! of [`crate::string_fingerprint`] and reuse its figure and band types.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -259,7 +259,10 @@ fn mem_total_kib() -> u64 {
 /// pre-registered one, before any of it is read as input.
 pub fn stamp_and_check_corpus(corpus: &Path, registered_sha256: &str) -> Result<Stamp, String> {
     if !corpus.is_file() {
-        return Err(format!("corpus {} is not a readable file", corpus.display()));
+        return Err(format!(
+            "corpus {} is not a readable file",
+            corpus.display()
+        ));
     }
     let (corpus_sha256, corpus_bytes) = file_digest(corpus)?;
     if corpus_sha256 != registered_sha256 {
@@ -370,7 +373,10 @@ pub fn line_body(line: &[u8]) -> String {
 }
 
 /// The identity both arms write their objects under.
-pub fn identity(tenant_hash: &ravel_types::TenantHash, writer_seq: u64) -> ravel_logseg::ObjectIdentity {
+pub fn identity(
+    tenant_hash: &ravel_types::TenantHash,
+    writer_seq: u64,
+) -> ravel_logseg::ObjectIdentity {
     ravel_logseg::ObjectIdentity {
         tenant_hash: tenant_hash.0,
         shard: 0,
@@ -460,7 +466,10 @@ impl Io {
 
     /// One GET per `(offset, len)`, at most `concurrency` in flight, in
     /// batches; the bytes come back with their offsets.
-    pub async fn get_ranges(&self, ranges: &[(u64, u64)]) -> Result<Vec<(u64, bytes::Bytes)>, String> {
+    pub async fn get_ranges(
+        &self,
+        ranges: &[(u64, u64)],
+    ) -> Result<Vec<(u64, bytes::Bytes)>, String> {
         let mut out = Vec::with_capacity(ranges.len());
         for batch in ranges.chunks(self.concurrency.max(1)) {
             let mut set = tokio::task::JoinSet::new();
@@ -469,7 +478,10 @@ impl Io {
                 let key = self.key.clone();
                 set.spawn(async move {
                     store
-                        .get(&key, ravel_object_store::GetRange::Range(start, start + len))
+                        .get(
+                            &key,
+                            ravel_object_store::GetRange::Range(start, start + len),
+                        )
                         .await
                         .map(|o| (start, o.data))
                         .map_err(|e| format!("get {key} [{start}, +{len}): {e}"))
@@ -497,10 +509,305 @@ pub struct Report<P: Serialize> {
     pub notes: Vec<String>,
 }
 
+/// The report was written with no structural problem and every figure in
+/// its band; with `--decide`, an overall GO.
+pub const EXIT_OK: u8 = 0;
+/// An error, or a report with a structural problem; with `--decide`, a
+/// report that could not be read or a set of reports that is not a decision.
+pub const EXIT_ERROR: u8 = 1;
+/// The report was written with no structural problem and at least one MISS.
+pub const EXIT_MISS: u8 = 2;
+/// With `--decide`, a complete set of reports whose overall decision is NO-GO.
+pub const EXIT_NO_GO: u8 = 3;
+
+pub const EXIT_CODES: &str = "Exit codes:
+  0  measure: the report was written, no structural problem, every figure in its band
+     --decide: overall GO
+  1  an error (a refused parameter or corpus, a corpus that cannot hold the
+     subject), or a report with a structural problem (a missing, duplicate or
+     not-pre-registered figure, a plan that read back a wrong row, a figure
+     that varied across reps; the report is still written);
+     --decide: a report could not be read, or the reports are not a decision
+  2  measure: the report was written with no structural problem and at least
+     one figure outside its band (MISS)
+  3  --decide: every pre-registered subject reported once without a problem,
+     and the overall decision is NO-GO";
+
+pub fn report_code(checked: &Checked) -> u8 {
+    if !checked.problems.is_empty() {
+        EXIT_ERROR
+    } else if !checked.misses.is_empty() {
+        EXIT_MISS
+    } else {
+        EXIT_OK
+    }
+}
+
+/// What a subject's run produced, before the bands are checked.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    pub figures: Vec<Figure>,
+    pub problems: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+/// One arm, as the two report bins drive it.
+pub trait Arm {
+    const NAME: &'static str;
+    type Subject: Serialize + Clone;
+    /// The pre-registered subjects, validated.
+    fn subjects(spec_text: &str) -> Result<Vec<Self::Subject>, String>;
+    fn name(s: &Self::Subject) -> &str;
+    fn corpus_sha256(s: &Self::Subject) -> &str;
+    fn max_lines(s: &Self::Subject) -> u64;
+    /// Keyed `<subject>/<figure>`.
+    fn expectations(s: &Self::Subject) -> BTreeMap<String, Expect>;
+    fn measure(s: &Self::Subject, lines: &[Vec<u8>]) -> Result<Outcome, String>;
+    fn decide(subject: &str, figures: &[Figure]) -> Decision;
+    fn overall(subjects: &[String], saved: &[SavedDecision]) -> Decision;
+}
+
+/// Every registered parameter of `subject` but its figures, as `name=value`
+/// text, sorted by name.
+pub fn params<S: Serialize>(subject: &S) -> Result<Vec<(String, String)>, String> {
+    let v = serde_json::to_value(subject).map_err(|e| format!("params: {e}"))?;
+    let obj = v.as_object().ok_or("params: subject is not a table")?;
+    Ok(obj
+        .iter()
+        .filter(|(k, _)| k.as_str() != "figures")
+        .map(|(k, v)| {
+            let text = v.as_str().map_or_else(|| v.to_string(), str::to_string);
+            (k.clone(), text)
+        })
+        .collect())
+}
+
+/// Refuses a `--param name=value` naming no registered parameter or
+/// disagreeing with it.
+pub fn check_params(
+    subject: &str,
+    registered: &[(String, String)],
+    given: &[String],
+) -> Result<(), String> {
+    let mut drift = Vec::new();
+    for g in given {
+        let (k, v) = g
+            .split_once('=')
+            .ok_or_else(|| format!("--param {g}: expected name=value"))?;
+        let reg = registered.iter().find(|(n, _)| n == k).ok_or_else(|| {
+            format!("subject {subject}: --param {k} is not a registered parameter")
+        })?;
+        drift.push((k, Some(v.to_string()), reg.1.clone()));
+    }
+    refuse_drift(subject, &drift)
+}
+
+/// Measures one subject and writes its report; the exit code is
+/// [`report_code`]. Every parameter is printed and any `--param` checked
+/// before the corpus is read, and the corpus is sha-checked before it is
+/// read as input.
+pub fn measure<A: Arm>(
+    spec_path: &Path,
+    subject: &str,
+    corpus: &Path,
+    given: &[String],
+    out: &Path,
+) -> Result<u8, String> {
+    let text = std::fs::read_to_string(spec_path)
+        .map_err(|e| format!("read {}: {e}", spec_path.display()))?;
+    let subjects = A::subjects(&text)?;
+    let s = subjects
+        .iter()
+        .find(|s| A::name(s) == subject)
+        .ok_or_else(|| format!("subject {subject} is not pre-registered"))?;
+    let registered = params(s)?;
+    for (k, v) in &registered {
+        println!("{} param {subject}.{k}={v}", A::NAME);
+    }
+    check_params(subject, &registered, given)?;
+    let stamp = stamp_and_check_corpus(corpus, A::corpus_sha256(s))?;
+    println!("{}", stamp.line(A::NAME));
+    let lines = crate::string_fingerprint_report::read_values(
+        &crate::string_fingerprint_report::Corpus::Lines(corpus.to_path_buf()),
+        A::max_lines(s),
+    )?;
+    let outcome = A::measure(s, &lines)?;
+    let mut checked = check_figures(&outcome.figures, &A::expectations(s));
+    checked.problems.extend(outcome.problems.iter().cloned());
+    let decision = A::decide(subject, &outcome.figures);
+    let report = Report {
+        arm: A::NAME.to_string(),
+        subject: subject.to_string(),
+        stamp,
+        params: s.clone(),
+        figures: outcome.figures,
+        checked,
+        decision,
+        notes: outcome.notes,
+    };
+    let json = serde_json::to_string_pretty(&report).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(out, json + "\n").map_err(|e| format!("write {}: {e}", out.display()))?;
+    for n in &report.notes {
+        println!("{} note {n}", A::NAME);
+    }
+    for f in &report.figures {
+        println!("{} figure {}={}", A::NAME, f.key, f.value);
+    }
+    for p in &report.checked.problems {
+        eprintln!("{}: problem: {p}", A::NAME);
+    }
+    for m in &report.checked.misses {
+        println!("{} miss {m}", A::NAME);
+    }
+    println!("{}", report.decision.line);
+    Ok(report_code(&report.checked))
+}
+
+/// The `--decide` output and its exit code: a stamp line naming the git
+/// commit and every report read with its sha256, each subject's decision
+/// line and its miss and problem counts, then the overall line.
+pub fn decide_overall<A: Arm>(
+    spec_path: &Path,
+    reports: &[PathBuf],
+) -> Result<(Vec<String>, u8), String> {
+    let text = std::fs::read_to_string(spec_path)
+        .map_err(|e| format!("read {}: {e}", spec_path.display()))?;
+    let names: Vec<String> = A::subjects(&text)?
+        .iter()
+        .map(|s| A::name(s).to_string())
+        .collect();
+    let mut read = Vec::new();
+    let mut saved = Vec::new();
+    for path in reports {
+        let json =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let (sha256, _) = file_digest(path)?;
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        read.push(format!("{name}:{sha256}"));
+        saved.push(saved_decision(&json).map_err(|e| format!("{}: {e}", path.display()))?);
+    }
+    let mut lines = vec![format!(
+        "{} decide stamp git={} reports={}",
+        A::NAME,
+        git_head(),
+        read.join(",")
+    )];
+    for s in &saved {
+        lines.push(s.decision.line.clone());
+        lines.push(format!(
+            "{} decide subject={} misses={} problems={}",
+            A::NAME,
+            s.decision.subject,
+            s.misses,
+            s.problems
+        ));
+    }
+    let d = A::overall(&names, &saved);
+    lines.push(d.line);
+    let code = if !complete(&names, &saved) {
+        EXIT_ERROR
+    } else if d.go {
+        EXIT_OK
+    } else {
+        EXIT_NO_GO
+    };
+    Ok((lines, code))
+}
+
+/// The command line both T13 report bins share.
+#[derive(clap::Parser, Debug)]
+#[command(after_help = EXIT_CODES)]
+pub struct Cli {
+    /// The pre-registration file.
+    #[arg(long)]
+    pub spec: PathBuf,
+    /// The subject name from the pre-registration file.
+    #[arg(long, conflicts_with = "decide")]
+    pub subject: Option<String>,
+    /// One log line per line of this (possibly gzip-compressed) text file.
+    #[arg(long, conflicts_with = "decide")]
+    pub corpus_lines: Option<PathBuf>,
+    /// `name=value`: checked against the subject's pre-registered parameter
+    /// and refused on any difference, before the corpus is read.
+    #[arg(long, conflicts_with = "decide")]
+    pub param: Vec<String>,
+    /// Where to write the JSON report.
+    #[arg(long, conflicts_with = "decide")]
+    pub out: Option<PathBuf>,
+    /// Print the overall decision over these written reports and exit.
+    #[arg(long, num_args = 1..)]
+    pub decide: Vec<PathBuf>,
+}
+
+pub fn exec<A: Arm>(cli: &Cli) -> Result<u8, String> {
+    if !cli.decide.is_empty() {
+        let (lines, code) = decide_overall::<A>(&cli.spec, &cli.decide)?;
+        for line in lines {
+            println!("{line}");
+        }
+        return Ok(code);
+    }
+    let (Some(subject), Some(corpus), Some(out)) = (&cli.subject, &cli.corpus_lines, &cli.out)
+    else {
+        return Err("--subject, --corpus-lines and --out are required".into());
+    };
+    measure::<A>(&cli.spec, subject, corpus, &cli.param, out)
+}
+
+/// A report bin's `main`.
+pub fn main<A: Arm>() -> std::process::ExitCode {
+    let cli = <Cli as clap::Parser>::parse();
+    match exec::<A>(&cli) {
+        Ok(code) => std::process::ExitCode::from(code),
+        Err(e) => {
+            eprintln!("{}_report: {e}", A::NAME);
+            std::process::ExitCode::from(EXIT_ERROR)
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_code_ranks_problems_over_misses() {
+        let checked = |problems: usize, misses: usize| Checked {
+            problems: vec!["p".into(); problems],
+            misses: vec!["m".into(); misses],
+        };
+        assert_eq!(report_code(&checked(0, 0)), EXIT_OK);
+        assert_eq!(report_code(&checked(0, 1)), EXIT_MISS);
+        assert_eq!(report_code(&checked(1, 1)), EXIT_ERROR);
+        assert_eq!(report_code(&checked(1, 0)), EXIT_ERROR);
+    }
+
+    #[test]
+    fn params_are_refused_on_drift_or_when_unknown() {
+        #[derive(Serialize)]
+        struct S {
+            seed: u64,
+            name: String,
+            figures: u8,
+        }
+        let reg = params(&S {
+            seed: 3,
+            name: "x".into(),
+            figures: 0,
+        })
+        .expect("params");
+        assert_eq!(
+            reg,
+            vec![("name".into(), "x".into()), ("seed".into(), "3".into())]
+        );
+        assert!(check_params("x", &reg, &["seed=3".into()]).is_ok());
+        assert!(check_params("x", &reg, &["seed=4".into()]).is_err());
+        assert!(check_params("x", &reg, &["figures=0".into()]).is_err());
+        assert!(check_params("x", &reg, &["seed".into()]).is_err());
+    }
 
     /// Plausible wrong coalescers, each kept so the exact-figure test shows
     /// it failing.
@@ -549,7 +856,10 @@ mod tests {
         let want = vec![(0, 20), (100, 20), (300, 1)];
         assert_eq!(coalesce(&extents, 5), want);
         // A gap one byte short of 5 leaves 0..10 and 15..20 apart.
-        assert_eq!(coalesce(&extents, 4), vec![(0, 10), (15, 5), (100, 20), (300, 1)]);
+        assert_eq!(
+            coalesce(&extents, 4),
+            vec![(0, 10), (15, 5), (100, 20), (300, 1)]
+        );
         assert_ne!(coalesce_strict(&extents, 5), want);
         assert_ne!(coalesce_unsorted(&extents, 5), want);
         assert_ne!(coalesce_no_max(&extents, 5), want);

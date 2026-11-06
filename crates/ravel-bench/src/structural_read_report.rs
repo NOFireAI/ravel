@@ -14,8 +14,7 @@ use ravel_commit::{keys, publish, record};
 use ravel_logseg::footer::{self, SuffixOutcome, kind};
 use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::{
-    ColumnSelection, LogRecord, Predicate, RlogConfig, RlogReader, SegmentDirectories,
-    SparseObject,
+    ColumnSelection, LogRecord, Predicate, RlogConfig, RlogReader, SegmentDirectories, SparseObject,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, InstrumentedStore, ObjectStoreBackend, PutOptions};
@@ -28,13 +27,15 @@ use crate::structural_read::{
     MiniChunk, SHAPES, SubjectSpec, chunks_for_rows, mini_chunks, place_chunks, wall_ms,
 };
 use crate::t13::{
-    Figure, Io, NOW_NS, RowMap, SplitMix, coalesce, decode_all, identity, line_body, line_records,
-    line_ts, median, thread_cpu_s, write_rlog,
+    Decision, Expect, Figure, Io, NOW_NS, RowMap, SavedDecision, SplitMix, coalesce, decode_all,
+    identity, line_body, line_records, line_ts, median, thread_cpu_s, write_rlog,
 };
 
 /// The columns every plan decodes: what the journey's row view shows.
 pub fn projection() -> ColumnSelection {
-    ColumnSelection::fixed_only().with_severity_text().with_body()
+    ColumnSelection::fixed_only()
+        .with_severity_text()
+        .with_body()
 }
 
 /// The projected columns' ids, which [`ColumnSelection::resolve`] gives for
@@ -46,13 +47,7 @@ pub const PROJECTED: [u32; 4] = [
     ravel_logseg::record::COL_BODY,
 ];
 
-/// What one subject's run produced.
-#[derive(Debug, Default)]
-pub struct Outcome {
-    pub figures: Vec<Figure>,
-    pub problems: Vec<String>,
-    pub notes: Vec<String>,
-}
+pub use crate::t13::Outcome;
 
 struct Store {
     inst: Arc<InstrumentedStore<DelayedGetStore<MemoryStore>>>,
@@ -78,7 +73,11 @@ struct Object {
 /// Writes the object from the first N lines, N calibrated in at most three
 /// proportional passes so the object lands within the tolerance of the
 /// target.
-fn calibrated_object(spec: &SubjectSpec, lines: &[Vec<u8>], th: &TenantHash) -> Result<(Vec<u8>, usize), String> {
+fn calibrated_object(
+    spec: &SubjectSpec,
+    lines: &[Vec<u8>],
+    th: &TenantHash,
+) -> Result<(Vec<u8>, usize), String> {
     let cfg = RlogConfig {
         block_target_records: spec.block_records,
         zstd_level: spec.zstd_level,
@@ -91,7 +90,11 @@ fn calibrated_object(spec: &SubjectSpec, lines: &[Vec<u8>], th: &TenantHash) -> 
         .clamp(1, lines.len().max(1));
     let mut last = None;
     for _ in 0..4 {
-        let bytes = write_rlog(line_records(&lines[..n], 0), cfg, crate::t13::identity(th, 1))?;
+        let bytes = write_rlog(
+            line_records(&lines[..n], 0),
+            cfg,
+            crate::t13::identity(th, 1),
+        )?;
         let size = bytes.len() as f64;
         if (size - target).abs() <= target * spec.object_tolerance {
             return Ok((bytes, n));
@@ -143,7 +146,11 @@ fn build_object(spec: &SubjectSpec, lines: &[Vec<u8>], th: &TenantHash) -> Resul
     })
 }
 
-async fn publish_object(store: &Store, th: TenantHash, obj: &Object) -> Result<ravel_catalog::SegmentRef, String> {
+async fn publish_object(
+    store: &Store,
+    th: TenantHash,
+    obj: &Object,
+) -> Result<ravel_catalog::SegmentRef, String> {
     let rec = NewCommitRecord {
         tenant_hash: th,
         signal: Signal::Logs,
@@ -167,7 +174,11 @@ async fn publish_object(store: &Store, th: TenantHash, obj: &Object) -> Result<r
     let key = keys::reconstruct_data_key(&rec).map_err(|e| format!("data key: {e}"))?;
     store
         .dyn_store
-        .put(&key, bytes::Bytes::from(obj.bytes.clone()), PutOptions::default())
+        .put(
+            &key,
+            bytes::Bytes::from(obj.bytes.clone()),
+            PutOptions::default(),
+        )
         .await
         .map_err(|e| format!("put: {e}"))?;
     publish::publish(&store.dyn_store, &rec, &RetryPolicy::default())
@@ -190,7 +201,10 @@ async fn publish_object(store: &Store, th: TenantHash, obj: &Object) -> Result<r
         .map_err(|e| format!("resolve: {e}"))?;
     match snap.segments.as_slice() {
         [s] => Ok(s.clone()),
-        other => Err(format!("resolve gave {} segments, published 1", other.len())),
+        other => Err(format!(
+            "resolve gave {} segments, published 1",
+            other.len()
+        )),
     }
 }
 
@@ -206,13 +220,21 @@ struct Rep {
 /// What a plan read back for the wanted ordinals: `ts -> body`.
 type Rows = HashMap<i64, String>;
 
-fn check_rows(plan: &str, shape: &str, wanted: &[u64], lines: &[Vec<u8>], got: &Rows) -> Vec<String> {
+fn check_rows(
+    plan: &str,
+    shape: &str,
+    wanted: &[u64],
+    lines: &[Vec<u8>],
+    got: &Rows,
+) -> Vec<String> {
     let mut out = Vec::new();
     for o in wanted {
         let want = line_body(&lines[*o as usize]);
         match got.get(&line_ts(*o)) {
             Some(b) if *b == want => {}
-            Some(_) => out.push(format!("{shape}/{plan}: row {o} read back a different body")),
+            Some(_) => out.push(format!(
+                "{shape}/{plan}: row {o} read back a different body"
+            )),
             None => out.push(format!("{shape}/{plan}: row {o} not read back")),
         }
     }
@@ -256,7 +278,10 @@ async fn run_today(
         .map_err(|e| format!("today: {e}"))?
         .ok_or("today: the fetcher pruned the object")?;
     let mut rows = Rows::new();
-    while let Some(b) = scan.next_block().map_err(|e| format!("today decode: {e}"))? {
+    while let Some(b) = scan
+        .next_block()
+        .map_err(|e| format!("today decode: {e}"))?
+    {
         keep_rows(&mut rows, b, ts);
     }
     let elapsed_s = t.elapsed().as_secs_f64();
@@ -276,7 +301,11 @@ async fn run_today(
 /// The structural read's metadata rounds: one suffix GET (a second when the
 /// footer is longer than the suffix), then one coalesced round for the
 /// directory sections the suffix did not cover.
-async fn structural_dirs(io: &Io, total: u64, spec: &SubjectSpec) -> Result<(SparseObject, SegmentDirectories, u64), String> {
+async fn structural_dirs(
+    io: &Io,
+    total: u64,
+    spec: &SubjectSpec,
+) -> Result<(SparseObject, SegmentDirectories, u64), String> {
     let mut sparse = SparseObject::new(total);
     let suffix_len = spec.structural_suffix_bytes.min(total);
     let suffix = io.get(GetRange::Suffix(suffix_len)).await?;
@@ -288,7 +317,9 @@ async fn structural_dirs(io: &Io, total: u64, spec: &SubjectSpec) -> Result<(Spa
         SuffixOutcome::Ready(f) => f,
         SuffixOutcome::NeedRange { offset, len } => {
             let b = io.get(GetRange::Range(offset, offset + len)).await?;
-            sparse.place(offset, b.clone()).map_err(|e| format!("place footer: {e}"))?;
+            sparse
+                .place(offset, b.clone())
+                .map_err(|e| format!("place footer: {e}"))?;
             held_from = held_from.min(offset);
             match footer::open_from_suffix(&b, total).map_err(|e| format!("footer: {e}"))? {
                 SuffixOutcome::Ready(f) => f,
@@ -310,8 +341,13 @@ async fn structural_dirs(io: &Io, total: u64, spec: &SubjectSpec) -> Result<(Spa
             missing.push((s.offset, s.len.min(held_from - s.offset)));
         }
     }
-    for (start, b) in io.get_ranges(&coalesce(&missing, spec.coalesce_gap)).await? {
-        sparse.place(start, b).map_err(|e| format!("place dirs: {e}"))?;
+    for (start, b) in io
+        .get_ranges(&coalesce(&missing, spec.coalesce_gap))
+        .await?
+    {
+        sparse
+            .place(start, b)
+            .map_err(|e| format!("place dirs: {e}"))?;
     }
     let dirs = RlogReader::<SparseObject>::decode_directories(&sparse, &RlogConfig::default())
         .map_err(|e| format!("directories: {e}"))?;
@@ -352,15 +388,29 @@ async fn run_page_exact(
             .ok_or("projected_page_ranges")?;
         extents.extend(r.into_iter().map(|(o, l)| (blocks_off + o, l)));
     }
-    for (start, b) in io.get_ranges(&coalesce(&extents, spec.coalesce_gap)).await? {
-        sparse.place(start, b).map_err(|e| format!("place pages: {e}"))?;
+    for (start, b) in io
+        .get_ranges(&coalesce(&extents, spec.coalesce_gap))
+        .await?
+    {
+        sparse
+            .place(start, b)
+            .map_err(|e| format!("place pages: {e}"))?;
     }
     let reader = RlogReader::from_decoded(&sparse, &dirs);
     let mut scan = reader
-        .scan_blocks_raw_subset(&Predicate::And(vec![]), &[], &projection(), wanted_blocks, all_blocks)
+        .scan_blocks_raw_subset(
+            &Predicate::And(vec![]),
+            &[],
+            &projection(),
+            wanted_blocks,
+            all_blocks,
+        )
         .map_err(|e| format!("page_exact scan: {e}"))?;
     let mut rows = Rows::new();
-    while let Some(b) = scan.next_block(&sparse).map_err(|e| format!("page_exact decode: {e}"))? {
+    while let Some(b) = scan
+        .next_block(&sparse)
+        .map_err(|e| format!("page_exact decode: {e}"))?
+    {
         keep_rows(&mut rows, b, ts);
     }
     let elapsed_s = t.elapsed().as_secs_f64();
@@ -424,9 +474,9 @@ fn zstd_len(level: i32) -> impl Fn(&[u8]) -> Result<usize, String> {
 /// absolute, and the column chunk's dictionary page.
 /// `None` when the block stores no page for the column (a column the writer
 /// elides for the block, such as one constant over the whole group).
-type RealPage = (Option<(u64, u64)>, Option<(u64, u64)>);
+pub type RealPage = (Option<(u64, u64)>, Option<(u64, u64)>);
 
-fn real_page(pd: &PageDir, blocks_off: u64, block: u32, col: u32) -> RealPage {
+pub fn real_page(pd: &PageDir, blocks_off: u64, block: u32, col: u32) -> RealPage {
     let Some((g, within)) = pd.locate_block(block) else {
         return (None, None);
     };
@@ -472,13 +522,21 @@ pub fn mini_layout(
     for (b, recs) in blocks.iter().enumerate() {
         for col in PROJECTED {
             let values: Vec<Vec<u8>> = recs.iter().map(|r| serialize(col, r)).collect();
-            let chunks = mini_chunks(&values, spec.mini_max_rows, spec.mini_chunk_bytes, &compress)?;
+            let chunks = mini_chunks(
+                &values,
+                spec.mini_max_rows,
+                spec.mini_chunk_bytes,
+                &compress,
+            )?;
             let (data, dict) = real_page(&pd, blocks_off, b as u32, col);
             let stored = chunks
                 .iter()
                 .map(|c| {
-                    zstd::bulk::compress(&values[c.first_row..c.first_row + c.rows].concat(), spec.zstd_level)
-                        .map_err(|e| format!("zstd: {e}"))
+                    zstd::bulk::compress(
+                        &values[c.first_row..c.first_row + c.rows].concat(),
+                        spec.zstd_level,
+                    )
+                    .map_err(|e| format!("zstd: {e}"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             total_chunks += chunks.len() as u64;
@@ -517,7 +575,8 @@ fn parse_values(col: u32, data: &[u8], n: usize) -> Result<Vec<Vec<u8>>, String>
         let len = match col {
             ravel_logseg::record::COL_TS => 8,
             ravel_logseg::record::COL_STREAM_REF => 4,
-            _ => ravel_logseg::varint::get_uvarint(data, &mut pos).map_err(|e| format!("chunk: {e}"))? as usize,
+            _ => ravel_logseg::varint::get_uvarint(data, &mut pos)
+                .map_err(|e| format!("chunk: {e}"))? as usize,
         };
         let v = data.get(pos..pos + len).ok_or("chunk: short value")?;
         out.push(v.to_vec());
@@ -564,7 +623,9 @@ async fn run_miniblock(
             }
         }
     }
-    let _fetched = io.get_ranges(&coalesce(&extents, spec.coalesce_gap)).await?;
+    let _fetched = io
+        .get_ranges(&coalesce(&extents, spec.coalesce_gap))
+        .await?;
     // Decode the needed chunks' simulated contents.
     let mut values: HashMap<(u32, u32), Vec<Vec<u8>>> = HashMap::new();
     for (b, col, c) in needed {
@@ -626,7 +687,10 @@ pub fn wanted_rows(shape: &str, rows: usize, total: u64, seed: u64) -> Vec<u64> 
 /// Medians over reps of one plan; GETs and bytes must not vary.
 fn settle(plan: &str, shape: &str, reps: &[Rep], problems: &mut Vec<String>) -> Rep {
     let first = reps[0];
-    if reps.iter().any(|r| r.gets != first.gets || r.bytes != first.bytes) {
+    if reps
+        .iter()
+        .any(|r| r.gets != first.gets || r.bytes != first.bytes)
+    {
         problems.push(format!("{shape}/{plan}: GETs or bytes varied across reps"));
     }
     let el: Vec<f64> = reps.iter().map(|r| r.elapsed_s).collect();
@@ -668,7 +732,8 @@ pub async fn run_subject(spec: &SubjectSpec, lines: &[Vec<u8>]) -> Result<Outcom
     };
     out.figures.push(p("object/lines", obj.lines as f64));
     out.figures.push(p("object/bytes", total as f64));
-    out.figures.push(p("object/blocks", obj.map.blocks() as f64));
+    out.figures
+        .push(p("object/blocks", obj.map.blocks() as f64));
     let meta = layout.total_chunks * spec.mini_meta_bytes_per_chunk;
     out.figures.push(p("miniblock/meta_bytes", meta as f64));
     out.notes.push(format!(
@@ -689,44 +754,107 @@ pub async fn run_subject(spec: &SubjectSpec, lines: &[Vec<u8>]) -> Result<Outcom
         out.notes.push(format!(
             "{shape}: rows {wanted:?} in blocks {wanted_blocks:?}"
         ));
-        out.figures.push(p(&format!("{shape}/blocks_touched"), wanted_blocks.len() as f64));
+        out.figures.push(p(
+            &format!("{shape}/blocks_touched"),
+            wanted_blocks.len() as f64,
+        ));
         let (mut today, mut exact, mut mini) = (Vec::new(), Vec::new(), Vec::new());
         for rep in 0..spec.reps {
             let (r, rows) = run_today(&store, &seg, th, &wanted_blocks, &all_blocks, &ts).await?;
             if rep == 0 {
-                out.problems.extend(check_rows("today", shape, &wanted, lines, &rows));
+                out.problems
+                    .extend(check_rows("today", shape, &wanted, lines, &rows));
             }
             today.push(r);
-            let (r, rows) = run_page_exact(&store, &io, total, spec, &wanted_blocks, &all_blocks, &ts).await?;
+            let (r, rows) =
+                run_page_exact(&store, &io, total, spec, &wanted_blocks, &all_blocks, &ts).await?;
             if rep == 0 {
-                out.problems.extend(check_rows("page_exact", shape, &wanted, lines, &rows));
+                out.problems
+                    .extend(check_rows("page_exact", shape, &wanted, lines, &rows));
             }
             exact.push(r);
-            let (r, rows) = run_miniblock(&store, &io, total, spec, &layout, &obj.map, &wanted).await?;
+            let (r, rows) =
+                run_miniblock(&store, &io, total, spec, &layout, &obj.map, &wanted).await?;
             if rep == 0 {
-                out.problems.extend(check_rows("miniblock", shape, &wanted, lines, &rows));
+                out.problems
+                    .extend(check_rows("miniblock", shape, &wanted, lines, &rows));
             }
             mini.push(r);
         }
         let today = settle("today", shape, &today, &mut out.problems);
         let today_wall = wall_ms(today.elapsed_s, today.bytes, spec.bandwidth_mib_s);
-        out.figures.push(p(&format!("{shape}/today/gets"), today.gets as f64));
-        out.figures.push(p(&format!("{shape}/today/bytes"), today.bytes as f64));
-        out.figures.push(p(&format!("{shape}/today/wall_ms"), today_wall));
-        out.figures.push(p(&format!("{shape}/today/decode_cpu_ms"), today.cpu_s * 1000.0));
+        out.figures
+            .push(p(&format!("{shape}/today/gets"), today.gets as f64));
+        out.figures
+            .push(p(&format!("{shape}/today/bytes"), today.bytes as f64));
+        out.figures
+            .push(p(&format!("{shape}/today/wall_ms"), today_wall));
+        out.figures.push(p(
+            &format!("{shape}/today/decode_cpu_ms"),
+            today.cpu_s * 1000.0,
+        ));
         for (v, reps) in [("page_exact", exact), ("miniblock", mini)] {
             let r = settle(v, shape, &reps, &mut out.problems);
             let wall = wall_ms(r.elapsed_s, r.bytes, spec.bandwidth_mib_s);
             let ratio = |a: f64, b: f64| if b > 0.0 { a / b } else { f64::INFINITY };
-            out.figures.push(p(&format!("{shape}/{v}/gets"), r.gets as f64));
-            out.figures.push(p(&format!("{shape}/{v}/bytes"), r.bytes as f64));
-            out.figures.push(p(&format!("{shape}/{v}/decode_cpu_ms"), r.cpu_s * 1000.0));
-            out.figures.push(p(&format!("{shape}/{v}/bytes_ratio"), ratio(r.bytes as f64, today.bytes as f64)));
-            out.figures.push(p(&format!("{shape}/{v}/gets_ratio"), ratio(r.gets as f64, today.gets as f64)));
-            out.figures.push(p(&format!("{shape}/{v}/wall_ratio"), ratio(wall, today_wall)));
+            out.figures
+                .push(p(&format!("{shape}/{v}/gets"), r.gets as f64));
+            out.figures
+                .push(p(&format!("{shape}/{v}/bytes"), r.bytes as f64));
+            out.figures
+                .push(p(&format!("{shape}/{v}/decode_cpu_ms"), r.cpu_s * 1000.0));
+            out.figures.push(p(
+                &format!("{shape}/{v}/bytes_ratio"),
+                ratio(r.bytes as f64, today.bytes as f64),
+            ));
+            out.figures.push(p(
+                &format!("{shape}/{v}/gets_ratio"),
+                ratio(r.gets as f64, today.gets as f64),
+            ));
+            out.figures.push(p(
+                &format!("{shape}/{v}/wall_ratio"),
+                ratio(wall, today_wall),
+            ));
         }
     }
     Ok(out)
+}
+
+/// Arm 1 as the report bin drives it.
+pub struct StructuralRead;
+
+impl crate::t13::Arm for StructuralRead {
+    const NAME: &'static str = crate::structural_read::ARM;
+    type Subject = SubjectSpec;
+
+    fn subjects(spec_text: &str) -> Result<Vec<SubjectSpec>, String> {
+        Ok(crate::structural_read::parse(spec_text)?.subject)
+    }
+    fn name(s: &SubjectSpec) -> &str {
+        &s.name
+    }
+    fn corpus_sha256(s: &SubjectSpec) -> &str {
+        &s.corpus_sha256
+    }
+    fn max_lines(s: &SubjectSpec) -> u64 {
+        s.max_lines
+    }
+    fn expectations(s: &SubjectSpec) -> BTreeMap<String, Expect> {
+        s.expectations()
+    }
+    fn measure(s: &SubjectSpec, lines: &[Vec<u8>]) -> Result<Outcome, String> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .map_err(|e| format!("tokio runtime: {e}"))?;
+        rt.block_on(run_subject(s, lines))
+    }
+    fn decide(subject: &str, figures: &[Figure]) -> Decision {
+        crate::structural_read::decide(subject, figures)
+    }
+    fn overall(subjects: &[String], saved: &[SavedDecision]) -> Decision {
+        crate::structural_read::overall(subjects, saved)
+    }
 }
 
 #[cfg(test)]
@@ -767,12 +895,21 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn every_plan_reads_the_wanted_rows_back() {
         let lines: Vec<Vec<u8>> = (0..4000)
-            .map(|i| format!("{i:06} host-{} request handled in {} ms status ok", i % 7, (i * 37) % 1000).into_bytes())
+            .map(|i| {
+                format!(
+                    "{i:06} host-{} request handled in {} ms status ok",
+                    i % 7,
+                    (i * 37) % 1000
+                )
+                .into_bytes()
+            })
             .collect();
-        let spec = crate::structural_read::parse(&crate::structural_read::tests_support::spec_toml(16, 40_000, 0.9))
-            .expect("spec")
-            .subject
-            .remove(0);
+        let spec = crate::structural_read::parse(
+            &crate::structural_read::tests_support::spec_toml(16, 40_000, 0.9),
+        )
+        .expect("spec")
+        .subject
+        .remove(0);
         let out = run_subject(&spec, &lines).await.expect("run");
         assert!(out.problems.is_empty(), "{:?}", out.problems);
         let get = |k: &str| {
@@ -782,9 +919,14 @@ mod tests {
                 .map(|f| f.value)
                 .unwrap_or_else(|| panic!("{k} missing"))
         };
-        assert_eq!(out.figures.len(), crate::structural_read::figure_names().len());
+        assert_eq!(
+            out.figures.len(),
+            crate::structural_read::figure_names().len()
+        );
         for shape in SHAPES {
-            assert!(get(&format!("{shape}/page_exact/bytes")) <= get(&format!("{shape}/today/bytes")));
+            assert!(
+                get(&format!("{shape}/page_exact/bytes")) <= get(&format!("{shape}/today/bytes"))
+            );
             assert!(get(&format!("{shape}/blocks_touched")) >= 1.0);
         }
     }

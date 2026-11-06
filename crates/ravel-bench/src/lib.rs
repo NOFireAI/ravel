@@ -48,6 +48,8 @@ pub mod metrics_query;
 pub mod metrics_workload;
 // Compiled in the default test build too, where ravel-server is a
 // dev-dependency, so its count test runs without the `saturation` feature.
+pub mod fulltext_sidecar;
+pub mod fulltext_sidecar_report;
 #[cfg(any(feature = "saturation", test))]
 pub mod pending_ack_shed;
 pub mod profiling;

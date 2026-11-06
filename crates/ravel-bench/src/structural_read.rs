@@ -31,7 +31,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::t13::{Decision, Expect, Figure, SavedDecision, validate_figure_names};
 
@@ -86,7 +86,7 @@ pub struct Spec {
     pub subject: Vec<SubjectSpec>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubjectSpec {
     pub name: String,
@@ -376,7 +376,11 @@ pub(crate) mod tests_support {
 
     /// A one-subject spec (`s1`) with every figure unpredicted and no
     /// injected latency.
-    pub(crate) fn spec_toml(block_records: usize, object_target_bytes: u64, tolerance: f64) -> String {
+    pub(crate) fn spec_toml(
+        block_records: usize,
+        object_target_bytes: u64,
+        tolerance: f64,
+    ) -> String {
         let mut figures = String::new();
         for f in figure_names() {
             figures.push_str(&format!("\"{f}\" = {{ unpredicted = \"test\" }}\n"));
@@ -552,7 +556,11 @@ mod tests {
         let d = decide("s", &f);
         assert!(d.go);
         assert_eq!(d.variants, vec!["page_exact".to_string()]);
-        assert!(d.line.starts_with("structural_read decision s: GO"), "{}", d.line);
+        assert!(
+            d.line.starts_with("structural_read decision s: GO"),
+            "{}",
+            d.line
+        );
         // Just over each edge is a NO-GO for page_exact.
         for i in 0..3 {
             let mut r = at_edge;
@@ -585,7 +593,10 @@ mod tests {
         let subjects = vec!["a".to_string(), "b".to_string()];
         let go = overall(
             &subjects,
-            &[d("a", &["page_exact", "miniblock"], 0), d("b", &["miniblock"], 0)],
+            &[
+                d("a", &["page_exact", "miniblock"], 0),
+                d("b", &["miniblock"], 0),
+            ],
         );
         assert!(go.go);
         assert_eq!(go.variants, vec!["miniblock".to_string()]);
@@ -595,7 +606,13 @@ mod tests {
         );
         assert!(!split.go, "a different variant per subject is not GO");
         assert!(!overall(&subjects, &[d("a", &["miniblock"], 0)]).go);
-        assert!(!overall(&subjects, &[d("a", &["miniblock"], 0), d("b", &["miniblock"], 1)]).go);
+        assert!(
+            !overall(
+                &subjects,
+                &[d("a", &["miniblock"], 0), d("b", &["miniblock"], 1)]
+            )
+            .go
+        );
     }
 
     fn minimal_toml() -> String {
