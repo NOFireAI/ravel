@@ -1587,6 +1587,8 @@ const SCRATCH_LIST_PAGE: usize = 1000;
 /// The `(start, end)` extents of every row group any stream of `catalog` has a
 /// candidate block in.
 fn candidate_group_extents(catalog: &RlogInputCatalog) -> Result<BTreeSet<(u64, u64)>> {
+    #[cfg(test)]
+    LEVEL1_PRICING.with(|c| c.set(c.get().extent_walk()));
     let mut extents = BTreeSet::new();
     for entry in catalog.reader.stream_dir().entries() {
         if let Some(locs) = catalog.reader.stream_blocks(&entry.stream_id)? {
@@ -1596,18 +1598,96 @@ fn candidate_group_extents(catalog: &RlogInputCatalog) -> Result<BTreeSet<(u64, 
     Ok(extents)
 }
 
-/// What one input costs a level-1 group (ADR-3853 D1, constraint (a)): its
-/// candidate row groups held resident plus the [`pass_block_cost`] of each of
-/// its blocks, since the group's one pass holds every block it decodes.
-fn level1_input_bytes(catalog: &RlogInputCatalog) -> Result<u64> {
-    let raw = candidate_group_extents(catalog)?
+/// What one input costs a level-1 group (ADR-3853 D1, constraint (a)), from
+/// one walk of its stream directory and one of its blocks.
+struct Level1InputCost {
+    /// The bytes of its candidate row groups, held resident.
+    raw: u64,
+    /// The [`pass_block_cost`] of each of its blocks, summed: what it adds to
+    /// its group's run.
+    decoded: u64,
+    /// The largest of those block costs.
+    largest_block: u64,
+    /// Its candidate row groups, as [`candidate_group_extents`] gives them.
+    extents: BTreeSet<(u64, u64)>,
+}
+
+impl Level1InputCost {
+    /// Its candidate row groups plus every block it decodes, since the
+    /// group's one pass holds every block it decodes.
+    fn total(&self) -> u64 {
+        self.raw.saturating_add(self.decoded)
+    }
+}
+
+/// Prices `catalog` for level 1; see [`Level1InputCost`].
+fn level1_input_bytes(catalog: &RlogInputCatalog) -> Result<Level1InputCost> {
+    let extents = candidate_group_extents(catalog)?;
+    let raw = extents
         .iter()
         .fold(0u64, |a, (s, e)| a.saturating_add(e.saturating_sub(*s)));
     let mut decoded = 0u64;
+    let mut largest_block = 0u64;
+    #[cfg(test)]
+    LEVEL1_PRICING.with(|c| c.set(c.get().block_walk()));
     for block in 0..catalog.pricing.block_rows.len() {
-        decoded = decoded.saturating_add(pass_block_cost(&catalog.pricing, block)?);
+        let cost = pass_block_cost(&catalog.pricing, block)?;
+        decoded = decoded.saturating_add(cost);
+        largest_block = largest_block.max(cost);
     }
-    Ok(raw.saturating_add(decoded))
+    Ok(Level1InputCost {
+        raw,
+        decoded,
+        largest_block,
+        extents,
+    })
+}
+
+/// Pricing walks a two-level merge made before level 1, for a test that each
+/// input is priced once and that no [`Level1Shape`] is built for a configured
+/// worker count.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Level1PricingCount {
+    extent_walks: u64,
+    block_walks: u64,
+    shapes: u64,
+}
+
+#[cfg(test)]
+impl Level1PricingCount {
+    fn extent_walk(self) -> Self {
+        Self {
+            extent_walks: self.extent_walks + 1,
+            ..self
+        }
+    }
+
+    fn block_walk(self) -> Self {
+        Self {
+            block_walks: self.block_walks + 1,
+            ..self
+        }
+    }
+
+    fn shape(self) -> Self {
+        Self {
+            shapes: self.shapes + 1,
+            ..self
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The calling thread's pricing walks since its last two-level merge
+    /// began.
+    static LEVEL1_PRICING: std::cell::Cell<Level1PricingCount> =
+        const { std::cell::Cell::new(Level1PricingCount { extent_walks: 0, block_walks: 0, shapes: 0 }) };
+    /// [`LEVEL1_PRICING`] as the last two-level merge on this thread left it
+    /// once its worker count was settled, before level 1.
+    static LEVEL1_PRICED: std::cell::Cell<Option<Level1PricingCount>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// The largest `G` with `G * per_input + run_target <= ceiling`, capped at
@@ -2161,25 +2241,13 @@ async fn two_level_merge(
     let ceiling = config.merge_resident_ceiling();
     let run_target = config.rlog_run_memory_target_bytes;
 
-    let mut per_input = 0u64;
-    let mut run_bytes = Vec::with_capacity(inputs);
-    let mut block_bytes = 0u64;
-    let mut extents: Vec<u64> = Vec::new();
-    for catalog in catalogs.iter() {
-        per_input = per_input.max(level1_input_bytes(catalog)?);
-        let mut decoded = 0u64;
-        for block in 0..catalog.pricing.block_rows.len() {
-            let cost = pass_block_cost(&catalog.pricing, block)?;
-            decoded = decoded.saturating_add(cost);
-            block_bytes = block_bytes.max(cost);
-        }
-        run_bytes.push(decoded);
-        extents.extend(
-            candidate_group_extents(catalog)?
-                .iter()
-                .map(|(s, e)| e.saturating_sub(*s)),
-        );
-    }
+    #[cfg(test)]
+    LEVEL1_PRICING.with(|c| c.set(Level1PricingCount::default()));
+    let costs = catalogs
+        .iter()
+        .map(level1_input_bytes)
+        .collect::<Result<Vec<_>>>()?;
+    let per_input = costs.iter().map(Level1InputCost::total).max().unwrap_or(0);
     let share = unit_core_share(
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
         config.merge_cursor_budget_bytes,
@@ -2190,13 +2258,21 @@ async fn two_level_merge(
         None => {
             let shape = Level1Shape {
                 per_input,
-                run_bytes,
-                block_bytes,
-                in_flight: largest_in_flight(extents, config.input_read_concurrency),
+                run_bytes: costs.iter().map(|c| c.decoded).collect(),
+                block_bytes: costs.iter().map(|c| c.largest_block).max().unwrap_or(0),
+                in_flight: largest_in_flight(
+                    costs
+                        .iter()
+                        .flat_map(|c| c.extents.iter().map(|(s, e)| e.saturating_sub(*s)))
+                        .collect(),
+                    config.input_read_concurrency,
+                ),
                 run_target,
                 part_target: config.rlog_memory_target_bytes(),
                 ceiling,
             };
+            #[cfg(test)]
+            LEVEL1_PRICING.with(|c| c.set(c.get().shape()));
             match derive_level1_workers(&shape, share) {
                 Some(workers) => workers,
                 None => {
@@ -2222,6 +2298,8 @@ async fn two_level_merge(
             }
         }
     };
+    #[cfg(test)]
+    LEVEL1_PRICED.with(|p| p.set(Some(LEVEL1_PRICING.with(std::cell::Cell::get))));
     let worker_ceiling = ceiling / workers as u64;
     let group_size = level1_group_size(per_input, run_target, worker_ceiling, inputs);
     if group_size < 2 {
@@ -15475,7 +15553,7 @@ mod tests {
             let catalogs = catalogs_of(store, keys).await;
             catalogs
                 .iter()
-                .map(|c| level1_input_bytes(c).expect("level-1 cost"))
+                .map(|c| level1_input_bytes(c).expect("level-1 cost").total())
                 .max()
                 .expect("inputs")
         }
@@ -15770,6 +15848,40 @@ mod tests {
             let two_level = published(&store).await;
             assert_eq!(two_level.0, oracle.0, "single-level part keys");
             assert!(two_level.1 == oracle.1, "single-level parts");
+        }
+
+        /// Before level 1, a two-level merge walks each input's stream
+        /// directory once and its blocks once, and builds the worker-count
+        /// shape only when it derives the count: a configured
+        /// `level1_workers` builds none.
+        #[tokio::test]
+        async fn each_input_is_priced_once_and_a_set_worker_count_builds_no_shape() {
+            let (_, _, per_input) = single_level_oracle().await;
+            let run_target = 5 * per_input;
+            let ceiling = group_ceiling(per_input, TWO_LEVEL_RUN_PER_INPUTS * per_input, 12);
+            let inputs = two_level_inputs().len() as u64;
+            for (workers, shapes) in [(Some(4), 0), (None, 1)] {
+                let dir = fresh_scratch(&format!("priced-once-{workers:?}"));
+                let config = CompactorConfig {
+                    level1_workers: workers,
+                    ..two_level_config(ceiling, run_target, Some(dir.clone()))
+                };
+                LEVEL1_PRICED.with(|p| p.set(None));
+                let (outcome, run, _, _) = compact_two_level(&config).await;
+                outcome.unwrap_or_else(|e| panic!("{workers:?} workers: {e}"));
+                assert!(run.report.level1_groups > 0, "{:?}", run.report);
+                let priced = LEVEL1_PRICED.with(std::cell::Cell::get);
+                assert_eq!(
+                    priced,
+                    Some(Level1PricingCount {
+                        extent_walks: inputs,
+                        block_walks: inputs,
+                        shapes,
+                    }),
+                    "{workers:?} workers"
+                );
+                assert!(scratch_entries(&dir).is_empty());
+            }
         }
 
         /// ADR-3853 D4 and D3 at the production shape: 32 cores, 4 units of
