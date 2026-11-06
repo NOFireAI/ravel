@@ -29,11 +29,15 @@
 //! 64-bit result type either.
 //!
 //! Grouped execution runs [`CheckedSumGroupsAccumulator`], a flat per-group
-//! accumulator in the shape of DataFusion's own primitive one: one `i128` and
-//! one seen flag per group, updated from the whole input array and the
-//! batch's group indices in one loop, with no per-group `Accumulator` object
-//! and no `ScalarValue` per row. A batch with no nulls and no filter takes a
-//! loop over the raw value slice.
+//! accumulator in the shape of DataFusion's own primitive one: one `i64` or
+//! `u64` and one validity bit per group, updated from the whole input array
+//! and the batch's group indices in one loop with a checked add per value,
+//! with no per-group `Accumulator` object and no `ScalarValue` per row. A
+//! batch with no nulls and no filter takes a loop over the raw value slice.
+//! An add that would leave the 64-bit type promotes its group: the group's
+//! running sum moves into an `i128` carry held in a side table
+//! ([`NarrowSums`]) and the narrow sum restarts at the value, so the exact
+//! total is carry plus narrow sum, the same `i128` total as above.
 //!
 //! `sum(DISTINCT x)` sums the set of distinct values exactly and applies the
 //! same check. A window `sum` runs [`CheckedSumAccumulator`] for an
@@ -532,6 +536,10 @@ impl<N: NarrowSum> NarrowSums<N> {
             narrow: Vec::new(),
             carries: HashMap::new(),
         }
+    }
+
+    pub(crate) fn kind(&self) -> SumKind {
+        self.kind
     }
 
     pub(crate) fn resize(&mut self, total_num_groups: usize) {
@@ -1489,7 +1497,7 @@ mod tests {
             Some(MIN),
             Some(-3),
         ];
-        let (plan, result) = run(signed(&[rows.clone()]), 1, GROUPED);
+        let (plan, result) = run(signed(std::slice::from_ref(&rows)), 1, GROUPED);
         assert_stages(&plan, 1);
         assert_eq!(i64_cells(&result.expect("one partition")), expected);
         // Round-robin over eight partitions puts no two rows of one group in
