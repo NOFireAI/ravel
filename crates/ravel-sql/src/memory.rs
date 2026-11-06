@@ -1209,7 +1209,11 @@ impl ConsumerLedger {
 
     /// Drop consumer `id`'s entry once it charges nothing.
     fn forget(&mut self, id: usize) {
-        if self.consumers.get(&id).is_some_and(|entry| entry.charged == 0) {
+        if self
+            .consumers
+            .get(&id)
+            .is_some_and(|entry| entry.charged == 0)
+        {
             self.consumers.remove(&id);
         }
     }
@@ -1418,7 +1422,12 @@ impl TenantDelegatingPool {
     /// what the non-spillable consumers hold and the process aggregate
     /// envelope. Consumer names are DataFusion operator names, so the text
     /// carries no tenant data.
-    fn attribution(&self, ledger: &ConsumerLedger, consumer: &MemoryConsumer, asked: usize) -> String {
+    fn attribution(
+        &self,
+        ledger: &ConsumerLedger,
+        consumer: &MemoryConsumer,
+        asked: usize,
+    ) -> String {
         let holders = ledger.top_holders(REFUSAL_HOLDERS);
         let holders = if holders.is_empty() {
             "none".to_string()
@@ -4111,13 +4120,21 @@ mod tests {
                 unflagged.push(kind);
             }
         }
-        assert_eq!(unflagged, Vec::<&str>::new(), "refusals that left refused() false");
+        assert_eq!(
+            unflagged,
+            Vec::<&str>::new(),
+            "refusals that left refused() false"
+        );
 
         let (_, pool) = attributed_pool(100, 1 << 30, AggregateReserveAhead::OFF);
         let res = consumer_on(&pool, "ExternalSorter[0]", false);
         res.try_grow(100).expect("within every ceiling");
         res.grow(50);
-        assert_eq!(pool.reserved(), 150, "the infallible grow overshot the limit");
+        assert_eq!(
+            pool.reserved(),
+            150,
+            "the infallible grow overshot the limit"
+        );
         assert!(!pool.refused(), "no grow was refused");
     }
 
@@ -4151,7 +4168,9 @@ mod tests {
         assert!(!pool.refused(), "a spill trigger is not a memory refusal");
 
         let sorter = consumer_on(&pool, "ExternalSorter[0]", false);
-        sorter.try_grow(100).expect("a non-spillable consumer grows to L");
+        sorter
+            .try_grow(100)
+            .expect("a non-spillable consumer grows to L");
         assert_eq!(pool.reserved(), 1000);
 
         let (_, alone) = attributed_pool(1000, 1 << 30, AggregateReserveAhead::OFF);
