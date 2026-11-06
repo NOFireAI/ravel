@@ -1078,10 +1078,10 @@ target_if = "v <= m['row_11.logs_part_entries'] * 11 * 1024"
 # passes. Then the 1,000-key list: refused-by-guard when the SQL complexity
 # guard refused it, unsupported-on-this-build when it was refused otherwise or
 # carries no keyIndex.keysProbed and partsCovered, 0 when it probed another
-# count or covered no part, else 1. This build's guard refuses both lists
-# (MAX_STATEMENT_COMPLEXITY = 1,000, crates/ravel-sql/src/complexity_guard.rs:257),
-# so on main all three read refused-by-guard (fixtures/local-smoke, pinned by
-# test_control_1001_refused_by_guard_on_main).
+# count or covered no part, else 1. A build from before ADR-3692's key set
+# amendment refuses both lists (MAX_STATEMENT_COMPLEXITY = 1,000 at one unit
+# per token), so on such a build all three read refused-by-guard
+# (fixtures/local-smoke, pinned by test_control_1001_refused_by_guard_on_main).
 [[row.figure]]
 name = "spans_control_1001"
 statement = "spans_in_1000"

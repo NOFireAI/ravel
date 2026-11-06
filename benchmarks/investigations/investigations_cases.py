@@ -37,6 +37,11 @@ GEN = os.path.join(HERE, "gen_corpus.py")
 STATEMENTS = os.path.join(HERE, "statements.toml")
 BANDS = os.path.join(HERE, "bands.toml")
 README = os.path.join(HERE, "README.md")
+# complexity_guard.rs flat_literal_list: a bare '..' string, an X'..' hex
+# string, or a number, comma separated inside parentheses.
+IN_LIST_LITERAL = r"'(?:[^']|'')*'|[Xx]'[0-9A-Fa-f]*'|[-+]?[0-9]+(?:\.[0-9]+)?"
+FLAT_IN_LIST = re.compile(r"[ \t\n\r]*\((?:[ \t\n\r]*(?:%s)[ \t\n\r]*,)*[ \t\n\r]*(?:%s)[ \t\n\r]*\)"
+                          % (IN_LIST_LITERAL, IN_LIST_LITERAL))
 ADR = os.path.join(HERE, "..", "..", "docs", "adrs", "3692-selective-investigations-logs-traces.md")
 HITS_TRUTH = os.path.join(HERE, "hits.truth.json")
 SMOKE = os.path.join(HERE, "fixtures", "local-smoke")
@@ -752,10 +757,14 @@ class Statements(unittest.TestCase):
                          ("cold.max.rows", "v == 4"))
 
     @staticmethod
-    def guard_units(sql):
+    def guard_units(sql, key_sets=True):
         """complexity_guard's scan for the statements here: one unit per token
         start, a word run or a quoted literal one token, any other character
-        one token. An X'..' literal is the X run plus the quoted literal."""
+        one token. An X'..' literal is the X run plus the quoted literal.
+        With key_sets (ADR-3692's key set amendment), an IN followed by a flat
+        list of literals costs the IN plus in_list_units: one unit, and one
+        per 64 literals rounded up. Without it, main before the amendment,
+        the list is counted token by token."""
         n = i = 0
         while i < len(sql):
             c = sql[i]
@@ -766,24 +775,39 @@ class Statements(unittest.TestCase):
             if c == "'":
                 i = sql.index("'", i + 1) + 1
             elif c.isalnum() or c in "_$":
+                start = i
                 while i < len(sql) and (sql[i].isalnum() or sql[i] in "_$"):
                     i += 1
+                flat = FLAT_IN_LIST.match(sql, i) if key_sets and sql[start:i].lower() == "in" else None
+                if flat:
+                    n += 1 + -(-len(re.findall(IN_LIST_LITERAL, flat.group(0))) // 64)
+                    i = flat.end()
             else:
                 i += 1
         return n
 
     def test_in_list_caps_from_the_complexity_guard(self):
-        # Item 9: an X list holds at most 330 keys (3n + 8) and a quoted list
-        # at most 496 (2n + 8) under MAX_STATEMENT_COMPLEXITY = 1,000. Kills a
-        # cap stated from 2 units per X element (495) or from 1,000 / 2.
+        # Item 9. Before ADR-3692's key set amendment an X list held at most
+        # 330 keys (3n + 8) and a quoted list at most 496 (2n + 8) under
+        # MAX_STATEMENT_COMPLEXITY = 1,000, so the 1,000- and 1,001-key lists
+        # carry expect_refusal_on_main and fixtures/local-smoke reads them
+        # refused. Kills a cap stated from 2 units per X element (495) or from
+        # 1,000 / 2. Since the amendment a flat literal list costs one unit
+        # plus one per 64 literals, so every one of these statements costs 24
+        # units at 1,000 and at 1,001 keys: kills a harness or README still
+        # reading the old caps as the current guard's.
         with open(os.path.join(HERE, "..", "..", "crates", "ravel-sql", "src", "complexity_guard.rs")) as f:
-            guard = f.read().splitlines()
-        self.assertEqual(guard[256], "pub const MAX_STATEMENT_COMPLEXITY: usize = 1_000;")
-        self.assertIn("count > MAX_STATEMENT_COMPLEXITY", guard[380])
-        self.assertIn("scan(sql, MAX_STATEMENT_COMPLEXITY)", guard[379])
-        self.assertEqual(guard[639].strip(), "count += 1;")
-        self.assertIn("if c == '\\''", guard[673])
-        self.assertTrue(any("BackslashEscaped" in line for line in guard[673:684]))
+            guard = f.read()
+        lines = guard.splitlines()
+        for anchor in ("pub const MAX_STATEMENT_COMPLEXITY: usize = 1_000;",
+                       "pub const MAX_IN_LIST_LITERALS: usize = 4_096;",
+                       "pub const IN_LIST_LITERALS_PER_UNIT: usize = 64;",
+                       "    1 + literals.div_ceil(IN_LIST_LITERALS_PER_UNIT)",
+                       "    let count = scan(sql, MAX_STATEMENT_COMPLEXITY);",
+                       "    if count > MAX_STATEMENT_COMPLEXITY {"):
+            self.assertEqual(lines.count(anchor), 1, anchor)
+        self.assertIn('if word.eq_ignore_ascii_case("in")', guard)
+        self.assertIn("count += in_list_units(literals);", guard)
         by = {x["id"]: x for x in self.st}
         caps = {}
         for sid, elem in (("spans_in_1000", "X'{:032x}'"), ("logs_trace_in_1000", "X'{:032x}'"),
@@ -792,10 +816,12 @@ class Statements(unittest.TestCase):
             fill = lambda n: re.sub(r"\{[a-z_0-9]+\}", ", ".join(elem.format(k) for k in range(n)), sql)
             per = 3 if elem.startswith("X") else 2
             for n in (1, 2, 330):
-                self.assertEqual(self.guard_units(fill(n)), per * n + 8, (sid, n))
-            caps[sid] = max(n for n in range(1, 1001) if self.guard_units(fill(n)) <= 1000)
-            self.assertGreater(self.guard_units(fill(1000)), 1000, sid)
-            self.assertGreater(self.guard_units(fill(1001)), 1000, sid)
+                self.assertEqual(self.guard_units(fill(n), key_sets=False), per * n + 8, (sid, n))
+            caps[sid] = max(n for n in range(1, 1001) if self.guard_units(fill(n), key_sets=False) <= 1000)
+            self.assertGreater(self.guard_units(fill(1000), key_sets=False), 1000, sid)
+            self.assertGreater(self.guard_units(fill(1001), key_sets=False), 1000, sid)
+            for n, units in ((1, 9), (64, 9), (65, 10), (1000, 24), (1001, 24), (4096, 72)):
+                self.assertEqual(self.guard_units(fill(n)), units, (sid, n))
             self.assertTrue(by[sid].get("expect_refusal_on_main"), sid)
             self.assertTrue(by[sid.replace("1000", "1001")].get("expect_refusal_on_main"), sid)
         self.assertEqual(caps, {"spans_in_1000": 330, "logs_trace_in_1000": 330, "logs_request_in_1000": 496})
@@ -806,13 +832,16 @@ class Statements(unittest.TestCase):
             self.assertIn("496", text, doc)
             self.assertIn("3n + 8", text, doc)
             self.assertIn("2n + 8", text, doc)
+            self.assertIn("one per 64 literals", text, doc)
+            self.assertIn("24 units", text, doc)
             self.assertNotRegex(text, r"\b999 keys\b", doc)
+            self.assertNotRegex(text, r"complexity_guard\.rs:\d", doc)
         # Box A's refusal of a 1,000-key list read "statement complexity 1001
         # exceeds the maximum of 1000 tokens": check stops scanning at the cap
         # plus one, so 1001 is the stop point, not one unit per key. Kills a
         # README that reads the cap off the refusal text (999 keys).
-        self.assertIn("The returned count is then `stop_above + 1`, never the full", guard[469])
-        self.assertEqual(guard[640].strip(), "if count > stop_above {")
+        self.assertIn("The returned count is then `stop_above + 1`, never the full", guard)
+        self.assertIn("if count > stop_above {", guard)
         with open(README) as f:
             text = " ".join(f.read().split())
         for claim in ("an X list of 330 keys is admitted and one of 331 refused",

@@ -1168,7 +1168,7 @@ decision's text:
   rollout: a worker on version 11 refuses these tickets, an error rather
   than wrong rows.
 
-| check | target | miss | source |
+| amendment check | target | miss | source |
 |---|---|---|---|
 | `IN` rows, logs and spans, 1, 10, 100 and 1,000 keys | rows equal the union of the per-key equality answers; `keysProbed` equal to the list's distinct key count | a missing or extra row, or another count | services/ravel-server/tests/sql_key_in.rs:567 |
 | 1,000-key list on a 13-bit leaf | the part uncovered (`skippedByBudget` 1, `partsCovered` 0) after 1 leaf GET, rows exact | a second leaf GET, or a covered part | services/ravel-server/tests/sql_key_in.rs:567 |

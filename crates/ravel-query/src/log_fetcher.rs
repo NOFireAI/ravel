@@ -7133,14 +7133,17 @@ impl BlockRangeFetcher {
                         .await?
                 }
             };
-            for bucket in keyed {
-                match bucket.finish(&frame) {
-                    Ok(KeyProbe::Present(blocks)) => union.extend(blocks),
-                    Ok(_) => {}
-                    Err(err) => return Ok(Err(err)),
-                }
-            }
+            let Some(bucket) = keyed.first() else {
+                continue;
+            };
+            let entries = match bucket.entries(&frame) {
+                Ok(entries) => entries,
+                Err(err) => return Ok(Err(err)),
+            };
             accounting.add_decompressed_bytes(key_idx_frame_decompressed_len(&frame));
+            for bucket in keyed {
+                union.extend(bucket.matching(&entries));
+            }
         }
         union.sort_unstable();
         union.dedup();
