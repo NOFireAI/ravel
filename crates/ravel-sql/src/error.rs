@@ -2300,7 +2300,7 @@ mod tests {
             "query memory budget exhausted: query memory pool exhausted: 40 more bytes on top \
              of 70 already reserved exceeds per-query limit 100; asked by ExternalSorter[0] \
              (can_spill=true, 40 bytes asked); top holders: HashJoinInput[0] 70 bytes; \
-             non-spillable consumers hold 70 bytes; process aggregate envelope 0 bytes"
+             non-spillable consumers hold 70 bytes; this query's aggregate envelope 0 bytes"
         );
         assert_redacted(&err.client_message());
     }
