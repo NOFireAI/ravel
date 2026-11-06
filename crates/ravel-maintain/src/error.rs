@@ -368,16 +368,21 @@ pub enum MaintainError {
         check: TwoLevelCheck,
     },
     /// The filesystem holding the scratch directory has less free space than
-    /// the two-level merge's runs need (ADR-3853 D2). Raised before the first
-    /// block GET.
+    /// the two-level merge's runs need once the units of this process already
+    /// running there have their share set aside (ADR-3853 D2). Raised before
+    /// the first block GET, or when a scratch write fails for want of space
+    /// during either level.
     #[error(
-        "RLOG compaction refused: two-level merge needs {need} bytes of scratch under {path:?} and that filesystem has {free} free (ADR-3853 D2); nothing fetched or published, the L0 inputs stay live"
+        "RLOG compaction refused: two-level merge needs {need} bytes of scratch under {path:?} and that filesystem has {free} free with {reserved} reserved by other merges of this process (ADR-3853 D2); nothing published, the L0 inputs stay live"
     )]
     ScratchHeadroom {
         /// 1.3 times the summed object sizes of the inputs.
         need: u64,
         /// Bytes available to an unprivileged writer on that filesystem.
         free: u64,
+        /// Bytes the other two-level merges of this process running in the
+        /// same scratch directory hold reserved.
+        reserved: u64,
         /// The configured scratch directory.
         path: std::path::PathBuf,
     },

@@ -53,7 +53,8 @@ pub struct ScanReport {
     /// Buckets compaction refused for their merge geometry
     /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), including a
     /// two-level merge's refusal ([`CompactionOutcome::TwoLevelUnsupported`],
-    /// [`CompactionOutcome::ScratchHeadroom`]). Later hours still compact; the
+    /// [`CompactionOutcome::ScratchHeadroom`],
+    /// [`CompactionOutcome::ScratchLocked`]). Later hours still compact; the
     /// cursor stops before the first refused hour, so a build that can merge
     /// it revisits it.
     pub geometry_unsupported: usize,
@@ -108,7 +109,8 @@ pub async fn scan_and_compact(
             }
             CompactionOutcome::GeometryUnsupported { .. }
             | CompactionOutcome::TwoLevelUnsupported { .. }
-            | CompactionOutcome::ScratchHeadroom { .. } => {
+            | CompactionOutcome::ScratchHeadroom { .. }
+            | CompactionOutcome::ScratchLocked { .. } => {
                 report.geometry_unsupported += 1;
                 first_held.get_or_insert(hour);
             }
@@ -163,7 +165,8 @@ pub struct MaintainReport {
     /// Buckets whose compaction this pass refused for their merge geometry
     /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), including a
     /// two-level merge's refusal ([`CompactionOutcome::TwoLevelUnsupported`],
-    /// [`CompactionOutcome::ScratchHeadroom`]). Not counted for a bucket the
+    /// [`CompactionOutcome::ScratchHeadroom`],
+    /// [`CompactionOutcome::ScratchLocked`]). Not counted for a bucket the
     /// [`MaintainMemo`] already holds as refused.
     pub geometry_unsupported: usize,
     /// Expired buckets whose physical sweep was blocked because the live
@@ -763,7 +766,8 @@ pub enum TerminalState {
     /// Compaction refused the bucket for its merge geometry
     /// ([`CompactionOutcome::GeometryUnsupported`], ADR-3853 D0), or refused
     /// its two-level merge ([`CompactionOutcome::TwoLevelUnsupported`],
-    /// [`CompactionOutcome::ScratchHeadroom`]). Terminal
+    /// [`CompactionOutcome::ScratchHeadroom`],
+    /// [`CompactionOutcome::ScratchLocked`]). Terminal
     /// for this process's binary only, so it is held in memory and never
     /// written to the durable snapshot: a restart, or a sibling seeded from a
     /// snapshot, evaluates the bucket again.
@@ -1887,7 +1891,8 @@ fn classify_terminal(
                 Some(
                     CompactionOutcome::GeometryUnsupported { .. }
                     | CompactionOutcome::TwoLevelUnsupported { .. }
-                    | CompactionOutcome::ScratchHeadroom { .. },
+                    | CompactionOutcome::ScratchHeadroom { .. }
+                    | CompactionOutcome::ScratchLocked { .. },
                 ) => Some(TerminalState::GeometryUnsupported),
             }
         }
@@ -2119,7 +2124,8 @@ pub async fn scan_and_maintain_with_memo(
                 Some(ClaimedCompaction::Ran(
                     CompactionOutcome::GeometryUnsupported { .. }
                     | CompactionOutcome::TwoLevelUnsupported { .. }
-                    | CompactionOutcome::ScratchHeadroom { .. },
+                    | CompactionOutcome::ScratchHeadroom { .. }
+                    | CompactionOutcome::ScratchLocked { .. },
                 )) => report.geometry_unsupported += 1,
                 Some(ClaimedCompaction::Ran(CompactionOutcome::BelowMinInputs { count })) => {
                     report.already_done += 1;
