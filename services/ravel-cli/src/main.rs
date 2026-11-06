@@ -1446,7 +1446,8 @@ enum ClusteringKeyCommand {
     /// keep their order and their filters until compaction rewrites them: L1
     /// compaction and the erasure rewrite take the sort descriptor and bloom
     /// coverage of the input with the highest generation, re-sort every part
-    /// by that descriptor, and compress at zstd level 9.
+    /// by that descriptor, and compress at the compaction zstd level (3 by
+    /// default).
     Set {
         /// The tenant whose clustering key to set.
         #[arg(long)]
@@ -2280,7 +2281,7 @@ enum MaintainCommand {
         max_l1_part_bytes: Option<u64>,
         /// The zstd level an RLOG compaction writes its L1 segments at. Higher
         /// levels store smaller segments for more compaction CPU; reads decode
-        /// any level the same way. Refused outside 1..=22. Default 9 (the
+        /// any level the same way. Refused outside 1..=22. Default 3 (the
         /// compactor default).
         #[arg(long, value_name = "LEVEL")]
         compaction_zstd_level: Option<i32>,
@@ -2410,7 +2411,7 @@ enum MaintainCommand {
         bucket_concurrency: usize,
         /// The zstd level an RLOG compaction writes its L1 segments at. Higher
         /// levels store smaller segments for more compaction CPU; reads decode
-        /// any level the same way. Refused outside 1..=22. Default 9 (the
+        /// any level the same way. Refused outside 1..=22. Default 3 (the
         /// compactor default).
         #[arg(long, value_name = "LEVEL")]
         compaction_zstd_level: Option<i32>,
@@ -7376,7 +7377,7 @@ mod tests {
 
     /// `--compaction-zstd-level` on both `compact-bucket` and `compact-tenant`
     /// arrives in the built `CompactorConfig::rlog_zstd_level`, its absence
-    /// leaves the compactor default (9), and a level outside 1..=22 is refused
+    /// leaves the compactor default (3), and a level outside 1..=22 is refused
     /// with the typed error before any store access.
     ///
     /// Non-vacuity (prove-the-test), each flip named:
@@ -7386,7 +7387,7 @@ mod tests {
     ///   either subcommand's `#[arg(long, value_name = "LEVEL")]` to
     ///   `#[arg(skip)]` fails its `try_parse_from` with "unexpected argument".
     /// - Drop the `if let Some(level) = rlog_zstd_level` block from
-    ///   `build_compactor_config`: the `== 4` assertion reads the default 9.
+    ///   `build_compactor_config`: the `== 4` assertion reads the default 3.
     /// - Drop the `validate_rlog_zstd_level` call there: the 0 and 23 refusals
     ///   build `Ok`.
     #[test]
@@ -7471,7 +7472,7 @@ mod tests {
         )
         .expect("no flag builds a config");
         assert_eq!(
-            default.rlog_zstd_level, 9,
+            default.rlog_zstd_level, 3,
             "no flag keeps the compactor default"
         );
         for level in [0, 23] {

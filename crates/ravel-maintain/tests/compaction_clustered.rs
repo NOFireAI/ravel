@@ -5,7 +5,8 @@
 //! `(ts.div_euclid(W), input_index)` for the widest input bucket `W` across
 //! part cuts as well as inside a part, a coarse bucket whose cursor
 //! reservations pass the budget merges in input-order batches into the same
-//! parts, and parts are written at `CompactorConfig::rlog_zstd_level`.
+//! parts, and parts are written at `CompactorConfig::rlog_zstd_level`, 3 by
+//! default.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::BTreeSet;
@@ -20,8 +21,8 @@ use ravel_logseg::footer::{
 use ravel_logseg::record::{COL_BODY, COL_SEVERITY_TEXT};
 use ravel_logseg::rlog_bloom::RlogBloomSection;
 use ravel_logseg::{
-    BloomScope, FieldType, LogRecord, ObjectIdentity, Predicate, RlogConfig, RlogReader,
-    RlogWriter, read_section,
+    BloomScope, FieldType, LogRecord, ObjectIdentity, PageChoice, Predicate, RlogConfig,
+    RlogReader, RlogWriter, read_section,
 };
 use ravel_maintain::config::AdmissionMode;
 use ravel_maintain::{Bucket, CompactorConfig, FixedClock, MaintainError, compact_bucket};
@@ -309,7 +310,7 @@ fn covered_names(object: &[u8]) -> Vec<String> {
 /// The reference part for one merge: per stream in id order, each input's
 /// records for it in stored order, concatenated in input order and stably
 /// sorted by `ts.div_euclid(width_ns)`, pushed through one writer with the
-/// output's descriptor at the compactor's level and identity.
+/// output's descriptor at the compactor's level, page choice and identity.
 fn reference_part(
     objects: &[Vec<u8>],
     width_ns: i64,
@@ -329,6 +330,7 @@ fn reference_part(
     };
     let writer_config = RlogConfig {
         zstd_level: config.rlog_zstd_level,
+        page_choice: PageChoice::Estimated,
         ..RlogConfig::default()
     };
     let mut writer = RlogWriter::new(writer_config, identity).with_sort_descriptor(out.0, out.1);
@@ -497,7 +499,8 @@ fn order_inputs() -> Vec<Input> {
 }
 
 /// The pinned hash of the merged part [`order_inputs`] compacts to.
-const ORDER_PART_HASH: &str = "01ddf5fa99bb1b4c047f77d03611ad1129e8515f83561d780612ce3c6b44aae6";
+// Re-pinned for issue 3878 (zstd 3, Estimated page choice).
+const ORDER_PART_HASH: &str = "1591e5c0b5cb61a79a6c986d488343124919077756e122c6e6214eea1e8a8361";
 
 /// Each stream merges by `(ts.div_euclid(1 day), input_index)`, the widest
 /// input bucket, in both admission modes, and the part equals the reference
@@ -549,13 +552,14 @@ async fn merge_order_is_bucket_then_input_index() {
 
 /// The pinned part hashes [`order_inputs`] compacts to under a memory target
 /// small enough to cut each stream into several parts.
+// Last entry re-pinned for issue 3878 (zstd 3, Estimated page choice).
 const ORDER_MULTI_PART_HASHES: &[&str] = &[
     "700580e0e7ec40b10926a96baf1abf31f2fed8fd837094e9c828514892f1a503",
     "f365f37f31418f3f11a2d4daa9af2f71e401fc33c3490802af5864b195f25d81",
     "a4eb997d5e11f02af3f78483546a054e58887ac1f8cb7fbcf8b74a4e1c2373b6",
     "7d3ba97b05ac99331e2a0b6a82fbfeda48d0f403555544f280721ddfe1bcdfb6",
     "977011aa321aaa5e9aaf4adbed2b8654d4af87c96eee4d2d7b0b5ed216cec457",
-    "dd36c0fb9e6e826c1193b061acf474ac092a4c4806c2053b2a793faa314205d6",
+    "47677590e3682447522c550a76ba4e5083dc45fe4d2139faff79ac58b49af4bc",
 ];
 
 /// With the output cut into several parts, which records land in which part
@@ -896,19 +900,21 @@ fn level_inputs() -> Vec<Input> {
 }
 
 const LEVEL_3_PART_BYTES: usize = 17_707;
-const LEVEL_9_PART_BYTES: usize = 13_974;
+// Re-pinned from 13_974 for issue 3878: Estimated page choice at level 9.
+const LEVEL_9_PART_BYTES: usize = 16_306;
 
-/// `CompactorConfig::rlog_zstd_level` reaches the part writer: level 9 stores
-/// fewer bytes than level 3, both sizes pinned, and the two parts read back to
-/// the same records.
+/// The default level is 3 (issue 3878), and `CompactorConfig::rlog_zstd_level`
+/// still reaches the part writer: an override to level 9 stores fewer bytes
+/// than the default, both sizes pinned, and the two parts read back to the same
+/// records.
 #[tokio::test]
-async fn compaction_writes_at_level_nine() {
+async fn compaction_writes_at_level_three_and_the_level_overrides() {
     let inputs = level_inputs();
-    let (_objects, at3) = compact(&inputs, &config_at(3)).await.expect("level 3");
-    let (_objects, at9) = compact(&inputs, &CompactorConfig::default())
+    let (_objects, at3) = compact(&inputs, &CompactorConfig::default())
         .await
         .expect("default level");
-    assert_eq!(CompactorConfig::default().rlog_zstd_level, 9);
+    let (_objects, at9) = compact(&inputs, &config_at(9)).await.expect("level 9");
+    assert_eq!(CompactorConfig::default().rlog_zstd_level, 3);
     assert_eq!(at3.len(), 1);
     assert_eq!(at9.len(), 1);
     assert_eq!(scan(&at3[0]), scan(&at9[0]), "levels read back identically");
@@ -942,13 +948,14 @@ fn unkeyed_inputs() -> Vec<Input> {
         .collect()
 }
 
+// Re-pinned for issue 3878 (Estimated page choice).
 const UNKEYED_PART_HASHES: &[&str] = &[
-    "5d0d4c1829adfb9d48a28789448eff62b9f0524e3bce80bb3c09e792c665a112",
-    "9d41d165a0158d982f8a9eb52305a89bc163cd469e195b4ba294408d58885eb3",
-    "5916ad0be50ceb91a0ee7912fbe955891e41839ba21a1cfdbadff9a962599de7",
-    "400937b931e3167ba5bafc3f9872fef6d7349f0e599f82ee05b76a98665bc8ab",
-    "745ea7ba154d8a4cd4e7197b129dbbdffb864224924dac4b83cf239a716ff29f",
-    "860c753e3b5378ded1b1dd5136ae3fb20ceeece53159c2c2520ac6b54e27b67a",
+    "69cd4e61f3b46634fb3f8e8d9198bd0cbd134ca45039b148a7ca720508bcca95",
+    "41b80d5669e7fd472701290cccd55219c4a4c764e2fdd9d83fc9c5e6cbe4bd6b",
+    "a2dd252406bf65431e8fadb093c1544177d45c548044dd04a77671cd8528238d",
+    "b66cd4198df2407672932513c637e191de2ff869e2383445b972064b200da23c",
+    "4cf5da735515175a128cb813ad8e03c21f87c760fa451a5fb2fd59575fed9853",
+    "4b5d4c6314f1141c92a7052b2f3b958b8e90949137712fc5f7b80a6b6d8a3e53",
     "3754ad15c7538142389247703b166c6209b02a0750ebfb12baf2d0aeaddeb605",
 ];
 
@@ -958,9 +965,11 @@ const UNKEYED_PART_HASHES: &[&str] = &[
 /// for this corpus, checked by running the same corpus there. They were
 /// re-captured, with the part count still seven, when the writer moved
 /// STREAM_DIR and FIELD_DIR after PAGE_DIR (ADR-0699 amendment of 2026-10-24,
-/// #3217), which changes every footer's section offsets and no record. The
-/// memory target cuts the output mid-stream, so a merge pushing records in any
-/// other order puts different records in each part.
+/// #3217), which changes every footer's section offsets and no record, and
+/// again, with the part count still seven, when L1 parts moved to Estimated
+/// page choice (issue 3878), which changes which encoding some pages carry and
+/// no record. The memory target cuts the output mid-stream, so a merge pushing
+/// records in any other order puts different records in each part.
 #[tokio::test]
 async fn unkeyed_inputs_merge_exactly_as_before() {
     let config = CompactorConfig {

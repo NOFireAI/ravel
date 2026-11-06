@@ -30,7 +30,8 @@ The mechanism is measured, not inferred:
    serially (`crates/ravel-maintain/src/rlog.rs:508-519`) and, per stream,
    `merge_stream_into_parts` opens one `StreamCursor` on *every* input object
    carrying that stream (`rlog.rs:1038-1065`). `input_read_concurrency`
-   (default 8) bounds concurrent *open requests* only (`rlog.rs:1047`);
+   (default 8 at the time; 32 since ADR-0032's 2026-11-06 amendment, #3856)
+   bounds concurrent *open requests* only (`rlog.rs:1047`);
    nothing bounds how many cursors are simultaneously resident.
 2. **Each cursor is ~80 MB on a wide schema.** A cursor holds one fully
    decoded block of up to 8,192 records as `Vec<LogRecord>` plus up to two

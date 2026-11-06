@@ -208,7 +208,7 @@ Run one compaction pass over a single sealed bucket. A bucket with at least 64 M
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--compaction-zstd-level` |  |  | The zstd level an RLOG compaction writes its L1 segments at. Higher levels store smaller segments for more compaction CPU; reads decode any level the same way. Refused outside 1..=22. Default 9 (the compactor default) |
+| `--compaction-zstd-level` |  |  | The zstd level an RLOG compaction writes its L1 segments at. Higher levels store smaller segments for more compaction CPU; reads decode any level the same way. Refused outside 1..=22. Default 3 (the compactor default) |
 | `--dry-run` |  |  | Compute the plan and report it, but write no L1 segments or record. Takes no compaction claim |
 | `--hour` |  |  |  |
 | `--l1-part-memory-target-bytes` |  |  | The decoded record-heap size at which a merge closes an in-progress L1 segment (a split target, not a peak-memory bound: a span merge can overshoot it by a whole trace). Applies to log and span merges. Refused at 0. Default for log merges: derived from the host's memory (MemTotal capped by a cgroup memory limit) less an overhead reserve (2 GiB from 8 GiB of memory up, below it a quarter of that memory but at least 256 MiB) and the 20 GiB merge cursor budget, divided by 8, capped at the part size the claim lease supports (1500 MiB at the default 300 s lease) and at 8 GiB, with a 256 MiB floor applied last; 256 MiB when the host memory cannot be read. A derived value also becomes the log stored-size cap unless --max-l1-part-bytes is given, so log parts close on this target. Default for span merges: 256 MiB. Part boundaries depend on it, so two runs over one bucket cut the same parts only at the same value |
@@ -227,7 +227,7 @@ Compact every sealed bucket of a whole tenant signal: walk each shard's ingest h
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
 | `--bucket-concurrency` |  | `1` | Number of buckets to compact CONCURRENTLY. Buckets are independent by construction (disjoint per-(shard, hour) input sets, separate content-addressed segments, separate CAS-published records), so the walk is embarrassingly parallel: N > 1 runs up to N buckets' compactions at once. Default 1, which is today's fully sequential behavior byte-for-byte (report line order included). Refused at 0 |
-| `--compaction-zstd-level` |  |  | The zstd level an RLOG compaction writes its L1 segments at. Higher levels store smaller segments for more compaction CPU; reads decode any level the same way. Refused outside 1..=22. Default 9 (the compactor default) |
+| `--compaction-zstd-level` |  |  | The zstd level an RLOG compaction writes its L1 segments at. Higher levels store smaller segments for more compaction CPU; reads decode any level the same way. Refused outside 1..=22. Default 3 (the compactor default) |
 | `--dry-run` |  |  | Compute each bucket's plan and report it, but write no L1 segments or records. Takes no compaction claims |
 | `--from-hour` |  |  | First ingest-hour bucket to consider, inclusive. Omit to start at each shard's oldest present hour |
 | `--input-read-concurrency` |  |  | Number of per-input reads a compaction keeps in flight at once (the commit-record GET and catalog load per input). Raise it to hide store round-trip latency on a many-input bucket; it never changes output bytes. Default 32 (the compactor default); values below 1 act as 1 |
@@ -675,7 +675,7 @@ Print the tenant's clustering key: never set, absent at a generation, or set, wi
 
 ### clustering-key set
 
-Set the tenant's clustering key at the stored clustering generation plus one, writing a version-3 config record. Every column must be a typed attribute column the tenant's config record itself declares, at most four, each named once; a refused key writes nothing. Log objects flushed after an ingest process reads the new record sort by (stream, time bucket, key columns, timestamp). Objects already written keep their order and their filters until compaction rewrites them: L1 compaction and the erasure rewrite take the sort descriptor and bloom coverage of the input with the highest generation, re-sort every part by that descriptor, and compress at zstd level 9
+Set the tenant's clustering key at the stored clustering generation plus one, writing a version-3 config record. Every column must be a typed attribute column the tenant's config record itself declares, at most four, each named once; a refused key writes nothing. Log objects flushed after an ingest process reads the new record sort by (stream, time bucket, key columns, timestamp). Objects already written keep their order and their filters until compaction rewrites them: L1 compaction and the erasure rewrite take the sort descriptor and bloom coverage of the input with the highest generation, re-sort every part by that descriptor, and compress at the compaction zstd level (3 by default)
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
