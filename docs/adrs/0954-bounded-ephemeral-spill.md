@@ -582,9 +582,7 @@ source wins:
    memory unknown the budget is unbounded and only the half-of-free clause
    and the 1 GiB threshold apply.
 4. Otherwise spill is disabled. (The refusal-retry spill amendment below
-   replaces this item with the working directory as a fourth source, and
-   replaces the whole-ceiling reservation of requirement 2 with fixed
-   shares reserved only on a spill retry.)
+   replaces this item with the working directory as a fourth source.)
 
 `RAVEL_SQL_SPILL_DIR` set without `RAVEL_SQL_SPILL_MAX_BYTES`, or
 `RAVEL_SQL_SPILL_MAX_BYTES` set alone with no `--cache-dir`, still refuses
@@ -618,7 +616,9 @@ reservation is released when the query's scratch directory is removed, on
 completion, error and cancellation alike. A query admitted while no other
 holds a reservation reserves the whole ceiling, so while it runs a
 concurrent eligible query runs with spill disabled; that is the price of
-the bound. The
+the bound. (The refusal-retry spill amendment below replaces the
+whole-ceiling reservation with fixed shares, reserved only on a spill
+retry.) The
 per-tenant quota is not implemented, and nothing bounds the sum across
 processes, so several processes sharing one cache volume can together hold
 more than one ceiling: one spilling process per volume stays the safe
@@ -874,17 +874,27 @@ answered, but three properties of the decision above cost the rest:
    once the bytes charged to spill-capable consumers plus their aggregate
    envelopes would exceed the query limit `L` less a headroom `H`.
    Consumers that cannot spill may use that headroom. `H` is `max(64 MiB,
-   10% of L)`, more than twenty times the peak the c6a.large measurement
-   found. It is re-derived if a later measurement finds a peak above it.
+   10% of L)`. At its 64 MiB floor, which binds on small hosts, that is
+   about eleven times the 6.1 MB non-spillable peak the c6a.large
+   measurement found, and more where 10% of `L` is larger. The peak is set
+   by the data, not by `L`. `H` is re-derived if a later measurement finds
+   a peak above it.
 3. **In a spill-enabled pool, a reserve-ahead refusal of a spill-capable
    consumer is a spill trigger, not a failure.** The same refusal of a
    consumer that cannot spill is unchanged, and so is any refusal in a
    pool whose query may not spill.
 4. **The process ceiling is shared in fixed shares.** `slots =
-   clamp(floor(ceiling / 8 GiB), 1, 4)`. A query granted spill reserves
-   `min(ceiling / slots, remaining)`, and runs without spill when that is
-   under 64 MiB. A ceiling under 16 GiB keeps one slot, which is the
-   earlier behaviour.
+   clamp(floor(ceiling / 8 GiB), 1, 4)`. A statement whose first attempt
+   was refused reserves `min(ceiling / slots, remaining)` before its spill
+   retry.
+   - When that is under 64 MiB, the statement does not retry: the first
+     attempt's refusal is returned, with the reason logged at WARN.
+   - The earlier exception for a ceiling below 64 MiB, which only an
+     explicit `RAVEL_SQL_SPILL_MAX_BYTES` can set (a derived ceiling is
+     never below 1 GiB), is kept: its single share is the whole ceiling,
+     and the retry runs with it.
+   - A ceiling under 16 GiB keeps one slot, so one spilling statement at a
+     time, as before.
 5. **Spill is on by default.** With no `--sql-spill off`, no environment
    pair and no `--cache-dir`, spill resolves as item 3 of the cache-dir
    spill default amendment does, with two differences: the process's
@@ -903,6 +913,12 @@ answered, but three properties of the decision above cost the rest:
 
    With spill on this way, both startup lines read `source="cwd-default"`,
    and `unset` is no longer reported.
+
+   The working-directory default applies only when neither spill
+   environment variable is set. `RAVEL_SQL_SPILL_MAX_BYTES` set alone with
+   no `--cache-dir` still refuses startup, as item 3 of the cache-dir
+   amendment says, and is not read as a ceiling for the working directory.
+   An explicit ceiling therefore always comes with an explicit place.
 
    The precedence is `--sql-spill off`, then the environment pair, then
    `--cache-dir`, then the working directory. This replaces requirement
@@ -981,8 +997,8 @@ flowchart TB
     A1 -->|"answers"| R["Exact result"]
     A1 -->|"typed memory refusal"| G{"Refusal recorded by the pool,<br/>no batch emitted, spill configured,<br/>statement spill-eligible, no earlier spill retry?"}
     G -->|"no"| E1["Typed ResourcesExhausted<br/>(as before)"]
-    G -->|"yes"| SH{"Spill share available?<br/>min(ceiling / slots, remaining) >= 64 MiB"}
-    SH -->|"no"| E1
+    G -->|"yes"| SH{"Spill share available?<br/>min(ceiling / slots, remaining) >= 64 MiB,<br/>or the whole of a sub-64 MiB ceiling"}
+    SH -->|"no: no retry, WARN"| E1
     SH -->|"yes"| A2["Attempt 2: spill-enabled plan<br/>spill-capable consumers capped at L - H;<br/>their reserve-ahead refusal spills"]
     A2 -->|"answers"| R
     A2 -->|"scratch share exceeded"| E2["spill_budget_exhausted"]
