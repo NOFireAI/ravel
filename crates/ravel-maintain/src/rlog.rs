@@ -2446,6 +2446,8 @@ struct Level1Groups {
     stop: Arc<Level1Stop>,
     #[cfg(test)]
     probe: Option<Arc<Level1Probe>>,
+    #[cfg(test)]
+    encode_probe: Option<Arc<Level1EncodeProbe>>,
 }
 
 #[cfg(test)]
@@ -2453,6 +2455,49 @@ thread_local! {
     /// Handed to the level-1 workers of a merge unit started on this thread.
     static LEVEL1_PROBE: std::cell::RefCell<Option<Arc<Level1Probe>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Handed to the level-1 run sinks of a merge unit started on this thread.
+    static LEVEL1_ENCODE_PROBE: std::cell::RefCell<Option<Arc<Level1EncodeProbe>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Holds every level-1 run-part encode before it starts until released, and
+/// counts the encodes that reached it and the ones whose task has since let
+/// go of it, by finishing or by being dropped.
+#[cfg(test)]
+struct Level1EncodeProbe {
+    release: tokio::sync::Semaphore,
+    held: std::sync::atomic::AtomicUsize,
+    let_go: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl Level1EncodeProbe {
+    fn new() -> Self {
+        Self {
+            release: tokio::sync::Semaphore::new(0),
+            held: std::sync::atomic::AtomicUsize::new(0),
+            let_go: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    async fn hold(self: Arc<Self>) {
+        struct LetGo(Arc<Level1EncodeProbe>);
+        impl Drop for LetGo {
+            fn drop(&mut self) {
+                self.0
+                    .let_go
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.held.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let let_go = LetGo(Arc::clone(&self));
+        let _released = self.release.acquire().await;
+        drop(let_go);
+    }
 }
 
 /// Where the first two level-1 groups of a unit meet before their merges, for
@@ -2898,6 +2943,9 @@ async fn level1_worker_groups(
                 index,
                 keys: Vec::new(),
                 stop: &groups.stop,
+                pending: None,
+                #[cfg(test)]
+                encode_probe: groups.encode_probe.clone(),
             }),
             pipeline: None,
             memory_target: groups.run_target,
@@ -2989,6 +3037,8 @@ async fn merge_in_unit(
         stop: Arc::clone(&stop),
         #[cfg(test)]
         probe: LEVEL1_PROBE.with(|p| p.borrow().clone()),
+        #[cfg(test)]
+        encode_probe: LEVEL1_ENCODE_PROBE.with(|p| p.borrow().clone()),
     });
     let mut workers = Level1Tasks(
         worker_configs
@@ -4197,6 +4247,11 @@ struct RunTarget<'a> {
     keys: Vec<String>,
     /// The unit's level-1 stop token, checked before every run-part PUT.
     stop: &'a Level1Stop,
+    /// The closed part encoding now, held here so dropping the sink aborts
+    /// it, as [`EncodePipeline::pending`] does at level 2.
+    pending: Option<PendingEncode>,
+    #[cfg(test)]
+    encode_probe: Option<Arc<Level1EncodeProbe>>,
 }
 
 /// A level-2 sink's closed parts in part-index order, each encoding on its
@@ -4230,11 +4285,33 @@ impl PendingEncode {
     async fn wait(self) -> Result<(Vec<u8>, WriteStats)> {
         match self {
             PendingEncode::Ready(encoded) => Ok(encoded),
-            PendingEncode::Task(task) => match task.await {
-                Ok(encoded) => encoded,
-                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-                Err(e) => Err(MaintainError::Invariant(format!("part encode task: {e}"))),
-            },
+            PendingEncode::Task(task) => Self::joined(task.await),
+        }
+    }
+
+    /// [`Self::wait`] on the encode in `slot`, which keeps it until it ends,
+    /// so a caller dropped while waiting leaves the task to the slot's owner.
+    async fn wait_held(slot: &mut Option<Self>) -> Result<(Vec<u8>, WriteStats)> {
+        if let Some(PendingEncode::Task(task)) = slot.as_mut() {
+            let joined = task.await;
+            *slot = None;
+            return Self::joined(joined);
+        }
+        match slot.take() {
+            Some(PendingEncode::Ready(encoded)) => Ok(encoded),
+            _ => Err(MaintainError::Invariant(
+                "no part encode to wait for".to_string(),
+            )),
+        }
+    }
+
+    fn joined(
+        joined: std::result::Result<Result<(Vec<u8>, WriteStats)>, tokio::task::JoinError>,
+    ) -> Result<(Vec<u8>, WriteStats)> {
+        match joined {
+            Ok(encoded) => encoded,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => Err(MaintainError::Invariant(format!("part encode task: {e}"))),
         }
     }
 }
@@ -4440,7 +4517,13 @@ impl PartSink<'_> {
         let input_set_hash = *self.input_set_hash;
         let part_index = self.part_index;
         let size = builder.stored_estimate;
+        #[cfg(test)]
+        let probe = self.run.as_ref().and_then(|r| r.encode_probe.clone());
         tokio::spawn(async move {
+            #[cfg(test)]
+            if let Some(probe) = probe {
+                probe.hold().await;
+            }
             gate.run(ReadSite::Compaction, size, move || {
                 builder.into_encoded(&input_set_hash, part_index)
             })
@@ -4452,10 +4535,11 @@ impl PartSink<'_> {
     /// another worker has stopped the unit while it encoded. Nothing awaits
     /// between that check and the PUT.
     async fn put_run_part(&mut self, encoded: PendingEncode) -> Result<()> {
-        let (object, _) = encoded.wait().await?;
         let Some(run) = self.run.as_mut() else {
             return Ok(());
         };
+        run.pending = Some(encoded);
+        let (object, _) = PendingEncode::wait_held(&mut run.pending).await?;
         if run.stop.is_stopped() {
             return Err(Level1Stop::halted());
         }
@@ -4578,6 +4662,10 @@ impl Drop for PartSink<'_> {
     fn drop(&mut self) {
         if let Some(t) = self.tracker {
             t.set_writer_bytes(0);
+        }
+        if let Some(PendingEncode::Task(task)) = self.run.as_ref().and_then(|r| r.pending.as_ref())
+        {
+            task.abort();
         }
         if let Some(pipeline) = self.pipeline.as_mut() {
             for part in pipeline.pending.drain(..) {
@@ -15848,6 +15936,60 @@ mod tests {
             let two_level = published(&store).await;
             assert_eq!(two_level.0, oracle.0, "single-level part keys");
             assert!(two_level.1 == oracle.1, "single-level parts");
+        }
+
+        /// A merge unit dropped while its level-1 workers wait on their run
+        /// part encodes aborts those encodes with the workers: none is left
+        /// running detached, holding its builder.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn dropping_a_level1_worker_mid_encode_aborts_its_encode() {
+            use std::sync::atomic::Ordering::SeqCst;
+            let (_, _, per_input) = single_level_oracle().await;
+            let run_target = 5 * per_input;
+            let ceiling = group_ceiling(per_input, TWO_LEVEL_RUN_PER_INPUTS * per_input, 12);
+            let dir = fresh_scratch("drop-mid-encode");
+            let config = CompactorConfig {
+                level1_workers: Some(4),
+                ..two_level_config(ceiling, run_target, Some(dir.clone()))
+            };
+            let store = ProbeStore::new();
+            seed_inputs(&store, &two_level_inputs()).await;
+            let clock = FixedClock::new(sealed_now_ns());
+            let probe = Arc::new(Level1EncodeProbe::new());
+            LEVEL1_ENCODE_PROBE.with(|p| *p.borrow_mut() = Some(Arc::clone(&probe)));
+            {
+                let bucket = bucket();
+                let compaction = compact_bucket(&store, &clock, &config, &bucket);
+                tokio::pin!(compaction);
+                let held = async {
+                    while probe.held.load(SeqCst) == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                };
+                tokio::select! {
+                    outcome = &mut compaction => {
+                        panic!("the unit ended with its encodes held: {outcome:?}")
+                    }
+                    reached = tokio::time::timeout(std::time::Duration::from_secs(30), held) => {
+                        reached.expect("a level-1 encode reached the probe");
+                    }
+                }
+            }
+            LEVEL1_ENCODE_PROBE.with(|p| *p.borrow_mut() = None);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while probe.let_go.load(SeqCst) < probe.held.load(SeqCst)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let (held, let_go) = (probe.held.load(SeqCst), probe.let_go.load(SeqCst));
+            probe.release.close();
+            assert!(held > 0);
+            assert_eq!(
+                let_go, held,
+                "every held encode was aborted with its worker"
+            );
+            assert!(scratch_entries(&dir).is_empty());
         }
 
         /// Before level 1, a two-level merge walks each input's stream
