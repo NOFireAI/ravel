@@ -734,6 +734,35 @@ verification (step 6), after which the run goes on as a diagnostic:
     After a failed ingest verification it must refuse the report, naming it
     a diagnostic of a failed run; a validate that accepts it fails the run
     (case q).
+
+    After `validate`, and before `memory`, a Ravel-only diagnostic cold pass
+    runs, recorded under the regime `cold-ravel-diagnostic`. The entries are
+    read from the corpus file: every entry of class `long_range`, plus
+    `mb_full_range_avg_over_time`, that is declared for the profile (no
+    `profiles` list means every profile). A profile that selects none,
+    `ci` with the shipped corpus, stamps `cold_ravel_diagnostic` `not
+    applicable` and restarts nothing (cases x, y3). For each entry, five
+    times, `docker compose restart ravel-server` runs, Ravel answers 200 on
+    `/api/v1/status/buildinfo` again, and `metricsbench_query` runs once
+    (`--warmup-passes 0 --passes 1 --reps-per-pass 1`) against a corpus file
+    holding that entry alone, with Prometheus as the oracle it requires and
+    Ravel as the other engine. Each run writes its report and diagnostics
+    under `cold-ravel-diagnostic/`, never to `report.json`, so no cold row
+    joins the timed denominators (case y). `cold-ravel-diagnostic.json`
+    holds `regime`, `comparable: false` and a note saying so, and per entry
+    and repetition the `status`, `latency_ms` and `ravel_cost` record
+    (`accounting` and `phases`, the shape `diagnostics.json` carries)
+    (case y). A failed provenance, restart, readiness wait or query run is
+    recorded in that run's `status`, counted in the `cold_ravel_diagnostic`
+    stamp's `failed_runs`, and never fails the run (case y1). After a failed
+    ingest verification the pass does not run and is stamped `not
+    applicable` (case y2). This pass does not decide the cross-engine cold
+    and warm procedure, which issue #3794 (M9) owns. The provenance each cold
+    run's `metricsbench_query` writes still says `regime: steady-state`,
+    because the bin sets that key itself; the regime and `comparable: false`
+    are in `cold-ravel-diagnostic.json`, in the stamp, and as
+    `diagnostic_regime` and `comparable` config entries of the per-entry
+    provenance the pass hands `metricsbench_query`.
 14. `memory`: the sampler stops, `memory-summary.json` records peak and
     final bytes per container and `OOMKilled` from `docker inspect` (case a),
     and every `--rss-band` is checked (case d). A breach (case d) or an
@@ -871,6 +900,25 @@ verification (step 6), after which the run goes on as a diagnostic:
     default fraction, and at that object count the floor is under half a
     percent of it.
 
+    After `readback-folded`, `ravel-object-spans.json` records the event-time
+    spread of Ravel's data objects, read from the catalog snapshot the fold
+    wrote: `ravel-cli catalog list --json` (one record per resolved metrics
+    segment, L0 and L1, with its ingest hour, size and event bounds) and
+    `ravel-cli catalog inspect` (the number of snapshot parts the HEAD
+    covers), both run on the `ravel-qualify` service (case x). The file holds
+    the object count and bytes, the number of distinct ingest hours, the
+    snapshot part count, and a histogram of each object's span (event
+    maximum minus event minimum) with the object count and bytes of each
+    bucket: under 1 h, 1 to 2 h, 2 to 6 h, 6 to 24 h (24 h included) and over
+    24 h. The buckets sum to the listed object count, and the file records
+    `ravel_objects_data_count` and `matches_ravel_objects` beside it, since
+    `ravel-objects.json` counts only L0 keys; a difference is visible there
+    rather than failing the run (case x0 pins the sum for a second count).
+    The stamp `object_spans` names both commands. A failed read, a
+    missing snapshot HEAD, or a run with no fold (the fold's skip, case x3) is
+    stamped `failed: <reason>` with no file, and the run still exits 0 where
+    it would have (cases x1, x2).
+
     `commit_record_cache_entries_delta` is a residency figure, the change
     in an eviction-bounded gauge, and after the stop and start its before
     value is near zero. It is stamped as context and the check does not use
@@ -938,7 +986,10 @@ and `anchor_source`, `started_at` and `ended_at`, `store_kind: s3s-fs`, `host.ar
 `instance_type` (EC2 IMDSv2, else `unknown`), `comparator_images` (each
 comparator's image block as the capture recorded it), `ravel_catalog_fold`,
 `ravel_catalog_fold_writers_stopped`, `ravel_restart` and `readback_folded`
-(steps 15 to 18; cases u, u7 and u9), `query_scrapes` (an object with
+(steps 15 to 18; cases u, u7 and u9), `object_spans` (the object
+event-time spread capture, after step 18; `not applicable` in the diagnostic
+mode; cases x to x3 and f), `cold_ravel_diagnostic` (the cold pass after step
+13; cases y to y3 and f), `query_scrapes` (an object with
 `ravel_before`, `mimir_before`, `ravel_after` and `mimir_after`, each `ok`,
 `failed: curl exit N`, `failed: HTTP N`, `failed: empty body` or `not taken:
 ...`, step 12; cases w, w1 to w3 and q4; `not applicable` in the diagnostic

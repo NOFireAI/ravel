@@ -224,7 +224,7 @@ S3S_FS_SHA256_X86_64="99592a8a64cbb773c34aee9966537eb4d1091d9a91b70699220f1f34dd
 S3S_FS_SHA256_AARCH64="92d7bbbb29bd4c5aee00b5f1c280c1402e799ed8a28f497e5ba813f1ebc3eecc"
 
 WORKLOAD="${repo_root}/benchmarks/metrics/workload.json"
-CORPUS="${repo_root}/benchmarks/metrics/metrics.corpus.json"
+CORPUS="${METRICSBENCH_CORPUS:-${repo_root}/benchmarks/metrics/metrics.corpus.json}"
 
 # The fixed local-development token ravel.yml's --tenant-token sets. It
 # reaches the bins through this variable's name, never through argv.
@@ -775,6 +775,126 @@ elif op == "falsification":
     if isinstance(result, list):
         doc["result_series_count"] = len(result)
     dump(out_path, doc)
+elif op == "object-spans":
+    # `catalog list --json` output (its store header line first), `catalog
+    # inspect` text, ravel-objects.json, the output path, the tenant, then
+    # the two commands as run. Exit 0 and the stamp as JSON on stdout, or 4
+    # and why not on stdout, writing nothing.
+    list_path, inspect_path, objects_path, out_path, tenant, list_cmd, inspect_cmd = args
+    try:
+        with open(list_path) as f:
+            lines = [l for l in f.read().splitlines() if l.strip().startswith("{")]
+        listing = json.loads(lines[-1])
+        segments = listing["segments"]
+        assert isinstance(segments, list) and listing["segment_count"] == len(segments)
+    except (OSError, ValueError, KeyError, IndexError, AssertionError, TypeError) as e:
+        print(f"the catalog listing is not the --json document ({type(e).__name__})")
+        sys.exit(4)
+    try:
+        with open(inspect_path) as f:
+            m = re.search(r"^parts: ([0-9]+)$", f.read(), re.M)
+    except OSError:
+        m = None
+    if not m:
+        print("no snapshot HEAD: catalog inspect printed no parts line, so the fold published none")
+        sys.exit(4)
+    parts = int(m.group(1))
+    if parts < 1:
+        print("the snapshot HEAD covers no part")
+        sys.exit(4)
+    NS_H = 3600 * 10**9
+    # Lower bound inclusive, upper bound exclusive, except the last two:
+    # "6 to 24 h" includes 24 h and "over 24 h" is strictly above it.
+    edges = [("under 1 h", lambda s: s < NS_H), ("1 to 2 h", lambda s: NS_H <= s < 2 * NS_H),
+             ("2 to 6 h", lambda s: 2 * NS_H <= s < 6 * NS_H), ("6 to 24 h", lambda s: 6 * NS_H <= s <= 24 * NS_H),
+             ("over 24 h", lambda s: s > 24 * NS_H)]
+    hist = [{"bucket": name, "objects": 0, "bytes": 0} for name, _ in edges]
+    hours = set()
+    total_bytes = 0
+    for seg in segments:
+        try:
+            span = seg["max_event_ts_ns"] - seg["min_event_ts_ns"]
+            size, hour, level = seg["object_size"], seg["ingest_hour_bucket"], seg["level"]
+            assert span >= 0 and isinstance(size, int) and level in ("L0", "L1")
+        except (KeyError, TypeError, AssertionError):
+            print(f"a listed segment has no usable event bounds, size, ingest hour or level: {seg!r}")
+            sys.exit(4)
+        hits = [i for i, (_, test) in enumerate(edges) if test(span)]
+        assert len(hits) == 1
+        hist[hits[0]]["objects"] += 1
+        hist[hits[0]]["bytes"] += size
+        hours.add(hour)
+        total_bytes += size
+    doc = {"tenant": tenant, "signal": "metrics",
+           "inspector": {"entries": list_cmd, "snapshot_parts": inspect_cmd},
+           "object_count": len(segments), "object_bytes": total_bytes,
+           "distinct_ingest_hours": len(hours), "snapshot_parts": parts,
+           "span_unit": "hours of event time (max event ts minus min event ts) per data object",
+           "histogram": hist}
+    try:
+        data_count = load(objects_path)["data"]["count"]
+    except (OSError, ValueError, KeyError, TypeError):
+        data_count = None
+    doc["ravel_objects_data_count"] = data_count
+    doc["matches_ravel_objects"] = data_count == len(segments)
+    dump(out_path, doc)
+    print(json.dumps({"status": "ok", "file": "ravel-object-spans.json", "inspector": doc["inspector"],
+                      "object_count": len(segments), "matches_ravel_objects": doc["matches_ravel_objects"]}))
+elif op == "cold-select":
+    # The corpus, the profile, a directory: one single-entry corpus file per
+    # selected entry (class long_range, plus the named full-range entry,
+    # declared for the profile), the ids one per line. Exit 3 when none.
+    corpus_path, prof, dest, extra_id = args
+    corpus = load(corpus_path)
+    ids = []
+    for e in corpus.get("entries", []):
+        if e.get("class") != "long_range" and e.get("id") != extra_id:
+            continue
+        if "profiles" in e and prof not in e["profiles"]:
+            continue
+        dump(os.path.join(dest, f"corpus-{e['id']}.json"), {**corpus, "entries": [e]})
+        ids.append(e["id"])
+    if not ids:
+        sys.exit(3)
+    print("\n".join(ids))
+elif op == "cold-record":
+    # runs file, entry, repetition, the query's exit code, its diagnostics
+    # file: append the one run's record.
+    runs_path, entry, rep, code, diag_path = args
+    runs = load(runs_path) if os.path.exists(runs_path) else []
+    rec = {"entry": entry, "repetition": int(rep), "status": None, "latency_ms": None, "ravel_cost": None}
+    why = None
+    if not code.isdigit():
+        why = f"failed: {code}"
+    elif code != "0":
+        why = f"failed: metricsbench_query exited {code}"
+    else:
+        try:
+            cost = [c for c in load(diag_path)["ravel_cost"] if c.get("entry") == entry]
+        except (OSError, ValueError, KeyError, TypeError):
+            cost = []
+            why = "failed: the diagnostics file carries no ravel_cost"
+        if why is None and len(cost) != 1:
+            why = f"failed: {len(cost)} ravel_cost records for the entry, want exactly 1"
+        elif why is None:
+            rec["ravel_cost"] = cost[0]
+            rec["status"] = cost[0].get("status")
+            rec["latency_ms"] = cost[0].get("latency_ms")
+    if why:
+        rec["status"] = why
+    runs.append(rec)
+    dump(runs_path, runs)
+elif op == "cold-final":
+    runs_path, out_path, prof, regime, reps, *ids = args
+    runs = load(runs_path) if os.path.exists(runs_path) else []
+    doc = {"regime": regime, "comparable": False,
+           "note": "diagnostic, not comparable: Ravel only, one restart per repetition, never in report.json's timed denominators; the cross-engine cold and warm procedure is issue #3794 (M9)",
+           "profile": prof, "repetitions_per_entry": int(reps), "entries": ids, "runs": runs}
+    dump(out_path, doc)
+    bad = [r for r in runs if r["ravel_cost"] is None]
+    print(json.dumps({"regime": regime, "comparable": False, "file": "cold-ravel-diagnostic.json",
+                      "entries": ids, "repetitions_per_entry": int(reps), "runs": len(runs),
+                      "failed_runs": len(bad)}))
 else:
     print(f"unknown op {op}", file=sys.stderr)
     sys.exit(2)
@@ -1134,6 +1254,8 @@ stamp_set ravel_objects null
 stamp_set object_store null
 stamp_set in_process_row null
 stamp_set query_scrapes null
+stamp_set object_spans null
+stamp_set cold_ravel_diagnostic null
 stamp_set steps_completed '[]'
 stamp_set failed_after_ingest '[]'
 stamp_set deferred_failures '[]'
@@ -1524,6 +1646,7 @@ folded_readback() {
     for k in ravel_catalog_fold_writers_stopped ravel_restart readback_folded; do
       stamp_str "$k" "skipped: $why"
     done
+    stamp_str object_spans "failed: no fold ran: $why"
     say "steps stop, fold, start and readback-folded skipped: $why"
     return 0
   fi
@@ -1531,6 +1654,7 @@ folded_readback() {
   fold_step
   start_step
   readback_folded_step
+  object_spans_step
 }
 
 # sha256_of FILE: the file's sha256 as 64 lowercase hex characters.
@@ -1614,6 +1738,130 @@ count_ravel_objects() {
   step_done objects
 }
 
+# object_spans_step: <out>/ravel-object-spans.json from the entries the
+# catalog inspector prints (`catalog list --json`, one record per data object
+# with its level, ingest hour, size and event bounds; `catalog inspect` for
+# the covering snapshot parts), read after the fold. Like query_scrapes, a
+# failure is stamped as object_spans, never fatal, and leaves no file.
+object_spans_step() {
+  local code=0 hours line list_log="${out_dir}/ravel-object-spans.list.txt"
+  local inspect_log="${out_dir}/ravel-object-spans.inspect.txt"
+  local list_cmd inspect_cmd
+  list_cmd="ravel-cli catalog list --tenant ${RAVEL_TENANT} --shards ${RAVEL_SHARDS} --hours HOURS --json"
+  inspect_cmd="ravel-cli catalog inspect --tenant ${RAVEL_TENANT} --signal metrics"
+  hours=$((($(date -u +%s) - anchor_ms / 1000) / 3600 + 2))
+  list_cmd="${list_cmd/HOURS/$hours}"
+  compose run --rm --no-deps -T ravel-qualify \
+    --store s3 --tenant-hash-unkeyed catalog list \
+    --tenant "$RAVEL_TENANT" --shards "$RAVEL_SHARDS" --hours "$hours" --json \
+    >"$list_log" 2>"${out_dir}/ravel-object-spans.list.log" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str object_spans "failed: ${list_cmd} exited ${code}"
+    say "object spans: ${list_cmd} exited ${code}"
+    return 0
+  fi
+  code=0
+  compose run --rm --no-deps -T ravel-qualify \
+    --store s3 --tenant-hash-unkeyed catalog inspect \
+    --tenant "$RAVEL_TENANT" --signal metrics \
+    >"$inspect_log" 2>"${out_dir}/ravel-object-spans.inspect.log" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str object_spans "failed: ${inspect_cmd} exited ${code}"
+    say "object spans: ${inspect_cmd} exited ${code}"
+    return 0
+  fi
+  code=0
+  line="$(py object-spans "$list_log" "$inspect_log" "${out_dir}/ravel-objects.json" \
+    "${out_dir}/ravel-object-spans.json" "$RAVEL_TENANT" "$list_cmd" "$inspect_cmd")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    rm -f "${out_dir}/ravel-object-spans.json"
+    stamp_str object_spans "failed: ${line:-object-spans exited $code}"
+    say "object spans: ${line:-object-spans exited $code}"
+    return 0
+  fi
+  stamp_set object_spans "$line"
+}
+
+# ravel_ready_nonfatal: wait_ready's loop for ravel, returning 1 instead of
+# failing the step.
+ravel_ready_nonfatal() {
+  local i code
+  for ((i = 1; i <= READY_TRIES; i++)); do
+    code="$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "${RAVEL_BASE}/api/v1/status/buildinfo" 2>/dev/null)" || code=""
+    [ "$code" = "200" ] && return 0
+    sleep "$READY_INTERVAL"
+  done
+  return 1
+}
+
+COLD_REGIME="cold-ravel-diagnostic"
+COLD_REPS=5
+# The one full-range entry the pass adds to the long_range class; every other
+# id comes from the corpus.
+COLD_EXTRA_ENTRY="mb_full_range_avg_over_time"
+
+# cold_ravel_diagnostic: after the standard query step, the corpus entries of
+# class long_range plus COLD_EXTRA_ENTRY declared for the profile, each run
+# COLD_REPS times through metricsbench_query, ravel-server restarted before
+# every run. Reports go under <out>/cold-ravel-diagnostic/, never to
+# report.json, so no row joins the timed set. A failure of any run, restart
+# or write is recorded (in the file, and stamped cold_ravel_diagnostic),
+# never fatal. Reads run_full's it_env, store_args and prov_tail.
+cold_ravel_diagnostic() {
+  local dir="${out_dir}/cold-ravel-diagnostic" ids id r code why line
+  local runs="${out_dir}/cold-ravel-diagnostic/runs.json"
+  mkdir -p "$dir" || { stamp_str cold_ravel_diagnostic "failed: cannot create $dir"; return 0; }
+  code=0
+  ids="$(py cold-select "$CORPUS" "$profile" "$dir" "$COLD_EXTRA_ENTRY")" || code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str cold_ravel_diagnostic "not applicable: no corpus entry of class long_range or ${COLD_EXTRA_ENTRY} is declared for profile ${profile}"
+    say "cold ravel diagnostic: no entry selected for profile ${profile}"
+    return 0
+  fi
+  for id in $ids; do
+    code=0
+    "${it_env[@]}" GITHUB_SHA="$ravel_source_commit" "${bin_dir}/metricsbench_report" provenance \
+      --workload "$WORKLOAD" --corpus "${dir}/corpus-${id}.json" "${prov_tail[@]}" \
+      --config "diagnostic_regime=${COLD_REGIME}" --config "comparable=false" \
+      >"${dir}/provenance-${id}.json" 2>>"${dir}/provenance.log" || code=$?
+    for ((r = 1; r <= COLD_REPS; r++)); do
+      why=""
+      if [ "$code" -ne 0 ]; then
+        why="metricsbench_report provenance exited ${code}"
+      elif ! compose restart ravel-server >>"${dir}/restart.log" 2>&1; then
+        why="docker compose restart ravel-server failed"
+      elif ! ravel_ready_nonfatal; then
+        why="ravel did not answer 200 after the restart"
+      fi
+      if [ -z "$why" ]; then
+        local qcode=0
+        "${bin_dir}/metricsbench_query" --ingest-report "${out_dir}/ingest.json" --workload "$WORKLOAD" \
+          --corpus "${dir}/corpus-${id}.json" --provenance "${dir}/provenance-${id}.json" \
+          --engine "name=prometheus,url=${PROM_BASE}" \
+          --engine "name=ravel,url=${RAVEL_BASE},bearer_env=${RAVEL_TOKEN_ENV}" \
+          --warmup-passes 0 --passes 1 --reps-per-pass 1 \
+          --diagnostics "${dir}/${id}.${r}.diagnostics.json" --out "${dir}/${id}.${r}.report.json" \
+          >"${dir}/${id}.${r}.query.log" 2>&1 || qcode=$?
+        py cold-record "$runs" "$id" "$r" "$qcode" "${dir}/${id}.${r}.diagnostics.json" ||
+          say "cold ravel diagnostic: could not record ${id} repetition ${r}"
+      else
+        say "cold ravel diagnostic: ${id} repetition ${r}: ${why}"
+        py cold-record "$runs" "$id" "$r" "${why}" "${dir}/none" ||
+          say "cold ravel diagnostic: could not record ${id} repetition ${r}"
+      fi
+    done
+  done
+  code=0
+  # shellcheck disable=SC2086
+  line="$(py cold-final "$runs" "${out_dir}/cold-ravel-diagnostic.json" "$profile" "$COLD_REGIME" "$COLD_REPS" $ids)" ||
+    code=$?
+  if [ "$code" -ne 0 ]; then
+    stamp_str cold_ravel_diagnostic "failed: cold-ravel-diagnostic.json could not be written"
+    return 0
+  fi
+  stamp_set cold_ravel_diagnostic "$line"
+}
+
 run_diagnostic() {
   local code=0 query at http
   compose_config="$("$DOCKER" compose -f "${here}/docker-compose.yml" config --format json 2>"${out_dir}/override.log")" ||
@@ -1644,6 +1892,8 @@ run_diagnostic() {
   stamp_str readback_folded "not applicable: diagnostic run starts no Ravel"
   stamp_str ravel_objects "not applicable: diagnostic run starts no Ravel"
   stamp_str query_scrapes "not applicable: diagnostic run starts no Ravel or Mimir and runs no query step"
+  stamp_str object_spans "not applicable: diagnostic run starts no Ravel"
+  stamp_str cold_ravel_diagnostic "not applicable: diagnostic run starts no Ravel"
 
   wait_ready prometheus "${PROM_BASE}/-/ready"
   step_done ready
@@ -1785,6 +2035,12 @@ run_full() {
       --config "store_release=${S3S_FS_RELEASE}"
       --config "store_sha256=${s3s_fs_sha256}")
   fi
+  local prov_tail=("${store_args[@]}" "${pins[@]}"
+    --config "ravel_image=${ravel_image}"
+    --config "ravel_image_kind=${ravel_image_kind}"
+    ${ravel_image_id:+--config "ravel_image_id=${ravel_image_id}"}
+    --config "ravel_source_commit=${ravel_source_commit}"
+    --config "harness_commit=$(py get "$STAMPS" harness_commit)")
   local it_env=(env -u RAVEL_INSTANCE_TYPE)
   [ "$host_instance_type" = "unknown" ] || it_env=(env "RAVEL_INSTANCE_TYPE=${host_instance_type}")
   # ravel_git_commit names the source of the image under test, not this
@@ -1792,13 +2048,7 @@ run_full() {
   code=0
   "${it_env[@]}" GITHUB_SHA="$ravel_source_commit" "${bin_dir}/metricsbench_report" provenance \
     --workload "$WORKLOAD" --corpus "$CORPUS" \
-    "${store_args[@]}" \
-    "${pins[@]}" \
-    --config "ravel_image=${ravel_image}" \
-    --config "ravel_image_kind=${ravel_image_kind}" \
-    ${ravel_image_id:+--config "ravel_image_id=${ravel_image_id}"} \
-    --config "ravel_source_commit=${ravel_source_commit}" \
-    --config "harness_commit=$(py get "$STAMPS" harness_commit)" \
+    "${prov_tail[@]}" \
     >"${out_dir}/provenance.json" 2>>"${out_dir}/provenance.log" || code=$?
   if [ "$code" -ne 0 ]; then
     show_log "${out_dir}/provenance.log"
@@ -1859,6 +2109,12 @@ run_full() {
     fail_step validate "metricsbench_report validate exited $code"
   fi
   step_done validate
+
+  if [ "$INGEST_FAILED" -eq 1 ]; then
+    stamp_str cold_ravel_diagnostic "not applicable: the ingest verification failed, so the run is a diagnostic already"
+  else
+    cold_ravel_diagnostic
+  fi
 
   memory_step --defer
   folded_readback

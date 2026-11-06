@@ -2545,6 +2545,11 @@ enum CatalogCommand {
         hours: i64,
         #[arg(long, default_value_t = 4)]
         shards: u32,
+        /// Print one JSON document of the resolved metrics segments (key,
+        /// level, shard, ingest hour bucket, object size and event bounds
+        /// per segment) instead of the text lines.
+        #[arg(long)]
+        json: bool,
     },
     /// One-shot catalog fold for one (tenant, signal).
     ///
@@ -3109,8 +3114,9 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     tenant,
                     hours,
                     shards,
+                    json,
                 },
-        } => catalog_list(&cli.store, &tenant, hours, shards).await,
+        } => catalog_list(&cli.store, &tenant, hours, shards, json).await,
         Command::Catalog {
             command:
                 CatalogCommand::Fold {
@@ -5015,6 +5021,7 @@ async fn catalog_list(
     tenant: &str,
     hours: i64,
     shard_count: u32,
+    json: bool,
 ) -> anyhow::Result<()> {
     let store = store::build_store(store_args)?;
     let selection = store_args.selection();
@@ -5051,6 +5058,26 @@ async fn catalog_list(
         .await
         .map_err(|err| anyhow::anyhow!("failed to resolve catalog: {err}"))?;
 
+    if json {
+        let segments: Vec<serde_json::Value> = snapshot
+            .segments
+            .iter()
+            .map(|seg| {
+                serde_json::json!({
+                    "key": seg.data_object_key,
+                    "level": format!("{:?}", seg.level),
+                    "shard": seg.shard,
+                    "ingest_hour_bucket": seg.ingest_hour_bucket,
+                    "object_size": seg.object_size,
+                    "min_event_ts_ns": seg.min_event_ts_ns,
+                    "max_event_ts_ns": seg.max_event_ts_ns,
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({ "segment_count": segments.len(), "segments": segments });
+        println!("{}", serde_json::to_string(&doc)?);
+        return Ok(());
+    }
     for seg in &snapshot.segments {
         println!(
             "{} shard={} samples={} series={} min_event_ts_ns={} max_event_ts_ns={} created_unix_ns={}",
