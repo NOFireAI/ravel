@@ -2781,8 +2781,8 @@ alter it without the slice key (`crates/ravel-sql/src/flight_ticket.rs`,
 
 | Table | Carried | Not carried |
 |---|---|---|
-| `spans` | `ts_lo`, `ts_hi`, `trace_id` | `duration_ns` window, `status_code` mask, `service_name`, `name` |
-| `logs` | `ts_lo`, `ts_hi`, prune predicates: attribute or declared-column string/bytes equality, I64/F64/Bool range; exact-key equalities (field, key type, 8-byte key) for the KEY_IDX probe | the content channel (`has_word`, a pushed `LIKE '%literal%'`) |
+| `spans` | `ts_lo`, `ts_hi`, `trace_id`, the `trace_id IN` list (16-byte ids) | `duration_ns` window, `status_code` mask, `service_name`, `name` |
+| `logs` | `ts_lo`, `ts_hi`, prune predicates: attribute or declared-column string/bytes equality, I64/F64/Bool range; exact-key equalities (field, key type, 8-byte key) for the KEY_IDX probe; the exact-key `IN` set (field, key type, sorted 8-byte keys) | the content channel (`has_word`, a pushed `LIKE '%literal%'`) |
 
 The pushdown-aware fragment is built by the provider's
 `worker_fragment_with_pushdown`. No production `DoGet` calls it yet: the Flight
@@ -2819,14 +2819,30 @@ signed under a slice key as `wrong_surface`. Version 11 is the slice ticket
 whose logs block also carries the exact-key equalities the worker probes
 KEY_IDX with (see the exact-key probe below); it is version 9's layout plus
 that key section, so it is a slice-surface version and never a client one. A
-slice ticket whose block carries no key stays version 9. Each surface decodes
-its own set: the client surface versions 8, 9 and 10, the slice surface 8, 9
-and 11. A version 11 ticket on the client surface is refused as an
-unsupported version, as a version 10 ticket is on the slice surface. Each
-surface mints only its own set: `FlightTicket::encode_for_surface`, which
+slice ticket whose block carries no key stays version 9. Version 12 is the
+slice ticket whose block carries a key set (ADR-3692 decision 6): version
+11's layout plus, on a logs block, the equalities' count (0 allowed) and
+equalities followed by the key-set section (field, key type, a count of 1
+to 1,024, then that many 8-byte keys in strictly ascending order), and, on a
+spans block, a trace-id list (a count of 1 to 1,024, then that many 16-byte
+ids in strictly ascending order) after the version 9 block's single optional
+trace id. Workers decode a slice ticket with `SqlTicketKeys::decode`, which
+drops the pushdown block and re-plans the fragment from the statement text,
+so the block never changes a worker's rows; what version 12 changes is a
+mixed-version rollout, where a version 11 worker refuses these tickets on
+their version byte, an error rather than wrong rows. A count of 0 or over 1,024, or
+keys out of order, is `InvalidKeySet`. Versions 8 to 11 encode byte for byte
+as before version 12 existed, each pinned by a golden-bytes test
+(`version_11_bytes_unchanged_and_version_12_carries_key_set`). Each surface
+decodes its own set: the client surface versions 8, 9 and 10, the slice
+surface 8, 9, 11 and 12. A version 11 or 12 ticket on the client surface is
+refused as an unsupported version, as a version 10 ticket is on the slice
+surface. Each surface mints only its own set: `FlightTicket::encode_for_surface`, which
 `SqlTicketKeys` and the coordinator's slice client mint through, refuses a
-version 10 ticket for the slice surface as `SignalGroupsOnSlice` and a
-version 11 ticket for the client surface as `KeyEqualsOnClient`. The
+version 10 ticket for the slice surface as `SignalGroupsOnSlice`, a
+version 11 ticket for the client surface as `KeyEqualsOnClient`, and a
+version 12 one as `KeySetOnClient`. A worker on version 11 refuses a version
+12 ticket on its version byte. The
 version moves because
 the coordinator that mints a ticket and the worker that redeems it can run
 different builds during a rolling upgrade, and the worker has to be able to
@@ -3788,9 +3804,10 @@ and block-level reported independently:
   the key absent, or, for several logs keys joined by `AND`, named no block
   every key shares (ADR-2707 decision 5). It also counts the segments the
   tier-2 router dropped before the scan because their part's leaves prove
-  the trace (spans) or the one declared-key equality's key (logs) absent
-  (ADR-3692 decisions 3 and 4); a segment is counted by one tier only, since
-  a tier-2 prune is never opened.
+  the trace or every id of a `trace_id IN` list (spans), or the key of the
+  one declared-key arm, an equality or every key of an `IN` set (logs),
+  absent (ADR-3692 decisions 3, 4 and 6); a segment is counted by one tier
+  only, since a tier-2 prune is never opened.
 - `blocksPrunedByKeyIndex`: blocks the skip index kept, in the segments that
   lookup did read, that KEY_IDX named no entry for. On spans it is 0 when the
   skip index already narrows the object to the trace's blocks, which it does
@@ -4738,6 +4755,20 @@ Three numbers, one decision:
   statement at the complexity bound fits in it many times over, with room for
   whitespace, string literals, and `min_commit_token` values.
 
+One construct is priced on its own (ADR-3692, key set amendment): a flat
+`IN` list whose every element is a literal, a bare `'...'` string, an
+`X'...'` hex string or a number with an optional sign, costs one token for
+the list plus one per 64 literals, rounded up, so a 1,000-key lookup costs
+17 instead of about 2,000 and fits under the bound with room for the rest of
+the statement. It is sound because the parser holds the list as one `Vec` of
+leaves under one `InList` node: the list adds width, not depth. Anything else
+between the parentheses (an identifier, an operator, a nested parenthesis, a
+comment) declines the allowance and every token counts as before. A flat list
+of more than 4,096 literals (`MAX_IN_LIST_LITERALS`) is refused with the same
+typed error, whose message names the list cap. Every other token's cost and
+the 1,000-token bound are unchanged. The body cap still applies: 1,000 hex
+trace ids are about 37 KB of text.
+
 The check is not a call each parse site is expected to remember. It is part of
 the parse: `ravel_sql::complexity_guard::parse_guarded` runs the check and then
 builds the parser with the pinned recursion limit, and it is the only parse of
@@ -5108,9 +5139,9 @@ does not pin it: it only decides which equalities reach the probe, which
 narrows the blocks read, not the rows returned. An equality on a typed
 attribute column the declaration does not name issues no KEY_IDX read, even on
 an object whose section indexes it. A distributed logs slice does not resolve it again: the
-coordinator's kept keys travel in the slice ticket (version 11; version 10 is
-the grouped client ticket of ADR-2904), and a version 11 ticket carrying a
-spans block is refused.
+coordinator's kept keys travel in the slice ticket (version 11, or version 12
+when it carries an `IN` set; version 10 is the grouped client ticket of
+ADR-2904), and a version 11 ticket carrying a spans block is refused.
 
 Each object above the block-range threshold that the catalog keeps reads the
 section's prefix
@@ -5185,6 +5216,55 @@ The probe trades block reads for index reads: a selective equality reads
 fewer bytes, but every object probed pays the prefix GET and up to one bucket
 GET per key whether or not it holds the key.
 
+**Exact-key `IN` lists (ADR-3692 decision 6).** A top-level
+`column IN (v1, ..., vn)` carries one key set of 1 to 1,024 distinct keys.
+On logs it is `LogsPushdown::key_in` (`LogQuery::key_in`, a
+`ravel_query::KeyIn`): a declared key-index `i64`, `str` or `bytes` column
+against literals of exactly its type, or `trace_id` (with `index_trace_id`
+on) against 16-byte binary or 32-character hex literals. On spans it is
+`SpansPushdown::trace_ids`, for `trace_id IN` 16-byte binary or 32-character
+hex literals; a hex list plans because the `trace_id_hex_in_list` analyzer
+rule rewrites it into the column's native literals before type coercion
+(`crates/ravel-sql/src/trace_id_planner.rs`). A `NOT IN`, a mixed-type list, a
+list holding a NULL or an expression, a list of more than 1,024 distinct
+values, and a list under `OR` carry no key; a declared `i64` list keeps its
+envelope `NumRange` prune arm whatever happens to the key. The first such list
+of a conjunction is the set; a second carries nothing. DataFusion rewrites a
+list of at most three values into `=` disjuncts before the scan sees it (one
+value into a plain `=`, which is an equality arm), and a disjunction carries
+no key. The pushdown stays `Inexact`: the residual re-applies the list over
+the full values, so a `key8` collision only adds a block. On spans the reader
+filters a set's rows by the time window alone, and the residual is the `IN`
+list's exact evaluator.
+
+The set is ANDed with the equality arms: an object is dropped when every key
+of the set is absent or when an equality is absent, and the blocks read are
+the union of the set's keys' block sets intersected with every equality's.
+Tier 1 with a set reads the KEY_IDX prefix once and locates every key in its
+bucket directory; a key whose bucket is empty is absent with no read. When the
+set touches at most `B_run` = 64 distinct non-empty buckets
+(`KEY_INDEX_SET_PROBE_MAX_RUNS`), each is one read; above that, one ranged
+read spans the touched buckets from the first one's start to the last one's
+end, and every touched bucket is decoded from it
+(`set_probe_reads_the_bucket_area_above_b_run` on both fetchers). So an
+uncovered object costs the prefix and at most `min(buckets touched, B_run)`
+bucket reads, or the prefix and one read of at most the section's bucket area.
+On spans the set takes the ranged trace read: the probe's union names the
+blocks read, and an object whose KEY_IDX says nothing for the set reads every
+SKIP_IDX candidate of the window, each adjacent run in one GET.
+
+A scan routes through the tier-2 router below only when it carries exactly
+one key arm: one declared-key equality or one `IN` set. A scan with two or
+more arms, an `IN` set beside an equality included, stays on the tier-1
+probe, which intersects their block sets where the router would answer from
+one (`route_needs_exactly_one_key_equality`). On spans a `trace_id =`
+equality governs: a statement carrying both it and a `trace_id IN` list
+routes and reads the one id, since the equality alone already pins the rows.
+`stats.keyIndex.keysProbed` is the routed set's distinct `key8` count, so a
+routed `IN` list of `n` distinct keys reads `n`, and a scan that did not route
+reads 0 (`in_list_rows_equal_the_union_of_equalities` in
+`services/ravel-server/tests/sql_key_in.rs`).
+
 **Tier-2 router (ADR-3692 decisions 1 and 2).** `ravel_query::key_index_route`
 is the one per-part leaf router the spans and logs read paths share. Given a
 snapshot resolved with `Catalog::resolve_pruned_with_parts`, which returns
@@ -5203,16 +5283,18 @@ moves `ravel_catalog_isolation_breach_total`. Leaf reads are charged to the
 with the routes; `stats.keyIndex` above renders them under their exact
 names.
 
-The spans `trace_id =` lookup calls it (ADR-3692 decision 3), and so does a
-logs scan carrying exactly one declared-key equality (decision 4, below). A
-logs scan carrying several, joined by `AND`, stays on the tier-1 probe, which
-intersects their block sets where the router would answer from one
-(`route_needs_exactly_one_key_equality`). The SQL
+The spans `trace_id =` lookup and a spans `trace_id IN` list call it
+(ADR-3692 decisions 3 and 6), and so does a logs scan carrying exactly one
+key arm, one declared-key equality or one `IN` set (decisions 4 and 6,
+below). A logs scan carrying two or more arms, joined by `AND`, stays on the
+tier-1 probe, which intersects their block sets where the router would
+answer from one (`route_needs_exactly_one_key_equality`). The SQL
 executor resolves the window with
 `resolve_pruned_with_parts` (`crates/ravel-sql/src/executor.rs`, the spans
 lane's resolve; without parts when the charge is refused, below) and hands
 the parts to `SpansTableProvider` with the snapshot it pins; the provider
-builds the key set from the trace id's `key8` and routes with
+builds the key set from the trace id's `key8`, or from every id of a
+`trace_id IN` list (`trace_ids_key_set`), and routes with
 `SpanLeafRangeReader`, which reads
 each leaf range through the span fetcher's read path, so leaf bytes share
 the read cache (keyed by the leaf's blake3) and the `keyIndex` phase with
@@ -5254,8 +5336,9 @@ The logs scan routes once per scan, in the plan pass before its per-segment
 loop (ADR-3692 decision 4; `route_segments` in
 `crates/ravel-sql/src/logs_scan/plan.rs`). The SQL executor resolves the
 logs lane with `resolve_pruned_with_parts` as it does the spans lane, and
-`LogsTableProvider` hands the parts to the scan. The key set is the first
-declared-key equality the statement pushed (`log_key_set`), and only the
+`LogsTableProvider` hands the parts to the scan. The key set is the scan's
+one key arm: its declared-key equality (`log_key_set`) or its `IN` set
+(`log_key_in_set`), and only the
 segments whose time range meets the statement's window are routed; the leaf
 ranges are read by `LogLeafRangeReader` through the log fetcher's read path,
 so leaf bytes share the read cache and the `keyIndex` phase with the KEY_IDX

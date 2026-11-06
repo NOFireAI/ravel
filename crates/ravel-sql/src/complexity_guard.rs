@@ -221,12 +221,20 @@
 //!
 //! A long flat `IN` list is not itself a depth risk (`sqlparser` holds it as
 //! a `Vec`; 500,000 elements parse and walk without incident, confirmed by
-//! the same probe), but this guard does not special-case it: the whole point
-//! of the sound-invariant approach is to not depend on a per-construct safety
-//! argument. Every element costs the same two units, one for the value token
-//! and one for the comma, whether the value is quoted or bare, so the list
-//! that fits the bound is the same list either way.
-//!
+//! the same probe), and it is the one construct this guard prices on its own
+//! (ADR-3692, key set amendment). A list whose every element is a literal
+//! ([`flat_literal_list`] states which) costs one unit plus one per
+//! [`IN_LIST_LITERALS_PER_UNIT`] literals, rounded up, so a 1,000-key lookup
+//! costs 17 units instead of about 2,000. The allowance is sound for the same
+//! reason the bound is: the list adds one tree level (the `InList` node)
+//! whatever its length, and each literal under it is a leaf (a signed number
+//! is a leaf under one unary node). Anything else inside the parentheses,
+//! an identifier, an operator, a nested parenthesis or a comment, declines
+//! the allowance and every token is counted as before. A flat list of more
+//! than [`MAX_IN_LIST_LITERALS`] literals is refused outright with
+//! [`IN_LIST_REFUSED`], whose message names the list cap. Every other
+//! token's cost and [`MAX_STATEMENT_COMPLEXITY`] are unchanged.
+
 //! # The guard cannot be skipped by a new entry point
 //!
 //! [`parse_guarded`] is the crate's only parse of caller text: it runs
@@ -279,8 +287,33 @@ pub struct StatementTooComplex {
 /// nothing about what to change.
 pub const REFUSED: usize = usize::MAX;
 
+/// The most literals one flat `IN` list may hold (ADR-3692, key set
+/// amendment). A list over it is refused with [`IN_LIST_REFUSED`].
+pub const MAX_IN_LIST_LITERALS: usize = 4_096;
+
+/// How many literals of a flat `IN` list cost one unit beyond the list's own.
+pub const IN_LIST_LITERALS_PER_UNIT: usize = 64;
+
+/// The sentinel [`StatementTooComplex::count`] carries for a statement with a
+/// flat `IN` list of more than [`MAX_IN_LIST_LITERALS`] literals.
+pub const IN_LIST_REFUSED: usize = usize::MAX - 1;
+
+/// What a flat `IN` list of `literals` literals costs, its parentheses and
+/// commas included: one unit plus one per [`IN_LIST_LITERALS_PER_UNIT`]
+/// literals, rounded up.
+pub fn in_list_units(literals: usize) -> usize {
+    1 + literals.div_ceil(IN_LIST_LITERALS_PER_UNIT)
+}
+
 impl fmt::Display for StatementTooComplex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.count == IN_LIST_REFUSED {
+            return write!(
+                f,
+                "statement has an IN list of more than {MAX_IN_LIST_LITERALS} literals, \
+                 the most one list may hold; split the list"
+            );
+        }
         if self.count == REFUSED {
             return write!(
                 f,
@@ -758,13 +791,116 @@ fn scan(sql: &str, stop_above: usize) -> usize {
                     // the unit already charged above and the scan advances
                     // normally. `run.max(1)` would be wrong: `rest[..1]` can
                     // split a multi-byte character and panic.
-                    skip = rest[..run].chars().count().saturating_sub(1);
+                    let word = &rest[..run];
+                    if word.eq_ignore_ascii_case("in")
+                        && let Some((len, literals)) = flat_literal_list(&rest[run..])
+                    {
+                        if literals > MAX_IN_LIST_LITERALS {
+                            return IN_LIST_REFUSED;
+                        }
+                        count += in_list_units(literals);
+                        if count > stop_above {
+                            return count;
+                        }
+                        // The list is ASCII through its closing `)` except
+                        // inside string literals, so count characters.
+                        skip = rest[..run + len].chars().count() - 1;
+                        continue;
+                    }
+                    skip = word.chars().count().saturating_sub(1);
                 }
             }
         }
     }
 
     count
+}
+
+/// A flat `IN` list at the start of `rest` (after the `IN` keyword): optional
+/// ASCII whitespace, `(`, one or more literals separated by commas, `)`.
+/// Returns the byte length through the `)` and the literal count, or `None`
+/// for anything else, which the caller then counts token by token.
+///
+/// A literal is a bare `'...'` string (a doubled `''` stays inside it), an
+/// `X'...'` hex string of hex digits only, or a number: an optional sign,
+/// digits, and an optional `.` and digits. Each is one token to the
+/// tokenizer (a sign is one more, a unary operator over the number), so the
+/// list is one `Vec` of leaves in the parsed tree whatever its length: it
+/// adds width and no depth. Any other character between the parentheses (a
+/// comment, an identifier, a nested parenthesis, an operator) declines.
+///
+/// Scanning stops one literal past [`MAX_IN_LIST_LITERALS`], since the
+/// caller refuses the statement then; the length is not used.
+fn flat_literal_list(rest: &str) -> Option<(usize, usize)> {
+    let b = rest.as_bytes();
+    let skip_ws = |mut i: usize| {
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    };
+    let mut i = skip_ws(0);
+    if b.get(i) != Some(&b'(') {
+        return None;
+    }
+    i += 1;
+    let mut literals = 0usize;
+    loop {
+        i = literal_end(b, skip_ws(i))?;
+        literals += 1;
+        if literals > MAX_IN_LIST_LITERALS {
+            return Some((i, literals));
+        }
+        i = skip_ws(i);
+        match b.get(i)? {
+            b',' => i += 1,
+            b')' => return Some((i + 1, literals)),
+            _ => return None,
+        }
+    }
+}
+
+/// The byte offset just past the literal starting at `b[i]`, by the rules
+/// [`flat_literal_list`] states, or `None` when no such literal starts there.
+fn literal_end(b: &[u8], i: usize) -> Option<usize> {
+    match *b.get(i)? {
+        b'\'' => {
+            let mut j = i + 1;
+            loop {
+                let close = j + b.get(j..)?.iter().position(|&c| c == b'\'')?;
+                if b.get(close + 1) == Some(&b'\'') {
+                    j = close + 2;
+                } else {
+                    return Some(close + 1);
+                }
+            }
+        }
+        b'X' | b'x' if b.get(i + 1) == Some(&b'\'') => {
+            let mut j = i + 2;
+            while b.get(j).is_some_and(u8::is_ascii_hexdigit) {
+                j += 1;
+            }
+            (b.get(j) == Some(&b'\'')).then_some(j + 1)
+        }
+        _ => {
+            let mut j = i;
+            if matches!(b.get(j), Some(b'-' | b'+')) {
+                j += 1;
+            }
+            let digits = |mut k: usize| {
+                let start = k;
+                while b.get(k).is_some_and(u8::is_ascii_digit) {
+                    k += 1;
+                }
+                (k > start).then_some(k)
+            };
+            j = digits(j)?;
+            if b.get(j) == Some(&b'.') {
+                j = digits(j + 1)?;
+            }
+            Some(j)
+        }
+    }
 }
 
 /// The character immediately before byte offset `at`, or `None` at the start
@@ -1470,6 +1606,98 @@ mod tests {
         assert!(msg.contains(&MAX_STATEMENT_COMPLEXITY.to_string()), "{msg}");
         assert!(!msg.contains("nest"), "{msg}");
         assert!(!msg.contains("depth"), "{msg}");
+    }
+
+    /// `trace_id IN (X'..', ...)` over `n` distinct 16-byte hex literals.
+    fn trace_in_list(n: usize) -> String {
+        let ids: Vec<String> = (0..n).map(|i| format!("X'{i:032x}'")).collect();
+        format!(
+            "SELECT * FROM spans WHERE trace_id IN ({}) AND start_ts > 0",
+            ids.join(", ")
+        )
+    }
+
+    /// A flat literal `IN` list costs one unit plus one per 64 literals: a
+    /// 1,000-key list over hex, string or numeric literals passes the guard
+    /// and parses, and a 4,096-literal list passes at the cap.
+    ///
+    /// Flip to watch it fail: drop the `flat_literal_list` arm from `scan`.
+    /// The 1,000-key list then counts each literal and comma and is refused.
+    #[test]
+    fn a_thousand_literal_in_list_passes_the_guard() {
+        let sql = trace_in_list(1_000);
+        // SELECT * FROM spans WHERE trace_id IN, the list, AND start_ts > 0.
+        assert_eq!(structural_count(&sql), 7 + in_list_units(1_000) + 4);
+        assert_eq!(in_list_units(1_000), 17);
+        parse_guarded(&sql).expect("a 1,000-key lookup parses");
+        let strings: Vec<String> = (0..1_000).map(|i| format!("'u{i}''s'")).collect();
+        check(&format!(
+            "SELECT * FROM logs WHERE user IN ({})",
+            strings.join(",")
+        ))
+        .expect("string literals, doubled quotes included");
+        let numbers: Vec<String> = (0..1_000).map(|i| format!("-{i}.5")).collect();
+        check(&format!(
+            "SELECT * FROM logs WHERE n NOT IN ({})",
+            numbers.join(" , ")
+        ))
+        .expect("signed numbers");
+        assert_eq!(check(&trace_in_list(MAX_IN_LIST_LITERALS)), Ok(()));
+    }
+
+    /// A flat list one literal over the cap is refused with the typed error,
+    /// and its message names the list cap rather than the token bound.
+    #[test]
+    fn a_list_over_the_literal_cap_is_refused_naming_the_cap() {
+        let err = check(&trace_in_list(MAX_IN_LIST_LITERALS + 1)).expect_err("over the cap");
+        assert_eq!(
+            err,
+            StatementTooComplex {
+                count: IN_LIST_REFUSED,
+                max: MAX_STATEMENT_COMPLEXITY,
+            }
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("IN list"), "{msg}");
+        assert!(msg.contains(&MAX_IN_LIST_LITERALS.to_string()), "{msg}");
+        assert!(matches!(
+            parse_guarded(&trace_in_list(MAX_IN_LIST_LITERALS + 1)),
+            Err(GuardedParseError::TooComplex(_))
+        ));
+    }
+
+    /// The allowance is for a flat list of literals only. A deep statement
+    /// with as many tokens as the admitted 1,000-key lookup is still refused,
+    /// and so are lists whose elements are not all literals.
+    ///
+    /// Flip to watch it fail: raise [`MAX_STATEMENT_COMPLEXITY`] to admit
+    /// the 1,000-key list token by token (2,100 would). The operator chain
+    /// below then passes and the first `expect_err` panics.
+    #[test]
+    fn a_deep_statement_of_the_same_token_count_is_still_refused() {
+        // The admitted list as the tokenizer sees it: one literal and one
+        // comma per key, about 2,000 tokens.
+        let tokens = 2 * 1_000 + 12;
+        let chain = format!("SELECT 1{}", "+1".repeat(tokens / 2));
+        assert!(structural_count(&chain) >= tokens);
+        check(&chain).expect_err("an operator chain of the same size is deep");
+        let idents: Vec<String> = (0..1_000).map(|i| format!("c{i}")).collect();
+        check(&format!(
+            "SELECT * FROM logs WHERE n IN ({})",
+            idents.join(", ")
+        ))
+        .expect_err("a list of identifiers is counted token by token");
+        let nested: Vec<String> = (0..1_000).map(|i| format!("({i})")).collect();
+        check(&format!(
+            "SELECT * FROM logs WHERE n IN ({})",
+            nested.join(", ")
+        ))
+        .expect_err("a parenthesized element declines the allowance");
+        let commented = format!(
+            "SELECT * FROM logs WHERE n IN (1 /* x */, {})",
+            vec!["1"; 1_000].join(", ")
+        );
+        check(&commented).expect_err("a comment inside the list declines the allowance");
     }
 
     #[test]
