@@ -830,6 +830,9 @@ pub fn build_session_with_tables(
         .with_config(session)
         .with_runtime_env(runtime)
         .with_default_features()
+        // `trace_id IN ('<32-hex>', ...)` against the native trace id column,
+        // rewritten before `type_coercion`; see `crate::trace_id_planner`.
+        .with_analyzer_rules(crate::trace_id_planner::analyzer_rules())
         .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews))
         // ADR-0850 item 2: answer `COUNT(*) WHERE <declared column> <>
         // <literal>` and `GROUP BY <declared column>, COUNT(*)` from exact
