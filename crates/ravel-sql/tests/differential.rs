@@ -665,7 +665,8 @@ impl Arith {
             Arith::KMinusX => k - x,
             Arith::XTimesK => x * k,
             Arith::XPlusX => x + x,
-            Arith::XMinusX => x - x,
+            // `x - x` written out is clippy's eq_op; the exact answer is 0.
+            Arith::XMinusX => 0,
             Arith::XTimesX => x * x,
         }
     }
