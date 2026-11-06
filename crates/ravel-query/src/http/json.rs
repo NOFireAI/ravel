@@ -98,6 +98,17 @@ pub struct QueryStatsJson {
     pub segments_fetched: u64,
     #[serde(rename = "segmentsPruned")]
     pub segments_pruned: u64,
+    /// Fetched sparse objects the dictionary-first probe dropped on a
+    /// LABEL_DICT miss (ADR-3694 decision 1, issue #3862).
+    #[serde(rename = "segmentsPrunedByDictionary")]
+    pub segments_pruned_by_dictionary: u64,
+    /// Fetched sparse objects whose probe read LABEL_DICT alone first.
+    #[serde(rename = "segmentsProbedTwoStep")]
+    pub segments_probed_two_step: u64,
+    /// True when the statement's first two-step probes pruned too little and
+    /// its remaining objects were probed in one step.
+    #[serde(rename = "dictionaryProbeSwitchedOff")]
+    pub dictionary_probe_switched_off: bool,
     pub accounting: QueryAccountingJson,
     /// The same GETs and bytes `accounting` pools, split across the five
     /// phases of a query's object-store cost (issue #935, ADR-0927 decision 7;
@@ -144,6 +155,9 @@ impl From<crate::QueryStats> for QueryStatsJson {
         QueryStatsJson {
             segments_fetched: stats.segments_fetched,
             segments_pruned: stats.segments_pruned,
+            segments_pruned_by_dictionary: stats.segments_pruned_by_dictionary,
+            segments_probed_two_step: stats.segments_probed_two_step,
+            dictionary_probe_switched_off: stats.dictionary_probe_switched_off,
             accounting: QueryAccountingJson::from_snapshot(&stats.accounting, &stats.page_stats),
             phases: phase_costs(&stats.phase_accounting),
             io: stats.io_shape.into(),
@@ -1454,6 +1468,30 @@ mod tests {
             value.get("estimate").is_some(),
             "estimate must not be removed"
         );
+    }
+
+    /// The dictionary-first probe's three figures render at the top of the
+    /// stats block beside `segmentsPruned`, each from its own field.
+    #[test]
+    fn stats_json_carries_the_dictionary_probe_figures() {
+        let stats = crate::QueryStats {
+            segments_pruned: 2,
+            segments_pruned_by_dictionary: 5,
+            segments_probed_two_step: 7,
+            dictionary_probe_switched_off: true,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(QueryStatsJson::from(stats)).expect("serializes");
+        assert_eq!(value["segmentsPruned"], 2);
+        assert_eq!(value["segmentsPrunedByDictionary"], 5);
+        assert_eq!(value["segmentsProbedTwoStep"], 7);
+        assert_eq!(value["dictionaryProbeSwitchedOff"], true);
+
+        let value =
+            serde_json::to_value(QueryStatsJson::from(crate::QueryStats::default())).expect("json");
+        assert_eq!(value["segmentsPrunedByDictionary"], 0);
+        assert_eq!(value["segmentsProbedTwoStep"], 0);
+        assert_eq!(value["dictionaryProbeSwitchedOff"], false);
     }
 
     #[test]
