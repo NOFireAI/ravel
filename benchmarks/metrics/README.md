@@ -1076,7 +1076,8 @@ version-3 report does not carry. It is diagnostic, not part of the report:
 written and the run is unchanged
 (`the_corpus_runs_against_every_engine_and_validates`). An unwritable path
 exits 74 after the report is already written (the sidecar write is the last
-step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
+step of `metrics_query::finish_run`, which the bin calls once the run
+returns). Its fields
 (`metrics_query::Diagnostics`):
 
 - `profile`, `corpus_digest` and `oracle` name the run it describes
@@ -1091,10 +1092,10 @@ step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
   repetition sent and timed pass; an exact entry shows 0. A repetition
   skipped after a timeout (`skipped_reps` below) is not an answer and counts
   nowhere here
-  (`metricsbench_query::a_timed_out_repetition_ends_its_pass_for_that_engine`). Only answers classified
-  against the oracle are measured, so warmup passes and an entry unsupported
-  on the engine by declaration are not. An answer is aligned when it is a
-  2xx `success` envelope of the oracle's result type with the same label
+  (`metricsbench_query::a_timed_out_repetition_ends_its_pass_for_that_engine`).
+  Only answers classified against the oracle are measured, so warmup passes
+  and an entry unsupported on the engine by declaration are not. An answer
+  is aligned when it is a 2xx `success` envelope of the oracle's result type with the same label
   sets and, series by series, the same number of steps at the same
   timestamps; series pair by label set, steps by position, and a native
   histogram contributes its `count` and `sum`
@@ -1115,10 +1116,10 @@ step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
   `metrics_query::RavelCost`). It is recorded here and never in
   `report.json`. Each object carries `entry`, `pass`, `rep`, `status`,
   `latency_ms`, `accounting` and `phases`. There is one object per timed
-  repetition sent, never summed or pooled across repetitions; a repetition
-  skipped after a timeout has none
-  (`ravel_cost_records_null_on_an_answer_with_no_stats`)
-  (`ravel_cost_records_every_repetitions_accounting_and_phases`); `pass` and
+  repetition sent, never summed or pooled across repetitions
+  (`ravel_cost_records_every_repetitions_accounting_and_phases`); a
+  repetition skipped after a timeout has none
+  (`ravel_cost_records_null_on_an_answer_with_no_stats`); `pass` and
   `rep` count from 1 and warm-up passes add nothing
   (`ravel_cost_skips_warmup_passes_and_counts_from_one`). `latency_ms` is
   that repetition's own elapsed time, the figure its pass median in
@@ -1156,7 +1157,15 @@ step of `run_main` in `src/bin/metricsbench_query.rs`). Its fields
   every engine and entry, the timed repetitions sent plus the records here
   equal `passes` times `reps_per_pass`; when they do not, the run exits 65
   and writes no report (`metrics_query::RunError::RepsUnaccounted`,
-  `unaccounted_repetitions_refuse_the_run`). `report.json` is unchanged by
+  `unaccounted_repetitions_refuse_the_run`). The sidecar is still written on
+  that failure when `--diagnostics` is given, since its records are what
+  explain the mismatch; a file already at `--out` is left untouched, and a
+  sidecar that cannot be written there still exits 65, with both failures
+  in the message
+  (`an_accounting_failure_keeps_the_sidecar_and_writes_no_report`,
+  `an_accounting_failure_leaves_an_existing_report_path_alone`,
+  `an_accounting_failure_with_an_unwritable_sidecar_names_both`).
+  `report.json` is unchanged by
   the skip: a pass's status is its first non-`ok` repetition and a row
   carries latency only when every pass is `ok`, so the repetitions after a
   timeout could not change a row
