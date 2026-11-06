@@ -154,7 +154,7 @@ use crate::ipcrypt_udf::SessionPrincipal;
 use crate::late_materialization::TopKLateMaterialization;
 use crate::like_udf::{LikeScope, LikeToUdf};
 use crate::logs_provider::LogsTableProvider;
-use crate::logs_scan::{ConfirmTopKThreshold, LogsLimitHint};
+use crate::logs_scan::{ConfirmTopKThreshold, LogsLimitHint, LogsPartitionTopK};
 use crate::logs_udf::has_word_udf;
 use crate::map_field_planner::map_field_access_planner;
 use crate::memory::AggregateProfileRule;
@@ -900,6 +900,13 @@ pub fn build_session_with_tables(
     // inserts a TopK, since it must see the final filter-to-scan path. See
     // `crate::logs_scan::LogsLimitHint`.
     builder = builder.with_physical_optimizer_rule(Arc::new(LogsLimitHint));
+    // ADR-0093, exact not-equal amendment: put a per-partition TopK under the
+    // global TopK of a scan that evaluates a row filter, so the global TopK
+    // reads `k` rows per partition instead of every narrowed batch. After
+    // every rule that rebuilds a scan or inserts or confirms a TopK, since it
+    // matches on the scan's confirmed threshold and the final sort shape. See
+    // `crate::logs_scan::LogsPartitionTopK`.
+    builder = builder.with_physical_optimizer_rule(Arc::new(LogsPartitionTopK));
     // Issue #2720: give an aggregate's output slices buffers of their own
     // before a `RepartitionExec` or a sort charges each slice the whole
     // materialized output. Appended after every rule above because each of
