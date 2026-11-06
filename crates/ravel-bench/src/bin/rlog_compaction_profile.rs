@@ -1026,15 +1026,25 @@ mod prof {
             Some(p) if !p.is_empty() => PathBuf::from(p),
             _ => return None,
         };
-        let exe = std::env::current_exe().expect("current exe");
-        let count = ravel_bench::profiling::count_exe_fp_prologues(&exe).unwrap_or_else(|e| {
-            eprintln!("profiling: {e}");
-            std::process::exit(1);
-        });
-        if let Err(e) = ravel_bench::profiling::check_fp_prologue_count(count) {
-            eprintln!("profiling: {e}");
-            std::process::exit(1);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let exe = std::env::current_exe().expect("current exe");
+            let count = ravel_bench::profiling::count_exe_fp_prologues(&exe).unwrap_or_else(|e| {
+                eprintln!("profiling: {e}");
+                std::process::exit(1);
+            });
+            if let Err(e) = ravel_bench::profiling::check_fp_prologue_count(count) {
+                eprintln!("profiling: {e}");
+                std::process::exit(1);
+            }
         }
+        // The prologue scan counts an x86-64 byte sequence; elsewhere it
+        // cannot run, so the profile is taken unverified and says so.
+        #[cfg(not(target_arch = "x86_64"))]
+        eprintln!(
+            "profiling: frame-pointer verification does not run on {}; continuing UNVERIFIED",
+            std::env::consts::ARCH
+        );
         // A sample whose interrupted PC sits in a blocklisted library is
         // dropped, not attributed, so the default blocklist hides CPU spent in
         // libc (memcpy, malloc). SAMPLE_LIBC_ENV=1 samples libc too, at the
