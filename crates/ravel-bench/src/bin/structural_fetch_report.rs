@@ -268,9 +268,13 @@ mod tests {
         );
         assert!(get("structural/bytes") > get("today/plan_bytes"));
         assert!(get("structural/data_ranges") <= get("structural/raw_ranges"));
-        assert_eq!(
-            get("ratio/bytes"),
-            get("structural/bytes") / get("today/bytes")
+        // serde_json's default float parse can land one ulp off the written
+        // value, so a ratio read back from the report is compared relatively.
+        let ratio = get("structural/bytes") / get("today/bytes");
+        assert!(
+            (get("ratio/bytes") - ratio).abs() <= ratio.abs() * 1e-12,
+            "{} against {ratio}",
+            get("ratio/bytes")
         );
         assert!(
             report

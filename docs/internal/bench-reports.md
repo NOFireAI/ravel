@@ -713,8 +713,9 @@ is inferred from the GET totals, not measured.
 The size ratio `sidecar/over_postings` divides by a POSTINGS section built
 for this experiment over every body token, with no cap. Production builds no
 body postings, and its writer caps a POSTINGS section at 10,000 distinct
-terms (`postings_max_distinct`), so no production section of that size
-exists to compare against. Against the BLOOM section production does write
+terms (`postings_max_distinct`), which every object here exceeds
+(`postings/capped_objects` 10 of 10 and 9 of 9), so no production section
+of that size exists to compare against. Against the BLOOM section production does write
 for the body, the sidecar is 11.3x (HDFS) and 5.14x (BGL); against that
 BLOOM section and the experiment's uncapped POSTINGS together, 3.12x and
 1.54x.
