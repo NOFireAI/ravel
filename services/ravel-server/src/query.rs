@@ -4948,7 +4948,8 @@ mod tests {
 
     /// Every configured source ranks above the working-directory default:
     /// `--sql-spill off`, the env pair and `--cache-dir` each resolve as they
-    /// did before it existed and create nothing under the working directory,
+    /// did before it existed, and neither sweeps nor writes the working
+    /// directory (a dead sibling root there survives),
     /// and a bare `RAVEL_SQL_SPILL_MAX_BYTES` with no `--cache-dir` is still
     /// the error naming the missing variable.
     #[test]
@@ -4956,10 +4957,16 @@ mod tests {
         let cwd = tempfile::tempdir().expect("working dir");
         let cache = tempfile::tempdir().expect("cache dir");
         let explicit = cache.path().join("explicit");
+        let orphan = dead_sibling(cwd.path(), "inst-dead");
         let untouched = |label: &str| {
-            assert!(
-                !cwd.path().join("sql-spill").exists(),
-                "{label}: nothing is created under the working directory"
+            let entries: Vec<PathBuf> = std::fs::read_dir(cwd.path().join("sql-spill"))
+                .expect("the working directory's spill root")
+                .map(|entry| entry.expect("entry").path())
+                .collect();
+            assert_eq!(
+                entries,
+                vec![orphan.clone()],
+                "{label}: the working directory is neither swept nor written"
             );
         };
 
