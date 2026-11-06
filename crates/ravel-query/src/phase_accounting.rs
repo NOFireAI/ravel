@@ -45,6 +45,8 @@ use ravel_logseg::decoded_cache::DecodedCacheCounters;
 use ravel_object_store::get_latency::GetPhase;
 use ravel_types::accounting::{AccessIntent, QueryAccounting, QueryAccountingSnapshot};
 
+use crate::fetcher::DictionaryProbeGates;
+
 /// The phases a query's object-store cost is split across (issue #796). See
 /// the [module docs](self) for what each phase covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -288,6 +290,10 @@ pub struct PhaseAccounting {
     /// This attempt's decoded-column cache counters (ADR-3326), shared by
     /// every scan the attempt opens.
     decoded_cache: Arc<DecodedCacheCounters>,
+    /// This attempt's dictionary-first probe gates (issue #3862), one per
+    /// selector plan, shared by every sparse catalog probe the attempt runs.
+    /// Unarmed unless the PromQL engine arms them.
+    dictionary_probe: Arc<DictionaryProbeGates>,
 }
 
 impl PhaseAccounting {
@@ -327,12 +333,18 @@ impl PhaseAccounting {
             key_index: accounting.clone(),
             shared: true,
             decoded_cache: Arc::default(),
+            dictionary_probe: Arc::default(),
         }
     }
 
     /// This attempt's decoded-column cache counters.
     pub fn decoded_cache(&self) -> &Arc<DecodedCacheCounters> {
         &self.decoded_cache
+    }
+
+    /// This attempt's dictionary-first probe gates, one per selector plan.
+    pub(crate) fn dictionary_probe(&self) -> &DictionaryProbeGates {
+        &self.dictionary_probe
     }
 
     /// Set the [`AccessIntent`] on all five phase handles, so every cache read

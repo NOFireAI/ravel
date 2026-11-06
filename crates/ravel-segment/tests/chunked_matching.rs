@@ -9,7 +9,7 @@ use ravel_proto::segment::v1::Footer;
 use ravel_segment::{
     IngestBounds, ReaderLimits, SegmentError, SegmentIdentity, SegmentWriter, SeriesEntryV4,
     SeriesInput, V5_SPARSE_THRESHOLD, V5_STRIDE, decode_catalog_v5_chunked,
-    decode_catalog_v5_chunked_matching, open_from_full,
+    decode_catalog_v5_chunked_matching, label_dict_holds_all, open_from_full,
 };
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
 
@@ -186,9 +186,14 @@ impl Catalog {
         )
     }
 
+    fn holds_all(&self, equals: &[(&str, &str)]) -> Result<bool, SegmentError> {
+        label_dict_holds_all(&self.footer, &self.dict, equals, ReaderLimits::default())
+    }
+
     /// Rewrites `kind`'s footer crc32c to match its (edited) stored bytes.
     fn refix_section_crc(&mut self, kind: u32) {
         let crc = crc32c::crc32c(match kind {
+            LABEL_DICT => &self.dict,
             SERIES_IDX => &self.idx,
             SERIES_META_CHUNKS => &self.chunks,
             _ => panic!("unsupported kind {kind}"),
@@ -199,7 +204,9 @@ impl Catalog {
             .iter_mut()
             .find(|s| s.kind == kind)
             .expect("section present");
-        assert_eq!(s.comp, 0, "kind {kind} must be stored uncompressed");
+        if kind != LABEL_DICT {
+            assert_eq!(s.comp, 0, "kind {kind} must be stored uncompressed");
+        }
         s.crc32c = crc;
     }
 }
@@ -367,4 +374,144 @@ fn present_value_surfaces_a_corrupt_chunk_as_the_unpruned_error() {
         catalog.matching(&[("b", "v0")]),
         Err(SegmentError::SectionCrcMismatch)
     );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(12))]
+
+    /// `label_dict_holds_all` answers `false` exactly when the matching decode
+    /// takes its early return. The catalog's first chunk frame is made
+    /// undecompressable, so the matching decode returns `Ok(empty)` only from
+    /// that early return and a typed error from everything past it. The sets
+    /// mix present pairs, absent names and values, pairs no series holds
+    /// together, and random strings against the unique `inst` values.
+    #[test]
+    fn holds_all_agrees_with_the_matching_decode_early_return(
+        seed in any::<u64>(),
+        extra in 0usize..200,
+        probes in proptest::collection::vec(("[a-z]{1,4}", "[a-z0-9]{1,4}"), 0..6),
+    ) {
+        let n = V5_SPARSE_THRESHOLD as usize + extra;
+        let mut rng = Rng(seed);
+        let labels = series_labels(n, &mut rng);
+        let mut catalog = Catalog::of(&build_sparse(&labels));
+        corrupt_first_frame(&mut catalog);
+
+        let mut sets = matcher_sets(&labels, &mut rng);
+        sets.push(Vec::new());
+        sets.extend(probes.iter().map(|(name, value)| vec![(name.clone(), value.clone())]));
+        sets.extend(probes.iter().map(|(_, value)| vec![("inst".to_string(), value.clone())]));
+        let (mut present, mut absent) = (0usize, 0usize);
+        for set in &sets {
+            let equals = equals_of(set);
+            let holds = catalog.holds_all(&equals).expect("dictionary decode");
+            let matching = catalog.matching(&equals);
+            if holds {
+                present += 1;
+                prop_assert!(
+                    matches!(matching, Err(SegmentError::Decompress(_))),
+                    "pairs {:?}: the decode must read past the dictionary: {:?}",
+                    equals,
+                    matching
+                );
+            } else {
+                absent += 1;
+                prop_assert_eq!(matching, Ok(Vec::new()), "pairs {:?}", equals);
+            }
+        }
+        // The fixed `b="v0"` set and the empty set are always present; an
+        // absent value is drawn for most seeds but not all, so only the
+        // present side is pinned here and the fixed test below pins absence.
+        prop_assert!(present >= 2, "present {} absent {}", present, absent);
+    }
+}
+
+/// A fixed catalog answers both ways, and a pair whose name and value are both
+/// in the dictionary answers `true` though no series holds them together.
+#[test]
+fn holds_all_answers_on_names_and_values() {
+    let catalog = fixture();
+    assert_eq!(catalog.holds_all(&[]), Ok(true));
+    assert_eq!(catalog.holds_all(&[("b", "v0")]), Ok(true));
+    assert_eq!(catalog.holds_all(&[("inst", "i3")]), Ok(true));
+    assert_eq!(catalog.holds_all(&[("zone", "v0")]), Ok(true));
+    assert_eq!(catalog.holds_all(&[("job", "zz_absent")]), Ok(false));
+    assert_eq!(catalog.holds_all(&[("nope_absent", "v0")]), Ok(false));
+    assert_eq!(
+        catalog.holds_all(&[("b", "v0"), ("job", "zz_absent")]),
+        Ok(false)
+    );
+}
+
+/// Corrupt or truncated LABEL_DICT bytes are a typed error, the same one the
+/// full matching decode returns for the same bytes, never a panic or an answer.
+#[test]
+fn holds_all_rejects_a_corrupt_dictionary_with_the_full_decode_error() {
+    let equals = [("b", "v0")];
+    let check = |catalog: &Catalog, expected: SegmentError| {
+        let got = catalog.holds_all(&equals).err();
+        assert_eq!(got.as_ref(), Some(&expected));
+        assert_eq!(catalog.matching(&equals).err(), got);
+    };
+
+    // A flipped byte fails the section crc.
+    let mut catalog = fixture();
+    catalog.dict[0] ^= 0xFF;
+    check(&catalog, SegmentError::SectionCrcMismatch);
+
+    // Truncated stored bytes are out of the footer's bounds.
+    let mut catalog = fixture();
+    catalog.dict.pop();
+    check(&catalog, SegmentError::SectionOutOfBounds);
+    catalog.dict.clear();
+    check(&catalog, SegmentError::SectionOutOfBounds);
+
+    // A zstd frame that does not decompress, with its crc repaired.
+    let mut catalog = fixture();
+    catalog.dict[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+    catalog.refix_section_crc(LABEL_DICT);
+    let got = catalog.holds_all(&equals);
+    assert!(matches!(got, Err(SegmentError::Decompress(_))), "{got:?}");
+    assert_eq!(catalog.matching(&equals).err(), got.err());
+
+    // A footer claiming a different decompressed length.
+    let mut catalog = fixture();
+    let s = dict_section(&mut catalog);
+    let expected = s.uncompressed_len;
+    s.uncompressed_len += 1;
+    let got = catalog.holds_all(&equals);
+    assert!(
+        matches!(
+            got,
+            Err(SegmentError::DecompressedLenMismatch { expected: e, .. }) if e == expected + 1
+        ) || matches!(got, Err(SegmentError::Decompress(_))),
+        "{got:?}"
+    );
+    assert_eq!(catalog.matching(&equals).err(), got.err());
+
+    // A decompressed size above the reader's bound is refused before inflating.
+    let catalog = fixture();
+    let limits = ReaderLimits {
+        max_section_uncompressed_bytes: 16,
+        ..ReaderLimits::default()
+    };
+    let got = label_dict_holds_all(&catalog.footer, &catalog.dict, &equals, limits);
+    assert!(
+        matches!(got, Err(SegmentError::SectionTooLarge { cap: 16, .. })),
+        "{got:?}"
+    );
+
+    // No LABEL_DICT section in the footer at all.
+    let mut catalog = fixture();
+    catalog.footer.sections.retain(|s| s.kind != LABEL_DICT);
+    check(&catalog, SegmentError::MissingSection("LABEL_DICT"));
+}
+
+fn dict_section(catalog: &mut Catalog) -> &mut ravel_proto::segment::v1::Section {
+    catalog
+        .footer
+        .sections
+        .iter_mut()
+        .find(|s| s.kind == LABEL_DICT)
+        .expect("LABEL_DICT present")
 }

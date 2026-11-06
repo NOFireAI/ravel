@@ -964,6 +964,29 @@ pub fn decode_catalog_v5_chunked_matching(
     )
 }
 
+/// Whether the LABEL_DICT section holds every name and every value in
+/// `equals`, decided from that section's stored bytes alone.
+///
+/// The section is crc-verified, decompressed within `limits` and indexed
+/// exactly as [`decode_catalog_v5_chunked_matching`] does before its early
+/// return, and the pairs are resolved by the same lookup, so `false` here is
+/// exactly the case where that decode returns an empty `Vec` without reading
+/// any other section. `true` says only that every string is present, not that
+/// any one series carries the pairs together. Corrupt or truncated bytes
+/// yield the same typed error the full decode returns for them.
+pub fn label_dict_holds_all(
+    footer: &Footer,
+    label_dict_stored: &[u8],
+    equals: &[(&str, &str)],
+    limits: ReaderLimits,
+) -> Result<bool, SegmentError> {
+    let section = find_section(footer, section_kind::LABEL_DICT)
+        .ok_or(SegmentError::MissingSection("LABEL_DICT"))?;
+    let dict_bytes = decode_section_bytes(section, label_dict_stored, limits)?;
+    let dict_index = index_label_dict(&dict_bytes)?;
+    Ok(resolve_equals(&dict_bytes, &dict_index, equals).is_some())
+}
+
 /// The LABEL_DICT ordinal of every name and value in `equals`, or `None` when
 /// any of them is not in the dictionary. Ordinal 0 is checked directly; the
 /// rest are binary-searched when ordinals `1..` are byte-sorted, which is what

@@ -1794,7 +1794,7 @@ pub struct Cli {
     /// unsealed tail a healthy catalog carries plus the time a stalled fold
     /// takes to page an operator, while a runaway query stays bounded. A
     /// deployment whose catalog seals on a different margin gets a budget
-    /// sized for its own tail, with no hand recomputation. That is 343,400 at
+    /// sized for its own tail, with no hand recomputation. That is 385,700 at
     /// the default 4 shards, the 2s flush cadence and the catalog's default
     /// 4,800s seal margin. The old flat 25,000 default was a per-query total
     /// against a per-shard-hour cost, so it rejected the worst legitimate open
