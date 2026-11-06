@@ -575,20 +575,42 @@ Outputs, JSON reports and `--decide` output are in
 `crates/ravel-bench/fixtures/t13/run_2026-11-06/`. Host: x86_64, 16 CPUs,
 32 GB, release build.
 
-Structural arm: **undecided; round 0's NO-GO is withdrawn.** Round 0 decided
-on `ratio/*` at the production gap, where ten targets about 1.1 MB apart sit
-inside the 1,887,437-byte gap and both sides span the targets by
+Structural arm: **NO-GO under the pre-registered rule, at the bar.** Round
+0 decided on `ratio/*` at the production gap, where ten targets about 1.1 MB
+apart sit inside the 1,887,437-byte gap and both sides span the targets by
 construction, so that ratio measures layout and recompression, not the
-structural read. Addendum 1 moves the decision to `gap_64k/ratio/*` on an L1
-segment. The LogHub runs at the new gaps were not made: the fix-round
-executor (aarch64, 4 CPUs, 8 GB) had no network route to Zenodo and no copy
-of either corpus, so no `gap_*` or `l0_64k` figure exists for HDFS or BGL
-and the arm has no decision. `structural_fetch_report --decide` over the
-round 0 reports now refuses them, since they carry no `gap_64k` figure. The
-pre-registered expectation is NO-GO on both subjects, decided by
-`gap_64k/ratio/gets` (predicted 1.64 HDFS, 1.71 BGL: 22 to 23 structural
-data ranges against about 13 today) and `gap_64k/ratio/wall` near 1.0, with
-`gap_64k/ratio/bytes` passing narrowly (0.24, 0.23).
+structural read. Addendum 1 moved the decision to `gap_64k/ratio/*` on an L1
+segment, both sides measured at the same gap with real GETs. The fix-round
+executor had no network route to Zenodo, so the two small-gap LogHub runs
+were made afterwards on another host from the same commit (b515bb8e1, clean
+tree, run stamps in the files): arm64, 15 CPUs, macOS, release build; the
+stamp reads `mem_total_kib=0` because the stamp reads `/proc/meminfo`, which
+macOS lacks. Bytes and GETs follow from the object layout and do not depend
+on the host; wall depends only on the simulated 30 ms per GET. The outputs
+are in `crates/ravel-bench/fixtures/t13/run_2026-11-06-gaps/`, beside round
+0's.
+
+| `gap_64k` figure | hdfs_structural | bgl_structural | Bar |
+|---|---|---|---|
+| ratio/bytes | 0.2473 (480,525 / 1,943,214) | 0.2507 (437,519 / 1,745,071) | at most 0.25 |
+| ratio/gets | 0.958 (23 / 24) | 0.960 (24 / 25) | at most 1.5 |
+| ratio/wall | 0.648 | 0.658 | at most 1 |
+| decision | GO | NO-GO, on bytes by 0.3 % | |
+
+The overall decision is NO-GO, since the rule needs every subject GO. Read
+it as a result at the bar, not a clear miss: the structural read moves about
+0.25x today's bytes at the same number of GETs and about 0.65x the wall
+time, HDFS passing the bytes bar by 1 % and BGL failing it by 0.3 %. The
+pre-registered expectation was NO-GO decided by `gap_64k/ratio/gets`
+(predicted 1.64 and 1.71); that did not hold, because today's side at 64 KiB
+issued 24 and 25 GETs where 14 were predicted (BGL's 25 misses its band's top
+of 24). The sweep shows how much the outcome depends on the gap and the
+subject: at `gap_256k` the bytes ratio is 0.198 on HDFS (a miss against a
+band of 0.25 to 1, under the bar) and 0.504 on BGL; at `gap_1m` it is 1.07
+and 0.89; on an L0 segment at 64 KiB (`l0_64k`, the production bridging cap,
+reported only) it is 0.82 and 0.67. A follow-up that wanted to settle the
+arm would need more subjects and a gap chosen per object, not one more run
+of these two.
 
 The round 0 figures below are the production gap on L0. The ratio rows are
 reported as a layout and recompression ratio and decide nothing. Every
@@ -630,9 +652,9 @@ no GET issued: at 64 KiB the structural plan would move 0.045x (HDFS) and
 `gap_64k/structural/*` figures, and their GET ratio is not a measured
 figure.
 
-The one measured small-gap comparison is the generated 32-block object the
-exact-figure test pins (`pins_the_exact_figures_of_a_generated_object`, not
-a LogHub subject, deciding nothing). At `gap_64k` on L1 today read 14 GETs,
+The generated 32-block object the exact-figure test pins
+(`pins_the_exact_figures_of_a_generated_object`, not a LogHub subject,
+deciding nothing) gives a second small-gap reading. At `gap_64k` on L1 today read 14 GETs,
 3,742,501 bytes; the structural side 13 GETs, 673,618 bytes (262,144 plan,
 6,016 index, 405,458 data): ratio/bytes 0.180, ratio/gets 0.929, GO on that
 object. At the production gap it gives 0.989, the round 0 shape, and
@@ -645,9 +667,9 @@ the production gap, `gap_1m` and `l0_64k`), its decode CPU is far above a
 ranged read's (on the generated object, debug build, about 1,076 ms against
 118 ms), so the modelled structural CPU there is inflated too. That does
 not touch `gap_64k` on the generated object, where today's read is ranged,
-and today's LogHub read at `gap_64k` is predicted ranged
-(`gap_64k/today/data_over_object` band 0.11 to 0.25); a whole-object read
-there misses that band.
+nor the LogHub `gap_64k` reads, which were ranged as predicted:
+`gap_64k/today/data_over_object` 0.151 (HDFS) and 0.134 (BGL), inside their
+bands of 0.12 to 0.25 and 0.11 to 0.24.
 
 Sidecar arm: **NO-GO overall, NO-GO on both subjects.** The rare-token bytes
 bar holds against the bloom-guided route; the size bar fails on both, and the
