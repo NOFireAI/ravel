@@ -513,7 +513,7 @@ impl SegmentCodec for RlogCodec {
         // counts the driver returns are the input count twice over; the
         // compaction-side conservation gate reads `part.sample_count`, not
         // these.
-        let merged = merge_catalogs(
+        let merged = merge_catalogs_with_geometry(
             store,
             config,
             bucket,
@@ -527,6 +527,7 @@ impl SegmentCodec for RlogCodec {
             // part is HEAD-verified after the record PUT instead of repaired from
             // RAM.
             false,
+            GeometryCheck::Refuse,
             &mut |_| Ok(true),
         )
         .await?;
@@ -1210,6 +1211,70 @@ pub(crate) async fn merge_catalogs(
     retain_bytes: bool,
     keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
 ) -> Result<MergeOutput> {
+    merge_catalogs_with_geometry(
+        store,
+        config,
+        bucket,
+        catalogs,
+        input_set_hash,
+        indexed_fields,
+        declared,
+        dry_run,
+        retain_bytes,
+        GeometryCheck::Off,
+        keep,
+    )
+    .await
+}
+
+/// Whether [`merge_catalogs_with_geometry`] refuses a cursor plan whose
+/// predicted decode exceeds [`MAX_CURSOR_DECODE_AMPLIFICATION`] (ADR-3853 D0).
+/// Compaction refuses; the L1 and erasure rewrites keep merging as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeometryCheck {
+    Refuse,
+    Off,
+}
+
+/// The most rows a cursor-mode merge may decode per input record before
+/// compaction refuses the bucket with
+/// [`MaintainError::MergeGeometryUnsupported`] (ADR-3853 D0). A plan under
+/// this ratio (few streams per block, or a hot stream) keeps running cursor
+/// mode.
+pub const MAX_CURSOR_DECODE_AMPLIFICATION: u64 = 16;
+
+/// The ADR-3853 D0 refusal for `plan`, or `None` when the plan is not cursor
+/// mode or its predicted decode is within
+/// [`MAX_CURSOR_DECODE_AMPLIFICATION`] times its input records.
+fn geometry_refusal(plan: &MergePlan, inputs: usize, streams: usize) -> Option<MaintainError> {
+    let limit = plan
+        .input_records
+        .saturating_mul(MAX_CURSOR_DECODE_AMPLIFICATION);
+    (plan.mode == MergeReadMode::Cursor && plan.predicted_decoded_rows > limit).then_some(
+        MaintainError::MergeGeometryUnsupported {
+            inputs,
+            streams,
+            blocks: plan.input_blocks,
+            records: plan.input_records,
+            predicted_decoded_rows: plan.predicted_decoded_rows,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn merge_catalogs_with_geometry(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    catalogs: &[RlogInputCatalog],
+    input_set_hash: &[u8; 32],
+    indexed_fields: Vec<String>,
+    declared: Vec<(String, DeclaredStatType)>,
+    dry_run: bool,
+    retain_bytes: bool,
+    geometry: GeometryCheck,
+    keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
+) -> Result<MergeOutput> {
     // The entry points refuse a bad level before their first store request
     // ([`check_rlog_zstd_level`]); this covers a direct `build_parts` caller.
     let zstd_level = crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
@@ -1321,8 +1386,15 @@ pub(crate) async fn merge_catalogs(
         largest_stream_pass_bytes = plan.estimates.iter().copied().max().unwrap_or(0),
         hot_streams = plan.hot.iter().filter(|h| **h).count(),
         mode = plan.mode.name(),
+        input_records = plan.input_records,
+        predicted_decoded_rows = plan.predicted_decoded_rows,
         "rlog merge read mode (compared = the held raw bytes + pass floor + largest hot-stream cursor charge that decided the mode)"
     );
+    if geometry == GeometryCheck::Refuse
+        && let Some(refusal) = geometry_refusal(&plan, catalogs.len(), stream_ids.len())
+    {
+        return Err(refusal);
+    }
     let mut resident_charges = MergeCharges::new(tracker);
     let resident = match plan.mode {
         MergeReadMode::Resident => Some(
@@ -1437,6 +1509,14 @@ struct MergePlan {
     renew_every_fetches: usize,
     /// Blocks a pass decodes between two claim checkpoints.
     renew_every_blocks: usize,
+    /// Rows the cursor merge would decode: for every stream and every input
+    /// carrying it, the `record_count` of each candidate block, summed. A
+    /// block carrying many streams is decoded once per stream it carries.
+    predicted_decoded_rows: u64,
+    /// Records across every input, the sum of their `record_count`.
+    input_records: u64,
+    /// Blocks across every input.
+    input_blocks: usize,
 }
 
 impl MergePlan {
@@ -1611,6 +1691,7 @@ fn plan_merge(
     let mut d3_fetched = Vec::with_capacity(streams);
     let mut two_g = vec![0u64; catalogs.len()];
     let mut largest_block = 0u64;
+    let mut predicted_decoded_rows = 0u64;
     for stream_id in stream_ids {
         let mut estimate = 0u64;
         let mut carriers: Vec<PendingCursor> = Vec::new();
@@ -1647,6 +1728,9 @@ fn plan_merge(
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             for &b in &blocks {
+                predicted_decoded_rows = predicted_decoded_rows.saturating_add(u64::from(
+                    catalog.pricing.block_rows.get(b).copied().unwrap_or(0),
+                ));
                 let cost = costs.get(b).copied().ok_or_else(|| {
                     MaintainError::Invariant(
                         "stream candidate block index past the input's SKIP_IDX block count"
@@ -1678,6 +1762,12 @@ fn plan_merge(
     }
     let (renew_every_fetches, renew_every_blocks) =
         lease_renewal_spacing(config, largest_group, largest_block);
+    let input_records = catalogs
+        .iter()
+        .fold(0u64, |a, c| a.saturating_add(c.record_count));
+    let input_blocks = catalogs
+        .iter()
+        .fold(0usize, |a, c| a.saturating_add(c.pricing.block_rows.len()));
 
     let cursor_plan = |compared_bytes: u64, estimates: Vec<u64>| MergePlan {
         mode: MergeReadMode::Cursor,
@@ -1692,6 +1782,9 @@ fn plan_merge(
         groups: Vec::new(),
         renew_every_fetches,
         renew_every_blocks,
+        predicted_decoded_rows,
+        input_records,
+        input_blocks,
     };
     // No pass budget can reach the floor under a ceiling below it; the sum
     // logged is the fetch-per-pass one with no hot stream, the smallest any
@@ -1747,6 +1840,9 @@ fn plan_merge(
         },
         renew_every_fetches,
         renew_every_blocks,
+        predicted_decoded_rows,
+        input_records,
+        input_blocks,
     })
 }
 
@@ -13211,6 +13307,152 @@ mod tests {
                 largest(32) + config.rlog_memory_target_bytes(),
                 "the in-flight reservation is the 32 largest groups"
             );
+        }
+
+        /// The ADR-3853 D0 fixture: 40 inputs of 60 streams, one record per
+        /// stream, cut into blocks of `per_block` records. With `per_block`
+        /// 60 every input is one block carrying all 60 streams; with 1 every
+        /// block carries one stream.
+        fn geometry_inputs(per_block: usize) -> Vec<L0Input> {
+            blocked(wide_inputs(40, 60, 1), per_block)
+        }
+
+        /// Compaction records in the fixture bucket.
+        async fn compaction_records(store: &dyn ObjectStoreBackend) -> usize {
+            let b = bucket();
+            let prefix = keys::commit_shard_hour_prefix(
+                &b.tenant_hash,
+                b.signal,
+                b.shard,
+                b.ingest_hour_bucket,
+            )
+            .expect("prefix");
+            list_all(store, &prefix)
+                .await
+                .expect("list")
+                .into_iter()
+                .filter(|m| {
+                    matches!(
+                        keys::partition_bucket_entry(&m.key),
+                        Ok(keys::BucketEntry::CompactionRecord(_))
+                    )
+                })
+                .count()
+        }
+
+        /// A ceiling under every pass floor, so the plan is cursor mode.
+        fn cursor_forced() -> CompactorConfig {
+            with_ceiling(&unkeyed_base(2), Some(0))
+        }
+
+        /// ADR-3853 D0: a cursor plan over 40 inputs whose one block each
+        /// carries all 60 streams predicts 60 streams x 40 inputs x 60 rows =
+        /// 144,000 decoded rows for 2,400 records, a ratio of 60 against the
+        /// limit of 16. Compaction refuses it with the inputs, streams, blocks,
+        /// records and predicted rows, after the catalog reads and before any
+        /// block GET, and publishes nothing.
+        #[tokio::test]
+        async fn a_many_stream_cursor_plan_is_refused_before_any_block_get() {
+            let inputs = geometry_inputs(60);
+            let config = cursor_forced();
+            let store = ProbeStore::new();
+            let keys = seed_inputs(&store, &inputs).await;
+            let (plan, _) = plan_for(&store, &keys, &config).await;
+            assert_eq!(plan.mode, MergeReadMode::Cursor);
+            assert_eq!(plan.input_blocks, 40, "one block per input");
+            assert_eq!(plan.input_records, 2_400);
+            assert_eq!(plan.predicted_decoded_rows, 144_000);
+
+            let refused = crate::compaction_refused_total(crate::CompactionRefusedReason::Geometry);
+            let (outcome, run) = compact_logged(&store, &config).await;
+            assert_eq!(
+                outcome.expect("a refusal is an outcome, not an error"),
+                CompactionOutcome::GeometryUnsupported {
+                    inputs: 40,
+                    streams: 60,
+                    blocks: 40,
+                    records: 2_400,
+                    predicted_decoded_rows: 144_000,
+                }
+            );
+            let mode = run.mode_line();
+            assert!(mode.contains("mode=\"cursor\""), "{mode}");
+            assert!(mode.contains("input_records=2400"), "{mode}");
+            assert!(mode.contains("predicted_decoded_rows=144000"), "{mode}");
+            assert!(run.report.catalog_read.requests > 0, "{:?}", run.report);
+            assert_eq!(run.report.block_read.requests, 0, "{:?}", run.report);
+            assert_eq!(run.report.part_put.requests, 0, "{:?}", run.report);
+            assert!(
+                crate::compaction_refused_total(crate::CompactionRefusedReason::Geometry) > refused,
+                "the geometry counter moved"
+            );
+            assert_eq!(
+                compaction_records(&store).await,
+                0,
+                "no compaction record published"
+            );
+        }
+
+        /// The same 40 inputs and 60 streams with one stream per block: the
+        /// cursor plan predicts 2,400 decoded rows for 2,400 records, under the
+        /// limit, so compaction still runs cursor mode and publishes.
+        #[tokio::test]
+        async fn a_few_streams_per_block_cursor_plan_still_completes() {
+            let inputs = geometry_inputs(1);
+            let config = cursor_forced();
+            let store = ProbeStore::new();
+            let keys = seed_inputs(&store, &inputs).await;
+            let (plan, _) = plan_for(&store, &keys, &config).await;
+            assert_eq!(plan.mode, MergeReadMode::Cursor);
+            assert_eq!(plan.input_records, 2_400);
+            assert_eq!(plan.predicted_decoded_rows, 2_400);
+
+            let (outcome, run) = compact_logged(&store, &config).await;
+            let outcome = outcome.expect("compact");
+            assert!(
+                matches!(outcome, CompactionOutcome::Compacted { .. }),
+                "{outcome:?}"
+            );
+            assert!(
+                run.mode_line().contains("mode=\"cursor\""),
+                "{}",
+                run.mode_line()
+            );
+            assert!(run.report.block_read.requests > 0, "{:?}", run.report);
+            assert_eq!(compaction_records(&store).await, 1, "one record published");
+        }
+
+        /// A claimed compaction refused for its geometry releases its claim:
+        /// a second process claims the same bucket at once, without waiting
+        /// out the lease, and is refused the same way.
+        #[tokio::test]
+        async fn a_geometry_refusal_releases_the_claim() {
+            let inputs = geometry_inputs(60);
+            let store = ProbeStore::new();
+            seed_inputs(&store, &inputs).await;
+            let clock = FixedClock::new(sealed_now_ns());
+            let as_process = |process: u128| CompactorConfig {
+                claim_participant: Some(ClaimParticipant::new(
+                    Uuid::from_u128(process),
+                    Arc::new(clock.clone()) as Arc<dyn Clock>,
+                )),
+                ..cursor_forced()
+            };
+            for process in [7, 8] {
+                let outcome =
+                    crate::compact_bucket_claimed(&store, &clock, &as_process(process), &bucket())
+                        .await
+                        .expect("compact");
+                assert!(
+                    matches!(
+                        outcome,
+                        crate::ClaimedCompaction::Ran(
+                            CompactionOutcome::GeometryUnsupported { .. }
+                        )
+                    ),
+                    "process {process}: {outcome:?}"
+                );
+            }
         }
 
         /// `r` moved to stream `s`, everything else kept.

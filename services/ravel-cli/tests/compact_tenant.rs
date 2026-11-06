@@ -731,6 +731,7 @@ async fn explicit_memory_with_an_empty_store_still_reports_zero_counters() {
             claim_skipped: 0,
             claim_cancelled: 0,
             held_out_of_window: 0,
+            geometry_unsupported: 0,
             parts_written: 0,
         },
         "the zero-count report is unchanged from before issue #1024"
@@ -851,6 +852,7 @@ async fn bucket_concurrency_one_is_todays_sequential_report() {
             claim_skipped: 0,
             claim_cancelled: 0,
             held_out_of_window: 0,
+            geometry_unsupported: 0,
             parts_written: 2,
         },
         "N=1 must report exactly today's sequential outcome"

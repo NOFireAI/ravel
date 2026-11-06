@@ -267,6 +267,26 @@ pub enum MaintainError {
         /// The RLOG output format version PAGE_DIR is mandatory in.
         format_version: u32,
     },
+    /// A cursor-mode merge plan would decode more than
+    /// [`crate::rlog::MAX_CURSOR_DECODE_AMPLIFICATION`] times the bucket's
+    /// record count (ADR-3853 D0). Raised after the catalog phase and before
+    /// the first block GET, so nothing was fetched or written.
+    #[error(
+        "RLOG compaction refused: cursor merge over {inputs} inputs, {streams} streams and {blocks} blocks would decode {predicted_decoded_rows} rows for {records} records (ADR-3853 D0); nothing fetched or published, the L0 inputs stay live"
+    )]
+    MergeGeometryUnsupported {
+        /// Input catalogs in the bucket.
+        inputs: usize,
+        /// Distinct streams across those inputs.
+        streams: usize,
+        /// Blocks across those inputs.
+        blocks: usize,
+        /// Records across those inputs.
+        records: u64,
+        /// Rows the cursor plan would decode: for every stream and every input
+        /// carrying it, the `record_count` of each candidate block, summed.
+        predicted_decoded_rows: u64,
+    },
     #[error("RLOG compaction refused before writing any part: {0}")]
     InvalidRlogZstdLevel(#[from] crate::config::RlogZstdLevelError),
     #[error("compaction invariant breach: {0}")]
