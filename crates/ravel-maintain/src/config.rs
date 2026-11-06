@@ -1519,8 +1519,17 @@ pub const DEFAULT_FOOTER_PROBE_BYTES: u64 = 64 * 1024;
 /// PAGE_DIR, STREAM_DIR, FIELD_DIR and the footer on the logs-benchmark
 /// objects (docs/log-segment-format.md reader protocol).
 pub const DEFAULT_RLOG_FOOTER_PROBE_BYTES: u64 = 128 * 1024;
-/// Default `input_read_concurrency`: 8 input reads in flight at once.
-pub const DEFAULT_INPUT_READ_CONCURRENCY: usize = 8;
+/// Default `input_read_concurrency`: 32 input reads in flight at once
+/// (ADR-3853). Object-store reads are latency-bound: from a GKE node, GCS
+/// moved 16, 72 and 108 MB/s at 8, 32 and 64 reads in flight (#3819).
+///
+/// What it costs in memory: the merge's fetch-per-pass plan reserves the 32
+/// largest input row groups, and the catalog phase holds up to 32 RLOG footer
+/// probes of [`DEFAULT_RLOG_FOOTER_PROBE_BYTES`], 4 MiB. On the #3819 GCS
+/// bucket (hour 498273: 16.7 GiB over 19,177 L0 inputs, each one row group,
+/// 0.94 MB per input on average) the reservation is about 32 x 0.94 MB =
+/// 30 MB, against 7.5 MB at 8.
+pub const DEFAULT_INPUT_READ_CONCURRENCY: usize = 32;
 /// Default `merge_cursor_budget_bytes`: 20 GiB (ADR-0979 decision 4), re-derived
 /// below from the arithmetic `crate::rlog` implements rather than from the ADR's
 /// summary figure.
@@ -2060,13 +2069,15 @@ pub struct CompactorConfig {
     /// inputs otherwise pays one full store round trip per input in sequence,
     /// which dominates the merge on any real object store.
     ///
-    /// This bounds request concurrency only, never resident bytes: a catalog
-    /// is directory metadata (KBs), and the merge itself still streams one
-    /// block at a time per cursor. Values below 1 are treated as 1. Output
-    /// bytes do not depend on it -- inputs are re-sorted into canonical order
-    /// after loading and the merge is a deterministic k-way merge over that
-    /// order -- so raising it can change timing but never content. Default
-    /// [`DEFAULT_INPUT_READ_CONCURRENCY`] (8).
+    /// It bounds requests in flight, and through them some transient bytes:
+    /// one footer probe of [`Self::rlog_footer_probe_bytes`] per catalog load
+    /// in flight, and, when the RLOG merge fetches row groups per pass, the
+    /// `input_read_concurrency` largest input row groups, which the merge plan
+    /// reserves against its resident ceiling. Values below 1 are treated as 1.
+    /// Output bytes do not depend on it -- inputs are re-sorted into canonical
+    /// order after loading and the merge is a deterministic k-way merge over
+    /// that order -- so raising it can change timing but never content.
+    /// Default [`DEFAULT_INPUT_READ_CONCURRENCY`] (32).
     pub input_read_concurrency: usize,
     /// The RLOG merge's per-stream cursor-memory budget (ADR-0979 decision 4).
     /// Unlike the two part-split targets and `input_read_concurrency`, this one
@@ -2593,6 +2604,13 @@ impl RetentionConfig {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Issue #3856: 32 reads in flight by default, the ADR-3853 figure.
+    #[test]
+    fn the_default_input_read_concurrency_is_32() {
+        assert_eq!(DEFAULT_INPUT_READ_CONCURRENCY, 32);
+        assert_eq!(CompactorConfig::default().input_read_concurrency, 32);
+    }
 
     const GIB: u64 = 1024 * 1024 * 1024;
     const MIB: u64 = 1024 * 1024;

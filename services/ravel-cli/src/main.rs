@@ -2371,7 +2371,7 @@ enum MaintainCommand {
         /// Number of per-input reads a compaction keeps in flight at once (the
         /// commit-record GET and catalog load per input). Raise it to hide store
         /// round-trip latency on a many-input bucket; it never changes output
-        /// bytes. Default 8 (the compactor default); values below 1 act as 1.
+        /// bytes. Default 32 (the compactor default); values below 1 act as 1.
         #[arg(long, value_name = "N")]
         input_read_concurrency: Option<usize>,
         /// Number of buckets to compact CONCURRENTLY. Buckets are independent by
