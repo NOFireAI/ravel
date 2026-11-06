@@ -294,8 +294,9 @@ use ravel_logseg::record::{
 };
 use ravel_logseg::skip_index::SkipIndex;
 use ravel_logseg::{
-    AttrValue, BloomScope, FieldType, LogRecord, LogStreamId, RlogConfig, RlogRangeReader,
-    RlogWriter, StreamBlockLoc, StreamBlockRows, decode_section, stream_attr_pairs,
+    AttrValue, BloomScope, FieldType, LogRecord, LogStreamId, PageChoice, RlogConfig,
+    RlogRangeReader, RlogWriter, StreamBlockLoc, StreamBlockRows, decode_section,
+    stream_attr_pairs,
     writer::{ObjectIdentity, WriteStats},
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend};
@@ -1022,12 +1023,19 @@ impl OutputClustering {
     }
 }
 
+/// The page choice every L1 part is written with (ADR-3492 decision 1 as
+/// amended by issue #3878): one candidate sealed per page rather than every
+/// one, for fewer encode CPU seconds at a small byte cost. Ingest and the bulk
+/// loader keep their own choice.
+pub(crate) const L1_PAGE_CHOICE: PageChoice = PageChoice::Estimated;
+
 /// How every part of one merge is encoded: the configured zstd level
-/// (ADR-2135 decision 4) and the clustering and bloom scope the merge derived
-/// from its inputs (decisions 2 and 5).
+/// (ADR-2135 decision 4), the page choice, and the clustering and bloom scope
+/// the merge derived from its inputs (decisions 2 and 5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PartWriterSettings {
     zstd_level: i32,
+    page_choice: PageChoice,
     sort_descriptor: Option<SortDescriptor>,
     clustering_generation: u64,
     bloom_scope: BloomScope,
@@ -1252,6 +1260,7 @@ pub(crate) async fn merge_catalogs(
     };
     let writer = Arc::new(PartWriterSettings {
         zstd_level,
+        page_choice: L1_PAGE_CHOICE,
         sort_descriptor: clustering.sort_descriptor.clone(),
         clustering_generation: clustering.clustering_generation,
         bloom_scope,
@@ -3019,8 +3028,9 @@ impl PartBuilder {
 
     /// Build a fresh writer over `records`. The writer configuration is the L0
     /// write path's `RlogConfig::default()` except for the zstd level, which is
-    /// the compaction level (ADR-2135 decision 4), and the writer sorts the part
-    /// by the merge's output descriptor and limits BLOOM to its bloom scope.
+    /// the compaction level (ADR-2135 decision 4), and the page choice, which
+    /// is [`L1_PAGE_CHOICE`]; the writer sorts the part by the merge's output
+    /// descriptor and limits BLOOM to its bloom scope.
     fn build_writer(
         identity: &ObjectIdentity,
         indexed_fields: &[String],
@@ -3030,6 +3040,7 @@ impl PartBuilder {
     ) -> Result<RlogWriter> {
         let cfg = RlogConfig {
             zstd_level: writer.zstd_level,
+            page_choice: writer.page_choice,
             ..RlogConfig::default()
         };
         let mut w = RlogWriter::new(cfg, *identity)
@@ -7185,19 +7196,19 @@ mod tests {
     /// `PROBE_MIN_STEP_BYTES / r`), plus the crossing probe itself -- which is
     /// `r * ln(d0 / PROBE_MIN_STEP_BYTES) + r` for large `r`.
     ///
-    /// This fixture measures `r` = 7.23 (`ratio` below, printed by the run, at
-    /// the compactor's default zstd level 9), so `d0` = 14_118, the ladder is
-    /// `ln(14118 / 4096) / ln(7.23 / 6.23)` = 8.3 probes, the floor tail is 7.2,
-    /// and with the crossing probe that is 16.5 per part. 10 of the 11 parts
-    /// close on the target (165 probes) and the trailing part runs its own
-    /// partial ladder without ever closing (its proxy passes the target, its
-    /// records run out), which with the per-part spread around the model
-    /// accounts for the remaining 32 of the 197 pinned below. At zstd level 3
-    /// the same fixture measured `r` = 7.26 and ran 195 probes over the same 11
-    /// parts.
+    /// This fixture measures `r` = 7.26 (`ratio` below, printed by the run, at
+    /// the compactor's default zstd level 3 and page choice), so `d0` = 14_127,
+    /// the ladder is `ln(14127 / 4096) / ln(7.26 / 6.26)` = 8.4 probes, the
+    /// floor tail is 7.3, and with the crossing probe that is 16.6 per part. 10
+    /// of the 11 parts close on the target (166 probes) and the trailing part
+    /// runs its own partial ladder without ever closing (its proxy passes the
+    /// target, its records run out), which with the per-part spread around the
+    /// model accounts for the remaining 29 of the 195 pinned below. At zstd
+    /// level 9 with Exhaustive page choice the same fixture measured `r` = 7.23
+    /// and ran 197 probes over the same 11 parts.
     /// The model treats `r` as constant along a part and ignores that a
-    /// floored step overshoots. Applied to all 11 parts it gives 16.5 * 11 =
-    /// 181.5 probes, and the 197 pinned is 8.5% above that: that is the
+    /// floored step overshoots. Applied to all 11 parts it gives 16.6 * 11 =
+    /// 182.8 probes, and the 195 pinned is 6.7% above that: that is the
     /// agreement this fixture shows. A change that made probing linear in the
     /// deficit, or per-record, would miss it by an order of magnitude. The part
     /// count is pinned too, since the model's figure scales with it.
@@ -7302,16 +7313,17 @@ mod tests {
         );
         // The probe cost, pinned exactly (the corpus is deterministic) and cross
         // checked against the geometric model in the doc comment above:
-        // r = 7.23, d0 = STORED_TARGET * (1 - 1/r) = 14_118, ladder
-        // ln(14118/4096) / ln(7.23/6.23) = 8.3, floor tail r = 7.2, crossing
-        // probe 1, so 16.5 per part; 10 closing parts = 165, plus the trailing
-        // part's partial ladder and the per-part spread around the model = 197
-        // pinned, 8.5% above the model's 181.5 for all 11 parts.
+        // r = 7.26, d0 = STORED_TARGET * (1 - 1/r) = 14_127, ladder
+        // ln(14127/4096) / ln(7.26/6.26) = 8.4, floor tail r = 7.3, crossing
+        // probe 1, so 16.6 per part; 10 closing parts = 166, plus the trailing
+        // part's partial ladder and the per-part spread around the model = 195
+        // pinned, 6.7% above the model's 182.8 for all 11 parts. Re-pinned
+        // from 197 (r = 7.23) for issue 3878's zstd 3 and Estimated parts.
         assert_eq!(
             tracker.probes_run(),
-            197,
+            195,
             "the exact-encode probe count for this fixture is deterministic; the \
-             geometric model predicts about 16.5 probes per part for r={ratio:.2} \
+             geometric model predicts about 16.6 probes per part for r={ratio:.2} \
              over {} parts",
             parts.len()
         );
@@ -7389,6 +7401,7 @@ mod tests {
         let identity = compactor_identity(&bucket(), &config);
         let writer_config = RlogConfig {
             zstd_level: config.rlog_zstd_level,
+            page_choice: L1_PAGE_CHOICE,
             ..RlogConfig::default()
         };
         let mut w = RlogWriter::new(writer_config, identity);
@@ -7520,9 +7533,11 @@ mod tests {
         // 40 closing parts = 120, plus the first part's longer ladder across the
         // compressible prefix (r = 1/pre_rate = 70 there) and the per-part spread
         // = 124 pinned, 0.8% above the model's 3.0 * 41 = 123 for the 41 parts
-        // this run writes. At zstd level 3 the run closed 39 parts of 40 and ran 123;
-        // at level 9 the incompressible suffix encodes a few bytes larger, so it
-        // closes one part more.
+        // this run writes. At zstd level 3 with Exhaustive page choice the run
+        // closed 39 parts of 40 and ran 123; at level 9 with Exhaustive the
+        // incompressible suffix encodes a few bytes larger, so it closes one part
+        // more, and the default level 3 with Estimated (issue 3878) runs the same
+        // 124 over 41 parts.
         assert_eq!(
             tracker.probes_run(),
             124,
@@ -7668,18 +7683,18 @@ mod tests {
             parts.len(),
             tracker.probes_run()
         );
-        // Deterministic corpus, so the probe count is pinned here too: r = 7.23
+        // Deterministic corpus, so the probe count is pinned here too: r = 7.26
         // as in `stored_target_closes_parts_on_actual_encoded_object_bytes`
-        // (same `ratio_record` fixture), 16.5 probes per part by the geometric
+        // (same `ratio_record` fixture), 16.6 probes per part by the geometric
         // model, 5 closing parts = 83 plus the trailing part's partial ladder and
-        // the per-part spread around the model = 92 (91 at zstd level 3, over
-        // the same 6 parts), 7.1% below the model's 16.5 * 6 = 99 for all 6
-        // parts. Under the rate-model scheduler that test names it ran 16 at
-        // level 3.
+        // the per-part spread around the model = 91, 8.7% below the model's
+        // 16.6 * 6 = 99.7 for all 6 parts. Re-pinned from 92 (zstd 9,
+        // Exhaustive) for issue 3878. Under the rate-model scheduler that test
+        // names it ran 16 at level 3.
         assert_eq!(
             tracker.probes_run(),
-            92,
-            "the probe count is deterministic for this corpus: 16.5 per part by \
+            91,
+            "the probe count is deterministic for this corpus: 16.6 per part by \
              the geometric model over the {} closing parts",
             parts.len() - 1
         );
@@ -8855,6 +8870,7 @@ mod tests {
         let identity = compactor_identity(&bucket(), &config);
         let writer_config = RlogConfig {
             zstd_level: config.rlog_zstd_level,
+            page_choice: L1_PAGE_CHOICE,
             ..RlogConfig::default()
         };
         let mut writer = RlogWriter::new(writer_config, identity)
@@ -9025,12 +9041,12 @@ mod tests {
     /// crate.
     ///
     /// The compactor's zstd level moved from the writer's 3 to 9 (ADR-2135
-    /// decision 4). That changes every part's bytes and none of its records, so
-    /// the lineage above is kept by running the fixture twice: at level 3 the
-    /// six constants it already carried must still come out, which proves the
-    /// clustered merge order left this unkeyed corpus's sequence and part
-    /// boundaries untouched, and at the default level a second vector, captured
-    /// from that run with the part count still six, pins the shipped bytes.
+    /// decision 4) and back to 3 with Estimated page choice (issue 3878). At
+    /// level 3 the six constants the lineage above carried still come out under
+    /// Estimated: no page in these parts picks a different encoding under it.
+    /// So the default level's run must print them too, and a run at level 9
+    /// pins the second vector, captured when 9 was the default, as the
+    /// flag-override bytes, with the part count still six.
     ///
     /// The stored-target geometry #872 introduced is pinned separately, by
     /// [`stored_target_closes_parts_on_actual_encoded_object_bytes`] (band plus
@@ -9052,8 +9068,8 @@ mod tests {
             "3c7e526ed44b8abd9a3f515e787d3c209c112c707ce8aa95b780a7eacda3b9ad",
             "9188988b0ae472ca36e143e46bb9a45f25b815d986e2b8c55408c1625db44c70",
         ];
-        /// The same parts at the compactor's default zstd level.
-        const DEFAULT_LEVEL_PART_HASHES: &[&str] = &[
+        /// The same parts at zstd level 9, the default before issue 3878.
+        const LEVEL_9_PART_HASHES: &[&str] = &[
             "32973629b90cc0aa0b5d97018f1f5c4880c701129c0877bcc66dda261d41b846",
             "951d64f566a4ecf1ad02e5e438bf8b2fb1645f821074188e07f0e1b107bbd332",
             "21bc3e20c7e67bf90aab05ed5d269b8c3968538f4e82041803fb771186989b16",
@@ -9073,9 +9089,16 @@ mod tests {
         );
         let (hashes, rows) = differential_hash_run(crate::config::DEFAULT_RLOG_ZSTD_LEVEL).await;
         assert_eq!(rows, EXPECTED_ROWS);
+        // Issue 3878: the default level is 3 again, so its run is the level-3 pin.
         assert_eq!(
-            hashes, DEFAULT_LEVEL_PART_HASHES,
+            hashes, LEVEL_3_PART_HASHES,
             "part content_hash vector diverged at the default zstd level"
+        );
+        let (hashes, rows) = differential_hash_run(9).await;
+        assert_eq!(rows, EXPECTED_ROWS);
+        assert_eq!(
+            hashes, LEVEL_9_PART_HASHES,
+            "part content_hash vector diverged at zstd level 9"
         );
     }
 
@@ -12534,6 +12557,167 @@ mod tests {
                 assert!(
                     output == oracle,
                     "{name}: parts differ from the cursor merge"
+                );
+            }
+        }
+
+        /// Records of [`page_choice_inputs`] in merged order: position `n` of
+        /// 18 000 carries `u` = the `n % 6000`-th 16-hex-digit noise value.
+        /// Every 8192-record L1 block then holds more distinct `u` values than
+        /// half its rows, so Estimated seals a plain page, while Exhaustive
+        /// finds the row-group dictionary smaller.
+        fn page_choice_records() -> Vec<LogRecord> {
+            (0..18_000i64)
+                .map(|n| {
+                    record(
+                        0,
+                        1_000 + n,
+                        &format!("line {n}"),
+                        vec![(
+                            "u".to_string(),
+                            AttrValue::Str(noise((n % 6000) as u64, 16)),
+                        )],
+                    )
+                })
+                .collect()
+        }
+
+        /// [`page_choice_records`] dealt round-robin over three unkeyed inputs.
+        fn page_choice_inputs() -> Vec<L0Input> {
+            let records = page_choice_records();
+            (0..3usize)
+                .map(|i| L0Input {
+                    records: records.iter().skip(i).step_by(3).cloned().collect(),
+                    cfg: RlogConfig::default(),
+                    clustering: None,
+                })
+                .collect()
+        }
+
+        /// The `u` column's pages of `object`, in row-group order, each with
+        /// its stored bytes.
+        fn u_pages(object: &[u8]) -> Vec<(ravel_logseg::page::PageDesc, Vec<u8>)> {
+            let reader = RlogReader::new(object, &RlogConfig::default()).expect("reader");
+            let dirs = reader.directories();
+            let column = dirs
+                .field_dir()
+                .column("u", FieldType::Str)
+                .expect("u column")
+                .column_id;
+            let blocks = footer::open(object)
+                .expect("footer")
+                .section(kind::BLOCKS)
+                .expect("BLOCKS")
+                .offset;
+            let mut out = Vec::new();
+            for group in &dirs.page_dir().groups {
+                for chunk in group.chunks.iter().filter(|c| c.column_id == column) {
+                    let offsets = chunk.page_offsets().expect("page offsets");
+                    for (page, at) in chunk.pages.iter().zip(offsets) {
+                        let start = (blocks + at) as usize;
+                        let stored = object[start..start + page.len as usize].to_vec();
+                        out.push((page.desc(column), stored));
+                    }
+                }
+            }
+            out
+        }
+
+        fn encodings(object: &[u8]) -> Vec<ravel_logseg::encoding::Enc> {
+            u_pages(object).iter().map(|(desc, _)| desc.enc).collect()
+        }
+
+        /// The one part a writer at zstd level 3 and `page_choice` stores for
+        /// [`page_choice_records`].
+        fn page_choice_reference(page_choice: PageChoice) -> Vec<u8> {
+            let config = CompactorConfig::default();
+            let cfg = RlogConfig {
+                zstd_level: 3,
+                page_choice,
+                ..RlogConfig::default()
+            };
+            let mut w = RlogWriter::new(cfg, compactor_identity(&bucket(), &config));
+            for r in page_choice_records() {
+                w.push(r).expect("push");
+            }
+            w.finish_compacted(1, vec![0u8; 32], 0).expect("encode")
+        }
+
+        /// Issue 3878: on every L1 merge path (resident, fetch-per-pass and
+        /// cursor reads) the compactor writes its part at zstd level 3 with
+        /// Estimated page choice. The fixture is one where the two choices
+        /// disagree on the `u` column (Exhaustive picks the row-group
+        /// dictionary, Estimated plain pages), and the part's `u` pages carry
+        /// Estimated's encodings. Every compressed page of the part re-seals
+        /// to its stored bytes at level 3, and at least one would not at
+        /// level 9.
+        #[tokio::test]
+        async fn l1_parts_use_estimated_page_choice_and_zstd_3() {
+            use ravel_logseg::encoding::Enc;
+            use ravel_logseg::page::{COMP_ZSTD, DEFAULT_MAX_UNCOMP, read_page, seal_page};
+
+            let exhaustive = encodings(&page_choice_reference(PageChoice::Exhaustive));
+            let estimated = encodings(&page_choice_reference(PageChoice::Estimated));
+            assert!(
+                exhaustive.contains(&Enc::DictPage),
+                "the fixture must make Exhaustive pick the row-group dictionary: {exhaustive:?}"
+            );
+            assert!(
+                !estimated.is_empty() && estimated.iter().all(|e| *e == Enc::Plain),
+                "the fixture must make Estimated pick plain pages: {estimated:?}"
+            );
+
+            let inputs = page_choice_inputs();
+            let base = CompactorConfig {
+                input_read_concurrency: 1,
+                ..CompactorConfig::default()
+            };
+            let store = ProbeStore::new();
+            let keys = seed_inputs(&store, &inputs).await;
+            let (_, fetch_tight) = tight_ceilings(&store, &keys, &base).await;
+            for (name, ceiling, mode) in [
+                ("resident", None, MergeReadMode::Resident),
+                (
+                    "fetch per pass",
+                    Some(fetch_tight),
+                    MergeReadMode::FetchPerPass,
+                ),
+                ("cursor", Some(0), MergeReadMode::Cursor),
+            ] {
+                let config = with_ceiling(&base, ceiling);
+                let (plan, _) = plan_for(&store, &keys, &config).await;
+                assert_eq!(plan.mode, mode, "{name}");
+                let (output, _, _, _) = compact_fresh(&inputs, &config).await;
+                assert_eq!(output.parts.len(), 1, "{name}: one part");
+                let part = &output.parts[0];
+                assert_eq!(decode_all(part).len(), 18_000, "{name}: every record");
+                assert_eq!(
+                    encodings(part),
+                    estimated,
+                    "{name}: the u pages carry Estimated's encodings"
+                );
+
+                let mut zstd_pages = 0;
+                let mut level_9_differs = 0;
+                for (desc, stored) in u_pages(part) {
+                    if desc.comp != COMP_ZSTD {
+                        continue;
+                    }
+                    zstd_pages += 1;
+                    let decoded = read_page(&stored, &desc, DEFAULT_MAX_UNCOMP).expect("page");
+                    assert_eq!(
+                        seal_page(desc.enc, decoded.clone(), 3).stored,
+                        stored,
+                        "{name}: a u page was not sealed at zstd level 3"
+                    );
+                    if seal_page(desc.enc, decoded, 9).stored != stored {
+                        level_9_differs += 1;
+                    }
+                }
+                assert!(zstd_pages > 0, "{name}: no compressed u page");
+                assert!(
+                    level_9_differs > 0,
+                    "{name}: level 9 seals every u page identically, so the check proves nothing"
                 );
             }
         }

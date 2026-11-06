@@ -239,10 +239,12 @@ What the codebase already guarantees, which bounds the change:
    level stays writer configuration, as it already is; what changes is that
    each writing path gets its own default and an operator surface: ingest
    (default 3, a server flag), compaction and erasure rewrite (default 9, a
-   maintain flag), and the bulk loader (a `--zstd-level` flag, default 3).
+   maintain flag; now 3, see the compaction level 3 amendment), and the bulk
+   loader (a `--zstd-level` flag, default 3).
    Readers are indifferent to the level. (The logs ingest flush now chooses
    by estimate instead; see the estimated page choice amendment at the end of
-   this ADR.)
+   this ADR. Compaction and erasure rewrite do too, per the compaction level 3
+   amendment.)
 
 5. **BLOOM records what it covers, and filters are sized exactly.** A tenant
    chooses a bloom scope: `all` (default, today's behaviour), `undeclared`
@@ -687,7 +689,9 @@ the target and at a quarter of it.
 Decision 4 had every writing path encode and seal every candidate encoding,
 keeping the smallest stored result. ADR-3492 decision 1 narrows that to the
 writers that keep objects: compaction, erasure rewrite and the bulk loader
-keep this decision's exhaustive choice, unchanged.
+keep this decision's exhaustive choice, unchanged. (Compaction and erasure
+rewrite have since moved to `Estimated`; see the compaction level 3
+amendment below.)
 
 The logs ingest flush uses an `Estimated` mode instead. Each page's encoding
 is chosen from statistics of its values: the smallest computed raw size for
@@ -697,6 +701,36 @@ page's values alone, so a given input still yields the same bytes.
 
 Every encoding it can choose is one this decision already lists, so objects
 stay valid RLOG v5 for today's readers, and no format version changes.
-Compaction rewrites ingest objects with the exhaustive choice. The measured
+Compaction rewrites ingest objects with the exhaustive choice (no longer
+true; see the compaction level 3 amendment below). The measured
 reason is in ADR-3492: a CPU profile of the ingest path at saturation put
 `write_block` at 27 to 31% of all CPU and compression itself at 3 to 4%.
+
+## Amendment (2026-11-06): compaction writes at zstd level 3 with estimated page choice (issue #3878)
+
+<!-- amendment-applies: sections="Decision|Amendment (2026-10-30): the logs ingest flush chooses page encodings by estimate (ADR-3492)" pointer="compaction level 3 amendment" -->
+<!-- amendment-supersedes: phrase="Compaction rewrites ingest objects with the exhaustive choice" pointer="compaction level 3 amendment" -->
+
+Decision 4 gave compaction and the erasure rewrite a default zstd level of 9
+and kept the exhaustive page choice for them. Both change.
+`DEFAULT_RLOG_ZSTD_LEVEL` is 3, and every L1 merge path (resident,
+fetch-per-pass and cursor) and the erasure rewrite choose page encodings
+with `Estimated` (ADR-3492 decision 1). The level stays an operator flag:
+`--maintain-compaction-zstd-level` on the server and
+`--compaction-zstd-level` on the CLI still set it, and a run at 9 seals
+its pages at level 9. Ingest and the bulk loader keep their current page
+choice.
+
+The measured reason is in #3853 comment 6670968041, on a
+synthetic logs-benchmark hour of 230 inputs and 2.74M records. Writing parts
+is about 80% of merge CPU there. zstd 3 cut merge wall time from 173 s to
+131 s (-24%) for 1.8% more L1 bytes, and `Estimated` cut encode-thread CPU
+from 144 s to 102 s (-29%) for 0.6% more bytes.
+
+The accepted cost: the -7.1% page bytes level 9 bought on this ADR's wide
+typed tenant (Context) is given up, and the logs-benchmark shape stores
+about 1.8% more at L1 from the level. Readers are unaffected: every
+encoding `Estimated` picks is one decision 4 already lists, and a reader
+decodes any level the same way, so no format version changes and L1
+objects already written keep the level and encodings they were written
+with.
