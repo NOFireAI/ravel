@@ -196,6 +196,7 @@ fn spill_config(spill_dir: PathBuf, scratch_bytes: u64, query_bytes: usize) -> S
         }),
         segment_timing: false,
         aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
+        checked_integer_arithmetic: false,
     }
 }
 
@@ -849,6 +850,7 @@ fn parallel_config(spill: Option<SpillConfig>) -> SqlConfig {
         spill,
         segment_timing: false,
         aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
+        checked_integer_arithmetic: false,
     }
 }
 
@@ -1007,6 +1009,7 @@ async fn spill_off_reproduces_todays_refusal() {
         spill: None,
         segment_timing: false,
         aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
+        checked_integer_arithmetic: false,
     };
     assert_eq!(config.spill, None, "this case is the spill-off default");
 

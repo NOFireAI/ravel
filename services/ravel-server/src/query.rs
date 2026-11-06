@@ -1382,6 +1382,8 @@ fn build_sql_state_inner(
         // metric registrations.
         segment_timing: SqlConfig::default().segment_timing,
         aggregate_reserve_ahead: SqlConfig::default().aggregate_reserve_ahead,
+        // Issue #3847: a spike with no flag yet; off, as the default.
+        checked_integer_arithmetic: SqlConfig::default().checked_integer_arithmetic,
     }
     .with_spill_resolved(
         spill.off,
