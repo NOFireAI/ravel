@@ -538,8 +538,9 @@ multiplies the term. The stream estimate term is there because a run's part
 cut can split one stream across two of that run's blocks. Group size under
 2, short scratch headroom, a scratch directory another process holds and a
 level 2 that does not fit are each refused by name, as a terminal outcome
-the scan memo does not retry in this process; the pass goes on to the
-buckets that do not need two levels.
+the scan memo does not retry in this process (see the per-worker budget amendment
+below for a headroom refusal caused only by other merges' reservations);
+the pass goes on to the buckets that do not need two levels.
 Only a bucket the D0 check refuses takes this route; a fetch-per-pass or
 resident plan stays single-level with `scratch_dir` set.
 The emitted sequence, and so
@@ -571,11 +572,14 @@ With no `scratch_dir`, the merge and the D0 refusal are unchanged.
 
 <!-- amendment-applies: sections="4. RLOG compaction: a real memory bound" pointer="per-worker budget amendment" -->
 <!-- amendment-supersedes: phrase="Level 1 runs one group" pointer="per-worker budget amendment" -->
+<!-- amendment-supersedes: phrase="as a terminal outcome the scan memo does not retry" pointer="per-worker budget amendment" -->
 
 A two-level merge's level 1 now runs `W1` workers at once (ADR-3853 D4 and
 its #3873 amendment). `W1` is the largest count at or under the unit's core
 share whose groups and predicted run parts fit both of ADR-3853's
-constraints, or the `level1_workers` setting when one is given. Decision 4's
+constraints, or the `level1_workers` setting when one is given; when no
+count fits, the unit is refused before level 1 reads a block. Each worker
+is its own task, so the workers' merges run on separate threads. Decision 4's
 bound then holds per worker: each merges its groups under its own copy of
 the unit's config, with `merge_cursor_budget_bytes / W1` as its cursor
 budget and `C = U / W1` as its resident ceiling, and charges its own
@@ -592,3 +596,11 @@ worker returns stops the others before their next group or run-part PUT;
 the unit then ends as one merge would, `Cancelled` with its publish
 `Abandoned` for a lost claim, the error otherwise, and its scratch runs
 removed either way.
+
+A scratch headroom refusal is no longer always terminal for the process. A
+unit refused only because the process's other two-level merges hold their
+reservations in the scratch directory (the free bytes alone would admit it)
+is not held by the scan memo, and the next tick evaluates the bucket again,
+once those merges may have ended. A volume short on its own stays terminal,
+as does a scratch write out of space. A free figure that cannot be read is
+the error `ScratchFreeUnreadable`, never zero free.
