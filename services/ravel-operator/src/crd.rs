@@ -1004,6 +1004,45 @@ pub struct MaintainSpec {
     /// to the Secret rolls the maintain pods.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_secret_ref: Option<LocalSecretRef>,
+
+    /// Local scratch space for the two-level RLOG merge (ADR-3853 D2). When
+    /// set, the maintain pods get an `emptyDir` volume named `scratch` with a
+    /// `sizeLimit` of `sizeGi` GiB mounted at `mountPath`, an
+    /// `ephemeral-storage` request of the same size, and
+    /// `--maintain-scratch-dir <mountPath>`. Omit to render none of these.
+    /// The directory is a cache only: ravel-server wipes it at start and
+    /// publishes nothing from it, so losing the volume loses no data. Size it
+    /// to about 1.3 times the largest merge unit's input bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<MaintainScratchSpec>,
+}
+
+/// Scratch volume for the maintain tier (ADR-3853 D2).
+///
+/// The directory is a cache only: ravel-server wipes it at start and when
+/// each merge unit ends, never publishes what it writes there, and a lost
+/// volume costs only a restart of the unit from object storage. Size it to
+/// about 1.3 times the input bytes of the largest merge unit; a unit whose
+/// need exceeds the free space is refused, not run in another mode.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintainScratchSpec {
+    /// Volume size in GiB: the `emptyDir` `sizeLimit` and the container's
+    /// `ephemeral-storage` request. About 1.3 times the largest merge unit's
+    /// input bytes. Minimum 1.
+    pub size_gi: u32,
+
+    /// Where the volume is mounted in the maintain container, and the value
+    /// of `--maintain-scratch-dir`. Defaults to `/var/lib/ravel/scratch`.
+    #[serde(default = "default_maintain_scratch_mount_path")]
+    pub mount_path: String,
+}
+
+/// Default `spec.maintain.scratch.mountPath`.
+pub const MAINTAIN_SCRATCH_DEFAULT_MOUNT_PATH: &str = "/var/lib/ravel/scratch";
+
+fn default_maintain_scratch_mount_path() -> String {
+    MAINTAIN_SCRATCH_DEFAULT_MOUNT_PATH.to_string()
 }
 
 impl Default for MaintainSpec {
@@ -1016,6 +1055,7 @@ impl Default for MaintainSpec {
             resources: None,
             credentials_secret_ref: None,
             key_secret_ref: None,
+            scratch: None,
         }
     }
 }
@@ -1363,8 +1403,8 @@ fn inject_shards_immutability(crd: &mut CustomResourceDefinition) {
 /// must be positive: `spec.shards`, `spec.gateway.replicas`,
 /// `spec.query.replicas`, `spec.maintain.replicas`,
 /// `spec.gateway.maxInflightFlushes`,
-/// `spec.gateway.maxInflightFlushesPerTenant`, `spec.maintain.intervalSecs`, and
-/// `spec.maintain.fold.intervalSecs`.
+/// `spec.gateway.maxInflightFlushesPerTenant`, `spec.maintain.intervalSecs`,
+/// `spec.maintain.fold.intervalSecs`, and `spec.maintain.scratch.sizeGi`.
 ///
 /// Without this, `shards: 0` or a negative replica count passes CRD validation
 /// and only fails much later as a confusing Deployment-apply error or a
@@ -1455,6 +1495,14 @@ fn inject_minimum_bounds(crd: &mut CustomResourceDefinition) {
                 .and_then(|p| p.get_mut("intervalSecs"))
             {
                 fold_interval.minimum = Some(1.0);
+            }
+            // A zero-size emptyDir leaves the merge no scratch space at all.
+            if let Some(size) = maintain_props
+                .get_mut("scratch")
+                .and_then(|f| f.properties.as_mut())
+                .and_then(|p| p.get_mut("sizeGi"))
+            {
+                size.minimum = Some(1.0);
             }
         }
     }
