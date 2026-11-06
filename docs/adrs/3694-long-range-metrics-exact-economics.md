@@ -97,7 +97,8 @@ measurement and is decided conditionally (decision 6).
 - **The probe fetches four catalog ranges in one GET.** At or above 4,096
   series an object's LABEL_DICT, SERIES_IDS, SERIES_IDX and
   SERIES_META_CHUNKS are coalesced into one request
-  (`crates/ravel-query/src/fetcher.rs:2180-2258`, `max_runs = 1`), about
+  (`decode_sparse_catalog` in `crates/ravel-query/src/fetcher.rs`,
+  `max_runs = 1`), about
   530 KB per object on the cardinality tenant, of which SERIES_IDS is
   16 B x 23,600 series, about 378 KB. The decoder already returns empty
   after reading LABEL_DICT alone when an equality value is absent
@@ -208,8 +209,8 @@ flowchart LR
 
 ### 1. The unfolded probe reads the dictionary first, and stops on a miss
 
-For an object the sparse probe qualifies (`sparse_probe_qualifies`,
-`fetcher.rs:2144-2163`), the probe becomes two steps. Step one GETs the
+For an object the sparse probe qualifies (`sparse_probe_qualifies` in
+`crates/ravel-query/src/fetcher.rs`), the probe becomes two steps. Step one GETs the
 LABEL_DICT range alone and decodes it. When any equality matcher's value
 (including `__name__`) is absent from the dictionary, the object holds no
 matching series, the segment is dropped, and `segmentsPrunedByDictionary`
@@ -233,7 +234,8 @@ catalog is the size of a dictionary.
 - Reads stay inside ADR-1170: each step reserves its own bytes and holds
   them only while decoding.
 
-The probe gate amendment below gates this per statement.
+The probe gate amendment below gates this per selector plan within each
+statement.
 
 ### 2. The fold builds a label-value index for metrics parts, in the `.kidx` leaf
 
@@ -544,20 +546,41 @@ already applied, or a low-cardinality value every object holds (R6's
 `mb_fanout_total_rate`, the `full_range` statements,
 `mb_selective_job_rate_sum`), step one prunes nothing and the extra GET is
 pure cost: about 2,900 GETs on a statement that issues 5,786 today. The
-two-step probe is therefore gated per statement:
+two-step probe is therefore gated within each statement, one gate per
+selector plan:
 
-- A statement whose only positive equality matchers are `__name__` values,
-  and whose snapshot the name postings already pruned, runs the one-step
-  probe.
-- Every other qualifying statement starts two-step. After its first `K`
-  two-step probes complete, `K` being the statement's PromQL fetch fan-out,
-  if fewer than half dropped their object, its remaining objects use the
-  one-step probe. Both probes decode the same catalog exactly; only the
-  request count differs.
+- The name-only rule is per segment. When a statement's only positive
+  equality matchers are `__name__` values, a segment the name postings
+  filtered (a sealed segment from a snapshot whose postings pruned at
+  least one segment) runs the one-step probe, since its dictionary holds
+  the name. Every other segment of that statement, a recent unsealed one
+  included, goes through its plan's gate
+  (`name_only_statement_gates_the_segments_the_postings_did_not_filter` in
+  `crates/ravel-query/tests/dictionary_probe.rs`).
+- Every other qualifying segment starts two-step under the gate of its
+  selector plan (a distinct matcher set), so a selective plan and a
+  non-selective plan in one statement decide apart
+  (`each_selector_plan_switches_its_own_gate`). A gate decides on the
+  first `K` of its plan's two-step probes to complete, `K` being the
+  statement's PromQL fetch fan-out: if fewer than half dropped their
+  object, the plan's later objects use the one-step probe. Before the
+  decision the cap is on probes in flight, at most `K` at once, so up to
+  `2K - 1` can start: `K - 1` completed and `K` running when the `K`-th
+  completes (`dictionary_probe_gate_decides_on_the_first_k_probes` in
+  `crates/ravel-query/src/fetcher.rs`). Both probes decode the same
+  catalog exactly; only the request count differs.
 - `segmentsProbedTwoStep` and `dictionaryProbeSwitchedOff` are reported
-  beside `segmentsPrunedByDictionary`.
-- A statement's extra GETs over the one-step probe are bounded by `K` plus
-  the probes in flight when the switch fires, at most twice the fan-out.
+  beside `segmentsPrunedByDictionary`. `segmentsProbedTwoStep` counts the
+  objects that paid the dictionary GET, so an object whose LABEL_DICT the
+  footer tail already held is not in it
+  (`a_held_dictionary_is_not_counted_as_probed_two_step`);
+  `dictionaryProbeSwitchedOff` is true when any plan's gate switched off.
+- When a plan's gate switches off, its extra GETs over the one-step probe
+  are the two-step probes started before the decision, at most `2K - 1`,
+  under twice the fan-out. When at least half of its first `K` two-step
+  probes dropped, the gate stays on: every later holder pays one extra
+  GET, and the drops pay for them, each dropped object reading its
+  LABEL_DICT alone instead of its whole catalog.
 
 Acceptance rows 4 and 12 read "no GET increase" and "any extra GET" as
 more than twice the PromQL fetch fan-out extra GETs per statement the

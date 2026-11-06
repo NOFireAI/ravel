@@ -83,11 +83,16 @@ pub struct QueryStats {
     /// counts the objects opened, not the objects that yielded series.
     pub segments_pruned_by_dictionary: u64,
     /// Fetched sparse objects whose probe read LABEL_DICT alone before the
-    /// rest of the catalog.
+    /// rest of the catalog, paying one GET a one-step probe would not. An
+    /// object whose LABEL_DICT the footer tail already held is checked with
+    /// no GET and is not counted here, though a miss on it still counts in
+    /// `segments_pruned_by_dictionary` (`a_held_dictionary_is_not_counted_as_probed_two_step`).
     pub segments_probed_two_step: u64,
-    /// True when the statement's first two-step probes (as many as its PromQL
-    /// fetch fan-out) dropped fewer than half their objects, so its remaining
-    /// objects were probed in one step.
+    /// True when at least one selector plan's gate switched off: the first
+    /// two-step probes of that plan to complete (as many as the PromQL fetch
+    /// fan-out) dropped fewer than half their objects, so that plan's later
+    /// objects were probed in one step. Each plan has its own gate
+    /// (`each_selector_plan_switches_its_own_gate`).
     pub dictionary_probe_switched_off: bool,
     /// Page-fetch counters summed across every segment this query opened
     /// (`FetchStats`), no longer discarded at the

@@ -22,9 +22,9 @@
 //! (the case decision 2's proof covers, since the proof never spends the 3/2
 //! retry allowance) and the per-shard allowance recomputed at this fixture's
 //! per-flush cost. The shipped term sizes every flush at
-//! `BUDGETED_REQUESTS_PER_UNSEALED_FLUSH` = 8, the ceiling above the
+//! `BUDGETED_REQUESTS_PER_UNSEALED_FLUSH` = 9, the ceiling above the
 //! whole-object threshold; these flushes are one sample each, so they cost the
-//! measured `REQUESTS_PER_UNSEALED_FLUSH` = 2 and a budget sized at 8 would
+//! measured `REQUESTS_PER_UNSEALED_FLUSH` = 2 and a budget sized at 9 would
 //! never refuse this fixture at all (ADR-1306, "Acceptance figures for tasks 3
 //! to 7"). Decision 2's proof is parametric in that cost, so substituting it is
 //! the scaling, not a weakening.

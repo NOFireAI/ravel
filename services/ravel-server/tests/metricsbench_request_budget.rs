@@ -160,8 +160,9 @@ fn stated_request_budget_is_the_derivation_of_the_stated_command() {
     let readme = read(README_FILE);
     let stated = check(&compose, &readme).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(
-        stated, 1_358_600,
-        "the count ADR-0927's flush-setting amendment restated for 4 shards and 500ms"
+        stated, 1_527_800,
+        "the count ADR-0927's flush-setting amendment restated for 4 shards and 500ms, \
+         at ADR-1306's dictionary GET amendment's 9 requests per flush"
     );
 }
 
@@ -171,13 +172,13 @@ fn a_count_left_behind_by_a_cadence_or_shard_change_is_refused() {
     let readme = read(README_FILE);
 
     // The 2 s figure kept after the flush delay moved to 500 ms.
-    let old_count = mutate(&compose, "      - \"1358600\"", "      - \"343400\"");
+    let old_count = mutate(&compose, "      - \"1527800\"", "      - \"385700\"");
     let old_readme = mutate(
         &readme,
-        &format!("{README_ROW_PREFIX}1358600`"),
-        &format!("{README_ROW_PREFIX}343400`"),
+        &format!("{README_ROW_PREFIX}1527800`"),
+        &format!("{README_ROW_PREFIX}385700`"),
     );
-    let err = check(&old_count, &old_readme).expect_err("343400 at 500ms must be refused");
+    let err = check(&old_count, &old_readme).expect_err("385700 at 500ms must be refused");
     assert!(err.contains("derives"), "{err}");
 
     // The flush delay moved and the count left alone.
