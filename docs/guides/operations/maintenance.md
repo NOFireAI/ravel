@@ -44,13 +44,16 @@ maintains in addition to every tenant named by `--tenant-token` or
 requires it. Those tenants are known only after a request arrives, and
 maintenance has no other way to learn about them.
 
-Four flags size how much work one tick does and how quickly a stuck unit is
-visible:
+These flags size how much work one tick does, where the two-level log merge
+writes its level-1 runs, and how quickly a stuck unit is visible:
 
 | Flag | Default | What to change it for |
 |---|---|---|
 | `--maintain-interval-secs` | `300` | How often each tenant's tick runs. `0` is refused at startup. |
 | `--maintain-unit-concurrency` | `4` | How many owned units this process maintains at once within one tenant's tick, so one pathological unit cannot starve the rest. Raise it on a process that owns many units and has spare request concurrency to spend, lower it on a host shared with other work. It is clamped to at least 1, and `0` degrades to a sequential walk rather than deadlocking. |
+| `--maintain-scratch-dir` | unset | The local directory the two-level RLOG merge writes its level-1 runs under. Set it to compact a log bucket whose cursor merge would decode more than 16 rows per input record; without it that bucket is refused and counted under `ravel_maintain_compaction_refused_total{reason="geometry"}`. The directory is a cache: each unit's runs are wiped when the unit ends and nothing durable is read from it, so an `emptyDir` serves. Give each process its own directory, because the first two-level merge locks `ravel-scratch.lock` in it for the life of the process; a second process refuses the bucket under `reason="scratch_locked"`. Size it at about 1.3 times the stored input bytes of the largest bucket it merges: a unit is admitted only when that much is free, and is otherwise refused under `reason="scratch_headroom"`. |
+| `--maintain-scratch-max-bytes` | unset | A cap on the bytes the scratch directory may hold, for a directory on a volume larger than its share, such as an `emptyDir` with a size limit on the node's root disk. A unit is admitted against the smaller of the volume's free bytes and this cap less the bytes already under the directory. `0`, or the flag without `--maintain-scratch-dir`, is refused at startup. |
+| `--maintain-level1-workers` | derived | How many level-1 groups of one two-level merge run at once, each under its share of the unit's memory ceiling. Omitted, it is derived per bucket from the unit's share of the usable cores and the largest count whose groups still fit. `0`, or the flag without `--maintain-scratch-dir`, is refused at startup. |
 | `--maintain-stalled-after-intervals` | `3` | Consecutive failed ticks a unit must accrue, with no intervening success, before it counts as stalled. Lower it to be paged sooner on a flaky unit at the cost of noise from transient faults; raise it to tolerate a noisier store at the cost of a slower page. A single success resets that unit's counter. |
 | `--maintain-interior-reverify` | `6h` | The slow safety-net cadence for hours that are neither at the head nor the tail of the keyspace this tick. An interior bucket's memoized state is re-verified no less often than this, and the sweeper runs a full-keyspace pass on the same cadence instead of its per-tick head-and-tail pass. Head and tail hours are unaffected and are evaluated every tick. Zero disables the safety net, which makes every interior bucket always due. |
 

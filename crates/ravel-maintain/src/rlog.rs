@@ -1786,12 +1786,11 @@ fn statvfs_free(
 /// An entry a concurrent unit wipe removes mid-walk counts as gone; any other
 /// failure is [`MaintainError::ScratchFreeUnreadable`].
 fn scratch_used_bytes(dir: &std::path::Path) -> Result<u64> {
-    let unreadable = |at: &std::path::Path, e: std::io::Error| {
-        MaintainError::ScratchFreeUnreadable {
+    let unreadable =
+        |at: &std::path::Path, e: std::io::Error| MaintainError::ScratchFreeUnreadable {
             path: dir.to_path_buf(),
             error: format!("walk {}: {e}", at.display()),
-        }
-    };
+        };
     let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
     let mut used = 0u64;
     let mut pending = vec![dir.to_path_buf()];
@@ -2310,7 +2309,8 @@ async fn two_level_merge(
         lock_scratch_dir(&scratch_dir)
     })
     .await?;
-    let reservation = ScratchReservation::admit(target.scratch_dir, config.scratch_max_bytes, need).await?;
+    let reservation =
+        ScratchReservation::admit(target.scratch_dir, config.scratch_max_bytes, need).await?;
     let free = reservation.free;
 
     let unit = ScratchUnit::open(target.scratch_dir, target.input_set_hash, reservation).await?;

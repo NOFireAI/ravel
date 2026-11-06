@@ -17312,7 +17312,11 @@ mod tests {
     fn maintain_scratch_flags_reach_the_compactor_config() {
         let unset = compactor(&[]).expect("resolve");
         assert_eq!(
-            (unset.scratch_dir, unset.scratch_max_bytes, unset.level1_workers),
+            (
+                unset.scratch_dir,
+                unset.scratch_max_bytes,
+                unset.level1_workers
+            ),
             (None, None, None)
         );
 
