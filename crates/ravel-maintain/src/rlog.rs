@@ -1777,9 +1777,64 @@ fn statvfs_free(
     };
     let stat = stat.map_err(|e| MaintainError::ScratchFreeUnreadable {
         path: path.to_path_buf(),
-        error: e.to_string(),
+        error: format!("statvfs: {e}"),
     })?;
     Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+/// The bytes of every file under `dir`, at any depth, symlinks not followed.
+/// An entry a concurrent unit wipe removes mid-walk counts as gone; any other
+/// failure is [`MaintainError::ScratchFreeUnreadable`].
+fn scratch_used_bytes(dir: &std::path::Path) -> Result<u64> {
+    let unreadable = |at: &std::path::Path, e: std::io::Error| {
+        MaintainError::ScratchFreeUnreadable {
+            path: dir.to_path_buf(),
+            error: format!("walk {}: {e}", at.display()),
+        }
+    };
+    let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let mut used = 0u64;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let entries = match std::fs::read_dir(&next) {
+            Ok(entries) => entries,
+            Err(e) if gone(&e) && next != dir => continue,
+            Err(e) => return Err(unreadable(&next, e)),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if gone(&e) => continue,
+                Err(e) => return Err(unreadable(&next, e)),
+            };
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(e) if gone(&e) => continue,
+                Err(e) => return Err(unreadable(&entry.path(), e)),
+            };
+            if meta.is_dir() {
+                pending.push(entry.path());
+            } else {
+                used = used.saturating_add(meta.len());
+            }
+        }
+    }
+    Ok(used)
+}
+
+/// The free figure the headroom admission reads for `dir` (ADR-3853 D2): the
+/// filesystem's free bytes, and under a `max_bytes` cap the smaller of those
+/// and the cap less the bytes already under `dir`.
+fn scratch_headroom_free(
+    dir: &std::path::Path,
+    max_bytes: Option<u64>,
+    free_override: Option<std::result::Result<u64, i32>>,
+) -> Result<u64> {
+    let free = statvfs_free(dir, free_override)?;
+    let Some(max_bytes) = max_bytes else {
+        return Ok(free);
+    };
+    Ok(free.min(max_bytes.saturating_sub(scratch_used_bytes(dir)?)))
 }
 
 /// Run the blocking scratch filesystem call `job` on tokio's blocking pool, so
@@ -1796,12 +1851,12 @@ where
         .map_err(|e| MaintainError::Invariant(format!("scratch filesystem task: {e}")))?
 }
 
-/// Bytes an unprivileged writer may still use on the filesystem holding
-/// `path` (ADR-3853 D2): `f_bavail * f_frsize`.
-async fn scratch_free_bytes(path: &std::path::Path) -> Result<u64> {
+/// Bytes the scratch directory `path` may still take (ADR-3853 D2):
+/// [`scratch_headroom_free`] under `max_bytes`.
+async fn scratch_free_bytes(path: &std::path::Path, max_bytes: Option<u64>) -> Result<u64> {
     let free_override = scratch_free_override();
     let path = path.to_path_buf();
-    scratch_blocking(move || statvfs_free(&path, free_override)).await
+    scratch_blocking(move || scratch_headroom_free(&path, max_bytes, free_override)).await
 }
 
 /// The lock file inside a scratch directory. Its name never matches
@@ -1909,19 +1964,23 @@ struct ScratchReservation {
 
 impl ScratchReservation {
     /// Admit a unit needing `need` bytes of `scratch_dir` (ADR-3853 D2) when
-    /// the filesystem's free bytes less what this process's running units
-    /// there hold reserved cover it; otherwise
+    /// its free figure ([`scratch_headroom_free`] under `max_bytes`) less what
+    /// this process's running units there hold reserved covers it; otherwise
     /// [`MaintainError::ScratchHeadroom`]. The free figure is read under the
     /// reservation lock, so two admissions never count the same bytes; the
     /// read and the update run together on the blocking pool.
-    async fn admit(scratch_dir: &std::path::Path, need: u64) -> Result<Self> {
+    async fn admit(
+        scratch_dir: &std::path::Path,
+        max_bytes: Option<u64>,
+        need: u64,
+    ) -> Result<Self> {
         let free_override = scratch_free_override();
         let dir = scratch_dir.to_path_buf();
         scratch_blocking(move || {
             let mut reserved = SCRATCH_RESERVED
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let free = statvfs_free(&dir, free_override)?;
+            let free = scratch_headroom_free(&dir, max_bytes, free_override)?;
             let held = reserved.get(&dir).copied().unwrap_or(0);
             if free.saturating_sub(held) < need {
                 return Err(MaintainError::ScratchHeadroom {
@@ -2251,7 +2310,7 @@ async fn two_level_merge(
         lock_scratch_dir(&scratch_dir)
     })
     .await?;
-    let reservation = ScratchReservation::admit(target.scratch_dir, need).await?;
+    let reservation = ScratchReservation::admit(target.scratch_dir, config.scratch_max_bytes, need).await?;
     let free = reservation.free;
 
     let unit = ScratchUnit::open(target.scratch_dir, target.input_set_hash, reservation).await?;
@@ -2277,7 +2336,7 @@ async fn two_level_merge(
     // still hold their space.
     let merged = match merged {
         Err(err) if meter.full.load(std::sync::atomic::Ordering::Relaxed) => {
-            scratch_full_refusal(target.scratch_dir, need, err).await
+            scratch_full_refusal(target.scratch_dir, config.scratch_max_bytes, need, err).await
         }
         other => other,
     };
@@ -2290,10 +2349,11 @@ async fn two_level_merge(
 /// [`MaintainError::ScratchFreeUnreadable`] when the free figure cannot be read.
 async fn scratch_full_refusal(
     scratch_dir: &std::path::Path,
+    max_bytes: Option<u64>,
     need: u64,
     err: MaintainError,
 ) -> Result<MergeOutput> {
-    let free = match scratch_free_bytes(scratch_dir).await {
+    let free = match scratch_free_bytes(scratch_dir, max_bytes).await {
         Ok(free) => free,
         Err(free_error) => {
             tracing::warn!(
@@ -16345,6 +16405,66 @@ mod tests {
             assert!(scratch_entries(&dir).is_empty());
         }
 
+        /// `dir` with `bytes` already in a nested file the lock-time orphan
+        /// sweep leaves alone.
+        fn scratch_with_stray(name: &str, bytes: usize) -> std::path::PathBuf {
+            let dir = fresh_scratch(name);
+            std::fs::create_dir_all(dir.join("keep")).expect("stray dir");
+            std::fs::write(dir.join("keep").join("stray.bin"), vec![0u8; bytes])
+                .expect("stray file");
+            dir
+        }
+
+        /// ADR-3853 D2: with free space stubbed large, a `scratch_max_bytes`
+        /// cap less the bytes already under the directory one short of the
+        /// unit's need refuses it with ScratchHeadroom, the free figure being
+        /// the cap less those bytes, before any block GET.
+        #[tokio::test]
+        async fn a_scratch_max_bytes_cap_refuses_a_unit_that_would_overflow_the_volume() {
+            let stray = 1000u64;
+            let dir = scratch_with_stray("cap-refuse", stray as usize);
+            let (mut config, need) = two_level_scratch_config(&dir).await;
+            config.scratch_max_bytes = Some(need - 1 + stray);
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(Some(Ok(u64::MAX / 2))));
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(None));
+            match outcome {
+                Ok(CompactionOutcome::ScratchHeadroom {
+                    need: n,
+                    free,
+                    reserved,
+                    path,
+                }) => {
+                    assert_eq!((n, free, path), (need, need - 1, dir.clone()));
+                    assert_eq!(reserved, 0);
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(run.report.block_read.requests, 0, "{:?}", run.report);
+            assert_eq!(compaction_records(&store).await, 0);
+            assert_eq!(scratch_entries(&dir), vec![dir.join("keep")]);
+        }
+
+        /// ADR-3853 D2: a cap that covers the need on top of the bytes already
+        /// under the directory admits the unit, which publishes.
+        #[tokio::test]
+        async fn a_scratch_max_bytes_cap_that_covers_the_need_admits_the_unit() {
+            let stray = 1000u64;
+            let dir = scratch_with_stray("cap-admit", stray as usize);
+            let (mut config, need) = two_level_scratch_config(&dir).await;
+            config.scratch_max_bytes = Some(need + stray);
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(Some(Ok(u64::MAX / 2))));
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(None));
+            assert!(
+                matches!(outcome, Ok(CompactionOutcome::Compacted { .. })),
+                "{outcome:?}"
+            );
+            assert!(run.report.level1_groups > 0, "{:?}", run.report);
+            assert_eq!(compaction_records(&store).await, 1);
+            assert_eq!(scratch_entries(&dir), vec![dir.join("keep")]);
+        }
+
         /// A [`MemoryStore`] whose first non-claim PUT once `armed` never
         /// completes, after raising `stalled`.
         struct StallStore {
@@ -16750,7 +16870,7 @@ mod tests {
             SCRATCH_FREE_OVERRIDE.with(|o| o.set(None));
             match outcome {
                 Err(MaintainError::ScratchFreeUnreadable { path, error }) => {
-                    assert_eq!((path, error), (dir.clone(), eio.to_string()));
+                    assert_eq!((path, error), (dir.clone(), format!("statvfs: {eio}")));
                 }
                 other => panic!("{other:?}"),
             }
@@ -16791,7 +16911,7 @@ mod tests {
             SCRATCH_FREE_OVERRIDE.with(|o| o.set(None));
             match outcome {
                 Err(MaintainError::ScratchFreeUnreadable { path, error }) => {
-                    assert_eq!((path, error), (dir.clone(), eio.to_string()));
+                    assert_eq!((path, error), (dir.clone(), format!("statvfs: {eio}")));
                 }
                 other => panic!("{other:?}"),
             }
