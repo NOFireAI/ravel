@@ -761,6 +761,85 @@ async fn get_section(
     Ok(got?.data)
 }
 
+/// A store wrapper that records the length of every suffix GET, for tests
+/// that pin the footer probe size a catalog load requests.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) mod probe_recorder {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{
+        Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
+        ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
+    };
+
+    #[derive(Default)]
+    pub(crate) struct SuffixRecordingStore {
+        inner: MemoryStore,
+        suffixes: Mutex<Vec<u64>>,
+    }
+
+    impl SuffixRecordingStore {
+        /// The requested length of every suffix GET, in issue order.
+        pub(crate) fn suffix_lengths(&self) -> Vec<u64> {
+            self.suffixes.lock().expect("lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for SuffixRecordingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            if let GetRange::Suffix(n) = range {
+                self.suffixes.lock().expect("lock").push(n);
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -1032,5 +1111,60 @@ mod tests {
             2,
             "the per-page counting hook fired once per page issued"
         );
+    }
+
+    /// The RSEG catalog load slices no section from its footer probe, so it
+    /// keeps the shared 64 KiB probe rather than the larger RLOG one.
+    #[tokio::test]
+    async fn rseg_catalog_probe_uses_the_shared_64_kib_default() {
+        let tenant = TenantId::new(TENANT);
+        let series = (0..2)
+            .map(|i| {
+                let metric = format!("m{i}");
+                let labels = LabelSet::new(vec![Label {
+                    name: METRIC_NAME_LABEL.to_string(),
+                    value: metric.clone(),
+                }])
+                .expect("valid labels");
+                SeriesInput {
+                    series_id: SeriesId::compute(&tenant, &metric, &labels).expect("series id"),
+                    labels,
+                    samples: vec![Sample {
+                        ts_ns: i + 1,
+                        value: i as f64,
+                    }],
+                }
+            })
+            .collect();
+        let identity = SegmentIdentity {
+            tenant_hash: tenant.hash().0,
+            shard: 3,
+            writer_id: uuid::Uuid::from_u128(1).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 1,
+            max_ingest_ts_ns: 1,
+        };
+        let bytes = SegmentWriter::write(series, identity, bounds)
+            .expect("write object")
+            .bytes;
+        let store = probe_recorder::SuffixRecordingStore::default();
+        store
+            .put(
+                "l0/rseg-probe",
+                bytes,
+                ravel_object_store::PutOptions::default(),
+            )
+            .await
+            .expect("put");
+
+        let config = CompactorConfig::default();
+        let catalog = load_catalog_from_object(&store, &config, "l0/rseg-probe".into(), 1, 1, 1)
+            .await
+            .expect("load catalog");
+        assert_eq!(catalog.series.len(), 2);
+        assert_eq!(store.suffix_lengths(), [65_536]);
     }
 }

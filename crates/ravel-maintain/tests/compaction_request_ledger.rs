@@ -338,7 +338,7 @@ async fn the_bloom_scope_read_is_one_catalog_get_of_the_list_prefix() {
     let before = metrics.snapshot();
     let ledger = RequestLedger::new();
     let config = CompactorConfig {
-        footer_probe_bytes: probe,
+        rlog_footer_probe_bytes: probe,
         ..config_with(&ledger)
     };
     let clock = FixedClock::new(sealed_now_ns());
@@ -379,7 +379,7 @@ async fn the_bloom_scope_read_is_one_catalog_get_of_the_list_prefix() {
     assert!(
         layout
             .iter()
-            .all(|l| l.size <= CompactorConfig::default().footer_probe_bytes),
+            .all(|l| l.size <= CompactorConfig::default().rlog_footer_probe_bytes),
         "the default footer probe covers each whole input object"
     );
     let ledger = RequestLedger::new();
@@ -405,7 +405,7 @@ async fn the_bloom_scope_read_is_one_catalog_get_of_the_list_prefix() {
 ///   exactly.
 /// - the ranged read phases are banded against the inputs' OWN sizes, per
 ///   object: the catalog phase must cover at least every input's footer probe
-///   (`min(footer_probe_bytes, that object's size)`, which on this fixture's
+///   (`min(rlog_footer_probe_bytes, that object's size)`, which on this fixture's
 ///   small objects is the whole object) and at most one further object's worth
 ///   of directory sections; the block phase must be positive and cannot exceed
 ///   the inputs' bytes, since every block is fetched by range exactly once.
@@ -478,7 +478,7 @@ async fn wire_bytes_track_the_fixtures_real_object_sizes() {
         .map(|i| {
             i.record
                 .object_size
-                .min(CompactorConfig::default().footer_probe_bytes)
+                .min(CompactorConfig::default().rlog_footer_probe_bytes)
         })
         .sum();
     let catalog = report.catalog_read.wire_bytes_received;
