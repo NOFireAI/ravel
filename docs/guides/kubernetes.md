@@ -357,7 +357,7 @@ A minimal example is in
 | `spec.maintain.fold.disabled` | boolean | `false` | `--disable-fold` on the maintain pods, the only Deployment the operator renders that runs the scheduled fold. Fold is a query-cost optimization only; disabling it never changes results. |
 | `spec.maintain.fold.intervalSecs` | integer | none | `--fold-interval-secs` on the maintain pods. While the maintain Deployment renders (`spec.maintain.enabled` true) and its fold runs (`spec.maintain.fold.disabled` false), the operator also passes it to the query pods as `--fold-lag-interval-secs`, so their request-budget refusals classify fold lag against the interval the maintain pods really fold on rather than the 300 s default; otherwise the query pods get no such flag. That flag requires a server image that has `--fold-lag-interval-secs`, and while that fold runs, editing this field rolls the query pods too. See "The fold-lag interval on the query pods" below. Minimum `1`: `0` is refused at admission, since the server refuses a zero interval at startup. |
 | `spec.maintain.resources` | object | `requests: {cpu: 100m, memory: 256Mi}`, no limits | An explicit block replaces the default entirely rather than merging with it. |
-| `spec.maintain.scratch.sizeGi` | integer | none | Size in GiB of the maintain pods' `scratch` `emptyDir` and of their `ephemeral-storage` request. Setting `spec.maintain.scratch` also mounts the volume and passes `--maintain-scratch-dir`. Minimum `1`. About 1.3 times the largest merge unit's input bytes. See "Maintain scratch volume" below. |
+| `spec.maintain.scratch.sizeGi` | integer | none | Size in GiB of the maintain pods' `scratch` `emptyDir` and of their `ephemeral-storage` request. Setting `spec.maintain.scratch` also mounts the volume and passes `--maintain-scratch-dir` and `--maintain-scratch-max-bytes` (`sizeGi` GiB in bytes). Those flags require a `ravel-server` image from a release that includes the two-level merge flags; an older image refuses the unknown flag at startup. Minimum `1`. An `ephemeral-storage` limit in `spec.maintain.resources.limits` below `sizeGi` is refused. About 1.3 times the largest merge unit's input bytes. See "Maintain scratch volume" below. |
 | `spec.maintain.scratch.mountPath` | string | `/var/lib/ravel/scratch` | Where the volume is mounted, and the value of `--maintain-scratch-dir`. |
 | `spec.gc.protectionHorizon` | string | none | `--gc-protection-horizon` on the maintain pods, a duration such as `25h5m`. It must equal the protection horizon stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
 | `spec.gc.grace` | string | none | `--gc-grace` on the maintain pods, a duration such as `24h`. It must equal the grace stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
@@ -544,17 +544,31 @@ spec:
       # mountPath: /var/lib/ravel/scratch   (the default)
 ```
 
-With the block set, the operator renders four things on the maintain
+With the block set, the operator renders five things on the maintain
 Deployment, and without it none of them:
 
 - an `emptyDir` volume named `scratch` with `sizeLimit` `<sizeGi>Gi`;
 - a mount of that volume at `mountPath` in the `ravel-server` container;
 - `--maintain-scratch-dir <mountPath>`;
+- `--maintain-scratch-max-bytes` set to `sizeGi` GiB in bytes
+  (`sizeGi * 2^30`);
 - an `ephemeral-storage` request of `<sizeGi>Gi` on the `ravel-server`
   container, beside its other requests. It replaces any `ephemeral-storage`
   request in `spec.maintain.resources`.
 
-`sizeGi` must be at least `1`; `0` is refused at admission.
+The two flags require a `ravel-server` image from a release that includes the
+two-level merge flags. An older image does not know
+`--maintain-scratch-dir` or `--maintain-scratch-max-bytes` and fails at
+startup on the unknown flag, so every maintain pod crash-loops with the cause
+only in its container log.
+
+`sizeGi` must be at least `1`; `0` is refused at admission, and so is a
+relative `mountPath`. An `ephemeral-storage` limit in
+`spec.maintain.resources.limits` below `sizeGi` would put the request above
+the limit, which Kubernetes refuses: the operator renders no maintain
+Deployment change, leaves any running one as it is, and sets the cluster's
+`Degraded` condition with reason `MaintainScratchExceedsEphemeralLimit`,
+naming both values. A limit at or above `sizeGi` is kept.
 
 The directory is a cache only. The server wipes it at start and when each
 merge unit ends, never publishes a run from it, and a pod that loses it
@@ -563,6 +577,14 @@ therefore the whole contract, and no PersistentVolumeClaim is needed. Size
 it to about 1.3 times the input bytes of the largest merge unit: before a
 merge reads its first block it computes that need and refuses the unit,
 naming the need and the free space, when the directory cannot hold it.
+
+The free space the server compares against is the smaller of the filesystem's
+free space and `--maintain-scratch-max-bytes` less what the scratch directory
+already holds. The filesystem figure alone is not enough on Kubernetes: for an
+`emptyDir` it is the node's free disk, while the kubelet enforces `sizeLimit`
+by evicting the pod. With the max-bytes bound, the server refuses a unit whose
+need exceeds the volume size instead of filling the volume and being evicted
+mid-merge.
 
 ### Distributed query
 
