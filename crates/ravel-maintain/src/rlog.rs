@@ -1663,8 +1663,9 @@ impl Level1Shape {
 /// `W1`, the level-1 worker count (ADR-3853 D4): the largest count up to
 /// `share` whose per-worker ceiling `U / W1` leaves constraint (a) a group of
 /// at least 2 and whose predicted run parts `R` keep constraint (b)'s part
-/// term, `R x block + in_flight + part_target`, under `U`; 1 when none does.
-fn derive_level1_workers(shape: &Level1Shape, share: usize) -> usize {
+/// term, `R x block + in_flight + part_target`, under `U`; `None` when none
+/// does, and the unit is refused before level 1 reads a block.
+fn derive_level1_workers(shape: &Level1Shape, share: usize) -> Option<usize> {
     let inputs = shape.run_bytes.len();
     for workers in (1..=share.max(1)).rev() {
         let ceiling = shape.ceiling / workers as u64;
@@ -1679,10 +1680,10 @@ fn derive_level1_workers(shape: &Level1Shape, share: usize) -> usize {
             .saturating_add(shape.part_target)
             <= shape.ceiling;
         if fits {
-            return workers;
+            return Some(workers);
         }
     }
-    1
+    None
 }
 
 /// `E`, the level-2 builders in flight at once, the open one included
@@ -2186,8 +2187,8 @@ async fn two_level_merge(
     );
     let workers = match config.level1_workers {
         Some(workers) => workers.max(1),
-        None => derive_level1_workers(
-            &Level1Shape {
+        None => {
+            let shape = Level1Shape {
                 per_input,
                 run_bytes,
                 block_bytes,
@@ -2195,9 +2196,31 @@ async fn two_level_merge(
                 run_target,
                 part_target: config.rlog_memory_target_bytes(),
                 ceiling,
-            },
-            share,
-        ),
+            };
+            match derive_level1_workers(&shape, share) {
+                Some(workers) => workers,
+                None => {
+                    // One worker gives the largest groups and so the fewest
+                    // run parts. A group under 2 there is constraint (a)'s
+                    // refusal, below.
+                    let group = level1_group_size(per_input, run_target, ceiling, inputs);
+                    if group >= 2 {
+                        return Err(MaintainError::MergeTwoLevelUnsupported {
+                            inputs,
+                            check: TwoLevelCheck::PredictedLevelTwoFit {
+                                run_parts: shape
+                                    .run_parts(usize::try_from(group).unwrap_or(usize::MAX)),
+                                block_bytes: shape.block_bytes,
+                                in_flight_bytes: shape.in_flight,
+                                part_target_bytes: shape.part_target,
+                                ceiling_bytes: ceiling,
+                            },
+                        });
+                    }
+                    1
+                }
+            }
+        }
     };
     let worker_ceiling = ceiling / workers as u64;
     let group_size = level1_group_size(per_input, run_target, worker_ceiling, inputs);
@@ -2250,38 +2273,54 @@ async fn two_level_merge(
         target, catalogs, stream_ids, width_ns, output, &meter, &layout,
     )
     .await;
-    unit.close().await;
-    match merged {
+    // The free figure of an out-of-space refusal is read while the unit's runs
+    // still hold their space.
+    let merged = match merged {
         Err(err) if meter.full.load(std::sync::atomic::Ordering::Relaxed) => {
-            let free = scratch_free_bytes(target.scratch_dir)
-                .await
-                .inspect_err(|e| {
-                    tracing::warn!(
-                        path = %target.scratch_dir.display(),
-                        need,
-                        error = %err,
-                        free_error = %e,
-                        "two-level merge scratch write ran out of space and the free figure could not be read (ADR-3853 D2)"
-                    );
-                })?;
-            let reserved = scratch_reserved(target.scratch_dir).saturating_sub(need);
-            tracing::warn!(
-                path = %target.scratch_dir.display(),
-                need,
-                free,
-                reserved,
-                error = %err,
-                "two-level merge scratch write ran out of space (ADR-3853 D2)"
-            );
-            Err(MaintainError::ScratchHeadroom {
-                need,
-                free,
-                reserved,
-                path: target.scratch_dir.to_path_buf(),
-            })
+            scratch_full_refusal(target.scratch_dir, need, err).await
         }
         other => other,
-    }
+    };
+    unit.close().await;
+    merged
+}
+
+/// The [`MaintainError::ScratchHeadroom`] refusal for a unit whose scratch
+/// write failed with `err` for want of space, or
+/// [`MaintainError::ScratchFreeUnreadable`] when the free figure cannot be read.
+async fn scratch_full_refusal(
+    scratch_dir: &std::path::Path,
+    need: u64,
+    err: MaintainError,
+) -> Result<MergeOutput> {
+    let free = match scratch_free_bytes(scratch_dir).await {
+        Ok(free) => free,
+        Err(free_error) => {
+            tracing::warn!(
+                path = %scratch_dir.display(),
+                need,
+                error = %err,
+                free_error = %free_error,
+                "two-level merge scratch write ran out of space and the free figure could not be read (ADR-3853 D2)"
+            );
+            return Err(free_error);
+        }
+    };
+    let reserved = scratch_reserved(scratch_dir).saturating_sub(need);
+    tracing::warn!(
+        path = %scratch_dir.display(),
+        need,
+        free,
+        reserved,
+        error = %err,
+        "two-level merge scratch write ran out of space (ADR-3853 D2)"
+    );
+    Err(MaintainError::ScratchHeadroom {
+        need,
+        free,
+        reserved,
+        path: scratch_dir.to_path_buf(),
+    })
 }
 
 /// The bytes `concurrency` of the largest row group GETs in `lens` hold at
@@ -15737,7 +15776,8 @@ mod tests {
         /// 5 GiB at once or one of 20 GiB, 256 MiB run targets, the
         /// 19,177-input bucket. Measured pricing gives each unit its whole
         /// core share, 8 or 32 workers; ceiling pricing leaves no worker
-        /// count whose run parts fit constraint (b), so it falls back to 1.
+        /// count whose run parts fit constraint (b), so the unit is refused
+        /// before level 1.
         /// `E` is the core share while final parts fit beside level 2's
         /// resident side, and 2 when they do not.
         #[test]
@@ -15764,13 +15804,13 @@ mod tests {
                 58
             );
             assert_eq!(measured.run_parts(58), 661, "330 runs of 2 parts, 1 of 1");
-            assert_eq!(derive_level1_workers(&measured, share), 8);
-            assert_eq!(derive_level1_workers(&measured, 1), 1);
+            assert_eq!(derive_level1_workers(&measured, share), Some(8));
+            assert_eq!(derive_level1_workers(&measured, 1), Some(1));
 
             let priced = shape(29_900_000, 29_000_000, 22_000_000);
             assert_eq!(level1_group_size(29_900_000, TARGET, ceiling, 19_177), 170);
             assert_eq!(priced.run_parts(170), 2_143);
-            assert_eq!(derive_level1_workers(&priced, share), 1);
+            assert_eq!(derive_level1_workers(&priced, share), None);
 
             // One unit of 20 GiB with all 32 cores and 1 GiB final parts.
             let whole = 20 * GIB;
@@ -15783,11 +15823,11 @@ mod tests {
             let measured = at_whole(6_900_000, 6_000_000, 3_000_000);
             assert_eq!(level1_group_size(6_900_000, TARGET, whole / 32, 19_177), 58);
             assert_eq!(measured.run_parts(58), 661);
-            assert_eq!(derive_level1_workers(&measured, 32), 32);
+            assert_eq!(derive_level1_workers(&measured, 32), Some(32));
             let priced = at_whole(29_900_000, 29_000_000, 22_000_000);
             assert_eq!(level1_group_size(29_900_000, TARGET, whole, 19_177), 709);
             assert_eq!(priced.run_parts(709), 2_083, "27 runs of 77 parts, 1 of 4");
-            assert_eq!(derive_level1_workers(&priced, 32), 1);
+            assert_eq!(derive_level1_workers(&priced, 32), None);
 
             assert_eq!(
                 level2_encode_builders(share, ceiling, 661 * 3_000_000, 32_000_000, TARGET),
@@ -15837,7 +15877,8 @@ mod tests {
 
         /// Each two-level check that fails is refused by name: constraint (a)
         /// leaving G under 2 before any block GET, and constraint (b) after
-        /// level 1, with the figures it compared.
+        /// level 1, with the figures it compared. `W1` is named for (b), so
+        /// the prediction before level 1 does not decide it.
         #[tokio::test]
         async fn a_two_level_refusal_names_the_failed_check() {
             let probe = ProbeStore::new();
@@ -15870,7 +15911,10 @@ mod tests {
             let dir = fresh_scratch("refusal-b");
             let run_target = 2 * per_input;
             let ceiling = group_ceiling(per_input, run_target, 12);
-            let config = two_level_config(ceiling, run_target, Some(dir.clone()));
+            let config = CompactorConfig {
+                level1_workers: Some(1),
+                ..two_level_config(ceiling, run_target, Some(dir.clone()))
+            };
             let (outcome, run, store, _) = compact_two_level(&config).await;
             match outcome {
                 Ok(CompactionOutcome::TwoLevelUnsupported {
@@ -15906,11 +15950,71 @@ mod tests {
             assert!(scratch_entries(&dir).is_empty());
         }
 
+        /// ADR-3853 D4: when constraint (b) priced on the predicted run parts
+        /// fits at no worker count, the unit is refused before level 1, with
+        /// no block GET, no group and no run written. At a run target of 2 P
+        /// each group of 12 decodes to about 12 P of priced bytes, so 6 run
+        /// parts are predicted per group, 30 in all, against a ceiling that
+        /// holds far fewer level-2 blocks.
+        #[tokio::test]
+        async fn an_unfit_level_two_is_refused_before_any_block_get() {
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &two_level_inputs()).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let run_target = 2 * per_input;
+            let ceiling = group_ceiling(per_input, run_target, 12);
+            let catalogs = catalogs_of(&probe, &keys).await;
+            let mut block_bytes = 0u64;
+            for catalog in &catalogs {
+                for block in 0..catalog.pricing.block_rows.len() {
+                    block_bytes =
+                        block_bytes.max(pass_block_cost(&catalog.pricing, block).expect("price"));
+                }
+            }
+
+            let dir = fresh_scratch("unfit-before-level-1");
+            let config = two_level_config(ceiling, run_target, Some(dir.clone()));
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            match outcome {
+                Ok(CompactionOutcome::TwoLevelUnsupported {
+                    inputs: 60,
+                    check:
+                        TwoLevelCheck::PredictedLevelTwoFit {
+                            run_parts,
+                            block_bytes: priced,
+                            in_flight_bytes,
+                            part_target_bytes,
+                            ceiling_bytes,
+                        },
+                }) => {
+                    assert_eq!(run_parts, 30, "6 predicted parts in each of 5 groups");
+                    assert_eq!(priced, block_bytes);
+                    assert_eq!(part_target_bytes, TWO_LEVEL_PART);
+                    assert_eq!(ceiling_bytes, ceiling);
+                    assert!(
+                        run_parts * priced + in_flight_bytes + part_target_bytes > ceiling,
+                        "(b) fails at one worker: {run_parts} x {priced}, \
+                         {in_flight_bytes}, {part_target_bytes}, {ceiling}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+            let r = &run.report;
+            assert_eq!(r.block_read.requests, 0, "no block GET: {r:?}");
+            assert_eq!(r.catalog_read.requests, 60, "{r:?}");
+            assert_eq!(r.level1_groups, 0, "{r:?}");
+            assert_eq!(r.level1_passes, 0, "{r:?}");
+            assert_eq!(r.scratch_writes, 0, "{r:?}");
+            assert_eq!(compaction_records(&store).await, 0);
+            assert!(!dir.exists(), "no scratch directory was even created");
+        }
+
         /// Constraint (b) prices every run part, not every group: at a run
         /// target of 8,192 bytes each of the 5 groups' runs is cut into 20
         /// parts, and the 100 parts are what level 2 merges. Counting the 5
         /// groups instead would fit this ceiling and run level 2 over a
-        /// stream estimate that leaves out 95 of its blocks.
+        /// stream estimate that leaves out 95 of its blocks. `W1` is named,
+        /// so the check runs on the run parts level 1 actually wrote.
         #[tokio::test]
         async fn constraint_b_counts_run_parts_not_groups() {
             let probe = ProbeStore::new();
@@ -15919,7 +16023,10 @@ mod tests {
             let run_target = 8192;
             let ceiling = group_ceiling(per_input, run_target, 12);
             let dir = fresh_scratch("parts-not-groups");
-            let config = two_level_config(ceiling, run_target, Some(dir.clone()));
+            let config = CompactorConfig {
+                level1_workers: Some(1),
+                ..two_level_config(ceiling, run_target, Some(dir.clone()))
+            };
             let (outcome, run, store, _) = compact_two_level(&config).await;
             match outcome {
                 Ok(CompactionOutcome::TwoLevelUnsupported {
@@ -16041,18 +16148,22 @@ mod tests {
 
         /// A level-2 refusal is a terminal outcome: the scan counts it, the
         /// memo holds it, and the next tick neither reads the inputs nor
-        /// writes runs again.
+        /// writes runs again. `W1` is named, so the refusal comes after level
+        /// 1 rather than from the prediction before it.
         #[tokio::test]
         async fn a_level_two_refusal_is_terminal_and_not_retried() {
             let store = ProbeStore::new();
             let keys = seed_inputs(&store, &two_level_inputs()).await;
             let per_input = level1_per_input(&store, &keys).await;
             let run_target = 2 * per_input;
-            let config = two_level_config(
-                group_ceiling(per_input, run_target, 12),
-                run_target,
-                Some(fresh_scratch("terminal-b")),
-            );
+            let config = CompactorConfig {
+                level1_workers: Some(1),
+                ..two_level_config(
+                    group_ceiling(per_input, run_target, 12),
+                    run_target,
+                    Some(fresh_scratch("terminal-b")),
+                )
+            };
             let mut memo = crate::MaintainMemo::new(crate::scan::DEFAULT_MEMO_REVERIFY_INTERVAL_NS);
             let (first, first_reads) = maintain_tick(&mut memo, &store, &config).await;
             let (second, second_reads) = maintain_tick(&mut memo, &store, &config).await;
@@ -16322,13 +16433,17 @@ mod tests {
             assert!(dir.is_dir(), "the scratch directory itself stays");
             assert!(scratch_entries(&dir).is_empty(), "success");
 
+            // `W1` named, so level 2's refusal comes after level 1 wrote runs.
             let dir = fresh_scratch("error");
             let small_run = 2 * per_input;
-            let config = two_level_config(
-                group_ceiling(per_input, small_run, 12),
-                small_run,
-                Some(dir.clone()),
-            );
+            let config = CompactorConfig {
+                level1_workers: Some(1),
+                ..two_level_config(
+                    group_ceiling(per_input, small_run, 12),
+                    small_run,
+                    Some(dir.clone()),
+                )
+            };
             let (outcome, run, _, _) = compact_two_level(&config).await;
             assert!(
                 matches!(
@@ -16620,6 +16735,70 @@ mod tests {
             ))));
             let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
             assert!(!is_scratch_full(&StoreError::Transient(full.to_string())));
+        }
+
+        /// ADR-3853 D2: a `statvfs` of the scratch directory that fails at
+        /// admission is a typed error naming the directory and the failure,
+        /// never a free figure of zero, and no block is read.
+        #[tokio::test]
+        async fn an_unreadable_free_figure_at_admission_is_a_typed_error() {
+            let dir = fresh_scratch("statvfs-admit");
+            let (config, _) = two_level_scratch_config(&dir).await;
+            let eio = rustix::io::Errno::IO;
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(Some(Err(eio.raw_os_error()))));
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(None));
+            match outcome {
+                Err(MaintainError::ScratchFreeUnreadable { path, error }) => {
+                    assert_eq!((path, error), (dir.clone(), eio.to_string()));
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(run.report.block_read.requests, 0, "{:?}", run.report);
+            assert_eq!(compaction_records(&store).await, 0);
+            assert_eq!(scratch_reserved(&dir), 0);
+            assert!(scratch_entries(&dir).is_empty());
+        }
+
+        /// ADR-3853 D2: a scratch write out of space whose free figure then
+        /// cannot be read is the typed `statvfs` error, not a headroom refusal
+        /// with zero free, and the unit still removes its scratch.
+        #[tokio::test]
+        async fn an_unreadable_free_figure_after_an_enospc_is_a_typed_error() {
+            use ravel_object_store::fault::{
+                FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+            };
+
+            let dir = fresh_scratch("statvfs-enospc");
+            let (config, _) = two_level_scratch_config(&dir).await;
+            let eio = rustix::io::Errno::IO;
+            let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+            let message = format!("scratch store: write {}: {full}", dir.display());
+            // The unit was admitted by the time its scratch store is wrapped,
+            // so only the out-of-space path reads the failing figure.
+            SCRATCH_STORE_WRAP.with(|w| {
+                *w.borrow_mut() = Some(Box::new(move |inner| {
+                    SCRATCH_FREE_OVERRIDE.with(|o| o.set(Some(Err(eio.raw_os_error()))));
+                    let plan = FaultPlan::empty().with_rule(
+                        Rule::new(Op::Put, ScriptedFault::Permanent(message.clone()))
+                            .with_occurrence(Occurrence::Nth(2)),
+                    );
+                    Arc::new(FaultStore::new(inner, plan)) as Arc<dyn ObjectStoreBackend>
+                }));
+            });
+            let (outcome, run, store, _) = compact_two_level(&config).await;
+            SCRATCH_STORE_WRAP.with(|w| *w.borrow_mut() = None);
+            SCRATCH_FREE_OVERRIDE.with(|o| o.set(None));
+            match outcome {
+                Err(MaintainError::ScratchFreeUnreadable { path, error }) => {
+                    assert_eq!((path, error), (dir.clone(), eio.to_string()));
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(run.report.scratch_writes >= 2, "{:?}", run.report);
+            assert_eq!(compaction_records(&store).await, 0);
+            assert_eq!(scratch_reserved(&dir), 0);
+            assert!(scratch_entries(&dir).is_empty());
         }
 
         /// `r` moved to stream `s`, everything else kept.

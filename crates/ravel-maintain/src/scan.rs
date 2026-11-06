@@ -1883,6 +1883,16 @@ fn classify_terminal(
                 // Held for an out-of-window input: retried every tick, so the
                 // bucket compacts on the first tick after the upgrade finishes.
                 Some(CompactionOutcome::HeldOutOfWindow { .. }) => None,
+                // Refused only because this process's other two-level merges
+                // hold their share of the scratch (ADR-3853 D2): the volume
+                // alone has room, and it is free again once they end, so the
+                // next tick tries again.
+                Some(CompactionOutcome::ScratchHeadroom {
+                    need,
+                    free,
+                    reserved,
+                    ..
+                }) if free >= need && free.saturating_sub(*reserved) < *need => None,
                 // Refused for its merge geometry (ADR-3853 D0): this binary
                 // would refuse it again, so it is not retried while the memo
                 // holds it, and the memo never persists it. A two-level merge's
@@ -2251,6 +2261,47 @@ async fn write_cursor(
     match store.put(key, payload.into(), opts).await {
         Ok(_) | Err(StoreError::AlreadyExists) | Err(StoreError::PreconditionFailed) => Ok(()),
         Err(e) => Err(MaintainError::Store(e)),
+    }
+}
+
+#[cfg(test)]
+mod scratch_headroom_memo_tests {
+    use super::*;
+
+    fn headroom(need: u64, free: u64, reserved: u64) -> Option<CompactionOutcome> {
+        Some(CompactionOutcome::ScratchHeadroom {
+            need,
+            free,
+            reserved,
+            path: std::path::PathBuf::from("/scratch"),
+        })
+    }
+
+    /// ADR-3853 D2: a headroom refusal the volume alone would have admitted,
+    /// refused only for what this process's other two-level merges hold
+    /// reserved, is not memoized, so the next tick evaluates the bucket again
+    /// and merges it once those units end. A volume short on its own, and an
+    /// out-of-space write the figures do not explain, stay terminal.
+    #[test]
+    fn a_reservation_only_headroom_refusal_is_retried_next_tick() {
+        let live = RetentionOutcome::NotExpired;
+        assert_eq!(classify_terminal(&live, &headroom(100, 150, 60)), None);
+        assert_eq!(classify_terminal(&live, &headroom(100, 100, 1)), None);
+        assert_eq!(
+            classify_terminal(&live, &headroom(100, 99, 0)),
+            Some(TerminalState::GeometryUnsupported),
+            "the volume alone is short"
+        );
+        assert_eq!(
+            classify_terminal(&live, &headroom(100, 99, 60)),
+            Some(TerminalState::GeometryUnsupported),
+            "short with or without the reservations"
+        );
+        assert_eq!(
+            classify_terminal(&live, &headroom(100, 500, 0)),
+            Some(TerminalState::GeometryUnsupported),
+            "a scratch write ran out of space with room on the figures"
+        );
     }
 }
 

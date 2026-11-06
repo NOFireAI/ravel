@@ -127,6 +127,24 @@ pub enum TwoLevelCheck {
         /// The resident ceiling `U`.
         ceiling_bytes: u64,
     },
+    /// Constraint (b) priced before level 1 reads a block (ADR-3853 D4): at
+    /// no level-1 worker count up to the unit's core share do the run parts
+    /// level 1 is predicted to write fit level 2, so the unit is refused
+    /// without running level 1. Shown at one worker, the count with the
+    /// fewest run parts.
+    PredictedLevelTwoFit {
+        /// Run parts level 1 would write at one worker: per group, its
+        /// inputs' decoded bytes over the run target, rounded up.
+        run_parts: u64,
+        /// The price of one level-2 block, taken from the inputs' largest.
+        block_bytes: u64,
+        /// Bytes of the `input_read_concurrency` largest input row groups.
+        in_flight_bytes: u64,
+        /// The final parts' memory split target.
+        part_target_bytes: u64,
+        /// The resident ceiling `U`.
+        ceiling_bytes: u64,
+    },
 }
 
 impl std::fmt::Display for TwoLevelCheck {
@@ -151,6 +169,16 @@ impl std::fmt::Display for TwoLevelCheck {
             } => write!(
                 f,
                 "level 2 over {runs} run parts needs the larger of {runs} x {run_block_bytes} and the largest stream estimate {stream_estimate_bytes}, + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes (constraint b)"
+            ),
+            Self::PredictedLevelTwoFit {
+                run_parts,
+                block_bytes,
+                in_flight_bytes,
+                part_target_bytes,
+                ceiling_bytes,
+            } => write!(
+                f,
+                "level 2 over a predicted {run_parts} run parts needs {run_parts} x {block_bytes} + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes at every level-1 worker count (constraint b, refused before level 1)"
             ),
         }
     }
