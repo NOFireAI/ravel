@@ -2008,8 +2008,16 @@ async fn q03_sum_plus_k_answered_from_stats_with_checked_arithmetic_on() {
     let batches = collect(Arc::clone(&plan), ctx.task_ctx())
         .await
         .expect("collect");
-    assert_eq!(single_i64(&batches), Some(2718), "2708 + 1 * 10 non-null rows");
-    assert_eq!(store.gets(), 0, "the checked-mode answer must read no objects");
+    assert_eq!(
+        single_i64(&batches),
+        Some(2718),
+        "2708 + 1 * 10 non-null rows"
+    );
+    assert_eq!(
+        store.gets(),
+        0,
+        "the checked-mode answer must read no objects"
+    );
 }
 
 /// The plain `SUM(status)` (addend 0) is answered from stats with zero GETs:

@@ -732,9 +732,7 @@ async fn assert_checked_arithmetic(specs: &[SegSpec], pred: &Pred, k: i64) {
         assert_exact_or_overflow(
             &fixture,
             &tenant,
-            &format!(
-                "SELECT ts, {expr} FROM samples WHERE {where_clause} ORDER BY series_id, ts"
-            ),
+            &format!("SELECT ts, {expr} FROM samples WHERE {where_clause} ORDER BY series_id, ts"),
             projected,
         )
         .await;

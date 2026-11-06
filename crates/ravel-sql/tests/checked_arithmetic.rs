@@ -32,8 +32,8 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
-    DeclaredColumn, DeclaredType, ErrorClass, SpanSegmentFetcher, SqlConfig, SqlError,
-    SqlExecutor, SqlRequest, StaticDeclaredColumns,
+    DeclaredColumn, DeclaredType, ErrorClass, SpanSegmentFetcher, SqlConfig, SqlError, SqlExecutor,
+    SqlRequest, StaticDeclaredColumns,
 };
 use ravel_types::{Signal, TenantId, TimeRange};
 use uuid::Uuid;
@@ -66,8 +66,14 @@ const STATEMENTS: &[(&str, &str)] = &[
         "aggregate filter",
         "SELECT COUNT(*) FILTER (WHERE a + 1 > 0) AS n FROM logs",
     ),
-    ("nested, outer wraps back", "SELECT (a + 1) - b AS v FROM logs ORDER BY ts"),
-    ("nested, outer overflows", "SELECT (a + 1) * 2 AS v FROM logs ORDER BY ts"),
+    (
+        "nested, outer wraps back",
+        "SELECT (a + 1) - b AS v FROM logs ORDER BY ts",
+    ),
+    (
+        "nested, outer overflows",
+        "SELECT (a + 1) * 2 AS v FROM logs ORDER BY ts",
+    ),
 ];
 
 fn identity(tenant_hash: [u8; 16]) -> ObjectIdentity {
@@ -217,7 +223,9 @@ async fn every_rewritten_exec_fails_on_overflow() {
 #[test]
 fn the_overflow_error_is_a_valueless_unsupported_class_error() {
     let err = SqlError::IntegerArithmeticOverflow;
-    let sum = SqlError::IntegerSumOverflow { result_type: "Int64" };
+    let sum = SqlError::IntegerSumOverflow {
+        result_type: "Int64",
+    };
     assert_eq!(err.class(), ErrorClass::Unsupported);
     assert_eq!(err.class(), sum.class());
     let text = err.client_message();
@@ -229,7 +237,11 @@ fn the_overflow_error_is_a_valueless_unsupported_class_error() {
 async fn in_range_results_are_identical_on_and_off() {
     let (store, tenant) = tenant_with(
         "checked-arith-small",
-        &[record(1, "x", 3, 2), record(2, "y", -4, 5), record(3, "x", 10, -7)],
+        &[
+            record(1, "x", 3, 2),
+            record(2, "y", -4, 5),
+            record(3, "x", 10, -7),
+        ],
     )
     .await;
     let on = executor(&store, true);

@@ -165,9 +165,7 @@ fn arrow_is_overflow(err: &ArrowError) -> bool {
 
 /// `node` with every covered expression in checked form, or `node` itself
 /// when nothing changed.
-fn rewrite_node(
-    node: Arc<dyn ExecutionPlan>,
-) -> DFResult<Transformed<Arc<dyn ExecutionPlan>>> {
+fn rewrite_node(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn ExecutionPlan>>> {
     let rebuilt: Option<Arc<dyn ExecutionPlan>> =
         if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
             rewrite_projection(projection)?
@@ -289,11 +287,13 @@ fn rewrite_projection(projection: &ProjectionExec) -> DFResult<Option<Arc<dyn Ex
     if !changed {
         return Ok(None);
     }
-    Ok(Some(Arc::new(ProjectionExec::try_new_with_schema_metadata(
-        exprs,
-        Arc::clone(projection.input()),
-        &projection.schema(),
-    )?)))
+    Ok(Some(Arc::new(
+        ProjectionExec::try_new_with_schema_metadata(
+            exprs,
+            Arc::clone(projection.input()),
+            &projection.schema(),
+        )?,
+    )))
 }
 
 fn rewrite_filter(filter: &FilterExec) -> DFResult<Option<Arc<dyn ExecutionPlan>>> {
@@ -579,7 +579,13 @@ mod tests {
         } else if let Some(filter) = plan.downcast_ref::<FilterExec>() {
             exprs.push(Arc::clone(filter.predicate()));
         } else if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
-            exprs.extend(aggregate.group_expr().expr().iter().map(|(e, _)| Arc::clone(e)));
+            exprs.extend(
+                aggregate
+                    .group_expr()
+                    .expr()
+                    .iter()
+                    .map(|(e, _)| Arc::clone(e)),
+            );
             for aggr in aggregate.aggr_expr() {
                 exprs.extend(aggr.expressions());
             }
@@ -612,11 +618,15 @@ mod tests {
             for (expr, schema) in node_exprs(node.as_ref()) {
                 expr.apply(|e| {
                     if let Some(b) = e.downcast_ref::<BinaryExpr>()
-                        && matches!(b.op(), Operator::Plus | Operator::Minus | Operator::Multiply)
+                        && matches!(
+                            b.op(),
+                            Operator::Plus | Operator::Minus | Operator::Multiply
+                        )
                         && e.data_type(&schema)?.is_integer()
                     {
-                        let flagged = BinaryExpr::new(Arc::clone(b.left()), *b.op(), Arc::clone(b.right()))
-                            .with_fail_on_overflow(true);
+                        let flagged =
+                            BinaryExpr::new(Arc::clone(b.left()), *b.op(), Arc::clone(b.right()))
+                                .with_fail_on_overflow(true);
                         if *b == flagged {
                             counts.0 += 1;
                         } else {

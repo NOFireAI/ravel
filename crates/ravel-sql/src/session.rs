@@ -827,13 +827,12 @@ pub fn build_session_with_tables(
     // is on. Ahead of DataFusion's own rules, so every operator they derive
     // from these expressions carries the checked form; see
     // `crate::checked_arithmetic`.
-    let physical_rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = std::iter::once(
-        Arc::new(CheckedIntegerArithmetic::new(
+    let physical_rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> =
+        std::iter::once(Arc::new(CheckedIntegerArithmetic::new(
             config.checked_integer_arithmetic,
-        )) as Arc<dyn PhysicalOptimizerRule + Send + Sync>,
-    )
-    .chain(PhysicalOptimizer::new().rules)
-    .collect();
+        )) as Arc<dyn PhysicalOptimizerRule + Send + Sync>)
+        .chain(PhysicalOptimizer::new().rules)
+        .collect();
 
     // `SessionContext::new_with_config_rt` with one extra physical optimizer
     // rule. `DictionaryGroupKeysAsViews` keeps a `GROUP BY` over a declared
@@ -2261,7 +2260,11 @@ mod tests {
     fn the_checked_arithmetic_rule_is_the_first_physical_optimizer_rule() {
         let ctx = samples_and_logs();
         let state = ctx.state();
-        let names: Vec<&str> = state.physical_optimizers().iter().map(|r| r.name()).collect();
+        let names: Vec<&str> = state
+            .physical_optimizers()
+            .iter()
+            .map(|r| r.name())
+            .collect();
         assert_eq!(
             names.first().copied(),
             Some(crate::checked_arithmetic::CHECKED_INTEGER_ARITHMETIC_RULE)

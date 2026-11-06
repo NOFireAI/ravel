@@ -113,7 +113,11 @@ impl Arm {
 
     fn summary(&self) -> String {
         let min = self.millis.iter().copied().fold(f64::INFINITY, f64::min);
-        let max = self.millis.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let max = self
+            .millis
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
         let plan = median(&self.plan_millis)
             .map_or_else(String::new, |plan| format!(",plan_median:{plan:.2}"));
         format!(
@@ -394,8 +398,20 @@ fn main() -> ExitCode {
 
     let lhs = int64_batches(KERNEL_VALUES, 1);
     let rhs = int64_batches(KERNEL_VALUES, 2);
-    passed.push(kernel_figure("kernel_add", add_kernel, add_wrapping_kernel, &lhs, &rhs));
-    passed.push(kernel_figure("kernel_mul", mul_kernel, mul_wrapping_kernel, &lhs, &rhs));
+    passed.push(kernel_figure(
+        "kernel_add",
+        add_kernel,
+        add_wrapping_kernel,
+        &lhs,
+        &rhs,
+    ));
+    passed.push(kernel_figure(
+        "kernel_mul",
+        mul_kernel,
+        mul_wrapping_kernel,
+        &lhs,
+        &rhs,
+    ));
     drop((lhs, rhs));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -408,7 +424,16 @@ fn main() -> ExitCode {
         let off = session(false, &table);
         passed.push(rule_fires(&on, &off).await);
         passed.push(sql_figure("sql_q30_shape", &q30_sql(), 1, &on, &off).await);
-        passed.push(sql_figure("sql_project_mul", "SELECT a * b FROM t", SQL_ROWS, &on, &off).await);
+        passed.push(
+            sql_figure(
+                "sql_project_mul",
+                "SELECT a * b FROM t",
+                SQL_ROWS,
+                &on,
+                &off,
+            )
+            .await,
+        );
         passed.push(
             sql_figure(
                 "sql_filter_add",
