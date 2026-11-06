@@ -610,6 +610,18 @@ pub async fn compact_to(
              inputs, {streams} streams and {blocks} blocks; refused before any \
              block was read, ADR-3853 D0)"
         )?,
+        CompactionOutcome::TwoLevelUnsupported { inputs, check } => writeln!(
+            out,
+            "outcome: TwoLevelUnsupported (the two-level merge over {inputs} inputs \
+             does not fit: {check}; nothing published)"
+        )?,
+        CompactionOutcome::ScratchHeadroom { need, free, path } => writeln!(
+            out,
+            "outcome: ScratchHeadroom (the two-level merge needs {need} bytes of \
+             scratch under {} and that filesystem has {free} free; refused before \
+             any block was read, ADR-3853 D2)",
+            path.display()
+        )?,
         CompactionOutcome::Compacted { parts, publish } => {
             let verb = if dry_run { "would write" } else { "wrote" };
             writeln!(out, "outcome: Compacted")?;
@@ -705,7 +717,8 @@ pub struct CompactTenantReport {
     /// compacted; a later run compacts them once this build can read them.
     pub held_out_of_window: usize,
     /// Buckets refused because their cursor merge would decode too many rows
-    /// per record (ADR-3853 D0). Not compacted; nothing was fetched or written.
+    /// per record (ADR-3853 D0), or whose two-level merge was refused. Not
+    /// compacted; nothing was published.
     pub geometry_unsupported: usize,
     /// L1 parts written across every compacted bucket (would-be writes under
     /// `--dry-run`).
@@ -1278,6 +1291,23 @@ fn emit_bucket_outcome(
                 "shard={shard} hour={hour} outcome=GeometryUnsupported inputs={inputs} \
                  streams={streams} blocks={blocks} records={records} \
                  predicted_decoded_rows={predicted_decoded_rows}"
+            )?;
+        }
+        Ok(CompactionOutcome::TwoLevelUnsupported { inputs, check }) => {
+            report.geometry_unsupported += 1;
+            writeln!(
+                out,
+                "shard={shard} hour={hour} outcome=TwoLevelUnsupported inputs={inputs} \
+                 check=\"{check}\""
+            )?;
+        }
+        Ok(CompactionOutcome::ScratchHeadroom { need, free, path }) => {
+            report.geometry_unsupported += 1;
+            writeln!(
+                out,
+                "shard={shard} hour={hour} outcome=ScratchHeadroom need={need} free={free} \
+                 path={}",
+                path.display()
             )?;
         }
         Ok(CompactionOutcome::BelowMinInputs { count }) => {

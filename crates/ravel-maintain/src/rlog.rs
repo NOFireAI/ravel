@@ -1417,13 +1417,15 @@ async fn merge_catalogs_with_geometry(
         predicted_decoded_rows = plan.predicted_decoded_rows,
         "rlog merge read mode (compared = the held raw bytes + pass floor + largest hot-stream cursor charge that decided the mode)"
     );
-    // A bucket whose single-level plan is not resident merges in two levels
-    // when the process has scratch to hold the runs (ADR-3853 D0, D1);
-    // without scratch the single-level plan runs, behind the D0 refusal.
+    // Only a bucket the D0 refusal would stop merges in two levels, and only
+    // when the process has scratch to hold the runs (ADR-3853 D0, D1); every
+    // other plan runs single-level as before.
     if geometry == GeometryCheck::Refuse
-        && plan.mode != MergeReadMode::Resident
-        && let Some(scratch_dir) = config.scratch_dir.as_deref()
+        && let Some(refusal) = geometry_refusal(&plan, catalogs.len(), stream_ids.len())
     {
+        let Some(scratch_dir) = config.scratch_dir.as_deref() else {
+            return Err(refusal);
+        };
         let target = TwoLevelTarget {
             store,
             config,
@@ -1434,11 +1436,6 @@ async fn merge_catalogs_with_geometry(
             scratch_dir,
         };
         return two_level_merge(&target, catalogs, &stream_ids, width_ns, output, keep).await;
-    }
-    if geometry == GeometryCheck::Refuse
-        && let Some(refusal) = geometry_refusal(&plan, catalogs.len(), stream_ids.len())
-    {
-        return Err(refusal);
     }
     let mut sink = PartSink {
         store,
@@ -1636,6 +1633,84 @@ fn scratch_free_bytes(path: &std::path::Path) -> Result<u64> {
     Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
 }
 
+/// The lock file inside a scratch directory. Its name never matches
+/// [`SCRATCH_UNIT_PREFIX`], so reclaiming orphaned units leaves it alone.
+const SCRATCH_LOCK_FILE: &str = "ravel-scratch.lock";
+
+/// The name prefix of every merge unit's scratch subdirectory.
+const SCRATCH_UNIT_PREFIX: &str = "rlog-merge-";
+
+/// The scratch directories this process holds the lock on, each with its
+/// locked file, which stays open (and so locked) for the life of the process.
+static SCRATCH_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::fs::File>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Take this process's exclusive lock on `scratch_dir` the first time a merge
+/// uses it, and while holding it remove every unit directory there, all of
+/// which a dead process left (ADR-3853 D2). Later calls return at once. A
+/// lock another process holds is refused with
+/// [`MaintainError::ScratchLocked`]: two processes never share a scratch
+/// directory.
+fn lock_scratch_dir(scratch_dir: &std::path::Path) -> Result<()> {
+    let mut held = SCRATCH_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.contains_key(scratch_dir) {
+        return Ok(());
+    }
+    let scratch_error = |what: &str, path: &std::path::Path, e: std::io::Error| {
+        MaintainError::Store(StoreError::Permanent(format!(
+            "scratch directory: {what} {}: {e}",
+            path.display()
+        )))
+    };
+    let lock_path = scratch_dir.join(SCRATCH_LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| scratch_error("open", &lock_path, e))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(MaintainError::ScratchLocked { path: lock_path });
+        }
+        Err(std::fs::TryLockError::Error(e)) => return Err(scratch_error("lock", &lock_path, e)),
+    }
+    // No unit of this process exists in `scratch_dir` before its lock is
+    // held, so every unit directory here is an orphan.
+    let entries =
+        std::fs::read_dir(scratch_dir).map_err(|e| scratch_error("list", scratch_dir, e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| scratch_error("list", scratch_dir, e))?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(SCRATCH_UNIT_PREFIX)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => tracing::info!(
+                path = %path.display(),
+                "removed an orphaned two-level merge scratch unit (ADR-3853 D2)"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(scratch_error("remove orphan", &path, e)),
+        }
+    }
+    held.insert(scratch_dir.to_path_buf(), file);
+    Ok(())
+}
+
 /// One merge unit's scratch subdirectory. Dropping it wipes and removes the
 /// subdirectory, so the runs are gone after a success, an error return, and a
 /// merge future dropped mid-await (ADR-3853 D2).
@@ -1648,7 +1723,7 @@ impl ScratchUnit {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = scratch_dir.join(format!(
-            "rlog-merge-{}-{}-{seq}",
+            "{SCRATCH_UNIT_PREFIX}{}-{}-{seq}",
             hex::encode(&input_set_hash[..8]),
             std::process::id()
         ));
@@ -1783,6 +1858,7 @@ async fn two_level_merge(
             target.scratch_dir.display()
         )))
     })?;
+    lock_scratch_dir(target.scratch_dir)?;
     let free = scratch_free_bytes(target.scratch_dir)?;
     if need > free {
         return Err(MaintainError::ScratchHeadroom {
@@ -1894,15 +1970,18 @@ async fn two_level_merge(
     let part_target = config.rlog_memory_target_bytes();
     let plan = plan_merge(config, &runs, stream_ids, width_ns)?;
     let stream_estimate = plan.estimates.iter().copied().max().unwrap_or(0);
+    // Level 2's inputs are the run parts, not the groups: a run cut into
+    // several parts holds one block per part.
+    let run_parts = runs.len() as u64;
     let fit = TwoLevelCheck::LevelTwoFit {
-        runs: runs_count as u64,
+        runs: run_parts,
         run_block_bytes,
         stream_estimate_bytes: stream_estimate,
         in_flight_bytes: in_flight,
         part_target_bytes: part_target,
         ceiling_bytes: ceiling,
     };
-    let compared = (runs_count as u64)
+    let compared = run_parts
         .saturating_mul(run_block_bytes)
         .max(stream_estimate)
         .saturating_add(in_flight)
@@ -14150,10 +14229,14 @@ mod tests {
             dir
         }
 
-        /// Everything under `dir`, empty when it does not exist.
+        /// Everything under `dir` but the scratch lock file, empty when it
+        /// does not exist.
         fn scratch_entries(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
             match std::fs::read_dir(dir) {
-                Ok(entries) => entries.map(|e| e.expect("entry").path()).collect(),
+                Ok(entries) => entries
+                    .map(|e| e.expect("entry").path())
+                    .filter(|p| !p.ends_with(SCRATCH_LOCK_FILE))
+                    .collect(),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
                 Err(e) => panic!("read {}: {e}", dir.display()),
             }
@@ -14384,7 +14467,7 @@ mod tests {
             let config = two_level_config(ceiling, run_target, Some(dir.clone()));
             let (outcome, run, store, _) = compact_two_level(&config).await;
             match outcome {
-                Err(MaintainError::MergeTwoLevelUnsupported { inputs, check }) => {
+                Ok(CompactionOutcome::TwoLevelUnsupported { inputs, check }) => {
                     assert_eq!(inputs, 60);
                     assert_eq!(
                         check,
@@ -14407,7 +14490,7 @@ mod tests {
             let config = two_level_config(ceiling, run_target, Some(dir.clone()));
             let (outcome, run, store, _) = compact_two_level(&config).await;
             match outcome {
-                Err(MaintainError::MergeTwoLevelUnsupported {
+                Ok(CompactionOutcome::TwoLevelUnsupported {
                     inputs: 60,
                     check:
                         TwoLevelCheck::LevelTwoFit {
@@ -14465,7 +14548,7 @@ mod tests {
             let (outcome, run, store, _) = compact_two_level(&config).await;
             SCRATCH_FREE_OVERRIDE.with(|o| o.set(None));
             match outcome {
-                Err(MaintainError::ScratchHeadroom {
+                Ok(CompactionOutcome::ScratchHeadroom {
                     need: n,
                     free,
                     path,
@@ -14583,7 +14666,7 @@ mod tests {
             assert!(
                 matches!(
                     outcome,
-                    Err(MaintainError::MergeTwoLevelUnsupported {
+                    Ok(CompactionOutcome::TwoLevelUnsupported {
                         check: TwoLevelCheck::LevelTwoFit { .. },
                         ..
                     })
