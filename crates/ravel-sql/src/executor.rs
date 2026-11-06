@@ -154,6 +154,7 @@ use crate::access_intent::{
 };
 use crate::alerts_provider::AlertsTableProvider;
 use crate::audit_provider::AuditTableProvider;
+use crate::checked_arithmetic::CheckedIntegerArithmeticEnabled;
 use crate::clock::SystemClock;
 use crate::config::SqlConfig;
 use crate::cost::{estimate_logs_cost, estimate_metrics_cost, estimate_spans_cost};
@@ -5625,6 +5626,11 @@ pub struct PinnedStream {
     /// Set once the cap-plus-one'th row was emitted, meaning the plan had more
     /// rows than the caller asked for.
     row_cap_hit: bool,
+    /// Whether the session was built with
+    /// [`crate::SqlConfig::checked_integer_arithmetic`] on, read from `ctx`'s
+    /// config extension in [`Self::start`]. Only then is an Arrow overflow
+    /// mapped to [`SqlError::IntegerArithmeticOverflow`].
+    checked_integer_arithmetic: bool,
     /// This query's scratch directory. Declared LAST so it drops after `_ctx`:
     /// the session's `RuntimeEnv` owns the spill files inside it and must
     /// release them first. Removing the directory here is what makes cleanup
@@ -5698,6 +5704,12 @@ impl PinnedStream {
             active_since: None,
             elapsed: Duration::ZERO,
         });
+        let checked_integer_arithmetic = ctx
+            .state_ref()
+            .read()
+            .config()
+            .get_extension::<CheckedIntegerArithmeticEnabled>()
+            .is_some();
         let inner = execute_stream(Arc::clone(&plan), ctx.task_ctx()).map_err(plan_error)?;
         Ok(PinnedStream {
             _ctx: ctx,
@@ -5711,6 +5723,7 @@ impl PinnedStream {
             row_cap: None,
             rows_emitted: 0,
             row_cap_hit: false,
+            checked_integer_arithmetic,
             _scratch: scratch,
         })
     }
@@ -5839,6 +5852,11 @@ impl PinnedStream {
         {
             return spill_error(failure, spill.disk_manager.used_disk_space(), spill.quota);
         }
+        // Issue #3847: the checked kernels' error names both operands, so it
+        // is replaced by the typed error, which names neither.
+        if self.checked_integer_arithmetic && is_arithmetic_overflow(&err) {
+            return SqlError::IntegerArithmeticOverflow;
+        }
         execution_error(err, &self.pool)
     }
 }
@@ -5914,6 +5932,29 @@ fn spill_failure_kind(err: &DataFusionError) -> Option<SpillFailure> {
         },
         DataFusionError::Collection(errors) => errors.iter().find_map(spill_failure_kind),
         _ => None,
+    }
+}
+
+/// True when `err` carries Arrow's checked-kernel overflow, through the same
+/// wrappers [`spill_failure_kind`] looks through.
+fn is_arithmetic_overflow(err: &DataFusionError) -> bool {
+    match err {
+        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+            is_arithmetic_overflow(inner)
+        }
+        DataFusionError::Shared(inner) => is_arithmetic_overflow(inner),
+        DataFusionError::External(boxed) => boxed
+            .downcast_ref::<DataFusionError>()
+            .is_some_and(is_arithmetic_overflow),
+        DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
+            ArrowError::ArithmeticOverflow(_) => true,
+            ArrowError::ExternalError(boxed) => boxed
+                .downcast_ref::<DataFusionError>()
+                .is_some_and(is_arithmetic_overflow),
+            _ => false,
+        },
+        DataFusionError::Collection(errors) => errors.iter().any(is_arithmetic_overflow),
+        _ => false,
     }
 }
 

@@ -509,6 +509,18 @@ pub enum SqlError {
     )]
     IntegerSumOverflow { result_type: &'static str },
 
+    /// An integer `+`, `-` or `*` whose exact result does not fit its result
+    /// type, raised only when [`crate::SqlConfig::checked_integer_arithmetic`]
+    /// is on (crate::checked_arithmetic) instead of returning a wrapped value.
+    /// The text names no operand and no value, so it is safe to return to the
+    /// client; 422, like [`SqlError::IntegerSumOverflow`].
+    #[error(
+        "integer arithmetic overflowed its result type: the exact result of an integer \
+         +, - or * is out of range, and no wrapped value is returned; cast an operand to \
+         DOUBLE for an approximate result"
+    )]
+    IntegerArithmeticOverflow,
+
     /// A DataFusion operator panicked while the query's stream was being
     /// polled, and [`crate::PinnedStream`] unwound it into an error rather
     /// than letting it escape (issue #737).
@@ -701,6 +713,7 @@ impl SqlError {
             | SqlError::Plan(_)
             | SqlError::UnencodableResult { .. }
             | SqlError::IntegerSumOverflow { .. }
+            | SqlError::IntegerArithmeticOverflow
             | SqlError::Execution(_)
             | SqlError::Internal(_)
             | SqlError::OperatorPanic(_) => ErrorClass::Unsupported,
@@ -860,6 +873,8 @@ impl SqlError {
             SqlError::UnencodableResult { .. } => self.to_string(),
             // The aggregate name and the result type; never a value.
             SqlError::IntegerSumOverflow { .. } => self.to_string(),
+            // A fixed text; never an operand or a value.
+            SqlError::IntegerArithmeticOverflow => self.to_string(),
             SqlError::Execution(_) => MSG_EXECUTION.to_string(),
             SqlError::Internal(_) | SqlError::OperatorPanic(_) | SqlError::PlanNotAdmitted(_) => {
                 MSG_INTERNAL.to_string()

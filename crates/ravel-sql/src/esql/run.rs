@@ -142,6 +142,18 @@ async fn run_row_inner(
 ) -> Result<QueryOutput, SqlError> {
     let config = executor.config();
     let (pool, breach) = config.query_pool(executor.tenant_budget(tenant), QueryAccounting::new());
+    // ES|QL long arithmetic has its own null-on-overflow semantics
+    // (`binder::checked_long`); the SQL option never applies here.
+    let unchecked;
+    let config = if config.checked_integer_arithmetic {
+        unchecked = crate::SqlConfig {
+            checked_integer_arithmetic: false,
+            ..config.clone()
+        };
+        &unchecked
+    } else {
+        config
+    };
     let session = build_session(
         config,
         Arc::clone(&pool),

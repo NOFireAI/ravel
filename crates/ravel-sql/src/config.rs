@@ -553,6 +553,18 @@ pub struct SqlConfig {
     /// value that fails [`AggregateReserveAhead::validate`] is replaced by the
     /// default, with a warning, when the pool is built.
     pub aggregate_reserve_ahead: AggregateReserveAhead,
+    /// Whether an integer `+`, `-` or `*` in a SQL statement fails the
+    /// statement with [`crate::SqlError::IntegerArithmeticOverflow`] when its
+    /// exact result does not fit the result type, instead of returning the
+    /// wrapped value (issue #3847). Default `false`, which plans exactly what
+    /// it planned before the option existed.
+    ///
+    /// Covers the expressions a projection, filter (and so `HAVING`),
+    /// aggregate (group keys, arguments and `FILTER` clauses), sort or window
+    /// operator evaluates; see `crate::checked_arithmetic` for what it does
+    /// not cover. ES|QL sessions never take it: ES|QL has its own overflow
+    /// semantics.
+    pub checked_integer_arithmetic: bool,
 }
 
 impl Default for SqlConfig {
@@ -572,6 +584,7 @@ impl Default for SqlConfig {
             spill: None,
             segment_timing: false,
             aggregate_reserve_ahead: AggregateReserveAhead::DEFAULT,
+            checked_integer_arithmetic: false,
         }
     }
 }

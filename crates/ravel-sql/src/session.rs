@@ -133,6 +133,8 @@ use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::object_store::ObjectStoreRegistry;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::functions::datetime::planner::DatetimeFunctionPlanner;
 use datafusion::functions::unicode::planner::UnicodeFunctionPlanner;
 use datafusion::logical_expr::registry::FunctionRegistry;
@@ -147,6 +149,7 @@ use crate::audit_provider::AuditTableProvider;
 use crate::avg::sequential_avg_udaf;
 use crate::bounded_topk::BoundedTopKAggregate;
 use crate::bucketed_final_aggregate::BucketedFinalAggregateRule;
+use crate::checked_arithmetic::{CheckedIntegerArithmetic, CheckedIntegerArithmeticEnabled};
 use crate::compact_slices::CompactSlices;
 use crate::config::SqlConfig;
 use crate::group_keys::DictionaryGroupKeysAsViews;
@@ -661,6 +664,12 @@ pub fn session_config(
             .enable_round_robin_repartition = false;
     }
 
+    // Issue #3847: tells the executor that an Arrow overflow is this mode's
+    // typed error. Absent on the default configuration.
+    if config.checked_integer_arithmetic {
+        session = session.with_extension(Arc::new(CheckedIntegerArithmeticEnabled));
+    }
+
     session
 }
 
@@ -827,10 +836,19 @@ pub fn build_session_with_tables(
     // after the default rules, which is where `with_physical_optimizer_rule`
     // puts it: the rewrite must see the final partial/final aggregation split
     // that `EnforceDistribution` chose.
+    // Issue #3847: flag integer `+`, `-` and `*` as checked before any
+    // default rule runs, so every later rule carries the flagged expressions
+    // forward. Installed on every session; a no-op unless the option is on.
+    // See `crate::checked_arithmetic`.
+    let mut physical_rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> = vec![Arc::new(
+        CheckedIntegerArithmetic::new(config.checked_integer_arithmetic),
+    )];
+    physical_rules.extend(PhysicalOptimizer::new().rules);
     let mut builder = SessionStateBuilder::new()
         .with_config(session)
         .with_runtime_env(runtime)
         .with_default_features()
+        .with_physical_optimizer_rules(physical_rules)
         // Issue #3845: an exact `SUM(x + c)` for an integer `x` and literal
         // `c`, with every such call over one `x` sharing one sum and count.
         // The default rules, with that rewrite before common subexpression
