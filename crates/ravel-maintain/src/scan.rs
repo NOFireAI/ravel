@@ -1888,9 +1888,7 @@ fn classify_terminal(
                     CompactionOutcome::GeometryUnsupported { .. }
                     | CompactionOutcome::TwoLevelUnsupported { .. }
                     | CompactionOutcome::ScratchHeadroom { .. },
-                ) => {
-                    Some(TerminalState::GeometryUnsupported)
-                }
+                ) => Some(TerminalState::GeometryUnsupported),
             }
         }
     }

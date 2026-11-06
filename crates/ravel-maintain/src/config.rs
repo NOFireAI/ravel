@@ -2143,7 +2143,9 @@ pub struct CompactorConfig {
     pub merge_resident_ceiling_bytes: Option<u64>,
     /// The local directory the two-level RLOG merge writes its level-1 runs
     /// under (ADR-3853 D2), one subdirectory per unit, wiped when the unit
-    /// ends. A cache only: nothing durable is ever read from it. `None` (the
+    /// ends. A cache only: nothing durable is ever read from it. The first
+    /// two-level merge locks `ravel-scratch.lock` in it for the life of the
+    /// process, so each process needs its own directory. `None` (the
     /// default) leaves a bucket whose single-level plan is not resident on
     /// the single-level merge, refused under ADR-3853 D0 when its cursor
     /// decode is too amplified.
