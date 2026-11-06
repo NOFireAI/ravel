@@ -15,16 +15,26 @@
 //! - `other_topk_shapes_plan_as_before`: the `ORDER BY ts` shapes, an
 //!   unfiltered `ORDER BY` a `Str` column, the q13 aggregate shape and a
 //!   `FilterExec` between the coalesce and the scan get no inserted sort.
+//! - `the_partition_topk_is_bounded_by_its_configured_limit`: the q26 shape
+//!   with `LIMIT` above `SqlConfig::partition_topk_max_limit` gets no inserted
+//!   sort, with `LIMIT` equal to it gets one, and with the field `None` gets
+//!   none.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
 
 use datafusion::physical_plan::{ExecutionPlan, displayable};
+use datafusion::prelude::SessionContext;
 use ravel_catalog::SegmentRef;
 use ravel_logseg::{AttrValue, LogRecord, RlogConfig};
 use ravel_object_store::memory::MemoryStore;
-use ravel_sql::{DeclaredColumn, DeclaredType};
+use ravel_sql::{
+    CeilingBreach, DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision,
+    SqlConfig, TenantDelegatingPool, TenantMemoryAccountant, build_session,
+};
+use ravel_types::TenantHash;
+use ravel_types::accounting::QueryAccounting;
 
 use crate::logs_str_not_equal_row_filter::{
     Stream, column_texts, encode, nodes, partitioned_session, pretty, provider, put, record, run, s,
@@ -277,6 +287,88 @@ async fn other_topk_shapes_plan_as_before() {
             pretty(&got),
             pretty(&reference),
             "{sql}: the reference answer"
+        );
+    }
+}
+
+/// `partitioned_session` with [`SqlConfig::partition_topk_max_limit`] set to
+/// `max_limit`.
+fn session_with_max_limit(provider: LogsTableProvider, max_limit: Option<usize>) -> SessionContext {
+    let mut config = SqlConfig {
+        partition_topk_max_limit: max_limit,
+        ..SqlConfig::default()
+    };
+    config.engine.sql_partition_count = Some(PARTITIONS);
+    let pool = Arc::new(TenantDelegatingPool::new(
+        1 << 30,
+        TenantMemoryAccountant::new(1 << 30),
+        CeilingBreach::new(),
+        QueryAccounting::new(),
+    ));
+    build_session(
+        &config,
+        pool,
+        SessionTable::Logs(Arc::new(provider)),
+        false,
+        SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(TenantHash([0u8; 16])),
+    )
+    .expect("session")
+}
+
+/// The q26 shape against `SqlConfig::partition_topk_max_limit`, at a ceiling
+/// of 3: `LIMIT 4` (above it) plans one `SortExec`, `LIMIT 3` (equal to it)
+/// plans the global and the partition `SortExec`, and with the field `None`
+/// `LIMIT 3` plans one. Each answer equals the reference answer, so the
+/// ceiling changes the plan and never the rows' sort keys.
+#[tokio::test]
+async fn the_partition_topk_is_bounded_by_its_configured_limit() {
+    let (store, segments) = fixture([
+        &["d", "", "b", "c"],
+        &["a", "", "e", "b"],
+        &["g", "", "h", "a"],
+        &["j", "", "b", "l"],
+    ])
+    .await;
+    let off = partitioned_session(
+        provider(&store, segments.clone(), &declared()).with_row_filter_pushdown(false),
+        PARTITIONS,
+    );
+    let q26 = |k: usize| {
+        format!(
+            "SELECT \"SearchPhrase\" FROM logs WHERE \"SearchPhrase\" <> '' \
+             ORDER BY \"SearchPhrase\" LIMIT {k}"
+        )
+    };
+    let cases: [(Option<usize>, usize, usize, &str); 3] = [
+        (Some(3), 4, 1, "LIMIT above the max: no partition TopK"),
+        (Some(3), 3, 2, "LIMIT equal to the max: a partition TopK"),
+        (None, 3, 1, "the field None: no partition TopK"),
+    ];
+    for (max_limit, k, sorts, what) in cases {
+        let on = session_with_max_limit(provider(&store, segments.clone(), &declared()), max_limit);
+        let sql = q26(k);
+        let (plan, got) = run(&on, &sql).await;
+        let (_, reference) = run(&off, &sql).await;
+        assert_eq!(
+            column_texts(&got, "SearchPhrase"),
+            column_texts(&reference, "SearchPhrase"),
+            "{what}: the reference sort keys"
+        );
+        assert_eq!(
+            nodes(&plan, "SortExec(TopK)").len(),
+            sorts,
+            "{what}: {:?}",
+            shape(&plan)
+        );
+        let partition_sorts = shape(&plan)
+            .iter()
+            .filter(|line| line.contains("preserve_partitioning=[true]"))
+            .count();
+        assert_eq!(
+            partition_sorts,
+            sorts - 1,
+            "{what}: the partition TopK count"
         );
     }
 }

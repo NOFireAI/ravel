@@ -493,9 +493,15 @@ Why the merge happens:
    partition. So a scan that carries a row filter, under a global `SortExec` with a fetch above a
    fetch-less `CoalescePartitionsExec` through pass-through nodes only, gets a per-partition
    `SortExec` with the same sort keys and fetch between them
-   (`a_row_filtered_scan_under_a_global_topk_gets_a_partition_topk`). The answer is unchanged,
-   because the top k of the union is the top k of the partitions' top k. A scan whose TopK is
-   already confirmed for late materialization (`ORDER BY ts`) is left as it is.
+   (`a_row_filtered_scan_under_a_global_topk_gets_a_partition_topk`). The sort keys returned
+   are unchanged, because the top k of the union is the top k of the partitions' top k; which of
+   several rows tied on the sort key is returned may differ, as it already may between runs. A
+   scan whose TopK is already confirmed for late materialization (`ORDER BY ts`) is left as it
+   is. The rule applies only when k is at most `partition_topk_max_limit` (default 1024; `None`
+   turns it off), since each partition then holds its own k-row heap. Measured after the change
+   (2026-11-06, #3231 comment 6674886547, pre-registered in comment 6673596661): q26 hot wall
+   0.509 s to 0.247 s (B/A 0.485, band at most 0.70), 43-statement hot geomean 0.9825, no other
+   statement outside 0.98 to 1.02.
 
 ### Why the evaluator sits after the build, not in the reader
 

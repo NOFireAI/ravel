@@ -193,9 +193,12 @@ The same comparison AND-ed with a shape the scan does not evaluate, in one
 unsplit expression, stays `Inexact`.
 
 A scan carrying such a comparison under an `ORDER BY ... LIMIT k` whose
-global sort reads it through a partition merge and projections only gets a
+global sort reads it through a partition concatenation
+(`CoalescePartitionsExec`), projections and cooperative wrappers only gets a
 per-partition top-`k` sort below the global one, so the global sort reads
-`k` rows per partition instead of every batch the scan emits.
+`k` rows per partition instead of every batch the scan emits. It applies
+when `k` is at most `partition_topk_max_limit` (default 1024; `None` turns
+it off), since each partition holds its own `k`-row heap.
 
 Every other filter stays `Inexact`. An `attrs['k'] = 'v'` equality and
 every declared typed column predicate (ADR-0093) go to the prune-only
