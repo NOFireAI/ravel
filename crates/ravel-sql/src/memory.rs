@@ -1048,9 +1048,9 @@ fn clear_pool_envelopes(budget: &Arc<MemoryBudget>, pool_id: u64) {
     }
 }
 
-/// Envelope bytes currently on `budget`: the figure a refusal names, and the
-/// one tests read since they share the process ledger with every other test
-/// in the binary.
+/// Envelope bytes currently on `budget`, across every pool on it: the figure a
+/// refusal logs at DEBUG and never puts in its message, and the one tests read
+/// since they share the process ledger with every other test in the binary.
 fn envelope_on_budget(budget: &Arc<MemoryBudget>) -> u64 {
     envelope_ledger()
         .get(&budget_key(budget))
@@ -1135,16 +1135,16 @@ static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(0);
 /// is a hypothesis, not a measurement (issue #3899): it is to be re-derived
 /// from the peak bytes non-spillable consumers were seen to hold
 /// ([`TenantDelegatingPool::peak_unspillable_bytes`]).
-pub const SPILL_MODE_HEADROOM_MIN_BYTES: usize = 64 << 20;
+pub(crate) const SPILL_MODE_HEADROOM_MIN_BYTES: usize = 64 << 20;
 
 /// The share of the per-query limit `L`, in percent, the spill-mode headroom
 /// `H` is at least. The same hypothesis as [`SPILL_MODE_HEADROOM_MIN_BYTES`].
-pub const SPILL_MODE_HEADROOM_PERCENT: usize = 10;
+pub(crate) const SPILL_MODE_HEADROOM_PERCENT: usize = 10;
 
 /// The spill-mode headroom `H` for a per-query limit of `query_limit` bytes:
 /// the larger of [`SPILL_MODE_HEADROOM_MIN_BYTES`] and
 /// [`SPILL_MODE_HEADROOM_PERCENT`] percent of the limit, rounded down.
-pub fn spill_mode_headroom(query_limit: usize) -> usize {
+pub(crate) fn spill_mode_headroom(query_limit: usize) -> usize {
     let share = (query_limit as u128 * SPILL_MODE_HEADROOM_PERCENT as u128 / 100) as usize;
     share.max(SPILL_MODE_HEADROOM_MIN_BYTES)
 }
@@ -1249,9 +1249,17 @@ impl ConsumerLedger {
         (current, after)
     }
 
+    /// The reserve-ahead envelopes this pool's consumers carry, in bytes.
+    fn envelope(&self) -> usize {
+        self.entries
+            .values()
+            .fold(0, |total, entry| total.saturating_add(entry.envelope))
+    }
+
     /// The consumer names and bytes that explain a refusal of `asked` bytes
-    /// asked by `consumer`, with `envelope` the process aggregate envelope.
-    fn attribution(&self, consumer: &MemoryConsumer, asked: usize, envelope: u64) -> String {
+    /// asked by `consumer`. Every figure is this pool's own: the message
+    /// reaches the client, and the process ledger is shared across tenants.
+    fn attribution(&self, consumer: &MemoryConsumer, asked: usize) -> String {
         let mut holders: Vec<(&str, usize, usize)> = self
             .entries
             .iter()
@@ -1271,10 +1279,11 @@ impl ConsumerLedger {
         };
         format!(
             "; asked by {} (can_spill={}, {asked} bytes asked); top holders: {top}; \
-             non-spillable consumers hold {} bytes; process aggregate envelope {envelope} bytes",
+             non-spillable consumers hold {} bytes; this query's aggregate envelope {} bytes",
             consumer.name(),
             consumer.can_spill(),
             self.unspillable_charged,
+            self.envelope(),
         )
     }
 }
@@ -1440,13 +1449,19 @@ impl TenantDelegatingPool {
     /// attribution to append to its message.
     fn refuse(&self, consumer: &MemoryConsumer, asked: usize) -> String {
         self.refused.store(true, Ordering::Release);
+        // The process-wide envelope covers every tenant's queries, so it goes
+        // to the operator log and never into the client-visible message.
+        tracing::debug!(
+            consumer = consumer.name(),
+            asked,
+            process_aggregate_envelope_bytes = envelope_on_budget(&self.tenant.budget),
+            "SQL query memory refused"
+        );
         self.attribution(consumer, asked)
     }
 
     fn attribution(&self, consumer: &MemoryConsumer, asked: usize) -> String {
-        let envelope = envelope_on_budget(&self.tenant.budget);
-        self.consumer_ledger()
-            .attribution(consumer, asked, envelope)
+        self.consumer_ledger().attribution(consumer, asked)
     }
 
     /// The spill-mode gate for a checked grow of `consumer`: held for the
@@ -1683,9 +1698,8 @@ impl TenantDelegatingPool {
             && let Err(refused) = self.set_envelope(id, next.envelope, EnvelopeCheck::Checked)
         {
             return Err(DataFusionError::ResourcesExhausted(format!(
-                "aggregate reserve-ahead refused: {additional} bytes asked by {} need \
-                 the process aggregate envelope to grow by {} bytes: {}{}",
-                consumer.name(),
+                "aggregate reserve-ahead refused: the process aggregate envelope needs to grow \
+                 by {} bytes: {}{}",
                 refused.delta,
                 refused.exhausted,
                 self.refuse(consumer, additional)
@@ -2652,7 +2666,7 @@ mod tests {
             "host memory gate refused the reservation: host available memory 1000 bytes \
              is below the 4000 byte floor (requested 500; tenant reserved 500 of tenant \
              limit 600); asked by tenant (can_spill=false, 500 bytes asked); top holders: \
-             none; non-spillable consumers hold 0 bytes; process aggregate envelope 0 bytes"
+             none; non-spillable consumers hold 0 bytes; this query's aggregate envelope 0 bytes"
         );
         assert!(
             !message.contains("exceeds process limit"),
@@ -2707,7 +2721,7 @@ mod tests {
             "process memory budget exhausted: 50 more bytes on top of 60 already reserved \
              exceeds process limit 100 (tenant reserved 50 of tenant limit 60); asked by \
              tenant-b (can_spill=false, 50 bytes asked); top holders: none; non-spillable \
-             consumers hold 0 bytes; process aggregate envelope 0 bytes",
+             consumers hold 0 bytes; this query's aggregate envelope 0 bytes",
             "the tenant figure is read before the rollback, so it names what B held \
              when it was refused, not what it holds after the refused charge came back"
         );
@@ -3530,7 +3544,9 @@ mod tests {
             .expect_err("a 10,192,159-byte envelope cannot fit a 6 MiB budget");
         let message = err.to_string();
         assert!(
-            message.contains("4194304 bytes asked by PartialHashAggregateStream[0]"),
+            message.contains(
+                "asked by PartialHashAggregateStream[0] (can_spill=false, 4194304 bytes asked)"
+            ),
             "{message}"
         );
         assert!(message.contains("grow by 10192159 bytes"), "{message}");
@@ -3984,7 +4000,7 @@ mod tests {
 
     /// Issue #3899: a query-pool refusal names the asker and whether it can
     /// spill, the top three holders by charged bytes, what the consumers that
-    /// cannot spill hold in total, and the process aggregate envelope, after
+    /// cannot spill hold in total, and this query's own aggregate envelope, after
     /// the message's existing leading text.
     #[test]
     fn a_query_pool_refusal_names_the_asker_and_the_top_three_holders() {
@@ -4020,7 +4036,7 @@ mod tests {
             "top holders: HashJoinInput[0] 300 bytes, SortPreservingMergeExec[0] 200 bytes, \
              PartialHashAggregateStream[0] 100 bytes;",
             "non-spillable consumers hold 550 bytes",
-            "process aggregate envelope 100 bytes",
+            "this query's aggregate envelope 100 bytes",
         ] {
             assert!(message.contains(part), "missing {part:?} in {message}");
         }
@@ -4034,9 +4050,40 @@ mod tests {
              exceeds per-query limit 1000; asked by ExternalSorter[0] (can_spill=true, 400 \
              bytes asked); top holders: HashJoinInput[0] 300 bytes, SortPreservingMergeExec[0] \
              200 bytes, PartialHashAggregateStream[0] 100 bytes; non-spillable consumers hold \
-             550 bytes; process aggregate envelope 100 bytes"
+             550 bytes; this query's aggregate envelope 100 bytes"
         );
         assert_eq!(pool.peak_unspillable_bytes(), 550);
+    }
+
+    /// Issue #3899: a refusal reports only its own pool's envelope. Pool B, on
+    /// the same process budget as A, holds a 777-byte envelope; A, holding
+    /// none, is refused on its per-query limit, and its message names A's 0
+    /// bytes and never B's 777, which would let one tenant read another's
+    /// aggregate load by triggering its own refusals.
+    #[test]
+    fn a_refusal_reports_its_own_envelope_not_another_pools() {
+        let _serial = envelope_tests();
+        let budget = Arc::new(MemoryBudget::new(1 << 30));
+        let pool_b = attributed_pool(&budget, 1 << 20, 1 << 30, None);
+        let aggregate_b = register_spilling(&pool_b, PARTIAL);
+        aggregate_b.try_grow(777).expect("within every ceiling");
+        assert_eq!(envelope_on_budget(&budget), 777);
+
+        let pool_a = attributed_pool(&budget, 100, 1 << 30, None);
+        let join_a = register_on(&pool_a, "HashJoinInput[0]");
+        let message = exhausted_message(
+            join_a
+                .try_grow(101)
+                .expect_err("101 exceeds A's 100-byte query limit"),
+        );
+        assert!(!message.contains("777"), "B's envelope leaked: {message}");
+        assert_eq!(
+            message,
+            "query memory pool exhausted: 101 more bytes on top of 0 already reserved \
+             exceeds per-query limit 100; asked by HashJoinInput[0] (can_spill=false, 101 \
+             bytes asked); top holders: none; non-spillable consumers hold 0 bytes; this \
+             query's aggregate envelope 0 bytes"
+        );
     }
 
     /// Issue #3899: the tenant, process and reserve-ahead refusals carry the
@@ -4054,7 +4101,7 @@ mod tests {
             "tenant memory budget exhausted: 40 more bytes on top of 20 already reserved \
              exceeds tenant limit 50; asked by HashJoinInput[0] (can_spill=false, 40 bytes \
              asked); top holders: HashJoinInput[0] 20 bytes; non-spillable consumers hold 20 \
-             bytes; process aggregate envelope 0 bytes"
+             bytes; this query's aggregate envelope 0 bytes"
         );
 
         let process_budget = Arc::new(MemoryBudget::new(40));
@@ -4066,7 +4113,7 @@ mod tests {
             "process memory budget exhausted: 60 more bytes on top of 0 already reserved \
              exceeds process limit 40 (tenant reserved 60 of tenant limit 1000); asked by \
              ExternalSorter[0] (can_spill=true, 60 bytes asked); top holders: none; \
-             non-spillable consumers hold 0 bytes; process aggregate envelope 0 bytes"
+             non-spillable consumers hold 0 bytes; this query's aggregate envelope 0 bytes"
         );
 
         let envelope_budget = Arc::new(MemoryBudget::new(1000));
@@ -4081,17 +4128,26 @@ mod tests {
         );
         assert!(
             message.starts_with(
-                "aggregate reserve-ahead refused: 60 bytes asked by \
-                 PartialHashAggregateStream[0] need the process aggregate envelope to grow by \
-                 60 bytes: "
+                "aggregate reserve-ahead refused: the process aggregate envelope needs to grow \
+                 by 60 bytes: "
             ),
             "{message}"
+        );
+        assert_eq!(
+            message.matches("PartialHashAggregateStream[0]").count(),
+            1,
+            "the asker appears once: {message}"
+        );
+        assert_eq!(
+            message.matches("60 bytes asked").count(),
+            1,
+            "the asked byte count appears once: {message}"
         );
         assert!(
             message.ends_with(
                 "; asked by PartialHashAggregateStream[0] (can_spill=true, 60 bytes asked); \
                  top holders: HashJoinInput[0] 950 bytes; non-spillable consumers hold 950 \
-                 bytes; process aggregate envelope 0 bytes"
+                 bytes; this query's aggregate envelope 0 bytes"
             ),
             "{message}"
         );
@@ -4189,7 +4245,7 @@ mod tests {
              bytes charged and enveloped, over the spill-mode cap 900 (per-query limit 1000 \
              less headroom 100); asked by ExternalSorter[0] (can_spill=true, 1 bytes asked); \
              top holders: ExternalSorter[0] 900 bytes; non-spillable consumers hold 0 bytes; \
-             process aggregate envelope 0 bytes"
+             this query's aggregate envelope 0 bytes"
         );
         assert_eq!(spill.reserved(), 900, "the refused grow reserved nothing");
         sorter.free();
