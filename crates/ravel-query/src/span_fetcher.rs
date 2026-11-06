@@ -1393,7 +1393,7 @@ impl SpanSegmentFetcher {
         let (Some(first), Some(last)) = (buckets.keys().next(), buckets.keys().next_back()) else {
             return Ok(Some(TraceKeyProbe::Absent));
         };
-        let area = (buckets.len() > KEY_INDEX_SET_PROBE_MAX_RUNS).then(|| first.0..last.1);
+        let area = (buckets.len() > KEY_INDEX_SET_PROBE_MAX_RUNS).then_some(first.0..last.1);
         let area_bytes = match &area {
             Some(range) => Some(
                 self.key_index_read(seg_ref, tenant_hash, probe, range.clone(), accounting)
