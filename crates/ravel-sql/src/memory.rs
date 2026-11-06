@@ -4050,8 +4050,8 @@ mod tests {
     /// grows that were never refused, the overshooting infallible `grow`
     /// included.
     ///
-    /// FLIP: set the flag only in `try_charge_unflagged`'s query-pool
-    /// `map_err` (and not in `try_charge`); the process case fails.
+    /// FLIP: set the flag in `try_charge` only for a refusal whose text starts
+    /// "query memory pool exhausted" and this reads `["tenant", "process"]`.
     #[test]
     fn refused_is_set_by_each_refusal_kind_and_by_nothing_else() {
         let _serial = envelope_tests();
@@ -4090,6 +4090,7 @@ mod tests {
             drop(sorter);
             (pool, refused)
         };
+        let mut unflagged = Vec::new();
         for (kind, (pool, outcome), leading) in [
             ("query", query, "query memory pool exhausted: "),
             ("tenant", tenant, "tenant memory budget exhausted: "),
@@ -4106,8 +4107,11 @@ mod tests {
                 message.contains("; asked by ") && message.contains("; top holders: "),
                 "{kind}: {message}"
             );
-            assert!(pool.refused(), "{kind} refusal sets refused()");
+            if !pool.refused() {
+                unflagged.push(kind);
+            }
         }
+        assert_eq!(unflagged, Vec::<&str>::new(), "refusals that left refused() false");
 
         let (_, pool) = attributed_pool(100, 1 << 30, AggregateReserveAhead::OFF);
         let res = consumer_on(&pool, "ExternalSorter[0]", false);
