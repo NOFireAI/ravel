@@ -1003,6 +1003,12 @@ fn thread_ticks() -> HashMap<String, (String, u64)> {
 /// Linux USER_HZ, the unit of `/proc/*/stat` utime and stime.
 const TICKS_PER_S: f64 = 100.0;
 
+/// Seconds between two tick readings. A counter that reads lower the second
+/// time (a thread id reused between samples) reports zero, not a wrapped u64.
+fn ticks_elapsed_s(before: u64, after: u64) -> f64 {
+    after.saturating_sub(before) as f64 / TICKS_PER_S
+}
+
 // ---------------------------------------------------------------------------
 // Profile (profiling feature only).
 
@@ -1670,11 +1676,7 @@ async fn run(
         .iter()
         .map(|(tid, (comm, t1))| {
             let before = threads0.get(tid).map(|(_, t)| *t).unwrap_or(0);
-            (
-                tid.clone(),
-                comm.clone(),
-                t1.saturating_sub(before) as f64 / TICKS_PER_S,
-            )
+            (tid.clone(), comm.clone(), ticks_elapsed_s(before, *t1))
         })
         .filter(|r| r.2 > 0.0)
         .collect();
@@ -1719,8 +1721,8 @@ async fn run(
         },
         "wall_s": wall_s,
         "process_cpu_s": cpu_s,
-        "user_s (proc ticks)": u1.saturating_sub(u0) as f64 / TICKS_PER_S,
-        "sys_s (proc ticks)": s1.saturating_sub(s0) as f64 / TICKS_PER_S,
+        "user_s (proc ticks)": ticks_elapsed_s(u0, u1),
+        "sys_s (proc ticks)": ticks_elapsed_s(s0, s1),
         "cores_busy (cpu/wall)": cpu_s / wall_s,
         "records_per_s_wall": l0_records as f64 / wall_s,
         "records_per_s_per_core (records / process cpu)": l0_records as f64 / cpu_s,
@@ -2222,6 +2224,13 @@ mod tests {
         for inside in [8_000.0, 30_000.0, 70_000.0] {
             assert_eq!(check_realism(inside), Ok(()), "{inside}");
         }
+    }
+
+    #[test]
+    fn ticks_elapsed_s_saturates_when_the_counter_goes_backwards() {
+        assert_eq!(ticks_elapsed_s(100, 350).to_bits(), 2.5f64.to_bits());
+        assert_eq!(ticks_elapsed_s(350, 100).to_bits(), 0.0f64.to_bits());
+        assert_eq!(ticks_elapsed_s(u64::MAX, 0).to_bits(), 0.0f64.to_bits());
     }
 
     const FIGURE_INPUTS: usize = 8;
