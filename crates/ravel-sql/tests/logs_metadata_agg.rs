@@ -2259,14 +2259,13 @@ async fn sum_and_avg_over_all_null_is_null_byte_identical() {
     }
 }
 
-/// One statement over one object, two answers. `SUM(status + 1)` over
-/// `i64::MAX` and `-i64::MAX` answers 2 from statistics, the exact total
-/// `0 + 1 x 2`, while the scan adds 1 per row with DataFusion's wrapping `+`:
-/// `i64::MAX + 1` reads `i64::MIN`, the checked sum of the two wrapped rows
-/// is `-2^64 + 2`, and the query fails with the integer sum overflow. Which
-/// one a caller gets depends only on whether statistics loaded.
+/// One statement over one object, one answer. `SUM(status + 1)` over
+/// `i64::MAX` and `-i64::MAX` is the exact total `0 + 1 x 2 = 2` from
+/// statistics and from the scan alike, though each row's `status + 1` leaves
+/// `i64` (issue #3845): both run `sum + 1 x count` over the exact sum and
+/// count of `status`.
 #[tokio::test]
-async fn sum_plus_literal_answers_from_stats_where_the_scan_overflows() {
+async fn sum_plus_literal_is_exact_from_stats_and_scan() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
     let rows = [(100, Some(i64::MAX)), (200, Some(-i64::MAX))];
     let seg = write_real_segment(&store, "logs/wrap.rlog", 1, &rows).await;
@@ -2304,14 +2303,45 @@ async fn sum_plus_literal_answers_from_stats_where_the_scan_overflows() {
         scan_plan.contains("LogsScanExec"),
         "without statistics the statement must scan; plan was:\n{scan_plan}"
     );
-    let err = scan_answer
-        .as_ref()
-        .expect_err("the scan's wrapped rows must overflow the checked sum");
+    let scan_answer = scan_answer.as_ref().expect("the scanned answer");
+    assert_eq!(single_i64(scan_answer), Some(2));
+}
+
+/// The same rows through a statement the statistics path declines, two
+/// aggregates, with statistics loaded: the scan reads the exact 2 as well.
+#[tokio::test]
+async fn sum_plus_literal_beside_a_second_aggregate_scans_exactly() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let rows = [(100, Some(i64::MAX)), (200, Some(-i64::MAX))];
+    let seg = write_real_segment(&store, "logs/wrap.rlog", 1, &rows).await;
+    let stats = loaded_stats(vec![(
+        &seg,
+        stats_segment(&seg, vec![stat_from_rows(&rows)]),
+    )]);
+    let snapshot = snapshot_of(vec![seg.clone()], Vec::new());
+    let ctx = logs_session(provider(&store, snapshot, status_col(), Some(stats))).expect("session");
+    let plan = ctx
+        .sql("SELECT SUM(status + 1), COUNT(*) FROM logs")
+        .await
+        .expect("plan")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let shown = plan_str(&plan);
     assert!(
-        err.to_string()
-            .contains("aggregate sum overflowed its Int64 result type"),
-        "{err}"
+        shown.contains("LogsScanExec") && !shown.contains("MetadataOnlyExec"),
+        "two aggregates must scan; plan was:\n{shown}"
     );
+    let answer = collect(plan, ctx.task_ctx())
+        .await
+        .expect("the scanned answer");
+    assert_eq!(single_i64(&answer), Some(2));
+    let count = answer[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count");
+    assert_eq!(count.value(0), 2);
 }
 
 // ---------------------------------------------------------------------------

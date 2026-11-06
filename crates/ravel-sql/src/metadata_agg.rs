@@ -22,11 +22,12 @@
 //!   ungrouped, filter-free aggregate directly over a [`LogsScanExec`].
 //!   Answered by [`LogsScanExec::declared_column_sum`] as `sum + k *
 //!   non_null_count` (#861); `k = 0` covers the plain `SUM(col)`. `SUM` over
-//!   zero non-null rows is `NULL`, matching the scan. The two differ at the
-//!   `i64` edge: this answer is the exact total, while the scan adds `k` per
-//!   row with DataFusion's wrapping `+`, so a row whose `col + k` leaves `i64`
-//!   reaches the sum wrapped, and where the exact total fits `i64` the scanned
-//!   query fails with the integer sum overflow.
+//!   zero non-null rows is `NULL`, matching the scan. With `k != 0`,
+//!   [`crate::sum_plus`] has already rewritten the call into an
+//!   `exact_sum_count(col)` aggregate under a projection that computes `sum +
+//!   k * count`; this rule answers that aggregate with the same sum and count,
+//!   and the projection applies the same overflow check on both paths, so the
+//!   statistics answer and the scanned one agree at the `i64` edge too.
 //! - **q30**: `AVG(<declared integer column>) FROM logs`, likewise ungrouped
 //!   and filter-free. Answered as `sum / non_null_count` in `f64`, `NULL` when
 //!   there are no non-null rows.
@@ -60,7 +61,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch};
+use datafusion::arrow::array::{ArrayRef, Decimal128Array, Int64Array, RecordBatch, StructArray};
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -91,6 +92,8 @@ use crate::declared::{DeclaredColumn, DeclaredType};
 use crate::logs_pushdown::{filter_has_row_filter, filter_is_exact};
 use crate::logs_scan::{DeclaredColumnSum, DeclaredGroupCounts, LogsScanExec};
 use crate::session::LOGS_TABLE;
+use crate::sum::SumKind;
+use crate::sum_plus::{EXACT_SUM_COUNT, sum_count_type};
 
 /// The rule's name, as it appears in DataFusion's optimizer diagnostics.
 pub const METADATA_ONLY_AGGREGATE_RULE: &str = "metadata_only_aggregate";
@@ -224,6 +227,11 @@ enum StatsAggregate<C> {
     Avg {
         col: C,
     },
+    /// `crate::sum_plus`'s shared exact sum and non-null count of `col`, the
+    /// aggregate an optimized `SUM(col + k)` runs.
+    SumCount {
+        col: C,
+    },
 }
 
 /// The one aggregate-call classification both sides share: the physical
@@ -247,6 +255,7 @@ fn stats_aggregate<C>(
         ("sum", StatsArg::Column(col)) => Some(StatsAggregate::Sum { col, addend: 0 }),
         ("sum", StatsArg::ColumnPlus(col, addend)) => Some(StatsAggregate::Sum { col, addend }),
         ("avg", StatsArg::Column(col)) => Some(StatsAggregate::Avg { col }),
+        (EXACT_SUM_COUNT, StatsArg::Column(col)) => Some(StatsAggregate::SumCount { col }),
         _ => None,
     }
 }
@@ -774,8 +783,28 @@ fn rewrite(node: Arc<dyn ExecutionPlan>) -> DFResult<Transformed<Arc<dyn Executi
                 None => return Ok(Transformed::no(node)),
             }
         }
+        // q03/q04 after `crate::sum_plus`: the sum and non-null count of a
+        // declared integer column, ungrouped, no filter. The projection above
+        // computes `sum + k * count` and its overflow check.
+        (None, StatsAggregate::SumCount { col: col_index }) => {
+            if filter.is_some() {
+                return Ok(Transformed::no(node));
+            }
+            let Some(k) = scan.declared_index_for_output(col_index) else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(cs) = scan.declared_column_sum(k) else {
+                return Ok(Transformed::no(node));
+            };
+            match sum_count_batch(&schema, &cs) {
+                Some(batch) => batch,
+                None => return Ok(Transformed::no(node)),
+            }
+        }
         // A grouped SUM/AVG is out of scope for this rule.
-        (Some(_), StatsAggregate::Sum { .. }) | (Some(_), StatsAggregate::Avg { .. }) => {
+        (Some(_), StatsAggregate::Sum { .. })
+        | (Some(_), StatsAggregate::Avg { .. })
+        | (Some(_), StatsAggregate::SumCount { .. }) => {
             return Ok(Transformed::no(node));
         }
     };
@@ -843,6 +872,33 @@ fn sum_scalar(schema: &SchemaRef, cs: &DeclaredColumnSum, addend: i128) -> Optio
     let term = addend.checked_mul(i128::from(cs.non_null_count))?;
     let total = cs.sum.checked_add(term)?;
     Some(ScalarValue::Int64(Some(i64::try_from(total).ok()?)))
+}
+
+/// The `exact_sum_count(col)` answer as a one-row batch: the exact sum and the
+/// non-null count. `None` -- a decline -- when the outer schema is not the
+/// single `exact_sum_count` column, the sum is outside `Decimal128(38, 0)`, or
+/// the count does not fit `i64`.
+fn sum_count_batch(schema: &SchemaRef, cs: &DeclaredColumnSum) -> Option<RecordBatch> {
+    let DataType::Struct(fields) = sum_count_type() else {
+        return None;
+    };
+    if schema.fields().len() != 1
+        || *schema.field(0).data_type() != DataType::Struct(fields.clone())
+    {
+        return None;
+    }
+    let sum = SumKind::Signed.state_value(cs.sum).ok()?;
+    let sums = Decimal128Array::from(vec![sum])
+        .with_precision_and_scale(38, 0)
+        .ok()?;
+    let counts = Int64Array::from(vec![count_to_i64(cs.non_null_count)?]);
+    let array = StructArray::try_new(
+        fields,
+        vec![Arc::new(sums) as ArrayRef, Arc::new(counts)],
+        None,
+    )
+    .ok()?;
+    RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(array)]).ok()
 }
 
 /// The `AVG(col)` answer as a scalar: `sum / non_null_count` in `f64`, or SQL
