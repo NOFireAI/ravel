@@ -65,6 +65,15 @@
 //! same as any other cross-axis case (a follow-up would need a new
 //! `ravel_rspan` primitive first, out of this crate's reach).
 //!
+//! A `trace_id IN (...)` conjunct (ADR-3692 decision 6) is the one
+//! disjunction on `trace_id` that is carried: its 16-byte or 32-hex literals,
+//! 2 to 1,024 distinct, become [`SpansPushdown::trace_ids`], a key set the
+//! tier-2 router and the tier-1 set probe answer, and the reader filters the
+//! rows by the ts window alone. A disjunction of `trace_id =` equalities stays
+//! refused, and DataFusion rewrites a list of at most three values into such
+//! a disjunction before the scan sees it, so a list of two or three ids
+//! carries no key (one id becomes a plain `=`).
+//!
 //! # Why one window covers both `start_ts` and `end_ts`
 //!
 //! [`ravel_rspan::SpanQuery`] carries one window `[ts_min, ts_max]`, and the
@@ -96,6 +105,10 @@ use datafusion::scalar::ScalarValue;
 /// to be a valid RSPAN trace key (`ravel_rspan::record::TRACE_ID_WIDTH`).
 const TRACE_ID_WIDTH: usize = 16;
 
+/// The most distinct ids a `trace_id IN (...)` key set carries (ADR-2983
+/// decision 5's k, [`ravel_query::key_index_route::KEY_SET_MAX_KEYS`]).
+pub const TRACE_ID_SET_MAX: usize = ravel_query::key_index_route::KEY_SET_MAX_KEYS;
+
 /// Everything the extractor pulled out of a `spans` filter set, all widen-only.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SpansPushdown {
@@ -108,6 +121,13 @@ pub struct SpansPushdown {
     /// The single trace id an exact `trace_id = <literal>` equality pinned, if
     /// any: the RSPAN fast-path key.
     pub trace_id: Option<[u8; 16]>,
+    /// The distinct trace ids, ascending, of a `trace_id IN (...)` conjunct of
+    /// 2 to 1,024 16-byte or 32-hex literals (ADR-3692 decision 6): the tier-2
+    /// router's key set and the tier-1 set probe's. Empty for any other
+    /// shape, and ignored when [`Self::trace_id`] is set, which pins one id.
+    /// The reader filters rows by the ts window alone for a set, so the
+    /// `Inexact` residual is the `IN` list's exact evaluator.
+    pub trace_ids: Vec<[u8; 16]>,
     /// Inclusive lower bound on `duration_ns`, if provably required. Folded
     /// from `duration_ns` lower-bound conjuncts the same way `ts_lo` folds
     /// `start_ts`/`end_ts` bounds (ADR-0045 decision 5).
@@ -248,6 +268,30 @@ fn handle_leaf(expr: &Expr, out: &mut SpansPushdown) {
         Expr::InList(il) if !il.negated && is_status_code_col(&il.expr) => {
             if let Some(mask) = status_mask_union(il.list.iter()) {
                 fold_status_mask(out, mask);
+            }
+        }
+        // `trace_id IN (...)` of 16-byte or 32-hex literals: the first such
+        // list is the key set; a list of one distinct id pins it like `=`.
+        // A wrong-width or malformed element, or more than 1,024 distinct
+        // ids, carries nothing.
+        Expr::InList(il) if !il.negated && is_trace_id_col(&il.expr) => {
+            if !out.trace_ids.is_empty() {
+                return;
+            }
+            let Some(mut ids) = il.list.iter().map(lit_trace_id).collect::<Option<Vec<_>>>() else {
+                return;
+            };
+            ids.sort_unstable();
+            ids.dedup();
+            match ids.as_slice() {
+                [] => {}
+                [one] => {
+                    if out.trace_id.is_none() {
+                        out.trace_id = Some(*one);
+                    }
+                }
+                _ if ids.len() <= TRACE_ID_SET_MAX => out.trace_ids = ids,
+                _ => {}
             }
         }
         _ => {}

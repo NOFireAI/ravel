@@ -571,10 +571,17 @@ async fn route_segments(ctx: &PartitionCtx, segments: &[SegmentRef]) -> DFResult
         routes: vec![None; segments.len()],
         figures: None,
     };
-    let (Some((route_ctx, pool)), Some(arm)) = (&ctx.key_index_route, ctx.query.key_equals.first())
-    else {
+    let Some((route_ctx, pool)) = &ctx.key_index_route else {
         return Ok(routed);
     };
+    // One key arm, an equality or an `IN` set; the provider routes nothing
+    // else (`LogsTableProvider::scan_key_index_route`).
+    let key_set = match (ctx.query.key_equals.as_slice(), &ctx.query.key_in) {
+        ([arm], None) => log_key_set(arm),
+        ([], Some(set)) => log_key_in_set(set),
+        _ => return Ok(routed),
+    }
+    .map_err(|e| DataFusionError::External(e.into()))?;
     if route_ctx.parts.origin.len() != segments.len() {
         tracing::warn!(
             origins = route_ctx.parts.origin.len(),
@@ -600,7 +607,6 @@ async fn route_segments(ctx: &PartitionCtx, segments: &[SegmentRef]) -> DFResult
         ..Snapshot::default()
     };
     let parts = SnapshotParts::new(route_ctx.parts.parts.clone(), origin);
-    let key_set = log_key_set(arm).map_err(|e| DataFusionError::External(e.into()))?;
     let reader = LogLeafRangeReader::new(&ctx.fetcher, ctx.tenant_hash);
     let budget = PoolLeafBudget(Arc::clone(pool));
     let input = RouteInput {
