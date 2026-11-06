@@ -71,6 +71,9 @@ pub mod sql_corpus;
 pub mod sql_latency;
 pub mod string_fingerprint;
 pub mod string_fingerprint_report;
+pub mod structural_read;
+pub mod structural_read_report;
+pub mod t13;
 pub mod value_shapes;
 #[cfg(feature = "walk-expiry")]
 pub mod walk_expiry;
