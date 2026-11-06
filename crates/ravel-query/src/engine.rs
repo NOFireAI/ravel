@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
 use promql_parser::parser::{Expr, Offset};
-use ravel_catalog::{Catalog, SegmentRef, ShardGeneration, Snapshot};
+use ravel_catalog::{Catalog, SegmentOrigin, SegmentRef, ShardGeneration, Snapshot};
 use ravel_cpu_gate::{JobSize, ReadGate, ReadSite};
 use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_promql::{
@@ -438,6 +438,12 @@ struct ResolvedBounded {
     /// decision 6), carried to every request-budget check downstream of it so
     /// a refusal caused by fold lag reads as one.
     fold_lag: FoldLag,
+    /// Data object keys of the snapshot-sourced segments the name postings
+    /// filtered, empty when the postings pruned nothing (issue #3862). The
+    /// dictionary-first probe skips these for a statement whose only positive
+    /// equalities are names; a recent or token-resolved segment never
+    /// passed through the postings and is not here.
+    postings_filtered: std::collections::HashSet<String>,
 }
 
 /// Resolves snapshots, fetches segments, merges cross-segment duplicates,
@@ -2056,13 +2062,16 @@ impl QueryEngine {
             // dedup `service_fetch_multiplier` below was sized from, so the
             // two never drift onto two different notions of "distinct".
             let distinct_plans = distinct_plans_by_matcher(plans);
-            // ADR-3694 decision 1 as amended for issue #3862: a statement
-            // whose only positive equalities are names the postings already
-            // applied cannot miss in any dictionary, so it never pays the
-            // two-step probe's extra GET.
+            // ADR-3694 decision 1 as amended for issue #3862: one gate per
+            // distinct matcher set. For a statement whose only positive
+            // equalities are names, the segments the name postings filtered
+            // cannot miss in any dictionary and take the one-step probe;
+            // every other segment, a recent one included, goes through its
+            // plan's gate.
             accounting.dictionary_probe().arm(
+                distinct_plans.iter().map(|plan| plan.matchers.as_slice()),
                 concurrency,
-                only_name_equalities(&distinct_plans) && snapshot.segments_pruned > 0,
+                only_name_equalities(&distinct_plans),
             );
             // ADR-0103 eligibility gate, evaluated ONCE per query over the whole
             // resolved snapshot's segment set and the generation history THIS
@@ -2453,6 +2462,7 @@ impl QueryEngine {
             generations: first_generations,
             unfolded_segments_resolved: first_unfolded,
             fold_lag: first_fold_lag,
+            postings_filtered: first_postings_filtered,
         } = self
             .resolve_bounded(
                 tenant_hash,
@@ -2489,6 +2499,9 @@ impl QueryEngine {
             &first_accounting,
             first_unfolded,
         );
+        first_accounting
+            .dictionary_probe()
+            .record_postings_filtered(first_postings_filtered);
         match attempt(
             first,
             first_generations,
@@ -2508,6 +2521,7 @@ impl QueryEngine {
                     generations: second_generations,
                     unfolded_segments_resolved: second_unfolded,
                     fold_lag: second_fold_lag,
+                    postings_filtered: second_postings_filtered,
                 } = self
                     .resolve_bounded(
                         tenant_hash,
@@ -2538,6 +2552,9 @@ impl QueryEngine {
                     &second_accounting,
                     second_unfolded,
                 );
+                second_accounting
+                    .dictionary_probe()
+                    .record_postings_filtered(second_postings_filtered);
                 match attempt(
                     second,
                     second_generations,
@@ -2637,11 +2654,23 @@ impl QueryEngine {
             now_ns,
             self.config.fold_lag_threshold(),
         );
+        let postings_filtered = if snapshot.segments_pruned > 0 {
+            snapshot
+                .segments
+                .iter()
+                .zip(&origins.origins)
+                .filter(|(_, origin)| **origin == SegmentOrigin::SealedBelowWatermark)
+                .map(|(seg, _)| seg.data_object_key.clone())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         Ok(ResolvedBounded {
             snapshot,
             generations,
             unfolded_segments_resolved,
             fold_lag,
+            postings_filtered,
         })
     }
 
