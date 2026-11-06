@@ -4,7 +4,9 @@
 //! The total of `x + c` over a group's non-null rows is `sum(x) + c *
 //! count(x)`. [`ExactSumPlusLiteral`] rewrites each such `sum` call of an
 //! `Aggregate` into an `exact_sum_count` aggregate over `x`, which keeps the
-//! exact `i128` sum and the non-null count of `x`, and a projection above the
+//! exact sum and the non-null count of `x` (grouped, the sum in `x`'s own
+//! 64-bit type, with the `i128` promotion of `crate::sum::NarrowSums` for a
+//! group that leaves it), and a projection above the
 //! aggregate that evaluates `exact_sum_plus` on it: `sum + c * count` in
 //! `i128`, converted to the call's result type once. A total that does not fit
 //! fails with [`SqlError::IntegerSumOverflow`], and a group with no non-null
@@ -28,8 +30,8 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Int64Array, PrimitiveArray,
-    StructArray,
+    Array, ArrayRef, ArrowPrimitiveType, AsArray, BooleanArray, Decimal128Array, Int64Array,
+    PrimitiveArray, StructArray,
 };
 use datafusion::arrow::buffer::ScalarBuffer;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields, Int64Type, UInt64Type};
@@ -49,7 +51,9 @@ use datafusion::scalar::ScalarValue;
 
 #[cfg(doc)]
 use crate::error::SqlError;
-use crate::sum::{SumKind, as_decimal128, as_primitive, row_is_filtered, sum_kind};
+use crate::sum::{
+    NarrowSum, NarrowSums, SumKind, as_decimal128, as_primitive, row_is_filtered, sum_kind,
+};
 
 /// The rule's name, as it appears in DataFusion's optimizer diagnostics.
 pub const EXACT_SUM_PLUS_RULE: &str = "exact_sum_plus_literal";
@@ -58,9 +62,10 @@ pub const EXACT_SUM_PLUS_RULE: &str = "exact_sum_plus_literal";
 /// answers it from statistics and `crate::memory` sizes its groups by it.
 pub(crate) const EXACT_SUM_COUNT: &str = "exact_sum_count";
 
-/// Per-group bytes of the `exact_sum_count` groups accumulator: an `i128` sum
-/// and an `i64` count.
-pub(crate) const EXACT_SUM_COUNT_GROUP_WIDTHS: [usize; 2] = [16, 8];
+/// Per-group bytes of the `exact_sum_count` groups accumulator: an `i64` or
+/// `u64` sum and an `i64` count. Its table of groups promoted past the sum's
+/// width is not a `Vec` of a group width.
+pub(crate) const EXACT_SUM_COUNT_GROUP_WIDTHS: [usize; 2] = [8, 8];
 
 /// The output type of `exact_sum_count`: the exact sum as `Decimal128(38, 0)`
 /// and the non-null count.
@@ -405,11 +410,12 @@ impl AggregateUDFImpl for ExactSumCount {
         &self,
         args: AccumulatorArgs,
     ) -> DFResult<Box<dyn GroupsAccumulator>> {
-        Ok(Box::new(SumCountGroupsAccumulator {
-            kind: input_kind(args.expr_fields)?,
-            sums: Vec::new(),
-            counts: Vec::new(),
-        }))
+        Ok(match input_kind(args.expr_fields)? {
+            kind @ SumKind::Signed => Box::new(SumCountGroupsAccumulator::<Int64Type>::new(kind)),
+            kind @ SumKind::Unsigned => {
+                Box::new(SumCountGroupsAccumulator::<UInt64Type>::new(kind))
+            }
+        })
     }
 }
 
@@ -516,56 +522,53 @@ impl Accumulator for SumCountAccumulator {
     }
 }
 
-/// The flat per-group accumulator of `exact_sum_count`: `sums[g]` and
-/// `counts[g]` are group `g`'s exact sum and non-null count.
+/// The flat per-group accumulator of `exact_sum_count`, over `T`, the
+/// argument's coerced type (`Int64` or `UInt64`): `sums` holds group `g`'s
+/// exact sum in `T`'s own width, promoting a group that leaves it, and
+/// `counts[g]` its non-null count.
 #[derive(Debug)]
-struct SumCountGroupsAccumulator {
-    kind: SumKind,
-    sums: Vec<i128>,
+struct SumCountGroupsAccumulator<T: ArrowPrimitiveType> {
+    sums: NarrowSums<T::Native>,
     counts: Vec<i64>,
 }
 
-impl SumCountGroupsAccumulator {
+impl<T> SumCountGroupsAccumulator<T>
+where
+    T: ArrowPrimitiveType,
+    T::Native: NarrowSum,
+{
+    fn new(kind: SumKind) -> Self {
+        Self {
+            sums: NarrowSums::new(kind),
+            counts: Vec::new(),
+        }
+    }
+
     fn resize(&mut self, total_num_groups: usize) {
-        self.sums.resize(total_num_groups, 0);
+        self.sums.resize(total_num_groups);
         self.counts.resize(total_num_groups, 0);
     }
 
-    fn add(&mut self, group: usize, value: i128) -> DFResult<()> {
-        let sum = &mut self.sums[group];
-        *sum = self.kind.checked_add(*sum, value)?;
+    #[inline]
+    fn add(&mut self, group: usize, value: T::Native) -> DFResult<()> {
+        self.sums.add(group, value)?;
         let count = &mut self.counts[group];
         *count = count.checked_add(1).ok_or_else(count_overflow)?;
         Ok(())
     }
 
-    fn update_primitive<T>(
-        &mut self,
-        values: &PrimitiveArray<T>,
-        group_indices: &[usize],
-        opt_filter: Option<&BooleanArray>,
-    ) -> DFResult<()>
-    where
-        T: datafusion::arrow::datatypes::ArrowPrimitiveType,
-        T::Native: Into<i128>,
-    {
-        if values.null_count() == 0 && opt_filter.is_none() {
-            for (&group, &value) in group_indices.iter().zip(values.values().iter()) {
-                self.add(group, value.into())?;
-            }
-            return Ok(());
-        }
-        for (row, &group) in group_indices.iter().enumerate() {
-            if row_is_filtered(opt_filter, row) || values.is_null(row) {
-                continue;
-            }
-            self.add(group, values.value(row).into())?;
-        }
-        Ok(())
+    fn take(&mut self, emit_to: EmitTo) -> DFResult<StructArray> {
+        let sums = self.sums.take_wide(emit_to)?;
+        let counts = emit_to.take_needed(&mut self.counts);
+        sum_count_array(self.sums.kind(), sums, counts)
     }
 }
 
-impl GroupsAccumulator for SumCountGroupsAccumulator {
+impl<T> GroupsAccumulator for SumCountGroupsAccumulator<T>
+where
+    T: ArrowPrimitiveType,
+    T::Native: NarrowSum,
+{
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
@@ -574,16 +577,20 @@ impl GroupsAccumulator for SumCountGroupsAccumulator {
         total_num_groups: usize,
     ) -> DFResult<()> {
         self.resize(total_num_groups);
-        match self.kind {
-            SumKind::Signed => {
-                let values = as_primitive::<Int64Type>(&values[0])?;
-                self.update_primitive(&values, group_indices, opt_filter)
+        let values = as_primitive::<T>(&values[0])?;
+        if values.null_count() == 0 && opt_filter.is_none() {
+            for (&group, &value) in group_indices.iter().zip(values.values().iter()) {
+                self.add(group, value)?;
             }
-            SumKind::Unsigned => {
-                let values = as_primitive::<UInt64Type>(&values[0])?;
-                self.update_primitive(&values, group_indices, opt_filter)
-            }
+            return Ok(());
         }
+        for (row, &group) in group_indices.iter().enumerate() {
+            if row_is_filtered(opt_filter, row) || values.is_null(row) {
+                continue;
+            }
+            self.add(group, values.value(row))?;
+        }
+        Ok(())
     }
 
     fn merge_batch(
@@ -596,8 +603,7 @@ impl GroupsAccumulator for SumCountGroupsAccumulator {
         let sums = as_decimal128(&values[0])?;
         let counts = as_count(&values[1])?;
         for (row, &group) in group_indices.iter().enumerate() {
-            let sum = &mut self.sums[group];
-            *sum = self.kind.checked_add(*sum, sums.value(row))?;
+            self.sums.add_wide(group, sums.value(row))?;
             let count = &mut self.counts[group];
             *count = count
                 .checked_add(counts.value(row))
@@ -607,16 +613,11 @@ impl GroupsAccumulator for SumCountGroupsAccumulator {
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> DFResult<ArrayRef> {
-        let sums = emit_to.take_needed(&mut self.sums);
-        let counts = emit_to.take_needed(&mut self.counts);
-        Ok(Arc::new(sum_count_array(self.kind, sums, counts)?))
+        Ok(Arc::new(self.take(emit_to)?))
     }
 
     fn state(&mut self, emit_to: EmitTo) -> DFResult<Vec<ArrayRef>> {
-        let sums = emit_to.take_needed(&mut self.sums);
-        let counts = emit_to.take_needed(&mut self.counts);
-        let state = sum_count_array(self.kind, sums, counts)?;
-        Ok(state.columns().to_vec())
+        Ok(self.take(emit_to)?.columns().to_vec())
     }
 
     /// One state row per input row; a filtered or NULL row is a zero sum and
@@ -626,22 +627,22 @@ impl GroupsAccumulator for SumCountGroupsAccumulator {
         values: &[ArrayRef],
         opt_filter: Option<&BooleanArray>,
     ) -> DFResult<Vec<ArrayRef>> {
+        let kind = self.sums.kind();
         let rows = values[0].len();
         let mut sums = vec![0i128; rows];
         let mut counts = vec![0i64; rows];
-        self.kind.for_each_value(&values[0], |row, value| {
+        kind.for_each_value(&values[0], |row, value| {
             if !row_is_filtered(opt_filter, row) {
                 sums[row] = value;
                 counts[row] = 1;
             }
             Ok(())
         })?;
-        Ok(sum_count_array(self.kind, sums, counts)?.columns().to_vec())
+        Ok(sum_count_array(kind, sums, counts)?.columns().to_vec())
     }
 
     fn size(&self) -> usize {
-        self.sums.capacity() * std::mem::size_of::<i128>()
-            + self.counts.capacity() * std::mem::size_of::<i64>()
+        self.sums.size() + self.counts.capacity() * std::mem::size_of::<i64>()
     }
 }
 
@@ -1222,5 +1223,63 @@ mod tests {
 
         let plain = query(table(&ones(&values), values, 1), 1, "SELECT sum(v) FROM t");
         assert_not_rewritten(&plain, "plain sum");
+    }
+
+    /// The grouped state is an `i64` sum and an `i64` count per group. Over
+    /// 131,072 groups grown batch by batch it reports 16 x 131,072 =
+    /// 2,097,152 bytes, within 16 per group plus a 64-byte allowance. The
+    /// `i128` sum it replaced made that 24 x 131,072 = 3,145,728.
+    #[test]
+    fn grouped_state_is_at_most_sixteen_bytes_per_group() {
+        const GROUPS: usize = 1 << 17;
+        let mut accumulator = SumCountGroupsAccumulator::<Int64Type>::new(SumKind::Signed);
+        for start in (0..GROUPS).step_by(8192) {
+            let values: ArrayRef = Arc::new(Int64Array::from(vec![1i64; 8192]));
+            let groups: Vec<usize> = (start..start + 8192).collect();
+            accumulator
+                .update_batch(&[values], &groups, None, start + 8192)
+                .expect("update");
+        }
+        let size = accumulator.size();
+        assert!(size <= 16 * GROUPS + 64, "{size} bytes for {GROUPS} groups");
+        assert_eq!(size, 2_097_152);
+    }
+
+    /// Beside a group that never leaves `i64`: a group whose sum of `v` leaves
+    /// `i64` and comes back, and one whose sum of `v` leaves and stays out
+    /// while `c x count` brings the total back, each return their own total.
+    /// At eight partitions no two rows of a group share one, so only the
+    /// merge leaves `i64`.
+    #[test]
+    fn promoted_groups_return_exact_totals() {
+        let cases = [
+            (
+                "sum(v + 1)",
+                vec![1, 2, 1, 2, 1, 1],
+                vec![Some(MAX), Some(5), Some(MAX), Some(6), Some(MIN), Some(MIN)],
+                vec![2, 13],
+            ),
+            (
+                "sum(v - 9223372036854775807)",
+                vec![1, 2, 1],
+                vec![Some(MAX), Some(MAX), Some(MAX)],
+                vec![0, 0],
+            ),
+        ];
+        for (sum, keys, values, expected) in cases {
+            let values = signed(&values);
+            for partitions in [1, 8] {
+                let case = format!("{sum} at {partitions}");
+                let run = query(
+                    table(&keys, Arc::clone(&values), partitions),
+                    partitions,
+                    &format!("SELECT {sum} FROM t GROUP BY k ORDER BY k"),
+                );
+                assert_rewritten(&run, &case);
+                let expected: Vec<Vec<Option<i128>>> =
+                    expected.iter().map(|&total| vec![Some(total)]).collect();
+                assert_eq!(cells(&run.batches(&case)), expected, "{case}");
+            }
+        }
     }
 }
