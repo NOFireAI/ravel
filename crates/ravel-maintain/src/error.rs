@@ -105,13 +105,14 @@ pub enum TwoLevelCheck {
         /// The group size the figures admit.
         group_size: u64,
     },
-    /// Constraint (b): one block per run, plus the reads in flight, plus the
+    /// Constraint (b): one block per run part, plus the reads in flight, plus the
     /// final part target, does not fit the resident ceiling at level 2. The
     /// block term is the larger of `runs x run_block_bytes` and the largest
     /// stream's level-2 estimate, which exceeds it when a run part cut splits
     /// a stream across two blocks of one run.
     LevelTwoFit {
-        /// Runs merged at level 2.
+        /// Run parts merged at level 2: every part of every run, each one a
+        /// level-2 input.
         runs: u64,
         /// The largest pass price of one run block.
         run_block_bytes: u64,
@@ -148,7 +149,7 @@ impl std::fmt::Display for TwoLevelCheck {
                 ceiling_bytes,
             } => write!(
                 f,
-                "level 2 over {runs} runs needs the larger of {runs} x {run_block_bytes} and the largest stream estimate {stream_estimate_bytes}, + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes (constraint b)"
+                "level 2 over {runs} run parts needs the larger of {runs} x {run_block_bytes} and the largest stream estimate {stream_estimate_bytes}, + {in_flight_bytes} in flight + {part_target_bytes} part target, above the ceiling of {ceiling_bytes} bytes (constraint b)"
             ),
         }
     }
@@ -378,6 +379,16 @@ pub enum MaintainError {
         /// Bytes available to an unprivileged writer on that filesystem.
         free: u64,
         /// The configured scratch directory.
+        path: std::path::PathBuf,
+    },
+    /// Another process holds the scratch directory's lock (ADR-3853 D2: two
+    /// processes never share a scratch directory). Raised before the first
+    /// block GET.
+    #[error(
+        "RLOG compaction refused: scratch directory {path:?} is locked by another process (ADR-3853 D2); give each process its own scratch_dir"
+    )]
+    ScratchLocked {
+        /// The lock file inside the configured scratch directory.
         path: std::path::PathBuf,
     },
     #[error("RLOG compaction refused before writing any part: {0}")]

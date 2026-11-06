@@ -71,6 +71,24 @@ pub enum CompactionOutcome {
         records: u64,
         predicted_decoded_rows: u64,
     },
+    /// The bucket's single-level plan is refused under ADR-3853 D0 and its
+    /// two-level merge failed `check` (ADR-3853 D1). Nothing was published
+    /// and the claim is released. Terminal for this build like
+    /// [`Self::GeometryUnsupported`], so a refusal after level 1 does not pay
+    /// for level 1 again on every pass.
+    TwoLevelUnsupported {
+        inputs: usize,
+        check: crate::error::TwoLevelCheck,
+    },
+    /// The bucket's single-level plan is refused under ADR-3853 D0 and the
+    /// scratch volume holds less than its two-level merge needs (ADR-3853
+    /// D2). Refused before the first block GET; terminal like
+    /// [`Self::GeometryUnsupported`].
+    ScratchHeadroom {
+        need: u64,
+        free: u64,
+        path: std::path::PathBuf,
+    },
     /// Built and published (or converged / abandoned): `parts` parts written,
     /// `publish` records how the record PUT resolved.
     Compacted {
@@ -333,7 +351,8 @@ fn merge_end_outcome(
         Err(
             MaintainError::MergeGeometryUnsupported { .. }
             | MaintainError::MergeTwoLevelUnsupported { .. }
-            | MaintainError::ScratchHeadroom { .. },
+            | MaintainError::ScratchHeadroom { .. }
+            | MaintainError::ScratchLocked { .. },
         ) => "refused",
         Err(_) => "failed",
         Ok(_) if cancelled => "cancelled",
@@ -708,6 +727,31 @@ async fn compact_bucket_scoped(
             records,
             predicted_decoded_rows,
         ),
+        Err(MaintainError::MergeTwoLevelUnsupported { inputs, check }) => {
+            tracing::warn!(
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                inputs,
+                %check,
+                "compaction refused a bucket: its two-level merge does not fit; \
+                 nothing published, the L0 inputs stay live (ADR-3853)"
+            );
+            CompactionOutcome::TwoLevelUnsupported { inputs, check }
+        }
+        Err(MaintainError::ScratchHeadroom { need, free, path }) => {
+            tracing::warn!(
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                need,
+                free,
+                path = %path.display(),
+                "compaction refused a bucket: its two-level merge needs more scratch \
+                 than the volume has free; nothing fetched or published (ADR-3853 D2)"
+            );
+            CompactionOutcome::ScratchHeadroom { need, free, path }
+        }
         other => other?,
     };
 
