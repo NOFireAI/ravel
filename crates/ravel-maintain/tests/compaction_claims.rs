@@ -1321,3 +1321,357 @@ async fn cancel_after_first_part(signal: Signal) -> (Checkpoint, u64) {
         other => panic!("expected a cancelled run, got {other:?}"),
     }
 }
+
+/// Sixty RLOG inputs of forty streams, one record each: a logs bucket whose
+/// single-level plan at a small ceiling is a cursor merge, so a scratch
+/// directory routes it to the two-level merge (ADR-3853).
+async fn seed_sixty_rlog_inputs(store: &dyn ObjectStoreBackend) -> ravel_maintain::Bucket {
+    for i in 0..60u32 {
+        let records: Vec<_> = (0..40u32)
+            .map(|s| log_record(s, i64::from(i) * 1_000 + i64::from(s), &format!("r{i}-{s}")))
+            .collect();
+        seed_rlog_input(
+            store,
+            Uuid::from_u128(u128::from(i) + 1),
+            10,
+            u64::from(i) + 1,
+            &records,
+        )
+        .await;
+    }
+    logs_bucket()
+}
+
+/// A two-level compactor config: final parts of 4 KiB, run parts closing at
+/// `run_target`, unit ceiling `ceiling`, `workers` level-1 workers.
+fn two_level(
+    config: CompactorConfig,
+    ceiling: u64,
+    run_target: u64,
+    workers: usize,
+    scratch: &std::path::Path,
+) -> CompactorConfig {
+    CompactorConfig {
+        rlog_l1_part_memory_target_bytes: Some(4096),
+        merge_resident_ceiling_bytes: Some(ceiling),
+        rlog_run_memory_target_bytes: run_target,
+        scratch_dir: Some(scratch.to_path_buf()),
+        level1_workers: Some(workers),
+        ..config
+    }
+}
+
+/// A scratch directory for this file's test `name`, absent on return.
+fn fresh_scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "ravel-maintain-claims-{}-{name}",
+        std::process::id()
+    ));
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("clear {}: {e}", dir.display()),
+    }
+    dir
+}
+
+/// `P`, the per-input resident price of [`seed_sixty_rlog_inputs`]'s inputs,
+/// read off a two-level run refused by constraint (a).
+async fn sixty_inputs_per_input_bytes(scratch: &std::path::Path) -> u64 {
+    let probe = MemoryStore::new();
+    let b = seed_sixty_rlog_inputs(&probe).await;
+    let refused = ravel_maintain::compact_bucket(
+        &probe,
+        &FixedClock::new(sealed_now_ns()),
+        &two_level(
+            CompactorConfig::default(),
+            1 << 20,
+            (1 << 20) - 1,
+            1,
+            scratch,
+        ),
+        &b,
+    )
+    .await
+    .expect("a refusal is an outcome");
+    match refused {
+        CompactionOutcome::TwoLevelUnsupported {
+            check:
+                ravel_maintain::error::TwoLevelCheck::GroupSize {
+                    per_input_bytes, ..
+                },
+            ..
+        } => per_input_bytes,
+        other => panic!("expected a group-size refusal, got {other:?}"),
+    }
+}
+
+/// The claim clock of a two-level run: fixed until the run's ledger shows a
+/// level-1 run part written to scratch, then a whole lease later, so the next
+/// checkpoint any worker reaches renews.
+struct AfterFirstRunPart {
+    start_ns: i64,
+    ledger: RequestLedger,
+}
+
+impl Clock for AfterFirstRunPart {
+    fn now_ns(&self) -> i64 {
+        if self.ledger.report().scratch_write_bytes > 0 {
+            self.start_ns + LEASE.as_nanos() as i64
+        } else {
+            self.start_ns
+        }
+    }
+}
+
+/// A store that notes the ledger's scratch writes issued, and their bytes, at
+/// the moment its one scripted fault, of kind `fault`, fires.
+struct NoteScratchAtFault {
+    inner: FaultStore<MemoryStore>,
+    ledger: RequestLedger,
+    fault: (Op, FaultKind),
+    at_fault: std::sync::Mutex<Option<ScratchAtFault>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScratchAtFault {
+    writes: u64,
+    bytes: u64,
+}
+
+/// Level-1 workers run as their own tasks, so between a worker's failing store
+/// call and the moment that worker stops the others, each other worker may
+/// already have issued the run-part write it was on. Past that, none writes
+/// another: at most `W1 - 1` writes follow the fault.
+fn assert_at_most_one_write_per_other_worker(
+    report: &ravel_maintain::RunRequestReport,
+    at_fault: ScratchAtFault,
+    what: &str,
+) {
+    let after = report.scratch_writes - at_fault.writes;
+    assert!(
+        after < report.level1_workers,
+        "{what}: {after} run-part writes followed the fault with {} workers: {report:?}",
+        report.level1_workers
+    );
+    assert!(
+        report.scratch_write_bytes >= at_fault.bytes,
+        "{report:?} {at_fault:?}"
+    );
+}
+
+impl NoteScratchAtFault {
+    fn new(inner: FaultStore<MemoryStore>, ledger: &RequestLedger, fault: (Op, FaultKind)) -> Self {
+        Self {
+            inner,
+            ledger: ledger.clone(),
+            fault,
+            at_fault: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn note(&self) {
+        if self.inner.fault_count(self.fault.0, self.fault.1) > 0 {
+            let mut at = self.at_fault.lock().unwrap();
+            if at.is_none() {
+                let report = self.ledger.report();
+                *at = Some(ScratchAtFault {
+                    writes: report.scratch_writes,
+                    bytes: report.scratch_write_bytes,
+                });
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for NoteScratchAtFault {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        let outcome = self.inner.put(key, data, opts).await;
+        self.note();
+        outcome
+    }
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        let outcome = self.inner.get(key, range).await;
+        self.note();
+        outcome
+    }
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// ADR-3853 D4 with ADR-0065 claims: four level-1 workers share one claim
+/// guard, and a claim stolen at the first renewal, which falls due once the
+/// first run part is issued, stops every worker past the run part it was
+/// already writing. The unit abandons at that part boundary, level 2 never
+/// runs, nothing is PUT to the store, and the scratch unit is removed.
+///
+/// `P` comes from a first run refused by constraint (a). The steal run's
+/// ceiling `U = 18 P` leaves each worker `4.5 P`, so with run parts closing at
+/// `P` the 60 inputs merge in 20 groups of 3.
+#[tokio::test]
+async fn a_stolen_claim_cancels_every_level1_worker() {
+    let clock = FixedClock::new(sealed_now_ns());
+    let dir = fresh_scratch("stolen");
+    let per_input = sixty_inputs_per_input_bytes(&dir).await;
+
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite)
+            .with_key_contains(COMPACTION_CLAIMS_PREFIX)
+            .with_occurrence(Occurrence::Nth(2)),
+    );
+    let ledger = RequestLedger::new();
+    let store = NoteScratchAtFault::new(
+        FaultStore::new(MemoryStore::new(), plan),
+        &ledger,
+        (Op::Put, FaultKind::FailedConditionalWrite),
+    );
+    let b = seed_sixty_rlog_inputs(&store).await;
+    let claim_clock = AfterFirstRunPart {
+        start_ns: sealed_now_ns(),
+        ledger: ledger.clone(),
+    };
+    let config = CompactorConfig {
+        claim_participant: Some(
+            ClaimParticipant::new(Uuid::from_u128(1), Arc::new(claim_clock) as Arc<dyn Clock>)
+                .with_sleeper(Arc::new(NoWait)),
+        ),
+        ..two_level(
+            claiming_config(1, &clock, 1, &ledger),
+            18 * per_input,
+            per_input,
+            4,
+            &dir,
+        )
+    };
+    let outcome = compact_bucket_claimed(&store, &clock, &config, &b)
+        .await
+        .expect("a lost claim is an outcome, never an error");
+
+    match outcome {
+        ClaimedCompaction::Cancelled { at, outcome } => {
+            assert_eq!(at, Checkpoint::PartBoundary, "after a run part PUT");
+            assert_eq!(
+                outcome,
+                CompactionOutcome::Compacted {
+                    parts: 0,
+                    publish: PublishOutcome::Abandoned
+                }
+            );
+        }
+        other => panic!("expected a cancelled run, got {other:?}"),
+    }
+    assert_eq!(
+        store
+            .inner
+            .fault_count(Op::Put, FaultKind::FailedConditionalWrite),
+        1,
+        "the scripted renewal rejection fired exactly once"
+    );
+    let report = ledger.report();
+    assert_eq!(report.level1_workers, 4, "{report:?}");
+    assert_eq!(report.level1_groups, 20, "{report:?}");
+    let at_steal = store.at_fault.lock().unwrap().expect("the steal fired");
+    assert!(at_steal.writes > 0, "the steal followed a run part");
+    assert_at_most_one_write_per_other_worker(&report, at_steal, "steal");
+    assert!(
+        report.level1_passes < 20,
+        "the workers stopped before merging every group: {report:?}"
+    );
+    assert_eq!(report.level2_passes, 0, "{report:?}");
+    assert_eq!(report.part_put.requests, 0, "{report:?}");
+    assert_eq!(report.publish.requests, 0, "{report:?}");
+    assert_eq!(record_keys_in(&store, &b).await.len(), 0);
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .expect("scratch dir")
+        .map(|e| e.expect("entry").file_name())
+        .filter(|n| n.to_str().is_some_and(|n| !n.ends_with(".lock")))
+        .collect();
+    assert!(left.is_empty(), "the scratch unit was removed: {left:?}");
+}
+
+/// ADR-3853 D4: with no claim to lose, the shared stop token is the only
+/// thing that stops the other workers when one fails. A block GET of input 32
+/// fails for good partway through level 1, in group 10 of 20; every other
+/// worker stops past the run part it was already writing, the unit returns
+/// that error,
+/// and the scratch unit is removed.
+#[tokio::test]
+async fn a_failed_level1_worker_stops_every_level1_worker() {
+    let clock = FixedClock::new(sealed_now_ns());
+    let dir = fresh_scratch("failed-worker");
+    let per_input = sixty_inputs_per_input_bytes(&dir).await;
+
+    // Input 32's third read: its commit record, its footer, then its blocks.
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Get,
+            ScriptedFault::Permanent("input 32 block lost".to_string()),
+        )
+        .with_key_contains("-000000000020.10.")
+        .with_occurrence(Occurrence::Nth(3)),
+    );
+    let ledger = RequestLedger::new();
+    let store = NoteScratchAtFault::new(
+        FaultStore::new(MemoryStore::new(), plan),
+        &ledger,
+        (Op::Get, FaultKind::Permanent),
+    );
+    let b = seed_sixty_rlog_inputs(&store).await;
+    let config = CompactorConfig {
+        request_ledger: Some(ledger.clone()),
+        ..two_level(
+            CompactorConfig::default(),
+            18 * per_input,
+            per_input,
+            4,
+            &dir,
+        )
+    };
+    let err = ravel_maintain::compact_bucket(&store, &clock, &config, &b)
+        .await
+        .expect_err("a lost block fails the unit");
+    assert!(err.to_string().contains("input 32 block lost"), "{err}");
+    assert_eq!(
+        store.inner.fault_count(Op::Get, FaultKind::Permanent),
+        1,
+        "the scripted GET failure fired exactly once"
+    );
+
+    let report = ledger.report();
+    assert_eq!(report.level1_workers, 4, "{report:?}");
+    assert_eq!(report.level1_groups, 20, "{report:?}");
+    let at_fault = store.at_fault.lock().unwrap().expect("the GET failed");
+    assert!(
+        at_fault.writes > 0,
+        "run parts were written before the failure"
+    );
+    assert_at_most_one_write_per_other_worker(&report, at_fault, "failed GET");
+    assert_eq!(report.level2_passes, 0, "{report:?}");
+    assert_eq!(report.part_put.requests, 0, "{report:?}");
+    assert_eq!(report.publish.requests, 0, "{report:?}");
+    let left: Vec<_> = std::fs::read_dir(&dir)
+        .expect("scratch dir")
+        .map(|e| e.expect("entry").file_name())
+        .filter(|n| n.to_str().is_some_and(|n| !n.ends_with(".lock")))
+        .collect();
+    assert!(left.is_empty(), "the scratch unit was removed: {left:?}");
+}
