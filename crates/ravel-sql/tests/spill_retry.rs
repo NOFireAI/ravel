@@ -322,7 +322,8 @@ async fn a_bounded_top_k_gets_no_tie_order_edit_with_spill_configured() {
     };
     let plan = plan_time_plan(&configured, MAX_TOP_SQL).await;
     let control = plan_time_plan(&unconfigured, MAX_TOP_SQL).await;
-    let text = |plan: &Arc<dyn ExecutionPlan>| format!("{}", displayable(plan.as_ref()).indent(false));
+    let text =
+        |plan: &Arc<dyn ExecutionPlan>| format!("{}", displayable(plan.as_ref()).indent(false));
     assert_eq!(
         text(&plan),
         text(&control),

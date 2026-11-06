@@ -1629,8 +1629,8 @@ async fn spilled_and_unlimited(sql: &str) -> (TopTen, TopTen) {
         )
     };
     let unlimited = run_top_ten(&*q33_executor(config(AMPLE_QUERY_BYTES), &file).await, sql).await;
-    let budget = usize::try_from(unlimited.peak_pool_bytes * SPILL_BUDGET_PERCENT / 100)
-        .expect("fits");
+    let budget =
+        usize::try_from(unlimited.peak_pool_bytes * SPILL_BUDGET_PERCENT / 100).expect("fits");
     let spilled = run_top_ten(&*q33_executor(config(budget), &file).await, sql).await;
     eprintln!(
         "issue #3899: unlimited peak={} budget={budget} spill files={} rows_written={}",
@@ -1761,7 +1761,10 @@ async fn a_reserve_ahead_refusal_of_a_spillable_aggregate_spills_on_the_retry() 
     let process = || Arc::new(ravel_memory::MemoryBudget::new(unlimited.peak_pool_bytes));
 
     let spilled = run_top_ten(&*q33_executor_in(config(), &file, process()).await, sql).await;
-    assert_eq!(spilled.spill_retries, 1, "the statement answers on its retry");
+    assert_eq!(
+        spilled.spill_retries, 1,
+        "the statement answers on its retry"
+    );
     assert_eq!(
         spilled.first_refusal,
         Some("aggregate_reserve_ahead"),

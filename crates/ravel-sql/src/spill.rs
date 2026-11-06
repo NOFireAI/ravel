@@ -1544,7 +1544,10 @@ mod tests {
             .map(|_| budget.reserve_share().expect("one of four shares"))
             .collect();
         assert_eq!(
-            shares.iter().map(SpillReservation::bytes).collect::<Vec<_>>(),
+            shares
+                .iter()
+                .map(SpillReservation::bytes)
+                .collect::<Vec<_>>(),
             [16 * GIB; 4]
         );
         assert_eq!(budget.reserved(), 64 * GIB);

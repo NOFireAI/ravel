@@ -163,9 +163,7 @@ use crate::ipcrypt_udf::{IpcryptDeployment, SessionPrincipal, SqlCapabilities};
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_pushdown::{extract_logs, prune_is_rewrite_neutral};
 use crate::logs_scan::ScanExecutions;
-use crate::memory::{
-    CeilingBreach, MemoryRefusal, TenantDelegatingPool, TenantMemoryAccountant,
-};
+use crate::memory::{CeilingBreach, MemoryRefusal, TenantDelegatingPool, TenantMemoryAccountant};
 use crate::min_commit_token::MinCommitToken;
 use crate::output::QueryOutput;
 use crate::parquet::{
@@ -3520,23 +3518,21 @@ impl SqlExecutor {
         // same aggregates and distincts either way; rewriting a `Sort` node
         // changes no `Aggregate` or `Distinct` node).
         let analyzed = match analyzed {
-            Some(plan) if wants_spill_gate => Some(spill_tie_ordered(
-                plan,
-                config.bounded_topk_max_limit,
-            )),
+            Some(plan) if wants_spill_gate => {
+                Some(spill_tie_ordered(plan, config.bounded_topk_max_limit))
+            }
             other => other,
         };
         // Issue #3899: a first attempt with spill configured keeps what the
         // spill retry needs to classify the statement, read only if this
         // attempt is refused. `analyzed` itself stays the unedited plan.
-        let spill_probe = (extras.spill == SpillAttempt::First && config.spill.is_some()).then(|| {
-            SpillProbe {
+        let spill_probe =
+            (extras.spill == SpillAttempt::First && config.spill.is_some()).then(|| SpillProbe {
                 analyzed: analyzed.clone(),
                 parquet_schemas: parquet_schemas.clone(),
                 principal: principal.clone(),
                 bounded_topk_max_limit: config.bounded_topk_max_limit,
-            }
-        });
+            });
         // ADR-0954: spill needs BOTH an operator-configured scratch area and a
         // plan whose every aggregate is exact under a changed folding order.
         // Fail closed the same way: an unbuildable plan is not eligible, so it
@@ -5765,8 +5761,8 @@ impl SpillRetryReport {
             statement_fingerprint = fingerprint,
             outcome,
             first_refusal = self.first_refusal,
-            first_refusal_after_ms = u64::try_from(self.first_refusal_after.as_millis())
-                .unwrap_or(u64::MAX),
+            first_refusal_after_ms =
+                u64::try_from(self.first_refusal_after.as_millis()).unwrap_or(u64::MAX),
             spill_bytes_written = self.spill_bytes_written,
             spill_bytes_read = self
                 .spill_bytes_read
@@ -6513,7 +6509,9 @@ fn fetch_refused_accounted(err: &SqlError) -> bool {
 /// The refusal class a spill retry's log line names for its first attempt.
 fn first_refusal_class(err: &SqlError, pool: PoolReport) -> &'static str {
     match err {
-        SqlError::ResourcesExhausted(_) => pool.first.map_or("resources_exhausted", MemoryRefusal::as_str),
+        SqlError::ResourcesExhausted(_) => pool
+            .first
+            .map_or("resources_exhausted", MemoryRefusal::as_str),
         _ => "fetch_memory_exhausted",
     }
 }
@@ -8937,7 +8935,8 @@ pub(crate) mod tests {
                         field: &tracing::field::Field,
                         value: &dyn std::fmt::Debug,
                     ) {
-                        self.0.insert(field.name().to_string(), format!("{value:?}"));
+                        self.0
+                            .insert(field.name().to_string(), format!("{value:?}"));
                     }
                     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
                         self.0.insert(field.name().to_string(), value.to_string());
@@ -8972,12 +8971,18 @@ pub(crate) mod tests {
             Some(16 << 30),
         );
         let infos = Infos::default();
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(infos.clone()), || {
-            report.emit("00000000deadbeef", "answered");
-        });
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(infos.clone()),
+            || {
+                report.emit("00000000deadbeef", "answered");
+            },
+        );
         let lines = infos.0.lock().expect("not poisoned").clone();
         let expected: Fields = [
-            ("message", "SQL statement retried with spill after a memory refusal"),
+            (
+                "message",
+                "SQL statement retried with spill after a memory refusal",
+            ),
             ("statement_fingerprint", "00000000deadbeef"),
             ("outcome", "answered"),
             ("first_refusal", "query_pool"),
