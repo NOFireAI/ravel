@@ -17985,4 +17985,88 @@ mod tests {
         .await;
         assert_eq!(answer, Some(KeyProbe::Present(vec![1])));
     }
+
+    /// A set mixing present and absent keys answers exactly the union of the
+    /// present keys' blocks, below and above `B_run`, whether an absent key's
+    /// bucket is empty (no read) or holds other keys (read, no match).
+    ///
+    /// Flip to watch it fail: in `probe_key_set`, return `KeyProbe::Absent`
+    /// at the first absent key, either where `locate_key` answers `Done` (an
+    /// empty bucket) or where a bucket's `finish` is not `Present`. The mixed
+    /// cases holding that kind of absent key then answer `Absent`.
+    #[tokio::test]
+    async fn set_probe_answers_the_union_of_a_mixed_set() {
+        let (fetcher, seg_ref) = fixture().await;
+        let bucket_of = |v: i64| {
+            bucket_index(&key8_str(&format!("r{v}")), KEY_IDX_WRITER_BUCKET_BITS).expect("bucket")
+        };
+        let occupied: BTreeSet<_> = (0..RECORDS).map(bucket_of).collect();
+        let absent = RECORDS..RECORDS + 10_000;
+        // Absent keys of both kinds: in a bucket the object's keys occupy,
+        // and in a bucket the object leaves empty.
+        let shares: Vec<i64> = absent
+            .clone()
+            .filter(|v| occupied.contains(&bucket_of(*v)))
+            .take(3)
+            .collect();
+        let alone: Vec<i64> = absent
+            .filter(|v| !occupied.contains(&bucket_of(*v)))
+            .take(3)
+            .collect();
+        assert_eq!((shares.len(), alone.len()), (3, 3), "fixture geometry");
+
+        let present: Vec<i64> = vec![3, 101, 250];
+        let cases: [(&str, Vec<i64>); 3] = [
+            ("absent in occupied buckets", shares.clone()),
+            ("absent in empty buckets", alone.clone()),
+            (
+                "absent of both kinds",
+                shares.iter().chain(&alone).copied().collect(),
+            ),
+        ];
+        for (what, absent) in cases {
+            let set: Vec<i64> = present.iter().chain(&absent).copied().collect();
+            assert!(distinct_buckets(&set) <= KEY_INDEX_SET_PROBE_MAX_RUNS);
+            let (answer, _) = probe(
+                &fetcher,
+                &seg_ref,
+                &LogQuery::new(i64::MIN, i64::MAX).with_key_in(key_in(set)),
+            )
+            .await;
+            assert_eq!(
+                answer,
+                Some(KeyProbe::Present(blocks_of(&present))),
+                "below B_run, {what}"
+            );
+        }
+
+        // Above B_run: 300 absent keys beside 100 present ones, plus the
+        // empty-bucket keys, read as the prefix and one bucket area.
+        let present: Vec<i64> = (0..100).collect();
+        let set: Vec<i64> = present
+            .iter()
+            .copied()
+            .chain(RECORDS..RECORDS + 300)
+            .chain(alone.iter().copied())
+            .collect();
+        let touched = set
+            .iter()
+            .map(|v| bucket_of(*v))
+            .filter(|b| occupied.contains(b))
+            .collect::<BTreeSet<_>>()
+            .len();
+        assert!(
+            touched > KEY_INDEX_SET_PROBE_MAX_RUNS,
+            "the set must touch more than B_run non-empty buckets: {touched}"
+        );
+        let (answer, gets) = probe(
+            &fetcher,
+            &seg_ref,
+            &LogQuery::new(i64::MIN, i64::MAX).with_key_in(key_in(set)),
+        )
+        .await;
+        assert_eq!(answer, Some(KeyProbe::Present(blocks_of(&present))));
+        assert_eq!(blocks_of(&present), (0..13).collect::<Vec<u32>>());
+        assert_eq!(gets, 2, "the prefix and one read of the bucket area");
+    }
 }
