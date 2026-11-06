@@ -1419,7 +1419,8 @@ async fn merge_catalogs_with_geometry(
     );
     // Only a bucket the D0 refusal would stop merges in two levels, and only
     // when the process has scratch to hold the runs (ADR-3853 D0, D1); every
-    // other plan runs single-level as before.
+    // other plan runs single-level as before. Only compaction asks for the
+    // refusal, and it keeps every record, so `keep` stops here.
     if geometry == GeometryCheck::Refuse
         && let Some(refusal) = geometry_refusal(&plan, catalogs.len(), stream_ids.len())
     {
@@ -1435,7 +1436,7 @@ async fn merge_catalogs_with_geometry(
             retain_bytes,
             scratch_dir,
         };
-        return two_level_merge(&target, catalogs, &stream_ids, width_ns, output, keep).await;
+        return two_level_merge(&target, catalogs, &stream_ids, width_ns, output).await;
     }
     let mut sink = PartSink {
         store,
@@ -1456,6 +1457,7 @@ async fn merge_catalogs_with_geometry(
         read_ledger: config.request_ledger.as_ref(),
         level: None,
         run: None,
+        pipeline: None,
         memory_target: config.rlog_memory_target_bytes(),
         stored_target: config.rlog_stored_target_bytes(),
     };
@@ -1609,6 +1611,129 @@ fn level1_group_size(per_input: u64, run_target: u64, ceiling: u64, inputs: usiz
     (room / per_input.max(1)).min(inputs as u64)
 }
 
+/// The cores one merge unit may use (ADR-3853 D4): the host's `cores` divided
+/// by the units the cursor budget runs at once (`budget / ceiling`), at least 1.
+fn unit_core_share(cores: usize, budget: u64, ceiling: u64) -> usize {
+    let units = usize::try_from(budget / ceiling.max(1))
+        .unwrap_or(usize::MAX)
+        .max(1);
+    (cores / units).max(1)
+}
+
+/// The figures [`derive_level1_workers`] prices a worker count with, all known
+/// before level 1 reads a block.
+struct Level1Shape {
+    /// `P`, the largest per-input cost of constraint (a).
+    per_input: u64,
+    /// Each input's decoded bytes, in canonical order: what it adds to its
+    /// group's run, so a group of them cuts into `ceil(sum / run_target)` run
+    /// parts.
+    run_bytes: Vec<u64>,
+    /// The price of one level-2 block, taken from the inputs' largest block.
+    block_bytes: u64,
+    /// The bytes `input_read_concurrency` row group GETs hold at once.
+    in_flight: u64,
+    run_target: u64,
+    part_target: u64,
+    /// `U`, the unit's resident ceiling.
+    ceiling: u64,
+}
+
+impl Level1Shape {
+    /// The run parts level 1 writes with groups of `group_size`.
+    fn run_parts(&self, group_size: usize) -> u64 {
+        self.run_bytes
+            .chunks(group_size.max(1))
+            .map(|g| {
+                g.iter()
+                    .fold(0u64, |a, b| a.saturating_add(*b))
+                    .div_ceil(self.run_target.max(1))
+                    .max(1)
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+}
+
+/// `W1`, the level-1 worker count (ADR-3853 D4): the largest count up to
+/// `share` whose per-worker ceiling `U / W1` leaves constraint (a) a group of
+/// at least 2 and whose predicted run parts `R` keep constraint (b)'s part
+/// term, `R x block + in_flight + part_target`, under `U`; 1 when none does.
+fn derive_level1_workers(shape: &Level1Shape, share: usize) -> usize {
+    let inputs = shape.run_bytes.len();
+    for workers in (1..=share.max(1)).rev() {
+        let ceiling = shape.ceiling / workers as u64;
+        let group = level1_group_size(shape.per_input, shape.run_target, ceiling, inputs);
+        if group < 2 {
+            continue;
+        }
+        let parts = shape.run_parts(usize::try_from(group).unwrap_or(usize::MAX));
+        let fits = parts
+            .saturating_mul(shape.block_bytes)
+            .saturating_add(shape.in_flight)
+            .saturating_add(shape.part_target)
+            <= shape.ceiling;
+        if fits {
+            return workers;
+        }
+    }
+    1
+}
+
+/// `E`, the level-2 builders in flight at once, the open one included
+/// (ADR-3853 D3): the cores the unit may use, capped by how many final parts
+/// fit in what `U` leaves beside level 2's resident read side and in-flight
+/// GETs, and never under 2.
+fn level2_encode_builders(
+    share: usize,
+    ceiling: u64,
+    resident: u64,
+    in_flight: u64,
+    part_target: u64,
+) -> usize {
+    let room = ceiling.saturating_sub(resident).saturating_sub(in_flight);
+    let fit = usize::try_from(room / part_target.max(1)).unwrap_or(usize::MAX);
+    share.min(fit).max(2)
+}
+
+/// The stop token every level-1 worker of one unit shares (ADR-3853 D4): the
+/// first error any worker returns, a lost claim among them, stops the rest at
+/// their next group or run-part PUT.
+#[derive(Default)]
+struct Level1Stop {
+    stopped: std::sync::atomic::AtomicBool,
+    first: std::sync::Mutex<Option<MaintainError>>,
+}
+
+impl Level1Stop {
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record `error` unless a worker stopped first.
+    fn fail(&self, error: MaintainError) {
+        let mut first = self
+            .first
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.stopped.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            *first = Some(error);
+        }
+    }
+
+    /// What a worker that saw the token returns; [`Self::fail`] drops it,
+    /// since the token was already set.
+    fn halted() -> MaintainError {
+        MaintainError::Invariant("level-1 worker stopped by another worker".to_string())
+    }
+
+    fn take(&self) -> Option<MaintainError> {
+        self.first
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Free bytes [`scratch_free_bytes`] reports instead of asking the
@@ -1617,20 +1742,36 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Run the blocking scratch filesystem call `job` on tokio's blocking pool, so
+/// a directory create, lock, `statvfs` or wipe never stalls an async worker.
+async fn scratch_blocking<R, F>(job: F) -> Result<R>
+where
+    F: FnOnce() -> Result<R> + Send + 'static,
+    R: Send + 'static,
+{
+    tokio::task::spawn_blocking(job)
+        .await
+        .map_err(|e| MaintainError::Invariant(format!("scratch filesystem task: {e}")))?
+}
+
 /// Bytes an unprivileged writer may still use on the filesystem holding
 /// `path` (ADR-3853 D2): `f_bavail * f_frsize`.
-fn scratch_free_bytes(path: &std::path::Path) -> Result<u64> {
+async fn scratch_free_bytes(path: &std::path::Path) -> Result<u64> {
     #[cfg(test)]
     if let Some(free) = SCRATCH_FREE_OVERRIDE.with(std::cell::Cell::get) {
         return Ok(free);
     }
-    let stat = rustix::fs::statvfs(path).map_err(|e| {
-        MaintainError::Store(StoreError::Permanent(format!(
-            "scratch headroom: statvfs of {}: {e}",
-            path.display()
-        )))
-    })?;
-    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+    let path = path.to_path_buf();
+    scratch_blocking(move || {
+        let stat = rustix::fs::statvfs(&path).map_err(|e| {
+            MaintainError::Store(StoreError::Permanent(format!(
+                "scratch headroom: statvfs of {}: {e}",
+                path.display()
+            )))
+        })?;
+        Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+    })
+    .await
 }
 
 /// The lock file inside a scratch directory. Its name never matches
@@ -1711,15 +1852,17 @@ fn lock_scratch_dir(scratch_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// One merge unit's scratch subdirectory. Dropping it wipes and removes the
-/// subdirectory, so the runs are gone after a success, an error return, and a
-/// merge future dropped mid-await (ADR-3853 D2).
+/// One merge unit's scratch subdirectory. [`Self::close`] wipes and removes it
+/// on the blocking pool once the merge returns, success or error; dropping an
+/// unclosed unit, a merge future dropped mid-await, does the same, on the
+/// blocking pool when a runtime is current (ADR-3853 D2).
 struct ScratchUnit {
     store: Arc<ScratchStore>,
+    closed: bool,
 }
 
 impl ScratchUnit {
-    fn open(scratch_dir: &std::path::Path, input_set_hash: &[u8; 32]) -> Result<Self> {
+    async fn open(scratch_dir: &std::path::Path, input_set_hash: &[u8; 32]) -> Result<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = scratch_dir.join(format!(
@@ -1727,22 +1870,51 @@ impl ScratchUnit {
             hex::encode(&input_set_hash[..8]),
             std::process::id()
         ));
+        let store = scratch_blocking(move || Ok(ScratchStore::open(dir, SCRATCH_LIST_PAGE)?)).await?;
         Ok(ScratchUnit {
-            store: Arc::new(ScratchStore::open(dir, SCRATCH_LIST_PAGE)?),
+            store: Arc::new(store),
+            closed: false,
         })
+    }
+
+    async fn close(mut self) {
+        let store = Arc::clone(&self.store);
+        let removed = scratch_blocking(move || {
+            remove_scratch_unit(&store);
+            Ok(())
+        })
+        .await;
+        if removed.is_ok() {
+            self.closed = true;
+        }
+    }
+}
+
+/// Wipe a unit's scratch store and remove its directory, logging a failure:
+/// the next process to lock the scratch directory reclaims what is left.
+fn remove_scratch_unit(store: &ScratchStore) {
+    let dir = store.root().to_path_buf();
+    if let Err(e) = store.wipe() {
+        tracing::warn!(dir = %dir.display(), error = %e, "two-level merge scratch wipe failed");
+    }
+    if let Err(e) = std::fs::remove_dir_all(&dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(dir = %dir.display(), error = %e, "two-level merge scratch removal failed");
     }
 }
 
 impl Drop for ScratchUnit {
     fn drop(&mut self) {
-        let dir = self.store.root().to_path_buf();
-        if let Err(e) = self.store.wipe() {
-            tracing::warn!(dir = %dir.display(), error = %e, "two-level merge scratch wipe failed");
+        if self.closed {
+            return;
         }
-        if let Err(e) = std::fs::remove_dir_all(&dir)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!(dir = %dir.display(), error = %e, "two-level merge scratch removal failed");
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let store = Arc::clone(&self.store);
+                drop(runtime.spawn_blocking(move || remove_scratch_unit(&store)));
+            }
+            Err(_) => remove_scratch_unit(&self.store),
         }
     }
 }
@@ -1763,12 +1935,12 @@ impl ObjectStoreBackend for ScratchMeter {
         data: Bytes,
         opts: PutOptions,
     ) -> std::result::Result<PutOutcome, StoreError> {
-        let len = data.len() as u64;
-        let outcome = self.scratch.put(key, data, opts).await?;
+        // Counted when the write is issued, so a write in flight when the
+        // merge stops is already in the ledger.
         if let Some(l) = &self.ledger {
-            l.record_scratch_write(len);
+            l.record_scratch_write(data.len() as u64);
         }
-        Ok(outcome)
+        self.scratch.put(key, data, opts).await
     }
 
     async fn get(&self, key: &str, range: GetRange) -> std::result::Result<GetOutcome, StoreError> {
@@ -1818,13 +1990,20 @@ impl ObjectStoreBackend for ScratchMeter {
 /// the single-level sequence and every published part keeps its bytes and
 /// key. The scratch headroom (D2) is checked before the first block GET, and
 /// the unit's scratch is removed however the merge ends.
+///
+/// Level 1 runs its groups on `W1` workers ([`derive_level1_workers`], or
+/// [`CompactorConfig::level1_workers`]), each under `U / W1` of the ceiling
+/// and the cursor budget with its own tracker, and every worker stops at its
+/// next group or run-part PUT once any of them fails (ADR-3853 D4). Level 2
+/// keeps up to `E` part builders in flight ([`level2_encode_builders`]) and
+/// PUTs the parts in part-index order (D3). Only compaction reaches this, and
+/// it keeps every record.
 async fn two_level_merge(
     target: &TwoLevelTarget<'_>,
     catalogs: &[RlogInputCatalog],
     stream_ids: &[LogStreamId],
     width_ns: i64,
     output: OutputSpec,
-    keep: &mut (dyn FnMut(&LogRecord) -> Result<bool> + Send),
 ) -> Result<MergeOutput> {
     let config = target.config;
     let inputs = catalogs.len();
@@ -1832,17 +2011,53 @@ async fn two_level_merge(
     let run_target = config.rlog_run_memory_target_bytes;
 
     let mut per_input = 0u64;
+    let mut run_bytes = Vec::with_capacity(inputs);
+    let mut block_bytes = 0u64;
+    let mut extents: Vec<u64> = Vec::new();
     for catalog in catalogs {
         per_input = per_input.max(level1_input_bytes(catalog)?);
+        let mut decoded = 0u64;
+        for block in 0..catalog.pricing.block_rows.len() {
+            let cost = pass_block_cost(&catalog.pricing, block)?;
+            decoded = decoded.saturating_add(cost);
+            block_bytes = block_bytes.max(cost);
+        }
+        run_bytes.push(decoded);
+        extents.extend(
+            candidate_group_extents(catalog)?
+                .iter()
+                .map(|(s, e)| e.saturating_sub(*s)),
+        );
     }
-    let group_size = level1_group_size(per_input, run_target, ceiling, inputs);
+    let share = unit_core_share(
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        config.merge_cursor_budget_bytes,
+        ceiling,
+    );
+    let workers = match config.level1_workers {
+        Some(workers) => workers.max(1),
+        None => derive_level1_workers(
+            &Level1Shape {
+                per_input,
+                run_bytes,
+                block_bytes,
+                in_flight: largest_in_flight(extents, config.input_read_concurrency),
+                run_target,
+                part_target: config.rlog_memory_target_bytes(),
+                ceiling,
+            },
+            share,
+        ),
+    };
+    let worker_ceiling = ceiling / workers as u64;
+    let group_size = level1_group_size(per_input, run_target, worker_ceiling, inputs);
     if group_size < 2 {
         return Err(MaintainError::MergeTwoLevelUnsupported {
             inputs,
             check: TwoLevelCheck::GroupSize {
                 per_input_bytes: per_input,
                 run_target_bytes: run_target,
-                ceiling_bytes: ceiling,
+                ceiling_bytes: worker_ceiling,
                 group_size,
             },
         });
@@ -1852,14 +2067,18 @@ async fn two_level_merge(
         .iter()
         .fold(0u64, |a, c| a.saturating_add(c.object_size));
     let need = stored.saturating_mul(13).div_ceil(10);
-    std::fs::create_dir_all(target.scratch_dir).map_err(|e| {
-        MaintainError::Store(StoreError::Permanent(format!(
-            "scratch directory {}: {e}",
-            target.scratch_dir.display()
-        )))
-    })?;
-    lock_scratch_dir(target.scratch_dir)?;
-    let free = scratch_free_bytes(target.scratch_dir)?;
+    let scratch_dir = target.scratch_dir.to_path_buf();
+    scratch_blocking(move || {
+        std::fs::create_dir_all(&scratch_dir).map_err(|e| {
+            MaintainError::Store(StoreError::Permanent(format!(
+                "scratch directory {}: {e}",
+                scratch_dir.display()
+            )))
+        })?;
+        lock_scratch_dir(&scratch_dir)
+    })
+    .await?;
+    let free = scratch_free_bytes(target.scratch_dir).await?;
     if need > free {
         return Err(MaintainError::ScratchHeadroom {
             need,
@@ -1868,7 +2087,179 @@ async fn two_level_merge(
         });
     }
 
-    let unit = ScratchUnit::open(target.scratch_dir, target.input_set_hash)?;
+    let unit = ScratchUnit::open(target.scratch_dir, target.input_set_hash).await?;
+    let layout = TwoLevelLayout {
+        per_input,
+        group_size,
+        share,
+        workers,
+        worker_ceiling,
+        need,
+        free,
+    };
+    let merged = merge_in_unit(target, catalogs, stream_ids, width_ns, output, &unit, &layout).await;
+    unit.close().await;
+    merged
+}
+
+/// The bytes `concurrency` of the largest row group GETs in `lens` hold at
+/// once.
+fn largest_in_flight(mut lens: Vec<u64>, concurrency: usize) -> u64 {
+    lens.sort_unstable_by(|a, b| b.cmp(a));
+    lens.iter()
+        .take(concurrency.max(1))
+        .fold(0u64, |a, l| a.saturating_add(*l))
+}
+
+/// What [`two_level_merge`] settled before it opened the unit's scratch.
+struct TwoLevelLayout {
+    per_input: u64,
+    group_size: u64,
+    /// The cores the unit may use ([`unit_core_share`]).
+    share: usize,
+    /// `W1`.
+    workers: usize,
+    /// `U / W1`, each worker's resident ceiling.
+    worker_ceiling: u64,
+    need: u64,
+    free: u64,
+}
+
+/// What every level-1 worker of one two-level merge shares (ADR-3853 D4):
+/// the groups, handed out in index order through `next`, and the stop token.
+struct Level1Groups<'a> {
+    target: &'a TwoLevelTarget<'a>,
+    catalogs: &'a [RlogInputCatalog],
+    group_len: usize,
+    width_ns: i64,
+    identity: ObjectIdentity,
+    key_index_fields: &'a [(String, KeyType)],
+    run_declared: &'a Arc<DeclaredSchema>,
+    run_writer: &'a Arc<PartWriterSettings>,
+    scratch: &'a ScratchMeter,
+    run_target: u64,
+    ceiling: u64,
+    next: std::sync::atomic::AtomicUsize,
+    stop: Level1Stop,
+}
+
+/// What one level-1 worker merged: each group's index with its run's scratch
+/// keys, and the records it read and wrote.
+#[derive(Default)]
+struct Level1Runs {
+    runs: Vec<(usize, Vec<String>)>,
+    counts: RecordCounts,
+}
+
+/// One level-1 worker under `config`, its per-worker share of the unit's. An
+/// error stops every worker through the shared token and yields `None`.
+async fn level1_worker(groups: &Level1Groups<'_>, config: &CompactorConfig) -> Option<Level1Runs> {
+    match level1_worker_groups(groups, config).await {
+        Ok(done) => Some(done),
+        Err(e) => {
+            groups.stop.fail(e);
+            None
+        }
+    }
+}
+
+async fn level1_worker_groups(
+    groups: &Level1Groups<'_>,
+    config: &CompactorConfig,
+) -> Result<Level1Runs> {
+    let target = groups.target;
+    let mut done = Level1Runs::default();
+    let mut keep_all = |_: &LogRecord| -> Result<bool> { Ok(true) };
+    loop {
+        if groups.stop.is_stopped() {
+            return Err(Level1Stop::halted());
+        }
+        let index = groups
+            .next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let start = index.saturating_mul(groups.group_len);
+        if start >= groups.catalogs.len() {
+            return Ok(done);
+        }
+        let end = start
+            .saturating_add(groups.group_len)
+            .min(groups.catalogs.len());
+        let group = &groups.catalogs[start..end];
+        let mut group_streams: BTreeSet<LogStreamId> = BTreeSet::new();
+        for catalog in group {
+            for entry in catalog.reader.stream_dir().entries() {
+                group_streams.insert(entry.stream_id);
+            }
+        }
+        let group_streams: Vec<LogStreamId> = group_streams.into_iter().collect();
+        let plan = plan_merge_with(
+            config,
+            group,
+            &group_streams,
+            groups.width_ns,
+            groups.ceiling,
+            groups.run_target,
+        )?;
+        let mut sink = PartSink {
+            store: target.store,
+            bucket: target.bucket,
+            config,
+            input_set_hash: target.input_set_hash,
+            identity: groups.identity,
+            indexed_fields: Vec::new(),
+            key_index_fields: groups.key_index_fields.to_vec(),
+            declared: Arc::clone(groups.run_declared),
+            writer: Arc::clone(groups.run_writer),
+            tracker: config.merge_memory_tracker.as_ref(),
+            dry_run: false,
+            retain_bytes: false,
+            current: None,
+            parts: Vec::new(),
+            part_index: 0,
+            read_ledger: config.request_ledger.as_ref(),
+            level: Some(LevelCounter {
+                ledger: config.request_ledger.clone(),
+                level: 1,
+            }),
+            run: Some(RunTarget {
+                scratch: groups.scratch,
+                index,
+                keys: Vec::new(),
+                stop: &groups.stop,
+            }),
+            pipeline: None,
+            memory_target: groups.run_target,
+            stored_target: u64::MAX,
+        };
+        merge_planned(
+            target.store,
+            group,
+            &group_streams,
+            groups.width_ns,
+            &plan,
+            &mut sink,
+            &mut keep_all,
+            &mut done.counts,
+        )
+        .await?;
+        done.runs.push((index, sink.finish_run().await?));
+    }
+}
+
+/// Both levels of [`two_level_merge`] inside the unit's scratch `unit`.
+async fn merge_in_unit(
+    target: &TwoLevelTarget<'_>,
+    catalogs: &[RlogInputCatalog],
+    stream_ids: &[LogStreamId],
+    width_ns: i64,
+    output: OutputSpec,
+    unit: &ScratchUnit,
+    layout: &TwoLevelLayout,
+) -> Result<MergeOutput> {
+    let config = target.config;
+    let inputs = catalogs.len();
+    let ceiling = config.merge_resident_ceiling();
+    let run_target = config.rlog_run_memory_target_bytes;
     let ledger = config.request_ledger.clone();
     let meter = ScratchMeter {
         scratch: Arc::clone(&unit.store),
@@ -1884,65 +2275,67 @@ async fn two_level_merge(
         group_target_blocks: RUN_GROUP_TARGET_BLOCKS,
     });
     let run_declared = Arc::new(DeclaredSchema::build(&[], &BTreeMap::new()));
-    let group_len = usize::try_from(group_size).unwrap_or(usize::MAX);
+    let group_len = usize::try_from(layout.group_size).unwrap_or(usize::MAX);
     let runs_count = inputs.div_ceil(group_len);
     if let Some(l) = &ledger {
         l.record_level1_groups(runs_count as u64);
+        l.record_level1_workers(layout.workers as u64);
     }
 
-    let mut level1 = RecordCounts::default();
-    let mut run_keys: Vec<String> = Vec::new();
-    for (index, group) in catalogs.chunks(group_len).enumerate() {
-        let mut group_streams: BTreeSet<LogStreamId> = BTreeSet::new();
-        for catalog in group {
-            for entry in catalog.reader.stream_dir().entries() {
-                group_streams.insert(entry.stream_id);
-            }
-        }
-        let group_streams: Vec<LogStreamId> = group_streams.into_iter().collect();
-        let plan = plan_merge_with(config, group, &group_streams, width_ns, ceiling, run_target)?;
-        let mut sink = PartSink {
-            store: target.store,
-            bucket: target.bucket,
-            config,
-            input_set_hash: target.input_set_hash,
-            identity: output.identity,
-            indexed_fields: Vec::new(),
-            key_index_fields: output.key_index_fields.clone(),
-            declared: Arc::clone(&run_declared),
-            writer: Arc::clone(&run_writer),
-            tracker,
-            dry_run: false,
-            retain_bytes: false,
-            current: None,
-            parts: Vec::new(),
-            part_index: 0,
-            read_ledger: config.request_ledger.as_ref(),
-            level: Some(LevelCounter {
-                ledger: ledger.clone(),
-                level: 1,
-            }),
-            run: Some(RunTarget {
-                scratch: &meter,
-                index,
-                keys: Vec::new(),
-            }),
-            memory_target: run_target,
-            stored_target: u64::MAX,
-        };
-        merge_planned(
-            target.store,
-            group,
-            &group_streams,
-            width_ns,
-            &plan,
-            &mut sink,
-            keep,
-            &mut level1,
-        )
-        .await?;
-        run_keys.extend(sink.finish_run().await?);
+    let worker_trackers: Vec<MergeMemoryTracker> = (0..layout.workers)
+        .map(|_| MergeMemoryTracker::new())
+        .collect();
+    let worker_budget = config.merge_cursor_budget_bytes / layout.workers as u64;
+    let worker_configs: Vec<CompactorConfig> = worker_trackers
+        .iter()
+        .map(|t| CompactorConfig {
+            merge_cursor_budget_bytes: worker_budget,
+            merge_resident_ceiling_bytes: Some(layout.worker_ceiling),
+            merge_memory_tracker: tracker.map(|_| t.clone()),
+            ..config.clone()
+        })
+        .collect();
+    let groups = Level1Groups {
+        target,
+        catalogs,
+        group_len,
+        width_ns,
+        identity: output.identity,
+        key_index_fields: &output.key_index_fields,
+        run_declared: &run_declared,
+        run_writer: &run_writer,
+        scratch: &meter,
+        run_target,
+        ceiling: layout.worker_ceiling,
+        next: std::sync::atomic::AtomicUsize::new(0),
+        stop: Level1Stop::default(),
+    };
+    let done = futures::future::join_all(
+        worker_configs
+            .iter()
+            .map(|worker_config| level1_worker(&groups, worker_config)),
+    )
+    .await;
+    if let Some(t) = tracker {
+        t.absorb_workers(&worker_trackers);
     }
+    if let Some(e) = groups.stop.take() {
+        return Err(e);
+    }
+    let mut level1 = RecordCounts::default();
+    let mut grouped: Vec<(usize, Vec<String>)> = Vec::with_capacity(runs_count);
+    for worker in done.into_iter().flatten() {
+        level1.absorb(&worker.counts)?;
+        grouped.extend(worker.runs);
+    }
+    if grouped.len() != runs_count {
+        return Err(MaintainError::Invariant(format!(
+            "level 1 merged {} of its {runs_count} groups",
+            grouped.len()
+        )));
+    }
+    grouped.sort_unstable_by_key(|(index, _)| *index);
+    let run_keys: Vec<String> = grouped.into_iter().flat_map(|(_, keys)| keys).collect();
 
     let mut runs: Vec<RlogInputCatalog> = Vec::with_capacity(run_keys.len());
     for key in run_keys {
@@ -1962,11 +2355,7 @@ async fn two_level_merge(
                 .map(|(s, e)| e.saturating_sub(*s)),
         );
     }
-    lens.sort_unstable_by(|a, b| b.cmp(a));
-    let in_flight = lens
-        .iter()
-        .take(config.input_read_concurrency.max(1))
-        .fold(0u64, |a, l| a.saturating_add(*l));
+    let in_flight = largest_in_flight(lens, config.input_read_concurrency);
     let part_target = config.rlog_memory_target_bytes();
     let plan = plan_merge(config, &runs, stream_ids, width_ns)?;
     let stream_estimate = plan.estimates.iter().copied().max().unwrap_or(0);
@@ -1981,21 +2370,27 @@ async fn two_level_merge(
         part_target_bytes: part_target,
         ceiling_bytes: ceiling,
     };
-    let compared = run_parts
+    let resident = run_parts
         .saturating_mul(run_block_bytes)
-        .max(stream_estimate)
+        .max(stream_estimate);
+    let compared = resident
         .saturating_add(in_flight)
         .saturating_add(part_target);
     if compared > ceiling || plan.mode == MergeReadMode::Cursor {
         return Err(MaintainError::MergeTwoLevelUnsupported { inputs, check: fit });
+    }
+    let builders =
+        level2_encode_builders(layout.share, ceiling, resident, in_flight, part_target);
+    if let Some(l) = &ledger {
+        l.record_encode_builders(builders as u64);
     }
     tracing::info!(
         signal = ?target.bucket.signal,
         shard = target.bucket.shard,
         ingest_hour_bucket = target.bucket.ingest_hour_bucket,
         inputs,
-        group_size,
-        per_input_bytes = per_input,
+        group_size = layout.group_size,
+        per_input_bytes = layout.per_input,
         run_target_bytes = run_target,
         runs = runs_count,
         run_parts = runs.len(),
@@ -2005,8 +2400,12 @@ async fn two_level_merge(
         in_flight_bytes = in_flight,
         part_target_bytes = part_target,
         ceiling_bytes = ceiling,
-        scratch_need_bytes = need,
-        scratch_free_bytes = free,
+        cores_per_unit = layout.share,
+        level1_workers = layout.workers,
+        level1_ceiling_bytes = layout.worker_ceiling,
+        encode_builders = builders,
+        scratch_need_bytes = layout.need,
+        scratch_free_bytes = layout.free,
         level2_mode = plan.mode.name(),
         "rlog two-level merge (ADR-3853)"
     );
@@ -2033,6 +2432,10 @@ async fn two_level_merge(
             level: 2,
         }),
         run: None,
+        pipeline: Some(EncodePipeline {
+            builders,
+            pending: std::collections::VecDeque::new(),
+        }),
         memory_target: part_target,
         stored_target: config.rlog_stored_target_bytes(),
     };
@@ -2961,6 +3364,15 @@ impl RecordCounts {
         })?;
         Ok(())
     }
+
+    /// Add another merge's tallies, as one level-1 worker's into the level's.
+    fn absorb(&mut self, other: &RecordCounts) -> Result<()> {
+        let overflow =
+            || MaintainError::Invariant("merged record count overflowed u64".to_string());
+        self.input = self.input.checked_add(other.input).ok_or_else(overflow)?;
+        self.output = self.output.checked_add(other.output).ok_or_else(overflow)?;
+        Ok(())
+    }
 }
 
 /// The sequence of L1 parts one merge produces, and the one place a part is
@@ -3054,6 +3466,9 @@ struct PartSink<'a> {
     level: Option<LevelCounter>,
     /// Where a level-1 sink writes its run; `None` writes published parts.
     run: Option<RunTarget<'a>>,
+    /// The closed parts whose encodes run while the merge fills the next
+    /// one, on a level-2 sink; `None` encodes and PUTs each part as it closes.
+    pipeline: Option<EncodePipeline>,
     /// The memory split target a part closes at: the configured one for
     /// published parts, the run target for a run.
     memory_target: u64,
@@ -3089,6 +3504,48 @@ struct RunTarget<'a> {
     scratch: &'a dyn ObjectStoreBackend,
     index: usize,
     keys: Vec<String>,
+    /// The unit's level-1 stop token, checked before every run-part PUT.
+    stop: &'a Level1Stop,
+}
+
+/// A level-2 sink's closed parts in part-index order, each encoding on its
+/// own task (ADR-3853 D3).
+struct EncodePipeline {
+    /// `E`: the builders held at once, the open one included, so at most
+    /// `E - 1` closed parts wait here.
+    builders: usize,
+    pending: std::collections::VecDeque<PendingPart>,
+}
+
+/// A closed part waiting for its encode and its PUT.
+struct PendingPart {
+    encoded: PendingEncode,
+    part_index: u32,
+    first_stream_id: Option<LogStreamId>,
+    last_stream_id: Option<LogStreamId>,
+    declared_accum: DeclaredStatAccum,
+    /// The builder's record bytes, charged as writer bytes in flight until
+    /// the part is PUT.
+    charged: u64,
+}
+
+/// A closed part's encoded object and stats, or the task producing them.
+enum PendingEncode {
+    Ready((Vec<u8>, WriteStats)),
+    Task(tokio::task::JoinHandle<Result<(Vec<u8>, WriteStats)>>),
+}
+
+impl PendingEncode {
+    async fn wait(self) -> Result<(Vec<u8>, WriteStats)> {
+        match self {
+            PendingEncode::Ready(encoded) => Ok(encoded),
+            PendingEncode::Task(task) => match task.await {
+                Ok(encoded) => encoded,
+                Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                Err(e) => Err(MaintainError::Invariant(format!("part encode task: {e}"))),
+            },
+        }
+    }
 }
 
 impl PartSink<'_> {
@@ -3198,6 +3655,29 @@ impl PartSink<'_> {
             // (ADR-0873 decision 3), stamped against the closed part's own row
             // count in `finalize_part`.
             let declared_accum = std::mem::take(&mut builder.declared_accum);
+            if self.run.is_some() {
+                let encoded = match pre_encoded {
+                    Some(enc) => PendingEncode::Ready(enc),
+                    None => PendingEncode::Task(self.spawn_encode(builder)),
+                };
+                return self.put_run_part(encoded).await;
+            }
+            if self.pipeline.is_some() {
+                let charged = builder.estimate;
+                let encoded = match pre_encoded {
+                    Some(enc) => PendingEncode::Ready(enc),
+                    None => PendingEncode::Task(self.spawn_encode(builder)),
+                };
+                let part = PendingPart {
+                    encoded,
+                    part_index: self.part_index,
+                    first_stream_id,
+                    last_stream_id,
+                    declared_accum,
+                    charged,
+                };
+                return self.queue_part(part).await;
+            }
             let (object, stats) = match pre_encoded {
                 Some(enc) => enc,
                 // The closing encode runs on the read gate (ADR-1702) as one
@@ -3214,24 +3694,6 @@ impl PartSink<'_> {
                         .await??
                 }
             };
-            if let Some(run) = self.run.as_mut() {
-                let key = format!("run-{:05}/part-{:05}.rlog", run.index, self.part_index);
-                run.scratch
-                    .put(&key, Bytes::from(object), PutOptions::default())
-                    .await?;
-                run.keys.push(key);
-                self.part_index += 1;
-                crate::claim_guard::checkpoint(
-                    self.config,
-                    self.store,
-                    crate::claim_guard::Checkpoint::PartBoundary,
-                )
-                .await?;
-                if let Some(t) = self.tracker {
-                    t.set_writer_bytes(0);
-                }
-                return Ok(());
-            }
             let built = finalize_part(
                 self.store,
                 self.bucket,
@@ -3278,10 +3740,133 @@ impl PartSink<'_> {
         Ok(())
     }
 
+    /// Encode `builder` on its own task, through the read gate (ADR-1702).
+    fn spawn_encode(
+        &self,
+        builder: PartBuilder,
+    ) -> tokio::task::JoinHandle<Result<(Vec<u8>, WriteStats)>> {
+        let gate = self.config.read_gate.clone();
+        let input_set_hash = *self.input_set_hash;
+        let part_index = self.part_index;
+        let size = builder.stored_estimate;
+        tokio::spawn(async move {
+            gate.run(ReadSite::Compaction, size, move || {
+                builder.into_encoded(&input_set_hash, part_index)
+            })
+            .await?
+        })
+    }
+
+    /// Encode a level-1 sink's closed part and PUT it to the run, unless
+    /// another worker has stopped the unit while it encoded. Nothing awaits
+    /// between that check and the PUT.
+    async fn put_run_part(&mut self, encoded: PendingEncode) -> Result<()> {
+        let (object, _) = encoded.wait().await?;
+        let Some(run) = self.run.as_mut() else {
+            return Ok(());
+        };
+        if run.stop.is_stopped() {
+            return Err(Level1Stop::halted());
+        }
+        let key = format!("run-{:05}/part-{:05}.rlog", run.index, self.part_index);
+        run.scratch
+            .put(&key, Bytes::from(object), PutOptions::default())
+            .await?;
+        run.keys.push(key);
+        self.part_index += 1;
+        crate::claim_guard::checkpoint(
+            self.config,
+            self.store,
+            crate::claim_guard::Checkpoint::PartBoundary,
+        )
+        .await?;
+        if let Some(t) = self.tracker {
+            t.set_writer_bytes(0);
+        }
+        Ok(())
+    }
+
+    /// Queue a level-2 sink's closed part behind the ones still encoding,
+    /// moving its builder's bytes to the in-flight writer term, then land the
+    /// oldest parts until `E - 1` wait.
+    async fn queue_part(&mut self, part: PendingPart) -> Result<()> {
+        self.part_index += 1;
+        if let Some(t) = self.tracker {
+            t.set_writer_bytes(0);
+            t.add_writer_in_flight(part.charged);
+        }
+        let Some(pipeline) = self.pipeline.as_mut() else {
+            return Ok(());
+        };
+        pipeline.pending.push_back(part);
+        let waiting = pipeline.builders.saturating_sub(1).max(1);
+        while self
+            .pipeline
+            .as_ref()
+            .is_some_and(|p| p.pending.len() > waiting)
+        {
+            self.land_oldest().await?;
+        }
+        Ok(())
+    }
+
+    /// Wait for the oldest queued part's encode, PUT it, and release its
+    /// in-flight charge.
+    async fn land_oldest(&mut self) -> Result<()> {
+        let Some(part) = self.pipeline.as_mut().and_then(|p| p.pending.pop_front()) else {
+            return Ok(());
+        };
+        let charged = part.charged;
+        let landed = self.land(part).await;
+        if let Some(t) = self.tracker {
+            t.release_writer_in_flight(charged);
+        }
+        let built = landed?;
+        crate::claim_guard::checkpoint(
+            self.config,
+            self.store,
+            crate::claim_guard::Checkpoint::PartBoundary,
+        )
+        .await?;
+        let retained = built.bytes.as_ref().map_or(0, |b| b.len() as u64);
+        self.parts.push(built);
+        if let Some(t) = self.tracker {
+            t.add_retained_part_bytes(retained);
+        }
+        Ok(())
+    }
+
+    async fn land(&self, part: PendingPart) -> Result<BuiltPart> {
+        let (object, stats) = part.encoded.wait().await?;
+        finalize_part(
+            self.store,
+            self.bucket,
+            &self.config.read_gate,
+            object,
+            stats,
+            part.first_stream_id,
+            part.last_stream_id,
+            self.input_set_hash,
+            part.part_index,
+            self.dry_run,
+            self.retain_bytes,
+            &part.declared_accum,
+            self.config.request_ledger.as_ref(),
+        )
+        .await
+    }
+
     /// Close the trailing part and yield every part built, in part-index order.
     async fn finish(mut self) -> Result<Vec<BuiltPart>> {
         if self.current.as_ref().is_some_and(|p| !p.is_empty()) {
             self.flush(None).await?;
+        }
+        while self
+            .pipeline
+            .as_ref()
+            .is_some_and(|p| !p.pending.is_empty())
+        {
+            self.land_oldest().await?;
         }
         Ok(std::mem::take(&mut self.parts))
     }
@@ -3302,6 +3887,16 @@ impl Drop for PartSink<'_> {
     fn drop(&mut self) {
         if let Some(t) = self.tracker {
             t.set_writer_bytes(0);
+        }
+        if let Some(pipeline) = self.pipeline.as_mut() {
+            for part in pipeline.pending.drain(..) {
+                if let PendingEncode::Task(task) = &part.encoded {
+                    task.abort();
+                }
+                if let Some(t) = self.tracker {
+                    t.release_writer_in_flight(part.charged);
+                }
+            }
         }
     }
 }

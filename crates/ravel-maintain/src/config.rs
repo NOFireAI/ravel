@@ -156,6 +156,12 @@ struct MergeMemoryInner {
     peak_decoded: AtomicU64,
     /// The in-progress part's accumulated record-byte estimate in the writer.
     writer: AtomicU64,
+    /// Closed builders handed to an encode and not yet PUT (ADR-3853 D3),
+    /// their record-byte estimates summed. Part of the writer term.
+    writer_in_flight: AtomicU64,
+    /// Each level-1 worker's [`Self::peak_resident`], in worker order, once
+    /// [`MergeMemoryTracker::absorb_workers`] has folded them in.
+    worker_peaks: std::sync::Mutex<Vec<u64>>,
     /// What an in-flight exact-encode probe holds on top of the writer buffer:
     /// the clone of the part's records plus, once the encode returns, the
     /// encoded object bytes. Zero whenever no probe is running.
@@ -356,6 +362,81 @@ impl MergeMemoryTracker {
         self.note();
     }
 
+    /// Account a closed builder of `bytes` handed to an encode while the
+    /// merge goes on into the next one. Counted in the writer term until
+    /// [`Self::release_writer_in_flight`].
+    pub fn add_writer_in_flight(&self, bytes: u64) {
+        self.inner
+            .writer_in_flight
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.note();
+    }
+
+    /// Release `bytes` of the in-flight builders once their part is PUT.
+    pub fn release_writer_in_flight(&self, bytes: u64) {
+        saturating_release(&self.inner.writer_in_flight, bytes);
+    }
+
+    /// Fold level-1 worker trackers into this unit tracker (ADR-3853 D4):
+    /// every high-water mark becomes the larger of its own and the sum of
+    /// the workers' marks, the flush and probe counts add, and each worker's
+    /// [`Self::peak_resident_bytes`] is kept for
+    /// [`Self::level1_worker_peak_bytes`]. A sum of high-water marks bounds
+    /// the workers' joint peak from above; they need not have coincided.
+    pub fn absorb_workers(&self, workers: &[MergeMemoryTracker]) {
+        let peaks = |field: fn(&MergeMemoryInner) -> &AtomicU64| {
+            let summed = workers.iter().fold(0u64, |a, w| {
+                a.saturating_add(field(&w.inner).load(Ordering::Relaxed))
+            });
+            field(&self.inner).fetch_max(summed, Ordering::Relaxed);
+        };
+        peaks(|i| &i.peak_probe);
+        peaks(|i| &i.peak_transient);
+        peaks(|i| &i.peak_decoded);
+        peaks(|i| &i.peak_total);
+        peaks(|i| &i.peak_retained_parts);
+        peaks(|i| &i.peak_catalog_directory);
+        peaks(|i| &i.peak_writer);
+        peaks(|i| &i.peak_publish_record);
+        peaks(|i| &i.peak_fetched);
+        peaks(|i| &i.peak_catalog_plan);
+        peaks(|i| &i.peak_catalog_labels);
+        peaks(|i| &i.peak_plan_index);
+        peaks(|i| &i.peak_resident_raw);
+        peaks(|i| &i.peak_pass_rows);
+        peaks(|i| &i.peak_read_side);
+        peaks(|i| &i.peak_resident);
+        for w in workers {
+            let add = |field: fn(&MergeMemoryInner) -> &AtomicU64| {
+                field(&self.inner)
+                    .fetch_add(field(&w.inner).load(Ordering::Relaxed), Ordering::Relaxed);
+            };
+            add(|i| &i.memory_target_flushes);
+            add(|i| &i.stored_target_flushes);
+            add(|i| &i.probes_run);
+            self.inner.max_open_cursors.fetch_max(
+                w.inner.max_open_cursors.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
+        let mut kept = self
+            .inner
+            .worker_peaks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        kept.extend(workers.iter().map(MergeMemoryTracker::peak_resident_bytes));
+    }
+
+    /// Each level-1 worker's [`Self::peak_resident_bytes`], in worker order;
+    /// empty unless a two-level merge ran (ADR-3853 D4).
+    pub fn level1_worker_peak_bytes(&self) -> Vec<u64> {
+        self.inner
+            .worker_peaks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Set what the in-flight exact-encode probe holds resident, or 0 once it
     /// has returned and its buffers are dropped.
     ///
@@ -482,7 +563,11 @@ impl MergeMemoryTracker {
     fn note(&self) {
         let fetched = self.inner.fetched.load(Ordering::Relaxed);
         let decoded = self.inner.decoded.load(Ordering::Relaxed);
-        let writer = self.inner.writer.load(Ordering::Relaxed);
+        let writer = self
+            .inner
+            .writer
+            .load(Ordering::Relaxed)
+            .saturating_add(self.inner.writer_in_flight.load(Ordering::Relaxed));
         let probe = self.inner.probe.load(Ordering::Relaxed);
         let catalog_plan = self.inner.catalog_plan.load(Ordering::Relaxed);
         let catalog_labels = self.inner.catalog_labels.load(Ordering::Relaxed);
@@ -686,9 +771,15 @@ impl MergeMemoryTracker {
             &self.inner.peak_pass_rows,
             &self.inner.peak_read_side,
             &self.inner.peak_resident,
+            &self.inner.writer_in_flight,
         ] {
             field.store(0, Ordering::Relaxed);
         }
+        self.inner
+            .worker_peaks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// The full phase split, each term naming its byte kind. See
@@ -757,7 +848,7 @@ impl MergeMemoryTracker {
         MergeLiveBytes {
             fetched: load(&self.inner.fetched),
             decoded: load(&self.inner.decoded),
-            writer: load(&self.inner.writer),
+            writer: load(&self.inner.writer).saturating_add(load(&self.inner.writer_in_flight)),
             probe: load(&self.inner.probe),
             catalog_plan: load(&self.inner.catalog_plan),
             catalog_labels: load(&self.inner.catalog_labels),
@@ -2155,6 +2246,15 @@ pub struct CompactorConfig {
     /// the final parts' bytes, only how the runs between the levels are cut.
     /// Default [`RLOG_RUN_MEMORY_TARGET_BYTES`].
     pub rlog_run_memory_target_bytes: u64,
+    /// The level-1 worker count `W1` of a two-level RLOG merge (ADR-3853 D4).
+    /// `None` (the default) derives it: the largest count at or under the
+    /// unit's core share (the usable cores over the units the cursor budget
+    /// admits at this ceiling) at which constraint (a) still leaves groups of
+    /// two and the predicted level 2 fits constraint (b). `Some(n)` overrides
+    /// the derivation; `Some(0)` reads as one. Each worker merges its groups
+    /// under `merge_cursor_budget_bytes / W1` and
+    /// `merge_resident_ceiling / W1`.
+    pub level1_workers: Option<usize>,
     /// How the RLOG merge admits a stream's cursors (ADR-0979 decision 2).
     /// Default [`AdmissionMode::Overlap`] (the bounded path). Only the
     /// differential part-hash test sets [`AdmissionMode::EagerAll`]; output
@@ -2404,6 +2504,7 @@ impl Default for CompactorConfig {
             merge_resident_ceiling_bytes: None,
             scratch_dir: None,
             rlog_run_memory_target_bytes: RLOG_RUN_MEMORY_TARGET_BYTES,
+            level1_workers: None,
             merge_admission: AdmissionMode::Overlap,
             rlog_zstd_level: DEFAULT_RLOG_ZSTD_LEVEL,
             compactor_writer_id: Uuid::nil(),

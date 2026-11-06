@@ -222,6 +222,13 @@ pub struct RunRequestReport {
     /// Bytes of level-1 runs read back from scratch at level 2, as stored.
     /// Scratch traffic is not a store request and never lands in a phase.
     pub scratch_read_bytes: u64,
+    /// Level-1 workers `W1` a two-level merge ran its groups on (ADR-3853
+    /// D4); zero for a single-level merge. Not a request count.
+    pub level1_workers: u64,
+    /// The level-2 encode depth `E`: builders a two-level merge's level 2
+    /// holds at once, the open one included (ADR-3853 D3); zero for a
+    /// single-level merge. Not a request count.
+    pub encode_builders: u64,
 }
 
 impl RunRequestReport {
@@ -284,6 +291,8 @@ struct RequestLedgerInner {
     level2_block_decodes: AtomicU64,
     scratch_write_bytes: AtomicU64,
     scratch_read_bytes: AtomicU64,
+    level1_workers: AtomicU64,
+    encode_builders: AtomicU64,
     /// Whether a run's scope is currently open. Read only by
     /// [`RequestLedger::reset_for_run_unless_open`] to decide whether an
     /// enclosing driver already opened one; it never reaches any store or
@@ -370,6 +379,8 @@ impl RequestLedger {
         self.inner.level2_block_decodes.store(0, Ordering::Relaxed);
         self.inner.scratch_write_bytes.store(0, Ordering::Relaxed);
         self.inner.scratch_read_bytes.store(0, Ordering::Relaxed);
+        self.inner.level1_workers.store(0, Ordering::Relaxed);
+        self.inner.encode_builders.store(0, Ordering::Relaxed);
     }
 
     /// Account one RLOG merge stream-range pass.
@@ -389,6 +400,20 @@ impl RequestLedger {
         self.inner
             .level1_groups
             .fetch_add(groups, Ordering::Relaxed);
+    }
+
+    /// Record the level-1 worker count `W1` of a two-level RLOG merge.
+    pub fn record_level1_workers(&self, workers: u64) {
+        self.inner
+            .level1_workers
+            .store(workers, Ordering::Relaxed);
+    }
+
+    /// Record the level-2 encode depth `E` of a two-level RLOG merge.
+    pub fn record_encode_builders(&self, builders: u64) {
+        self.inner
+            .encode_builders
+            .store(builders, Ordering::Relaxed);
     }
 
     /// Account one stream-range pass at `level` (1 or 2) of a two-level merge.
@@ -503,6 +528,8 @@ impl RequestLedger {
             level2_block_decodes: self.inner.level2_block_decodes.load(Ordering::Relaxed),
             scratch_write_bytes: self.inner.scratch_write_bytes.load(Ordering::Relaxed),
             scratch_read_bytes: self.inner.scratch_read_bytes.load(Ordering::Relaxed),
+            level1_workers: self.inner.level1_workers.load(Ordering::Relaxed),
+            encode_builders: self.inner.encode_builders.load(Ordering::Relaxed),
         }
     }
 }
