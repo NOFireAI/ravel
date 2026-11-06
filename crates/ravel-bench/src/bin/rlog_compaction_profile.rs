@@ -453,7 +453,7 @@ fn object_records(
             });
         }
     }
-    records.sort_by(|a, b| (a.stream_id, a.ts_ns).cmp(&(b.stream_id, b.ts_ns)));
+    records.sort_by_key(|r| (r.stream_id, r.ts_ns));
     records
 }
 
@@ -1396,7 +1396,7 @@ mod prof {
             })
             .collect();
         let mut thread_rows: Vec<(String, u64)> = threads.into_iter().collect();
-        thread_rows.sort_by(|a, b| b.1.cmp(&a.1));
+        thread_rows.sort_by_key(|r| std::cmp::Reverse(r.1));
         json!({
             "svg": sampler.path.display().to_string(),
             "frequency_hz": HZ,
