@@ -120,7 +120,8 @@ is permanent instead.
 Only the logs ingest flush, where it builds its `RlogConfig` in
 `log_shard.rs`, selects `Estimated`. Compaction, erasure rewrite,
 `ravel-cli load` and every test that does not name the mode keep
-`Exhaustive`.
+`Exhaustive`. (Compaction and erasure rewrite now select `Estimated` too;
+see the compaction page choice amendment at the end of this ADR.)
 
 Under `Estimated`:
 
@@ -389,7 +390,8 @@ flowchart LR
 ## Consequences
 
 - No persistent format changes and no format version changes. ADR-2135
-  decision 4 is amended for the ingest writer only. ADR-1702 decision 4 is
+  decision 4 is amended for the ingest writer only (and for compaction by
+  the compaction page choice amendment). ADR-1702 decision 4 is
   amended for the logs ingest flush only (D7).
 - `Estimated` ingest objects can be up to 10% larger, by the exit bound, until
   compaction rewrites them. D0 confirms that compaction runs on the benchmark
@@ -653,3 +655,21 @@ the owner declined a hasher without HashDoS resistance for this data on #3228
 builder's staging sets to foldhash; #3605 restores SipHash in both, at an
 expected cost of about 1% of server CPU. The tokenizer half of D4 stands, and
 the bloom bytes are unchanged.
+
+## Amendment (2026-11-06): the compaction page choice amendment (#3878)
+
+<!-- amendment-applies: sections="D1. The ingest flush chooses page encodings by estimate|Consequences" pointer="compaction page choice amendment" -->
+
+`Estimated` is now the compaction writer's page choice. Every L1 merge path
+(resident, fetch-per-pass and cursor) and the erasure rewrite build their
+parts with it, where D1 kept them on `Exhaustive`. `ravel-cli load` keeps
+`Exhaustive`, and the logs ingest flush keeps `Estimated`.
+
+The measurement is #3853 comment 6670968041, a synthetic logs-benchmark
+hour of 230 inputs and 2.74M records, where writing parts is about 80% of
+merge CPU: `Estimated` cut encode-thread CPU from 144 s to 102 s (-29%) for
+0.6% more L1 bytes. The same change moves the compaction zstd level from 9
+to 3; that half is ADR-2135's compaction level 3 amendment. D1's statement
+that objects are a function of their input and configuration holds for
+compaction output too, so merges retried or run in a different read mode
+still write the same bytes. Readers are unaffected.

@@ -385,7 +385,10 @@ is 43.5 us per record (measured 2026-11-05, hour 498274). `f` is the share
 of that in page trials and zstd, which the profile measures. Level 1 encodes
 runs at zstd 1 and `Estimated`, taken as a quarter of today's encode
 (predicted), so it costs `(1 - f) x 43.5 + f x 43.5 / 4` us per record;
-level 2 encodes final parts at today's settings and costs 43.5 us.
+level 2 encodes final parts at today's settings and costs 43.5 us. (Today's
+settings here mean zstd 9 and `Exhaustive`, which the rows below assume;
+final parts now use zstd 3 and `Estimated`, see the final-part settings
+amendment at the end of this ADR.)
 
 | | f = 0.75 | f = 0.5 | source |
 |---|---|---|---|
@@ -414,7 +417,8 @@ What the profile must show for each part of the decision to stand:
 
 Phase C, final-part encode settings (`Estimated`, which ADR-3492 measured
 at most 10% larger at ingest, and the zstd level ADR-2135 decision 4 sets to
-9), is deferred to the profile and is not decided here.
+9), is deferred to the profile and is not decided here. (Decided since, by
+issue #3878; see the final-part settings amendment at the end of this ADR.)
 
 ## Rejected alternatives
 
@@ -507,7 +511,8 @@ at most 10% larger at ingest, and the zstd level ADR-2135 decision 4 sets to
 
 ### Not in this ADR
 
-- Phase C, final-part encode settings, deferred to the profile.
+- Phase C, final-part encode settings, deferred to the profile (since
+  moved out of phase C; see the final-part settings amendment).
 - Cross-merge admission, a shared budget concurrent units wait on (#3825).
 - The ingest-side L0 geometry (why 0.7 s per object), a separate ADR.
 - Partial and multi-level compaction records.
@@ -535,3 +540,27 @@ flowchart LR
   X1 --> C["compaction record, CreateIfAbsent"]
   X2 --> C
 ```
+
+## Amendment (2026-11-06): the final-part settings amendment (#3878)
+
+<!-- amendment-applies: sections="D6. Counters and bands|Not in this ADR" pointer="final-part settings amendment" -->
+
+Phase C's final-part encode settings are decided ahead of the two-level
+merge, in issue #3878, and no longer wait on the phase C profile. Every L1
+merge path (resident, fetch-per-pass and cursor) and the erasure rewrite
+write their parts at zstd 3 with `Estimated`, in place of zstd 9 with
+`Exhaustive`; ADR-2135 and ADR-3492 carry the matching amendments. Level-1
+runs keep D2's settings.
+
+The measurement is #3853 comment 6670968041, on a synthetic logs-benchmark
+hour of 230 inputs and 2.74M records, where writing parts is about 80% of
+merge CPU. zstd 3 cut merge wall time from 173 s to 131 s (-24%) for 1.8%
+more L1 bytes, and `Estimated` cut encode-thread CPU from 144 s to 102 s
+(-29%) for 0.6% more bytes.
+
+D6's per-record cost rows (level 1 per record, both levels per record,
+core-seconds per unit, cores to sustain 134k records/s and cores for five
+minutes per unit) assumed final parts at zstd 9 and `Exhaustive`, priced
+at the 43.5 us single-level figure measured under those settings. They are
+not re-derived here: they stay as predicted, and they overstate the level-2
+cost by the share of encode the two changes removed.

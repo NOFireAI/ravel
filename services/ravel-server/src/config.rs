@@ -1386,7 +1386,7 @@ pub struct Cli {
 
     /// The zstd level RLOG compaction and the erasure rewrite write their L1
     /// segments at (ADR-2135 decision 4). Omitted defaults to
-    /// [`ravel_maintain::config::DEFAULT_RLOG_ZSTD_LEVEL`] (9). A level
+    /// [`ravel_maintain::config::DEFAULT_RLOG_ZSTD_LEVEL`] (3). A level
     /// outside 1..=22 is refused at startup.
     #[arg(long = "maintain-compaction-zstd-level", value_name = "LEVEL")]
     pub maintain_compaction_zstd_level: Option<i32>,
@@ -17793,11 +17793,11 @@ mod tests {
     }
 
     /// `--maintain-compaction-zstd-level` unset leaves the compactor at level
-    /// 9, a set level reaches `CompactorConfig::rlog_zstd_level`, and a level
+    /// 3, a set level reaches `CompactorConfig::rlog_zstd_level`, and a level
     /// outside 1..=22 fails startup naming the flag.
     #[test]
     fn maintain_compaction_zstd_level_reaches_the_compactor() {
-        assert_eq!(compactor(&[]).expect("default").rlog_zstd_level, 9);
+        assert_eq!(compactor(&[]).expect("default").rlog_zstd_level, 3);
         assert_eq!(
             compactor(&["--maintain-compaction-zstd-level", "4"])
                 .expect("4")

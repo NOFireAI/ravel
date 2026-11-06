@@ -1608,10 +1608,11 @@ pub enum AdmissionMode {
     EagerAll,
 }
 
-/// Default `rlog_zstd_level`: 9 (ADR-2135 decision 4). Compaction and the
-/// erasure rewrite write once per bucket and are read many times, so they take
-/// a higher level than the ingest path's 3; readers are indifferent to it.
-pub const DEFAULT_RLOG_ZSTD_LEVEL: i32 = 9;
+/// Default `rlog_zstd_level`: 3, the ingest path's level (ADR-2135 decision 4
+/// as amended by issue #3878). Writing parts is most of a merge's CPU, and on
+/// the logs-benchmark hour level 3 cut merge wall time 24% against level 9 for
+/// 1.8% more L1 bytes; readers are indifferent to the level.
+pub const DEFAULT_RLOG_ZSTD_LEVEL: i32 = 3;
 /// Lowest accepted `rlog_zstd_level`. zstd's negative "fast" levels are refused.
 pub const MIN_RLOG_ZSTD_LEVEL: i32 = 1;
 /// Highest accepted `rlog_zstd_level`: zstd's maximum level.
@@ -2150,7 +2151,7 @@ pub struct CompactorConfig {
     /// store request; a level outside
     /// [`MIN_RLOG_ZSTD_LEVEL`]`..=`[`MAX_RLOG_ZSTD_LEVEL`] fails the run with
     /// [`crate::error::MaintainError::InvalidRlogZstdLevel`]. Default
-    /// [`DEFAULT_RLOG_ZSTD_LEVEL`] (9).
+    /// [`DEFAULT_RLOG_ZSTD_LEVEL`] (3).
     pub rlog_zstd_level: i32,
     /// This compactor process's uuid. Informational only: it is recorded in
     /// each part's footer `writer_id` and never enters dedup priority.
@@ -2610,6 +2611,13 @@ mod tests {
     fn the_default_input_read_concurrency_is_32() {
         assert_eq!(DEFAULT_INPUT_READ_CONCURRENCY, 32);
         assert_eq!(CompactorConfig::default().input_read_concurrency, 32);
+    }
+
+    /// Issue #3878: L1 parts are written at zstd level 3 by default.
+    #[test]
+    fn the_default_rlog_zstd_level_is_3() {
+        assert_eq!(DEFAULT_RLOG_ZSTD_LEVEL, 3);
+        assert_eq!(CompactorConfig::default().rlog_zstd_level, 3);
     }
 
     const GIB: u64 = 1024 * 1024 * 1024;

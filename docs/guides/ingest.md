@@ -1930,7 +1930,7 @@ beside the clustering generation. Objects already written keep their order
 and their filters until compaction rewrites them. L1 compaction and the
 erasure rewrite take the sort descriptor and bloom coverage of the input
 with the highest generation. They re-sort every part by that descriptor and
-compress at zstd level 9.
+compress at the compaction zstd level, 3 by default.
 
 A worked example follows. It declares two typed columns, clusters on both at
 6h, and keeps the blooms on the text columns. It then loads, and inspects

@@ -734,7 +734,7 @@ the row-major and columnar write paths produce the same bytes. Which writers
 use which: the server's logs ingest flush writes `Estimated` (the ingest
 setting `rlog_page_choice`, whose default is `Estimated`); `ravel-cli load`
 writes through the same flush but sets `Exhaustive`; compaction and the
-erasure rewrite write `Exhaustive`. Readers are
+erasure rewrite write `Estimated`. Readers are
 unaffected: an object decodes the same way whichever choice wrote it.
 
 **Parallel page encode (ADR-3492 decision 7).** `RlogWriter::finish_on`
@@ -1702,8 +1702,10 @@ The merge is defined entirely in terms of this format:
   input KEY_IDX has none. The erasure rewrite uses the same merge, so its
   survivors keep every input's field set less those same exclusions.
 - **Compression level.** The compactor and the erasure rewrite encode every
-  L1 page and zstd section at `CompactorConfig::rlog_zstd_level`, default 9
-  (ADR-2135 decision 4), not the writer's level-3 default. The level changes
+  L1 page and zstd section at `CompactorConfig::rlog_zstd_level`, default 3
+  (ADR-2135 decision 4 and its compaction level 3 amendment), the same as
+  the writer's own default, and pick page encodings with `Estimated`. The
+  level changes
   stored bytes only; a reader decodes any level the same way.
 
 Because these are exactly the steps `RlogWriter` already performs for an
