@@ -330,7 +330,11 @@ fn merge_end_outcome(
 ) -> &'static str {
     match result {
         Err(MaintainError::InputOutOfWindow { .. }) => "held",
-        Err(MaintainError::MergeGeometryUnsupported { .. }) => "refused",
+        Err(
+            MaintainError::MergeGeometryUnsupported { .. }
+            | MaintainError::MergeTwoLevelUnsupported { .. }
+            | MaintainError::ScratchHeadroom { .. },
+        ) => "refused",
         Err(_) => "failed",
         Ok(_) if cancelled => "cancelled",
         Ok(CompactionOutcome::Compacted { publish, .. }) => match publish {

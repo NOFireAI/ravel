@@ -232,6 +232,15 @@ pub(crate) fn emit_request_report(config: &CompactorConfig, bucket: &Bucket, ok:
             // row-group bytes it held resident (stored bytes, not wire bytes).
             merge_passes = r.merge_passes,
             merge_resident_bytes = r.merge_resident_bytes,
+            // ADR-3853 D6: the two-level merge's per-level figures and its
+            // scratch traffic, which is not a store request.
+            level1_groups = r.level1_groups,
+            level1_passes = r.level1_passes,
+            level2_passes = r.level2_passes,
+            level1_block_decodes = r.level1_block_decodes,
+            level2_block_decodes = r.level2_block_decodes,
+            scratch_write_bytes = r.scratch_write_bytes,
+            scratch_read_bytes = r.scratch_read_bytes,
             "compaction store requests by phase (received and sent bytes are different kinds; do not sum them together)"
         );
     }
