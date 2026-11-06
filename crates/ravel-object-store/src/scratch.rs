@@ -4,7 +4,13 @@
 //! [`ScratchStore`] is a cache and nothing else. It is not durable and not
 //! shared: [`ScratchStore::open`] removes everything the directory held, so
 //! nothing a previous process wrote is ever read back, and
-//! [`ScratchStore::wipe`] empties it again at the end of a unit. No other
+//! [`ScratchStore::wipe`] empties it again at the end of a unit. `open` only
+//! clears a directory this store owns: one that does not exist, is empty, or
+//! holds the `.ravel-scratch` marker file a previous `open` wrote. Any other
+//! non-empty directory is refused with [`StoreError::Permanent`] naming it,
+//! before anything is deleted, so a mistyped path never empties a real
+//! directory. `open` writes the marker after clearing, and `wipe` keeps it.
+//! No other
 //! process reads it, nothing in it is published, and no durability or
 //! recovery path may depend on it (CLAUDE.md, "Object storage is the source
 //! of truth"). It must never back a tenant's data; it exists only so the
@@ -14,11 +20,13 @@
 //! Layout. A key maps to a path of one file name per `/`-separated segment:
 //! every segment but the last is a directory named `d` plus the escaped
 //! segment, and the last is a file named `f` plus the escaped segment.
-//! Escaping keeps ASCII letters, digits, `-` and `_` and writes every other
-//! byte as `%XX`, so no escaped name is empty, `.`, `..`, or contains a
-//! separator or NUL, and no key can name a path outside the directory. A
-//! key whose escaped segment exceeds 255 bytes, the common file name limit,
-//! is refused with [`StoreError::Permanent`]. Each file holds a 32-byte
+//! Escaping keeps ASCII lowercase letters, digits, `-` and `_` and writes
+//! every other byte, ASCII uppercase included, as `%XX`, so no escaped name
+//! is empty, `.`, `..`, or contains a separator or NUL, no key can name a
+//! path outside the directory, and no two keys map to file names that differ
+//! only by case, which a case-insensitive filesystem would fold into one. A
+//! key segment whose escaped name plus its one-byte mark exceeds 255 bytes,
+//! the common file name limit, is refused with [`StoreError::Permanent`]. Each file holds a 32-byte
 //! header (version counter, last-modified time, CRC-32C of the bytes)
 //! followed by the object's bytes. The header is private to this process and
 //! is not a persistent format: nothing outlives the process that wrote it.
@@ -67,6 +75,9 @@ const DIR_MARK: char = 'd';
 const OBJECT_MARK: char = 'f';
 /// Name prefix of an in-flight write's temporary file, at the top level only.
 const TEMP_MARK: char = 't';
+
+/// Name of the file marking a directory as this store's, at the top level.
+const OWNER_MARKER: &str = ".ravel-scratch";
 
 /// Longest file name the store creates.
 const MAX_NAME_BYTES: usize = 255;
@@ -165,7 +176,7 @@ fn io_error(what: &str, path: &Path, err: io::Error) -> StoreError {
 fn escape_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
-        if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' {
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_' {
             out.push(char::from(byte));
         } else {
             out.push_str(&format!("%{byte:02X}"));
@@ -254,12 +265,15 @@ fn verify_upload_checksum(data: &[u8], checksum: Option<UploadChecksum>) -> Resu
     Ok(())
 }
 
-/// Removes every entry inside `dir`, leaving `dir` itself. A symlink is
-/// removed, never followed.
+/// Removes every entry inside `dir` but the top-level owner marker, leaving
+/// `dir` itself. A symlink is removed, never followed.
 fn clear_dir(dir: &Path) -> Result<(), StoreError> {
     let entries = fs::read_dir(dir).map_err(|e| io_error("read", dir, e))?;
     for entry in entries {
         let entry = entry.map_err(|e| io_error("read", dir, e))?;
+        if entry.file_name() == OWNER_MARKER {
+            continue;
+        }
         let path = entry.path();
         let file_type = entry.file_type().map_err(|e| io_error("stat", &path, e))?;
         if file_type.is_dir() {
@@ -273,14 +287,32 @@ fn clear_dir(dir: &Path) -> Result<(), StoreError> {
 
 impl ScratchStore {
     /// Opens a scratch store over `dir` with listing pages of `page_size`
-    /// keys (at least 1). Creates `dir` if it does not exist, then removes
-    /// everything inside it, whatever wrote it, before returning.
-    ///
-    /// `dir` must be dedicated to this store: its contents are deleted
-    /// without inspection. Blocks the calling thread for the filesystem work.
+    /// keys (at least 1). Creates `dir` if it does not exist. A directory
+    /// that is empty or holds the `.ravel-scratch` marker as a regular file
+    /// is this store's: everything inside it but the marker is removed, then
+    /// the marker is written. Any other non-empty directory is refused with
+    /// [`StoreError::Permanent`] naming it, and nothing in it is touched.
+    /// Blocks the calling thread for the filesystem work.
     pub fn open(dir: PathBuf, page_size: usize) -> Result<Self, StoreError> {
         fs::create_dir_all(&dir).map_err(|e| io_error("create", &dir, e))?;
+        let marker = dir.join(OWNER_MARKER);
+        let owned = match fs::symlink_metadata(&marker) {
+            Ok(meta) => meta.file_type().is_file(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(io_error("stat", &marker, e)),
+        };
+        if !owned {
+            let mut entries = fs::read_dir(&dir).map_err(|e| io_error("read", &dir, e))?;
+            if entries.next().is_some() {
+                return Err(StoreError::Permanent(format!(
+                    "scratch store: refusing to open {}: the directory is not empty and holds \
+                     no {OWNER_MARKER} marker, so this store does not own it",
+                    dir.display()
+                )));
+            }
+        }
         clear_dir(&dir)?;
+        fs::write(&marker, b"").map_err(|e| io_error("write", &marker, e))?;
         Ok(ScratchStore {
             inner: Arc::new(Inner {
                 root: dir,
@@ -294,7 +326,7 @@ impl ScratchStore {
     }
 
     /// Removes every object and every in-flight write's temporary file, for
-    /// the unit-end cleanup of ADR-3853 D2. A put or multipart upload still
+    /// the unit-end cleanup of ADR-3853 D2. The owner marker stays. A put or multipart upload still
     /// in flight when this runs fails rather than publishing. Versions keep
     /// counting from where they were. Blocks the calling thread.
     pub fn wipe(&self) -> Result<(), StoreError> {
@@ -331,8 +363,8 @@ impl Inner {
         for component in key_components(key) {
             if component.len() > MAX_NAME_BYTES {
                 return Err(StoreError::Permanent(format!(
-                    "scratch store: key {key:?} has a segment that maps to a {}-byte file \
-                     name, over the {MAX_NAME_BYTES}-byte limit",
+                    "scratch store: key {key:?} has a segment whose escaped name plus its \
+                     one-byte mark is {} bytes, over the {MAX_NAME_BYTES}-byte limit",
                     component.len()
                 )));
             }
@@ -543,7 +575,7 @@ impl Inner {
             };
             let name = entry.file_name();
             let name = name.to_str().ok_or_else(unexpected)?;
-            if top && name.starts_with(TEMP_MARK) {
+            if top && (name.starts_with(TEMP_MARK) || name == OWNER_MARKER) {
                 continue;
             }
             let is_dir = entry
@@ -930,26 +962,82 @@ mod tests {
         out
     }
 
+    /// [`tree`] without the owner marker, after asserting it is there.
+    fn stored(dir: &Path) -> BTreeSet<PathBuf> {
+        let mut out = tree(dir);
+        assert!(
+            out.remove(Path::new(OWNER_MARKER)),
+            "the owner marker is in {}",
+            dir.display()
+        );
+        out
+    }
+
     #[tokio::test]
-    async fn open_wipes_whatever_the_directory_held() {
+    async fn open_clears_a_directory_it_marked() {
         let parent = tempfile::tempdir().expect("tempdir");
         let dir = parent.path().join("scratch");
+        drop(open_in(&dir));
         fs::create_dir_all(dir.join("nested/deeper")).expect("nested dirs");
         fs::write(dir.join("left-over.bin"), b"previous process").expect("file");
         fs::write(dir.join("nested/deeper/run-0.rlog"), b"old run").expect("nested file");
         fs::write(dir.join("fstale"), b"looks like an object").expect("object-shaped file");
         fs::write(dir.join("t7"), b"looks like a temp file").expect("temp-shaped file");
-        assert_eq!(tree(&dir).len(), 6, "the fixture is in place");
+        assert_eq!(stored(&dir).len(), 6, "the fixture is in place");
 
         let store = open_in(&dir);
 
         assert!(dir.is_dir(), "the directory itself is kept");
-        assert!(tree(&dir).is_empty(), "left: {:?}", tree(&dir));
+        assert!(stored(&dir).is_empty(), "left: {:?}", tree(&dir));
         assert!(list_all(&store, "").await.expect("list").is_empty());
         assert!(matches!(
             store.get("stale", GetRange::Full).await,
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn open_accepts_an_empty_or_missing_directory_and_marks_it() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let empty = parent.path().join("empty");
+        fs::create_dir(&empty).expect("empty dir");
+        let missing = parent.path().join("missing");
+        for dir in [empty, missing] {
+            open_in(&dir);
+            assert_eq!(
+                tree(&dir),
+                BTreeSet::from([PathBuf::from(OWNER_MARKER)]),
+                "{} holds the marker and nothing else",
+                dir.display()
+            );
+            assert!(dir.join(OWNER_MARKER).is_file());
+        }
+    }
+
+    #[test]
+    fn open_refuses_a_non_empty_directory_it_does_not_own() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let dir = parent.path().join("not-scratch");
+        fs::create_dir_all(dir.join("nested")).expect("nested dir");
+        fs::write(dir.join("report.txt"), b"someone's file").expect("file");
+        fs::write(dir.join("nested/data.bin"), b"more").expect("nested file");
+        let before = tree(&dir);
+        assert_eq!(before.len(), 3, "the fixture is in place");
+
+        let result = ScratchStore::open(dir.clone(), 1000);
+
+        assert_eq!(tree(&dir), before, "nothing was deleted or written");
+        assert_eq!(
+            fs::read(dir.join("report.txt")).expect("still there"),
+            b"someone's file"
+        );
+        let Err(StoreError::Permanent(message)) = result else {
+            panic!("expected a Permanent refusal, got {:?}", result.map(|_| ()));
+        };
+        assert!(
+            message.contains(&dir.display().to_string()),
+            "the error names the path: {message}"
+        );
     }
 
     #[test]
@@ -984,7 +1072,11 @@ mod tests {
 
         store.wipe().expect("wipe");
 
-        assert!(tree(dir.path()).is_empty(), "left: {:?}", tree(dir.path()));
+        assert!(
+            stored(dir.path()).is_empty(),
+            "left: {:?}",
+            stored(dir.path())
+        );
         assert!(list_all(&store, "").await.expect("list").is_empty());
         assert!(matches!(
             store.head("runs/0/part-0").await,
@@ -1082,7 +1174,7 @@ mod tests {
         ] {
             assert!(matches!(result, Err(StoreError::UnaddressableKey { .. })));
         }
-        assert!(tree(dir.path()).is_empty());
+        assert!(stored(dir.path()).is_empty());
     }
 
     #[tokio::test]
@@ -1154,23 +1246,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_segment_too_long_for_a_file_name_is_refused() {
+    async fn a_segment_whose_escaped_name_plus_its_mark_exceeds_255_bytes_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = open_in(dir.path());
-        let key = format!("runs/{}", "x".repeat(MAX_NAME_BYTES));
-        let result = store
-            .put(&key, Bytes::from_static(b"x"), PutOptions::default())
-            .await;
-        assert!(
-            matches!(result, Err(StoreError::Permanent(_))),
-            "{result:?}"
-        );
-        assert!(tree(dir.path()).is_empty());
+        // Each segment escapes to 255 bytes, so its name with the mark is 256:
+        // a final segment, a directory segment, and one escaped as `%XX`.
+        for key in [
+            format!("runs/{}", "x".repeat(MAX_NAME_BYTES)),
+            format!("{}/run", "x".repeat(MAX_NAME_BYTES)),
+            format!("runs/{}", "X".repeat(MAX_NAME_BYTES / 3)),
+        ] {
+            let result = store
+                .put(&key, Bytes::from_static(b"x"), PutOptions::default())
+                .await;
+            let Err(StoreError::Permanent(message)) = &result else {
+                panic!("expected a Permanent refusal, got {result:?}");
+            };
+            assert!(
+                message.contains("escaped name plus its one-byte mark is 256 bytes"),
+                "{message}"
+            );
+        }
+        assert!(stored(dir.path()).is_empty());
         let fits = format!("runs/{}", "x".repeat(MAX_NAME_BYTES - 1));
         store
             .put(&fits, Bytes::from_static(b"x"), PutOptions::default())
             .await
-            .expect("a 255-byte file name fits");
+            .expect("an escaped name plus its mark of exactly 255 bytes fits");
     }
 
     #[tokio::test]
@@ -1182,7 +1284,7 @@ mod tests {
             .put_part(Bytes::from_static(b"part"), None)
             .await
             .expect("part");
-        assert_eq!(tree(dir.path()).len(), 1, "one temporary file");
+        assert_eq!(stored(dir.path()).len(), 1, "one temporary file");
         assert!(list_all(&store, "").await.expect("list").is_empty());
         assert!(matches!(
             store.head("m/object").await,
@@ -1190,7 +1292,7 @@ mod tests {
         ));
         drop(upload);
         assert!(
-            tree(dir.path()).is_empty(),
+            stored(dir.path()).is_empty(),
             "a dropped upload removes its temporary file"
         );
     }
@@ -1342,7 +1444,7 @@ mod tests {
         );
         assert_eq!(got.version, outcome.version);
         assert_eq!(
-            tree(dir.path()).len(),
+            stored(dir.path()).len(),
             1,
             "no losing temporary file is left"
         );
@@ -1401,6 +1503,47 @@ mod tests {
         assert_eq!(direct(&ours), direct(&theirs));
     }
 
+    #[tokio::test]
+    async fn keys_differing_only_in_case_are_distinct_objects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = open_in(dir.path());
+        for (key, body) in [("A", &b"upper"[..]), ("a", &b"lower"[..])] {
+            store
+                .put(key, Bytes::copy_from_slice(body), PutOptions::default())
+                .await
+                .expect("put");
+        }
+        let get = |key: &'static str| {
+            let store = &store;
+            async move { store.get(key, GetRange::Full).await.expect("get").data }
+        };
+        assert_eq!(get("A").await, Bytes::from_static(b"upper"));
+        assert_eq!(get("a").await, Bytes::from_static(b"lower"));
+        let listed: Vec<String> = list_all(&store, "")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(listed, ["A", "a"]);
+    }
+
+    fn case_folded(components: &[String]) -> Vec<String> {
+        components.iter().map(|c| c.to_ascii_lowercase()).collect()
+    }
+
+    fn swap_ascii_case(key: &str) -> String {
+        key.chars()
+            .map(|c| {
+                if c.is_ascii_uppercase() {
+                    c.to_ascii_lowercase()
+                } else {
+                    c.to_ascii_uppercase()
+                }
+            })
+            .collect()
+    }
+
     fn key_strategy() -> impl Strategy<Value = String> {
         prop_oneof![any::<String>(), "[ab/. %~\\\\\u{0}\u{7f}é日-]{0,24}",]
     }
@@ -1424,6 +1567,26 @@ mod tests {
                 prop_assert!(name != "." && name != "..");
             }
             prop_assert_eq!(key_from_components(&components), Some(key.clone()));
+        }
+
+        /// File names never differ only by case, so a case-insensitive
+        /// filesystem cannot fold two keys into one file: distinct keys,
+        /// including a key and its case-swapped twin, map to names that
+        /// differ under ASCII case folding.
+        #[test]
+        fn distinct_keys_map_to_names_distinct_under_case_folding(
+            key in prop_oneof![key_strategy(), "[aAbBzZ09/._%-]{0,24}"],
+            other in key_strategy(),
+        ) {
+            for twin in [swap_ascii_case(&key), other] {
+                if twin != key {
+                    prop_assert_ne!(
+                        case_folded(&key_components(&key)),
+                        case_folded(&key_components(&twin)),
+                        "{:?} and {:?}", key, twin
+                    );
+                }
+            }
         }
     }
 }

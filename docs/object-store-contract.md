@@ -1829,10 +1829,16 @@ ADR-0042 decision 3.
    nothing else: `open` removes everything the directory held and `wipe`
    empties it, nothing in it is published or read by another process, and
    no durability or recovery path may depend on it. It must never back a
-   tenant's data. Each `/`-separated key segment maps to one escaped file
-   name (ASCII letters, digits, `-` and `_` kept, every other byte written
-   as `%XX`), so no key names a path outside the directory, and a segment
-   whose escaped name exceeds 255 bytes is refused as `Permanent`. A put
+   tenant's data. `open` only clears a directory it owns: one that does not
+   exist, is empty, or holds the `.ravel-scratch` marker file a previous
+   `open` wrote. Any other non-empty directory is refused as `Permanent`,
+   naming the path, before anything is deleted. `open` writes the marker
+   after clearing and `wipe` keeps it. Each `/`-separated key segment maps
+   to one escaped file name (ASCII lowercase letters, digits, `-` and `_`
+   kept, every other byte, ASCII uppercase included, written as `%XX`), so
+   no key names a path outside the directory and no two file names differ
+   only by case, and a key segment whose escaped name plus its one-byte
+   mark exceeds 255 bytes is refused as `Permanent`. A put
    writes a temporary file and renames it into place; conditional puts and
    deletes are decided under one lock, so their outcomes match
    `MemoryStore`'s. It declares the same `Capabilities` as `MemoryStore`
