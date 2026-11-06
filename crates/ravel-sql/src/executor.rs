@@ -6452,12 +6452,14 @@ fn plan_is_exact_typed(plan: &LogicalPlan) -> bool {
 ///   ([`rewrite_sort_group_key_tie_order`]) makes it total first, whenever it
 ///   can: it appends the aggregate's own GROUP BY expressions, in group
 ///   order, ascending with nulls last, as trailing sort terms, unless they
-///   are already present, to every `Sort` whose input is that `Aggregate` (or
-///   a `Projection` directly over it). Each group key is matched to the
+///   are already present, to every `Sort` whose input is that `Aggregate`, a
+///   `HAVING` `Filter` directly over it, or a `Projection` directly over
+///   either. A `Filter` only drops aggregate rows, so the group keys stay
+///   unique across the rows it keeps. Each group key is matched to the
 ///   aggregate's own qualified output column, never to a projected column
 ///   that merely shares its name, and a key the `Projection` drops is
 ///   projected through it. A `Sort` the rewrite cannot reach this way -- its
-///   input is any other shape (a `HAVING` filter, a nested projection), or
+///   input is any other shape (a nested projection, a subquery alias), or
 ///   the aggregate groups by grouping sets -- is left unchanged and stays
 ///   ineligible. A `DISTINCT ON` keeps its `ORDER BY` inside the `Distinct`
 ///   node, which the optimizer turns into an ordered `first_value` aggregate,
@@ -6811,20 +6813,38 @@ fn projected_group_key(projection: &Projection, key: &Column) -> Option<Column> 
         })
 }
 
+/// The `Aggregate` `plan` is, or the one a `HAVING` `Filter` directly over it
+/// reads. A `Filter` keeps the aggregate's schema and only drops rows, so its
+/// output still holds one row per group.
+fn aggregate_or_having(plan: &LogicalPlan) -> Option<&Aggregate> {
+    match plan {
+        LogicalPlan::Aggregate(aggregate) => Some(aggregate),
+        LogicalPlan::Filter(filter) => match filter.input.as_ref() {
+            LogicalPlan::Aggregate(aggregate) => Some(aggregate),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The `Projection` directly under `sort`, if there is one, and the aggregate
+/// `sort` orders ([`aggregate_or_having`] of the `Sort`'s input or of that
+/// projection's input), or `None` for any other shape.
+fn sorted_aggregate(sort: &Sort) -> Option<(Option<&Projection>, &Aggregate)> {
+    match sort.input.as_ref() {
+        LogicalPlan::Projection(projection) => {
+            aggregate_or_having(&projection.input).map(|aggregate| (Some(projection), aggregate))
+        }
+        other => aggregate_or_having(other).map(|aggregate| (None, aggregate)),
+    }
+}
+
 /// The edit that makes `sort`'s key total over the GROUP BY keys of the
-/// aggregate it orders, or `None` when no edit can: its input is not an
-/// `Aggregate` or a `Projection` directly over one, or the aggregate groups by
-/// grouping sets (whose per-row null group columns this does not attempt to
-/// order).
+/// aggregate it orders, or `None` when no edit can: [`sorted_aggregate`] finds
+/// no aggregate under it, or the aggregate groups by grouping sets (whose
+/// per-row null group columns this does not attempt to order).
 fn tie_order_edit(sort: &Sort) -> Option<TieOrderEdit> {
-    let (projection, aggregate_plan) = match sort.input.as_ref() {
-        LogicalPlan::Aggregate(_) => (None, &sort.input),
-        LogicalPlan::Projection(projection) => (Some(projection), &projection.input),
-        _ => return None,
-    };
-    let LogicalPlan::Aggregate(aggregate) = aggregate_plan.as_ref() else {
-        return None;
-    };
+    let (projection, aggregate) = sorted_aggregate(sort)?;
     if aggregate
         .group_expr
         .iter()
@@ -6882,7 +6902,15 @@ fn tie_order_edit(sort: &Sort) -> Option<TieOrderEdit> {
 
 /// The aggregate functions [`aggregate_expr_is_spill_exact`] can admit, by
 /// name, whatever their argument types.
-const SPILL_AGGREGATE_FAMILIES: [&str; 4] = ["count", "sum", "avg", "mean"];
+const SPILL_AGGREGATE_FAMILIES: [&str; 6] = ["count", "sum", "avg", "mean", "min", "max"];
+
+/// `expr` with one alias layer removed, the form every `aggr_expr` entry takes.
+fn unaliased(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Alias(alias) => alias.expr.as_ref(),
+        other => other,
+    }
+}
 
 /// Whether every aggregate expression of `aggregate` calls one of
 /// [`SPILL_AGGREGATE_FAMILIES`]. Reads function names only, never argument
@@ -6890,12 +6918,8 @@ const SPILL_AGGREGATE_FAMILIES: [&str; 4] = ["count", "sum", "avg", "mean"];
 /// those arguments.
 fn aggregate_functions_are_spill_families(aggregate: &Aggregate) -> bool {
     aggregate.aggr_expr.iter().all(|expr| {
-        let inner = match expr {
-            Expr::Alias(alias) => alias.expr.as_ref(),
-            other => other,
-        };
         matches!(
-            inner,
+            unaliased(expr),
             Expr::AggregateFunction(function)
                 if SPILL_AGGREGATE_FAMILIES
                     .contains(&function.func.name().to_ascii_lowercase().as_str())
@@ -6903,36 +6927,51 @@ fn aggregate_functions_are_spill_families(aggregate: &Aggregate) -> bool {
     })
 }
 
+/// Whether `sort` over `aggregate` is a shape the bounded aggregate
+/// (`crate::bounded_topk`) can serve: a single sort term over an aggregate
+/// whose only aggregate expression, after duplicates are merged, is a `min` or
+/// a `max`. That rule requires exactly one sort term and exactly one aggregate,
+/// so a trailing tiebreak term would take the top-k away from it.
+fn is_bounded_topk_candidate(sort: &Sort, aggregate: &Aggregate) -> bool {
+    let Some((first, rest)) = aggregate.aggr_expr.split_first() else {
+        return false;
+    };
+    let first = unaliased(first);
+    sort.expr.len() == 1
+        && rest.iter().all(|expr| unaliased(expr) == first)
+        && matches!(
+            first,
+            Expr::AggregateFunction(function)
+                if matches!(function.func.name().to_ascii_lowercase().as_str(), "min" | "max")
+        )
+}
+
 /// [`tie_order_edit`] for a `Sort` whose aggregate has only non-float GROUP BY
 /// keys ([`group_keys_are_non_float`]) and only
-/// [`SPILL_AGGREGATE_FAMILIES`] functions, else `None`.
+/// [`SPILL_AGGREGATE_FAMILIES`] functions, and which is not a bounded top-k
+/// candidate ([`is_bounded_topk_candidate`]), else `None`.
 ///
 /// A float key is left alone for the reason it disqualifies spill: nothing
 /// proves which `-0.0` or NaN bit pattern represents its group, so ordering on
 /// it proves nothing. Any other aggregate function can never make the plan
-/// spill-eligible, so it gains nothing from a total order, and the trailing
-/// terms would keep a `max`/`min` top-k from the bounded aggregate
-/// (`crate::bounded_topk`), whose gate requires the sort to be the aggregate
-/// column alone.
+/// spill-eligible, so it gains nothing from a total order. A bounded top-k
+/// candidate is left as written so the bounded aggregate can still bound its
+/// state; it stays spill-ineligible unless its single term already orders by
+/// every group key.
 fn total_tie_order_edit(sort: &Sort) -> Option<TieOrderEdit> {
-    let aggregate = match sort.input.as_ref() {
-        LogicalPlan::Aggregate(aggregate) => aggregate,
-        LogicalPlan::Projection(projection) => match projection.input.as_ref() {
-            LogicalPlan::Aggregate(aggregate) => aggregate,
-            _ => return None,
-        },
-        _ => return None,
-    };
-    if !group_keys_are_non_float(aggregate) || !aggregate_functions_are_spill_families(aggregate) {
+    let (_, aggregate) = sorted_aggregate(sort)?;
+    if !group_keys_are_non_float(aggregate)
+        || !aggregate_functions_are_spill_families(aggregate)
+        || is_bounded_topk_candidate(sort, aggregate)
+    {
         return None;
     }
     tie_order_edit(sort)
 }
 
 /// Whether `plan` has a `Sort` [`rewrite_sort_group_key_tie_order`] edits:
-/// one over an `Aggregate` (or a `Projection` directly over one) whose GROUP
-/// BY keys are all non-float and not yet all sort terms, and whose aggregate
-/// functions are all [`SPILL_AGGREGATE_FAMILIES`]. Shape, key types and
+/// one [`total_tie_order_edit`] admits whose GROUP BY keys are not yet all
+/// sort terms. Shape, key types and
 /// function names only, never argument types: the plan this reads has not
 /// been through the analyzer that coerces them.
 fn plan_has_tie_order_edit(plan: &LogicalPlan) -> bool {
@@ -6984,8 +7023,9 @@ fn apply_tie_order_edit(
     }
 }
 
-/// Rewrites every `Sort` whose input is an `Aggregate` (or a `Projection`
-/// directly over one) with no float GROUP BY key so its key is total over
+/// Rewrites every `Sort` whose input is an `Aggregate` (or a `HAVING` filter
+/// or a `Projection` directly over one, [`sorted_aggregate`]) with no float
+/// GROUP BY key so its key is total over
 /// that aggregate's GROUP BY keys ([`total_tie_order_edit`]): each key without
 /// a sort term is appended, in group order, ascending with nulls last, and
 /// `fetch` is unchanged. A `Sort` no edit applies to is returned unchanged.
@@ -7060,29 +7100,32 @@ fn group_keys_are_non_float(aggregate: &Aggregate) -> bool {
 ///   is.
 /// - `sum` over a resolved integer input: eligible. Integer addition is
 ///   associative, so partial sums merged in any order give the same total.
-/// - `avg`/`mean` over a resolved `Int64` input: eligible. That is
-///   `crate::avg`'s exact integer path, an `i128` numerator with checked
-///   addition and an integer count (ADR-0825 decision 2); the analyzer coerces
-///   every admitted integer width, plain or dictionary-encoded, to `Int64`, so
-///   a resolved `Int64` argument is the whole of that path. `avg(DISTINCT)`
-///   over the same input keeps a set of the distinct values instead, and its
-///   merge is a set union, which does not depend on order either.
+/// - `avg`/`mean` over a resolved integer input `crate::avg` computes exactly
+///   ([`is_exact_avg_integer`]: `Int8` to `Int64`, `UInt8` to `UInt32`, or a
+///   dictionary of one): eligible. That is `crate::avg`'s exact integer path,
+///   an `i128` numerator with checked addition and an integer count (ADR-0825
+///   decision 2), whose partial states merge by adding numerators and counts.
+///   The analyzer coerces each of those widths to `Int64`, so an analyzed plan
+///   carries an `Int64` argument; the narrower widths are the same path seen
+///   before coercion. `avg(DISTINCT)` over the same input keeps a set of the
+///   distinct values instead, and its merge is a set union, which does not
+///   depend on order either. `UInt64` is not one of them: `crate::avg` widens
+///   it to `Float64` and folds it as a float.
+/// - `min`/`max` over a resolved type whose comparison is a total order that
+///   no float is part of ([`is_exact_extreme_type`]): eligible. Ravel's
+///   `crate::minmax` delegates every non-float type to DataFusion's built-in
+///   `min`/`max`, whose partial state is the running extreme in the argument's
+///   own type and whose merge keeps the smaller (or larger) of two states. The
+///   extreme of a multiset does not depend on how it is split or the order the
+///   parts are merged in, and two values the comparison calls equal are equal.
 ///
 /// Everything else is ineligible, including `sum` over a float (order-dependent
-/// IEEE addition), `avg` over a float (the same fold), `min`/`max` of any type,
+/// IEEE addition), `avg` over a float (the same fold) or a `UInt64`, `min`/`max`
+/// over a float or over any type outside [`is_exact_extreme_type`]'s list,
 /// `sum` over a Decimal, and any expression that is not an aggregate function
-/// call. `min`/`max` are excluded because ADR-0954's core cut enumerates three
-/// eligible families and this predicate implements exactly those; admitting
-/// more is a widening that needs its own evidence, and the cost of leaving them
-/// out is today's typed refusal, not a wrong answer.
+/// call.
 fn aggregate_expr_is_spill_exact(expr: &Expr, schema: &DFSchema) -> bool {
-    // `aggr_expr` entries are either an `AggregateFunction` or an `Alias`
-    // wrapping one; unwrap a single alias layer.
-    let inner = match expr {
-        Expr::Alias(alias) => alias.expr.as_ref(),
-        other => other,
-    };
-    let Expr::AggregateFunction(aggregate_function) = inner else {
+    let Expr::AggregateFunction(aggregate_function) = unaliased(expr) else {
         // Not an aggregate function where one is required: fail closed.
         return false;
     };
@@ -7101,11 +7144,58 @@ fn aggregate_expr_is_spill_exact(expr: &Expr, schema: &DFSchema) -> bool {
     match aggregate_function.func.name().to_ascii_lowercase().as_str() {
         "count" => true,
         "sum" => arg_type(is_exact_integer),
-        "avg" | "mean" => {
-            arg_type(|ty| matches!(ty, datafusion::arrow::datatypes::DataType::Int64))
-        }
+        "avg" | "mean" => arg_type(is_exact_avg_integer),
+        "min" | "max" => arg_type(is_exact_extreme_type),
         _ => false,
     }
+}
+
+/// The argument types `crate::avg` averages on its exact integer path:
+/// `Int8` to `Int64` and `UInt8` to `UInt32`, plain or as a dictionary's
+/// values. The same list as that module's coercion; `UInt64` is not on it.
+fn is_exact_avg_integer(ty: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    let value_type = match ty {
+        DataType::Dictionary(_, value_type) => value_type.as_ref(),
+        other => other,
+    };
+    is_exact_integer(value_type) && !matches!(value_type, DataType::UInt64)
+}
+
+/// The argument types `min`/`max` merge exactly under spill: integers,
+/// decimals, booleans, strings, binary, dates, times and timestamps, plain or
+/// as a dictionary's values. Every one is compared by a total order in which
+/// equal means identical, so the extreme of a group is the same whatever order
+/// its partial states merge in. Floats are never on the list
+/// (`crate::minmax::is_float`), and every type not named here (durations,
+/// intervals, nested types, nulls) fails closed.
+fn is_exact_extreme_type(ty: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType;
+    let value_type = match ty {
+        DataType::Dictionary(_, value_type) => value_type.as_ref(),
+        other => other,
+    };
+    is_exact_integer(value_type)
+        || matches!(
+            value_type,
+            DataType::Decimal32(..)
+                | DataType::Decimal64(..)
+                | DataType::Decimal128(..)
+                | DataType::Decimal256(..)
+                | DataType::Boolean
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+                | DataType::FixedSizeBinary(_)
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+                | DataType::Timestamp(..)
+        )
 }
 
 /// The integer types whose addition is exact and associative, so a partial sum
@@ -9088,19 +9178,222 @@ pub(crate) mod tests {
         assert!(plan_is_spill_eligible(&rewritten));
     }
 
-    /// A `HAVING` filter sits between the `Sort`'s projection and the
-    /// aggregate, which is not a shape [`tie_order_edit`] reaches: the Sort is
-    /// left as it is and the plan stays ineligible.
+    /// A `HAVING` filter between the `Sort`'s projection and the aggregate
+    /// only drops groups, so the group keys still identify each row it keeps:
+    /// [`tie_order_edit`] reaches through it, appends `(a, b)`, and the plan
+    /// becomes eligible (issue #3899).
+    ///
+    /// Prove-the-test: make `aggregate_or_having` return `None` for a
+    /// `Filter` and `plan_has_tie_order_edit` reads false here and in the row
+    /// 29 test below.
     #[tokio::test]
-    async fn a_having_filter_keeps_the_sort_ineligible() {
+    async fn a_having_filter_gets_the_tie_order_and_becomes_eligible() {
         let plan = q33_plan(
             "SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b HAVING count(*) > 1 \
              ORDER BY c DESC LIMIT 10",
         )
         .await;
-        let rewritten = rewrite_sort_group_key_tie_order(plan.clone()).expect("nothing to do");
-        assert_eq!(rewritten, plan);
-        assert!(!plan_is_spill_eligible(&rewritten));
+        assert!(!plan_is_spill_eligible(&plan));
+        assert!(plan_has_tie_order_edit(&plan));
+        let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite applies");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![
+                term(None, "c", false),
+                term(Some("q33"), "a", true),
+                term(Some("q33"), "b", true),
+            ]
+        );
+        assert!(plan_is_spill_eligible(&rewritten));
+    }
+
+    /// One column of each type the min/max and avg spill gate distinguishes,
+    /// plus a string group key `k`.
+    fn spill_types_schema() -> Arc<datafusion::arrow::datatypes::Schema> {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("s", DataType::Utf8, false),
+            Field::new("i8", DataType::Int8, false),
+            Field::new("i32", DataType::Int32, false),
+            Field::new("i64", DataType::Int64, false),
+            Field::new("u32", DataType::UInt32, false),
+            Field::new("u64", DataType::UInt64, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("d", DataType::Decimal128(18, 2), false),
+            Field::new("f", DataType::Float64, false),
+        ]))
+    }
+
+    /// Whether `SELECT k, <aggregate> FROM types GROUP BY k` is spill-eligible
+    /// on its analyzed classification plan.
+    async fn grouped_aggregate_is_spill_eligible(aggregate: &str) -> bool {
+        let schemas = vec![("types".to_string(), spill_types_schema())];
+        let sql = format!("SELECT k, {aggregate} AS v FROM types GROUP BY k");
+        let plan = eviction_test_executor()
+            .sql_classification_plan(TenantHash([111u8; 16]), &sql, &[], Some(&schemas))
+            .await
+            .expect("the statement plans");
+        plan_is_spill_eligible(&plan)
+    }
+
+    /// Issue #3899: `min`/`max` over a non-float type merge exactly under
+    /// spill and are eligible; over a float they are not.
+    ///
+    /// Prove-the-test: let `is_exact_extreme_type` admit `Float64` and the
+    /// float rows read true.
+    #[tokio::test]
+    async fn min_and_max_are_spill_eligible_over_non_float_types_only() {
+        use datafusion::arrow::datatypes::{DataType, TimeUnit};
+
+        let dictionary =
+            |value: DataType| DataType::Dictionary(Box::new(DataType::Int32), Box::new(value));
+        for admitted in [
+            dictionary(DataType::Utf8),
+            DataType::Boolean,
+            DataType::Date32,
+        ] {
+            assert!(is_exact_extreme_type(&admitted), "{admitted} is admitted");
+        }
+        for refused in [
+            DataType::Float16,
+            DataType::Float32,
+            DataType::Float64,
+            dictionary(DataType::Float64),
+            DataType::Duration(TimeUnit::Second),
+        ] {
+            assert!(!is_exact_extreme_type(&refused), "{refused} is refused");
+        }
+        for column in ["s", "i32", "ts", "d"] {
+            for function in ["min", "max"] {
+                let aggregate = format!("{function}({column})");
+                assert!(
+                    grouped_aggregate_is_spill_eligible(&aggregate).await,
+                    "{aggregate} must be spill-eligible"
+                );
+            }
+        }
+        for function in ["min", "max"] {
+            let aggregate = format!("{function}(f)");
+            assert!(
+                !grouped_aggregate_is_spill_eligible(&aggregate).await,
+                "{aggregate} over Float64 must not be spill-eligible"
+            );
+        }
+    }
+
+    /// Issue #3899: `avg` over every integer width `crate::avg` averages
+    /// exactly is eligible; over `UInt64` (a float fold there) and `Float64`
+    /// it is not. Checked on the analyzed plan and on the argument type
+    /// before coercion.
+    #[tokio::test]
+    async fn avg_is_spill_eligible_over_the_exact_integer_widths_only() {
+        use datafusion::arrow::datatypes::DataType;
+
+        for column in ["i8", "i32", "i64", "u32"] {
+            for function in ["avg", "mean"] {
+                let aggregate = format!("{function}({column})");
+                assert!(
+                    grouped_aggregate_is_spill_eligible(&aggregate).await,
+                    "{aggregate} must be spill-eligible"
+                );
+            }
+        }
+        for column in ["u64", "f"] {
+            let aggregate = format!("avg({column})");
+            assert!(
+                !grouped_aggregate_is_spill_eligible(&aggregate).await,
+                "{aggregate} must not be spill-eligible"
+            );
+        }
+        for admitted in [
+            DataType::Int8,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt32,
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32)),
+        ] {
+            assert!(is_exact_avg_integer(&admitted), "{admitted} is admitted");
+        }
+        for refused in [
+            DataType::UInt64,
+            DataType::Float64,
+            DataType::Decimal128(18, 2),
+        ] {
+            assert!(!is_exact_avg_integer(&refused), "{refused} is refused");
+        }
+    }
+
+    /// The ClickBench row 29 statement, over a `hits` table with a string
+    /// `Referer` column (issue #3899): a `regexp_replace` group key,
+    /// `AVG(length(..))`, `COUNT(*)`, `MIN` of a string, a `HAVING` filter, an
+    /// `ORDER BY` the average, and a `LIMIT`. Its `ORDER BY l DESC` ties
+    /// across groups, so it is ineligible as written; the tie-order rewrite
+    /// reaches through the `HAVING` filter, appends the key, and makes it
+    /// eligible.
+    #[tokio::test]
+    async fn the_clickbench_row_29_shape_is_spill_eligible_after_the_rewrite() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "Referer",
+            DataType::Utf8,
+            false,
+        )]));
+        let schemas = vec![("hits".to_string(), schema)];
+        let plan = eviction_test_executor()
+            .sql_classification_plan(TenantHash([112u8; 16]), ROW_29_SQL, &[], Some(&schemas))
+            .await
+            .expect("the row 29 shape plans");
+        assert!(!plan_is_spill_eligible(&plan), "ORDER BY l alone ties");
+        assert!(plan_is_spill_eligible_ignoring_sort_order(&plan));
+        assert!(plan_has_tie_order_edit(&plan));
+        let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite applies");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![term(None, "l", false), term(None, "k", true)]
+        );
+        assert!(plan_is_spill_eligible(&rewritten));
+    }
+
+    const ROW_29_SQL: &str = "SELECT regexp_replace(\"Referer\", \
+        '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') AS k, AVG(length(\"Referer\")) AS l, \
+        COUNT(*) AS c, MIN(\"Referer\") FROM hits WHERE \"Referer\" <> '' GROUP BY k \
+        HAVING COUNT(*) > 100000 ORDER BY l DESC LIMIT 25";
+
+    /// A `min`/`max` top-k the bounded aggregate (`crate::bounded_topk`) can
+    /// serve keeps its single sort term: admitting `min`/`max` to the spill
+    /// families must not append a tiebreak, which would take the top-k from
+    /// that rule. A second aggregate, or a second sort term, is not such a
+    /// candidate, and gets the tiebreak.
+    ///
+    /// Prove-the-test: drop the `is_bounded_topk_candidate` check from
+    /// `total_tie_order_edit` and the single-`max` rows read true.
+    #[tokio::test]
+    async fn a_min_or_max_top_k_keeps_its_single_sort_term() {
+        for sql in [
+            "SELECT a, max(x) AS m FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
+            "SELECT a, min(y) AS m FROM q33 GROUP BY a ORDER BY m LIMIT 10",
+            "SELECT a, max(x) AS m, max(x) AS m2 FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
+        ] {
+            let plan = q33_plan(sql).await;
+            assert!(!plan_has_tie_order_edit(&plan), "{sql}");
+            let rewritten = rewrite_sort_group_key_tie_order(plan.clone()).expect("nothing to do");
+            assert_eq!(rewritten, plan, "{sql}");
+        }
+
+        let two_aggregates = q33_plan(
+            "SELECT a, max(x) AS m, count(*) AS c FROM q33 GROUP BY a ORDER BY m DESC LIMIT 10",
+        )
+        .await;
+        assert!(plan_has_tie_order_edit(&two_aggregates));
+        let rewritten =
+            rewrite_sort_group_key_tie_order(two_aggregates).expect("the rewrite applies");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![term(None, "m", false), term(Some("q33"), "a", true)]
+        );
+        assert!(plan_is_spill_eligible(&rewritten));
     }
 
     /// An `ORDER BY` over a subquery puts a second projection (and the
@@ -9160,15 +9453,15 @@ pub(crate) mod tests {
     /// The executed-plan gate reads the `Sort`'s shape, the group key types
     /// and the aggregate function names, never argument types: a `sum` over a
     /// float expression is not spill-exact, yet its `Sort` gets the group keys
-    /// as tiebreaks. A `max` is outside the spill families and its `Sort` is
-    /// left as written, which keeps it a single-term top-k the bounded
-    /// aggregate can serve. A `Sort` that already orders by every group key
-    /// has nothing to edit.
+    /// as tiebreaks. A lone `max` under a single sort term is a bounded top-k
+    /// candidate and its `Sort` is left as written, which keeps it a
+    /// single-term top-k the bounded aggregate can serve. A `Sort` that
+    /// already orders by every group key has nothing to edit.
     ///
     /// Prove-the-test: return `plan_is_spill_eligible_ignoring_sort_order` from
     /// `plan_has_tie_order_edit` and the float `sum` row reads false; drop the
-    /// `aggregate_functions_are_spill_families` check from
-    /// `total_tie_order_edit` and the `max` row reads true; drop the
+    /// `is_bounded_topk_candidate` check from `total_tie_order_edit` and the
+    /// `max` row reads true; drop the
     /// `Extend`/`ProjectThrough` filter (accept any `Some`) and the
     /// already-total row reads true.
     #[tokio::test]

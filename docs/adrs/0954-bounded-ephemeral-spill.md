@@ -248,6 +248,12 @@ drops the reason drops the requirement.
    below admits a `Sort` over a spill-exact aggregate once its sort key is
    made total over the aggregate's group keys.
 
+   The classifier admitted only `count`, `sum` over an exact integer and
+   `avg` over `Int64`, narrower than the classification above. The exact
+   min, max and integer avg spill amendment below widens it to `min`/`max`
+   over non-float types and to `avg` over every integer width Ravel's `avg`
+   computes exactly.
+
 5. **Typed `spill_budget_exhausted`, `spill_unavailable`, and cleanup
    errors.** The invariant's three failure modes (scratch budget exceeded,
    scratch capacity unavailable, spill failure) must be distinguishable at
@@ -650,6 +656,10 @@ rewrite that cannot be applied (a reserved name already in use) leaves the
 plan as it was, which keeps it ineligible rather than failing the statement.
 A `Sort` the rewrite does not reach (over grouping sets, over a `HAVING`
 filter, or over nested projections) is left unchanged and stays ineligible.
+(The exact min, max and integer avg spill amendment below adds `min` and
+`max` to the functions this rewrite accepts, keeps a single-term `min`/`max`
+top-k as written, and lets the rewrite reach a `Sort` over a `HAVING`
+filter.)
 
 **Requirement 7: the ownership mechanism.** A process whose spill resolved
 under `--cache-dir` creates `<cache-dir>/sql-spill/<instance-id>` and takes
@@ -718,3 +728,51 @@ from it, every query granted spill reserves its cap from that budget, and
 HTTP, mTLS and Flight SQL surfaces. The environment pair therefore sets the
 directory and the process-wide ceiling. Nothing else in the amendment
 changes.
+
+## Amendment (2026-11-06): exact min, max and integer avg spill (issue #3899)
+
+<!-- amendment-applies: sections="Normative implementation requirements|Amendment (2026-10-03): spill under --cache-dir by default, and a tie-ordered Sort (issue #2416)" pointer="exact min, max and integer avg spill amendment" -->
+
+This is the exact min, max and integer avg spill amendment (issue #3899).
+Requirement 4 classifies `count`, `sum`, `min` and `max` over non-float
+types as always exact and `avg` as exact over integers, as ADR-0094 does.
+The eligibility gate implemented less than that: `count`, `sum` over an
+exact integer and `avg`/`mean` over `Int64`. ClickBench row 29, which groups
+by a `regexp_replace` of a string and computes `AVG(length(..))`,
+`COUNT(*)` and `MIN` of that string with a `HAVING` filter and an
+`ORDER BY` the average, was therefore refused on the memory budget on a
+4 GB host even with spill configured. The gate now matches requirement 4:
+
+1. `min` and `max` are eligible over integers, decimals, booleans, strings
+   (`Utf8`, `LargeUtf8`, `Utf8View`), binary, dates, times and timestamps,
+   plain or as a dictionary's values. Their partial state is the running
+   extreme in the argument's own type and a merge keeps the smaller (or
+   larger) of two states, so the extreme does not depend on how the input
+   was split or the order the parts merge in. A float argument stays
+   refused, and so does every type not named here (durations, intervals,
+   nested types).
+2. `avg` and `mean` are eligible over `Int8` to `Int64` and `UInt8` to
+   `UInt32`, plain or as a dictionary's values: the widths Ravel's `avg`
+   coerces to `Int64` and averages with an exact `i128` numerator. `UInt64`
+   stays refused, since that `avg` widens it to `Float64` and folds it as a
+   float.
+3. The tie-order rewrite of the cache-dir spill default amendment's
+   requirement 4 accepts `min` and `max` among its aggregate functions,
+   except for a `Sort` with a single term over an aggregate whose only
+   aggregate expression is one `min` or `max`. That is the shape the
+   bounded aggregate of issue #1402 serves, and its gate requires exactly
+   one sort term, so a trailing tiebreak would take the top-k away from
+   it. Such a `Sort` is left as written and stays spill-ineligible, as it
+   was before this amendment.
+4. The rewrite also reaches a `Sort` whose input is a `HAVING` filter
+   directly over the aggregate, or a `Projection` directly over that
+   filter. The filter only drops aggregate rows, so the group keys still
+   identify each row it keeps and the appended terms make the order total.
+   The bounded aggregate refuses a `HAVING` filter under its sort, so this
+   takes no top-k from it.
+
+DataFusion's grouped-hash spill path merging spilled partial states of
+Ravel's `min` over strings, `max` over integers and `avg` over `Int32`
+returns the in-memory result value for value, the average bit for bit, and
+so does the row 29 shape; `crates/ravel-sql/tests/spill.rs` pins both with
+nonzero spill counters.
