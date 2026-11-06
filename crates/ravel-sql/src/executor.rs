@@ -9826,10 +9826,13 @@ pub(crate) mod tests {
         has_bounded_aggregate(&physical)
     }
 
+    /// One agreement-matrix type: the column-name suffix and the type.
+    type MatrixType = (&'static str, fn() -> datafusion::arrow::datatypes::DataType);
+
     /// Group-key types of the agreement matrix: the types a declared logs
     /// column takes (`Str` is a `Dictionary(Int32, Utf8)`, `Bool` a
     /// `Boolean`, `Bytes` a `Binary`), plus `Int64` and plain `Utf8`.
-    const TOPK_KEY_TYPES: [(&str, fn() -> datafusion::arrow::datatypes::DataType); 5] = {
+    const TOPK_KEY_TYPES: [MatrixType; 5] = {
         use datafusion::arrow::datatypes::DataType;
         [
             ("int64", || DataType::Int64),
@@ -9844,7 +9847,7 @@ pub(crate) mod tests {
 
     /// `min`/`max` argument types of the agreement matrix: the key types plus
     /// a timestamp.
-    const TOPK_VALUE_TYPES: [(&str, fn() -> datafusion::arrow::datatypes::DataType); 6] = {
+    const TOPK_VALUE_TYPES: [MatrixType; 6] = {
         use datafusion::arrow::datatypes::{DataType, TimeUnit};
         [
             ("int64", || DataType::Int64),
