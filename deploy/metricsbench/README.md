@@ -783,7 +783,12 @@ verification (step 6), after which the run goes on as a diagnostic:
     `phases`, the shape `diagnostics.json` carries) (case y). A failed
     restart (case y4), readiness wait (case y5) or query run (case y1) is
     recorded in that run's `status`, counted in the `cold_ravel_diagnostic`
-    stamp's `failed_runs`, and does not fail the run. A run whose record was
+    stamp's `failed_runs`, and does not fail the run. After the first
+    readiness wait that times out, the remaining repetitions of every entry
+    are recorded as `failed: skipped after ravel did not answer 200
+    following <entry> repetition <n>` without another restart or wait, so a
+    server that does not come back costs one wait, not one per repetition
+    (case y5). A run whose record was
     never written gets a record with status `failed: no record was written
     for this run`, is counted in `failed_runs`, and is named by entry and
     repetition in the stamp's `missing_runs` (case y6). After a failed

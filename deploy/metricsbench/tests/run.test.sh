@@ -2033,8 +2033,9 @@ expect_no_log "y4: no cold query after a failed restart" "--out ${OUT}/cold-rave
 
 METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_RESTART_NOT_READY=1 run_cold y5
 expect_rc y5 0
-check "y5: a failed readiness wait is a recorded run, stamped, the run passes" 'j("stamps.json")["status"] == "passed" and j("stamps.json")["cold_ravel_diagnostic"]["failed_runs"] == 15 and all(r["status"] == "failed: ravel did not answer 200 after the restart" for r in j("cold-ravel-diagnostic.json")["runs"]) and "readback-folded" in j("stamps.json")["steps_completed"]'
+check "y5: a failed readiness wait is a recorded run, stamped, the run passes, and the remaining runs are skipped without another wait" 'j("stamps.json")["status"] == "passed" and j("stamps.json")["cold_ravel_diagnostic"]["failed_runs"] == 15 and [r["status"] for r in j("cold-ravel-diagnostic.json")["runs"]].count("failed: ravel did not answer 200 after the restart") == 1 and sum(1 for r in j("cold-ravel-diagnostic.json")["runs"] if r["status"].startswith("failed: skipped after ravel did not answer 200 following ")) == 14 and "readback-folded" in j("stamps.json")["steps_completed"]'
 expect_no_log "y5: no cold query after a failed readiness wait" "--out ${OUT}/cold-ravel-diagnostic/"
+if [ "$(grep -c ' restart --no-deps ravel-server$' "${LOG}")" -eq 1 ]; then pass "y5: one restart, none for the skipped runs"; else fail "y5: restarts $(grep -c ' restart --no-deps ravel-server$' "${LOG}"), want 1"; fi
 
 METRICSBENCH_CORPUS="${TMP}/corpus.json" STUB_COLD_DROP_RECORD=zz_long_any.3 run_cold y6
 expect_rc y6 0
