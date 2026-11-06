@@ -1536,8 +1536,8 @@ async fn run(
     let profile: Option<Value> = None;
     store.armed.store(false, Ordering::Relaxed);
 
-    let parts_written = match outcome {
-        CompactionOutcome::Compacted { parts, .. } => parts,
+    let (parts_written, publish) = match outcome {
+        CompactionOutcome::Compacted { parts, publish } => (parts, publish),
         other => panic!("compaction did not compact: {other:?}"),
     };
 
@@ -1691,6 +1691,7 @@ async fn run(
         "l1_l0_ratio": l1_bytes as f64 / l0_bytes.max(1) as f64,
         "l1_parts": crec.parts.len(),
         "l1_parts_reported_by_outcome": parts_written,
+        "publish_outcome": format!("{publish:?}"),
         "l1_part_bytes": crec.parts.iter().map(|p| p.object_size).collect::<Vec<_>>(),
         "merge_read_mode": mode.get("mode").cloned(),
         "read_mode_event_fields": mode,
@@ -1708,8 +1709,8 @@ async fn run(
         },
         "wall_s": wall_s,
         "process_cpu_s": cpu_s,
-        "user_s (proc ticks)": (u1 - u0) as f64 / TICKS_PER_S,
-        "sys_s (proc ticks)": (s1 - s0) as f64 / TICKS_PER_S,
+        "user_s (proc ticks)": u1.saturating_sub(u0) as f64 / TICKS_PER_S,
+        "sys_s (proc ticks)": s1.saturating_sub(s0) as f64 / TICKS_PER_S,
         "cores_busy (cpu/wall)": cpu_s / wall_s,
         "records_per_s_wall": l0_records as f64 / wall_s,
         "records_per_s_per_core (records / process cpu)": l0_records as f64 / cpu_s,
@@ -2078,6 +2079,20 @@ fn check_figures(doc: &Value, inputs: usize, page_choice_ab: bool, profiled: boo
             run["records_in"], run["records_out"]
         ));
     }
+    if run["l1_parts"] != run["l1_parts_reported_by_outcome"] {
+        failures.push(format!(
+            "l1_parts {} (compaction record) != l1_parts_reported_by_outcome {}",
+            run["l1_parts"], run["l1_parts_reported_by_outcome"]
+        ));
+    }
+    // A fresh store has no prior record, so anything but Published means the
+    // run measured a converge or an abandon rather than a compaction.
+    if run["publish_outcome"] != "Published" {
+        failures.push(format!(
+            "publish_outcome {}, want Published",
+            run["publish_outcome"]
+        ));
+    }
     if doc["shape"]["objects"].as_u64() != Some(inputs as u64) {
         failures.push(format!(
             "shape.objects {} != --inputs {inputs}",
@@ -2196,6 +2211,90 @@ mod tests {
         assert!(check_realism(f64::NAN).is_err());
         for inside in [8_000.0, 30_000.0, 70_000.0] {
             assert_eq!(check_realism(inside), Ok(()), "{inside}");
+        }
+    }
+
+    const FIGURE_INPUTS: usize = 8;
+
+    /// A document carrying every `RUN_FIGURES` key exactly once, with the
+    /// cross-checked figures consistent.
+    fn figures_doc() -> Value {
+        let mut run = serde_json::Map::new();
+        for (i, key) in RUN_FIGURES.iter().enumerate() {
+            run.insert((*key).to_string(), json!(i + 1));
+        }
+        run.insert("records_out".to_string(), run["records_in"].clone());
+        run.insert("l1_parts".to_string(), json!(3));
+        run.insert("l1_parts_reported_by_outcome".to_string(), json!(3));
+        run.insert(
+            "publish_outcome".to_string(),
+            json!(format!("{:?}", ravel_maintain::PublishOutcome::Published)),
+        );
+        run.insert("timeline".to_string(), json!({"seed_s": 0.5}));
+        json!({
+            "shape": {"objects": FIGURE_INPUTS},
+            "run": Value::Object(run),
+        })
+    }
+
+    #[test]
+    fn check_figures_passes_when_every_run_figure_is_present_once() {
+        let failures = check_figures(&figures_doc(), FIGURE_INPUTS, false, false);
+        assert_eq!(failures, Vec::<String>::new());
+    }
+
+    #[test]
+    fn check_figures_refuses_a_missing_or_duplicated_figure() {
+        let mut doc = figures_doc();
+        doc["run"]["l1_l0_ratio"] = Value::Null;
+        doc["run"]["timeline"]["process_cpu_s"] = json!(9.0);
+        let failures = check_figures(&doc, FIGURE_INPUTS, false, false);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures[0].starts_with("figure l1_l0_ratio: reported 1 times, value null"),
+            "{failures:?}"
+        );
+        assert!(
+            failures[1].starts_with("figure process_cpu_s: reported 2 times"),
+            "{failures:?}"
+        );
+
+        let mut doc = figures_doc();
+        let run = doc["run"].as_object_mut().expect("run object");
+        run.remove("wall_s");
+        let failures = check_figures(&doc, FIGURE_INPUTS, false, false);
+        assert_eq!(
+            failures,
+            ["figure wall_s: reported 0 times, value null".to_string()]
+        );
+    }
+
+    #[test]
+    fn check_figures_refuses_a_part_count_mismatch() {
+        let mut doc = figures_doc();
+        doc["run"]["l1_parts_reported_by_outcome"] = json!(4);
+        let failures = check_figures(&doc, FIGURE_INPUTS, false, false);
+        assert_eq!(
+            failures,
+            ["l1_parts 3 (compaction record) != l1_parts_reported_by_outcome 4".to_string()]
+        );
+    }
+
+    #[test]
+    fn check_figures_refuses_a_publish_other_than_published() {
+        for publish in [
+            ravel_maintain::PublishOutcome::Converged { parts_repaired: 0 },
+            ravel_maintain::PublishOutcome::Abandoned,
+        ] {
+            let mut doc = figures_doc();
+            let shown = format!("{publish:?}");
+            doc["run"]["publish_outcome"] = json!(shown);
+            let failures = check_figures(&doc, FIGURE_INPUTS, false, false);
+            assert_eq!(
+                failures,
+                [format!("publish_outcome \"{shown}\", want Published")],
+                "{shown}"
+            );
         }
     }
 }
