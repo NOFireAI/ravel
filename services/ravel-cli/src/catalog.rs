@@ -673,6 +673,10 @@ pub fn render_rebuild_report(
     out.push_str(&format!("parts_unindexed: {}\n", report.parts_unindexed));
     out.push_str(&format!("parts_rebuilt: {}\n", report.parts_rebuilt));
     out.push_str(&format!("parts_deferred: {}\n", report.parts_deferred));
+    out.push_str(&format!(
+        "parts_with_refused_leaves: {}\n",
+        report.parts_with_refused_leaves
+    ));
     out.push_str(&format!("leaves_written: {}\n", report.leaves_written));
     out.push_str(&format!(
         "leaf_bytes_written: {}\n",
@@ -683,6 +687,11 @@ pub fn render_rebuild_report(
         report.section_bytes_read
     ));
     out.push_str(&format!("ranged_gets: {}\n", report.ranged_gets));
+    out.push_str(&format!("leaf_prefix_gets: {}\n", report.leaf_prefix_gets));
+    out.push_str(&format!(
+        "leaf_prefix_bytes_read: {}\n",
+        report.leaf_prefix_bytes_read
+    ));
     out.push_str(&format!(
         "uncovered_entries: {}\n",
         report.uncovered_entries

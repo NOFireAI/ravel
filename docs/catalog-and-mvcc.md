@@ -1535,7 +1535,8 @@ key-index leaves") can prove absent a key its part holds, and the reader
 rejects it, so the rebuild also replaces it. Before any batch, on logs only,
 it reads each ref of a requested field with one ranged GET of the leaf's
 `[0, prefix_len)` to learn its `format_version` (`leaf_prefix_gets` and
-`leaf_prefix_bytes_read` in the report, counted when issued). That cost is
+`leaf_prefix_bytes_read` in the report, text and JSON alike, counted when
+issued and not part of `ranged_gets`). That cost is
 paid on every run, by a tenant with no version 1 leaf too: one GET per
 held logs ref of each requested field. A part holding a version 1 ref for a
 field is counted under `parts_unindexed` and `parts_with_refused_leaves`, its

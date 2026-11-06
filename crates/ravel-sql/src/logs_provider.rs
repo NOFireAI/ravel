@@ -455,7 +455,10 @@ impl LogsTableProvider {
         pushdown: &LogsPushdown,
     ) -> Option<Arc<LogsKeyIndexRoute>> {
         let ctx = self.key_index_route.as_ref()?;
-        if pushdown.key_equals.is_empty() {
+        // One equality only: a routed segment skips the tier-1 probe, which
+        // intersects every equality's block set and so prunes more when there
+        // are several.
+        if pushdown.key_equals.len() != 1 {
             return None;
         }
         let segment_count = self.snapshot.segments.len();
@@ -5491,5 +5494,52 @@ mod tests {
                 Ok(())
             })?;
         }
+    }
+
+    /// The provider routes a logs scan only for exactly one declared-key
+    /// equality: with several, the tier-1 probe intersects their block sets,
+    /// which a route answered from one of them would skip.
+    #[test]
+    fn route_needs_exactly_one_key_equality() {
+        use ravel_catalog::CatalogConfig;
+        use ravel_logseg::key_index::{KeyType, key8_i64};
+        use ravel_query::KeyEquals;
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let snapshot = Snapshot {
+            segments: Vec::new(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            LogSegmentFetcher::new(Arc::clone(&store)),
+            PhaseAccounting::new(),
+        )
+        .with_key_index_route(
+            Arc::new(Catalog::new(store, CatalogConfig::default()).expect("catalog")),
+            SnapshotParts::new(Vec::new(), Vec::new()),
+        );
+        let key = |v| KeyEquals::new("user_id", KeyType::I64, key8_i64(v));
+        let with = |keys: Vec<KeyEquals>| LogsPushdown {
+            key_equals: keys,
+            ..LogsPushdown::default()
+        };
+        assert!(
+            provider
+                .scan_key_index_route(&[], &with(Vec::new()))
+                .is_none()
+        );
+        assert!(
+            provider
+                .scan_key_index_route(&[], &with(vec![key(7)]))
+                .is_some()
+        );
+        assert!(
+            provider
+                .scan_key_index_route(&[], &with(vec![key(7), key(8)]))
+                .is_none()
+        );
     }
 }

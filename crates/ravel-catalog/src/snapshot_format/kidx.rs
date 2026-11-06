@@ -1766,6 +1766,7 @@ pub fn verify_key_index_leaf_frames(
 /// recomputing the header crc, the length fields and the ref; the directory
 /// and frames are kept byte for byte. It is for tests that need a leaf as an
 /// earlier writer left it: nothing in the fold or the rebuild calls it.
+#[doc(hidden)]
 pub fn restamp_key_index_leaf_version(
     bytes: &[u8],
     format_version: u32,

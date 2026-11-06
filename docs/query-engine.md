@@ -3780,7 +3780,7 @@ and block-level reported independently:
   the key absent, or, for several logs keys joined by `AND`, named no block
   every key shares (ADR-2707 decision 5). It also counts the segments the
   tier-2 router dropped before the scan because their part's leaves prove
-  the trace (spans) or the first declared-key equality's key (logs) absent
+  the trace (spans) or the one declared-key equality's key (logs) absent
   (ADR-3692 decisions 3 and 4); a segment is counted by one tier only, since
   a tier-2 prune is never opened.
 - `blocksPrunedByKeyIndex`: blocks the skip index kept, in the segments that
@@ -5196,7 +5196,10 @@ with the routes; `stats.keyIndex` above renders them under their exact
 names.
 
 The spans `trace_id =` lookup calls it (ADR-3692 decision 3), and so does a
-logs scan carrying a declared-key equality (decision 4, below). The SQL
+logs scan carrying exactly one declared-key equality (decision 4, below). A
+logs scan carrying several, joined by `AND`, stays on the tier-1 probe, which
+intersects their block sets where the router would answer from one
+(`route_needs_exactly_one_key_equality`). The SQL
 executor resolves the window with
 `resolve_pruned_with_parts` (`crates/ravel-sql/src/executor.rs`, the spans
 lane's resolve; without parts when the charge is refused, below) and hands
