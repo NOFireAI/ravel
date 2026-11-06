@@ -1860,7 +1860,7 @@ COLD_EXTRA_ENTRY="mb_full_range_avg_over_time"
 # or write is recorded (in the file, and stamped cold_ravel_diagnostic),
 # never fatal. Reads run_full's it_env, store_args and prov_tail.
 cold_ravel_diagnostic() {
-  local dir="${out_dir}/cold-ravel-diagnostic" ids id r code why line
+  local dir="${out_dir}/cold-ravel-diagnostic" ids id r code why line dead=""
   local runs="${out_dir}/cold-ravel-diagnostic/runs.json"
   mkdir -p "$dir" || { stamp_str cold_ravel_diagnostic "failed: cannot create $dir"; return 0; }
   # cold-record appends to runs.json; a reused out-dir would otherwise carry a
@@ -1887,6 +1887,11 @@ cold_ravel_diagnostic() {
       why=""
       if [ "$code" -ne 0 ]; then
         why="metricsbench_report provenance exited ${code}"
+      elif [ -n "$dead" ]; then
+        # One readiness wait is READY_TRIES x READY_INTERVAL; repeating it
+        # for every remaining repetition of a server that does not come back
+        # would hold the fold and the folded read-back for hours.
+        why="skipped after ravel did not answer 200 following ${dead}"
       elif ! compose restart --no-deps ravel-server >>"${dir}/restart.log" 2>&1; then
         # Without --no-deps, compose restart also bounces ravel-server's
         # dependency chain (ravel-qualify, createbuckets, s3s), and the cold
@@ -1894,6 +1899,7 @@ cold_ravel_diagnostic() {
         why="docker compose restart --no-deps ravel-server failed"
       elif ! ravel_ready_nonfatal; then
         why="ravel did not answer 200 after the restart"
+        dead="${id} repetition ${r}"
       fi
       if [ -z "$why" ]; then
         local qcode=0
