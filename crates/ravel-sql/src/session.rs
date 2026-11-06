@@ -112,7 +112,10 @@
 //! directions, never left to DataFusion's default. [`build_session`] takes a
 //! per-query [`SpillDecision`]; `Disabled` is ADR-0102 decision 3 unchanged,
 //! and `Enabled` names one directory and one byte ceiling. See
-//! [`disk_manager_builder`].
+//! [`disk_manager_builder`]. Through `SqlExecutor::execute` a statement's
+//! first attempt always gets `Disabled`; `Enabled` is for its spill retry
+//! after a memory refusal (issue #3899), and for the Flight SQL lanes, which
+//! still decide spill at plan time.
 //!
 //! A `SpillDecision::Enabled` query is also repartition-free: [`session_config`]
 //! forces `repartition_aggregations` off for it, whatever the ADR-0094
@@ -543,10 +546,13 @@ impl ObjectStoreRegistry for EmptyObjectStoreRegistry {
 }
 
 /// Whether THIS query may spill, and where (ADR-0954). Decided per query by
-/// the caller ([`crate::SqlExecutor`]), never inferred here: spill needs both
-/// an operator-configured [`SpillConfig`](crate::SpillConfig) and a plan whose
+/// the caller ([`crate::SqlExecutor`]), never inferred here: spill needs an
+/// operator-configured [`SpillConfig`](crate::SpillConfig) and a plan whose
 /// every aggregate is exactness-preserving under spill, and only the caller
-/// has the plan.
+/// has the plan. On the execute path it also needs a first attempt that was
+/// refused for memory: the first attempt is planned as if no `SpillConfig`
+/// were set and always runs `Disabled`, and only its spill retry may run
+/// `Enabled` (issue #3899). The Flight SQL lanes decide at plan time.
 #[derive(Debug, Clone, Copy)]
 pub enum SpillDecision<'a> {
     /// No spill. Identical to the pre-ADR-0954 behavior in every respect: an
@@ -554,8 +560,8 @@ pub enum SpillDecision<'a> {
     /// `"... (DiskManager is disabled)"` `ResourcesExhausted`, which
     /// [`SqlError::resources_exhausted_reattributed`](crate::SqlError::resources_exhausted_reattributed)
     /// then re-attributes to the pool that actually filled. This is what an
-    /// unconfigured deployment gets, and what an ineligible plan gets on a
-    /// configured one.
+    /// unconfigured deployment gets, what an ineligible plan gets on a
+    /// configured one, and what every first attempt gets on the execute path.
     Disabled,
     /// Spill into `dir`, capped at `max_bytes` for this query.
     Enabled {
@@ -685,8 +691,9 @@ pub fn session_config(
 /// permission: both knobs that can introduce one are turned off for a
 /// spill-enabled query.
 ///
-/// The cost is parallelism, on queries that today are refused outright, and it
-/// is bounded: `RsegScanExec` still scans its objects in parallel, and the
+/// The cost is parallelism, paid only by an attempt that may spill: on the
+/// execute path that is the spill retry of a statement whose first attempt,
+/// repartitioned as usual, was refused for memory. It is bounded: `RsegScanExec` still scans its objects in parallel, and the
 /// grouped aggregate that spill exists for still spills. What is given up is
 /// the fan-out ABOVE the merged, deduplicated stream.
 fn repartition_free(spill: SpillDecision<'_>) -> bool {
