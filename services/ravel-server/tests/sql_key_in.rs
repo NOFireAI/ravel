@@ -2,8 +2,10 @@
 //! a declared key-index column `IN` literals, and `trace_id IN` 16-byte
 //! literals, carry one key set through the tier-2 router and the tier-1 set
 //! probe. The rows of an `IN` list equal the union of the per-key equality
-//! answers, `stats.keyIndex.keysProbed` is the list's size, and a list the
-//! router cannot afford reads its part from tier 1 with no further leaf read.
+//! answers, `stats.keyIndex.keysProbed` is the list's distinct key count,
+//! an object holding none of the keys is pruned on either tier, and a list
+//! the router cannot afford reads its part from tier 1 with no further leaf
+//! read.
 //! A list of more than 1,024 values carries no key and is answered by the
 //! residual filter; a list beside a second key arm stays on tier 1.
 //!
@@ -141,7 +143,12 @@ impl Lane {
 
     /// `column IN` the first `n` keys.
     fn in_list(self, n: usize) -> String {
-        let values: Vec<String> = (0..n).map(|j| self.literal(j)).collect();
+        self.in_keys(&(0..n).collect::<Vec<_>>())
+    }
+
+    /// `column IN` the keys numbered `keys`.
+    fn in_keys(self, keys: &[usize]) -> String {
+        let values: Vec<String> = keys.iter().map(|&j| self.literal(j)).collect();
         self.select(&format!("{} IN ({})", self.column(), values.join(", ")))
     }
 
@@ -456,12 +463,24 @@ fn key_index(value: &Value, field: &str) -> u64 {
 
 /// The expected rows of the first `n` keys.
 fn oracle(n: usize) -> BTreeSet<String> {
-    (0..n)
-        .map(|j| {
+    oracle_of(&(0..n).collect::<Vec<_>>())
+}
+
+/// The expected rows of the keys numbered `keys`.
+fn oracle_of(keys: &[usize]) -> BTreeSet<String> {
+    keys.iter()
+        .map(|&j| {
             let (o, i) = key_record(j);
             label(o, i)
         })
         .collect()
+}
+
+/// `stats.pruning.<field>`.
+fn pruning(value: &Value, field: &str) -> u64 {
+    value["stats"]["pruning"][field]
+        .as_u64()
+        .unwrap_or_else(|| panic!("stats.pruning.{field} is a u64 in {value}"))
 }
 
 /// Re-encodes the one part's leaf for `lane` at 13 bucket bits and repoints
@@ -640,4 +659,36 @@ async fn a_hex_trace_id_list_plans_and_carries_the_key_set() {
     .await;
     assert_eq!(rows(&v), oracle(100), "{v}");
     assert_eq!(key_index(&v, "keysProbed"), 100, "{v}");
+}
+
+/// A logs key set whose every key is absent from an object prunes that
+/// object, both when the part's leaves route the set and when the part is
+/// uncovered and each object's own KEY_IDX answers the set. Key `j` lives in
+/// object `j % 4`: ten keys of object 0 leave objects 1 to 3 without a key,
+/// and on a 13-bit leaf 1,000 keys of objects 0 and 1 leave objects 2 and 3
+/// without one.
+///
+/// Flip to watch it fail: in ravel-query's `probe_key_index` (log_fetcher), push
+/// the key set's answer only when it is not `Absent`. Every object is then
+/// kept and the tier-1 count reads 0 instead of 2.
+#[tokio::test]
+async fn a_logs_set_absent_from_an_object_prunes_it() {
+    let store = fixture().await;
+    let lane = Lane::Logs;
+
+    let one_object: Vec<usize> = (0..10).map(|n| n * OBJECTS).collect();
+    let v = sql(&serve(Arc::clone(&store)), &lane.in_keys(&one_object)).await;
+    assert_eq!(rows(&v), oracle_of(&one_object), "{v}");
+    assert_eq!(key_index(&v, "keysProbed"), 10, "{v}");
+    assert_eq!(key_index(&v, "partsCovered"), 1, "{v}");
+    assert_eq!(pruning(&v, "segmentsPrunedByKeyIndex"), 3, "{v}");
+
+    swap_in_a_13_bit_leaf(&store, lane).await;
+    let two_objects: Vec<usize> = (0..).filter(|j| j % OBJECTS < 2).take(SIZES[3]).collect();
+    let v = sql(&serve(Arc::clone(&store)), &lane.in_keys(&two_objects)).await;
+    assert_eq!(rows(&v), oracle_of(&two_objects), "{v}");
+    assert_eq!(key_index(&v, "keysProbed"), 1_000, "{v}");
+    assert_eq!(key_index(&v, "partsCovered"), 0, "{v}");
+    assert_eq!(key_index(&v, "skippedByBudget"), 1, "{v}");
+    assert_eq!(pruning(&v, "segmentsPrunedByKeyIndex"), 2, "{v}");
 }

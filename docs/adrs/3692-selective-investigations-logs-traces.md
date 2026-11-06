@@ -1170,9 +1170,10 @@ decision's text:
 
 | check | target | miss | source |
 |---|---|---|---|
-| `IN` rows, logs and spans, 1, 10, 100 and 1,000 keys | rows equal the union of the per-key equality answers; `keysProbed` equal to the list's distinct key count | a missing or extra row, or another count | services/ravel-server/tests/sql_key_in.rs:548 |
-| 1,000-key list on a 13-bit leaf | the part uncovered (`skippedByBudget` 1, `partsCovered` 0) after 1 leaf GET, rows exact | a second leaf GET, or a covered part | services/ravel-server/tests/sql_key_in.rs:548 |
-| 1,025-key list, and a list beside an equality | no route (`keysProbed` 0, 0 leaf GETs), rows exact; the 1,025-key list carries no key set, the list beside an equality carries its set to tier 1 | a routed set, or a wrong row | services/ravel-server/tests/sql_key_in.rs:548 |
+| `IN` rows, logs and spans, 1, 10, 100 and 1,000 keys | rows equal the union of the per-key equality answers; `keysProbed` equal to the list's distinct key count | a missing or extra row, or another count | services/ravel-server/tests/sql_key_in.rs:567 |
+| 1,000-key list on a 13-bit leaf | the part uncovered (`skippedByBudget` 1, `partsCovered` 0) after 1 leaf GET, rows exact | a second leaf GET, or a covered part | services/ravel-server/tests/sql_key_in.rs:567 |
+| 1,025-key list, and a list beside an equality | no route (`keysProbed` 0, 0 leaf GETs), rows exact; the 1,025-key list carries no key set, the list beside an equality carries its set to tier 1 | a routed set, or a wrong row | services/ravel-server/tests/sql_key_in.rs:567 |
+| logs set every key of which an object lacks, routed and on a 13-bit leaf | that object pruned: `segmentsPrunedByKeyIndex` 3 for ten keys of one object (routed), 2 for 1,000 keys of two objects (tier 1), rows exact | a kept object, or a wrong row | services/ravel-server/tests/sql_key_in.rs:675 |
 | tier-1 set probe above `B_run`, logs and spans | the prefix and 1 ranged read, 2 KEY_IDX GETs | 1 + the distinct touched buckets | crates/ravel-query/src/log_fetcher.rs:17915; crates/ravel-query/src/span_fetcher.rs:3745 |
 | tier-1 set mixing present and absent keys, below and above `B_run`, logs and spans | exactly the union of the present keys' blocks, absent keys in empty and in occupied buckets | `Absent`, a dropped object, or another block set | crates/ravel-query/src/log_fetcher.rs:17998; crates/ravel-query/src/span_fetcher.rs:3745 |
 | ticket versions | 8 to 11 byte identical; 12 round-trips both sections; a spans `IN` never encodes as 9 | any byte change, or a version 9 spans `IN` | crates/ravel-sql/src/flight_ticket.rs:2707 |
