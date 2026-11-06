@@ -341,6 +341,25 @@ async fn selective_statement_drops_objects_whose_dictionary_lacks_the_value() {
             .sum::<u64>();
     assert_eq!(probe_bytes(&stats), expected_bytes);
 
+    // A regex or a negated matcher never drops an object, whatever its value
+    // spells: the dictionary is checked for positive equalities only. Every
+    // dictionary holds `series="s0"`, so each object costs two GETs.
+    for query in [
+        "probe_metric{instance=~\"targ.*\",series=\"s0\"}",
+        "probe_metric{instance!=\"obj0\",series=\"s0\"}",
+    ] {
+        let (value, stats) = run(&engine, th, query, t_ms, now).await;
+        assert_eq!(stats.segments_pruned_by_dictionary, 0, "{query}");
+        assert_eq!(stats.segments_probed_two_step, N, "{query}");
+        assert_eq!(probe_gets(&stats), 2 * N, "{query}");
+        let one_step = query
+            .replace("probe_metric{", "{__name__=~\"probe_metric\",")
+            .replace("series=", "series=~");
+        let (one_step_value, _) = run(&engine, th, &one_step, t_ms, now).await;
+        assert!(!vector_bits(&value).is_empty(), "{query}");
+        assert_eq!(vector_bits(&value), vector_bits(&one_step_value), "{query}");
+    }
+
     // The one-step probe over the same series: regex matchers carry no
     // positive equality, so the gate never starts a two-step probe.
     let (one_step_value, one_step) = run(
@@ -360,42 +379,6 @@ async fn selective_statement_drops_objects_whose_dictionary_lacks_the_value() {
     let bits = vector_bits(&value);
     assert_eq!(bits.len(), 1, "one series: {bits:?}");
     assert_eq!(bits, vector_bits(&one_step_value));
-
-    // A regex or a negated matcher never drops an object, whatever its value
-    // spells: the dictionary is checked for positive equalities only.
-    for query in [
-        "probe_metric{instance=~\"targ.*\",series=\"s0\"}",
-        "probe_metric{instance!=\"obj0\",series=\"s0\"}",
-    ] {
-        let (value, stats) = run(&engine, th, query, t_ms, now).await;
-        assert_eq!(stats.segments_pruned_by_dictionary, 0, "{query}");
-        assert_eq!(stats.segments_probed_two_step, N, "{query}");
-        assert!(!vector_bits(&value).is_empty(), "{query}");
-    }
-    let (value, stats) = run(
-        &engine,
-        th,
-        "probe_metric{instance=~\"targ.*\",series=\"s0\"}",
-        t_ms,
-        now,
-    )
-    .await;
-    assert_eq!(
-        probe_gets(&stats),
-        2 * N,
-        "every dictionary holds series=\"s0\""
-    );
-    assert_eq!(vector_bits(&value), {
-        let (v, _) = run(
-            &engine,
-            th,
-            "{__name__=~\"probe_metric\",instance=~\"targ.*\",series=~\"s0\"}",
-            t_ms,
-            now,
-        )
-        .await;
-        vector_bits(&v)
-    });
 }
 
 /// A selector every dictionary holds: the statement starts two-step, sees
@@ -423,14 +406,14 @@ async fn fan_out_statement_switches_the_dictionary_probe_off() {
     )
     .await;
     assert_eq!(probe_gets(&one_step), N);
-    assert!(stats.dictionary_probe_switched_off);
-    assert_eq!(stats.segments_pruned_by_dictionary, 0);
     assert!(
         probe_gets(&stats) <= probe_gets(&one_step) + 2 * FAN_OUT,
         "extra GETs over the one-step probe are bounded by twice the fan-out: {} against {}",
         probe_gets(&stats),
         probe_gets(&one_step)
     );
+    assert!(stats.dictionary_probe_switched_off);
+    assert_eq!(stats.segments_pruned_by_dictionary, 0);
     assert_eq!(
         probe_gets(&stats),
         probe_gets(&one_step) + stats.segments_probed_two_step,
