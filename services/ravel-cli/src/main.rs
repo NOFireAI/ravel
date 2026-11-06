@@ -2545,6 +2545,12 @@ enum CatalogCommand {
         hours: i64,
         #[arg(long, default_value_t = 4)]
         shards: u32,
+        /// Print the resolved metrics segments as JSON lines, one JSON
+        /// document per line and per segment (key, level as "L0" or "L1",
+        /// shard, ingest hour bucket, object size and event bounds), instead
+        /// of the text lines; the store header goes to stderr.
+        #[arg(long)]
+        json: bool,
     },
     /// One-shot catalog fold for one (tenant, signal).
     ///
@@ -3109,8 +3115,9 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     tenant,
                     hours,
                     shards,
+                    json,
                 },
-        } => catalog_list(&cli.store, &tenant, hours, shards).await,
+        } => catalog_list(&cli.store, &tenant, hours, shards, json).await,
         Command::Catalog {
             command:
                 CatalogCommand::Fold {
@@ -5010,16 +5017,40 @@ fn commit_decode(bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One `catalog list --json` line. The level is its plain name, never the
+/// `Debug` form, which for an L1 part carries the input-set hash and part
+/// index; deploy/metricsbench/run.sh's object-spans capture reads these keys.
+fn catalog_list_json_line(seg: &ravel_catalog::SegmentRef) -> serde_json::Value {
+    let level = match seg.level {
+        ravel_catalog::SegmentLevel::L0 => "L0",
+        ravel_catalog::SegmentLevel::L1 { .. } => "L1",
+    };
+    serde_json::json!({
+        "key": seg.data_object_key,
+        "level": level,
+        "shard": seg.shard,
+        "ingest_hour_bucket": seg.ingest_hour_bucket,
+        "object_size": seg.object_size,
+        "min_event_ts_ns": seg.min_event_ts_ns,
+        "max_event_ts_ns": seg.max_event_ts_ns,
+    })
+}
+
 async fn catalog_list(
     store_args: &store::StoreArgs,
     tenant: &str,
     hours: i64,
     shard_count: u32,
+    json: bool,
 ) -> anyhow::Result<()> {
     let store = store::build_store(store_args)?;
     let selection = store_args.selection();
     let tenant_hash = TenantId::new(tenant).hash();
-    selection.print_header();
+    if json {
+        eprintln!("{}", selection.header());
+    } else {
+        selection.print_header();
+    }
     store::require_tenant_data_present(
         selection,
         store.as_ref(),
@@ -5051,6 +5082,12 @@ async fn catalog_list(
         .await
         .map_err(|err| anyhow::anyhow!("failed to resolve catalog: {err}"))?;
 
+    if json {
+        for seg in &snapshot.segments {
+            println!("{}", catalog_list_json_line(seg));
+        }
+        return Ok(());
+    }
     for seg in &snapshot.segments {
         println!(
             "{} shard={} samples={} series={} min_event_ts_ns={} max_event_ts_ns={} created_unix_ns={}",
@@ -7610,6 +7647,63 @@ mod tests {
         let out = rspan_status_mask_names(STATUS_BIT_ERROR | 0b0000_1000);
         assert_eq!(out, "error|bit3");
         assert!(out.contains("bit3"), "unnamed bit position must appear");
+    }
+
+    /// One `catalog list --json` line for an L1 part: a single line that
+    /// parses as one JSON object, carrying every key the object-spans capture
+    /// in deploy/metricsbench/run.sh reads (its `SPANS_SEGMENT_FIELDS`), with
+    /// the level as the plain string "L1", not the `Debug` form; an L0 ref
+    /// prints "L0".
+    #[test]
+    fn catalog_list_json_line_carries_the_spans_fields_and_a_plain_l1_level() {
+        const SPANS_SEGMENT_FIELDS: [&str; 5] = [
+            "level",
+            "object_size",
+            "ingest_hour_bucket",
+            "min_event_ts_ns",
+            "max_event_ts_ns",
+        ];
+        let seg = ravel_catalog::SegmentRef {
+            data_object_key: "t/h1/m/l1/part-0003.rseg".to_string(),
+            object_size: 4096,
+            min_event_ts_ns: 1_000,
+            max_event_ts_ns: 7_201_000,
+            ingest_hour_bucket: 490_001,
+            sample_count: 10,
+            series_count: 2,
+            shard: 3,
+            content_hash: [7; 32],
+            writer_id: uuid::Uuid::nil(),
+            writer_epoch: 0,
+            writer_seq: 0,
+            created_unix_ns: 5,
+            level: ravel_catalog::SegmentLevel::L1 {
+                input_set_hash: [9; 32],
+                part_index: 3,
+            },
+            segment_format_version: 4,
+            declared_column_stats: ravel_catalog::DeclaredColumnStats::default(),
+        };
+        let line = super::catalog_list_json_line(&seg).to_string();
+        assert!(!line.contains('\n'), "one line per segment: {line}");
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("one JSON document");
+        let obj = parsed.as_object().expect("a JSON object");
+        for field in SPANS_SEGMENT_FIELDS {
+            assert!(obj.contains_key(field), "missing {field} in {line}");
+        }
+        assert_eq!(parsed["level"], "L1", "{line}");
+        assert_eq!(parsed["object_size"], 4096);
+        assert_eq!(parsed["ingest_hour_bucket"], 490_001);
+        assert_eq!(parsed["min_event_ts_ns"], 1_000);
+        assert_eq!(parsed["max_event_ts_ns"], 7_201_000);
+        assert_eq!(parsed["key"], "t/h1/m/l1/part-0003.rseg");
+        assert_eq!(parsed["shard"], 3);
+
+        let l0 = ravel_catalog::SegmentRef {
+            level: ravel_catalog::SegmentLevel::L0,
+            ..seg
+        };
+        assert_eq!(super::catalog_list_json_line(&l0)["level"], "L0");
     }
 }
 

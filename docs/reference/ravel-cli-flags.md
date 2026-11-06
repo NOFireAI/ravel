@@ -131,6 +131,7 @@ _No flags._
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
 | `--hours` |  | `1` | How many hours back from now to list commit records for |
+| `--json` |  |  | Print the resolved metrics segments as JSON lines, one JSON document per line and per segment (key, level as "L0" or "L1", shard, ingest hour bucket, object size and event bounds), instead of the text lines; the store header goes to stderr |
 | `--shards` |  | `4` |  |
 | `--tenant` |  |  |  |
 
