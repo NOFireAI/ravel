@@ -17,6 +17,7 @@ The sections below tell you how to choose a value.
 - [Admission limits](#admission-limits)
 - [Read cache tiers](#read-cache-tiers)
 - [SQL spill](#sql-spill)
+- [Compaction scratch](#compaction-scratch)
 - [Retention and garbage-collection configuration](#retention-and-garbage-collection-configuration)
 - [Tenancy setup](#tenancy-setup)
 - [Durable shard count](#durable-shard-count)
@@ -1075,6 +1076,51 @@ over any of these:
 - grouping sets
 - a `HAVING` filter
 - a nested subquery
+
+## Compaction scratch
+
+A `--mode maintain` process compacts a log bucket in two levels when its
+single-level merge would be a cursor merge that decodes more than 16 rows per
+input record. Every other bucket merges in one level as before. Level 1
+merges groups of inputs into sorted runs on local disk, and level 2 merges
+the runs into the L1 segments. The runs need a local directory, and three flags configure
+it:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--maintain-scratch-dir` | unset | The directory the level-1 runs are written under. Without it, a bucket whose cursor merge would decode more than 16 rows per input record is refused and counted under `ravel_maintain_compaction_refused_total{reason="geometry"}`. |
+| `--maintain-scratch-max-bytes` | unset | A cap on the bytes the directory may hold. A unit is admitted against the smaller of the volume's free bytes and this cap less the bytes already under the directory. Without it, the volume's free bytes alone decide. |
+| `--maintain-level1-workers` | derived | How many level-1 groups of one bucket merge at once, each under its share of the unit's memory ceiling. Without it, the count is derived per bucket from the unit's share of the usable cores and the largest count whose groups still fit. |
+
+The scratch directory is a cache, not storage:
+
+- Each unit writes its runs in its own subdirectory, and the subdirectory is
+  wiped when the unit ends, whether it published or failed.
+- Nothing durable is read from it, so an `emptyDir` serves.
+- The first two-level merge locks `ravel-scratch.lock` in the directory for
+  the life of the process. Give each process its own directory: a second
+  process that finds the lock held refuses the bucket and counts it under
+  `reason="scratch_locked"`.
+- When it takes the lock, the process removes the unit subdirectories a
+  dead process left there. It leaves any other file in place, and under
+  `--maintain-scratch-max-bytes` those files count against the cap.
+
+Size the directory at about 1.3 times the stored input bytes of the largest
+bucket the process merges. A unit is admitted only when that many bytes are
+free, counting the cap when one is set. A unit that does not fit is refused
+before it fetches a block and counted under `reason="scratch_headroom"`.
+
+- When the volume has the room and only this process's other two-level
+  merges hold it, the next tick tries the bucket again.
+- Otherwise the process does not plan the bucket again until it restarts,
+  as for a geometry refusal.
+
+Several units of one process merging at once each reserve their own share,
+so a process at `--maintain-unit-concurrency` above 1 needs room for that
+many of its largest buckets at once.
+
+Startup refuses `--maintain-scratch-max-bytes` or `--maintain-level1-workers`
+given without `--maintain-scratch-dir`, and either one set to `0`.
 
 ## Retention and garbage-collection configuration
 

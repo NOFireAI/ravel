@@ -5864,10 +5864,10 @@ pub struct MaintenanceSafetySnapshot {
     /// [`ravel_maintain::buckets_held_out_of_window_total`], read at scrape
     /// time. Not signal-scoped: ravel-maintain keeps one total.
     pub compaction_held_out_of_window_buckets: u64,
-    /// [`ravel_maintain::compaction_refused_total`] for
-    /// [`ravel_maintain::CompactionRefusedReason::Geometry`], read at scrape
-    /// time. Not signal-scoped: ravel-maintain keeps one total.
-    pub compaction_refused_geometry: u64,
+    /// [`ravel_maintain::compaction_refused_total`] for every
+    /// [`ravel_maintain::CompactionRefusedReason::ALL`] reason, read at scrape
+    /// time. Not signal-scoped: ravel-maintain keeps one total per reason.
+    pub compaction_refused: Vec<(ravel_maintain::CompactionRefusedReason, u64)>,
     pub signals: Vec<MaintenanceSafetySignalSnapshot>,
 }
 
@@ -5912,9 +5912,10 @@ impl MaintenanceSafetySnapshot {
             ),
             compaction_held_out_of_window_buckets: ravel_maintain::buckets_held_out_of_window_total(
             ),
-            compaction_refused_geometry: ravel_maintain::compaction_refused_total(
-                ravel_maintain::CompactionRefusedReason::Geometry,
-            ),
+            compaction_refused: ravel_maintain::CompactionRefusedReason::ALL
+                .iter()
+                .map(|&reason| (reason, ravel_maintain::compaction_refused_total(reason)))
+                .collect(),
             signals: crate::maintain::MAINTAINED_SIGNALS
                 .iter()
                 .map(|&signal| MaintenanceSafetySignalSnapshot {
@@ -6075,24 +6076,30 @@ fn render_maintain_safety_family(
     write_header(
         out,
         "ravel_maintain_compaction_refused_total",
-        "Bucket compactions refused before the first block GET, by reason, summed over every \
-         signal since process start (ADR-3853 D0). reason=\"geometry\": a cursor-mode merge \
-         whose predicted decoded rows exceed 16 times the bucket's record count, which happens \
-         when many L0 inputs each carry blocks spanning many streams. Nothing is fetched or \
-         published, the claim is released and the L0 inputs stay live; the server's in-memory \
-         maintain memo stops retrying the bucket until restart. A warn log line names the \
-         bucket. The fix is ADR-3853's two-level merge.",
+        &format!(
+            "Bucket compactions refused, by reason, summed over every signal since process start \
+             (ADR-3853). reason=\"geometry\": with no --maintain-scratch-dir, a cursor-mode merge \
+             whose predicted decoded rows exceed {} (MAX_CURSOR_DECODE_AMPLIFICATION) times the \
+             bucket's record count, which happens when many L0 inputs each carry blocks spanning \
+             many streams; refused before the first block GET. reason=\"two_level\": such a \
+             bucket's two-level merge does not fit its unit's memory ceiling. \
+             reason=\"scratch_headroom\": the scratch directory has less free than the two-level \
+             merge needs, or a scratch write ran out of space. reason=\"scratch_locked\": another \
+             process holds the scratch directory's lock. Nothing is published, the claim is \
+             released and the L0 inputs stay live; the server's in-memory maintain memo stops \
+             retrying the bucket until restart. A warn log line names the bucket.",
+            ravel_maintain::rlog::MAX_CURSOR_DECODE_AMPLIFICATION
+        ),
         "counter",
     );
-    write_sample(
-        out,
-        "ravel_maintain_compaction_refused_total",
-        &[
-            Label::Mode(mode),
-            Label::CompactionRefusedReason(ravel_maintain::CompactionRefusedReason::Geometry),
-        ],
-        snapshot.compaction_refused_geometry,
-    );
+    for &(reason, value) in &snapshot.compaction_refused {
+        write_sample(
+            out,
+            "ravel_maintain_compaction_refused_total",
+            &[Label::Mode(mode), Label::CompactionRefusedReason(reason)],
+            value,
+        );
+    }
 
     write_header(
         out,
@@ -15483,7 +15490,12 @@ mod tests {
             retention_held_out_of_window_objects: 15,
             retention_held_by_lease_buckets: 16,
             compaction_held_out_of_window_buckets: 31,
-            compaction_refused_geometry: 32,
+            compaction_refused: vec![
+                (ravel_maintain::CompactionRefusedReason::Geometry, 32),
+                (ravel_maintain::CompactionRefusedReason::TwoLevel, 33),
+                (ravel_maintain::CompactionRefusedReason::ScratchHeadroom, 34),
+                (ravel_maintain::CompactionRefusedReason::ScratchLocked, 35),
+            ],
             signals: vec![
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Metrics,
@@ -15594,13 +15606,18 @@ mod tests {
             ),
             "missing compaction_held_out_of_window_buckets sample:\n{body}"
         );
-        assert!(
-            body.contains(
-                "ravel_maintain_compaction_refused_total{mode=\"maintain\",reason=\"geometry\"} \
-                 32\n"
-            ),
-            "missing compaction_refused_geometry sample:\n{body}"
-        );
+        for (reason, value) in [
+            ("geometry", 32),
+            ("two_level", 33),
+            ("scratch_headroom", 34),
+            ("scratch_locked", 35),
+        ] {
+            let sample = format!(
+                "ravel_maintain_compaction_refused_total{{mode=\"maintain\",reason=\"{reason}\"}} \
+                 {value}\n"
+            );
+            assert!(body.contains(&sample), "missing {sample}in:\n{body}");
+        }
         assert!(
             body.contains(
                 "ravel_maintain_conservation_aborts_total{mode=\"maintain\",signal=\"metrics\"} 1"
@@ -17180,7 +17197,10 @@ mod tests {
             retention_held_out_of_window_objects: 1,
             retention_held_by_lease_buckets: 1,
             compaction_held_out_of_window_buckets: 1,
-            compaction_refused_geometry: 1,
+            compaction_refused: ravel_maintain::CompactionRefusedReason::ALL
+                .iter()
+                .map(|&reason| (reason, 1))
+                .collect(),
             signals: vec![MaintenanceSafetySignalSnapshot {
                 signal: Signal::Metrics,
                 conservation_aborts: 1,
