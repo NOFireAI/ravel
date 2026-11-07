@@ -1590,6 +1590,7 @@ async fn a_compacted_bucket_exports_each_record_exactly_once() {
         None,
         compact_now_ns,
         &ravel_cli::maintain::ClaimOptions::fresh(),
+        &ravel_cli::maintain::ScratchOptions::default(),
     )
     .await
     .expect("compaction runs");

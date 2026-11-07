@@ -242,6 +242,7 @@ async fn compact_tenant_writes_l1_parts_and_its_records_under_the_tenant_key() {
         None,
         crate::now_ns().expect("wall clock"),
         &ClaimOptions::fresh(),
+        &maintain::ScratchOptions::default(),
     )
     .await
     .expect("compact-tenant runs");
