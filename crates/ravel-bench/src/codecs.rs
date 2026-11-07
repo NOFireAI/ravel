@@ -997,6 +997,9 @@ fn encode_rd_vector(out: &mut Vec<u8>, chunk: &[f64]) {
 
 fn decode_rd_vector(bytes: &[u8], pos: &mut usize, n: usize) -> Result<Vec<f64>, CodecError> {
     let dict_len = usize::try_from(get_uvarint(bytes, pos)?).map_err(|_| CodecError::Overflow)?;
+    if dict_len > RD_DICT_CAP {
+        return Err(CodecError::Corrupt);
+    }
     let mut dict = Vec::with_capacity(dict_len);
     for _ in 0..dict_len {
         let end = pos.checked_add(2).ok_or(CodecError::Truncated)?;
@@ -1008,6 +1011,9 @@ fn decode_rd_vector(bytes: &[u8], pos: &mut usize, n: usize) -> Result<Vec<f64>,
     let codes = for_unpack(bytes, pos, n)?;
     let rights = for_unpack(bytes, pos, n)?;
     let n_exc = usize::try_from(get_uvarint(bytes, pos)?).map_err(|_| CodecError::Overflow)?;
+    if n_exc > n {
+        return Err(CodecError::Corrupt);
+    }
     let mut exc_map: HashMap<usize, u16> = HashMap::with_capacity(n_exc);
     for _ in 0..n_exc {
         let idx = usize::try_from(get_uvarint(bytes, pos)?).map_err(|_| CodecError::Overflow)?;
@@ -1262,5 +1268,52 @@ mod tests {
                 // No panic is the assertion; result may be Ok or Err.
             }
         }
+    }
+
+    /// An rd-mode vector for `values` (at most one vector), as `AlpRd` frames
+    /// it: the mode byte, then `encode_rd_vector`'s bytes.
+    fn rd_frame(dict_len: Option<u64>, n_exc: Option<u64>, values: &[f64]) -> Vec<u8> {
+        let mut body = Vec::new();
+        encode_rd_vector(&mut body, values);
+        let mut pos = 0usize;
+        let real_dict = get_uvarint(&body, &mut pos).expect("dict_len");
+        let dict_end = pos + 2 * usize::try_from(real_dict).expect("fits");
+        let mut out = vec![ALP_RD_MODE_RD];
+        match dict_len {
+            Some(fake) => {
+                put_uvarint(&mut out, fake);
+                out.extend_from_slice(&body[pos..]);
+            }
+            None => out.extend_from_slice(&body[..pos]),
+        }
+        if dict_len.is_some() {
+            return out;
+        }
+        out.extend_from_slice(&body[pos..dict_end]);
+        let mut p = dict_end;
+        let n = values.len();
+        for_unpack(&body, &mut p, n).expect("codes");
+        for_unpack(&body, &mut p, n).expect("rights");
+        out.extend_from_slice(&body[dict_end..p]);
+        put_uvarint(&mut out, n_exc.expect("one override"));
+        out
+    }
+
+    #[test]
+    fn rd_dict_len_above_cap_is_corrupt_before_allocating() {
+        let values = [1.5f64, 2.25, 3.125];
+        let bytes = rd_frame(Some(u64::MAX >> 1), None, &values);
+        assert_eq!(AlpRd.decode(&bytes, values.len()), Err(CodecError::Corrupt));
+        let bytes = rd_frame(Some(RD_DICT_CAP as u64 + 1), None, &values);
+        assert_eq!(AlpRd.decode(&bytes, values.len()), Err(CodecError::Corrupt));
+    }
+
+    #[test]
+    fn rd_exception_count_above_n_is_corrupt_before_allocating() {
+        let values = [1.5f64, 2.25, 3.125];
+        let bytes = rd_frame(None, Some(u64::MAX >> 1), &values);
+        assert_eq!(AlpRd.decode(&bytes, values.len()), Err(CodecError::Corrupt));
+        let bytes = rd_frame(None, Some(values.len() as u64 + 1), &values);
+        assert_eq!(AlpRd.decode(&bytes, values.len()), Err(CodecError::Corrupt));
     }
 }
