@@ -1765,7 +1765,10 @@ async fn serial_runs_before(fx: &Fixture, query: &BTreeSet<u16>, slices: usize) 
     let serial = serial_probe(fx, &key_set(KeyType::Str, &before)).await;
     let runs = runs_by_slice(
         fx,
-        serial.reads.iter().map(|(leaf, range)| (leaf.as_str(), range)),
+        serial
+            .reads
+            .iter()
+            .map(|(leaf, range)| (leaf.as_str(), range)),
     );
     assert!(
         runs[..slices].iter().all(|(n, _)| *n > 0),
@@ -2073,7 +2076,10 @@ async fn the_allowance_is_charged_in_slice_order() {
     }
     assert_eq!(gets_1, [1, 1, 1, 1], "every slice's GET 1 is read once");
     assert_eq!(&runs[2..], &[0, 0], "no run of slice 2 or 3 is read");
-    let read = runs_by_slice(&fx, ranges.iter().map(|(leaf, range)| (leaf.as_str(), range)));
+    let read = runs_by_slice(
+        &fx,
+        ranges.iter().map(|(leaf, range)| (leaf.as_str(), range)),
+    );
     assert_eq!(
         read[..2],
         serial_runs_before(&fx, &query, 2).await[..2],
@@ -2177,7 +2183,10 @@ async fn the_first_failing_slice_in_order_decides() {
             "slice {s}: {ended:?}"
         );
     }
-    let runs = runs_by_slice(&fx, ended.iter().map(|(leaf, range)| (leaf.as_str(), range)));
+    let runs = runs_by_slice(
+        &fx,
+        ended.iter().map(|(leaf, range)| (leaf.as_str(), range)),
+    );
     assert_eq!(
         runs[..2],
         serial_runs_before(&fx, &query, 2).await[..2],
