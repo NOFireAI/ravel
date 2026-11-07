@@ -3717,9 +3717,11 @@ impl SegmentFetcher {
     /// Phase-split counterpart of
     /// [`fetch_soa_and_histograms_accounted`](Self::fetch_soa_and_histograms_accounted)
     /// (issue #796); see [`fetch_series_phase_accounted`](Self::fetch_series_phase_accounted)
-    /// for why both forms exist. `engine.rs` calls this directly with a real,
-    /// persistent `PhaseAccounting` for end-to-end phase visibility;
-    /// `fetch_soa_and_histograms_accounted` is a thin wrapper over this that
+    /// for why both forms exist. `engine.rs` calls its streaming form,
+    /// [`fetch_soa_and_histograms_into`](Self::fetch_soa_and_histograms_into),
+    /// with a real, persistent `PhaseAccounting` for end-to-end phase
+    /// visibility; `fetch_soa_and_histograms_accounted` is a thin wrapper over
+    /// this that
     /// runs it against a [`PhaseAccounting::pooled_over`] its single
     /// `QueryAccounting` handle, so every GET records straight onto that one
     /// handle (live, as it is issued) and its callers (`ravel-sql`'s direct
@@ -3749,6 +3751,47 @@ impl SegmentFetcher {
                 .map(RunHistogramDecode::into_fetched)
                 .collect(),
         ))
+    }
+
+    /// Streaming form of
+    /// [`fetch_soa_and_histograms_phase_accounted`](Self::fetch_soa_and_histograms_phase_accounted):
+    /// hands each page batch's decoded scalar and histogram series to `sink`
+    /// as soon as the batch decodes, before the next batch reserves its fetch
+    /// memory, in catalog order. An L0 segment is one batch; an L1 part is
+    /// one call per batch of whole series (ADR-3694, whole-series batch
+    /// amendment). The concatenation of every call's series is what the
+    /// collecting form returns. An error from `sink` stops the fetch before
+    /// the next batch's GET.
+    pub(crate) async fn fetch_soa_and_histograms_into<E, S>(
+        &self,
+        tenant_hash: TenantHash,
+        seg_ref: &SegmentRef,
+        matchers: &[LabelMatcher],
+        accounting: &PhaseAccounting,
+        mut sink: S,
+    ) -> Result<FetchStats, E>
+    where
+        E: From<FetchError>,
+        S: FnMut(Vec<FetchedSeriesSoa>, Vec<FetchedHistogramSeries>) -> Result<(), E>,
+    {
+        self.fetch_decoded(
+            tenant_hash,
+            seg_ref,
+            matchers,
+            PageKinds::Both,
+            true,
+            accounting,
+            |runs, hist_runs| {
+                sink(
+                    runs.into_iter().map(RunDecode::into_soa).collect(),
+                    hist_runs
+                        .into_iter()
+                        .map(RunHistogramDecode::into_fetched)
+                        .collect(),
+                )
+            },
+        )
+        .await
     }
 }
 

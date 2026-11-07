@@ -2789,13 +2789,16 @@ impl QueryEngine {
     }
 
     /// Fetches every matched series from each snapshot segment in a single
-    /// open+decode pass per segment and folds each segment's scalar runs into
-    /// `scalar` and its native-histogram runs into `histograms` as that
-    /// segment's fetch completes (issue #3747), returning the per-segment
-    /// `FetchStats` summed across the snapshot (ADR-0044). No segment's decoded
-    /// runs outlive the fold that absorbs them, so the read holds one copy of
-    /// each `(series, ts)` sample however many objects carry it, charged to
-    /// the memory budget by the fold.
+    /// open+decode pass per segment and folds its scalar runs into `scalar`
+    /// and its native-histogram runs into `histograms` one page batch at a
+    /// time, returning the per-segment `FetchStats` summed across the
+    /// snapshot (ADR-0044). An L0 segment is one batch; an L1 part is one
+    /// batch per group of whole series (ADR-3694, whole-series batch
+    /// amendment), and each batch is folded before the next batch of that
+    /// part reserves fetch memory. No batch's decoded runs outlive the fold
+    /// that absorbs them, so the read holds one copy of each `(series, ts)`
+    /// sample however many objects carry it, charged to the memory budget by
+    /// the fold (issue #3747).
     #[allow(clippy::too_many_arguments)]
     async fn fetch_all_samples_and_histograms(
         &self,
@@ -2810,41 +2813,19 @@ impl QueryEngine {
     ) -> Result<FetchStats, QueryError> {
         let concurrency = self.config.promql_fetch_fanout().max(1);
         let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
-        let mut stream = stream::iter(snapshot.segments.iter().cloned())
-            .map(|seg_ref| {
-                let fetcher = self.fetcher.clone();
-                let matchers = Arc::clone(&matchers);
-                let accounting = accounting.clone();
-                async move {
-                    fetcher
-                        .fetch_soa_and_histograms_phase_accounted(
-                            tenant_hash,
-                            &seg_ref,
-                            matchers.as_slice(),
-                            &accounting,
-                        )
-                        .await
-                }
-            })
-            .buffer_unordered(concurrency);
         // Selective-erasure exclusion (ADR-0064 decision 2): drop erased
-        // series/samples from each segment's decoded results, after the fetch
-        // and after any cache tier `fetch_soa_and_histograms_accounted`
-        // consulted, before they are folded. A no-op when the snapshot carries
-        // no pending erasure predicate.
+        // series/samples from each batch's decoded results, after the fetch
+        // and after any cache tier the fetcher consulted, before they are
+        // folded. A no-op when the snapshot carries no pending erasure
+        // predicate.
         let erasure = snapshot_erasure_predicates(snapshot);
-        let mut page_stats = FetchStats::default();
-        // Consume the fetch fan-out one completed segment at a time so the
-        // bytes-scanned budget (ADR-0061 decision 1) can short-circuit here,
-        // at the stage that owns segment concurrency, instead of after every
-        // segment has been drained (and paid for). Returning early drops
-        // `stream`, which stops polling the remaining segment fetch futures
-        // and cancels their in-flight GETs cooperatively (proven by
-        // tests/bytes_scanned_budget.rs).
-        while let Some(r) = stream.next().await {
-            let (mut scalar_runs, stats, mut histogram_runs) = r?;
-            page_stats.raw_f64_pages += stats.raw_f64_pages;
-            page_stats.raw_f64_bytes += stats.raw_f64_bytes;
+        let erasure = &erasure;
+        let histograms = std::sync::Mutex::new(histograms);
+        let histograms = &histograms;
+        // The bytes-scanned (ADR-0061 decision 1) and request budgets are
+        // checked after every batch, before it is folded, so a part that
+        // overruns stops before its next batch's GET.
+        let check_budgets = move || -> Result<(), QueryError> {
             if let Some(err) = bytes_scanned_exceeded(
                 accounting.snapshot().pooled().total_s3_bytes(),
                 max_bytes_scanned,
@@ -2857,15 +2838,56 @@ impl QueryEngine {
             ) {
                 return Err(err);
             }
-            if !erasure.is_empty() {
-                crate::erasure::retain_series_soa(&mut scalar_runs, &erasure);
-                crate::erasure::retain_histogram_series(&mut histogram_runs, &erasure);
-            }
-            scalar
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .absorb(scalar_runs)?;
-            histograms.absorb(histogram_runs)?;
+            Ok(())
+        };
+        let mut stream = stream::iter(snapshot.segments.iter().cloned())
+            .map(|seg_ref| {
+                let fetcher = self.fetcher.clone();
+                let matchers = Arc::clone(&matchers);
+                let accounting = accounting.clone();
+                async move {
+                    fetcher
+                        .fetch_soa_and_histograms_into(
+                            tenant_hash,
+                            &seg_ref,
+                            matchers.as_slice(),
+                            &accounting,
+                            |mut scalar_runs, mut histogram_runs| {
+                                check_budgets()?;
+                                if !erasure.is_empty() {
+                                    crate::erasure::retain_series_soa(&mut scalar_runs, erasure);
+                                    crate::erasure::retain_histogram_series(
+                                        &mut histogram_runs,
+                                        erasure,
+                                    );
+                                }
+                                scalar
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .absorb(scalar_runs)?;
+                                histograms
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .absorb(histogram_runs)?;
+                                Ok::<(), QueryError>(())
+                            },
+                        )
+                        .await
+                }
+            })
+            .buffer_unordered(concurrency);
+        let mut page_stats = FetchStats::default();
+        // Consume the fetch fan-out one completed segment at a time so the
+        // budgets can short-circuit here, at the stage that owns segment
+        // concurrency, instead of after every segment has been drained (and
+        // paid for). Returning early drops `stream`, which stops polling the
+        // remaining segment fetch futures and cancels their in-flight GETs
+        // cooperatively (proven by tests/bytes_scanned_budget.rs).
+        while let Some(r) = stream.next().await {
+            let stats = r?;
+            page_stats.raw_f64_pages += stats.raw_f64_pages;
+            page_stats.raw_f64_bytes += stats.raw_f64_bytes;
+            check_budgets()?;
         }
         Ok(page_stats)
     }
