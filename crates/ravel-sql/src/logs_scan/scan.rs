@@ -424,13 +424,22 @@ pub(super) struct PrefetchPool {
 /// open when one partition's retried open is refused; it never rises again.
 /// Waiters are admitted in arrival order, a narrowed partition first, so a
 /// sibling that finishes a segment cannot take the freed turn ahead of it.
+/// A waiter whose own wait has passed its bound no longer holds up the
+/// waiters behind it: its consumer may have stopped polling it, and every
+/// sibling would otherwise pay the bound again at each of its segments.
 struct FanOut {
     cap: usize,
     holding: Vec<bool>,
     queue: VecDeque<usize>,
+    /// When each queued partition's wait reaches [`Self::wait`], set as it
+    /// joins the queue; `None` for a partition not queued.
+    deadlines: Vec<Option<tokio::time::Instant>>,
     wakers: Vec<Option<std::task::Waker>>,
-    /// Bumped whenever a partition stops holding, so a partition whose open
-    /// was refused can tell whether bytes were freed since it was issued.
+    /// Bumped whenever a partition gives back an open it held
+    /// ([`PrefetchPool::release_open`]), so a partition whose open was
+    /// refused can tell whether bytes were freed since it was issued. A
+    /// partition [`PrefetchPool::narrow`] stops holding freed no bytes, since
+    /// its own open was refused, and does not bump it.
     releases: u64,
     /// How long a partition waits for a turn: [`NARROWED_ADMISSION_WAIT`],
     /// shortened only by tests whose driver cannot serve a wait.
@@ -468,6 +477,7 @@ impl PrefetchPool {
                 cap: partitions,
                 holding: vec![false; partitions],
                 queue: VecDeque::new(),
+                deadlines: vec![None; partitions],
                 wakers: vec![None; partitions],
                 releases: 0,
                 wait: NARROWED_ADMISSION_WAIT,
@@ -497,6 +507,10 @@ impl PrefetchPool {
 
     /// Admits `partition` to hold a current fast-path open, or queues it and
     /// registers `cx`'s waker. A partition already holding one is admitted.
+    /// It is `partition`'s turn when no queued partition ahead of it is still
+    /// within its own wait: one past its deadline keeps its place, so it is
+    /// admitted when its consumer polls it and a turn is free, but no longer
+    /// blocks the partitions behind it.
     fn admit(&self, partition: usize, cx: &Context<'_>) -> DFResult<bool> {
         let mut wake = Vec::new();
         let admitted = {
@@ -510,10 +524,23 @@ impl PrefetchPool {
                 return Ok(true);
             }
             let held = f.holding.iter().filter(|h| **h).count();
-            let turn = f.queue.front().is_none_or(|&p| p == partition);
+            let now = tokio::time::Instant::now();
+            let turn = f
+                .queue
+                .iter()
+                .find(|&&p| {
+                    p == partition
+                        || f.deadlines
+                            .get(p)
+                            .copied()
+                            .flatten()
+                            .is_none_or(|d| d > now)
+                })
+                .is_none_or(|&p| p == partition);
             if held < f.cap && turn {
                 f.queue.retain(|&p| p != partition);
                 f.holding[partition] = true;
+                f.deadlines[partition] = None;
                 f.wakers[partition] = None;
                 if held + 1 < f.cap {
                     wake.extend(f.wakers.iter_mut().filter_map(Option::take));
@@ -522,6 +549,7 @@ impl PrefetchPool {
             } else {
                 if !f.queue.contains(&partition) {
                     f.queue.push_back(partition);
+                    f.deadlines[partition] = Some(now + f.wait);
                 }
                 f.wakers[partition] = Some(cx.waker().clone());
                 false
@@ -539,6 +567,9 @@ impl PrefetchPool {
         f.queue.retain(|&p| p != partition);
         if let Some(h) = f.holding.get_mut(partition) {
             *h = true;
+        }
+        if let Some(d) = f.deadlines.get_mut(partition) {
+            *d = None;
         }
         if let Some(w) = f.wakers.get_mut(partition) {
             *w = None;
@@ -575,9 +606,12 @@ impl PrefetchPool {
         if let Some(h) = f.holding.get_mut(partition) {
             *h = false;
         }
-        f.releases += 1;
         f.queue.retain(|&p| p != partition);
         f.queue.push_front(partition);
+        let deadline = tokio::time::Instant::now() + f.wait;
+        if let Some(d) = f.deadlines.get_mut(partition) {
+            *d = Some(deadline);
+        }
         Ok(Narrowing::Wait { cap: f.cap })
     }
 
@@ -596,6 +630,9 @@ impl PrefetchPool {
                 .holding
                 .get_mut(partition)
                 .is_some_and(|h| std::mem::replace(h, false));
+            if let Some(d) = f.deadlines.get_mut(partition) {
+                *d = None;
+            }
             if let Some(w) = f.wakers.get_mut(partition) {
                 *w = None;
             }
@@ -2678,9 +2715,18 @@ mod fast_path_prefetch_tests {
         overflow: Option<usize>,
         faults: FaultPlan,
     ) -> (Arc<FaultStore<MemoryStore>>, Vec<SegmentRef>) {
+        fixture_of(SEGMENTS, overflow, faults).await
+    }
+
+    /// [`fixture_with_faults`] with `count` segments instead of `SEGMENTS`.
+    async fn fixture_of(
+        count: usize,
+        overflow: Option<usize>,
+        faults: FaultPlan,
+    ) -> (Arc<FaultStore<MemoryStore>>, Vec<SegmentRef>) {
         let store = Arc::new(FaultStore::new(MemoryStore::new(), faults));
         let mut segments = Vec::new();
-        for seq in 0..SEGMENTS {
+        for seq in 0..count {
             let obj = object(seq, overflow == Some(seq));
             store
                 .put(
@@ -2759,7 +2805,7 @@ mod fast_path_prefetch_tests {
             segments,
             partitions,
             0,
-            SEGMENTS as i64 * SPAN,
+            segments.len() as i64 * SPAN,
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
@@ -3929,9 +3975,9 @@ mod fast_path_prefetch_tests {
     /// `limit`. Partition 1 is polled to its first batch, so it holds
     /// segment 1's open; then partition 0 alone, until it narrows the
     /// statement's fan-out (`fan_out_narrowings` on partition 0 moves) or
-    /// ends, or the error it ended with.
-    async fn edge(limit: u64, pipelined: bool) -> Result<Edge, DataFusionError> {
-        let (store, segments) = fixture(None).await;
+    /// ends, or the error it ended with. The fixture has `count` segments.
+    async fn edge(limit: u64, pipelined: bool, count: usize) -> Result<Edge, DataFusionError> {
+        let (store, segments) = fixture_of(count, None, FaultPlan::empty()).await;
         let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
         let fetcher = ranged_fetcher(&store, 4).with_memory_budget(Arc::clone(&budget));
         let exec = Arc::new(exec_with(fetcher, &segments, 2, PhaseAccounting::new()));
@@ -4014,7 +4060,7 @@ mod fast_path_prefetch_tests {
                 mut s1,
                 mut rows,
                 budget,
-            } = edge(fits_1, pipelined)
+            } = edge(fits_1, pipelined, SEGMENTS)
                 .await
                 .unwrap_or_else(|e| panic!("partition 0 failed (pipelined {pipelined}): {e}"));
             assert_eq!(
@@ -4112,7 +4158,9 @@ mod fast_path_prefetch_tests {
             mut s1,
             mut rows,
             budget,
-        } = edge(fits_1, false).await.expect("partition 0 parks");
+        } = edge(fits_1, false, SEGMENTS)
+            .await
+            .expect("partition 0 parks");
         assert_eq!(partition_metric(plan.as_ref(), "fan_out_narrowings", 0), 1);
         tokio::time::pause();
         let err = match tokio::time::timeout(2 * NARROWED_ADMISSION_WAIT, s0.next())
@@ -4134,6 +4182,68 @@ mod fast_path_prefetch_tests {
         drop(s0);
         rows[1].extend(drain(&mut s1).await.expect("partition 1 completes"));
         assert_eq!(rows[1], rows_of(&[1, 3, 5]));
+        drop(s1);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Issue #3899. Partition 0 narrows the fan-out and parks at the head of
+    /// the queue, and its consumer stops polling it. Partition 1, with
+    /// segments 3, 5 and 7 still to open, pays [`NARROWED_ADMISSION_WAIT`]
+    /// once, not once per segment: its paused-clock time to segment 7 is at
+    /// least the bound and under twice the bound, and it opens all four of
+    /// its segments. Partition 0, polled again while partition 1 holds
+    /// segment 7, still ends with the typed refusal.
+    ///
+    /// Fails against a head past its own wait still blocking the turns
+    /// behind it (partition 1 waits the bound at each of segments 3, 5 and
+    /// 7, about three times the bound).
+    #[tokio::test]
+    async fn a_stale_narrowed_head_delays_a_sibling_once() {
+        const COUNT: usize = 8;
+        let fits_1 = fits_1().await;
+        let started = tokio::time::Instant::now();
+        let Edge {
+            plan,
+            mut s0,
+            mut s1,
+            mut rows,
+            budget,
+        } = edge(fits_1, false, COUNT).await.expect("partition 0 parks");
+        assert_eq!(partition_metric(plan.as_ref(), "fan_out_narrowings", 0), 1);
+        assert!(rows[0].is_empty(), "partition 0 parked before any row");
+        tokio::time::pause();
+        let to_segment_7 = 3 * BLOCKS as usize + 1;
+        tokio::time::timeout(4 * NARROWED_ADMISSION_WAIT, async {
+            while rows[1].len() < to_segment_7 {
+                let batch = s1
+                    .next()
+                    .await
+                    .expect("partition 1 reaches segment 7")
+                    .expect("partition 1's batch");
+                rows[1].extend(timestamps(&[batch]));
+            }
+        })
+        .await
+        .expect("partition 1 reaches segment 7 within four times the bound");
+        let waited = started.elapsed();
+        // hygiene-allow: wall-clock -- `started` is a tokio Instant and the
+        // clock is paused, so `waited` reads the injected clock the bound
+        // runs on.
+        assert!(
+            waited >= NARROWED_ADMISSION_WAIT && waited < 2 * NARROWED_ADMISSION_WAIT,
+            "partition 1 waited {waited:?}"
+        );
+        let err = match futures::poll!(s0.next()) {
+            Poll::Ready(Some(Err(e))) => e,
+            Poll::Ready(Some(Ok(_))) => panic!("partition 0 emitted a row without a turn"),
+            Poll::Ready(None) => panic!("partition 0 ended without its segments"),
+            Poll::Pending => panic!("partition 0 kept waiting past its bound"),
+        };
+        assert!(is_fetch_memory_refusal(&err), "typed refusal: {err}");
+        drop(s0);
+        rows[1].extend(drain(&mut s1).await.expect("partition 1 completes"));
+        assert_eq!(rows[1], rows_of(&[1, 3, 5, 7]));
+        assert_eq!(partition_metric(plan.as_ref(), "segments_opened", 1), 4);
         drop(s1);
         assert_eq!(budget.reserved(), 0);
     }

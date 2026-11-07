@@ -424,12 +424,15 @@ sibling that finishes a segment while a partition waits queues behind it. Only
 the order and concurrency of the opens change, never what they read. The wait
 is bounded at 30 seconds, because a turn needs the sibling's consumer to keep
 polling it; a refused partition still waiting then returns its refusal. A
-refused retry with no sibling holding a current open is returned as before,
+waiting partition whose own wait has passed the bound no longer holds up the
+partitions queued behind it, so a sibling pays the bound once rather than at
+each of its segments. A refused retry with no sibling holding a current open is returned as before,
 unless a sibling finished a segment since the retry was issued, in which case
 the open is issued once more. Across statements nothing changes: the budget
 stays fail-fast.
 
 Pinned by `an_open_refused_by_its_own_fan_out_waits_for_a_turn`,
-`a_budget_below_one_open_still_returns_the_typed_refusal` and
-`a_narrowed_wait_is_bounded` (ravel-sql `logs_scan::scan`). The scan counts
-each narrowing in `fan_out_narrowings`.
+`a_budget_below_one_open_still_returns_the_typed_refusal`,
+`a_narrowed_wait_is_bounded` and `a_stale_narrowed_head_delays_a_sibling_once`
+(ravel-sql `logs_scan::scan`). The scan counts each narrowing in
+`fan_out_narrowings`, which `SqlStats::scan_timing` sums over partitions.
