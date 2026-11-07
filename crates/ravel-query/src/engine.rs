@@ -12336,7 +12336,8 @@ mod l1_batch_tests {
         probe: Arc<std::sync::Mutex<Vec<BatchObservation>>>,
     ) -> QueryEngine {
         let backend: Arc<dyn ObjectStoreBackend> = store;
-        let catalog = Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog");
+        let catalog =
+            Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog");
         let config = EngineConfig {
             promql_fetch_fanout: Some(4),
             ..EngineConfig::default()
@@ -12382,7 +12383,10 @@ mod l1_batch_tests {
         // One whole-call reservation, as before the amendment: its peak.
         let probe = Arc::default();
         let whole = engine(Arc::clone(&store), None, u64::MAX, Arc::clone(&probe));
-        assert_eq!(format!("{:?}", query(&whole).await.expect("answers")), reference);
+        assert_eq!(
+            format!("{:?}", query(&whole).await.expect("answers")),
+            reference
+        );
         let observed: Vec<BatchObservation> = probe.lock().expect("probe").clone();
         assert_eq!(observed.len(), 1, "one L1 part, fetched as one batch");
         let whole_pages = observed[0].batch_reserved;
@@ -12390,9 +12394,14 @@ mod l1_batch_tests {
 
         // One byte below that peak: the whole-call reservation refuses.
         let limit = whole_peak - 1;
-        let refused = query(&engine(Arc::clone(&store), Some(limit), u64::MAX, Arc::default()))
-            .await
-            .expect_err("a whole-call reservation over the limit refuses");
+        let refused = query(&engine(
+            Arc::clone(&store),
+            Some(limit),
+            u64::MAX,
+            Arc::default(),
+        ))
+        .await
+        .expect_err("a whole-call reservation over the limit refuses");
         let message = refused.to_string();
         assert!(
             message.contains("fetch memory exhausted"),
@@ -12409,7 +12418,11 @@ mod l1_batch_tests {
         let answer = query(&batched).await.unwrap_or_else(|e| {
             panic!("a batched fetch at {limit} B answers, got: {e}");
         });
-        assert_eq!(format!("{answer:?}"), reference, "the same answer as unlimited");
+        assert_eq!(
+            format!("{answer:?}"),
+            reference,
+            "the same answer as unlimited"
+        );
         let observed: Vec<BatchObservation> = probe.lock().expect("probe").clone();
         assert!(observed.len() >= 2, "{} batches", observed.len());
         for (i, b) in observed.iter().enumerate() {

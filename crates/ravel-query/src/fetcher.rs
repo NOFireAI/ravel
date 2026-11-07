@@ -2952,9 +2952,7 @@ impl SegmentFetcher {
             let scalar_entries = scalar.get(batch.scalar).unwrap_or(&[]);
             let scalar_plans = scalar_planned.get(batch.scalar_plans).unwrap_or(&[]);
             let histogram_entries = histogram.get(batch.histogram).unwrap_or(&[]);
-            let histogram_plans = histogram_planned
-                .get(batch.histogram_plans)
-                .unwrap_or(&[]);
+            let histogram_plans = histogram_planned.get(batch.histogram_plans).unwrap_or(&[]);
             let ranges = page_ranges(scalar_plans, histogram_plans);
             let page_kind = match (scalar_entries.is_empty(), histogram_entries.is_empty()) {
                 (false, true) => "scalar",
@@ -4008,7 +4006,8 @@ fn page_batches(
     batch_bytes: u64,
 ) -> Vec<PageBatch> {
     let mut batches = Vec::new();
-    let (mut scalar, mut scalar_plans, mut histogram, mut histogram_plans) = (0usize, 0usize, 0usize, 0usize);
+    let (mut scalar, mut scalar_plans, mut histogram, mut histogram_plans) =
+        (0usize, 0usize, 0usize, 0usize);
     let mut current = PageBatch {
         scalar: 0..0,
         scalar_plans: 0..0,
@@ -7803,7 +7802,9 @@ mod tests {
         }
 
         fn scan_bytes(&self) -> u64 {
-            self.phases.phase(QueryPhase::Scan).s3_bytes(AccountedOp::Get)
+            self.phases
+                .phase(QueryPhase::Scan)
+                .s3_bytes(AccountedOp::Get)
         }
 
         fn decoded(&self) -> &str {
@@ -7881,7 +7882,11 @@ mod tests {
             ranged_l1(f).with_fetch_batch_floor(u64::MAX)
         })
         .await;
-        assert_eq!(whole.batches.len(), 1, "a floor above the part is one batch");
+        assert_eq!(
+            whole.batches.len(),
+            1,
+            "a floor above the part is one batch"
+        );
         let one = &whole.batches[0];
         assert!(
             one.batch_owned <= one.batch_reserved,
@@ -7890,7 +7895,10 @@ mod tests {
             one.batch_reserved
         );
         let page_bytes = whole.scan_bytes();
-        assert_eq!(one.batch_reserved, page_bytes, "the one batch reserves every page");
+        assert_eq!(
+            one.batch_reserved, page_bytes,
+            "the one batch reserves every page"
+        );
         let regions = one.segment_reserved;
         // The open and catalog regions plus the decoded catalog's reservation.
         let catalog = one.budget_reserved - page_bytes;
@@ -7915,7 +7923,10 @@ mod tests {
         );
         let batched = batch_run(&bytes, tenant_hash, &seg_ref, &[], configure).await;
         for (i, b) in batched.batches.iter().enumerate() {
-            assert_eq!(b.segment_reserved, regions, "batch {i}: open and catalog regions");
+            assert_eq!(
+                b.segment_reserved, regions,
+                "batch {i}: open and catalog regions"
+            );
             assert_eq!(
                 b.budget_reserved,
                 catalog + b.batch_reserved,
@@ -7934,8 +7945,16 @@ mod tests {
                 b.batch_reserved
             );
         }
-        assert!(batched.batches.len() >= 20, "{} batches", batched.batches.len());
-        assert_eq!(batched.decoded(), whole.decoded(), "bitwise the same samples");
+        assert!(
+            batched.batches.len() >= 20,
+            "{} batches",
+            batched.batches.len()
+        );
+        assert_eq!(
+            batched.decoded(),
+            whole.decoded(),
+            "bitwise the same samples"
+        );
         assert_eq!(budget.reserved(), 0, "every batch released its reservation");
     }
 
@@ -8033,7 +8052,10 @@ mod tests {
             Err(FetchError::FetchMemoryExhausted {
                 requested, limit, ..
             }) => {
-                assert_eq!(*requested, first_batch, "the refusal names the batch's bytes");
+                assert_eq!(
+                    *requested, first_batch,
+                    "the refusal names the batch's bytes"
+                );
                 assert_eq!(*limit, catalog + first_batch - 1);
             }
             other => panic!("expected FetchMemoryExhausted, got {other:?}"),
@@ -8053,13 +8075,17 @@ mod tests {
     #[tokio::test]
     async fn l0_is_one_batch_whatever_the_fetch_share() {
         let (bytes, tenant_hash, seg_ref, order) = many_run_segment();
-        let alternate = order.iter().step_by(2).cloned().collect::<Vec<_>>().join("|");
+        let alternate = order
+            .iter()
+            .step_by(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("|");
         let matchers = [LabelMatcher::regex("__name__", alternate).expect("regex")];
         // The first GET (16-byte tail), the footer chase, one catalog GET and
         // the four bounded page-range GETs.
         const GETS: u64 = 7;
-        let unbudgeted =
-            batch_run(&bytes, tenant_hash, &seg_ref, &matchers, ranged_l1).await;
+        let unbudgeted = batch_run(&bytes, tenant_hash, &seg_ref, &matchers, ranged_l1).await;
         assert_eq!(unbudgeted.batches.len(), 1);
         let pages = unbudgeted.batches[0].batch_reserved;
         let held = unbudgeted.batches[0].segment_reserved + pages;
@@ -8070,7 +8096,8 @@ mod tests {
                 .with_get_limiter(limiter(BATCH_PERMITS))
                 .with_memory_budget(Arc::clone(&budget))
         };
-        let share = configure(SegmentFetcher::new(Arc::new(MemoryStore::new()))).fetch_batch_bytes();
+        let share =
+            configure(SegmentFetcher::new(Arc::new(MemoryStore::new()))).fetch_batch_bytes();
         assert!(
             share * 4 < pages,
             "an L1 part of these pages would be cut into batches: share {share}, pages {pages}"
@@ -8116,7 +8143,13 @@ mod tests {
                     .map(|(_, _, _, regions)| regions);
                 let held = budget.reserved();
                 let get_bytes = accounting.snapshot().s3_bytes(AccountedOp::Get);
-                (opened, held, get_bytes, counted.sequence_progress(0), budget)
+                (
+                    opened,
+                    held,
+                    get_bytes,
+                    counted.sequence_progress(0),
+                    budget,
+                )
             }
         };
 
