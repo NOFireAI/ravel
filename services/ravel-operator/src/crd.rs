@@ -1012,18 +1012,25 @@ pub struct MaintainSpec {
     /// `--maintain-scratch-dir <mountPath>`, and `--maintain-scratch-max-bytes`
     /// of `sizeGi` GiB in bytes. Omit to render none of these. Requires a
     /// ravel-server release that includes the two-level merge flags.
-    /// The directory is a cache only: ravel-server wipes it at start and
-    /// publishes nothing from it, so losing the volume loses no data. Size it
-    /// to about 1.3 times the largest merge unit's input bytes.
+    /// The directory is a cache only: ravel-server publishes nothing from it,
+    /// so losing the volume loses no data. Each merge unit's own subdirectory
+    /// is wiped when the unit ends. Unit subdirectories a dead process left
+    /// are removed when the first two-level merge takes the directory's lock;
+    /// other files there are kept and count against
+    /// `--maintain-scratch-max-bytes`. Size it to about 1.3 times the largest
+    /// merge unit's input bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scratch: Option<MaintainScratchSpec>,
 }
 
 /// Scratch volume for the maintain tier (ADR-3853 D2).
 ///
-/// The directory is a cache only: ravel-server wipes it at start and when
-/// each merge unit ends, never publishes what it writes there, and a lost
-/// volume costs only a restart of the unit from object storage. Size it to
+/// The directory is a cache only: ravel-server wipes each merge unit's own
+/// subdirectory when the unit ends, removes the unit subdirectories a dead
+/// process left when its first two-level merge takes the directory's lock
+/// (other files are kept and count against `--maintain-scratch-max-bytes`),
+/// never publishes what it writes there, and a lost volume costs only a
+/// restart of the unit from object storage. Size it to
 /// about 1.3 times the input bytes of the largest merge unit; a unit whose
 /// need exceeds the free space is refused, not run in another mode.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
