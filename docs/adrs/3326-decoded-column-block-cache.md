@@ -2005,6 +2005,9 @@ abneq and abq26).
    - A `Mutex<Option<ViewMemo>>` on `StrMemo` (`batch.rs:445-452`), beside `keys`. It is not a
      `OnceLock`, because decision 7 must be able to empty it on its own.
    - `ViewMemo` holds the views array.
+   - A memo with NULL entries is never filled. The fill applies the serve rule's null check
+     (decision 5) before it builds anything, so such a memo keeps no views and `viewMemoFills` does
+     not count it.
    - The views buffer is a `Vec<u128>`, built with `make_view` (arrow-array 59.3.0
      `generic_bytes_view_builder.rs:676`), behind an owner that holds the views' `Reservation`.
      Block 0 is the memo's values `Buffer`.
@@ -2055,7 +2058,8 @@ abneq and abq26).
      null buffer, and `filter` adds none. So the shared memo and the gathered array have the same
      views, buffers and null buffer (`None`) as arrow's cast output.
    - **A NULL key over a recognised memo.** This can happen only when the same values reach the
-     aggregate through another operator. `take` sets the NULL bit (`take.rs:461-487`). The raw view
+     aggregate through another operator. `take` sets the NULL bit from the key nulls (`take_nulls`,
+     arrow-select 59.3.0 `take.rs:421-433`). The raw view
      under it can differ from arrow's cast, which writes 0. Arrow leaves a NULL slot's view
      unspecified. Tests on NULL rows compare values and null bits.
    - **A memo with NULL entries is not served.** The serve rule (decision 5) requires both sides to
@@ -2232,7 +2236,12 @@ its pull request merges.
     - (b) releasing a held view memo and counting its bytes as freed;
     - (c) releasing views only for the ledger cause, not the host gate;
     - (d) on the host-gate cause, not counting the released views toward `want`. B frees the views
-      and then its whole shortfall from data: A's data plus the view bytes, more than A.
+      and then its whole shortfall from data: A's data plus the view bytes, more than A;
+    - (e) releasing a view memo without lowering `view_resident`, so the counter and the view
+      budget stay full after the views are gone.
+  - **The counter falls with the release.** After the pass releases a view memo whose entry stays
+    resident, `view_resident` and the budget's reserved total each fall by exactly that memo's
+    bytes, and reach 0 once every view memo is released; `resident` is unchanged.
 - **T7, lifetime.**
   - The checks:
     - evicting a data entry, by CLOCK or by pressure, drops its view memo, and `view_resident`
@@ -2329,12 +2338,11 @@ The arithmetic is in `research.md`, section 6 (alternative D).
 | Decoded-cache evictions and pressure evictions per round, whole loop | 0.985 to 1.015 each | outside 0.97 to 1.03 | predicted 1.00, same reason; A reads 57,273 pressure evictions at q33 (abneq B2) |
 | Data `residentBytes` per statement's recorded call | 0.99 to 1.01 | outside 0.98 to 1.02 | predicted 1.00: views are not in `resident` (decision 3) |
 | Data `residentBytes` at the end of the loop | 1.000 to 1.01 | above 1.02 | predicted; A reads 7,999,979,446 to 7,999,995,454 B (abneq, measured 2026-11-05) |
-| `viewMemoBytes`, B, end of q19's recorded call | reported, expected 1.36 to 1.60 GB, never above 2.0 GB | above 2.0 GB | predicted; plain SearchPhrase rows times 16 B (inference) |
+| `viewMemoBytes`, B, end of q19's recorded call | 1.29 to 2.0 GB | below 1.29 GB or above 2.0 GB | predicted; plain SearchPhrase rows times 16 B (inference); the floor is 0.95 of the 1.36 GB low end, so a refused or missing fill on more than about a twentieth of the plain blocks misses here |
 | `viewMemoBytes`, B, end of q33's recorded call | reported, expected under 0.1 GB | above 0.5 GB | predicted: the pressure pass releases views first |
 | `viewMemoBytes`, A | 0 on every call | any other value | predicted: A has no view memo |
 | `viewMemoReleases` per round, B | reported, at least 1 at q33 | 0 in every round | predicted |
 | `viewMemoRefusals` per round, B | 0 | above 0 | predicted: the 2.0 GB default holds the 1.36 to 1.60 GB of plain SearchPhrase views, so no fill is refused (decision 3) |
-| `viewMemoFills` per round, B, summed over q06, q13 to q15 and q17 to q19 | at least 9,860 | below 9,860 in any B round | predicted: the 1.36 to 1.60 GB of views is 79 to 93% of the 13,141 SearchPhrase blocks at 16 B x 8,192 rows each (10,380 to 12,210 blocks, inference); every round starts a new server, so each plain block those calls serve fills once per round, and the floor is 0.95 of the low end |
 | Process peak resident (`ravel_process_allocator_bytes{stat="resident"}`), median over each arm's round servers, B minus A, REPORT ONLY (owner decision) | reported, expected 0 to +1.6 GB | none: not judged | predicted: the views are resident until q33's pass releases them, and jemalloc returns freed pages only on decay (see "Risks"). A reads 29.05 to 29.76 GB per round server (abneq and abq26 metrics, measured 2026-11-05 and 2026-11-06) |
 | Host memory gate, minimum available over the run (`ravel_memory_gate_available_bytes`), B against A | B at least A minus 0.5 GB | B below A minus 0.5 GB | measured 2026-11-06: A read 1.83 GB (abneq) and 1.40 GB (abq26), against a 0.66 GB floor (`ravel_memory_gate_available_floor_bytes`) |
 | Host OOM kills, either arm (`sampler/cpuab/dmesg-oom.txt`) | the file is empty | any line: a hard miss, whatever the other rows read | predicted: the one OOM path, see "Risks" |
@@ -2353,8 +2361,8 @@ process. The gate row and the OOM row are the memory gates.
 - **Misses or evictions above 1.015** mean the views cost data entries: a fill, a held view memo,
   or a host-gate pass at q33 that freed views the host had not yet seen returned (see "Risks").
   Look first at q33's `pressureFreedBytes` against A's, then at T5's reservation path.
-- **A saving under 0.18 s: check `viewMemoRefusals` and `viewMemoFills` first.** A refused or
-  missing fill leaves blocks without views, and the cast runs on them as on main.
+- **A saving under 0.18 s: check `viewMemoRefusals` and q19's `viewMemoBytes` first.** A refused
+  or missing fill leaves blocks without views, and the cast runs on them as on main.
 - **A saving under 0.18 s with no refusals and the profile rows inside their bands** means removed cast time moved
   into intern or into the gather. Look first at q17's intern share in B's profile.
 - **If q06 never fills in the loop**, the saving and geomean move to 0.15 to 0.29 s and 0.9942 to
