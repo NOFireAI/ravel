@@ -2060,6 +2060,25 @@ flag, since it runs no fold. The fold report and `/metrics` count the work
 in `key_index_sections_read`, `key_index_entries_carried`,
 `key_index_build_passes` and `key_index_leaf_gets`.
 
+`--fold-key-index-leaves` stays off by default. An advancing fold reads
+only the new entries' sections, but it reads them once per pass. It also
+reads every previous leaf, holds those bytes in memory outside the pair
+budget, and rewrites the tail's whole leaf set.
+
+The pass count follows the tail's total pairs, not the new hour's, so
+every one of those costs grows with the tail's age. One measured advance,
+on real S3, of a 25-hour tail of 20,000,000 traces:
+
+| signal | passes | leaf bytes rewritten | peak RSS |
+|---|---|---|---|
+| spans | 3 | 227,528,100 B | 1,079,029,760 B |
+| logs | 27 | 1,365,715,342 B | 1,990,848,512 B |
+
+At the same ingest rate, a 30-day tail projects to about 6.5 GB of spans
+leaf bytes and 39 GB of logs leaf bytes per advance. Turning the flag on
+for a tenant whose tail lives longer than about a day therefore needs a
+memory and request budget sized from these figures.
+
 ## Per-query budgets
 
 Eight flags bound what one query can spend. Unset, each resolves at startup:
