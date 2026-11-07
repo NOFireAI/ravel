@@ -2049,7 +2049,12 @@ impl QueryEngine {
         // two plans, one distinct matcher set -- runs as ONE fetch pass over
         // the snapshot, not two. Using `fetch_multiplier` here as well (the
         // upper-envelope, undeduplicated count) would report a round count
-        // the fan-out never actually needed.
+        // the fan-out never actually needed. Both figures are computed over
+        // the whole resolved snapshot, before the label-value route runs:
+        // when the route prunes, a pass reads only its plan's surviving
+        // segments, so `service_batches` can then exceed the rounds the
+        // routed fetch needed and is not a lower bound for that query, and
+        // the estimate does not count the route's leaf GETs.
         let service_fetch_multiplier = distinct_plans_by_matcher(plans).len() as u64;
         // Captured by reference (like `plans`), so the `FnMut` attempt copies
         // the reference on each retry rather than moving the owned `Vec` out of
@@ -2147,6 +2152,21 @@ impl QueryEngine {
                 )
                 .await?;
             drop(parts);
+            // The route's leaf GETs are charged before any segment fetch
+            // runs, and a plan whose every segment was pruned runs no fetch
+            // batch, so the budgets are checked here as well as per batch.
+            if let Some(err) = bytes_scanned_exceeded(
+                accounting.snapshot().pooled().total_s3_bytes(),
+                max_bytes_scanned,
+            ) {
+                return Err(err);
+            }
+            if let Some(err) = segment_admission::request_budget_exceeded(
+                accounting.snapshot().pooled().total_s3_requests(),
+                RequestBudget::new(max_s3_requests, fold_lag),
+            ) {
+                return Err(err);
+            }
             let pruned_by_label_index =
                 segments_pruned_by_label_index(&plan_keeps, snapshot.segments.len());
             let plan_snapshots: Vec<Option<Snapshot>> = plan_keeps
@@ -2437,7 +2457,12 @@ impl QueryEngine {
     /// when every key is absent. Blocks and Uncovered both keep the segment.
     /// Negative, regex and empty-value matchers route nothing, and a plan with
     /// no positive equality is not routed. Nothing is routed while the
-    /// snapshot carries a pending erasure, or when `parts` is `None`.
+    /// snapshot carries a pending erasure, when `parts` is `None`, or when no
+    /// part a snapshot segment comes from carries a metrics leaf ref (a
+    /// tenant folded without `metrics_label_index`), so such a query issues
+    /// no leaf GET and settles no part. The value passes run at most
+    /// `promql_fetch_fanout` at a time, the width the per-plan fetch passes
+    /// that follow run at.
     async fn route_metric_plans(
         &self,
         tenant_hash: TenantHash,
@@ -2452,6 +2477,16 @@ impl QueryEngine {
             return Ok(unrouted());
         };
         if !snapshot.pending_erasure.is_empty() || snapshot.segments.is_empty() {
+            return Ok(unrouted());
+        }
+        let has_metrics_leaf = parts.origin.iter().flatten().any(|origin| {
+            parts.parts.get(origin.part as usize).is_some_and(|part| {
+                part.key_index
+                    .iter()
+                    .any(|leaf| leaf.field == ravel_catalog::METRICS_LABEL_VALUE_FIELD)
+            })
+        });
+        if !has_metrics_leaf {
             return Ok(unrouted());
         }
         let plan_values: Vec<Vec<&str>> = plans
@@ -2477,22 +2512,31 @@ impl QueryEngine {
             })
             .collect();
         let reader = crate::fetcher::MetricLeafRangeReader::new(&self.fetcher, tenant_hash);
-        let routed = futures::future::join_all(key_sets.iter().map(|(value, key_set)| {
-            let input = RouteInput {
-                catalog: &self.catalog,
-                snapshot,
-                parts,
-                signal: Signal::Metrics,
-                tenant_hash,
-                key_set,
-                accounting,
-                reader: &reader,
-                budget: &self.memory_budget,
-                limits: ravel_catalog::KeyIndexLeafLimits::default(),
-            };
-            async move { (*value, route(input).await) }
-        }))
-        .await;
+        // The passes are built before the stream, not inside a `.map`
+        // closure on it: a closure there fails axum's higher-ranked `Send`
+        // bound on the handler future.
+        let passes: Vec<_> = key_sets
+            .iter()
+            .map(|(value, key_set)| {
+                let input = RouteInput {
+                    catalog: &self.catalog,
+                    snapshot,
+                    parts,
+                    signal: Signal::Metrics,
+                    tenant_hash,
+                    key_set,
+                    accounting,
+                    reader: &reader,
+                    budget: &self.memory_budget,
+                    limits: ravel_catalog::KeyIndexLeafLimits::default(),
+                };
+                async move { (*value, route(input).await) }
+            })
+            .collect();
+        let routed: Vec<_> = stream::iter(passes)
+            .buffer_unordered(self.config.promql_fetch_fanout().max(1))
+            .collect()
+            .await;
         let mut pruned_by_value: HashMap<&str, Vec<bool>> = HashMap::with_capacity(routed.len());
         for (value, result) in routed {
             match result {
