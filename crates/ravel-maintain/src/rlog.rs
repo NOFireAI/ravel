@@ -2576,6 +2576,9 @@ async fn two_level_merge(
                     // refusal, below.
                     let group = level1_group_size(per_input, run_target, ceiling, inputs);
                     if group >= 2 {
+                        // One-sided: no stream size is known before level 1,
+                        // so a bucket refused only by its stream estimate
+                        // passes here and is refused by `LevelTwoFit` after.
                         return Err(MaintainError::MergeTwoLevelUnsupported {
                             inputs,
                             check: TwoLevelCheck::PredictedLevelTwoFit {
@@ -16806,6 +16809,89 @@ mod tests {
             assert_eq!(run.report.scratch_write_bytes, 0, "{:?}", run.report);
             assert_eq!(compaction_records(&store).await, 0);
             assert!(!dir.exists());
+        }
+
+        /// ADR-3853 D3, #3943 correction: after level 1, constraint (b)
+        /// prices each run at two blocks, and that run term, not the stream
+        /// estimate, can be the side of the maximum that refuses. Two
+        /// level-1 workers at the fixture's 8,192-byte run target leave groups
+        /// of 6 and 10 runs, whose stream estimate sits under `R x 2` run
+        /// blocks. A ceiling between the larger of `R x 1` run block and the
+        /// stream estimate, and `R x 2` run blocks, each plus the tail, is
+        /// refused by `LevelTwoFit` after level 1 wrote the runs.
+        #[tokio::test]
+        async fn level2_fit_refuses_on_two_blocks_per_run_over_the_stream_estimate() {
+            let probe = ProbeStore::new();
+            let keys = seed_inputs(&probe, &two_level_inputs()).await;
+            let per_input = level1_per_input(&probe, &keys).await;
+            let run_target = TWO_LEVEL_RUN_TARGET;
+            let workers = 2u64;
+            let config_at = |ceiling: u64, dir: &std::path::Path| CompactorConfig {
+                level1_workers: Some(workers as usize),
+                ..two_level_config(ceiling, run_target, Some(dir.to_path_buf()))
+            };
+            let level_two_fit = |outcome: Result<CompactionOutcome>| match outcome {
+                Ok(CompactionOutcome::TwoLevelUnsupported {
+                    inputs: 60,
+                    check:
+                        TwoLevelCheck::LevelTwoFit {
+                            runs,
+                            blocks_per_run,
+                            run_block_bytes,
+                            stream_estimate_bytes,
+                            in_flight_bytes,
+                            part_target_bytes,
+                            ceiling_bytes,
+                        },
+                }) => (
+                    runs,
+                    blocks_per_run,
+                    run_block_bytes,
+                    stream_estimate_bytes,
+                    in_flight_bytes + part_target_bytes,
+                    ceiling_bytes,
+                ),
+                other => panic!("{other:?}"),
+            };
+
+            // At the low end of the groups-of-6 ceilings both sides refuse,
+            // which reports the figures level 2 prices.
+            let low = workers * group_ceiling(per_input, run_target, 6);
+            assert_eq!(
+                level1_group_size(per_input, run_target, low / workers, 60),
+                6
+            );
+            let dir = fresh_scratch("run-term-low");
+            let (outcome, _, _, _) = compact_two_level(&config_at(low, &dir)).await;
+            let (runs, blocks_per_run, run_block, stream_estimate, tail, _) =
+                level_two_fit(outcome);
+            assert_eq!((runs, blocks_per_run), (10, 2));
+            assert!(
+                runs * 2 * run_block > stream_estimate,
+                "{runs} x 2 x {run_block} over {stream_estimate}"
+            );
+
+            let fits_one_block = (runs * run_block).max(stream_estimate) + tail;
+            let two_blocks = runs * 2 * run_block + tail;
+            let ceiling = fits_one_block + (two_blocks - fits_one_block) / 2;
+            assert!(fits_one_block <= ceiling && ceiling < two_blocks);
+            assert_eq!(
+                level1_group_size(per_input, run_target, ceiling / workers, 60),
+                6,
+                "the same groups at this ceiling"
+            );
+
+            let dir = fresh_scratch("run-term");
+            let (outcome, run, store, _) = compact_two_level(&config_at(ceiling, &dir)).await;
+            assert_eq!(
+                level_two_fit(outcome),
+                (runs, 2, run_block, stream_estimate, tail, ceiling),
+                "refused on R x 2 x run block, which the stream estimate is under"
+            );
+            assert_eq!(run.report.level1_groups, 10, "{:?}", run.report);
+            assert_eq!(run.report.level2_passes, 0, "{:?}", run.report);
+            assert_eq!(compaction_records(&store).await, 0);
+            assert!(scratch_entries(&dir).is_empty());
         }
 
         /// ADR-3853 D0 routing: a bucket whose single-level plan reads fetch
