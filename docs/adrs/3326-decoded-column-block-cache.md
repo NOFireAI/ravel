@@ -1528,9 +1528,10 @@ within about 1.5% within one arm.
 - **A view memo for GROUP BY.** The dictionary-to-view cast costs 1.07 s
   of hot wall and is rebuilt per batch even over a shared values array
   (measured 2026-10-30, prof028). Once the first pull request makes those
-  arrays stable across calls, a memo keyed by the values array could keep
+  arrays stable across calls, a memo kept beside the values array could keep
   the views. Its memory is not sized here; the view memo amendment below
-  sizes it, gives it a budget of its own and takes the plain-page part.
+  sizes it, gives it a budget of its own, keys it on the memo's offsets
+  buffer rather than the values buffer, and takes the plain-page part.
 - **Building the array per call without a memo.** A safe constructor
   validates the whole buffer on every call. It saves about 0.4 to 0.65 s
   (inference) and needs no amendment. It is the fallback if this one is
@@ -1861,7 +1862,7 @@ list.
 **Page shapes.**
 - **URL and MobilePhoneModel are dictionary-page columns.**
   - The zero-copy amendment measured `dict_key` at 13.2% and 10.9% of q11 and q12's CPU
-    (`:1506`), and dictionary values at 19.0% of q28's CPU (`:1455`).
+    (`:1511`), and dictionary values at 19.0% of q28's CPU (`:1460`).
   - In profB q34 and q35 the plain loop does not show (0 to 13 `build_str_block` samples).
 - **SearchPhrase is mostly plain** (inference). In profB q06, 55 of its 63 memo-build samples are
   plain.
@@ -1882,8 +1883,8 @@ abneq and abq26).
      `byte_view_array.rs:1022-1058`) and the u128 arrow's dictionary cast writes for that entry.
    - On a plain page an entry is a row, so these are exactly the per-row views of the unnarrowed
      block.
-   - A batch whose keys are the identity over the whole memo, with no NULL, gets the memo array
-     itself, shared. Any other batch gets `arrow_select::take(views, keys)`: a 16 B gather per row,
+   - A batch whose keys are the identity over the whole memo, with no NULL, gets the memo's views
+     array itself, shared. Any other batch gets `arrow_select::take(views, keys)`: a 16 B gather per row,
      with no string read.
    - A per-row memo keyed on the keys buffer is rejected. It cannot serve a narrowed batch, since
      `filter_primitive` allocates new keys on every call (`filter.rs:989`).
@@ -1898,8 +1899,11 @@ abneq and abq26).
      `crates/ravel-logseg/src/block.rs:183-192`).
 
 3. **The view budget.**
-   - **Where it lives.** The budget is a counter and a ceiling inside `DecodedColumnCache`
-     (`crates/ravel-logseg/src/decoded_cache.rs:572-581`), beside `resident` and `max_bytes`.
+   - **Where it lives.** The counter and the ceiling live where their data counterparts do:
+     `view_resident` in `Inner`, beside `resident` (`crates/ravel-logseg/src/decoded_cache.rs:496`),
+     behind the same mutex, and `view_max_bytes` on `DecodedColumnCache`, beside `max_bytes`
+     (`decoded_cache.rs:573`). So `Inner::remove` and the release-and-sweep pass in
+     `evict_for_pressure` update it under the lock that already guards `resident`.
      There are two separate figures:
      - `resident` counts data entries only, against `max_bytes`;
      - `view_resident` counts view memos only, against `view_max_bytes`.
@@ -1908,10 +1912,10 @@ abneq and abq26).
      (`services/ravel-server/src/lib.rs:3846-3863`). That evictor is the cache's
      `evict_for_pressure`, so that is where views are released first (decision 7).
    - **Configuration.** A flag shaped like `--decoded-cache-max-bytes`
-     (`services/ravel-server/src/config.rs:3027-3037`):
+     (`services/ravel-server/src/config.rs:3064-3073`):
      - `--decoded-cache-view-max-bytes BYTES`, carried as
        `QueryBudgets::decoded_cache_view_max_bytes: Option<u64>`, beside
-       `decoded_cache_max_bytes` (`config.rs:4242-4244`);
+       `decoded_cache_max_bytes` (`config.rs:4278-4280`);
      - it reaches `DecodedColumnCache::new` where the server builds the cache
        (`lib.rs:3818-3823`).
    - **Default.** The view memo is on by default. Unset, the view budget is the smallest of three
@@ -1929,7 +1933,7 @@ abneq and abq26).
    - **Why the third term.**
      - The decoded cache is not in `memory_hard_caps_bytes`. That sum is the fetch cache, the
        catalog byte cache and the column-statistics cache
-       (`services/ravel-server/src/config.rs:5846-5853`). So nothing at startup reserves the cap or
+       (`services/ravel-server/src/config.rs:5883-5889`). So nothing at startup reserves the cap or
        the views out of the budget.
      - When the cap plus the margin exceeds the budget, the server only warns (`lib.rs:3836-3845`).
      - Without the clamp, a box sized for the old envelope would advertise a view budget that every
@@ -2054,8 +2058,10 @@ abneq and abq26).
      aggregate through another operator. `take` sets the NULL bit (`take.rs:461-487`). The raw view
      under it can differ from arrow's cast, which writes 0. Arrow leaves a NULL slot's view
      unspecified. Tests on NULL rows compare values and null bits.
-   - **A valid key over a NULL entry** comes out NULL through the memo's own null buffer, which is
-     the #3521 rule. `NullEntriesAsNullKeys` stays in place.
+   - **A memo with NULL entries is not served.** The serve rule (decision 5) requires both sides to
+     have no null buffer, so a null-bearing memo always takes arrow's cast, and
+     `NullEntriesAsNullKeys` keeps the #3521 rule there. Every block in scope has a plain memo,
+     which has no null buffer (`batch.rs:557-562`).
 
 ### Scope by statement on current main
 
@@ -2065,7 +2071,7 @@ abneq and abq26).
 | q13, q14, q15 | in | narrowed, by gather |
 | q17, q18, q19 | in | unnarrowed, shared memo |
 | q34, q35 | out, except any plain URL blocks | dictionary-page column |
-| q11, q12 | out, except any plain blocks | dictionary-page column (`dict_key` frames, `:1506`) |
+| q11, q12 | out, except any plain blocks | dictionary-page column (`dict_key` frames, `:1511`) |
 
 The 2 GB default would hold plain URL views too, but URL takes dictionary pages. Taking q34 and q35
 needs dictionary-block views, with the entries per block measured first. That is a later amendment.
@@ -2130,7 +2136,9 @@ One behaviour change per pull request.
      - the `held_outside` change;
      - `--decoded-cache-view-max-bytes` with its derived default, the startup log line naming the bound term, the warning and the
        metrics.
-   - The rule's `casts_to` helper (`group_keys.rs:1252`) accepts `GroupKeyViews`.
+   - The production site is `rewrite_aggregate` (`group_keys.rs:761`), which builds the cast at
+     `group_keys.rs:827-830` and now builds `GroupKeyViews`. The rule's tests use a test helper,
+     `casts_to` (`group_keys.rs:1252`, inside `mod tests`), which is updated to accept it.
    - The same commit updates `docs/reference/ravel-server-flags.md:65` (a new row),
      `docs/guides/operations/configuration.md` and `docs/query-engine.md:6113`.
    - Tests: T1, T2, T8, T9, T10, T11, and T3 to T7 again with the real memo.
@@ -2163,11 +2171,12 @@ its pull request merges.
 - **T2, NULL semantics over a recognised memo.**
   - The fixture: NULL keys over a registered plain memo, and a memo with NULL entries (a mixed
     memo in a unit fixture).
-  - The check: values and null bits equal arrow's cast, and a session `GROUP BY` puts NULL rows in
-    the NULL group.
+  - The checks: values and null bits equal arrow's cast; a session `GROUP BY` puts NULL rows in
+    the NULL group; and the null-bearing memo is not served (the cast runs, and the served-batch
+    counter does not move).
   - Wrong implementations:
-    - (a) views built for every entry, ignoring the memo's nulls, so a NULL entry groups as `''`
-      (#3521);
+    - (a) a serve rule that skips the null-buffer condition, so the null-bearing memo is served and
+      a NULL entry groups as `''` (#3521);
     - (b) a gather that drops the key nulls.
 - **T3, the views are charged to the view budget, not to the data cap.**
   - The checks:
@@ -2308,7 +2317,7 @@ The arithmetic is in `research.md`, section 6 (alternative D).
 | Fill cost (profiled): B's `make_view` plus `validate_string_view` frames under `GroupKeyViews` on the profiled call | at most 0.01 s | above 0.01 s | predicted: fills land on the warm calls (decision 4) |
 | Hot-sum saving, A minus B | 0.18 to 0.35 s | outside 0.18 to 0.35 s | predicted; research.md section 6, alternative D, from abq26-20261106T0050Z B hot walls (#3231 comment 6674886547) |
 | 43-statement hot geomean | 0.9925 to 0.9963 | outside 0.9925 to 0.9963 | predicted; same basis |
-| q06 hot wall, REPORT ONLY (owner decision) | reported, expected 0.928 to 0.962 | none: not judged | predicted; its loop hit pattern is not established (ADR-3326:1454 against abneq q13's 0 admissions) |
+| q06 hot wall, REPORT ONLY (owner decision) | reported, expected 0.928 to 0.962 | none: not judged | predicted; its loop hit pattern is not established (ADR-3326:1459 against abneq q13's 0 admissions) |
 | q13 hot wall | 0.967 to 0.987 | outside 0.96 to 1.00 | predicted; gather on narrowed batches |
 | q14 hot wall | 0.978 to 0.991 | outside 0.97 to 1.00 | predicted; same |
 | q15 hot wall | 0.969 to 0.987 | outside 0.96 to 1.00 | predicted; same |
@@ -2324,6 +2333,8 @@ The arithmetic is in `research.md`, section 6 (alternative D).
 | `viewMemoBytes`, B, end of q33's recorded call | reported, expected under 0.1 GB | above 0.5 GB | predicted: the pressure pass releases views first |
 | `viewMemoBytes`, A | 0 on every call | any other value | predicted: A has no view memo |
 | `viewMemoReleases` per round, B | reported, at least 1 at q33 | 0 in every round | predicted |
+| `viewMemoRefusals` per round, B | 0 | above 0 | predicted: the 2.0 GB default holds the 1.36 to 1.60 GB of plain SearchPhrase views, so no fill is refused (decision 3) |
+| `viewMemoFills` per round, B, summed over q06 and q13 to q19 | in every B round, at least 90% of the distinct plain SearchPhrase blocks those calls serve | below 90% in any B round | predicted: every round starts a new server, so each served plain block fills once per round, on its first hit, and keeps its views until q33's pass releases them (decisions 6 and 7) |
 | Process peak resident (`ravel_process_allocator_bytes{stat="resident"}`), median over each arm's round servers, B minus A, REPORT ONLY (owner decision) | reported, expected 0 to +1.6 GB | none: not judged | predicted: the views are resident until q33's pass releases them, and jemalloc returns freed pages only on decay (see "Risks"). A reads 29.05 to 29.76 GB per round server (abneq and abq26 metrics, measured 2026-11-05 and 2026-11-06) |
 | Host memory gate, minimum available over the run (`ravel_memory_gate_available_bytes`), B against A | B at least A minus 0.5 GB | B below A minus 0.5 GB | measured 2026-11-06: A read 1.83 GB (abneq) and 1.40 GB (abq26), against a 0.66 GB floor (`ravel_memory_gate_available_floor_bytes`) |
 | Host OOM kills, either arm (`sampler/cpuab/dmesg-oom.txt`) | the file is empty | any line: a hard miss, whatever the other rows read | predicted: the one OOM path, see "Risks" |
@@ -2342,7 +2353,9 @@ process. The gate row and the OOM row are the memory gates.
 - **Misses or evictions above 1.015** mean the views cost data entries: a fill, a held view memo,
   or a host-gate pass at q33 that freed views the host had not yet seen returned (see "Risks").
   Look first at q33's `pressureFreedBytes` against A's, then at T5's reservation path.
-- **A saving under 0.18 s with the profile rows inside their bands** means removed cast time moved
+- **A saving under 0.18 s: check `viewMemoRefusals` and `viewMemoFills` first.** A refused or
+  missing fill leaves blocks without views, and the cast runs on them as on main.
+- **A saving under 0.18 s with no refusals and the profile rows inside their bands** means removed cast time moved
   into intern or into the gather. Look first at q17's intern share in B's profile.
 - **If q06 never fills in the loop**, the saving and geomean move to 0.15 to 0.29 s and 0.9942 to
   0.9972. Judge then against those, and record why.
@@ -2353,7 +2366,7 @@ process. The gate row and the OOM row are the memory gates.
 - **The plain fraction of SearchPhrase blocks.** It sets the view bytes, 1.36 to 1.60 GB.
 - **q06's hit pattern in the loop.** Two readings conflict:
   - abneq's recorded q06 call misses and admits all 13,141 SearchPhrase blocks in every round
-    (as ADR-3326:1454 says of abe2a);
+    (as ADR-3326:1459 says of abe2a);
   - yet q13 hits SearchPhrase with 0 admissions at the same residentBytes.
 
   The recorded call is probably rep 1: q34's JSON carries 356.9 MB of S3 GETs, and only its rep 1
