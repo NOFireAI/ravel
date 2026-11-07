@@ -51,7 +51,8 @@ const SCRATCH_LOCK_FILE: &str = "ravel-scratch.lock";
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The `CompactorConfig` `ravel-server` resolves from `flags` the way its
-/// `main` does, on a 16-core 32 GiB host.
+/// `main` does, on a 16-core 32 GiB host, with the ADR-3853 D0 floor off: the
+/// bucket predicts 2.4 million decoded rows, under the production floor.
 fn compactor(flags: &[&str]) -> ravel_maintain::CompactorConfig {
     let mut argv = vec![
         "ravel-server",
@@ -69,8 +70,12 @@ fn compactor(flags: &[&str]) -> ravel_maintain::CompactorConfig {
     let gc_runtime = cli
         .resolve_gc_runtime(performance.query_deadline)
         .expect("gc runtime");
-    cli.resolve_compactor_config(&gc_runtime, &performance)
-        .expect("compactor config")
+    ravel_maintain::CompactorConfig {
+        geometry_floor_decoded_rows: 0,
+        ..cli
+            .resolve_compactor_config(&gc_runtime, &performance)
+            .expect("compactor config")
+    }
 }
 
 fn maintain_config(tenant: &TenantId, compactor: ravel_maintain::CompactorConfig) -> ServerConfig {

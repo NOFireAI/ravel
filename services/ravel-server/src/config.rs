@@ -1416,8 +1416,9 @@ pub struct Cli {
     /// process, so each process needs its own directory. Size it at about
     /// 1.3 times the input bytes of the largest bucket it merges: a unit is
     /// admitted only when that much is free. Omitted, a bucket whose cursor
-    /// merge would decode more than 16 rows per input record is refused and
-    /// counted under `ravel_maintain_compaction_refused_total{reason="geometry"}`.
+    /// merge would decode more than 16 rows per input record and more than
+    /// 10 million rows in all is refused and counted under
+    /// `ravel_maintain_compaction_refused_total{reason="geometry"}`.
     #[arg(long = "maintain-scratch-dir", value_name = "PATH")]
     pub maintain_scratch_dir: Option<std::path::PathBuf>,
 

@@ -1081,21 +1081,24 @@ over any of these:
 
 A `--mode maintain` process compacts a log bucket in two levels when its
 single-level merge would be a cursor merge that decodes more than 16 rows per
-input record. Every other bucket merges in one level as before. Level 1
+input record and more than 10 million rows in all. Every other bucket merges
+in one level as before. Level 1
 merges groups of inputs into sorted runs on local disk, and level 2 merges
 the runs into the L1 segments. The runs need a local directory, and three flags configure
 it:
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--maintain-scratch-dir` | unset | The directory the level-1 runs are written under. Without it, a bucket whose cursor merge would decode more than 16 rows per input record is refused and counted under `ravel_maintain_compaction_refused_total{reason="geometry"}`. |
+| `--maintain-scratch-dir` | unset | The directory the level-1 runs are written under. Without it, a bucket whose cursor merge would decode more than 16 rows per input record and more than 10 million rows in all is refused and counted under `ravel_maintain_compaction_refused_total{reason="geometry"}`. |
 | `--maintain-scratch-max-bytes` | unset | A cap on the bytes the directory may hold. A unit is admitted against the smaller of the volume's free bytes and this cap less the bytes already under the directory. A running unit whose next run write would take the directory past the cap stops before that write and is refused under `reason="scratch_headroom"`. Without it, the volume's free bytes alone decide. |
 | `--maintain-level1-workers` | derived | How many level-1 groups of one bucket merge at once, each under its share of the unit's memory ceiling. Without it, the count is derived per bucket from the unit's share of the usable cores and the largest count whose groups still fit. |
 
 The scratch directory is a cache, not storage:
 
 - Each unit writes its runs in its own subdirectory, and the subdirectory is
-  wiped when the unit ends, whether it published or failed.
+  wiped when the unit ends, whether it published or failed. A unit whose
+  wipe fails keeps its share of the cap until the orphan is reclaimed, which
+  happens when the next process locks the directory.
 - Nothing durable is read from it, so an `emptyDir` serves.
 - The first two-level merge locks `ravel-scratch.lock` in the directory for
   the life of the process. Give each process its own directory: a second

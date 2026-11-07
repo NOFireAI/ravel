@@ -2262,6 +2262,12 @@ pub struct CompactorConfig {
     /// under `merge_cursor_budget_bytes / W1` and
     /// `merge_resident_ceiling / W1`.
     pub level1_workers: Option<usize>,
+    /// The predicted decoded rows at or below which a cursor plan always runs
+    /// as a cursor merge, neither refused nor routed to two levels under
+    /// ADR-3853 D0, whatever its amplification. Default
+    /// [`crate::rlog::MIN_GEOMETRY_PREDICTED_DECODED_ROWS`]; tests lower it to
+    /// reach D0 with small fixtures.
+    pub geometry_floor_decoded_rows: u64,
     /// How the RLOG merge admits a stream's cursors (ADR-0979 decision 2).
     /// Default [`AdmissionMode::Overlap`] (the bounded path). Only the
     /// differential part-hash test sets [`AdmissionMode::EagerAll`]; output
@@ -2513,6 +2519,7 @@ impl Default for CompactorConfig {
             scratch_max_bytes: None,
             rlog_run_memory_target_bytes: RLOG_RUN_MEMORY_TARGET_BYTES,
             level1_workers: None,
+            geometry_floor_decoded_rows: crate::rlog::MIN_GEOMETRY_PREDICTED_DECODED_ROWS,
             merge_admission: AdmissionMode::Overlap,
             rlog_zstd_level: DEFAULT_RLOG_ZSTD_LEVEL,
             compactor_writer_id: Uuid::nil(),

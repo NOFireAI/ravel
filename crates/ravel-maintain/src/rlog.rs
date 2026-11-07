@@ -1289,22 +1289,35 @@ enum GeometryCheck<'a> {
 /// mode.
 pub const MAX_CURSOR_DECODE_AMPLIFICATION: u64 = 16;
 
+/// The default [`CompactorConfig::geometry_floor_decoded_rows`]: a cursor plan
+/// predicting at most this many decoded rows always runs as a cursor merge,
+/// whatever its ratio (ADR-3853 D0, amendment of 2026-11-07). A predicted
+/// figure: a few seconds of decode at the profile's per-row cost.
+pub const MIN_GEOMETRY_PREDICTED_DECODED_ROWS: u64 = 10_000_000;
+
 /// The ADR-3853 D0 refusal for `plan`, or `None` when the plan is not cursor
-/// mode or its predicted decode is within
-/// [`MAX_CURSOR_DECODE_AMPLIFICATION`] times its input records.
-fn geometry_refusal(plan: &MergePlan, inputs: usize, streams: usize) -> Option<MaintainError> {
+/// mode, its predicted decode is at or below `floor`, or it is within
+/// [`MAX_CURSOR_DECODE_AMPLIFICATION`] times its input records. The refusal
+/// and the two-level routing both read this one predicate.
+fn geometry_refusal(
+    plan: &MergePlan,
+    floor: u64,
+    inputs: usize,
+    streams: usize,
+) -> Option<MaintainError> {
     let limit = plan
         .input_records
         .saturating_mul(MAX_CURSOR_DECODE_AMPLIFICATION);
-    (plan.mode == MergeReadMode::Cursor && plan.predicted_decoded_rows > limit).then_some(
-        MaintainError::MergeGeometryUnsupported {
+    (plan.mode == MergeReadMode::Cursor
+        && plan.predicted_decoded_rows > floor
+        && plan.predicted_decoded_rows > limit)
+        .then_some(MaintainError::MergeGeometryUnsupported {
             inputs,
             streams,
             blocks: plan.input_blocks,
             records: plan.input_records,
             predicted_decoded_rows: plan.predicted_decoded_rows,
-        },
-    )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1428,7 +1441,12 @@ async fn merge_catalogs_with_geometry(
     // other plan runs single-level as before. Only compaction asks for the
     // refusal, and it keeps every record, so `keep` stops here.
     if let GeometryCheck::Refuse(shared) = geometry
-        && let Some(refusal) = geometry_refusal(&plan, catalogs.len(), stream_ids.len())
+        && let Some(refusal) = geometry_refusal(
+            &plan,
+            config.geometry_floor_decoded_rows,
+            catalogs.len(),
+            stream_ids.len(),
+        )
     {
         let Some(scratch_dir) = config.scratch_dir.as_deref() else {
             return Err(refusal);
@@ -2069,17 +2087,20 @@ fn lock_scratch_dir(scratch_dir: &std::path::Path) -> Result<()> {
             Err(e) => return Err(scratch_error("remove orphan", &path, e)),
         }
     }
+    release_orphaned_charges(scratch_dir);
     held.insert(scratch_dir.to_path_buf(), file);
     Ok(())
 }
 
-/// One running unit's charge against its scratch directory: the larger of its
-/// need and the run-part bytes it has written. Only a capped unit's writes
-/// raise `written`.
+/// One unit's charge against its scratch directory: the larger of its need and
+/// the run-part bytes it has written. Only a capped unit's writes raise
+/// `written`. A unit whose subdirectory outlived its end keeps its charge,
+/// marked `orphaned`, until [`lock_scratch_dir`] reclaims the subdirectory.
 #[derive(Clone, Copy, Debug)]
 struct ScratchCharge {
     need: u64,
     written: u64,
+    orphaned: bool,
 }
 
 impl ScratchCharge {
@@ -2143,6 +2164,8 @@ struct ScratchReservation {
     /// The bytes under the directory outside every unit subdirectory at
     /// admission, under a cap; 0 with none.
     baseline: u64,
+    /// The unit's subdirectory outlived it, so the charge stays on drop.
+    orphaned: bool,
 }
 
 /// A capped unit's hold on `--maintain-scratch-max-bytes` while it runs
@@ -2169,6 +2192,7 @@ impl ScratchCap {
         let mut charge = units.get(&self.unit).copied().unwrap_or(ScratchCharge {
             need: self.need,
             written: 0,
+            orphaned: false,
         });
         charge.written = charge.written.saturating_add(payload);
         if self
@@ -2215,16 +2239,21 @@ impl ScratchReservation {
                 });
             }
             let unit = NEXT_UNIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            reserved
-                .entry(dir.clone())
-                .or_default()
-                .insert(unit, ScratchCharge { need, written: 0 });
+            reserved.entry(dir.clone()).or_default().insert(
+                unit,
+                ScratchCharge {
+                    need,
+                    written: 0,
+                    orphaned: false,
+                },
+            );
             Ok(ScratchReservation {
                 dir,
                 unit,
                 need,
                 free,
                 baseline,
+                orphaned: false,
             })
         })
         .await
@@ -2248,10 +2277,30 @@ impl Drop for ScratchReservation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(units) = reserved.get_mut(&self.dir) {
+            if self.orphaned {
+                if let Some(charge) = units.get_mut(&self.unit) {
+                    charge.orphaned = true;
+                }
+                return;
+            }
             units.remove(&self.unit);
             if units.is_empty() {
                 reserved.remove(&self.dir);
             }
+        }
+    }
+}
+
+/// Give back the charges of `scratch_dir`'s orphaned units, whose
+/// subdirectories [`lock_scratch_dir`] has just removed.
+fn release_orphaned_charges(scratch_dir: &std::path::Path) {
+    let mut reserved = SCRATCH_RESERVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(units) = reserved.get_mut(scratch_dir) {
+        units.retain(|_, charge| !charge.orphaned);
+        if units.is_empty() {
+            reserved.remove(scratch_dir);
         }
     }
 }
@@ -2272,11 +2321,12 @@ fn is_scratch_full(err: &StoreError) -> bool {
 /// [`Self::close`] wipes and removes the subdirectory on the blocking pool
 /// once the merge returns, success or error; dropping an unclosed unit, a
 /// merge future dropped mid-await, does the same inline. The reservation is
-/// given back after the runs are gone (ADR-3853 D2).
+/// given back after the runs are gone, and kept when the subdirectory could
+/// not be removed (ADR-3853 D2).
 struct ScratchUnit {
     store: Arc<ScratchStore>,
     closed: bool,
-    _reservation: ScratchReservation,
+    reservation: ScratchReservation,
 }
 
 impl ScratchUnit {
@@ -2297,45 +2347,46 @@ impl ScratchUnit {
         Ok(ScratchUnit {
             store: Arc::new(store),
             closed: false,
-            _reservation: reservation,
+            reservation,
         })
     }
 
     async fn close(mut self) {
         let store = Arc::clone(&self.store);
-        let removed = scratch_blocking(move || {
-            remove_scratch_unit(&store);
-            Ok(())
-        })
-        .await;
-        if removed.is_ok() {
+        let removed = scratch_blocking(move || Ok(remove_scratch_unit(&store))).await;
+        if let Ok(removed) = removed {
             self.closed = true;
+            self.reservation.orphaned = !removed;
         }
     }
 }
 
 /// Wipe a unit's scratch store and remove its directory, logging a failure:
 /// the next process to lock the scratch directory reclaims what is left.
-fn remove_scratch_unit(store: &ScratchStore) {
+/// Returns whether the directory is gone.
+fn remove_scratch_unit(store: &ScratchStore) -> bool {
     let dir = store.root().to_path_buf();
     if let Err(e) = store.wipe() {
         tracing::warn!(dir = %dir.display(), error = %e, "two-level merge scratch wipe failed");
     }
-    if let Err(e) = std::fs::remove_dir_all(&dir)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(dir = %dir.display(), error = %e, "two-level merge scratch removal failed");
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), error = %e, "two-level merge scratch removal failed; its charge stays until the orphan is reclaimed");
+            false
+        }
     }
 }
 
 impl Drop for ScratchUnit {
-    // The _reservation field drops after this body, so the headroom is given
+    // The reservation field drops after this body, so the headroom is given
     // back only once the runs are gone.
     fn drop(&mut self) {
         // A dropped merge cannot await the blocking pool, and its scratch must
         // be gone when the drop returns.
         if !self.closed {
-            remove_scratch_unit(&self.store);
+            self.reservation.orphaned = !remove_scratch_unit(&self.store);
         }
     }
 }
@@ -14948,10 +14999,13 @@ mod tests {
             output
         }
 
+        /// The D0 fixtures predict far fewer decoded rows than the production
+        /// floor, so the floor is off here.
         fn unkeyed_base(concurrency: usize) -> CompactorConfig {
             CompactorConfig {
                 rlog_l1_part_memory_target_bytes: Some(FLOOR),
                 input_read_concurrency: concurrency,
+                geometry_floor_decoded_rows: 0,
                 ..CompactorConfig::default()
             }
         }
@@ -15909,6 +15963,7 @@ mod tests {
                 merge_resident_ceiling_bytes: Some(ceiling),
                 rlog_run_memory_target_bytes: run_target,
                 scratch_dir,
+                geometry_floor_decoded_rows: 0,
                 ..CompactorConfig::default()
             }
         }
@@ -16376,6 +16431,87 @@ mod tests {
             assert_eq!(compaction_records(&store).await, 0);
         }
 
+        /// ADR-3853 D0 floor: 2 inputs whose one block each carries 20
+        /// streams predict 800 decoded rows for 40 records, a ratio of 20, at
+        /// or below [`MIN_GEOMETRY_PREDICTED_DECODED_ROWS`]. With no scratch
+        /// directory the bucket compacts as a cursor merge and the geometry
+        /// counter does not move; with one it still compacts in one level. The
+        /// two-level fixture, 96,000 predicted rows, also merges in one level
+        /// with the floor and in two with it off.
+        #[tokio::test]
+        async fn a_tiny_many_stream_cursor_bucket_compacts_under_the_floor() {
+            let inputs = blocked(wide_inputs(2, 20, 1), 20);
+            let floored = |config: CompactorConfig| CompactorConfig {
+                geometry_floor_decoded_rows: MIN_GEOMETRY_PREDICTED_DECODED_ROWS,
+                ..config
+            };
+
+            let config = floored(cursor_forced());
+            let store = ProbeStore::new();
+            let keys = seed_inputs(&store, &inputs).await;
+            let (plan, _) = plan_for(&store, &keys, &config).await;
+            assert_eq!(plan.mode, MergeReadMode::Cursor);
+            assert_eq!(plan.input_records, 40);
+            assert_eq!(plan.predicted_decoded_rows, 800);
+            assert!(plan.predicted_decoded_rows > 40 * MAX_CURSOR_DECODE_AMPLIFICATION);
+            let refused = crate::compaction_refused_total(crate::CompactionRefusedReason::Geometry);
+            let (outcome, run) = compact_logged(&store, &config).await;
+            let outcome = outcome.expect("compact");
+            assert!(
+                matches!(outcome, CompactionOutcome::Compacted { .. }),
+                "{outcome:?}"
+            );
+            assert!(
+                run.mode_line().contains("mode=\"cursor\""),
+                "{}",
+                run.mode_line()
+            );
+            assert_eq!(
+                crate::compaction_refused_total(crate::CompactionRefusedReason::Geometry),
+                refused,
+                "the geometry counter did not move"
+            );
+            assert_eq!(compaction_records(&store).await, 1, "one record published");
+
+            let dir = fresh_scratch("tiny-floor");
+            let config = floored(CompactorConfig {
+                scratch_dir: Some(dir.clone()),
+                ..cursor_forced()
+            });
+            let store = ProbeStore::new();
+            seed_inputs(&store, &inputs).await;
+            let (outcome, run) = compact_logged(&store, &config).await;
+            let outcome = outcome.expect("compact");
+            assert!(
+                matches!(outcome, CompactionOutcome::Compacted { .. }),
+                "{outcome:?}"
+            );
+            assert!(
+                run.mode_line().contains("mode=\"cursor\""),
+                "{}",
+                run.mode_line()
+            );
+            assert_eq!(run.report.level1_groups, 0, "{:?}", run.report);
+            assert_eq!(run.report.scratch_write_bytes, 0, "{:?}", run.report);
+            assert_eq!(compaction_records(&store).await, 1, "one record published");
+
+            // The two-level fixture predicts 96,000 decoded rows, also under
+            // the floor: one level with it, two with it off.
+            let dir = fresh_scratch("two-level-floor");
+            let (config, _) = two_level_scratch_config(&dir).await;
+            let (outcome, run, _, _) = compact_two_level(&floored(config.clone())).await;
+            let outcome = outcome.expect("compact");
+            assert!(
+                matches!(outcome, CompactionOutcome::Compacted { .. }),
+                "{outcome:?}"
+            );
+            assert_eq!(run.report.level1_groups, 0, "{:?}", run.report);
+            assert_eq!(config.geometry_floor_decoded_rows, 0);
+            let (outcome, run, _, _) = compact_two_level(&config).await;
+            outcome.expect("compact");
+            assert!(run.report.level1_groups > 0, "{:?}", run.report);
+        }
+
         /// Each two-level check that fails is refused by name: constraint (a)
         /// leaving G under 2 before any block GET, and constraint (b) after
         /// level 1, with the figures it compared. `W1` is named for (b), so
@@ -16763,6 +16899,47 @@ mod tests {
             assert!(dir.join(SCRATCH_LOCK_FILE).is_file());
         }
 
+        /// A unit whose scratch wipe fails, here because its subdirectory is
+        /// read-only, keeps its charge after it ends, so a later unit under
+        /// the cap is admitted against it; reclaiming the orphan when the
+        /// scratch lock is taken gives the charge back.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_failed_wipe_keeps_the_units_charge_until_the_orphan_is_reclaimed() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = fresh_scratch("failed-wipe");
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let need = 4096u64;
+            let reservation = ScratchReservation::admit(&dir, None, need)
+                .await
+                .expect("admit");
+            let unit = ScratchUnit::open(&dir, &[7u8; 32], reservation)
+                .await
+                .expect("open");
+            let root = unit.store.root().to_path_buf();
+            std::fs::write(root.join("run-0.rlog"), [7u8; 64]).expect("run");
+            let chmod = |mode: u32| {
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode))
+                    .expect("chmod");
+            };
+            chmod(0o555);
+            unit.close().await;
+            assert!(root.join("run-0.rlog").exists(), "the wipe failed");
+            assert_eq!(scratch_reserved(&dir), need, "the charge stays");
+            match ScratchReservation::admit(&dir, Some(2 * need - 1), need).await {
+                Err(MaintainError::ScratchHeadroom { reserved, .. }) => {
+                    assert_eq!(reserved, need);
+                }
+                Ok(_) => panic!("admitted past the cap"),
+                Err(e) => panic!("{e}"),
+            }
+
+            chmod(0o755);
+            lock_scratch_dir(&dir).expect("lock");
+            assert!(!root.exists(), "the orphan was reclaimed");
+            assert_eq!(scratch_reserved(&dir), 0, "the charge is released");
+        }
+
         /// A scratch directory whose lock another holder has is refused with
         /// the lock file's path, before any block GET or scratch write.
         #[tokio::test]
@@ -17001,6 +17178,7 @@ mod tests {
                         ScratchCharge {
                             need: bytes,
                             written: 0,
+                            orphaned: false,
                         },
                     );
                 OtherUnit(dir.to_path_buf())
